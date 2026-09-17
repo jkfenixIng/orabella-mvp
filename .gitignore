@@ -32,5 +32,5 @@ coverage/
 *.bak
 *.tmp
 
-# Repos (submodules)
-API/
+# Repos (submodules) — anchored to root so app/**/api routes are not ignored
+/API/
