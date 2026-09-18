@@ -38,6 +38,8 @@ snapshot y deja espacio para documentos electrónicos sin reestructurar).
   anulación inválida, OUT+reversión (motivos), 10 reservas concurrentes
   1…10 sin huecos (mutex que emula el lock; en BD lo hace `FOR UPDATE`),
   y texto de la migración 005.
-- RLS: deny-by-default con `TODO(seguridad-T7)` igual que T3/T4
-  (hoy permisiva temporal; segrega la capa servidor).
+- RLS: deny-by-default; políticas por sede endurecidas en T8
+  (`008_hardening.sql`: `TODO(seguridad-T7)` cerrado, claim
+  `app_metadata.sede_id`). Anulación auditada (`invoice.annulled` vía
+  `writeAudit`, solo servidor).
 - PRD: §5.4 FAC-01…07, §9 invoices/invoice_items/invoice_taxes, §10 Factura.

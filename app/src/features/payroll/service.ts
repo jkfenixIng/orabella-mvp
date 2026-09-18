@@ -25,6 +25,7 @@ import {
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
+import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import {
   AdminError,
   getEmployee,
@@ -530,7 +531,17 @@ export async function calculatePayroll(
       if (discountError) throw new PayrollError("INTERNAL", "Error interno.", 500);
     }
 
-    void actor;
+    await writeAudit({
+      sede_id: sedeId,
+      user_id: actor.userId,
+      action: AUDIT_ACTIONS.PAYROLL_CALCULATED,
+      entity: "payroll_periods",
+      entity_id: periodId,
+      metadata: {
+        employees: payload.length,
+        vales_descontados: discountedIds.length,
+      },
+    });
     return getPeriodDetail(sedeId, periodId);
   } catch (error) {
     throw toPayrollError(error);
@@ -655,6 +666,7 @@ export async function payPayrollItem(
 export async function closePayrollPeriod(
   sedeId: string,
   periodId: string,
+  actor?: { userId: string },
 ): Promise<PayrollPeriodRow> {
   const db = await payrollDb();
   try {
@@ -671,6 +683,14 @@ export async function closePayrollPeriod(
       .select(PERIOD_SELECT)
       .single();
     if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    await writeAudit({
+      sede_id: sedeId,
+      user_id: actor?.userId ?? null,
+      action: AUDIT_ACTIONS.PAYROLL_CLOSED,
+      entity: "payroll_periods",
+      entity_id: periodId,
+      metadata: { start_date: period.start_date, end_date: period.end_date },
+    });
     return data as PayrollPeriodRow;
   } catch (error) {
     throw toPayrollError(error);
@@ -896,7 +916,39 @@ export async function approveVoucher(
       .select(VOUCHER_SELECT)
       .single();
     if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
-    return data as VoucherRequestRow;
+    const approved = data as VoucherRequestRow;
+    // T8: marca si el vale superó topes (reproduce el chequeo de solicitud
+    // descontando el propio vale del acumulado vigente que lo incluye).
+    let overTope = false;
+    try {
+      const settings = await getVoucherSettings(sedeId);
+      const totals = await vigenteTotals(db, sedeId, voucher.employee_id, voucher.request_date, settings);
+      const amount = Number(voucher.amount);
+      const caps = checkVoucherCaps({
+        dayTotal: totals.dayTotal - amount,
+        weekTotal: totals.weekTotal - amount,
+        requested: amount,
+        maxPerDay: settings ? Number(settings.max_per_day) : null,
+        maxPerWeek: settings ? Number(settings.max_per_week) : null,
+      });
+      overTope = requiresVoucherApproval(caps);
+    } catch {
+      overTope = false;
+    }
+    await writeAudit({
+      sede_id: sedeId,
+      user_id: actor.userId,
+      action: AUDIT_ACTIONS.VOUCHER_APPROVED,
+      entity: "voucher_requests",
+      entity_id: id,
+      metadata: {
+        employee_id: voucher.employee_id,
+        amount: Number(voucher.amount),
+        over_tope: overTope,
+        approval_code: approved.approval_code,
+      },
+    });
+    return approved;
   } catch (error) {
     throw toPayrollError(error);
   }

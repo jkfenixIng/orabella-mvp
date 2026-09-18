@@ -5,7 +5,9 @@ Login con número de documento, clave inicial = documento con cambio forzado
 revocación / timeout de inactividad (AUTH-03), alta solo por admin
 (AUTH-04), bloqueo tras 5 intentos (AUTH-05), recuperación con token de un
 solo uso y expiración de 30 min (AUTH-06), 3 roles fijos sin granularidad
-(AUTH-07). RLS deny-by-default; políticas por sede en T3.
+(AUTH-07). RLS deny-by-default; políticas por sede endurecidas en T8
+(`008_hardening.sql`, claim `app_metadata.sede_id` vía
+`public.current_sede_id()`).
 
 - Tablas (migración `002_auth.sql`): `users`, `roles` (seed
   admin/empleado/caja), `user_roles`, `sessions`, `password_resets`.
@@ -54,9 +56,10 @@ Las Server Actions (`actions.ts`: `loginAction`, `logoutAction`,
 
 ## Reglas implementadas
 
-- Rate-limit en memoria: 5 intentos / 15 min por documento
-  (`DocumentRateLimiter`, compartido por routes + actions). Nota serverless:
-  es local al proceso; en multi-instancia se endurece con store externo (T7).
+- Rate-limit T8: 5 intentos / 15 min por documento en login y
+  password-reset (`src/shared/lib/rate-limit.ts`: Upstash Redis REST si hay
+  `UPSTASH_REDIS_REST_URL`/`TOKEN`, si no memoria con advertencia). La clase
+  `DocumentRateLimiter` conserva su interfaz (tests). Ver README raíz §Seguridad.
 - Bloqueo: al 5.º fallo `failed_attempts=5` y `locked_until=now+15min`;
   dentro del bloqueo se rechaza aunque la clave sea correcta (423).
 - Errores genéricos en login (`Documento o clave inválidos.`): no revelan si
@@ -73,6 +76,12 @@ Las Server Actions (`actions.ts`: `loginAction`, `logoutAction`,
   `getSessionUser()` contra BD en cada request.
 - UI mínima (`/login`): form documento+clave, error genérico, flujo de cambio
   forzado inline (AUTH-01).
+
+## T8 (endurecimiento)
+
+- Auditoría (`audit_logs` vía `writeAudit`, solo servidor): login fallido
+  (`auth.login_failed`), bloqueo (`auth.login_locked`) y cambio de clave
+  (`auth.password_changed`). Nunca en cliente.
 
 ## Tests
 

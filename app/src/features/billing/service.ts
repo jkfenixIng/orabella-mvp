@@ -26,6 +26,7 @@ import {
   InventoryError,
 } from "@/src/features/inventory/service";
 import { applyMovementStock } from "@/src/features/inventory/schemas";
+import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 
 export class BillingError extends Error {
   readonly code: string;
@@ -492,8 +493,8 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
 
 /**
  * FAC-04/FAC-06: anula (solo Emitida/Pagada, motivo obligatorio). Revierte
- * stock con IN por cada producto y deja el motivo en cancel_reason
- * (auditoría en BD; TRA-01 audit_logs llega en T7). Solo admin.
+ * stock con IN por cada producto y deja el motivo en cancel_reason.
+ * Queda en audit_logs (TRA-01, T8). Solo admin.
  */
 export async function annulInvoice(
   sedeId: string,
@@ -542,6 +543,19 @@ export async function annulInvoice(
   } catch (error) {
     throw toBillingError(error);
   }
+
+  await writeAudit({
+    sede_id: sedeId,
+    user_id: actor.userId,
+    action: AUDIT_ACTIONS.INVOICE_ANNULLED,
+    entity: "invoices",
+    entity_id: id,
+    metadata: {
+      consecutive_number: detail.invoice.consecutive_number,
+      motivo,
+      previous_status: detail.invoice.status,
+    },
+  });
 
   return loadDetail(db, updated as InvoiceRow);
 }

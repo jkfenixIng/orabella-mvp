@@ -60,12 +60,13 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   inmutable (`PERIOD_CLOSED`), tope día/semana con aprobación obligatoria,
   semana desde el lunes, código de 6 dígitos, terminales sin doble
   descuento, y texto de la migración 007.
-- RLS: deny-by-default con `TODO(seguridad-T7)` igual que T2–T6
-  (hoy permisiva temporal; segrega la capa servidor).
+- RLS: deny-by-default; políticas por sede endurecidas en T8
+  (`008_hardening.sql`: `TODO(seguridad-T7)` cerrado, claim
+  `app_metadata.sede_id`).
 - Notas: el neto se acota a 0 si los descuentos superan el bruto (el CHECK
-  exige `net_pay >= 0`); `audit_logs` (TRA-01) sigue pendiente de la fase
-  de endurecimiento —igual que en T2–T6— porque el MVP aún usa tokens
-  opacos propios sin JWT con claim de sede.
+  exige `net_pay >= 0`). T8: cálculo (`payroll.calculated`), cierre
+  (`payroll.closed`) y aprobación de vales (`voucher.approved` con flag
+  `over_tope`) auditados vía `writeAudit` (solo servidor).
 - PRD: §5.6 PAY-01…04, §5.7 PAY-05…07, §9
   payroll_periods/items/payments + voucher_settings/requests, §10
   Nómina/vales, plan paso 6 (§12).

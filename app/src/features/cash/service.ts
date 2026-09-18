@@ -25,6 +25,7 @@ import {
   AdminError,
 } from "@/src/features/admin/service";
 import { BillingError, getInvoiceDetail } from "@/src/features/billing/service";
+import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 
 export class CashError extends Error {
   readonly code: string;
@@ -526,7 +527,24 @@ export async function closeShift(
       .select(SHIFT_SELECT)
       .single();
     if (updateError || !updated) throw new CashError("INTERNAL", "Error interno.", 500);
-    return updated as CashShiftRow;
+    const closed = updated as CashShiftRow;
+    await writeAudit({
+      sede_id: sedeId,
+      user_id: actor.userId,
+      action: AUDIT_ACTIONS.SHIFT_CLOSED,
+      entity: "cash_shifts",
+      entity_id: shift.id,
+      metadata: {
+        expected_cash: expectedCash,
+        counted_cash: roundMoney(input.counted_cash),
+        base_left: roundMoney(input.base_left),
+        base_configurada: Number(register.base_configurada),
+        base_difference: close.baseDifference,
+        base_incompleta: close.baseDifference < 0,
+        observation: observation ?? null,
+      },
+    });
+    return closed;
   } catch (error) {
     throw toCashError(error);
   }

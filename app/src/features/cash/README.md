@@ -50,6 +50,8 @@ fecha.
   cierre sin conteo, casos 400/200 y 300/150, base incompleta exige
   observación, acumulado = suma de 2 turnos (550000/450000/550000/350000/
   200000/−150000), y texto de la migración 006.
-- RLS: deny-by-default con `TODO(seguridad-T7)` igual que T2–T5
-  (hoy permisiva temporal; segrega la capa servidor).
+- RLS: deny-by-default; políticas por sede endurecidas en T8
+  (`008_hardening.sql`: `TODO(seguridad-T7)` cerrado, claim
+  `app_metadata.sede_id`). Cierre auditado (`cash.shift_closed` con flag
+  `base_incompleta`, vía `writeAudit`, solo servidor).
 - PRD: §5.5 CAJ-01…06, §9 cash_registers/cash_shifts/payments, §10 Caja.

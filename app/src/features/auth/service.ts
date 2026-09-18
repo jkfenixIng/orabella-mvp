@@ -21,6 +21,14 @@ import {
   SESSION_INACTIVITY_TIMEOUT_MS,
   SESSION_TTL_MS,
 } from "./constants";
+import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
+import {
+  MemoryRateLimiter,
+  isRateLimited,
+  recordRateFailure,
+  resetRateLimit,
+  type RateLimitBudget,
+} from "@/src/shared/lib/rate-limit";
 
 export {
   ACCOUNT_LOCKED_ERROR,
@@ -135,45 +143,29 @@ export function checkSessionValidity(args: {
 
 // ------------------------------------------------------------- rate-limit ---
 /**
- * Rate-limit en memoria: 5 intentos / 15 min por documento (NFR-03).
- * Puramente local al proceso (nota serverless en el README).
+ * T8: rate-limit externo (Upstash Redis REST) con fallback a memoria
+ * (NFR-03; ver src/shared/lib/rate-limit.ts). La clase se conserva con la
+ * interfaz de T2 para compatibilidad y tests; el flujo de login y
+ * recuperación usa las funciones async del módulo compartido.
  */
-export class DocumentRateLimiter {
-  private readonly attempts = new Map<string, number[]>();
+export { MemoryRateLimiter as DocumentRateLimiter } from "@/src/shared/lib/rate-limit";
 
-  constructor(
-    private readonly maxAttempts: number = MAX_LOGIN_ATTEMPTS,
-    private readonly windowMs: number = RATE_LIMIT_WINDOW_MS,
-  ) {}
+/** Instancia histórica por proceso (compatibilidad; el flujo usa el módulo compartido). */
+export const loginRateLimiter = new MemoryRateLimiter();
 
-  static normalize(documento: string): string {
-    return documento.trim();
-  }
+/** 5 intentos / 15 min por documento (AUTH-05, NFR-03). */
+const LOGIN_BUDGET: RateLimitBudget = {
+  maxAttempts: MAX_LOGIN_ATTEMPTS,
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  namespace: "login",
+};
 
-  isBlocked(documento: string, nowMs: number): boolean {
-    return this.recent(DocumentRateLimiter.normalize(documento), nowMs).length >= this.maxAttempts;
-  }
-
-  recordFailure(documento: string, nowMs: number): { blocked: boolean; attempts: number } {
-    const key = DocumentRateLimiter.normalize(documento);
-    const recent = this.recent(key, nowMs);
-    recent.push(nowMs);
-    this.attempts.set(key, recent);
-    return { blocked: recent.length >= this.maxAttempts, attempts: recent.length };
-  }
-
-  reset(documento: string): void {
-    this.attempts.delete(DocumentRateLimiter.normalize(documento));
-  }
-
-  private recent(key: string, nowMs: number): number[] {
-    const cutoff = nowMs - this.windowMs;
-    return (this.attempts.get(key) ?? []).filter((t) => t > cutoff);
-  }
-}
-
-/** Instancia compartida por el proceso (Route Handlers + Server Actions). */
-export const loginRateLimiter = new DocumentRateLimiter();
+/** 5 solicitudes / 15 min por documento (NFR-03). */
+const RESET_BUDGET: RateLimitBudget = {
+  maxAttempts: MAX_LOGIN_ATTEMPTS,
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  namespace: "password-reset",
+};
 
 // ---------------------------------------------------------------- bloqueo ---
 export function isAccountLocked(
@@ -287,22 +279,30 @@ export interface LoginResult {
 }
 
 /**
- * AUTH-01/05: login por documento. Rate-limit en memoria, bloqueo tras
- * 5 fallos, flag de cambio forzado. Error genérico (sin enumerar usuarios).
+ * AUTH-01/05: login por documento. Rate-limit compartido T8 (Upstash o
+ * memoria), bloqueo tras 5 fallos, flag de cambio forzado. Error genérico
+ * (sin enumerar usuarios). Los fallos y bloqueos quedan en audit_logs.
  */
 export async function loginWithDocument(raw: unknown, now: Date = new Date()): Promise<LoginResult> {
   const parsed = loginSchema.safeParse(raw);
   if (!parsed.success) throw new AuthError("VALIDATION", validationMessage(parsed.error), 400);
   const { documento, password } = parsed.data;
-  const nowMs = now.getTime();
 
-  if (loginRateLimiter.isBlocked(documento, nowMs)) {
+  if (await isRateLimited(documento, LOGIN_BUDGET)) {
     throw new AuthError("RATE_LIMITED", ACCOUNT_LOCKED_ERROR, 429);
   }
 
   const found = await findUserByDocument(documento);
   if (!found || !found.user.is_active) {
-    loginRateLimiter.recordFailure(documento, nowMs);
+    await recordRateFailure(documento, LOGIN_BUDGET);
+    await writeAudit({
+      sede_id: found?.user.sede_id ?? null,
+      user_id: found?.user.id ?? null,
+      action: AUDIT_ACTIONS.LOGIN_FAILED,
+      entity: "users",
+      entity_id: found?.user.id ?? documento,
+      metadata: { reason: "unknown_or_inactive" },
+    });
     throw new AuthError("INVALID_CREDENTIALS", GENERIC_LOGIN_ERROR, 401);
   }
   const { user, roles } = found;
@@ -315,7 +315,7 @@ export async function loginWithDocument(raw: unknown, now: Date = new Date()): P
   const db = await adminDb();
   if (!matches) {
     const outcome = nextFailedLoginState(user.failed_attempts, now);
-    loginRateLimiter.recordFailure(documento, nowMs);
+    await recordRateFailure(documento, LOGIN_BUDGET);
     const { error } = await db
       .from("users")
       .update({
@@ -324,6 +324,14 @@ export async function loginWithDocument(raw: unknown, now: Date = new Date()): P
       })
       .eq("id", user.id);
     if (error) throw new AuthError("INTERNAL", "Error interno.", 500);
+    await writeAudit({
+      sede_id: user.sede_id,
+      user_id: user.id,
+      action: outcome.locked ? AUDIT_ACTIONS.LOGIN_LOCKED : AUDIT_ACTIONS.LOGIN_FAILED,
+      entity: "users",
+      entity_id: user.id,
+      metadata: { attempts: outcome.failedAttempts, locked: outcome.locked },
+    });
     throw new AuthError(
       "INVALID_CREDENTIALS",
       outcome.locked ? ACCOUNT_LOCKED_ERROR : GENERIC_LOGIN_ERROR,
@@ -345,7 +353,7 @@ export async function loginWithDocument(raw: unknown, now: Date = new Date()): P
     .eq("id", user.id);
   if (resetError) throw new AuthError("INTERNAL", "Error interno.", 500);
 
-  loginRateLimiter.reset(documento);
+  await resetRateLimit(documento, LOGIN_BUDGET);
   return {
     user: { id: user.id, full_name: user.full_name, must_change_password: user.must_change_password },
     roles,
@@ -426,6 +434,7 @@ export async function getSessionUser(
 
 /**
  * AUTH-02: cambio de clave propia. Revoca las demás sesiones, mantiene la actual.
+ * Queda en audit_logs (TRA-01).
  */
 export async function changeUserPassword(args: {
   userId: string;
@@ -437,7 +446,7 @@ export async function changeUserPassword(args: {
   const db = await adminDb();
   const { data: user, error } = await db
     .from("users")
-    .select("id, password_hash")
+    .select("id, password_hash, sede_id")
     .eq("id", args.userId)
     .maybeSingle();
   if (error) throw new AuthError("INTERNAL", "Error interno.", 500);
@@ -462,12 +471,22 @@ export async function changeUserPassword(args: {
   if (args.currentTokenHash) query = query.neq("token_hash", args.currentTokenHash);
   const { error: revokeError } = await query;
   if (revokeError) throw new AuthError("INTERNAL", "Error interno.", 500);
+  const changed = user as { id: string; sede_id: string | null };
+  await writeAudit({
+    sede_id: changed.sede_id,
+    user_id: args.userId,
+    action: AUDIT_ACTIONS.PASSWORD_CHANGED,
+    entity: "users",
+    entity_id: args.userId,
+    metadata: {},
+  });
   return { changed: true };
 }
 
 /**
  * AUTH-06: solicitud de recuperación. Respuesta genérica siempre
- * (no revela si el documento existe). Sin mailer en T2: en no-producción
+ * (no revela si el documento existe). Rate-limit T8: 5 solicitudes / 15 min
+ * por documento (NFR-03). Sin mailer en T2: en no-producción
  * devuelve el token para pruebas manuales; en producción solo { requested }.
  */
 export async function requestPasswordReset(
@@ -476,6 +495,10 @@ export async function requestPasswordReset(
 ): Promise<{ requested: boolean; devToken?: string }> {
   const parsed = requestResetSchema.safeParse(raw);
   if (!parsed.success) throw new AuthError("VALIDATION", validationMessage(parsed.error), 400);
+  if (await isRateLimited(parsed.data.documento, RESET_BUDGET)) {
+    throw new AuthError("RATE_LIMITED", "Demasiadas solicitudes. Intente más tarde.", 429);
+  }
+  await recordRateFailure(parsed.data.documento, RESET_BUDGET);
   const found = await findUserByDocument(parsed.data.documento);
   if (!found || !found.user.is_active) return { requested: true };
 
