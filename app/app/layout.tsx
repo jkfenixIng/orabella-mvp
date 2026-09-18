@@ -3,6 +3,7 @@ import { cookies } from "next/headers";
 import Script from "next/script";
 import type { ReactNode } from "react";
 import { ThemeProvider } from "@/src/shared/components/theme-provider";
+import { AppShell } from "@/src/shared/components/app-shell";
 import {
   parseThemePreference,
   themeInitScript,
@@ -33,7 +34,9 @@ export default async function RootLayout({ children }: RootLayoutProps) {
         <Script id="orabella-theme-init" strategy="beforeInteractive">
           {themeInitScript}
         </Script>
-        <ThemeProvider>{children}</ThemeProvider>
+        <ThemeProvider>
+          <AppShell>{children}</AppShell>
+        </ThemeProvider>
       </body>
     </html>
   );

@@ -14,7 +14,10 @@ import { AdminTabs } from "./admin-tabs";
 export const dynamic = "force-dynamic";
 
 /**
- * T3 — panel admin (ADM-01…08). Solo rol admin; el resto recibe 403.
+ * Panel admin. Solo rol admin: quien no lo tenga es redirigido al
+ * inicio. La validación vive aquí (servidor con BD) y no en el
+ * middleware, porque la cookie de sesión es un token opaco que no
+ * porta el rol (ver decisión documentada en middleware.ts).
  * Carga inicial en servidor con el mismo servicio que la API.
  */
 export default async function AdminPage() {
@@ -23,19 +26,7 @@ export default async function AdminPage() {
   const session = await getSessionUser(token);
   if (!session) redirect("/login?next=/admin");
 
-  if (!session.roles.includes("admin")) {
-    return (
-      <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-4 px-6 py-12">
-        <h1 className="text-2xl font-bold">Administración</h1>
-        <p role="alert" className="text-sm text-red-600 dark:text-red-400">
-          No tiene permiso para ver esta sección (se requiere rol admin).
-        </p>
-        <a className="text-sm underline" href="/">
-          Volver al inicio
-        </a>
-      </main>
-    );
-  }
+  if (!session.roles.includes("admin")) redirect("/");
 
   const sedeId = session.user.sede_id;
   if (!sedeId) {

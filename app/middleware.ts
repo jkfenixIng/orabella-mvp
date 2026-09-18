@@ -8,6 +8,13 @@ import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
  * Solo verifica presencia de la cookie; la validez (expiración,
  * revocación, inactividad) la verifica getSessionUser() en cada
  * Route Handler / Server Action con la BD (AUTH-03).
+ *
+ * DECISIÓN — /admin solo admin: la cookie de sesión es un token
+ * opaco y no porta el rol, y el middleware corre en el Edge sin
+ * acceso a la BD; por eso NO se valida el rol aquí. La autorización
+ * por rol se hace en la página del servidor (app/admin/page.tsx),
+ * que lee la sesión con getSessionUser() y redirige al inicio a
+ * quien no tenga rol admin.
  */
 const PUBLIC_PATHS: RegExp[] = [/^\/login\/?$/, /^\/api\/v1\/health\/?$/, /^\/api\/v1\/auth(\/|$)/];
 

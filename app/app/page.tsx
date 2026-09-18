@@ -1,50 +1,61 @@
-import { ThemeToggle } from "@/src/shared/components/theme-toggle";
+import Link from "next/link";
 
 const MODULES = [
-  { code: "T2 · Auth", text: "login por documento, roles, bloqueo, recuperación" },
-  { code: "T3 · Admin", text: "empleados, servicios, impuestos, métodos de pago" },
-  { code: "T4 · Inventario", text: "productos, kardex, alertas, búsqueda" },
-  { code: "T5 · Factura", text: "factura interna, consecutivo por sede, cobro dividido" },
-  { code: "T6 · Caja", text: "multi-turno, base encadenada, arqueo, vista del día" },
-  { code: "T7 · Nómina/vales", text: "periodos, cálculo desde facturación, topes y aprobación" },
+  {
+    href: "/invoices",
+    name: "Facturación",
+    purpose: "Cree las cuentas de sus clientes y reciba pagos en efectivo, tarjeta o mezcla de ambos.",
+  },
+  {
+    href: "/cash",
+    name: "Caja",
+    purpose: "Abra y cierre turnos, registre movimientos y consulte el arqueo del día.",
+  },
+  {
+    href: "/inventory",
+    name: "Inventario",
+    purpose: "Controle los productos de la tienda: existencias, entradas, salidas y alertas de poco stock.",
+  },
+  {
+    href: "/admin",
+    name: "Administración",
+    purpose: "Gestione empleados, servicios, precios, impuestos y formas de pago de su sede.",
+  },
+  {
+    href: "/payroll",
+    name: "Nómina y vales",
+    purpose: "Calcule la nómina del personal desde la facturación y controle vales y aprobaciones.",
+  },
 ] as const;
 
 export default function HomePage() {
   return (
-    <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-8 px-6 py-12">
-      <header className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-bold">Orabella MVP</h1>
-          <p className="mt-2 text-slate-600 dark:text-slate-300">
-            Fundación lista (T1): Next.js 15 + React 19 + Supabase + modo oscuro
-            sin flash + API-first.
-          </p>
-        </div>
-        <ThemeToggle />
+    <main className="mx-auto flex min-h-screen w-full max-w-4xl flex-col gap-8 px-6 py-12">
+      <header>
+        <p className="text-sm font-medium text-slate-500 dark:text-slate-400">Bienvenido a</p>
+        <h1 className="mt-1 text-3xl font-bold">Orabella</h1>
+        <p className="mt-2 text-slate-600 dark:text-slate-300">
+          El sistema de su negocio de belleza: ventas, caja, inventario y personal en un solo lugar.
+          Elija un módulo para empezar.
+        </p>
       </header>
 
-      <section className="rounded-lg border border-slate-300 p-4 dark:border-slate-700">
-        <h2 className="text-lg font-semibold">Salud de la API</h2>
-        <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-          Route Handler versionado, respuesta con Zod:
-        </p>
-        <a
-          className="mt-2 inline-block text-sm font-medium text-slate-900 underline dark:text-slate-100"
-          href="/api/v1/health"
-        >
-          GET /api/v1/health
-        </a>
-      </section>
-
-      <section>
-        <h2 className="text-lg font-semibold">Orden de construcción (T1 → T7)</h2>
-        <ul className="mt-2 flex flex-col gap-2">
+      <section aria-label="Módulos del sistema">
+        <ul className="grid gap-4 sm:grid-cols-2">
           {MODULES.map((module) => (
             <li
-              key={module.code}
-              className="rounded-lg border border-slate-300 p-3 text-sm dark:border-slate-700"
+              key={module.href}
+              className="flex flex-col gap-2 rounded-lg border border-slate-300 p-4 dark:border-slate-700"
             >
-              <span className="font-semibold">{module.code}:</span> {module.text}
+              <h2 className="text-lg font-semibold">{module.name}</h2>
+              <p className="text-sm text-slate-600 dark:text-slate-300">{module.purpose}</p>
+              <Link
+                href={module.href}
+                aria-label={`Ir a ${module.name}`}
+                className="mt-auto inline-block w-fit rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white dark:bg-slate-100 dark:text-slate-900"
+              >
+                Entrar
+              </Link>
             </li>
           ))}
         </ul>
