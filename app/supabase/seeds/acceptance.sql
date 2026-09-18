@@ -187,8 +187,8 @@ BEGIN
   -- ----------------------- caja lista (base configurada; turnos por UI) ---
   -- Los 2 turnos/día de §11 (casos 400/200 y 300/150) se crean por UI contra
   -- el turno abierto; el seed NO crea cash_shifts.
-  INSERT INTO public.cash_registers (sede_id, name, base_configurada, is_open)
-  VALUES (v_sede, 'Caja única', 300000, false)
+  INSERT INTO public.cash_registers (sede_id, name, base_configurada, is_active)
+  VALUES (v_sede, 'Caja única', 300000, true)
   ON CONFLICT (sede_id, name)
   DO UPDATE SET base_configurada = EXCLUDED.base_configurada, updated_at = now();
 END
