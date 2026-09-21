@@ -27,7 +27,8 @@ Preparar ambientes de pruebas y productivo. Productivo debe quedar limpio en pro
 - [x] ENV-07 Vercel Preview apuntado al test (URL test + publishable test + secret test como Secret) - verificado con env pull preview
 - [x] ENV-08 Esquema cargado en test vía pooler ca-central-1 (001→010 + acceptance.sql) - users 10, products 3, services 4, methods 6, registers 1 verificados
 - [x] ENV-09 Migraciones 009+010 aplicadas a prod vía MCP (cash_shift_counts + cash_denominations con 11 COP) - prod intacto: users 1, products 0, shifts 0
-- [ ] ENV-10 Vercel prod: Root Directory debe ser `app` (repo raíz tiene API/app/front) + falta SUPABASE_SERVICE_ROLE_KEY de prod; repo git ya conectado (orabella-mvp)
+- [x] ENV-10 Ramas: develop = pruebas (fast-forward a 02cc61f con todo el MVP, pusheado), main = producción (se actualiza solo con aprobación explícita antes del deploy a prod)
+- [ ] ENV-11 Vercel: Root Directory `app` + Production Branch `main` (dashboard) + SUPABASE_SERVICE_ROLE_KEY de prod; Preview sale solo de develop con env test
 
 ## Alcance autorizado
 - Solo tablas de negocio indicadas. No tocar migrations. No tocar API/ ni front/ legacy.
