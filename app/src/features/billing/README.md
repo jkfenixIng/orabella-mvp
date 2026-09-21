@@ -43,3 +43,7 @@ snapshot y deja espacio para documentos electrónicos sin reestructurar).
   `app_metadata.sede_id`). Anulación auditada (`invoice.annulled` vía
   `writeAudit`, solo servidor).
 - PRD: §5.4 FAC-01…07, §9 invoices/invoice_items/invoice_taxes, §10 Factura.
+
+## Límites de lectura
+
+- Navegación instantánea: `listInvoices` acotado a 50 facturas por defecto (máx. 100, con filtros estado/fecha); `validateItemRefs` sin N+1 (una query con `IN` por tabla en vez de 2 queries por ítem).

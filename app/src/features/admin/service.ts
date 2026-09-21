@@ -36,6 +36,18 @@ async function adminDb() {
   return createAdminClient();
 }
 
+/**
+ * Límite de lectura para listados (navegación instantánea): todo listado
+ * trae como máximo 50 filas por defecto; los usos internos que necesitan
+ * cobertura total (p. ej. validaciones de facturación/nómina) pasan un
+ * límite explícito mayor. Nunca sin límite.
+ */
+function clampLimit(limit: number | undefined, def = 50, max = 500): number {
+  if (limit === undefined) return def;
+  if (!Number.isFinite(limit)) return def;
+  return Math.min(max, Math.max(1, Math.floor(limit)));
+}
+
 function validationMessage(error: { issues: Array<{ message: string }> }): string {
   return error.issues[0]?.message ?? "Datos inválidos.";
 }
@@ -106,12 +118,13 @@ export interface SedeRow {
   is_active: boolean;
 }
 
-export async function listSedes(): Promise<SedeRow[]> {
+export async function listSedes(limit?: number): Promise<SedeRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("sedes")
     .select("id, name, address, phone, is_active")
-    .order("name");
+    .order("name")
+    .limit(clampLimit(limit));
   if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
   return (data ?? []) as SedeRow[];
 }
@@ -153,7 +166,7 @@ export interface EmployeeRow {
   is_active: boolean;
 }
 
-export async function listEmployees(sedeId: string): Promise<EmployeeRow[]> {
+export async function listEmployees(sedeId: string, limit?: number): Promise<EmployeeRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("employees")
@@ -161,7 +174,8 @@ export async function listEmployees(sedeId: string): Promise<EmployeeRow[]> {
       "id, sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent, is_active",
     )
     .eq("sede_id", sedeId)
-    .order("document");
+    .order("document")
+    .limit(clampLimit(limit));
   if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
   return (data ?? []) as EmployeeRow[];
 }
@@ -254,13 +268,14 @@ export interface ServiceRow {
 const SERVICE_SELECT =
   "id, sede_id, name, description, price, duracion_min, duracion_max, is_active";
 
-export async function listServices(sedeId: string): Promise<ServiceRow[]> {
+export async function listServices(sedeId: string, limit?: number): Promise<ServiceRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("services")
     .select(SERVICE_SELECT)
     .eq("sede_id", sedeId)
-    .order("name");
+    .order("name")
+    .limit(clampLimit(limit));
   if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
   return (data ?? []) as ServiceRow[];
 }
@@ -302,13 +317,14 @@ export interface TaxConfigRow {
 
 const TAX_SELECT = "id, sede_id, code, name, percent, is_active";
 
-export async function listTaxes(sedeId: string): Promise<TaxConfigRow[]> {
+export async function listTaxes(sedeId: string, limit?: number): Promise<TaxConfigRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("tax_configs")
     .select(TAX_SELECT)
     .eq("sede_id", sedeId)
-    .order("code");
+    .order("code")
+    .limit(clampLimit(limit));
   if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
   return (data ?? []) as TaxConfigRow[];
 }
@@ -347,13 +363,14 @@ export interface PaymentMethodRow {
 
 const PAYMENT_METHOD_SELECT = "id, sede_id, code, name, is_active";
 
-export async function listPaymentMethods(sedeId: string): Promise<PaymentMethodRow[]> {
+export async function listPaymentMethods(sedeId: string, limit?: number): Promise<PaymentMethodRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("payment_methods")
     .select(PAYMENT_METHOD_SELECT)
     .eq("sede_id", sedeId)
-    .order("code");
+    .order("code")
+    .limit(clampLimit(limit));
   if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
   return (data ?? []) as PaymentMethodRow[];
 }

@@ -64,3 +64,7 @@ coherente, min<=max, percent 0–100, códigos de pago, roles), unicidad parcial
 (normalización y conflictos), `requireSedeRole`/`resolveSede`, y contenido de
 la migración `003_admin.sql` (5 tablas, índice parcial, NOT NULL + FK,
 políticas RLS con TODO, seeds).
+
+## Límites de lectura
+
+- Navegación instantánea: `listSedes`/`listEmployees`/`listServices`/`listTaxes`/`listPaymentMethods` acotados a 50 filas por defecto (límite explícito 500 solo para validaciones internas de facturación/nómina).

@@ -19,9 +19,8 @@ import {
   requireSedeRole,
   resolveSede,
 } from "@/src/features/admin/service";
-import { getEmployee, listPaymentMethods, listServices, listTaxes } from "@/src/features/admin/service";
+import { listPaymentMethods, listServices, listTaxes } from "@/src/features/admin/service";
 import {
-  getProduct,
   registerMovement,
   InventoryError,
 } from "@/src/features/inventory/service";
@@ -254,13 +253,48 @@ async function loadRefs(sedeId: string): Promise<ValidatedRefs> {
  * Verifica existencia y sede de cada referencia de los ítems (productos,
  * servicios, empleados). Además pre-verifica stock de productos para
  * fallar ANTES de reservar el consecutivo (FAC-05 sin huecos).
+ *
+ * Sin N+1: una sola query con IN por tabla (productos + empleados) más el
+ * catálogo de servicios; el bucle posterior es en memoria.
  */
 async function validateItemRefs(sedeId: string, items: InvoiceItemInput[]): Promise<void> {
-  const serviceRows = await listServices(sedeId);
+  const db = await billingDb();
+  const serviceRows = await listServices(sedeId, 500);
   const serviceSedeById = new Map(serviceRows.map((row) => [row.id, row.sede_id]));
+
+  const productIds = [...new Set(
+    items
+      .filter((item) => item.item_type === "producto" && item.product_id)
+      .map((item) => item.product_id as string),
+  )];
+  const employeeIds = [...new Set(items.map((item) => item.employee_id))];
+
+  const [productRes, employeeRes] = await Promise.all([
+    productIds.length > 0
+      ? db.from("products").select("id, sede_id, name, stock_qty").in("id", productIds)
+      : Promise.resolve({ data: [], error: null }),
+    employeeIds.length > 0
+      ? db.from("employees").select("id, sede_id").in("id", employeeIds)
+      : Promise.resolve({ data: [], error: null }),
+  ]);
+  if (productRes.error || employeeRes.error) {
+    throw new BillingError("INTERNAL", "Error interno.", 500);
+  }
+  const productById = new Map(
+    ((productRes.data ?? []) as Array<{ id: string; sede_id: string; name: string; stock_qty: number }>).map(
+      (row) => [row.id, row],
+    ),
+  );
+  const employeeSedeById = new Map(
+    ((employeeRes.data ?? []) as Array<{ id: string; sede_id: string }>).map((row) => [row.id, row.sede_id]),
+  );
+
   for (const item of items) {
     if (item.item_type === "producto" && item.product_id) {
-      const product = await getProduct(item.product_id);
+      const product = productById.get(item.product_id);
+      if (!product) {
+        throw new BillingError("NOT_FOUND", "Producto no encontrado.", 404);
+      }
       if (product.sede_id !== sedeId) {
         throw new BillingError("FORBIDDEN", "No tiene acceso a esa sede.", 403);
       }
@@ -279,8 +313,11 @@ async function validateItemRefs(sedeId: string, items: InvoiceItemInput[]): Prom
         throw new BillingError("NOT_FOUND", "Servicio no encontrado en esta sede.", 404);
       }
     }
-    const employee = await getEmployee(item.employee_id);
-    if (employee.sede_id !== sedeId) {
+    const employeeSedeId = employeeSedeById.get(item.employee_id);
+    if (!employeeSedeId) {
+      throw new BillingError("NOT_FOUND", "Empleado no encontrado.", 404);
+    }
+    if (employeeSedeId !== sedeId) {
       throw new BillingError("FORBIDDEN", "No tiene acceso a esa sede.", 403);
     }
   }

@@ -4,8 +4,8 @@ import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import {
   listProducts,
-  lowStockAlerts,
 } from "@/src/features/inventory/service";
+import { filterLowStock } from "@/src/features/inventory/schemas";
 import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 import { InventoryClient } from "./inventory-client";
 
@@ -34,11 +34,10 @@ export default async function InventoryPage() {
     );
   }
 
-  const [products, alerts] = await Promise.all([
-    listProducts(sedeId),
-    lowStockAlerts(sedeId),
-  ]);
-  const alertIds = new Set(alerts.map((alert) => alert.id));
+  // Una sola query: las alertas se derivan del listado (misma regla
+  // stock <= mínimo que filterLowStock), sin segundo scan completo.
+  const products = await listProducts(sedeId);
+  const alertIds = new Set(filterLowStock(products).map((alert) => alert.id));
   const canWrite = session.roles.includes("admin") || session.roles.includes("caja");
 
   return (

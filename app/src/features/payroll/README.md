@@ -70,3 +70,7 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
 - PRD: §5.6 PAY-01…04, §5.7 PAY-05…07, §9
   payroll_periods/items/payments + voucher_settings/requests, §10
   Nómina/vales, plan paso 6 (§12).
+
+## Límites de lectura
+
+- Navegación instantánea: `listPeriods` acotado a 20 periodos recientes, `listVouchers` a 50 vales recientes; el detalle del periodo (ítems + saldos) se carga bajo demanda al seleccionar.

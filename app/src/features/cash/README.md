@@ -55,3 +55,7 @@ fecha.
   `app_metadata.sede_id`). Cierre auditado (`cash.shift_closed` con flag
   `base_incompleta`, vía `writeAudit`, solo servidor).
 - PRD: §5.5 CAJ-01…06, §9 cash_registers/cash_shifts/payments, §10 Caja.
+
+## Límites de lectura
+
+- Navegación instantánea: `/cash` entra solo con cajas + turno abierto + vista del día (el historial de 30 días se carga bajo demanda con el filtro); `getHistory` acotado a 50 turnos.

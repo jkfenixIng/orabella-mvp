@@ -39,6 +39,16 @@ async function inventoryDb() {
   return createAdminClient();
 }
 
+/**
+ * Límite de lectura para listados (navegación instantánea): 50 filas por
+ * defecto; kardex y alertas (excepcionales) acotados a 200. Nunca sin límite.
+ */
+function clampLimit(limit: number | undefined, def = 50, max = 500): number {
+  if (limit === undefined) return def;
+  if (!Number.isFinite(limit)) return def;
+  return Math.min(max, Math.max(1, Math.floor(limit)));
+}
+
 function validationMessage(error: { issues: Array<{ message: string }> }): string {
   return error.issues[0]?.message ?? "Datos inválidos.";
 }
@@ -81,14 +91,15 @@ export interface ProductRow {
 const PRODUCT_SELECT =
   "id, sede_id, sku, name, description, stock_qty, min_stock, cost_price, sale_price, is_active";
 
-/** INV-05 + lectura: lista productos activos e inactivos de la sede. */
-export async function listProducts(sedeId: string): Promise<ProductRow[]> {
+/** INV-05 + lectura: lista productos activos e inactivos de la sede (máx. 50 por defecto). */
+export async function listProducts(sedeId: string, limit?: number): Promise<ProductRow[]> {
   const db = await inventoryDb();
   const { data, error } = await db
     .from("products")
     .select(PRODUCT_SELECT)
     .eq("sede_id", sedeId)
-    .order("name");
+    .order("name")
+    .limit(clampLimit(limit));
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
   return (data ?? []) as ProductRow[];
 }
@@ -161,10 +172,10 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
   return data as ProductRow;
 }
 
-/** INV-05: búsqueda por fragmento de nombre o SKU, solo dentro de la sede. */
-export async function searchProducts(sedeId: string, q: string): Promise<ProductRow[]> {
+/** INV-05: búsqueda por fragmento de nombre o SKU, solo dentro de la sede (máx. 50 por defecto). */
+export async function searchProducts(sedeId: string, q: string, limit?: number): Promise<ProductRow[]> {
   const needle = q.trim();
-  if (needle === "") return listProducts(sedeId);
+  if (needle === "") return listProducts(sedeId, limit);
   const db = await inventoryDb();
   const escaped = needle.replace(/[%_,\\]/g, (char) => `\\${char}`);
   const pattern = `%${escaped}%`;
@@ -173,22 +184,24 @@ export async function searchProducts(sedeId: string, q: string): Promise<Product
     .select(PRODUCT_SELECT)
     .eq("sede_id", sedeId)
     .or(`name.ilike.${pattern},sku.ilike.${pattern}`)
-    .order("name");
+    .order("name")
+    .limit(clampLimit(limit));
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
   const rows = (data ?? []) as ProductRow[];
   // Filtro de apoyo en memoria (misma regla que matchesProductQuery).
   return rows.filter((row) => matchesProductQuery(row, needle));
 }
 
-/** INV-04: productos con stock en o bajo el mínimo (alerta visible). */
-export async function lowStockAlerts(sedeId: string): Promise<ProductRow[]> {
+/** INV-04: productos con stock en o bajo el mínimo (alerta visible, máx. 200). */
+export async function lowStockAlerts(sedeId: string, limit?: number): Promise<ProductRow[]> {
   const db = await inventoryDb();
   const { data, error } = await db
     .from("products")
     .select(PRODUCT_SELECT)
     .eq("sede_id", sedeId)
     .eq("is_active", true)
-    .order("stock_qty");
+    .order("stock_qty")
+    .limit(clampLimit(limit, 200));
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
   return filterLowStock((data ?? []) as ProductRow[]);
 }
@@ -286,10 +299,11 @@ function resolveSedeOrThrow(sessionSedeId: string, rowSedeId: string): void {
   }
 }
 
-/** Kardex cronológico ascendente de un producto (solo su sede). */
+/** Kardex cronológico ascendente de un producto (solo su sede, máx. 200 movimientos). */
 export async function getKardex(
   sedeId: string,
   productId: string,
+  limit?: number,
 ): Promise<MovementRow[]> {
   const product = await getProduct(productId);
   resolveSedeOrThrow(sedeId, product.sede_id);
@@ -299,7 +313,8 @@ export async function getKardex(
     .select(MOVEMENT_SELECT)
     .eq("product_id", productId)
     .order("created_at", { ascending: true })
-    .order("id", { ascending: true });
+    .order("id", { ascending: true })
+    .limit(clampLimit(limit, 200));
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
   return sortKardexAscending((data ?? []) as MovementRow[]);
 }

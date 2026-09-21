@@ -651,7 +651,9 @@ export interface HistoryResult {
 
 /**
  * CAJ-06: historial de aperturas, movimientos, bases y cierres filtrable
- * por fecha (rango inclusive sobre opened_at, más recientes primero).
+ * por fecha (rango inclusive sobre opened_at, más recientes primero,
+ * máx. 50 turnos). La página /cash NO lo trae de entrada: se carga bajo
+ * demanda con el filtro (navegación instantánea).
  */
 export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryResult> {
   const parsed = historySchema.safeParse(raw);
@@ -667,7 +669,7 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
     .gte("opened_at", `${desde}T00:00:00`)
     .lte("opened_at", `${hasta}T23:59:59.999`)
     .order("opened_at", { ascending: false })
-    .limit(200);
+    .limit(50);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
   const rows = (shifts ?? []) as CashShiftRow[];
 

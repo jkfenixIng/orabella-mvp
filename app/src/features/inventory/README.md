@@ -59,3 +59,7 @@ Deny-by-default con políticas por sede permisivas temporales
 (`USING true`) + `TODO(seguridad-T7)`: las sesiones del MVP son tokens
 opacos propios, sin claim de sede en `auth.jwt()`; la segregación la
 aplica la capa servidor. Endurecer al migrar a JWT de Supabase.
+
+## Límites de lectura
+
+- Navegación instantánea: `listProducts`/`searchProducts` acotados a 50 filas por defecto, `getKardex` a 200 movimientos; `/inventory` deriva las alertas del propio listado (una sola query, sin segundo scan).

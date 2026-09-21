@@ -259,7 +259,7 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
   }
 }
 
-/** Lista los periodos de la sede (más recientes primero). */
+/** Lista los periodos de la sede (más recientes primero, máx. 20). */
 export async function listPeriods(sedeId: string): Promise<PayrollPeriodRow[]> {
   const db = await payrollDb();
   const { data, error } = await db
@@ -267,7 +267,7 @@ export async function listPeriods(sedeId: string): Promise<PayrollPeriodRow[]> {
     .select(PERIOD_SELECT)
     .eq("sede_id", sedeId)
     .order("start_date", { ascending: false })
-    .limit(100);
+    .limit(20);
   if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
   return (data ?? []) as PayrollPeriodRow[];
 }
@@ -378,7 +378,9 @@ export async function calculatePayroll(
       throw toPayrollError(error);
     }
 
-    const employees = await listEmployees(sedeId).catch((error) => {
+    // El cálculo cubre toda la planta activa: límite explícito amplio
+    // (la UI lista con el límite por defecto de 50).
+    const employees = await listEmployees(sedeId, 500).catch((error) => {
       throw toPayrollError(error);
     });
     const actives = employees.filter((row) => row.is_active);
@@ -836,21 +838,22 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
   }
 }
 
-/** Lista los vales de la sede (filtro opcional por estado/empleado). */
+/** Lista los vales de la sede (filtro opcional por estado/empleado, máx. 50 recientes). */
 export async function listVouchers(
   sedeId: string,
-  filters: { status?: string; employee_id?: string } = {},
+  filters: { status?: string; employee_id?: string; limit?: number } = {},
 ): Promise<VoucherRequestRow[]> {
   if (filters.status !== undefined && !["pendiente", "aprobada", "rechazada", "descontada"].includes(filters.status)) {
     throw new PayrollError("VALIDATION", "Estado de filtro inválido.", 400);
   }
+  const limit = filters.limit === undefined ? 50 : Math.min(200, Math.max(1, Math.floor(filters.limit)));
   const db = await payrollDb();
   let query = db
     .from("voucher_requests")
     .select(VOUCHER_SELECT)
     .eq("sede_id", sedeId)
     .order("request_date", { ascending: false })
-    .limit(200);
+    .limit(limit);
   if (filters.status) query = query.eq("status", filters.status);
   if (filters.employee_id) query = query.eq("employee_id", filters.employee_id);
   const { data, error } = await query;

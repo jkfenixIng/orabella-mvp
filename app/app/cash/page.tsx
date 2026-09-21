@@ -3,7 +3,7 @@ import { redirect } from "next/navigation";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { listPaymentMethods } from "@/src/features/admin/service";
-import { getDayView, getHistory, getOpenShift, listRegisters } from "@/src/features/cash/service";
+import { getDayView, getOpenShift, listRegisters } from "@/src/features/cash/service";
 import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 import { CashClient } from "./cash-client";
 
@@ -42,11 +42,12 @@ export default async function CashPage() {
   }
 
   const today = isoDay(0);
-  const [registers, openShift, day, history, methods] = await Promise.all([
+  // Entrada instantánea: solo registros + turno abierto + día. El
+  // historial (30 días) se carga bajo demanda con el filtro del cliente.
+  const [registers, openShift, day, methods] = await Promise.all([
     listRegisters(sedeId),
     getOpenShift(sedeId),
     getDayView(sedeId, { fecha: today }),
-    getHistory(sedeId, { desde: isoDay(-30), hasta: today }),
     listPaymentMethods(sedeId),
   ]);
 
@@ -69,7 +70,7 @@ export default async function CashPage() {
         initialRegisters={registers}
         initialOpenShift={openShift}
         initialDay={day}
-        initialHistory={history}
+        initialHistory={{ desde: today, hasta: today, shifts: [] }}
         methods={methods.filter((row) => row.is_active)}
         canWrite={canWrite}
       />

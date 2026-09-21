@@ -148,13 +148,14 @@ export async function requestVoucherAction(input: unknown) {
   }
 }
 
-/** Vales de la sede (requiere sesión; empleado ve los suyos vía filtro). */
-export async function listVouchersAction(input: { status?: string; employee_id?: string; sede_id?: string }) {
+/** Vales de la sede (requiere sesión; empleado ve los suyos vía filtro; máx. 50 por defecto). */
+export async function listVouchersAction(input: { status?: string; employee_id?: string; sede_id?: string; limit?: number }) {
   try {
     const session = await requireSession(await sessionToken());
     const data = await listVouchers(resolveSede(session.sedeId, input.sede_id), {
       status: input.status,
       employee_id: input.employee_id,
+      limit: input.limit,
     });
     return { success: true as const, data };
   } catch (error) {
