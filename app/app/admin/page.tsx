@@ -8,7 +8,6 @@ import {
   listServices,
   listTaxes,
 } from "@/src/features/admin/service";
-import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 import { AdminTabs } from "./admin-tabs";
 
 export const dynamic = "force-dynamic";
@@ -56,7 +55,6 @@ export default async function AdminPage() {
             Empleados, servicios, impuestos y métodos de pago de su sede.
           </p>
         </div>
-        <ThemeToggle />
       </header>
       <AdminTabs
         sedeId={sedeId}

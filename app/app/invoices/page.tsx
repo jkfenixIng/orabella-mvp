@@ -9,7 +9,6 @@ import {
 } from "@/src/features/admin/service";
 import { listProducts } from "@/src/features/inventory/service";
 import { listInvoices } from "@/src/features/billing/service";
-import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 import { InvoicesClient } from "./invoices-client";
 
 export const dynamic = "force-dynamic";
@@ -56,7 +55,6 @@ export default async function InvoicesPage() {
             Factura interna con consecutivo por sede, impuestos y cobro dividido.
           </p>
         </div>
-        <ThemeToggle />
       </header>
       <InvoicesClient
         sedeId={sedeId}

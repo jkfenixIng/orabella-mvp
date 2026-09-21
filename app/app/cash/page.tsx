@@ -4,7 +4,6 @@ import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { listPaymentMethods } from "@/src/features/admin/service";
 import { getDayView, getOpenShift, listRegisters } from "@/src/features/cash/service";
-import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 import { CashClient } from "./cash-client";
 
 export const dynamic = "force-dynamic";
@@ -62,7 +61,6 @@ export default async function CashPage() {
             Turnos con base encadenada, pagos por método y cierre con arqueo.
           </p>
         </div>
-        <ThemeToggle />
       </header>
       <CashClient
         sedeId={sedeId}

@@ -6,7 +6,6 @@ import {
   listProducts,
 } from "@/src/features/inventory/service";
 import { filterLowStock } from "@/src/features/inventory/schemas";
-import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 import { InventoryClient } from "./inventory-client";
 
 export const dynamic = "force-dynamic";
@@ -49,7 +48,6 @@ export default async function InventoryPage() {
             Productos, stock, kardex y alertas de mínimo de su sede.
           </p>
         </div>
-        <ThemeToggle />
       </header>
       <InventoryClient
         sedeId={sedeId}

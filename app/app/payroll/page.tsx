@@ -8,7 +8,6 @@ import {
   listPeriods,
   listVouchers,
 } from "@/src/features/payroll/service";
-import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 import { PayrollClient } from "./payroll-client";
 
 export const dynamic = "force-dynamic";
@@ -56,7 +55,6 @@ export default async function PayrollPage() {
             Periodos con cálculo desde facturación, pago por porciones y vales con topes.
           </p>
         </div>
-        <ThemeToggle />
       </header>
       <PayrollClient
         sedeId={sedeId}
