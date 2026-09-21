@@ -29,6 +29,7 @@ Preparar ambientes de pruebas y productivo. Productivo debe quedar limpio en pro
 - [x] ENV-09 Migraciones 009+010 aplicadas a prod vía MCP (cash_shift_counts + cash_denominations con 11 COP) - prod intacto: users 1, products 0, shifts 0
 - [x] ENV-10 Ramas: develop = pruebas (fast-forward a 02cc61f con todo el MVP, pusheado), main = producción (se actualiza solo con aprobación explícita antes del deploy a prod)
 - [ ] ENV-11 Vercel: Root Directory `app` + Production Branch `main` (dashboard) + SUPABASE_SERVICE_ROLE_KEY de prod; Preview sale solo de develop con env test
+- [x] ENV-12 Preview manual desde app/ por CLI (Root Directory aún en raíz): build Next.js OK 45s, Ready https://orabella-15cg1anub-camilo-rodriguezs-projects-030d5ccd.vercel.app - con Deployment Protection (SSO) activa, abrir logueado en Vercel o desactivarla
 
 ## Alcance autorizado
 - Solo tablas de negocio indicadas. No tocar migrations. No tocar API/ ni front/ legacy.
