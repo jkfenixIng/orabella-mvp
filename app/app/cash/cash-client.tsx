@@ -16,6 +16,14 @@ import type {
   HistoryResult,
 } from "@/src/features/cash/service";
 import type { PaymentMethodRow } from "@/src/features/admin/service";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/src/components/ui/lib/dialog";
 import { cn } from "@/src/components/ui/lib/utils";
 
 const sectionClass = cn(
@@ -100,7 +108,7 @@ export function CashClient(props: CashClientProps) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [, setIsOpeningDialogOpen] = useState(false);
-  const [, setIsPaymentDialogOpen] = useState(false);
+  const [isPaymentDialogOpen, setIsPaymentDialogOpen] = useState(false);
   const [, setIsClosingDialogOpen] = useState(false);
   // Transición para los cambios de vista (día/historial): la UI no se
   // congela mientras la server action responde.
@@ -284,6 +292,13 @@ export function CashClient(props: CashClientProps) {
             <p className="text-slate-600 dark:text-slate-300">
               Base configurada: {formatMoney(baseConfigurada)}.
             </p>
+            {props.canWrite && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button type="button" onClick={() => setIsPaymentDialogOpen(true)} className={buttonClass}>
+                  Registrar pago
+                </button>
+              </div>
+            )}
           </div>
         ) : (
           <div className="mt-3 flex flex-col gap-3 text-sm">
@@ -315,9 +330,12 @@ export function CashClient(props: CashClientProps) {
       </section>
 
       {props.canWrite && openShift && (
-        <section className={sectionClass}>
-          <h2 className="text-lg font-semibold">Registrar pago</h2>
-          <form onSubmit={handlePayment} className="mt-3 flex flex-wrap items-end gap-3">
+        <Dialog open={isPaymentDialogOpen} onOpenChange={setIsPaymentDialogOpen}>
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Registrar pago</DialogTitle>
+            </DialogHeader>
+            <form onSubmit={handlePayment} className="mt-3 flex flex-wrap items-end gap-3">
             <label className={labelClass}>
               Método
               <select
@@ -351,11 +369,19 @@ export function CashClient(props: CashClientProps) {
                 placeholder="uuid de la factura"
               />
             </label>
-            <button type="submit" className={buttonClass} disabled={busy}>
-              Registrar pago
-            </button>
-          </form>
-        </section>
+            <DialogFooter>
+              <DialogClose asChild>
+                <button type="button" className={ghostClass}>
+                  Cancelar
+                </button>
+              </DialogClose>
+              <button type="submit" className={buttonClass} disabled={busy}>
+                Registrar pago
+              </button>
+            </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
       )}
 
       {props.canWrite && openShift && (
