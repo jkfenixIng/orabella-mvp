@@ -13,6 +13,7 @@ import type {
   VoucherSettingsRow,
 } from "@/src/features/payroll/service";
 import type { EmployeeRow } from "@/src/features/admin/service";
+import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 
 const inputClass =
   "rounded border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900";
@@ -186,11 +187,11 @@ export function VouchersClient(props: VouchersClientProps) {
           <form onSubmit={handleLimits} className="mt-3 flex flex-wrap items-end gap-3">
             <label className={labelClass}>
               Máximo por día
-              <input value={maxDay} onChange={(event) => setMaxDay(event.target.value)} inputMode="decimal" className={inputClass} />
+              <input value={formatMoneyInput(maxDay)} onChange={(event) => setMaxDay(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
             </label>
             <label className={labelClass}>
               Máximo por semana
-              <input value={maxWeek} onChange={(event) => setMaxWeek(event.target.value)} inputMode="decimal" className={inputClass} />
+              <input value={formatMoneyInput(maxWeek)} onChange={(event) => setMaxWeek(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
             </label>
             <button type="submit" disabled={busy} className={buttonClass}>
               Guardar topes
@@ -214,7 +215,7 @@ export function VouchersClient(props: VouchersClientProps) {
           </label>
           <label className={labelClass}>
             Monto
-            <input value={voucherAmount} onChange={(event) => setVoucherAmount(event.target.value)} inputMode="decimal" className={inputClass} />
+            <input value={formatMoneyInput(voucherAmount)} onChange={(event) => setVoucherAmount(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
           </label>
           <label className={labelClass}>
             Fecha (opcional)

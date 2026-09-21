@@ -25,6 +25,7 @@ import {
   DialogTitle,
 } from "@/src/components/ui/lib/dialog";
 import { cn } from "@/src/components/ui/lib/utils";
+import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 
 const sectionClass = cn(
   "rounded-lg border border-border-color bg-surface p-4 shadow-sm",
@@ -357,10 +358,10 @@ export function CashClient(props: CashClientProps) {
               Monto
               <input
                 className={inputClass}
-                value={paymentAmount}
-                onChange={(event) => setPaymentAmount(event.target.value)}
-                inputMode="decimal"
-                placeholder="50000"
+                value={formatMoneyInput(paymentAmount)}
+                onChange={(event) => setPaymentAmount(stripMoneyInput(event.target.value))}
+                inputMode="numeric"
+                placeholder="50.000"
               />
             </label>
             <label className={labelClass}>
@@ -398,20 +399,20 @@ export function CashClient(props: CashClientProps) {
               Conteo de efectivo (obligatorio)
               <input
                 className={inputClass}
-                value={countedCash}
-                onChange={(event) => setCountedCash(event.target.value)}
-                inputMode="decimal"
-                placeholder="400000"
+                value={formatMoneyInput(countedCash)}
+                onChange={(event) => setCountedCash(stripMoneyInput(event.target.value))}
+                inputMode="numeric"
+                placeholder="400.000"
               />
             </label>
             <label className={labelClass}>
               Base dejada (obligatoria)
               <input
                 className={inputClass}
-                value={baseLeft}
-                onChange={(event) => setBaseLeft(event.target.value)}
-                inputMode="decimal"
-                placeholder="200000"
+                value={formatMoneyInput(baseLeft)}
+                onChange={(event) => setBaseLeft(stripMoneyInput(event.target.value))}
+                inputMode="numeric"
+                placeholder="200.000"
               />
             </label>
             <label className={labelClass}>

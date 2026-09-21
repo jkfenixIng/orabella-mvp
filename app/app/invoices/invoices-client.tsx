@@ -54,6 +54,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { cn } from "@/src/components/ui/lib/utils";
+import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 
 const inputClass = cn(
   "flex h-10 w-full rounded-lg border border-color bg-surface px-3 text-sm text-text-primary outline-none transition-colors duration-200 placeholder:text-text-tertiary focus:border-primary-600 focus:ring-2 focus:ring-primary-600/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-border-color dark:bg-surface dark:text-text-primary",
@@ -355,10 +356,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             Descuento factura
                             <Input
                               className={inputClass}
-                              value={discount}
-                              onChange={(event) => setDiscount(event.target.value)}
+                              value={formatMoneyInput(discount)}
+                              onChange={(event) => setDiscount(stripMoneyInput(event.target.value))}
                               placeholder="0"
-                              inputMode="decimal"
+                              inputMode="numeric"
                             />
                           </Label>
                         </div>
@@ -486,10 +487,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   Precio
                                   <Input
                                     className={inputClass}
-                                    value={item.unit_price}
-                                    onChange={(event) => patchItem(index, { unit_price: event.target.value })}
+                                    value={formatMoneyInput(item.unit_price)}
+                                    onChange={(event) => patchItem(index, { unit_price: stripMoneyInput(event.target.value) })}
                                     placeholder="Precio"
-                                    inputMode="decimal"
+                                    inputMode="numeric"
                                     required
                                   />
                                 </Label>
@@ -548,14 +549,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 Monto (vacío = sin cobro inmediato)
                                 <Input
                                   className={inputClass}
-                                  value={portion.amount}
+                                  value={formatMoneyInput(portion.amount)}
                                   onChange={(event) =>
                                     setPortions((prev) =>
-                                      prev.map((row, i) => (i === index ? { ...row, amount: event.target.value } : row)),
+                                      prev.map((row, i) => (i === index ? { ...row, amount: stripMoneyInput(event.target.value) } : row)),
                                     )
                                   }
                                   placeholder="0"
-                                  inputMode="decimal"
+                                  inputMode="numeric"
                                 />
                               </Label>
                               {portions.length > 1 && (
@@ -763,10 +764,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 Monto
                                 <Input
                                   className={inputClass}
-                                  value={splitDraft.amount}
-                                  onChange={(event) => setSplitDraft({ ...splitDraft, amount: event.target.value })}
+                                  value={formatMoneyInput(splitDraft.amount)}
+                                  onChange={(event) => setSplitDraft({ ...splitDraft, amount: stripMoneyInput(event.target.value) })}
                                   placeholder="0"
-                                  inputMode="decimal"
+                                  inputMode="numeric"
                                   required
                                 />
                               </Label>
