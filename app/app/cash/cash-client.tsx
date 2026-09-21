@@ -109,7 +109,7 @@ export function CashClient(props: CashClientProps) {
   const [busy, setBusy] = useState(false);
   const [, setIsOpeningDialogOpen] = useState(false);
   const [isPaymentDialogOpen, setIsPaymentDialogOpen] = useState(false);
-  const [, setIsClosingDialogOpen] = useState(false);
+  const [isClosingDialogOpen, setIsClosingDialogOpen] = useState(false);
   // Transición para los cambios de vista (día/historial): la UI no se
   // congela mientras la server action responde.
   const [isViewPending, startViewTransition] = useTransition();
@@ -297,6 +297,9 @@ export function CashClient(props: CashClientProps) {
                 <button type="button" onClick={() => setIsPaymentDialogOpen(true)} className={buttonClass}>
                   Registrar pago
                 </button>
+                <button type="button" onClick={() => setIsClosingDialogOpen(true)} className={ghostClass}>
+                  Cerrar turno
+                </button>
               </div>
             )}
           </div>
@@ -385,9 +388,12 @@ export function CashClient(props: CashClientProps) {
       )}
 
       {props.canWrite && openShift && (
-        <section className={sectionClass}>
-          <h2 className="text-lg font-semibold">Cerrar turno</h2>
-          <form onSubmit={handleClose} className="mt-3 flex flex-wrap items-end gap-3">
+        <Dialog open={isClosingDialogOpen} onOpenChange={setIsClosingDialogOpen}>
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Cerrar turno</DialogTitle>
+            </DialogHeader>
+            <form onSubmit={handleClose} className="mt-3 flex flex-wrap items-end gap-3">
             <label className={labelClass}>
               Conteo de efectivo (obligatorio)
               <input
@@ -417,15 +423,23 @@ export function CashClient(props: CashClientProps) {
                 placeholder="Faltante de 150000…"
               />
             </label>
-            <button type="submit" className={buttonClass} disabled={busy}>
-              Cerrar turno
-            </button>
-          </form>
-          <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-            Base configurada: {formatMoney(baseConfigurada)}. Recogido = contado − base;
-            diferencia = base − configurada.
-          </p>
-        </section>
+            <DialogFooter>
+              <DialogClose asChild>
+                <button type="button" className={ghostClass}>
+                  Cancelar
+                </button>
+              </DialogClose>
+              <button type="submit" className={buttonClass} disabled={busy}>
+                Cerrar turno
+              </button>
+            </DialogFooter>
+            </form>
+            <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
+              Base configurada: {formatMoney(baseConfigurada)}. Recogido = contado − base;
+              diferencia = base − configurada.
+            </p>
+          </DialogContent>
+        </Dialog>
       )}
 
       <section className={sectionClass} aria-busy={isViewPending}>
