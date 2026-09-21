@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useState, useTransition, type FormEvent } from "react";
 import {
   approveVoucherAction,
   calculatePayrollAction,
@@ -100,6 +100,9 @@ export function PayrollClient(props: PayrollClientProps) {
   // Ajustes por empleado al calcular ("bonos,otros" por empleado).
   const [adjustments, setAdjustments] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
+  // Transición para los cambios de vista (detalle del periodo / vales):
+  // la UI no se congela mientras la server action responde.
+  const [isViewPending, startViewTransition] = useTransition();
 
   function show<T>(result: ActionResult<T>, okText?: string): result is { success: true; data: T } {
     if (!result.success) {
@@ -119,15 +122,19 @@ export function PayrollClient(props: PayrollClientProps) {
     }
   }
 
-  async function refreshVouchers() {
-    const result = (await listVouchersAction({})) as ActionResult<VoucherRequestRow[]>;
-    if (result.success) setVouchers(result.data);
+  function refreshVouchers() {
+    startViewTransition(async () => {
+      const result = (await listVouchersAction({})) as ActionResult<VoucherRequestRow[]>;
+      if (result.success) setVouchers(result.data);
+    });
   }
 
-  async function loadDetail(id: string) {
+  function loadDetail(id: string) {
     setSelectedId(id);
-    const result = (await getPeriodDetailAction(id)) as ActionResult<PeriodDetail>;
-    if (show(result)) setDetail(result.data);
+    startViewTransition(async () => {
+      const result = (await getPeriodDetailAction(id)) as ActionResult<PeriodDetail>;
+      if (show(result)) setDetail(result.data);
+    });
   }
 
   async function handleOpen(event: FormEvent) {
@@ -331,7 +338,13 @@ export function PayrollClient(props: PayrollClientProps) {
         <ul className="mt-3 flex flex-col gap-2">
           {periods.map((row) => (
             <li key={row.id} className="flex flex-wrap items-center gap-3 text-sm">
-              <button type="button" onClick={() => loadDetail(row.id)} className={ghostClass}>
+              <button
+                type="button"
+                onClick={() => loadDetail(row.id)}
+                disabled={isViewPending}
+                aria-current={row.id === selectedId ? "true" : undefined}
+                className={ghostClass}
+              >
                 {row.start_date} → {row.end_date}
               </button>
               <span className="rounded bg-slate-200 px-2 py-0.5 text-xs dark:bg-slate-800">{row.status}</span>
@@ -345,7 +358,7 @@ export function PayrollClient(props: PayrollClientProps) {
       </section>
 
       {selected && (
-        <section className={sectionClass}>
+        <section className={sectionClass} aria-busy={isViewPending}>
           <h2 className="text-lg font-semibold">
             Liquidación {selected.start_date} → {selected.end_date} ({selected.status})
           </h2>
@@ -381,8 +394,13 @@ export function PayrollClient(props: PayrollClientProps) {
             )
           )}
           {!detail && (
-            <button type="button" onClick={() => loadDetail(selected.id)} className={`${ghostClass} mt-3`}>
-              Ver liquidación
+            <button
+              type="button"
+              onClick={() => loadDetail(selected.id)}
+              disabled={isViewPending}
+              className={`${ghostClass} mt-3`}
+            >
+              {isViewPending ? "Cargando…" : "Ver liquidación"}
             </button>
           )}
           {detail && (
