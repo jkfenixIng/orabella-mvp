@@ -1,20 +1,24 @@
 "use server";
 
 import { cookies } from "next/headers";
+import { revalidateTag } from "next/cache";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { resolveSede, requireSession, requireAdminSession } from "@/src/features/admin/service";
 import {
   CashError,
   closeShift,
+  deleteDenomination,
   getDayView,
   getHistory,
   getOpenShift,
+  listDenominations,
   listRegisters,
   openShift,
   registerPayment,
   requireCashWriter,
   updateClosedShift,
   updateRegisterBase,
+  upsertDenomination,
 } from "./service";
 
 async function sessionToken(): Promise<string | undefined> {
@@ -144,6 +148,44 @@ export async function updateClosedShiftAction(id: string, input: unknown) {
       sedeId: session.sedeId,
     });
     return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Denominaciones activas de la sede (requiere sesión). */
+export async function listDenominationsAction() {
+  try {
+    const session = await requireSession(await sessionToken());
+    const data = await listDenominations(session.sedeId);
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Crear/ajustar denominación (solo admin). */
+export async function upsertDenominationAction(input: unknown) {
+  try {
+    const session = await requireAdminSession(await sessionToken());
+    const data = await upsertDenomination(input, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+    });
+    revalidateTag("catalog:denominations");
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Eliminar denominación (solo admin). */
+export async function deleteDenominationAction(id: string) {
+  try {
+    const session = await requireAdminSession(await sessionToken());
+    await deleteDenomination(session.sedeId, id);
+    revalidateTag("catalog:denominations");
+    return { success: true as const };
   } catch (error) {
     return toFailure(error);
   }

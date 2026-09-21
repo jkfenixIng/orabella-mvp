@@ -27,6 +27,7 @@ import {
 } from "@/src/features/admin/service";
 import { BillingError, getInvoiceDetail } from "@/src/features/billing/service";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
+import { unstable_cache } from "next/cache";
 import { z } from "zod";
 
 export class CashError extends Error {
@@ -181,8 +182,68 @@ export interface MethodDifference {
   difference: number;
 }
 
-/** Denominaciones COP para el conteo de efectivo (billetes y monedas). */
-export const CASH_DENOMINATIONS = [100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 200, 100, 50];
+export interface CashDenominationRow {
+  id: string;
+  sede_id: string;
+  kind: "billete" | "moneda";
+  value: number;
+  is_active: boolean;
+}
+
+// ------------------------------------------------------------ denominaciones ---
+
+/** Denominaciones activas de la sede (configurables desde el admin). */
+async function fetchDenominations(sedeId: string): Promise<CashDenominationRow[]> {
+  const db = await cashDb();
+  const { data, error } = await db
+    .from("cash_denominations")
+    .select("id, sede_id, kind, value, is_active")
+    .eq("sede_id", sedeId)
+    .eq("is_active", true)
+    .order("value", { ascending: false });
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  return (data ?? []) as CashDenominationRow[];
+}
+
+export const listDenominations = unstable_cache(fetchDenominations, ["cash:denominations"], {
+  tags: ["catalog:denominations"],
+  revalidate: 3600,
+});
+
+/** Crea o ajusta una denominación (solo admin; el gate vive en actions). */
+export async function upsertDenomination(raw: unknown, actor: CashActor): Promise<CashDenominationRow> {
+  const parsed = z.object({
+    id: z.uuid().optional(),
+    kind: z.enum(["billete", "moneda"]),
+    value: z.coerce.number().positive(),
+    is_active: z.boolean().optional(),
+  }).safeParse(raw);
+  if (!parsed.success) {
+    throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
+  }
+  const db = await cashDb();
+  const payload = {
+    ...(parsed.data.id ? { id: parsed.data.id } : {}),
+    sede_id: actor.sedeId,
+    kind: parsed.data.kind,
+    value: roundMoney(parsed.data.value),
+    ...(parsed.data.is_active !== undefined ? { is_active: parsed.data.is_active } : {}),
+  };
+  const { data, error } = await db
+    .from("cash_denominations")
+    .upsert(payload, { onConflict: "id" })
+    .select("id, sede_id, kind, value, is_active")
+    .single();
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  return data as CashDenominationRow;
+}
+
+/** Elimina una denominación (solo admin; el gate vive en actions). */
+export async function deleteDenomination(sedeId: string, id: string): Promise<void> {
+  const db = await cashDb();
+  const { error } = await db.from("cash_denominations").delete().eq("id", id).eq("sede_id", sedeId);
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+}
 
 // ------------------------------------------------------------------ conteos ---
 
@@ -197,6 +258,7 @@ export async function checkCounts(
 ): Promise<Map<string, number>> {
   const methods = await listPaymentMethods(sedeId);
   const allowed = new Map(methods.filter((m) => m.is_active && m.arqueable).map((m) => [m.code, m]));
+  const denominations = new Set((await listDenominations(sedeId)).map((d) => Number(d.value)));
   const byMethod = new Map<string, ShiftCountInput[]>();
   for (const line of counts) {
     const method = allowed.get(line.method_code);
@@ -204,8 +266,8 @@ export async function checkCounts(
       throw new CashError("VALIDATION", `Método no arqueable: ${line.method_code}.`, 400);
     }
     if (line.method_code === "efectivo") {
-      if (line.denomination == null || line.denomination <= 0) {
-        throw new CashError("VALIDATION", "El efectivo se cuenta por denominación.", 400);
+      if (line.denomination == null || !denominations.has(Number(line.denomination))) {
+        throw new CashError("VALIDATION", "Denominación no configurada para esta sede.", 400);
       }
       if (!moneyEquals(line.amount, roundMoney(line.denomination * line.quantity))) {
         throw new CashError("COUNT_MISMATCH", "El detalle del efectivo no cuadra con el total.", 422);
