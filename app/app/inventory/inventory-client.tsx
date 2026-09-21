@@ -34,6 +34,7 @@ import {
   SelectValue,
 } from "@/src/components/ui/lib/select";
 import { cn } from "@/src/components/ui/lib/utils";
+import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 
 const inputClass = cn(
   "h-10 w-full rounded-lg border border-color bg-surface px-3 py-2 text-sm text-text-primary outline-none transition-all duration-200 placeholder:text-text-tertiary focus:border-primary-600 focus:ring-2 focus:ring-primary-600/20 dark:border-border-color dark:bg-surface dark:text-text-primary",
@@ -130,6 +131,11 @@ export function InventoryClient(props: InventoryClientProps) {
   const pageCount = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
   const paged = visible.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
+  const skuTaken =
+    form.sku.trim() !== "" &&
+    products.some(
+      (row) => row.sku.trim().toLowerCase() === form.sku.trim().toLowerCase() && row.id !== editingId,
+    );
 
   async function refresh() {
     const result: ActionResult<ProductRow[]> = await listProductsAction(props.sedeId);
@@ -443,6 +449,11 @@ export function InventoryClient(props: InventoryClientProps) {
                   <span className="text-xs text-text-secondary">
                     Código único por sede. Sugerencia: iniciales del producto + consecutivo (p. ej. SH-001 para shampoo).
                   </span>
+                  {skuTaken ? (
+                    <span role="alert" className="text-xs text-error">
+                      Este SKU ya existe en otro producto.
+                    </span>
+                  ) : null}
                 </Label>
                 <Label htmlFor="product-name" className={labelClass}>
                   Nombre *
@@ -483,9 +494,10 @@ export function InventoryClient(props: InventoryClientProps) {
                   <Input
                     id="product-cost-price"
                     className={inputClass}
-                    value={form.cost_price}
-                    inputMode="decimal"
-                    onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, cost_price: event.target.value })}
+                    value={formatMoneyInput(form.cost_price)}
+                    inputMode="numeric"
+                    placeholder="25.000"
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, cost_price: stripMoneyInput(event.target.value) })}
                   />
                 </Label>
                 <Label htmlFor="product-sale-price" className={labelClass}>
@@ -493,16 +505,17 @@ export function InventoryClient(props: InventoryClientProps) {
                   <Input
                     id="product-sale-price"
                     className={inputClass}
-                    value={form.sale_price}
-                    inputMode="decimal"
-                    onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, sale_price: event.target.value })}
+                    value={formatMoneyInput(form.sale_price)}
+                    inputMode="numeric"
+                    placeholder="35.000"
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, sale_price: stripMoneyInput(event.target.value) })}
                   />
                 </Label>
                 <DialogFooter className="sm:col-span-2">
                   <Button type="button" variant="outline" onClick={cancelEdit}>
                     Cancelar
                   </Button>
-                  <Button type="submit" disabled={busy} className={buttonClass}>
+                  <Button type="submit" disabled={busy || skuTaken} className={buttonClass}>
                     {editingId ? "Guardar cambios" : "Crear producto"}
                   </Button>
                 </DialogFooter>
@@ -631,6 +644,9 @@ export function InventoryClient(props: InventoryClientProps) {
                     <th className={cn(tableCellClass, "text-left")} scope="col">
                       Motivo
                     </th>
+                    <th className={cn(tableCellClass, "text-left")} scope="col">
+                      Quién
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -640,6 +656,7 @@ export function InventoryClient(props: InventoryClientProps) {
                       <td className={cn(tableCellClass, "font-mono")}>{row.type}</td>
                       <td className={tableCellClass}>{row.qty}</td>
                       <td className={tableCellClass}>{row.reason}</td>
+                      <td className={tableCellClass}>{row.actor_name ?? "—"}</td>
                     </tr>
                   ))}
                 </tbody>

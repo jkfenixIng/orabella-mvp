@@ -215,6 +215,7 @@ export interface MovementRow {
   qty: number;
   reason: string;
   user_id: string | null;
+  actor_name?: string | null;
   created_at: string;
 }
 
@@ -316,7 +317,19 @@ export async function getKardex(
     .order("id", { ascending: true })
     .limit(clampLimit(limit, 200));
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  return sortKardexAscending((data ?? []) as MovementRow[]);
+  const rows = sortKardexAscending((data ?? []) as MovementRow[]);
+  const actorIds = [...new Set(rows.map((row) => row.user_id).filter((id): id is string => id !== null))];
+  const actorNames = new Map<string, string>();
+  if (actorIds.length > 0) {
+    const { data: users } = await db.from("users").select("id, full_name").in("id", actorIds);
+    for (const user of ((users ?? []) as Array<{ id: string; full_name: string }>)) {
+      actorNames.set(user.id, user.full_name);
+    }
+  }
+  return rows.map((row) => ({
+    ...row,
+    actor_name: row.user_id ? (actorNames.get(row.user_id) ?? null) : null,
+  }));
 }
 
 export { requireSession };
