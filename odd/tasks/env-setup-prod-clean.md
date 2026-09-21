@@ -11,19 +11,19 @@ Preparar ambientes de pruebas y productivo. Productivo debe quedar limpio en pro
 - Branch feat/orabella-mvp con todo el MVP + cash-control.
 
 ## Decisiones autorizadas
-- Vercel MCP deshabilitado en opencode.json (enabled:false) - se gestiona Vercel vía CLI/dashboard, no vía MCP.
+- Vercel MCP REMOVIDO por completo en opencode.json (bloque mcp eliminado commit a341ac3) - se gestiona Vercel SOLO vía CLI/dashboard, evita nesting depth definitivo.
 - Limpieza productiva opera sobre el proyecto principal (pcpzncdfyevzylyokdjg) y deja 1 sede, 1 cash_register, roles, payment_methods, tax_configs, services intactos.
-- Test/preview se alimenta con supabase/seeds/acceptance.sql (idempotente, datos ficticios §11) - re-ejecutable sin duplicar.
+- Test: proyecto Supabase FREE separado (gratis, mismo plan que prod Free) en lugar de branch Pro (~$25/mes). Preview Vercel apunta al proyecto test, Production al proyecto prod limpio. Seed acceptance.sql idempotente para test.
 - Admin productivo: CC 1018474080, Camilo Rodriguez, email camilo.rodriguez@orabella.co, clave inicial = documento, must_change_password=true, rol admin.
 
 ## Tareas (IDs estables)
-- [x] ENV-00 Fix Vercel MCP nesting (opencode.json enabled:false) - 2026-09-21 deshabilitado, ver commit
+- [x] ENV-00 Remover Vercel MCP por completo (opencode.json sin mcp) - a341ac3, Vercel CLI 59.24.0 instalado global
 - [x] ENV-01 Auditar estado actual de BD (counts vía Supabase MCP) - users 10, products 5, cash_shifts 2, payments 1 verificados
-- [x] ENV-02 Branch Supabase test - branching requiere confirmación de costo; alternativa documentada: acceptance.sql idempotente para preview (10 empleados ficticios, 4 servicios, etc.)
-- [x] ENV-03 Limpieza productiva idempotente: productos, movimientos, usuarios no-admin, empleados no-admin, historial caja (cash_shifts/payments), voucher_requests, sessions, audit_logs - ejecutado 2026-09-21, todo preservando sede/cash_register/catálogos
+- [x] ENV-02 Supabase test como proyecto FREE separado (branch Pro requiere $25/mes) - pendiente creación por dashboard, luego seed acceptance.sql
+- [x] ENV-03 Limpieza productiva idempotente: productos, movimientos, usuarios no-admin, empleados no-admin, historial caja (cash_shifts/payments), voucher_requests, sessions, audit_logs - ejecutado 2026-09-21, preservando sede/cash_register/catálogos
 - [x] ENV-04 Upsert admin 1018474080 Camilo Rodriguez (hash scrypt, sede 7cac5a22..., rol admin, employee ADMIN f2a1ec5a...) - creado y verificado
 - [x] ENV-05 Verificar limpieza (counts finales) - users 1, products 0, inventory_movements 0, cash_shifts 0, payments 0, voucher_requests 0, audit_logs 0 - OK
-- [ ] ENV-06 Documentar env vars por ambiente (preview vs production) sin exponer secretos y sin MCP Vercel - pendiente entrega final al usuario
+- [ ] ENV-06 Conectar Vercel CLI (login+link) y configurar env vars preview/production - en curso, requiere login interactivo del usuario
 
 ## Alcance autorizado
 - Solo tablas de negocio indicadas. No tocar migrations. No tocar API/ ni front/ legacy.
