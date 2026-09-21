@@ -3,6 +3,7 @@
 import { cookies } from "next/headers";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { requireSession } from "@/src/features/admin/service";
+import { listEmployees } from "@/src/features/admin/service";
 import { resolveSede } from "@/src/features/admin/service";
 import {
   PayrollError,
@@ -134,10 +135,10 @@ export async function setVoucherLimitsAction(input: unknown) {
   }
 }
 
-/** Misma lógica que POST /api/v1/vouchers (cualquier rol de la sede). */
+/** Misma lógica que POST /api/v1/vouchers (admin/caja: emitir vales). */
 export async function requestVoucherAction(input: unknown) {
   try {
-    const session = await requireSession(await sessionToken());
+    const session = await requirePayrollPayer(await sessionToken());
     const data = await requestVoucher(input, {
       userId: session.userId,
       sedeId: session.sedeId,
@@ -148,13 +149,20 @@ export async function requestVoucherAction(input: unknown) {
   }
 }
 
-/** Vales de la sede (requiere sesión; empleado ve los suyos vía filtro; máx. 50 por defecto). */
+/** Vales de la sede (admin/caja ven todo; empleado solo los suyos; máx. 50 por defecto). */
 export async function listVouchersAction(input: { status?: string; employee_id?: string; sede_id?: string; limit?: number }) {
   try {
     const session = await requireSession(await sessionToken());
-    const data = await listVouchers(resolveSede(session.sedeId, input.sede_id), {
+    const sedeId = resolveSede(session.sedeId, input.sede_id);
+    const isManager = session.roles.includes("admin") || session.roles.includes("caja");
+    let employeeId = input.employee_id;
+    if (!isManager) {
+      const mine = (await listEmployees(sedeId)).find((row) => row.user_id === session.userId);
+      employeeId = mine?.id ?? "sin-acceso";
+    }
+    const data = await listVouchers(sedeId, {
       status: input.status,
-      employee_id: input.employee_id,
+      employee_id: employeeId,
       limit: input.limit,
     });
     return { success: true as const, data };

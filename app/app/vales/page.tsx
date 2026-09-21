@@ -39,6 +39,13 @@ export default async function ValesPage() {
     listVouchers(sedeId),
   ]);
 
+  const isAdmin = session.roles.includes("admin");
+  const canIssue = isAdmin || session.roles.includes("caja");
+  // Empleado: solo sus vales y sin nómina de empleados (no ve el personal).
+  const ownId = canIssue
+    ? undefined
+    : employees.find((row) => row.user_id === session.user.id)?.id ?? "sin-acceso";
+
   return (
     <main className="mx-auto flex min-h-screen max-w-4xl flex-col gap-6 px-6 py-12">
       <header>
@@ -48,10 +55,11 @@ export default async function ValesPage() {
         </p>
       </header>
       <VouchersClient
-        initialEmployees={employees}
+        initialEmployees={canIssue ? employees : []}
         initialSettings={settings}
-        initialVouchers={vouchers}
-        canAdmin={session.roles.includes("admin")}
+        initialVouchers={ownId ? vouchers.filter((row) => row.employee_id === ownId) : vouchers}
+        canAdmin={isAdmin}
+        canIssue={canIssue}
       />
     </main>
   );

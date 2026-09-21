@@ -52,6 +52,7 @@ interface VouchersClientProps {
   initialSettings: VoucherSettingsRow | null;
   initialVouchers: VoucherRequestRow[];
   canAdmin: boolean;
+  canIssue: boolean;
 }
 
 export function VouchersClient(props: VouchersClientProps) {
@@ -196,6 +197,7 @@ export function VouchersClient(props: VouchersClientProps) {
             </button>
           </form>
         )}
+        {props.canIssue && (
         <form onSubmit={handleRequestVoucher} className="mt-4 flex flex-wrap items-end gap-3">
           <label className={labelClass}>
             Empleado
@@ -226,6 +228,7 @@ export function VouchersClient(props: VouchersClientProps) {
             Solicitar vale
           </button>
         </form>
+        )}
         <ul className="mt-4 flex flex-col gap-2">
           {vouchers.map((row) => (
             <li key={row.id} className="flex flex-wrap items-center gap-2 text-sm">
