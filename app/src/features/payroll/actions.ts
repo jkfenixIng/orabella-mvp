@@ -100,11 +100,16 @@ export async function listPeriodsAction() {
 }
 
 /** Detalle del periodo con ítems y saldos (requiere sesión, solo su sede). */
+/** Detalle del periodo (admin/caja/pagador ven todo; empleado solo sus ítems). */
 export async function getPeriodDetailAction(id: string) {
   try {
     const session = await requireSession(await sessionToken());
     const data = await getPeriodDetail(session.sedeId, id);
-    return { success: true as const, data };
+    const isManager = session.roles.includes("admin") || session.roles.includes("caja");
+    if (isManager) return { success: true as const, data };
+    const mine = (await listEmployees(session.sedeId)).find((row) => row.user_id === session.userId);
+    const ownId = mine?.id ?? "sin-acceso";
+    return { success: true as const, data: { ...data, items: data.items.filter((item) => item.employee_id === ownId) } };
   } catch (error) {
     return toFailure(error);
   }
