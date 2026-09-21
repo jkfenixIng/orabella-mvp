@@ -13,30 +13,35 @@ const MODULES = [
     name: "Facturación",
     purpose: "Cree las cuentas de sus clientes y reciba pagos en efectivo, tarjeta o mezcla de ambos.",
     Icon: Receipt,
+    roles: ["admin", "caja", "empleado"],
   },
   {
     href: "/cash",
     name: "Caja",
     purpose: "Abra y cierre turnos, registre movimientos y consulte el arqueo del día.",
     Icon: Wallet,
+    roles: ["admin", "caja"],
   },
   {
     href: "/inventory",
     name: "Inventario",
     purpose: "Controle los productos de la tienda: existencias, entradas, salidas y alertas de poco stock.",
     Icon: Package,
+    roles: ["admin", "caja"],
   },
   {
     href: "/admin",
     name: "Administración",
     purpose: "Gestione empleados, servicios, precios, impuestos y formas de pago de su sede.",
     Icon: Settings,
+    roles: ["admin"],
   },
   {
     href: "/payroll",
     name: "Nómina y vales",
     purpose: "Calcule la nómina del personal desde la facturación y controle vales y aprobaciones.",
     Icon: Calculator,
+    roles: ["admin", "empleado"],
   },
 ] as const;
 
@@ -47,7 +52,11 @@ export default async function HomePage() {
   if (!session) redirect("/login?next=/");
   const sedeId = session.user.sede_id;
 
-  const lowStock = sedeId ? filterLowStock(await listProducts(sedeId)) : [];
+  const visibleModules = MODULES.filter((module) =>
+    module.roles.some((role) => session.roles.includes(role)),
+  );
+  const canSeeInventory = visibleModules.some((module) => module.href === "/inventory");
+  const lowStock = sedeId && canSeeInventory ? filterLowStock(await listProducts(sedeId)) : [];
 
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-4xl flex-col gap-8 px-6 py-12">
@@ -88,7 +97,7 @@ export default async function HomePage() {
 
       <section aria-label="Módulos del sistema">
         <ul className="grid gap-4 sm:grid-cols-2">
-          {MODULES.map((module) => (
+          {visibleModules.map((module) => (
             <li
               key={module.href}
               className="flex flex-col gap-2 rounded-lg border border-slate-300 p-4 dark:border-slate-700"

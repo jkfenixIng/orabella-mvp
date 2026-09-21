@@ -11,6 +11,7 @@ interface NavLink {
   label: string;
   description: string;
   Icon: LucideIcon;
+  roles: string[];
 }
 
 interface NavGroup {
@@ -29,8 +30,9 @@ const NAV_GROUPS: NavGroup[] = [
           label: "Facturación",
           description: "Crear y cobrar facturas",
           Icon: Receipt,
+          roles: ["admin", "caja", "empleado"],
         },
-        { href: "/cash", label: "Caja", description: "Turnos y cierre del día", Icon: Wallet },
+        { href: "/cash", label: "Caja", description: "Turnos y cierre del día", Icon: Wallet, roles: ["admin", "caja"] },
       ],
   },
   {
@@ -42,12 +44,14 @@ const NAV_GROUPS: NavGroup[] = [
           label: "Inventario",
           description: "Productos y existencias",
           Icon: Package,
+          roles: ["admin", "caja"],
         },
         {
           href: "/admin",
           label: "Administración",
           description: "Empleados, servicios y precios",
           Icon: Settings,
+          roles: ["admin"],
         },
       ],
   },
@@ -60,6 +64,7 @@ const NAV_GROUPS: NavGroup[] = [
           label: "Nómina y vales",
           description: "Pagos al personal",
           Icon: Calculator,
+          roles: ["admin", "empleado"],
         },
       ],
   },
@@ -73,9 +78,14 @@ function groupHasActive(pathname: string, group: NavGroup): boolean {
   return group.links.some((link) => isActive(pathname, link.href));
 }
 
-export function MainNav() {
+export function MainNav({ roles }: { roles: string[] }) {
   const pathname = usePathname();
   const router = useRouter();
+  // Fail closed: without roles only Inicio is visible.
+  const visibleGroups: NavGroup[] = NAV_GROUPS.map((group) => ({
+    ...group,
+    links: group.links.filter((link) => link.roles.some((role) => roles.includes(role))),
+  })).filter((group) => group.links.length > 0);
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>(() =>
     Object.fromEntries(NAV_GROUPS.map((group) => [group.id, groupHasActive(pathname, group)])),
   );
@@ -124,7 +134,7 @@ export function MainNav() {
         <House className="h-4 w-4" aria-hidden="true" />
         Inicio
       </Link>
-      {NAV_GROUPS.map((group) => {
+      {visibleGroups.map((group) => {
         const open = openGroups[group.id] ?? false;
         const active = groupHasActive(pathname, group);
         return (
@@ -277,7 +287,7 @@ export function MainNav() {
             >
               ⌂
             </Link>
-            {NAV_GROUPS.flatMap((group) =>
+            {visibleGroups.flatMap((group) =>
               group.links.map((link) => (
                 <Link
                   key={link.href}

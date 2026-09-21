@@ -22,6 +22,7 @@ export default async function PayrollPage() {
   const token = store.get(SESSION_COOKIE_NAME)?.value;
   const session = await getSessionUser(token);
   if (!session) redirect("/login?next=/payroll");
+  if (!session.roles.includes("admin") && !session.roles.includes("empleado")) redirect("/");
 
   const sedeId = session.user.sede_id;
   if (!sedeId) {

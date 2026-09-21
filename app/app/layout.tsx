@@ -4,6 +4,8 @@ import Script from "next/script";
 import type { ReactNode } from "react";
 import { ThemeProvider } from "@/src/shared/components/theme-provider";
 import { AppShell } from "@/src/shared/components/app-shell";
+import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
+import { getSessionUser } from "@/src/features/auth/service";
 import {
   parseThemePreference,
   themeInitScript,
@@ -27,6 +29,10 @@ export default async function RootLayout({ children }: RootLayoutProps) {
   // never flashes the opposite theme. "system"/missing is resolved
   // pre-paint by the blocking script below.
   const initialClass = preference === "dark" ? "dark" : undefined;
+  // Roles for menu visibility (fail closed: no session means no entries).
+  // Login pages skip the nav entirely, so this only feeds MainNav.
+  const session = await getSessionUser(cookieStore.get(SESSION_COOKIE_NAME)?.value);
+  const roles = session?.roles ?? [];
 
   return (
     <html lang="es" className={initialClass} suppressHydrationWarning>
@@ -35,7 +41,7 @@ export default async function RootLayout({ children }: RootLayoutProps) {
           {themeInitScript}
         </Script>
         <ThemeProvider>
-          <AppShell>{children}</AppShell>
+          <AppShell roles={roles}>{children}</AppShell>
         </ThemeProvider>
       </body>
     </html>
