@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 
 interface NavLink {
@@ -73,6 +73,12 @@ export function MainNav() {
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>(() =>
     Object.fromEntries(NAV_GROUPS.map((group) => [group.id, groupHasActive(pathname, group)])),
   );
+
+  useEffect(() => {
+    setOpenGroups(
+      Object.fromEntries(NAV_GROUPS.map((group) => [group.id, groupHasActive(pathname, group)])),
+    );
+  }, [pathname]);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);

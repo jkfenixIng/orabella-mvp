@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useState, useTransition, type FormEvent } from "react";
+import { Banknote, CalendarDays, Clock3, Coins, ReceiptText, X } from "lucide-react";
 import {
   closeShiftAction,
   getDayViewAction,
@@ -16,17 +17,48 @@ import type {
   HistoryResult,
 } from "@/src/features/cash/service";
 import type { PaymentMethodRow } from "@/src/features/admin/service";
+import { Badge } from "@/src/components/ui/lib/badge";
+import { Button } from "@/src/components/ui/lib/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/src/components/ui/lib/card";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/src/components/ui/lib/dialog";
+import { Input } from "@/src/components/ui/lib/input";
+import { Label } from "@/src/components/ui/lib/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/src/components/ui/lib/select";
+import { cn } from "@/src/components/ui/lib/utils";
 
-const inputClass =
-  "rounded border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900";
-const labelClass = "flex flex-col gap-1 text-sm";
-const buttonClass =
-  "rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900";
-const ghostClass =
-  "rounded border border-slate-300 px-3 py-2 text-sm dark:border-slate-700";
-const sectionClass = "rounded-lg border border-slate-300 p-4 dark:border-slate-700";
-const errorClass = "text-sm text-red-600 dark:text-red-400";
-const okClass = "text-sm text-green-700 dark:text-green-400";
+const sectionClass = cn(
+  "rounded-lg border border-border-color bg-surface p-4 shadow-sm",
+  "dark:border-border-color-2",
+);
+const labelClass = cn("flex flex-col gap-1 text-sm text-text-primary");
+const inputClass = cn(
+  "rounded-md border border-border-color bg-surface px-3 py-2 text-sm text-text-primary shadow-sm",
+  "dark:border-border-color-2",
+);
+const buttonClass = cn(
+  "inline-flex items-center justify-center gap-2 rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-all duration-200 hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
+);
+const ghostClass = cn(
+  "inline-flex items-center justify-center gap-2 rounded-md border border-border-color bg-transparent px-4 py-2 text-sm font-medium text-text-primary shadow-sm transition-all duration-200 hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
+  "dark:border-border-color-2 dark:hover:bg-surface-hover",
+);
+const errorClass = cn("text-sm text-error", "dark:text-error");
+const okClass = cn("text-sm text-success", "dark:text-success");
 
 type ActionResult<T> =
   | { success: true; data: T }
@@ -90,6 +122,12 @@ export function CashClient(props: CashClientProps) {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [isOpeningDialogOpen, setIsOpeningDialogOpen] = useState(false);
+  const [isPaymentDialogOpen, setIsPaymentDialogOpen] = useState(false);
+  const [isClosingDialogOpen, setIsClosingDialogOpen] = useState(false);
+  // Transición para los cambios de vista (día/historial): la UI no se
+  // congela mientras la server action responde.
+  const [isViewPending, startViewTransition] = useTransition();
 
   const register = registers[0] ?? day.register;
   const baseConfigurada = Number(register?.base_configurada ?? 200000);
@@ -118,6 +156,7 @@ export function CashClient(props: CashClientProps) {
       if (result.success) {
         showResult(result, `Turno abierto con base ${formatMoney(result.data.opening_base)}.`);
         setOpenShift(result.data);
+        setIsOpeningDialogOpen(false);
         const dayResult = await getDayViewAction({ fecha: dayFecha, sede_id: props.sedeId });
         if (dayResult.success) setDay(dayResult.data);
       } else {
@@ -151,6 +190,7 @@ export function CashClient(props: CashClientProps) {
         );
         setPaymentAmount("");
         setPaymentInvoice("");
+        setIsPaymentDialogOpen(false);
         await refreshOpenShift();
         const dayResult = await getDayViewAction({ fecha: dayFecha, sede_id: props.sedeId });
         if (dayResult.success) setDay(dayResult.data);
@@ -194,6 +234,7 @@ export function CashClient(props: CashClientProps) {
         setCountedCash("");
         setBaseLeft("");
         setObservation("");
+        setIsClosingDialogOpen(false);
         const dayResult = await getDayViewAction({ fecha: dayFecha, sede_id: props.sedeId });
         if (dayResult.success) setDay(dayResult.data);
         const histResult = await getHistoryAction({
@@ -210,32 +251,36 @@ export function CashClient(props: CashClientProps) {
     }
   }
 
-  async function handleDay(event: FormEvent): Promise<void> {
+  function handleDay(event: FormEvent): void {
     event.preventDefault();
-    setBusy(true);
-    try {
-      const result = await getDayViewAction({ fecha: dayFecha, sede_id: props.sedeId });
-      if (!showResult(result, `Vista del día ${dayFecha} actualizada.`)) return;
-      setDay(result.data);
-    } finally {
-      setBusy(false);
-    }
+    startViewTransition(async () => {
+      setBusy(true);
+      try {
+        const result = await getDayViewAction({ fecha: dayFecha, sede_id: props.sedeId });
+        if (!showResult(result, `Vista del día ${dayFecha} actualizada.`)) return;
+        setDay(result.data);
+      } finally {
+        setBusy(false);
+      }
+    });
   }
 
-  async function handleHistory(event: FormEvent): Promise<void> {
+  function handleHistory(event: FormEvent): void {
     event.preventDefault();
-    setBusy(true);
-    try {
-      const result = await getHistoryAction({
-        desde: histDesde,
-        hasta: histHasta,
-        sede_id: props.sedeId,
-      });
-      if (!showResult(result, `Historial ${histDesde} … ${histHasta} actualizado.`)) return;
-      setHistory(result.data);
-    } finally {
-      setBusy(false);
-    }
+    startViewTransition(async () => {
+      setBusy(true);
+      try {
+        const result = await getHistoryAction({
+          desde: histDesde,
+          hasta: histHasta,
+          sede_id: props.sedeId,
+        });
+        if (!showResult(result, `Historial ${histDesde} … ${histHasta} actualizado.`)) return;
+        setHistory(result.data);
+      } finally {
+        setBusy(false);
+      }
+    });
   }
 
   return (
@@ -380,7 +425,7 @@ export function CashClient(props: CashClientProps) {
         </section>
       )}
 
-      <section className={sectionClass}>
+      <section className={sectionClass} aria-busy={isViewPending}>
         <h2 className="text-lg font-semibold">Vista del día</h2>
         <form onSubmit={handleDay} className="mt-3 flex flex-wrap items-end gap-3">
           <label className={labelClass}>
@@ -392,8 +437,8 @@ export function CashClient(props: CashClientProps) {
               onChange={(event) => setDayFecha(event.target.value)}
             />
           </label>
-          <button type="submit" className={ghostClass} disabled={busy}>
-            Ver día
+          <button type="submit" className={ghostClass} disabled={busy || isViewPending}>
+            {isViewPending ? "Actualizando…" : "Ver día"}
           </button>
         </form>
         <div className="mt-3 overflow-x-auto">
@@ -443,7 +488,7 @@ export function CashClient(props: CashClientProps) {
         </p>
       </section>
 
-      <section className={sectionClass}>
+      <section className={sectionClass} aria-busy={isViewPending}>
         <h2 className="text-lg font-semibold">Historial</h2>
         <form onSubmit={handleHistory} className="mt-3 flex flex-wrap items-end gap-3">
           <label className={labelClass}>
@@ -464,8 +509,8 @@ export function CashClient(props: CashClientProps) {
               onChange={(event) => setHistHasta(event.target.value)}
             />
           </label>
-          <button type="submit" className={ghostClass} disabled={busy}>
-            Filtrar
+          <button type="submit" className={ghostClass} disabled={busy || isViewPending}>
+            {isViewPending ? "Filtrando…" : "Filtrar"}
           </button>
         </form>
         <ul className="mt-3 flex flex-col gap-2 text-sm">
