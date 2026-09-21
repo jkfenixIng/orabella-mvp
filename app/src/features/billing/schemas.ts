@@ -1,0 +1,250 @@
+import { z } from "zod";
+
+/** FAC-01: un solo origen por línea (producto O servicio O custom). */
+export const invoiceItemTypeSchema = z.enum(["producto", "servicio", "custom"]);
+export type InvoiceItemType = z.infer<typeof invoiceItemTypeSchema>;
+
+/** FAC-04: estados de la factura interna (sin borrado, solo transiciones). */
+export const invoiceStatusSchema = z.enum(["Emitida", "Pagada", "Anulada"]);
+export type InvoiceStatus = z.infer<typeof invoiceStatusSchema>;
+
+const uuidSchema = z.uuid("Identificador inválido.");
+
+/** Tolerancia de centavo al comparar sumas de dinero (redondeo a 2 dec). */
+export const MONEY_EPSILON = 0.01;
+
+/** Redondea a 2 decimales (numérico de dinero numeric(12,2)). */
+export function roundMoney(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+/** true cuando dos montos cuadran dentro de la tolerancia de centavo. */
+export function moneyEquals(a: number, b: number): boolean {
+  return Math.abs(a - b) < MONEY_EPSILON;
+}
+
+const moneySchema = (label: string) =>
+  z.coerce.number().nonnegative(`${label} no puede ser negativo.`);
+
+/**
+ * FAC-01/FAC-02: línea de factura. El origen único se valida en
+ * superRefine (mismo mensaje claro a nivel app que el CHECK SQL):
+ * producto exige product_id, servicio exige service_id, custom exige
+ * custom_name con valor. employee_id siempre requerido (base T7).
+ */
+export const invoiceItemSchema = z
+  .object({
+    item_type: invoiceItemTypeSchema,
+    product_id: uuidSchema.nullish(),
+    service_id: uuidSchema.nullish(),
+    custom_name: z.string().trim().max(120, "Nombre muy largo.").nullish(),
+    employee_id: uuidSchema,
+    qty: z.coerce.number().int("Cantidad entera.").positive("La cantidad debe ser mayor a 0."),
+    unit_price: moneySchema("El precio"),
+    discount: moneySchema("El descuento").default(0),
+  })
+  .superRefine((value, context) => {
+    const fail = (message: string) => context.addIssue({ code: "custom", message });
+    switch (value.item_type) {
+      case "producto":
+        if (!value.product_id) fail("La línea de producto exige un producto.");
+        if (value.service_id) fail("La línea de producto no lleva servicio.");
+        if (value.custom_name?.trim()) fail("La línea de producto no lleva nombre personalizado.");
+        break;
+      case "servicio":
+        if (!value.service_id) fail("La línea de servicio exige un servicio.");
+        if (value.product_id) fail("La línea de servicio no lleva producto.");
+        if (value.custom_name?.trim()) fail("La línea de servicio no lleva nombre personalizado.");
+        break;
+      case "custom":
+        if (!value.custom_name?.trim()) fail("La línea personalizada exige un nombre.");
+        if (value.product_id) fail("La línea personalizada no lleva producto.");
+        if (value.service_id) fail("La línea personalizada no lleva servicio.");
+        break;
+    }
+    const lineGross = value.qty * value.unit_price;
+    if (value.discount > lineGross) {
+      fail("El descuento de la línea no puede superar su valor bruto.");
+    }
+  });
+export type InvoiceItemInput = z.infer<typeof invoiceItemSchema>;
+
+/** FAC-07: porción del cobro con su método de pago (monto > 0). */
+export const paymentPortionSchema = z.object({
+  method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
+  amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+});
+export type PaymentPortionInput = z.infer<typeof paymentPortionSchema>;
+
+/** FAC-01…07: creación de factura (descuento a nivel factura + porciones). */
+export const createInvoiceSchema = z.object({
+  client_name: z.string().trim().min(1, "Nombre del cliente requerido.").max(120, "Nombre muy largo."),
+  client_document: z.string().trim().max(20, "Documento inválido.").nullish(),
+  items: z.array(invoiceItemSchema).min(1, "La factura exige al menos un ítem."),
+  discount: moneySchema("El descuento").default(0),
+  payments: z.array(paymentPortionSchema).default([]),
+});
+export type CreateInvoiceInput = z.infer<typeof createInvoiceSchema>;
+
+/** FAC-04: anulación con motivo obligatorio (sin borrado). */
+export const annulInvoiceSchema = z.object({
+  motivo: z.string().trim().min(1, "El motivo de anulación es requerido.").max(500, "Motivo muy largo."),
+});
+export type AnnulInvoiceInput = z.infer<typeof annulInvoiceSchema>;
+
+/** FAC-07: cobro dividido (las porciones deben cuadrar con el saldo). */
+export const splitPaymentSchema = z.object({
+  portions: z.array(paymentPortionSchema).min(1, "Indique al menos una porción de pago."),
+});
+export type SplitPaymentInput = z.infer<typeof splitPaymentSchema>;
+
+// ------------------------------------------------------------ cálculos puros ---
+
+export interface ComputedLine {
+  gross: number;
+  discount: number;
+  subtotal: number;
+}
+
+/** Subtotal de una línea: qty × precio − descuento de línea. */
+export function computeLineSubtotal(item: { qty: number; unit_price: number; discount: number }): ComputedLine {
+  const gross = roundMoney(item.qty * item.unit_price);
+  const discount = roundMoney(Math.min(item.discount, gross));
+  return { gross, discount, subtotal: roundMoney(gross - discount) };
+}
+
+export interface ActiveTax {
+  code: string;
+  name: string;
+  percent: number;
+}
+
+export interface TaxSnapshot {
+  tax_code: string;
+  tax_name: string;
+  percent: number;
+  amount: number;
+}
+
+/**
+ * FAC-03: snapshot de los impuestos ACTIVOS sobre la base
+ * (subtotal − descuento de factura). Los inactivos se excluyen (suman 0).
+ * Puro para probarlo sin base de datos.
+ */
+export function snapshotInvoiceTaxes(activeTaxes: ActiveTax[], base: number): TaxSnapshot[] {
+  const taxable = Math.max(0, roundMoney(base));
+  return activeTaxes.map((tax) => ({
+    tax_code: tax.code,
+    tax_name: tax.name,
+    percent: tax.percent,
+    amount: roundMoney((taxable * tax.percent) / 100),
+  }));
+}
+
+export interface InvoiceTotals {
+  subtotal: number;
+  discount: number;
+  base: number;
+  taxes: TaxSnapshot[];
+  tax: number;
+  total: number;
+}
+
+/**
+ * FAC-01/FAC-03: total = subtotal − descuento + impuestos (snapshot).
+ * Lanza DESCUENTO_EXCEDE cuando el descuento supera el subtotal.
+ * Puro para probarlo sin base de datos.
+ */
+export function computeInvoiceTotals(args: {
+  items: Array<{ qty: number; unit_price: number; discount: number }>;
+  discount: number;
+  activeTaxes: ActiveTax[];
+}): InvoiceTotals {
+  const subtotal = roundMoney(
+    args.items.reduce((acc, item) => acc + computeLineSubtotal(item).subtotal, 0),
+  );
+  const discount = roundMoney(args.discount);
+  if (discount - subtotal > MONEY_EPSILON) {
+    throw new Error("DESCUENTO_EXCEDE");
+  }
+  const base = roundMoney(Math.max(0, subtotal - discount));
+  const taxes = snapshotInvoiceTaxes(args.activeTaxes, base);
+  const tax = roundMoney(taxes.reduce((acc, row) => acc + row.amount, 0));
+  return { subtotal, discount, base, taxes, tax, total: roundMoney(base + tax) };
+}
+
+export interface SplitCheck {
+  paid: number;
+  remaining: number;
+  fullyPaid: boolean;
+}
+
+/**
+ * FAC-07: valida porciones nuevas contra el saldo pendiente. Lanza
+ * SOBREPAGO si exceden el saldo. Puro para probarlo sin base de datos.
+ */
+export function applyPaymentSplit(args: {
+  paidSoFar: number;
+  portions: Array<{ amount: number }>;
+  total: number;
+}): SplitCheck {
+  const incoming = roundMoney(args.portions.reduce((acc, row) => acc + row.amount, 0));
+  if (incoming <= 0) throw new Error("PORCION_INVALIDA");
+  const paid = roundMoney(args.paidSoFar + incoming);
+  if (paid - args.total > MONEY_EPSILON) throw new Error("SOBREPAGO");
+  const remaining = roundMoney(Math.max(0, args.total - paid));
+  return { paid, remaining, fullyPaid: moneyEquals(paid, args.total) };
+}
+
+/** Las porciones de una llamada deben sumar exactamente el saldo pendiente. */
+export function portionsMatchBalance(portions: Array<{ amount: number }>, balance: number): boolean {
+  const sum = roundMoney(portions.reduce((acc, row) => acc + row.amount, 0));
+  return moneyEquals(sum, balance);
+}
+
+// ------------------------------------------------------------------ estados ---
+
+/** FAC-04: solo Emitida/Pagada admiten anulación (Anulada es terminal). */
+export function canAnnulStatus(status: string): boolean {
+  return status === "Emitida" || status === "Pagada";
+}
+
+/** Mensaje de negocio cuando el estado no admite anulación. */
+export function annulBlockedMessage(status: string): string {
+  if (status === "Anulada") return "La factura ya está anulada.";
+  return `No se puede anular una factura en estado ${status}.`;
+}
+
+/**
+ * FAC-05: reserva N números consecutivos desde el último emitido.
+ * Simula la serie que next_invoice_number() produce bajo lock
+ * (SELECT … FOR UPDATE): 1..N únicos y continuos. Puro para probar la
+ * propiedad sin concurrencia real de BD (ver tests).
+ */
+export function nextConsecutiveNumbers(lastNumber: number, count: number): number[] {
+  if (!Number.isInteger(count) || count <= 0) throw new Error("CONTEO_INVALIDO");
+  return Array.from({ length: count }, (_, index) => lastNumber + index + 1);
+}
+
+/**
+ * FAC-06: movimientos IN de reversión por cada ítem de producto de la
+ * factura anulada. El motivo lleva el consecutivo + motivo de anulación
+ * (auditoría en el kardex). Puro para probarlo sin base de datos.
+ */
+export function buildReversalReasons(args: {
+  consecutiveNumber: number;
+  motivo: string;
+  productItems: Array<{ product_id: string; qty: number }>;
+}): Array<{ product_id: string; qty: number; reason: string }> {
+  const motivo = args.motivo.trim().slice(0, 200);
+  return args.productItems.map((item) => ({
+    product_id: item.product_id,
+    qty: item.qty,
+    reason: `Reversión factura #${args.consecutiveNumber} — ${motivo}`,
+  }));
+}
+
+/** Motivo OUT de stock al facturar (trazable al consecutivo). */
+export function buildInvoiceOutReason(consecutiveNumber: number, clientName: string): string {
+  return `FACTURA #${consecutiveNumber} — ${clientName.trim().slice(0, 120)}`;
+}
