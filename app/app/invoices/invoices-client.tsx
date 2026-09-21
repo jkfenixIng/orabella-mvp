@@ -115,6 +115,7 @@ interface InvoicesClientProps {
   methods: PaymentMethodRow[];
   canWrite: boolean;
   canAnnul: boolean;
+  detailMode: "full" | "open-only" | "none";
 }
 
 export function InvoicesClient(props: InvoicesClientProps) {
@@ -651,6 +652,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   {formatMoney(row.total)} ·{" "}
                   <Badge variant={invoiceStatusVariant(row.status)}>{row.status}</Badge>
                 </span>
+                {props.detailMode !== "none" && (props.detailMode === "full" || row.status === "Emitida") && (
                 <Dialog open={detailDialogOpen} onOpenChange={(open) => {
                   if (!open) {
                     setDetail(null);
@@ -803,6 +805,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     </DialogContent>
                   )}
                 </Dialog>
+                )}
               </li>
             ))}
             {invoices.length === 0 && (

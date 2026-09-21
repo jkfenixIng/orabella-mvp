@@ -25,7 +25,7 @@ function toFailure(error: unknown): { success: false; code: string; message: str
   return { success: false, code: "INTERNAL", message: "Error interno." };
 }
 
-/** Misma lógica que GET /api/v1/invoices (requiere sesión, solo su sede). */
+/** Misma lógica que GET /api/v1/invoices (requiere sesión, solo su sede; empleado ve solo las propias). */
 export async function listInvoicesAction(filters: {
   sede_id?: string;
   status?: string;
@@ -39,17 +39,26 @@ export async function listInvoicesAction(filters: {
       from: filters.from || undefined,
       to: filters.to || undefined,
     });
-    return { success: true as const, data };
+    const isManager = session.roles.includes("admin") || session.roles.includes("caja");
+    const scoped = isManager ? data : data.filter((row) => row.user_id === session.userId);
+    return { success: true as const, data: scoped };
   } catch (error) {
     return toFailure(error);
   }
 }
 
-/** Misma lógica que GET /api/v1/invoices/:id (requiere sesión, solo su sede). */
+/** Misma lógica que GET /api/v1/invoices/:id (caja no ve detalle de cerradas; empleado solo las propias). */
 export async function getInvoiceAction(id: string) {
   try {
     const session = await requireSession(await sessionToken());
     const data = await getInvoiceDetail(session.sedeId, id);
+    const isManager = session.roles.includes("admin") || session.roles.includes("caja");
+    if (!isManager && data.invoice.user_id !== session.userId) {
+      throw new BillingError("FORBIDDEN", "Sin acceso a esta factura.", 403);
+    }
+    if (session.roles.includes("caja") && !session.roles.includes("admin") && data.invoice.status !== "Emitida") {
+      throw new BillingError("FORBIDDEN", "Factura cerrada: solo lectura del listado.", 403);
+    }
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

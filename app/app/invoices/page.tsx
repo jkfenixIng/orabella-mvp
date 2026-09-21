@@ -45,6 +45,10 @@ export default async function InvoicesPage() {
   ]);
 
   const canWrite = session.roles.includes("admin") || session.roles.includes("caja");
+  const isAdmin = session.roles.includes("admin");
+  const isManager = isAdmin || session.roles.includes("caja");
+  // Empleado: solo sus facturas (emitidas por su usuario), sin detalle.
+  const visibleInvoices = isManager ? invoices : invoices.filter((row) => row.user_id === session.user.id);
 
   return (
     <main className="mx-auto flex min-h-screen max-w-5xl flex-col gap-6 px-6 py-12">
@@ -58,13 +62,14 @@ export default async function InvoicesPage() {
       </header>
       <InvoicesClient
         sedeId={sedeId}
-        initialInvoices={invoices}
+        initialInvoices={visibleInvoices}
         products={products}
         services={services}
         employees={employees.filter((row) => row.is_active)}
         methods={methods.filter((row) => row.is_active)}
         canWrite={canWrite}
         canAnnul={session.roles.includes("admin")}
+        detailMode={isAdmin ? "full" : isManager ? "open-only" : "none"}
       />
     </main>
   );
