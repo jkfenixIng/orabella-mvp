@@ -97,7 +97,6 @@ export function CashClient(props: CashClientProps) {
   const [histDesde, setHistDesde] = useState(props.initialHistory.desde);
   const [histHasta, setHistHasta] = useState(props.initialHistory.hasta);
 
-  const [countedCash, setCountedCash] = useState("");
   const [baseLeft, setBaseLeft] = useState("");
   const [observation, setObservation] = useState("");
 
@@ -109,6 +108,9 @@ export function CashClient(props: CashClientProps) {
   const [denominations, setDenominations] = useState<Array<{ id: string; kind: string; value: number }>>([]);
   const [openCounts, setOpenCounts] = useState<Record<string, string>>({});
   const [openDigitals, setOpenDigitals] = useState<Record<string, string>>({});
+  const [closeCounts, setCloseCounts] = useState<Record<string, string>>({});
+  const [closeDigitals, setCloseDigitals] = useState<Record<string, string>>({});
+  const [closeStep, setCloseStep] = useState<"counts" | "confirm">("counts");
   // Transición para los cambios de vista (día/historial): la UI no se
   // congela mientras la server action responde.
   const [isViewPending, startViewTransition] = useTransition();
@@ -133,6 +135,39 @@ export function CashClient(props: CashClientProps) {
     setIsOpeningDialogOpen(true);
     const result = await listDenominationsAction();
     if (result.success) setDenominations(result.data);
+  }
+
+  function closeCashTotal(): number {
+    return denominations.reduce((acc, denom) => {
+      const qty = Number(closeCounts[denom.id] ?? "0");
+      return acc + (Number.isFinite(qty) ? qty : 0) * Number(denom.value);
+    }, 0);
+  }
+
+  async function startClosing() {
+    setCloseCounts({});
+    setCloseDigitals({});
+    setCloseStep("counts");
+    setIsClosingDialogOpen(true);
+    const result = await listDenominationsAction();
+    if (result.success) setDenominations(result.data);
+  }
+
+  function buildCloseCounts(): Array<{ method_code: string; denomination: number | null; quantity: number; amount: number }> {
+    return [
+      ...denominations.map((denom) => {
+        const qty = Math.max(0, Math.floor(Number(closeCounts[denom.id] ?? "0")) || 0);
+        return { method_code: "efectivo", denomination: Number(denom.value), quantity: qty, amount: qty * Number(denom.value) };
+      }),
+      ...props.methods
+        .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
+        .map((method) => ({
+          method_code: method.code,
+          denomination: null,
+          quantity: 1,
+          amount: Number((closeDigitals[method.code] ?? "").replace(/\D/g, "")) || 0,
+        })),
+    ];
   }
 
   function openCashTotal(): number {
@@ -178,12 +213,7 @@ export function CashClient(props: CashClientProps) {
   async function handleClose(event: FormEvent): Promise<void> {
     event.preventDefault();
     if (!openShift) return;
-    const counted = toNumber(countedCash);
     const base = toNumber(baseLeft);
-    if (counted === null || counted < 0) {
-      setError("El conteo de efectivo es obligatorio para cerrar.");
-      return;
-    }
     if (base === null || base < 0) {
       setError("La base dejada es obligatoria.");
       return;
@@ -194,20 +224,44 @@ export function CashClient(props: CashClientProps) {
       );
       return;
     }
+    if (closeStep === "counts") {
+      setError(null);
+      setCloseStep("confirm");
+      return;
+    }
+    const counted = closeCashTotal();
     setBusy(true);
     try {
       const result = await closeShiftAction(openShift.id, {
         counted_cash: counted,
         base_left: base,
         observation: observation.trim() || undefined,
+        counts: buildCloseCounts(),
+        confirmed: true,
       });
       if (result.success) {
-        showResult(result, `Turno cerrado. Recogido ${formatMoney(result.data.shift.cash_withdrawn)}.`);
+        const row = result.data.shift;
+        const digitalDiff = result.data.methodDifferences;
+        const baseDiff = Number(row.base_difference ?? 0);
+        const envelope = Number(row.cash_withdrawn ?? 0);
         setOpenShift(null);
-        setCountedCash("");
         setBaseLeft("");
         setObservation("");
+        setCloseCounts({});
+        setCloseDigitals({});
+        setCloseStep("counts");
         setIsClosingDialogOpen(false);
+        if (digitalDiff.length === 0 && baseDiff >= 0) {
+          showResult(result, `Turno cerrado. Base ${formatMoney(row.base_left)} · sobre ${formatMoney(envelope)}.`);
+        } else {
+          const parts = digitalDiff.map(
+            (d) => `${d.method_code}: declarado ${formatMoney(d.declared)}, esperado ${formatMoney(d.expected)}`,
+          );
+          if (baseDiff < 0) parts.push(`base incompleta (faltante ${formatMoney(-baseDiff)})`);
+          if (baseDiff > 0) parts.push(`sobrante en base ${formatMoney(baseDiff)}`);
+          setError(null);
+          setNotice(`Cierre con diferencias: ${parts.join(" · ")}. Sobre ${formatMoney(envelope)}. Se informó a los administradores.`);
+        }
         const dayResult = await getDayViewAction({ fecha: dayFecha, sede_id: props.sedeId });
         if (dayResult.success) setDay(dayResult.data);
         const histResult = await getHistoryAction({
@@ -217,6 +271,7 @@ export function CashClient(props: CashClientProps) {
         });
         if (histResult.success) setHistory(histResult.data);
       } else {
+        if (result.code === "COUNT_MISMATCH") setCloseStep("counts");
         showResult(result, "");
       }
     } finally {
@@ -282,7 +337,7 @@ export function CashClient(props: CashClientProps) {
             </p>
             {props.canWrite && (
               <div className="mt-3 flex flex-wrap gap-2">
-                <button type="button" onClick={() => setIsClosingDialogOpen(true)} className={buttonClass}>
+                <button type="button" onClick={startClosing} className={buttonClass}>
                   Cerrar turno
                 </button>
               </div>
@@ -374,44 +429,86 @@ export function CashClient(props: CashClientProps) {
             <DialogHeader>
               <DialogTitle>Cerrar turno</DialogTitle>
             </DialogHeader>
-            <form onSubmit={handleClose} className="mt-3 flex flex-wrap items-end gap-3">
-            <label className={labelClass}>
-              Conteo de efectivo (obligatorio)
-              <input
-                className={inputClass}
-                value={formatMoneyInput(countedCash)}
-                onChange={(event) => setCountedCash(stripMoneyInput(event.target.value))}
-                inputMode="numeric"
-                placeholder="400.000"
-              />
-            </label>
-            <label className={labelClass}>
-              Base dejada (obligatoria)
-              <input
-                className={inputClass}
-                value={formatMoneyInput(baseLeft)}
-                onChange={(event) => setBaseLeft(stripMoneyInput(event.target.value))}
-                inputMode="numeric"
-                placeholder="200.000"
-              />
-            </label>
-            <label className={labelClass}>
-              Observación (obligatoria si la base queda incompleta)
-              <input
-                className={inputClass}
-                value={observation}
-                onChange={(event) => setObservation(event.target.value)}
-                placeholder="Faltante de 150000…"
-              />
-            </label>
+            <form onSubmit={handleClose} className="mt-3 flex flex-col gap-3">
+            {closeStep === "counts" ? (
+              <>
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                  {denominations.map((denom) => (
+                    <label key={denom.id} className={labelClass}>
+                      {denom.kind} {formatMoney(denom.value)}
+                      <input
+                        className={inputClass}
+                        value={closeCounts[denom.id] ?? ""}
+                        onChange={(event) =>
+                          setCloseCounts((prev) => ({ ...prev, [denom.id]: event.target.value.replace(/\D/g, "") }))
+                        }
+                        inputMode="numeric"
+                        placeholder="0"
+                      />
+                    </label>
+                  ))}
+                </div>
+                <p className="text-sm font-semibold">Efectivo contado: {formatMoney(closeCashTotal())}</p>
+                {props.methods
+                  .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
+                  .map((method) => (
+                    <label key={method.id} className={labelClass}>
+                      {method.name} (total en la aplicación)
+                      <input
+                        className={inputClass}
+                        value={formatMoneyInput(closeDigitals[method.code] ?? "")}
+                        onChange={(event) =>
+                          setCloseDigitals((prev) => ({ ...prev, [method.code]: stripMoneyInput(event.target.value) }))
+                        }
+                        inputMode="numeric"
+                        placeholder="0"
+                      />
+                    </label>
+                  ))}
+                <label className={labelClass}>
+                  Base dejada (obligatoria)
+                  <input
+                    className={inputClass}
+                    value={formatMoneyInput(baseLeft)}
+                    onChange={(event) => setBaseLeft(stripMoneyInput(event.target.value))}
+                    inputMode="numeric"
+                    placeholder="200.000"
+                  />
+                </label>
+                <label className={labelClass}>
+                  Observación (obligatoria si la base queda incompleta)
+                  <input
+                    className={inputClass}
+                    value={observation}
+                    onChange={(event) => setObservation(event.target.value)}
+                    placeholder="Faltante de 150000…"
+                  />
+                </label>
+              </>
+            ) : (
+              <div className="flex flex-col gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-800 dark:bg-amber-950">
+                <p className="font-semibold">¿Está seguro de cerrar?</p>
+                <p>
+                  Efectivo contado {formatMoney(closeCashTotal())} · base que queda{" "}
+                  {formatMoney(toNumber(baseLeft) ?? 0)} · sobre {formatMoney(closeCashTotal() - (toNumber(baseLeft) ?? 0))}.
+                </p>
+                <p>Después del cierre ya no podrá modificarlo. Solo un administrador puede editarlo y queda registrado.</p>
+              </div>
+            )}
             <DialogFooter>
-              <DialogClose asChild>
-                <button type="button" className={ghostClass}>
-                  Cancelar
+              {closeStep === "confirm" ? (
+                <button type="button" className={ghostClass} onClick={() => setCloseStep("counts")}>
+                  Volver
                 </button>
-              </DialogClose>
+              ) : (
+                <DialogClose asChild>
+                  <button type="button" className={ghostClass}>
+                    Cancelar
+                  </button>
+                </DialogClose>
+              )}
               <button type="submit" className={buttonClass} disabled={busy}>
-                Cerrar turno
+                {closeStep === "counts" ? "Continuar" : "Sí, cerrar turno"}
               </button>
             </DialogFooter>
             </form>
