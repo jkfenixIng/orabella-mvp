@@ -5,9 +5,7 @@ import {
   closeShiftAction,
   getDayViewAction,
   getHistoryAction,
-  getOpenShiftAction,
   openShiftAction,
-  registerPaymentAction,
 } from "@/src/features/cash/actions";
 import type {
   CashRegisterRow,
@@ -98,9 +96,6 @@ export function CashClient(props: CashClientProps) {
   const [histDesde, setHistDesde] = useState(props.initialHistory.desde);
   const [histHasta, setHistHasta] = useState(props.initialHistory.hasta);
 
-  const [paymentMethod, setPaymentMethod] = useState("efectivo");
-  const [paymentAmount, setPaymentAmount] = useState("");
-  const [paymentInvoice, setPaymentInvoice] = useState("");
   const [countedCash, setCountedCash] = useState("");
   const [baseLeft, setBaseLeft] = useState("");
   const [observation, setObservation] = useState("");
@@ -109,7 +104,6 @@ export function CashClient(props: CashClientProps) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [, setIsOpeningDialogOpen] = useState(false);
-  const [isPaymentDialogOpen, setIsPaymentDialogOpen] = useState(false);
   const [isClosingDialogOpen, setIsClosingDialogOpen] = useState(false);
   // Transición para los cambios de vista (día/historial): la UI no se
   // congela mientras la server action responde.
@@ -129,11 +123,6 @@ export function CashClient(props: CashClientProps) {
     return true;
   }
 
-  async function refreshOpenShift(): Promise<void> {
-    const result = await getOpenShiftAction();
-    if (result.success) setOpenShift(result.data);
-  }
-
   async function handleOpen(event: FormEvent): Promise<void> {
     event.preventDefault();
     setBusy(true);
@@ -143,41 +132,6 @@ export function CashClient(props: CashClientProps) {
         showResult(result, `Turno abierto con base ${formatMoney(result.data.opening_base)}.`);
         setOpenShift(result.data);
         setIsOpeningDialogOpen(false);
-        const dayResult = await getDayViewAction({ fecha: dayFecha, sede_id: props.sedeId });
-        if (dayResult.success) setDay(dayResult.data);
-      } else {
-        showResult(result, "");
-      }
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handlePayment(event: FormEvent): Promise<void> {
-    event.preventDefault();
-    const amount = toNumber(paymentAmount);
-    if (amount === null || amount <= 0) {
-      setError("El monto debe ser mayor a 0.");
-      return;
-    }
-    setBusy(true);
-    try {
-      const result = await registerPaymentAction({
-        method_code: paymentMethod,
-        amount,
-        invoice_id: paymentInvoice.trim() || undefined,
-      });
-      if (result.success) {
-        showResult(
-          result,
-          result.data.invoice_id
-            ? `Pago registrado (${formatMoney(amount)}). Factura ${result.data.invoice_status ?? ""}.`
-            : `Pago registrado (${formatMoney(amount)}).`,
-        );
-        setPaymentAmount("");
-        setPaymentInvoice("");
-        setIsPaymentDialogOpen(false);
-        await refreshOpenShift();
         const dayResult = await getDayViewAction({ fecha: dayFecha, sede_id: props.sedeId });
         if (dayResult.success) setDay(dayResult.data);
       } else {
@@ -295,10 +249,7 @@ export function CashClient(props: CashClientProps) {
             </p>
             {props.canWrite && (
               <div className="mt-3 flex flex-wrap gap-2">
-                <button type="button" onClick={() => setIsPaymentDialogOpen(true)} className={buttonClass}>
-                  Registrar pago
-                </button>
-                <button type="button" onClick={() => setIsClosingDialogOpen(true)} className={ghostClass}>
+                <button type="button" onClick={() => setIsClosingDialogOpen(true)} className={buttonClass}>
                   Cerrar turno
                 </button>
               </div>
@@ -332,61 +283,6 @@ export function CashClient(props: CashClientProps) {
           </div>
         )}
       </section>
-
-      {props.canWrite && openShift && (
-        <Dialog open={isPaymentDialogOpen} onOpenChange={setIsPaymentDialogOpen}>
-          <DialogContent className="max-w-lg">
-            <DialogHeader>
-              <DialogTitle>Registrar pago</DialogTitle>
-            </DialogHeader>
-            <form onSubmit={handlePayment} className="mt-3 flex flex-wrap items-end gap-3">
-            <label className={labelClass}>
-              Método
-              <select
-                className={inputClass}
-                value={paymentMethod}
-                onChange={(event) => setPaymentMethod(event.target.value)}
-              >
-                {props.methods.map((method) => (
-                  <option key={method.id} value={method.code}>
-                    {method.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className={labelClass}>
-              Monto
-              <input
-                className={inputClass}
-                value={formatMoneyInput(paymentAmount)}
-                onChange={(event) => setPaymentAmount(stripMoneyInput(event.target.value))}
-                inputMode="numeric"
-                placeholder="50.000"
-              />
-            </label>
-            <label className={labelClass}>
-              Factura (opcional, id)
-              <input
-                className={inputClass}
-                value={paymentInvoice}
-                onChange={(event) => setPaymentInvoice(event.target.value)}
-                placeholder="uuid de la factura"
-              />
-            </label>
-            <DialogFooter>
-              <DialogClose asChild>
-                <button type="button" className={ghostClass}>
-                  Cancelar
-                </button>
-              </DialogClose>
-              <button type="submit" className={buttonClass} disabled={busy}>
-                Registrar pago
-              </button>
-            </DialogFooter>
-            </form>
-          </DialogContent>
-        </Dialog>
-      )}
 
       {props.canWrite && openShift && (
         <Dialog open={isClosingDialogOpen} onOpenChange={setIsClosingDialogOpen}>
