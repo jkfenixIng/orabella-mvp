@@ -18,13 +18,11 @@ import { Card, CardContent, CardHeader } from "@/src/components/ui/lib/card";
 import { Checkbox } from "@/src/components/ui/lib/checkbox";
 import {
   Dialog,
-  DialogClose,
   DialogContent,
   DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from "@/src/components/ui/lib/dialog";
 import { Input } from "@/src/components/ui/lib/input";
 import { Label } from "@/src/components/ui/lib/label";
@@ -97,6 +95,8 @@ export function InventoryClient(props: InventoryClientProps) {
   const [products, setProducts] = useState(props.initialProducts);
   const [alertIds, setAlertIds] = useState<Set<string>>(new Set(props.initialAlertIds));
   const [query, setQuery] = useState("");
+  const [page, setPage] = useState(0);
+  const PAGE_SIZE = 15;
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -108,6 +108,15 @@ export function InventoryClient(props: InventoryClientProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState(emptyProductForm());
   const [movement, setMovement] = useState(emptyMovementForm());
+  const [movementProductQuery, setMovementProductQuery] = useState("");
+  const movementProductOptions = useMemo(() => {
+    const needle = movementProductQuery.trim().toLowerCase();
+    if (needle === "") return products;
+    return products.filter(
+      (row) =>
+        row.name.toLowerCase().includes(needle) || row.sku.toLowerCase().includes(needle),
+    );
+  }, [products, movementProductQuery]);
   const [kardex, setKardex] = useState<{ product: ProductRow; rows: MovementRow[] } | null>(null);
 
   const visible = useMemo(() => {
@@ -118,6 +127,9 @@ export function InventoryClient(props: InventoryClientProps) {
         row.name.toLowerCase().includes(needle) || row.sku.toLowerCase().includes(needle),
     );
   }, [products, query]);
+  const pageCount = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const paged = visible.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
 
   async function refresh() {
     const result: ActionResult<ProductRow[]> = await listProductsAction(props.sedeId);
@@ -161,6 +173,7 @@ export function InventoryClient(props: InventoryClientProps) {
 
   function openMovementDialog() {
     setMovement(emptyMovementForm());
+    setMovementProductQuery("");
     setMovementDialogOpen(true);
   }
 
@@ -244,7 +257,7 @@ export function InventoryClient(props: InventoryClientProps) {
             id="inventory-search"
             className={inputClass}
             value={query}
-            onChange={(event: ChangeEvent<HTMLInputElement>) => setQuery(event.target.value)}
+            onChange={(event: ChangeEvent<HTMLInputElement>) => { setPage(0); setQuery(event.target.value); }}
             placeholder="Ej. shampoo o SH-001"
           />
         </Label>
@@ -314,7 +327,7 @@ export function InventoryClient(props: InventoryClientProps) {
                   </tr>
                 </thead>
                 <tbody>
-                  {visible.map((row) => (
+                  {paged.map((row) => (
                     <tr key={row.id} className={tableRowClass}>
                       <td className={cn(tableCellClass, "font-mono")}>{row.sku}</td>
                       <td className={tableCellClass}>
@@ -348,18 +361,16 @@ export function InventoryClient(props: InventoryClientProps) {
                             {isViewPending ? "Cargando…" : "Kardex"}
                           </Button>
                           {props.canWrite ? (
-                            <DialogTrigger asChild>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="sm"
-                                onClick={() => startEdit(row)}
-                                className="gap-1.5"
-                              >
-                                <Pencil className="h-4 w-4" aria-hidden="true" />
-                                Editar
-                              </Button>
-                            </DialogTrigger>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => startEdit(row)}
+                              className="gap-1.5"
+                            >
+                              <Pencil className="h-4 w-4" aria-hidden="true" />
+                              Editar
+                            </Button>
                           ) : null}
                         </div>
                       </td>
@@ -375,30 +386,34 @@ export function InventoryClient(props: InventoryClientProps) {
                 </tbody>
               </table>
             </div>
-          </section>
-
-          {props.canWrite ? (
-            <section className={sectionClass}>
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <h2 className="text-lg font-semibold">
-                    {editingId ? "Editar producto" : "Crear producto"}
-                  </h2>
-                  <p className={cn("mt-1", mutedTextClass)}>
-                    {editingId
-                      ? "Actualiza los datos del producto."
-                      : "Completa los campos obligatorios para registrar un producto."}
-                  </p>
-                </div>
-                <DialogTrigger asChild>
-                  <Button type="button" variant="outline" size="sm" onClick={() => startProductDialog()}>
-                    <PackagePlus className="h-4 w-4" aria-hidden="true" />
-                    Crear producto
+            {pageCount > 1 ? (
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-sm">
+                <span className={mutedTextClass}>
+                  Página {safePage + 1} de {pageCount} · {visible.length} productos
+                </span>
+                <div className="flex gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={safePage === 0}
+                    onClick={() => setPage(safePage - 1)}
+                  >
+                    Anterior
                   </Button>
-                </DialogTrigger>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={safePage >= pageCount - 1}
+                    onClick={() => setPage(safePage + 1)}
+                  >
+                    Siguiente
+                  </Button>
+                </div>
               </div>
-            </section>
-          ) : null}
+            ) : null}
+          </section>
         </div>
 
         <DialogContent className="max-w-2xl">
@@ -425,6 +440,9 @@ export function InventoryClient(props: InventoryClientProps) {
                     placeholder="SH-001"
                     required
                   />
+                  <span className="text-xs text-text-secondary">
+                    Código único por sede. Sugerencia: iniciales del producto + consecutivo (p. ej. SH-001 para shampoo).
+                  </span>
                 </Label>
                 <Label htmlFor="product-name" className={labelClass}>
                   Nombre *
@@ -481,13 +499,9 @@ export function InventoryClient(props: InventoryClientProps) {
                   />
                 </Label>
                 <DialogFooter className="sm:col-span-2">
-                  {editingId ? (
-                    <DialogClose asChild>
-                      <Button type="button" variant="outline">
-                        Cancelar
-                      </Button>
-                    </DialogClose>
-                  ) : null}
+                  <Button type="button" variant="outline" onClick={cancelEdit}>
+                    Cancelar
+                  </Button>
                   <Button type="submit" disabled={busy} className={buttonClass}>
                     {editingId ? "Guardar cambios" : "Crear producto"}
                   </Button>
@@ -500,23 +514,6 @@ export function InventoryClient(props: InventoryClientProps) {
 
       {props.canWrite ? (
         <Dialog open={movementDialogOpen} onOpenChange={(open: boolean) => { if (!open) cancelMovement(); else setMovementDialogOpen(open); }}>
-          <section className={sectionClass}>
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <h2 className="text-lg font-semibold">Registrar movimiento</h2>
-                <p className={cn("mt-1", mutedTextClass)}>
-                  Registra una entrada, salida o ajuste de stock.
-                </p>
-              </div>
-              <DialogTrigger asChild>
-                <Button type="button" variant="outline" size="sm" onClick={openMovementDialog}>
-                  <PackageOpen className="h-4 w-4" aria-hidden="true" />
-                  Registrar movimiento
-                </Button>
-              </DialogTrigger>
-            </div>
-          </section>
-
           <DialogContent className="max-w-2xl">
             <Card className="overflow-hidden">
               <CardHeader>
@@ -536,12 +533,23 @@ export function InventoryClient(props: InventoryClientProps) {
                         <SelectValue placeholder="Seleccione…" />
                       </SelectTrigger>
                       <SelectContent>
+                        <div className="p-2">
+                          <Input
+                            placeholder="Filtrar por nombre o SKU…"
+                            value={movementProductQuery}
+                            onChange={(event: ChangeEvent<HTMLInputElement>) => setMovementProductQuery(event.target.value)}
+                            onKeyDown={(event) => event.stopPropagation()}
+                          />
+                        </div>
                         <SelectItem value="">Seleccione…</SelectItem>
-                        {products.map((row) => (
+                        {movementProductOptions.map((row) => (
                           <SelectItem key={row.id} value={row.id}>
                             {row.sku} — {row.name} (stock {row.stock_qty})
                           </SelectItem>
                         ))}
+                        {movementProductOptions.length === 0 && (
+                          <p className="px-2 py-1 text-xs text-text-secondary">Sin coincidencias.</p>
+                        )}
                       </SelectContent>
                     </Select>
                   </Label>
@@ -579,11 +587,9 @@ export function InventoryClient(props: InventoryClientProps) {
                     />
                   </Label>
                   <DialogFooter>
-                    <DialogClose asChild>
-                      <Button type="button" variant="outline">
-                        Cancelar
-                      </Button>
-                    </DialogClose>
+                    <Button type="button" variant="outline" onClick={cancelMovement}>
+                      Cancelar
+                    </Button>
                     <Button type="submit" disabled={busy} className={buttonClass}>
                       Registrar
                     </Button>
