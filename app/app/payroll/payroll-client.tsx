@@ -21,6 +21,14 @@ import type {
   VoucherSettingsRow,
 } from "@/src/features/payroll/service";
 import type { EmployeeRow, PaymentMethodRow } from "@/src/features/admin/service";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/src/components/ui/lib/dialog";
 
 const inputClass =
   "rounded border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900";
@@ -100,6 +108,7 @@ export function PayrollClient(props: PayrollClientProps) {
   // Ajustes por empleado al calcular ("bonos,otros" por empleado).
   const [adjustments, setAdjustments] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
+  const [detailDialogOpen, setDetailDialogOpen] = useState(false);
   // Transición para los cambios de vista (detalle del periodo / vales):
   // la UI no se congela mientras la server action responde.
   const [isViewPending, startViewTransition] = useTransition();
@@ -133,7 +142,10 @@ export function PayrollClient(props: PayrollClientProps) {
     setSelectedId(id);
     startViewTransition(async () => {
       const result = (await getPeriodDetailAction(id)) as ActionResult<PeriodDetail>;
-      if (show(result)) setDetail(result.data);
+      if (show(result)) {
+        setDetail(result.data);
+        setDetailDialogOpen(true);
+      }
     });
   }
 
@@ -358,10 +370,14 @@ export function PayrollClient(props: PayrollClientProps) {
       </section>
 
       {selected && (
-        <section className={sectionClass} aria-busy={isViewPending}>
-          <h2 className="text-lg font-semibold">
-            Liquidación {selected.start_date} → {selected.end_date} ({selected.status})
-          </h2>
+        <Dialog open={detailDialogOpen} onOpenChange={setDetailDialogOpen}>
+          <DialogContent className="max-w-4xl" aria-busy={isViewPending}>
+            <DialogHeader>
+              <DialogTitle>
+                Liquidación {selected.start_date} → {selected.end_date} ({selected.status})
+              </DialogTitle>
+            </DialogHeader>
+            <div className="max-h-[calc(100dvh-12rem)] overflow-y-auto pr-1">
           {selected.status === "cerrado" ? (
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
               Periodo cerrado e inmutable: no admite cálculo ni pagos.
@@ -497,7 +513,16 @@ export function PayrollClient(props: PayrollClientProps) {
               )}
             </div>
           )}
-        </section>
+            </div>
+            <DialogFooter>
+              <DialogClose asChild>
+                <button type="button" className={ghostClass}>
+                  Cerrar
+                </button>
+              </DialogClose>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       )}
 
       <section className={sectionClass}>
