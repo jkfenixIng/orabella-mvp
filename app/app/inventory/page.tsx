@@ -39,6 +39,7 @@ export default async function InventoryPage() {
   const products = await listProducts(sedeId);
   const alertIds = new Set(filterLowStock(products).map((alert) => alert.id));
   const canWrite = session.roles.includes("admin") || session.roles.includes("caja");
+  const canAdmin = session.roles.includes("admin");
 
   return (
     <main className="mx-auto flex min-h-screen max-w-4xl flex-col gap-6 px-6 py-12">
@@ -55,6 +56,7 @@ export default async function InventoryPage() {
         initialProducts={products}
         initialAlertIds={[...alertIds]}
         canWrite={canWrite}
+        canAdmin={canAdmin}
       />
     </main>
   );

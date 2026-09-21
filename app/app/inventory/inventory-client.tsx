@@ -90,6 +90,7 @@ interface InventoryClientProps {
   initialProducts: ProductRow[];
   initialAlertIds: string[];
   canWrite: boolean;
+  canAdmin: boolean;
 }
 
 export function InventoryClient(props: InventoryClientProps) {
@@ -366,7 +367,7 @@ export function InventoryClient(props: InventoryClientProps) {
                             )}
                             {isViewPending ? "Cargando…" : "Kardex"}
                           </Button>
-                          {props.canWrite ? (
+                          {props.canAdmin ? (
                             <Button
                               type="button"
                               variant="ghost"
@@ -574,8 +575,12 @@ export function InventoryClient(props: InventoryClientProps) {
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="IN">Entrada (IN)</SelectItem>
-                        <SelectItem value="OUT">Salida (OUT)</SelectItem>
-                        <SelectItem value="ADJUST">Ajuste: fija el nivel (ADJUST)</SelectItem>
+                        {props.canAdmin ? (
+                          <>
+                            <SelectItem value="OUT">Salida (OUT)</SelectItem>
+                            <SelectItem value="ADJUST">Ajuste: fija el nivel (ADJUST)</SelectItem>
+                          </>
+                        ) : null}
                       </SelectContent>
                     </Select>
                   </Label>

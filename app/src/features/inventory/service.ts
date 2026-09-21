@@ -56,6 +56,15 @@ function validationMessage(error: { issues: Array<{ message: string }> }): strin
 /** Roles que pueden escribir inventario (upsert + movimientos). */
 const WRITER_ROLES: RoleCode[] = ["admin", "caja"];
 
+/** Solo admin: editar productos y movimientos que no sean entradas. */
+export async function requireInventoryAdmin(
+  token: string | null | undefined,
+): Promise<{ userId: string; sedeId: string; roles: RoleCode[] }> {
+  const session = await requireInventoryWriter(token);
+  requireSedeRole(session.roles, ["admin"]);
+  return session;
+}
+
 /**
  * §10 Inventario: escritura solo admin/caja de su sede; lectura cualquier
  * rol autenticado de su sede (las rutas y actions aplican este gate).

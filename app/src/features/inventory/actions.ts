@@ -10,6 +10,7 @@ import {
   listProducts,
   lowStockAlerts,
   registerMovement,
+  requireInventoryAdmin,
   requireInventoryWriter,
   requireSession,
   searchProducts,
@@ -52,10 +53,16 @@ export async function getProductAction(id: string) {
   }
 }
 
-/** Misma lógica que POST /api/v1/products (solo admin/caja). */
+/** Misma lógica que POST /api/v1/products (crear: admin/caja; editar: solo admin). */
 export async function upsertProductAction(input: unknown) {
   try {
-    const session = await requireInventoryWriter(await sessionToken());
+    const isUpdate =
+      typeof input === "object" && input !== null && "id" in input &&
+      typeof (input as { id?: unknown }).id === "string" &&
+      (input as { id: string }).id !== "";
+    const session = isUpdate
+      ? await requireInventoryAdmin(await sessionToken())
+      : await requireInventoryWriter(await sessionToken());
     const data = await upsertProduct({
       ...(typeof input === "object" && input !== null ? input : {}),
       sede_id: resolveSede(session.sedeId, (input as { sede_id?: string }).sede_id),
@@ -66,10 +73,16 @@ export async function upsertProductAction(input: unknown) {
   }
 }
 
-/** Misma lógica que POST /api/v1/inventory/movements (solo admin/caja). */
+/** Misma lógica que POST /api/v1/inventory/movements (IN: admin/caja; OUT/ADJUST: solo admin). */
 export async function registerMovementAction(input: unknown) {
   try {
-    const session = await requireInventoryWriter(await sessionToken());
+    const movementType =
+      typeof input === "object" && input !== null
+        ? (input as { type?: unknown }).type
+        : undefined;
+    const session = movementType === "IN" || movementType === undefined
+      ? await requireInventoryWriter(await sessionToken())
+      : await requireInventoryAdmin(await sessionToken());
     const data = await registerMovement(input, {
       userId: session.userId,
       sedeId: session.sedeId,
