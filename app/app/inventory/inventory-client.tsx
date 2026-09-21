@@ -1,6 +1,7 @@
 "use client";
 
-import { useMemo, useState, type FormEvent } from "react";
+import { useMemo, useState, useTransition, type ChangeEvent, type FormEvent } from "react";
+import { Activity, PackageOpen, PackagePlus, Pencil, X } from "lucide-react";
 import {
   getKardexAction,
   listProductsAction,
@@ -11,17 +12,43 @@ import type {
   MovementRow,
   ProductRow,
 } from "@/src/features/inventory/service";
+import { Badge } from "@/src/components/ui/lib/badge";
+import { Button } from "@/src/components/ui/lib/button";
+import { Card, CardContent, CardHeader } from "@/src/components/ui/lib/card";
+import { Checkbox } from "@/src/components/ui/lib/checkbox";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/src/components/ui/lib/dialog";
+import { Input } from "@/src/components/ui/lib/input";
+import { Label } from "@/src/components/ui/lib/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/src/components/ui/lib/select";
+import { cn } from "@/src/components/ui/lib/utils";
 
-const inputClass =
-  "rounded border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900";
-const labelClass = "flex flex-col gap-1 text-sm";
-const buttonClass =
-  "rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900";
-const sectionClass = "rounded-lg border border-slate-300 p-4 dark:border-slate-700";
-const errorClass = "text-sm text-red-600 dark:text-red-400";
-const okClass = "text-sm text-green-700 dark:text-green-400";
-const alertClass =
-  "rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-900 dark:text-amber-200";
+const inputClass = cn(
+  "h-10 w-full rounded-lg border border-color bg-surface px-3 py-2 text-sm text-text-primary outline-none transition-all duration-200 placeholder:text-text-tertiary focus:border-primary-600 focus:ring-2 focus:ring-primary-600/20 dark:border-border-color dark:bg-surface dark:text-text-primary",
+);
+const labelClass = cn("flex flex-col gap-1 text-sm");
+const buttonClass = cn("gap-2");
+const sectionClass = cn("rounded-xl border border-color bg-surface p-4 shadow-sm");
+const errorClass = cn("text-sm text-error-600 dark:text-error-400");
+const okClass = cn("text-sm text-success-600 dark:text-success-600");
+const tableHeaderClass = cn("border-b border-color-2 dark:border-color");
+const tableRowClass = cn("border-b border-color-2 dark:border-color");
+const tableCellClass = cn("py-2 pr-3");
+const mutedTextClass = cn("text-sm text-text-secondary");
 
 type ActionResult<T> =
   | { success: true; data: T }
@@ -43,6 +70,22 @@ function formatMoney(value: number | null): string {
   }).format(value);
 }
 
+function emptyProductForm() {
+  return {
+    sku: "",
+    name: "",
+    description: "",
+    min_stock: "0",
+    cost_price: "",
+    sale_price: "",
+    is_active: true,
+  };
+}
+
+function emptyMovementForm() {
+  return { product_id: "", type: "IN", qty: "", reason: "" };
+}
+
 interface InventoryClientProps {
   sedeId: string;
   initialProducts: ProductRow[];
@@ -57,17 +100,14 @@ export function InventoryClient(props: InventoryClientProps) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Transición para los cambios de vista (kardex): la UI no se congela
+  // mientras la server action responde.
+  const [isViewPending, startViewTransition] = useTransition();
+  const [productDialogOpen, setProductDialogOpen] = useState(false);
+  const [movementDialogOpen, setMovementDialogOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [form, setForm] = useState({
-    sku: "",
-    name: "",
-    description: "",
-    min_stock: "0",
-    cost_price: "",
-    sale_price: "",
-    is_active: true,
-  });
-  const [movement, setMovement] = useState({ product_id: "", type: "IN", qty: "", reason: "" });
+  const [form, setForm] = useState(emptyProductForm());
+  const [movement, setMovement] = useState(emptyMovementForm());
   const [kardex, setKardex] = useState<{ product: ProductRow; rows: MovementRow[] } | null>(null);
 
   const visible = useMemo(() => {
@@ -89,32 +129,44 @@ export function InventoryClient(props: InventoryClientProps) {
     }
   }
 
-  function startEdit(row: ProductRow) {
-    setEditingId(row.id);
-    setForm({
-      sku: row.sku,
-      name: row.name,
-      description: row.description ?? "",
-      min_stock: String(row.min_stock),
-      cost_price: row.cost_price == null ? "" : String(row.cost_price),
-      sale_price: row.sale_price == null ? "" : String(row.sale_price),
-      is_active: row.is_active,
-    });
+  function startProductDialog(row?: ProductRow) {
+    setEditingId(row?.id ?? null);
+    setForm(
+      row
+        ? {
+            sku: row.sku,
+            name: row.name,
+            description: row.description ?? "",
+            min_stock: String(row.min_stock),
+            cost_price: row.cost_price == null ? "" : String(row.cost_price),
+            sale_price: row.sale_price == null ? "" : String(row.sale_price),
+            is_active: row.is_active,
+          }
+        : emptyProductForm(),
+    );
     setError(null);
     setNotice(null);
+    setProductDialogOpen(true);
+  }
+
+  function startEdit(row: ProductRow) {
+    startProductDialog(row);
   }
 
   function cancelEdit() {
     setEditingId(null);
-    setForm({
-      sku: "",
-      name: "",
-      description: "",
-      min_stock: "0",
-      cost_price: "",
-      sale_price: "",
-      is_active: true,
-    });
+    setForm(emptyProductForm());
+    setProductDialogOpen(false);
+  }
+
+  function openMovementDialog() {
+    setMovement(emptyMovementForm());
+    setMovementDialogOpen(true);
+  }
+
+  function cancelMovement() {
+    setMovement(emptyMovementForm());
+    setMovementDialogOpen(false);
   }
 
   async function handleProductSubmit(event: FormEvent) {
@@ -163,284 +215,412 @@ export function InventoryClient(props: InventoryClientProps) {
       return;
     }
     setNotice(`Movimiento registrado. Stock actual: ${result.data.stock_qty}.`);
-    setMovement({ product_id: "", type: "IN", qty: "", reason: "" });
+    setMovement(emptyMovementForm());
     await refresh();
     if (kardex && kardex.product.id === result.data.movement.product_id) {
       await showKardex(kardex.product);
     }
+    setMovementDialogOpen(false);
   }
 
-  async function showKardex(row: ProductRow) {
-    setError(null);
-    const result: ActionResult<MovementRow[]> = await getKardexAction(row.id);
-    if (!result.success) {
-      setError(result.message);
-      return;
-    }
-    setKardex({ product: row, rows: result.data });
+  function showKardex(row: ProductRow) {
+    startViewTransition(async () => {
+      setError(null);
+      const result: ActionResult<MovementRow[]> = await getKardexAction(row.id);
+      if (!result.success) {
+        setError(result.message);
+        return;
+      }
+      setKardex({ product: row, rows: result.data });
+    });
   }
 
   return (
     <div className="flex flex-col gap-6">
       <section className={sectionClass}>
-        <label className={labelClass}>
+        <Label htmlFor="inventory-search" className={labelClass}>
           Buscar por nombre o SKU
-          <input
+          <Input
+            id="inventory-search"
             className={inputClass}
             value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event: ChangeEvent<HTMLInputElement>) => setQuery(event.target.value)}
             placeholder="Ej. shampoo o SH-001"
           />
-        </label>
+        </Label>
       </section>
 
-      <section className={sectionClass}>
-        <h2 className="text-lg font-semibold">Productos ({visible.length})</h2>
-        {error ? (
-          <p role="alert" className={errorClass}>
-            {error}
-          </p>
-        ) : null}
-        {notice ? (
-          <p role="status" className={okClass}>
-            {notice}
-          </p>
-        ) : null}
-        <div className="mt-3 overflow-x-auto">
-          <table className="w-full text-left text-sm">
-            <thead>
-              <tr className="border-b border-slate-300 dark:border-slate-700">
-                <th className="py-2 pr-3">SKU</th>
-                <th className="py-2 pr-3">Nombre</th>
-                <th className="py-2 pr-3">Stock</th>
-                <th className="py-2 pr-3">Mínimo</th>
-                <th className="py-2 pr-3">Costo</th>
-                <th className="py-2 pr-3">Venta</th>
-                <th className="py-2 pr-3">Estado</th>
-                <th className="py-2">Acciones</th>
-              </tr>
-            </thead>
-            <tbody>
-              {visible.map((row) => (
-                <tr key={row.id} className="border-b border-slate-200 dark:border-slate-800">
-                  <td className="py-2 pr-3 font-mono">{row.sku}</td>
-                  <td className="py-2 pr-3">
-                    {row.name}{" "}
-                    {alertIds.has(row.id) ? <span className={alertClass}>Bajo mínimo</span> : null}
-                  </td>
-                  <td className="py-2 pr-3">{row.stock_qty}</td>
-                  <td className="py-2 pr-3">{row.min_stock}</td>
-                  <td className="py-2 pr-3">{formatMoney(row.cost_price)}</td>
-                  <td className="py-2 pr-3">{formatMoney(row.sale_price)}</td>
-                  <td className="py-2 pr-3">{row.is_active ? "Activo" : "Inactivo"}</td>
-                  <td className="py-2">
-                    <div className="flex gap-2">
-                      <button
-                        type="button"
-                        className="text-sm underline"
-                        onClick={() => showKardex(row)}
-                      >
-                        Kardex
-                      </button>
-                      {props.canWrite ? (
-                        <button
-                          type="button"
-                          className="text-sm underline"
-                          onClick={() => startEdit(row)}
-                        >
-                          Editar
-                        </button>
-                      ) : null}
-                    </div>
-                  </td>
-                </tr>
-              ))}
-              {visible.length === 0 ? (
-                <tr>
-                  <td colSpan={8} className="py-4 text-slate-500">
-                    Sin productos para esta búsqueda.
-                  </td>
-                </tr>
-              ) : null}
-            </tbody>
-          </table>
+      <Dialog
+        open={productDialogOpen}
+        onOpenChange={(open: boolean) => {
+          if (!open) cancelEdit();
+          else setProductDialogOpen(open);
+        }}
+      >
+        <div className="flex flex-col gap-6">
+          <section className={sectionClass}>
+            <h2 className="text-lg font-semibold">Productos ({visible.length})</h2>
+            {error ? (
+              <p role="alert" className={errorClass}>
+                {error}
+              </p>
+            ) : null}
+            {notice ? (
+              <p role="status" className={okClass}>
+                {notice}
+              </p>
+            ) : null}
+            <div className="mt-3 overflow-x-auto">
+              <table className={cn("w-full text-left text-sm", "min-w-[720px]")}>
+                <thead>
+                  <tr className={tableHeaderClass}>
+                    <th className={cn(tableCellClass, "text-left")} scope="col">
+                      SKU
+                    </th>
+                    <th className={cn(tableCellClass, "text-left")} scope="col">
+                      Nombre
+                    </th>
+                    <th className={cn(tableCellClass, "text-left")} scope="col">
+                      Stock
+                    </th>
+                    <th className={cn(tableCellClass, "text-left")} scope="col">
+                      Mínimo
+                    </th>
+                    <th className={cn(tableCellClass, "text-left")} scope="col">
+                      Costo
+                    </th>
+                    <th className={cn(tableCellClass, "text-left")} scope="col">
+                      Venta
+                    </th>
+                    <th className={cn(tableCellClass, "text-left")} scope="col">
+                      Estado
+                    </th>
+                    <th className={cn(tableCellClass, "text-left")} scope="col">
+                      Acciones
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visible.map((row) => (
+                    <tr key={row.id} className={tableRowClass}>
+                      <td className={cn(tableCellClass, "font-mono")}>{row.sku}</td>
+                      <td className={tableCellClass}>
+                        {row.name}{" "}
+                        {alertIds.has(row.id) ? (
+                          <Badge variant="warning" size="sm">
+                            Bajo mínimo
+                          </Badge>
+                        ) : null}
+                      </td>
+                      <td className={tableCellClass}>{row.stock_qty}</td>
+                      <td className={tableCellClass}>{row.min_stock}</td>
+                      <td className={tableCellClass}>{formatMoney(row.cost_price)}</td>
+                      <td className={tableCellClass}>{formatMoney(row.sale_price)}</td>
+                      <td className={tableCellClass}>{row.is_active ? "Activo" : "Inactivo"}</td>
+                      <td className={tableCellClass}>
+                        <div className="flex flex-wrap gap-2">
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            disabled={isViewPending}
+                            onClick={() => showKardex(row)}
+                            className={cn("gap-1.5", isViewPending && "opacity-50")}
+                          >
+                            {isViewPending ? (
+                              <Activity className="h-4 w-4 animate-spin" aria-hidden="true" />
+                            ) : (
+                              <Activity className="h-4 w-4" aria-hidden="true" />
+                            )}
+                            {isViewPending ? "Cargando…" : "Kardex"}
+                          </Button>
+                          {props.canWrite ? (
+                            <DialogTrigger asChild>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => startEdit(row)}
+                                className="gap-1.5"
+                              >
+                                <Pencil className="h-4 w-4" aria-hidden="true" />
+                                Editar
+                              </Button>
+                            </DialogTrigger>
+                          ) : null}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                  {visible.length === 0 ? (
+                    <tr>
+                      <td colSpan={8} className={cn("py-4 text-sm text-text-secondary")}>
+                        Sin productos para esta búsqueda.
+                      </td>
+                    </tr>
+                  ) : null}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          {props.canWrite ? (
+            <section className={sectionClass}>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-semibold">
+                    {editingId ? "Editar producto" : "Crear producto"}
+                  </h2>
+                  <p className={cn("mt-1", mutedTextClass)}>
+                    {editingId
+                      ? "Actualiza los datos del producto."
+                      : "Completa los campos obligatorios para registrar un producto."}
+                  </p>
+                </div>
+                <DialogTrigger asChild>
+                  <Button type="button" variant="outline" size="sm" onClick={() => startProductDialog()}>
+                    <PackagePlus className="h-4 w-4" aria-hidden="true" />
+                    Crear producto
+                  </Button>
+                </DialogTrigger>
+              </div>
+            </section>
+          ) : null}
         </div>
-      </section>
+
+        <DialogContent className="max-w-2xl">
+          <Card className="overflow-hidden">
+            <CardHeader>
+              <DialogHeader>
+                <DialogTitle>{editingId ? "Editar producto" : "Crear producto"}</DialogTitle>
+                <DialogDescription>
+                  {editingId
+                    ? "Actualiza los datos del producto. El stock no cambia desde este formulario."
+                    : "Completa los campos obligatorios para registrar un producto."}
+                </DialogDescription>
+              </DialogHeader>
+            </CardHeader>
+            <CardContent>
+              <form onSubmit={handleProductSubmit} className="grid gap-3 sm:grid-cols-2">
+                <Label htmlFor="product-sku" className={labelClass}>
+                  SKU *
+                  <Input
+                    id="product-sku"
+                    className={inputClass}
+                    value={form.sku}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, sku: event.target.value })}
+                    placeholder="SH-001"
+                    required
+                  />
+                </Label>
+                <Label htmlFor="product-name" className={labelClass}>
+                  Nombre *
+                  <Input
+                    id="product-name"
+                    className={inputClass}
+                    value={form.name}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, name: event.target.value })}
+                    placeholder="Shampoo"
+                    required
+                  />
+                </Label>
+                <Label htmlFor="product-description" className={cn(labelClass, "sm:col-span-2")}>
+                  Descripción
+                  <Input
+                    id="product-description"
+                    className={inputClass}
+                    value={form.description}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, description: event.target.value })}
+                  />
+                </Label>
+                <Label htmlFor="product-min-stock" className={labelClass}>
+                  Stock mínimo
+                  <Input
+                    id="product-min-stock"
+                    className={inputClass}
+                    value={form.min_stock}
+                    inputMode="numeric"
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, min_stock: event.target.value })}
+                  />
+                </Label>
+                <Label htmlFor="product-is-active" className={cn(labelClass, "flex-row items-center")}>
+                  <Checkbox id="product-is-active" checked={form.is_active} onCheckedChange={(checked: boolean | "indeterminate") => setForm({ ...form, is_active: checked === true })} />
+                  Activo
+                </Label>
+                <Label htmlFor="product-cost-price" className={labelClass}>
+                  Precio de costo
+                  <Input
+                    id="product-cost-price"
+                    className={inputClass}
+                    value={form.cost_price}
+                    inputMode="decimal"
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, cost_price: event.target.value })}
+                  />
+                </Label>
+                <Label htmlFor="product-sale-price" className={labelClass}>
+                  Precio de venta
+                  <Input
+                    id="product-sale-price"
+                    className={inputClass}
+                    value={form.sale_price}
+                    inputMode="decimal"
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, sale_price: event.target.value })}
+                  />
+                </Label>
+                <DialogFooter className="sm:col-span-2">
+                  {editingId ? (
+                    <DialogClose asChild>
+                      <Button type="button" variant="outline">
+                        Cancelar
+                      </Button>
+                    </DialogClose>
+                  ) : null}
+                  <Button type="submit" disabled={busy} className={buttonClass}>
+                    {editingId ? "Guardar cambios" : "Crear producto"}
+                  </Button>
+                </DialogFooter>
+              </form>
+            </CardContent>
+          </Card>
+        </DialogContent>
+      </Dialog>
 
       {props.canWrite ? (
-        <section className={sectionClass}>
-          <h2 className="text-lg font-semibold">
-            {editingId ? "Editar producto" : "Crear producto"}
-          </h2>
-          <form onSubmit={handleProductSubmit} className="mt-3 grid gap-3 sm:grid-cols-2">
-            <label className={labelClass}>
-              SKU *
-              <input
-                className={inputClass}
-                value={form.sku}
-                onChange={(event) => setForm({ ...form, sku: event.target.value })}
-                placeholder="SH-001"
-                required
-              />
-            </label>
-            <label className={labelClass}>
-              Nombre *
-              <input
-                className={inputClass}
-                value={form.name}
-                onChange={(event) => setForm({ ...form, name: event.target.value })}
-                placeholder="Shampoo"
-                required
-              />
-            </label>
-            <label className={`${labelClass} sm:col-span-2`}>
-              Descripción
-              <input
-                className={inputClass}
-                value={form.description}
-                onChange={(event) => setForm({ ...form, description: event.target.value })}
-              />
-            </label>
-            <label className={labelClass}>
-              Stock mínimo
-              <input
-                className={inputClass}
-                value={form.min_stock}
-                inputMode="numeric"
-                onChange={(event) => setForm({ ...form, min_stock: event.target.value })}
-              />
-            </label>
-            <label className={labelClass}>
-              Activo
-              <input
-                type="checkbox"
-                checked={form.is_active}
-                onChange={(event) => setForm({ ...form, is_active: event.target.checked })}
-              />
-            </label>
-            <label className={labelClass}>
-              Precio de costo
-              <input
-                className={inputClass}
-                value={form.cost_price}
-                inputMode="decimal"
-                onChange={(event) => setForm({ ...form, cost_price: event.target.value })}
-              />
-            </label>
-            <label className={labelClass}>
-              Precio de venta
-              <input
-                className={inputClass}
-                value={form.sale_price}
-                inputMode="decimal"
-                onChange={(event) => setForm({ ...form, sale_price: event.target.value })}
-              />
-            </label>
-            <div className="flex gap-2 sm:col-span-2">
-              <button type="submit" className={buttonClass} disabled={busy}>
-                {editingId ? "Guardar cambios" : "Crear producto"}
-              </button>
-              {editingId ? (
-                <button type="button" className={buttonClass} onClick={cancelEdit}>
-                  Cancelar
-                </button>
-              ) : null}
+        <Dialog open={movementDialogOpen} onOpenChange={(open: boolean) => { if (!open) cancelMovement(); else setMovementDialogOpen(open); }}>
+          <section className={sectionClass}>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-semibold">Registrar movimiento</h2>
+                <p className={cn("mt-1", mutedTextClass)}>
+                  Registra una entrada, salida o ajuste de stock.
+                </p>
+              </div>
+              <DialogTrigger asChild>
+                <Button type="button" variant="outline" size="sm" onClick={openMovementDialog}>
+                  <PackageOpen className="h-4 w-4" aria-hidden="true" />
+                  Registrar movimiento
+                </Button>
+              </DialogTrigger>
             </div>
-          </form>
-        </section>
-      ) : null}
+          </section>
 
-      {props.canWrite ? (
-        <section className={sectionClass}>
-          <h2 className="text-lg font-semibold">Registrar movimiento</h2>
-          <form onSubmit={handleMovementSubmit} className="mt-3 grid gap-3 sm:grid-cols-2">
-            <label className={labelClass}>
-              Producto *
-              <select
-                className={inputClass}
-                value={movement.product_id}
-                onChange={(event) => setMovement({ ...movement, product_id: event.target.value })}
-                required
-              >
-                <option value="">Seleccione…</option>
-                {products.map((row) => (
-                  <option key={row.id} value={row.id}>
-                    {row.sku} — {row.name} (stock {row.stock_qty})
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className={labelClass}>
-              Tipo *
-              <select
-                className={inputClass}
-                value={movement.type}
-                onChange={(event) => setMovement({ ...movement, type: event.target.value })}
-              >
-                <option value="IN">Entrada (IN)</option>
-                <option value="OUT">Salida (OUT)</option>
-                <option value="ADJUST">Ajuste: fija el nivel (ADJUST)</option>
-              </select>
-            </label>
-            <label className={labelClass}>
-              Cantidad * {movement.type === "ADJUST" ? "(nivel que se fija)" : ""}
-              <input
-                className={inputClass}
-                value={movement.qty}
-                inputMode="numeric"
-                onChange={(event) => setMovement({ ...movement, qty: event.target.value })}
-                required
-              />
-            </label>
-            <label className={labelClass}>
-              Motivo *
-              <input
-                className={inputClass}
-                value={movement.reason}
-                onChange={(event) => setMovement({ ...movement, reason: event.target.value })}
-                placeholder="Compra a proveedor, venta, conteo físico…"
-                required
-              />
-            </label>
-            <div className="sm:col-span-2">
-              <button type="submit" className={buttonClass} disabled={busy}>
-                Registrar
-              </button>
-            </div>
-          </form>
-        </section>
+          <DialogContent className="max-w-2xl">
+            <Card className="overflow-hidden">
+              <CardHeader>
+                <DialogHeader>
+                  <DialogTitle>Registrar movimiento</DialogTitle>
+                  <DialogDescription>
+                    Selecciona un producto y completa los datos del movimiento.
+                  </DialogDescription>
+                </DialogHeader>
+              </CardHeader>
+              <CardContent>
+                <form onSubmit={handleMovementSubmit} className="grid gap-3 sm:grid-cols-2">
+                  <Label className={labelClass}>
+                    Producto *
+                    <Select required value={movement.product_id} onValueChange={(value: string) => setMovement({ ...movement, product_id: value })}>
+                      <SelectTrigger className={inputClass}>
+                        <SelectValue placeholder="Seleccione…" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="">Seleccione…</SelectItem>
+                        {products.map((row) => (
+                          <SelectItem key={row.id} value={row.id}>
+                            {row.sku} — {row.name} (stock {row.stock_qty})
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </Label>
+                  <Label className={labelClass}>
+                    Tipo *
+                    <Select value={movement.type} onValueChange={(value: string) => setMovement({ ...movement, type: value })}>
+                      <SelectTrigger className={inputClass}>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="IN">Entrada (IN)</SelectItem>
+                        <SelectItem value="OUT">Salida (OUT)</SelectItem>
+                        <SelectItem value="ADJUST">Ajuste: fija el nivel (ADJUST)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </Label>
+                  <Label className={labelClass}>
+                    Cantidad * {movement.type === "ADJUST" ? "(nivel que se fija)" : ""}
+                    <Input
+                      className={inputClass}
+                      value={movement.qty}
+                      inputMode="numeric"
+                      onChange={(event: ChangeEvent<HTMLInputElement>) => setMovement({ ...movement, qty: event.target.value })}
+                      required
+                    />
+                  </Label>
+                  <Label className={labelClass}>
+                    Motivo *
+                    <Input
+                      className={inputClass}
+                      value={movement.reason}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) => setMovement({ ...movement, reason: event.target.value })}
+                      placeholder="Compra a proveedor, venta, conteo físico…"
+                      required
+                    />
+                  </Label>
+                  <DialogFooter>
+                    <DialogClose asChild>
+                      <Button type="button" variant="outline">
+                        Cancelar
+                      </Button>
+                    </DialogClose>
+                    <Button type="submit" disabled={busy} className={buttonClass}>
+                      Registrar
+                    </Button>
+                  </DialogFooter>
+                </form>
+              </CardContent>
+            </Card>
+          </DialogContent>
+        </Dialog>
       ) : null}
 
       {kardex ? (
-        <section className={sectionClass}>
+        <section className={sectionClass} aria-busy={isViewPending}>
           <div className="flex items-center justify-between gap-2">
             <h2 className="text-lg font-semibold">
               Kardex: {kardex.product.sku} — {kardex.product.name}
             </h2>
-            <button type="button" className="text-sm underline" onClick={() => setKardex(null)}>
+            <Button type="button" variant="ghost" size="sm" onClick={() => setKardex(null)} className="gap-1.5">
+              <X className="h-4 w-4" aria-hidden="true" />
               Cerrar
-            </button>
+            </Button>
           </div>
           {kardex.rows.length === 0 ? (
-            <p className="mt-2 text-sm text-slate-500">Sin movimientos registrados.</p>
+            <p className={cn("mt-2", mutedTextClass)}>Sin movimientos registrados.</p>
           ) : (
             <div className="mt-3 overflow-x-auto">
-              <table className="w-full text-left text-sm">
+              <table className={cn("w-full text-left text-sm", "min-w-[520px]")}>
                 <thead>
-                  <tr className="border-b border-slate-300 dark:border-slate-700">
-                    <th className="py-2 pr-3">Fecha</th>
-                    <th className="py-2 pr-3">Tipo</th>
-                    <th className="py-2 pr-3">Cantidad</th>
-                    <th className="py-2">Motivo</th>
+                  <tr className={tableHeaderClass}>
+                    <th className={cn(tableCellClass, "text-left")} scope="col">
+                      Fecha
+                    </th>
+                    <th className={cn(tableCellClass, "text-left")} scope="col">
+                      Tipo
+                    </th>
+                    <th className={cn(tableCellClass, "text-left")} scope="col">
+                      Cantidad
+                    </th>
+                    <th className={cn(tableCellClass, "text-left")} scope="col">
+                      Motivo
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
                   {kardex.rows.map((row) => (
-                    <tr key={row.id} className="border-b border-slate-200 dark:border-slate-800">
-                      <td className="py-2 pr-3">{new Date(row.created_at).toLocaleString("es-CO")}</td>
-                      <td className="py-2 pr-3 font-mono">{row.type}</td>
-                      <td className="py-2 pr-3">{row.qty}</td>
-                      <td className="py-2">{row.reason}</td>
+                    <tr key={row.id} className={tableRowClass}>
+                      <td className={tableCellClass}>{new Date(row.created_at).toLocaleString("es-CO")}</td>
+                      <td className={cn(tableCellClass, "font-mono")}>{row.type}</td>
+                      <td className={tableCellClass}>{row.qty}</td>
+                      <td className={tableCellClass}>{row.reason}</td>
                     </tr>
                   ))}
                 </tbody>

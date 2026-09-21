@@ -1,7 +1,6 @@
 "use client";
 
 import { useState, useTransition, type FormEvent } from "react";
-import { Banknote, CalendarDays, Clock3, Coins, ReceiptText, X } from "lucide-react";
 import {
   closeShiftAction,
   getDayViewAction,
@@ -17,28 +16,6 @@ import type {
   HistoryResult,
 } from "@/src/features/cash/service";
 import type { PaymentMethodRow } from "@/src/features/admin/service";
-import { Badge } from "@/src/components/ui/lib/badge";
-import { Button } from "@/src/components/ui/lib/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/src/components/ui/lib/card";
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/src/components/ui/lib/dialog";
-import { Input } from "@/src/components/ui/lib/input";
-import { Label } from "@/src/components/ui/lib/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/src/components/ui/lib/select";
 import { cn } from "@/src/components/ui/lib/utils";
 
 const sectionClass = cn(
@@ -122,9 +99,9 @@ export function CashClient(props: CashClientProps) {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [isOpeningDialogOpen, setIsOpeningDialogOpen] = useState(false);
-  const [isPaymentDialogOpen, setIsPaymentDialogOpen] = useState(false);
-  const [isClosingDialogOpen, setIsClosingDialogOpen] = useState(false);
+  const [, setIsOpeningDialogOpen] = useState(false);
+  const [, setIsPaymentDialogOpen] = useState(false);
+  const [, setIsClosingDialogOpen] = useState(false);
   // Transición para los cambios de vista (día/historial): la UI no se
   // congela mientras la server action responde.
   const [isViewPending, startViewTransition] = useTransition();
