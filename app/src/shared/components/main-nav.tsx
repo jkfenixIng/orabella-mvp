@@ -117,7 +117,7 @@ export function MainNav() {
         aria-current={homeActive ? "page" : undefined}
         className={
           homeActive
-            ? "flex items-center gap-2 rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white dark:bg-slate-100 dark:text-slate-900"
+            ? "flex items-center gap-2 rounded-md bg-primary-600 px-3 py-2 text-sm font-medium text-white"
             : "flex items-center gap-2 rounded-md px-3 py-2 text-sm text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
         }
       >
@@ -158,7 +158,7 @@ export function MainNav() {
                         title={link.description}
                         className={
                           linkActive
-                            ? "flex items-center gap-2 rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white dark:bg-slate-100 dark:text-slate-900"
+                            ? "flex items-center gap-2 rounded-md bg-primary-600 px-3 py-2 text-sm font-medium text-white"
                             : "flex items-center gap-2 rounded-md px-3 py-2 text-sm text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
                         }
                       >
@@ -194,7 +194,7 @@ export function MainNav() {
   return (
     <>
       {/* Barra superior: visible en móvil y tableta */}
-      <header className="sticky top-0 z-30 flex items-center justify-between gap-3 border-b border-slate-200 bg-white px-4 py-3 lg:hidden dark:border-slate-700 dark:bg-slate-900">
+      <header className="sticky top-0 z-30 flex items-center justify-between gap-3 border-b border-slate-200 bg-white px-4 py-3 lg:hidden dark:border-slate-700 dark:bg-primary-600">
         <Link href="/" className="text-lg font-bold" aria-label="Orabella inicio">
           Orabella
         </Link>
@@ -214,7 +214,7 @@ export function MainNav() {
       {drawerOpen && (
         <div className="fixed inset-0 z-40 lg:hidden">
           <div
-            className="absolute inset-0 bg-black/40"
+            className="absolute inset-0 bg-black/40 backdrop-blur-sm"
             aria-hidden="true"
             onClick={() => setDrawerOpen(false)}
           />
@@ -223,7 +223,7 @@ export function MainNav() {
             role="dialog"
             aria-modal="true"
             aria-label="Menú principal"
-            className="absolute left-0 top-0 flex h-full w-72 flex-col gap-4 overflow-y-auto bg-white p-4 dark:bg-slate-900"
+            className="absolute left-0 top-0 flex h-full w-72 flex-col gap-4 overflow-y-auto bg-white p-4 dark:bg-primary-600"
           >
             <div className="flex items-center justify-between">
               <span className="text-lg font-bold">Orabella</span>
@@ -247,8 +247,8 @@ export function MainNav() {
         aria-label="Barra lateral"
         className={
           sidebarCollapsed
-            ? "sticky top-0 hidden h-screen w-16 flex-col gap-4 overflow-y-auto border-r border-slate-200 bg-white p-2 lg:flex dark:border-slate-700 dark:bg-slate-900"
-            : "sticky top-0 hidden h-screen w-64 flex-col gap-4 overflow-y-auto border-r border-slate-200 bg-white p-4 lg:flex dark:border-slate-700 dark:bg-slate-900"
+            ? "sticky top-0 hidden h-screen w-16 flex-col gap-4 overflow-y-auto border-r border-slate-200 bg-white p-2 lg:flex dark:border-slate-700 dark:bg-primary-600"
+            : "sticky top-0 hidden h-screen w-64 flex-col gap-4 overflow-y-auto border-r border-slate-200 bg-white p-4 lg:flex dark:border-slate-700 dark:bg-primary-600"
         }
       >
         <div className="flex items-center justify-between gap-2">
@@ -287,7 +287,7 @@ export function MainNav() {
                   aria-current={isActive(pathname, link.href) ? "page" : undefined}
                   className={
                     isActive(pathname, link.href)
-                      ? "flex justify-center rounded-md bg-slate-900 px-3 py-2 text-center text-sm font-medium text-white dark:bg-slate-100 dark:text-slate-900"
+                      ? "flex justify-center rounded-md bg-primary-600 px-3 py-2 text-center text-sm font-medium text-white"
                       : "flex justify-center rounded-md px-3 py-2 text-center text-sm hover:bg-slate-100 dark:hover:bg-slate-800"
                   }
                 >
