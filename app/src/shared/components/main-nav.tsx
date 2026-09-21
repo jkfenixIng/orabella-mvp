@@ -3,12 +3,14 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState, useEffect } from "react";
+import { Calculator, House, Package, Receipt, Settings, Wallet, type LucideIcon } from "lucide-react";
 import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 
 interface NavLink {
   href: string;
   label: string;
   description: string;
+  Icon: LucideIcon;
 }
 
 interface NavGroup {
@@ -21,41 +23,45 @@ const NAV_GROUPS: NavGroup[] = [
   {
     id: "operacion",
     label: "Operación",
-    links: [
-      {
-        href: "/invoices",
-        label: "Facturación",
-        description: "Crear y cobrar facturas",
-      },
-      { href: "/cash", label: "Caja", description: "Turnos y cierre del día" },
-    ],
+      links: [
+        {
+          href: "/invoices",
+          label: "Facturación",
+          description: "Crear y cobrar facturas",
+          Icon: Receipt,
+        },
+        { href: "/cash", label: "Caja", description: "Turnos y cierre del día", Icon: Wallet },
+      ],
   },
   {
     id: "catalogos",
     label: "Catálogos",
-    links: [
-      {
-        href: "/inventory",
-        label: "Inventario",
-        description: "Productos y existencias",
-      },
-      {
-        href: "/admin",
-        label: "Administración",
-        description: "Empleados, servicios y precios",
-      },
-    ],
+      links: [
+        {
+          href: "/inventory",
+          label: "Inventario",
+          description: "Productos y existencias",
+          Icon: Package,
+        },
+        {
+          href: "/admin",
+          label: "Administración",
+          description: "Empleados, servicios y precios",
+          Icon: Settings,
+        },
+      ],
   },
   {
     id: "contable",
     label: "Contable",
-    links: [
-      {
-        href: "/payroll",
-        label: "Nómina y vales",
-        description: "Pagos al personal",
-      },
-    ],
+      links: [
+        {
+          href: "/payroll",
+          label: "Nómina y vales",
+          description: "Pagos al personal",
+          Icon: Calculator,
+        },
+      ],
   },
 ];
 
@@ -111,10 +117,11 @@ export function MainNav() {
         aria-current={homeActive ? "page" : undefined}
         className={
           homeActive
-            ? "rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white dark:bg-slate-100 dark:text-slate-900"
-            : "rounded-md px-3 py-2 text-sm text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+            ? "flex items-center gap-2 rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white dark:bg-slate-100 dark:text-slate-900"
+            : "flex items-center gap-2 rounded-md px-3 py-2 text-sm text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
         }
       >
+        <House className="h-4 w-4" aria-hidden="true" />
         Inicio
       </Link>
       {NAV_GROUPS.map((group) => {
@@ -151,10 +158,11 @@ export function MainNav() {
                         title={link.description}
                         className={
                           linkActive
-                            ? "block rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white dark:bg-slate-100 dark:text-slate-900"
-                            : "block rounded-md px-3 py-2 text-sm text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+                            ? "flex items-center gap-2 rounded-md bg-slate-900 px-3 py-2 text-sm font-medium text-white dark:bg-slate-100 dark:text-slate-900"
+                            : "flex items-center gap-2 rounded-md px-3 py-2 text-sm text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
                         }
                       >
+                        <link.Icon className="h-4 w-4" aria-hidden="true" />
                         {link.label}
                       </Link>
                     </li>
@@ -279,11 +287,11 @@ export function MainNav() {
                   aria-current={isActive(pathname, link.href) ? "page" : undefined}
                   className={
                     isActive(pathname, link.href)
-                      ? "rounded-md bg-slate-900 px-3 py-2 text-center text-sm font-medium text-white dark:bg-slate-100 dark:text-slate-900"
-                      : "rounded-md px-3 py-2 text-center text-sm hover:bg-slate-100 dark:hover:bg-slate-800"
+                      ? "flex justify-center rounded-md bg-slate-900 px-3 py-2 text-center text-sm font-medium text-white dark:bg-slate-100 dark:text-slate-900"
+                      : "flex justify-center rounded-md px-3 py-2 text-center text-sm hover:bg-slate-100 dark:hover:bg-slate-800"
                   }
                 >
-                  {link.label.charAt(0)}
+                  <link.Icon className="h-4 w-4" aria-hidden="true" />
                 </Link>
               )),
             )}
