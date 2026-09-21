@@ -101,7 +101,7 @@ export default async function HomePage() {
               <Link
                 href={module.href}
                 aria-label={`Ir a ${module.name}`}
-                className="mt-auto inline-block w-fit rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700"
+                className="mt-auto inline-block w-fit rounded-md bg-slate-200 px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-300 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700"
               >
                 Entrar
               </Link>

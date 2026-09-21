@@ -84,7 +84,7 @@ export function LoginForm({ next }: { next?: string }) {
           Ya puede operar con su nueva clave.
         </p>
         <a
-          className="mt-4 inline-block rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white dark:bg-slate-100 dark:text-slate-900"
+          className="mt-4 inline-block rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white dark:bg-slate-800 dark:text-slate-100"
           href={next ?? "/"}
         >
           Entrar
@@ -129,7 +129,7 @@ export function LoginForm({ next }: { next?: string }) {
           <button
             type="submit"
             disabled={busy}
-            className="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900"
+            className="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-slate-800 dark:text-slate-100"
           >
             {busy ? "Guardando…" : "Cambiar clave"}
           </button>
@@ -168,7 +168,7 @@ export function LoginForm({ next }: { next?: string }) {
       <button
         type="submit"
         disabled={busy}
-        className="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900"
+        className="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-slate-800 dark:text-slate-100"
       >
         {busy ? "Ingresando…" : "Ingresar"}
       </button>

@@ -49,7 +49,7 @@ export function ThemeToggle() {
           }}
           className={
             current === option.value
-              ? "rounded-md bg-slate-900 px-3 py-1 text-sm text-white dark:bg-slate-100 dark:text-slate-900"
+              ? "rounded-md bg-slate-200 px-3 py-1 text-sm text-slate-900 dark:bg-slate-800 dark:text-slate-100"
               : "rounded-md px-3 py-1 text-sm text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
           }
         >
