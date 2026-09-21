@@ -1,6 +1,7 @@
 "use server";
 
 import { cookies } from "next/headers";
+import { revalidateTag } from "next/cache";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import {
   AdminError,
@@ -54,6 +55,7 @@ export async function upsertEmployeeAction(input: unknown) {
         (input as { sede_id?: string }).sede_id,
       ),
     });
+    revalidateTag("catalog:employees");
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -90,6 +92,7 @@ export async function upsertServiceAction(input: unknown) {
       ...(typeof input === "object" && input !== null ? input : {}),
       sede_id: resolveSede(session.sedeId, (input as { sede_id?: string }).sede_id),
     });
+    revalidateTag("catalog:services");
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -114,6 +117,7 @@ export async function upsertTaxConfigAction(input: unknown) {
       ...(typeof input === "object" && input !== null ? input : {}),
       sede_id: resolveSede(session.sedeId, (input as { sede_id?: string }).sede_id),
     });
+    revalidateTag("catalog:taxes");
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -141,6 +145,7 @@ export async function upsertPaymentMethodAction(input: unknown) {
       ...(typeof input === "object" && input !== null ? input : {}),
       sede_id: resolveSede(session.sedeId, (input as { sede_id?: string }).sede_id),
     });
+    revalidateTag("catalog:payment-methods");
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -162,6 +167,7 @@ export async function upsertSedeAction(input: unknown) {
   try {
     await requireAdminSession(await sessionToken());
     const data = await upsertSede(input);
+    revalidateTag("catalog:sedes");
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

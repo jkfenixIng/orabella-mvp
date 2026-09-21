@@ -14,6 +14,7 @@ import {
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
+import { unstable_cache } from "next/cache";
 
 export class AdminError extends Error {
   readonly code: string;
@@ -47,6 +48,14 @@ function clampLimit(limit: number | undefined, def = 50, max = 500): number {
   if (!Number.isFinite(limit)) return def;
   return Math.min(max, Math.max(1, Math.floor(limit)));
 }
+
+/**
+ * Caché de catálogos (lecturas de referencia que cambian rara vez).
+ * Frescura por evento: cada mutación del admin invalida su etiqueta con
+ * revalidateTag, así un cambio se ve al instante. `revalidate` (1 hora)
+ * es solo el respaldo por si la base se edita fuera de la app.
+ */
+const CATALOG_TTL_SECONDS = 3600;
 
 function validationMessage(error: { issues: Array<{ message: string }> }): string {
   return error.issues[0]?.message ?? "Datos inválidos.";
@@ -118,7 +127,7 @@ export interface SedeRow {
   is_active: boolean;
 }
 
-export async function listSedes(limit?: number): Promise<SedeRow[]> {
+async function fetchSedes(limit?: number): Promise<SedeRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("sedes")
@@ -166,7 +175,7 @@ export interface EmployeeRow {
   is_active: boolean;
 }
 
-export async function listEmployees(sedeId: string, limit?: number): Promise<EmployeeRow[]> {
+async function fetchEmployees(sedeId: string, limit?: number): Promise<EmployeeRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("employees")
@@ -268,7 +277,7 @@ export interface ServiceRow {
 const SERVICE_SELECT =
   "id, sede_id, name, description, price, duracion_min, duracion_max, is_active";
 
-export async function listServices(sedeId: string, limit?: number): Promise<ServiceRow[]> {
+async function fetchServices(sedeId: string, limit?: number): Promise<ServiceRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("services")
@@ -317,7 +326,7 @@ export interface TaxConfigRow {
 
 const TAX_SELECT = "id, sede_id, code, name, percent, is_active";
 
-export async function listTaxes(sedeId: string, limit?: number): Promise<TaxConfigRow[]> {
+async function fetchTaxes(sedeId: string, limit?: number): Promise<TaxConfigRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("tax_configs")
@@ -363,7 +372,7 @@ export interface PaymentMethodRow {
 
 const PAYMENT_METHOD_SELECT = "id, sede_id, code, name, is_active";
 
-export async function listPaymentMethods(sedeId: string, limit?: number): Promise<PaymentMethodRow[]> {
+async function fetchPaymentMethods(sedeId: string, limit?: number): Promise<PaymentMethodRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("payment_methods")
@@ -431,3 +440,30 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
 
   return { user_id: parsed.data.user_id, roles: parsed.data.roles };
 }
+
+// ------------------------------------------ listados con caché (catálogos) ---
+
+export const listSedes = unstable_cache(fetchSedes, ["catalog:sedes"], {
+  tags: ["catalog:sedes"],
+  revalidate: CATALOG_TTL_SECONDS,
+});
+
+export const listEmployees = unstable_cache(fetchEmployees, ["catalog:employees"], {
+  tags: ["catalog:employees"],
+  revalidate: CATALOG_TTL_SECONDS,
+});
+
+export const listServices = unstable_cache(fetchServices, ["catalog:services"], {
+  tags: ["catalog:services"],
+  revalidate: CATALOG_TTL_SECONDS,
+});
+
+export const listTaxes = unstable_cache(fetchTaxes, ["catalog:taxes"], {
+  tags: ["catalog:taxes"],
+  revalidate: CATALOG_TTL_SECONDS,
+});
+
+export const listPaymentMethods = unstable_cache(fetchPaymentMethods, ["catalog:payment-methods"], {
+  tags: ["catalog:payment-methods"],
+  revalidate: CATALOG_TTL_SECONDS,
+});
