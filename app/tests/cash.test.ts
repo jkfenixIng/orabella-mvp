@@ -39,13 +39,15 @@ describe("cash: rechazo de doble apertura (CAJ-01, sin solape)", () => {
     expect(() => assertNoOpenShift(false)).not.toThrow();
   });
 
-  it("apertura acepta caja opcional (Caja única por defecto)", () => {
-    expect(openShiftSchema.safeParse({}).success).toBe(true);
+  it("apertura exige pre-arqueo y acepta caja opcional (Caja única por defecto)", () => {
+    const counts = [{ method_code: "efectivo", denomination: 50000, quantity: 4, amount: 200000 }];
+    expect(openShiftSchema.safeParse({}).success).toBe(false);
+    expect(openShiftSchema.safeParse({ counts }).success).toBe(true);
     expect(
-      openShiftSchema.safeParse({ cash_register_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" })
+      openShiftSchema.safeParse({ cash_register_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", counts })
         .success,
     ).toBe(true);
-    expect(openShiftSchema.safeParse({ cash_register_id: "no-uuid" }).success).toBe(false);
+    expect(openShiftSchema.safeParse({ cash_register_id: "no-uuid", counts }).success).toBe(false);
   });
 });
 
@@ -61,11 +63,19 @@ describe("cash: cierre exige conteo de efectivo (CAJ-03)", () => {
     ).toThrowError("COUNT_REQUIRED");
   });
 
-  it("el esquema exige conteo y base dejada", () => {
-    expect(closeShiftSchema.safeParse({ counted_cash: 400000, base_left: 200000 }).success).toBe(true);
+  it("el esquema exige conteo, base dejada, detalle y confirmación", () => {
+    const base = {
+      counted_cash: 400000,
+      base_left: 200000,
+      counts: [{ method_code: "efectivo", denomination: 50000, quantity: 8, amount: 400000 }],
+      confirmed: true,
+    };
+    expect(closeShiftSchema.safeParse(base).success).toBe(true);
     expect(closeShiftSchema.safeParse({ base_left: 200000 }).success).toBe(false);
     expect(closeShiftSchema.safeParse({ counted_cash: 400000 }).success).toBe(false);
     expect(closeShiftSchema.safeParse({ counted_cash: -1, base_left: 200000 }).success).toBe(false);
+    expect(closeShiftSchema.safeParse({ ...base, confirmed: false }).success).toBe(false);
+    expect(closeShiftSchema.safeParse({ counted_cash: 400000, base_left: 200000 }).success).toBe(false);
   });
 });
 

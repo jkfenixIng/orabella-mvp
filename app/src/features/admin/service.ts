@@ -368,9 +368,10 @@ export interface PaymentMethodRow {
   code: string;
   name: string;
   is_active: boolean;
+  arqueable: boolean;
 }
 
-const PAYMENT_METHOD_SELECT = "id, sede_id, code, name, is_active";
+const PAYMENT_METHOD_SELECT = "id, sede_id, code, name, is_active, arqueable";
 
 async function fetchPaymentMethods(sedeId: string, limit?: number): Promise<PaymentMethodRow[]> {
   const db = await adminDb();
@@ -396,6 +397,7 @@ export async function upsertPaymentMethod(raw: unknown): Promise<PaymentMethodRo
     code: input.code,
     name: input.name,
     ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
+    ...(input.arqueable !== undefined ? { arqueable: input.arqueable } : {}),
   };
   const { data, error } = await db
     .from("payment_methods")

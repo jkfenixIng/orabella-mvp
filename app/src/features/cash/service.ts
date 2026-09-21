@@ -15,6 +15,7 @@ import {
   type DayTotals,
   type OpenShiftInput,
   type RegisterPaymentInput,
+  type ShiftCountInput,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
@@ -26,6 +27,7 @@ import {
 } from "@/src/features/admin/service";
 import { BillingError, getInvoiceDetail } from "@/src/features/billing/service";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
+import { z } from "zod";
 
 export class CashError extends Error {
   readonly code: string;
@@ -162,6 +164,118 @@ export interface CashActor {
   roles?: RoleCode[];
 }
 
+export interface ShiftCountRow {
+  id: string;
+  shift_id: string;
+  phase: "apertura" | "cierre";
+  method_code: string;
+  denomination: number | null;
+  quantity: number;
+  amount: number;
+}
+
+export interface MethodDifference {
+  method_code: string;
+  expected: number;
+  declared: number;
+  difference: number;
+}
+
+/** Denominaciones COP para el conteo de efectivo (billetes y monedas). */
+export const CASH_DENOMINATIONS = [100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 200, 100, 50];
+
+// ------------------------------------------------------------------ conteos ---
+
+/**
+ * Valida las líneas de conteo contra los métodos arqueables activos.
+ * Efectivo por denominación (amount debe cuadrar con denom*qty);
+ * digitales con total declarado. Devuelve totales por método.
+ */
+export async function checkCounts(
+  sedeId: string,
+  counts: ShiftCountInput[],
+): Promise<Map<string, number>> {
+  const methods = await listPaymentMethods(sedeId);
+  const allowed = new Map(methods.filter((m) => m.is_active && m.arqueable).map((m) => [m.code, m]));
+  const byMethod = new Map<string, ShiftCountInput[]>();
+  for (const line of counts) {
+    const method = allowed.get(line.method_code);
+    if (!method) {
+      throw new CashError("VALIDATION", `Método no arqueable: ${line.method_code}.`, 400);
+    }
+    if (line.method_code === "efectivo") {
+      if (line.denomination == null || line.denomination <= 0) {
+        throw new CashError("VALIDATION", "El efectivo se cuenta por denominación.", 400);
+      }
+      if (!moneyEquals(line.amount, roundMoney(line.denomination * line.quantity))) {
+        throw new CashError("COUNT_MISMATCH", "El detalle del efectivo no cuadra con el total.", 422);
+      }
+    } else if (line.denomination != null || line.quantity !== 1) {
+      throw new CashError("VALIDATION", "Los métodos digitales se declaran con el total.", 400);
+    }
+    const group = byMethod.get(line.method_code) ?? [];
+    group.push(line);
+    byMethod.set(line.method_code, group);
+  }
+  for (const method of allowed.keys()) {
+    if (!byMethod.has(method)) {
+      throw new CashError("COUNT_REQUIRED", `Falta el conteo de ${method}.`, 400);
+    }
+  }
+  const totals = new Map<string, number>();
+  for (const line of counts) {
+    totals.set(line.method_code, roundMoney((totals.get(line.method_code) ?? 0) + line.amount));
+  }
+  return totals;
+}
+
+async function insertCounts(
+  db: DbClient,
+  shiftId: string,
+  phase: "apertura" | "cierre",
+  counts: ShiftCountInput[],
+): Promise<void> {
+  const rows = counts.map((line) => ({
+    shift_id: shiftId,
+    phase,
+    method_code: line.method_code,
+    denomination: line.denomination ?? null,
+    quantity: line.quantity,
+    amount: roundMoney(line.amount),
+  }));
+  const { error } = await db.from("cash_shift_counts").insert(rows);
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+}
+
+/** Totales del último cierre (por método) para validar la apertura. */
+async function previousCloseTotals(
+  db: DbClient,
+  registerId: string,
+): Promise<{ baseLeft: number | null; byMethod: Map<string, number>; hasCounts: boolean } | null> {
+  const { data: last, error: lastError } = await db
+    .from("cash_shifts")
+    .select("id, base_left")
+    .eq("cash_register_id", registerId)
+    .eq("status", "cerrado")
+    .order("closed_at", { ascending: false })
+    .order("opened_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (lastError) throw new CashError("INTERNAL", "Error interno.", 500);
+  if (!last) return null;
+  const { data: counts, error: countsError } = await db
+    .from("cash_shift_counts")
+    .select("method_code, amount")
+    .eq("shift_id", (last as { id: string }).id)
+    .eq("phase", "cierre");
+  if (countsError) throw new CashError("INTERNAL", "Error interno.", 500);
+  const byMethod = new Map<string, number>();
+  for (const row of ((counts ?? []) as Array<{ method_code: string; amount: number | string }>)) {
+    byMethod.set(row.method_code, roundMoney((byMethod.get(row.method_code) ?? 0) + Number(row.amount)));
+  }
+  return { baseLeft: (last as { base_left: number | null }).base_left, byMethod, hasCounts: byMethod.size > 0 };
+}
+
 // --------------------------------------------------------------- registros ---
 
 /** Lista las cajas de la sede (el MVP opera la "Caja única"). */
@@ -293,6 +407,41 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<CashShi
     const lastBaseLeft = (last as { base_left: number | null } | null)?.base_left ?? null;
     const openingBase = resolveOpeningBase(lastBaseLeft, Number(register.base_configurada));
 
+    // Pre-arqueo: el conteo declarado debe coincidir con el último cierre
+    // (efectivo contra la base que se dejó; digitales contra sus totales).
+    // Sin coincidencia no se abre y queda alerta para administradores.
+    const declared = await checkCounts(actor.sedeId, input.counts);
+    const prev = await previousCloseTotals(db, register.id);
+    const mismatches: Array<{ method_code: string; expected: number; declared: number }> = [];
+    const cashDeclared = declared.get("efectivo") ?? 0;
+    if (!moneyEquals(cashDeclared, openingBase)) {
+      mismatches.push({ method_code: "efectivo", expected: openingBase, declared: cashDeclared });
+    }
+    if (prev?.hasCounts) {
+      for (const [code, total] of declared) {
+        if (code === "efectivo") continue;
+        const expected = prev.byMethod.get(code) ?? 0;
+        if (!moneyEquals(total, expected)) {
+          mismatches.push({ method_code: code, expected, declared: total });
+        }
+      }
+    }
+    if (mismatches.length > 0) {
+      await writeAudit({
+        sede_id: actor.sedeId,
+        user_id: actor.userId,
+        action: AUDIT_ACTIONS.SHIFT_OPEN_MISMATCH,
+        entity: "cash_registers",
+        entity_id: register.id,
+        metadata: { opening_base: openingBase, mismatches },
+      });
+      throw new CashError(
+        "OPENING_MISMATCH",
+        "El pre-arqueo no coincide con el cierre anterior. Se alertó a los administradores.",
+        422,
+      );
+    }
+
     const { data: created, error: createError } = await db
       .from("cash_shifts")
       .insert({
@@ -317,6 +466,7 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<CashShi
       throw new CashError("INTERNAL", "Error interno.", 500);
     }
     if (!created) throw new CashError("INTERNAL", "Error interno.", 500);
+    await insertCounts(db, (created as CashShiftRow).id, "apertura", input.counts);
     return created as CashShiftRow;
   } catch (error) {
     throw toCashError(error);
@@ -463,12 +613,17 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
  * recogido (= contado − base) y diferencia (= base − base configurada).
  * Base incompleta (base_left < base_configurada) exige observación.
  */
+export interface CloseShiftResult {
+  shift: CashShiftRow;
+  methodDifferences: MethodDifference[];
+}
+
 export async function closeShift(
   sedeId: string,
   id: string,
   raw: unknown,
   actor: CashActor,
-): Promise<CashShiftRow> {
+): Promise<CloseShiftResult> {
   const parsed = closeShiftSchema.safeParse(raw);
   if (!parsed.success) {
     throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
@@ -497,11 +652,28 @@ export async function closeShift(
       .select("amount, method_code")
       .eq("cash_shift_id", shift.id);
     if (paymentsError) throw new CashError("INTERNAL", "Error interno.", 500);
-    const expectedCash = roundMoney(
-      ((shiftPayments ?? []) as Array<{ amount: number | string; method_code: string }>)
-        .filter((row) => row.method_code === "efectivo")
-        .reduce((acc, row) => acc + Number(row.amount), 0),
-    );
+    const paidByMethod = new Map<string, number>();
+    for (const row of ((shiftPayments ?? []) as Array<{ amount: number | string; method_code: string }>)) {
+      paidByMethod.set(row.method_code, roundMoney((paidByMethod.get(row.method_code) ?? 0) + Number(row.amount)));
+    }
+    const expectedCash = paidByMethod.get("efectivo") ?? 0;
+
+    // El conteo de efectivo sale del detalle por denominación (el sistema
+    // calcula; el total declarado debe cuadrar con el detalle).
+    const declared = await checkCounts(sedeId, input.counts);
+    const countedFromDetail = declared.get("efectivo") ?? 0;
+    if (!moneyEquals(countedFromDetail, input.counted_cash)) {
+      throw new CashError("COUNT_MISMATCH", "El conteo no cuadra con el detalle por denominación.", 422);
+    }
+    // Digitales: lo declarado contra lo cobrado en el turno.
+    const methodDifferences: MethodDifference[] = [];
+    for (const [code, total] of declared) {
+      if (code === "efectivo") continue;
+      const expected = paidByMethod.get(code) ?? 0;
+      if (!moneyEquals(total, expected)) {
+        methodDifferences.push({ method_code: code, expected, declared: total, difference: roundMoney(total - expected) });
+      }
+    }
 
     const close = computeCashClose({
       countedCash: input.counted_cash,
@@ -528,6 +700,7 @@ export async function closeShift(
       .single();
     if (updateError || !updated) throw new CashError("INTERNAL", "Error interno.", 500);
     const closed = updated as CashShiftRow;
+    await insertCounts(db, shift.id, "cierre", input.counts);
     await writeAudit({
       sede_id: sedeId,
       user_id: actor.userId,
@@ -541,13 +714,120 @@ export async function closeShift(
         base_configurada: Number(register.base_configurada),
         base_difference: close.baseDifference,
         base_incompleta: close.baseDifference < 0,
+        method_differences: methodDifferences,
         observation: observation ?? null,
       },
     });
-    return closed;
+    if (methodDifferences.length > 0) {
+      await writeAudit({
+        sede_id: sedeId,
+        user_id: actor.userId,
+        action: AUDIT_ACTIONS.SHIFT_CLOSE_MISMATCH,
+        entity: "cash_shifts",
+        entity_id: shift.id,
+        metadata: { method_differences: methodDifferences },
+      });
+    }
+    return { shift: closed, methodDifferences };
   } catch (error) {
     throw toCashError(error);
   }
+}
+
+/**
+ * CASH: actualiza la base configurada de una caja (solo admin; el gate vive
+ * en actions). Queda rastro de auditoría con el valor anterior y el nuevo.
+ */
+export async function updateRegisterBase(
+  sedeId: string,
+  registerId: string,
+  base: number,
+  actor: CashActor,
+): Promise<CashRegisterRow> {
+  if (!Number.isFinite(base) || base < 0) {
+    throw new CashError("VALIDATION", "Base inválida.", 400);
+  }
+  const db = await cashDb();
+  const register = await resolveRegister(db, sedeId, registerId);
+  const previous = Number(register.base_configurada);
+  const { data: updated, error } = await db
+    .from("cash_registers")
+    .update({ base_configurada: roundMoney(base) })
+    .eq("id", register.id)
+    .select(REGISTER_SELECT)
+    .single();
+  if (error || !updated) throw new CashError("INTERNAL", "Error interno.", 500);
+  await writeAudit({
+    sede_id: sedeId,
+    user_id: actor.userId,
+    action: AUDIT_ACTIONS.REGISTER_BASE_UPDATED,
+    entity: "cash_registers",
+    entity_id: register.id,
+    metadata: { previous_base: previous, new_base: roundMoney(base) },
+  });
+  return updated as CashRegisterRow;
+}
+
+/**
+ * CASH: edita un turno cerrado (solo admin; el gate vive en actions).
+ * Recalcula el sobre y la diferencia; todo cambio queda auditado con
+ * los valores anteriores. Los conteos originales no se tocan.
+ */
+export async function updateClosedShift(
+  sedeId: string,
+  id: string,
+  raw: unknown,
+  actor: CashActor,
+): Promise<CashShiftRow> {
+  const parsed = z.object({
+    counted_cash: z.coerce.number().nonnegative().optional(),
+    base_left: z.coerce.number().nonnegative().optional(),
+    observation: z.string().trim().max(500).nullish(),
+  }).safeParse(raw);
+  if (!parsed.success) {
+    throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
+  }
+  const db = await cashDb();
+  const shift = await getShiftOrThrow(db, sedeId, id);
+  if (shift.status !== "cerrado") {
+    throw new CashError("VALIDATION", "Solo se editan turnos cerrados.", 400);
+  }
+  const register = await resolveRegister(db, sedeId, shift.cash_register_id);
+  const counted = parsed.data.counted_cash ?? Number(shift.counted_cash);
+  const left = parsed.data.base_left ?? Number(shift.base_left);
+  const close = computeCashClose({
+    countedCash: counted,
+    baseLeft: left,
+    baseConfigurada: Number(register.base_configurada),
+  });
+  const observation = parsed.data.observation !== undefined
+    ? (parsed.data.observation?.trim() ? parsed.data.observation.trim() : null)
+    : shift.observation;
+  const { data: updated, error } = await db
+    .from("cash_shifts")
+    .update({
+      counted_cash: roundMoney(counted),
+      base_left: roundMoney(left),
+      cash_withdrawn: close.cashWithdrawn,
+      base_difference: close.baseDifference,
+      observation,
+    })
+    .eq("id", shift.id)
+    .select(SHIFT_SELECT)
+    .single();
+  if (error || !updated) throw new CashError("INTERNAL", "Error interno.", 500);
+  await writeAudit({
+    sede_id: sedeId,
+    user_id: actor.userId,
+    action: AUDIT_ACTIONS.SHIFT_EDITED,
+    entity: "cash_shifts",
+    entity_id: shift.id,
+    metadata: {
+      previous: { counted_cash: shift.counted_cash, base_left: shift.base_left, observation: shift.observation },
+      updated: { counted_cash: roundMoney(counted), base_left: roundMoney(left), observation },
+    },
+  });
+  return updated as CashShiftRow;
 }
 
 // -------------------------------------------------------- día e historial ---

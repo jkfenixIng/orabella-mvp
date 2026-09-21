@@ -9,9 +9,23 @@ export type ShiftStatus = z.infer<typeof shiftStatusSchema>;
 
 const uuidSchema = z.uuid("Identificador inválido.");
 
+/**
+ * CASH: línea de conteo de apertura/cierre. Efectivo por denominación
+ * (cantidad de billetes/monedas); digitales con denomination null,
+ * quantity 1 y el total declarado en amount.
+ */
+export const shiftCountSchema = z.object({
+  method_code: z.string().trim().min(1, "Método requerido.").max(40, "Método muy largo."),
+  denomination: z.coerce.number().positive("Denominación inválida.").nullish(),
+  quantity: z.coerce.number().int().nonnegative("Cantidad inválida."),
+  amount: z.coerce.number().nonnegative("Monto inválido."),
+});
+export type ShiftCountInput = z.infer<typeof shiftCountSchema>;
+
 /** CAJ-01: apertura (la caja se resuelve a la "Caja única" de la sede si se omite). */
 export const openShiftSchema = z.object({
   cash_register_id: uuidSchema.optional(),
+  counts: z.array(shiftCountSchema).min(1, "El pre-arqueo es obligatorio para abrir."),
 });
 export type OpenShiftInput = z.infer<typeof openShiftSchema>;
 
@@ -33,6 +47,8 @@ export const closeShiftSchema = z.object({
   counted_cash: z.coerce.number({ error: "El conteo de efectivo es obligatorio." }).nonnegative("El conteo no puede ser negativo."),
   base_left: z.coerce.number({ error: "La base dejada es obligatoria." }).nonnegative("La base no puede ser negativa."),
   observation: z.string().trim().max(500, "Observación muy larga.").nullish(),
+  counts: z.array(shiftCountSchema).min(1, "El detalle del conteo es obligatorio para cerrar."),
+  confirmed: z.boolean().refine((value) => value === true, "Confirme el cierre: después no se puede modificar."),
 });
 export type CloseShiftInput = z.infer<typeof closeShiftSchema>;
 

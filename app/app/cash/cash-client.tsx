@@ -215,7 +215,7 @@ export function CashClient(props: CashClientProps) {
         observation: observation.trim() || undefined,
       });
       if (result.success) {
-        showResult(result, `Turno cerrado. Recogido ${formatMoney(result.data.cash_withdrawn)}.`);
+        showResult(result, `Turno cerrado. Recogido ${formatMoney(result.data.shift.cash_withdrawn)}.`);
         setOpenShift(null);
         setCountedCash("");
         setBaseLeft("");

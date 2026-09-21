@@ -2,7 +2,7 @@
 
 import { cookies } from "next/headers";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede, requireSession } from "@/src/features/admin/service";
+import { resolveSede, requireSession, requireAdminSession } from "@/src/features/admin/service";
 import {
   CashError,
   closeShift,
@@ -13,6 +13,8 @@ import {
   openShift,
   registerPayment,
   requireCashWriter,
+  updateClosedShift,
+  updateRegisterBase,
 } from "./service";
 
 async function sessionToken(): Promise<string | undefined> {
@@ -112,6 +114,35 @@ export async function listRegistersAction() {
   try {
     const session = await requireSession(await sessionToken());
     const data = await listRegisters(session.sedeId);
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Base configurada de la caja (solo admin, queda auditado). */
+export async function updateRegisterBaseAction(registerId: string, input: unknown) {
+  try {
+    const session = await requireAdminSession(await sessionToken());
+    const base = (input as { base_configurada?: unknown }).base_configurada;
+    const data = await updateRegisterBase(session.sedeId, registerId, Number(base), {
+      userId: session.userId,
+      sedeId: session.sedeId,
+    });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Edición de turno cerrado (solo admin, queda auditado). */
+export async function updateClosedShiftAction(id: string, input: unknown) {
+  try {
+    const session = await requireAdminSession(await sessionToken());
+    const data = await updateClosedShift(session.sedeId, id, input, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+    });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
