@@ -3,11 +3,7 @@ import { redirect } from "next/navigation";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { listEmployees, listPaymentMethods } from "@/src/features/admin/service";
-import {
-  getVoucherSettings,
-  listPeriods,
-  listVouchers,
-} from "@/src/features/payroll/service";
+import { listPeriods } from "@/src/features/payroll/service";
 import { PayrollClient } from "./payroll-client";
 
 export const dynamic = "force-dynamic";
@@ -36,11 +32,9 @@ export default async function PayrollPage() {
     );
   }
 
-  const [employees, periods, settings, vouchers, methods] = await Promise.all([
+  const [employees, periods, methods] = await Promise.all([
     listEmployees(sedeId),
     listPeriods(sedeId),
-    getVoucherSettings(sedeId),
-    listVouchers(sedeId),
     listPaymentMethods(sedeId),
   ]);
 
@@ -61,8 +55,6 @@ export default async function PayrollPage() {
         sedeId={sedeId}
         initialEmployees={employees}
         initialPeriods={periods}
-        initialSettings={settings}
-        initialVouchers={vouchers}
         methods={methods.filter((row) => row.is_active)}
         canAdmin={canAdmin}
         canPay={canPay}

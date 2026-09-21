@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState, useEffect } from "react";
-import { Calculator, House, Package, Receipt, Settings, Wallet, type LucideIcon } from "lucide-react";
+import { Calculator, House, Package, Receipt, Settings, Ticket, Wallet, type LucideIcon } from "lucide-react";
 import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 
 interface NavLink {
@@ -61,10 +61,17 @@ const NAV_GROUPS: NavGroup[] = [
       links: [
         {
           href: "/payroll",
-          label: "Nómina y vales",
+          label: "Nómina",
           description: "Pagos al personal",
           Icon: Calculator,
           roles: ["admin", "empleado"],
+        },
+        {
+          href: "/vales",
+          label: "Vales",
+          description: "Vales para empleados",
+          Icon: Ticket,
+          roles: ["admin", "caja", "empleado"],
         },
       ],
   },

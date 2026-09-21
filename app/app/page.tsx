@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { Calculator, Package, Receipt, Settings, TriangleAlert, Wallet } from "lucide-react";
+import { Calculator, Package, Receipt, Settings, Ticket, TriangleAlert, Wallet } from "lucide-react";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { listProducts } from "@/src/features/inventory/service";
@@ -38,10 +38,17 @@ const MODULES = [
   },
   {
     href: "/payroll",
-    name: "Nómina y vales",
-    purpose: "Calcule la nómina del personal desde la facturación y controle vales y aprobaciones.",
+    name: "Nómina",
+    purpose: "Calcule la nómina del personal desde la facturación.",
     Icon: Calculator,
     roles: ["admin", "empleado"],
+  },
+  {
+    href: "/vales",
+    name: "Vales",
+    purpose: "Solicite y apruebe vales para empleados con topes.",
+    Icon: Ticket,
+    roles: ["admin", "caja", "empleado"],
   },
 ] as const;
 
