@@ -25,7 +25,7 @@ Preparar ambientes de pruebas y productivo. Productivo debe quedar limpio en pro
 - [x] ENV-05 Verificar limpieza (counts finales) - users 1, products 0, inventory_movements 0, cash_shifts 0, payments 0, voucher_requests 0, audit_logs 0 - OK
 - [x] ENV-06 Vercel CLI login (jkfenixing) + link orabella + env prod (URL+anon JWT prod) verificado
 - [x] ENV-07 Vercel Preview apuntado al test (URL test + publishable test + secret test como Secret) - verificado con env pull preview
-- [ ] ENV-08 Cargar esquema en test vía SQL Editor (usuario pega test-bootstrap.sql) y verificar counts
+- [x] ENV-08 Esquema cargado en test vía pooler ca-central-1 (001→010 + acceptance.sql) - users 10, products 3, services 4, methods 6, registers 1 verificados
 
 ## Alcance autorizado
 - Solo tablas de negocio indicadas. No tocar migrations. No tocar API/ ni front/ legacy.
