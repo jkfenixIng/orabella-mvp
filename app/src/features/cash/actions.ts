@@ -4,6 +4,7 @@ import { cookies } from "next/headers";
 import { revalidateTag } from "next/cache";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { resolveSede, requireSession, requireAdminSession } from "@/src/features/admin/service";
+import { accumulateDayTotals } from "./schemas";
 import {
   CashError,
   closeShift,
@@ -86,23 +87,41 @@ export async function getOpenShiftAction() {
   }
 }
 
-/** Misma lógica que GET /api/v1/cash/day (requiere sesión, solo su sede). */
+/** Misma lógica que GET /api/v1/cash/day (admin ve todo; caja solo sus turnos). */
 export async function getDayViewAction(input: { fecha: string; sede_id?: string }) {
   try {
     const session = await requireSession(await sessionToken());
     const data = await getDayView(resolveSede(session.sedeId, input.sede_id), {
       fecha: input.fecha,
     });
-    return { success: true as const, data };
+    if (session.roles.includes("admin")) return { success: true as const, data };
+    const shifts = data.shifts.filter((view) => view.shift.opened_by === session.userId);
+    return {
+      success: true as const,
+      data: {
+        ...data,
+        shifts,
+        totals: accumulateDayTotals(
+          shifts.map((view) => ({
+            expectedCash: view.efectivo,
+            countedCash: view.shift.counted_cash,
+            baseLeft: view.shift.base_left,
+            cashWithdrawn: view.shift.cash_withdrawn,
+            baseDifference: view.shift.base_difference,
+            ventas: view.ventas,
+          })),
+        ),
+      },
+    };
   } catch (error) {
     return toFailure(error);
   }
 }
 
-/** Misma lógica que GET /api/v1/cash/history (requiere sesión, solo su sede). */
+/** Misma lógica que GET /api/v1/cash/history (solo admin). */
 export async function getHistoryAction(input: { desde: string; hasta: string; sede_id?: string }) {
   try {
-    const session = await requireSession(await sessionToken());
+    const session = await requireAdminSession(await sessionToken());
     const data = await getHistory(resolveSede(session.sedeId, input.sede_id), {
       desde: input.desde,
       hasta: input.hasta,

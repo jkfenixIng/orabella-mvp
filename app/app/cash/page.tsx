@@ -4,6 +4,7 @@ import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { listPaymentMethods } from "@/src/features/admin/service";
 import { getDayView, getOpenShift, listRegisters } from "@/src/features/cash/service";
+import { accumulateDayTotals } from "@/src/features/cash/schemas";
 import { CashClient } from "./cash-client";
 
 export const dynamic = "force-dynamic";
@@ -43,8 +44,8 @@ export default async function CashPage() {
 
   const today = isoDay(0);
   // Entrada instantánea: solo registros + turno abierto + día. El
-  // historial (30 días) se carga bajo demanda con el filtro del cliente.
-  const [registers, openShift, day, methods] = await Promise.all([
+  // historial (30 días, solo admin) se carga bajo demanda con el filtro.
+  const [registers, openShift, rawDay, methods] = await Promise.all([
     listRegisters(sedeId),
     getOpenShift(sedeId),
     getDayView(sedeId, { fecha: today }),
@@ -52,6 +53,25 @@ export default async function CashPage() {
   ]);
 
   const canWrite = session.roles.includes("admin") || session.roles.includes("caja");
+  const isAdmin = session.roles.includes("admin");
+  // Caja ve solo sus turnos en la vista del día (el servidor refuerza lo mismo).
+  const dayShifts = isAdmin ? rawDay.shifts : rawDay.shifts.filter((view) => view.shift.opened_by === session.user.id);
+  const day = isAdmin
+    ? rawDay
+    : {
+        ...rawDay,
+        shifts: dayShifts,
+        totals: accumulateDayTotals(
+          dayShifts.map((view) => ({
+            expectedCash: view.efectivo,
+            countedCash: view.shift.counted_cash,
+            baseLeft: view.shift.base_left,
+            cashWithdrawn: view.shift.cash_withdrawn,
+            baseDifference: view.shift.base_difference,
+            ventas: view.ventas,
+          })),
+        ),
+      };
 
   return (
     <main className="mx-auto flex min-h-screen max-w-5xl flex-col gap-6 px-6 py-12">
@@ -72,6 +92,7 @@ export default async function CashPage() {
         initialHistory={{ desde: today, hasta: today, shifts: [] }}
         methods={methods.filter((row) => row.is_active)}
         canWrite={canWrite}
+        isAdmin={isAdmin}
       />
     </main>
   );

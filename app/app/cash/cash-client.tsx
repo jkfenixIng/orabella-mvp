@@ -86,6 +86,7 @@ interface CashClientProps {
   initialHistory: HistoryResult;
   methods: PaymentMethodRow[];
   canWrite: boolean;
+  isAdmin: boolean;
 }
 
 export function CashClient(props: CashClientProps) {
@@ -583,6 +584,7 @@ export function CashClient(props: CashClientProps) {
         </p>
       </section>
 
+      {props.isAdmin ? (
       <section className={sectionClass} aria-busy={isViewPending}>
         <h2 className="text-lg font-semibold">Historial</h2>
         <form onSubmit={handleHistory} className="mt-3 flex flex-wrap items-end gap-3">
@@ -628,6 +630,7 @@ export function CashClient(props: CashClientProps) {
           )}
         </ul>
       </section>
+      ) : null}
     </div>
   );
 }
