@@ -250,6 +250,19 @@ export function InventoryClient(props: InventoryClientProps) {
         </Label>
       </section>
 
+      {props.canWrite ? (
+        <div className="sticky top-0 z-10 flex flex-wrap gap-2 rounded-xl border border-color bg-surface p-3 shadow-sm">
+          <Button type="button" onClick={() => setProductDialogOpen(true)}>
+            <PackagePlus className="h-4 w-4" aria-hidden="true" />
+            Crear producto
+          </Button>
+          <Button type="button" variant="outline" onClick={openMovementDialog}>
+            <PackageOpen className="h-4 w-4" aria-hidden="true" />
+            Registrar movimiento
+          </Button>
+        </div>
+      ) : null}
+
       <Dialog
         open={productDialogOpen}
         onOpenChange={(open: boolean) => {
