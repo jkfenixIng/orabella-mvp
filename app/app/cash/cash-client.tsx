@@ -5,6 +5,7 @@ import {
   closeShiftAction,
   getDayViewAction,
   getHistoryAction,
+  listDenominationsAction,
   openShiftAction,
 } from "@/src/features/cash/actions";
 import type {
@@ -103,8 +104,11 @@ export function CashClient(props: CashClientProps) {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [, setIsOpeningDialogOpen] = useState(false);
+  const [isOpeningDialogOpen, setIsOpeningDialogOpen] = useState(false);
   const [isClosingDialogOpen, setIsClosingDialogOpen] = useState(false);
+  const [denominations, setDenominations] = useState<Array<{ id: string; kind: string; value: number }>>([]);
+  const [openCounts, setOpenCounts] = useState<Record<string, string>>({});
+  const [openDigitals, setOpenDigitals] = useState<Record<string, string>>({});
   // Transición para los cambios de vista (día/historial): la UI no se
   // congela mientras la server action responde.
   const [isViewPending, startViewTransition] = useTransition();
@@ -123,11 +127,40 @@ export function CashClient(props: CashClientProps) {
     return true;
   }
 
+  async function startOpening() {
+    setOpenCounts({});
+    setOpenDigitals({});
+    setIsOpeningDialogOpen(true);
+    const result = await listDenominationsAction();
+    if (result.success) setDenominations(result.data);
+  }
+
+  function openCashTotal(): number {
+    return denominations.reduce((acc, denom) => {
+      const qty = Number(openCounts[denom.id] ?? "0");
+      return acc + (Number.isFinite(qty) ? qty : 0) * Number(denom.value);
+    }, 0);
+  }
+
   async function handleOpen(event: FormEvent): Promise<void> {
     event.preventDefault();
+    const counts: Array<{ method_code: string; denomination: number | null; quantity: number; amount: number }> = [
+      ...denominations.map((denom) => {
+        const qty = Math.max(0, Math.floor(Number(openCounts[denom.id] ?? "0")) || 0);
+        return { method_code: "efectivo", denomination: Number(denom.value), quantity: qty, amount: qty * Number(denom.value) };
+      }),
+      ...props.methods
+        .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
+        .map((method) => ({
+          method_code: method.code,
+          denomination: null,
+          quantity: 1,
+          amount: Number((openDigitals[method.code] ?? "").replace(/\D/g, "")) || 0,
+        })),
+    ];
     setBusy(true);
     try {
-      const result = await openShiftAction({});
+      const result = await openShiftAction({ counts });
       if (result.success) {
         showResult(result, `Turno abierto con base ${formatMoney(result.data.opening_base)}.`);
         setOpenShift(result.data);
@@ -259,22 +292,14 @@ export function CashClient(props: CashClientProps) {
           <div className="mt-3 flex flex-col gap-3 text-sm">
             <p>No hay un turno abierto.</p>
             {props.canWrite ? (
-              <form onSubmit={handleOpen} className="flex flex-wrap items-end gap-3">
+              <div>
                 <p className="w-full text-slate-600 dark:text-slate-300">
-                  Al abrir se hereda la base del último cierre
-                  {day.shifts.length > 0 ? " (ver turnos del día)" : ""}
-                  {register ? (
-                    <>
-                      {" "}o {formatMoney(register.base_configurada)} si es el primero.
-                    </>
-                  ) : (
-                    <>.</>
-                  )}
+                  Al abrir se valida el pre-arqueo contra el último cierre antes de iniciar.
                 </p>
-                <button type="submit" className={buttonClass} disabled={busy}>
-                  Abrir turno
+                <button type="button" onClick={startOpening} className={`${buttonClass} mt-3`}>
+                  Abrir turno con pre-arqueo
                 </button>
-              </form>
+              </div>
             ) : (
               <p className="text-slate-600 dark:text-slate-300">
                 Solo admin o caja pueden abrir turnos.
@@ -283,6 +308,65 @@ export function CashClient(props: CashClientProps) {
           </div>
         )}
       </section>
+
+      {props.canWrite && !openShift && (
+        <Dialog open={isOpeningDialogOpen} onOpenChange={setIsOpeningDialogOpen}>
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Pre-arqueo de apertura</DialogTitle>
+            </DialogHeader>
+            <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+              Cuente billetes y monedas por denominación y declare los totales digitales.
+              El sistema valida contra el cierre anterior antes de abrir.
+            </p>
+            <form onSubmit={handleOpen} className="mt-3 flex flex-col gap-3">
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                {denominations.map((denom) => (
+                  <label key={denom.id} className={labelClass}>
+                    {denom.kind} {formatMoney(denom.value)}
+                    <input
+                      className={inputClass}
+                      value={openCounts[denom.id] ?? ""}
+                      onChange={(event) =>
+                        setOpenCounts((prev) => ({ ...prev, [denom.id]: event.target.value.replace(/\D/g, "") }))
+                      }
+                      inputMode="numeric"
+                      placeholder="0"
+                    />
+                  </label>
+                ))}
+              </div>
+              <p className="text-sm font-semibold">Efectivo contado: {formatMoney(openCashTotal())}</p>
+              {props.methods
+                .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
+                .map((method) => (
+                  <label key={method.id} className={labelClass}>
+                    {method.name} (total en la aplicación)
+                    <input
+                      className={inputClass}
+                      value={formatMoneyInput(openDigitals[method.code] ?? "")}
+                      onChange={(event) =>
+                        setOpenDigitals((prev) => ({ ...prev, [method.code]: stripMoneyInput(event.target.value) }))
+                      }
+                      inputMode="numeric"
+                      placeholder="0"
+                    />
+                  </label>
+                ))}
+              <DialogFooter>
+                <DialogClose asChild>
+                  <button type="button" className={ghostClass}>
+                    Cancelar
+                  </button>
+                </DialogClose>
+                <button type="submit" className={buttonClass} disabled={busy}>
+                  Validar y abrir
+                </button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
 
       {props.canWrite && openShift && (
         <Dialog open={isClosingDialogOpen} onOpenChange={setIsClosingDialogOpen}>
