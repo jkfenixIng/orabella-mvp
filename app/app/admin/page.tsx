@@ -8,6 +8,7 @@ import {
   listServices,
   listTaxes,
 } from "@/src/features/admin/service";
+import { listDenominations, listRegisters } from "@/src/features/cash/service";
 import { AdminTabs } from "./admin-tabs";
 
 export const dynamic = "force-dynamic";
@@ -39,11 +40,13 @@ export default async function AdminPage() {
     );
   }
 
-  const [employees, services, taxes, methods] = await Promise.all([
+  const [employees, services, taxes, methods, registers, denominations] = await Promise.all([
     listEmployees(sedeId),
     listServices(sedeId),
     listTaxes(sedeId),
     listPaymentMethods(sedeId),
+    listRegisters(sedeId),
+    listDenominations(sedeId),
   ]);
 
   return (
@@ -62,6 +65,8 @@ export default async function AdminPage() {
         initialServices={services}
         initialTaxes={taxes}
         initialMethods={methods}
+        initialRegisters={registers}
+        initialDenominations={denominations}
       />
     </main>
   );

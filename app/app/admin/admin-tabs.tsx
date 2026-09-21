@@ -7,6 +7,15 @@ import {
   upsertServiceAction,
   upsertTaxConfigAction,
 } from "@/src/features/admin/actions";
+import {
+  deleteDenominationAction,
+  updateRegisterBaseAction,
+  upsertDenominationAction,
+} from "@/src/features/cash/actions";
+import type {
+  CashDenominationRow,
+  CashRegisterRow,
+} from "@/src/features/cash/service";
 import type {
   EmployeeRow,
   PaymentMethodRow,
@@ -14,13 +23,14 @@ import type {
   TaxConfigRow,
 } from "@/src/features/admin/service";
 
-type Tab = "empleados" | "servicios" | "impuestos" | "metodos";
+type Tab = "empleados" | "servicios" | "impuestos" | "metodos" | "caja";
 
 const TABS: Array<{ value: Tab; label: string }> = [
   { value: "empleados", label: "Empleados" },
   { value: "servicios", label: "Servicios" },
   { value: "impuestos", label: "Impuestos" },
   { value: "metodos", label: "Métodos de pago" },
+  { value: "caja", label: "Caja" },
 ];
 
 const inputClass =
@@ -49,6 +59,8 @@ interface AdminTabsProps {
   initialServices: ServiceRow[];
   initialTaxes: TaxConfigRow[];
   initialMethods: PaymentMethodRow[];
+  initialRegisters: CashRegisterRow[];
+  initialDenominations: CashDenominationRow[];
 }
 
 export function AdminTabs(props: AdminTabsProps) {
@@ -90,6 +102,12 @@ export function AdminTabs(props: AdminTabsProps) {
       ) : null}
       {tab === "metodos" ? (
         <MethodsSection sedeId={props.sedeId} initial={props.initialMethods} />
+      ) : null}
+      {tab === "caja" ? (
+        <CashSection
+          initialRegisters={props.initialRegisters}
+          initialDenominations={props.initialDenominations}
+        />
       ) : null}
     </div>
   );
@@ -627,7 +645,7 @@ function TaxesSection({ sedeId, initial }: { sedeId: string; initial: TaxConfigR
 }
 
 // ----------------------------------------------------------------- métodos ---
-const EMPTY_METHOD = { code: "efectivo", name: "", is_active: true };
+const EMPTY_METHOD = { code: "efectivo", name: "", is_active: true, arqueable: true };
 
 function MethodsSection({ sedeId, initial }: { sedeId: string; initial: PaymentMethodRow[] }) {
   const [rows, setRows] = useState(initial);
@@ -639,7 +657,7 @@ function MethodsSection({ sedeId, initial }: { sedeId: string; initial: PaymentM
 
   function startEdit(row: PaymentMethodRow) {
     setEditingId(row.id);
-    setForm({ code: row.code, name: row.name, is_active: row.is_active });
+    setForm({ code: row.code, name: row.name, is_active: row.is_active, arqueable: row.arqueable });
     setError(null);
     setNotice(null);
   }
@@ -655,6 +673,7 @@ function MethodsSection({ sedeId, initial }: { sedeId: string; initial: PaymentM
       code: form.code,
       name: form.name,
       is_active: form.is_active,
+      arqueable: form.arqueable,
     });
     setBusy(false);
     if (!result.success) {
@@ -683,7 +702,8 @@ function MethodsSection({ sedeId, initial }: { sedeId: string; initial: PaymentM
             >
               <span>
                 <strong>{row.name}</strong> ({row.code}) ·{" "}
-                {row.is_active ? "activo" : "inactivo"}
+                {row.is_active ? "activo" : "inactivo"} ·{" "}
+                {row.arqueable ? "se arquea" : "sin arqueo"}
               </span>
               <button
                 type="button"
@@ -733,6 +753,14 @@ function MethodsSection({ sedeId, initial }: { sedeId: string; initial: PaymentM
             />
             Activo (solo activos aceptan cobros)
           </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={form.arqueable}
+              onChange={(event) => setForm({ ...form, arqueable: event.target.checked })}
+            />
+            Se arquea (desactívelo si no se puede contar, p. ej. tarjeta por terminal)
+          </label>
           {error ? (
             <p role="alert" className={errorClass}>
               {error}
@@ -757,6 +785,181 @@ function MethodsSection({ sedeId, initial }: { sedeId: string; initial: PaymentM
             ) : null}
           </div>
         </form>
+      </section>
+    </div>
+  );
+}
+
+// --------------------------------------------------------------------- caja ---
+
+function CashSection({
+  initialRegisters,
+  initialDenominations,
+}: {
+  initialRegisters: CashRegisterRow[];
+  initialDenominations: CashDenominationRow[];
+}) {
+  const [registers, setRegisters] = useState(initialRegisters);
+  const [denominations, setDenominations] = useState(initialDenominations);
+  const [baseDrafts, setBaseDrafts] = useState<Record<string, string>>({});
+  const [newKind, setNewKind] = useState("billete");
+  const [newValue, setNewValue] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function handleBase(registerId: string) {
+    const raw = (baseDrafts[registerId] ?? "").replace(/\D/g, "");
+    if (raw === "") {
+      setError("Indique la nueva base.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    const result: ActionResult<CashRegisterRow> = await updateRegisterBaseAction(registerId, {
+      base_configurada: Number(raw),
+    });
+    setBusy(false);
+    if (!result.success) {
+      setError(result.message);
+      return;
+    }
+    setRegisters((current) => current.map((row) => (row.id === result.data.id ? result.data : row)));
+    setBaseDrafts((current) => ({ ...current, [registerId]: "" }));
+    setNotice("Base actualizada (queda auditado).");
+  }
+
+  async function handleAddDenomination(event: FormEvent) {
+    event.preventDefault();
+    const value = Number(newValue.replace(/\D/g, ""));
+    if (!Number.isFinite(value) || value <= 0) {
+      setError("Indique un valor mayor a 0.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    const result: ActionResult<CashDenominationRow> = await upsertDenominationAction({
+      kind: newKind,
+      value,
+    });
+    setBusy(false);
+    if (!result.success) {
+      setError(result.message);
+      return;
+    }
+    setDenominations((current) => [...current, result.data].sort((a, b) => b.value - a.value));
+    setNewValue("");
+    setNotice("Denominación agregada.");
+  }
+
+  async function toggleDenomination(row: CashDenominationRow) {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    const result: ActionResult<CashDenominationRow> = await upsertDenominationAction({
+      id: row.id,
+      kind: row.kind,
+      value: row.value,
+      is_active: !row.is_active,
+    });
+    setBusy(false);
+    if (!result.success) {
+      setError(result.message);
+      return;
+    }
+    setDenominations((current) => current.map((item) => (item.id === row.id ? result.data : item)));
+    setNotice("Denominación actualizada.");
+  }
+
+  async function removeDenomination(id: string) {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    const result = await deleteDenominationAction(id);
+    setBusy(false);
+    if (!result.success) {
+      setError(result.message);
+      return;
+    }
+    setDenominations((current) => current.filter((item) => item.id !== id));
+    setNotice("Denominación eliminada.");
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <section className={sectionClass} aria-label="Base de caja">
+        <h2 className="text-lg font-semibold">Base de caja</h2>
+        <ul className="mt-2 flex flex-col gap-2">
+          {registers.map((row) => (
+            <li
+              key={row.id}
+              className="flex flex-wrap items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-slate-800"
+            >
+              <span>
+                <strong>{row.name}</strong> · base actual{" "}
+                {new Intl.NumberFormat("es-CO", { style: "currency", currency: "COP", maximumFractionDigits: 0 }).format(row.base_configurada)}
+              </span>
+              <input
+                value={baseDrafts[row.id] ?? ""}
+                onChange={(event) => setBaseDrafts((current) => ({ ...current, [row.id]: event.target.value }))}
+                inputMode="numeric"
+                placeholder="Nueva base"
+                className={inputClass}
+              />
+              <button type="button" disabled={busy} onClick={() => handleBase(row.id)} className={buttonClass}>
+                Guardar base
+              </button>
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <section className={sectionClass} aria-label="Denominaciones">
+        <h2 className="text-lg font-semibold">Denominaciones ({denominations.length})</h2>
+        <form onSubmit={handleAddDenomination} className="mt-3 flex flex-wrap items-end gap-3">
+          <label className={labelClass}>
+            Tipo
+            <select value={newKind} onChange={(event) => setNewKind(event.target.value)} className={inputClass}>
+              <option value="billete">Billete</option>
+              <option value="moneda">Moneda</option>
+            </select>
+          </label>
+          <label className={labelClass}>
+            Valor
+            <input value={newValue} onChange={(event) => setNewValue(event.target.value)} inputMode="numeric" className={inputClass} />
+          </label>
+          <button type="submit" disabled={busy} className={buttonClass}>
+            Agregar
+          </button>
+        </form>
+        <ul className="mt-3 flex flex-col gap-2">
+          {denominations.map((row) => (
+            <li
+              key={row.id}
+              className="flex flex-wrap items-center justify-between gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-slate-800"
+            >
+              <span>
+                {row.kind} · {row.value} · {row.is_active ? "activa" : "inactiva"}
+              </span>
+              <div className="flex gap-2">
+                <button type="button" disabled={busy} onClick={() => toggleDenomination(row)} className="text-sm font-medium underline">
+                  {row.is_active ? "Desactivar" : "Activar"}
+                </button>
+                <button type="button" disabled={busy} onClick={() => removeDenomination(row.id)} className="text-sm font-medium underline">
+                  Eliminar
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+        {error ? (
+          <p role="alert" className={errorClass}>
+            {error}
+          </p>
+        ) : null}
+        {notice ? <p className={okClass}>{notice}</p> : null}
       </section>
     </div>
   );
