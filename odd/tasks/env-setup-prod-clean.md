@@ -19,11 +19,13 @@ Preparar ambientes de pruebas y productivo. Productivo debe quedar limpio en pro
 ## Tareas (IDs estables)
 - [x] ENV-00 Remover Vercel MCP por completo (opencode.json sin mcp) - a341ac3, Vercel CLI 59.24.0 instalado global
 - [x] ENV-01 Auditar estado actual de BD (counts vía Supabase MCP) - users 10, products 5, cash_shifts 2, payments 1 verificados
-- [x] ENV-02 Supabase test como proyecto FREE separado (branch Pro requiere $25/mes) - pendiente creación por dashboard, luego seed acceptance.sql
+- [x] ENV-02 Supabase test como proyecto FREE separado creado por el usuario (vmnyxhoqnpqwumynlbun) - pendiente cargarle esquema vía SQL Editor con app/supabase/test-bootstrap.sql (001→010 + seed)
 - [x] ENV-03 Limpieza productiva idempotente: productos, movimientos, usuarios no-admin, empleados no-admin, historial caja (cash_shifts/payments), voucher_requests, sessions, audit_logs - ejecutado 2026-09-21, preservando sede/cash_register/catálogos
 - [x] ENV-04 Upsert admin 1018474080 Camilo Rodriguez (hash scrypt, sede 7cac5a22..., rol admin, employee ADMIN f2a1ec5a...) - creado y verificado
 - [x] ENV-05 Verificar limpieza (counts finales) - users 1, products 0, inventory_movements 0, cash_shifts 0, payments 0, voucher_requests 0, audit_logs 0 - OK
-- [ ] ENV-06 Conectar Vercel CLI (login+link) y configurar env vars preview/production - en curso, requiere login interactivo del usuario
+- [x] ENV-06 Vercel CLI login (jkfenixing) + link orabella + env prod (URL+anon JWT prod) verificado
+- [x] ENV-07 Vercel Preview apuntado al test (URL test + publishable test + secret test como Secret) - verificado con env pull preview
+- [ ] ENV-08 Cargar esquema en test vía SQL Editor (usuario pega test-bootstrap.sql) y verificar counts
 
 ## Alcance autorizado
 - Solo tablas de negocio indicadas. No tocar migrations. No tocar API/ ni front/ legacy.
