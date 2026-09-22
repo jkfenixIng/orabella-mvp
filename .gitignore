@@ -36,3 +36,5 @@ coverage/
 /API/
 # Local Pi runtime state
 .atl/
+# Standalone frontend repo: lives on disk, never in this repo
+/front/
