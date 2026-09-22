@@ -14,6 +14,7 @@ describe("alerts: conjunto de alerta y paginado", () => {
       "cash.shift_open_mismatch",
       "cash.shift_close_mismatch",
       "auth.login_locked",
+      "payroll.commission_paid",
     ]);
     expect(ALERTS_PAGE_SIZE).toBe(10);
   });

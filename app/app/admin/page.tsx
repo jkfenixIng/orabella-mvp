@@ -5,9 +5,11 @@ import { getSessionUser } from "@/src/features/auth/service";
 import {
   listEmployees,
   listPaymentMethods,
+  listSedeUsers,
   listServices,
   listTaxes,
 } from "@/src/features/admin/service";
+import { getVoucherSettings } from "@/src/features/payroll/service";
 import { listDenominations, listRegisters } from "@/src/features/cash/service";
 import { AdminTabs } from "./admin-tabs";
 
@@ -40,14 +42,17 @@ export default async function AdminPage() {
     );
   }
 
-  const [employees, services, taxes, methods, registers, denominations] = await Promise.all([
-    listEmployees(sedeId),
-    listServices(sedeId),
-    listTaxes(sedeId),
-    listPaymentMethods(sedeId),
-    listRegisters(sedeId),
-    listDenominations(sedeId),
-  ]);
+  const [employees, users, services, taxes, methods, voucherSettings, registers, denominations] =
+    await Promise.all([
+      listEmployees(sedeId),
+      listSedeUsers(sedeId),
+      listServices(sedeId),
+      listTaxes(sedeId),
+      listPaymentMethods(sedeId),
+      getVoucherSettings(sedeId),
+      listRegisters(sedeId),
+      listDenominations(sedeId),
+    ]);
 
   return (
     <main className="mx-auto flex min-h-screen max-w-4xl flex-col gap-6 px-6 py-12">
@@ -61,10 +66,13 @@ export default async function AdminPage() {
       </header>
       <AdminTabs
         sedeId={sedeId}
+        currentUserId={session.user.id}
         initialEmployees={employees}
+        initialUsers={users}
         initialServices={services}
         initialTaxes={taxes}
         initialMethods={methods}
+        initialVoucherSettings={voucherSettings}
         initialRegisters={registers}
         initialDenominations={denominations}
       />

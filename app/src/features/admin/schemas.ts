@@ -96,16 +96,25 @@ export function checkPayCoherence(args: {
   }
 }
 
-/** ADM-02/ADM-08: empleado con sueldo fijo/porcentaje/mixto. */
+/** ADM-02/ADM-08: empleado con nombre propio y sueldo fijo/porcentaje/mixto.
+ * El vínculo al usuario es automático por documento (no se recibe). */
 export const employeeSchema = z
   .object({
     id: uuidSchema.optional(),
     sede_id: sedeIdSchema,
-    user_id: uuidSchema.nullish(),
+    full_name: z.string().trim().min(2, "Nombre requerido.").max(120, "Nombre muy largo."),
     employee_code: z.string().trim().max(40, "Código muy largo.").nullish(),
     document: z.string().trim().min(3, "Documento inválido.").max(20, "Documento inválido."),
     phone: z.string().trim().max(30, "Teléfono muy largo.").nullish(),
     position: z.string().trim().max(80, "Cargo muy largo.").nullish(),
+    payout_mode: z.enum(["nomina", "inmediato"]).optional(),
+    email: z.email("Correo inválido.").nullish(),
+    birth_date: z
+      .string()
+      .trim()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, "Fecha inválida (use yyyy-mm-dd).")
+      .refine((value) => value <= new Date().toISOString().slice(0, 10), "La fecha no puede ser futura.")
+      .nullish(),
     pay_type: payTypeSchema,
     salary_fixed: z.coerce.number().nonnegative("El salario no puede ser negativo.").nullish(),
     commission_percent: z.coerce

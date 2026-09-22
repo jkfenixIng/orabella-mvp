@@ -629,5 +629,60 @@ export async function adminCreateUser(raw: unknown): Promise<{ id: string }> {
     throw new AuthError("INTERNAL", "Error interno.", 500);
   }
 
+  // Vínculo automático (best-effort, no rompe el alta): empleados sin
+  // usuario con el mismo documento en la sede quedan vinculados.
+  if (input.sede_id) {
+    const { error: linkError } = await db
+      .from("employees")
+      .update({ user_id: userId })
+      .eq("sede_id", input.sede_id)
+      .eq("document", input.documento)
+      .is("user_id", null);
+    if (linkError) console.error("[auth] no se pudo vincular empleado:", linkError.message);
+  }
+
   return { id: userId };
+}
+
+/**
+ * AUTH-04: el admin restablece la clave de un usuario de su sede a su
+ * documento (convención de clave inicial), con cambio forzado al entrar.
+ * Desbloquea y limpia intentos. Queda auditado.
+ */
+export async function adminResetUserPassword(
+  sedeId: string,
+  userId: string,
+  actorUserId: string,
+): Promise<{ user_id: string }> {
+  const db = await adminDb();
+  const { data: target, error: targetError } = await db
+    .from("users")
+    .select("id, sede_id, id_number")
+    .eq("id", userId)
+    .maybeSingle();
+  if (targetError) throw new AuthError("INTERNAL", "Error interno.", 500);
+  if (!target) throw new AuthError("NOT_FOUND", "Usuario no encontrado.", 404);
+  const row = target as { id: string; sede_id: string | null; id_number: string };
+  if (row.sede_id !== sedeId) {
+    throw new AuthError("FORBIDDEN", "Ese usuario no es de esta sede.", 403);
+  }
+  const { error: updateError } = await db
+    .from("users")
+    .update({
+      password_hash: await hashPassword(row.id_number),
+      must_change_password: true,
+      failed_attempts: 0,
+      locked_until: null,
+    })
+    .eq("id", row.id);
+  if (updateError) throw new AuthError("INTERNAL", "Error interno.", 500);
+  await writeAudit({
+    sede_id: sedeId,
+    user_id: actorUserId,
+    action: AUDIT_ACTIONS.PASSWORD_CHANGED,
+    entity: "users",
+    entity_id: row.id,
+    metadata: { reset_by_admin: true },
+  });
+  return { user_id: row.id };
 }

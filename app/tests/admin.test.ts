@@ -21,6 +21,7 @@ const SEDE_B = "22222222-2222-4222-8222-222222222222";
 function baseEmployee(overrides: Record<string, unknown> = {}) {
   return {
     sede_id: SEDE_A,
+    full_name: "Carolina Rojas",
     document: "123456",
     pay_type: "fijo",
     salary_fixed: 1000000,
@@ -39,6 +40,17 @@ describe("admin schemas: empleado y pay_type coherente (ADM-08)", () => {
   it("fijo exige salary_fixed y rechaza comisión", () => {
     expect(baseEmployee().pay_type).toBe("fijo");
     expect(employeeSchema.safeParse(baseEmployee()).success).toBe(true);
+    expect(employeeSchema.safeParse(baseEmployee({ full_name: "A" })).success).toBe(false);
+    expect(employeeSchema.safeParse(baseEmployee({ full_name: "  " })).success).toBe(false);
+    expect(employeeSchema.safeParse(baseEmployee({ payout_mode: "quincenal" })).success).toBe(false);
+    expect(employeeSchema.safeParse(baseEmployee({ email: "no-es-correo" })).success).toBe(false);
+    expect(employeeSchema.safeParse(baseEmployee({ birth_date: "mañana" })).success).toBe(false);
+    expect(employeeSchema.safeParse(baseEmployee({ birth_date: "2999-01-01" })).success).toBe(false);
+    expect(
+      employeeSchema.safeParse(
+        baseEmployee({ payout_mode: "inmediato", email: "a@b.co", birth_date: "1990-05-01" }),
+      ).success,
+    ).toBe(true);
     expect(employeeSchema.safeParse(baseEmployee({ salary_fixed: null })).success).toBe(false);
     expect(
       employeeSchema.safeParse(baseEmployee({ commission_percent: 10 })).success,

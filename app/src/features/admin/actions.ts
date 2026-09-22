@@ -8,6 +8,7 @@ import {
   getEmployee,
   listEmployees,
   listPaymentMethods,
+  listSedeUsers,
   listSedes,
   listServices,
   listTaxes,
@@ -39,6 +40,16 @@ export async function listEmployeesAction(sedeId?: string) {
   try {
     const session = await requireSession(await sessionToken());
     return { success: true as const, data: await listEmployees(resolveSede(session.sedeId, sedeId)) };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Usuarios de la sede con roles (selector de vínculo y pestaña Usuarios). */
+export async function listSedeUsersAction(sedeId?: string) {
+  try {
+    const session = await requireSession(await sessionToken());
+    return { success: true as const, data: await listSedeUsers(resolveSede(session.sedeId, sedeId)) };
   } catch (error) {
     return toFailure(error);
   }

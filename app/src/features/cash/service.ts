@@ -326,6 +326,33 @@ async function fetchCountTotals(
   return result;
 }
 
+/**
+ * Pagos inmediatos de comisión por turno y método (descuentan del
+ * esperado digital en vistas y cierre).
+ */
+async function fetchPayoutTotals(
+  db: DbClient,
+  shiftIds: string[],
+): Promise<Map<string, Map<string, number>>> {
+  const result = new Map<string, Map<string, number>>();
+  if (shiftIds.length === 0) return result;
+  const { data, error } = await db
+    .from("commission_payouts")
+    .select("cash_shift_id, method_code, amount")
+    .in("cash_shift_id", shiftIds);
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  for (const row of (data ?? []) as Array<{
+    cash_shift_id: string;
+    method_code: string;
+    amount: number | string;
+  }>) {
+    const byMethod = result.get(row.cash_shift_id) ?? new Map<string, number>();
+    byMethod.set(row.method_code, roundMoney((byMethod.get(row.method_code) ?? 0) + Number(row.amount)));
+    result.set(row.cash_shift_id, byMethod);
+  }
+  return result;
+}
+
 async function insertCounts(
   db: DbClient,
   shiftId: string,
@@ -771,7 +798,20 @@ export async function closeShift(
     for (const row of ((shiftPayments ?? []) as Array<{ amount: number | string; method_code: string }>)) {
       paidByMethod.set(row.method_code, roundMoney((paidByMethod.get(row.method_code) ?? 0) + Number(row.amount)));
     }
-    const expectedCash = paidByMethod.get("efectivo") ?? 0;
+    // Pagos inmediatos de comisión del turno (descuentan del esperado
+    // por método: lo cobrado menos lo pagado).
+    const { data: payoutRows, error: payoutError } = await db
+      .from("commission_payouts")
+      .select("method_code, amount")
+      .eq("cash_shift_id", shift.id);
+    if (payoutError) throw new CashError("INTERNAL", "Error interno.", 500);
+    const paidOutByMethod = new Map<string, number>();
+    for (const row of ((payoutRows ?? []) as Array<{ method_code: string; amount: number | string }>)) {
+      paidOutByMethod.set(row.method_code, roundMoney((paidOutByMethod.get(row.method_code) ?? 0) + Number(row.amount)));
+    }
+    const expectedCash = roundMoney(
+      (paidByMethod.get("efectivo") ?? 0) - (paidOutByMethod.get("efectivo") ?? 0),
+    );
 
     // El conteo de efectivo sale del detalle por denominación (el sistema
     // calcula; el total declarado debe cuadrar con el detalle).
@@ -781,13 +821,18 @@ export async function closeShift(
       throw new CashError("COUNT_MISMATCH", "El conteo no cuadra con el detalle por denominación.", 422);
     }
     // Digitales: lo declarado contra el saldo de apertura del turno más
-    // lo cobrado en el turno (el "total en la aplicación").
+    // lo cobrado en el turno menos lo pagado inmediato (el "total en la
+    // aplicación").
     const countMaps = await fetchCountTotals(db, [shift.id]);
     const openByMethod = countMaps.get(shift.id)?.open ?? new Map<string, number>();
     const methodDifferences: MethodDifference[] = [];
     for (const [code, total] of declared) {
       if (code === "efectivo") continue;
-      const expected = expectedDigitalTotal(openByMethod.get(code) ?? 0, paidByMethod.get(code) ?? 0);
+      const expected = expectedDigitalTotal(
+        openByMethod.get(code) ?? 0,
+        paidByMethod.get(code) ?? 0,
+        paidOutByMethod.get(code) ?? 0,
+      );
       if (!moneyEquals(total, expected)) {
         methodDifferences.push({ method_code: code, expected, declared: total, difference: roundMoney(total - expected) });
       }
@@ -833,6 +878,7 @@ export async function closeShift(
         base_difference: close.baseDifference,
         base_incompleta: close.baseDifference < 0,
         admin_override: isOverride,
+        payouts_out: roundMoney([...paidOutByMethod.values()].reduce((acc, value) => acc + value, 0)),
         method_differences: methodDifferences,
         observation: observation ?? null,
       },
@@ -1043,6 +1089,10 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
   );
   const closedIds = rows.filter((row) => row.status === "cerrado").map((row) => row.id);
   const reviews = await getShiftReviews(sedeId, closedIds);
+  const payoutMaps = await fetchPayoutTotals(
+    db,
+    rows.map((row) => row.id),
+  );
   const names = await userNames(
     db,
     rows.flatMap((row) => [row.opened_by, row.closed_by]),
@@ -1058,6 +1108,7 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
     const { metodos, declarados, diferencias } = buildMethodViews({
       paid: paidByMethod,
       open: counts.open,
+      paidOut: payoutMaps.get(shift.id) ?? new Map<string, number>(),
       closed: shift.status === "cerrado" ? counts.closed : null,
     });
     const revision = assembleShiftRevision(
@@ -1168,6 +1219,10 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
   );
   const historyClosedIds = rows.filter((row) => row.status === "cerrado").map((row) => row.id);
   const historyReviews = await getShiftReviews(sedeId, historyClosedIds);
+  const historyPayoutMaps = await fetchPayoutTotals(
+    db,
+    rows.map((row) => row.id),
+  );
   const historyNames = await userNames(
     db,
     rows.flatMap((row) => [row.opened_by, row.closed_by]),
@@ -1189,6 +1244,7 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
       const { metodos, declarados, diferencias } = buildMethodViews({
         paid: paidByMethod,
         open: counts.open,
+        paidOut: historyPayoutMaps.get(shift.id) ?? new Map<string, number>(),
         closed: shift.status === "cerrado" ? counts.closed : null,
       });
       const revision = assembleShiftRevision(
