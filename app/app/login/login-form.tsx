@@ -147,6 +147,7 @@ export function LoginForm({ next }: { next?: string }) {
           onChange={(event) => setDocumento(event.target.value)}
           autoComplete="username"
           inputMode="numeric"
+          required
           className="rounded border border-slate-300 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
         />
       </label>
@@ -157,6 +158,7 @@ export function LoginForm({ next }: { next?: string }) {
           value={password}
           onChange={(event) => setPassword(event.target.value)}
           autoComplete="current-password"
+          required
           className="rounded border border-slate-300 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
         />
       </label>
