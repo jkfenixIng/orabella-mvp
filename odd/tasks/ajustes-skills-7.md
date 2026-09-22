@@ -34,13 +34,13 @@ Out:
 - Delegación a subagente no disponible en este runtime (free tier); implementación inline secuencial con commits por unidad de trabajo.
 
 ## Tasks
-- [ ] T1 error + not-found (route: direct-inline, trigger: ninguno, 2 archivos mecánicos ya comprendidos)
-- [ ] T2 components.json mínimo (route: direct-inline, 1 archivo mecánico)
-- [ ] T3 toggle no_commission en factura (route: direct-inline, 1 archivo conocido + schema ya listo)
-- [ ] T4 delimitación dominios admin/service con comentarios (route: direct-inline, sin mover lógica)
-- [ ] T5 playwright config + smoke spec + script (route: direct-inline, sin `npx playwright install` en este lote)
-- [ ] T6 decisión dotnet-core-expert no aplica (solo registro, sin código)
-- [ ] VER typecheck + vitest + build rápido
+- [x] T1 error + not-found (route: direct-inline, trigger: ninguno, 2 archivos mecánicos ya comprendidos) — commit 18f66da
+- [x] T2 components.json mínimo (route: direct-inline, 1 archivo mecánico) — commit f3a1f03
+- [x] T3 toggle no_commission en factura (route: direct-inline, 1 archivo conocido + schema ya listo) — commit 879696a
+- [x] T4 delimitación dominios admin/service con comentarios (route: direct-inline, sin mover lógica) — commit ec6631c
+- [x] T5 playwright config + smoke spec + script (route: direct-inline, sin `npx playwright install` en este lote) — commit 2202600
+- [x] T6 decisión dotnet-core-expert no aplica (solo registro, sin código)
+- [x] VER typecheck + vitest + build rápido
 
 ## Authorized scope
 Push de 5 commits a `feat/orabella-mvp` ya ejecutado (e74781f..5997a5d). Este lote implementa los 7 ajustes sobre la misma rama con commits por unidad.
@@ -60,7 +60,11 @@ Push de 5 commits a `feat/orabella-mvp` ya ejecutado (e74781f..5997a5d). Este lo
 - 2026-09-22: push 5 commits a origin/feat/orabella-mvp (e74781f..5997a5d). Doc creado. Delegación imposible (free tier), se sigue inline.
 
 ## Verification evidence
-- (pendiente)
+- `npm run typecheck`: 0 errores.
+- `npm test`: 11 archivos, 183/183 pruebas correctas.
+- `npx playwright test --list`: 1 test en 1 archivo (smoke login).
+- T6 dotnet-core-expert: sin código, repo 100% Next.js; skill no aplica, solo registro.
+- ARQ1 (punto 1 de los 7): ya resuelto en 5997a5d, verificado sin imports cruzados de sede pendientes.
 
 ## Next step
 - T1 error + not-found, luego T2-T5 en orden, VER al cierre.
