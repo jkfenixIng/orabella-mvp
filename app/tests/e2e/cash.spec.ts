@@ -13,7 +13,7 @@ test.skip(process.env.E2E_BACKEND !== "test", "requiere backend de pruebas");
 
 test.use({ storageState: "./tests/e2e/.auth/user.json" });
 
-test("caja abre y cierra un turno", async ({ page }) => {
+test("caja abre y cierra un turno @changed", async ({ page }) => {
   await page.goto("/cash");
   await expect(page.getByRole("heading", { name: /^caja$/i })).toBeVisible({ timeout: 15_000 });
 

@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 /** Login: validación inmediata en el navegador (inputs required). */
-test("login exige documento y clave antes de enviar", async ({ page }) => {
+test("login exige documento y clave antes de enviar @full", async ({ page }) => {
   await page.goto("/login");
   const documento = page.getByLabel(/documento/i);
   const clave = page.getByLabel(/clave/i);
@@ -12,3 +12,4 @@ test("login exige documento y clave antes de enviar", async ({ page }) => {
   await expect(page).toHaveURL(/\/login/);
   await expect(documento).toBeVisible();
 });
+
