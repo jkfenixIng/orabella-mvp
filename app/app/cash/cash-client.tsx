@@ -72,31 +72,31 @@ function ShiftsTable({
   return (
     <>
       <div className="mt-3 overflow-x-auto">
-        <table className="w-full text-sm">
+        <table className="min-w-full text-sm">
           <thead>
               <tr className="text-left text-slate-600 dark:text-slate-300">
-                <th className="py-1 pr-3">Apertura</th>
-                <th className="py-1 pr-3">Estado</th>
-                <th className="py-1 pr-3">Abrió</th>
-                <th className="py-1 pr-3">Cerró</th>
-                <th className="py-1 pr-3">Base inicial</th>
+                <th className="whitespace-nowrap py-1 pr-3">Apertura</th>
+                <th className="whitespace-nowrap py-1 pr-3">Estado</th>
+                <th className="whitespace-nowrap py-1 pr-3">Abrió</th>
+                <th className="whitespace-nowrap py-1 pr-3">Cerró</th>
+                <th className="whitespace-nowrap py-1 pr-3">Base inicial</th>
               {isAdmin && (
                 <>
-                  <th className="py-1 pr-3">Ventas</th>
-                  <th className="py-1 pr-3">Efectivo</th>
+                  <th className="whitespace-nowrap py-1 pr-3">Ventas</th>
+                  <th className="whitespace-nowrap py-1 pr-3">Efectivo</th>
                   {methodCols.map((method) => (
-                    <th key={method.id} className="py-1 pr-3">
+                    <th key={method.id} className="whitespace-nowrap py-1 pr-3">
                       {method.name}
                     </th>
                   ))}
                 </>
               )}
-              <th className="py-1 pr-3">Base final</th>
+              <th className="whitespace-nowrap py-1 pr-3">Base final</th>
               {isAdmin && (
                 <>
-                  <th className="py-1 pr-3">Diferencia</th>
-                  <th className="py-1 pr-3">Revisada</th>
-                  <th className="py-1 pr-3">Justificación</th>
+                  <th className="whitespace-nowrap py-1 pr-3">Diferencia</th>
+                  <th className="whitespace-nowrap py-1 pr-3">Revisada</th>
+                  <th className="whitespace-nowrap py-1 pr-3">Justificación</th>
                 </>
               )}
             </tr>
@@ -106,39 +106,49 @@ function ShiftsTable({
               const isClosed = view.shift.status === "cerrado";
               return (
                 <tr key={view.shift.id} className="border-t border-slate-200 dark:border-slate-700">
-                  <td className="py-1 pr-3">{formatDateTime(view.shift.opened_at)}</td>
-                  <td className="py-1 pr-3">{view.shift.status}</td>
-                  <td className="py-1 pr-3">{view.abierto_por ?? "—"}</td>
-                  <td className="py-1 pr-3">{view.cerrado_por ?? "—"}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.shift.opening_base)}</td>
+                  <td className="whitespace-nowrap py-1 pr-3">{formatDateTime(view.shift.opened_at)}</td>
+                  <td className="whitespace-nowrap py-1 pr-3">{view.shift.status}</td>
+                  <td
+                    className="max-w-48 truncate whitespace-nowrap py-1 pr-3"
+                    title={view.abierto_por ?? undefined}
+                  >
+                    {view.abierto_por ?? "—"}
+                  </td>
+                  <td
+                    className="max-w-48 truncate whitespace-nowrap py-1 pr-3"
+                    title={view.cerrado_por ?? undefined}
+                  >
+                    {view.cerrado_por ?? "—"}
+                  </td>
+                  <td className="whitespace-nowrap py-1 pr-3">{formatMoney(view.shift.opening_base)}</td>
                   {isAdmin && (
                     <>
-                      <td className="py-1 pr-3">{formatMoney(view.ventas)}</td>
-                      <td className="py-1 pr-3">{formatMoney(view.efectivo)}</td>
+                      <td className="whitespace-nowrap py-1 pr-3">{formatMoney(view.ventas)}</td>
+                      <td className="whitespace-nowrap py-1 pr-3">{formatMoney(view.efectivo)}</td>
                       {methodCols.map((method) => {
                         const declarado = view.declarados.find(
                           (m) => m.method_code === method.code,
                         )?.amount;
                         return (
-                          <td key={method.id} className="py-1 pr-3">
+                          <td key={method.id} className="whitespace-nowrap py-1 pr-3">
                             {declarado === undefined ? "—" : formatMoney(declarado)}
                           </td>
                         );
                       })}
                     </>
                   )}
-                  <td className="py-1 pr-3">
+                  <td className="whitespace-nowrap py-1 pr-3">
                     {isClosed ? formatMoney(view.shift.base_left) : "—"}
                   </td>
                   {isAdmin && (
                     <>
-                      <td className="py-1 pr-3">
+                      <td className="whitespace-nowrap py-1 pr-3">
                         {!isClosed ? "—" : view.revision ? "Sí" : "No"}
                       </td>
-                      <td className="py-1 pr-3">
+                      <td className="whitespace-nowrap py-1 pr-3">
                         {!view.revision ? "N/A" : view.revision.revisada ? "Sí" : "No"}
                       </td>
-                      <td className="py-1 pr-3">
+                      <td className="whitespace-nowrap py-1 pr-3">
                         {!view.revision ? (
                           "N/A"
                         ) : view.revision.notas.length > 0 ? (
