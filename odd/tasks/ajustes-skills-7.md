@@ -63,6 +63,7 @@ Push de 5 commits a `feat/orabella-mvp` ya ejecutado (e74781f..5997a5d). Este lo
 - `npm run typecheck`: 0 errores.
 - `npm test`: 11 archivos, 183/183 pruebas correctas.
 - `npx playwright test --list`: 1 test en 1 archivo (smoke login).
+- `npx playwright test` (2026-09-22, Chromium instalado): 1 passed, smoke login muestra formulario (42.2s). Warnings de webpack PackFileCacheStrategy al arrancar dev son benignos.
 - T6 dotnet-core-expert: sin código, repo 100% Next.js; skill no aplica, solo registro.
 - ARQ1 (punto 1 de los 7): ya resuelto en 5997a5d, verificado sin imports cruzados de sede pendientes.
 
