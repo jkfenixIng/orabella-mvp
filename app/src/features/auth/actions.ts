@@ -6,6 +6,7 @@ import {
   SESSION_COOKIE_NAME,
   SESSION_TTL_MS,
   adminCreateUser,
+  adminResetUserPassword,
   changeUserPassword,
   confirmPasswordReset,
   getSessionUser,
@@ -14,6 +15,7 @@ import {
   logoutWithToken,
   requestPasswordReset,
 } from "./service";
+import { requireAdminSession } from "@/src/features/admin/service";
 
 const isProduction = process.env.NODE_ENV === "production";
 
@@ -119,6 +121,22 @@ export async function adminCreateUserAction(input: {
   try {
     const created = await adminCreateUser(input);
     return { success: true as const, id: created.id };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
+ * Restablece la clave de un usuario de la sede a su documento, con cambio
+ * forzado al entrar (solo admin). Para cuando la olvidan y no hay cómo
+ * recuperarla por la app.
+ */
+export async function adminResetPasswordAction(userId: string) {
+  try {
+    const store = await cookies();
+    const session = await requireAdminSession(store.get(SESSION_COOKIE_NAME)?.value);
+    const data = await adminResetUserPassword(session.sedeId, userId, session.userId);
+    return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
   }

@@ -165,25 +165,38 @@ export interface EmployeeRow {
   id: string;
   sede_id: string;
   user_id: string | null;
+  full_name: string;
   employee_code: string | null;
   document: string;
   phone: string | null;
   position: string | null;
+  payout_mode: string;
+  email: string | null;
+  birth_date: string | null;
   pay_type: string;
   salary_fixed: number | null;
   commission_percent: number | null;
   is_active: boolean;
 }
 
+export interface SedeUserRow {
+  id: string;
+  sede_id: string | null;
+  full_name: string;
+  id_number: string;
+  roles: RoleCode[];
+}
+
+const EMPLOYEE_SELECT =
+  "id, sede_id, user_id, full_name, employee_code, document, phone, position, payout_mode, email, birth_date, pay_type, salary_fixed, commission_percent, is_active";
+
 async function fetchEmployees(sedeId: string, limit?: number): Promise<EmployeeRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("employees")
-    .select(
-      "id, sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent, is_active",
-    )
+    .select(EMPLOYEE_SELECT)
     .eq("sede_id", sedeId)
-    .order("document")
+    .order("full_name")
     .limit(clampLimit(limit));
   if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
   return (data ?? []) as EmployeeRow[];
@@ -193,14 +206,49 @@ export async function getEmployee(id: string): Promise<EmployeeRow> {
   const db = await adminDb();
   const { data, error } = await db
     .from("employees")
-    .select(
-      "id, sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent, is_active",
-    )
+    .select(EMPLOYEE_SELECT)
     .eq("id", id)
     .maybeSingle();
   if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
   if (!data) throw new AdminError("NOT_FOUND", "Empleado no encontrado.", 404);
   return data as EmployeeRow;
+}
+
+/** Usuarios de la sede con sus roles (selector de vínculo + pestaña Roles).
+ * Incluye sin sede para que ninguno quede invisible sin rol. */
+export async function listSedeUsers(sedeId: string): Promise<SedeUserRow[]> {
+  const db = await adminDb();
+  const { data: users, error } = await db
+    .from("users")
+    .select("id, sede_id, full_name, id_number")
+    .or(`sede_id.eq.${sedeId},sede_id.is.null`)
+    .order("full_name");
+  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
+  const rows = (users ?? []) as Array<{ id: string; sede_id: string | null; full_name: string; id_number: string }>;
+  const { data: roleRows, error: roleError } = await db
+    .from("user_roles")
+    .select("user_id, roles(code)")
+    .in(
+      "user_id",
+      rows.map((row) => row.id),
+    );
+  if (roleError) throw new AdminError("INTERNAL", "Error interno.", 500);
+  const byUser = new Map<string, RoleCode[]>();
+  for (const row of (roleRows ?? []) as unknown as Array<{
+    user_id: string;
+    roles: { code: string } | Array<{ code: string }> | null;
+  }>) {
+    const codes = Array.isArray(row.roles)
+      ? row.roles.map((item) => item.code)
+      : row.roles
+        ? [row.roles.code]
+        : [];
+    for (const code of codes) {
+      if (code !== "admin" && code !== "empleado" && code !== "caja") continue;
+      byUser.set(row.user_id, [...(byUser.get(row.user_id) ?? []), code]);
+    }
+  }
+  return rows.map((row) => ({ ...row, roles: byUser.get(row.id) ?? [] }));
 }
 
 /**
@@ -214,6 +262,27 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
   const input: EmployeeInput = parsed.data;
   const code = normalizeEmployeeCode(input.employee_code);
   const db = await adminDb();
+
+  // Vínculo automático por documento (no editable): el usuario de acceso
+  // es el de la sede con el mismo documento; sin coincidencia va sin link.
+  // El user_id que traiga el input se ignora a propósito.
+  const { data: linked, error: linkedError } = await db
+    .from("users")
+    .select("id")
+    .eq("sede_id", input.sede_id)
+    .eq("id_number", input.document)
+    .maybeSingle();
+  if (linkedError) throw new AdminError("INTERNAL", "Error interno.", 500);
+  const userId = (linked as { id: string } | null)?.id ?? null;
+  if (userId) {
+    let takenQuery = db.from("employees").select("id").eq("user_id", userId).limit(1);
+    if (input.id) takenQuery = takenQuery.neq("id", input.id);
+    const { data: taken, error: takenError } = await takenQuery;
+    if (takenError) throw new AdminError("INTERNAL", "Error interno.", 500);
+    if (taken && taken.length > 0) {
+      throw new AdminError("USER_ALREADY_LINKED", "Ese documento ya está vinculado a otro empleado.", 409);
+    }
+  }
 
   if (code !== null) {
     let conflictQuery = db
@@ -233,11 +302,15 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
   const payload = {
     ...(input.id ? { id: input.id } : {}),
     sede_id: input.sede_id,
-    user_id: input.user_id ?? null,
+    user_id: userId,
+    full_name: input.full_name,
     employee_code: code,
     document: input.document,
     phone: input.phone ?? null,
     position: input.position ?? null,
+    ...(input.payout_mode !== undefined ? { payout_mode: input.payout_mode } : {}),
+    email: input.email?.trim() ? input.email.trim() : null,
+    birth_date: input.birth_date?.trim() ? input.birth_date : null,
     pay_type: input.pay_type,
     salary_fixed: input.salary_fixed ?? null,
     commission_percent: input.commission_percent ?? null,
@@ -246,9 +319,7 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
   const { data, error } = await db
     .from("employees")
     .upsert(payload, { onConflict: "id" })
-    .select(
-      "id, sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent, is_active",
-    )
+    .select(EMPLOYEE_SELECT)
     .single();
   // 23505: carrera perdida contra el índice parcial (doble escritura
   // simultánea); se traduce al mismo error de negocio.
