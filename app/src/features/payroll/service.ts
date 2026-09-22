@@ -402,22 +402,36 @@ export async function calculatePayroll(
     if (invoiceRows.length > 0) {
       const { data: items, error: itemsError } = await db
         .from("invoice_items")
-        .select("id, invoice_id, item_type, employee_id, qty, unit_price, subtotal")
+        .select("id, invoice_id, item_type, employee_id, qty, unit_price, subtotal, no_commission")
         .in(
           "invoice_id",
           invoiceRows.map((row) => row.id),
         )
         .limit(5000);
       if (itemsError) throw new PayrollError("INTERNAL", "Error interno.", 500);
-      lines = ((items ?? []) as Array<{
+      lines = (((items ?? []) as Array<{
         id: string;
         invoice_id: string;
         item_type: string;
-        employee_id: string;
+        employee_id: string | null;
         qty: number | string;
         unit_price: number | string;
         subtotal: number | string;
-      }>).map((row) => ({
+        no_commission?: boolean | null;
+      }>).filter(
+        (
+          row,
+        ): row is {
+          id: string;
+          invoice_id: string;
+          item_type: string;
+          employee_id: string;
+          qty: number | string;
+          unit_price: number | string;
+          subtotal: number | string;
+          no_commission?: boolean | null;
+        } => Boolean(row.employee_id) && !row.no_commission,
+      )).map((row) => ({
         invoice_id: row.invoice_id,
         consecutive_number: consecutiveByInvoice.get(row.invoice_id) ?? null,
         item_id: row.id,
@@ -464,12 +478,34 @@ export async function calculatePayroll(
       input.adjustments.map((row) => [row.employee_id, row]),
     );
 
+    // Inmediato ya pagado por (factura×empleado) en este rango: se resta
+    // para no pagar doble. Tope acumulado (ganado − pagado, nunca negativo).
+    const paidImmediateByEmployee = new Map<string, number>();
+    if (invoiceRows.length > 0) {
+      const { data: payouts } = await db
+        .from("commission_payouts")
+        .select("employee_id, amount")
+        .eq("sede_id", sedeId)
+        .in(
+          "invoice_id",
+          invoiceRows.map((row) => row.id),
+        )
+        .limit(5000);
+      for (const row of ((payouts ?? []) as Array<{ employee_id: string; amount: number | string }>)) {
+        paidImmediateByEmployee.set(
+          row.employee_id,
+          roundMoney((paidImmediateByEmployee.get(row.employee_id) ?? 0) + Number(row.amount)),
+        );
+      }
+    }
+
     const payload = actives.map((employee) => {
-      const employeeLines = linesByEmployee.get(employee.id) ?? [];
+      const isNoAplica = (employee as { payout_mode?: string }).payout_mode === "no_aplica";
+      const employeeLines = isNoAplica ? [] : (linesByEmployee.get(employee.id) ?? []);
       const percent =
-        employee.pay_type === "porcentaje" || employee.pay_type === "mixto"
-          ? Number(employee.commission_percent ?? 0)
-          : null;
+        isNoAplica || (employee.pay_type !== "porcentaje" && employee.pay_type !== "mixto")
+          ? null
+          : Number(employee.commission_percent ?? 0);
       const baseFixed =
         employee.pay_type === "fijo" || employee.pay_type === "mixto"
           ? roundMoney(Number(employee.salary_fixed ?? 0))
@@ -489,7 +525,9 @@ export async function calculatePayroll(
               line_subtotal: roundMoney(line.line_subtotal),
               commission: computeLineCommission(line.line_subtotal, percent),
             }));
-      const { detail, commissions } = buildEmployeeDetail(detailInput);
+      const { detail, commissions: earnedCommissions } = buildEmployeeDetail(detailInput);
+      const paidImmediate = paidImmediateByEmployee.get(employee.id) ?? 0;
+      const commissions = roundMoney(Math.max(0, earnedCommissions - paidImmediate));
       const adjustment = adjustments.get(employee.id);
       const bonuses = roundMoney(adjustment?.bonuses ?? 0);
       const otherDiscounts = roundMoney(adjustment?.other_discounts ?? 0);

@@ -472,6 +472,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
         qty: item.qty,
         unit_price: item.unit_price,
         discount: item.discount,
+        no_commission: item.no_commission ?? false,
         subtotal:
           Math.round(item.qty * Number(item.unit_price) * 100) / 100 -
           Math.min(item.discount, Math.round(item.qty * Number(item.unit_price) * 100) / 100),

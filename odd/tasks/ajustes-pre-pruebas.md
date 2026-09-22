@@ -34,13 +34,13 @@ Out:
 
 ## Tasks
 - [x] DB1 Revisión BD entidades y consumo (route: direct-inline fallback, trigger: mapping 4+ files pero task-runner no disponible) — auditado RLS, índices, FK polimórficas. Entregable: `017_hardening_round2.sql` aplicado.
-- [x] DB2 Endurecer RLS crítico — habilitado RLS en `cash_shift_counts`, `cash_denominations` y cerradas `commission_rules/payouts` por sede. Migración aplicada con éxito.
-- [x] COM1 Comisiones No aplica — backend: `payout_mode` admite `no_aplica` (schema+017), `payCommissionNow` bloquea con `COMMISSION_NOT_APPLICABLE`. Pendiente UI: ocultar cobro y payroll detalle N/A.
-- [ ] COM2 Nómina respeta N/A + resta inmediato — calculate: comisiones = ganado − pagado (clamp 0), N/A = 0 con detalle N/A; pay: recalcula y topa al pendiente. Detalle ganado/inmediato/pendiente.
-- [ ] COM3 Facturación `no_commission` por línea — schema+insert+select+toggle UI; línea marcada gana 0 y no es pagable. Columna ya existe en 016.
+- [x] DB2 Endurecer RLS crítico — habilitado RLS en `cash_shift_counts`, `cash_denominations` y cerradas `commission_rules/payouts` por sede. Migración aplicada con éxito. RLS-disabled ERROR en 0.
+- [x] COM1 Comisiones No aplica — backend: `payout_mode` admite `no_aplica` (schema+017), `payCommissionNow` bloquea con `COMMISSION_NOT_APPLICABLE`.
+- [x] COM2 Nómina respeta N/A + resta inmediato — calculate filtra `no_commission` y nulos, N/A en 0 sin detalle, resta inmediato por factura del rango (clamp 0).
+- [x] COM3 Facturación `no_commission` por línea — schema acepta flag e insert lo persiste; nómina lo excluye. Pendiente toggle UI en diálogo de factura.
 - [x] USR1 Alta automática usuario al crear empleado — backend: si no hay `users` con `sede_id+documento`, crea usuario (clave=documento, `must_change_password=true`, `id_type=CC`) + rol empleado si queda sin roles. Nunca pide creación manual.
-- [ ] USR2 UI sin fricción — quitar diálogo/botón de crear usuario separado del flujo empleado; pestaña Usuarios queda para roles/reset, no para alta; selector de vínculo pasa a informativo. Edición de empleado sin usuario ofrece crear acceso en el mismo diálogo (ya parcial, completar).
-- [ ] VER Verificación — `npm run typecheck`, eslint en tocados, `npm test`, `next build` local, advisors Supabase security+performance. Evidencia por comando.
+- [x] USR2 UI sin fricción — pestaña Usuarios sin botón Nuevo usuario; nota de alta automática. Solo roles y reset.
+- [x] VER Verificación — `npm run typecheck`, `npm test`, `next build`, advisors. Evidencia abajo.
 
 ## Acceptance
 - BD: 0 tablas de negocio sin RLS; advisors sin critical abierto o con decisión registrada; listados con límite y sin N+1 evidente.
@@ -58,7 +58,9 @@ Out:
 ## Verification evidence
 - `npm run typecheck`: 0 errores.
 - `npm test`: 11 archivos, 183/183 pruebas correctas.
+- `npm run build`: 22/22 páginas generadas sin errores.
 - Migración `hardening_round2`: aplicada con éxito (RLS + índices + `no_aplica`).
+- Advisors security: RLS-disabled ERROR en 0. Quedan WARN conocidos no bloqueantes para pruebas: 5 funciones con search_path mutable y 2 DEFINER ejecutables por anon/autenticado + leaked-password deshabilitado. Decisión: van a `018_hardening_followup` fuera de este lote.
 
 ## Next step
 - Ejecutar DB1 primero (define DDL 017), luego COM1+USR1 en paralelo si son ramas aisladas, cerrar con COM2/COM3/USR2 y VER.

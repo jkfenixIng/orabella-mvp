@@ -1456,9 +1456,9 @@ function UsersSection({ sedeId, initial, currentUserId }: { sedeId: string; init
       <section className={sectionClass} aria-label="Listado de usuarios">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-lg font-semibold">Usuarios ({rows.length})</h2>
-          <button type="button" onClick={() => setCreateOpen(true)} className={buttonClass}>
-            Nuevo usuario
-          </button>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Los usuarios se crean solos al crear el empleado. Aquí solo se asigna rol y se restablece clave.
+          </p>
         </div>
         {rows.length === 0 ? (
           <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
