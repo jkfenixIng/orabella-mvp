@@ -5,13 +5,19 @@ import {
   accumulateDayTotals,
   assertCloseInput,
   assertNoOpenShift,
+  assertShiftCloser,
+  bogotaDay,
+  buildMethodViews,
   closeShiftSchema,
   computeCashClose,
+  dayBounds,
   dayViewSchema,
+  expectedDigitalTotal,
+  HISTORY_PAGE_SIZE,
   historySchema,
   openShiftSchema,
   registerPaymentSchema,
-  requiresCloseObservation,
+  resolveClosingBase,
   resolveOpeningBase,
 } from "@/src/features/cash/schemas";
 
@@ -30,8 +36,69 @@ describe("cash: apertura hereda la base del último cierre (CAJ-01)", () => {
   });
 });
 
-describe("cash: rechazo de doble apertura (CAJ-01, sin solape)", () => {
-  it("con un turno abierto la apertura se rechaza (SHIFT_ALREADY_OPEN)", () => {
+describe("cash: filtros por día usan hora de Bogotá (CAJ-05/06)", () => {
+  it("dayBounds cubre el día calendario de Bogotá con offset -05:00", () => {
+    expect(dayBounds("2026-09-22")).toEqual({
+      from: "2026-09-22T00:00:00-05:00",
+      to: "2026-09-22T23:59:59.999-05:00",
+    });
+  });
+
+  it("bogotaDay resuelve la fecha en America/Bogota, no en UTC del servidor", () => {
+    // 02:00 UTC = 21:00 del día anterior en Bogotá.
+    expect(bogotaDay(0, new Date("2026-01-01T02:00:00Z"))).toBe("2025-12-31");
+    expect(bogotaDay(0, new Date("2026-01-01T06:00:00Z"))).toBe("2026-01-01");
+    expect(bogotaDay(1, new Date("2026-01-01T12:00:00Z"))).toBe("2026-01-02");
+  });
+});
+
+describe("cash: esperado digital = apertura + cobrado (CAJ-03)", () => {
+  it("suma saldo de apertura y pagos del turno", () => {
+    expect(expectedDigitalTotal(1000000, 0)).toBe(1000000);
+    expect(expectedDigitalTotal(1000000, 200000)).toBe(1200000);
+    expect(expectedDigitalTotal(0, 0)).toBe(0);
+  });
+
+  it("vistas: metodos con lo cobrado y diferencias solo en cerrados", () => {
+    const paid = new Map([["nequi", 200000]]);
+    const open = new Map([["nequi", 1000000]]);
+    const closedOk = new Map([["nequi", 1200000]]);
+    expect(
+      buildMethodViews({ paid, open, closed: closedOk }),
+    ).toEqual({
+      metodos: [{ method_code: "nequi", amount: 200000 }],
+      declarados: [{ method_code: "nequi", amount: 1200000 }],
+      diferencias: [],
+    });
+    const closedShort = new Map([["nequi", 1000000]]);
+    expect(
+      buildMethodViews({ paid, open, closed: closedShort }).diferencias,
+    ).toEqual([{ method_code: "nequi", expected: 1200000, declared: 1000000, difference: -200000 }]);
+    expect(buildMethodViews({ paid, open, closed: null }).diferencias).toEqual([]);
+  });
+});
+
+describe("cash: solo quien abrió cierra, admin como válvula (CAJ-03)", () => {
+  it("el que abrió cierra sin override", () => {
+    expect(
+      assertShiftCloser({ openedBy: "u-a", actorUserId: "u-a", isAdmin: false }),
+    ).toEqual({ isOverride: false });
+  });
+
+  it("otro caja no puede cerrar (SHIFT_NOT_OWNER)", () => {
+    expect(() =>
+      assertShiftCloser({ openedBy: "u-a", actorUserId: "u-b", isAdmin: false }),
+    ).toThrowError("SHIFT_NOT_OWNER");
+  });
+
+  it("admin cierra el ajeno con override auditado", () => {
+    expect(
+      assertShiftCloser({ openedBy: "u-a", actorUserId: "u-admin", isAdmin: true }),
+    ).toEqual({ isOverride: true });
+  });
+});
+
+describe("cash: rechazo de doble apertura (CAJ-01, sin solape)", () => {  it("con un turno abierto la apertura se rechaza (SHIFT_ALREADY_OPEN)", () => {
     expect(() => assertNoOpenShift(true)).toThrowError("SHIFT_ALREADY_OPEN");
   });
 
@@ -56,26 +123,31 @@ describe("cash: rechazo de doble apertura (CAJ-01, sin solape)", () => {
 describe("cash: cierre exige conteo de efectivo (CAJ-03)", () => {
   it("sin conteo el cierre se bloquea (COUNT_REQUIRED)", () => {
     expect(() =>
-      assertCloseInput({ countedCash: null, baseLeft: 200000, baseConfigurada: 200000, observation: null }),
+      assertCloseInput({ countedCash: null }),
     ).toThrowError("COUNT_REQUIRED");
     expect(() =>
-      assertCloseInput({ countedCash: undefined, baseLeft: 200000, baseConfigurada: 200000, observation: null }),
+      assertCloseInput({ countedCash: undefined }),
     ).toThrowError("COUNT_REQUIRED");
   });
 
-  it("el esquema exige conteo, base dejada, detalle y confirmación", () => {
+  it("con conteo el cierre procede sin pedir base ni justificación (arqueo escondido)", () => {
+    expect(() => assertCloseInput({ countedCash: 150000 })).not.toThrow();
+    expect(() => assertCloseInput({ countedCash: 0 })).not.toThrow();
+  });
+
+  it("el esquema exige conteo, detalle y confirmación; la base es opcional (la calcula el servidor)", () => {
     const base = {
       counted_cash: 400000,
-      base_left: 200000,
       counts: [{ method_code: "efectivo", denomination: 50000, quantity: 8, amount: 400000 }],
       confirmed: true,
     };
     expect(closeShiftSchema.safeParse(base).success).toBe(true);
-    expect(closeShiftSchema.safeParse({ base_left: 200000 }).success).toBe(false);
-    expect(closeShiftSchema.safeParse({ counted_cash: 400000 }).success).toBe(false);
-    expect(closeShiftSchema.safeParse({ counted_cash: -1, base_left: 200000 }).success).toBe(false);
+    expect(closeShiftSchema.safeParse({}).success).toBe(false);
+    expect(closeShiftSchema.safeParse({ counted_cash: -1 }).success).toBe(false);
     expect(closeShiftSchema.safeParse({ ...base, confirmed: false }).success).toBe(false);
-    expect(closeShiftSchema.safeParse({ counted_cash: 400000, base_left: 200000 }).success).toBe(false);
+    expect(
+      closeShiftSchema.safeParse({ counted_cash: 400000, base_left: 200000 }).success,
+    ).toBe(false);
   });
 });
 
@@ -99,29 +171,15 @@ describe("cash: casos del dueño 400/200 y 300/150 (CAJ-04)", () => {
   });
 });
 
-describe("cash: base incompleta exige observación (CAJ-04)", () => {
-  it("base_left < base_configurada marca incompleta", () => {
-    expect(requiresCloseObservation(150000, 300000)).toBe(true);
-    expect(requiresCloseObservation(300000, 300000)).toBe(false);
-    expect(requiresCloseObservation(350000, 300000)).toBe(false);
+describe("cash: base automática del cierre (CAJ-04, arqueo escondido)", () => {
+  it("contado >= configurada → base nivelada en la configurada", () => {
+    expect(resolveClosingBase(200000, 200000)).toBe(200000);
+    expect(resolveClosingBase(300000, 200000)).toBe(200000);
   });
 
-  it("incompleta sin observación se rechaza (OBSERVATION_REQUIRED)", () => {
-    expect(() =>
-      assertCloseInput({ countedCash: 150000, baseLeft: 150000, baseConfigurada: 300000, observation: null }),
-    ).toThrowError("OBSERVATION_REQUIRED");
-    expect(() =>
-      assertCloseInput({ countedCash: 150000, baseLeft: 150000, baseConfigurada: 300000, observation: "   " }),
-    ).toThrowError("OBSERVATION_REQUIRED");
-  });
-
-  it("incompleta con observación y completa sin observación proceden", () => {
-    expect(() =>
-      assertCloseInput({ countedCash: 150000, baseLeft: 150000, baseConfigurada: 300000, observation: "Faltante de 150000" }),
-    ).not.toThrow();
-    expect(() =>
-      assertCloseInput({ countedCash: 400000, baseLeft: 200000, baseConfigurada: 200000, observation: null }),
-    ).not.toThrow();
+  it("contado < configurada → base queda en lo contado hasta nivelarse", () => {
+    expect(resolveClosingBase(150000, 200000)).toBe(150000);
+    expect(resolveClosingBase(150000, 300000)).toBe(150000);
   });
 });
 
@@ -165,6 +223,21 @@ describe("cash: vista del día valida la fecha (CAJ-05)", () => {
       historySchema.safeParse({ desde: "2026-09-18", hasta: "2026-09-01" }).success,
     ).toBe(false);
     expect(historySchema.safeParse({ desde: "ayer", hasta: "2026-09-18" }).success).toBe(false);
+  });
+
+  it("historial pagina de a 10 con página 1 por defecto (CAJ-06)", () => {
+    const parsed = historySchema.safeParse({ desde: "2026-09-01", hasta: "2026-09-18" });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.page).toBe(1);
+      expect(HISTORY_PAGE_SIZE).toBe(10);
+    }
+    expect(
+      historySchema.safeParse({ desde: "2026-09-01", hasta: "2026-09-18", page: 3 }).success,
+    ).toBe(true);
+    expect(
+      historySchema.safeParse({ desde: "2026-09-01", hasta: "2026-09-18", page: 0 }).success,
+    ).toBe(false);
   });
 });
 

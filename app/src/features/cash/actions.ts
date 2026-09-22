@@ -69,6 +69,7 @@ export async function closeShiftAction(id: string, input: unknown) {
     const data = await closeShift(session.sedeId, id, input, {
       userId: session.userId,
       sedeId: session.sedeId,
+      roles: session.roles,
     });
     return { success: true as const, data };
   } catch (error) {
@@ -119,12 +120,13 @@ export async function getDayViewAction(input: { fecha: string; sede_id?: string 
 }
 
 /** Misma lógica que GET /api/v1/cash/history (solo admin). */
-export async function getHistoryAction(input: { desde: string; hasta: string; sede_id?: string }) {
+export async function getHistoryAction(input: { desde: string; hasta: string; sede_id?: string; page?: number }) {
   try {
     const session = await requireAdminSession(await sessionToken());
     const data = await getHistory(resolveSede(session.sedeId, input.sede_id), {
       desde: input.desde,
       hasta: input.hasta,
+      page: input.page,
     });
     return { success: true as const, data };
   } catch (error) {

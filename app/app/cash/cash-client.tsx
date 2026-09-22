@@ -11,13 +11,13 @@ import {
 import type {
   CashRegisterRow,
   CashShiftRow,
+  DayShiftView,
   DayView,
   HistoryResult,
 } from "@/src/features/cash/service";
 import type { PaymentMethodRow } from "@/src/features/admin/service";
 import {
   Dialog,
-  DialogClose,
   DialogContent,
   DialogFooter,
   DialogHeader,
@@ -25,6 +25,8 @@ import {
 } from "@/src/components/ui/lib/dialog";
 import { cn } from "@/src/components/ui/lib/utils";
 import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import { HISTORY_PAGE_SIZE } from "@/src/features/cash/schemas";
+import { ArrowLeftRight, Banknote, Coins, CreditCard, Wallet, Zap } from "lucide-react";
 
 const sectionClass = cn(
   "rounded-lg border border-border-color bg-surface p-4 shadow-sm",
@@ -49,6 +51,161 @@ type ActionResult<T> =
   | { success: true; data: T }
   | { success: false; code: string; message: string };
 
+// Misma tabla para vista del día e historial: mismas columnas siempre.
+function ShiftsTable({
+  shifts,
+  methodCols,
+  isAdmin,
+  emptyText,
+}: {
+  shifts: DayShiftView[];
+  methodCols: PaymentMethodRow[];
+  isAdmin: boolean;
+  emptyText: string;
+}) {
+  const [justOpen, setJustOpen] = useState<Array<{
+    accion: string;
+    fecha: string;
+    nota: string;
+    revisor: string | null;
+  }> | null>(null);
+  return (
+    <>
+      <div className="mt-3 overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+              <tr className="text-left text-slate-600 dark:text-slate-300">
+                <th className="py-1 pr-3">Apertura</th>
+                <th className="py-1 pr-3">Estado</th>
+                <th className="py-1 pr-3">Abrió</th>
+                <th className="py-1 pr-3">Cerró</th>
+                <th className="py-1 pr-3">Base inicial</th>
+              {isAdmin && (
+                <>
+                  <th className="py-1 pr-3">Ventas</th>
+                  <th className="py-1 pr-3">Efectivo</th>
+                  {methodCols.map((method) => (
+                    <th key={method.id} className="py-1 pr-3">
+                      {method.name}
+                    </th>
+                  ))}
+                </>
+              )}
+              <th className="py-1 pr-3">Base final</th>
+              {isAdmin && (
+                <>
+                  <th className="py-1 pr-3">Diferencia</th>
+                  <th className="py-1 pr-3">Revisada</th>
+                  <th className="py-1 pr-3">Justificación</th>
+                </>
+              )}
+            </tr>
+          </thead>
+          <tbody>
+            {shifts.map((view) => {
+              const isClosed = view.shift.status === "cerrado";
+              return (
+                <tr key={view.shift.id} className="border-t border-slate-200 dark:border-slate-700">
+                  <td className="py-1 pr-3">{formatDateTime(view.shift.opened_at)}</td>
+                  <td className="py-1 pr-3">{view.shift.status}</td>
+                  <td className="py-1 pr-3">{view.abierto_por ?? "—"}</td>
+                  <td className="py-1 pr-3">{view.cerrado_por ?? "—"}</td>
+                  <td className="py-1 pr-3">{formatMoney(view.shift.opening_base)}</td>
+                  {isAdmin && (
+                    <>
+                      <td className="py-1 pr-3">{formatMoney(view.ventas)}</td>
+                      <td className="py-1 pr-3">{formatMoney(view.efectivo)}</td>
+                      {methodCols.map((method) => {
+                        const declarado = view.declarados.find(
+                          (m) => m.method_code === method.code,
+                        )?.amount;
+                        return (
+                          <td key={method.id} className="py-1 pr-3">
+                            {declarado === undefined ? "—" : formatMoney(declarado)}
+                          </td>
+                        );
+                      })}
+                    </>
+                  )}
+                  <td className="py-1 pr-3">
+                    {isClosed ? formatMoney(view.shift.base_left) : "—"}
+                  </td>
+                  {isAdmin && (
+                    <>
+                      <td className="py-1 pr-3">
+                        {!isClosed ? "—" : view.revision ? "Sí" : "No"}
+                      </td>
+                      <td className="py-1 pr-3">
+                        {!view.revision ? "N/A" : view.revision.revisada ? "Sí" : "No"}
+                      </td>
+                      <td className="py-1 pr-3">
+                        {!view.revision ? (
+                          "N/A"
+                        ) : view.revision.notas.length > 0 ? (
+                          <button
+                            type="button"
+                            className="underline"
+                            onClick={() => setJustOpen(view.revision?.notas ?? null)}
+                          >
+                            Ver
+                          </button>
+                        ) : (
+                          ""
+                        )}
+                      </td>
+                    </>
+                  )}
+                </tr>
+              );
+            })}
+            {shifts.length === 0 && (
+              <tr>
+              <td
+                colSpan={6 + (isAdmin ? 5 + methodCols.length : 0)}
+                  className="py-2 text-slate-600 dark:text-slate-300"
+                >
+                  {emptyText}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      {justOpen && (
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setJustOpen(null);
+          }}
+        >
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Justificación de la revisión</DialogTitle>
+            </DialogHeader>
+            <ul className="mt-2 flex flex-col gap-2 text-sm">
+              {(justOpen ?? []).map((item, index) => (
+                <li key={index}>
+                  {item.accion} · {formatDateTime(item.fecha)} — «{item.nota}»
+                  {item.revisor && (
+                    <span className="block text-slate-600 dark:text-slate-300">
+                      Revisada por {item.revisor}.
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+            <DialogFooter>
+              <button type="button" className={ghostClass} onClick={() => setJustOpen(null)}>
+                Cerrar
+              </button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+    </>
+  );
+}
+
 function formatMoney(value: number | string | null): string {
   if (value === null || value === undefined) return "-";
   const numeric = typeof value === "string" ? Number(value) : value;
@@ -70,16 +227,56 @@ function formatDateTime(value: string | null): string {
   });
 }
 
-function toNumber(value: string): number | null {
-  const trimmed = value.trim();
-  if (trimmed === "") return null;
-  const parsed = Number(trimmed);
-  return Number.isFinite(parsed) ? parsed : null;
+// Brand badge as inline SVG (no external assets): rounded square in the
+// brand color with its initial. Stylized visual aid, not the official logo.
+function BrandBadge({ initial, fill }: { initial: string; fill: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className="h-5 w-5 shrink-0" aria-hidden="true">
+      <rect width="24" height="24" rx="6" fill={fill} />
+      <text
+        x="12"
+        y="16.5"
+        textAnchor="middle"
+        fontSize="12"
+        fontWeight="800"
+        fill="#ffffff"
+        fontFamily="Arial, sans-serif"
+      >
+        {initial}
+      </text>
+    </svg>
+  );
+}
+
+const payIconClass = "h-5 w-5 shrink-0 text-slate-500 dark:text-slate-400";
+
+// Visual aid for cash counts: denomination kind or payment method code
+// mapped to a recognizable icon. Unknown codes fall back to a wallet.
+function PayIcon({ code, kind }: { code?: string; kind?: string }) {
+  if (kind === "moneda") return <Coins className={payIconClass} aria-hidden="true" />;
+  if (kind === "billete") return <Banknote className={payIconClass} aria-hidden="true" />;
+  switch (code) {
+    case "efectivo":
+      return <Banknote className={payIconClass} aria-hidden="true" />;
+    case "nequi":
+      return <BrandBadge initial="N" fill="#6b21a8" />;
+    case "daviplata":
+      return <BrandBadge initial="D" fill="#d9261c" />;
+    case "tarjeta":
+      return <CreditCard className={payIconClass} aria-hidden="true" />;
+    case "bre-b":
+      return <Zap className={payIconClass} aria-hidden="true" />;
+    case "transferencia_normal":
+      return <ArrowLeftRight className={payIconClass} aria-hidden="true" />;
+    default:
+      return <Wallet className={payIconClass} aria-hidden="true" />;
+  }
 }
 
 interface CashClientProps {
   sedeId: string;
   today: string;
+  currentUserId: string;
   initialRegisters: CashRegisterRow[];
   initialOpenShift: CashShiftRow | null;
   initialDay: DayView;
@@ -94,12 +291,8 @@ export function CashClient(props: CashClientProps) {
   const [openShift, setOpenShift] = useState<CashShiftRow | null>(props.initialOpenShift);
   const [day, setDay] = useState<DayView>(props.initialDay);
   const [history, setHistory] = useState<HistoryResult>(props.initialHistory);
-  const [dayFecha, setDayFecha] = useState(props.today);
   const [histDesde, setHistDesde] = useState(props.initialHistory.desde);
   const [histHasta, setHistHasta] = useState(props.initialHistory.hasta);
-
-  const [baseLeft, setBaseLeft] = useState("");
-  const [observation, setObservation] = useState("");
 
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -112,12 +305,34 @@ export function CashClient(props: CashClientProps) {
   const [closeCounts, setCloseCounts] = useState<Record<string, string>>({});
   const [closeDigitals, setCloseDigitals] = useState<Record<string, string>>({});
   const [closeStep, setCloseStep] = useState<"counts" | "confirm">("counts");
+  // La vista del día no se carga al entrar (abrir/cerrar no la necesita):
+  // solo se pide si el usuario la muestra.
+  const [showDay, setShowDay] = useState(false);
+  const [histPage, setHistPage] = useState(1);
+  // Paginador local de la vista del día (el servidor la acota a 50).
+  const [dayPage, setDayPage] = useState(0);
   // Transición para los cambios de vista (día/historial): la UI no se
   // congela mientras la server action responde.
   const [isViewPending, startViewTransition] = useTransition();
 
   const register = registers[0] ?? day.register;
   const baseConfigurada = Number(register?.base_configurada ?? 200000);
+  // Solo quien abrió cierra; el admin es la válvula para no bloquear la caja.
+  const isOpener = openShift !== null && openShift.opened_by === props.currentUserId;
+  const canClose = props.canWrite && (isOpener || props.isAdmin);
+  // Columnas dinámicas: una columna por método digital arqueable.
+  const methodCols = props.methods.filter(
+    (method) => method.is_active && method.arqueable && method.code !== "efectivo",
+  );
+  // Paginadores: el historial pagina en servidor (los rangos pueden
+  // traer más de una página); el día pagina en cliente sobre lo cargado.
+  const histPageCount = Math.max(1, Math.ceil(history.total / history.pageSize));
+  const dayPageCount = Math.max(1, Math.ceil(day.shifts.length / HISTORY_PAGE_SIZE));
+  const safeDayPage = Math.min(dayPage, dayPageCount - 1);
+  const dayVisible = day.shifts.slice(
+    safeDayPage * HISTORY_PAGE_SIZE,
+    (safeDayPage + 1) * HISTORY_PAGE_SIZE,
+  );
 
   function showResult<T>(result: ActionResult<T>, okMessage: string): result is { success: true; data: T } {
     if (!result.success) {
@@ -154,6 +369,21 @@ export function CashClient(props: CashClientProps) {
     if (result.success) setDenominations(result.data);
   }
 
+  // Inventory-style cancel: closing the dialog always resets its state,
+  // so Esc/overlay/Cancel never leave stale counts or steps behind.
+  function cancelOpening() {
+    setOpenCounts({});
+    setOpenDigitals({});
+    setIsOpeningDialogOpen(false);
+  }
+
+  function cancelClosing() {
+    setCloseCounts({});
+    setCloseDigitals({});
+    setCloseStep("counts");
+    setIsClosingDialogOpen(false);
+  }
+
   function buildCloseCounts(): Array<{ method_code: string; denomination: number | null; quantity: number; amount: number }> {
     return [
       ...denominations.map((denom) => {
@@ -169,13 +399,6 @@ export function CashClient(props: CashClientProps) {
           amount: Number((closeDigitals[method.code] ?? "").replace(/\D/g, "")) || 0,
         })),
     ];
-  }
-
-  function openCashTotal(): number {
-    return denominations.reduce((acc, denom) => {
-      const qty = Number(openCounts[denom.id] ?? "0");
-      return acc + (Number.isFinite(qty) ? qty : 0) * Number(denom.value);
-    }, 0);
   }
 
   async function handleOpen(event: FormEvent): Promise<void> {
@@ -198,10 +421,17 @@ export function CashClient(props: CashClientProps) {
     try {
       const result = await openShiftAction({ counts });
       if (result.success) {
-        showResult(result, `Turno abierto con base ${formatMoney(result.data.opening_base)}.`);
-        setOpenShift(result.data);
+        const { shift, mismatches, firstOpen } = result.data;
+        setOpenShift(shift);
+        if (mismatches.length === 0) {
+          showResult(result, `Turno abierto con base ${formatMoney(shift.opening_base)}.`);
+        } else if (firstOpen) {
+          showResult(result, "Turno abierto. Primera apertura: el conteo inicial quedó registrado.");
+        } else {
+          showResult(result, "Turno abierto con diferencias registradas.");
+        }
         setIsOpeningDialogOpen(false);
-        const dayResult = await getDayViewAction({ fecha: dayFecha, sede_id: props.sedeId });
+        const dayResult = await getDayViewAction({ fecha: props.today, sede_id: props.sedeId });
         if (dayResult.success) setDay(dayResult.data);
       } else {
         showResult(result, "");
@@ -214,17 +444,6 @@ export function CashClient(props: CashClientProps) {
   async function handleClose(event: FormEvent): Promise<void> {
     event.preventDefault();
     if (!openShift) return;
-    const base = toNumber(baseLeft);
-    if (base === null || base < 0) {
-      setError("La base dejada es obligatoria.");
-      return;
-    }
-    if (base < baseConfigurada && observation.trim() === "") {
-      setError(
-        `La base quedó incompleta (${formatMoney(base)} de ${formatMoney(baseConfigurada)}): la observación es obligatoria.`,
-      );
-      return;
-    }
     if (closeStep === "counts") {
       setError(null);
       setCloseStep("confirm");
@@ -235,8 +454,6 @@ export function CashClient(props: CashClientProps) {
     try {
       const result = await closeShiftAction(openShift.id, {
         counted_cash: counted,
-        base_left: base,
-        observation: observation.trim() || undefined,
         counts: buildCloseCounts(),
         confirmed: true,
       });
@@ -246,13 +463,15 @@ export function CashClient(props: CashClientProps) {
         const baseDiff = Number(row.base_difference ?? 0);
         const envelope = Number(row.cash_withdrawn ?? 0);
         setOpenShift(null);
-        setBaseLeft("");
-        setObservation("");
         setCloseCounts({});
         setCloseDigitals({});
         setCloseStep("counts");
         setIsClosingDialogOpen(false);
-        if (digitalDiff.length === 0 && baseDiff >= 0) {
+        // Hidden count: only admins see bases, differences and expected
+        // values. Everyone else gets a neutral confirmation.
+        if (!props.isAdmin) {
+          showResult(result, "Turno cerrado.");
+        } else if (digitalDiff.length === 0 && baseDiff >= 0) {
           showResult(result, `Turno cerrado. Base ${formatMoney(row.base_left)} · sobre ${formatMoney(envelope)}.`);
         } else {
           const parts = digitalDiff.map(
@@ -263,12 +482,13 @@ export function CashClient(props: CashClientProps) {
           setError(null);
           setNotice(`Cierre con diferencias: ${parts.join(" · ")}. Sobre ${formatMoney(envelope)}. Se informó a los administradores.`);
         }
-        const dayResult = await getDayViewAction({ fecha: dayFecha, sede_id: props.sedeId });
+        const dayResult = await getDayViewAction({ fecha: props.today, sede_id: props.sedeId });
         if (dayResult.success) setDay(dayResult.data);
         const histResult = await getHistoryAction({
           desde: histDesde,
           hasta: histHasta,
           sede_id: props.sedeId,
+          page: histPage,
         });
         if (histResult.success) setHistory(histResult.data);
       } else {
@@ -280,14 +500,14 @@ export function CashClient(props: CashClientProps) {
     }
   }
 
-  function handleDay(event: FormEvent): void {
-    event.preventDefault();
+  function loadDay(): void {
     startViewTransition(async () => {
       setBusy(true);
       try {
-        const result = await getDayViewAction({ fecha: dayFecha, sede_id: props.sedeId });
-        if (!showResult(result, `Vista del día ${dayFecha} actualizada.`)) return;
+        const result = await getDayViewAction({ fecha: props.today, sede_id: props.sedeId });
+        if (!showResult(result, "Vista del día actualizada.")) return;
         setDay(result.data);
+        setDayPage(0);
       } finally {
         setBusy(false);
       }
@@ -296,6 +516,11 @@ export function CashClient(props: CashClientProps) {
 
   function handleHistory(event: FormEvent): void {
     event.preventDefault();
+    fetchHistory(1);
+  }
+
+  // Historial paginado en servidor: cada página se pide con su número.
+  function fetchHistory(page: number): void {
     startViewTransition(async () => {
       setBusy(true);
       try {
@@ -303,9 +528,11 @@ export function CashClient(props: CashClientProps) {
           desde: histDesde,
           hasta: histHasta,
           sede_id: props.sedeId,
+          page,
         });
         if (!showResult(result, `Historial ${histDesde} … ${histHasta} actualizado.`)) return;
         setHistory(result.data);
+        setHistPage(page);
       } finally {
         setBusy(false);
       }
@@ -333,27 +560,30 @@ export function CashClient(props: CashClientProps) {
               Turno abierto desde {formatDateTime(openShift.opened_at)} con base{" "}
               <strong>{formatMoney(openShift.opening_base)}</strong>.
             </p>
-            <p className="text-slate-600 dark:text-slate-300">
-              Base configurada: {formatMoney(baseConfigurada)}.
-            </p>
-            {props.canWrite && (
+            {props.isAdmin && (
+              <p className="text-slate-600 dark:text-slate-300">
+                Base configurada: {formatMoney(baseConfigurada)}.
+              </p>
+            )}
+            {canClose ? (
               <div className="mt-3 flex flex-wrap gap-2">
                 <button type="button" onClick={startClosing} className={buttonClass}>
                   Cerrar turno
                 </button>
               </div>
-            )}
+            ) : props.canWrite ? (
+              <p className="mt-3 text-slate-600 dark:text-slate-300">
+                Solo quien abrió el turno puede cerrarlo.
+              </p>
+            ) : null}
           </div>
         ) : (
           <div className="mt-3 flex flex-col gap-3 text-sm">
             <p>No hay un turno abierto.</p>
             {props.canWrite ? (
               <div>
-                <p className="w-full text-slate-600 dark:text-slate-300">
-                  Al abrir se valida el pre-arqueo contra el último cierre antes de iniciar.
-                </p>
-                <button type="button" onClick={startOpening} className={`${buttonClass} mt-3`}>
-                  Abrir turno con pre-arqueo
+                <button type="button" onClick={startOpening} className={buttonClass}>
+                  Abrir turno
                 </button>
               </div>
             ) : (
@@ -366,20 +596,28 @@ export function CashClient(props: CashClientProps) {
       </section>
 
       {props.canWrite && !openShift && (
-        <Dialog open={isOpeningDialogOpen} onOpenChange={setIsOpeningDialogOpen}>
+        <Dialog
+          open={isOpeningDialogOpen}
+          onOpenChange={(open) => {
+            if (!open) cancelOpening();
+            else setIsOpeningDialogOpen(open);
+          }}
+        >
           <DialogContent className="max-w-lg">
             <DialogHeader>
-              <DialogTitle>Pre-arqueo de apertura</DialogTitle>
+              <DialogTitle>Abrir turno</DialogTitle>
             </DialogHeader>
             <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
               Cuente billetes y monedas por denominación y declare los totales digitales.
-              El sistema valida contra el cierre anterior antes de abrir.
             </p>
             <form onSubmit={handleOpen} className="mt-3 flex flex-col gap-3">
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                 {denominations.map((denom) => (
                   <label key={denom.id} className={labelClass}>
-                    {denom.kind} {formatMoney(denom.value)}
+                    <span className="inline-flex items-center gap-1.5">
+                      <PayIcon kind={denom.kind} />
+                      {denom.kind} {formatMoney(denom.value)}
+                    </span>
                     <input
                       className={inputClass}
                       value={openCounts[denom.id] ?? ""}
@@ -392,12 +630,14 @@ export function CashClient(props: CashClientProps) {
                   </label>
                 ))}
               </div>
-              <p className="text-sm font-semibold">Efectivo contado: {formatMoney(openCashTotal())}</p>
               {props.methods
                 .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
                 .map((method) => (
                   <label key={method.id} className={labelClass}>
-                    {method.name} (total en la aplicación)
+                    <span className="inline-flex items-center gap-1.5">
+                      <PayIcon code={method.code} />
+                      {method.name} (total en la aplicación)
+                    </span>
                     <input
                       className={inputClass}
                       value={formatMoneyInput(openDigitals[method.code] ?? "")}
@@ -410,11 +650,9 @@ export function CashClient(props: CashClientProps) {
                   </label>
                 ))}
               <DialogFooter>
-                <DialogClose asChild>
-                  <button type="button" className={ghostClass}>
-                    Cancelar
-                  </button>
-                </DialogClose>
+                <button type="button" className={ghostClass} onClick={cancelOpening}>
+                  Cancelar
+                </button>
                 <button type="submit" className={buttonClass} disabled={busy}>
                   Validar y abrir
                 </button>
@@ -425,7 +663,13 @@ export function CashClient(props: CashClientProps) {
       )}
 
       {props.canWrite && openShift && (
-        <Dialog open={isClosingDialogOpen} onOpenChange={setIsClosingDialogOpen}>
+        <Dialog
+          open={isClosingDialogOpen}
+          onOpenChange={(open) => {
+            if (!open) cancelClosing();
+            else setIsClosingDialogOpen(open);
+          }}
+        >
           <DialogContent className="max-w-lg">
             <DialogHeader>
               <DialogTitle>Cerrar turno</DialogTitle>
@@ -436,7 +680,10 @@ export function CashClient(props: CashClientProps) {
                 <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                   {denominations.map((denom) => (
                     <label key={denom.id} className={labelClass}>
-                      {denom.kind} {formatMoney(denom.value)}
+                      <span className="inline-flex items-center gap-1.5">
+                        <PayIcon kind={denom.kind} />
+                        {denom.kind} {formatMoney(denom.value)}
+                      </span>
                       <input
                         className={inputClass}
                         value={closeCounts[denom.id] ?? ""}
@@ -449,12 +696,14 @@ export function CashClient(props: CashClientProps) {
                     </label>
                   ))}
                 </div>
-                <p className="text-sm font-semibold">Efectivo contado: {formatMoney(closeCashTotal())}</p>
                 {props.methods
                   .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
                   .map((method) => (
                     <label key={method.id} className={labelClass}>
-                      {method.name} (total en la aplicación)
+                      <span className="inline-flex items-center gap-1.5">
+                        <PayIcon code={method.code} />
+                        {method.name} (total en la aplicación)
+                      </span>
                       <input
                         className={inputClass}
                         value={formatMoneyInput(closeDigitals[method.code] ?? "")}
@@ -466,122 +715,106 @@ export function CashClient(props: CashClientProps) {
                       />
                     </label>
                   ))}
-                <label className={labelClass}>
-                  Base dejada (obligatoria)
-                  <input
-                    className={inputClass}
-                    value={formatMoneyInput(baseLeft)}
-                    onChange={(event) => setBaseLeft(stripMoneyInput(event.target.value))}
-                    inputMode="numeric"
-                    placeholder="200.000"
-                  />
-                </label>
-                <label className={labelClass}>
-                  Observación (obligatoria si la base queda incompleta)
-                  <input
-                    className={inputClass}
-                    value={observation}
-                    onChange={(event) => setObservation(event.target.value)}
-                    placeholder="Faltante de 150000…"
-                  />
-                </label>
               </>
             ) : (
               <div className="flex flex-col gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-800 dark:bg-amber-950">
                 <p className="font-semibold">¿Está seguro de cerrar?</p>
-                <p>
-                  Efectivo contado {formatMoney(closeCashTotal())} · base que queda{" "}
-                  {formatMoney(toNumber(baseLeft) ?? 0)} · sobre {formatMoney(closeCashTotal() - (toNumber(baseLeft) ?? 0))}.
-                </p>
-                <p>Después del cierre ya no podrá modificarlo. Solo un administrador puede editarlo y queda registrado.</p>
+                {props.isAdmin && !isOpener && <p>Cierra este turno como administrador.</p>}
+                <p>Después del cierre ya no podrá modificarlo.</p>
               </div>
             )}
             <DialogFooter>
               {closeStep === "confirm" ? (
-                <button type="button" className={ghostClass} onClick={() => setCloseStep("counts")}>
-                  Volver
-                </button>
-              ) : (
-                <DialogClose asChild>
-                  <button type="button" className={ghostClass}>
+                <>
+                  <button type="button" className={ghostClass} onClick={() => setCloseStep("counts")}>
+                    Volver
+                  </button>
+                  <button type="button" className={ghostClass} onClick={cancelClosing}>
                     Cancelar
                   </button>
-                </DialogClose>
+                </>
+              ) : (
+                <button type="button" className={ghostClass} onClick={cancelClosing}>
+                  Cancelar
+                </button>
               )}
               <button type="submit" className={buttonClass} disabled={busy}>
                 {closeStep === "counts" ? "Continuar" : "Sí, cerrar turno"}
               </button>
             </DialogFooter>
             </form>
-            <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-              Base configurada: {formatMoney(baseConfigurada)}. Recogido = contado − base;
-              diferencia = base − configurada.
-            </p>
           </DialogContent>
         </Dialog>
       )}
 
       <section className={sectionClass} aria-busy={isViewPending}>
         <h2 className="text-lg font-semibold">Vista del día</h2>
-        <form onSubmit={handleDay} className="mt-3 flex flex-wrap items-end gap-3">
-          <label className={labelClass}>
-            Fecha
-            <input
-              type="date"
-              className={inputClass}
-              value={dayFecha}
-              onChange={(event) => setDayFecha(event.target.value)}
+        {!showDay ? (
+          <div className="mt-3 flex flex-col gap-3 text-sm">
+            <div>
+              <button
+                type="button"
+                className={ghostClass}
+                disabled={busy || isViewPending}
+                onClick={() => {
+                  setShowDay(true);
+                  loadDay();
+                }}
+              >
+                {isViewPending ? "Cargando…" : "Mostrar vista del día"}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="mt-3">
+              <button
+                type="button"
+                className={ghostClass}
+                disabled={busy || isViewPending}
+                onClick={loadDay}
+              >
+                {isViewPending ? "Actualizando…" : "Actualizar"}
+              </button>
+            </div>
+            <ShiftsTable
+              shifts={dayVisible}
+              methodCols={methodCols}
+              isAdmin={props.isAdmin}
+              emptyText="Sin turnos este día."
             />
-          </label>
-          <button type="submit" className={ghostClass} disabled={busy || isViewPending}>
-            {isViewPending ? "Actualizando…" : "Ver día"}
-          </button>
-        </form>
-        <div className="mt-3 overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-slate-600 dark:text-slate-300">
-                <th className="py-1 pr-3">Apertura</th>
-                <th className="py-1 pr-3">Estado</th>
-                <th className="py-1 pr-3">Base inicial</th>
-                <th className="py-1 pr-3">Ventas</th>
-                <th className="py-1 pr-3">Esperado</th>
-                <th className="py-1 pr-3">Contado</th>
-                <th className="py-1 pr-3">Base dejada</th>
-                <th className="py-1 pr-3">Recogido</th>
-                <th className="py-1 pr-3">Diferencia</th>
-              </tr>
-            </thead>
-            <tbody>
-              {day.shifts.map((view) => (
-                <tr key={view.shift.id} className="border-t border-slate-200 dark:border-slate-700">
-                  <td className="py-1 pr-3">{formatDateTime(view.shift.opened_at)}</td>
-                  <td className="py-1 pr-3">{view.shift.status}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.shift.opening_base)}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.ventas)}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.efectivo)}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.shift.counted_cash)}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.shift.base_left)}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.shift.cash_withdrawn)}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.shift.base_difference)}</td>
-                </tr>
-              ))}
-              {day.shifts.length === 0 && (
-                <tr>
-                  <td colSpan={9} className="py-2 text-slate-600 dark:text-slate-300">
-                    Sin turnos este día.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-        <p className="mt-3 text-sm">
-          Acumulado ({day.totals.turnos} turnos): ventas {formatMoney(day.totals.ventas)} ·
-          esperado {formatMoney(day.totals.esperado)} · contado {formatMoney(day.totals.contado)} ·
-          base dejada {formatMoney(day.totals.baseDejada)} · recogido {formatMoney(day.totals.recogido)} ·
-          diferencias {formatMoney(day.totals.diferencias)}.
-        </p>
+          {dayPageCount > 1 && (
+            <div className="mt-3 flex items-center gap-2 text-sm">
+              <button
+                type="button"
+                className={ghostClass}
+                disabled={safeDayPage === 0}
+                onClick={() => setDayPage(safeDayPage - 1)}
+              >
+                Anterior
+              </button>
+              <span className="text-slate-600 dark:text-slate-300">
+                Página {safeDayPage + 1} de {dayPageCount}
+              </span>
+              <button
+                type="button"
+                className={ghostClass}
+                disabled={safeDayPage >= dayPageCount - 1}
+                onClick={() => setDayPage(safeDayPage + 1)}
+              >
+                Siguiente
+              </button>
+            </div>
+          )}
+            {props.isAdmin ? (
+              <p className="mt-3 text-sm">
+                Acumulado ({day.totals.turnos} turnos): ventas {formatMoney(day.totals.ventas)} ·
+                recogido {formatMoney(day.totals.recogido)} ·
+                diferencias {formatMoney(day.totals.diferencias)}.
+              </p>
+            ) : null}
+          </>
+        )}
       </section>
 
       {props.isAdmin ? (
@@ -610,25 +843,35 @@ export function CashClient(props: CashClientProps) {
             {isViewPending ? "Filtrando…" : "Filtrar"}
           </button>
         </form>
-        <ul className="mt-3 flex flex-col gap-2 text-sm">
-          {history.shifts.map((view) => (
-            <li key={view.shift.id} className="border-t border-slate-200 pt-2 dark:border-slate-700">
-              {formatDateTime(view.shift.opened_at)} · {view.shift.status} · base{" "}
-              {formatMoney(view.shift.opening_base)} · ventas {formatMoney(view.ventas)}
-              {view.shift.status === "cerrado" && (
-                <>
-                  {" "}· contado {formatMoney(view.shift.counted_cash)} · base dejada{" "}
-                  {formatMoney(view.shift.base_left)} · recogido {formatMoney(view.shift.cash_withdrawn)} ·
-                  diferencia {formatMoney(view.shift.base_difference)}
-                  {view.shift.observation ? ` · «${view.shift.observation}»` : ""}
-                </>
-              )}
-            </li>
-          ))}
-          {history.shifts.length === 0 && (
-            <li className="text-slate-600 dark:text-slate-300">Sin turnos en el rango.</li>
-          )}
-        </ul>
+        <ShiftsTable
+          shifts={history.shifts}
+          methodCols={methodCols}
+          isAdmin={props.isAdmin}
+          emptyText="Sin turnos en el rango."
+        />
+        {histPageCount > 1 && (
+          <div className="mt-3 flex items-center gap-2 text-sm">
+            <button
+              type="button"
+              className={ghostClass}
+              disabled={histPage <= 1 || isViewPending}
+              onClick={() => fetchHistory(histPage - 1)}
+            >
+              Anterior
+            </button>
+            <span className="text-slate-600 dark:text-slate-300">
+              Página {histPage} de {histPageCount} ({history.total} turnos)
+            </span>
+            <button
+              type="button"
+              className={ghostClass}
+              disabled={histPage >= histPageCount || isViewPending}
+              onClick={() => fetchHistory(histPage + 1)}
+            >
+              Siguiente
+            </button>
+          </div>
+        )}
       </section>
       ) : null}
     </div>

@@ -3,19 +3,15 @@ import { redirect } from "next/navigation";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { listPaymentMethods } from "@/src/features/admin/service";
-import { getDayView, getOpenShift, listRegisters } from "@/src/features/cash/service";
-import { accumulateDayTotals } from "@/src/features/cash/schemas";
+import { getOpenShift, listRegisters } from "@/src/features/cash/service";
+import type { DayView } from "@/src/features/cash/service";
+import { accumulateDayTotals, bogotaDay, HISTORY_PAGE_SIZE } from "@/src/features/cash/schemas";
 import { CashClient } from "./cash-client";
 
 export const dynamic = "force-dynamic";
 
 function isoDay(offsetDays: number): string {
-  const date = new Date();
-  date.setDate(date.getDate() + offsetDays);
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
+  return bogotaDay(offsetDays);
 }
 
 /**
@@ -43,14 +39,23 @@ export default async function CashPage() {
   }
 
   const today = isoDay(0);
-  // Entrada instantánea: solo registros + turno abierto + día. El
-  // historial (30 días, solo admin) se carga bajo demanda con el filtro.
-  const [registers, openShift, rawDay, methods] = await Promise.all([
+  // Entrada instantánea: solo registros + turno abierto. La vista del día
+  // y el historial (solo admin) se cargan bajo demanda desde el cliente,
+  // para no pagar ese costo al entrar solo a abrir o cerrar turno.
+  const [registers, openShift, methods] = await Promise.all([
     listRegisters(sedeId),
     getOpenShift(sedeId),
-    getDayView(sedeId, { fecha: today }),
     listPaymentMethods(sedeId),
   ]);
+
+  // Día vacío inicial: el cliente lo pide solo si el usuario lo muestra.
+  const emptyDay: DayView = {
+    fecha: today,
+    register: registers[0] ?? null,
+    shifts: [],
+    totals: accumulateDayTotals([]),
+  };
+  const rawDay = emptyDay;
 
   const canWrite = session.roles.includes("admin") || session.roles.includes("caja");
   const isAdmin = session.roles.includes("admin");
@@ -79,17 +84,18 @@ export default async function CashPage() {
         <div>
           <h1 className="text-3xl font-bold">Caja</h1>
           <p className="mt-2 text-slate-600 dark:text-slate-300">
-            Turnos con base encadenada, pagos por método y cierre con arqueo.
+            Turnos, pagos por método y cierres de caja.
           </p>
         </div>
       </header>
       <CashClient
         sedeId={sedeId}
         today={today}
+        currentUserId={session.user.id}
         initialRegisters={registers}
         initialOpenShift={openShift}
         initialDay={day}
-        initialHistory={{ desde: today, hasta: today, shifts: [] }}
+        initialHistory={{ desde: today, hasta: today, shifts: [], page: 1, pageSize: HISTORY_PAGE_SIZE, total: 0 }}
         methods={methods.filter((row) => row.is_active)}
         canWrite={canWrite}
         isAdmin={isAdmin}

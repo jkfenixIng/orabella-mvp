@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState, useEffect } from "react";
-import { Calculator, House, Package, Receipt, Settings, Ticket, Wallet, type LucideIcon } from "lucide-react";
+import { Bell, Calculator, House, Package, Receipt, Settings, Ticket, Wallet, type LucideIcon } from "lucide-react";
 import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 
 interface NavLink {
@@ -75,6 +75,19 @@ const NAV_GROUPS: NavGroup[] = [
         },
       ],
   },
+  {
+    id: "control",
+    label: "Control",
+      links: [
+        {
+          href: "/alerts",
+          label: "Alertas",
+          description: "Desajustes de caja y cuentas bloqueadas",
+          Icon: Bell,
+          roles: ["admin"],
+        },
+      ],
+  },
 ];
 
 function isActive(pathname: string, href: string): boolean {
@@ -85,7 +98,7 @@ function groupHasActive(pathname: string, group: NavGroup): boolean {
   return group.links.some((link) => isActive(pathname, link.href));
 }
 
-export function MainNav({ roles }: { roles: string[] }) {
+export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; userName: string | null; alertsUnread: number }) {
   const pathname = usePathname();
   const router = useRouter();
   // Fail closed: without roles only Inicio is visible.
@@ -181,6 +194,11 @@ export function MainNav({ roles }: { roles: string[] }) {
                       >
                         <link.Icon className="h-4 w-4" aria-hidden="true" />
                         {link.label}
+                        {link.href === "/alerts" && alertsUnread > 0 && (
+                          <span className="ml-auto rounded-full bg-red-600 px-2 py-0.5 text-xs font-bold text-white">
+                            {alertsUnread}
+                          </span>
+                        )}
                       </Link>
                     </li>
                   );
@@ -196,6 +214,12 @@ export function MainNav({ roles }: { roles: string[] }) {
   const footer = (
     <div className="flex flex-col gap-3 border-t border-slate-200 pt-3 dark:border-slate-700">
       <ThemeToggle />
+      {userName && (
+        <p className="truncate px-1 text-xs text-slate-500 dark:text-slate-400" title={userName}>
+          En sesión:{" "}
+          <span className="font-medium text-slate-700 dark:text-slate-200">{userName}</span>
+        </p>
+      )}
       <button
         type="button"
         onClick={handleLogout}

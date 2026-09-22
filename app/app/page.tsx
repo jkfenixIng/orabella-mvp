@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 import { Calculator, Package, Receipt, Settings, Ticket, TriangleAlert, Wallet } from "lucide-react";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
+import { countUnreadAlerts } from "@/src/features/alerts/service";
 import { listProducts } from "@/src/features/inventory/service";
 import { filterLowStock } from "@/src/features/inventory/schemas";
 
@@ -18,7 +19,7 @@ const MODULES = [
   {
     href: "/cash",
     name: "Caja",
-    purpose: "Abra y cierre turnos, registre movimientos y consulte el arqueo del día.",
+    purpose: "Abra y cierre turnos, registre movimientos y revise el día.",
     Icon: Wallet,
     roles: ["admin", "caja"],
   },
@@ -64,6 +65,9 @@ export default async function HomePage() {
   );
   const canSeeInventory = visibleModules.some((module) => module.href === "/inventory");
   const lowStock = sedeId && canSeeInventory ? filterLowStock(await listProducts(sedeId)) : [];
+  const isAdmin = session.roles.includes("admin");
+  const unreadAlerts =
+    isAdmin && sedeId ? await countUnreadAlerts(sedeId, "caja").catch(() => 0) : 0;
 
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-4xl flex-col gap-8 px-6 py-12">
@@ -75,6 +79,24 @@ export default async function HomePage() {
           Elija un módulo para empezar.
         </p>
       </header>
+
+      {unreadAlerts > 0 ? (
+        <section
+          aria-label="Alertas de caja"
+          className="flex flex-col gap-2 rounded-lg border border-red-300 bg-red-50 p-4 dark:border-red-800 dark:bg-red-950"
+        >
+          <h2 className="text-lg font-semibold text-red-800 dark:text-red-200">
+            Alertas de caja ({unreadAlerts} sin leer)
+          </h2>
+          <Link
+            href="/alerts"
+            aria-label="Ver alertas de caja"
+            className="mt-1 w-fit rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+          >
+            Ver alertas
+          </Link>
+        </section>
+      ) : null}
 
       {lowStock.length > 0 ? (
         <section

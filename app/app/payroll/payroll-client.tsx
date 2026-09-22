@@ -16,7 +16,6 @@ import type {
 import type { EmployeeRow, PaymentMethodRow } from "@/src/features/admin/service";
 import {
   Dialog,
-  DialogClose,
   DialogContent,
   DialogFooter,
   DialogHeader,
@@ -105,9 +104,17 @@ export function PayrollClient(props: PayrollClientProps) {
     }
   }
 
+  // Inventory-style cancel: closing the dialog always resets its state.
+  function closeDetail() {
+    setDetail(null);
+    setExpanded({});
+    setAdjustments({});
+    setPortions({});
+    setDetailDialogOpen(false);
+  }
+
   function loadDetail(id: string) {
-    setSelectedId(id);
-    startViewTransition(async () => {
+    setSelectedId(id);    startViewTransition(async () => {
       const result = (await getPeriodDetailAction(id)) as ActionResult<PeriodDetail>;
       if (show(result)) {
         setDetail(result.data);
@@ -196,7 +203,7 @@ export function PayrollClient(props: PayrollClientProps) {
     setBusy(true);
     const result = (await closePayrollPeriodAction(selectedId)) as ActionResult<PayrollPeriodRow>;
     setBusy(false);
-    if (show(result, "Periodo cerrado: quedó inmutable.")) {
+    if (show(result, "Periodo cerrado.")) {
       await refreshPeriods(selectedId);
       await loadDetail(selectedId);
     }
@@ -263,7 +270,13 @@ export function PayrollClient(props: PayrollClientProps) {
       </section>
 
       {selected && (
-        <Dialog open={detailDialogOpen} onOpenChange={setDetailDialogOpen}>
+        <Dialog
+          open={detailDialogOpen}
+          onOpenChange={(open) => {
+            if (!open) closeDetail();
+            else setDetailDialogOpen(open);
+          }}
+        >
           <DialogContent className="max-w-4xl" aria-busy={isViewPending}>
             <DialogHeader>
               <DialogTitle>
@@ -273,7 +286,7 @@ export function PayrollClient(props: PayrollClientProps) {
             <div className="max-h-[calc(100dvh-12rem)] overflow-y-auto pr-1">
           {selected.status === "cerrado" ? (
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-              Periodo cerrado e inmutable: no admite cálculo ni pagos.
+              Periodo cerrado.
             </p>
           ) : (
             props.canAdmin && (
@@ -408,11 +421,9 @@ export function PayrollClient(props: PayrollClientProps) {
           )}
             </div>
             <DialogFooter>
-              <DialogClose asChild>
-                <button type="button" className={ghostClass}>
-                  Cerrar
-                </button>
-              </DialogClose>
+              <button type="button" className={ghostClass} onClick={closeDetail}>
+                Cerrar
+              </button>
             </DialogFooter>
           </DialogContent>
         </Dialog>

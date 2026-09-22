@@ -56,7 +56,7 @@ export default async function InvoicesPage() {
         <div>
           <h1 className="text-3xl font-bold">Facturación</h1>
           <p className="mt-2 text-slate-600 dark:text-slate-300">
-            Factura interna con consecutivo por sede, impuestos y cobro dividido.
+            Facturas, impuestos y cobros.
           </p>
         </div>
       </header>

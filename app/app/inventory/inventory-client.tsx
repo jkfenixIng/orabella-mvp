@@ -211,7 +211,7 @@ export function InventoryClient(props: InventoryClientProps) {
       setError(result.message);
       return;
     }
-    setNotice(editingId ? "Producto actualizado." : "Producto creado. Registre el stock inicial con un movimiento IN.");
+    setNotice(editingId ? "Producto actualizado." : "Producto creado.");
     cancelEdit();
     await refresh();
   }
@@ -430,7 +430,7 @@ export function InventoryClient(props: InventoryClientProps) {
                 <DialogTitle>{editingId ? "Editar producto" : "Crear producto"}</DialogTitle>
                 <DialogDescription>
                   {editingId
-                    ? "Actualiza los datos del producto. El stock no cambia desde este formulario."
+                    ? "Actualiza los datos del producto."
                     : "Completa los campos obligatorios para registrar un producto."}
                 </DialogDescription>
               </DialogHeader>
@@ -448,7 +448,7 @@ export function InventoryClient(props: InventoryClientProps) {
                     required
                   />
                   <span className="text-xs text-text-secondary">
-                    Código único por sede. Sugerencia: iniciales del producto + consecutivo (p. ej. SH-001 para shampoo).
+                    Código único por sede (p. ej. SH-001 para shampoo).
                   </span>
                   {skuTaken ? (
                     <span role="alert" className="text-xs text-error">
