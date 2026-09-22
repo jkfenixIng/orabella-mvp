@@ -27,7 +27,6 @@ import {
   Card,
   CardContent,
   CardDescription,
-  CardFooter,
   CardHeader,
   CardTitle,
 } from "@/src/components/ui/lib/card";
@@ -801,81 +800,142 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     </Button>
                   </DialogTrigger>
                   {detail && (
-                    <DialogContent className="max-w-3xl">
-                      <Card className="max-h-[calc(100dvh-2rem)] overflow-y-auto">
-                        <CardHeader className="pb-3">
-                          <div className="flex flex-wrap items-start justify-between gap-3">
+                    <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none">
+                      <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
+                        <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
+                          <div className="flex flex-wrap items-start justify-between gap-4">
                             <div>
-                              <CardTitle>
-                                Factura #{detail.invoice.consecutive_number}{" "}
+                              <p className="text-xl font-black tracking-tight">ORABELLA</p>
+                              <p className="text-xs text-slate-500">Belleza · Factura de venta</p>
+                            </div>
+                            <div className="text-right">
+                              <p className="text-lg font-bold">
+                                FACTURA #{detail.invoice.consecutive_number}{" "}
                                 <Badge variant={invoiceStatusVariant(detail.invoice.status)}>
                                   {detail.invoice.status}
                                 </Badge>
-                              </CardTitle>
-                              <CardDescription>
-                                {detail.invoice.client_name}
-                                {detail.invoice.client_document ? ` · ${detail.invoice.client_document}` : ""} ·{" "}
-                                {formatMoney(detail.invoice.total)}
+                              </p>
+                              <p className="text-sm text-slate-500">
+                                {new Date(detail.invoice.created_at).toLocaleDateString("es-CO", {
+                                  year: "numeric",
+                                  month: "long",
+                                  day: "numeric",
+                                })}
                                 {detail.invoice.status === "Anulada" && detail.invoice.cancel_reason
                                   ? ` · Motivo: ${detail.invoice.cancel_reason}`
                                   : ""}
-                              </CardDescription>
+                              </p>
                             </div>
                           </div>
-                        </CardHeader>
-                        <CardContent className="space-y-6">
-                          <section>
-                            <h3 className="text-sm font-semibold text-text-primary">Ítems</h3>
-                            <ul className="mt-1 flex flex-col gap-1 text-sm text-text-primary">
-                              {detail.items.map((row) => (
-                                <li key={row.id}>
-                                  {row.item_type}
-                                  {row.custom_name ? ` · ${row.custom_name}` : ""} · cant. {row.qty} ·{" "}
-                                  {formatMoney(row.unit_price)} = {formatMoney(row.subtotal)}
-                                </li>
-                              ))}
-                            </ul>
-                          </section>
-                          <section>
-                            <h3 className="text-sm font-semibold text-text-primary">Impuestos (snapshot)</h3>
-                            <ul className="mt-1 flex flex-col gap-1 text-sm text-text-primary">
-                              {detail.taxes.map((row) => (
-                                <li key={row.id}>
-                                  {row.tax_name} ({row.percent}%) = {formatMoney(row.amount)}
-                                </li>
-                              ))}
-                              {detail.taxes.length === 0 && <li>Sin impuestos.</li>}
-                            </ul>
-                          </section>
-                          <p className="text-sm text-text-primary">
-                            Subtotal {formatMoney(detail.invoice.subtotal)} · Descuento{" "}
-                            {formatMoney(detail.invoice.discount)} · Impuestos {formatMoney(detail.invoice.tax)} ·{" "}
-                            <strong>Total {formatMoney(detail.invoice.total)}</strong>
-                          </p>
-                          <section>
-                            <h3 className="text-sm font-semibold text-text-primary">Cobro</h3>
-                            <ul className="mt-1 flex flex-col gap-1 text-sm text-text-primary">
-                              {detail.payments.map((row) => (
-                                <li key={row.id}>
-                                  {row.method_code} = {formatMoney(row.amount)}
-                                </li>
-                              ))}
-                              {detail.payments.length === 0 && <li>Sin cobro registrado (Emitida).</li>}
-                            </ul>
-                          </section>
-                          <p className="text-sm text-text-primary">
+                        </div>
+                        <div className="flex flex-col gap-5 px-6 py-5 sm:px-8">
+                          <div className="grid gap-4 sm:grid-cols-2 text-sm">
+                            <p>
+                              <span className="font-semibold">Señor(es): </span>
+                              {detail.invoice.client_name}
+                              {detail.invoice.client_document ? ` · ${detail.invoice.client_document}` : ""}
+                            </p>
+                            <p className="sm:text-right">
+                              <span className="font-semibold">Total: </span>
+                              {formatMoney(detail.invoice.total)}
+                            </p>
+                          </div>
+                          <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500">Ítems</h3>
+                          <div className="mt-2 overflow-x-auto rounded-lg border border-slate-200">
+                            <table className="w-full min-w-[560px] text-left text-sm text-slate-900">
+                              <thead>
+                                <tr className="bg-slate-100 text-xs uppercase tracking-wide text-slate-500">
+                                  <th className="px-3 py-2">#</th>
+                                  <th className="px-3 py-2">Descripción</th>
+                                  <th className="px-3 py-2 text-right">Cant.</th>
+                                  <th className="px-3 py-2 text-right">V. unitario</th>
+                                  <th className="px-3 py-2 text-right">Subtotal</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {detail.items.map((row, index) => (
+                                  <tr key={row.id} className="border-t border-slate-200">
+                                    <td className="px-3 py-2 font-semibold">{index + 1}</td>
+                                    <td className="px-3 py-2">
+                                      {row.item_type === "custom" && row.custom_name ? row.custom_name : row.item_type}
+                                      {row.no_commission && (
+                                        <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">
+                                          Sin comisión
+                                        </span>
+                                      )}
+                                    </td>
+                                    <td className="px-3 py-2 text-right">{row.qty}</td>
+                                    <td className="px-3 py-2 text-right">{formatMoney(row.unit_price)}</td>
+                                    <td className="px-3 py-2 text-right font-medium">{formatMoney(row.subtotal)}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                          <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500">Impuestos</h3>
+                          <ul className="mt-1 flex flex-col gap-1 text-sm text-slate-900">
+                            {detail.taxes.map((row) => (
+                              <li key={row.id}>
+                                {row.tax_name} ({row.percent}%) = {formatMoney(row.amount)}
+                              </li>
+                            ))}
+                            {detail.taxes.length === 0 && <li className="text-slate-500">Sin impuestos.</li>}
+                          </ul>
+                          <div className="flex justify-end">
+                            <dl className="w-full max-w-xs space-y-1 text-sm text-slate-900">
+                              <div className="flex justify-between gap-3">
+                                <dt>Subtotal</dt>
+                                <dd className="font-medium">{formatMoney(detail.invoice.subtotal)}</dd>
+                              </div>
+                              <div className="flex justify-between gap-3">
+                                <dt>Descuento</dt>
+                                <dd className="font-medium">{formatMoney(detail.invoice.discount)}</dd>
+                              </div>
+                              <div className="flex justify-between gap-3">
+                                <dt>Impuestos</dt>
+                                <dd className="font-medium">{formatMoney(detail.invoice.tax)}</dd>
+                              </div>
+                              <div className="flex justify-between gap-3 border-t-2 border-slate-900 pt-2 text-lg font-black">
+                                <dt>TOTAL</dt>
+                                <dd>{formatMoney(detail.invoice.total)}</dd>
+                              </div>
+                            </dl>
+                          </div>
+                          <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500">Cobro</h3>
+                          <ul className="mt-1 flex flex-col gap-1 text-sm text-slate-900">
+                            {detail.payments.map((row) => (
+                              <li key={row.id}>
+                                {row.method_code} = {formatMoney(row.amount)}
+                              </li>
+                            ))}
+                            {detail.payments.length === 0 && (
+                              <li className="text-slate-500">Sin cobro registrado (Emitida).</li>
+                            )}
+                          </ul>
+                          <p className="text-sm text-slate-900">
                             Pagado {formatMoney(detail.paid)} · Saldo {formatMoney(detail.remaining)}
                           </p>
 
+                          {((props.canWrite && detail.invoice.status === "Emitida") ||
+                            (props.canAnnul &&
+                              (detail.invoice.status === "Emitida" || detail.invoice.status === "Pagada"))) && (
+                            <div className="rounded-lg bg-slate-50 p-4">
+                              <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500">Operaciones</h3>
+                              {error && (
+                                <p role="alert" className="mt-2 rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+                                  {error}
+                                </p>
+                              )}
+                              <div className="mt-3 flex flex-col gap-4">
                           {props.canWrite && detail.invoice.status === "Emitida" && (
                             <form onSubmit={submitSplit} className="flex flex-wrap items-end gap-3">
-                              <Label className="min-w-[10rem]">
+                              <label className="flex min-w-[10rem] flex-col gap-1 text-sm font-medium text-slate-900">
                                 Método
                                 <Select
                                   value={splitDraft.method_code}
                                   onValueChange={(method_code) => setSplitDraft({ ...splitDraft, method_code })}
                                 >
-                                  <SelectTrigger className={inputClass}>
+                                  <SelectTrigger className={paperInputClass}>
                                     <SelectValue placeholder="Método" />
                                   </SelectTrigger>
                                   <SelectContent>
@@ -886,50 +946,66 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     ))}
                                   </SelectContent>
                                 </Select>
-                              </Label>
-                              <Label className="min-w-[10rem]">
+                              </label>
+                              <label className="flex min-w-[10rem] flex-col gap-1 text-sm font-medium text-slate-900">
                                 Monto
-                                <Input
-                                  className={inputClass}
+                                <input
+                                  className={paperInputClass}
                                   value={formatMoneyInput(splitDraft.amount)}
                                   onChange={(event) => setSplitDraft({ ...splitDraft, amount: stripMoneyInput(event.target.value) })}
                                   placeholder="0"
                                   inputMode="numeric"
                                   required
                                 />
-                              </Label>
-                              <Button type="submit" variant="secondary" loading={busy}>
+                              </label>
+                              <button
+                                type="submit"
+                                disabled={busy}
+                                className="flex h-10 items-center gap-2 rounded-md bg-slate-200 px-4 text-sm font-medium text-slate-900 hover:bg-slate-300 disabled:opacity-50"
+                              >
                                 <Banknote className="h-4 w-4" aria-hidden="true" />
-                                Registrar porción
-                              </Button>
+                                {busy ? "Registrando…" : "Registrar porción"}
+                              </button>
                             </form>
                           )}
 
                           {props.canAnnul && (detail.invoice.status === "Emitida" || detail.invoice.status === "Pagada") && (
                             <form onSubmit={submitAnnul} className="flex flex-wrap items-end gap-3">
-                              <Label className="min-w-0 flex-1">
+                              <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-slate-900">
                                 Motivo de anulación
-                                <Input
-                                  className={inputClass}
+                                <input
+                                  className={paperInputClass}
                                   value={motivo}
                                   onChange={(event) => setMotivo(event.target.value)}
                                   placeholder="Obligatorio"
                                   required
                                 />
-                              </Label>
-                              <Button type="submit" variant="destructive" loading={busy}>
+                              </label>
+                              <button
+                                type="submit"
+                                disabled={busy}
+                                className="flex h-10 items-center gap-2 rounded-md bg-red-600 px-4 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                              >
                                 <CircleX className="h-4 w-4" aria-hidden="true" />
-                                Anular factura
-                              </Button>
+                                {busy ? "Anulando…" : "Anular factura"}
+                              </button>
                             </form>
                           )}
-                        </CardContent>
-                        <CardFooter className="border-t border-color-2 pt-4">
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                        <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-6 py-4 sm:px-8">
                           <DialogClose asChild>
-                            <Button variant="outline">Cerrar</Button>
+                            <button
+                              type="button"
+                              className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                            >
+                              Cerrar
+                            </button>
                           </DialogClose>
-                        </CardFooter>
-                      </Card>
+                        </div>
+                      </div>
                     </DialogContent>
                   )}
                 </Dialog>

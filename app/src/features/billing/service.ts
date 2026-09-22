@@ -107,6 +107,7 @@ export interface InvoiceItemRow {
   unit_price: number;
   discount: number;
   subtotal: number;
+  no_commission: boolean;
 }
 
 export interface InvoiceTaxRow {
@@ -139,7 +140,7 @@ export interface InvoiceDetail {
 const INVOICE_SELECT =
   "id, sede_id, consecutive_number, client_name, client_document, subtotal, discount, tax, total, status, user_id, cash_shift_id, cancel_reason, created_at";
 const ITEM_SELECT =
-  "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal";
+  "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission";
 const TAX_SELECT = "id, invoice_id, tax_code, tax_name, percent, amount";
 const PAYMENT_SELECT = "id, invoice_id, method_id, method_code, amount, created_at";
 
