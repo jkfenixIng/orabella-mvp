@@ -27,7 +27,10 @@ Preparar ambientes de pruebas y productivo. Productivo debe quedar limpio en pro
 - [x] ENV-07 Vercel Preview apuntado al test (URL test + publishable test + secret test como Secret) - verificado con env pull preview
 - [x] ENV-08 Esquema cargado en test vía pooler ca-central-1 (001→010 + acceptance.sql) - users 10, products 3, services 4, methods 6, registers 1 verificados
 - [x] ENV-09 Migraciones 009+010 aplicadas a prod vía MCP (cash_shift_counts + cash_denominations con 11 COP) - prod intacto: users 1, products 0, shifts 0
-- [ ] ENV-10 Vercel prod: Root Directory debe ser `app` (repo raíz tiene API/app/front) + falta SUPABASE_SERVICE_ROLE_KEY de prod; repo git ya conectado (orabella-mvp)
+- [x] ENV-10 Ramas: develop = pruebas (fast-forward a 02cc61f con todo el MVP, pusheado), main = producción (se actualiza solo con aprobación explícita antes del deploy a prod)
+- [x] ENV-11 Vercel: Root Directory `app` (usuario, dashboard) + Production con URL/anon nuevos + secret prod como Secret; Preview con env test
+- [x] ENV-13 Deploy producción: merge feat→main (f05e62a, PR #2 previo incluido), push dispara build Git ● Ready 48s https://orabella-nt6xbfrp9-...vercel.app; orabella.vercel.app/login 200 con formulario Orabella
+- [x] ENV-12 Preview manual desde app/ por CLI (Root Directory aún en raíz): build Next.js OK 45s, Ready https://orabella-15cg1anub-camilo-rodriguezs-projects-030d5ccd.vercel.app - con Deployment Protection (SSO) activa, abrir logueado en Vercel o desactivarla
 
 ## Alcance autorizado
 - Solo tablas de negocio indicadas. No tocar migrations. No tocar API/ ni front/ legacy.

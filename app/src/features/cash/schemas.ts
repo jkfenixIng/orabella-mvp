@@ -3,6 +3,63 @@ import { moneyEquals, roundMoney } from "@/src/features/billing/schemas";
 
 export { moneyEquals, roundMoney };
 
+/** Diferencia por método entre lo declarado y lo esperado (arqueo). */
+export interface MethodDifference {
+  method_code: string;
+  expected: number;
+  declared: number;
+  difference: number;
+}
+
+/**
+ * CAJ-03/04: total digital esperado al cierre = saldo de apertura del turno
+ * más lo cobrado en el turno (el "total en la aplicación"). Puro para
+ * probarlo sin base de datos.
+ */
+export function expectedDigitalTotal(openAmount: number, paidAmount: number): number {
+  return roundMoney(roundMoney(openAmount) + roundMoney(paidAmount));
+}
+
+export interface ShiftCountMaps {
+  paid: Map<string, number>;
+  open: Map<string, number>;
+  /** Null cuando el turno sigue abierto (aún no hay conteo de cierre). */
+  closed: Map<string, number> | null;
+}
+
+/**
+ * Totales por método para las vistas (día/historial): cobrado, declarado
+ * (cierre si está cerrado, apertura si no) y diferencias del cierre contra
+ * apertura + cobrado. Puro para probarlo sin base de datos.
+ */
+export function buildMethodViews(maps: ShiftCountMaps): {
+  metodos: Array<{ method_code: string; amount: number }>;
+  declarados: Array<{ method_code: string; amount: number }>;
+  diferencias: MethodDifference[];
+} {
+  const metodos = [...maps.paid.entries()].map(([method_code, amount]) => ({
+    method_code,
+    amount: roundMoney(amount),
+  }));
+  const source = maps.closed ?? maps.open;
+  const declarados = [...source.entries()]
+    .filter(([method_code]) => method_code !== "efectivo")
+    .map(([method_code, amount]) => ({ method_code, amount: roundMoney(amount) }));
+  const diferencias: MethodDifference[] = [];
+  if (maps.closed) {
+    const codes = new Set([...maps.closed.keys(), ...maps.open.keys(), ...maps.paid.keys()]);
+    codes.delete("efectivo");
+    for (const code of codes) {
+      const expected = expectedDigitalTotal(maps.open.get(code) ?? 0, maps.paid.get(code) ?? 0);
+      const declared = roundMoney(maps.closed.get(code) ?? 0);
+      if (!moneyEquals(declared, expected)) {
+        diferencias.push({ method_code: code, expected, declared, difference: roundMoney(declared - expected) });
+      }
+    }
+  }
+  return { metodos, declarados, diferencias };
+}
+
 /** CAJ-01/CAJ-04: estados del turno (abierto = en operación, cerrado = terminal). */
 export const shiftStatusSchema = z.enum(["abierto", "cerrado"]);
 export type ShiftStatus = z.infer<typeof shiftStatusSchema>;
@@ -39,13 +96,13 @@ export const registerPaymentSchema = z.object({
 export type RegisterPaymentInput = z.infer<typeof registerPaymentSchema>;
 
 /**
- * CAJ-03/CAJ-04: cierre con arqueo. conteo y base dejada obligatorios;
- * la observación se exige en el servicio cuando la base queda incompleta
- * (base_left < base_configurada), no en el esquema.
+ * CAJ-03/CAJ-04: cierre con arqueo. Solo conteo y confirmación; la base del
+ * próximo turno la calcula el servidor (resolveClosingBase) y nunca se pide
+ * ni se justifica en el cierre (método de arqueo escondido).
  */
 export const closeShiftSchema = z.object({
   counted_cash: z.coerce.number({ error: "El conteo de efectivo es obligatorio." }).nonnegative("El conteo no puede ser negativo."),
-  base_left: z.coerce.number({ error: "La base dejada es obligatoria." }).nonnegative("La base no puede ser negativa."),
+  base_left: z.coerce.number().nonnegative("La base no puede ser negativa.").optional(),
   observation: z.string().trim().max(500, "Observación muy larga.").nullish(),
   counts: z.array(shiftCountSchema).min(1, "El detalle del conteo es obligatorio para cerrar."),
   confirmed: z.boolean().refine((value) => value === true, "Confirme el cierre: después no se puede modificar."),
@@ -62,6 +119,8 @@ export const dayViewSchema = z.object({
 export type DayViewInput = z.infer<typeof dayViewSchema>;
 
 /** CAJ-06: historial filtrable por rango de fechas (inclusive). */
+export const HISTORY_PAGE_SIZE = 10;
+
 export const historySchema = z
   .object({
     desde: z
@@ -72,6 +131,7 @@ export const historySchema = z
       .string()
       .trim()
       .regex(/^\d{4}-\d{2}-\d{2}$/, "Fecha final inválida (use yyyy-mm-dd)."),
+    page: z.coerce.number().int().min(1).default(1),
   })
   .superRefine((value, context) => {
     if (value.desde > value.hasta) {
@@ -81,6 +141,37 @@ export const historySchema = z
 export type HistoryInput = z.infer<typeof historySchema>;
 
 // ------------------------------------------------------------ cálculos puros ---
+
+/**
+ * Business timezone. Colombia has no daylight saving time, so America/Bogota
+ * is a fixed UTC-05:00 year-round. Timestamps are timestamptz (UTC); date
+ * filters must carry the offset or shifts opened after 19:00 COT land on
+ * the next UTC day and vanish from "today".
+ */
+export const BOGOTA_TZ_OFFSET = "-05:00";
+
+/** Calendar day (yyyy-mm-dd) in America/Bogota for the given instant. */
+export function bogotaDay(offsetDays = 0, now: Date = new Date()): string {
+  const shifted = new Date(now.getTime() + offsetDays * 24 * 60 * 60 * 1000);
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Bogota",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(shifted);
+  const get = (type: string): string => parts.find((part) => part.type === type)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+/** Exact timestamptz bounds of a Bogota calendar day (inclusive). */
+export function dayBounds(fecha: string): { from: string; to: string } {
+  return { from: `${fecha}T00:00:00${BOGOTA_TZ_OFFSET}`, to: `${fecha}T23:59:59.999${BOGOTA_TZ_OFFSET}` };
+}
+
+/** Exact bounds of an inclusive Bogota date range. */
+export function rangeBounds(desde: string, hasta: string): { from: string; to: string } {
+  return { from: dayBounds(desde).from, to: dayBounds(hasta).to };
+}
 
 /**
  * CAJ-01: base con la que abre el turno. Hereda base_left del último
@@ -93,6 +184,16 @@ export function resolveOpeningBase(
 ): number {
   if (lastBaseLeft === null || lastBaseLeft === undefined) return roundMoney(baseConfigurada);
   return roundMoney(lastBaseLeft);
+}
+
+/**
+ * CAJ-04: base automática del cierre. Nunca se pregunta: si el contado
+ * cubre la base configurada, la base queda nivelada en la configurada;
+ * si no la cubre, queda en lo contado hasta nivelarse en otro cierre.
+ * Pura para probarla sin base de datos.
+ */
+export function resolveClosingBase(countedCash: number, baseConfigurada: number): number {
+  return roundMoney(Math.min(roundMoney(countedCash), roundMoney(baseConfigurada)));
 }
 
 export interface CashCloseResult {
@@ -124,9 +225,32 @@ export function computeCashClose(args: {
   };
 }
 
-/** CAJ-04: true cuando la base queda incompleta y exige observación. */
-export function requiresCloseObservation(baseLeft: number, baseConfigurada: number): boolean {
-  return roundMoney(baseLeft) < roundMoney(baseConfigurada);
+/**
+ * CAJ-03: valida el cierre a nivel negocio. Solo exige el conteo; la base
+ * es automática y jamás se pide justificación (arqueo escondido).
+ * Pura para probarla sin base de datos.
+ */
+export function assertCloseInput(args: {
+  countedCash: number | null | undefined;
+}): void {
+  if (args.countedCash === null || args.countedCash === undefined) {
+    throw new Error("COUNT_REQUIRED");
+  }
+}
+
+/**
+ * CAJ-03: solo quien abrió el turno puede cerrarlo. El admin puede cerrar
+ * el de otro (queda auditado como override) para que la caja nunca quede
+ * bloqueada si el encargado falta. Puro para probarlo sin base de datos.
+ */
+export function assertShiftCloser(args: {
+  openedBy: string;
+  actorUserId: string;
+  isAdmin: boolean;
+}): { isOverride: boolean } {
+  if (args.openedBy === args.actorUserId) return { isOverride: false };
+  if (args.isAdmin) return { isOverride: true };
+  throw new Error("SHIFT_NOT_OWNER");
 }
 
 /**
@@ -140,29 +264,7 @@ export function assertNoOpenShift(hasOpenShift: boolean): void {
   }
 }
 
-/**
- * CAJ-03/CAJ-04: valida el cierre a nivel negocio. Lanza COUNT_REQUIRED
- * sin conteo y OBSERVATION_REQUIRED cuando la base queda incompleta sin
- * observación. Puro para probarlo sin base de datos.
- */
-export function assertCloseInput(args: {
-  countedCash: number | null | undefined;
-  baseLeft: number;
-  baseConfigurada: number;
-  observation: string | null | undefined;
-}): void {
-  if (args.countedCash === null || args.countedCash === undefined) {
-    throw new Error("COUNT_REQUIRED");
-  }
-  if (requiresCloseObservation(args.baseLeft, args.baseConfigurada)) {
-    if (!args.observation || args.observation.trim() === "") {
-      throw new Error("OBSERVATION_REQUIRED");
-    }
-  }
-}
-
-export interface DayShiftSummary {
-  expectedCash: number;
+export interface DayShiftSummary {  expectedCash: number;
   countedCash: number | null;
   baseLeft: number | null;
   cashWithdrawn: number | null;

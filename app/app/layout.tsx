@@ -6,6 +6,7 @@ import { ThemeProvider } from "@/src/shared/components/theme-provider";
 import { AppShell } from "@/src/shared/components/app-shell";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
+import { countUnreadAlerts } from "@/src/features/alerts/service";
 import {
   parseThemePreference,
   themeInitScript,
@@ -33,6 +34,10 @@ export default async function RootLayout({ children }: RootLayoutProps) {
   // Login pages skip the nav entirely, so this only feeds MainNav.
   const session = await getSessionUser(cookieStore.get(SESSION_COOKIE_NAME)?.value);
   const roles = session?.roles ?? [];
+  const alertsUnread =
+    session && roles.includes("admin") && session.user.sede_id
+      ? await countUnreadAlerts(session.user.sede_id).catch(() => 0)
+      : 0;
 
   return (
     <html lang="es" className={initialClass} suppressHydrationWarning>
@@ -41,7 +46,9 @@ export default async function RootLayout({ children }: RootLayoutProps) {
           {themeInitScript}
         </Script>
         <ThemeProvider>
-          <AppShell roles={roles}>{children}</AppShell>
+          <AppShell roles={roles} userName={session?.user.full_name ?? null} alertsUnread={alertsUnread}>
+            {children}
+          </AppShell>
         </ThemeProvider>
       </body>
     </html>

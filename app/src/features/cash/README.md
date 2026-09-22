@@ -2,10 +2,11 @@
 
 Caja única con varios turnos por día sin solape, apertura con base
 encadenada (`opening_base` = `base_left` del cierre anterior), pagos
-contra el turno abierto, cierre con conteo obligatorio (esperado vs
-contado), base configurable con casos 400/200 y 300/150, base incompleta
-con observación obligatoria, vista del día con acumulado, historial por
-fecha.
+contra el turno abierto, cierre con conteo obligatorio a ciegas (digitales:
+declarado vs apertura + cobrado; la base del próximo turno es automática =
+`min(contado, configurada)`, sin preguntarla ni justificarla), vista del
+día (siempre hoy, con columnas por método) con acumulado (la base no se
+totaliza), historial por fecha.
 
 - Tablas (migración `006_cash.sql`): `cash_registers` (una "Caja única"
   por sede, `base_configurada` default 200000, semilla por sede existente;
@@ -26,16 +27,17 @@ fecha.
   inserta en `payments` (ajuste documentado). Ante fallo del reflejo hay
   limpieza best-effort del pago por turno.
 - Servicio (`service.ts`): `openShift` (hereda `base_left` anterior o
-  `base_configurada`; 23505 del índice → `SHIFT_ALREADY_OPEN`),
-  `registerPayment` (turno abierto, método activo, monto > 0; factura
-  vigente y sin sobrepago), `closeShift` (conteo + base obligatorios,
-  `expected_cash` = efectivo del turno, observación obligatoria si
-  `base_left < base_configurada`; calcula recogido/diferencia),
-  `getDayView` (turnos + acumulado = suma de turnos; el contado suma solo
-  cerrados), `getHistory` (rango sobre `opened_at`, 200 máx). Escritura:
-  admin/caja. Reutiliza `requireSedeRole`/`resolveSede`,
-  `listPaymentMethods` (T3), `getInvoiceDetail` + `roundMoney`/
-  `moneyEquals` (T5), `ok()`/`fail()`.
+  `base_configurada`; primera apertura sin alerta; 23505 del índice →
+  `SHIFT_ALREADY_OPEN`), `registerPayment` (turno abierto, método activo,
+  monto > 0; factura vigente y sin sobrepago), `closeShift` (solo conteo;
+  base automática `min(contado, configurada)`, sin justificación;
+  `expected_cash` = efectivo del turno; digitales vs apertura + cobrado;
+  calcula recogido/diferencia), `getDayView` (siempre hoy en hora Bogotá;
+  turnos + acumulado = suma de turnos sin totalizar la base; el contado
+  suma solo cerrados), `getHistory` (rango sobre `opened_at` en hora
+  Bogotá, 50 máx). Escritura: admin/caja. Reutiliza `requireSedeRole`/
+  `resolveSede`, `listPaymentMethods` (T3), `getInvoiceDetail` +
+  `roundMoney`/`moneyEquals` (T5), `ok()`/`fail()`.
 - API-first (`/api/v1`): `POST /cash-shifts/open` (equivale al
   `cash-shifts:open` del PRD; `:` no es válido en carpetas Windows),
   `POST /cash-shifts/:id/close`, `GET /cash/day?fecha=` (hoy por defecto),
@@ -43,13 +45,15 @@ fecha.
   `POST /cash/payments`. Lectura: sesión de la sede.
 - UI (`/cash`, español): estado del turno (base heredada visible al
   abrir), registrar pago (método/monto/factura opcional), cerrar con
-  conteo + base + observación (validada en cliente y servidor), vista del
-  día con turnos y acumulado, historial filtrable.
+  conteo a ciegas (la base es automática), vista del día siempre hoy con
+  columnas por método y acumulado, historial filtrable. No-admin no ve
+  esperado/recogido/diferencias; historial solo admin.
 - Tests (`tests/cash.test.ts`): base encadenada (primero = configurada,
   N+1 = `base_left` anterior incl. 150000), rechazo doble apertura,
-  cierre sin conteo, casos 400/200 y 300/150, base incompleta exige
-  observación, acumulado = suma de 2 turnos (550000/450000/550000/350000/
-  200000/−150000), y texto de la migración 006.
+  cierre sin conteo, casos 400/200 y 300/150, base automática
+  (`min(contado, configurada)`), esperado digital = apertura + cobrado,
+  filtros en hora Bogotá, acumulado = suma de turnos, y texto de la
+  migración 006.
 - RLS: deny-by-default; políticas por sede endurecidas en T8
   (`008_hardening.sql`: `TODO(seguridad-T7)` cerrado, claim
   `app_metadata.sede_id`). Cierre auditado (`cash.shift_closed` con flag
