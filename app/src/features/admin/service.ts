@@ -31,6 +31,14 @@ export {
 } from "@/src/shared/lib/sede";
 
 /**
+ * Mapa de dominios (SRP, decisión pre-pruebas 2026-09-22):
+ * 1) Sesión (requireSession/requireAdminSession) 2) Sedes 3) Empleados+usuarios
+ * 4) Catálogos (servicios, impuestos, métodos de pago) 5) Roles.
+ * El split físico en módulos se difiere a post-pruebas para no romper
+ * los 12 importadores activos; el código nuevo usa `@/src/shared/lib/sede.ts`.
+ */
+
+/**
  * Cliente privilegiado bajo demanda (service_role, solo servidor).
  * Import dinámico para que los tests unitarios (sin red/env) nunca lo carguen.
  */
