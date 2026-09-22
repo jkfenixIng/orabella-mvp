@@ -21,16 +21,29 @@ setup("login admin de pruebas", async ({ page }) => {
   await page.getByLabel(/^clave/i).fill(PASSWORD);
   await page.getByRole("button", { name: /ingresar/i }).click();
 
-  // Cambio forzado la primera vez (AUTH-01): clave 8+ con letra y número.
+  // El primer golpe compila la ruta bajo demanda: espera larga y ramificada.
   const forceHeading = page.getByRole("heading", { name: /cambio de clave/i });
-  if (await forceHeading.isVisible({ timeout: 5_000 }).catch(() => false)) {
+  const modules = page.getByRole("region", { name: /módulos/i });
+  // El anunciador de rutas de Next (__next-route-announcer__) también usa
+  // role=alert vacío: los errores reales viven en <p role=alert> del form.
+  const alert = page.locator("form p[role=alert]");
+  await expect(forceHeading.or(modules).or(alert)).toBeVisible({ timeout: 60_000 });
+
+  // Cambio forzado la primera vez (AUTH-01): clave 8+ con letra y número.
+  if (await forceHeading.isVisible()) {
     await page.getByLabel(/nueva clave/i).first().fill(NEW_PASSWORD);
     await page.getByLabel(/confirmar/i).fill(NEW_PASSWORD);
     await page.getByRole("button", { name: /cambiar clave/i }).click();
+    await expect(modules.or(alert)).toBeVisible({ timeout: 60_000 });
   }
 
-  // Home con módulos: sesión válida.
-  await expect(page.getByRole("heading", { name: /^orabella$/i })).toBeVisible({ timeout: 15_000 });
-  await expect(page.getByRole("region", { name: /módulos/i })).toBeVisible();
+  // Error de login: falla fuerte con el mensaje real (no sigue sin sesión).
+  if (await alert.isVisible()) {
+    throw new Error(`login E2E rechazado: ${await alert.innerText()}`);
+  }
+
+  // Home con módulos: sesión válida (la URL manda, el h1 "Orabella" también existe en /login).
+  await expect(page).toHaveURL(/^.*\/$/);
+  await expect(modules).toBeVisible();
   await page.context().storageState({ path: AUTH_FILE });
 });
