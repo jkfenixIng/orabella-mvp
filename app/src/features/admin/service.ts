@@ -330,6 +330,24 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
     throw new AdminError("INTERNAL", "Error interno.", 500);
   }
   if (!data) throw new AdminError("INTERNAL", "Error interno.", 500);
+  // Red de seguridad (solo al crear): si el usuario vinculado quedó sin
+  // roles, se le asigna empleado para que nadie quede sin acceso por olvido.
+  if (!input.id && userId) {
+    const { data: existingRoles } = await db
+      .from("user_roles")
+      .select("id")
+      .eq("user_id", userId)
+      .limit(1);
+    if (!existingRoles || existingRoles.length === 0) {
+      const { data: empRole } = await db.from("roles").select("id").eq("code", "empleado").maybeSingle();
+      if (empRole) {
+        const { error: roleError } = await db
+          .from("user_roles")
+          .insert({ user_id: userId, role_id: (empRole as { id: string }).id });
+        if (roleError) console.error("[admin] no se pudo asignar rol empleado:", roleError.message);
+      }
+    }
+  }
   return data as EmployeeRow;
 }
 
