@@ -64,7 +64,7 @@ export const adminCreateUserSchema = z.object({
   id_type: idTypeSchema,
   full_name: z.string().trim().min(2, "Nombre requerido.").max(120),
   phone: z.string().trim().max(30).optional(),
-  roles: z.array(roleCodeSchema).min(1, "Asigne al menos un rol."),
+  roles: z.array(roleCodeSchema).length(1, "Un solo rol por usuario."),
   sede_id: z.uuid("Sede inválida.").nullable().optional(),
 });
 export type AdminCreateUserInput = z.infer<typeof adminCreateUserSchema>;

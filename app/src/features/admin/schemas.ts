@@ -180,9 +180,9 @@ export const paymentMethodSchema = z.object({
 });
 export type PaymentMethodInput = z.infer<typeof paymentMethodSchema>;
 
-/** ADM-04: asignación de roles (admin/empleado/caja, doble rol permitido). */
+/** ADM-04: asignación de rol único por usuario. */
 export const setUserRolesSchema = z.object({
   user_id: uuidSchema,
-  roles: z.array(roleCodeSchema).min(1, "Asigne al menos un rol."),
+  roles: z.array(roleCodeSchema).length(1, "Un solo rol por usuario."),
 });
 export type SetUserRolesInput = z.infer<typeof setUserRolesSchema>;
