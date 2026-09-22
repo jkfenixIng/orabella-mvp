@@ -95,6 +95,12 @@ interface AdminTabsProps {
 
 export function AdminTabs(props: AdminTabsProps) {
   const [tab, setTab] = useState<Tab>("empleados");
+  const [users, setUsers] = useState(props.initialUsers);
+
+  async function refreshUsers() {
+    const result: ActionResult<SedeUserRow[]> = await listSedeUsersAction(props.sedeId);
+    if (result.success) setUsers(result.data);
+  }
 
   return (
     <div className="flex flex-col gap-4">
@@ -122,10 +128,20 @@ export function AdminTabs(props: AdminTabsProps) {
       </div>
 
       {tab === "empleados" ? (
-        <EmployeesSection sedeId={props.sedeId} initial={props.initialEmployees} users={props.initialUsers} />
+        <EmployeesSection
+          sedeId={props.sedeId}
+          initial={props.initialEmployees}
+          users={users}
+          onUsersChanged={() => void refreshUsers()}
+        />
       ) : null}
       {tab === "roles" ? (
-        <UsersSection sedeId={props.sedeId} initial={props.initialUsers} currentUserId={props.currentUserId} />
+        <UsersSection
+          key={users.map((user) => user.id).join(",")}
+          sedeId={props.sedeId}
+          initial={users}
+          currentUserId={props.currentUserId}
+        />
       ) : null}
       {tab === "servicios" ? (
         <ServicesSection sedeId={props.sedeId} initial={props.initialServices} />
@@ -180,16 +196,21 @@ function EmployeesSection({
   sedeId,
   initial,
   users,
+  onUsersChanged,
 }: {
   sedeId: string;
   initial: EmployeeRow[];
   users: SedeUserRow[];
+  onUsersChanged: () => void;
 }) {
   const [rows, setRows] = useState(initial);
   const [form, setForm] = useState(EMPTY_EMPLOYEE);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [dialog, setDialog] = useState<EmployeeDialog | null>(null);
   const [filter, setFilter] = useState("");
+  const [createLogin, setCreateLogin] = useState(true);
+  const [loginIdType, setLoginIdType] = useState("CC");
+  const [loginRoles, setLoginRoles] = useState<RoleCode[]>(["empleado"]);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -214,12 +235,19 @@ function EmployeesSection({
   function openCreate() {
     setForm(EMPTY_EMPLOYEE);
     setEditingId(null);
+    setCreateLogin(true);
+    setLoginIdType("CC");
+    setLoginRoles(["empleado"]);
     setError(null);
     setNotice(null);
     setDialog({ mode: "create" });
   }
 
   function openEdit(row: EmployeeRow) {
+    setEditingId(row.id);
+    setCreateLogin(!row.user_id);
+    setLoginIdType("CC");
+    setLoginRoles(["empleado"]);
     setEditingId(row.id);
     setForm({
       full_name: row.full_name,
@@ -252,6 +280,42 @@ function EmployeesSection({
     setBusy(true);
     setError(null);
     setNotice(null);
+    // Alta conjunta: primero el usuario (reutiliza nombre, documento,
+    // correo y teléfono del formulario), luego el empleado se vincula solo.
+    // En edición solo aplica si el empleado aún no tiene usuario.
+    const wantLogin = createLogin && (!editingId || !dialogRow?.user_id);
+    let userNote = "";
+    if (wantLogin) {
+      if (form.email.trim() === "") {
+        setBusy(false);
+        setError("El correo del empleado es obligatorio para crear su acceso.");
+        return;
+      }
+      if (loginRoles.length === 0) {
+        setBusy(false);
+        setError("Asigne al menos un rol para el acceso.");
+        return;
+      }
+      const created = await adminCreateUserAction({
+        full_name: form.full_name,
+        documento: form.document,
+        id_type: loginIdType as "CC" | "CE" | "PPT" | "PEP" | "otro",
+        email: form.email,
+        phone: form.phone.trim() === "" ? undefined : form.phone,
+        roles: loginRoles,
+        sede_id: sedeId,
+      });
+      if (!created.success) {
+        if (created.code !== "USER_EXISTS") {
+          setBusy(false);
+          setError(`[${created.code}] ${created.message}`);
+          return;
+        }
+        userNote = " El usuario ya existía y quedó vinculado.";
+      } else {
+        userNote = " Usuario creado (clave inicial: su documento).";
+      }
+    }
     const result: ActionResult<EmployeeRow> = await upsertEmployeeAction({
       ...(editingId ? { id: editingId } : {}),
       sede_id: sedeId,
@@ -278,7 +342,8 @@ function EmployeesSection({
       if (exists) return current.map((row) => (row.id === result.data.id ? result.data : row));
       return [...current, result.data];
     });
-    setNotice(editingId ? "Empleado actualizado." : "Empleado creado.");
+    setNotice(`${editingId ? "Empleado actualizado." : "Empleado creado."}${userNote}`);
+    onUsersChanged();
     closeDialog();
   }
 
@@ -538,6 +603,55 @@ function EmployeesSection({
                 className={inputClass}
               />
             </label>
+            {(dialog?.mode === "create" || (dialog?.mode === "edit" && !dialogRow?.user_id)) && (
+            <div className="flex flex-col gap-1 text-sm sm:col-span-2">
+              <label className="flex items-center gap-2 font-medium">
+                <input
+                  type="checkbox"
+                  checked={createLogin}
+                  onChange={(event) => setCreateLogin(event.target.checked)}
+                />
+                Crear usuario de acceso (usa nombre, documento, correo y teléfono de arriba)
+              </label>
+              {createLogin && (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <label className={labelClass}>
+                    Tipo de documento
+                    <select
+                      value={loginIdType}
+                      onChange={(event) => setLoginIdType(event.target.value)}
+                      className={inputClass}
+                    >
+                      <option value="CC">CC</option>
+                      <option value="CE">CE</option>
+                      <option value="PPT">PPT</option>
+                      <option value="PEP">PEP</option>
+                      <option value="otro">Otro</option>
+                    </select>
+                  </label>
+                  <fieldset className="flex flex-col gap-1 text-sm">
+                    <legend>Roles (al menos uno)</legend>
+                    {ROLE_OPTIONS.map((option) => (
+                      <label key={option.value} className="flex items-center gap-1">
+                        <input
+                          type="checkbox"
+                          checked={loginRoles.includes(option.value)}
+                          onChange={() =>
+                            setLoginRoles((prev) =>
+                              prev.includes(option.value)
+                                ? prev.filter((item) => item !== option.value)
+                                : [...prev, option.value],
+                            )
+                          }
+                        />
+                        {option.label}
+                      </label>
+                    ))}
+                  </fieldset>
+                </div>
+              )}
+            </div>
+            )}
             <label className={labelClass}>
               Esquema de sueldo
               <select
