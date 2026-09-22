@@ -292,6 +292,20 @@ export async function payCommissionNow(
   const input = parsed.data;
   const db = await commissionsDb();
 
+  const { data: payoutEmployee } = await db
+    .from("employees")
+    .select("payout_mode")
+    .eq("id", input.employee_id)
+    .eq("sede_id", actor.sedeId)
+    .maybeSingle();
+  if ((payoutEmployee as { payout_mode?: string } | null)?.payout_mode === "no_aplica") {
+    throw new CommissionError(
+      "COMMISSION_NOT_APPLICABLE",
+      "Ese empleado no aplica para comisiones.",
+      422,
+    );
+  }
+
   const methods = await listPaymentMethods(actor.sedeId).catch(() => {
     throw new CommissionError("INTERNAL", "Error interno.", 500);
   });

@@ -12,11 +12,8 @@ import {
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
-import {
-  requireSedeRole,
-  requireSession,
-  resolveSede,
-} from "@/src/features/admin/service";
+import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
+import { requireSession } from "@/src/features/admin/service";
 
 export class InventoryError extends Error {
   readonly code: string;

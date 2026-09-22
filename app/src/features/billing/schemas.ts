@@ -42,6 +42,7 @@ export const invoiceItemSchema = z
     qty: z.coerce.number().int("Cantidad entera.").positive("La cantidad debe ser mayor a 0."),
     unit_price: moneySchema("El precio"),
     discount: moneySchema("El descuento").default(0),
+    no_commission: z.boolean().optional().default(false),
   })
   .superRefine((value, context) => {
     const fail = (message: string) => context.addIssue({ code: "custom", message });

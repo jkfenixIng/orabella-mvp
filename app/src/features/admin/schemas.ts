@@ -107,7 +107,7 @@ export const employeeSchema = z
     document: z.string().trim().min(3, "Documento inválido.").max(20, "Documento inválido."),
     phone: z.string().trim().max(30, "Teléfono muy largo.").nullish(),
     position: z.string().trim().max(80, "Cargo muy largo.").nullish(),
-    payout_mode: z.enum(["nomina", "inmediato"]).optional(),
+    payout_mode: z.enum(["nomina", "inmediato", "no_aplica"]).optional(),
     email: z.email("Correo inválido.").nullish(),
     birth_date: z
       .string()
