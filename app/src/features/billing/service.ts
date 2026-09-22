@@ -18,7 +18,7 @@ import { getSessionUser } from "@/src/features/auth/service";
 import {
   requireSedeRole,
   resolveSede,
-} from "@/src/features/admin/service";
+} from "@/src/shared/lib/sede";
 import { listPaymentMethods, listServices, listTaxes } from "@/src/features/admin/service";
 import {
   registerMovement,

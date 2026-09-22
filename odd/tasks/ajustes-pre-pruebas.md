@@ -41,6 +41,7 @@ Out:
 - [x] USR1 Alta automática usuario al crear empleado — backend: si no hay `users` con `sede_id+documento`, crea usuario (clave=documento, `must_change_password=true`, `id_type=CC`) + rol empleado si queda sin roles. Nunca pide creación manual.
 - [x] USR2 UI sin fricción — pestaña Usuarios sin botón Nuevo usuario; nota de alta automática. Solo roles y reset.
 - [x] VER Verificación — `npm run typecheck`, `npm test`, `next build`, advisors. Evidencia abajo.
+- [x] ARQ1 Guardas de sede/rol a shared — `resolveSede`+`requireSedeRole` viven en `src/shared/lib/sede.ts`; `admin/service` los re-exporta (misma identidad); 21 importadores migrados. Seguimiento: guardas de sesión y deps de datos entre servicios.
 
 ## Acceptance
 - BD: 0 tablas de negocio sin RLS; advisors sin critical abierto o con decisión registrada; listados con límite y sin N+1 evidente.

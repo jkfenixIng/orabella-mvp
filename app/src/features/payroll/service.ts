@@ -26,13 +26,12 @@ import {
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
+import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
 import {
   AdminError,
   getEmployee,
   listEmployees,
   listPaymentMethods,
-  requireSedeRole,
-  resolveSede,
 } from "@/src/features/admin/service";
 
 export class PayrollError extends Error {

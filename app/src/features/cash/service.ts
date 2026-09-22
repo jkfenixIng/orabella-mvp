@@ -27,9 +27,8 @@ import {
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
+import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
 import {
-  requireSedeRole,
-  resolveSede,
   listPaymentMethods,
   AdminError,
 } from "@/src/features/admin/service";

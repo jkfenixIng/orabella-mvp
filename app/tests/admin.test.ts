@@ -13,7 +13,8 @@ import {
   setUserRolesSchema,
   taxConfigSchema,
 } from "@/src/features/admin/schemas";
-import { AdminError, requireSedeRole, resolveSede } from "@/src/features/admin/service";
+import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
+import { AdminError } from "@/src/features/admin/service";
 
 const SEDE_A = "11111111-1111-4111-8111-111111111111";
 const SEDE_B = "22222222-2222-4222-8222-222222222222";

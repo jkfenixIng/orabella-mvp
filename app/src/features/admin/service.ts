@@ -16,17 +16,19 @@ import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser, hashPassword } from "@/src/features/auth/service";
 import { unstable_cache } from "next/cache";
 
-export class AdminError extends Error {
-  readonly code: string;
-  readonly status: number;
-
-  constructor(code: string, message: string, status = 400) {
-    super(message);
-    this.name = "AdminError";
-    this.code = code;
-    this.status = status;
-  }
-}
+// Compatibilidad: la identidad de estos guardas vive en
+// `@/src/shared/lib/sede.ts` (import cruzado entre features resuelto).
+// Se re-exportan aquí para no romper importadores existentes; el código
+// nuevo importa desde shared. Misma clase: `instanceof` intacto.
+import {
+  requireSedeRole,
+  SedeError as AdminError,
+} from "@/src/shared/lib/sede";
+export {
+  requireSedeRole,
+  resolveSede,
+  SedeError as AdminError,
+} from "@/src/shared/lib/sede";
 
 /**
  * Cliente privilegiado bajo demanda (service_role, solo servidor).
@@ -62,16 +64,7 @@ function validationMessage(error: { issues: Array<{ message: string }> }): strin
 }
 
 // ------------------------------------------------------- roles por sede ---
-/**
- * TRA/NFR-02 + §10: verifica que la sesión tenga al menos uno de los roles
- * exigidos. Puro (sin red) para poder probarlo en unit tests.
- */
-export function requireSedeRole(roles: RoleCode[], allowed: RoleCode[]): void {
-  const permitted = allowed.some((role) => roles.includes(role));
-  if (!permitted) {
-    throw new AdminError("FORBIDDEN", "No tiene permiso para esta acción.", 403);
-  }
-}
+// `requireSedeRole` vive en `@/src/shared/lib/sede.ts` (re-exportado arriba).
 
 export interface AdminSession {
   userId: string;
@@ -110,13 +103,9 @@ export async function requireSession(token: string | null | undefined): Promise<
 }
 
 /**
- * El MVP opera una sola sede: el sede_id solicitado debe coincidir con el
- * de la sesión (si se omite, se usa el de la sesión).
+ * El MVP opera una sola sede (`resolveSede` en `@/src/shared/lib/sede.ts`,
+ * re-exportado arriba).
  */
-export function resolveSede(sessionSedeId: string, requestedSedeId?: string | null): string {
-  if (!requestedSedeId || requestedSedeId === sessionSedeId) return sessionSedeId;
-  throw new AdminError("FORBIDDEN", "No tiene acceso a esa sede.", 403);
-}
 
 // ----------------------------------------------------------------- sedes ---
 export interface SedeRow {
