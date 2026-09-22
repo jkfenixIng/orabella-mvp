@@ -33,8 +33,6 @@ async function commissionsDb() {
   return createAdminClient();
 }
 
-type DbClient = Awaited<ReturnType<typeof commissionsDb>>;
-
 export interface CommissionActor {
   userId: string;
   sedeId: string;
