@@ -34,3 +34,5 @@ coverage/
 
 # Repos (submodules) — anchored to root so app/**/api routes are not ignored
 /API/
+# Local Pi runtime state
+.atl/

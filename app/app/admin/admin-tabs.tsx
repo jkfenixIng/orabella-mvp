@@ -827,7 +827,7 @@ function CashSection({
     }
     setRegisters((current) => current.map((row) => (row.id === result.data.id ? result.data : row)));
     setBaseDrafts((current) => ({ ...current, [registerId]: "" }));
-    setNotice("Base actualizada (queda auditado).");
+    setNotice("Base actualizada.");
   }
 
   async function handleAddDenomination(event: FormEvent) {

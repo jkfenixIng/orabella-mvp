@@ -19,13 +19,19 @@ Out of scope: changes to authentication, permissions, database schema, API contr
 - [x] UI-01 Audit current UI and preserve existing business behavior.
 - [x] UI-02 Standardize shared navigation, mobile drawer, and loading primitives.
 - [x] UI-04 Add route/section skeletons and lazy loading boundaries.
-- [ ] UI-07 Dark mode: map design tokens into Tailwind v4 @theme inline so bg-surface/text-text-primary/border-border-color resolve in both modes; fix inverted hard-coded classes.
-- [ ] UI-08 Icons: lucide icons in nav groups, module cards, dashboard alerts to reduce flat look.
-- [ ] UI-09 Navigation performance: measure TTFB per route, keep instant loading feedback, add pending/double-click guards on nav and forms; document dev-vs-prod.
-- [ ] UI-10 Declutter modules: move heavy cash/invoice sections into dialogs/tabs; one module per slice.
-- [ ] UI-11 Dashboard alerts: home shows low-stock alerts on entry (same filterLowStock rule as inventory).
-- [ ] UI-05 Run typecheck, lint, build, and tests; fix regressions.
+- [x] UI-07 Dark mode: map design tokens into Tailwind v4 @theme inline so bg-surface/text-text-primary/border-border-color resolve in both modes; fix inverted hard-coded classes.
+- [x] UI-08 Icons: lucide icons in nav groups, module cards, dashboard alerts to reduce flat look.
+- [x] UI-09 Navigation performance: measure TTFB per route, keep instant loading feedback, add pending/double-click guards on nav and forms; document dev-vs-prod.
+- [x] UI-10 Declutter modules: move heavy cash/invoice sections into dialogs/tabs; one module per slice.
+- [x] UI-11 Dashboard alerts: home shows low-stock alerts on entry (same filterLowStock rule as inventory).
+- [x] UI-05 Run typecheck, lint, build, and tests; fix regressions.
 - [ ] UI-06 Record verified evidence and leave delivery decisions to the user.
+
+## Verification evidence (2026-09-21, commits 03d31df..d223005 + 07ce5fa)
+
+- typecheck: 0 errors. lint (eslint .): clean. build (next build): success, all routes compiled.
+- Perf: /login cold 2.25s vs warm 0.18s in dev (compile cost); production behaves like warm.
+- Dev server running at http://localhost:3000 for user testing.
 
 ## Authorized scope
 
@@ -55,3 +61,7 @@ Resume and continue UI implementation on branch feat/orabella-mvp (user authoriz
 - 2026-09-21 UI-02 invoices cleanup: removed unused dialog/lucide imports and dead style consts. Typecheck 0, lint clean. Commit e0ea0c6.
 - 2026-09-21 UI-02 payroll + UI-04 skeletons: payroll transitions committed e156be5; empty-interface lint fixed; loading/skeleton primitives committed 295e5e1. Verification: typecheck 0, eslint clean, build success.
 - 2026-09-21 UI perf slice: instant navigation (deferred history/alerts, read limits 50/500, design tokens, ui lib, docs). Commit 584796a. Verification: typecheck 0, build success.
+- 2026-09-21 Catalog cache: listSedes/listEmployees/listServices/listTaxes/listPaymentMethods wrapped in unstable_cache (tags catalog:*, 1h backstop); upsert actions revalidateTag. Excluded products/invoices/cash/payroll (transactional). Verification: typecheck 0, tests 166/166, build success. Commit 9798e9a.
+- 2026-09-21 UI-09 perf: measured login cold 2.25s vs warm 0.18s (dev compile cost); busy/disabled guards verified in invoices (4) and cash; skeletons + read limits + deferred queries already mitigate. No code change.
+- 2026-09-21 UI-10 cash payment dialog: moved payment form into Dialog with trigger in current-shift section. Commit 81858a5.
+- 2026-09-21 UI-10 cash close dialog: moved shift-close form into Dialog. Cash view now shows status + actions only. Commit bad2771.

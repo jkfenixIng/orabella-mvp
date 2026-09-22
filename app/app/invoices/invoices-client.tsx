@@ -174,8 +174,17 @@ export function InvoicesClient(props: InvoicesClientProps) {
     }
   }
 
-  function openDetail(id: string) {
-    startViewTransition(async () => {
+  // Inventory-style cancel: closing the dialog always resets its draft.
+  function cancelCreate() {
+    setClientName("");
+    setClientDocument("");
+    setDiscount("");
+    setItems([emptyItem()]);
+    setPortions([{ method_code: "efectivo", amount: "" }]);
+    setCreateDialogOpen(false);
+  }
+
+  function openDetail(id: string) {    startViewTransition(async () => {
       setError(null);
       const result: ActionResult<InvoiceDetail> = await getInvoiceAction(id);
       if (!result.success) {
@@ -317,7 +326,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
               <CardDescription>Consulte el historial y abra el detalle de cada factura.</CardDescription>
             </div>
             {props.canWrite && (
-              <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
+              <Dialog
+                open={createDialogOpen}
+                onOpenChange={(open) => {
+                  if (!open) cancelCreate();
+                  else setCreateDialogOpen(open);
+                }}
+              >
                 <DialogTrigger asChild>
                   <Button variant="default">
                     <Plus className="h-4 w-4" aria-hidden="true" />
@@ -584,10 +599,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         </Button>
                       </form>
                     </CardContent>
-                    <CardFooter className="border-t border-color-2 pt-4">
-                      <DialogClose asChild>
-                        <Button variant="outline">Cancelar</Button>
-                      </DialogClose>
+                      <CardFooter className="border-t border-color-2 pt-4">
+                        <Button type="button" variant="outline" onClick={cancelCreate}>
+                          Cancelar
+                        </Button>
                       <Button type="submit" disabled={busy}>
                         {busy ? "Emitiendo…" : "Emitir factura"}
                       </Button>
@@ -658,6 +673,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   if (!open) {
                     setDetail(null);
                     setMotivo("");
+                    setSplitDraft({ method_code: "efectivo", amount: "" });
                   }
                   setDetailDialogOpen(open);
                 }}>

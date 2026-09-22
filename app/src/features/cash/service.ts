@@ -2,17 +2,25 @@ import {
   accumulateDayTotals,
   assertCloseInput,
   assertNoOpenShift,
+  assertShiftCloser,
+  buildMethodViews,
   closeShiftSchema,
   computeCashClose,
+  dayBounds,
   dayViewSchema,
+  expectedDigitalTotal,
+  HISTORY_PAGE_SIZE,
   historySchema,
   openShiftSchema,
+  rangeBounds,
   registerPaymentSchema,
+  resolveClosingBase,
   resolveOpeningBase,
   roundMoney,
   moneyEquals,
   type CloseShiftInput,
   type DayTotals,
+  type MethodDifference,
   type OpenShiftInput,
   type RegisterPaymentInput,
   type ShiftCountInput,
@@ -27,6 +35,8 @@ import {
 } from "@/src/features/admin/service";
 import { BillingError, getInvoiceDetail } from "@/src/features/billing/service";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
+import { getShiftReviews } from "@/src/features/alerts/service";
+import { assembleShiftRevision, type ShiftRevision } from "@/src/features/alerts/schemas";
 import { unstable_cache } from "next/cache";
 import { z } from "zod";
 
@@ -103,6 +113,9 @@ function toCashError(error: unknown): CashError {
   if (error instanceof Error && error.message === "COUNT_REQUIRED") {
     return new CashError("COUNT_REQUIRED", "El conteo de efectivo es obligatorio para cerrar.", 400);
   }
+  if (error instanceof Error && error.message === "SHIFT_NOT_OWNER") {
+    return new CashError("SHIFT_NOT_OWNER", "Solo quien abrió el turno puede cerrarlo.", 403);
+  }
   if (error instanceof Error && error.message === "OBSERVATION_REQUIRED") {
     return new CashError(
       "OBSERVATION_REQUIRED",
@@ -173,13 +186,6 @@ export interface ShiftCountRow {
   denomination: number | null;
   quantity: number;
   amount: number;
-}
-
-export interface MethodDifference {
-  method_code: string;
-  expected: number;
-  declared: number;
-  difference: number;
 }
 
 export interface CashDenominationRow {
@@ -291,13 +297,41 @@ export async function checkCounts(
   return totals;
 }
 
+/**
+ * Totales por método de los conteos de varios turnos, separados por fase.
+ * Base del esperado digital acumulativo (apertura + cobrado).
+ */
+async function fetchCountTotals(
+  db: DbClient,
+  shiftIds: string[],
+): Promise<Map<string, { open: Map<string, number>; closed: Map<string, number> }>> {
+  const result = new Map<string, { open: Map<string, number>; closed: Map<string, number> }>();
+  if (shiftIds.length === 0) return result;
+  const { data, error } = await db
+    .from("cash_shift_counts")
+    .select("shift_id, phase, method_code, amount")
+    .in("shift_id", shiftIds);
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  for (const row of (data ?? []) as Array<{
+    shift_id: string;
+    phase: string;
+    method_code: string;
+    amount: number | string;
+  }>) {
+    const entry = result.get(row.shift_id) ?? { open: new Map(), closed: new Map() };
+    const target = row.phase === "apertura" ? entry.open : entry.closed;
+    target.set(row.method_code, roundMoney((target.get(row.method_code) ?? 0) + Number(row.amount)));
+    result.set(row.shift_id, entry);
+  }
+  return result;
+}
+
 async function insertCounts(
   db: DbClient,
   shiftId: string,
   phase: "apertura" | "cierre",
   counts: ShiftCountInput[],
-): Promise<void> {
-  const rows = counts.map((line) => ({
+): Promise<void> {  const rows = counts.map((line) => ({
     shift_id: shiftId,
     phase,
     method_code: line.method_code,
@@ -433,11 +467,20 @@ async function getShiftOrThrow(db: DbClient, sedeId: string, id: string): Promis
 
 /**
  * CAJ-01: abre un turno con opening_base heredada (base_left del último
- * cierre o base_configurada si es el primero). Rechaza si hay un turno
- * abierto en la caja (además del índice parcial, barrera ante carreras:
- * 23505 → mismo error de negocio).
+ * cierre o base_configurada si es el primero). El pre-arqueo NUNCA bloquea
+ * la operación: las diferencias quedan registradas (y avisan a los
+ * administradores, salvo en la primerísima apertura) y el turno abre igual
+ * con la base del sistema. Rechaza si hay un turno abierto en la caja
+ * (además del índice parcial, barrera ante carreras: 23505 → mismo error
+ * de negocio).
  */
-export async function openShift(raw: unknown, actor: CashActor): Promise<CashShiftRow> {
+export interface OpenShiftResult {
+  shift: CashShiftRow;
+  mismatches: Array<{ method_code: string; expected: number; declared: number }>;
+  firstOpen: boolean;
+}
+
+export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShiftResult> {
   const parsed = openShiftSchema.safeParse(raw);
   if (!parsed.success) {
     throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
@@ -469,11 +512,15 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<CashShi
     const lastBaseLeft = (last as { base_left: number | null } | null)?.base_left ?? null;
     const openingBase = resolveOpeningBase(lastBaseLeft, Number(register.base_configurada));
 
-    // Pre-arqueo: el conteo declarado debe coincidir con el último cierre
-    // (efectivo contra la base que se dejó; digitales contra sus totales).
-    // Sin coincidencia no se abre y queda alerta para administradores.
+    // Pre-open count never blocks the operation: cash must match the base
+    // the shift opens with (base_left from the last close, or
+    // base_configurada on first open); digitals are checked against last
+    // close totals only when they exist. Mismatches are recorded and alert
+    // administrators (except on the very first open) while the shift opens
+    // anyway so the business never stops.
     const declared = await checkCounts(actor.sedeId, input.counts);
     const prev = await previousCloseTotals(db, register.id);
+    const isFirstOpen = prev === null;
     const mismatches: Array<{ method_code: string; expected: number; declared: number }> = [];
     const cashDeclared = declared.get("efectivo") ?? 0;
     if (!moneyEquals(cashDeclared, openingBase)) {
@@ -488,21 +535,7 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<CashShi
         }
       }
     }
-    if (mismatches.length > 0) {
-      await writeAudit({
-        sede_id: actor.sedeId,
-        user_id: actor.userId,
-        action: AUDIT_ACTIONS.SHIFT_OPEN_MISMATCH,
-        entity: "cash_registers",
-        entity_id: register.id,
-        metadata: { opening_base: openingBase, mismatches },
-      });
-      throw new CashError(
-        "OPENING_MISMATCH",
-        "El pre-arqueo no coincide con el cierre anterior. Se alertó a los administradores.",
-        422,
-      );
-    }
+    // (open-mismatch audit is written after creation, filed against the shift)
 
     const { data: created, error: createError } = await db
       .from("cash_shifts")
@@ -529,7 +562,19 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<CashShi
     }
     if (!created) throw new CashError("INTERNAL", "Error interno.", 500);
     await insertCounts(db, (created as CashShiftRow).id, "apertura", input.counts);
-    return created as CashShiftRow;
+    // Filed against the created shift (not the register) so the shift's
+    // review state can be joined from the day/history views.
+    if (mismatches.length > 0 && !isFirstOpen) {
+      await writeAudit({
+        sede_id: actor.sedeId,
+        user_id: actor.userId,
+        action: AUDIT_ACTIONS.SHIFT_OPEN_MISMATCH,
+        entity: "cash_shifts",
+        entity_id: (created as CashShiftRow).id,
+        metadata: { opening_base: openingBase, mismatches },
+      });
+    }
+    return { shift: created as CashShiftRow, mismatches, firstOpen: isFirstOpen };
   } catch (error) {
     throw toCashError(error);
   }
@@ -670,10 +715,11 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
 // ------------------------------------------------------------------- cierre ---
 
 /**
- * CAJ-03/CAJ-04: cierra con arqueo. Conteo (counted_cash) y base dejada
- * obligatorios; expected_cash = efectivo cobrado en el turno; calcula
- * recogido (= contado − base) y diferencia (= base − base configurada).
- * Base incompleta (base_left < base_configurada) exige observación.
+ * CAJ-03/CAJ-04: cierra con arqueo. Solo se pide el conteo; la base del
+ * próximo turno es automática (min(contado, configurada)) y jamás se pide
+ * justificación (arqueo escondido). expected_cash = efectivo cobrado en el
+ * turno; calcula recogido (= contado − base) y diferencia
+ * (= base − base configurada).
  */
 export interface CloseShiftResult {
   shift: CashShiftRow;
@@ -697,17 +743,24 @@ export async function closeShift(
     if (shift.status !== "abierto") {
       throw new CashError("SHIFT_ALREADY_CLOSED", "El turno ya está cerrado.", 409);
     }
-    const register = await resolveRegister(db, sedeId, shift.cash_register_id);
+    let isOverride = false;
     try {
-      assertCloseInput({
-        countedCash: input.counted_cash,
-        baseLeft: input.base_left,
-        baseConfigurada: Number(register.base_configurada),
-        observation: input.observation,
-      });
+      isOverride = assertShiftCloser({
+        openedBy: shift.opened_by,
+        actorUserId: actor.userId,
+        isAdmin: (actor.roles ?? []).includes("admin"),
+      }).isOverride;
     } catch (error) {
       throw toCashError(error);
     }
+    const register = await resolveRegister(db, sedeId, shift.cash_register_id);
+    try {
+      assertCloseInput({ countedCash: input.counted_cash });
+    } catch (error) {
+      throw toCashError(error);
+    }
+    // Automatic next base (hidden count): never asked, never justified.
+    const baseLeft = resolveClosingBase(input.counted_cash, Number(register.base_configurada));
 
     const { data: shiftPayments, error: paymentsError } = await db
       .from("payments")
@@ -727,11 +780,14 @@ export async function closeShift(
     if (!moneyEquals(countedFromDetail, input.counted_cash)) {
       throw new CashError("COUNT_MISMATCH", "El conteo no cuadra con el detalle por denominación.", 422);
     }
-    // Digitales: lo declarado contra lo cobrado en el turno.
+    // Digitales: lo declarado contra el saldo de apertura del turno más
+    // lo cobrado en el turno (el "total en la aplicación").
+    const countMaps = await fetchCountTotals(db, [shift.id]);
+    const openByMethod = countMaps.get(shift.id)?.open ?? new Map<string, number>();
     const methodDifferences: MethodDifference[] = [];
     for (const [code, total] of declared) {
       if (code === "efectivo") continue;
-      const expected = paidByMethod.get(code) ?? 0;
+      const expected = expectedDigitalTotal(openByMethod.get(code) ?? 0, paidByMethod.get(code) ?? 0);
       if (!moneyEquals(total, expected)) {
         methodDifferences.push({ method_code: code, expected, declared: total, difference: roundMoney(total - expected) });
       }
@@ -739,7 +795,7 @@ export async function closeShift(
 
     const close = computeCashClose({
       countedCash: input.counted_cash,
-      baseLeft: input.base_left,
+      baseLeft,
       baseConfigurada: Number(register.base_configurada),
     });
     const observation = input.observation?.trim() ? input.observation.trim() : null;
@@ -749,7 +805,7 @@ export async function closeShift(
       .update({
         expected_cash: expectedCash,
         counted_cash: roundMoney(input.counted_cash),
-        base_left: roundMoney(input.base_left),
+        base_left: roundMoney(baseLeft),
         cash_withdrawn: close.cashWithdrawn,
         base_difference: close.baseDifference,
         observation,
@@ -772,10 +828,11 @@ export async function closeShift(
       metadata: {
         expected_cash: expectedCash,
         counted_cash: roundMoney(input.counted_cash),
-        base_left: roundMoney(input.base_left),
+        base_left: roundMoney(baseLeft),
         base_configurada: Number(register.base_configurada),
         base_difference: close.baseDifference,
         base_incompleta: close.baseDifference < 0,
+        admin_override: isOverride,
         method_differences: methodDifferences,
         observation: observation ?? null,
       },
@@ -898,6 +955,33 @@ export interface DayShiftView {
   shift: CashShiftRow;
   ventas: number;
   efectivo: number;
+  /** Cobrado por método en el turno (todos los métodos con movimiento). */
+  metodos: Array<{ method_code: string; amount: number }>;
+  /** Declarado por método (cierre si está cerrado, apertura si no). */
+  declarados: Array<{ method_code: string; amount: number }>;
+  /** Diferencias digitales del cierre (vacío en turnos abiertos). */
+  diferencias: MethodDifference[];
+  /** Revisión de los desajustes del turno (null si no hay). */
+  revision: ShiftRevision | null;
+  /** Quién abrió / cerró (null al cerrar si sigue abierto). */
+  abierto_por: string | null;
+  cerrado_por: string | null;
+}
+
+/** Nombres de usuarios para las vistas (quién abrió/cerró). */
+async function userNames(
+  db: DbClient,
+  userIds: Array<string | null>,
+): Promise<Map<string, string>> {
+  const ids = [...new Set(userIds.filter((id): id is string => !!id))];
+  if (ids.length === 0) return new Map();
+  const { data, error } = await db.from("users").select("id, full_name").in("id", ids);
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  const names = new Map<string, string>();
+  for (const row of (data ?? []) as Array<{ id: string; full_name: string }>) {
+    names.set(row.id, row.full_name);
+  }
+  return names;
 }
 
 export interface DayView {
@@ -905,10 +989,6 @@ export interface DayView {
   register: CashRegisterRow | null;
   shifts: DayShiftView[];
   totals: DayTotals;
-}
-
-function dayBounds(fecha: string): { from: string; to: string } {
-  return { from: `${fecha}T00:00:00`, to: `${fecha}T23:59:59.999` };
 }
 
 /**
@@ -930,87 +1010,7 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
     .eq("sede_id", sedeId)
     .gte("opened_at", from)
     .lte("opened_at", to)
-    .order("opened_at");
-  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  const rows = (shifts ?? []) as CashShiftRow[];
-
-  let paymentsByShift = new Map<string, Array<{ amount: number; method_code: string }>>();
-  if (rows.length > 0) {
-    const { data: payments, error: paymentsError } = await db
-      .from("payments")
-      .select("cash_shift_id, amount, method_code")
-      .in(
-        "cash_shift_id",
-        rows.map((row) => row.id),
-      );
-    if (paymentsError) throw new CashError("INTERNAL", "Error interno.", 500);
-    paymentsByShift = new Map();
-    for (const row of (payments ?? []) as Array<{
-      cash_shift_id: string;
-      amount: number | string;
-      method_code: string;
-    }>) {
-      const list = paymentsByShift.get(row.cash_shift_id) ?? [];
-      list.push({ amount: Number(row.amount), method_code: row.method_code });
-      paymentsByShift.set(row.cash_shift_id, list);
-    }
-  }
-
-  const views: DayShiftView[] = rows.map((shift) => {
-    const list = paymentsByShift.get(shift.id) ?? [];
-    return {
-      shift,
-      ventas: roundMoney(list.reduce((acc, row) => acc + row.amount, 0)),
-      efectivo: roundMoney(
-        list.filter((row) => row.method_code === "efectivo").reduce((acc, row) => acc + row.amount, 0),
-      ),
-    };
-  });
-
-  const registers = await listRegisters(sedeId);
-  return {
-    fecha,
-    register: registers[0] ?? null,
-    shifts: views,
-    totals: accumulateDayTotals(
-      views.map((view) => ({
-        expectedCash: view.efectivo,
-        countedCash: view.shift.counted_cash,
-        baseLeft: view.shift.base_left,
-        cashWithdrawn: view.shift.cash_withdrawn,
-        baseDifference: view.shift.base_difference,
-        ventas: view.ventas,
-      })),
-    ),
-  };
-}
-
-export interface HistoryResult {
-  desde: string;
-  hasta: string;
-  shifts: DayShiftView[];
-}
-
-/**
- * CAJ-06: historial de aperturas, movimientos, bases y cierres filtrable
- * por fecha (rango inclusive sobre opened_at, más recientes primero,
- * máx. 50 turnos). La página /cash NO lo trae de entrada: se carga bajo
- * demanda con el filtro (navegación instantánea).
- */
-export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryResult> {
-  const parsed = historySchema.safeParse(raw);
-  if (!parsed.success) {
-    throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
-  }
-  const { desde, hasta } = parsed.data;
-  const db = await cashDb();
-  const { data: shifts, error } = await db
-    .from("cash_shifts")
-    .select(SHIFT_SELECT)
-    .eq("sede_id", sedeId)
-    .gte("opened_at", `${desde}T00:00:00`)
-    .lte("opened_at", `${hasta}T23:59:59.999`)
-    .order("opened_at", { ascending: false })
+    .order("opened_at")
     .limit(50);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
   const rows = (shifts ?? []) as CashShiftRow[];
@@ -1037,17 +1037,176 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
     }
   }
 
+  const countMaps = await fetchCountTotals(
+    db,
+    rows.map((row) => row.id),
+  );
+  const closedIds = rows.filter((row) => row.status === "cerrado").map((row) => row.id);
+  const reviews = await getShiftReviews(sedeId, closedIds);
+  const names = await userNames(
+    db,
+    rows.flatMap((row) => [row.opened_by, row.closed_by]),
+  );
+
+  const views: DayShiftView[] = rows.map((shift) => {
+    const list = paymentsByShift.get(shift.id) ?? [];
+    const paidByMethod = new Map<string, number>();
+    for (const item of list) {
+      paidByMethod.set(item.method_code, roundMoney((paidByMethod.get(item.method_code) ?? 0) + item.amount));
+    }
+    const counts = countMaps.get(shift.id) ?? { open: new Map(), closed: new Map() };
+    const { metodos, declarados, diferencias } = buildMethodViews({
+      paid: paidByMethod,
+      open: counts.open,
+      closed: shift.status === "cerrado" ? counts.closed : null,
+    });
+    const revision = assembleShiftRevision(
+      reviews.get(shift.id) ?? [],
+      diferencias.length > 0,
+    );
+    return {
+      shift,
+      ventas: roundMoney(list.reduce((acc, row) => acc + row.amount, 0)),
+      efectivo: roundMoney(
+        list.filter((row) => row.method_code === "efectivo").reduce((acc, row) => acc + row.amount, 0),
+      ),
+      metodos,
+      declarados,
+      diferencias,
+      revision,
+      abierto_por: names.get(shift.opened_by) ?? null,
+      cerrado_por: shift.closed_by ? (names.get(shift.closed_by) ?? null) : null,
+    };
+  });
+
+  const registers = await listRegisters(sedeId);
+  return {
+    fecha,
+    register: registers[0] ?? null,
+    shifts: views,
+    totals: accumulateDayTotals(
+      views.map((view) => ({
+        expectedCash: view.efectivo,
+        countedCash: view.shift.counted_cash,
+        baseLeft: view.shift.base_left,
+        cashWithdrawn: view.shift.cash_withdrawn,
+        baseDifference: view.shift.base_difference,
+        ventas: view.ventas,
+      })),
+    ),
+  };
+}
+
+export interface HistoryResult {
+  desde: string;
+  hasta: string;
+  shifts: DayShiftView[];
+  page: number;
+  pageSize: number;
+  total: number;
+}
+
+/**
+ * CAJ-06: historial de aperturas, movimientos, bases y cierres filtrable
+ * por fecha (rango inclusive sobre opened_at, más recientes primero,
+ * paginado en servidor de a HISTORY_PAGE_SIZE para que ningún rango
+ * esconda turnos). La página /cash lo pide bajo demanda con el filtro.
+ */
+export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryResult> {
+  const parsed = historySchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
+  }
+  const { desde, hasta, page } = parsed.data;
+  const db = await cashDb();
+  const { from, to } = rangeBounds(desde, hasta);
+  const { count, error: countError } = await db
+    .from("cash_shifts")
+    .select("id", { count: "exact", head: true })
+    .eq("sede_id", sedeId)
+    .gte("opened_at", from)
+    .lte("opened_at", to);
+  if (countError) throw new CashError("INTERNAL", "Error interno.", 500);
+  const total = count ?? 0;
+  const offset = (page - 1) * HISTORY_PAGE_SIZE;
+  const { data: shifts, error } = await db
+    .from("cash_shifts")
+    .select(SHIFT_SELECT)
+    .eq("sede_id", sedeId)
+    .gte("opened_at", from)
+    .lte("opened_at", to)
+    .order("opened_at", { ascending: false })
+    .range(offset, offset + HISTORY_PAGE_SIZE - 1);
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  const rows = (shifts ?? []) as CashShiftRow[];
+
+  let paymentsByShift = new Map<string, Array<{ amount: number; method_code: string }>>();
+  if (rows.length > 0) {
+    const { data: payments, error: paymentsError } = await db
+      .from("payments")
+      .select("cash_shift_id, amount, method_code")
+      .in(
+        "cash_shift_id",
+        rows.map((row) => row.id),
+      );
+    if (paymentsError) throw new CashError("INTERNAL", "Error interno.", 500);
+    paymentsByShift = new Map();
+    for (const row of (payments ?? []) as Array<{
+      cash_shift_id: string;
+      amount: number | string;
+      method_code: string;
+    }>) {
+      const list = paymentsByShift.get(row.cash_shift_id) ?? [];
+      list.push({ amount: Number(row.amount), method_code: row.method_code });
+      paymentsByShift.set(row.cash_shift_id, list);
+    }
+  }
+
+  const historyCountMaps = await fetchCountTotals(
+    db,
+    rows.map((row) => row.id),
+  );
+  const historyClosedIds = rows.filter((row) => row.status === "cerrado").map((row) => row.id);
+  const historyReviews = await getShiftReviews(sedeId, historyClosedIds);
+  const historyNames = await userNames(
+    db,
+    rows.flatMap((row) => [row.opened_by, row.closed_by]),
+  );
+
   return {
     desde,
     hasta,
+    page,
+    pageSize: HISTORY_PAGE_SIZE,
+    total,
     shifts: rows.map((shift) => {
       const list = paymentsByShift.get(shift.id) ?? [];
+      const paidByMethod = new Map<string, number>();
+      for (const item of list) {
+        paidByMethod.set(item.method_code, roundMoney((paidByMethod.get(item.method_code) ?? 0) + item.amount));
+      }
+      const counts = historyCountMaps.get(shift.id) ?? { open: new Map(), closed: new Map() };
+      const { metodos, declarados, diferencias } = buildMethodViews({
+        paid: paidByMethod,
+        open: counts.open,
+        closed: shift.status === "cerrado" ? counts.closed : null,
+      });
+      const revision = assembleShiftRevision(
+        historyReviews.get(shift.id) ?? [],
+        diferencias.length > 0,
+      );
       return {
         shift,
         ventas: roundMoney(list.reduce((acc, row) => acc + row.amount, 0)),
         efectivo: roundMoney(
           list.filter((row) => row.method_code === "efectivo").reduce((acc, row) => acc + row.amount, 0),
         ),
+        metodos,
+        declarados,
+        diferencias,
+        revision,
+        abierto_por: historyNames.get(shift.opened_by) ?? null,
+        cerrado_por: shift.closed_by ? (historyNames.get(shift.closed_by) ?? null) : null,
       };
     }),
   };
