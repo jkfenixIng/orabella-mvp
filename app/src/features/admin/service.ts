@@ -13,7 +13,7 @@ import {
   type TaxConfigInput,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
-import { getSessionUser } from "@/src/features/auth/service";
+import { getSessionUser, hashPassword } from "@/src/features/auth/service";
 import { unstable_cache } from "next/cache";
 
 export class AdminError extends Error {
@@ -264,7 +264,8 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
   const db = await adminDb();
 
   // Vínculo automático por documento (no editable): el usuario de acceso
-  // es el de la sede con el mismo documento; sin coincidencia va sin link.
+  // es el de la sede con el mismo documento; sin coincidencia se crea
+  // automáticamente (nunca se pide creación manual).
   // El user_id que traiga el input se ignora a propósito.
   const { data: linked, error: linkedError } = await db
     .from("users")
@@ -273,7 +274,25 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
     .eq("id_number", input.document)
     .maybeSingle();
   if (linkedError) throw new AdminError("INTERNAL", "Error interno.", 500);
-  const userId = (linked as { id: string } | null)?.id ?? null;
+  let userId = (linked as { id: string } | null)?.id ?? null;
+  if (!userId && !input.id) {
+    const { data: createdUser, error: createError } = await db
+      .from("users")
+      .insert({
+        sede_id: input.sede_id,
+        email: input.email?.trim() ? input.email.trim() : null,
+        phone: input.phone ?? null,
+        id_type: "CC",
+        id_number: input.document,
+        password_hash: await hashPassword(input.document),
+        full_name: input.full_name,
+        must_change_password: true,
+      })
+      .select("id")
+      .single();
+    if (createError || !createdUser) throw new AdminError("INTERNAL", "Error interno.", 500);
+    userId = (createdUser as { id: string }).id;
+  }
   if (userId) {
     let takenQuery = db.from("employees").select("id").eq("user_id", userId).limit(1);
     if (input.id) takenQuery = takenQuery.neq("id", input.id);

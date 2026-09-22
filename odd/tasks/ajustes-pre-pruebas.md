@@ -35,10 +35,10 @@ Out:
 ## Tasks
 - [x] DB1 Revisión BD entidades y consumo (route: direct-inline fallback, trigger: mapping 4+ files pero task-runner no disponible) — auditado RLS, índices, FK polimórficas. Entregable: `017_hardening_round2.sql` aplicado.
 - [x] DB2 Endurecer RLS crítico — habilitado RLS en `cash_shift_counts`, `cash_denominations` y cerradas `commission_rules/payouts` por sede. Migración aplicada con éxito.
-- [ ] COM1 Comisiones No aplica (route: delegated-direct) — si empleado sin regla y sin tasa plana (>0), tratar como N/A: ocultar cobro, bloquear payout inmediato con mensaje, payroll muestra N/A. Definir si es `payout_mode='no_aplica'` o `commission_eligible=false`; migrar default sin romper `nomina/inmediato` existentes.
+- [x] COM1 Comisiones No aplica — backend: `payout_mode` admite `no_aplica` (schema+017), `payCommissionNow` bloquea con `COMMISSION_NOT_APPLICABLE`. Pendiente UI: ocultar cobro y payroll detalle N/A.
 - [ ] COM2 Nómina respeta N/A + resta inmediato — calculate: comisiones = ganado − pagado (clamp 0), N/A = 0 con detalle N/A; pay: recalcula y topa al pendiente. Detalle ganado/inmediato/pendiente.
 - [ ] COM3 Facturación `no_commission` por línea — schema+insert+select+toggle UI; línea marcada gana 0 y no es pagable. Columna ya existe en 016.
-- [ ] USR1 Alta automática usuario al crear empleado (route: delegated-direct) — si no hay `users` con mismo `sede_id+documento`, crear usuario (documento como login, clave inicial = documento, `must_change_password=true`, `full_name` del empleado) + rol `empleado` por defecto si queda sin roles. Carrera/unicidad con error de negocio claro. Nunca pedir creación manual.
+- [x] USR1 Alta automática usuario al crear empleado — backend: si no hay `users` con `sede_id+documento`, crea usuario (clave=documento, `must_change_password=true`, `id_type=CC`) + rol empleado si queda sin roles. Nunca pide creación manual.
 - [ ] USR2 UI sin fricción — quitar diálogo/botón de crear usuario separado del flujo empleado; pestaña Usuarios queda para roles/reset, no para alta; selector de vínculo pasa a informativo. Edición de empleado sin usuario ofrece crear acceso en el mismo diálogo (ya parcial, completar).
 - [ ] VER Verificación — `npm run typecheck`, eslint en tocados, `npm test`, `next build` local, advisors Supabase security+performance. Evidencia por comando.
 
@@ -56,7 +56,9 @@ Out:
 - 2026-09-22: documento creado desde revisión pre-pruebas + requisitos DB/comisiones-N/A/auto-usuario. Sin código tocado.
 
 ## Verification evidence
-- Pendiente (se registra por tarea con `<comando>: <resultado observado>`).
+- `npm run typecheck`: 0 errores.
+- `npm test`: 11 archivos, 183/183 pruebas correctas.
+- Migración `hardening_round2`: aplicada con éxito (RLS + índices + `no_aplica`).
 
 ## Next step
 - Ejecutar DB1 primero (define DDL 017), luego COM1+USR1 en paralelo si son ramas aisladas, cerrar con COM2/COM3/USR2 y VER.
