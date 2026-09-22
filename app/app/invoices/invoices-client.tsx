@@ -22,6 +22,7 @@ import {
   Badge,
 } from "@/src/components/ui/lib/badge";
 import { Button } from "@/src/components/ui/lib/button";
+import { Checkbox } from "@/src/components/ui/lib/checkbox";
 import {
   Card,
   CardContent,
@@ -73,6 +74,7 @@ interface ItemDraft {
   employee_id: string;
   qty: string;
   unit_price: string;
+  no_commission: boolean;
 }
 
 interface PortionDraft {
@@ -81,7 +83,7 @@ interface PortionDraft {
 }
 
 function emptyItem(): ItemDraft {
-  return { item_type: "servicio", ref_id: "", custom_name: "", employee_id: "", qty: "1", unit_price: "" };
+  return { item_type: "servicio", ref_id: "", custom_name: "", employee_id: "", qty: "1", unit_price: "", no_commission: false };
 }
 
 function toNumber(value: string): number | null {
@@ -231,6 +233,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
         qty,
         unit_price: price,
         discount: 0,
+        no_commission: item.no_commission,
       });
     }
     const parsedPortions = [];
@@ -509,6 +512,16 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     required
                                   />
                                 </Label>
+                                <label className="flex items-center gap-2 text-sm text-text-secondary">
+                                  <Checkbox
+                                    checked={item.no_commission}
+                                    onCheckedChange={(checked) =>
+                                      patchItem(index, { no_commission: checked === true })
+                                    }
+                                    aria-label={`Ítem ${index + 1} sin comisión`}
+                                  />
+                                  Sin comisión
+                                </label>
                               </div>
                               {items.length > 1 && (
                                 <Button
