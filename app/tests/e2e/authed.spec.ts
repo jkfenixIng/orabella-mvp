@@ -1,15 +1,13 @@
 import { expect, test } from "@playwright/test";
-import { existsSync } from "node:fs";
 
 /** Flujos con sesión (solo con E2E_BACKEND=test; ver auth.setup.ts). */
 const AUTH_FILE = "./tests/e2e/.auth/user.json";
 
-test.skip(
-  process.env.E2E_BACKEND !== "test" || !existsSync(AUTH_FILE),
-  "requiere backend de pruebas + sesión de setup",
-);
+// Solo la bandera decide: el archivo lo escribe setup (dependencia) antes
+// de que este proyecto corra; evaluarlo acá sería en carga, demasiado pronto.
+test.skip(process.env.E2E_BACKEND !== "test", "requiere backend de pruebas");
 
-test.use({ storageState: existsSync(AUTH_FILE) ? AUTH_FILE : undefined });
+test.use({ storageState: AUTH_FILE });
 
 test("home muestra módulos con sesión", async ({ page }) => {
   await page.goto("/");
