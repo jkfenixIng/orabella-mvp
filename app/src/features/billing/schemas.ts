@@ -79,7 +79,7 @@ export type PaymentPortionInput = z.infer<typeof paymentPortionSchema>;
 
 /** FAC-01…07: creación de factura (descuento a nivel factura + porciones). */
 export const createInvoiceSchema = z.object({
-  client_name: z.string().trim().min(1, "Nombre del cliente requerido.").max(120, "Nombre muy largo."),
+  client_name: z.string().trim().max(120, "Nombre muy largo.").optional(),
   client_document: z.string().trim().max(20, "Documento inválido.").nullish(),
   items: z.array(invoiceItemSchema).min(1, "La factura exige al menos un ítem."),
   discount: moneySchema("El descuento").default(0),
@@ -246,6 +246,7 @@ export function buildReversalReasons(args: {
 }
 
 /** Motivo OUT de stock al facturar (trazable al consecutivo). */
-export function buildInvoiceOutReason(consecutiveNumber: number, clientName: string): string {
-  return `FACTURA #${consecutiveNumber} — ${clientName.trim().slice(0, 120)}`;
+export function buildInvoiceOutReason(consecutiveNumber: number, clientName: string | null | undefined): string {
+  const name = clientName?.trim() ?? "Cliente sin nombre";
+  return `FACTURA #${consecutiveNumber} — ${name.slice(0, 120)}`;
 }

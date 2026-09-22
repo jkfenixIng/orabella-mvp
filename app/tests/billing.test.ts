@@ -107,11 +107,11 @@ describe("billing schemas: línea con un solo origen (FAC-01)", () => {
   });
 });
 
-describe("billing schemas: factura exige cliente e ítems", () => {
-  it("rechaza sin cliente o sin ítems", () => {
+describe("billing schemas: factura exige ítems (cliente opcional)", () => {
+  it("rechaza sin ítems; cliente vacío es válido (opcional)", () => {
     expect(
       createInvoiceSchema.safeParse({ client_name: "  ", items: [productItem()] }).success,
-    ).toBe(false);
+    ).toBe(true);
     expect(createInvoiceSchema.safeParse({ client_name: "Ana", items: [] }).success).toBe(false);
   });
 

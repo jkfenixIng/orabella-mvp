@@ -442,7 +442,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
       .insert({
         sede_id: actor.sedeId,
         consecutive_number: consecutive,
-        client_name: input.client_name.trim(),
+        client_name: input.client_name?.trim() || null,
         client_document: input.client_document?.trim() || null,
         subtotal: totals.subtotal,
         discount: totals.discount,

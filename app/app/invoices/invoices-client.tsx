@@ -34,7 +34,6 @@ import {
   Dialog,
   DialogClose,
   DialogContent,
-  DialogTrigger,
 } from "@/src/components/ui/lib/dialog";
 import { Input } from "@/src/components/ui/lib/input";
 import { Label } from "@/src/components/ui/lib/label";
@@ -404,8 +403,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             className={paperInputClass}
                             value={clientName}
                             onChange={(event) => setClientName(event.target.value)}
-                            placeholder="Nombre del cliente"
-                            required
+                            placeholder="Nombre del cliente (opcional)"
                           />
                         </label>
                         <label className="flex flex-col gap-1 text-sm font-medium">
@@ -485,7 +483,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                               .filter((row) => row.is_active)
                                               .map((row) => (
                                                 <SelectItem key={row.id} value={row.id}>
-                                                  {row.name} (stock {row.stock_qty})
+                                                  {row.name} (stock {row.stock_qty}) <span className="text-xs text-emerald-600">💰</span>
                                                 </SelectItem>
                                               ))}
                                           </SelectContent>
@@ -504,13 +502,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                           </SelectTrigger>
                                           <SelectContent>
                                             <SelectItem value="">Servicio…</SelectItem>
-                                            {props.services
-                                              .filter((row) => row.is_active)
-                                              .map((row) => (
-                                                <SelectItem key={row.id} value={row.id}>
-                                                  {row.name}
-                                                </SelectItem>
-                                              ))}
+{props.services
+                                                .filter((row) => row.is_active)
+                                                .map((row) => (
+                                                  <SelectItem key={row.id} value={row.id}>
+                                                    {row.name} <span className="text-xs text-slate-500">(sin comisión)</span>
+                                                  </SelectItem>
+                                                ))}
                                           </SelectContent>
                                         </Select>
                                       )}
@@ -527,23 +525,24 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                       <p className="mt-1 text-xs text-slate-500">{draftItemName(item)}</p>
                                     </td>
                                     <td className="min-w-[150px] px-3 py-2">
-                                      <Select
-                                        value={item.employee_id}
-                                        onValueChange={(value) => patchItem(index, { employee_id: value })}
-                                      >
-                                        <SelectTrigger className={paperInputClass} aria-label={`Ítem ${index + 1} empleado`}>
-                                          <SelectValue placeholder="Empleado…" />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                          <SelectItem value="">Empleado…</SelectItem>
-                                          {props.employees.map((row) => (
-                                            <SelectItem key={row.id} value={row.id}>
-                                              {row.document}
-                                              {row.employee_code ? ` (${row.employee_code})` : ""}
-                                            </SelectItem>
-                                          ))}
-                                        </SelectContent>
-                                      </Select>
+<Select
+                                      value={item.employee_id}
+                                      onValueChange={(value) => patchItem(index, { employee_id: value })}
+                                    >
+                                      <SelectTrigger className={paperInputClass} aria-label={`Ítem ${index + 1} empleado`}>
+                                        <SelectValue placeholder="Empleado…" />
+                                      </SelectTrigger>
+                                      <SelectContent>
+                                        <SelectItem value="">Empleado…</SelectItem>
+                                        {props.employees.map((row) => (
+                                          <SelectItem key={row.id} value={row.id}>
+                                            {row.full_name}
+                                            {row.employee_code ? ` (${row.employee_code})` : ""}
+                                            {row.document ? ` · ${row.document}` : ""}
+                                          </SelectItem>
+                                        ))}
+                                      </SelectContent>
+                                    </Select>
                                     </td>
                                     <td className="px-3 py-2">
                                       <input
@@ -713,7 +712,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           <button
                             type="submit"
                             disabled={busy}
-                            className="h-10 rounded-md bg-slate-900 px-6 text-sm font-semibold text-white hover:bg-slate-700 disabled:opacity-50"
+                            className="h-10 rounded-md bg-emerald-700 px-6 text-sm font-semibold text-white hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 disabled:opacity-50"
                           >
                             {busy ? "Emitiendo…" : "Emitir factura"}
                           </button>
