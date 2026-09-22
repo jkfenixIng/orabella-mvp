@@ -79,3 +79,6 @@ Out: sedes UI (single-sede operations; service stays for login/select).
 - E7 evidence: user creation dialog with roles, null-sede users listed
   with tag, admin password reset with confirm + audit; typecheck 0;
   eslint clean; `npm test` 11 files, 183/183 passed.
+- E8 evidence: joint employee+login creation (no duplicated data),
+  server safety net (empleado role on create), auto-link both
+  directions; typecheck 0; eslint clean; `npm test` 183/183.
