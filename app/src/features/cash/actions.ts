@@ -3,7 +3,8 @@
 import { cookies } from "next/headers";
 import { revalidateTag } from "next/cache";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede, requireSession, requireAdminSession } from "@/src/features/admin/service";
+import { resolveSede } from "@/src/shared/lib/sede";
+import { requireSession, requireAdminSession } from "@/src/features/admin/service";
 import { accumulateDayTotals } from "./schemas";
 import {
   CashError,

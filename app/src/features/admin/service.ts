@@ -13,20 +13,30 @@ import {
   type TaxConfigInput,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
-import { getSessionUser } from "@/src/features/auth/service";
+import { getSessionUser, hashPassword } from "@/src/features/auth/service";
 import { unstable_cache } from "next/cache";
 
-export class AdminError extends Error {
-  readonly code: string;
-  readonly status: number;
+// Compatibilidad: la identidad de estos guardas vive en
+// `@/src/shared/lib/sede.ts` (import cruzado entre features resuelto).
+// Se re-exportan aquí para no romper importadores existentes; el código
+// nuevo importa desde shared. Misma clase: `instanceof` intacto.
+import {
+  requireSedeRole,
+  SedeError as AdminError,
+} from "@/src/shared/lib/sede";
+export {
+  requireSedeRole,
+  resolveSede,
+  SedeError as AdminError,
+} from "@/src/shared/lib/sede";
 
-  constructor(code: string, message: string, status = 400) {
-    super(message);
-    this.name = "AdminError";
-    this.code = code;
-    this.status = status;
-  }
-}
+/**
+ * Mapa de dominios (SRP, decisión pre-pruebas 2026-09-22):
+ * 1) Sesión (requireSession/requireAdminSession) 2) Sedes 3) Empleados+usuarios
+ * 4) Catálogos (servicios, impuestos, métodos de pago) 5) Roles.
+ * El split físico en módulos se difiere a post-pruebas para no romper
+ * los 12 importadores activos; el código nuevo usa `@/src/shared/lib/sede.ts`.
+ */
 
 /**
  * Cliente privilegiado bajo demanda (service_role, solo servidor).
@@ -62,16 +72,7 @@ function validationMessage(error: { issues: Array<{ message: string }> }): strin
 }
 
 // ------------------------------------------------------- roles por sede ---
-/**
- * TRA/NFR-02 + §10: verifica que la sesión tenga al menos uno de los roles
- * exigidos. Puro (sin red) para poder probarlo en unit tests.
- */
-export function requireSedeRole(roles: RoleCode[], allowed: RoleCode[]): void {
-  const permitted = allowed.some((role) => roles.includes(role));
-  if (!permitted) {
-    throw new AdminError("FORBIDDEN", "No tiene permiso para esta acción.", 403);
-  }
-}
+// `requireSedeRole` vive en `@/src/shared/lib/sede.ts` (re-exportado arriba).
 
 export interface AdminSession {
   userId: string;
@@ -110,13 +111,9 @@ export async function requireSession(token: string | null | undefined): Promise<
 }
 
 /**
- * El MVP opera una sola sede: el sede_id solicitado debe coincidir con el
- * de la sesión (si se omite, se usa el de la sesión).
+ * El MVP opera una sola sede (`resolveSede` en `@/src/shared/lib/sede.ts`,
+ * re-exportado arriba).
  */
-export function resolveSede(sessionSedeId: string, requestedSedeId?: string | null): string {
-  if (!requestedSedeId || requestedSedeId === sessionSedeId) return sessionSedeId;
-  throw new AdminError("FORBIDDEN", "No tiene acceso a esa sede.", 403);
-}
 
 // ----------------------------------------------------------------- sedes ---
 export interface SedeRow {
@@ -264,7 +261,8 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
   const db = await adminDb();
 
   // Vínculo automático por documento (no editable): el usuario de acceso
-  // es el de la sede con el mismo documento; sin coincidencia va sin link.
+  // es el de la sede con el mismo documento; sin coincidencia se crea
+  // automáticamente (nunca se pide creación manual).
   // El user_id que traiga el input se ignora a propósito.
   const { data: linked, error: linkedError } = await db
     .from("users")
@@ -273,7 +271,25 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
     .eq("id_number", input.document)
     .maybeSingle();
   if (linkedError) throw new AdminError("INTERNAL", "Error interno.", 500);
-  const userId = (linked as { id: string } | null)?.id ?? null;
+  let userId = (linked as { id: string } | null)?.id ?? null;
+  if (!userId && !input.id) {
+    const { data: createdUser, error: createError } = await db
+      .from("users")
+      .insert({
+        sede_id: input.sede_id,
+        email: input.email?.trim() ? input.email.trim() : null,
+        phone: input.phone ?? null,
+        id_type: "CC",
+        id_number: input.document,
+        password_hash: await hashPassword(input.document),
+        full_name: input.full_name,
+        must_change_password: true,
+      })
+      .select("id")
+      .single();
+    if (createError || !createdUser) throw new AdminError("INTERNAL", "Error interno.", 500);
+    userId = (createdUser as { id: string }).id;
+  }
   if (userId) {
     let takenQuery = db.from("employees").select("id").eq("user_id", userId).limit(1);
     if (input.id) takenQuery = takenQuery.neq("id", input.id);

@@ -2,7 +2,7 @@
 
 import { cookies } from "next/headers";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/features/admin/service";
+import { resolveSede } from "@/src/shared/lib/sede";
 import {
   InventoryError,
   getKardex,

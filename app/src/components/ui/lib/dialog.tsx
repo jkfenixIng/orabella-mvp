@@ -81,7 +81,7 @@ const DialogOverlay = React.forwardRef<
   <DialogPrimitive.Overlay
     ref={ref}
     className={cn(
-      'fixed inset-0 z-40 bg-black/60 animate-in data-[state=open]:fade-in data-[state=closed]:fade-out-0 data-[state=closed]:duration-150',
+        'fixed inset-0 z-40 bg-black/60 transition-opacity duration-150 data-[state=open]:opacity-100 data-[state=closed]:opacity-0',
       className,
     )}
     {...props}
@@ -94,11 +94,11 @@ const DialogContent = React.forwardRef<
   DialogContentProps
 >(({ className, children, ...props }, ref) => (
   <DialogPrimitive.Portal>
-    <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm data-[state=open]:animate-in data-[state=open]:fade-in data-[state=closed]:animate-out data-[state=closed]:fade-out data-[state=closed]:duration-150" />
+    <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm transition-opacity duration-150 data-[state=open]:opacity-100 data-[state=closed]:opacity-0" />
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
-        'fixed left-1/2 top-1/2 z-50 grid w-full max-w-lg -translate-x-1/2 -translate-y-1/2 max-h-[calc(100vh-2rem)] overflow-y-auto rounded-lg border border-border-color bg-surface p-6 shadow-xl outline-none animate-in data-[state=open]:fade-in data-[state=open]:zoom-in-95 data-[state=open]:duration-150 data-[state=closed]:fade-out data-[state=closed]:zoom-out-95 data-[state=closed]:duration-100 dark:border-border-color-2 dark:bg-surface',
+        'fixed left-1/2 top-1/2 z-50 grid w-full max-w-lg -translate-x-1/2 -translate-y-1/2 max-h-[calc(100vh-2rem)] overflow-y-auto rounded-lg border border-border-color bg-surface p-6 shadow-xl outline-none transition duration-150 data-[state=open]:scale-100 data-[state=open]:opacity-100 data-[state=closed]:scale-95 data-[state=closed]:opacity-0 dark:border-border-color-2 dark:bg-surface',
         className,
       )}
       {...props}
