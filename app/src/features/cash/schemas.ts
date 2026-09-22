@@ -13,16 +13,18 @@ export interface MethodDifference {
 
 /**
  * CAJ-03/04: total digital esperado al cierre = saldo de apertura del turno
- * más lo cobrado en el turno (el "total en la aplicación"). Puro para
- * probarlo sin base de datos.
+ * más lo cobrado en el turno menos lo pagado inmediato (el "total en la
+ * aplicación"). Puro para probarlo sin base de datos.
  */
-export function expectedDigitalTotal(openAmount: number, paidAmount: number): number {
-  return roundMoney(roundMoney(openAmount) + roundMoney(paidAmount));
+export function expectedDigitalTotal(openAmount: number, paidAmount: number, paidOut = 0): number {
+  return roundMoney(roundMoney(openAmount) + roundMoney(paidAmount) - roundMoney(paidOut));
 }
 
 export interface ShiftCountMaps {
   paid: Map<string, number>;
   open: Map<string, number>;
+  /** Pagado inmediato por método (descuenta del esperado). */
+  paidOut?: Map<string, number>;
   /** Null cuando el turno sigue abierto (aún no hay conteo de cierre). */
   closed: Map<string, number> | null;
 }
@@ -47,10 +49,14 @@ export function buildMethodViews(maps: ShiftCountMaps): {
     .map(([method_code, amount]) => ({ method_code, amount: roundMoney(amount) }));
   const diferencias: MethodDifference[] = [];
   if (maps.closed) {
-    const codes = new Set([...maps.closed.keys(), ...maps.open.keys(), ...maps.paid.keys()]);
+    const codes = new Set([...maps.closed.keys(), ...maps.open.keys(), ...maps.paid.keys(), ...(maps.paidOut?.keys() ?? [])]);
     codes.delete("efectivo");
     for (const code of codes) {
-      const expected = expectedDigitalTotal(maps.open.get(code) ?? 0, maps.paid.get(code) ?? 0);
+      const expected = expectedDigitalTotal(
+        maps.open.get(code) ?? 0,
+        maps.paid.get(code) ?? 0,
+        maps.paidOut?.get(code) ?? 0,
+      );
       const declared = roundMoney(maps.closed.get(code) ?? 0);
       if (!moneyEquals(declared, expected)) {
         diferencias.push({ method_code: code, expected, declared, difference: roundMoney(declared - expected) });

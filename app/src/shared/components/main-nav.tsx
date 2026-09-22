@@ -46,13 +46,6 @@ const NAV_GROUPS: NavGroup[] = [
           Icon: Package,
           roles: ["admin", "caja"],
         },
-        {
-          href: "/admin",
-          label: "Administración",
-          description: "Empleados, servicios y precios",
-          Icon: Settings,
-          roles: ["admin"],
-        },
       ],
   },
   {
@@ -79,6 +72,13 @@ const NAV_GROUPS: NavGroup[] = [
     id: "control",
     label: "Control",
       links: [
+        {
+          href: "/admin",
+          label: "Administración",
+          description: "Empleados, servicios y precios",
+          Icon: Settings,
+          roles: ["admin"],
+        },
         {
           href: "/alerts",
           label: "Alertas",

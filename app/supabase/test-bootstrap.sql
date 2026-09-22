@@ -191,10 +191,14 @@ CREATE TABLE public.employees (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   sede_id uuid NOT NULL REFERENCES public.sedes (id),
   user_id uuid NULL UNIQUE REFERENCES public.users (id) ON DELETE SET NULL,
+  full_name text NOT NULL DEFAULT '',
   employee_code text NULL,
   document text NOT NULL,
   phone text,
   position text,
+  payout_mode text NOT NULL DEFAULT 'nomina' CHECK (payout_mode IN ('nomina', 'inmediato')),
+  email text NULL,
+  birth_date date NULL,
   pay_type text NOT NULL CHECK (pay_type IN ('fijo', 'porcentaje', 'mixto')),
   salary_fixed numeric(12, 2) NULL CHECK (salary_fixed IS NULL OR salary_fixed >= 0),
   commission_percent numeric(5, 2) NULL CHECK (commission_percent IS NULL OR (commission_percent >= 0 AND commission_percent <= 100)),
@@ -219,6 +223,57 @@ CREATE INDEX idx_employees_user_id ON public.employees (user_id);
 CREATE TRIGGER trg_employees_updated_at
   BEFORE UPDATE ON public.employees
   FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
+
+-- ------------------------------------------------------- comisiones (016) ---
+CREATE TABLE public.commission_rules (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  sede_id uuid NOT NULL REFERENCES public.sedes (id),
+  item_type text NOT NULL CHECK (item_type IN ('producto', 'servicio')),
+  item_id uuid NOT NULL,
+  employee_id uuid NOT NULL REFERENCES public.employees (id) ON DELETE CASCADE,
+  percent numeric(5, 2) NULL CHECK (percent IS NULL OR (percent >= 0 AND percent <= 100)),
+  amount numeric(12, 2) NULL CHECK (amount IS NULL OR amount >= 0),
+  CHECK (percent IS NOT NULL OR amount IS NOT NULL),
+  is_active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX uq_commission_rule
+  ON public.commission_rules (sede_id, item_type, item_id, employee_id);
+CREATE INDEX idx_commission_rules_lookup
+  ON public.commission_rules (sede_id, item_type, item_id)
+  WHERE is_active;
+
+CREATE TABLE public.commission_payouts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  sede_id uuid NOT NULL REFERENCES public.sedes (id),
+  employee_id uuid NOT NULL REFERENCES public.employees (id) ON DELETE RESTRICT,
+  invoice_id uuid NOT NULL REFERENCES public.invoices (id) ON DELETE RESTRICT,
+  cash_shift_id uuid NOT NULL REFERENCES public.cash_shifts (id) ON DELETE RESTRICT,
+  method_code text NOT NULL,
+  base_subtotal numeric(12, 2) NOT NULL CHECK (base_subtotal >= 0),
+  percent_applied numeric(5, 2) NULL,
+  fixed_applied numeric(12, 2) NULL,
+  amount numeric(12, 2) NOT NULL CHECK (amount > 0),
+  paid_by uuid NULL REFERENCES public.users (id) ON DELETE SET NULL,
+  paid_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_commission_payouts_invoice_employee
+  ON public.commission_payouts (invoice_id, employee_id);
+
+CREATE INDEX idx_commission_payouts_sede_shift
+  ON public.commission_payouts (sede_id, cash_shift_id);
+CREATE INDEX idx_commission_payouts_employee
+  ON public.commission_payouts (employee_id);
+
+ALTER TABLE public.commission_rules ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.commission_payouts ENABLE ROW LEVEL SECURITY;
+CREATE POLICY pol_commission_rules_sede_isolation ON public.commission_rules
+  FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY pol_commission_payouts_sede_isolation ON public.commission_payouts
+  FOR ALL USING (true) WITH CHECK (true);
 
 -- -------------------------------------------------------------- services ---
 -- ADM-05: catálogo de servicios facturables con rango de duración
@@ -630,6 +685,7 @@ CREATE TABLE public.invoice_items (
   unit_price numeric(12, 2) NOT NULL CHECK (unit_price >= 0),
   discount numeric(12, 2) NOT NULL DEFAULT 0 CHECK (discount >= 0),
   subtotal numeric(12, 2) NOT NULL CHECK (subtotal >= 0),
+  no_commission boolean NOT NULL DEFAULT false,
   -- Solo un origen por línea (FAC-01): producto exige product_id,
   -- servicio exige service_id, custom exige custom_name con valor.
   CHECK (
@@ -1786,44 +1842,44 @@ BEGIN
   -- --------------------------------------- empleados (10, Sonia mixta '13') ---
   -- Códigos con valor únicos por sede; dos sin código (NULL y vacío) para
   -- ejercitar la unicidad parcial ADM-03.
-  INSERT INTO public.employees (sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, '01', '10000001', '3001110101', 'Administradora', 'fijo', 1500000, NULL FROM public.users u WHERE u.id_number = '10000001'
+  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
+  SELECT v_sede, u.id, u.full_name, '01', '10000001', '3001110101', 'Administradora', 'fijo', 1500000, NULL FROM public.users u WHERE u.id_number = '10000001'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, '02', '10000002', '3001110102', 'Estilista', 'porcentaje', NULL, 30 FROM public.users u WHERE u.id_number = '10000002'
+  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
+  SELECT v_sede, u.id, u.full_name, '02', '10000002', '3001110102', 'Estilista', 'porcentaje', NULL, 30 FROM public.users u WHERE u.id_number = '10000002'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, '03', '10000003', '3001110103', 'Manicurista', 'mixto', 800000, 20 FROM public.users u WHERE u.id_number = '10000003'
+  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
+  SELECT v_sede, u.id, u.full_name, '03', '10000003', '3001110103', 'Manicurista', 'mixto', 800000, 20 FROM public.users u WHERE u.id_number = '10000003'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, '04', '10000004', '3001110104', 'Barbero', 'porcentaje', NULL, 35 FROM public.users u WHERE u.id_number = '10000004'
+  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
+  SELECT v_sede, u.id, u.full_name, '04', '10000004', '3001110104', 'Barbero', 'porcentaje', NULL, 35 FROM public.users u WHERE u.id_number = '10000004'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, NULL, '10000005', '3001110105', 'Recepcionista', 'fijo', 1300000, NULL FROM public.users u WHERE u.id_number = '10000005'
+  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
+  SELECT v_sede, u.id, u.full_name, NULL, '10000005', '3001110105', 'Recepcionista', 'fijo', 1300000, NULL FROM public.users u WHERE u.id_number = '10000005'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, '', '10000006', '3001110106', 'Auxiliar', 'fijo', 1200000, NULL FROM public.users u WHERE u.id_number = '10000006'
+  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
+  SELECT v_sede, u.id, u.full_name, '', '10000006', '3001110106', 'Auxiliar', 'fijo', 1200000, NULL FROM public.users u WHERE u.id_number = '10000006'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, '07', '10000007', '3001110107', 'Cajera', 'fijo', 1400000, NULL FROM public.users u WHERE u.id_number = '10000007'
+  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
+  SELECT v_sede, u.id, u.full_name, '07', '10000007', '3001110107', 'Cajera', 'fijo', 1400000, NULL FROM public.users u WHERE u.id_number = '10000007'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, '08', '10000008', '3001110108', 'Cajero', 'fijo', 1400000, NULL FROM public.users u WHERE u.id_number = '10000008'
+  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
+  SELECT v_sede, u.id, u.full_name, '08', '10000008', '3001110108', 'Cajero', 'fijo', 1400000, NULL FROM public.users u WHERE u.id_number = '10000008'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, '09', '10000009', '3001110109', 'Colorista', 'mixto', 900000, 25 FROM public.users u WHERE u.id_number = '10000009'
+  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
+  SELECT v_sede, u.id, u.full_name, '09', '10000009', '3001110109', 'Colorista', 'mixto', 900000, 25 FROM public.users u WHERE u.id_number = '10000009'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, '13', '10000013', '3001110113', 'Estilista senior', 'mixto', 1000000, 30 FROM public.users u WHERE u.id_number = '10000013'
+  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent)
+  SELECT v_sede, u.id, u.full_name, '13', '10000013', '3001110113', 'Estilista senior', 'mixto', 1000000, 30 FROM public.users u WHERE u.id_number = '10000013'
   ON CONFLICT (user_id) DO NOTHING;
 
   -- ----------------------------------------------- servicios (4, min/max) ---
