@@ -247,14 +247,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
       parsedPortions.push({ method_code: portion.method_code, amount });
     }
     setBusy(true);
-    const result: ActionResult<InvoiceDetail> = await createInvoiceAction({
-      client_name: clientName,
-      client_document: clientDocument.trim() === "" ? null : clientDocument,
-      items: parsedItems,
-      discount: parsedDiscount,
-      payments: parsedPortions,
-    });
-    setBusy(false);
+    let result: ActionResult<InvoiceDetail>;
+    try {
+      result = await createInvoiceAction({
+        client_name: clientName,
+        client_document: clientDocument.trim() === "" ? null : clientDocument,
+        items: parsedItems,
+        discount: parsedDiscount,
+        payments: parsedPortions,
+      });
+    } finally {
+      setBusy(false);
+    }
     if (!result.success) {
       setError(`[${result.code}] ${result.message}`);
       return;
@@ -277,10 +281,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setError(null);
     setNotice(null);
     setBusy(true);
-    const result: ActionResult<InvoiceDetail> = await annulInvoiceAction(detail.invoice.id, {
-      motivo,
-    });
-    setBusy(false);
+    let result: ActionResult<InvoiceDetail>;
+    try {
+      result = await annulInvoiceAction(detail.invoice.id, {
+        motivo,
+      });
+    } finally {
+      setBusy(false);
+    }
     if (!result.success) {
       setError(`[${result.code}] ${result.message}`);
       return;
@@ -301,10 +309,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setError(null);
     setNotice(null);
     setBusy(true);
-    const result: ActionResult<InvoiceDetail> = await splitPaymentAction(detail.invoice.id, {
-      portions: [{ method_code: splitDraft.method_code, amount }],
-    });
-    setBusy(false);
+    let result: ActionResult<InvoiceDetail>;
+    try {
+      result = await splitPaymentAction(detail.invoice.id, {
+        portions: [{ method_code: splitDraft.method_code, amount }],
+      });
+    } finally {
+      setBusy(false);
+    }
     if (!result.success) {
       setError(`[${result.code}] ${result.message}`);
       return;
@@ -318,6 +330,30 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setSplitDraft({ method_code: "efectivo", amount: "" });
     await applyFilters();
   }
+
+  // Hoja factura: totales vivos del borrador (solo presentación; la verdad la calcula el servidor).
+  const todayStr = new Date().toLocaleDateString("es-CO", { year: "numeric", month: "long", day: "numeric" });
+  const draftSubtotal = items.reduce((acc, item) => {
+    const qty = toNumber(item.qty) ?? 0;
+    const price = toNumber(item.unit_price) ?? 0;
+    return acc + qty * price;
+  }, 0);
+  const draftDiscount = toNumber(discount) ?? 0;
+  const draftTotal = Math.max(0, draftSubtotal - draftDiscount);
+
+  function draftItemName(item: ItemDraft): string {
+    if (item.item_type === "producto") {
+      return props.products.find((row) => row.id === item.ref_id)?.name ?? "Producto por elegir";
+    }
+    if (item.item_type === "servicio") {
+      return props.services.find((row) => row.id === item.ref_id)?.name ?? "Servicio por elegir";
+    }
+    return item.custom_name.trim() === "" ? "Ítem personalizado" : item.custom_name;
+  }
+
+  // Papel factura: paleta clara fija a propósito (documento, no tema).
+  const paperInputClass =
+    "flex h-10 w-full rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-slate-500 disabled:cursor-not-allowed disabled:opacity-50";
 
   return (
     <div className="flex min-h-0 flex-col gap-6">
@@ -342,216 +378,230 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     Emitir factura
                   </Button>
                 </DialogTrigger>
-                <DialogContent className="max-w-3xl">
-                  <Card className="max-h-[calc(100dvh-2rem)] overflow-y-auto">
-                    <CardHeader>
-                      <CardTitle>Emitir factura</CardTitle>
-                      <CardDescription>Complete los datos y los ítems de la factura.</CardDescription>
-                    </CardHeader>
-                    <CardContent>
-                      <form onSubmit={submitInvoice} className="flex flex-col gap-4">
-                        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                          <Label>
-                            Cliente
-                            <Input
-                              className={inputClass}
-                              value={clientName}
-                              onChange={(event) => setClientName(event.target.value)}
-                              placeholder="Nombre del cliente"
-                              required
-                            />
-                          </Label>
-                          <Label>
-                            Documento (opcional)
-                            <Input
-                              className={inputClass}
-                              value={clientDocument}
-                              onChange={(event) => setClientDocument(event.target.value)}
-                              placeholder="CC / NIT"
-                            />
-                          </Label>
-                          <Label>
-                            Descuento factura
-                            <Input
-                              className={inputClass}
-                              value={formatMoneyInput(discount)}
-                              onChange={(event) => setDiscount(stripMoneyInput(event.target.value))}
-                              placeholder="0"
-                              inputMode="numeric"
-                            />
-                          </Label>
+                <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none">
+                  <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
+                    <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
+                      <div className="flex flex-wrap items-start justify-between gap-4">
+                        <div>
+                          <p className="text-xl font-black tracking-tight">ORABELLA</p>
+                          <p className="text-xs text-slate-500">Belleza · Factura de venta</p>
                         </div>
+                        <div className="text-right">
+                          <p className="text-lg font-bold">FACTURA DE VENTA</p>
+                          <p className="text-sm text-slate-500">N.º por asignar · {todayStr}</p>
+                          <span className="mt-1 inline-block rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800">
+                            Borrador
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                    <form onSubmit={submitInvoice} className="flex flex-col gap-5 px-6 py-5 sm:px-8">
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        <label className="flex flex-col gap-1 text-sm font-medium">
+                          Señor(es)
+                          <input
+                            className={paperInputClass}
+                            value={clientName}
+                            onChange={(event) => setClientName(event.target.value)}
+                            placeholder="Nombre del cliente"
+                            required
+                          />
+                        </label>
+                        <label className="flex flex-col gap-1 text-sm font-medium">
+                          Documento (opcional)
+                          <input
+                            className={paperInputClass}
+                            value={clientDocument}
+                            onChange={(event) => setClientDocument(event.target.value)}
+                            placeholder="CC / NIT"
+                          />
+                        </label>
+                      </div>
 
-                        <div className="flex flex-col gap-3">
-                          {items.map((item, index) => (
-                            <fieldset key={index} className="rounded-lg border border-color-2 p-3 dark:border-border-color">
-                              <legend className="px-1 text-xs text-text-secondary">Ítem {index + 1}</legend>
-                              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                                <Label className="sm:col-span-2 lg:col-span-1">
-                                  Tipo
-                                  <Select
-                                    value={item.item_type}
-                                    onValueChange={(value) => {
-                                      const type = value as ItemDraft["item_type"];
-                                      patchItem(index, { item_type: type, ref_id: "", custom_name: "", unit_price: "" });
-                                    }}
-                                  >
-                                    <SelectTrigger className={inputClass} aria-required="true">
-                                      <SelectValue placeholder="Seleccione un tipo" />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                      <SelectItem value="producto">Producto</SelectItem>
-                                      <SelectItem value="servicio">Servicio</SelectItem>
-                                      <SelectItem value="custom">Personalizado</SelectItem>
-                                    </SelectContent>
-                                  </Select>
-                                </Label>
-                                {item.item_type === "producto" && (
-                                  <Label>
-                                    Producto
-                                    <Select
-                                      value={item.ref_id}
-                                      onValueChange={(value) => {
-                                        patchItem(index, { ref_id: value });
-                                        autofillPrice(index, "producto", value);
-                                      }}
-                                    >
-                                      <SelectTrigger className={inputClass} aria-required="true">
-                                        <SelectValue placeholder="Producto…" />
-                                      </SelectTrigger>
-                                      <SelectContent>
-                                        <SelectItem value="">Producto…</SelectItem>
-                                        {props.products
-                                          .filter((row) => row.is_active)
-                                          .map((row) => (
+                        <div className="overflow-x-auto rounded-lg border border-slate-200">
+                          <table className="w-full min-w-[820px] text-left text-sm text-slate-900">
+                            <thead>
+                              <tr className="bg-slate-100 text-xs uppercase tracking-wide text-slate-500">
+                                <th className="px-3 py-2">#</th>
+                                <th className="px-3 py-2">Cant.</th>
+                                <th className="px-3 py-2">Descripción</th>
+                                <th className="px-3 py-2">Empleado</th>
+                                <th className="px-3 py-2 text-right">V. unitario</th>
+                                <th className="px-3 py-2 text-right">Subtotal</th>
+                                <th className="px-3 py-2 text-center">Sin comis.</th>
+                                <th className="px-3 py-2"><span className="sr-only">Quitar</span></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {items.map((item, index) => {
+                                const lineQty = toNumber(item.qty) ?? 0;
+                                const linePrice = toNumber(item.unit_price) ?? 0;
+                                return (
+                                  <tr key={index} className="border-t border-slate-200 align-top">
+                                    <td className="px-3 py-2 font-semibold">{index + 1}</td>
+                                    <td className="px-3 py-2">
+                                      <input
+                                        className={`${paperInputClass} w-20`}
+                                        value={item.qty}
+                                        onChange={(event) => patchItem(index, { qty: event.target.value })}
+                                        placeholder="1"
+                                        inputMode="numeric"
+                                        required
+                                        aria-label={`Ítem ${index + 1} cantidad`}
+                                      />
+                                    </td>
+                                    <td className="min-w-[230px] px-3 py-2">
+                                      <Select
+                                        value={item.item_type}
+                                        onValueChange={(value) => {
+                                          const type = value as ItemDraft["item_type"];
+                                          patchItem(index, { item_type: type, ref_id: "", custom_name: "", unit_price: "" });
+                                        }}
+                                      >
+                                        <SelectTrigger className={paperInputClass} aria-label={`Ítem ${index + 1} tipo`}>
+                                          <SelectValue placeholder="Seleccione un tipo" />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                          <SelectItem value="producto">Producto</SelectItem>
+                                          <SelectItem value="servicio">Servicio</SelectItem>
+                                          <SelectItem value="custom">Personalizado</SelectItem>
+                                        </SelectContent>
+                                      </Select>
+                                      {item.item_type === "producto" && (
+                                        <Select
+                                          value={item.ref_id}
+                                          onValueChange={(value) => {
+                                            patchItem(index, { ref_id: value });
+                                            autofillPrice(index, "producto", value);
+                                          }}
+                                        >
+                                          <SelectTrigger className={`${paperInputClass} mt-2`} aria-label={`Ítem ${index + 1} producto`}>
+                                            <SelectValue placeholder="Producto…" />
+                                          </SelectTrigger>
+                                          <SelectContent>
+                                            <SelectItem value="">Producto…</SelectItem>
+                                            {props.products
+                                              .filter((row) => row.is_active)
+                                              .map((row) => (
+                                                <SelectItem key={row.id} value={row.id}>
+                                                  {row.name} (stock {row.stock_qty})
+                                                </SelectItem>
+                                              ))}
+                                          </SelectContent>
+                                        </Select>
+                                      )}
+                                      {item.item_type === "servicio" && (
+                                        <Select
+                                          value={item.ref_id}
+                                          onValueChange={(value) => {
+                                            patchItem(index, { ref_id: value });
+                                            autofillPrice(index, "servicio", value);
+                                          }}
+                                        >
+                                          <SelectTrigger className={`${paperInputClass} mt-2`} aria-label={`Ítem ${index + 1} servicio`}>
+                                            <SelectValue placeholder="Servicio…" />
+                                          </SelectTrigger>
+                                          <SelectContent>
+                                            <SelectItem value="">Servicio…</SelectItem>
+                                            {props.services
+                                              .filter((row) => row.is_active)
+                                              .map((row) => (
+                                                <SelectItem key={row.id} value={row.id}>
+                                                  {row.name}
+                                                </SelectItem>
+                                              ))}
+                                          </SelectContent>
+                                        </Select>
+                                      )}
+                                      {item.item_type === "custom" && (
+                                        <input
+                                          className={`${paperInputClass} mt-2`}
+                                          value={item.custom_name}
+                                          onChange={(event) => patchItem(index, { custom_name: event.target.value })}
+                                          placeholder="Descripción"
+                                          required
+                                          aria-label={`Ítem ${index + 1} descripción`}
+                                        />
+                                      )}
+                                      <p className="mt-1 text-xs text-slate-500">{draftItemName(item)}</p>
+                                    </td>
+                                    <td className="min-w-[150px] px-3 py-2">
+                                      <Select
+                                        value={item.employee_id}
+                                        onValueChange={(value) => patchItem(index, { employee_id: value })}
+                                      >
+                                        <SelectTrigger className={paperInputClass} aria-label={`Ítem ${index + 1} empleado`}>
+                                          <SelectValue placeholder="Empleado…" />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                          <SelectItem value="">Empleado…</SelectItem>
+                                          {props.employees.map((row) => (
                                             <SelectItem key={row.id} value={row.id}>
-                                              {row.name} (stock {row.stock_qty})
+                                              {row.document}
+                                              {row.employee_code ? ` (${row.employee_code})` : ""}
                                             </SelectItem>
                                           ))}
-                                      </SelectContent>
-                                    </Select>
-                                  </Label>
-                                )}
-                                {item.item_type === "servicio" && (
-                                  <Label>
-                                    Servicio
-                                    <Select
-                                      value={item.ref_id}
-                                      onValueChange={(value) => {
-                                        patchItem(index, { ref_id: value });
-                                        autofillPrice(index, "servicio", value);
-                                      }}
-                                    >
-                                      <SelectTrigger className={inputClass} aria-required="true">
-                                        <SelectValue placeholder="Servicio…" />
-                                      </SelectTrigger>
-                                      <SelectContent>
-                                        <SelectItem value="">Servicio…</SelectItem>
-                                        {props.services
-                                          .filter((row) => row.is_active)
-                                          .map((row) => (
-                                            <SelectItem key={row.id} value={row.id}>
-                                              {row.name}
-                                            </SelectItem>
-                                          ))}
-                                      </SelectContent>
-                                    </Select>
-                                  </Label>
-                                )}
-                                {item.item_type === "custom" && (
-                                  <Label className="sm:col-span-2 lg:col-span-3">
-                                    Descripción
-                                    <Input
-                                      className={inputClass}
-                                      value={item.custom_name}
-                                      onChange={(event) => patchItem(index, { custom_name: event.target.value })}
-                                      placeholder="Descripción"
-                                      required
-                                    />
-                                  </Label>
-                                )}
-                                <Label>
-                                  Empleado
-                                  <Select
-                                    value={item.employee_id}
-                                    onValueChange={(value) => patchItem(index, { employee_id: value })}
-                                  >
-                                    <SelectTrigger className={inputClass} aria-required="true">
-                                      <SelectValue placeholder="Empleado…" />
-                                    </SelectTrigger>
-                                    <SelectContent>
-                                      <SelectItem value="">Empleado…</SelectItem>
-                                      {props.employees.map((row) => (
-                                        <SelectItem key={row.id} value={row.id}>
-                                          {row.document}
-                                          {row.employee_code ? ` (${row.employee_code})` : ""}
-                                        </SelectItem>
-                                      ))}
-                                    </SelectContent>
-                                  </Select>
-                                </Label>
-                                <Label>
-                                  Cantidad
-                                  <Input
-                                    className={inputClass}
-                                    value={item.qty}
-                                    onChange={(event) => patchItem(index, { qty: event.target.value })}
-                                    placeholder="Cant."
-                                    inputMode="numeric"
-                                    required
-                                  />
-                                </Label>
-                                <Label>
-                                  Precio
-                                  <Input
-                                    className={inputClass}
-                                    value={formatMoneyInput(item.unit_price)}
-                                    onChange={(event) => patchItem(index, { unit_price: stripMoneyInput(event.target.value) })}
-                                    placeholder="Precio"
-                                    inputMode="numeric"
-                                    required
-                                  />
-                                </Label>
-                                <label className="flex items-center gap-2 text-sm text-text-secondary">
-                                  <Checkbox
-                                    checked={item.no_commission}
-                                    onCheckedChange={(checked) =>
-                                      patchItem(index, { no_commission: checked === true })
-                                    }
-                                    aria-label={`Ítem ${index + 1} sin comisión`}
-                                  />
-                                  Sin comisión
-                                </label>
-                              </div>
-                              {items.length > 1 && (
-                                <Button
-                                  type="button"
-                                  variant="outline"
-                                  size="sm"
-                                  className="mt-3"
-                                  onClick={() => setItems((prev) => prev.filter((_, i) => i !== index))}
-                                >
-                                  <Trash2 className="h-4 w-4" aria-hidden="true" />
-                                  Quitar
-                                </Button>
-                              )}
-                            </fieldset>
-                          ))}
+                                        </SelectContent>
+                                      </Select>
+                                    </td>
+                                    <td className="px-3 py-2">
+                                      <input
+                                        className={`${paperInputClass} w-28 text-right`}
+                                        value={formatMoneyInput(item.unit_price)}
+                                        onChange={(event) => patchItem(index, { unit_price: stripMoneyInput(event.target.value) })}
+                                        placeholder="0"
+                                        inputMode="numeric"
+                                        required
+                                        aria-label={`Ítem ${index + 1} precio`}
+                                      />
+                                    </td>
+                                    <td className="whitespace-nowrap px-3 py-2 text-right font-medium">
+                                      {formatMoney(lineQty * linePrice)}
+                                    </td>
+                                    <td className="px-3 py-2 text-center">
+                                      <Checkbox
+                                        checked={item.no_commission}
+                                        onCheckedChange={(checked) =>
+                                          patchItem(index, { no_commission: checked === true })
+                                        }
+                                        aria-label={`Ítem ${index + 1} sin comisión`}
+                                      />
+                                    </td>
+                                    <td className="px-3 py-2">
+                                      {items.length > 1 && (
+                                        <button
+                                          type="button"
+                                          aria-label={`Quitar ítem ${index + 1}`}
+                                          onClick={() => setItems((prev) => prev.filter((_, i) => i !== index))}
+                                          className="rounded-md border border-slate-300 p-2 text-slate-500 hover:bg-slate-100"
+                                        >
+                                          <Trash2 className="h-4 w-4" aria-hidden="true" />
+                                        </button>
+                                      )}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
                         </div>
 
-                        <Button
+                        <button
                           type="button"
-                          variant="outline"
                           onClick={() => setItems((prev) => [...prev, emptyItem()])}
+                          className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 text-sm font-medium text-slate-600 hover:bg-slate-50"
                         >
                           <Plus className="h-4 w-4" aria-hidden="true" />
                           Agregar ítem
-                        </Button>
+                        </button>
 
+                        <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500">
+                          Cobro inmediato (opcional)
+                        </h3>
                         <div className="flex flex-col gap-3">
                           {portions.map((portion, index) => (
                             <div key={index} className="flex flex-col gap-2 sm:flex-row sm:items-end">
-                              <Label className="min-w-0 flex-1">
+                              <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-slate-900">
                                 Método {index + 1}
                                 <Select
                                   value={portion.method_code}
@@ -561,7 +611,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     )
                                   }
                                 >
-                                  <SelectTrigger className={inputClass}>
+                                  <SelectTrigger className={paperInputClass}>
                                     <SelectValue placeholder="Método de pago" />
                                   </SelectTrigger>
                                   <SelectContent>
@@ -572,11 +622,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     ))}
                                   </SelectContent>
                                 </Select>
-                              </Label>
-                              <Label className="min-w-0 flex-1">
+                              </label>
+                              <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-slate-900">
                                 Monto (vacío = sin cobro inmediato)
-                                <Input
-                                  className={inputClass}
+                                <input
+                                  className={paperInputClass}
                                   value={formatMoneyInput(portion.amount)}
                                   onChange={(event) =>
                                     setPortions((prev) =>
@@ -586,41 +636,89 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   placeholder="0"
                                   inputMode="numeric"
                                 />
-                              </Label>
+                              </label>
                               {portions.length > 1 && (
-                                <Button
+                                <button
                                   type="button"
-                                  variant="outline"
-                                  size="sm"
                                   onClick={() => setPortions((prev) => prev.filter((_, i) => i !== index))}
+                                  className="flex h-10 items-center gap-1 rounded-md border border-slate-300 px-3 text-sm font-medium text-slate-600 hover:bg-slate-100"
                                 >
                                   <Trash2 className="h-4 w-4" aria-hidden="true" />
                                   Quitar
-                                </Button>
+                                </button>
                               )}
                             </div>
                           ))}
                         </div>
 
-                        <Button
+                        <button
                           type="button"
-                          variant="outline"
                           onClick={() => setPortions((prev) => [...prev, { method_code: "efectivo", amount: "" }])}
+                          className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 text-sm font-medium text-slate-600 hover:bg-slate-50"
                         >
                           <Banknote className="h-4 w-4" aria-hidden="true" />
                           Dividir cobro (agregar porción)
-                        </Button>
+                        </button>
+
+                        <div className="flex justify-end">
+                          <dl className="w-full max-w-xs space-y-1 text-sm text-slate-900">
+                            <div className="flex justify-between gap-3">
+                              <dt>Subtotal</dt>
+                              <dd className="font-medium">{formatMoney(draftSubtotal)}</dd>
+                            </div>
+                            <div className="flex items-center justify-between gap-3">
+                              <dt>
+                                <label className="font-medium">
+                                  Descuento
+                                  <span className="sr-only">Descuento factura</span>
+                                </label>
+                              </dt>
+                              <dd>
+                                <input
+                                  className={`${paperInputClass} h-9 w-28 text-right`}
+                                  value={formatMoneyInput(discount)}
+                                  onChange={(event) => setDiscount(stripMoneyInput(event.target.value))}
+                                  placeholder="0"
+                                  inputMode="numeric"
+                                  aria-label="Descuento factura"
+                                />
+                              </dd>
+                            </div>
+                            <div className="flex justify-between gap-3 text-slate-500">
+                              <dt>Impuestos</dt>
+                              <dd>se liquidan al emitir</dd>
+                            </div>
+                            <div className="flex justify-between gap-3 border-t-2 border-slate-900 pt-2 text-lg font-black">
+                              <dt>TOTAL</dt>
+                              <dd>{formatMoney(draftTotal)}</dd>
+                            </div>
+                          </dl>
+                        </div>
+
+                        {error && (
+                          <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+                            {error}
+                          </p>
+                        )}
+
+                        <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 pt-4">
+                          <button
+                            type="button"
+                            onClick={cancelCreate}
+                            className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                          >
+                            Cancelar
+                          </button>
+                          <button
+                            type="submit"
+                            disabled={busy}
+                            className="h-10 rounded-md bg-slate-900 px-6 text-sm font-semibold text-white hover:bg-slate-700 disabled:opacity-50"
+                          >
+                            {busy ? "Emitiendo…" : "Emitir factura"}
+                          </button>
+                        </div>
                       </form>
-                    </CardContent>
-                      <CardFooter className="border-t border-color-2 pt-4">
-                        <Button type="button" variant="outline" onClick={cancelCreate}>
-                          Cancelar
-                        </Button>
-                      <Button type="submit" disabled={busy}>
-                        {busy ? "Emitiendo…" : "Emitir factura"}
-                      </Button>
-                    </CardFooter>
-                  </Card>
+                  </div>
                 </DialogContent>
               </Dialog>
             )}
