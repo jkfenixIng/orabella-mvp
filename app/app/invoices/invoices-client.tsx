@@ -371,14 +371,16 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   else setCreateDialogOpen(open);
                 }}
               >
-                <DialogTrigger asChild>
-                  <Button variant="default">
-                    <Plus className="h-4 w-4" aria-hidden="true" />
-                    Emitir factura
-                  </Button>
-                </DialogTrigger>
-                <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none">
-                  <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
+                <button
+                  type="button"
+                  onClick={() => setCreateDialogOpen(true)}
+                  className="inline-flex h-10 items-center justify-center gap-2 whitespace-nowrap rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-all duration-200 hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 active:scale-[0.98]"
+                >
+                  <Plus className="h-4 w-4" aria-hidden="true" />
+                  Emitir factura
+                </button>
+                <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                  <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
                     <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
                       <div className="flex flex-wrap items-start justify-between gap-4">
                         <div>
@@ -386,7 +388,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           <p className="text-xs text-slate-500">Belleza · Factura de venta</p>
                         </div>
                         <div className="text-right">
-                          <p className="text-lg font-bold">FACTURA DE VENTA</p>
+                          <h2 className="text-lg font-bold">FACTURA DE VENTA</h2>
                           <p className="text-sm text-slate-500">N.º por asignar · {todayStr}</p>
                           <span className="mt-1 inline-block rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800">
                             Borrador
@@ -787,21 +789,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   }
                   setDetailDialogOpen(open);
                 }}>
-                  <DialogTrigger asChild>
-                    <Button
+                  <button
                       type="button"
-                      variant="outline"
-                      size="sm"
                       aria-label={`Ver detalle de la factura ${row.consecutive_number}`}
                       onClick={() => openDetail(row.id)}
+                      className="inline-flex h-9 items-center justify-center gap-2 whitespace-nowrap rounded-md border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 shadow-sm transition-all duration-200 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 focus-visible:ring-offset-2 active:scale-[0.98]"
                     >
                       <Eye className="h-4 w-4" aria-hidden="true" />
                       Ver detalle
-                    </Button>
-                  </DialogTrigger>
+                    </button>
                   {detail && (
-                    <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none">
-                      <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
+                    <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                      <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
                         <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
                           <div className="flex flex-wrap items-start justify-between gap-4">
                             <div>
@@ -809,12 +808,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               <p className="text-xs text-slate-500">Belleza · Factura de venta</p>
                             </div>
                             <div className="text-right">
-                              <p className="text-lg font-bold">
+                              <h2 className="text-lg font-bold">
                                 FACTURA #{detail.invoice.consecutive_number}{" "}
                                 <Badge variant={invoiceStatusVariant(detail.invoice.status)}>
                                   {detail.invoice.status}
                                 </Badge>
-                              </p>
+                              </h2>
                               <p className="text-sm text-slate-500">
                                 {new Date(detail.invoice.created_at).toLocaleDateString("es-CO", {
                                   year: "numeric",
