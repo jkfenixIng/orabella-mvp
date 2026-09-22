@@ -499,9 +499,9 @@ export async function upsertPaymentMethod(raw: unknown): Promise<PaymentMethodRo
 
 // ------------------------------------------------------------------ roles ---
 /**
- * ADM-04: reemplaza los roles de un usuario (incluye doble rol, p. ej.
- * empleado + caja). Surte efecto en el siguiente refresh de sesión porque
- * getSessionUser lee user_roles en cada request.
+ * ADM-04: reemplaza el rol de un usuario (uno solo). Surte efecto en el
+ * siguiente refresh de sesión porque getSessionUser lee user_roles en
+ * cada request.
  */
 export async function setUserRoles(raw: unknown): Promise<{ user_id: string; roles: RoleCode[] }> {
   const parsed = setUserRolesSchema.safeParse(raw);

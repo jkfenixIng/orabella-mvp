@@ -194,13 +194,13 @@ describe("admin schemas: impuestos y métodos (ADM-06/ADM-07)", () => {
     expect(paymentMethodSchema.safeParse({ ...base, code: "PSE" }).success).toBe(false);
   });
 
-  it("setUserRoles exige al menos un rol válido (ADM-04)", () => {
+  it("setUserRoles exige un solo rol válido (ADM-04)", () => {
     expect(
       setUserRolesSchema.safeParse({ user_id: SEDE_A, roles: ["admin"] }).success,
     ).toBe(true);
     expect(
       setUserRolesSchema.safeParse({ user_id: SEDE_A, roles: ["empleado", "caja"] }).success,
-    ).toBe(true);
+    ).toBe(false);
     expect(setUserRolesSchema.safeParse({ user_id: SEDE_A, roles: [] }).success).toBe(false);
     expect(setUserRolesSchema.safeParse({ user_id: SEDE_A, roles: ["dueño"] }).success).toBe(false);
   });

@@ -210,7 +210,7 @@ function EmployeesSection({
   const [filter, setFilter] = useState("");
   const [createLogin, setCreateLogin] = useState(true);
   const [loginIdType, setLoginIdType] = useState("CC");
-  const [loginRoles, setLoginRoles] = useState<RoleCode[]>(["empleado"]);
+  const [loginRole, setLoginRole] = useState<RoleCode>("empleado");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -237,7 +237,7 @@ function EmployeesSection({
     setEditingId(null);
     setCreateLogin(true);
     setLoginIdType("CC");
-    setLoginRoles(["empleado"]);
+    setLoginRole("empleado");
     setError(null);
     setNotice(null);
     setDialog({ mode: "create" });
@@ -247,8 +247,7 @@ function EmployeesSection({
     setEditingId(row.id);
     setCreateLogin(!row.user_id);
     setLoginIdType("CC");
-    setLoginRoles(["empleado"]);
-    setEditingId(row.id);
+    setLoginRole("empleado");
     setForm({
       full_name: row.full_name,
       document: row.document,
@@ -291,18 +290,13 @@ function EmployeesSection({
         setError("El correo del empleado es obligatorio para crear su acceso.");
         return;
       }
-      if (loginRoles.length === 0) {
-        setBusy(false);
-        setError("Asigne al menos un rol para el acceso.");
-        return;
-      }
       const created = await adminCreateUserAction({
         full_name: form.full_name,
         documento: form.document,
         id_type: loginIdType as "CC" | "CE" | "PPT" | "PEP" | "otro",
         email: form.email,
         phone: form.phone.trim() === "" ? undefined : form.phone,
-        roles: loginRoles,
+        roles: [loginRole],
         sede_id: sedeId,
       });
       if (!created.success) {
@@ -630,19 +624,14 @@ function EmployeesSection({
                     </select>
                   </label>
                   <fieldset className="flex flex-col gap-1 text-sm">
-                    <legend>Roles (al menos uno)</legend>
+                    <legend>Rol</legend>
                     {ROLE_OPTIONS.map((option) => (
                       <label key={option.value} className="flex items-center gap-1">
                         <input
-                          type="checkbox"
-                          checked={loginRoles.includes(option.value)}
-                          onChange={() =>
-                            setLoginRoles((prev) =>
-                              prev.includes(option.value)
-                                ? prev.filter((item) => item !== option.value)
-                                : [...prev, option.value],
-                            )
-                          }
+                          type="radio"
+                          name="empleado-rol"
+                          checked={loginRole === option.value}
+                          onChange={() => setLoginRole(option.value)}
                         />
                         {option.label}
                       </label>
@@ -1361,8 +1350,8 @@ const ROLE_OPTIONS: Array<{ value: RoleCode; label: string }> = [
 
 function UsersSection({ sedeId, initial, currentUserId }: { sedeId: string; initial: SedeUserRow[]; currentUserId: string }) {
   const [rows, setRows] = useState(initial);
-  const [drafts, setDrafts] = useState<Record<string, RoleCode[]>>(() =>
-    Object.fromEntries(initial.map((row) => [row.id, row.roles])),
+  const [selected, setSelected] = useState<Record<string, RoleCode | null>>(() =>
+    Object.fromEntries(initial.map((row) => [row.id, row.roles[0] ?? null])),
   );
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -1375,7 +1364,7 @@ function UsersSection({ sedeId, initial, currentUserId }: { sedeId: string; init
     id_type: "CC",
     email: "",
     phone: "",
-    roles: [] as RoleCode[],
+    role: "empleado" as RoleCode,
   });
 
   async function refreshUsers() {
@@ -1385,20 +1374,16 @@ function UsersSection({ sedeId, initial, currentUserId }: { sedeId: string; init
       return;
     }
     setRows(result.data);
-    setDrafts(Object.fromEntries(result.data.map((row) => [row.id, row.roles])));
+    setSelected(Object.fromEntries(result.data.map((row) => [row.id, row.roles[0] ?? null])));
   }
 
-  function toggleRole(userId: string, role: RoleCode) {
-    setDrafts((prev) => {
-      const current = prev[userId] ?? [];
-      const next = current.includes(role) ? current.filter((item) => item !== role) : [...current, role];
-      return { ...prev, [userId]: next };
-    });
+  function selectRole(userId: string, role: RoleCode) {
+    setSelected((prev) => ({ ...prev, [userId]: role }));
   }
 
   function isDirty(row: SedeUserRow): boolean {
-    const draft = [...(drafts[row.id] ?? row.roles)].sort().join(",");
-    return draft !== [...row.roles].sort().join(",");
+    const sel = selected[row.id] ?? null;
+    return sel !== null && (row.roles.length !== 1 || row.roles[0] !== sel);
   }
 
   async function handleCreateUser(event: FormEvent) {
@@ -1412,7 +1397,7 @@ function UsersSection({ sedeId, initial, currentUserId }: { sedeId: string; init
       id_type: newUser.id_type as "CC" | "CE" | "PPT" | "PEP" | "otro",
       email: newUser.email,
       phone: newUser.phone.trim() === "" ? undefined : newUser.phone,
-      roles: newUser.roles,
+      roles: [newUser.role],
       sede_id: sedeId,
     });
     setBusyId(null);
@@ -1421,7 +1406,7 @@ function UsersSection({ sedeId, initial, currentUserId }: { sedeId: string; init
       return;
     }
     setCreateOpen(false);
-    setNewUser({ full_name: "", documento: "", id_type: "CC", email: "", phone: "", roles: [] });
+    setNewUser({ full_name: "", documento: "", id_type: "CC", email: "", phone: "", role: "empleado" });
     setNotice("Usuario creado con su rol.");
     await refreshUsers();
   }
@@ -1441,9 +1426,9 @@ function UsersSection({ sedeId, initial, currentUserId }: { sedeId: string; init
   }
 
   async function handleSave(row: SedeUserRow) {
-    const roles = drafts[row.id] ?? row.roles;
-    if (roles.length === 0) {
-      setError("Asigne al menos un rol.");
+    const role = selected[row.id] ?? null;
+    if (!role) {
+      setError("Seleccione un rol.");
       setNotice(null);
       return;
     }
@@ -1452,7 +1437,7 @@ function UsersSection({ sedeId, initial, currentUserId }: { sedeId: string; init
     setNotice(null);
     const result: ActionResult<{ user_id: string; roles: RoleCode[] }> = await setUserRolesAction({
       user_id: row.id,
-      roles,
+      roles: [role],
     });
     setBusyId(null);
     if (!result.success) {
@@ -1462,8 +1447,8 @@ function UsersSection({ sedeId, initial, currentUserId }: { sedeId: string; init
     setRows((current) =>
       current.map((item) => (item.id === row.id ? { ...item, roles: result.data.roles } : item)),
     );
-    setDrafts((prev) => ({ ...prev, [row.id]: result.data.roles }));
-    setNotice(`Roles de ${row.full_name} actualizados.`);
+    setSelected((prev) => ({ ...prev, [row.id]: result.data.roles[0] ?? null }));
+    setNotice(`Rol de ${row.full_name} actualizado.`);
   }
 
   return (
@@ -1486,14 +1471,15 @@ function UsersSection({ sedeId, initial, currentUserId }: { sedeId: string; init
                 <tr className="text-left text-slate-600 dark:text-slate-300">
                   <th className="whitespace-nowrap py-1 pr-3">Nombre</th>
                   <th className="whitespace-nowrap py-1 pr-3">Documento</th>
-                  <th className="whitespace-nowrap py-1 pr-3">Roles</th>
+                  <th className="whitespace-nowrap py-1 pr-3">Actual</th>
+                  <th className="whitespace-nowrap py-1 pr-3">Rol</th>
                   <th className="whitespace-nowrap py-1 pr-3">Guardar</th>
                   <th className="whitespace-nowrap py-1 pr-3">Clave</th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((row) => {
-                  const draft = drafts[row.id] ?? row.roles;
+                  const sel = selected[row.id] ?? row.roles[0] ?? null;
                   const isSelf = row.id === currentUserId;
                   return (
                     <tr key={row.id} className="border-t border-slate-200 dark:border-slate-700">
@@ -1507,14 +1493,18 @@ function UsersSection({ sedeId, initial, currentUserId }: { sedeId: string; init
                       </td>
                       <td className="whitespace-nowrap py-1 pr-3">{row.id_number}</td>
                       <td className="whitespace-nowrap py-1 pr-3">
+                        {row.roles.length > 0 ? row.roles.join(", ") : "Sin rol"}
+                      </td>
+                      <td className="whitespace-nowrap py-1 pr-3">
                         <span className="flex flex-wrap gap-3">
                           {ROLE_OPTIONS.map((option) => (
                             <label key={option.value} className="flex items-center gap-1">
                               <input
-                                type="checkbox"
-                                checked={draft.includes(option.value)}
-                                disabled={isSelf && option.value === "admin" && draft.includes("admin")}
-                                onChange={() => toggleRole(row.id, option.value)}
+                                type="radio"
+                                name={`rol-${row.id}`}
+                                checked={sel === option.value}
+                                disabled={isSelf}
+                                onChange={() => selectRole(row.id, option.value)}
                               />
                               {option.label}
                             </label>
@@ -1642,26 +1632,20 @@ function UsersSection({ sedeId, initial, currentUserId }: { sedeId: string; init
                 className={inputClass}
               />
             </label>
-            <fieldset className="flex flex-col gap-1 text-sm">
-              <legend>Roles (al menos uno)</legend>
-              {ROLE_OPTIONS.map((option) => (
-                <label key={option.value} className="flex items-center gap-1">
-                  <input
-                    type="checkbox"
-                    checked={newUser.roles.includes(option.value)}
-                    onChange={() =>
-                      setNewUser((prev) => ({
-                        ...prev,
-                        roles: prev.roles.includes(option.value)
-                          ? prev.roles.filter((item) => item !== option.value)
-                          : [...prev.roles, option.value],
-                      }))
-                    }
-                  />
-                  {option.label}
-                </label>
-              ))}
-            </fieldset>
+                  <fieldset className="flex flex-col gap-1 text-sm">
+                    <legend>Rol</legend>
+                    {ROLE_OPTIONS.map((option) => (
+                      <label key={option.value} className="flex items-center gap-1">
+                        <input
+                          type="radio"
+                          name="nuevo-rol"
+                          checked={newUser.role === option.value}
+                          onChange={() => setNewUser({ ...newUser, role: option.value })}
+                        />
+                        {option.label}
+                      </label>
+                    ))}
+                  </fieldset>
             <DialogFooter className="sm:col-span-2">
               <button
                 type="button"
