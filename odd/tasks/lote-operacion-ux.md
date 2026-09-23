@@ -44,7 +44,7 @@ Out:
 - [x] F2 Mensajes caja en factura (HECHO bf7dc96 2026-09-23; sin turno/turno ajeno con dueño en emitir/editar/pagar; anular admin-only intacto; aviso temprano en crear).
 - [x] F3 Columna Cerrada (HECHO 22cb0ac 2026-09-23; 025 closed_at aplicada por usuario en PRUEBAS).
 - [x] B1 Stock no descuenta (HECHO 30a6ae3 2026-09-23; descuento único al EMITIR vía deductStock en inventory/service; 210/210 verde).
-- [ ] C1 Caja todos los pagos + dueño del turno: columnas todos los métodos (desglose ventas) + "Turno actual de {nombre}".
+- [x] C1 Caja todos los pagos + dueño del turno (HECHO ceeac9a 2026-09-23; columnas todos los activos no-efectivo aunque no arqueables; título "Turno actual de {nombre}").
 - [ ] V1 Vales gating + layout: sin config → mensaje y bloqueo; botón-crear abre modal; lista debajo.
 - [ ] V2 Config vales wizard: días todos/indicados → topes sin/diarios/semanales/ambos → tope por día o general.
 - [ ] G1 Validación temprana caja: al abrir crear/editar factura y crear vale (factura o vale), aviso inmediato si no hay turno o no es propio.
@@ -71,13 +71,15 @@ Módulos Facturación, Inventario, Servicios/Catálogos, Alertas, Caja, Vales. R
 ## Progress
 - 2026-09-23: Doc creado + mapa read-only. Base: migraciones hasta 024 aplicadas por usuario.
 - 2026-09-23: F2 hecho (bf7dc96). Route: direct-inline (delegación imposible en este runtime, constancia). TDD: no configurado (sin runner declarado; verificación ordinaria typecheck+vitest full).
+- 2026-09-23: C1 hecho (ceeac9a). Route: direct-inline (2 archivos, writer trigger pero sin delegación posible).
 
 ## Verification evidence
 - F2 (bf7dc96): `npm run typecheck` 0 errores; `npm test` 11 archivos 210/210.
+- C1 (ceeac9a): `npm run typecheck` 0 errores; `npm test` 11 archivos 210/210.
 - (pendiente por item)
 
 ## Next step
-- C1 Caja todos los pagos + dueño del turno.
+- V1 Vales gating + layout.
 
 ## Route declaration
 - Delegated-direct por item (writer trigger 2+ archivos); inline solo mecánico de 1 archivo.
