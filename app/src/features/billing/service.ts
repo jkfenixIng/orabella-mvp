@@ -85,7 +85,7 @@ export interface InvoiceRow {
   id: string;
   sede_id: string;
   consecutive_number: number;
-  client_name: string;
+  client_name: string | null;
   client_document: string | null;
   subtotal: number;
   discount: number;

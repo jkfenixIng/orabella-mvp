@@ -474,21 +474,20 @@ export async function getOpenShift(sedeId: string): Promise<CashShiftRow | null>
 
 /** Turno abierto con nombre del que lo abrió (para validaciones de facturación). */
 export async function getOpenShiftWithOpener(sedeId: string): Promise<(CashShiftRow & { opener_name: string | null }) | null> {
+  // Dos queries simples a propósito: cash_shifts tiene DOS FK a users
+  // (opened_by y closed_by) y PostgREST no desambigua `users!inner`.
+  const shift = await getOpenShift(sedeId);
+  if (!shift) return null;
   const db = await cashDb();
-  const { data, error } = await db
-    .from("cash_shifts")
-    .select(`${SHIFT_SELECT}, users!inner(full_name)`)
-    .eq("sede_id", sedeId)
-    .eq("status", "abierto")
-    .order("opened_at", { ascending: false })
-    .limit(1)
+  const { data: user, error } = await db
+    .from("users")
+    .select("full_name")
+    .eq("id", shift.opened_by)
     .maybeSingle();
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  if (!data) return null;
-  const user = Array.isArray(data.users) ? data.users[0] : data.users;
   return {
-    ...(data as CashShiftRow),
-    opener_name: user?.full_name ?? null,
+    ...shift,
+    opener_name: (user as { full_name?: string | null } | null)?.full_name ?? null,
   };
 }
 

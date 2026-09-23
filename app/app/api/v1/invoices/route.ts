@@ -12,6 +12,7 @@ import {
 
 function billingErrorResponse(error: unknown) {
   if (error instanceof BillingError) return fail(error.code, error.message, error.status);
+  console.error("invoices POST non-billing error:", error instanceof Error ? (error.stack ?? error.message) : error);
   return fail("INTERNAL", "Error interno.", 500);
 }
 
