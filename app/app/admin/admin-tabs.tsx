@@ -13,7 +13,6 @@ import {
   setUserRolesAction,
   upsertEmployeeAction,
   upsertPaymentMethodAction,
-  upsertServiceAction,
   upsertTaxConfigAction,
 } from "@/src/features/admin/actions";
 import { setVoucherLimitsAction } from "@/src/features/payroll/actions";
@@ -31,18 +30,16 @@ import type {
   EmployeeRow,
   PaymentMethodRow,
   SedeUserRow,
-  ServiceRow,
   TaxConfigRow,
 } from "@/src/features/admin/service";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import type { VoucherSettingsRow } from "@/src/features/payroll/service";
 
-type Tab = "empleados" | "roles" | "servicios" | "impuestos" | "metodos" | "vales" | "caja";
+type Tab = "empleados" | "roles" | "impuestos" | "metodos" | "vales" | "caja";
 
 const TABS: Array<{ value: Tab; label: string }> = [
   { value: "empleados", label: "Empleados" },
   { value: "roles", label: "Roles" },
-  { value: "servicios", label: "Servicios" },
   { value: "impuestos", label: "Impuestos" },
   { value: "metodos", label: "Métodos de pago" },
   { value: "vales", label: "Vales" },
@@ -85,7 +82,6 @@ interface AdminTabsProps {
   currentUserId: string;
   initialEmployees: EmployeeRow[];
   initialUsers: SedeUserRow[];
-  initialServices: ServiceRow[];
   initialTaxes: TaxConfigRow[];
   initialMethods: PaymentMethodRow[];
   initialVoucherSettings: VoucherSettingsRow | null;
@@ -142,9 +138,6 @@ export function AdminTabs(props: AdminTabsProps) {
           initial={users}
           currentUserId={props.currentUserId}
         />
-      ) : null}
-      {tab === "servicios" ? (
-        <ServicesSection sedeId={props.sedeId} initial={props.initialServices} />
       ) : null}
       {tab === "impuestos" ? (
         <TaxesSection sedeId={props.sedeId} initial={props.initialTaxes} />
@@ -697,183 +690,6 @@ function EmployeesSection({
           </form>
         </DialogContent>
       </Dialog>
-    </div>
-  );
-}
-
-// --------------------------------------------------------------- servicios ---
-const EMPTY_SERVICE = {
-  name: "",
-  description: "",
-  price: "",
-  duracion_min: "",
-  duracion_max: "",
-  is_active: true,
-};
-
-function ServicesSection({ sedeId, initial }: { sedeId: string; initial: ServiceRow[] }) {
-  const [rows, setRows] = useState(initial);
-  const [form, setForm] = useState(EMPTY_SERVICE);
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  function startEdit(row: ServiceRow) {
-    setEditingId(row.id);
-    setForm({
-      name: row.name,
-      description: row.description ?? "",
-      price: String(row.price),
-      duracion_min: String(row.duracion_min),
-      duracion_max: String(row.duracion_max),
-      is_active: row.is_active,
-    });
-    setError(null);
-    setNotice(null);
-  }
-
-  async function handleSubmit(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError(null);
-    setNotice(null);
-    const result: ActionResult<ServiceRow> = await upsertServiceAction({
-      ...(editingId ? { id: editingId } : {}),
-      sede_id: sedeId,
-      name: form.name,
-      description: form.description.trim() === "" ? null : form.description,
-      price: toNumber(form.price) ?? 0,
-      duracion_min: toNumber(form.duracion_min) ?? 0,
-      duracion_max: toNumber(form.duracion_max) ?? 0,
-      is_active: form.is_active,
-    });
-    setBusy(false);
-    if (!result.success) {
-      setError(result.message);
-      return;
-    }
-    setRows((current) => {
-      const exists = current.some((row) => row.id === result.data.id);
-      if (exists) return current.map((row) => (row.id === result.data.id ? result.data : row));
-      return [...current, result.data];
-    });
-    setNotice(editingId ? "Servicio actualizado." : "Servicio creado.");
-    setEditingId(null);
-    setForm(EMPTY_SERVICE);
-  }
-
-  return (
-    <div className="flex flex-col gap-4">
-      <section className={sectionClass} aria-label="Listado de servicios">
-        <h2 className="text-lg font-semibold">Servicios ({rows.length})</h2>
-        {rows.length === 0 ? (
-          <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-            Aún no hay servicios en esta sede.
-          </p>
-        ) : (
-          <ul className="mt-2 flex flex-col gap-2">
-            {rows.map((row) => (
-              <li
-                key={row.id}
-                className="flex flex-wrap items-center justify-between gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-slate-800"
-              >
-                <span>
-                  <strong>{row.name}</strong> · ${row.price} · {row.duracion_min}–
-                  {row.duracion_max} min{!row.is_active ? " · inactivo" : ""}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => startEdit(row)}
-                  className="text-sm font-medium underline"
-                >
-                  Editar
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-
-      <section className={sectionClass} aria-label="Formulario de servicio">
-        <h2 className="text-lg font-semibold">{editingId ? "Editar servicio" : "Nuevo servicio"}</h2>
-        <form onSubmit={handleSubmit} className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <label className={labelClass}>
-            Nombre
-            <input
-              value={form.name}
-              onChange={(event) => setForm({ ...form, name: event.target.value })}
-              className={inputClass}
-            />
-          </label>
-          <label className={labelClass}>
-            Precio
-            <input
-              value={form.price}
-              onChange={(event) => setForm({ ...form, price: event.target.value })}
-              inputMode="decimal"
-              className={inputClass}
-            />
-          </label>
-          <label className={labelClass}>
-            Duración mínima (min)
-            <input
-              value={form.duracion_min}
-              onChange={(event) => setForm({ ...form, duracion_min: event.target.value })}
-              inputMode="numeric"
-              className={inputClass}
-            />
-          </label>
-          <label className={labelClass}>
-            Duración máxima (min)
-            <input
-              value={form.duracion_max}
-              onChange={(event) => setForm({ ...form, duracion_max: event.target.value })}
-              inputMode="numeric"
-              className={inputClass}
-            />
-          </label>
-          <label className={`${labelClass} sm:col-span-2`}>
-            Descripción
-            <input
-              value={form.description}
-              onChange={(event) => setForm({ ...form, description: event.target.value })}
-              className={inputClass}
-            />
-          </label>
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={form.is_active}
-              onChange={(event) => setForm({ ...form, is_active: event.target.checked })}
-            />
-            Activo
-          </label>
-          {error ? (
-            <p role="alert" className={errorClass}>
-              {error}
-            </p>
-          ) : null}
-          {notice ? <p className={okClass}>{notice}</p> : null}
-          <div className="flex gap-2">
-            <button type="submit" disabled={busy} className={buttonClass}>
-              {busy ? "Guardando…" : editingId ? "Guardar cambios" : "Crear servicio"}
-            </button>
-            {editingId ? (
-              <button
-                type="button"
-                onClick={() => {
-                  setEditingId(null);
-                  setForm(EMPTY_SERVICE);
-                }}
-                className="rounded border px-4 py-2 text-sm"
-              >
-                Cancelar
-              </button>
-            ) : null}
-          </div>
-        </form>
-      </section>
     </div>
   );
 }

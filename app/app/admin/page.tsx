@@ -6,7 +6,6 @@ import {
   listEmployees,
   listPaymentMethods,
   listSedeUsers,
-  listServices,
   listTaxes,
 } from "@/src/features/admin/service";
 import { getVoucherSettings } from "@/src/features/payroll/service";
@@ -42,11 +41,10 @@ export default async function AdminPage() {
     );
   }
 
-  const [employees, users, services, taxes, methods, voucherSettings, registers, denominations] =
+  const [employees, users, taxes, methods, voucherSettings, registers, denominations] =
     await Promise.all([
       listEmployees(sedeId),
       listSedeUsers(sedeId),
-      listServices(sedeId),
       listTaxes(sedeId),
       listPaymentMethods(sedeId),
       getVoucherSettings(sedeId),
@@ -60,7 +58,7 @@ export default async function AdminPage() {
         <div>
           <h1 className="text-3xl font-bold">Administración</h1>
           <p className="mt-2 text-slate-600 dark:text-slate-300">
-            Empleados, servicios, impuestos y métodos de pago de su sede.
+            Empleados, impuestos y métodos de pago de su sede.
           </p>
         </div>
       </header>
@@ -69,7 +67,6 @@ export default async function AdminPage() {
         currentUserId={session.user.id}
         initialEmployees={employees}
         initialUsers={users}
-        initialServices={services}
         initialTaxes={taxes}
         initialMethods={methods}
         initialVoucherSettings={voucherSettings}
