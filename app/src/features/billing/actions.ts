@@ -7,6 +7,7 @@ import { requireSession } from "@/src/features/admin/service";
 import {
   BillingError,
   annulInvoice,
+  countInvoices,
   createInvoice,
   getInvoiceDetail,
   listInvoices,
@@ -34,19 +35,31 @@ export async function listInvoicesAction(filters: {
   to?: string;
   user_id?: string;
   consecutive_number?: number;
+  closed_by?: string;
+  employee_id?: string;
+  page?: number;
+  pageSize?: number;
 } = {}) {
   try {
     const session = await requireSession(await sessionToken());
-    const data = await listInvoices(resolveSede(session.sedeId, filters.sede_id), {
+    const sedeId = resolveSede(session.sedeId, filters.sede_id);
+    const isManager = session.roles.includes("admin") || session.roles.includes("caja");
+    // Empleado: solo las propias (filtro forzado para que el total cuadre).
+    const effectiveUserId = isManager ? filters.user_id : session.userId;
+    const where = {
       status: filters.status || undefined,
       from: filters.from || undefined,
       to: filters.to || undefined,
-      user_id: filters.user_id,
+      user_id: effectiveUserId,
       consecutive_number: filters.consecutive_number,
-    });
-    const isManager = session.roles.includes("admin") || session.roles.includes("caja");
-    const scoped = isManager ? data : data.filter((row) => row.user_id === session.userId);
-    return { success: true as const, data: scoped };
+      closed_by: filters.closed_by || undefined,
+      employee_id: isManager ? filters.employee_id || undefined : undefined,
+    };
+    const [rows, total] = await Promise.all([
+      listInvoices(sedeId, { ...where, page: filters.page, pageSize: filters.pageSize }),
+      countInvoices(sedeId, where),
+    ]);
+    return { success: true as const, data: { rows, total } };
   } catch (error) {
     return toFailure(error);
   }

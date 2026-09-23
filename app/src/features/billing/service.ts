@@ -95,6 +95,7 @@ export interface InvoiceRow {
   status: string;
   user_id: string | null;
   cash_shift_id: string | null;
+  closed_by: string | null;
   cancel_reason: string | null;
   created_at: string;
 }
@@ -147,7 +148,7 @@ export interface InvoiceDetail {
 }
 
 const INVOICE_SELECT =
-  "id, sede_id, consecutive_number, client_name, client_document, subtotal, discount, tax, surcharge, total, status, user_id, cash_shift_id, cancel_reason, created_at";
+  "id, sede_id, consecutive_number, client_name, client_document, subtotal, discount, tax, surcharge, total, status, user_id, cash_shift_id, closed_by, cancel_reason, created_at";
 const ITEM_SELECT =
   "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission, commission_value, employees!inner(full_name, employee_code)";
 const TAX_SELECT = "id, invoice_id, tax_code, tax_name, percent, amount";
@@ -162,7 +163,21 @@ export interface InvoiceFilters {
   limit?: number;
   user_id?: string;
   consecutive_number?: number;
+  closed_by?: string;
+  employee_id?: string;
+  page?: number;
+  pageSize?: number;
 }
+
+/** Fila de lista: factura + quién abrió/cerró + empleados participantes. */
+export interface InvoiceListItem extends InvoiceRow {
+  user_name: string | null;
+  closed_by_name: string | null;
+  employee_names: string[];
+}
+
+/** Tamaño de página del listado de facturas. */
+export const INVOICE_PAGE_SIZE = 20;
 
 function dateBound(value: string, end: boolean): string {
   const trimmed = value.trim();
@@ -173,24 +188,43 @@ function dateBound(value: string, end: boolean): string {
   return trimmed;
 }
 
-/** Lista facturas de la sede con filtros de estado/fecha (más recientes primero). */
-export async function listInvoices(sedeId: string, filters: InvoiceFilters = {}): Promise<(InvoiceRow & { user_name: string | null })[]> {
+/** Lista facturas de la sede con filtros + paginación (más recientes primero). */
+export async function listInvoices(sedeId: string, filters: InvoiceFilters = {}): Promise<InvoiceListItem[]> {
   if (filters.status !== undefined && !["Emitida", "Pagada", "Anulada"].includes(filters.status)) {
     throw new BillingError("VALIDATION", "Estado de filtro inválido.", 400);
   }
-  const limit = filters.limit === undefined ? 50 : Math.min(100, Math.max(1, Math.floor(filters.limit)));
+  const pageSize =
+    filters.pageSize === undefined ? INVOICE_PAGE_SIZE : Math.min(100, Math.max(1, Math.floor(filters.pageSize)));
+  const page = filters.page === undefined ? 1 : Math.max(1, Math.floor(filters.page));
   const db = await billingDb();
+
+  // Filtro por empleado participante: primero los invoice_id con ese empleado.
+  let employeeInvoiceIds: string[] | null = null;
+  if (filters.employee_id) {
+    const { data: idRows, error: idError } = await db
+      .from("invoice_items")
+      .select("invoice_id")
+      .eq("employee_id", filters.employee_id)
+      .limit(2000);
+    if (idError) throw new BillingError("INTERNAL", "Error interno.", 500);
+    employeeInvoiceIds = [...new Set(((idRows ?? []) as Array<{ invoice_id: string }>).map((row) => row.invoice_id))];
+    if (employeeInvoiceIds.length === 0) return [];
+  }
+
   let query = db
     .from("invoices")
     .select(`${INVOICE_SELECT}, users!inner(full_name)`)
     .eq("sede_id", sedeId)
     .order("consecutive_number", { ascending: false })
-    .limit(limit);
+    .range((page - 1) * pageSize, page * pageSize - 1);
+  if (filters.limit !== undefined) query = query.limit(Math.min(100, Math.max(1, Math.floor(filters.limit))));
   if (filters.status) query = query.eq("status", filters.status);
   if (filters.from?.trim()) query = query.gte("created_at", dateBound(filters.from, false));
   if (filters.to?.trim()) query = query.lte("created_at", dateBound(filters.to, true));
   if (filters.user_id) query = query.eq("user_id", filters.user_id);
+  if (filters.closed_by) query = query.eq("closed_by", filters.closed_by);
   if (filters.consecutive_number !== undefined) query = query.eq("consecutive_number", filters.consecutive_number);
+  if (employeeInvoiceIds) query = query.in("id", employeeInvoiceIds);
   const { data, error } = await query;
   if (error) {
     // Diagnóstico servidor (no se expone al cliente): código/mensaje de PostgREST.
@@ -200,10 +234,82 @@ export async function listInvoices(sedeId: string, filters: InvoiceFilters = {})
   interface JoinedUser {
     users?: { full_name?: string | null } | null;
   }
-  return ((data ?? []) as Array<InvoiceRow & JoinedUser>).map((row) => ({
+  const rows = ((data ?? []) as Array<InvoiceRow & JoinedUser>).map((row) => ({
     ...row,
     user_name: row.users?.full_name ?? null,
-  })) as Array<InvoiceRow & { user_name: string | null }>;
+  }));
+  if (rows.length === 0) return [];
+
+  // Enriquecimiento: quién cerró + empleados participantes (sin N+1: 3 queries).
+  const ids = rows.map((row) => row.id);
+  const { data: itemRows, error: itemsError } = await db
+    .from("invoice_items")
+    .select("invoice_id, employee_id")
+    .in("invoice_id", ids)
+    .order("created_at")
+    .limit(2000);
+  if (itemsError) throw new BillingError("INTERNAL", "Error interno.", 500);
+  const empIds = [...new Set(((itemRows ?? []) as Array<{ employee_id: string }>).map((row) => row.employee_id))];
+  const closerIds = [...new Set(rows.map((row) => row.closed_by).filter((id): id is string => id !== null))];
+  const userIds = [...new Set([...empIds, ...closerIds])];
+  const nameByUser = new Map<string, string>();
+  if (userIds.length > 0) {
+    const [{ data: empRows }, { data: userRows }] = await Promise.all([
+      empIds.length > 0
+        ? db.from("employees").select("id, user_id, full_name").in("id", empIds)
+        : Promise.resolve({ data: [] }),
+      closerIds.length > 0
+        ? db.from("users").select("id, full_name").in("id", closerIds)
+        : Promise.resolve({ data: [] }),
+    ]);
+    for (const row of ((empRows ?? []) as Array<{ id: string; user_id: string | null; full_name: string }>)) {
+      nameByUser.set(row.id, row.full_name);
+      if (row.user_id) nameByUser.set(row.user_id, row.full_name);
+    }
+    for (const row of ((userRows ?? []) as Array<{ id: string; full_name: string }>)) {
+      if (!nameByUser.has(row.id)) nameByUser.set(row.id, row.full_name);
+    }
+  }
+  const namesByInvoice = new Map<string, string[]>();
+  for (const row of ((itemRows ?? []) as Array<{ invoice_id: string; employee_id: string }>)) {
+    const name = nameByUser.get(row.employee_id);
+    if (!name) continue;
+    const list = namesByInvoice.get(row.invoice_id) ?? [];
+    if (!list.includes(name)) list.push(name);
+    namesByInvoice.set(row.invoice_id, list);
+  }
+  return rows.map((row) => ({
+    ...row,
+    closed_by_name: row.closed_by ? (nameByUser.get(row.closed_by) ?? null) : null,
+    employee_names: namesByInvoice.get(row.id) ?? [],
+  }));
+}
+
+/** Total de facturas con los mismos filtros (para paginar). */
+export async function countInvoices(sedeId: string, filters: InvoiceFilters = {}): Promise<number> {
+  const db = await billingDb();
+  let employeeInvoiceIds: string[] | null = null;
+  if (filters.employee_id) {
+    const { data: idRows, error: idError } = await db
+      .from("invoice_items")
+      .select("invoice_id")
+      .eq("employee_id", filters.employee_id)
+      .limit(5000);
+    if (idError) throw new BillingError("INTERNAL", "Error interno.", 500);
+    employeeInvoiceIds = [...new Set(((idRows ?? []) as Array<{ invoice_id: string }>).map((row) => row.invoice_id))];
+    if (employeeInvoiceIds.length === 0) return 0;
+  }
+  let query = db.from("invoices").select("id", { count: "exact", head: true }).eq("sede_id", sedeId);
+  if (filters.status) query = query.eq("status", filters.status);
+  if (filters.from?.trim()) query = query.gte("created_at", dateBound(filters.from, false));
+  if (filters.to?.trim()) query = query.lte("created_at", dateBound(filters.to, true));
+  if (filters.user_id) query = query.eq("user_id", filters.user_id);
+  if (filters.closed_by) query = query.eq("closed_by", filters.closed_by);
+  if (filters.consecutive_number !== undefined) query = query.eq("consecutive_number", filters.consecutive_number);
+  if (employeeInvoiceIds) query = query.in("id", employeeInvoiceIds);
+  const { count, error } = await query;
+  if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
+  return count ?? 0;
 }
 
 /** Detalle con ítems, snapshot de impuestos y porciones (solo su sede). */

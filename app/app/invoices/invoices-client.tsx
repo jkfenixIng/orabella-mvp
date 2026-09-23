@@ -10,7 +10,7 @@ import {
 } from "@/src/features/billing/actions";
 import type {
   InvoiceDetail,
-  InvoiceRow,
+  InvoiceListItem,
 } from "@/src/features/billing/service";
 import type { ProductRow } from "@/src/features/inventory/service";
 import type {
@@ -19,9 +19,6 @@ import type {
   ServiceRow,
   TaxConfigRow,
 } from "@/src/features/admin/service";
-import {
-  Badge,
-} from "@/src/components/ui/lib/badge";
 import { Button } from "@/src/components/ui/lib/button";
 import {
   Card,
@@ -48,6 +45,7 @@ import {
   Banknote,
   CircleX,
   Eye,
+  Pencil,
   Plus,
   Search,
   Trash2,
@@ -102,20 +100,32 @@ function formatMoney(value: number | string): string {
   }).format(numeric);
 }
 
-function invoiceStatusVariant(status: string): "default" | "success" | "destructive" | "secondary" {
-  if (status === "Pagada") return "success";
-  if (status === "Anulada") return "destructive";
-  if (status === "Emitida") return "secondary";
-  return "default";
+/** Pastilla de estado: Emitida azul, Pagada verde, Anulada roja (ambos temas). */
+function statusPill(status: string) {
+  const tone =
+    status === "Pagada"
+      ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200"
+      : status === "Anulada"
+        ? "bg-red-100 text-red-800 dark:bg-red-900/50 dark:text-red-200"
+        : "bg-blue-100 text-blue-800 dark:bg-blue-900/50 dark:text-blue-200";
+  return (
+    <span className={`inline-block whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-semibold ${tone}`}>
+      {status}
+    </span>
+  );
 }
 
-interface InvoiceRowWithUser extends InvoiceRow {
-  user_name: string | null;
+/** "Camilo, Andrés + 3 más": dos nombres y el resto resumido. */
+function employeeSummary(names: string[]): string {
+  if (names.length === 0) return "—";
+  if (names.length <= 2) return names.join(", ");
+  return `${names[0]}, ${names[1]} +${names.length - 2}`;
 }
 
 interface InvoicesClientProps {
   sedeId: string;
-  initialInvoices: InvoiceRowWithUser[];
+  initialInvoices: InvoiceListItem[];
+  initialTotal: number;
   products: ProductRow[];
   services: ServiceRow[];
   employees: EmployeeRow[];
@@ -127,8 +137,10 @@ interface InvoicesClientProps {
 }
 
 export function InvoicesClient(props: InvoicesClientProps) {
-  const [invoices, setInvoices] = useState<InvoiceRowWithUser[]>(props.initialInvoices);
-  const [filters, setFilters] = useState({ status: "", from: "", to: "", seller: "", number: "" });
+  const [invoices, setInvoices] = useState<InvoiceListItem[]>(props.initialInvoices);
+  const [totalInvoices, setTotalInvoices] = useState(props.initialTotal);
+  const [invoicePage, setInvoicePage] = useState(1);
+  const [filters, setFilters] = useState({ status: "", from: "", to: "", seller: "", number: "", closedBy: "", employee: "" });
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -151,25 +163,35 @@ export function InvoicesClient(props: InvoicesClientProps) {
   const [motivo, setMotivo] = useState("");
   const [splitDraft, setSplitDraft] = useState<PortionDraft>({ method_code: "efectivo", amount: "" });
 
-  function applyFilters(event?: FormEvent) {
+  function applyFilters(event?: FormEvent, page = 1) {
     event?.preventDefault();
     startViewTransition(async () => {
       setError(null);
-      const result: ActionResult<InvoiceRowWithUser[]> = await listInvoicesAction({
+      const result: ActionResult<{ rows: InvoiceListItem[]; total: number }> = await listInvoicesAction({
         sede_id: props.sedeId,
         status: filters.status || undefined,
         from: filters.from || undefined,
         to: filters.to || undefined,
         user_id: filters.seller || undefined,
         consecutive_number: filters.number ? parseInt(filters.number, 10) : undefined,
+        closed_by: filters.closedBy || undefined,
+        employee_id: filters.employee || undefined,
+        page,
       });
       if (!result.success) {
         setError(result.message);
         return;
       }
-      setInvoices(result.data);
+      setInvoices(result.data.rows);
+      setTotalInvoices(result.data.total);
+      setInvoicePage(page);
     });
   }
+
+  // Debe coincidir con INVOICE_PAGE_SIZE del servicio (import por valor
+  // arrastraría código de servidor al cliente).
+  const INVOICE_CLIENT_PAGE_SIZE = 20;
+  const invoicePageCount = Math.max(1, Math.ceil(totalInvoices / INVOICE_CLIENT_PAGE_SIZE));
 
   function patchDraft(patch: Partial<ItemDraft>) {
     setItemDraft((prev) => ({ ...prev, ...patch }));
@@ -372,7 +394,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     }
     setNotice(`Factura #${result.data.invoice.consecutive_number} anulada (stock revertido).`);
     setDetail(result.data);
-    await applyFilters();
+    await applyFilters(undefined, invoicePage);
   }
 
   async function submitSplit(event: FormEvent) {
@@ -405,7 +427,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     );
     setDetail(result.data);
     setSplitDraft({ method_code: "efectivo", amount: "" });
-    await applyFilters();
+    await applyFilters(undefined, invoicePage);
   }
 
   // Hoja factura: totales vivos del borrador (solo presentación; la verdad la calcula el servidor).
@@ -498,7 +520,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 <button
                   type="button"
                   onClick={() => setCreateDialogOpen(true)}
-                  className="inline-flex h-10 items-center justify-center gap-2 whitespace-nowrap rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-all duration-200 hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 active:scale-[0.98]"
+                  className="inline-flex h-10 items-center justify-center gap-2 whitespace-nowrap rounded-md bg-emerald-700 px-4 py-2 text-sm font-semibold text-white shadow-sm transition-all duration-200 hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 active:scale-[0.98]"
                 >
                   <Plus className="h-4 w-4" aria-hidden="true" />
                   Emitir factura
@@ -1095,6 +1117,44 @@ export function InvoicesClient(props: InvoicesClientProps) {
               />
             </Label>
             <Label className="min-w-[10rem]">
+              Cerró por
+              <Combobox
+                value={filters.closedBy}
+                onValueChange={(closedBy) => setFilters({ ...filters, closedBy })}
+                placeholder="Todos"
+                allowClear
+                clearLabel="Todos"
+                options={props.employees
+                  .filter((row) => row.is_active)
+                  .map((row) => ({
+                    value: row.id,
+                    label: row.full_name,
+                    description: row.employee_code ?? '',
+                  }))}
+                ariaLabel="Filtrar por quien cerró"
+                filterPlaceholder="Buscar..."
+              />
+            </Label>
+            <Label className="min-w-[10rem]">
+              Empleado
+              <Combobox
+                value={filters.employee}
+                onValueChange={(employee) => setFilters({ ...filters, employee })}
+                placeholder="Todos"
+                allowClear
+                clearLabel="Todos"
+                options={props.employees
+                  .filter((row) => row.is_active)
+                  .map((row) => ({
+                    value: row.id,
+                    label: row.full_name,
+                    description: row.employee_code ?? '',
+                  }))}
+                ariaLabel="Filtrar por empleado participante"
+                filterPlaceholder="Buscar..."
+              />
+            </Label>
+            <Label className="min-w-[10rem]">
               Nº Factura
               <Input
                 className={inputClass}
@@ -1127,39 +1187,73 @@ export function InvoicesClient(props: InvoicesClientProps) {
               {isViewPending ? "Filtrando…" : "Filtrar"}
             </Button>
           </form>
-          <ul className="mt-4 flex flex-col gap-2">
+          <div className="mt-4 overflow-hidden rounded-lg border border-color-2 dark:border-border-color">
+            <div
+              aria-hidden="true"
+              className="hidden grid-cols-[2.5rem_7.5rem_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.2fr)_5.5rem_4.5rem_4.5rem] gap-2 border-b border-color-2 bg-surface px-3 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary sm:grid dark:border-border-color"
+            >
+              <span>ID</span>
+              <span>Fecha</span>
+              <span>Abrió</span>
+              <span>Cerró</span>
+              <span>Empleados</span>
+              <span className="text-right">Total</span>
+              <span>Estado</span>
+              <span className="text-center">Acciones</span>
+            </div>
+            <ul className="flex flex-col divide-y divide-color-2 dark:divide-border-color">
             {invoices.map((row) => (
               <li
                 key={row.id}
-                className={cn(
-                  "flex flex-wrap items-center justify-between gap-2 rounded-lg border border-color-2 bg-surface px-3 py-2 dark:border-border-color",
-                )}
+                className="flex flex-col gap-1 px-3 py-2.5 sm:grid sm:grid-cols-[2.5rem_7.5rem_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.2fr)_5.5rem_4.5rem_4.5rem] sm:items-center sm:gap-2"
               >
-                <div className="flex flex-wrap items-center gap-3 min-w-0 flex-1">
-                  <span className="text-sm font-mono font-semibold text-slate-700 dark:text-slate-300">
-                    #{row.consecutive_number}
-                  </span>
-                  <span className="text-sm text-slate-500 dark:text-slate-400 whitespace-nowrap">
-                    {new Date(row.created_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}
-                  </span>
-                  <span className="text-sm text-slate-600 dark:text-slate-300 truncate max-w-[180px]">
-                    {row.user_name ?? "—"}
-                  </span>
-                  <Badge variant={invoiceStatusVariant(row.status)} className="whitespace-nowrap">
-                    {row.status}
-                  </Badge>
-                </div>
+                <span className="font-mono text-sm font-semibold text-slate-700 dark:text-slate-300">
+                  #{row.consecutive_number}
+                </span>
+                <span className="whitespace-nowrap text-sm text-slate-500 dark:text-slate-400">
+                  {new Date(row.created_at).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })}{" "}
+                  {new Date(row.created_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}
+                </span>
+                <span className="truncate text-sm text-slate-600 dark:text-slate-300" title={row.user_name ?? ""}>
+                  {row.user_name ?? "—"}
+                </span>
+                <span className="truncate text-sm text-slate-600 dark:text-slate-300" title={row.closed_by_name ?? ""}>
+                  {row.closed_by_name ?? "—"}
+                </span>
+                <span
+                  className="truncate text-sm text-slate-600 dark:text-slate-300"
+                  title={row.employee_names.join(", ")}
+                >
+                  {employeeSummary(row.employee_names)}
+                </span>
+                <span className="whitespace-nowrap text-sm font-medium text-slate-900 sm:text-right dark:text-slate-100">
+                  {formatMoney(row.total)}
+                </span>
+                <span>{statusPill(row.status)}</span>
+                <span className="flex items-center gap-1 sm:justify-center">
+                  {props.canAnnul && (
+                    <button
+                      type="button"
+                      title="Gestionar factura"
+                      aria-label={`Gestionar factura ${row.consecutive_number}`}
+                      onClick={() => openDetail(row.id)}
+                      className="rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                    >
+                      <Pencil className="h-4 w-4" aria-hidden="true" />
+                    </button>
+                  )}
                 {props.detailMode !== "none" && (props.detailMode === "full" || row.status === "Emitida") && (
                   <button
                     type="button"
+                    title="Ver detalle"
                     aria-label={`Ver detalle de la factura ${row.consecutive_number}`}
                     onClick={() => openDetail(row.id)}
-                    className="inline-flex h-9 items-center justify-center gap-2 whitespace-nowrap rounded-md border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 shadow-sm transition-all duration-200 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 focus-visible:ring-offset-2 active:scale-[0.98]"
+                    className="rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
                   >
                     <Eye className="h-4 w-4" aria-hidden="true" />
-                    Ver detalle
                   </button>
                 )}
+                </span>
                   {detail && detail.invoice.id === row.id && (
                     <Dialog
                       open={detailDialogOpen}
@@ -1178,9 +1272,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             <div className="text-right">
                               <h2 className="text-lg font-bold">
                                 FACTURA #{detail.invoice.consecutive_number}{" "}
-                                <Badge variant={invoiceStatusVariant(detail.invoice.status)}>
-                                  {detail.invoice.status}
-                                </Badge>
+                                {statusPill(detail.invoice.status)}
                               </h2>
                               <p className="text-sm text-slate-500">
                                 {new Date(detail.invoice.created_at).toLocaleDateString("es-CO", {
@@ -1413,9 +1505,35 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 </li>
             ))}
             {invoices.length === 0 && (
-              <li className="text-sm text-text-secondary">Sin facturas para estos filtros.</li>
+              <li className="px-3 py-4 text-sm text-text-secondary">Sin facturas para estos filtros.</li>
             )}
           </ul>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-sm text-text-secondary">
+            <p>
+              {totalInvoices} factura(s) · Página {invoicePage} de {invoicePageCount}
+            </p>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={invoicePage <= 1 || isViewPending}
+                onClick={() => applyFilters(undefined, invoicePage - 1)}
+              >
+                Anterior
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={invoicePage >= invoicePageCount || isViewPending}
+                onClick={() => applyFilters(undefined, invoicePage + 1)}
+              >
+                Siguiente
+              </Button>
+            </div>
+          </div>
         </CardContent>
       </Card>
 

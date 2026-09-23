@@ -9,7 +9,7 @@ import {
   listTaxes,
 } from "@/src/features/admin/service";
 import { listProducts } from "@/src/features/inventory/service";
-import { listInvoices } from "@/src/features/billing/service";
+import { countInvoices, listInvoices } from "@/src/features/billing/service";
 import { InvoicesClient } from "./invoices-client";
 
 export const dynamic = "force-dynamic";
@@ -37,20 +37,20 @@ export default async function InvoicesPage() {
     );
   }
 
-  const [invoices, products, services, employees, methods, taxes] = await Promise.all([
-    listInvoices(sedeId),
+  const canWrite = session.roles.includes("admin") || session.roles.includes("caja");
+  const isAdmin = session.roles.includes("admin");
+  const isManager = isAdmin || session.roles.includes("caja");
+  // Empleado: solo sus facturas (filtro forzado para que el total cuadre).
+  const pageFilters = { page: 1, ...(isManager ? {} : { user_id: session.user.id }) };
+  const [invoices, totalInvoices, products, services, employees, methods, taxes] = await Promise.all([
+    listInvoices(sedeId, pageFilters),
+    countInvoices(sedeId, isManager ? {} : { user_id: session.user.id }),
     listProducts(sedeId),
     listServices(sedeId),
     listEmployees(sedeId),
     listPaymentMethods(sedeId),
     listTaxes(sedeId),
   ]);
-
-  const canWrite = session.roles.includes("admin") || session.roles.includes("caja");
-  const isAdmin = session.roles.includes("admin");
-  const isManager = isAdmin || session.roles.includes("caja");
-  // Empleado: solo sus facturas (emitidas por su usuario), sin detalle.
-  const visibleInvoices = isManager ? invoices : invoices.filter((row) => row.user_id === session.user.id);
 
   return (
     <main className="mx-auto flex min-h-screen max-w-5xl flex-col gap-6 px-6 py-12">
@@ -64,7 +64,8 @@ export default async function InvoicesPage() {
       </header>
       <InvoicesClient
         sedeId={sedeId}
-        initialInvoices={visibleInvoices}
+        initialInvoices={invoices}
+        initialTotal={totalInvoices}
         products={products}
         services={services}
         employees={employees.filter((row) => row.is_active)}
