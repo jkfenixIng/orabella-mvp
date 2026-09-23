@@ -88,7 +88,8 @@ Out:
 - [x] Modal agregar ítem + filas compactas + cierre combobox robusto + comisión custom en VALOR (7b1a332)
 - [x] 019 re-ejecutable + 020 commission_value (faltaba: rompía detalle y nómina) (1d1e33a); 020 aplicada en prod
 - [x] Logs PG diagnóstico en lista/detalle (ad34bee, 93c9da4)
-- [ ] Usuario: aplicar 019+020 en PRUEBAS, recargar, verificar combobox/modal/detalle/flujo tarjeta
+- [x] Listado paginado (20/pág): ID, fecha, abrió, cerró, empleados resumidos, total, estado pill azul/verde/rojo, editar-admin + ver; filtros cerró-por y empleado; botón emitir esmeralda (3b6ca22)
+- [ ] Usuario: aplicar 019+020+021 en PRUEBAS, recargar, verificar combobox/modal/detalle/flujo tarjeta/listado
 - [ ] VER full + push
 
 ## Authorized scope
