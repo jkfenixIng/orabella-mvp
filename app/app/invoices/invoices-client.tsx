@@ -48,6 +48,7 @@ import {
   Banknote,
   CircleX,
   Eye,
+  EyeOff,
   Pencil,
   Plus,
   Search,
@@ -160,6 +161,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
   // congela mientras la server action responde.
   const [isViewPending, startViewTransition] = useTransition();
   const [detail, setDetail] = useState<InvoiceDetail | null>(null);
+  // Vista cliente: oculta datos internos (empleado y comisión) para mostrar
+  // la factura en pantalla sin exponer información de nómina. Arranca interna.
+  const [clientView, setClientView] = useState(false);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [detailDialogOpen, setDetailDialogOpen] = useState(false);
   type EditItemDraft = ItemDraft & { id?: string; discount: number };
@@ -369,6 +373,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
       }
       setDetail(result.data);
       setMotivo("");
+      setClientView(false);
       setDetailDialogOpen(true);
     });
   }
@@ -425,6 +430,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
       setEditPayments(current.payments.map((payment) => ({ id: payment.id, method_code: payment.method_code })));
       setEditMotivo("");
       setEditError(null);
+      setClientView(false);
       setIsEditDialogOpen(true);
     } finally {
       setBusy(false);
@@ -821,6 +827,28 @@ export function InvoicesClient(props: InvoicesClientProps) {
     return item.custom_name.trim() === "" ? "Ítem personalizado" : item.custom_name;
   }
 
+  /**
+   * Botón "Modo cliente": alterna la vista para mostrar la factura en
+   * pantalla. Activo oculta empleado y comisión (datos internos de nómina).
+   */
+  function clientViewToggle() {
+    return (
+      <button
+        type="button"
+        onClick={() => setClientView((prev) => !prev)}
+        aria-pressed={clientView}
+        className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-100"
+      >
+        {clientView ? (
+          <EyeOff className="h-3.5 w-3.5" aria-hidden="true" />
+        ) : (
+          <Eye className="h-3.5 w-3.5" aria-hidden="true" />
+        )}
+        {clientView ? "Volver a vista interna" : "Ver como cliente"}
+      </button>
+    );
+  }
+
   // Papel factura: paleta clara fija a propósito (documento, no tema).
   const paperInputClass =
     "flex h-10 w-full rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-slate-500 disabled:cursor-not-allowed disabled:opacity-50";
@@ -849,6 +877,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   onClick={() => {
                     if (!passShiftGate()) return;
                     setBlockNotice(null);
+                    setClientView(false);
                     setCreateDialogOpen(true);
                   }}
                   className={cn(
@@ -898,6 +927,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         </label>
                       </div>
 
+                        <div className="flex justify-end">
+                          {clientViewToggle()}
+                        </div>
                         <div className="overflow-x-auto rounded-lg border border-slate-200">
                           <table className="w-full min-w-[820px] text-left text-sm text-slate-900">
                             <thead>
@@ -905,10 +937,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 <th className="px-3 py-2">#</th>
                                 <th className="px-3 py-2">Cant.</th>
                                 <th className="px-3 py-2">Descripción</th>
-                                <th className="px-3 py-2">Empleado</th>
+                                {!clientView && <th className="px-3 py-2">Empleado</th>}
                                 <th className="px-3 py-2 text-right">V. unitario</th>
                                 <th className="px-3 py-2 text-right">Subtotal</th>
-                                <th className="px-3 py-2 text-center">Comisión</th>
+                                {!clientView && <th className="px-3 py-2 text-center">Comisión</th>}
                                 <th className="px-3 py-2"><span className="sr-only">Quitar</span></th>
                               </tr>
                             </thead>
@@ -930,30 +962,34 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                             : "Personalizado"}
                                       </p>
                                     </td>
-                                    <td className="min-w-[140px] px-3 py-2">{employeeNameOf(item.employee_id)}</td>
+                                    {!clientView && (
+                                      <td className="min-w-[140px] px-3 py-2">{employeeNameOf(item.employee_id)}</td>
+                                    )}
                                     <td className="whitespace-nowrap px-3 py-2 text-right">
                                       {formatMoney(linePrice)}
                                     </td>
                                     <td className="whitespace-nowrap px-3 py-2 text-right font-medium">
                                       {formatMoney(lineQty * linePrice)}
                                     </td>
-                                    <td className="whitespace-nowrap px-3 py-2 text-center">
-                                      {item.item_type === "servicio" ? (
-                                        <span className="text-xs text-slate-500">Sin comisión</span>
-                                      ) : item.no_commission ? (
-                                        <span className="text-xs text-slate-500">Sin comisión</span>
-                                      ) : item.item_type === "custom" &&
-                                        item.commission_value !== null &&
-                                        item.commission_value !== undefined ? (
-                                        <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
-                                          {formatMoney(item.commission_value)}
-                                        </span>
-                                      ) : (
-                                        <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
-                                          Con comisión
-                                        </span>
-                                      )}
-                                    </td>
+                                    {!clientView && (
+                                      <td className="whitespace-nowrap px-3 py-2 text-center">
+                                        {item.item_type === "servicio" ? (
+                                          <span className="text-xs text-slate-500">Sin comisión</span>
+                                        ) : item.no_commission ? (
+                                          <span className="text-xs text-slate-500">Sin comisión</span>
+                                        ) : item.item_type === "custom" &&
+                                          item.commission_value !== null &&
+                                          item.commission_value !== undefined ? (
+                                          <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                                            {formatMoney(item.commission_value)}
+                                          </span>
+                                        ) : (
+                                          <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                                            Con comisión
+                                          </span>
+                                        )}
+                                      </td>
+                                    )}
                                     <td className="px-3 py-2">
                                       <button
                                         type="button"
@@ -969,7 +1005,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               })}
                               {items.length === 0 && (
                                 <tr>
-                                  <td colSpan={8} className="px-3 py-4 text-center text-sm text-slate-500">
+                                  <td colSpan={clientView ? 6 : 8} className="px-3 py-4 text-center text-sm text-slate-500">
                                     Sin ítems. Agregue al menos uno para emitir.
                                   </td>
                                 </tr>
@@ -1426,18 +1462,21 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               {formatMoney(detail.invoice.total)}
                             </p>
                           </div>
-                          <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500">Ítems</h3>
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500">Ítems</h3>
+                            {clientViewToggle()}
+                          </div>
                           <div className="mt-2 overflow-x-auto rounded-lg border border-slate-200">
                             <table className="w-full min-w-[560px] text-left text-sm text-slate-900">
                               <thead>
                                 <tr className="bg-slate-100 text-xs uppercase tracking-wide text-slate-500">
                                   <th className="px-3 py-2">#</th>
                                   <th className="px-3 py-2">Descripción</th>
-                                  <th className="px-3 py-2">Empleado</th>
+                                  {!clientView && <th className="px-3 py-2">Empleado</th>}
                                   <th className="px-3 py-2 text-right">Cant.</th>
                                   <th className="px-3 py-2 text-right">V. unitario</th>
                                   <th className="px-3 py-2 text-right">Subtotal</th>
-                                  <th className="px-3 py-2 text-center">¿Comisión?</th>
+                                  {!clientView && <th className="px-3 py-2 text-center">¿Comisión?</th>}
                                 </tr>
                               </thead>
                               <tbody>
@@ -1446,37 +1485,45 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     <td className="px-3 py-2 font-semibold">{index + 1}</td>
                                     <td className="px-3 py-2">
                                       {row.item_type === "custom" && row.custom_name ? row.custom_name : row.item_type}
-                                      {row.item_type === "custom" && row.commission_value !== null && row.commission_value !== undefined && !row.no_commission && (
-                                        <span className="ml-2 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
-                                          Comisión: {formatMoney(row.commission_value)}
-                                        </span>
-                                      )}
-                                      {row.no_commission && (
+                                      {!clientView &&
+                                        row.item_type !== "servicio" &&
+                                        !row.no_commission &&
+                                        row.commission_amount !== null &&
+                                        row.commission_amount !== undefined && (
+                                          <span className="ml-2 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                                            Comisión: {formatMoney(row.commission_amount)}
+                                          </span>
+                                        )}
+                                      {!clientView && row.no_commission && (
                                         <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">
                                           Sin comisión
                                         </span>
                                       )}
                                     </td>
-                                    <td className="px-3 py-2">
-                                      {row.employee_full_name ?? "—"}
-                                      {row.employee_code ? (
-                                        <span className="text-xs text-slate-500"> ({row.employee_code})</span>
-                                      ) : null}
-                                    </td>
+                                    {!clientView && (
+                                      <td className="px-3 py-2">
+                                        {row.employee_full_name ?? "—"}
+                                        {row.employee_code ? (
+                                          <span className="text-xs text-slate-500"> ({row.employee_code})</span>
+                                        ) : null}
+                                      </td>
+                                    )}
                                     <td className="px-3 py-2 text-right">{row.qty}</td>
                                     <td className="px-3 py-2 text-right">{formatMoney(row.unit_price)}</td>
                                     <td className="px-3 py-2 text-right font-medium">{formatMoney(row.subtotal)}</td>
-                                    <td className="px-3 py-2 text-center">
-                                      {row.item_type === "servicio" ? (
-                                        <span className="text-xs text-slate-500">Sin comisión</span>
-                                      ) : row.no_commission ? (
-                                        <span className="text-slate-500">No</span>
-                                      ) : row.item_type === "custom" && row.commission_value !== null && row.commission_value !== undefined ? (
-                                        <span className="font-medium text-emerald-700">{formatMoney(row.commission_value)}</span>
-                                      ) : (
-                                        <span className="text-emerald-700">Sí</span>
-                                      )}
-                                    </td>
+                                    {!clientView && (
+                                      <td className="px-3 py-2 text-center">
+                                        {row.item_type === "servicio" ? (
+                                          <span className="text-xs text-slate-500">Sin comisión</span>
+                                        ) : row.no_commission ? (
+                                          <span className="text-slate-500">No</span>
+                                        ) : row.commission_amount !== null && row.commission_amount !== undefined ? (
+                                          <span className="font-medium text-emerald-700">{formatMoney(row.commission_amount)}</span>
+                                        ) : (
+                                          <span className="text-slate-400">—</span>
+                                        )}
+                                      </td>
+                                    )}
                                   </tr>
                                 ))}
                               </tbody>
@@ -1691,6 +1738,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 />
                               </label>
                             )}
+                            <div className="flex justify-end">
+                              {clientViewToggle()}
+                            </div>
                             <div className="overflow-x-auto rounded-lg border border-slate-200">
                               <table className="w-full min-w-[860px] text-left text-sm text-slate-900">
                                 <thead>
@@ -1698,10 +1748,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     <th className="px-3 py-2">#</th>
                                     <th className="px-3 py-2">Cant.</th>
                                     <th className="px-3 py-2">Descripción</th>
-                                    <th className="px-3 py-2">Empleado</th>
+                                    {!clientView && <th className="px-3 py-2">Empleado</th>}
                                     <th className="px-3 py-2 text-right">V. unitario</th>
                                     <th className="px-3 py-2 text-right">Subtotal</th>
-                                    <th className="px-3 py-2 text-center">Comisión</th>
+                                    {!clientView && <th className="px-3 py-2 text-center">Comisión</th>}
                                     <th className="px-3 py-2"><span className="sr-only">Quitar</span></th>
                                   </tr>
                                 </thead>
@@ -1778,20 +1828,22 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                 : "Personalizado"}
                                           </p>
                                         </td>
-                                        <td className="min-w-[150px] px-3 py-2">
-                                          <Combobox
-                                            value={item.employee_id}
-                                            onValueChange={(value) => patchEditItem(index, { employee_id: value })}
-                                            placeholder="Empleado…"
-                                            options={props.employees.map((row) => ({
-                                              value: row.id,
-                                              label: row.full_name,
-                                              description: row.employee_code ? `ID ${row.employee_code}` : undefined,
-                                            }))}
-                                            ariaLabel={`Editar ítem ${index + 1} empleado`}
-                                            filterPlaceholder="Escriba para filtrar…"
-                                          />
-                                        </td>
+                                        {!clientView && (
+                                          <td className="min-w-[150px] px-3 py-2">
+                                            <Combobox
+                                              value={item.employee_id}
+                                              onValueChange={(value) => patchEditItem(index, { employee_id: value })}
+                                              placeholder="Empleado…"
+                                              options={props.employees.map((row) => ({
+                                                value: row.id,
+                                                label: row.full_name,
+                                                description: row.employee_code ? `ID ${row.employee_code}` : undefined,
+                                              }))}
+                                              ariaLabel={`Editar ítem ${index + 1} empleado`}
+                                              filterPlaceholder="Escriba para filtrar…"
+                                            />
+                                          </td>
+                                        )}
                                         <td className="px-3 py-2">
                                           <input
                                             className={`${paperInputClass} w-28 text-right`}
@@ -1807,46 +1859,48 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         <td className="whitespace-nowrap px-3 py-2 text-right font-medium">
                                           {formatMoney(lineQty * linePrice)}
                                         </td>
-                                        <td className="px-3 py-2 text-center">
-                                          {item.item_type === "servicio" ? (
-                                            <span className="text-xs text-slate-500">Sin comisión</span>
-                                          ) : (
-                                            <div className="flex flex-col items-center gap-1">
-                                              <label className="flex items-center gap-1.5 text-sm">
-                                                <input
-                                                  type="checkbox"
-                                                  checked={!item.no_commission}
-                                                  onChange={(event) =>
-                                                    patchEditItem(index, {
-                                                      no_commission: !event.target.checked,
-                                                      commission_value: null,
-                                                    })
-                                                  }
-                                                  className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
-                                                />
-                                                <span className="text-slate-600">¿Comisión?</span>
-                                              </label>
-                                              {item.item_type === "custom" && !item.no_commission && (
-                                                <input
-                                                  type="number"
-                                                  className={`${paperInputClass} w-28`}
-                                                  value={item.commission_value ?? ""}
-                                                  onChange={(event) =>
-                                                    patchEditItem(index, {
-                                                      commission_value:
-                                                        event.target.value === "" ? null : Number(event.target.value),
-                                                    })
-                                                  }
-                                                  placeholder="Valor $"
-                                                  min={0}
-                                                  step={100}
-                                                  inputMode="decimal"
-                                                  aria-label={`Editar ítem ${index + 1} valor comisión`}
-                                                />
-                                              )}
-                                            </div>
-                                          )}
-                                        </td>
+                                        {!clientView && (
+                                          <td className="px-3 py-2 text-center">
+                                            {item.item_type === "servicio" ? (
+                                              <span className="text-xs text-slate-500">Sin comisión</span>
+                                            ) : (
+                                              <div className="flex flex-col items-center gap-1">
+                                                <label className="flex items-center gap-1.5 text-sm">
+                                                  <input
+                                                    type="checkbox"
+                                                    checked={!item.no_commission}
+                                                    onChange={(event) =>
+                                                      patchEditItem(index, {
+                                                        no_commission: !event.target.checked,
+                                                        commission_value: null,
+                                                      })
+                                                    }
+                                                    className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                                                  />
+                                                  <span className="text-slate-600">¿Comisión?</span>
+                                                </label>
+                                                {item.item_type === "custom" && !item.no_commission && (
+                                                  <input
+                                                    type="number"
+                                                    className={`${paperInputClass} w-28`}
+                                                    value={item.commission_value ?? ""}
+                                                    onChange={(event) =>
+                                                      patchEditItem(index, {
+                                                        commission_value:
+                                                          event.target.value === "" ? null : Number(event.target.value),
+                                                      })
+                                                    }
+                                                    placeholder="Valor $"
+                                                    min={0}
+                                                    step={100}
+                                                    inputMode="decimal"
+                                                    aria-label={`Editar ítem ${index + 1} valor comisión`}
+                                                  />
+                                                )}
+                                              </div>
+                                            )}
+                                          </td>
+                                        )}
                                         <td className="px-3 py-2">
                                           <button
                                             type="button"
