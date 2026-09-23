@@ -37,7 +37,7 @@ import {
 } from "@/src/features/inventory/service";
 import { planStockDeduction } from "@/src/features/inventory/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
-import { getOpenShift, getOpenShiftWithOpener } from "@/src/features/cash/service";
+import { getOpenShiftWithOpener } from "@/src/features/cash/service";
 
 export class BillingError extends Error {
   readonly code: string;
@@ -610,16 +610,19 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
     if (!openShift) {
       throw new BillingError(
         "NO_OPEN_SHIFT",
-        "No hay turno de caja abierto. Abra un turno antes de emitir facturas.",
+        "No hay caja abierta: abre tu turno para emitir.",
         409,
       );
     }
     const isAdmin = (actor.roles ?? []).includes("admin");
     const isOpener = openShift.opened_by === actor.userId;
     if (!isOpener && !isAdmin) {
+      const owner = openShift.opener_name?.trim() || null;
       throw new BillingError(
         "SHIFT_NOT_OWNER",
-        `Solo quien abrió el turno (${openShift.opener_name ?? "el cajero"}) puede emitir facturas.`,
+        owner
+          ? `La caja abierta es del turno de ${owner}: solo ${owner} o un administrador puede emitir.`
+          : "La caja abierta es de otro turno: solo quien abrió el turno o un administrador puede emitir.",
         403,
       );
     }
@@ -1154,16 +1157,23 @@ export async function editEmittedInvoiceItems(
   }
 
   if (!isAdmin) {
-    const openShift = await getOpenShift(sedeId).catch(() => null);
+    const openShift = await getOpenShiftWithOpener(sedeId).catch(() => null);
     if (!openShift) {
       throw new BillingError(
         "NO_OPEN_SHIFT",
-        "No hay turno de caja abierto. Abra un turno antes de editar facturas.",
+        "No hay caja abierta: abre tu turno para editar.",
         409,
       );
     }
     if (openShift.opened_by !== actor.userId) {
-      throw new BillingError("SHIFT_NOT_OWNER", "Solo quien tiene el turno abierto puede editar emitidas.", 403);
+      const owner = openShift.opener_name?.trim() || null;
+      throw new BillingError(
+        "SHIFT_NOT_OWNER",
+        owner
+          ? `El turno abierto es de ${owner}: solo ${owner} o un administrador puede editar.`
+          : "El turno abierto es de otro cajero: solo quien abrió el turno o un administrador puede editar.",
+        403,
+      );
     }
     if (detail.invoice.user_id !== actor.userId) {
       throw new BillingError("FORBIDDEN", "Solo quien abrió la factura puede editarla.", 403);
@@ -1452,7 +1462,7 @@ export async function splitPayment(
   sedeId: string,
   id: string,
   raw: unknown,
-  actor: { userId: string },
+  actor: BillingActor,
 ): Promise<InvoiceDetail> {
   const parsed = splitPaymentSchema.safeParse(raw);
   if (!parsed.success) {
@@ -1462,6 +1472,28 @@ export async function splitPayment(
   const detail = await getInvoiceDetail(sedeId, id);
   if (detail.invoice.status === "Anulada") {
     throw new BillingError("ANNUL_INVALID", annulBlockedMessage("Anulada"), 409);
+  }
+
+  // F2: el cobro exige caja abierta (CAJ-02). Solo la caja dueña del
+  // turno o un administrador puede pagar o anular.
+  const openShift = await getOpenShiftWithOpener(sedeId).catch(() => null);
+  if (!openShift) {
+    throw new BillingError(
+      "NO_OPEN_SHIFT",
+      "No hay caja abierta: abre tu turno para pagar.",
+      409,
+    );
+  }
+  const isAdmin = (actor.roles ?? []).includes("admin");
+  if (openShift.opened_by !== actor.userId && !isAdmin) {
+    const owner = openShift.opener_name?.trim() || null;
+    throw new BillingError(
+      "SHIFT_NOT_OWNER",
+      owner
+        ? `Esta factura es del turno de ${owner}: solo ${owner} o un administrador puede pagarla o anularla.`
+        : "El turno abierto es de otro cajero: solo quien abrió el turno o un administrador puede pagar o anular.",
+      403,
+    );
   }
 
   const refs = await loadRefs(sedeId);
@@ -1500,8 +1532,8 @@ export async function splitPayment(
   };
 
   // El cobro pertenece al turno abierto AHORA (dueño del dinero en caja),
-  // que puede ser otro turno/cajera que el de emisión. Sin turno: null.
-  const payShift = await getOpenShift(sedeId).catch(() => null);
+  // que puede ser otro turno/cajera que el de emisión.
+  const payShift = openShift;
 
   const { error: insertError } = await db.from("invoice_payments").insert(
     fees.map((fee) => ({
@@ -1511,7 +1543,7 @@ export async function splitPayment(
       amount: fee.gross,
       fee_percent: fee.feePercent,
       fee_amount: fee.fee,
-      cash_shift_id: payShift?.id ?? null,
+      cash_shift_id: payShift.id,
     })),
   );
   if (insertError) throw new BillingError("INTERNAL", "Error interno.", 500);

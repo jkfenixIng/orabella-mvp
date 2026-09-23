@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition, type FormEvent } from "react";
+import { useEffect, useState, useTransition, type FormEvent } from "react";
 import {
   annulInvoiceAction,
   createInvoiceAction,
@@ -10,6 +10,7 @@ import {
   listInvoicesAction,
   splitPaymentAction,
 } from "@/src/features/billing/actions";
+import { getOpenShiftAction } from "@/src/features/cash/actions";
 import type {
   InvoiceDetail,
   InvoiceListItem,
@@ -182,6 +183,31 @@ export function InvoicesClient(props: InvoicesClientProps) {
   // Modal clásico de confirmación ("¿Está seguro? ...", OK/Cancelar).
   const [confirmKind, setConfirmKind] = useState<"emit" | "pay" | "annul" | null>(null);
   const [splitDraft, setSplitDraft] = useState<PortionDraft>({ method_code: "efectivo", amount: "" });
+
+  // F2: turno abierto conocido por el cliente (aviso temprano; el servidor
+  // manda). Se refresca al abrir los diálogos de operar.
+  const [shiftKnown, setShiftKnown] = useState(false);
+  const [shiftOpen, setShiftOpen] = useState(false);
+  const [shiftOwn, setShiftOwn] = useState(true);
+  useEffect(() => {
+    if (!props.canWrite && !props.canAnnul) return;
+    let cancelled = false;
+    (async () => {
+      const result = await getOpenShiftAction();
+      if (cancelled || !result.success) return;
+      const shift = result.data;
+      setShiftKnown(true);
+      setShiftOpen(shift !== null);
+      setShiftOwn(shift === null || shift.opened_by === props.currentUserId || props.isAdmin);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [props.canWrite, props.canAnnul, props.currentUserId, props.isAdmin, createDialogOpen, detailDialogOpen, isEditDialogOpen]);
+
+  // Avisos tempranos F2 (el servidor confirma al intentar).
+  const noShiftWarn = shiftKnown && !shiftOpen;
+  const foreignShiftWarn = shiftKnown && shiftOpen && !shiftOwn;
 
   function applyFilters(event?: FormEvent, page = 1) {
     event?.preventDefault();
@@ -1078,6 +1104,16 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           </dl>
                         </div>
 
+                        {noShiftWarn && (
+                          <p role="status" className="rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
+                            No hay caja abierta: abre tu turno para emitir.
+                          </p>
+                        )}
+                        {foreignShiftWarn && (
+                          <p role="status" className="rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
+                            El turno abierto es de otro cajero: solo esa persona o un administrador puede emitir.
+                          </p>
+                        )}
                         {error && (
                           <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
                             {error}
