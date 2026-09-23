@@ -8,6 +8,8 @@ import {
   listDenominationsAction,
   openShiftAction,
 } from "@/src/features/cash/actions";
+import { listVouchersAction } from "@/src/features/payroll/actions";
+import type { VoucherRequestRow } from "@/src/features/payroll/service";
 import type {
   CashRegisterRow,
   CashShiftRow,
@@ -318,6 +320,8 @@ export function CashClient(props: CashClientProps) {
   // La vista del día no se carga al entrar (abrir/cerrar no la necesita):
   // solo se pide si el usuario la muestra.
   const [showDay, setShowDay] = useState(false);
+  // Item 5: vales del día visibles en caja (se cargan con la vista del día).
+  const [dayVouchers, setDayVouchers] = useState<VoucherRequestRow[]>([]);
   const [histPage, setHistPage] = useState(1);
   // Paginador local de la vista del día (el servidor la acota a 50).
   const [dayPage, setDayPage] = useState(0);
@@ -518,6 +522,13 @@ export function CashClient(props: CashClientProps) {
         if (!showResult(result, "Vista del día actualizada.")) return;
         setDay(result.data);
         setDayPage(0);
+        // Item 5: vales del día (no bloquean la vista si fallan).
+        const vouchers = (await listVouchersAction({
+          request_date: props.today,
+          limit: 200,
+          sede_id: props.sedeId,
+        })) as ActionResult<VoucherRequestRow[]>;
+        if (vouchers.success) setDayVouchers(vouchers.data);
       } finally {
         setBusy(false);
       }
@@ -826,6 +837,37 @@ export function CashClient(props: CashClientProps) {
           </>
         )}
       </section>
+
+      {showDay ? (
+        <section className={sectionClass} aria-busy={isViewPending}>
+          <h2 className="text-lg font-semibold">Vales del día</h2>
+          {dayVouchers.length === 0 ? (
+            <p className="mt-3 text-sm text-slate-600 dark:text-slate-300">Sin vales este día.</p>
+          ) : (
+            <>
+              <ul className="mt-3 flex flex-col gap-2 text-sm">
+                {dayVouchers.map((row) => (
+                  <li key={row.id} className="flex flex-wrap items-center gap-2">
+                    <span>
+                      {formatMoney(row.amount)} · {row.request_date}
+                    </span>
+                    <span className="rounded bg-slate-200 px-2 py-0.5 text-xs dark:bg-slate-800">
+                      {row.status}
+                      {row.status === "descontada" ? " (en nómina)" : ""}
+                    </span>
+                    {row.approval_code && <span className="text-xs">Código: {row.approval_code}</span>}
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-3 text-sm">
+                Total en vales:{" "}
+                {formatMoney(dayVouchers.reduce((acc, row) => acc + Number(row.amount), 0))} (
+                {dayVouchers.length} vales).
+              </p>
+            </>
+          )}
+        </section>
+      ) : null}
 
       {props.isAdmin ? (
       <section className={sectionClass} aria-busy={isViewPending}>

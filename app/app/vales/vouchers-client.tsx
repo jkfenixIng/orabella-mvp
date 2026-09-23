@@ -48,6 +48,23 @@ function formatMoney(value: number | string | null): string {
   }).format(numeric);
 }
 
+/** Item 5: días ISO (1=lunes…7=domingo) con nombre corto. */
+const DAY_NAMES: Array<{ day: number; label: string }> = [
+  { day: 1, label: "Lun" },
+  { day: 2, label: "Mar" },
+  { day: 3, label: "Mié" },
+  { day: 4, label: "Jue" },
+  { day: 5, label: "Vie" },
+  { day: 6, label: "Sáb" },
+  { day: 7, label: "Dom" },
+];
+
+interface VoucherRequestResult {
+  requires_approval: boolean;
+  day_not_allowed: boolean;
+  auto_approved: boolean;
+}
+
 interface VouchersClientProps {
   initialEmployees: EmployeeRow[];
   initialSettings: VoucherSettingsRow | null;
@@ -65,6 +82,10 @@ export function VouchersClient(props: VouchersClientProps) {
   );
   const [maxWeek, setMaxWeek] = useState(
     props.initialSettings ? String(props.initialSettings.max_per_week) : "",
+  );
+  // Item 5: días permitidos (null en BD = todos; la UI parte de todos).
+  const [allowedDays, setAllowedDays] = useState<number[]>(
+    props.initialSettings?.allowed_days ?? [1, 2, 3, 4, 5, 6, 7],
   );
   const [voucherEmployee, setVoucherEmployee] = useState("");
   const [voucherAmount, setVoucherAmount] = useState("");
@@ -102,13 +123,24 @@ export function VouchersClient(props: VouchersClientProps) {
       setMessage({ kind: "error", text: "Los topes deben ser números." });
       return;
     }
+    if (allowedDays.length === 0) {
+      setMessage({ kind: "error", text: "Elija al menos un día permitido." });
+      return;
+    }
     setBusy(true);
     const result = (await setVoucherLimitsAction({
       max_per_day: day,
       max_per_week: week,
+      allowed_days: [...allowedDays].sort((a, b) => a - b),
     })) as ActionResult<VoucherSettingsRow>;
     setBusy(false);
     if (show(result, "Topes actualizados.")) setSettings(result.data);
+  }
+
+  function toggleDay(day: number): void {
+    setAllowedDays((current) =>
+      current.includes(day) ? current.filter((row) => row !== day) : [...current, day],
+    );
   }
 
   async function handleRequestVoucher(event: FormEvent) {
@@ -124,14 +156,20 @@ export function VouchersClient(props: VouchersClientProps) {
       amount,
       request_date: voucherDate || undefined,
       observation: voucherNote || undefined,
-    })) as ActionResult<{ requires_approval: boolean }>;
+    })) as ActionResult<VoucherRequestResult>;
     setBusy(false);
     if (
       show(
         result,
-        result.success && result.data.requires_approval
-          ? "Vale pendiente: supera los topes y exige aprobación con código."
-          : "Vale solicitado.",
+        !result.success
+          ? undefined
+          : result.data.auto_approved
+            ? `Vale aprobado automáticamente con detalle auditado${result.data.day_not_allowed ? " (día no permitido)" : ""}.`
+            : result.data.day_not_allowed
+              ? "Vale pendiente: cae en día no permitido y exige revisión del admin."
+              : result.data.requires_approval
+                ? "Vale pendiente: supera los topes y exige aprobación con código."
+                : "Vale solicitado.",
       )
     ) {
       setVoucherAmount("");
@@ -181,7 +219,8 @@ export function VouchersClient(props: VouchersClientProps) {
         <h2 className="text-lg font-semibold">Vales</h2>
         <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
           Topes vigentes: día {settings ? formatMoney(settings.max_per_day) : "sin configurar"} · semana{" "}
-          {settings ? formatMoney(settings.max_per_week) : "sin configurar"}.
+          {settings ? formatMoney(settings.max_per_week) : "sin configurar"} · días{" "}
+          {settings?.allowed_days ? settings.allowed_days.map((day) => DAY_NAMES[day - 1]?.label ?? day).join(", ") : "todos"}.
         </p>
         {props.canAdmin && (
           <form onSubmit={handleLimits} className="mt-3 flex flex-wrap items-end gap-3">
@@ -193,6 +232,21 @@ export function VouchersClient(props: VouchersClientProps) {
               Máximo por semana
               <input value={formatMoneyInput(maxWeek)} onChange={(event) => setMaxWeek(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
             </label>
+            <fieldset className="flex flex-col gap-1 text-sm">
+              <legend>Días permitidos</legend>
+              <div className="flex flex-wrap gap-2">
+                {DAY_NAMES.map((row) => (
+                  <label key={row.day} className="flex items-center gap-1 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={allowedDays.includes(row.day)}
+                      onChange={() => toggleDay(row.day)}
+                    />
+                    {row.label}
+                  </label>
+                ))}
+              </div>
+            </fieldset>
             <button type="submit" disabled={busy} className={buttonClass}>
               Guardar topes
             </button>
@@ -236,7 +290,10 @@ export function VouchersClient(props: VouchersClientProps) {
               <span>
                 {employeeName(row.employee_id)} · {formatMoney(row.amount)} · {row.request_date}
               </span>
-              <span className="rounded bg-slate-200 px-2 py-0.5 text-xs dark:bg-slate-800">{row.status}</span>
+              <span className="rounded bg-slate-200 px-2 py-0.5 text-xs dark:bg-slate-800">
+                {row.status}
+                {row.status === "descontada" ? " (en nómina: sin cambios)" : ""}
+              </span>
               {row.approval_code && <span className="text-xs">Código: {row.approval_code}</span>}
               {row.observation && <span className="text-xs text-slate-500">{row.observation}</span>}
               {props.canAdmin && row.status === "pendiente" && (

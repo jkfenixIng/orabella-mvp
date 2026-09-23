@@ -51,7 +51,7 @@ export default async function ValesPage() {
       <header>
         <h1 className="text-3xl font-bold">Vales</h1>
         <p className="mt-2 text-slate-600 dark:text-slate-300">
-          Solicite vales para empleados con topes por día y semana.
+          Solicite vales para empleados con topes por día y semana, días permitidos y revisión del admin.
         </p>
       </header>
       <VouchersClient
