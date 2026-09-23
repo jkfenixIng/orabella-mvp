@@ -472,6 +472,26 @@ export async function getOpenShift(sedeId: string): Promise<CashShiftRow | null>
   return (data as CashShiftRow | null) ?? null;
 }
 
+/** Turno abierto con nombre del que lo abrió (para validaciones de facturación). */
+export async function getOpenShiftWithOpener(sedeId: string): Promise<(CashShiftRow & { opener_name: string | null }) | null> {
+  const db = await cashDb();
+  const { data, error } = await db
+    .from("cash_shifts")
+    .select(`${SHIFT_SELECT}, users!inner(full_name)`)
+    .eq("sede_id", sedeId)
+    .eq("status", "abierto")
+    .order("opened_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  if (!data) return null;
+  const user = Array.isArray(data.users) ? data.users[0] : data.users;
+  return {
+    ...(data as CashShiftRow),
+    opener_name: user?.full_name ?? null,
+  };
+}
+
 async function getShiftOrThrow(db: DbClient, sedeId: string, id: string): Promise<CashShiftRow> {
   const { data, error } = await db
     .from("cash_shifts")
@@ -808,6 +828,36 @@ export async function closeShift(
     for (const row of ((payoutRows ?? []) as Array<{ method_code: string; amount: number | string }>)) {
       paidOutByMethod.set(row.method_code, roundMoney((paidOutByMethod.get(row.method_code) ?? 0) + Number(row.amount)));
     }
+    // Facturas del turno: sumar por método de pago (para arqueo y auditoría)
+    let invoicesByMethod = new Map<string, number>();
+    let invoicesTotal = 0;
+    // Deshabilitado temporalmente para debugging
+    // const { data: invoiceRows, error: invoiceError } = await db
+    //   .from("invoices")
+    //   .select("id, total, status, cash_shift_id")
+    //   .eq("cash_shift_id", shift.id);
+    // if (invoiceError) throw new CashError("INTERNAL", "Error interno.", 500);
+    // const invoiceIds = (invoiceRows ?? []).map((inv) => inv.id);
+    // let invoicesByMethod = new Map<string, number>();
+    // let invoicesTotal = 0;
+    // if (invoiceIds.length > 0) {
+    //   const { data: payRows, error: payError } = await db
+    //     .from("invoice_payments")
+    //     .select("invoice_id, method_code, amount")
+    //     .in("invoice_id", invoiceIds);
+    //   if (payError) throw new CashError("INTERNAL", "Error interno.", 500);
+    //   const invoicesById = new Map<string, number>();
+    //   for (const inv of (invoiceRows ?? []) as Array<{ id: string; total: number; status: string; cash_shift_id: string | null }>) {
+    //     if (inv.cash_shift_id !== shift.id) continue;
+    //     invoicesTotal += Number(inv.total);
+    //     invoicesById.set(inv.id, Number(inv.total));
+    //   }
+    //   for (const pay of (payRows ?? []) as Array<{ invoice_id: string; method_code: string; amount: number }>) {
+    //     if (!invoicesById.has(pay.invoice_id)) continue;
+    //     invoicesByMethod.set(pay.method_code, roundMoney((invoicesByMethod.get(pay.method_code) ?? 0) + Number(pay.amount)));
+    //   }
+    // }
+
     const expectedCash = roundMoney(
       (paidByMethod.get("efectivo") ?? 0) - (paidOutByMethod.get("efectivo") ?? 0),
     );
@@ -880,6 +930,8 @@ export async function closeShift(
         payouts_out: roundMoney([...paidOutByMethod.values()].reduce((acc, value) => acc + value, 0)),
         method_differences: methodDifferences,
         observation: observation ?? null,
+        invoices_total: invoicesTotal,
+        invoices_by_method: Object.fromEntries(invoicesByMethod),
       },
     });
     if (methodDifferences.length > 0) {

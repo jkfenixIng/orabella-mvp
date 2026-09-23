@@ -345,6 +345,7 @@ interface BillingLine {
   qty: number;
   unit_price: number;
   line_subtotal: number;
+  commission_value: number | null;
 }
 
 /**
@@ -401,7 +402,7 @@ export async function calculatePayroll(
     if (invoiceRows.length > 0) {
       const { data: items, error: itemsError } = await db
         .from("invoice_items")
-        .select("id, invoice_id, item_type, employee_id, qty, unit_price, subtotal, no_commission")
+        .select("id, invoice_id, item_type, employee_id, qty, unit_price, subtotal, no_commission, commission_value")
         .in(
           "invoice_id",
           invoiceRows.map((row) => row.id),
@@ -417,6 +418,7 @@ export async function calculatePayroll(
         unit_price: number | string;
         subtotal: number | string;
         no_commission?: boolean | null;
+        commission_value?: number | null;
       }>).filter(
         (
           row,
@@ -429,6 +431,7 @@ export async function calculatePayroll(
           unit_price: number | string;
           subtotal: number | string;
           no_commission?: boolean | null;
+          commission_value?: number | null;
         } => Boolean(row.employee_id) && !row.no_commission,
       )).map((row) => ({
         invoice_id: row.invoice_id,
@@ -439,6 +442,7 @@ export async function calculatePayroll(
         qty: Number(row.qty),
         unit_price: Number(row.unit_price),
         line_subtotal: Number(row.subtotal),
+        commission_value: row.commission_value ? Number(row.commission_value) : null,
       }));
     }
     const linesByEmployee = new Map<string, BillingLine[]>();
@@ -522,7 +526,11 @@ export async function calculatePayroll(
               qty: line.qty,
               unit_price: line.unit_price,
               line_subtotal: roundMoney(line.line_subtotal),
-              commission: computeLineCommission(line.line_subtotal, percent),
+              // Para items custom, usar commission_value del ítem; para productos/servicios, usar percent del empleado
+              commission: line.item_type === "custom" && line.commission_value !== null
+                ? computeLineCommission(line.line_subtotal, line.commission_value)
+                : computeLineCommission(line.line_subtotal, percent),
+              commission_value: line.commission_value,
             }));
       const { detail, commissions: earnedCommissions } = buildEmployeeDetail(detailInput);
       const paidImmediate = paidImmediateByEmployee.get(employee.id) ?? 0;

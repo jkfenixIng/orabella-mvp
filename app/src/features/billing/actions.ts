@@ -32,6 +32,8 @@ export async function listInvoicesAction(filters: {
   status?: string;
   from?: string;
   to?: string;
+  user_id?: string;
+  consecutive_number?: number;
 } = {}) {
   try {
     const session = await requireSession(await sessionToken());
@@ -39,6 +41,8 @@ export async function listInvoicesAction(filters: {
       status: filters.status || undefined,
       from: filters.from || undefined,
       to: filters.to || undefined,
+      user_id: filters.user_id,
+      consecutive_number: filters.consecutive_number,
     });
     const isManager = session.roles.includes("admin") || session.roles.includes("caja");
     const scoped = isManager ? data : data.filter((row) => row.user_id === session.userId);

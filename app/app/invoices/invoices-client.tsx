@@ -17,12 +17,12 @@ import type {
   EmployeeRow,
   PaymentMethodRow,
   ServiceRow,
+  TaxConfigRow,
 } from "@/src/features/admin/service";
 import {
   Badge,
 } from "@/src/components/ui/lib/badge";
 import { Button } from "@/src/components/ui/lib/button";
-import { Checkbox } from "@/src/components/ui/lib/checkbox";
 import {
   Card,
   CardContent,
@@ -34,7 +34,6 @@ import {
   Dialog,
   DialogClose,
   DialogContent,
-  DialogTrigger,
 } from "@/src/components/ui/lib/dialog";
 import { Input } from "@/src/components/ui/lib/input";
 import { Label } from "@/src/components/ui/lib/label";
@@ -45,6 +44,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/src/components/ui/lib/select";
+import { Combobox } from "@/src/components/ui/lib/combobox";
 import {
   Banknote,
   CircleX,
@@ -74,6 +74,7 @@ interface ItemDraft {
   qty: string;
   unit_price: string;
   no_commission: boolean;
+  commission_value: number | null;
 }
 
 interface PortionDraft {
@@ -82,7 +83,7 @@ interface PortionDraft {
 }
 
 function emptyItem(): ItemDraft {
-  return { item_type: "servicio", ref_id: "", custom_name: "", employee_id: "", qty: "1", unit_price: "", no_commission: false };
+  return { item_type: "servicio", ref_id: "", custom_name: "", employee_id: "", qty: "1", unit_price: "", no_commission: true, commission_value: null };
 }
 
 function toNumber(value: string): number | null {
@@ -102,27 +103,33 @@ function formatMoney(value: number | string): string {
   }).format(numeric);
 }
 
-function invoiceStatusVariant(status: string): "default" | "success" | "destructive" {
+function invoiceStatusVariant(status: string): "default" | "success" | "destructive" | "secondary" {
   if (status === "Pagada") return "success";
   if (status === "Anulada") return "destructive";
+  if (status === "Emitida") return "secondary";
   return "default";
+}
+
+interface InvoiceRowWithUser extends InvoiceRow {
+  user_name: string | null;
 }
 
 interface InvoicesClientProps {
   sedeId: string;
-  initialInvoices: InvoiceRow[];
+  initialInvoices: InvoiceRowWithUser[];
   products: ProductRow[];
   services: ServiceRow[];
   employees: EmployeeRow[];
   methods: PaymentMethodRow[];
+  taxes: TaxConfigRow[];
   canWrite: boolean;
   canAnnul: boolean;
   detailMode: "full" | "open-only" | "none";
 }
 
 export function InvoicesClient(props: InvoicesClientProps) {
-  const [invoices, setInvoices] = useState(props.initialInvoices);
-  const [filters, setFilters] = useState({ status: "", from: "", to: "" });
+  const [invoices, setInvoices] = useState<InvoiceRowWithUser[]>(props.initialInvoices);
+  const [filters, setFilters] = useState({ status: "", from: "", to: "", seller: "", number: "" });
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -146,11 +153,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
     event?.preventDefault();
     startViewTransition(async () => {
       setError(null);
-      const result: ActionResult<InvoiceRow[]> = await listInvoicesAction({
+      const result: ActionResult<InvoiceRowWithUser[]> = await listInvoicesAction({
         sede_id: props.sedeId,
         status: filters.status || undefined,
         from: filters.from || undefined,
         to: filters.to || undefined,
+        user_id: filters.seller || undefined,
+        consecutive_number: filters.number ? parseInt(filters.number, 10) : undefined,
       });
       if (!result.success) {
         setError(result.message);
@@ -338,7 +347,32 @@ export function InvoicesClient(props: InvoicesClientProps) {
     return acc + qty * price;
   }, 0);
   const draftDiscount = toNumber(discount) ?? 0;
-  const draftTotal = Math.max(0, draftSubtotal - draftDiscount);
+  const draftSubtotalAfterDiscount = Math.max(0, draftSubtotal - draftDiscount);
+  
+  // Calcular impuestos en tiempo real usando los impuestos activos de la sede
+  const draftTaxes = props.taxes.reduce((acc, tax) => {
+    const percent = tax.percent ?? 0;
+    return acc + Math.round(draftSubtotalAfterDiscount * (percent / 100) * 100) / 100;
+  }, 0);
+  const draftTotal = Math.max(0, draftSubtotalAfterDiscount + draftTaxes);
+
+  // Recargo por método en vivo (tarjeta 5%): fee sobre el NETO de cada
+  // porción; el cliente paga el bruto. Misma fórmula que el servidor.
+  const draftFees = portions.map((portion) => {
+    const net = toNumber(portion.amount) ?? 0;
+    const feePercent = Number(props.methods.find((row) => row.code === portion.method_code)?.fee_percent ?? 0);
+    const fee = Math.round(net * (feePercent / 100) * 100) / 100;
+    return { method_code: portion.method_code, net, feePercent, fee, gross: net + fee };
+  });
+  const draftSurcharge = draftFees.reduce((acc, row) => acc + row.fee, 0);
+  const draftFeeLabel = draftFees
+    .filter((row) => row.fee > 0)
+    .map((row) => `${row.method_code} ${row.feePercent}%`)
+    .join(", ");
+  const draftGrandTotal = draftTotal + draftSurcharge;
+
+  // Determinar si hay pago inmediato (para botón "Emitir y pagar")
+  const hasImmediatePayment = portions.some((p) => (toNumber(p.amount) ?? 0) > 0);
 
   function draftItemName(item: ItemDraft): string {
     if (item.item_type === "producto") {
@@ -371,14 +405,16 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   else setCreateDialogOpen(open);
                 }}
               >
-                <DialogTrigger asChild>
-                  <Button variant="default">
-                    <Plus className="h-4 w-4" aria-hidden="true" />
-                    Emitir factura
-                  </Button>
-                </DialogTrigger>
-                <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none">
-                  <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
+                <button
+                  type="button"
+                  onClick={() => setCreateDialogOpen(true)}
+                  className="inline-flex h-10 items-center justify-center gap-2 whitespace-nowrap rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-all duration-200 hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 active:scale-[0.98]"
+                >
+                  <Plus className="h-4 w-4" aria-hidden="true" />
+                  Emitir factura
+                </button>
+                <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                  <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
                     <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
                       <div className="flex flex-wrap items-start justify-between gap-4">
                         <div>
@@ -386,7 +422,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           <p className="text-xs text-slate-500">Belleza · Factura de venta</p>
                         </div>
                         <div className="text-right">
-                          <p className="text-lg font-bold">FACTURA DE VENTA</p>
+                          <h2 className="text-lg font-bold">FACTURA DE VENTA</h2>
                           <p className="text-sm text-slate-500">N.º por asignar · {todayStr}</p>
                           <span className="mt-1 inline-block rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800">
                             Borrador
@@ -402,8 +438,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             className={paperInputClass}
                             value={clientName}
                             onChange={(event) => setClientName(event.target.value)}
-                            placeholder="Nombre del cliente"
-                            required
+                            placeholder="Nombre del cliente (opcional)"
                           />
                         </label>
                         <label className="flex flex-col gap-1 text-sm font-medium">
@@ -427,7 +462,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 <th className="px-3 py-2">Empleado</th>
                                 <th className="px-3 py-2 text-right">V. unitario</th>
                                 <th className="px-3 py-2 text-right">Subtotal</th>
-                                <th className="px-3 py-2 text-center">Sin comis.</th>
+                                <th className="px-3 py-2 text-center">¿Comisión?</th>
                                 <th className="px-3 py-2"><span className="sr-only">Quitar</span></th>
                               </tr>
                             </thead>
@@ -467,50 +502,42 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         </SelectContent>
                                       </Select>
                                       {item.item_type === "producto" && (
-                                        <Select
+                                        <Combobox
                                           value={item.ref_id}
                                           onValueChange={(value) => {
                                             patchItem(index, { ref_id: value });
                                             autofillPrice(index, "producto", value);
                                           }}
-                                        >
-                                          <SelectTrigger className={`${paperInputClass} mt-2`} aria-label={`Ítem ${index + 1} producto`}>
-                                            <SelectValue placeholder="Producto…" />
-                                          </SelectTrigger>
-                                          <SelectContent>
-                                            <SelectItem value="">Producto…</SelectItem>
-                                            {props.products
-                                              .filter((row) => row.is_active)
-                                              .map((row) => (
-                                                <SelectItem key={row.id} value={row.id}>
-                                                  {row.name} (stock {row.stock_qty})
-                                                </SelectItem>
-                                              ))}
-                                          </SelectContent>
-                                        </Select>
+                                          placeholder="Producto…"
+                                          options={props.products
+                                            .filter((row) => row.is_active)
+                                            .map((row) => ({
+                                              value: row.id,
+                                              label: row.name,
+                                              description: `Stock: ${row.stock_qty} • 💰 Con comisión`,
+                                            }))}
+                                          ariaLabel={`Ítem ${index + 1} producto`}
+                                          filterPlaceholder="Buscar producto..."
+                                        />
                                       )}
-                                      {item.item_type === "servicio" && (
-                                        <Select
+{item.item_type === "servicio" && (
+                                        <Combobox
                                           value={item.ref_id}
                                           onValueChange={(value) => {
                                             patchItem(index, { ref_id: value });
                                             autofillPrice(index, "servicio", value);
                                           }}
-                                        >
-                                          <SelectTrigger className={`${paperInputClass} mt-2`} aria-label={`Ítem ${index + 1} servicio`}>
-                                            <SelectValue placeholder="Servicio…" />
-                                          </SelectTrigger>
-                                          <SelectContent>
-                                            <SelectItem value="">Servicio…</SelectItem>
-                                            {props.services
-                                              .filter((row) => row.is_active)
-                                              .map((row) => (
-                                                <SelectItem key={row.id} value={row.id}>
-                                                  {row.name}
-                                                </SelectItem>
-                                              ))}
-                                          </SelectContent>
-                                        </Select>
+                                          placeholder="Servicio…"
+                                          options={props.services
+                                            .filter((row) => row.is_active)
+                                            .map((row) => ({
+                                              value: row.id,
+                                              label: row.name,
+                                              description: "(sin comisión)",
+                                            }))}
+                                          ariaLabel={`Ítem ${index + 1} servicio`}
+                                          filterPlaceholder="Buscar servicio..."
+                                        />
                                       )}
                                       {item.item_type === "custom" && (
                                         <input
@@ -525,23 +552,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                       <p className="mt-1 text-xs text-slate-500">{draftItemName(item)}</p>
                                     </td>
                                     <td className="min-w-[150px] px-3 py-2">
-                                      <Select
+<Combobox
                                         value={item.employee_id}
                                         onValueChange={(value) => patchItem(index, { employee_id: value })}
-                                      >
-                                        <SelectTrigger className={paperInputClass} aria-label={`Ítem ${index + 1} empleado`}>
-                                          <SelectValue placeholder="Empleado…" />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                          <SelectItem value="">Empleado…</SelectItem>
-                                          {props.employees.map((row) => (
-                                            <SelectItem key={row.id} value={row.id}>
-                                              {row.document}
-                                              {row.employee_code ? ` (${row.employee_code})` : ""}
-                                            </SelectItem>
-                                          ))}
-                                        </SelectContent>
-                                      </Select>
+                                        placeholder="Empleado…"
+                                        options={props.employees.map((row) => ({
+                                          value: row.id,
+                                          label: row.full_name,
+                                          description: `${row.employee_code ?? ''} · ${row.document ?? ''}`.trim(),
+                                        }))}
+                                        ariaLabel={`Ítem ${index + 1} empleado`}
+                                        filterPlaceholder="Buscar empleado..."
+                                      />
                                     </td>
                                     <td className="px-3 py-2">
                                       <input
@@ -558,13 +580,45 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                       {formatMoney(lineQty * linePrice)}
                                     </td>
                                     <td className="px-3 py-2 text-center">
-                                      <Checkbox
-                                        checked={item.no_commission}
-                                        onCheckedChange={(checked) =>
-                                          patchItem(index, { no_commission: checked === true })
-                                        }
-                                        aria-label={`Ítem ${index + 1} sin comisión`}
-                                      />
+                                      {item.item_type === "servicio" ? (
+                                        <span className="text-xs text-slate-500">Sin comisión</span>
+                                      ) : item.item_type === "custom" ? (
+                                        <div className="flex flex-col gap-1">
+                                          <label className="flex items-center gap-1.5 text-sm">
+                                            <input
+                                              type="checkbox"
+                                              checked={!item.no_commission}
+                                              onChange={(e) => patchItem(index, { no_commission: !e.target.checked })}
+                                              className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                                            />
+                                            <span className="text-slate-600">¿Tiene comisión?</span>
+                                          </label>
+                                          {!item.no_commission && (
+                                            <input
+                                              type="number"
+                                              className={`${paperInputClass} w-20`}
+                                              value={item.commission_value ?? ""}
+                                              onChange={(e) => patchItem(index, { commission_value: e.target.value === "" ? null : Number(e.target.value) })}
+                                              placeholder="%"
+                                              min={0}
+                                              max={100}
+                                              step={0.01}
+                                              inputMode="decimal"
+                                              aria-label={`Ítem ${index + 1} valor comisión`}
+                                            />
+                                          )}
+                                        </div>
+                                      ) : (
+                                        <label className="flex items-center gap-1.5 text-sm">
+                                          <input
+                                            type="checkbox"
+                                            checked={!item.no_commission}
+                                            onChange={(e) => patchItem(index, { no_commission: !e.target.checked })}
+                                            className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                                          />
+                                          <span className="text-slate-600">¿Tiene comisión?</span>
+                                        </label>
+                                      )}
                                     </td>
                                     <td className="px-3 py-2">
                                       {items.length > 1 && (
@@ -683,13 +737,19 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 />
                               </dd>
                             </div>
-                            <div className="flex justify-between gap-3 text-slate-500">
+                            <div className="flex justify-between gap-3">
                               <dt>Impuestos</dt>
-                              <dd>se liquidan al emitir</dd>
+                              <dd className="font-medium">{formatMoney(draftTaxes)}</dd>
                             </div>
+                            {draftSurcharge > 0 && (
+                              <div className="flex justify-between gap-3 text-emerald-700">
+                                <dt>Recargo{draftFeeLabel !== "" ? ` (${draftFeeLabel})` : ""}</dt>
+                                <dd className="font-medium">+{formatMoney(draftSurcharge)}</dd>
+                              </div>
+                            )}
                             <div className="flex justify-between gap-3 border-t-2 border-slate-900 pt-2 text-lg font-black">
                               <dt>TOTAL</dt>
-                              <dd>{formatMoney(draftTotal)}</dd>
+                              <dd>{formatMoney(draftGrandTotal)}</dd>
                             </div>
                           </dl>
                         </div>
@@ -711,9 +771,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           <button
                             type="submit"
                             disabled={busy}
-                            className="h-10 rounded-md bg-slate-900 px-6 text-sm font-semibold text-white hover:bg-slate-700 disabled:opacity-50"
+                            className="h-10 rounded-md bg-emerald-700 px-6 text-sm font-semibold text-white hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 disabled:opacity-50"
                           >
-                            {busy ? "Emitiendo…" : "Emitir factura"}
+                            {busy ? "Emitiendo…" : hasImmediatePayment ? "Emitir y pagar" : "Emitir factura"}
                           </button>
                         </div>
                       </form>
@@ -741,6 +801,35 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   <SelectItem value="Anulada">Anulada</SelectItem>
                 </SelectContent>
               </Select>
+            </Label>
+            <Label className="min-w-[10rem]">
+              Vendedor
+              <Combobox
+                value={filters.seller}
+                onValueChange={(seller) => setFilters({ ...filters, seller })}
+                placeholder="Todos"
+                allowClear
+                clearLabel="Todos"
+                options={props.employees
+                  .filter((row) => row.is_active)
+                  .map((row) => ({
+                    value: row.id,
+                    label: row.full_name,
+                    description: row.employee_code ?? '',
+                  }))}
+                ariaLabel="Filtrar por vendedor"
+                filterPlaceholder="Buscar vendedor..."
+              />
+            </Label>
+            <Label className="min-w-[10rem]">
+              Nº Factura
+              <Input
+                className={inputClass}
+                value={filters.number}
+                onChange={(event) => setFilters({ ...filters, number: event.target.value })}
+                placeholder="#123"
+                inputMode="numeric"
+              />
             </Label>
             <Label className="min-w-[10rem]">
               Desde
@@ -773,11 +862,20 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   "flex flex-wrap items-center justify-between gap-2 rounded-lg border border-color-2 bg-surface px-3 py-2 dark:border-border-color",
                 )}
               >
-                <span className="text-sm">
-                  <strong>#{row.consecutive_number}</strong> · {row.client_name} ·{" "}
-                  {formatMoney(row.total)} ·{" "}
-                  <Badge variant={invoiceStatusVariant(row.status)}>{row.status}</Badge>
-                </span>
+                <div className="flex flex-wrap items-center gap-3 min-w-0 flex-1">
+                  <span className="text-sm font-mono font-semibold text-slate-700 dark:text-slate-300">
+                    #{row.consecutive_number}
+                  </span>
+                  <span className="text-sm text-slate-500 dark:text-slate-400 whitespace-nowrap">
+                    {new Date(row.created_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}
+                  </span>
+                  <span className="text-sm text-slate-600 dark:text-slate-300 truncate max-w-[180px]">
+                    {row.user_name ?? "—"}
+                  </span>
+                  <Badge variant={invoiceStatusVariant(row.status)} className="whitespace-nowrap">
+                    {row.status}
+                  </Badge>
+                </div>
                 {props.detailMode !== "none" && (props.detailMode === "full" || row.status === "Emitida") && (
                 <Dialog open={detailDialogOpen} onOpenChange={(open) => {
                   if (!open) {
@@ -787,21 +885,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   }
                   setDetailDialogOpen(open);
                 }}>
-                  <DialogTrigger asChild>
-                    <Button
+                  <button
                       type="button"
-                      variant="outline"
-                      size="sm"
                       aria-label={`Ver detalle de la factura ${row.consecutive_number}`}
                       onClick={() => openDetail(row.id)}
+                      className="inline-flex h-9 items-center justify-center gap-2 whitespace-nowrap rounded-md border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 shadow-sm transition-all duration-200 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 focus-visible:ring-offset-2 active:scale-[0.98]"
                     >
                       <Eye className="h-4 w-4" aria-hidden="true" />
                       Ver detalle
-                    </Button>
-                  </DialogTrigger>
+                    </button>
                   {detail && (
-                    <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none">
-                      <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
+                    <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                      <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
                         <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
                           <div className="flex flex-wrap items-start justify-between gap-4">
                             <div>
@@ -809,12 +904,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               <p className="text-xs text-slate-500">Belleza · Factura de venta</p>
                             </div>
                             <div className="text-right">
-                              <p className="text-lg font-bold">
+                              <h2 className="text-lg font-bold">
                                 FACTURA #{detail.invoice.consecutive_number}{" "}
                                 <Badge variant={invoiceStatusVariant(detail.invoice.status)}>
                                   {detail.invoice.status}
                                 </Badge>
-                              </p>
+                              </h2>
                               <p className="text-sm text-slate-500">
                                 {new Date(detail.invoice.created_at).toLocaleDateString("es-CO", {
                                   year: "numeric",
@@ -847,9 +942,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 <tr className="bg-slate-100 text-xs uppercase tracking-wide text-slate-500">
                                   <th className="px-3 py-2">#</th>
                                   <th className="px-3 py-2">Descripción</th>
+                                  <th className="px-3 py-2">Empleado</th>
                                   <th className="px-3 py-2 text-right">Cant.</th>
                                   <th className="px-3 py-2 text-right">V. unitario</th>
                                   <th className="px-3 py-2 text-right">Subtotal</th>
+                                  <th className="px-3 py-2 text-center">¿Comisión?</th>
                                 </tr>
                               </thead>
                               <tbody>
@@ -858,15 +955,37 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     <td className="px-3 py-2 font-semibold">{index + 1}</td>
                                     <td className="px-3 py-2">
                                       {row.item_type === "custom" && row.custom_name ? row.custom_name : row.item_type}
+                                      {row.item_type === "custom" && row.commission_value !== null && row.commission_value !== undefined && !row.no_commission && (
+                                        <span className="ml-2 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                                          Comisión: {row.commission_value}%
+                                        </span>
+                                      )}
                                       {row.no_commission && (
                                         <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">
                                           Sin comisión
                                         </span>
                                       )}
                                     </td>
+                                    <td className="px-3 py-2">
+                                      {row.employee_full_name ?? "—"}
+                                      {row.employee_code ? (
+                                        <span className="text-xs text-slate-500"> ({row.employee_code})</span>
+                                      ) : null}
+                                    </td>
                                     <td className="px-3 py-2 text-right">{row.qty}</td>
                                     <td className="px-3 py-2 text-right">{formatMoney(row.unit_price)}</td>
                                     <td className="px-3 py-2 text-right font-medium">{formatMoney(row.subtotal)}</td>
+                                    <td className="px-3 py-2 text-center">
+                                      {row.item_type === "servicio" ? (
+                                        <span className="text-xs text-slate-500">Sin comisión</span>
+                                      ) : row.no_commission ? (
+                                        <span className="text-slate-500">No</span>
+                                      ) : row.item_type === "custom" && row.commission_value !== null && row.commission_value !== undefined ? (
+                                        <span className="font-medium text-emerald-700">{row.commission_value}%</span>
+                                      ) : (
+                                        <span className="text-emerald-700">Sí</span>
+                                      )}
+                                    </td>
                                   </tr>
                                 ))}
                               </tbody>
@@ -895,6 +1014,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 <dt>Impuestos</dt>
                                 <dd className="font-medium">{formatMoney(detail.invoice.tax)}</dd>
                               </div>
+                              {Number(detail.invoice.surcharge ?? 0) > 0 && (
+                                <div className="flex justify-between gap-3 text-emerald-700">
+                                  <dt>Recargo</dt>
+                                  <dd className="font-medium">+{formatMoney(Number(detail.invoice.surcharge))}</dd>
+                                </div>
+                              )}
                               <div className="flex justify-between gap-3 border-t-2 border-slate-900 pt-2 text-lg font-black">
                                 <dt>TOTAL</dt>
                                 <dd>{formatMoney(detail.invoice.total)}</dd>
@@ -906,6 +1031,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             {detail.payments.map((row) => (
                               <li key={row.id}>
                                 {row.method_code} = {formatMoney(row.amount)}
+                                {row.fee_amount > 0 && (
+                                  <span className="ml-2 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                                    recargo {row.fee_percent}%: +{formatMoney(row.fee_amount)}
+                                  </span>
+                                )}
                               </li>
                             ))}
                             {detail.payments.length === 0 && (

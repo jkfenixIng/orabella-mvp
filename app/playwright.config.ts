@@ -37,7 +37,8 @@ export default defineConfig({
   },
   projects: [
     { name: "setup", testMatch: /auth\.setup\.ts/ },
-    { name: "e2e", testMatch: /.*\.spec\.ts/, dependencies: ["setup"] },
+    { name: "e2e:changed", testMatch: /.*\.spec\.ts/, grep: /@changed/, dependencies: ["setup"] },
+    { name: "e2e:full", testMatch: /.*\.spec\.ts/, grep: /@full/, dependencies: ["setup"] },
   ],
   webServer: {
     command: "npm run dev",

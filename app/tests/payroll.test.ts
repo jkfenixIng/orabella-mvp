@@ -70,6 +70,7 @@ describe("payroll: cálculo mixto con detail_json reproducible (PAY-02/PAY-03)",
       unit_price: 200000,
       line_subtotal: 200000,
       commission: computeLineCommission(200000, 10),
+      commission_value: null,
     },
     {
       employee_id: "emp-1",
@@ -81,6 +82,7 @@ describe("payroll: cálculo mixto con detail_json reproducible (PAY-02/PAY-03)",
       unit_price: 150000,
       line_subtotal: 300000,
       commission: computeLineCommission(300000, 10),
+      commission_value: null,
     },
   ];
 

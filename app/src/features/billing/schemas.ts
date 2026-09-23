@@ -43,6 +43,7 @@ export const invoiceItemSchema = z
     unit_price: moneySchema("El precio"),
     discount: moneySchema("El descuento").default(0),
     no_commission: z.boolean().optional().default(false),
+    commission_value: z.coerce.number().min(0).max(100).optional().nullable(),
   })
   .superRefine((value, context) => {
     const fail = (message: string) => context.addIssue({ code: "custom", message });
@@ -61,6 +62,12 @@ export const invoiceItemSchema = z
         if (!value.custom_name?.trim()) fail("La línea personalizada exige un nombre.");
         if (value.product_id) fail("La línea personalizada no lleva producto.");
         if (value.service_id) fail("La línea personalizada no lleva servicio.");
+        if (!value.no_commission && (value.commission_value === undefined || value.commission_value === null || value.commission_value < 0 || value.commission_value > 100)) {
+          fail("La línea personalizada con comisión exige un valor de comisión (0-100).");
+        }
+        if (value.no_commission && value.commission_value !== undefined && value.commission_value !== null) {
+          fail("La línea personalizada sin comisión no debe tener valor de comisión.");
+        }
         break;
     }
     const lineGross = value.qty * value.unit_price;
@@ -79,7 +86,7 @@ export type PaymentPortionInput = z.infer<typeof paymentPortionSchema>;
 
 /** FAC-01…07: creación de factura (descuento a nivel factura + porciones). */
 export const createInvoiceSchema = z.object({
-  client_name: z.string().trim().min(1, "Nombre del cliente requerido.").max(120, "Nombre muy largo."),
+  client_name: z.string().trim().max(120, "Nombre muy largo.").optional(),
   client_document: z.string().trim().max(20, "Documento inválido.").nullish(),
   items: z.array(invoiceItemSchema).min(1, "La factura exige al menos un ítem."),
   discount: moneySchema("El descuento").default(0),
@@ -148,7 +155,32 @@ export interface InvoiceTotals {
   base: number;
   taxes: TaxSnapshot[];
   tax: number;
+  surcharge: number;
   total: number;
+}
+
+/**
+ * Recargo por método (p. ej. tarjeta 5%): fee = neto × feePercent / 100
+ * por porción. El cliente paga el BRUTO (neto + recargo). Puro.
+ */
+export interface CardFee {
+  method_code: string;
+  net: number;
+  feePercent: number;
+  fee: number;
+  gross: number;
+}
+
+export function computeCardFees(
+  portions: Array<{ method_code: string; amount: number }>,
+  feeByMethod: (methodCode: string) => number,
+): CardFee[] {
+  return portions.map((portion) => {
+    const net = roundMoney(portion.amount);
+    const feePercent = feeByMethod(portion.method_code) ?? 0;
+    const fee = roundMoney((net * feePercent) / 100);
+    return { method_code: portion.method_code, net, feePercent, fee, gross: roundMoney(net + fee) };
+  });
 }
 
 /**
@@ -160,6 +192,7 @@ export function computeInvoiceTotals(args: {
   items: Array<{ qty: number; unit_price: number; discount: number }>;
   discount: number;
   activeTaxes: ActiveTax[];
+  surcharge?: number;
 }): InvoiceTotals {
   const subtotal = roundMoney(
     args.items.reduce((acc, item) => acc + computeLineSubtotal(item).subtotal, 0),
@@ -171,7 +204,8 @@ export function computeInvoiceTotals(args: {
   const base = roundMoney(Math.max(0, subtotal - discount));
   const taxes = snapshotInvoiceTaxes(args.activeTaxes, base);
   const tax = roundMoney(taxes.reduce((acc, row) => acc + row.amount, 0));
-  return { subtotal, discount, base, taxes, tax, total: roundMoney(base + tax) };
+  const surcharge = roundMoney(args.surcharge ?? 0);
+  return { subtotal, discount, base, taxes, tax, surcharge, total: roundMoney(base + tax + surcharge) };
 }
 
 export interface SplitCheck {
@@ -246,6 +280,7 @@ export function buildReversalReasons(args: {
 }
 
 /** Motivo OUT de stock al facturar (trazable al consecutivo). */
-export function buildInvoiceOutReason(consecutiveNumber: number, clientName: string): string {
-  return `FACTURA #${consecutiveNumber} — ${clientName.trim().slice(0, 120)}`;
+export function buildInvoiceOutReason(consecutiveNumber: number, clientName: string | null | undefined): string {
+  const name = clientName?.trim() ?? "Cliente sin nombre";
+  return `FACTURA #${consecutiveNumber} — ${name.slice(0, 120)}`;
 }
