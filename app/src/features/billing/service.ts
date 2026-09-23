@@ -183,7 +183,7 @@ export interface InvoiceListItem extends InvoiceRow {
 }
 
 /** Tamaño de página del listado de facturas. */
-export const INVOICE_PAGE_SIZE = 20;
+export const INVOICE_PAGE_SIZE = 10;
 
 function dateBound(value: string, end: boolean): string {
   const trimmed = value.trim();

@@ -199,7 +199,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
 
   // Debe coincidir con INVOICE_PAGE_SIZE del servicio (import por valor
   // arrastraría código de servidor al cliente).
-  const INVOICE_CLIENT_PAGE_SIZE = 20;
+  const INVOICE_CLIENT_PAGE_SIZE = 10;
   const invoicePageCount = Math.max(1, Math.ceil(totalInvoices / INVOICE_CLIENT_PAGE_SIZE));
 
   function patchDraft(patch: Partial<ItemDraft>) {
