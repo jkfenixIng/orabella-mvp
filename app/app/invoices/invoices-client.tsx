@@ -437,6 +437,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
   // Determinar si hay pago inmediato (para botón "Emitir y pagar")
   const hasImmediatePayment = portions.some((p) => (toNumber(p.amount) ?? 0) > 0);
 
+  // Métodos ya usados en otras porciones: cada método se cobra una sola vez.
+  const usedMethodCodes = new Set(portions.map((portion) => portion.method_code));
+  const firstFreeMethod =
+    props.methods.find((row) => row.is_active !== false && !usedMethodCodes.has(row.code))?.code ?? null;
+
   function draftItemName(item: ItemDraft): string {
     if (item.item_type === "producto") {
       return props.products.find((row) => row.id === item.ref_id)?.name ?? "Producto por elegir";
@@ -860,11 +865,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     <SelectValue placeholder="Método de pago" />
                                   </SelectTrigger>
                                   <SelectContent>
-                                    {props.methods.map((row) => (
-                                      <SelectItem key={row.id} value={row.code}>
-                                        {row.name}
-                                      </SelectItem>
-                                    ))}
+                                    {props.methods
+                                      .filter(
+                                        (row) =>
+                                          row.is_active !== false &&
+                                          (row.code === portion.method_code || !usedMethodCodes.has(row.code)),
+                                      )
+                                      .map((row) => (
+                                        <SelectItem key={row.id} value={row.code}>
+                                          {row.name}
+                                          {row.fee_percent > 0 ? ` (+${row.fee_percent}%)` : ""}
+                                        </SelectItem>
+                                      ))}
                                   </SelectContent>
                                 </Select>
                               </label>
@@ -898,12 +910,30 @@ export function InvoicesClient(props: InvoicesClientProps) {
 
                         <button
                           type="button"
-                          onClick={() => setPortions((prev) => [...prev, { method_code: "efectivo", amount: "" }])}
-                          className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 text-sm font-medium text-slate-600 hover:bg-slate-50"
+                          disabled={!firstFreeMethod}
+                          title={!firstFreeMethod ? "Todos los métodos ya están en uso" : undefined}
+                          onClick={() =>
+                            setPortions((prev) => [
+                              ...prev,
+                              {
+                                method_code:
+                                  props.methods.find(
+                                    (row) =>
+                                      row.is_active !== false &&
+                                      !prev.some((portion) => portion.method_code === row.code),
+                                  )?.code ?? "efectivo",
+                                amount: "",
+                              },
+                            ])
+                          }
+                          className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           <Banknote className="h-4 w-4" aria-hidden="true" />
                           Dividir cobro (agregar porción)
                         </button>
+                        {!firstFreeMethod && (
+                          <p className="text-xs text-slate-500">Todos los métodos ya están en uso.</p>
+                        )}
 
                         <div className="flex justify-end">
                           <dl className="w-full max-w-xs space-y-1 text-sm text-slate-900">
