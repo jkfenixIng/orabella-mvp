@@ -13,6 +13,13 @@ import type {
   VoucherSettingsRow,
 } from "@/src/features/payroll/service";
 import type { EmployeeRow } from "@/src/features/admin/service";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/src/components/ui/lib/dialog";
 import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 
 const inputClass =
@@ -94,6 +101,9 @@ export function VouchersClient(props: VouchersClientProps) {
   const [reviewNote, setReviewNote] = useState("");
   const [rejectReason, setRejectReason] = useState("");
   const [busy, setBusy] = useState(false);
+  // V1: sin topes configurados no se puede solicitar; el alta vive en un modal.
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const configured = settings !== null;
 
   function show<T>(result: ActionResult<T>, okText?: string): result is { success: true; data: T } {
     if (!result.success) {
@@ -175,6 +185,7 @@ export function VouchersClient(props: VouchersClientProps) {
       setVoucherAmount("");
       setVoucherDate("");
       setVoucherNote("");
+      setIsCreateOpen(false);
       await refreshVouchers();
     }
   }
@@ -216,12 +227,35 @@ export function VouchersClient(props: VouchersClientProps) {
       )}
 
       <section className={sectionClass}>
-        <h2 className="text-lg font-semibold">Vales</h2>
-        <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-          Topes vigentes: día {settings ? formatMoney(settings.max_per_day) : "sin configurar"} · semana{" "}
-          {settings ? formatMoney(settings.max_per_week) : "sin configurar"} · días{" "}
-          {settings?.allowed_days ? settings.allowed_days.map((day) => DAY_NAMES[day - 1]?.label ?? day).join(", ") : "todos"}.
-        </p>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-semibold">Vales</h2>
+            <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+              Topes vigentes: día {settings ? formatMoney(settings.max_per_day) : "sin configurar"} · semana{" "}
+              {settings ? formatMoney(settings.max_per_week) : "sin configurar"} · días{" "}
+              {settings?.allowed_days ? settings.allowed_days.map((day) => DAY_NAMES[day - 1]?.label ?? day).join(", ") : "todos"}.
+            </p>
+          </div>
+          {props.canIssue && (
+            <button
+              type="button"
+              title={!configured ? "Configure los topes antes de solicitar vales" : undefined}
+              disabled={!configured}
+              onClick={() => {
+                setMessage(null);
+                setIsCreateOpen(true);
+              }}
+              className={`${buttonClass} disabled:cursor-not-allowed disabled:opacity-50`}
+            >
+              Solicitar vale
+            </button>
+          )}
+        </div>
+        {!configured && (
+          <p role="status" className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
+            Los vales no están configurados: un administrador debe definir topes y días permitidos antes de solicitar.
+          </p>
+        )}
         {props.canAdmin && (
           <form onSubmit={handleLimits} className="mt-3 flex flex-wrap items-end gap-3">
             <label className={labelClass}>
@@ -253,36 +287,54 @@ export function VouchersClient(props: VouchersClientProps) {
           </form>
         )}
         {props.canIssue && (
-        <form onSubmit={handleRequestVoucher} className="mt-4 flex flex-wrap items-end gap-3">
-          <label className={labelClass}>
-            Empleado
-            <select value={voucherEmployee} onChange={(event) => setVoucherEmployee(event.target.value)} className={inputClass}>
-              <option value="">Seleccione…</option>
-              {props.initialEmployees
-                .filter((row) => row.is_active)
-                .map((row) => (
-                  <option key={row.id} value={row.id}>
-                    {employeeName(row.id)}
-                  </option>
-                ))}
-            </select>
-          </label>
-          <label className={labelClass}>
-            Monto
-            <input value={formatMoneyInput(voucherAmount)} onChange={(event) => setVoucherAmount(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
-          </label>
-          <label className={labelClass}>
-            Fecha (opcional)
-            <input type="date" value={voucherDate} onChange={(event) => setVoucherDate(event.target.value)} className={inputClass} />
-          </label>
-          <label className={labelClass}>
-            Observación (opcional)
-            <input value={voucherNote} onChange={(event) => setVoucherNote(event.target.value)} className={inputClass} />
-          </label>
-          <button type="submit" disabled={busy} className={buttonClass}>
-            Solicitar vale
-          </button>
-        </form>
+          <Dialog
+            open={isCreateOpen}
+            onOpenChange={(open) => {
+              if (!open) setIsCreateOpen(false);
+              else setIsCreateOpen(true);
+            }}
+          >
+            <DialogContent className="max-w-lg">
+              <DialogHeader>
+                <DialogTitle>Solicitar vale</DialogTitle>
+              </DialogHeader>
+              <form onSubmit={handleRequestVoucher} className="mt-3 flex flex-col gap-3">
+                <label className={labelClass}>
+                  Empleado
+                  <select value={voucherEmployee} onChange={(event) => setVoucherEmployee(event.target.value)} className={inputClass}>
+                    <option value="">Seleccione…</option>
+                    {props.initialEmployees
+                      .filter((row) => row.is_active)
+                      .map((row) => (
+                        <option key={row.id} value={row.id}>
+                          {employeeName(row.id)}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+                <label className={labelClass}>
+                  Monto
+                  <input value={formatMoneyInput(voucherAmount)} onChange={(event) => setVoucherAmount(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
+                </label>
+                <label className={labelClass}>
+                  Fecha (opcional)
+                  <input type="date" value={voucherDate} onChange={(event) => setVoucherDate(event.target.value)} className={inputClass} />
+                </label>
+                <label className={labelClass}>
+                  Observación (opcional)
+                  <input value={voucherNote} onChange={(event) => setVoucherNote(event.target.value)} className={inputClass} />
+                </label>
+                <DialogFooter>
+                  <button type="button" className={ghostClass} onClick={() => setIsCreateOpen(false)}>
+                    Cancelar
+                  </button>
+                  <button type="submit" disabled={busy} className={buttonClass}>
+                    {busy ? "Solicitando…" : "Solicitar vale"}
+                  </button>
+                </DialogFooter>
+              </form>
+            </DialogContent>
+          </Dialog>
         )}
         <ul className="mt-4 flex flex-col gap-2">
           {vouchers.map((row) => (
