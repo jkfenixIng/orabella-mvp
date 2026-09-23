@@ -291,6 +291,7 @@ interface CashClientProps {
   currentUserId: string;
   initialRegisters: CashRegisterRow[];
   initialOpenShift: CashShiftRow | null;
+  initialOpenerName: string | null;
   initialDay: DayView;
   initialHistory: HistoryResult;
   methods: PaymentMethodRow[];
@@ -334,9 +335,10 @@ export function CashClient(props: CashClientProps) {
   // Solo quien abrió cierra; el admin es la válvula para no bloquear la caja.
   const isOpener = openShift !== null && openShift.opened_by === props.currentUserId;
   const canClose = props.canWrite && (isOpener || props.isAdmin);
-  // Columnas dinámicas: una columna por método digital arqueable.
+  // Columnas dinámicas: una columna por método activo (desglose de
+  // ventas cobrado real, aunque no sea arqueable).
   const methodCols = props.methods.filter(
-    (method) => method.is_active && method.arqueable && method.code !== "efectivo",
+    (method) => method.is_active && method.code !== "efectivo",
   );
   // Paginadores: el historial pagina en servidor (los rangos pueden
   // traer más de una página); el día pagina en cliente sobre lo cargado.
@@ -574,7 +576,11 @@ export function CashClient(props: CashClientProps) {
       )}
 
       <section className={sectionClass}>
-        <h2 className="text-lg font-semibold">Turno actual</h2>
+        <h2 className="text-lg font-semibold">
+          {openShift && props.initialOpenerName
+            ? `Turno actual de ${props.initialOpenerName}`
+            : "Turno actual"}
+        </h2>
         {openShift ? (
           <div className="mt-3 flex flex-col gap-2 text-sm">
             <p>
