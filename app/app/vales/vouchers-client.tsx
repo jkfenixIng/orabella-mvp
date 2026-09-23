@@ -41,6 +41,9 @@ const sectionClass = cn(
 );
 const errorClass = cn("text-sm text-error dark:text-error");
 const okClass = cn("text-sm text-success dark:text-success");
+const tableCellClass = cn("px-3 py-2 align-middle");
+const tableHeaderClass = cn("bg-surface-hover text-xs font-semibold uppercase text-text-tertiary");
+const tableRowClass = cn("border-t border-border-color dark:border-border-color-2");
 
 type ActionResult<T> =
   | { success: true; data: T }
@@ -124,6 +127,12 @@ export function VouchersClient(props: VouchersClientProps) {
   // colisionar con reviewTarget (aprobar/rechazar) ni con isCreateOpen.
   const [detailTarget, setDetailTarget] = useState<VoucherRequestRow | null>(null);
   const [busy, setBusy] = useState(false);
+  // Filtros del listado: se aplican en cliente sobre los vales ya cargados
+  // (el backend no expone un filtro combinado, así que se resuelve aquí).
+  const [statusFilter, setStatusFilter] = useState("");
+  const [employeeFilter, setEmployeeFilter] = useState("");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
   // V1: sin topes configurados no se puede solicitar; el alta vive en un modal.
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const configured = settings !== null;
@@ -288,6 +297,17 @@ export function VouchersClient(props: VouchersClientProps) {
     closeReview();
   }
 
+  // Filtrado en cliente: estado exacto, empleado por nombre/ID interno y rango
+  // de fechas de solicitud (request_date es ISO yyyy-mm-dd, comparable como texto).
+  const filteredVouchers = vouchers.filter((row) => {
+    if (statusFilter !== "" && row.status !== statusFilter) return false;
+    if (dateFrom !== "" && row.request_date < dateFrom) return false;
+    if (dateTo !== "" && row.request_date > dateTo) return false;
+    const query = employeeFilter.trim().toLowerCase();
+    if (query !== "" && !employeeName(row.employee_id).toLowerCase().includes(query)) return false;
+    return true;
+  });
+
   return (
     <div className="flex flex-col gap-6">
       {message && (
@@ -410,43 +430,122 @@ export function VouchersClient(props: VouchersClientProps) {
             </DialogContent>
           </Dialog>
         )}
-        <ul className="mt-4 flex flex-col gap-2">
-          {vouchers.map((row) => (
-            <li key={row.id} className="flex flex-wrap items-center gap-2 text-sm">
-              <span>
-                {employeeName(row.employee_id)} · {formatMoney(row.amount)} · {row.request_date}
-              </span>
-              <span className="rounded bg-surface-hover px-2 py-0.5 text-xs text-text-secondary">
-                {row.status}
-                {row.status === "descontada" ? " (en nómina: sin cambios)" : ""}
-              </span>
-              {row.method_code && <span className="text-xs">Método: {row.method_code}</span>}
-              {row.observation && <span className="text-xs text-text-tertiary">{row.observation}</span>}
-              <button
-                type="button"
-                onClick={() => {
-                  setMessage(null);
-                  setDetailTarget(row);
-                }}
-                className={ghostClass}
-                aria-label={`Ver detalle del vale de ${employeeName(row.employee_id)}`}
-              >
-                Ver detalle
-              </button>
-              {props.canAdmin && row.status === "pendiente" && (
-                <>
-                  <button type="button" onClick={() => openReview(row.id, "approve")} disabled={busy} className={ghostClass}>
-                    Aprobar
-                  </button>
-                  <button type="button" onClick={() => openReview(row.id, "reject")} disabled={busy} className={ghostClass}>
-                    Rechazar
-                  </button>
-                </>
-              )}
-            </li>
-          ))}
-          {vouchers.length === 0 && <li className="text-sm text-text-tertiary">Sin vales todavía.</li>}
-        </ul>
+        <div className="mt-4 flex flex-wrap items-end gap-3">
+          <label className={labelClass}>
+            Estado
+            <select
+              value={statusFilter}
+              onChange={(event) => setStatusFilter(event.target.value)}
+              className={inputClass}
+            >
+              <option value="">Todos</option>
+              <option value="pendiente">Pendiente</option>
+              <option value="aprobada">Aprobada</option>
+              <option value="rechazada">Rechazada</option>
+              <option value="descontada">Descontada</option>
+            </select>
+          </label>
+          <label className={labelClass}>
+            Empleado
+            <input
+              value={employeeFilter}
+              onChange={(event) => setEmployeeFilter(event.target.value)}
+              placeholder="Nombre o ID interno"
+              className={inputClass}
+            />
+          </label>
+          <label className={labelClass}>
+            Desde
+            <input
+              type="date"
+              value={dateFrom}
+              onChange={(event) => setDateFrom(event.target.value)}
+              className={inputClass}
+            />
+          </label>
+          <label className={labelClass}>
+            Hasta
+            <input
+              type="date"
+              value={dateTo}
+              onChange={(event) => setDateTo(event.target.value)}
+              className={inputClass}
+            />
+          </label>
+        </div>
+        {vouchers.length === 0 ? (
+          <p className="mt-4 text-sm text-text-tertiary">Sin vales todavía.</p>
+        ) : filteredVouchers.length === 0 ? (
+          <p className="mt-4 text-sm text-text-tertiary">Sin vales para estos filtros.</p>
+        ) : (
+          <div className="mt-4 overflow-x-auto">
+            <table className={cn("w-full text-left text-sm", "min-w-[760px]")}>
+              <thead>
+                <tr className={tableHeaderClass}>
+                  <th className={tableCellClass} scope="col">
+                    Empleado
+                  </th>
+                  <th className={tableCellClass} scope="col">
+                    Monto
+                  </th>
+                  <th className={tableCellClass} scope="col">
+                    Fecha
+                  </th>
+                  <th className={tableCellClass} scope="col">
+                    Estado
+                  </th>
+                  <th className={tableCellClass} scope="col">
+                    Método
+                  </th>
+                  <th className={tableCellClass} scope="col">
+                    Acciones
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredVouchers.map((row) => (
+                  <tr key={row.id} className={tableRowClass}>
+                    <td className={cn(tableCellClass, "font-medium")}>{employeeName(row.employee_id)}</td>
+                    <td className={tableCellClass}>{formatMoney(row.amount)}</td>
+                    <td className={tableCellClass}>{row.request_date}</td>
+                    <td className={tableCellClass}>
+                      <span className="rounded bg-surface-hover px-2 py-0.5 text-xs text-text-secondary">
+                        {row.status}
+                        {row.status === "descontada" ? " (en nómina: sin cambios)" : ""}
+                      </span>
+                    </td>
+                    <td className={tableCellClass}>{methodLabel(row.method_code)}</td>
+                    <td className={tableCellClass}>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setMessage(null);
+                            setDetailTarget(row);
+                          }}
+                          className={ghostClass}
+                          aria-label={`Ver detalle del vale de ${employeeName(row.employee_id)}`}
+                        >
+                          Ver detalle
+                        </button>
+                        {props.canAdmin && row.status === "pendiente" && (
+                          <>
+                            <button type="button" onClick={() => openReview(row.id, "approve")} disabled={busy} className={ghostClass}>
+                              Aprobar
+                            </button>
+                            <button type="button" onClick={() => openReview(row.id, "reject")} disabled={busy} className={ghostClass}>
+                              Rechazar
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
         {/* Detalle de solo lectura: disponible para cualquier rol, sin acciones. */}
         <Dialog
           open={detailTarget !== null}
@@ -461,7 +560,6 @@ export function VouchersClient(props: VouchersClientProps) {
             {detailTarget && (
               <dl className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <DetailField label="Empleado">{employeeName(detailTarget.employee_id)}</DetailField>
-                <DetailField label="Identificador">{detailTarget.id}</DetailField>
                 <DetailField label="Monto">{formatMoney(detailTarget.amount)}</DetailField>
                 <DetailField label="Fecha de solicitud">{detailTarget.request_date}</DetailField>
                 <DetailField label="Estado">
@@ -469,9 +567,7 @@ export function VouchersClient(props: VouchersClientProps) {
                   {detailTarget.status === "descontada" ? " (en nómina: sin cambios)" : ""}
                 </DetailField>
                 <DetailField label="Método de pago">{methodLabel(detailTarget.method_code)}</DetailField>
-                <DetailField label="Turno de caja">{detailTarget.cash_shift_id ?? "-"}</DetailField>
                 <DetailField label="Observación">{detailTarget.observation ?? "-"}</DetailField>
-                <DetailField label="Código histórico">{detailTarget.approval_code ?? "-"}</DetailField>
               </dl>
             )}
             <DialogFooter>

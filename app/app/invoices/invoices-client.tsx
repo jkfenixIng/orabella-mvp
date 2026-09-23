@@ -13,6 +13,7 @@ import {
 import { getOpenShiftAction } from "@/src/features/cash/actions";
 import type {
   InvoiceDetail,
+  InvoiceItemRow,
   InvoiceListItem,
 } from "@/src/features/billing/service";
 import type { ProductRow } from "@/src/features/inventory/service";
@@ -843,6 +844,23 @@ export function InvoicesClient(props: InvoicesClientProps) {
   }
 
   /**
+   * Nombre visible de un ítem ya emitido. El detalle no trae el nombre del
+   * catálogo (solo product_id/service_id), así que se resuelve contra los
+   * catálogos cargados en el cliente. Si el id no está disponible (ítem
+   * inactivo o de otra sede), se usa una etiqueta genérica en lugar de
+   * mostrar el tipo crudo o un identificador interno.
+   */
+  function detailItemName(row: InvoiceItemRow): string {
+    if (row.item_type === "producto") {
+      return props.products.find((product) => product.id === row.product_id)?.name ?? "Producto";
+    }
+    if (row.item_type === "servicio") {
+      return props.services.find((service) => service.id === row.service_id)?.name ?? "Servicio";
+    }
+    return row.custom_name?.trim() ? row.custom_name : "Ítem personalizado";
+  }
+
+  /**
    * Botón "Modo cliente": alterna la vista para mostrar la factura en
    * pantalla. Activo oculta empleado y comisión (datos internos de nómina).
    */
@@ -1525,7 +1543,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   <tr key={row.id} className="border-t border-slate-200">
                                     <td className="px-3 py-2 font-semibold">{index + 1}</td>
                                     <td className="px-3 py-2">
-                                      {row.item_type === "custom" && row.custom_name ? row.custom_name : row.item_type}
+                                      {detailItemName(row)}
                                       {!clientView &&
                                         row.item_type !== "servicio" &&
                                         !row.no_commission &&
