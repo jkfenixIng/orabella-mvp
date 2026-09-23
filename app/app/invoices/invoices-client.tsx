@@ -32,7 +32,6 @@ import {
 } from "@/src/components/ui/lib/card";
 import {
   Dialog,
-  DialogClose,
   DialogContent,
 } from "@/src/components/ui/lib/dialog";
 import { Input } from "@/src/components/ui/lib/input";
@@ -264,6 +263,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
       setMotivo("");
       setDetailDialogOpen(true);
     });
+  }
+
+  function closeDetail() {
+    setDetail(null);
+    setMotivo("");
+    setSplitDraft({ method_code: "efectivo", amount: "" });
+    setDetailDialogOpen(false);
   }
 
   async function submitInvoice(event: FormEvent) {
@@ -1144,24 +1150,23 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   </Badge>
                 </div>
                 {props.detailMode !== "none" && (props.detailMode === "full" || row.status === "Emitida") && (
-                <Dialog open={detailDialogOpen} onOpenChange={(open) => {
-                  if (!open) {
-                    setDetail(null);
-                    setMotivo("");
-                    setSplitDraft({ method_code: "efectivo", amount: "" });
-                  }
-                  setDetailDialogOpen(open);
-                }}>
                   <button
-                      type="button"
-                      aria-label={`Ver detalle de la factura ${row.consecutive_number}`}
-                      onClick={() => openDetail(row.id)}
-                      className="inline-flex h-9 items-center justify-center gap-2 whitespace-nowrap rounded-md border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 shadow-sm transition-all duration-200 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 focus-visible:ring-offset-2 active:scale-[0.98]"
+                    type="button"
+                    aria-label={`Ver detalle de la factura ${row.consecutive_number}`}
+                    onClick={() => openDetail(row.id)}
+                    className="inline-flex h-9 items-center justify-center gap-2 whitespace-nowrap rounded-md border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 shadow-sm transition-all duration-200 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 focus-visible:ring-offset-2 active:scale-[0.98]"
+                  >
+                    <Eye className="h-4 w-4" aria-hidden="true" />
+                    Ver detalle
+                  </button>
+                )}
+                  {detail && detail.invoice.id === row.id && (
+                    <Dialog
+                      open={detailDialogOpen}
+                      onOpenChange={(isOpen) => {
+                        if (!isOpen) closeDetail();
+                      }}
                     >
-                      <Eye className="h-4 w-4" aria-hidden="true" />
-                      Ver detalle
-                    </button>
-                  {detail && (
                     <DialogContent className="max-w-4xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
                       <div className="rounded-xl bg-white text-slate-900 shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
                         <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
@@ -1393,21 +1398,19 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           )}
                         </div>
                         <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-6 py-4 sm:px-8">
-                          <DialogClose asChild>
-                            <button
-                              type="button"
-                              className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100"
-                            >
-                              Cerrar
-                            </button>
-                          </DialogClose>
+                          <button
+                            type="button"
+                            onClick={closeDetail}
+                            className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                          >
+                            Cerrar
+                          </button>
                         </div>
                       </div>
                     </DialogContent>
+                    </Dialog>
                   )}
-                </Dialog>
-                )}
-              </li>
+                </li>
             ))}
             {invoices.length === 0 && (
               <li className="text-sm text-text-secondary">Sin facturas para estos filtros.</li>
