@@ -47,7 +47,7 @@ Out:
 - [x] C1 Caja todos los pagos + dueño del turno (HECHO ceeac9a 2026-09-23; columnas todos los activos no-efectivo aunque no arqueables; título "Turno actual de {nombre}").
 - [x] G1 Validación temprana caja (HECHO 9d050d3 2026-09-23; bloqueo de entrada a emitir/editar/pagar sin caja propia con motivo y dueño del turno; admin exento; backend sigue validando).
 - [x] V1 Vales gating + layout (HECHO 12dd333 2026-09-23; sin config → mensaje + solicitud bloqueada; alta en modal; lista debajo).
-- [ ] V2 Config vales wizard: días todos/indicados → topes sin/diarios/semanales/ambos → tope por día o general.
+- [x] V2 Config vales wizard (HECHO 6fb3f0d 2026-09-23; días todos/indicados → topes sin/diarios/semanales/ambos → tope propio por día o mismo; decisión de producto: el tope por día REEMPLAZA al general ese día; migración 026 vuelve opcionales los topes y agrega per_day_limits jsonb — PENDIENTE de aplicar en PRUEBAS).
 - [x] U1 Uniformidad modales (HECHO 673d3cd 2026-09-23; apilado de z-index por nivel en dialog.tsx → el modal de abajo sí se atenúa/desenfoca; overlay manual duplicado eliminado en invoices).
 - [ ] U2 Uniformidad de estilos (auditoría HECHA, refactor pendiente): payroll-client y vouchers-client no usan `cn` ni los tokens compartidos; invoices mantiene 24 clases de la hoja-factura (decisión de diseño deliberada). No bloqueante para pruebas.
 
@@ -77,6 +77,7 @@ Módulos Facturación, Inventario, Servicios/Catálogos, Alertas, Caja, Vales. R
 - 2026-09-23: V1 hecho (12dd333). Route: direct-inline (1 archivo).
 - 2026-09-23: U1 hecho (673d3cd). Route: direct-inline (2 archivos). Auditoría U2 solo lectura.
 - 2026-09-23: PENDIENTE BLOQUEADO V2: requiere DDL (topes opcionales + tope por día) y decisión de producto sobre la forma del tope por día.
+- 2026-09-23: V2 hecho (6fb3f0d). Decisión de producto: el tope por día REEMPLAZA al general ese día. Route: direct-inline (5 archivos).
 
 ## Verification evidence
 - F2 (bf7dc96): `npm run typecheck` 0 errores; `npm test` 11 archivos 210/210.
@@ -85,10 +86,14 @@ Módulos Facturación, Inventario, Servicios/Catálogos, Alertas, Caja, Vales. R
 - V1 (12dd333): `npm run typecheck` 0 errores; `eslint` limpio; `npm test` 210/210.
 - U1 (673d3cd): `npm run typecheck` 0 errores; `eslint` limpio; `npm test` 210/210; `playwright --list` 18 tests en 9 archivos.
 - Auditoría U2 (solo lectura): todos los clientes usan el Dialog compartido salvo alerts-client (sin modal); `cn` ausente en payroll-client y vouchers-client; invoices conserva 24 clases de hoja-factura (deliberado).
+- V2 (6fb3f0d): `npm run typecheck` 0 errores; `eslint` limpio; `npm test` 11 archivos 218/218 (8 pruebas nuevas: normalización, reemplazo del general, sin topes, esquema, migración 026).
+- PENDIENTE USUARIO: aplicar 026 en PRUEBAS (topes opcionales + per_day_limits).
 - (pendiente por item)
 
 ## Next step
-- V2 Config vales wizard (requiere evaluar DDL para tope por día).
+- Aplicar 026 en PRUEBAS y probar el wizard de vales.
+- I1 y S1 siguen bloqueados por P1 (comisión por producto vs línea) y P2 (alcance de Catálogos).
+- U2 refactor de estilos (no bloqueante).
 
 ## Route declaration
 - Delegated-direct por item (writer trigger 2+ archivos); inline solo mecánico de 1 archivo.
