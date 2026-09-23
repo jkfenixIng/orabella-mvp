@@ -62,8 +62,8 @@ export const invoiceItemSchema = z
         if (!value.custom_name?.trim()) fail("La línea personalizada exige un nombre.");
         if (value.product_id) fail("La línea personalizada no lleva producto.");
         if (value.service_id) fail("La línea personalizada no lleva servicio.");
-        if (!value.no_commission && (value.commission_value === undefined || value.commission_value === null || value.commission_value < 0)) {
-          fail("La línea personalizada con comisión exige el valor de la comisión en pesos.");
+        if (value.commission_value !== undefined && value.commission_value !== null && value.commission_value < 0) {
+          fail("El valor de la comisión no puede ser negativo.");
         }
         if (value.no_commission && value.commission_value !== undefined && value.commission_value !== null) {
           fail("La línea personalizada sin comisión no debe tener valor de comisión.");
@@ -135,7 +135,7 @@ export interface OldInvoiceItem {
   unit_price: number;
   discount: number;
   no_commission: boolean | null | undefined;
-  commission_value: number | null | undefined;
+  commission_value?: number | null | undefined;
 }
 
 export interface InvoiceItemsDiff {

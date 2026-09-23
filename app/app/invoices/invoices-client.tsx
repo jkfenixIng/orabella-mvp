@@ -4,6 +4,7 @@ import { useState, useTransition, type FormEvent } from "react";
 import {
   annulInvoiceAction,
   createInvoiceAction,
+  editInvoiceAction,
   getInvoiceAction,
   listInvoicesAction,
   splitPaymentAction,
@@ -150,6 +151,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
   const [detail, setDetail] = useState<InvoiceDetail | null>(null);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [detailDialogOpen, setDetailDialogOpen] = useState(false);
+  type EditItemDraft = ItemDraft & { id?: string; discount: number };
+  const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
+  const [editItems, setEditItems] = useState<EditItemDraft[]>([]);
+  const [editPayments, setEditPayments] = useState<Array<{ id: string; method_code: string }>>([]);
+  const [editMotivo, setEditMotivo] = useState("");
+  const [editError, setEditError] = useState<string | null>(null);
   const [clientName, setClientName] = useState("");
   const [clientDocument, setClientDocument] = useState("");
   const [discount, setDiscount] = useState("");
@@ -195,6 +202,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
 
   function patchDraft(patch: Partial<ItemDraft>) {
     setItemDraft((prev) => ({ ...prev, ...patch }));
+  }
+
+  function patchEditItem(index: number, patch: Partial<EditItemDraft>) {
+    setEditItems((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
   }
 
   function autofillDraftPrice(type: ItemDraft["item_type"], refId: string) {
@@ -292,6 +303,127 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setMotivo("");
     setSplitDraft({ method_code: "efectivo", amount: "" });
     setDetailDialogOpen(false);
+  }
+
+  function toEditDraft(row: {
+    id: string;
+    item_type: string;
+    product_id: string | null;
+    service_id: string | null;
+    custom_name: string | null;
+    employee_id: string;
+    qty: number | string;
+    unit_price: number | string;
+    discount: number | string;
+    no_commission: boolean | null;
+    commission_value: number | string | null;
+  }): EditItemDraft {
+    return {
+      id: row.id,
+      item_type: row.item_type as ItemDraft["item_type"],
+      ref_id: row.product_id ?? row.service_id ?? "",
+      custom_name: row.custom_name ?? "",
+      employee_id: row.employee_id,
+      qty: String(row.qty),
+      unit_price: String(row.unit_price),
+      discount: Number(row.discount),
+      no_commission: Boolean(row.no_commission),
+      commission_value: row.commission_value == null ? null : Number(row.commission_value),
+    };
+  }
+
+  async function openEdit(id: string) {
+    setError(null);
+    setBusy(true);
+    try {
+      const result: ActionResult<InvoiceDetail> = await getInvoiceAction(id);
+      if (!result.success) {
+        setError(result.message);
+        return;
+      }
+      const current = result.data;
+      setDetail(current);
+      setEditItems(current.items.map(toEditDraft));
+      setEditPayments(current.payments.map((payment) => ({ id: payment.id, method_code: payment.method_code })));
+      setEditMotivo("");
+      setEditError(null);
+      setIsEditDialogOpen(true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitEdit() {
+    if (!detail) return;
+    setEditError(null);
+    const parsedItems = [];
+    for (const [index, item] of editItems.entries()) {
+      const qty = toNumber(item.qty);
+      const price = toNumber(item.unit_price);
+      if (item.item_type === "producto" && !item.ref_id) {
+        setEditError(`Ítem ${index + 1}: elija el producto.`);
+        return;
+      }
+      if (item.item_type === "servicio" && !item.ref_id) {
+        setEditError(`Ítem ${index + 1}: elija el servicio.`);
+        return;
+      }
+      if (item.item_type === "custom" && item.custom_name.trim() === "") {
+        setEditError(`Ítem ${index + 1}: describa el ítem.`);
+        return;
+      }
+      if (!item.employee_id) {
+        setEditError(`Ítem ${index + 1}: el empleado es requerido.`);
+        return;
+      }
+      if (qty == null || !Number.isInteger(qty) || qty <= 0) {
+        setEditError(`Ítem ${index + 1}: cantidad inválida.`);
+        return;
+      }
+      if (price == null || price < 0) {
+        setEditError(`Ítem ${index + 1}: precio inválido.`);
+        return;
+      }
+      if (item.item_type === "custom" && !item.no_commission) {
+        if (item.commission_value == null || !(item.commission_value >= 0)) {
+          setEditError(`Ítem ${index + 1}: indique el valor de la comisión.`);
+          return;
+        }
+      }
+      parsedItems.push({
+        ...(item.id ? { id: item.id } : {}),
+        item_type: item.item_type,
+        product_id: item.item_type === "producto" ? item.ref_id || null : null,
+        service_id: item.item_type === "servicio" ? item.ref_id || null : null,
+        custom_name: item.item_type === "custom" ? item.custom_name || null : null,
+        employee_id: item.employee_id,
+        qty,
+        unit_price: price,
+        discount: item.discount,
+        no_commission: item.no_commission,
+        commission_value: item.item_type === "custom" && !item.no_commission ? item.commission_value : null,
+      });
+    }
+    setBusy(true);
+    try {
+      const result: ActionResult<InvoiceDetail> = await editInvoiceAction(detail.invoice.id, {
+        motivo: editMotivo,
+        items: parsedItems,
+        payments: editPayments,
+      });
+      if (!result.success) {
+        setEditError(`[${result.code}] ${result.message}`);
+        return;
+      }
+      setDetail(result.data);
+      setIsEditDialogOpen(false);
+      setNotice(
+        `Factura #${result.data.invoice.consecutive_number} actualizada (total intacto ${formatMoney(result.data.invoice.total)}).`,
+      );
+      await applyFilters(undefined, invoicePage);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function submitInvoice(event: FormEvent) {
@@ -470,6 +602,29 @@ export function InvoicesClient(props: InvoicesClientProps) {
 
   // Determinar si hay pago inmediato (para botón "Emitir y pagar")
   const hasImmediatePayment = portions.some((p) => (toNumber(p.amount) ?? 0) > 0);
+
+  // Medidor de conciliación de edición: el total nunca cambia.
+  const editSubtotal = editItems.reduce((acc, item) => {
+    const qty = toNumber(item.qty) ?? 0;
+    const price = toNumber(item.unit_price) ?? 0;
+    return acc + qty * price;
+  }, 0);
+  const editSubtotalOk =
+    detail !== null && Math.abs(editSubtotal - Number(detail.invoice.subtotal)) < 0.01;
+  const editFeeRows = (detail?.payments ?? []).map((payment) => {
+    const draft = editPayments.find((row) => row.id === payment.id);
+    const code = draft?.method_code ?? payment.method_code;
+    const feePct = Number(props.methods.find((row) => row.code === code)?.fee_percent ?? 0);
+    return { id: payment.id, code, feePct, ok: feePct === Number(payment.fee_percent ?? 0) };
+  });
+  const editFeesOk = editFeeRows.every((row) => row.ok);
+  const canSaveEdit =
+    detail !== null &&
+    editItems.length > 0 &&
+    editMotivo.trim() !== "" &&
+    editSubtotalOk &&
+    editFeesOk &&
+    !busy;
 
   function totalizePortions() {
     const firstEmpty = portions.findIndex((portion) => portion.amount.trim() === "");
@@ -1234,9 +1389,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   {props.canAnnul && (
                     <button
                       type="button"
-                      title="Gestionar factura"
-                      aria-label={`Gestionar factura ${row.consecutive_number}`}
-                      onClick={() => openDetail(row.id)}
+                      title="Editar factura (solo admin, con motivo)"
+                      aria-label={`Editar factura ${row.consecutive_number}`}
+                      onClick={() => openEdit(row.id)}
                       className="rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
                     >
                       <Pencil className="h-4 w-4" aria-hidden="true" />
@@ -1500,6 +1655,316 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         </div>
                       </div>
                     </DialogContent>
+                    </Dialog>
+                  )}
+                  {props.canAnnul && (
+                    <Dialog
+                      open={isEditDialogOpen}
+                      onOpenChange={(isOpen) => {
+                        if (!isOpen) setIsEditDialogOpen(false);
+                      }}
+                    >
+                      <DialogContent className="max-w-5xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                        <div className="rounded-xl bg-white text-slate-900 shadow-2xl">
+                          <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
+                            <div className="flex flex-wrap items-start justify-between gap-4">
+                              <div>
+                                <p className="text-xl font-black tracking-tight">ORABELLA</p>
+                                <p className="text-xs text-slate-500">Edición con motivo y auditoría</p>
+                              </div>
+                              <div className="text-right">
+                                <h2 className="text-lg font-bold">
+                                  EDITAR FACTURA #{detail?.invoice.consecutive_number ?? "—"}
+                                </h2>
+                                <p className="mt-1 text-sm">
+                                  <span className="inline-block rounded-full bg-blue-100 px-2 py-0.5 text-xs font-semibold text-blue-800">
+                                    Total inmutable: {detail ? formatMoney(detail.invoice.total) : "—"}
+                                  </span>
+                                </p>
+                              </div>
+                            </div>
+                          </div>
+                          <div className="flex flex-col gap-5 px-6 py-5 sm:px-8">
+                            <label className="flex flex-col gap-1 text-sm font-medium">
+                              Motivo de la edición (obligatorio, queda auditado)
+                              <input
+                                className={paperInputClass}
+                                value={editMotivo}
+                                onChange={(event) => setEditMotivo(event.target.value)}
+                                placeholder="Ej. Servicio mal depreciado: se ajusta y agrega kit"
+                              />
+                            </label>
+                            <div className="overflow-x-auto rounded-lg border border-slate-200">
+                              <table className="w-full min-w-[860px] text-left text-sm text-slate-900">
+                                <thead>
+                                  <tr className="bg-slate-100 text-xs uppercase tracking-wide text-slate-500">
+                                    <th className="px-3 py-2">#</th>
+                                    <th className="px-3 py-2">Cant.</th>
+                                    <th className="px-3 py-2">Descripción</th>
+                                    <th className="px-3 py-2">Empleado</th>
+                                    <th className="px-3 py-2 text-right">V. unitario</th>
+                                    <th className="px-3 py-2 text-right">Subtotal</th>
+                                    <th className="px-3 py-2 text-center">Comisión</th>
+                                    <th className="px-3 py-2"><span className="sr-only">Quitar</span></th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {editItems.map((item, index) => {
+                                    const lineQty = toNumber(item.qty) ?? 0;
+                                    const linePrice = toNumber(item.unit_price) ?? 0;
+                                    return (
+                                      <tr key={item.id ?? `nuevo-${index}`} className="border-t border-slate-200 align-top">
+                                        <td className="px-3 py-2 font-semibold">{index + 1}</td>
+                                        <td className="px-3 py-2">
+                                          <input
+                                            className={`${paperInputClass} w-20`}
+                                            value={item.qty}
+                                            onChange={(event) => patchEditItem(index, { qty: event.target.value })}
+                                            placeholder="1"
+                                            inputMode="numeric"
+                                            aria-label={`Editar ítem ${index + 1} cantidad`}
+                                          />
+                                        </td>
+                                        <td className="min-w-[220px] px-3 py-2">
+                                          {item.item_type === "producto" && (
+                                            <Combobox
+                                              value={item.ref_id}
+                                              onValueChange={(value) => {
+                                                patchEditItem(index, { ref_id: value });
+                                                const found = props.products.find((row) => row.id === value);
+                                                if (found?.sale_price != null) {
+                                                  patchEditItem(index, { unit_price: String(found.sale_price) });
+                                                }
+                                              }}
+                                              placeholder="Producto…"
+                                              options={props.products
+                                                .filter((row) => row.is_active)
+                                                .map((row) => ({
+                                                  value: row.id,
+                                                  label: row.name,
+                                                  description: `Stock: ${row.stock_qty}`,
+                                                }))}
+                                              ariaLabel={`Editar ítem ${index + 1} producto`}
+                                              filterPlaceholder="Escriba para filtrar…"
+                                            />
+                                          )}
+                                          {item.item_type === "servicio" && (
+                                            <Combobox
+                                              value={item.ref_id}
+                                              onValueChange={(value) => {
+                                                patchEditItem(index, { ref_id: value });
+                                                const found = props.services.find((row) => row.id === value);
+                                                if (found) patchEditItem(index, { unit_price: String(found.price) });
+                                              }}
+                                              placeholder="Servicio…"
+                                              options={props.services
+                                                .filter((row) => row.is_active)
+                                                .map((row) => ({ value: row.id, label: row.name }))}
+                                              ariaLabel={`Editar ítem ${index + 1} servicio`}
+                                              filterPlaceholder="Escriba para filtrar…"
+                                            />
+                                          )}
+                                          {item.item_type === "custom" && (
+                                            <input
+                                              className={paperInputClass}
+                                              value={item.custom_name}
+                                              onChange={(event) => patchEditItem(index, { custom_name: event.target.value })}
+                                              placeholder="Descripción"
+                                              aria-label={`Editar ítem ${index + 1} descripción`}
+                                            />
+                                          )}
+                                          <p className="mt-1 text-xs text-slate-500">
+                                            {item.item_type === "producto"
+                                              ? "Producto"
+                                              : item.item_type === "servicio"
+                                                ? "Servicio"
+                                                : "Personalizado"}
+                                          </p>
+                                        </td>
+                                        <td className="min-w-[150px] px-3 py-2">
+                                          <Combobox
+                                            value={item.employee_id}
+                                            onValueChange={(value) => patchEditItem(index, { employee_id: value })}
+                                            placeholder="Empleado…"
+                                            options={props.employees.map((row) => ({
+                                              value: row.id,
+                                              label: row.full_name,
+                                              description: row.employee_code ? `ID ${row.employee_code}` : undefined,
+                                            }))}
+                                            ariaLabel={`Editar ítem ${index + 1} empleado`}
+                                            filterPlaceholder="Escriba para filtrar…"
+                                          />
+                                        </td>
+                                        <td className="px-3 py-2">
+                                          <input
+                                            className={`${paperInputClass} w-28 text-right`}
+                                            value={formatMoneyInput(item.unit_price)}
+                                            onChange={(event) =>
+                                              patchEditItem(index, { unit_price: stripMoneyInput(event.target.value) })
+                                            }
+                                            placeholder="0"
+                                            inputMode="numeric"
+                                            aria-label={`Editar ítem ${index + 1} precio`}
+                                          />
+                                        </td>
+                                        <td className="whitespace-nowrap px-3 py-2 text-right font-medium">
+                                          {formatMoney(lineQty * linePrice)}
+                                        </td>
+                                        <td className="px-3 py-2 text-center">
+                                          {item.item_type === "servicio" ? (
+                                            <span className="text-xs text-slate-500">Sin comisión</span>
+                                          ) : (
+                                            <div className="flex flex-col items-center gap-1">
+                                              <label className="flex items-center gap-1.5 text-sm">
+                                                <input
+                                                  type="checkbox"
+                                                  checked={!item.no_commission}
+                                                  onChange={(event) =>
+                                                    patchEditItem(index, {
+                                                      no_commission: !event.target.checked,
+                                                      commission_value: null,
+                                                    })
+                                                  }
+                                                  className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                                                />
+                                                <span className="text-slate-600">¿Comisión?</span>
+                                              </label>
+                                              {item.item_type === "custom" && !item.no_commission && (
+                                                <input
+                                                  type="number"
+                                                  className={`${paperInputClass} w-28`}
+                                                  value={item.commission_value ?? ""}
+                                                  onChange={(event) =>
+                                                    patchEditItem(index, {
+                                                      commission_value:
+                                                        event.target.value === "" ? null : Number(event.target.value),
+                                                    })
+                                                  }
+                                                  placeholder="Valor $"
+                                                  min={0}
+                                                  step={100}
+                                                  inputMode="decimal"
+                                                  aria-label={`Editar ítem ${index + 1} valor comisión`}
+                                                />
+                                              )}
+                                            </div>
+                                          )}
+                                        </td>
+                                        <td className="px-3 py-2">
+                                          <button
+                                            type="button"
+                                            aria-label={`Quitar ítem ${index + 1}`}
+                                            onClick={() => setEditItems((prev) => prev.filter((_, i) => i !== index))}
+                                            className="rounded-md border border-slate-300 p-2 text-slate-500 hover:bg-slate-100"
+                                          >
+                                            <Trash2 className="h-4 w-4" aria-hidden="true" />
+                                          </button>
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => setEditItems((prev) => [...prev, { ...emptyItem(), discount: 0 }])}
+                              className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 text-sm font-medium text-slate-600 hover:bg-slate-50"
+                            >
+                              <Plus className="h-4 w-4" aria-hidden="true" />
+                              Agregar ítem
+                            </button>
+                            <div>
+                              <h3 className="mb-2 text-sm font-bold uppercase tracking-wide text-slate-500">
+                                Cobros (solo cambia el método, montos intactos)
+                              </h3>
+                              <div className="flex flex-col gap-2">
+                                {(detail?.payments ?? []).map((payment) => {
+                                  const draft = editPayments.find((row) => row.id === payment.id);
+                                  const code = draft?.method_code ?? payment.method_code;
+                                  const feePct = Number(
+                                    props.methods.find((row) => row.code === code)?.fee_percent ?? 0,
+                                  );
+                                  const feeOk = feePct === Number(payment.fee_percent ?? 0);
+                                  return (
+                                    <div key={payment.id} className="flex flex-col gap-2 sm:flex-row sm:items-end">
+                                      <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-slate-900">
+                                        Método ({formatMoney(payment.amount)})
+                                        <Select
+                                          value={code}
+                                          onValueChange={(value) =>
+                                            setEditPayments((prev) =>
+                                              prev.map((row) =>
+                                                row.id === payment.id ? { ...row, method_code: value } : row,
+                                              ),
+                                            )
+                                          }
+                                        >
+                                          <SelectTrigger className={paperInputClass}>
+                                            <SelectValue placeholder="Método" />
+                                          </SelectTrigger>
+                                          <SelectContent>
+                                            {props.methods.map((row) => (
+                                              <SelectItem key={row.id} value={row.code}>
+                                                {row.name}
+                                                {row.fee_percent > 0 ? ` (+${row.fee_percent}%)` : ""}
+                                              </SelectItem>
+                                            ))}
+                                          </SelectContent>
+                                        </Select>
+                                      </label>
+                                      {!feeOk && (
+                                        <p className="text-xs font-medium text-red-700">
+                                          Cambia el recargo: el total no cuadraría.
+                                        </p>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                            <div className="rounded-md bg-slate-50 px-3 py-2 text-sm text-slate-900">
+                              <p>
+                                Subtotal: {formatMoney(editSubtotal)} / emitido{" "}
+                                {detail ? formatMoney(detail.invoice.subtotal) : "—"}{" "}
+                                {editSubtotalOk ? "✓" : "✗ debe cuadrar"}
+                              </p>
+                              <p>
+                                Recargo:{" "}
+                                {editFeesOk
+                                  ? "igual al emitido ✓"
+                                  : "✗ use métodos con igual recargo"}
+                              </p>
+                              <p className="font-semibold">
+                                TOTAL intacto: {detail ? formatMoney(detail.invoice.total) : "—"}
+                              </p>
+                            </div>
+                            {editError && (
+                              <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+                                {editError}
+                              </p>
+                            )}
+                          </div>
+                          <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-6 py-4 sm:px-8">
+                            <button
+                              type="button"
+                              onClick={() => setIsEditDialogOpen(false)}
+                              className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                            >
+                              Cancelar
+                            </button>
+                            <button
+                              type="button"
+                              onClick={submitEdit}
+                              disabled={!canSaveEdit}
+                              title={!canSaveEdit ? "Cuadre subtotal, recargo y motivo para guardar" : undefined}
+                              className="h-10 rounded-md bg-slate-900 px-6 text-sm font-semibold text-white hover:bg-slate-700 disabled:opacity-50"
+                            >
+                              {busy ? "Guardando…" : "Guardar edición"}
+                            </button>
+                          </div>
+                        </div>
+                      </DialogContent>
                     </Dialog>
                   )}
                 </li>

@@ -489,6 +489,9 @@ function toBillingError(error: unknown): BillingError {
   if (error instanceof Error && error.message === "DESCUENTO_EXCEDE") {
     return new BillingError("VALIDATION", "El descuento no puede superar el subtotal.", 400);
   }
+  if (error instanceof Error && error.message.startsWith("TOTAL_MISMATCH")) {
+    return new BillingError("TOTAL_MISMATCH", error.message.replace(/^TOTAL_MISMATCH:\s*/, ""), 422);
+  }
   return new BillingError("INTERNAL", "Error interno.", 500);
 }
 
