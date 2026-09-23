@@ -32,7 +32,7 @@ export default async function AlertsPage() {
 
   const initial = await listAlerts(
     sedeId,
-    { unreadOnly: false, page: 1 },
+    { unreadOnly: true, page: 1 },
   );
 
   return (

@@ -84,7 +84,7 @@ function alertDetail(alert: AlertRow): string {
 
 export function AlertsClient({ initial }: { initial: AlertsResult }) {
   const [result, setResult] = useState<AlertsResult>(initial);
-  const [unreadOnly, setUnreadOnly] = useState(false);
+  const [unreadOnly, setUnreadOnly] = useState(true);
   const [module, setModule] = useState<"caja" | "acceso" | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
