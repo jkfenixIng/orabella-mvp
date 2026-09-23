@@ -40,11 +40,15 @@ export default async function InvoicesPage() {
   const canWrite = session.roles.includes("admin") || session.roles.includes("caja");
   const isAdmin = session.roles.includes("admin");
   const isManager = isAdmin || session.roles.includes("caja");
+  // F1: el listado abre solo con las facturas del día (fecha local del
+  // servidor); el resto se consulta limpiando los filtros de fecha.
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
   // Empleado: solo sus facturas (filtro forzado para que el total cuadre).
-  const pageFilters = { page: 1, ...(isManager ? {} : { user_id: session.user.id }) };
+  const pageFilters = { page: 1, from: today, to: today, ...(isManager ? {} : { user_id: session.user.id }) };
   const [invoices, totalInvoices, products, services, employees, methods, taxes] = await Promise.all([
     listInvoices(sedeId, pageFilters),
-    countInvoices(sedeId, isManager ? {} : { user_id: session.user.id }),
+    countInvoices(sedeId, { from: today, to: today, ...(isManager ? {} : { user_id: session.user.id })}),
     listProducts(sedeId),
     listServices(sedeId),
     listEmployees(sedeId),

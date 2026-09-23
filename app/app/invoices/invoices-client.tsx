@@ -140,11 +140,18 @@ interface InvoicesClientProps {
   detailMode: "full" | "open-only" | "none";
 }
 
+/** Fecha local yyyy-mm-dd (F1: el listado abre solo con las del día). */
+function todayLocalISO(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+}
+
 export function InvoicesClient(props: InvoicesClientProps) {
   const [invoices, setInvoices] = useState<InvoiceListItem[]>(props.initialInvoices);
   const [totalInvoices, setTotalInvoices] = useState(props.initialTotal);
   const [invoicePage, setInvoicePage] = useState(1);
-  const [filters, setFilters] = useState({ status: "", from: "", to: "", seller: "", number: "", closedBy: "", employee: "" });
+  // F1: Desde/Hasta = hoy por defecto; vaciarlas muestra todo el historial.
+  const [filters, setFilters] = useState({ status: "", from: todayLocalISO(), to: todayLocalISO(), seller: "", number: "", closedBy: "", employee: "" });
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
