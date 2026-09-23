@@ -101,15 +101,20 @@ function formatMoney(value: number | string): string {
   }).format(numeric);
 }
 
-function invoiceStatusVariant(status: string): "default" | "success" | "destructive" {
+function invoiceStatusVariant(status: string): "default" | "success" | "destructive" | "secondary" {
   if (status === "Pagada") return "success";
   if (status === "Anulada") return "destructive";
+  if (status === "Emitida") return "secondary";
   return "default";
+}
+
+interface InvoiceRowWithUser extends InvoiceRow {
+  user_name: string | null;
 }
 
 interface InvoicesClientProps {
   sedeId: string;
-  initialInvoices: InvoiceRow[];
+  initialInvoices: InvoiceRowWithUser[];
   products: ProductRow[];
   services: ServiceRow[];
   employees: EmployeeRow[];
@@ -120,8 +125,8 @@ interface InvoicesClientProps {
 }
 
 export function InvoicesClient(props: InvoicesClientProps) {
-  const [invoices, setInvoices] = useState(props.initialInvoices);
-  const [filters, setFilters] = useState({ status: "", from: "", to: "" });
+  const [invoices, setInvoices] = useState<InvoiceRowWithUser[]>(props.initialInvoices);
+  const [filters, setFilters] = useState({ status: "", from: "", to: "", seller: "", number: "" });
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -145,11 +150,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
     event?.preventDefault();
     startViewTransition(async () => {
       setError(null);
-      const result: ActionResult<InvoiceRow[]> = await listInvoicesAction({
+      const result: ActionResult<InvoiceRowWithUser[]> = await listInvoicesAction({
         sede_id: props.sedeId,
         status: filters.status || undefined,
         from: filters.from || undefined,
         to: filters.to || undefined,
+        user_id: filters.seller || undefined,
+        consecutive_number: filters.number ? parseInt(filters.number, 10) : undefined,
       });
       if (!result.success) {
         setError(result.message);
@@ -744,6 +751,38 @@ export function InvoicesClient(props: InvoicesClientProps) {
               </Select>
             </Label>
             <Label className="min-w-[10rem]">
+              Vendedor
+              <Select
+                value={filters.seller}
+                onValueChange={(seller) => setFilters({ ...filters, seller })}
+              >
+                <SelectTrigger className={inputClass}>
+                  <SelectValue placeholder="Todos" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="">Todos</SelectItem>
+                  {props.employees
+                    .filter((row) => row.is_active)
+                    .map((row) => (
+                      <SelectItem key={row.id} value={row.id}>
+                        {row.full_name}
+                        {row.employee_code ? ` (${row.employee_code})` : ""}
+                      </SelectItem>
+                    ))}
+                </SelectContent>
+              </Select>
+            </Label>
+            <Label className="min-w-[10rem]">
+              Nº Factura
+              <Input
+                className={inputClass}
+                value={filters.number}
+                onChange={(event) => setFilters({ ...filters, number: event.target.value })}
+                placeholder="#123"
+                inputMode="numeric"
+              />
+            </Label>
+            <Label className="min-w-[10rem]">
               Desde
               <Input
                 type="date"
@@ -774,11 +813,20 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   "flex flex-wrap items-center justify-between gap-2 rounded-lg border border-color-2 bg-surface px-3 py-2 dark:border-border-color",
                 )}
               >
-                <span className="text-sm">
-                  <strong>#{row.consecutive_number}</strong> · {row.client_name} ·{" "}
-                  {formatMoney(row.total)} ·{" "}
-                  <Badge variant={invoiceStatusVariant(row.status)}>{row.status}</Badge>
-                </span>
+                <div className="flex flex-wrap items-center gap-3 min-w-0 flex-1">
+                  <span className="text-sm font-mono font-semibold text-slate-700 dark:text-slate-300">
+                    #{row.consecutive_number}
+                  </span>
+                  <span className="text-sm text-slate-500 dark:text-slate-400 whitespace-nowrap">
+                    {new Date(row.created_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}
+                  </span>
+                  <span className="text-sm text-slate-600 dark:text-slate-300 truncate max-w-[180px]">
+                    {row.user_name ?? "—"}
+                  </span>
+                  <Badge variant={invoiceStatusVariant(row.status)} className="whitespace-nowrap">
+                    {row.status}
+                  </Badge>
+                </div>
                 {props.detailMode !== "none" && (props.detailMode === "full" || row.status === "Emitida") && (
                 <Dialog open={detailDialogOpen} onOpenChange={(open) => {
                   if (!open) {

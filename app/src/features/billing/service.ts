@@ -151,6 +151,8 @@ export interface InvoiceFilters {
   from?: string;
   to?: string;
   limit?: number;
+  user_id?: string;
+  consecutive_number?: number;
 }
 
 function dateBound(value: string, end: boolean): string {
@@ -163,7 +165,7 @@ function dateBound(value: string, end: boolean): string {
 }
 
 /** Lista facturas de la sede con filtros de estado/fecha (más recientes primero). */
-export async function listInvoices(sedeId: string, filters: InvoiceFilters = {}): Promise<InvoiceRow[]> {
+export async function listInvoices(sedeId: string, filters: InvoiceFilters = {}): Promise<(InvoiceRow & { user_name: string | null })[]> {
   if (filters.status !== undefined && !["Emitida", "Pagada", "Anulada"].includes(filters.status)) {
     throw new BillingError("VALIDATION", "Estado de filtro inválido.", 400);
   }
@@ -171,16 +173,21 @@ export async function listInvoices(sedeId: string, filters: InvoiceFilters = {})
   const db = await billingDb();
   let query = db
     .from("invoices")
-    .select(INVOICE_SELECT)
+    .select(`${INVOICE_SELECT}, users!inner(full_name)`)
     .eq("sede_id", sedeId)
     .order("consecutive_number", { ascending: false })
     .limit(limit);
   if (filters.status) query = query.eq("status", filters.status);
   if (filters.from?.trim()) query = query.gte("created_at", dateBound(filters.from, false));
   if (filters.to?.trim()) query = query.lte("created_at", dateBound(filters.to, true));
+  if (filters.user_id) query = query.eq("user_id", filters.user_id);
+  if (filters.consecutive_number !== undefined) query = query.eq("consecutive_number", filters.consecutive_number);
   const { data, error } = await query;
   if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as InvoiceRow[];
+  return (data ?? []).map((row: any) => ({
+    ...row,
+    user_name: row.users?.full_name ?? null,
+  })) as (InvoiceRow & { user_name: string | null })[];
 }
 
 /** Detalle con ítems, snapshot de impuestos y porciones (solo su sede). */
