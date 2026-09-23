@@ -490,7 +490,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
         unit_price: price,
         discount: item.discount,
         no_commission: item.no_commission,
-        commission_value: item.item_type === "custom" && !item.no_commission ? item.commission_value : null,
+        // La comisión se persiste para producto y custom; servicio no lleva valor.
+        commission_value: item.item_type !== "servicio" && !item.no_commission ? item.commission_value : null,
       });
     }
     setBusy(true);
@@ -625,7 +626,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
         unit_price: price,
         discount: 0,
         no_commission: item.no_commission,
-        commission_value: item.item_type === "custom" && !item.no_commission ? item.commission_value : null,
+        // La comisión se persiste para producto y custom; servicio no lleva valor.
+        commission_value: item.item_type !== "servicio" && !item.no_commission ? item.commission_value : null,
       });
     }
     const parsedPortions = [];
