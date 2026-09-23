@@ -194,7 +194,6 @@ export async function listInvoices(sedeId: string, filters: InvoiceFilters = {})
   const { data, error } = await query;
   if (error) {
     // Diagnóstico servidor (no se expone al cliente): código/mensaje de PostgREST.
-    // eslint-disable-next-line no-console
     console.error("PG listInvoices:", JSON.stringify({ code: error.code, message: error.message, details: error.details, hint: error.hint }));
     throw new BillingError("INTERNAL", "Error interno.", 500);
   }
@@ -233,7 +232,6 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
     db.from("invoice_payments").select(PAYMENT_SELECT).eq("invoice_id", invoice.id).order("created_at"),
   ]);
   if (itemsRes.error || taxesRes.error || paymentsRes.error) {
-    // eslint-disable-next-line no-console
     console.error(
       "PG loadDetail:",
       JSON.stringify({
