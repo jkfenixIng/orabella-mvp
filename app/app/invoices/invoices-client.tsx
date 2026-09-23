@@ -74,6 +74,7 @@ interface ItemDraft {
   qty: string;
   unit_price: string;
   no_commission: boolean;
+  commission_value: number | null;
 }
 
 interface PortionDraft {
@@ -82,7 +83,7 @@ interface PortionDraft {
 }
 
 function emptyItem(): ItemDraft {
-  return { item_type: "servicio", ref_id: "", custom_name: "", employee_id: "", qty: "1", unit_price: "", no_commission: false };
+  return { item_type: "servicio", ref_id: "", custom_name: "", employee_id: "", qty: "1", unit_price: "", no_commission: true, commission_value: null };
 }
 
 function toNumber(value: string): number | null {
@@ -446,7 +447,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 <th className="px-3 py-2">Empleado</th>
                                 <th className="px-3 py-2 text-right">V. unitario</th>
                                 <th className="px-3 py-2 text-right">Subtotal</th>
-                                <th className="px-3 py-2 text-center">Sin comis.</th>
+                                <th className="px-3 py-2 text-center">¿Comisión?</th>
                                 <th className="px-3 py-2"><span className="sr-only">Quitar</span></th>
                               </tr>
                             </thead>
@@ -578,13 +579,45 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                       {formatMoney(lineQty * linePrice)}
                                     </td>
                                     <td className="px-3 py-2 text-center">
-                                      <Checkbox
-                                        checked={item.no_commission}
-                                        onCheckedChange={(checked) =>
-                                          patchItem(index, { no_commission: checked === true })
-                                        }
-                                        aria-label={`Ítem ${index + 1} sin comisión`}
-                                      />
+                                      {item.item_type === "servicio" ? (
+                                        <span className="text-xs text-slate-500">Sin comisión</span>
+                                      ) : item.item_type === "custom" ? (
+                                        <div className="flex flex-col gap-1">
+                                          <label className="flex items-center gap-1.5 text-sm">
+                                            <input
+                                              type="checkbox"
+                                              checked={!item.no_commission}
+                                              onChange={(e) => patchItem(index, { no_commission: !e.target.checked })}
+                                              className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                                            />
+                                            <span className="text-slate-600">¿Tiene comisión?</span>
+                                          </label>
+                                          {!item.no_commission && (
+                                            <input
+                                              type="number"
+                                              className={`${paperInputClass} w-20`}
+                                              value={item.commission_value ?? ""}
+                                              onChange={(e) => patchItem(index, { commission_value: e.target.value === "" ? null : Number(e.target.value) })}
+                                              placeholder="%"
+                                              min={0}
+                                              max={100}
+                                              step={0.01}
+                                              inputMode="decimal"
+                                              aria-label={`Ítem ${index + 1} valor comisión`}
+                                            />
+                                          )}
+                                        </div>
+                                      ) : (
+                                        <label className="flex items-center gap-1.5 text-sm">
+                                          <input
+                                            type="checkbox"
+                                            checked={!item.no_commission}
+                                            onChange={(e) => patchItem(index, { no_commission: !e.target.checked })}
+                                            className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                                          />
+                                          <span className="text-slate-600">¿Tiene comisión?</span>
+                                        </label>
+                                      )}
                                     </td>
                                     <td className="px-3 py-2">
                                       {items.length > 1 && (
@@ -908,6 +941,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   <th className="px-3 py-2 text-right">Cant.</th>
                                   <th className="px-3 py-2 text-right">V. unitario</th>
                                   <th className="px-3 py-2 text-right">Subtotal</th>
+                                  <th className="px-3 py-2 text-center">¿Comisión?</th>
                                 </tr>
                               </thead>
                               <tbody>
@@ -916,6 +950,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     <td className="px-3 py-2 font-semibold">{index + 1}</td>
                                     <td className="px-3 py-2">
                                       {row.item_type === "custom" && row.custom_name ? row.custom_name : row.item_type}
+                                      {row.item_type === "custom" && row.commission_value !== null && row.commission_value !== undefined && !row.no_commission && (
+                                        <span className="ml-2 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                                          Comisión: {row.commission_value}%
+                                        </span>
+                                      )}
                                       {row.no_commission && (
                                         <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">
                                           Sin comisión
@@ -925,6 +964,17 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     <td className="px-3 py-2 text-right">{row.qty}</td>
                                     <td className="px-3 py-2 text-right">{formatMoney(row.unit_price)}</td>
                                     <td className="px-3 py-2 text-right font-medium">{formatMoney(row.subtotal)}</td>
+                                    <td className="px-3 py-2 text-center">
+                                      {row.item_type === "servicio" ? (
+                                        <span className="text-xs text-slate-500">Sin comisión</span>
+                                      ) : row.no_commission ? (
+                                        <span className="text-slate-500">No</span>
+                                      ) : row.item_type === "custom" && row.commission_value !== null && row.commission_value !== undefined ? (
+                                        <span className="font-medium text-emerald-700">{row.commission_value}%</span>
+                                      ) : (
+                                        <span className="text-emerald-700">Sí</span>
+                                      )}
+                                    </td>
                                   </tr>
                                 ))}
                               </tbody>

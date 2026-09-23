@@ -43,6 +43,7 @@ export const invoiceItemSchema = z
     unit_price: moneySchema("El precio"),
     discount: moneySchema("El descuento").default(0),
     no_commission: z.boolean().optional().default(false),
+    commission_value: z.coerce.number().min(0).max(100).optional().nullable(),
   })
   .superRefine((value, context) => {
     const fail = (message: string) => context.addIssue({ code: "custom", message });
@@ -61,6 +62,12 @@ export const invoiceItemSchema = z
         if (!value.custom_name?.trim()) fail("La línea personalizada exige un nombre.");
         if (value.product_id) fail("La línea personalizada no lleva producto.");
         if (value.service_id) fail("La línea personalizada no lleva servicio.");
+        if (!value.no_commission && (value.commission_value === undefined || value.commission_value === null || value.commission_value < 0 || value.commission_value > 100)) {
+          fail("La línea personalizada con comisión exige un valor de comisión (0-100).");
+        }
+        if (value.no_commission && value.commission_value !== undefined && value.commission_value !== null) {
+          fail("La línea personalizada sin comisión no debe tener valor de comisión.");
+        }
         break;
     }
     const lineGross = value.qty * value.unit_price;

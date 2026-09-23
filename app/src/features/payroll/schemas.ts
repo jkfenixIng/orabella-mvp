@@ -100,10 +100,12 @@ export interface CommissionLine {
   unit_price: number;
   line_subtotal: number;
   commission: number;
+  commission_value: number | null;
 }
 
 export interface DetailLine extends CommissionLine {
   employee_id: string;
+  commission_value: number | null;
 }
 
 /**

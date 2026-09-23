@@ -104,11 +104,14 @@ export interface InvoiceItemRow {
   service_id: string | null;
   custom_name: string | null;
   employee_id: string;
+  employee_full_name: string | null;
+  employee_code: string | null;
   qty: number;
   unit_price: number;
   discount: number;
   subtotal: number;
   no_commission: boolean;
+  commission_value: number | null;
 }
 
 export interface InvoiceTaxRow {
@@ -141,7 +144,7 @@ export interface InvoiceDetail {
 const INVOICE_SELECT =
   "id, sede_id, consecutive_number, client_name, client_document, subtotal, discount, tax, total, status, user_id, cash_shift_id, cancel_reason, created_at";
 const ITEM_SELECT =
-  "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission";
+  "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission, commission_value, employees!inner(full_name, employee_code)";
 const TAX_SELECT = "id, invoice_id, tax_code, tax_name, percent, amount";
 const PAYMENT_SELECT = "id, invoice_id, method_id, method_code, amount, created_at";
 
@@ -221,11 +224,18 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
   }
   const payments = (paymentsRes.data ?? []) as InvoicePaymentRow[];
   const paid = round2(payments.reduce((acc, row) => acc + Number(row.amount), 0));
+  const rawItems = (itemsRes.data ?? []) as any[];
+  const items = rawItems.map((item: any) => ({
+    ...item,
+    employee_full_name: item.employees?.[0]?.full_name ?? null,
+    employee_code: item.employees?.[0]?.employee_code ?? null,
+    commission_value: item.commission_value ?? null,
+  })) as InvoiceItemRow[];
   return {
     invoice,
-    items: (itemsRes.data ?? []) as InvoiceItemRow[],
+    items,
     taxes: (taxesRes.data ?? []) as InvoiceTaxRow[],
-    payments,
+    payments: (paymentsRes.data ?? []) as InvoicePaymentRow[],
     paid,
     remaining: round2(Math.max(0, Number(invoice.total) - paid)),
   };

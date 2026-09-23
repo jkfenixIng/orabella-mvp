@@ -59,6 +59,7 @@ describe("billing schemas: línea con un solo origen (FAC-01)", () => {
         qty: 1,
         unit_price: 80000,
         discount: 0,
+        no_commission: true,
       }).success,
     ).toBe(true);
   });
