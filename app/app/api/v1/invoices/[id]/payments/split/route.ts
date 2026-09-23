@@ -27,7 +27,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
     const session = await requireBillingWriter(tokenOf(request));
     const { id } = await context.params;
     const body: unknown = await request.json().catch(() => ({}));
-    const data = await splitPayment(session.sedeId, id, body);
+    const data = await splitPayment(session.sedeId, id, body, { userId: session.userId });
     return ok(data);
   } catch (error) {
     return billingErrorResponse(error);

@@ -116,7 +116,7 @@ export async function annulInvoiceAction(id: string, input: unknown) {
 export async function splitPaymentAction(id: string, input: unknown) {
   try {
     const session = await requireBillingWriter(await sessionToken());
-    const data = await splitPayment(session.sedeId, id, input);
+    const data = await splitPayment(session.sedeId, id, input, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

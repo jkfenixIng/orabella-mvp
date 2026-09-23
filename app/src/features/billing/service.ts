@@ -638,6 +638,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
         status,
         user_id: actor.userId,
         cash_shift_id: cashShiftId,
+        closed_by: status === "Pagada" ? actor.userId : null,
       })
       .select(INVOICE_SELECT)
       .single();
@@ -779,7 +780,7 @@ export async function annulInvoice(
 
   const { data: updated, error: updateError } = await db
     .from("invoices")
-    .update({ status: "Anulada", cancel_reason: motivo })
+    .update({ status: "Anulada", cancel_reason: motivo, closed_by: actor.userId })
     .eq("id", id)
     .select(INVOICE_SELECT)
     .single();
@@ -831,6 +832,7 @@ export async function splitPayment(
   sedeId: string,
   id: string,
   raw: unknown,
+  actor: { userId: string },
 ): Promise<InvoiceDetail> {
   const parsed = splitPaymentSchema.safeParse(raw);
   if (!parsed.success) {
@@ -892,7 +894,7 @@ export async function splitPayment(
   if (check.fullyPaid && detail.invoice.status === "Emitida") {
     const { data: updated, error: updateError } = await db
       .from("invoices")
-      .update({ status: "Pagada" })
+      .update({ status: "Pagada", closed_by: actor.userId })
       .eq("id", id)
       .select(INVOICE_SELECT)
       .single();
