@@ -1,4 +1,5 @@
 import { Skeleton } from "@/src/shared/components/skeleton";
+import { hintTextClass, sectionClass } from "./admin-styles";
 
 /**
  * Skeleton instantáneo de /admin (streaming de Next.js).
@@ -17,14 +18,14 @@ export default function AdminLoading() {
         </div>
       </header>
       <div role="status" className="flex flex-col gap-4">
-        <span className="text-sm text-slate-500 dark:text-slate-400">Cargando…</span>
+        <span className={hintTextClass}>Cargando…</span>
         <div className="flex gap-2">
           <Skeleton className="h-9 w-24" />
           <Skeleton className="h-9 w-24" />
           <Skeleton className="h-9 w-24" />
           <Skeleton className="h-9 w-28" />
         </div>
-        <div className="flex flex-col gap-2 rounded-lg border border-slate-300 p-4 dark:border-slate-700">
+        <div className={`flex flex-col gap-2 ${sectionClass}`}>
           <Skeleton className="h-5 w-full" />
           <Skeleton className="h-5 w-full" />
           <Skeleton className="h-5 w-2/3" />
