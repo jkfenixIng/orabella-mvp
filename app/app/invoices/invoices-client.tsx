@@ -168,9 +168,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
     { method_code: "efectivo", amount: "" },
   ]);
   const [motivo, setMotivo] = useState("");
-  const [confirmEmit, setConfirmEmit] = useState(false);
-  const [confirmPay, setConfirmPay] = useState(false);
-  const [confirmAnnul, setConfirmAnnul] = useState(false);
+  // Modal clásico de confirmación ("¿Está seguro? ...", OK/Cancelar).
+  const [confirmKind, setConfirmKind] = useState<"emit" | "pay" | "annul" | null>(null);
   const [splitDraft, setSplitDraft] = useState<PortionDraft>({ method_code: "efectivo", amount: "" });
 
   function applyFilters(event?: FormEvent, page = 1) {
@@ -285,7 +284,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setDiscount("");
     setItems([]);
     setPortions([{ method_code: "efectivo", amount: "" }]);
-    setConfirmEmit(false);
     setCreateDialogOpen(false);
   }
 
@@ -298,8 +296,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
       }
       setDetail(result.data);
       setMotivo("");
-      setConfirmPay(false);
-      setConfirmAnnul(false);
       setDetailDialogOpen(true);
     });
   }
@@ -308,8 +304,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setDetail(null);
     setMotivo("");
     setSplitDraft({ method_code: "efectivo", amount: "" });
-    setConfirmPay(false);
-    setConfirmAnnul(false);
     setDetailDialogOpen(false);
   }
 
@@ -436,16 +430,69 @@ export function InvoicesClient(props: InvoicesClientProps) {
 
   async function submitInvoice(event: FormEvent) {
     event.preventDefault();
+    if (buildCreatePayload() === null) return;
+    // Validación local superada: pide confirmación clásica antes de emitir.
+    setConfirmKind("emit");
+  }
+
+  async function confirmEmit() {
+    const payload = buildCreatePayload();
+    if (payload === null) {
+      setConfirmKind(null);
+      return;
+    }
+    setBusy(true);
+    let result: ActionResult<InvoiceDetail>;
+    try {
+      result = await createInvoiceAction(payload);
+    } finally {
+      setBusy(false);
+    }
+    if (!result.success) {
+      setError(`[${result.code}] ${result.message}`);
+      setConfirmKind(null);
+      return;
+    }
+    setNotice(`Factura #${result.data.invoice.consecutive_number} ${result.data.invoice.status.toLowerCase()}.`);
+    setClientName("");
+    setClientDocument("");
+    setDiscount("");
+    setItems([]);
+    setPortions([{ method_code: "efectivo", amount: "" }]);
+    setConfirmKind(null);
+    setDetail(result.data);
+    setCreateDialogOpen(false);
+    setDetailDialogOpen(true);
+    await applyFilters();
+  }
+
+  function buildCreatePayload(): {
+    client_name: string;
+    client_document: string | null;
+    items: Array<{
+      item_type: string;
+      product_id: string | null;
+      service_id: string | null;
+      custom_name: string | null;
+      employee_id: string;
+      qty: number;
+      unit_price: number;
+      discount: number;
+      no_commission: boolean;
+    }>;
+    discount: number;
+    payments: Array<{ method_code: string; amount: number }>;
+  } | null {
     setError(null);
     setNotice(null);
     if (items.length === 0) {
       setError("Agregue al menos un ítem a la factura.");
-      return;
+      return null;
     }
     const parsedDiscount = discount.trim() === "" ? 0 : toNumber(discount);
     if (parsedDiscount == null) {
       setError("Descuento inválido.");
-      return;
+      return null;
     }
     const parsedItems = [];
     for (const [index, item] of items.entries()) {
@@ -453,15 +500,15 @@ export function InvoicesClient(props: InvoicesClientProps) {
       const price = toNumber(item.unit_price);
       if (!item.employee_id) {
         setError(`Ítem ${index + 1}: el empleado es requerido.`);
-        return;
+        return null;
       }
       if (qty == null || !Number.isInteger(qty) || qty <= 0) {
         setError(`Ítem ${index + 1}: cantidad inválida.`);
-        return;
+        return null;
       }
       if (price == null || price < 0) {
         setError(`Ítem ${index + 1}: precio inválido.`);
-        return;
+        return null;
       }
       parsedItems.push({
         item_type: item.item_type,
@@ -481,43 +528,35 @@ export function InvoicesClient(props: InvoicesClientProps) {
       if (amount == null) continue;
       if (amount <= 0) {
         setError("Las porciones de pago deben ser mayores a 0.");
-        return;
+        return null;
       }
       parsedPortions.push({ method_code: portion.method_code, amount });
     }
-    setBusy(true);
-    let result: ActionResult<InvoiceDetail>;
-    try {
-      result = await createInvoiceAction({
-        client_name: clientName,
-        client_document: clientDocument.trim() === "" ? null : clientDocument,
-        items: parsedItems,
-        discount: parsedDiscount,
-        payments: parsedPortions,
-      });
-    } finally {
-      setBusy(false);
-    }
-    if (!result.success) {
-      setError(`[${result.code}] ${result.message}`);
-      return;
-    }
-    setNotice(`Factura #${result.data.invoice.consecutive_number} ${result.data.invoice.status.toLowerCase()}.`);
-    setClientName("");
-    setClientDocument("");
-    setDiscount("");
-    setItems([]);
-    setPortions([{ method_code: "efectivo", amount: "" }]);
-    setConfirmEmit(false);
-    setDetail(result.data);
-    setCreateDialogOpen(false);
-    setDetailDialogOpen(true);
-    await applyFilters();
+    return {
+      client_name: clientName,
+      client_document: clientDocument.trim() === "" ? null : clientDocument,
+      items: parsedItems,
+      discount: parsedDiscount,
+      payments: parsedPortions,
+    };
   }
 
   async function submitAnnul(event: FormEvent) {
     event.preventDefault();
     if (!detail) return;
+    if (motivo.trim() === "") {
+      setError("Indique el motivo de anulación.");
+      return;
+    }
+    // Motivo presente: pide confirmación clásica antes de anular.
+    setConfirmKind("annul");
+  }
+
+  async function confirmAnnul() {
+    if (!detail) {
+      setConfirmKind(null);
+      return;
+    }
     setError(null);
     setNotice(null);
     setBusy(true);
@@ -531,11 +570,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
     }
     if (!result.success) {
       setError(`[${result.code}] ${result.message}`);
+      setConfirmKind(null);
       return;
     }
     setNotice(`Factura #${result.data.invoice.consecutive_number} anulada (stock revertido).`);
     setDetail(result.data);
-    setConfirmAnnul(false);
+    setConfirmKind(null);
     await applyFilters(undefined, invoicePage);
   }
 
@@ -545,6 +585,21 @@ export function InvoicesClient(props: InvoicesClientProps) {
     const amount = toNumber(splitDraft.amount);
     if (amount == null || amount <= 0) {
       setError("Monto de la porción inválido.");
+      return;
+    }
+    // Monto válido: pide confirmación clásica antes de pagar.
+    setConfirmKind("pay");
+  }
+
+  async function confirmPay() {
+    if (!detail) {
+      setConfirmKind(null);
+      return;
+    }
+    const amount = toNumber(splitDraft.amount);
+    if (amount == null || amount <= 0) {
+      setError("Monto de la porción inválido.");
+      setConfirmKind(null);
       return;
     }
     setError(null);
@@ -569,7 +624,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     );
     setDetail(result.data);
     setSplitDraft({ method_code: "efectivo", amount: "" });
-    setConfirmPay(false);
+    setConfirmKind(null);
     await applyFilters(undefined, invoicePage);
   }
 
@@ -1221,20 +1276,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           </p>
                         )}
 
-                        <label className="flex items-start gap-2 text-sm text-slate-700">
-                          <input
-                            type="checkbox"
-                            checked={confirmEmit}
-                            onChange={(event) => setConfirmEmit(event.target.checked)}
-                            className="mt-0.5 rounded border-slate-300 text-emerald-700 focus:ring-emerald-500"
-                          />
-                          <span>
-                            {hasImmediatePayment
-                              ? "Va a emitir y cobrar la factura. Después no se podrá modificar. ¿Desea continuar?"
-                              : "Va a emitir la factura. Esto genera un registro permanente que no se podrá eliminar. ¿Desea continuar?"}
-                          </span>
-                        </label>
-
                         <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 pt-4">
                           <button
                             type="button"
@@ -1245,7 +1286,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           </button>
                           <button
                             type="submit"
-                            disabled={busy || !confirmEmit}
+                            disabled={busy}
                             className="h-10 rounded-md bg-emerald-700 px-6 text-sm font-semibold text-white hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 disabled:opacity-50"
                           >
                             {busy ? "Emitiendo…" : hasImmediatePayment ? "Emitir y pagar" : "Emitir factura"}
@@ -1634,21 +1675,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 />
                               </label>
                               </div>
-                              <label className="flex items-start gap-2 text-sm text-slate-700">
-                                <input
-                                  type="checkbox"
-                                  checked={confirmPay}
-                                  onChange={(event) => setConfirmPay(event.target.checked)}
-                                  className="mt-0.5 rounded border-slate-300 text-emerald-700 focus:ring-emerald-500"
-                                />
-                                <span>
-                                  Va a pagar la factura. Después no se podrá modificar. ¿Desea continuar?
-                                </span>
-                              </label>
                               <div>
                               <button
                                 type="submit"
-                                disabled={busy || !confirmPay}
+                                disabled={busy}
                                 className="flex h-10 items-center gap-2 rounded-md bg-slate-200 px-4 text-sm font-medium text-slate-900 hover:bg-slate-300 disabled:opacity-50"
                               >
                                 <Banknote className="h-4 w-4" aria-hidden="true" />
@@ -1672,21 +1702,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 />
                               </label>
                               </div>
-                              <label className="flex items-start gap-2 text-sm text-slate-700">
-                                <input
-                                  type="checkbox"
-                                  checked={confirmAnnul}
-                                  onChange={(event) => setConfirmAnnul(event.target.checked)}
-                                  className="mt-0.5 rounded border-slate-300 text-red-600 focus:ring-red-500"
-                                />
-                                <span>
-                                  Va a anular la factura. Esto revierte el stock y no se puede deshacer. ¿Desea continuar?
-                                </span>
-                              </label>
                               <div>
                               <button
                                 type="submit"
-                                disabled={busy || !confirmAnnul}
+                                disabled={busy}
                                 className="flex h-10 items-center gap-2 rounded-md bg-red-600 px-4 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
                               >
                                 <CircleX className="h-4 w-4" aria-hidden="true" />
@@ -2067,6 +2086,73 @@ export function InvoicesClient(props: InvoicesClientProps) {
           {notice}
         </p>
       )}
+
+      {/* Confirmación clásica: ¿Está seguro? … OK/Cancelar. */}
+      <Dialog
+        open={confirmKind !== null}
+        onOpenChange={(open) => {
+          if (!open && !busy) setConfirmKind(null);
+        }}
+      >
+        <DialogContent className="max-w-sm border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+          <div className="rounded-xl bg-white text-slate-900 shadow-2xl">
+            <div className="px-6 pt-5">
+              <h2 className="text-lg font-bold">
+                {confirmKind === "annul"
+                  ? "Anular factura"
+                  : confirmKind === "pay"
+                    ? "Pagar factura"
+                    : hasImmediatePayment
+                      ? "Emitir y pagar"
+                      : "Emitir factura"}
+              </h2>
+              <p className="mt-2 text-sm text-slate-600">
+                {confirmKind === "annul"
+                  ? `¿Está seguro de anular la factura${detail ? ` #${detail.invoice.consecutive_number}` : ""}? Se revertirá el stock y no se puede deshacer.`
+                  : confirmKind === "pay"
+                    ? `¿Está seguro de registrar el pago de ${formatMoney(toNumber(splitDraft.amount) ?? 0)} (${splitDraft.method_code})${detail ? ` en la factura #${detail.invoice.consecutive_number}` : ""}? Después no se podrá modificar.`
+                    : hasImmediatePayment
+                      ? `¿Está seguro de emitir y cobrar la factura por ${formatMoney(draftGrandTotal)}? Después no se podrá modificar.`
+                      : `¿Está seguro de emitir la factura por ${formatMoney(draftGrandTotal)}? Esta acción genera un registro permanente que no se podrá eliminar.`}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-3 px-6 py-4">
+              <button
+                type="button"
+                onClick={() => setConfirmKind(null)}
+                disabled={busy}
+                className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  if (confirmKind === "annul") void confirmAnnul();
+                  else if (confirmKind === "pay") void confirmPay();
+                  else void confirmEmit();
+                }}
+                className={
+                  confirmKind === "annul"
+                    ? "h-10 rounded-md bg-red-600 px-6 text-sm font-semibold text-white hover:bg-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-2 disabled:opacity-50"
+                    : "h-10 rounded-md bg-emerald-700 px-6 text-sm font-semibold text-white hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 disabled:opacity-50"
+                }
+              >
+                {busy
+                  ? "Procesando…"
+                  : confirmKind === "annul"
+                    ? "Anular factura"
+                    : confirmKind === "pay"
+                      ? "Pagar"
+                      : hasImmediatePayment
+                        ? "Emitir y pagar"
+                        : "Emitir factura"}
+              </button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
