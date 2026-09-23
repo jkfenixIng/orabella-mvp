@@ -477,7 +477,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   Emitir factura
                 </button>
                 <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
-                  <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
+                  <div className="rounded-xl bg-white text-slate-900 shadow-2xl">
                     <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
                       <div className="flex flex-wrap items-start justify-between gap-4">
                         <div>
@@ -611,11 +611,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             else setIsItemDialogOpen(isOpen);
                           }}
                         >
-                          <div
-                            className="fixed inset-0 z-40 bg-slate-950/50 backdrop-blur-[2px]"
-                            aria-hidden="true"
-                            onClick={() => setIsItemDialogOpen(false)}
-                          />
+                          {isItemDialogOpen && (
+                            <div
+                              className="fixed inset-0 z-40 bg-slate-950/50 backdrop-blur-[2px]"
+                              aria-hidden="true"
+                              onClick={() => setIsItemDialogOpen(false)}
+                            />
+                          )}
                           <DialogContent className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
                             <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
                               <div className="border-b border-slate-200 px-5 py-3">
@@ -1086,7 +1088,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     </button>
                   {detail && (
                     <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
-                      <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
+                      <div className="rounded-xl bg-white text-slate-900 shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
                         <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
                           <div className="flex flex-wrap items-start justify-between gap-4">
                             <div>
