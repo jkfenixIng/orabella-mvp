@@ -89,24 +89,53 @@ const DialogOverlay = React.forwardRef<
 ))
 DialogOverlay.displayName = DialogPrimitive.Overlay.displayName
 
+// U1: apilado de diálogos. Radix no ordena modal-sobre-modal: con z-index fijo
+// el overlay del nuevo diálogo queda DEBAJO del contenido del anterior, así que
+// el modal de abajo no se atenúa ni se desenfoca. Cada diálogo abierto toma un
+// nivel y su overlay siempre queda por encima del contenido anterior.
+const dialogLayers: object[] = []
+
+function useDialogLayer(): number {
+  const [layer, setLayer] = React.useState(0)
+  React.useLayoutEffect(() => {
+    const token = {}
+    dialogLayers.push(token)
+    setLayer(dialogLayers.length)
+    return () => {
+      const at = dialogLayers.indexOf(token)
+      if (at >= 0) dialogLayers.splice(at, 1)
+    }
+  }, [])
+  return layer
+}
+
 const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
   DialogContentProps
->(({ className, children, ...props }, ref) => (
-  <DialogPrimitive.Portal>
-    <DialogPrimitive.Overlay className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm transition-opacity duration-150 data-[state=open]:opacity-100 data-[state=closed]:opacity-0" />
-    <DialogPrimitive.Content
-      ref={ref}
-      className={cn(
-        'fixed left-1/2 top-1/2 z-50 grid w-full max-w-lg -translate-x-1/2 -translate-y-1/2 max-h-[calc(100vh-2rem)] overflow-y-auto rounded-lg border border-border-color bg-surface p-6 shadow-xl outline-none transition duration-150 data-[state=open]:scale-100 data-[state=open]:opacity-100 data-[state=closed]:scale-95 data-[state=closed]:opacity-0 dark:border-border-color-2 dark:bg-surface',
-        className,
-      )}
-      {...props}
-    >
-      {children}
-    </DialogPrimitive.Content>
-  </DialogPrimitive.Portal>
-))
+>(({ className, children, ...props }, ref) => {
+  const level = Math.max(1, useDialogLayer())
+  const overlayZ = 45 + (level - 1) * 10
+  const contentZ = 50 + (level - 1) * 10
+  return (
+    <DialogPrimitive.Portal>
+      <DialogPrimitive.Overlay
+        style={{ zIndex: overlayZ }}
+        className="fixed inset-0 bg-black/60 backdrop-blur-sm transition-opacity duration-150 data-[state=open]:opacity-100 data-[state=closed]:opacity-0"
+      />
+      <DialogPrimitive.Content
+        ref={ref}
+        style={{ zIndex: contentZ, ...props.style }}
+        className={cn(
+          'fixed left-1/2 top-1/2 grid w-full max-w-lg -translate-x-1/2 -translate-y-1/2 max-h-[calc(100vh-2rem)] overflow-y-auto rounded-lg border border-border-color bg-surface p-6 shadow-xl outline-none transition duration-150 data-[state=open]:scale-100 data-[state=open]:opacity-100 data-[state=closed]:scale-95 data-[state=closed]:opacity-0 dark:border-border-color-2 dark:bg-surface',
+          className,
+        )}
+        {...props}
+      >
+        {children}
+      </DialogPrimitive.Content>
+    </DialogPrimitive.Portal>
+  )
+})
 DialogContent.displayName = DialogPrimitive.Content.displayName
 
 const DialogHeader = React.forwardRef<

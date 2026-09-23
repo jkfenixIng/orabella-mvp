@@ -2031,13 +2031,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
           else setIsItemDialogOpen(isOpen);
         }}
       >
-        {isItemDialogOpen && (
-          <div
-            className="fixed inset-0 z-40 bg-slate-950/50 backdrop-blur-[2px]"
-            aria-hidden="true"
-            onClick={() => setIsItemDialogOpen(false)}
-          />
-        )}
         <DialogContent className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
           <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
             <div className="border-b border-slate-200 px-5 py-3">
