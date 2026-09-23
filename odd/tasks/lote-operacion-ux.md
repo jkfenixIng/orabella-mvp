@@ -42,7 +42,8 @@ Out:
 - [ ] S1 Servicios a Catálogos: sacar de panel admin a módulo catálogos (ALCANCE por confirmar).
 - [x] A1 Alertas default pendientes (HECHO 2026-09-23; unreadOnly=true en page + client).
 - [ ] F2 Mensajes caja en factura: sin turno / turno ajeno, quién puede pagar o anular (emitir, pagar, anular, edición).
-- [x] F3 Columna Cerrada (HECHO 22cb0ac 2026-09-23; migración 025 closed_at + columna; ⚠️ correr 025 en PRUEBAS/PROD o el listado falla).
+- [x] F3 Columna Cerrada (HECHO 22cb0ac 2026-09-23; 025 closed_at aplicada por usuario en PRUEBAS).
+- [x] B1 Stock no descuenta (HECHO 30a6ae3 2026-09-23; descuento único al EMITIR vía deductStock en inventory/service; 210/210 verde).
 - [ ] C1 Caja todos los pagos + dueño del turno: columnas todos los métodos (desglose ventas) + "Turno actual de {nombre}".
 - [ ] V1 Vales gating + layout: sin config → mensaje y bloqueo; botón-crear abre modal; lista debajo.
 - [ ] V2 Config vales wizard: días todos/indicados → topes sin/diarios/semanales/ambos → tope por día o general.
