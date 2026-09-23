@@ -1,12 +1,14 @@
 import {
   annulInvoiceSchema,
-  applyPaymentSplit,
   buildInvoiceOutReason,
   buildReversalReasons,
   canAnnulStatus,
+  computeCardFees,
   computeInvoiceTotals,
   createInvoiceSchema,
   annulBlockedMessage,
+  moneyEquals,
+  MONEY_EPSILON,
   portionsMatchBalance,
   splitPaymentSchema,
   type CreateInvoiceInput,
@@ -88,6 +90,7 @@ export interface InvoiceRow {
   subtotal: number;
   discount: number;
   tax: number;
+  surcharge: number;
   total: number;
   status: string;
   user_id: string | null;
@@ -129,6 +132,8 @@ export interface InvoicePaymentRow {
   method_id: string | null;
   method_code: string;
   amount: number;
+  fee_percent: number;
+  fee_amount: number;
   created_at: string;
 }
 
@@ -142,11 +147,11 @@ export interface InvoiceDetail {
 }
 
 const INVOICE_SELECT =
-  "id, sede_id, consecutive_number, client_name, client_document, subtotal, discount, tax, total, status, user_id, cash_shift_id, cancel_reason, created_at";
+  "id, sede_id, consecutive_number, client_name, client_document, subtotal, discount, tax, surcharge, total, status, user_id, cash_shift_id, cancel_reason, created_at";
 const ITEM_SELECT =
   "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission, commission_value, employees!inner(full_name, employee_code)";
 const TAX_SELECT = "id, invoice_id, tax_code, tax_name, percent, amount";
-const PAYMENT_SELECT = "id, invoice_id, method_id, method_code, amount, created_at";
+const PAYMENT_SELECT = "id, invoice_id, method_id, method_code, amount, fee_percent, fee_amount, created_at";
 
 // ----------------------------------------------------------------- lectura ---
 
@@ -188,10 +193,13 @@ export async function listInvoices(sedeId: string, filters: InvoiceFilters = {})
   if (filters.consecutive_number !== undefined) query = query.eq("consecutive_number", filters.consecutive_number);
   const { data, error } = await query;
   if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
-  return (data ?? []).map((row: any) => ({
+  interface JoinedUser {
+    users?: { full_name?: string | null } | null;
+  }
+  return ((data ?? []) as Array<InvoiceRow & JoinedUser>).map((row) => ({
     ...row,
     user_name: row.users?.full_name ?? null,
-  })) as (InvoiceRow & { user_name: string | null })[];
+  })) as Array<InvoiceRow & { user_name: string | null }>;
 }
 
 /** Detalle con ítems, snapshot de impuestos y porciones (solo su sede). */
@@ -224,13 +232,18 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
   }
   const payments = (paymentsRes.data ?? []) as InvoicePaymentRow[];
   const paid = round2(payments.reduce((acc, row) => acc + Number(row.amount), 0));
-  const rawItems = (itemsRes.data ?? []) as any[];
-  const items = rawItems.map((item: any) => ({
-    ...item,
-    employee_full_name: item.employees?.[0]?.full_name ?? null,
-    employee_code: item.employees?.[0]?.employee_code ?? null,
-    commission_value: item.commission_value ?? null,
-  })) as InvoiceItemRow[];
+  interface JoinedEmployee {
+    employees?: { full_name?: string | null; employee_code?: string | null } | Array<{ full_name?: string | null; employee_code?: string | null }> | null;
+  }
+  const items = ((itemsRes.data ?? []) as Array<InvoiceItemRow & JoinedEmployee>).map((item) => {
+    const joined = Array.isArray(item.employees) ? item.employees[0] : item.employees;
+    return {
+      ...item,
+      employee_full_name: joined?.full_name ?? null,
+      employee_code: joined?.employee_code ?? null,
+      commission_value: item.commission_value ?? null,
+    };
+  }) as InvoiceItemRow[];
   return {
     invoice,
     items,
@@ -249,7 +262,7 @@ function round2(value: number): number {
 
 interface ValidatedRefs {
   activeTaxes: Array<{ code: string; name: string; percent: number }>;
-  methodByCode: Map<string, { id: string; code: string }>;
+  methodByCode: Map<string, { id: string; code: string; feePercent: number }>;
 }
 
 /** Valida catálogos: impuestos activos (snapshot) y métodos activos por código. */
@@ -263,7 +276,9 @@ async function loadRefs(sedeId: string): Promise<ValidatedRefs> {
       .filter((tax) => tax.is_active)
       .map((tax) => ({ code: tax.code, name: tax.name, percent: Number(tax.percent) })),
     methodByCode: new Map(
-      methods.filter((method) => method.is_active).map((method) => [method.code, { id: method.id, code: method.code }]),
+      methods
+        .filter((method) => method.is_active)
+        .map((method) => [method.code, { id: method.id, code: method.code, feePercent: Number(method.fee_percent ?? 0) }]),
     ),
   };
 }
@@ -414,10 +429,16 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   if (portions.length > 0 && !portionsMatchBalance(portions, totals.total)) {
     throw new BillingError(
       "SPLIT_MISMATCH",
-      "Las porciones de pago deben sumar exactamente el total de la factura.",
+      "Las porciones de pago deben sumar exactamente el neto de la factura (sin recargo; el recargo se suma solo).",
       422,
     );
   }
+  // Recargo por método (p. ej. tarjeta 5%) sobre el neto de cada porción.
+  // El cliente paga el bruto; pagado/saldo/cierre cuadran sin lógica especial.
+  const feeOf = (methodCode: string): number => methodByCode.get(methodCode)?.feePercent ?? 0;
+  const fees = computeCardFees(portions, feeOf);
+  const surcharge = round2(fees.reduce((acc, fee) => acc + fee.fee, 0));
+  const grandTotal = round2(totals.total + surcharge);
   const status = portions.length > 0 ? "Pagada" : "Emitida";
 
   // Validar turno de caja abierto (CAJ-01 / FAC-01): solo se emite con turno abierto.
@@ -494,7 +515,8 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
         subtotal: totals.subtotal,
         discount: totals.discount,
         tax: totals.tax,
-        total: totals.total,
+        surcharge,
+        total: grandTotal,
         status,
         user_id: actor.userId,
         cash_shift_id: cashShiftId,
@@ -543,11 +565,13 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
 
     if (portions.length > 0) {
       const { error: paymentsError } = await db.from("invoice_payments").insert(
-        portions.map((portion) => ({
+        fees.map((fee) => ({
           invoice_id: invoiceId,
-          method_id: methodByCode.get(portion.method_code)?.id ?? null,
-          method_code: portion.method_code,
-          amount: portion.amount,
+          method_id: methodByCode.get(fee.method_code)?.id ?? null,
+          method_code: fee.method_code,
+          amount: fee.gross,
+          fee_percent: fee.feePercent,
+          fee_amount: fee.fee,
         })),
       );
       if (paymentsError) throw new BillingError("INTERNAL", "Error interno.", 500);
@@ -578,7 +602,9 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
       metadata: {
         consecutive_number: consecutive,
         client_name: input.client_name,
-        total: totals.total,
+        total: grandTotal,
+        surcharge,
+        card_fees: fees.filter((fee) => fee.fee > 0),
         status,
         cash_shift_id: cashShiftId,
         admin_override: adminOverrideJustification,
@@ -698,26 +724,38 @@ export async function splitPayment(
     }
   }
 
-  let check: ReturnType<typeof applyPaymentSplit>;
-  try {
-    check = applyPaymentSplit({
-      paidSoFar: detail.paid,
-      portions: parsed.data.portions,
-      total: Number(detail.invoice.total),
-    });
-  } catch (error) {
-    if (error instanceof Error && error.message === "SOBREPAGO") {
-      throw new BillingError("OVERPAID", "Las porciones superan el saldo pendiente.", 422);
-    }
-    throw new BillingError("VALIDATION", "Porciones de pago inválidas.", 400);
+  // Recargo por método también al pagar después: los inputs son NETOS
+  // (igual que al crear); el bruto cubre el saldo y el fee queda auditado.
+  const fees = computeCardFees(
+    parsed.data.portions,
+    (code) => refs.methodByCode.get(code)?.feePercent ?? 0,
+  );
+  const netSum = round2(fees.reduce((acc, fee) => acc + fee.net, 0));
+  const grossSum = round2(fees.reduce((acc, fee) => acc + fee.gross, 0));
+  const remaining = round2(Number(detail.invoice.total) - detail.paid);
+  if (!moneyEquals(netSum, remaining)) {
+    throw new BillingError(
+      netSum - remaining > 0 ? "OVERPAID" : "SUM_MISMATCH",
+      netSum - remaining > 0
+        ? "Las porciones superan el saldo pendiente."
+        : "Las porciones no cubren el saldo pendiente.",
+      422,
+    );
   }
+  const check = {
+    paid: round2(detail.paid + grossSum),
+    remaining: round2(Math.max(0, Number(detail.invoice.total) - (detail.paid + grossSum))),
+    fullyPaid: detail.paid + grossSum - Number(detail.invoice.total) > -MONEY_EPSILON,
+  };
 
   const { error: insertError } = await db.from("invoice_payments").insert(
-    parsed.data.portions.map((portion) => ({
+    fees.map((fee) => ({
       invoice_id: id,
-      method_id: refs.methodByCode.get(portion.method_code)?.id ?? null,
-      method_code: portion.method_code,
-      amount: portion.amount,
+      method_id: refs.methodByCode.get(fee.method_code)?.id ?? null,
+      method_code: fee.method_code,
+      amount: fee.gross,
+      fee_percent: fee.feePercent,
+      fee_amount: fee.fee,
     })),
   );
   if (insertError) throw new BillingError("INTERNAL", "Error interno.", 500);

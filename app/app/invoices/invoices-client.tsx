@@ -23,7 +23,6 @@ import {
   Badge,
 } from "@/src/components/ui/lib/badge";
 import { Button } from "@/src/components/ui/lib/button";
-import { Checkbox } from "@/src/components/ui/lib/checkbox";
 import {
   Card,
   CardContent,
@@ -356,7 +355,22 @@ export function InvoicesClient(props: InvoicesClientProps) {
     return acc + Math.round(draftSubtotalAfterDiscount * (percent / 100) * 100) / 100;
   }, 0);
   const draftTotal = Math.max(0, draftSubtotalAfterDiscount + draftTaxes);
-  
+
+  // Recargo por método en vivo (tarjeta 5%): fee sobre el NETO de cada
+  // porción; el cliente paga el bruto. Misma fórmula que el servidor.
+  const draftFees = portions.map((portion) => {
+    const net = toNumber(portion.amount) ?? 0;
+    const feePercent = Number(props.methods.find((row) => row.code === portion.method_code)?.fee_percent ?? 0);
+    const fee = Math.round(net * (feePercent / 100) * 100) / 100;
+    return { method_code: portion.method_code, net, feePercent, fee, gross: net + fee };
+  });
+  const draftSurcharge = draftFees.reduce((acc, row) => acc + row.fee, 0);
+  const draftFeeLabel = draftFees
+    .filter((row) => row.fee > 0)
+    .map((row) => `${row.method_code} ${row.feePercent}%`)
+    .join(", ");
+  const draftGrandTotal = draftTotal + draftSurcharge;
+
   // Determinar si hay pago inmediato (para botón "Emitir y pagar")
   const hasImmediatePayment = portions.some((p) => (toNumber(p.amount) ?? 0) > 0);
 
@@ -727,9 +741,15 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               <dt>Impuestos</dt>
                               <dd className="font-medium">{formatMoney(draftTaxes)}</dd>
                             </div>
+                            {draftSurcharge > 0 && (
+                              <div className="flex justify-between gap-3 text-emerald-700">
+                                <dt>Recargo{draftFeeLabel !== "" ? ` (${draftFeeLabel})` : ""}</dt>
+                                <dd className="font-medium">+{formatMoney(draftSurcharge)}</dd>
+                              </div>
+                            )}
                             <div className="flex justify-between gap-3 border-t-2 border-slate-900 pt-2 text-lg font-black">
                               <dt>TOTAL</dt>
-                              <dd>{formatMoney(draftTotal)}</dd>
+                              <dd>{formatMoney(draftGrandTotal)}</dd>
                             </div>
                           </dl>
                         </div>
@@ -922,6 +942,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 <tr className="bg-slate-100 text-xs uppercase tracking-wide text-slate-500">
                                   <th className="px-3 py-2">#</th>
                                   <th className="px-3 py-2">Descripción</th>
+                                  <th className="px-3 py-2">Empleado</th>
                                   <th className="px-3 py-2 text-right">Cant.</th>
                                   <th className="px-3 py-2 text-right">V. unitario</th>
                                   <th className="px-3 py-2 text-right">Subtotal</th>
@@ -944,6 +965,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                           Sin comisión
                                         </span>
                                       )}
+                                    </td>
+                                    <td className="px-3 py-2">
+                                      {row.employee_full_name ?? "—"}
+                                      {row.employee_code ? (
+                                        <span className="text-xs text-slate-500"> ({row.employee_code})</span>
+                                      ) : null}
                                     </td>
                                     <td className="px-3 py-2 text-right">{row.qty}</td>
                                     <td className="px-3 py-2 text-right">{formatMoney(row.unit_price)}</td>
@@ -987,6 +1014,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 <dt>Impuestos</dt>
                                 <dd className="font-medium">{formatMoney(detail.invoice.tax)}</dd>
                               </div>
+                              {Number(detail.invoice.surcharge ?? 0) > 0 && (
+                                <div className="flex justify-between gap-3 text-emerald-700">
+                                  <dt>Recargo</dt>
+                                  <dd className="font-medium">+{formatMoney(Number(detail.invoice.surcharge))}</dd>
+                                </div>
+                              )}
                               <div className="flex justify-between gap-3 border-t-2 border-slate-900 pt-2 text-lg font-black">
                                 <dt>TOTAL</dt>
                                 <dd>{formatMoney(detail.invoice.total)}</dd>
@@ -998,6 +1031,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             {detail.payments.map((row) => (
                               <li key={row.id}>
                                 {row.method_code} = {formatMoney(row.amount)}
+                                {row.fee_amount > 0 && (
+                                  <span className="ml-2 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                                    recargo {row.fee_percent}%: +{formatMoney(row.fee_amount)}
+                                  </span>
+                                )}
                               </li>
                             ))}
                             {detail.payments.length === 0 && (

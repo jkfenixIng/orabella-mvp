@@ -8,6 +8,7 @@ import {
   buildInvoiceOutReason,
   buildReversalReasons,
   canAnnulStatus,
+  computeCardFees,
   computeInvoiceTotals,
   computeLineSubtotal,
   createInvoiceSchema,
@@ -236,6 +237,35 @@ describe("billing: porciones que cuadran con el total (FAC-07)", () => {
     expect(
       splitPaymentSchema.safeParse({ portions: [{ method_code: "  ", amount: 1000 }] }).success,
     ).toBe(false);
+  });
+});
+
+// ------------------------------------------------- recargo tarjeta (019) ---
+
+describe("billing: recargo por método sobre el neto (tarjeta 5%)", () => {
+  const feeByMethod = (code: string): number => (code === "tarjeta" ? 5 : 0);
+
+  it("tarjeta 100000 genera fee 5000 y bruto 105000", () => {
+    const [fee] = computeCardFees([{ method_code: "tarjeta", amount: 100000 }], feeByMethod);
+    expect(fee).toEqual({ method_code: "tarjeta", net: 100000, feePercent: 5, fee: 5000, gross: 105000 });
+  });
+
+  it("efectivo no genera recargo", () => {
+    const [fee] = computeCardFees([{ amount: 50000, method_code: "efectivo" }], feeByMethod);
+    expect(fee.fee).toBe(0);
+    expect(fee.gross).toBe(50000);
+  });
+
+  it("el total incluye el recargo y las porciones netas cuadran el neto", () => {
+    const totals = computeInvoiceTotals({
+      items: [{ qty: 2, unit_price: 50000, discount: 0 }],
+      discount: 0,
+      activeTaxes: [],
+      surcharge: 5000,
+    });
+    expect(totals.surcharge).toBe(5000);
+    expect(totals.total).toBe(105000);
+    expect(portionsMatchBalance([{ amount: 100000 }], totals.total - totals.surcharge)).toBe(true);
   });
 });
 

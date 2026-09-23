@@ -155,7 +155,32 @@ export interface InvoiceTotals {
   base: number;
   taxes: TaxSnapshot[];
   tax: number;
+  surcharge: number;
   total: number;
+}
+
+/**
+ * Recargo por método (p. ej. tarjeta 5%): fee = neto × feePercent / 100
+ * por porción. El cliente paga el BRUTO (neto + recargo). Puro.
+ */
+export interface CardFee {
+  method_code: string;
+  net: number;
+  feePercent: number;
+  fee: number;
+  gross: number;
+}
+
+export function computeCardFees(
+  portions: Array<{ method_code: string; amount: number }>,
+  feeByMethod: (methodCode: string) => number,
+): CardFee[] {
+  return portions.map((portion) => {
+    const net = roundMoney(portion.amount);
+    const feePercent = feeByMethod(portion.method_code) ?? 0;
+    const fee = roundMoney((net * feePercent) / 100);
+    return { method_code: portion.method_code, net, feePercent, fee, gross: roundMoney(net + fee) };
+  });
 }
 
 /**
@@ -167,6 +192,7 @@ export function computeInvoiceTotals(args: {
   items: Array<{ qty: number; unit_price: number; discount: number }>;
   discount: number;
   activeTaxes: ActiveTax[];
+  surcharge?: number;
 }): InvoiceTotals {
   const subtotal = roundMoney(
     args.items.reduce((acc, item) => acc + computeLineSubtotal(item).subtotal, 0),
@@ -178,7 +204,8 @@ export function computeInvoiceTotals(args: {
   const base = roundMoney(Math.max(0, subtotal - discount));
   const taxes = snapshotInvoiceTaxes(args.activeTaxes, base);
   const tax = roundMoney(taxes.reduce((acc, row) => acc + row.amount, 0));
-  return { subtotal, discount, base, taxes, tax, total: roundMoney(base + tax) };
+  const surcharge = roundMoney(args.surcharge ?? 0);
+  return { subtotal, discount, base, taxes, tax, surcharge, total: roundMoney(base + tax + surcharge) };
 }
 
 export interface SplitCheck {

@@ -177,6 +177,7 @@ export const paymentMethodSchema = z.object({
   name: z.string().trim().min(1, "Nombre requerido.").max(120, "Nombre muy largo."),
   is_active: z.boolean().optional(),
   arqueable: z.boolean().optional(),
+  fee_percent: z.coerce.number().min(0).max(100).optional(),
 });
 export type PaymentMethodInput = z.infer<typeof paymentMethodSchema>;
 
