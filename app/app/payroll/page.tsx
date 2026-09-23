@@ -45,9 +45,9 @@ export default async function PayrollPage() {
     <main className="mx-auto flex min-h-screen max-w-5xl flex-col gap-6 px-6 py-12">
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h1 className="text-3xl font-bold">Nómina y vales</h1>
+          <h1 className="text-3xl font-bold">Nómina</h1>
           <p className="mt-2 text-text-secondary">
-            Periodos con cálculo desde facturación, pago por porciones y vales con topes.
+            Periodos con cálculo desde facturación y pago por porciones.
           </p>
         </div>
       </header>

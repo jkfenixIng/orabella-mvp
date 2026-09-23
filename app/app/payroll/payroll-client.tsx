@@ -17,6 +17,7 @@ import type { EmployeeRow, PaymentMethodRow } from "@/src/features/admin/service
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -65,6 +66,64 @@ function toNumber(value: string): number | null {
   if (trimmed === "") return null;
   const parsed = Number(trimmed);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+const MONTHS_SHORT = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+
+interface SimpleDate {
+  year: number;
+  month: number;
+  day: number;
+}
+
+/** Parsea yyyy-mm-dd sin pasar por Date (evita el desfase de zona horaria). */
+function parseIsoDate(value: string): SimpleDate | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return null;
+  return { year: Number(match[1]), month: Number(match[2]), day: Number(match[3]) };
+}
+
+/** Etiqueta compacta de un periodo ("1–15 sep"); si comparten mes, un solo nombre. */
+function formatPeriodLabel(row: PayrollPeriodRow): string {
+  const start = parseIsoDate(row.start_date);
+  const end = parseIsoDate(row.end_date);
+  if (!start || !end) return `${row.start_date} → ${row.end_date}`;
+  const sameMonth = start.year === end.year && start.month === end.month;
+  const startText = sameMonth ? `${start.day}` : `${start.day} ${MONTHS_SHORT[start.month - 1]}`;
+  return `${startText}–${end.day} ${MONTHS_SHORT[end.month - 1]}`;
+}
+
+/** Fecha legible con año ("1 oct 2026"). */
+function formatFullDate(value: string): string {
+  const date = parseIsoDate(value);
+  if (!date) return value;
+  return `${date.day} ${MONTHS_SHORT[date.month - 1]} ${date.year}`;
+}
+
+/** Día siguiente a una fecha yyyy-mm-dd (aritmética UTC, solo fechas). */
+function nextDay(value: string): string {
+  const date = parseIsoDate(value);
+  if (!date) return "";
+  const next = new Date(Date.UTC(date.year, date.month - 1, date.day + 1));
+  return next.toISOString().slice(0, 10);
+}
+
+/** Último fin de periodo registrado (los rangos llegan ordenados desc). */
+function latestEndDate(rows: PayrollPeriodRow[]): string | null {
+  let latest: string | null = null;
+  for (const row of rows) {
+    if (latest === null || row.end_date > latest) latest = row.end_date;
+  }
+  return latest;
+}
+
+/** Primer periodo cuyo rango se solapa con [start, end] (fechas ISO comparables como texto). */
+function findOverlappingPeriod(
+  rows: PayrollPeriodRow[],
+  start: string,
+  end: string,
+): PayrollPeriodRow | null {
+  return rows.find((row) => start <= row.end_date && end >= row.start_date) ?? null;
 }
 
 interface PayrollClientProps {
@@ -231,9 +290,11 @@ export function PayrollClient(props: PayrollClientProps) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
 
-  // Periodo: abrir.
+  // Periodo: abrir (el rango se pide en el modal, no en la vista principal).
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
+  const [openDialogOpen, setOpenDialogOpen] = useState(false);
+  const [openError, setOpenError] = useState<string | null>(null);
   // Pagos: porciones por ítem (texto "metodo:monto, metodo:monto").
   const [portions, setPortions] = useState<Record<string, string>>({});
   // Ajustes por empleado al calcular ("bonos,otros" por empleado).
@@ -284,21 +345,45 @@ export function PayrollClient(props: PayrollClientProps) {
   async function handleOpen(event: FormEvent) {
     event.preventDefault();
     if (!startDate || !endDate) {
-      setMessage({ kind: "error", text: "Indique el rango del periodo." });
+      setOpenError("Indique el rango del período.");
       return;
     }
+    if (endDate < startDate) {
+      setOpenError("La fecha final no puede ser anterior a la inicial.");
+      return;
+    }
+    const collision = findOverlappingPeriod(periods, startDate, endDate);
+    if (collision) {
+      setOpenError(
+        `El rango se solapa con ${formatPeriodLabel(collision)} (${collision.status}). Ajuste las fechas.`,
+      );
+      return;
+    }
+    setOpenError(null);
     setBusy(true);
     const result = (await openPayrollPeriodAction({
       start_date: startDate,
       end_date: endDate,
     })) as ActionResult<PayrollPeriodRow>;
     setBusy(false);
-    if (show(result, "Periodo abierto en borrador.")) {
-      setStartDate("");
-      setEndDate("");
-      await refreshPeriods(result.data.id);
-      await loadDetail(result.data.id);
+    if (!result.success) {
+      setOpenError(`${result.code}: ${result.message}`);
+      return;
     }
+    setMessage({ kind: "ok", text: "Periodo abierto en borrador." });
+    setStartDate("");
+    setEndDate("");
+    setOpenDialogOpen(false);
+    await refreshPeriods(result.data.id);
+    await loadDetail(result.data.id);
+  }
+
+  // Cerrar el modal de apertura siempre limpia su estado (mismo criterio que closeDetail).
+  function closeOpenDialog() {
+    setStartDate("");
+    setEndDate("");
+    setOpenError(null);
+    setOpenDialogOpen(false);
   }
 
   async function handleCalculate(event: FormEvent) {
@@ -369,6 +454,15 @@ export function PayrollClient(props: PayrollClientProps) {
 
 
   const selected = periods.find((row) => row.id === selectedId) ?? null;
+
+  // Ayuda para elegir el rango del nuevo periodo, construida solo con `periods`.
+  const lastEnd = latestEndDate(periods);
+  const suggestedStart = lastEnd ? nextDay(lastEnd) : null;
+  const draftPeriods = periods.filter((row) => row.status === "borrador");
+  const rangeInvalid = Boolean(startDate && endDate && endDate < startDate);
+  const overlap =
+    startDate && endDate && !rangeInvalid ? findOverlappingPeriod(periods, startDate, endDate) : null;
+
   const employeeName = (id: string) => {
     const found = props.initialEmployees.find((row) => row.id === id);
     if (!found) return id.slice(0, 8);
@@ -391,31 +485,16 @@ export function PayrollClient(props: PayrollClientProps) {
           </p>
         )}
         {props.canAdmin && (
-          <form onSubmit={handleOpen} className="mt-3 flex flex-wrap items-end gap-3">
-            <label className={labelClass} htmlFor="payroll-start-date">
-              Inicio
-              <input
-                id="payroll-start-date"
-                type="date"
-                value={startDate}
-                onChange={(event) => setStartDate(event.target.value)}
-                className={inputClass}
-              />
-            </label>
-            <label className={labelClass} htmlFor="payroll-end-date">
-              Fin
-              <input
-                id="payroll-end-date"
-                type="date"
-                value={endDate}
-                onChange={(event) => setEndDate(event.target.value)}
-                className={inputClass}
-              />
-            </label>
-            <button type="submit" disabled={busy} className={buttonClass}>
-              {busy ? "Abriendo…" : "Abrir periodo"}
-            </button>
-          </form>
+          <button
+            type="button"
+            onClick={() => {
+              setOpenError(null);
+              setOpenDialogOpen(true);
+            }}
+            className={`${buttonClass} mt-3`}
+          >
+            Abrir período
+          </button>
         )}
         <ul className="mt-3 flex flex-col gap-2">
           {periods.map((row) => (
@@ -438,6 +517,108 @@ export function PayrollClient(props: PayrollClientProps) {
           {periods.length === 0 && <li className="text-sm text-text-tertiary">Sin periodos todavía.</li>}
         </ul>
       </section>
+
+      {props.canAdmin && (
+        <Dialog
+          open={openDialogOpen}
+          onOpenChange={(open) => {
+            if (!open) closeOpenDialog();
+            else setOpenDialogOpen(true);
+          }}
+        >
+          <DialogContent className="max-w-xl">
+            <DialogHeader>
+              <DialogTitle>Abrir período</DialogTitle>
+              <DialogDescription>
+                Elija el rango de fechas. El período se abre en borrador.
+              </DialogDescription>
+            </DialogHeader>
+            <form onSubmit={handleOpen} className="mt-4 flex flex-col gap-4">
+              <div className="flex flex-wrap gap-3">
+                <label className={labelClass} htmlFor="payroll-open-start">
+                  Inicio
+                  <input
+                    id="payroll-open-start"
+                    type="date"
+                    value={startDate}
+                    onChange={(event) => {
+                      setStartDate(event.target.value);
+                      setOpenError(null);
+                    }}
+                    className={inputClass}
+                    required
+                  />
+                </label>
+                <label className={labelClass} htmlFor="payroll-open-end">
+                  Fin
+                  <input
+                    id="payroll-open-end"
+                    type="date"
+                    value={endDate}
+                    onChange={(event) => {
+                      setEndDate(event.target.value);
+                      setOpenError(null);
+                    }}
+                    className={inputClass}
+                    required
+                  />
+                </label>
+              </div>
+
+              <div className="rounded-md border border-border-color bg-surface-hover p-3 text-sm text-text-secondary dark:border-border-color-2">
+                <p className="font-medium text-text-primary">Períodos existentes</p>
+                {periods.length === 0 ? (
+                  <p className="mt-1">Sin períodos todavía: este será el primero.</p>
+                ) : (
+                  <ul className="mt-1 flex flex-col gap-1">
+                    {periods.map((row) => (
+                      <li key={row.id} className="flex items-center justify-between gap-3">
+                        <span>{formatPeriodLabel(row)}</span>
+                        <span className="text-xs text-text-tertiary">{row.status}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {suggestedStart && (
+                  <p className="mt-2">
+                    Sugerencia: empiece el {formatFullDate(suggestedStart)}, día siguiente al último período
+                    registrado.
+                  </p>
+                )}
+                {draftPeriods.length > 0 && (
+                  <p className="mt-2 text-text-tertiary">
+                    {draftPeriods.length === 1
+                      ? "Hay un período en borrador"
+                      : `Hay ${draftPeriods.length} períodos en borrador`}
+                    : no se pueden solapar rangos.
+                  </p>
+                )}
+              </div>
+
+              {rangeInvalid ? (
+                <p className={errorClass}>La fecha final no puede ser anterior a la inicial.</p>
+              ) : overlap ? (
+                <p className={errorClass}>
+                  El rango se solapa con {formatPeriodLabel(overlap)} ({overlap.status}). Ajuste las fechas.
+                </p>
+              ) : openError ? (
+                <p role="alert" className={errorClass}>
+                  {openError}
+                </p>
+              ) : null}
+
+              <DialogFooter>
+                <button type="button" className={ghostClass} onClick={closeOpenDialog}>
+                  Cancelar
+                </button>
+                <button type="submit" disabled={busy} className={buttonClass}>
+                  {busy ? "Creando…" : "Crear"}
+                </button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
 
       {selected && (
         <Dialog

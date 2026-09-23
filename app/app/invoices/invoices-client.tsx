@@ -311,23 +311,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
     return found.employee_code ? `${found.full_name} (${found.employee_code})` : found.full_name;
   }
 
-  /**
-   * Ítem `producto` en borrador: su comisión NO es un valor fijo del ítem, es
-   * el porcentaje configurado en el empleado, que el sistema aplica al emitir
-   * (misma regla que `computeInvoiceItemCommission` en billing/commission).
-   * Por eso acá se describe la regla vigente en vez de adelantar un monto que
-   * el backend calculará.
-   */
-  function productCommissionLabel(employeeId: string): string {
-    const employee = props.employees.find((row) => row.id === employeeId);
-    if (!employee) return "Según empleado";
-    if (employee.payout_mode === "no_aplica") return "Sin comisión";
-    if (employee.pay_type !== "porcentaje" && employee.pay_type !== "mixto") return "Sin comisión";
-    const percent = employee.commission_percent == null ? 0 : Number(employee.commission_percent);
-    if (!(percent > 0)) return "Sin comisión";
-    return `Según empleado: ${percent}%`;
-  }
-
   function addItemFromDialog() {
     setItemError(null);
     if (itemDraft.item_type === "producto" && !itemDraft.ref_id) {
@@ -1003,9 +986,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     </td>
                                     {!clientView && (
                                       <td className="whitespace-nowrap px-3 py-2 text-center">
-                                        {item.item_type === "servicio" || item.no_commission ? (
+                                        {item.item_type === "producto" ? (
+                                          <span
+                                            className="text-xs text-slate-600"
+                                            title="Valor de comisión asignado al ítem."
+                                          >
+                                            {item.commission_value == null
+                                              ? "—"
+                                              : formatMoney(item.commission_value)}
+                                          </span>
+                                        ) : item.item_type === "servicio" || item.no_commission ? (
                                           <span className="text-xs text-slate-500">Sin comisión</span>
-                                        ) : item.item_type === "custom" ? (
+                                        ) : (
                                           <div className="flex flex-col items-center gap-0.5">
                                             <input
                                               className={`${paperInputClass} h-9 w-28 text-right`}
@@ -1034,13 +1026,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                               </span>
                                             )}
                                           </div>
-                                        ) : (
-                                          <span
-                                            className="text-xs font-medium text-emerald-700"
-                                            title="El sistema calcula el monto con el porcentaje del empleado al emitir."
-                                          >
-                                            {productCommissionLabel(item.employee_id)}
-                                          </span>
                                         )}
                                       </td>
                                     )}
@@ -1965,10 +1950,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                 )}
                                                 {!item.no_commission && item.item_type === "producto" && (
                                                   <span
-                                                    className="text-xs font-medium text-emerald-700"
-                                                    title="El sistema calcula el monto con el porcentaje del empleado al emitir."
+                                                    className="text-xs text-slate-600"
+                                                    title="Valor de comisión asignado al ítem."
                                                   >
-                                                    {productCommissionLabel(item.employee_id)}
+                                                    {item.commission_value == null
+                                                      ? "—"
+                                                      : formatMoney(item.commission_value)}
                                                   </span>
                                                 )}
                                               </div>

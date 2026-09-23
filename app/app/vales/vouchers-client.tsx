@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, type ReactNode } from "react";
 import {
   approveVoucherAction,
   listVouchersAction,
@@ -64,6 +64,16 @@ function formatMoney(value: number | string | null): string {
   }).format(numeric);
 }
 
+/** Campo de solo lectura del detalle: etiqueta pequeña sobre el valor. */
+function DetailField({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <dt className="text-xs uppercase tracking-wide text-text-tertiary">{label}</dt>
+      <dd className="break-words text-sm text-text-primary">{children}</dd>
+    </div>
+  );
+}
+
 /** Item 5: días ISO (1=lunes…7=domingo) con nombre corto. */
 const DAY_NAMES: Array<{ day: number; label: string }> = [
   { day: 1, label: "Lun" },
@@ -110,6 +120,9 @@ export function VouchersClient(props: VouchersClientProps) {
   // Aprobación y rechazo comparten un único modal: guarda el vale y la acción.
   const [reviewTarget, setReviewTarget] = useState<{ id: string; action: "approve" | "reject" } | null>(null);
   const [reviewError, setReviewError] = useState<string | null>(null);
+  // Detalle de solo lectura: guarda el vale seleccionado. Estado propio para no
+  // colisionar con reviewTarget (aprobar/rechazar) ni con isCreateOpen.
+  const [detailTarget, setDetailTarget] = useState<VoucherRequestRow | null>(null);
   const [busy, setBusy] = useState(false);
   // V1: sin topes configurados no se puede solicitar; el alta vive en un modal.
   const [isCreateOpen, setIsCreateOpen] = useState(false);
@@ -160,6 +173,17 @@ export function VouchersClient(props: VouchersClientProps) {
     if (!found) return id.slice(0, 8);
     const internalId = found.employee_code ? found.employee_code : found.document;
     return `${found.full_name} (${internalId})`;
+  }
+
+  /**
+   * Nombre legible del método de pago. Se resuelve contra los métodos activos;
+   * un vale histórico puede apuntar a un método ya inactivo, en ese caso se
+   * muestra el código tal cual.
+   */
+  function methodLabel(code: string | null): string {
+    if (!code) return "-";
+    const found = props.initialMethods.find((row) => row.code === code);
+    return found ? `${found.name} (${code})` : code;
   }
 
   async function refreshVouchers() {
@@ -398,6 +422,17 @@ export function VouchersClient(props: VouchersClientProps) {
               </span>
               {row.method_code && <span className="text-xs">Método: {row.method_code}</span>}
               {row.observation && <span className="text-xs text-text-tertiary">{row.observation}</span>}
+              <button
+                type="button"
+                onClick={() => {
+                  setMessage(null);
+                  setDetailTarget(row);
+                }}
+                className={ghostClass}
+                aria-label={`Ver detalle del vale de ${employeeName(row.employee_id)}`}
+              >
+                Ver detalle
+              </button>
               {props.canAdmin && row.status === "pendiente" && (
                 <>
                   <button type="button" onClick={() => openReview(row.id, "approve")} disabled={busy} className={ghostClass}>
@@ -412,6 +447,40 @@ export function VouchersClient(props: VouchersClientProps) {
           ))}
           {vouchers.length === 0 && <li className="text-sm text-text-tertiary">Sin vales todavía.</li>}
         </ul>
+        {/* Detalle de solo lectura: disponible para cualquier rol, sin acciones. */}
+        <Dialog
+          open={detailTarget !== null}
+          onOpenChange={(open) => {
+            if (!open) setDetailTarget(null);
+          }}
+        >
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Detalle del vale</DialogTitle>
+            </DialogHeader>
+            {detailTarget && (
+              <dl className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <DetailField label="Empleado">{employeeName(detailTarget.employee_id)}</DetailField>
+                <DetailField label="Identificador">{detailTarget.id}</DetailField>
+                <DetailField label="Monto">{formatMoney(detailTarget.amount)}</DetailField>
+                <DetailField label="Fecha de solicitud">{detailTarget.request_date}</DetailField>
+                <DetailField label="Estado">
+                  {detailTarget.status}
+                  {detailTarget.status === "descontada" ? " (en nómina: sin cambios)" : ""}
+                </DetailField>
+                <DetailField label="Método de pago">{methodLabel(detailTarget.method_code)}</DetailField>
+                <DetailField label="Turno de caja">{detailTarget.cash_shift_id ?? "-"}</DetailField>
+                <DetailField label="Observación">{detailTarget.observation ?? "-"}</DetailField>
+                <DetailField label="Código histórico">{detailTarget.approval_code ?? "-"}</DetailField>
+              </dl>
+            )}
+            <DialogFooter>
+              <button type="button" className={ghostClass} onClick={() => setDetailTarget(null)}>
+                Cerrar
+              </button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
         {props.canAdmin && (
           <Dialog
             open={reviewTarget !== null}
