@@ -26,6 +26,7 @@ import {
 } from "@/src/features/inventory/service";
 import { applyMovementStock } from "@/src/features/inventory/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
+import { getOpenShiftWithOpener } from "@/src/features/cash/service";
 
 export class BillingError extends Error {
   readonly code: string;
@@ -409,6 +410,35 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   }
   const status = portions.length > 0 ? "Pagada" : "Emitida";
 
+  // Validar turno de caja abierto (CAJ-01 / FAC-01): solo se emite con turno abierto.
+  // Solo quien abrió el turno puede emitir; admin puede con justificación (override).
+  let cashShiftId: string | null = null;
+  let adminOverrideJustification: string | null = null;
+  {
+    const openShift = await getOpenShiftWithOpener(actor.sedeId);
+    if (!openShift) {
+      throw new BillingError(
+        "NO_OPEN_SHIFT",
+        "No hay turno de caja abierto. Abra un turno antes de emitir facturas.",
+        409,
+      );
+    }
+    const isAdmin = (actor.roles ?? []).includes("admin");
+    const isOpener = openShift.opened_by === actor.userId;
+    if (!isOpener && !isAdmin) {
+      throw new BillingError(
+        "SHIFT_NOT_OWNER",
+        `Solo quien abrió el turno (${openShift.opener_name ?? "el cajero"}) puede emitir facturas.`,
+        403,
+      );
+    }
+    if (!isOpener && isAdmin) {
+      // Admin override: requerir justificación en metadata (se audita abajo).
+      adminOverrideJustification = `Admin override: emitida por admin (${actor.userId}) en turno abierto por ${openShift.opener_name ?? openShift.opened_by}.`;
+    }
+    cashShiftId = openShift.id;
+  }
+
   const { data: seq, error: seqError } = await db.rpc("next_invoice_number", {
     p_sede_id: actor.sedeId,
   });
@@ -457,7 +487,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
         total: totals.total,
         status,
         user_id: actor.userId,
-        cash_shift_id: null,
+        cash_shift_id: cashShiftId,
       })
       .select(INVOICE_SELECT)
       .single();
@@ -527,6 +557,25 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
         throw toBillingError(error);
       }
     }
+
+    // Audit log para creación de factura (con info de admin override si aplica)
+    await writeAudit({
+      sede_id: actor.sedeId,
+      user_id: actor.userId,
+      action: AUDIT_ACTIONS.INVOICE_CREATED,
+      entity: "invoices",
+      entity_id: invoiceId,
+      metadata: {
+        consecutive_number: consecutive,
+        client_name: input.client_name,
+        total: totals.total,
+        status,
+        cash_shift_id: cashShiftId,
+        admin_override: adminOverrideJustification,
+        portions_count: portions.length,
+        items_count: input.items.length,
+      },
+    });
 
     return loadDetail(db, invoice as InvoiceRow);
   } catch (error) {
