@@ -41,6 +41,9 @@ const sectionClass = cn(
 );
 const errorClass = cn("text-sm text-error dark:text-error");
 const okClass = cn("text-sm text-success dark:text-success");
+const tableHeaderClass = cn("bg-surface-hover text-xs font-semibold uppercase text-text-tertiary");
+const tableCellClass = cn("px-3 py-2 align-middle");
+const tableRowClass = cn("border-t border-border-color dark:border-border-color-2");
 
 type ActionResult<T> =
   | { success: true; data: T }
@@ -74,6 +77,152 @@ interface PayrollClientProps {
 }
 
 type DetailItem = PeriodDetail["items"][number];
+
+interface PeriodDetailTableProps {
+  items: DetailItem[];
+  employeeName: (id: string) => string;
+  expanded: Record<string, boolean>;
+  onToggle: (itemId: string) => void;
+}
+
+/** Tabla del detalle del periodo (solo presentación). */
+function PeriodDetailTable({ items, employeeName, expanded, onToggle }: PeriodDetailTableProps) {
+  return (
+    <div className="mt-4 overflow-x-auto">
+      <table className={cn("w-full text-left text-sm", "min-w-[960px]")}>
+        <thead>
+          <tr className={tableHeaderClass}>
+            <th className={tableCellClass} scope="col">
+              Empleado
+            </th>
+            <th className={tableCellClass} scope="col">
+              Fijo
+            </th>
+            <th className={tableCellClass} scope="col">
+              Comisiones
+            </th>
+            <th className={tableCellClass} scope="col">
+              Bonos
+            </th>
+            <th className={tableCellClass} scope="col">
+              Vales
+            </th>
+            <th className={tableCellClass} scope="col">
+              Otros
+            </th>
+            <th className={tableCellClass} scope="col">
+              Neto
+            </th>
+            <th className={tableCellClass} scope="col">
+              Pagado
+            </th>
+            <th className={tableCellClass} scope="col">
+              Saldo
+            </th>
+            <th className={tableCellClass} scope="col">
+              Detalle
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((item) => (
+            <tr key={item.id} className={tableRowClass}>
+              <td className={tableCellClass}>{employeeName(item.employee_id)}</td>
+              <td className={tableCellClass}>{formatMoney(item.base_fixed)}</td>
+              <td className={tableCellClass}>{formatMoney(item.commissions)}</td>
+              <td className={tableCellClass}>{formatMoney(item.bonuses)}</td>
+              <td className={tableCellClass}>{formatMoney(item.deductions_vales)}</td>
+              <td className={tableCellClass}>{formatMoney(item.other_discounts)}</td>
+              <td className={cn(tableCellClass, "font-semibold")}>{formatMoney(item.net_pay)}</td>
+              <td className={tableCellClass}>{formatMoney(item.paid)}</td>
+              <td className={tableCellClass}>{formatMoney(item.remaining)}</td>
+              <td className={tableCellClass}>
+                <button
+                  type="button"
+                  onClick={() => onToggle(item.id)}
+                  aria-expanded={Boolean(expanded[item.id])}
+                  aria-controls={`payroll-item-detail-${item.id}`}
+                  aria-label={`${expanded[item.id] ? "Ocultar" : "Ver"} el desglose de ${employeeName(item.employee_id)}`}
+                  className={ghostClass}
+                >
+                  {expanded[item.id] ? "Ocultar" : "Ver"}
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+interface ExpandedItemPanelProps {
+  item: DetailItem;
+  methods: PaymentMethodRow[];
+  canPay: boolean;
+  busy: boolean;
+  portionsValue: string;
+  onPortionsChange: (value: string) => void;
+  onPay: () => void;
+}
+
+/** Desglose de comisiones y pago por porciones de un ítem (fila expandida). */
+function ExpandedItemPanel({
+  item,
+  methods,
+  canPay,
+  busy,
+  portionsValue,
+  onPortionsChange,
+  onPay,
+}: ExpandedItemPanelProps) {
+  return (
+    <div
+      id={`payroll-item-detail-${item.id}`}
+      className="mt-2 rounded bg-surface-hover p-3 text-xs text-text-secondary"
+    >
+      {item.detail_json.length === 0 ? (
+        <p>Sueldo fijo: sin reporte de comisiones.</p>
+      ) : (
+        <ul className="flex flex-col gap-1">
+          {item.detail_json.map((line) => (
+            <li key={line.item_id}>
+              Factura #{line.consecutive_number ?? "?"} · {line.item_type} × {line.qty} a{" "}
+              {formatMoney(line.unit_price)} = {formatMoney(line.line_subtotal)} → comisión{" "}
+              {formatMoney(line.commission)}
+            </li>
+          ))}
+        </ul>
+      )}
+      {canPay && (
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            onPay();
+          }}
+          className="mt-2 flex flex-wrap items-end gap-2"
+        >
+          <label className={labelClass} htmlFor={`payroll-pay-${item.id}`}>
+            Porciones (método:monto, …)
+            <input
+              id={`payroll-pay-${item.id}`}
+              value={portionsValue}
+              onChange={(event) => onPortionsChange(event.target.value)}
+              placeholder="efectivo:200000, nequi:100000"
+              className={inputClass}
+            />
+          </label>
+          <button type="submit" disabled={busy} className={buttonClass}>
+            {busy ? "Pagando…" : "Pagar"}
+          </button>
+          <span className="text-text-tertiary">
+            Métodos: {methods.map((row) => row.code).join(", ") || "sin métodos activos"}
+          </span>
+        </form>
+      )}
+    </div>
+  );
+}
 
 export function PayrollClient(props: PayrollClientProps) {
   const [periods, setPeriods] = useState<PayrollPeriodRow[]>(props.initialPeriods);
@@ -243,16 +392,28 @@ export function PayrollClient(props: PayrollClientProps) {
         )}
         {props.canAdmin && (
           <form onSubmit={handleOpen} className="mt-3 flex flex-wrap items-end gap-3">
-            <label className={labelClass}>
+            <label className={labelClass} htmlFor="payroll-start-date">
               Inicio
-              <input type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} className={inputClass} />
+              <input
+                id="payroll-start-date"
+                type="date"
+                value={startDate}
+                onChange={(event) => setStartDate(event.target.value)}
+                className={inputClass}
+              />
             </label>
-            <label className={labelClass}>
+            <label className={labelClass} htmlFor="payroll-end-date">
               Fin
-              <input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} className={inputClass} />
+              <input
+                id="payroll-end-date"
+                type="date"
+                value={endDate}
+                onChange={(event) => setEndDate(event.target.value)}
+                className={inputClass}
+              />
             </label>
             <button type="submit" disabled={busy} className={buttonClass}>
-              Abrir periodo
+              {busy ? "Abriendo…" : "Abrir periodo"}
             </button>
           </form>
         )}
@@ -293,141 +454,84 @@ export function PayrollClient(props: PayrollClientProps) {
               </DialogTitle>
             </DialogHeader>
             <div className="max-h-[calc(100dvh-12rem)] overflow-y-auto pr-1">
-          {selected.status === "cerrado" ? (
-            <p className="mt-2 text-sm text-text-secondary">
-              Periodo cerrado.
-            </p>
-          ) : (
-            props.canAdmin && (
-              <form onSubmit={handleCalculate} className="mt-3 flex flex-col gap-2">
-                <p className="text-sm text-text-secondary">
-                  Ajustes opcionales por empleado (bonos,otros descuentos separados por coma).
+              {selected.status === "cerrado" ? (
+                <p className="mt-2 text-sm text-text-secondary">
+                  Periodo cerrado.
                 </p>
-                {props.initialEmployees
-                  .filter((row) => row.is_active)
-                  .map((row) => (
-                    <label key={row.id} className="flex flex-wrap items-center gap-2 text-sm">
-                      <span className="w-48 truncate">{employeeName(row.id)}</span>
-                      <input
-                        value={adjustments[row.id] ?? ""}
-                        onChange={(event) => setAdjustments((prev) => ({ ...prev, [row.id]: event.target.value }))}
-                        placeholder="bonos,otros (p. ej. 50000,10000)"
-                        className={inputClass}
-                      />
-                    </label>
-                  ))}
-                <div>
-                  <button type="submit" disabled={busy} className={buttonClass}>
-                    Calcular nómina
-                  </button>
-                </div>
-              </form>
-            )
-          )}
-          {!detail && (
-            <button
-              type="button"
-              onClick={() => loadDetail(selected.id)}
-              disabled={isViewPending}
-              className={`${ghostClass} mt-3`}
-            >
-              {isViewPending ? "Cargando…" : "Ver liquidación"}
-            </button>
-          )}
-          {detail && (
-            <div className="mt-4 overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-left text-xs text-text-tertiary">
-                    <th className="py-1 pr-2">Empleado</th>
-                    <th className="py-1 pr-2">Fijo</th>
-                    <th className="py-1 pr-2">Comisiones</th>
-                    <th className="py-1 pr-2">Bonos</th>
-                    <th className="py-1 pr-2">Vales</th>
-                    <th className="py-1 pr-2">Otros</th>
-                    <th className="py-1 pr-2">Neto</th>
-                    <th className="py-1 pr-2">Pagado</th>
-                    <th className="py-1 pr-2">Saldo</th>
-                    <th className="py-1 pr-2">Detalle</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {detail.items.map((item) => (
-                    <tr key={item.id} className="border-t border-border-color dark:border-border-color-2">
-                      <td className="py-2 pr-2">{employeeName(item.employee_id)}</td>
-                      <td className="py-2 pr-2">{formatMoney(item.base_fixed)}</td>
-                      <td className="py-2 pr-2">{formatMoney(item.commissions)}</td>
-                      <td className="py-2 pr-2">{formatMoney(item.bonuses)}</td>
-                      <td className="py-2 pr-2">{formatMoney(item.deductions_vales)}</td>
-                      <td className="py-2 pr-2">{formatMoney(item.other_discounts)}</td>
-                      <td className="py-2 pr-2 font-semibold">{formatMoney(item.net_pay)}</td>
-                      <td className="py-2 pr-2">{formatMoney(item.paid)}</td>
-                      <td className="py-2 pr-2">{formatMoney(item.remaining)}</td>
-                      <td className="py-2 pr-2">
-                        <button
-                          type="button"
-                          onClick={() => setExpanded((prev) => ({ ...prev, [item.id]: !prev[item.id] }))}
-                          className={ghostClass}
+              ) : (
+                props.canAdmin && (
+                  <form onSubmit={handleCalculate} className="mt-3 flex flex-col gap-2">
+                    <p className="text-sm text-text-secondary">
+                      Ajustes opcionales por empleado (bonos,otros descuentos separados por coma).
+                    </p>
+                    {props.initialEmployees
+                      .filter((row) => row.is_active)
+                      .map((row) => (
+                        <label
+                          key={row.id}
+                          className="flex flex-wrap items-center gap-2 text-sm"
+                          htmlFor={`payroll-adjust-${row.id}`}
                         >
-                          {expanded[item.id] ? "Ocultar" : "Ver"}
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              {detail.items.map(
-                (item) =>
-                  expanded[item.id] && (
-                    <div key={`${item.id}-detail`} className="mt-2 rounded bg-surface-hover p-3 text-xs text-text-secondary">
-                      {item.detail_json.length === 0 ? (
-                        <p>Sueldo fijo: sin reporte de comisiones.</p>
-                      ) : (
-                        <ul className="flex flex-col gap-1">
-                          {item.detail_json.map((line) => (
-                            <li key={line.item_id}>
-                              Factura #{line.consecutive_number ?? "?"} · {line.item_type} × {line.qty} a{" "}
-                              {formatMoney(line.unit_price)} = {formatMoney(line.line_subtotal)} → comisión{" "}
-                              {formatMoney(line.commission)}
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                      {props.canPay && selected.status === "borrador" && item.remaining > 0 && (
-                        <form
-                          onSubmit={(event) => {
-                            event.preventDefault();
-                            void handlePay(item);
-                          }}
-                          className="mt-2 flex flex-wrap items-end gap-2"
-                        >
-                          <label className={labelClass}>
-                            Porciones (método:monto, …)
-                            <input
-                              value={portions[item.id] ?? ""}
-                              onChange={(event) => setPortions((prev) => ({ ...prev, [item.id]: event.target.value }))}
-                              placeholder="efectivo:200000, nequi:100000"
-                              className={inputClass}
-                            />
-                          </label>
-                          <button type="submit" disabled={busy} className={buttonClass}>
-                            Pagar
-                          </button>
-                          <span className="text-text-tertiary">
-                            Métodos: {props.methods.map((row) => row.code).join(", ") || "sin métodos activos"}
-                          </span>
-                        </form>
-                      )}
+                          <span className="w-48 truncate">{employeeName(row.id)}</span>
+                          <input
+                            id={`payroll-adjust-${row.id}`}
+                            value={adjustments[row.id] ?? ""}
+                            onChange={(event) => setAdjustments((prev) => ({ ...prev, [row.id]: event.target.value }))}
+                            placeholder="bonos,otros (p. ej. 50000,10000)"
+                            className={inputClass}
+                          />
+                        </label>
+                      ))}
+                    <div>
+                      <button type="submit" disabled={busy} className={buttonClass}>
+                        {busy ? "Calculando…" : "Calcular nómina"}
+                      </button>
                     </div>
-                  ),
+                  </form>
+                )
               )}
-              {props.canAdmin && selected.status === "borrador" && (
-                <button type="button" onClick={handleClose} disabled={busy} className={`${buttonClass} mt-4`}>
-                  Cerrar periodo
+              {!detail && (
+                <button
+                  type="button"
+                  onClick={() => loadDetail(selected.id)}
+                  disabled={isViewPending}
+                  className={`${ghostClass} mt-3`}
+                >
+                  {isViewPending ? "Cargando…" : "Ver liquidación"}
                 </button>
               )}
-            </div>
-          )}
+              {detail && (
+                <>
+                  <PeriodDetailTable
+                    items={detail.items}
+                    employeeName={employeeName}
+                    expanded={expanded}
+                    onToggle={(itemId) => setExpanded((prev) => ({ ...prev, [itemId]: !prev[itemId] }))}
+                  />
+                  {detail.items.map(
+                    (item) =>
+                      expanded[item.id] && (
+                        <ExpandedItemPanel
+                          key={`${item.id}-detail`}
+                          item={item}
+                          methods={props.methods}
+                          canPay={props.canPay && selected.status === "borrador" && item.remaining > 0}
+                          busy={busy}
+                          portionsValue={portions[item.id] ?? ""}
+                          onPortionsChange={(value) =>
+                            setPortions((prev) => ({ ...prev, [item.id]: value }))
+                          }
+                          onPay={() => void handlePay(item)}
+                        />
+                      ),
+                  )}
+                  {props.canAdmin && selected.status === "borrador" && (
+                    <button type="button" onClick={handleClose} disabled={busy} className={`${buttonClass} mt-4`}>
+                      {busy ? "Cerrando…" : "Cerrar periodo"}
+                    </button>
+                  )}
+                </>
+              )}
             </div>
             <DialogFooter>
               <button type="button" className={ghostClass} onClick={closeDetail}>
