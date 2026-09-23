@@ -17,6 +17,7 @@ import type {
   EmployeeRow,
   PaymentMethodRow,
   ServiceRow,
+  TaxConfigRow,
 } from "@/src/features/admin/service";
 import {
   Badge,
@@ -119,6 +120,7 @@ interface InvoicesClientProps {
   services: ServiceRow[];
   employees: EmployeeRow[];
   methods: PaymentMethodRow[];
+  taxes: TaxConfigRow[];
   canWrite: boolean;
   canAnnul: boolean;
   detailMode: "full" | "open-only" | "none";
@@ -344,7 +346,17 @@ export function InvoicesClient(props: InvoicesClientProps) {
     return acc + qty * price;
   }, 0);
   const draftDiscount = toNumber(discount) ?? 0;
-  const draftTotal = Math.max(0, draftSubtotal - draftDiscount);
+  const draftSubtotalAfterDiscount = Math.max(0, draftSubtotal - draftDiscount);
+  
+  // Calcular impuestos en tiempo real usando los impuestos activos de la sede
+  const draftTaxes = props.taxes.reduce((acc, tax) => {
+    const percent = tax.percent ?? 0;
+    return acc + Math.round(draftSubtotalAfterDiscount * (percent / 100) * 100) / 100;
+  }, 0);
+  const draftTotal = Math.max(0, draftSubtotalAfterDiscount + draftTaxes);
+  
+  // Determinar si hay pago inmediato (para botón "Emitir y pagar")
+  const hasImmediatePayment = portions.some((p) => (toNumber(p.amount) ?? 0) > 0);
 
   function draftItemName(item: ItemDraft): string {
     if (item.item_type === "producto") {
@@ -691,9 +703,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 />
                               </dd>
                             </div>
-                            <div className="flex justify-between gap-3 text-slate-500">
+                            <div className="flex justify-between gap-3">
                               <dt>Impuestos</dt>
-                              <dd>se liquidan al emitir</dd>
+                              <dd className="font-medium">{formatMoney(draftTaxes)}</dd>
                             </div>
                             <div className="flex justify-between gap-3 border-t-2 border-slate-900 pt-2 text-lg font-black">
                               <dt>TOTAL</dt>
@@ -721,7 +733,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             disabled={busy}
                             className="h-10 rounded-md bg-emerald-700 px-6 text-sm font-semibold text-white hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 disabled:opacity-50"
                           >
-                            {busy ? "Emitiendo…" : "Emitir factura"}
+                            {busy ? "Emitiendo…" : hasImmediatePayment ? "Emitir y pagar" : "Emitir factura"}
                           </button>
                         </div>
                       </form>

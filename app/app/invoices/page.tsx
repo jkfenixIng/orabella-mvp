@@ -6,6 +6,7 @@ import {
   listEmployees,
   listPaymentMethods,
   listServices,
+  listTaxes,
 } from "@/src/features/admin/service";
 import { listProducts } from "@/src/features/inventory/service";
 import { listInvoices } from "@/src/features/billing/service";
@@ -36,12 +37,13 @@ export default async function InvoicesPage() {
     );
   }
 
-  const [invoices, products, services, employees, methods] = await Promise.all([
+  const [invoices, products, services, employees, methods, taxes] = await Promise.all([
     listInvoices(sedeId),
     listProducts(sedeId),
     listServices(sedeId),
     listEmployees(sedeId),
     listPaymentMethods(sedeId),
+    listTaxes(sedeId),
   ]);
 
   const canWrite = session.roles.includes("admin") || session.roles.includes("caja");
@@ -67,6 +69,7 @@ export default async function InvoicesPage() {
         services={services}
         employees={employees.filter((row) => row.is_active)}
         methods={methods.filter((row) => row.is_active)}
+        taxes={taxes.filter((row) => row.is_active)}
         canWrite={canWrite}
         canAnnul={session.roles.includes("admin")}
         detailMode={isAdmin ? "full" : isManager ? "open-only" : "none"}
