@@ -11,7 +11,7 @@ import type {
   VoucherRequestRow,
   VoucherSettingsRow,
 } from "@/src/features/payroll/service";
-import type { EmployeeRow } from "@/src/features/admin/service";
+import type { EmployeeRow, PaymentMethodRow } from "@/src/features/admin/service";
 import {
   Dialog,
   DialogContent,
@@ -85,6 +85,14 @@ interface VouchersClientProps {
   initialEmployees: EmployeeRow[];
   initialSettings: VoucherSettingsRow | null;
   initialVouchers: VoucherRequestRow[];
+  /** Métodos activos y arqueables de la sede (la lista NO va hardcodeada). */
+  initialMethods: PaymentMethodRow[];
+  /** Hay caja abierta en la sede. */
+  shiftOpen: boolean;
+  /** La caja abierta es mía (o soy admin). */
+  shiftOwn: boolean;
+  /** Nombre de quien abrió la caja (para el aviso de bloqueo). */
+  shiftOwner: string | null;
   canAdmin: boolean;
   canIssue: boolean;
 }
@@ -95,6 +103,7 @@ export function VouchersClient(props: VouchersClientProps) {
   const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
   const [voucherEmployee, setVoucherEmployee] = useState("");
   const [voucherAmount, setVoucherAmount] = useState("");
+  const [voucherMethod, setVoucherMethod] = useState("");
   const [voucherNote, setVoucherNote] = useState("");
   const [reviewNote, setReviewNote] = useState("");
   const [rejectReason, setRejectReason] = useState("");
@@ -105,6 +114,15 @@ export function VouchersClient(props: VouchersClientProps) {
   // V1: sin topes configurados no se puede solicitar; el alta vive en un modal.
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const configured = settings !== null;
+  // La caja abierta es quien abre el vale: sin turno abierto, o si el turno
+  // es de otro y no soy admin, se bloquea (el servidor vuelve a validar).
+  const shiftBlockReason: string | null = !props.shiftOpen
+    ? "No hay caja abierta: abre tu turno para solicitar vales."
+    : !props.shiftOwn
+      ? props.shiftOwner
+        ? `La caja abierta es del turno de ${props.shiftOwner}: solo ${props.shiftOwner} o un administrador puede solicitar vales.`
+        : "La caja abierta es de otro turno: solo quien abrió el turno o un administrador puede solicitar vales."
+      : null;
   // V2: resumen legible de los topes vigentes.
   const capsSummary = (() => {
     const parts: string[] = [];
@@ -156,12 +174,17 @@ export function VouchersClient(props: VouchersClientProps) {
       setMessage({ kind: "error", text: "Elija el empleado e indique un monto mayor a 0." });
       return;
     }
+    if (!voucherMethod) {
+      setMessage({ kind: "error", text: "Elija el método de pago por el que saldrá el dinero." });
+      return;
+    }
     setBusy(true);
-    // La fecha del vale la asigna el backend con la fecha del día de la
-    // solicitud; el frontend no la envía.
+    // La fecha del vale la asigna el backend (día de la solicitud) y el turno
+    // de caja lo toma del turno abierto; el frontend no los envía.
     const result = (await requestVoucherAction({
       employee_id: voucherEmployee,
       amount,
+      method_code: voucherMethod,
       observation: voucherNote || undefined,
     })) as ActionResult<VoucherRequestResult>;
     setBusy(false);
@@ -171,15 +194,12 @@ export function VouchersClient(props: VouchersClientProps) {
         !result.success
           ? undefined
           : result.data.auto_approved
-            ? `Vale aprobado automáticamente con detalle auditado${result.data.day_not_allowed ? " (día no permitido)" : ""}.`
-            : result.data.day_not_allowed
-              ? "Vale pendiente: cae en día no permitido y exige revisión del admin."
-              : result.data.requires_approval
-                ? "Vale pendiente: supera los topes y exige aprobación con código."
-                : "Vale solicitado.",
+            ? "Vale aprobado: dentro de rango se generó directo con su método de pago."
+            : "Vale pendiente: fuera de rango (día o topes), el admin debe autorizarlo.",
       )
     ) {
       setVoucherAmount("");
+      setVoucherMethod("");
       setVoucherNote("");
       setIsCreateOpen(false);
       await refreshVouchers();
@@ -192,7 +212,7 @@ export function VouchersClient(props: VouchersClientProps) {
       observation: reviewNote || undefined,
     })) as ActionResult<VoucherRequestRow>;
     setBusy(false);
-    if (show(result, result.success ? `Vale aprobado con código ${result.data.approval_code}.` : undefined)) {
+    if (show(result, "Vale aprobado.")) {
       setReviewNote("");
       await refreshVouchers();
     }
@@ -272,8 +292,12 @@ export function VouchersClient(props: VouchersClientProps) {
           {props.canIssue && (
             <button
               type="button"
-              title={!configured ? "Configure los topes antes de solicitar vales" : undefined}
-              disabled={!configured}
+              title={
+                !configured
+                  ? "Configure los topes antes de solicitar vales"
+                  : shiftBlockReason ?? undefined
+              }
+              disabled={!configured || shiftBlockReason !== null}
               onClick={() => {
                 setMessage(null);
                 setIsCreateOpen(true);
@@ -287,6 +311,11 @@ export function VouchersClient(props: VouchersClientProps) {
         {!configured && (
           <p role="status" className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
             Los vales no están configurados: un administrador debe definir topes y días permitidos antes de solicitar.
+          </p>
+        )}
+        {props.canIssue && configured && shiftBlockReason !== null && (
+          <p role="status" className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
+            {shiftBlockReason}
           </p>
         )}
         {props.canIssue && (
@@ -323,6 +352,25 @@ export function VouchersClient(props: VouchersClientProps) {
                   <input value={formatMoneyInput(voucherAmount)} onChange={(event) => setVoucherAmount(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
                 </label>
                 <label className={labelClass}>
+                  Método de pago (arqueable)
+                  <Combobox
+                    value={voucherMethod}
+                    onValueChange={setVoucherMethod}
+                    placeholder="Seleccione…"
+                    options={props.initialMethods.map((row) => ({
+                      value: row.code,
+                      label: row.name,
+                    }))}
+                    ariaLabel="Método de pago por el que sale el vale"
+                    filterPlaceholder="Buscar método…"
+                  />
+                </label>
+                {props.initialMethods.length === 0 && (
+                  <p role="status" className={errorClass}>
+                    No hay métodos de pago arqueables activos: configúrelos antes de solicitar vales.
+                  </p>
+                )}
+                <label className={labelClass}>
                   Observación (opcional)
                   <input value={voucherNote} onChange={(event) => setVoucherNote(event.target.value)} className={inputClass} />
                 </label>
@@ -348,12 +396,12 @@ export function VouchersClient(props: VouchersClientProps) {
                 {row.status}
                 {row.status === "descontada" ? " (en nómina: sin cambios)" : ""}
               </span>
-              {row.approval_code && <span className="text-xs">Código: {row.approval_code}</span>}
+              {row.method_code && <span className="text-xs">Método: {row.method_code}</span>}
               {row.observation && <span className="text-xs text-text-tertiary">{row.observation}</span>}
               {props.canAdmin && row.status === "pendiente" && (
                 <>
                   <button type="button" onClick={() => openReview(row.id, "approve")} disabled={busy} className={ghostClass}>
-                    Aprobar con código
+                    Aprobar
                   </button>
                   <button type="button" onClick={() => openReview(row.id, "reject")} disabled={busy} className={ghostClass}>
                     Rechazar
@@ -374,7 +422,7 @@ export function VouchersClient(props: VouchersClientProps) {
             <DialogContent className="max-w-lg">
               <DialogHeader>
                 <DialogTitle>
-                  {reviewTarget?.action === "reject" ? "Rechazar vale" : "Aprobar vale con código"}
+                  {reviewTarget?.action === "reject" ? "Rechazar vale" : "Aprobar vale"}
                 </DialogTitle>
               </DialogHeader>
               <div className="mt-3 flex flex-col gap-3">

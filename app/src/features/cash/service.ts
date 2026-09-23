@@ -18,12 +18,15 @@ import {
   resolveOpeningBase,
   roundMoney,
   moneyEquals,
+  sumMethodMaps,
+  voucherOutByMethod,
   type CloseShiftInput,
   type DayTotals,
   type MethodDifference,
   type OpenShiftInput,
   type RegisterPaymentInput,
   type ShiftCountInput,
+  type VoucherCashOutInput,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
@@ -348,6 +351,61 @@ async function fetchPayoutTotals(
     const byMethod = result.get(row.cash_shift_id) ?? new Map<string, number>();
     byMethod.set(row.method_code, roundMoney((byMethod.get(row.method_code) ?? 0) + Number(row.amount)));
     result.set(row.cash_shift_id, byMethod);
+  }
+  return result;
+}
+
+// 028 (method_code/cash_shift_id en voucher_requests) puede no estar aplicada
+// en esta base: la primera consulta decide y se cachea. Sin las columnas
+// simplemente no hay salidas por vale (el arqueo no se rompe). Un error
+// distinto (red/permisos) no se cachea: la consulta real lo reporta.
+let voucherOutColumns: boolean | null = null;
+
+async function hasVoucherOutColumns(db: DbClient): Promise<boolean> {
+  if (voucherOutColumns === null) {
+    const probe = await db.from("voucher_requests").select("method_code, cash_shift_id").limit(1);
+    if (!probe.error) {
+      voucherOutColumns = true;
+    } else {
+      const message = String((probe.error as { message?: string }).message ?? "");
+      if (/method_code|cash_shift_id/i.test(message)) voucherOutColumns = false;
+    }
+  }
+  return voucherOutColumns !== false;
+}
+
+/**
+ * Salidas de caja por vales aprobados, por turno y método (descuentan del
+ * esperado igual que los pagos inmediatos de comisión). Solo cuentan los
+ * vales aprobados: un vale pendiente/rechazado NO toca caja (regla "no toca
+ * caja hasta aprobar"). Si la migración 028 no está aplicada no hay salidas.
+ */
+async function fetchVoucherOutTotals(
+  db: DbClient,
+  shiftIds: string[],
+): Promise<Map<string, Map<string, number>>> {
+  const result = new Map<string, Map<string, number>>();
+  if (shiftIds.length === 0) return result;
+  if (!(await hasVoucherOutColumns(db))) return result;
+  const { data, error } = await db
+    .from("voucher_requests")
+    .select("cash_shift_id, approved_by, method_code, amount")
+    .in("cash_shift_id", shiftIds);
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  const byShift = new Map<string, VoucherCashOutInput[]>();
+  for (const row of (data ?? []) as Array<{
+    cash_shift_id: string;
+    approved_by: string | null;
+    method_code: string | null;
+    amount: number | string;
+  }>) {
+    const list = byShift.get(row.cash_shift_id) ?? [];
+    list.push({ approved_by: row.approved_by, method_code: row.method_code, amount: row.amount });
+    byShift.set(row.cash_shift_id, list);
+  }
+  for (const [shiftId, rows] of byShift) {
+    const out = voucherOutByMethod(rows);
+    if (out.size > 0) result.set(shiftId, out);
   }
   return result;
 }
@@ -817,6 +875,15 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
  * justificación (arqueo escondido). expected_cash = efectivo cobrado en el
  * turno; calcula recogido (= contado − base) y diferencia
  * (= base − base configurada).
+ *
+ * Los vales APROBADOS del turno (por su method_code) son salidas de caja y
+ * descuentan del esperado por método, igual que los pagos inmediatos de
+ * comisión; un vale pendiente o rechazado no toca caja.
+ *
+ * LIMITACIÓN CONOCIDA: si la caja ya le entregó el efectivo al empleado y el
+ * administrador rechaza el vale después, ese dinero salió del cajón pero el
+ * sistema no lo registra (rechazar no toca caja): el cierre puede mostrar un
+ * faltante no explicado por el sistema. Trade-off aceptado.
  */
 export interface CloseShiftResult {
   shift: CashShiftRow;
@@ -879,6 +946,16 @@ export async function closeShift(
     for (const row of ((payoutRows ?? []) as Array<{ method_code: string; amount: number | string }>)) {
       paidOutByMethod.set(row.method_code, roundMoney((paidOutByMethod.get(row.method_code) ?? 0) + Number(row.amount)));
     }
+    const payoutsOut = roundMoney([...paidOutByMethod.values()].reduce((acc, value) => acc + value, 0));
+    // Vales aprobados del turno: salida de dinero por su método (RESTAN del
+    // esperado, igual que los pagos inmediatos de comisión). Un vale pendiente
+    // o rechazado no toca caja (regla "no toca caja hasta aprobar").
+    const voucherOutMaps = await fetchVoucherOutTotals(db, [shift.id]);
+    const voucherOut = voucherOutMaps.get(shift.id) ?? new Map<string, number>();
+    for (const [code, amount] of voucherOut) {
+      paidOutByMethod.set(code, roundMoney((paidOutByMethod.get(code) ?? 0) + amount));
+    }
+    const vouchersOut = roundMoney([...voucherOut.values()].reduce((acc, value) => acc + value, 0));
     // Facturas cobradas en este turno (emitidas aquí o en turnos anteriores):
     // suman al esperado y al arqueo por método, igual que `payments`.
     const invoicePayMaps = await fetchInvoicePaymentsByShift(db, [shift.id]);
@@ -958,7 +1035,8 @@ export async function closeShift(
         base_difference: close.baseDifference,
         base_incompleta: close.baseDifference < 0,
         admin_override: isOverride,
-        payouts_out: roundMoney([...paidOutByMethod.values()].reduce((acc, value) => acc + value, 0)),
+        payouts_out: payoutsOut,
+        vouchers_out: vouchersOut,
         method_differences: methodDifferences,
         observation: observation ?? null,
         invoices_total: invoicesTotal,
@@ -1175,6 +1253,10 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
     db,
     rows.map((row) => row.id),
   );
+  const voucherOutMaps = await fetchVoucherOutTotals(
+    db,
+    rows.map((row) => row.id),
+  );
   const invoicePayMaps = await fetchInvoicePaymentsByShift(
     db,
     rows.map((row) => row.id),
@@ -1194,7 +1276,7 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
     const { metodos, declarados, diferencias } = buildMethodViews({
       paid: paidByMethod,
       open: counts.open,
-      paidOut: payoutMaps.get(shift.id) ?? new Map<string, number>(),
+      paidOut: sumMethodMaps(payoutMaps.get(shift.id), voucherOutMaps.get(shift.id)),
       closed: shift.status === "cerrado" ? counts.closed : null,
     });
     const revision = assembleShiftRevision(
@@ -1309,6 +1391,10 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
     db,
     rows.map((row) => row.id),
   );
+  const historyVoucherOutMaps = await fetchVoucherOutTotals(
+    db,
+    rows.map((row) => row.id),
+  );
   const historyInvoicePayMaps = await fetchInvoicePaymentsByShift(
     db,
     rows.map((row) => row.id),
@@ -1334,7 +1420,7 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
       const { metodos, declarados, diferencias } = buildMethodViews({
         paid: paidByMethod,
         open: counts.open,
-        paidOut: historyPayoutMaps.get(shift.id) ?? new Map<string, number>(),
+        paidOut: sumMethodMaps(historyPayoutMaps.get(shift.id), historyVoucherOutMaps.get(shift.id)),
         closed: shift.status === "cerrado" ? counts.closed : null,
       });
       const revision = assembleShiftRevision(

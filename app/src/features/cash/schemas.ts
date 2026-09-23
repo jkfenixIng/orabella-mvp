@@ -20,6 +20,56 @@ export function expectedDigitalTotal(openAmount: number, paidAmount: number, pai
   return roundMoney(roundMoney(openAmount) + roundMoney(paidAmount) - roundMoney(paidOut));
 }
 
+/** Vale tal como lo lee el arqueo para descontarlo de la caja. */
+export interface VoucherCashOutInput {
+  /** Quién autorizó: null = nunca aprobado (pendiente/rechazada). */
+  approved_by: string | null;
+  /** Método arqueable por el que salió el dinero; null = histórico sin método. */
+  method_code: string | null;
+  amount: number | string;
+}
+
+/**
+ * Regla de dinero del vale: un vale SOLO toca caja cuando fue aprobado
+ * (approved_by no nulo) y tiene método arqueable. Un vale pendiente o
+ * rechazado NUNCA afecta el arqueo; uno aprobado sí, aunque después pase a
+ * descontada en nómina (el efectivo ya salió del cajón). Puro para probarlo.
+ */
+export function isVoucherCashOut(row: VoucherCashOutInput): boolean {
+  return row.approved_by !== null && row.method_code !== null;
+}
+
+/**
+ * Salida de caja por vales aprobados, agrupada por método. Se usa como
+ * `paidOut` del arqueo (resta del esperado), igual que los pagos inmediatos
+ * de comisión. Puro para probarlo sin base de datos.
+ */
+export function voucherOutByMethod(rows: VoucherCashOutInput[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const row of rows) {
+    if (!isVoucherCashOut(row)) continue;
+    out.set(row.method_code as string, roundMoney((out.get(row.method_code as string) ?? 0) + Number(row.amount)));
+  }
+  return out;
+}
+
+/**
+ * Suma mapas de salida por método (p. ej. comisiones + vales). Los mapas
+ * ausentes se ignoran. Puro para probarlo sin base de datos.
+ */
+export function sumMethodMaps(
+  ...maps: Array<Map<string, number> | null | undefined>
+): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const map of maps) {
+    if (!map) continue;
+    for (const [code, amount] of map) {
+      out.set(code, roundMoney((out.get(code) ?? 0) + amount));
+    }
+  }
+  return out;
+}
+
 export interface ShiftCountMaps {
   paid: Map<string, number>;
   open: Map<string, number>;

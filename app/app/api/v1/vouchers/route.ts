@@ -6,6 +6,7 @@ import {
   PayrollError,
   listVouchers,
   requestVoucher,
+  requirePayrollPayer,
 } from "@/src/features/payroll/service";
 
 function payrollErrorResponse(error: unknown) {
@@ -37,14 +38,15 @@ export async function GET(request: NextRequest) {
 }
 
 /**
- * POST /api/v1/vouchers — solicita un vale (PAY-05/PAY-06 + item 5,
- * cualquier rol de la sede). Valida topes día/semana y días permitidos;
- * si exige revisión queda pendiente (alerta voucher.requested); el admin
- * queda auto-aprobado con código y detalle.
+ * POST /api/v1/vouchers — la caja (turno abierto) abre un vale para el
+ * empleado que lo solicita en el mostrador (admin/caja vía requirePayrollPayer;
+ * el servicio exige turno abierto y dueño o admin). El método arqueable se
+ * elige al crear. Dentro de rango se genera directo; fuera de rango queda
+ * pendiente (alerta voucher.requested) para autorización del admin.
  */
 export async function POST(request: NextRequest) {
   try {
-    const session = await requireSession(tokenOf(request));
+    const session = await requirePayrollPayer(tokenOf(request));
     const body: unknown = await request.json().catch(() => ({}));
     const data = await requestVoucher(body, {
       userId: session.userId,

@@ -140,7 +140,7 @@ export async function setVoucherLimitsAction(input: unknown) {
   }
 }
 
-/** Misma lógica que POST /api/v1/vouchers (admin/caja: emitir vales; admin auto-aprueba). */
+/** Misma lógica que POST /api/v1/vouchers (admin/caja; el servicio exige turno abierto). */
 export async function requestVoucherAction(input: unknown) {
   try {
     const session = await requirePayrollPayer(await sessionToken());

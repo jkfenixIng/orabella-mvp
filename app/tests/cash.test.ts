@@ -15,10 +15,13 @@ import {
   expectedDigitalTotal,
   HISTORY_PAGE_SIZE,
   historySchema,
+  isVoucherCashOut,
   openShiftSchema,
   registerPaymentSchema,
   resolveClosingBase,
   resolveOpeningBase,
+  sumMethodMaps,
+  voucherOutByMethod,
 } from "@/src/features/cash/schemas";
 
 // ------------------------------------------------- base encadenada (CAJ-01) ---
@@ -208,8 +211,7 @@ describe("cash: pagos contra el turno con método activo y monto > 0 (CAJ-02)", 
 
 // ------------------------------------------------- día y acumulado (CAJ-05) ---
 
-describe("cash: vista del día valida la fecha (CAJ-05)", () => {
-  it("acepta yyyy-mm-dd y rechaza otros formatos", () => {
+describe("cash: vista del día valida la fecha (CAJ-05)", () => {  it("acepta yyyy-mm-dd y rechaza otros formatos", () => {
     expect(dayViewSchema.safeParse({ fecha: "2026-09-18" }).success).toBe(true);
     expect(dayViewSchema.safeParse({ fecha: "18/09/2026" }).success).toBe(false);
     expect(dayViewSchema.safeParse({}).success).toBe(false);
@@ -346,5 +348,66 @@ describe("migración 006_cash.sql (T6)", () => {
     expect(sql).toContain("CAJ-04");
     expect(sql).toContain("invoice_payments");
     expect(sql).toContain("400");
+  });
+});
+
+// ------------------------------------------------- vales en el arqueo ---
+
+describe("cash: vales aprobados descuentan del arqueo por su método", () => {
+  it("un vale pendiente NO afecta el arqueo (nunca aprobado)", () => {
+    expect(isVoucherCashOut({ approved_by: null, method_code: "efectivo", amount: 50000 })).toBe(false);
+    // Histórico sin método tampoco cuenta, aunque figure aprobado.
+    expect(isVoucherCashOut({ approved_by: "u1", method_code: null, amount: 50000 })).toBe(false);
+    const out = voucherOutByMethod([
+      { approved_by: null, method_code: "efectivo", amount: 50000 },
+      { approved_by: null, method_code: "nequi", amount: 30000 },
+    ]);
+    expect(out.size).toBe(0);
+  });
+
+  it("un vale aprobado SÍ sale por su método (resta del esperado digital)", () => {
+    const out = voucherOutByMethod([
+      { approved_by: "u1", method_code: "efectivo", amount: 30000 },
+      { approved_by: "u1", method_code: "nequi", amount: 20000 },
+    ]);
+    expect(out.get("efectivo")).toBe(30000);
+    expect(out.get("nequi")).toBe(20000);
+    // Esperado digital = apertura + cobrado − salida del vale.
+    expect(expectedDigitalTotal(1000000, 50000, out.get("nequi") ?? 0)).toBe(1030000);
+  });
+
+  it("varios vales del mismo método acumulan y los pendientes se ignoran", () => {
+    const out = voucherOutByMethod([
+      { approved_by: "u1", method_code: "efectivo", amount: 10000 },
+      { approved_by: "u2", method_code: "efectivo", amount: 25000 },
+      { approved_by: null, method_code: "efectivo", amount: 999999 },
+    ]);
+    expect(out.get("efectivo")).toBe(35000);
+  });
+
+  it("sumMethodMaps combina comisiones + vales (mapas ausentes se ignoran)", () => {
+    const payouts = new Map([["nequi", 100000]]);
+    const vouchers = new Map([
+      ["nequi", 20000],
+      ["efectivo", 30000],
+    ]);
+    const combined = sumMethodMaps(payouts, vouchers);
+    expect(combined.get("nequi")).toBe(120000);
+    expect(combined.get("efectivo")).toBe(30000);
+    expect(sumMethodMaps(null, undefined).size).toBe(0);
+  });
+
+  it("buildMethodViews cuadra el cierre descontando la salida por vale", () => {
+    const paid = new Map([["nequi", 200000]]);
+    const open = new Map([["nequi", 1000000]]);
+    const out = new Map([["nequi", 50000]]);
+    const closedOk = new Map([["nequi", 1150000]]);
+    // 1000000 + 200000 − 50000 = 1150000 → sin diferencias.
+    expect(buildMethodViews({ paid, open, paidOut: out, closed: closedOk }).diferencias).toEqual([]);
+    // Sin descontar el vale el mismo conteo daría faltante.
+    const closedNoOut = new Map([["nequi", 1150000]]);
+    expect(
+      buildMethodViews({ paid, open, paidOut: new Map(), closed: closedNoOut }).diferencias,
+    ).toEqual([{ method_code: "nequi", expected: 1200000, declared: 1150000, difference: -50000 }]);
   });
 });

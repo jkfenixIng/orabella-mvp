@@ -83,16 +83,24 @@ export const voucherLimitsSchema = z.object({
 });
 export type VoucherLimitsInput = z.infer<typeof voucherLimitsSchema>;
 
-/** PAY-06: solicitud de vale (monto > 0, fecha opcional, observación opcional). */
+/**
+ * PAY-06: solicitud de vale (monto > 0, método arqueable obligatorio, fecha
+ * opcional, observación opcional). El método se elige AL CREAR el vale (la
+ * caja lo sabe antes de aprobar): es el medio por el que saldrá el dinero.
+ */
 export const requestVoucherSchema = z.object({
   employee_id: uuidSchema,
   amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+  method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
   request_date: dateSchema.optional(),
   observation: z.string().trim().max(500, "Observación muy larga.").nullish(),
 });
 export type RequestVoucherInput = z.infer<typeof requestVoucherSchema>;
 
-/** PAY-06: aprobación con observación opcional (el código lo genera el servidor). */
+/**
+ * PAY-06: aprobación con observación opcional. Sin código de aprobación: la
+ * autorización queda en `approved_by` + la observación.
+ */
 export const approveVoucherSchema = z.object({
   observation: z.string().trim().max(500, "Observación muy larga.").nullish(),
 });
@@ -222,8 +230,8 @@ export interface VoucherCapCheck {
 
 /**
  * PAY-05/PAY-06: true cuando el vale supera algún tope y por tanto exige
- * aprobación del admin con código (el servicio lo marca pendiente con
- * requires_approval). Topes en 0 o nulos = sin tope (ilimitado).
+ * aprobación del admin (el servicio lo marca pendiente con requires_approval).
+ * Topes en 0 o nulos = sin tope (ilimitado).
  * Puro para probarlo sin base de datos.
  */
 export function checkVoucherCaps(args: {
@@ -247,7 +255,7 @@ export function checkVoucherCaps(args: {
   return { overDay, overWeek };
 }
 
-/** PAY-06: el vale exige aprobación con código cuando supera algún tope. */
+/** PAY-06: el vale exige revisión del admin cuando supera algún tope. */
 export function requiresVoucherApproval(caps: VoucherCapCheck): boolean {
   return caps.overDay || caps.overWeek;
 }
@@ -352,23 +360,23 @@ export function checkVoucherEligibility(args: {
   return { ...caps, dayNotAllowed: !isVoucherDayAllowed(args.requestDate, args.allowedDays) };
 }
 
-/** Item 5: el vale exige revisión del admin (topes o día no permitido). */
+/**
+ * Item 5: el vale exige revisión del admin (topes o día no permitido).
+ */
 export function voucherRequiresReview(eligibility: VoucherEligibility): boolean {
   return eligibility.overDay || eligibility.overWeek || eligibility.dayNotAllowed;
 }
 
 /**
- * PAY-06: código dinámico básico de 6 dígitos para la aprobación.
- * Puro salvo la aleatoriedad (el test valida formato, no valor).
+ * Nuevo flujo: estado con el que nace el vale. Dentro de rango (días
+ * permitidos + topes) se genera directo (aprobada, utilizable de una); fuera
+ * de rango queda pendiente para que el admin lo autorice o rechace.
+ * Puro para probarlo sin base de datos.
  */
-export function generateApprovalCode(): string {
-  const code = Math.floor(100000 + Math.random() * 900000);
-  return String(code);
-}
-
-/** PAY-06: formato válido del código (6 dígitos). */
-export function isApprovalCodeValid(code: string | null | undefined): boolean {
-  return typeof code === "string" && /^\d{6}$/.test(code);
+export function resolveVoucherInitialStatus(
+  eligibility: VoucherEligibility,
+): "aprobada" | "pendiente" {
+  return voucherRequiresReview(eligibility) ? "pendiente" : "aprobada";
 }
 
 /**

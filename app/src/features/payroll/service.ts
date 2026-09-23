@@ -11,7 +11,6 @@ import {
   checkVoucherEligibility,
   computeLineCommission,
   computeNetPay,
-  generateApprovalCode,
   normalizeAllowedDays,
   normalizePerDayLimits,
   openPeriodSchema,
@@ -20,7 +19,7 @@ import {
   rejectVoucherSchema,
   requiresVoucherApproval,
   resolveVoucherDayCap,
-  voucherRequiresReview,
+  resolveVoucherInitialStatus,
   roundMoney,
   voucherLimitsSchema,
   weekStartOf,
@@ -30,6 +29,7 @@ import {
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
+import { getOpenShiftWithOpener } from "@/src/features/cash/service";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
 import {
@@ -213,6 +213,11 @@ export interface VoucherRequestRow {
   request_date: string;
   status: string;
   approved_by: string | null;
+  /** Método arqueable por el que sale el dinero; null = vale histórico. */
+  method_code: string | null;
+  /** Turno de caja que abrió el vale; null = vale histórico. */
+  cash_shift_id: string | null;
+  /** PAY-06: código histórico. Ya no se genera; se conserva la columna. */
   approval_code: string | null;
   observation: string | null;
 }
@@ -224,7 +229,37 @@ const ITEM_SELECT =
 const PAYMENT_SELECT =
   "id, payroll_item_id, method_id, method_code, amount, paid_at, paid_by, reference";
 const VOUCHER_SELECT =
+  "id, sede_id, employee_id, amount, request_date, status, approved_by, method_code, cash_shift_id, approval_code, observation";
+/** Misma selección sin las columnas de la migración 028 (aún sin aplicar). */
+const VOUCHER_SELECT_LEGACY =
   "id, sede_id, employee_id, amount, request_date, status, approved_by, approval_code, observation";
+
+// 028 (method_code/cash_shift_id) puede no estar aplicada en esta base: la
+// primera consulta decide y se cachea; un error distinto (red/permisos) no se
+// cachea, así la consulta real lo reporta en vez de degradar en silencio.
+let voucherMethodColumns: boolean | null = null;
+
+async function resolveVoucherSelect(db: DbClient): Promise<string> {
+  if (voucherMethodColumns === null) {
+    const probe = await db.from("voucher_requests").select("method_code, cash_shift_id").limit(1);
+    if (!probe.error) {
+      voucherMethodColumns = true;
+    } else {
+      const message = String((probe.error as { message?: string }).message ?? "");
+      if (/method_code|cash_shift_id/i.test(message)) voucherMethodColumns = false;
+    }
+  }
+  return voucherMethodColumns === false ? VOUCHER_SELECT_LEGACY : VOUCHER_SELECT;
+}
+
+/** Rellena method_code/cash_shift_id cuando la migración 028 no está aplicada. */
+function normalizeVoucher(row: Record<string, unknown>): VoucherRequestRow {
+  return {
+    ...(row as unknown as VoucherRequestRow),
+    method_code: (row.method_code as string | null) ?? null,
+    cash_shift_id: (row.cash_shift_id as string | null) ?? null,
+  };
+}
 
 // ----------------------------------------------------------------- periodos ---
 
@@ -903,17 +938,24 @@ export interface VoucherRequestResult {
   over_week: boolean;
   /** Item 5: la fecha cae fuera de los días permitidos (también exige revisión). */
   day_not_allowed: boolean;
-  /** Item 5: el admin quedó auto-aprobado al solicitar (con código y detalle). */
+  /** Dentro de rango: se generó directo (aprobada, utilizable de una). */
   auto_approved: boolean;
 }
 
 /**
- * PAY-05/PAY-06 + item 5: solicita un vale. Valida topes día/semana
- * acumulando los vales vigentes + días permitidos; si excede topes o cae
- * en día no permitido queda pendiente exigiendo revisión del admin
- * (requires_approval + alerta voucher.requested). El admin que solicita
- * queda auto-aprobado con código y detalle auditado. Lo puede pedir
- * cualquier rol autenticado de la sede.
+ * PAY-05/PAY-06 + item 5 (nuevo flujo): la CAJA (turno abierto) abre el vale
+ * del empleado que se acerca al mostrador. Exige turno abierto y ser su dueño
+ * (o admin); el método arqueable se elige aquí. Valida topes día/semana
+ * acumulando los vigentes + días permitidos: dentro de rango se genera DIRECTO
+ * (aprobada, utilizable de una); fuera de rango o en día no permitido queda
+ * PENDIENTE para que el admin lo autorice o rechace (alerta voucher.requested).
+ * Sin código de aprobación: la autorización queda en approved_by + observation.
+ *
+ * LIMITACIÓN CONOCIDA: un vale aprobado descuenta del arqueo por su método en
+ * el turno que lo abrió. Si la caja ya entregó el efectivo y el administrador
+ * rechaza después, ese dinero salió del cajón pero el sistema no lo registra
+ * (rechazar no toca caja): el cierre puede mostrar un faltante no explicado
+ * por el sistema. Trade-off aceptado.
  */
 export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise<VoucherRequestResult> {
   const parsed = requestVoucherSchema.safeParse(raw);
@@ -922,6 +964,42 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
   }
   const db = await payrollDb();
   try {
+    // La caja abierta es quien abre el vale: sin turno abierto no hay vale.
+    const openShift = await getOpenShiftWithOpener(actor.sedeId).catch((error) => {
+      throw toPayrollError(error);
+    });
+    if (!openShift) {
+      throw new PayrollError(
+        "NO_OPEN_SHIFT",
+        "No hay caja abierta: abre tu turno para abrir un vale.",
+        409,
+      );
+    }
+    const isAdmin = (actor.roles ?? []).includes("admin");
+    if (openShift.opened_by !== actor.userId && !isAdmin) {
+      const owner = openShift.opener_name?.trim() || null;
+      throw new PayrollError(
+        "SHIFT_NOT_OWNER",
+        owner
+          ? `La caja abierta es del turno de ${owner}: solo ${owner} o un administrador puede abrir vales.`
+          : "La caja abierta es de otro turno: solo quien abrió el turno o un administrador puede abrir vales.",
+        403,
+      );
+    }
+    // Método de pago arqueable: del catálogo real de la sede, no hardcodeado.
+    const methods = await listPaymentMethods(actor.sedeId).catch((error) => {
+      throw toPayrollError(error);
+    });
+    const method = methods.find(
+      (row) => row.is_active && row.arqueable && row.code === parsed.data.method_code,
+    );
+    if (!method) {
+      throw new PayrollError(
+        "METHOD_NOT_ARCHIVABLE",
+        `El método de pago ${parsed.data.method_code} no está activo o no es arqueable en esta sede.`,
+        422,
+      );
+    }
     const employee = await getEmployee(parsed.data.employee_id).catch((error) => {
       throw toPayrollError(error);
     });
@@ -930,8 +1008,7 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
     } catch (error) {
       throw toPayrollError(error);
     }
-    const requestDate =
-      parsed.data.request_date ?? new Date().toISOString().slice(0, 10);
+    const requestDate = parsed.data.request_date ?? new Date().toISOString().slice(0, 10);
     const settings = await getVoucherSettings(actor.sedeId);
     const { dayTotal, weekTotal } = await vigenteTotals(
       db,
@@ -950,52 +1027,16 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
       allowedDays: settings?.allowed_days ?? null,
       perDayLimits: settings?.per_day_limits ?? null,
     });
-    const needsReview = voucherRequiresReview(eligibility);
-    // Item 5: auto-aprobación del admin con código y detalle auditado.
-    if ((actor.roles ?? []).includes("admin")) {
-      const observation = parsed.data.observation?.trim()
-        ? parsed.data.observation.trim()
-        : `Auto-aprobado por admin (solicitud propia${eligibility.dayNotAllowed ? ", día no permitido" : ""}${eligibility.overDay || eligibility.overWeek ? ", sobre tope" : ""}).`;
-      const { data, error } = await db
-        .from("voucher_requests")
-        .insert({
-          sede_id: actor.sedeId,
-          employee_id: employee.id,
-          amount: roundMoney(parsed.data.amount),
-          request_date: requestDate,
-          status: "aprobada",
-          approved_by: actor.userId,
-          approval_code: generateApprovalCode(),
-          observation,
-        })
-        .select(VOUCHER_SELECT)
-        .single();
-      if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
-      const approved = data as VoucherRequestRow;
-      await writeAudit({
-        sede_id: actor.sedeId,
-        user_id: actor.userId,
-        action: AUDIT_ACTIONS.VOUCHER_APPROVED,
-        entity: "voucher_requests",
-        entity_id: approved.id,
-        metadata: {
-          employee_id: employee.id,
-          amount: Number(approved.amount),
-          auto: true,
-          over_tope: eligibility.overDay || eligibility.overWeek,
-          day_not_allowed: eligibility.dayNotAllowed,
-          approval_code: approved.approval_code,
-        },
-      });
-      return {
-        voucher: approved,
-        requires_approval: false,
-        over_day: eligibility.overDay,
-        over_week: eligibility.overWeek,
-        day_not_allowed: eligibility.dayNotAllowed,
-        auto_approved: true,
-      };
-    }
+    // Dentro de rango → directo; fuera de rango (topes/día) → pendiente.
+    const status = resolveVoucherInitialStatus(eligibility);
+    const autoApproved = status === "aprobada";
+    const observation = parsed.data.observation?.trim()
+      ? parsed.data.observation.trim()
+      : autoApproved
+        ? "Generado directo en caja (dentro de rango)."
+        : null;
+    const voucherSelect = await resolveVoucherSelect(db);
+    const hasMethodColumns = voucherSelect === VOUCHER_SELECT;
     const { data, error } = await db
       .from("voucher_requests")
       .insert({
@@ -1003,15 +1044,34 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
         employee_id: employee.id,
         amount: roundMoney(parsed.data.amount),
         request_date: requestDate,
-        status: "pendiente",
-        observation: parsed.data.observation?.trim() || null,
+        status,
+        approved_by: autoApproved ? actor.userId : null,
+        observation,
+        ...(hasMethodColumns ? { method_code: method.code, cash_shift_id: openShift.id } : {}),
       })
-      .select(VOUCHER_SELECT)
+      .select(voucherSelect)
       .single();
     if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
-    const created = data as VoucherRequestRow;
-    // Item 5: alerta al admin para aceptar/rechazar con motivo.
-    if (needsReview) {
+    const created = normalizeVoucher(data as unknown as Record<string, unknown>);
+    if (autoApproved) {
+      // Dentro de rango: sale de caja de una; auditado sin código.
+      await writeAudit({
+        sede_id: actor.sedeId,
+        user_id: actor.userId,
+        action: AUDIT_ACTIONS.VOUCHER_APPROVED,
+        entity: "voucher_requests",
+        entity_id: created.id,
+        metadata: {
+          employee_id: employee.id,
+          amount: Number(created.amount),
+          method_code: method.code,
+          cash_shift_id: openShift.id,
+          auto: true,
+          within_range: true,
+        },
+      });
+    } else {
+      // Fuera de rango: alerta al admin para autorizar o rechazar.
       await writeAudit({
         sede_id: actor.sedeId,
         user_id: actor.userId,
@@ -1022,6 +1082,7 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
           employee_id: employee.id,
           amount: Number(created.amount),
           request_date: requestDate,
+          method_code: method.code,
           over_day: eligibility.overDay,
           over_week: eligibility.overWeek,
           day_not_allowed: eligibility.dayNotAllowed,
@@ -1030,11 +1091,11 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
     }
     return {
       voucher: created,
-      requires_approval: needsReview,
+      requires_approval: !autoApproved,
       over_day: eligibility.overDay,
       over_week: eligibility.overWeek,
       day_not_allowed: eligibility.dayNotAllowed,
-      auto_approved: false,
+      auto_approved: autoApproved,
     };
   } catch (error) {
     throw toPayrollError(error);
@@ -1056,7 +1117,7 @@ export async function listVouchers(
   const db = await payrollDb();
   let query = db
     .from("voucher_requests")
-    .select(VOUCHER_SELECT)
+    .select(await resolveVoucherSelect(db))
     .eq("sede_id", sedeId)
     .order("request_date", { ascending: false })
     .limit(limit);
@@ -1065,18 +1126,18 @@ export async function listVouchers(
   if (filters.request_date) query = query.eq("request_date", filters.request_date);
   const { data, error } = await query;
   if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as VoucherRequestRow[];
+  return ((data ?? []) as unknown as Array<Record<string, unknown>>).map(normalizeVoucher);
 }
 
 async function getVoucherOrThrow(db: DbClient, sedeId: string, id: string): Promise<VoucherRequestRow> {
   const { data, error } = await db
     .from("voucher_requests")
-    .select(VOUCHER_SELECT)
+    .select(await resolveVoucherSelect(db))
     .eq("id", id)
     .maybeSingle();
   if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
   if (!data) throw new PayrollError("NOT_FOUND", "Vale no encontrado.", 404);
-  const row = data as VoucherRequestRow;
+  const row = normalizeVoucher(data as unknown as Record<string, unknown>);
   try {
     resolveSede(sedeId, row.sede_id);
   } catch (error) {
@@ -1086,10 +1147,10 @@ async function getVoucherOrThrow(db: DbClient, sedeId: string, id: string): Prom
 }
 
 /**
- * PAY-06: aprueba un vale pendiente con código dinámico básico de 6
- * dígitos (generado por el servidor) + observación opcional. El código es
- * obligatorio cuando el vale supera los topes (se genera siempre al
- * aprobar). Solo admin.
+ * PAY-06 (nuevo flujo): el admin autoriza un vale pendiente (fuera de rango)
+ * con observación opcional. Sin código de aprobación: la autorización queda en
+ * `approved_by` + observation. Al aprobarse, el vale entra al arqueo por su
+ * método en el turno que lo abrió. Solo admin.
  */
 export async function approveVoucher(
   sedeId: string,
@@ -1128,14 +1189,13 @@ export async function approveVoucher(
       .update({
         status: "aprobada",
         approved_by: actor.userId,
-        approval_code: generateApprovalCode(),
         observation,
       })
       .eq("id", id)
-      .select(VOUCHER_SELECT)
+      .select(await resolveVoucherSelect(db))
       .single();
     if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
-    const approved = data as VoucherRequestRow;
+    const approved = normalizeVoucher(data as unknown as Record<string, unknown>);
     // T8: marca si el vale superó topes (reproduce el chequeo de solicitud
     // descontando el propio vale del acumulado vigente que lo incluye).
     let overTope = false;
@@ -1167,8 +1227,8 @@ export async function approveVoucher(
       metadata: {
         employee_id: voucher.employee_id,
         amount: Number(voucher.amount),
+        method_code: approved.method_code,
         over_tope: overTope,
-        approval_code: approved.approval_code,
       },
     });
     return approved;
@@ -1214,7 +1274,7 @@ export async function rejectVoucher(
       .from("voucher_requests")
       .update({ status: "rechazada", observation: parsed.data.motivo.trim() })
       .eq("id", id)
-      .select(VOUCHER_SELECT)
+      .select(await resolveVoucherSelect(db))
       .single();
     if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
     await writeAudit({
@@ -1229,7 +1289,7 @@ export async function rejectVoucher(
         motivo: parsed.data.motivo.trim(),
       },
     });
-    return data as VoucherRequestRow;
+    return normalizeVoucher(data as unknown as Record<string, unknown>);
   } catch (error) {
     throw toPayrollError(error);
   }

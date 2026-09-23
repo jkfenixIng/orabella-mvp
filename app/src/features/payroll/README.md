@@ -20,7 +20,9 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   `max_per_day`/`max_per_week >= 0`), `voucher_requests` (`sede_id`,
   `employee_id`, `amount > 0`, `request_date` default current_date, `status`
   pendiente/aprobada/rechazada/descontada default pendiente, `approved_by`,
-  `approval_code`, `observation`; descontada y rechazada terminales).
+  `method_code` + `cash_shift_id` (migración 028: método arqueable y turno de
+  caja que abrió el vale), `approval_code` (histórico, ya sin uso),
+  `observation`; descontada y rechazada terminales).
 - Servicio (`service.ts`): `openPayrollPeriod` (23505 del índice →
   `PERIOD_DRAFT_EXISTS`), `calculatePayroll` (fijo según `pay_type`
   fijo/mixto + comisiones desde `invoice_items` del rango por `employee_id`
@@ -31,14 +33,18 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   parciales permitidos —40/40/20 en una o varias llamadas— y el acumulado
   nunca excede el neto), `closePayrollPeriod` (inmutable: `assertDraftPeriod`
   bloquea cálculo, pagos y cambios posteriores), `setVoucherLimits`
-  (upsert por sede), `requestVoucher` (valida topes día/semana acumulando
-  vigentes; si excede queda pendiente con `requires_approval`), 
-  `approveVoucher` (solo pendiente; genera `approval_code` de 6 dígitos +
-  observación opcional; obligatorio sobre topes), `rejectVoucher` (solo
-  pendiente, motivo obligatorio). Escritura: admin (pagos también caja);
+  (upsert por sede), `requestVoucher` (nuevo flujo: la CAJA con turno abierto
+  abre el vale; exige turno abierto y dueño o admin; elige el método arqueable
+  al crear; valida topes día/semana y días permitidos —dentro de rango se
+  genera directo/aprobada, fuera de rango queda pendiente con
+  `requires_approval` y alerta `voucher.requested`—),
+  `approveVoucher` (solo pendiente; autorización con `approved_by` +
+  observación, SIN código), `rejectVoucher` (solo pendiente, motivo
+  obligatorio). Escritura: admin (pagos también caja);
   lectura: cualquier rol de la sede. Reutiliza `requireSedeRole`/
   `resolveSede`, `listPaymentMethods` + `getEmployee`/`listEmployees` (T3),
-  `roundMoney`/`moneyEquals` (T5), `ok()`/`fail()`.
+  `getOpenShiftWithOpener` (T6) para el turno de caja, `roundMoney`/
+  `moneyEquals` (T5), `ok()`/`fail()`.
 - API-first (`/api/v1`): `POST /payroll-periods` (+ `GET` lista),
   `GET /payroll-periods/:id` (periodo + ítems con pagado/saldo),
   `POST /payroll-periods/:id/calculate` (`{adjustments[]}` opcional),
@@ -51,15 +57,15 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   bonos/otros por empleado, tabla fijo/comisiones/bonos/vales/otros/neto
   con pagado/saldo, detalle expandible por factura/ítem, pagar por
   porciones `método:monto`, cerrar; cerrado muestra inmutabilidad), vales
-  (topes vigentes + guardar, solicitar, aprobar con código / rechazar con
-  motivo + observación).
+  (topes vigentes + guardar, caja abre con empleado/monto/método arqueable,
+  aprobar o rechazar según rango).
 - Tests (`tests/payroll.test.ts`): mixto 800000+150000+50000−100000−20000 =
   880000 reproducible, fijo sin comisiones, porcentual sin base, neto nunca
   negativo, `detail_json` ordenado por factura/ítem que suma comisiones,
   pago dividido exacto 40/40/20, `SUM_MISMATCH`/`OVERPAID`, cerrado
   inmutable (`PERIOD_CLOSED`), tope día/semana con aprobación obligatoria,
-  semana desde el lunes, código de 6 dígitos, terminales sin doble
-  descuento, y texto de la migración 007.
+  semana desde el lunes, estado inicial directo/pendiente por rango,
+  terminales sin doble descuento, y texto de las migraciones 007/024/026/028.
 - RLS: deny-by-default; políticas por sede endurecidas en T8
   (`008_hardening.sql`: `TODO(seguridad-T7)` cerrado, claim
   `app_metadata.sede_id`).

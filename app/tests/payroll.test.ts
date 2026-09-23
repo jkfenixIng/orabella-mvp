@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  approveVoucherSchema,
   assertDraftPeriod,
   assertNoOverpay,
   assertPortionsMatchNet,
@@ -13,8 +14,6 @@ import {
   checkVoucherEligibility,
   computeLineCommission,
   computeNetPay,
-  generateApprovalCode,
-  isApprovalCodeValid,
   isVoucherDayAllowed,
   normalizeAllowedDays,
   normalizePerDayLimits,
@@ -24,6 +23,7 @@ import {
   requestVoucherSchema,
   requiresVoucherApproval,
   resolveVoucherDayCap,
+  resolveVoucherInitialStatus,
   voucherLimitsSchema,
   voucherRequiresReview,
   weekdayIso,
@@ -228,11 +228,32 @@ describe("payroll: tope con aprobación obligatoria (PAY-05/PAY-06)", () => {
     expect(requiresVoucherApproval(caps)).toBe(false);
   });
 
-  it("el código de aprobación es de 6 dígitos", () => {
-    const code = generateApprovalCode();
-    expect(isApprovalCodeValid(code)).toBe(true);
-    expect(isApprovalCodeValid("12345")).toBe(false);
-    expect(isApprovalCodeValid(null)).toBe(false);
+  it("sin código de aprobación: el esquema de aprobar solo lleva observación", () => {
+    // El flujo ya no genera ni valida códigos: la autorización queda en
+    // approved_by + observation.
+    expect(approveVoucherSchema.safeParse({}).success).toBe(true);
+    expect(approveVoucherSchema.safeParse({ observation: "Autorizado por el admin." }).success).toBe(true);
+  });
+
+  it("dentro de rango nace aprobada (directo); fuera de rango nace pendiente", () => {
+    const base = {
+      dayTotal: 20000,
+      weekTotal: 50000,
+      requested: 30000,
+      maxPerDay: 100000,
+      maxPerWeek: 300000,
+      requestDate: "2026-09-14",
+      allowedDays: [1, 2, 3, 4, 5],
+    };
+    expect(resolveVoucherInitialStatus(checkVoucherEligibility(base))).toBe("aprobada");
+    // Día no permitido → pendiente.
+    expect(
+      resolveVoucherInitialStatus(checkVoucherEligibility({ ...base, requestDate: "2026-09-20" })),
+    ).toBe("pendiente");
+    // Sobre el tope diario → pendiente.
+    expect(
+      resolveVoucherInitialStatus(checkVoucherEligibility({ ...base, dayTotal: 80000 })),
+    ).toBe("pendiente");
   });
 
   it("la semana arranca el lunes (para el tope semanal)", () => {
@@ -257,12 +278,21 @@ describe("payroll: tope con aprobación obligatoria (PAY-05/PAY-06)", () => {
       requestVoucherSchema.safeParse({
         employee_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         amount: 50000,
+        method_code: "efectivo",
       }).success,
     ).toBe(true);
+    // El método arqueable se elige AL CREAR el vale: es obligatorio.
+    expect(
+      requestVoucherSchema.safeParse({
+        employee_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        amount: 50000,
+      }).success,
+    ).toBe(false);
     expect(
       requestVoucherSchema.safeParse({
         employee_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         amount: 0,
+        method_code: "efectivo",
       }).success,
     ).toBe(false);
     expect(rejectVoucherSchema.safeParse({ motivo: "Sin justificación" }).success).toBe(true);
@@ -523,5 +553,24 @@ describe("migración 024_voucher_days.sql (item 5)", () => {
     expect(sql).toContain("IF NOT EXISTS");
     expect(sql).toContain("chk_voucher_settings_allowed_days");
     expect(sql).toContain("'{1,2,3,4,5,6,7}'");
+  });
+});
+
+// ------------------------------------------------- migración 028 ---
+
+describe("migración 028_voucher_payment_method.sql (método y turno del vale)", () => {
+  const sql = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "028_voucher_payment_method.sql"),
+    "utf8",
+  );
+
+  it("agrega method_code y cash_shift_id re-ejecutable y sin borrar approval_code", () => {
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS method_code text");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS cash_shift_id uuid");
+    expect(sql).toContain("REFERENCES public.cash_shifts");
+    expect(sql).toContain("idx_voucher_requests_cash_shift");
+    expect(sql).toContain("chk_voucher_requests_method_code");
+    // No destructiva: la columna histórica del código se conserva sin uso.
+    expect(sql).not.toContain("DROP COLUMN approval_code");
   });
 });
