@@ -184,11 +184,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
   const [confirmKind, setConfirmKind] = useState<"emit" | "pay" | "annul" | null>(null);
   const [splitDraft, setSplitDraft] = useState<PortionDraft>({ method_code: "efectivo", amount: "" });
 
-  // F2: turno abierto conocido por el cliente (aviso temprano; el servidor
-  // manda). Se refresca al abrir los diálogos de operar.
+  // G1: turno abierto conocido por el cliente. La validación de caja se hace
+  // ANTES de entrar a emitir o editar (el servidor vuelve a validar).
   const [shiftKnown, setShiftKnown] = useState(false);
   const [shiftOpen, setShiftOpen] = useState(false);
   const [shiftOwn, setShiftOwn] = useState(true);
+  const [shiftOwner, setShiftOwner] = useState<string | null>(null);
+  const [blockNotice, setBlockNotice] = useState<string | null>(null);
   useEffect(() => {
     if (!props.canWrite && !props.canAnnul) return;
     let cancelled = false;
@@ -199,15 +201,31 @@ export function InvoicesClient(props: InvoicesClientProps) {
       setShiftKnown(true);
       setShiftOpen(shift !== null);
       setShiftOwn(shift === null || shift.opened_by === props.currentUserId || props.isAdmin);
+      setShiftOwner(shift?.opener_name?.trim() || null);
     })();
     return () => {
       cancelled = true;
     };
   }, [props.canWrite, props.canAnnul, props.currentUserId, props.isAdmin, createDialogOpen, detailDialogOpen, isEditDialogOpen]);
 
-  // Avisos tempranos F2 (el servidor confirma al intentar).
-  const noShiftWarn = shiftKnown && !shiftOpen;
-  const foreignShiftWarn = shiftKnown && shiftOpen && !shiftOwn;
+  // G1: motivo de bloqueo de las acciones que exigen caja propia. El admin
+  // queda exento (la válvula auditada del backend); "sin dato aún" no bloquea.
+  const shiftBlockReason: string | null = !shiftKnown
+    ? null
+    : !shiftOpen
+      ? "No hay caja abierta: abre tu turno para emitir o editar."
+      : !shiftOwn
+        ? shiftOwner
+          ? `La caja abierta es del turno de ${shiftOwner}: solo ${shiftOwner} o un administrador puede emitir o editar.`
+          : "La caja abierta es de otro turno: solo quien abrió el turno o un administrador puede emitir o editar."
+        : null;
+
+  /** G1: valida la caja antes de abrir una acción que la exige. */
+  function passShiftGate(): boolean {
+    if (shiftBlockReason === null) return true;
+    setBlockNotice(shiftBlockReason);
+    return false;
+  }
 
   function applyFilters(event?: FormEvent, page = 1) {
     event?.preventDefault();
@@ -382,6 +400,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
   }
 
   async function openEdit(id: string) {
+    // G1: no se entra a editar sin caja propia (el servidor vuelve a validar).
+    if (!passShiftGate()) return;
+    setBlockNotice(null);
     setError(null);
     setBusy(true);
     try {
@@ -640,6 +661,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
   async function submitSplit(event: FormEvent) {
     event.preventDefault();
     if (!detail) return;
+    // G1: cobrar también exige caja propia (el servidor vuelve a validar).
+    if (shiftBlockReason !== null) {
+      setError(shiftBlockReason);
+      return;
+    }
     const amount = toNumber(splitDraft.amount);
     if (amount == null || amount <= 0) {
       setError("Monto de la porción inválido.");
@@ -810,8 +836,17 @@ export function InvoicesClient(props: InvoicesClientProps) {
               >
                 <button
                   type="button"
-                  onClick={() => setCreateDialogOpen(true)}
-                  className="inline-flex h-10 items-center justify-center gap-2 whitespace-nowrap rounded-md bg-emerald-700 px-4 py-2 text-sm font-semibold text-white shadow-sm transition-all duration-200 hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 active:scale-[0.98]"
+                  aria-disabled={shiftBlockReason !== null}
+                  title={shiftBlockReason ?? undefined}
+                  onClick={() => {
+                    if (!passShiftGate()) return;
+                    setBlockNotice(null);
+                    setCreateDialogOpen(true);
+                  }}
+                  className={cn(
+                    "inline-flex h-10 items-center justify-center gap-2 whitespace-nowrap rounded-md bg-emerald-700 px-4 py-2 text-sm font-semibold text-white shadow-sm transition-all duration-200 hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 active:scale-[0.98]",
+                    shiftBlockReason !== null && "opacity-50",
+                  )}
                 >
                   <Plus className="h-4 w-4" aria-hidden="true" />
                   Emitir factura
@@ -1104,14 +1139,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           </dl>
                         </div>
 
-                        {noShiftWarn && (
+                        {shiftBlockReason !== null && (
                           <p role="status" className="rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
-                            No hay caja abierta: abre tu turno para emitir.
-                          </p>
-                        )}
-                        {foreignShiftWarn && (
-                          <p role="status" className="rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
-                            El turno abierto es de otro cajero: solo esa persona o un administrador puede emitir.
+                            {shiftBlockReason}
                           </p>
                         )}
                         {error && (
@@ -1142,6 +1172,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
               </Dialog>
             )}
           </div>
+          {(blockNotice ?? shiftBlockReason) !== null && (
+            <p
+              role={blockNotice ? "alert" : "status"}
+              className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800"
+            >
+              {blockNotice ?? shiftBlockReason}
+            </p>
+          )}
         </CardHeader>
         <CardContent>
           <form onSubmit={applyFilters} className="mt-0 flex flex-wrap items-end gap-3">
@@ -1309,14 +1347,16 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         row.user_id === props.currentUserId)) && (
                     <button
                       type="button"
-                      title={
-                        row.status === "Emitida"
-                          ? "Editar factura emitida (el total se recalcula)"
-                          : "Editar factura (solo admin, con motivo)"
-                      }
+                      aria-disabled={shiftBlockReason !== null}
+                      title={shiftBlockReason ?? (row.status === "Emitida"
+                        ? "Editar factura emitida (el total se recalcula)"
+                        : "Editar factura (solo admin, con motivo)")}
                       aria-label={`Editar factura ${row.consecutive_number}`}
                       onClick={() => openEdit(row.id)}
-                      className="rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                      className={cn(
+                        "rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800",
+                        shiftBlockReason !== null && "opacity-50",
+                      )}
                     >
                       <Pencil className="h-4 w-4" aria-hidden="true" />
                     </button>
@@ -1494,6 +1534,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               (detail.invoice.status === "Emitida" || detail.invoice.status === "Pagada"))) && (
                             <div className="rounded-lg bg-slate-50 p-4">
                               <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500">Operaciones</h3>
+                              {shiftBlockReason !== null && (
+                                <p role="status" className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
+                                  {shiftBlockReason}
+                                </p>
+                              )}
                               {error && (
                                 <p role="alert" className="mt-2 rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
                                   {error}

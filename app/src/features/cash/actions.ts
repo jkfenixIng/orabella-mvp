@@ -12,7 +12,7 @@ import {
   deleteDenomination,
   getDayView,
   getHistory,
-  getOpenShift,
+  getOpenShiftWithOpener,
   listDenominations,
   listRegisters,
   openShift,
@@ -82,7 +82,7 @@ export async function closeShiftAction(id: string, input: unknown) {
 export async function getOpenShiftAction() {
   try {
     const session = await requireSession(await sessionToken());
-    const data = await getOpenShift(session.sedeId);
+    const data = await getOpenShiftWithOpener(session.sedeId);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
