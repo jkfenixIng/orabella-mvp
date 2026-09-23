@@ -10,6 +10,7 @@ export const ALERT_ACTIONS = [
   "cash.shift_close_mismatch",
   "auth.login_locked",
   "payroll.commission_paid",
+  "voucher.requested",
 ] as const;
 export type AlertAction = (typeof ALERT_ACTIONS)[number];
 
@@ -20,7 +21,7 @@ export type AlertAction = (typeof ALERT_ACTIONS)[number];
 export const ALERT_MODULES = {
   caja: {
     label: "Caja",
-    actions: ["cash.shift_open_mismatch", "cash.shift_close_mismatch", "payroll.commission_paid"],
+    actions: ["cash.shift_open_mismatch", "cash.shift_close_mismatch", "payroll.commission_paid", "voucher.requested"],
   },
   acceso: {
     label: "Acceso",

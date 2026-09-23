@@ -70,6 +70,15 @@ function alertDetail(alert: AlertRow): string {
   if (alert.action === "auth.login_locked") {
     return "Cuenta bloqueada por intentos fallidos.";
   }
+  if (alert.action === "voucher.requested") {
+    const meta = metadata as Record<string, unknown>;
+    const amount = typeof meta.amount === "number" ? formatMoney(meta.amount) : "monto sin registrar";
+    const reasons: string[] = [];
+    if (meta.over_day) reasons.push("sobre tope diario");
+    if (meta.over_week) reasons.push("sobre tope semanal");
+    if (meta.day_not_allowed) reasons.push("día no permitido");
+    return `Vale por ${amount} que exige revisión (${reasons.join(", ") || "revise el detalle"}). Acepte o rechace con motivo en Vales.`;
+  }
   return `${alert.action} en ${alert.entity}.`;
 }
 

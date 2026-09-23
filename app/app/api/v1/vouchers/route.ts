@@ -19,7 +19,7 @@ function tokenOf(request: NextRequest): string | undefined {
 
 /**
  * GET /api/v1/vouchers — lista los vales de la sede con filtro opcional
- * (?status=&employee_id=). Requiere sesión, solo su sede.
+ * (?status=&employee_id=&request_date=). Requiere sesión, solo su sede.
  */
 export async function GET(request: NextRequest) {
   try {
@@ -28,6 +28,7 @@ export async function GET(request: NextRequest) {
     const data = await listVouchers(session.sedeId, {
       status: params.get("status") ?? undefined,
       employee_id: params.get("employee_id") ?? undefined,
+      request_date: params.get("request_date") ?? undefined,
     });
     return ok(data);
   } catch (error) {
@@ -36,9 +37,10 @@ export async function GET(request: NextRequest) {
 }
 
 /**
- * POST /api/v1/vouchers — solicita un vale (PAY-05/PAY-06, cualquier rol
- * de la sede). Valida topes día/semana; si excede queda pendiente
- * exigiendo aprobación del admin (requires_approval).
+ * POST /api/v1/vouchers — solicita un vale (PAY-05/PAY-06 + item 5,
+ * cualquier rol de la sede). Valida topes día/semana y días permitidos;
+ * si exige revisión queda pendiente (alerta voucher.requested); el admin
+ * queda auto-aprobado con código y detalle.
  */
 export async function POST(request: NextRequest) {
   try {
@@ -47,6 +49,7 @@ export async function POST(request: NextRequest) {
     const data = await requestVoucher(body, {
       userId: session.userId,
       sedeId: session.sedeId,
+      roles: session.roles,
     });
     return ok(data, 201);
   } catch (error) {

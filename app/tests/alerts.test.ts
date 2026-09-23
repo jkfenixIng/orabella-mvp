@@ -9,12 +9,13 @@ import {
 } from "@/src/features/alerts/schemas";
 
 describe("alerts: conjunto de alerta y paginado", () => {
-  it("cubre desajustes de caja y bloqueos, página fija de 10", () => {
+  it("cubre desajustes de caja, bloqueos y vales por revisar, página fija de 10", () => {
     expect([...ALERT_ACTIONS]).toEqual([
       "cash.shift_open_mismatch",
       "cash.shift_close_mismatch",
       "auth.login_locked",
       "payroll.commission_paid",
+      "voucher.requested",
     ]);
     expect(ALERTS_PAGE_SIZE).toBe(10);
   });

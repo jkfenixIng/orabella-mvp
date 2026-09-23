@@ -8,14 +8,17 @@ import {
   canDiscountVoucher,
   canReviewVoucher,
   checkVoucherCaps,
+  checkVoucherEligibility,
   computeLineCommission,
   computeNetPay,
   generateApprovalCode,
+  normalizeAllowedDays,
   openPeriodSchema,
   payPayrollItemSchema,
   requestVoucherSchema,
   rejectVoucherSchema,
   requiresVoucherApproval,
+  voucherRequiresReview,
   roundMoney,
   voucherLimitsSchema,
   weekStartOf,
@@ -192,6 +195,8 @@ export interface VoucherSettingsRow {
   sede_id: string;
   max_per_day: number;
   max_per_week: number;
+  /** Días ISO permitidos (1=lunes…7=domingo); null = todos (sin restricción). */
+  allowed_days: number[] | null;
 }
 
 export interface VoucherRequestRow {
@@ -750,22 +755,54 @@ export async function closePayrollPeriod(
 /** PAY-05: topes vigentes de la sede (null cuando aún no se configuran). */
 export async function getVoucherSettings(sedeId: string): Promise<VoucherSettingsRow | null> {
   const db = await payrollDb();
+  const withDays = await db
+    .from("voucher_settings")
+    .select("sede_id, max_per_day, max_per_week, allowed_days")
+    .eq("sede_id", sedeId)
+    .maybeSingle();
+  if (!withDays.error) return (withDays.data as VoucherSettingsRow | null) ?? null;
+  // La migración 024 aún sin aplicar en esta base: degradar sin días.
+  const message = String((withDays.error as { message?: string }).message ?? "");
+  if (!/allowed_days/i.test(message)) throw new PayrollError("INTERNAL", "Error interno.", 500);
   const { data, error } = await db
     .from("voucher_settings")
     .select("sede_id, max_per_day, max_per_week")
     .eq("sede_id", sedeId)
     .maybeSingle();
   if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
-  return (data as VoucherSettingsRow | null) ?? null;
+  if (!data) return null;
+  return { ...(data as Omit<VoucherSettingsRow, "allowed_days">), allowed_days: null };
 }
 
-/** PAY-05: configura los topes día/semana de la sede (upsert). Solo admin. */
+/** PAY-05: configura topes día/semana + días permitidos de la sede (upsert). Solo admin. */
 export async function setVoucherLimits(raw: unknown, actor: PayrollActor): Promise<VoucherSettingsRow> {
   const parsed = voucherLimitsSchema.safeParse(raw);
   if (!parsed.success) {
     throw new PayrollError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const db = await payrollDb();
+  // Sin días en el payload se conserva la config vigente (upsert pisa la fila).
+  const current = await getVoucherSettings(actor.sedeId).catch(() => null);
+  const allowed = parsed.data.allowed_days !== undefined
+    ? normalizeAllowedDays(parsed.data.allowed_days)
+    : (current?.allowed_days ?? null);
+  const first = await db
+    .from("voucher_settings")
+    .upsert(
+      {
+        sede_id: actor.sedeId,
+        max_per_day: roundMoney(parsed.data.max_per_day),
+        max_per_week: roundMoney(parsed.data.max_per_week),
+        allowed_days: allowed ?? [1, 2, 3, 4, 5, 6, 7],
+      },
+      { onConflict: "sede_id" },
+    )
+    .select("sede_id, max_per_day, max_per_week, allowed_days")
+    .single();
+  if (!first.error && first.data) return first.data as VoucherSettingsRow;
+  // La migración 024 aún sin aplicar en esta base: guardar sin días.
+  const firstMessage = String((first.error as { message?: string } | null)?.message ?? "");
+  if (!/allowed_days/i.test(firstMessage)) throw new PayrollError("INTERNAL", "Error interno.", 500);
   const { data, error } = await db
     .from("voucher_settings")
     .upsert(
@@ -779,7 +816,7 @@ export async function setVoucherLimits(raw: unknown, actor: PayrollActor): Promi
     .select("sede_id, max_per_day, max_per_week")
     .single();
   if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
-  return data as VoucherSettingsRow;
+  return { ...(data as Omit<VoucherSettingsRow, "allowed_days">), allowed_days: current?.allowed_days ?? null };
 }
 
 /** Vales vigentes (pendiente/aprobada) de un empleado en una fecha. */
@@ -821,12 +858,19 @@ export interface VoucherRequestResult {
   requires_approval: boolean;
   over_day: boolean;
   over_week: boolean;
+  /** Item 5: la fecha cae fuera de los días permitidos (también exige revisión). */
+  day_not_allowed: boolean;
+  /** Item 5: el admin quedó auto-aprobado al solicitar (con código y detalle). */
+  auto_approved: boolean;
 }
 
 /**
- * PAY-05/PAY-06: solicita un vale. Valida topes día/semana acumulando los
- * vales vigentes; si excede queda pendiente exigiendo aprobación del admin
- * (requires_approval). Lo puede pedir cualquier rol autenticado de la sede.
+ * PAY-05/PAY-06 + item 5: solicita un vale. Valida topes día/semana
+ * acumulando los vales vigentes + días permitidos; si excede topes o cae
+ * en día no permitido queda pendiente exigiendo revisión del admin
+ * (requires_approval + alerta voucher.requested). El admin que solicita
+ * queda auto-aprobado con código y detalle auditado. Lo puede pedir
+ * cualquier rol autenticado de la sede.
  */
 export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise<VoucherRequestResult> {
   const parsed = requestVoucherSchema.safeParse(raw);
@@ -853,13 +897,61 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
       requestDate,
       settings,
     );
-    const caps = checkVoucherCaps({
+    const eligibility = checkVoucherEligibility({
       dayTotal,
       weekTotal,
       requested: parsed.data.amount,
       maxPerDay: settings ? Number(settings.max_per_day) : null,
       maxPerWeek: settings ? Number(settings.max_per_week) : null,
+      requestDate,
+      allowedDays: settings?.allowed_days ?? null,
     });
+    const needsReview = voucherRequiresReview(eligibility);
+    // Item 5: auto-aprobación del admin con código y detalle auditado.
+    if ((actor.roles ?? []).includes("admin")) {
+      const observation = parsed.data.observation?.trim()
+        ? parsed.data.observation.trim()
+        : `Auto-aprobado por admin (solicitud propia${eligibility.dayNotAllowed ? ", día no permitido" : ""}${eligibility.overDay || eligibility.overWeek ? ", sobre tope" : ""}).`;
+      const { data, error } = await db
+        .from("voucher_requests")
+        .insert({
+          sede_id: actor.sedeId,
+          employee_id: employee.id,
+          amount: roundMoney(parsed.data.amount),
+          request_date: requestDate,
+          status: "aprobada",
+          approved_by: actor.userId,
+          approval_code: generateApprovalCode(),
+          observation,
+        })
+        .select(VOUCHER_SELECT)
+        .single();
+      if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
+      const approved = data as VoucherRequestRow;
+      await writeAudit({
+        sede_id: actor.sedeId,
+        user_id: actor.userId,
+        action: AUDIT_ACTIONS.VOUCHER_APPROVED,
+        entity: "voucher_requests",
+        entity_id: approved.id,
+        metadata: {
+          employee_id: employee.id,
+          amount: Number(approved.amount),
+          auto: true,
+          over_tope: eligibility.overDay || eligibility.overWeek,
+          day_not_allowed: eligibility.dayNotAllowed,
+          approval_code: approved.approval_code,
+        },
+      });
+      return {
+        voucher: approved,
+        requires_approval: false,
+        over_day: eligibility.overDay,
+        over_week: eligibility.overWeek,
+        day_not_allowed: eligibility.dayNotAllowed,
+        auto_approved: true,
+      };
+    }
     const { data, error } = await db
       .from("voucher_requests")
       .insert({
@@ -873,24 +965,48 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
       .select(VOUCHER_SELECT)
       .single();
     if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    const created = data as VoucherRequestRow;
+    // Item 5: alerta al admin para aceptar/rechazar con motivo.
+    if (needsReview) {
+      await writeAudit({
+        sede_id: actor.sedeId,
+        user_id: actor.userId,
+        action: AUDIT_ACTIONS.VOUCHER_REQUESTED,
+        entity: "voucher_requests",
+        entity_id: created.id,
+        metadata: {
+          employee_id: employee.id,
+          amount: Number(created.amount),
+          request_date: requestDate,
+          over_day: eligibility.overDay,
+          over_week: eligibility.overWeek,
+          day_not_allowed: eligibility.dayNotAllowed,
+        },
+      });
+    }
     return {
-      voucher: data as VoucherRequestRow,
-      requires_approval: requiresVoucherApproval(caps),
-      over_day: caps.overDay,
-      over_week: caps.overWeek,
+      voucher: created,
+      requires_approval: needsReview,
+      over_day: eligibility.overDay,
+      over_week: eligibility.overWeek,
+      day_not_allowed: eligibility.dayNotAllowed,
+      auto_approved: false,
     };
   } catch (error) {
     throw toPayrollError(error);
   }
 }
 
-/** Lista los vales de la sede (filtro opcional por estado/empleado, máx. 50 recientes). */
+/** Lista los vales de la sede (filtro opcional por estado/empleado/fecha, máx. 50 recientes). */
 export async function listVouchers(
   sedeId: string,
-  filters: { status?: string; employee_id?: string; limit?: number } = {},
+  filters: { status?: string; employee_id?: string; request_date?: string; limit?: number } = {},
 ): Promise<VoucherRequestRow[]> {
   if (filters.status !== undefined && !["pendiente", "aprobada", "rechazada", "descontada"].includes(filters.status)) {
     throw new PayrollError("VALIDATION", "Estado de filtro inválido.", 400);
+  }
+  if (filters.request_date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(filters.request_date)) {
+    throw new PayrollError("VALIDATION", "Fecha inválida (use yyyy-mm-dd).", 400);
   }
   const limit = filters.limit === undefined ? 50 : Math.min(200, Math.max(1, Math.floor(filters.limit)));
   const db = await payrollDb();
@@ -902,6 +1018,7 @@ export async function listVouchers(
     .limit(limit);
   if (filters.status) query = query.eq("status", filters.status);
   if (filters.employee_id) query = query.eq("employee_id", filters.employee_id);
+  if (filters.request_date) query = query.eq("request_date", filters.request_date);
   const { data, error } = await query;
   if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
   return (data ?? []) as VoucherRequestRow[];
@@ -943,6 +1060,15 @@ export async function approveVoucher(
   const db = await payrollDb();
   try {
     const voucher = await getVoucherOrThrow(db, sedeId, id);
+    // Item 5: edición bloqueada si el vale ya entró en nómina pagada
+    // (descontada al liquidar: terminal, con mensaje propio).
+    if (voucher.status === "descontada") {
+      throw new PayrollError(
+        "VOUCHER_IN_PAYROLL",
+        "El vale ya entró en nómina (descontada) y no admite cambios.",
+        409,
+      );
+    }
     if (!canReviewVoucher(voucher.status)) {
       throw new PayrollError(
         "VOUCHER_IMMUTABLE",
@@ -1004,13 +1130,15 @@ export async function approveVoucher(
 }
 
 /**
- * PAY-06: rechaza un vale pendiente con motivo obligatorio (queda en
- * observation). Rechazada es terminal. Solo admin.
+ * PAY-06 + item 5: rechaza un vale pendiente con motivo obligatorio (queda
+ * en observation + auditoría voucher.rejected). Rechazada es terminal y
+ * descontada (en nómina) no admite cambios. Solo admin.
  */
 export async function rejectVoucher(
   sedeId: string,
   id: string,
   raw: unknown,
+  actor?: { userId: string },
 ): Promise<VoucherRequestRow> {
   const parsed = rejectVoucherSchema.safeParse(raw);
   if (!parsed.success) {
@@ -1019,6 +1147,14 @@ export async function rejectVoucher(
   const db = await payrollDb();
   try {
     const voucher = await getVoucherOrThrow(db, sedeId, id);
+    // Item 5: edición bloqueada si el vale ya entró en nómina pagada.
+    if (voucher.status === "descontada") {
+      throw new PayrollError(
+        "VOUCHER_IN_PAYROLL",
+        "El vale ya entró en nómina (descontada) y no admite cambios.",
+        409,
+      );
+    }
     if (!canReviewVoucher(voucher.status)) {
       throw new PayrollError(
         "VOUCHER_IMMUTABLE",
@@ -1033,6 +1169,18 @@ export async function rejectVoucher(
       .select(VOUCHER_SELECT)
       .single();
     if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    await writeAudit({
+      sede_id: sedeId,
+      user_id: actor?.userId ?? null,
+      action: AUDIT_ACTIONS.VOUCHER_REJECTED,
+      entity: "voucher_requests",
+      entity_id: id,
+      metadata: {
+        employee_id: voucher.employee_id,
+        amount: Number(voucher.amount),
+        motivo: parsed.data.motivo.trim(),
+      },
+    });
     return data as VoucherRequestRow;
   } catch (error) {
     throw toPayrollError(error);

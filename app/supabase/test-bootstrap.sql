@@ -1221,6 +1221,8 @@ CREATE TABLE public.voucher_settings (
   sede_id uuid PRIMARY KEY REFERENCES public.sedes (id) ON DELETE CASCADE,
   max_per_day numeric(12, 2) NOT NULL DEFAULT 0 CHECK (max_per_day >= 0),
   max_per_week numeric(12, 2) NOT NULL DEFAULT 0 CHECK (max_per_week >= 0),
+  allowed_days smallint[] NOT NULL DEFAULT '{1,2,3,4,5,6,7}'
+    CHECK (allowed_days <@ '{1,2,3,4,5,6,7}' AND cardinality(allowed_days) > 0),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );

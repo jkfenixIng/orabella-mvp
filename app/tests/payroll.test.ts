@@ -10,16 +10,21 @@ import {
   canDiscountVoucher,
   canReviewVoucher,
   checkVoucherCaps,
+  checkVoucherEligibility,
   computeLineCommission,
   computeNetPay,
   generateApprovalCode,
   isApprovalCodeValid,
+  isVoucherDayAllowed,
+  normalizeAllowedDays,
   openPeriodSchema,
   payPayrollItemSchema,
   rejectVoucherSchema,
   requestVoucherSchema,
   requiresVoucherApproval,
   voucherLimitsSchema,
+  voucherRequiresReview,
+  weekdayIso,
   weekStartOf,
 } from "@/src/features/payroll/schemas";
 
@@ -268,7 +273,6 @@ describe("payroll: tope con aprobación obligatoria (PAY-05/PAY-06)", () => {
 });
 
 // ------------------------------------------------- migración 007 ---
-
 describe("migración 007_payroll.sql (T7)", () => {
   const sql = readFileSync(join(process.cwd(), "supabase", "migrations", "007_payroll.sql"), "utf8");
 
@@ -316,5 +320,106 @@ describe("migración 007_payroll.sql (T7)", () => {
     expect(sql).toContain("PAY-01");
     expect(sql).toContain("PAY-07");
     expect(sql).toContain("inmutable");
+  });
+});
+
+// ------------------------------------------------- item 5: días permitidos ---
+
+describe("vales item 5: días permitidos + elegibilidad (sin romper topes)", () => {
+  it("weekdayIso: 1=lunes…7=domingo", () => {
+    // 2026-09-14 es lunes, 2026-09-20 es domingo.
+    expect(weekdayIso("2026-09-14")).toBe(1);
+    expect(weekdayIso("2026-09-18")).toBe(5);
+    expect(weekdayIso("2026-09-20")).toBe(7);
+  });
+
+  it("sin config (null) todos los días están permitidos", () => {
+    expect(isVoucherDayAllowed("2026-09-20", null)).toBe(true);
+    expect(isVoucherDayAllowed("2026-09-20", [])).toBe(true);
+  });
+
+  it("con días L–V el domingo no está permitido y el lunes sí", () => {
+    expect(isVoucherDayAllowed("2026-09-20", [1, 2, 3, 4, 5])).toBe(false);
+    expect(isVoucherDayAllowed("2026-09-14", [1, 2, 3, 4, 5])).toBe(true);
+  });
+
+  it("normaliza: únicos, ordenados y solo 1…7", () => {
+    expect(normalizeAllowedDays([5, 1, 5, 0, 8])).toEqual([1, 5]);
+    expect(normalizeAllowedDays(null)).toBeNull();
+  });
+
+  it("dentro de topes y en día permitido no exige revisión", () => {
+    const ok = checkVoucherEligibility({
+      dayTotal: 20000,
+      weekTotal: 50000,
+      requested: 30000,
+      maxPerDay: 100000,
+      maxPerWeek: 300000,
+      requestDate: "2026-09-14",
+      allowedDays: [1, 2, 3, 4, 5],
+    });
+    expect(ok.dayNotAllowed).toBe(false);
+    expect(voucherRequiresReview(ok)).toBe(false);
+  });
+
+  it("día no permitido exige revisión aunque esté dentro de topes", () => {
+    const off = checkVoucherEligibility({
+      dayTotal: 20000,
+      weekTotal: 50000,
+      requested: 30000,
+      maxPerDay: 100000,
+      maxPerWeek: 300000,
+      requestDate: "2026-09-20",
+      allowedDays: [1, 2, 3, 4, 5],
+    });
+    expect(off.dayNotAllowed).toBe(true);
+    expect(off.overDay).toBe(false);
+    expect(voucherRequiresReview(off)).toBe(true);
+  });
+
+  it("sobre tope sigue exigiendo revisión (compatibilidad F4)", () => {
+    const over = checkVoucherEligibility({
+      dayTotal: 80000,
+      weekTotal: 50000,
+      requested: 30000,
+      maxPerDay: 100000,
+      maxPerWeek: 300000,
+      requestDate: "2026-09-14",
+      allowedDays: null,
+    });
+    expect(over.overDay).toBe(true);
+    expect(voucherRequiresReview(over)).toBe(true);
+  });
+
+  it("el esquema de topes acepta días opcionales y rechaza inválidos", () => {
+    expect(
+      voucherLimitsSchema.safeParse({ max_per_day: 100000, max_per_week: 300000 }).success,
+    ).toBe(true);
+    expect(
+      voucherLimitsSchema.safeParse({ max_per_day: 100000, max_per_week: 300000, allowed_days: [1, 2, 3, 4, 5] })
+        .success,
+    ).toBe(true);
+    expect(
+      voucherLimitsSchema.safeParse({ max_per_day: 100000, max_per_week: 300000, allowed_days: [] }).success,
+    ).toBe(false);
+    expect(
+      voucherLimitsSchema.safeParse({ max_per_day: 100000, max_per_week: 300000, allowed_days: [0] }).success,
+    ).toBe(false);
+    expect(
+      voucherLimitsSchema.safeParse({ max_per_day: 100000, max_per_week: 300000, allowed_days: [8] }).success,
+    ).toBe(false);
+  });
+});
+
+// ------------------------------------------------- migración 024 ---
+
+describe("migración 024_voucher_days.sql (item 5)", () => {
+  const sql = readFileSync(join(process.cwd(), "supabase", "migrations", "024_voucher_days.sql"), "utf8");
+
+  it("agrega allowed_days re-ejecutable con CHECK 1…7 y valor por defecto", () => {
+    expect(sql).toContain("allowed_days");
+    expect(sql).toContain("IF NOT EXISTS");
+    expect(sql).toContain("chk_voucher_settings_allowed_days");
+    expect(sql).toContain("'{1,2,3,4,5,6,7}'");
   });
 });

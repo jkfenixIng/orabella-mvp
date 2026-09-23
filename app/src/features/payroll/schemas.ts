@@ -61,10 +61,15 @@ export const payPayrollItemSchema = z.object({
 });
 export type PayPayrollItemInput = z.infer<typeof payPayrollItemSchema>;
 
-/** PAY-05: topes de vales por sede (día y semana). */
+/** PAY-05: topes de vales por sede (día y semana) + días permitidos ISO. */
 export const voucherLimitsSchema = z.object({
   max_per_day: z.coerce.number().nonnegative("El tope diario no puede ser negativo."),
   max_per_week: z.coerce.number().nonnegative("El tope semanal no puede ser negativo."),
+  allowed_days: z
+    .array(z.coerce.number().int().min(1, "Día inválido (1=lunes…7=domingo).").max(7, "Día inválido (1=lunes…7=domingo)."))
+    .min(1, "Elija al menos un día permitido.")
+    .max(7, "Máximo 7 días.")
+    .optional(),
 });
 export type VoucherLimitsInput = z.infer<typeof voucherLimitsSchema>;
 
@@ -235,6 +240,69 @@ export function checkVoucherCaps(args: {
 /** PAY-06: el vale exige aprobación con código cuando supera algún tope. */
 export function requiresVoucherApproval(caps: VoucherCapCheck): boolean {
   return caps.overDay || caps.overWeek;
+}
+
+/**
+ * Item 5: día ISO de la semana (1=lunes…7=domingo) de una fecha yyyy-mm-dd.
+ * Puro para probarlo sin base de datos.
+ */
+export function weekdayIso(dateIso: string): number {
+  const [year, month, day] = dateIso.split("-").map(Number);
+  const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+  return weekday === 0 ? 7 : weekday;
+}
+
+/**
+ * Item 5: normaliza los días permitidos (únicos, ordenados). null/undefined
+ * o vacío = sin restricción (todos los días, comportamiento previo).
+ * Puro para probarlo sin base de datos.
+ */
+export function normalizeAllowedDays(days: Array<number | string> | null | undefined): number[] | null {
+  if (!days || days.length === 0) return null;
+  const unique = [...new Set(days.map(Number).filter((day) => Number.isInteger(day) && day >= 1 && day <= 7))];
+  if (unique.length === 0) return null;
+  return unique.sort((a, b) => a - b);
+}
+
+/**
+ * Item 5: true cuando la fecha cae en un día permitido (null = todos).
+ * Puro para probarlo sin base de datos.
+ */
+export function isVoucherDayAllowed(
+  requestDate: string,
+  allowedDays: Array<number | string> | null | undefined,
+): boolean {
+  const normalized = normalizeAllowedDays(allowedDays);
+  if (!normalized) return true;
+  return normalized.includes(weekdayIso(requestDate));
+}
+
+export interface VoucherEligibility extends VoucherCapCheck {
+  /** La fecha cae fuera de los días permitidos (también exige revisión). */
+  dayNotAllowed: boolean;
+}
+
+/**
+ * Item 5: elegibilidad completa del vale (topes + día permitido). Pedir
+ * fuera de día permitido NO bloquea: exige revisión del admin igual que
+ * superar topes. Puro para probarlo sin base de datos.
+ */
+export function checkVoucherEligibility(args: {
+  dayTotal: number;
+  weekTotal: number;
+  requested: number;
+  maxPerDay: number | null;
+  maxPerWeek: number | null;
+  requestDate: string;
+  allowedDays: Array<number | string> | null | undefined;
+}): VoucherEligibility {
+  const caps = checkVoucherCaps(args);
+  return { ...caps, dayNotAllowed: !isVoucherDayAllowed(args.requestDate, args.allowedDays) };
+}
+
+/** Item 5: el vale exige revisión del admin (topes o día no permitido). */
+export function voucherRequiresReview(eligibility: VoucherEligibility): boolean {
+  return eligibility.overDay || eligibility.overWeek || eligibility.dayNotAllowed;
 }
 
 /**

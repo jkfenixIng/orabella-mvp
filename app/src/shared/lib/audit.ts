@@ -47,6 +47,8 @@ export const AUDIT_ACTIONS = {
   PAYROLL_CLOSED: "payroll.closed",
   COMMISSION_PAID: "payroll.commission_paid",
   VOUCHER_APPROVED: "voucher.approved",
+  VOUCHER_REQUESTED: "voucher.requested",
+  VOUCHER_REJECTED: "voucher.rejected",
 } as const;
 
 /**
