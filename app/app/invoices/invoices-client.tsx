@@ -142,7 +142,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
   const [clientName, setClientName] = useState("");
   const [clientDocument, setClientDocument] = useState("");
   const [discount, setDiscount] = useState("");
-  const [items, setItems] = useState<ItemDraft[]>([emptyItem()]);
+  const [items, setItems] = useState<ItemDraft[]>([]);
   const [isItemDialogOpen, setIsItemDialogOpen] = useState(false);
   const [itemDraft, setItemDraft] = useState<ItemDraft>(emptyItem());
   const [itemError, setItemError] = useState<string | null>(null);
@@ -248,7 +248,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setClientName("");
     setClientDocument("");
     setDiscount("");
-    setItems([emptyItem()]);
+    setItems([]);
     setPortions([{ method_code: "efectivo", amount: "" }]);
     setCreateDialogOpen(false);
   }
@@ -270,6 +270,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
     event.preventDefault();
     setError(null);
     setNotice(null);
+    if (items.length === 0) {
+      setError("Agregue al menos un ítem a la factura.");
+      return;
+    }
     const parsedDiscount = discount.trim() === "" ? 0 : toNumber(discount);
     if (parsedDiscount == null) {
       setError("Descuento inválido.");
@@ -334,7 +338,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setClientName("");
     setClientDocument("");
     setDiscount("");
-    setItems([emptyItem()]);
+    setItems([]);
     setPortions([{ method_code: "efectivo", amount: "" }]);
     setDetail(result.data);
     setCreateDialogOpen(false);
@@ -568,16 +572,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                       )}
                                     </td>
                                     <td className="px-3 py-2">
-                                      {items.length > 1 && (
-                                        <button
-                                          type="button"
-                                          aria-label={`Quitar ítem ${index + 1}`}
-                                          onClick={() => setItems((prev) => prev.filter((_, i) => i !== index))}
-                                          className="rounded-md border border-slate-300 p-2 text-slate-500 hover:bg-slate-100"
-                                        >
-                                          <Trash2 className="h-4 w-4" aria-hidden="true" />
-                                        </button>
-                                      )}
+                                      <button
+                                        type="button"
+                                        aria-label={`Quitar ítem ${index + 1}`}
+                                        onClick={() => setItems((prev) => prev.filter((_, i) => i !== index))}
+                                        className="rounded-md border border-slate-300 p-2 text-slate-500 hover:bg-slate-100"
+                                      >
+                                        <Trash2 className="h-4 w-4" aria-hidden="true" />
+                                      </button>
                                     </td>
                                   </tr>
                                 );
@@ -609,9 +611,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             else setIsItemDialogOpen(isOpen);
                           }}
                         >
+                          <div
+                            className="fixed inset-0 z-40 bg-slate-950/50 backdrop-blur-[2px]"
+                            aria-hidden="true"
+                            onClick={() => setIsItemDialogOpen(false)}
+                          />
                           <DialogContent className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
-                            <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
-                              <div className="border-b border-slate-200 px-6 py-4">
+                            <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
+                              <div className="border-b border-slate-200 px-5 py-3">
                                 <h2 className="text-lg font-bold">Agregar ítem</h2>
                                 <p className="text-sm text-slate-500">
                                   Subtotal:{" "}
@@ -620,7 +627,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   )}
                                 </p>
                               </div>
-                              <div className="flex flex-col gap-4 px-6 py-4">
+                              <div className="flex flex-col gap-3 px-5 py-3">
                                 <div>
                                   <p className="mb-2 text-sm font-medium">Tipo</p>
                                   <div className="grid grid-cols-3 gap-2" role="group" aria-label="Tipo de ítem">
@@ -647,8 +654,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         }
                                         className={
                                           itemDraft.item_type === type
-                                            ? "h-10 rounded-md bg-slate-900 text-sm font-semibold text-white"
-                                            : "h-10 rounded-md border border-slate-300 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                                            ? "h-9 rounded-md bg-slate-900 text-sm font-semibold text-white"
+                                            : "h-9 rounded-md border border-slate-300 text-sm font-medium text-slate-700 hover:bg-slate-100"
                                         }
                                       >
                                         {label}
@@ -811,7 +818,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   </p>
                                 )}
                               </div>
-                              <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-6 py-4">
+                              <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-5 py-3">
                                 <button
                                   type="button"
                                   onClick={() => setIsItemDialogOpen(false)}
