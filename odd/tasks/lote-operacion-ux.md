@@ -37,11 +37,12 @@ Out:
 - Tablas/dialogs/modales: mismo look y comportamiento (componentes compartidos).
 
 ## Tasks
-- [x] F1 Facturación default día (HECHO 59e58b0 2026-09-23; from/to=hoy, vaciar = ver todo).
+- [x] F1 Facturación default día (HECHO 59e58b0 2026-09-23; from/to=hoy, vaciar = ver todo; fix TZ Bogotá -05:00 en dateBound — la ventana UTC colaba la noche anterior).
 - [ ] I1 Inventario producto: auditar UI vs schema; agregar lo faltante (COMISIÓN: ver pregunta abierta — no existe por producto, vive por línea de factura).
 - [ ] S1 Servicios a Catálogos: sacar de panel admin a módulo catálogos (ALCANCE por confirmar).
 - [x] A1 Alertas default pendientes (HECHO 2026-09-23; unreadOnly=true en page + client).
 - [ ] F2 Mensajes caja en factura: sin turno / turno ajeno, quién puede pagar o anular (emitir, pagar, anular, edición).
+- [x] F3 Columna Cerrada (HECHO 22cb0ac 2026-09-23; migración 025 closed_at + columna; ⚠️ correr 025 en PRUEBAS/PROD o el listado falla).
 - [ ] C1 Caja todos los pagos + dueño del turno: columnas todos los métodos (desglose ventas) + "Turno actual de {nombre}".
 - [ ] V1 Vales gating + layout: sin config → mensaje y bloqueo; botón-crear abre modal; lista debajo.
 - [ ] V2 Config vales wizard: días todos/indicados → topes sin/diarios/semanales/ambos → tope por día o general.
