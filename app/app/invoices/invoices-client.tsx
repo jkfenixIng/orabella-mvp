@@ -143,6 +143,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
   const [clientDocument, setClientDocument] = useState("");
   const [discount, setDiscount] = useState("");
   const [items, setItems] = useState<ItemDraft[]>([emptyItem()]);
+  const [isItemDialogOpen, setIsItemDialogOpen] = useState(false);
+  const [itemDraft, setItemDraft] = useState<ItemDraft>(emptyItem());
+  const [itemError, setItemError] = useState<string | null>(null);
   const [portions, setPortions] = useState<PortionDraft[]>([
     { method_code: "efectivo", amount: "" },
   ]);
@@ -169,19 +172,75 @@ export function InvoicesClient(props: InvoicesClientProps) {
     });
   }
 
-  function patchItem(index: number, patch: Partial<ItemDraft>) {
-    setItems((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+  function patchDraft(patch: Partial<ItemDraft>) {
+    setItemDraft((prev) => ({ ...prev, ...patch }));
   }
 
-  function autofillPrice(index: number, type: ItemDraft["item_type"], refId: string) {
+  function autofillDraftPrice(type: ItemDraft["item_type"], refId: string) {
     if (type === "producto") {
       const found = props.products.find((row) => row.id === refId);
-      if (found?.sale_price != null) patchItem(index, { unit_price: String(found.sale_price) });
+      if (found?.sale_price != null) patchDraft({ unit_price: String(found.sale_price) });
     }
     if (type === "servicio") {
       const found = props.services.find((row) => row.id === refId);
-      if (found) patchItem(index, { unit_price: String(found.price) });
+      if (found) patchDraft({ unit_price: String(found.price) });
     }
+  }
+
+  function openItemDialog() {
+    setItemDraft(emptyItem());
+    setItemError(null);
+    setIsItemDialogOpen(true);
+  }
+
+  function employeeNameOf(employeeId: string): string {
+    const found = props.employees.find((row) => row.id === employeeId);
+    if (!found) return "—";
+    return found.employee_code ? `${found.full_name} (${found.employee_code})` : found.full_name;
+  }
+
+  function addItemFromDialog() {
+    setItemError(null);
+    if (itemDraft.item_type === "producto" && !itemDraft.ref_id) {
+      setItemError("Elija el producto.");
+      return;
+    }
+    if (itemDraft.item_type === "servicio" && !itemDraft.ref_id) {
+      setItemError("Elija el servicio.");
+      return;
+    }
+    if (itemDraft.item_type === "custom" && itemDraft.custom_name.trim() === "") {
+      setItemError("Describa el ítem personalizado.");
+      return;
+    }
+    if (!itemDraft.employee_id) {
+      setItemError("Elija el empleado que atiende.");
+      return;
+    }
+    const qty = toNumber(itemDraft.qty);
+    const price = toNumber(itemDraft.unit_price);
+    if (qty == null || !Number.isInteger(qty) || qty <= 0) {
+      setItemError("Cantidad inválida.");
+      return;
+    }
+    if (price == null || price < 0) {
+      setItemError("Precio inválido.");
+      return;
+    }
+    const draft: ItemDraft =
+      itemDraft.item_type === "servicio"
+        ? { ...itemDraft, no_commission: true, commission_value: null }
+        : itemDraft.item_type === "custom" && itemDraft.no_commission
+          ? { ...itemDraft, commission_value: null }
+          : itemDraft;
+    if (draft.item_type === "custom" && !draft.no_commission) {
+      if (draft.commission_value == null || !(draft.commission_value >= 0)) {
+        setItemError("Indique el valor de la comisión.");
+        return;
+      }
+    }
+    setItems((prev) => [...prev, draft]);
+    setIsItemDialogOpen(false);
   }
 
   // Inventory-style cancel: closing the dialog always resets its draft.
@@ -462,7 +521,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 <th className="px-3 py-2">Empleado</th>
                                 <th className="px-3 py-2 text-right">V. unitario</th>
                                 <th className="px-3 py-2 text-right">Subtotal</th>
-                                <th className="px-3 py-2 text-center">¿Comisión?</th>
+                                <th className="px-3 py-2 text-center">Comisión</th>
                                 <th className="px-3 py-2"><span className="sr-only">Quitar</span></th>
                               </tr>
                             </thead>
@@ -473,151 +532,39 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 return (
                                   <tr key={index} className="border-t border-slate-200 align-top">
                                     <td className="px-3 py-2 font-semibold">{index + 1}</td>
-                                    <td className="px-3 py-2">
-                                      <input
-                                        className={`${paperInputClass} w-20`}
-                                        value={item.qty}
-                                        onChange={(event) => patchItem(index, { qty: event.target.value })}
-                                        placeholder="1"
-                                        inputMode="numeric"
-                                        required
-                                        aria-label={`Ítem ${index + 1} cantidad`}
-                                      />
+                                    <td className="whitespace-nowrap px-3 py-2">{item.qty}</td>
+                                    <td className="min-w-[200px] px-3 py-2">
+                                      <p className="font-medium">{draftItemName(item)}</p>
+                                      <p className="text-xs text-slate-500">
+                                        {item.item_type === "producto"
+                                          ? "Producto"
+                                          : item.item_type === "servicio"
+                                            ? "Servicio"
+                                            : "Personalizado"}
+                                      </p>
                                     </td>
-                                    <td className="min-w-[230px] px-3 py-2">
-                                      <Select
-                                        value={item.item_type}
-                                        onValueChange={(value) => {
-                                          const type = value as ItemDraft["item_type"];
-                                          patchItem(index, { item_type: type, ref_id: "", custom_name: "", unit_price: "" });
-                                        }}
-                                      >
-                                        <SelectTrigger className={paperInputClass} aria-label={`Ítem ${index + 1} tipo`}>
-                                          <SelectValue placeholder="Seleccione un tipo" />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                          <SelectItem value="producto">Producto</SelectItem>
-                                          <SelectItem value="servicio">Servicio</SelectItem>
-                                          <SelectItem value="custom">Personalizado</SelectItem>
-                                        </SelectContent>
-                                      </Select>
-                                      {item.item_type === "producto" && (
-                                        <Combobox
-                                          value={item.ref_id}
-                                          onValueChange={(value) => {
-                                            patchItem(index, { ref_id: value });
-                                            autofillPrice(index, "producto", value);
-                                          }}
-                                          placeholder="Producto…"
-                                          options={props.products
-                                            .filter((row) => row.is_active)
-                                            .map((row) => ({
-                                              value: row.id,
-                                              label: row.name,
-                                              description: `Stock: ${row.stock_qty} • 💰 Con comisión`,
-                                            }))}
-                                          ariaLabel={`Ítem ${index + 1} producto`}
-                                          filterPlaceholder="Buscar producto..."
-                                        />
-                                      )}
-{item.item_type === "servicio" && (
-                                        <Combobox
-                                          value={item.ref_id}
-                                          onValueChange={(value) => {
-                                            patchItem(index, { ref_id: value });
-                                            autofillPrice(index, "servicio", value);
-                                          }}
-                                          placeholder="Servicio…"
-                                          options={props.services
-                                            .filter((row) => row.is_active)
-                                            .map((row) => ({
-                                              value: row.id,
-                                              label: row.name,
-                                              description: "(sin comisión)",
-                                            }))}
-                                          ariaLabel={`Ítem ${index + 1} servicio`}
-                                          filterPlaceholder="Buscar servicio..."
-                                        />
-                                      )}
-                                      {item.item_type === "custom" && (
-                                        <input
-                                          className={`${paperInputClass} mt-2`}
-                                          value={item.custom_name}
-                                          onChange={(event) => patchItem(index, { custom_name: event.target.value })}
-                                          placeholder="Descripción"
-                                          required
-                                          aria-label={`Ítem ${index + 1} descripción`}
-                                        />
-                                      )}
-                                      <p className="mt-1 text-xs text-slate-500">{draftItemName(item)}</p>
-                                    </td>
-                                    <td className="min-w-[150px] px-3 py-2">
-<Combobox
-                                        value={item.employee_id}
-                                        onValueChange={(value) => patchItem(index, { employee_id: value })}
-                                        placeholder="Empleado…"
-                                        options={props.employees.map((row) => ({
-                                          value: row.id,
-                                          label: row.full_name,
-                                          description: `${row.employee_code ?? ''} · ${row.document ?? ''}`.trim(),
-                                        }))}
-                                        ariaLabel={`Ítem ${index + 1} empleado`}
-                                        filterPlaceholder="Buscar empleado..."
-                                      />
-                                    </td>
-                                    <td className="px-3 py-2">
-                                      <input
-                                        className={`${paperInputClass} w-28 text-right`}
-                                        value={formatMoneyInput(item.unit_price)}
-                                        onChange={(event) => patchItem(index, { unit_price: stripMoneyInput(event.target.value) })}
-                                        placeholder="0"
-                                        inputMode="numeric"
-                                        required
-                                        aria-label={`Ítem ${index + 1} precio`}
-                                      />
+                                    <td className="min-w-[140px] px-3 py-2">{employeeNameOf(item.employee_id)}</td>
+                                    <td className="whitespace-nowrap px-3 py-2 text-right">
+                                      {formatMoney(linePrice)}
                                     </td>
                                     <td className="whitespace-nowrap px-3 py-2 text-right font-medium">
                                       {formatMoney(lineQty * linePrice)}
                                     </td>
-                                    <td className="px-3 py-2 text-center">
+                                    <td className="whitespace-nowrap px-3 py-2 text-center">
                                       {item.item_type === "servicio" ? (
                                         <span className="text-xs text-slate-500">Sin comisión</span>
-                                      ) : item.item_type === "custom" ? (
-                                        <div className="flex flex-col gap-1">
-                                          <label className="flex items-center gap-1.5 text-sm">
-                                            <input
-                                              type="checkbox"
-                                              checked={!item.no_commission}
-                                              onChange={(e) => patchItem(index, { no_commission: !e.target.checked })}
-                                              className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
-                                            />
-                                            <span className="text-slate-600">¿Tiene comisión?</span>
-                                          </label>
-                                          {!item.no_commission && (
-                                            <input
-                                              type="number"
-                                              className={`${paperInputClass} w-20`}
-                                              value={item.commission_value ?? ""}
-                                              onChange={(e) => patchItem(index, { commission_value: e.target.value === "" ? null : Number(e.target.value) })}
-                                              placeholder="%"
-                                              min={0}
-                                              max={100}
-                                              step={0.01}
-                                              inputMode="decimal"
-                                              aria-label={`Ítem ${index + 1} valor comisión`}
-                                            />
-                                          )}
-                                        </div>
+                                      ) : item.no_commission ? (
+                                        <span className="text-xs text-slate-500">Sin comisión</span>
+                                      ) : item.item_type === "custom" &&
+                                        item.commission_value !== null &&
+                                        item.commission_value !== undefined ? (
+                                        <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                                          {formatMoney(item.commission_value)}
+                                        </span>
                                       ) : (
-                                        <label className="flex items-center gap-1.5 text-sm">
-                                          <input
-                                            type="checkbox"
-                                            checked={!item.no_commission}
-                                            onChange={(e) => patchItem(index, { no_commission: !e.target.checked })}
-                                            className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
-                                          />
-                                          <span className="text-slate-600">¿Tiene comisión?</span>
-                                        </label>
+                                        <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                                          Con comisión
+                                        </span>
                                       )}
                                     </td>
                                     <td className="px-3 py-2">
@@ -635,18 +582,254 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   </tr>
                                 );
                               })}
+                              {items.length === 0 && (
+                                <tr>
+                                  <td colSpan={8} className="px-3 py-4 text-center text-sm text-slate-500">
+                                    Sin ítems. Agregue al menos uno para emitir.
+                                  </td>
+                                </tr>
+                              )}
                             </tbody>
                           </table>
                         </div>
 
                         <button
                           type="button"
-                          onClick={() => setItems((prev) => [...prev, emptyItem()])}
+                          onClick={openItemDialog}
                           className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 text-sm font-medium text-slate-600 hover:bg-slate-50"
                         >
                           <Plus className="h-4 w-4" aria-hidden="true" />
                           Agregar ítem
                         </button>
+
+                        <Dialog
+                          open={isItemDialogOpen}
+                          onOpenChange={(isOpen) => {
+                            if (!isOpen) setIsItemDialogOpen(false);
+                            else setIsItemDialogOpen(isOpen);
+                          }}
+                        >
+                          <DialogContent className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                            <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
+                              <div className="border-b border-slate-200 px-6 py-4">
+                                <h2 className="text-lg font-bold">Agregar ítem</h2>
+                                <p className="text-sm text-slate-500">
+                                  Subtotal:{" "}
+                                  {formatMoney(
+                                    (toNumber(itemDraft.qty) ?? 0) * (toNumber(itemDraft.unit_price) ?? 0),
+                                  )}
+                                </p>
+                              </div>
+                              <div className="flex flex-col gap-4 px-6 py-4">
+                                <div>
+                                  <p className="mb-2 text-sm font-medium">Tipo</p>
+                                  <div className="grid grid-cols-3 gap-2" role="group" aria-label="Tipo de ítem">
+                                    {(
+                                      [
+                                        ["producto", "Producto"],
+                                        ["servicio", "Servicio"],
+                                        ["custom", "Personalizado"],
+                                      ] as Array<[ItemDraft["item_type"], string]>
+                                    ).map(([type, label]) => (
+                                      <button
+                                        key={type}
+                                        type="button"
+                                        aria-pressed={itemDraft.item_type === type}
+                                        onClick={() =>
+                                          patchDraft({
+                                            item_type: type,
+                                            ref_id: "",
+                                            custom_name: "",
+                                            unit_price: "",
+                                            no_commission: type !== "producto",
+                                            commission_value: null,
+                                          })
+                                        }
+                                        className={
+                                          itemDraft.item_type === type
+                                            ? "h-10 rounded-md bg-slate-900 text-sm font-semibold text-white"
+                                            : "h-10 rounded-md border border-slate-300 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                                        }
+                                      >
+                                        {label}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                                {itemDraft.item_type === "producto" && (
+                                  <div>
+                                    <p className="mb-1 text-sm font-medium">
+                                      Producto <span className="text-xs font-normal text-emerald-700">puede llevar comisión</span>
+                                    </p>
+                                    <Combobox
+                                      value={itemDraft.ref_id}
+                                      onValueChange={(value) => {
+                                        patchDraft({ ref_id: value });
+                                        autofillDraftPrice("producto", value);
+                                      }}
+                                      placeholder="Buscar producto…"
+                                      options={props.products
+                                        .filter((row) => row.is_active)
+                                        .map((row) => ({
+                                          value: row.id,
+                                          label: row.name,
+                                          description: `Stock: ${row.stock_qty}`,
+                                        }))}
+                                      ariaLabel="Producto del ítem"
+                                      filterPlaceholder="Escriba para filtrar…"
+                                    />
+                                  </div>
+                                )}
+                                {itemDraft.item_type === "servicio" && (
+                                  <div>
+                                    <p className="mb-1 text-sm font-medium">
+                                      Servicio <span className="text-xs font-normal text-slate-500">sin comisión</span>
+                                    </p>
+                                    <Combobox
+                                      value={itemDraft.ref_id}
+                                      onValueChange={(value) => {
+                                        patchDraft({ ref_id: value });
+                                        autofillDraftPrice("servicio", value);
+                                      }}
+                                      placeholder="Buscar servicio…"
+                                      options={props.services
+                                        .filter((row) => row.is_active)
+                                        .map((row) => ({ value: row.id, label: row.name }))}
+                                      ariaLabel="Servicio del ítem"
+                                      filterPlaceholder="Escriba para filtrar…"
+                                    />
+                                  </div>
+                                )}
+                                {itemDraft.item_type === "custom" && (
+                                  <label className="flex flex-col gap-1 text-sm font-medium">
+                                    Descripción
+                                    <input
+                                      className={paperInputClass}
+                                      value={itemDraft.custom_name}
+                                      onChange={(event) => patchDraft({ custom_name: event.target.value })}
+                                      placeholder="Ej. Peinado novia"
+                                    />
+                                  </label>
+                                )}
+                                <div>
+                                  <p className="mb-1 text-sm font-medium">Empleado que atiende</p>
+                                  <Combobox
+                                    value={itemDraft.employee_id}
+                                    onValueChange={(value) => patchDraft({ employee_id: value })}
+                                    placeholder="Buscar empleado…"
+                                    options={props.employees
+                                      .filter((row) => row.is_active)
+                                      .map((row) => ({
+                                        value: row.id,
+                                        label: row.full_name,
+                                        description: row.employee_code
+                                          ? `ID ${row.employee_code}`
+                                          : undefined,
+                                      }))}
+                                    ariaLabel="Empleado del ítem"
+                                    filterPlaceholder="Escriba para filtrar…"
+                                  />
+                                </div>
+                                <div className="grid grid-cols-2 gap-4">
+                                  <label className="flex flex-col gap-1 text-sm font-medium">
+                                    Cantidad
+                                    <input
+                                      className={paperInputClass}
+                                      value={itemDraft.qty}
+                                      onChange={(event) => patchDraft({ qty: event.target.value })}
+                                      placeholder="1"
+                                      inputMode="numeric"
+                                    />
+                                  </label>
+                                  <label className="flex flex-col gap-1 text-sm font-medium">
+                                    Precio unitario
+                                    <input
+                                      className={paperInputClass}
+                                      value={formatMoneyInput(itemDraft.unit_price)}
+                                      onChange={(event) =>
+                                        patchDraft({ unit_price: stripMoneyInput(event.target.value) })
+                                      }
+                                      placeholder="0"
+                                      inputMode="numeric"
+                                    />
+                                  </label>
+                                </div>
+                                {itemDraft.item_type === "producto" && (
+                                  <label className="flex items-center gap-2 text-sm">
+                                    <input
+                                      type="checkbox"
+                                      checked={!itemDraft.no_commission}
+                                      onChange={(event) =>
+                                        patchDraft({ no_commission: !event.target.checked })
+                                      }
+                                      className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                                    />
+                                    <span className="text-slate-700">¿Tiene comisión?</span>
+                                  </label>
+                                )}
+                                {itemDraft.item_type === "custom" && (
+                                  <div className="flex flex-col gap-2">
+                                    <label className="flex items-center gap-2 text-sm">
+                                      <input
+                                        type="checkbox"
+                                        checked={!itemDraft.no_commission}
+                                        onChange={(event) =>
+                                          patchDraft({
+                                            no_commission: !event.target.checked,
+                                            commission_value: null,
+                                          })
+                                        }
+                                        className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                                      />
+                                      <span className="text-slate-700">¿Tiene comisión?</span>
+                                    </label>
+                                    {!itemDraft.no_commission && (
+                                      <label className="flex flex-col gap-1 text-sm font-medium">
+                                        Valor de la comisión ($)
+                                        <input
+                                          type="number"
+                                          className={paperInputClass}
+                                          value={itemDraft.commission_value ?? ""}
+                                          onChange={(event) =>
+                                            patchDraft({
+                                              commission_value:
+                                                event.target.value === "" ? null : Number(event.target.value),
+                                            })
+                                          }
+                                          placeholder="Ej. 10000"
+                                          min={0}
+                                          step={100}
+                                          inputMode="decimal"
+                                        />
+                                      </label>
+                                    )}
+                                  </div>
+                                )}
+                                {itemError && (
+                                  <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+                                    {itemError}
+                                  </p>
+                                )}
+                              </div>
+                              <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-6 py-4">
+                                <button
+                                  type="button"
+                                  onClick={() => setIsItemDialogOpen(false)}
+                                  className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                                >
+                                  Cancelar
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={addItemFromDialog}
+                                  className="h-10 rounded-md bg-slate-900 px-6 text-sm font-semibold text-white hover:bg-slate-700"
+                                >
+                                  Agregar a la factura
+                                </button>
+                              </div>
+                            </div>
+                          </DialogContent>
+                        </Dialog>
 
                         <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500">
                           Cobro inmediato (opcional)
@@ -957,7 +1140,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                       {row.item_type === "custom" && row.custom_name ? row.custom_name : row.item_type}
                                       {row.item_type === "custom" && row.commission_value !== null && row.commission_value !== undefined && !row.no_commission && (
                                         <span className="ml-2 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
-                                          Comisión: {row.commission_value}%
+                                          Comisión: {formatMoney(row.commission_value)}
                                         </span>
                                       )}
                                       {row.no_commission && (
@@ -981,7 +1164,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                       ) : row.no_commission ? (
                                         <span className="text-slate-500">No</span>
                                       ) : row.item_type === "custom" && row.commission_value !== null && row.commission_value !== undefined ? (
-                                        <span className="font-medium text-emerald-700">{row.commission_value}%</span>
+                                        <span className="font-medium text-emerald-700">{formatMoney(row.commission_value)}</span>
                                       ) : (
                                         <span className="text-emerald-700">Sí</span>
                                       )}

@@ -46,7 +46,22 @@ function Combobox({
 }: ComboboxProps) {
   const [filter, setFilter] = React.useState('')
   const [open, setOpen] = React.useState(false)
-  const inputRef = React.useRef<HTMLInputElement>(null)
+  const containerRef = React.useRef<HTMLDivElement>(null)
+
+  function close() {
+    setOpen(false)
+    setFilter('')
+  }
+
+  // Cierra al hacer clic en cualquier otro lado (robusto ante z-index/portales).
+  React.useEffect(() => {
+    if (!open) return
+    function onPointerDown(event: PointerEvent) {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) close()
+    }
+    document.addEventListener('pointerdown', onPointerDown, true)
+    return () => document.removeEventListener('pointerdown', onPointerDown, true)
+  }, [open])
 
   const filteredOptions = React.useMemo(() => {
     const query = filter.trim().toLowerCase()
@@ -61,18 +76,13 @@ function Combobox({
 
   const selectedOption = options.find((opt) => opt.value === value)
 
-  function close() {
-    setOpen(false)
-    setFilter('')
-  }
-
   function choose(next: string) {
     onValueChange(next)
     close()
   }
 
   return (
-    <div className={cn('relative w-full', className)}>
+    <div ref={containerRef} className={cn('relative w-full', className)}>
       <button
         type="button"
         onClick={() => {
@@ -106,8 +116,6 @@ function Combobox({
       </button>
 
       {open && (
-        <>
-          <div className="fixed inset-0 z-40 cursor-default" onClick={close} aria-hidden="true" />
           <div
             role="listbox"
             aria-label={ariaLabel}
@@ -115,7 +123,6 @@ function Combobox({
           >
             <div className="border-b border-slate-200 p-2 dark:border-slate-700">
               <input
-                ref={inputRef}
                 type="text"
                 value={filter}
                 onChange={(event) => setFilter(event.target.value)}
@@ -174,7 +181,6 @@ function Combobox({
               )}
             </div>
           </div>
-        </>
       )}
     </div>
   )

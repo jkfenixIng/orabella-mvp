@@ -526,9 +526,10 @@ export async function calculatePayroll(
               qty: line.qty,
               unit_price: line.unit_price,
               line_subtotal: roundMoney(line.line_subtotal),
-              // Para items custom, usar commission_value del ítem; para productos/servicios, usar percent del empleado
+              // Para items custom, la comisión es un VALOR fijo del ítem;
+              // para productos/servicios, porcentaje del empleado.
               commission: line.item_type === "custom" && line.commission_value !== null
-                ? computeLineCommission(line.line_subtotal, line.commission_value)
+                ? roundMoney(line.commission_value)
                 : computeLineCommission(line.line_subtotal, percent),
               commission_value: line.commission_value,
             }));
