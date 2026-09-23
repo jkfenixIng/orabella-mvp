@@ -33,6 +33,13 @@ const NAV_GROUPS: NavGroup[] = [
           roles: ["admin", "caja", "empleado"],
         },
         { href: "/cash", label: "Caja", description: "Turnos y cierre del día", Icon: Wallet, roles: ["admin", "caja"] },
+        {
+          href: "/vales",
+          label: "Vales",
+          description: "Vales para empleados",
+          Icon: Ticket,
+          roles: ["admin", "caja", "empleado"],
+        },
       ],
   },
   {
@@ -58,13 +65,6 @@ const NAV_GROUPS: NavGroup[] = [
           description: "Pagos al personal",
           Icon: Calculator,
           roles: ["admin", "empleado"],
-        },
-        {
-          href: "/vales",
-          label: "Vales",
-          description: "Vales para empleados",
-          Icon: Ticket,
-          roles: ["admin", "caja", "empleado"],
         },
       ],
   },
