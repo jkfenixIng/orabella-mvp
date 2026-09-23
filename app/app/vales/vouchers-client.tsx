@@ -21,17 +21,26 @@ import {
   DialogTitle,
 } from "@/src/components/ui/lib/dialog";
 import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import { cn } from "@/src/components/ui/lib/utils";
 
-const inputClass =
-  "rounded border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900";
-const labelClass = "flex flex-col gap-1 text-sm";
-const buttonClass =
-  "rounded bg-slate-200 px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-300 disabled:opacity-50 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700";
-const ghostClass =
-  "rounded border border-slate-300 px-3 py-2 text-sm dark:border-slate-700";
-const sectionClass = "rounded-lg border border-slate-300 p-4 dark:border-slate-700";
-const errorClass = "text-sm text-red-600 dark:text-red-400";
-const okClass = "text-sm text-green-700 dark:text-green-400";
+const inputClass = cn(
+  "rounded-md border border-border-color bg-surface px-3 py-2 text-sm text-text-primary shadow-sm",
+  "dark:border-border-color-2",
+);
+const labelClass = cn("flex flex-col gap-1 text-sm text-text-primary");
+const buttonClass = cn(
+  "inline-flex items-center justify-center gap-2 rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-all duration-200 hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
+);
+const ghostClass = cn(
+  "inline-flex items-center justify-center gap-2 rounded-md border border-border-color bg-transparent px-4 py-2 text-sm font-medium text-text-primary shadow-sm transition-all duration-200 hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
+  "dark:border-border-color-2 dark:hover:bg-surface-hover",
+);
+const sectionClass = cn(
+  "rounded-lg border border-border-color bg-surface p-4 shadow-sm",
+  "dark:border-border-color-2",
+);
+const errorClass = cn("text-sm text-error dark:text-error");
+const okClass = cn("text-sm text-success dark:text-success");
 
 type ActionResult<T> =
   | { success: true; data: T }
@@ -301,7 +310,7 @@ export function VouchersClient(props: VouchersClientProps) {
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <h2 className="text-lg font-semibold">Vales</h2>
-            <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+            <p className="mt-1 text-sm text-text-secondary">
               {configured ? (
                 <>
                   Topes vigentes: {capsSummary} · días{" "}
@@ -335,7 +344,7 @@ export function VouchersClient(props: VouchersClientProps) {
           </p>
         )}
         {props.canAdmin && (
-          <form onSubmit={handleLimits} className="mt-3 flex flex-col gap-4 rounded-md border border-slate-200 p-3 dark:border-slate-700">
+          <form onSubmit={handleLimits} className="mt-3 flex flex-col gap-4 rounded-md border border-border-color p-3 dark:border-border-color-2">
             <fieldset className="flex flex-col gap-2 text-sm">
               <legend className="font-semibold">1. Días permitidos</legend>
               <div className="flex flex-wrap gap-4">
@@ -449,7 +458,7 @@ export function VouchersClient(props: VouchersClientProps) {
                       </label>
                     ))}
                     {allowedDays.length === 0 && (
-                      <p className="text-sm text-slate-500">Elija los días indicados arriba.</p>
+                      <p className="text-sm text-text-tertiary">Elija los días indicados arriba.</p>
                     )}
                   </div>
                 )}
@@ -519,12 +528,12 @@ export function VouchersClient(props: VouchersClientProps) {
               <span>
                 {employeeName(row.employee_id)} · {formatMoney(row.amount)} · {row.request_date}
               </span>
-              <span className="rounded bg-slate-200 px-2 py-0.5 text-xs dark:bg-slate-800">
+              <span className="rounded bg-surface-hover px-2 py-0.5 text-xs text-text-secondary">
                 {row.status}
                 {row.status === "descontada" ? " (en nómina: sin cambios)" : ""}
               </span>
               {row.approval_code && <span className="text-xs">Código: {row.approval_code}</span>}
-              {row.observation && <span className="text-xs text-slate-500">{row.observation}</span>}
+              {row.observation && <span className="text-xs text-text-tertiary">{row.observation}</span>}
               {props.canAdmin && row.status === "pendiente" && (
                 <>
                   <button type="button" onClick={() => handleApprove(row.id)} disabled={busy} className={ghostClass}>
@@ -537,7 +546,7 @@ export function VouchersClient(props: VouchersClientProps) {
               )}
             </li>
           ))}
-          {vouchers.length === 0 && <li className="text-sm text-slate-500">Sin vales todavía.</li>}
+          {vouchers.length === 0 && <li className="text-sm text-text-tertiary">Sin vales todavía.</li>}
         </ul>
         {props.canAdmin && (
           <div className="mt-3 flex flex-wrap items-end gap-3">

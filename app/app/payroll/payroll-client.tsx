@@ -21,17 +21,26 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/src/components/ui/lib/dialog";
+import { cn } from "@/src/components/ui/lib/utils";
 
-const inputClass =
-  "rounded border border-slate-300 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900";
-const labelClass = "flex flex-col gap-1 text-sm";
-const buttonClass =
-  "rounded bg-slate-200 px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-300 disabled:opacity-50 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700";
-const ghostClass =
-  "rounded border border-slate-300 px-3 py-2 text-sm dark:border-slate-700";
-const sectionClass = "rounded-lg border border-slate-300 p-4 dark:border-slate-700";
-const errorClass = "text-sm text-red-600 dark:text-red-400";
-const okClass = "text-sm text-green-700 dark:text-green-400";
+const inputClass = cn(
+  "rounded-md border border-border-color bg-surface px-3 py-2 text-sm text-text-primary shadow-sm",
+  "dark:border-border-color-2",
+);
+const labelClass = cn("flex flex-col gap-1 text-sm text-text-primary");
+const buttonClass = cn(
+  "inline-flex items-center justify-center gap-2 rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-all duration-200 hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
+);
+const ghostClass = cn(
+  "inline-flex items-center justify-center gap-2 rounded-md border border-border-color bg-transparent px-4 py-2 text-sm font-medium text-text-primary shadow-sm transition-all duration-200 hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
+  "dark:border-border-color-2 dark:hover:bg-surface-hover",
+);
+const sectionClass = cn(
+  "rounded-lg border border-border-color bg-surface p-4 shadow-sm",
+  "dark:border-border-color-2",
+);
+const errorClass = cn("text-sm text-error dark:text-error");
+const okClass = cn("text-sm text-success dark:text-success");
 
 type ActionResult<T> =
   | { success: true; data: T }
@@ -228,7 +237,7 @@ export function PayrollClient(props: PayrollClientProps) {
       <section className={sectionClass}>
         <h2 className="text-lg font-semibold">Periodos</h2>
         {props.initialEmployees.length === 0 && (
-          <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
+          <p className="mt-2 text-sm text-text-secondary">
             Aún no hay empleados en la sede: créelos en /admin antes de liquidar.
           </p>
         )}
@@ -259,13 +268,13 @@ export function PayrollClient(props: PayrollClientProps) {
               >
                 {row.start_date} → {row.end_date}
               </button>
-              <span className="rounded bg-slate-200 px-2 py-0.5 text-xs dark:bg-slate-800">{row.status}</span>
+              <span className="rounded bg-surface-hover px-2 py-0.5 text-xs text-text-secondary">{row.status}</span>
               {row.status === "cerrado" && row.closed_at && (
-                <span className="text-xs text-slate-500">Cerrado: {new Date(row.closed_at).toLocaleString("es-CO")}</span>
+                <span className="text-xs text-text-tertiary">Cerrado: {new Date(row.closed_at).toLocaleString("es-CO")}</span>
               )}
             </li>
           ))}
-          {periods.length === 0 && <li className="text-sm text-slate-500">Sin periodos todavía.</li>}
+          {periods.length === 0 && <li className="text-sm text-text-tertiary">Sin periodos todavía.</li>}
         </ul>
       </section>
 
@@ -285,13 +294,13 @@ export function PayrollClient(props: PayrollClientProps) {
             </DialogHeader>
             <div className="max-h-[calc(100dvh-12rem)] overflow-y-auto pr-1">
           {selected.status === "cerrado" ? (
-            <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
+            <p className="mt-2 text-sm text-text-secondary">
               Periodo cerrado.
             </p>
           ) : (
             props.canAdmin && (
               <form onSubmit={handleCalculate} className="mt-3 flex flex-col gap-2">
-                <p className="text-sm text-slate-600 dark:text-slate-300">
+                <p className="text-sm text-text-secondary">
                   Ajustes opcionales por empleado (bonos,otros descuentos separados por coma).
                 </p>
                 {props.initialEmployees
@@ -329,7 +338,7 @@ export function PayrollClient(props: PayrollClientProps) {
             <div className="mt-4 overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
-                  <tr className="text-left text-xs text-slate-500">
+                  <tr className="text-left text-xs text-text-tertiary">
                     <th className="py-1 pr-2">Empleado</th>
                     <th className="py-1 pr-2">Fijo</th>
                     <th className="py-1 pr-2">Comisiones</th>
@@ -344,7 +353,7 @@ export function PayrollClient(props: PayrollClientProps) {
                 </thead>
                 <tbody>
                   {detail.items.map((item) => (
-                    <tr key={item.id} className="border-t border-slate-200 dark:border-slate-800">
+                    <tr key={item.id} className="border-t border-border-color dark:border-border-color-2">
                       <td className="py-2 pr-2">{employeeName(item.employee_id)}</td>
                       <td className="py-2 pr-2">{formatMoney(item.base_fixed)}</td>
                       <td className="py-2 pr-2">{formatMoney(item.commissions)}</td>
@@ -370,7 +379,7 @@ export function PayrollClient(props: PayrollClientProps) {
               {detail.items.map(
                 (item) =>
                   expanded[item.id] && (
-                    <div key={`${item.id}-detail`} className="mt-2 rounded bg-slate-100 p-3 text-xs dark:bg-slate-900">
+                    <div key={`${item.id}-detail`} className="mt-2 rounded bg-surface-hover p-3 text-xs text-text-secondary">
                       {item.detail_json.length === 0 ? (
                         <p>Sueldo fijo: sin reporte de comisiones.</p>
                       ) : (
@@ -404,7 +413,7 @@ export function PayrollClient(props: PayrollClientProps) {
                           <button type="submit" disabled={busy} className={buttonClass}>
                             Pagar
                           </button>
-                          <span className="text-slate-500">
+                          <span className="text-text-tertiary">
                             Métodos: {props.methods.map((row) => row.code).join(", ") || "sin métodos activos"}
                           </span>
                         </form>
