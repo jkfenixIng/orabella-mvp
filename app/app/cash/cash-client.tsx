@@ -126,12 +126,12 @@ function ShiftsTable({
                       <td className="whitespace-nowrap py-1 pr-3">{formatMoney(view.ventas)}</td>
                       <td className="whitespace-nowrap py-1 pr-3">{formatMoney(view.efectivo)}</td>
                       {methodCols.map((method) => {
-                        const declarado = view.declarados.find(
+                        const cobrado = view.metodos.find(
                           (m) => m.method_code === method.code,
-                        )?.amount;
+                        )?.amount ?? 0;
                         return (
                           <td key={method.id} className="whitespace-nowrap py-1 pr-3">
-                            {declarado === undefined ? "—" : formatMoney(declarado)}
+                            {formatMoney(cobrado)}
                           </td>
                         );
                       })}
