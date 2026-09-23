@@ -6,7 +6,6 @@ import {
   listVouchersAction,
   rejectVoucherAction,
   requestVoucherAction,
-  setVoucherLimitsAction,
 } from "@/src/features/payroll/actions";
 import type {
   VoucherRequestRow,
@@ -91,51 +90,17 @@ interface VouchersClientProps {
 
 export function VouchersClient(props: VouchersClientProps) {
   const [vouchers, setVouchers] = useState<VoucherRequestRow[]>(props.initialVouchers);
-  const [settings, setSettings] = useState<VoucherSettingsRow | null>(props.initialSettings);
+  const [settings] = useState<VoucherSettingsRow | null>(props.initialSettings);
   const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
-  const [maxDay, setMaxDay] = useState(
-    props.initialSettings?.max_per_day ? String(props.initialSettings.max_per_day) : "",
-  );
-  const [maxWeek, setMaxWeek] = useState(
-    props.initialSettings?.max_per_week ? String(props.initialSettings.max_per_week) : "",
-  );
-  // V2 wizard: días (todos/indicados) → topes (sin/diarios/semanales/ambos)
-  // → tope propio por día o mismo para todos.
-  const [daysMode, setDaysMode] = useState<"todos" | "indicados">(
-    props.initialSettings?.allowed_days && props.initialSettings.allowed_days.length < 7
-      ? "indicados"
-      : "todos",
-  );
-  const [capsMode, setCapsMode] = useState<"sin" | "diarios" | "semanales" | "ambos">(() => {
-    const day = Number(props.initialSettings?.max_per_day ?? 0) > 0;
-    const week = Number(props.initialSettings?.max_per_week ?? 0) > 0;
-    if (day && week) return "ambos";
-    if (day) return "diarios";
-    if (week) return "semanales";
-    return "sin";
-  });
-  const [perDayMode, setPerDayMode] = useState<"mismo" | "propio">(
-    props.initialSettings?.per_day_limits && Object.keys(props.initialSettings.per_day_limits).length > 0
-      ? "propio"
-      : "mismo",
-  );
-  const [dayAmounts, setDayAmounts] = useState<Record<string, string>>(() => {
-    const map: Record<string, string> = {};
-    for (const [day, amount] of Object.entries(props.initialSettings?.per_day_limits ?? {})) {
-      map[day] = String(amount);
-    }
-    return map;
-  });
-  // Item 5: días permitidos (null en BD = todos; la UI parte de todos).
-  const [allowedDays, setAllowedDays] = useState<number[]>(
-    props.initialSettings?.allowed_days ?? [1, 2, 3, 4, 5, 6, 7],
-  );
   const [voucherEmployee, setVoucherEmployee] = useState("");
   const [voucherAmount, setVoucherAmount] = useState("");
   const [voucherDate, setVoucherDate] = useState("");
   const [voucherNote, setVoucherNote] = useState("");
   const [reviewNote, setReviewNote] = useState("");
   const [rejectReason, setRejectReason] = useState("");
+  // Aprobación y rechazo comparten un único modal: guarda el vale y la acción.
+  const [reviewTarget, setReviewTarget] = useState<{ id: string; action: "approve" | "reject" } | null>(null);
+  const [reviewError, setReviewError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // V1: sin topes configurados no se puede solicitar; el alta vive en un modal.
   const [isCreateOpen, setIsCreateOpen] = useState(false);
@@ -176,61 +141,6 @@ export function VouchersClient(props: VouchersClientProps) {
   async function refreshVouchers() {
     const result = (await listVouchersAction({})) as ActionResult<VoucherRequestRow[]>;
     if (result.success) setVouchers(result.data);
-  }
-
-  async function handleLimits(event: FormEvent) {
-    event.preventDefault();
-    const wantsDay = capsMode === "diarios" || capsMode === "ambos";
-    const wantsWeek = capsMode === "semanales" || capsMode === "ambos";
-    const day = wantsDay ? toNumber(maxDay) : null;
-    const week = wantsWeek ? toNumber(maxWeek) : null;
-    if (wantsDay && (day === null || day <= 0)) {
-      setMessage({ kind: "error", text: "Indique el tope diario (mayor a 0)." });
-      return;
-    }
-    if (wantsWeek && (week === null || week <= 0)) {
-      setMessage({ kind: "error", text: "Indique el tope semanal (mayor a 0)." });
-      return;
-    }
-    const days = daysMode === "todos" ? DAY_NAMES.map((row) => row.day) : [...allowedDays].sort((a, b) => a - b);
-    if (days.length === 0) {
-      setMessage({ kind: "error", text: "Elija al menos un día permitido." });
-      return;
-    }
-    // Tope propio por día: solo aplica con días indicados + tope diario.
-    const ownDayLimits = perDayMode === "propio" && daysMode === "indicados" && wantsDay;
-    let perDayLimits: Array<{ day: number; amount: number }> = [];
-    if (ownDayLimits) {
-      const entries: Array<{ day: number; amount: number }> = [];
-      for (const dayNumber of days) {
-        const amount = toNumber(dayAmounts[String(dayNumber)] ?? "");
-        if (amount === null || amount <= 0) {
-          setMessage({
-            kind: "error",
-            text: `Indique el tope del ${DAY_NAMES[dayNumber - 1]?.label ?? dayNumber} (mayor a 0).`,
-          });
-          return;
-        }
-        entries.push({ day: dayNumber, amount });
-      }
-      perDayLimits = entries;
-    }
-    setBusy(true);
-    const result = (await setVoucherLimitsAction({
-      // Con tope propio por día el general no aplica: cada día trae el suyo.
-      max_per_day: wantsDay && !ownDayLimits ? day : null,
-      max_per_week: week,
-      allowed_days: days,
-      per_day_limits: perDayLimits,
-    })) as ActionResult<VoucherSettingsRow>;
-    setBusy(false);
-    if (show(result, "Configuración de vales guardada.")) setSettings(result.data);
-  }
-
-  function toggleDay(day: number): void {
-    setAllowedDays((current) =>
-      current.includes(day) ? current.filter((row) => row !== day) : [...current, day],
-    );
   }
 
   async function handleRequestVoucher(event: FormEvent) {
@@ -298,6 +208,36 @@ export function VouchersClient(props: VouchersClientProps) {
     }
   }
 
+  function openReview(id: string, action: "approve" | "reject") {
+    setMessage(null);
+    setReviewError(null);
+    setReviewNote("");
+    setRejectReason("");
+    setReviewTarget({ id, action });
+  }
+
+  function closeReview() {
+    setReviewTarget(null);
+    setReviewError(null);
+    setReviewNote("");
+    setRejectReason("");
+  }
+
+  async function confirmReview() {
+    if (!reviewTarget) return;
+    if (reviewTarget.action === "reject" && !rejectReason.trim()) {
+      setReviewError("El motivo del rechazo es requerido.");
+      return;
+    }
+    const { id, action } = reviewTarget;
+    if (action === "approve") {
+      await handleApprove(id);
+    } else {
+      await handleReject(id);
+    }
+    closeReview();
+  }
+
   return (
     <div className="flex flex-col gap-6">
       {message && (
@@ -342,135 +282,6 @@ export function VouchersClient(props: VouchersClientProps) {
           <p role="status" className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
             Los vales no están configurados: un administrador debe definir topes y días permitidos antes de solicitar.
           </p>
-        )}
-        {props.canAdmin && (
-          <form onSubmit={handleLimits} className="mt-3 flex flex-col gap-4 rounded-md border border-border-color p-3 dark:border-border-color-2">
-            <fieldset className="flex flex-col gap-2 text-sm">
-              <legend className="font-semibold">1. Días permitidos</legend>
-              <div className="flex flex-wrap gap-4">
-                <label className="flex items-center gap-1.5">
-                  <input
-                    type="radio"
-                    name="voucher-days-mode"
-                    checked={daysMode === "todos"}
-                    onChange={() => setDaysMode("todos")}
-                  />
-                  Todos
-                </label>
-                <label className="flex items-center gap-1.5">
-                  <input
-                    type="radio"
-                    name="voucher-days-mode"
-                    checked={daysMode === "indicados"}
-                    onChange={() => setDaysMode("indicados")}
-                  />
-                  Indicados
-                </label>
-              </div>
-              {daysMode === "indicados" && (
-                <div className="flex flex-wrap gap-2">
-                  {DAY_NAMES.map((row) => (
-                    <label key={row.day} className="flex items-center gap-1 text-sm">
-                      <input
-                        type="checkbox"
-                        checked={allowedDays.includes(row.day)}
-                        onChange={() => toggleDay(row.day)}
-                      />
-                      {row.label}
-                    </label>
-                  ))}
-                </div>
-              )}
-            </fieldset>
-
-            <fieldset className="flex flex-col gap-2 text-sm">
-              <legend className="font-semibold">2. Topes</legend>
-              <div className="flex flex-wrap gap-4">
-                {(
-                  [
-                    ["sin", "Sin topes"],
-                    ["diarios", "Diarios"],
-                    ["semanales", "Semanales"],
-                    ["ambos", "Ambos"],
-                  ] as Array<["sin" | "diarios" | "semanales" | "ambos", string]>
-                ).map(([mode, label]) => (
-                  <label key={mode} className="flex items-center gap-1.5">
-                    <input
-                      type="radio"
-                      name="voucher-caps-mode"
-                      checked={capsMode === mode}
-                      onChange={() => setCapsMode(mode)}
-                    />
-                    {label}
-                  </label>
-                ))}
-              </div>
-              {(capsMode === "diarios" || capsMode === "ambos") && (
-                <label className={labelClass}>
-                  Máximo por día
-                  <input value={formatMoneyInput(maxDay)} onChange={(event) => setMaxDay(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
-                </label>
-              )}
-              {(capsMode === "semanales" || capsMode === "ambos") && (
-                <label className={labelClass}>
-                  Máximo por semana
-                  <input value={formatMoneyInput(maxWeek)} onChange={(event) => setMaxWeek(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
-                </label>
-              )}
-            </fieldset>
-
-            {daysMode === "indicados" && (capsMode === "diarios" || capsMode === "ambos") && (
-              <fieldset className="flex flex-col gap-2 text-sm">
-                <legend className="font-semibold">3. Tope por día</legend>
-                <div className="flex flex-wrap gap-4">
-                  <label className="flex items-center gap-1.5">
-                    <input
-                      type="radio"
-                      name="voucher-perday-mode"
-                      checked={perDayMode === "mismo"}
-                      onChange={() => setPerDayMode("mismo")}
-                    />
-                    Mismo para todos
-                  </label>
-                  <label className="flex items-center gap-1.5">
-                    <input
-                      type="radio"
-                      name="voucher-perday-mode"
-                      checked={perDayMode === "propio"}
-                      onChange={() => setPerDayMode("propio")}
-                    />
-                    Tope propio por día
-                  </label>
-                </div>
-                {perDayMode === "propio" && (
-                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                    {[...allowedDays].sort((a, b) => a - b).map((dayNumber) => (
-                      <label key={dayNumber} className={labelClass}>
-                        {DAY_NAMES[dayNumber - 1]?.label ?? dayNumber}
-                        <input
-                          value={formatMoneyInput(dayAmounts[String(dayNumber)] ?? "")}
-                          onChange={(event) =>
-                            setDayAmounts((prev) => ({ ...prev, [String(dayNumber)]: stripMoneyInput(event.target.value) }))
-                          }
-                          inputMode="numeric"
-                          className={inputClass}
-                        />
-                      </label>
-                    ))}
-                    {allowedDays.length === 0 && (
-                      <p className="text-sm text-text-tertiary">Elija los días indicados arriba.</p>
-                    )}
-                  </div>
-                )}
-              </fieldset>
-            )}
-
-            <div>
-              <button type="submit" disabled={busy} className={buttonClass}>
-                {busy ? "Guardando…" : "Guardar configuración"}
-              </button>
-            </div>
-          </form>
         )}
         {props.canIssue && (
           <Dialog
@@ -536,10 +347,10 @@ export function VouchersClient(props: VouchersClientProps) {
               {row.observation && <span className="text-xs text-text-tertiary">{row.observation}</span>}
               {props.canAdmin && row.status === "pendiente" && (
                 <>
-                  <button type="button" onClick={() => handleApprove(row.id)} disabled={busy} className={ghostClass}>
+                  <button type="button" onClick={() => openReview(row.id, "approve")} disabled={busy} className={ghostClass}>
                     Aprobar con código
                   </button>
-                  <button type="button" onClick={() => handleReject(row.id)} disabled={busy} className={ghostClass}>
+                  <button type="button" onClick={() => openReview(row.id, "reject")} disabled={busy} className={ghostClass}>
                     Rechazar
                   </button>
                 </>
@@ -549,16 +360,53 @@ export function VouchersClient(props: VouchersClientProps) {
           {vouchers.length === 0 && <li className="text-sm text-text-tertiary">Sin vales todavía.</li>}
         </ul>
         {props.canAdmin && (
-          <div className="mt-3 flex flex-wrap items-end gap-3">
-            <label className={labelClass}>
-              Observación de aprobación (opcional)
-              <input value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} className={inputClass} />
-            </label>
-            <label className={labelClass}>
-              Motivo de rechazo
-              <input value={rejectReason} onChange={(event) => setRejectReason(event.target.value)} className={inputClass} />
-            </label>
-          </div>
+          <Dialog
+            open={reviewTarget !== null}
+            onOpenChange={(open) => {
+              if (!open) closeReview();
+            }}
+          >
+            <DialogContent className="max-w-lg">
+              <DialogHeader>
+                <DialogTitle>
+                  {reviewTarget?.action === "reject" ? "Rechazar vale" : "Aprobar vale con código"}
+                </DialogTitle>
+              </DialogHeader>
+              <div className="mt-3 flex flex-col gap-3">
+                {reviewTarget?.action === "reject" ? (
+                  <label className={labelClass}>
+                    Motivo de rechazo
+                    <input
+                      value={rejectReason}
+                      onChange={(event) => {
+                        setRejectReason(event.target.value);
+                        if (reviewError) setReviewError(null);
+                      }}
+                      className={inputClass}
+                    />
+                  </label>
+                ) : (
+                  <label className={labelClass}>
+                    Observación de aprobación (opcional)
+                    <input value={reviewNote} onChange={(event) => setReviewNote(event.target.value)} className={inputClass} />
+                  </label>
+                )}
+                {reviewError && (
+                  <p role="alert" className={errorClass}>
+                    {reviewError}
+                  </p>
+                )}
+                <DialogFooter>
+                  <button type="button" className={ghostClass} onClick={closeReview}>
+                    Cancelar
+                  </button>
+                  <button type="button" disabled={busy} className={buttonClass} onClick={confirmReview}>
+                    {busy ? "Procesando…" : reviewTarget?.action === "reject" ? "Rechazar" : "Aprobar"}
+                  </button>
+                </DialogFooter>
+              </div>
+            </DialogContent>
+          </Dialog>
         )}
       </section>
     </div>
