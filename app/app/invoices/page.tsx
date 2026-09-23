@@ -73,6 +73,8 @@ export default async function InvoicesPage() {
         taxes={taxes.filter((row) => row.is_active)}
         canWrite={canWrite}
         canAnnul={session.roles.includes("admin")}
+        isAdmin={isAdmin}
+        currentUserId={session.user.id}
         detailMode={isAdmin ? "full" : isManager ? "open-only" : "none"}
       />
     </main>

@@ -4,6 +4,7 @@ import { useState, useTransition, type FormEvent } from "react";
 import {
   annulInvoiceAction,
   createInvoiceAction,
+  editEmittedInvoiceAction,
   editInvoiceAction,
   getInvoiceAction,
   listInvoicesAction,
@@ -134,6 +135,8 @@ interface InvoicesClientProps {
   taxes: TaxConfigRow[];
   canWrite: boolean;
   canAnnul: boolean;
+  isAdmin: boolean;
+  currentUserId: string;
   detailMode: "full" | "open-only" | "none";
 }
 
@@ -162,6 +165,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
   const [discount, setDiscount] = useState("");
   const [items, setItems] = useState<ItemDraft[]>([]);
   const [isItemDialogOpen, setIsItemDialogOpen] = useState(false);
+  const [itemDialogTarget, setItemDialogTarget] = useState<"create" | "edit">("create");
   const [itemDraft, setItemDraft] = useState<ItemDraft>(emptyItem());
   const [itemError, setItemError] = useState<string | null>(null);
   const [portions, setPortions] = useState<PortionDraft[]>([
@@ -221,9 +225,15 @@ export function InvoicesClient(props: InvoicesClientProps) {
     }
   }
 
-  function openItemDialog() {
+  /**
+   * Modal de ítems generalizado: sirve para crear ("create", agrega al
+   * borrador) y para la edición libre de EMITIDAS ("edit", agrega a la
+   * edición). Vive a nivel raíz para que ambos diálogos lo reutilicen.
+   */
+  function openItemDialog(target: "create" | "edit" = "create") {
     setItemDraft(emptyItem());
     setItemError(null);
+    setItemDialogTarget(target);
     setIsItemDialogOpen(true);
   }
 
@@ -273,7 +283,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
         return;
       }
     }
-    setItems((prev) => [...prev, draft]);
+    if (itemDialogTarget === "edit") {
+      setEditItems((prev) => [...prev, { ...draft, discount: 0 }]);
+    } else {
+      setItems((prev) => [...prev, draft]);
+    }
     setIsItemDialogOpen(false);
   }
 
@@ -408,11 +422,20 @@ export function InvoicesClient(props: InvoicesClientProps) {
     }
     setBusy(true);
     try {
-      const result: ActionResult<InvoiceDetail> = await editInvoiceAction(detail.invoice.id, {
-        motivo: editMotivo,
-        items: parsedItems,
-        payments: editPayments,
-      });
+      const free = detail.invoice.status === "Emitida";
+      const result: ActionResult<InvoiceDetail> = free
+        ? await editEmittedInvoiceAction(detail.invoice.id, {
+            items: parsedItems,
+            payments: detail.payments.map((payment) => ({
+              id: payment.id,
+              method_code: payment.method_code,
+            })),
+          })
+        : await editInvoiceAction(detail.invoice.id, {
+            motivo: editMotivo,
+            items: parsedItems,
+            payments: editPayments,
+          });
       if (!result.success) {
         setEditError(`[${result.code}] ${result.message}`);
         return;
@@ -420,7 +443,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
       setDetail(result.data);
       setIsEditDialogOpen(false);
       setNotice(
-        `Factura #${result.data.invoice.consecutive_number} actualizada (total intacto ${formatMoney(result.data.invoice.total)}).`,
+        free
+          ? `Factura #${result.data.invoice.consecutive_number} actualizada (nuevo total ${formatMoney(result.data.invoice.total)}).`
+          : `Factura #${result.data.invoice.consecutive_number} actualizada (total intacto ${formatMoney(result.data.invoice.total)}).`,
       );
       await applyFilters(undefined, invoicePage);
     } finally {
@@ -669,6 +694,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
   // Determinar si hay pago inmediato (para botón "Emitir y pagar")
   const hasImmediatePayment = portions.some((p) => (toNumber(p.amount) ?? 0) > 0);
 
+  // Edición libre (Emitida: la cajera del turno edita sin motivo y el total
+  // se recalcula) vs edición estricta (Pagada: solo admin, motivo + total
+  // inmutable). Anulada nunca se edita (el botón ni se muestra).
+  const isFreeEdit = detail?.invoice.status === "Emitida";
   // Medidor de conciliación de edición: el total nunca cambia.
   const editSubtotal = editItems.reduce((acc, item) => {
     const qty = toNumber(item.qty) ?? 0;
@@ -687,10 +716,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
   const canSaveEdit =
     detail !== null &&
     editItems.length > 0 &&
-    editMotivo.trim() !== "" &&
-    editSubtotalOk &&
-    editFeesOk &&
-    !busy;
+    !busy &&
+    (isFreeEdit || (editMotivo.trim() !== "" && editSubtotalOk && editFeesOk));
+
+  // Estimado del nuevo total en edición libre (solo presentación; los
+  // impuestos vigentes y el recargo emitido los recalcula el servidor).
+  const freeEditDiscount = detail ? Number(detail.invoice.discount) : 0;
+  const freeEditBase = Math.max(0, editSubtotal - freeEditDiscount);
+  const freeEditTax = props.taxes.reduce((acc, tax) => {
+    const percent = Number(tax.percent ?? 0);
+    return acc + Math.round(freeEditBase * (percent / 100) * 100) / 100;
+  }, 0);
+  const freeEditTotal = freeEditBase + freeEditTax + (detail ? Number(detail.invoice.surcharge ?? 0) : 0);
 
   function totalizePortions() {
     const firstEmpty = portions.findIndex((portion) => portion.amount.trim() === "");
@@ -867,248 +904,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
 
                         <button
                           type="button"
-                          onClick={openItemDialog}
+                          onClick={() => openItemDialog("create")}
                           className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 text-sm font-medium text-slate-600 hover:bg-slate-50"
                         >
                           <Plus className="h-4 w-4" aria-hidden="true" />
                           Agregar ítem
                         </button>
-
-                        <Dialog
-                          open={isItemDialogOpen}
-                          onOpenChange={(isOpen) => {
-                            if (!isOpen) setIsItemDialogOpen(false);
-                            else setIsItemDialogOpen(isOpen);
-                          }}
-                        >
-                          {isItemDialogOpen && (
-                            <div
-                              className="fixed inset-0 z-40 bg-slate-950/50 backdrop-blur-[2px]"
-                              aria-hidden="true"
-                              onClick={() => setIsItemDialogOpen(false)}
-                            />
-                          )}
-                          <DialogContent className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
-                            <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
-                              <div className="border-b border-slate-200 px-5 py-3">
-                                <h2 className="text-lg font-bold">Agregar ítem</h2>
-                                <p className="text-sm text-slate-500">
-                                  Subtotal:{" "}
-                                  {formatMoney(
-                                    (toNumber(itemDraft.qty) ?? 0) * (toNumber(itemDraft.unit_price) ?? 0),
-                                  )}
-                                </p>
-                              </div>
-                              <div className="flex flex-col gap-3 px-5 py-3">
-                                <div>
-                                  <p className="mb-2 text-sm font-medium">Tipo</p>
-                                  <div className="grid grid-cols-3 gap-2" role="group" aria-label="Tipo de ítem">
-                                    {(
-                                      [
-                                        ["producto", "Producto"],
-                                        ["servicio", "Servicio"],
-                                        ["custom", "Personalizado"],
-                                      ] as Array<[ItemDraft["item_type"], string]>
-                                    ).map(([type, label]) => (
-                                      <button
-                                        key={type}
-                                        type="button"
-                                        aria-pressed={itemDraft.item_type === type}
-                                        onClick={() =>
-                                          patchDraft({
-                                            item_type: type,
-                                            ref_id: "",
-                                            custom_name: "",
-                                            unit_price: "",
-                                            no_commission: type !== "producto",
-                                            commission_value: null,
-                                          })
-                                        }
-                                        className={
-                                          itemDraft.item_type === type
-                                            ? "h-9 rounded-md bg-slate-900 text-sm font-semibold text-white"
-                                            : "h-9 rounded-md border border-slate-300 text-sm font-medium text-slate-700 hover:bg-slate-100"
-                                        }
-                                      >
-                                        {label}
-                                      </button>
-                                    ))}
-                                  </div>
-                                </div>
-                                {itemDraft.item_type === "producto" && (
-                                  <div>
-                                    <p className="mb-1 text-sm font-medium">
-                                      Producto <span className="text-xs font-normal text-emerald-700">puede llevar comisión</span>
-                                    </p>
-                                    <Combobox
-                                      value={itemDraft.ref_id}
-                                      onValueChange={(value) => {
-                                        patchDraft({ ref_id: value });
-                                        autofillDraftPrice("producto", value);
-                                      }}
-                                      placeholder="Buscar producto…"
-                                      options={props.products
-                                        .filter((row) => row.is_active)
-                                        .map((row) => ({
-                                          value: row.id,
-                                          label: row.name,
-                                          description: `Stock: ${row.stock_qty}`,
-                                        }))}
-                                      ariaLabel="Producto del ítem"
-                                      filterPlaceholder="Escriba para filtrar…"
-                                    />
-                                  </div>
-                                )}
-                                {itemDraft.item_type === "servicio" && (
-                                  <div>
-                                    <p className="mb-1 text-sm font-medium">
-                                      Servicio <span className="text-xs font-normal text-slate-500">sin comisión</span>
-                                    </p>
-                                    <Combobox
-                                      value={itemDraft.ref_id}
-                                      onValueChange={(value) => {
-                                        patchDraft({ ref_id: value });
-                                        autofillDraftPrice("servicio", value);
-                                      }}
-                                      placeholder="Buscar servicio…"
-                                      options={props.services
-                                        .filter((row) => row.is_active)
-                                        .map((row) => ({ value: row.id, label: row.name }))}
-                                      ariaLabel="Servicio del ítem"
-                                      filterPlaceholder="Escriba para filtrar…"
-                                    />
-                                  </div>
-                                )}
-                                {itemDraft.item_type === "custom" && (
-                                  <label className="flex flex-col gap-1 text-sm font-medium">
-                                    Descripción
-                                    <input
-                                      className={paperInputClass}
-                                      value={itemDraft.custom_name}
-                                      onChange={(event) => patchDraft({ custom_name: event.target.value })}
-                                      placeholder="Ej. Peinado novia"
-                                    />
-                                  </label>
-                                )}
-                                <div>
-                                  <p className="mb-1 text-sm font-medium">Empleado que atiende</p>
-                                  <Combobox
-                                    value={itemDraft.employee_id}
-                                    onValueChange={(value) => patchDraft({ employee_id: value })}
-                                    placeholder="Buscar empleado…"
-                                    options={props.employees
-                                      .filter((row) => row.is_active)
-                                      .map((row) => ({
-                                        value: row.id,
-                                        label: row.full_name,
-                                        description: row.employee_code
-                                          ? `ID ${row.employee_code}`
-                                          : undefined,
-                                      }))}
-                                    ariaLabel="Empleado del ítem"
-                                    filterPlaceholder="Escriba para filtrar…"
-                                  />
-                                </div>
-                                <div className="grid grid-cols-2 gap-4">
-                                  <label className="flex flex-col gap-1 text-sm font-medium">
-                                    Cantidad
-                                    <input
-                                      className={paperInputClass}
-                                      value={itemDraft.qty}
-                                      onChange={(event) => patchDraft({ qty: event.target.value })}
-                                      placeholder="1"
-                                      inputMode="numeric"
-                                    />
-                                  </label>
-                                  <label className="flex flex-col gap-1 text-sm font-medium">
-                                    Precio unitario
-                                    <input
-                                      className={paperInputClass}
-                                      value={formatMoneyInput(itemDraft.unit_price)}
-                                      onChange={(event) =>
-                                        patchDraft({ unit_price: stripMoneyInput(event.target.value) })
-                                      }
-                                      placeholder="0"
-                                      inputMode="numeric"
-                                    />
-                                  </label>
-                                </div>
-                                {itemDraft.item_type === "producto" && (
-                                  <label className="flex items-center gap-2 text-sm">
-                                    <input
-                                      type="checkbox"
-                                      checked={!itemDraft.no_commission}
-                                      onChange={(event) =>
-                                        patchDraft({ no_commission: !event.target.checked })
-                                      }
-                                      className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
-                                    />
-                                    <span className="text-slate-700">¿Tiene comisión?</span>
-                                  </label>
-                                )}
-                                {itemDraft.item_type === "custom" && (
-                                  <div className="flex flex-col gap-2">
-                                    <label className="flex items-center gap-2 text-sm">
-                                      <input
-                                        type="checkbox"
-                                        checked={!itemDraft.no_commission}
-                                        onChange={(event) =>
-                                          patchDraft({
-                                            no_commission: !event.target.checked,
-                                            commission_value: null,
-                                          })
-                                        }
-                                        className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
-                                      />
-                                      <span className="text-slate-700">¿Tiene comisión?</span>
-                                    </label>
-                                    {!itemDraft.no_commission && (
-                                      <label className="flex flex-col gap-1 text-sm font-medium">
-                                        Valor de la comisión ($)
-                                        <input
-                                          type="number"
-                                          className={paperInputClass}
-                                          value={itemDraft.commission_value ?? ""}
-                                          onChange={(event) =>
-                                            patchDraft({
-                                              commission_value:
-                                                event.target.value === "" ? null : Number(event.target.value),
-                                            })
-                                          }
-                                          placeholder="Ej. 10000"
-                                          min={0}
-                                          step={100}
-                                          inputMode="decimal"
-                                        />
-                                      </label>
-                                    )}
-                                  </div>
-                                )}
-                                {itemError && (
-                                  <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
-                                    {itemError}
-                                  </p>
-                                )}
-                              </div>
-                              <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-5 py-3">
-                                <button
-                                  type="button"
-                                  onClick={() => setIsItemDialogOpen(false)}
-                                  className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100"
-                                >
-                                  Cancelar
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={addItemFromDialog}
-                                  className="h-10 rounded-md bg-slate-900 px-6 text-sm font-semibold text-white hover:bg-slate-700"
-                                >
-                                  Agregar a la factura
-                                </button>
-                              </div>
-                            </div>
-                          </DialogContent>
-                        </Dialog>
 
                         <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500">
                           Cobro inmediato (opcional)
@@ -1452,10 +1253,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 </span>
                 <span>{statusPill(row.status)}</span>
                 <span className="flex items-center gap-1 sm:justify-center">
-                  {props.canAnnul && (
+                  {row.status !== "Anulada" &&
+                    (props.isAdmin ||
+                      (props.canWrite &&
+                        row.status === "Emitida" &&
+                        row.user_id === props.currentUserId)) && (
                     <button
                       type="button"
-                      title="Editar factura (solo admin, con motivo)"
+                      title={
+                        row.status === "Emitida"
+                          ? "Editar factura emitida (el total se recalcula)"
+                          : "Editar factura (solo admin, con motivo)"
+                      }
                       aria-label={`Editar factura ${row.consecutive_number}`}
                       onClick={() => openEdit(row.id)}
                       className="rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
@@ -1731,7 +1540,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     </DialogContent>
                     </Dialog>
                   )}
-                  {props.canAnnul && (
+                  {row.status !== "Anulada" &&
+                    (props.isAdmin ||
+                      (props.canWrite &&
+                        row.status === "Emitida" &&
+                        row.user_id === props.currentUserId)) && (
                     <Dialog
                       open={isEditDialogOpen}
                       onOpenChange={(isOpen) => {
@@ -1744,7 +1557,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             <div className="flex flex-wrap items-start justify-between gap-4">
                               <div>
                                 <p className="text-xl font-black tracking-tight">ORABELLA</p>
-                                <p className="text-xs text-slate-500">Edición con motivo y auditoría</p>
+                                <p className="text-xs text-slate-500">
+                                  {isFreeEdit
+                                    ? "Edición libre de emitida (sin motivo, el total se recalcula)"
+                                    : "Edición con motivo y auditoría"}
+                                </p>
                               </div>
                               <div className="text-right">
                                 <h2 className="text-lg font-bold">
@@ -1752,22 +1569,26 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 </h2>
                                 <p className="mt-1 text-sm">
                                   <span className="inline-block rounded-full bg-blue-100 px-2 py-0.5 text-xs font-semibold text-blue-800">
-                                    Total inmutable: {detail ? formatMoney(detail.invoice.total) : "—"}
+                                    {isFreeEdit
+                                      ? `Total anterior: ${detail ? formatMoney(detail.invoice.total) : "—"} (se recalcula)`
+                                      : `Total inmutable: ${detail ? formatMoney(detail.invoice.total) : "—"}`}
                                   </span>
                                 </p>
                               </div>
                             </div>
                           </div>
                           <div className="flex flex-col gap-5 px-6 py-5 sm:px-8">
-                            <label className="flex flex-col gap-1 text-sm font-medium">
-                              Motivo de la edición (obligatorio, queda auditado)
-                              <input
-                                className={paperInputClass}
-                                value={editMotivo}
-                                onChange={(event) => setEditMotivo(event.target.value)}
-                                placeholder="Ej. Servicio mal depreciado: se ajusta y agrega kit"
-                              />
-                            </label>
+                            {!isFreeEdit && (
+                              <label className="flex flex-col gap-1 text-sm font-medium">
+                                Motivo de la edición (obligatorio, queda auditado)
+                                <input
+                                  className={paperInputClass}
+                                  value={editMotivo}
+                                  onChange={(event) => setEditMotivo(event.target.value)}
+                                  placeholder="Ej. Servicio mal depreciado: se ajusta y agrega kit"
+                                />
+                              </label>
+                            )}
                             <div className="overflow-x-auto rounded-lg border border-slate-200">
                               <table className="w-full min-w-[860px] text-left text-sm text-slate-900">
                                 <thead>
@@ -1942,12 +1763,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             </div>
                             <button
                               type="button"
-                              onClick={() => setEditItems((prev) => [...prev, { ...emptyItem(), discount: 0 }])}
+                              onClick={() => openItemDialog("edit")}
                               className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 text-sm font-medium text-slate-600 hover:bg-slate-50"
                             >
                               <Plus className="h-4 w-4" aria-hidden="true" />
                               Agregar ítem
                             </button>
+                            {!isFreeEdit && (
                             <div>
                               <h3 className="mb-2 text-sm font-bold uppercase tracking-wide text-slate-500">
                                 Cobros (solo cambia el método, montos intactos)
@@ -1997,6 +1819,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 })}
                               </div>
                             </div>
+                            )}
+                            {isFreeEdit ? (
+                              <div className="rounded-md bg-blue-50 px-3 py-2 text-sm text-slate-900">
+                                <p>
+                                  Subtotal nuevo: {formatMoney(editSubtotal)} (antes{" "}
+                                  {detail ? formatMoney(detail.invoice.subtotal) : "—"})
+                                </p>
+                                <p className="font-semibold">
+                                  Nuevo total estimado: {formatMoney(freeEditTotal)}
+                                </p>
+                              </div>
+                            ) : (
                             <div className="rounded-md bg-slate-50 px-3 py-2 text-sm text-slate-900">
                               <p>
                                 Subtotal: {formatMoney(editSubtotal)} / emitido{" "}
@@ -2013,6 +1847,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 TOTAL intacto: {detail ? formatMoney(detail.invoice.total) : "—"}
                               </p>
                             </div>
+                            )}
                             {editError && (
                               <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
                                 {editError}
@@ -2031,7 +1866,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               type="button"
                               onClick={submitEdit}
                               disabled={!canSaveEdit}
-                              title={!canSaveEdit ? "Cuadre subtotal, recargo y motivo para guardar" : undefined}
+                              title={
+                                !canSaveEdit
+                                  ? isFreeEdit
+                                    ? "Agregue al menos un ítem válido para guardar"
+                                    : "Cuadre subtotal, recargo y motivo para guardar"
+                                  : undefined
+                              }
                               className="h-10 rounded-md bg-slate-900 px-6 text-sm font-semibold text-white hover:bg-slate-700 disabled:opacity-50"
                             >
                               {busy ? "Guardando…" : "Guardar edición"}
@@ -2086,6 +1927,246 @@ export function InvoicesClient(props: InvoicesClientProps) {
           {notice}
         </p>
       )}
+
+      {/* Modal de ítems generalizado: crear (borrador) y edición libre de
+          EMITIDAS (agrega a la edición). Nivel raíz para no anidarse. */}
+      <Dialog
+        open={isItemDialogOpen}
+        onOpenChange={(isOpen) => {
+          if (!isOpen) setIsItemDialogOpen(false);
+          else setIsItemDialogOpen(isOpen);
+        }}
+      >
+        {isItemDialogOpen && (
+          <div
+            className="fixed inset-0 z-40 bg-slate-950/50 backdrop-blur-[2px]"
+            aria-hidden="true"
+            onClick={() => setIsItemDialogOpen(false)}
+          />
+        )}
+        <DialogContent className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+          <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
+            <div className="border-b border-slate-200 px-5 py-3">
+              <h2 className="text-lg font-bold">
+                {itemDialogTarget === "edit" ? "Agregar ítem a la edición" : "Agregar ítem"}
+              </h2>
+              <p className="text-sm text-slate-500">
+                Subtotal:{" "}
+                {formatMoney(
+                  (toNumber(itemDraft.qty) ?? 0) * (toNumber(itemDraft.unit_price) ?? 0),
+                )}
+              </p>
+            </div>
+            <div className="flex flex-col gap-3 px-5 py-3">
+              <div>
+                <p className="mb-2 text-sm font-medium">Tipo</p>
+                <div className="grid grid-cols-3 gap-2" role="group" aria-label="Tipo de ítem">
+                  {(
+                    [
+                      ["producto", "Producto"],
+                      ["servicio", "Servicio"],
+                      ["custom", "Personalizado"],
+                    ] as Array<[ItemDraft["item_type"], string]>
+                  ).map(([type, label]) => (
+                    <button
+                      key={type}
+                      type="button"
+                      aria-pressed={itemDraft.item_type === type}
+                      onClick={() =>
+                        patchDraft({
+                          item_type: type,
+                          ref_id: "",
+                          custom_name: "",
+                          unit_price: "",
+                          no_commission: type !== "producto",
+                          commission_value: null,
+                        })
+                      }
+                      className={
+                        itemDraft.item_type === type
+                          ? "h-9 rounded-md bg-slate-900 text-sm font-semibold text-white"
+                          : "h-9 rounded-md border border-slate-300 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                      }
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {itemDraft.item_type === "producto" && (
+                <div>
+                  <p className="mb-1 text-sm font-medium">
+                    Producto <span className="text-xs font-normal text-emerald-700">puede llevar comisión</span>
+                  </p>
+                  <Combobox
+                    value={itemDraft.ref_id}
+                    onValueChange={(value) => {
+                      patchDraft({ ref_id: value });
+                      autofillDraftPrice("producto", value);
+                    }}
+                    placeholder="Buscar producto…"
+                    options={props.products
+                      .filter((row) => row.is_active)
+                      .map((row) => ({
+                        value: row.id,
+                        label: row.name,
+                        description: `Stock: ${row.stock_qty}`,
+                      }))}
+                    ariaLabel="Producto del ítem"
+                    filterPlaceholder="Escriba para filtrar…"
+                  />
+                </div>
+              )}
+              {itemDraft.item_type === "servicio" && (
+                <div>
+                  <p className="mb-1 text-sm font-medium">
+                    Servicio <span className="text-xs font-normal text-slate-500">sin comisión</span>
+                  </p>
+                  <Combobox
+                    value={itemDraft.ref_id}
+                    onValueChange={(value) => {
+                      patchDraft({ ref_id: value });
+                      autofillDraftPrice("servicio", value);
+                    }}
+                    placeholder="Buscar servicio…"
+                    options={props.services
+                      .filter((row) => row.is_active)
+                      .map((row) => ({ value: row.id, label: row.name }))}
+                    ariaLabel="Servicio del ítem"
+                    filterPlaceholder="Escriba para filtrar…"
+                  />
+                </div>
+              )}
+              {itemDraft.item_type === "custom" && (
+                <label className="flex flex-col gap-1 text-sm font-medium">
+                  Descripción
+                  <input
+                    className={paperInputClass}
+                    value={itemDraft.custom_name}
+                    onChange={(event) => patchDraft({ custom_name: event.target.value })}
+                    placeholder="Ej. Peinado novia"
+                  />
+                </label>
+              )}
+              <div>
+                <p className="mb-1 text-sm font-medium">Empleado que atiende</p>
+                <Combobox
+                  value={itemDraft.employee_id}
+                  onValueChange={(value) => patchDraft({ employee_id: value })}
+                  placeholder="Buscar empleado…"
+                  options={props.employees
+                    .filter((row) => row.is_active)
+                    .map((row) => ({
+                      value: row.id,
+                      label: row.full_name,
+                      description: row.employee_code
+                        ? `ID ${row.employee_code}`
+                        : undefined,
+                    }))}
+                  ariaLabel="Empleado del ítem"
+                  filterPlaceholder="Escriba para filtrar…"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <label className="flex flex-col gap-1 text-sm font-medium">
+                  Cantidad
+                  <input
+                    className={paperInputClass}
+                    value={itemDraft.qty}
+                    onChange={(event) => patchDraft({ qty: event.target.value })}
+                    placeholder="1"
+                    inputMode="numeric"
+                  />
+                </label>
+                <label className="flex flex-col gap-1 text-sm font-medium">
+                  Precio unitario
+                  <input
+                    className={paperInputClass}
+                    value={formatMoneyInput(itemDraft.unit_price)}
+                    onChange={(event) =>
+                      patchDraft({ unit_price: stripMoneyInput(event.target.value) })
+                    }
+                    placeholder="0"
+                    inputMode="numeric"
+                  />
+                </label>
+              </div>
+              {itemDraft.item_type === "producto" && (
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={!itemDraft.no_commission}
+                    onChange={(event) =>
+                      patchDraft({ no_commission: !event.target.checked })
+                    }
+                    className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                  />
+                  <span className="text-slate-700">¿Tiene comisión?</span>
+                </label>
+              )}
+              {itemDraft.item_type === "custom" && (
+                <div className="flex flex-col gap-2">
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={!itemDraft.no_commission}
+                      onChange={(event) =>
+                        patchDraft({
+                          no_commission: !event.target.checked,
+                          commission_value: null,
+                        })
+                      }
+                      className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                    />
+                    <span className="text-slate-700">¿Tiene comisión?</span>
+                  </label>
+                  {!itemDraft.no_commission && (
+                    <label className="flex flex-col gap-1 text-sm font-medium">
+                      Valor de la comisión ($)
+                      <input
+                        type="number"
+                        className={paperInputClass}
+                        value={itemDraft.commission_value ?? ""}
+                        onChange={(event) =>
+                          patchDraft({
+                            commission_value:
+                              event.target.value === "" ? null : Number(event.target.value),
+                          })
+                        }
+                        placeholder="Ej. 10000"
+                        min={0}
+                        step={100}
+                        inputMode="decimal"
+                      />
+                    </label>
+                  )}
+                </div>
+              )}
+              {itemError && (
+                <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+                  {itemError}
+                </p>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-5 py-3">
+              <button
+                type="button"
+                onClick={() => setIsItemDialogOpen(false)}
+                className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={addItemFromDialog}
+                className="h-10 rounded-md bg-slate-900 px-6 text-sm font-semibold text-white hover:bg-slate-700"
+              >
+                {itemDialogTarget === "edit" ? "Agregar a la edición" : "Agregar a la factura"}
+              </button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Confirmación clásica: ¿Está seguro? … OK/Cancelar. */}
       <Dialog

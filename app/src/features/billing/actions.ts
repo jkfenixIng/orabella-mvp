@@ -9,6 +9,7 @@ import {
   annulInvoice,
   countInvoices,
   createInvoice,
+  editEmittedInvoiceItems,
   editInvoiceItems,
   getInvoiceDetail,
   listInvoices,
@@ -103,6 +104,21 @@ export async function editInvoiceAction(id: string, input: unknown) {
   try {
     const session = await requireAdminSession(await sessionToken());
     const data = await editInvoiceItems(session.sedeId, id, input, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+      roles: session.roles,
+    });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Edición LIBRE de factura EMITIDA (cajera del turno sin motivo, total se recalcula; el servicio refuerza). */
+export async function editEmittedInvoiceAction(id: string, input: unknown) {
+  try {
+    const session = await requireBillingWriter(await sessionToken());
+    const data = await editEmittedInvoiceItems(session.sedeId, id, input, {
       userId: session.userId,
       sedeId: session.sedeId,
       roles: session.roles,

@@ -124,6 +124,20 @@ export const editInvoiceSchema = z.object({
 });
 export type EditInvoiceInput = z.infer<typeof editInvoiceSchema>;
 
+/**
+ * Edición libre de factura EMITIDA (cajera del turno, sin motivo): agrega,
+ * quita o cambia ítems, cantidades y precios. El total SE recalcula (a
+ * diferencia de la edición admin de Pagadas, donde es inmutable). Los cobros
+ * parciales que ya existan se conservan (mismos ids, el método solo puede
+ * cambiar entre iguales recargos para no mover el recargo emitido).
+ */
+export const editEmittedInvoiceSchema = z.object({
+  motivo: z.string().trim().max(500, "Motivo muy largo.").nullish(),
+  items: z.array(editInvoiceItemSchema).min(1, "La factura exige al menos un ítem."),
+  payments: z.array(editInvoicePaymentSchema).default([]),
+});
+export type EditEmittedInvoiceInput = z.infer<typeof editEmittedInvoiceSchema>;
+
 export interface OldInvoiceItem {
   id: string;
   item_type: string;

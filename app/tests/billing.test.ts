@@ -14,6 +14,7 @@ import {
   createInvoiceSchema,
   diffInvoiceItems,
   assertEditReconciles,
+  editEmittedInvoiceSchema,
   editInvoiceSchema,
   type EditInvoiceItemInput,
   moneyEquals,
@@ -480,6 +481,43 @@ describe("billing: edición con total inmutable y motivo (admin)", () => {
         items: [{ ...OLD, id: "item-9" }],
         payments: [{ id: "no-uuid", method_code: "efectivo" }],
       }).success,
+    ).toBe(false);
+  });
+});
+
+describe("billing: edición libre de emitida sin motivo (cajera del turno)", () => {
+  const OLD: EditInvoiceItemInput & { id: string } = {
+    id: "99999999-9999-4999-8999-999999999999",
+    item_type: "servicio",
+    product_id: null,
+    service_id: SERVICE_ID,
+    custom_name: null,
+    employee_id: EMPLOYEE_ID,
+    qty: 1,
+    unit_price: 120000,
+    discount: 0,
+    no_commission: false,
+    commission_value: null,
+  };
+
+  it("acepta sin motivo (el total se recalcula en el servidor)", () => {
+    expect(editEmittedInvoiceSchema.safeParse({ items: [OLD], payments: [] }).success).toBe(true);
+    expect(
+      editEmittedInvoiceSchema.safeParse({ motivo: null, items: [OLD], payments: [] }).success,
+    ).toBe(true);
+  });
+
+  it("acepta motivo opcional de override ligero y exige al menos un ítem", () => {
+    expect(
+      editEmittedInvoiceSchema.safeParse({ motivo: "Ajuste admin", items: [OLD], payments: [] }).success,
+    ).toBe(true);
+    expect(editEmittedInvoiceSchema.safeParse({ payments: [] }).success).toBe(false);
+    expect(editEmittedInvoiceSchema.safeParse({ items: [], payments: [] }).success).toBe(false);
+  });
+
+  it("rechaza motivo demasiado largo", () => {
+    expect(
+      editEmittedInvoiceSchema.safeParse({ motivo: "x".repeat(501), items: [OLD], payments: [] }).success,
     ).toBe(false);
   });
 });
