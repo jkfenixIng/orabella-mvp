@@ -476,7 +476,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   <Plus className="h-4 w-4" aria-hidden="true" />
                   Emitir factura
                 </button>
-                <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                <DialogContent className="max-w-5xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
                   <div className="rounded-xl bg-white text-slate-900 shadow-2xl">
                     <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
                       <div className="flex flex-wrap items-start justify-between gap-4">
@@ -1087,7 +1087,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       Ver detalle
                     </button>
                   {detail && (
-                    <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                    <DialogContent className="max-w-4xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
                       <div className="rounded-xl bg-white text-slate-900 shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
                         <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
                           <div className="flex flex-wrap items-start justify-between gap-4">
