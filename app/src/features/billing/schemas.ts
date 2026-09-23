@@ -100,6 +100,126 @@ export const annulInvoiceSchema = z.object({
 });
 export type AnnulInvoiceInput = z.infer<typeof annulInvoiceSchema>;
 
+/**
+ * Edición admin de factura (total inmutable): cambia ítems y métodos de
+ * pago con motivo obligatorio. Los ítems llevan `id` cuando son filas
+ * existentes (sin id = fila nueva; ids viejos ausentes = eliminadas).
+ * Los pagos conservan montos: solo puede cambiar el método.
+ */
+export const editInvoiceItemSchema = invoiceItemSchema.extend({
+  id: uuidSchema.optional(),
+});
+export type EditInvoiceItemInput = z.infer<typeof editInvoiceItemSchema>;
+
+export const editInvoicePaymentSchema = z.object({
+  id: uuidSchema,
+  method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
+});
+export type EditInvoicePaymentInput = z.infer<typeof editInvoicePaymentSchema>;
+
+export const editInvoiceSchema = z.object({
+  motivo: z.string().trim().min(1, "El motivo de edición es requerido.").max(500, "Motivo muy largo."),
+  items: z.array(editInvoiceItemSchema).min(1, "La factura exige al menos un ítem."),
+  payments: z.array(editInvoicePaymentSchema).default([]),
+});
+export type EditInvoiceInput = z.infer<typeof editInvoiceSchema>;
+
+export interface OldInvoiceItem {
+  id: string;
+  item_type: string;
+  product_id?: string | null | undefined;
+  service_id?: string | null | undefined;
+  custom_name?: string | null | undefined;
+  employee_id: string;
+  qty: number;
+  unit_price: number;
+  discount: number;
+  no_commission: boolean | null | undefined;
+  commission_value: number | null | undefined;
+}
+
+export interface InvoiceItemsDiff {
+  added: EditInvoiceItemInput[];
+  removed: OldInvoiceItem[];
+  changed: Array<{ old: OldInvoiceItem; next: EditInvoiceItemInput }>;
+  /** Toca quién cobra o cuánto (empleado, comisión, cant., precio). */
+  payTouched: boolean;
+}
+
+/** Diferencia ítems viejos vs nuevos por id (puros, sin BD). */
+export function diffInvoiceItems(oldItems: OldInvoiceItem[], nextItems: EditInvoiceItemInput[]): InvoiceItemsDiff {
+  const oldById = new Map(oldItems.map((row) => [row.id, row]));
+  const seen = new Set<string>();
+  const added: EditInvoiceItemInput[] = [];
+  const changed: Array<{ old: OldInvoiceItem; next: EditInvoiceItemInput }> = [];
+  let payTouched = false;
+  const same = (a: number | null | undefined, b: number | null | undefined): boolean => (a ?? 0) === (b ?? 0);
+  for (const next of nextItems) {
+    if (!next.id || !oldById.has(next.id)) {
+      added.push(next);
+      payTouched = true;
+      continue;
+    }
+    seen.add(next.id);
+    const old = oldById.get(next.id) as OldInvoiceItem;
+    const equal =
+      old.item_type === next.item_type &&
+      (old.product_id ?? null) === (next.product_id ?? null) &&
+      (old.service_id ?? null) === (next.service_id ?? null) &&
+      (old.custom_name ?? null) === (next.custom_name?.trim() || null) &&
+      old.employee_id === next.employee_id &&
+      Number(old.qty) === Number(next.qty) &&
+      Number(old.unit_price) === Number(next.unit_price) &&
+      Number(old.discount) === Number(next.discount) &&
+      Boolean(old.no_commission) === Boolean(next.no_commission) &&
+      same(old.commission_value, next.commission_value ?? null);
+    if (!equal) {
+      changed.push({ old, next });
+      if (
+        old.employee_id !== next.employee_id ||
+        Boolean(old.no_commission) !== Boolean(next.no_commission) ||
+        !same(old.commission_value, next.commission_value ?? null) ||
+        Number(old.qty) !== Number(next.qty) ||
+        Number(old.unit_price) !== Number(next.unit_price)
+      ) {
+        payTouched = true;
+      }
+    }
+  }
+  const removed = oldItems.filter((row) => !seen.has(row.id));
+  if (removed.length > 0 || added.length > 0) payTouched = true;
+  return { added, removed, changed, payTouched };
+}
+
+/** Subtotal de un borrador de edición (puros). */
+export function editItemsSubtotal(items: Array<{ qty: number; unit_price: number; discount: number }>): number {
+  return roundMoney(items.reduce((acc, item) => acc + computeLineSubtotal(item).subtotal, 0));
+}
+
+/**
+ * Regla de oro de la edición: el total NO se toca. Con descuento fijo e
+ * impuestos snapshot intactos, basta exigir mismo subtotal y mismo recargo.
+ * Lanza TOTAL_MISMATCH si no cuadra.
+ */
+export function assertEditReconciles(args: {
+  oldSubtotal: number;
+  newSubtotal: number;
+  oldSurcharge: number;
+  newSurcharge: number;
+  oldTotal: number;
+}): void {
+  if (!moneyEquals(args.newSubtotal, args.oldSubtotal)) {
+    throw new Error(
+      `TOTAL_MISMATCH: el nuevo subtotal (${args.newSubtotal}) debe igualar al emitido (${args.oldSubtotal}). Ajuste cantidades/precios.`,
+    );
+  }
+  if (!moneyEquals(args.newSurcharge, args.oldSurcharge)) {
+    throw new Error(
+      `TOTAL_MISMATCH: el recargo resultante (${args.newSurcharge}) debe igualar al emitido (${args.oldSurcharge}). Use métodos con igual recargo.`,
+    );
+  }
+}
+
 /** FAC-07: cobro dividido (las porciones deben cuadrar con el saldo). */
 export const splitPaymentSchema = z.object({
   portions: z.array(paymentPortionSchema).min(1, "Indique al menos una porción de pago."),

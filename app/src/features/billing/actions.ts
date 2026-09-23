@@ -3,12 +3,13 @@
 import { cookies } from "next/headers";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { resolveSede } from "@/src/shared/lib/sede";
-import { requireSession } from "@/src/features/admin/service";
+import { requireAdminSession, requireSession } from "@/src/features/admin/service";
 import {
   BillingError,
   annulInvoice,
   countInvoices,
   createInvoice,
+  editInvoiceItems,
   getInvoiceDetail,
   listInvoices,
   requireBillingWriter,
@@ -90,6 +91,21 @@ export async function createInvoiceAction(input: unknown) {
     const data = await createInvoice(input, {
       userId: session.userId,
       sedeId: session.sedeId,
+    });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Edición admin de factura con motivo (solo admin; el servicio refuerza). */
+export async function editInvoiceAction(id: string, input: unknown) {
+  try {
+    const session = await requireAdminSession(await sessionToken());
+    const data = await editInvoiceItems(session.sedeId, id, input, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+      roles: session.roles,
     });
     return { success: true as const, data };
   } catch (error) {

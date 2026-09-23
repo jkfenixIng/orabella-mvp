@@ -1,12 +1,17 @@
 import {
   annulInvoiceSchema,
+  assertEditReconciles,
   buildInvoiceOutReason,
   buildReversalReasons,
   canAnnulStatus,
   computeCardFees,
   computeInvoiceTotals,
+  computeLineSubtotal,
   createInvoiceSchema,
   annulBlockedMessage,
+  diffInvoiceItems,
+  editInvoiceSchema,
+  editItemsSubtotal,
   moneyEquals,
   MONEY_EPSILON,
   portionsMatchBalance,
@@ -28,7 +33,7 @@ import {
 } from "@/src/features/inventory/service";
 import { applyMovementStock } from "@/src/features/inventory/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
-import { getOpenShiftWithOpener } from "@/src/features/cash/service";
+import { getOpenShift, getOpenShiftWithOpener } from "@/src/features/cash/service";
 
 export class BillingError extends Error {
   readonly code: string;
@@ -135,6 +140,7 @@ export interface InvoicePaymentRow {
   amount: number;
   fee_percent: number;
   fee_amount: number;
+  cash_shift_id: string | null;
   created_at: string;
 }
 
@@ -152,7 +158,7 @@ const INVOICE_SELECT =
 const ITEM_SELECT =
   "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission, commission_value, employees!inner(full_name, employee_code)";
 const TAX_SELECT = "id, invoice_id, tax_code, tax_name, percent, amount";
-const PAYMENT_SELECT = "id, invoice_id, method_id, method_code, amount, fee_percent, fee_amount, created_at";
+const PAYMENT_SELECT = "id, invoice_id, method_id, method_code, amount, fee_percent, fee_amount, cash_shift_id, created_at";
 
 // ----------------------------------------------------------------- lectura ---
 
@@ -699,6 +705,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
           amount: fee.gross,
           fee_percent: fee.feePercent,
           fee_amount: fee.fee,
+          cash_shift_id: cashShiftId,
         })),
       );
       if (paymentsError) {
@@ -821,6 +828,276 @@ export async function annulInvoice(
   return loadDetail(db, updated as InvoiceRow);
 }
 
+// ------------------------------------------------------------------ editar ---
+
+/**
+ * Edición admin de factura (total INMUTABLE): corrige ítems y métodos de
+ * pago con motivo obligatorio. Reglas:
+ * - Empleado/comisión/cant./precio bloqueados si la factura ya entró en
+ *   una nómina cerrada (al que se le pagó no se le toca).
+ * - Nuevo subtotal y recargo deben igualar a los emitidos (si no, se rechaza).
+ * - Cambios de método solo entre iguales recargos.
+ * - ANULADA es terminal: no se edita. Inventario se reajusta por deltas.
+ * - Todo queda en audit_logs con motivo + antes/después.
+ */
+export async function editInvoiceItems(
+  sedeId: string,
+  invoiceId: string,
+  raw: unknown,
+  actor: BillingActor,
+): Promise<InvoiceDetail> {
+  if (!actor.roles?.includes("admin")) {
+    throw new BillingError("FORBIDDEN", "Solo el admin puede editar facturas.", 403);
+  }
+  const parsed = editInvoiceSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new BillingError("VALIDATION", validationMessage(parsed.error), 400);
+  }
+  const input = parsed.data;
+  const motivo = input.motivo.trim();
+  const db = await billingDb();
+
+  const detail = await getInvoiceDetail(sedeId, invoiceId);
+  if (detail.invoice.status === "Anulada") {
+    throw new BillingError("ANNUL_INVALID", "Anulada es terminal: no se edita (emita una nueva).", 409);
+  }
+
+  let refs: ValidatedRefs;
+  try {
+    refs = await loadRefs(actor.sedeId);
+    await validateItemRefs(
+      actor.sedeId,
+      input.items.map((item) => ({
+        item_type: item.item_type,
+        product_id: item.product_id,
+        service_id: item.service_id,
+        custom_name: item.custom_name,
+        employee_id: item.employee_id,
+        qty: item.qty,
+        unit_price: item.unit_price,
+        discount: item.discount,
+        no_commission: item.no_commission,
+        commission_value: item.commission_value,
+      })),
+    );
+  } catch (error) {
+    throw toBillingError(error);
+  }
+
+  // Cobros: mismos ids, solo puede cambiar el método (montos intactos).
+  const oldPayIds = [...detail.payments.map((row) => row.id)].sort();
+  const newPayIds = [...input.payments.map((row) => row.id)].sort();
+  if (JSON.stringify(oldPayIds) !== JSON.stringify(newPayIds)) {
+    throw new BillingError(
+      "VALIDATION",
+      "Los cobros no se agregan ni quitan al editar (solo cambia el método).",
+      400,
+    );
+  }
+  const oldPayById = new Map(detail.payments.map((row) => [row.id, row]));
+  for (const payment of input.payments) {
+    const method = refs.methodByCode.get(payment.method_code);
+    if (!method) {
+      throw new BillingError(
+        "METHOD_INACTIVE",
+        `El método de pago ${payment.method_code} no está activo en esta sede.`,
+        422,
+      );
+    }
+    const old = oldPayById.get(payment.id);
+    if (old && Number(method.feePercent) !== Number(old.fee_percent ?? 0)) {
+      throw new BillingError(
+        "METHOD_FEE_CHANGED",
+        "El nuevo método cambia el recargo y movería el total (inmutable). Use uno con igual recargo.",
+        422,
+      );
+    }
+  }
+
+  const diff = diffInvoiceItems(
+    detail.items.map((row) => ({
+      id: row.id,
+      item_type: row.item_type,
+      product_id: row.product_id,
+      service_id: row.service_id,
+      custom_name: row.custom_name,
+      employee_id: row.employee_id,
+      qty: Number(row.qty),
+      unit_price: Number(row.unit_price),
+      discount: Number(row.discount),
+      no_commission: row.no_commission,
+      commission_value: row.commission_value ?? null,
+    })),
+    input.items,
+  );
+
+  if (diff.payTouched && (await invoiceInClosedPayroll(db, sedeId, invoiceId))) {
+    throw new BillingError(
+      "PAYROLL_LOCKED",
+      "La factura ya entró en una nómina cerrada: al empleado pagado no se le toca (empleado, comisión, cant., precio).",
+      409,
+    );
+  }
+
+  const newSubtotal = editItemsSubtotal(input.items);
+  try {
+    assertEditReconciles({
+      oldSubtotal: Number(detail.invoice.subtotal),
+      newSubtotal,
+      oldSurcharge: Number(detail.invoice.surcharge ?? 0),
+      newSurcharge: Number(detail.invoice.surcharge ?? 0),
+      oldTotal: Number(detail.invoice.total),
+    });
+  } catch (error) {
+    throw toBillingError(error);
+  }
+
+  // Inventario por deltas netos por producto (pre-valida stock antes de mutar).
+  const oldQtyByProduct = new Map<string, number>();
+  for (const row of detail.items) {
+    if (row.item_type === "producto" && row.product_id) {
+      oldQtyByProduct.set(row.product_id, (oldQtyByProduct.get(row.product_id) ?? 0) + Number(row.qty));
+    }
+  }
+  const newQtyByProduct = new Map<string, number>();
+  for (const item of input.items) {
+    if (item.item_type === "producto" && item.product_id) {
+      newQtyByProduct.set(item.product_id, (newQtyByProduct.get(item.product_id) ?? 0) + Number(item.qty));
+    }
+  }
+  const productIds = [...new Set([...oldQtyByProduct.keys(), ...newQtyByProduct.keys()])];
+  if (productIds.length > 0) {
+    const { data: products, error: productsError } = await db
+      .from("products")
+      .select("id, name, stock_qty")
+      .in("id", productIds);
+    if (productsError) throw new BillingError("INTERNAL", "Error interno.", 500);
+    const stockById = new Map(
+      ((products ?? []) as Array<{ id: string; stock_qty: number | string }>).map((row) => [
+        row.id,
+        Number(row.stock_qty),
+      ]),
+    );
+    for (const productId of productIds) {
+      const delta = (newQtyByProduct.get(productId) ?? 0) - (oldQtyByProduct.get(productId) ?? 0);
+      if (delta > 0) {
+        try {
+          applyMovementStock(stockById.get(productId) ?? 0, "OUT", delta);
+        } catch {
+          throw new BillingError("INSUFFICIENT_STOCK", "Stock insuficiente para el ajuste.", 409);
+        }
+      }
+    }
+  }
+
+  // Aplica: borra, actualiza, inserta, métodos, inventario, auditoría.
+  const editReason = `Ajuste edición factura #${detail.invoice.consecutive_number} — ${motivo.slice(0, 200)}`;
+  try {
+    for (const row of diff.removed) {
+      const { error } = await db.from("invoice_items").delete().eq("id", row.id);
+      if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
+    }
+    for (const { old, next } of diff.changed) {
+      const line = computeLineSubtotal({ qty: next.qty, unit_price: next.unit_price, discount: next.discount });
+      const { error } = await db
+        .from("invoice_items")
+        .update({
+          item_type: next.item_type,
+          product_id: next.product_id ?? null,
+          service_id: next.service_id ?? null,
+          custom_name: next.custom_name?.trim() || null,
+          employee_id: next.employee_id,
+          qty: next.qty,
+          unit_price: next.unit_price,
+          discount: next.discount,
+          no_commission: next.no_commission ?? false,
+          commission_value: next.commission_value ?? null,
+          subtotal: line.subtotal,
+        })
+        .eq("id", old.id);
+      if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
+    }
+    for (const item of diff.added) {
+      const line = computeLineSubtotal({ qty: item.qty, unit_price: item.unit_price, discount: item.discount });
+      const { error } = await db.from("invoice_items").insert({
+        invoice_id: invoiceId,
+        item_type: item.item_type,
+        product_id: item.product_id ?? null,
+        service_id: item.service_id ?? null,
+        custom_name: item.custom_name?.trim() || null,
+        employee_id: item.employee_id,
+        qty: item.qty,
+        unit_price: item.unit_price,
+        discount: item.discount,
+        no_commission: item.no_commission ?? false,
+        commission_value: item.commission_value ?? null,
+        subtotal: line.subtotal,
+      });
+      if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
+    }
+    for (const payment of input.payments) {
+      const method = refs.methodByCode.get(payment.method_code);
+      const { error } = await db
+        .from("invoice_payments")
+        .update({ method_code: payment.method_code, method_id: method?.id ?? null })
+        .eq("id", payment.id);
+      if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
+    }
+    const inventoryMoves: Array<{ product_id: string; qty: number; type: "IN" | "OUT" }> = [];
+    for (const productId of productIds) {
+      const delta = (newQtyByProduct.get(productId) ?? 0) - (oldQtyByProduct.get(productId) ?? 0);
+      if (delta === 0) continue;
+      const type = delta > 0 ? "OUT" : "IN";
+      await registerMovement({ product_id: productId, type, qty: Math.abs(delta), reason: editReason }, actor);
+      inventoryMoves.push({ product_id: productId, qty: Math.abs(delta), type });
+    }
+    await writeAudit({
+      sede_id: actor.sedeId,
+      user_id: actor.userId,
+      action: AUDIT_ACTIONS.INVOICE_EDITED,
+      entity: "invoices",
+      entity_id: invoiceId,
+      metadata: {
+        consecutive_number: detail.invoice.consecutive_number,
+        motivo,
+        total: Number(detail.invoice.total),
+        items_before: diff.removed.length + diff.changed.length,
+        items_added: diff.added.length,
+        inventory_moves: inventoryMoves,
+      },
+    });
+  } catch (error) {
+    throw toBillingError(error);
+  }
+  return loadDetail(db, { ...detail.invoice } as InvoiceRow);
+}
+
+/** ¿La factura ya entró en una nómina cerrada? (bloquea tocar al pagado). */
+async function invoiceInClosedPayroll(db: DbClient, sedeId: string, invoiceId: string): Promise<boolean> {
+  const { data: periods, error: periodsError } = await db
+    .from("payroll_periods")
+    .select("id")
+    .eq("sede_id", sedeId)
+    .eq("status", "cerrado")
+    .limit(200);
+  if (periodsError) throw new BillingError("INTERNAL", "Error interno.", 500);
+  const periodIds = ((periods ?? []) as Array<{ id: string }>).map((row) => row.id);
+  if (periodIds.length === 0) return false;
+  const { data: items, error: itemsError } = await db
+    .from("payroll_items")
+    .select("detail_json")
+    .in("period_id", periodIds)
+    .limit(2000);
+  if (itemsError) throw new BillingError("INTERNAL", "Error interno.", 500);
+  return ((items ?? []) as Array<{ detail_json: unknown }>).some(
+    (row) =>
+      Array.isArray(row.detail_json) &&
+      row.detail_json.some(
+        (line) => typeof line === "object" && line !== null && (line as { invoice_id?: string }).invoice_id === invoiceId,
+      ),
+  );
+}
+
 // ------------------------------------------------------------------ cobrar ---
 
 /**
@@ -879,6 +1156,10 @@ export async function splitPayment(
     fullyPaid: detail.paid + grossSum - Number(detail.invoice.total) > -MONEY_EPSILON,
   };
 
+  // El cobro pertenece al turno abierto AHORA (dueño del dinero en caja),
+  // que puede ser otro turno/cajera que el de emisión. Sin turno: null.
+  const payShift = await getOpenShift(sedeId).catch(() => null);
+
   const { error: insertError } = await db.from("invoice_payments").insert(
     fees.map((fee) => ({
       invoice_id: id,
@@ -887,6 +1168,7 @@ export async function splitPayment(
       amount: fee.gross,
       fee_percent: fee.feePercent,
       fee_amount: fee.fee,
+      cash_shift_id: payShift?.id ?? null,
     })),
   );
   if (insertError) throw new BillingError("INTERNAL", "Error interno.", 500);

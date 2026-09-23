@@ -12,6 +12,10 @@ import {
   computeInvoiceTotals,
   computeLineSubtotal,
   createInvoiceSchema,
+  diffInvoiceItems,
+  assertEditReconciles,
+  editInvoiceSchema,
+  type EditInvoiceItemInput,
   moneyEquals,
   nextConsecutiveNumbers,
   portionsMatchBalance,
@@ -402,5 +406,80 @@ describe("migración 005_billing.sql (T5)", () => {
   it("documenta FAC-01…07 y que es factura interna sin DIAN", () => {
     expect(sql).toContain("FAC-05");
     expect(sql).toContain("SIN DIAN");
+  });
+});
+
+// ------------------------------------------------- edición admin ---
+
+describe("billing: edición con total inmutable y motivo (admin)", () => {
+  const OLD: EditInvoiceItemInput & { id: string } = {
+    id: "item-9",
+    item_type: "servicio",
+    product_id: null,
+    service_id: SERVICE_ID,
+    custom_name: null,
+    employee_id: EMPLOYEE_ID,
+    qty: 1,
+    unit_price: 120000,
+    discount: 0,
+    no_commission: false,
+    commission_value: null,
+  };
+
+  it("detecta agregadas, eliminadas, cambiadas y si toca pago", () => {
+    const next = { ...OLD };
+    const added = {
+      item_type: "custom" as const,
+      product_id: null,
+      service_id: null,
+      custom_name: "Kit",
+      employee_id: EMPLOYEE_ID,
+      qty: 1,
+      unit_price: 6000,
+      discount: 0,
+      no_commission: false,
+      commission_value: 6000,
+    };
+    const diff = diffInvoiceItems([OLD], [next, added]);
+    expect(diff.added).toHaveLength(1);
+    expect(diff.removed).toHaveLength(0);
+    expect(diff.changed).toHaveLength(0);
+    expect(diff.payTouched).toBe(true);
+  });
+
+  it("sin cambios no toca pago", () => {
+    const diff = diffInvoiceItems([OLD], [{ ...OLD }]);
+    expect(diff.payTouched).toBe(false);
+    expect(diff.changed).toHaveLength(0);
+  });
+
+  it("cambio de empleado marca payTouched y eliminada también", () => {
+    const other = { ...OLD, id: "item-8", employee_id: "otro-id" };
+    const diff = diffInvoiceItems([OLD, other], [{ ...OLD }]);
+    expect(diff.removed.map((row) => row.id)).toEqual(["item-8"]);
+    expect(diff.payTouched).toBe(true);
+  });
+
+  it("reconcilia solo si subtotal y recargo cuadran", () => {
+    expect(() =>
+      assertEditReconciles({ oldSubtotal: 120000, newSubtotal: 120000, oldSurcharge: 0, newSurcharge: 0, oldTotal: 120000 }),
+    ).not.toThrow();
+    expect(() =>
+      assertEditReconciles({ oldSubtotal: 120000, newSubtotal: 114000, oldSurcharge: 0, newSurcharge: 0, oldTotal: 120000 }),
+    ).toThrowError("TOTAL_MISMATCH");
+    expect(() =>
+      assertEditReconciles({ oldSubtotal: 120000, newSubtotal: 120000, oldSurcharge: 0, newSurcharge: 500, oldTotal: 120000 }),
+    ).toThrowError("TOTAL_MISMATCH");
+  });
+
+  it("el schema exige motivo e ids de cobro existentes", () => {
+    expect(editInvoiceSchema.safeParse({ motivo: "  ", items: [OLD], payments: [] }).success).toBe(false);
+    expect(
+      editInvoiceSchema.safeParse({
+        motivo: "Precio mal digitado",
+        items: [{ ...OLD, id: "item-9" }],
+        payments: [{ id: "no-uuid", method_code: "efectivo" }],
+      }).success,
+    ).toBe(false);
   });
 });

@@ -36,6 +36,7 @@ export const AUDIT_ACTIONS = {
   LOGIN_LOCKED: "auth.login_locked",
   PASSWORD_CHANGED: "auth.password_changed",
   INVOICE_CREATED: "invoice.created",
+  INVOICE_EDITED: "invoice.edited",
   INVOICE_ANNULLED: "invoice.annulled",
   SHIFT_CLOSED: "cash.shift_closed",
   SHIFT_OPEN_MISMATCH: "cash.shift_open_mismatch",
