@@ -352,6 +352,58 @@ async function fetchPayoutTotals(
   return result;
 }
 
+/**
+ * Cobros de factura por turno y método (lo que entra a caja por facturas).
+ * Cada pago pertenece al turno ABIERTO al momento del cobro
+ * (invoice_payments.cash_shift_id); los legacy sin turno se atribuyen al
+ * turno de emisión de su factura. Sin N+1: 3 queries acotadas.
+ */
+async function fetchInvoicePaymentsByShift(
+  db: DbClient,
+  shiftIds: string[],
+): Promise<Map<string, Array<{ invoice_id: string; method_code: string; amount: number }>>> {
+  const result = new Map<string, Array<{ invoice_id: string; method_code: string; amount: number }>>();
+  if (shiftIds.length === 0) return result;
+  const push = (shiftId: string, row: { invoice_id: string; method_code: string; amount: number | string }) => {
+    const list = result.get(shiftId) ?? [];
+    list.push({ invoice_id: row.invoice_id, method_code: row.method_code, amount: Number(row.amount) });
+    result.set(shiftId, list);
+  };
+  const { data: direct, error: directError } = await db
+    .from("invoice_payments")
+    .select("invoice_id, cash_shift_id, method_code, amount")
+    .in("cash_shift_id", shiftIds);
+  if (directError) throw new CashError("INTERNAL", "Error interno.", 500);
+  for (const row of (direct ?? []) as Array<{
+    invoice_id: string;
+    cash_shift_id: string;
+    method_code: string;
+    amount: number | string;
+  }>) {
+    push(row.cash_shift_id, row);
+  }
+  const { data: invoices, error: invoicesError } = await db
+    .from("invoices")
+    .select("id, cash_shift_id")
+    .in("cash_shift_id", shiftIds);
+  if (invoicesError) throw new CashError("INTERNAL", "Error interno.", 500);
+  const shiftByInvoice = new Map(
+    ((invoices ?? []) as Array<{ id: string; cash_shift_id: string }>).map((row) => [row.id, row.cash_shift_id]),
+  );
+  if (shiftByInvoice.size === 0) return result;
+  const { data: legacy, error: legacyError } = await db
+    .from("invoice_payments")
+    .select("invoice_id, method_code, amount")
+    .in("invoice_id", [...shiftByInvoice.keys()])
+    .is("cash_shift_id", null);
+  if (legacyError) throw new CashError("INTERNAL", "Error interno.", 500);
+  for (const row of (legacy ?? []) as Array<{ invoice_id: string; method_code: string; amount: number | string }>) {
+    const shiftId = shiftByInvoice.get(row.invoice_id);
+    if (shiftId) push(shiftId, row);
+  }
+  return result;
+}
+
 async function insertCounts(
   db: DbClient,
   shiftId: string,
@@ -827,35 +879,15 @@ export async function closeShift(
     for (const row of ((payoutRows ?? []) as Array<{ method_code: string; amount: number | string }>)) {
       paidOutByMethod.set(row.method_code, roundMoney((paidOutByMethod.get(row.method_code) ?? 0) + Number(row.amount)));
     }
-    // Facturas del turno: sumar por método de pago (para arqueo y auditoría)
-    let invoicesByMethod = new Map<string, number>();
-    let invoicesTotal = 0;
-    // Deshabilitado temporalmente para debugging
-    // const { data: invoiceRows, error: invoiceError } = await db
-    //   .from("invoices")
-    //   .select("id, total, status, cash_shift_id")
-    //   .eq("cash_shift_id", shift.id);
-    // if (invoiceError) throw new CashError("INTERNAL", "Error interno.", 500);
-    // const invoiceIds = (invoiceRows ?? []).map((inv) => inv.id);
-    // let invoicesByMethod = new Map<string, number>();
-    // let invoicesTotal = 0;
-    // if (invoiceIds.length > 0) {
-    //   const { data: payRows, error: payError } = await db
-    //     .from("invoice_payments")
-    //     .select("invoice_id, method_code, amount")
-    //     .in("invoice_id", invoiceIds);
-    //   if (payError) throw new CashError("INTERNAL", "Error interno.", 500);
-    //   const invoicesById = new Map<string, number>();
-    //   for (const inv of (invoiceRows ?? []) as Array<{ id: string; total: number; status: string; cash_shift_id: string | null }>) {
-    //     if (inv.cash_shift_id !== shift.id) continue;
-    //     invoicesTotal += Number(inv.total);
-    //     invoicesById.set(inv.id, Number(inv.total));
-    //   }
-    //   for (const pay of (payRows ?? []) as Array<{ invoice_id: string; method_code: string; amount: number }>) {
-    //     if (!invoicesById.has(pay.invoice_id)) continue;
-    //     invoicesByMethod.set(pay.method_code, roundMoney((invoicesByMethod.get(pay.method_code) ?? 0) + Number(pay.amount)));
-    //   }
-    // }
+    // Facturas cobradas en este turno (emitidas aquí o en turnos anteriores):
+    // suman al esperado y al arqueo por método, igual que `payments`.
+    const invoicePayMaps = await fetchInvoicePaymentsByShift(db, [shift.id]);
+    const invoicePays = invoicePayMaps.get(shift.id) ?? [];
+    for (const row of invoicePays) {
+      paidByMethod.set(row.method_code, roundMoney((paidByMethod.get(row.method_code) ?? 0) + row.amount));
+    }
+    const invoicesTotal = roundMoney(invoicePays.reduce((acc, row) => acc + row.amount, 0));
+    const invoicesCount = new Set(invoicePays.map((row) => row.invoice_id)).size;
 
     const expectedCash = roundMoney(
       (paidByMethod.get("efectivo") ?? 0) - (paidOutByMethod.get("efectivo") ?? 0),
@@ -930,7 +962,7 @@ export async function closeShift(
         method_differences: methodDifferences,
         observation: observation ?? null,
         invoices_total: invoicesTotal,
-        invoices_by_method: Object.fromEntries(invoicesByMethod),
+        invoices_count: invoicesCount,
       },
     });
     if (methodDifferences.length > 0) {
@@ -1143,13 +1175,17 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
     db,
     rows.map((row) => row.id),
   );
+  const invoicePayMaps = await fetchInvoicePaymentsByShift(
+    db,
+    rows.map((row) => row.id),
+  );
   const names = await userNames(
     db,
     rows.flatMap((row) => [row.opened_by, row.closed_by]),
   );
 
   const views: DayShiftView[] = rows.map((shift) => {
-    const list = paymentsByShift.get(shift.id) ?? [];
+    const list = [...(paymentsByShift.get(shift.id) ?? []), ...(invoicePayMaps.get(shift.id) ?? [])];
     const paidByMethod = new Map<string, number>();
     for (const item of list) {
       paidByMethod.set(item.method_code, roundMoney((paidByMethod.get(item.method_code) ?? 0) + item.amount));
@@ -1273,6 +1309,10 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
     db,
     rows.map((row) => row.id),
   );
+  const historyInvoicePayMaps = await fetchInvoicePaymentsByShift(
+    db,
+    rows.map((row) => row.id),
+  );
   const historyNames = await userNames(
     db,
     rows.flatMap((row) => [row.opened_by, row.closed_by]),
@@ -1285,7 +1325,7 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
     pageSize: HISTORY_PAGE_SIZE,
     total,
     shifts: rows.map((shift) => {
-      const list = paymentsByShift.get(shift.id) ?? [];
+      const list = [...(paymentsByShift.get(shift.id) ?? []), ...(historyInvoicePayMaps.get(shift.id) ?? [])];
       const paidByMethod = new Map<string, number>();
       for (const item of list) {
         paidByMethod.set(item.method_code, roundMoney((paidByMethod.get(item.method_code) ?? 0) + item.amount));

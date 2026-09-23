@@ -168,6 +168,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
     { method_code: "efectivo", amount: "" },
   ]);
   const [motivo, setMotivo] = useState("");
+  const [confirmEmit, setConfirmEmit] = useState(false);
+  const [confirmPay, setConfirmPay] = useState(false);
+  const [confirmAnnul, setConfirmAnnul] = useState(false);
   const [splitDraft, setSplitDraft] = useState<PortionDraft>({ method_code: "efectivo", amount: "" });
 
   function applyFilters(event?: FormEvent, page = 1) {
@@ -282,6 +285,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setDiscount("");
     setItems([]);
     setPortions([{ method_code: "efectivo", amount: "" }]);
+    setConfirmEmit(false);
     setCreateDialogOpen(false);
   }
 
@@ -294,6 +298,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
       }
       setDetail(result.data);
       setMotivo("");
+      setConfirmPay(false);
+      setConfirmAnnul(false);
       setDetailDialogOpen(true);
     });
   }
@@ -302,6 +308,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setDetail(null);
     setMotivo("");
     setSplitDraft({ method_code: "efectivo", amount: "" });
+    setConfirmPay(false);
+    setConfirmAnnul(false);
     setDetailDialogOpen(false);
   }
 
@@ -500,6 +508,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setDiscount("");
     setItems([]);
     setPortions([{ method_code: "efectivo", amount: "" }]);
+    setConfirmEmit(false);
     setDetail(result.data);
     setCreateDialogOpen(false);
     setDetailDialogOpen(true);
@@ -526,6 +535,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     }
     setNotice(`Factura #${result.data.invoice.consecutive_number} anulada (stock revertido).`);
     setDetail(result.data);
+    setConfirmAnnul(false);
     await applyFilters(undefined, invoicePage);
   }
 
@@ -559,6 +569,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     );
     setDetail(result.data);
     setSplitDraft({ method_code: "efectivo", amount: "" });
+    setConfirmPay(false);
     await applyFilters(undefined, invoicePage);
   }
 
@@ -1210,6 +1221,20 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           </p>
                         )}
 
+                        <label className="flex items-start gap-2 text-sm text-slate-700">
+                          <input
+                            type="checkbox"
+                            checked={confirmEmit}
+                            onChange={(event) => setConfirmEmit(event.target.checked)}
+                            className="mt-0.5 rounded border-slate-300 text-emerald-700 focus:ring-emerald-500"
+                          />
+                          <span>
+                            {hasImmediatePayment
+                              ? "Va a emitir y cobrar la factura. Después no se podrá modificar. ¿Desea continuar?"
+                              : "Va a emitir la factura. Esto genera un registro permanente que no se podrá eliminar. ¿Desea continuar?"}
+                          </span>
+                        </label>
+
                         <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 pt-4">
                           <button
                             type="button"
@@ -1220,7 +1245,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           </button>
                           <button
                             type="submit"
-                            disabled={busy}
+                            disabled={busy || !confirmEmit}
                             className="h-10 rounded-md bg-emerald-700 px-6 text-sm font-semibold text-white hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 disabled:opacity-50"
                           >
                             {busy ? "Emitiendo…" : hasImmediatePayment ? "Emitir y pagar" : "Emitir factura"}
@@ -1577,7 +1602,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               )}
                               <div className="mt-3 flex flex-col gap-4">
                           {props.canWrite && detail.invoice.status === "Emitida" && (
-                            <form onSubmit={submitSplit} className="flex flex-wrap items-end gap-3">
+                            <form onSubmit={submitSplit} className="flex flex-col gap-3">
+                              <div className="flex flex-wrap items-end gap-3">
                               <label className="flex min-w-[10rem] flex-col gap-1 text-sm font-medium text-slate-900">
                                 Método
                                 <Select
@@ -1607,19 +1633,34 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   required
                                 />
                               </label>
+                              </div>
+                              <label className="flex items-start gap-2 text-sm text-slate-700">
+                                <input
+                                  type="checkbox"
+                                  checked={confirmPay}
+                                  onChange={(event) => setConfirmPay(event.target.checked)}
+                                  className="mt-0.5 rounded border-slate-300 text-emerald-700 focus:ring-emerald-500"
+                                />
+                                <span>
+                                  Va a pagar la factura. Después no se podrá modificar. ¿Desea continuar?
+                                </span>
+                              </label>
+                              <div>
                               <button
                                 type="submit"
-                                disabled={busy}
+                                disabled={busy || !confirmPay}
                                 className="flex h-10 items-center gap-2 rounded-md bg-slate-200 px-4 text-sm font-medium text-slate-900 hover:bg-slate-300 disabled:opacity-50"
                               >
                                 <Banknote className="h-4 w-4" aria-hidden="true" />
-                                {busy ? "Registrando…" : "Registrar porción"}
+                                {busy ? "Pagando…" : "Pagar"}
                               </button>
+                              </div>
                             </form>
                           )}
 
                           {props.canAnnul && (detail.invoice.status === "Emitida" || detail.invoice.status === "Pagada") && (
-                            <form onSubmit={submitAnnul} className="flex flex-wrap items-end gap-3">
+                            <form onSubmit={submitAnnul} className="flex flex-col gap-3">
+                              <div className="flex flex-wrap items-end gap-3">
                               <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-slate-900">
                                 Motivo de anulación
                                 <input
@@ -1630,14 +1671,28 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   required
                                 />
                               </label>
+                              </div>
+                              <label className="flex items-start gap-2 text-sm text-slate-700">
+                                <input
+                                  type="checkbox"
+                                  checked={confirmAnnul}
+                                  onChange={(event) => setConfirmAnnul(event.target.checked)}
+                                  className="mt-0.5 rounded border-slate-300 text-red-600 focus:ring-red-500"
+                                />
+                                <span>
+                                  Va a anular la factura. Esto revierte el stock y no se puede deshacer. ¿Desea continuar?
+                                </span>
+                              </label>
+                              <div>
                               <button
                                 type="submit"
-                                disabled={busy}
+                                disabled={busy || !confirmAnnul}
                                 className="flex h-10 items-center gap-2 rounded-md bg-red-600 px-4 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
                               >
                                 <CircleX className="h-4 w-4" aria-hidden="true" />
                                 {busy ? "Anulando…" : "Anular factura"}
                               </button>
+                              </div>
                             </form>
                           )}
                               </div>
