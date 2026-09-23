@@ -38,6 +38,7 @@ import {
 import { planStockDeduction } from "@/src/features/inventory/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { getOpenShiftWithOpener } from "@/src/features/cash/service";
+import { computeInvoiceItemCommission } from "./commission";
 
 export class BillingError extends Error {
   readonly code: string;
@@ -126,6 +127,12 @@ export interface InvoiceItemRow {
   subtotal: number;
   no_commission: boolean;
   commission_value: number | null;
+  /**
+   * Comisión calculada de la línea (solo lectura, no se persiste). null = no
+   * calculable (sin empleado); número = monto en moneda. Misma regla que
+   * nómina: ver `computeInvoiceItemCommission` en ./commission.
+   */
+  commission_amount: number | null;
 }
 
 export interface InvoiceTaxRow {
@@ -161,7 +168,7 @@ export interface InvoiceDetail {
 const INVOICE_SELECT =
   "id, sede_id, consecutive_number, client_name, client_document, subtotal, discount, tax, surcharge, total, status, user_id, cash_shift_id, closed_by, closed_at, cancel_reason, created_at";
 const ITEM_SELECT =
-  "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission, commission_value, employees!inner(full_name, employee_code)";
+  "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission, commission_value, employees!inner(full_name, employee_code, commission_percent, pay_type, payout_mode)";
 const TAX_SELECT = "id, invoice_id, tax_code, tax_name, percent, amount";
 const PAYMENT_SELECT = "id, invoice_id, method_id, method_code, amount, fee_percent, fee_amount, cash_shift_id, created_at";
 
@@ -366,7 +373,22 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
   const payments = (paymentsRes.data ?? []) as InvoicePaymentRow[];
   const paid = round2(payments.reduce((acc, row) => acc + Number(row.amount), 0));
   interface JoinedEmployee {
-    employees?: { full_name?: string | null; employee_code?: string | null } | Array<{ full_name?: string | null; employee_code?: string | null }> | null;
+    employees?:
+      | {
+          full_name?: string | null;
+          employee_code?: string | null;
+          commission_percent?: number | null;
+          pay_type?: string | null;
+          payout_mode?: string | null;
+        }
+      | Array<{
+          full_name?: string | null;
+          employee_code?: string | null;
+          commission_percent?: number | null;
+          pay_type?: string | null;
+          payout_mode?: string | null;
+        }>
+      | null;
   }
   const items = ((itemsRes.data ?? []) as Array<InvoiceItemRow & JoinedEmployee>).map((item) => {
     const joined = Array.isArray(item.employees) ? item.employees[0] : item.employees;
@@ -375,6 +397,20 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
       employee_full_name: joined?.full_name ?? null,
       employee_code: joined?.employee_code ?? null,
       commission_value: item.commission_value ?? null,
+      // Campo derivado de lectura (no se persiste): misma regla que nómina.
+      commission_amount: computeInvoiceItemCommission({
+        itemType: item.item_type,
+        subtotal: Number(item.subtotal),
+        commissionValue: item.commission_value ?? null,
+        noCommission: Boolean(item.no_commission),
+        employee: joined
+          ? {
+              payoutMode: joined.payout_mode ?? null,
+              payType: joined.pay_type ?? null,
+              commissionPercent: joined.commission_percent ?? null,
+            }
+          : null,
+      }),
     };
   }) as InvoiceItemRow[];
   return {

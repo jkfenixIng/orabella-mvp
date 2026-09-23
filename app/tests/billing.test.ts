@@ -25,6 +25,7 @@ import {
   splitPaymentSchema,
   invoiceItemSchema,
 } from "@/src/features/billing/schemas";
+import { computeInvoiceItemCommission } from "@/src/features/billing/commission";
 
 const EMPLOYEE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const PRODUCT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -545,5 +546,100 @@ describe("billing: edición libre de emitida sin motivo (cajera del turno)", () 
     expect(
       editEmittedInvoiceSchema.safeParse({ motivo: "x".repeat(501), items: [OLD], payments: [] }).success,
     ).toBe(false);
+  });
+});
+
+// ------------------------------------- comisión por línea en el detalle ---
+
+describe("billing: comisión calculada por línea (misma regla que nómina)", () => {
+  const porcentaje = {
+    payoutMode: "normal",
+    payType: "porcentaje",
+    commissionPercent: 10,
+  };
+
+  it("producto con pay_type porcentaje: subtotal × porcentaje / 100", () => {
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "producto",
+        subtotal: 100000,
+        commissionValue: null,
+        noCommission: false,
+        employee: porcentaje,
+      }),
+    ).toBe(10000);
+  });
+
+  it("pay_type fijo no genera porcentaje (sin comisión)", () => {
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "producto",
+        subtotal: 100000,
+        commissionValue: null,
+        noCommission: false,
+        employee: { payoutMode: "normal", payType: "fijo", commissionPercent: 10 },
+      }),
+    ).toBe(0);
+  });
+
+  it("payout_mode no_aplica no genera comisión", () => {
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "producto",
+        subtotal: 100000,
+        commissionValue: null,
+        noCommission: false,
+        employee: { ...porcentaje, payoutMode: "no_aplica" },
+      }),
+    ).toBe(0);
+  });
+
+  it("ítem custom con commission_value usa el valor fijo (ignora el porcentaje)", () => {
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "custom",
+        subtotal: 100000,
+        commissionValue: 5000,
+        noCommission: false,
+        employee: porcentaje,
+      }),
+    ).toBe(5000);
+  });
+
+  it("ítem custom con commission_value 0 cae al porcentaje del empleado (paridad con nómina)", () => {
+    // Nómina normaliza con chequeo de veracidad: un 0 no es valor fijo.
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "custom",
+        subtotal: 100000,
+        commissionValue: 0,
+        noCommission: false,
+        employee: porcentaje,
+      }),
+    ).toBe(10000);
+  });
+
+  it("no_commission da 0", () => {
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "producto",
+        subtotal: 100000,
+        commissionValue: null,
+        noCommission: true,
+        employee: porcentaje,
+      }),
+    ).toBe(0);
+  });
+
+  it("sin datos de empleado no es calculable (null)", () => {
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "producto",
+        subtotal: 100000,
+        commissionValue: null,
+        noCommission: false,
+        employee: null,
+      }),
+    ).toBe(null);
   });
 });
