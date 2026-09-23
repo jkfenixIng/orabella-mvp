@@ -45,6 +45,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/src/components/ui/lib/select";
+import { Combobox } from "@/src/components/ui/lib/combobox";
 import {
   Banknote,
   CircleX,
@@ -487,50 +488,42 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         </SelectContent>
                                       </Select>
                                       {item.item_type === "producto" && (
-                                        <Select
+                                        <Combobox
                                           value={item.ref_id}
                                           onValueChange={(value) => {
                                             patchItem(index, { ref_id: value });
                                             autofillPrice(index, "producto", value);
                                           }}
-                                        >
-                                          <SelectTrigger className={`${paperInputClass} mt-2`} aria-label={`Ítem ${index + 1} producto`}>
-                                            <SelectValue placeholder="Producto…" />
-                                          </SelectTrigger>
-                                          <SelectContent>
-                                            <SelectItem value="">Producto…</SelectItem>
-                                            {props.products
-                                              .filter((row) => row.is_active)
-                                              .map((row) => (
-                                                <SelectItem key={row.id} value={row.id}>
-                                                  {row.name} (stock {row.stock_qty}) <span className="text-xs text-emerald-600">💰</span>
-                                                </SelectItem>
-                                              ))}
-                                          </SelectContent>
-                                        </Select>
+                                          placeholder="Producto…"
+                                          options={props.products
+                                            .filter((row) => row.is_active)
+                                            .map((row) => ({
+                                              value: row.id,
+                                              label: row.name,
+                                              description: `Stock: ${row.stock_qty} • 💰 Con comisión`,
+                                            }))}
+                                          ariaLabel={`Ítem ${index + 1} producto`}
+                                          filterPlaceholder="Buscar producto..."
+                                        />
                                       )}
-                                      {item.item_type === "servicio" && (
-                                        <Select
+{item.item_type === "servicio" && (
+                                        <Combobox
                                           value={item.ref_id}
                                           onValueChange={(value) => {
                                             patchItem(index, { ref_id: value });
                                             autofillPrice(index, "servicio", value);
                                           }}
-                                        >
-                                          <SelectTrigger className={`${paperInputClass} mt-2`} aria-label={`Ítem ${index + 1} servicio`}>
-                                            <SelectValue placeholder="Servicio…" />
-                                          </SelectTrigger>
-                                          <SelectContent>
-                                            <SelectItem value="">Servicio…</SelectItem>
-{props.services
-                                                .filter((row) => row.is_active)
-                                                .map((row) => (
-                                                  <SelectItem key={row.id} value={row.id}>
-                                                    {row.name} <span className="text-xs text-slate-500">(sin comisión)</span>
-                                                  </SelectItem>
-                                                ))}
-                                          </SelectContent>
-                                        </Select>
+                                          placeholder="Servicio…"
+                                          options={props.services
+                                            .filter((row) => row.is_active)
+                                            .map((row) => ({
+                                              value: row.id,
+                                              label: row.name,
+                                              description: "(sin comisión)",
+                                            }))}
+                                          ariaLabel={`Ítem ${index + 1} servicio`}
+                                          filterPlaceholder="Buscar servicio..."
+                                        />
                                       )}
                                       {item.item_type === "custom" && (
                                         <input
@@ -545,24 +538,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                       <p className="mt-1 text-xs text-slate-500">{draftItemName(item)}</p>
                                     </td>
                                     <td className="min-w-[150px] px-3 py-2">
-<Select
-                                      value={item.employee_id}
-                                      onValueChange={(value) => patchItem(index, { employee_id: value })}
-                                    >
-                                      <SelectTrigger className={paperInputClass} aria-label={`Ítem ${index + 1} empleado`}>
-                                        <SelectValue placeholder="Empleado…" />
-                                      </SelectTrigger>
-                                      <SelectContent>
-                                        <SelectItem value="">Empleado…</SelectItem>
-                                        {props.employees.map((row) => (
-                                          <SelectItem key={row.id} value={row.id}>
-                                            {row.full_name}
-                                            {row.employee_code ? ` (${row.employee_code})` : ""}
-                                            {row.document ? ` · ${row.document}` : ""}
-                                          </SelectItem>
-                                        ))}
-                                      </SelectContent>
-                                    </Select>
+<Combobox
+                                        value={item.employee_id}
+                                        onValueChange={(value) => patchItem(index, { employee_id: value })}
+                                        placeholder="Empleado…"
+                                        options={props.employees.map((row) => ({
+                                          value: row.id,
+                                          label: row.full_name,
+                                          description: `${row.employee_code ?? ''} · ${row.document ?? ''}`.trim(),
+                                        }))}
+                                        ariaLabel={`Ítem ${index + 1} empleado`}
+                                        filterPlaceholder="Buscar empleado..."
+                                      />
                                     </td>
                                     <td className="px-3 py-2">
                                       <input
@@ -797,25 +784,22 @@ export function InvoicesClient(props: InvoicesClientProps) {
             </Label>
             <Label className="min-w-[10rem]">
               Vendedor
-              <Select
+              <Combobox
                 value={filters.seller}
                 onValueChange={(seller) => setFilters({ ...filters, seller })}
-              >
-                <SelectTrigger className={inputClass}>
-                  <SelectValue placeholder="Todos" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="">Todos</SelectItem>
-                  {props.employees
-                    .filter((row) => row.is_active)
-                    .map((row) => (
-                      <SelectItem key={row.id} value={row.id}>
-                        {row.full_name}
-                        {row.employee_code ? ` (${row.employee_code})` : ""}
-                      </SelectItem>
-                    ))}
-                </SelectContent>
-              </Select>
+                placeholder="Todos"
+                allowClear
+                clearLabel="Todos"
+                options={props.employees
+                  .filter((row) => row.is_active)
+                  .map((row) => ({
+                    value: row.id,
+                    label: row.full_name,
+                    description: row.employee_code ?? '',
+                  }))}
+                ariaLabel="Filtrar por vendedor"
+                filterPlaceholder="Buscar vendedor..."
+              />
             </Label>
             <Label className="min-w-[10rem]">
               Nº Factura
