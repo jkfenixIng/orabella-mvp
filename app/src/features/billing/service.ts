@@ -213,7 +213,7 @@ export async function listInvoices(sedeId: string, filters: InvoiceFilters = {})
 
   let query = db
     .from("invoices")
-    .select(`${INVOICE_SELECT}, users!inner(full_name)`)
+    .select(`${INVOICE_SELECT}, users!invoices_user_id_fkey(full_name)`)
     .eq("sede_id", sedeId)
     .order("consecutive_number", { ascending: false })
     .range((page - 1) * pageSize, page * pageSize - 1);
