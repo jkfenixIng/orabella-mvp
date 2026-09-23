@@ -45,6 +45,10 @@ const okClass = cn("text-sm text-success dark:text-success");
 const tableHeaderClass = cn("bg-surface-hover text-xs font-semibold uppercase text-text-tertiary");
 const tableCellClass = cn("px-3 py-2 align-middle");
 const tableRowClass = cn("border-t border-border-color dark:border-border-color-2");
+const tableInputClass = cn(
+  "w-28 rounded-md border border-border-color bg-surface px-2 py-1 text-right text-sm text-text-primary shadow-sm",
+  "dark:border-border-color-2",
+);
 
 type ActionResult<T> =
   | { success: true; data: T }
@@ -215,6 +219,142 @@ function PeriodDetailTable({ items, employeeName, expanded, onToggle }: PeriodDe
   );
 }
 
+type AdjustmentField = "bonuses" | "others";
+
+interface DraftRow {
+  employeeId: string;
+  item: DetailItem | null;
+}
+
+interface DraftPayrollTableProps {
+  rows: DraftRow[];
+  employeeName: (id: string) => string;
+  adjustmentValue: (employeeId: string, field: AdjustmentField) => string;
+  onAdjustmentChange: (employeeId: string, field: AdjustmentField, value: string) => void;
+  expanded: Record<string, boolean>;
+  onToggle: (itemId: string) => void;
+}
+
+/**
+ * Tabla editable del borrador: muestra lo calculado por empleado (fijo,
+ * comisiones, vales, neto) y permite ajustar bonos y otros descuentos por
+ * fila antes de recalcular. Los empleados aún sin cálculo aparecen con sus
+ * montos en blanco ("—") para poder cargarles un ajuste.
+ */
+function DraftPayrollTable({
+  rows,
+  employeeName,
+  adjustmentValue,
+  onAdjustmentChange,
+  expanded,
+  onToggle,
+}: DraftPayrollTableProps) {
+  return (
+    <div className="mt-4 overflow-x-auto">
+      <table className={cn("w-full text-left text-sm", "min-w-[1040px]")}>
+        <thead>
+          <tr className={tableHeaderClass}>
+            <th className={tableCellClass} scope="col">
+              Empleado
+            </th>
+            <th className={tableCellClass} scope="col">
+              Fijo
+            </th>
+            <th className={tableCellClass} scope="col">
+              Comisiones
+            </th>
+            <th className={tableCellClass} scope="col">
+              Bonos
+            </th>
+            <th className={tableCellClass} scope="col">
+              Vales
+            </th>
+            <th className={tableCellClass} scope="col">
+              Otros
+            </th>
+            <th className={tableCellClass} scope="col">
+              Neto
+            </th>
+            <th className={tableCellClass} scope="col">
+              Pagado
+            </th>
+            <th className={tableCellClass} scope="col">
+              Saldo
+            </th>
+            <th className={tableCellClass} scope="col">
+              Detalle
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => {
+            const item = row.item;
+            const isExpanded = item ? Boolean(expanded[item.id]) : false;
+            return (
+              <tr key={row.employeeId} className={tableRowClass}>
+                <td className={tableCellClass}>{employeeName(row.employeeId)}</td>
+                <td className={tableCellClass}>{item ? formatMoney(item.base_fixed) : "—"}</td>
+                <td className={tableCellClass}>{item ? formatMoney(item.commissions) : "—"}</td>
+                <td className={tableCellClass}>
+                  <input
+                    type="number"
+                    min="0"
+                    inputMode="numeric"
+                    value={adjustmentValue(row.employeeId, "bonuses")}
+                    onChange={(event) => onAdjustmentChange(row.employeeId, "bonuses", event.target.value)}
+                    aria-label={`Bonos de ${employeeName(row.employeeId)}`}
+                    className={tableInputClass}
+                  />
+                </td>
+                <td className={tableCellClass}>{item ? formatMoney(item.deductions_vales) : "—"}</td>
+                <td className={tableCellClass}>
+                  <input
+                    type="number"
+                    min="0"
+                    inputMode="numeric"
+                    value={adjustmentValue(row.employeeId, "others")}
+                    onChange={(event) => onAdjustmentChange(row.employeeId, "others", event.target.value)}
+                    aria-label={`Otros descuentos de ${employeeName(row.employeeId)}`}
+                    className={tableInputClass}
+                  />
+                </td>
+                <td className={cn(tableCellClass, "font-semibold")}>
+                  {item ? formatMoney(item.net_pay) : "—"}
+                </td>
+                <td className={tableCellClass}>{item ? formatMoney(item.paid) : "—"}</td>
+                <td className={tableCellClass}>{item ? formatMoney(item.remaining) : "—"}</td>
+                <td className={tableCellClass}>
+                  {item ? (
+                    <button
+                      type="button"
+                      onClick={() => onToggle(item.id)}
+                      aria-expanded={isExpanded}
+                      aria-controls={`payroll-item-detail-${item.id}`}
+                      aria-label={`${isExpanded ? "Ocultar" : "Ver"} el desglose de ${employeeName(row.employeeId)}`}
+                      className={ghostClass}
+                    >
+                      {isExpanded ? "Ocultar" : "Ver"}
+                    </button>
+                  ) : (
+                    "—"
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+          {rows.length === 0 && (
+            <tr className={tableRowClass}>
+              <td className={tableCellClass} colSpan={10}>
+                No hay empleados activos para liquidar.
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 interface ExpandedItemPanelProps {
   item: DetailItem;
   methods: PaymentMethodRow[];
@@ -297,13 +437,32 @@ export function PayrollClient(props: PayrollClientProps) {
   const [openError, setOpenError] = useState<string | null>(null);
   // Pagos: porciones por ítem (texto "metodo:monto, metodo:monto").
   const [portions, setPortions] = useState<Record<string, string>>({});
-  // Ajustes por empleado al calcular ("bonos,otros" por empleado).
-  const [adjustments, setAdjustments] = useState<Record<string, string>>({});
+  // Ajustes por empleado al calcular (bonos y otros descuentos editables).
+  const [adjustments, setAdjustments] = useState<
+    Record<string, Partial<Record<AdjustmentField, string>>>
+  >({});
   const [busy, setBusy] = useState(false);
   const [detailDialogOpen, setDetailDialogOpen] = useState(false);
   // Transición para los cambios de vista (detalle del periodo / vales):
   // la UI no se congela mientras la server action responde.
   const [isViewPending, startViewTransition] = useTransition();
+
+  // Filas del borrador: la planta activa más los empleados ya calculados que
+  // hayan quedado inactivos después del cálculo (no se pierden al recalcular).
+  const itemByEmployee = new Map((detail?.items ?? []).map((item) => [item.employee_id, item]));
+  const activeEmployeeIds = props.initialEmployees
+    .filter((row) => row.is_active)
+    .map((row) => row.id);
+  const draftEmployeeIds = [
+    ...activeEmployeeIds,
+    ...(detail?.items ?? [])
+      .map((item) => item.employee_id)
+      .filter((id) => !activeEmployeeIds.includes(id)),
+  ];
+  const draftRows: DraftRow[] = draftEmployeeIds.map((employeeId) => ({
+    employeeId,
+    item: itemByEmployee.get(employeeId) ?? null,
+  }));
 
   function show<T>(result: ActionResult<T>, okText?: string): result is { success: true; data: T } {
     if (!result.success) {
@@ -312,6 +471,26 @@ export function PayrollClient(props: PayrollClientProps) {
     }
     if (okText) setMessage({ kind: "ok", text: okText });
     return true;
+  }
+
+  /**
+   * Valor vigente de un ajuste: lo editado por el usuario o, si todavía no lo
+   * tocó, el monto ya calculado del ítem (así la tabla "viene" con lo
+   * calculado y recalcular no borra los ajustes previos).
+   */
+  function adjustmentValue(employeeId: string, field: AdjustmentField): string {
+    const edited = adjustments[employeeId]?.[field];
+    if (edited !== undefined) return edited;
+    const item = itemByEmployee.get(employeeId);
+    if (!item) return "";
+    return String(field === "bonuses" ? item.bonuses : item.other_discounts);
+  }
+
+  function updateAdjustment(employeeId: string, field: AdjustmentField, value: string) {
+    setAdjustments((prev) => ({
+      ...prev,
+      [employeeId]: { ...prev[employeeId], [field]: value },
+    }));
   }
 
   async function refreshPeriods(select?: string) {
@@ -386,25 +565,24 @@ export function PayrollClient(props: PayrollClientProps) {
     setOpenDialogOpen(false);
   }
 
-  async function handleCalculate(event: FormEvent) {
-    event.preventDefault();
+  /**
+   * Recalcula el borrador enviando el ajuste vigente de cada fila. Se envían
+   * todas las filas (no solo las modificadas) porque el backend parte de cero
+   * por empleado: omitir una fila borraría su bono/descuento previo.
+   */
+  async function handleRecalculate() {
     if (!selectedId) return;
-    const list = Object.entries(adjustments)
-      .map(([employee_id, raw]) => {
-        const [bonusesRaw = "", othersRaw = ""] = raw.split(",");
-        return {
-          employee_id,
-          bonuses: toNumber(bonusesRaw) ?? 0,
-          other_discounts: toNumber(othersRaw) ?? 0,
-        };
-      })
-      .filter((row) => row.bonuses > 0 || row.other_discounts > 0);
+    const list = draftRows.map((row) => ({
+      employee_id: row.employeeId,
+      bonuses: toNumber(adjustmentValue(row.employeeId, "bonuses")) ?? 0,
+      other_discounts: toNumber(adjustmentValue(row.employeeId, "others")) ?? 0,
+    }));
     setBusy(true);
     const result = (await calculatePayrollAction(selectedId, {
       adjustments: list,
     })) as ActionResult<PeriodDetail>;
     setBusy(false);
-    if (show(result, "Nómina calculada: vales pendientes/aprobados quedaron descontados.")) {
+    if (show(result, "Borrador recalculado: vales pendientes/aprobados quedaron descontados.")) {
       setDetail(result.data);
     }
   }
@@ -463,10 +641,16 @@ export function PayrollClient(props: PayrollClientProps) {
   const overlap =
     startDate && endDate && !rangeInvalid ? findOverlappingPeriod(periods, startDate, endDate) : null;
 
+  /**
+   * Nombre legible del empleado: nombre + ID interno (el código de empleado
+   * `employee_code`; si no está definido, el documento). Nunca el número de
+   * documento solo, para distinguir homónimos igual que en vales.
+   */
   const employeeName = (id: string) => {
     const found = props.initialEmployees.find((row) => row.id === id);
     if (!found) return id.slice(0, 8);
-    return `${found.document}${found.employee_code ? ` (${found.employee_code})` : ""}`;
+    const internalId = found.employee_code ? found.employee_code : found.document;
+    return `${found.full_name} (${internalId})`;
   };
 
   return (
@@ -636,67 +820,41 @@ export function PayrollClient(props: PayrollClientProps) {
             </DialogHeader>
             <div className="max-h-[calc(100dvh-12rem)] overflow-y-auto pr-1">
               {selected.status === "cerrado" ? (
-                <p className="mt-2 text-sm text-text-secondary">
-                  Periodo cerrado.
-                </p>
-              ) : (
-                props.canAdmin && (
-                  <form onSubmit={handleCalculate} className="mt-3 flex flex-col gap-2">
-                    <p className="text-sm text-text-secondary">
-                      Ajustes opcionales por empleado (bonos,otros descuentos separados por coma).
-                    </p>
-                    {props.initialEmployees
-                      .filter((row) => row.is_active)
-                      .map((row) => (
-                        <label
-                          key={row.id}
-                          className="flex flex-wrap items-center gap-2 text-sm"
-                          htmlFor={`payroll-adjust-${row.id}`}
-                        >
-                          <span className="w-48 truncate">{employeeName(row.id)}</span>
-                          <input
-                            id={`payroll-adjust-${row.id}`}
-                            value={adjustments[row.id] ?? ""}
-                            onChange={(event) => setAdjustments((prev) => ({ ...prev, [row.id]: event.target.value }))}
-                            placeholder="bonos,otros (p. ej. 50000,10000)"
-                            className={inputClass}
-                          />
-                        </label>
-                      ))}
-                    <div>
-                      <button type="submit" disabled={busy} className={buttonClass}>
-                        {busy ? "Calculando…" : "Calcular nómina"}
-                      </button>
-                    </div>
-                  </form>
-                )
-              )}
-              {!detail && (
-                <button
-                  type="button"
-                  onClick={() => loadDetail(selected.id)}
-                  disabled={isViewPending}
-                  className={`${ghostClass} mt-3`}
-                >
-                  {isViewPending ? "Cargando…" : "Ver liquidación"}
-                </button>
-              )}
-              {detail && (
                 <>
-                  <PeriodDetailTable
-                    items={detail.items}
+                  <p className="mt-2 text-sm text-text-secondary">
+                    Periodo cerrado. La liquidación quedó registrada.
+                  </p>
+                  {detail && (
+                    <PeriodDetailTable
+                      items={detail.items}
+                      employeeName={employeeName}
+                      expanded={expanded}
+                      onToggle={(itemId) => setExpanded((prev) => ({ ...prev, [itemId]: !prev[itemId] }))}
+                    />
+                  )}
+                </>
+              ) : props.canAdmin ? (
+                <>
+                  <p className="mt-3 text-sm text-text-secondary">
+                    Tabla del borrador: ajuste bonos y otros descuentos por empleado y recalcule si hubo
+                    cambios.
+                  </p>
+                  <DraftPayrollTable
+                    rows={draftRows}
                     employeeName={employeeName}
+                    adjustmentValue={adjustmentValue}
+                    onAdjustmentChange={updateAdjustment}
                     expanded={expanded}
                     onToggle={(itemId) => setExpanded((prev) => ({ ...prev, [itemId]: !prev[itemId] }))}
                   />
-                  {detail.items.map(
+                  {detail?.items.map(
                     (item) =>
                       expanded[item.id] && (
                         <ExpandedItemPanel
                           key={`${item.id}-detail`}
                           item={item}
                           methods={props.methods}
-                          canPay={props.canPay && selected.status === "borrador" && item.remaining > 0}
+                          canPay={props.canPay && item.remaining > 0}
                           busy={busy}
                           portionsValue={portions[item.id] ?? ""}
                           onPortionsChange={(value) =>
@@ -706,17 +864,58 @@ export function PayrollClient(props: PayrollClientProps) {
                         />
                       ),
                   )}
-                  {props.canAdmin && selected.status === "borrador" && (
-                    <button type="button" onClick={handleClose} disabled={busy} className={`${buttonClass} mt-4`}>
-                      {busy ? "Cerrando…" : "Cerrar periodo"}
+                  <div className="mt-4 flex flex-wrap gap-3">
+                    <button
+                      type="button"
+                      onClick={() => void handleRecalculate()}
+                      disabled={busy}
+                      className={buttonClass}
+                    >
+                      {busy ? "Recalculando…" : "Recalcular borrador"}
                     </button>
-                  )}
+                    <button
+                      type="button"
+                      onClick={() => void handleClose()}
+                      disabled={busy}
+                      className={buttonClass}
+                    >
+                      {busy ? "Cerrando…" : "Cerrar nómina"}
+                    </button>
+                  </div>
                 </>
+              ) : (
+                detail && (
+                  <>
+                    <PeriodDetailTable
+                      items={detail.items}
+                      employeeName={employeeName}
+                      expanded={expanded}
+                      onToggle={(itemId) => setExpanded((prev) => ({ ...prev, [itemId]: !prev[itemId] }))}
+                    />
+                    {detail.items.map(
+                      (item) =>
+                        expanded[item.id] && (
+                          <ExpandedItemPanel
+                            key={`${item.id}-detail`}
+                            item={item}
+                            methods={props.methods}
+                            canPay={props.canPay && item.remaining > 0}
+                            busy={busy}
+                            portionsValue={portions[item.id] ?? ""}
+                            onPortionsChange={(value) =>
+                              setPortions((prev) => ({ ...prev, [item.id]: value }))
+                            }
+                            onPay={() => void handlePay(item)}
+                          />
+                        ),
+                    )}
+                  </>
+                )
               )}
             </div>
             <DialogFooter>
               <button type="button" className={ghostClass} onClick={closeDetail}>
-                Cerrar
+                Cancelar
               </button>
             </DialogFooter>
           </DialogContent>
