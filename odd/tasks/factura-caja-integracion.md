@@ -91,7 +91,7 @@ Out:
 - [x] Listado paginado (20/pág): ID, fecha, abrió, cerró, empleados resumidos, total, estado pill azul/verde/rojo, editar-admin + ver; filtros cerró-por y empleado; botón emitir esmeralda (3b6ca22)
 - [x] Caja suma cobros de factura en ventas/esperado (merge día/historial/cierre + 023) + checks confirmación + botón Pagar (aa653c3, 9fe6e22) + Vales a Operación (f479cf4)
 - [ ] SECUENCIADO (validado con usuario 2026-09-23, en orden):
-  1. Caja día/historial: columnas por método (daviplata/nequi) muestran declarado y siguen en 0 con cobros de factura → mostrar lo cobrado real por método.
+  1. Caja día/historial: columnas por método muestran lo cobrado real (HECHO c80cb6d 2026-09-23).
   2. Confirmaciones: cambiar CHECKBOXES por MODAL clásico ("¿Está seguro? ..." OK/Cancelar) en emitir, emitir y pagar, pagar y anular.
   3. Listado facturas: 10 por página (hoy 20).
   4. Edición libre para Emitidas (cajera del turno, sin motivo, total se recalcula) + modal de ítems generalizado; edición admin estricta queda para Pagadas.
