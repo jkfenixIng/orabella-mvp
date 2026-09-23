@@ -95,7 +95,7 @@ Out:
   2. Confirmaciones: modal clásico OK/Cancelar en emitir, emitir y pagar, pagar y anular (HECHO 8bd6e32 2026-09-23).
   3. Listado facturas: 10 por página (HECHO ccf7cff 2026-09-23).
   4. Edición libre para Emitidas + modal de ítems generalizado (HECHO 5e1e443 2026-09-23; pagadas intactas admin estricta).
-  5. Vales configurables: días permitidos + topes por día, visibles en caja, alertas admin aceptar/rechazar con motivo, auto-aprobación admin con detalle, edición bloqueada si entró en nómina pagada.
+   5. Vales configurables: días permitidos + topes por día, visibles en caja, alertas admin aceptar/rechazar con motivo, auto-aprobación admin con detalle, edición bloqueada si entró en nómina pagada (HECHO 7c24547+db8809a 2026-09-23; migración 024 allowed_days, alerta voucher.requested en módulo caja, VOUCHER_IN_PAYROLL en descontada).
 - [ ] Usuario: aplicar 019+020+021+022+023 en PRUEBAS, recargar, verificar combobox/modal/detalle/flujo tarjeta/listado
 - [ ] VER full + push
 
