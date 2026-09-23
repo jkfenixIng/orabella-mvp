@@ -50,6 +50,9 @@ Out:
 - [x] V2 Config vales wizard (HECHO 6fb3f0d 2026-09-23; días todos/indicados → topes sin/diarios/semanales/ambos → tope propio por día o mismo; decisión de producto: el tope por día REEMPLAZA al general ese día; migración 026 vuelve opcionales los topes y agrega per_day_limits jsonb — PENDIENTE de aplicar en PRUEBAS).
 - [x] U1 Uniformidad modales (HECHO 673d3cd 2026-09-23; apilado de z-index por nivel en dialog.tsx → el modal de abajo sí se atenúa/desenfoca; overlay manual duplicado eliminado en invoices).
 - [x] U2 Uniformidad de estilos (HECHO 4b68c18 2026-09-23; payroll-client y vouchers-client migrados a tokens compartidos — `border-border-color`, `bg-surface`, `text-text-primary/secondary/tertiary`, `primary-600`, `text-error/success` — con `cn`; 0 clases slate/red/green ad-hoc en esos dos archivos).
+- [x] F4 Comisión de producto visible y editable en factura (HECHO 5dc0462 2026-09-23; en el diálogo de ítem, para `item_type === "producto"` con comisión activa se muestra `Comisión: {formatMoney(...)}` y un input editable "Valor de la comisión ($)"; NO se cambió el envío de `commission_value` al backend — sigue enviándose solo para ítems `custom`, para producto la comisión la calcula el backend).
+- [x] V3 Config de vales fuera de la pantalla + aprobar/rechazar en modal (HECHO 9386cae 2026-09-23; se quitó de `/vales` el formulario de configuración (wizard de días/topes/tope por día) junto con su estado y handlers muertos — `handleLimits`, `toggleDay`, `allowedDays`, `daysMode`, `capsMode`, `perDayMode`, `dayAmounts`, `maxDay`, `maxWeek` e import `setVoucherLimitsAction`; se conservaron `settings`, `configured`, `capsSummary`, `DAY_NAMES`, el resumen de topes, el mensaje "Los vales no están configurados…" y el bloqueo del botón "Solicitar vale"; los dos campos que flotaban en el listado (observación de aprobación y motivo de rechazo) se movieron a un modal único compartido por aprobar y rechazar — `reviewTarget: { id, action }` — con el error de rechazo mostrado dentro del modal; contratos con el backend intactos; el archivo pasó de 566 a 414 líneas).
+- [x] V4 Config de vales en el panel de admin con vista previa y confirmación (HECHO 5a19a90 2026-09-23; reconstruida completa en la pestaña Vales del panel de admin, inline en `admin-tabs.tsx` siguiendo el patrón de las demás secciones, con días permitidos (todos/indicados), topes (sin/diarios/semanales/ambos) y tope por día (mismo/propio); vista previa en vivo del resultado y confirmación con modal OK/Cancelar antes de guardar; contrato con `setVoucherLimitsAction` respetado — `max_per_day` y `max_per_week` número o null, `allowed_days` array 1..7 con al menos 1, `per_day_limits` como array de `{day, amount}`, y con tope propio por día el general va null).
 
 ## Preguntas abiertas (decisión de producto, bloquean solo su tarea)
 - P1 (I1-comisión) RESUELTA 2026-09-23: comisión sugerida en el producto (migración 027 + precarga en factura).
@@ -80,6 +83,9 @@ Módulos Facturación, Inventario, Servicios/Catálogos, Alertas, Caja, Vales. R
 - 2026-09-23: V2 hecho (6fb3f0d). Decisión de producto: el tope por día REEMPLAZA al general ese día. Route: direct-inline (5 archivos).
 - 2026-09-23: U2 hecho (4b68c18). Route: direct-inline (2 archivos).
 - 2026-09-23: I1 hecho (3bb5c3f). Decisión de producto: comisión sugerida en el producto. Route: direct-inline (6 archivos).
+- 2026-09-23: F4 hecho (5dc0462). Route: delegated-direct (subagente writer).
+- 2026-09-23: V3 hecho (9386cae). Route: delegated-direct (subagente writer).
+- 2026-09-23: V4 hecho (5a19a90). Route: delegated-direct (subagente writer).
 
 ## Verification evidence
 - F2 (bf7dc96): `npm run typecheck` 0 errores; `npm test` 11 archivos 210/210.
@@ -94,11 +100,16 @@ Módulos Facturación, Inventario, Servicios/Catálogos, Alertas, Caja, Vales. R
 - I1 (3bb5c3f): `npm run typecheck` 0 errores; `eslint` limpio; `npm test` 11 archivos 221/221 (3 pruebas nuevas: comisión válida/negativa en el schema, migración 027 re-ejecutable con CHECK, documentación de precedencia de la línea).
 - PENDIENTE USUARIO: aplicar 027 en PRUEBAS. Sin ella la app degrada sola: el listado de productos omite la comisión (probado una vez por proceso) en vez de romper.
 - VERIFICACIÓN 026 (2026-09-23): el proyecto que ve el MCP de Supabase no muestra 023–026 (su última migración es `closed_by_invoices` ≈ 022); el usuario confirma que aplicó 026 en PRUEBAS, entorno distinto al que ve el MCP. No se aplicó nada desde aquí.
+- F4 (5dc0462): `npm run typecheck` 0 errores; `eslint` limpio en tocados; `npm test` 11 archivos 221/221.
+- V3 (9386cae): `npm run typecheck` 0 errores; `eslint` limpio en tocados; `npm test` 11 archivos 221/221.
+- V4 (5a19a90): `npm run typecheck` 0 errores; `eslint` limpio en tocados; `npm test` 11 archivos 221/221 (verificación sobre HEAD 5a19a90).
 - (pendiente por item)
 
 ## Next step
 - S1 bloqueado por P2 (alcance de Catálogos): espera decisión del usuario.
-- Aplicar 027 en PRUEBAS y probar la precarga de comisión al facturar.
+- Aplicar las migraciones 026 (vales) y 027 (comisión de producto) en PRUEBAS si todavía no están.
+- Pruebas manuales de runtime (no verificables desde aquí, no hay runtime de UI): `/services`, wizard de vales en el panel de admin, modal de aprobar/rechazar vales, comisión del producto en factura.
 
 ## Route declaration
 - Delegated-direct por item (writer trigger 2+ archivos); inline solo mecánico de 1 archivo.
+- Corrección 2026-09-23: en esta sesión la delegación a subagentes SÍ funcionó (se usó para F4, V3 y V4). Las notas previas de "delegación imposible en este runtime" quedan sin efecto.
