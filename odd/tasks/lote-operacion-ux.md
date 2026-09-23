@@ -38,7 +38,7 @@ Out:
 
 ## Tasks
 - [x] F1 Facturación default día (HECHO 59e58b0 2026-09-23; from/to=hoy, vaciar = ver todo; fix TZ Bogotá -05:00 en dateBound — la ventana UTC colaba la noche anterior).
-- [ ] I1 Inventario producto: auditar UI vs schema; agregar lo faltante (COMISIÓN: ver pregunta abierta — no existe por producto, vive por línea de factura).
+- [x] I1 Inventario producto (HECHO 3bb5c3f 2026-09-23; decisión de producto: comisión sugerida en el producto vía migración 027 — `products.commission_value` absoluta, NULL = sin sugerencia. Inventario la muestra y edita; factura la precarga al elegir el producto; la línea editada a mano manda).
 - [ ] S1 Servicios a Catálogos: sacar de panel admin a módulo catálogos (ALCANCE por confirmar).
 - [x] A1 Alertas default pendientes (HECHO 2026-09-23; unreadOnly=true en page + client).
 - [x] F2 Mensajes caja en factura (HECHO bf7dc96 2026-09-23; sin turno/turno ajeno con dueño en emitir/editar/pagar; anular admin-only intacto; aviso temprano en crear).
@@ -52,7 +52,7 @@ Out:
 - [x] U2 Uniformidad de estilos (HECHO 4b68c18 2026-09-23; payroll-client y vouchers-client migrados a tokens compartidos — `border-border-color`, `bg-surface`, `text-text-primary/secondary/tertiary`, `primary-600`, `text-error/success` — con `cn`; 0 clases slate/red/green ad-hoc en esos dos archivos).
 
 ## Preguntas abiertas (decisión de producto, bloquean solo su tarea)
-- P1 (bloquea I1-comisión): comisión por producto NO existe (solo por línea de factura). ¿Agregar campo comisión al producto, o mostrar la de línea?
+- P1 (I1-comisión) RESUELTA 2026-09-23: comisión sugerida en el producto (migración 027 + precarga en factura).
 - P2 (bloquea S1): ¿"Catálogos" = nuevo módulo `/catalogos` con qué secciones, o mover el tab de admin?
 
 ## Authorized scope
@@ -79,6 +79,7 @@ Módulos Facturación, Inventario, Servicios/Catálogos, Alertas, Caja, Vales. R
 - 2026-09-23: PENDIENTE BLOQUEADO V2: requiere DDL (topes opcionales + tope por día) y decisión de producto sobre la forma del tope por día.
 - 2026-09-23: V2 hecho (6fb3f0d). Decisión de producto: el tope por día REEMPLAZA al general ese día. Route: direct-inline (5 archivos).
 - 2026-09-23: U2 hecho (4b68c18). Route: direct-inline (2 archivos).
+- 2026-09-23: I1 hecho (3bb5c3f). Decisión de producto: comisión sugerida en el producto. Route: direct-inline (6 archivos).
 
 ## Verification evidence
 - F2 (bf7dc96): `npm run typecheck` 0 errores; `npm test` 11 archivos 210/210.
@@ -90,12 +91,14 @@ Módulos Facturación, Inventario, Servicios/Catálogos, Alertas, Caja, Vales. R
 - V2 (6fb3f0d): `npm run typecheck` 0 errores; `eslint` limpio; `npm test` 11 archivos 218/218 (8 pruebas nuevas: normalización, reemplazo del general, sin topes, esquema, migración 026).
 - PENDIENTE USUARIO: aplicar 026 en PRUEBAS (topes opcionales + per_day_limits).
 - U2 (4b68c18): `npm run typecheck` 0 errores; `eslint` limpio; `npm test` 218/218; 0 clases ad-hoc restantes en los 2 archivos.
+- I1 (3bb5c3f): `npm run typecheck` 0 errores; `eslint` limpio; `npm test` 11 archivos 221/221 (3 pruebas nuevas: comisión válida/negativa en el schema, migración 027 re-ejecutable con CHECK, documentación de precedencia de la línea).
+- PENDIENTE USUARIO: aplicar 027 en PRUEBAS. Sin ella la app degrada sola: el listado de productos omite la comisión (probado una vez por proceso) en vez de romper.
 - VERIFICACIÓN 026 (2026-09-23): el proyecto que ve el MCP de Supabase no muestra 023–026 (su última migración es `closed_by_invoices` ≈ 022); el usuario confirma que aplicó 026 en PRUEBAS, entorno distinto al que ve el MCP. No se aplicó nada desde aquí.
 - (pendiente por item)
 
 ## Next step
-- I1 y S1 bloqueados por P1 (comisión por producto vs línea) y P2 (alcance de Catálogos): esperan decisión del usuario.
-- Probar el wizard de vales en PRUEBAS con 026 aplicada.
+- S1 bloqueado por P2 (alcance de Catálogos): espera decisión del usuario.
+- Aplicar 027 en PRUEBAS y probar la precarga de comisión al facturar.
 
 ## Route declaration
 - Delegated-direct por item (writer trigger 2+ archivos); inline solo mecánico de 1 archivo.
