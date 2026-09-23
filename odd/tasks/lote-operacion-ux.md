@@ -48,7 +48,8 @@ Out:
 - [x] G1 Validación temprana caja (HECHO 9d050d3 2026-09-23; bloqueo de entrada a emitir/editar/pagar sin caja propia con motivo y dueño del turno; admin exento; backend sigue validando).
 - [x] V1 Vales gating + layout (HECHO 12dd333 2026-09-23; sin config → mensaje + solicitud bloqueada; alta en modal; lista debajo).
 - [ ] V2 Config vales wizard: días todos/indicados → topes sin/diarios/semanales/ambos → tope por día o general.
-- [ ] U1 Uniformidad modales: blur stacking modal-sobre-modal + auditoría de reutilizables.
+- [x] U1 Uniformidad modales (HECHO 673d3cd 2026-09-23; apilado de z-index por nivel en dialog.tsx → el modal de abajo sí se atenúa/desenfoca; overlay manual duplicado eliminado en invoices).
+- [ ] U2 Uniformidad de estilos (auditoría HECHA, refactor pendiente): payroll-client y vouchers-client no usan `cn` ni los tokens compartidos; invoices mantiene 24 clases de la hoja-factura (decisión de diseño deliberada). No bloqueante para pruebas.
 
 ## Preguntas abiertas (decisión de producto, bloquean solo su tarea)
 - P1 (bloquea I1-comisión): comisión por producto NO existe (solo por línea de factura). ¿Agregar campo comisión al producto, o mostrar la de línea?
@@ -74,12 +75,16 @@ Módulos Facturación, Inventario, Servicios/Catálogos, Alertas, Caja, Vales. R
 - 2026-09-23: C1 hecho (ceeac9a). Route: direct-inline (2 archivos, writer trigger pero sin delegación posible).
 - 2026-09-23: G1 hecho (9d050d3). Bloqueo de entrada (no aviso dentro). Route: direct-inline.
 - 2026-09-23: V1 hecho (12dd333). Route: direct-inline (1 archivo).
+- 2026-09-23: U1 hecho (673d3cd). Route: direct-inline (2 archivos). Auditoría U2 solo lectura.
+- 2026-09-23: PENDIENTE BLOQUEADO V2: requiere DDL (topes opcionales + tope por día) y decisión de producto sobre la forma del tope por día.
 
 ## Verification evidence
 - F2 (bf7dc96): `npm run typecheck` 0 errores; `npm test` 11 archivos 210/210.
 - C1 (ceeac9a): `npm run typecheck` 0 errores; `npm test` 11 archivos 210/210.
 - G1 (9d050d3): `npm run typecheck` 0 errores; `eslint` limpio en tocados; `npm test` 210/210.
 - V1 (12dd333): `npm run typecheck` 0 errores; `eslint` limpio; `npm test` 210/210.
+- U1 (673d3cd): `npm run typecheck` 0 errores; `eslint` limpio; `npm test` 210/210; `playwright --list` 18 tests en 9 archivos.
+- Auditoría U2 (solo lectura): todos los clientes usan el Dialog compartido salvo alerts-client (sin modal); `cn` ausente en payroll-client y vouchers-client; invoices conserva 24 clases de hoja-factura (deliberado).
 - (pendiente por item)
 
 ## Next step
