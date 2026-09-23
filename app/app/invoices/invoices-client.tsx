@@ -2187,17 +2187,44 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 </label>
               </div>
               {itemDraft.item_type === "producto" && (
-                <label className="flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={!itemDraft.no_commission}
-                    onChange={(event) =>
-                      patchDraft({ no_commission: !event.target.checked })
-                    }
-                    className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
-                  />
-                  <span className="text-slate-700">¿Tiene comisión?</span>
-                </label>
+                <div className="flex flex-col gap-2">
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={!itemDraft.no_commission}
+                      onChange={(event) =>
+                        patchDraft({ no_commission: !event.target.checked })
+                      }
+                      className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                    />
+                    <span className="text-slate-700">¿Tiene comisión?</span>
+                    {!itemDraft.no_commission && itemDraft.commission_value != null && (
+                      <span className="text-slate-500">
+                        Comisión: {formatMoney(itemDraft.commission_value)}
+                      </span>
+                    )}
+                  </label>
+                  {!itemDraft.no_commission && (
+                    <label className="flex flex-col gap-1 text-sm font-medium">
+                      Valor de la comisión ($)
+                      <input
+                        type="number"
+                        className={paperInputClass}
+                        value={itemDraft.commission_value ?? ""}
+                        onChange={(event) =>
+                          patchDraft({
+                            commission_value:
+                              event.target.value === "" ? null : Number(event.target.value),
+                          })
+                        }
+                        placeholder="Ej. 10000"
+                        min={0}
+                        step={100}
+                        inputMode="decimal"
+                      />
+                    </label>
+                  )}
+                </div>
               )}
               {itemDraft.item_type === "custom" && (
                 <div className="flex flex-col gap-2">
