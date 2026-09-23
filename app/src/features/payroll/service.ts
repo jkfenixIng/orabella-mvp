@@ -13,11 +13,13 @@ import {
   computeNetPay,
   generateApprovalCode,
   normalizeAllowedDays,
+  normalizePerDayLimits,
   openPeriodSchema,
   payPayrollItemSchema,
   requestVoucherSchema,
   rejectVoucherSchema,
   requiresVoucherApproval,
+  resolveVoucherDayCap,
   voucherRequiresReview,
   roundMoney,
   voucherLimitsSchema,
@@ -193,10 +195,14 @@ export interface PayrollPaymentRow {
 
 export interface VoucherSettingsRow {
   sede_id: string;
-  max_per_day: number;
-  max_per_week: number;
+  /** V2: null o 0 = sin tope diario general. */
+  max_per_day: number | null;
+  /** V2: null o 0 = sin tope semanal. */
+  max_per_week: number | null;
   /** Días ISO permitidos (1=lunes…7=domingo); null = todos (sin restricción). */
   allowed_days: number[] | null;
+  /** V2: tope propio por día ISO {"3": 50000}; reemplaza al general ese día. */
+  per_day_limits: Record<string, number> | null;
 }
 
 export interface VoucherRequestRow {
@@ -752,18 +758,30 @@ export async function closePayrollPeriod(
 
 // -------------------------------------------------------------------- vales ---
 
-/** PAY-05: topes vigentes de la sede (null cuando aún no se configuran). */
+/** PAY-05/V2: topes vigentes de la sede (null cuando aún no se configuran). */
 export async function getVoucherSettings(sedeId: string): Promise<VoucherSettingsRow | null> {
   const db = await payrollDb();
-  const withDays = await db
-    .from("voucher_settings")
-    .select("sede_id, max_per_day, max_per_week, allowed_days")
-    .eq("sede_id", sedeId)
-    .maybeSingle();
-  if (!withDays.error) return (withDays.data as VoucherSettingsRow | null) ?? null;
-  // La migración 024 aún sin aplicar en esta base: degradar sin días.
-  const message = String((withDays.error as { message?: string }).message ?? "");
-  if (!/allowed_days/i.test(message)) throw new PayrollError("INTERNAL", "Error interno.", 500);
+  // Degradación por migraciones pendientes: 026 (per_day_limits) y 024 (allowed_days).
+  const attempts: Array<{ select: string; missing: string }> = [
+    { select: "sede_id, max_per_day, max_per_week, allowed_days, per_day_limits", missing: "per_day_limits" },
+    { select: "sede_id, max_per_day, max_per_week, allowed_days", missing: "allowed_days" },
+  ];
+  for (const attempt of attempts) {
+    const result = await db.from("voucher_settings").select(attempt.select).eq("sede_id", sedeId).maybeSingle();
+    if (!result.error) {
+      const row = result.data as unknown as Record<string, unknown> | null;
+      if (!row) return null;
+      return {
+        ...(row as unknown as VoucherSettingsRow),
+        allowed_days: (row.allowed_days as number[] | null) ?? null,
+        per_day_limits: readPerDayLimits(row.per_day_limits),
+      };
+    }
+    const message = String((result.error as { message?: string }).message ?? "");
+    if (!new RegExp(attempt.missing, "i").test(message)) {
+      throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
+  }
   const { data, error } = await db
     .from("voucher_settings")
     .select("sede_id, max_per_day, max_per_week")
@@ -771,10 +789,24 @@ export async function getVoucherSettings(sedeId: string): Promise<VoucherSetting
     .maybeSingle();
   if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
   if (!data) return null;
-  return { ...(data as Omit<VoucherSettingsRow, "allowed_days">), allowed_days: null };
+  return {
+    ...(data as unknown as VoucherSettingsRow),
+    allowed_days: null,
+    per_day_limits: null,
+  };
 }
 
-/** PAY-05: configura topes día/semana + días permitidos de la sede (upsert). Solo admin. */
+/** V2: lee per_day_limits de la BD (jsonb) a un mapa numérico saneado. */
+function readPerDayLimits(value: unknown): Record<string, number> | null {
+  if (value === null || value === undefined || typeof value !== "object") return null;
+  const entries = Object.entries(value as Record<string, unknown>).map(([day, amount]) => ({
+    day,
+    amount: amount as number,
+  }));
+  return normalizePerDayLimits(entries);
+}
+
+/** PAY-05/V2: configura topes día/semana (opcionales) + días permitidos + topes por día. Solo admin. */
 export async function setVoucherLimits(raw: unknown, actor: PayrollActor): Promise<VoucherSettingsRow> {
   const parsed = voucherLimitsSchema.safeParse(raw);
   if (!parsed.success) {
@@ -786,37 +818,48 @@ export async function setVoucherLimits(raw: unknown, actor: PayrollActor): Promi
   const allowed = parsed.data.allowed_days !== undefined
     ? normalizeAllowedDays(parsed.data.allowed_days)
     : (current?.allowed_days ?? null);
-  const first = await db
-    .from("voucher_settings")
-    .upsert(
-      {
-        sede_id: actor.sedeId,
-        max_per_day: roundMoney(parsed.data.max_per_day),
-        max_per_week: roundMoney(parsed.data.max_per_week),
-        allowed_days: allowed ?? [1, 2, 3, 4, 5, 6, 7],
-      },
-      { onConflict: "sede_id" },
-    )
-    .select("sede_id, max_per_day, max_per_week, allowed_days")
-    .single();
-  if (!first.error && first.data) return first.data as VoucherSettingsRow;
-  // La migración 024 aún sin aplicar en esta base: guardar sin días.
-  const firstMessage = String((first.error as { message?: string } | null)?.message ?? "");
-  if (!/allowed_days/i.test(firstMessage)) throw new PayrollError("INTERNAL", "Error interno.", 500);
-  const { data, error } = await db
-    .from("voucher_settings")
-    .upsert(
-      {
-        sede_id: actor.sedeId,
-        max_per_day: roundMoney(parsed.data.max_per_day),
-        max_per_week: roundMoney(parsed.data.max_per_week),
-      },
-      { onConflict: "sede_id" },
-    )
-    .select("sede_id, max_per_day, max_per_week")
-    .single();
-  if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
-  return { ...(data as Omit<VoucherSettingsRow, "allowed_days">), allowed_days: current?.allowed_days ?? null };
+  const perDay = parsed.data.per_day_limits !== undefined
+    ? normalizePerDayLimits(parsed.data.per_day_limits)
+    : (current?.per_day_limits ?? null);
+  // V2: "sin topes" se guarda como NULL; 0 también se normaliza a NULL.
+  const maxDay = parsed.data.max_per_day == null || Number(parsed.data.max_per_day) === 0
+    ? null
+    : roundMoney(Number(parsed.data.max_per_day));
+  const maxWeek = parsed.data.max_per_week == null || Number(parsed.data.max_per_week) === 0
+    ? null
+    : roundMoney(Number(parsed.data.max_per_week));
+  const base = { sede_id: actor.sedeId, max_per_day: maxDay, max_per_week: maxWeek };
+  const variants = [
+    { ...base, allowed_days: allowed ?? [1, 2, 3, 4, 5, 6, 7], per_day_limits: perDay ?? {} },
+    { ...base, allowed_days: allowed ?? [1, 2, 3, 4, 5, 6, 7] },
+    base,
+  ];
+  const selects = [
+    "sede_id, max_per_day, max_per_week, allowed_days, per_day_limits",
+    "sede_id, max_per_day, max_per_week, allowed_days",
+    "sede_id, max_per_day, max_per_week",
+  ];
+  for (const [index, payload] of variants.entries()) {
+    const result = await db
+      .from("voucher_settings")
+      .upsert(payload, { onConflict: "sede_id" })
+      .select(selects[index])
+      .single();
+    if (!result.error && result.data) {
+      const row = result.data as unknown as Record<string, unknown>;
+      return {
+        ...(row as unknown as VoucherSettingsRow),
+        allowed_days: (row.allowed_days as number[] | null) ?? current?.allowed_days ?? null,
+        per_day_limits: readPerDayLimits(row.per_day_limits) ?? (index === 0 ? perDay : current?.per_day_limits ?? null),
+      };
+    }
+    const message = String((result.error as { message?: string } | null)?.message ?? "");
+    const expected = index === 0 ? "per_day_limits" : "allowed_days";
+    if (!new RegExp(expected, "i").test(message)) {
+      throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
+  }
+  throw new PayrollError("INTERNAL", "Error interno.", 500);
 }
 
 /** Vales vigentes (pendiente/aprobada) de un empleado en una fecha. */
@@ -901,10 +944,11 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
       dayTotal,
       weekTotal,
       requested: parsed.data.amount,
-      maxPerDay: settings ? Number(settings.max_per_day) : null,
-      maxPerWeek: settings ? Number(settings.max_per_week) : null,
+      maxPerDay: settings?.max_per_day == null ? null : Number(settings.max_per_day),
+      maxPerWeek: settings?.max_per_week == null ? null : Number(settings.max_per_week),
       requestDate,
       allowedDays: settings?.allowed_days ?? null,
+      perDayLimits: settings?.per_day_limits ?? null,
     });
     const needsReview = voucherRequiresReview(eligibility);
     // Item 5: auto-aprobación del admin con código y detalle auditado.
@@ -1103,8 +1147,12 @@ export async function approveVoucher(
         dayTotal: totals.dayTotal - amount,
         weekTotal: totals.weekTotal - amount,
         requested: amount,
-        maxPerDay: settings ? Number(settings.max_per_day) : null,
-        maxPerWeek: settings ? Number(settings.max_per_week) : null,
+        maxPerDay: resolveVoucherDayCap(
+          settings?.max_per_day == null ? null : Number(settings.max_per_day),
+          settings?.per_day_limits ?? null,
+          voucher.request_date,
+        ),
+        maxPerWeek: settings?.max_per_week == null ? null : Number(settings.max_per_week),
       });
       overTope = requiresVoucherApproval(caps);
     } catch {

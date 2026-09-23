@@ -61,13 +61,23 @@ export const payPayrollItemSchema = z.object({
 });
 export type PayPayrollItemInput = z.infer<typeof payPayrollItemSchema>;
 
-/** PAY-05: topes de vales por sede (día y semana) + días permitidos ISO. */
+/** PAY-05: topes de vales por sede (día/semana opcionales) + días permitidos ISO + tope por día. */
 export const voucherLimitsSchema = z.object({
-  max_per_day: z.coerce.number().nonnegative("El tope diario no puede ser negativo."),
-  max_per_week: z.coerce.number().nonnegative("El tope semanal no puede ser negativo."),
+  max_per_day: z.coerce.number().nonnegative("El tope diario no puede ser negativo.").nullish(),
+  max_per_week: z.coerce.number().nonnegative("El tope semanal no puede ser negativo.").nullish(),
   allowed_days: z
     .array(z.coerce.number().int().min(1, "Día inválido (1=lunes…7=domingo).").max(7, "Día inválido (1=lunes…7=domingo)."))
     .min(1, "Elija al menos un día permitido.")
+    .max(7, "Máximo 7 días.")
+    .optional(),
+  /** V2: tope propio por día ISO; reemplaza al tope diario general ese día. */
+  per_day_limits: z
+    .array(
+      z.object({
+        day: z.coerce.number().int().min(1, "Día inválido (1=lunes…7=domingo).").max(7, "Día inválido (1=lunes…7=domingo)."),
+        amount: z.coerce.number().nonnegative("El tope del día no puede ser negativo."),
+      }),
+    )
     .max(7, "Máximo 7 días.")
     .optional(),
 });
@@ -283,6 +293,40 @@ export interface VoucherEligibility extends VoucherCapCheck {
 }
 
 /**
+ * V2: normaliza los topes por día a un mapa { "1": 50000 }. Entradas
+ * repetidas: gana la última. Vacío o inválido = null (sin topes por día).
+ * Puro para probarlo sin base de datos.
+ */
+export function normalizePerDayLimits(
+  entries: Array<{ day: number | string; amount: number | string }> | null | undefined,
+): Record<string, number> | null {
+  if (!entries || entries.length === 0) return null;
+  const map: Record<string, number> = {};
+  for (const entry of entries) {
+    const day = Number(entry.day);
+    const amount = Number(entry.amount);
+    if (!Number.isInteger(day) || day < 1 || day > 7) continue;
+    if (!Number.isFinite(amount) || amount < 0) continue;
+    map[String(day)] = roundMoney(amount);
+  }
+  return Object.keys(map).length === 0 ? null : map;
+}
+
+/**
+ * V2: tope diario aplicable a una fecha. El tope propio del día REEMPLAZA al
+ * tope diario general; sin tope propio rige el general. Puro.
+ */
+export function resolveVoucherDayCap(
+  maxPerDay: number | null,
+  perDayLimits: Record<string, number | string> | null | undefined,
+  requestDate: string,
+): number | null {
+  const specific = perDayLimits?.[String(weekdayIso(requestDate))];
+  if (specific !== undefined && specific !== null) return Number(specific);
+  return maxPerDay;
+}
+
+/**
  * Item 5: elegibilidad completa del vale (topes + día permitido). Pedir
  * fuera de día permitido NO bloquea: exige revisión del admin igual que
  * superar topes. Puro para probarlo sin base de datos.
@@ -295,8 +339,16 @@ export function checkVoucherEligibility(args: {
   maxPerWeek: number | null;
   requestDate: string;
   allowedDays: Array<number | string> | null | undefined;
+  /** V2: topes propios por día; reemplazan al general en su día. */
+  perDayLimits?: Record<string, number | string> | null;
 }): VoucherEligibility {
-  const caps = checkVoucherCaps(args);
+  const caps = checkVoucherCaps({
+    dayTotal: args.dayTotal,
+    weekTotal: args.weekTotal,
+    requested: args.requested,
+    maxPerDay: resolveVoucherDayCap(args.maxPerDay, args.perDayLimits, args.requestDate),
+    maxPerWeek: args.maxPerWeek,
+  });
   return { ...caps, dayNotAllowed: !isVoucherDayAllowed(args.requestDate, args.allowedDays) };
 }
 

@@ -17,11 +17,13 @@ import {
   isApprovalCodeValid,
   isVoucherDayAllowed,
   normalizeAllowedDays,
+  normalizePerDayLimits,
   openPeriodSchema,
   payPayrollItemSchema,
   rejectVoucherSchema,
   requestVoucherSchema,
   requiresVoucherApproval,
+  resolveVoucherDayCap,
   voucherLimitsSchema,
   voucherRequiresReview,
   weekdayIso,
@@ -408,6 +410,106 @@ describe("vales item 5: días permitidos + elegibilidad (sin romper topes)", () 
     expect(
       voucherLimitsSchema.safeParse({ max_per_day: 100000, max_per_week: 300000, allowed_days: [8] }).success,
     ).toBe(false);
+  });
+});
+
+// ------------------------------------------------- V2: tope por día ---
+
+describe("V2 topes de vales: opcionales y por día", () => {
+  it("normaliza los topes por día a un mapa y descarta inválidos", () => {
+    expect(normalizePerDayLimits([{ day: 3, amount: 50000 }, { day: 5, amount: "80000" }])).toEqual({
+      "3": 50000,
+      "5": 80000,
+    });
+    expect(normalizePerDayLimits([{ day: 0, amount: 1000 }, { day: 9, amount: 1000 }])).toBeNull();
+    expect(normalizePerDayLimits([])).toBeNull();
+    expect(normalizePerDayLimits(null)).toBeNull();
+  });
+
+  it("las entradas repetidas se quedan con la última", () => {
+    expect(normalizePerDayLimits([{ day: 1, amount: 1000 }, { day: 1, amount: 2000 }])).toEqual({
+      "1": 2000,
+    });
+  });
+
+  it("el tope propio del día reemplaza al general ese día", () => {
+    const limits = { "3": 50000 };
+    // 2026-09-16 es miércoles (ISO 3) y 2026-09-14 lunes (ISO 1).
+    expect(resolveVoucherDayCap(100000, limits, "2026-09-16")).toBe(50000);
+    expect(resolveVoucherDayCap(100000, limits, "2026-09-14")).toBe(100000);
+  });
+
+  it("sin tope propio ni general el tope es nulo (ilimitado)", () => {
+    expect(resolveVoucherDayCap(null, null, "2026-09-16")).toBeNull();
+    expect(resolveVoucherDayCap(null, {}, "2026-09-16")).toBeNull();
+  });
+
+  it("con tope propio más bajo, el vale que cabía en el general exige revisión", () => {
+    const base = {
+      dayTotal: 20000,
+      weekTotal: 50000,
+      requested: 40000,
+      maxPerWeek: 300000,
+      requestDate: "2026-09-16",
+      allowedDays: null,
+    };
+    const withGeneral = checkVoucherEligibility({ ...base, maxPerDay: 100000 });
+    expect(withGeneral.overDay).toBe(false);
+    const withOwnDay = checkVoucherEligibility({
+      ...base,
+      maxPerDay: 100000,
+      perDayLimits: { "3": 50000 },
+    });
+    expect(withOwnDay.overDay).toBe(true);
+    expect(voucherRequiresReview(withOwnDay)).toBe(true);
+  });
+
+  it("sin topes (null) ningún monto exige revisión por topes", () => {
+    const noCaps = checkVoucherEligibility({
+      dayTotal: 0,
+      weekTotal: 0,
+      requested: 500000,
+      maxPerDay: null,
+      maxPerWeek: null,
+      requestDate: "2026-09-16",
+      allowedDays: null,
+    });
+    expect(noCaps.overDay).toBe(false);
+    expect(noCaps.overWeek).toBe(false);
+    expect(voucherRequiresReview(noCaps)).toBe(false);
+  });
+
+  it("el esquema acepta topes opcionales y tope por día, y rechaza inválidos", () => {
+    expect(voucherLimitsSchema.safeParse({ max_per_day: null, max_per_week: null }).success).toBe(true);
+    expect(
+      voucherLimitsSchema.safeParse({
+        max_per_day: null,
+        max_per_week: 300000,
+        allowed_days: [1, 3, 5],
+        per_day_limits: [{ day: 1, amount: 50000 }],
+      }).success,
+    ).toBe(true);
+    expect(
+      voucherLimitsSchema.safeParse({ max_per_day: 1000, max_per_week: 1000, per_day_limits: [{ day: 8, amount: 1 }] })
+        .success,
+    ).toBe(false);
+    expect(
+      voucherLimitsSchema.safeParse({ max_per_day: 1000, max_per_week: 1000, per_day_limits: [{ day: 1, amount: -1 }] })
+        .success,
+    ).toBe(false);
+  });
+});
+
+// ------------------------------------------------- migración 026 ---
+
+describe("migración 026_voucher_limits.sql (V2)", () => {
+  const sql = readFileSync(join(process.cwd(), "supabase", "migrations", "026_voucher_limits.sql"), "utf8");
+
+  it("vuelve opcionales los topes y agrega per_day_limits re-ejecutable", () => {
+    expect(sql).toContain("max_per_day DROP NOT NULL");
+    expect(sql).toContain("max_per_week DROP NOT NULL");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS per_day_limits jsonb");
+    expect(sql).toContain("chk_voucher_settings_per_day_limits");
   });
 });
 

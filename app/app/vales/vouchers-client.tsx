@@ -85,11 +85,38 @@ export function VouchersClient(props: VouchersClientProps) {
   const [settings, setSettings] = useState<VoucherSettingsRow | null>(props.initialSettings);
   const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
   const [maxDay, setMaxDay] = useState(
-    props.initialSettings ? String(props.initialSettings.max_per_day) : "",
+    props.initialSettings?.max_per_day ? String(props.initialSettings.max_per_day) : "",
   );
   const [maxWeek, setMaxWeek] = useState(
-    props.initialSettings ? String(props.initialSettings.max_per_week) : "",
+    props.initialSettings?.max_per_week ? String(props.initialSettings.max_per_week) : "",
   );
+  // V2 wizard: días (todos/indicados) → topes (sin/diarios/semanales/ambos)
+  // → tope propio por día o mismo para todos.
+  const [daysMode, setDaysMode] = useState<"todos" | "indicados">(
+    props.initialSettings?.allowed_days && props.initialSettings.allowed_days.length < 7
+      ? "indicados"
+      : "todos",
+  );
+  const [capsMode, setCapsMode] = useState<"sin" | "diarios" | "semanales" | "ambos">(() => {
+    const day = Number(props.initialSettings?.max_per_day ?? 0) > 0;
+    const week = Number(props.initialSettings?.max_per_week ?? 0) > 0;
+    if (day && week) return "ambos";
+    if (day) return "diarios";
+    if (week) return "semanales";
+    return "sin";
+  });
+  const [perDayMode, setPerDayMode] = useState<"mismo" | "propio">(
+    props.initialSettings?.per_day_limits && Object.keys(props.initialSettings.per_day_limits).length > 0
+      ? "propio"
+      : "mismo",
+  );
+  const [dayAmounts, setDayAmounts] = useState<Record<string, string>>(() => {
+    const map: Record<string, string> = {};
+    for (const [day, amount] of Object.entries(props.initialSettings?.per_day_limits ?? {})) {
+      map[day] = String(amount);
+    }
+    return map;
+  });
   // Item 5: días permitidos (null en BD = todos; la UI parte de todos).
   const [allowedDays, setAllowedDays] = useState<number[]>(
     props.initialSettings?.allowed_days ?? [1, 2, 3, 4, 5, 6, 7],
@@ -104,6 +131,23 @@ export function VouchersClient(props: VouchersClientProps) {
   // V1: sin topes configurados no se puede solicitar; el alta vive en un modal.
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const configured = settings !== null;
+  // V2: resumen legible de los topes vigentes.
+  const capsSummary = (() => {
+    const parts: string[] = [];
+    const perDay = settings?.per_day_limits ?? null;
+    if (perDay && Object.keys(perDay).length > 0) {
+      parts.push(
+        `por día ${Object.entries(perDay)
+          .map(([day, amount]) => `${DAY_NAMES[Number(day) - 1]?.label ?? day} ${formatMoney(amount)}`)
+          .join(", ")}`,
+      );
+    }
+    const day = Number(settings?.max_per_day ?? 0);
+    const week = Number(settings?.max_per_week ?? 0);
+    if (day > 0) parts.push(`día ${formatMoney(day)}`);
+    if (week > 0) parts.push(`semana ${formatMoney(week)}`);
+    return parts.length > 0 ? parts.join(" · ") : "sin topes";
+  })();
 
   function show<T>(result: ActionResult<T>, okText?: string): result is { success: true; data: T } {
     if (!result.success) {
@@ -127,24 +171,51 @@ export function VouchersClient(props: VouchersClientProps) {
 
   async function handleLimits(event: FormEvent) {
     event.preventDefault();
-    const day = toNumber(maxDay);
-    const week = toNumber(maxWeek);
-    if (day === null || week === null) {
-      setMessage({ kind: "error", text: "Los topes deben ser números." });
+    const wantsDay = capsMode === "diarios" || capsMode === "ambos";
+    const wantsWeek = capsMode === "semanales" || capsMode === "ambos";
+    const day = wantsDay ? toNumber(maxDay) : null;
+    const week = wantsWeek ? toNumber(maxWeek) : null;
+    if (wantsDay && (day === null || day <= 0)) {
+      setMessage({ kind: "error", text: "Indique el tope diario (mayor a 0)." });
       return;
     }
-    if (allowedDays.length === 0) {
+    if (wantsWeek && (week === null || week <= 0)) {
+      setMessage({ kind: "error", text: "Indique el tope semanal (mayor a 0)." });
+      return;
+    }
+    const days = daysMode === "todos" ? DAY_NAMES.map((row) => row.day) : [...allowedDays].sort((a, b) => a - b);
+    if (days.length === 0) {
       setMessage({ kind: "error", text: "Elija al menos un día permitido." });
       return;
     }
+    // Tope propio por día: solo aplica con días indicados + tope diario.
+    const ownDayLimits = perDayMode === "propio" && daysMode === "indicados" && wantsDay;
+    let perDayLimits: Array<{ day: number; amount: number }> = [];
+    if (ownDayLimits) {
+      const entries: Array<{ day: number; amount: number }> = [];
+      for (const dayNumber of days) {
+        const amount = toNumber(dayAmounts[String(dayNumber)] ?? "");
+        if (amount === null || amount <= 0) {
+          setMessage({
+            kind: "error",
+            text: `Indique el tope del ${DAY_NAMES[dayNumber - 1]?.label ?? dayNumber} (mayor a 0).`,
+          });
+          return;
+        }
+        entries.push({ day: dayNumber, amount });
+      }
+      perDayLimits = entries;
+    }
     setBusy(true);
     const result = (await setVoucherLimitsAction({
-      max_per_day: day,
+      // Con tope propio por día el general no aplica: cada día trae el suyo.
+      max_per_day: wantsDay && !ownDayLimits ? day : null,
       max_per_week: week,
-      allowed_days: [...allowedDays].sort((a, b) => a - b),
+      allowed_days: days,
+      per_day_limits: perDayLimits,
     })) as ActionResult<VoucherSettingsRow>;
     setBusy(false);
-    if (show(result, "Topes actualizados.")) setSettings(result.data);
+    if (show(result, "Configuración de vales guardada.")) setSettings(result.data);
   }
 
   function toggleDay(day: number): void {
@@ -231,9 +302,16 @@ export function VouchersClient(props: VouchersClientProps) {
           <div>
             <h2 className="text-lg font-semibold">Vales</h2>
             <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-              Topes vigentes: día {settings ? formatMoney(settings.max_per_day) : "sin configurar"} · semana{" "}
-              {settings ? formatMoney(settings.max_per_week) : "sin configurar"} · días{" "}
-              {settings?.allowed_days ? settings.allowed_days.map((day) => DAY_NAMES[day - 1]?.label ?? day).join(", ") : "todos"}.
+              {configured ? (
+                <>
+                  Topes vigentes: {capsSummary} · días{" "}
+                  {settings?.allowed_days && settings.allowed_days.length < 7
+                    ? settings.allowed_days.map((day) => DAY_NAMES[day - 1]?.label ?? day).join(", ")
+                    : "todos"}.
+                </>
+              ) : (
+                "Topes vigentes: sin configurar."
+              )}
             </p>
           </div>
           {props.canIssue && (
@@ -257,33 +335,132 @@ export function VouchersClient(props: VouchersClientProps) {
           </p>
         )}
         {props.canAdmin && (
-          <form onSubmit={handleLimits} className="mt-3 flex flex-wrap items-end gap-3">
-            <label className={labelClass}>
-              Máximo por día
-              <input value={formatMoneyInput(maxDay)} onChange={(event) => setMaxDay(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
-            </label>
-            <label className={labelClass}>
-              Máximo por semana
-              <input value={formatMoneyInput(maxWeek)} onChange={(event) => setMaxWeek(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
-            </label>
-            <fieldset className="flex flex-col gap-1 text-sm">
-              <legend>Días permitidos</legend>
-              <div className="flex flex-wrap gap-2">
-                {DAY_NAMES.map((row) => (
-                  <label key={row.day} className="flex items-center gap-1 text-sm">
+          <form onSubmit={handleLimits} className="mt-3 flex flex-col gap-4 rounded-md border border-slate-200 p-3 dark:border-slate-700">
+            <fieldset className="flex flex-col gap-2 text-sm">
+              <legend className="font-semibold">1. Días permitidos</legend>
+              <div className="flex flex-wrap gap-4">
+                <label className="flex items-center gap-1.5">
+                  <input
+                    type="radio"
+                    name="voucher-days-mode"
+                    checked={daysMode === "todos"}
+                    onChange={() => setDaysMode("todos")}
+                  />
+                  Todos
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <input
+                    type="radio"
+                    name="voucher-days-mode"
+                    checked={daysMode === "indicados"}
+                    onChange={() => setDaysMode("indicados")}
+                  />
+                  Indicados
+                </label>
+              </div>
+              {daysMode === "indicados" && (
+                <div className="flex flex-wrap gap-2">
+                  {DAY_NAMES.map((row) => (
+                    <label key={row.day} className="flex items-center gap-1 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={allowedDays.includes(row.day)}
+                        onChange={() => toggleDay(row.day)}
+                      />
+                      {row.label}
+                    </label>
+                  ))}
+                </div>
+              )}
+            </fieldset>
+
+            <fieldset className="flex flex-col gap-2 text-sm">
+              <legend className="font-semibold">2. Topes</legend>
+              <div className="flex flex-wrap gap-4">
+                {(
+                  [
+                    ["sin", "Sin topes"],
+                    ["diarios", "Diarios"],
+                    ["semanales", "Semanales"],
+                    ["ambos", "Ambos"],
+                  ] as Array<["sin" | "diarios" | "semanales" | "ambos", string]>
+                ).map(([mode, label]) => (
+                  <label key={mode} className="flex items-center gap-1.5">
                     <input
-                      type="checkbox"
-                      checked={allowedDays.includes(row.day)}
-                      onChange={() => toggleDay(row.day)}
+                      type="radio"
+                      name="voucher-caps-mode"
+                      checked={capsMode === mode}
+                      onChange={() => setCapsMode(mode)}
                     />
-                    {row.label}
+                    {label}
                   </label>
                 ))}
               </div>
+              {(capsMode === "diarios" || capsMode === "ambos") && (
+                <label className={labelClass}>
+                  Máximo por día
+                  <input value={formatMoneyInput(maxDay)} onChange={(event) => setMaxDay(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
+                </label>
+              )}
+              {(capsMode === "semanales" || capsMode === "ambos") && (
+                <label className={labelClass}>
+                  Máximo por semana
+                  <input value={formatMoneyInput(maxWeek)} onChange={(event) => setMaxWeek(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
+                </label>
+              )}
             </fieldset>
-            <button type="submit" disabled={busy} className={buttonClass}>
-              Guardar topes
-            </button>
+
+            {daysMode === "indicados" && (capsMode === "diarios" || capsMode === "ambos") && (
+              <fieldset className="flex flex-col gap-2 text-sm">
+                <legend className="font-semibold">3. Tope por día</legend>
+                <div className="flex flex-wrap gap-4">
+                  <label className="flex items-center gap-1.5">
+                    <input
+                      type="radio"
+                      name="voucher-perday-mode"
+                      checked={perDayMode === "mismo"}
+                      onChange={() => setPerDayMode("mismo")}
+                    />
+                    Mismo para todos
+                  </label>
+                  <label className="flex items-center gap-1.5">
+                    <input
+                      type="radio"
+                      name="voucher-perday-mode"
+                      checked={perDayMode === "propio"}
+                      onChange={() => setPerDayMode("propio")}
+                    />
+                    Tope propio por día
+                  </label>
+                </div>
+                {perDayMode === "propio" && (
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                    {[...allowedDays].sort((a, b) => a - b).map((dayNumber) => (
+                      <label key={dayNumber} className={labelClass}>
+                        {DAY_NAMES[dayNumber - 1]?.label ?? dayNumber}
+                        <input
+                          value={formatMoneyInput(dayAmounts[String(dayNumber)] ?? "")}
+                          onChange={(event) =>
+                            setDayAmounts((prev) => ({ ...prev, [String(dayNumber)]: stripMoneyInput(event.target.value) }))
+                          }
+                          inputMode="numeric"
+                          className={inputClass}
+                        />
+                      </label>
+                    ))}
+                    {allowedDays.length === 0 && (
+                      <p className="text-sm text-slate-500">Elija los días indicados arriba.</p>
+                    )}
+                  </div>
+                )}
+              </fieldset>
+            )}
+
+            <div>
+              <button type="submit" disabled={busy} className={buttonClass}>
+                {busy ? "Guardando…" : "Guardar configuración"}
+              </button>
+            </div>
           </form>
         )}
         {props.canIssue && (
