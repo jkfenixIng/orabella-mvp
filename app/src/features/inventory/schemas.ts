@@ -39,6 +39,8 @@ export const productSchema = z.object({
   min_stock: z.coerce.number().int("Mínimo entero.").nonnegative("El mínimo no puede ser negativo.").default(0),
   cost_price: z.coerce.number().nonnegative("El costo no puede ser negativo.").nullish(),
   sale_price: z.coerce.number().nonnegative("El precio no puede ser negativo.").nullish(),
+  /** I1: comisión sugerida (valor absoluto) que precarga la línea de factura. */
+  commission_value: z.coerce.number().nonnegative("La comisión no puede ser negativa.").nullish(),
   is_active: z.boolean().optional(),
 });
 export type ProductInput = z.infer<typeof productSchema>;

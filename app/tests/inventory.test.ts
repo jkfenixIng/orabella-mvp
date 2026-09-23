@@ -43,6 +43,13 @@ describe("inventory schemas: producto (INV-01)", () => {
     expect(productSchema.safeParse(baseProduct({ sale_price: -5 })).success).toBe(false);
   });
 
+  it("I1: acepta comisión sugerida válida y rechaza negativa", () => {
+    expect(productSchema.safeParse(baseProduct({ commission_value: 5000 })).success).toBe(true);
+    expect(productSchema.safeParse(baseProduct({ commission_value: 0 })).success).toBe(true);
+    expect(productSchema.safeParse(baseProduct({ commission_value: null })).success).toBe(true);
+    expect(productSchema.safeParse(baseProduct({ commission_value: -1 })).success).toBe(false);
+  });
+
   it("normaliza el SKU (trim + mayúsculas) para unicidad por sede", () => {
     expect(normalizeSku("  sh-001 ")).toBe("SH-001");
     expect(normalizeSku("Sh-001")).toBe("SH-001");
@@ -236,5 +243,20 @@ describe("migración 004_inventory.sql (T4)", () => {
 
   it("documenta que el stock solo se escribe vía movimientos", () => {
     expect(sql).toContain("INV-03");
+  });
+});
+
+describe("migración 027_products_commission.sql (I1)", () => {
+  const sql = readFileSync(join(process.cwd(), "supabase", "migrations", "027_products_commission.sql"), "utf8");
+
+  it("agrega commission_value nullable re-ejecutable con CHECK no negativo", () => {
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS commission_value numeric(12, 2) NULL");
+    expect(sql).toContain("chk_products_commission_value");
+    expect(sql).toContain("commission_value IS NULL OR commission_value >= 0");
+  });
+
+  it("documenta que la línea de factura manda sobre la sugerencia", () => {
+    expect(sql).toContain("Precarga la comisión de la línea");
+    expect(sql).toContain("el valor editado en la línea manda");
   });
 });

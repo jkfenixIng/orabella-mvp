@@ -265,10 +265,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setEditItems((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
   }
 
+  /**
+   * I1: al elegir el producto se sugieren precio de venta y comisión del
+   * catálogo. La comisión del producto es un valor absoluto; si el cajero la
+   * edita a mano en la línea, la línea manda.
+   */
   function autofillDraftPrice(type: ItemDraft["item_type"], refId: string) {
     if (type === "producto") {
       const found = props.products.find((row) => row.id === refId);
       if (found?.sale_price != null) patchDraft({ unit_price: String(found.sale_price) });
+      if (found && found.commission_value != null && found.commission_value > 0) {
+        patchDraft({ commission_value: found.commission_value, no_commission: false });
+      }
     }
     if (type === "servicio") {
       const found = props.services.find((row) => row.id === refId);

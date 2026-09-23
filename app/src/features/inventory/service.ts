@@ -94,35 +94,66 @@ export interface ProductRow {
   min_stock: number;
   cost_price: number | null;
   sale_price: number | null;
+  /** I1: comisión sugerida del producto (absoluta); null = sin sugerencia. */
+  commission_value: number | null;
   is_active: boolean;
 }
 
 const PRODUCT_SELECT =
+  "id, sede_id, sku, name, description, stock_qty, min_stock, cost_price, sale_price, commission_value, is_active";
+/** Misma selección sin la comisión: la migración 027 aún sin aplicar en esta base. */
+const PRODUCT_SELECT_LEGACY =
   "id, sede_id, sku, name, description, stock_qty, min_stock, cost_price, sale_price, is_active";
+
+// I1: commission_value llega con la migración 027. La primera consulta decide y
+// se cachea para no repetir la prueba; un error distinto (red/permisos) no se
+// cachea, así la consulta real lo reporta en vez de degradar en silencio.
+let commissionColumn: boolean | null = null;
+
+async function resolveProductSelect(db: Awaited<ReturnType<typeof inventoryDb>>): Promise<string> {
+  if (commissionColumn === null) {
+    const probe = await db.from("products").select("commission_value").limit(1);
+    if (!probe.error) {
+      commissionColumn = true;
+    } else {
+      const message = String((probe.error as { message?: string }).message ?? "");
+      if (/commission_value/i.test(message)) commissionColumn = false;
+    }
+  }
+  return commissionColumn === false ? PRODUCT_SELECT_LEGACY : PRODUCT_SELECT;
+}
+
+/** Rellena commission_value cuando la columna no está disponible en esta base. */
+function normalizeProduct(row: Record<string, unknown>): ProductRow {
+  return {
+    ...(row as unknown as ProductRow),
+    commission_value: (row.commission_value as number | null) ?? null,
+  };
+}
 
 /** INV-05 + lectura: lista productos activos e inactivos de la sede (máx. 50 por defecto). */
 export async function listProducts(sedeId: string, limit?: number): Promise<ProductRow[]> {
   const db = await inventoryDb();
   const { data, error } = await db
     .from("products")
-    .select(PRODUCT_SELECT)
+    .select(await resolveProductSelect(db))
     .eq("sede_id", sedeId)
     .order("name")
     .limit(clampLimit(limit));
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as ProductRow[];
+  return ((data ?? []) as unknown as Array<Record<string, unknown>>).map(normalizeProduct);
 }
 
 export async function getProduct(id: string): Promise<ProductRow> {
   const db = await inventoryDb();
   const { data, error } = await db
     .from("products")
-    .select(PRODUCT_SELECT)
+    .select(await resolveProductSelect(db))
     .eq("id", id)
     .maybeSingle();
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
   if (!data) throw new InventoryError("NOT_FOUND", "Producto no encontrado.", 404);
-  return data as ProductRow;
+  return normalizeProduct(data as unknown as Record<string, unknown>);
 }
 
 /**
@@ -154,6 +185,7 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
     throw new InventoryError("SKU_TAKEN", "El SKU ya existe en esta sede.", 409);
   }
 
+  const select = await resolveProductSelect(db);
   const payload = {
     ...(input.id ? { id: input.id } : {}),
     sede_id: input.sede_id,
@@ -163,12 +195,14 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
     min_stock: input.min_stock,
     cost_price: input.cost_price ?? null,
     sale_price: input.sale_price ?? null,
+    // Con la columna ausente (027 sin aplicar) no se envía la comisión.
+    ...(select === PRODUCT_SELECT ? { commission_value: input.commission_value ?? null } : {}),
     ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
   };
   const { data, error } = await db
     .from("products")
     .upsert(payload, { onConflict: "id" })
-    .select(PRODUCT_SELECT)
+    .select(select)
     .single();
   if (error) {
     // Carrera perdida contra UNIQUE (sede_id, sku): mismo error de negocio.
@@ -178,7 +212,7 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
     throw new InventoryError("INTERNAL", "Error interno.", 500);
   }
   if (!data) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  return data as ProductRow;
+  return normalizeProduct(data as unknown as Record<string, unknown>);
 }
 
 /** INV-05: búsqueda por fragmento de nombre o SKU, solo dentro de la sede (máx. 50 por defecto). */
@@ -190,13 +224,13 @@ export async function searchProducts(sedeId: string, q: string, limit?: number):
   const pattern = `%${escaped}%`;
   const { data, error } = await db
     .from("products")
-    .select(PRODUCT_SELECT)
+    .select(await resolveProductSelect(db))
     .eq("sede_id", sedeId)
     .or(`name.ilike.${pattern},sku.ilike.${pattern}`)
     .order("name")
     .limit(clampLimit(limit));
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  const rows = (data ?? []) as ProductRow[];
+  const rows = ((data ?? []) as unknown as Array<Record<string, unknown>>).map(normalizeProduct);
   // Filtro de apoyo en memoria (misma regla que matchesProductQuery).
   return rows.filter((row) => matchesProductQuery(row, needle));
 }
@@ -206,13 +240,13 @@ export async function lowStockAlerts(sedeId: string, limit?: number): Promise<Pr
   const db = await inventoryDb();
   const { data, error } = await db
     .from("products")
-    .select(PRODUCT_SELECT)
+    .select(await resolveProductSelect(db))
     .eq("sede_id", sedeId)
     .eq("is_active", true)
     .order("stock_qty")
     .limit(clampLimit(limit, 200));
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  return filterLowStock((data ?? []) as ProductRow[]);
+  return filterLowStock(((data ?? []) as unknown as Array<Record<string, unknown>>).map(normalizeProduct));
 }
 
 // ---------------------------------------------------------------- movimientos ---
