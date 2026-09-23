@@ -40,7 +40,7 @@ Out:
 - [x] F1 Facturación default día (HECHO 59e58b0 2026-09-23; from/to=hoy, vaciar = ver todo).
 - [ ] I1 Inventario producto: auditar UI vs schema; agregar lo faltante (COMISIÓN: ver pregunta abierta — no existe por producto, vive por línea de factura).
 - [ ] S1 Servicios a Catálogos: sacar de panel admin a módulo catálogos (ALCANCE por confirmar).
-- [ ] A1 Alertas default pendientes: unreadOnly=true por defecto (cliente + page).
+- [x] A1 Alertas default pendientes (HECHO 2026-09-23; unreadOnly=true en page + client).
 - [ ] F2 Mensajes caja en factura: sin turno / turno ajeno, quién puede pagar o anular (emitir, pagar, anular, edición).
 - [ ] C1 Caja todos los pagos + dueño del turno: columnas todos los métodos (desglose ventas) + "Turno actual de {nombre}".
 - [ ] V1 Vales gating + layout: sin config → mensaje y bloqueo; botón-crear abre modal; lista debajo.
