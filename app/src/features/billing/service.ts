@@ -102,6 +102,7 @@ export interface InvoiceRow {
   user_id: string | null;
   cash_shift_id: string | null;
   closed_by: string | null;
+  closed_at: string | null;
   cancel_reason: string | null;
   created_at: string;
 }
@@ -155,7 +156,7 @@ export interface InvoiceDetail {
 }
 
 const INVOICE_SELECT =
-  "id, sede_id, consecutive_number, client_name, client_document, subtotal, discount, tax, surcharge, total, status, user_id, cash_shift_id, closed_by, cancel_reason, created_at";
+  "id, sede_id, consecutive_number, client_name, client_document, subtotal, discount, tax, surcharge, total, status, user_id, cash_shift_id, closed_by, closed_at, cancel_reason, created_at";
 const ITEM_SELECT =
   "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission, commission_value, employees!inner(full_name, employee_code)";
 const TAX_SELECT = "id, invoice_id, tax_code, tax_name, percent, amount";
@@ -653,6 +654,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
         user_id: actor.userId,
         cash_shift_id: cashShiftId,
         closed_by: status === "Pagada" ? actor.userId : null,
+        closed_at: status === "Pagada" ? new Date().toISOString() : null,
       })
       .select(INVOICE_SELECT)
       .single();
@@ -795,7 +797,7 @@ export async function annulInvoice(
 
   const { data: updated, error: updateError } = await db
     .from("invoices")
-    .update({ status: "Anulada", cancel_reason: motivo, closed_by: actor.userId })
+    .update({ status: "Anulada", cancel_reason: motivo, closed_by: actor.userId, closed_at: new Date().toISOString() })
     .eq("id", id)
     .select(INVOICE_SELECT)
     .single();
@@ -1484,7 +1486,7 @@ export async function splitPayment(
   if (check.fullyPaid && detail.invoice.status === "Emitida") {
     const { data: updated, error: updateError } = await db
       .from("invoices")
-      .update({ status: "Pagada", closed_by: actor.userId })
+      .update({ status: "Pagada", closed_by: actor.userId, closed_at: new Date().toISOString() })
       .eq("id", id)
       .select(INVOICE_SELECT)
       .single();

@@ -1219,12 +1219,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
           <div className="mt-4 overflow-hidden rounded-lg border border-color-2 dark:border-border-color">
             <div
               aria-hidden="true"
-              className="hidden grid-cols-[2.5rem_7.5rem_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.2fr)_5.5rem_4.5rem_4.5rem] gap-2 border-b border-color-2 bg-surface px-3 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary sm:grid dark:border-border-color"
+              className="hidden grid-cols-[2.5rem_7.5rem_minmax(0,1fr)_minmax(0,1fr)_7.5rem_minmax(0,1.2fr)_5.5rem_4.5rem_4.5rem] gap-2 border-b border-color-2 bg-surface px-3 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary sm:grid dark:border-border-color"
             >
               <span>ID</span>
               <span>Fecha</span>
               <span>Abrió</span>
               <span>Cerró</span>
+              <span>Cerrada</span>
               <span>Empleados</span>
               <span className="text-right">Total</span>
               <span>Estado</span>
@@ -1234,7 +1235,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
             {invoices.map((row) => (
               <li
                 key={row.id}
-                className="flex flex-col gap-1 px-3 py-2.5 sm:grid sm:grid-cols-[2.5rem_7.5rem_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.2fr)_5.5rem_4.5rem_4.5rem] sm:items-center sm:gap-2"
+                className="flex flex-col gap-1 px-3 py-2.5 sm:grid sm:grid-cols-[2.5rem_7.5rem_minmax(0,1fr)_minmax(0,1fr)_7.5rem_minmax(0,1.2fr)_5.5rem_4.5rem_4.5rem] sm:items-center sm:gap-2"
               >
                 <span className="font-mono text-sm font-semibold text-slate-700 dark:text-slate-300">
                   #{row.consecutive_number}
@@ -1248,6 +1249,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 </span>
                 <span className="truncate text-sm text-slate-600 dark:text-slate-300" title={row.closed_by_name ?? ""}>
                   {row.closed_by_name ?? "—"}
+                </span>
+                <span className="whitespace-nowrap text-sm text-slate-500 dark:text-slate-400">
+                  {row.closed_at
+                    ? `${new Date(row.closed_at).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })} ${new Date(row.closed_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}`
+                    : "—"}
                 </span>
                 <span
                   className="truncate text-sm text-slate-600 dark:text-slate-300"
