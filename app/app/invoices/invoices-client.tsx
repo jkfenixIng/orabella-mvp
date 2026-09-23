@@ -269,6 +269,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setEditItems((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
   }
 
+  /** Ajusta un ítem ya agregado al borrador de emisión (edición del listado). */
+  function patchDraftItem(index: number, patch: Partial<ItemDraft>) {
+    setItems((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+  }
+
   /**
    * I1: al elegir el producto se sugieren precio de venta y comisión del
    * catálogo. La comisión del producto es un valor absoluto; si el cajero la
@@ -304,6 +309,23 @@ export function InvoicesClient(props: InvoicesClientProps) {
     const found = props.employees.find((row) => row.id === employeeId);
     if (!found) return "—";
     return found.employee_code ? `${found.full_name} (${found.employee_code})` : found.full_name;
+  }
+
+  /**
+   * Ítem `producto` en borrador: su comisión NO es un valor fijo del ítem, es
+   * el porcentaje configurado en el empleado, que el sistema aplica al emitir
+   * (misma regla que `computeInvoiceItemCommission` en billing/commission).
+   * Por eso acá se describe la regla vigente en vez de adelantar un monto que
+   * el backend calculará.
+   */
+  function productCommissionLabel(employeeId: string): string {
+    const employee = props.employees.find((row) => row.id === employeeId);
+    if (!employee) return "Según empleado";
+    if (employee.payout_mode === "no_aplica") return "Sin comisión";
+    if (employee.pay_type !== "porcentaje" && employee.pay_type !== "mixto") return "Sin comisión";
+    const percent = employee.commission_percent == null ? 0 : Number(employee.commission_percent);
+    if (!(percent > 0)) return "Sin comisión";
+    return `Según empleado: ${percent}%`;
   }
 
   function addItemFromDialog() {
@@ -572,6 +594,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
       unit_price: number;
       discount: number;
       no_commission: boolean;
+      commission_value: number | null;
     }>;
     discount: number;
     payments: Array<{ method_code: string; amount: number }>;
@@ -603,6 +626,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
         setError(`Ítem ${index + 1}: precio inválido.`);
         return null;
       }
+      if (item.item_type === "custom" && !item.no_commission) {
+        if (item.commission_value == null || !(item.commission_value >= 0)) {
+          setError(`Ítem ${index + 1}: indique el valor de la comisión.`);
+          return null;
+        }
+      }
       parsedItems.push({
         item_type: item.item_type,
         product_id: item.item_type === "producto" ? item.ref_id || null : null,
@@ -613,6 +642,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
         unit_price: price,
         discount: 0,
         no_commission: item.no_commission,
+        commission_value: item.item_type === "custom" && !item.no_commission ? item.commission_value : null,
       });
     }
     const parsedPortions = [];
@@ -973,19 +1003,43 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     </td>
                                     {!clientView && (
                                       <td className="whitespace-nowrap px-3 py-2 text-center">
-                                        {item.item_type === "servicio" ? (
+                                        {item.item_type === "servicio" || item.no_commission ? (
                                           <span className="text-xs text-slate-500">Sin comisión</span>
-                                        ) : item.no_commission ? (
-                                          <span className="text-xs text-slate-500">Sin comisión</span>
-                                        ) : item.item_type === "custom" &&
-                                          item.commission_value !== null &&
-                                          item.commission_value !== undefined ? (
-                                          <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
-                                            {formatMoney(item.commission_value)}
-                                          </span>
+                                        ) : item.item_type === "custom" ? (
+                                          <div className="flex flex-col items-center gap-0.5">
+                                            <input
+                                              className={`${paperInputClass} h-9 w-28 text-right`}
+                                              value={formatMoneyInput(
+                                                item.commission_value == null ? "" : String(item.commission_value),
+                                              )}
+                                              onChange={(event) =>
+                                                patchDraftItem(index, {
+                                                  commission_value:
+                                                    event.target.value.trim() === ""
+                                                      ? null
+                                                      : Number(stripMoneyInput(event.target.value)),
+                                                })
+                                              }
+                                              placeholder="Valor $"
+                                              inputMode="numeric"
+                                              aria-label={`Ítem ${index + 1} valor comisión`}
+                                              title="Corrija aquí el valor de la comisión del ítem."
+                                            />
+                                            {item.commission_value == null && (
+                                              <span
+                                                className="text-[10px] text-slate-500"
+                                                title="Sin valor fijo se aplica el porcentaje del empleado."
+                                              >
+                                                Se usará % del empleado
+                                              </span>
+                                            )}
+                                          </div>
                                         ) : (
-                                          <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
-                                            Con comisión
+                                          <span
+                                            className="text-xs font-medium text-emerald-700"
+                                            title="El sistema calcula el monto con el porcentaje del empleado al emitir."
+                                          >
+                                            {productCommissionLabel(item.employee_id)}
                                           </span>
                                         )}
                                       </td>
@@ -1879,23 +1933,43 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                   />
                                                   <span className="text-slate-600">¿Comisión?</span>
                                                 </label>
-                                                {item.item_type === "custom" && !item.no_commission && (
-                                                  <input
-                                                    type="number"
-                                                    className={`${paperInputClass} w-28`}
-                                                    value={item.commission_value ?? ""}
-                                                    onChange={(event) =>
-                                                      patchEditItem(index, {
-                                                        commission_value:
-                                                          event.target.value === "" ? null : Number(event.target.value),
-                                                      })
-                                                    }
-                                                    placeholder="Valor $"
-                                                    min={0}
-                                                    step={100}
-                                                    inputMode="decimal"
-                                                    aria-label={`Editar ítem ${index + 1} valor comisión`}
-                                                  />
+                                                {!item.no_commission && item.item_type === "custom" && (
+                                                  <>
+                                                    <input
+                                                      className={`${paperInputClass} h-9 w-28 text-right`}
+                                                      value={formatMoneyInput(
+                                                        item.commission_value == null ? "" : String(item.commission_value),
+                                                      )}
+                                                      onChange={(event) =>
+                                                        patchEditItem(index, {
+                                                          commission_value:
+                                                            event.target.value.trim() === ""
+                                                              ? null
+                                                              : Number(stripMoneyInput(event.target.value)),
+                                                        })
+                                                      }
+                                                      placeholder="Valor $"
+                                                      inputMode="numeric"
+                                                      aria-label={`Editar ítem ${index + 1} valor comisión`}
+                                                      title="Corrija aquí el valor de la comisión del ítem."
+                                                    />
+                                                    {item.commission_value == null && (
+                                                      <span
+                                                        className="text-[10px] text-slate-500"
+                                                        title="Sin valor fijo se aplica el porcentaje del empleado."
+                                                      >
+                                                        Se usará % del empleado
+                                                      </span>
+                                                    )}
+                                                  </>
+                                                )}
+                                                {!item.no_commission && item.item_type === "producto" && (
+                                                  <span
+                                                    className="text-xs font-medium text-emerald-700"
+                                                    title="El sistema calcula el monto con el porcentaje del empleado al emitir."
+                                                  >
+                                                    {productCommissionLabel(item.employee_id)}
+                                                  </span>
                                                 )}
                                               </div>
                                             )}
