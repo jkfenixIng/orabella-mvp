@@ -41,7 +41,7 @@ Out:
 - [ ] I1 Inventario producto: auditar UI vs schema; agregar lo faltante (COMISIÓN: ver pregunta abierta — no existe por producto, vive por línea de factura).
 - [ ] S1 Servicios a Catálogos: sacar de panel admin a módulo catálogos (ALCANCE por confirmar).
 - [x] A1 Alertas default pendientes (HECHO 2026-09-23; unreadOnly=true en page + client).
-- [ ] F2 Mensajes caja en factura: sin turno / turno ajeno, quién puede pagar o anular (emitir, pagar, anular, edición).
+- [x] F2 Mensajes caja en factura (HECHO bf7dc96 2026-09-23; sin turno/turno ajeno con dueño en emitir/editar/pagar; anular admin-only intacto; aviso temprano en crear).
 - [x] F3 Columna Cerrada (HECHO 22cb0ac 2026-09-23; 025 closed_at aplicada por usuario en PRUEBAS).
 - [x] B1 Stock no descuenta (HECHO 30a6ae3 2026-09-23; descuento único al EMITIR vía deductStock en inventory/service; 210/210 verde).
 - [ ] C1 Caja todos los pagos + dueño del turno: columnas todos los métodos (desglose ventas) + "Turno actual de {nombre}".
@@ -70,12 +70,14 @@ Módulos Facturación, Inventario, Servicios/Catálogos, Alertas, Caja, Vales. R
 
 ## Progress
 - 2026-09-23: Doc creado + mapa read-only. Base: migraciones hasta 024 aplicadas por usuario.
+- 2026-09-23: F2 hecho (bf7dc96). Route: direct-inline (delegación imposible en este runtime, constancia). TDD: no configurado (sin runner declarado; verificación ordinaria typecheck+vitest full).
 
 ## Verification evidence
+- F2 (bf7dc96): `npm run typecheck` 0 errores; `npm test` 11 archivos 210/210.
 - (pendiente por item)
 
 ## Next step
-- F1 Facturación default día.
+- C1 Caja todos los pagos + dueño del turno.
 
 ## Route declaration
 - Delegated-direct por item (writer trigger 2+ archivos); inline solo mecánico de 1 archivo.
