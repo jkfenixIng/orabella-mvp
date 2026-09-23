@@ -21,6 +21,7 @@ import {
   resolveClosingBase,
   resolveOpeningBase,
   sumMethodMaps,
+  sumMethodTotal,
   voucherOutByMethod,
 } from "@/src/features/cash/schemas";
 
@@ -409,5 +410,30 @@ describe("cash: vales aprobados descuentan del arqueo por su método", () => {
     expect(
       buildMethodViews({ paid, open, paidOut: new Map(), closed: closedNoOut }).diferencias,
     ).toEqual([{ method_code: "nequi", expected: 1200000, declared: 1150000, difference: -50000 }]);
+  });
+});
+
+// ------------------------------------------------- total de vales por turno ---
+
+describe("cash: total de vales por turno (columna Vales)", () => {
+  it("suma los vales del turno de todos los métodos como salida positiva", () => {
+    const out = voucherOutByMethod([
+      { approved_by: "u1", method_code: "efectivo", amount: 10000 },
+      { approved_by: "u1", method_code: "nequi", amount: 25000 },
+      { approved_by: null, method_code: "efectivo", amount: 999999 },
+    ]);
+    // Solo los aprobados cuentan; el pendiente se ignora.
+    expect(sumMethodTotal(out)).toBe(35000);
+  });
+
+  it("degrada a 0 cuando la migración de vales no está aplicada (mapa ausente)", () => {
+    // `fetchVoucherOutTotals` devuelve un mapa vacío si faltan las columnas.
+    expect(sumMethodTotal(undefined)).toBe(0);
+    expect(sumMethodTotal(null)).toBe(0);
+    expect(sumMethodTotal(new Map())).toBe(0);
+  });
+
+  it("redondea el total a centavos", () => {
+    expect(sumMethodTotal(new Map([["nequi", 0.1], ["efectivo", 0.2]]))).toBe(0.3);
   });
 });

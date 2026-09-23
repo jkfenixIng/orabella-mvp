@@ -70,6 +70,19 @@ export function sumMethodMaps(
   return out;
 }
 
+/**
+ * Total de un mapa de montos por método (p. ej. el total de vales de un
+ * turno). Un mapa ausente suma 0, de modo que la vista degrada sin romperse
+ * cuando la migración de vales no está aplicada. Puro para probarlo sin base
+ * de datos.
+ */
+export function sumMethodTotal(map: Map<string, number> | null | undefined): number {
+  if (!map) return 0;
+  let total = 0;
+  for (const amount of map.values()) total += amount;
+  return roundMoney(total);
+}
+
 export interface ShiftCountMaps {
   paid: Map<string, number>;
   open: Map<string, number>;

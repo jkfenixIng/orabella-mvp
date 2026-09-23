@@ -93,6 +93,7 @@ function ShiftsTable({
                   ))}
                 </>
               )}
+              <th className="whitespace-nowrap py-1 pr-3">Vales</th>
               <th className="whitespace-nowrap py-1 pr-3">Base final</th>
               {isAdmin && (
                 <>
@@ -139,6 +140,7 @@ function ShiftsTable({
                       })}
                     </>
                   )}
+                  <td className="whitespace-nowrap py-1 pr-3">{formatMoney(view.vales)}</td>
                   <td className="whitespace-nowrap py-1 pr-3">
                     {isClosed ? formatMoney(view.shift.base_left) : "—"}
                   </td>
@@ -173,7 +175,7 @@ function ShiftsTable({
             {shifts.length === 0 && (
               <tr>
               <td
-                colSpan={6 + (isAdmin ? 5 + methodCols.length : 0)}
+                colSpan={7 + (isAdmin ? 5 + methodCols.length : 0)}
                   className="py-2 text-slate-600 dark:text-slate-300"
                 >
                   {emptyText}
@@ -861,7 +863,6 @@ export function CashClient(props: CashClientProps) {
                       {row.status}
                       {row.status === "descontada" ? " (en nómina)" : ""}
                     </span>
-                    {row.approval_code && <span className="text-xs">Código: {row.approval_code}</span>}
                   </li>
                 ))}
               </ul>

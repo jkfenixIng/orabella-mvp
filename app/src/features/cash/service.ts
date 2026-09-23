@@ -19,6 +19,7 @@ import {
   roundMoney,
   moneyEquals,
   sumMethodMaps,
+  sumMethodTotal,
   voucherOutByMethod,
   type CloseShiftInput,
   type DayTotals,
@@ -888,6 +889,8 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
 export interface CloseShiftResult {
   shift: CashShiftRow;
   methodDifferences: MethodDifference[];
+  /** Total de vales aprobados del turno (salida de caja, valor absoluto). */
+  vales: number;
 }
 
 export async function closeShift(
@@ -955,7 +958,7 @@ export async function closeShift(
     for (const [code, amount] of voucherOut) {
       paidOutByMethod.set(code, roundMoney((paidOutByMethod.get(code) ?? 0) + amount));
     }
-    const vouchersOut = roundMoney([...voucherOut.values()].reduce((acc, value) => acc + value, 0));
+    const vouchersOut = sumMethodTotal(voucherOut);
     // Facturas cobradas en este turno (emitidas aquí o en turnos anteriores):
     // suman al esperado y al arqueo por método, igual que `payments`.
     const invoicePayMaps = await fetchInvoicePaymentsByShift(db, [shift.id]);
@@ -1053,7 +1056,7 @@ export async function closeShift(
         metadata: { method_differences: methodDifferences },
       });
     }
-    return { shift: closed, methodDifferences };
+    return { shift: closed, methodDifferences, vales: vouchersOut };
   } catch (error) {
     throw toCashError(error);
   }
@@ -1161,6 +1164,13 @@ export interface DayShiftView {
   shift: CashShiftRow;
   ventas: number;
   efectivo: number;
+  /**
+   * Total de vales aprobados del turno, en valor absoluto (es una SALIDA de
+   * caja: el dinero ya salió del cajón, por eso resta del esperado). Suma
+   * todos los métodos; 0 si no hay vales o si la migración de vales no está
+   * aplicada.
+   */
+  vales: number;
   /** Cobrado por método en el turno (todos los métodos con movimiento). */
   metodos: Array<{ method_code: string; amount: number }>;
   /** Declarado por método (cierre si está cerrado, apertura si no). */
@@ -1289,6 +1299,7 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
       efectivo: roundMoney(
         list.filter((row) => row.method_code === "efectivo").reduce((acc, row) => acc + row.amount, 0),
       ),
+      vales: sumMethodTotal(voucherOutMaps.get(shift.id)),
       metodos,
       declarados,
       diferencias,
@@ -1433,6 +1444,7 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
         efectivo: roundMoney(
           list.filter((row) => row.method_code === "efectivo").reduce((acc, row) => acc + row.amount, 0),
         ),
+        vales: sumMethodTotal(historyVoucherOutMaps.get(shift.id)),
         metodos,
         declarados,
         diferencias,
