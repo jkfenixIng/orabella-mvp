@@ -19,6 +19,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/src/components/ui/lib/dialog";
+import { Combobox } from "@/src/components/ui/lib/combobox";
 import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 import { cn } from "@/src/components/ui/lib/utils";
 
@@ -94,7 +95,6 @@ export function VouchersClient(props: VouchersClientProps) {
   const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
   const [voucherEmployee, setVoucherEmployee] = useState("");
   const [voucherAmount, setVoucherAmount] = useState("");
-  const [voucherDate, setVoucherDate] = useState("");
   const [voucherNote, setVoucherNote] = useState("");
   const [reviewNote, setReviewNote] = useState("");
   const [rejectReason, setRejectReason] = useState("");
@@ -132,10 +132,16 @@ export function VouchersClient(props: VouchersClientProps) {
     return true;
   }
 
+  /**
+   * Etiqueta legible del empleado: nombre + ID interno. El ID interno es el
+   * código de empleado (`employee_code`); si no está definido, se usa el
+   * documento. Así dos personas con el mismo nombre se distinguen de un vistazo.
+   */
   function employeeName(id: string): string {
     const found = props.initialEmployees.find((row) => row.id === id);
     if (!found) return id.slice(0, 8);
-    return `${found.document}${found.employee_code ? ` (${found.employee_code})` : ""}`;
+    const internalId = found.employee_code ? found.employee_code : found.document;
+    return `${found.full_name} (${internalId})`;
   }
 
   async function refreshVouchers() {
@@ -151,10 +157,11 @@ export function VouchersClient(props: VouchersClientProps) {
       return;
     }
     setBusy(true);
+    // La fecha del vale la asigna el backend con la fecha del día de la
+    // solicitud; el frontend no la envía.
     const result = (await requestVoucherAction({
       employee_id: voucherEmployee,
       amount,
-      request_date: voucherDate || undefined,
       observation: voucherNote || undefined,
     })) as ActionResult<VoucherRequestResult>;
     setBusy(false);
@@ -173,7 +180,6 @@ export function VouchersClient(props: VouchersClientProps) {
       )
     ) {
       setVoucherAmount("");
-      setVoucherDate("");
       setVoucherNote("");
       setIsCreateOpen(false);
       await refreshVouchers();
@@ -298,24 +304,23 @@ export function VouchersClient(props: VouchersClientProps) {
               <form onSubmit={handleRequestVoucher} className="mt-3 flex flex-col gap-3">
                 <label className={labelClass}>
                   Empleado
-                  <select value={voucherEmployee} onChange={(event) => setVoucherEmployee(event.target.value)} className={inputClass}>
-                    <option value="">Seleccione…</option>
-                    {props.initialEmployees
+                  <Combobox
+                    value={voucherEmployee}
+                    onValueChange={setVoucherEmployee}
+                    placeholder="Seleccione…"
+                    options={props.initialEmployees
                       .filter((row) => row.is_active)
-                      .map((row) => (
-                        <option key={row.id} value={row.id}>
-                          {employeeName(row.id)}
-                        </option>
-                      ))}
-                  </select>
+                      .map((row) => ({
+                        value: row.id,
+                        label: employeeName(row.id),
+                      }))}
+                    ariaLabel="Empleado que solicita el vale"
+                    filterPlaceholder="Buscar empleado…"
+                  />
                 </label>
                 <label className={labelClass}>
                   Monto
                   <input value={formatMoneyInput(voucherAmount)} onChange={(event) => setVoucherAmount(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
-                </label>
-                <label className={labelClass}>
-                  Fecha (opcional)
-                  <input type="date" value={voucherDate} onChange={(event) => setVoucherDate(event.target.value)} className={inputClass} />
                 </label>
                 <label className={labelClass}>
                   Observación (opcional)
