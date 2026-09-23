@@ -4,10 +4,13 @@ import {
   matchesProductQuery,
   movementSchema,
   normalizeSku,
+  planStockDeduction,
   productSchema,
   sortKardexAscending,
+  type DeductionLine,
   type MovementInput,
   type MovementType,
+  type PlannedDeduction,
   type ProductInput,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
@@ -296,6 +299,100 @@ export async function registerMovement(
 
   const current = await getProduct(product.id);
   return { movement: data as MovementRow, stock_qty: current.stock_qty };
+}
+
+/**
+ * B1/FAC-06 (frontera modular): lectura batch de stock para otros módulos.
+ * Billing la usa para validar existencia/sede y pre-chequear stock SIN
+ * tocar las tablas de inventario directamente. Una sola query con IN
+ * (sin N+1); el mapa solo incluye productos de la sede indicada.
+ */
+export interface StockEntry {
+  name: string;
+  stock_qty: number;
+  sede_id: string;
+}
+
+export async function getProductsStock(
+  sedeId: string,
+  productIds: string[],
+): Promise<Map<string, StockEntry>> {
+  const unique = [...new Set(productIds)];
+  if (unique.length === 0) return new Map();
+  const db = await inventoryDb();
+  const { data, error } = await db
+    .from("products")
+    .select("id, sede_id, name, stock_qty")
+    .eq("sede_id", sedeId)
+    .in("id", unique);
+  if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
+  return new Map(
+    ((data ?? []) as Array<{ id: string; sede_id: string; name: string; stock_qty: number }>).map(
+      (row) => [row.id, { name: row.name, stock_qty: Number(row.stock_qty), sede_id: row.sede_id }],
+    ),
+  );
+}
+
+function toStockError(error: unknown): InventoryError {
+  if (error instanceof InventoryError) return error;
+  if (error instanceof Error && error.message === "PRODUCT_NOT_FOUND") {
+    return new InventoryError("NOT_FOUND", "Producto no encontrado.", 404);
+  }
+  if (error instanceof Error && error.message === "INSUFFICIENT_STOCK") {
+    const details = (error as { details?: { name?: string; stock?: number; requested?: number } })
+      .details;
+    return new InventoryError(
+      "INSUFFICIENT_STOCK",
+      details
+        ? `Stock insuficiente para ${details.name}: hay ${details.stock}, se piden ${details.requested}.`
+        : "Stock insuficiente para el ajuste.",
+      409,
+    );
+  }
+  return new InventoryError("INTERNAL", "Error interno.", 500);
+}
+
+/**
+ * B1/FAC-06 (frontera modular): descuenta stock para una venta.
+ * Momento único del descuento: AL EMITIR la factura. Pagar después
+ * (splitPayment) NO descuenta; anular revierte con IN; editar ajusta
+ * por deltas. Servicios y líneas sin product_id no tocan stock.
+ *
+ * Valida todo ANTES de mover (existencia, sede, stock suficiente con
+ * mensaje por producto, 409, nunca INTERNAL por falta de stock) y luego
+ * registra un OUT por producto vía registerMovement (trigger aplica el
+ * stock y bloquea carreras con el mismo 409).
+ */
+export async function deductStock(
+  actor: { userId: string; sedeId: string },
+  lines: DeductionLine[],
+  reason: string,
+): Promise<PlannedDeduction[]> {
+  const wanted = [...new Set(lines.map((line) => line.product_id).filter((id): id is string => !!id))];
+  // Solo servicios/custom: nada que descontar (no tocan stock).
+  if (wanted.length === 0) return [];
+  const stockMap = await getProductsStock(actor.sedeId, wanted);
+  const stockByProduct = new Map(
+    [...stockMap].map(([id, entry]) => [id, { name: entry.name, stock_qty: entry.stock_qty }]),
+  );
+
+  let planned: PlannedDeduction[];
+  try {
+    planned = planStockDeduction(lines, stockByProduct);
+  } catch (error) {
+    throw toStockError(error);
+  }
+  try {
+    for (const item of planned) {
+      await registerMovement(
+        { product_id: item.product_id, type: "OUT", qty: item.qty, reason },
+        actor,
+      );
+    }
+  } catch (error) {
+    throw toStockError(error);
+  }
+  return planned;
 }
 
 function resolveSedeOrThrow(sessionSedeId: string, rowSedeId: string): void {

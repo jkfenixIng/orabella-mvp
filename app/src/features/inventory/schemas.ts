@@ -100,6 +100,68 @@ export function sortKardexAscending<T extends KardexEntry>(rows: T[]): T[] {
 }
 
 /**
+ * B1/FAC-06: planifica el descuento de stock de una venta (puro, sin BD).
+ *
+ * - Agrega cantidades por producto (varias líneas del mismo producto suman).
+ * - Ignora líneas sin product_id (servicios y custom no tocan stock).
+ * - Lanza PRODUCT_NOT_FOUND si el producto no está en el mapa de stock.
+ * - Lanza INSUFFICIENT_STOCK si el OUT agregado dejaría negativo (misma
+ *   regla que applyMovementStock y el trigger trg_inventory_no_negative).
+ *   El error lleva `details` { productId, name, stock, requested } para que
+ *   el servicio construya el mensaje de negocio sin adivinar.
+ */
+export interface DeductionLine {
+  product_id: string | null | undefined;
+  qty: number;
+}
+
+export interface PlannedDeduction {
+  product_id: string;
+  qty: number;
+}
+
+export interface InsufficientStockDetails {
+  productId: string;
+  name: string;
+  stock: number;
+  requested: number;
+}
+
+export function planStockDeduction(
+  lines: DeductionLine[],
+  stockByProduct: Map<string, { name: string; stock_qty: number }>,
+): PlannedDeduction[] {
+  const totalByProduct = new Map<string, number>();
+  for (const line of lines) {
+    if (!line.product_id) continue;
+    totalByProduct.set(line.product_id, (totalByProduct.get(line.product_id) ?? 0) + line.qty);
+  }
+  const planned: PlannedDeduction[] = [];
+  for (const [productId, qty] of totalByProduct) {
+    const entry = stockByProduct.get(productId);
+    if (!entry) {
+      const error = new Error("PRODUCT_NOT_FOUND");
+      (error as { productId?: string }).productId = productId;
+      throw error;
+    }
+    try {
+      applyMovementStock(entry.stock_qty, "OUT", qty);
+    } catch {
+      const error = new Error("INSUFFICIENT_STOCK");
+      (error as { details?: InsufficientStockDetails }).details = {
+        productId,
+        name: entry.name,
+        stock: entry.stock_qty,
+        requested: qty,
+      };
+      throw error;
+    }
+    planned.push({ product_id: productId, qty });
+  }
+  return planned;
+}
+
+/**
  * Aplica un movimiento al stock en memoria. Lanza INSUFFICIENT_STOCK si un
  * OUT dejaría el stock negativo (misma regla que el trigger
  * trg_inventory_no_negative). Puro para poder probarlo sin base de datos.

@@ -321,6 +321,32 @@ describe("billing: reversión de stock al anular (FAC-06)", () => {
   });
 });
 
+describe("billing: frontera modular con inventario (B1)", () => {
+  const service = readFileSync(
+    join(process.cwd(), "src", "features", "billing", "service.ts"),
+    "utf8",
+  );
+
+  it("descuenta al emitir vía la frontera de inventory/service", () => {
+    expect(service).toContain("deductStock");
+    expect(service).toContain("planStockDeduction");
+    expect(service).toContain("getProductsStock");
+  });
+
+  it("billing no toca tablas de inventory directo (products, inventory_movements)", () => {
+    expect(service).not.toContain('from("products")');
+    expect(service).not.toContain("from('products')");
+    expect(service).not.toContain('from("inventory_movements")');
+    expect(service).not.toContain("from('inventory_movements')");
+  });
+
+  it("pagar no descuenta: splitPayment no registra movimientos (momento único al emitir)", () => {
+    const splitBody = service.slice(service.indexOf("export async function splitPayment"));
+    expect(splitBody).not.toContain("deductStock");
+    expect(splitBody).not.toContain("registerMovement");
+  });
+});
+
 // ------------------------------------------------- consecutivo (FAC-05) ---
 
 describe("billing: consecutivo sin huecos bajo concurrencia (FAC-05)", () => {

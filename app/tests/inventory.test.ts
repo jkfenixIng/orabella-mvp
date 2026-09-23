@@ -9,6 +9,7 @@ import {
   matchesProductQuery,
   movementSchema,
   normalizeSku,
+  planStockDeduction,
   productSchema,
   sortKardexAscending,
 } from "@/src/features/inventory/schemas";
@@ -140,6 +141,63 @@ describe("inventory: búsqueda por nombre o SKU (INV-05)", () => {
 
   it("consulta vacía coincide con todo", () => {
     expect(matchesProductQuery({ name: "X", sku: "Y" }, "   ")).toBe(true);
+  });
+});
+
+describe("inventory: planStockDeduction descuenta la venta (B1/FAC-06)", () => {
+  const OTHER_ID = "44444444-4444-4444-8444-444444444444";
+  const stock = () =>
+    new Map([
+      [PRODUCT_ID, { name: "Shampoo", stock_qty: 10 }],
+      [OTHER_ID, { name: "Acondicionador", stock_qty: 3 }],
+    ]);
+
+  it("agrega líneas del mismo producto y descuenta exacto hasta cero", () => {
+    expect(
+      planStockDeduction(
+        [
+          { product_id: PRODUCT_ID, qty: 4 },
+          { product_id: PRODUCT_ID, qty: 6 },
+        ],
+        stock(),
+      ),
+    ).toEqual([{ product_id: PRODUCT_ID, qty: 10 }]);
+  });
+
+  it("ignora líneas sin product_id (servicios/custom no tocan stock)", () => {
+    expect(
+      planStockDeduction(
+        [
+          { product_id: null, qty: 2 },
+          { product_id: undefined, qty: 1 },
+          { product_id: OTHER_ID, qty: 3 },
+        ],
+        stock(),
+      ),
+    ).toEqual([{ product_id: OTHER_ID, qty: 3 }]);
+    expect(planStockDeduction([{ product_id: null, qty: 5 }], stock())).toEqual([]);
+  });
+
+  it("stock insuficiente lanza INSUFFICIENT_STOCK con detalle del producto", () => {
+    try {
+      planStockDeduction([{ product_id: OTHER_ID, qty: 4 }], stock());
+      expect.unreachable("debió lanzar INSUFFICIENT_STOCK");
+    } catch (error) {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe("INSUFFICIENT_STOCK");
+      expect((error as { details?: unknown }).details).toEqual({
+        productId: OTHER_ID,
+        name: "Acondicionador",
+        stock: 3,
+        requested: 4,
+      });
+    }
+  });
+
+  it("producto ausente del mapa lanza PRODUCT_NOT_FOUND", () => {
+    expect(() =>
+      planStockDeduction([{ product_id: "99999999-9999-4999-8999-999999999999", qty: 1 }], stock()),
+    ).toThrowError("PRODUCT_NOT_FOUND");
   });
 });
 

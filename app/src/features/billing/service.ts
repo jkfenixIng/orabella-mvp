@@ -29,10 +29,13 @@ import {
 } from "@/src/shared/lib/sede";
 import { listPaymentMethods, listServices, listTaxes } from "@/src/features/admin/service";
 import {
+  deductStock,
+  getProductsStock,
   registerMovement,
   InventoryError,
+  type StockEntry,
 } from "@/src/features/inventory/service";
-import { applyMovementStock } from "@/src/features/inventory/schemas";
+import { planStockDeduction } from "@/src/features/inventory/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { getOpenShift, getOpenShiftWithOpener } from "@/src/features/cash/service";
 
@@ -415,13 +418,18 @@ async function loadRefs(sedeId: string): Promise<ValidatedRefs> {
 
 /**
  * Verifica existencia y sede de cada referencia de los ítems (productos,
- * servicios, empleados). Además pre-verifica stock de productos para
- * fallar ANTES de reservar el consecutivo (FAC-05 sin huecos).
- *
- * Sin N+1: una sola query con IN por tabla (productos + empleados) más el
- * catálogo de servicios; el bucle posterior es en memoria.
+ * servicios, empleados). B1: los productos se validan vía la frontera de
+ * inventario (getProductsStock) — billing NUNCA toca las tablas de
+ * inventory directo. Devuelve el mapa de stock para que el llamador
+ * pre-verifique disponibilidad ANTES de reservar el consecutivo
+ * (FAC-05 sin huecos) o de mutar. Sin N+1: una sola query con IN por
+ * tabla (productos vía servicio + empleados) más el catálogo de
+ * servicios; el bucle posterior es en memoria.
  */
-async function validateItemRefs(sedeId: string, items: InvoiceItemInput[]): Promise<void> {
+async function validateItemRefs(
+  sedeId: string,
+  items: InvoiceItemInput[],
+): Promise<Map<string, StockEntry>> {
   const db = await billingDb();
   const serviceRows = await listServices(sedeId, 500);
   const serviceSedeById = new Map(serviceRows.map((row) => [row.id, row.sede_id]));
@@ -433,43 +441,27 @@ async function validateItemRefs(sedeId: string, items: InvoiceItemInput[]): Prom
   )];
   const employeeIds = [...new Set(items.map((item) => item.employee_id))];
 
-  const [productRes, employeeRes] = await Promise.all([
+  const [stockMap, employeeRes] = await Promise.all([
     productIds.length > 0
-      ? db.from("products").select("id, sede_id, name, stock_qty").in("id", productIds)
-      : Promise.resolve({ data: [], error: null }),
+      ? getProductsStock(sedeId, productIds)
+      : Promise.resolve(new Map<string, StockEntry>()),
     employeeIds.length > 0
       ? db.from("employees").select("id, sede_id").in("id", employeeIds)
       : Promise.resolve({ data: [], error: null }),
   ]);
-  if (productRes.error || employeeRes.error) {
+  if (employeeRes.error) {
     throw new BillingError("INTERNAL", "Error interno.", 500);
   }
-  const productById = new Map(
-    ((productRes.data ?? []) as Array<{ id: string; sede_id: string; name: string; stock_qty: number }>).map(
-      (row) => [row.id, row],
-    ),
-  );
   const employeeSedeById = new Map(
     ((employeeRes.data ?? []) as Array<{ id: string; sede_id: string }>).map((row) => [row.id, row.sede_id]),
   );
 
   for (const item of items) {
     if (item.item_type === "producto" && item.product_id) {
-      const product = productById.get(item.product_id);
-      if (!product) {
+      // getProductsStock solo devuelve productos de esta sede: ausente =
+      // inexistente o de otra sede (sin filtrar datos ajenos).
+      if (!stockMap.has(item.product_id)) {
         throw new BillingError("NOT_FOUND", "Producto no encontrado.", 404);
-      }
-      if (product.sede_id !== sedeId) {
-        throw new BillingError("FORBIDDEN", "No tiene acceso a esa sede.", 403);
-      }
-      try {
-        applyMovementStock(product.stock_qty, "OUT", item.qty);
-      } catch {
-        throw new BillingError(
-          "INSUFFICIENT_STOCK",
-          `Stock insuficiente para ${product.name}: hay ${product.stock_qty}, se piden ${item.qty}.`,
-          409,
-        );
       }
     }
     if (item.item_type === "servicio" && item.service_id) {
@@ -485,6 +477,26 @@ async function validateItemRefs(sedeId: string, items: InvoiceItemInput[]): Prom
       throw new BillingError("FORBIDDEN", "No tiene acceso a esa sede.", 403);
     }
   }
+  return stockMap;
+}
+
+/**
+ * Traduce el error puro de planStockDeduction a BillingError con mensaje
+ * de negocio por producto (409, nunca INTERNAL por falta de stock).
+ */
+function insufficientStockError(error: unknown): BillingError {
+  if (error instanceof Error && error.message === "INSUFFICIENT_STOCK") {
+    const details = (error as { details?: { name: string; stock: number; requested: number } })
+      .details;
+    if (details) {
+      return new BillingError(
+        "INSUFFICIENT_STOCK",
+        `Stock insuficiente para ${details.name}: hay ${details.stock}, se piden ${details.requested}.`,
+        409,
+      );
+    }
+  }
+  return toBillingError(error);
 }
 
 function toBillingError(error: unknown): BillingError {
@@ -511,8 +523,10 @@ export interface BillingActor {
 
 /**
  * FAC-01…07: crea la factura (consecutivo con lock, snapshot de
- * impuestos activos, OUT de stock por producto, porciones que cuadran).
- * Estado inicial Emitida; si las porciones suman el total → Pagada.
+ * impuestos activos, OUT de stock por producto vía deductStock,
+ * porciones que cuadran). Estado inicial Emitida; si las porciones
+ * suman el total → Pagada. B1: este es el MOMENTO ÚNICO del descuento;
+ * pagar después no descuenta de nuevo.
  *
  * Orden anti-huecos (FAC-05): valida todo y pre-verifica stock ANTES de
  * reservar el número vía rpc next_invoice_number(); el UNIQUE
@@ -530,9 +544,22 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   const db = await billingDb();
 
   let refs: ValidatedRefs;
+  let stockMap: Map<string, StockEntry>;
   try {
     refs = await loadRefs(actor.sedeId);
-    await validateItemRefs(actor.sedeId, input.items);
+    stockMap = await validateItemRefs(actor.sedeId, input.items);
+    // B1/FAC-05: pre-verifica stock ANTES de reservar el consecutivo (sin
+    // huecos). El descuento real ocurre tras insertar ítems vía deductStock.
+    try {
+      planStockDeduction(
+        input.items.map((item) => ({ product_id: item.product_id, qty: item.qty })),
+        new Map(
+          [...stockMap].map(([id, entry]) => [id, { name: entry.name, stock_qty: entry.stock_qty }]),
+        ),
+      );
+    } catch (error) {
+      throw insufficientStockError(error);
+    }
   } catch (error) {
     throw toBillingError(error);
   }
@@ -616,15 +643,18 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   const outMovements: Array<{ product_id: string; qty: number }> = [];
   const cleanupFailedInvoice = async () => {
     try {
+      // B1: la compensación también cruza por la frontera de inventario
+      // (registerMovement), nunca con insert directo a inventory_movements.
       for (const out of outMovements.reverse()) {
-        await db.from("inventory_movements").insert({
-          sede_id: actor.sedeId,
-          product_id: out.product_id,
-          type: "IN",
-          qty: out.qty,
-          reason: `Compensación fallo emisión factura #${consecutive}`,
-          user_id: actor.userId,
-        });
+        await registerMovement(
+          {
+            product_id: out.product_id,
+            type: "IN",
+            qty: out.qty,
+            reason: `Compensación fallo emisión factura #${consecutive}`,
+          },
+          actor,
+        );
       }
       if (invoiceId) {
         await db.from("invoice_payments").delete().eq("invoice_id", invoiceId);
@@ -724,19 +754,22 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
       }
     }
 
-    // FAC-06: OUT de stock por cada ítem producto (reutiliza registerMovement).
+    // B1/FAC-06, momento único: AL EMITIR se descuenta el stock de cada
+    // ítem producto vía la frontera de inventario (deductStock valida y
+    // registra los OUT). Pagar después (splitPayment) NO descuenta de
+    // nuevo; anular revierte con IN; editar ajusta por deltas.
     const outReason = buildInvoiceOutReason(consecutive, input.client_name);
-    for (const item of input.items) {
-      if (item.item_type !== "producto" || !item.product_id) continue;
-      try {
-        await registerMovement(
-          { product_id: item.product_id, type: "OUT", qty: item.qty, reason: outReason },
-          actor,
-        );
+    try {
+      const planned = await deductStock(
+        actor,
+        input.items.map((item) => ({ product_id: item.product_id, qty: item.qty })),
+        outReason,
+      );
+      for (const item of planned) {
         outMovements.push({ product_id: item.product_id, qty: item.qty });
-      } catch (error) {
-        throw toBillingError(error);
       }
+    } catch (error) {
+      throw toBillingError(error);
     }
 
     // Audit log para creación de factura (con info de admin override si aplica)
@@ -873,9 +906,10 @@ export async function editInvoiceItems(
   }
 
   let refs: ValidatedRefs;
+  let stockMap: Map<string, StockEntry>;
   try {
     refs = await loadRefs(actor.sedeId);
-    await validateItemRefs(
+    stockMap = await validateItemRefs(
       actor.sedeId,
       input.items.map((item) => ({
         item_type: item.item_type,
@@ -962,7 +996,8 @@ export async function editInvoiceItems(
     throw toBillingError(error);
   }
 
-  // Inventario por deltas netos por producto (pre-valida stock antes de mutar).
+  // Inventario por deltas netos por producto (pre-valida stock vía la
+  // frontera antes de mutar; solo los incrementos requieren stock).
   const oldQtyByProduct = new Map<string, number>();
   for (const row of detail.items) {
     if (row.item_type === "producto" && row.product_id) {
@@ -976,27 +1011,22 @@ export async function editInvoiceItems(
     }
   }
   const productIds = [...new Set([...oldQtyByProduct.keys(), ...newQtyByProduct.keys()])];
-  if (productIds.length > 0) {
-    const { data: products, error: productsError } = await db
-      .from("products")
-      .select("id, name, stock_qty")
-      .in("id", productIds);
-    if (productsError) throw new BillingError("INTERNAL", "Error interno.", 500);
-    const stockById = new Map(
-      ((products ?? []) as Array<{ id: string; stock_qty: number | string }>).map((row) => [
-        row.id,
-        Number(row.stock_qty),
-      ]),
-    );
-    for (const productId of productIds) {
-      const delta = (newQtyByProduct.get(productId) ?? 0) - (oldQtyByProduct.get(productId) ?? 0);
-      if (delta > 0) {
-        try {
-          applyMovementStock(stockById.get(productId) ?? 0, "OUT", delta);
-        } catch {
-          throw new BillingError("INSUFFICIENT_STOCK", "Stock insuficiente para el ajuste.", 409);
-        }
-      }
+  const increments = productIds
+    .map((productId) => ({
+      product_id: productId,
+      qty: (newQtyByProduct.get(productId) ?? 0) - (oldQtyByProduct.get(productId) ?? 0),
+    }))
+    .filter((line) => line.qty > 0);
+  if (increments.length > 0) {
+    try {
+      planStockDeduction(
+        increments,
+        new Map(
+          [...stockMap].map(([id, entry]) => [id, { name: entry.name, stock_qty: entry.stock_qty }]),
+        ),
+      );
+    } catch {
+      throw new BillingError("INSUFFICIENT_STOCK", "Stock insuficiente para el ajuste.", 409);
     }
   }
 
@@ -1141,9 +1171,10 @@ export async function editEmittedInvoiceItems(
   }
 
   let refs: ValidatedRefs;
+  let emittedStockMap: Map<string, StockEntry>;
   try {
     refs = await loadRefs(actor.sedeId);
-    await validateItemRefs(
+    emittedStockMap = await validateItemRefs(
       actor.sedeId,
       input.items.map((item) => ({
         item_type: item.item_type,
@@ -1233,7 +1264,8 @@ export async function editEmittedInvoiceItems(
   const surcharge = round2(Number(detail.invoice.surcharge ?? 0));
   const newTotal = round2(totals.total + surcharge);
 
-  // Inventario por deltas netos por producto (pre-valida stock antes de mutar).
+  // Inventario por deltas netos por producto vía la frontera (pre-valida
+  // stock antes de mutar; solo los incrementos requieren stock).
   const oldQtyByProduct = new Map<string, number>();
   for (const row of detail.items) {
     if (row.item_type === "producto" && row.product_id) {
@@ -1247,27 +1279,25 @@ export async function editEmittedInvoiceItems(
     }
   }
   const productIds = [...new Set([...oldQtyByProduct.keys(), ...newQtyByProduct.keys()])];
-  if (productIds.length > 0) {
-    const { data: products, error: productsError } = await db
-      .from("products")
-      .select("id, name, stock_qty")
-      .in("id", productIds);
-    if (productsError) throw new BillingError("INTERNAL", "Error interno.", 500);
-    const stockById = new Map(
-      ((products ?? []) as Array<{ id: string; stock_qty: number | string }>).map((row) => [
-        row.id,
-        Number(row.stock_qty),
-      ]),
-    );
-    for (const productId of productIds) {
-      const delta = (newQtyByProduct.get(productId) ?? 0) - (oldQtyByProduct.get(productId) ?? 0);
-      if (delta > 0) {
-        try {
-          applyMovementStock(stockById.get(productId) ?? 0, "OUT", delta);
-        } catch {
-          throw new BillingError("INSUFFICIENT_STOCK", "Stock insuficiente para el ajuste.", 409);
-        }
-      }
+  const emittedIncrements = productIds
+    .map((productId) => ({
+      product_id: productId,
+      qty: (newQtyByProduct.get(productId) ?? 0) - (oldQtyByProduct.get(productId) ?? 0),
+    }))
+    .filter((line) => line.qty > 0);
+  if (emittedIncrements.length > 0) {
+    try {
+      planStockDeduction(
+        emittedIncrements,
+        new Map(
+          [...emittedStockMap].map(([id, entry]) => [
+            id,
+            { name: entry.name, stock_qty: entry.stock_qty },
+          ]),
+        ),
+      );
+    } catch {
+      throw new BillingError("INSUFFICIENT_STOCK", "Stock insuficiente para el ajuste.", 409);
     }
   }
 
@@ -1414,6 +1444,9 @@ async function invoiceInClosedPayroll(db: DbClient, sedeId: string, invoiceId: s
  * FAC-07: registra porciones de pago (métodos activos) contra el saldo.
  * Rechaza sobrepago; si las porciones completan el total → Pagada.
  * Solo admin/caja (vía requireBillingWriter en rutas/actions).
+ *
+ * B1: pagar NO mueve stock — el descuento ocurrió al emitir (momento
+ * único FAC-06). Descontar aquí duplicaría la salida.
  */
 export async function splitPayment(
   sedeId: string,
