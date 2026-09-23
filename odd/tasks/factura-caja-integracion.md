@@ -84,7 +84,11 @@ Out:
 
 ## Tasks (estado real 2026-09-23)
 - [x] T1-T7 base + T8-T11 + combobox funcional (commits hasta 2aa1389)
-- [ ] FEE Recargo tarjeta 5%: migración 019 + backend + UI crear/detalle + auditoría (modelo: recargo sobre neto, cliente paga bruto, todo cuadra por construcción; split posterior fuera de alcance)
+- [x] FEE Recargo tarjeta 5%: migración 019 + backend + UI crear/detalle + auditoría (a690f51)
+- [x] Modal agregar ítem + filas compactas + cierre combobox robusto + comisión custom en VALOR (7b1a332)
+- [x] 019 re-ejecutable + 020 commission_value (faltaba: rompía detalle y nómina) (1d1e33a); 020 aplicada en prod
+- [x] Logs PG diagnóstico en lista/detalle (ad34bee, 93c9da4)
+- [ ] Usuario: aplicar 019+020 en PRUEBAS, recargar, verificar combobox/modal/detalle/flujo tarjeta
 - [ ] VER full + push
 
 ## Authorized scope
