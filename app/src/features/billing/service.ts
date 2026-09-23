@@ -536,6 +536,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
       .select(INVOICE_SELECT)
       .single();
     if (invoiceError || !invoice) {
+      console.error("PG invoice insert:", JSON.stringify(invoiceError));
       if ((invoiceError as { code?: string } | null)?.code === "23505") {
         throw new BillingError("DUPLICATE_NUMBER", "Consecutivo duplicado, reintente la emisión.", 409);
       }
@@ -555,12 +556,16 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
         unit_price: item.unit_price,
         discount: item.discount,
         no_commission: item.no_commission ?? false,
+        commission_value: item.commission_value ?? null,
         subtotal:
           Math.round(item.qty * Number(item.unit_price) * 100) / 100 -
           Math.min(item.discount, Math.round(item.qty * Number(item.unit_price) * 100) / 100),
       })),
     );
-    if (itemsError) throw new BillingError("INTERNAL", "Error interno.", 500);
+    if (itemsError) {
+      console.error("PG invoice_items insert:", JSON.stringify(itemsError));
+      throw new BillingError("INTERNAL", "Error interno.", 500);
+    }
 
     if (totals.taxes.length > 0) {
       const { error: taxesError } = await db.from("invoice_taxes").insert(
@@ -572,7 +577,10 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
           amount: tax.amount,
         })),
       );
-      if (taxesError) throw new BillingError("INTERNAL", "Error interno.", 500);
+      if (taxesError) {
+        console.error("PG invoice_taxes insert:", JSON.stringify(taxesError));
+        throw new BillingError("INTERNAL", "Error interno.", 500);
+      }
     }
 
     if (portions.length > 0) {
@@ -586,7 +594,10 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
           fee_amount: fee.fee,
         })),
       );
-      if (paymentsError) throw new BillingError("INTERNAL", "Error interno.", 500);
+      if (paymentsError) {
+        console.error("PG invoice_payments insert:", JSON.stringify(paymentsError));
+        throw new BillingError("INTERNAL", "Error interno.", 500);
+      }
     }
 
     // FAC-06: OUT de stock por cada ítem producto (reutiliza registerMovement).

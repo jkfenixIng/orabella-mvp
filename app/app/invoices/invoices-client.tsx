@@ -434,8 +434,24 @@ export function InvoicesClient(props: InvoicesClientProps) {
     .join(", ");
   const draftGrandTotal = draftTotal + draftSurcharge;
 
+  // Totalizar: rellena la primera porción vacía con el neto pendiente.
+  // Las porciones son NETOS; el recargo se suma solo al total.
+  const portionsFilled = portions.reduce((acc, portion) => acc + (toNumber(portion.amount) ?? 0), 0);
+  const portionsRemaining = Math.max(0, draftTotal - portionsFilled);
+  const canTotalize = portions.some((portion) => portion.amount.trim() === "") && portionsRemaining > 0;
+
   // Determinar si hay pago inmediato (para botón "Emitir y pagar")
   const hasImmediatePayment = portions.some((p) => (toNumber(p.amount) ?? 0) > 0);
+
+  function totalizePortions() {
+    const firstEmpty = portions.findIndex((portion) => portion.amount.trim() === "");
+    if (firstEmpty === -1) return;
+    const filled = portions.reduce((acc, portion) => acc + (toNumber(portion.amount) ?? 0), 0);
+    const remaining = Math.max(0, draftTotal - filled);
+    if (remaining <= 0) return;
+    const value = String(Math.round(remaining * 100) / 100);
+    setPortions((prev) => prev.map((row, i) => (i === firstEmpty ? { ...row, amount: value } : row)));
+  }
 
   // Métodos ya usados en otras porciones: cada método se cobra una sola vez.
   const usedMethodCodes = new Set(portions.map((portion) => portion.method_code));
@@ -893,6 +909,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   placeholder="0"
                                   inputMode="numeric"
                                 />
+                                {draftFees[index] && draftFees[index].fee > 0 && (
+                                  <span className="text-xs font-normal text-emerald-700">
+                                    +{formatMoney(draftFees[index].fee)} recargo → cobra{" "}
+                                    {formatMoney(draftFees[index].gross)}
+                                  </span>
+                                )}
                               </label>
                               {portions.length > 1 && (
                                 <button
@@ -908,29 +930,52 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           ))}
                         </div>
 
-                        <button
-                          type="button"
-                          disabled={!firstFreeMethod}
-                          title={!firstFreeMethod ? "Todos los métodos ya están en uso" : undefined}
-                          onClick={() =>
-                            setPortions((prev) => [
-                              ...prev,
-                              {
-                                method_code:
-                                  props.methods.find(
-                                    (row) =>
-                                      row.is_active !== false &&
-                                      !prev.some((portion) => portion.method_code === row.code),
-                                  )?.code ?? "efectivo",
-                                amount: "",
-                              },
-                            ])
-                          }
-                          className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          <Banknote className="h-4 w-4" aria-hidden="true" />
-                          Dividir cobro (agregar porción)
-                        </button>
+                        <div className="flex flex-col gap-2 sm:flex-row">
+                          <button
+                            type="button"
+                            disabled={!canTotalize}
+                            title={
+                              canTotalize
+                                ? "Rellena la primera porción vacía con el neto pendiente"
+                                : "Nada por rellenar"
+                            }
+                            onClick={totalizePortions}
+                            className="flex h-10 flex-1 items-center justify-center gap-2 rounded-lg border border-slate-300 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            Totalizar pagos
+                          </button>
+                          <button
+                            type="button"
+                            disabled={!firstFreeMethod}
+                            title={!firstFreeMethod ? "Todos los métodos ya están en uso" : undefined}
+                            onClick={() =>
+                              setPortions((prev) => {
+                                const filledPrev = prev.reduce(
+                                  (acc, portion) => acc + (toNumber(portion.amount) ?? 0),
+                                  0,
+                                );
+                                const remainingPrev = Math.max(0, draftTotal - filledPrev);
+                                return [
+                                  ...prev,
+                                  {
+                                    method_code:
+                                      props.methods.find(
+                                        (row) =>
+                                          row.is_active !== false &&
+                                          !prev.some((portion) => portion.method_code === row.code),
+                                      )?.code ?? "efectivo",
+                                    amount:
+                                      remainingPrev > 0 ? String(Math.round(remainingPrev * 100) / 100) : "",
+                                  },
+                                ];
+                              })
+                            }
+                            className="flex h-10 flex-1 items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            <Banknote className="h-4 w-4" aria-hidden="true" />
+                            Dividir cobro
+                          </button>
+                        </div>
                         {!firstFreeMethod && (
                           <p className="text-xs text-slate-500">Todos los métodos ya están en uso.</p>
                         )}
