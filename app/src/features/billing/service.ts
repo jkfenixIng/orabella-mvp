@@ -188,9 +188,13 @@ export const INVOICE_PAGE_SIZE = 10;
 
 function dateBound(value: string, end: boolean): string {
   const trimmed = value.trim();
-  // Fecha sola (yyyy-mm-dd) → rango del día en hora local del servidor.
+  // Fecha sola (yyyy-mm-dd) → rango del día en hora de Bogotá (UTC-5 fijo,
+  // Colombia no tiene DST). El offset explícito es obligatorio: sin él,
+  // Postgres interpreta el literal en la TZ de la sesión (UTC en Supabase)
+  // y la ventana queda corrida 5h — se cuelan facturas de la noche anterior
+  // (19:00–23:59) y faltan las de la noche del propio día.
   if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-    return end ? `${trimmed}T23:59:59.999` : `${trimmed}T00:00:00`;
+    return end ? `${trimmed}T23:59:59.999-05:00` : `${trimmed}T00:00:00-05:00`;
   }
   return trimmed;
 }
