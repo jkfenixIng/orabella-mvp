@@ -9,7 +9,8 @@ import {
   type RuleRate,
 } from "./schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
-import { getOpenShift } from "@/src/features/cash/service";
+import { cashOutUsedInShift, getOpenShift } from "@/src/features/cash/service";
+import { cashOutLimitViolation } from "@/src/features/cash/schemas";
 import { listPaymentMethods } from "@/src/features/admin/service";
 
 export class CommissionError extends Error {
@@ -349,6 +350,22 @@ export async function payCommissionNow(
       `El monto supera la comisión pendiente (${pending}).`,
       422,
     );
+  }
+
+  // Tope de salidas en efectivo del turno (50% de la base de apertura): la
+  // comisión pagada en efectivo no puede dejar el acumulado del turno por
+  // encima del tope. Solo aplica al efectivo; los digitales no tienen tope.
+  if (method.code === "efectivo") {
+    const usedCashOut = await cashOutUsedInShift(shift.id).catch(() => {
+      throw new CommissionError("INTERNAL", "Error interno.", 500);
+    });
+    const violation = cashOutLimitViolation({
+      methodCode: method.code,
+      openingBase: Number(shift.opening_base),
+      cashOutUsed: usedCashOut,
+      amount: input.amount,
+    });
+    if (violation) throw new CommissionError(violation.code, violation.message, 422);
   }
 
   const { data, error } = await db

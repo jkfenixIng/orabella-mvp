@@ -412,6 +412,24 @@ async function fetchVoucherOutTotals(
 }
 
 /**
+ * Salidas en efectivo ya acumuladas en un turno (vales aprobados + comisiones
+ * pagadas inmediatas en efectivo). Es la base del tope del 50% de la base de
+ * apertura que vales y comisiones validan antes de pagar en efectivo.
+ * Reutiliza exactamente la misma lógica del arqueo (fetchVoucherOutTotals +
+ * fetchPayoutTotals), de modo que el tope y el cierre nunca divergen.
+ */
+export async function cashOutUsedInShift(shiftId: string): Promise<number> {
+  const db = await cashDb();
+  const [voucherOutMaps, payoutMaps] = await Promise.all([
+    fetchVoucherOutTotals(db, [shiftId]),
+    fetchPayoutTotals(db, [shiftId]),
+  ]);
+  const voucherOut = voucherOutMaps.get(shiftId) ?? new Map<string, number>();
+  const payoutOut = payoutMaps.get(shiftId) ?? new Map<string, number>();
+  return roundMoney((voucherOut.get("efectivo") ?? 0) + (payoutOut.get("efectivo") ?? 0));
+}
+
+/**
  * Cobros de factura por turno y método (lo que entra a caja por facturas).
  * Cada pago pertenece al turno ABIERTO al momento del cobro
  * (invoice_payments.cash_shift_id); los legacy sin turno se atribuyen al
@@ -1021,7 +1039,21 @@ export async function closeShift(
       .eq("id", shift.id)
       .select(SHIFT_SELECT)
       .single();
-    if (updateError || !updated) throw new CashError("INTERNAL", "Error interno.", 500);
+    if (updateError || !updated) {
+      // CHECK expected_cash >= 0 (006_cash.sql): el turno tiene más salidas
+      // en efectivo (vales/comisiones) que efectivo cobrado. Es una regla de
+      // negocio, no un fallo interno: se reporta con su código y ayuda.
+      const errorCode = (updateError as { code?: string } | null)?.code;
+      const errorMessage = (updateError as { message?: string } | null)?.message ?? "";
+      if (errorCode === "23514" && /expected_cash/i.test(errorMessage)) {
+        throw new CashError(
+          "CASH_OUT_EXCEEDS_COLLECTED",
+          "Las salidas en efectivo del turno superan el efectivo cobrado. Revise los vales y comisiones pagados en efectivo antes de cerrar.",
+          422,
+        );
+      }
+      throw new CashError("INTERNAL", "Error interno.", 500);
+    }
     const closed = updated as CashShiftRow;
     await insertCounts(db, shift.id, "cierre", input.counts);
     await writeAudit({

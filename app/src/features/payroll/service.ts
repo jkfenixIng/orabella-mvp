@@ -29,7 +29,8 @@ import {
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
-import { getOpenShiftWithOpener } from "@/src/features/cash/service";
+import { cashOutUsedInShift, getOpenShiftWithOpener } from "@/src/features/cash/service";
+import { cashOutLimitViolation } from "@/src/features/cash/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
 import {
@@ -1037,6 +1038,22 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
         : null;
     const voucherSelect = await resolveVoucherSelect(db);
     const hasMethodColumns = voucherSelect === VOUCHER_SELECT;
+    // Tope de salidas en efectivo del turno (50% de la base de apertura): el
+    // vale no puede dejar el acumulado del turno por encima del tope. Solo
+    // aplica al efectivo y solo cuando el vale queda ligado a un turno
+    // (migración 028); los digitales no tienen tope.
+    if (hasMethodColumns && method.code === "efectivo") {
+      const usedCashOut = await cashOutUsedInShift(openShift.id).catch((error) => {
+        throw toPayrollError(error);
+      });
+      const violation = cashOutLimitViolation({
+        methodCode: method.code,
+        openingBase: Number(openShift.opening_base),
+        cashOutUsed: usedCashOut,
+        amount: parsed.data.amount,
+      });
+      if (violation) throw new PayrollError(violation.code, violation.message, 422);
+    }
     const { data, error } = await db
       .from("voucher_requests")
       .insert({

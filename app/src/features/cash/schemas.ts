@@ -83,6 +83,79 @@ export function sumMethodTotal(map: Map<string, number> | null | undefined): num
   return roundMoney(total);
 }
 
+/**
+ * Regla de negocio del efectivo del turno: las salidas en efectivo (vales
+ * aprobados + comisiones pagadas inmediatas) no pueden superar el 50% de la
+ * base de apertura. El otro 50% permanece físicamente en el cajón para dar
+ * vueltos y nuevos vales. El tope es INCLUSIVO: el acumulado puede llegar
+ * exactamente al límite; solo superarlo lo rechaza. Puro para probarlo sin
+ * base de datos.
+ */
+export const CASH_OUT_LIMIT_RATIO = 0.5;
+
+/** Código de negocio cuando una salida en efectivo supera el tope del turno. */
+export const CASH_OUT_LIMIT_CODE = "CASH_OUT_LIMIT_EXCEEDED";
+
+export interface CashOutLimitState {
+  /** Base de apertura del turno. */
+  base: number;
+  /** Tope de salidas en efectivo: roundMoney(base * 0.5). */
+  limit: number;
+  /** Salidas en efectivo ya acumuladas en el turno. */
+  used: number;
+  /** Disponible para nuevas salidas en efectivo (nunca negativo). */
+  available: number;
+}
+
+/** Estado del tope de salidas en efectivo para una base y un acumulado dados. */
+export function cashOutLimitState(openingBase: number, cashOutUsed: number): CashOutLimitState {
+  const base = roundMoney(openingBase);
+  const limit = roundMoney(base * CASH_OUT_LIMIT_RATIO);
+  const used = roundMoney(cashOutUsed);
+  return { base, limit, used, available: roundMoney(Math.max(0, limit - used)) };
+}
+
+/**
+ * true cuando pagar `amount` en efectivo deja el acumulado del turno por
+ * encima del tope. Al ser INCLUSIVO, un proyectado exactamente igual al
+ * límite se permite; solo el exceso de al menos un centavo se rechaza. La
+ * resta se redondea a centavos para no fallar por representación flotante
+ * (100000.01 − 100000 = 0.00999…). Puro.
+ */
+export function exceedsCashOutLimit(state: CashOutLimitState, amount: number): boolean {
+  const projected = roundMoney(state.used + roundMoney(amount));
+  return roundMoney(projected - state.limit) > 0;
+}
+
+export interface CashOutLimitViolation {
+  code: typeof CASH_OUT_LIMIT_CODE;
+  message: string;
+}
+
+/**
+ * Valida una salida en efectivo contra el tope del turno. Devuelve null si el
+ * monto cabe (acumulado dentro del tope) y el detalle del rechazo si lo
+ * supera. Solo rige para `efectivo`: los métodos digitales no tienen tope.
+ * Puro para probarlo sin base de datos.
+ */
+export function cashOutLimitViolation(args: {
+  methodCode: string;
+  openingBase: number;
+  cashOutUsed: number;
+  amount: number;
+}): CashOutLimitViolation | null {
+  if (args.methodCode !== "efectivo") return null;
+  const state = cashOutLimitState(args.openingBase, args.cashOutUsed);
+  if (!exceedsCashOutLimit(state, args.amount)) return null;
+  const amount = roundMoney(args.amount);
+  return {
+    code: CASH_OUT_LIMIT_CODE,
+    message:
+      `No se puede pagar ${amount} en efectivo: supera el máximo del 50% de la base ` +
+      `del turno (${state.base}). Quedan ${state.available} disponibles para salidas en efectivo.`,
+  };
+}
+
 export interface ShiftCountMaps {
   paid: Map<string, number>;
   open: Map<string, number>;

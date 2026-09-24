@@ -8,10 +8,15 @@ import {
   assertShiftCloser,
   bogotaDay,
   buildMethodViews,
+  CASH_OUT_LIMIT_CODE,
+  CASH_OUT_LIMIT_RATIO,
+  cashOutLimitState,
+  cashOutLimitViolation,
   closeShiftSchema,
   computeCashClose,
   dayBounds,
   dayViewSchema,
+  exceedsCashOutLimit,
   expectedDigitalTotal,
   HISTORY_PAGE_SIZE,
   historySchema,
@@ -435,5 +440,116 @@ describe("cash: total de vales por turno (columna Vales)", () => {
 
   it("redondea el total a centavos", () => {
     expect(sumMethodTotal(new Map([["nequi", 0.1], ["efectivo", 0.2]]))).toBe(0.3);
+  });
+});
+
+// --------------------------------- tope de salidas en efectivo (50% base) ---
+
+describe("cash: tope de salidas en efectivo = 50% de la base del turno", () => {
+  const base = 200000; // tope 100000
+
+  it("calcula el tope como la mitad de la base de apertura", () => {
+    expect(CASH_OUT_LIMIT_RATIO).toBe(0.5);
+    expect(cashOutLimitState(base, 0)).toEqual({
+      base: 200000,
+      limit: 100000,
+      used: 0,
+      available: 100000,
+    });
+    // El disponible nunca queda negativo aunque el acumulado supere el tope.
+    expect(cashOutLimitState(base, 120000).available).toBe(0);
+  });
+
+  it("un vale en efectivo por debajo del tope se permite", () => {
+    const state = cashOutLimitState(base, 40000);
+    expect(exceedsCashOutLimit(state, 30000)).toBe(false);
+    expect(
+      cashOutLimitViolation({
+        methodCode: "efectivo",
+        openingBase: base,
+        cashOutUsed: 40000,
+        amount: 30000,
+      }),
+    ).toBeNull();
+  });
+
+  it("un vale en efectivo exactamente en el 50% se permite (tope inclusivo)", () => {
+    const state = cashOutLimitState(base, 0);
+    expect(exceedsCashOutLimit(state, 100000)).toBe(false);
+    expect(
+      cashOutLimitViolation({
+        methodCode: "efectivo",
+        openingBase: base,
+        cashOutUsed: 0,
+        amount: 100000,
+      }),
+    ).toBeNull();
+    // Acumulado 60000 + 40000 = 100000 = tope: también se permite.
+    expect(
+      cashOutLimitViolation({
+        methodCode: "efectivo",
+        openingBase: base,
+        cashOutUsed: 60000,
+        amount: 40000,
+      }),
+    ).toBeNull();
+    // Un centavo por encima ya se rechaza.
+    expect(exceedsCashOutLimit(cashOutLimitState(base, 60000), 40000.01)).toBe(true);
+  });
+
+  it("un vale en efectivo que supera el tope se rechaza con el código de negocio", () => {
+    const violation = cashOutLimitViolation({
+      methodCode: "efectivo",
+      openingBase: base,
+      cashOutUsed: 0,
+      amount: 150000,
+    });
+    expect(violation).not.toBeNull();
+    expect(violation?.code).toBe(CASH_OUT_LIMIT_CODE);
+    expect(violation?.code).toBe("CASH_OUT_LIMIT_EXCEEDED");
+    expect(violation?.message).toContain("150000");
+    expect(violation?.message).toContain("200000");
+    expect(violation?.message).toContain("100000");
+  });
+
+  it("el tope rige sobre el acumulado: 40000 ya salidos + 70000 nuevo lo supera", () => {
+    // Tope 100000; 40000 + 70000 = 110000 > 100000 → rechazado.
+    const violation = cashOutLimitViolation({
+      methodCode: "efectivo",
+      openingBase: base,
+      cashOutUsed: 40000,
+      amount: 70000,
+    });
+    expect(violation?.code).toBe(CASH_OUT_LIMIT_CODE);
+    // El disponible reportado es el real: 100000 − 40000 = 60000.
+    expect(violation?.message).toContain("60000");
+  });
+
+  it("las salidas por método digital se permiten aunque superen el 50%", () => {
+    expect(
+      cashOutLimitViolation({
+        methodCode: "nequi",
+        openingBase: base,
+        cashOutUsed: 0,
+        amount: 999999,
+      }),
+    ).toBeNull();
+    expect(
+      cashOutLimitViolation({
+        methodCode: "tarjeta",
+        openingBase: base,
+        cashOutUsed: 90000,
+        amount: 50000,
+      }),
+    ).toBeNull();
+    // El mismo monto en efectivo sí se rechaza.
+    expect(
+      cashOutLimitViolation({
+        methodCode: "efectivo",
+        openingBase: base,
+        cashOutUsed: 90000,
+        amount: 50000,
+      })?.code,
+    ).toBe(CASH_OUT_LIMIT_CODE);
   });
 });
