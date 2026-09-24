@@ -7,6 +7,7 @@ import {
   assertDraftPeriod,
   assertNoOverpay,
   assertPortionsMatchNet,
+  buildEmployeeCommissionDetail,
   buildEmployeeDetail,
   calculatePayrollSchema,
   canDiscountVoucher,
@@ -32,7 +33,12 @@ import {
   voucherRequiresReview,
   weekdayIso,
   weekStartOf,
+  type PayrollCommissionLine,
 } from "@/src/features/payroll/schemas";
+import {
+  commissionRuleKey,
+  resolveEmployeeLineCommission,
+} from "@/src/features/commissions/schemas";
 
 // ------------------------------------------------- neto (PAY-02) ---
 
@@ -117,6 +123,142 @@ describe("payroll: cálculo mixto con detail_json reproducible (PAY-02/PAY-03)",
 
   it("el fijo no lleva comisión aunque tenga líneas (solo fijo → 0)", () => {
     expect(computeLineCommission(500000, null)).toBe(0);
+  });
+});
+
+// --------------------------------- detalle con resolución compartida (PAY-02/03) ---
+
+describe("payroll: detalle de comisiones con la resolución compartida (PAY-02/PAY-03)", () => {
+  function line(overrides: Partial<PayrollCommissionLine> = {}): PayrollCommissionLine {
+    return {
+      invoice_id: "inv-1",
+      consecutive_number: 10,
+      item_id: "item-1",
+      item_type: "producto",
+      qty: 1,
+      unit_price: 100000,
+      line_subtotal: 100000,
+      commission_value: null,
+      item_ref_id: "prod-1",
+      ...overrides,
+    };
+  }
+
+  it("fijo + regla ítem×empleado: la regla comisiona (NO cero) — bug corregido", () => {
+    const rules = new Map([[commissionRuleKey("producto", "prod-1"), { percent: 10, amount: null }]]);
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "fijo",
+      commissionPercent: null,
+      lines: [line()],
+      rules,
+    });
+    expect(detail).toHaveLength(1);
+    expect(detail[0].commission).toBe(10000);
+  });
+
+  it("fijo sin regla: sin detalle (comisión 0), comportamiento preservado", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "fijo",
+      commissionPercent: null,
+      lines: [line()],
+      rules: new Map(),
+    });
+    expect(detail).toHaveLength(0);
+    expect(buildEmployeeDetail(detail).commissions).toBe(0);
+  });
+
+  it("porcentaje: subtotal × commission_percent (comportamiento preservado)", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "porcentaje",
+      commissionPercent: 10,
+      lines: [line()],
+      rules: new Map(),
+    });
+    expect(detail[0].commission).toBe(10000);
+  });
+
+  it("regla con monto fijo por unidad: se multiplica por la cantidad", () => {
+    const rules = new Map([[commissionRuleKey("producto", "prod-1"), { percent: null, amount: 5000 }]]);
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "fijo",
+      commissionPercent: null,
+      lines: [line({ qty: 3, unit_price: 30000, line_subtotal: 90000 })],
+      rules,
+    });
+    expect(detail[0].commission).toBe(15000);
+  });
+
+  it("la regla gana sobre el porcentaje plano", () => {
+    const rules = new Map([[commissionRuleKey("producto", "prod-1"), { percent: 10, amount: null }]]);
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "mixto",
+      commissionPercent: 30,
+      lines: [line()],
+      rules,
+    });
+    expect(detail[0].commission).toBe(10000);
+  });
+
+  it("custom con valor fijo: se respeta el valor del ítem", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "porcentaje",
+      commissionPercent: 20,
+      lines: [line({ item_type: "custom", item_ref_id: null, commission_value: 12000 })],
+      rules: new Map(),
+    });
+    expect(detail[0].commission).toBe(12000);
+  });
+
+  it("no_aplica: sin detalle ni comisión", () => {
+    const rules = new Map([[commissionRuleKey("producto", "prod-1"), { percent: 10, amount: null }]]);
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "no_aplica",
+      payType: "porcentaje",
+      commissionPercent: 10,
+      lines: [line()],
+      rules,
+    });
+    expect(detail).toHaveLength(0);
+    expect(buildEmployeeDetail(detail).commissions).toBe(0);
+  });
+
+  it("paridad: el detalle de nómina usa la misma resolución que el pago inmediato", () => {
+    const rules = new Map([[commissionRuleKey("producto", "prod-1"), { percent: 8, amount: 1000 }]]);
+    const source = line({ qty: 2, unit_price: 125000, line_subtotal: 250000 });
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "fijo",
+      commissionPercent: null,
+      lines: [source],
+      rules,
+    });
+    expect(detail[0].commission).toBe(
+      resolveEmployeeLineCommission({
+        itemType: source.item_type,
+        itemRefId: source.item_ref_id,
+        subtotal: source.line_subtotal,
+        qty: source.qty,
+        commissionValue: source.commission_value,
+        rules,
+        flatPercent: null,
+      }),
+    );
+    // 250000 × 8% = 20000 + 1000 × 2 = 22000.
+    expect(detail[0].commission).toBe(22000);
   });
 });
 

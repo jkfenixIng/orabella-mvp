@@ -38,6 +38,7 @@ import {
 import { planStockDeduction } from "@/src/features/inventory/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { getOpenShiftWithOpener } from "@/src/features/cash/service";
+import { commissionRuleKey, type RuleRate } from "@/src/features/commissions/schemas";
 import { computeInvoiceItemCommission } from "./commission";
 
 export class BillingError extends Error {
@@ -390,19 +391,36 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
         }>
       | null;
   }
-  const items = ((itemsRes.data ?? []) as Array<InvoiceItemRow & JoinedEmployee>).map((item) => {
+  const itemRows = (itemsRes.data ?? []) as Array<InvoiceItemRow & JoinedEmployee>;
+  // Reglas ítem×empleado de TODOS los empleados de la factura en una sola
+  // consulta: el detalle puede mezclar empleados y no se cae en N+1.
+  const rulesByEmployee = await loadCommissionRulesByEmployee(
+    db,
+    invoice.sede_id,
+    [...new Set(itemRows.map((item) => item.employee_id))],
+  );
+  const items = itemRows.map((item) => {
     const joined = Array.isArray(item.employees) ? item.employees[0] : item.employees;
     return {
       ...item,
       employee_full_name: joined?.full_name ?? null,
       employee_code: joined?.employee_code ?? null,
       commission_value: item.commission_value ?? null,
-      // Campo derivado de lectura (no se persiste): misma regla que nómina.
+      // Campo derivado de lectura (no se persiste): misma regla que nómina y
+      // el pago inmediato (resolución compartida).
       commission_amount: computeInvoiceItemCommission({
         itemType: item.item_type,
+        itemRefId:
+          item.item_type === "producto"
+            ? item.product_id
+            : item.item_type === "servicio"
+              ? item.service_id
+              : null,
         subtotal: Number(item.subtotal),
+        qty: Number(item.qty),
         commissionValue: item.commission_value ?? null,
         noCommission: Boolean(item.no_commission),
+        rules: rulesByEmployee.get(item.employee_id) ?? new Map<string, RuleRate>(),
         employee: joined
           ? {
               payoutMode: joined.payout_mode ?? null,
@@ -421,6 +439,50 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
     paid,
     remaining: round2(Math.max(0, Number(invoice.total) - paid)),
   };
+}
+
+/**
+ * Reglas ítem×empleado activas de todos los empleados de una factura, en una
+ * sola consulta (sin N+1). Se agrupan por empleado y por la clave
+ * `${item_type}:${item_id}` que consume la resolución compartida.
+ *
+ * `commission_rules` es una tabla estable (migración 016): el pago inmediato
+ * (`earnedCommissionFor`, commissions/service.ts) y la nómina
+ * (`calculatePayroll`, payroll/service.ts) la consultan sin degradación. Acá
+ * se sigue el mismo criterio: un error real se propaga en vez de degradar a
+ * "sin reglas", que reintroduciría justamente la divergencia que este cálculo
+ * elimina (mostrar solo el porcentaje plano cuando el pago usa la regla).
+ */
+async function loadCommissionRulesByEmployee(
+  db: DbClient,
+  sedeId: string,
+  employeeIds: string[],
+): Promise<Map<string, Map<string, RuleRate>>> {
+  const byEmployee = new Map<string, Map<string, RuleRate>>();
+  if (employeeIds.length === 0) return byEmployee;
+  const { data, error } = await db
+    .from("commission_rules")
+    .select("employee_id, item_type, item_id, percent, amount")
+    .eq("sede_id", sedeId)
+    .eq("is_active", true)
+    .in("employee_id", employeeIds)
+    .limit(5000);
+  if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
+  for (const rule of (data ?? []) as Array<{
+    employee_id: string;
+    item_type: string;
+    item_id: string;
+    percent: number | string | null;
+    amount: number | string | null;
+  }>) {
+    const byItem = byEmployee.get(rule.employee_id) ?? new Map<string, RuleRate>();
+    byItem.set(commissionRuleKey(rule.item_type, rule.item_id), {
+      percent: rule.percent != null ? Number(rule.percent) : null,
+      amount: rule.amount != null ? Number(rule.amount) : null,
+    });
+    byEmployee.set(rule.employee_id, byItem);
+  }
+  return byEmployee;
 }
 
 function round2(value: number): number {

@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { moneyEquals, roundMoney } from "@/src/features/billing/schemas";
 import { cashOutLimitViolation } from "@/src/features/cash/schemas";
+import {
+  commissionRuleKey,
+  resolveEmployeeLineCommission,
+  type RuleRate,
+} from "@/src/features/commissions/schemas";
 
 export { moneyEquals, roundMoney };
 
@@ -175,6 +180,74 @@ export function buildEmployeeDetail(lines: DetailLine[]): { detail: DetailLine[]
   });
   const commissions = roundMoney(detail.reduce((acc, line) => acc + line.commission, 0));
   return { detail, commissions };
+}
+
+/** Línea de factura cruda que alimenta el detalle de comisiones de nómina. */
+export interface PayrollCommissionLine {
+  invoice_id: string;
+  consecutive_number: number | null;
+  item_id: string;
+  item_type: string;
+  qty: number;
+  unit_price: number;
+  line_subtotal: number;
+  commission_value: number | null;
+  /** product_id o service_id según el tipo (null en ítems `custom`). */
+  item_ref_id: string | null;
+}
+
+/** Una línea entra al detalle si el empleado tiene % plano o si tiene regla. */
+function lineHasActiveRule(line: PayrollCommissionLine, rules: Map<string, RuleRate>): boolean {
+  return line.item_ref_id != null && rules.has(commissionRuleKey(line.item_type, line.item_ref_id));
+}
+
+/**
+ * PAY-02/PAY-03: arma el detalle por línea de un empleado con la MISMA
+ * resolución que el pago inmediato (`resolveEmployeeLineCommission`): la regla
+ * ítem×empleado gana sobre el porcentaje plano. Así un `pay_type = "fijo"` con
+ * regla sí genera comisión (antes nómina la ignoraba).
+ *
+ * Preserva la semántica histórica:
+ *  - `payout_mode = "no_aplica"` → sin comisión (detalle vacío).
+ *  - `pay_type` fijo sin reglas → sin detalle (comisión 0).
+ *  - El valor fijo de ítems `custom` se respeta tal cual.
+ * Puro para probarlo sin base de datos.
+ */
+export function buildEmployeeCommissionDetail(args: {
+  employeeId: string;
+  payoutMode?: string | null;
+  payType: string;
+  commissionPercent: number | null;
+  lines: PayrollCommissionLine[];
+  rules: Map<string, RuleRate>;
+}): DetailLine[] {
+  if (args.payoutMode === "no_aplica") return [];
+  const flatPercent =
+    args.payType === "porcentaje" || args.payType === "mixto"
+      ? Number(args.commissionPercent ?? 0)
+      : null;
+  return args.lines
+    .filter((line) => flatPercent !== null || lineHasActiveRule(line, args.rules))
+    .map((line) => ({
+      employee_id: args.employeeId,
+      invoice_id: line.invoice_id,
+      consecutive_number: line.consecutive_number,
+      item_id: line.item_id,
+      item_type: line.item_type,
+      qty: line.qty,
+      unit_price: line.unit_price,
+      line_subtotal: roundMoney(line.line_subtotal),
+      commission: resolveEmployeeLineCommission({
+        itemType: line.item_type,
+        itemRefId: line.item_ref_id,
+        subtotal: line.line_subtotal,
+        qty: line.qty,
+        commissionValue: line.commission_value,
+        rules: args.rules,
+        flatPercent,
+      }),
+      commission_value: line.commission_value,
+    }));
 }
 
 /**

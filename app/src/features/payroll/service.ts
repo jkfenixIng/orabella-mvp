@@ -4,13 +4,13 @@ import {
   assertDeletablePeriod,
   assertNoOverpay,
   assertPortionsMatchNet,
+  buildEmployeeCommissionDetail,
   buildEmployeeDetail,
   calculatePayrollSchema,
   canDiscountVoucher,
   canReviewVoucher,
   checkVoucherCaps,
   checkVoucherEligibility,
-  computeLineCommission,
   computeNetPay,
   normalizeAllowedDays,
   normalizePerDayLimits,
@@ -33,6 +33,7 @@ import {
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
+import { commissionRuleKey, type RuleRate } from "@/src/features/commissions/schemas";
 import { cashOutUsedInShift, getOpenShiftWithOpener } from "@/src/features/cash/service";
 import { cashOutLimitViolation } from "@/src/features/cash/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
@@ -459,6 +460,8 @@ interface BillingLine {
   unit_price: number;
   line_subtotal: number;
   commission_value: number | null;
+  product_id: string | null;
+  service_id: string | null;
 }
 
 /**
@@ -515,7 +518,9 @@ export async function calculatePayroll(
     if (invoiceRows.length > 0) {
       const { data: items, error: itemsError } = await db
         .from("invoice_items")
-        .select("id, invoice_id, item_type, employee_id, qty, unit_price, subtotal, no_commission, commission_value")
+        .select(
+          "id, invoice_id, item_type, employee_id, qty, unit_price, subtotal, no_commission, commission_value, product_id, service_id",
+        )
         .in(
           "invoice_id",
           invoiceRows.map((row) => row.id),
@@ -532,6 +537,8 @@ export async function calculatePayroll(
         subtotal: number | string;
         no_commission?: boolean | null;
         commission_value?: number | null;
+        product_id: string | null;
+        service_id: string | null;
       }>).filter(
         (
           row,
@@ -545,6 +552,8 @@ export async function calculatePayroll(
           subtotal: number | string;
           no_commission?: boolean | null;
           commission_value?: number | null;
+          product_id: string | null;
+          service_id: string | null;
         } => Boolean(row.employee_id) && !row.no_commission,
       )).map((row) => ({
         invoice_id: row.invoice_id,
@@ -556,6 +565,8 @@ export async function calculatePayroll(
         unit_price: Number(row.unit_price),
         line_subtotal: Number(row.subtotal),
         commission_value: row.commission_value ? Number(row.commission_value) : null,
+        product_id: row.product_id,
+        service_id: row.service_id,
       }));
     }
     const linesByEmployee = new Map<string, BillingLine[]>();
@@ -563,6 +574,38 @@ export async function calculatePayroll(
       const list = linesByEmployee.get(line.employee_id) ?? [];
       list.push(line);
       linesByEmployee.set(line.employee_id, list);
+    }
+
+    // Reglas ítem×empleado activas de la sede (mismos filtros que usa el pago
+    // inmediato: sede + empleado + activa). Una sola consulta y se agrupan en
+    // memoria para no caer en N+1 sobre la planta activa.
+    const rulesByEmployee = new Map<string, Map<string, RuleRate>>();
+    if (actives.length > 0) {
+      const { data: rules, error: rulesError } = await db
+        .from("commission_rules")
+        .select("employee_id, item_type, item_id, percent, amount")
+        .eq("sede_id", sedeId)
+        .eq("is_active", true)
+        .in(
+          "employee_id",
+          actives.map((employee) => employee.id),
+        )
+        .limit(5000);
+      if (rulesError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+      for (const rule of (rules ?? []) as Array<{
+        employee_id: string;
+        item_type: string;
+        item_id: string;
+        percent: number | string | null;
+        amount: number | string | null;
+      }>) {
+        const byItem = rulesByEmployee.get(rule.employee_id) ?? new Map<string, RuleRate>();
+        byItem.set(commissionRuleKey(rule.item_type, rule.item_id), {
+          percent: rule.percent != null ? Number(rule.percent) : null,
+          amount: rule.amount != null ? Number(rule.amount) : null,
+        });
+        rulesByEmployee.set(rule.employee_id, byItem);
+      }
     }
 
     // Vales pendientes/aprobados del rango (se descuentan y marcan).
@@ -616,36 +659,36 @@ export async function calculatePayroll(
     }
 
     const payload = actives.map((employee) => {
-      const isNoAplica = (employee as { payout_mode?: string }).payout_mode === "no_aplica";
-      const employeeLines = isNoAplica ? [] : (linesByEmployee.get(employee.id) ?? []);
-      const percent =
-        isNoAplica || (employee.pay_type !== "porcentaje" && employee.pay_type !== "mixto")
-          ? null
-          : Number(employee.commission_percent ?? 0);
       const baseFixed =
         employee.pay_type === "fijo" || employee.pay_type === "mixto"
           ? roundMoney(Number(employee.salary_fixed ?? 0))
           : 0;
-      // Fijo: sin reporte de comisiones (alterno F3).
-      const detailInput: DetailLine[] =
-        percent === null
-          ? []
-          : employeeLines.map((line) => ({
-              employee_id: employee.id,
-              invoice_id: line.invoice_id,
-              consecutive_number: line.consecutive_number,
-              item_id: line.item_id,
-              item_type: line.item_type,
-              qty: line.qty,
-              unit_price: line.unit_price,
-              line_subtotal: roundMoney(line.line_subtotal),
-              // Para items custom, la comisión es un VALOR fijo del ítem;
-              // para productos/servicios, porcentaje del empleado.
-              commission: line.item_type === "custom" && line.commission_value !== null
-                ? roundMoney(line.commission_value)
-                : computeLineCommission(line.line_subtotal, percent),
-              commission_value: line.commission_value,
-            }));
+      // Misma resolución por línea que el pago inmediato: la regla ítem×empleado
+      // gana sobre el porcentaje plano. Un `fijo` con regla sí comisiona; un
+      // `fijo` sin reglas sigue sin detalle (comisión 0). `no_aplica` no entra.
+      const detailInput: DetailLine[] = buildEmployeeCommissionDetail({
+        employeeId: employee.id,
+        payoutMode: employee.payout_mode,
+        payType: employee.pay_type,
+        commissionPercent: employee.commission_percent,
+        lines: (linesByEmployee.get(employee.id) ?? []).map((line) => ({
+          invoice_id: line.invoice_id,
+          consecutive_number: line.consecutive_number,
+          item_id: line.item_id,
+          item_type: line.item_type,
+          qty: line.qty,
+          unit_price: line.unit_price,
+          line_subtotal: line.line_subtotal,
+          commission_value: line.commission_value,
+          item_ref_id:
+            line.item_type === "producto"
+              ? line.product_id
+              : line.item_type === "servicio"
+                ? line.service_id
+                : null,
+        })),
+        rules: rulesByEmployee.get(employee.id) ?? new Map<string, RuleRate>(),
+      });
       const { detail, commissions: earnedCommissions } = buildEmployeeDetail(detailInput);
       const paidImmediate = paidImmediateByEmployee.get(employee.id) ?? 0;
       const commissions = roundMoney(Math.max(0, earnedCommissions - paidImmediate));

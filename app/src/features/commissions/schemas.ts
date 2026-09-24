@@ -84,6 +84,47 @@ export function resolveLineCommission(args: {
   return roundMoney((roundMoney(args.subtotal) * args.flatPercent) / 100);
 }
 
+/** Clave de una regla ítem×empleado en el mapa: `${item_type}:${item_id}`. */
+export function commissionRuleKey(itemType: string, itemId: string): string {
+  return `${itemType}:${itemId}`;
+}
+
+/**
+ * Resolución POR LÍNEA compartida por el pago inmediato y la nómina (una sola
+ * fuente de verdad). Dada una línea y el contexto del empleado:
+ *  - Regla ítem×empleado activa → la regla gana (% sobre el subtotal + fijo
+ *    por unidad), sin importar el porcentaje plano.
+ *  - Sin regla → porcentaje plano del empleado (null = 0).
+ * El valor fijo de un ítem `custom` se respeta tal cual cuando lo trae la
+ * línea (la nómina lo persiste así; el pago inmediato no consulta ese campo).
+ * Puro para probarlo sin base de datos.
+ */
+export function resolveEmployeeLineCommission(args: {
+  itemType: string;
+  /** product_id o service_id de la línea (null en ítems `custom`). */
+  itemRefId: string | null;
+  subtotal: number;
+  qty: number;
+  /** Valor fijo de comisión del ítem `custom`, si la línea lo trae. */
+  commissionValue?: number | null;
+  rules: Map<string, RuleRate>;
+  flatPercent: number | null;
+}): number {
+  if (args.itemType === "custom" && args.commissionValue != null) {
+    return roundMoney(args.commissionValue);
+  }
+  const rule =
+    args.itemRefId != null
+      ? args.rules.get(commissionRuleKey(args.itemType, args.itemRefId)) ?? null
+      : null;
+  return resolveLineCommission({
+    subtotal: args.subtotal,
+    qty: Math.floor(args.qty),
+    rule,
+    flatPercent: rule ? null : args.flatPercent,
+  });
+}
+
 /**
  * Pendiente = ganado − pagado inmediato (nunca negativo: tope acumulado
  * contra el doble pago). Puro para probarlo sin base de datos.

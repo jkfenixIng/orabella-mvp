@@ -26,6 +26,12 @@ import {
   invoiceItemSchema,
 } from "@/src/features/billing/schemas";
 import { computeInvoiceItemCommission } from "@/src/features/billing/commission";
+import {
+  commissionRuleKey,
+  resolveEmployeeLineCommission,
+  type RuleRate,
+} from "@/src/features/commissions/schemas";
+import { buildEmployeeCommissionDetail } from "@/src/features/payroll/schemas";
 
 const EMPLOYEE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const PRODUCT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -551,6 +557,13 @@ describe("billing: edición libre de emitida sin motivo (cajera del turno)", () 
 
 // ------------------------------------- comisión por línea en el detalle ---
 
+const NO_RULES = new Map<string, RuleRate>();
+
+/** Regla de producto para el empleado de prueba. */
+function productRule(percent: number | null, amount: number | null): Map<string, RuleRate> {
+  return new Map([[commissionRuleKey("producto", PRODUCT_ID), { percent, amount }]]);
+}
+
 describe("billing: comisión calculada por línea (misma regla que nómina)", () => {
   const porcentaje = {
     payoutMode: "normal",
@@ -562,33 +575,100 @@ describe("billing: comisión calculada por línea (misma regla que nómina)", ()
     expect(
       computeInvoiceItemCommission({
         itemType: "producto",
+        itemRefId: PRODUCT_ID,
         subtotal: 100000,
+        qty: 2,
         commissionValue: null,
         noCommission: false,
+        rules: NO_RULES,
         employee: porcentaje,
       }),
     ).toBe(10000);
   });
 
-  it("pay_type fijo no genera porcentaje (sin comisión)", () => {
+  it("pay_type fijo sin reglas no genera comisión", () => {
     expect(
       computeInvoiceItemCommission({
         itemType: "producto",
+        itemRefId: PRODUCT_ID,
         subtotal: 100000,
+        qty: 2,
         commissionValue: null,
         noCommission: false,
+        rules: NO_RULES,
         employee: { payoutMode: "normal", payType: "fijo", commissionPercent: 10 },
       }),
     ).toBe(0);
+  });
+
+  it("pay_type fijo CON regla ítem×empleado sí comisiona (el caso que estaba mal)", () => {
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "producto",
+        itemRefId: PRODUCT_ID,
+        subtotal: 100000,
+        qty: 2,
+        commissionValue: null,
+        noCommission: false,
+        rules: productRule(5, null),
+        employee: { payoutMode: "normal", payType: "fijo", commissionPercent: null },
+      }),
+    ).toBe(5000);
+  });
+
+  it("la regla ítem×empleado gana al porcentaje plano", () => {
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "producto",
+        itemRefId: PRODUCT_ID,
+        subtotal: 100000,
+        qty: 2,
+        commissionValue: null,
+        noCommission: false,
+        rules: productRule(7, null),
+        employee: porcentaje,
+      }),
+    ).toBe(7000);
+  });
+
+  it("regla con monto fijo por unidad respeta la cantidad", () => {
+    const rules = productRule(null, 1500);
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "producto",
+        itemRefId: PRODUCT_ID,
+        subtotal: 80000,
+        qty: 4,
+        commissionValue: null,
+        noCommission: false,
+        rules,
+        employee: porcentaje,
+      }),
+    ).toBe(6000);
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "producto",
+        itemRefId: PRODUCT_ID,
+        subtotal: 20000,
+        qty: 1,
+        commissionValue: null,
+        noCommission: false,
+        rules,
+        employee: porcentaje,
+      }),
+    ).toBe(1500);
   });
 
   it("payout_mode no_aplica no genera comisión", () => {
     expect(
       computeInvoiceItemCommission({
         itemType: "producto",
+        itemRefId: PRODUCT_ID,
         subtotal: 100000,
+        qty: 2,
         commissionValue: null,
         noCommission: false,
+        rules: NO_RULES,
         employee: { ...porcentaje, payoutMode: "no_aplica" },
       }),
     ).toBe(0);
@@ -598,9 +678,12 @@ describe("billing: comisión calculada por línea (misma regla que nómina)", ()
     expect(
       computeInvoiceItemCommission({
         itemType: "custom",
+        itemRefId: null,
         subtotal: 100000,
+        qty: 1,
         commissionValue: 5000,
         noCommission: false,
+        rules: NO_RULES,
         employee: porcentaje,
       }),
     ).toBe(5000);
@@ -611,9 +694,12 @@ describe("billing: comisión calculada por línea (misma regla que nómina)", ()
     expect(
       computeInvoiceItemCommission({
         itemType: "custom",
+        itemRefId: null,
         subtotal: 100000,
+        qty: 1,
         commissionValue: 0,
         noCommission: false,
+        rules: NO_RULES,
         employee: porcentaje,
       }),
     ).toBe(10000);
@@ -623,9 +709,12 @@ describe("billing: comisión calculada por línea (misma regla que nómina)", ()
     expect(
       computeInvoiceItemCommission({
         itemType: "producto",
+        itemRefId: PRODUCT_ID,
         subtotal: 100000,
+        qty: 2,
         commissionValue: null,
         noCommission: true,
+        rules: productRule(50, null),
         employee: porcentaje,
       }),
     ).toBe(0);
@@ -635,11 +724,240 @@ describe("billing: comisión calculada por línea (misma regla que nómina)", ()
     expect(
       computeInvoiceItemCommission({
         itemType: "producto",
+        itemRefId: PRODUCT_ID,
         subtotal: 100000,
+        qty: 2,
         commissionValue: null,
         noCommission: false,
+        rules: NO_RULES,
         employee: null,
       }),
     ).toBe(null);
   });
 });
+
+// ------------------------- paridad: detalle === resolución compartida/nómina ---
+
+describe("billing: paridad del detalle con la resolución compartida y la nómina", () => {
+  /**
+   * Comisión que la nómina produce para una línea (0 si la descarta). Reproduce
+   * el input tal como lo arma calculatePayroll: normaliza `commission_value`
+   * con chequeo de veracidad antes de llamar a la resolución compartida.
+   */
+  function payrollLineCommission(args: {
+    itemType: string;
+    itemRefId: string | null;
+    subtotal: number;
+    qty: number;
+    commissionValue: number | null;
+    payType: string;
+    commissionPercent: number | null;
+    payoutMode?: string | null;
+    rules: Map<string, RuleRate>;
+  }): number {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: EMPLOYEE_ID,
+      payoutMode: args.payoutMode ?? "normal",
+      payType: args.payType,
+      commissionPercent: args.commissionPercent,
+      lines: [
+        {
+          invoice_id: "inv-1",
+          consecutive_number: 1,
+          item_id: "line-1",
+          item_type: args.itemType,
+          qty: args.qty,
+          unit_price: args.qty > 0 ? args.subtotal / args.qty : 0,
+          line_subtotal: args.subtotal,
+          commission_value: args.commissionValue ? Number(args.commissionValue) : null,
+          item_ref_id: args.itemRefId,
+        },
+      ],
+      rules: args.rules,
+    });
+    return detail.reduce((acc, line) => acc + line.commission, 0);
+  }
+
+  it("mismo input: detalle === resolución compartida (resolveEmployeeLineCommission)", () => {
+    const rules = new Map([[commissionRuleKey("servicio", SERVICE_ID), { percent: 12, amount: 500 }]]);
+    const flatPercent = 10;
+    const input = {
+      itemType: "servicio",
+      itemRefId: SERVICE_ID,
+      subtotal: 100000,
+      qty: 2,
+      commissionValue: null,
+      noCommission: false,
+      rules,
+      employee: { payoutMode: "normal", payType: "porcentaje", commissionPercent: flatPercent },
+    };
+    expect(computeInvoiceItemCommission(input)).toBe(
+      resolveEmployeeLineCommission({
+        itemType: "servicio",
+        itemRefId: SERVICE_ID,
+        subtotal: 100000,
+        qty: 2,
+        commissionValue: null,
+        rules,
+        flatPercent,
+      }),
+    );
+    // Regla: 100000×12% + 500×2 = 13000.
+    expect(computeInvoiceItemCommission(input)).toBe(13000);
+  });
+
+  it("mismo input: detalle === comisión de nómina (fijo + regla, porcentaje, mixto)", () => {
+    const rules = productRule(7, 1500);
+    const cases = [
+      { payType: "fijo", commissionPercent: null },
+      { payType: "porcentaje", commissionPercent: 10 },
+      { payType: "mixto", commissionPercent: 4 },
+    ];
+    for (const employee of cases) {
+      const input = {
+        itemType: "producto",
+        itemRefId: PRODUCT_ID,
+        subtotal: 100000,
+        qty: 3,
+        commissionValue: null,
+        noCommission: false,
+        rules,
+        employee: { payoutMode: "normal", ...employee },
+      };
+      const billing = computeInvoiceItemCommission(input);
+      const payroll = payrollLineCommission({
+        itemType: "producto",
+        itemRefId: PRODUCT_ID,
+        subtotal: 100000,
+        qty: 3,
+        commissionValue: null,
+        payType: employee.payType,
+        commissionPercent: employee.commissionPercent,
+        rules,
+      });
+      expect(billing).toBe(payroll);
+      // 100000×7% + 1500×3 = 11500 (la regla gana en los tres pay_type).
+      expect(billing).toBe(11500);
+    }
+  });
+
+  it("fijo sin reglas: detalle y nómina coinciden en 0", () => {
+    const input = {
+      itemType: "producto",
+      itemRefId: PRODUCT_ID,
+      subtotal: 100000,
+      qty: 2,
+      commissionValue: null,
+      noCommission: false,
+      rules: NO_RULES,
+      employee: { payoutMode: "normal", payType: "fijo", commissionPercent: 10 },
+    };
+    expect(computeInvoiceItemCommission(input)).toBe(0);
+    expect(
+      payrollLineCommission({
+        itemType: "producto",
+        itemRefId: PRODUCT_ID,
+        subtotal: 100000,
+        qty: 2,
+        commissionValue: null,
+        payType: "fijo",
+        commissionPercent: 10,
+        rules: NO_RULES,
+      }),
+    ).toBe(0);
+  });
+
+  it("custom con commission_value: coherente con nómina (porcentaje y fijo sin regla)", () => {
+    // Empleado con porcentaje: ambos usan el valor fijo del ítem.
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "custom",
+        itemRefId: null,
+        subtotal: 100000,
+        qty: 1,
+        commissionValue: 5000,
+        noCommission: false,
+        rules: NO_RULES,
+        employee: { payoutMode: "normal", payType: "porcentaje", commissionPercent: 10 },
+      }),
+    ).toBe(5000);
+    expect(
+      payrollLineCommission({
+        itemType: "custom",
+        itemRefId: null,
+        subtotal: 100000,
+        qty: 1,
+        commissionValue: 5000,
+        payType: "porcentaje",
+        commissionPercent: 10,
+        rules: NO_RULES,
+      }),
+    ).toBe(5000);
+    // Empleado fijo sin regla: nómina descarta la línea; el detalle también da 0.
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "custom",
+        itemRefId: null,
+        subtotal: 100000,
+        qty: 1,
+        commissionValue: 5000,
+        noCommission: false,
+        rules: NO_RULES,
+        employee: { payoutMode: "normal", payType: "fijo", commissionPercent: null },
+      }),
+    ).toBe(0);
+    expect(
+      payrollLineCommission({
+        itemType: "custom",
+        itemRefId: null,
+        subtotal: 100000,
+        qty: 1,
+        commissionValue: 5000,
+        payType: "fijo",
+        commissionPercent: null,
+        rules: NO_RULES,
+      }),
+    ).toBe(0);
+  });
+
+  it("no_commission y no_aplica: 0 en el detalle y sin línea en nómina", () => {
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "producto",
+        itemRefId: PRODUCT_ID,
+        subtotal: 100000,
+        qty: 2,
+        commissionValue: null,
+        noCommission: true,
+        rules: productRule(5, null),
+        employee: { payoutMode: "normal", payType: "fijo", commissionPercent: null },
+      }),
+    ).toBe(0);
+    expect(
+      computeInvoiceItemCommission({
+        itemType: "producto",
+        itemRefId: PRODUCT_ID,
+        subtotal: 100000,
+        qty: 2,
+        commissionValue: null,
+        noCommission: false,
+        rules: productRule(5, null),
+        employee: { payoutMode: "no_aplica", payType: "porcentaje", commissionPercent: 10 },
+      }),
+    ).toBe(0);
+    expect(
+      payrollLineCommission({
+        itemType: "producto",
+        itemRefId: PRODUCT_ID,
+        subtotal: 100000,
+        qty: 2,
+        commissionValue: null,
+        payType: "porcentaje",
+        commissionPercent: 10,
+        payoutMode: "no_aplica",
+        rules: productRule(5, null),
+      }),
+    ).toBe(0);
+  });
+});
+

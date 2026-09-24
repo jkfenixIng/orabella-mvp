@@ -1,8 +1,9 @@
 import {
   commissionPayoutSchema,
+  commissionRuleKey,
   commissionRuleSchema,
   pendingCommission,
-  resolveLineCommission,
+  resolveEmployeeLineCommission,
   roundMoney,
   type CommissionPayoutRow,
   type CommissionRuleRow,
@@ -197,9 +198,15 @@ export async function earnedCommissionFor(
     .eq("employee_id", employeeId)
     .eq("is_active", true);
   if (rulesError) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  const ruleByItem = new Map(
+  const ruleByItem = new Map<string, RuleRate>(
     ((rules ?? []) as Array<{ item_type: string; item_id: string; percent: number | null; amount: number | null }>).map(
-      (rule) => [`${rule.item_type}:${rule.item_id}`, rule],
+      (rule) => [
+        commissionRuleKey(rule.item_type, rule.item_id),
+        {
+          percent: rule.percent != null ? Number(rule.percent) : null,
+          amount: rule.amount != null ? Number(rule.amount) : null,
+        },
+      ],
     ),
   );
 
@@ -221,25 +228,25 @@ export async function earnedCommissionFor(
   const usedRules = new Map<string, RuleRate>();
   for (const line of earning) {
     const refId = line.item_type === "producto" ? line.product_id : line.service_id;
-    const rule = refId ? ruleByItem.get(`${line.item_type}:${refId}`) : undefined;
+    const rule = refId ? ruleByItem.get(commissionRuleKey(line.item_type, refId)) : undefined;
     const subtotal = roundMoney(Number(line.subtotal));
     baseSubtotal = roundMoney(baseSubtotal + subtotal);
     earned = roundMoney(
       earned +
-        resolveLineCommission({
+        resolveEmployeeLineCommission({
+          itemType: line.item_type,
+          itemRefId: refId ?? null,
           subtotal,
-          qty: Math.floor(Number(line.qty)),
-          rule: rule
-            ? { percent: rule.percent != null ? Number(rule.percent) : null, amount: rule.amount != null ? Number(rule.amount) : null }
-            : null,
-          flatPercent: rule ? null : flatPercent,
+          qty: Number(line.qty),
+          // El pago inmediato no consulta el valor fijo de ítems custom: se
+          // mantiene su comportamiento observable (null = sin override).
+          commissionValue: null,
+          rules: ruleByItem,
+          flatPercent,
         }),
     );
-    if (rule) {
-      usedRules.set(`${line.item_type}:${refId}`, {
-        percent: rule.percent != null ? Number(rule.percent) : null,
-        amount: rule.amount != null ? Number(rule.amount) : null,
-      });
+    if (rule && refId) {
+      usedRules.set(commissionRuleKey(line.item_type, refId), rule);
     }
   }
   const uniform = usedRules.size === 1 ? [...usedRules.values()][0] : null;
