@@ -95,14 +95,27 @@ function toNumber(value: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function formatMoney(value: number | string): string {
+function formatMoney(value: number | string | null | undefined): string {
   const numeric = typeof value === "string" ? Number(value) : value;
-  if (!Number.isFinite(numeric)) return "—";
+  if (numeric == null || !Number.isFinite(numeric)) return "—";
   return new Intl.NumberFormat("es-CO", {
     style: "currency",
     currency: "COP",
     maximumFractionDigits: 0,
   }).format(numeric);
+}
+
+/**
+ * Comisión a mostrar en el detalle de solo lectura. Prioriza el valor cargado
+ * en el ítem (`commission_value`, el que el usuario ingresó); si no hay, cae al
+ * monto calculado por nómina (`commission_amount`); sin ninguno, null (la
+ * tabla pinta "—"). Nunca suma ni mezcla ambos campos.
+ */
+function commissionDisplayValue(
+  row: Pick<InvoiceItemRow, "commission_value" | "commission_amount">,
+): number | null {
+  if (row.commission_value != null) return row.commission_value;
+  return row.commission_amount ?? null;
 }
 
 /** Pastilla de estado: Emitida azul, Pagada verde, Anulada roja (ambos temas). */
@@ -1547,10 +1560,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                       {!clientView &&
                                         row.item_type !== "servicio" &&
                                         !row.no_commission &&
-                                        row.commission_amount !== null &&
-                                        row.commission_amount !== undefined && (
+                                        commissionDisplayValue(row) !== null && (
                                           <span className="ml-2 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
-                                            Comisión: {formatMoney(row.commission_amount)}
+                                            Comisión: {formatMoney(commissionDisplayValue(row))}
                                           </span>
                                         )}
                                       {!clientView && row.no_commission && (
@@ -1576,8 +1588,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                           <span className="text-xs text-slate-500">Sin comisión</span>
                                         ) : row.no_commission ? (
                                           <span className="text-slate-500">No</span>
-                                        ) : row.commission_amount !== null && row.commission_amount !== undefined ? (
-                                          <span className="font-medium text-emerald-700">{formatMoney(row.commission_amount)}</span>
+                                        ) : commissionDisplayValue(row) !== null ? (
+                                          <span className="font-medium text-emerald-700">{formatMoney(commissionDisplayValue(row))}</span>
                                         ) : (
                                           <span className="text-slate-400">—</span>
                                         )}
@@ -1938,7 +1950,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                   />
                                                   <span className="text-slate-600">¿Comisión?</span>
                                                 </label>
-                                                {!item.no_commission && item.item_type === "custom" && (
+                                                {!item.no_commission && (
                                                   <>
                                                     <input
                                                       className={`${paperInputClass} h-9 w-28 text-right`}
@@ -1967,16 +1979,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                       </span>
                                                     )}
                                                   </>
-                                                )}
-                                                {!item.no_commission && item.item_type === "producto" && (
-                                                  <span
-                                                    className="text-xs text-slate-600"
-                                                    title="Valor de comisión asignado al ítem."
-                                                  >
-                                                    {item.commission_value == null
-                                                      ? "—"
-                                                      : formatMoney(item.commission_value)}
-                                                  </span>
                                                 )}
                                               </div>
                                             )}
