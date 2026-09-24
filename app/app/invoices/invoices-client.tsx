@@ -72,6 +72,12 @@ type ActionResult<T> =
   | { success: true; data: T }
   | { success: false; code: string; message: string };
 
+/** Modo de comisión de una línea (espejo del enum del backend, migración 030). */
+type CommissionMode = "comision" | "porcentaje" | "ninguna";
+
+/** Modos ofrecidos en el personalizado: comisión, porcentaje o ninguna. */
+const CUSTOM_COMMISSION_MODES: CommissionMode[] = ["comision", "porcentaje", "ninguna"];
+
 interface ItemDraft {
   item_type: "producto" | "servicio" | "custom";
   ref_id: string;
@@ -81,6 +87,10 @@ interface ItemDraft {
   unit_price: string;
   no_commission: boolean;
   commission_value: number | null;
+  /** Modo explícito de la línea: comisión (valor fijo), porcentaje o ninguna. */
+  commission_mode: CommissionMode;
+  /** Porcentaje de la línea para un personalizado por porcentaje con empleado de pago fijo. */
+  commission_percent_override: number | null;
 }
 
 interface PortionDraft {
@@ -97,10 +107,109 @@ interface CommissionPayRow {
 }
 
 function emptyItem(): ItemDraft {
-  // Servicio por defecto: comisiona el % del empleado (se puede excluir con el
-  // checkbox "¿Tiene comisión?"). Personalizado arranca sin comisión: exige
-  // valor explícito.
-  return { item_type: "servicio", ref_id: "", custom_name: "", employee_id: "", qty: "1", unit_price: "", no_commission: false, commission_value: null };
+  // Servicio por defecto: siempre comisiona el % del empleado. El
+  // personalizado arranca sin comisión y exige elegir el modo.
+  return { item_type: "servicio", ref_id: "", custom_name: "", employee_id: "", qty: "1", unit_price: "", no_commission: false, commission_value: null, commission_mode: "porcentaje", commission_percent_override: null };
+}
+
+/**
+ * Deriva el modo de una fila histórica sin `commission_mode` (misma regla que
+ * `deriveCommissionMode` del backend): sin comisión → ninguna; con valor fijo
+ * → comisión; producto sin valor → comisión; el resto (servicio/custom) →
+ * porcentaje. Se usa al cargar una factura ya emitida para editar.
+ */
+function deriveDraftMode(
+  itemType: string,
+  noCommission: boolean | null | undefined,
+  commissionValue: number | null | undefined,
+): CommissionMode {
+  if (noCommission) return "ninguna";
+  if (commissionValue != null && commissionValue > 0) return "comision";
+  if (itemType === "producto") return "comision";
+  return "porcentaje";
+}
+
+/**
+ * true si el empleado es de pago fijo: no aporta porcentaje propio. Réplica de
+ * `effectiveFlatPercent` del backend, donde solo `pay_type` `porcentaje` o
+ * `mixto` dan tasa plana (y por ADM-08 siempre traen `commission_percent`).
+ */
+function isFixedPayEmployee(employee: EmployeeRow | undefined): boolean {
+  return !(employee?.pay_type === "porcentaje" || employee?.pay_type === "mixto");
+}
+
+/**
+ * Alinea los campos de comisión de un borrador con su modo antes de guardarlo
+ * o enviarlo: comisión lleva valor; porcentaje lleva el porcentaje explícito
+ * solo si es personalizado y el empleado es de pago fijo; ninguna no lleva
+ * nada. El servicio siempre comisiona por porcentaje del empleado.
+ */
+function normalizeDraftCommission(item: ItemDraft, employeeFixedPay: boolean): ItemDraft {
+  let mode = item.commission_mode;
+  if (item.item_type === "servicio") mode = "porcentaje";
+  if (item.item_type === "producto" && mode === "porcentaje") mode = "comision";
+  return {
+    ...item,
+    commission_mode: mode,
+    no_commission: mode === "ninguna",
+    commission_value: mode === "comision" ? item.commission_value : null,
+    commission_percent_override:
+      mode === "porcentaje" && item.item_type === "custom" && employeeFixedPay
+        ? item.commission_percent_override
+        : null,
+  };
+}
+
+/**
+ * Modo efectivo de una fila ya emitida: el almacenado si es válido o, en filas
+ * históricas sin `commission_mode`, el derivado de los campos viejos.
+ */
+function commissionModeOf(row: {
+  item_type: string;
+  no_commission: boolean | null | undefined;
+  commission_value: number | null | undefined;
+  commission_mode: string | null | undefined;
+}): CommissionMode {
+  const mode = row.commission_mode;
+  if (mode === "comision" || mode === "porcentaje" || mode === "ninguna") return mode;
+  return deriveDraftMode(row.item_type, row.no_commission, row.commission_value);
+}
+
+/** Selector segmentado del modo de comisión (comisión / porcentaje / ninguna). */
+function CommissionModeSelector(props: {
+  value: CommissionMode;
+  options: CommissionMode[];
+  onChange: (mode: CommissionMode) => void;
+  ariaLabel: string;
+}) {
+  const labels: Record<CommissionMode, string> = {
+    comision: "Comisión",
+    porcentaje: "Porcentaje",
+    ninguna: "Ninguna",
+  };
+  return (
+    <div
+      className="inline-flex overflow-hidden rounded-md border border-slate-300"
+      role="group"
+      aria-label={props.ariaLabel}
+    >
+      {props.options.map((mode) => (
+        <button
+          key={mode}
+          type="button"
+          aria-pressed={props.value === mode}
+          onClick={() => props.onChange(mode)}
+          className={
+            props.value === mode
+              ? "bg-slate-900 px-2 py-1 text-[10px] font-semibold text-white"
+              : "bg-white px-2 py-1 text-[10px] font-medium text-slate-700 hover:bg-slate-100"
+          }
+        >
+          {labels[mode]}
+        </button>
+      ))}
+    </div>
+  );
 }
 
 function toNumber(value: string): number | null {
@@ -324,7 +433,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
       const found = props.products.find((row) => row.id === refId);
       if (found?.sale_price != null) patchDraft({ unit_price: String(found.sale_price) });
       if (found && found.commission_value != null && found.commission_value > 0) {
-        patchDraft({ commission_value: found.commission_value, no_commission: false });
+        patchDraft({ commission_value: found.commission_value, no_commission: false, commission_mode: "comision" });
       }
     }
     if (type === "servicio") {
@@ -379,16 +488,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
       setItemError("Precio inválido.");
       return;
     }
-    const draft: ItemDraft =
-      itemDraft.item_type === "servicio"
-        ? // Servicio: comisiona por % del empleado; nunca lleva valor fijo.
-          { ...itemDraft, commission_value: null }
-        : itemDraft.item_type === "custom" && itemDraft.no_commission
-          ? { ...itemDraft, commission_value: null }
-          : itemDraft;
-    if (draft.item_type === "custom" && !draft.no_commission) {
+    const employee = props.employees.find((row) => row.id === itemDraft.employee_id);
+    const fixedPay = isFixedPayEmployee(employee);
+    const draft = normalizeDraftCommission(itemDraft, fixedPay);
+    if (draft.item_type === "custom" && draft.commission_mode === "comision") {
       if (draft.commission_value == null || !(draft.commission_value >= 0)) {
         setItemError("Indique el valor de la comisión.");
+        return;
+      }
+    }
+    if (draft.item_type === "custom" && draft.commission_mode === "porcentaje" && fixedPay) {
+      if (draft.commission_percent_override == null || !(draft.commission_percent_override >= 0)) {
+        setItemError("Indique el porcentaje para este ítem.");
         return;
       }
     }
@@ -443,7 +554,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
     discount: number | string;
     no_commission: boolean | null;
     commission_value: number | string | null;
+    commission_mode: string | null;
+    commission_percent_override: number | string | null;
   }): EditItemDraft {
+    const commissionValue = row.commission_value == null ? null : Number(row.commission_value);
     return {
       id: row.id,
       item_type: row.item_type as ItemDraft["item_type"],
@@ -454,7 +568,15 @@ export function InvoicesClient(props: InvoicesClientProps) {
       unit_price: String(row.unit_price),
       discount: Number(row.discount),
       no_commission: Boolean(row.no_commission),
-      commission_value: row.commission_value == null ? null : Number(row.commission_value),
+      commission_value: commissionValue,
+      commission_mode: commissionModeOf({
+        item_type: row.item_type,
+        no_commission: row.no_commission,
+        commission_value: commissionValue,
+        commission_mode: row.commission_mode,
+      }),
+      commission_percent_override:
+        row.commission_percent_override == null ? null : Number(row.commission_percent_override),
     };
   }
 
@@ -514,9 +636,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
         setEditError(`Ítem ${index + 1}: precio inválido.`);
         return;
       }
-      if (item.item_type === "custom" && !item.no_commission) {
-        if (item.commission_value == null || !(item.commission_value >= 0)) {
+      const employee = props.employees.find((row) => row.id === item.employee_id);
+      const fixedPay = isFixedPayEmployee(employee);
+      const normalized = normalizeDraftCommission(item, fixedPay);
+      if (normalized.item_type === "custom" && normalized.commission_mode === "comision") {
+        if (normalized.commission_value == null || !(normalized.commission_value >= 0)) {
           setEditError(`Ítem ${index + 1}: indique el valor de la comisión.`);
+          return;
+        }
+      }
+      if (normalized.item_type === "custom" && normalized.commission_mode === "porcentaje" && fixedPay) {
+        if (normalized.commission_percent_override == null || !(normalized.commission_percent_override >= 0)) {
+          setEditError(`Ítem ${index + 1}: indique el porcentaje para este ítem.`);
           return;
         }
       }
@@ -530,9 +661,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
         qty,
         unit_price: price,
         discount: item.discount,
-        no_commission: item.no_commission,
-        // La comisión se persiste para producto y custom; servicio no lleva valor.
-        commission_value: item.item_type !== "servicio" && !item.no_commission ? item.commission_value : null,
+        no_commission: normalized.no_commission,
+        // Modo explícito (030): el backend normaliza no_commission/valor desde él.
+        commission_mode: normalized.commission_mode,
+        commission_value: normalized.commission_value,
+        commission_percent_override: normalized.commission_percent_override,
       });
     }
     setBusy(true);
@@ -621,6 +754,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
       discount: number;
       no_commission: boolean;
       commission_value: number | null;
+      commission_mode: CommissionMode;
+      commission_percent_override: number | null;
     }>;
     discount: number;
     payments: Array<{ method_code: string; amount: number }>;
@@ -652,9 +787,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
         setError(`Ítem ${index + 1}: precio inválido.`);
         return null;
       }
-      if (item.item_type === "custom" && !item.no_commission) {
-        if (item.commission_value == null || !(item.commission_value >= 0)) {
+      const employee = props.employees.find((row) => row.id === item.employee_id);
+      const fixedPay = isFixedPayEmployee(employee);
+      const normalized = normalizeDraftCommission(item, fixedPay);
+      if (normalized.item_type === "custom" && normalized.commission_mode === "comision") {
+        if (normalized.commission_value == null || !(normalized.commission_value >= 0)) {
           setError(`Ítem ${index + 1}: indique el valor de la comisión.`);
+          return null;
+        }
+      }
+      if (normalized.item_type === "custom" && normalized.commission_mode === "porcentaje" && fixedPay) {
+        if (normalized.commission_percent_override == null || !(normalized.commission_percent_override >= 0)) {
+          setError(`Ítem ${index + 1}: indique el porcentaje para este ítem.`);
           return null;
         }
       }
@@ -667,9 +811,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
         qty,
         unit_price: price,
         discount: 0,
-        no_commission: item.no_commission,
-        // La comisión se persiste para producto y custom; servicio no lleva valor.
-        commission_value: item.item_type !== "servicio" && !item.no_commission ? item.commission_value : null,
+        no_commission: normalized.no_commission,
+        // Modo explícito (030): el backend normaliza no_commission/valor desde él.
+        commission_mode: normalized.commission_mode,
+        commission_value: normalized.commission_value,
+        commission_percent_override: normalized.commission_percent_override,
       });
     }
     const parsedPortions = [];
@@ -1034,6 +1180,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
   const paperInputClass =
     "flex h-10 w-full rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-slate-500 disabled:cursor-not-allowed disabled:opacity-50";
 
+  // Empleado elegido en el diálogo de ítem: define si el porcentaje del
+  // personalizado se toma del empleado o se digita explícitamente.
+  const itemDraftEmployee = props.employees.find((row) => row.id === itemDraft.employee_id);
+  const itemDraftFixedPay = isFixedPayEmployee(itemDraftEmployee);
+
   return (
     <div className="flex min-h-0 flex-col gap-6">
       <Card className="overflow-hidden">
@@ -1154,7 +1305,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     </td>
                                     {!clientView && (
                                       <td className="whitespace-nowrap px-3 py-2 text-center">
-                                        {item.no_commission ? (
+                                        {item.commission_mode === "ninguna" ? (
                                           <span className="text-xs text-slate-500">Sin comisión</span>
                                         ) : item.item_type === "servicio" ? (
                                           <span
@@ -1162,6 +1313,15 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                             title="Se paga el porcentaje del empleado sobre el subtotal."
                                           >
                                             % del empleado
+                                          </span>
+                                        ) : item.commission_mode === "porcentaje" ? (
+                                          <span
+                                            className="text-xs text-slate-600"
+                                            title="Porcentaje sobre el subtotal; se paga en nómina."
+                                          >
+                                            {item.commission_percent_override != null
+                                              ? `${item.commission_percent_override}% (ítem)`
+                                              : "% del empleado"}
                                           </span>
                                         ) : item.item_type === "producto" ? (
                                           <div className="flex flex-col items-center gap-0.5">
@@ -1200,11 +1360,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                               title="Valor de comisión por unidad; se multiplica por la cantidad."
                                             />
                                             {item.commission_value == null ? (
-                                              <span
-                                                className="text-[10px] text-slate-500"
-                                                title="Sin valor fijo se aplica el porcentaje del empleado."
-                                              >
-                                                Se usará % del empleado
+                                              <span className="text-[10px] text-slate-500">
+                                                Requerido
                                               </span>
                                             ) : (
                                               <span className="text-[10px] text-slate-500">
@@ -1701,7 +1858,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   <th className="px-3 py-2 text-right">Cant.</th>
                                   <th className="px-3 py-2 text-right">V. unitario</th>
                                   <th className="px-3 py-2 text-right">Subtotal</th>
-                                  {!clientView && <th className="px-3 py-2 text-center">¿Comisión?</th>}
+                                  {!clientView && <th className="px-3 py-2 text-center">Comisión</th>}
                                 </tr>
                               </thead>
                               <tbody>
@@ -1736,8 +1893,17 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     <td className="px-3 py-2 text-right font-medium">{formatMoney(row.subtotal)}</td>
                                     {!clientView && (
                                       <td className="px-3 py-2 text-center">
-                                        {row.no_commission ? (
-                                          <span className="text-slate-500">No</span>
+                                        {commissionModeOf(row) === "ninguna" ? (
+                                          <span className="text-slate-500">Sin comisión</span>
+                                        ) : commissionModeOf(row) === "porcentaje" ? (
+                                          <span
+                                            className="text-slate-600"
+                                            title="Porcentaje sobre el subtotal; se paga en nómina."
+                                          >
+                                            {row.commission_percent_override != null
+                                              ? `${row.commission_percent_override}% (ítem)`
+                                              : "% del empleado"}
+                                          </span>
                                         ) : commissionDisplayValue(row) !== null ? (
                                           <span className="font-medium text-emerald-700">{formatMoney(commissionDisplayValue(row))}</span>
                                         ) : (
@@ -1980,6 +2146,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   {editItems.map((item, index) => {
                                     const lineQty = toNumber(item.qty) ?? 0;
                                     const linePrice = toNumber(item.unit_price) ?? 0;
+                                    const employee = props.employees.find((row) => row.id === item.employee_id);
+                                    const fixedPay = isFixedPayEmployee(employee);
                                     return (
                                       <tr key={item.id ?? `nuevo-${index}`} className="border-t border-slate-200 align-top">
                                         <td className="px-3 py-2 font-semibold">{index + 1}</td>
@@ -2083,47 +2251,30 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         {!clientView && (
                                           <td className="px-3 py-2 text-center">
                                             {item.item_type === "servicio" ? (
+                                              <span
+                                                className="text-[10px] text-slate-500"
+                                                title="Se paga el porcentaje del empleado sobre el subtotal."
+                                              >
+                                                % del empleado
+                                              </span>
+                                            ) : item.item_type === "producto" ? (
                                               <div className="flex flex-col items-center gap-1">
                                                 <label className="flex items-center gap-1.5 text-sm">
                                                   <input
                                                     type="checkbox"
-                                                    checked={!item.no_commission}
+                                                    checked={item.commission_mode === "comision"}
                                                     onChange={(event) =>
                                                       patchEditItem(index, {
+                                                        commission_mode: event.target.checked ? "comision" : "ninguna",
                                                         no_commission: !event.target.checked,
-                                                        commission_value: null,
+                                                        commission_value: event.target.checked ? item.commission_value : null,
                                                       })
                                                     }
                                                     className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
                                                   />
                                                   <span className="text-slate-600">¿Comisión?</span>
                                                 </label>
-                                                {!item.no_commission && (
-                                                  <span
-                                                    className="text-[10px] text-slate-500"
-                                                    title="Se paga el porcentaje del empleado sobre el subtotal."
-                                                  >
-                                                    % del empleado
-                                                  </span>
-                                                )}
-                                              </div>
-                                            ) : (
-                                              <div className="flex flex-col items-center gap-1">
-                                                <label className="flex items-center gap-1.5 text-sm">
-                                                  <input
-                                                    type="checkbox"
-                                                    checked={!item.no_commission}
-                                                    onChange={(event) =>
-                                                      patchEditItem(index, {
-                                                        no_commission: !event.target.checked,
-                                                        commission_value: null,
-                                                      })
-                                                    }
-                                                    className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
-                                                  />
-                                                  <span className="text-slate-600">¿Comisión?</span>
-                                                </label>
-                                                {!item.no_commission && (
+                                                {item.commission_mode === "comision" && (
                                                   <>
                                                     <input
                                                       className={`${paperInputClass} h-9 w-28 text-right`}
@@ -2144,11 +2295,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                       title="Valor de comisión por unidad; se multiplica por la cantidad."
                                                     />
                                                     {item.commission_value == null ? (
-                                                      <span
-                                                        className="text-[10px] text-slate-500"
-                                                        title="Sin valor fijo se aplica el porcentaje del empleado."
-                                                      >
-                                                        Se usará % del empleado
+                                                      <span className="text-[10px] text-slate-500">
+                                                        Opcional
                                                       </span>
                                                     ) : (
                                                       <span className="text-[10px] text-slate-500">
@@ -2157,6 +2305,77 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                     )}
                                                   </>
                                                 )}
+                                              </div>
+                                            ) : (
+                                              <div className="flex flex-col items-center gap-1">
+                                                <CommissionModeSelector
+                                                  value={item.commission_mode}
+                                                  options={CUSTOM_COMMISSION_MODES}
+                                                  onChange={(mode) =>
+                                                    patchEditItem(index, {
+                                                      commission_mode: mode,
+                                                      commission_value: mode === "comision" ? item.commission_value : null,
+                                                      commission_percent_override:
+                                                        mode === "porcentaje" ? item.commission_percent_override : null,
+                                                    })
+                                                  }
+                                                  ariaLabel={`Editar ítem ${index + 1} modo de comisión`}
+                                                />
+                                                {item.commission_mode === "comision" && (
+                                                  <>
+                                                    <input
+                                                      className={`${paperInputClass} h-9 w-28 text-right`}
+                                                      value={formatMoneyInput(
+                                                        item.commission_value == null ? "" : String(item.commission_value),
+                                                      )}
+                                                      onChange={(event) =>
+                                                        patchEditItem(index, {
+                                                          commission_value:
+                                                            event.target.value.trim() === ""
+                                                              ? null
+                                                              : Number(stripMoneyInput(event.target.value)),
+                                                        })
+                                                      }
+                                                      placeholder="Valor $"
+                                                      inputMode="numeric"
+                                                      aria-label={`Editar ítem ${index + 1} valor comisión`}
+                                                      title="Valor de comisión por unidad; se multiplica por la cantidad."
+                                                    />
+                                                    {item.commission_value == null ? (
+                                                      <span className="text-[10px] text-slate-500">Requerido</span>
+                                                    ) : (
+                                                      <span className="text-[10px] text-slate-500">× cantidad</span>
+                                                    )}
+                                                  </>
+                                                )}
+                                                {item.commission_mode === "porcentaje" &&
+                                                  (fixedPay ? (
+                                                    <input
+                                                      type="number"
+                                                      className={`${paperInputClass} h-9 w-28 text-right`}
+                                                      value={item.commission_percent_override ?? ""}
+                                                      onChange={(event) =>
+                                                        patchEditItem(index, {
+                                                          commission_percent_override:
+                                                            event.target.value === "" ? null : Number(event.target.value),
+                                                        })
+                                                      }
+                                                      placeholder="% ítem"
+                                                      min={0}
+                                                      max={100}
+                                                      step={0.5}
+                                                      inputMode="decimal"
+                                                      aria-label={`Editar ítem ${index + 1} porcentaje`}
+                                                      title="Porcentaje del subtotal para este ítem."
+                                                    />
+                                                  ) : (
+                                                    <span
+                                                      className="text-[10px] text-slate-500"
+                                                      title="El empleado tiene porcentaje propio."
+                                                    >
+                                                      % del empleado
+                                                    </span>
+                                                  ))}
                                               </div>
                                             )}
                                           </td>
@@ -2387,10 +2606,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           ref_id: "",
                           custom_name: "",
                           unit_price: "",
-                          // Producto y servicio comisionan por defecto; el
-                          // personalizado exige valor explícito.
+                          // Producto arranca en comisión; el servicio siempre
+                          // comisiona el % del empleado; el personalizado
+                          // arranca sin comisión y exige elegir el modo.
                           no_commission: type === "custom",
                           commission_value: null,
+                          commission_mode:
+                            type === "producto" ? "comision" : type === "servicio" ? "porcentaje" : "ninguna",
+                          commission_percent_override: null,
                         })
                       }
                       className={
@@ -2507,20 +2730,24 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   <label className="flex items-center gap-2 text-sm">
                     <input
                       type="checkbox"
-                      checked={!itemDraft.no_commission}
+                      checked={itemDraft.commission_mode === "comision"}
                       onChange={(event) =>
-                        patchDraft({ no_commission: !event.target.checked })
+                        patchDraft({
+                          commission_mode: event.target.checked ? "comision" : "ninguna",
+                          no_commission: !event.target.checked,
+                          commission_value: event.target.checked ? itemDraft.commission_value : null,
+                        })
                       }
                       className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
                     />
                     <span className="text-slate-700">¿Tiene comisión?</span>
-                    {!itemDraft.no_commission && itemDraft.commission_value != null && (
+                    {itemDraft.commission_mode === "comision" && itemDraft.commission_value != null && (
                       <span className="text-slate-500">
                         Comisión: {formatMoney(itemDraft.commission_value)}
                       </span>
                     )}
                   </label>
-                  {!itemDraft.no_commission && (
+                  {itemDraft.commission_mode === "comision" && (
                     <>
                       <label className="flex flex-col gap-1 text-sm font-medium">
                         Valor de la comisión ($)
@@ -2548,42 +2775,30 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 </div>
               )}
               {itemDraft.item_type === "servicio" && (
-                <div className="flex flex-col gap-2">
-                  <label className="flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={!itemDraft.no_commission}
-                      onChange={(event) =>
-                        patchDraft({ no_commission: !event.target.checked })
-                      }
-                      className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
-                    />
-                    <span className="text-slate-700">¿Tiene comisión?</span>
-                  </label>
-                  {!itemDraft.no_commission && (
-                    <p className="text-xs text-slate-500">
-                      Se paga el porcentaje del empleado sobre el subtotal.
-                    </p>
-                  )}
-                </div>
+                <p className="text-xs text-slate-500">
+                  Se paga el porcentaje del empleado sobre el subtotal.
+                </p>
               )}
               {itemDraft.item_type === "custom" && (
                 <div className="flex flex-col gap-2">
-                  <label className="flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      checked={!itemDraft.no_commission}
-                      onChange={(event) =>
+                  <div className="flex flex-col gap-1">
+                    <span className="text-sm font-medium">Comisión</span>
+                    <CommissionModeSelector
+                      value={itemDraft.commission_mode}
+                      options={CUSTOM_COMMISSION_MODES}
+                      onChange={(mode) =>
                         patchDraft({
-                          no_commission: !event.target.checked,
-                          commission_value: null,
+                          commission_mode: mode,
+                          no_commission: mode === "ninguna",
+                          commission_value: mode === "comision" ? itemDraft.commission_value : null,
+                          commission_percent_override:
+                            mode === "porcentaje" ? itemDraft.commission_percent_override : null,
                         })
                       }
-                      className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                      ariaLabel="Modo de comisión del ítem personalizado"
                     />
-                    <span className="text-slate-700">¿Tiene comisión?</span>
-                  </label>
-                  {!itemDraft.no_commission && (
+                  </div>
+                  {itemDraft.commission_mode === "comision" && (
                     <>
                       <label className="flex flex-col gap-1 text-sm font-medium">
                         Valor de la comisión ($)
@@ -2608,6 +2823,36 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       </p>
                     </>
                   )}
+                  {itemDraft.commission_mode === "porcentaje" &&
+                    (itemDraftFixedPay ? (
+                      <label className="flex flex-col gap-1 text-sm font-medium">
+                        Porcentaje para este ítem (%)
+                        <input
+                          type="number"
+                          className={paperInputClass}
+                          value={itemDraft.commission_percent_override ?? ""}
+                          onChange={(event) =>
+                            patchDraft({
+                              commission_percent_override:
+                                event.target.value === "" ? null : Number(event.target.value),
+                            })
+                          }
+                          placeholder="Ej. 15"
+                          min={0}
+                          max={100}
+                          step={0.5}
+                          inputMode="decimal"
+                        />
+                      </label>
+                    ) : (
+                      <p className="text-xs text-slate-500">
+                        Se paga el % del empleado
+                        {itemDraftEmployee?.commission_percent != null
+                          ? ` (${itemDraftEmployee.commission_percent}%)`
+                          : ""}
+                        .
+                      </p>
+                    ))}
                 </div>
               )}
               {itemError && (
