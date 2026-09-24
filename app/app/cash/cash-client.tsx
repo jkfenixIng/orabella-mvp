@@ -744,7 +744,7 @@ export function CashClient(props: CashClientProps) {
                   ))}
               </>
             ) : (
-              <div className="flex flex-col gap-2 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
+              <div className="flex flex-col gap-2 rounded-md bg-warning-light px-3 py-2 text-sm font-medium text-warning">
                 <p className="font-semibold">¿Está seguro de cerrar?</p>
                 {props.isAdmin && !isOpener && <p>Cierra este turno como administrador.</p>}
                 <p>Después del cierre ya no podrá modificarlo.</p>

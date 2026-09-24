@@ -1139,7 +1139,7 @@ export function PayrollClient(props: PayrollClientProps) {
                   {pendingItems.length > 0 && (
                     <div
                       role="status"
-                      className="mt-4 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800"
+                      className="mt-4 rounded-md bg-warning-light px-3 py-2 text-sm font-medium text-warning"
                     >
                       <p>
                         {`Pendientes de pago (${pendingItems.length}): páguelos todos antes de cerrar la nómina.`}

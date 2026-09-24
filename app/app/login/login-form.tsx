@@ -96,7 +96,7 @@ export function LoginForm({ next }: { next?: string }) {
   if (step === "force-change") {
     // Paso forzado (AUTH-01): se unifica al patrón ámbar canónico de advertencia.
     return (
-      <section className="rounded-lg bg-amber-50 p-6 text-amber-800">
+      <section className="rounded-lg bg-warning-light p-6 text-warning">
         <h2 className="text-lg font-semibold">Cambio de clave obligatorio</h2>
         <p className="mt-2 text-sm">
           Su clave inicial es su número de documento. Debe cambiarla antes de continuar (AUTH-01).

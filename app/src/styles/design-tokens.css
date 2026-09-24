@@ -172,8 +172,12 @@
   --color-primary-300: oklch(0.77 0.11 250);
   --color-primary-400: oklch(0.65 0.16 250);
   --color-primary-500: oklch(0.55 0.2 250);
-  --color-primary-600: oklch(0.65 0.2 250);
-  --color-primary-700: oklch(0.72 0.17 250);
+  /* En oscuro la escala numérica va de claro a oscuro al revés que en claro:
+     los peldaños 600/700 se usan como FONDO de botón con texto blanco, así que
+     deben bajar de luminosidad para cumplir AA (blanco sobre 0.55 ≈ 4.74:1).
+     El rol de TEXTO en oscuro usa primary-400 (0.65), no estos peldaños. */
+  --color-primary-600: oklch(0.55 0.2 250);
+  --color-primary-700: oklch(0.48 0.2 250);
   --color-primary-800: oklch(0.8 0.12 250);
   --color-primary-900: oklch(0.9 0.05 250);
 
@@ -192,8 +196,8 @@
   --bg-surface-2: oklch(0.22 0 0);
 
   /* Borders & Dividers */
-  --border-color: oklch(0.24 0 0);
-  --border-color-2: oklch(0.21 0 0);
+  --border-color: oklch(0.3 0 0);
+  --border-color-2: oklch(0.27 0 0);
 
   /* Text */
   --text-primary: oklch(0.95 0 0);

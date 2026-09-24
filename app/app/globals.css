@@ -18,6 +18,10 @@
   --color-border-color-2: var(--border-color-2);
   --color-primary-600: var(--color-primary-600);
   --color-primary-700: var(--color-primary-700);
+  /* Peldaño usado por los estados de foco en oscuro (anillo/borde/texto):
+     dark:ring-primary-400, dark:focus:border-primary-400, dark:text-primary-400.
+     Sin exponerlo, esas utilidades no se generan y el foco queda muerto. */
+  --color-primary-400: var(--color-primary-400);
   --color-success: var(--color-success-600);
   --color-success-400: var(--color-success-400);
   --color-success-600: var(--color-success-600);

@@ -103,7 +103,7 @@ export default async function HomePage() {
       {lowStock.length > 0 ? (
         <section
           aria-label="Alertas de inventario"
-          className="flex flex-col gap-2 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800"
+          className="flex flex-col gap-2 rounded-md bg-warning-light px-3 py-2 text-sm font-medium text-warning"
         >
           <h2 className="flex items-center gap-2 font-semibold">
             <TriangleAlert className="h-5 w-5" aria-hidden="true" />
