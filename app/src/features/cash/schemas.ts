@@ -285,35 +285,10 @@ export type HistoryInput = z.infer<typeof historySchema>;
 // ------------------------------------------------------------ cálculos puros ---
 
 /**
- * Business timezone. Colombia has no daylight saving time, so America/Bogota
- * is a fixed UTC-05:00 year-round. Timestamps are timestamptz (UTC); date
- * filters must carry the offset or shifts opened after 19:00 COT land on
- * the next UTC day and vanish from "today".
+ * Helpers de fecha en hora de Bogotá: viven en el módulo compartido y se
+ * re-exportan aquí para no romper a los consumidores históricos de caja.
  */
-export const BOGOTA_TZ_OFFSET = "-05:00";
-
-/** Calendar day (yyyy-mm-dd) in America/Bogota for the given instant. */
-export function bogotaDay(offsetDays = 0, now: Date = new Date()): string {
-  const shifted = new Date(now.getTime() + offsetDays * 24 * 60 * 60 * 1000);
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/Bogota",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(shifted);
-  const get = (type: string): string => parts.find((part) => part.type === type)?.value ?? "";
-  return `${get("year")}-${get("month")}-${get("day")}`;
-}
-
-/** Exact timestamptz bounds of a Bogota calendar day (inclusive). */
-export function dayBounds(fecha: string): { from: string; to: string } {
-  return { from: `${fecha}T00:00:00${BOGOTA_TZ_OFFSET}`, to: `${fecha}T23:59:59.999${BOGOTA_TZ_OFFSET}` };
-}
-
-/** Exact bounds of an inclusive Bogota date range. */
-export function rangeBounds(desde: string, hasta: string): { from: string; to: string } {
-  return { from: dayBounds(desde).from, to: dayBounds(hasta).to };
-}
+export { BOGOTA_TZ_OFFSET, bogotaDay, dayBounds, rangeBounds } from "@/src/shared/lib/dates";
 
 /**
  * CAJ-01: base con la que abre el turno. Hereda base_left del último

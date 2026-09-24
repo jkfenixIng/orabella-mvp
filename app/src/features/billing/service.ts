@@ -28,6 +28,7 @@ import {
   requireSedeRole,
   resolveSede,
 } from "@/src/shared/lib/sede";
+import { dayBounds } from "@/src/shared/lib/dates";
 import { listPaymentMethods, listServices, listTaxes } from "@/src/features/admin/service";
 import {
   deductStock,
@@ -209,9 +210,11 @@ function dateBound(value: string, end: boolean): string {
   // Colombia no tiene DST). El offset explícito es obligatorio: sin él,
   // Postgres interpreta el literal en la TZ de la sesión (UTC en Supabase)
   // y la ventana queda corrida 5h — se cuelan facturas de la noche anterior
-  // (19:00–23:59) y faltan las de la noche del propio día.
+  // (19:00–23:59) y faltan las de la noche del propio día. El cálculo vive en
+  // el helper compartido para que caja, facturación y nómina no diverjan.
   if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
-    return end ? `${trimmed}T23:59:59.999-05:00` : `${trimmed}T00:00:00-05:00`;
+    const bounds = dayBounds(trimmed);
+    return end ? bounds.to : bounds.from;
   }
   return trimmed;
 }

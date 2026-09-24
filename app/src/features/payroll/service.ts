@@ -38,6 +38,7 @@ import { commissionRuleKey, type RuleRate } from "@/src/features/commissions/sch
 import { cashOutUsedInShift, getOpenShiftWithOpener } from "@/src/features/cash/service";
 import { cashOutLimitViolation } from "@/src/features/cash/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
+import { bogotaDay, rangeBounds } from "@/src/shared/lib/dates";
 import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
 import {
   AdminError,
@@ -509,14 +510,17 @@ export async function calculatePayroll(
     });
     const actives = employees.filter((row) => row.is_active);
 
-    // Facturas vigentes de la sede en el rango (Anulada excluida).
+    // Facturas vigentes de la sede en el rango (Anulada excluida). El rango
+    // lleva offset de Bogotá: sin él la ventana corre 5 h y se pierden las
+    // facturas de la noche del último día (comisión no liquidada).
+    const invoiceRange = rangeBounds(period.start_date, period.end_date);
     const { data: invoices, error: invoicesError } = await db
       .from("invoices")
       .select("id, consecutive_number")
       .eq("sede_id", sedeId)
       .neq("status", "Anulada")
-      .gte("created_at", `${period.start_date}T00:00:00`)
-      .lte("created_at", `${period.end_date}T23:59:59.999`)
+      .gte("created_at", invoiceRange.from)
+      .lte("created_at", invoiceRange.to)
       .limit(2000);
     if (invoicesError) {
       console.error(
@@ -1314,7 +1318,9 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
     } catch (error) {
       throw toPayrollError(error);
     }
-    const requestDate = parsed.data.request_date ?? new Date().toISOString().slice(0, 10);
+    // Día del vale en hora de Bogotá: el default de la BD (CURRENT_DATE) usa
+    // el día UTC y a partir de las 19:00 COT adelanta la fecha un día.
+    const requestDate = parsed.data.request_date ?? bogotaDay();
     const settings = await getVoucherSettings(actor.sedeId);
     const { dayTotal, weekTotal } = await vigenteTotals(
       db,
