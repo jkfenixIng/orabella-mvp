@@ -10,6 +10,7 @@ import {
   approveVoucher,
   calculatePayroll,
   closePayrollPeriod,
+  deletePayrollPeriod,
   getPeriodDetail,
   getVoucherSettings,
   listPeriods,
@@ -82,6 +83,20 @@ export async function closePayrollPeriodAction(id: string) {
   try {
     const session = await requirePayrollAdmin(await sessionToken());
     const data = await closePayrollPeriod(session.sedeId, id);
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Misma lógica que DELETE /api/v1/payroll-periods/:id (solo admin). */
+export async function deletePayrollPeriodAction(id: string) {
+  try {
+    const session = await requirePayrollAdmin(await sessionToken());
+    const data = await deletePayrollPeriod(session.sedeId, id, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+    });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

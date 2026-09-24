@@ -4,6 +4,7 @@ import { useState, useTransition, type FormEvent } from "react";
 import {
   calculatePayrollAction,
   closePayrollPeriodAction,
+  deletePayrollPeriodAction,
   getPeriodDetailAction,
   listPeriodsAction,
   openPayrollPeriodAction,
@@ -42,6 +43,13 @@ const sectionClass = cn(
 );
 const errorClass = cn("text-sm text-error dark:text-error");
 const okClass = cn("text-sm text-success dark:text-success");
+/** Acción destructiva (borrar borrador): contorno y texto en rojo, separada de las demás. */
+const dangerOutlineClass = cn(
+  "inline-flex items-center justify-center gap-2 rounded-md border border-error bg-transparent px-4 py-2 text-sm font-medium text-error shadow-sm transition-all duration-200 hover:bg-error/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
+);
+const dangerSolidClass = cn(
+  "inline-flex items-center justify-center gap-2 rounded-md bg-error-600 px-6 py-2 text-sm font-semibold text-white shadow-sm transition-all duration-200 hover:bg-error-600/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
+);
 const tableHeaderClass = cn("bg-surface-hover text-xs font-semibold uppercase text-text-tertiary");
 const tableCellClass = cn("px-3 py-2 align-middle");
 const tableRowClass = cn("border-t border-border-color dark:border-border-color-2");
@@ -443,6 +451,8 @@ export function PayrollClient(props: PayrollClientProps) {
   >({});
   const [busy, setBusy] = useState(false);
   const [detailDialogOpen, setDetailDialogOpen] = useState(false);
+  // Confirmación clásica antes de una acción destructiva (borrar borrador).
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   // Transición para los cambios de vista (detalle del periodo / vales):
   // la UI no se congela mientras la server action responde.
   const [isViewPending, startViewTransition] = useTransition();
@@ -627,6 +637,25 @@ export function PayrollClient(props: PayrollClientProps) {
     if (show(result, "Periodo cerrado.")) {
       await refreshPeriods(selectedId);
       await loadDetail(selectedId);
+    }
+  }
+
+  /**
+   * Borra el borrador seleccionado tras la confirmación clásica. El backend
+   * rechaza períodos cerrados y arrastra ítems/pagos; los vales descontados
+   * vuelven a su estado previo. Al terminar se refresca la lista y se cierra
+   * el detalle (el período ya no existe).
+   */
+  async function handleDelete() {
+    if (!selectedId) return;
+    setBusy(true);
+    const result = (await deletePayrollPeriodAction(selectedId)) as ActionResult<{ id: string }>;
+    setBusy(false);
+    if (show(result, "Borrador borrado.")) {
+      setConfirmDeleteOpen(false);
+      closeDetail();
+      setSelectedId(null);
+      await refreshPeriods();
     }
   }
 
@@ -914,8 +943,57 @@ export function PayrollClient(props: PayrollClientProps) {
               )}
             </div>
             <DialogFooter>
+              {selected.status === "borrador" && props.canAdmin && (
+                <button
+                  type="button"
+                  onClick={() => setConfirmDeleteOpen(true)}
+                  disabled={busy}
+                  className={dangerOutlineClass}
+                >
+                  Borrar borrador
+                </button>
+              )}
               <button type="button" className={ghostClass} onClick={closeDetail}>
                 Cancelar
+              </button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/* Confirmación clásica: ¿Está seguro? … Cancelar/Borrar. */}
+      {selected && (
+        <Dialog
+          open={confirmDeleteOpen}
+          onOpenChange={(open) => {
+            if (!open && !busy) setConfirmDeleteOpen(false);
+          }}
+        >
+          <DialogContent className="max-w-sm">
+            <DialogHeader>
+              <DialogTitle>Borrar borrador</DialogTitle>
+              <DialogDescription>
+                ¿Está seguro de borrar el borrador {selected.start_date} → {selected.end_date}? Se
+                eliminarán sus ítems y pagos, y los vales que haya descontado volverán a su estado
+                anterior. No se puede deshacer.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter className="mt-4">
+              <button
+                type="button"
+                className={ghostClass}
+                onClick={() => setConfirmDeleteOpen(false)}
+                disabled={busy}
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                className={dangerSolidClass}
+                onClick={() => void handleDelete()}
+                disabled={busy}
+              >
+                {busy ? "Borrando…" : "Borrar borrador"}
               </button>
             </DialogFooter>
           </DialogContent>

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { moneyEquals, roundMoney } from "@/src/features/billing/schemas";
+import { cashOutLimitViolation } from "@/src/features/cash/schemas";
 
 export { moneyEquals, roundMoney };
 
@@ -184,6 +185,28 @@ export function assertDraftPeriod(status: string): void {
   if (status === "cerrado") {
     throw new Error("PERIOD_CLOSED");
   }
+}
+
+/**
+ * PAY-01: solo un periodo en borrador puede borrarse. Un periodo cerrado
+ * tiene nómina pagada y es historia: borrarlo la destruiría. Puro para
+ * probarlo sin base de datos.
+ */
+export function assertDeletablePeriod(status: string): void {
+  if (status !== "borrador") {
+    throw new Error("PERIOD_NOT_DRAFT");
+  }
+}
+
+/**
+ * PAY-07: estado al que vuelve un vale que había quedado `descontada` cuando
+ * se borra el borrador que lo descontó. La aprobación deja `approved_by`
+ * informado (el flujo automático lo setea al crear dentro de rango); un vale
+ * pendiente nunca lo tiene. Por eso `approved_by` distingue el estado previo
+ * sin columna adicional. Puro para probarlo sin base de datos.
+ */
+export function restoreVoucherStatus(approvedBy: string | null): "aprobada" | "pendiente" {
+  return approvedBy ? "aprobada" : "pendiente";
 }
 
 /**
@@ -377,6 +400,32 @@ export function resolveVoucherInitialStatus(
   eligibility: VoucherEligibility,
 ): "aprobada" | "pendiente" {
   return voucherRequiresReview(eligibility) ? "pendiente" : "aprobada";
+}
+
+/**
+ * PAY-06: valida el tope del 50% de salidas en efectivo del turno al APROBAR
+ * un vale. Un vale puede nacer pendiente por debajo del límite y superarlo al
+ * aprobarse (el acumulado del turno creció): la aprobación repite la misma
+ * regla de la solicitud, con el acumulado YA salido del turno más este vale.
+ * Solo rige para `efectivo` ligado a un turno; los digitales y los vales
+ * históricos sin turno no tienen tope. Reutiliza la regla pura de caja (no la
+ * reescribe). Devuelve null si el monto cabe. Puro para probarlo sin BD.
+ */
+export function voucherApprovalCashOutViolation(args: {
+  methodCode: string | null;
+  cashShiftId: string | null;
+  openingBase: number | null;
+  cashOutUsed: number;
+  amount: number;
+}): { code: string; message: string } | null {
+  if (args.methodCode !== "efectivo") return null;
+  if (!args.cashShiftId || args.openingBase === null || args.openingBase === undefined) return null;
+  return cashOutLimitViolation({
+    methodCode: args.methodCode,
+    openingBase: args.openingBase,
+    cashOutUsed: args.cashOutUsed,
+    amount: args.amount,
+  });
 }
 
 /**

@@ -45,6 +45,7 @@ export const AUDIT_ACTIONS = {
   REGISTER_BASE_UPDATED: "cash.register_base_updated",
   PAYROLL_CALCULATED: "payroll.calculated",
   PAYROLL_CLOSED: "payroll.closed",
+  PAYROLL_DELETED: "payroll.deleted",
   COMMISSION_PAID: "payroll.commission_paid",
   VOUCHER_APPROVED: "voucher.approved",
   VOUCHER_REQUESTED: "voucher.requested",
