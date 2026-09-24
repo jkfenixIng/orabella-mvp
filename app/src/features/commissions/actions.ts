@@ -8,11 +8,14 @@ import { requireCashWriter } from "@/src/features/cash/service";
 import {
   CommissionError,
   deleteCommissionRule,
+  earnedCommissionFor,
+  immediatePaidTotal,
   listCommissionPayouts,
   listCommissionRules,
   payCommissionNow,
   upsertCommissionRule,
 } from "./service";
+import { pendingCommission } from "./schemas";
 
 async function sessionToken(): Promise<string | undefined> {
   const store = await cookies();
@@ -80,6 +83,34 @@ export async function payCommissionNowAction(input: unknown) {
       sedeId: session.sedeId,
     });
     return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
+ * Comisión pendiente por (factura × empleado): ganado − pagado inmediato.
+ * Solo lectura; el cálculo autoritativo vive en el servicio (no se duplica).
+ * La usa el modal de pago inmediato al cobrar la factura.
+ */
+export async function getPendingCommissionsAction(input: {
+  invoice_id: string;
+  employee_ids: string[];
+}) {
+  try {
+    const session = await requireSession(await sessionToken());
+    const rows = [];
+    for (const employee_id of input.employee_ids) {
+      const earned = await earnedCommissionFor(session.sedeId, input.invoice_id, employee_id);
+      const paid = await immediatePaidTotal(session.sedeId, input.invoice_id, employee_id);
+      rows.push({
+        employee_id,
+        earned: earned.earned,
+        paid,
+        pending: pendingCommission(earned.earned, paid),
+      });
+    }
+    return { success: true as const, data: rows };
   } catch (error) {
     return toFailure(error);
   }

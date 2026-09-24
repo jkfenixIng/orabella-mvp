@@ -11,6 +11,10 @@ import {
   splitPaymentAction,
 } from "@/src/features/billing/actions";
 import { getOpenShiftAction } from "@/src/features/cash/actions";
+import {
+  getPendingCommissionsAction,
+  payCommissionNowAction,
+} from "@/src/features/commissions/actions";
 import type {
   InvoiceDetail,
   InvoiceItemRow,
@@ -82,6 +86,14 @@ interface ItemDraft {
 interface PortionDraft {
   method_code: string;
   amount: string;
+}
+
+/** Fila del modal de pago inmediato de comisión (un empleado por fila). */
+interface CommissionPayRow {
+  employee_id: string;
+  employee_name: string;
+  pending: number;
+  method_code: string;
 }
 
 function emptyItem(): ItemDraft {
@@ -201,6 +213,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
   // Modal clásico de confirmación ("¿Está seguro? ...", OK/Cancelar).
   const [confirmKind, setConfirmKind] = useState<"emit" | "pay" | "annul" | null>(null);
   const [splitDraft, setSplitDraft] = useState<PortionDraft>({ method_code: "efectivo", amount: "" });
+  // Pago inmediato de comisión(es) al dejar la factura Pagada.
+  const [commissionOpen, setCommissionOpen] = useState(false);
+  const [commissionRows, setCommissionRows] = useState<CommissionPayRow[]>([]);
+  const [commissionError, setCommissionError] = useState<string | null>(null);
+  const [commissionBusy, setCommissionBusy] = useState(false);
 
   // G1: turno abierto conocido por el cliente. La validación de caja se hace
   // ANTES de entrar a emitir o editar (el servidor vuelve a validar).
@@ -208,6 +225,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
   const [shiftOpen, setShiftOpen] = useState(false);
   const [shiftOwn, setShiftOwn] = useState(true);
   const [shiftOwner, setShiftOwner] = useState<string | null>(null);
+  // Base de apertura del turno (referencia del tope de efectivo del 50%).
+  const [shiftOpeningBase, setShiftOpeningBase] = useState<number | null>(null);
   const [blockNotice, setBlockNotice] = useState<string | null>(null);
   useEffect(() => {
     if (!props.canWrite && !props.canAnnul) return;
@@ -220,6 +239,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
       setShiftOpen(shift !== null);
       setShiftOwn(shift === null || shift.opened_by === props.currentUserId || props.isAdmin);
       setShiftOwner(shift?.opener_name?.trim() || null);
+      setShiftOpeningBase(shift ? Number(shift.opening_base) : null);
     })();
     return () => {
       cancelled = true;
@@ -577,6 +597,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setCreateDialogOpen(false);
     setDetailDialogOpen(true);
     await applyFilters();
+    await askCommissionPayment(result.data);
   }
 
   function buildCreatePayload(): {
@@ -753,6 +774,76 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setSplitDraft({ method_code: "efectivo", amount: "" });
     setConfirmKind(null);
     await applyFilters(undefined, invoicePage);
+    await askCommissionPayment(result.data);
+  }
+
+  /**
+   * Pago inmediato de comisión(es): al dejar la factura en "Pagada" se ofrece
+   * pagar lo pendiente de cada empleado con `payout_mode === "inmediato"` que
+   * tenga comisión en la factura. El monto autoritativo lo calcula el servidor
+   * (`getPendingCommissionsAction`); acá solo se elige el método de pago.
+   */
+  async function askCommissionPayment(next: InvoiceDetail) {
+    if (next.invoice.status !== "Pagada") return;
+    const employeeIds = [...new Set(next.items.map((item) => item.employee_id))].filter(
+      (id) => props.employees.find((row) => row.id === id)?.payout_mode === "inmediato",
+    );
+    if (employeeIds.length === 0) return;
+    const result: ActionResult<Array<{ employee_id: string; pending: number }>> =
+      await getPendingCommissionsAction({ invoice_id: next.invoice.id, employee_ids: employeeIds });
+    if (!result.success) {
+      setError(`[${result.code}] ${result.message}`);
+      return;
+    }
+    const payable = result.data.filter((row) => row.pending > 0);
+    if (payable.length === 0) return;
+    const fallbackMethod =
+      props.methods.find((row) => row.code === "efectivo")?.code ?? props.methods[0]?.code ?? "efectivo";
+    setCommissionRows(
+      payable.map((row) => ({
+        employee_id: row.employee_id,
+        employee_name: employeeNameOf(row.employee_id),
+        pending: row.pending,
+        method_code: fallbackMethod,
+      })),
+    );
+    setCommissionError(null);
+    setCommissionOpen(true);
+  }
+
+  /** Confirma el pago de las comisiones listadas; si una falla, la conserva. */
+  async function confirmCommissionPayment() {
+    if (!detail || commissionRows.length === 0) return;
+    setCommissionBusy(true);
+    setCommissionError(null);
+    let paidCount = 0;
+    const failed: CommissionPayRow[] = [];
+    for (const row of commissionRows) {
+      const result = await payCommissionNowAction({
+        invoice_id: detail.invoice.id,
+        employee_id: row.employee_id,
+        amount: row.pending,
+        method_code: row.method_code,
+      });
+      if (result.success) {
+        paidCount += 1;
+      } else {
+        failed.push(row);
+        setCommissionError(`[${result.code}] ${result.message}`);
+      }
+    }
+    setCommissionBusy(false);
+    if (failed.length === 0) {
+      setCommissionOpen(false);
+      setCommissionRows([]);
+      setNotice(
+        paidCount === 1
+          ? "Comisión pagada desde la caja del turno."
+          : `${paidCount} comisiones pagadas desde la caja del turno.`,
+      );
+    } else {
+      setCommissionRows(failed);
+    }
   }
 
   // Hoja factura: totales vivos del borrador (solo presentación; la verdad la calcula el servidor).
@@ -2421,6 +2512,97 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 className="h-10 rounded-md bg-slate-900 px-6 text-sm font-semibold text-white hover:bg-slate-700"
               >
                 {itemDialogTarget === "edit" ? "Agregar a la edición" : "Agregar a la factura"}
+              </button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Pago inmediato de comisión(es): aparece al dejar la factura Pagada si
+          hay empleados con payout_mode "inmediato" y comisión pendiente. */}
+      <Dialog
+        open={commissionOpen}
+        onOpenChange={(open) => {
+          if (!open && !commissionBusy) {
+            setCommissionOpen(false);
+            setCommissionRows([]);
+            setCommissionError(null);
+          }
+        }}
+      >
+        <DialogContent className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+          <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
+            <div className="border-b border-slate-200 px-6 py-4">
+              <h2 className="text-lg font-bold">Pagar comisión al empleado</h2>
+              <p className="text-sm text-slate-500">
+                {detail ? `Factura #${detail.invoice.consecutive_number}` : "Factura"} · el
+                pago sale de la caja del turno abierto.
+              </p>
+            </div>
+            <div className="flex flex-col gap-4 px-6 py-4">
+              {commissionRows.map((row, index) => (
+                <div key={row.employee_id} className="rounded-lg border border-slate-200 p-3">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2">
+                    <span className="text-sm font-semibold">{row.employee_name}</span>
+                    <span className="text-sm font-medium">{formatMoney(row.pending)}</span>
+                  </div>
+                  <label className="mt-3 flex flex-col gap-1 text-sm font-medium text-slate-900">
+                    Método de pago
+                    <Select
+                      value={row.method_code}
+                      onValueChange={(value) =>
+                        setCommissionRows((prev) =>
+                          prev.map((item, i) => (i === index ? { ...item, method_code: value } : item)),
+                        )
+                      }
+                    >
+                      <SelectTrigger className={paperInputClass}>
+                        <SelectValue placeholder="Método" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {props.methods.map((method) => (
+                          <SelectItem key={method.id} value={method.code}>
+                            {method.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </label>
+                  {row.method_code === "efectivo" && (
+                    <p className="mt-2 text-xs text-slate-500">
+                      El efectivo no puede superar el 50% de la base de apertura del turno
+                      {shiftOpeningBase !== null ? ` (${formatMoney(shiftOpeningBase)})` : ""}. Si lo
+                      supera, el sistema lo rechazará indicando cuánto queda disponible.
+                    </p>
+                  )}
+                </div>
+              ))}
+              {commissionError && (
+                <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+                  {commissionError}
+                </p>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-6 py-4">
+              <button
+                type="button"
+                onClick={() => {
+                  setCommissionOpen(false);
+                  setCommissionRows([]);
+                  setCommissionError(null);
+                }}
+                disabled={commissionBusy}
+                className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={() => void confirmCommissionPayment()}
+                disabled={commissionBusy || commissionRows.length === 0 || props.methods.length === 0}
+                className="h-10 rounded-md bg-emerald-700 px-6 text-sm font-semibold text-white hover:bg-emerald-800 disabled:opacity-50"
+              >
+                {commissionBusy ? "Pagando…" : "Confirmar pago"}
               </button>
             </div>
           </div>
