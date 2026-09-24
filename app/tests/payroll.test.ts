@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   approveVoucherSchema,
+  assertDeletablePeriod,
   assertDraftPeriod,
   assertNoOverpay,
   assertPortionsMatchNet,
@@ -24,6 +25,8 @@ import {
   requiresVoucherApproval,
   resolveVoucherDayCap,
   resolveVoucherInitialStatus,
+  restoreVoucherStatus,
+  voucherApprovalCashOutViolation,
   voucherLimitsSchema,
   voucherRequiresReview,
   weekdayIso,
@@ -572,5 +575,104 @@ describe("migración 028_voucher_payment_method.sql (método y turno del vale)",
     expect(sql).toContain("chk_voucher_requests_method_code");
     // No destructiva: la columna histórica del código se conserva sin uso.
     expect(sql).not.toContain("DROP COLUMN approval_code");
+  });
+});
+
+// ------------------------------------------------- migración 029 ---
+
+describe("migración 029_voucher_created_by.sql (autor del vale)", () => {
+  const sql = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "029_voucher_created_by.sql"),
+    "utf8",
+  );
+
+  it("agrega created_by re-ejecutable sin borrar approved_by ni approval_code", () => {
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS created_by uuid");
+    expect(sql).toContain("REFERENCES public.users");
+    expect(sql).toContain("ON DELETE SET NULL");
+    // No destructiva: las columnas de aprobación se conservan intactas.
+    expect(sql).not.toContain("DROP COLUMN approved_by");
+    expect(sql).not.toContain("DROP COLUMN approval_code");
+  });
+});
+
+// ------------------------------------------------- borrar borrador (PAY-01) ---
+
+describe("payroll: borrado de un período en borrador (PAY-01)", () => {
+  it("solo el borrador puede borrarse; el cerrado se rechaza con código propio", () => {
+    expect(() => assertDeletablePeriod("borrador")).not.toThrow();
+    expect(() => assertDeletablePeriod("cerrado")).toThrowError("PERIOD_NOT_DRAFT");
+  });
+
+  it("los vales descontados vuelven a su estado previo según approved_by", () => {
+    // Aprobado (o auto-aprobado) tenía aprobador: vuelve a aprobada.
+    expect(restoreVoucherStatus("user-1")).toBe("aprobada");
+    // Pendiente nunca tuvo aprobador: vuelve a pendiente.
+    expect(restoreVoucherStatus(null)).toBe("pendiente");
+  });
+
+  it("las FK de 007 son ON DELETE CASCADE (ítems y pagos caen con el período)", () => {
+    const sql = readFileSync(join(process.cwd(), "supabase", "migrations", "007_payroll.sql"), "utf8");
+    expect(sql).toContain(
+      "period_id uuid NOT NULL REFERENCES public.payroll_periods (id) ON DELETE CASCADE",
+    );
+    expect(sql).toContain(
+      "payroll_item_id uuid NOT NULL REFERENCES public.payroll_items (id) ON DELETE CASCADE",
+    );
+  });
+});
+
+// ------------------------------------------- tope de efectivo al aprobar (PAY-06) ---
+
+describe("payroll: tope del 50% de salidas en efectivo al APROBAR un vale (PAY-06)", () => {
+  it("aprueba un vale de efectivo dentro del tope (acumulado + vale <= 50% de la base)", () => {
+    // Base 200000 → tope 100000; ya salió 20000; el vale de 50000 deja 70000.
+    expect(
+      voucherApprovalCashOutViolation({
+        methodCode: "efectivo",
+        cashShiftId: "shift-1",
+        openingBase: 200000,
+        cashOutUsed: 20000,
+        amount: 50000,
+      }),
+    ).toBeNull();
+  });
+
+  it("rechaza un vale de efectivo que supera el tope contando lo ya salido del turno", () => {
+    // Base 200000 → tope 100000; ya salió 80000; el vale de 30000 proyecta 110000.
+    const violation = voucherApprovalCashOutViolation({
+      methodCode: "efectivo",
+      cashShiftId: "shift-1",
+      openingBase: 200000,
+      cashOutUsed: 80000,
+      amount: 30000,
+    });
+    expect(violation?.code).toBe("CASH_OUT_LIMIT_EXCEEDED");
+    expect(violation?.message).toContain("30000");
+    expect(violation?.message).toContain("200000");
+  });
+
+  it("no aplica tope a un vale NO efectivo aunque supere el 50%", () => {
+    expect(
+      voucherApprovalCashOutViolation({
+        methodCode: "nequi",
+        cashShiftId: "shift-1",
+        openingBase: 200000,
+        cashOutUsed: 80000,
+        amount: 300000,
+      }),
+    ).toBeNull();
+  });
+
+  it("un vale histórico sin turno ni método no tiene tope (no se puede acumular)", () => {
+    expect(
+      voucherApprovalCashOutViolation({
+        methodCode: "efectivo",
+        cashShiftId: null,
+        openingBase: null,
+        cashOutUsed: 0,
+        amount: 999999,
+      }),
+    ).toBeNull();
   });
 });

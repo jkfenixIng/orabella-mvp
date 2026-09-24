@@ -567,6 +567,10 @@ export function VouchersClient(props: VouchersClientProps) {
                   {detailTarget.status === "descontada" ? " (en nómina: sin cambios)" : ""}
                 </DetailField>
                 <DetailField label="Método de pago">{methodLabel(detailTarget.method_code)}</DetailField>
+                <DetailField label="Creado por">{detailTarget.created_by_name ?? "—"}</DetailField>
+                {detailTarget.approved_by_name ? (
+                  <DetailField label="Aprobado por">{detailTarget.approved_by_name}</DetailField>
+                ) : null}
                 <DetailField label="Observación">{detailTarget.observation ?? "-"}</DetailField>
               </dl>
             )}

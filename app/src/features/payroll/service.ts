@@ -1,6 +1,7 @@
 import {
   approveVoucherSchema,
   assertDraftPeriod,
+  assertDeletablePeriod,
   assertNoOverpay,
   assertPortionsMatchNet,
   buildEmployeeDetail,
@@ -20,7 +21,9 @@ import {
   requiresVoucherApproval,
   resolveVoucherDayCap,
   resolveVoucherInitialStatus,
+  restoreVoucherStatus,
   roundMoney,
+  voucherApprovalCashOutViolation,
   voucherLimitsSchema,
   weekStartOf,
   type CalculatePayrollInput,
@@ -139,6 +142,12 @@ function toPayrollError(error: unknown): PayrollError {
           "El periodo está cerrado y es inmutable. No admite cambios.",
           409,
         );
+      case "PERIOD_NOT_DRAFT":
+        return new PayrollError(
+          "PERIOD_NOT_DRAFT",
+          "Solo se pueden borrar períodos en borrador; este ya está cerrado.",
+          409,
+        );
       case "OVERPAID":
         return new PayrollError(
           "OVERPAID",
@@ -214,6 +223,8 @@ export interface VoucherRequestRow {
   request_date: string;
   status: string;
   approved_by: string | null;
+  /** Usuario de caja que abrió el vale; null = vale histórico. */
+  created_by: string | null;
   /** Método arqueable por el que sale el dinero; null = vale histórico. */
   method_code: string | null;
   /** Turno de caja que abrió el vale; null = vale histórico. */
@@ -221,6 +232,10 @@ export interface VoucherRequestRow {
   /** PAY-06: código histórico. Ya no se genera; se conserva la columna. */
   approval_code: string | null;
   observation: string | null;
+  /** Nombre de quien abrió el vale (resuelto desde users); null si no disponible. */
+  created_by_name: string | null;
+  /** Nombre de quien aprobó el vale; null si no hay aprobación o no disponible. */
+  approved_by_name: string | null;
 }
 
 const PERIOD_SELECT =
@@ -229,16 +244,21 @@ const ITEM_SELECT =
   "id, period_id, employee_id, base_fixed, commissions, bonuses, deductions_vales, other_discounts, net_pay, detail_json, created_at";
 const PAYMENT_SELECT =
   "id, payroll_item_id, method_id, method_code, amount, paid_at, paid_by, reference";
-const VOUCHER_SELECT =
-  "id, sede_id, employee_id, amount, request_date, status, approved_by, method_code, cash_shift_id, approval_code, observation";
-/** Misma selección sin las columnas de la migración 028 (aún sin aplicar). */
-const VOUCHER_SELECT_LEGACY =
+/** Columnas base (migración 007), siempre presentes. */
+const VOUCHER_SELECT_BASE =
   "id, sede_id, employee_id, amount, request_date, status, approved_by, approval_code, observation";
+/** Columnas de la migración 028 (método y turno), opcionales. */
+const VOUCHER_SELECT_METHOD = "method_code, cash_shift_id";
+/** Columna de la migración 029 (usuario de caja que abrió el vale), opcional. */
+const VOUCHER_SELECT_CREATED_BY = "created_by";
 
-// 028 (method_code/cash_shift_id) puede no estar aplicada en esta base: la
-// primera consulta decide y se cachea; un error distinto (red/permisos) no se
-// cachea, así la consulta real lo reporta en vez de degradar en silencio.
+// 028 (method_code/cash_shift_id) y 029 (created_by) pueden no estar aplicadas
+// en esta base: cada migración se prueba por separado y se cachea de forma
+// independiente, para que la ausencia de una no degrade a la otra. Un error
+// distinto de "columna ausente" (red/permisos) NO se cachea, así la consulta
+// real lo reporta en vez de degradar en silencio.
 let voucherMethodColumns: boolean | null = null;
+let voucherCreatedByColumn: boolean | null = null;
 
 async function resolveVoucherSelect(db: DbClient): Promise<string> {
   if (voucherMethodColumns === null) {
@@ -250,16 +270,61 @@ async function resolveVoucherSelect(db: DbClient): Promise<string> {
       if (/method_code|cash_shift_id/i.test(message)) voucherMethodColumns = false;
     }
   }
-  return voucherMethodColumns === false ? VOUCHER_SELECT_LEGACY : VOUCHER_SELECT;
+  if (voucherCreatedByColumn === null) {
+    const probe = await db.from("voucher_requests").select("created_by").limit(1);
+    if (!probe.error) {
+      voucherCreatedByColumn = true;
+    } else {
+      const message = String((probe.error as { message?: string }).message ?? "");
+      if (/created_by/i.test(message)) voucherCreatedByColumn = false;
+    }
+  }
+  const columns = [VOUCHER_SELECT_BASE];
+  if (voucherMethodColumns !== false) columns.push(VOUCHER_SELECT_METHOD);
+  if (voucherCreatedByColumn !== false) columns.push(VOUCHER_SELECT_CREATED_BY);
+  return columns.join(", ");
 }
 
-/** Rellena method_code/cash_shift_id cuando la migración 028 no está aplicada. */
+/** Rellena columnas opcionales cuando su migración (028/029) no está aplicada. */
 function normalizeVoucher(row: Record<string, unknown>): VoucherRequestRow {
   return {
     ...(row as unknown as VoucherRequestRow),
+    created_by: (row.created_by as string | null) ?? null,
     method_code: (row.method_code as string | null) ?? null,
     cash_shift_id: (row.cash_shift_id as string | null) ?? null,
+    // Los nombres se resuelven aparte (attachVoucherUserNames) solo cuando la
+    // fila va al cliente; aquí quedan en null.
+    created_by_name: null,
+    approved_by_name: null,
   };
+}
+
+/**
+ * Resuelve los nombres de created_by/approved_by con una segunda query a
+ * `users` (sin join embebido: voucher_requests tiene DOS FK a users y PostgREST
+ * no las desambigua). Una sola consulta por lote para no caer en N+1.
+ */
+async function attachVoucherUserNames(
+  db: DbClient,
+  rows: VoucherRequestRow[],
+): Promise<VoucherRequestRow[]> {
+  const ids = new Set<string>();
+  for (const row of rows) {
+    if (row.created_by) ids.add(row.created_by);
+    if (row.approved_by) ids.add(row.approved_by);
+  }
+  if (ids.size === 0) return rows;
+  const { data, error } = await db.from("users").select("id, full_name").in("id", [...ids]);
+  if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+  const names = new Map<string, string | null>();
+  for (const user of (data ?? []) as Array<{ id: string; full_name: string | null }>) {
+    names.set(user.id, user.full_name ?? null);
+  }
+  return rows.map((row) => ({
+    ...row,
+    created_by_name: row.created_by ? names.get(row.created_by) ?? null : null,
+    approved_by_name: row.approved_by ? names.get(row.approved_by) ?? null : null,
+  }));
 }
 
 // ----------------------------------------------------------------- periodos ---
@@ -792,6 +857,112 @@ export async function closePayrollPeriod(
   }
 }
 
+/**
+ * PAY-01: borra un período en BORRADOR (es provisional, no historia). Solo
+ * admin (lo aplican ruta/action).
+ *
+ * - Solo borrador: un período cerrado tiene nómina pagada y es inmutable.
+ * - Hijos: `payroll_items` referencia al período y `payroll_payments` al ítem,
+ *   ambas con ON DELETE CASCADE (migración 007): un solo delete del período
+ *   arrastra ítems y pagos, sin borrado manual ni huérfanos.
+ * - Vales: al liquidar, `calculatePayroll` marca como `descontada` los vales
+ *   del rango (estado terminal, sin FK al período). Si se borra el borrador
+ *   hay que devolverlos a su estado previo o quedarían descontados sin nómina
+ *   que los respalde. La atribución es por rango de fechas; para que sea
+ *   EXACTA se exige que ningún otro período de la sede solape el rango (si
+ *   solapa, no puede saberse qué vales son de este borrador y se rechaza). El
+ *   estado previo se infiere de `approved_by` (ver restoreVoucherStatus).
+ */
+export async function deletePayrollPeriod(
+  sedeId: string,
+  periodId: string,
+  actor: PayrollActor,
+): Promise<{ id: string }> {
+  const db = await payrollDb();
+  try {
+    const period = await getPeriodOrThrow(db, sedeId, periodId);
+    try {
+      assertDeletablePeriod(period.status);
+    } catch (error) {
+      throw toPayrollError(error);
+    }
+
+    // Sin FK vale↔período, la atribución es por rango: si otro período de la
+    // sede solapa este rango, sus vales descontados caen dentro y no se puede
+    // distinguir cuáles son de este borrador. Se rechaza antes que revertir
+    // vales ajenos (destruiría historia de un período cerrado).
+    const { data: overlapping, error: overlapError } = await db
+      .from("payroll_periods")
+      .select("id")
+      .eq("sede_id", sedeId)
+      .neq("id", periodId)
+      .lte("start_date", period.end_date)
+      .gte("end_date", period.start_date)
+      .limit(1);
+    if (overlapError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    if ((overlapping ?? []).length > 0) {
+      throw new PayrollError(
+        "PERIOD_OVERLAP_AMBIGUOUS",
+        "No se puede borrar: otro período de la sede solapa este rango y no se puede determinar qué vales pertenecen a este borrador.",
+        409,
+      );
+    }
+
+    // Devuelve a su estado previo los vales que este borrador descontó.
+    const { data: discounted, error: discountedError } = await db
+      .from("voucher_requests")
+      .select("id, approved_by")
+      .eq("sede_id", sedeId)
+      .eq("status", "descontada")
+      .gte("request_date", period.start_date)
+      .lte("request_date", period.end_date);
+    if (discountedError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    const voucherRows = (discounted ?? []) as Array<{ id: string; approved_by: string | null }>;
+    const backToApproved = voucherRows
+      .filter((row) => restoreVoucherStatus(row.approved_by) === "aprobada")
+      .map((row) => row.id);
+    const backToPending = voucherRows
+      .filter((row) => restoreVoucherStatus(row.approved_by) === "pendiente")
+      .map((row) => row.id);
+    if (backToApproved.length > 0) {
+      const { error } = await db
+        .from("voucher_requests")
+        .update({ status: "aprobada" })
+        .in("id", backToApproved)
+        .eq("status", "descontada");
+      if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
+    if (backToPending.length > 0) {
+      const { error } = await db
+        .from("voucher_requests")
+        .update({ status: "pendiente" })
+        .in("id", backToPending)
+        .eq("status", "descontada");
+      if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
+
+    // Los ítems (y por cascada sus pagos) caen con el período.
+    const { error: deleteError } = await db.from("payroll_periods").delete().eq("id", periodId);
+    if (deleteError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+
+    await writeAudit({
+      sede_id: sedeId,
+      user_id: actor.userId,
+      action: AUDIT_ACTIONS.PAYROLL_DELETED,
+      entity: "payroll_periods",
+      entity_id: periodId,
+      metadata: {
+        start_date: period.start_date,
+        end_date: period.end_date,
+        vales_revertidos: backToApproved.length + backToPending.length,
+      },
+    });
+    return { id: periodId };
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
 // -------------------------------------------------------------------- vales ---
 
 /** PAY-05/V2: topes vigentes de la sede (null cuando aún no se configuran). */
@@ -1037,7 +1208,8 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
         ? "Generado directo en caja (dentro de rango)."
         : null;
     const voucherSelect = await resolveVoucherSelect(db);
-    const hasMethodColumns = voucherSelect === VOUCHER_SELECT;
+    const hasMethodColumns = voucherMethodColumns !== false;
+    const hasCreatedByColumn = voucherCreatedByColumn !== false;
     // Tope de salidas en efectivo del turno (50% de la base de apertura): el
     // vale no puede dejar el acumulado del turno por encima del tope. Solo
     // aplica al efectivo y solo cuando el vale queda ligado a un turno
@@ -1065,11 +1237,14 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
         approved_by: autoApproved ? actor.userId : null,
         observation,
         ...(hasMethodColumns ? { method_code: method.code, cash_shift_id: openShift.id } : {}),
+        ...(hasCreatedByColumn ? { created_by: actor.userId } : {}),
       })
       .select(voucherSelect)
       .single();
     if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
-    const created = normalizeVoucher(data as unknown as Record<string, unknown>);
+    const [created] = await attachVoucherUserNames(db, [
+      normalizeVoucher(data as unknown as Record<string, unknown>),
+    ]);
     if (autoApproved) {
       // Dentro de rango: sale de caja de una; auditado sin código.
       await writeAudit({
@@ -1143,7 +1318,8 @@ export async function listVouchers(
   if (filters.request_date) query = query.eq("request_date", filters.request_date);
   const { data, error } = await query;
   if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
-  return ((data ?? []) as unknown as Array<Record<string, unknown>>).map(normalizeVoucher);
+  const rows = ((data ?? []) as unknown as Array<Record<string, unknown>>).map(normalizeVoucher);
+  return attachVoucherUserNames(db, rows);
 }
 
 async function getVoucherOrThrow(db: DbClient, sedeId: string, id: string): Promise<VoucherRequestRow> {
@@ -1198,6 +1374,33 @@ export async function approveVoucher(
         409,
       );
     }
+    // Tope del 50% de salidas en efectivo del turno: un vale puede nacer
+    // pendiente por debajo del límite y superarlo al aprobarse (el acumulado
+    // del turno creció). Se repite la validación de la solicitud con lo YA
+    // salido del turno (otros vales aprobados + pagos inmediatos) más este
+    // vale. Solo aplica al efectivo ligado a un turno (028); los digitales y
+    // los vales históricos sin turno no tienen tope.
+    if (voucher.method_code === "efectivo" && voucher.cash_shift_id) {
+      const { data: shift, error: shiftError } = await db
+        .from("cash_shifts")
+        .select("id, opening_base")
+        .eq("id", voucher.cash_shift_id)
+        .maybeSingle();
+      if (shiftError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+      if (shift) {
+        const cashOutUsed = await cashOutUsedInShift(voucher.cash_shift_id).catch((error) => {
+          throw toPayrollError(error);
+        });
+        const violation = voucherApprovalCashOutViolation({
+          methodCode: voucher.method_code,
+          cashShiftId: voucher.cash_shift_id,
+          openingBase: Number((shift as { opening_base: number | string }).opening_base),
+          cashOutUsed,
+          amount: Number(voucher.amount),
+        });
+        if (violation) throw new PayrollError(violation.code, violation.message, 422);
+      }
+    }
     const observation = parsed.data.observation?.trim()
       ? parsed.data.observation.trim()
       : voucher.observation;
@@ -1212,7 +1415,9 @@ export async function approveVoucher(
       .select(await resolveVoucherSelect(db))
       .single();
     if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
-    const approved = normalizeVoucher(data as unknown as Record<string, unknown>);
+    const [approved] = await attachVoucherUserNames(db, [
+      normalizeVoucher(data as unknown as Record<string, unknown>),
+    ]);
     // T8: marca si el vale superó topes (reproduce el chequeo de solicitud
     // descontando el propio vale del acumulado vigente que lo incluye).
     let overTope = false;
@@ -1294,6 +1499,9 @@ export async function rejectVoucher(
       .select(await resolveVoucherSelect(db))
       .single();
     if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    const [rejected] = await attachVoucherUserNames(db, [
+      normalizeVoucher(data as unknown as Record<string, unknown>),
+    ]);
     await writeAudit({
       sede_id: sedeId,
       user_id: actor?.userId ?? null,
@@ -1306,7 +1514,7 @@ export async function rejectVoucher(
         motivo: parsed.data.motivo.trim(),
       },
     });
-    return normalizeVoucher(data as unknown as Record<string, unknown>);
+    return rejected;
   } catch (error) {
     throw toPayrollError(error);
   }
