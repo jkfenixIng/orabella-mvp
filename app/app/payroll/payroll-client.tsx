@@ -24,25 +24,19 @@ import {
   DialogTitle,
 } from "@/src/components/ui/lib/dialog";
 import { cn } from "@/src/components/ui/lib/utils";
+import {
+  buttonClass,
+  errorClass,
+  ghostClass,
+  inputClass,
+  labelClass,
+  okClass,
+  sectionClass,
+  tableCellClass,
+  tableHeaderClass,
+  tableRowClass,
+} from "@/src/shared/lib/ui-styles";
 
-const inputClass = cn(
-  "rounded-md border border-border-color bg-surface px-3 py-2 text-sm text-text-primary shadow-sm",
-  "dark:border-border-color-2",
-);
-const labelClass = cn("flex flex-col gap-1 text-sm text-text-primary");
-const buttonClass = cn(
-  "inline-flex items-center justify-center gap-2 rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-all duration-200 hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
-);
-const ghostClass = cn(
-  "inline-flex items-center justify-center gap-2 rounded-md border border-border-color bg-transparent px-4 py-2 text-sm font-medium text-text-primary shadow-sm transition-all duration-200 hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
-  "dark:border-border-color-2 dark:hover:bg-surface-hover",
-);
-const sectionClass = cn(
-  "rounded-lg border border-border-color bg-surface p-4 shadow-sm",
-  "dark:border-border-color-2",
-);
-const errorClass = cn("text-sm text-error dark:text-error");
-const okClass = cn("text-sm text-success dark:text-success");
 /** Acción destructiva (borrar borrador): contorno y texto en rojo, separada de las demás. */
 const dangerOutlineClass = cn(
   "inline-flex items-center justify-center gap-2 rounded-md border border-error bg-transparent px-4 py-2 text-sm font-medium text-error shadow-sm transition-all duration-200 hover:bg-error/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
@@ -50,9 +44,6 @@ const dangerOutlineClass = cn(
 const dangerSolidClass = cn(
   "inline-flex items-center justify-center gap-2 rounded-md bg-error-600 px-6 py-2 text-sm font-semibold text-white shadow-sm transition-all duration-200 hover:bg-error-600/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
 );
-const tableHeaderClass = cn("bg-surface-hover text-xs font-semibold uppercase text-text-tertiary");
-const tableCellClass = cn("px-3 py-2 align-middle");
-const tableRowClass = cn("border-t border-border-color dark:border-border-color-2");
 const tableInputClass = cn(
   "w-28 rounded-md border border-border-color bg-surface px-2 py-1 text-right text-sm text-text-primary shadow-sm",
   "dark:border-border-color-2",

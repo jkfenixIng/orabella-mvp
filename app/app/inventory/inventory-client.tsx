@@ -34,26 +34,17 @@ import {
 } from "@/src/components/ui/lib/select";
 import { cn } from "@/src/components/ui/lib/utils";
 import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
-
-// Constantes locales alineadas con el estándar compartido del sistema de diseño.
-// Se definen con cn(...) sobre los tokens (no se importa admin-styles.ts: ese
-// módulo está acotado al panel de administración y cada sección declara las
-// suyas con los mismos tokens, como hacen services y vales).
-const inputClass = cn(
-  "rounded-md border border-border-color bg-surface px-3 py-2 text-sm text-text-primary shadow-sm",
-  "dark:border-border-color-2",
-);
-const labelClass = cn("flex flex-col gap-1 text-sm text-text-primary");
-const sectionClass = cn(
-  "rounded-lg border border-border-color bg-surface p-4 shadow-sm",
-  "dark:border-border-color-2",
-);
-const errorClass = cn("text-sm text-error dark:text-error");
-const okClass = cn("text-sm text-success dark:text-success");
-const tableCellClass = cn("px-3 py-2 align-middle");
-const tableHeaderClass = cn("bg-surface-hover text-xs font-semibold uppercase text-text-tertiary");
-const tableRowClass = cn("border-t border-border-color dark:border-border-color-2");
-const mutedTextClass = cn("text-sm text-text-secondary");
+import {
+  errorClass,
+  inputClass,
+  labelClass,
+  mutedTextClass,
+  okClass,
+  sectionClass,
+  tableCellClass,
+  tableHeaderClass,
+  tableRowClass,
+} from "@/src/shared/lib/ui-styles";
 
 type ActionResult<T> =
   | { success: true; data: T }

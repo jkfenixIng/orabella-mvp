@@ -159,7 +159,7 @@ export function UsersSection({
           </p>
         ) : (
           <div className="mt-3 overflow-x-auto">
-            <table className="min-w-full text-sm">
+            <table className="min-w-full text-left text-sm">
               <thead>
                 <tr className={tableHeaderClass}>
                   <th className="whitespace-nowrap py-1 pr-3">Nombre</th>
