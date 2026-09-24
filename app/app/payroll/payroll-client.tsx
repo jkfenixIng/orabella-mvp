@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition, type FormEvent } from "react";
+import { useRef, useState, useTransition, type FormEvent } from "react";
 import {
   calculatePayrollAction,
   closePayrollPeriodAction,
@@ -86,6 +86,21 @@ const PAY_TYPE_LABELS: Record<string, string> = {
   porcentaje: "Porcentaje",
   mixto: "Mixto",
 };
+
+/**
+ * Etiqueta legible del tipo de línea del desglose de comisiones. El
+ * `detail_json` guarda el tipo y la cantidad, pero NO el nombre del catálogo
+ * (ni `product_id`/`service_id` ni `custom_name`), así que no hay con qué
+ * resolver el nombre real en el cliente. Se muestra una etiqueta en español
+ * en lugar del tipo crudo: `custom` deja de verse como "custom" y pasa a
+ * "Personalizado".
+ */
+function detailLineLabel(itemType: string): string {
+  if (itemType === "producto") return "Producto";
+  if (itemType === "servicio") return "Servicio";
+  if (itemType === "custom") return "Personalizado";
+  return itemType;
+}
 
 /** Porcentaje sin decimales innecesarios (10 → "10", 10.5 → "10.5"). */
 function formatPercent(value: number): string {
@@ -392,26 +407,47 @@ function DraftPayrollTable({
   );
 }
 
+/** Fila editable del pago por porciones: método y monto como campos separados. */
+interface PortionDraft {
+  key: string;
+  method_code: string;
+  amount: string;
+}
+
 interface ExpandedItemPanelProps {
   item: DetailItem;
   methods: PaymentMethodRow[];
   canPay: boolean;
   busy: boolean;
-  portionsValue: string;
-  onPortionsChange: (value: string) => void;
+  portions: PortionDraft[];
+  onPortionChange: (key: string, patch: Partial<Pick<PortionDraft, "method_code" | "amount">>) => void;
+  onAddPortion: () => void;
+  onRemovePortion: (key: string) => void;
+  onTotalize: () => void;
   onPay: () => void;
 }
 
-/** Desglose de comisiones y pago por porciones de un ítem (contenido del modal de detalle). */
+/**
+ * Desglose de comisiones y pago por porciones de un ítem (contenido del modal
+ * de detalle). Las porciones se capturan en una tabla con método y monto como
+ * columnas independientes, en lugar del string "metodo:monto" que había que
+ * escribir y parsear.
+ */
 function ExpandedItemPanel({
   item,
   methods,
   canPay,
   busy,
-  portionsValue,
-  onPortionsChange,
+  portions,
+  onPortionChange,
+  onAddPortion,
+  onRemovePortion,
+  onTotalize,
   onPay,
 }: ExpandedItemPanelProps) {
+  const filled = portions.reduce((acc, portion) => acc + (toNumber(portion.amount) ?? 0), 0);
+  const missing = Math.max(0, item.remaining - filled);
+  const canTotalize = portions.some((portion) => portion.amount.trim() === "") && missing > 0;
   return (
     <div
       id={`payroll-item-detail-${item.id}`}
@@ -423,7 +459,7 @@ function ExpandedItemPanel({
         <ul className="flex flex-col gap-1">
           {item.detail_json.map((line) => (
             <li key={line.item_id}>
-              Factura #{line.consecutive_number ?? "?"} · {line.item_type} × {line.qty} a{" "}
+              Factura #{line.consecutive_number ?? "?"} · {detailLineLabel(line.item_type)} × {line.qty} a{" "}
               {formatMoney(line.unit_price)} = {formatMoney(line.line_subtotal)} → comisión{" "}
               {formatMoney(line.commission)}
             </li>
@@ -436,24 +472,103 @@ function ExpandedItemPanel({
             event.preventDefault();
             onPay();
           }}
-          className="mt-2 flex flex-wrap items-end gap-2"
+          className="mt-3 flex flex-col gap-3"
         >
-          <label className={labelClass} htmlFor={`payroll-pay-${item.id}`}>
-            Porciones (método:monto, …)
-            <input
-              id={`payroll-pay-${item.id}`}
-              value={portionsValue}
-              onChange={(event) => onPortionsChange(event.target.value)}
-              placeholder="efectivo:200000, nequi:100000"
-              className={inputClass}
-            />
-          </label>
-          <button type="submit" disabled={busy} className={buttonClass}>
-            {busy ? "Pagando…" : "Pagar"}
-          </button>
-          <span className="text-text-tertiary">
-            Métodos: {methods.map((row) => row.code).join(", ") || "sin métodos activos"}
-          </span>
+          <div className="overflow-x-auto">
+            <table className={cn("w-full text-left text-xs", "min-w-[420px]")}>
+              <thead>
+                <tr className={tableHeaderClass}>
+                  <th className={tableCellClass} scope="col">
+                    Método
+                  </th>
+                  <th className={tableCellClass} scope="col">
+                    Monto
+                  </th>
+                  <th className={tableCellClass} scope="col">
+                    Acciones
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {portions.map((portion, index) => (
+                  <tr key={portion.key} className={tableRowClass}>
+                    <td className={tableCellClass}>
+                      <select
+                        value={portion.method_code}
+                        onChange={(event) => onPortionChange(portion.key, { method_code: event.target.value })}
+                        aria-label={`Método de la porción ${index + 1}`}
+                        className={inputClass}
+                      >
+                        <option value="">Método…</option>
+                        {methods.map((row) => (
+                          <option key={row.id} value={row.code}>
+                            {row.name}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td className={tableCellClass}>
+                      <input
+                        type="number"
+                        min="0"
+                        inputMode="numeric"
+                        value={portion.amount}
+                        onChange={(event) => onPortionChange(portion.key, { amount: event.target.value })}
+                        aria-label={`Monto de la porción ${index + 1}`}
+                        placeholder="0"
+                        className={tableInputClass}
+                      />
+                    </td>
+                    <td className={tableCellClass}>
+                      {portions.length > 1 && (
+                        <button
+                          type="button"
+                          onClick={() => onRemovePortion(portion.key)}
+                          aria-label={`Quitar la porción ${index + 1}`}
+                          className={ghostClass}
+                        >
+                          Quitar
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+                {portions.length === 0 && (
+                  <tr className={tableRowClass}>
+                    <td className={tableCellClass} colSpan={3}>
+                      Sin porciones. Agregue al menos una para pagar.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button type="button" onClick={onAddPortion} className={ghostClass}>
+              Agregar porción
+            </button>
+            <button
+              type="button"
+              onClick={onTotalize}
+              disabled={!canTotalize}
+              title={canTotalize ? "Rellena una porción vacía con lo que falta" : "Nada por rellenar"}
+              className={ghostClass}
+            >
+              Totalizar
+            </button>
+            <span className="text-text-tertiary">
+              Saldo: {formatMoney(item.remaining)} · Porciones: {formatMoney(filled)} · Falta:{" "}
+              {formatMoney(missing)}
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <button type="submit" disabled={busy} className={buttonClass}>
+              {busy ? "Pagando…" : "Pagar"}
+            </button>
+            <span className="text-text-tertiary">
+              Métodos activos: {methods.map((row) => row.code).join(", ") || "sin métodos activos"}
+            </span>
+          </div>
         </form>
       )}
     </div>
@@ -472,8 +587,11 @@ export function PayrollClient(props: PayrollClientProps) {
   const [endDate, setEndDate] = useState("");
   const [openDialogOpen, setOpenDialogOpen] = useState(false);
   const [openError, setOpenError] = useState<string | null>(null);
-  // Pagos: porciones por ítem (texto "metodo:monto, metodo:monto").
-  const [portions, setPortions] = useState<Record<string, string>>({});
+  // Pagos: porciones por ítem (método y monto como campos separados en tabla).
+  const [portions, setPortions] = useState<Record<string, PortionDraft[]>>({});
+  // Contador para claves estables de las filas de porciones (no usar el índice:
+  // al quitar una fila intermedia el índice cambia y React reusaría el input equivocado).
+  const portionKeyRef = useRef(0);
   // Ajustes por empleado al calcular (bonos y otros descuentos editables).
   const [adjustments, setAdjustments] = useState<
     Record<string, Partial<Record<AdjustmentField, string>>>
@@ -583,17 +701,43 @@ export function PayrollClient(props: PayrollClientProps) {
       start_date: startDate,
       end_date: endDate,
     })) as ActionResult<PayrollPeriodRow>;
-    setBusy(false);
     if (!result.success) {
+      setBusy(false);
       setOpenError(`${result.code}: ${result.message}`);
       return;
     }
-    setMessage({ kind: "ok", text: "Periodo abierto en borrador." });
+    const created = result.data;
     setStartDate("");
     setEndDate("");
     setOpenDialogOpen(false);
-    await refreshPeriods(result.data.id);
-    await loadDetail(result.data.id);
+    await refreshPeriods(created.id);
+
+    // Calcular de inmediato el período recién creado: así el borrador "viene"
+    // calculado y el usuario no tiene que apretar "Recalcular".
+    //
+    // ATENCIÓN — efecto lateral real: `calculatePayroll` marca como
+    // `descontada` los vales pendientes/aprobados del rango y escribe
+    // auditoría. Por eso este cálculo se dispara SOLO al crear un período
+    // nuevo; NUNCA al abrir uno existente (eso movería vales sin que nadie lo
+    // pida). Crear un período, por lo tanto, descuenta vales sin intervención
+    // adicional del usuario.
+    const calculated = (await calculatePayrollAction(created.id, {
+      adjustments: [],
+    })) as ActionResult<PeriodDetail>;
+    setBusy(false);
+    if (calculated.success) {
+      setDetail(calculated.data);
+      setDetailDialogOpen(true);
+      setMessage({ kind: "ok", text: "Periodo abierto y calculado." });
+      return;
+    }
+    // Si el cálculo falla, el período igual quedó creado en borrador: se
+    // muestra su detalle vacío para poder recalcular a mano.
+    setMessage({
+      kind: "error",
+      text: `Periodo abierto, pero el cálculo falló — ${calculated.code}: ${calculated.message}`,
+    });
+    await loadDetail(created.id);
   }
 
   // Cerrar el modal de apertura siempre limpia su estado (mismo criterio que closeDetail).
@@ -626,24 +770,101 @@ export function PayrollClient(props: PayrollClientProps) {
     }
   }
 
+  /** Filas de porción vigentes de un ítem. */
+  function itemPortions(itemId: string): PortionDraft[] {
+    return portions[itemId] ?? [];
+  }
+
+  /**
+   * Crea una fila de porción con el primer método aún no usado y, si hay saldo,
+   * prellena el monto con lo que falta por pagar (el usuario solo confirma).
+   */
+  function createPortion(item: DetailItem, rows: PortionDraft[]): PortionDraft {
+    const used = new Set(rows.map((row) => row.method_code));
+    const free = props.methods.find((row) => !used.has(row.code))?.code ?? "";
+    const filled = rows.reduce((acc, row) => acc + (toNumber(row.amount) ?? 0), 0);
+    const remaining = Math.max(0, item.remaining - filled);
+    portionKeyRef.current += 1;
+    return {
+      key: `portion-${portionKeyRef.current}`,
+      method_code: free,
+      amount: remaining > 0 ? String(remaining) : "",
+    };
+  }
+
+  function addPortion(item: DetailItem) {
+    const row = createPortion(item, itemPortions(item.id));
+    setPortions((prev) => ({ ...prev, [item.id]: [...(prev[item.id] ?? []), row] }));
+  }
+
+  function removePortion(itemId: string, key: string) {
+    setPortions((prev) => ({
+      ...prev,
+      [itemId]: (prev[itemId] ?? []).filter((row) => row.key !== key),
+    }));
+  }
+
+  function changePortion(
+    itemId: string,
+    key: string,
+    patch: Partial<Pick<PortionDraft, "method_code" | "amount">>,
+  ) {
+    setPortions((prev) => ({
+      ...prev,
+      [itemId]: (prev[itemId] ?? []).map((row) => (row.key === key ? { ...row, ...patch } : row)),
+    }));
+  }
+
+  /** Rellena la primera porción vacía con el saldo que falta (patrón de facturas). */
+  function totalizePortions(item: DetailItem) {
+    setPortions((prev) => {
+      const rows = prev[item.id] ?? [];
+      const index = rows.findIndex((row) => row.amount.trim() === "");
+      if (index === -1) return prev;
+      const filled = rows.reduce((acc, row) => acc + (toNumber(row.amount) ?? 0), 0);
+      const remaining = Math.max(0, item.remaining - filled);
+      if (remaining <= 0) return prev;
+      return {
+        ...prev,
+        [item.id]: rows.map((row, i) => (i === index ? { ...row, amount: String(remaining) } : row)),
+      };
+    });
+  }
+
+  /** Abre el desglose de un ítem y deja una porción lista con el saldo pendiente. */
+  function openItemDetail(item: DetailItem) {
+    setDetailTargetId(item.id);
+    if (!props.canPay || item.remaining <= 0) return;
+    if (itemPortions(item.id).length > 0) return;
+    const row = createPortion(item, []);
+    setPortions((prev) => (prev[item.id]?.length ? prev : { ...prev, [item.id]: [row] }));
+  }
+
   async function handlePay(item: DetailItem) {
-    const raw = portions[item.id] ?? "";
-    const parts = raw
-      .split(",")
-      .map((chunk) => chunk.trim())
-      .filter(Boolean)
-      .map((chunk) => {
-        const [method_code = "", amountRaw = "", ...rest] = chunk.split(":");
-        return {
-          method_code: method_code.trim(),
-          amount: toNumber(amountRaw) ?? NaN,
-          reference: rest.join(":").trim() || undefined,
-        };
-      });
-    if (parts.length === 0 || parts.some((row) => !row.method_code || !Number.isFinite(row.amount))) {
+    const rows = itemPortions(item.id);
+    if (rows.length === 0) {
+      setMessage({ kind: "error", text: "Agregue al menos una porción de pago." });
+      return;
+    }
+    const parts: Array<{ method_code: string; amount: number }> = [];
+    for (const row of rows) {
+      const amount = toNumber(row.amount);
+      if (!row.method_code.trim() || amount === null || amount <= 0) {
+        setMessage({
+          kind: "error",
+          text: "Complete el método y un monto mayor a 0 en cada porción.",
+        });
+        return;
+      }
+      parts.push({ method_code: row.method_code.trim(), amount });
+    }
+    // El backend permite pago parcial: solo se rechaza pasarse del saldo
+    // pendiente (misma regla OVERPAID que `assertNoOverpay`).
+    const total = parts.reduce((acc, part) => acc + part.amount, 0);
+    if (total - item.remaining > 0.009) {
       setMessage({
         kind: "error",
-        text: "Indique porciones método:monto separadas por coma (p. ej. efectivo:200000, nequi:100000).",
+        text: `Las porciones (${formatMoney(total)}) superan el saldo pendiente (${formatMoney(item.remaining)}).`,
       });
       return;
     }
@@ -653,7 +874,7 @@ export function PayrollClient(props: PayrollClientProps) {
     })) as ActionResult<{ paid: number; remaining: number }>;
     setBusy(false);
     if (show(result, "Pago registrado.")) {
-      setPortions((prev) => ({ ...prev, [item.id]: "" }));
+      setPortions((prev) => ({ ...prev, [item.id]: [] }));
       if (selectedId) await loadDetail(selectedId);
     }
   }
@@ -906,7 +1127,7 @@ export function PayrollClient(props: PayrollClientProps) {
                       items={detail.items}
                       employeeName={employeeName}
                       payLabel={employeePayLabel}
-                      onView={(item) => setDetailTargetId(item.id)}
+                      onView={openItemDetail}
                     />
                   )}
                 </>
@@ -922,7 +1143,7 @@ export function PayrollClient(props: PayrollClientProps) {
                     payLabel={employeePayLabel}
                     adjustmentValue={adjustmentValue}
                     onAdjustmentChange={updateAdjustment}
-                    onView={(item) => setDetailTargetId(item.id)}
+                    onView={openItemDetail}
                   />
                   {pendingItems.length > 0 && (
                     <div
@@ -976,7 +1197,7 @@ export function PayrollClient(props: PayrollClientProps) {
                     items={detail.items}
                     employeeName={employeeName}
                     payLabel={employeePayLabel}
-                    onView={(item) => setDetailTargetId(item.id)}
+                    onView={openItemDetail}
                   />
                 )
               )}
@@ -1020,10 +1241,11 @@ export function PayrollClient(props: PayrollClientProps) {
               methods={props.methods}
               canPay={props.canPay && detailTarget.remaining > 0}
               busy={busy}
-              portionsValue={portions[detailTarget.id] ?? ""}
-              onPortionsChange={(value) =>
-                setPortions((prev) => ({ ...prev, [detailTarget.id]: value }))
-              }
+              portions={itemPortions(detailTarget.id)}
+              onPortionChange={(key, patch) => changePortion(detailTarget.id, key, patch)}
+              onAddPortion={() => addPortion(detailTarget)}
+              onRemovePortion={(key) => removePortion(detailTarget.id, key)}
+              onTotalize={() => totalizePortions(detailTarget)}
               onPay={() => void handlePay(detailTarget)}
             />
             <DialogFooter className="mt-4">
