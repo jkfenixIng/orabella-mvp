@@ -72,42 +72,44 @@ export default async function HomePage() {
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-4xl flex-col gap-8 px-6 py-12">
       <header>
-        <p className="text-sm font-medium text-slate-500 dark:text-slate-400">Bienvenido a</p>
+        <p className="text-sm font-medium text-text-tertiary">Bienvenido a</p>
         <h1 className="mt-1 text-3xl font-bold">Orabella</h1>
-        <p className="mt-2 text-slate-600 dark:text-slate-300">
+        <p className="mt-2 text-text-secondary">
           El sistema de su negocio de belleza: ventas, caja, inventario y personal en un solo lugar.
           Elija un módulo para empezar.
         </p>
       </header>
 
+      {/* Alerta de error: mismo shape que el aviso ámbar canónico, con tokens de error. */}
       {unreadAlerts > 0 ? (
         <section
           aria-label="Alertas de caja"
-          className="flex flex-col gap-2 rounded-lg border border-red-300 bg-red-50 p-4 dark:border-red-800 dark:bg-red-950"
+          className="flex flex-col gap-2 rounded-md bg-error-light px-3 py-2 text-sm font-medium text-error"
         >
-          <h2 className="text-lg font-semibold text-red-800 dark:text-red-200">
+          <h2 className="font-semibold">
             Alertas de caja ({unreadAlerts} sin leer)
           </h2>
           <Link
             href="/alerts"
             aria-label="Ver alertas de caja"
-            className="mt-1 w-fit rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+            className="mt-1 w-fit rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700"
           >
             Ver alertas
           </Link>
         </section>
       ) : null}
 
+      {/* Aviso ámbar canónico del proyecto (patrón aceptado). */}
       {lowStock.length > 0 ? (
         <section
           aria-label="Alertas de inventario"
-          className="flex flex-col gap-2 rounded-lg border border-amber-300 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950"
+          className="flex flex-col gap-2 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800"
         >
-          <h2 className="flex items-center gap-2 text-lg font-semibold text-amber-800 dark:text-amber-200">
+          <h2 className="flex items-center gap-2 font-semibold">
             <TriangleAlert className="h-5 w-5" aria-hidden="true" />
             Poco stock ({lowStock.length})
           </h2>
-          <ul className="flex flex-col gap-1 text-sm text-amber-900 dark:text-amber-100">
+          <ul className="flex flex-col gap-1">
             {lowStock.slice(0, 5).map((item) => (
               <li key={item.id}>
                 {item.name} ({item.sku}): quedan {item.stock_qty}, mínimo {item.min_stock}.
@@ -117,7 +119,7 @@ export default async function HomePage() {
           <Link
             href="/inventory"
             aria-label="Ver inventario con poco stock"
-            className="mt-1 w-fit rounded-md bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700"
+            className="mt-1 w-fit rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700"
           >
             Ver inventario
           </Link>
@@ -129,17 +131,17 @@ export default async function HomePage() {
           {visibleModules.map((module) => (
             <li
               key={module.href}
-              className="flex flex-col gap-2 rounded-lg border border-slate-300 p-4 dark:border-slate-700"
+              className="flex flex-col gap-2 rounded-lg border border-border-color p-4 dark:border-border-color-2"
             >
               <h2 className="flex items-center gap-2 text-lg font-semibold">
                 <module.Icon className="h-5 w-5" aria-hidden="true" />
                 {module.name}
               </h2>
-              <p className="text-sm text-slate-600 dark:text-slate-300">{module.purpose}</p>
+              <p className="text-sm text-text-secondary">{module.purpose}</p>
               <Link
                 href={module.href}
                 aria-label={`Ir a ${module.name}`}
-                className="mt-auto inline-block w-fit rounded-md bg-slate-200 px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-300 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700"
+                className="mt-auto inline-block w-fit rounded-md border border-border-color bg-surface px-4 py-2 text-sm font-medium text-text-primary hover:bg-surface-hover"
               >
                 Entrar
               </Link>

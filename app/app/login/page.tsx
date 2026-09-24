@@ -24,7 +24,7 @@ export default async function LoginPage({ searchParams }: LoginPageProps) {
     <main className="mx-auto flex min-h-screen max-w-md flex-col gap-6 px-6 py-12">
       <header>
         <h1 className="text-3xl font-bold">Orabella</h1>
-        <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
+        <p className="mt-2 text-sm text-text-secondary">
           Ingrese con su número de documento y su clave.
         </p>
       </header>
