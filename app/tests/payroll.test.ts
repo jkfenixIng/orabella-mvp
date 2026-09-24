@@ -19,6 +19,7 @@ import {
   normalizeAllowedDays,
   normalizePerDayLimits,
   openPeriodSchema,
+  overlapBlocksDeletion,
   payPayrollItemSchema,
   rejectVoucherSchema,
   requestVoucherSchema,
@@ -602,6 +603,38 @@ describe("payroll: borrado de un período en borrador (PAY-01)", () => {
   it("solo el borrador puede borrarse; el cerrado se rechaza con código propio", () => {
     expect(() => assertDeletablePeriod("borrador")).not.toThrow();
     expect(() => assertDeletablePeriod("cerrado")).toThrowError("PERIOD_NOT_DRAFT");
+  });
+
+  it("solapar con otro BORRADOR no bloquea el borrado (no hay plata pagada)", () => {
+    expect(overlapBlocksDeletion([])).toBe(false);
+    expect(overlapBlocksDeletion(["borrador"])).toBe(false);
+    expect(overlapBlocksDeletion(["borrador", "borrador"])).toBe(false);
+  });
+
+  it("solapar con un período CERRADO sí bloquea (se destruiría nómina pagada)", () => {
+    expect(overlapBlocksDeletion(["cerrado"])).toBe(true);
+    // Basta un cerrado entre varios solapados para bloquear.
+    expect(overlapBlocksDeletion(["borrador", "cerrado"])).toBe(true);
+    expect(overlapBlocksDeletion(["cerrado", "borrador"])).toBe(true);
+  });
+
+  it("(b) la reversión es por rango + estado: puede alcanzar vales que descontó OTRO borrador", () => {
+    // Escenario documentado (sin FK vale↔período; migración 007):
+    // A [2026-09-01, 2026-09-15] y B [2026-09-10, 2026-09-20], ambos borradores.
+    // B liquidó primero el vale V (request_date 2026-09-12): V = descontada.
+    // A, al liquidar, filtra status IN (pendiente, aprobada) y NO vuelve a
+    // descontar V. Al borrar A, la reversión (status = descontada + rango de A)
+    // SÍ alcanza V aunque su descuento provenga de B: el filtro no tiene
+    // atribución de período. B queda inconsistente hasta que se recalcule
+    // (calculatePayroll vuelve a marcar V como descontada).
+    const periodA = { start_date: "2026-09-01", end_date: "2026-09-15" };
+    const voucher = { request_date: "2026-09-12", status: "descontada", approved_by: "user-1" };
+    // Réplica exacta del filtro SQL de deletePayrollPeriod.
+    const reaches = voucher.status === "descontada"
+      && voucher.request_date >= periodA.start_date
+      && voucher.request_date <= periodA.end_date;
+    expect(reaches).toBe(true);
+    expect(restoreVoucherStatus(voucher.approved_by)).toBe("aprobada");
   });
 
   it("los vales descontados vuelven a su estado previo según approved_by", () => {

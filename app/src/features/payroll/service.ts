@@ -15,6 +15,7 @@ import {
   normalizeAllowedDays,
   normalizePerDayLimits,
   openPeriodSchema,
+  overlapBlocksDeletion,
   payPayrollItemSchema,
   requestVoucherSchema,
   rejectVoucherSchema,
@@ -868,10 +869,11 @@ export async function closePayrollPeriod(
  * - Vales: al liquidar, `calculatePayroll` marca como `descontada` los vales
  *   del rango (estado terminal, sin FK al período). Si se borra el borrador
  *   hay que devolverlos a su estado previo o quedarían descontados sin nómina
- *   que los respalde. La atribución es por rango de fechas; para que sea
- *   EXACTA se exige que ningún otro período de la sede solape el rango (si
- *   solapa, no puede saberse qué vales son de este borrador y se rechaza). El
- *   estado previo se infiere de `approved_by` (ver restoreVoucherStatus).
+ *   que los respalde. La atribución es por rango de fechas; el único
+ *   solapamiento que bloquea es con un período CERRADO (nómina ya pagada):
+ *   revertir esos vales destruiría historia. Solapar con otros borradores no
+ *   bloquea, pues nada está pagado y el borrador restante puede recalcularse.
+ *   El estado previo se infiere de `approved_by` (ver restoreVoucherStatus).
  */
 export async function deletePayrollPeriod(
   sedeId: string,
@@ -887,23 +889,26 @@ export async function deletePayrollPeriod(
       throw toPayrollError(error);
     }
 
-    // Sin FK vale↔período, la atribución es por rango: si otro período de la
-    // sede solapa este rango, sus vales descontados caen dentro y no se puede
-    // distinguir cuáles son de este borrador. Se rechaza antes que revertir
-    // vales ajenos (destruiría historia de un período cerrado).
+    // Sin FK vale↔período, la atribución es por rango. Un período CERRADO
+    // (nómina ya pagada) que solape este rango hace ambiguo qué vales
+    // pertenecen a este borrador: se rechaza antes que revertir vales de una
+    // nómina ya pagada. Los borradores solapados NO bloquean: no hay plata
+    // pagada y el borrador restante puede recalcularse.
     const { data: overlapping, error: overlapError } = await db
       .from("payroll_periods")
-      .select("id")
+      .select("id, status")
       .eq("sede_id", sedeId)
       .neq("id", periodId)
       .lte("start_date", period.end_date)
-      .gte("end_date", period.start_date)
-      .limit(1);
+      .gte("end_date", period.start_date);
     if (overlapError) throw new PayrollError("INTERNAL", "Error interno.", 500);
-    if ((overlapping ?? []).length > 0) {
+    const overlappingStatuses = ((overlapping ?? []) as Array<{ status: string }>).map(
+      (row) => row.status,
+    );
+    if (overlapBlocksDeletion(overlappingStatuses)) {
       throw new PayrollError(
         "PERIOD_OVERLAP_AMBIGUOUS",
-        "No se puede borrar: otro período de la sede solapa este rango y no se puede determinar qué vales pertenecen a este borrador.",
+        "No se puede borrar: otro período CERRADO de la sede solapa este rango y no se puede determinar qué vales pertenecen a este borrador sin revertir una nómina ya pagada.",
         409,
       );
     }

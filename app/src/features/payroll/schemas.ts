@@ -199,6 +199,16 @@ export function assertDeletablePeriod(status: string): void {
 }
 
 /**
+ * PAY-01: un borrador solo se bloquea por solapamiento con un período
+ * CERRADO (nómina ya pagada: borrar el rango revertiría vales de historia).
+ * Solapar con otros borradores no bloquea: nada está pagado y el borrador
+ * restante puede recalcularse. Puro para probarlo sin base de datos.
+ */
+export function overlapBlocksDeletion(statuses: string[]): boolean {
+  return statuses.some((status) => status === "cerrado");
+}
+
+/**
  * PAY-07: estado al que vuelve un vale que había quedado `descontada` cuando
  * se borra el borrador que lo descontó. La aprobación deja `approved_by`
  * informado (el flujo automático lo setea al crear dentro de rango); un vale
