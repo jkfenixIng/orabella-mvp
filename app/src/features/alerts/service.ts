@@ -3,7 +3,9 @@ import {
   ALERT_MODULES,
   ALERTS_PAGE_SIZE,
   alertsQuerySchema,
+  buildVoucherAlertResolution,
   reviewNoteSchema,
+  voucherAlertFilter,
   type AlertModule,
   type ShiftAuditState,
 } from "./schemas";
@@ -263,4 +265,41 @@ export async function markAlertRead(
   if (error) throw toAlertError(error);
   if (!data) throw new AlertError("NOT_FOUND", "Alerta no encontrada.", 404);
   return { id: (data as { id: string }).id };
+}
+
+/**
+ * Cierra la alerta pendiente de un vale ya revisado (aprobado o rechazado).
+ * La alerta decía "hay un vale pendiente de revisar": una vez revisado, ya no
+ * aplica. Reutiliza el mecanismo de la bandeja (`is_read`/`read_at`/
+ * `review_note`/`reviewed_by`), sin estados nuevos, y filtra por `entity_id`
+ * + `is_read:false` para ser idempotente y no pisar otras alertas.
+ *
+ * NUNCA lanza: aprobar/rechazar el vale ya quedó aplicado y auditado, así que
+ * un fallo al cerrar la alerta no debe tumbar la operación de negocio (la
+ * alerta seguiría en la bandeja para revisarla a mano).
+ */
+export async function resolveVoucherAlert(
+  sedeId: string,
+  voucherId: string,
+  reviewedBy: string | null,
+  note: string,
+): Promise<{ resolved: boolean }> {
+  try {
+    const db = await alertsDb();
+    const { error } = await db
+      .from("audit_logs")
+      .update(buildVoucherAlertResolution({ reviewedBy, note }))
+      .match(voucherAlertFilter(sedeId, voucherId));
+    if (error) {
+      console.error("[alerts] no se pudo cerrar la alerta del vale:", error.message);
+      return { resolved: false };
+    }
+    return { resolved: true };
+  } catch (error) {
+    console.error(
+      "[alerts] no se pudo cerrar la alerta del vale:",
+      error instanceof Error ? error.message : error,
+    );
+    return { resolved: false };
+  }
 }

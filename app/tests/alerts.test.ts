@@ -3,9 +3,15 @@ import {
   ALERT_ACTIONS,
   ALERT_MODULES,
   ALERTS_PAGE_SIZE,
+  VOUCHER_ALERT_ACTION,
+  VOUCHER_ALERT_ENTITY,
   alertsQuerySchema,
   assembleShiftRevision,
+  buildVoucherAlertResolution,
   reviewNoteSchema,
+  voucherAlertFilter,
+  voucherAlertRequired,
+  voucherAlertResolutionNote,
 } from "@/src/features/alerts/schemas";
 
 describe("alerts: conjunto de alerta y paginado", () => {
@@ -68,5 +74,58 @@ describe("alerts: conjunto de alerta y paginado", () => {
         true,
       )?.revisada,
     ).toBe(false);
+  });
+});
+
+describe("alerts: la alerta del vale se resuelve al aprobarlo o rechazarlo", () => {
+  it("solo un vale fuera de rango (pendiente) deja alerta; dentro de rango no", () => {
+    // requestVoucher nace aprobada (dentro de rango) o pendiente (fuera);
+    // solo la pendiente escribe la alerta voucher.requested.
+    expect(voucherAlertRequired("pendiente")).toBe(true);
+    expect(voucherAlertRequired("aprobada")).toBe(false);
+    expect(voucherAlertRequired("rechazada")).toBe(false);
+    expect(voucherAlertRequired("descontada")).toBe(false);
+  });
+
+  it("la alerta del vale vive en el vocabulario y módulo de la bandeja", () => {
+    expect([...ALERT_ACTIONS]).toContain(VOUCHER_ALERT_ACTION);
+    expect([...ALERT_MODULES.caja.actions]).toContain(VOUCHER_ALERT_ACTION);
+    expect(VOUCHER_ALERT_ENTITY).toBe("voucher_requests");
+  });
+
+  it("el cierre reutiliza is_read/read_at/review_note/reviewed_by (sin estados nuevos)", () => {
+    const patch = buildVoucherAlertResolution({
+      reviewedBy: "admin-1",
+      note: "Vale aprobado.",
+      now: "2026-01-02T03:04:05.000Z",
+    });
+    expect(patch).toEqual({
+      is_read: true,
+      read_at: "2026-01-02T03:04:05.000Z",
+      review_note: "Vale aprobado.",
+      reviewed_by: "admin-1",
+    });
+  });
+
+  it("nota de resolución: aprobado y rechazado con su motivo", () => {
+    expect(voucherAlertResolutionNote("aprobada")).toBe("Vale aprobado.");
+    expect(voucherAlertResolutionNote("rechazada")).toBe("Vale rechazado.");
+    expect(voucherAlertResolutionNote("rechazada", "sin soporte")).toBe(
+      "Vale rechazado: sin soporte",
+    );
+    expect(voucherAlertResolutionNote("rechazada", "   ")).toBe("Vale rechazado.");
+  });
+
+  it("el cierre toca SOLO la alerta pendiente de ESE vale (idempotente, sin duplicar)", () => {
+    expect(voucherAlertFilter("sede-1", "vale-9")).toEqual({
+      sede_id: "sede-1",
+      action: VOUCHER_ALERT_ACTION,
+      entity: VOUCHER_ALERT_ENTITY,
+      entity_id: "vale-9",
+      is_read: false,
+    });
+    // Otro vale queda fuera del filtro: aprobar uno no cierra la alerta de otro.
+    const other = voucherAlertFilter("sede-1", "vale-10");
+    expect(other.entity_id).not.toBe("vale-9");
   });
 });

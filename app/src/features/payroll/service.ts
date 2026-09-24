@@ -45,6 +45,11 @@ import {
   listEmployees,
   listPaymentMethods,
 } from "@/src/features/admin/service";
+import { resolveVoucherAlert } from "@/src/features/alerts/service";
+import {
+  voucherAlertRequired,
+  voucherAlertResolutionNote,
+} from "@/src/features/alerts/schemas";
 
 export class PayrollError extends Error {
   readonly code: string;
@@ -1330,7 +1335,9 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
     });
     // Dentro de rango → directo; fuera de rango (topes/día) → pendiente.
     const status = resolveVoucherInitialStatus(eligibility);
-    const autoApproved = status === "aprobada";
+    // Fuera de rango (topes/día) queda pendiente y abre la alerta del admin;
+    // dentro de rango sale directo. Mismo criterio que usa el cierre de la alerta.
+    const autoApproved = !voucherAlertRequired(status);
     const observation = parsed.data.observation?.trim()
       ? parsed.data.observation.trim()
       : autoApproved
@@ -1582,6 +1589,14 @@ export async function approveVoucher(
         over_tope: overTope,
       },
     });
+    // La alerta abierta por la solicitud fuera de rango queda resuelta:
+    // aprobado el vale, ya no hay nada pendiente de revisar.
+    await resolveVoucherAlert(
+      sedeId,
+      id,
+      actor.userId,
+      voucherAlertResolutionNote("aprobada"),
+    );
     return approved;
   } catch (error) {
     throw toPayrollError(error);
@@ -1643,6 +1658,13 @@ export async function rejectVoucher(
         motivo: parsed.data.motivo.trim(),
       },
     });
+    // Rechazado el vale, su alerta pendiente deja de aplicar.
+    await resolveVoucherAlert(
+      sedeId,
+      id,
+      actor?.userId ?? null,
+      voucherAlertResolutionNote("rechazada", parsed.data.motivo),
+    );
     return rejected;
   } catch (error) {
     throw toPayrollError(error);

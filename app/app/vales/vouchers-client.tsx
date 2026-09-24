@@ -235,7 +235,7 @@ export function VouchersClient(props: VouchersClientProps) {
       observation: reviewNote || undefined,
     })) as ActionResult<VoucherRequestRow>;
     setBusy(false);
-    if (show(result, "Vale aprobado.")) {
+    if (show(result, "Vale aprobado. Su alerta quedó resuelta.")) {
       setReviewNote("");
       await refreshVouchers();
     }
@@ -251,7 +251,7 @@ export function VouchersClient(props: VouchersClientProps) {
       motivo: rejectReason,
     })) as ActionResult<VoucherRequestRow>;
     setBusy(false);
-    if (show(result, "Vale rechazado.")) {
+    if (show(result, "Vale rechazado. Su alerta quedó resuelta.")) {
       setRejectReason("");
       await refreshVouchers();
     }
@@ -343,12 +343,12 @@ export function VouchersClient(props: VouchersClientProps) {
           )}
         </div>
         {!configured && (
-          <p role="status" className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
+          <p role="status" className="mt-3 rounded-md bg-warning-light px-3 py-2 text-sm font-medium text-warning">
             Los vales no están configurados: un administrador debe definir topes y días permitidos antes de solicitar.
           </p>
         )}
         {props.canIssue && configured && shiftBlockReason !== null && (
-          <p role="status" className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
+          <p role="status" className="mt-3 rounded-md bg-warning-light px-3 py-2 text-sm font-medium text-warning">
             {shiftBlockReason}
           </p>
         )}
