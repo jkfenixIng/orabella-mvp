@@ -80,7 +80,35 @@ function toNumber(value: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+/** Etiquetas del tipo de pago del empleado (ADM-08: fijo, porcentaje o mixto). */
+const PAY_TYPE_LABELS: Record<string, string> = {
+  fijo: "Fijo",
+  porcentaje: "Porcentaje",
+  mixto: "Mixto",
+};
+
+/** Porcentaje sin decimales innecesarios (10 → "10", 10.5 → "10.5"). */
+function formatPercent(value: number): string {
+  return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)));
+}
+
+/**
+ * Tipo de pago legible para la liquidación ("Fijo", "Porcentaje 10%",
+ * "Mixto 10%"). El porcentaje se anexa solo en porcentaje/mixto con valor
+ * definido, para no mostrar "Porcentaje null%".
+ */
+function formatPayType(payType: string, percent: number | null): string {
+  const label = PAY_TYPE_LABELS[payType] ?? payType;
+  if ((payType === "porcentaje" || payType === "mixto") && percent !== null) {
+    return `${label} ${formatPercent(percent)}%`;
+  }
+  return label;
+}
+
 const MONTHS_SHORT = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+
+/** Máximo de nombres listados en el aviso de pendientes antes de resumir. */
+const PENDING_VISIBLE_LIMIT = 8;
 
 interface SimpleDate {
   year: number;
@@ -152,12 +180,12 @@ type DetailItem = PeriodDetail["items"][number];
 interface PeriodDetailTableProps {
   items: DetailItem[];
   employeeName: (id: string) => string;
-  expanded: Record<string, boolean>;
-  onToggle: (itemId: string) => void;
+  payLabel: (id: string) => string;
+  onView: (item: DetailItem) => void;
 }
 
 /** Tabla del detalle del periodo (solo presentación). */
-function PeriodDetailTable({ items, employeeName, expanded, onToggle }: PeriodDetailTableProps) {
+function PeriodDetailTable({ items, employeeName, payLabel, onView }: PeriodDetailTableProps) {
   return (
     <div className="mt-4 overflow-x-auto">
       <table className={cn("w-full text-left text-sm", "min-w-[960px]")}>
@@ -198,7 +226,10 @@ function PeriodDetailTable({ items, employeeName, expanded, onToggle }: PeriodDe
         <tbody>
           {items.map((item) => (
             <tr key={item.id} className={tableRowClass}>
-              <td className={tableCellClass}>{employeeName(item.employee_id)}</td>
+              <td className={tableCellClass}>
+                <span className="block">{employeeName(item.employee_id)}</span>
+                <span className="block text-xs text-text-tertiary">{payLabel(item.employee_id)}</span>
+              </td>
               <td className={tableCellClass}>{formatMoney(item.base_fixed)}</td>
               <td className={tableCellClass}>{formatMoney(item.commissions)}</td>
               <td className={tableCellClass}>{formatMoney(item.bonuses)}</td>
@@ -210,13 +241,11 @@ function PeriodDetailTable({ items, employeeName, expanded, onToggle }: PeriodDe
               <td className={tableCellClass}>
                 <button
                   type="button"
-                  onClick={() => onToggle(item.id)}
-                  aria-expanded={Boolean(expanded[item.id])}
-                  aria-controls={`payroll-item-detail-${item.id}`}
-                  aria-label={`${expanded[item.id] ? "Ocultar" : "Ver"} el desglose de ${employeeName(item.employee_id)}`}
+                  onClick={() => onView(item)}
+                  aria-label={`Ver el desglose de ${employeeName(item.employee_id)}`}
                   className={ghostClass}
                 >
-                  {expanded[item.id] ? "Ocultar" : "Ver"}
+                  Ver
                 </button>
               </td>
             </tr>
@@ -237,10 +266,10 @@ interface DraftRow {
 interface DraftPayrollTableProps {
   rows: DraftRow[];
   employeeName: (id: string) => string;
+  payLabel: (id: string) => string;
   adjustmentValue: (employeeId: string, field: AdjustmentField) => string;
   onAdjustmentChange: (employeeId: string, field: AdjustmentField, value: string) => void;
-  expanded: Record<string, boolean>;
-  onToggle: (itemId: string) => void;
+  onView: (item: DetailItem) => void;
 }
 
 /**
@@ -252,10 +281,10 @@ interface DraftPayrollTableProps {
 function DraftPayrollTable({
   rows,
   employeeName,
+  payLabel,
   adjustmentValue,
   onAdjustmentChange,
-  expanded,
-  onToggle,
+  onView,
 }: DraftPayrollTableProps) {
   return (
     <div className="mt-4 overflow-x-auto">
@@ -297,10 +326,12 @@ function DraftPayrollTable({
         <tbody>
           {rows.map((row) => {
             const item = row.item;
-            const isExpanded = item ? Boolean(expanded[item.id]) : false;
             return (
               <tr key={row.employeeId} className={tableRowClass}>
-                <td className={tableCellClass}>{employeeName(row.employeeId)}</td>
+                <td className={tableCellClass}>
+                  <span className="block">{employeeName(row.employeeId)}</span>
+                  <span className="block text-xs text-text-tertiary">{payLabel(row.employeeId)}</span>
+                </td>
                 <td className={tableCellClass}>{item ? formatMoney(item.base_fixed) : "—"}</td>
                 <td className={tableCellClass}>{item ? formatMoney(item.commissions) : "—"}</td>
                 <td className={tableCellClass}>
@@ -335,13 +366,11 @@ function DraftPayrollTable({
                   {item ? (
                     <button
                       type="button"
-                      onClick={() => onToggle(item.id)}
-                      aria-expanded={isExpanded}
-                      aria-controls={`payroll-item-detail-${item.id}`}
-                      aria-label={`${isExpanded ? "Ocultar" : "Ver"} el desglose de ${employeeName(row.employeeId)}`}
+                      onClick={() => onView(item)}
+                      aria-label={`Ver el desglose de ${employeeName(row.employeeId)}`}
                       className={ghostClass}
                     >
-                      {isExpanded ? "Ocultar" : "Ver"}
+                      Ver
                     </button>
                   ) : (
                     "—"
@@ -373,7 +402,7 @@ interface ExpandedItemPanelProps {
   onPay: () => void;
 }
 
-/** Desglose de comisiones y pago por porciones de un ítem (fila expandida). */
+/** Desglose de comisiones y pago por porciones de un ítem (contenido del modal de detalle). */
 function ExpandedItemPanel({
   item,
   methods,
@@ -435,7 +464,7 @@ export function PayrollClient(props: PayrollClientProps) {
   const [periods, setPeriods] = useState<PayrollPeriodRow[]>(props.initialPeriods);
   const [selectedId, setSelectedId] = useState<string | null>(props.initialPeriods[0]?.id ?? null);
   const [detail, setDetail] = useState<PeriodDetail | null>(null);
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [detailTargetId, setDetailTargetId] = useState<string | null>(null);
   const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
 
   // Periodo: abrir (el rango se pide en el modal, no en la vista principal).
@@ -515,7 +544,7 @@ export function PayrollClient(props: PayrollClientProps) {
   // Inventory-style cancel: closing the dialog always resets its state.
   function closeDetail() {
     setDetail(null);
-    setExpanded({});
+    setDetailTargetId(null);
     setAdjustments({});
     setPortions({});
     setDetailDialogOpen(false);
@@ -661,6 +690,11 @@ export function PayrollClient(props: PayrollClientProps) {
 
 
   const selected = periods.find((row) => row.id === selectedId) ?? null;
+  // Ítem cuyo desglose se muestra en el modal de detalle. Se resuelve contra el
+  // detalle vigente para que un pago o recálculo refresque sus montos.
+  const detailTarget = detailTargetId
+    ? detail?.items.find((item) => item.id === detailTargetId) ?? null
+    : null;
 
   // Ayuda para elegir el rango del nuevo periodo, construida solo con `periods`.
   const lastEnd = latestEndDate(periods);
@@ -681,6 +715,20 @@ export function PayrollClient(props: PayrollClientProps) {
     const internalId = found.employee_code ? found.employee_code : found.document;
     return `${found.full_name} (${internalId})`;
   };
+
+  /**
+   * Tipo de pago del empleado (fijo/porcentaje/mixto y su porcentaje) para la
+   * columna de liquidación. Se resuelve contra la configuración vigente del
+   * empleado, igual que el nombre.
+   */
+  const employeePayLabel = (id: string) => {
+    const found = props.initialEmployees.find((row) => row.id === id);
+    if (!found) return "Sin definir";
+    return formatPayType(found.pay_type, found.commission_percent);
+  };
+
+  // Ítems del detalle con saldo pendiente de pago: bloquean el cierre del borrador.
+  const pendingItems = (detail?.items ?? []).filter((item) => item.remaining > 0);
 
   return (
     <div className="flex flex-col gap-6">
@@ -841,7 +889,7 @@ export function PayrollClient(props: PayrollClientProps) {
             else setDetailDialogOpen(open);
           }}
         >
-          <DialogContent className="max-w-4xl" aria-busy={isViewPending}>
+          <DialogContent className="max-w-6xl" aria-busy={isViewPending}>
             <DialogHeader>
               <DialogTitle>
                 Liquidación {selected.start_date} → {selected.end_date} ({selected.status})
@@ -857,8 +905,8 @@ export function PayrollClient(props: PayrollClientProps) {
                     <PeriodDetailTable
                       items={detail.items}
                       employeeName={employeeName}
-                      expanded={expanded}
-                      onToggle={(itemId) => setExpanded((prev) => ({ ...prev, [itemId]: !prev[itemId] }))}
+                      payLabel={employeePayLabel}
+                      onView={(item) => setDetailTargetId(item.id)}
                     />
                   )}
                 </>
@@ -871,27 +919,32 @@ export function PayrollClient(props: PayrollClientProps) {
                   <DraftPayrollTable
                     rows={draftRows}
                     employeeName={employeeName}
+                    payLabel={employeePayLabel}
                     adjustmentValue={adjustmentValue}
                     onAdjustmentChange={updateAdjustment}
-                    expanded={expanded}
-                    onToggle={(itemId) => setExpanded((prev) => ({ ...prev, [itemId]: !prev[itemId] }))}
+                    onView={(item) => setDetailTargetId(item.id)}
                   />
-                  {detail?.items.map(
-                    (item) =>
-                      expanded[item.id] && (
-                        <ExpandedItemPanel
-                          key={`${item.id}-detail`}
-                          item={item}
-                          methods={props.methods}
-                          canPay={props.canPay && item.remaining > 0}
-                          busy={busy}
-                          portionsValue={portions[item.id] ?? ""}
-                          onPortionsChange={(value) =>
-                            setPortions((prev) => ({ ...prev, [item.id]: value }))
-                          }
-                          onPay={() => void handlePay(item)}
-                        />
-                      ),
+                  {pendingItems.length > 0 && (
+                    <div
+                      role="status"
+                      className="mt-4 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800"
+                    >
+                      <p>
+                        {`Pendientes de pago (${pendingItems.length}): páguelos todos antes de cerrar la nómina.`}
+                      </p>
+                      <ul className="mt-1 flex flex-col gap-0.5">
+                        {pendingItems.slice(0, PENDING_VISIBLE_LIMIT).map((item) => (
+                          <li key={item.id}>
+                            {employeeName(item.employee_id)} — {formatMoney(item.remaining)}
+                          </li>
+                        ))}
+                      </ul>
+                      {pendingItems.length > PENDING_VISIBLE_LIMIT && (
+                        <p className="mt-1">
+                          {`y ${pendingItems.length - PENDING_VISIBLE_LIMIT} más (vea la columna Saldo de la tabla).`}
+                        </p>
+                      )}
+                    </div>
                   )}
                   <div className="mt-4 flex flex-wrap gap-3">
                     <button
@@ -905,7 +958,12 @@ export function PayrollClient(props: PayrollClientProps) {
                     <button
                       type="button"
                       onClick={() => void handleClose()}
-                      disabled={busy}
+                      disabled={busy || pendingItems.length > 0}
+                      title={
+                        pendingItems.length > 0
+                          ? "Hay empleados con saldo pendiente de pago."
+                          : undefined
+                      }
                       className={buttonClass}
                     >
                       {busy ? "Cerrando…" : "Cerrar nómina"}
@@ -914,31 +972,12 @@ export function PayrollClient(props: PayrollClientProps) {
                 </>
               ) : (
                 detail && (
-                  <>
-                    <PeriodDetailTable
-                      items={detail.items}
-                      employeeName={employeeName}
-                      expanded={expanded}
-                      onToggle={(itemId) => setExpanded((prev) => ({ ...prev, [itemId]: !prev[itemId] }))}
-                    />
-                    {detail.items.map(
-                      (item) =>
-                        expanded[item.id] && (
-                          <ExpandedItemPanel
-                            key={`${item.id}-detail`}
-                            item={item}
-                            methods={props.methods}
-                            canPay={props.canPay && item.remaining > 0}
-                            busy={busy}
-                            portionsValue={portions[item.id] ?? ""}
-                            onPortionsChange={(value) =>
-                              setPortions((prev) => ({ ...prev, [item.id]: value }))
-                            }
-                            onPay={() => void handlePay(item)}
-                          />
-                        ),
-                    )}
-                  </>
+                  <PeriodDetailTable
+                    items={detail.items}
+                    employeeName={employeeName}
+                    payLabel={employeePayLabel}
+                    onView={(item) => setDetailTargetId(item.id)}
+                  />
                 )
               )}
             </div>
@@ -955,6 +994,41 @@ export function PayrollClient(props: PayrollClientProps) {
               )}
               <button type="button" className={ghostClass} onClick={closeDetail}>
                 Cancelar
+              </button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/* Detalle de un ítem en modal propio, apilado sobre el del período. */}
+      {detailTarget && (
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setDetailTargetId(null);
+          }}
+        >
+          <DialogContent className="max-w-3xl">
+            <DialogHeader>
+              <DialogTitle>Desglose de {employeeName(detailTarget.employee_id)}</DialogTitle>
+              <DialogDescription>
+                Comisiones del período y registro de pagos por porciones.
+              </DialogDescription>
+            </DialogHeader>
+            <ExpandedItemPanel
+              item={detailTarget}
+              methods={props.methods}
+              canPay={props.canPay && detailTarget.remaining > 0}
+              busy={busy}
+              portionsValue={portions[detailTarget.id] ?? ""}
+              onPortionsChange={(value) =>
+                setPortions((prev) => ({ ...prev, [detailTarget.id]: value }))
+              }
+              onPay={() => void handlePay(detailTarget)}
+            />
+            <DialogFooter className="mt-4">
+              <button type="button" className={ghostClass} onClick={() => setDetailTargetId(null)}>
+                Cerrar
               </button>
             </DialogFooter>
           </DialogContent>
