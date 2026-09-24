@@ -2926,13 +2926,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         )
                       }
                     >
-                      {/* El desplegable se monta en un portal con z-index propio;
-                          este modal apilado tiene un overlay por encima, así que
-                          se eleva para que las opciones queden clickeables. */}
                       <SelectTrigger className={paperInputClass}>
                         <SelectValue placeholder="Método" />
                       </SelectTrigger>
-                      <SelectContent className="z-[1000]">
+                      <SelectContent>
                         {props.methods.map((method) => (
                           <SelectItem key={method.id} value={method.code}>
                             {method.name}
