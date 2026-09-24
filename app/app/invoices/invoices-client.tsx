@@ -218,6 +218,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
   const [commissionRows, setCommissionRows] = useState<CommissionPayRow[]>([]);
   const [commissionError, setCommissionError] = useState<string | null>(null);
   const [commissionBusy, setCommissionBusy] = useState(false);
+  // Factura del modal de comisión. Se guarda aparte porque el detalle se cierra
+  // antes de abrirlo y no debe perderse el id ni el número.
+  const [commissionInvoice, setCommissionInvoice] = useState<{ id: string; number: number } | null>(null);
 
   // G1: turno abierto conocido por el cliente. La validación de caja se hace
   // ANTES de entrar a emitir o editar (el servidor vuelve a validar).
@@ -789,8 +792,15 @@ export function InvoicesClient(props: InvoicesClientProps) {
       (id) => props.employees.find((row) => row.id === id)?.payout_mode === "inmediato",
     );
     if (employeeIds.length === 0) return;
-    const result: ActionResult<Array<{ employee_id: string; pending: number }>> =
-      await getPendingCommissionsAction({ invoice_id: next.invoice.id, employee_ids: employeeIds });
+    let result: ActionResult<Array<{ employee_id: string; pending: number }>>;
+    try {
+      result = await getPendingCommissionsAction({ invoice_id: next.invoice.id, employee_ids: employeeIds });
+    } catch (error) {
+      // La acción lanzó (red/timeout): no se apila el modal ni se rompe el
+      // flujo de emisión/cobro; se reporta y se sigue.
+      setError(error instanceof Error ? error.message : "No se pudieron calcular las comisiones pendientes.");
+      return;
+    }
     if (!result.success) {
       setError(`[${result.code}] ${result.message}`);
       return;
@@ -799,6 +809,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
     if (payable.length === 0) return;
     const fallbackMethod =
       props.methods.find((row) => row.code === "efectivo")?.code ?? props.methods[0]?.code ?? "efectivo";
+    // Fix C: se guarda la factura y se cierra su detalle antes de abrir el
+    // modal de comisión, para que no queden dos diálogos apilados y el de
+    // comisión se lea solo. El id no depende de `detail` tras el cierre.
+    setCommissionInvoice({ id: next.invoice.id, number: next.invoice.consecutive_number });
+    setDetailDialogOpen(false);
     setCommissionRows(
       payable.map((row) => ({
         employee_id: row.employee_id,
@@ -811,31 +826,56 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setCommissionOpen(true);
   }
 
+  /**
+   * Cierra el modal de comisión. Si el detalle de la factura seguía cargado, lo
+   * vuelve a mostrar (se ocultó al abrir el de comisión).
+   */
+  function closeCommission() {
+    setCommissionOpen(false);
+    setCommissionRows([]);
+    setCommissionError(null);
+    setCommissionInvoice(null);
+    if (detail) setDetailDialogOpen(true);
+  }
+
   /** Confirma el pago de las comisiones listadas; si una falla, la conserva. */
   async function confirmCommissionPayment() {
-    if (!detail || commissionRows.length === 0) return;
+    if (!commissionInvoice || commissionRows.length === 0) return;
     setCommissionBusy(true);
     setCommissionError(null);
     let paidCount = 0;
     const failed: CommissionPayRow[] = [];
-    for (const row of commissionRows) {
-      const result = await payCommissionNowAction({
-        invoice_id: detail.invoice.id,
-        employee_id: row.employee_id,
-        amount: row.pending,
-        method_code: row.method_code,
-      });
-      if (result.success) {
-        paidCount += 1;
-      } else {
-        failed.push(row);
-        setCommissionError(`[${result.code}] ${result.message}`);
+    try {
+      for (const [index, row] of commissionRows.entries()) {
+        let result: Awaited<ReturnType<typeof payCommissionNowAction>>;
+        try {
+          result = await payCommissionNowAction({
+            invoice_id: commissionInvoice.id,
+            employee_id: row.employee_id,
+            amount: row.pending,
+            method_code: row.method_code,
+          });
+        } catch (error) {
+          // La acción lanzó (red/timeout): conserva esta fila y las siguientes
+          // para reintentar; el finally libera el botón.
+          failed.push(...commissionRows.slice(index));
+          setCommissionError(
+            error instanceof Error ? error.message : "No se pudo pagar la comisión.",
+          );
+          break;
+        }
+        if (result.success) {
+          paidCount += 1;
+        } else {
+          failed.push(row);
+          setCommissionError(`[${result.code}] ${result.message}`);
+        }
       }
+    } finally {
+      setCommissionBusy(false);
     }
-    setCommissionBusy(false);
     if (failed.length === 0) {
-      setCommissionOpen(false);
-      setCommissionRows([]);
+      closeCommission();
       setNotice(
         paidCount === 1
           ? "Comisión pagada desde la caja del turno."
@@ -2523,11 +2563,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
       <Dialog
         open={commissionOpen}
         onOpenChange={(open) => {
-          if (!open && !commissionBusy) {
-            setCommissionOpen(false);
-            setCommissionRows([]);
-            setCommissionError(null);
-          }
+          if (!open && !commissionBusy) closeCommission();
         }}
       >
         <DialogContent className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
@@ -2535,7 +2571,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
             <div className="border-b border-slate-200 px-6 py-4">
               <h2 className="text-lg font-bold">Pagar comisión al empleado</h2>
               <p className="text-sm text-slate-500">
-                {detail ? `Factura #${detail.invoice.consecutive_number}` : "Factura"} · el
+                {commissionInvoice ? `Factura #${commissionInvoice.number}` : "Factura"} · el
                 pago sale de la caja del turno abierto.
               </p>
             </div>
@@ -2577,6 +2613,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   )}
                 </div>
               ))}
+              <p className="rounded-md bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                Si eliges «Dejar para nómina», la comisión queda pendiente y se paga en la
+                nómina del período. No se pierde.
+              </p>
               {commissionError && (
                 <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
                   {commissionError}
@@ -2586,15 +2626,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
             <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-6 py-4">
               <button
                 type="button"
-                onClick={() => {
-                  setCommissionOpen(false);
-                  setCommissionRows([]);
-                  setCommissionError(null);
-                }}
+                onClick={closeCommission}
                 disabled={commissionBusy}
                 className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50"
               >
-                Cancelar
+                Dejar para nómina
               </button>
               <button
                 type="button"
