@@ -8,6 +8,7 @@ import {
   buildEmployeeDetail,
   calculatePayrollSchema,
   canDiscountVoucher,
+  capPayrollDiscounts,
   canReviewVoucher,
   checkVoucherCaps,
   checkVoucherEligibility,
@@ -510,7 +511,19 @@ export async function calculatePayroll(
       .gte("created_at", `${period.start_date}T00:00:00`)
       .lte("created_at", `${period.end_date}T23:59:59.999`)
       .limit(2000);
-    if (invoicesError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    if (invoicesError) {
+      console.error(
+        "[payroll] calculatePayroll: fallo al listar facturas:",
+        JSON.stringify({
+          periodId,
+          code: invoicesError.code,
+          message: invoicesError.message,
+          details: invoicesError.details,
+          hint: invoicesError.hint,
+        }),
+      );
+      throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
     const invoiceRows = (invoices ?? []) as Array<{ id: string; consecutive_number: number }>;
     const consecutiveByInvoice = new Map(invoiceRows.map((row) => [row.id, row.consecutive_number]));
 
@@ -526,7 +539,20 @@ export async function calculatePayroll(
           invoiceRows.map((row) => row.id),
         )
         .limit(5000);
-      if (itemsError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+      if (itemsError) {
+        console.error(
+          "[payroll] calculatePayroll: fallo al listar ítems de factura:",
+          JSON.stringify({
+            periodId,
+            invoices: invoiceRows.length,
+            code: itemsError.code,
+            message: itemsError.message,
+            details: itemsError.details,
+            hint: itemsError.hint,
+          }),
+        );
+        throw new PayrollError("INTERNAL", "Error interno.", 500);
+      }
       lines = (((items ?? []) as Array<{
         id: string;
         invoice_id: string;
@@ -591,7 +617,20 @@ export async function calculatePayroll(
           actives.map((employee) => employee.id),
         )
         .limit(5000);
-      if (rulesError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+      if (rulesError) {
+        console.error(
+          "[payroll] calculatePayroll: fallo al listar reglas de comisión:",
+          JSON.stringify({
+            periodId,
+            employees: actives.length,
+            code: rulesError.code,
+            message: rulesError.message,
+            details: rulesError.details,
+            hint: rulesError.hint,
+          }),
+        );
+        throw new PayrollError("INTERNAL", "Error interno.", 500);
+      }
       for (const rule of (rules ?? []) as Array<{
         employee_id: string;
         item_type: string;
@@ -617,7 +656,19 @@ export async function calculatePayroll(
       .gte("request_date", period.start_date)
       .lte("request_date", period.end_date)
       .limit(2000);
-    if (vouchersError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    if (vouchersError) {
+      console.error(
+        "[payroll] calculatePayroll: fallo al listar vales del periodo:",
+        JSON.stringify({
+          periodId,
+          code: vouchersError.code,
+          message: vouchersError.message,
+          details: vouchersError.details,
+          hint: vouchersError.hint,
+        }),
+      );
+      throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
     const voucherRows = (vouchers ?? []) as Array<{
       id: string;
       employee_id: string;
@@ -696,12 +747,22 @@ export async function calculatePayroll(
       const bonuses = roundMoney(adjustment?.bonuses ?? 0);
       const otherDiscounts = roundMoney(adjustment?.other_discounts ?? 0);
       const vales = valesByEmployee.get(employee.id)?.total ?? 0;
+      // El neto nunca queda negativo: si vales + otros supera el bruto, el
+      // descuento efectivo se topa al bruto para que el neto persistido (0)
+      // sea consistente con el CHECK de payroll_items
+      // (neto = bruto − vales − otros). El exceso se absorbe, no se arrastra
+      // como deuda; el recorte va primero a other_discounts y luego a vales.
+      const applied = capPayrollDiscounts({
+        gross: roundMoney(baseFixed + commissions + bonuses),
+        vales,
+        otherDiscounts,
+      });
       const net = computeNetPay({
         baseFixed,
         commissions,
         bonuses,
-        vales,
-        otherDiscounts,
+        vales: applied.vales,
+        otherDiscounts: applied.otherDiscounts,
       });
       return {
         period_id: period.id,
@@ -709,8 +770,8 @@ export async function calculatePayroll(
         base_fixed: baseFixed,
         commissions,
         bonuses,
-        deductions_vales: roundMoney(vales),
-        other_discounts: otherDiscounts,
+        deductions_vales: applied.vales,
+        other_discounts: applied.otherDiscounts,
         net_pay: net,
         detail_json: detail,
       };
@@ -720,7 +781,20 @@ export async function calculatePayroll(
       const { error: upsertError } = await db
         .from("payroll_items")
         .upsert(payload, { onConflict: "period_id,employee_id" });
-      if (upsertError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+      if (upsertError) {
+        console.error(
+          "[payroll] calculatePayroll: fallo al guardar ítems de nómina:",
+          JSON.stringify({
+            periodId,
+            items: payload.length,
+            code: upsertError.code,
+            message: upsertError.message,
+            details: upsertError.details,
+            hint: upsertError.hint,
+          }),
+        );
+        throw new PayrollError("INTERNAL", "Error interno.", 500);
+      }
     }
 
     // PAY-07: los vales descontados pasan a descontada (transición única;

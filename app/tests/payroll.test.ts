@@ -12,6 +12,7 @@ import {
   calculatePayrollSchema,
   canDiscountVoucher,
   canReviewVoucher,
+  capPayrollDiscounts,
   checkVoucherCaps,
   checkVoucherEligibility,
   computeLineCommission,
@@ -70,6 +71,81 @@ describe("payroll: neto = fijo + comisiones + bonos − vales − otros (PAY-02)
   it("recalcular con los mismos insumos reproduce el mismo neto", () => {
     const args = { baseFixed: 800000, commissions: 150000, bonuses: 50000, vales: 100000, otherDiscounts: 20000 };
     expect(computeNetPay(args)).toBe(computeNetPay({ ...args }));
+  });
+});
+
+// --------------------- descuento que supera el bruto (contradicción CHECK) ---
+
+describe("payroll: descuento mayor que el bruto es persistible (PAY-02)", () => {
+  /**
+   * Réplica del payload que arma calculatePayroll: gross = base + comisiones +
+   * bonos, descuentos topados al bruto y neto con la regla vigente.
+   */
+  function persist(args: {
+    baseFixed: number;
+    commissions: number;
+    bonuses?: number;
+    vales?: number;
+    otherDiscounts?: number;
+  }) {
+    const gross = (args.baseFixed ?? 0) + (args.commissions ?? 0) + (args.bonuses ?? 0);
+    const applied = capPayrollDiscounts({
+      gross,
+      vales: args.vales ?? 0,
+      otherDiscounts: args.otherDiscounts ?? 0,
+    });
+    const netPay = computeNetPay({
+      baseFixed: args.baseFixed,
+      commissions: args.commissions,
+      bonuses: args.bonuses,
+      vales: applied.vales,
+      otherDiscounts: applied.otherDiscounts,
+    });
+    return { gross, ...applied, netPay };
+  }
+
+  it("empleado porcentaje sin ventas con un vale que supera el bruto no revienta", () => {
+    // Caso alcanzable: base 0 + comisiones 0 (sin facturación) + vale 300000.
+    const row = persist({ baseFixed: 0, commissions: 0, vales: 300000 });
+    expect(row.netPay).toBe(0);
+    expect(row.vales).toBe(0);
+    expect(row.otherDiscounts).toBe(0);
+  });
+
+  it("el descuento persistido nunca excede el bruto (neto = bruto − descuentos)", () => {
+    const cases = [
+      { baseFixed: 0, commissions: 0, vales: 300000 },
+      { baseFixed: 100000, commissions: 0, vales: 300000 },
+      { baseFixed: 100000, commissions: 0, vales: 80000, otherDiscounts: 50000 },
+      { baseFixed: 800000, commissions: 150000, bonuses: 50000, vales: 100000, otherDiscounts: 20000 },
+    ];
+    for (const args of cases) {
+      const row = persist(args);
+      // Invariante del CHECK de payroll_items con tolerancia de centavo.
+      expect(Math.abs(row.netPay - (row.gross - row.vales - row.otherDiscounts))).toBeLessThan(0.01);
+      expect(row.netPay).toBeGreaterThanOrEqual(0);
+      expect(row.vales).toBeGreaterThanOrEqual(0);
+      expect(row.otherDiscounts).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it("el recorte prioriza recuperar el vale: baja first other_discounts y luego vales", () => {
+    // Bruto 100000; vales 80000 + otros 50000 = 130000. Se recorta otros a 20000.
+    const withBoth = persist({ baseFixed: 100000, commissions: 0, vales: 80000, otherDiscounts: 50000 });
+    expect(withBoth.vales).toBe(80000);
+    expect(withBoth.otherDiscounts).toBe(20000);
+    expect(withBoth.netPay).toBe(0);
+    // Vale solo por encima del bruto: queda parcialmente descontado (remanente).
+    const valeOnly = persist({ baseFixed: 100000, commissions: 0, vales: 300000 });
+    expect(valeOnly.vales).toBe(100000);
+    expect(valeOnly.netPay).toBe(0);
+  });
+
+  it("sin exceso no toca los montos (comportamiento preservado)", () => {
+    const row = persist({ baseFixed: 800000, commissions: 150000, bonuses: 50000, vales: 100000, otherDiscounts: 20000 });
+    expect(row.vales).toBe(100000);
+    expect(row.otherDiscounts).toBe(20000);
+    expect(row.netPay).toBe(880000);
   });
 });
 
@@ -171,16 +247,55 @@ describe("payroll: detalle de comisiones con la resolución compartida (PAY-02/P
     expect(buildEmployeeDetail(detail).commissions).toBe(0);
   });
 
-  it("porcentaje: subtotal × commission_percent (comportamiento preservado)", () => {
+  it("servicio: subtotal × commission_percent (comportamiento preservado)", () => {
     const detail = buildEmployeeCommissionDetail({
       employeeId: "emp-1",
       payoutMode: "nomina",
       payType: "porcentaje",
       commissionPercent: 10,
-      lines: [line()],
+      lines: [line({ item_type: "servicio", item_ref_id: "svc-1" })],
       rules: new Map(),
     });
     expect(detail[0].commission).toBe(10000);
+  });
+
+  it("producto con valor fijo: comisiona el valor del ítem (no el % plano)", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "porcentaje",
+      commissionPercent: 35,
+      lines: [line({ unit_price: 42000, line_subtotal: 42000, commission_value: 1000 })],
+      rules: new Map(),
+    });
+    expect(detail).toHaveLength(1);
+    expect(detail[0].commission).toBe(1000);
+  });
+
+  it("producto sin valor fijo no cae al % plano: sin detalle", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "porcentaje",
+      commissionPercent: 35,
+      lines: [line()],
+      rules: new Map(),
+    });
+    expect(detail).toHaveLength(0);
+    expect(buildEmployeeDetail(detail).commissions).toBe(0);
+  });
+
+  it("producto con valor fijo vendido por empleado fijo: comisiona (antes 0)", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "fijo",
+      commissionPercent: null,
+      lines: [line({ commission_value: 1000 })],
+      rules: new Map(),
+    });
+    expect(detail).toHaveLength(1);
+    expect(detail[0].commission).toBe(1000);
   });
 
   it("regla con monto fijo por unidad: se multiplica por la cantidad", () => {
@@ -219,6 +334,40 @@ describe("payroll: detalle de comisiones con la resolución compartida (PAY-02/P
       rules: new Map(),
     });
     expect(detail[0].commission).toBe(12000);
+  });
+
+  it("varias líneas del mismo empleado se SUMAN (producto 3000 + servicio 10000 = 13000)", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "porcentaje",
+      commissionPercent: 10,
+      lines: [
+        line({
+          item_id: "item-producto",
+          item_type: "producto",
+          item_ref_id: "prod-1",
+          qty: 3,
+          unit_price: 42000,
+          line_subtotal: 126000,
+          commission_value: 1000,
+        }),
+        line({
+          item_id: "item-servicio",
+          item_type: "servicio",
+          item_ref_id: "svc-1",
+          qty: 1,
+          unit_price: 100000,
+          line_subtotal: 100000,
+          commission_value: null,
+        }),
+      ],
+      rules: new Map(),
+    });
+    // Producto: 1000 × 3 = 3000. Servicio: 100000 × 10% = 10000.
+    const summed = buildEmployeeDetail(detail);
+    expect(summed.detail).toHaveLength(2);
+    expect(summed.commissions).toBe(13000);
   });
 
   it("no_aplica: sin detalle ni comisión", () => {

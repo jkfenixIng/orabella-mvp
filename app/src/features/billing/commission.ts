@@ -1,5 +1,5 @@
 import {
-  commissionRuleKey,
+  lineHasCommissionBasis,
   resolveEmployeeLineCommission,
   type RuleRate,
 } from "@/src/features/commissions/schemas";
@@ -17,16 +17,14 @@ import {
  *  1. Sin datos de empleado → null (no calculable).
  *  2. `no_commission` → 0 (nómina excluye la línea antes de comisionar).
  *  3. `payout_mode === "no_aplica"` → 0 (nómina no arma detalle).
- *  4. La línea solo entra al detalle si el empleado tiene porcentaje plano
- *     (pay_type "porcentaje"/"mixto") o una regla ítem×empleado activa. Sin
- *     ninguno de los dos → 0. Replica el filtro de
- *     `buildEmployeeCommissionDetail` y evita que un ítem `custom` con
- *     `commission_value` comisione en un empleado sin porcentaje ni regla
- *     (nómina lo descarta).
+ *  4. La línea solo entra al detalle si tiene base de comisión (ver
+ *     `lineHasCommissionBasis`): valor fijo del ítem, porcentaje plano del
+ *     empleado o regla ítem×empleado activa. Sin ninguna → 0. Replica el filtro
+ *     de `buildEmployeeCommissionDetail`.
  *
- * La resolución compartida aplica, en este orden: valor fijo del ítem `custom`
- * (si lo trae), regla ítem×empleado (gana al porcentaje plano) o porcentaje
- * plano del empleado.
+ * La resolución compartida aplica, en este orden: comisión por VALOR FIJO del
+ * ítem (productos siempre; personalizados con valor), regla ítem×empleado o
+ * porcentaje plano del empleado (servicios y personalizados sin valor).
  */
 export interface InvoiceItemCommissionInput {
   itemType: string;
@@ -64,21 +62,30 @@ export function computeInvoiceItemCommission(
     employee.payType === "porcentaje" || employee.payType === "mixto"
       ? Number(employee.commissionPercent ?? 0)
       : null;
-  const hasRule =
-    input.itemRefId != null &&
-    input.rules.has(commissionRuleKey(input.itemType, input.itemRefId));
-  // Sin porcentaje plano ni regla la línea no entra al detalle de nómina: 0.
-  if (flatPercent === null && !hasRule) return 0;
+  // Nómina normaliza `commission_value` con chequeo de veracidad (payroll/
+  // service.ts: `row.commission_value ? Number(...) : null`): un 0 no es valor
+  // fijo. Se replica el mismo criterio.
+  const commissionValue = input.commissionValue ? Number(input.commissionValue) : null;
+  // Sin base de comisión (valor fijo del ítem, porcentaje plano o regla) la
+  // línea no entra al detalle de nómina: 0.
+  if (
+    !lineHasCommissionBasis({
+      itemType: input.itemType,
+      itemRefId: input.itemRefId,
+      commissionValue,
+      rules: input.rules,
+      flatPercent,
+    })
+  ) {
+    return 0;
+  }
 
   return resolveEmployeeLineCommission({
     itemType: input.itemType,
     itemRefId: input.itemRefId,
     subtotal: input.subtotal,
     qty: input.qty,
-    // Nómina normaliza `commission_value` con chequeo de veracidad (payroll/
-    // service.ts: `row.commission_value ? Number(...) : null`): un 0 no es
-    // valor fijo y cae al porcentaje/regla. Se replica el mismo criterio.
-    commissionValue: input.commissionValue ? Number(input.commissionValue) : null,
+    commissionValue,
     rules: input.rules,
     flatPercent,
   });

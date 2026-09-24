@@ -2,7 +2,7 @@ import { z } from "zod";
 import { moneyEquals, roundMoney } from "@/src/features/billing/schemas";
 import { cashOutLimitViolation } from "@/src/features/cash/schemas";
 import {
-  commissionRuleKey,
+  lineHasCommissionBasis,
   resolveEmployeeLineCommission,
   type RuleRate,
 } from "@/src/features/commissions/schemas";
@@ -157,6 +157,32 @@ export function computeNetPay(args: {
 }
 
 /**
+ * PAY-02: topa el descuento efectivo al bruto para que el neto persistido
+ * (que nunca queda negativo) sea consistente con el CHECK de payroll_items
+ * (neto = bruto − vales − otros). El exceso de descuento se absorbe, no se
+ * arrastra como deuda: por eso el descuento efectivo no puede superar el
+ * bruto. El recorte se aplica primero a other_discounts (descuentos manuales)
+ * y solo después a vales, para priorizar la recuperación del vale ya
+ * desembolsado; un vale queda parcialmente descontado únicamente cuando por
+ * sí solo supera el bruto.
+ */
+export function capPayrollDiscounts(args: {
+  gross: number;
+  vales: number;
+  otherDiscounts: number;
+}): { vales: number; otherDiscounts: number } {
+  const gross = roundMoney(Math.max(0, args.gross));
+  const vales = roundMoney(Math.max(0, args.vales));
+  const others = roundMoney(Math.max(0, args.otherDiscounts));
+  if (roundMoney(vales + others) <= gross) {
+    return { vales, otherDiscounts: others };
+  }
+  const valesCapped = roundMoney(Math.min(vales, gross));
+  const othersCapped = roundMoney(Math.max(0, Math.min(others, roundMoney(gross - vales))));
+  return { vales: valesCapped, otherDiscounts: othersCapped };
+}
+
+/**
  * PAY-02/PAY-03: comisión de una línea = subtotal × porcentaje / 100.
  * Solo aplica a porcentaje/mixto; el fijo la ignora (comisión 0).
  */
@@ -196,21 +222,18 @@ export interface PayrollCommissionLine {
   item_ref_id: string | null;
 }
 
-/** Una línea entra al detalle si el empleado tiene % plano o si tiene regla. */
-function lineHasActiveRule(line: PayrollCommissionLine, rules: Map<string, RuleRate>): boolean {
-  return line.item_ref_id != null && rules.has(commissionRuleKey(line.item_type, line.item_ref_id));
-}
-
 /**
  * PAY-02/PAY-03: arma el detalle por línea de un empleado con la MISMA
- * resolución que el pago inmediato (`resolveEmployeeLineCommission`): la regla
- * ítem×empleado gana sobre el porcentaje plano. Así un `pay_type = "fijo"` con
- * regla sí genera comisión (antes nómina la ignoraba).
+ * resolución que el pago inmediato (`resolveEmployeeLineCommission`). Una línea
+ * entra si tiene base de comisión (`lineHasCommissionBasis`): valor fijo del
+ * ítem, porcentaje plano del empleado o regla ítem×empleado activa. La regla
+ * gana sobre el porcentaje plano; el valor fijo del ítem manda sobre ambos.
  *
  * Preserva la semántica histórica:
  *  - `payout_mode = "no_aplica"` → sin comisión (detalle vacío).
- *  - `pay_type` fijo sin reglas → sin detalle (comisión 0).
- *  - El valor fijo de ítems `custom` se respeta tal cual.
+ *  - `pay_type` fijo sin reglas ni valor fijo → sin detalle (comisión 0).
+ *  - El valor fijo de ítems `custom` y `producto` es POR UNIDAD: se multiplica
+ *    por la cantidad de la línea.
  * Puro para probarlo sin base de datos.
  */
 export function buildEmployeeCommissionDetail(args: {
@@ -227,7 +250,15 @@ export function buildEmployeeCommissionDetail(args: {
       ? Number(args.commissionPercent ?? 0)
       : null;
   return args.lines
-    .filter((line) => flatPercent !== null || lineHasActiveRule(line, args.rules))
+    .filter((line) =>
+      lineHasCommissionBasis({
+        itemType: line.item_type,
+        itemRefId: line.item_ref_id,
+        commissionValue: line.commission_value,
+        rules: args.rules,
+        flatPercent,
+      }),
+    )
     .map((line) => ({
       employee_id: args.employeeId,
       invoice_id: line.invoice_id,

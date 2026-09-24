@@ -177,7 +177,7 @@ export async function earnedCommissionFor(
 
   const { data: lines, error: linesError } = await db
     .from("invoice_items")
-    .select("item_type, product_id, service_id, qty, unit_price, subtotal, no_commission")
+    .select("item_type, product_id, service_id, qty, unit_price, subtotal, no_commission, commission_value")
     .eq("invoice_id", invoiceId)
     .eq("employee_id", employeeId);
   if (linesError) throw new CommissionError("INTERNAL", "Error interno.", 500);
@@ -189,6 +189,7 @@ export async function earnedCommissionFor(
     unit_price: number | string;
     subtotal: number | string;
     no_commission: boolean | null;
+    commission_value: number | string | null;
   }>).filter((line) => !line.no_commission);
 
   const { data: rules, error: rulesError } = await db
@@ -238,9 +239,10 @@ export async function earnedCommissionFor(
           itemRefId: refId ?? null,
           subtotal,
           qty: Number(line.qty),
-          // El pago inmediato no consulta el valor fijo de ítems custom: se
-          // mantiene su comportamiento observable (null = sin override).
-          commissionValue: null,
+          // El valor fijo del ítem (producto o `custom`) es la comisión: mismo
+          // insumo que nómina y detalle. Un 0 no es valor fijo (se normaliza a
+          // null, igual que en payroll/billing).
+          commissionValue: line.commission_value ? Number(line.commission_value) : null,
           rules: ruleByItem,
           flatPercent,
         }),

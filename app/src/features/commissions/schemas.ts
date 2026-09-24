@@ -90,13 +90,69 @@ export function commissionRuleKey(itemType: string, itemId: string): string {
 }
 
 /**
- * Resolución POR LÍNEA compartida por el pago inmediato y la nómina (una sola
- * fuente de verdad). Dada una línea y el contexto del empleado:
- *  - Regla ítem×empleado activa → la regla gana (% sobre el subtotal + fijo
- *    por unidad), sin importar el porcentaje plano.
- *  - Sin regla → porcentaje plano del empleado (null = 0).
- * El valor fijo de un ítem `custom` se respeta tal cual cuando lo trae la
- * línea (la nómina lo persiste así; el pago inmediato no consulta ese campo).
+ * true cuando la comisión de la línea es por VALOR FIJO del ítem: productos y
+ * personalizados con `commission_value` (> 0). El 0 no es comisión fija: la
+ * nómina y el detalle normalizan `commission_value ? … : null`.
+ * Puro para probarlo sin base de datos.
+ */
+export function hasFixedItemCommission(
+  itemType: string,
+  commissionValue: number | null | undefined,
+): boolean {
+  return (
+    (itemType === "producto" || itemType === "custom") &&
+    commissionValue != null &&
+    commissionValue > 0
+  );
+}
+
+/**
+ * ¿La línea entra al detalle de comisión del empleado? Compartido por la nómina
+ * (`buildEmployeeCommissionDetail`) y el detalle de factura
+ * (`computeInvoiceItemCommission`) para que coincidan línea a línea:
+ *  - `producto`: valor fijo del ítem o regla ítem×empleado activa. El
+ *    porcentaje plano del empleado NUNCA comisiona un producto.
+ *  - `custom`: valor fijo del ítem, o porcentaje plano si la línea no trae valor
+ *    (un `custom` no tiene ítem de catálogo y por tanto no tiene regla).
+ *  - `servicio`: porcentaje plano o regla ítem×empleado activa.
+ * Puro para probarlo sin base de datos.
+ */
+export function lineHasCommissionBasis(args: {
+  itemType: string;
+  itemRefId: string | null;
+  commissionValue: number | null | undefined;
+  rules: Map<string, RuleRate>;
+  flatPercent: number | null;
+}): boolean {
+  if (args.itemType === "producto") {
+    return (
+      hasFixedItemCommission("producto", args.commissionValue) ||
+      (args.itemRefId != null && args.rules.has(commissionRuleKey("producto", args.itemRefId)))
+    );
+  }
+  if (args.itemType === "custom") {
+    return hasFixedItemCommission("custom", args.commissionValue) || args.flatPercent !== null;
+  }
+  return (
+    args.flatPercent !== null ||
+    (args.itemRefId != null && args.rules.has(commissionRuleKey(args.itemType, args.itemRefId)))
+  );
+}
+
+/**
+ * Resolución POR LÍNEA compartida por el pago inmediato, la nómina y el detalle
+ * de factura (una sola fuente de verdad). Comisión y porcentaje son conceptos
+ * mutuamente excluyentes:
+ *  - `producto`: comisión = VALOR FIJO del ítem (`commission_value`) × cantidad.
+ *    El valor del ítem manda; sin valor aplica una regla ítem×empleado activa;
+ *    NUNCA el porcentaje plano del empleado.
+ *  - `custom` con `commission_value`: comisión = valor fijo del ítem × cantidad.
+ *  - `custom` sin `commission_value` y `servicio`: porcentaje del empleado; una
+ *    regla ítem×empleado activa gana sobre el porcentaje plano (% sobre el
+ *    subtotal + fijo por unidad).
+ * El valor fijo es POR UNIDAD: se multiplica por `qty` (igual que el fijo de una
+ * regla). El subtotal ya trae la cantidad y no se usa en esta rama, así que no
+ * hay doble multiplicación.
  * Puro para probarlo sin base de datos.
  */
 export function resolveEmployeeLineCommission(args: {
@@ -105,18 +161,34 @@ export function resolveEmployeeLineCommission(args: {
   itemRefId: string | null;
   subtotal: number;
   qty: number;
-  /** Valor fijo de comisión del ítem `custom`, si la línea lo trae. */
+  /** Valor fijo de comisión del ítem (producto o `custom`), si la línea lo trae. */
   commissionValue?: number | null;
   rules: Map<string, RuleRate>;
   flatPercent: number | null;
 }): number {
-  if (args.itemType === "custom" && args.commissionValue != null) {
-    return roundMoney(args.commissionValue);
-  }
   const rule =
     args.itemRefId != null
       ? args.rules.get(commissionRuleKey(args.itemType, args.itemRefId)) ?? null
       : null;
+
+  // Producto: comisión por valor fijo del ítem × cantidad. El valor del ítem
+  // manda; sin valor cae a la regla ítem×empleado (nunca al porcentaje plano).
+  if (args.itemType === "producto") {
+    if (args.commissionValue) return roundMoney(args.commissionValue * Math.floor(args.qty));
+    return rule
+      ? resolveLineCommission({
+          subtotal: args.subtotal,
+          qty: Math.floor(args.qty),
+          rule,
+          flatPercent: null,
+        })
+      : 0;
+  }
+  // Personalizado con valor fijo: manda el valor del ítem × cantidad.
+  if (args.itemType === "custom" && args.commissionValue) {
+    return roundMoney(args.commissionValue * Math.floor(args.qty));
+  }
+  // Servicio y personalizado sin valor: porcentaje del empleado (la regla gana).
   return resolveLineCommission({
     subtotal: args.subtotal,
     qty: Math.floor(args.qty),

@@ -69,14 +69,14 @@ describe("commissions: cálculo puro", () => {
 });
 
 describe("commissions: resolución compartida por línea (pago inmediato ≡ nómina)", () => {
-  it("regla ítem×empleado gana sobre el porcentaje plano", () => {
+  it("regla ítem×empleado gana sobre el porcentaje plano (servicio)", () => {
     const rules = new Map<string, RuleRate>([
-      [commissionRuleKey("producto", "prod-1"), { percent: 10, amount: null }],
+      [commissionRuleKey("servicio", "svc-1"), { percent: 10, amount: null }],
     ]);
     expect(
       resolveEmployeeLineCommission({
-        itemType: "producto",
-        itemRefId: "prod-1",
+        itemType: "servicio",
+        itemRefId: "svc-1",
         subtotal: 100000,
         qty: 1,
         rules,
@@ -85,12 +85,12 @@ describe("commissions: resolución compartida por línea (pago inmediato ≡ nó
     ).toBe(10000);
   });
 
-  it("sin regla rige el porcentaje plano; null = 0", () => {
+  it("sin regla rige el porcentaje plano; null = 0 (servicio)", () => {
     const rules = new Map<string, RuleRate>();
     expect(
       resolveEmployeeLineCommission({
-        itemType: "producto",
-        itemRefId: "prod-1",
+        itemType: "servicio",
+        itemRefId: "svc-1",
         subtotal: 100000,
         qty: 1,
         rules,
@@ -99,8 +99,8 @@ describe("commissions: resolución compartida por línea (pago inmediato ≡ nó
     ).toBe(10000);
     expect(
       resolveEmployeeLineCommission({
-        itemType: "producto",
-        itemRefId: "prod-1",
+        itemType: "servicio",
+        itemRefId: "svc-1",
         subtotal: 100000,
         qty: 1,
         rules,
@@ -125,7 +125,7 @@ describe("commissions: resolución compartida por línea (pago inmediato ≡ nó
     ).toBe(15000);
   });
 
-  it("ítem custom con valor fijo: manda el valor del ítem", () => {
+  it("ítem custom con valor fijo: manda el valor del ítem × cantidad", () => {
     expect(
       resolveEmployeeLineCommission({
         itemType: "custom",
@@ -136,7 +136,7 @@ describe("commissions: resolución compartida por línea (pago inmediato ≡ nó
         rules: new Map(),
         flatPercent: 20,
       }),
-    ).toBe(12000);
+    ).toBe(24000);
   });
 
   it("paridad: la resolución compartida usa la misma fórmula del pago inmediato", () => {
@@ -154,5 +154,205 @@ describe("commissions: resolución compartida por línea (pago inmediato ≡ nó
     expect(shared).toBe(resolveLineCommission(args));
     // 250000 × 8% = 20000 + 1000 × 2 = 22000.
     expect(shared).toBe(22000);
+  });
+});
+
+describe("commissions: comisión y porcentaje son excluyentes (producto = valor del ítem)", () => {
+  const rules = new Map<string, RuleRate>();
+
+  it("producto con commission_value usa el valor del ítem, no el % del empleado", () => {
+    // Caso del bug reportado: Tinte rubio commission_value=1000, empleado 35%,
+    // subtotal 42.000. Antes mostraba el 35% (~14.700); debe ser 1.000.
+    expect(
+      resolveEmployeeLineCommission({
+        itemType: "producto",
+        itemRefId: "prod-tinte",
+        subtotal: 42000,
+        qty: 1,
+        commissionValue: 1000,
+        rules,
+        flatPercent: 35,
+      }),
+    ).toBe(1000);
+  });
+
+  it("producto sin commission_value (null o 0) no cae al porcentaje: 0", () => {
+    expect(
+      resolveEmployeeLineCommission({
+        itemType: "producto",
+        itemRefId: "prod-1",
+        subtotal: 100000,
+        qty: 1,
+        commissionValue: null,
+        rules,
+        flatPercent: 35,
+      }),
+    ).toBe(0);
+    expect(
+      resolveEmployeeLineCommission({
+        itemType: "producto",
+        itemRefId: "prod-1",
+        subtotal: 100000,
+        qty: 1,
+        commissionValue: 0,
+        rules,
+        flatPercent: 35,
+      }),
+    ).toBe(0);
+  });
+
+  it("producto sin valor con regla ítem×empleado: la regla aplica (nunca el % plano)", () => {
+    const withRule = new Map<string, RuleRate>([
+      [commissionRuleKey("producto", "prod-1"), { percent: 10, amount: null }],
+    ]);
+    // Sin valor del ítem cae a la regla (otra capa), no al 35% del empleado.
+    expect(
+      resolveEmployeeLineCommission({
+        itemType: "producto",
+        itemRefId: "prod-1",
+        subtotal: 100000,
+        qty: 1,
+        commissionValue: null,
+        rules: withRule,
+        flatPercent: 35,
+      }),
+    ).toBe(10000);
+    // Con valor del ítem, el valor manda sobre la regla.
+    expect(
+      resolveEmployeeLineCommission({
+        itemType: "producto",
+        itemRefId: "prod-1",
+        subtotal: 100000,
+        qty: 1,
+        commissionValue: 1000,
+        rules: withRule,
+        flatPercent: 35,
+      }),
+    ).toBe(1000);
+  });
+
+  it("servicio sigue el % del empleado sobre el subtotal", () => {
+    expect(
+      resolveEmployeeLineCommission({
+        itemType: "servicio",
+        itemRefId: "svc-1",
+        subtotal: 42000,
+        qty: 1,
+        rules,
+        flatPercent: 35,
+      }),
+    ).toBe(14700);
+  });
+
+  it("custom: con valor fijo manda el ítem; sin valor rige el % del empleado", () => {
+    expect(
+      resolveEmployeeLineCommission({
+        itemType: "custom",
+        itemRefId: null,
+        subtotal: 42000,
+        qty: 1,
+        commissionValue: 12000,
+        rules,
+        flatPercent: 35,
+      }),
+    ).toBe(12000);
+    expect(
+      resolveEmployeeLineCommission({
+        itemType: "custom",
+        itemRefId: null,
+        subtotal: 42000,
+        qty: 1,
+        commissionValue: null,
+        rules,
+        flatPercent: 35,
+      }),
+    ).toBe(14700);
+  });
+});
+
+describe("commissions: el valor fijo es por unidad y se multiplica por la cantidad", () => {
+  const rules = new Map<string, RuleRate>();
+
+  it("producto commission_value=1000 con qty=3 paga 3000", () => {
+    expect(
+      resolveEmployeeLineCommission({
+        itemType: "producto",
+        itemRefId: "prod-tinte",
+        subtotal: 126000,
+        qty: 3,
+        commissionValue: 1000,
+        rules,
+        flatPercent: 35,
+      }),
+    ).toBe(3000);
+  });
+
+  it("custom commission_value=5000 con qty=2 paga 10000 (cambio de gasto)", () => {
+    expect(
+      resolveEmployeeLineCommission({
+        itemType: "custom",
+        itemRefId: null,
+        subtotal: 100000,
+        qty: 2,
+        commissionValue: 5000,
+        rules,
+        flatPercent: 20,
+      }),
+    ).toBe(10000);
+  });
+
+  it("no hay doble multiplicación: el fijo ignora el subtotal (que ya trae la cantidad)", () => {
+    // subtotal = unit_price × qty; el fijo se multiplica por qty una sola vez.
+    const qty = 3;
+    const unitPrice = 42000;
+    expect(
+      resolveEmployeeLineCommission({
+        itemType: "producto",
+        itemRefId: "prod-1",
+        subtotal: unitPrice * qty,
+        qty,
+        commissionValue: 1000,
+        rules,
+        flatPercent: 35,
+      }),
+    ).toBe(3000);
+  });
+
+  it("qty=1 conserva el valor del ítem (no rompe lo que ya funcionaba)", () => {
+    expect(
+      resolveEmployeeLineCommission({
+        itemType: "producto",
+        itemRefId: "prod-1",
+        subtotal: 42000,
+        qty: 1,
+        commissionValue: 1000,
+        rules,
+        flatPercent: 35,
+      }),
+    ).toBe(1000);
+    expect(
+      resolveEmployeeLineCommission({
+        itemType: "custom",
+        itemRefId: null,
+        subtotal: 42000,
+        qty: 1,
+        commissionValue: 5000,
+        rules,
+        flatPercent: 35,
+      }),
+    ).toBe(5000);
+  });
+
+  it("servicio con subtotal 100000 y empleado 10% paga 10000", () => {
+    expect(
+      resolveEmployeeLineCommission({
+        itemType: "servicio",
+        itemRefId: "svc-1",
+        subtotal: 100000,
+        qty: 1,
+        rules,
+        flatPercent: 10,
+      }),
+    ).toBe(10000);
   });
 });
