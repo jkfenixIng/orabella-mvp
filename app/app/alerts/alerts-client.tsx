@@ -8,16 +8,18 @@ import {
 } from "@/src/features/alerts/actions";
 import type { AlertRow, AlertsResult } from "@/src/features/alerts/service";
 import { cn } from "@/src/components/ui/lib/utils";
+import {
+  errorClass,
+  ghostClass,
+  inputClass,
+  labelClass,
+  mutedTextClass,
+  sectionClass,
+} from "@/src/shared/lib/ui-styles";
 
-const sectionClass = cn(
-  "rounded-lg border border-border-color bg-surface p-4 shadow-sm",
-  "dark:border-border-color-2",
-);
-const ghostClass = cn(
-  "inline-flex items-center justify-center gap-2 rounded-md border border-border-color bg-transparent px-4 py-2 text-sm font-medium text-text-primary shadow-sm transition-all duration-200 hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
-  "dark:border-border-color-2 dark:hover:bg-surface-hover",
-);
-const errorClass = cn("text-sm text-error", "dark:text-error");
+// Separador de la lista de alertas: no es tabla, pero comparte los tokens
+// de borde del estándar.
+const alertItemClass = cn("border-t border-border-color pt-2", "dark:border-border-color-2");
 
 type ActionResult<T> =
   | { success: true; data: T }
@@ -151,7 +153,7 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
 
       <section className={sectionClass} aria-busy={isViewPending}>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="text-sm text-slate-600 dark:text-slate-300">Estado:</span>
+          <span className={mutedTextClass}>Estado:</span>
           <button
             type="button"
             className={ghostClass}
@@ -170,7 +172,7 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
           >
             Sin leer
           </button>
-          <span className="ml-2 text-sm text-slate-600 dark:text-slate-300">Módulo:</span>
+          <span className={cn("ml-2", mutedTextClass)}>Módulo:</span>
           <button
             type="button"
             className={ghostClass}
@@ -206,8 +208,8 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
               key={alert.id}
               className={
                 alert.is_read
-                  ? "border-t border-slate-200 pt-2 dark:border-slate-700"
-                  : "border-t border-slate-200 pt-2 font-medium dark:border-slate-700"
+                  ? alertItemClass
+                  : cn(alertItemClass, "font-medium")
               }
             >
               <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -229,11 +231,11 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
                   </button>
                 )}
               </div>
-              <p className="mt-1 text-slate-600 dark:text-slate-300">
+              <p className={cn("mt-1", mutedTextClass)}>
                 {alert.user_name ?? "Usuario no registrado"}
               </p>
               {alert.is_read ? (
-                <p className="mt-1 text-slate-600 dark:text-slate-300">
+                <p className={cn("mt-1", mutedTextClass)}>
                   Revisada{alert.reviewed_by_name ? ` por ${alert.reviewed_by_name}` : ""}
                   {alert.review_note ? `: «${alert.review_note}»` : ""}.
                 </p>
@@ -246,10 +248,10 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
                       void handleMarkRead(alert.id);
                     }}
                   >
-                    <label className="flex flex-col gap-1 text-sm">
+                    <label className={labelClass}>
                       Justificación (queda en la traza)
                       <textarea
-                        className="rounded-md border border-border-color bg-surface px-3 py-2 text-sm dark:border-border-color-2"
+                        className={inputClass}
                         value={reviewNote}
                         onChange={(event) => setReviewNote(event.target.value)}
                         placeholder="Qué pasó y qué se habló"
@@ -277,7 +279,7 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
             </li>
           ))}
           {result.alerts.length === 0 && (
-            <li className="text-slate-600 dark:text-slate-300">Sin alertas.</li>
+            <li className={mutedTextClass}>Sin alertas.</li>
           )}
         </ul>
 
@@ -291,7 +293,7 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
             >
               Anterior
             </button>
-            <span className="text-slate-600 dark:text-slate-300">
+            <span className={mutedTextClass}>
               Página {result.page} de {pageCount} ({result.total} alertas)
             </span>
             <button

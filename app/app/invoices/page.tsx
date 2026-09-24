@@ -30,7 +30,7 @@ export default async function InvoicesPage() {
     return (
       <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-4 px-6 py-12">
         <h1 className="text-2xl font-bold">Facturación</h1>
-        <p role="alert" className="text-sm text-red-600 dark:text-red-400">
+        <p role="alert" className="text-sm text-error dark:text-error">
           El usuario no tiene sede asignada.
         </p>
       </main>
@@ -61,7 +61,7 @@ export default async function InvoicesPage() {
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold">Facturación</h1>
-          <p className="mt-2 text-slate-600 dark:text-slate-300">
+          <p className="mt-2 text-text-secondary">
             Facturas, impuestos y cobros.
           </p>
         </div>

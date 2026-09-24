@@ -15,7 +15,7 @@ export default function LoginLoading() {
         <Skeleton className="h-4 w-64" />
       </div>
       <div role="status" className="flex flex-col gap-3">
-        <span className="text-sm text-slate-500 dark:text-slate-400">Cargando…</span>
+        <span className="text-sm text-text-secondary">Cargando…</span>
         <Skeleton className="h-10 w-full" />
         <Skeleton className="h-10 w-full" />
         <Skeleton className="h-10 w-full" />

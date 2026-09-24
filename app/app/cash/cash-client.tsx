@@ -28,26 +28,24 @@ import {
 import { cn } from "@/src/components/ui/lib/utils";
 import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 import { HISTORY_PAGE_SIZE } from "@/src/features/cash/schemas";
+import {
+  buttonClass,
+  errorClass,
+  ghostClass,
+  inputClass,
+  labelClass,
+  mutedTextClass,
+  okClass,
+  sectionClass,
+  tableCellClass,
+  tableHeaderClass,
+  tableRowClass,
+} from "@/src/shared/lib/ui-styles";
 import { ArrowLeftRight, Banknote, Coins, CreditCard, Wallet, Zap } from "lucide-react";
 
-const sectionClass = cn(
-  "rounded-lg border border-border-color bg-surface p-4 shadow-sm",
-  "dark:border-border-color-2",
-);
-const labelClass = cn("flex flex-col gap-1 text-sm text-text-primary");
-const inputClass = cn(
-  "rounded-md border border-border-color bg-surface px-3 py-2 text-sm text-text-primary shadow-sm",
-  "dark:border-border-color-2",
-);
-const buttonClass = cn(
-  "inline-flex items-center justify-center gap-2 rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-all duration-200 hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
-);
-const ghostClass = cn(
-  "inline-flex items-center justify-center gap-2 rounded-md border border-border-color bg-transparent px-4 py-2 text-sm font-medium text-text-primary shadow-sm transition-all duration-200 hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
-  "dark:border-border-color-2 dark:hover:bg-surface-hover",
-);
-const errorClass = cn("text-sm text-error", "dark:text-error");
-const okClass = cn("text-sm text-success", "dark:text-success");
+// Celdas de la tabla de turnos: la base compartida más el no-wrap que
+// necesitan las columnas estrechas (fechas, montos y estados).
+const shiftCellClass = cn(tableCellClass, "whitespace-nowrap");
 
 type ActionResult<T> =
   | { success: true; data: T }
@@ -74,32 +72,32 @@ function ShiftsTable({
   return (
     <>
       <div className="mt-3 overflow-x-auto">
-        <table className="min-w-full text-sm">
+        <table className={cn("w-full text-left text-sm", "min-w-[1100px]")}>
           <thead>
-              <tr className="text-left text-slate-600 dark:text-slate-300">
-                <th className="whitespace-nowrap py-1 pr-3">Apertura</th>
-                <th className="whitespace-nowrap py-1 pr-3">Estado</th>
-                <th className="whitespace-nowrap py-1 pr-3">Abrió</th>
-                <th className="whitespace-nowrap py-1 pr-3">Cerró</th>
-                <th className="whitespace-nowrap py-1 pr-3">Base inicial</th>
+              <tr className={tableHeaderClass}>
+                <th className={shiftCellClass} scope="col">Apertura</th>
+                <th className={shiftCellClass} scope="col">Estado</th>
+                <th className={shiftCellClass} scope="col">Abrió</th>
+                <th className={shiftCellClass} scope="col">Cerró</th>
+                <th className={shiftCellClass} scope="col">Base inicial</th>
               {isAdmin && (
                 <>
-                  <th className="whitespace-nowrap py-1 pr-3">Ventas</th>
-                  <th className="whitespace-nowrap py-1 pr-3">Efectivo</th>
+                  <th className={shiftCellClass} scope="col">Ventas</th>
+                  <th className={shiftCellClass} scope="col">Efectivo</th>
                   {methodCols.map((method) => (
-                    <th key={method.id} className="whitespace-nowrap py-1 pr-3">
+                    <th key={method.id} className={shiftCellClass} scope="col">
                       {method.name}
                     </th>
                   ))}
                 </>
               )}
-              <th className="whitespace-nowrap py-1 pr-3">Vales</th>
-              <th className="whitespace-nowrap py-1 pr-3">Base final</th>
+              <th className={shiftCellClass} scope="col">Vales</th>
+              <th className={shiftCellClass} scope="col">Base final</th>
               {isAdmin && (
                 <>
-                  <th className="whitespace-nowrap py-1 pr-3">Diferencia</th>
-                  <th className="whitespace-nowrap py-1 pr-3">Revisada</th>
-                  <th className="whitespace-nowrap py-1 pr-3">Justificación</th>
+                  <th className={shiftCellClass} scope="col">Diferencia</th>
+                  <th className={shiftCellClass} scope="col">Revisada</th>
+                  <th className={shiftCellClass} scope="col">Justificación</th>
                 </>
               )}
             </tr>
@@ -108,51 +106,51 @@ function ShiftsTable({
             {shifts.map((view) => {
               const isClosed = view.shift.status === "cerrado";
               return (
-                <tr key={view.shift.id} className="border-t border-slate-200 dark:border-slate-700">
-                  <td className="whitespace-nowrap py-1 pr-3">{formatDateTime(view.shift.opened_at)}</td>
-                  <td className="whitespace-nowrap py-1 pr-3">{view.shift.status}</td>
+                <tr key={view.shift.id} className={tableRowClass}>
+                  <td className={shiftCellClass}>{formatDateTime(view.shift.opened_at)}</td>
+                  <td className={shiftCellClass}>{view.shift.status}</td>
                   <td
-                    className="max-w-48 truncate whitespace-nowrap py-1 pr-3"
+                    className={cn(shiftCellClass, "max-w-48 truncate")}
                     title={view.abierto_por ?? undefined}
                   >
                     {view.abierto_por ?? "—"}
                   </td>
                   <td
-                    className="max-w-48 truncate whitespace-nowrap py-1 pr-3"
+                    className={cn(shiftCellClass, "max-w-48 truncate")}
                     title={view.cerrado_por ?? undefined}
                   >
                     {view.cerrado_por ?? "—"}
                   </td>
-                  <td className="whitespace-nowrap py-1 pr-3">{formatMoney(view.shift.opening_base)}</td>
+                  <td className={shiftCellClass}>{formatMoney(view.shift.opening_base)}</td>
                   {isAdmin && (
                     <>
-                      <td className="whitespace-nowrap py-1 pr-3">{formatMoney(view.ventas)}</td>
-                      <td className="whitespace-nowrap py-1 pr-3">{formatMoney(view.efectivo)}</td>
+                      <td className={shiftCellClass}>{formatMoney(view.ventas)}</td>
+                      <td className={shiftCellClass}>{formatMoney(view.efectivo)}</td>
                       {methodCols.map((method) => {
                         const cobrado = view.metodos.find(
                           (m) => m.method_code === method.code,
                         )?.amount ?? 0;
                         return (
-                          <td key={method.id} className="whitespace-nowrap py-1 pr-3">
+                          <td key={method.id} className={shiftCellClass}>
                             {formatMoney(cobrado)}
                           </td>
                         );
                       })}
                     </>
                   )}
-                  <td className="whitespace-nowrap py-1 pr-3">{formatMoney(view.vales)}</td>
-                  <td className="whitespace-nowrap py-1 pr-3">
+                  <td className={shiftCellClass}>{formatMoney(view.vales)}</td>
+                  <td className={shiftCellClass}>
                     {isClosed ? formatMoney(view.shift.base_left) : "—"}
                   </td>
                   {isAdmin && (
                     <>
-                      <td className="whitespace-nowrap py-1 pr-3">
+                      <td className={shiftCellClass}>
                         {!isClosed ? "—" : view.revision ? "Sí" : "No"}
                       </td>
-                      <td className="whitespace-nowrap py-1 pr-3">
+                      <td className={shiftCellClass}>
                         {!view.revision ? "N/A" : view.revision.revisada ? "Sí" : "No"}
                       </td>
-                      <td className="whitespace-nowrap py-1 pr-3">
+                      <td className={shiftCellClass}>
                         {!view.revision ? (
                           "N/A"
                         ) : view.revision.notas.length > 0 ? (
@@ -176,7 +174,7 @@ function ShiftsTable({
               <tr>
               <td
                 colSpan={7 + (isAdmin ? 5 + methodCols.length : 0)}
-                  className="py-2 text-slate-600 dark:text-slate-300"
+                  className={cn(tableCellClass, "text-text-secondary")}
                 >
                   {emptyText}
                 </td>
@@ -201,7 +199,7 @@ function ShiftsTable({
                 <li key={index}>
                   {item.accion} · {formatDateTime(item.fecha)} — «{item.nota}»
                   {item.revisor && (
-                    <span className="block text-slate-600 dark:text-slate-300">
+                    <span className={cn("block", mutedTextClass)}>
                       Revisada por {item.revisor}.
                     </span>
                   )}
@@ -262,7 +260,7 @@ function BrandBadge({ initial, fill }: { initial: string; fill: string }) {
   );
 }
 
-const payIconClass = "h-5 w-5 shrink-0 text-slate-500 dark:text-slate-400";
+const payIconClass = "h-5 w-5 shrink-0 text-text-tertiary";
 
 // Visual aid for cash counts: denomination kind or payment method code
 // mapped to a recognizable icon. Unknown codes fall back to a wallet.
@@ -590,7 +588,7 @@ export function CashClient(props: CashClientProps) {
               <strong>{formatMoney(openShift.opening_base)}</strong>.
             </p>
             {props.isAdmin && (
-              <p className="text-slate-600 dark:text-slate-300">
+              <p className={mutedTextClass}>
                 Base configurada: {formatMoney(baseConfigurada)}.
               </p>
             )}
@@ -601,7 +599,7 @@ export function CashClient(props: CashClientProps) {
                 </button>
               </div>
             ) : props.canWrite ? (
-              <p className="mt-3 text-slate-600 dark:text-slate-300">
+              <p className={cn("mt-3", mutedTextClass)}>
                 Solo quien abrió el turno puede cerrarlo.
               </p>
             ) : null}
@@ -616,7 +614,7 @@ export function CashClient(props: CashClientProps) {
                 </button>
               </div>
             ) : (
-              <p className="text-slate-600 dark:text-slate-300">
+              <p className={mutedTextClass}>
                 Solo admin o caja pueden abrir turnos.
               </p>
             )}
@@ -636,7 +634,7 @@ export function CashClient(props: CashClientProps) {
             <DialogHeader>
               <DialogTitle>Abrir turno</DialogTitle>
             </DialogHeader>
-            <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+            <p className={cn("mt-1", mutedTextClass)}>
               Cuente billetes y monedas por denominación y declare los totales digitales.
             </p>
             <form onSubmit={handleOpen} className="mt-3 flex flex-col gap-3">
@@ -746,7 +744,7 @@ export function CashClient(props: CashClientProps) {
                   ))}
               </>
             ) : (
-              <div className="flex flex-col gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-800 dark:bg-amber-950">
+              <div className="flex flex-col gap-2 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
                 <p className="font-semibold">¿Está seguro de cerrar?</p>
                 {props.isAdmin && !isOpener && <p>Cierra este turno como administrador.</p>}
                 <p>Después del cierre ya no podrá modificarlo.</p>
@@ -822,7 +820,7 @@ export function CashClient(props: CashClientProps) {
               >
                 Anterior
               </button>
-              <span className="text-slate-600 dark:text-slate-300">
+              <span className={mutedTextClass}>
                 Página {safeDayPage + 1} de {dayPageCount}
               </span>
               <button
@@ -850,7 +848,7 @@ export function CashClient(props: CashClientProps) {
         <section className={sectionClass} aria-busy={isViewPending}>
           <h2 className="text-lg font-semibold">Vales del día</h2>
           {dayVouchers.length === 0 ? (
-            <p className="mt-3 text-sm text-slate-600 dark:text-slate-300">Sin vales este día.</p>
+            <p className={cn("mt-3", mutedTextClass)}>Sin vales este día.</p>
           ) : (
             <>
               <ul className="mt-3 flex flex-col gap-2 text-sm">
@@ -859,7 +857,7 @@ export function CashClient(props: CashClientProps) {
                     <span>
                       {formatMoney(row.amount)} · {row.request_date}
                     </span>
-                    <span className="rounded bg-slate-200 px-2 py-0.5 text-xs dark:bg-slate-800">
+                    <span className="rounded bg-surface-hover px-2 py-0.5 text-xs text-text-secondary">
                       {row.status}
                       {row.status === "descontada" ? " (en nómina)" : ""}
                     </span>
@@ -918,7 +916,7 @@ export function CashClient(props: CashClientProps) {
             >
               Anterior
             </button>
-            <span className="text-slate-600 dark:text-slate-300">
+            <span className={mutedTextClass}>
               Página {histPage} de {histPageCount} ({history.total} turnos)
             </span>
             <button
