@@ -198,6 +198,37 @@ export function resolveEmployeeLineCommission(args: {
 }
 
 /**
+ * Origen de lo que comisiona una línea para el empleado, con la MISMA
+ * precedencia que `resolveEmployeeLineCommission`:
+ *  - "commission": valor fijo del ítem (producto o `custom`) o regla
+ *    ítem×empleado activa. Es lo único que se puede pagar de inmediato.
+ *  - "percent": porcentaje plano del empleado (servicios y `custom` sin valor).
+ *    Se acumula y se paga en nómina, nunca de inmediato.
+ *  - "none": la línea no aporta comisión (ver `lineHasCommissionBasis`).
+ * Puro para probarlo sin base de datos.
+ */
+export function employeeLineCommissionOrigin(args: {
+  itemType: string;
+  itemRefId: string | null;
+  /** Valor fijo de comisión del ítem (producto o `custom`), si la línea lo trae. */
+  commissionValue?: number | null;
+  rules: Map<string, RuleRate>;
+  flatPercent: number | null;
+}): "commission" | "percent" | "none" {
+  const rule =
+    args.itemRefId != null
+      ? args.rules.get(commissionRuleKey(args.itemType, args.itemRefId)) ?? null
+      : null;
+  if (args.itemType === "producto") {
+    if (args.commissionValue) return "commission";
+    return rule ? "commission" : "none";
+  }
+  if (args.itemType === "custom" && args.commissionValue) return "commission";
+  if (rule) return "commission";
+  return args.flatPercent != null ? "percent" : "none";
+}
+
+/**
  * Pendiente = ganado − pagado inmediato (nunca negativo: tope acumulado
  * contra el doble pago). Puro para probarlo sin base de datos.
  */

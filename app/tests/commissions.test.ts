@@ -3,11 +3,17 @@ import {
   commissionPayoutSchema,
   commissionRuleKey,
   commissionRuleSchema,
+  employeeLineCommissionOrigin,
   pendingCommission,
   resolveEmployeeLineCommission,
   resolveLineCommission,
+  roundMoney,
   type RuleRate,
 } from "@/src/features/commissions/schemas";
+import {
+  buildEmployeeCommissionDetail,
+  buildEmployeeDetail,
+} from "@/src/features/payroll/schemas";
 
 describe("commissions: reglas exigen % o fijo", () => {
   const base = {
@@ -354,5 +360,154 @@ describe("commissions: el valor fijo es por unidad y se multiplica por la cantid
         flatPercent: 10,
       }),
     ).toBe(10000);
+  });
+});
+
+describe("commissions: el pago inmediato solo ofrece comisiones (no el % del empleado)", () => {
+  const employeeId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const rules = new Map<string, RuleRate>();
+  // Empleado con payout_mode "inmediato" y pay_type "porcentaje" (35%).
+  const flatPercent = 35;
+
+  interface TestLine {
+    itemType: string;
+    itemRefId: string | null;
+    subtotal: number;
+    qty: number;
+    commissionValue: number | null;
+  }
+
+  // Servicio: comisiona por el % del empleado. Producto con valor fijo: comisión.
+  const serviceLine: TestLine = {
+    itemType: "servicio",
+    itemRefId: "svc-1",
+    subtotal: 42000,
+    qty: 1,
+    commissionValue: null,
+  };
+  const productLine: TestLine = {
+    itemType: "producto",
+    itemRefId: "prod-tinte",
+    subtotal: 42000,
+    qty: 1,
+    commissionValue: 1000,
+  };
+
+  /** Mismo reparto que `earnedCommissionFor`: total de la línea y su parte inmediata. */
+  function split(line: TestLine): { earned: number; immediate: number } {
+    const earned = resolveEmployeeLineCommission({
+      itemType: line.itemType,
+      itemRefId: line.itemRefId,
+      subtotal: line.subtotal,
+      qty: line.qty,
+      commissionValue: line.commissionValue,
+      rules,
+      flatPercent,
+    });
+    const immediate =
+      employeeLineCommissionOrigin({
+        itemType: line.itemType,
+        itemRefId: line.itemRefId,
+        commissionValue: line.commissionValue,
+        rules,
+        flatPercent,
+      }) === "commission"
+        ? earned
+        : 0;
+    return { earned, immediate };
+  }
+
+  it("clasifica el origen: servicio = percent, producto con valor = commission, sin base = none", () => {
+    expect(
+      employeeLineCommissionOrigin({
+        itemType: "servicio",
+        itemRefId: "svc-1",
+        commissionValue: null,
+        rules,
+        flatPercent,
+      }),
+    ).toBe("percent");
+    expect(
+      employeeLineCommissionOrigin({
+        itemType: "producto",
+        itemRefId: "prod-tinte",
+        commissionValue: 1000,
+        rules,
+        flatPercent,
+      }),
+    ).toBe("commission");
+    expect(
+      employeeLineCommissionOrigin({
+        itemType: "producto",
+        itemRefId: "prod-1",
+        commissionValue: null,
+        rules,
+        flatPercent,
+      }),
+    ).toBe("none");
+  });
+
+  it("el pendiente inmediato incluye SOLO el producto (1000), nunca el % del servicio (14700)", () => {
+    const service = split(serviceLine);
+    const product = split(productLine);
+    const earned = roundMoney(service.earned + product.earned);
+    const immediateEarned = roundMoney(service.immediate + product.immediate);
+
+    expect(service.earned).toBe(14700); // 42000 × 35%
+    expect(product.earned).toBe(1000); // valor fijo del ítem × 1
+    expect(earned).toBe(15700); // total ganado
+    expect(immediateEarned).toBe(1000); // solo comisión por ítem
+    expect(pendingCommission(immediateEarned, 0)).toBe(1000);
+  });
+
+  it("la nómina incluye ambos: el % del servicio y la comisión del producto", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId,
+      payoutMode: "inmediato",
+      payType: "porcentaje",
+      commissionPercent: flatPercent,
+      lines: [
+        {
+          invoice_id: "inv-1",
+          consecutive_number: 1,
+          item_id: "svc-1",
+          item_type: "servicio",
+          qty: 1,
+          unit_price: 42000,
+          line_subtotal: 42000,
+          commission_value: null,
+          item_ref_id: "svc-1",
+        },
+        {
+          invoice_id: "inv-1",
+          consecutive_number: 1,
+          item_id: "prod-tinte",
+          item_type: "producto",
+          qty: 1,
+          unit_price: 42000,
+          line_subtotal: 42000,
+          commission_value: 1000,
+          item_ref_id: "prod-tinte",
+        },
+      ],
+      rules,
+    });
+    const { commissions } = buildEmployeeDetail(detail);
+
+    expect(detail).toHaveLength(2);
+    expect(commissions).toBe(15700); // % del servicio (14700) + comisión (1000)
+    expect(detail.find((line) => line.item_type === "servicio")?.commission).toBe(14700);
+    expect(detail.find((line) => line.item_type === "producto")?.commission).toBe(1000);
+  });
+
+  it("paridad: lo pagado inmediato + lo que aporta nómina = total ganado (nada se pierde ni se duplica)", () => {
+    const totalEarned = 15700;
+    const paidImmediate = pendingCommission(1000, 0); // solo el producto
+    // La nómina suma todo lo ganado y resta lo pagado inmediato (payroll/service).
+    const payrollCommissions = roundMoney(Math.max(0, totalEarned - paidImmediate));
+
+    expect(paidImmediate).toBe(1000);
+    expect(payrollCommissions).toBe(14700); // exactamente el % del servicio
+    expect(roundMoney(paidImmediate + payrollCommissions)).toBe(totalEarned);
   });
 });

@@ -89,7 +89,9 @@ export async function payCommissionNowAction(input: unknown) {
 }
 
 /**
- * Comisión pendiente por (factura × empleado): ganado − pagado inmediato.
+ * Comisión pendiente por (factura × empleado): comisión pagable − pagado
+ * inmediato. El pendiente inmediato incluye SOLO la comisión por ítem; el
+ * porcentaje del empleado se acumula y se paga en nómina.
  * Solo lectura; el cálculo autoritativo vive en el servicio (no se duplica).
  * La usa el modal de pago inmediato al cobrar la factura.
  */
@@ -106,8 +108,9 @@ export async function getPendingCommissionsAction(input: {
       rows.push({
         employee_id,
         earned: earned.earned,
+        immediate_earned: earned.immediateEarned,
         paid,
-        pending: pendingCommission(earned.earned, paid),
+        pending: pendingCommission(earned.immediateEarned, paid),
       });
     }
     return { success: true as const, data: rows };

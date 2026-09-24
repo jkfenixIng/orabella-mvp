@@ -2,6 +2,7 @@ import {
   commissionPayoutSchema,
   commissionRuleKey,
   commissionRuleSchema,
+  employeeLineCommissionOrigin,
   pendingCommission,
   resolveEmployeeLineCommission,
   roundMoney,
@@ -149,13 +150,22 @@ export interface EarnedCommission {
   baseSubtotal: number;
   percentApplied: number | null;
   fixedApplied: number | null;
+  /** Total ganado por el empleado: comisión por ítem + porcentaje del empleado. */
   earned: number;
+  /**
+   * Ganado que se puede pagar de IMMEDIATO: solo el origen "commission"
+   * (valor fijo del ítem o regla ítem×empleado). El porcentaje del empleado
+   * queda fuera: se acumula y se paga en nómina.
+   */
+  immediateEarned: number;
   lines: number;
 }
 
 /**
  * Comisión ganada por (factura, empleado): líneas sin flag × (regla o
  * tasa plana del empleado). Las líneas marcadas sin comisión no suman.
+ * Devuelve el total (`earned`) y, separado, lo pagable de inmediato
+ * (`immediateEarned`, solo origen comisión por ítem).
  */
 export async function earnedCommissionFor(
   sedeId: string,
@@ -226,27 +236,40 @@ export async function earnedCommissionFor(
 
   let baseSubtotal = 0;
   let earned = 0;
+  let immediateEarned = 0;
   const usedRules = new Map<string, RuleRate>();
   for (const line of earning) {
     const refId = line.item_type === "producto" ? line.product_id : line.service_id;
     const rule = refId ? ruleByItem.get(commissionRuleKey(line.item_type, refId)) : undefined;
     const subtotal = roundMoney(Number(line.subtotal));
     baseSubtotal = roundMoney(baseSubtotal + subtotal);
-    earned = roundMoney(
-      earned +
-        resolveEmployeeLineCommission({
-          itemType: line.item_type,
-          itemRefId: refId ?? null,
-          subtotal,
-          qty: Number(line.qty),
-          // El valor fijo del ítem (producto o `custom`) es la comisión: mismo
-          // insumo que nómina y detalle. Un 0 no es valor fijo (se normaliza a
-          // null, igual que en payroll/billing).
-          commissionValue: line.commission_value ? Number(line.commission_value) : null,
-          rules: ruleByItem,
-          flatPercent,
-        }),
-    );
+    // El valor fijo del ítem (producto o `custom`) es la comisión: mismo
+    // insumo que nómina y detalle. Un 0 no es valor fijo (se normaliza a
+    // null, igual que en payroll/billing).
+    const commissionValue = line.commission_value ? Number(line.commission_value) : null;
+    const lineCommission = resolveEmployeeLineCommission({
+      itemType: line.item_type,
+      itemRefId: refId ?? null,
+      subtotal,
+      qty: Number(line.qty),
+      commissionValue,
+      rules: ruleByItem,
+      flatPercent,
+    });
+    earned = roundMoney(earned + lineCommission);
+    // Solo la comisión por ítem (origen "commission") es pagable de inmediato;
+    // el porcentaje del empleado (origen "percent") se acumula para la nómina.
+    if (
+      employeeLineCommissionOrigin({
+        itemType: line.item_type,
+        itemRefId: refId ?? null,
+        commissionValue,
+        rules: ruleByItem,
+        flatPercent,
+      }) === "commission"
+    ) {
+      immediateEarned = roundMoney(immediateEarned + lineCommission);
+    }
     if (rule && refId) {
       usedRules.set(commissionRuleKey(line.item_type, refId), rule);
     }
@@ -257,6 +280,7 @@ export async function earnedCommissionFor(
     percentApplied: uniform?.percent ?? null,
     fixedApplied: uniform?.amount ?? null,
     earned,
+    immediateEarned,
     lines: earning.length,
   };
 }
@@ -349,9 +373,17 @@ export async function payCommissionNow(
     throw new CommissionError("NOTHING_EARNED", "Esa factura y empleado no tienen comisión.", 422);
   }
   const paid = await immediatePaidTotal(actor.sedeId, input.invoice_id, input.employee_id);
-  const pending = pendingCommission(earned.earned, paid);
+  // El pendiente inmediato es SOLO comisión por ítem: el porcentaje del empleado
+  // se acumula y se paga en nómina, nunca de inmediato.
+  const pending = pendingCommission(earned.immediateEarned, paid);
   if (pending <= 0) {
-    throw new CommissionError("NOTHING_PENDING", "Esa comisión ya fue pagada.", 422);
+    throw new CommissionError(
+      "NOTHING_PENDING",
+      earned.immediateEarned <= 0
+        ? "Esa factura solo tiene porcentaje del empleado: se paga en nómina, no de inmediato."
+        : "Esa comisión ya fue pagada.",
+      422,
+    );
   }
   if (input.amount - pending > 0.009) {
     throw new CommissionError(

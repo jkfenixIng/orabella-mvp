@@ -2637,14 +2637,25 @@ export function InvoicesClient(props: InvoicesClientProps) {
       </Dialog>
 
       {/* Pago inmediato de comisión(es): aparece al dejar la factura Pagada si
-          hay empleados con payout_mode "inmediato" y comisión pendiente. */}
+          hay empleados con payout_mode "inmediato" y comisión pendiente. Solo
+          se paga la comisión por ítem; el porcentaje del empleado se acumula y
+          se paga en nómina. Mientras haya pendientes el modal NO se cierra por
+          clic fuera ni con Escape: solo al pagar o al dejarla para nómina. */}
       <Dialog
         open={commissionOpen}
         onOpenChange={(open) => {
           if (!open && !commissionBusy) closeCommission();
         }}
       >
-        <DialogContent className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+        <DialogContent
+          className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent"
+          onInteractOutside={(event) => {
+            if (commissionRows.length > 0) event.preventDefault();
+          }}
+          onEscapeKeyDown={(event) => {
+            if (commissionRows.length > 0) event.preventDefault();
+          }}
+        >
           <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
             <div className="border-b border-slate-200 px-6 py-4">
               <h2 className="text-lg font-bold">Pagar comisión al empleado</h2>
@@ -2670,10 +2681,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         )
                       }
                     >
+                      {/* El desplegable se monta en un portal con z-index propio;
+                          este modal apilado tiene un overlay por encima, así que
+                          se eleva para que las opciones queden clickeables. */}
                       <SelectTrigger className={paperInputClass}>
                         <SelectValue placeholder="Método" />
                       </SelectTrigger>
-                      <SelectContent>
+                      <SelectContent className="z-[1000]">
                         {props.methods.map((method) => (
                           <SelectItem key={method.id} value={method.code}>
                             {method.name}
@@ -2692,8 +2706,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 </div>
               ))}
               <p className="rounded-md bg-slate-50 px-3 py-2 text-xs text-slate-600">
-                Si eliges «Dejar para nómina», la comisión queda pendiente y se paga en la
-                nómina del período. No se pierde.
+                Solo se paga de inmediato la comisión por ítem. El porcentaje del
+                empleado se acumula y se paga en la nómina del período: si eliges
+                «Dejar para nómina», la comisión también queda pendiente para la
+                nómina. No se pierde.
               </p>
               {commissionError && (
                 <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
