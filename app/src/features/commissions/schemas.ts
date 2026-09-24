@@ -107,13 +107,33 @@ export function hasFixedItemCommission(
 }
 
 /**
+ * Porcentaje efectivo de una línea: el del empleado si existe; si no, el
+ * porcentaje explícito de la línea (solo para `custom` con empleado de pago
+ * fijo, migración 030). Nunca inventa un porcentaje para servicios ni
+ * productos: esos conservan su regla propia.
+ * Puro para probarlo sin base de datos.
+ */
+function effectiveFlatPercent(args: {
+  flatPercent: number | null;
+  itemType: string;
+  commissionPercentOverride?: number | null;
+}): number | null {
+  if (args.flatPercent != null) return args.flatPercent;
+  if (args.itemType === "custom" && args.commissionPercentOverride != null) {
+    return Number(args.commissionPercentOverride);
+  }
+  return null;
+}
+
+/**
  * ¿La línea entra al detalle de comisión del empleado? Compartido por la nómina
  * (`buildEmployeeCommissionDetail`) y el detalle de factura
  * (`computeInvoiceItemCommission`) para que coincidan línea a línea:
  *  - `producto`: valor fijo del ítem o regla ítem×empleado activa. El
  *    porcentaje plano del empleado NUNCA comisiona un producto.
- *  - `custom`: valor fijo del ítem, o porcentaje plano si la línea no trae valor
- *    (un `custom` no tiene ítem de catálogo y por tanto no tiene regla).
+ *  - `custom`: valor fijo del ítem, o porcentaje (el del empleado o el
+ *    explícito de la línea) si no trae valor (un `custom` no tiene ítem de
+ *    catálogo y por tanto no tiene regla).
  *  - `servicio`: porcentaje plano o regla ítem×empleado activa.
  * Puro para probarlo sin base de datos.
  */
@@ -121,6 +141,8 @@ export function lineHasCommissionBasis(args: {
   itemType: string;
   itemRefId: string | null;
   commissionValue: number | null | undefined;
+  /** Porcentaje explícito de la línea (personalizado por porcentaje, pago fijo). */
+  commissionPercentOverride?: number | null;
   rules: Map<string, RuleRate>;
   flatPercent: number | null;
 }): boolean {
@@ -131,7 +153,10 @@ export function lineHasCommissionBasis(args: {
     );
   }
   if (args.itemType === "custom") {
-    return hasFixedItemCommission("custom", args.commissionValue) || args.flatPercent !== null;
+    return (
+      hasFixedItemCommission("custom", args.commissionValue) ||
+      effectiveFlatPercent(args) !== null
+    );
   }
   return (
     args.flatPercent !== null ||
@@ -163,6 +188,11 @@ export function resolveEmployeeLineCommission(args: {
   qty: number;
   /** Valor fijo de comisión del ítem (producto o `custom`), si la línea lo trae. */
   commissionValue?: number | null;
+  /**
+   * Porcentaje explícito de la línea (personalizado por porcentaje con empleado
+   * de pago fijo). Solo se usa si el empleado no tiene porcentaje propio.
+   */
+  commissionPercentOverride?: number | null;
   rules: Map<string, RuleRate>;
   flatPercent: number | null;
 }): number {
@@ -188,12 +218,13 @@ export function resolveEmployeeLineCommission(args: {
   if (args.itemType === "custom" && args.commissionValue) {
     return roundMoney(args.commissionValue * Math.floor(args.qty));
   }
-  // Servicio y personalizado sin valor: porcentaje del empleado (la regla gana).
+  // Servicio y personalizado sin valor: porcentaje (el del empleado, o el
+  // explícito de la línea para personalizado). La regla gana sobre el porcentaje.
   return resolveLineCommission({
     subtotal: args.subtotal,
     qty: Math.floor(args.qty),
     rule,
-    flatPercent: rule ? null : args.flatPercent,
+    flatPercent: rule ? null : effectiveFlatPercent(args),
   });
 }
 
@@ -202,8 +233,9 @@ export function resolveEmployeeLineCommission(args: {
  * precedencia que `resolveEmployeeLineCommission`:
  *  - "commission": valor fijo del ítem (producto o `custom`) o regla
  *    ítem×empleado activa. Es lo único que se puede pagar de inmediato.
- *  - "percent": porcentaje plano del empleado (servicios y `custom` sin valor).
- *    Se acumula y se paga en nómina, nunca de inmediato.
+ *  - "percent": porcentaje (el del empleado, o el explícito de la línea para
+ *    personalizado con pago fijo). Se acumula y se paga en nómina, nunca de
+ *    inmediato.
  *  - "none": la línea no aporta comisión (ver `lineHasCommissionBasis`).
  * Puro para probarlo sin base de datos.
  */
@@ -212,6 +244,8 @@ export function employeeLineCommissionOrigin(args: {
   itemRefId: string | null;
   /** Valor fijo de comisión del ítem (producto o `custom`), si la línea lo trae. */
   commissionValue?: number | null;
+  /** Porcentaje explícito de la línea (personalizado por porcentaje, pago fijo). */
+  commissionPercentOverride?: number | null;
   rules: Map<string, RuleRate>;
   flatPercent: number | null;
 }): "commission" | "percent" | "none" {
@@ -225,7 +259,7 @@ export function employeeLineCommissionOrigin(args: {
   }
   if (args.itemType === "custom" && args.commissionValue) return "commission";
   if (rule) return "commission";
-  return args.flatPercent != null ? "percent" : "none";
+  return effectiveFlatPercent(args) != null ? "percent" : "none";
 }
 
 /**

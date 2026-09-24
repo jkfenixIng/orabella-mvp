@@ -461,6 +461,8 @@ interface BillingLine {
   unit_price: number;
   line_subtotal: number;
   commission_value: number | null;
+  /** Porcentaje explícito de la línea (personalizado por porcentaje, pago fijo). */
+  commission_percent_override: number | null;
   product_id: string | null;
   service_id: string | null;
 }
@@ -532,7 +534,7 @@ export async function calculatePayroll(
       const { data: items, error: itemsError } = await db
         .from("invoice_items")
         .select(
-          "id, invoice_id, item_type, employee_id, qty, unit_price, subtotal, no_commission, commission_value, product_id, service_id",
+          "id, invoice_id, item_type, employee_id, qty, unit_price, subtotal, no_commission, commission_value, commission_percent_override, product_id, service_id",
         )
         .in(
           "invoice_id",
@@ -563,6 +565,7 @@ export async function calculatePayroll(
         subtotal: number | string;
         no_commission?: boolean | null;
         commission_value?: number | null;
+        commission_percent_override?: number | null;
         product_id: string | null;
         service_id: string | null;
       }>).filter(
@@ -578,6 +581,7 @@ export async function calculatePayroll(
           subtotal: number | string;
           no_commission?: boolean | null;
           commission_value?: number | null;
+          commission_percent_override?: number | null;
           product_id: string | null;
           service_id: string | null;
         } => Boolean(row.employee_id) && !row.no_commission,
@@ -591,6 +595,8 @@ export async function calculatePayroll(
         unit_price: Number(row.unit_price),
         line_subtotal: Number(row.subtotal),
         commission_value: row.commission_value ? Number(row.commission_value) : null,
+        commission_percent_override:
+          row.commission_percent_override != null ? Number(row.commission_percent_override) : null,
         product_id: row.product_id,
         service_id: row.service_id,
       }));
@@ -731,6 +737,7 @@ export async function calculatePayroll(
           unit_price: line.unit_price,
           line_subtotal: line.line_subtotal,
           commission_value: line.commission_value,
+          commission_percent_override: line.commission_percent_override,
           item_ref_id:
             line.item_type === "producto"
               ? line.product_id

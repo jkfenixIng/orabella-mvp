@@ -15,6 +15,7 @@ import {
   editItemsSubtotal,
   moneyEquals,
   MONEY_EPSILON,
+  normalizeCommissionFields,
   portionsMatchBalance,
   splitPaymentSchema,
   type CreateInvoiceInput,
@@ -128,6 +129,10 @@ export interface InvoiceItemRow {
   subtotal: number;
   no_commission: boolean;
   commission_value: number | null;
+  /** Modo de comisión explícito (030): comision | porcentaje | ninguna | null. */
+  commission_mode: string | null;
+  /** Porcentaje explícito de la línea (personalizado por porcentaje, pago fijo). */
+  commission_percent_override: number | null;
   /**
    * Comisión calculada de la línea (solo lectura, no se persiste). null = no
    * calculable (sin empleado); número = monto en moneda. Misma regla que
@@ -169,7 +174,7 @@ export interface InvoiceDetail {
 const INVOICE_SELECT =
   "id, sede_id, consecutive_number, client_name, client_document, subtotal, discount, tax, surcharge, total, status, user_id, cash_shift_id, closed_by, closed_at, cancel_reason, created_at";
 const ITEM_SELECT =
-  "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission, commission_value, employees!inner(full_name, employee_code, commission_percent, pay_type, payout_mode)";
+  "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission, commission_value, commission_mode, commission_percent_override, employees!inner(full_name, employee_code, commission_percent, pay_type, payout_mode)";
 const TAX_SELECT = "id, invoice_id, tax_code, tax_name, percent, amount";
 const PAYMENT_SELECT = "id, invoice_id, method_id, method_code, amount, fee_percent, fee_amount, cash_shift_id, created_at";
 
@@ -419,6 +424,7 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
         subtotal: Number(item.subtotal),
         qty: Number(item.qty),
         commissionValue: item.commission_value ?? null,
+        commissionPercentOverride: item.commission_percent_override ?? null,
         noCommission: Boolean(item.no_commission),
         rules: rulesByEmployee.get(item.employee_id) ?? new Map<string, RuleRate>(),
         employee: joined
@@ -809,8 +815,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
         qty: item.qty,
         unit_price: item.unit_price,
         discount: item.discount,
-        no_commission: item.no_commission ?? false,
-        commission_value: item.commission_value ?? null,
+        ...normalizeCommissionFields(item),
         subtotal:
           Math.round(item.qty * Number(item.unit_price) * 100) / 100 -
           Math.min(item.discount, Math.round(item.qty * Number(item.unit_price) * 100) / 100),
@@ -1151,8 +1156,7 @@ export async function editInvoiceItems(
           qty: next.qty,
           unit_price: next.unit_price,
           discount: next.discount,
-          no_commission: next.no_commission ?? false,
-          commission_value: next.commission_value ?? null,
+          ...normalizeCommissionFields(next),
           subtotal: line.subtotal,
         })
         .eq("id", old.id);
@@ -1170,8 +1174,7 @@ export async function editInvoiceItems(
         qty: item.qty,
         unit_price: item.unit_price,
         discount: item.discount,
-        no_commission: item.no_commission ?? false,
-        commission_value: item.commission_value ?? null,
+        ...normalizeCommissionFields(item),
         subtotal: line.subtotal,
       });
       if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
@@ -1429,8 +1432,7 @@ export async function editEmittedInvoiceItems(
           qty: next.qty,
           unit_price: next.unit_price,
           discount: next.discount,
-          no_commission: next.no_commission ?? false,
-          commission_value: next.commission_value ?? null,
+          ...normalizeCommissionFields(next),
           subtotal: line.subtotal,
         })
         .eq("id", old.id);
@@ -1448,8 +1450,7 @@ export async function editEmittedInvoiceItems(
         qty: item.qty,
         unit_price: item.unit_price,
         discount: item.discount,
-        no_commission: item.no_commission ?? false,
-        commission_value: item.commission_value ?? null,
+        ...normalizeCommissionFields(item),
         subtotal: line.subtotal,
       });
       if (error) throw new BillingError("INTERNAL", "Error interno.", 500);

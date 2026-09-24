@@ -18,13 +18,14 @@ import {
  *  2. `no_commission` → 0 (nómina excluye la línea antes de comisionar).
  *  3. `payout_mode === "no_aplica"` → 0 (nómina no arma detalle).
  *  4. La línea solo entra al detalle si tiene base de comisión (ver
- *     `lineHasCommissionBasis`): valor fijo del ítem, porcentaje plano del
- *     empleado o regla ítem×empleado activa. Sin ninguna → 0. Replica el filtro
- *     de `buildEmployeeCommissionDetail`.
+ *     `lineHasCommissionBasis`): valor fijo del ítem, porcentaje (el del
+ *     empleado o el explícito de la línea) o regla ítem×empleado activa. Sin
+ *     ninguna → 0. Replica el filtro de `buildEmployeeCommissionDetail`.
  *
  * La resolución compartida aplica, en este orden: comisión por VALOR FIJO del
  * ítem (productos siempre; personalizados con valor), regla ítem×empleado o
- * porcentaje plano del empleado (servicios y personalizados sin valor).
+ * porcentaje (el del empleado y, para personalizados de pago fijo, el
+ * porcentaje explícito de la línea).
  */
 export interface InvoiceItemCommissionInput {
   itemType: string;
@@ -33,6 +34,11 @@ export interface InvoiceItemCommissionInput {
   subtotal: number;
   qty: number;
   commissionValue: number | null;
+  /**
+   * Porcentaje explícito de la línea (personalizado por porcentaje con empleado
+   * de pago fijo). Solo aplica si el empleado no tiene porcentaje propio.
+   */
+  commissionPercentOverride?: number | null;
   noCommission: boolean;
   /** Reglas ítem×empleado activas del empleado (vacío si no tiene). */
   rules: Map<string, RuleRate>;
@@ -73,6 +79,7 @@ export function computeInvoiceItemCommission(
       itemType: input.itemType,
       itemRefId: input.itemRefId,
       commissionValue,
+      commissionPercentOverride: input.commissionPercentOverride ?? null,
       rules: input.rules,
       flatPercent,
     })
@@ -86,6 +93,7 @@ export function computeInvoiceItemCommission(
     subtotal: input.subtotal,
     qty: input.qty,
     commissionValue,
+    commissionPercentOverride: input.commissionPercentOverride ?? null,
     rules: input.rules,
     flatPercent,
   });

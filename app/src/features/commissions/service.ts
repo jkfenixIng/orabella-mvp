@@ -187,7 +187,9 @@ export async function earnedCommissionFor(
 
   const { data: lines, error: linesError } = await db
     .from("invoice_items")
-    .select("item_type, product_id, service_id, qty, unit_price, subtotal, no_commission, commission_value")
+    .select(
+      "item_type, product_id, service_id, qty, unit_price, subtotal, no_commission, commission_value, commission_percent_override",
+    )
     .eq("invoice_id", invoiceId)
     .eq("employee_id", employeeId);
   if (linesError) throw new CommissionError("INTERNAL", "Error interno.", 500);
@@ -200,6 +202,7 @@ export async function earnedCommissionFor(
     subtotal: number | string;
     no_commission: boolean | null;
     commission_value: number | string | null;
+    commission_percent_override: number | string | null;
   }>).filter((line) => !line.no_commission);
 
   const { data: rules, error: rulesError } = await db
@@ -247,23 +250,28 @@ export async function earnedCommissionFor(
     // insumo que nómina y detalle. Un 0 no es valor fijo (se normaliza a
     // null, igual que en payroll/billing).
     const commissionValue = line.commission_value ? Number(line.commission_value) : null;
+    const commissionPercentOverride =
+      line.commission_percent_override != null ? Number(line.commission_percent_override) : null;
     const lineCommission = resolveEmployeeLineCommission({
       itemType: line.item_type,
       itemRefId: refId ?? null,
       subtotal,
       qty: Number(line.qty),
       commissionValue,
+      commissionPercentOverride,
       rules: ruleByItem,
       flatPercent,
     });
     earned = roundMoney(earned + lineCommission);
     // Solo la comisión por ítem (origen "commission") es pagable de inmediato;
-    // el porcentaje del empleado (origen "percent") se acumula para la nómina.
+    // el porcentaje (del empleado o el explícito de la línea) se acumula para la
+    // nómina.
     if (
       employeeLineCommissionOrigin({
         itemType: line.item_type,
         itemRefId: refId ?? null,
         commissionValue,
+        commissionPercentOverride,
         rules: ruleByItem,
         flatPercent,
       }) === "commission"

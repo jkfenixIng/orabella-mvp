@@ -220,6 +220,11 @@ export interface PayrollCommissionLine {
   commission_value: number | null;
   /** product_id o service_id según el tipo (null en ítems `custom`). */
   item_ref_id: string | null;
+  /**
+   * Porcentaje explícito de la línea (personalizado por porcentaje con empleado
+   * de pago fijo). Se usa solo si el empleado no tiene `commission_percent`.
+   */
+  commission_percent_override?: number | null;
 }
 
 /**
@@ -255,6 +260,7 @@ export function buildEmployeeCommissionDetail(args: {
         itemType: line.item_type,
         itemRefId: line.item_ref_id,
         commissionValue: line.commission_value,
+        commissionPercentOverride: line.commission_percent_override ?? null,
         rules: args.rules,
         flatPercent,
       }),
@@ -274,6 +280,7 @@ export function buildEmployeeCommissionDetail(args: {
         subtotal: line.line_subtotal,
         qty: line.qty,
         commissionValue: line.commission_value,
+        commissionPercentOverride: line.commission_percent_override ?? null,
         rules: args.rules,
         flatPercent,
       }),
