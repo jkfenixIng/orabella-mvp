@@ -1,16 +1,24 @@
 "use client";
 
-import { useState, useTransition, type FormEvent } from "react";
+import { useEffect, useState, useTransition, type FormEvent } from "react";
 import {
   annulInvoiceAction,
   createInvoiceAction,
+  editEmittedInvoiceAction,
+  editInvoiceAction,
   getInvoiceAction,
   listInvoicesAction,
   splitPaymentAction,
 } from "@/src/features/billing/actions";
+import { getOpenShiftAction } from "@/src/features/cash/actions";
+import {
+  getPendingCommissionsAction,
+  payCommissionNowAction,
+} from "@/src/features/commissions/actions";
 import type {
   InvoiceDetail,
-  InvoiceRow,
+  InvoiceItemRow,
+  InvoiceListItem,
 } from "@/src/features/billing/service";
 import type { ProductRow } from "@/src/features/inventory/service";
 import type {
@@ -19,9 +27,6 @@ import type {
   ServiceRow,
   TaxConfigRow,
 } from "@/src/features/admin/service";
-import {
-  Badge,
-} from "@/src/components/ui/lib/badge";
 import { Button } from "@/src/components/ui/lib/button";
 import {
   Card,
@@ -32,7 +37,6 @@ import {
 } from "@/src/components/ui/lib/card";
 import {
   Dialog,
-  DialogClose,
   DialogContent,
 } from "@/src/components/ui/lib/dialog";
 import { Input } from "@/src/components/ui/lib/input";
@@ -49,6 +53,8 @@ import {
   Banknote,
   CircleX,
   Eye,
+  EyeOff,
+  Pencil,
   Plus,
   Search,
   Trash2,
@@ -66,6 +72,12 @@ type ActionResult<T> =
   | { success: true; data: T }
   | { success: false; code: string; message: string };
 
+/** Modo de comisión de una línea (espejo del enum del backend, migración 030). */
+type CommissionMode = "comision" | "porcentaje" | "ninguna";
+
+/** Modos ofrecidos en el personalizado: comisión, porcentaje o ninguna. */
+const CUSTOM_COMMISSION_MODES: CommissionMode[] = ["comision", "porcentaje", "ninguna"];
+
 interface ItemDraft {
   item_type: "producto" | "servicio" | "custom";
   ref_id: string;
@@ -75,6 +87,10 @@ interface ItemDraft {
   unit_price: string;
   no_commission: boolean;
   commission_value: number | null;
+  /** Modo explícito de la línea: comisión (valor fijo), porcentaje o ninguna. */
+  commission_mode: CommissionMode;
+  /** Porcentaje de la línea para un personalizado por porcentaje con empleado de pago fijo. */
+  commission_percent_override: number | null;
 }
 
 interface PortionDraft {
@@ -82,8 +98,118 @@ interface PortionDraft {
   amount: string;
 }
 
+/** Fila del modal de pago inmediato de comisión (un empleado por fila). */
+interface CommissionPayRow {
+  employee_id: string;
+  employee_name: string;
+  pending: number;
+  method_code: string;
+}
+
 function emptyItem(): ItemDraft {
-  return { item_type: "servicio", ref_id: "", custom_name: "", employee_id: "", qty: "1", unit_price: "", no_commission: true, commission_value: null };
+  // Servicio por defecto: siempre comisiona el % del empleado. El
+  // personalizado arranca sin comisión y exige elegir el modo.
+  return { item_type: "servicio", ref_id: "", custom_name: "", employee_id: "", qty: "1", unit_price: "", no_commission: false, commission_value: null, commission_mode: "porcentaje", commission_percent_override: null };
+}
+
+/**
+ * Deriva el modo de una fila histórica sin `commission_mode` (misma regla que
+ * `deriveCommissionMode` del backend): sin comisión → ninguna; con valor fijo
+ * → comisión; producto sin valor → comisión; el resto (servicio/custom) →
+ * porcentaje. Se usa al cargar una factura ya emitida para editar.
+ */
+function deriveDraftMode(
+  itemType: string,
+  noCommission: boolean | null | undefined,
+  commissionValue: number | null | undefined,
+): CommissionMode {
+  if (noCommission) return "ninguna";
+  if (commissionValue != null && commissionValue > 0) return "comision";
+  if (itemType === "producto") return "comision";
+  return "porcentaje";
+}
+
+/**
+ * true si el empleado es de pago fijo: no aporta porcentaje propio. Réplica de
+ * `effectiveFlatPercent` del backend, donde solo `pay_type` `porcentaje` o
+ * `mixto` dan tasa plana (y por ADM-08 siempre traen `commission_percent`).
+ */
+function isFixedPayEmployee(employee: EmployeeRow | undefined): boolean {
+  return !(employee?.pay_type === "porcentaje" || employee?.pay_type === "mixto");
+}
+
+/**
+ * Alinea los campos de comisión de un borrador con su modo antes de guardarlo
+ * o enviarlo: comisión lleva valor; porcentaje lleva el porcentaje explícito
+ * solo si es personalizado y el empleado es de pago fijo; ninguna no lleva
+ * nada. El servicio siempre comisiona por porcentaje del empleado.
+ */
+function normalizeDraftCommission(item: ItemDraft, employeeFixedPay: boolean): ItemDraft {
+  let mode = item.commission_mode;
+  if (item.item_type === "servicio") mode = "porcentaje";
+  if (item.item_type === "producto" && mode === "porcentaje") mode = "comision";
+  return {
+    ...item,
+    commission_mode: mode,
+    no_commission: mode === "ninguna",
+    commission_value: mode === "comision" ? item.commission_value : null,
+    commission_percent_override:
+      mode === "porcentaje" && item.item_type === "custom" && employeeFixedPay
+        ? item.commission_percent_override
+        : null,
+  };
+}
+
+/**
+ * Modo efectivo de una fila ya emitida: el almacenado si es válido o, en filas
+ * históricas sin `commission_mode`, el derivado de los campos viejos.
+ */
+function commissionModeOf(row: {
+  item_type: string;
+  no_commission: boolean | null | undefined;
+  commission_value: number | null | undefined;
+  commission_mode: string | null | undefined;
+}): CommissionMode {
+  const mode = row.commission_mode;
+  if (mode === "comision" || mode === "porcentaje" || mode === "ninguna") return mode;
+  return deriveDraftMode(row.item_type, row.no_commission, row.commission_value);
+}
+
+/** Selector segmentado del modo de comisión (comisión / porcentaje / ninguna). */
+function CommissionModeSelector(props: {
+  value: CommissionMode;
+  options: CommissionMode[];
+  onChange: (mode: CommissionMode) => void;
+  ariaLabel: string;
+}) {
+  const labels: Record<CommissionMode, string> = {
+    comision: "Comisión",
+    porcentaje: "Porcentaje",
+    ninguna: "Ninguna",
+  };
+  return (
+    <div
+      className="inline-flex overflow-hidden rounded-md border border-slate-300"
+      role="group"
+      aria-label={props.ariaLabel}
+    >
+      {props.options.map((mode) => (
+        <button
+          key={mode}
+          type="button"
+          aria-pressed={props.value === mode}
+          onClick={() => props.onChange(mode)}
+          className={
+            props.value === mode
+              ? "bg-slate-900 px-2 py-1 text-[10px] font-semibold text-white"
+              : "bg-white px-2 py-1 text-[10px] font-medium text-slate-700 hover:bg-slate-100"
+          }
+        >
+          {labels[mode]}
+        </button>
+      ))}
+    </div>
+  );
 }
 
 function toNumber(value: string): number | null {
@@ -93,9 +219,9 @@ function toNumber(value: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function formatMoney(value: number | string): string {
+function formatMoney(value: number | string | null | undefined): string {
   const numeric = typeof value === "string" ? Number(value) : value;
-  if (!Number.isFinite(numeric)) return "—";
+  if (numeric == null || !Number.isFinite(numeric)) return "—";
   return new Intl.NumberFormat("es-CO", {
     style: "currency",
     currency: "COP",
@@ -103,20 +229,45 @@ function formatMoney(value: number | string): string {
   }).format(numeric);
 }
 
-function invoiceStatusVariant(status: string): "default" | "success" | "destructive" | "secondary" {
-  if (status === "Pagada") return "success";
-  if (status === "Anulada") return "destructive";
-  if (status === "Emitida") return "secondary";
-  return "default";
+/**
+ * Comisión a mostrar en el detalle de solo lectura. Prioriza el valor cargado
+ * en el ítem (`commission_value`, el que el usuario ingresó); si no hay, cae al
+ * monto calculado por nómina (`commission_amount`); sin ninguno, null (la
+ * tabla pinta "—"). Nunca suma ni mezcla ambos campos.
+ */
+function commissionDisplayValue(
+  row: Pick<InvoiceItemRow, "commission_value" | "commission_amount">,
+): number | null {
+  if (row.commission_value != null) return row.commission_value;
+  return row.commission_amount ?? null;
 }
 
-interface InvoiceRowWithUser extends InvoiceRow {
-  user_name: string | null;
+/** Pastilla de estado: Emitida azul, Pagada verde, Anulada roja (ambos temas). */
+function statusPill(status: string) {
+  const tone =
+    status === "Pagada"
+      ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200"
+      : status === "Anulada"
+        ? "bg-red-100 text-red-800 dark:bg-red-900/50 dark:text-red-200"
+        : "bg-blue-100 text-blue-800 dark:bg-blue-900/50 dark:text-blue-200";
+  return (
+    <span className={`inline-block whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-semibold ${tone}`}>
+      {status}
+    </span>
+  );
+}
+
+/** "Camilo, Andrés + 3 más": dos nombres y el resto resumido. */
+function employeeSummary(names: string[]): string {
+  if (names.length === 0) return "—";
+  if (names.length <= 2) return names.join(", ");
+  return `${names[0]}, ${names[1]} +${names.length - 2}`;
 }
 
 interface InvoicesClientProps {
   sedeId: string;
-  initialInvoices: InvoiceRowWithUser[];
+  initialInvoices: InvoiceListItem[];
+  initialTotal: number;
   products: ProductRow[];
   services: ServiceRow[];
   employees: EmployeeRow[];
@@ -124,12 +275,23 @@ interface InvoicesClientProps {
   taxes: TaxConfigRow[];
   canWrite: boolean;
   canAnnul: boolean;
+  isAdmin: boolean;
+  currentUserId: string;
   detailMode: "full" | "open-only" | "none";
 }
 
+/** Fecha local yyyy-mm-dd (F1: el listado abre solo con las del día). */
+function todayLocalISO(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+}
+
 export function InvoicesClient(props: InvoicesClientProps) {
-  const [invoices, setInvoices] = useState<InvoiceRowWithUser[]>(props.initialInvoices);
-  const [filters, setFilters] = useState({ status: "", from: "", to: "", seller: "", number: "" });
+  const [invoices, setInvoices] = useState<InvoiceListItem[]>(props.initialInvoices);
+  const [totalInvoices, setTotalInvoices] = useState(props.initialTotal);
+  const [invoicePage, setInvoicePage] = useState(1);
+  // F1: Desde/Hasta = hoy por defecto; vaciarlas muestra todo el historial.
+  const [filters, setFilters] = useState({ status: "", from: todayLocalISO(), to: todayLocalISO(), seller: "", number: "", closedBy: "", employee: "" });
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -137,51 +299,216 @@ export function InvoicesClient(props: InvoicesClientProps) {
   // congela mientras la server action responde.
   const [isViewPending, startViewTransition] = useTransition();
   const [detail, setDetail] = useState<InvoiceDetail | null>(null);
+  // Vista cliente: oculta datos internos (empleado y comisión) para mostrar
+  // la factura en pantalla sin exponer información de nómina. Arranca interna.
+  const [clientView, setClientView] = useState(false);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [detailDialogOpen, setDetailDialogOpen] = useState(false);
+  type EditItemDraft = ItemDraft & { id?: string; discount: number };
+  const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
+  const [editItems, setEditItems] = useState<EditItemDraft[]>([]);
+  const [editPayments, setEditPayments] = useState<Array<{ id: string; method_code: string }>>([]);
+  const [editMotivo, setEditMotivo] = useState("");
+  const [editError, setEditError] = useState<string | null>(null);
   const [clientName, setClientName] = useState("");
   const [clientDocument, setClientDocument] = useState("");
   const [discount, setDiscount] = useState("");
-  const [items, setItems] = useState<ItemDraft[]>([emptyItem()]);
+  const [items, setItems] = useState<ItemDraft[]>([]);
+  const [isItemDialogOpen, setIsItemDialogOpen] = useState(false);
+  const [itemDialogTarget, setItemDialogTarget] = useState<"create" | "edit">("create");
+  const [itemDraft, setItemDraft] = useState<ItemDraft>(emptyItem());
+  const [itemError, setItemError] = useState<string | null>(null);
   const [portions, setPortions] = useState<PortionDraft[]>([
     { method_code: "efectivo", amount: "" },
   ]);
   const [motivo, setMotivo] = useState("");
+  // Modal clásico de confirmación ("¿Está seguro? ...", OK/Cancelar).
+  const [confirmKind, setConfirmKind] = useState<"emit" | "pay" | "annul" | null>(null);
   const [splitDraft, setSplitDraft] = useState<PortionDraft>({ method_code: "efectivo", amount: "" });
+  // Pago inmediato de comisión(es) al dejar la factura Pagada.
+  const [commissionOpen, setCommissionOpen] = useState(false);
+  const [commissionRows, setCommissionRows] = useState<CommissionPayRow[]>([]);
+  const [commissionError, setCommissionError] = useState<string | null>(null);
+  const [commissionBusy, setCommissionBusy] = useState(false);
+  // Factura del modal de comisión. Se guarda aparte porque el detalle se cierra
+  // antes de abrirlo y no debe perderse el id ni el número.
+  const [commissionInvoice, setCommissionInvoice] = useState<{ id: string; number: number } | null>(null);
 
-  function applyFilters(event?: FormEvent) {
+  // G1: turno abierto conocido por el cliente. La validación de caja se hace
+  // ANTES de entrar a emitir o editar (el servidor vuelve a validar).
+  const [shiftKnown, setShiftKnown] = useState(false);
+  const [shiftOpen, setShiftOpen] = useState(false);
+  const [shiftOwn, setShiftOwn] = useState(true);
+  const [shiftOwner, setShiftOwner] = useState<string | null>(null);
+  // Base de apertura del turno (referencia del tope de efectivo del 50%).
+  const [shiftOpeningBase, setShiftOpeningBase] = useState<number | null>(null);
+  const [blockNotice, setBlockNotice] = useState<string | null>(null);
+  useEffect(() => {
+    if (!props.canWrite && !props.canAnnul) return;
+    let cancelled = false;
+    (async () => {
+      const result = await getOpenShiftAction();
+      if (cancelled || !result.success) return;
+      const shift = result.data;
+      setShiftKnown(true);
+      setShiftOpen(shift !== null);
+      setShiftOwn(shift === null || shift.opened_by === props.currentUserId || props.isAdmin);
+      setShiftOwner(shift?.opener_name?.trim() || null);
+      setShiftOpeningBase(shift ? Number(shift.opening_base) : null);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [props.canWrite, props.canAnnul, props.currentUserId, props.isAdmin, createDialogOpen, detailDialogOpen, isEditDialogOpen]);
+
+  // G1: motivo de bloqueo de las acciones que exigen caja propia. El admin
+  // queda exento (la válvula auditada del backend); "sin dato aún" no bloquea.
+  const shiftBlockReason: string | null = !shiftKnown
+    ? null
+    : !shiftOpen
+      ? "No hay caja abierta: abre tu turno para emitir o editar."
+      : !shiftOwn
+        ? shiftOwner
+          ? `La caja abierta es del turno de ${shiftOwner}: solo ${shiftOwner} o un administrador puede emitir o editar.`
+          : "La caja abierta es de otro turno: solo quien abrió el turno o un administrador puede emitir o editar."
+        : null;
+
+  /** G1: valida la caja antes de abrir una acción que la exige. */
+  function passShiftGate(): boolean {
+    if (shiftBlockReason === null) return true;
+    setBlockNotice(shiftBlockReason);
+    return false;
+  }
+
+  function applyFilters(event?: FormEvent, page = 1) {
     event?.preventDefault();
     startViewTransition(async () => {
       setError(null);
-      const result: ActionResult<InvoiceRowWithUser[]> = await listInvoicesAction({
+      const result: ActionResult<{ rows: InvoiceListItem[]; total: number }> = await listInvoicesAction({
         sede_id: props.sedeId,
         status: filters.status || undefined,
         from: filters.from || undefined,
         to: filters.to || undefined,
         user_id: filters.seller || undefined,
         consecutive_number: filters.number ? parseInt(filters.number, 10) : undefined,
+        closed_by: filters.closedBy || undefined,
+        employee_id: filters.employee || undefined,
+        page,
       });
       if (!result.success) {
         setError(result.message);
         return;
       }
-      setInvoices(result.data);
+      setInvoices(result.data.rows);
+      setTotalInvoices(result.data.total);
+      setInvoicePage(page);
     });
   }
 
-  function patchItem(index: number, patch: Partial<ItemDraft>) {
+  // Debe coincidir con INVOICE_PAGE_SIZE del servicio (import por valor
+  // arrastraría código de servidor al cliente).
+  const INVOICE_CLIENT_PAGE_SIZE = 10;
+  const invoicePageCount = Math.max(1, Math.ceil(totalInvoices / INVOICE_CLIENT_PAGE_SIZE));
+
+  function patchDraft(patch: Partial<ItemDraft>) {
+    setItemDraft((prev) => ({ ...prev, ...patch }));
+  }
+
+  function patchEditItem(index: number, patch: Partial<EditItemDraft>) {
+    setEditItems((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+  }
+
+  /** Ajusta un ítem ya agregado al borrador de emisión (edición del listado). */
+  function patchDraftItem(index: number, patch: Partial<ItemDraft>) {
     setItems((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
   }
 
-  function autofillPrice(index: number, type: ItemDraft["item_type"], refId: string) {
+  /**
+   * I1: al elegir el producto se sugieren precio de venta y comisión del
+   * catálogo. La comisión del producto es un valor absoluto; si el cajero la
+   * edita a mano en la línea, la línea manda.
+   */
+  function autofillDraftPrice(type: ItemDraft["item_type"], refId: string) {
     if (type === "producto") {
       const found = props.products.find((row) => row.id === refId);
-      if (found?.sale_price != null) patchItem(index, { unit_price: String(found.sale_price) });
+      if (found?.sale_price != null) patchDraft({ unit_price: String(found.sale_price) });
+      if (found && found.commission_value != null && found.commission_value > 0) {
+        patchDraft({ commission_value: found.commission_value, no_commission: false, commission_mode: "comision" });
+      }
     }
     if (type === "servicio") {
       const found = props.services.find((row) => row.id === refId);
-      if (found) patchItem(index, { unit_price: String(found.price) });
+      if (found) patchDraft({ unit_price: String(found.price) });
     }
+  }
+
+  /**
+   * Modal de ítems generalizado: sirve para crear ("create", agrega al
+   * borrador) y para la edición libre de EMITIDAS ("edit", agrega a la
+   * edición). Vive a nivel raíz para que ambos diálogos lo reutilicen.
+   */
+  function openItemDialog(target: "create" | "edit" = "create") {
+    setItemDraft(emptyItem());
+    setItemError(null);
+    setItemDialogTarget(target);
+    setIsItemDialogOpen(true);
+  }
+
+  function employeeNameOf(employeeId: string): string {
+    const found = props.employees.find((row) => row.id === employeeId);
+    if (!found) return "—";
+    return found.employee_code ? `${found.full_name} (${found.employee_code})` : found.full_name;
+  }
+
+  function addItemFromDialog() {
+    setItemError(null);
+    if (itemDraft.item_type === "producto" && !itemDraft.ref_id) {
+      setItemError("Elija el producto.");
+      return;
+    }
+    if (itemDraft.item_type === "servicio" && !itemDraft.ref_id) {
+      setItemError("Elija el servicio.");
+      return;
+    }
+    if (itemDraft.item_type === "custom" && itemDraft.custom_name.trim() === "") {
+      setItemError("Describa el ítem personalizado.");
+      return;
+    }
+    if (!itemDraft.employee_id) {
+      setItemError("Elija el empleado que atiende.");
+      return;
+    }
+    const qty = toNumber(itemDraft.qty);
+    const price = toNumber(itemDraft.unit_price);
+    if (qty == null || !Number.isInteger(qty) || qty <= 0) {
+      setItemError("Cantidad inválida.");
+      return;
+    }
+    if (price == null || price < 0) {
+      setItemError("Precio inválido.");
+      return;
+    }
+    const employee = props.employees.find((row) => row.id === itemDraft.employee_id);
+    const fixedPay = isFixedPayEmployee(employee);
+    const draft = normalizeDraftCommission(itemDraft, fixedPay);
+    if (draft.item_type === "custom" && draft.commission_mode === "comision") {
+      if (draft.commission_value == null || !(draft.commission_value >= 0)) {
+        setItemError("Indique el valor de la comisión.");
+        return;
+      }
+    }
+    if (draft.item_type === "custom" && draft.commission_mode === "porcentaje" && fixedPay) {
+      if (draft.commission_percent_override == null || !(draft.commission_percent_override >= 0)) {
+        setItemError("Indique el porcentaje para este ítem.");
+        return;
+      }
+    }
+    if (itemDialogTarget === "edit") {
+      setEditItems((prev) => [...prev, { ...draft, discount: 0 }]);
+    } else {
+      setItems((prev) => [...prev, draft]);
+    }
+    setIsItemDialogOpen(false);
   }
 
   // Inventory-style cancel: closing the dialog always resets its draft.
@@ -189,7 +516,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setClientName("");
     setClientDocument("");
     setDiscount("");
-    setItems([emptyItem()]);
+    setItems([]);
     setPortions([{ method_code: "efectivo", amount: "" }]);
     setCreateDialogOpen(false);
   }
@@ -203,18 +530,246 @@ export function InvoicesClient(props: InvoicesClientProps) {
       }
       setDetail(result.data);
       setMotivo("");
+      setClientView(false);
       setDetailDialogOpen(true);
     });
   }
 
+  function closeDetail() {
+    setDetail(null);
+    setMotivo("");
+    setSplitDraft({ method_code: "efectivo", amount: "" });
+    setDetailDialogOpen(false);
+  }
+
+  function toEditDraft(row: {
+    id: string;
+    item_type: string;
+    product_id: string | null;
+    service_id: string | null;
+    custom_name: string | null;
+    employee_id: string;
+    qty: number | string;
+    unit_price: number | string;
+    discount: number | string;
+    no_commission: boolean | null;
+    commission_value: number | string | null;
+    commission_mode: string | null;
+    commission_percent_override: number | string | null;
+  }): EditItemDraft {
+    const commissionValue = row.commission_value == null ? null : Number(row.commission_value);
+    return {
+      id: row.id,
+      item_type: row.item_type as ItemDraft["item_type"],
+      ref_id: row.product_id ?? row.service_id ?? "",
+      custom_name: row.custom_name ?? "",
+      employee_id: row.employee_id,
+      qty: String(row.qty),
+      unit_price: String(row.unit_price),
+      discount: Number(row.discount),
+      no_commission: Boolean(row.no_commission),
+      commission_value: commissionValue,
+      commission_mode: commissionModeOf({
+        item_type: row.item_type,
+        no_commission: row.no_commission,
+        commission_value: commissionValue,
+        commission_mode: row.commission_mode,
+      }),
+      commission_percent_override:
+        row.commission_percent_override == null ? null : Number(row.commission_percent_override),
+    };
+  }
+
+  async function openEdit(id: string) {
+    // G1: no se entra a editar sin caja propia (el servidor vuelve a validar).
+    if (!passShiftGate()) return;
+    setBlockNotice(null);
+    setError(null);
+    setBusy(true);
+    try {
+      const result: ActionResult<InvoiceDetail> = await getInvoiceAction(id);
+      if (!result.success) {
+        setError(result.message);
+        return;
+      }
+      const current = result.data;
+      setDetail(current);
+      setEditItems(current.items.map(toEditDraft));
+      setEditPayments(current.payments.map((payment) => ({ id: payment.id, method_code: payment.method_code })));
+      setEditMotivo("");
+      setEditError(null);
+      setClientView(false);
+      setIsEditDialogOpen(true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitEdit() {
+    if (!detail) return;
+    setEditError(null);
+    const parsedItems = [];
+    for (const [index, item] of editItems.entries()) {
+      const qty = toNumber(item.qty);
+      const price = toNumber(item.unit_price);
+      if (item.item_type === "producto" && !item.ref_id) {
+        setEditError(`Ítem ${index + 1}: elija el producto.`);
+        return;
+      }
+      if (item.item_type === "servicio" && !item.ref_id) {
+        setEditError(`Ítem ${index + 1}: elija el servicio.`);
+        return;
+      }
+      if (item.item_type === "custom" && item.custom_name.trim() === "") {
+        setEditError(`Ítem ${index + 1}: describa el ítem.`);
+        return;
+      }
+      if (!item.employee_id) {
+        setEditError(`Ítem ${index + 1}: el empleado es requerido.`);
+        return;
+      }
+      if (qty == null || !Number.isInteger(qty) || qty <= 0) {
+        setEditError(`Ítem ${index + 1}: cantidad inválida.`);
+        return;
+      }
+      if (price == null || price < 0) {
+        setEditError(`Ítem ${index + 1}: precio inválido.`);
+        return;
+      }
+      const employee = props.employees.find((row) => row.id === item.employee_id);
+      const fixedPay = isFixedPayEmployee(employee);
+      const normalized = normalizeDraftCommission(item, fixedPay);
+      if (normalized.item_type === "custom" && normalized.commission_mode === "comision") {
+        if (normalized.commission_value == null || !(normalized.commission_value >= 0)) {
+          setEditError(`Ítem ${index + 1}: indique el valor de la comisión.`);
+          return;
+        }
+      }
+      if (normalized.item_type === "custom" && normalized.commission_mode === "porcentaje" && fixedPay) {
+        if (normalized.commission_percent_override == null || !(normalized.commission_percent_override >= 0)) {
+          setEditError(`Ítem ${index + 1}: indique el porcentaje para este ítem.`);
+          return;
+        }
+      }
+      parsedItems.push({
+        ...(item.id ? { id: item.id } : {}),
+        item_type: item.item_type,
+        product_id: item.item_type === "producto" ? item.ref_id || null : null,
+        service_id: item.item_type === "servicio" ? item.ref_id || null : null,
+        custom_name: item.item_type === "custom" ? item.custom_name || null : null,
+        employee_id: item.employee_id,
+        qty,
+        unit_price: price,
+        discount: item.discount,
+        no_commission: normalized.no_commission,
+        // Modo explícito (030): el backend normaliza no_commission/valor desde él.
+        commission_mode: normalized.commission_mode,
+        commission_value: normalized.commission_value,
+        commission_percent_override: normalized.commission_percent_override,
+      });
+    }
+    setBusy(true);
+    try {
+      const free = detail.invoice.status === "Emitida";
+      const result: ActionResult<InvoiceDetail> = free
+        ? await editEmittedInvoiceAction(detail.invoice.id, {
+            items: parsedItems,
+            payments: detail.payments.map((payment) => ({
+              id: payment.id,
+              method_code: payment.method_code,
+            })),
+          })
+        : await editInvoiceAction(detail.invoice.id, {
+            motivo: editMotivo,
+            items: parsedItems,
+            payments: editPayments,
+          });
+      if (!result.success) {
+        setEditError(`[${result.code}] ${result.message}`);
+        return;
+      }
+      setDetail(result.data);
+      setIsEditDialogOpen(false);
+      setNotice(
+        free
+          ? `Factura #${result.data.invoice.consecutive_number} actualizada (nuevo total ${formatMoney(result.data.invoice.total)}).`
+          : `Factura #${result.data.invoice.consecutive_number} actualizada (total intacto ${formatMoney(result.data.invoice.total)}).`,
+      );
+      await applyFilters(undefined, invoicePage);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function submitInvoice(event: FormEvent) {
     event.preventDefault();
+    if (buildCreatePayload() === null) return;
+    // Validación local superada: pide confirmación clásica antes de emitir.
+    setConfirmKind("emit");
+  }
+
+  async function confirmEmit() {
+    const payload = buildCreatePayload();
+    if (payload === null) {
+      setConfirmKind(null);
+      return;
+    }
+    setBusy(true);
+    let result: ActionResult<InvoiceDetail>;
+    try {
+      result = await createInvoiceAction(payload);
+    } finally {
+      setBusy(false);
+    }
+    if (!result.success) {
+      setError(`[${result.code}] ${result.message}`);
+      setConfirmKind(null);
+      return;
+    }
+    setNotice(`Factura #${result.data.invoice.consecutive_number} ${result.data.invoice.status.toLowerCase()}.`);
+    setClientName("");
+    setClientDocument("");
+    setDiscount("");
+    setItems([]);
+    setPortions([{ method_code: "efectivo", amount: "" }]);
+    setConfirmKind(null);
+    setDetail(result.data);
+    setCreateDialogOpen(false);
+    setDetailDialogOpen(true);
+    await applyFilters();
+    await askCommissionPayment(result.data);
+  }
+
+  function buildCreatePayload(): {
+    client_name: string;
+    client_document: string | null;
+    items: Array<{
+      item_type: string;
+      product_id: string | null;
+      service_id: string | null;
+      custom_name: string | null;
+      employee_id: string;
+      qty: number;
+      unit_price: number;
+      discount: number;
+      no_commission: boolean;
+      commission_value: number | null;
+      commission_mode: CommissionMode;
+      commission_percent_override: number | null;
+    }>;
+    discount: number;
+    payments: Array<{ method_code: string; amount: number }>;
+  } | null {
     setError(null);
     setNotice(null);
+    if (items.length === 0) {
+      setError("Agregue al menos un ítem a la factura.");
+      return null;
+    }
     const parsedDiscount = discount.trim() === "" ? 0 : toNumber(discount);
     if (parsedDiscount == null) {
       setError("Descuento inválido.");
-      return;
+      return null;
     }
     const parsedItems = [];
     for (const [index, item] of items.entries()) {
@@ -222,15 +777,30 @@ export function InvoicesClient(props: InvoicesClientProps) {
       const price = toNumber(item.unit_price);
       if (!item.employee_id) {
         setError(`Ítem ${index + 1}: el empleado es requerido.`);
-        return;
+        return null;
       }
       if (qty == null || !Number.isInteger(qty) || qty <= 0) {
         setError(`Ítem ${index + 1}: cantidad inválida.`);
-        return;
+        return null;
       }
       if (price == null || price < 0) {
         setError(`Ítem ${index + 1}: precio inválido.`);
-        return;
+        return null;
+      }
+      const employee = props.employees.find((row) => row.id === item.employee_id);
+      const fixedPay = isFixedPayEmployee(employee);
+      const normalized = normalizeDraftCommission(item, fixedPay);
+      if (normalized.item_type === "custom" && normalized.commission_mode === "comision") {
+        if (normalized.commission_value == null || !(normalized.commission_value >= 0)) {
+          setError(`Ítem ${index + 1}: indique el valor de la comisión.`);
+          return null;
+        }
+      }
+      if (normalized.item_type === "custom" && normalized.commission_mode === "porcentaje" && fixedPay) {
+        if (normalized.commission_percent_override == null || !(normalized.commission_percent_override >= 0)) {
+          setError(`Ítem ${index + 1}: indique el porcentaje para este ítem.`);
+          return null;
+        }
       }
       parsedItems.push({
         item_type: item.item_type,
@@ -241,7 +811,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
         qty,
         unit_price: price,
         discount: 0,
-        no_commission: item.no_commission,
+        no_commission: normalized.no_commission,
+        // Modo explícito (030): el backend normaliza no_commission/valor desde él.
+        commission_mode: normalized.commission_mode,
+        commission_value: normalized.commission_value,
+        commission_percent_override: normalized.commission_percent_override,
       });
     }
     const parsedPortions = [];
@@ -250,42 +824,35 @@ export function InvoicesClient(props: InvoicesClientProps) {
       if (amount == null) continue;
       if (amount <= 0) {
         setError("Las porciones de pago deben ser mayores a 0.");
-        return;
+        return null;
       }
       parsedPortions.push({ method_code: portion.method_code, amount });
     }
-    setBusy(true);
-    let result: ActionResult<InvoiceDetail>;
-    try {
-      result = await createInvoiceAction({
-        client_name: clientName,
-        client_document: clientDocument.trim() === "" ? null : clientDocument,
-        items: parsedItems,
-        discount: parsedDiscount,
-        payments: parsedPortions,
-      });
-    } finally {
-      setBusy(false);
-    }
-    if (!result.success) {
-      setError(`[${result.code}] ${result.message}`);
-      return;
-    }
-    setNotice(`Factura #${result.data.invoice.consecutive_number} ${result.data.invoice.status.toLowerCase()}.`);
-    setClientName("");
-    setClientDocument("");
-    setDiscount("");
-    setItems([emptyItem()]);
-    setPortions([{ method_code: "efectivo", amount: "" }]);
-    setDetail(result.data);
-    setCreateDialogOpen(false);
-    setDetailDialogOpen(true);
-    await applyFilters();
+    return {
+      client_name: clientName,
+      client_document: clientDocument.trim() === "" ? null : clientDocument,
+      items: parsedItems,
+      discount: parsedDiscount,
+      payments: parsedPortions,
+    };
   }
 
   async function submitAnnul(event: FormEvent) {
     event.preventDefault();
     if (!detail) return;
+    if (motivo.trim() === "") {
+      setError("Indique el motivo de anulación.");
+      return;
+    }
+    // Motivo presente: pide confirmación clásica antes de anular.
+    setConfirmKind("annul");
+  }
+
+  async function confirmAnnul() {
+    if (!detail) {
+      setConfirmKind(null);
+      return;
+    }
     setError(null);
     setNotice(null);
     setBusy(true);
@@ -299,19 +866,41 @@ export function InvoicesClient(props: InvoicesClientProps) {
     }
     if (!result.success) {
       setError(`[${result.code}] ${result.message}`);
+      setConfirmKind(null);
       return;
     }
     setNotice(`Factura #${result.data.invoice.consecutive_number} anulada (stock revertido).`);
     setDetail(result.data);
-    await applyFilters();
+    setConfirmKind(null);
+    await applyFilters(undefined, invoicePage);
   }
 
   async function submitSplit(event: FormEvent) {
     event.preventDefault();
     if (!detail) return;
+    // G1: cobrar también exige caja propia (el servidor vuelve a validar).
+    if (shiftBlockReason !== null) {
+      setError(shiftBlockReason);
+      return;
+    }
     const amount = toNumber(splitDraft.amount);
     if (amount == null || amount <= 0) {
       setError("Monto de la porción inválido.");
+      return;
+    }
+    // Monto válido: pide confirmación clásica antes de pagar.
+    setConfirmKind("pay");
+  }
+
+  async function confirmPay() {
+    if (!detail) {
+      setConfirmKind(null);
+      return;
+    }
+    const amount = toNumber(splitDraft.amount);
+    if (amount == null || amount <= 0) {
+      setError("Monto de la porción inválido.");
+      setConfirmKind(null);
       return;
     }
     setError(null);
@@ -336,7 +925,115 @@ export function InvoicesClient(props: InvoicesClientProps) {
     );
     setDetail(result.data);
     setSplitDraft({ method_code: "efectivo", amount: "" });
-    await applyFilters();
+    setConfirmKind(null);
+    await applyFilters(undefined, invoicePage);
+    await askCommissionPayment(result.data);
+  }
+
+  /**
+   * Pago inmediato de comisión(es): al dejar la factura en "Pagada" se ofrece
+   * pagar lo pendiente de cada empleado con `payout_mode === "inmediato"` que
+   * tenga comisión en la factura. El monto autoritativo lo calcula el servidor
+   * (`getPendingCommissionsAction`); acá solo se elige el método de pago.
+   */
+  async function askCommissionPayment(next: InvoiceDetail) {
+    if (next.invoice.status !== "Pagada") return;
+    const employeeIds = [...new Set(next.items.map((item) => item.employee_id))].filter(
+      (id) => props.employees.find((row) => row.id === id)?.payout_mode === "inmediato",
+    );
+    if (employeeIds.length === 0) return;
+    let result: ActionResult<Array<{ employee_id: string; pending: number }>>;
+    try {
+      result = await getPendingCommissionsAction({ invoice_id: next.invoice.id, employee_ids: employeeIds });
+    } catch (error) {
+      // La acción lanzó (red/timeout): no se apila el modal ni se rompe el
+      // flujo de emisión/cobro; se reporta y se sigue.
+      setError(error instanceof Error ? error.message : "No se pudieron calcular las comisiones pendientes.");
+      return;
+    }
+    if (!result.success) {
+      setError(`[${result.code}] ${result.message}`);
+      return;
+    }
+    const payable = result.data.filter((row) => row.pending > 0);
+    if (payable.length === 0) return;
+    const fallbackMethod =
+      props.methods.find((row) => row.code === "efectivo")?.code ?? props.methods[0]?.code ?? "efectivo";
+    // Fix C: se guarda la factura y se cierra su detalle antes de abrir el
+    // modal de comisión, para que no queden dos diálogos apilados y el de
+    // comisión se lea solo. El id no depende de `detail` tras el cierre.
+    setCommissionInvoice({ id: next.invoice.id, number: next.invoice.consecutive_number });
+    setDetailDialogOpen(false);
+    setCommissionRows(
+      payable.map((row) => ({
+        employee_id: row.employee_id,
+        employee_name: employeeNameOf(row.employee_id),
+        pending: row.pending,
+        method_code: fallbackMethod,
+      })),
+    );
+    setCommissionError(null);
+    setCommissionOpen(true);
+  }
+
+  /**
+   * Cierra el modal de comisión. Si el detalle de la factura seguía cargado, lo
+   * vuelve a mostrar (se ocultó al abrir el de comisión).
+   */
+  function closeCommission() {
+    setCommissionOpen(false);
+    setCommissionRows([]);
+    setCommissionError(null);
+    setCommissionInvoice(null);
+    if (detail) setDetailDialogOpen(true);
+  }
+
+  /** Confirma el pago de las comisiones listadas; si una falla, la conserva. */
+  async function confirmCommissionPayment() {
+    if (!commissionInvoice || commissionRows.length === 0) return;
+    setCommissionBusy(true);
+    setCommissionError(null);
+    let paidCount = 0;
+    const failed: CommissionPayRow[] = [];
+    try {
+      for (const [index, row] of commissionRows.entries()) {
+        let result: Awaited<ReturnType<typeof payCommissionNowAction>>;
+        try {
+          result = await payCommissionNowAction({
+            invoice_id: commissionInvoice.id,
+            employee_id: row.employee_id,
+            amount: row.pending,
+            method_code: row.method_code,
+          });
+        } catch (error) {
+          // La acción lanzó (red/timeout): conserva esta fila y las siguientes
+          // para reintentar; el finally libera el botón.
+          failed.push(...commissionRows.slice(index));
+          setCommissionError(
+            error instanceof Error ? error.message : "No se pudo pagar la comisión.",
+          );
+          break;
+        }
+        if (result.success) {
+          paidCount += 1;
+        } else {
+          failed.push(row);
+          setCommissionError(`[${result.code}] ${result.message}`);
+        }
+      }
+    } finally {
+      setCommissionBusy(false);
+    }
+    if (failed.length === 0) {
+      closeCommission();
+      setNotice(
+        paidCount === 1
+          ? "Comisión pagada desde la caja del turno."
+          : `${paidCount} comisiones pagadas desde la caja del turno.`,
+      );
+    } else {
+      setCommissionRows(failed);
+    }
   }
 
   // Hoja factura: totales vivos del borrador (solo presentación; la verdad la calcula el servidor).
@@ -371,8 +1068,64 @@ export function InvoicesClient(props: InvoicesClientProps) {
     .join(", ");
   const draftGrandTotal = draftTotal + draftSurcharge;
 
+  // Totalizar: rellena la primera porción vacía con el neto pendiente.
+  // Las porciones son NETOS; el recargo se suma solo al total.
+  const portionsFilled = portions.reduce((acc, portion) => acc + (toNumber(portion.amount) ?? 0), 0);
+  const portionsRemaining = Math.max(0, draftTotal - portionsFilled);
+  const canTotalize = portions.some((portion) => portion.amount.trim() === "") && portionsRemaining > 0;
+
   // Determinar si hay pago inmediato (para botón "Emitir y pagar")
   const hasImmediatePayment = portions.some((p) => (toNumber(p.amount) ?? 0) > 0);
+
+  // Edición libre (Emitida: la cajera del turno edita sin motivo y el total
+  // se recalcula) vs edición estricta (Pagada: solo admin, motivo + total
+  // inmutable). Anulada nunca se edita (el botón ni se muestra).
+  const isFreeEdit = detail?.invoice.status === "Emitida";
+  // Medidor de conciliación de edición: el total nunca cambia.
+  const editSubtotal = editItems.reduce((acc, item) => {
+    const qty = toNumber(item.qty) ?? 0;
+    const price = toNumber(item.unit_price) ?? 0;
+    return acc + qty * price;
+  }, 0);
+  const editSubtotalOk =
+    detail !== null && Math.abs(editSubtotal - Number(detail.invoice.subtotal)) < 0.01;
+  const editFeeRows = (detail?.payments ?? []).map((payment) => {
+    const draft = editPayments.find((row) => row.id === payment.id);
+    const code = draft?.method_code ?? payment.method_code;
+    const feePct = Number(props.methods.find((row) => row.code === code)?.fee_percent ?? 0);
+    return { id: payment.id, code, feePct, ok: feePct === Number(payment.fee_percent ?? 0) };
+  });
+  const editFeesOk = editFeeRows.every((row) => row.ok);
+  const canSaveEdit =
+    detail !== null &&
+    editItems.length > 0 &&
+    !busy &&
+    (isFreeEdit || (editMotivo.trim() !== "" && editSubtotalOk && editFeesOk));
+
+  // Estimado del nuevo total en edición libre (solo presentación; los
+  // impuestos vigentes y el recargo emitido los recalcula el servidor).
+  const freeEditDiscount = detail ? Number(detail.invoice.discount) : 0;
+  const freeEditBase = Math.max(0, editSubtotal - freeEditDiscount);
+  const freeEditTax = props.taxes.reduce((acc, tax) => {
+    const percent = Number(tax.percent ?? 0);
+    return acc + Math.round(freeEditBase * (percent / 100) * 100) / 100;
+  }, 0);
+  const freeEditTotal = freeEditBase + freeEditTax + (detail ? Number(detail.invoice.surcharge ?? 0) : 0);
+
+  function totalizePortions() {
+    const firstEmpty = portions.findIndex((portion) => portion.amount.trim() === "");
+    if (firstEmpty === -1) return;
+    const filled = portions.reduce((acc, portion) => acc + (toNumber(portion.amount) ?? 0), 0);
+    const remaining = Math.max(0, draftTotal - filled);
+    if (remaining <= 0) return;
+    const value = String(Math.round(remaining * 100) / 100);
+    setPortions((prev) => prev.map((row, i) => (i === firstEmpty ? { ...row, amount: value } : row)));
+  }
+
+  // Métodos ya usados en otras porciones: cada método se cobra una sola vez.
+  const usedMethodCodes = new Set(portions.map((portion) => portion.method_code));
+  const firstFreeMethod =
+    props.methods.find((row) => row.is_active !== false && !usedMethodCodes.has(row.code))?.code ?? null;
 
   function draftItemName(item: ItemDraft): string {
     if (item.item_type === "producto") {
@@ -384,9 +1137,53 @@ export function InvoicesClient(props: InvoicesClientProps) {
     return item.custom_name.trim() === "" ? "Ítem personalizado" : item.custom_name;
   }
 
+  /**
+   * Nombre visible de un ítem ya emitido. El detalle no trae el nombre del
+   * catálogo (solo product_id/service_id), así que se resuelve contra los
+   * catálogos cargados en el cliente. Si el id no está disponible (ítem
+   * inactivo o de otra sede), se usa una etiqueta genérica en lugar de
+   * mostrar el tipo crudo o un identificador interno.
+   */
+  function detailItemName(row: InvoiceItemRow): string {
+    if (row.item_type === "producto") {
+      return props.products.find((product) => product.id === row.product_id)?.name ?? "Producto";
+    }
+    if (row.item_type === "servicio") {
+      return props.services.find((service) => service.id === row.service_id)?.name ?? "Servicio";
+    }
+    return row.custom_name?.trim() ? row.custom_name : "Ítem personalizado";
+  }
+
+  /**
+   * Botón "Modo cliente": alterna la vista para mostrar la factura en
+   * pantalla. Activo oculta empleado y comisión (datos internos de nómina).
+   */
+  function clientViewToggle() {
+    return (
+      <button
+        type="button"
+        onClick={() => setClientView((prev) => !prev)}
+        aria-pressed={clientView}
+        className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-100"
+      >
+        {clientView ? (
+          <EyeOff className="h-3.5 w-3.5" aria-hidden="true" />
+        ) : (
+          <Eye className="h-3.5 w-3.5" aria-hidden="true" />
+        )}
+        {clientView ? "Volver a vista interna" : "Ver como cliente"}
+      </button>
+    );
+  }
+
   // Papel factura: paleta clara fija a propósito (documento, no tema).
   const paperInputClass =
     "flex h-10 w-full rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-slate-500 disabled:cursor-not-allowed disabled:opacity-50";
+
+  // Empleado elegido en el diálogo de ítem: define si el porcentaje del
+  // personalizado se toma del empleado o se digita explícitamente.
+  const itemDraftEmployee = props.employees.find((row) => row.id === itemDraft.employee_id);
+  const itemDraftFixedPay = isFixedPayEmployee(itemDraftEmployee);
 
   return (
     <div className="flex min-h-0 flex-col gap-6">
@@ -407,14 +1204,24 @@ export function InvoicesClient(props: InvoicesClientProps) {
               >
                 <button
                   type="button"
-                  onClick={() => setCreateDialogOpen(true)}
-                  className="inline-flex h-10 items-center justify-center gap-2 whitespace-nowrap rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-all duration-200 hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 active:scale-[0.98]"
+                  aria-disabled={shiftBlockReason !== null}
+                  title={shiftBlockReason ?? undefined}
+                  onClick={() => {
+                    if (!passShiftGate()) return;
+                    setBlockNotice(null);
+                    setClientView(false);
+                    setCreateDialogOpen(true);
+                  }}
+                  className={cn(
+                    "inline-flex h-10 items-center justify-center gap-2 whitespace-nowrap rounded-md bg-emerald-700 px-4 py-2 text-sm font-semibold text-white shadow-sm transition-all duration-200 hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 active:scale-[0.98]",
+                    shiftBlockReason !== null && "opacity-50",
+                  )}
                 >
                   <Plus className="h-4 w-4" aria-hidden="true" />
                   Emitir factura
                 </button>
-                <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
-                  <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
+                <DialogContent className="max-w-5xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                  <div className="rounded-xl bg-white text-slate-900 shadow-2xl">
                     <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
                       <div className="flex flex-wrap items-start justify-between gap-4">
                         <div>
@@ -452,6 +1259,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         </label>
                       </div>
 
+                        <div className="flex justify-end">
+                          {clientViewToggle()}
+                        </div>
                         <div className="overflow-x-auto rounded-lg border border-slate-200">
                           <table className="w-full min-w-[820px] text-left text-sm text-slate-900">
                             <thead>
@@ -459,10 +1269,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 <th className="px-3 py-2">#</th>
                                 <th className="px-3 py-2">Cant.</th>
                                 <th className="px-3 py-2">Descripción</th>
-                                <th className="px-3 py-2">Empleado</th>
+                                {!clientView && <th className="px-3 py-2">Empleado</th>}
                                 <th className="px-3 py-2 text-right">V. unitario</th>
                                 <th className="px-3 py-2 text-right">Subtotal</th>
-                                <th className="px-3 py-2 text-center">¿Comisión?</th>
+                                {!clientView && <th className="px-3 py-2 text-center">Comisión</th>}
                                 <th className="px-3 py-2"><span className="sr-only">Quitar</span></th>
                               </tr>
                             </thead>
@@ -473,175 +1283,122 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 return (
                                   <tr key={index} className="border-t border-slate-200 align-top">
                                     <td className="px-3 py-2 font-semibold">{index + 1}</td>
-                                    <td className="px-3 py-2">
-                                      <input
-                                        className={`${paperInputClass} w-20`}
-                                        value={item.qty}
-                                        onChange={(event) => patchItem(index, { qty: event.target.value })}
-                                        placeholder="1"
-                                        inputMode="numeric"
-                                        required
-                                        aria-label={`Ítem ${index + 1} cantidad`}
-                                      />
+                                    <td className="whitespace-nowrap px-3 py-2">{item.qty}</td>
+                                    <td className="min-w-[200px] px-3 py-2">
+                                      <p className="font-medium">{draftItemName(item)}</p>
+                                      <p className="text-xs text-slate-500">
+                                        {item.item_type === "producto"
+                                          ? "Producto"
+                                          : item.item_type === "servicio"
+                                            ? "Servicio"
+                                            : "Personalizado"}
+                                      </p>
                                     </td>
-                                    <td className="min-w-[230px] px-3 py-2">
-                                      <Select
-                                        value={item.item_type}
-                                        onValueChange={(value) => {
-                                          const type = value as ItemDraft["item_type"];
-                                          patchItem(index, { item_type: type, ref_id: "", custom_name: "", unit_price: "" });
-                                        }}
-                                      >
-                                        <SelectTrigger className={paperInputClass} aria-label={`Ítem ${index + 1} tipo`}>
-                                          <SelectValue placeholder="Seleccione un tipo" />
-                                        </SelectTrigger>
-                                        <SelectContent>
-                                          <SelectItem value="producto">Producto</SelectItem>
-                                          <SelectItem value="servicio">Servicio</SelectItem>
-                                          <SelectItem value="custom">Personalizado</SelectItem>
-                                        </SelectContent>
-                                      </Select>
-                                      {item.item_type === "producto" && (
-                                        <Combobox
-                                          value={item.ref_id}
-                                          onValueChange={(value) => {
-                                            patchItem(index, { ref_id: value });
-                                            autofillPrice(index, "producto", value);
-                                          }}
-                                          placeholder="Producto…"
-                                          options={props.products
-                                            .filter((row) => row.is_active)
-                                            .map((row) => ({
-                                              value: row.id,
-                                              label: row.name,
-                                              description: `Stock: ${row.stock_qty} • 💰 Con comisión`,
-                                            }))}
-                                          ariaLabel={`Ítem ${index + 1} producto`}
-                                          filterPlaceholder="Buscar producto..."
-                                        />
-                                      )}
-{item.item_type === "servicio" && (
-                                        <Combobox
-                                          value={item.ref_id}
-                                          onValueChange={(value) => {
-                                            patchItem(index, { ref_id: value });
-                                            autofillPrice(index, "servicio", value);
-                                          }}
-                                          placeholder="Servicio…"
-                                          options={props.services
-                                            .filter((row) => row.is_active)
-                                            .map((row) => ({
-                                              value: row.id,
-                                              label: row.name,
-                                              description: "(sin comisión)",
-                                            }))}
-                                          ariaLabel={`Ítem ${index + 1} servicio`}
-                                          filterPlaceholder="Buscar servicio..."
-                                        />
-                                      )}
-                                      {item.item_type === "custom" && (
-                                        <input
-                                          className={`${paperInputClass} mt-2`}
-                                          value={item.custom_name}
-                                          onChange={(event) => patchItem(index, { custom_name: event.target.value })}
-                                          placeholder="Descripción"
-                                          required
-                                          aria-label={`Ítem ${index + 1} descripción`}
-                                        />
-                                      )}
-                                      <p className="mt-1 text-xs text-slate-500">{draftItemName(item)}</p>
-                                    </td>
-                                    <td className="min-w-[150px] px-3 py-2">
-<Combobox
-                                        value={item.employee_id}
-                                        onValueChange={(value) => patchItem(index, { employee_id: value })}
-                                        placeholder="Empleado…"
-                                        options={props.employees.map((row) => ({
-                                          value: row.id,
-                                          label: row.full_name,
-                                          description: `${row.employee_code ?? ''} · ${row.document ?? ''}`.trim(),
-                                        }))}
-                                        ariaLabel={`Ítem ${index + 1} empleado`}
-                                        filterPlaceholder="Buscar empleado..."
-                                      />
-                                    </td>
-                                    <td className="px-3 py-2">
-                                      <input
-                                        className={`${paperInputClass} w-28 text-right`}
-                                        value={formatMoneyInput(item.unit_price)}
-                                        onChange={(event) => patchItem(index, { unit_price: stripMoneyInput(event.target.value) })}
-                                        placeholder="0"
-                                        inputMode="numeric"
-                                        required
-                                        aria-label={`Ítem ${index + 1} precio`}
-                                      />
+                                    {!clientView && (
+                                      <td className="min-w-[140px] px-3 py-2">{employeeNameOf(item.employee_id)}</td>
+                                    )}
+                                    <td className="whitespace-nowrap px-3 py-2 text-right">
+                                      {formatMoney(linePrice)}
                                     </td>
                                     <td className="whitespace-nowrap px-3 py-2 text-right font-medium">
                                       {formatMoney(lineQty * linePrice)}
                                     </td>
-                                    <td className="px-3 py-2 text-center">
-                                      {item.item_type === "servicio" ? (
-                                        <span className="text-xs text-slate-500">Sin comisión</span>
-                                      ) : item.item_type === "custom" ? (
-                                        <div className="flex flex-col gap-1">
-                                          <label className="flex items-center gap-1.5 text-sm">
+                                    {!clientView && (
+                                      <td className="whitespace-nowrap px-3 py-2 text-center">
+                                        {item.commission_mode === "ninguna" ? (
+                                          <span className="text-xs text-slate-500">Sin comisión</span>
+                                        ) : item.item_type === "servicio" ? (
+                                          <span
+                                            className="text-xs text-slate-600"
+                                            title="Se paga el porcentaje del empleado sobre el subtotal."
+                                          >
+                                            % del empleado
+                                          </span>
+                                        ) : item.commission_mode === "porcentaje" ? (
+                                          <span
+                                            className="text-xs text-slate-600"
+                                            title="Porcentaje sobre el subtotal; se paga en nómina."
+                                          >
+                                            {item.commission_percent_override != null
+                                              ? `${item.commission_percent_override}% (ítem)`
+                                              : "% del empleado"}
+                                          </span>
+                                        ) : item.item_type === "producto" ? (
+                                          <div className="flex flex-col items-center gap-0.5">
+                                            <span
+                                              className="text-xs text-slate-600"
+                                              title="Valor de comisión por unidad; se multiplica por la cantidad."
+                                            >
+                                              {item.commission_value == null
+                                                ? "—"
+                                                : formatMoney(item.commission_value)}
+                                            </span>
+                                            {item.commission_value != null && (
+                                              <span className="text-[10px] text-slate-500">
+                                                × cantidad
+                                              </span>
+                                            )}
+                                          </div>
+                                        ) : (
+                                          <div className="flex flex-col items-center gap-0.5">
                                             <input
-                                              type="checkbox"
-                                              checked={!item.no_commission}
-                                              onChange={(e) => patchItem(index, { no_commission: !e.target.checked })}
-                                              className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
-                                            />
-                                            <span className="text-slate-600">¿Tiene comisión?</span>
-                                          </label>
-                                          {!item.no_commission && (
-                                            <input
-                                              type="number"
-                                              className={`${paperInputClass} w-20`}
-                                              value={item.commission_value ?? ""}
-                                              onChange={(e) => patchItem(index, { commission_value: e.target.value === "" ? null : Number(e.target.value) })}
-                                              placeholder="%"
-                                              min={0}
-                                              max={100}
-                                              step={0.01}
-                                              inputMode="decimal"
+                                              className={`${paperInputClass} h-9 w-28 text-right`}
+                                              value={formatMoneyInput(
+                                                item.commission_value == null ? "" : String(item.commission_value),
+                                              )}
+                                              onChange={(event) =>
+                                                patchDraftItem(index, {
+                                                  commission_value:
+                                                    event.target.value.trim() === ""
+                                                      ? null
+                                                      : Number(stripMoneyInput(event.target.value)),
+                                                })
+                                              }
+                                              placeholder="Valor $"
+                                              inputMode="numeric"
                                               aria-label={`Ítem ${index + 1} valor comisión`}
+                                              title="Valor de comisión por unidad; se multiplica por la cantidad."
                                             />
-                                          )}
-                                        </div>
-                                      ) : (
-                                        <label className="flex items-center gap-1.5 text-sm">
-                                          <input
-                                            type="checkbox"
-                                            checked={!item.no_commission}
-                                            onChange={(e) => patchItem(index, { no_commission: !e.target.checked })}
-                                            className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
-                                          />
-                                          <span className="text-slate-600">¿Tiene comisión?</span>
-                                        </label>
-                                      )}
-                                    </td>
+                                            {item.commission_value == null ? (
+                                              <span className="text-[10px] text-slate-500">
+                                                Requerido
+                                              </span>
+                                            ) : (
+                                              <span className="text-[10px] text-slate-500">
+                                                × cantidad
+                                              </span>
+                                            )}
+                                          </div>
+                                        )}
+                                      </td>
+                                    )}
                                     <td className="px-3 py-2">
-                                      {items.length > 1 && (
-                                        <button
-                                          type="button"
-                                          aria-label={`Quitar ítem ${index + 1}`}
-                                          onClick={() => setItems((prev) => prev.filter((_, i) => i !== index))}
-                                          className="rounded-md border border-slate-300 p-2 text-slate-500 hover:bg-slate-100"
-                                        >
-                                          <Trash2 className="h-4 w-4" aria-hidden="true" />
-                                        </button>
-                                      )}
+                                      <button
+                                        type="button"
+                                        aria-label={`Quitar ítem ${index + 1}`}
+                                        onClick={() => setItems((prev) => prev.filter((_, i) => i !== index))}
+                                        className="rounded-md border border-slate-300 p-2 text-slate-500 hover:bg-slate-100"
+                                      >
+                                        <Trash2 className="h-4 w-4" aria-hidden="true" />
+                                      </button>
                                     </td>
                                   </tr>
                                 );
                               })}
+                              {items.length === 0 && (
+                                <tr>
+                                  <td colSpan={clientView ? 6 : 8} className="px-3 py-4 text-center text-sm text-slate-500">
+                                    Sin ítems. Agregue al menos uno para emitir.
+                                  </td>
+                                </tr>
+                              )}
                             </tbody>
                           </table>
                         </div>
 
                         <button
                           type="button"
-                          onClick={() => setItems((prev) => [...prev, emptyItem()])}
+                          onClick={() => openItemDialog("create")}
                           className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 text-sm font-medium text-slate-600 hover:bg-slate-50"
                         >
                           <Plus className="h-4 w-4" aria-hidden="true" />
@@ -668,11 +1425,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     <SelectValue placeholder="Método de pago" />
                                   </SelectTrigger>
                                   <SelectContent>
-                                    {props.methods.map((row) => (
-                                      <SelectItem key={row.id} value={row.code}>
-                                        {row.name}
-                                      </SelectItem>
-                                    ))}
+                                    {props.methods
+                                      .filter(
+                                        (row) =>
+                                          row.is_active !== false &&
+                                          (row.code === portion.method_code || !usedMethodCodes.has(row.code)),
+                                      )
+                                      .map((row) => (
+                                        <SelectItem key={row.id} value={row.code}>
+                                          {row.name}
+                                          {row.fee_percent > 0 ? ` (+${row.fee_percent}%)` : ""}
+                                        </SelectItem>
+                                      ))}
                                   </SelectContent>
                                 </Select>
                               </label>
@@ -689,6 +1453,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   placeholder="0"
                                   inputMode="numeric"
                                 />
+                                {draftFees[index] && draftFees[index].fee > 0 && (
+                                  <span className="text-xs font-normal text-emerald-700">
+                                    +{formatMoney(draftFees[index].fee)} recargo → cobra{" "}
+                                    {formatMoney(draftFees[index].gross)}
+                                  </span>
+                                )}
                               </label>
                               {portions.length > 1 && (
                                 <button
@@ -704,14 +1474,55 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           ))}
                         </div>
 
-                        <button
-                          type="button"
-                          onClick={() => setPortions((prev) => [...prev, { method_code: "efectivo", amount: "" }])}
-                          className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 text-sm font-medium text-slate-600 hover:bg-slate-50"
-                        >
-                          <Banknote className="h-4 w-4" aria-hidden="true" />
-                          Dividir cobro (agregar porción)
-                        </button>
+                        <div className="flex flex-col gap-2 sm:flex-row">
+                          <button
+                            type="button"
+                            disabled={!canTotalize}
+                            title={
+                              canTotalize
+                                ? "Rellena la primera porción vacía con el neto pendiente"
+                                : "Nada por rellenar"
+                            }
+                            onClick={totalizePortions}
+                            className="flex h-10 flex-1 items-center justify-center gap-2 rounded-lg border border-slate-300 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            Totalizar pagos
+                          </button>
+                          <button
+                            type="button"
+                            disabled={!firstFreeMethod}
+                            title={!firstFreeMethod ? "Todos los métodos ya están en uso" : undefined}
+                            onClick={() =>
+                              setPortions((prev) => {
+                                const filledPrev = prev.reduce(
+                                  (acc, portion) => acc + (toNumber(portion.amount) ?? 0),
+                                  0,
+                                );
+                                const remainingPrev = Math.max(0, draftTotal - filledPrev);
+                                return [
+                                  ...prev,
+                                  {
+                                    method_code:
+                                      props.methods.find(
+                                        (row) =>
+                                          row.is_active !== false &&
+                                          !prev.some((portion) => portion.method_code === row.code),
+                                      )?.code ?? "efectivo",
+                                    amount:
+                                      remainingPrev > 0 ? String(Math.round(remainingPrev * 100) / 100) : "",
+                                  },
+                                ];
+                              })
+                            }
+                            className="flex h-10 flex-1 items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            <Banknote className="h-4 w-4" aria-hidden="true" />
+                            Dividir cobro
+                          </button>
+                        </div>
+                        {!firstFreeMethod && (
+                          <p className="text-xs text-slate-500">Todos los métodos ya están en uso.</p>
+                        )}
 
                         <div className="flex justify-end">
                           <dl className="w-full max-w-xs space-y-1 text-sm text-slate-900">
@@ -754,6 +1565,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           </dl>
                         </div>
 
+                        {shiftBlockReason !== null && (
+                          <p role="status" className="rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
+                            {shiftBlockReason}
+                          </p>
+                        )}
                         {error && (
                           <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
                             {error}
@@ -782,6 +1598,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
               </Dialog>
             )}
           </div>
+          {(blockNotice ?? shiftBlockReason) !== null && (
+            <p
+              role={blockNotice ? "alert" : "status"}
+              className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800"
+            >
+              {blockNotice ?? shiftBlockReason}
+            </p>
+          )}
         </CardHeader>
         <CardContent>
           <form onSubmit={applyFilters} className="mt-0 flex flex-wrap items-end gap-3">
@@ -822,6 +1646,44 @@ export function InvoicesClient(props: InvoicesClientProps) {
               />
             </Label>
             <Label className="min-w-[10rem]">
+              Cerró por
+              <Combobox
+                value={filters.closedBy}
+                onValueChange={(closedBy) => setFilters({ ...filters, closedBy })}
+                placeholder="Todos"
+                allowClear
+                clearLabel="Todos"
+                options={props.employees
+                  .filter((row) => row.is_active)
+                  .map((row) => ({
+                    value: row.id,
+                    label: row.full_name,
+                    description: row.employee_code ?? '',
+                  }))}
+                ariaLabel="Filtrar por quien cerró"
+                filterPlaceholder="Buscar..."
+              />
+            </Label>
+            <Label className="min-w-[10rem]">
+              Empleado
+              <Combobox
+                value={filters.employee}
+                onValueChange={(employee) => setFilters({ ...filters, employee })}
+                placeholder="Todos"
+                allowClear
+                clearLabel="Todos"
+                options={props.employees
+                  .filter((row) => row.is_active)
+                  .map((row) => ({
+                    value: row.id,
+                    label: row.full_name,
+                    description: row.employee_code ?? '',
+                  }))}
+                ariaLabel="Filtrar por empleado participante"
+                filterPlaceholder="Buscar..."
+              />
+            </Label>
+            <Label className="min-w-[10rem]">
               Nº Factura
               <Input
                 className={inputClass}
@@ -854,49 +1716,98 @@ export function InvoicesClient(props: InvoicesClientProps) {
               {isViewPending ? "Filtrando…" : "Filtrar"}
             </Button>
           </form>
-          <ul className="mt-4 flex flex-col gap-2">
+          <div className="mt-4 overflow-hidden rounded-lg border border-color-2 dark:border-border-color">
+            <div
+              aria-hidden="true"
+              className="hidden grid-cols-[2.5rem_7.5rem_minmax(0,1fr)_minmax(0,1fr)_7.5rem_minmax(0,1.2fr)_5.5rem_4.5rem_4.5rem] gap-2 border-b border-color-2 bg-surface px-3 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary sm:grid dark:border-border-color"
+            >
+              <span>ID</span>
+              <span>Fecha</span>
+              <span>Abrió</span>
+              <span>Cerró</span>
+              <span>Cerrada</span>
+              <span>Empleados</span>
+              <span className="text-right">Total</span>
+              <span>Estado</span>
+              <span className="text-center">Acciones</span>
+            </div>
+            <ul className="flex flex-col divide-y divide-color-2 dark:divide-border-color">
             {invoices.map((row) => (
               <li
                 key={row.id}
-                className={cn(
-                  "flex flex-wrap items-center justify-between gap-2 rounded-lg border border-color-2 bg-surface px-3 py-2 dark:border-border-color",
-                )}
+                className="flex flex-col gap-1 px-3 py-2.5 sm:grid sm:grid-cols-[2.5rem_7.5rem_minmax(0,1fr)_minmax(0,1fr)_7.5rem_minmax(0,1.2fr)_5.5rem_4.5rem_4.5rem] sm:items-center sm:gap-2"
               >
-                <div className="flex flex-wrap items-center gap-3 min-w-0 flex-1">
-                  <span className="text-sm font-mono font-semibold text-slate-700 dark:text-slate-300">
-                    #{row.consecutive_number}
-                  </span>
-                  <span className="text-sm text-slate-500 dark:text-slate-400 whitespace-nowrap">
-                    {new Date(row.created_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}
-                  </span>
-                  <span className="text-sm text-slate-600 dark:text-slate-300 truncate max-w-[180px]">
-                    {row.user_name ?? "—"}
-                  </span>
-                  <Badge variant={invoiceStatusVariant(row.status)} className="whitespace-nowrap">
-                    {row.status}
-                  </Badge>
-                </div>
-                {props.detailMode !== "none" && (props.detailMode === "full" || row.status === "Emitida") && (
-                <Dialog open={detailDialogOpen} onOpenChange={(open) => {
-                  if (!open) {
-                    setDetail(null);
-                    setMotivo("");
-                    setSplitDraft({ method_code: "efectivo", amount: "" });
-                  }
-                  setDetailDialogOpen(open);
-                }}>
-                  <button
+                <span className="font-mono text-sm font-semibold text-slate-700 dark:text-slate-300">
+                  #{row.consecutive_number}
+                </span>
+                <span className="whitespace-nowrap text-sm text-slate-500 dark:text-slate-400">
+                  {new Date(row.created_at).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })}{" "}
+                  {new Date(row.created_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}
+                </span>
+                <span className="truncate text-sm text-slate-600 dark:text-slate-300" title={row.user_name ?? ""}>
+                  {row.user_name ?? "—"}
+                </span>
+                <span className="truncate text-sm text-slate-600 dark:text-slate-300" title={row.closed_by_name ?? ""}>
+                  {row.closed_by_name ?? "—"}
+                </span>
+                <span className="whitespace-nowrap text-sm text-slate-500 dark:text-slate-400">
+                  {row.closed_at
+                    ? `${new Date(row.closed_at).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })} ${new Date(row.closed_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}`
+                    : "—"}
+                </span>
+                <span
+                  className="truncate text-sm text-slate-600 dark:text-slate-300"
+                  title={row.employee_names.join(", ")}
+                >
+                  {employeeSummary(row.employee_names)}
+                </span>
+                <span className="whitespace-nowrap text-sm font-medium text-slate-900 sm:text-right dark:text-slate-100">
+                  {formatMoney(row.total)}
+                </span>
+                <span>{statusPill(row.status)}</span>
+                <span className="flex items-center gap-1 sm:justify-center">
+                  {row.status !== "Anulada" &&
+                    (props.isAdmin ||
+                      (props.canWrite &&
+                        row.status === "Emitida" &&
+                        row.user_id === props.currentUserId)) && (
+                    <button
                       type="button"
-                      aria-label={`Ver detalle de la factura ${row.consecutive_number}`}
-                      onClick={() => openDetail(row.id)}
-                      className="inline-flex h-9 items-center justify-center gap-2 whitespace-nowrap rounded-md border border-slate-300 bg-white px-3 text-sm font-medium text-slate-700 shadow-sm transition-all duration-200 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 focus-visible:ring-offset-2 active:scale-[0.98]"
+                      aria-disabled={shiftBlockReason !== null}
+                      title={shiftBlockReason ?? (row.status === "Emitida"
+                        ? "Editar factura emitida (el total se recalcula)"
+                        : "Editar factura (solo admin, con motivo)")}
+                      aria-label={`Editar factura ${row.consecutive_number}`}
+                      onClick={() => openEdit(row.id)}
+                      className={cn(
+                        "rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800",
+                        shiftBlockReason !== null && "opacity-50",
+                      )}
                     >
-                      <Eye className="h-4 w-4" aria-hidden="true" />
-                      Ver detalle
+                      <Pencil className="h-4 w-4" aria-hidden="true" />
                     </button>
-                  {detail && (
-                    <DialogContent className="max-w-3xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
-                      <div className="max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
+                  )}
+                {props.detailMode !== "none" && (props.detailMode === "full" || row.status === "Emitida") && (
+                  <button
+                    type="button"
+                    title="Ver detalle"
+                    aria-label={`Ver detalle de la factura ${row.consecutive_number}`}
+                    onClick={() => openDetail(row.id)}
+                    className="rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                  >
+                    <Eye className="h-4 w-4" aria-hidden="true" />
+                  </button>
+                )}
+                </span>
+                  {detail && detail.invoice.id === row.id && (
+                    <Dialog
+                      open={detailDialogOpen}
+                      onOpenChange={(isOpen) => {
+                        if (!isOpen) closeDetail();
+                      }}
+                    >
+                    <DialogContent className="max-w-4xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                      <div className="rounded-xl bg-white text-slate-900 shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
                         <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
                           <div className="flex flex-wrap items-start justify-between gap-4">
                             <div>
@@ -906,9 +1817,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             <div className="text-right">
                               <h2 className="text-lg font-bold">
                                 FACTURA #{detail.invoice.consecutive_number}{" "}
-                                <Badge variant={invoiceStatusVariant(detail.invoice.status)}>
-                                  {detail.invoice.status}
-                                </Badge>
+                                {statusPill(detail.invoice.status)}
                               </h2>
                               <p className="text-sm text-slate-500">
                                 {new Date(detail.invoice.created_at).toLocaleDateString("es-CO", {
@@ -935,18 +1844,21 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               {formatMoney(detail.invoice.total)}
                             </p>
                           </div>
-                          <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500">Ítems</h3>
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500">Ítems</h3>
+                            {clientViewToggle()}
+                          </div>
                           <div className="mt-2 overflow-x-auto rounded-lg border border-slate-200">
                             <table className="w-full min-w-[560px] text-left text-sm text-slate-900">
                               <thead>
                                 <tr className="bg-slate-100 text-xs uppercase tracking-wide text-slate-500">
                                   <th className="px-3 py-2">#</th>
                                   <th className="px-3 py-2">Descripción</th>
-                                  <th className="px-3 py-2">Empleado</th>
+                                  {!clientView && <th className="px-3 py-2">Empleado</th>}
                                   <th className="px-3 py-2 text-right">Cant.</th>
                                   <th className="px-3 py-2 text-right">V. unitario</th>
                                   <th className="px-3 py-2 text-right">Subtotal</th>
-                                  <th className="px-3 py-2 text-center">¿Comisión?</th>
+                                  {!clientView && <th className="px-3 py-2 text-center">Comisión</th>}
                                 </tr>
                               </thead>
                               <tbody>
@@ -954,38 +1866,51 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   <tr key={row.id} className="border-t border-slate-200">
                                     <td className="px-3 py-2 font-semibold">{index + 1}</td>
                                     <td className="px-3 py-2">
-                                      {row.item_type === "custom" && row.custom_name ? row.custom_name : row.item_type}
-                                      {row.item_type === "custom" && row.commission_value !== null && row.commission_value !== undefined && !row.no_commission && (
-                                        <span className="ml-2 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
-                                          Comisión: {row.commission_value}%
-                                        </span>
-                                      )}
-                                      {row.no_commission && (
+                                      {detailItemName(row)}
+                                      {!clientView &&
+                                        !row.no_commission &&
+                                        commissionDisplayValue(row) !== null && (
+                                          <span className="ml-2 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                                            Comisión: {formatMoney(commissionDisplayValue(row))}
+                                          </span>
+                                        )}
+                                      {!clientView && row.no_commission && (
                                         <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">
                                           Sin comisión
                                         </span>
                                       )}
                                     </td>
-                                    <td className="px-3 py-2">
-                                      {row.employee_full_name ?? "—"}
-                                      {row.employee_code ? (
-                                        <span className="text-xs text-slate-500"> ({row.employee_code})</span>
-                                      ) : null}
-                                    </td>
+                                    {!clientView && (
+                                      <td className="px-3 py-2">
+                                        {row.employee_full_name ?? "—"}
+                                        {row.employee_code ? (
+                                          <span className="text-xs text-slate-500"> ({row.employee_code})</span>
+                                        ) : null}
+                                      </td>
+                                    )}
                                     <td className="px-3 py-2 text-right">{row.qty}</td>
                                     <td className="px-3 py-2 text-right">{formatMoney(row.unit_price)}</td>
                                     <td className="px-3 py-2 text-right font-medium">{formatMoney(row.subtotal)}</td>
-                                    <td className="px-3 py-2 text-center">
-                                      {row.item_type === "servicio" ? (
-                                        <span className="text-xs text-slate-500">Sin comisión</span>
-                                      ) : row.no_commission ? (
-                                        <span className="text-slate-500">No</span>
-                                      ) : row.item_type === "custom" && row.commission_value !== null && row.commission_value !== undefined ? (
-                                        <span className="font-medium text-emerald-700">{row.commission_value}%</span>
-                                      ) : (
-                                        <span className="text-emerald-700">Sí</span>
-                                      )}
-                                    </td>
+                                    {!clientView && (
+                                      <td className="px-3 py-2 text-center">
+                                        {commissionModeOf(row) === "ninguna" ? (
+                                          <span className="text-slate-500">Sin comisión</span>
+                                        ) : commissionModeOf(row) === "porcentaje" ? (
+                                          <span
+                                            className="text-slate-600"
+                                            title="Porcentaje sobre el subtotal; se paga en nómina."
+                                          >
+                                            {row.commission_percent_override != null
+                                              ? `${row.commission_percent_override}% (ítem)`
+                                              : "% del empleado"}
+                                          </span>
+                                        ) : commissionDisplayValue(row) !== null ? (
+                                          <span className="font-medium text-emerald-700">{formatMoney(commissionDisplayValue(row))}</span>
+                                        ) : (
+                                          <span className="text-slate-400">—</span>
+                                        )}
+                                      </td>
+                                    )}
                                   </tr>
                                 ))}
                               </tbody>
@@ -1051,6 +1976,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               (detail.invoice.status === "Emitida" || detail.invoice.status === "Pagada"))) && (
                             <div className="rounded-lg bg-slate-50 p-4">
                               <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500">Operaciones</h3>
+                              {shiftBlockReason !== null && (
+                                <p role="status" className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
+                                  {shiftBlockReason}
+                                </p>
+                              )}
                               {error && (
                                 <p role="alert" className="mt-2 rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
                                   {error}
@@ -1058,7 +1988,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               )}
                               <div className="mt-3 flex flex-col gap-4">
                           {props.canWrite && detail.invoice.status === "Emitida" && (
-                            <form onSubmit={submitSplit} className="flex flex-wrap items-end gap-3">
+                            <form onSubmit={submitSplit} className="flex flex-col gap-3">
+                              <div className="flex flex-wrap items-end gap-3">
                               <label className="flex min-w-[10rem] flex-col gap-1 text-sm font-medium text-slate-900">
                                 Método
                                 <Select
@@ -1088,19 +2019,23 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   required
                                 />
                               </label>
+                              </div>
+                              <div>
                               <button
                                 type="submit"
                                 disabled={busy}
                                 className="flex h-10 items-center gap-2 rounded-md bg-slate-200 px-4 text-sm font-medium text-slate-900 hover:bg-slate-300 disabled:opacity-50"
                               >
                                 <Banknote className="h-4 w-4" aria-hidden="true" />
-                                {busy ? "Registrando…" : "Registrar porción"}
+                                {busy ? "Pagando…" : "Pagar"}
                               </button>
+                              </div>
                             </form>
                           )}
 
                           {props.canAnnul && (detail.invoice.status === "Emitida" || detail.invoice.status === "Pagada") && (
-                            <form onSubmit={submitAnnul} className="flex flex-wrap items-end gap-3">
+                            <form onSubmit={submitAnnul} className="flex flex-col gap-3">
+                              <div className="flex flex-wrap items-end gap-3">
                               <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-slate-900">
                                 Motivo de anulación
                                 <input
@@ -1111,6 +2046,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   required
                                 />
                               </label>
+                              </div>
+                              <div>
                               <button
                                 type="submit"
                                 disabled={busy}
@@ -1119,6 +2056,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 <CircleX className="h-4 w-4" aria-hidden="true" />
                                 {busy ? "Anulando…" : "Anular factura"}
                               </button>
+                              </div>
                             </form>
                           )}
                               </div>
@@ -1126,26 +2064,491 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           )}
                         </div>
                         <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-6 py-4 sm:px-8">
-                          <DialogClose asChild>
-                            <button
-                              type="button"
-                              className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100"
-                            >
-                              Cerrar
-                            </button>
-                          </DialogClose>
+                          <button
+                            type="button"
+                            onClick={closeDetail}
+                            className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                          >
+                            Cerrar
+                          </button>
                         </div>
                       </div>
                     </DialogContent>
+                    </Dialog>
                   )}
-                </Dialog>
-                )}
-              </li>
+                  {row.status !== "Anulada" &&
+                    (props.isAdmin ||
+                      (props.canWrite &&
+                        row.status === "Emitida" &&
+                        row.user_id === props.currentUserId)) && (
+                    <Dialog
+                      open={isEditDialogOpen}
+                      onOpenChange={(isOpen) => {
+                        if (!isOpen) setIsEditDialogOpen(false);
+                      }}
+                    >
+                      <DialogContent className="max-w-5xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                        <div className="rounded-xl bg-white text-slate-900 shadow-2xl">
+                          <div className="border-b-4 border-double border-slate-300 px-6 py-5 sm:px-8">
+                            <div className="flex flex-wrap items-start justify-between gap-4">
+                              <div>
+                                <p className="text-xl font-black tracking-tight">ORABELLA</p>
+                                <p className="text-xs text-slate-500">
+                                  {isFreeEdit
+                                    ? "Edición libre de emitida (sin motivo, el total se recalcula)"
+                                    : "Edición con motivo y auditoría"}
+                                </p>
+                              </div>
+                              <div className="text-right">
+                                <h2 className="text-lg font-bold">
+                                  EDITAR FACTURA #{detail?.invoice.consecutive_number ?? "—"}
+                                </h2>
+                                <p className="mt-1 text-sm">
+                                  <span className="inline-block rounded-full bg-blue-100 px-2 py-0.5 text-xs font-semibold text-blue-800">
+                                    {isFreeEdit
+                                      ? `Total anterior: ${detail ? formatMoney(detail.invoice.total) : "—"} (se recalcula)`
+                                      : `Total inmutable: ${detail ? formatMoney(detail.invoice.total) : "—"}`}
+                                  </span>
+                                </p>
+                              </div>
+                            </div>
+                          </div>
+                          <div className="flex flex-col gap-5 px-6 py-5 sm:px-8">
+                            {!isFreeEdit && (
+                              <label className="flex flex-col gap-1 text-sm font-medium">
+                                Motivo de la edición (obligatorio, queda auditado)
+                                <input
+                                  className={paperInputClass}
+                                  value={editMotivo}
+                                  onChange={(event) => setEditMotivo(event.target.value)}
+                                  placeholder="Ej. Servicio mal depreciado: se ajusta y agrega kit"
+                                />
+                              </label>
+                            )}
+                            <div className="flex justify-end">
+                              {clientViewToggle()}
+                            </div>
+                            <div className="overflow-x-auto rounded-lg border border-slate-200">
+                              <table className="w-full min-w-[860px] text-left text-sm text-slate-900">
+                                <thead>
+                                  <tr className="bg-slate-100 text-xs uppercase tracking-wide text-slate-500">
+                                    <th className="px-3 py-2">#</th>
+                                    <th className="px-3 py-2">Cant.</th>
+                                    <th className="px-3 py-2">Descripción</th>
+                                    {!clientView && <th className="px-3 py-2">Empleado</th>}
+                                    <th className="px-3 py-2 text-right">V. unitario</th>
+                                    <th className="px-3 py-2 text-right">Subtotal</th>
+                                    {!clientView && <th className="px-3 py-2 text-center">Comisión</th>}
+                                    <th className="px-3 py-2"><span className="sr-only">Quitar</span></th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {editItems.map((item, index) => {
+                                    const lineQty = toNumber(item.qty) ?? 0;
+                                    const linePrice = toNumber(item.unit_price) ?? 0;
+                                    const employee = props.employees.find((row) => row.id === item.employee_id);
+                                    const fixedPay = isFixedPayEmployee(employee);
+                                    return (
+                                      <tr key={item.id ?? `nuevo-${index}`} className="border-t border-slate-200 align-top">
+                                        <td className="px-3 py-2 font-semibold">{index + 1}</td>
+                                        <td className="px-3 py-2">
+                                          <input
+                                            className={`${paperInputClass} w-20`}
+                                            value={item.qty}
+                                            onChange={(event) => patchEditItem(index, { qty: event.target.value })}
+                                            placeholder="1"
+                                            inputMode="numeric"
+                                            aria-label={`Editar ítem ${index + 1} cantidad`}
+                                          />
+                                        </td>
+                                        <td className="min-w-[220px] px-3 py-2">
+                                          {item.item_type === "producto" && (
+                                            <Combobox
+                                              value={item.ref_id}
+                                              onValueChange={(value) => {
+                                                patchEditItem(index, { ref_id: value });
+                                                const found = props.products.find((row) => row.id === value);
+                                                if (found?.sale_price != null) {
+                                                  patchEditItem(index, { unit_price: String(found.sale_price) });
+                                                }
+                                              }}
+                                              placeholder="Producto…"
+                                              options={props.products
+                                                .filter((row) => row.is_active)
+                                                .map((row) => ({
+                                                  value: row.id,
+                                                  label: row.name,
+                                                  description: `Stock: ${row.stock_qty}`,
+                                                }))}
+                                              ariaLabel={`Editar ítem ${index + 1} producto`}
+                                              filterPlaceholder="Escriba para filtrar…"
+                                            />
+                                          )}
+                                          {item.item_type === "servicio" && (
+                                            <Combobox
+                                              value={item.ref_id}
+                                              onValueChange={(value) => {
+                                                patchEditItem(index, { ref_id: value });
+                                                const found = props.services.find((row) => row.id === value);
+                                                if (found) patchEditItem(index, { unit_price: String(found.price) });
+                                              }}
+                                              placeholder="Servicio…"
+                                              options={props.services
+                                                .filter((row) => row.is_active)
+                                                .map((row) => ({ value: row.id, label: row.name }))}
+                                              ariaLabel={`Editar ítem ${index + 1} servicio`}
+                                              filterPlaceholder="Escriba para filtrar…"
+                                            />
+                                          )}
+                                          {item.item_type === "custom" && (
+                                            <input
+                                              className={paperInputClass}
+                                              value={item.custom_name}
+                                              onChange={(event) => patchEditItem(index, { custom_name: event.target.value })}
+                                              placeholder="Descripción"
+                                              aria-label={`Editar ítem ${index + 1} descripción`}
+                                            />
+                                          )}
+                                          <p className="mt-1 text-xs text-slate-500">
+                                            {item.item_type === "producto"
+                                              ? "Producto"
+                                              : item.item_type === "servicio"
+                                                ? "Servicio"
+                                                : "Personalizado"}
+                                          </p>
+                                        </td>
+                                        {!clientView && (
+                                          <td className="min-w-[150px] px-3 py-2">
+                                            <Combobox
+                                              value={item.employee_id}
+                                              onValueChange={(value) => patchEditItem(index, { employee_id: value })}
+                                              placeholder="Empleado…"
+                                              options={props.employees.map((row) => ({
+                                                value: row.id,
+                                                label: row.full_name,
+                                                description: row.employee_code ? `ID ${row.employee_code}` : undefined,
+                                              }))}
+                                              ariaLabel={`Editar ítem ${index + 1} empleado`}
+                                              filterPlaceholder="Escriba para filtrar…"
+                                            />
+                                          </td>
+                                        )}
+                                        <td className="px-3 py-2">
+                                          <input
+                                            className={`${paperInputClass} w-28 text-right`}
+                                            value={formatMoneyInput(item.unit_price)}
+                                            onChange={(event) =>
+                                              patchEditItem(index, { unit_price: stripMoneyInput(event.target.value) })
+                                            }
+                                            placeholder="0"
+                                            inputMode="numeric"
+                                            aria-label={`Editar ítem ${index + 1} precio`}
+                                          />
+                                        </td>
+                                        <td className="whitespace-nowrap px-3 py-2 text-right font-medium">
+                                          {formatMoney(lineQty * linePrice)}
+                                        </td>
+                                        {!clientView && (
+                                          <td className="px-3 py-2 text-center">
+                                            {item.item_type === "servicio" ? (
+                                              <span
+                                                className="text-[10px] text-slate-500"
+                                                title="Se paga el porcentaje del empleado sobre el subtotal."
+                                              >
+                                                % del empleado
+                                              </span>
+                                            ) : item.item_type === "producto" ? (
+                                              <div className="flex flex-col items-center gap-1">
+                                                <label className="flex items-center gap-1.5 text-sm">
+                                                  <input
+                                                    type="checkbox"
+                                                    checked={item.commission_mode === "comision"}
+                                                    onChange={(event) =>
+                                                      patchEditItem(index, {
+                                                        commission_mode: event.target.checked ? "comision" : "ninguna",
+                                                        no_commission: !event.target.checked,
+                                                        commission_value: event.target.checked ? item.commission_value : null,
+                                                      })
+                                                    }
+                                                    className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                                                  />
+                                                  <span className="text-slate-600">¿Comisión?</span>
+                                                </label>
+                                                {item.commission_mode === "comision" && (
+                                                  <>
+                                                    <input
+                                                      className={`${paperInputClass} h-9 w-28 text-right`}
+                                                      value={formatMoneyInput(
+                                                        item.commission_value == null ? "" : String(item.commission_value),
+                                                      )}
+                                                      onChange={(event) =>
+                                                        patchEditItem(index, {
+                                                          commission_value:
+                                                            event.target.value.trim() === ""
+                                                              ? null
+                                                              : Number(stripMoneyInput(event.target.value)),
+                                                        })
+                                                      }
+                                                      placeholder="Valor $"
+                                                      inputMode="numeric"
+                                                      aria-label={`Editar ítem ${index + 1} valor comisión`}
+                                                      title="Valor de comisión por unidad; se multiplica por la cantidad."
+                                                    />
+                                                    {item.commission_value == null ? (
+                                                      <span className="text-[10px] text-slate-500">
+                                                        Opcional
+                                                      </span>
+                                                    ) : (
+                                                      <span className="text-[10px] text-slate-500">
+                                                        × cantidad
+                                                      </span>
+                                                    )}
+                                                  </>
+                                                )}
+                                              </div>
+                                            ) : (
+                                              <div className="flex flex-col items-center gap-1">
+                                                <CommissionModeSelector
+                                                  value={item.commission_mode}
+                                                  options={CUSTOM_COMMISSION_MODES}
+                                                  onChange={(mode) =>
+                                                    patchEditItem(index, {
+                                                      commission_mode: mode,
+                                                      commission_value: mode === "comision" ? item.commission_value : null,
+                                                      commission_percent_override:
+                                                        mode === "porcentaje" ? item.commission_percent_override : null,
+                                                    })
+                                                  }
+                                                  ariaLabel={`Editar ítem ${index + 1} modo de comisión`}
+                                                />
+                                                {item.commission_mode === "comision" && (
+                                                  <>
+                                                    <input
+                                                      className={`${paperInputClass} h-9 w-28 text-right`}
+                                                      value={formatMoneyInput(
+                                                        item.commission_value == null ? "" : String(item.commission_value),
+                                                      )}
+                                                      onChange={(event) =>
+                                                        patchEditItem(index, {
+                                                          commission_value:
+                                                            event.target.value.trim() === ""
+                                                              ? null
+                                                              : Number(stripMoneyInput(event.target.value)),
+                                                        })
+                                                      }
+                                                      placeholder="Valor $"
+                                                      inputMode="numeric"
+                                                      aria-label={`Editar ítem ${index + 1} valor comisión`}
+                                                      title="Valor de comisión por unidad; se multiplica por la cantidad."
+                                                    />
+                                                    {item.commission_value == null ? (
+                                                      <span className="text-[10px] text-slate-500">Requerido</span>
+                                                    ) : (
+                                                      <span className="text-[10px] text-slate-500">× cantidad</span>
+                                                    )}
+                                                  </>
+                                                )}
+                                                {item.commission_mode === "porcentaje" &&
+                                                  (fixedPay ? (
+                                                    <input
+                                                      type="number"
+                                                      className={`${paperInputClass} h-9 w-28 text-right`}
+                                                      value={item.commission_percent_override ?? ""}
+                                                      onChange={(event) =>
+                                                        patchEditItem(index, {
+                                                          commission_percent_override:
+                                                            event.target.value === "" ? null : Number(event.target.value),
+                                                        })
+                                                      }
+                                                      placeholder="% ítem"
+                                                      min={0}
+                                                      max={100}
+                                                      step={0.5}
+                                                      inputMode="decimal"
+                                                      aria-label={`Editar ítem ${index + 1} porcentaje`}
+                                                      title="Porcentaje del subtotal para este ítem."
+                                                    />
+                                                  ) : (
+                                                    <span
+                                                      className="text-[10px] text-slate-500"
+                                                      title="El empleado tiene porcentaje propio."
+                                                    >
+                                                      % del empleado
+                                                    </span>
+                                                  ))}
+                                              </div>
+                                            )}
+                                          </td>
+                                        )}
+                                        <td className="px-3 py-2">
+                                          <button
+                                            type="button"
+                                            aria-label={`Quitar ítem ${index + 1}`}
+                                            onClick={() => setEditItems((prev) => prev.filter((_, i) => i !== index))}
+                                            className="rounded-md border border-slate-300 p-2 text-slate-500 hover:bg-slate-100"
+                                          >
+                                            <Trash2 className="h-4 w-4" aria-hidden="true" />
+                                          </button>
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => openItemDialog("edit")}
+                              className="flex h-10 w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 text-sm font-medium text-slate-600 hover:bg-slate-50"
+                            >
+                              <Plus className="h-4 w-4" aria-hidden="true" />
+                              Agregar ítem
+                            </button>
+                            {!isFreeEdit && (
+                            <div>
+                              <h3 className="mb-2 text-sm font-bold uppercase tracking-wide text-slate-500">
+                                Cobros (solo cambia el método, montos intactos)
+                              </h3>
+                              <div className="flex flex-col gap-2">
+                                {(detail?.payments ?? []).map((payment) => {
+                                  const draft = editPayments.find((row) => row.id === payment.id);
+                                  const code = draft?.method_code ?? payment.method_code;
+                                  const feePct = Number(
+                                    props.methods.find((row) => row.code === code)?.fee_percent ?? 0,
+                                  );
+                                  const feeOk = feePct === Number(payment.fee_percent ?? 0);
+                                  return (
+                                    <div key={payment.id} className="flex flex-col gap-2 sm:flex-row sm:items-end">
+                                      <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-slate-900">
+                                        Método ({formatMoney(payment.amount)})
+                                        <Select
+                                          value={code}
+                                          onValueChange={(value) =>
+                                            setEditPayments((prev) =>
+                                              prev.map((row) =>
+                                                row.id === payment.id ? { ...row, method_code: value } : row,
+                                              ),
+                                            )
+                                          }
+                                        >
+                                          <SelectTrigger className={paperInputClass}>
+                                            <SelectValue placeholder="Método" />
+                                          </SelectTrigger>
+                                          <SelectContent>
+                                            {props.methods.map((row) => (
+                                              <SelectItem key={row.id} value={row.code}>
+                                                {row.name}
+                                                {row.fee_percent > 0 ? ` (+${row.fee_percent}%)` : ""}
+                                              </SelectItem>
+                                            ))}
+                                          </SelectContent>
+                                        </Select>
+                                      </label>
+                                      {!feeOk && (
+                                        <p className="text-xs font-medium text-red-700">
+                                          Cambia el recargo: el total no cuadraría.
+                                        </p>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                            )}
+                            {isFreeEdit ? (
+                              <div className="rounded-md bg-blue-50 px-3 py-2 text-sm text-slate-900">
+                                <p>
+                                  Subtotal nuevo: {formatMoney(editSubtotal)} (antes{" "}
+                                  {detail ? formatMoney(detail.invoice.subtotal) : "—"})
+                                </p>
+                                <p className="font-semibold">
+                                  Nuevo total estimado: {formatMoney(freeEditTotal)}
+                                </p>
+                              </div>
+                            ) : (
+                            <div className="rounded-md bg-slate-50 px-3 py-2 text-sm text-slate-900">
+                              <p>
+                                Subtotal: {formatMoney(editSubtotal)} / emitido{" "}
+                                {detail ? formatMoney(detail.invoice.subtotal) : "—"}{" "}
+                                {editSubtotalOk ? "✓" : "✗ debe cuadrar"}
+                              </p>
+                              <p>
+                                Recargo:{" "}
+                                {editFeesOk
+                                  ? "igual al emitido ✓"
+                                  : "✗ use métodos con igual recargo"}
+                              </p>
+                              <p className="font-semibold">
+                                TOTAL intacto: {detail ? formatMoney(detail.invoice.total) : "—"}
+                              </p>
+                            </div>
+                            )}
+                            {editError && (
+                              <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+                                {editError}
+                              </p>
+                            )}
+                          </div>
+                          <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-6 py-4 sm:px-8">
+                            <button
+                              type="button"
+                              onClick={() => setIsEditDialogOpen(false)}
+                              className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                            >
+                              Cancelar
+                            </button>
+                            <button
+                              type="button"
+                              onClick={submitEdit}
+                              disabled={!canSaveEdit}
+                              title={
+                                !canSaveEdit
+                                  ? isFreeEdit
+                                    ? "Agregue al menos un ítem válido para guardar"
+                                    : "Cuadre subtotal, recargo y motivo para guardar"
+                                  : undefined
+                              }
+                              className="h-10 rounded-md bg-slate-900 px-6 text-sm font-semibold text-white hover:bg-slate-700 disabled:opacity-50"
+                            >
+                              {busy ? "Guardando…" : "Guardar edición"}
+                            </button>
+                          </div>
+                        </div>
+                      </DialogContent>
+                    </Dialog>
+                  )}
+                </li>
             ))}
             {invoices.length === 0 && (
-              <li className="text-sm text-text-secondary">Sin facturas para estos filtros.</li>
+              <li className="px-3 py-4 text-sm text-text-secondary">Sin facturas para estos filtros.</li>
             )}
           </ul>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-sm text-text-secondary">
+            <p>
+              {totalInvoices} factura(s) · Página {invoicePage} de {invoicePageCount}
+            </p>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={invoicePage <= 1 || isViewPending}
+                onClick={() => applyFilters(undefined, invoicePage - 1)}
+              >
+                Anterior
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={invoicePage >= invoicePageCount || isViewPending}
+                onClick={() => applyFilters(undefined, invoicePage + 1)}
+              >
+                Siguiente
+              </Button>
+            </div>
+          </div>
         </CardContent>
       </Card>
 
@@ -1159,6 +2562,491 @@ export function InvoicesClient(props: InvoicesClientProps) {
           {notice}
         </p>
       )}
+
+      {/* Modal de ítems generalizado: crear (borrador) y edición libre de
+          EMITIDAS (agrega a la edición). Nivel raíz para no anidarse. */}
+      <Dialog
+        open={isItemDialogOpen}
+        onOpenChange={(isOpen) => {
+          if (!isOpen) setIsItemDialogOpen(false);
+          else setIsItemDialogOpen(isOpen);
+        }}
+      >
+        <DialogContent className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+          <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
+            <div className="border-b border-slate-200 px-5 py-3">
+              <h2 className="text-lg font-bold">
+                {itemDialogTarget === "edit" ? "Agregar ítem a la edición" : "Agregar ítem"}
+              </h2>
+              <p className="text-sm text-slate-500">
+                Subtotal:{" "}
+                {formatMoney(
+                  (toNumber(itemDraft.qty) ?? 0) * (toNumber(itemDraft.unit_price) ?? 0),
+                )}
+              </p>
+            </div>
+            <div className="flex flex-col gap-3 px-5 py-3">
+              <div>
+                <p className="mb-2 text-sm font-medium">Tipo</p>
+                <div className="grid grid-cols-3 gap-2" role="group" aria-label="Tipo de ítem">
+                  {(
+                    [
+                      ["producto", "Producto"],
+                      ["servicio", "Servicio"],
+                      ["custom", "Personalizado"],
+                    ] as Array<[ItemDraft["item_type"], string]>
+                  ).map(([type, label]) => (
+                    <button
+                      key={type}
+                      type="button"
+                      aria-pressed={itemDraft.item_type === type}
+                      onClick={() =>
+                        patchDraft({
+                          item_type: type,
+                          ref_id: "",
+                          custom_name: "",
+                          unit_price: "",
+                          // Producto arranca en comisión; el servicio siempre
+                          // comisiona el % del empleado; el personalizado
+                          // arranca sin comisión y exige elegir el modo.
+                          no_commission: type === "custom",
+                          commission_value: null,
+                          commission_mode:
+                            type === "producto" ? "comision" : type === "servicio" ? "porcentaje" : "ninguna",
+                          commission_percent_override: null,
+                        })
+                      }
+                      className={
+                        itemDraft.item_type === type
+                          ? "h-9 rounded-md bg-slate-900 text-sm font-semibold text-white"
+                          : "h-9 rounded-md border border-slate-300 text-sm font-medium text-slate-700 hover:bg-slate-100"
+                      }
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              {itemDraft.item_type === "producto" && (
+                <div>
+                  <p className="mb-1 text-sm font-medium">
+                    Producto <span className="text-xs font-normal text-emerald-700">puede llevar comisión</span>
+                  </p>
+                  <Combobox
+                    value={itemDraft.ref_id}
+                    onValueChange={(value) => {
+                      patchDraft({ ref_id: value });
+                      autofillDraftPrice("producto", value);
+                    }}
+                    placeholder="Buscar producto…"
+                    options={props.products
+                      .filter((row) => row.is_active)
+                      .map((row) => ({
+                        value: row.id,
+                        label: row.name,
+                        description: `Stock: ${row.stock_qty}`,
+                      }))}
+                    ariaLabel="Producto del ítem"
+                    filterPlaceholder="Escriba para filtrar…"
+                  />
+                </div>
+              )}
+              {itemDraft.item_type === "servicio" && (
+                <div>
+                  <p className="mb-1 text-sm font-medium">
+                    Servicio <span className="text-xs font-normal text-emerald-700">comisión % del empleado</span>
+                  </p>
+                  <Combobox
+                    value={itemDraft.ref_id}
+                    onValueChange={(value) => {
+                      patchDraft({ ref_id: value });
+                      autofillDraftPrice("servicio", value);
+                    }}
+                    placeholder="Buscar servicio…"
+                    options={props.services
+                      .filter((row) => row.is_active)
+                      .map((row) => ({ value: row.id, label: row.name }))}
+                    ariaLabel="Servicio del ítem"
+                    filterPlaceholder="Escriba para filtrar…"
+                  />
+                </div>
+              )}
+              {itemDraft.item_type === "custom" && (
+                <label className="flex flex-col gap-1 text-sm font-medium">
+                  Descripción
+                  <input
+                    className={paperInputClass}
+                    value={itemDraft.custom_name}
+                    onChange={(event) => patchDraft({ custom_name: event.target.value })}
+                    placeholder="Ej. Peinado novia"
+                  />
+                </label>
+              )}
+              <div>
+                <p className="mb-1 text-sm font-medium">Empleado que atiende</p>
+                <Combobox
+                  value={itemDraft.employee_id}
+                  onValueChange={(value) => patchDraft({ employee_id: value })}
+                  placeholder="Buscar empleado…"
+                  options={props.employees
+                    .filter((row) => row.is_active)
+                    .map((row) => ({
+                      value: row.id,
+                      label: row.full_name,
+                      description: row.employee_code
+                        ? `ID ${row.employee_code}`
+                        : undefined,
+                    }))}
+                  ariaLabel="Empleado del ítem"
+                  filterPlaceholder="Escriba para filtrar…"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <label className="flex flex-col gap-1 text-sm font-medium">
+                  Cantidad
+                  <input
+                    className={paperInputClass}
+                    value={itemDraft.qty}
+                    onChange={(event) => patchDraft({ qty: event.target.value })}
+                    placeholder="1"
+                    inputMode="numeric"
+                  />
+                </label>
+                <label className="flex flex-col gap-1 text-sm font-medium">
+                  Precio unitario
+                  <input
+                    className={paperInputClass}
+                    value={formatMoneyInput(itemDraft.unit_price)}
+                    onChange={(event) =>
+                      patchDraft({ unit_price: stripMoneyInput(event.target.value) })
+                    }
+                    placeholder="0"
+                    inputMode="numeric"
+                  />
+                </label>
+              </div>
+              {itemDraft.item_type === "producto" && (
+                <div className="flex flex-col gap-2">
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={itemDraft.commission_mode === "comision"}
+                      onChange={(event) =>
+                        patchDraft({
+                          commission_mode: event.target.checked ? "comision" : "ninguna",
+                          no_commission: !event.target.checked,
+                          commission_value: event.target.checked ? itemDraft.commission_value : null,
+                        })
+                      }
+                      className="rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                    />
+                    <span className="text-slate-700">¿Tiene comisión?</span>
+                    {itemDraft.commission_mode === "comision" && itemDraft.commission_value != null && (
+                      <span className="text-slate-500">
+                        Comisión: {formatMoney(itemDraft.commission_value)}
+                      </span>
+                    )}
+                  </label>
+                  {itemDraft.commission_mode === "comision" && (
+                    <>
+                      <label className="flex flex-col gap-1 text-sm font-medium">
+                        Valor de la comisión ($)
+                        <input
+                          type="number"
+                          className={paperInputClass}
+                          value={itemDraft.commission_value ?? ""}
+                          onChange={(event) =>
+                            patchDraft({
+                              commission_value:
+                                event.target.value === "" ? null : Number(event.target.value),
+                            })
+                          }
+                          placeholder="Ej. 10000"
+                          min={0}
+                          step={100}
+                          inputMode="decimal"
+                        />
+                      </label>
+                      <p className="text-xs text-slate-500">
+                        El valor de comisión se multiplica por la cantidad.
+                      </p>
+                    </>
+                  )}
+                </div>
+              )}
+              {itemDraft.item_type === "servicio" && (
+                <p className="text-xs text-slate-500">
+                  Se paga el porcentaje del empleado sobre el subtotal.
+                </p>
+              )}
+              {itemDraft.item_type === "custom" && (
+                <div className="flex flex-col gap-2">
+                  <div className="flex flex-col gap-1">
+                    <span className="text-sm font-medium">Comisión</span>
+                    <CommissionModeSelector
+                      value={itemDraft.commission_mode}
+                      options={CUSTOM_COMMISSION_MODES}
+                      onChange={(mode) =>
+                        patchDraft({
+                          commission_mode: mode,
+                          no_commission: mode === "ninguna",
+                          commission_value: mode === "comision" ? itemDraft.commission_value : null,
+                          commission_percent_override:
+                            mode === "porcentaje" ? itemDraft.commission_percent_override : null,
+                        })
+                      }
+                      ariaLabel="Modo de comisión del ítem personalizado"
+                    />
+                  </div>
+                  {itemDraft.commission_mode === "comision" && (
+                    <>
+                      <label className="flex flex-col gap-1 text-sm font-medium">
+                        Valor de la comisión ($)
+                        <input
+                          type="number"
+                          className={paperInputClass}
+                          value={itemDraft.commission_value ?? ""}
+                          onChange={(event) =>
+                            patchDraft({
+                              commission_value:
+                                event.target.value === "" ? null : Number(event.target.value),
+                            })
+                          }
+                          placeholder="Ej. 10000"
+                          min={0}
+                          step={100}
+                          inputMode="decimal"
+                        />
+                      </label>
+                      <p className="text-xs text-slate-500">
+                        El valor de comisión se multiplica por la cantidad.
+                      </p>
+                    </>
+                  )}
+                  {itemDraft.commission_mode === "porcentaje" &&
+                    (itemDraftFixedPay ? (
+                      <label className="flex flex-col gap-1 text-sm font-medium">
+                        Porcentaje para este ítem (%)
+                        <input
+                          type="number"
+                          className={paperInputClass}
+                          value={itemDraft.commission_percent_override ?? ""}
+                          onChange={(event) =>
+                            patchDraft({
+                              commission_percent_override:
+                                event.target.value === "" ? null : Number(event.target.value),
+                            })
+                          }
+                          placeholder="Ej. 15"
+                          min={0}
+                          max={100}
+                          step={0.5}
+                          inputMode="decimal"
+                        />
+                      </label>
+                    ) : (
+                      <p className="text-xs text-slate-500">
+                        Se paga el % del empleado
+                        {itemDraftEmployee?.commission_percent != null
+                          ? ` (${itemDraftEmployee.commission_percent}%)`
+                          : ""}
+                        .
+                      </p>
+                    ))}
+                </div>
+              )}
+              {itemError && (
+                <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+                  {itemError}
+                </p>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-5 py-3">
+              <button
+                type="button"
+                onClick={() => setIsItemDialogOpen(false)}
+                className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={addItemFromDialog}
+                className="h-10 rounded-md bg-slate-900 px-6 text-sm font-semibold text-white hover:bg-slate-700"
+              >
+                {itemDialogTarget === "edit" ? "Agregar a la edición" : "Agregar a la factura"}
+              </button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Pago inmediato de comisión(es): aparece al dejar la factura Pagada si
+          hay empleados con payout_mode "inmediato" y comisión pendiente. Solo
+          se paga la comisión por ítem; el porcentaje del empleado se acumula y
+          se paga en nómina. Mientras haya pendientes el modal NO se cierra por
+          clic fuera ni con Escape: solo al pagar o al dejarla para nómina. */}
+      <Dialog
+        open={commissionOpen}
+        onOpenChange={(open) => {
+          if (!open && !commissionBusy) closeCommission();
+        }}
+      >
+        <DialogContent
+          className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent"
+          onInteractOutside={(event) => {
+            if (commissionRows.length > 0) event.preventDefault();
+          }}
+          onEscapeKeyDown={(event) => {
+            if (commissionRows.length > 0) event.preventDefault();
+          }}
+        >
+          <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-white text-slate-900 shadow-2xl">
+            <div className="border-b border-slate-200 px-6 py-4">
+              <h2 className="text-lg font-bold">Pagar comisión al empleado</h2>
+              <p className="text-sm text-slate-500">
+                {commissionInvoice ? `Factura #${commissionInvoice.number}` : "Factura"} · el
+                pago sale de la caja del turno abierto.
+              </p>
+            </div>
+            <div className="flex flex-col gap-4 px-6 py-4">
+              {commissionRows.map((row, index) => (
+                <div key={row.employee_id} className="rounded-lg border border-slate-200 p-3">
+                  <div className="flex flex-wrap items-baseline justify-between gap-2">
+                    <span className="text-sm font-semibold">{row.employee_name}</span>
+                    <span className="text-sm font-medium">{formatMoney(row.pending)}</span>
+                  </div>
+                  <label className="mt-3 flex flex-col gap-1 text-sm font-medium text-slate-900">
+                    Método de pago
+                    <Select
+                      value={row.method_code}
+                      onValueChange={(value) =>
+                        setCommissionRows((prev) =>
+                          prev.map((item, i) => (i === index ? { ...item, method_code: value } : item)),
+                        )
+                      }
+                    >
+                      <SelectTrigger className={paperInputClass}>
+                        <SelectValue placeholder="Método" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {props.methods.map((method) => (
+                          <SelectItem key={method.id} value={method.code}>
+                            {method.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </label>
+                  {row.method_code === "efectivo" && (
+                    <p className="mt-2 text-xs text-slate-500">
+                      El efectivo no puede superar el 50% de la base de apertura del turno
+                      {shiftOpeningBase !== null ? ` (${formatMoney(shiftOpeningBase)})` : ""}. Si lo
+                      supera, el sistema lo rechazará indicando cuánto queda disponible.
+                    </p>
+                  )}
+                </div>
+              ))}
+              <p className="rounded-md bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                Solo se paga de inmediato la comisión por ítem. El porcentaje del
+                empleado se acumula y se paga en la nómina del período: si eliges
+                «Dejar para nómina», la comisión también queda pendiente para la
+                nómina. No se pierde.
+              </p>
+              {commissionError && (
+                <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+                  {commissionError}
+                </p>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-6 py-4">
+              <button
+                type="button"
+                onClick={closeCommission}
+                disabled={commissionBusy}
+                className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+              >
+                Dejar para nómina
+              </button>
+              <button
+                type="button"
+                onClick={() => void confirmCommissionPayment()}
+                disabled={commissionBusy || commissionRows.length === 0 || props.methods.length === 0}
+                className="h-10 rounded-md bg-emerald-700 px-6 text-sm font-semibold text-white hover:bg-emerald-800 disabled:opacity-50"
+              >
+                {commissionBusy ? "Pagando…" : "Confirmar pago"}
+              </button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Confirmación clásica: ¿Está seguro? … OK/Cancelar. */}
+      <Dialog
+        open={confirmKind !== null}
+        onOpenChange={(open) => {
+          if (!open && !busy) setConfirmKind(null);
+        }}
+      >
+        <DialogContent className="max-w-sm border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+          <div className="rounded-xl bg-white text-slate-900 shadow-2xl">
+            <div className="px-6 pt-5">
+              <h2 className="text-lg font-bold">
+                {confirmKind === "annul"
+                  ? "Anular factura"
+                  : confirmKind === "pay"
+                    ? "Pagar factura"
+                    : hasImmediatePayment
+                      ? "Emitir y pagar"
+                      : "Emitir factura"}
+              </h2>
+              <p className="mt-2 text-sm text-slate-600">
+                {confirmKind === "annul"
+                  ? `¿Está seguro de anular la factura${detail ? ` #${detail.invoice.consecutive_number}` : ""}? Se revertirá el stock y no se puede deshacer.`
+                  : confirmKind === "pay"
+                    ? `¿Está seguro de registrar el pago de ${formatMoney(toNumber(splitDraft.amount) ?? 0)} (${splitDraft.method_code})${detail ? ` en la factura #${detail.invoice.consecutive_number}` : ""}? Después no se podrá modificar.`
+                    : hasImmediatePayment
+                      ? `¿Está seguro de emitir y cobrar la factura por ${formatMoney(draftGrandTotal)}? Después no se podrá modificar.`
+                      : `¿Está seguro de emitir la factura por ${formatMoney(draftGrandTotal)}? Esta acción genera un registro permanente que no se podrá eliminar.`}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-3 px-6 py-4">
+              <button
+                type="button"
+                onClick={() => setConfirmKind(null)}
+                disabled={busy}
+                className="h-10 rounded-md border border-slate-300 px-4 text-sm font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  if (confirmKind === "annul") void confirmAnnul();
+                  else if (confirmKind === "pay") void confirmPay();
+                  else void confirmEmit();
+                }}
+                className={
+                  confirmKind === "annul"
+                    ? "h-10 rounded-md bg-red-600 px-6 text-sm font-semibold text-white hover:bg-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-2 disabled:opacity-50"
+                    : "h-10 rounded-md bg-emerald-700 px-6 text-sm font-semibold text-white hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 disabled:opacity-50"
+                }
+              >
+                {busy
+                  ? "Procesando…"
+                  : confirmKind === "annul"
+                    ? "Anular factura"
+                    : confirmKind === "pay"
+                      ? "Pagar"
+                      : hasImmediatePayment
+                        ? "Emitir y pagar"
+                        : "Emitir factura"}
+              </button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

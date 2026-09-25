@@ -12,6 +12,7 @@ import {
 
 function billingErrorResponse(error: unknown) {
   if (error instanceof BillingError) return fail(error.code, error.message, error.status);
+  console.error("invoices POST non-billing error:", error instanceof Error ? (error.stack ?? error.message) : error);
   return fail("INTERNAL", "Error interno.", 500);
 }
 
@@ -27,10 +28,17 @@ export async function GET(request: NextRequest) {
   try {
     const session = await requireSession(tokenOf(request));
     const params = request.nextUrl.searchParams;
+    const pageParam = params.get("page");
+    const consecutiveParam = params.get("consecutive_number");
     const data = await listInvoices(resolveSede(session.sedeId, params.get("sede_id")), {
       status: params.get("status") ?? undefined,
       from: params.get("from") ?? undefined,
       to: params.get("to") ?? undefined,
+      user_id: params.get("user_id") ?? undefined,
+      closed_by: params.get("closed_by") ?? undefined,
+      employee_id: params.get("employee_id") ?? undefined,
+      consecutive_number: consecutiveParam ? Number(consecutiveParam) : undefined,
+      page: pageParam ? Number(pageParam) : undefined,
     });
     return ok(data);
   } catch (error) {

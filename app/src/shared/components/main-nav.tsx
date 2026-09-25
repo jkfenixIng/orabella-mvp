@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState, useEffect } from "react";
-import { Bell, Calculator, House, Package, Receipt, Settings, Ticket, Wallet, type LucideIcon } from "lucide-react";
+import { Bell, Calculator, House, Package, Receipt, Settings, Sparkles, Ticket, Wallet, type LucideIcon } from "lucide-react";
 import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 
 interface NavLink {
@@ -33,6 +33,13 @@ const NAV_GROUPS: NavGroup[] = [
           roles: ["admin", "caja", "empleado"],
         },
         { href: "/cash", label: "Caja", description: "Turnos y cierre del día", Icon: Wallet, roles: ["admin", "caja"] },
+        {
+          href: "/vales",
+          label: "Vales",
+          description: "Vales para empleados",
+          Icon: Ticket,
+          roles: ["admin", "caja", "empleado"],
+        },
       ],
   },
   {
@@ -44,6 +51,13 @@ const NAV_GROUPS: NavGroup[] = [
           label: "Inventario",
           description: "Productos y existencias",
           Icon: Package,
+          roles: ["admin", "caja"],
+        },
+        {
+          href: "/services",
+          label: "Servicios",
+          description: "Qué se brinda y a qué precio",
+          Icon: Sparkles,
           roles: ["admin", "caja"],
         },
       ],
@@ -58,13 +72,6 @@ const NAV_GROUPS: NavGroup[] = [
           description: "Pagos al personal",
           Icon: Calculator,
           roles: ["admin", "empleado"],
-        },
-        {
-          href: "/vales",
-          label: "Vales",
-          description: "Vales para empleados",
-          Icon: Ticket,
-          roles: ["admin", "caja", "empleado"],
         },
       ],
   },
@@ -147,8 +154,8 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
         aria-current={homeActive ? "page" : undefined}
         className={
           homeActive
-            ? "flex items-center gap-2 rounded-md bg-slate-200 dark:bg-slate-800 px-3 py-2 text-sm font-medium text-slate-900 dark:text-slate-100"
-            : "flex items-center gap-2 rounded-md px-3 py-2 text-sm text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+            ? "flex items-center gap-2 rounded-md bg-primary-600 px-3 py-2 text-sm font-medium text-white"
+            : "flex items-center gap-2 rounded-md px-3 py-2 text-sm text-text-secondary hover:bg-surface-hover"
         }
       >
         <House className="h-4 w-4" aria-hidden="true" />
@@ -166,8 +173,8 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
               onClick={() => toggleGroup(group.id)}
               className={
                 active
-                  ? "flex items-center justify-between rounded-md px-3 py-2 text-sm font-semibold text-slate-900 dark:text-slate-100"
-                  : "flex items-center justify-between rounded-md px-3 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+                  ? "flex items-center justify-between rounded-md px-3 py-2 text-sm font-semibold text-text-primary"
+                  : "flex items-center justify-between rounded-md px-3 py-2 text-sm font-semibold text-text-secondary hover:bg-surface-hover"
               }
             >
               <span>{group.label}</span>
@@ -176,7 +183,7 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
               </span>
             </button>
             {open && (
-              <ul id={`nav-grupo-${group.id}`} className="ml-2 flex flex-col gap-1 border-l border-slate-200 pl-2 dark:border-slate-700">
+              <ul id={`nav-grupo-${group.id}`} className="ml-2 flex flex-col gap-1 border-l border-border-color-2 pl-2">
                 {group.links.map((link) => {
                   const linkActive = isActive(pathname, link.href);
                   return (
@@ -188,14 +195,14 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
                         title={link.description}
                         className={
                           linkActive
-                            ? "flex items-center gap-2 rounded-md bg-slate-200 dark:bg-slate-800 px-3 py-2 text-sm font-medium text-slate-900 dark:text-slate-100"
-                            : "flex items-center gap-2 rounded-md px-3 py-2 text-sm text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+                            ? "flex items-center gap-2 rounded-md bg-primary-600 px-3 py-2 text-sm font-medium text-white"
+                            : "flex items-center gap-2 rounded-md px-3 py-2 text-sm text-text-secondary hover:bg-surface-hover"
                         }
                       >
                         <link.Icon className="h-4 w-4" aria-hidden="true" />
                         {link.label}
                         {link.href === "/alerts" && alertsUnread > 0 && (
-                          <span className="ml-auto rounded-full bg-red-600 px-2 py-0.5 text-xs font-bold text-white">
+                          <span className="ml-auto rounded-full bg-error px-2 py-0.5 text-xs font-bold text-white">
                             {alertsUnread}
                           </span>
                         )}
@@ -212,12 +219,12 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
   );
 
   const footer = (
-    <div className="flex flex-col gap-3 border-t border-slate-200 pt-3 dark:border-slate-700">
+    <div className="flex flex-col gap-3 border-t border-border-color-2 pt-3">
       <ThemeToggle />
       {userName && (
-        <p className="truncate px-1 text-xs text-slate-500 dark:text-slate-400" title={userName}>
+        <p className="truncate px-1 text-xs text-text-tertiary" title={userName}>
           En sesión:{" "}
-          <span className="font-medium text-slate-700 dark:text-slate-200">{userName}</span>
+          <span className="font-medium text-text-primary">{userName}</span>
         </p>
       )}
       <button
@@ -225,7 +232,7 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
         onClick={handleLogout}
         disabled={loggingOut}
         aria-label="Cerrar sesión"
-        className="rounded-md border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+        className="rounded-md border border-border-color px-3 py-2 text-sm font-medium text-text-primary hover:bg-surface-hover disabled:opacity-50"
       >
         {loggingOut ? "Saliendo…" : "Salir"}
       </button>
@@ -235,7 +242,7 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
   return (
     <>
       {/* Barra superior: visible en móvil y tableta */}
-      <header className="sticky top-0 z-30 flex items-center justify-between gap-3 border-b border-slate-200 bg-white px-4 py-3 lg:hidden dark:border-slate-700 dark:bg-slate-900">
+      <header className="sticky top-0 z-30 flex items-center justify-between gap-3 border-b border-border-color bg-surface px-4 py-3 lg:hidden dark:border-border-color-2">
         <Link href="/" className="text-lg font-bold" aria-label="Orabella inicio">
           Orabella
         </Link>
@@ -245,7 +252,7 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
           aria-expanded={drawerOpen}
           aria-controls="menu-movil"
           onClick={() => setDrawerOpen((prev) => !prev)}
-          className="rounded-md border border-slate-300 px-3 py-2 text-sm font-medium dark:border-slate-700"
+          className="rounded-md border border-border-color px-3 py-2 text-sm font-medium"
         >
           ☰
         </button>
@@ -264,7 +271,7 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
             role="dialog"
             aria-modal="true"
             aria-label="Menú principal"
-            className="absolute left-0 top-0 flex h-full w-72 flex-col gap-4 overflow-y-auto bg-white p-4 dark:bg-slate-900"
+            className="absolute left-0 top-0 flex h-full w-72 flex-col gap-4 overflow-y-auto bg-surface p-4"
           >
             <div className="flex items-center justify-between">
               <span className="text-lg font-bold">Orabella</span>
@@ -272,7 +279,7 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
                 type="button"
                 aria-label="Cerrar menú"
                 onClick={() => setDrawerOpen(false)}
-                className="rounded-md border border-slate-300 px-3 py-1 text-sm dark:border-slate-700"
+                className="rounded-md border border-border-color px-3 py-1 text-sm"
               >
                 ✕
               </button>
@@ -288,8 +295,8 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
         aria-label="Barra lateral"
         className={
           sidebarCollapsed
-            ? "sticky top-0 hidden h-screen w-16 flex-col gap-4 overflow-y-auto border-r border-slate-200 bg-white p-2 lg:flex dark:border-slate-700 dark:bg-slate-900"
-            : "sticky top-0 hidden h-screen w-64 flex-col gap-4 overflow-y-auto border-r border-slate-200 bg-white p-4 lg:flex dark:border-slate-700 dark:bg-slate-900"
+            ? "sticky top-0 hidden h-screen w-16 flex-col gap-4 overflow-y-auto border-r border-border-color bg-surface p-2 lg:flex dark:border-border-color-2"
+            : "sticky top-0 hidden h-screen w-64 flex-col gap-4 overflow-y-auto border-r border-border-color bg-surface p-4 lg:flex dark:border-border-color-2"
         }
       >
         <div className="flex items-center justify-between gap-2">
@@ -303,7 +310,7 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
             aria-label={sidebarCollapsed ? "Ampliar navegación" : "Contraer navegación"}
             aria-expanded={!sidebarCollapsed}
             onClick={() => setSidebarCollapsed((prev) => !prev)}
-            className="rounded-md border border-slate-300 px-2 py-1 text-sm dark:border-slate-700"
+            className="rounded-md border border-border-color px-2 py-1 text-sm"
           >
             {sidebarCollapsed ? "»" : "«"}
           </button>
@@ -314,7 +321,7 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
               href="/"
               aria-label="Inicio"
               aria-current={homeActive ? "page" : undefined}
-              className="rounded-md px-3 py-2 text-center text-sm hover:bg-slate-100 dark:hover:bg-slate-800"
+              className="rounded-md px-3 py-2 text-center text-sm text-text-secondary hover:bg-surface-hover"
             >
               ⌂
             </Link>
@@ -328,8 +335,8 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
                   aria-current={isActive(pathname, link.href) ? "page" : undefined}
                   className={
                     isActive(pathname, link.href)
-                      ? "flex justify-center rounded-md bg-slate-200 dark:bg-slate-800 px-3 py-2 text-center text-sm font-medium text-slate-900 dark:text-slate-100"
-                      : "flex justify-center rounded-md px-3 py-2 text-center text-sm hover:bg-slate-100 dark:hover:bg-slate-800"
+                      ? "flex justify-center rounded-md bg-primary-600 px-3 py-2 text-center text-sm font-medium text-white"
+                      : "flex justify-center rounded-md px-3 py-2 text-center text-sm text-text-secondary hover:bg-surface-hover"
                   }
                 >
                   <link.Icon className="h-4 w-4" aria-hidden="true" />

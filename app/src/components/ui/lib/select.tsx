@@ -4,6 +4,7 @@ import * as React from 'react'
 import * as SelectPrimitive from '@radix-ui/react-select'
 import { Check, ChevronDown } from 'lucide-react'
 import { cn } from './utils'
+import { usePopoverLayer } from './dialog'
 
 type SelectProps = React.ComponentPropsWithoutRef<typeof SelectPrimitive.Root>
 
@@ -71,25 +72,32 @@ const SelectContent = React.forwardRef<
   SelectContentProps
 >(
   (
-    { className, children, position = 'popper', ...props },
+    { className, children, position = 'popper', style, ...props },
     ref,
-  ) => (
-    <SelectPrimitive.Portal>
-      <SelectPrimitive.Content
-        ref={ref}
-        position={position}
-        className={cn(
-          'relative z-50 max-h-96 min-w-[var(--radix-select-trigger-width)] overflow-y-auto overflow-x-hidden rounded-lg border border-border-color bg-surface text-sm text-text-primary shadow-lg outline-none transition duration-150 data-[state=open]:scale-100 data-[state=open]:opacity-100 data-[state=closed]:scale-95 data-[state=closed]:opacity-0 dark:border-border-color-2 dark:bg-surface dark:text-text-primary',
-          className,
-        )}
-        {...props}
-      >
-        <SelectPrimitive.Viewport className={cn('p-1', position === 'popper' && 'h-[var(--radix-select-trigger-height)] w-min min-w-[var(--radix-select-trigger-width)]')}>
-          {children}
-        </SelectPrimitive.Viewport>
-      </SelectPrimitive.Content>
-    </SelectPrimitive.Portal>
-  ),
+  ) => {
+    // El portal del desplegable compite con el overlay del diálogo que lo
+    // contiene. `z-50` fijo no alcanza cuando el diálogo está apilado, así que
+    // se eleva por encima del contenido del diálogo abierto más alto.
+    const popoverZ = usePopoverLayer()
+    return (
+      <SelectPrimitive.Portal>
+        <SelectPrimitive.Content
+          ref={ref}
+          position={position}
+          style={{ zIndex: popoverZ, ...style }}
+          className={cn(
+            'relative z-50 max-h-96 min-w-[var(--radix-select-trigger-width)] overflow-y-auto overflow-x-hidden rounded-lg border border-border-color bg-surface text-sm text-text-primary shadow-lg outline-none transition duration-150 data-[state=open]:scale-100 data-[state=open]:opacity-100 data-[state=closed]:scale-95 data-[state=closed]:opacity-0 dark:border-border-color-2 dark:bg-surface dark:text-text-primary',
+            className,
+          )}
+          {...props}
+        >
+          <SelectPrimitive.Viewport className={cn('p-1', position === 'popper' && 'h-[var(--radix-select-trigger-height)] w-min min-w-[var(--radix-select-trigger-width)]')}>
+            {children}
+          </SelectPrimitive.Viewport>
+        </SelectPrimitive.Content>
+      </SelectPrimitive.Portal>
+    )
+  },
 )
 SelectContent.displayName = SelectPrimitive.Content.displayName
 
@@ -136,7 +144,7 @@ const SelectItem = React.forwardRef<
   <SelectPrimitive.Item
     ref={ref}
     className={cn(
-      'relative flex w-full cursor-default select-none items-center rounded-md py-2 pl-3 pr-10 text-sm outline-none focus:bg-primary-50 focus:text-primary-900 data-[disabled]:pointer-events-none data-[disabled]:opacity-50 dark:focus:bg-primary-900/30 dark:focus:text-primary-100',
+      'relative flex w-full cursor-default select-none items-center rounded-md py-2 pl-3 pr-10 text-sm outline-none focus:bg-surface-hover focus:text-text-primary data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
       className,
     )}
     {...props}

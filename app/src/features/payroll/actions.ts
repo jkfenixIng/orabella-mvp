@@ -10,6 +10,7 @@ import {
   approveVoucher,
   calculatePayroll,
   closePayrollPeriod,
+  deletePayrollPeriod,
   getPeriodDetail,
   getVoucherSettings,
   listPeriods,
@@ -88,6 +89,20 @@ export async function closePayrollPeriodAction(id: string) {
   }
 }
 
+/** Misma lógica que DELETE /api/v1/payroll-periods/:id (solo admin). */
+export async function deletePayrollPeriodAction(id: string) {
+  try {
+    const session = await requirePayrollAdmin(await sessionToken());
+    const data = await deletePayrollPeriod(session.sedeId, id, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+    });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
 /** Periodos de la sede (requiere sesión, cualquier rol de su sede). */
 export async function listPeriodsAction() {
   try {
@@ -140,13 +155,14 @@ export async function setVoucherLimitsAction(input: unknown) {
   }
 }
 
-/** Misma lógica que POST /api/v1/vouchers (admin/caja: emitir vales). */
+/** Misma lógica que POST /api/v1/vouchers (admin/caja; el servicio exige turno abierto). */
 export async function requestVoucherAction(input: unknown) {
   try {
     const session = await requirePayrollPayer(await sessionToken());
     const data = await requestVoucher(input, {
       userId: session.userId,
       sedeId: session.sedeId,
+      roles: session.roles,
     });
     return { success: true as const, data };
   } catch (error) {
@@ -155,7 +171,7 @@ export async function requestVoucherAction(input: unknown) {
 }
 
 /** Vales de la sede (admin/caja ven todo; empleado solo los suyos; máx. 50 por defecto). */
-export async function listVouchersAction(input: { status?: string; employee_id?: string; sede_id?: string; limit?: number }) {
+export async function listVouchersAction(input: { status?: string; employee_id?: string; request_date?: string; sede_id?: string; limit?: number }) {
   try {
     const session = await requireSession(await sessionToken());
     const sedeId = resolveSede(session.sedeId, input.sede_id);
@@ -168,6 +184,7 @@ export async function listVouchersAction(input: { status?: string; employee_id?:
     const data = await listVouchers(sedeId, {
       status: input.status,
       employee_id: employeeId,
+      request_date: input.request_date,
       limit: input.limit,
     });
     return { success: true as const, data };
@@ -190,11 +207,11 @@ export async function approveVoucherAction(id: string, input: unknown) {
   }
 }
 
-/** Misma lógica que POST /api/v1/vouchers/:id/reject (solo admin). */
+/** Misma lógica que POST /api/v1/vouchers/:id/reject (solo admin, motivo + auditoría). */
 export async function rejectVoucherAction(id: string, input: unknown) {
   try {
     const session = await requirePayrollAdmin(await sessionToken());
-    const data = await rejectVoucher(session.sedeId, id, input);
+    const data = await rejectVoucher(session.sedeId, id, input, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

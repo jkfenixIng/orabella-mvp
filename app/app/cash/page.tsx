@@ -3,7 +3,7 @@ import { redirect } from "next/navigation";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { listPaymentMethods } from "@/src/features/admin/service";
-import { getOpenShift, listRegisters } from "@/src/features/cash/service";
+import { getOpenShiftWithOpener, listRegisters } from "@/src/features/cash/service";
 import type { DayView } from "@/src/features/cash/service";
 import { accumulateDayTotals, bogotaDay, HISTORY_PAGE_SIZE } from "@/src/features/cash/schemas";
 import { CashClient } from "./cash-client";
@@ -31,7 +31,7 @@ export default async function CashPage() {
     return (
       <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-4 px-6 py-12">
         <h1 className="text-2xl font-bold">Caja</h1>
-        <p role="alert" className="text-sm text-red-600 dark:text-red-400">
+        <p role="alert" className="text-sm text-error dark:text-error">
           El usuario no tiene sede asignada.
         </p>
       </main>
@@ -44,7 +44,7 @@ export default async function CashPage() {
   // para no pagar ese costo al entrar solo a abrir o cerrar turno.
   const [registers, openShift, methods] = await Promise.all([
     listRegisters(sedeId),
-    getOpenShift(sedeId),
+    getOpenShiftWithOpener(sedeId),
     listPaymentMethods(sedeId),
   ]);
 
@@ -83,7 +83,7 @@ export default async function CashPage() {
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold">Caja</h1>
-          <p className="mt-2 text-slate-600 dark:text-slate-300">
+          <p className="mt-2 text-text-secondary">
             Turnos, pagos por método y cierres de caja.
           </p>
         </div>
@@ -94,6 +94,7 @@ export default async function CashPage() {
         currentUserId={session.user.id}
         initialRegisters={registers}
         initialOpenShift={openShift}
+        initialOpenerName={openShift?.opener_name ?? null}
         initialDay={day}
         initialHistory={{ desde: today, hasta: today, shifts: [], page: 1, pageSize: HISTORY_PAGE_SIZE, total: 0 }}
         methods={methods.filter((row) => row.is_active)}

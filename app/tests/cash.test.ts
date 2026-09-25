@@ -8,17 +8,26 @@ import {
   assertShiftCloser,
   bogotaDay,
   buildMethodViews,
+  CASH_OUT_LIMIT_CODE,
+  CASH_OUT_LIMIT_RATIO,
+  cashOutLimitState,
+  cashOutLimitViolation,
   closeShiftSchema,
   computeCashClose,
   dayBounds,
   dayViewSchema,
+  exceedsCashOutLimit,
   expectedDigitalTotal,
   HISTORY_PAGE_SIZE,
   historySchema,
+  isVoucherCashOut,
   openShiftSchema,
   registerPaymentSchema,
   resolveClosingBase,
   resolveOpeningBase,
+  sumMethodMaps,
+  sumMethodTotal,
+  voucherOutByMethod,
 } from "@/src/features/cash/schemas";
 
 // ------------------------------------------------- base encadenada (CAJ-01) ---
@@ -208,8 +217,7 @@ describe("cash: pagos contra el turno con método activo y monto > 0 (CAJ-02)", 
 
 // ------------------------------------------------- día y acumulado (CAJ-05) ---
 
-describe("cash: vista del día valida la fecha (CAJ-05)", () => {
-  it("acepta yyyy-mm-dd y rechaza otros formatos", () => {
+describe("cash: vista del día valida la fecha (CAJ-05)", () => {  it("acepta yyyy-mm-dd y rechaza otros formatos", () => {
     expect(dayViewSchema.safeParse({ fecha: "2026-09-18" }).success).toBe(true);
     expect(dayViewSchema.safeParse({ fecha: "18/09/2026" }).success).toBe(false);
     expect(dayViewSchema.safeParse({}).success).toBe(false);
@@ -346,5 +354,202 @@ describe("migración 006_cash.sql (T6)", () => {
     expect(sql).toContain("CAJ-04");
     expect(sql).toContain("invoice_payments");
     expect(sql).toContain("400");
+  });
+});
+
+// ------------------------------------------------- vales en el arqueo ---
+
+describe("cash: vales aprobados descuentan del arqueo por su método", () => {
+  it("un vale pendiente NO afecta el arqueo (nunca aprobado)", () => {
+    expect(isVoucherCashOut({ approved_by: null, method_code: "efectivo", amount: 50000 })).toBe(false);
+    // Histórico sin método tampoco cuenta, aunque figure aprobado.
+    expect(isVoucherCashOut({ approved_by: "u1", method_code: null, amount: 50000 })).toBe(false);
+    const out = voucherOutByMethod([
+      { approved_by: null, method_code: "efectivo", amount: 50000 },
+      { approved_by: null, method_code: "nequi", amount: 30000 },
+    ]);
+    expect(out.size).toBe(0);
+  });
+
+  it("un vale aprobado SÍ sale por su método (resta del esperado digital)", () => {
+    const out = voucherOutByMethod([
+      { approved_by: "u1", method_code: "efectivo", amount: 30000 },
+      { approved_by: "u1", method_code: "nequi", amount: 20000 },
+    ]);
+    expect(out.get("efectivo")).toBe(30000);
+    expect(out.get("nequi")).toBe(20000);
+    // Esperado digital = apertura + cobrado − salida del vale.
+    expect(expectedDigitalTotal(1000000, 50000, out.get("nequi") ?? 0)).toBe(1030000);
+  });
+
+  it("varios vales del mismo método acumulan y los pendientes se ignoran", () => {
+    const out = voucherOutByMethod([
+      { approved_by: "u1", method_code: "efectivo", amount: 10000 },
+      { approved_by: "u2", method_code: "efectivo", amount: 25000 },
+      { approved_by: null, method_code: "efectivo", amount: 999999 },
+    ]);
+    expect(out.get("efectivo")).toBe(35000);
+  });
+
+  it("sumMethodMaps combina comisiones + vales (mapas ausentes se ignoran)", () => {
+    const payouts = new Map([["nequi", 100000]]);
+    const vouchers = new Map([
+      ["nequi", 20000],
+      ["efectivo", 30000],
+    ]);
+    const combined = sumMethodMaps(payouts, vouchers);
+    expect(combined.get("nequi")).toBe(120000);
+    expect(combined.get("efectivo")).toBe(30000);
+    expect(sumMethodMaps(null, undefined).size).toBe(0);
+  });
+
+  it("buildMethodViews cuadra el cierre descontando la salida por vale", () => {
+    const paid = new Map([["nequi", 200000]]);
+    const open = new Map([["nequi", 1000000]]);
+    const out = new Map([["nequi", 50000]]);
+    const closedOk = new Map([["nequi", 1150000]]);
+    // 1000000 + 200000 − 50000 = 1150000 → sin diferencias.
+    expect(buildMethodViews({ paid, open, paidOut: out, closed: closedOk }).diferencias).toEqual([]);
+    // Sin descontar el vale el mismo conteo daría faltante.
+    const closedNoOut = new Map([["nequi", 1150000]]);
+    expect(
+      buildMethodViews({ paid, open, paidOut: new Map(), closed: closedNoOut }).diferencias,
+    ).toEqual([{ method_code: "nequi", expected: 1200000, declared: 1150000, difference: -50000 }]);
+  });
+});
+
+// ------------------------------------------------- total de vales por turno ---
+
+describe("cash: total de vales por turno (columna Vales)", () => {
+  it("suma los vales del turno de todos los métodos como salida positiva", () => {
+    const out = voucherOutByMethod([
+      { approved_by: "u1", method_code: "efectivo", amount: 10000 },
+      { approved_by: "u1", method_code: "nequi", amount: 25000 },
+      { approved_by: null, method_code: "efectivo", amount: 999999 },
+    ]);
+    // Solo los aprobados cuentan; el pendiente se ignora.
+    expect(sumMethodTotal(out)).toBe(35000);
+  });
+
+  it("degrada a 0 cuando la migración de vales no está aplicada (mapa ausente)", () => {
+    // `fetchVoucherOutTotals` devuelve un mapa vacío si faltan las columnas.
+    expect(sumMethodTotal(undefined)).toBe(0);
+    expect(sumMethodTotal(null)).toBe(0);
+    expect(sumMethodTotal(new Map())).toBe(0);
+  });
+
+  it("redondea el total a centavos", () => {
+    expect(sumMethodTotal(new Map([["nequi", 0.1], ["efectivo", 0.2]]))).toBe(0.3);
+  });
+});
+
+// --------------------------------- tope de salidas en efectivo (50% base) ---
+
+describe("cash: tope de salidas en efectivo = 50% de la base del turno", () => {
+  const base = 200000; // tope 100000
+
+  it("calcula el tope como la mitad de la base de apertura", () => {
+    expect(CASH_OUT_LIMIT_RATIO).toBe(0.5);
+    expect(cashOutLimitState(base, 0)).toEqual({
+      base: 200000,
+      limit: 100000,
+      used: 0,
+      available: 100000,
+    });
+    // El disponible nunca queda negativo aunque el acumulado supere el tope.
+    expect(cashOutLimitState(base, 120000).available).toBe(0);
+  });
+
+  it("un vale en efectivo por debajo del tope se permite", () => {
+    const state = cashOutLimitState(base, 40000);
+    expect(exceedsCashOutLimit(state, 30000)).toBe(false);
+    expect(
+      cashOutLimitViolation({
+        methodCode: "efectivo",
+        openingBase: base,
+        cashOutUsed: 40000,
+        amount: 30000,
+      }),
+    ).toBeNull();
+  });
+
+  it("un vale en efectivo exactamente en el 50% se permite (tope inclusivo)", () => {
+    const state = cashOutLimitState(base, 0);
+    expect(exceedsCashOutLimit(state, 100000)).toBe(false);
+    expect(
+      cashOutLimitViolation({
+        methodCode: "efectivo",
+        openingBase: base,
+        cashOutUsed: 0,
+        amount: 100000,
+      }),
+    ).toBeNull();
+    // Acumulado 60000 + 40000 = 100000 = tope: también se permite.
+    expect(
+      cashOutLimitViolation({
+        methodCode: "efectivo",
+        openingBase: base,
+        cashOutUsed: 60000,
+        amount: 40000,
+      }),
+    ).toBeNull();
+    // Un centavo por encima ya se rechaza.
+    expect(exceedsCashOutLimit(cashOutLimitState(base, 60000), 40000.01)).toBe(true);
+  });
+
+  it("un vale en efectivo que supera el tope se rechaza con el código de negocio", () => {
+    const violation = cashOutLimitViolation({
+      methodCode: "efectivo",
+      openingBase: base,
+      cashOutUsed: 0,
+      amount: 150000,
+    });
+    expect(violation).not.toBeNull();
+    expect(violation?.code).toBe(CASH_OUT_LIMIT_CODE);
+    expect(violation?.code).toBe("CASH_OUT_LIMIT_EXCEEDED");
+    expect(violation?.message).toContain("150000");
+    expect(violation?.message).toContain("200000");
+    expect(violation?.message).toContain("100000");
+  });
+
+  it("el tope rige sobre el acumulado: 40000 ya salidos + 70000 nuevo lo supera", () => {
+    // Tope 100000; 40000 + 70000 = 110000 > 100000 → rechazado.
+    const violation = cashOutLimitViolation({
+      methodCode: "efectivo",
+      openingBase: base,
+      cashOutUsed: 40000,
+      amount: 70000,
+    });
+    expect(violation?.code).toBe(CASH_OUT_LIMIT_CODE);
+    // El disponible reportado es el real: 100000 − 40000 = 60000.
+    expect(violation?.message).toContain("60000");
+  });
+
+  it("las salidas por método digital se permiten aunque superen el 50%", () => {
+    expect(
+      cashOutLimitViolation({
+        methodCode: "nequi",
+        openingBase: base,
+        cashOutUsed: 0,
+        amount: 999999,
+      }),
+    ).toBeNull();
+    expect(
+      cashOutLimitViolation({
+        methodCode: "tarjeta",
+        openingBase: base,
+        cashOutUsed: 90000,
+        amount: 50000,
+      }),
+    ).toBeNull();
+    // El mismo monto en efectivo sí se rechaza.
+    expect(
+      cashOutLimitViolation({
+        methodCode: "efectivo",
+        openingBase: base,
+        cashOutUsed: 90000,
+        amount: 50000,
+      })?.code,
+    ).toBe(CASH_OUT_LIMIT_CODE);
   });
 });

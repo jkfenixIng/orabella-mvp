@@ -6,7 +6,6 @@ import {
   listEmployees,
   listPaymentMethods,
   listSedeUsers,
-  listServices,
   listTaxes,
 } from "@/src/features/admin/service";
 import { getVoucherSettings } from "@/src/features/payroll/service";
@@ -35,18 +34,17 @@ export default async function AdminPage() {
     return (
       <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-4 px-6 py-12">
         <h1 className="text-2xl font-bold">Administración</h1>
-        <p role="alert" className="text-sm text-red-600 dark:text-red-400">
+        <p role="alert" className="text-sm text-error dark:text-error">
           El usuario no tiene sede asignada.
         </p>
       </main>
     );
   }
 
-  const [employees, users, services, taxes, methods, voucherSettings, registers, denominations] =
+  const [employees, users, taxes, methods, voucherSettings, registers, denominations] =
     await Promise.all([
       listEmployees(sedeId),
       listSedeUsers(sedeId),
-      listServices(sedeId),
       listTaxes(sedeId),
       listPaymentMethods(sedeId),
       getVoucherSettings(sedeId),
@@ -59,8 +57,8 @@ export default async function AdminPage() {
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold">Administración</h1>
-          <p className="mt-2 text-slate-600 dark:text-slate-300">
-            Empleados, servicios, impuestos y métodos de pago de su sede.
+          <p className="mt-2 text-text-secondary">
+            Empleados, impuestos y métodos de pago de su sede.
           </p>
         </div>
       </header>
@@ -69,7 +67,6 @@ export default async function AdminPage() {
         currentUserId={session.user.id}
         initialEmployees={employees}
         initialUsers={users}
-        initialServices={services}
         initialTaxes={taxes}
         initialMethods={methods}
         initialVoucherSettings={voucherSettings}

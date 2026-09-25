@@ -3,11 +3,14 @@
 import { cookies } from "next/headers";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { resolveSede } from "@/src/shared/lib/sede";
-import { requireSession } from "@/src/features/admin/service";
+import { requireAdminSession, requireSession } from "@/src/features/admin/service";
 import {
   BillingError,
   annulInvoice,
+  countInvoices,
   createInvoice,
+  editEmittedInvoiceItems,
+  editInvoiceItems,
   getInvoiceDetail,
   listInvoices,
   requireBillingWriter,
@@ -34,19 +37,31 @@ export async function listInvoicesAction(filters: {
   to?: string;
   user_id?: string;
   consecutive_number?: number;
+  closed_by?: string;
+  employee_id?: string;
+  page?: number;
+  pageSize?: number;
 } = {}) {
   try {
     const session = await requireSession(await sessionToken());
-    const data = await listInvoices(resolveSede(session.sedeId, filters.sede_id), {
+    const sedeId = resolveSede(session.sedeId, filters.sede_id);
+    const isManager = session.roles.includes("admin") || session.roles.includes("caja");
+    // Empleado: solo las propias (filtro forzado para que el total cuadre).
+    const effectiveUserId = isManager ? filters.user_id : session.userId;
+    const where = {
       status: filters.status || undefined,
       from: filters.from || undefined,
       to: filters.to || undefined,
-      user_id: filters.user_id,
+      user_id: effectiveUserId,
       consecutive_number: filters.consecutive_number,
-    });
-    const isManager = session.roles.includes("admin") || session.roles.includes("caja");
-    const scoped = isManager ? data : data.filter((row) => row.user_id === session.userId);
-    return { success: true as const, data: scoped };
+      closed_by: filters.closed_by || undefined,
+      employee_id: isManager ? filters.employee_id || undefined : undefined,
+    };
+    const [rows, total] = await Promise.all([
+      listInvoices(sedeId, { ...where, page: filters.page, pageSize: filters.pageSize }),
+      countInvoices(sedeId, where),
+    ]);
+    return { success: true as const, data: { rows, total } };
   } catch (error) {
     return toFailure(error);
   }
@@ -84,6 +99,36 @@ export async function createInvoiceAction(input: unknown) {
   }
 }
 
+/** Edición admin de factura con motivo (solo admin; el servicio refuerza). */
+export async function editInvoiceAction(id: string, input: unknown) {
+  try {
+    const session = await requireAdminSession(await sessionToken());
+    const data = await editInvoiceItems(session.sedeId, id, input, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+      roles: session.roles,
+    });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Edición LIBRE de factura EMITIDA (cajera del turno sin motivo, total se recalcula; el servicio refuerza). */
+export async function editEmittedInvoiceAction(id: string, input: unknown) {
+  try {
+    const session = await requireBillingWriter(await sessionToken());
+    const data = await editEmittedInvoiceItems(session.sedeId, id, input, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+      roles: session.roles,
+    });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
 /** Misma lógica que POST /api/v1/invoices/:id/annul (solo admin). */
 export async function annulInvoiceAction(id: string, input: unknown) {
   try {
@@ -103,7 +148,11 @@ export async function annulInvoiceAction(id: string, input: unknown) {
 export async function splitPaymentAction(id: string, input: unknown) {
   try {
     const session = await requireBillingWriter(await sessionToken());
-    const data = await splitPayment(session.sedeId, id, input);
+    const data = await splitPayment(session.sedeId, id, input, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+      roles: session.roles,
+    });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

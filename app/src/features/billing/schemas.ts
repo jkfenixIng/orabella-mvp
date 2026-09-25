@@ -4,6 +4,78 @@ import { z } from "zod";
 export const invoiceItemTypeSchema = z.enum(["producto", "servicio", "custom"]);
 export type InvoiceItemType = z.infer<typeof invoiceItemTypeSchema>;
 
+/**
+ * Modo de comisión explícito de una línea (migración 030):
+ *  - `comision`   → valor fijo por unidad (`commission_value` × cantidad).
+ *  - `porcentaje` → porcentaje del subtotal (el del empleado, o
+ *    `commission_percent_override` si el empleado es de pago fijo).
+ *  - `ninguna`    → la línea no comisiona.
+ */
+export const commissionModeSchema = z.enum(["comision", "porcentaje", "ninguna"]);
+export type CommissionMode = z.infer<typeof commissionModeSchema>;
+
+/**
+ * Deriva el modo de comisión desde los campos históricos (`no_commission` +
+ * `commission_value`) cuando el payload no trae `commission_mode`. Reproduce
+ * exactamente la semántica previa de la resolución:
+ *  - `no_commission`                    → `ninguna`.
+ *  - `commission_value > 0`             → `comision` (valor fijo por unidad).
+ *  - `servicio` / `custom` sin valor    → `porcentaje` (porcentaje del empleado).
+ *  - `producto` sin valor               → `comision` (valor del ítem, regla o 0;
+ *    el producto nunca usa el porcentaje del empleado).
+ * Puro para probarlo sin base de datos.
+ */
+export function deriveCommissionMode(
+  itemType: string,
+  noCommission: boolean | null | undefined,
+  commissionValue: number | null | undefined,
+): CommissionMode {
+  if (noCommission) return "ninguna";
+  if (commissionValue != null && commissionValue > 0) return "comision";
+  if (itemType === "producto") return "comision";
+  return "porcentaje";
+}
+
+/** Columnas de comisión ya normalizadas de una línea (migración 030). */
+export interface CommissionFields {
+  no_commission: boolean;
+  commission_value: number | null;
+  commission_mode: CommissionMode;
+  commission_percent_override: number | null;
+}
+
+/**
+ * Normaliza las columnas de comisión de una línea al modelo explícito:
+ *  - `commission_mode`: el declarado por el payload o, si no viene, el derivado
+ *    de los campos históricos (`no_commission` + `commission_value`) —
+ *    retrocompatibilidad total con los clientes que aún no lo mandan.
+ *  - `no_commission` / `commission_value`: columnas vivas que se conservan y se
+ *    mantienen coherentes con el modo (`ninguna` ⇒ sin comisión; `comision` ⇒
+ *    con valor; `porcentaje` ⇒ sin valor). Con modo derivado se conservan tal
+ *    cual venían, para no alterar el pasado.
+ *  - `commission_percent_override`: solo para personalizado por porcentaje.
+ * Puro para probarlo sin base de datos.
+ */
+export function normalizeCommissionFields(
+  item: Pick<
+    InvoiceItemInput,
+    "item_type" | "no_commission" | "commission_value" | "commission_mode" | "commission_percent_override"
+  >,
+): CommissionFields {
+  const mode =
+    item.commission_mode ?? deriveCommissionMode(item.item_type, item.no_commission, item.commission_value);
+  const explicit = item.commission_mode !== undefined && item.commission_mode !== null;
+  return {
+    no_commission: mode === "ninguna",
+    commission_value: mode === "comision" || !explicit ? (item.commission_value ?? null) : null,
+    commission_mode: mode,
+    commission_percent_override:
+      mode === "porcentaje" && item.item_type === "custom"
+        ? (item.commission_percent_override ?? null)
+        : null,
+  };
+}
+
 /** FAC-04: estados de la factura interna (sin borrado, solo transiciones). */
 export const invoiceStatusSchema = z.enum(["Emitida", "Pagada", "Anulada"]);
 export type InvoiceStatus = z.infer<typeof invoiceStatusSchema>;
@@ -43,10 +115,30 @@ export const invoiceItemSchema = z
     unit_price: moneySchema("El precio"),
     discount: moneySchema("El descuento").default(0),
     no_commission: z.boolean().optional().default(false),
-    commission_value: z.coerce.number().min(0).max(100).optional().nullable(),
+    commission_value: z.coerce.number().min(0, "La comisión no puede ser negativa.").optional().nullable(),
+    /**
+     * Modo de comisión explícito (migración 030). `nullish` por
+     * retrocompatibilidad: un payload que no lo mande deriva el modo de
+     * `no_commission` + `commission_value` (ver `deriveCommissionMode`).
+     */
+    commission_mode: commissionModeSchema.nullish(),
+    /**
+     * Porcentaje explícito (0–100) de una línea `porcentaje` cuando el
+     * empleado es de pago fijo y no tiene `commission_percent`. Solo aplica a
+     * líneas personalizadas.
+     */
+    commission_percent_override: z.coerce
+      .number()
+      .min(0, "El porcentaje no puede ser negativo.")
+      .max(100, "El porcentaje máximo es 100.")
+      .nullish(),
   })
   .superRefine((value, context) => {
     const fail = (message: string) => context.addIssue({ code: "custom", message });
+    const hasValue = value.commission_value !== undefined && value.commission_value !== null;
+    const hasOverride = value.commission_percent_override !== undefined && value.commission_percent_override !== null;
+    const explicitMode = value.commission_mode !== undefined && value.commission_mode !== null;
+    const mode = value.commission_mode ?? deriveCommissionMode(value.item_type, value.no_commission, value.commission_value);
     switch (value.item_type) {
       case "producto":
         if (!value.product_id) fail("La línea de producto exige un producto.");
@@ -62,13 +154,40 @@ export const invoiceItemSchema = z
         if (!value.custom_name?.trim()) fail("La línea personalizada exige un nombre.");
         if (value.product_id) fail("La línea personalizada no lleva producto.");
         if (value.service_id) fail("La línea personalizada no lleva servicio.");
-        if (!value.no_commission && (value.commission_value === undefined || value.commission_value === null || value.commission_value < 0 || value.commission_value > 100)) {
-          fail("La línea personalizada con comisión exige un valor de comisión (0-100).");
+        if (hasValue && (value.commission_value as number) < 0) {
+          fail("El valor de la comisión no puede ser negativo.");
         }
-        if (value.no_commission && value.commission_value !== undefined && value.commission_value !== null) {
+        // Regla histórica (solo cuando el payload NO declara el modo explícito).
+        if (!explicitMode && value.no_commission && hasValue) {
           fail("La línea personalizada sin comisión no debe tener valor de comisión.");
         }
         break;
+    }
+    if (explicitMode) {
+      // Reglas coherentes con el modo declarado por el cliente.
+      if (value.commission_mode === "comision") {
+        if (value.item_type === "servicio") fail("La línea de servicio no lleva comisión en valor.");
+        // El valor es obligatorio en el personalizado (lo digita el usuario). En
+        // el producto es opcional: sin valor cae a la regla ítem×empleado (o 0),
+        // que es el comportamiento vigente del catálogo de productos.
+        if (value.item_type === "custom" && !hasValue) {
+          fail("La línea personalizada con comisión exige un valor de comisión.");
+        }
+      }
+      if (value.commission_mode === "porcentaje" && hasValue) {
+        fail("La línea por porcentaje no lleva valor de comisión.");
+      }
+      if (value.commission_mode === "ninguna" && hasValue) {
+        fail("La línea sin comisión no debe tener valor de comisión.");
+      }
+    }
+    if (hasOverride) {
+      if (value.item_type !== "custom") {
+        fail("Solo la línea personalizada por porcentaje admite un porcentaje explícito.");
+      }
+      if (mode !== "porcentaje") {
+        fail("El porcentaje explícito solo aplica a la línea por porcentaje.");
+      }
     }
     const lineGross = value.qty * value.unit_price;
     if (value.discount > lineGross) {
@@ -99,6 +218,153 @@ export const annulInvoiceSchema = z.object({
   motivo: z.string().trim().min(1, "El motivo de anulación es requerido.").max(500, "Motivo muy largo."),
 });
 export type AnnulInvoiceInput = z.infer<typeof annulInvoiceSchema>;
+
+/**
+ * Edición admin de factura (total inmutable): cambia ítems y métodos de
+ * pago con motivo obligatorio. Los ítems llevan `id` cuando son filas
+ * existentes (sin id = fila nueva; ids viejos ausentes = eliminadas).
+ * Los pagos conservan montos: solo puede cambiar el método.
+ */
+export const editInvoiceItemSchema = invoiceItemSchema.extend({
+  id: uuidSchema.optional(),
+});
+export type EditInvoiceItemInput = z.infer<typeof editInvoiceItemSchema>;
+
+export const editInvoicePaymentSchema = z.object({
+  id: uuidSchema,
+  method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
+});
+export type EditInvoicePaymentInput = z.infer<typeof editInvoicePaymentSchema>;
+
+export const editInvoiceSchema = z.object({
+  motivo: z.string().trim().min(1, "El motivo de edición es requerido.").max(500, "Motivo muy largo."),
+  items: z.array(editInvoiceItemSchema).min(1, "La factura exige al menos un ítem."),
+  payments: z.array(editInvoicePaymentSchema).default([]),
+});
+export type EditInvoiceInput = z.infer<typeof editInvoiceSchema>;
+
+/**
+ * Edición libre de factura EMITIDA (cajera del turno, sin motivo): agrega,
+ * quita o cambia ítems, cantidades y precios. El total SE recalcula (a
+ * diferencia de la edición admin de Pagadas, donde es inmutable). Los cobros
+ * parciales que ya existan se conservan (mismos ids, el método solo puede
+ * cambiar entre iguales recargos para no mover el recargo emitido).
+ */
+export const editEmittedInvoiceSchema = z.object({
+  motivo: z.string().trim().max(500, "Motivo muy largo.").nullish(),
+  items: z.array(editInvoiceItemSchema).min(1, "La factura exige al menos un ítem."),
+  payments: z.array(editInvoicePaymentSchema).default([]),
+});
+export type EditEmittedInvoiceInput = z.infer<typeof editEmittedInvoiceSchema>;
+
+export interface OldInvoiceItem {
+  id: string;
+  item_type: string;
+  product_id?: string | null | undefined;
+  service_id?: string | null | undefined;
+  custom_name?: string | null | undefined;
+  employee_id: string;
+  qty: number;
+  unit_price: number;
+  discount: number;
+  no_commission: boolean | null | undefined;
+  commission_value?: number | null | undefined;
+  commission_mode?: string | null | undefined;
+  commission_percent_override?: number | null | undefined;
+}
+
+export interface InvoiceItemsDiff {
+  added: EditInvoiceItemInput[];
+  removed: OldInvoiceItem[];
+  changed: Array<{ old: OldInvoiceItem; next: EditInvoiceItemInput }>;
+  /** Toca quién cobra o cuánto (empleado, comisión, cant., precio). */
+  payTouched: boolean;
+}
+
+/** Diferencia ítems viejos vs nuevos por id (puros, sin BD). */
+export function diffInvoiceItems(oldItems: OldInvoiceItem[], nextItems: EditInvoiceItemInput[]): InvoiceItemsDiff {
+  const oldById = new Map(oldItems.map((row) => [row.id, row]));
+  const seen = new Set<string>();
+  const added: EditInvoiceItemInput[] = [];
+  const changed: Array<{ old: OldInvoiceItem; next: EditInvoiceItemInput }> = [];
+  let payTouched = false;
+  const same = (a: number | null | undefined, b: number | null | undefined): boolean => (a ?? 0) === (b ?? 0);
+  // Modo efectivo: el explícito si viene, o el derivado de los campos viejos.
+  // Así una fila histórica (sin `commission_mode`) y un payload nuevo que no lo
+  // manda no se ven como distintos solo por el campo declarativo.
+  const modeOf = (row: {
+    item_type: string;
+    no_commission?: boolean | null | undefined;
+    commission_value?: number | null | undefined;
+    commission_mode?: string | null | undefined;
+  }): string => row.commission_mode ?? deriveCommissionMode(row.item_type, row.no_commission, row.commission_value);
+  for (const next of nextItems) {
+    if (!next.id || !oldById.has(next.id)) {
+      added.push(next);
+      payTouched = true;
+      continue;
+    }
+    seen.add(next.id);
+    const old = oldById.get(next.id) as OldInvoiceItem;
+    const equal =
+      old.item_type === next.item_type &&
+      (old.product_id ?? null) === (next.product_id ?? null) &&
+      (old.service_id ?? null) === (next.service_id ?? null) &&
+      (old.custom_name ?? null) === (next.custom_name?.trim() || null) &&
+      old.employee_id === next.employee_id &&
+      Number(old.qty) === Number(next.qty) &&
+      Number(old.unit_price) === Number(next.unit_price) &&
+      Number(old.discount) === Number(next.discount) &&
+      same(old.commission_value, next.commission_value ?? null) &&
+      modeOf(old) === modeOf(next) &&
+      same(old.commission_percent_override, next.commission_percent_override ?? null);
+    if (!equal) {
+      changed.push({ old, next });
+      if (
+        old.employee_id !== next.employee_id ||
+        !same(old.commission_value, next.commission_value ?? null) ||
+        modeOf(old) !== modeOf(next) ||
+        !same(old.commission_percent_override, next.commission_percent_override ?? null) ||
+        Number(old.qty) !== Number(next.qty) ||
+        Number(old.unit_price) !== Number(next.unit_price)
+      ) {
+        payTouched = true;
+      }
+    }
+  }
+  const removed = oldItems.filter((row) => !seen.has(row.id));
+  if (removed.length > 0 || added.length > 0) payTouched = true;
+  return { added, removed, changed, payTouched };
+}
+
+/** Subtotal de un borrador de edición (puros). */
+export function editItemsSubtotal(items: Array<{ qty: number; unit_price: number; discount: number }>): number {
+  return roundMoney(items.reduce((acc, item) => acc + computeLineSubtotal(item).subtotal, 0));
+}
+
+/**
+ * Regla de oro de la edición: el total NO se toca. Con descuento fijo e
+ * impuestos snapshot intactos, basta exigir mismo subtotal y mismo recargo.
+ * Lanza TOTAL_MISMATCH si no cuadra.
+ */
+export function assertEditReconciles(args: {
+  oldSubtotal: number;
+  newSubtotal: number;
+  oldSurcharge: number;
+  newSurcharge: number;
+  oldTotal: number;
+}): void {
+  if (!moneyEquals(args.newSubtotal, args.oldSubtotal)) {
+    throw new Error(
+      `TOTAL_MISMATCH: el nuevo subtotal (${args.newSubtotal}) debe igualar al emitido (${args.oldSubtotal}). Ajuste cantidades/precios.`,
+    );
+  }
+  if (!moneyEquals(args.newSurcharge, args.oldSurcharge)) {
+    throw new Error(
+      `TOTAL_MISMATCH: el recargo resultante (${args.newSurcharge}) debe igualar al emitido (${args.oldSurcharge}). Use métodos con igual recargo.`,
+    );
+  }
+}
 
 /** FAC-07: cobro dividido (las porciones deben cuadrar con el saldo). */
 export const splitPaymentSchema = z.object({

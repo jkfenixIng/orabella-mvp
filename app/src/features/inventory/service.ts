@@ -4,10 +4,13 @@ import {
   matchesProductQuery,
   movementSchema,
   normalizeSku,
+  planStockDeduction,
   productSchema,
   sortKardexAscending,
+  type DeductionLine,
   type MovementInput,
   type MovementType,
+  type PlannedDeduction,
   type ProductInput,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
@@ -91,35 +94,66 @@ export interface ProductRow {
   min_stock: number;
   cost_price: number | null;
   sale_price: number | null;
+  /** I1: comisión sugerida del producto (absoluta); null = sin sugerencia. */
+  commission_value: number | null;
   is_active: boolean;
 }
 
 const PRODUCT_SELECT =
+  "id, sede_id, sku, name, description, stock_qty, min_stock, cost_price, sale_price, commission_value, is_active";
+/** Misma selección sin la comisión: la migración 027 aún sin aplicar en esta base. */
+const PRODUCT_SELECT_LEGACY =
   "id, sede_id, sku, name, description, stock_qty, min_stock, cost_price, sale_price, is_active";
+
+// I1: commission_value llega con la migración 027. La primera consulta decide y
+// se cachea para no repetir la prueba; un error distinto (red/permisos) no se
+// cachea, así la consulta real lo reporta en vez de degradar en silencio.
+let commissionColumn: boolean | null = null;
+
+async function resolveProductSelect(db: Awaited<ReturnType<typeof inventoryDb>>): Promise<string> {
+  if (commissionColumn === null) {
+    const probe = await db.from("products").select("commission_value").limit(1);
+    if (!probe.error) {
+      commissionColumn = true;
+    } else {
+      const message = String((probe.error as { message?: string }).message ?? "");
+      if (/commission_value/i.test(message)) commissionColumn = false;
+    }
+  }
+  return commissionColumn === false ? PRODUCT_SELECT_LEGACY : PRODUCT_SELECT;
+}
+
+/** Rellena commission_value cuando la columna no está disponible en esta base. */
+function normalizeProduct(row: Record<string, unknown>): ProductRow {
+  return {
+    ...(row as unknown as ProductRow),
+    commission_value: (row.commission_value as number | null) ?? null,
+  };
+}
 
 /** INV-05 + lectura: lista productos activos e inactivos de la sede (máx. 50 por defecto). */
 export async function listProducts(sedeId: string, limit?: number): Promise<ProductRow[]> {
   const db = await inventoryDb();
   const { data, error } = await db
     .from("products")
-    .select(PRODUCT_SELECT)
+    .select(await resolveProductSelect(db))
     .eq("sede_id", sedeId)
     .order("name")
     .limit(clampLimit(limit));
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as ProductRow[];
+  return ((data ?? []) as unknown as Array<Record<string, unknown>>).map(normalizeProduct);
 }
 
 export async function getProduct(id: string): Promise<ProductRow> {
   const db = await inventoryDb();
   const { data, error } = await db
     .from("products")
-    .select(PRODUCT_SELECT)
+    .select(await resolveProductSelect(db))
     .eq("id", id)
     .maybeSingle();
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
   if (!data) throw new InventoryError("NOT_FOUND", "Producto no encontrado.", 404);
-  return data as ProductRow;
+  return normalizeProduct(data as unknown as Record<string, unknown>);
 }
 
 /**
@@ -151,6 +185,7 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
     throw new InventoryError("SKU_TAKEN", "El SKU ya existe en esta sede.", 409);
   }
 
+  const select = await resolveProductSelect(db);
   const payload = {
     ...(input.id ? { id: input.id } : {}),
     sede_id: input.sede_id,
@@ -160,12 +195,14 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
     min_stock: input.min_stock,
     cost_price: input.cost_price ?? null,
     sale_price: input.sale_price ?? null,
+    // Con la columna ausente (027 sin aplicar) no se envía la comisión.
+    ...(select === PRODUCT_SELECT ? { commission_value: input.commission_value ?? null } : {}),
     ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
   };
   const { data, error } = await db
     .from("products")
     .upsert(payload, { onConflict: "id" })
-    .select(PRODUCT_SELECT)
+    .select(select)
     .single();
   if (error) {
     // Carrera perdida contra UNIQUE (sede_id, sku): mismo error de negocio.
@@ -175,7 +212,7 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
     throw new InventoryError("INTERNAL", "Error interno.", 500);
   }
   if (!data) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  return data as ProductRow;
+  return normalizeProduct(data as unknown as Record<string, unknown>);
 }
 
 /** INV-05: búsqueda por fragmento de nombre o SKU, solo dentro de la sede (máx. 50 por defecto). */
@@ -187,13 +224,13 @@ export async function searchProducts(sedeId: string, q: string, limit?: number):
   const pattern = `%${escaped}%`;
   const { data, error } = await db
     .from("products")
-    .select(PRODUCT_SELECT)
+    .select(await resolveProductSelect(db))
     .eq("sede_id", sedeId)
     .or(`name.ilike.${pattern},sku.ilike.${pattern}`)
     .order("name")
     .limit(clampLimit(limit));
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  const rows = (data ?? []) as ProductRow[];
+  const rows = ((data ?? []) as unknown as Array<Record<string, unknown>>).map(normalizeProduct);
   // Filtro de apoyo en memoria (misma regla que matchesProductQuery).
   return rows.filter((row) => matchesProductQuery(row, needle));
 }
@@ -203,13 +240,13 @@ export async function lowStockAlerts(sedeId: string, limit?: number): Promise<Pr
   const db = await inventoryDb();
   const { data, error } = await db
     .from("products")
-    .select(PRODUCT_SELECT)
+    .select(await resolveProductSelect(db))
     .eq("sede_id", sedeId)
     .eq("is_active", true)
     .order("stock_qty")
     .limit(clampLimit(limit, 200));
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  return filterLowStock((data ?? []) as ProductRow[]);
+  return filterLowStock(((data ?? []) as unknown as Array<Record<string, unknown>>).map(normalizeProduct));
 }
 
 // ---------------------------------------------------------------- movimientos ---
@@ -296,6 +333,100 @@ export async function registerMovement(
 
   const current = await getProduct(product.id);
   return { movement: data as MovementRow, stock_qty: current.stock_qty };
+}
+
+/**
+ * B1/FAC-06 (frontera modular): lectura batch de stock para otros módulos.
+ * Billing la usa para validar existencia/sede y pre-chequear stock SIN
+ * tocar las tablas de inventario directamente. Una sola query con IN
+ * (sin N+1); el mapa solo incluye productos de la sede indicada.
+ */
+export interface StockEntry {
+  name: string;
+  stock_qty: number;
+  sede_id: string;
+}
+
+export async function getProductsStock(
+  sedeId: string,
+  productIds: string[],
+): Promise<Map<string, StockEntry>> {
+  const unique = [...new Set(productIds)];
+  if (unique.length === 0) return new Map();
+  const db = await inventoryDb();
+  const { data, error } = await db
+    .from("products")
+    .select("id, sede_id, name, stock_qty")
+    .eq("sede_id", sedeId)
+    .in("id", unique);
+  if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
+  return new Map(
+    ((data ?? []) as Array<{ id: string; sede_id: string; name: string; stock_qty: number }>).map(
+      (row) => [row.id, { name: row.name, stock_qty: Number(row.stock_qty), sede_id: row.sede_id }],
+    ),
+  );
+}
+
+function toStockError(error: unknown): InventoryError {
+  if (error instanceof InventoryError) return error;
+  if (error instanceof Error && error.message === "PRODUCT_NOT_FOUND") {
+    return new InventoryError("NOT_FOUND", "Producto no encontrado.", 404);
+  }
+  if (error instanceof Error && error.message === "INSUFFICIENT_STOCK") {
+    const details = (error as { details?: { name?: string; stock?: number; requested?: number } })
+      .details;
+    return new InventoryError(
+      "INSUFFICIENT_STOCK",
+      details
+        ? `Stock insuficiente para ${details.name}: hay ${details.stock}, se piden ${details.requested}.`
+        : "Stock insuficiente para el ajuste.",
+      409,
+    );
+  }
+  return new InventoryError("INTERNAL", "Error interno.", 500);
+}
+
+/**
+ * B1/FAC-06 (frontera modular): descuenta stock para una venta.
+ * Momento único del descuento: AL EMITIR la factura. Pagar después
+ * (splitPayment) NO descuenta; anular revierte con IN; editar ajusta
+ * por deltas. Servicios y líneas sin product_id no tocan stock.
+ *
+ * Valida todo ANTES de mover (existencia, sede, stock suficiente con
+ * mensaje por producto, 409, nunca INTERNAL por falta de stock) y luego
+ * registra un OUT por producto vía registerMovement (trigger aplica el
+ * stock y bloquea carreras con el mismo 409).
+ */
+export async function deductStock(
+  actor: { userId: string; sedeId: string },
+  lines: DeductionLine[],
+  reason: string,
+): Promise<PlannedDeduction[]> {
+  const wanted = [...new Set(lines.map((line) => line.product_id).filter((id): id is string => !!id))];
+  // Solo servicios/custom: nada que descontar (no tocan stock).
+  if (wanted.length === 0) return [];
+  const stockMap = await getProductsStock(actor.sedeId, wanted);
+  const stockByProduct = new Map(
+    [...stockMap].map(([id, entry]) => [id, { name: entry.name, stock_qty: entry.stock_qty }]),
+  );
+
+  let planned: PlannedDeduction[];
+  try {
+    planned = planStockDeduction(lines, stockByProduct);
+  } catch (error) {
+    throw toStockError(error);
+  }
+  try {
+    for (const item of planned) {
+      await registerMovement(
+        { product_id: item.product_id, type: "OUT", qty: item.qty, reason },
+        actor,
+      );
+    }
+  } catch (error) {
+    throw toStockError(error);
+  }
+  return planned;
 }
 
 function resolveSedeOrThrow(sessionSedeId: string, rowSedeId: string): void {
