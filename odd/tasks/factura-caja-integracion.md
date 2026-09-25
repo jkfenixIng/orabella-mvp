@@ -96,8 +96,10 @@ Out:
   3. Listado facturas: 10 por página (HECHO ccf7cff 2026-09-23).
   4. Edición libre para Emitidas + modal de ítems generalizado (HECHO 5e1e443 2026-09-23; pagadas intactas admin estricta).
   5. Vales configurables: días permitidos + topes por día, visibles en caja, alertas admin aceptar/rechazar con motivo, auto-aprobación admin con detalle, edición bloqueada si entró en nómina pagada (HECHO 7c24547+db8809a 2026-09-23; migración 024 allowed_days, alerta voucher.requested en módulo caja, VOUCHER_IN_PAYROLL en descontada).
-- [ ] Usuario: aplicar 019+020+021+022+023+024 en PRUEBAS, recargar, verificar combobox/modal/detalle/flujo tarjeta/listado/vales
-- [ ] VER full + push
+- [x] Código de los 6 flujos (verificado 2026-09-25): combobox `app/src/components/ui/lib/combobox.tsx` usado en `invoices-client.tsx:2635,2659,2687` (modal de ítem) y `:1631,1650,1669` (filtros); modal "Agregar ítem" `:2568-2579`; detalle `:1803-1809` + `getInvoiceDetail` (`billing/service.ts:347`); recargo tarjeta 5% (`019_card_fee.sql:25`) con cálculo `billing/service.ts:705-708` y UI `:1056,1557,1942`; listado con filtros `:294,383-395` y 10/pág `:410` (`billing/service.ts:205,228`); vales en `vales/vouchers-client.tsx` (626 líneas).
+- [ ] Usuario: aplicar 019+020+021+022+023+024 (más 025-030) en PRUEBAS, recargar y verificar en vivo. NO verificable desde el workspace: sin acceso SQL y el MCP de Supabase apunta a PRODUCCIÓN. Según confirmación del usuario las 023-029 ya están aplicadas en PRUEBAS; la 030 sigue pendiente.
+- [x] VER full (2026-09-25): `npm run typecheck` exit 0 y `npm test` 14 archivos / 349 tests pasando.
+- [x] push (2026-09-25): rama `feat/orabella-mvp` subida a origin y PR contra `develop` abierto.
 
 ## Authorized scope
 Módulos Facturación + Caja. Rama `feat/orabella-mvp`, commits por unidad.
