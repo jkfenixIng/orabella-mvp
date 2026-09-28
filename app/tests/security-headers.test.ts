@@ -80,6 +80,29 @@ function readHeaderValue(rule: HeaderRule, key: string): string | undefined {
   return rule.headers.find((header) => header.key === key)?.value;
 }
 
+/**
+ * Precondición positiva compartida: devuelve la lista de headers requeridos
+ * que faltan o cuyo valor no es el exigido. Vacía === el rule está completo.
+ *
+ * Existe porque los tests de omisión deliberada solo miraban AUSENCIA: si
+ * alguien vaciaba `headers` o renombraba los cuatro headers, la omisión se
+ * cumplía trivialmente y el test seguía pasando. Ahora la omisión se exige
+ * DESPUÉS de comprobar esta precondición, así que vaciar la lista también
+ * rompe los tests de omisión.
+ */
+function missingRequiredHeaders(rule: HeaderRule): string[] {
+  const missing: string[] = [];
+
+  for (const [key, value] of Object.entries(REQUIRED_HEADERS)) {
+    const declared = readHeaderValue(rule, key);
+    if (declared !== value) {
+      missing.push(`${key}: se esperaba \`${value}\` y se leyó \`${declared ?? "(ausente)"}\``);
+    }
+  }
+
+  return missing;
+}
+
 describe("headers de seguridad en next.config.ts", () => {
   it("declara una función headers() asíncrona", () => {
     const declared = nextConfig.headers;
@@ -103,8 +126,19 @@ describe("headers de seguridad en next.config.ts", () => {
 
   it("NO declara Content-Security-Policy (omisión deliberada)", async () => {
     const rules = await readHeaderRules();
-    const present = rules.flatMap((rule) =>
-      rule.headers.filter((header) => header.key.toLowerCase() === "content-security-policy"),
+    const rule = readCatchAllRule(rules);
+
+    // Precondición positiva PRIMERO: el catch-all debe declarar los cuatro
+    // headers requeridos con sus valores exactos. Sin esto, un `headers: []` o
+    // un renombre masivo haría pasar la omisión de forma vacua.
+    const missing = missingRequiredHeaders(rule);
+    expect(
+      missing,
+      `precondición positiva: el catch-all ${CATCH_ALL_SOURCE} debe declarar los cuatro headers requeridos antes de exigir la omisión: ${missing.join("; ")}`,
+    ).toEqual([]);
+
+    const present = rules.flatMap((candidate) =>
+      candidate.headers.filter((header) => header.key.toLowerCase() === "content-security-policy"),
     );
 
     // Deliberado: una CSP mal calibrada rompe la app y las suites e2e de
@@ -118,8 +152,17 @@ describe("headers de seguridad en next.config.ts", () => {
 
   it("NO declara Permissions-Policy (omisión deliberada)", async () => {
     const rules = await readHeaderRules();
-    const present = rules.flatMap((rule) =>
-      rule.headers.filter((header) => header.key.toLowerCase() === "permissions-policy"),
+    const rule = readCatchAllRule(rules);
+
+    // Precondición positiva PRIMERO (ver el test de CSP).
+    const missing = missingRequiredHeaders(rule);
+    expect(
+      missing,
+      `precondición positiva: el catch-all ${CATCH_ALL_SOURCE} debe declarar los cuatro headers requeridos antes de exigir la omisión: ${missing.join("; ")}`,
+    ).toEqual([]);
+
+    const present = rules.flatMap((candidate) =>
+      candidate.headers.filter((header) => header.key.toLowerCase() === "permissions-policy"),
     );
 
     // Deliberado: la app puede depender de capacidades del navegador (cámara,
@@ -129,5 +172,31 @@ describe("headers de seguridad en next.config.ts", () => {
       present,
       `Permissions-Policy no debe declararse todavía: ${FORBIDDEN_HEADERS["Permissions-Policy"]}`,
     ).toEqual([]);
+  });
+});
+
+/* --------------------------------------------------------------------------
+   Self-tests de la precondición positiva: prueban, con un rule sintético, que
+   el helper compartido rechaza una lista de headers vacía o renombrada. Son la
+   evidencia de que los tests de omisión de arriba ya no pueden pasar en vacío.
+   -------------------------------------------------------------------------- */
+
+describe("precondición positiva de los headers requeridos", () => {
+  it("rechaza un catch-all con `headers: []`", () => {
+    const missing = missingRequiredHeaders({ source: CATCH_ALL_SOURCE, headers: [] });
+
+    expect(missing.length, `un rule sin headers debe reportar los cuatro faltantes: ${missing.join("; ")}`).toBe(
+      Object.keys(REQUIRED_HEADERS).length,
+    );
+  });
+
+  it("rechaza los cuatro headers renombrados con valores exactos pero claves distintas", () => {
+    const renamed = Object.entries(REQUIRED_HEADERS).map(([key, value]) => ({
+      key: `X-Renamed-${key}`,
+      value,
+    }));
+    const missing = missingRequiredHeaders({ source: CATCH_ALL_SOURCE, headers: renamed });
+
+    expect(missing.length, missing.join("; ")).toBe(Object.keys(REQUIRED_HEADERS).length);
   });
 });
