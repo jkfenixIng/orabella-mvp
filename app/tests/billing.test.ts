@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   annulBlockedMessage,
   annulInvoiceSchema,
@@ -1188,6 +1188,24 @@ const overCollectionStub = vi.hoisted(() => ({
 }));
 
 /**
+ * Datos paginables del candado de nómina (U5). Solo las tablas registradas acá
+ * entran al camino FIEL a PostgREST del doble (`eq`/`in` de verdad, orden por
+ * `order()`, ventana real de `range`/`limit`). Sin esto un doble que devuelve
+ * siempre la tabla entera no podría demostrar una truncación: la truncación vive
+ * en la ventana.
+ */
+const pagedStub = vi.hoisted(() => ({
+  /** `max-rows` por request del Data API de Supabase: el tope REAL. */
+  rowCap: 1000,
+  tables: {} as Record<string, Array<Record<string, unknown>>>,
+  /** Número de request (1-based, por tabla) donde el doble devuelve error. */
+  failAt: {} as Record<string, number[]>,
+  requests: {} as Record<string, number>,
+  /** Ventanas efectivamente pedidas: la prueba de que se paginó y en qué orden. */
+  windows: [] as Array<{ table: string; from: number; to: number; order: string[] }>,
+}));
+
+/**
  * Total emitido ANTES del ajuste (la línea vale lo mismo). 300.000 con un cobro
  * de 200.000 es el caso REAL: factura Emitida cobrada a medias (saldo 100.000),
  * no una Emitida ya completa (esa la cierra el cobro cuando cubre el neto).
@@ -1293,8 +1311,60 @@ function createOverCollectionStubClient(): unknown {
     }
   };
 
+  /**
+   * Camino FIEL a PostgREST, solo para las tablas de `pagedStub.tables`: aplica
+   * `eq`/`in`, ordena por las claves de `order()` y sirve la ventana pedida
+   * (`range`/`limit`) con el techo por request del Data API (`rowCap`). Así el
+   * tope que el código pide (200, 2000) y el que el servidor impone (1000) se
+   * comportan como en producción.
+   */
+  const pagedResponse = (
+    table: string,
+    spec: {
+      filters: Array<(row: Record<string, unknown>) => boolean>;
+      orderKeys: Array<{ column: string; ascending: boolean }>;
+      rangeFrom: number;
+      rangeTo: number;
+      single: boolean;
+    },
+  ): { data: unknown; error: unknown } => {
+    const rows = pagedStub.tables[table];
+    if (!rows) return { data: null, error: null };
+    pagedStub.requests[table] = (pagedStub.requests[table] ?? 0) + 1;
+    const attempt = pagedStub.requests[table] as number;
+    if ((pagedStub.failAt[table] ?? []).includes(attempt)) {
+      return { data: null, error: { message: `doble: fallo inyectado en ${table} (request ${attempt})` } };
+    }
+    const to = Math.min(spec.rangeTo, spec.rangeFrom + pagedStub.rowCap - 1);
+    pagedStub.windows.push({ table, from: spec.rangeFrom, to, order: spec.orderKeys.map((key) => key.column) });
+    const filtered = rows.filter((row) => spec.filters.every((matches) => matches(row)));
+    if (spec.orderKeys.length > 0) {
+      filtered.sort((left, right) => {
+        for (const key of spec.orderKeys) {
+          const leftValue = String(left[key.column] ?? "");
+          const rightValue = String(right[key.column] ?? "");
+          if (leftValue === rightValue) continue;
+          return (leftValue < rightValue ? -1 : 1) * (key.ascending ? 1 : -1);
+        }
+        return 0;
+      });
+    }
+    const window = filtered.slice(spec.rangeFrom, to + 1);
+    return { data: spec.single ? window[0] ?? null : window, error: null };
+  };
+
   const from = (table: string) => {
     let op = "select";
+    const filters: Array<(row: Record<string, unknown>) => boolean> = [];
+    const orderKeys: Array<{ column: string; ascending: boolean }> = [];
+    let rangeFrom = 0;
+    let rangeTo = pagedStub.rowCap - 1;
+    // Las tablas NO registradas en `pagedStub` conservan la respuesta fija de
+    // siempre: los filtros y la ventana se aceptan y se ignoran.
+    const resolve = (single: boolean) =>
+      op === "select" && pagedStub.tables[table]
+        ? pagedResponse(table, { filters, orderKeys, rangeFrom, rangeTo, single })
+        : response(table, op);
     const query: Record<string, unknown> = {
       select: () => query,
       insert: (payload?: unknown) => {
@@ -1315,16 +1385,35 @@ function createOverCollectionStubClient(): unknown {
         op = "delete";
         return query;
       },
-      eq: () => query,
-      in: () => query,
-      order: () => query,
-      limit: () => query,
-      single: () => Promise.resolve(response(table, op)),
-      maybeSingle: () => Promise.resolve(response(table, op)),
+      eq: (column: string, value: unknown) => {
+        filters.push((row) => row[column] === value);
+        return query;
+      },
+      in: (column: string, values: readonly unknown[]) => {
+        const set = new Set(values);
+        filters.push((row) => set.has(row[column]));
+        return query;
+      },
+      order: (column: string, options?: { ascending?: boolean }) => {
+        orderKeys.push({ column, ascending: options?.ascending !== false });
+        return query;
+      },
+      range: (start: number, end: number) => {
+        rangeFrom = start;
+        rangeTo = end;
+        return query;
+      },
+      limit: (count: number) => {
+        rangeFrom = 0;
+        rangeTo = Math.max(0, count - 1);
+        return query;
+      },
+      single: () => Promise.resolve(resolve(true)),
+      maybeSingle: () => Promise.resolve(resolve(true)),
       // `await` directo sobre la cadena (p. ej. `insert(...)` o
       // `delete().eq(...)`) resuelve al objeto de respuesta, igual que PostgREST.
       then: (onFulfilled?: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>
-        Promise.resolve(response(table, op)).then(onFulfilled, onRejected),
+        Promise.resolve(resolve(false)).then(onFulfilled, onRejected),
     };
     return query;
   };
@@ -1475,6 +1564,158 @@ describe("billing: gate de sobre-cobro al bajar el total de una emitida (WU2)", 
     expect(confirmado.invoice.total).toBe(150000);
     expect(overCollectionStub.invoiceUpdate?.total).toBe(150000);
     expect(overCollectionStub.auditInsert).not.toBeNull();
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+});
+
+// ------- U5: el candado de nómina cerrada no se trunca ni falla abierto -----
+//
+// `invoiceInClosedPayroll` decidía con `.limit(200)` períodos y `.limit(2000)`
+// ítems, SIN orden y sin error al tocar el tope. Pasado cualquiera de los dos,
+// la respuesta era `false`: el candado PAYROLL_LOCKED fallaba ABIERTO y una
+// factura cuya comisión ya estaba pagada en un período cerrado se podía
+// repreciar o reasignar. El tope era de TRANSPORTE (lo que aguanta un request),
+// no de negocio. El doble de acá sirve ventanas reales para poder demostrarlo.
+
+const CLOSED_PERIODS = 201;
+const ITEMS_PER_PERIOD = 10;
+const OTHER_INVOICE_ID = "77777777-7777-4777-8777-777777777777";
+
+/**
+ * Historial de nómina de la sede: 201 períodos cerrados (tope viejo: 200) con
+ * 2001 ítems (tope viejo: 2000). La línea que menciona la factura vive en el
+ * ÚLTIMO período y en el ÚLTIMO ítem, siempre detrás de los dos topes.
+ */
+function seedClosedPayroll(matching: boolean) {
+  const periods: Array<Record<string, unknown>> = [];
+  const items: Array<Record<string, unknown>> = [];
+  for (let period = 1; period <= CLOSED_PERIODS; period += 1) {
+    const periodId = `periodo-${String(period).padStart(3, "0")}`;
+    periods.push({ id: periodId, sede_id: overCollectionStub.SEDE_ID, status: "cerrado" });
+    const isLast = period === CLOSED_PERIODS;
+    const count = isLast ? 1 : ITEMS_PER_PERIOD;
+    for (let item = 1; item <= count; item += 1) {
+      const suffix = `${String(period).padStart(3, "0")}-${String(item).padStart(3, "0")}`;
+      items.push({
+        id: `nomina-${suffix}`,
+        period_id: periodId,
+        // Solo una línea lleva la factura: es la que `buildEmployeeCommissionDetail`
+        // escribió cuando la comisión se liquidó en el período cerrado.
+        detail_json: [{ invoice_id: isLast && matching ? overCollectionStub.INVOICE_ID : OTHER_INVOICE_ID }],
+      });
+    }
+  }
+  pagedStub.tables.payroll_periods = periods;
+  pagedStub.tables.payroll_items = items;
+  return { periods, items };
+}
+
+describe("billing: el candado de nómina cerrada no se trunca (U5)", () => {
+  const ACTOR: BillingActor = {
+    userId: "u-1",
+    sedeId: overCollectionStub.SEDE_ID,
+    roles: ["admin"],
+  };
+
+  /** Ajuste del precio de la única línea: 300.000 → `unitPrice` (toca pago). */
+  function editInvoice(unitPrice: number) {
+    return editEmittedInvoiceItems(
+      overCollectionStub.SEDE_ID,
+      overCollectionStub.INVOICE_ID,
+      {
+        items: [
+          {
+            id: overCollectionStub.ITEM_ID,
+            item_type: "custom",
+            custom_name: "Corte y peinado",
+            product_id: null,
+            service_id: null,
+            employee_id: EMPLOYEE_ID,
+            qty: 1,
+            unit_price: unitPrice,
+            discount: 0,
+            no_commission: true,
+          },
+        ],
+        payments: [],
+      },
+      ACTOR,
+    );
+  }
+
+  beforeEach(() => {
+    overCollectionStub.payments = [];
+    overCollectionStub.invoiceUpdate = null;
+    overCollectionStub.auditInsert = null;
+    overCollectionStub.writes.length = 0;
+    overCollectionStub.unexpectedQueries.length = 0;
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+  });
+
+  afterEach(() => {
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+  });
+
+  it("una línea de nómina cerrada detrás de los topes frena la edición", async () => {
+    const seed = seedClosedPayroll(true);
+    // Non-vacuidad del fixture: supera los DOS topes viejos.
+    expect(seed.periods).toHaveLength(CLOSED_PERIODS);
+    expect(seed.items.length).toBeGreaterThan(2000);
+
+    const failure: unknown = await editInvoice(150000).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "PAYROLL_LOCKED", status: 409 });
+    // El rechazo ocurre ANTES de tocar nada: ni una fila, ni auditoría.
+    expect(overCollectionStub.writes).toEqual([]);
+    expect(overCollectionStub.invoiceUpdate).toBeNull();
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("la lectura del candado pagina y va en orden determinista", async () => {
+    seedClosedPayroll(true);
+    await editInvoice(150000).catch(() => null);
+
+    const periodWindows = pagedStub.windows.filter((window) => window.table === "payroll_periods");
+    const itemWindows = pagedStub.windows.filter((window) => window.table === "payroll_items");
+    // Los 201 períodos no entran en un request: hubo más de una lectura.
+    expect(periodWindows.length).toBeGreaterThan(1);
+    // Y los ítems se pidieron por páginas sucesivas, no en una sola.
+    expect(itemWindows.length).toBeGreaterThan(1);
+    expect(itemWindows.some((window) => window.from > 0)).toBe(true);
+    // Requisito 2: el orden va explícito en cada lectura (sin `order()` no hay
+    // forma de que dos páginas no se pisen ni de reproducir la corrida).
+    for (const window of [...periodWindows, ...itemWindows]) expect(window.order).toEqual(["id"]);
+  });
+
+  it("si el candado no puede completar la lectura, la edición se RECHAZA", async () => {
+    seedClosedPayroll(true);
+    // El historial no se puede leer entero (falla la segunda página).
+    pagedStub.failAt = { payroll_items: [2] };
+
+    const failure: unknown = await editInvoice(150000).catch((error: unknown) => error);
+    // NUNCA `false` por no haber podido mirar: sin historial completo no se sabe
+    // si la comisión ya estaba pagada, así que la edición no se permite.
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "READ_INCOMPLETE" });
+    expect(overCollectionStub.writes).toEqual([]);
+    expect(overCollectionStub.invoiceUpdate).toBeNull();
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("control negativo: sin línea que mencione la factura, el MISMO ajuste pasa", async () => {
+    seedClosedPayroll(false);
+    const detail = await editInvoice(150000);
+    expect(detail.invoice.total).toBe(150000);
+    expect(overCollectionStub.invoiceUpdate?.total).toBe(150000);
+    // El candado miró el historial completo (mismo volumen, otra respuesta) y
+    // siguió: lo que frena arriba son los datos, no un tope del doble.
+    expect(pagedStub.windows.some((window) => window.table === "payroll_items" && window.from > 0)).toBe(true);
     expect(overCollectionStub.unexpectedQueries).toEqual([]);
   });
 });

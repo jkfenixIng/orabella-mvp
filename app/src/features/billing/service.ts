@@ -42,6 +42,12 @@ import {
 } from "@/src/features/inventory/service";
 import { planStockDeduction } from "@/src/features/inventory/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
+import {
+  IN_FILTER_CHUNK_SIZE,
+  PagedReadError,
+  readAllPaged,
+  readPagedBatches,
+} from "@/src/shared/lib/paged";
 import { getOpenShiftWithOpener } from "@/src/features/cash/service";
 import { commissionRuleKey, type RuleRate } from "@/src/features/commissions/schemas";
 import { computeInvoiceItemCommission } from "./commission";
@@ -732,6 +738,13 @@ function insufficientStockError(error: unknown): BillingError {
 
 function toBillingError(error: unknown): BillingError {
   if (error instanceof BillingError) return error;
+  if (error instanceof PagedReadError) {
+    return new BillingError(
+      error.code,
+      `${error.message} La edición se rechaza: sin el historial de nómina completo no se puede saber si la comisión de esta factura ya estaba pagada.`,
+      500,
+    );
+  }
   if (error instanceof InventoryError) {
     return new BillingError(error.code, error.message, error.status);
   }
@@ -1702,30 +1715,86 @@ export async function editEmittedInvoiceItems(
   }
 }
 
-/** ¿La factura ya entró en una nómina cerrada? (bloquea tocar al pagado). */
-async function invoiceInClosedPayroll(db: DbClient, sedeId: string, invoiceId: string): Promise<boolean> {
-  const { data: periods, error: periodsError } = await db
-    .from("payroll_periods")
-    .select("id")
-    .eq("sede_id", sedeId)
-    .eq("status", "cerrado")
-    .limit(200);
-  if (periodsError) throw new BillingError("INTERNAL", "Error interno.", 500);
-  const periodIds = ((periods ?? []) as Array<{ id: string }>).map((row) => row.id);
-  if (periodIds.length === 0) return false;
-  const { data: items, error: itemsError } = await db
-    .from("payroll_items")
-    .select("detail_json")
-    .in("period_id", periodIds)
-    .limit(2000);
-  if (itemsError) throw new BillingError("INTERNAL", "Error interno.", 500);
-  return ((items ?? []) as Array<{ detail_json: unknown }>).some(
-    (row) =>
-      Array.isArray(row.detail_json) &&
-      row.detail_json.some(
-        (line) => typeof line === "object" && line !== null && (line as { invoice_id?: string }).invoice_id === invoiceId,
-      ),
+/** ¿Alguna línea de `detail_json` menciona esta factura? */
+function detailHasInvoice(detail: unknown, invoiceId: string): boolean {
+  return (
+    Array.isArray(detail) &&
+    detail.some(
+      (line) => typeof line === "object" && line !== null && (line as { invoice_id?: string }).invoice_id === invoiceId,
+    )
   );
+}
+
+/**
+ * ¿La factura ya entró en una nómina cerrada? (bloquea tocar al pagado).
+ *
+ * U5: antes leía `.limit(200)` períodos y `.limit(2000)` ítems, SIN orden y sin
+ * aviso. Pasado cualquiera de los dos topes la respuesta era `false`, o sea que
+ * el candado PAYROLL_LOCKED FALLABA ABIERTO: una factura cuya comisión ya se
+ * había pagado en un período cerrado se podía repreciar o reasignar. El tope era
+ * de TRANSPORTE (lo que aguanta un request), no de negocio. Ahora se pagina
+ * hasta agotar, en orden determinista (`id`), y si la lectura no se puede
+ * completar se LANZA: el llamador rechaza la edición. Nunca `false` por no haber
+ * podido mirar, porque un `false` acá autoriza a tocar plata ya pagada.
+ *
+ * Los ids de período van en lotes (`in(...)` viaja en la URL: una lista sin
+ * tope termina en 414 y la lectura no ocurre) y los ítems se leen por páginas,
+ * cortando en la primera línea que menciona la factura para no traer todo el
+ * historial a memoria.
+ *
+ * LÍMITE CONOCIDO, SIN CAMBIO DE ALCANCE: el candado reconoce la factura por una
+ * línea de `detail_json`, y ese detalle lo escribe `buildEmployeeCommissionDetail`
+ * (payroll/schemas.ts) SOLO con las líneas que tienen base de comisión. Una
+ * factura cuyas líneas no comisionan a nadie no aparece en ninguna nómina; en ese
+ * caso tampoco había comisión pagada que proteger, pero el candado no la ve. No
+ * se ensancha acá: no existe otra fuente que ligue factura e ítem de nómina, así
+ * que cambiar el alcance exige decidir antes qué se considera "pagado".
+ */
+async function invoiceInClosedPayroll(db: DbClient, sedeId: string, invoiceId: string): Promise<boolean> {
+  try {
+    const closedPeriods = await readAllClosedPeriods(db, sedeId);
+    if (closedPeriods.length === 0) return false;
+    for (let start = 0; start < closedPeriods.length; start += IN_FILTER_CHUNK_SIZE) {
+      const chunk = closedPeriods.slice(start, start + IN_FILTER_CHUNK_SIZE);
+      for await (const batch of readPagedBatches<{ detail_json: unknown }>({
+        table: "payroll_items",
+        fetchPage: (from, to) =>
+          db
+            .from("payroll_items")
+            .select("detail_json")
+            .in("period_id", chunk)
+            .order("id")
+            .range(from, to),
+      })) {
+        if (batch.some((row) => detailHasInvoice(row.detail_json, invoiceId))) return true;
+      }
+    }
+    return false;
+  } catch (error) {
+    // "No se pudo evaluar" se traduce a un error de negocio: el llamador rechaza
+    // la edición. Si esto devolviera `false`, el candado fallaría ABIERTO.
+    throw toBillingError(error);
+  }
+}
+
+/**
+ * Períodos CERRADOS de la sede, todos y en orden (U5: sin `.limit(200)`). Se
+ * leen en lotes del tamaño que después aguanta el `in(...)` de los ítems.
+ */
+async function readAllClosedPeriods(db: DbClient, sedeId: string): Promise<string[]> {
+  const periods = await readAllPaged<{ id: string }>({
+    table: "payroll_periods",
+    pageSize: IN_FILTER_CHUNK_SIZE,
+    fetchPage: (from, to) =>
+      db
+        .from("payroll_periods")
+        .select("id")
+        .eq("sede_id", sedeId)
+        .eq("status", "cerrado")
+        .order("id")
+        .range(from, to),
+  });
+  return periods.map((row) => row.id);
 }
 
 // ------------------------------------------------------------------ cobrar ---

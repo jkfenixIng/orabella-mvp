@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   approveVoucherSchema,
   assertDeletablePeriod,
@@ -40,6 +40,12 @@ import {
   commissionRuleKey,
   resolveEmployeeLineCommission,
 } from "@/src/features/commissions/schemas";
+import {
+  calculatePayroll,
+  PayrollError,
+  type PayrollActor,
+} from "@/src/features/payroll/service";
+import { chunkIds, PagedReadError, readAllPaged } from "@/src/shared/lib/paged";
 
 // ------------------------------------------------- neto (PAY-02) ---
 
@@ -998,5 +1004,448 @@ describe("payroll: tope del 50% de salidas en efectivo al APROBAR un vale (PAY-0
         amount: 999999,
       }),
     ).toBeNull();
+  });
+});
+
+// ---- U5: el cálculo lee TODAS las filas (tope de transporte ≠ tope de negocio) ----
+//
+// `calculatePayroll` leía facturas, ítems, reglas, vales y pagos inmediatos con
+// `.limit(N)` — sin `order()` y sin error al tocar el tope. El Data API de
+// Supabase sirve por request la ventana pedida y a lo sumo `max-rows` filas: ese
+// tope de TRANSPORTE se comportaba como tope de NEGOCIO. Una sede que lo pasa
+// liquida comisiones y vales con un conjunto recortado: al empleado le falta
+// plata y los topes de vales se evalúan contra un acumulado que no es el real.
+// El doble de acá sirve ventanas reales (filtros, orden y tope por request) para
+// poder demostrarlo sin base de datos.
+
+const payrollPagedStub = vi.hoisted(() => ({
+  SEDE_ID: "11111111-1111-4111-8111-111111111111",
+  PERIOD_ID: "22222222-2222-4222-8222-222222222222",
+  EMPLOYEE_ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  SERVICE_ID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+  /** `max-rows` por request del Data API de Supabase: el tope REAL. */
+  rowCap: 1000,
+  tables: {} as Record<string, Array<Record<string, unknown>>>,
+  /** Número de request (1-based, por tabla) donde el doble devuelve error. */
+  failAt: {} as Record<string, number[]>,
+  requests: {} as Record<string, number>,
+  /** Ventanas efectivamente pedidas: prueba de que se paginó y en qué orden. */
+  windows: [] as Array<{ table: string; from: number; to: number; order: string[] }>,
+  /** Payload del upsert de `payroll_items`: la plata que el servicio persistió. */
+  itemsUpsert: null as Array<Record<string, unknown>> | null,
+}));
+
+/**
+ * Cliente Supabase falso con la conducta del Data API: aplica filtros
+ * (`eq`/`neq`/`gte`/`lte`/`in`), ordena por `order()` y sirve SOLO la ventana
+ * pedida (`range`/`limit`), con el techo por request de `rowCap`. Sin eso la
+ * truncación no existiría en el doble y el test no probaría nada.
+ */
+function createPayrollPagedStubClient(): unknown {
+  const from = (table: string) => {
+    let op = "select";
+    const filters: Array<(row: Record<string, unknown>) => boolean> = [];
+    const orderKeys: Array<{ column: string; ascending: boolean }> = [];
+    let rangeFrom = 0;
+    let rangeTo = payrollPagedStub.rowCap - 1;
+
+    const rows = (): Array<Record<string, unknown>> => payrollPagedStub.tables[table] ?? [];
+
+    const select = (single: boolean): { data: unknown; error: unknown } => {
+      if (op !== "select") return { data: null, error: null };
+      const index = (payrollPagedStub.requests[table] = (payrollPagedStub.requests[table] ?? 0) + 1);
+      if ((payrollPagedStub.failAt[table] ?? []).includes(index)) {
+        return { data: null, error: { message: `doble: fallo inyectado en ${table} (request ${index})` } };
+      }
+      const to = Math.min(rangeTo, rangeFrom + payrollPagedStub.rowCap - 1);
+      payrollPagedStub.windows.push({ table, from: rangeFrom, to, order: orderKeys.map((key) => key.column) });
+      const filtered = rows().filter((row) => filters.every((matches) => matches(row)));
+      for (const key of [...orderKeys].reverse()) {
+        filtered.sort((left, right) => {
+          const leftValue = String(left[key.column] ?? "");
+          const rightValue = String(right[key.column] ?? "");
+          if (leftValue === rightValue) return 0;
+          return (leftValue < rightValue ? -1 : 1) * (key.ascending ? 1 : -1);
+        });
+      }
+      const window = filtered.slice(rangeFrom, to + 1);
+      return { data: single ? window[0] ?? null : window, error: null };
+    };
+
+    const query: Record<string, unknown> = {
+      select: () => query,
+      insert: () => {
+        op = "insert";
+        return query;
+      },
+      update: () => {
+        op = "update";
+        return query;
+      },
+      upsert: (value?: unknown) => {
+        op = "upsert";
+        // El upsert persiste de verdad: `getPeriodDetail` lee después estas filas.
+        const persisted = (Array.isArray(value) ? value : [value]).map((row, index) => ({
+          ...(row as Record<string, unknown>),
+          id: `item-nomina-${index + 1}`,
+          created_at: "2026-01-31T23:59:59.000Z",
+        }));
+        payrollPagedStub.itemsUpsert = persisted;
+        payrollPagedStub.tables.payroll_items = [...rows(), ...persisted];
+        return query;
+      },
+      delete: () => {
+        op = "delete";
+        return query;
+      },
+      eq: (column: string, value: unknown) => {
+        filters.push((row) => row[column] === value);
+        return query;
+      },
+      neq: (column: string, value: unknown) => {
+        filters.push((row) => row[column] !== value);
+        return query;
+      },
+      gte: (column: string, value: unknown) => {
+        filters.push((row) => String(row[column] ?? "") >= String(value));
+        return query;
+      },
+      lte: (column: string, value: unknown) => {
+        filters.push((row) => String(row[column] ?? "") <= String(value));
+        return query;
+      },
+      in: (column: string, values: readonly unknown[]) => {
+        const set = new Set(values);
+        filters.push((row) => set.has(row[column]));
+        return query;
+      },
+      order: (column: string, options?: { ascending?: boolean }) => {
+        orderKeys.push({ column, ascending: options?.ascending !== false });
+        return query;
+      },
+      range: (start: number, end: number) => {
+        rangeFrom = start;
+        rangeTo = end;
+        return query;
+      },
+      limit: (count: number) => {
+        rangeFrom = 0;
+        rangeTo = Math.max(0, count - 1);
+        return query;
+      },
+      single: () => Promise.resolve(select(true)),
+      maybeSingle: () => Promise.resolve(select(true)),
+      then: (onFulfilled?: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve(select(false)).then(onFulfilled, onRejected),
+    };
+    return query;
+  };
+  return { from };
+}
+
+vi.mock("@/src/shared/lib/supabase/server", () => ({
+  createAdminClient: () => createPayrollPagedStubClient(),
+}));
+
+vi.mock("@/src/features/admin/service", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/src/features/admin/service")>();
+  const employee: Awaited<ReturnType<typeof actual.listEmployees>>[number] = {
+    id: payrollPagedStub.EMPLOYEE_ID,
+    sede_id: payrollPagedStub.SEDE_ID,
+    user_id: null,
+    full_name: "Empleada de prueba",
+    employee_code: null,
+    document: "1000000001",
+    phone: null,
+    position: null,
+    payout_mode: "normal",
+    email: null,
+    birth_date: null,
+    pay_type: "porcentaje",
+    salary_fixed: null,
+    commission_percent: 10,
+    is_active: true,
+  };
+  return {
+    ...actual,
+    listEmployees: async () => [employee] as Awaited<ReturnType<typeof actual.listEmployees>>,
+  };
+});
+
+describe("payroll: el cálculo lee todas las filas (U5)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  /** Facturas de una sede en el rango: más que el tope por request (1000). */
+  const INVOICE_COUNT = 1200;
+  /** Cada línea vale 10.000 y el empleado comisiona el 10% => 1.000 por línea. */
+  const LINE_SUBTOTAL = 10000;
+  const COMMISSION_PER_LINE = 1000;
+
+  function seedCalculation(invoiceCount: number) {
+    const invoices: Array<Record<string, unknown>> = [];
+    const items: Array<Record<string, unknown>> = [];
+    for (let index = 1; index <= invoiceCount; index += 1) {
+      const suffix = String(index).padStart(5, "0");
+      invoices.push({
+        id: `factura-${suffix}`,
+        consecutive_number: index,
+        sede_id: payrollPagedStub.SEDE_ID,
+        status: "Emitida",
+        // Dentro del rango del período: el filtro `created_at` de la lectura es real.
+        created_at: "2026-01-15T12:00:00.000Z",
+      });
+      items.push({
+        id: `linea-${suffix}`,
+        invoice_id: `factura-${suffix}`,
+        item_type: "servicio",
+        employee_id: payrollPagedStub.EMPLOYEE_ID,
+        qty: 1,
+        unit_price: LINE_SUBTOTAL,
+        subtotal: LINE_SUBTOTAL,
+        no_commission: false,
+        commission_value: null,
+        commission_percent_override: null,
+        product_id: null,
+        service_id: payrollPagedStub.SERVICE_ID,
+      });
+    }
+    payrollPagedStub.tables = {
+      payroll_periods: [
+        {
+          id: payrollPagedStub.PERIOD_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          start_date: "2026-01-01",
+          end_date: "2026-01-31",
+          status: "borrador",
+          created_by: "u-1",
+          closed_at: null,
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      invoices,
+      invoice_items: items,
+      commission_rules: [],
+      voucher_requests: [],
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      audit_logs: [],
+    };
+    return { invoices, items };
+  }
+
+  beforeEach(() => {
+    payrollPagedStub.tables = {};
+    payrollPagedStub.failAt = {};
+    payrollPagedStub.requests = {};
+    payrollPagedStub.windows.length = 0;
+    payrollPagedStub.itemsUpsert = null;
+  });
+
+  it("una sede con más facturas que el tope por request no pierde comisiones", async () => {
+    const seed = seedCalculation(INVOICE_COUNT);
+    // Non-vacuidad del fixture: hay más facturas que el tope por request.
+    expect(seed.items).toHaveLength(INVOICE_COUNT);
+    expect(INVOICE_COUNT).toBeGreaterThan(payrollPagedStub.rowCap);
+
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+
+    const persisted = payrollPagedStub.itemsUpsert ?? [];
+    expect(persisted).toHaveLength(1);
+    // Las 1200 líneas, en pesos enteros: 1200 × 1.000 = 1.200.000.
+    expect(persisted[0].commissions).toBe(INVOICE_COUNT * COMMISSION_PER_LINE);
+    expect(persisted[0].detail_json).toHaveLength(INVOICE_COUNT);
+    expect(persisted[0].net_pay).toBe(INVOICE_COUNT * COMMISSION_PER_LINE);
+  });
+
+  it("control negativo: una sede por debajo del tope se lee igual", async () => {
+    // El caso chico no cambia en nada: una sola lectura por tabla y las mismas
+    // comisiones (si la paginación duplicara o perdiera filas, esto lo delata).
+    const seed = seedCalculation(50);
+
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+
+    expect(seed.invoices).toHaveLength(50);
+    expect(payrollPagedStub.itemsUpsert?.[0].commissions).toBe(50 * COMMISSION_PER_LINE);
+    expect(payrollPagedStub.itemsUpsert?.[0].detail_json).toHaveLength(50);
+    expect(payrollPagedStub.windows.filter((window) => window.table === "invoices")).toEqual([
+      { table: "invoices", from: 0, to: 999, order: ["id"] },
+    ]);
+  });
+
+  it("pide el conjunto completo, en páginas y con orden explícito", async () => {
+    seedCalculation(INVOICE_COUNT);
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+
+    const invoiceWindows = payrollPagedStub.windows.filter((window) => window.table === "invoices");
+    expect(invoiceWindows.length).toBeGreaterThan(1);
+    expect(invoiceWindows[0]).toEqual({ table: "invoices", from: 0, to: 999, order: ["id"] });
+    expect(invoiceWindows.some((window) => window.from > 0)).toBe(true);
+    // Requisito 2: cada lectura que alimenta una decisión va ordenada. Sin
+    // `order()` dos páginas pueden pisarse o repetir filas sin que se note.
+    for (const table of [
+      "invoices",
+      "invoice_items",
+      "commission_rules",
+      "voucher_requests",
+      "commission_payouts",
+    ]) {
+      const windows = payrollPagedStub.windows.filter((window) => window.table === table);
+      expect(windows.length, `sin lectura de ${table}`).toBeGreaterThan(0);
+      for (const window of windows) expect(window.order, table).toEqual(["id"]);
+    }
+  });
+
+  it("si una página falla, el cálculo se detiene a la vista (no liquida con menos)", async () => {
+    seedCalculation(INVOICE_COUNT);
+    payrollPagedStub.failAt = { invoices: [2] };
+
+    const failure: unknown = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      {},
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "READ_INCOMPLETE" });
+    // Control de vacuidad: no se persistió NADA (ni una nómina recortada).
+    expect(payrollPagedStub.itemsUpsert).toBeNull();
+  });
+});
+
+// --- El límite del candado de nómina cerrada: qué NO se puede ver (U5) -------
+
+describe("payroll: el detalle que alimenta el candado de nómina cerrada (U5)", () => {
+  /**
+   * Evidencia del límite conocido de `invoiceInClosedPayroll` (billing): el
+   * candado reconoce la factura por una línea de `detail_json`, y ese detalle
+   * SOLO escribe las líneas con base de comisión. Acá están las formas de que
+   * una línea no entre: sin base (empleado fijo sin regla ni valor de ítem) y
+   * empleado con `payout_mode = "no_aplica"`.
+   */
+  const LINE: PayrollCommissionLine = {
+    invoice_id: "33333333-3333-4333-8333-333333333333",
+    consecutive_number: 7,
+    item_id: "item-1",
+    item_type: "servicio",
+    qty: 1,
+    unit_price: 50000,
+    line_subtotal: 50000,
+    commission_value: null,
+    item_ref_id: null,
+  };
+
+  it("un empleado fijo sin regla ni valor de ítem no deja línea en el detalle", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payType: "fijo",
+      commissionPercent: null,
+      lines: [LINE],
+      rules: new Map(),
+    });
+    // Sin línea no hay comisión liquidada por esa factura: para el candado la
+    // factura es invisible (y no había plata pagada que proteger).
+    expect(detail).toEqual([]);
+  });
+
+  it("con la misma línea, un empleado porcentual SÍ deja la línea (control)", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payType: "porcentaje",
+      commissionPercent: 10,
+      lines: [LINE],
+      rules: new Map(),
+    });
+    expect(detail).toHaveLength(1);
+    expect(detail[0].invoice_id).toBe(LINE.invoice_id);
+    expect(detail[0].commission).toBe(5000);
+  });
+
+  it("payout_mode = no_aplica deja el detalle vacío aunque haya base", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payType: "porcentaje",
+      payoutMode: "no_aplica",
+      commissionPercent: 10,
+      lines: [LINE],
+      rules: new Map(),
+    });
+    expect(detail).toEqual([]);
+  });
+});
+
+// --- El helper compartido por los dos sitios de U5 --------------------------
+
+describe("paged: la lectura exhaustiva no recorta en silencio (U5)", () => {
+  /** Servidor falso: filas totales y techo por request, con ventanas reales. */
+  function server(total: number, rowCap = 1000, failAt: number | null = null) {
+    const windows: Array<{ from: number; to: number }> = [];
+    let request = 0;
+    return {
+      windows,
+      fetchPage: (from: number, to: number) => {
+        request += 1;
+        if (request === failAt) {
+          return Promise.resolve({ data: null, error: { message: "boom" } });
+        }
+        const capped = Math.min(to, from + rowCap - 1);
+        windows.push({ from, to: capped });
+        const rows = Array.from({ length: Math.max(0, Math.min(total, capped + 1) - from) }, (_, index) => from + index);
+        return Promise.resolve({ data: rows, error: null });
+      },
+    };
+  }
+
+  it("pagina hasta agotar el conjunto, con ventanas sucesivas", async () => {
+    const fake = server(2500);
+    const rows = await readAllPaged<number>({ table: "x", fetchPage: fake.fetchPage });
+
+    expect(rows).toHaveLength(2500);
+    // Sin duplicados ni huecos: el conjunto completo, en orden de lectura.
+    expect(rows[0]).toBe(0);
+    expect(rows[rows.length - 1]).toBe(2499);
+    expect(new Set(rows).size).toBe(2500);
+    expect(fake.windows).toEqual([
+      { from: 0, to: 999 },
+      { from: 1000, to: 1999 },
+      { from: 2000, to: 2999 },
+    ]);
+  });
+
+  it("un conjunto más chico que la página se lee en un solo request", async () => {
+    const fake = server(3);
+    const rows = await readAllPaged<number>({ table: "x", fetchPage: fake.fetchPage });
+    expect(rows).toEqual([0, 1, 2]);
+    expect(fake.windows).toEqual([{ from: 0, to: 999 }]);
+  });
+
+  it("un error de página LANZA y no devuelve lo que alcanzó a leer", async () => {
+    const fake = server(2500, 1000, 2);
+    const failure: unknown = await readAllPaged<number>({ table: "x", fetchPage: fake.fetchPage }).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(PagedReadError);
+    expect(failure).toMatchObject({ code: "READ_INCOMPLETE", table: "x", requestedFrom: 1000 });
+  });
+
+  it("el techo de seguridad LANZA: no es una lista recortada", async () => {
+    const fake = server(50_000);
+    const failure: unknown = await readAllPaged<number>({
+      table: "x",
+      maxRows: 2000,
+      fetchPage: fake.fetchPage,
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PagedReadError);
+    expect(failure).toMatchObject({ code: "READ_INCOMPLETE" });
+  });
+
+  it("los ids se parten en lotes del tamaño que aguanta la URL", () => {
+    expect(chunkIds(["a", "b", "c"], 2)).toEqual([["a", "b"], ["c"]]);
+    expect(chunkIds([], 2)).toEqual([]);
+    expect(chunkIds(Array.from({ length: 250 }, (_, index) => String(index)))).toHaveLength(3);
   });
 });

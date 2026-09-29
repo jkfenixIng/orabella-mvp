@@ -39,6 +39,12 @@ import { cashOutUsedInShift, getOpenShiftWithOpener } from "@/src/features/cash/
 import { cashOutLimitViolation } from "@/src/features/cash/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { bogotaDay, rangeBounds } from "@/src/shared/lib/dates";
+import {
+  chunkIds,
+  PagedReadError,
+  readAllPaged,
+  type PagedResponse,
+} from "@/src/shared/lib/paged";
 import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
 import {
   AdminError,
@@ -74,6 +80,56 @@ async function payrollDb() {
 }
 
 type DbClient = Awaited<ReturnType<typeof payrollDb>>;
+
+/** Campos de diagnóstico que devuelve PostgREST en un error de lectura. */
+interface PostgrestFailure {
+  code?: string | null;
+  message?: string | null;
+  details?: string | null;
+  hint?: string | null;
+}
+
+/** Los campos de error de PostgREST (o el mensaje suelto si no vino de la base). */
+function readFailureFields(error: unknown): Record<string, unknown> {
+  if (!(error instanceof PagedReadError)) {
+    return { message: error instanceof Error ? error.message : "error desconocido" };
+  }
+  const cause = (error.cause ?? null) as PostgrestFailure | null;
+  if (!cause) return { message: error.message };
+  return {
+    code: cause.code ?? null,
+    message: cause.message ?? error.message,
+    details: cause.details ?? null,
+    hint: cause.hint ?? null,
+  };
+}
+
+/**
+ * U5: lectura exhaustiva de nómina. El tope de transporte del Data API NO es un
+ * tope de negocio: leer un conjunto recortado liquida comisiones y vales con
+ * datos incompletos —al empleado le falta plata y los topes de vales se evalúan
+ * contra un acumulado que no es el real— y eso no se ve en ningún lado. Acá se
+ * pagina hasta agotar el conjunto y cualquier fallo se registra y se LANZA
+ * (`READ_INCOMPLETE` en `toPayrollError`): nunca se sigue con lo que se alcanzó
+ * a leer.
+ */
+async function readAllPayroll<TRow>(args: {
+  log: string;
+  what: string;
+  meta: Record<string, unknown>;
+  table: string;
+  fetchPage: (from: number, to: number) => PromiseLike<PagedResponse<TRow>>;
+}): Promise<TRow[]> {
+  try {
+    return await readAllPaged<TRow>({ table: args.table, fetchPage: args.fetchPage });
+  } catch (error) {
+    console.error(
+      `[payroll] ${args.log}: fallo al listar ${args.what}:`,
+      JSON.stringify({ ...args.meta, ...readFailureFields(error) }),
+    );
+    throw error;
+  }
+}
 
 function validationMessage(error: { issues: Array<{ message: string }> }): string {
   return error.issues[0]?.message ?? "Datos inválidos.";
@@ -140,6 +196,13 @@ export async function requirePayrollPayer(
 
 function toPayrollError(error: unknown): PayrollError {
   if (error instanceof PayrollError) return error;
+  if (error instanceof PagedReadError) {
+    return new PayrollError(
+      error.code,
+      `${error.message} El cálculo se detuvo: con una lectura incompleta las comisiones y los vales saldrían mal. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+      500,
+    );
+  }
   if (error instanceof AdminError) {
     return new PayrollError(error.code, error.message, error.status);
   }
@@ -457,6 +520,22 @@ export async function getPeriodDetail(sedeId: string, id: string): Promise<Perio
 
 // ------------------------------------------------------------------ cálculo ---
 
+/** Fila cruda de `invoice_items` que alimenta el cálculo de comisiones. */
+interface InvoiceItemRow {
+  id: string;
+  invoice_id: string;
+  item_type: string;
+  employee_id: string | null;
+  qty: number | string;
+  unit_price: number | string;
+  subtotal: number | string;
+  no_commission?: boolean | null;
+  commission_value?: number | null;
+  commission_percent_override?: number | null;
+  product_id: string | null;
+  service_id: string | null;
+}
+
 interface BillingLine {
   invoice_id: string;
   consecutive_number: number | null;
@@ -514,101 +593,77 @@ export async function calculatePayroll(
     // lleva offset de Bogotá: sin él la ventana corre 5 h y se pierden las
     // facturas de la noche del último día (comisión no liquidada).
     const invoiceRange = rangeBounds(period.start_date, period.end_date);
-    const { data: invoices, error: invoicesError } = await db
-      .from("invoices")
-      .select("id, consecutive_number")
-      .eq("sede_id", sedeId)
-      .neq("status", "Anulada")
-      .gte("created_at", invoiceRange.from)
-      .lte("created_at", invoiceRange.to)
-      .limit(2000);
-    if (invoicesError) {
-      console.error(
-        "[payroll] calculatePayroll: fallo al listar facturas:",
-        JSON.stringify({
-          periodId,
-          code: invoicesError.code,
-          message: invoicesError.message,
-          details: invoicesError.details,
-          hint: invoicesError.hint,
-        }),
-      );
-      throw new PayrollError("INTERNAL", "Error interno.", 500);
-    }
-    const invoiceRows = (invoices ?? []) as Array<{ id: string; consecutive_number: number }>;
+    // U5: lectura exhaustiva. El `.limit(2000)` de antes era un tope de
+    // TRANSPORTE tomado por tope de negocio: una sede con más facturas en el
+    // rango liquidaba comisiones con un conjunto recortado (al empleado le
+    // faltaba plata) sin un solo error. Se pagina hasta agotar, con
+    // `order("id")` para que dos corridas lean exactamente lo mismo.
+    const invoiceRows = await readAllPayroll<{ id: string; consecutive_number: number }>({
+      log: "calculatePayroll",
+      what: "facturas",
+      meta: { periodId },
+      table: "invoices",
+      fetchPage: (from, to) =>
+        db
+          .from("invoices")
+          .select("id, consecutive_number")
+          .eq("sede_id", sedeId)
+          .neq("status", "Anulada")
+          .gte("created_at", invoiceRange.from)
+          .lte("created_at", invoiceRange.to)
+          .order("id")
+          .range(from, to),
+    });
     const consecutiveByInvoice = new Map(invoiceRows.map((row) => [row.id, row.consecutive_number]));
 
     let lines: BillingLine[] = [];
     if (invoiceRows.length > 0) {
-      const { data: items, error: itemsError } = await db
-        .from("invoice_items")
-        .select(
-          "id, invoice_id, item_type, employee_id, qty, unit_price, subtotal, no_commission, commission_value, commission_percent_override, product_id, service_id",
-        )
-        .in(
-          "invoice_id",
-          invoiceRows.map((row) => row.id),
-        )
-        .limit(5000);
-      if (itemsError) {
-        console.error(
-          "[payroll] calculatePayroll: fallo al listar ítems de factura:",
-          JSON.stringify({
-            periodId,
-            invoices: invoiceRows.length,
-            code: itemsError.code,
-            message: itemsError.message,
-            details: itemsError.details,
-            hint: itemsError.hint,
-          }),
+      // U5: mismos dos topes de transporte acá (`.limit(5000)` y la lista de ids
+      // en la URL del `in(...)`). Los ids se mandan en lotes para que la URL no
+      // reviente en 414, y cada lote se pagina hasta agotar.
+      const items: Array<InvoiceItemRow> = [];
+      for (const chunk of chunkIds(invoiceRows.map((row) => row.id))) {
+        items.push(
+          ...(await readAllPayroll<InvoiceItemRow>({
+            log: "calculatePayroll",
+            what: "ítems de factura",
+            meta: { periodId, invoices: invoiceRows.length, ids: chunk.length },
+            table: "invoice_items",
+            fetchPage: (from, to) =>
+              db
+                .from("invoice_items")
+                .select(
+                  "id, invoice_id, item_type, employee_id, qty, unit_price, subtotal, no_commission, commission_value, commission_percent_override, product_id, service_id",
+                )
+                .in("invoice_id", chunk)
+                .order("id")
+                .range(from, to),
+          })),
         );
-        throw new PayrollError("INTERNAL", "Error interno.", 500);
       }
-      lines = (((items ?? []) as Array<{
-        id: string;
-        invoice_id: string;
-        item_type: string;
-        employee_id: string | null;
-        qty: number | string;
-        unit_price: number | string;
-        subtotal: number | string;
-        no_commission?: boolean | null;
-        commission_value?: number | null;
-        commission_percent_override?: number | null;
-        product_id: string | null;
-        service_id: string | null;
-      }>).filter(
-        (
-          row,
-        ): row is {
-          id: string;
-          invoice_id: string;
-          item_type: string;
-          employee_id: string;
-          qty: number | string;
-          unit_price: number | string;
-          subtotal: number | string;
-          no_commission?: boolean | null;
-          commission_value?: number | null;
-          commission_percent_override?: number | null;
-          product_id: string | null;
-          service_id: string | null;
-        } => Boolean(row.employee_id) && !row.no_commission,
-      )).map((row) => ({
-        invoice_id: row.invoice_id,
-        consecutive_number: consecutiveByInvoice.get(row.invoice_id) ?? null,
-        item_id: row.id,
-        item_type: row.item_type,
-        employee_id: row.employee_id,
-        qty: Number(row.qty),
-        unit_price: Number(row.unit_price),
-        line_subtotal: Number(row.subtotal),
-        commission_value: row.commission_value ? Number(row.commission_value) : null,
-        commission_percent_override:
-          row.commission_percent_override != null ? Number(row.commission_percent_override) : null,
-        product_id: row.product_id,
-        service_id: row.service_id,
-      }));
+      lines = items
+        // Solo las líneas con empleado y comisionables: el resto no entra al
+        // detalle (es la misma semántica de siempre, ahora sobre el conjunto
+        // COMPLETO de ítems).
+        .filter(
+          (row): row is InvoiceItemRow & { employee_id: string } =>
+            Boolean(row.employee_id) && !row.no_commission,
+        )
+        .map((row) => ({
+          invoice_id: row.invoice_id,
+          consecutive_number: consecutiveByInvoice.get(row.invoice_id) ?? null,
+          item_id: row.id,
+          item_type: row.item_type,
+          employee_id: row.employee_id,
+          qty: Number(row.qty),
+          unit_price: Number(row.unit_price),
+          line_subtotal: Number(row.subtotal),
+          commission_value: row.commission_value ? Number(row.commission_value) : null,
+          commission_percent_override:
+            row.commission_percent_override != null ? Number(row.commission_percent_override) : null,
+          product_id: row.product_id,
+          service_id: row.service_id,
+        }));
     }
     const linesByEmployee = new Map<string, BillingLine[]>();
     for (const line of lines) {
@@ -618,41 +673,39 @@ export async function calculatePayroll(
     }
 
     // Reglas ítem×empleado activas de la sede (mismos filtros que usa el pago
-    // inmediato: sede + empleado + activa). Una sola consulta y se agrupan en
-    // memoria para no caer en N+1 sobre la planta activa.
+    // inmediato: sede + empleado + activa). Una sola lectura exhaustiva y se
+    // agrupan en memoria para no caer en N+1 sobre la planta activa.
     const rulesByEmployee = new Map<string, Map<string, RuleRate>>();
     if (actives.length > 0) {
-      const { data: rules, error: rulesError } = await db
-        .from("commission_rules")
-        .select("employee_id, item_type, item_id, percent, amount")
-        .eq("sede_id", sedeId)
-        .eq("is_active", true)
-        .in(
-          "employee_id",
-          actives.map((employee) => employee.id),
-        )
-        .limit(5000);
-      if (rulesError) {
-        console.error(
-          "[payroll] calculatePayroll: fallo al listar reglas de comisión:",
-          JSON.stringify({
-            periodId,
-            employees: actives.length,
-            code: rulesError.code,
-            message: rulesError.message,
-            details: rulesError.details,
-            hint: rulesError.hint,
-          }),
-        );
-        throw new PayrollError("INTERNAL", "Error interno.", 500);
-      }
-      for (const rule of (rules ?? []) as Array<{
+      // U5: sin `.limit(5000)`. Una regla que no se lee es una comisión que se
+      // liquida de menos (el `porcentaje plano` del empleado o cero, según el
+      // ítem): la diferencia sale del bolsillo del empleado y no aparece en
+      // ningún error.
+      const rules = await readAllPayroll<{
         employee_id: string;
         item_type: string;
         item_id: string;
         percent: number | string | null;
         amount: number | string | null;
-      }>) {
+      }>({
+        log: "calculatePayroll",
+        what: "reglas de comisión",
+        meta: { periodId, employees: actives.length },
+        table: "commission_rules",
+        fetchPage: (from, to) =>
+          db
+            .from("commission_rules")
+            .select("employee_id, item_type, item_id, percent, amount")
+            .eq("sede_id", sedeId)
+            .eq("is_active", true)
+            .in(
+              "employee_id",
+              actives.map((employee) => employee.id),
+            )
+            .order("id")
+            .range(from, to),
+      });
+      for (const rule of rules) {
         const byItem = rulesByEmployee.get(rule.employee_id) ?? new Map<string, RuleRate>();
         byItem.set(commissionRuleKey(rule.item_type, rule.item_id), {
           percent: rule.percent != null ? Number(rule.percent) : null,
@@ -663,33 +716,29 @@ export async function calculatePayroll(
     }
 
     // Vales pendientes/aprobados del rango (se descuentan y marcan).
-    const { data: vouchers, error: vouchersError } = await db
-      .from("voucher_requests")
-      .select("id, employee_id, amount, status")
-      .eq("sede_id", sedeId)
-      .in("status", ["pendiente", "aprobada"])
-      .gte("request_date", period.start_date)
-      .lte("request_date", period.end_date)
-      .limit(2000);
-    if (vouchersError) {
-      console.error(
-        "[payroll] calculatePayroll: fallo al listar vales del periodo:",
-        JSON.stringify({
-          periodId,
-          code: vouchersError.code,
-          message: vouchersError.message,
-          details: vouchersError.details,
-          hint: vouchersError.hint,
-        }),
-      );
-      throw new PayrollError("INTERNAL", "Error interno.", 500);
-    }
-    const voucherRows = (vouchers ?? []) as Array<{
+    // U5: sin `.limit(2000)`. Un vale que no se lee NO se descuenta del neto y
+    // queda sin marcar: el descuento se pierde y el vale sigue vigente.
+    const voucherRows = await readAllPayroll<{
       id: string;
       employee_id: string;
       amount: number | string;
       status: string;
-    }>;
+    }>({
+      log: "calculatePayroll",
+      what: "vales del periodo",
+      meta: { periodId },
+      table: "voucher_requests",
+      fetchPage: (from, to) =>
+        db
+          .from("voucher_requests")
+          .select("id, employee_id, amount, status")
+          .eq("sede_id", sedeId)
+          .in("status", ["pendiente", "aprobada"])
+          .gte("request_date", period.start_date)
+          .lte("request_date", period.end_date)
+          .order("id")
+          .range(from, to),
+    });
     const valesByEmployee = new Map<string, { total: number; ids: string[] }>();
     for (const row of voucherRows) {
       if (!canDiscountVoucher(row.status)) continue;
@@ -707,20 +756,30 @@ export async function calculatePayroll(
     // para no pagar doble. Tope acumulado (ganado − pagado, nunca negativo).
     const paidImmediateByEmployee = new Map<string, number>();
     if (invoiceRows.length > 0) {
-      const { data: payouts } = await db
-        .from("commission_payouts")
-        .select("employee_id, amount")
-        .eq("sede_id", sedeId)
-        .in(
-          "invoice_id",
-          invoiceRows.map((row) => row.id),
-        )
-        .limit(5000);
-      for (const row of ((payouts ?? []) as Array<{ employee_id: string; amount: number | string }>)) {
-        paidImmediateByEmployee.set(
-          row.employee_id,
-          roundMoney((paidImmediateByEmployee.get(row.employee_id) ?? 0) + Number(row.amount)),
-        );
+      // U5: sin `.limit(5000)`, con los ids en lotes y por páginas. Un pago
+      // inmediato que no se lee no se resta: la comisión se pagaría DOS VECES.
+      // Y el error deja de ignorarse en silencio (antes no se miraba `error`).
+      for (const chunk of chunkIds(invoiceRows.map((row) => row.id))) {
+        const payouts = await readAllPayroll<{ employee_id: string; amount: number | string }>({
+          log: "calculatePayroll",
+          what: "pagos inmediatos",
+          meta: { periodId, invoices: invoiceRows.length, ids: chunk.length },
+          table: "commission_payouts",
+          fetchPage: (from, to) =>
+            db
+              .from("commission_payouts")
+              .select("employee_id, amount")
+              .eq("sede_id", sedeId)
+              .in("invoice_id", chunk)
+              .order("id")
+              .range(from, to),
+        });
+        for (const row of payouts) {
+          paidImmediateByEmployee.set(
+            row.employee_id,
+            roundMoney((paidImmediateByEmployee.get(row.employee_id) ?? 0) + Number(row.amount)),
+          );
+        }
       }
     }
 
@@ -1220,19 +1279,29 @@ async function vigenteTotals(
   const weekEndDate = new Date(`${weekStart}T00:00:00Z`);
   weekEndDate.setUTCDate(weekEndDate.getUTCDate() + 6);
   const weekEnd = weekEndDate.toISOString().slice(0, 10);
-  const { data, error } = await db
-    .from("voucher_requests")
-    .select("amount, request_date")
-    .eq("sede_id", sedeId)
-    .eq("employee_id", employeeId)
-    .in("status", ["pendiente", "aprobada"])
-    .gte("request_date", weekStart)
-    .lte("request_date", weekEnd)
-    .limit(1000);
-  if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+  // U5: sin `.limit(1000)`. El acumulado que decide el tope día/semana tiene
+  // que ser el REAL: con un acumulado recortado el tope se evade (se aprueba un
+  // vale por encima del límite de la sede).
+  const data = await readAllPayroll<{ amount: number | string; request_date: string }>({
+    log: "vigenteTotals",
+    what: "vales vigentes",
+    meta: { sedeId, employeeId, weekStart, weekEnd },
+    table: "voucher_requests",
+    fetchPage: (from, to) =>
+      db
+        .from("voucher_requests")
+        .select("amount, request_date")
+        .eq("sede_id", sedeId)
+        .eq("employee_id", employeeId)
+        .in("status", ["pendiente", "aprobada"])
+        .gte("request_date", weekStart)
+        .lte("request_date", weekEnd)
+        .order("id")
+        .range(from, to),
+  });
   let dayTotal = 0;
   let weekTotal = 0;
-  for (const row of (data ?? []) as Array<{ amount: number | string; request_date: string }>) {
+  for (const row of data) {
     weekTotal = roundMoney(weekTotal + Number(row.amount));
     if (row.request_date === requestDate) {
       dayTotal = roundMoney(dayTotal + Number(row.amount));
