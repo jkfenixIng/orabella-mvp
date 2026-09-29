@@ -20,6 +20,7 @@ import type {
 } from "@/src/features/cash/service";
 import type { PaymentMethodRow } from "@/src/features/admin/service";
 import { Alert } from "@/src/components/ui/lib/alert";
+import { Badge } from "@/src/components/ui/lib/badge";
 import {
   Dialog,
   DialogContent,
@@ -843,10 +844,10 @@ export function CashClient(props: CashClientProps) {
                     <span>
                       {formatMoney(row.amount)} · {row.request_date}
                     </span>
-                    <span className="rounded bg-surface-hover px-2 py-0.5 text-xs text-text-secondary">
+                    <Badge variant="secondary">
                       {row.status}
                       {row.status === "descontada" ? " (en nómina)" : ""}
-                    </span>
+                    </Badge>
                   </li>
                 ))}
               </ul>

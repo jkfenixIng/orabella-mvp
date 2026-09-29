@@ -26,6 +26,7 @@ import {
 } from "@/src/components/ui/lib/dialog";
 import { cn } from "@/src/components/ui/lib/utils";
 import { Alert } from "@/src/components/ui/lib/alert";
+import { Badge } from "@/src/components/ui/lib/badge";
 import {
   buttonClass,
   ghostClass,
@@ -972,7 +973,7 @@ export function PayrollClient(props: PayrollClientProps) {
               >
                 {row.start_date} → {row.end_date}
               </button>
-              <span className="rounded bg-surface-hover px-2 py-0.5 text-xs text-text-secondary">{row.status}</span>
+              <Badge variant="secondary">{row.status}</Badge>
               {row.status === "cerrado" && row.closed_at && (
                 <span className="text-xs text-text-tertiary">Cerrado: {new Date(row.closed_at).toLocaleString("es-CO")}</span>
               )}

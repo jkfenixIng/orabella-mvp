@@ -14,8 +14,13 @@ import { describe, expect, it } from "vitest";
    en 9 archivos, con 246 en `app/invoices/invoices-client.tsx` (WU5). WU1 limpió
    los que se renderizan en TODAS las rutas (esqueletos, error, 404, theme toggle)
    y WU2 limpió `src/components/ui/lib/combobox.tsx`, que ya usa los mismos tokens
-   que sus primitivas hermanas. Sin esta guarda el próximo archivo reintroduce la
-   paleta cruda y la disparidad se reabre.
+   que sus primitivas hermanas. WU4 bajó su archivo de 246 a 224: las siete
+   pastillas de estado que todavía se escribían con la paleta cruda pasaron al
+   primitivo `Badge` (variantes `warning`/`success`/`secondary`/`default` y el
+   mapeo `invoiceStatusVariant`). Los 224 restantes son el cromo del papel de
+   factura (impresión, tablas, botones, inputs) y siguen siendo WU5. Sin esta
+   guarda el próximo archivo reintroduce la paleta cruda y la disparidad se
+   reabre.
 
    Método: se cuentan TOKENS de clase completos, nunca substrings. Los lotes
    anteriores se quemaron dos veces con grep de substring:
@@ -171,7 +176,11 @@ function readProductionSources(): Map<string, string> {
 const ALLOWLIST = new Map<string, { hits: number; reason: string }>([
   [
     "app/invoices/invoices-client.tsx",
-    { hits: 246, reason: "WU5: unidad grande, fuera del alcance de WU1." },
+    {
+      hits: 224,
+      reason:
+        "WU5: unidad grande, fuera del alcance de WU1. WU4 ya bajó las pastillas de estado (246 → 224); el resto es el cromo del papel de factura.",
+    },
   ],
   [
     "src/components/ui/lib/dialog.tsx",

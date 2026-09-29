@@ -29,6 +29,7 @@ import type {
   TaxConfigRow,
 } from "@/src/features/admin/service";
 import { Alert } from "@/src/components/ui/lib/alert";
+import { Badge, type BadgeProps } from "@/src/components/ui/lib/badge";
 import { Button } from "@/src/components/ui/lib/button";
 import {
   Card,
@@ -223,19 +224,20 @@ function commissionDisplayValue(
   return row.commission_amount ?? null;
 }
 
-/** Pastilla de estado: Emitida azul, Pagada verde, Anulada roja (ambos temas). */
-function statusPill(status: string) {
-  const tone =
-    status === "Pagada"
-      ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200"
-      : status === "Anulada"
-        ? "bg-red-100 text-red-800 dark:bg-red-900/50 dark:text-red-200"
-        : "bg-blue-100 text-blue-800 dark:bg-blue-900/50 dark:text-blue-200";
-  return (
-    <span className={`inline-block whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-semibold ${tone}`}>
-      {status}
-    </span>
-  );
+/**
+ * Estado de factura → variante del `Badge` compartido: Emitida azul (la
+ * primaria), Pagada verde (`success`), Anulada roja (`destructive`).
+ *
+ * El color de cada estado y su override de tema viven en la primitiva
+ * (`bg-*-light` + `text-*` de design-tokens.css). Antes cada estado se
+ * escribía acá a mano con la paleta cruda, y la misma pastilla
+ * (`rounded-full px-2 py-0.5`) reaparecía con otras tres grafías en el
+ * archivo.
+ */
+function invoiceStatusVariant(status: string): BadgeProps["variant"] {
+  if (status === "Pagada") return "success";
+  if (status === "Anulada") return "destructive";
+  return "default";
 }
 
 /** "Camilo, Andrés + 3 más": dos nombres y el resto resumido. */
@@ -1215,9 +1217,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         <div className="text-right">
                           <h2 className="text-lg font-bold">FACTURA DE VENTA</h2>
                           <p className="text-sm text-slate-500">N.º por asignar · {todayStr}</p>
-                          <span className="mt-1 inline-block rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800">
+                          <Badge variant="warning" className="mt-1">
                             Borrador
-                          </span>
+                          </Badge>
                         </div>
                       </div>
                     </div>
@@ -1764,7 +1766,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 <span className="whitespace-nowrap text-sm font-medium text-slate-900 sm:text-right dark:text-slate-100">
                   {formatMoney(row.total)}
                 </span>
-                <span>{statusPill(row.status)}</span>
+                <span>
+                  <Badge variant={invoiceStatusVariant(row.status)}>{row.status}</Badge>
+                </span>
                 <span className="flex items-center gap-1 sm:justify-center">
                   {row.status !== "Anulada" &&
                     (props.isAdmin ||
@@ -1817,7 +1821,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             <div className="text-right">
                               <h2 className="text-lg font-bold">
                                 FACTURA #{detail.invoice.consecutive_number}{" "}
-                                {statusPill(detail.invoice.status)}
+                                <Badge variant={invoiceStatusVariant(detail.invoice.status)}>
+                                  {detail.invoice.status}
+                                </Badge>
                               </h2>
                               <p className="text-sm text-slate-500">
                                 {new Date(detail.invoice.created_at).toLocaleDateString("es-CO", {
@@ -1870,14 +1876,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                       {!clientView &&
                                         !row.no_commission &&
                                         commissionDisplayValue(row) !== null && (
-                                          <span className="ml-2 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                                          <Badge variant="success" className="ml-2">
                                             Comisión: {formatMoney(commissionDisplayValue(row))}
-                                          </span>
+                                          </Badge>
                                         )}
                                       {!clientView && row.no_commission && (
-                                        <span className="ml-2 rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">
+                                        <Badge variant="secondary" className="ml-2">
                                           Sin comisión
-                                        </span>
+                                        </Badge>
                                       )}
                                     </td>
                                     {!clientView && (
@@ -1957,9 +1963,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               <li key={row.id}>
                                 {row.method_code} = {formatMoney(row.amount)}
                                 {row.fee_amount > 0 && (
-                                  <span className="ml-2 rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+                                  <Badge variant="success" className="ml-2">
                                     recargo {row.fee_percent}%: +{formatMoney(row.fee_amount)}
-                                  </span>
+                                  </Badge>
                                 )}
                               </li>
                             ))}
@@ -2109,11 +2115,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   EDITAR FACTURA #{detail?.invoice.consecutive_number ?? "—"}
                                 </h2>
                                 <p className="mt-1 text-sm">
-                                  <span className="inline-block rounded-full bg-blue-100 px-2 py-0.5 text-xs font-semibold text-blue-800">
+                                  <Badge variant="default">
                                     {isFreeEdit
                                       ? `Total anterior: ${detail ? formatMoney(detail.invoice.total) : "—"} (se recalcula)`
                                       : `Total inmutable: ${detail ? formatMoney(detail.invoice.total) : "—"}`}
-                                  </span>
+                                  </Badge>
                                 </p>
                               </div>
                             </div>
