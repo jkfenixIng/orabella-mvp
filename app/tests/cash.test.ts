@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   accumulateDayTotals,
   assertCloseInput,
@@ -30,14 +30,93 @@ import {
   voucherOutByMethod,
 } from "@/src/features/cash/schemas";
 import {
+  CashError,
   invoiceCollectionsSummary,
   mergeShiftMoney,
+  registerPayment,
   sumShiftMoneyByMethod,
 } from "@/src/features/cash/service";
 import {
   invoiceNetBalance,
   splitGrossCardFee,
 } from "@/src/features/billing/service";
+
+// ------------------------------------------------------ helpers de recorte ---
+
+/**
+ * Copia de `source` con el contenido de strings, template literals y
+ * comentarios reemplazado por espacios (misma longitud). Solo se usa para
+ * contar llaves: así una llave dentro de un literal no descuadra el conteo.
+ */
+function blankStringsAndComments(source: string): string {
+  const out = source.split("");
+  const blank = (from: number, to: number): void => {
+    for (let i = from; i < to; i += 1) {
+      if (out[i] !== "\n") out[i] = " ";
+    }
+  };
+  let i = 0;
+  while (i < source.length) {
+    const char = source[i];
+    if (char === "/" && source[i + 1] === "/") {
+      const end = source.indexOf("\n", i);
+      const stop = end === -1 ? source.length : end;
+      blank(i, stop);
+      i = stop;
+      continue;
+    }
+    if (char === "/" && source[i + 1] === "*") {
+      const end = source.indexOf("*/", i + 2);
+      const stop = end === -1 ? source.length : end + 2;
+      blank(i, stop);
+      i = stop;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") {
+      let j = i + 1;
+      while (j < source.length) {
+        if (source[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (source[j] === char) break;
+        j += 1;
+      }
+      blank(i + 1, Math.min(j, source.length));
+      i = j + 1;
+      continue;
+    }
+    i += 1;
+  }
+  return out.join("");
+}
+
+/**
+ * Cuerpo de la primera rama que empieza con `marker` (p. ej. `if (mirrorError) {`),
+ * delimitado por llaves balanceadas.
+ *
+ * T0-b: reemplaza al recorte con `indexOf`/`slice`, que degradaba a `""` (o a un
+ * tramo invertido) sin avisar. Un `expect("").not.toContain(...)` pasa siempre:
+ * la guarda se perdía en silencio. Acá el marcador tiene que existir y el bloque
+ * tiene que cerrar, o el test falla con un mensaje explícito.
+ */
+function extractBranch(source: string, marker: string): string {
+  const start = source.indexOf(marker);
+  expect(start, `no se encontró la rama \`${marker}\``).toBeGreaterThan(-1);
+  const open = source.indexOf("{", start);
+  expect(open, `\`${marker}\` no abre un bloque`).toBeGreaterThan(-1);
+  const scan = blankStringsAndComments(source);
+  let depth = 0;
+  for (let i = open; i < scan.length; i += 1) {
+    if (scan[i] === "{") {
+      depth += 1;
+    } else if (scan[i] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(open + 1, i);
+    }
+  }
+  throw new Error(`la rama \`${marker}\` no cierra sus llaves`);
+}
 
 // ------------------------------------------------- base encadenada (CAJ-01) ---
 
@@ -719,10 +798,25 @@ describe("cash: T0-a (Defecto 2) el espejo va antes que la fila de cajón", () =
     // El recorte es la rama del INSERT fallido, que es la que no tiene fila que
     // borrar. La rama del insert SIN fila confirmada sí compensa (Defecto 3,
     // asertado aparte): su `.delete()` vive después de este recorte.
-    const mirrorErrorBranch = mirrorBlock.slice(
-      mirrorBlock.indexOf("if (mirrorError) {"),
-      mirrorBlock.indexOf("if (!mirror) {"),
+    //
+    // T0-b: antes este tramo salía de `slice(indexOf("if (mirrorError) {"),
+    // indexOf("if (!mirror) {"))`. Con esos dos índices invertidos (o en -1) el
+    // recorte quedaba vacío y la negación de abajo pasaba sin mirar nada. Ahora
+    // cada rama se extrae por llaves balanceadas (falla si no existe o no
+    // cierra) y el orden se asevera de forma explícita.
+    const mirrorErrorStart = body.indexOf("if (mirrorError) {");
+    const notMirrorStart = body.indexOf("if (!mirror) {");
+    expect(mirrorErrorStart, "la rama del INSERT fallido debe existir").toBeGreaterThan(-1);
+    expect(notMirrorStart, "la rama sin fila confirmada debe existir").toBeGreaterThan(-1);
+    expect(notMirrorStart, "`!mirror` va después de `mirrorError`").toBeGreaterThan(
+      mirrorErrorStart,
     );
+    const mirrorErrorBranch = extractBranch(body, "if (mirrorError) {");
+    const notMirrorBranch = extractBranch(body, "if (!mirror) {");
+    // Positivas de contenido: si el recorte se rompiera, estas dos fallan.
+    expect(mirrorErrorBranch).toContain('"OVERPAID"');
+    expect(notMirrorBranch).toContain('.eq("id", mirrorIdCandidate)');
+    // Y solo entonces la negación, sobre un bloque que existe de verdad.
     expect(mirrorErrorBranch).not.toContain(".delete()");
   });
 });
@@ -1199,5 +1293,189 @@ describe("migración 031_cash_invoice_payment_integrity.sql (T0-a)", () => {
     expect(sql).toContain("expected_cash");
     expect(sql).toContain("turno_emisor");
     expect(sql).toContain("turno_cobrador");
+  });
+});
+
+// ------- T0-b: el INSERT fallido del espejo no emite NINGÚN DELETE -------
+
+/**
+ * Estado del doble de Supabase. `vi.hoisted` lo iza junto con los `vi.mock`,
+ * que en Vitest se ejecutan antes de los imports estáticos del archivo.
+ */
+const paymentStub = vi.hoisted(() => ({
+  SEDE_ID: "11111111-1111-4111-8111-111111111111",
+  SHIFT_ID: "22222222-2222-4222-8222-222222222222",
+  INVOICE_ID: "33333333-3333-4333-8333-333333333333",
+  METHOD_ID: "55555555-5555-4555-8555-555555555555",
+  /** Tablas borradas, en orden: el registro que hace observable el DELETE. */
+  deleteCalls: [] as string[],
+  /** Consultas que el doble no sabe responder (debería quedar siempre vacío). */
+  unexpectedQueries: [] as string[],
+  mirrorError: null as { code?: string; message?: string } | null,
+  mirrorData: null as { id: string } | null,
+  rollbackError: null as { message?: string } | null,
+}));
+
+/**
+ * Cliente Supabase falso y encadenable. Solo responde lo que el camino de
+ * `registerPayment` consulta de verdad (`cash_shifts`, `invoice_payments`);
+ * cualquier otra consulta se registra en `unexpectedQueries` y vuelve como
+ * error, para que el test falle a la vista en vez de en silencio.
+ */
+function createStubSupabaseClient(): unknown {
+  const respond = (
+    table: string,
+    op: "select" | "insert" | "delete",
+  ): { data: unknown; error: unknown } => {
+    if (table === "cash_shifts" && op === "select") {
+      return {
+        data: {
+          id: paymentStub.SHIFT_ID,
+          sede_id: paymentStub.SEDE_ID,
+          status: "abierto",
+          opened_by: "u-1",
+        },
+        error: null,
+      };
+    }
+    if (table === "invoice_payments" && op === "insert") {
+      return { data: paymentStub.mirrorData, error: paymentStub.mirrorError };
+    }
+    if (table === "invoice_payments" && op === "delete") {
+      paymentStub.deleteCalls.push(table);
+      return { data: null, error: paymentStub.rollbackError };
+    }
+    paymentStub.unexpectedQueries.push(`${table}.${op}`);
+    return { data: null, error: { message: `stub sin respuesta para ${table}.${op}` } };
+  };
+
+  const from = (table: string) => {
+    let op: "select" | "insert" | "delete" = "select";
+    const query: Record<string, unknown> = {
+      select: () => query,
+      insert: () => {
+        op = "insert";
+        return query;
+      },
+      delete: () => {
+        op = "delete";
+        return query;
+      },
+      eq: () => query,
+      order: () => query,
+      limit: () => query,
+      single: () => Promise.resolve(respond(table, op)),
+      maybeSingle: () => Promise.resolve(respond(table, op)),
+      // `await` directo sobre la cadena (p. ej. `delete().eq(...)`) resuelve al
+      // objeto de respuesta, igual que el PostgREST real.
+      then: (onFulfilled?: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve(respond(table, op)).then(onFulfilled, onRejected),
+    };
+    return query;
+  };
+
+  return { from };
+}
+
+vi.mock("@/src/shared/lib/supabase/server", () => ({
+  createAdminClient: () => createStubSupabaseClient(),
+}));
+
+vi.mock("@/src/features/admin/service", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/src/features/admin/service")>();
+  const methods = [
+    {
+      id: paymentStub.METHOD_ID,
+      sede_id: paymentStub.SEDE_ID,
+      code: "efectivo",
+      name: "Efectivo",
+      is_active: true,
+      arqueable: true,
+      fee_percent: 0,
+    },
+  ] as Awaited<ReturnType<typeof actual.listPaymentMethods>>;
+  return { ...actual, listPaymentMethods: async () => methods };
+});
+
+vi.mock("@/src/features/billing/service", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/src/features/billing/service")>();
+  // Solo se sustituye la lectura del detalle: `invoiceNetBalance` y
+  // `splitGrossCardFee` siguen siendo los reales (vienen del spread).
+  const detail = {
+    invoice: {
+      id: paymentStub.INVOICE_ID,
+      sede_id: paymentStub.SEDE_ID,
+      status: "Emitida",
+      total: 100000,
+      surcharge: 0,
+      cash_shift_id: paymentStub.SHIFT_ID,
+    },
+    payments: [],
+  } as unknown as Awaited<ReturnType<typeof actual.getInvoiceDetail>>;
+  return { ...actual, getInvoiceDetail: async () => detail };
+});
+
+describe("cash: T0-b el INSERT fallido del espejo no emite ningún DELETE", () => {
+  const input = {
+    cash_shift_id: paymentStub.SHIFT_ID,
+    invoice_id: paymentStub.INVOICE_ID,
+    method_code: "efectivo",
+    amount: 50000,
+  };
+  const actor = { userId: "u-1", sedeId: paymentStub.SEDE_ID };
+
+  beforeEach(() => {
+    paymentStub.deleteCalls.length = 0;
+    paymentStub.unexpectedQueries.length = 0;
+    paymentStub.mirrorError = null;
+    paymentStub.mirrorData = null;
+    paymentStub.rollbackError = null;
+  });
+
+  it("P0001 del tope: rechaza OVERPAID y no emite DELETE", async () => {
+    paymentStub.mirrorError = { code: "P0001", message: "cap" };
+    const failure: unknown = await registerPayment(input, actor).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(CashError);
+    expect(failure).toMatchObject({ code: "OVERPAID", status: 422 });
+    expect(paymentStub.deleteCalls).toEqual([]);
+    expect(paymentStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("error genérico del INSERT: rechaza INTERNAL y no emite DELETE", async () => {
+    paymentStub.mirrorError = { code: "23514", message: "check_violation" };
+    const failure: unknown = await registerPayment(input, actor).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(CashError);
+    expect(failure).toMatchObject({ code: "INTERNAL", status: 500 });
+    expect(paymentStub.deleteCalls).toEqual([]);
+    expect(paymentStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("control positivo: sin fila confirmada la compensación SÍ se emite", async () => {
+    // Si el doble dejara de observar el DELETE, esta positiva falla: es lo que
+    // convierte a las dos negaciones de arriba en una guarda y no en un vacío.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const failure: unknown = await registerPayment(input, actor).catch((error: unknown) => error);
+      expect(failure).toMatchObject({ code: "MIRROR_UNCONFIRMED", status: 500 });
+      expect(errorSpy).toHaveBeenCalled();
+      expect(paymentStub.deleteCalls).toEqual(["invoice_payments"]);
+      expect(paymentStub.unexpectedQueries).toEqual([]);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("control positivo: si la compensación también falla, se emite el DELETE y se grita", async () => {
+    paymentStub.rollbackError = { message: "network" };
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const failure: unknown = await registerPayment(input, actor).catch((error: unknown) => error);
+      expect(failure).toMatchObject({ code: "PAYMENT_ROLLBACK_FAILED", status: 500 });
+      expect(errorSpy).toHaveBeenCalled();
+      expect(paymentStub.deleteCalls).toEqual(["invoice_payments"]);
+      expect(paymentStub.unexpectedQueries).toEqual([]);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });
