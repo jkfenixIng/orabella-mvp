@@ -12,7 +12,9 @@ en la raíz del repo. **No tocar `API/` ni `front/`** (stack anterior).
 
 ## Env
 
-Copiar `.env.example` a `.env.local` y completar:
+Copiar `.env.example` a `.env.local` y completar. Las dos variables de Upstash
+son opcionales y no vienen en `.env.example`: se leen directo de `process.env`
+en `src/shared/lib/rate-limit.ts`.
 
 | Variable | Alcance | Notas |
 |---|---|---|
@@ -38,11 +40,11 @@ npm test        # vitest run
 
 ```text
 app/                      # App Router (layout, page, globals.css, api/v1/*)
-src/features/{auth,admin,inventory,billing,cash,payroll}/  # un módulo por tarea T2→T7
+src/features/{admin,alerts,auth,billing,cash,commissions,inventory,payroll}/  # un módulo por feature, con README propio
 src/shared/{components,lib,config}/  # theme, api-response, supabase client/server, audit, rate-limit, env
-supabase/migrations/      # SQL versionado (001 fundación; dominio en T2→T7; endurecimiento en T8)
+supabase/migrations/      # SQL versionado (001 fundación; dominio en T2→T7; endurecimiento en T8; 009→030 ampliaciones)
 supabase/seeds/           # seeds de aceptación §11 (T8, idempotentes)
-tests/                    # smoke tests vitest
+tests/                    # suites vitest + e2e Playwright (tests/e2e/)
 ```
 
 ## Convenciones
@@ -52,13 +54,18 @@ tests/                    # smoke tests vitest
   inline bloqueante (`beforeInteractive`) que fija la clase antes del paint +
   `suppressHydrationWarning` + variables CSS (`@custom-variant dark` en Tailwind 4).
 - **API-first (§10):** lógica en servicios del servidor; web vía Server Actions,
-  futura app vía REST `/api/v1` (JWT Supabase, errores `{success:false, code, message}`).
+  futura app vía REST `/api/v1` (hoy todas las rutas autentican con la cookie
+  de sesión `orabella_session`, no con JWT de Supabase; errores
+  `{success:false, code, message}`).
 - **Seguridad:** RLS deny-by-default por `sede_id`; `service_role` solo en servidor;
   validación Zod server-side en toda escritura.
 - **Migraciones:** `supabase/migrations/NNN_*.sql`, `001_foundation.sql` solo trae
   `pgcrypto` + trigger `set_updated_at()` (sin tablas de dominio). Aplicar en
-  orden `001 → 008` en un proyecto Supabase **nuevo**; luego
+  orden `001 → 030` en un proyecto Supabase **nuevo**; luego
   `supabase/seeds/acceptance.sql` (idempotente, datos ficticios §11).
+  Tras T8 (001→008) la numeración continúa con endurecimiento (017/018),
+  control de caja (009/010), alertas (011–014), comisiones (016/020/027/030) y
+  ajustes de admin, factura y vales (015, 019, 021–026, 028, 029).
 
 ## Seguridad (T8 — endurecimiento)
 
@@ -72,9 +79,11 @@ tests/                    # smoke tests vitest
   encabezado de `008_hardening.sql` (`public.custom_access_token_hook`): al
   login setea `app_metadata.sede_id` desde `users.sede_id`.
 - **Auditoría:** `audit_logs` (TRA-01) + `src/shared/lib/audit.ts`
-  (`writeAudit()` con service_role, nunca en cliente). Acciones: login
-  fallido/bloqueo, anulación de factura, cierre con base incompleta,
-  cálculo/cierre de nómina, vales sobre tope, cambio de clave.
+  (`writeAudit()` con service_role, nunca en cliente). Acciones
+  (`AUDIT_ACTIONS` en ese archivo): login fallido/bloqueo, cambio de clave,
+  creación/edición/anulación de factura, turnos de caja (apertura, cierre con
+  o sin desajuste, edición), base de caja, cálculo/cierre/eliminación de
+  nómina, pago de comisión y vales (solicitado, aprobado, rechazado).
 - **Rate-limit:** `src/shared/lib/rate-limit.ts` — Upstash Redis REST cuando
   existen `UPSTASH_REDIS_REST_URL`/`UPSTASH_REDIS_REST_TOKEN` (5 intentos /
   15 min por documento en login y password-reset); sin ellas, fallback a
