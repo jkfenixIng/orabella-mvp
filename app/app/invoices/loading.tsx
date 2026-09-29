@@ -17,20 +17,20 @@ export default function InvoicesLoading() {
         </div>
       </header>
       <div role="status" className="flex flex-col gap-4">
-        <span className="text-sm text-slate-500 dark:text-slate-400">Cargando…</span>
+        <span className="text-sm text-text-secondary">Cargando…</span>
         <div className="flex flex-wrap gap-2">
           <Skeleton className="h-10 w-36" />
           <Skeleton className="h-10 w-36" />
           <Skeleton className="h-10 w-36" />
           <Skeleton className="h-10 w-24" />
         </div>
-        <div className="flex flex-col gap-2 rounded-lg border border-slate-300 p-4 dark:border-slate-700">
+        <div className="flex flex-col gap-2 rounded-lg border border-border-color p-4 dark:border-border-color-2">
           <Skeleton className="h-6 w-40" />
           <Skeleton className="h-5 w-full" />
           <Skeleton className="h-5 w-full" />
           <Skeleton className="h-5 w-3/4" />
         </div>
-        <div className="flex flex-col gap-2 rounded-lg border border-slate-300 p-4 dark:border-slate-700">
+        <div className="flex flex-col gap-2 rounded-lg border border-border-color p-4 dark:border-border-color-2">
           <Skeleton className="h-6 w-32" />
           <Skeleton className="h-5 w-full" />
           <Skeleton className="h-5 w-2/3" />

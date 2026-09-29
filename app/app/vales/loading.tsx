@@ -14,9 +14,9 @@ export default function ValesLoading() {
         <Skeleton className="h-4 w-80" />
       </div>
       <div role="status" className="flex flex-col gap-4">
-        <span className="text-sm text-slate-500 dark:text-slate-400">Cargando…</span>
+        <span className="text-sm text-text-secondary">Cargando…</span>
         <Skeleton className="h-10 w-full max-w-sm" />
-        <div className="flex flex-col gap-2 rounded-lg border border-slate-300 p-4 dark:border-slate-700">
+        <div className="flex flex-col gap-2 rounded-lg border border-border-color p-4 dark:border-border-color-2">
           <Skeleton className="h-5 w-full" />
           <Skeleton className="h-5 w-full" />
           <Skeleton className="h-5 w-1/2" />

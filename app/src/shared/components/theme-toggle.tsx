@@ -34,7 +34,7 @@ export function ThemeToggle() {
 
   return (
     <div
-      className="inline-flex items-center gap-1 rounded-lg border border-slate-300 p-1 dark:border-slate-700"
+      className="inline-flex items-center gap-1 rounded-lg border border-border-color p-1 dark:border-border-color-2"
       role="group"
       aria-label="Tema de la aplicación"
     >
@@ -48,9 +48,16 @@ export function ThemeToggle() {
             writeThemeCookie(option.value);
           }}
           className={
+            // El segmento elegido se pinta como superficie SELECCIONADA
+            // (`bg-surface-selected`) y el resto como texto secundario. El
+            // segmento elegido NO puede usar `bg-surface-hover`: ese peldaño
+            // (L 0.96 en claro) queda a 0.020 de la página (L 0.98) y el estado
+            // activo se vuelve indistinguible. `bg-surface-selected` mantiene el
+            // paso en 0.050 en claro y 0.050 en oscuro. Ambos tokens se
+            // invierten solos en `.dark`, así que no llevan `dark:`.
             current === option.value
-              ? "rounded-md bg-slate-200 px-3 py-1 text-sm text-slate-900 dark:bg-slate-800 dark:text-slate-100"
-              : "rounded-md px-3 py-1 text-sm text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+              ? "rounded-md bg-surface-selected px-3 py-1 text-sm text-text-primary"
+              : "rounded-md px-3 py-1 text-sm text-text-secondary hover:bg-surface-hover"
           }
         >
           {option.label}

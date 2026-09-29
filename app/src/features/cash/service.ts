@@ -4,26 +4,34 @@ import {
   assertNoOpenShift,
   assertShiftCloser,
   buildMethodViews,
+  buildRecountRecord,
   closeShiftSchema,
   computeCashClose,
   dayBounds,
   dayViewSchema,
   expectedDigitalTotal,
+  governingClose,
   HISTORY_PAGE_SIZE,
   historySchema,
   openShiftSchema,
   rangeBounds,
+  recountShiftSchema,
   registerPaymentSchema,
   resolveClosingBase,
   resolveOpeningBase,
   roundMoney,
   moneyEquals,
+  sumMethodMaps,
+  sumMethodTotal,
+  voucherOutByMethod,
+  type CloseAmounts,
   type CloseShiftInput,
   type DayTotals,
   type MethodDifference,
   type OpenShiftInput,
   type RegisterPaymentInput,
   type ShiftCountInput,
+  type VoucherCashOutInput,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
@@ -32,7 +40,14 @@ import {
   listPaymentMethods,
   AdminError,
 } from "@/src/features/admin/service";
-import { BillingError, getInvoiceDetail } from "@/src/features/billing/service";
+import {
+  BillingError,
+  getInvoiceDetail,
+  invoiceNetBalance,
+  splitGrossCardFee,
+  type InvoiceNetBalance,
+} from "@/src/features/billing/service";
+import { randomUUID } from "node:crypto";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { getShiftReviews } from "@/src/features/alerts/service";
 import { assembleShiftRevision, type ShiftRevision } from "@/src/features/alerts/schemas";
@@ -180,7 +195,7 @@ export interface CashActor {
 export interface ShiftCountRow {
   id: string;
   shift_id: string;
-  phase: "apertura" | "cierre";
+  phase: "apertura" | "cierre" | "reconteo";
   method_code: string;
   denomination: number | null;
   quantity: number;
@@ -297,14 +312,28 @@ export async function checkCounts(
 }
 
 /**
- * Totales por método de los conteos de varios turnos, separados por fase.
- * Base del esperado digital acumulativo (apertura + cobrado).
+ * Totales por método de los conteos de varios turnos, separados por fase
+ * (apertura, cierre y reconteo U3). Base del esperado digital acumulativo
+ * (apertura + cobrado) y de la versión que gobierna un turno recontado.
+ *
+ * OJO: el reconteo se agrupa APARTE del cierre a propósito. Antes toda fase
+ * distinta de `apertura` caía en `closed`; con `reconteo` en esa bolsa, las
+ * líneas del reconteo se sumarían al cierre firmado y el arqueo contaría el
+ * dinero dos veces.
  */
 async function fetchCountTotals(
   db: DbClient,
   shiftIds: string[],
-): Promise<Map<string, { open: Map<string, number>; closed: Map<string, number> }>> {
-  const result = new Map<string, { open: Map<string, number>; closed: Map<string, number> }>();
+): Promise<
+  Map<
+    string,
+    { open: Map<string, number>; closed: Map<string, number>; recount: Map<string, number> }
+  >
+> {
+  const result = new Map<
+    string,
+    { open: Map<string, number>; closed: Map<string, number>; recount: Map<string, number> }
+  >();
   if (shiftIds.length === 0) return result;
   const { data, error } = await db
     .from("cash_shift_counts")
@@ -317,8 +346,17 @@ async function fetchCountTotals(
     method_code: string;
     amount: number | string;
   }>) {
-    const entry = result.get(row.shift_id) ?? { open: new Map(), closed: new Map() };
-    const target = row.phase === "apertura" ? entry.open : entry.closed;
+    const entry = result.get(row.shift_id) ?? {
+      open: new Map<string, number>(),
+      closed: new Map<string, number>(),
+      recount: new Map<string, number>(),
+    };
+    const target =
+      row.phase === "apertura"
+        ? entry.open
+        : row.phase === "reconteo"
+          ? entry.recount
+          : entry.closed;
     target.set(row.method_code, roundMoney((target.get(row.method_code) ?? 0) + Number(row.amount)));
     result.set(row.shift_id, entry);
   }
@@ -352,10 +390,203 @@ async function fetchPayoutTotals(
   return result;
 }
 
+// 028 (method_code/cash_shift_id en voucher_requests) puede no estar aplicada
+// en esta base: la primera consulta decide y se cachea. Sin las columnas
+// simplemente no hay salidas por vale (el arqueo no se rompe). Un error
+// distinto (red/permisos) no se cachea: la consulta real lo reporta.
+let voucherOutColumns: boolean | null = null;
+
+async function hasVoucherOutColumns(db: DbClient): Promise<boolean> {
+  if (voucherOutColumns === null) {
+    const probe = await db.from("voucher_requests").select("method_code, cash_shift_id").limit(1);
+    if (!probe.error) {
+      voucherOutColumns = true;
+    } else {
+      const message = String((probe.error as { message?: string }).message ?? "");
+      if (/method_code|cash_shift_id/i.test(message)) voucherOutColumns = false;
+    }
+  }
+  return voucherOutColumns !== false;
+}
+
+/**
+ * Salidas de caja por vales aprobados, por turno y método (descuentan del
+ * esperado igual que los pagos inmediatos de comisión). Solo cuentan los
+ * vales aprobados: un vale pendiente/rechazado NO toca caja (regla "no toca
+ * caja hasta aprobar"). Si la migración 028 no está aplicada no hay salidas.
+ */
+async function fetchVoucherOutTotals(
+  db: DbClient,
+  shiftIds: string[],
+): Promise<Map<string, Map<string, number>>> {
+  const result = new Map<string, Map<string, number>>();
+  if (shiftIds.length === 0) return result;
+  if (!(await hasVoucherOutColumns(db))) return result;
+  const { data, error } = await db
+    .from("voucher_requests")
+    .select("cash_shift_id, approved_by, method_code, amount")
+    .in("cash_shift_id", shiftIds);
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  const byShift = new Map<string, VoucherCashOutInput[]>();
+  for (const row of (data ?? []) as Array<{
+    cash_shift_id: string;
+    approved_by: string | null;
+    method_code: string | null;
+    amount: number | string;
+  }>) {
+    const list = byShift.get(row.cash_shift_id) ?? [];
+    list.push({ approved_by: row.approved_by, method_code: row.method_code, amount: row.amount });
+    byShift.set(row.cash_shift_id, list);
+  }
+  for (const [shiftId, rows] of byShift) {
+    const out = voucherOutByMethod(rows);
+    if (out.size > 0) result.set(shiftId, out);
+  }
+  return result;
+}
+
+/**
+ * Salidas en efectivo ya acumuladas en un turno (vales aprobados + comisiones
+ * pagadas inmediatas en efectivo). Es la base del tope del 50% de la base de
+ * apertura que vales y comisiones validan antes de pagar en efectivo.
+ * Reutiliza exactamente la misma lógica del arqueo (fetchVoucherOutTotals +
+ * fetchPayoutTotals), de modo que el tope y el cierre nunca divergen.
+ */
+export async function cashOutUsedInShift(shiftId: string): Promise<number> {
+  const db = await cashDb();
+  const [voucherOutMaps, payoutMaps] = await Promise.all([
+    fetchVoucherOutTotals(db, [shiftId]),
+    fetchPayoutTotals(db, [shiftId]),
+  ]);
+  const voucherOut = voucherOutMaps.get(shiftId) ?? new Map<string, number>();
+  const payoutOut = payoutMaps.get(shiftId) ?? new Map<string, number>();
+  return roundMoney((voucherOut.get("efectivo") ?? 0) + (payoutOut.get("efectivo") ?? 0));
+}
+
+/** Fila mínima del ledger de dinero del turno (`payments` / `invoice_payments`). */
+export interface ShiftMoneyRow {
+  amount: number | string;
+  method_code: string;
+}
+
+/**
+ * T0-a (C1): une los DOS ledgers del turno SIN solapar. Los movimientos de
+ * cajón llegan filtrados a `invoice_id IS NULL` en la consulta (un pago con
+ * factura ya vive en `invoice_payments`, el ledger del cobro de factura: su
+ * fila espejo en `payments` duplicaba el efectivo del arqueo). Puro para
+ * probarlo sin base de datos.
+ */
+export function mergeShiftMoney(
+  drawerRows: ShiftMoneyRow[] | null | undefined,
+  invoiceRows: ShiftMoneyRow[] | null | undefined,
+): Array<{ amount: number; method_code: string }> {
+  const merged: Array<{ amount: number; method_code: string }> = [];
+  for (const row of drawerRows ?? []) {
+    merged.push({ amount: Number(row.amount), method_code: row.method_code });
+  }
+  for (const row of invoiceRows ?? []) {
+    merged.push({ amount: Number(row.amount), method_code: row.method_code });
+  }
+  return merged;
+}
+
+/** Suma del ledger del turno por método (base del arqueo). Puro. */
+export function sumShiftMoneyByMethod(rows: ShiftMoneyRow[]): Map<string, number> {
+  const byMethod = new Map<string, number>();
+  for (const row of rows) {
+    byMethod.set(
+      row.method_code,
+      roundMoney((byMethod.get(row.method_code) ?? 0) + Number(row.amount)),
+    );
+  }
+  return byMethod;
+}
+
+/**
+ * Cobros de factura del turno: total cobrado y número de FACTURAS distintas
+ * (una factura puede tener varias porciones: cuentan como una). Puro, para
+ * probar sin base de datos la parte pura del cierre (`invoicesTotal` /
+ * `invoicesCount`).
+ */
+export function invoiceCollectionsSummary(
+  rows: Array<{ invoice_id: string; amount: number | string }>,
+): { total: number; count: number } {
+  return {
+    total: roundMoney(rows.reduce((acc, row) => acc + Number(row.amount), 0)),
+    count: new Set(rows.map((row) => row.invoice_id)).size,
+  };
+}
+
+/**
+ * Cobros de factura por turno y método (lo que entra a caja por facturas).
+ * Cada pago pertenece al turno ABIERTO al momento del cobro
+ * (invoice_payments.cash_shift_id); los que quedaron sin turno se atribuyen
+ * al turno de emisión de su factura. Sin N+1: 3 queries acotadas.
+ *
+ * T0-a (C1): la rama sin turno (`cash_shift_id IS NULL`) sigue viva a
+ * propósito y es SEGURA: solo lee filas con `cash_shift_id` NULL, mientras la
+ * consulta directa lee las de `cash_shift_id` no nulo, así que no puede solapar
+ * consigo misma; y las filas de `invoice_payments` que lee están atadas a una
+ * factura (`invoice_id NOT NULL`), mientras los lectores de `payments` suman
+ * solo `invoice_id IS NULL`. La migración 031 materializa esta atribución en
+ * `cash_shift_id` (idempotente, sin borrar filas); la rama queda como red de
+ * seguridad para la ventana en que conviven código/migración y para las filas
+ * que la migración no pudo atribuir (factura sin turno).
+ */
+async function fetchInvoicePaymentsByShift(
+  db: DbClient,
+  shiftIds: string[],
+): Promise<Map<string, Array<{ invoice_id: string; method_code: string; amount: number }>>> {
+  const result = new Map<string, Array<{ invoice_id: string; method_code: string; amount: number }>>();
+  if (shiftIds.length === 0) return result;
+  const push = (shiftId: string, row: { invoice_id: string; method_code: string; amount: number | string }) => {
+    const list = result.get(shiftId) ?? [];
+    list.push({ invoice_id: row.invoice_id, method_code: row.method_code, amount: Number(row.amount) });
+    result.set(shiftId, list);
+  };
+  const { data: direct, error: directError } = await db
+    .from("invoice_payments")
+    .select("invoice_id, cash_shift_id, method_code, amount")
+    .in("cash_shift_id", shiftIds);
+  if (directError) throw new CashError("INTERNAL", "Error interno.", 500);
+  for (const row of (direct ?? []) as Array<{
+    invoice_id: string;
+    cash_shift_id: string;
+    method_code: string;
+    amount: number | string;
+  }>) {
+    push(row.cash_shift_id, row);
+  }
+  const { data: invoices, error: invoicesError } = await db
+    .from("invoices")
+    .select("id, cash_shift_id")
+    .in("cash_shift_id", shiftIds);
+  if (invoicesError) throw new CashError("INTERNAL", "Error interno.", 500);
+  const shiftByInvoice = new Map(
+    ((invoices ?? []) as Array<{ id: string; cash_shift_id: string }>).map((row) => [row.id, row.cash_shift_id]),
+  );
+  if (shiftByInvoice.size === 0) return result;
+  // C1: filas históricas sin turno atribuidas al turno de emisión de su
+  // factura. Conjunto disjunto del directo (`cash_shift_id` no nulo) y de la
+  // suma de `payments` (los lectores de `payments` excluyen `invoice_id`),
+  // por lo que este dinero se cuenta exactamente una vez.
+  const { data: nullShiftRows, error: legacyError } = await db
+    .from("invoice_payments")
+    .select("invoice_id, method_code, amount")
+    .in("invoice_id", [...shiftByInvoice.keys()])
+    .is("cash_shift_id", null);
+  if (legacyError) throw new CashError("INTERNAL", "Error interno.", 500);
+  for (const row of (nullShiftRows ?? []) as Array<{ invoice_id: string; method_code: string; amount: number | string }>) {
+    const shiftId = shiftByInvoice.get(row.invoice_id);
+    if (shiftId) push(shiftId, row);
+  }
+  return result;
+}
+
 async function insertCounts(
   db: DbClient,
   shiftId: string,
-  phase: "apertura" | "cierre",
+  phase: "apertura" | "cierre" | "reconteo",
   counts: ShiftCountInput[],
 ): Promise<void> {  const rows = counts.map((line) => ({
     shift_id: shiftId,
@@ -367,6 +598,98 @@ async function insertCounts(
   }));
   const { error } = await db.from("cash_shift_counts").insert(rows);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+}
+
+/**
+ * U3: un reconteo tal como vive en `cash_shift_recounts`. Guarda las DOS
+ * versiones: `previous_*` (el cierre firmado que se conserva) y los cuatro
+ * montos corregidos, más quién, cuándo y por qué.
+ */
+export interface ShiftRecountRow {
+  id: string;
+  shift_id: string;
+  previous_counted_cash: number;
+  previous_base_left: number;
+  previous_cash_withdrawn: number;
+  previous_base_difference: number;
+  counted_cash: number;
+  base_left: number;
+  cash_withdrawn: number;
+  base_difference: number;
+  reason: string;
+  recounted_by: string;
+  recounted_at: string;
+}
+
+/** Proyección de un reconteo para las vistas (nombre en vez de uuid). */
+export interface ShiftRecountView {
+  counted_cash: number;
+  base_left: number;
+  cash_withdrawn: number;
+  base_difference: number;
+  /** El cierre firmado original, tal como quedó en `cash_shifts`. */
+  previous: CloseAmounts;
+  reason: string;
+  /** Nombre de quien recontó (null si el usuario ya no existe). */
+  recounted_by: string | null;
+  recounted_at: string;
+}
+
+const RECOUNT_SELECT =
+  "id, shift_id, previous_counted_cash, previous_base_left, previous_cash_withdrawn, previous_base_difference, counted_cash, base_left, cash_withdrawn, base_difference, reason, recounted_by, recounted_at";
+
+/** Reconteos de los turnos pedidos, uno por turno (a lo sumo existe uno). */
+async function fetchRecounts(
+  db: DbClient,
+  shiftIds: string[],
+): Promise<Map<string, ShiftRecountRow>> {
+  const result = new Map<string, ShiftRecountRow>();
+  if (shiftIds.length === 0) return result;
+  const { data, error } = await db
+    .from("cash_shift_recounts")
+    .select(RECOUNT_SELECT)
+    .in("shift_id", shiftIds);
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  for (const row of (data ?? []) as ShiftRecountRow[]) {
+    result.set(row.shift_id, row);
+  }
+  return result;
+}
+
+/** Los cuatro montos corregidos de un reconteo, listos como `CloseAmounts`. */
+function recountAmounts(row: ShiftRecountRow): CloseAmounts {
+  return {
+    counted_cash: roundMoney(Number(row.counted_cash)),
+    base_left: roundMoney(Number(row.base_left)),
+    cash_withdrawn: roundMoney(Number(row.cash_withdrawn)),
+    base_difference: roundMoney(Number(row.base_difference)),
+  };
+}
+
+/** Proyección del reconteo con las DOS versiones y quién/cuándo/por qué. */
+function recountView(row: ShiftRecountRow, actorName: string | null): ShiftRecountView {
+  return {
+    ...recountAmounts(row),
+    previous: {
+      counted_cash: roundMoney(Number(row.previous_counted_cash)),
+      base_left: roundMoney(Number(row.previous_base_left)),
+      cash_withdrawn: roundMoney(Number(row.previous_cash_withdrawn)),
+      base_difference: roundMoney(Number(row.previous_base_difference)),
+    },
+    reason: row.reason,
+    recounted_by: actorName,
+    recounted_at: row.recounted_at,
+  };
+}
+
+/** Montos firmados de un turno (los de `cash_shifts`, sin reconteo). */
+function signedAmounts(shift: CashShiftRow): CloseAmounts {
+  return {
+    counted_cash: roundMoney(Number(shift.counted_cash ?? 0)),
+    base_left: roundMoney(Number(shift.base_left ?? 0)),
+    cash_withdrawn: roundMoney(Number(shift.cash_withdrawn ?? 0)),
+    base_difference: roundMoney(Number(shift.base_difference ?? 0)),
+  };
 }
 
 /** Totales del último cierre (por método) para validar la apertura. */
@@ -385,17 +708,27 @@ async function previousCloseTotals(
     .maybeSingle();
   if (lastError) throw new CashError("INTERNAL", "Error interno.", 500);
   if (!last) return null;
+  // U3: si el último cierre fue recontado, la base que hereda el próximo turno
+  // y los totales digitales contra los que se compara la apertura son los
+  // CORREGIDOS; el cierre firmado sigue intacto en `cash_shifts` pero no
+  // gobierna la cadena.
+  const recountMap = await fetchRecounts(db, [(last as { id: string }).id]);
+  const recountRow = recountMap.get((last as { id: string }).id) ?? null;
   const { data: counts, error: countsError } = await db
     .from("cash_shift_counts")
     .select("method_code, amount")
     .eq("shift_id", (last as { id: string }).id)
-    .eq("phase", "cierre");
+    .eq("phase", recountRow ? "reconteo" : "cierre");
   if (countsError) throw new CashError("INTERNAL", "Error interno.", 500);
   const byMethod = new Map<string, number>();
   for (const row of ((counts ?? []) as Array<{ method_code: string; amount: number | string }>)) {
     byMethod.set(row.method_code, roundMoney((byMethod.get(row.method_code) ?? 0) + Number(row.amount)));
   }
-  return { baseLeft: (last as { base_left: number | null }).base_left, byMethod, hasCounts: byMethod.size > 0 };
+  return {
+    baseLeft: recountRow ? Number(recountRow.base_left) : (last as { base_left: number | null }).base_left,
+    byMethod,
+    hasCounts: byMethod.size > 0,
+  };
 }
 
 // --------------------------------------------------------------- registros ---
@@ -474,21 +807,20 @@ export async function getOpenShift(sedeId: string): Promise<CashShiftRow | null>
 
 /** Turno abierto con nombre del que lo abrió (para validaciones de facturación). */
 export async function getOpenShiftWithOpener(sedeId: string): Promise<(CashShiftRow & { opener_name: string | null }) | null> {
+  // Dos queries simples a propósito: cash_shifts tiene DOS FK a users
+  // (opened_by y closed_by) y PostgREST no desambigua `users!inner`.
+  const shift = await getOpenShift(sedeId);
+  if (!shift) return null;
   const db = await cashDb();
-  const { data, error } = await db
-    .from("cash_shifts")
-    .select(`${SHIFT_SELECT}, users!inner(full_name)`)
-    .eq("sede_id", sedeId)
-    .eq("status", "abierto")
-    .order("opened_at", { ascending: false })
-    .limit(1)
+  const { data: user, error } = await db
+    .from("users")
+    .select("full_name")
+    .eq("id", shift.opened_by)
     .maybeSingle();
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  if (!data) return null;
-  const user = Array.isArray(data.users) ? data.users[0] : data.users;
   return {
-    ...(data as CashShiftRow),
-    opener_name: user?.full_name ?? null,
+    ...shift,
+    opener_name: (user as { full_name?: string | null } | null)?.full_name ?? null,
   };
 }
 
@@ -545,18 +877,11 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     if (openError) throw new CashError("INTERNAL", "Error interno.", 500);
     assertNoOpenShift((open ?? []).length > 0);
 
-    const { data: last, error: lastError } = await db
-      .from("cash_shifts")
-      .select("base_left")
-      .eq("cash_register_id", register.id)
-      .eq("status", "cerrado")
-      .order("closed_at", { ascending: false })
-      .order("opened_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (lastError) throw new CashError("INTERNAL", "Error interno.", 500);
-    const lastBaseLeft = (last as { base_left: number | null } | null)?.base_left ?? null;
-    const openingBase = resolveOpeningBase(lastBaseLeft, Number(register.base_configurada));
+    // U3: la base que hereda el turno sale de `previousCloseTotals`, que ya
+    // prefiere el reconteo cuando el último cierre fue corregido. Una sola
+    // lectura del último cierre para la cadena y para el chequeo digital.
+    const prev = await previousCloseTotals(db, register.id);
+    const openingBase = resolveOpeningBase(prev?.baseLeft ?? null, Number(register.base_configurada));
 
     // Pre-open count never blocks the operation: cash must match the base
     // the shift opens with (base_left from the last close, or
@@ -565,7 +890,6 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     // administrators (except on the very first open) while the shift opens
     // anyway so the business never stops.
     const declared = await checkCounts(actor.sedeId, input.counts);
-    const prev = await previousCloseTotals(db, register.id);
     const isFirstOpen = prev === null;
     const mismatches: Array<{ method_code: string; expected: number; declared: number }> = [];
     const cashDeclared = declared.get("efectivo") ?? 0;
@@ -640,11 +964,15 @@ export interface PaymentResult {
  * único abierto de la sede). Método activo, monto > 0; si trae
  * invoice_id, la factura debe existir en la sede y no estar Anulada.
  *
- * Consolidación T5 (dual-write): el pago vive en payments (por turno,
- * PRD §9.1) Y se refleja en invoice_payments, así el saldo de la factura
- * (paid/remaining de T5) sigue cuadrando. Si las porciones completan el
- * total, la factura pasa a Pagada y se vincula al turno (cash_shift_id).
- * Solo admin/caja (vía requireCashWriter en rutas/actions).
+ * Consolidación T5/T0-a: el cobro de factura vive en `invoice_payments` (el
+ * ledger del cobro, con `cash_shift_id` = turno que COBRA) y se refleja en
+ * `payments` (por turno, PRD §9.1, con `user_id`: el único rastro de quién
+ * cobró). El espejo se escribe PRIMERO y la fila de cajón después, para que
+ * ninguna falla pueda dejar un `payments` con `invoice_id` sin espejo: los
+ * tres lectores del arqueo filtran `invoice_id IS NULL`, así que ese huérfano
+ * sería dinero invisible (Defecto 2). Si las porciones completan el total, la
+ * factura pasa a Pagada y se vincula al turno (`cash_shift_id`). Solo
+ * admin/caja (vía requireCashWriter en rutas/actions).
  */
 export async function registerPayment(raw: unknown, actor: CashActor): Promise<PaymentResult> {
   const parsed = registerPaymentSchema.safeParse(raw);
@@ -683,9 +1011,22 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
     }
 
     let invoiceStatus: string | null = null;
-    let invoicePaid = 0;
-    let invoiceTotal = 0;
     let invoiceShiftId: string | null = null;
+    let invoiceBalance: InvoiceNetBalance | null = null;
+
+    // T0-a (Defecto 1): el monto de entrada es el BRUTO que el cliente entrega
+    // (019: la porción guarda bruto y el arqueo suma bruto; el contrato de
+    // `POST /api/v1/cash/payments` no cambia), así que el recargo se DERIVA de
+    // él con el `fee_percent` del método cobrado (`payment_methods.fee_percent`:
+    // el mismo snapshot que escribe billing al emitir). El bruto se redondea
+    // UNA vez: la aritmética del servicio y las dos filas escritas
+    // (`invoice_payments.amount` y `payments.amount`, numeric(12,2)) coinciden
+    // al centavo, así el tope de 031 ve exactamente el neto que calculó el
+    // servicio.
+    const gross = roundMoney(input.amount);
+    const feePercent = Math.max(0, Number(method.fee_percent) || 0);
+    const cardFee = splitGrossCardFee(gross, feePercent);
+
     if (input.invoice_id) {
       const detail = await getInvoiceDetail(actor.sedeId, input.invoice_id).catch((error) => {
         throw toCashError(error);
@@ -694,13 +1035,105 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
         throw new CashError("ANNUL_INVALID", "No se puede cobrar una factura anulada.", 409);
       }
       invoiceStatus = detail.invoice.status;
-      invoicePaid = detail.paid;
-      invoiceTotal = Number(detail.invoice.total);
       invoiceShiftId = detail.invoice.cash_shift_id;
-      const incoming = roundMoney(invoicePaid + input.amount);
-      if (incoming - invoiceTotal > 0.009) {
+      // T0-a (Defecto 2): el saldo cobrable es NETO (total − surcharge, 019) y
+      // la porción entra en neto (bruto − recargo). El bruto de un cobro con
+      // tarjeta supera `invoices.total` cuando el recargo es de un cobro
+      // POSTERIOR a la emisión: comparar el bruto contra el total rechazaba
+      // como "sobrepago" un cobro legítimo. Mismo tope y tolerancia que el
+      // trigger de 031 (0.009), que es la barrera real ante carreras.
+      invoiceBalance = invoiceNetBalance({
+        total: detail.invoice.total,
+        surcharge: detail.invoice.surcharge,
+        payments: detail.payments,
+      });
+      if (invoiceBalance.netCollected + cardFee.net - invoiceBalance.netBilled > 0.009) {
         throw new CashError("OVERPAID", "El pago supera el saldo pendiente de la factura.", 422);
       }
+    }
+
+    // T0-a (Defecto 2): el espejo de factura va PRIMERO. `invoice_payments`
+    // es el ledger del cobro de factura y el arqueo lo lee por
+    // `cash_shift_id` (el turno que COBRA: sin ese turno el cobro se sumaba
+    // dos veces, C1). El ORDEN importa: la fila de cajón (`payments`, con
+    // `invoice_id`) se escribe SOLO cuando el espejo ya existe, así ninguna
+    // falla puede dejar un `payments` con `invoice_id` que el arqueo ignora
+    // (los tres lectores filtran `invoice_id IS NULL`): el dinero nunca queda
+    // invisible. Si el espejo falla, no hay nada que revertir.
+    //
+    // T0-a (Defecto 1): el espejo lleva el recargo de la porción
+    // (`fee_percent` + `fee_amount`) para que `amount − fee_amount` sea el neto
+    // cobrado, que es lo que suman el tope de 031, el saldo de la factura y el
+    // reporte del recargo. Sin él, `fee_amount` tomaba su DEFAULT 0 y el
+    // recargo de la caja era irrecuperable.
+    let mirrorId: string | null = null;
+    if (input.invoice_id) {
+      // El id se genera acá: la columna es `uuid PRIMARY KEY DEFAULT
+      // gen_random_uuid()` (005_billing.sql). Tenerlo ANTES del INSERT hace que
+      // toda compensación sea EXACTA por id — nunca por (factura, turno,
+      // método, monto), que podría borrar también un cobro legítimo anterior
+      // idéntico.
+      const mirrorIdCandidate = randomUUID();
+      const { data: mirror, error: mirrorError } = await db
+        .from("invoice_payments")
+        .insert({
+          id: mirrorIdCandidate,
+          invoice_id: input.invoice_id,
+          method_id: method.id,
+          method_code: method.code,
+          amount: gross,
+          fee_percent: feePercent,
+          fee_amount: cardFee.fee,
+          cash_shift_id: shift.id,
+        })
+        .select("id")
+        .single();
+      if (mirrorError) {
+        // Carrera perdida contra trg_invoice_payments_cap (031): el mismo
+        // código P0001 que traduce nómina en payroll/service.ts.
+        if ((mirrorError as { code?: string }).code === "P0001") {
+          throw new CashError("OVERPAID", "El pago supera el saldo pendiente de la factura.", 422);
+        }
+        throw new CashError("INTERNAL", "Error interno.", 500);
+      }
+      if (!mirror) {
+        // Defecto 3: esta rama no puede quedar muda ni sin compensar.
+        // PostgREST no debería responder sin error y sin fila; si pasa, la
+        // compensación es exacta (el DELETE solo puede tocar la fila que
+        // acabamos de intentar insertar; 0 filas si nunca llegó a existir) y
+        // se grita. Si la compensación también falla no se sabe qué quedó
+        // escrito: mismo desenlace que la reversa de la fila de cajón.
+        const { error: unconfirmedError } = await db
+          .from("invoice_payments")
+          .delete()
+          .eq("id", mirrorIdCandidate);
+        console.error(
+          "PG invoice_payments insert sin fila:",
+          JSON.stringify({
+            invoice_id: input.invoice_id,
+            shift_id: shift.id,
+            method_code: method.code,
+            amount: gross,
+            fee_percent: feePercent,
+            fee_amount: cardFee.fee,
+            mirror_id: mirrorIdCandidate,
+            compensation_error: unconfirmedError,
+          }),
+        );
+        if (unconfirmedError) {
+          throw new CashError(
+            "PAYMENT_ROLLBACK_FAILED",
+            "El cobro quedó registrado en la factura y en el arqueo, pero no en el libro de caja del turno. No reintente: avise al administrador.",
+            500,
+          );
+        }
+        throw new CashError(
+          "MIRROR_UNCONFIRMED",
+          "No se pudo confirmar el registro del cobro en la factura; no quedó nada escrito. Reintente.",
+          500,
+        );
+      }
+      mirrorId = mirrorIdCandidate;
     }
 
     const { data: payment, error: paymentError } = await db
@@ -711,30 +1144,54 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
         invoice_id: input.invoice_id ?? null,
         method_id: method.id,
         method_code: method.code,
-        amount: input.amount,
+        amount: gross,
         user_id: actor.userId,
       })
       .select(PAYMENT_SELECT)
       .single();
-    if (paymentError || !payment) throw new CashError("INTERNAL", "Error interno.", 500);
-
-    // Dual-write T5: refleja la porción en invoice_payments (o limpia el
-    // pago por turno si falla, best-effort).
-    if (input.invoice_id) {
-      const { error: mirrorError } = await db.from("invoice_payments").insert({
-        invoice_id: input.invoice_id,
-        method_id: method.id,
-        method_code: method.code,
-        amount: input.amount,
-      });
-      if (mirrorError) {
-        await db.from("payments").delete().eq("id", (payment as CashPaymentRow).id);
-        throw new CashError("INTERNAL", "Error interno.", 500);
+    if (paymentError || !payment) {
+      // Reversa VERIFICADA del espejo: el error del DELETE no se traga. Si el
+      // DELETE falla, la fila de cajón tampoco existe, así que el cobro queda
+      // SOLO en `invoice_payments` (visible para el arqueo) y la falla se
+      // grita en vez de dejar un huérfano invisible.
+      if (mirrorId) {
+        const { error: rollbackError } = await db
+          .from("invoice_payments")
+          .delete()
+          .eq("id", mirrorId);
+        if (rollbackError) {
+          console.error(
+            "PG invoice_payments rollback:",
+            JSON.stringify({
+              invoice_id: input.invoice_id,
+              shift_id: shift.id,
+              amount: gross,
+              method_code: method.code,
+              mirror_id: mirrorId,
+              rollback_error: rollbackError,
+            }),
+          );
+          throw new CashError(
+            "PAYMENT_ROLLBACK_FAILED",
+            "El cobro quedó registrado en la factura y en el arqueo, pero no en el libro de caja del turno. No reintente: avise al administrador.",
+            500,
+          );
+        }
       }
-      const paid = roundMoney(invoicePaid + input.amount);
+      throw new CashError("INTERNAL", "Error interno.", 500);
+    }
+
+    if (input.invoice_id && invoiceBalance) {
       const updates: Record<string, unknown> = {};
       if (!invoiceShiftId) updates.cash_shift_id = shift.id;
-      if (invoiceStatus === "Emitida" && moneyEquals(paid, invoiceTotal)) {
+      // La factura queda Pagada cuando el NETO cobrado cubre el neto
+      // facturado: con el recargo de un cobro posterior a la emisión el bruto
+      // supera `total`, así que comparar el bruto contra total dejaba en
+      // Emitida una factura con el neto ya completo.
+      if (
+        invoiceStatus === "Emitida" &&
+        moneyEquals(roundMoney(invoiceBalance.netCollected + cardFee.net), invoiceBalance.netBilled)
+      ) {
         updates.status = "Pagada";
         invoiceStatus = "Pagada";
       }
@@ -766,10 +1223,21 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
  * justificación (arqueo escondido). expected_cash = efectivo cobrado en el
  * turno; calcula recogido (= contado − base) y diferencia
  * (= base − base configurada).
+ *
+ * Los vales APROBADOS del turno (por su method_code) son salidas de caja y
+ * descuentan del esperado por método, igual que los pagos inmediatos de
+ * comisión; un vale pendiente o rechazado no toca caja.
+ *
+ * LIMITACIÓN CONOCIDA: si la caja ya le entregó el efectivo al empleado y el
+ * administrador rechaza el vale después, ese dinero salió del cajón pero el
+ * sistema no lo registra (rechazar no toca caja): el cierre puede mostrar un
+ * faltante no explicado por el sistema. Trade-off aceptado.
  */
 export interface CloseShiftResult {
   shift: CashShiftRow;
   methodDifferences: MethodDifference[];
+  /** Total de vales aprobados del turno (salida de caja, valor absoluto). */
+  vales: number;
 }
 
 export async function closeShift(
@@ -808,15 +1276,20 @@ export async function closeShift(
     // Automatic next base (hidden count): never asked, never justified.
     const baseLeft = resolveClosingBase(input.counted_cash, Number(register.base_configurada));
 
+    // T0-a (C1): el arqueo suma los DOS ledgers del turno SIN solapar:
+    // movimientos de cajón SIN factura (`invoice_id IS NULL`) más los cobros
+    // de factura del turno. Un pago con factura ya vive en `invoice_payments`
+    // (ledger del cobro de factura): sumarlo también desde `payments`
+    // duplicaba el efectivo del turno.
     const { data: shiftPayments, error: paymentsError } = await db
       .from("payments")
       .select("amount, method_code")
-      .eq("cash_shift_id", shift.id);
+      .eq("cash_shift_id", shift.id)
+      .is("invoice_id", null);
     if (paymentsError) throw new CashError("INTERNAL", "Error interno.", 500);
-    const paidByMethod = new Map<string, number>();
-    for (const row of ((shiftPayments ?? []) as Array<{ amount: number | string; method_code: string }>)) {
-      paidByMethod.set(row.method_code, roundMoney((paidByMethod.get(row.method_code) ?? 0) + Number(row.amount)));
-    }
+    const invoicePayMaps = await fetchInvoicePaymentsByShift(db, [shift.id]);
+    const invoicePays = invoicePayMaps.get(shift.id) ?? [];
+    const paidByMethod = sumShiftMoneyByMethod(mergeShiftMoney(shiftPayments, invoicePays));
     // Pagos inmediatos de comisión del turno (descuentan del esperado
     // por método: lo cobrado menos lo pagado).
     const { data: payoutRows, error: payoutError } = await db
@@ -828,35 +1301,19 @@ export async function closeShift(
     for (const row of ((payoutRows ?? []) as Array<{ method_code: string; amount: number | string }>)) {
       paidOutByMethod.set(row.method_code, roundMoney((paidOutByMethod.get(row.method_code) ?? 0) + Number(row.amount)));
     }
-    // Facturas del turno: sumar por método de pago (para arqueo y auditoría)
-    let invoicesByMethod = new Map<string, number>();
-    let invoicesTotal = 0;
-    // Deshabilitado temporalmente para debugging
-    // const { data: invoiceRows, error: invoiceError } = await db
-    //   .from("invoices")
-    //   .select("id, total, status, cash_shift_id")
-    //   .eq("cash_shift_id", shift.id);
-    // if (invoiceError) throw new CashError("INTERNAL", "Error interno.", 500);
-    // const invoiceIds = (invoiceRows ?? []).map((inv) => inv.id);
-    // let invoicesByMethod = new Map<string, number>();
-    // let invoicesTotal = 0;
-    // if (invoiceIds.length > 0) {
-    //   const { data: payRows, error: payError } = await db
-    //     .from("invoice_payments")
-    //     .select("invoice_id, method_code, amount")
-    //     .in("invoice_id", invoiceIds);
-    //   if (payError) throw new CashError("INTERNAL", "Error interno.", 500);
-    //   const invoicesById = new Map<string, number>();
-    //   for (const inv of (invoiceRows ?? []) as Array<{ id: string; total: number; status: string; cash_shift_id: string | null }>) {
-    //     if (inv.cash_shift_id !== shift.id) continue;
-    //     invoicesTotal += Number(inv.total);
-    //     invoicesById.set(inv.id, Number(inv.total));
-    //   }
-    //   for (const pay of (payRows ?? []) as Array<{ invoice_id: string; method_code: string; amount: number }>) {
-    //     if (!invoicesById.has(pay.invoice_id)) continue;
-    //     invoicesByMethod.set(pay.method_code, roundMoney((invoicesByMethod.get(pay.method_code) ?? 0) + Number(pay.amount)));
-    //   }
-    // }
+    const payoutsOut = roundMoney([...paidOutByMethod.values()].reduce((acc, value) => acc + value, 0));
+    // Vales aprobados del turno: salida de dinero por su método (RESTAN del
+    // esperado, igual que los pagos inmediatos de comisión). Un vale pendiente
+    // o rechazado no toca caja (regla "no toca caja hasta aprobar").
+    const voucherOutMaps = await fetchVoucherOutTotals(db, [shift.id]);
+    const voucherOut = voucherOutMaps.get(shift.id) ?? new Map<string, number>();
+    for (const [code, amount] of voucherOut) {
+      paidOutByMethod.set(code, roundMoney((paidOutByMethod.get(code) ?? 0) + amount));
+    }
+    const vouchersOut = sumMethodTotal(voucherOut);
+    // Facturas cobradas en este turno (emitidas aquí o en turnos anteriores):
+    // ya suman al esperado y al arqueo por método en `paidByMethod`.
+    const { total: invoicesTotal, count: invoicesCount } = invoiceCollectionsSummary(invoicePays);
 
     const expectedCash = roundMoney(
       (paidByMethod.get("efectivo") ?? 0) - (paidOutByMethod.get("efectivo") ?? 0),
@@ -908,9 +1365,33 @@ export async function closeShift(
         closed_by: actor.userId,
       })
       .eq("id", shift.id)
+      // T0-a: el cierre solo pisa un turno ABIERTO. Dos cierres simultáneos
+      // (doble clic) leerían "abierto" los dos; el segundo UPDATE afecta 0
+      // filas y así no puede reescribir un cierre ya confirmado ni duplicar
+      // los conteos de cierre.
+      .eq("status", "abierto")
       .select(SHIFT_SELECT)
       .single();
-    if (updateError || !updated) throw new CashError("INTERNAL", "Error interno.", 500);
+    if (updateError || !updated) {
+      // CHECK expected_cash >= 0 (006_cash.sql): el turno tiene más salidas
+      // en efectivo (vales/comisiones) que efectivo cobrado. Es una regla de
+      // negocio, no un fallo interno: se reporta con su código y ayuda.
+      const errorCode = (updateError as { code?: string } | null)?.code;
+      const errorMessage = (updateError as { message?: string } | null)?.message ?? "";
+      if (errorCode === "23514" && /expected_cash/i.test(errorMessage)) {
+        throw new CashError(
+          "CASH_OUT_EXCEEDS_COLLECTED",
+          "Las salidas en efectivo del turno superan el efectivo cobrado. Revise los vales y comisiones pagados en efectivo antes de cerrar.",
+          422,
+        );
+      }
+      // Carrera perdida contra el guard de estado: otro cierre ganó primero
+      // (PGRST116 = .single() sin filas, el patrón del cliente Supabase).
+      if (errorCode === "PGRST116") {
+        throw new CashError("SHIFT_ALREADY_CLOSED", "El turno ya está cerrado.", 409);
+      }
+      throw new CashError("INTERNAL", "Error interno.", 500);
+    }
     const closed = updated as CashShiftRow;
     await insertCounts(db, shift.id, "cierre", input.counts);
     await writeAudit({
@@ -927,11 +1408,12 @@ export async function closeShift(
         base_difference: close.baseDifference,
         base_incompleta: close.baseDifference < 0,
         admin_override: isOverride,
-        payouts_out: roundMoney([...paidOutByMethod.values()].reduce((acc, value) => acc + value, 0)),
+        payouts_out: payoutsOut,
+        vouchers_out: vouchersOut,
         method_differences: methodDifferences,
         observation: observation ?? null,
         invoices_total: invoicesTotal,
-        invoices_by_method: Object.fromEntries(invoicesByMethod),
+        invoices_count: invoicesCount,
       },
     });
     if (methodDifferences.length > 0) {
@@ -944,7 +1426,7 @@ export async function closeShift(
         metadata: { method_differences: methodDifferences },
       });
     }
-    return { shift: closed, methodDifferences };
+    return { shift: closed, methodDifferences, vales: vouchersOut };
   } catch (error) {
     throw toCashError(error);
   }
@@ -985,65 +1467,118 @@ export async function updateRegisterBase(
 }
 
 /**
- * CASH: edita un turno cerrado (solo admin; el gate vive en actions).
- * Recalcula el sobre y la diferencia; todo cambio queda auditado con
- * los valores anteriores. Los conteos originales no se tocan.
+ * U3: recontar un cierre (solo admin; el gate vive en actions). Un cierre
+ * firmado es INMUTABLE: `cash_shifts` nunca se pisa. La corrección exige un
+ * conteo COMPLETO nuevo (mismo detalle por denominación y totales digitales
+ * que el cierre) más un motivo; se reutiliza la maquinaria del cierre
+ * (`checkCounts`, `insertCounts`, `resolveClosingBase`, `computeCashClose`)
+ * para que no exista una aritmética paralela. El reconteo se guarda en
+ * `cash_shift_recounts` con la versión anterior congelada y la nueva, más
+ * quién y cuándo, y deja sus líneas en `cash_shift_counts` (fase `reconteo`).
+ *
+ * Un cierre se recontá UNA vez: el reconteo también queda firmado y un
+ * segundo intento se rechaza (ALREADY_RECOUNTED), no se encadena otro
+ * reconteo encima. Antes esto era `updateClosedShift`, que escribía
+ * `counted_cash`/`base_left` tecleados sin tocar los conteos por denominación
+ * y dejaba el cierre contradiciendo su propia evidencia.
  */
-export async function updateClosedShift(
+export interface RecountShiftResult {
+  /** El turno: su cierre firmado original sigue intacto. */
+  shift: CashShiftRow;
+  /** El reconteo con las dos versiones y quién/cuándo/por qué. */
+  recount: ShiftRecountRow;
+}
+
+export async function recountClosedShift(
   sedeId: string,
   id: string,
   raw: unknown,
   actor: CashActor,
-): Promise<CashShiftRow> {
-  const parsed = z.object({
-    counted_cash: z.coerce.number().nonnegative().optional(),
-    base_left: z.coerce.number().nonnegative().optional(),
-    observation: z.string().trim().max(500).nullish(),
-  }).safeParse(raw);
+): Promise<RecountShiftResult> {
+  const parsed = recountShiftSchema.safeParse(raw);
   if (!parsed.success) {
     throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const db = await cashDb();
   const shift = await getShiftOrThrow(db, sedeId, id);
   if (shift.status !== "cerrado") {
-    throw new CashError("VALIDATION", "Solo se editan turnos cerrados.", 400);
+    throw new CashError("VALIDATION", "Solo se recontán turnos cerrados.", 400);
+  }
+  const { data: existing, error: existingError } = await db
+    .from("cash_shift_recounts")
+    .select("id")
+    .eq("shift_id", shift.id)
+    .maybeSingle();
+  if (existingError) throw new CashError("INTERNAL", "Error interno.", 500);
+  if (existing) {
+    throw new CashError(
+      "ALREADY_RECOUNTED",
+      "Este cierre ya fue recontado. El reconteo también quedó firmado y no se modifica.",
+      409,
+    );
   }
   const register = await resolveRegister(db, sedeId, shift.cash_register_id);
-  const counted = parsed.data.counted_cash ?? Number(shift.counted_cash);
-  const left = parsed.data.base_left ?? Number(shift.base_left);
-  const close = computeCashClose({
-    countedCash: counted,
-    baseLeft: left,
+  // El reconteo es un conteo COMPLETO: mismas reglas que el cierre (métodos
+  // arqueables completos, efectivo por denominación). `checkCounts` devuelve el
+  // total por método; el efectivo declarado debe cuadrar con su detalle.
+  const declared = await checkCounts(sedeId, parsed.data.counts);
+  const countedFromDetail = declared.get("efectivo") ?? 0;
+  if (!moneyEquals(countedFromDetail, parsed.data.counted_cash)) {
+    throw new CashError("COUNT_MISMATCH", "El reconteo no cuadra con el detalle por denominación.", 422);
+  }
+  const record = buildRecountRecord({
+    previous: signedAmounts(shift),
+    countedCash: parsed.data.counted_cash,
     baseConfigurada: Number(register.base_configurada),
+    reason: parsed.data.reason,
   });
-  const observation = parsed.data.observation !== undefined
-    ? (parsed.data.observation?.trim() ? parsed.data.observation.trim() : null)
-    : shift.observation;
-  const { data: updated, error } = await db
-    .from("cash_shifts")
-    .update({
-      counted_cash: roundMoney(counted),
-      base_left: roundMoney(left),
-      cash_withdrawn: close.cashWithdrawn,
-      base_difference: close.baseDifference,
-      observation,
+  const { data: inserted, error } = await db
+    .from("cash_shift_recounts")
+    .insert({
+      shift_id: shift.id,
+      previous_counted_cash: record.previous.counted_cash,
+      previous_base_left: record.previous.base_left,
+      previous_cash_withdrawn: record.previous.cash_withdrawn,
+      previous_base_difference: record.previous.base_difference,
+      counted_cash: record.next.counted_cash,
+      base_left: record.next.base_left,
+      cash_withdrawn: record.next.cash_withdrawn,
+      base_difference: record.next.base_difference,
+      reason: record.reason,
+      recounted_by: actor.userId,
     })
-    .eq("id", shift.id)
-    .select(SHIFT_SELECT)
+    .select(RECOUNT_SELECT)
     .single();
-  if (error || !updated) throw new CashError("INTERNAL", "Error interno.", 500);
+  if (error || !inserted) {
+    // Carrera perdida contra el índice único por turno: otro reconteo ganó.
+    if ((error as { code?: string } | null)?.code === "23505") {
+      throw new CashError(
+        "ALREADY_RECOUNTED",
+        "Este cierre ya fue recontado. El reconteo también quedó firmado y no se modifica.",
+        409,
+      );
+    }
+    throw new CashError("INTERNAL", "Error interno.", 500);
+  }
+  const recount = inserted as ShiftRecountRow;
+  // Las líneas por denominación del reconteo viven en la MISMA tabla del
+  // arqueo, en la fase `reconteo` (033 extiende el CHECK de `phase`). Así la
+  // evidencia por denominación del reconteo es tan real como la del cierre.
+  await insertCounts(db, shift.id, "reconteo", parsed.data.counts);
   await writeAudit({
     sede_id: sedeId,
     user_id: actor.userId,
-    action: AUDIT_ACTIONS.SHIFT_EDITED,
+    action: AUDIT_ACTIONS.SHIFT_RECOUNTED,
     entity: "cash_shifts",
     entity_id: shift.id,
     metadata: {
-      previous: { counted_cash: shift.counted_cash, base_left: shift.base_left, observation: shift.observation },
-      updated: { counted_cash: roundMoney(counted), base_left: roundMoney(left), observation },
+      reason: record.reason,
+      previous: record.previous,
+      corrected: record.next,
+      recount_id: recount.id,
     },
   });
-  return updated as CashShiftRow;
+  return { shift, recount };
 }
 
 // -------------------------------------------------------- día e historial ---
@@ -1052,6 +1587,13 @@ export interface DayShiftView {
   shift: CashShiftRow;
   ventas: number;
   efectivo: number;
+  /**
+   * Total de vales aprobados del turno, en valor absoluto (es una SALIDA de
+   * caja: el dinero ya salió del cajón, por eso resta del esperado). Suma
+   * todos los métodos; 0 si no hay vales o si la migración de vales no está
+   * aplicada.
+   */
+  vales: number;
   /** Cobrado por método en el turno (todos los métodos con movimiento). */
   metodos: Array<{ method_code: string; amount: number }>;
   /** Declarado por método (cierre si está cerrado, apertura si no). */
@@ -1060,6 +1602,23 @@ export interface DayShiftView {
   diferencias: MethodDifference[];
   /** Revisión de los desajustes del turno (null si no hay). */
   revision: ShiftRevision | null;
+  /**
+   * U3: el reconteo del cierre, con las DOS versiones y quién/cuándo/por qué.
+   * null cuando el cierre firmado nunca se recontó.
+   */
+  recount: ShiftRecountView | null;
+  /**
+   * U3: los cuatro montos que GOVIERNA el turno. Con reconteo, los corregidos;
+   * sin reconteo, los del cierre firmado (`shift.*`). Las tablas y los
+   * acumulados leen de acá: `shift.counted_cash` es la versión ORIGINAL firmada,
+   * no la que rige, cuando hay reconteo.
+   */
+  vigente: {
+    counted_cash: number | null;
+    base_left: number | null;
+    cash_withdrawn: number | null;
+    base_difference: number | null;
+  };
   /** Quién abrió / cerró (null al cerrar si sigue abierto). */
   abierto_por: string | null;
   cerrado_por: string | null;
@@ -1120,7 +1679,8 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
       .in(
         "cash_shift_id",
         rows.map((row) => row.id),
-      );
+      )
+      .is("invoice_id", null);
     if (paymentsError) throw new CashError("INTERNAL", "Error interno.", 500);
     paymentsByShift = new Map();
     for (const row of (payments ?? []) as Array<{
@@ -1144,23 +1704,44 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
     db,
     rows.map((row) => row.id),
   );
-  const names = await userNames(
+  const voucherOutMaps = await fetchVoucherOutTotals(
     db,
-    rows.flatMap((row) => [row.opened_by, row.closed_by]),
+    rows.map((row) => row.id),
   );
+  const invoicePayMaps = await fetchInvoicePaymentsByShift(
+    db,
+    rows.map((row) => row.id),
+  );
+  // U3: los reconteos de los turnos leídos, para preferir la versión corregida
+  // y poder marcar en la vista que el cierre fue recontado.
+  const recountMaps = await fetchRecounts(
+    db,
+    rows.map((row) => row.id),
+  );
+  const names = await userNames(db, [
+    ...rows.flatMap((row) => [row.opened_by, row.closed_by]),
+    ...[...recountMaps.values()].map((row) => row.recounted_by),
+  ]);
 
   const views: DayShiftView[] = rows.map((shift) => {
-    const list = paymentsByShift.get(shift.id) ?? [];
-    const paidByMethod = new Map<string, number>();
-    for (const item of list) {
-      paidByMethod.set(item.method_code, roundMoney((paidByMethod.get(item.method_code) ?? 0) + item.amount));
-    }
-    const counts = countMaps.get(shift.id) ?? { open: new Map(), closed: new Map() };
+    // T0-a (C1): `payments` sin factura + `invoice_payments` del turno.
+    const list = mergeShiftMoney(paymentsByShift.get(shift.id), invoicePayMaps.get(shift.id));
+    const paidByMethod = sumShiftMoneyByMethod(list);
+    const counts = countMaps.get(shift.id) ?? {
+      open: new Map<string, number>(),
+      closed: new Map<string, number>(),
+      recount: new Map<string, number>(),
+    };
+    const recountRow = recountMaps.get(shift.id) ?? null;
+    // U3: el arqueo lee el conteo del reconteo cuando existe; si no, el del
+    // cierre firmado. `counts.recount` vive aparte justamente para no sumarse
+    // al cierre.
     const { metodos, declarados, diferencias } = buildMethodViews({
       paid: paidByMethod,
       open: counts.open,
-      paidOut: payoutMaps.get(shift.id) ?? new Map<string, number>(),
-      closed: shift.status === "cerrado" ? counts.closed : null,
+      paidOut: sumMethodMaps(payoutMaps.get(shift.id), voucherOutMaps.get(shift.id)),
+      closed:
+        shift.status === "cerrado" ? (recountRow ? counts.recount : counts.closed) : null,
     });
     const revision = assembleShiftRevision(
       reviews.get(shift.id) ?? [],
@@ -1172,10 +1753,15 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
       efectivo: roundMoney(
         list.filter((row) => row.method_code === "efectivo").reduce((acc, row) => acc + row.amount, 0),
       ),
+      vales: sumMethodTotal(voucherOutMaps.get(shift.id)),
       metodos,
       declarados,
       diferencias,
       revision,
+      recount: recountRow
+        ? recountView(recountRow, names.get(recountRow.recounted_by) ?? null)
+        : null,
+      vigente: governingClose(shift, recountRow ? recountAmounts(recountRow) : null),
       abierto_por: names.get(shift.opened_by) ?? null,
       cerrado_por: shift.closed_by ? (names.get(shift.closed_by) ?? null) : null,
     };
@@ -1189,10 +1775,10 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
     totals: accumulateDayTotals(
       views.map((view) => ({
         expectedCash: view.efectivo,
-        countedCash: view.shift.counted_cash,
-        baseLeft: view.shift.base_left,
-        cashWithdrawn: view.shift.cash_withdrawn,
-        baseDifference: view.shift.base_difference,
+        countedCash: view.vigente.counted_cash,
+        baseLeft: view.vigente.base_left,
+        cashWithdrawn: view.vigente.cash_withdrawn,
+        baseDifference: view.vigente.base_difference,
         ventas: view.ventas,
       })),
     ),
@@ -1250,7 +1836,8 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
       .in(
         "cash_shift_id",
         rows.map((row) => row.id),
-      );
+      )
+      .is("invoice_id", null);
     if (paymentsError) throw new CashError("INTERNAL", "Error interno.", 500);
     paymentsByShift = new Map();
     for (const row of (payments ?? []) as Array<{
@@ -1274,10 +1861,22 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
     db,
     rows.map((row) => row.id),
   );
-  const historyNames = await userNames(
+  const historyVoucherOutMaps = await fetchVoucherOutTotals(
     db,
-    rows.flatMap((row) => [row.opened_by, row.closed_by]),
+    rows.map((row) => row.id),
   );
+  const historyInvoicePayMaps = await fetchInvoicePaymentsByShift(
+    db,
+    rows.map((row) => row.id),
+  );
+  const historyRecountMaps = await fetchRecounts(
+    db,
+    rows.map((row) => row.id),
+  );
+  const historyNames = await userNames(db, [
+    ...rows.flatMap((row) => [row.opened_by, row.closed_by]),
+    ...[...historyRecountMaps.values()].map((row) => row.recounted_by),
+  ]);
 
   return {
     desde,
@@ -1286,17 +1885,21 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
     pageSize: HISTORY_PAGE_SIZE,
     total,
     shifts: rows.map((shift) => {
-      const list = paymentsByShift.get(shift.id) ?? [];
-      const paidByMethod = new Map<string, number>();
-      for (const item of list) {
-        paidByMethod.set(item.method_code, roundMoney((paidByMethod.get(item.method_code) ?? 0) + item.amount));
-      }
-      const counts = historyCountMaps.get(shift.id) ?? { open: new Map(), closed: new Map() };
+      // T0-a (C1): `payments` sin factura + `invoice_payments` del turno.
+      const list = mergeShiftMoney(paymentsByShift.get(shift.id), historyInvoicePayMaps.get(shift.id));
+      const paidByMethod = sumShiftMoneyByMethod(list);
+      const counts = historyCountMaps.get(shift.id) ?? {
+        open: new Map<string, number>(),
+        closed: new Map<string, number>(),
+        recount: new Map<string, number>(),
+      };
+      const recountRow = historyRecountMaps.get(shift.id) ?? null;
       const { metodos, declarados, diferencias } = buildMethodViews({
         paid: paidByMethod,
         open: counts.open,
-        paidOut: historyPayoutMaps.get(shift.id) ?? new Map<string, number>(),
-        closed: shift.status === "cerrado" ? counts.closed : null,
+        paidOut: sumMethodMaps(historyPayoutMaps.get(shift.id), historyVoucherOutMaps.get(shift.id)),
+        closed:
+          shift.status === "cerrado" ? (recountRow ? counts.recount : counts.closed) : null,
       });
       const revision = assembleShiftRevision(
         historyReviews.get(shift.id) ?? [],
@@ -1308,10 +1911,15 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
         efectivo: roundMoney(
           list.filter((row) => row.method_code === "efectivo").reduce((acc, row) => acc + row.amount, 0),
         ),
+        vales: sumMethodTotal(historyVoucherOutMaps.get(shift.id)),
         metodos,
         declarados,
         diferencias,
         revision,
+        recount: recountRow
+          ? recountView(recountRow, historyNames.get(recountRow.recounted_by) ?? null)
+          : null,
+        vigente: governingClose(shift, recountRow ? recountAmounts(recountRow) : null),
         abierto_por: historyNames.get(shift.opened_by) ?? null,
         cerrado_por: shift.closed_by ? (historyNames.get(shift.closed_by) ?? null) : null,
       };

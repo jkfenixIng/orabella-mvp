@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { roleCodeSchema } from "@/src/features/auth/schemas";
+import { bogotaDay } from "@/src/shared/lib/dates";
 
 /** ADM-08: esquemas de sueldo por empleado. */
 export const payTypeSchema = z.enum(["fijo", "porcentaje", "mixto"]);
@@ -113,7 +114,7 @@ export const employeeSchema = z
       .string()
       .trim()
       .regex(/^\d{4}-\d{2}-\d{2}$/, "Fecha inválida (use yyyy-mm-dd).")
-      .refine((value) => value <= new Date().toISOString().slice(0, 10), "La fecha no puede ser futura.")
+      .refine((value) => value <= bogotaDay(), "La fecha no puede ser futura.")
       .nullish(),
     pay_type: payTypeSchema,
     salary_fixed: z.coerce.number().nonnegative("El salario no puede ser negativo.").nullish(),

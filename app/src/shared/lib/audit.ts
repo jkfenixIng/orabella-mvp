@@ -36,16 +36,25 @@ export const AUDIT_ACTIONS = {
   LOGIN_LOCKED: "auth.login_locked",
   PASSWORD_CHANGED: "auth.password_changed",
   INVOICE_CREATED: "invoice.created",
+  INVOICE_EDITED: "invoice.edited",
   INVOICE_ANNULLED: "invoice.annulled",
   SHIFT_CLOSED: "cash.shift_closed",
   SHIFT_OPEN_MISMATCH: "cash.shift_open_mismatch",
   SHIFT_CLOSE_MISMATCH: "cash.shift_close_mismatch",
   SHIFT_EDITED: "cash.shift_edited",
+  // El reconteo (033) NO edita el cierre: inserta una version corregida y deja
+  // la firmada intacta. Se registra con su propia accion para que un auditor no
+  // lea "el cierre se edito" donde lo que paso es lo contrario. SHIFT_EDITED se
+  // conserva porque las filas historicas de audit_logs ya usan ese valor.
+  SHIFT_RECOUNTED: "cash.shift_recounted",
   REGISTER_BASE_UPDATED: "cash.register_base_updated",
   PAYROLL_CALCULATED: "payroll.calculated",
   PAYROLL_CLOSED: "payroll.closed",
+  PAYROLL_DELETED: "payroll.deleted",
   COMMISSION_PAID: "payroll.commission_paid",
   VOUCHER_APPROVED: "voucher.approved",
+  VOUCHER_REQUESTED: "voucher.requested",
+  VOUCHER_REJECTED: "voucher.rejected",
 } as const;
 
 /**

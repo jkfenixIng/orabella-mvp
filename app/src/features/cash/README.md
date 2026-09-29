@@ -18,14 +18,27 @@ totaliza), historial por fecha.
   `invoice_id` nullable, `method_id` + snapshot `method_code`,
   `amount > 0`). Además agrega la FK `invoices.cash_shift_id →
   cash_shifts` (la columna forward-ref llegó en 005; bloque DO idempotente).
-- Consolidación T5 (decisión): dual-write. Todo `registerPayment` con
-  `invoice_id` inserta en `payments` (totales por turno/día) Y se refleja
-  en `invoice_payments` (saldo paid/remaining de la factura en T5). Así
-  `invoice_payments` sigue siendo la fuente del cobro por factura y
-  `payments` la fuente por turno; al completar el total la factura pasa a
-  Pagada y se vincula al turno (`cash_shift_id`). Sin factura, solo se
-  inserta en `payments` (ajuste documentado). Ante fallo del reflejo hay
-  limpieza best-effort del pago por turno.
+- Consolidación T5/T0-a (estado actual del código): el arqueo suma cada
+  peso UNA vez. `payments` aporta solo los movimientos del turno SIN
+  factura (`invoice_id IS NULL`) y `invoice_payments` aporta los cobros de
+  factura del turno, atribuidos por `cash_shift_id` = turno que COBRÓ (no
+  el que emitió). Los tres lectores (cierre, vista del día, historial)
+  usan esa regla; la migración `031_cash_invoice_payment_integrity.sql`
+  materializa la atribución de las filas históricas (su sección 4 advierte
+  que eso re-atribuye dinero de turnos pasados ya cerrados).
+- `registerPayment` con `invoice_id` escribe PRIMERO el espejo
+  `invoice_payments` (con `cash_shift_id` del turno que cobra) y DESPUÉS
+  la fila de cajón en `payments` (con el mismo `invoice_id` y `user_id`: es
+  el único rastro de quién cobró; `invoice_payments` no tiene columna de
+  usuario). El orden es deliberado: ninguna falla puede dejar un `payments`
+  con `invoice_id` sin espejo, porque el arqueo ignora esas filas
+  (`invoice_id IS NULL`) y ese dinero quedaría invisible. Si el espejo
+  falla no hay nada que revertir (P0001 del tope de 031 → `OVERPAID` 422);
+  si falla la fila de cajón se borra el espejo y ese DELETE sí verifica su
+  error: si también falla, el cobro queda solo en `invoice_payments`
+  (visible) y la petición responde `PAYMENT_ROLLBACK_FAILED` (500) con log,
+  nunca en silencio. Sin factura, solo se inserta en `payments` (ajuste
+  documentado).
 - Servicio (`service.ts`): `openShift` (hereda `base_left` anterior o
   `base_configurada`; primera apertura sin alerta; 23505 del índice →
   `SHIFT_ALREADY_OPEN`), `registerPayment` (turno abierto, método activo,

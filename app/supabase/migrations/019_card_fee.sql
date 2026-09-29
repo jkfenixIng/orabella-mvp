@@ -27,11 +27,20 @@ WHERE code = 'tarjeta' AND fee_percent = 0;
 
 -- ------------------------------------------------- CHECK total ---
 -- El total ahora incluye el recargo: total = subtotal − discount + tax + surcharge.
+-- Bloque DO para que re-correr el archivo nunca falle si ya existe.
 ALTER TABLE public.invoices DROP CONSTRAINT IF EXISTS invoices_check;
 
-ALTER TABLE public.invoices
-  ADD CONSTRAINT invoices_total_surcharge_check
-  CHECK (abs(total - (subtotal - discount + tax + surcharge)) < 0.01);
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'invoices_total_surcharge_check'
+  ) THEN
+    ALTER TABLE public.invoices
+      ADD CONSTRAINT invoices_total_surcharge_check
+      CHECK (abs(total - (subtotal - discount + tax + surcharge)) < 0.01);
+  END IF;
+END
+$$;
 
 COMMENT ON COLUMN public.payment_methods.fee_percent IS
 'Recargo % que se suma al total cuando se cobra con este método (tarjeta: 5). 0 = sin recargo.';

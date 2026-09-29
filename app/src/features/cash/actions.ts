@@ -12,13 +12,13 @@ import {
   deleteDenomination,
   getDayView,
   getHistory,
-  getOpenShift,
+  getOpenShiftWithOpener,
   listDenominations,
   listRegisters,
   openShift,
+  recountClosedShift,
   registerPayment,
   requireCashWriter,
-  updateClosedShift,
   updateRegisterBase,
   upsertDenomination,
 } from "./service";
@@ -82,7 +82,7 @@ export async function closeShiftAction(id: string, input: unknown) {
 export async function getOpenShiftAction() {
   try {
     const session = await requireSession(await sessionToken());
-    const data = await getOpenShift(session.sedeId);
+    const data = await getOpenShiftWithOpener(session.sedeId);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -106,10 +106,10 @@ export async function getDayViewAction(input: { fecha: string; sede_id?: string 
         totals: accumulateDayTotals(
           shifts.map((view) => ({
             expectedCash: view.efectivo,
-            countedCash: view.shift.counted_cash,
-            baseLeft: view.shift.base_left,
-            cashWithdrawn: view.shift.cash_withdrawn,
-            baseDifference: view.shift.base_difference,
+            countedCash: view.vigente.counted_cash,
+            baseLeft: view.vigente.base_left,
+            cashWithdrawn: view.vigente.cash_withdrawn,
+            baseDifference: view.vigente.base_difference,
             ventas: view.ventas,
           })),
         ),
@@ -161,11 +161,15 @@ export async function updateRegisterBaseAction(registerId: string, input: unknow
   }
 }
 
-/** Edición de turno cerrado (solo admin, queda auditado). */
-export async function updateClosedShiftAction(id: string, input: unknown) {
+/**
+ * U3: reconteo de un cierre (solo admin, queda auditado). El cierre firmado
+ * es inmutable: la corrección exige un conteo completo nuevo más un motivo, y
+ * conserva las dos versiones en `cash_shift_recounts`.
+ */
+export async function recountClosedShiftAction(id: string, input: unknown) {
   try {
     const session = await requireAdminSession(await sessionToken());
-    const data = await updateClosedShift(session.sedeId, id, input, {
+    const data = await recountClosedShift(session.sedeId, id, input, {
       userId: session.userId,
       sedeId: session.sedeId,
     });

@@ -84,8 +84,22 @@ Out:
 
 ## Tasks (estado real 2026-09-23)
 - [x] T1-T7 base + T8-T11 + combobox funcional (commits hasta 2aa1389)
-- [ ] FEE Recargo tarjeta 5%: migración 019 + backend + UI crear/detalle + auditoría (modelo: recargo sobre neto, cliente paga bruto, todo cuadra por construcción; split posterior fuera de alcance)
-- [ ] VER full + push
+- [x] FEE Recargo tarjeta 5%: migración 019 + backend + UI crear/detalle + auditoría (a690f51)
+- [x] Modal agregar ítem + filas compactas + cierre combobox robusto + comisión custom en VALOR (7b1a332)
+- [x] 019 re-ejecutable + 020 commission_value (faltaba: rompía detalle y nómina) (1d1e33a); 020 aplicada en prod
+- [x] Logs PG diagnóstico en lista/detalle (ad34bee, 93c9da4)
+- [x] Listado paginado (20/pág): ID, fecha, abrió, cerró, empleados resumidos, total, estado pill azul/verde/rojo, editar-admin + ver; filtros cerró-por y empleado; botón emitir esmeralda (3b6ca22)
+- [x] Caja suma cobros de factura en ventas/esperado (merge día/historial/cierre + 023) + checks confirmación + botón Pagar (aa653c3, 9fe6e22) + Vales a Operación (f479cf4)
+- [ ] SECUENCIADO (validado con usuario 2026-09-23, en orden):
+  1. Caja día/historial: columnas por método muestran lo cobrado real (HECHO c80cb6d 2026-09-23).
+  2. Confirmaciones: modal clásico OK/Cancelar en emitir, emitir y pagar, pagar y anular (HECHO 8bd6e32 2026-09-23).
+  3. Listado facturas: 10 por página (HECHO ccf7cff 2026-09-23).
+  4. Edición libre para Emitidas + modal de ítems generalizado (HECHO 5e1e443 2026-09-23; pagadas intactas admin estricta).
+  5. Vales configurables: días permitidos + topes por día, visibles en caja, alertas admin aceptar/rechazar con motivo, auto-aprobación admin con detalle, edición bloqueada si entró en nómina pagada (HECHO 7c24547+db8809a 2026-09-23; migración 024 allowed_days, alerta voucher.requested en módulo caja, VOUCHER_IN_PAYROLL en descontada).
+- [x] Código de los 6 flujos (verificado 2026-09-25): combobox `app/src/components/ui/lib/combobox.tsx` usado en `invoices-client.tsx:2635,2659,2687` (modal de ítem) y `:1631,1650,1669` (filtros); modal "Agregar ítem" `:2568-2579`; detalle `:1803-1809` + `getInvoiceDetail` (`billing/service.ts:347`); recargo tarjeta 5% (`019_card_fee.sql:25`) con cálculo `billing/service.ts:705-708` y UI `:1056,1557,1942`; listado con filtros `:294,383-395` y 10/pág `:410` (`billing/service.ts:205,228`); vales en `vales/vouchers-client.tsx` (626 líneas).
+- [ ] Usuario: aplicar 019+020+021+022+023+024 (más 025-030) en PRUEBAS, recargar y verificar en vivo. NO verificable desde el workspace: sin acceso SQL y el MCP de Supabase apunta a PRODUCCIÓN. Según confirmación del usuario las 023-029 ya están aplicadas en PRUEBAS; la 030 sigue pendiente.
+- [x] VER full (2026-09-25): `npm run typecheck` exit 0 y `npm test` 14 archivos / 349 tests pasando.
+- [x] push (2026-09-25): rama `feat/orabella-mvp` subida a origin (`cc89010..9957e78`) y PR #18 contra `develop` abierto. `develop` no aporta contenido propio: sus 8 commits son merges de esta misma rama (PRs #3 a #17), y `git merge-tree` da merge limpio.
 
 ## Authorized scope
 Módulos Facturación + Caja. Rama `feat/orabella-mvp`, commits por unidad.

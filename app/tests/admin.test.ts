@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   areEmployeeCodesConflicting,
   checkPayCoherence,
@@ -106,6 +106,25 @@ describe("admin schemas: empleado y pay_type coherente (ADM-08)", () => {
     expect(
       checkPayCoherence({ pay_type: "mixto", salary_fixed: 1, commission_percent: 5 }),
     ).toBeNull();
+  });
+});
+
+describe("admin schemas: birth_date futura según el día de Bogotá", () => {
+  // 2026-09-25T01:00:00Z = 2026-09-24 20:00 en Bogotá (UTC-05:00): el día UTC
+  // ya es el 25, pero en Bogotá todavía es el 24.
+  it("rechaza el 25 y acepta el 24 cuando en Bogotá todavía es el 24", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-25T01:00:00.000Z"));
+    try {
+      expect(employeeSchema.safeParse(baseEmployee({ birth_date: "2026-09-25" })).success).toBe(
+        false,
+      );
+      expect(employeeSchema.safeParse(baseEmployee({ birth_date: "2026-09-24" })).success).toBe(
+        true,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
