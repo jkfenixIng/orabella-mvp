@@ -204,6 +204,167 @@ const whiteLuminance = luminanceFromLinear(
 );
 const themeInline = readThemeVars(GLOBALS_CSS, "@theme inline");
 
+/* --------------------------------------------------------------------------
+   Pares reales `bg-*-light` + color de texto, leídos de los consumidores (no
+   supuestos): las cuatro variantes de src/components/ui/lib/badge.tsx y las
+   llamadas a `.bg-*-light` en app/page.tsx:87,106, app/cash/cash-client.tsx:747,
+   app/login/login-form.tsx:99, app/payroll/payroll-client.tsx:1142 y
+   app/vales/vouchers-client.tsx:346,351.
+
+   En claro el fondo lo da `--color-*-50` y el texto `--color-*-600` (clases
+   `.text-*` de design-tokens.css). En oscuro `.dark .bg-*-light` pisa el fondo
+   con un literal oklch del propio archivo y `.dark .text-*` usa `--color-*-400`.
+   -------------------------------------------------------------------------- */
+type StatusPair = {
+  label: string;
+  ramp: string;
+  bg: string;
+  fg: string;
+  darkBgSelector: string;
+  darkTextSelector: string;
+};
+
+const STATUS_PAIRS: StatusPair[] = [
+  {
+    label: "badge default / primary",
+    ramp: "--color-primary",
+    bg: "--color-primary-50",
+    fg: "--color-primary-600",
+    darkBgSelector: ".dark .bg-primary-light",
+    darkTextSelector: ".dark .text-primary-color",
+  },
+  {
+    label: "badge success / success",
+    ramp: "--color-success",
+    bg: "--color-success-50",
+    fg: "--color-success-600",
+    darkBgSelector: ".dark .bg-success-light",
+    darkTextSelector: ".dark .text-success",
+  },
+  {
+    label: "aviso ámbar (page.tsx, cash-client.tsx, login-form.tsx, payroll-client.tsx, vouchers-client.tsx)",
+    ramp: "--color-warning",
+    bg: "--color-warning-50",
+    fg: "--color-warning-600",
+    darkBgSelector: ".dark .bg-warning-light",
+    darkTextSelector: ".dark .text-warning",
+  },
+  {
+    label: "alerta de error (page.tsx:87, badge destructive)",
+    ramp: "--color-error",
+    bg: "--color-error-50",
+    fg: "--color-error-600",
+    darkBgSelector: ".dark .bg-error-light",
+    darkTextSelector: ".dark .text-error",
+  },
+];
+
+/** Alias canónicos de shadcn/ui agregados a globals.css: todos referencias vivas. */
+const ADDED_ALIASES = [
+  "--card",
+  "--card-foreground",
+  "--popover",
+  "--popover-foreground",
+  "--primary",
+  "--primary-foreground",
+  "--secondary",
+  "--secondary-foreground",
+  "--muted",
+  "--muted-foreground",
+  "--accent",
+  "--accent-foreground",
+  "--destructive",
+  "--destructive-foreground",
+  "--border",
+  "--input",
+  "--radius",
+];
+
+/** Set canónico completo que debe existir (incluye --background/--foreground previos). */
+const SHADCN_ALIASES = ["--background", "--foreground", ...ADDED_ALIASES];
+
+/** Capas donde puede declararse un alias, en orden de precedencia real. */
+const ALIAS_LAYERS = [globalsRoot, lightVars, darkTheme, themeInline];
+
+/** Familia de radios que Tailwind v4 usa para generar `rounded-*`: no se re-define. */
+const RADIUS_FAMILY: Array<[string, string]> = [
+  ["--radius-sm", "0.25rem"],
+  ["--radius-md", "0.375rem"],
+  ["--radius-lg", "0.5rem"],
+  ["--radius-xl", "0.75rem"],
+  ["--radius-2xl", "1rem"],
+  ["--radius-full", "9999px"],
+];
+
+/**
+ * Lee la última declaración plana (`prop: valor;`) de un bloque por selector exacto.
+ * Necesario para `.dark .bg-*-light` / `.dark .text-*`, que declaran propiedades
+ * normales y no custom properties.
+ */
+function readDeclaration(css: string, selector: string, property: string): string | undefined {
+  const clean = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  const blockRe = /([^{}]*)\{([^{}]*)\}/g;
+  const declRe = new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;]+);`, "g");
+  let value: string | undefined;
+  let block: RegExpExecArray | null;
+  while ((block = blockRe.exec(clean)) !== null) {
+    const head = block[1];
+    const selectorPart = head.slice(Math.max(head.lastIndexOf(";"), head.lastIndexOf("}")) + 1);
+    const selectors = selectorPart.split(",").map((part) => part.trim());
+    if (!selectors.includes(selector)) {
+      continue;
+    }
+    declRe.lastIndex = 0;
+    let decl: RegExpExecArray | null;
+    while ((decl = declRe.exec(block[2])) !== null) {
+      value = decl[1].trim();
+    }
+  }
+  return value;
+}
+
+/** Igual que oklchToken pero para un literal oklch obtenido con readDeclaration. */
+function oklchLiteral(raw: string | undefined, where: string): Oklch {
+  expect(raw, `se esperaba una declaración oklch en ${where}`).toBeDefined();
+  const token = parseOklch(raw as string);
+  expect(token, `${where} debe ser un oklch(...) (valor real: ${raw})`).not.toBeNull();
+  return token as Oklch;
+}
+
+/**
+ * Sigue una cadena `var(--x)` hasta un valor terminal. Ignora las entradas
+ * auto-referentes de `@theme inline` (`--color-x: var(--color-x)`), que Tailwind
+ * resuelve inline y por eso no son la declaración real del token.
+ */
+function resolveAlias(name: string, layers: Array<Map<string, string>>): string | null {
+  let current = name;
+  for (let hop = 0; hop < 8; hop += 1) {
+    const raw = layers
+      .map((layer) => layer.get(current))
+      .find((value) => value !== undefined && value.trim() !== `var(${current})`);
+    if (raw === undefined) {
+      return null;
+    }
+    const inner = /^var\(\s*(--[a-zA-Z0-9-]+)\s*\)$/.exec(raw.trim());
+    if (!inner) {
+      return raw;
+    }
+    current = inner[1];
+  }
+  return null;
+}
+
+/** Los cuatro tintes claros de estado con su peldaño -100 de referencia. */
+function lightStatusTints() {
+  return STATUS_PAIRS.map(({ label, ramp, bg }) => ({
+    label,
+    bg,
+    hundredName: `${ramp}-100`,
+    fifty: oklchToken(lightVars, bg, ":root"),
+    hundred: oklchToken(lightVars, `${ramp}-100`, ":root"),
+  }));
+}
+
 describe("design tokens: guardas de contrato", () => {
   it("ningún token de color pide más chroma de la que el sRGB puede mostrar", () => {
     const outOfGamut = collectOklchTokens(TOKENS_CSS)
@@ -307,5 +468,112 @@ describe("design tokens: guardas de contrato", () => {
     expect(contrast(darkRing, DARK_SURFACE)).toBeGreaterThanOrEqual(AA_NON_TEXT_MIN);
     expect(themeInline.get("--color-ring"), "globals.css @theme inline").toBe("var(--ring)");
     expect(BUTTON_TSX).toContain("focus-visible:ring-ring");
+  });
+
+  it("los cuatro -50 claros de estado llevan tinte (chroma > 0)", () => {
+    const failures = STATUS_PAIRS.map(({ label, bg }) => ({
+      label,
+      bg,
+      token: oklchToken(lightVars, bg, ":root"),
+    }))
+      .filter(({ token }) => token.c <= 0)
+      .map(
+        ({ label, bg, token }) =>
+          `${label}: ${bg} = oklch(${token.l} ${token.c} ${token.h}) es acromático`,
+      );
+    expect(failures).toEqual([]);
+  });
+
+  it("cada -50 comparte el hue de su rampa y difiere de la superficie neutra y de los otros tres", () => {
+    const tints = lightStatusTints();
+    const wrongHue = tints
+      .filter(({ fifty, hundred }) => fifty.h !== hundred.h)
+      .map(({ label, fifty, hundred }) => `${label}: -50 H=${fifty.h} != -100 H=${hundred.h}`);
+    expect(wrongHue).toEqual([]);
+    const neutral = oklchToken(lightVars, "--color-neutral-50", ":root");
+    expect(neutral.c, "--color-neutral-50 sigue siendo la superficie neutra").toBe(0);
+    const signatures = tints.map(
+      ({ fifty }) => `L${fifty.l} C${fifty.c} H${fifty.h}`,
+    );
+    expect(new Set(signatures).size, `tintes repetidos: ${signatures.join(", ")}`).toBe(
+      tints.length,
+    );
+  });
+
+  it("cada par real bg-*-light + color de texto cumple AA (>= 4.5:1) en ambos temas", () => {
+    const failures: string[] = [];
+    for (const pair of STATUS_PAIRS) {
+      const lightRatio = contrast(
+        oklchToken(lightVars, pair.fg, ":root"),
+        oklchToken(lightVars, pair.bg, ":root"),
+      );
+      if (lightRatio < AA_TEXT_MIN) {
+        failures.push(
+          `claro ${pair.label}: ${pair.fg} sobre ${pair.bg} = ${lightRatio.toFixed(2)}:1`,
+        );
+      }
+      const darkTextRaw = readDeclaration(TOKENS_CSS, pair.darkTextSelector, "color");
+      expect(darkTextRaw, `${pair.darkTextSelector} debe declarar color`).toBeDefined();
+      const darkRatio = contrast(
+        resolveVarToken(darkTextRaw as string, [darkTheme]),
+        oklchLiteral(
+          readDeclaration(TOKENS_CSS, pair.darkBgSelector, "background-color"),
+          `${pair.darkBgSelector} background-color`,
+        ),
+      );
+      if (darkRatio < AA_TEXT_MIN) {
+        failures.push(
+          `oscuro ${pair.label}: ${pair.darkTextSelector} sobre ${pair.darkBgSelector} = ${darkRatio.toFixed(2)}:1`,
+        );
+      }
+    }
+    expect(failures).toEqual([]);
+  });
+
+  it("cada -50 es más claro que el -100 de su rampa (la rampa sigue ordenada)", () => {
+    const failures = lightStatusTints()
+      .filter(({ fifty, hundred }) => !(fifty.l > hundred.l))
+      .map(
+        ({ label, bg, hundredName, fifty, hundred }) =>
+          `${label}: ${bg} L=${fifty.l} no es más claro que ${hundredName} L=${hundred.l}`,
+      );
+    expect(failures).toEqual([]);
+  });
+
+  it("los alias canónicos de shadcn/ui están declarados y resuelven a tokens del proyecto", () => {
+    const unresolved = SHADCN_ALIASES.filter(
+      (name) => resolveAlias(name, ALIAS_LAYERS) === null,
+    );
+    expect(unresolved).toEqual([]);
+  });
+
+  it("los alias añadidos son referencias a tokens y no colores literales", () => {
+    const literals = ADDED_ALIASES.map((name) => ({
+      name,
+      value: requireVar(globalsRoot, name, "globals.css :root"),
+    }))
+      .filter(({ value }) => !/^var\(\s*--[a-zA-Z0-9-]+\s*\)$/.test(value.trim()))
+      .map(({ name, value }) => `${name}: ${value}`);
+    expect(literals).toEqual([]);
+  });
+
+  it("los alias de marca no apuntan a los tokens HSL muertos y estos quedan intactos", () => {
+    expect(requireVar(globalsRoot, "--primary", "globals.css :root")).toBe(
+      "var(--color-primary-600)",
+    );
+    expect(requireVar(globalsRoot, "--secondary", "globals.css :root")).not.toBe(
+      "var(--color-secondary)",
+    );
+    expect(requireVar(lightVars, "--color-primary", "design-tokens.css :root")).toBe("175 82%");
+    expect(requireVar(lightVars, "--color-secondary", "design-tokens.css :root")).toBe(
+      "260 70%",
+    );
+  });
+
+  it("la familia --radius-* conserva sus valores y la base --radius solo la referencia", () => {
+    for (const [name, value] of RADIUS_FAMILY) {
+      expect(requireVar(lightVars, name, "design-tokens.css :root"), name).toBe(value);
+    }
+    expect(requireVar(globalsRoot, "--radius", "globals.css :root")).toBe("var(--radius-md)");
   });
 });

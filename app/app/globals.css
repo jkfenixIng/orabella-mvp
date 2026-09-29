@@ -40,6 +40,39 @@
   color-scheme: light;
   --background: #ffffff;
   --foreground: #0f172a;
+
+  /* Puente de nombres canónicos de shadcn/ui (app/components.json declara
+     baseColor slate, style new-york, cssVariables true). Todos los alias
+     apuntan a tokens que ya existen en design-tokens.css: como ese archivo
+     invierte sus valores en `.dark`, basta declararlos una vez y el resultado
+     es coherente en ambos temas. Ninguno es un color literal.
+
+     `--primary` NO se conecta a `--color-primary` ni `--secondary` a
+     `--color-secondary`: esos dos tokens son valores HSL muertos
+     (`175 82%`, `260 70%`) que nada consume. El color de marca sale de la
+     rampa `--color-primary-*`; el fondo secundario/acento, de las superficies
+     neutras del proyecto. `--ring` ya existía en design-tokens.css con este
+     mismo significado, así que no se vuelve a declarar. */
+  --card: var(--bg-surface);
+  --card-foreground: var(--text-primary);
+  --popover: var(--bg-surface);
+  --popover-foreground: var(--text-primary);
+  --primary: var(--color-primary-600);
+  --primary-foreground: var(--color-neutral-50);
+  --secondary: var(--bg-surface-hover);
+  --secondary-foreground: var(--text-primary);
+  --muted: var(--bg-surface-2);
+  --muted-foreground: var(--color-text-secondary);
+  --accent: var(--bg-surface-hover);
+  --accent-foreground: var(--text-primary);
+  --destructive: var(--color-error-600);
+  --destructive-foreground: var(--color-neutral-50);
+  --border: var(--color-border-color);
+  --input: var(--color-border-color);
+  /* Única variable de radio que faltaba: la familia --radius-sm|md|lg|xl|2xl|full
+     ya existe en design-tokens.css y Tailwind v4 genera `rounded-*` desde ella,
+     así que la base solo la referencia y nunca la re-define. */
+  --radius: var(--radius-md);
 }
 
 .dark {

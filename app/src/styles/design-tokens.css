@@ -31,7 +31,15 @@
 :root {
   /* Primary - Blue */
   --color-primary: 175 82%;
-  --color-primary-50: oklch(0.96 0 0);
+  /* Peldaño -50: es el fondo de las clases `.bg-*-light` (chips de estado y
+     avisos). Antes tenía chroma 0, así que los cuatro fondos "light" del tema
+     claro salían gris casi blanco y solo el texto llevaba color. Cada -50
+     recupera el hue de su rampa con ~80% de la chroma máxima que el sRGB
+     admite en su L, y sigue siendo más claro que su -100 (la rampa queda
+     ordenada). El texto real sobre esos fondos es el peldaño -600
+     (.text-success/.text-warning/.text-error/.text-primary-color), que conserva
+     AA 4.5:1. El bloque oscuro no se toca. */
+  --color-primary-50: oklch(0.96 0.016 250);
   --color-primary-100: oklch(0.93 0.02 250);
   --color-primary-200: oklch(0.86 0.06 250);
   --color-primary-300: oklch(0.77 0.11 250);
@@ -56,7 +64,7 @@
   --color-secondary-900: oklch(0.25 0.1 280);
 
   /* Status - Success (Emerald) */
-  --color-success-50: oklch(0.97 0 0);
+  --color-success-50: oklch(0.97 0.035 160);
   --color-success-100: oklch(0.93 0.03 160);
   --color-success-200: oklch(0.86 0.06 160);
   --color-success-300: oklch(0.77 0.1 160);
@@ -68,7 +76,10 @@
   --color-success-900: oklch(0.24 0.048 160);
 
   /* Status - Warning (Amber) */
-  --color-warning-50: oklch(0.98 0 0);
+  /* Warning es la rampa más apretada: su -100 ya está en L 0.96, así que el -50
+     solo puede bajar hasta 0.97 y en L 0.98 el sRGB limita la chroma a 0.0109
+     (tinte imperceptible). Se baja el peldaño un paso, aún más claro que el -100. */
+  --color-warning-50: oklch(0.97 0.014 50);
   --color-warning-100: oklch(0.96 0.02 50);
   --color-warning-200: oklch(0.90 0.052 50);
   --color-warning-300: oklch(0.82 0.10 50);
@@ -80,7 +91,7 @@
   --color-warning-900: oklch(0.27 0.07 50);
 
   /* Status - Error (Red) */
-  --color-error-50: oklch(0.97 0 0);
+  --color-error-50: oklch(0.96 0.016 25);
   --color-error-100: oklch(0.93 0.03 25);
   --color-error-200: oklch(0.86 0.06 25);
   --color-error-300: oklch(0.77 0.12 25);
