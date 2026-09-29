@@ -57,9 +57,10 @@ Higiene registrada aparte: falta `.gitattributes` (git avisa `LF will be replace
 
 ## Tasks
 - [x] W1 Autorización de acciones de servidor (F1 + test de invariante) — gate verde y evidencia rojo→verde real
-- [ ] W2 Cabeceras de seguridad en `next.config.ts` + test
-- [ ] W3 (propuesto) Endurecer el invariante de guardas: los 3 huecos residuales de abajo
-- [ ] Consolidar el informe de las 4 dimensiones de auditoría (S1–S4) con plan priorizado
+- [x] W2 Cabeceras de seguridad en `next.config.ts` + test — `23cfb54`. Verificadas **en vuelo** con `next start` + `curl`: las cuatro salen con el valor exacto en respuestas 200, en el 307 del middleware y en los 401 de la API.
+- [x] W3 Endurecer el invariante y los tests de cabeceras — `fa74bb3`. Los 3 huecos de arriba quedaron cerrados; la verificación adversarial encontró 6 mecanismos de bypass nuevos, ninguno activo hoy (detalle abajo).
+- [ ] W4 (el usuario canceló la decisión: **no se toca el test**) Arreglar la regla de orden. Detalle abajo, queda como deuda conocida.
+- [ ] Consolidar el informe de las dimensiones de auditoría (S1–S5) con plan priorizado
 
 ## W1 — resultado y deuda residual (verificación independiente, 2026-10-01)
 Gate: `npm run test` 359/359 · `tsc --noEmit` limpio · `eslint` (1 warning pre-existente en `app/error.tsx`, archivo ajeno al cambio) · `next build` compilado, 22/22 páginas.
@@ -75,6 +76,33 @@ Divergencia de diseño observada, **no un agujero**: esta action reescribe `sede
 
 Fuera de alcance por diseño: los route handlers REST de `app/api/**/route.ts` también alcanzan `service_role` y este invariante no los cubre.
 
+## W3 — resultado y deuda residual (verificación adversarial, 2026-10-01)
+Commit `fa74bb3`. Gate: `npm run test` 376/376 (baseline 363) · `tsc --noEmit` · `eslint` (1 warning pre-existente) · `next build`. Ningún archivo de `src/` fue tocado.
+
+Cerrado de verdad: la allowlist pasó a `(archivo, nombre)` con tests de no-uso, declaración única y módulo correcto; el limpiador de comentarios y literales evita el match dentro de texto; se exige forma de declaración de función en todo export; y los dos tests de omisión de cabeceras ahora afirman primero la precondición positiva, así que vaciar o renombrar los headers ya no pasa vacío.
+
+**Corrección al auto-reporte del writer:** la regla de orden evalúa **63** actions, no 67. Las 4 públicas de auth están exentas, y la exención es correcta: no pueden exigir sesión porque su trabajo es crearla o recuperarla.
+
+### La regla de orden: 6 mecanismos de bypass, ninguno activo hoy
+Verificados con arnés propio fuera del repo. Hoy no dispara ninguno porque las 63 actions tienen como primera llamada a `service` una guarda que **lanza** excepción, y la coincidencia crudo-vs-limpiado dio 63/63 sin discrepancias.
+
+1. **Guarda cuya falla se descarta**: `try { await requireSession(...) } catch {}` y después mutar. Verde total. Es el falso verde futuro más probable.
+2. **`getSessionUser(...)` con el resultado ignorado**: devuelve `null` en lugar de lanzar, pero satisface el regex; ya está importado de `./service`. Su único call site hoy sí valida.
+3. **Token `require*` que no es guarda** (`requireSedeRole` sirve) o mutar por fuera de `service`: verde total. La regla no mira procedencia.
+4. **Import mutador re-ruteado fuera de `./service`**: barrel `./service/index`, `default + * as`, dos imports en una línea, `await import()`.
+5. **Confusión del limpiador con un regex literal** (`/a\/*/`): demostrado. Mete el limpiador en modo comentario y borra la mutación.
+6. **Guarda diferida** (`const authorize = () => requireSession(...)` antes del mutate): verde. Compara offsets textuales, no orden de ejecución.
+
+### Proporcionalidad: veredicto del verificador
+El archivo tiene **802 líneas**, de las cuales **~500 son un lexer hecho a mano** que reimplementa peor lo que `oxc` y `typescript` — ya instalados — dan gratis. Es más código que varios de los módulos que vigila.
+
+**Las limitaciones documentadas del archivo NO conceden los casos 1 y 2**, que son falsos verdes completos: el test afirma más cobertura de la que tiene. Eso es peor que no tenerlo, porque da confianza falsa. Además el ejemplo de regex que documenta (`/a//b/`) no es TypeScript válido, así que ni el ejemplo sirve.
+
+**Riesgo de falso positivo, no hipotético:** `sessionToken()` es un helper local en 7 de los 8 módulos. Si se mueve a `auth/service.ts` — su casa natural, al lado de `SESSION_COOKIE_NAME` — el idiom `const token = await sessionToken(); const s = await requireSession(token)` pasa a leerse como "muta antes de autorizar" en **todas** las actions de todos los módulos: un muro de rojo por un refactor que no empeora nada. La causa de fondo es que la regla **no tiene modelo de lectura/escritura** y no distingue `listEmployees()` de `deleteCommissionRule()`.
+
+W4 propuesto: allow-list de imports de plomería (`sessionToken` y similares), conceder los casos 1 y 2 en las limitaciones documentadas, borrar la regla de export (redundante con `next build`) y corregir el ejemplo de regex inválido. **El usuario canceló la decisión, así que el test no se toca**: queda registrado como deuda conocida y ningún guardia se debilita por accidente.
+
 ## Estado
 - 2026-09-28: creado. Auditoría S1 completa (14 hallazgos, F1 verificado por el orquestador). S2/S3/S4 en curso. Lote autorizado por el usuario ("aplica lo que se pueda") bajo la restricción de cero sobrecostos de infraestructura y cero límites a las pruebas.
-- 2026-10-01: W1 commiteado con gate verde. **Review nativo omitido por decisión explícita del usuario** (el switch RDD permite omitir cuando el usuario deja el candidato sin revisar). Quedó un linaje abierto, `review-91c57d3fbc9f6a7b`, en estado `reviewing`, sin capturar, sin autoridad consumida y sin mutación; limpiarlo requiere la operación auditada `abandon` con decisión explícita. Diferido.
+- 2026-10-01: W2 (`23cfb54`) y W3 (`fa74bb3`) commiteados, gate verde en ambos. El linaje `review-91c57d3fbc9f6a7b` quedó **cerrado** con la operación auditada `review abandon` (`reason: operator_disposition`, registro en `.git/gentle-ai/review-transactions/quarantine/`); no se descartó trabajo: cero resultados de lente, cero hallazgos. Tras un `abandon` commiteado corresponde un `inspect` antes de cualquier START nuevo.
+- 2026-10-01: lote de estilos auditado (S5). Hallazgo verificado por el orquestador: los cuatro tokens `-50` en tema claro tienen chroma 0, así que `.bg-*-light` pinta el mismo gris casi blanco y todo badge sale gris en claro y con color en oscuro. WU0 en curso: dar croma a los `-50` y cablear los aliases canónicos de shadcn.
