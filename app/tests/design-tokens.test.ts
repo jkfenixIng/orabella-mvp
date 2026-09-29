@@ -380,6 +380,61 @@ const CANONICAL_COLOR_KEYS = [
 ];
 
 /**
+ * El par base del registry (`bg-background` / `text-foreground`), que junto con
+ * las 16 claves de arriba son las únicas entradas `--color-*` que existen para
+ * los componentes de shadcn. Se cubren aparte —y no dentro de
+ * CANONICAL_COLOR_KEYS— porque su valor terminal no es un oklch de
+ * design-tokens.css sino el literal hex de `:root` / `.dark` de globals.css:
+ * meterlas en el loop de las 16 obligaría a aceptar hex también para ellas, que
+ * es justo la laxitud que ese loop existe para impedir.
+ */
+const BASE_COLOR_KEYS: Array<[key: string, alias: string]> = [
+  ["--color-background", "--background"],
+  ["--color-foreground", "--foreground"],
+];
+
+/**
+ * Claves `--color-*` de `@theme inline` que NO son colores del registry: rampa de
+ * marca, roles de estado/superficie/texto/borde del proyecto y el anillo de
+ * foco. Sirven de complemento explícito en la guarda de cobertura: cualquier
+ * clave nueva tiene que caer en una de las tres listas, y con eso una
+ * regresión como la de background/foreground (clave canónica ausente, utilidad
+ * nunca emitida) falla en vez de pasar desapercibida.
+ */
+const NON_REGISTRY_COLOR_KEYS = [
+  "--color-surface",
+  "--color-surface-hover",
+  "--color-text-primary",
+  "--color-text-secondary",
+  "--color-text-tertiary",
+  "--color-border-color",
+  "--color-border-color-2",
+  "--color-ring",
+  "--color-primary-400",
+  "--color-primary-600",
+  "--color-primary-700",
+  "--color-success",
+  "--color-success-400",
+  "--color-success-600",
+  "--color-warning",
+  "--color-warning-400",
+  "--color-warning-600",
+  "--color-error",
+  "--color-error-400",
+  "--color-error-600",
+];
+
+/** ¿El valor terminal es un color concreto y no otra indirección? */
+function isConcreteColor(value: string): boolean {
+  const raw = value.trim();
+  return (
+    /^#[0-9a-f]{3,8}$/i.test(raw) ||
+    parseOklch(raw) !== null ||
+    /^(?:rgb|rgba|hsl|hsla|oklab|oklch|lab|lch|color)\(/i.test(raw)
+  );
+}
+
+/**
  * Familias de utilidades que Tailwind deriva de cada clave `--color-*`: el
  * nombre de clase es `<prefijo>-<clave sin el prefijo --color->`.
  */
@@ -730,6 +785,58 @@ describe("design tokens: guardas de contrato", () => {
     );
     const shadowed = bareClassNames(TOKENS_CSS).filter((name) => generated.has(name));
     expect(shadowed).toEqual([]);
+  });
+
+  it("las dos claves base del registry (background/foreground) existen y resuelven en ambos temas", () => {
+    const globalsDark = readThemeVars(GLOBALS_CSS, ".dark");
+    const failures: string[] = [];
+    for (const [key, alias] of BASE_COLOR_KEYS) {
+      const raw = themeInline.get(key);
+      if (raw !== `var(${alias})`) {
+        failures.push(`${key}: se esperaba var(${alias}), hay ${raw}`);
+        continue;
+      }
+      // Claro: el literal de `:root`; oscuro: el de `.dark`, que es el que gana
+      // en la cascada real (globals.css declara `color-scheme` en los dos).
+      const light = resolveConcrete(key, [globalsRoot, lightVars, darkTheme, themeInline]);
+      const dark = resolveConcrete(key, [
+        globalsDark,
+        globalsRoot,
+        lightVars,
+        darkTheme,
+        themeInline,
+      ]);
+      const lightExpected = requireVar(globalsRoot, alias, "globals.css :root");
+      const darkExpected = requireVar(globalsDark, alias, "globals.css .dark");
+      if (light !== lightExpected) {
+        failures.push(`${key}: en claro ${raw} -> ${light ?? "sin resolver"}, se esperaba ${lightExpected}`);
+      }
+      if (dark !== darkExpected) {
+        failures.push(`${key}: en oscuro ${raw} -> ${dark ?? "sin resolver"}, se esperaba ${darkExpected}`);
+      }
+      if (light !== null && !isConcreteColor(light)) {
+        failures.push(`${key}: ${light} no es un color concreto`);
+      }
+    }
+    expect(failures).toEqual([]);
+    // El par base no puede repetirse en el loop de las 16 (allí se exige oklch).
+    const duplicated = BASE_COLOR_KEYS.map(([key]) => key).filter((key) =>
+      CANONICAL_COLOR_KEYS.includes(key),
+    );
+    expect(duplicated).toEqual([]);
+  });
+
+  it("toda clave --color-* de @theme inline está clasificada (ninguna queda sin cubrir)", () => {
+    const covered = new Set([
+      ...CANONICAL_COLOR_KEYS,
+      ...BASE_COLOR_KEYS.map(([key]) => key),
+      ...NON_REGISTRY_COLOR_KEYS,
+    ]);
+    const uncovered = [...themeInline.keys()]
+      .filter((name) => name.startsWith("--color-"))
+      .filter((name) => !covered.has(name))
+      .sort();
+    expect(uncovered).toEqual([]);
   });
 
   it("las 16 claves canónicas están en @theme inline y resuelven a un valor concreto", () => {
