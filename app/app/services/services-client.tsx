@@ -1,8 +1,10 @@
 "use client";
 
 import { useState, useTransition, type FormEvent } from "react";
+import { toast } from "sonner";
 import { upsertServiceAction } from "@/src/features/admin/actions";
 import type { ServiceRow } from "@/src/features/admin/service";
+import { Alert } from "@/src/components/ui/lib/alert";
 import { Button } from "@/src/components/ui/lib/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/src/components/ui/lib/card";
 import { Checkbox } from "@/src/components/ui/lib/checkbox";
@@ -19,10 +21,8 @@ import {
 import { cn } from "@/src/components/ui/lib/utils";
 import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 import {
-  errorClass,
   inputClass,
   labelClass,
-  okClass,
   tableCellClass,
   tableHeaderClass,
   tableRowClass,
@@ -78,7 +78,6 @@ export function ServicesClient(props: ServicesClientProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [isPending, startRefresh] = useTransition();
 
@@ -86,7 +85,6 @@ export function ServicesClient(props: ServicesClientProps) {
     setEditingId(null);
     setForm(emptyForm());
     setError(null);
-    setNotice(null);
     setDialogOpen(true);
   }
 
@@ -101,7 +99,6 @@ export function ServicesClient(props: ServicesClientProps) {
       is_active: row.is_active,
     });
     setError(null);
-    setNotice(null);
     setDialogOpen(true);
   }
 
@@ -109,7 +106,6 @@ export function ServicesClient(props: ServicesClientProps) {
     event.preventDefault();
     setBusy(true);
     setError(null);
-    setNotice(null);
     const result: ActionResult<ServiceRow> = await upsertServiceAction({
       ...(editingId ? { id: editingId } : {}),
       sede_id: props.sedeId,
@@ -132,7 +128,10 @@ export function ServicesClient(props: ServicesClientProps) {
         : [...current, result.data];
       return [...next].sort((a, b) => a.name.localeCompare(b.name));
     });
-    setNotice(editingId ? "Servicio actualizado." : "Servicio creado.");
+    // Éxito = EVENTO: acaba de pasar y no tiene que quedarse en pantalla
+    // compitiendo con lo que sí importa. Antes era un <p role="status"> que
+    // persistía hasta la siguiente acción. El texto es el mismo.
+    toast.success(editingId ? "Servicio actualizado." : "Servicio creado.");
     setDialogOpen(false);
     setEditingId(null);
     setForm(emptyForm());
@@ -140,12 +139,6 @@ export function ServicesClient(props: ServicesClientProps) {
 
   return (
     <div className="flex min-h-0 flex-col gap-6">
-      {notice && (
-        <p role="status" className={okClass}>
-          {notice}
-        </p>
-      )}
-
       <Card className="overflow-hidden">
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -304,9 +297,13 @@ export function ServicesClient(props: ServicesClientProps) {
                 Activo
               </Label>
               {error ? (
-                <p role="alert" className={cn(errorClass, "sm:col-span-2")}>
+                // Fallo al guardar = ESTADO: sigue siendo el caso mientras el
+                // formulario esté abierto, así que va inline y persistente al
+                // lado de los campos, no como aviso efímero. `destructive`
+                // deriva role="alert" (asertivo) igual que el rol que había.
+                <Alert variant="destructive" className="sm:col-span-2">
                   {error}
-                </p>
+                </Alert>
               ) : null}
               <DialogFooter className="sm:col-span-2">
                 <Button
