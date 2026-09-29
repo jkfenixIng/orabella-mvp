@@ -1085,9 +1085,22 @@ export function PayrollClient(props: PayrollClientProps) {
                 // botón Crear no puede producir una apertura válida. Antes era
                 // un <p> con la clase de error y sin rol; ahora el canal es el
                 // mismo que el de los otros dos avisos del diálogo.
-                <Alert variant="destructive">La fecha final no puede ser anterior a la inicial.</Alert>
+                //
+                // `role="status"` explícito (polite): este aviso se DERIVA del
+                // formulario mientras el usuario escribe las fechas, no es el
+                // desenlace de una acción enviada. `destructive` derivaría
+                // `alert` (asertivo), y una región asertiva que interrumpe a
+                // quien está tecleando es el antipatrón de sobreanuncio.
+                // Bloquea la creación, sí, pero está en orden de lectura justo
+                // al lado de los campos: con `polite` alcanza. Los fallos
+                // confirmados del mismo archivo (arriba, `{error}`) siguen
+                // asertivos porque hay que enterarse antes de salir.
+                <Alert variant="destructive" role="status">
+                  La fecha final no puede ser anterior a la inicial.
+                </Alert>
               ) : overlap ? (
-                <Alert variant="destructive">
+                // Mismo caso derivado en vivo y por la misma razón: `polite`.
+                <Alert variant="destructive" role="status">
                   El rango se solapa con {formatPeriodLabel(overlap)} ({overlap.status}). Ajuste las fechas.
                 </Alert>
               ) : openError ? (

@@ -118,6 +118,20 @@ function expectShowRoutesOkToToast(clientCode: string, where: string): void {
   expect(show, `${where}: show() guarda el fallo como estado`).toMatch(/setError\(/);
 }
 
+/**
+ * ¿Cuántos `Alert` de esta variante llevan el override `role="status"` escrito
+ * a mano? Se exige que el atributo venga INMEDIATAMENTE después de la variante
+ * (es la forma en que está escrito el marcado): así un `role="status"` a 600
+ * caracteres de distancia no pasa por vecino.
+ */
+function alertsWithExplicitStatusRole(
+  source: string,
+  variant: "destructive" | "warning",
+): number {
+  const re = new RegExp(`<Alert\\s+variant="${variant}"\\s+role="status"`, "g");
+  return [...source.matchAll(re)].length;
+}
+
 /* ==========================================================================
    El detector mismo (control negativo compartido por los tres módulos)
    ========================================================================== */
@@ -162,12 +176,19 @@ describe("detector de roles ad-hoc: no es un sello de goma", () => {
       ["app/alerts/page.tsx", ALERTS_PAGE_CODE],
       ["app/vales/vouchers-client.tsx", VALES_CLIENT_CODE],
       ["app/vales/page.tsx", VALES_PAGE_CODE],
-      ["app/payroll/payroll-client.tsx", PAYROLL_CLIENT_CODE],
       ["app/payroll/page.tsx", PAYROLL_PAGE_CODE],
     ];
     for (const [path, code] of modules) {
       expect(adHocRoles(code), `role= en ${path}`).toEqual([]);
     }
+    // Excepción DELIBERADA: nómina escribe dos roles a mano. Son el override
+    // `role="status"` de los dos avisos de rango, que se derivan en vivo del
+    // formulario y por eso anuncian `polite` (test dedicado más abajo).
+    // Cualquier otro `role=` sigue siendo el defecto que esta guarda caza.
+    expect(adHocRoles(PAYROLL_CLIENT_CODE), "excepción deliberada").toEqual(["role=", "role="]);
+    expect(
+      [...PAYROLL_CLIENT_CODE.matchAll(/<Alert variant="destructive" role="status">/g)],
+    ).toHaveLength(2);
   });
 });
 
@@ -441,19 +462,57 @@ describe("nómina: lo persistente va por Alert (estado)", () => {
   it("los tres avisos del diálogo de apertura son estado: Alert destructivo", () => {
     // Los dos primeros se calculan en vivo (rango inválido / solape) y el
     // tercero viene de la acción (`openError`). Antes convivían un `<p>` sin rol
-    // y un `<p role="alert">`: ahora los tres son el mismo canal, con el rol que
-    // la variante deriva.
+    // y un `<p role="alert">`: ahora los tres son el mismo canal.
     expect(PAYROLL_CLIENT_CODE).toMatch(
-      /<Alert variant="destructive">La fecha final no puede ser anterior a la inicial\.<\/Alert>/,
+      /<Alert\s+variant="destructive"\s+role="status">\s*La fecha final no puede ser anterior a la inicial\./,
     );
     expect(PAYROLL_CLIENT_CODE).toMatch(
-      /<Alert\s+variant="destructive"[\s\S]{0,200}Ajuste las fechas\.[\s\S]{0,40}<\/Alert>/,
+      /<Alert\s+variant="destructive"\s+role="status"[\s\S]{0,200}Ajuste las fechas\.[\s\S]{0,40}<\/Alert>/,
     );
     expect(PAYROLL_CLIENT_CODE).toMatch(
       /<Alert\s+variant="destructive"[\s\S]{0,160}\{openError\}[\s\S]{0,40}<\/Alert>/,
     );
     // Ningún aviso del diálogo quedó como `<p>` con la clase de error suelta.
     expect(PAYROLL_CLIENT_CODE).not.toMatch(/<p className=\{errorClass\}/);
+  });
+
+  it("solo los dos avisos derivados en vivo anuncian `polite`: los fallos confirmados siguen asertivos", () => {
+    // Los dos avisos de rango se DERIVAN del formulario mientras se escriben
+    // las fechas; una región asertiva que interrumpe a quien teclea es el
+    // antipatrón de sobreanuncio. Conservan la presentación `destructive` (el
+    // par de tokens del error, que es lo que bloquea) pero pasan `role="status"`
+    // explícito, que gana sobre el rol derivado de la variante.
+    expect(alertsWithExplicitStatusRole(PAYROLL_CLIENT_CODE, "destructive")).toBe(2);
+
+    // CONTROL NEGATIVO 1: el override no se aplicó en bloque. Los fallos
+    // confirmados de una acción enviada (`{error}` arriba y `{openError}` en el
+    // diálogo) quedan sin rol explícito, o sea asertivos: el usuario tiene que
+    // enterarse antes de navegar. Si alguien pasara `role="status"` a todos los
+    // Alert destructivos, este `toContain` seguiría verde y el conteo de arriba
+    // pasaría a 4 y fallaría.
+    for (const committed of [
+      '<Alert variant="destructive">{error}</Alert>',
+      '<Alert variant="destructive">{openError}</Alert>',
+    ]) {
+      const lines = linesWith(PAYROLL_CLIENT_CODE, committed);
+      expect(lines, committed).toHaveLength(1);
+      expect(lines[0], committed).not.toContain('role="status"');
+    }
+
+    // CONTROL NEGATIVO 2: el detector discrimina. No se conforma con encontrar
+    // un `variant="destructive"` cualquiera ni con un `role="status"` lejano.
+    expect(
+      alertsWithExplicitStatusRole('<Alert variant="destructive" role="status">x</Alert>', "destructive"),
+    ).toBe(1);
+    expect(
+      alertsWithExplicitStatusRole('<Alert variant="destructive">x</Alert>', "destructive"),
+    ).toBe(0);
+    expect(
+      alertsWithExplicitStatusRole(
+        '<Alert variant="warning" role="status">x</Alert>',
+        "destructive",
+      ),
+    ).toBe(0);
   });
 
   it("los pendientes de pago bloquean el cierre: Alert de aviso con la lista adentro", () => {
