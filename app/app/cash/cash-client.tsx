@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useTransition, type FormEvent } from "react";
+import { toast } from "sonner";
 import {
   closeShiftAction,
   getDayViewAction,
@@ -18,6 +19,7 @@ import type {
   HistoryResult,
 } from "@/src/features/cash/service";
 import type { PaymentMethodRow } from "@/src/features/admin/service";
+import { Alert } from "@/src/components/ui/lib/alert";
 import {
   Dialog,
   DialogContent,
@@ -30,12 +32,10 @@ import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 import { HISTORY_PAGE_SIZE } from "@/src/features/cash/schemas";
 import {
   buttonClass,
-  errorClass,
   ghostClass,
   inputClass,
   labelClass,
   mutedTextClass,
-  okClass,
   sectionClass,
   tableCellClass,
   tableHeaderClass,
@@ -307,7 +307,6 @@ export function CashClient(props: CashClientProps) {
   const [histDesde, setHistDesde] = useState(props.initialHistory.desde);
   const [histHasta, setHistHasta] = useState(props.initialHistory.hasta);
 
-  const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [isOpeningDialogOpen, setIsOpeningDialogOpen] = useState(false);
@@ -352,12 +351,19 @@ export function CashClient(props: CashClientProps) {
 
   function showResult<T>(result: ActionResult<T>, okMessage: string): result is { success: true; data: T } {
     if (!result.success) {
+      // El fallo de una acción es ESTADO: deja el mensaje en la vista,
+      // persistente mientras el problema exista.
       setError(result.message);
-      setNotice(null);
       return false;
     }
     setError(null);
-    setNotice(okMessage);
+    if (okMessage) {
+      // El éxito de una acción es EVENTO: acaba de pasar y no tiene que
+      // quedarse en pantalla compitiendo con lo que sí importa. Antes era un
+      // <p role="status"> que persistía hasta la siguiente acción. El texto es
+      // el mismo.
+      toast.success(okMessage);
+    }
     return true;
   }
 
@@ -495,8 +501,14 @@ export function CashClient(props: CashClientProps) {
           );
           if (baseDiff < 0) parts.push(`base incompleta (faltante ${formatMoney(-baseDiff)})`);
           if (baseDiff > 0) parts.push(`sobrante en base ${formatMoney(baseDiff)}`);
+          // El cierre con diferencias también es EVENTO —el turno ya se
+          // cerró, solo que con salvedades—, así que sale por el mismo canal
+          // efímero. `setError(null)` se queda: el cierre salió bien y el
+          // fallo anterior (si lo había) ya no es el caso.
           setError(null);
-          setNotice(`Cierre con diferencias: ${parts.join(" · ")}. Sobre ${formatMoney(envelope)}. Se informó a los administradores.`);
+          toast.success(
+            `Cierre con diferencias: ${parts.join(" · ")}. Sobre ${formatMoney(envelope)}. Se informó a los administradores.`,
+          );
         }
         const dayResult = await getDayViewAction({ fecha: props.today, sede_id: props.sedeId });
         if (dayResult.success) setDay(dayResult.data);
@@ -565,14 +577,11 @@ export function CashClient(props: CashClientProps) {
   return (
     <div className="flex flex-col gap-6">
       {error && (
-        <p role="alert" className={errorClass}>
-          {error}
-        </p>
-      )}
-      {notice && (
-        <p role="status" className={okClass}>
-          {notice}
-        </p>
+        // Fallo al abrir o cerrar el turno = ESTADO: sigue siendo el caso
+        // mientras no se corrija, así que va inline y persistente arriba de las
+        // secciones. `destructive` deriva role="alert" (asertivo), el mismo rol
+        // que el `<p role="alert">` escribía a mano.
+        <Alert variant="destructive">{error}</Alert>
       )}
 
       <section className={sectionClass}>
