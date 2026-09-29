@@ -1,6 +1,28 @@
 @import "tailwindcss";
 @import "../src/styles/design-tokens.css";
 
+/* Alcance del escaneo de candidatos (D9a).
+
+   Tailwind v4 arma sus fuentes así: si el CSS no declara `@source`,
+   `source(none)` ni `@tailwind utilities source(...)`, el escáner usa un único
+   glob `**` anclado en el `base` del plugin de PostCSS, y ese `base` es
+   `process.cwd()` cuando el build no le pasa ninguno (`@tailwindcss/postcss`,
+   fábrica del plugin: `base ?? process.cwd()`). O sea: la raíz desde la que
+   corre el build. `next build` corre desde `app/`, así que `odd/**` nunca
+   estuvo en el escaneo; lo que sí entraba era la documentación de `app/`: este
+   README y el de cada feature (9 `.md`). Una clase nombrada en una nota se
+   emitía y la evidencia "esta utilidad se emite" quedaba contaminada.
+
+   Los patrones son relativos a este archivo (`app/app/globals.css`), así que
+   `../../` es la raíz del checkout: quedan afuera TODOS los `.md` del repo,
+   corra el build desde donde corra. Los `.md` no aportan ninguna clase que el
+   código no nombre ya: 0 de las 332 utilidades del CSS compilado aparecían solo
+   en un `.md`, así que el bundle emitido no cambia (verificado antes/después).
+   Los comentarios de los propios `.ts`/`.css` siguen alimentando el escáner
+   —Tailwind lee texto, no distingue comentarios— y eso no se puede acotar por
+   ruta: es un límite conocido, no un olvido. */
+@source not "../../**/*.md";
+
 /* Tailwind CSS 4: dark mode driven by the `.dark` class on <html>. */
 @custom-variant dark (&:where(.dark, .dark *));
 
@@ -101,7 +123,14 @@
   --primary-foreground: var(--color-neutral-50);
   --secondary: var(--bg-surface-hover);
   --secondary-foreground: var(--text-primary);
-  --muted: var(--bg-surface-2);
+  /* `--muted` apuntaba a `--bg-surface-2`, que era el mismo color que
+     `--bg-surface-hover` en los dos temas (dos nombres para un valor). Se
+     retiró el duplicado y esta clave usa el superviviente: el valor resuelto no
+     cambia (en claro el mismo `theme()` del peldaño 100; en oscuro el mismo
+     `oklch(0.22 0 0)`), y el token de estado que el código ya pedía en 32
+     apariciones de la utilidad `bg-surface-hover` (14 archivos) deja de tener un
+     gemelo de un solo consumidor. */
+  --muted: var(--bg-surface-hover);
   --muted-foreground: var(--color-text-secondary);
   --accent: var(--bg-surface-hover);
   --accent-foreground: var(--text-primary);

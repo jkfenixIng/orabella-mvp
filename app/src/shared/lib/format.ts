@@ -29,9 +29,23 @@ export function toNumber(value: string): number | null {
  * "Invalid Date" (conducta heredada: `toLocaleString` sobre un `Date`
  * inválido); no se corrige acá para no introducir conducta nueva en WU3.
  *
- * Nota: usa el huso del runtime, igual que las dos copias que reemplaza. El
- * huso de negocio (America/Bogota) vive en `src/shared/lib/dates.ts` y no es lo
- * que este formateador resuelve.
+ * Huso horario de PRESENTACIÓN — decisión registrada (D5, opción b: dejarlo
+ * como está). La app RAZONA en America/Bogota: `bogotaDay()`, `dayBounds()` y
+ * `rangeBounds()` en `src/shared/lib/dates.ts` pasan `timeZone: "America/Bogota"`
+ * al calcular el día calendario y el rango. Lo que se RENDERIZA, en cambio, sale
+ * del huso del runtime: el `toLocaleString` de la línea de abajo no lleva
+ * `timeZone`, así que usa el reloj de la máquina del usuario. Un usuario con el
+ * sistema en otro huso ve las horas corridas respecto de alguien en Bogotá, sin
+ * error, sin aviso y sin registro.
+ *
+ * Revisado y decidido: se deja así a propósito. La operación es de una sola sede
+ * (`src/shared/lib/sede.ts`, `resolveSede`) con el personal en Colombia, así que
+ * el corrimiento solo aparece en un cliente con el sistema mal configurado; y
+ * fijar el huso acá cambiaría la fecha y hora de todas las pantallas que ya se
+ * aceptaron (alertas, caja, nómina, vales) sin una necesidad medida. Si algún día
+ * se decide fijarlo, el punto ÚNICO es esta función (`timeZone: "America/Bogota"`
+ * en las opciones de abajo), no `dates.ts`: ese archivo es el huso del CÁLCULO de
+ * negocio, no el de la presentación.
  */
 export function formatDateTime(value: string | null | undefined): string {
   if (!value) return "—";

@@ -869,6 +869,43 @@ describe("design tokens: guardas de contrato", () => {
       .toBeGreaterThanOrEqual(AA_TEXT_MIN);
   });
 
+  it("el escaneo de candidatos sigue excluyendo la documentación (.md)", () => {
+    // D9a: sin `@source`, Tailwind v4 escanea `**/*` desde la raíz del build
+    // (`base ?? process.cwd()` en @tailwindcss/postcss), y ahí entraban el
+    // README de la app y el de cada feature: una clase nombrada en una nota se
+    // emitía y la evidencia "esta utilidad se emite" dejaba de valer. Esta
+    // guarda es un TRIPWIRE de texto, no una medición: comprueba que la
+    // directiva sigue declarada y que sigue apuntando a los `.md` de todo el
+    // checkout. El mecanismo real (que el escáner ya no recorra ningún `.md` y
+    // que el CSS emitido no cambie) se verificó con el escáner de PostCSS y con
+    // dos builds comparados byte a byte, no acá.
+    expect(GLOBALS_CSS, "globals.css").toContain('@source not "../../**/*.md"');
+  });
+
+  it("el token de superficie duplicado --bg-surface-2 no existe y --muted conserva su valor", () => {
+    // --bg-surface-2 era el mismo color que --bg-surface-hover en los dos temas
+    // (en claro los dos se resolvían contra el mismo peldaño con `theme(...)`;
+    // en oscuro, el mismo literal oklch(0.22 0 0)) y tenía un solo consumidor:
+    // la clave `--muted` de globals.css. Se retiró el nombre duplicado y
+    // `--muted` usa el superviviente. La guarda exige las dos mitades: que el
+    // duplicado no vuelva, y que el valor RESUELTO de `--muted` no haya
+    // cambiado al cambiar de nombre (si el superviviente dejara de resolver,
+    // esto falla).
+    expect(lightVars.has("--bg-surface-2"), "design-tokens.css :root").toBe(false);
+    expect(darkVars.has("--bg-surface-2"), "design-tokens.css .dark").toBe(false);
+    expect(requireVar(globalsRoot, "--muted", "globals.css :root")).toBe("var(--bg-surface-hover)");
+
+    const darkLayers = [globalsRoot, darkTheme, themeInline];
+    const lightMuted = resolveConcrete("--muted", ALIAS_LAYERS);
+    const darkMuted = resolveConcrete("--muted", darkLayers);
+    expect(lightMuted, "--muted (claro) debe resolver").not.toBeNull();
+    expect(darkMuted, "--muted (oscuro) debe resolver").not.toBeNull();
+    expect(lightMuted).toBe(resolveConcrete("--bg-surface-hover", ALIAS_LAYERS));
+    expect(darkMuted).toBe(resolveConcrete("--bg-surface-hover", darkLayers));
+    expect(parseOklch(lightMuted as string), `claro: ${lightMuted}`).not.toBeNull();
+    expect(parseOklch(darkMuted as string), `oscuro: ${darkMuted}`).not.toBeNull();
+  });
+
   it("las dos claves base del registry (background/foreground) existen y resuelven en ambos temas", () => {
     const globalsDark = readThemeVars(GLOBALS_CSS, ".dark");
     const failures: string[] = [];
