@@ -45,8 +45,14 @@ import {
   calculatePayroll,
   getPeriodDetail,
   PayrollError,
+  rejectVoucher,
   type PayrollActor,
 } from "@/src/features/payroll/service";
+import {
+  getPeriodDetailAction,
+  listVouchersAction,
+} from "@/src/features/payroll/actions";
+import type { AdminSession } from "@/src/features/admin/service";
 import {
   chunkIds,
   IN_FILTER_CHUNK_SIZE,
@@ -1046,6 +1052,19 @@ const payrollPagedStub = vi.hoisted(() => ({
   inFilters: [] as Array<{ table: string; column: string; count: number }>,
   /** Falla el select de `table` cuando entre sus filtros está `filter`. */
   failOn: null as { table: string; filter: string } | null,
+  /**
+   * U8: simula la ESCRITURA concurrente de otra transacción (la nómina que
+   * descuenta el vale) justo antes de que el UPDATE del servicio evalúe sus
+   * filtros. Así la carrera entre la lectura y la escritura se observa de
+   * verdad: la fila cambió entre la lectura y el compare-and-swap.
+   */
+  beforeUpdate: null as { table: string; run: () => void } | null,
+  /** Sesión que devuelve el `requireSession` simulado (pruebas de actions, U8). */
+  session: {
+    userId: "u-empleado-55",
+    sedeId: "11111111-1111-4111-8111-111111111111",
+    roles: ["empleado"],
+  } as AdminSession,
   /** Payload de cada INSERT (auditoría y demás): qué se registró de verdad. */
   inserts: [] as Array<{ table: string; payload: unknown }>,
   /** Payload de cada UPDATE, por tabla: si la escritura ocurrió o no. */
@@ -1073,9 +1092,27 @@ function createPayrollPagedStubClient(): unknown {
 
     const select = (single: boolean): { data: unknown; error: unknown } => {
       if (op === "update") {
+        // U8: la otra transacción escribe ANTES de que este UPDATE evalúe sus
+        // filtros (la carrera real). Se dispara una sola vez.
+        const beforeUpdate = payrollPagedStub.beforeUpdate;
+        if (beforeUpdate && beforeUpdate.table === table) {
+          payrollPagedStub.beforeUpdate = null;
+          beforeUpdate.run();
+        }
         // PostgREST devuelve las filas que el UPDATE afectó, con el payload ya
         // aplicado: la aprobación del vale necesita esa fila de vuelta.
         const matched = rows().filter((row) => filters.every((matches) => matches(row)));
+        // `.single()` sobre 0 filas es PGRST116 (el patrón del cliente
+        // Supabase): la señal de que el compare-and-swap perdió la carrera.
+        if (single && matched.length === 0) {
+          return {
+            data: null,
+            error: {
+              code: "PGRST116",
+              message: "JSON object requested, multiple (or no) rows returned",
+            },
+          };
+        }
         for (const row of matched) Object.assign(row, updatePayload ?? {});
         return { data: single ? matched[0] ?? null : matched, error: null };
       }
@@ -1209,6 +1246,12 @@ function resetPayrollStubState(): void {
   payrollPagedStub.itemsUpsert = null;
   payrollPagedStub.inFilters.length = 0;
   payrollPagedStub.failOn = null;
+  payrollPagedStub.beforeUpdate = null;
+  payrollPagedStub.session = {
+    userId: "u-empleado-55",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["empleado"],
+  };
   payrollPagedStub.inserts.length = 0;
   payrollPagedStub.updates.length = 0;
 }
@@ -1219,6 +1262,12 @@ function resetPayrollStubState(): void {
 vi.mock("next/cache", () => ({
   unstable_cache: (fn: unknown) => fn,
   revalidateTag: () => {},
+}));
+
+// Las actions de nómina leen la cookie de sesión; acá la sesión la resuelve el
+// `requireSession` simulado del mock de admin/service (ver abajo).
+vi.mock("next/headers", () => ({
+  cookies: async () => ({ get: () => ({ value: "token-de-prueba" }) }),
 }));
 
 vi.mock("@/src/features/admin/service", async (importOriginal) => {
@@ -1245,6 +1294,7 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
   // si no, el fixture de un empleado que usan las pruebas de U5.
   return {
     ...actual,
+    requireSession: async () => payrollPagedStub.session,
     listEmployees: async (sedeId: string, limit?: number) =>
       payrollPagedStub.tables.employees
         ? actual.listEmployees(sedeId, limit)
@@ -1950,5 +2000,318 @@ describe("payroll: la marca over_tope de la aprobación no puede mentir (U7)", (
 
     expect(approved.status).toBe("aprobada");
     expect((approvalAudit()?.metadata as { over_tope?: unknown }).over_tope).toBe(true);
+  });
+});
+
+// ------------------------------------------- transición de vales (U8) ---
+// `approveVoucher`/`rejectVoucher` leían el estado y después escribían con
+// `.eq("id", id)` SIN precondición. Entre esa lectura y esa escritura la nómina
+// puede marcar el vale `descontada` (el descuento SÍ guarda con `.in("status",
+// ["pendiente","aprobada"])`). La aprobación entonces pisaba `descontada` con
+// `aprobada`: el vale quedaba descontable OTRA vez en un período posterior y, a
+// la vez, contado como salida de caja. Acá se reproduce la carrera con la
+// escritura concurrente del doble.
+//
+// Matriz legal, leída del código (no adivinada):
+//   - `canReviewVoucher(schemas.ts:565)` = solo `pendiente` → origen de aprobar
+//     y de rechazar.
+//   - aprobar escribe `aprobada`; rechazar escribe `rechazada`.
+//   - `canDiscountVoucher(schemas.ts:557)` = `pendiente` | `aprobada` → origen
+//     de `descontada` (nómina).
+//   - `restoreVoucherStatus(schemas.ts:329)`: `descontada` → `aprobada` si hay
+//     `approved_by`, si no `pendiente` (al borrar el borrador).
+//   - `resolveVoucherInitialStatus(schemas.ts:520)`: nace `aprobada` o `pendiente`.
+//   Por eso el origen legal de aprobar/rechazar es exactamente `pendiente`.
+describe("payroll: la revisión del vale no pisa lo que la nómina descontó (U8)", () => {
+  const VOUCHER_ID = "88888888-8888-4888-8888-888888888888";
+  const EMPLEADO = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const ACTOR: PayrollActor = {
+    userId: "u-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const REQUEST_DATE = "2026-01-15";
+
+  function seedVoucher(status: string, extra: Record<string, unknown> = {}) {
+    const voucher: Record<string, unknown> = {
+      id: VOUCHER_ID,
+      sede_id: payrollPagedStub.SEDE_ID,
+      employee_id: EMPLEADO,
+      amount: 150000,
+      request_date: REQUEST_DATE,
+      status,
+      approved_by: null,
+      approval_code: null,
+      observation: null,
+      method_code: "transferencia",
+      cash_shift_id: null,
+      created_by: "u-1",
+      ...extra,
+    };
+    payrollPagedStub.tables = {
+      voucher_requests: [voucher],
+      voucher_settings: [
+        {
+          sede_id: payrollPagedStub.SEDE_ID,
+          max_per_day: 200000,
+          max_per_week: null,
+          allowed_days: null,
+          per_day_limits: null,
+        },
+      ],
+      users: [],
+      audit_logs: [],
+    };
+    return voucher;
+  }
+
+  /** La nómina marca el vale `descontada` justo antes del UPDATE del admin. */
+  function nominaDescuentaAntesDelUpdate(voucher: Record<string, unknown>): void {
+    payrollPagedStub.beforeUpdate = {
+      table: "voucher_requests",
+      run: () => {
+        voucher.status = "descontada";
+        voucher.approved_by = "u-nomina";
+      },
+    };
+  }
+
+  function auditActions(): string[] {
+    return payrollPagedStub.inserts
+      .filter((entry) => entry.table === "audit_logs")
+      .map((entry) => String((entry.payload as { action?: string }).action));
+  }
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  it("RED: si la nómina descuenta el vale antes de aprobarlo, la aprobación se RECHAZA", async () => {
+    const voucher = seedVoucher("pendiente");
+    nominaDescuentaAntesDelUpdate(voucher);
+
+    const failure: unknown = await approveVoucher(
+      payrollPagedStub.SEDE_ID,
+      VOUCHER_ID,
+      {},
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "VOUCHER_CONFLICT", status: 409 });
+    expect(voucher.status).toBe("descontada");
+    expect(auditActions()).toEqual([]);
+  });
+
+  it("la carrera del rechazo también se rechaza (no pisa `descontada`)", async () => {
+    const voucher = seedVoucher("pendiente");
+    nominaDescuentaAntesDelUpdate(voucher);
+
+    const failure: unknown = await rejectVoucher(
+      payrollPagedStub.SEDE_ID,
+      VOUCHER_ID,
+      { motivo: "Fuera de política" },
+      { userId: "u-1" },
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "VOUCHER_CONFLICT", status: 409 });
+    expect(voucher.status).toBe("descontada");
+    expect(auditActions()).toEqual([]);
+  });
+
+  it("control: un vale pendiente sin carrera se aprueba (la guarda no bloquea el camino legal)", async () => {
+    const voucher = seedVoucher("pendiente");
+
+    const approved = await approveVoucher(payrollPagedStub.SEDE_ID, VOUCHER_ID, {}, ACTOR);
+
+    expect(approved.status).toBe("aprobada");
+    expect(voucher.status).toBe("aprobada");
+    expect(auditActions()).toContain("voucher.approved");
+  });
+
+  it("control: un vale pendiente sin carrera se rechaza", async () => {
+    const voucher = seedVoucher("pendiente");
+
+    const rejected = await rejectVoucher(
+      payrollPagedStub.SEDE_ID,
+      VOUCHER_ID,
+      { motivo: "Sin justificación" },
+      { userId: "u-1" },
+    );
+
+    expect(rejected.status).toBe("rechazada");
+    expect(voucher.status).toBe("rechazada");
+    expect(auditActions()).toContain("voucher.rejected");
+  });
+
+  it("control negativo: lo que ya no es `pendiente` se rechaza en la lectura, sin tocar la fila", async () => {
+    seedVoucher("aprobada", { approved_by: "u-1" });
+    const onApproved: unknown = await approveVoucher(
+      payrollPagedStub.SEDE_ID,
+      VOUCHER_ID,
+      {},
+      ACTOR,
+    ).catch((error: unknown) => error);
+    expect(onApproved).toMatchObject({ code: "VOUCHER_IMMUTABLE", status: 409 });
+
+    seedVoucher("descontada", { approved_by: "u-1" });
+    const onDiscounted: unknown = await rejectVoucher(
+      payrollPagedStub.SEDE_ID,
+      VOUCHER_ID,
+      { motivo: "x" },
+      { userId: "u-1" },
+    ).catch((error: unknown) => error);
+    expect(onDiscounted).toMatchObject({ code: "VOUCHER_IN_PAYROLL", status: 409 });
+    expect(auditActions()).toEqual([]);
+  });
+});
+
+// ------------------------------------------- actions de nómina (U8) ---
+// El empleado logueado se ubicaba con `listEmployees(sedeId)`, que corta en 50
+// (`clampLimit`). En una sede con más de 50 empleados, quien estaba después del
+// 50 recibía `ownId = "sin-acceso"` y veía su detalle y su nómina VACÍOS, sin un
+// solo error. U7 ya había cerrado el extremo que ARMA la nómina (el cálculo);
+// acá se cierra el extremo que MIRA (la pantalla del propio empleado).
+describe("payroll: el empleado logueado se ubica en la planta completa (U8)", () => {
+  const PERIOD_ID = payrollPagedStub.PERIOD_ID;
+  const TARGET_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeee5555";
+  const TARGET_USER = "u-empleado-55";
+
+  /** 60 empleados ordenados por nombre; el objetivo (user_id) va en `targetIndex`. */
+  function seedPlanta(count: number, targetIndex: number) {
+    const employees: Array<Record<string, unknown>> = [];
+    for (let index = 1; index <= count; index += 1) {
+      const suffix = String(index).padStart(2, "0");
+      const isTarget = index === targetIndex;
+      employees.push({
+        id: isTarget ? TARGET_ID : `emp-${suffix}`,
+        sede_id: payrollPagedStub.SEDE_ID,
+        user_id: isTarget ? TARGET_USER : `u-${suffix}`,
+        full_name: `Empleado ${suffix}`,
+        employee_code: null,
+        document: null,
+        phone: null,
+        position: null,
+        payout_mode: "normal",
+        email: null,
+        birth_date: null,
+        pay_type: "porcentaje",
+        salary_fixed: null,
+        commission_percent: 10,
+        is_active: true,
+      });
+    }
+    payrollPagedStub.tables.employees = employees;
+    return employees;
+  }
+
+  function seedPeriodo() {
+    payrollPagedStub.tables.payroll_periods = [
+      {
+        id: PERIOD_ID,
+        sede_id: payrollPagedStub.SEDE_ID,
+        start_date: "2026-01-01",
+        end_date: "2026-01-31",
+        status: "borrador",
+        created_by: "u-1",
+        closed_at: null,
+        created_at: "2026-01-01T00:00:00.000Z",
+      },
+    ];
+  }
+
+  function item(id: string, employeeId: string) {
+    return {
+      id,
+      period_id: PERIOD_ID,
+      employee_id: employeeId,
+      base_fixed: 0,
+      commissions: 100000,
+      bonuses: 0,
+      deductions_vales: 0,
+      other_discounts: 0,
+      net_pay: 100000,
+      detail_json: [],
+      created_at: "2026-01-15T10:00:00.000Z",
+    };
+  }
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  it("un empleado después del tope del listado (50) ve su propio detalle", async () => {
+    seedPlanta(60, 55);
+    seedPeriodo();
+    payrollPagedStub.tables.payroll_items = [item("item-mio", TARGET_ID), item("item-otro", "emp-02")];
+    payrollPagedStub.tables.payroll_payments = [
+      { id: "pago-mio", payroll_item_id: "item-mio", method_code: "efectivo", amount: 40000, paid_at: "2026-01-20T10:00:00.000Z" },
+    ];
+
+    const result = await getPeriodDetailAction(PERIOD_ID);
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.items.map((row) => row.id)).toEqual(["item-mio"]);
+    expect(result.data.items[0].paid).toBe(40000);
+    expect(result.data.items[0].remaining).toBe(60000);
+  });
+
+  it("el mismo empleado ve sus vales (no `sin-acceso`)", async () => {
+    seedPlanta(60, 55);
+    payrollPagedStub.tables.voucher_requests = [
+      {
+        id: "99999999-9999-4999-8999-999999999999",
+        sede_id: payrollPagedStub.SEDE_ID,
+        employee_id: TARGET_ID,
+        amount: 100000,
+        request_date: "2026-01-10",
+        status: "aprobada",
+        approved_by: "u-1",
+        approval_code: null,
+        observation: null,
+        method_code: "efectivo",
+        cash_shift_id: null,
+        created_by: "u-1",
+      },
+    ];
+    payrollPagedStub.tables.users = [];
+
+    const result = await listVouchersAction({});
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.map((voucher) => voucher.id)).toEqual([
+      "99999999-9999-4999-8999-999999999999",
+    ]);
+  });
+
+  it("control: un empleado dentro de los primeros 50 sigue viendo su detalle", async () => {
+    seedPlanta(60, 5);
+    seedPeriodo();
+    payrollPagedStub.tables.payroll_items = [item("item-mio", TARGET_ID)];
+    payrollPagedStub.session = { userId: TARGET_USER, sedeId: payrollPagedStub.SEDE_ID, roles: ["empleado"] };
+
+    const result = await getPeriodDetailAction(PERIOD_ID);
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.items.map((row) => row.id)).toEqual(["item-mio"]);
+  });
+
+  it("control negativo: sin legajo propio NO ve ítems ajenos (no falla abierto)", async () => {
+    seedPlanta(60, 55);
+    seedPeriodo();
+    payrollPagedStub.tables.payroll_items = [item("item-ajeno", TARGET_ID)];
+    payrollPagedStub.session = {
+      userId: "u-sin-legajo",
+      sedeId: payrollPagedStub.SEDE_ID,
+      roles: ["empleado"],
+    };
+
+    const result = await getPeriodDetailAction(PERIOD_ID);
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.items).toEqual([]);
   });
 });

@@ -231,6 +231,38 @@ function dateBound(value: string, end: boolean): string {
   return trimmed;
 }
 
+/**
+ * U8: los ids de factura en los que participa un empleado, leídos de forma
+ * EXHAUSTIVA. Antes cada llamador usaba un `.limit(N)` (`2000` en el listado,
+ * `5000` en el conteo) que el `max-rows` del Data API bajaba a 1000: listado y
+ * conteo trabajaban con un conjunto RECORTADO —facturas del empleado que no
+ * aparecían, páginas inalcanzables— sin un solo error. `order("id")` fija un
+ * orden determinista para que dos corridas paginen exactamente lo mismo. El
+ * fallo de la lectura se convierte en un error de negocio a la vista
+ * (`READ_INCOMPLETE`): nunca en “no hay facturas”.
+ */
+async function invoiceIdsOfEmployee(db: DbClient, employeeId: string): Promise<string[]> {
+  try {
+    const rows = await readAllPaged<{ invoice_id: string }>({
+      table: "invoice_items",
+      fetchPage: (from, to) =>
+        db
+          .from("invoice_items")
+          .select("invoice_id")
+          .eq("employee_id", employeeId)
+          .order("id")
+          .range(from, to),
+    });
+    return [...new Set(rows.map((row) => row.invoice_id))];
+  } catch (error) {
+    throw new BillingError(
+      "READ_INCOMPLETE",
+      `${error instanceof Error ? error.message : "La lectura de invoice_items quedó incompleta."} No se puede listar ni contar sin las facturas del empleado: con el conjunto recortado faltarían facturas y el paginador mostraría páginas vacías. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+      500,
+    );
+  }
+}
+
 /** Lista facturas de la sede con filtros + paginación (más recientes primero). */
 export async function listInvoices(sedeId: string, filters: InvoiceFilters = {}): Promise<InvoiceListItem[]> {
   if (filters.status !== undefined && !["Emitida", "Pagada", "Anulada"].includes(filters.status)) {
@@ -241,58 +273,123 @@ export async function listInvoices(sedeId: string, filters: InvoiceFilters = {})
   const page = filters.page === undefined ? 1 : Math.max(1, Math.floor(filters.page));
   const db = await billingDb();
 
-  // Filtro por empleado participante: primero los invoice_id con ese empleado.
+  // Filtro por empleado participante: primero los invoice_id con ese empleado
+  // (U8: lectura exhaustiva, ver `invoiceIdsOfEmployee`).
   let employeeInvoiceIds: string[] | null = null;
   if (filters.employee_id) {
-    const { data: idRows, error: idError } = await db
-      .from("invoice_items")
-      .select("invoice_id")
-      .eq("employee_id", filters.employee_id)
-      .limit(2000);
-    if (idError) throw new BillingError("INTERNAL", "Error interno.", 500);
-    employeeInvoiceIds = [...new Set(((idRows ?? []) as Array<{ invoice_id: string }>).map((row) => row.invoice_id))];
+    employeeInvoiceIds = await invoiceIdsOfEmployee(db, filters.employee_id);
     if (employeeInvoiceIds.length === 0) return [];
   }
 
-  let query = db
-    .from("invoices")
-    .select(`${INVOICE_SELECT}, users!invoices_user_id_fkey(full_name)`)
-    .eq("sede_id", sedeId)
-    .order("consecutive_number", { ascending: false })
-    .range((page - 1) * pageSize, page * pageSize - 1);
-  if (filters.limit !== undefined) query = query.limit(Math.min(100, Math.max(1, Math.floor(filters.limit))));
-  if (filters.status) query = query.eq("status", filters.status);
-  if (filters.from?.trim()) query = query.gte("created_at", dateBound(filters.from, false));
-  if (filters.to?.trim()) query = query.lte("created_at", dateBound(filters.to, true));
-  if (filters.user_id) query = query.eq("user_id", filters.user_id);
-  if (filters.closed_by) query = query.eq("closed_by", filters.closed_by);
-  if (filters.consecutive_number !== undefined) query = query.eq("consecutive_number", filters.consecutive_number);
-  if (employeeInvoiceIds) query = query.in("id", employeeInvoiceIds);
-  const { data, error } = await query;
-  if (error) {
-    // Diagnóstico servidor (no se expone al cliente): código/mensaje de PostgREST.
-    console.error("PG listInvoices:", JSON.stringify({ code: error.code, message: error.message, details: error.details, hint: error.hint }));
-    throw new BillingError("INTERNAL", "Error interno.", 500);
-  }
+  // Ventana pedida. `limit` (si viene) manda sobre `page`: reproduce el
+  // comportamiento del header `Range` de PostgREST, donde el último valor pedido
+  // gana.
+  const limit = filters.limit === undefined ? null : Math.min(100, Math.max(1, Math.floor(filters.limit)));
+  const offset = limit === null ? (page - 1) * pageSize : 0;
+  const size = limit ?? pageSize;
+
+  // Constructor de la consulta con TODOS los filtros, nuevo en cada llamada:
+  // los constructores encadenables de Supabase son inmutables y el doble de
+  // pruebas muta, así que reutilizar uno acumularía filtros entre lotes.
+  const buildInvoiceQuery = () => {
+    let query = db
+      .from("invoices")
+      .select(`${INVOICE_SELECT}, users!invoices_user_id_fkey(full_name)`)
+      .eq("sede_id", sedeId)
+      .order("consecutive_number", { ascending: false });
+    if (filters.status) query = query.eq("status", filters.status);
+    if (filters.from?.trim()) query = query.gte("created_at", dateBound(filters.from, false));
+    if (filters.to?.trim()) query = query.lte("created_at", dateBound(filters.to, true));
+    if (filters.user_id) query = query.eq("user_id", filters.user_id);
+    if (filters.closed_by) query = query.eq("closed_by", filters.closed_by);
+    if (filters.consecutive_number !== undefined) query = query.eq("consecutive_number", filters.consecutive_number);
+    return query;
+  };
+
   interface JoinedUser {
     users?: { full_name?: string | null } | null;
   }
-  const rows = ((data ?? []) as Array<InvoiceRow & JoinedUser>).map((row) => ({
+  let pageRows: InvoiceRow[];
+  if (employeeInvoiceIds) {
+    // U8: el `in("id", ...)` viaja en la URL; con 1000+ ids son ~44 KB y el Data
+    // API responde 414 —la lectura no ocurre—. Se lee por lotes y por páginas y
+    // recién ahí se recorta la página en memoria: el orden global
+    // (`consecutive_number` desc) no se puede reconstruir leyendo ventanas por
+    // lote, así que se trae el conjunto completo del empleado y se ordena igual
+    // que el servidor.
+    const all: InvoiceRow[] = [];
+    try {
+      for (const chunk of chunkIds(employeeInvoiceIds)) {
+        all.push(
+          ...(await readAllPaged<InvoiceRow>({
+            table: "invoices",
+            fetchPage: (from, to) =>
+              buildInvoiceQuery()
+                .in("id", chunk)
+                .order("id", { ascending: false })
+                .range(from, to),
+          })),
+        );
+      }
+    } catch (error) {
+      throw new BillingError(
+        "READ_INCOMPLETE",
+        `${error instanceof Error ? error.message : "La lectura de invoices quedó incompleta."} No se muestra el listado: con las facturas recortadas faltarían facturas del empleado. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+        500,
+      );
+    }
+    all.sort(
+      (left, right) =>
+        right.consecutive_number - left.consecutive_number ||
+        (right.id === left.id ? 0 : right.id < left.id ? -1 : 1),
+    );
+    pageRows = all.slice(offset, offset + size);
+  } else {
+    const { data, error } = await buildInvoiceQuery().range(offset, offset + size - 1);
+    if (error) {
+      // Diagnóstico servidor (no se expone al cliente): código/mensaje de PostgREST.
+      console.error("PG listInvoices:", JSON.stringify({ code: error.code, message: error.message, details: error.details, hint: error.hint }));
+      throw new BillingError("INTERNAL", "Error interno.", 500);
+    }
+    pageRows = (data ?? []) as unknown as InvoiceRow[];
+  }
+  const rows = pageRows.map((row) => ({
     ...row,
-    user_name: row.users?.full_name ?? null,
+    user_name: (row as unknown as JoinedUser).users?.full_name ?? null,
   }));
   if (rows.length === 0) return [];
 
   // Enriquecimiento: quién cerró + empleados participantes (sin N+1: 3 queries).
   const ids = rows.map((row) => row.id);
-  const { data: itemRows, error: itemsError } = await db
-    .from("invoice_items")
-    .select("invoice_id, employee_id")
-    .in("invoice_id", ids)
-    .order("created_at")
-    .limit(2000);
-  if (itemsError) throw new BillingError("INTERNAL", "Error interno.", 500);
-  const empIds = [...new Set(((itemRows ?? []) as Array<{ employee_id: string }>).map((row) => row.employee_id))];
+  // U8: lectura exhaustiva, por lotes de ids. Antes `.limit(2000)` (que el
+  // `max-rows` bajaba a 1000) truncaba los ítems de la página: con muchas líneas
+  // por factura, los empleados participantes de las últimas facturas
+  // desaparecían del listado.
+  const itemRows: Array<{ invoice_id: string; employee_id: string }> = [];
+  try {
+    for (const chunk of chunkIds(ids)) {
+      itemRows.push(
+        ...(await readAllPaged<{ invoice_id: string; employee_id: string }>({
+          table: "invoice_items",
+          fetchPage: (from, to) =>
+            db
+              .from("invoice_items")
+              .select("invoice_id, employee_id")
+              .in("invoice_id", chunk)
+              .order("created_at")
+              .order("id")
+              .range(from, to),
+        })),
+      );
+    }
+  } catch (error) {
+    throw new BillingError(
+      "READ_INCOMPLETE",
+      `${error instanceof Error ? error.message : "La lectura de los ítems de factura quedó incompleta."} No se muestra el listado: sin los ítems no se sabe qué empleados participaron. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+      500,
+    );
+  }
+  const empIds = [...new Set(itemRows.map((row) => row.employee_id))];
   const closerIds = [...new Set(rows.map((row) => row.closed_by).filter((id): id is string => id !== null))];
   const userIds = [...new Set([...empIds, ...closerIds])];
   const nameByUser = new Map<string, string>();
@@ -314,7 +411,7 @@ export async function listInvoices(sedeId: string, filters: InvoiceFilters = {})
     }
   }
   const namesByInvoice = new Map<string, string[]>();
-  for (const row of ((itemRows ?? []) as Array<{ invoice_id: string; employee_id: string }>)) {
+  for (const row of itemRows) {
     const name = nameByUser.get(row.employee_id);
     if (!name) continue;
     const list = namesByInvoice.get(row.invoice_id) ?? [];
@@ -333,24 +430,34 @@ export async function countInvoices(sedeId: string, filters: InvoiceFilters = {}
   const db = await billingDb();
   let employeeInvoiceIds: string[] | null = null;
   if (filters.employee_id) {
-    const { data: idRows, error: idError } = await db
-      .from("invoice_items")
-      .select("invoice_id")
-      .eq("employee_id", filters.employee_id)
-      .limit(5000);
-    if (idError) throw new BillingError("INTERNAL", "Error interno.", 500);
-    employeeInvoiceIds = [...new Set(((idRows ?? []) as Array<{ invoice_id: string }>).map((row) => row.invoice_id))];
+    employeeInvoiceIds = await invoiceIdsOfEmployee(db, filters.employee_id);
     if (employeeInvoiceIds.length === 0) return 0;
   }
-  let query = db.from("invoices").select("id", { count: "exact", head: true }).eq("sede_id", sedeId);
-  if (filters.status) query = query.eq("status", filters.status);
-  if (filters.from?.trim()) query = query.gte("created_at", dateBound(filters.from, false));
-  if (filters.to?.trim()) query = query.lte("created_at", dateBound(filters.to, true));
-  if (filters.user_id) query = query.eq("user_id", filters.user_id);
-  if (filters.closed_by) query = query.eq("closed_by", filters.closed_by);
-  if (filters.consecutive_number !== undefined) query = query.eq("consecutive_number", filters.consecutive_number);
-  if (employeeInvoiceIds) query = query.in("id", employeeInvoiceIds);
-  const { count, error } = await query;
+  // Constructor nuevo por lote (los encadenables de Supabase son inmutables y el
+  // doble de pruebas muta): el `in("id", ...)` con todos los ids de una vez
+  // viaja en la URL y con 1000+ ids son ~44 KB → 414, la lectura no ocurre.
+  const buildCountQuery = () => {
+    let query = db.from("invoices").select("id", { count: "exact", head: true }).eq("sede_id", sedeId);
+    if (filters.status) query = query.eq("status", filters.status);
+    if (filters.from?.trim()) query = query.gte("created_at", dateBound(filters.from, false));
+    if (filters.to?.trim()) query = query.lte("created_at", dateBound(filters.to, true));
+    if (filters.user_id) query = query.eq("user_id", filters.user_id);
+    if (filters.closed_by) query = query.eq("closed_by", filters.closed_by);
+    if (filters.consecutive_number !== undefined) query = query.eq("consecutive_number", filters.consecutive_number);
+    return query;
+  };
+  if (employeeInvoiceIds) {
+    // U8: el conteo se hace por lotes DISJUNTOS de ids y se suma: la suma es el
+    // total exacto y cada URL queda dentro del tamaño que aguanta.
+    let total = 0;
+    for (const chunk of chunkIds(employeeInvoiceIds)) {
+      const { count, error } = await buildCountQuery().in("id", chunk);
+      if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
+      total += count ?? 0;
+    }
+    return total;
+  }
+  const { count, error } = await buildCountQuery();
   if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
   return count ?? 0;
 }

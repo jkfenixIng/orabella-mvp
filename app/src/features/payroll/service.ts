@@ -1702,9 +1702,31 @@ export async function approveVoucher(
         observation,
       })
       .eq("id", id)
+      // U8: el estado LEÍDO es la precondición del UPDATE (compare-and-swap,
+      // igual que el cierre de caja y la anulación de factura). Sin esta guarda,
+      // una nómina que marca el vale `descontada` entre la lectura y esta
+      // escritura —el descuento SÍ guarda con `.in("status", ["pendiente",
+      // "aprobada"])`— quedaba pisada por `aprobada`: el vale se volvía a
+      // descontar en un período posterior y, a la vez, quedaba contado como
+      // salida de caja. El empleado cobraba de menos dos veces o la caja
+      // mostraba una salida fantasma.
+      .eq("status", voucher.status)
       .select(await resolveVoucherSelect(db))
       .single();
-    if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    if (error || !data) {
+      // Carrera perdida contra la guarda de estado (PGRST116 = `.single()` sin
+      // filas, el patrón del cliente Supabase: el mismo que usan el cierre de
+      // caja —SHIFT_ALREADY_CLOSED— y la anulación de factura —ANNUL_CONFLICT—).
+      const errorCode = (error as { code?: string } | null)?.code;
+      if (errorCode === "PGRST116") {
+        throw new PayrollError(
+          "VOUCHER_CONFLICT",
+          "El vale cambió de estado mientras se revisaba (posible descuento en nómina simultáneo). No se aprobó nada: vuelva a cargar el vale y revíselo de nuevo.",
+          409,
+        );
+      }
+      throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
     const [approved] = await attachVoucherUserNames(db, [
       normalizeVoucher(data as unknown as Record<string, unknown>),
     ]);
@@ -1772,9 +1794,26 @@ export async function rejectVoucher(
       .from("voucher_requests")
       .update({ status: "rechazada", observation: parsed.data.motivo.trim() })
       .eq("id", id)
+      // U8: misma guarda que la aprobación y por la misma razón. Acá el daño es
+      // el espejo: pisar `descontada` con `rechazada` deja un vale que YA se le
+      // descontó al empleado (y que quizá ya salió de caja) marcado como si
+      // nunca hubiera entrado en nómina, sin camino de reversión.
+      .eq("status", voucher.status)
       .select(await resolveVoucherSelect(db))
       .single();
-    if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    if (error || !data) {
+      // Carrera perdida contra la guarda de estado (PGRST116 = `.single()` sin
+      // filas, el patrón del cliente Supabase).
+      const errorCode = (error as { code?: string } | null)?.code;
+      if (errorCode === "PGRST116") {
+        throw new PayrollError(
+          "VOUCHER_CONFLICT",
+          "El vale cambió de estado mientras se revisaba (posible descuento en nómina simultáneo). No se rechazó nada: vuelva a cargar el vale y revíselo de nuevo.",
+          409,
+        );
+      }
+      throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
     const [rejected] = await attachVoucherUserNames(db, [
       normalizeVoucher(data as unknown as Record<string, unknown>),
     ]);

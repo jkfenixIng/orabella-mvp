@@ -31,8 +31,10 @@ import { computeInvoiceItemCommission } from "@/src/features/billing/commission"
 import {
   BillingError,
   annulInvoice,
+  countInvoices,
   editEmittedInvoiceItems,
   getInvoiceDetail,
+  listInvoices,
   type BillingActor,
 } from "@/src/features/billing/service";
 import {
@@ -1206,6 +1208,8 @@ const pagedStub = vi.hoisted(() => ({
   requests: {} as Record<string, number>,
   /** Ventanas efectivamente pedidas: la prueba de que se paginó y en qué orden. */
   windows: [] as Array<{ table: string; from: number; to: number; order: string[] }>,
+  /** Largo de cada `in(...)`, por tabla y columna: prueba el troceo (414). */
+  inFilters: [] as Array<{ table: string; column: string; count: number }>,
 }));
 
 /**
@@ -1399,7 +1403,17 @@ function createOverCollectionStubClient(): unknown {
       case "commission_rules":
         return { data: [], error: null };
       case "employees":
-        return { data: [{ id: EMPLOYEE_ID, sede_id: overCollectionStub.SEDE_ID }], error: null };
+        return {
+          data: [
+            {
+              id: EMPLOYEE_ID,
+              sede_id: overCollectionStub.SEDE_ID,
+              user_id: "u-1",
+              full_name: "Empleada de prueba",
+            },
+          ],
+          error: null,
+        };
       case "payroll_periods":
         return { data: [], error: null };
       default:
@@ -1424,13 +1438,13 @@ function createOverCollectionStubClient(): unknown {
       rangeTo: number;
       single: boolean;
     },
-  ): { data: unknown; error: unknown } => {
+  ): { data: unknown; error: unknown; total: number } => {
     const rows = pagedStub.tables[table];
-    if (!rows) return { data: null, error: null };
+    if (!rows) return { data: null, error: null, total: 0 };
     pagedStub.requests[table] = (pagedStub.requests[table] ?? 0) + 1;
     const attempt = pagedStub.requests[table] as number;
     if ((pagedStub.failAt[table] ?? []).includes(attempt)) {
-      return { data: null, error: { message: `doble: fallo inyectado en ${table} (request ${attempt})` } };
+      return { data: null, error: { message: `doble: fallo inyectado en ${table} (request ${attempt})` }, total: 0 };
     }
     const to = Math.min(spec.rangeTo, spec.rangeFrom + pagedStub.rowCap - 1);
     pagedStub.windows.push({ table, from: spec.rangeFrom, to, order: spec.orderKeys.map((key) => key.column) });
@@ -1447,7 +1461,7 @@ function createOverCollectionStubClient(): unknown {
       });
     }
     const window = filtered.slice(spec.rangeFrom, to + 1);
-    return { data: spec.single ? window[0] ?? null : window, error: null };
+    return { data: spec.single ? window[0] ?? null : window, error: null, total: filtered.length };
   };
 
   const from = (table: string) => {
@@ -1458,12 +1472,23 @@ function createOverCollectionStubClient(): unknown {
     let rangeTo = pagedStub.rowCap - 1;
     /** Guarda de estado del UPDATE (U6): la precondición del compare-and-swap. */
     let statusGuard: string | undefined;
+    // `select(cols, { count, head })`: PostgREST responde el total sin filas.
+    let countRequested = false;
+    let headOnly = false;
     // Las tablas NO registradas en `pagedStub` conservan la respuesta fija de
     // siempre: los filtros y la ventana se aceptan y se ignoran.
-    const resolve = (single: boolean) =>
-      op === "select" && pagedStub.tables[table]
-        ? pagedResponse(table, { filters, orderKeys, rangeFrom, rangeTo, single })
-        : response(table, op, statusGuard);
+    const resolve = (single: boolean) => {
+      const result =
+        op === "select" && pagedStub.tables[table]
+          ? pagedResponse(table, { filters, orderKeys, rangeFrom, rangeTo, single })
+          : response(table, op, statusGuard);
+      if (!countRequested) return result;
+      return {
+        data: headOnly ? null : (result as { data?: unknown }).data,
+        error: (result as { error?: unknown }).error,
+        count: (result as { total?: number }).total ?? 0,
+      };
+    };
     /**
      * Cierra la consulta. Si el test pidió detener el próximo UPDATE de
      * `invoices`, la escritura queda EN VUELO hasta que la libere: así se puede
@@ -1480,7 +1505,11 @@ function createOverCollectionStubClient(): unknown {
       }).then(() => resolve(single) as unknown);
     };
     const query: Record<string, unknown> = {
-      select: () => query,
+      select: (_columns?: unknown, options?: { count?: string; head?: boolean }) => {
+        if (options?.count) countRequested = true;
+        if (options?.head) headOnly = true;
+        return query;
+      },
       insert: (payload?: unknown) => {
         op = "insert";
         if (table === "audit_logs") {
@@ -1517,6 +1546,7 @@ function createOverCollectionStubClient(): unknown {
       },
       in: (column: string, values: readonly unknown[]) => {
         if (table === "commission_rules") commissionStub.inSizes.push(values.length);
+        pagedStub.inFilters.push({ table, column, count: values.length });
         const set = new Set(values);
         filters.push((row) => set.has(row[column]));
         return query;
@@ -2263,6 +2293,138 @@ describe("billing: la comisión mostrada no se corta con las reglas (U7)", () =>
     // Nunca una comisión calculada con lo que se alcanzó a leer.
     expect(failure).toBeInstanceOf(BillingError);
     expect(failure).toMatchObject({ code: "READ_INCOMPLETE" });
+  });
+});
+
+// ------------------------------- filtro por empleado: ni recorte ni 414 (U8) ---
+// `countInvoices` leía los ids de factura del empleado con `.limit(5000)` (que el
+// `max-rows` del Data API baja a 1000) y después filtraba `in("id", ids)` SIN
+// lotes: el conteo salía CORTO —páginas inalcanzables— y con 1000+ ids la URL
+// (~44 KB) no entra y el Data API responde 414, así que la lectura no ocurría.
+// `listInvoices` tenía el mismo recorte (`.limit(2000)`) y el mismo `in` sin
+// lotes, más un `.limit(2000)` en el enriquecimiento que truncaba los ítems de
+// la página.
+describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () => {
+  const SEDE = overCollectionStub.SEDE_ID;
+
+  function seedEmployeeInvoices(count: number, itemsPerInvoice = 1) {
+    const items: Array<Record<string, unknown>> = [];
+    const invoices: Array<Record<string, unknown>> = [];
+    for (let index = 1; index <= count; index += 1) {
+      const suffix = String(index).padStart(5, "0");
+      const invoiceId = `fac-${suffix}`;
+      invoices.push({
+        id: invoiceId,
+        sede_id: SEDE,
+        consecutive_number: index,
+        client_name: null,
+        client_document: null,
+        subtotal: 1000,
+        discount: 0,
+        tax: 0,
+        surcharge: 0,
+        total: 1000,
+        status: "Emitida",
+        user_id: "u-1",
+        cash_shift_id: null,
+        closed_by: null,
+        closed_at: null,
+        cancel_reason: null,
+        created_at: "2026-01-01T00:00:00.000Z",
+      });
+      for (let line = 1; line <= itemsPerInvoice; line += 1) {
+        items.push({
+          id: `li-${suffix}-${String(line).padStart(3, "0")}`,
+          invoice_id: invoiceId,
+          employee_id: EMPLOYEE_ID,
+          created_at: "2026-01-01T00:00:00.000Z",
+        });
+      }
+    }
+    pagedStub.tables = { invoice_items: items, invoices };
+  }
+
+  function invoiceIdInSizes(): number[] {
+    return pagedStub.inFilters
+      .filter((entry) => entry.table === "invoices" && entry.column === "id")
+      .map((entry) => entry.count);
+  }
+
+  beforeEach(() => {
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+    pagedStub.inFilters.length = 0;
+  });
+
+  it("RED: countInvoices cuenta TODAS las facturas del empleado, no un recorte", async () => {
+    seedEmployeeInvoices(1200);
+
+    const total = await countInvoices(SEDE, { employee_id: EMPLOYEE_ID });
+
+    expect(total).toBe(1200);
+  });
+
+  it("countInvoices manda los ids en lotes que aguantan la URL y pagina la lectura", async () => {
+    seedEmployeeInvoices(1200);
+
+    await countInvoices(SEDE, { employee_id: EMPLOYEE_ID });
+
+    const sizes = invoiceIdInSizes();
+    expect(sizes.length).toBeGreaterThan(1);
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(IN_FILTER_CHUNK_SIZE);
+    // La lectura de `invoice_items` paginó: no se cortó en el tope por request.
+    expect(pagedStub.windows.filter((window) => window.table === "invoice_items").length).toBeGreaterThan(1);
+  });
+
+  it("RED: listInvoices no pierde facturas del empleado", async () => {
+    seedEmployeeInvoices(1200);
+
+    const rows = await listInvoices(SEDE, { employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
+
+    expect(rows).toHaveLength(10);
+    // La más reciente del conjunto COMPLETO del empleado, no del recorte.
+    expect(rows[0].consecutive_number).toBe(1200);
+  });
+
+  it("listInvoices no arma un `in` gigante y mantiene el orden descendente", async () => {
+    seedEmployeeInvoices(1200);
+
+    const rows = await listInvoices(SEDE, { employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
+
+    expect(rows.map((row) => row.consecutive_number)).toEqual([
+      1200, 1199, 1198, 1197, 1196, 1195, 1194, 1193, 1192, 1191,
+    ]);
+    expect(Math.max(...invoiceIdInSizes())).toBeLessThanOrEqual(IN_FILTER_CHUNK_SIZE);
+  });
+
+  it("RED: con más de 1000 líneas en la página no se pierde factura ni participante", async () => {
+    // 10 facturas × 120 líneas = 1200 ítems en la página: el `.limit(2000)` que
+    // el `max-rows` baja a 1000 dejaba a las últimas facturas sin participantes.
+    seedEmployeeInvoices(10, 120);
+
+    const rows = await listInvoices(SEDE, { employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
+
+    expect(rows).toHaveLength(10);
+    expect(rows.every((row) => row.employee_names.length === 1)).toBe(true);
+  });
+
+  it("control: un empleado con pocas facturas sigue listando y contando igual", async () => {
+    seedEmployeeInvoices(3);
+
+    const rows = await listInvoices(SEDE, { employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
+
+    expect(rows.map((row) => row.consecutive_number)).toEqual([3, 2, 1]);
+    expect(await countInvoices(SEDE, { employee_id: EMPLOYEE_ID })).toBe(3);
+    // Cada lectura pidió su único lote (uno para el listado, uno para el conteo)
+    // y ninguna paginó más allá de la primera página: el conjunto entra entero.
+    expect(invoiceIdInSizes().every((size) => size <= IN_FILTER_CHUNK_SIZE)).toBe(true);
+    expect(
+      pagedStub.windows
+        .filter((window) => window.table === "invoice_items")
+        .every((window) => window.from === 0),
+    ).toBe(true);
   });
 });
 
