@@ -23,6 +23,8 @@ import {
   openPeriodSchema,
   overlapBlocksDeletion,
   payPayrollItemSchema,
+  prorateFixedSalary,
+  rangesOverlap,
   rejectVoucherSchema,
   requestVoucherSchema,
   requiresVoucherApproval,
@@ -44,6 +46,7 @@ import {
   approveVoucher,
   calculatePayroll,
   getPeriodDetail,
+  openPayrollPeriod,
   PayrollError,
   rejectVoucher,
   type PayrollActor,
@@ -1067,6 +1070,13 @@ const payrollPagedStub = vi.hoisted(() => ({
   } as AdminSession,
   /** Payload de cada INSERT (auditoría y demás): qué se registró de verdad. */
   inserts: [] as Array<{ table: string; payload: unknown }>,
+  /**
+   * PR1: falla el INSERT de `table` con este código. El doble tiene que poder
+   * responder como la BASE (una restricción violada, `23P01`), no sólo como un
+   * cliente feliz: si no, la carrera contra la restricción de exclusión no se
+   * podría probar.
+   */
+  insertError: null as { table: string; code: string } | null,
   /** Payload de cada UPDATE, por tabla: si la escritura ocurrió o no. */
   updates: [] as Array<{ table: string; payload: unknown }>,
 }));
@@ -1087,6 +1097,7 @@ function createPayrollPagedStubClient(): unknown {
     let rangeFrom = 0;
     let rangeTo = payrollPagedStub.rowCap - 1;
     let updatePayload: Record<string, unknown> | undefined;
+    let insertPayload: unknown;
 
     const rows = (): Array<Record<string, unknown>> => payrollPagedStub.tables[table] ?? [];
 
@@ -1116,7 +1127,30 @@ function createPayrollPagedStubClient(): unknown {
         for (const row of matched) Object.assign(row, updatePayload ?? {});
         return { data: single ? matched[0] ?? null : matched, error: null };
       }
-      if (op !== "select") return { data: null, error: null };
+      if (op !== "select") {
+        // INSERT: PostgREST devuelve las filas insertadas y las deja en la
+        // tabla (el upsert ya persistía: `getPeriodDetail` lee después esas
+        // filas). Hacía falta acá para `openPayrollPeriod`, que necesita la
+        // fila de vuelta; y para poder inyectar el fallo de la BASE.
+        const failure = payrollPagedStub.insertError;
+        if (failure && failure.table === table) {
+          return {
+            data: null,
+            error: { code: failure.code, message: `doble: ${failure.code} inyectado en el INSERT de ${table}` },
+          };
+        }
+        const values = (Array.isArray(insertPayload) ? insertPayload : [insertPayload]) as Array<
+          Record<string, unknown>
+        >;
+        const persisted = values.map((row, index) => ({
+          id: `fila-insertada-${index + 1}`,
+          created_at: "2026-01-31T23:59:59.000Z",
+          closed_at: null,
+          ...row,
+        }));
+        payrollPagedStub.tables[table] = [...rows(), ...persisted];
+        return { data: single ? persisted[0] ?? null : persisted, error: null };
+      }
       const failOn = payrollPagedStub.failOn;
       if (failOn && failOn.table === table && filterColumns.includes(failOn.filter)) {
         return {
@@ -1147,6 +1181,7 @@ function createPayrollPagedStubClient(): unknown {
       select: () => query,
       insert: (payload?: unknown) => {
         op = "insert";
+        insertPayload = payload;
         payrollPagedStub.inserts.push({ table, payload });
         return query;
       },
@@ -1253,6 +1288,7 @@ function resetPayrollStubState(): void {
     roles: ["empleado"],
   };
   payrollPagedStub.inserts.length = 0;
+  payrollPagedStub.insertError = null;
   payrollPagedStub.updates.length = 0;
 }
 
@@ -2315,3 +2351,461 @@ describe("payroll: el empleado logueado se ubica en la planta completa (U8)", ()
     expect(result.data.items).toEqual([]);
   });
 });
+
+// ------------------------------------- prorata del fijo y solape (PR1) ---
+//
+// El fijo de un período (`base_fixed`) es la parte del sueldo MENSUAL que
+// corresponde a los DÍAS de ese período, calculada en el servidor. Antes no
+// había prorata: cada período pagaba `salary_fixed` completo, así que cuatro
+// cierres semanales de septiembre pagaban 4 × el sueldo, sin error, sin aviso y
+// sin señal de auditoría. La prorata sólo cierra la suma si los períodos no
+// comparten días, así que el mismo trabajo cierra el solape: un día nominado
+// una sola vez, en el servicio y en la base.
+
+describe("payroll: el fijo es la parte del sueldo mensual de los DÍAS del período (PR1)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  /** Sueldo MENSUAL (migración 003: `salary_fixed` es por mes). */
+  const SALARY = 1_400_000;
+  const WEEK_1 = "periodo-semana-1";
+  const WEEK_2 = "periodo-semana-2";
+
+  /** Empleado de pago fijo con el sueldo mensual del ejemplo del dueño. */
+  function employeeFijo(payType = "fijo", salary: number | null = SALARY) {
+    return {
+      id: payrollPagedStub.EMPLOYEE_ID,
+      sede_id: payrollPagedStub.SEDE_ID,
+      user_id: null,
+      full_name: "Empleada fija",
+      employee_code: "E-001",
+      document: "1000000001",
+      phone: null,
+      position: null,
+      payout_mode: "normal",
+      email: null,
+      birth_date: null,
+      pay_type: payType,
+      salary_fixed: salary,
+      commission_percent: null,
+      is_active: true,
+    };
+  }
+
+  function periodRow(id: string, start: string, end: string, status = "borrador") {
+    return {
+      id,
+      sede_id: payrollPagedStub.SEDE_ID,
+      start_date: start,
+      end_date: end,
+      status,
+      created_by: "u-1",
+      closed_at: null,
+      created_at: "2026-09-01T00:00:00.000Z",
+    };
+  }
+
+  /** Dos semanas de septiembre (1→7 y 8→14) y una empleada fija. */
+  function seedTwoWeeklyPeriods() {
+    payrollPagedStub.tables = {
+      employees: [employeeFijo()],
+      payroll_periods: [
+        periodRow(WEEK_1, "2026-09-01", "2026-09-07"),
+        periodRow(WEEK_2, "2026-09-08", "2026-09-14"),
+      ],
+      invoices: [],
+      invoice_items: [],
+      commission_rules: [],
+      voucher_requests: [],
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      audit_logs: [],
+    };
+  }
+
+  /** `base_fixed` que el servicio persistió al calcular el período dado. */
+  async function baseFixedOf(periodId: string): Promise<number> {
+    await calculatePayroll(payrollPagedStub.SEDE_ID, periodId, {}, ACTOR);
+    const persisted = payrollPagedStub.itemsUpsert ?? [];
+    expect(persisted).toHaveLength(1);
+    return Number(persisted[0].base_fixed);
+  }
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  it("dos semanas del mismo mes ya no pagan dos veces el sueldo", async () => {
+    seedTwoWeeklyPeriods();
+
+    const first = await baseFixedOf(WEEK_1);
+    const second = await baseFixedOf(WEEK_2);
+
+    // 7 de 30 días: 7/30 × 1.400.000 = 326.666,67 → 326.667 por período.
+    // Antes cada período pagaba el sueldo MENSUAL completo: 1.400.000 +
+    // 1.400.000 = 2.800.000 por 14 días de un mes de 30.
+    expect([first, second]).toEqual([326_667, 326_667]);
+    // Non-vacuidad de la prorata: 14 días NO son el mes entero.
+    expect(first + second).toBeLessThan(SALARY);
+  });
+
+  it("un período de un mes completo paga exactamente el sueldo mensual", async () => {
+    payrollPagedStub.tables = {
+      employees: [employeeFijo()],
+      payroll_periods: [periodRow("periodo-mes", "2026-09-01", "2026-09-30")],
+      invoices: [],
+      invoice_items: [],
+      commission_rules: [],
+      voucher_requests: [],
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      audit_logs: [],
+    };
+
+    // El mes completo es el único caso en que el fijo es el sueldo tal cual:
+    // 30 de 30 días. Sirve de ancla de la fórmula (si el divisor no fuera el
+    // largo real del mes, acá no daría exacto).
+    await expect(baseFixedOf("periodo-mes")).resolves.toBe(SALARY);
+  });
+
+  it("mixto: el fijo prorrateado y la comisión se SUMAN (la aritmética no cambia)", async () => {
+    payrollPagedStub.tables = {
+      employees: [employeeFijo("mixto")],
+      payroll_periods: [periodRow(WEEK_1, "2026-09-01", "2026-09-07")],
+      invoices: [
+        {
+          id: "factura-1",
+          consecutive_number: 1,
+          sede_id: payrollPagedStub.SEDE_ID,
+          status: "Emitida",
+          created_at: "2026-09-03T12:00:00.000Z",
+        },
+      ],
+      invoice_items: [
+        {
+          id: "linea-1",
+          invoice_id: "factura-1",
+          item_type: "servicio",
+          employee_id: payrollPagedStub.EMPLOYEE_ID,
+          qty: 1,
+          unit_price: 10_000,
+          subtotal: 10_000,
+          no_commission: false,
+          commission_value: null,
+          commission_percent_override: null,
+          product_id: null,
+          service_id: payrollPagedStub.SERVICE_ID,
+        },
+      ],
+      commission_rules: [],
+      voucher_requests: [],
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      audit_logs: [],
+    };
+    // El porcentaje del mixto vive en `commission_percent`.
+    payrollPagedStub.tables.employees[0].commission_percent = 10;
+
+    await calculatePayroll(payrollPagedStub.SEDE_ID, WEEK_1, {}, ACTOR);
+
+    const persisted = payrollPagedStub.itemsUpsert ?? [];
+    expect(persisted).toHaveLength(1);
+    // La comisión (1.000) sigue ENCIMA del fijo prorrateado (326.667): la
+    // prorata sólo cambia el fijo, no la suma de comisiones ni los descuentos.
+    expect(persisted[0].base_fixed).toBe(326_667);
+    expect(persisted[0].commissions).toBe(1_000);
+    expect(persisted[0].net_pay).toBe(327_667);
+  });
+
+  it("un pago que no es fijo ni mixto no recibe fijo (sigue en 0)", async () => {
+    payrollPagedStub.tables = {
+      employees: [employeeFijo("porcentaje")],
+      payroll_periods: [periodRow(WEEK_1, "2026-09-01", "2026-09-07")],
+      invoices: [],
+      invoice_items: [],
+      commission_rules: [],
+      voucher_requests: [],
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      audit_logs: [],
+    };
+
+    // `salary_fixed` informado de más en un empleado porcentual no se paga:
+    // el fijo es de fijo/mixto, y el mensual se prorratea o no se paga.
+    await expect(baseFixedOf(WEEK_1)).resolves.toBe(0);
+  });
+});
+
+// ------------------------------------------------- migración 035 ---
+describe("migración 035_payroll_period_proration.sql (PR1)", () => {
+  const sql = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "035_payroll_period_proration.sql"),
+    "utf8",
+  );
+  /** Sin espacios de más: compara el DDL, no la indentación del archivo. */
+  const flat = sql.replace(/\s+/g, " ");
+
+  it("barrera en la base: exclusión de rangos que comparten días, por sede", () => {
+    // El operador `=` de `sede_id` dentro del gist lo aporta `btree_gist`.
+    expect(flat).toContain("CREATE EXTENSION IF NOT EXISTS btree_gist");
+    expect(flat).toContain("EXCLUDE USING gist");
+    expect(flat).toContain("sede_id WITH =");
+    // Rango INCLUSIVO en los dos extremos: fin 07 / inicio 08 NO comparte día.
+    expect(flat).toContain("daterange(start_date, end_date, '[]') WITH &&");
+  });
+
+  it("cubre TODOS los estados: un período cerrado también pagó esos días", () => {
+    // El DDL de la restricción, sin filtro de estado: no hay `WHERE status`
+    // (PostgreSQL tampoco admite restricciones de exclusión parciales).
+    expect(flat).toContain(
+      "ALTER TABLE public.payroll_periods ADD CONSTRAINT ex_payroll_periods_no_overlap EXCLUDE USING gist ( sede_id WITH =, daterange(start_date, end_date, '[]') WITH && );",
+    );
+  });
+
+  it("es idempotente y no borra ni reescribe datos", () => {
+    expect(flat).toContain("IF NOT EXISTS");
+    expect(flat).toContain("pg_constraint");
+    expect(sql).not.toMatch(/\bDELETE\s+FROM\b/i);
+    expect(sql).not.toMatch(/\bUPDATE\s+\w+\s+SET\b/i);
+    expect(sql).not.toMatch(/\bDROP\s+(TABLE|INDEX|CONSTRAINT|COLUMN)\b/i);
+    expect(sql).not.toMatch(/\bTRUNCATE\b/i);
+  });
+
+  it("si ya hay filas solapadas FALLA a la vista y dice qué hacer", () => {
+    // No se puede crear la restricción con datos que la violen: el archivo lo
+    // detecta ANTES y aborta con los pares en conflicto en el mensaje.
+    expect(flat).toContain("RAISE EXCEPTION");
+    expect(flat).toContain("23P01");
+    expect(flat).toMatch(/ABORTADA/i);
+    expect(flat).toMatch(/qu[eé] hacer/i);
+    // Nombra el conflicto: los dos períodos con sus fechas y su estado.
+    expect(flat).toContain("daterange(a.start_date, a.end_date, '[]') && daterange(b.start_date, b.end_date, '[]')");
+  });
+});
+
+describe("payroll: la prorata del fijo, fórmula (función pura, PR1)", () => {
+  const SALARY = 1_400_000;
+  const prorate = (startDate: string, endDate: string, salaryFixed: number | null = SALARY) =>
+    prorateFixedSalary({ salaryFixed, startDate, endDate });
+
+  it("el ejemplo del dueño: las cuatro semanas de septiembre (mes de 30 días)", () => {
+    const amounts = [
+      prorate("2026-09-01", "2026-09-07"),
+      prorate("2026-09-08", "2026-09-14"),
+      prorate("2026-09-15", "2026-09-21"),
+      prorate("2026-09-22", "2026-09-30"),
+    ];
+    expect(amounts).toEqual([326_667, 326_667, 326_667, 420_000]);
+    // Son los DÍAS, no el sueldo: la primera semana no paga 1.400.000.
+    expect(amounts[0]).not.toBe(SALARY);
+    // El dueño espera que las cuatro sumen 1.400.000. Con peso entero POR
+    // PERÍODO la suma da 1.400.001: 7/30 = 326.666,67 redondea +0,33 y tres
+    // períodos de 7 días dejan +1 peso. El desvío es ≤ 1 peso por período y no
+    // se puede eliminar sin repartir el resto del mes entre períodos (un
+    // período no conoce a los otros). Se documenta en vez de esconderse.
+    expect(amounts.reduce((acc, value) => acc + value, 0)).toBe(SALARY + 1);
+  });
+
+  it("un mes completo paga EXACTAMENTE el sueldo, sea de 28, 29, 30 o 31 días", () => {
+    expect(prorate("2026-09-01", "2026-09-30")).toBe(SALARY); // 30
+    expect(prorate("2026-01-01", "2026-01-31")).toBe(SALARY); // 31
+    expect(prorate("2026-02-01", "2026-02-28")).toBe(SALARY); // 28
+    expect(prorate("2028-02-01", "2028-02-29")).toBe(SALARY); // bisiesto, 29
+  });
+
+  it("cruza el fin de mes: prorratea a los dos lados", () => {
+    // 2026-08-28 → 2026-09-03: 4 días de agosto (31) + 3 de septiembre (30).
+    // 1.400.000 × 4/31 = 180.645,16 y × 3/30 = 140.000 → 320.645,16 → 320.645.
+    expect(prorate("2026-08-28", "2026-09-03")).toBe(320_645);
+  });
+
+  it("dos meses completos son DOS sueldos (no hay tope mensual)", () => {
+    expect(prorate("2026-08-01", "2026-09-30")).toBe(2 * SALARY);
+  });
+
+  it("un solo día es un día del mes, no el sueldo (control negativo)", () => {
+    expect(prorate("2026-09-01", "2026-09-01")).toBe(46_667);
+    expect(prorate("2026-09-01", "2026-09-01")).not.toBe(SALARY);
+  });
+
+  it("usa el largo REAL del mes: 7 días de enero no valen lo mismo que 7 de septiembre", () => {
+    // Control negativo del divisor: con un 30 fijo, enero daría 326.667.
+    expect(prorate("2026-01-01", "2026-01-07")).toBe(316_129); // 7/31
+    expect(prorate("2026-09-01", "2026-09-07")).toBe(326_667); // 7/30
+  });
+
+  it("medio mes es la mitad del sueldo", () => {
+    expect(prorate("2026-09-01", "2026-09-15")).toBe(700_000);
+  });
+
+  it("sin sueldo no hay fijo (ni división por cero)", () => {
+    expect(prorate("2026-09-01", "2026-09-30", null)).toBe(0);
+    expect(prorate("2026-09-01", "2026-09-30", 0)).toBe(0);
+  });
+
+  it("un rango imposible LANZA en vez de inventar 0", () => {
+    expect(() => prorate("2026-09-14", "2026-09-01")).toThrowError("INVALID_PERIOD_RANGE");
+    expect(() => prorate("2026-02-30", "2026-03-02")).toThrowError("INVALID_PERIOD_RANGE");
+    expect(() => prorate("2026-13-01", "2026-13-05")).toThrowError("INVALID_PERIOD_RANGE");
+  });
+
+  it("el predicado de solape: ADYACENTE no comparte día, un día compartido sí", () => {
+    const week = { start_date: "2026-09-01", end_date: "2026-09-07" };
+    expect(rangesOverlap(week, { start_date: "2026-09-08", end_date: "2026-09-14" })).toBe(false);
+    expect(rangesOverlap(week, { start_date: "2026-09-07", end_date: "2026-09-14" })).toBe(true);
+    expect(rangesOverlap(week, { start_date: "2026-09-03", end_date: "2026-09-04" })).toBe(true);
+    expect(rangesOverlap(week, { start_date: "2026-08-01", end_date: "2026-09-30" })).toBe(true);
+    expect(rangesOverlap(week, week)).toBe(true);
+  });
+});
+
+describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const OTHER_SEDE = "99999999-9999-4999-8999-999999999999";
+
+  function seedPeriods(rows: Array<Record<string, unknown>>) {
+    payrollPagedStub.tables = {
+      payroll_periods: rows,
+      invoices: [],
+      invoice_items: [],
+      commission_rules: [],
+      voucher_requests: [],
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      audit_logs: [],
+    };
+  }
+
+  function periodRow(id: string, start: string, end: string, status = "borrador", sedeId = payrollPagedStub.SEDE_ID) {
+    return {
+      id,
+      sede_id: sedeId,
+      start_date: start,
+      end_date: end,
+      status,
+      created_by: "u-1",
+      closed_at: status === "cerrado" ? "2026-09-08T00:00:00.000Z" : null,
+      created_at: "2026-09-01T00:00:00.000Z",
+    };
+  }
+
+  const periodInserts = () =>
+    payrollPagedStub.inserts.filter((entry) => entry.table === "payroll_periods");
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  it("rechaza abrir un período que comparte días con otro de la sede", async () => {
+    seedPeriods([periodRow("periodo-1", "2026-09-01", "2026-09-07")]);
+
+    const failure: unknown = await openPayrollPeriod(
+      { start_date: "2026-09-05", end_date: "2026-09-12" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
+    // El mensaje nombra los DOS rangos: el pedido y el que estorba.
+    const message = (failure as PayrollError).message;
+    expect(message).toContain("2026-09-05 a 2026-09-12");
+    expect(message).toContain("2026-09-01 a 2026-09-07");
+    // Nada se escribió: la guarda corre ANTES del INSERT.
+    expect(periodInserts()).toHaveLength(0);
+  });
+
+  it("compartir UN solo día ya bloquea", async () => {
+    seedPeriods([periodRow("periodo-1", "2026-09-01", "2026-09-07")]);
+
+    const failure: unknown = await openPayrollPeriod(
+      { start_date: "2026-09-07", end_date: "2026-09-14" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: "PERIOD_OVERLAP" });
+  });
+
+  it("también bloquea contra un período CERRADO: esos días ya se pagaron", async () => {
+    seedPeriods([periodRow("periodo-1", "2026-09-01", "2026-09-07", "cerrado")]);
+
+    const failure: unknown = await openPayrollPeriod(
+      { start_date: "2026-08-28", end_date: "2026-09-02" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
+    expect((failure as PayrollError).message).toContain("2026-09-01 a 2026-09-07");
+  });
+
+  it("control negativo: el rango ADYACENTE (empieza el día siguiente) se abre", async () => {
+    seedPeriods([periodRow("periodo-1", "2026-09-01", "2026-09-07")]);
+
+    const created = await openPayrollPeriod(
+      { start_date: "2026-09-08", end_date: "2026-09-14" },
+      ACTOR,
+    );
+
+    expect(created).toMatchObject({
+      start_date: "2026-09-08",
+      end_date: "2026-09-14",
+      status: "borrador",
+      sede_id: payrollPagedStub.SEDE_ID,
+    });
+    expect(periodInserts()).toHaveLength(1);
+  });
+
+  it("control negativo: el solape es por SEDE (otra sede no bloquea)", async () => {
+    seedPeriods([periodRow("periodo-otra", "2026-09-01", "2026-09-07", "borrador", OTHER_SEDE)]);
+
+    const created = await openPayrollPeriod(
+      { start_date: "2026-09-01", end_date: "2026-09-07" },
+      ACTOR,
+    );
+
+    expect(created).toMatchObject({ start_date: "2026-09-01", end_date: "2026-09-07" });
+  });
+
+  it("una carrera perdida (23P01 de la restricción) es el MISMO error de negocio", async () => {
+    seedPeriods([]);
+    // La otra transacción ganó entre la lectura y el INSERT: la base responde
+    // como responde una restricción de exclusión violada.
+    payrollPagedStub.insertError = { table: "payroll_periods", code: "23P01" };
+
+    const failure: unknown = await openPayrollPeriod(
+      { start_date: "2026-09-08", end_date: "2026-09-14" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
+    // No es un fallo interno disfrazado: la carrera tiene su propio mensaje.
+    expect((failure as PayrollError).code).not.toBe("INTERNAL");
+  });
+
+  it("si la lectura de períodos no se completa, ABRIR se detiene (no decide con menos)", async () => {
+    seedPeriods([periodRow("periodo-1", "2026-09-01", "2026-09-07")]);
+    // La primera página de la lectura de períodos falla: con el conjunto
+    // recortado la guarda podría no ver el período que estorba.
+    payrollPagedStub.failAt = { payroll_periods: [1] };
+
+    const failure: unknown = await openPayrollPeriod(
+      { start_date: "2026-09-08", end_date: "2026-09-14" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "READ_INCOMPLETE" });
+    // No se abrió nada con una lectura incompleta.
+    expect(periodInserts()).toHaveLength(0);
+  });
+});
+

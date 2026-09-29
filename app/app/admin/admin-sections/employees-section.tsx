@@ -308,7 +308,7 @@ export function EmployeesSection({
               </div>
               {(dialogRow.pay_type === "fijo" || dialogRow.pay_type === "mixto") && (
                 <div>
-                  <dt className="text-text-secondary">Salario fijo</dt>
+                  <dt className="text-text-secondary">Salario fijo mensual</dt>
                   <dd className="font-medium">{formatMoney(dialogRow.salary_fixed)}</dd>
                 </div>
               )}
@@ -516,7 +516,7 @@ export function EmployeesSection({
               </select>
             </label>
             <label className={labelClass}>
-              Salario fijo (fijo/mixto)
+              Salario fijo mensual (fijo/mixto)
               <input
                 value={form.salary_fixed}
                 onChange={(event) => setForm({ ...form, salary_fixed: event.target.value })}
@@ -524,6 +524,9 @@ export function EmployeesSection({
                 inputMode="decimal"
                 className={inputClass}
               />
+              <span className="text-xs text-text-tertiary">
+                Es el sueldo por MES: la nómina paga la parte que corresponde a los días del período.
+              </span>
             </label>
             <label className={labelClass}>
               Comisión % (porcentaje/mixto, 0–100)

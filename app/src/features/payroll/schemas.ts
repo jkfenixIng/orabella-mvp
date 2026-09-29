@@ -365,6 +365,101 @@ export function weekStartOf(dateIso: string): string {
   return `${y}-${m}-${d}`;
 }
 
+/** Un día en milisegundos: la aritmética de fechas de acá es siempre UTC. */
+const DAY_MS = 86_400_000;
+
+/** Día UTC (ms) de una fecha yyyy-mm-dd; `null` si no es una fecha del calendario. */
+function utcDayOf(dateIso: string): number | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateIso.trim());
+  if (!match) return null;
+  const [year, month, day] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  const ms = Date.UTC(year, month - 1, day);
+  const date = new Date(ms);
+  // Rechaza fechas que el calendario NORMALIZA (2026-02-30 → 2026-03-02): una
+  // fecha imposible no puede convertirse en una porción de sueldo.
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return ms;
+}
+
+/** Largo real del mes (28…31) de un mes del calendario. */
+function daysInMonth(year: number, month0: number): number {
+  return new Date(Date.UTC(year, month0 + 1, 0)).getUTCDate();
+}
+
+/**
+ * PR1/PAY-02: porción del sueldo MENSUAL que corresponde a los DÍAS de un
+ * rango de fechas. `salary_fixed` es un valor por MES (003_admin.sql), así que
+ * pagarlo tal cual en cada período paga el mes tantas veces como períodos
+ * tenga: cuatro cierres semanales de septiembre pagaban 4 × el sueldo, sin
+ * error y sin aviso.
+ *
+ * Fórmula (la regla del dueño: "el cálculo máximo que se le paga en esos
+ * días"): por cada mes del calendario que el rango toca,
+ *
+ *     sueldo × (días de ese mes dentro del rango) / (días de ese mes)
+ *
+ * se SUMAN las porciones y se redondea UNA sola vez el total (peso entero,
+ * `roundMoney`), igual que el resto del módulo. Un período que cubre un mes
+ * completo da EXACTAMENTE el sueldo, sea el mes de 28, 29, 30 o 31 días; un
+ * rango que cruza el fin de mes prorratea en los dos meses. NO es un tope del
+ * mes: no mira los otros períodos ni limita la suma de varios (el dueño
+ * rechazó explícitamente un tope mensual); la suma sólo cuadra si los períodos
+ * no comparten días, y de eso se ocupa la guarda de solape (007+035).
+ *
+ * Puro para probarlo sin base de datos. Un rango invertido o una fecha
+ * imposible LANZAN: devolver 0 en silencio sería pagar de menos sin señal.
+ */
+export function prorateFixedSalary(args: {
+  salaryFixed: number | null | undefined;
+  startDate: string;
+  endDate: string;
+}): number {
+  const salary = Number(args.salaryFixed ?? 0);
+  if (!Number.isFinite(salary) || salary <= 0) return 0;
+  const start = utcDayOf(args.startDate);
+  const end = utcDayOf(args.endDate);
+  if (start === null || end === null || end < start) {
+    throw new Error("INVALID_PERIOD_RANGE");
+  }
+  let total = 0;
+  let cursor = start;
+  while (cursor <= end) {
+    const date = new Date(cursor);
+    const year = date.getUTCFullYear();
+    const month0 = date.getUTCMonth();
+    const monthEnd = Date.UTC(year, month0 + 1, 1) - DAY_MS;
+    const last = Math.min(end, monthEnd);
+    const days = (last - cursor) / DAY_MS + 1;
+    total += (salary * days) / daysInMonth(year, month0);
+    cursor = last + DAY_MS;
+  }
+  return roundMoney(total);
+}
+
+/** Rango de fechas inclusivo en ambos extremos (mismo contrato que el rango). */
+export interface DateRange {
+  start_date: string;
+  end_date: string;
+}
+
+/**
+ * PR1/PAY-01: true cuando dos rangos inclusivos comparten AL MENOS un día. Los
+ * rangos ADYACENTES no se solapan (fin 2026-09-07 / inicio 2026-09-08): son la
+ * serie semanal legal del mes y no comparten ningún día. Es la misma cuenta que
+ * hace el filtro SQL (`start_date <= otro.end_date AND end_date >= otro.start_date`)
+ * y la que sostiene `daterange(start_date, end_date, '[]') &&` de la migración
+ * 035. Puro para probarlo sin base de datos.
+ */
+export function rangesOverlap(left: DateRange, right: DateRange): boolean {
+  return left.start_date <= right.end_date && left.end_date >= right.start_date;
+}
+
 export interface VoucherCapCheck {
   /** Acumulado vigente del día + lo solicitado vs tope diario. */
   overDay: boolean;

@@ -18,6 +18,8 @@ import {
   openPeriodSchema,
   overlapBlocksDeletion,
   payPayrollItemSchema,
+  prorateFixedSalary,
+  rangesOverlap,
   requestVoucherSchema,
   rejectVoucherSchema,
   requiresVoucherApproval,
@@ -277,6 +279,15 @@ function toPayrollError(error: unknown): PayrollError {
           "Las porciones de pago deben sumar exactamente el neto del ítem.",
           422,
         );
+      case "INVALID_PERIOD_RANGE":
+        // PR1: la prorata del fijo no puede calcularse sobre un rango
+        // imposible. El CHECK de 007 ya lo impide en la base; si igual llega
+        // acá, el cálculo se detiene en vez de pagar 0 en silencio.
+        return new PayrollError(
+          "INVALID_PERIOD_RANGE",
+          "El rango del período es inválido (la fecha final no puede ser anterior a la inicial).",
+          409,
+        );
     }
   }
   return new PayrollError("INTERNAL", "Error interno.", 500);
@@ -447,9 +458,18 @@ async function attachVoucherUserNames(
 // ----------------------------------------------------------------- periodos ---
 
 /**
- * PAY-01: abre un periodo borrador por sede y rango. El índice parcial
- * uq_payroll_draft_per_range es la barrera final ante carreras (23505 →
- * mismo error de negocio).
+ * PAY-01: abre un periodo borrador por sede y rango.
+ *
+ * PR1: un DÍA se nomina una sola vez. La prorata del fijo hace que la suma de
+ * los períodos de un mes sea el sueldo SOLO si no comparten días, así que
+ * abrir un rango que solape otro (en cualquier estado: un período cerrado ya
+ * pagó esos días) se rechaza acá con el rango en conflicto a la vista. El
+ * índice único parcial de 007 sólo miraba la tupla EXACTA de los borradores:
+ * dos rangos adyacentes o cruzados pasaban sin ruido.
+ *
+ * Barreras ante carreras: la lectura y el INSERT no son atómicos, así que la
+ * restricción de exclusión de la base (migración 035) es la barrera final
+ * (23P01 → mismo error de negocio, igual que 23505 para el borrador repetido).
  */
 export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Promise<PayrollPeriodRow> {
   const parsed = openPeriodSchema.safeParse(raw);
@@ -459,6 +479,41 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
   const input: OpenPeriodInput = parsed.data;
   const db = await payrollDb();
   try {
+    // Candidatos: los períodos de la sede que tocan el rango pedido. La
+    // decisión la toma el predicado puro `rangesOverlap` (el mismo contrato que
+    // el `daterange(..., '[]') &&` de la base), pero la LECTURA es exhaustiva y
+    // falla a la vista (READ_INCOMPLETE): con una lectura recortada por el tope
+    // del Data API la guarda podría no ver el período que estorba y abrir un
+    // rango que comparte días. Acá no se decide con lo que se alcanzó a leer.
+    const candidates = await readAllPayroll<{
+      start_date: string;
+      end_date: string;
+      status: string;
+    }>({
+      log: "openPayrollPeriod",
+      what: "períodos de la sede en el rango",
+      meta: { sedeId: actor.sedeId, start: input.start_date, end: input.end_date },
+      table: "payroll_periods",
+      fetchPage: (from, to) =>
+        db
+          .from("payroll_periods")
+          .select("id, start_date, end_date, status")
+          .eq("sede_id", actor.sedeId)
+          .lte("start_date", input.end_date)
+          .gte("end_date", input.start_date)
+          .order("id")
+          .range(from, to),
+    });
+    const requested = { start_date: input.start_date, end_date: input.end_date };
+    const clash = candidates.find((row) => rangesOverlap(row, requested));
+    if (clash) {
+      throw new PayrollError(
+        "PERIOD_OVERLAP",
+        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${clash.start_date} a ${clash.end_date} (${clash.status}) de esta sede. Un día se nomina una sola vez: ajuste las fechas para que no se crucen con un período existente.`,
+        409,
+      );
+    }
+
     const { data, error } = await db
       .from("payroll_periods")
       .insert({
@@ -475,6 +530,16 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
         throw new PayrollError(
           "PERIOD_DRAFT_EXISTS",
           "Ya existe un borrador para esta sede y rango de fechas.",
+          409,
+        );
+      }
+      // Carrera perdida contra `ex_payroll_periods_no_overlap` (035): otro
+      // proceso abrió un período con días en común entre la lectura y el
+      // INSERT. Es el mismo error de negocio, no un fallo interno.
+      if ((error as { code?: string }).code === "23P01") {
+        throw new PayrollError(
+          "PERIOD_OVERLAP",
+          "Otro período de esta sede quedó con días en común mientras se abría este. Un día se nomina una sola vez: revise los períodos existentes y ajuste las fechas.",
           409,
         );
       }
@@ -866,9 +931,19 @@ export async function calculatePayroll(
     }
 
     const payload = actives.map((employee) => {
+      // PR1: el fijo de un período son SOLO sus días. `salary_fixed` es mensual
+      // (003_admin.sql): antes se pagaba completo en cada período y cuatro
+      // cierres semanales de un mes pagaban 4 × el sueldo, sin error ni aviso.
+      // La porción se calcula por los días del rango (mes por mes, redondeando
+      // una sola vez) y la suma de los períodos del mes da el sueldo siempre
+      // que no compartan días (de eso se ocupa la guarda de solape).
       const baseFixed =
         employee.pay_type === "fijo" || employee.pay_type === "mixto"
-          ? roundMoney(Number(employee.salary_fixed ?? 0))
+          ? prorateFixedSalary({
+              salaryFixed: employee.salary_fixed,
+              startDate: period.start_date,
+              endDate: period.end_date,
+            })
           : 0;
       // Misma resolución por línea que el pago inmediato: la regla ítem×empleado
       // gana sobre el porcentaje plano. Un `fijo` con regla sí comisiona; un

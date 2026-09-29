@@ -154,6 +154,35 @@ function findOverlappingPeriod(
   return rows.find((row) => start <= row.end_date && end >= row.start_date) ?? null;
 }
 
+/** Días de un rango inclusivo (mismo criterio que la prorata del servidor). */
+function rangeDayCount(start: string, end: string): number {
+  const [startY, startM, startD] = start.split("-").map(Number);
+  const [endY, endM, endD] = end.split("-").map(Number);
+  const days =
+    Math.round((Date.UTC(endY, endM - 1, endD) - Date.UTC(startY, startM - 1, startD)) / 86_400_000) + 1;
+  return Number.isFinite(days) && days > 0 ? days : 0;
+}
+
+/**
+ * PR1: la base del fijo, a la vista. El fijo de un período NO es el sueldo del
+ * mes: es la parte que corresponde a sus días (el servidor prorratea el sueldo
+ * mensual por los días nominados). Sin esta nota el administrador ve un número
+ * sin explicación —que era el defecto: cada período pagaba el sueldo completo—.
+ * Presentación pura: los días salen del rango del período que ya está cargado.
+ */
+function FixedBasisNote({ start, end }: { start: string; end: string }) {
+  const days = rangeDayCount(start, end);
+  return (
+    <p className="mt-3 text-xs text-text-tertiary">
+      Fijo de estos días: la parte del sueldo mensual que corresponde a los {days}{" "}
+      {days === 1 ? "día" : "días"} del período ({start} a {end}) es el máximo que se paga por
+      ellos; si el período cruza el fin de mes, el sueldo se prorratea en los dos meses. Las
+      comisiones y los bonos van aparte, encima del fijo; los mismos días no se pueden nominar
+      en otro período de la sede.
+    </p>
+  );
+}
+
 interface PayrollClientProps {
   sedeId: string;
   initialEmployees: EmployeeRow[];
@@ -183,7 +212,7 @@ function PeriodDetailTable({ items, employeeName, payLabel, onView }: PeriodDeta
               Empleado
             </th>
             <th className={tableCellClass} scope="col">
-              Fijo
+              Fijo (días)
             </th>
             <th className={tableCellClass} scope="col">
               Comisiones
@@ -283,7 +312,7 @@ function DraftPayrollTable({
               Empleado
             </th>
             <th className={tableCellClass} scope="col">
-              Fijo
+              Fijo (días)
             </th>
             <th className={tableCellClass} scope="col">
               Comisiones
@@ -1122,6 +1151,7 @@ export function PayrollClient(props: PayrollClientProps) {
                   <p className="mt-2 text-sm text-text-secondary">
                     Periodo cerrado. La liquidación quedó registrada.
                   </p>
+                  <FixedBasisNote start={selected.start_date} end={selected.end_date} />
                   {detail && (
                     <PeriodDetailTable
                       items={detail.items}
@@ -1137,6 +1167,7 @@ export function PayrollClient(props: PayrollClientProps) {
                     Tabla del borrador: ajuste bonos y otros descuentos por empleado y recalcule si hubo
                     cambios.
                   </p>
+                  <FixedBasisNote start={selected.start_date} end={selected.end_date} />
                   <DraftPayrollTable
                     rows={draftRows}
                     employeeName={employeeName}
