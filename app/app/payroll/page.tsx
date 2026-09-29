@@ -10,9 +10,12 @@ import { PayrollClient } from "./payroll-client";
 export const dynamic = "force-dynamic";
 
 /**
- * T7 — nómina y vales (PAY-01…07). Lectura: cualquier rol autenticado de
- * su sede. Periodos/cálculo/cierre/vales-aprobación: admin (el servidor
- * lo refuerza en ambos casos); pagar admite también caja.
+ * T7 — nómina y vales (PAY-01…07).
+ *
+ * Nómina: la administra el admin de la sede; el empleado entra a ver SU recibo
+ * (periodo y detalle con alcance por fila). La caja no entra —ni la página ni el
+ * API—: el módulo de nómina es del administrador, que es quien la genera y la
+ * revisa. El vale de la caja vive en /vales.
  */
 export default async function PayrollPage() {
   const store = await cookies();
@@ -43,7 +46,10 @@ export default async function PayrollPage() {
   ]);
 
   const canAdmin = session.roles.includes("admin");
-  const canPay = canAdmin || session.roles.includes("caja");
+  // Pagar un ítem es del admin igual que el resto del módulo: el guard del
+  // servidor (requirePayrollAdmin) y el botón no pueden decir cosas distintas
+  // (antes `canPay` sumaba `caja` en una página que a la caja la redirige arriba).
+  const canPay = canAdmin;
 
   return (
     <main className="mx-auto flex min-h-screen max-w-5xl flex-col gap-6 px-6 py-12">

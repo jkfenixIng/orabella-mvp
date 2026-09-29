@@ -22,6 +22,7 @@ import {
   requestVoucher,
   requirePayrollAdmin,
   requirePayrollPayer,
+  requirePayrollViewer,
   setVoucherLimits,
 } from "./service";
 
@@ -71,10 +72,15 @@ export async function calculatePayrollAction(id: string, input: unknown) {
   }
 }
 
-/** Misma lógica que POST /api/v1/payroll-items/:id/payments (admin/caja). */
+/**
+ * Misma lógica que POST /api/v1/payroll-items/:id/payments (solo admin).
+ *
+ * Pagar un ítem es parte de liquidar la nómina: era la superficie por la que la
+ * caja entraba al módulo (requirePayrollPayer). Esa guarda quedó para los vales.
+ */
 export async function payPayrollItemAction(id: string, input: unknown) {
   try {
-    const session = await requirePayrollPayer(await sessionToken());
+    const session = await requirePayrollAdmin(await sessionToken());
     const data = await payPayrollItem(session.sedeId, id, input, {
       userId: session.userId,
       sedeId: session.sedeId,
@@ -110,10 +116,15 @@ export async function deletePayrollPeriodAction(id: string) {
   }
 }
 
-/** Periodos de la sede (requiere sesión, cualquier rol de su sede). */
+/**
+ * Periodos de la sede (admin y el empleado que mira SU recibo).
+ *
+ * El empleado necesita los periodos para llegar a su propio detalle; la caja no
+ * entra al módulo de nómina.
+ */
 export async function listPeriodsAction() {
   try {
-    const session = await requireSession(await sessionToken());
+    const session = await requirePayrollViewer(await sessionToken());
     const data = await listPeriods(session.sedeId);
     return { success: true as const, data };
   } catch (error) {
@@ -121,13 +132,17 @@ export async function listPeriodsAction() {
   }
 }
 
-/** Detalle del periodo con ítems y saldos (requiere sesión, solo su sede). */
-/** Detalle del periodo (admin/caja/pagador ven todo; empleado solo sus ítems). */
+/**
+ * Detalle del periodo con ítems y saldos (admin ven todo; empleado solo sus
+ * ítems; la caja no entra al módulo).
+ */
 export async function getPeriodDetailAction(id: string) {
   try {
-    const session = await requireSession(await sessionToken());
+    const session = await requirePayrollViewer(await sessionToken());
     const data = await getPeriodDetail(session.sedeId, id);
-    const isManager = session.roles.includes("admin") || session.roles.includes("caja");
+    // Solo el admin ve la nómina completa; el empleado ve la suya. La caja no
+    // llega hasta acá (requirePayrollViewer la rechaza antes).
+    const isManager = (session.roles ?? []).includes("admin");
     if (isManager) return { success: true as const, data };
     // U8: ubicar al empleado logueado es encontrar UNO, no armar el listado de
     // navegación. `listEmployees` corta en 50 (`clampLimit`), así que en una sede
@@ -143,7 +158,11 @@ export async function getPeriodDetailAction(id: string) {
   }
 }
 
-/** Topes vigentes de la sede (requiere sesión, solo su sede). */
+/**
+ * Topes vigentes de la sede: lectura del flujo de VALES (no de nómina), así que
+ * mantiene la guarda que tenía: cualquier rol autenticado de su sede. La caja
+ * los necesita para saber si el vale entra en rango.
+ */
 export async function getVoucherSettingsAction() {
   try {
     const session = await requireSession(await sessionToken());

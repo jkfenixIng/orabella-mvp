@@ -33,7 +33,6 @@ import {
   type OpenPeriodInput,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
-import { getSessionUser } from "@/src/features/auth/service";
 import { commissionRuleKey, type RuleRate } from "@/src/features/commissions/schemas";
 import { cashOutUsedInShift, getOpenShiftWithOpener } from "@/src/features/cash/service";
 import { cashOutLimitViolation } from "@/src/features/cash/schemas";
@@ -51,6 +50,7 @@ import {
   getEmployee,
   listAllEmployees,
   listPaymentMethods,
+  requireSession,
 } from "@/src/features/admin/service";
 import { resolveVoucherAlert } from "@/src/features/alerts/service";
 import {
@@ -135,9 +135,22 @@ function validationMessage(error: { issues: Array<{ message: string }> }): strin
   return error.issues[0]?.message ?? "Datos inválidos.";
 }
 
-/** Escritura contable: solo admin (periodos, cálculo, cierre, vales, topes). */
+/**
+ * Administración de la nómina: solo admin. Quien genera (periodo, cálculo) y
+ * quien revisa (cierre, borrado, pago de ítems) la nómina es el administrador;
+ * la caja no tiene acceso al módulo.
+ */
 const ADMIN_ROLES: RoleCode[] = ["admin"];
-/** Pagos de nómina: admin y caja (igual que los cobros de caja en T6). */
+/**
+ * Lectura de nómina: admin y empleado. El empleado ve SU recibo —el alcance por
+ * fila lo aplica el llamador—; la caja NO entra, ni siquiera para leer.
+ */
+const VIEWER_ROLES: RoleCode[] = ["admin", "empleado"];
+/**
+ * Vales: admin y caja (la caja abre el vale al empleado con su turno abierto).
+ * Es la ÚNICA superficie que admite caja: NO usar esta guarda en nómina —por
+ * acá entraba la caja a leer y a pagar nómina.
+ */
 const PAYER_ROLES: RoleCode[] = ["admin", "caja"];
 
 export interface PayrollActor {
@@ -146,52 +159,84 @@ export interface PayrollActor {
   roles?: RoleCode[];
 }
 
+/** Sesión de nómina: autenticada, con sede, y sus roles. */
+interface PayrollSession {
+  userId: string;
+  sedeId: string;
+  roles: RoleCode[];
+}
+
 /**
- * §10 Nómina/vales: escritura solo admin de su sede (las rutas y actions
- * aplican este gate; el pago de ítems admite también caja vía
- * requirePayrollPayer).
+ * Resuelve la sesión con el guard compartido (`requireSession`: autenticada y
+ * con sede) y la reescribe a los tipos de nómina. Los errores de sesión cambian
+ * de clase, no de forma: mismo código, mismo mensaje, mismo status.
+ */
+async function payrollSession(token: string | null | undefined): Promise<PayrollSession> {
+  try {
+    const session = await requireSession(token);
+    return { userId: session.userId, sedeId: session.sedeId, roles: session.roles };
+  } catch (error) {
+    if (error instanceof AdminError) {
+      throw new PayrollError(error.code, error.message, error.status);
+    }
+    throw error;
+  }
+}
+
+/** Gate de rol de una superficie: FORBIDDEN como error de nómina. */
+function requirePayrollRoles(roles: RoleCode[], allowed: RoleCode[]): void {
+  try {
+    requireSedeRole(roles, allowed);
+  } catch (error) {
+    if (error instanceof AdminError) {
+      throw new PayrollError(error.code, error.message, error.status);
+    }
+    throw error;
+  }
+}
+
+/**
+ * §10 Nómina/vales: administrar la nómina es solo admin de su sede (las rutas y
+ * las actions aplican este gate; incluye pagar un ítem).
+ *
+ * Los vales NO usan esta guarda: el vale lo abre la caja (requirePayrollPayer).
  */
 export async function requirePayrollAdmin(
   token: string | null | undefined,
 ): Promise<PayrollActor> {
-  const session = await getSessionUser(token);
-  if (!session) {
-    throw new PayrollError("UNAUTHENTICATED", "Se requiere autenticación.", 401);
-  }
-  try {
-    requireSedeRole(session.roles, ADMIN_ROLES);
-  } catch (error) {
-    if (error instanceof AdminError) {
-      throw new PayrollError(error.code, error.message, error.status);
-    }
-    throw error;
-  }
-  if (!session.user.sede_id) {
-    throw new PayrollError("NO_SEDE", "El usuario no tiene sede asignada.", 403);
-  }
-  return { userId: session.user.id, sedeId: session.user.sede_id, roles: session.roles };
+  const session = await payrollSession(token);
+  requirePayrollRoles(session.roles, ADMIN_ROLES);
+  return session;
 }
 
-/** PAY-04: pagar un ítem admite admin y caja (el turno/caja lo respalda). */
+/**
+ * Lectura de nómina: admin de la sede y el empleado que mira SU recibo.
+ *
+ * El empleado pasa el gate y el llamador recorta por fila (`getPeriodDetail` +
+ * el filtro por legajo); la caja queda fuera: el módulo de nómina no es de caja,
+ * ni para leer (para el vale tiene /vales y requirePayrollPayer).
+ */
+export async function requirePayrollViewer(
+  token: string | null | undefined,
+): Promise<PayrollActor> {
+  const session = await payrollSession(token);
+  requirePayrollRoles(session.roles, VIEWER_ROLES);
+  return session;
+}
+
+/**
+ * Vales (PAY-04/V2): abrir un vale admite admin y caja —la caja abierta es quien
+ * lo abre con turno abierto (el servicio lo vuelve a validar)—.
+ *
+ * Solo para el flujo de vales. La nómina NO pasa por acá: usar esta guarda en
+ * una superficie de nómina vuelve a abrirle el módulo a la caja.
+ */
 export async function requirePayrollPayer(
   token: string | null | undefined,
 ): Promise<PayrollActor> {
-  const session = await getSessionUser(token);
-  if (!session) {
-    throw new PayrollError("UNAUTHENTICATED", "Se requiere autenticación.", 401);
-  }
-  try {
-    requireSedeRole(session.roles, PAYER_ROLES);
-  } catch (error) {
-    if (error instanceof AdminError) {
-      throw new PayrollError(error.code, error.message, error.status);
-    }
-    throw error;
-  }
-  if (!session.user.sede_id) {
-    throw new PayrollError("NO_SEDE", "El usuario no tiene sede asignada.", 403);
-  }
-  return { userId: session.user.id, sedeId: session.user.sede_id, roles: session.roles };
+  const session = await payrollSession(token);
+  requirePayrollRoles(session.roles, PAYER_ROLES);
+  return session;
 }
 
 function toPayrollError(error: unknown): PayrollError {
@@ -959,7 +1004,8 @@ async function getItemOrThrow(db: DbClient, sedeId: string, id: string): Promise
  * sede, montos > 0). Acepta abonos parciales (40% + 40% + 20% en una o
  * varias llamadas); el acumulado nunca excede el neto (además del trigger
  * trg_payroll_payments_cap). Periodo cerrado → PERIOD_CLOSED.
- * Solo admin/caja (vía requirePayrollPayer en rutas/actions).
+ * Solo admin (vía requirePayrollAdmin en rutas/actions): pagar un ítem es parte
+ * de liquidar la nómina, y el módulo de nómina no es de caja.
  */
 export async function payPayrollItem(
   sedeId: string,
