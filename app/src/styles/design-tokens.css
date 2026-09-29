@@ -117,6 +117,18 @@
   --bg-surface: theme(--color-neutral-50);
   --bg-surface-hover: theme(--color-neutral-100);
   --bg-surface-2: theme(--color-neutral-100);
+  /* Superficie SELECCIONADA (segmento activo de un control segmentado,
+     theme-toggle). La familia de superficies no tenía un tercer peldaño:
+     --bg-surface-2 es byte-idéntico a --bg-surface-hover (ambos
+     theme(--color-neutral-100)), así que el estado seleccionado quedaba con el
+     mismo valor que el hover. Medido contra la página (--bg-surface, L 0.98):
+     hover L 0.96 deja un paso de 0.020 —casi indistinguible—; este peldaño
+     L 0.93 deja 0.050, el mismo paso del `slate-200` original (L 0.929, paso
+     0.051) que la app usaba antes de mover el segmento a tokens. No se usa
+     --color-neutral-200 (L 0.91, paso 0.070): sobrecorrige.
+     El nombre es semántico a propósito: el consumidor pide "seleccionado", no
+     un peldaño de rampa. */
+  --bg-surface-selected: oklch(0.93 0 0);
 
   /* Borders & Dividers */
   --border-color: theme(--color-neutral-300);
@@ -207,6 +219,10 @@
   --bg-surface: oklch(0.17 0 0);
   --bg-surface-hover: oklch(0.22 0 0);
   --bg-surface-2: oklch(0.22 0 0);
+  /* En oscuro el paso actual ya era correcto (página 0.17 -> 0.22 = 0.050) y se
+     conserva tal cual: el token es semántico aunque su valor coincida con el
+     hover en este tema. Bajarlo o subirlo sería la regresión, no la mejora. */
+  --bg-surface-selected: oklch(0.22 0 0);
 
   /* Borders & Dividers */
   --border-color: oklch(0.3 0 0);

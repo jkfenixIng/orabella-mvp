@@ -30,6 +30,14 @@ const AA_TEXT_MIN = 4.5;
 const AA_NON_TEXT_MIN = 3;
 const GAMUT_TOLERANCE = 1e-6;
 
+/* Paso mínimo de luminancia (oklch L) entre la página y la superficie de un
+   control SELECCIONADO. Medido sobre el estado anterior a la regresión: el
+   segmento elegido del theme-toggle usaba slate-200 (L 0.929) sobre una página
+   neutral-50 (L 0.980), paso 0.051. Con --bg-surface-hover (L 0.960) el paso
+   cae a 0.020 y el control deja de leerse. El umbral corta ese caso y no
+   obliga a clavar el peldaño exacto. */
+const MIN_SURFACE_STEP = 0.04;
+
 // Superficies de tema usadas como fondo de referencia en los contrastes.
 const LIGHT_SURFACE: Oklch = { l: 0.98, c: 0, h: 0 };
 const DARK_SURFACE: Oklch = { l: 0.17, c: 0, h: 0 };
@@ -405,6 +413,7 @@ const BASE_COLOR_KEYS: Array<[key: string, alias: string]> = [
 const NON_REGISTRY_COLOR_KEYS = [
   "--color-surface",
   "--color-surface-hover",
+  "--color-surface-selected",
   "--color-text-primary",
   "--color-text-secondary",
   "--color-text-tertiary",
@@ -521,6 +530,17 @@ function resolveConcrete(name: string, layers: Array<Map<string, string>>): stri
     current = next[1];
   }
   return null;
+}
+
+/**
+ * `resolveConcrete` pero exigiendo que el token exista y resuelva: sin esto, un
+ * token borrado llegaría como `null` y el test fallaría recién al parsear, con
+ * un mensaje que no dice cuál. Igual que `requireVar`, no se saltea: rompe.
+ */
+function requireResolved(name: string, layers: Array<Map<string, string>>): string {
+  const value = resolveConcrete(name, layers);
+  expect(value, `${name} debe resolverse a un valor concreto`).not.toBeNull();
+  return value as string;
 }
 
 /** Los cuatro tintes claros de estado con su peldaño -100 de referencia. */
@@ -786,6 +806,67 @@ describe("design tokens: guardas de contrato", () => {
     );
     const shadowed = bareClassNames(TOKENS_CSS).filter((name) => generated.has(name));
     expect(shadowed).toEqual([]);
+  });
+
+  it("la superficie seleccionada restaura el paso de luminancia de la página en ambos temas", () => {
+    // La regresión real: el segmento elegido del theme-toggle quedó pintado con
+    // --bg-surface-hover y su paso contra la página en claro cayó a 0.020, o sea
+    // indistinguible. Este token semántico fija el paso en ~0.050 (el del
+    // slate-200 original, 0.051) y no puede volver a encogerse sin romper acá.
+    expect(themeInline.get("--color-surface-selected"), "globals.css @theme inline").toBe(
+      "var(--bg-surface-selected)",
+    );
+
+    const lightRaw = requireResolved("--color-surface-selected", [themeInline, lightVars, darkTheme]);
+    const darkRaw = requireResolved("--color-surface-selected", [themeInline, darkTheme, lightVars]);
+    const lightSelected = oklchLiteral(lightRaw, "--color-surface-selected (claro)");
+    const darkSelected = oklchLiteral(darkRaw, "--color-surface-selected (oscuro)");
+    const lightPage = oklchLiteral(
+      requireResolved("--bg-surface", [lightVars]),
+      "--bg-surface (claro)",
+    );
+    const darkPage = oklchLiteral(
+      requireResolved("--bg-surface", [darkTheme]),
+      "--bg-surface (oscuro)",
+    );
+
+    // Primero el PASO, que es la propiedad que la regresión rompió; si se mira
+    // solo el valor exacto el test se vuelve un candado y no una medición.
+    const lightStep = Math.abs(lightSelected.l - lightPage.l);
+    const darkStep = Math.abs(darkSelected.l - darkPage.l);
+    expect(lightStep, `claro: página ${lightPage.l} -> seleccionado ${lightSelected.l}`)
+      .toBeGreaterThanOrEqual(MIN_SURFACE_STEP);
+    expect(darkStep, `oscuro: página ${darkPage.l} -> seleccionado ${darkSelected.l}`)
+      .toBeGreaterThanOrEqual(MIN_SURFACE_STEP);
+
+    // Y después el valor resuelto PINNEADO en ambos temas: si alguien lo mueve,
+    // la tabla de mediciones deja de valer y hay que volver a medir.
+    expect(lightRaw, "claro: --color-surface-selected").toBe("oklch(0.93 0 0)");
+    expect(darkRaw, "oscuro: --color-surface-selected").toBe("oklch(0.22 0 0)");
+
+    // En claro el token DEBE separarse del hover: es exactamente el bug que este
+    // token existe para impedir. En oscuro ambos coinciden a propósito (ahí el
+    // paso de 0.050 ya era correcto) y por eso no se compara.
+    const lightHover = oklchLiteral(
+      requireResolved("--bg-surface-hover", [lightVars]),
+      "--bg-surface-hover (claro)",
+    );
+    expect(lightSelected.l, "claro: seleccionado vs hover").toBeLessThan(lightHover.l);
+
+    // El label del segmento elegido usa `text-text-primary`
+    // (src/shared/components/theme-toggle.tsx); debe mantener AA sobre su fondo.
+    const lightRatio = contrast(
+      lightSelected,
+      oklchLiteral(requireResolved("--text-primary", [lightVars]), "--text-primary (claro)"),
+    );
+    const darkRatio = contrast(
+      darkSelected,
+      oklchLiteral(requireResolved("--text-primary", [darkTheme]), "--text-primary (oscuro)"),
+    );
+    expect(lightRatio, `claro: text-primary sobre seleccionado = ${lightRatio.toFixed(2)}:1`)
+      .toBeGreaterThanOrEqual(AA_TEXT_MIN);
+    expect(darkRatio, `oscuro: text-primary sobre seleccionado = ${darkRatio.toFixed(2)}:1`)
+      .toBeGreaterThanOrEqual(AA_TEXT_MIN);
   });
 
   it("las dos claves base del registry (background/foreground) existen y resuelven en ambos temas", () => {

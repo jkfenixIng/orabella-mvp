@@ -48,11 +48,15 @@ export function ThemeToggle() {
             writeThemeCookie(option.value);
           }}
           className={
-            // El segmento elegido se pinta como superficie realzada
-            // (`bg-surface-hover`) y el resto como texto secundario; ambos
-            // tokens se invierten solos en `.dark`, así que no llevan `dark:`.
+            // El segmento elegido se pinta como superficie SELECCIONADA
+            // (`bg-surface-selected`) y el resto como texto secundario. El
+            // segmento elegido NO puede usar `bg-surface-hover`: ese peldaño
+            // (L 0.96 en claro) queda a 0.020 de la página (L 0.98) y el estado
+            // activo se vuelve indistinguible. `bg-surface-selected` mantiene el
+            // paso en 0.050 en claro y 0.050 en oscuro. Ambos tokens se
+            // invierten solos en `.dark`, así que no llevan `dark:`.
             current === option.value
-              ? "rounded-md bg-surface-hover px-3 py-1 text-sm text-text-primary"
+              ? "rounded-md bg-surface-selected px-3 py-1 text-sm text-text-primary"
               : "rounded-md px-3 py-1 text-sm text-text-secondary hover:bg-surface-hover"
           }
         >

@@ -11,6 +11,7 @@
 @theme inline {
   --color-surface: var(--bg-surface);
   --color-surface-hover: var(--bg-surface-hover);
+  --color-surface-selected: var(--bg-surface-selected);
   --color-text-primary: var(--text-primary);
   --color-text-secondary: var(--text-secondary);
   --color-text-tertiary: var(--text-tertiary);
