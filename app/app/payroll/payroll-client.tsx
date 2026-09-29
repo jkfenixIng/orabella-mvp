@@ -1,6 +1,7 @@
 "use client";
 
 import { useRef, useState, useTransition, type FormEvent } from "react";
+import { toast } from "sonner";
 import {
   calculatePayrollAction,
   closePayrollPeriodAction,
@@ -24,13 +25,12 @@ import {
   DialogTitle,
 } from "@/src/components/ui/lib/dialog";
 import { cn } from "@/src/components/ui/lib/utils";
+import { Alert } from "@/src/components/ui/lib/alert";
 import {
   buttonClass,
-  errorClass,
   ghostClass,
   inputClass,
   labelClass,
-  okClass,
   sectionClass,
   tableCellClass,
   tableHeaderClass,
@@ -571,7 +571,10 @@ export function PayrollClient(props: PayrollClientProps) {
   const [selectedId, setSelectedId] = useState<string | null>(props.initialPeriods[0]?.id ?? null);
   const [detail, setDetail] = useState<PeriodDetail | null>(null);
   const [detailTargetId, setDetailTargetId] = useState<string | null>(null);
-  const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  // Un solo canal de ESTADO: lo que sigue siendo el caso mientras no se
+  // corrija (fallo de acción o validación incompleta). Lo que acaba de pasar
+  // (éxito) es EVENTO y sale por `toast`, no por estado.
+  const [error, setError] = useState<string | null>(null);
 
   // Periodo: abrir (el rango se pide en el modal, no en la vista principal).
   const [startDate, setStartDate] = useState("");
@@ -614,10 +617,18 @@ export function PayrollClient(props: PayrollClientProps) {
 
   function show<T>(result: ActionResult<T>, okText?: string): result is { success: true; data: T } {
     if (!result.success) {
-      setMessage({ kind: "error", text: `${result.code}: ${result.message}` });
+      // El fallo de una acción es ESTADO: deja el mensaje en la vista,
+      // persistente mientras el problema exista.
+      setError(`${result.code}: ${result.message}`);
       return false;
     }
-    if (okText) setMessage({ kind: "ok", text: okText });
+    if (okText) {
+      // El éxito de una acción es EVENTO: acaba de pasar y no tiene que
+      // quedarse en pantalla compitiendo con lo que sí importa. Antes era un
+      // <p role="status"> que persistía hasta la siguiente acción. El texto es
+      // el mismo.
+      toast.success(okText);
+    }
     return true;
   }
 
@@ -719,15 +730,15 @@ export function PayrollClient(props: PayrollClientProps) {
     if (calculated.success) {
       setDetail(calculated.data);
       setDetailDialogOpen(true);
-      setMessage({ kind: "ok", text: "Periodo abierto y calculado." });
+      // EVENTO: el período recién abierto y calculado. Es la única salida de
+      // éxito que no pasa por `show()` porque este flujo tiene dos desenlaces.
+      toast.success("Periodo abierto y calculado.");
       return;
     }
     // Si el cálculo falla, el período igual quedó creado en borrador: se
-    // muestra su detalle vacío para poder recalcular a mano.
-    setMessage({
-      kind: "error",
-      text: `Periodo abierto, pero el cálculo falló — ${calculated.code}: ${calculated.message}`,
-    });
+    // muestra su detalle vacío para poder recalcular a mano. ESTADO: el
+    // problema sigue ahí hasta que el usuario recalcule.
+    setError(`Periodo abierto, pero el cálculo falló — ${calculated.code}: ${calculated.message}`);
     await loadDetail(created.id);
   }
 
@@ -834,17 +845,14 @@ export function PayrollClient(props: PayrollClientProps) {
   async function handlePay(item: DetailItem) {
     const rows = itemPortions(item.id);
     if (rows.length === 0) {
-      setMessage({ kind: "error", text: "Agregue al menos una porción de pago." });
+      setError("Agregue al menos una porción de pago.");
       return;
     }
     const parts: Array<{ method_code: string; amount: number }> = [];
     for (const row of rows) {
       const amount = toNumber(row.amount);
       if (!row.method_code.trim() || amount === null || amount <= 0) {
-        setMessage({
-          kind: "error",
-          text: "Complete el método y un monto mayor a 0 en cada porción.",
-        });
+        setError("Complete el método y un monto mayor a 0 en cada porción.");
         return;
       }
       parts.push({ method_code: row.method_code.trim(), amount });
@@ -853,10 +861,9 @@ export function PayrollClient(props: PayrollClientProps) {
     // pendiente (misma regla OVERPAID que `assertNoOverpay`).
     const total = parts.reduce((acc, part) => acc + part.amount, 0);
     if (total - item.remaining > 0.009) {
-      setMessage({
-        kind: "error",
-        text: `Las porciones (${formatMoney(total)}) superan el saldo pendiente (${formatMoney(item.remaining)}).`,
-      });
+      setError(
+        `Las porciones (${formatMoney(total)}) superan el saldo pendiente (${formatMoney(item.remaining)}).`,
+      );
       return;
     }
     setBusy(true);
@@ -944,15 +951,18 @@ export function PayrollClient(props: PayrollClientProps) {
 
   return (
     <div className="flex flex-col gap-6">
-      {message && (
-        <p role={message.kind === "error" ? "alert" : "status"} className={message.kind === "error" ? errorClass : okClass}>
-          {message.text}
-        </p>
+      {error && (
+        // Fallo de acción o validación incompleta = ESTADO: sigue siendo el
+        // caso mientras no se corrija, así que va inline y persistente arriba
+        // de los períodos. `destructive` deriva role="alert" (asertivo), el
+        // mismo rol que la rama de error escribía a mano.
+        <Alert variant="destructive">{error}</Alert>
       )}
 
       <section className={sectionClass}>
         <h2 className="text-lg font-semibold">Periodos</h2>
         {props.initialEmployees.length === 0 && (
+          // VACÍO: no es un aviso, es el estado base de la sede sin planta.
           <p className="mt-2 text-sm text-text-secondary">
             Aún no hay empleados en la sede: créelos en /admin antes de liquidar.
           </p>
@@ -1041,6 +1051,8 @@ export function PayrollClient(props: PayrollClientProps) {
               <div className="rounded-md border border-border-color bg-surface-hover p-3 text-sm text-text-secondary dark:border-border-color-2">
                 <p className="font-medium text-text-primary">Períodos existentes</p>
                 {periods.length === 0 ? (
+                  // VACÍO dentro del diálogo: describe lo esperado (el primero
+                  // de la lista), no bloquea nada y nunca anunció nada.
                   <p className="mt-1">Sin períodos todavía: este será el primero.</p>
                 ) : (
                   <ul className="mt-1 flex flex-col gap-1">
@@ -1069,15 +1081,17 @@ export function PayrollClient(props: PayrollClientProps) {
               </div>
 
               {rangeInvalid ? (
-                <p className={errorClass}>La fecha final no puede ser anterior a la inicial.</p>
+                // ESTADO calculado en vivo: mientras el rango sea inválido el
+                // botón Crear no puede producir una apertura válida. Antes era
+                // un <p> con la clase de error y sin rol; ahora el canal es el
+                // mismo que el de los otros dos avisos del diálogo.
+                <Alert variant="destructive">La fecha final no puede ser anterior a la inicial.</Alert>
               ) : overlap ? (
-                <p className={errorClass}>
+                <Alert variant="destructive">
                   El rango se solapa con {formatPeriodLabel(overlap)} ({overlap.status}). Ajuste las fechas.
-                </p>
+                </Alert>
               ) : openError ? (
-                <p role="alert" className={errorClass}>
-                  {openError}
-                </p>
+                <Alert variant="destructive">{openError}</Alert>
               ) : null}
 
               <DialogFooter>
@@ -1137,10 +1151,12 @@ export function PayrollClient(props: PayrollClientProps) {
                     onView={openItemDetail}
                   />
                   {pendingItems.length > 0 && (
-                    <div
-                      role="status"
-                      className="mt-4 rounded-md bg-warning-light px-3 py-2 text-sm font-medium text-warning"
-                    >
+                    // ESTADO que bloquea el cierre de la nómina: el botón
+                    // "Cerrar nómina" queda deshabilitado hasta pagar todo.
+                    // No es un error — es un pendiente — así que la variante
+                    // deliberada es `warning`, que es además el par de tokens
+                    // que el marcado ya usaba (bg-warning-light + text-warning).
+                    <Alert variant="warning" className="mt-4">
                       <p>
                         {`Pendientes de pago (${pendingItems.length}): páguelos todos antes de cerrar la nómina.`}
                       </p>
@@ -1156,7 +1172,7 @@ export function PayrollClient(props: PayrollClientProps) {
                           {`y ${pendingItems.length - PENDING_VISIBLE_LIMIT} más (vea la columna Saldo de la tabla).`}
                         </p>
                       )}
-                    </div>
+                    </Alert>
                   )}
                   <div className="mt-4 flex flex-wrap gap-3">
                     <button
