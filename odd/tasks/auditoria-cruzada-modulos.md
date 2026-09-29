@@ -95,10 +95,15 @@ deltas sin lock → dos ediciones concurrentes descuentan dos veces.
 escribe las mismas tablas. Un fallo entre el delete y el insert deja al usuario **sin roles** → cada
 guarda responde 403. No es plata.
 
-### 11. La 032 está referenciada pero no existe como migración aplicable
-`billing/service.ts:522`, `:552`, `:1511` y `tests/money-rounding.test.ts` tratan la 032 como la
-reparación de centavos históricos, pero el directorio salta 031 → 033: el borrador está en
-`032_*.sql.draft` a propósito (su gate fue refutado). **El artefacto está pendiente y es de esta ola.**
+### 11. La 032 existió como borrador y se dio de baja (resuelto el 2026-09-29)
+`billing/service.ts` y `tests/money-rounding.test.ts` mencionaban una migración `032` como "la
+reparación de centavos históricos", y el directorio saltaba 031 → 033: el borrador estaba en
+`032_*.sql.draft` a propósito porque su gate H3 fue refutado por una verificación independiente.
+**Resolución: el dueño dio de baja la reparación histórica** (la app no está en producción, así que
+esas filas son datos de prueba descartables). El borrador se **eliminó** y las referencias que apuntaban
+a una migración inexistente se limpiaron del código y de los tests. Hoy los comentarios dicen qué pasa
+de verdad: los cuadres contra filas guardadas siguen al centavo (`round2`) y el saldo cobrable es peso
+entero (`invoiceNetBalance`), así que una factura con centavos igual cierra.
 
 ### 12. Columnas de entrada de dinero aceptan centavos y la edición los reescribe
 `unit_price`/`discount` (`billing/schemas.ts:147-148`), catálogo (`admin/schemas.ts:120,147`), y

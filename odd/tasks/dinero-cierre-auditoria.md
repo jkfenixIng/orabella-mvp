@@ -4,8 +4,10 @@
 Ejecutar, **en orden**, las cuatro unidades confirmadas por el usuario el 2026-09-29, que son la
 respuesta operativa a las nueve decisiones pendientes de `odd/tasks/auditoria-monolito.md`:
 
-1. **Regla del peso entero** en toda la aritmética de dinero + **backfill** del recargo de tarjeta
-   histórico (migración `032`). Una sola unidad: comparten el criterio de redondeo.
+1. **Regla del peso entero** en toda la aritmética de dinero. La **reparación histórica** del recargo
+   de tarjeta y de los centavos viejos se **dio de baja** por decisión del dueño (2026-09-29): la app
+   no está en producción, así que esas filas son datos de prueba descartables y ninguna migración las
+   repara. Ver "U1 — decisión de baja" en Evidence.
 2. **Gate de edición del total** de una factura que ya tiene cobros: avisar y pedir confirmación.
 3. **Cierre de caja intocable** + corrección por **reconteo obligatorio**, dejando las dos versiones.
 4. **Auditoría cruzada de interacciones entre módulos**, sobre el árbol ya arreglado.
@@ -49,7 +51,7 @@ la misma regla. Hacer el backfill antes escribiría datos con centavos que despu
 Touched (por unidad; a confirmar al abrir cada una):
 - **U1:** `app/src/features/billing/schemas.ts`, `app/src/features/billing/service.ts`,
   `app/src/features/cash/service.ts`, `app/src/features/payroll/service.ts`,
-  `app/src/features/commissions/service.ts`, `app/supabase/migrations/032_*.sql`,
+  `app/src/features/commissions/service.ts`
   `app/tests/{money-rounding,billing,cash}.test.ts`
 - **U2:** `app/src/features/billing/{service,schemas,actions}.ts`, `app/app/invoices/invoices-client.tsx`, tests
 - **U3:** `app/src/features/cash/*`, `app/supabase/migrations/033_*` (a definir), tests
@@ -69,10 +71,12 @@ Out:
 - Nunca inventar una regla de negocio que toque plata.
 
 ## Tasks
-- [ ] **U1** Regla del peso entero + reparación revisable de la plata histórica (migración `032`, **rediseñada**)
-  - Estado: **EN CURSO / rediseño**. La aritmética y los tests están hechos y verificados. La migración
-    quedó **en borrador inerte** (`app/supabase/migrations/032_whole_peso_and_fee_backfill.sql.draft`)
-    porque su gate H3 fue **refutado**: ver la verificación independiente abajo. **No aplicar.**
+- [ ] **U1** Regla del peso entero en toda la aritmética de dinero
+  - Estado: **CERRADA** el 2026-09-29 (commit `ff561a1`). La reparación histórica quedó **dada de baja
+    por decisión del dueño**: la app no está en producción, así que las filas con centavos son datos de
+    prueba descartables y no hace falta ninguna migración que las repare. El borrador que llegó a
+    existir (`032_whole_peso_and_fee_backfill.sql.draft`, gate H3 refutado) se **eliminó**, y las
+    referencias que apuntaban a una migración inexistente se limpiaron del código y de los tests.
 - [ ] **U2** Gate de edición del total con cobros: aviso + confirmación (decisión 2, opción B).
 - [ ] **U3** Cierre de caja intocable + reconteo obligatorio con doble versión (decisión 3).
 - [ ] **U4** Auditoría cruzada entre módulos (decisión del usuario, 2026-09-29): matriz de pares
@@ -141,9 +145,17 @@ Lo que cambia el diseño:
    tarjeta suma `fee_amount` sin tocar `surcharge`. Su conclusión sobre el gate se sostiene igual,
    porque se apoya en el guard, no en ese invariante.
 
-### Diseño corregido de U1 (propuesto)
-El usuario ya eligió, para los cobros viejos, "(a) reparar con una corrección de datos **revisable**".
-Esa es la medicina correcta para los tres hallazgos y un heurístico aritmético no la reemplaza:
+### U1 — decisión de baja de la reparación histórica (2026-09-29)
+El dueño dio de baja la reparación: la app **no está en producción**, así que las filas con centavos y el
+recargo faltante son **datos de prueba descartables**. No hay migración de reparación, y el borrador
+`032_whole_peso_and_fee_backfill.sql.draft` se **eliminó**, junto con las referencias que el código y los
+tests hacían a una migración inexistente. Consecuencia práctica, ya escrita en el código: los cuadres
+contra filas guardadas siguen al centavo (`round2`), y el saldo **cobrable** es peso entero
+(`invoiceNetBalance`), así que una factura con centavos igual cierra.
+
+### Diseño corregido de U1 (propuesto, ya no necesario)
+Se conserva como registro de por qué el heurístico no servía. El usuario había elegido, para los cobros
+viejos, "(a) reparar con una corrección de datos **revisable**".
 
 1. **Vista previa (solo lectura):** censo de centavos (a2), candidatos de recargo **con su `created_at`**
    (para ver la era de cada fila) e impacto por factura.
@@ -154,13 +166,14 @@ Esa es la medicina correcta para los tres hallazgos y un heurístico aritmético
    por heurístico aritmético.
 
 ## Next step
-- U1: el archivo está en **borrador inerte y NO se aplica**. Corregir su encabezado (la afirmación H3 es
-  falsa y engañaría al próximo lector) y rediseñar (b)/(c) según el diseño corregido de arriba.
-- Conseguir el connection string de **PRUEBAS** para correr la vista previa y **reemplazar la inferencia
-  por números**. Es el desbloqueo real: todo el diseño depende de esos conteos.
-- **No commitear U1** hasta que el diseño corregido esté verificado.
-- Seguir con U2 (gate del total con cobros) y U3 (cierre intocable), en serie.
-- U4 al final, sobre el árbol arreglado.
+- U1: **cerrada** en `ff561a1`; la reparación histórica se dio de baja y su borrador se eliminó: no
+  queda ninguna `032`, ni aplicable ni en cuarentena, y el código y los tests ya no la mencionan.
+- U2 (gate del total con cobros), U3 (cierre intocable) y U4 (auditoría cruzada): **cerradas**
+  (`bb718e8`, `2baa716`, `3eae311`).
+- Pendiente el lote que abrió la auditoría cruzada: el tope en la base para `commission_payouts`, y el
+  pulido D5–D9. Ver `odd/tasks/auditoria-cruzada-modulos.md`.
+- Conseguir el connection string de **PRUEBAS** para tener las migraciones al día y confirmar por
+  números lo que hoy es inferencia.
 
 ## Route declaration
 - Delegación a un writer por unidad (`gentle-ai-worker`) y verificación independiente
