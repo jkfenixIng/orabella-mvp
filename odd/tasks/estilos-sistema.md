@@ -86,17 +86,35 @@ El escáner de candidatos de Tailwind v4 recorre la raíz del repo, **incluidos 
 Decisión pendiente: acotar el escaneo de candidatos (un `@source` explícito o una regla en `next.config.ts`). **Requiere cuidado**: acotar mal deja utilidades legítimas fuera del CSS y rompe estilos en producción — es de los cambios donde el fallo se ve en pantalla y no en un test.
 
 ## Tasks
-- [x] WU0 croma de los `-50` + aliases canónicos (`5d4b6f8`; evidencia roja real)
-- [x] WU-C1 retirar muertos y registrar claves canónicas (`d5b8fdd`, verificado)
+- [x] WU0 croma de los `-50` + aliases canónicos (`5d4b6f8`)
+- [x] WU-C1 retirar muertos y registrar claves canónicas (`d5b8fdd`)
 - [x] WU-C2 claves base del registry (`704aaf1`)
 - [x] WU1 paleta cruda fuera de facturación (`c1bd2ee` — **commit rojo, ver abajo**)
 - [x] WU2 coherencia de combobox (`534ef6f`; 44 tokens crudos → 0)
 - [x] WU-T1 token de superficie seleccionada (`058fbec`)
-- [ ] WU-C3 (requiere decisión) `.shadow-sm|md|lg|xl`: qué valor debe ganar
-- [ ] WU-C4 (requiere decisión) `--bg-surface-2` es duplicado de `--bg-surface-hover`
-- [ ] WU3 consolidar helpers duplicados — **inventario re-medido abajo**
-- [ ] WU4 adoptar `Badge` (`Alert` ya está adoptado por WU-C)
-- [ ] WU5 tokenizar chrome de `invoices-client`, encadenado en 2–3 PRs
+- [x] WU3 ayudantes consolidados en un solo hogar (`a42d2a2`)
+- [x] WU4 adopción de `Badge` (`a4a5110`; paleta cruda de facturación 246 → 224)
+- [ ] **WU5 — tokenizar el chrome de `invoices-client`: NO se hace en esta rama.** Van 224 hits en un archivo de 3050 líneas y toca la estética de papel de la factura, que es intencional. Necesita rama y PR propios, encadenados por región.
+- [ ] WU-C3 (decisión) `.shadow-sm|md|lg|xl`: qué valor debe ganar
+- [ ] WU-C4 (decisión) `--bg-surface-2` es duplicado de `--bg-surface-hover`
+
+## Cierre del frente de estilos: cortado a propósito (2026-10-01)
+La rama `feat/orabella-mvp` quedó **140 commits** adelante de `origin/develop`, con un diff acumulado de **139 archivos, +23.583 / −3.608**. De esa cifra, **36 commits son de esta sesión**, y buena parte de las líneas son **guardas**: `design-tokens.test.ts` +1002, `cash.test.ts` +928, `action-guards.test.ts` +802, más las siete tandas de feedback, el de formato y el de adopción de `Badge`.
+
+Se cortó acá **por decisión del usuario**: sumarle WU5 —el refactor más grande que queda— empeoraría la revisión en vez de mejorarla, y WU5 tiene una parte que no se debe tocar (la estética de papel). Ningún pendiente se pierde por mergear: las decisiones y los follow-ups viven en `odd/tasks/`.
+
+**Estado verificado del cierre:** vitest **651/651** · `tsc --noEmit` · eslint 0 errores (1 warning preexistente en `app/error.tsx`) · `next build` 22/22. Todo pusheado; árbol limpio salvo la basura del harness.
+
+**Lo único razonado y no observado:** los **5 asertos e2e de `cash.spec.ts`**, que necesitan backend vivo. El chequeo pre-merge es exactamente: `E2E_BACKEND=test npx playwright test tests/e2e/cash.spec.ts` con el estado de auth sembrado.
+
+### Cinco guardas nuevas, y cada una nació de un defecto que ya había pasado
+1. **Paleta cruda** — conteo de TOKENS enteros (no substrings), allowlist con conteo exacto por archivo.
+2. **Clasificación de claves** — agregar una clave a `@theme` sin clasificarla es imposible.
+3. **Una sola definición por ayudante** — probada por mutación.
+4. **Adopción de `Badge`** — detector de dos firmas, porque la pastilla vieja interpolaba el color y una sola firma se la habría escapado.
+5. **Feedback por módulo** — cada tanda con su contrato, y las que no tienen mensaje derivado lo fijan como hecho.
+
+La consistencia no se sostiene con buena voluntad: se sostiene con un test que falla.
 
 ## WU1 / WU2 / WU-T1 — resultados (2026-10-01)
 - **WU1** sacó la paleta cruda de los archivos que se ven en toda ruta y **borró `app/loading.tsx`**, que estaba en la raíz del proyecto y no dentro del App Router. La prueba decisiva de que era código muerto: el `app-build-manifest.json` de Next lista **siete** entradas de `loading` y **ninguna** para `/loading`. De paso desapareció la duplicación que el audit marcó: era el único llamador que re-pasaba las clases de color al esqueleto. Se agregó `tests/no-raw-palette.test.ts`, que cuenta **tokens enteros** (no substrings), limpia comentarios, tiene control negativo, piso anti-walk-roto, y allowlist con **conteo exacto** por archivo.
