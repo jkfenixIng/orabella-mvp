@@ -77,6 +77,14 @@ Lo que **sí** quedó probado: 21 clases sin capa en el build y **ninguna** coli
 - **`.dark .text-success|warning|error`** siguen sin capa y sobreescriben la utilidad generada en oscuro, deliberadamente, para dar el peldaño `-400`. Aceptable para el objetivo de shadcn (no son nombres del registry), pero deja en pie el patrón "clase del proyecto gana a utilidad de Tailwind" para cualquier colisión futura.
 - **`radius-*` zafó por nombre**: el proyecto usa `radius-lg`, Tailwind genera `rounded-lg`.
 
+## Hallazgo de build: Tailwind escanea `odd/**/*.md` (2026-10-01)
+El escáner de candidatos de Tailwind v4 recorre la raíz del repo, **incluidos los `.md` de `odd/`**. Comprobado por el writer de WU-C2. Consecuencias:
+- Las clases nombradas en **documentación** entran al bundle CSS. `.bg-background` y `.text-foreground` aparecen en el CSS compilado porque **este documento las nombra**, no porque ninguna UI las use: cero consumidores en `app/**`.
+- Y `.bg-primary` se emite aunque un test afirme que ningún `.ts/.tsx` de producción la usa, por el mismo mecanismo (el nombre del token y los comentarios).
+- Efecto colateral grave para la ingeniería: **la evidencia "esta utilidad se emite" queda contaminada por los docs.** Es la explicación de fondo de por qué el "salen 2 de 8" de WU-C1 era inestable — el "2" venía del archivo de test, no de la app. La prueba de carga útil real es la emisión forzada en memoria, no el CSS compilado.
+- Efecto en el bundle: bytes de más, sin riesgo funcional.
+Decisión pendiente: acotar el escaneo de candidatos (un `@source` explícito o una regla en `next.config.ts`). **Requiere cuidado**: acotar mal deja utilidades legítimas fuera del CSS y rompe estilos en producción — es de los cambios donde el fallo se ve en pantalla y no en un test.
+
 ## Tasks
 - [x] WU0 croma de los `-50` + aliases canónicos (`5d4b6f8`; 384 tests, evidencia roja real)
 - [x] WU-C1 retirar muertos y registrar claves canónicas (`d5b8fdd`, verificado)
