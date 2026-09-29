@@ -36,7 +36,14 @@ import {
   listPaymentMethods,
   AdminError,
 } from "@/src/features/admin/service";
-import { BillingError, getInvoiceDetail } from "@/src/features/billing/service";
+import {
+  BillingError,
+  getInvoiceDetail,
+  invoiceNetBalance,
+  splitGrossCardFee,
+  type InvoiceNetBalance,
+} from "@/src/features/billing/service";
+import { randomUUID } from "node:crypto";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { getShiftReviews } from "@/src/features/alerts/service";
 import { assembleShiftRevision, type ShiftRevision } from "@/src/features/alerts/schemas";
@@ -883,9 +890,22 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
     }
 
     let invoiceStatus: string | null = null;
-    let invoicePaid = 0;
-    let invoiceTotal = 0;
     let invoiceShiftId: string | null = null;
+    let invoiceBalance: InvoiceNetBalance | null = null;
+
+    // T0-a (Defecto 1): el monto de entrada es el BRUTO que el cliente entrega
+    // (019: la porción guarda bruto y el arqueo suma bruto; el contrato de
+    // `POST /api/v1/cash/payments` no cambia), así que el recargo se DERIVA de
+    // él con el `fee_percent` del método cobrado (`payment_methods.fee_percent`:
+    // el mismo snapshot que escribe billing al emitir). El bruto se redondea
+    // UNA vez: la aritmética del servicio y las dos filas escritas
+    // (`invoice_payments.amount` y `payments.amount`, numeric(12,2)) coinciden
+    // al centavo, así el tope de 031 ve exactamente el neto que calculó el
+    // servicio.
+    const gross = roundMoney(input.amount);
+    const feePercent = Math.max(0, Number(method.fee_percent) || 0);
+    const cardFee = splitGrossCardFee(gross, feePercent);
+
     if (input.invoice_id) {
       const detail = await getInvoiceDetail(actor.sedeId, input.invoice_id).catch((error) => {
         throw toCashError(error);
@@ -894,11 +914,19 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
         throw new CashError("ANNUL_INVALID", "No se puede cobrar una factura anulada.", 409);
       }
       invoiceStatus = detail.invoice.status;
-      invoicePaid = detail.paid;
-      invoiceTotal = Number(detail.invoice.total);
       invoiceShiftId = detail.invoice.cash_shift_id;
-      const incoming = roundMoney(invoicePaid + input.amount);
-      if (incoming - invoiceTotal > 0.009) {
+      // T0-a (Defecto 2): el saldo cobrable es NETO (total − surcharge, 019) y
+      // la porción entra en neto (bruto − recargo). El bruto de un cobro con
+      // tarjeta supera `invoices.total` cuando el recargo es de un cobro
+      // POSTERIOR a la emisión: comparar el bruto contra el total rechazaba
+      // como "sobrepago" un cobro legítimo. Mismo tope y tolerancia que el
+      // trigger de 031 (0.009), que es la barrera real ante carreras.
+      invoiceBalance = invoiceNetBalance({
+        total: detail.invoice.total,
+        surcharge: detail.invoice.surcharge,
+        payments: detail.payments,
+      });
+      if (invoiceBalance.netCollected + cardFee.net - invoiceBalance.netBilled > 0.009) {
         throw new CashError("OVERPAID", "El pago supera el saldo pendiente de la factura.", 422);
       }
     }
@@ -911,15 +939,30 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
     // falla puede dejar un `payments` con `invoice_id` que el arqueo ignora
     // (los tres lectores filtran `invoice_id IS NULL`): el dinero nunca queda
     // invisible. Si el espejo falla, no hay nada que revertir.
+    //
+    // T0-a (Defecto 1): el espejo lleva el recargo de la porción
+    // (`fee_percent` + `fee_amount`) para que `amount − fee_amount` sea el neto
+    // cobrado, que es lo que suman el tope de 031, el saldo de la factura y el
+    // reporte del recargo. Sin él, `fee_amount` tomaba su DEFAULT 0 y el
+    // recargo de la caja era irrecuperable.
     let mirrorId: string | null = null;
     if (input.invoice_id) {
+      // El id se genera acá: la columna es `uuid PRIMARY KEY DEFAULT
+      // gen_random_uuid()` (005_billing.sql). Tenerlo ANTES del INSERT hace que
+      // toda compensación sea EXACTA por id — nunca por (factura, turno,
+      // método, monto), que podría borrar también un cobro legítimo anterior
+      // idéntico.
+      const mirrorIdCandidate = randomUUID();
       const { data: mirror, error: mirrorError } = await db
         .from("invoice_payments")
         .insert({
+          id: mirrorIdCandidate,
           invoice_id: input.invoice_id,
           method_id: method.id,
           method_code: method.code,
-          amount: input.amount,
+          amount: gross,
+          fee_percent: feePercent,
+          fee_amount: cardFee.fee,
           cash_shift_id: shift.id,
         })
         .select("id")
@@ -932,8 +975,44 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
         }
         throw new CashError("INTERNAL", "Error interno.", 500);
       }
-      if (!mirror) throw new CashError("INTERNAL", "Error interno.", 500);
-      mirrorId = (mirror as { id: string }).id;
+      if (!mirror) {
+        // Defecto 3: esta rama no puede quedar muda ni sin compensar.
+        // PostgREST no debería responder sin error y sin fila; si pasa, la
+        // compensación es exacta (el DELETE solo puede tocar la fila que
+        // acabamos de intentar insertar; 0 filas si nunca llegó a existir) y
+        // se grita. Si la compensación también falla no se sabe qué quedó
+        // escrito: mismo desenlace que la reversa de la fila de cajón.
+        const { error: unconfirmedError } = await db
+          .from("invoice_payments")
+          .delete()
+          .eq("id", mirrorIdCandidate);
+        console.error(
+          "PG invoice_payments insert sin fila:",
+          JSON.stringify({
+            invoice_id: input.invoice_id,
+            shift_id: shift.id,
+            method_code: method.code,
+            amount: gross,
+            fee_percent: feePercent,
+            fee_amount: cardFee.fee,
+            mirror_id: mirrorIdCandidate,
+            compensation_error: unconfirmedError,
+          }),
+        );
+        if (unconfirmedError) {
+          throw new CashError(
+            "PAYMENT_ROLLBACK_FAILED",
+            "El cobro quedó registrado en la factura y en el arqueo, pero no en el libro de caja del turno. No reintente: avise al administrador.",
+            500,
+          );
+        }
+        throw new CashError(
+          "MIRROR_UNCONFIRMED",
+          "No se pudo confirmar el registro del cobro en la factura; no quedó nada escrito. Reintente.",
+          500,
+        );
+      }
+      mirrorId = mirrorIdCandidate;
     }
 
     const { data: payment, error: paymentError } = await db
@@ -944,7 +1023,7 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
         invoice_id: input.invoice_id ?? null,
         method_id: method.id,
         method_code: method.code,
-        amount: input.amount,
+        amount: gross,
         user_id: actor.userId,
       })
       .select(PAYMENT_SELECT)
@@ -965,7 +1044,7 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
             JSON.stringify({
               invoice_id: input.invoice_id,
               shift_id: shift.id,
-              amount: input.amount,
+              amount: gross,
               method_code: method.code,
               mirror_id: mirrorId,
               rollback_error: rollbackError,
@@ -981,11 +1060,17 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
       throw new CashError("INTERNAL", "Error interno.", 500);
     }
 
-    if (input.invoice_id) {
-      const paid = roundMoney(invoicePaid + input.amount);
+    if (input.invoice_id && invoiceBalance) {
       const updates: Record<string, unknown> = {};
       if (!invoiceShiftId) updates.cash_shift_id = shift.id;
-      if (invoiceStatus === "Emitida" && moneyEquals(paid, invoiceTotal)) {
+      // La factura queda Pagada cuando el NETO cobrado cubre el neto
+      // facturado: con el recargo de un cobro posterior a la emisión el bruto
+      // supera `total`, así que comparar el bruto contra total dejaba en
+      // Emitida una factura con el neto ya completo.
+      if (
+        invoiceStatus === "Emitida" &&
+        moneyEquals(roundMoney(invoiceBalance.netCollected + cardFee.net), invoiceBalance.netBilled)
+      ) {
         updates.status = "Pagada";
         invoiceStatus = "Pagada";
       }

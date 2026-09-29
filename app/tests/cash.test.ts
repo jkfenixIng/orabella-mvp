@@ -34,6 +34,10 @@ import {
   mergeShiftMoney,
   sumShiftMoneyByMethod,
 } from "@/src/features/cash/service";
+import {
+  invoiceNetBalance,
+  splitGrossCardFee,
+} from "@/src/features/billing/service";
 
 // ------------------------------------------------- base encadenada (CAJ-01) ---
 
@@ -712,7 +716,318 @@ describe("cash: T0-a (Defecto 2) el espejo va antes que la fila de cajón", () =
       body.indexOf('.from("payments")'),
     );
     expect(mirrorBlock).toContain('(mirrorError as { code?: string }).code === "P0001"');
-    expect(mirrorBlock).not.toContain(".delete()");
+    // El recorte es la rama del INSERT fallido, que es la que no tiene fila que
+    // borrar. La rama del insert SIN fila confirmada sí compensa (Defecto 3,
+    // asertado aparte): su `.delete()` vive después de este recorte.
+    const mirrorErrorBranch = mirrorBlock.slice(
+      mirrorBlock.indexOf("if (mirrorError) {"),
+      mirrorBlock.indexOf("if (!mirror) {"),
+    );
+    expect(mirrorErrorBranch).not.toContain(".delete()");
+  });
+});
+
+// ------- T0-a (Defecto 1/2): recargo derivado del bruto y saldo NETO -------
+
+describe("cash: T0-a (Defecto 1/2) el cobro de caja deriva el recargo del BRUTO", () => {
+  const service = readFileSync(
+    join(process.cwd(), "src", "features", "cash", "service.ts"),
+    "utf8",
+  );
+  const start = service.indexOf("export async function registerPayment");
+  const body = service.slice(start, service.indexOf("export async function", start + 10));
+  const mirror = body.slice(
+    body.indexOf('.from("invoice_payments")'),
+    body.indexOf('.from("payments")'),
+  );
+
+  it("la fila espejo lleva el recargo y el porcentaje, no el DEFAULT 0", () => {
+    expect(mirror).toContain("fee_percent: feePercent");
+    expect(mirror).toContain("fee_amount: cardFee.fee");
+    // El porcentaje sale del método cobrado (payment_methods.fee_percent: el
+    // mismo snapshot que escribe billing al emitir; 019).
+    expect(body).toContain("Math.max(0, Number(method.fee_percent) || 0)");
+  });
+
+  it("el bruto se redondea una sola vez y es el que va a las dos filas", () => {
+    expect(body).toContain("const gross = roundMoney(input.amount);");
+    expect(body).toContain("splitGrossCardFee(gross, feePercent)");
+    expect(body).toContain("amount: gross");
+    // El INSERT crudo (sin centavos normalizados) no puede volver: la fila
+    // espejo y la de cajón tienen que guardar el mismo monto.
+    expect(body).not.toContain("amount: input.amount");
+  });
+
+  it("la factura se marca Pagada por NETO, no por bruto contra total", () => {
+    expect(body).toContain("invoiceNetBalance({");
+    expect(body).toContain(
+      "invoiceBalance.netCollected + cardFee.net - invoiceBalance.netBilled > 0.009",
+    );
+    expect(body).toContain(
+      "moneyEquals(roundMoney(invoiceBalance.netCollected + cardFee.net), invoiceBalance.netBilled)",
+    );
+    // Los dos chequeos viejos (bruto de caja contra el total) no pueden volver.
+    expect(body).not.toContain("roundMoney(invoicePaid + input.amount)");
+    expect(body).not.toContain("moneyEquals(paid, invoiceTotal)");
+  });
+
+  it("el id del espejo se conoce ANTES del INSERT (compensación exacta)", () => {
+    const declared = body.indexOf("const mirrorIdCandidate = randomUUID();");
+    expect(declared).toBeGreaterThan(-1);
+    expect(declared).toBeLessThan(body.indexOf('.from("invoice_payments")'));
+    expect(mirror).toContain("id: mirrorIdCandidate,");
+  });
+
+  it("Defecto 3: la rama sin fila confirmada compensa por id y grita", () => {
+    const branch = body.slice(
+      body.indexOf("if (!mirror)"),
+      body.indexOf("mirrorId = mirrorIdCandidate"),
+    );
+    expect(branch).toContain("console.error(");
+    expect(branch).toContain('.eq("id", mirrorIdCandidate)');
+    // Compensación fallida: mismo desenlace ya conocido para el operador.
+    expect(branch).toContain('"PAYMENT_ROLLBACK_FAILED"');
+    // Compensada: nada quedó escrito y se dice con código propio (no genérico).
+    expect(branch).toContain('"MIRROR_UNCONFIRMED"');
+    expect(branch).not.toContain('"INTERNAL"');
+  });
+});
+
+describe("cash: T0-a (Defecto 1/2) aritmética del recargo y del saldo (puro)", () => {
+  const TARJETA = 5;
+  const tarjeta = (code: string): number => (code === "tarjeta" ? TARJETA : 0);
+  const round2 = (value: number): number => Math.round(value * 100) / 100;
+
+  /**
+   * Réplica pura del tope de 031 (`trg_invoice_payments_cap`; ver el test
+   * estructural de la migración más abajo y el bloque de Defecto 1): el neto
+   * cobrado nunca excede el neto facturado. Tolerancia de centavo (0.009).
+   */
+  function capRejects(args: {
+    total: number;
+    surcharge: number;
+    paidNet: number;
+    newNet: number;
+  }): boolean {
+    return args.paidNet + args.newNet - (args.total - args.surcharge) > 0.009;
+  }
+
+  it("deriva el recargo del BRUTO entregado: inversa de computeCardFees", () => {
+    expect(splitGrossCardFee(105000, TARJETA)).toEqual({ net: 100000, fee: 5000 });
+    expect(splitGrossCardFee(52500, TARJETA)).toEqual({ net: 50000, fee: 2500 });
+    expect(splitGrossCardFee(4200, TARJETA)).toEqual({ net: 4000, fee: 200 });
+    // Sin recargo el neto es el bruto (efectivo/nequi).
+    expect(splitGrossCardFee(100000, 0)).toEqual({ net: 100000, fee: 0 });
+    // El invariante de la fila: `amount − fee_amount` es el neto, y volver a
+    // derivar del bruto reconstruye el mismo par (nada de centavos perdidos).
+    for (const gross of [0.16, 1, 999.99, 4200, 105000, 1234567.89]) {
+      const { net, fee } = splitGrossCardFee(gross, TARJETA);
+      expect(net + fee).toBeCloseTo(gross, 2);
+      expect(splitGrossCardFee(net + fee, TARJETA)).toEqual({ net, fee });
+    }
+  });
+
+  it("el saldo neto descuenta el recargo emitido y los recargos cobrados", () => {
+    // Factura de neto 100000 emitida con una porción de tarjeta de neto 96000:
+    // surcharge 4800, total 104800; la porción guarda bruto 100800 + fee 4800.
+    expect(
+      invoiceNetBalance({
+        total: 104800,
+        surcharge: 4800,
+        payments: [{ amount: 100800, fee_amount: 4800 }],
+      }),
+    ).toEqual({ netBilled: 100000, netCollected: 96000, netRemaining: 4000 });
+    // Sin cobros el saldo es el neto facturado (el recargo emitido no es saldo).
+    expect(invoiceNetBalance({ total: 104800, surcharge: 4800, payments: [] }).netRemaining).toBe(
+      100000,
+    );
+    // Normaliza numeric que llega como string (mismo criterio que el resto).
+    expect(
+      invoiceNetBalance({
+        total: "104800.00",
+        surcharge: "4800.00",
+        payments: [{ amount: "100800.00", fee_amount: "4800.00" }],
+      }).netRemaining,
+    ).toBe(4000);
+  });
+
+  /** Un intento de cobro del módulo de caja, resuelto como lo hace el servicio. */
+  function replayCash(args: {
+    total: number;
+    surcharge: number;
+    rows: Array<{ amount: number; fee_amount: number }>;
+    collections: Array<{ method_code: string; gross: number }>;
+  }): { verdicts: string[]; rows: Array<{ amount: number; fee_amount: number }> } {
+    const rows = args.rows.map((row) => ({ ...row }));
+    const verdicts: string[] = [];
+    for (const collection of args.collections) {
+      const gross = round2(collection.gross);
+      const { net, fee } = splitGrossCardFee(gross, tarjeta(collection.method_code));
+      const balance = invoiceNetBalance({
+        total: args.total,
+        surcharge: args.surcharge,
+        payments: rows,
+      });
+      // 1) Chequeo del servicio: mismo tope y misma tolerancia que el trigger.
+      const serviceBlocks = balance.netCollected + net - balance.netBilled > 0.009;
+      // 2) Lo que evalúa `trg_invoice_payments_cap` con lo YA escrito.
+      const capBlocks = capRejects({
+        total: args.total,
+        surcharge: args.surcharge,
+        paidNet: balance.netCollected,
+        newNet: net,
+      });
+      // Nunca pueden discrepar: si el servicio acepta, la fila entra con ese
+      // neto, así que el tope de la base tiene que aceptarla también.
+      expect(capBlocks).toBe(serviceBlocks);
+      verdicts.push(serviceBlocks ? "OVERPAID" : "ACCEPT");
+      if (!serviceBlocks) rows.push({ amount: gross, fee_amount: fee });
+    }
+    return { verdicts, rows };
+  }
+
+  it("ningún flujo legítimo es rechazado (ni por el servicio ni por el tope)", () => {
+    const flows: Array<{
+      label: string;
+      total: number;
+      surcharge: number;
+      rows: Array<{ amount: number; fee_amount: number }>;
+      collections: Array<{ method_code: string; gross: number }>;
+      expect: string[];
+    }> = [
+      {
+        label: "contado: la factura se cobra completa en efectivo",
+        total: 100000,
+        surcharge: 0,
+        rows: [],
+        collections: [{ method_code: "efectivo", gross: 100000 }],
+        expect: ["ACCEPT"],
+      },
+      {
+        label: "tarjeta: bruto 105000 sobre una factura de 100000 sin cobro emitido",
+        total: 100000,
+        surcharge: 0,
+        rows: [],
+        collections: [{ method_code: "tarjeta", gross: 105000 }],
+        expect: ["ACCEPT"],
+      },
+      {
+        label: "mixto: efectivo 40000 + tarjeta 63000 (netos 40000 + 60000)",
+        total: 100000,
+        surcharge: 0,
+        rows: [],
+        collections: [
+          { method_code: "efectivo", gross: 40000 },
+          { method_code: "tarjeta", gross: 63000 },
+        ],
+        expect: ["ACCEPT", "ACCEPT"],
+      },
+      {
+        label: "parcial: dos porciones de tarjeta (30000 + 70000 de neto)",
+        total: 100000,
+        surcharge: 0,
+        rows: [],
+        collections: [
+          { method_code: "tarjeta", gross: 31500 },
+          { method_code: "tarjeta", gross: 73500 },
+        ],
+        expect: ["ACCEPT", "ACCEPT"],
+      },
+      {
+        label: "saldo de una factura con recargo emitido (caso de 031)",
+        total: 104800,
+        surcharge: 4800,
+        rows: [{ amount: 100800, fee_amount: 4800 }],
+        collections: [{ method_code: "tarjeta", gross: 4200 }],
+        expect: ["ACCEPT"],
+      },
+      {
+        label: "instalment sobre una factura ya cobrada por tarjeta desde billing",
+        total: 100000,
+        surcharge: 0,
+        rows: [{ amount: 105000, fee_amount: 5000 }],
+        collections: [{ method_code: "tarjeta", gross: 105000 }],
+        expect: ["OVERPAID"],
+      },
+    ];
+    for (const flow of flows) {
+      const { verdicts } = replayCash(flow);
+      expect({ label: flow.label, verdicts }).toEqual({ label: flow.label, verdicts: flow.expect });
+    }
+  });
+
+  it("el cobro con tarjeta de una factura sin cobro ya no es un sobrepago falso", () => {
+    const { net, fee } = splitGrossCardFee(105000, TARJETA);
+    const balance = invoiceNetBalance({ total: 100000, surcharge: 0, payments: [] });
+    expect(net).toBe(balance.netRemaining);
+    expect(fee).toBe(5000);
+    // Antes: el servicio comparaba el BRUTO contra el total (105000 − 100000 =
+    // 5000 > 0.009 → OVERPAID) y, sin fee en la fila, el tope veía 105000.
+    expect(round2(105000) - 100000).toBeGreaterThan(0.009);
+    expect(capRejects({ total: 100000, surcharge: 0, paidNet: 0, newNet: 105000 })).toBe(true);
+    expect(capRejects({ total: 100000, surcharge: 0, paidNet: 0, newNet: net })).toBe(false);
+  });
+
+  it("el recargo cobrado queda registrado en la fila (reconciliación del surcharge)", () => {
+    // Emitida sin recargo (surcharge 0) y cobrada con tarjeta: la fila guarda su
+    // fee (antes tomaba el DEFAULT 0 y el recargo era irrecuperable).
+    const { net, fee } = splitGrossCardFee(105000, TARJETA);
+    expect(fee).toBe(5000);
+    expect(net).toBe(100000);
+    // Factura con recargo emitido: la porción emitida reconcilia el snapshot y
+    // la porción posterior suma su propio fee (019: el recargo de un cobro
+    // posterior no se agrega al total, pero sí se cobra y se registra).
+    const emitted = { amount: 100800, fee_amount: 4800 };
+    const later = { amount: 4200, fee_amount: 200 };
+    const invoice = { total: 104800, surcharge: 4800 };
+    expect(emitted.fee_amount).toBe(invoice.surcharge);
+    const closed = invoiceNetBalance({
+      total: invoice.total,
+      surcharge: invoice.surcharge,
+      payments: [emitted, later],
+    });
+    expect(closed.netCollected).toBe(closed.netBilled);
+    expect(closed.netRemaining).toBe(0);
+    expect([emitted, later].reduce((acc, row) => acc + row.fee_amount, 0)).toBe(5000);
+  });
+
+  it("un cobro posterior de billing exige el NETO pendiente, no `total − Σbruto`", () => {
+    // Caja cobró un parcial con tarjeta: bruto 52500, neto 50000, fee 2500.
+    const previous = [{ amount: 52500, fee_amount: 2500 }];
+    const balance = invoiceNetBalance({ total: 100000, surcharge: 0, payments: previous });
+    expect(balance.netRemaining).toBe(50000);
+    // La fórmula anterior (`total − detail.paid`, bruto) daba 47500: rechazaba
+    // una porción legítima de neto 50000 (OVERPAID) y con 47500 dejaba 2500 sin
+    // cobrar marcando la factura Pagada.
+    const grossPaid = previous.reduce((acc, row) => acc + row.amount, 0);
+    expect(round2(100000 - grossPaid)).toBe(47500);
+    const portion = splitGrossCardFee(52500, TARJETA);
+    expect(portion.net).toBe(balance.netRemaining);
+    expect(
+      capRejects({ total: 100000, surcharge: 0, paidNet: balance.netCollected, newNet: portion.net }),
+    ).toBe(false);
+  });
+});
+
+describe("billing: T0-a (Defecto 2) el cobro posterior exige el saldo NETO", () => {
+  const billing = readFileSync(
+    join(process.cwd(), "src", "features", "billing", "service.ts"),
+    "utf8",
+  );
+  const split = billing.slice(billing.indexOf("export async function splitPayment"));
+
+  it("splitPayment compara las porciones contra invoiceNetBalance", () => {
+    expect(split).toContain("invoiceNetBalance({");
+    expect(split).toContain("netSum - balance.netRemaining");
+    expect(split).toContain("balance.netCollected + netSum - balance.netBilled");
+    // El bruto contra total (el saldo corto) no puede volver al código: la
+    // mención en el comentario no cuenta como uso.
+    expect(split).not.toMatch(/round2\(Number\(detail\.invoice\.total\) - detail\.paid\)/);
+  });
+
+  it("el Saldo que ve la UI es el mismo que exige el cobro", () => {
+    expect(billing).toContain("remaining: round2(Math.max(0, balance.netRemaining))");
+    expect(billing).not.toContain("remaining: round2(Math.max(0, Number(invoice.total) - paid))");
   });
 });
 

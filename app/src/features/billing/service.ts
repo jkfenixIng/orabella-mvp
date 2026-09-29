@@ -168,7 +168,9 @@ export interface InvoiceDetail {
   items: InvoiceItemRow[];
   taxes: InvoiceTaxRow[];
   payments: InvoicePaymentRow[];
+  /** BRUTO cobrado = Σ invoice_payments.amount (019: la porción guarda bruto). */
   paid: number;
+  /** Saldo cobrable NETO = (total − surcharge) − Σ(amount − fee_amount). */
   remaining: number;
 }
 
@@ -440,13 +442,25 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
       }),
     };
   }) as InvoiceItemRow[];
+  // El saldo cobrable es NETO: `total` incluye el recargo EMITIDO
+  // (invoices.surcharge), que no es saldo, y cada porción ya trae su recargo
+  // en el bruto. `paid` sigue siendo el BRUTO cobrado (lo que entregó el
+  // cliente, y lo que lista el detalle de cobro); el saldo se calcula sobre
+  // el neto facturado, que es lo que exigen el cobro
+  // (billing.splitPayment / cash.registerPayment) y el tope de 031. Así lo
+  // que se muestra como Saldo es exactamente lo que el cobro va a aceptar.
+  const balance = invoiceNetBalance({
+    total: invoice.total,
+    surcharge: invoice.surcharge,
+    payments,
+  });
   return {
     invoice,
     items,
     taxes: (taxesRes.data ?? []) as InvoiceTaxRow[],
     payments: (paymentsRes.data ?? []) as InvoicePaymentRow[],
     paid,
-    remaining: round2(Math.max(0, Number(invoice.total) - paid)),
+    remaining: round2(Math.max(0, balance.netRemaining)),
   };
 }
 
@@ -496,6 +510,72 @@ async function loadCommissionRulesByEmployee(
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+// ------------------------------------------- dinero de factura (019/031) ---
+
+/**
+ * Saldo NETO de una factura: la única comparación de dinero correcta para
+ * cobrar y para decidir si la factura queda Pagada.
+ *
+ * `invoice_payments.amount` guarda el BRUTO (neto + recargo del método,
+ * 019_card_fee.sql) y `invoices.total = neto facturado + invoices.surcharge`
+ * — recargo EMITIDO, que no es saldo cobrable (031). Por eso:
+ *
+ *     netBilled    = total − surcharge
+ *     netCollected = Σ(amount − fee_amount)
+ *     netRemaining = netBilled − netCollected
+ *
+ * Comparar bruto contra `total` (saldo = `total − Σamount`) deja un saldo
+ * MENOR que el neto pendiente en cuanto hay un cobro con recargo posterior a
+ * la emisión: la porción final se cobra corta y la factura queda Pagada con
+ * neto sin cobrar. Es la misma cuenta que aplica
+ * `trg_invoice_payments_cap` (031) en la base. Puro: se prueba sin base de
+ * datos.
+ */
+export interface InvoiceNetBalance {
+  /** Neto facturado = total − surcharge. */
+  netBilled: number;
+  /** Neto cobrado = Σ(amount − fee_amount) de invoice_payments. */
+  netCollected: number;
+  /** Saldo neto pendiente; negativo solo si hubo un sobrecobro previo. */
+  netRemaining: number;
+}
+
+export function invoiceNetBalance(args: {
+  total: number | string;
+  surcharge?: number | string | null;
+  payments: Array<{ amount: number | string; fee_amount?: number | string | null }>;
+}): InvoiceNetBalance {
+  const netBilled = round2(Number(args.total) - Number(args.surcharge ?? 0));
+  const netCollected = round2(
+    args.payments.reduce(
+      (acc, row) => acc + (Number(row.amount) - Number(row.fee_amount ?? 0)),
+      0,
+    ),
+  );
+  return { netBilled, netCollected, netRemaining: round2(netBilled - netCollected) };
+}
+
+/**
+ * Recargo de una porción cuyo monto es el BRUTO que entregó el cliente (el
+ * caso de la caja: el operador cobra lo que el cliente paga). Inversa exacta
+ * de `computeCardFees` (billing/schemas.ts), que trabaja con el NETO:
+ *
+ *     neto = bruto / (1 + fee_percent/100)      fee = bruto − neto
+ *
+ * Se redondea primero el NETO y el recargo sale por diferencia, así
+ * `neto + fee == bruto` al centavo y `amount − fee_amount` es exactamente el
+ * neto cobrado que suman `invoiceNetBalance` y el tope de 031. Puro.
+ */
+export function splitGrossCardFee(
+  gross: number,
+  feePercent: number,
+): { net: number; fee: number } {
+  const percent = Math.max(0, Number(feePercent) || 0);
+  const rounded = round2(Number(gross));
+  const net = round2(rounded / (1 + percent / 100));
+  return { net, fee: round2(rounded - net) };
 }
 
 // ------------------------------------------------------------------ ayudas ---
@@ -1621,22 +1701,30 @@ export async function splitPayment(
     (code) => refs.methodByCode.get(code)?.feePercent ?? 0,
   );
   const netSum = round2(fees.reduce((acc, fee) => acc + fee.net, 0));
-  const grossSum = round2(fees.reduce((acc, fee) => acc + fee.gross, 0));
-  const remaining = round2(Number(detail.invoice.total) - detail.paid);
-  if (!moneyEquals(netSum, remaining)) {
+  // El saldo cobrable es NETO. `detail.paid` es el BRUTO cobrado, así que
+  // `total − detail.paid` quedaba corto en el recargo de los cobros
+  // posteriores a la emisión (o cuando un cobro con tarjeta de caja dejó su
+  // fila en `invoice_payments`): la porción final se cobraba incompleta y la
+  // factura quedaba Pagada con neto sin cobrar.
+  const balance = invoiceNetBalance({
+    total: detail.invoice.total,
+    surcharge: detail.invoice.surcharge,
+    payments: detail.payments,
+  });
+  if (!moneyEquals(netSum, balance.netRemaining)) {
     throw new BillingError(
-      netSum - remaining > 0 ? "OVERPAID" : "SUM_MISMATCH",
-      netSum - remaining > 0
+      netSum - balance.netRemaining > 0 ? "OVERPAID" : "SUM_MISMATCH",
+      netSum - balance.netRemaining > 0
         ? "Las porciones superan el saldo pendiente."
         : "Las porciones no cubren el saldo pendiente.",
       422,
     );
   }
-  const check = {
-    paid: round2(detail.paid + grossSum),
-    remaining: round2(Math.max(0, Number(detail.invoice.total) - (detail.paid + grossSum))),
-    fullyPaid: detail.paid + grossSum - Number(detail.invoice.total) > -MONEY_EPSILON,
-  };
+  // Cierra la factura el NETO cobrado, no el bruto: con el recargo de un
+  // cobro posterior a la emisión el bruto supera `total` y comparar bruto
+  // contra total era lo que marcaba Pagada sin neto completo.
+  const fullyPaid =
+    balance.netCollected + netSum - balance.netBilled > -MONEY_EPSILON;
 
   // El cobro pertenece al turno abierto AHORA (dueño del dinero en caja),
   // que puede ser otro turno/cajera que el de emisión.
@@ -1662,7 +1750,7 @@ export async function splitPayment(
     throw new BillingError("INTERNAL", "Error interno.", 500);
   }
 
-  if (check.fullyPaid && detail.invoice.status === "Emitida") {
+  if (fullyPaid && detail.invoice.status === "Emitida") {
     const { data: updated, error: updateError } = await db
       .from("invoices")
       .update({ status: "Pagada", closed_by: actor.userId, closed_at: new Date().toISOString() })
