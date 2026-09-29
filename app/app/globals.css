@@ -34,6 +34,33 @@
   --color-error: var(--color-error-600);
   --color-error-400: var(--color-error-400);
   --color-error-600: var(--color-error-600);
+
+  /* Claves canónicas de shadcn/ui. Son las que hacen que Tailwind emita las
+     utilidades que esperan los componentes del registry (bg-primary,
+     text-primary-foreground, bg-card, text-muted-foreground, border-border,
+     ...). Antes no existían y esos componentes quedaban sin color.
+
+     Cada clave apunta al alias homónimo de :root de más abajo (esa es la fuente
+     de valor), salvo las tres que el sistema resuelve en otros tokens: primary
+     sale de la rampa de marca, muted-foreground del rol de texto secundario y
+     destructive del token de error. --color-ring ya existía arriba y la familia
+     --radius-* no se toca (Tailwind deriva rounded-* de ella). */
+  --color-primary: var(--color-primary-600);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--color-text-secondary);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--color-error-600);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--color-border-color);
+  --color-input: var(--color-border-color);
 }
 
 :root {
@@ -47,11 +74,14 @@
      invierte sus valores en `.dark`, basta declararlos una vez y el resultado
      es coherente en ambos temas. Ninguno es un color literal.
 
-     `--primary` NO se conecta a `--color-primary` ni `--secondary` a
-     `--color-secondary`: esos dos tokens son valores HSL muertos
-     (`175 82%`, `260 70%`) que nada consume. El color de marca sale de la
-     rampa `--color-primary-*`; el fondo secundario/acento, de las superficies
-     neutras del proyecto. `--ring` ya existía en design-tokens.css con este
+     `--primary` no se apoya en el token suelto que antes existía como
+     `--color-primary: 175 82%` ni `--secondary` en `--color-secondary: 260 70%`:
+     ambos eran HSL muertos que nada consumía y se eliminaron. El color de marca
+     sale de la rampa `--color-primary-*`; el fondo secundario/acento, de las
+     superficies neutras del proyecto. `--color-primary` y `--color-secondary`
+     siguen existiendo, pero solo como claves de `@theme inline` (más arriba),
+     que es lo que hace que Tailwind emita `bg-primary`, `text-primary`,
+     `bg-secondary`, etc. `--ring` ya existía en design-tokens.css con este
      mismo significado, así que no se vuelve a declarar. */
   --card: var(--bg-surface);
   --card-foreground: var(--text-primary);

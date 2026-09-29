@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -354,6 +354,119 @@ function resolveAlias(name: string, layers: Array<Map<string, string>>): string 
   return null;
 }
 
+/**
+ * Claves canónicas de shadcn/ui declaradas en `@theme inline`. Sin estas claves
+ * Tailwind no emite bg-primary, bg-card, text-muted-foreground, border-border,
+ * etc., y los componentes del registry (components.json, baseColor slate)
+ * quedan sin color.
+ */
+const CANONICAL_COLOR_KEYS = [
+  "--color-primary",
+  "--color-primary-foreground",
+  "--color-secondary",
+  "--color-secondary-foreground",
+  "--color-card",
+  "--color-card-foreground",
+  "--color-popover",
+  "--color-popover-foreground",
+  "--color-muted",
+  "--color-muted-foreground",
+  "--color-accent",
+  "--color-accent-foreground",
+  "--color-destructive",
+  "--color-destructive-foreground",
+  "--color-border",
+  "--color-input",
+];
+
+/**
+ * Familias de utilidades que Tailwind deriva de cada clave `--color-*`: el
+ * nombre de clase es `<prefijo>-<clave sin el prefijo --color->`.
+ */
+const COLOR_UTILITY_PREFIXES = [
+  "bg",
+  "text",
+  "border",
+  "fill",
+  "stroke",
+  "outline",
+  "ring",
+  "divide",
+  "accent",
+  "caret",
+  "decoration",
+  "placeholder",
+];
+
+/**
+ * Clases de las reglas sueltas de un CSS: selector formado por UNA sola clase
+ * (`.x`, sin `.dark` delante). Son exactamente las que compiten con una utilidad
+ * de `@layer utilities` en igualdad de especificidad y ganan por ir sin capa.
+ * Las reglas compuestas (`.dark .x`) son overrides de tema a propósito y quedan
+ * fuera de esta lectura.
+ */
+function bareClassNames(css: string): string[] {
+  const clean = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  const names = new Set<string>();
+  for (const block of clean.matchAll(/([^{}]+)\{/g)) {
+    for (const part of block[1].split(",")) {
+      const single = /^\.([a-zA-Z0-9_-]+)$/.exec(part.trim());
+      if (single) {
+        names.add(single[1]);
+      }
+    }
+  }
+  return [...names].sort();
+}
+
+/** Extensiones donde un nombre de clase llega al DOM. */
+const CLASS_CONSUMER_EXTENSIONS = [".ts", ".tsx"];
+const CLASS_CONSUMER_SKIP_DIRS = new Set(["node_modules", ".next", ".git", "tests"]);
+
+/** Contenido de todos los .ts/.tsx de producción, indexado por ruta relativa. */
+function readClassConsumers(): Map<string, string> {
+  const files = new Map<string, string>();
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        if (!CLASS_CONSUMER_SKIP_DIRS.has(entry.name)) {
+          walk(join(dir, entry.name));
+        }
+        continue;
+      }
+      if (CLASS_CONSUMER_EXTENSIONS.some((ext) => entry.name.endsWith(ext))) {
+        const path = join(dir, entry.name);
+        files.set(path.slice(APP_ROOT.length + 1), readFileSync(path, "utf8"));
+      }
+    }
+  };
+  walk(APP_ROOT);
+  return files;
+}
+
+/**
+ * Sigue `var(--x)` y `theme(--x)` (la función de Tailwind v4) hasta el valor
+ * terminal. Ignora las entradas auto-referentes de `@theme inline`, que Tailwind
+ * resuelve inline y por eso no son la declaración real del token.
+ */
+function resolveConcrete(name: string, layers: Array<Map<string, string>>): string | null {
+  let current = name;
+  for (let hop = 0; hop < 8; hop += 1) {
+    const raw = layers
+      .map((layer) => layer.get(current))
+      .find((value) => value !== undefined && value.trim() !== `var(${current})`);
+    if (raw === undefined) {
+      return null;
+    }
+    const next = /^(?:var|theme)\(\s*(--[a-zA-Z0-9-]+)\s*\)$/.exec(raw.trim());
+    if (!next) {
+      return raw.trim();
+    }
+    current = next[1];
+  }
+  return null;
+}
+
 /** Los cuatro tintes claros de estado con su peldaño -100 de referencia. */
 function lightStatusTints() {
   return STATUS_PAIRS.map(({ label, ramp, bg }) => ({
@@ -557,17 +670,19 @@ describe("design tokens: guardas de contrato", () => {
     expect(literals).toEqual([]);
   });
 
-  it("los alias de marca no apuntan a los tokens HSL muertos y estos quedan intactos", () => {
+  it("los alias de marca no apuntan a los tokens HSL muertos y estos ya no existen", () => {
     expect(requireVar(globalsRoot, "--primary", "globals.css :root")).toBe(
       "var(--color-primary-600)",
     );
     expect(requireVar(globalsRoot, "--secondary", "globals.css :root")).not.toBe(
       "var(--color-secondary)",
     );
-    expect(requireVar(lightVars, "--color-primary", "design-tokens.css :root")).toBe("175 82%");
-    expect(requireVar(lightVars, "--color-secondary", "design-tokens.css :root")).toBe(
-      "260 70%",
-    );
+    // `--color-primary: 175 82%` y `--color-secondary: 260 70%` se eliminaron por
+    // muertos: cero consumidores, ni siquiera como valor arbitrario de Tailwind.
+    expect(lightVars.has("--color-primary"), "design-tokens.css :root").toBe(false);
+    expect(lightVars.has("--color-secondary"), "design-tokens.css :root").toBe(false);
+    expect(darkVars.has("--color-primary"), "design-tokens.css .dark").toBe(false);
+    expect(darkVars.has("--color-secondary"), "design-tokens.css .dark").toBe(false);
   });
 
   it("la familia --radius-* conserva sus valores y la base --radius solo la referencia", () => {
@@ -575,5 +690,124 @@ describe("design tokens: guardas de contrato", () => {
       expect(requireVar(lightVars, name, "design-tokens.css :root"), name).toBe(value);
     }
     expect(requireVar(globalsRoot, "--radius", "globals.css :root")).toBe("var(--radius-md)");
+    // Tailwind deriva `rounded-*` de la familia --radius-*: si @theme la
+    // re-declarara, cambiaría toda esquina de la app sin tocar una sola clase.
+    const redefined = [...themeInline.keys()].filter((name) => name.startsWith("--radius"));
+    expect(redefined).toEqual([]);
+  });
+
+  it("las cuatro clases muertas ya no se declaran y ningún .ts/.tsx de producción las usa", () => {
+    const deletedClasses = ["text-primary", "text-secondary", "text-tertiary", "bg-primary"];
+    const stillDeclared = bareClassNames(TOKENS_CSS).filter((name) =>
+      deletedClasses.includes(name),
+    );
+    expect(stillDeclared, "design-tokens.css").toEqual([]);
+
+    const consumers = readClassConsumers();
+    // Sin este piso, un walk roto (p. ej. cwd distinto) haría pasar la guarda sola.
+    expect(consumers.size, "archivos .ts/.tsx de producción leídos").toBeGreaterThan(50);
+    const usages: string[] = [];
+    for (const name of deletedClasses) {
+      const re = new RegExp(`(?<![a-z0-9-])${name}(?![a-z0-9-])`, "g");
+      for (const [path, content] of consumers) {
+        if (re.test(content)) {
+          usages.push(`${path}: ${name}`);
+        }
+      }
+    }
+    expect(usages).toEqual([]);
+  });
+
+  it("ninguna clase suelta de design-tokens.css pisa una utilidad de color que Tailwind genera", () => {
+    const generated = new Set(
+      [...themeInline.keys()]
+        .filter((name) => name.startsWith("--color-"))
+        .flatMap((name) =>
+          COLOR_UTILITY_PREFIXES.map(
+            (prefix) => `${prefix}-${name.slice("--color-".length)}`,
+          ),
+        ),
+    );
+    const shadowed = bareClassNames(TOKENS_CSS).filter((name) => generated.has(name));
+    expect(shadowed).toEqual([]);
+  });
+
+  it("las 16 claves canónicas están en @theme inline y resuelven a un valor concreto", () => {
+    const failures: string[] = [];
+    for (const key of CANONICAL_COLOR_KEYS) {
+      const raw = themeInline.get(key);
+      if (raw === undefined) {
+        failures.push(`${key}: no está en globals.css @theme inline`);
+        continue;
+      }
+      if (!/^var\(\s*--[a-zA-Z0-9-]+\s*\)$/.test(raw)) {
+        failures.push(`${key}: ${raw} no es una referencia var(--token)`);
+        continue;
+      }
+      const resolved = resolveConcrete(key, ALIAS_LAYERS);
+      if (resolved === null || parseOklch(resolved) === null) {
+        failures.push(`${key}: ${raw} -> ${resolved ?? "sin resolver"}`);
+      }
+    }
+    expect(failures).toEqual([]);
+  });
+
+  it("--color-primary sale de la rampa de marca (nunca del token HSL muerto)", () => {
+    expect(themeInline.get("--color-primary")).toBe("var(--color-primary-600)");
+    const resolved = resolveConcrete("--color-primary", ALIAS_LAYERS);
+    expect(resolved).not.toBeNull();
+    expect(parseOklch(resolved as string), `resuelto a: ${resolved}`).not.toBeNull();
+    expect(resolved).toBe(requireVar(lightVars, "--color-primary-600", ":root"));
+    // El token muerto era HSL crudo (`175 82%`), que Tailwind no puede usar.
+    expect(resolved as string).not.toMatch(/^\d+(\.\d+)?\s+\d+(\.\d+)?%$/);
+    expect(globalsRoot.has("--color-primary"), "globals.css :root").toBe(false);
+  });
+
+  it("las claves canónicas que apuntan a un alias de :root lo hacen de verdad", () => {
+    const expected: Array<[string, string]> = [
+      ["--color-card", "var(--card)"],
+      ["--color-card-foreground", "var(--card-foreground)"],
+      ["--color-popover", "var(--popover)"],
+      ["--color-popover-foreground", "var(--popover-foreground)"],
+      ["--color-primary-foreground", "var(--primary-foreground)"],
+      ["--color-secondary", "var(--secondary)"],
+      ["--color-secondary-foreground", "var(--secondary-foreground)"],
+      ["--color-muted", "var(--muted)"],
+      ["--color-accent", "var(--accent)"],
+      ["--color-accent-foreground", "var(--accent-foreground)"],
+      ["--color-destructive", "var(--color-error-600)"],
+      ["--color-destructive-foreground", "var(--destructive-foreground)"],
+      ["--color-border", "var(--color-border-color)"],
+      ["--color-input", "var(--color-border-color)"],
+      ["--color-muted-foreground", "var(--color-text-secondary)"],
+    ];
+    const wrong = expected
+      .map(([key, value]) => [key, value, themeInline.get(key)] as const)
+      .filter(([, value, raw]) => raw !== value)
+      .map(([key, value, raw]) => `${key}: se esperaba ${value}, hay ${raw}`);
+    expect(wrong).toEqual([]);
+  });
+
+  it("el secundario canónico es una superficie y no el token HSL muerto", () => {
+    const resolved = resolveConcrete("--color-secondary", ALIAS_LAYERS);
+    expect(resolved).not.toBeNull();
+    expect(parseOklch(resolved as string), `resuelto a: ${resolved}`).not.toBeNull();
+    // Debe aterrizar en la misma superficie que `--secondary` (--bg-surface-hover),
+    // no en el HSL muerto ni en la superficie base.
+    expect(resolved).toBe(resolveConcrete("--bg-surface-hover", ALIAS_LAYERS));
+    expect(resolved).not.toBe(resolveConcrete("--bg-surface", ALIAS_LAYERS));
+    expect(themeInline.get("--color-secondary")).toBe("var(--secondary)");
+    expect(themeInline.get("--color-muted-foreground")).toBe("var(--color-text-secondary)");
+    expect(themeInline.get("--color-destructive")).toBe("var(--color-error-600)");
+  });
+
+  it("los .shadow-* locales siguen intactos: su valor difiere del que genera Tailwind", () => {
+    const declared = bareClassNames(TOKENS_CSS);
+    for (const name of ["shadow-sm", "shadow-md", "shadow-lg", "shadow-xl"]) {
+      expect(declared, `${name} debe seguir declarada`).toContain(name);
+    }
+    // No se toca lo que no se puede probar igual: `.shadow-sm` local = 1px/2px
+    // con el token del proyecto; el de Tailwind (v4) = 1px/3px con su default.
+    expect(readDeclaration(TOKENS_CSS, ".shadow-sm", "box-shadow")).toBe("var(--shadow-sm)");
   });
 });

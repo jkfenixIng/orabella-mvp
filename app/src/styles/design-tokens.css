@@ -29,8 +29,7 @@
    Colors - Light Mode
    -------------------------------------------------------------------------- */
 :root {
-  /* Primary - Blue */
-  --color-primary: 175 82%;
+  /* Primary - Blue (sin token suelto: el color de marca es la rampa) */
   /* Peldaño -50: es el fondo de las clases `.bg-*-light` (chips de estado y
      avisos). Antes tenía chroma 0, así que los cuatro fondos "light" del tema
      claro salían gris casi blanco y solo el texto llevaba color. Cada -50
@@ -50,8 +49,7 @@
   --color-primary-800: oklch(0.31 0.078 250);
   --color-primary-900: oklch(0.25 0.063 250);
 
-  /* Secondary - Purple/Amber */
-  --color-secondary: 260 70%;
+  /* Secondary - Purple/Amber (sin token suelto: el secundario es una superficie) */
   --color-secondary-50: oklch(0.97 0 0);
   --color-secondary-100: oklch(0.93 0.02 280);
   --color-secondary-200: oklch(0.87 0.05 280);
@@ -290,14 +288,11 @@ button {
    Utility Classes for Design Tokens
    -------------------------------------------------------------------------- */
 
-/* Color text utilities */
-.text-primary { color: var(--text-primary); }
-.text-secondary { color: var(--text-secondary); }
-.text-tertiary { color: var(--text-tertiary); }
-
-/* Background utilities */
-.bg-primary { background-color: var(--bg-primary); }
-.bg-surface { background-color: var(--bg-surface); }
+/* Las utilidades .text-primary, .text-secondary, .text-tertiary y .bg-primary
+   se eliminaron (cero consumidores) y .bg-surface también, porque Tailwind ya
+   la genera igual desde --color-surface. Estaban fuera de todo @layer, así que
+   ganaban en la cascada contra la utilidad homónima de @layer utilities y la
+   dejaban inservible: por eso hay que borrar la declaración, no reordenarla. */
 
 /* Border utilities */
 .border-color { border: 1px solid var(--border-color); }
@@ -325,9 +320,10 @@ button {
 /* --------------------------------------------------------------------------
    Status Colors (Semantic)
    -------------------------------------------------------------------------- */
-.text-success { color: var(--color-success-600); }
-.text-warning { color: var(--color-warning-600); }
-.text-error { color: var(--color-error-600); }
+/* .text-success/.text-warning/.text-error ya no se declaran acá: Tailwind genera
+   esas utilidades con exactamente el mismo color (var(--color-*-600)) desde las
+   claves --color-* de @theme inline. El override de .dark sí sigue acá, porque
+   Tailwind no expresa "otro token según el tema" sin duplicar la utilidad. */
 .text-primary-color { color: var(--color-primary-600); }
 
 .bg-success-light { background-color: var(--color-success-50); }
