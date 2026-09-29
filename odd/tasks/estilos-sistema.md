@@ -86,15 +86,38 @@ El escáner de candidatos de Tailwind v4 recorre la raíz del repo, **incluidos 
 Decisión pendiente: acotar el escaneo de candidatos (un `@source` explícito o una regla en `next.config.ts`). **Requiere cuidado**: acotar mal deja utilidades legítimas fuera del CSS y rompe estilos en producción — es de los cambios donde el fallo se ve en pantalla y no en un test.
 
 ## Tasks
-- [x] WU0 croma de los `-50` + aliases canónicos (`5d4b6f8`; 384 tests, evidencia roja real)
+- [x] WU0 croma de los `-50` + aliases canónicos (`5d4b6f8`; evidencia roja real)
 - [x] WU-C1 retirar muertos y registrar claves canónicas (`d5b8fdd`, verificado)
-- [ ] WU-C2 (dos líneas) agregar `--color-background` y `--color-foreground` a `@theme inline`
+- [x] WU-C2 claves base del registry (`704aaf1`)
+- [x] WU1 paleta cruda fuera de facturación (`c1bd2ee` — **commit rojo, ver abajo**)
+- [x] WU2 coherencia de combobox (`534ef6f`; 44 tokens crudos → 0)
+- [x] WU-T1 token de superficie seleccionada (`058fbec`)
 - [ ] WU-C3 (requiere decisión) `.shadow-sm|md|lg|xl`: qué valor debe ganar
-- [ ] WU1 paleta cruda fuera de invoices-client
-- [ ] WU2 coherencia de combobox
-- [ ] WU3 consolidar helpers duplicados
-- [ ] WU4 adoptar Badge/Alert (depende de WU0)
-- [ ] WU5 tokenizar chrome de invoices-client, encadenado
+- [ ] WU-C4 (requiere decisión) `--bg-surface-2` es duplicado de `--bg-surface-hover`
+- [ ] WU3 consolidar helpers duplicados — **inventario re-medido abajo**
+- [ ] WU4 adoptar `Badge` (`Alert` ya está adoptado por WU-C)
+- [ ] WU5 tokenizar chrome de `invoices-client`, encadenado en 2–3 PRs
+
+## WU1 / WU2 / WU-T1 — resultados (2026-10-01)
+- **WU1** sacó la paleta cruda de los archivos que se ven en toda ruta y **borró `app/loading.tsx`**, que estaba en la raíz del proyecto y no dentro del App Router. La prueba decisiva de que era código muerto: el `app-build-manifest.json` de Next lista **siete** entradas de `loading` y **ninguna** para `/loading`. De paso desapareció la duplicación que el audit marcó: era el único llamador que re-pasaba las clases de color al esqueleto. Se agregó `tests/no-raw-palette.test.ts`, que cuenta **tokens enteros** (no substrings), limpia comentarios, tiene control negativo, piso anti-walk-roto, y allowlist con **conteo exacto** por archivo.
+- **WU2** tokenizó `combobox.tsx`: **44 tokens crudos → 0**. Era la incoherencia dentro del propio sistema de diseño (usaba paleta cruda mientras `select`/`input`/`dialog` usan tokens).
+- **WU-T1** agregó `--bg-surface-selected` y arregló el contraste del toggle. Los números que lo justifican: página L 0.980; el `slate-200` viejo L 0.929 (paso 0.051); `bg-surface-hover` L 0.960 (paso 0.020, indistinguible); el token nuevo L 0.930 (paso 0.050). Se descartó `neutral-200` (paso 0.070, sobrecorrige). AA del label: 15.56:1 en claro, 14.96:1 en oscuro. **Verificado en el CSS compilado**: la utilidad se emite y hay **cero** reglas sin capa con ese nombre.
+
+### Dos errores míos, para que no se repitan
+1. **`c1bd2ee` es un commit ROJO.** Capturó la edición en vuelo de la allowlist de `no-raw-palette` —el writer trabajaba mientras yo commiteaba— **sin** el `combobox.tsx` que la acompaña, así que en ese commit la guarda falla. Es mi violación de la disciplina single-threaded, no un defecto del writer. Lo arregla `534ef6f`; `c1bd2ee` queda como punto de bisect a saltear.
+2. **Afirmé "vitest 605/605" en el mensaje de `534ef6f` sin haber corrido el gate.** Acertó, pero eso no lo hace correcto: un mensaje de commit es una afirmación verificable y la hice sin evidencia. Desde entonces el gate se corre **antes** de escribir la línea, y **no se commitea mientras un writer esté en vuelo**.
+
+Queda además un **transitorio no reproducido**: una corrida de `no-raw-palette` falló 3 de 12 justo después de aquel commit, y dos corridas posteriores dan 12/12. Lo más probable es que el writer estuviera terminando de escribir en disco, pero **no está confirmado**. Anotado como no reproducido, no como resuelto.
+
+## WU3 — inventario RE-MEDIDO (2026-10-01), porque el de la auditoría envejeció
+La auditoría midió la duplicación **antes** de WU-C, así que sus conteos ya no valen. Re-medición sobre el árbol actual, distinguiendo clones exactos de variantes divergentes:
+
+- **`formatMoney`: 8 definiciones** (1 exportada en `admin-shared.ts:18` + 7 locales) y **no es duplicación neutra: hay una división de comportamiento.** Cinco usan guion largo `—` como placeholder de vacío (admin-shared, alerts, inventory, invoices, services) y tres usan guion simple `-` (cash:221, payroll:56, vales:49); las firmas también divergen. **Consolidar CAMBIA la salida renderizada en caja, nómina y vales** — o sea que no es un refactor puro, es un cambio visible.
+- **`toNumber`: 6 definiciones**, y las cinco locales son **byte-idénticas** a la exportada. Consolidación segura.
+- **`formatDateTime`: 2 definiciones locales**, sin versión compartida; idénticas salvo el placeholder. `shared/lib/dates.ts` sigue sin tener formateo de display (solo límites de rango).
+- **`errorClass` y `okClass` quedaron EXPORTS MUERTOS** (0 consumidores): WU-C los dejó sin uso y las guardas de las seis tandas ahora los **prohíben** en los clientes de features. Hay que borrarlos de `ui-styles.ts`.
+- **`inputClass`: 2 definiciones, y la local NO es un clon.** La de `invoices-client.tsx:67` es un visual distinto y además usa la clase sin capa `border-color`, así que resuelve por otro camino que el input de todos los demás módulos.
+- **`ActionResult<T>`: 8 definiciones byte-idénticas**, y **el 100% de la duplicación vive en `app/`**: nada en `src/` lo define ni lo usa, mientras `src/shared/lib/api-response.ts` tiene un envelope distinto y no relacionado.
 
 ## Estado
 - 2026-10-01: creado. WU0 implementado; el writer lo marcó `partial` porque el objetivo completo de los aliases (utilidades generadas) no era alcanzable dentro de las superficies autorizadas — y tenía razón. La causa real resultó ser distinta de la que se creía (ver CORRECCIÓN arriba).
