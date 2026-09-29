@@ -2469,9 +2469,25 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         </Select>
                                       </label>
                                       {!feeOk && (
-                                        <p className="text-xs font-medium text-red-700">
+                                        // ESTADO que bloquea, derivado EN VIVO:
+                                        // `feeOk` se calcula del método elegido
+                                        // mientras el usuario edita el cobro, no
+                                        // es el desenlace de una acción enviada.
+                                        //
+                                        // `role="status"` explícito (polite):
+                                        // `destructive` derivaría `alert`
+                                        // (asertivo), y una región asertiva que
+                                        // interrumpe a quien está eligiendo es el
+                                        // antipatrón de sobreanuncio. Es el mismo
+                                        // tratamiento que los avisos derivados en
+                                        // vivo del turno de esta vista y que los de
+                                        // nómina e inventario: una clase de
+                                        // mensaje, una sola ARIA. El `text-xs` se
+                                        // conserva porque el aviso va pegado al
+                                        // campo, no como bloque de página.
+                                        <Alert variant="destructive" role="status" className="text-xs">
                                           Cambia el recargo: el total no cuadraría.
-                                        </p>
+                                        </Alert>
                                       )}
                                     </div>
                                   );

@@ -7,8 +7,8 @@ import { describe, expect, it } from "vitest";
 
    Es el MISMO criterio que ya verificaron `services` (WU-B), `alertas`, `vales`
    y `nómina` (lote 2), `inventario` (lote 3) y el panel admin (lote 4), aplicado
-   a los últimos dos módulos con roles ad-hoc: `app/invoices/` (la vista con más
-   portadores de rol escritos a mano de la app: diez) y `app/login/`.
+   a los dos módulos de este lote: `app/invoices/` (la vista con más portadores
+   de rol escritos a mano de la app: diez) y `app/login/`.
 
    - ESTADO  -> lo que ES el caso hasta que algo cambie ("El usuario no tiene
                 sede asignada.", "Agregue al menos un ítem a la factura."):
@@ -46,6 +46,14 @@ import { describe, expect, it } from "vitest";
    conserva el anuncio asertivo que el `role="alert"` escribía a mano. Si algún
    día aparece una validación por tecleo, esta guarda la obliga a venir con
    `role="status"`.
+
+   CARRY-OVER DEL LOTE 6: este lote declaró como superficie los portadores de rol
+   y dejó afuera, por eso mismo, un aviso SIN rol que sí es un mensaje del
+   criterio: el recargo del cobro en edición (`!feeOk`). Es ESTADO DERIVADO EN
+   VIVO —se calcula del método elegido mientras el usuario edita, y bloquea el
+   guardado— así que el lote 6 lo convierte en `Alert variant="destructive"
+   role="status"` (polite) conservando el `text-xs` y la copia. Se pinea al final
+   de este archivo, junto al resto de la superficie que lo contiene.
 
    ARIA ESTRUCTURAL: quedan dos `role="group"` con su `aria-label` (el
    conmutador de modo de comisión del ítem y la rejilla de tipo de ítem). No son
@@ -301,12 +309,14 @@ describe("facturación y login: no queda ningún portador de mensaje ad-hoc", ()
     expect(INVOICES_CLIENT_CODE).not.toMatch(/role=\{/);
   });
 
-  it("los cinco roles que quedan en el cliente están justificados: dos `group` y tres overrides", () => {
-    // La guarda es enumerativa a propósito: un sexto rol, o un tercer `group`
+  it("los seis roles que quedan en el cliente están justificados: dos `group` y cuatro overrides", () => {
+    // La guarda es enumerativa a propósito: un séptimo rol, o un tercer `group`
     // sin `aria-label`, no tiene excusa y rompe el conteo.
-    expect(adHocRoles(INVOICES_CLIENT_CODE), "roles escritos a mano").toHaveLength(5);
-    // Tres son el override DELIBERADO del estado derivado en vivo.
-    expect(alertsWithExplicitStatusRole(INVOICES_CLIENT_CODE)).toBe(3);
+    expect(adHocRoles(INVOICES_CLIENT_CODE), "roles escritos a mano").toHaveLength(6);
+    // Cuatro son el override DELIBERADO del estado derivado en vivo: los tres
+    // del bloqueo de caja y el recargo del cobro en edición (carry-over del
+    // lote 6).
+    expect(alertsWithExplicitStatusRole(INVOICES_CLIENT_CODE)).toBe(4);
     // Los otros dos son ARIA ESTRUCTURAL de una agrupación de botones.
     expect([...INVOICES_CLIENT_CODE.matchAll(/role="group"/g)]).toHaveLength(2);
     expect(INVOICES_CLIENT_CODE).toMatch(/role="group"\s+aria-label=\{props\.ariaLabel\}/);
@@ -409,15 +419,16 @@ describe("facturación: lo efímero va por el toast (evento)", () => {
    Las tres superficies: lo persistente va por Alert (estado)
    ========================================================================== */
 describe("facturación y login: lo persistente va por Alert (estado)", () => {
-  it("el cliente tiene diez Alert, todos de aviso o de error", () => {
-    // Seis destructivos (el error compartido arriba del listado y dentro de cada
-    // formulario, más la validación de edición, la del ítem y la del pago de
-    // comisión) y cuatro de aviso (las dos caras del bloqueo de caja, en el
-    // formulario de emisión, el encabezado y el detalle). Si apareciera un
-    // Alert de más, o alguien cambiara una variante, el conteo lo delata.
+  it("el cliente tiene once Alert, todos de aviso o de error", () => {
+    // Siete destructivos (el error compartido arriba del listado y dentro de cada
+    // formulario, más la validación de edición, la del ítem, la del pago de
+    // comisión y el recargo del cobro en edición del carry-over del lote 6) y
+    // cuatro de aviso (las dos caras del bloqueo de caja, en el formulario de
+    // emisión, el encabezado y el detalle). Si apareciera un Alert de más, o
+    // alguien cambiara una variante, el conteo lo delata.
     expect(INVOICES_CLIENT_CODE).toMatch(ALERT_IMPORT);
-    expect(alertOpenerCount(INVOICES_CLIENT_CODE)).toBe(10);
-    expect(alertsWithVariant(INVOICES_CLIENT_CODE, "destructive")).toBe(6);
+    expect(alertOpenerCount(INVOICES_CLIENT_CODE)).toBe(11);
+    expect(alertsWithVariant(INVOICES_CLIENT_CODE, "destructive")).toBe(7);
     expect(alertsWithVariant(INVOICES_CLIENT_CODE, "warning")).toBe(4);
     // Ni `info` ni `success` como `Alert`: nada se confirma por estado (eso es
     // evento y va por toast) y no hay datos de color neutro que anunciar.
@@ -479,12 +490,13 @@ describe("facturación y login: lo persistente va por Alert (estado)", () => {
     for (const sitio of sitios) {
       expect(INVOICES_CLIENT_CODE, String(sitio)).toMatch(sitio);
     }
-    // CONTROL NEGATIVO: el override no se aplicó en bloque. Los seis fallos
-    // destructivos quedan sin rol explícito —o sea asertivos—, y si alguien
-    // pasara `role="status"` a todos los destructivos, el conteo pasaría de 0 a
-    // 6 y fallaría.
-    expect([...INVOICES_CLIENT_CODE.matchAll(/<Alert variant="destructive" role="status"/g)]).toHaveLength(0);
-    expect(alertsWithExplicitStatusRole(INVOICES_CLIENT_CODE)).toBe(3);
+    // CONTROL NEGATIVO: el override no se aplicó en bloque. De los siete fallos
+    // destructivos, seis quedan sin rol explícito —o sea asertivos— y solo el
+    // aviso derivado en vivo del recargo (carry-over del lote 6) lleva el
+    // polite: si alguien pasara `role="status"` a todos, el conteo pasaría de 1
+    // a 7 y fallaría.
+    expect([...INVOICES_CLIENT_CODE.matchAll(/<Alert variant="destructive" role="status"/g)]).toHaveLength(1);
+    expect(alertsWithExplicitStatusRole(INVOICES_CLIENT_CODE)).toBe(4);
   });
 
   it("el clic que la guarda frena es un estado confirmado y sigue asertivo", () => {
@@ -618,5 +630,39 @@ describe("facturación y login: el texto visible no cambió", () => {
       "text-text-secondary",
     );
     expect(LOGIN_FORM_CODE).toContain("Clave actualizada");
+  });
+});
+
+/* ==========================================================================
+   Carry-over del lote 6: el recargo del cobro en edición (derivado en vivo)
+   ========================================================================== */
+describe("facturación: el recargo del cobro en edición es estado derivado en vivo", () => {
+  it("el aviso sin rol pasó a ser `Alert` destructivo con override polite", () => {
+    // `feeOk` se calcula del método elegido mientras el usuario edita el cobro
+    // (`feePct === payment.fee_percent`), no es el desenlace de una acción
+    // enviada, y bloquea el guardado. Es el MISMO caso que los tres avisos del
+    // turno de arriba: `role="status"` explícito (polite) para no interrumpir a
+    // quien está eligiendo.
+    expect(INVOICES_CLIENT_CODE).toMatch(/const feeOk = feePct === Number\(payment\.fee_percent \?\? 0\);/);
+    expect(INVOICES_CLIENT_CODE).toMatch(
+      /<Alert variant="destructive" role="status" className="text-xs">\s*Cambia el recargo: el total no cuadraría\.\s*<\/Alert>/,
+    );
+    // La copia es la misma y el `text-xs` se conservó: el aviso va pegado al
+    // campo, no como bloque de página.
+    expect(INVOICES_CLIENT_CODE).toContain("Cambia el recargo: el total no cuadraría.");
+    // El `<p>` crudo con la clase de rojo suelta ya no existe.
+    expect(INVOICES_CLIENT_CODE).not.toContain("text-xs font-medium text-red-700");
+  });
+
+  it("control negativo: no se aplicó en bloque ni se perdió el aviso", () => {
+    // Si el aviso desapareciera, el bloqueo del recargo quedaría mudo.
+    expect(INVOICES_CLIENT_CODE).toMatch(/\{!feeOk && \(/);
+    // Y no se reescribió la copia.
+    expect(INVOICES_CLIENT_CODE).not.toContain("Cambia el recargo: el total cuadraría.");
+    expect(INVOICES_CLIENT_CODE).not.toContain("El recargo no coincide.");
+    // Ni se le pasó el override polite a los fallos confirmados: solo hay UN
+    // destructivo con `role="status"` en todo el cliente, y es este.
+    expect([...INVOICES_CLIENT_CODE.matchAll(/<Alert variant="destructive" role="status"/g)]).toHaveLength(1);
+    expect(alertsWithVariant(INVOICES_CLIENT_CODE, "destructive")).toBe(7);
   });
 });
