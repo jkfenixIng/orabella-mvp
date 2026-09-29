@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { formatMoney } from "@/src/shared/lib/money";
 
 /** FAC-01: un solo origen por línea (producto O servicio O custom). */
 export const invoiceItemTypeSchema = z.enum(["producto", "servicio", "custom"]);
@@ -280,13 +281,87 @@ export type EditInvoiceInput = z.infer<typeof editInvoiceSchema>;
  * diferencia de la edición admin de Pagadas, donde es inmutable). Los cobros
  * parciales que ya existan se conservan (mismos ids, el método solo puede
  * cambiar entre iguales recargos para no mover el recargo emitido).
+ *
+ * `confirmar_bajo_cobrado`: confirmación explícita del único caso en que el
+ * recálculo baja el total por DEBAJO de lo ya cobrado (ver `overCollectedEdit`).
+ * Es opcional y arranca en FALSO: el payload histórico sigue siendo válido y el
+ * gate que decide es el del servidor; sin la bandera ese ajuste se rechaza.
  */
 export const editEmittedInvoiceSchema = z.object({
   motivo: z.string().trim().max(500, "Motivo muy largo.").nullish(),
   items: z.array(editInvoiceItemSchema).min(1, "La factura exige al menos un ítem."),
   payments: z.array(editInvoicePaymentSchema).default([]),
+  confirmar_bajo_cobrado: z.boolean().optional().default(false),
 });
 export type EditEmittedInvoiceInput = z.infer<typeof editEmittedInvoiceSchema>;
+
+/**
+ * Cifras del ajuste que deja la factura SOBRE-COBRADA: lo ya cobrado supera el
+ * nuevo neto facturado.
+ */
+export interface OverCollectedEdit {
+  /** Neto cobrado = Σ(amount − fee_amount): lo pagado sin el recargo del método. */
+  cobrado: number;
+  /** Neto que quedaría facturado: el nuevo total menos el recargo EMITIDO. */
+  total: number;
+  /** Exceso = cobrado − total, siempre positivo. */
+  diferencia: number;
+}
+
+/**
+ * ¿El recálculo de una factura EMITIDA la deja SOBRE-COBRADA?
+ *
+ * Decisión del dueño (WU2): bajar el total por debajo de lo ya cobrado SE
+ * PERMITE —el ajuste tiene que seguir siendo posible— pero NUNCA en silencio:
+ * el operador lo confirma con `confirmar_bajo_cobrado`. Esta función solo decide
+ * y describe; el rechazo con código propio y el mensaje viven en el servicio.
+ *
+ * BASE DE LA COMPARACIÓN — neto contra neto. Los dos números que entran son los
+ * de `invoiceNetBalance` (billing/service, casa única de qué se factura, qué se
+ * cobra y qué falta):
+ *
+ *     netBilled    = roundMoney(total − surcharge)   ← el nuevo total
+ *     netCollected = Σ(amount − fee_amount)          ← lo ya cobrado
+ *
+ * `invoice_payments.amount` es BRUTO (neto + recargo del método, 019) y
+ * `invoices.total` es NETO facturado + el recargo EMITIDO (031). Comparar el
+ * bruto cobrado contra el `total` nuevo marcaría un sobre-cobro FALSO en cuanto
+ * un cobro trae recargo: por eso el recargo se descuenta de los dos lados.
+ *
+ * EXACTITUD: sin tolerancia nueva. `netBilled` es entero (peso entero,
+ * `roundMoney`) y `netCollected` lo es con la regla vigente, así que
+ * `diferencia >= MONEY_EPSILON` es el complemento exacto de `moneyEquals` (que
+ * rechaza justo las diferencias menores a `MONEY_EPSILON`): un peso de exceso ya
+ * cuenta, la igualdad no. Sin cobros, `diferencia <= 0` y no hay nada que
+ * confirmar. Pura: se prueba sin base de datos.
+ */
+export function overCollectedEdit(balance: {
+  netBilled: number;
+  netCollected: number;
+}): OverCollectedEdit | null {
+  const diferencia = balance.netCollected - balance.netBilled;
+  if (diferencia < MONEY_EPSILON) return null;
+  return { cobrado: balance.netCollected, total: balance.netBilled, diferencia };
+}
+
+/**
+ * Aviso de confirmación: lleva las TRES cifras que el humano necesita para
+ * decidir (cobrado, nuevo total y exceso), no un "no se puede". Es el texto del
+ * error del gate y el que la pantalla de edición muestra antes de reenviar el
+ * ajuste confirmado. Pura.
+ */
+export function overCollectedEditMessage(
+  args: OverCollectedEdit & { consecutive_number?: number | null },
+): string {
+  const factura =
+    args.consecutive_number != null ? ` de la factura #${args.consecutive_number}` : "";
+  return (
+    `Bajar el total${factura} dejaría la factura sobre-cobrada por ${formatMoney(args.diferencia)}: ` +
+    `el neto cobrado es ${formatMoney(args.cobrado)} (sin recargos de método) y el nuevo ` +
+    `total neto sería ${formatMoney(args.total)}. El saldo quedaría en ${formatMoney(0)} y ` +
+    `no se podrían registrar más cobros. Confirme el ajuste para continuar.`
+  );
+}
 
 export interface OldInvoiceItem {
   id: string;

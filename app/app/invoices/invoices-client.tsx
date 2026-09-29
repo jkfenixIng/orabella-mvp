@@ -305,7 +305,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
   ]);
   const [motivo, setMotivo] = useState("");
   // Modal clásico de confirmación ("¿Está seguro? ...", OK/Cancelar).
-  const [confirmKind, setConfirmKind] = useState<"emit" | "pay" | "annul" | null>(null);
+  const [confirmKind, setConfirmKind] = useState<"emit" | "pay" | "annul" | "bajo_cobrado" | null>(null);
+  // WU2: aviso del servidor cuando el ajuste de una emitida dejaría la factura
+  // sobre-cobrada. Trae las cifras (neto cobrado, nuevo total y exceso) que el
+  // operador tiene que ver antes de confirmar; la confirmación reenvía el mismo
+  // ajuste con `confirmar_bajo_cobrado`.
+  const [bajoCobradoNotice, setBajoCobradoNotice] = useState<string | null>(null);
   const [splitDraft, setSplitDraft] = useState<PortionDraft>({ method_code: "efectivo", amount: "" });
   // Pago inmediato de comisión(es) al dejar la factura Pagada.
   const [commissionOpen, setCommissionOpen] = useState(false);
@@ -587,7 +592,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
     }
   }
 
-  async function submitEdit() {
+  /**
+   * WU2: el ajuste de una emitida se envía SIN confirmación; si el servidor lo
+   * rechaza por sobre-cobro (`OVERCOLLECTED`) se muestra el aviso con las cifras
+   * y la confirmación clásica reenvía el MISMO ajuste ya confirmado.
+   */
+  async function submitEdit(confirmarBajoCobrado = false) {
     if (!detail) return;
     setEditError(null);
     const parsedItems = [];
@@ -660,6 +670,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
               id: payment.id,
               method_code: payment.method_code,
             })),
+            confirmar_bajo_cobrado: confirmarBajoCobrado,
           })
         : await editInvoiceAction(detail.invoice.id, {
             motivo: editMotivo,
@@ -667,9 +678,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
             payments: editPayments,
           });
       if (!result.success) {
+        // El sobre-cobro no es un error del ajuste: es una confirmación
+        // pendiente. El mensaje del servidor ya trae cobrado, nuevo total y
+        // exceso, así que se muestra tal cual en el modal clásico.
+        if (free && !confirmarBajoCobrado && result.code === "OVERCOLLECTED") {
+          setBajoCobradoNotice(result.message);
+          setConfirmKind("bajo_cobrado");
+          return;
+        }
         setEditError(`[${result.code}] ${result.message}`);
         return;
       }
+      setBajoCobradoNotice(null);
       setDetail(result.data);
       setIsEditDialogOpen(false);
       // EVENTO: la edición acaba de guardarse, así que va por el canal efímero
@@ -684,6 +704,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
     } finally {
       setBusy(false);
     }
+  }
+
+  /** WU2: confirma el ajuste que baja el total por debajo de lo ya cobrado. */
+  async function confirmBajoCobrado() {
+    setConfirmKind(null);
+    await submitEdit(true);
   }
 
   async function submitInvoice(event: FormEvent) {
@@ -2524,9 +2550,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             >
                               Cancelar
                             </button>
+                            {/* Sin argumentos a propósito: `submitEdit` recibe la
+                                confirmación de sobre-cobro como primer parámetro, y el
+                                evento del clic la activaría sin preguntar. */}
                             <button
                               type="button"
-                              onClick={submitEdit}
+                              onClick={() => void submitEdit()}
                               disabled={!canSaveEdit}
                               title={
                                 !canSaveEdit
@@ -3014,16 +3043,26 @@ export function InvoicesClient(props: InvoicesClientProps) {
           <div className="rounded-xl bg-white text-slate-900 shadow-2xl">
             <div className="px-6 pt-5">
               <h2 className="text-lg font-bold">
-                {confirmKind === "annul"
-                  ? "Anular factura"
-                  : confirmKind === "pay"
-                    ? "Pagar factura"
-                    : hasImmediatePayment
-                      ? "Emitir y pagar"
-                      : "Emitir factura"}
+                {confirmKind === "bajo_cobrado"
+                  ? "Total por debajo de lo cobrado"
+                  : confirmKind === "annul"
+                    ? "Anular factura"
+                    : confirmKind === "pay"
+                      ? "Pagar factura"
+                      : hasImmediatePayment
+                        ? "Emitir y pagar"
+                        : "Emitir factura"}
               </h2>
               <p className="mt-2 text-sm text-slate-600">
-                {confirmKind === "annul"
+                {confirmKind === "bajo_cobrado" ? (
+                  <>
+                    {bajoCobradoNotice ?? "El nuevo total dejaría la factura sobre-cobrada."}
+                    <span className="mt-2 block font-medium text-warning">
+                      Si confirma, el ajuste se guarda así: la factura queda sobre-cobrada y no
+                      admitirá más cobros.
+                    </span>
+                  </>
+                ) : confirmKind === "annul"
                   ? `¿Está seguro de anular la factura${detail ? ` #${detail.invoice.consecutive_number}` : ""}? Se revertirá el stock y no se puede deshacer.`
                   : confirmKind === "pay"
                     ? `¿Está seguro de registrar el pago de ${formatMoney(toNumber(splitDraft.amount) ?? 0)} (${splitDraft.method_code})${detail ? ` en la factura #${detail.invoice.consecutive_number}` : ""}? Después no se podrá modificar.`
@@ -3047,17 +3086,20 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 onClick={() => {
                   if (confirmKind === "annul") void confirmAnnul();
                   else if (confirmKind === "pay") void confirmPay();
+                  else if (confirmKind === "bajo_cobrado") void confirmBajoCobrado();
                   else void confirmEmit();
                 }}
                 className={
-                  confirmKind === "annul"
+                  confirmKind === "annul" || confirmKind === "bajo_cobrado"
                     ? "h-10 rounded-md bg-red-600 px-6 text-sm font-semibold text-white hover:bg-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-2 disabled:opacity-50"
                     : "h-10 rounded-md bg-emerald-700 px-6 text-sm font-semibold text-white hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 focus-visible:ring-offset-2 disabled:opacity-50"
                 }
               >
                 {busy
                   ? "Procesando…"
-                  : confirmKind === "annul"
+                  : confirmKind === "bajo_cobrado"
+                    ? "Aplicar el nuevo total"
+                    : confirmKind === "annul"
                     ? "Anular factura"
                     : confirmKind === "pay"
                       ? "Pagar"

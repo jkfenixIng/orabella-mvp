@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   annulBlockedMessage,
   annulInvoiceSchema,
@@ -19,6 +19,8 @@ import {
   type EditInvoiceItemInput,
   moneyEquals,
   nextConsecutiveNumbers,
+  overCollectedEdit,
+  overCollectedEditMessage,
   portionsMatchBalance,
   roundMoney,
   snapshotInvoiceTaxes,
@@ -26,6 +28,11 @@ import {
   invoiceItemSchema,
 } from "@/src/features/billing/schemas";
 import { computeInvoiceItemCommission } from "@/src/features/billing/commission";
+import {
+  BillingError,
+  editEmittedInvoiceItems,
+  type BillingActor,
+} from "@/src/features/billing/service";
 import {
   commissionRuleKey,
   resolveEmployeeLineCommission,
@@ -557,6 +564,60 @@ describe("billing: edición libre de emitida sin motivo (cajera del turno)", () 
     expect(
       editEmittedInvoiceSchema.safeParse({ motivo: "x".repeat(501), items: [OLD], payments: [] }).success,
     ).toBe(false);
+  });
+
+  it("confirmar_bajo_cobrado es opcional y arranca en false (payload histórico intacto)", () => {
+    expect(editEmittedInvoiceSchema.parse({ items: [OLD], payments: [] }).confirmar_bajo_cobrado).toBe(
+      false,
+    );
+    expect(
+      editEmittedInvoiceSchema.safeParse({ items: [OLD], payments: [], confirmar_bajo_cobrado: true })
+        .success,
+    ).toBe(true);
+  });
+});
+
+// ---------------- WU2: sobre-cobro al bajar el total de una emitida -------
+
+/**
+ * Cifras del aviso: la decisión del dueño es permitir el ajuste con
+ * confirmación explícita, así que lo que se prueba acá es que el aviso exista,
+ * lleve las tres cifras y NO se dispare cuando no hay sobre-cobro.
+ *
+ * Los dos números que entran son los de `invoiceNetBalance` (neto facturado del
+ * total nuevo y neto cobrado), no el bruto de `invoice_payments.amount`.
+ */
+describe("billing: el aviso de sobre-cobro (neto, exacto, sin tolerancia nueva)", () => {
+  it("cobrado 200.000 contra nuevo total 150.000: exceso 50.000", () => {
+    expect(overCollectedEdit({ netBilled: 150000, netCollected: 200000 })).toEqual({
+      cobrado: 200000,
+      total: 150000,
+      diferencia: 50000,
+    });
+  });
+
+  it("un peso de exceso ya cuenta y la igualdad no (complemento exacto de moneyEquals)", () => {
+    expect(overCollectedEdit({ netBilled: 150000, netCollected: 150001 })?.diferencia).toBe(1);
+    expect(overCollectedEdit({ netBilled: 150000, netCollected: 150000 })).toBeNull();
+    // Por debajo del nuevo total no hay nada que confirmar.
+    expect(overCollectedEdit({ netBilled: 200000, netCollected: 150000 })).toBeNull();
+    // Factura sin cobros: nunca hay sobre-cobro, por chico que sea el total.
+    expect(overCollectedEdit({ netBilled: 1000, netCollected: 0 })).toBeNull();
+  });
+
+  it("el mensaje lleva cobrado, nuevo total y exceso (y el número de factura)", () => {
+    const aviso = overCollectedEditMessage({
+      cobrado: 200000,
+      total: 150000,
+      diferencia: 50000,
+      consecutive_number: 7,
+    });
+    expect(aviso).toContain("#7");
+    expect(aviso).toContain("200.000");
+    expect(aviso).toContain("150.000");
+    expect(aviso).toContain("50.000");
+    // Explica la consecuencia que el operador no puede deshacer después.
+    expect(aviso).toContain("no se podrían registrar más cobros");
   });
 });
 
@@ -1095,3 +1156,325 @@ describe("billing: paridad del detalle con la resolución compartida y la nómin
   });
 });
 
+// ------------ WU2: el gate de sobre-cobro vive en el SERVIDOR --------------
+//
+// La pantalla es solo ayuda: la regla se prueba sobre `editEmittedInvoiceItems`
+// REAL, con un doble del cliente de Supabase (mismo criterio que cash.test.ts).
+// Solo se sustituyen la frontera de datos y los catálogos; la aritmética del
+// dinero (`invoiceNetBalance`, `computeInvoiceTotals`) es la de producción.
+
+const overCollectionStub = vi.hoisted(() => ({
+  SEDE_ID: "11111111-1111-4111-8111-111111111111",
+  INVOICE_ID: "33333333-3333-4333-8333-333333333333",
+  ITEM_ID: "99999999-9999-4999-8999-999999999999",
+  PAY_ID: "44444444-4444-4444-8444-444444444444",
+  METHOD_ID: "55555555-5555-4555-8555-555555555555",
+  /** Cobros YA registrados de la factura: es el dato que decide el gate. */
+  payments: [] as Array<{
+    id: string;
+    amount: number;
+    fee_amount: number;
+    method_code: string;
+    fee_percent: number;
+  }>,
+  /** Payload del UPDATE de `invoices`: lo que el servicio realmente escribió. */
+  invoiceUpdate: null as Record<string, unknown> | null,
+  /** Payload del INSERT de `audit_logs`: el rastro del acto deliberado. */
+  auditInsert: null as Record<string, unknown> | null,
+  /** Escrituras observadas, en orden (`tabla.op`). */
+  writes: [] as string[],
+  /** Consultas que el doble no sabe responder: debe quedar SIEMPRE vacío. */
+  unexpectedQueries: [] as string[],
+}));
+
+/**
+ * Total emitido ANTES del ajuste (la línea vale lo mismo). 300.000 con un cobro
+ * de 200.000 es el caso REAL: factura Emitida cobrada a medias (saldo 100.000),
+ * no una Emitida ya completa (esa la cierra el cobro cuando cubre el neto).
+ */
+const STUB_EMITTED_TOTAL = 300000;
+
+/** Fila de factura emitida, tal como la lee `loadDetail`. */
+function stubInvoiceRow(total: number) {
+  return {
+    id: overCollectionStub.INVOICE_ID,
+    sede_id: overCollectionStub.SEDE_ID,
+    consecutive_number: 7,
+    client_name: null,
+    client_document: null,
+    subtotal: total,
+    discount: 0,
+    tax: 0,
+    surcharge: 0,
+    total,
+    status: "Emitida",
+    user_id: "u-1",
+    cash_shift_id: null,
+    closed_by: null,
+    closed_at: null,
+    cancel_reason: null,
+    created_at: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+/** La única línea de la factura antes del ajuste (300.000). */
+function stubItemRow() {
+  return {
+    id: overCollectionStub.ITEM_ID,
+    invoice_id: overCollectionStub.INVOICE_ID,
+    item_type: "custom",
+    product_id: null,
+    service_id: null,
+    custom_name: "Corte y peinado",
+    employee_id: EMPLOYEE_ID,
+    qty: 1,
+    unit_price: STUB_EMITTED_TOTAL,
+    discount: 0,
+    subtotal: STUB_EMITTED_TOTAL,
+    no_commission: true,
+    commission_value: null,
+    commission_mode: "ninguna",
+    commission_percent_override: null,
+    created_at: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+/** Cobro registrado: `amount` es BRUTO y `fee_amount` el recargo del método. */
+function stubPayment(amount: number, feeAmount = 0) {
+  return {
+    id: overCollectionStub.PAY_ID,
+    amount,
+    fee_amount: feeAmount,
+    method_code: "efectivo",
+    fee_percent: 0,
+  };
+}
+
+/**
+ * Cliente Supabase falso y encadenable. Responde lo que el camino
+ * `editEmittedInvoiceItems` consulta de verdad y registra las ESCRITURAS (que es
+ * lo que vuelve observable si el gate frenó antes de tocar algo); cualquier
+ * consulta que no sepa responder se registra en `unexpectedQueries` y vuelve
+ * como error, para que el test falle a la vista y no en silencio.
+ */
+function createOverCollectionStubClient(): unknown {
+  const response = (table: string, op: string): { data: unknown; error: unknown } => {
+    if (op !== "select") {
+      overCollectionStub.writes.push(`${table}.${op}`);
+      if (table === "invoices" && op === "update") {
+        // El `total` que devuelve el UPDATE es el que el servicio ESCRIBIÓ: la
+        // aserción compara contra el recálculo real y no contra un número
+        // puesto a mano en el doble.
+        return {
+          data: stubInvoiceRow(Number(overCollectionStub.invoiceUpdate?.total ?? 0)),
+          error: null,
+        };
+      }
+      return { data: null, error: null };
+    }
+    switch (table) {
+      case "invoices":
+        return { data: stubInvoiceRow(STUB_EMITTED_TOTAL), error: null };
+      case "invoice_items":
+        return { data: [stubItemRow()], error: null };
+      case "invoice_taxes":
+        return { data: [], error: null };
+      case "invoice_payments":
+        return { data: overCollectionStub.payments, error: null };
+      case "commission_rules":
+        return { data: [], error: null };
+      case "employees":
+        return { data: [{ id: EMPLOYEE_ID, sede_id: overCollectionStub.SEDE_ID }], error: null };
+      case "payroll_periods":
+        return { data: [], error: null };
+      default:
+        overCollectionStub.unexpectedQueries.push(`${table}.select`);
+        return { data: null, error: { message: `stub sin respuesta para ${table}.select` } };
+    }
+  };
+
+  const from = (table: string) => {
+    let op = "select";
+    const query: Record<string, unknown> = {
+      select: () => query,
+      insert: (payload?: unknown) => {
+        op = "insert";
+        if (table === "audit_logs") {
+          overCollectionStub.auditInsert = payload as Record<string, unknown>;
+        }
+        return query;
+      },
+      update: (payload?: unknown) => {
+        op = "update";
+        if (table === "invoices") {
+          overCollectionStub.invoiceUpdate = payload as Record<string, unknown>;
+        }
+        return query;
+      },
+      delete: () => {
+        op = "delete";
+        return query;
+      },
+      eq: () => query,
+      in: () => query,
+      order: () => query,
+      limit: () => query,
+      single: () => Promise.resolve(response(table, op)),
+      maybeSingle: () => Promise.resolve(response(table, op)),
+      // `await` directo sobre la cadena (p. ej. `insert(...)` o
+      // `delete().eq(...)`) resuelve al objeto de respuesta, igual que PostgREST.
+      then: (onFulfilled?: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve(response(table, op)).then(onFulfilled, onRejected),
+    };
+    return query;
+  };
+
+  return { from };
+}
+
+vi.mock("@/src/shared/lib/supabase/server", () => ({
+  createAdminClient: () => createOverCollectionStubClient(),
+}));
+
+vi.mock("@/src/features/admin/service", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/src/features/admin/service")>();
+  const method = {
+    id: overCollectionStub.METHOD_ID,
+    sede_id: overCollectionStub.SEDE_ID,
+    code: "efectivo",
+    name: "Efectivo",
+    is_active: true,
+    arqueable: true,
+    fee_percent: 0,
+  } as Awaited<ReturnType<typeof actual.listPaymentMethods>>[number];
+  return {
+    ...actual,
+    listTaxes: async () => [] as Awaited<ReturnType<typeof actual.listTaxes>>,
+    listPaymentMethods: async () =>
+      [method] as Awaited<ReturnType<typeof actual.listPaymentMethods>>,
+    listServices: async () => [] as Awaited<ReturnType<typeof actual.listServices>>,
+  };
+});
+
+describe("billing: gate de sobre-cobro al bajar el total de una emitida (WU2)", () => {
+  const ACTOR: BillingActor = {
+    userId: "u-1",
+    sedeId: overCollectionStub.SEDE_ID,
+    roles: ["admin"],
+  };
+
+  /** Ajuste de la única línea: baja el precio de 300.000 a `unitPrice`. */
+  function editPayload(unitPrice: number, extra: Record<string, unknown> = {}) {
+    return {
+      items: [
+        {
+          id: overCollectionStub.ITEM_ID,
+          item_type: "custom",
+          custom_name: "Corte y peinado",
+          product_id: null,
+          service_id: null,
+          employee_id: EMPLOYEE_ID,
+          qty: 1,
+          unit_price: unitPrice,
+          discount: 0,
+          no_commission: true,
+        },
+      ],
+      payments: overCollectionStub.payments.map((payment) => ({
+        id: payment.id,
+        method_code: payment.method_code,
+      })),
+      ...extra,
+    };
+  }
+
+  function edit(unitPrice: number, extra: Record<string, unknown> = {}) {
+    return editEmittedInvoiceItems(
+      overCollectionStub.SEDE_ID,
+      overCollectionStub.INVOICE_ID,
+      editPayload(unitPrice, extra),
+      ACTOR,
+    );
+  }
+
+  beforeEach(() => {
+    overCollectionStub.payments = [];
+    overCollectionStub.invoiceUpdate = null;
+    overCollectionStub.auditInsert = null;
+    overCollectionStub.writes.length = 0;
+    overCollectionStub.unexpectedQueries.length = 0;
+  });
+
+  it("rechaza con OVERCOLLECTED y las tres cifras cuando nadie confirmó", async () => {
+    overCollectionStub.payments = [stubPayment(200000)];
+    const failure: unknown = await edit(150000).catch((error: unknown) => error);
+    // Código EXACTO (no "algún error"): es el contrato que consume la pantalla.
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "OVERCOLLECTED", status: 422 });
+    const mensaje = (failure as BillingError).message;
+    expect(mensaje).toContain("200.000");
+    expect(mensaje).toContain("150.000");
+    expect(mensaje).toContain("50.000");
+    // El rechazo ocurre ANTES de tocar nada: ni una fila, ni auditoría.
+    expect(overCollectionStub.writes).toEqual([]);
+    expect(overCollectionStub.invoiceUpdate).toBeNull();
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("con confirmar_bajo_cobrado el ajuste sigue y deja el rastro auditado", async () => {
+    overCollectionStub.payments = [stubPayment(200000)];
+    const detail = await edit(150000, { confirmar_bajo_cobrado: true });
+    // El total sale del recálculo del servicio (300.000 → 150.000).
+    expect(detail.invoice.total).toBe(150000);
+    expect(overCollectionStub.invoiceUpdate?.total).toBe(150000);
+    // La consecuencia que el gate evita a ciegas: saldo en 0 y factura Emitida
+    // que ya no admite cobros (tope de 031 y OVERPAID de caja).
+    expect(detail.remaining).toBe(0);
+    // Control de vacuidad: el camino NO se frenó, escribió.
+    expect(overCollectionStub.writes).toContain("invoices.update");
+    // El acto deliberado queda explicable después, en la MISMA acción auditada.
+    expect(overCollectionStub.auditInsert).toMatchObject({
+      action: "invoice.edited",
+      entity: "invoices",
+      entity_id: overCollectionStub.INVOICE_ID,
+      metadata: {
+        total_antes: 300000,
+        total_nuevo: 150000,
+        bajo_cobrado_confirmado: true,
+        cobrado_neto: 200000,
+        bajo_cobrado_diferencia: 50000,
+      },
+    });
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("un ajuste que NO sobre-cobra pasa sin confirmación", async () => {
+    overCollectionStub.payments = [stubPayment(100000)];
+    const detail = await edit(150000);
+    expect(detail.invoice.total).toBe(150000);
+    expect(overCollectionStub.writes).toContain("invoices.update");
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("una factura SIN cobros no tiene nada que confirmar, por chico que sea el total", async () => {
+    overCollectionStub.payments = [];
+    const detail = await edit(1000);
+    expect(detail.invoice.total).toBe(1000);
+    expect(overCollectionStub.writes).toContain("invoices.update");
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("control negativo: la ÚNICA diferencia entre rechazar y avanzar es la bandera", async () => {
+    overCollectionStub.payments = [stubPayment(200000)];
+    const rechazado: unknown = await edit(150000).catch((error: unknown) => error);
+    expect(rechazado).toMatchObject({ code: "OVERCOLLECTED" });
+    expect(overCollectionStub.writes).toEqual([]);
+    expect(overCollectionStub.invoiceUpdate).toBeNull();
+
+    const confirmado = await edit(150000, { confirmar_bajo_cobrado: true });
+    expect(confirmado.invoice.total).toBe(150000);
+    expect(overCollectionStub.invoiceUpdate?.total).toBe(150000);
+    expect(overCollectionStub.auditInsert).not.toBeNull();
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+});

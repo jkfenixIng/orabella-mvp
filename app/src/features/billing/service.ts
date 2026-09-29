@@ -16,6 +16,8 @@ import {
   moneyEquals,
   MONEY_EPSILON,
   normalizeCommissionFields,
+  overCollectedEdit,
+  overCollectedEditMessage,
   portionsMatchBalance,
   roundMoney,
   splitPaymentSchema,
@@ -1514,6 +1516,32 @@ export async function editEmittedInvoiceItems(
   // `invoices` no cerraría y el UPDATE fallaría.
   const newTotal = round2(totals.total + surcharge);
 
+  // GATE (WU2, decisión del dueño): bajar el total de una factura YA COBRADA
+  // por debajo de lo cobrado se permite, pero nunca en silencio. El saldo sale
+  // de `invoiceNetBalance` —la casa única de qué se factura, qué se cobra y qué
+  // falta—: el neto facturado del total NUEVO (`roundMoney(newTotal −
+  // surcharge)`, y por eso el recargo emitido entra por `surcharge`) contra el
+  // neto cobrado (`Σ(amount − fee_amount)`, NO el bruto de `amount`, que lleva
+  // el recargo del método). Sin la confirmación explícita del operador el ajuste
+  // se rechaza ANTES de tocar nada —ni una fila, ni el stock, ni la auditoría—;
+  // con ella sigue el camino de siempre.
+  const newBalance = invoiceNetBalance({
+    total: newTotal,
+    surcharge,
+    payments: detail.payments,
+  });
+  const sobreCobro = overCollectedEdit(newBalance);
+  if (sobreCobro && !input.confirmar_bajo_cobrado) {
+    throw new BillingError(
+      "OVERCOLLECTED",
+      overCollectedEditMessage({
+        ...sobreCobro,
+        consecutive_number: detail.invoice.consecutive_number,
+      }),
+      422,
+    );
+  }
+
   // Inventario por deltas netos por producto vía la frontera (pre-valida
   // stock antes de mutar; solo los incrementos requieren stock).
   const oldQtyByProduct = new Map<string, number>();
@@ -1650,6 +1678,19 @@ export async function editEmittedInvoiceItems(
         admin_override: isAdmin && detail.invoice.user_id !== actor.userId,
         total_antes: Number(detail.invoice.total),
         total_nuevo: newTotal,
+        // La confirmación convierte el sobre-cobro en un acto DELIBERADO y
+        // explicable después: la MISMA acción INVOICE_EDITED (la que ya cubre
+        // esta edición) deja el rastro de que hubo confirmación y las cifras del
+        // aviso. No se inventa una acción nueva: `AUDIT_ACTIONS` es el
+        // vocabulario cerrado del sistema (src/shared/lib/audit.ts) y este
+        // ajuste ya se audita como INVOICE_EDITED.
+        ...(sobreCobro
+          ? {
+              bajo_cobrado_confirmado: true,
+              cobrado_neto: sobreCobro.cobrado,
+              bajo_cobrado_diferencia: sobreCobro.diferencia,
+            }
+          : {}),
         items_before: diff.removed.length + diff.changed.length,
         items_added: diff.added.length,
         inventory_moves: inventoryMoves,
