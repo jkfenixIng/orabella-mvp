@@ -206,10 +206,11 @@ const themeInline = readThemeVars(GLOBALS_CSS, "@theme inline");
 
 /* --------------------------------------------------------------------------
    Pares reales `bg-*-light` + color de texto, leídos de los consumidores (no
-   supuestos): las cuatro variantes de src/components/ui/lib/badge.tsx y las
-   llamadas a `.bg-*-light` en app/page.tsx:87,106, app/cash/cash-client.tsx:747,
-   app/login/login-form.tsx:99, app/payroll/payroll-client.tsx:1142 y
-   app/vales/vouchers-client.tsx:346,351.
+   supuestos): las cuatro variantes de src/components/ui/lib/badge.tsx (el par
+   ámbar, en la línea 21) y las llamadas a `.bg-*-light` en app/page.tsx:87,106,
+   app/cash/cash-client.tsx:747 y app/login/login-form.tsx:99. Desde WU-C la
+   nómina y los vales ya no escriben el par ámbar a mano: lo consumen por la
+   variante `warning` de src/components/ui/lib/alert.tsx:33.
 
    En claro el fondo lo da `--color-*-50` y el texto `--color-*-600` (clases
    `.text-*` de design-tokens.css). En oscuro `.dark .bg-*-light` pisa el fondo
