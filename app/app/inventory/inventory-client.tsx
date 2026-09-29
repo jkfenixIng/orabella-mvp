@@ -447,9 +447,16 @@ export function InventoryClient(props: InventoryClientProps) {
               {skuTaken ? (
                 // ESTADO que bloquea: con un SKU ya tomado el botón Guardar
                 // queda deshabilitado, y el aviso sigue siendo el caso hasta
-                // que se corrija. `destructive` deriva el mismo role="alert"
-                // asertivo que el `<span role="alert">` escribía a mano.
-                <Alert variant="destructive" className="text-xs">
+                // que se corrija.
+                //
+                // `role="status"` explícito (polite): este aviso se DERIVA del
+                // formulario mientras el usuario escribe el SKU, no es el
+                // desenlace de una acción enviada. `destructive` derivaría
+                // `alert` (asertivo), y una región asertiva que interrumpe a
+                // quien está tecleando es el antipatrón de sobreanuncio. Es el
+                // mismo tratamiento que los dos avisos derivados en vivo de
+                // nómina: una clase de mensaje, una sola ARIA.
+                <Alert variant="destructive" role="status" className="text-xs">
                   Este SKU ya existe en otro producto.
                 </Alert>
               ) : null}

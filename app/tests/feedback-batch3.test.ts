@@ -12,11 +12,17 @@ import { describe, expect, it } from "vitest";
    pantalla para siempre compitiendo con lo que sí importa.
 
    - ESTADO  -> lo que ES el caso hasta que algo cambie ("El usuario no tiene
-                sede asignada.", "no se pudieron cargar los productos",
-                "Este SKU ya existe en otro producto."): inline, persistente, al
-                lado de la cosa -> `Alert`, que deriva el rol ARIA de la
-                variante (`destructive` -> asertivo, el mismo anuncio que el
-                marcado escribía a mano).
+                sede asignada.", "no se pudieron cargar los productos"):
+                inline, persistente, al lado de la cosa -> `Alert`, que deriva el
+                rol ARIA de la variante (`destructive` -> asertivo, el mismo
+                anuncio que el marcado escribía a mano).
+   - ESTADO DERIVADO EN VIVO -> un aviso que se CALCULA del formulario
+                mientras el usuario escribe ("Este SKU ya existe en otro
+                producto."), no el desenlace de una acción enviada: conserva la
+                presentación `Alert` pero pasa `role="status"` explícito
+                (polite). Una región asertiva que interrumpe a quien teclea es
+                el antipatrón de sobreanuncio; los fallos confirmados siguen
+                asertivos.
    - EVENTO  -> lo que acaba de pasar ("Producto creado.", "Movimiento
                 registrado…"): efímero -> `toast`.
    - VACÍO   -> el estado base de una lista o tabla ("Sin productos para esta
@@ -94,11 +100,14 @@ describe("detector de roles ad-hoc: no es un sello de goma", () => {
 
   it("el módulo explica el criterio en comentarios, y el stripper es quien evita el falso positivo", () => {
     // El archivo crudo SÍ menciona el rol: está en los comentarios que explican
-    // por qué `destructive` ya deriva `role="alert"`. Si el stripper dejara de
-    // funcionar, la guarda de "ningún rol ad-hoc" fallaría sola y este test
-    // documenta por qué eso sería un falso positivo, no una regresión.
-    expect(adHocRoles(CLIENT_TSX).length, "menciones en comentarios").toBeGreaterThan(0);
-    expect(adHocRoles(CLIENT_CODE)).toEqual([]);
+    // por qué `destructive` deriva `role="alert"` y por qué el aviso del SKU
+    // pasa `role="status"`. Si el stripper dejara de funcionar, la guarda de
+    // "ningún rol ad-hoc" fallaría sola y este test documenta por qué eso sería
+    // un falso positivo, no una regresión.
+    expect(adHocRoles(CLIENT_TSX).length, "menciones en comentarios").toBeGreaterThan(1);
+    // En código queda exactamente UN rol escrito a mano: el override deliberado
+    // del SKU (test dedicado más abajo).
+    expect(adHocRoles(CLIENT_CODE)).toEqual(["role="]);
   });
 
   it("los dos archivos se leyeron de verdad (si el walk se rompe, esto falla)", () => {
@@ -110,14 +119,15 @@ describe("detector de roles ad-hoc: no es un sello de goma", () => {
     expect(PAGE_CODE).toContain("export default async function InventoryPage");
   });
 
-  it("no queda ningún rol ad-hoc en los dos archivos", () => {
-    const modules: Array<[string, string]> = [
-      ["app/inventory/inventory-client.tsx", CLIENT_CODE],
-      ["app/inventory/page.tsx", PAGE_CODE],
-    ];
-    for (const [path, code] of modules) {
-      expect(adHocRoles(code), `role= en ${path}`).toEqual([]);
-    }
+  it("no queda ningún rol ad-hoc, salvo el override deliberado del SKU", () => {
+    // La página servidor sigue sin un solo `role=` escrito a mano.
+    expect(adHocRoles(PAGE_CODE), "role= en app/inventory/page.tsx").toEqual([]);
+    // El cliente tiene UNA excepción DELIBERADA: el `role="status"` del aviso
+    // de SKU tomado, que se deriva en vivo del formulario y por eso anuncia
+    // `polite` (test dedicado más abajo). Cualquier otro `role=` sigue siendo el
+    // defecto que esta guarda caza.
+    expect(adHocRoles(CLIENT_CODE), "excepción deliberada").toEqual(["role="]);
+    expect(CLIENT_CODE).toMatch(/<Alert variant="destructive" role="status" className="text-xs">/);
   });
 });
 
@@ -183,17 +193,35 @@ describe("inventario: lo persistente va por Alert (estado)", () => {
     expect(CLIENT_CODE).not.toMatch(/errorClass/);
   });
 
-  it("'este SKU ya existe' bloquea el alta: Alert destructivo junto al campo", () => {
+  it("'este SKU ya existe' bloquea el alta: Alert destructivo con rol polite explícito", () => {
     // ESTADO derivado del formulario: mientras el SKU esté tomado el botón
-    // Guardar queda deshabilitado, así que el aviso sigue siendo el caso.
-    // `destructive` deriva el mismo `role="alert"` asertivo que el
-    // `<span role="alert">` escribía a mano: cambia el canal visual, no el
-    // anuncio.
+    // Guardar queda deshabilitado, así que el aviso sigue siendo el caso. Se
+    // calcula MIENTRAS el usuario escribe el SKU, no es el desenlace de una
+    // acción enviada, así que conserva la presentación `destructive` pero pasa
+    // `role="status"` explícito (polite). Es el mismo tratamiento que los dos
+    // avisos derivados en vivo de nómina: una clase de mensaje, una sola ARIA.
     const sku = linesWith(CLIENT_CODE, "Este SKU ya existe en otro producto.");
     expect(sku).toHaveLength(1);
     expect(CLIENT_CODE).toMatch(
-      /<Alert variant="destructive" className="text-xs">\s*Este SKU ya existe en otro producto\./,
+      /<Alert variant="destructive" role="status" className="text-xs">\s*Este SKU ya existe en otro producto\./,
     );
+
+    // CONTROL NEGATIVO: el override no se aplicó en bloque. Los fallos
+    // confirmados (arriba y dentro de cada modal) quedan sin rol explícito, o
+    // sea asertivos: el usuario tiene que enterarse antes de navegar. Si
+    // alguien pasara `role="status"` a todos los Alert destructivos, el conteo
+    // de abajo pasaría de 1 a 4 y fallaría.
+    expect([...CLIENT_CODE.matchAll(/<Alert variant="destructive" role="status"/g)]).toHaveLength(1);
+    for (const committed of [
+      '<Alert variant="destructive">{error}</Alert>',
+      '<Alert variant="destructive" className="sm:col-span-2">',
+    ]) {
+      const lines = linesWith(CLIENT_CODE, committed);
+      expect(lines, committed).toHaveLength(committed === '<Alert variant="destructive">{error}</Alert>' ? 1 : 2);
+      for (const line of lines) {
+        expect(line, committed).not.toContain('role="status"');
+      }
+    }
   });
 
   it("no se inventaron avisos: el módulo tiene exactamente cuatro Alert, todos destructivos", () => {
