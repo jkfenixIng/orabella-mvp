@@ -10,6 +10,7 @@ import {
 } from "@/src/features/admin/service";
 import { getVoucherSettings } from "@/src/features/payroll/service";
 import { listDenominations, listRegisters } from "@/src/features/cash/service";
+import { Alert } from "@/src/components/ui/lib/alert";
 import { AdminTabs } from "./admin-tabs";
 
 export const dynamic = "force-dynamic";
@@ -34,9 +35,12 @@ export default async function AdminPage() {
     return (
       <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-4 px-6 py-12">
         <h1 className="text-2xl font-bold">Administración</h1>
-        <p role="alert" className="text-sm text-error dark:text-error">
-          El usuario no tiene sede asignada.
-        </p>
+        {/* Sin sede no hay panel que mostrar: es ESTADO (el caso hasta que a
+            alguien se le asigne una sede), así que va inline y persistente.
+            Esta vista es un Server Component: no puede emitir un toast. El
+            texto es el mismo; `destructive` deriva role="alert", el mismo
+            anuncio asertivo que antes estaba escrito a mano. */}
+        <Alert variant="destructive">El usuario no tiene sede asignada.</Alert>
       </main>
     );
   }

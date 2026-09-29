@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
+import { toast } from "sonner";
 import {
   Dialog,
   DialogContent,
@@ -15,16 +16,15 @@ import {
 } from "@/src/features/auth/actions";
 import type { SedeUserRow } from "@/src/features/admin/service";
 import type { RoleCode } from "@/src/features/auth/schemas";
+import { Alert } from "@/src/components/ui/lib/alert";
 import {
   buttonClass,
-  errorClass,
   ghostClass,
   hintTextClass,
   inputClass,
   labelClass,
   linkButtonClass,
   mutedTextClass,
-  okClass,
   sectionClass,
   sectionTitleClass,
   stackClass,
@@ -47,7 +47,6 @@ export function UsersSection({
     Object.fromEntries(initial.map((row) => [row.id, row.roles[0] ?? null])),
   );
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [confirmResetId, setConfirmResetId] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
@@ -83,7 +82,6 @@ export function UsersSection({
     event.preventDefault();
     setBusyId("nuevo");
     setError(null);
-    setNotice(null);
     const result = await adminCreateUserAction({
       full_name: newUser.full_name,
       documento: newUser.documento,
@@ -100,14 +98,13 @@ export function UsersSection({
     }
     setCreateOpen(false);
     setNewUser({ full_name: "", documento: "", id_type: "CC", email: "", phone: "", role: "empleado" });
-    setNotice("Usuario creado con su rol.");
+    toast.success("Usuario creado con su rol.");
     await refreshUsers();
   }
 
   async function handleReset(row: SedeUserRow) {
     setBusyId(row.id);
     setError(null);
-    setNotice(null);
     const result: ActionResult<{ user_id: string }> = await adminResetPasswordAction(row.id);
     setBusyId(null);
     setConfirmResetId(null);
@@ -115,19 +112,17 @@ export function UsersSection({
       setError(result.message);
       return;
     }
-    setNotice(`Clave de ${row.full_name} restablecida a su documento; deberá cambiarla al entrar.`);
+    toast.success(`Clave de ${row.full_name} restablecida a su documento; deberá cambiarla al entrar.`);
   }
 
   async function handleSave(row: SedeUserRow) {
     const role = selected[row.id] ?? null;
     if (!role) {
       setError("Seleccione un rol.");
-      setNotice(null);
       return;
     }
     setBusyId(row.id);
     setError(null);
-    setNotice(null);
     const result: ActionResult<{ user_id: string; roles: RoleCode[] }> = await setUserRolesAction({
       user_id: row.id,
       roles: [role],
@@ -141,7 +136,7 @@ export function UsersSection({
       current.map((item) => (item.id === row.id ? { ...item, roles: result.data.roles } : item)),
     );
     setSelected((prev) => ({ ...prev, [row.id]: result.data.roles[0] ?? null }));
-    setNotice(`Rol de ${row.full_name} actualizado.`);
+    toast.success(`Rol de ${row.full_name} actualizado.`);
   }
 
   return (
@@ -252,14 +247,13 @@ export function UsersSection({
           </div>
         )}
         {error ? (
-          <p role="alert" className={`${errorClass} mt-3`}>
+          // ESTADO: el fallo al crear o guardar sigue siendo el caso mientras
+          // no se corrija, así que va inline y persistente. `destructive`
+          // deriva role="alert" asertivo, el mismo anuncio que el
+          // `<p role="alert">` escribía a mano antes.
+          <Alert variant="destructive" className="mt-3">
             {error}
-          </p>
-        ) : null}
-        {notice ? (
-          <p role="status" className={`${okClass} mt-3`}>
-            {notice}
-          </p>
+          </Alert>
         ) : null}
       </section>
 

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
+import { toast } from "sonner";
 import {
   Dialog,
   DialogContent,
@@ -12,15 +13,14 @@ import { upsertEmployeeAction } from "@/src/features/admin/actions";
 import { adminCreateUserAction } from "@/src/features/auth/actions";
 import type { EmployeeRow, SedeUserRow } from "@/src/features/admin/service";
 import type { RoleCode } from "@/src/features/auth/schemas";
+import { Alert } from "@/src/components/ui/lib/alert";
 import {
   buttonClass,
-  errorClass,
   ghostClass,
   inputClass,
   labelClass,
   linkButtonClass,
   mutedTextClass,
-  okClass,
   sectionClass,
   sectionTitleClass,
   stackClass,
@@ -80,7 +80,6 @@ export function EmployeesSection({
   const [loginIdType, setLoginIdType] = useState("CC");
   const [loginRole, setLoginRole] = useState<RoleCode>("empleado");
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const dialogRow =
@@ -107,7 +106,6 @@ export function EmployeesSection({
     setLoginIdType("CC");
     setLoginRole("empleado");
     setError(null);
-    setNotice(null);
     setDialog({ mode: "create" });
   }
 
@@ -131,7 +129,6 @@ export function EmployeesSection({
       is_active: row.is_active,
     });
     setError(null);
-    setNotice(null);
     setDialog({ mode: "edit", id: row.id });
   }
 
@@ -146,7 +143,6 @@ export function EmployeesSection({
     event.preventDefault();
     setBusy(true);
     setError(null);
-    setNotice(null);
     // Alta conjunta: primero el usuario (reutiliza nombre, documento,
     // correo y teléfono del formulario), luego el empleado se vincula solo.
     // En edición solo aplica si el empleado aún no tiene usuario.
@@ -204,7 +200,7 @@ export function EmployeesSection({
       if (exists) return current.map((row) => (row.id === result.data.id ? result.data : row));
       return [...current, result.data];
     });
-    setNotice(`${editingId ? "Empleado actualizado." : "Empleado creado."}${userNote}`);
+    toast.success(`${editingId ? "Empleado actualizado." : "Empleado creado."}${userNote}`);
     onUsersChanged();
     closeDialog();
   }
@@ -277,12 +273,6 @@ export function EmployeesSection({
           </div>
         )}
       </section>
-
-      {notice ? (
-        <p role="status" className={okClass}>
-          {notice}
-        </p>
-      ) : null}
 
       <Dialog
         open={dialog?.mode === "view"}
@@ -554,9 +544,13 @@ export function EmployeesSection({
               Activo
             </label>
             {error ? (
-              <p role="alert" className={`${errorClass} sm:col-span-2`}>
+              // ESTADO: el fallo al guardar sigue siendo el caso mientras no se
+              // corrija, así que va inline y persistente. `destructive` deriva
+              // role="alert" asertivo, el mismo anuncio que el `<p role="alert">`
+              // escribía a mano antes.
+              <Alert variant="destructive" className="sm:col-span-2">
                 {error}
-              </p>
+              </Alert>
             ) : null}
             <DialogFooter className="sm:col-span-2">
               <button type="button" onClick={closeDialog} className={ghostClass}>

@@ -1,21 +1,21 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
+import { toast } from "sonner";
 import {
   deleteDenominationAction,
   updateRegisterBaseAction,
   upsertDenominationAction,
 } from "@/src/features/cash/actions";
 import type { CashDenominationRow, CashRegisterRow } from "@/src/features/cash/service";
+import { Alert } from "@/src/components/ui/lib/alert";
 import {
   buttonClass,
-  errorClass,
   inputClass,
   labelClass,
   linkButtonClass,
   listItemClass,
   mutedTextClass,
-  okClass,
   sectionClass,
   sectionTitleClass,
   stackClass,
@@ -35,7 +35,6 @@ export function CashSection({
   const [newKind, setNewKind] = useState("billete");
   const [newValue, setNewValue] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   async function handleBase(registerId: string) {
@@ -46,7 +45,6 @@ export function CashSection({
     }
     setBusy(true);
     setError(null);
-    setNotice(null);
     const result: ActionResult<CashRegisterRow> = await updateRegisterBaseAction(registerId, {
       base_configurada: Number(raw),
     });
@@ -57,7 +55,7 @@ export function CashSection({
     }
     setRegisters((current) => current.map((row) => (row.id === result.data.id ? result.data : row)));
     setBaseDrafts((current) => ({ ...current, [registerId]: "" }));
-    setNotice("Base actualizada.");
+    toast.success("Base actualizada.");
   }
 
   async function handleAddDenomination(event: FormEvent) {
@@ -69,7 +67,6 @@ export function CashSection({
     }
     setBusy(true);
     setError(null);
-    setNotice(null);
     const result: ActionResult<CashDenominationRow> = await upsertDenominationAction({
       kind: newKind,
       value,
@@ -81,13 +78,12 @@ export function CashSection({
     }
     setDenominations((current) => [...current, result.data].sort((a, b) => b.value - a.value));
     setNewValue("");
-    setNotice("Denominación agregada.");
+    toast.success("Denominación agregada.");
   }
 
   async function toggleDenomination(row: CashDenominationRow) {
     setBusy(true);
     setError(null);
-    setNotice(null);
     const result: ActionResult<CashDenominationRow> = await upsertDenominationAction({
       id: row.id,
       kind: row.kind,
@@ -100,13 +96,12 @@ export function CashSection({
       return;
     }
     setDenominations((current) => current.map((item) => (item.id === row.id ? result.data : item)));
-    setNotice("Denominación actualizada.");
+    toast.success("Denominación actualizada.");
   }
 
   async function removeDenomination(id: string) {
     setBusy(true);
     setError(null);
-    setNotice(null);
     const result = await deleteDenominationAction(id);
     setBusy(false);
     if (!result.success) {
@@ -114,7 +109,7 @@ export function CashSection({
       return;
     }
     setDenominations((current) => current.filter((item) => item.id !== id));
-    setNotice("Denominación eliminada.");
+    toast.success("Denominación eliminada.");
   }
 
   return (
@@ -186,14 +181,11 @@ export function CashSection({
           </ul>
         )}
         {error ? (
-          <p role="alert" className={errorClass}>
-            {error}
-          </p>
-        ) : null}
-        {notice ? (
-          <p role="status" className={okClass}>
-            {notice}
-          </p>
+          // ESTADO: el fallo al guardar sigue siendo el caso mientras no se
+          // corrija, así que va inline y persistente. `destructive` deriva
+          // role="alert" asertivo, el mismo anuncio que el `<p role="alert">`
+          // escribía a mano antes.
+          <Alert variant="destructive">{error}</Alert>
         ) : null}
       </section>
     </div>

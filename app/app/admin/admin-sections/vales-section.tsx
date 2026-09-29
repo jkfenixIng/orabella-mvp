@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
+import { toast } from "sonner";
 import {
   Dialog,
   DialogContent,
@@ -10,13 +11,12 @@ import {
 } from "@/src/components/ui/lib/dialog";
 import { setVoucherLimitsAction } from "@/src/features/payroll/actions";
 import type { VoucherSettingsRow } from "@/src/features/payroll/service";
+import { Alert } from "@/src/components/ui/lib/alert";
 import {
   buttonClass,
-  errorClass,
   ghostClass,
   inputClass,
   labelClass,
-  okClass,
   sectionClass,
   sectionTitleClass,
   stackClass,
@@ -125,7 +125,6 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
   const [maxWeek, setMaxWeek] = useState(() => (initial?.max_per_week ? String(initial.max_per_week) : ""));
   const [perDayValues, setPerDayValues] = useState<Record<number, string>>(() => voucherPerDayValues(initial));
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState<VoucherLimitsPayload | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -176,7 +175,6 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
   /** Valida y arma el payload respetando el contrato de voucherLimitsSchema. */
   function buildPayload(): VoucherLimitsPayload | null {
     setError(null);
-    setNotice(null);
     const days = daysMode === "all" ? [...ALL_DAYS] : [...selectedDays].sort((a, b) => a - b);
     if (days.length === 0) {
       setError("Elija al menos un día permitido.");
@@ -247,7 +245,7 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
       return;
     }
     applySettings(result.data);
-    setNotice("Configuración de vales actualizada.");
+    toast.success("Configuración de vales actualizada.");
     setConfirmOpen(false);
     setPending(null);
   }
@@ -410,14 +408,11 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
           </div>
 
           {error ? (
-            <p role="alert" className={errorClass}>
-              {error}
-            </p>
-          ) : null}
-          {notice ? (
-            <p role="status" className={okClass}>
-              {notice}
-            </p>
+            // ESTADO: el fallo de validación o de guardado sigue siendo el caso
+            // mientras no se corrija, así que va inline y persistente.
+            // `destructive` deriva role="alert" asertivo, el mismo anuncio que
+            // el `<p role="alert">` escribía a mano antes.
+            <Alert variant="destructive">{error}</Alert>
           ) : null}
 
           <div>

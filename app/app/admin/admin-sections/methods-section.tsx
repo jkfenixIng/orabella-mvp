@@ -1,18 +1,18 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
+import { toast } from "sonner";
 import { upsertPaymentMethodAction } from "@/src/features/admin/actions";
 import type { PaymentMethodRow } from "@/src/features/admin/service";
+import { Alert } from "@/src/components/ui/lib/alert";
 import {
   buttonClass,
-  errorClass,
   ghostClass,
   inputClass,
   labelClass,
   linkButtonClass,
   listItemClass,
   mutedTextClass,
-  okClass,
   sectionClass,
   sectionTitleClass,
   stackClass,
@@ -26,21 +26,18 @@ export function MethodsSection({ sedeId, initial }: { sedeId: string; initial: P
   const [form, setForm] = useState(EMPTY_METHOD);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   function startEdit(row: PaymentMethodRow) {
     setEditingId(row.id);
     setForm({ code: row.code, name: row.name, is_active: row.is_active, arqueable: row.arqueable });
     setError(null);
-    setNotice(null);
   }
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
     setError(null);
-    setNotice(null);
     const result: ActionResult<PaymentMethodRow> = await upsertPaymentMethodAction({
       ...(editingId ? { id: editingId } : {}),
       sede_id: sedeId,
@@ -59,7 +56,7 @@ export function MethodsSection({ sedeId, initial }: { sedeId: string; initial: P
       if (exists) return current.map((row) => (row.id === result.data.id ? result.data : row));
       return [...current, result.data];
     });
-    setNotice(editingId ? "Método actualizado." : "Método creado.");
+    toast.success(editingId ? "Método actualizado." : "Método creado.");
     setEditingId(null);
     setForm(EMPTY_METHOD);
   }
@@ -135,14 +132,11 @@ export function MethodsSection({ sedeId, initial }: { sedeId: string; initial: P
             Se arquea (desactívelo si no se puede contar, p. ej. tarjeta por terminal)
           </label>
           {error ? (
-            <p role="alert" className={errorClass}>
-              {error}
-            </p>
-          ) : null}
-          {notice ? (
-            <p role="status" className={okClass}>
-              {notice}
-            </p>
+            // ESTADO: el fallo al guardar sigue siendo el caso mientras no se
+            // corrija, así que va inline y persistente. `destructive` deriva
+            // role="alert" asertivo, el mismo anuncio que el `<p role="alert">`
+            // escribía a mano antes.
+            <Alert variant="destructive">{error}</Alert>
           ) : null}
           <div className="flex gap-2">
             <button type="submit" disabled={busy} className={buttonClass}>
