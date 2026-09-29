@@ -98,13 +98,13 @@ function Combobox({
         aria-expanded={open}
         aria-label={ariaLabel}
         className={cn(
-          'flex h-10 w-full items-center justify-between gap-2 rounded-md border border-slate-300 bg-white px-3 text-sm outline-none transition-colors placeholder:text-slate-400 hover:border-slate-400 focus:border-slate-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:hover:border-slate-600',
-          selectedOption ? 'text-slate-900 dark:text-slate-100' : 'text-slate-400',
+          'flex h-10 w-full items-center justify-between gap-2 rounded-md border border-border-color bg-surface px-3 text-sm outline-none transition-colors placeholder:text-text-tertiary hover:border-border-color-2 focus:border-primary-600 focus:ring-2 focus:ring-primary-600/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-border-color-2 dark:bg-surface',
+          selectedOption ? 'text-text-primary' : 'text-text-tertiary',
         )}
       >
         <span className="truncate">{selectedOption ? selectedOption.label : placeholder}</span>
         <svg
-          className={cn('h-4 w-4 shrink-0 text-slate-400 transition-transform duration-200', open && 'rotate-180')}
+          className={cn('h-4 w-4 shrink-0 text-text-secondary transition-transform duration-200', open && 'rotate-180')}
           viewBox="0 0 24 24"
           fill="none"
           stroke="currentColor"
@@ -119,9 +119,9 @@ function Combobox({
           <div
             role="listbox"
             aria-label={ariaLabel}
-            className="absolute inset-x-0 top-full z-50 mt-1 overflow-hidden rounded-md border border-slate-300 bg-white shadow-xl dark:border-slate-700 dark:bg-slate-900"
+            className="absolute inset-x-0 top-full z-50 mt-1 overflow-hidden rounded-md border border-border-color bg-surface shadow-xl dark:border-border-color-2 dark:bg-surface"
           >
-            <div className="border-b border-slate-200 p-2 dark:border-slate-700">
+            <div className="border-b border-border-color-2 p-2">
               <input
                 type="text"
                 value={filter}
@@ -132,7 +132,7 @@ function Combobox({
                 placeholder={filterPlaceholder}
                 autoFocus
                 aria-label={filterPlaceholder}
-                className="h-9 w-full rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none placeholder:text-slate-400 focus:border-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                className="h-9 w-full rounded-md border border-border-color bg-surface px-3 text-sm text-text-primary outline-none placeholder:text-text-tertiary focus:border-primary-600 focus:ring-2 focus:ring-primary-600/20 dark:border-border-color-2 dark:bg-surface"
               />
             </div>
             <div className="max-h-[240px] overflow-y-auto p-1">
@@ -145,15 +145,15 @@ function Combobox({
                   className={cn(
                     'flex w-full items-center rounded-md px-3 py-2 text-left text-sm transition-colors',
                     value === ''
-                      ? 'bg-slate-100 font-medium text-slate-900 dark:bg-slate-800 dark:text-slate-100'
-                      : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800',
+                      ? 'bg-surface-hover font-medium text-text-primary'
+                      : 'text-text-primary hover:bg-surface-hover',
                   )}
                 >
                   {clearLabel}
                 </button>
               )}
               {filteredOptions.length === 0 ? (
-                <p className="px-3 py-4 text-center text-sm text-slate-500">{noResultsText}</p>
+                <p className="px-3 py-4 text-center text-sm text-text-secondary">{noResultsText}</p>
               ) : (
                 filteredOptions.map((option) => (
                   <button
@@ -168,13 +168,13 @@ function Combobox({
                     className={cn(
                       'flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50',
                       option.value === value
-                        ? 'bg-emerald-50 font-medium text-emerald-900 dark:bg-emerald-900/30 dark:text-emerald-300'
-                        : 'text-slate-900 hover:bg-slate-100 dark:text-slate-100 dark:hover:bg-slate-800',
+                        ? 'bg-success-light font-medium text-success'
+                        : 'text-text-primary hover:bg-surface-hover',
                     )}
                   >
                     <span className="min-w-0 flex-1 truncate">{option.label}</span>
                     {option.description ? (
-                      <span className="shrink-0 text-xs text-slate-500">{option.description}</span>
+                      <span className="shrink-0 text-xs text-text-secondary">{option.description}</span>
                     ) : null}
                   </button>
                 ))
