@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState, useTransition, type ChangeEvent, type FormEvent } from "react";
+import { toast } from "sonner";
 import { Activity, PackageOpen, PackagePlus, Pencil, X } from "lucide-react";
 import {
   getKardexAction,
@@ -12,6 +13,7 @@ import type {
   MovementRow,
   ProductRow,
 } from "@/src/features/inventory/service";
+import { Alert } from "@/src/components/ui/lib/alert";
 import { Badge } from "@/src/components/ui/lib/badge";
 import { Button } from "@/src/components/ui/lib/button";
 import { Checkbox } from "@/src/components/ui/lib/checkbox";
@@ -35,11 +37,9 @@ import {
 import { cn } from "@/src/components/ui/lib/utils";
 import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 import {
-  errorClass,
   inputClass,
   labelClass,
   mutedTextClass,
-  okClass,
   sectionClass,
   tableCellClass,
   tableHeaderClass,
@@ -98,7 +98,6 @@ export function InventoryClient(props: InventoryClientProps) {
   const [page, setPage] = useState(0);
   const PAGE_SIZE = 15;
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // Transición para los cambios de vista (kardex): la UI no se congela
   // mientras la server action responde.
@@ -163,7 +162,6 @@ export function InventoryClient(props: InventoryClientProps) {
         : emptyProductForm(),
     );
     setError(null);
-    setNotice(null);
     setProductDialogOpen(true);
   }
 
@@ -193,7 +191,6 @@ export function InventoryClient(props: InventoryClientProps) {
     event.preventDefault();
     setBusy(true);
     setError(null);
-    setNotice(null);
     const minStock = toNumber(form.min_stock);
     const result: ActionResult<ProductRow> = await upsertProductAction({
       ...(editingId ? { id: editingId } : {}),
@@ -212,7 +209,9 @@ export function InventoryClient(props: InventoryClientProps) {
       setError(result.message);
       return;
     }
-    setNotice(editingId ? "Producto actualizado." : "Producto creado.");
+    // EVENTO: el alta acaba de pasar, así que va por el canal efímero (toast)
+    // y no como texto pegado a la pantalla. Antes era un `notice` de estado.
+    toast.success(editingId ? "Producto actualizado." : "Producto creado.");
     cancelEdit();
     await refresh();
   }
@@ -221,7 +220,6 @@ export function InventoryClient(props: InventoryClientProps) {
     event.preventDefault();
     setBusy(true);
     setError(null);
-    setNotice(null);
     const qty = toNumber(movement.qty);
     const result: ActionResult<{ movement: MovementRow; stock_qty: number }> =
       await registerMovementAction({
@@ -235,7 +233,8 @@ export function InventoryClient(props: InventoryClientProps) {
       setError(result.message);
       return;
     }
-    setNotice(`Movimiento registrado. Stock actual: ${result.data.stock_qty}.`);
+    // EVENTO: el movimiento acaba de registrarse; efímero, no estado.
+    toast.success(`Movimiento registrado. Stock actual: ${result.data.stock_qty}.`);
     setMovement(emptyMovementForm());
     await refresh();
     if (kardex && kardex.product.id === result.data.movement.product_id) {
@@ -259,14 +258,11 @@ export function InventoryClient(props: InventoryClientProps) {
   return (
     <div className="flex flex-col gap-6">
       {error ? (
-        <p role="alert" className={errorClass}>
-          {error}
-        </p>
-      ) : null}
-      {notice ? (
-        <p role="status" className={okClass}>
-          {notice}
-        </p>
+        // ESTADO: el fallo al cargar o al guardar sigue siendo el caso mientras
+        // no se corrija, así que va inline y persistente. `destructive` deriva
+        // role="alert" asertivo, el mismo anuncio que el `<p role="alert">`
+        // escribía a mano antes.
+        <Alert variant="destructive">{error}</Alert>
       ) : null}
 
       <section className={sectionClass}>
@@ -298,6 +294,10 @@ export function InventoryClient(props: InventoryClientProps) {
       <section className={sectionClass}>
         <h2 className="text-lg font-semibold">Productos ({visible.length})</h2>
         {visible.length === 0 ? (
+          // VACÍO: el estado base de la tabla cuando la búsqueda no devuelve
+          // nada. Describe lo esperado, no bloquea nada y nunca anunció nada
+          // (no tenía rol), así que NO se envuelve en `Alert`: envolverlo
+          // AGREGARÍA un anuncio que hoy no existe.
           <p className="mt-3 text-sm text-text-tertiary">Sin productos para esta búsqueda.</p>
         ) : (
           <div className="mt-3 overflow-x-auto">
@@ -445,9 +445,13 @@ export function InventoryClient(props: InventoryClientProps) {
                 Código único por sede (p. ej. SH-001 para shampoo).
               </span>
               {skuTaken ? (
-                <span role="alert" className="text-xs text-error">
+                // ESTADO que bloquea: con un SKU ya tomado el botón Guardar
+                // queda deshabilitado, y el aviso sigue siendo el caso hasta
+                // que se corrija. `destructive` deriva el mismo role="alert"
+                // asertivo que el `<span role="alert">` escribía a mano.
+                <Alert variant="destructive" className="text-xs">
                   Este SKU ya existe en otro producto.
-                </span>
+                </Alert>
               ) : null}
             </Label>
             <Label htmlFor="product-name" className={labelClass}>
@@ -518,9 +522,9 @@ export function InventoryClient(props: InventoryClientProps) {
               />
             </Label>
             {error ? (
-              <p role="alert" className={cn(errorClass, "sm:col-span-2")}>
+              <Alert variant="destructive" className="sm:col-span-2">
                 {error}
-              </p>
+              </Alert>
             ) : null}
             <DialogFooter className="sm:col-span-2">
               <Button type="button" variant="outline" onClick={cancelEdit}>
@@ -566,6 +570,8 @@ export function InventoryClient(props: InventoryClientProps) {
                       </SelectItem>
                     ))}
                     {movementProductOptions.length === 0 && (
+                      // VACÍO del filtro: mismo caso que el de la tabla. Texto
+                      // plano, sin `role` y fuera de `Alert`.
                       <p className="px-2 py-1 text-xs text-text-secondary">Sin coincidencias.</p>
                     )}
                   </SelectContent>
@@ -609,9 +615,9 @@ export function InventoryClient(props: InventoryClientProps) {
                 />
               </Label>
               {error ? (
-                <p role="alert" className={cn(errorClass, "sm:col-span-2")}>
+                <Alert variant="destructive" className="sm:col-span-2">
                   {error}
-                </p>
+                </Alert>
               ) : null}
               <DialogFooter className="sm:col-span-2">
                 <Button type="button" variant="outline" onClick={cancelMovement}>
@@ -638,6 +644,8 @@ export function InventoryClient(props: InventoryClientProps) {
             </Button>
           </div>
           {kardex.rows.length === 0 ? (
+            // VACÍO del kardex: mismo criterio que los otros dos. Texto plano,
+            // sin anuncio que agregar.
             <p className="mt-3 text-sm text-text-tertiary">Sin movimientos registrados.</p>
           ) : (
             <div className="mt-3 overflow-x-auto">
