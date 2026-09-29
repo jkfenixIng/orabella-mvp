@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, type FormEvent, type ReactNode } from "react";
+import { toast } from "sonner";
 import {
   approveVoucherAction,
   listVouchersAction,
@@ -20,15 +21,14 @@ import {
   DialogTitle,
 } from "@/src/components/ui/lib/dialog";
 import { Combobox } from "@/src/components/ui/lib/combobox";
+import { Alert } from "@/src/components/ui/lib/alert";
 import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 import { cn } from "@/src/components/ui/lib/utils";
 import {
   buttonClass,
-  errorClass,
   ghostClass,
   inputClass,
   labelClass,
-  okClass,
   sectionClass,
   tableCellClass,
   tableHeaderClass,
@@ -103,7 +103,10 @@ interface VouchersClientProps {
 export function VouchersClient(props: VouchersClientProps) {
   const [vouchers, setVouchers] = useState<VoucherRequestRow[]>(props.initialVouchers);
   const [settings] = useState<VoucherSettingsRow | null>(props.initialSettings);
-  const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  // Un solo canal de ESTADO: lo que sigue siendo el caso mientras no se
+  // corrija (fallo de acción o validación incompleta). Lo que acaba de pasar
+  // (éxito) es EVENTO y sale por `toast`, no por estado.
+  const [error, setError] = useState<string | null>(null);
   const [voucherEmployee, setVoucherEmployee] = useState("");
   const [voucherAmount, setVoucherAmount] = useState("");
   const [voucherMethod, setVoucherMethod] = useState("");
@@ -155,10 +158,18 @@ export function VouchersClient(props: VouchersClientProps) {
 
   function show<T>(result: ActionResult<T>, okText?: string): result is { success: true; data: T } {
     if (!result.success) {
-      setMessage({ kind: "error", text: `${result.code}: ${result.message}` });
+      // El fallo de una acción es ESTADO: deja el mensaje en la vista,
+      // persistente mientras el problema exista.
+      setError(`${result.code}: ${result.message}`);
       return false;
     }
-    if (okText) setMessage({ kind: "ok", text: okText });
+    if (okText) {
+      // El éxito de una acción es EVENTO: acaba de pasar y no tiene que
+      // quedarse en pantalla compitiendo con lo que sí importa. Antes era un
+      // <p role="status"> que persistía hasta la siguiente acción. El texto es
+      // el mismo.
+      toast.success(okText);
+    }
     return true;
   }
 
@@ -194,11 +205,11 @@ export function VouchersClient(props: VouchersClientProps) {
     event.preventDefault();
     const amount = toNumber(voucherAmount);
     if (!voucherEmployee || amount === null) {
-      setMessage({ kind: "error", text: "Elija el empleado e indique un monto mayor a 0." });
+      setError("Elija el empleado e indique un monto mayor a 0.");
       return;
     }
     if (!voucherMethod) {
-      setMessage({ kind: "error", text: "Elija el método de pago por el que saldrá el dinero." });
+      setError("Elija el método de pago por el que saldrá el dinero.");
       return;
     }
     setBusy(true);
@@ -243,7 +254,7 @@ export function VouchersClient(props: VouchersClientProps) {
 
   async function handleReject(id: string) {
     if (!rejectReason.trim()) {
-      setMessage({ kind: "error", text: "El motivo del rechazo es requerido." });
+      setError("El motivo del rechazo es requerido.");
       return;
     }
     setBusy(true);
@@ -258,7 +269,7 @@ export function VouchersClient(props: VouchersClientProps) {
   }
 
   function openReview(id: string, action: "approve" | "reject") {
-    setMessage(null);
+    setError(null);
     setReviewError(null);
     setReviewNote("");
     setRejectReason("");
@@ -300,10 +311,12 @@ export function VouchersClient(props: VouchersClientProps) {
 
   return (
     <div className="flex flex-col gap-6">
-      {message && (
-        <p role={message.kind === "error" ? "alert" : "status"} className={message.kind === "error" ? errorClass : okClass}>
-          {message.text}
-        </p>
+      {error && (
+        // Fallo de acción o validación incompleta = ESTADO: sigue siendo el
+        // caso mientras no se corrija, así que va inline y persistente arriba
+        // del listado. `destructive` deriva role="alert" (asertivo), el mismo
+        // rol que la rama de error escribía a mano.
+        <Alert variant="destructive">{error}</Alert>
       )}
 
       <section className={sectionClass}>
@@ -333,7 +346,7 @@ export function VouchersClient(props: VouchersClientProps) {
               }
               disabled={!configured || shiftBlockReason !== null}
               onClick={() => {
-                setMessage(null);
+                setError(null);
                 setIsCreateOpen(true);
               }}
               className={`${buttonClass} disabled:cursor-not-allowed disabled:opacity-50`}
@@ -343,14 +356,20 @@ export function VouchersClient(props: VouchersClientProps) {
           )}
         </div>
         {!configured && (
-          <p role="status" className="mt-3 rounded-md bg-warning-light px-3 py-2 text-sm font-medium text-warning">
+          // ESTADO que bloquea la acción primaria: sin topes no se puede
+          // solicitar. Persistente y deliberadamente `warning` — no es un
+          // fallo sino una precondición pendiente, y conserva el par de
+          // tokens que el marcado ya usaba (bg-warning-light + text-warning).
+          <Alert variant="warning" className="mt-3">
             Los vales no están configurados: un administrador debe definir topes y días permitidos antes de solicitar.
-          </p>
+          </Alert>
         )}
         {props.canIssue && configured && shiftBlockReason !== null && (
-          <p role="status" className="mt-3 rounded-md bg-warning-light px-3 py-2 text-sm font-medium text-warning">
+          // Mismo caso que el anterior: sin caja abierta (o con la caja de
+          // otro) la solicitud está bloqueada hasta que se resuelva.
+          <Alert variant="warning" className="mt-3">
             {shiftBlockReason}
-          </p>
+          </Alert>
         )}
         {props.canIssue && (
           <Dialog
@@ -400,9 +419,13 @@ export function VouchersClient(props: VouchersClientProps) {
                   />
                 </label>
                 {props.initialMethods.length === 0 && (
-                  <p role="status" className={errorClass}>
+                  // ESTADO dentro del formulario: sin métodos arqueables no hay
+                  // método que elegir, así que no se puede enviar la solicitud.
+                  // `destructive` porque es un error de configuración, no un
+                  // aviso, y es el par de tokens que ya usaba (text-error).
+                  <Alert variant="destructive">
                     No hay métodos de pago arqueables activos: configúrelos antes de solicitar vales.
-                  </p>
+                  </Alert>
                 )}
                 <label className={labelClass}>
                   Observación (opcional)
@@ -464,8 +487,10 @@ export function VouchersClient(props: VouchersClientProps) {
           </label>
         </div>
         {vouchers.length === 0 ? (
+          // VACÍO: el estado base de la lista.
           <p className="mt-4 text-sm text-text-tertiary">Sin vales todavía.</p>
         ) : filteredVouchers.length === 0 ? (
+          // VACÍO con filtros puestos: mismo caso que arriba.
           <p className="mt-4 text-sm text-text-tertiary">Sin vales para estos filtros.</p>
         ) : (
           <div className="mt-4 overflow-x-auto">
@@ -510,7 +535,7 @@ export function VouchersClient(props: VouchersClientProps) {
                         <button
                           type="button"
                           onClick={() => {
-                            setMessage(null);
+                            setError(null);
                             setDetailTarget(row);
                           }}
                           className={ghostClass}
@@ -604,9 +629,9 @@ export function VouchersClient(props: VouchersClientProps) {
                   </label>
                 )}
                 {reviewError && (
-                  <p role="alert" className={errorClass}>
-                    {reviewError}
-                  </p>
+                  // ESTADO del modal: el motivo falta mientras el campo siga
+                  // vacío, así que no es un aviso efímero.
+                  <Alert variant="destructive">{reviewError}</Alert>
                 )}
                 <DialogFooter>
                   <button type="button" className={ghostClass} onClick={closeReview}>
