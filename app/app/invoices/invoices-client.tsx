@@ -62,15 +62,13 @@ import {
   Trash2,
 } from "lucide-react";
 import { cn } from "@/src/components/ui/lib/utils";
-import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import type { ActionResult } from "@/src/shared/lib/api-response";
+import { toNumber } from "@/src/shared/lib/format";
 
 const inputClass = cn(
   "flex h-10 w-full rounded-lg border border-color bg-surface px-3 text-sm text-text-primary outline-none transition-colors duration-200 placeholder:text-text-tertiary focus:border-primary-600 focus:ring-2 focus:ring-primary-600/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-border-color dark:bg-surface dark:text-text-primary",
 );
-
-type ActionResult<T> =
-  | { success: true; data: T }
-  | { success: false; code: string; message: string };
 
 /** Modo de comisión de una línea (espejo del enum del backend, migración 030). */
 type CommissionMode = "comision" | "porcentaje" | "ninguna";
@@ -210,23 +208,6 @@ function CommissionModeSelector(props: {
       ))}
     </div>
   );
-}
-
-function toNumber(value: string): number | null {
-  const trimmed = value.trim();
-  if (trimmed === "") return null;
-  const parsed = Number(trimmed);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function formatMoney(value: number | string | null | undefined): string {
-  const numeric = typeof value === "string" ? Number(value) : value;
-  if (numeric == null || !Number.isFinite(numeric)) return "—";
-  return new Intl.NumberFormat("es-CO", {
-    style: "currency",
-    currency: "COP",
-    maximumFractionDigits: 0,
-  }).format(numeric);
 }
 
 /**

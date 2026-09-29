@@ -19,7 +19,9 @@ import {
   DialogTitle,
 } from "@/src/components/ui/lib/dialog";
 import { cn } from "@/src/components/ui/lib/utils";
-import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import type { ActionResult } from "@/src/shared/lib/api-response";
+import { toNumber } from "@/src/shared/lib/format";
 import {
   inputClass,
   labelClass,
@@ -27,28 +29,6 @@ import {
   tableHeaderClass,
   tableRowClass,
 } from "@/src/shared/lib/ui-styles";
-
-type ActionResult<T> =
-  | { success: true; data: T }
-  | { success: false; code: string; message: string };
-
-function toNumber(value: string): number | null {
-  const trimmed = value.trim();
-  if (trimmed === "") return null;
-  const parsed = Number(trimmed);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function formatMoney(value: number | string | null): string {
-  if (value === null || value === undefined) return "—";
-  const numeric = typeof value === "string" ? Number(value) : value;
-  if (!Number.isFinite(numeric)) return "—";
-  return new Intl.NumberFormat("es-CO", {
-    style: "currency",
-    currency: "COP",
-    maximumFractionDigits: 0,
-  }).format(numeric);
-}
 
 function emptyForm() {
   return {

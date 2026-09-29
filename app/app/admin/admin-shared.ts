@@ -2,29 +2,19 @@ import type { RoleCode } from "@/src/features/auth/schemas";
 
 /**
  * Tipos y utilidades compartidas por las secciones del panel admin.
+ *
+ * Reexporta los helpers canónicos de `src/shared/lib` (mismo patrón que
+ * `admin-styles.ts`) para que las secciones sigan importando desde acá sin
+ * volver a declararlos. El hogar de cada uno es el módulo compartido.
+ *
+ * Se reexporta NOMBRE POR NOMBRE y no `export *`: `api-response.ts` importa
+ * `next/server` y las secciones del panel son componentes cliente
+ * (`"use client"`), así que un `export *` arrastraría el módulo de servidor al
+ * bundle del navegador.
  */
-
-export type ActionResult<T> =
-  | { success: true; data: T }
-  | { success: false; code: string; message: string };
-
-export function toNumber(value: string): number | null {
-  const trimmed = value.trim();
-  if (trimmed === "") return null;
-  const parsed = Number(trimmed);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-export function formatMoney(value: number | string | null): string {
-  if (value === null || value === undefined) return "—";
-  const numeric = typeof value === "string" ? Number(value) : value;
-  if (!Number.isFinite(numeric)) return "—";
-  return new Intl.NumberFormat("es-CO", {
-    style: "currency",
-    currency: "COP",
-    maximumFractionDigits: 0,
-  }).format(numeric);
-}
+export type { ActionResult } from "@/src/shared/lib/api-response";
+export { toNumber } from "@/src/shared/lib/format";
+export { formatMoney } from "@/src/shared/lib/money";
 
 /** Roles asignables desde el panel; compartido por empleados y usuarios. */
 export const ROLE_OPTIONS: Array<{ value: RoleCode; label: string }> = [

@@ -36,6 +36,9 @@ import {
   tableHeaderClass,
   tableRowClass,
 } from "@/src/shared/lib/ui-styles";
+import type { ActionResult } from "@/src/shared/lib/api-response";
+import { toNumber } from "@/src/shared/lib/format";
+import { formatMoney } from "@/src/shared/lib/money";
 
 /** Acción destructiva (borrar borrador): contorno y texto en rojo, separada de las demás. */
 const dangerOutlineClass = cn(
@@ -48,28 +51,6 @@ const tableInputClass = cn(
   "w-28 rounded-md border border-border-color bg-surface px-2 py-1 text-right text-sm text-text-primary shadow-sm",
   "dark:border-border-color-2",
 );
-
-type ActionResult<T> =
-  | { success: true; data: T }
-  | { success: false; code: string; message: string };
-
-function formatMoney(value: number | string | null): string {
-  if (value === null || value === undefined) return "-";
-  const numeric = typeof value === "string" ? Number(value) : value;
-  if (!Number.isFinite(numeric)) return "-";
-  return new Intl.NumberFormat("es-CO", {
-    style: "currency",
-    currency: "COP",
-    maximumFractionDigits: 0,
-  }).format(numeric);
-}
-
-function toNumber(value: string): number | null {
-  const trimmed = value.trim();
-  if (trimmed === "") return null;
-  const parsed = Number(trimmed);
-  return Number.isFinite(parsed) ? parsed : null;
-}
 
 /** Etiquetas del tipo de pago del empleado (ADM-08: fijo, porcentaje o mixto). */
 const PAY_TYPE_LABELS: Record<string, string> = {

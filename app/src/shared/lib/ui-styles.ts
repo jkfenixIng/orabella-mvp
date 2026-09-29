@@ -30,8 +30,6 @@ export const sectionClass = cn(
   "dark:border-border-color-2",
 );
 
-export const errorClass = cn("text-sm text-error dark:text-error");
-export const okClass = cn("text-sm text-success dark:text-success");
 export const mutedTextClass = cn("text-sm text-text-secondary");
 export const hintTextClass = cn("text-xs text-text-tertiary");
 

@@ -28,7 +28,9 @@ import {
   DialogTitle,
 } from "@/src/components/ui/lib/dialog";
 import { cn } from "@/src/components/ui/lib/utils";
-import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import type { ActionResult } from "@/src/shared/lib/api-response";
+import { formatDateTime } from "@/src/shared/lib/format";
 import { HISTORY_PAGE_SIZE } from "@/src/features/cash/schemas";
 import {
   buttonClass,
@@ -46,10 +48,6 @@ import { ArrowLeftRight, Banknote, Coins, CreditCard, Wallet, Zap } from "lucide
 // Celdas de la tabla de turnos: la base compartida más el no-wrap que
 // necesitan las columnas estrechas (fechas, montos y estados).
 const shiftCellClass = cn(tableCellClass, "whitespace-nowrap");
-
-type ActionResult<T> =
-  | { success: true; data: T }
-  | { success: false; code: string; message: string };
 
 // Misma tabla para vista del día e historial: mismas columnas siempre.
 function ShiftsTable({
@@ -216,27 +214,6 @@ function ShiftsTable({
       )}
     </>
   );
-}
-
-function formatMoney(value: number | string | null): string {
-  if (value === null || value === undefined) return "-";
-  const numeric = typeof value === "string" ? Number(value) : value;
-  if (!Number.isFinite(numeric)) return "-";
-  return new Intl.NumberFormat("es-CO", {
-    style: "currency",
-    currency: "COP",
-    maximumFractionDigits: 0,
-  }).format(numeric);
-}
-
-function formatDateTime(value: string | null): string {
-  if (!value) return "-";
-  return new Date(value).toLocaleString("es-CO", {
-    day: "2-digit",
-    month: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
 }
 
 // Brand badge as inline SVG (no external assets): rounded square in the

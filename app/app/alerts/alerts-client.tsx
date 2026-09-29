@@ -16,35 +16,13 @@ import {
   mutedTextClass,
   sectionClass,
 } from "@/src/shared/lib/ui-styles";
+import type { ActionResult } from "@/src/shared/lib/api-response";
+import { formatDateTime } from "@/src/shared/lib/format";
+import { formatMoney } from "@/src/shared/lib/money";
 
 // Separador de la lista de alertas: no es tabla, pero comparte los tokens
 // de borde del estándar.
 const alertItemClass = cn("border-t border-border-color pt-2", "dark:border-border-color-2");
-
-type ActionResult<T> =
-  | { success: true; data: T }
-  | { success: false; code: string; message: string };
-
-function formatMoney(value: number | string | null | undefined): string {
-  if (value === null || value === undefined) return "—";
-  const numeric = typeof value === "string" ? Number(value) : value;
-  if (!Number.isFinite(numeric)) return "—";
-  return new Intl.NumberFormat("es-CO", {
-    style: "currency",
-    currency: "COP",
-    maximumFractionDigits: 0,
-  }).format(numeric);
-}
-
-function formatDateTime(value: string | null): string {
-  if (!value) return "—";
-  return new Date(value).toLocaleString("es-CO", {
-    day: "2-digit",
-    month: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
 
 function mismatchParts(items: unknown): string {
   if (!Array.isArray(items) || items.length === 0) return "";
