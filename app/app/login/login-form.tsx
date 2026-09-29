@@ -2,6 +2,8 @@
 
 import { useState, type FormEvent } from "react";
 
+import { Alert } from "@/src/components/ui/lib/alert";
+
 type Step = "login" | "force-change" | "done";
 
 async function postJson(path: string, body: unknown) {
@@ -123,9 +125,13 @@ export function LoginForm({ next }: { next?: string }) {
             />
           </label>
           {error ? (
-            <p role="alert" className="text-sm text-error">
-              {error}
-            </p>
+            // ESTADO CONFIRMADO, no derivado en vivo: el desajuste de la
+            // confirmación se detecta al enviar el formulario, no mientras se
+            // escribe (no hay validación por tecleo en este archivo). Es el
+            // desenlace de una acción enviada, así que `destructive` deriva
+            // role="alert" asertivo —el mismo anuncio que el `<p>` escribía— y
+            // queda al lado del campo que hay que corregir.
+            <Alert variant="destructive">{error}</Alert>
           ) : null}
           <button
             type="submit"
@@ -164,9 +170,12 @@ export function LoginForm({ next }: { next?: string }) {
         />
       </label>
       {error ? (
-        <p role="alert" className="text-sm text-error">
-          {error}
-        </p>
+        // Mismo caso que el error del cambio forzado: la credencial rechazada
+        // es el desenlace de una acción ENVIADA (el navegador ya frena el envío
+        // vacío con `required`), no algo que se calcule mientras se teclea. Va
+        // como estado confirmado, y `destructive` conserva el anuncio asertivo
+        // que el `role="alert"` escribía a mano.
+        <Alert variant="destructive">{error}</Alert>
       ) : null}
       <button
         type="submit"
