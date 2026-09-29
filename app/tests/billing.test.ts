@@ -32,6 +32,7 @@ import {
   BillingError,
   annulInvoice,
   editEmittedInvoiceItems,
+  getInvoiceDetail,
   type BillingActor,
 } from "@/src/features/billing/service";
 import {
@@ -39,6 +40,7 @@ import {
   resolveEmployeeLineCommission,
   type RuleRate,
 } from "@/src/features/commissions/schemas";
+import { IN_FILTER_CHUNK_SIZE } from "@/src/shared/lib/paged";
 import { buildEmployeeCommissionDetail } from "@/src/features/payroll/schemas";
 
 const EMPLOYEE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -1245,6 +1247,20 @@ const annulStub = vi.hoisted(() => ({
 }));
 
 /**
+ * U7: la comisión que MUESTRA la pantalla de la factura vs. la que paga la
+ * nómina. Solo el bloque de U7 redefine la línea y mira los lotes de ids.
+ */
+const commissionStub = vi.hoisted(() => ({
+  /**
+   * Línea(s) de `invoice_items` del detalle; null = la línea de siempre. Lo usa
+   * el bloque U7 (comisión mostrada vs. comisión pagada).
+   */
+  items: null as Array<Record<string, unknown>> | null,
+  /** Largo de cada `in(...)` sobre `commission_rules`: prueba el troceo (414). */
+  inSizes: [] as number[],
+}));
+
+/**
  * Total emitido ANTES del ajuste (la línea vale lo mismo). 300.000 con un cobro
  * de 200.000 es el caso REAL: factura Emitida cobrada a medias (saldo 100.000),
  * no una Emitida ya completa (esa la cierra el cobro cuando cubre el neto).
@@ -1374,6 +1390,7 @@ function createOverCollectionStubClient(): unknown {
       case "products":
         return { data: annulStub.product, error: null };
       case "invoice_items":
+        if (commissionStub.items) return { data: commissionStub.items, error: null };
         return { data: annulStub.active && annulStub.items ? annulStub.items : [stubItemRow()], error: null };
       case "invoice_taxes":
         return { data: [], error: null };
@@ -1499,6 +1516,7 @@ function createOverCollectionStubClient(): unknown {
         return query;
       },
       in: (column: string, values: readonly unknown[]) => {
+        if (table === "commission_rules") commissionStub.inSizes.push(values.length);
         const set = new Set(values);
         filters.push((row) => set.has(row[column]));
         return query;
@@ -2072,6 +2090,179 @@ describe("billing: la anulación respeta el candado de nómina y guarda el estad
     expect(outcome).toMatchObject({ code: "ANNUL_INVALID", status: 409 });
     expect(overCollectionStub.writes).toEqual([]);
     expect(annulStub.guards).toEqual([]);
+  });
+});
+
+// ---------- U7: la comisión que se MUESTRA es la que la nómina PAGA ----------
+//
+// `loadCommissionRulesByEmployee` leía con `.limit(5000)`, y el `max-rows` del
+// Data API sirve 1000 filas por request: pasadas 1000 reglas, la pantalla de la
+// factura caía al porcentaje plano del empleado mientras la nómina —que SÍ lee
+// todas las reglas— pagaba la regla. Dos cifras de la misma plata que no cuadran.
+// Acá la línea de la factura es comisionable y la regla que la resuelve está
+// DESPUÉS del tope, así que la divergencia se puede medir sin base de datos.
+
+describe("billing: la comisión mostrada no se corta con las reglas (U7)", () => {
+  const ITEM_SUBTOTAL = 100000;
+  /** Comisión que la pantalla muestra si le falta la regla (5% plano). */
+  const FLAT_PERCENT = 5;
+  /** Comisión que la nómina paga con la regla ítem×empleado (10%). */
+  const RULE_PERCENT = 10;
+  const RULE_COMMISSION = (ITEM_SUBTOTAL * RULE_PERCENT) / 100;
+  const FLAT_COMMISSION = (ITEM_SUBTOTAL * FLAT_PERCENT) / 100;
+
+  /** Línea comisionable de la factura: producto con regla ítem×empleado. */
+  function commissionableItem(employeeId: string, index: number): Record<string, unknown> {
+    return {
+      id: `linea-${String(index).padStart(5, "0")}`,
+      invoice_id: overCollectionStub.INVOICE_ID,
+      item_type: "producto",
+      product_id: PRODUCT_ID,
+      service_id: null,
+      custom_name: null,
+      employee_id: employeeId,
+      qty: 1,
+      unit_price: ITEM_SUBTOTAL,
+      discount: 0,
+      subtotal: ITEM_SUBTOTAL,
+      no_commission: false,
+      commission_value: null,
+      commission_mode: "porcentaje",
+      commission_percent_override: null,
+      created_at: "2026-01-01T00:00:00.000Z",
+      employees: {
+        full_name: "Ana Pérez",
+        employee_code: "E-1",
+        commission_percent: FLAT_PERCENT,
+        pay_type: "porcentaje",
+        payout_mode: "normal",
+      },
+    };
+  }
+
+  /** Regla de comisión activa de la sede (el `id` da el orden determinista). */
+  function ruleRow(index: number, employeeId: string, percent: number): Record<string, unknown> {
+    return {
+      id: `regla-${String(index).padStart(5, "0")}`,
+      sede_id: overCollectionStub.SEDE_ID,
+      employee_id: employeeId,
+      item_type: "producto",
+      item_id: PRODUCT_ID,
+      percent,
+      amount: null,
+      is_active: true,
+    };
+  }
+
+  beforeEach(() => {
+    overCollectionStub.payments = [];
+    overCollectionStub.invoiceUpdate = null;
+    overCollectionStub.writes.length = 0;
+    overCollectionStub.unexpectedQueries.length = 0;
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+    commissionStub.items = null;
+    commissionStub.inSizes.length = 0;
+  });
+
+  afterEach(() => {
+    pagedStub.tables = {};
+    commissionStub.items = null;
+    commissionStub.inSizes.length = 0;
+  });
+
+  it("una regla más allá del tope por request se usa igual (misma cifra que la nómina)", async () => {
+    const RULES = 1200;
+    commissionStub.items = [commissionableItem(EMPLOYEE_ID, 1)];
+    // Reglas de OTRO ítem llenan la tabla; la que resuelve esta línea es la
+    // última, o sea la que el tope por request deja afuera.
+    pagedStub.tables.commission_rules = [
+      ...Array.from({ length: RULES - 1 }, (_, index) => ruleRow(index + 1, EMPLOYEE_ID, 0)),
+      { ...ruleRow(RULES, EMPLOYEE_ID, RULE_PERCENT), item_id: PRODUCT_ID },
+    ];
+    // Non-vacuidad del fixture: hay más reglas que el tope por request.
+    expect(pagedStub.tables.commission_rules).toHaveLength(RULES);
+    expect(RULES).toBeGreaterThan(pagedStub.rowCap);
+    // Y el 5% plano NO es lo que da la regla: las dos cifras se distinguen.
+    expect(FLAT_COMMISSION).not.toBe(RULE_COMMISSION);
+
+    const detail = await getInvoiceDetail(
+      overCollectionStub.SEDE_ID,
+      overCollectionStub.INVOICE_ID,
+    );
+
+    // La regla que la nómina usa es la que se muestra: 10% de 100.000 = 10.000.
+    expect(detail.items).toHaveLength(1);
+    expect(detail.items[0].commission_amount).toBe(RULE_COMMISSION);
+  });
+
+  it("las reglas se piden por páginas y en orden determinista", async () => {
+    const RULES = 1200;
+    commissionStub.items = [commissionableItem(EMPLOYEE_ID, 1)];
+    pagedStub.tables.commission_rules = Array.from({ length: RULES }, (_, index) =>
+      ruleRow(index + 1, EMPLOYEE_ID, RULE_PERCENT),
+    );
+
+    await getInvoiceDetail(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID);
+
+    const ruleWindows = pagedStub.windows.filter((window) => window.table === "commission_rules");
+    expect(ruleWindows.length).toBeGreaterThan(1);
+    expect(ruleWindows[0]).toEqual({
+      table: "commission_rules",
+      from: 0,
+      to: 999,
+      order: ["id"],
+    });
+    expect(ruleWindows.some((window) => window.from > 0)).toBe(true);
+    for (const window of ruleWindows) expect(window.order).toEqual(["id"]);
+  });
+
+  it("los ids de los empleados van en lotes que aguantan la URL (414)", async () => {
+    const EMPLOYEES = 150;
+    commissionStub.items = Array.from({ length: EMPLOYEES }, (_, index) =>
+      commissionableItem(`empleado-${String(index + 1).padStart(5, "0")}`, index + 1),
+    );
+    pagedStub.tables.commission_rules = [];
+
+    await getInvoiceDetail(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID);
+
+    // Más de un lote: 150 ids no entran en una sola URL.
+    expect(commissionStub.inSizes.length).toBeGreaterThan(1);
+    expect(Math.max(...commissionStub.inSizes)).toBeLessThanOrEqual(IN_FILTER_CHUNK_SIZE);
+    expect(commissionStub.inSizes.reduce((acc, size) => acc + size, 0)).toBe(EMPLOYEES);
+  });
+
+  it("control negativo: una factura chica se resuelve igual (una lectura, un lote)", async () => {
+    commissionStub.items = [commissionableItem(EMPLOYEE_ID, 1)];
+    pagedStub.tables.commission_rules = [ruleRow(1, EMPLOYEE_ID, RULE_PERCENT)];
+
+    const detail = await getInvoiceDetail(
+      overCollectionStub.SEDE_ID,
+      overCollectionStub.INVOICE_ID,
+    );
+
+    expect(detail.items[0].commission_amount).toBe(RULE_COMMISSION);
+    expect(commissionStub.inSizes).toEqual([1]);
+    expect(pagedStub.windows.filter((window) => window.table === "commission_rules")).toEqual([
+      { table: "commission_rules", from: 0, to: 999, order: ["id"] },
+    ]);
+  });
+
+  it("si la lectura de reglas no se completa, el detalle falla a la vista", async () => {
+    commissionStub.items = [commissionableItem(EMPLOYEE_ID, 1)];
+    pagedStub.tables.commission_rules = [ruleRow(1, EMPLOYEE_ID, RULE_PERCENT)];
+    pagedStub.failAt = { commission_rules: [1] };
+
+    const failure: unknown = await getInvoiceDetail(
+      overCollectionStub.SEDE_ID,
+      overCollectionStub.INVOICE_ID,
+    ).catch((error: unknown) => error);
+
+    // Nunca una comisión calculada con lo que se alcanzó a leer.
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "READ_INCOMPLETE" });
   });
 });
 

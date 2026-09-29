@@ -49,7 +49,7 @@ import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
 import {
   AdminError,
   getEmployee,
-  listEmployees,
+  listAllEmployees,
   listPaymentMethods,
 } from "@/src/features/admin/service";
 import { resolveVoucherAlert } from "@/src/features/alerts/service";
@@ -199,7 +199,7 @@ function toPayrollError(error: unknown): PayrollError {
   if (error instanceof PagedReadError) {
     return new PayrollError(
       error.code,
-      `${error.message} El cálculo se detuvo: con una lectura incompleta las comisiones y los vales saldrían mal. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+      `${error.message} La operación se detuvo: con una lectura incompleta las cifras de nómina (comisiones, vales y pagado) saldrían mal. Reintente y, si persiste, revise el volumen de datos de la sede.`,
       500,
     );
   }
@@ -480,42 +480,76 @@ export interface PeriodDetail {
 /**
  * PAY-02/PAY-04: periodo con sus ítems y el saldo de cada uno
  * (pagado = suma de porciones, restante = neto − pagado).
+ *
+ * U7: las dos lecturas son exhaustivas. Antes los ítems se leían con
+ * `.order("created_at")` y sin tope explícito —el `max-rows` del Data API los
+ * recortaba a 1000— y los pagos con un `in(...)` de todos los ids de una sola
+ * vez. El `paid`/`remaining` que se muestra es plata: una lectura recortada
+ * mostraba menos líneas de las que tiene el período y menos pagado del real
+ * (plata ya entregada que parece debida). El fallo de cualquiera de las dos
+ * lecturas se convierte en un error de negocio a la vista, nunca en una cifra
+ * calculada con lo que se alcanzó a leer.
  */
 export async function getPeriodDetail(sedeId: string, id: string): Promise<PeriodDetail> {
-  const db = await payrollDb();
-  const period = await getPeriodOrThrow(db, sedeId, id);
-  const { data: items, error: itemsError } = await db
-    .from("payroll_items")
-    .select(ITEM_SELECT)
-    .eq("period_id", id)
-    .order("created_at");
-  if (itemsError) throw new PayrollError("INTERNAL", "Error interno.", 500);
-  const rows = (items ?? []) as PayrollItemRow[];
-  let paidByItem = new Map<string, number>();
-  if (rows.length > 0) {
-    const { data: payments, error: paymentsError } = await db
-      .from("payroll_payments")
-      .select("payroll_item_id, amount")
-      .in(
-        "payroll_item_id",
-        rows.map((row) => row.id),
-      );
-    if (paymentsError) throw new PayrollError("INTERNAL", "Error interno.", 500);
-    paidByItem = new Map();
-    for (const row of (payments ?? []) as Array<{ payroll_item_id: string; amount: number | string }>) {
-      paidByItem.set(
-        row.payroll_item_id,
-        roundMoney((paidByItem.get(row.payroll_item_id) ?? 0) + Number(row.amount)),
-      );
+  try {
+    const db = await payrollDb();
+    const period = await getPeriodOrThrow(db, sedeId, id);
+    // `created_at` es el orden de presentación; `id` lo desempata para que dos
+    // ítems con el mismo timestamp no caigan en páginas distintas.
+    const rows = await readAllPayroll<PayrollItemRow>({
+      log: "getPeriodDetail",
+      what: "ítems del período",
+      meta: { periodId: id },
+      table: "payroll_items",
+      fetchPage: (from, to) =>
+        db
+          .from("payroll_items")
+          .select(ITEM_SELECT)
+          .eq("period_id", id)
+          .order("created_at")
+          .order("id")
+          .range(from, to),
+    });
+    let paidByItem = new Map<string, number>();
+    if (rows.length > 0) {
+      // U7: los ids van en lotes del tamaño que aguanta la URL (una lista sin
+      // tope termina en 414 y la lectura no ocurre) y cada lote se pagina hasta
+      // agotar, con `order("id")` para que dos corridas lean lo mismo.
+      paidByItem = new Map();
+      for (const chunk of chunkIds(rows.map((row) => row.id))) {
+        const payments = await readAllPayroll<{ payroll_item_id: string; amount: number | string }>({
+          log: "getPeriodDetail",
+          what: "pagos del período",
+          meta: { periodId: id, items: rows.length, ids: chunk.length },
+          table: "payroll_payments",
+          fetchPage: (from, to) =>
+            db
+              .from("payroll_payments")
+              .select("payroll_item_id, amount")
+              .in("payroll_item_id", chunk)
+              .order("id")
+              .range(from, to),
+        });
+        for (const row of payments) {
+          paidByItem.set(
+            row.payroll_item_id,
+            roundMoney((paidByItem.get(row.payroll_item_id) ?? 0) + Number(row.amount)),
+          );
+        }
+      }
     }
+    return {
+      period,
+      items: rows.map((item) => {
+        const paid = paidByItem.get(item.id) ?? 0;
+        return { ...item, paid, remaining: roundMoney(Math.max(0, Number(item.net_pay) - paid)) };
+      }),
+    };
+  } catch (error) {
+    // "No se pudo leer" no puede llegar como INTERNAL genérico: el código
+    // READ_INCOMPLETE y la tabla/fila donde se cortó son lo accionable.
+    throw toPayrollError(error);
   }
-  return {
-    period,
-    items: rows.map((item) => {
-      const paid = paidByItem.get(item.id) ?? 0;
-      return { ...item, paid, remaining: roundMoney(Math.max(0, Number(item.net_pay) - paid)) };
-    }),
-  };
 }
 
 // ------------------------------------------------------------------ cálculo ---
@@ -582,9 +616,12 @@ export async function calculatePayroll(
       throw toPayrollError(error);
     }
 
-    // El cálculo cubre toda la planta activa: límite explícito amplio
-    // (la UI lista con el límite por defecto de 50).
-    const employees = await listEmployees(sedeId, 500).catch((error) => {
+    // La alineación cubre TODA la planta activa de la sede, no el listado de
+    // navegación: U7: antes esto era `listEmployees(sedeId, 500)` y el techo de
+    // `clampLimit` (500) mandaba. El empleado 501 no se liquidaba —ausente, sin
+    // error— y la nómina quedaba firmada como completa. La planta está acotada
+    // por la sede, así que se lee entera por páginas.
+    const employees = await listAllEmployees(sedeId).catch((error) => {
       throw toPayrollError(error);
     });
     const actives = employees.filter((row) => row.is_active);
@@ -1619,6 +1656,44 @@ export async function approveVoucher(
     const observation = parsed.data.observation?.trim()
       ? parsed.data.observation.trim()
       : voucher.observation;
+    // T8: marca si el vale superó topes (reproduce el chequeo de solicitud
+    // descontando el propio vale del acumulado vigente que lo incluye).
+    //
+    // U7: esto se evalúa ANTES de aprobar y su fallo es FATAL. Antes iba después
+    // del UPDATE y dentro de un `catch {}` que dejaba `over_tope: false`: el
+    // registro de auditoría afirmaba "no superó topes" cuando el chequeo NO SE
+    // PUDO EVALUAR —una marca que miente justo en el control de topes—.
+    //
+    // Se eligió el fallo fatal (y no una marca del tipo "no evaluado") porque el
+    // acumulado que decide el tope sale de la MISMA tabla `voucher_requests` que
+    // la aprobación escribe: si esa lectura no se completa, la escritura tampoco
+    // es confiable. Así el vale queda pendiente, el admin reintenta, y la
+    // auditoría solo conoce `true` o `false` verificados. De paso, evaluarlo
+    // antes del UPDATE es lo que hace que rechazar no deje un vale aprobado sin
+    // auditoría ni alerta resuelta.
+    const settings = await getVoucherSettings(sedeId);
+    const totals = await vigenteTotals(
+      db,
+      sedeId,
+      voucher.employee_id,
+      voucher.request_date,
+      settings,
+    ).catch((error) => {
+      throw toPayrollError(error);
+    });
+    const amount = Number(voucher.amount);
+    const caps = checkVoucherCaps({
+      dayTotal: totals.dayTotal - amount,
+      weekTotal: totals.weekTotal - amount,
+      requested: amount,
+      maxPerDay: resolveVoucherDayCap(
+        settings?.max_per_day == null ? null : Number(settings.max_per_day),
+        settings?.per_day_limits ?? null,
+        voucher.request_date,
+      ),
+      maxPerWeek: settings?.max_per_week == null ? null : Number(settings.max_per_week),
+    });
+    const overTope = requiresVoucherApproval(caps);
     const { data, error } = await db
       .from("voucher_requests")
       .update({
@@ -1633,28 +1708,6 @@ export async function approveVoucher(
     const [approved] = await attachVoucherUserNames(db, [
       normalizeVoucher(data as unknown as Record<string, unknown>),
     ]);
-    // T8: marca si el vale superó topes (reproduce el chequeo de solicitud
-    // descontando el propio vale del acumulado vigente que lo incluye).
-    let overTope = false;
-    try {
-      const settings = await getVoucherSettings(sedeId);
-      const totals = await vigenteTotals(db, sedeId, voucher.employee_id, voucher.request_date, settings);
-      const amount = Number(voucher.amount);
-      const caps = checkVoucherCaps({
-        dayTotal: totals.dayTotal - amount,
-        weekTotal: totals.weekTotal - amount,
-        requested: amount,
-        maxPerDay: resolveVoucherDayCap(
-          settings?.max_per_day == null ? null : Number(settings.max_per_day),
-          settings?.per_day_limits ?? null,
-          voucher.request_date,
-        ),
-        maxPerWeek: settings?.max_per_week == null ? null : Number(settings.max_per_week),
-      });
-      overTope = requiresVoucherApproval(caps);
-    } catch {
-      overTope = false;
-    }
     await writeAudit({
       sede_id: sedeId,
       user_id: actor.userId,

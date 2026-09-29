@@ -43,6 +43,7 @@ import {
 import { planStockDeduction } from "@/src/features/inventory/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import {
+  chunkIds,
   IN_FILTER_CHUNK_SIZE,
   PagedReadError,
   readAllPaged,
@@ -484,6 +485,14 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
  * se sigue el mismo criterio: un error real se propaga en vez de degradar a
  * "sin reglas", que reintroduciría justamente la divergencia que este cálculo
  * elimina (mostrar solo el porcentaje plano cuando el pago usa la regla).
+ *
+ * U7: lectura exhaustiva. El `.limit(5000)` de antes no era un tope de negocio
+ * y, peor, el `max-rows` del Data API lo bajaba a 1000: una regla que no se leía
+ * hacía que la pantalla mostrara el porcentaje plano mientras la nómina —que SÍ
+ * lee todas las reglas— pagaba la regla. Dos cifras de la misma plata que no
+ * cuadran. Se pagina hasta agotar, con `order("id")`, y los ids van en lotes del
+ * tamaño que aguanta la URL (una lista sin tope termina en 414 y la lectura no
+ * ocurre).
  */
 async function loadCommissionRulesByEmployee(
   db: DbClient,
@@ -492,27 +501,44 @@ async function loadCommissionRulesByEmployee(
 ): Promise<Map<string, Map<string, RuleRate>>> {
   const byEmployee = new Map<string, Map<string, RuleRate>>();
   if (employeeIds.length === 0) return byEmployee;
-  const { data, error } = await db
-    .from("commission_rules")
-    .select("employee_id, item_type, item_id, percent, amount")
-    .eq("sede_id", sedeId)
-    .eq("is_active", true)
-    .in("employee_id", employeeIds)
-    .limit(5000);
-  if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
-  for (const rule of (data ?? []) as Array<{
-    employee_id: string;
-    item_type: string;
-    item_id: string;
-    percent: number | string | null;
-    amount: number | string | null;
-  }>) {
-    const byItem = byEmployee.get(rule.employee_id) ?? new Map<string, RuleRate>();
-    byItem.set(commissionRuleKey(rule.item_type, rule.item_id), {
-      percent: rule.percent != null ? Number(rule.percent) : null,
-      amount: rule.amount != null ? Number(rule.amount) : null,
-    });
-    byEmployee.set(rule.employee_id, byItem);
+  try {
+    for (const chunk of chunkIds(employeeIds)) {
+      const rules = await readAllPaged<{
+        employee_id: string;
+        item_type: string;
+        item_id: string;
+        percent: number | string | null;
+        amount: number | string | null;
+      }>({
+        table: "commission_rules",
+        fetchPage: (from, to) =>
+          db
+            .from("commission_rules")
+            .select("employee_id, item_type, item_id, percent, amount")
+            .eq("sede_id", sedeId)
+            .eq("is_active", true)
+            .in("employee_id", chunk)
+            .order("id")
+            .range(from, to),
+      });
+      for (const rule of rules) {
+        const byItem = byEmployee.get(rule.employee_id) ?? new Map<string, RuleRate>();
+        byItem.set(commissionRuleKey(rule.item_type, rule.item_id), {
+          percent: rule.percent != null ? Number(rule.percent) : null,
+          amount: rule.amount != null ? Number(rule.amount) : null,
+        });
+        byEmployee.set(rule.employee_id, byItem);
+      }
+    }
+  } catch (error) {
+    // "No se pudo leer" llega como error de negocio con el código accionable:
+    // el mensaje genérico de `toBillingError` habla del candado de nómina, que
+    // no es este camino.
+    throw new BillingError(
+      "READ_INCOMPLETE",
+      `${error instanceof Error ? error.message : "La lectura de commission_rules quedó incompleta."} No se muestra la comisión: con las reglas incompletas la cifra no coincidiría con lo que paga la nómina. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+      500,
+    );
   }
   return byEmployee;
 }

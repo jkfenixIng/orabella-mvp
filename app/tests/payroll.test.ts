@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   approveVoucherSchema,
   assertDeletablePeriod,
@@ -41,11 +41,18 @@ import {
   resolveEmployeeLineCommission,
 } from "@/src/features/commissions/schemas";
 import {
+  approveVoucher,
   calculatePayroll,
+  getPeriodDetail,
   PayrollError,
   type PayrollActor,
 } from "@/src/features/payroll/service";
-import { chunkIds, PagedReadError, readAllPaged } from "@/src/shared/lib/paged";
+import {
+  chunkIds,
+  IN_FILTER_CHUNK_SIZE,
+  PagedReadError,
+  readAllPaged,
+} from "@/src/shared/lib/paged";
 
 // ------------------------------------------------- neto (PAY-02) ---
 
@@ -1033,6 +1040,16 @@ const payrollPagedStub = vi.hoisted(() => ({
   windows: [] as Array<{ table: string; from: number; to: number; order: string[] }>,
   /** Payload del upsert de `payroll_items`: la plata que el servicio persistió. */
   itemsUpsert: null as Array<Record<string, unknown>> | null,
+  /**
+   * Largo de cada `in(...)`: prueba de que los ids se parten (URL de 414).
+   */
+  inFilters: [] as Array<{ table: string; column: string; count: number }>,
+  /** Falla el select de `table` cuando entre sus filtros está `filter`. */
+  failOn: null as { table: string; filter: string } | null,
+  /** Payload de cada INSERT (auditoría y demás): qué se registró de verdad. */
+  inserts: [] as Array<{ table: string; payload: unknown }>,
+  /** Payload de cada UPDATE, por tabla: si la escritura ocurrió o no. */
+  updates: [] as Array<{ table: string; payload: unknown }>,
 }));
 
 /**
@@ -1045,14 +1062,31 @@ function createPayrollPagedStubClient(): unknown {
   const from = (table: string) => {
     let op = "select";
     const filters: Array<(row: Record<string, unknown>) => boolean> = [];
+    /** Columnas filtradas, en orden: identifica QUÉ lectura se está pidiendo. */
+    const filterColumns: string[] = [];
     const orderKeys: Array<{ column: string; ascending: boolean }> = [];
     let rangeFrom = 0;
     let rangeTo = payrollPagedStub.rowCap - 1;
+    let updatePayload: Record<string, unknown> | undefined;
 
     const rows = (): Array<Record<string, unknown>> => payrollPagedStub.tables[table] ?? [];
 
     const select = (single: boolean): { data: unknown; error: unknown } => {
+      if (op === "update") {
+        // PostgREST devuelve las filas que el UPDATE afectó, con el payload ya
+        // aplicado: la aprobación del vale necesita esa fila de vuelta.
+        const matched = rows().filter((row) => filters.every((matches) => matches(row)));
+        for (const row of matched) Object.assign(row, updatePayload ?? {});
+        return { data: single ? matched[0] ?? null : matched, error: null };
+      }
       if (op !== "select") return { data: null, error: null };
+      const failOn = payrollPagedStub.failOn;
+      if (failOn && failOn.table === table && filterColumns.includes(failOn.filter)) {
+        return {
+          data: null,
+          error: { message: `doble: fallo inyectado en ${table} (filtro ${failOn.filter})` },
+        };
+      }
       const index = (payrollPagedStub.requests[table] = (payrollPagedStub.requests[table] ?? 0) + 1);
       if ((payrollPagedStub.failAt[table] ?? []).includes(index)) {
         return { data: null, error: { message: `doble: fallo inyectado en ${table} (request ${index})` } };
@@ -1074,12 +1108,15 @@ function createPayrollPagedStubClient(): unknown {
 
     const query: Record<string, unknown> = {
       select: () => query,
-      insert: () => {
+      insert: (payload?: unknown) => {
         op = "insert";
+        payrollPagedStub.inserts.push({ table, payload });
         return query;
       },
-      update: () => {
+      update: (payload?: unknown) => {
         op = "update";
+        updatePayload = (payload ?? {}) as Record<string, unknown>;
+        payrollPagedStub.updates.push({ table, payload });
         return query;
       },
       upsert: (value?: unknown) => {
@@ -1099,24 +1136,37 @@ function createPayrollPagedStubClient(): unknown {
         return query;
       },
       eq: (column: string, value: unknown) => {
+        filterColumns.push(column);
         filters.push((row) => row[column] === value);
         return query;
       },
       neq: (column: string, value: unknown) => {
+        filterColumns.push(column);
         filters.push((row) => row[column] !== value);
         return query;
       },
       gte: (column: string, value: unknown) => {
+        filterColumns.push(column);
         filters.push((row) => String(row[column] ?? "") >= String(value));
         return query;
       },
       lte: (column: string, value: unknown) => {
+        filterColumns.push(column);
         filters.push((row) => String(row[column] ?? "") <= String(value));
         return query;
       },
       in: (column: string, values: readonly unknown[]) => {
+        filterColumns.push(column);
+        payrollPagedStub.inFilters.push({ table, column, count: values.length });
         const set = new Set(values);
         filters.push((row) => set.has(row[column]));
+        return query;
+      },
+      match: (criteria: Record<string, unknown>) => {
+        for (const [column, value] of Object.entries(criteria)) {
+          filterColumns.push(column);
+          filters.push((row) => row[column] === value);
+        }
         return query;
       },
       order: (column: string, options?: { ascending?: boolean }) => {
@@ -1147,6 +1197,30 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
   createAdminClient: () => createPayrollPagedStubClient(),
 }));
 
+/**
+ * Estado limpio del doble: cada bloque arma sus datos desde cero. (El bloque de
+ * U5 conserva el suyo tal cual: no se toca una prueba existente.)
+ */
+function resetPayrollStubState(): void {
+  payrollPagedStub.tables = {};
+  payrollPagedStub.failAt = {};
+  payrollPagedStub.requests = {};
+  payrollPagedStub.windows.length = 0;
+  payrollPagedStub.itemsUpsert = null;
+  payrollPagedStub.inFilters.length = 0;
+  payrollPagedStub.failOn = null;
+  payrollPagedStub.inserts.length = 0;
+  payrollPagedStub.updates.length = 0;
+}
+
+// Los catálogos de admin/cash son `unstable_cache` (caché de Next). Fuera de un
+// request de Next no hay caché incremental: se usa la función tal cual, así la
+// lectura corre de verdad contra el doble de PostgREST que arma cada test.
+vi.mock("next/cache", () => ({
+  unstable_cache: (fn: unknown) => fn,
+  revalidateTag: () => {},
+}));
+
 vi.mock("@/src/features/admin/service", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/src/features/admin/service")>();
   const employee: Awaited<ReturnType<typeof actual.listEmployees>>[number] = {
@@ -1166,9 +1240,19 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
     commission_percent: 10,
     is_active: true,
   };
+  // La planta: cuando el test SIEMBRA la tabla `employees` la lectura corre de
+  // verdad (con el tope del listado y todo, que es justo lo que hay que probar);
+  // si no, el fixture de un empleado que usan las pruebas de U5.
   return {
     ...actual,
-    listEmployees: async () => [employee] as Awaited<ReturnType<typeof actual.listEmployees>>,
+    listEmployees: async (sedeId: string, limit?: number) =>
+      payrollPagedStub.tables.employees
+        ? actual.listEmployees(sedeId, limit)
+        : ([employee] as Awaited<ReturnType<typeof actual.listEmployees>>),
+    listAllEmployees: async (sedeId: string) =>
+      payrollPagedStub.tables.employees
+        ? actual.listAllEmployees(sedeId)
+        : ([employee] as Awaited<ReturnType<typeof actual.listEmployees>>),
   };
 });
 
@@ -1447,5 +1531,424 @@ describe("paged: la lectura exhaustiva no recorta en silencio (U5)", () => {
     expect(chunkIds(["a", "b", "c"], 2)).toEqual([["a", "b"], ["c"]]);
     expect(chunkIds([], 2)).toEqual([]);
     expect(chunkIds(Array.from({ length: 250 }, (_, index) => String(index)))).toHaveLength(3);
+  });
+});
+
+// ---- U7: los sitios de plata que quedaban con lectura recortada -------------
+//
+// La auditoría que produjo U5 encontró cuatro sitios más de la misma familia:
+//
+//   1. `calculatePayroll` armaba su alineación con `listEmployees(sedeId, 500)`.
+//      El tope no es de la nómina: es `clampLimit(limit, 50, 500)` del listado de
+//      admin, así que el empleado 501 de una sede NO se liquidaba —ausente, sin
+//      un solo error—. Acá se siembra la planta REAL contra el doble de PostgREST
+//      (con el tope del listado puesto) para poder medirlo.
+//   2. `loadCommissionRulesByEmployee` (billing) leía con `.limit(5000)`, que el
+//      `max-rows` del Data API baja a 1000: la pantalla de la factura mostraba el
+//      porcentaje plano donde la nómina —que sí lee todo— paga la regla.
+//   3. `getPeriodDetail` leía los ítems sin tope explícito (→ 1000) y los pagos
+//      con un `in(...)` sin tope ni lotes: el `paid`/`remaining` del período se
+//      mostraba corto (plata ya pagada que parece debida).
+//   4. `approveVoucher` envolvía el chequeo de topes en un `catch {}` que dejaba
+//      `over_tope: false`: la auditoría afirmaba "no superó topes" cuando el
+//      chequeo NO SE PUDO EVALUAR.
+
+describe("payroll: la alineación de la planta se lee completa (U7)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  /** El techo del listado de admin: `clampLimit(limit, 50, 500)`. */
+  const LIST_CAP = 500;
+  /** Cada línea vale 10.000 y el empleado comisiona el 10% => 1.000. */
+  const LINE_SUBTOTAL = 10000;
+  const COMMISSION_PER_EMPLOYEE = 1000;
+
+  function employeeRow(index: number): Record<string, unknown> {
+    const suffix = String(index).padStart(5, "0");
+    return {
+      id: `empleado-${suffix}`,
+      sede_id: payrollPagedStub.SEDE_ID,
+      user_id: null,
+      full_name: `Empleado ${suffix}`,
+      employee_code: `E-${suffix}`,
+      document: `1000${suffix}`,
+      phone: null,
+      position: null,
+      payout_mode: "normal",
+      email: null,
+      birth_date: null,
+      pay_type: "porcentaje",
+      salary_fixed: null,
+      commission_percent: 10,
+      is_active: true,
+    };
+  }
+
+  /** Planta de la sede: un empleado activo y UNA línea comisionable cada uno. */
+  function seedPlant(count: number) {
+    const employees: Array<Record<string, unknown>> = [];
+    const invoices: Array<Record<string, unknown>> = [];
+    const items: Array<Record<string, unknown>> = [];
+    for (let index = 1; index <= count; index += 1) {
+      const suffix = String(index).padStart(5, "0");
+      employees.push(employeeRow(index));
+      invoices.push({
+        id: `factura-${suffix}`,
+        consecutive_number: index,
+        sede_id: payrollPagedStub.SEDE_ID,
+        status: "Emitida",
+        created_at: "2026-01-15T12:00:00.000Z",
+      });
+      items.push({
+        id: `linea-${suffix}`,
+        invoice_id: `factura-${suffix}`,
+        item_type: "servicio",
+        employee_id: `empleado-${suffix}`,
+        qty: 1,
+        unit_price: LINE_SUBTOTAL,
+        subtotal: LINE_SUBTOTAL,
+        no_commission: false,
+        commission_value: null,
+        commission_percent_override: null,
+        product_id: null,
+        service_id: payrollPagedStub.SERVICE_ID,
+      });
+    }
+    payrollPagedStub.tables = {
+      employees,
+      payroll_periods: [
+        {
+          id: payrollPagedStub.PERIOD_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          start_date: "2026-01-01",
+          end_date: "2026-01-31",
+          status: "borrador",
+          created_by: "u-1",
+          closed_at: null,
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      invoices,
+      invoice_items: items,
+      commission_rules: [],
+      voucher_requests: [],
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      audit_logs: [],
+    };
+    return { employees, items };
+  }
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  it("una sede con más empleados que el tope del listado liquida a TODOS", async () => {
+    const PLANT = 1200;
+    const seed = seedPlant(PLANT);
+    // Non-vacuidad del fixture: supera el tope del listado (500) y el de
+    // transporte del Data API (1000), que es lo que hay que cruzar.
+    expect(seed.employees).toHaveLength(PLANT);
+    expect(PLANT).toBeGreaterThan(LIST_CAP);
+    expect(PLANT).toBeGreaterThan(payrollPagedStub.rowCap);
+
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+
+    const persisted = payrollPagedStub.itemsUpsert ?? [];
+    // Los 1200, cada uno con su comisión: 1200 × 1.000 = 1.200.000.
+    expect(persisted).toHaveLength(PLANT);
+    expect(persisted.map((row) => row.employee_id)).toContain("empleado-01200");
+    expect(persisted.every((row) => row.commissions === COMMISSION_PER_EMPLOYEE)).toBe(true);
+    expect(persisted.reduce((acc, row) => acc + Number(row.net_pay), 0)).toBe(
+      PLANT * COMMISSION_PER_EMPLOYEE,
+    );
+  });
+
+  it("la planta se pide entera y en orden (sin el tope de 500)", async () => {
+    seedPlant(1200);
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+
+    const employeeWindows = payrollPagedStub.windows.filter((window) => window.table === "employees");
+    // Más de una página: la ventana pedida es la del Data API (1000), no 500.
+    expect(employeeWindows.length).toBeGreaterThan(1);
+    expect(employeeWindows[0]).toEqual({
+      table: "employees",
+      from: 0,
+      to: 999,
+      order: ["full_name", "id"],
+    });
+    expect(employeeWindows.some((window) => window.from > 0)).toBe(true);
+    // Requisito 2: orden determinista. Sin desempate, dos empleados homónimos
+    // pueden caer en páginas distintas y repetirse o perderse.
+    for (const window of employeeWindows) expect(window.order).toEqual(["full_name", "id"]);
+  });
+
+  it("control negativo: una sede chica se lee igual (mismos montos, sin duplicados)", async () => {
+    const seed = seedPlant(3);
+    const detail = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      {},
+      ACTOR,
+    );
+
+    expect(seed.items).toHaveLength(3);
+    const persisted = payrollPagedStub.itemsUpsert ?? [];
+    expect(persisted).toHaveLength(3);
+    // Ni duplicados ni faltantes: una fila por empleado, con su monto.
+    expect(new Set(persisted.map((row) => row.employee_id)).size).toBe(3);
+    expect(persisted.reduce((acc, row) => acc + Number(row.net_pay), 0)).toBe(3 * COMMISSION_PER_EMPLOYEE);
+    expect(detail.items).toHaveLength(3);
+    // Una sola lectura de la planta (el conjunto entra en la primera página).
+    expect(payrollPagedStub.windows.filter((window) => window.table === "employees")).toEqual([
+      { table: "employees", from: 0, to: 999, order: ["full_name", "id"] },
+    ]);
+  });
+
+  it("si la planta no se puede leer entera, el cálculo se detiene a la vista", async () => {
+    seedPlant(1200);
+    // Falla la SEGUNDA página de la planta: la lectura no se completa.
+    payrollPagedStub.failAt = { employees: [2] };
+
+    const failure: unknown = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      {},
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "READ_INCOMPLETE" });
+    // Control de vacuidad: no se liquidó una nómina con la planta recortada.
+    expect(payrollPagedStub.itemsUpsert).toBeNull();
+  });
+});
+
+describe("payroll: el detalle del período muestra TODO lo pagado (U7)", () => {
+  const PERIOD_ID = payrollPagedStub.PERIOD_ID;
+  const NET_PER_ITEM = 1000;
+  const PAID_PER_ITEM = 1000;
+
+  function seedPeriod(itemCount: number, paidPerItem: number) {
+    const items: Array<Record<string, unknown>> = [];
+    const payments: Array<Record<string, unknown>> = [];
+    for (let index = 1; index <= itemCount; index += 1) {
+      const suffix = String(index).padStart(5, "0");
+      const minute = String(Math.floor(index / 60)).padStart(2, "0");
+      const second = String(index % 60).padStart(2, "0");
+      items.push({
+        id: `item-${suffix}`,
+        period_id: PERIOD_ID,
+        employee_id: `empleado-${suffix}`,
+        base_fixed: 0,
+        commissions: NET_PER_ITEM,
+        bonuses: 0,
+        deductions_vales: 0,
+        other_discounts: 0,
+        net_pay: NET_PER_ITEM,
+        detail_json: [],
+        created_at: `2026-01-15T12:${minute}:${second}.000Z`,
+      });
+      if (paidPerItem > 0) {
+        payments.push({
+          id: `pago-${suffix}`,
+          payroll_item_id: `item-${suffix}`,
+          method_code: "efectivo",
+          amount: paidPerItem,
+          paid_at: `2026-01-15T13:${minute}:${second}.000Z`,
+        });
+      }
+    }
+    payrollPagedStub.tables = {
+      payroll_periods: [
+        {
+          id: PERIOD_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          start_date: "2026-01-01",
+          end_date: "2026-01-31",
+          status: "cerrado",
+          created_by: "u-1",
+          closed_at: "2026-02-01T00:00:00.000Z",
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      payroll_items: items,
+      payroll_payments: payments,
+    };
+    return { items, payments };
+  }
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  it("un período con más ítems que el tope por request muestra los pagos reales", async () => {
+    const ITEMS = 1200;
+    const seed = seedPeriod(ITEMS, PAID_PER_ITEM);
+    expect(seed.items).toHaveLength(ITEMS);
+    expect(ITEMS).toBeGreaterThan(payrollPagedStub.rowCap);
+
+    const detail = await getPeriodDetail(payrollPagedStub.SEDE_ID, PERIOD_ID);
+
+    // Ni una línea de menos: el período se muestra completo.
+    expect(detail.items).toHaveLength(ITEMS);
+    // El pagado mostrado es el REAL: 1200 × 1.000 = 1.200.000, y no queda saldo.
+    expect(detail.items.reduce((acc, item) => acc + item.paid, 0)).toBe(ITEMS * PAID_PER_ITEM);
+    expect(detail.items.reduce((acc, item) => acc + item.remaining, 0)).toBe(0);
+    expect(detail.items.every((item) => item.paid === PAID_PER_ITEM && item.remaining === 0)).toBe(true);
+  });
+
+  it("los ids de los pagos van en lotes que aguantan la URL (414)", async () => {
+    seedPeriod(1200, PAID_PER_ITEM);
+    await getPeriodDetail(payrollPagedStub.SEDE_ID, PERIOD_ID);
+
+    const paymentInFilters = payrollPagedStub.inFilters.filter(
+      (entry) => entry.table === "payroll_payments",
+    );
+    // Más de un lote: 1200 ids no entran en una sola URL.
+    expect(paymentInFilters.length).toBeGreaterThan(1);
+    const counts = [...new Set(paymentInFilters.map((entry) => entry.count))];
+    expect(Math.max(...counts)).toBeLessThanOrEqual(IN_FILTER_CHUNK_SIZE);
+  });
+
+  it("las dos lecturas van ordenadas y por páginas", async () => {
+    seedPeriod(1200, PAID_PER_ITEM);
+    await getPeriodDetail(payrollPagedStub.SEDE_ID, PERIOD_ID);
+
+    const itemWindows = payrollPagedStub.windows.filter((window) => window.table === "payroll_items");
+    const paymentWindows = payrollPagedStub.windows.filter(
+      (window) => window.table === "payroll_payments",
+    );
+    expect(itemWindows).toEqual([
+      { table: "payroll_items", from: 0, to: 999, order: ["created_at", "id"] },
+      { table: "payroll_items", from: 1000, to: 1999, order: ["created_at", "id"] },
+    ]);
+    for (const window of paymentWindows) expect(window.order).toEqual(["id"]);
+  });
+
+  it("control negativo: un período chico se lee igual (mismos pagos, sin duplicados)", async () => {
+    const seed = seedPeriod(3, PAID_PER_ITEM);
+    const detail = await getPeriodDetail(payrollPagedStub.SEDE_ID, PERIOD_ID);
+
+    expect(seed.payments).toHaveLength(3);
+    expect(detail.items.map((item) => item.id)).toEqual(["item-00001", "item-00002", "item-00003"]);
+    expect(detail.items.map((item) => item.paid)).toEqual([1000, 1000, 1000]);
+    expect(detail.items.map((item) => item.remaining)).toEqual([0, 0, 0]);
+    // Una sola lectura de cada tabla: el conjunto entra en la primera página.
+    expect(payrollPagedStub.windows.filter((window) => window.table === "payroll_items")).toEqual([
+      { table: "payroll_items", from: 0, to: 999, order: ["created_at", "id"] },
+    ]);
+    expect(payrollPagedStub.windows.filter((window) => window.table === "payroll_payments")).toEqual([
+      { table: "payroll_payments", from: 0, to: 999, order: ["id"] },
+    ]);
+  });
+
+  it("si una página de pagos falla, el detalle falla a la vista (no muestra menos plata)", async () => {
+    seedPeriod(1200, PAID_PER_ITEM);
+    payrollPagedStub.failAt = { payroll_payments: [1] };
+
+    const failure: unknown = await getPeriodDetail(payrollPagedStub.SEDE_ID, PERIOD_ID).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toMatchObject({ code: "READ_INCOMPLETE" });
+  });
+});
+
+describe("payroll: la marca over_tope de la aprobación no puede mentir (U7)", () => {
+  const VOUCHER_ID = "77777777-7777-4777-8777-777777777777";
+  const EMPLEADO = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const ACTOR: PayrollActor = {
+    userId: "u-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const REQUEST_DATE = "2026-01-15";
+
+  function seedPendingVoucher(amount: number, maxPerDay: number | null) {
+    const voucher: Record<string, unknown> = {
+      id: VOUCHER_ID,
+      sede_id: payrollPagedStub.SEDE_ID,
+      employee_id: EMPLEADO,
+      amount,
+      request_date: REQUEST_DATE,
+      status: "pendiente",
+      approved_by: null,
+      approval_code: null,
+      observation: null,
+      method_code: "transferencia",
+      cash_shift_id: null,
+      created_by: "u-1",
+    };
+    payrollPagedStub.tables = {
+      voucher_requests: [voucher],
+      voucher_settings: [
+        {
+          sede_id: payrollPagedStub.SEDE_ID,
+          max_per_day: maxPerDay,
+          max_per_week: null,
+          allowed_days: null,
+          per_day_limits: null,
+        },
+      ],
+      users: [],
+      audit_logs: [],
+    };
+    return voucher;
+  }
+
+  /** El registro de auditoría de la aprobación: la marca `over_tope` observada. */
+  function approvalAudit(): Record<string, unknown> | null {
+    const inserted = payrollPagedStub.inserts.find(
+      (entry) =>
+        entry.table === "audit_logs" &&
+        (entry.payload as { action?: string }).action === "voucher.approved",
+    );
+    return (inserted?.payload as Record<string, unknown> | undefined) ?? null;
+  }
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  it("si la lectura de topes no se completa, la aprobación se RECHAZA (nunca un `false` inventado)", async () => {
+    const voucher = seedPendingVoucher(150000, 200000);
+    // Falla la lectura del acumulado vigente: la que filtra por `request_date`.
+    payrollPagedStub.failOn = { table: "voucher_requests", filter: "request_date" };
+
+    const failure: unknown = await approveVoucher(
+      payrollPagedStub.SEDE_ID,
+      VOUCHER_ID,
+      {},
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    // El chequeo no se pudo evaluar: `false` significa "no superó topes" y no
+    // puede venir de no haber podido mirar. Se rechaza y el admin reintenta.
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "READ_INCOMPLETE" });
+    // Y no queda rastro de una aprobación con la marca en falso.
+    expect(payrollPagedStub.updates.filter((entry) => entry.table === "voucher_requests")).toEqual([]);
+    expect(approvalAudit()).toBeNull();
+    expect(voucher.status).toBe("pendiente");
+  });
+
+  it("control: dentro de topes la marca sigue siendo `false` (ahora es un dato, no un default)", async () => {
+    const voucher = seedPendingVoucher(150000, 200000);
+
+    const approved = await approveVoucher(payrollPagedStub.SEDE_ID, VOUCHER_ID, {}, ACTOR);
+
+    expect(approved.status).toBe("aprobada");
+    expect(voucher.status).toBe("aprobada");
+    expect((approvalAudit()?.metadata as { over_tope?: unknown }).over_tope).toBe(false);
+  });
+
+  it("control: sobre el tope la marca sigue siendo `true`", async () => {
+    seedPendingVoucher(150000, 100000);
+
+    const approved = await approveVoucher(payrollPagedStub.SEDE_ID, VOUCHER_ID, {}, ACTOR);
+
+    expect(approved.status).toBe("aprobada");
+    expect((approvalAudit()?.metadata as { over_tope?: unknown }).over_tope).toBe(true);
   });
 });
