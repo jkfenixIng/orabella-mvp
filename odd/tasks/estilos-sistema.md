@@ -62,12 +62,26 @@ Borrar `.text-primary`, `.text-secondary`, `.text-tertiary`, `.bg-primary` (muer
 - No instalar primitivos sin evidencia (`dropdown-menu`, `popover`, `tooltip`, `avatar`, `progress`, `scroll-area`, `sonner` como toast suelto).
 - No renombrar los `-50` en masa sin verificar ambos temas: son carga útil de `Badge`.
 
-## Colisiones vivas detectadas y no resueltas
-`.shadow-sm|md|lg|xl` están definidas como clases sin capa en `design-tokens.css:306-309` con los mismos nombres que las utilidades de Tailwind, así que **las del proyecto ganan en silencio**. Hoy `shadow-sm` no vale lo que Tailwind dice. No medido todavía si el valor difiere en la práctica. `radius-*` zafó: el proyecto usa `radius-lg`, Tailwind genera `rounded-lg`.
+## WU-C1 verificado (2026-10-01) — y tres correcciones
+Verificación independiente con escáner propio sobre `css-tree`, no con grep (que no ve `@layer`). Veredicto: seguro de commitear y **entrega lo que afirma para las clases listadas**.
+
+Correcciones que hay que conservar:
+1. **La evidencia del writer era inestable.** Reportó "las 8 utilidades salen en el build real"; salen **2** (`bg-primary`, `text-primary`), y solo porque Tailwind escanea `app/tests/**` y el test nuevo contiene los literales en un array `deletedClasses` (`tests/design-tokens.test.ts:700`). Si se excluyeran los tests, saldrían **0**. La conclusión de cascada se sostiene —se reprodujo con una compilación forzada— pero el número reportado no.
+2. **La razón por la que se conservó `--bg-primary` es FALSA y no se puede registrar como restricción.** Hay DOS reglas `body` sin capa con la misma especificidad y gana la de `globals.css` → `var(--background)` = `#fff`. El único consumidor de `--bg-primary` está dentro de la regla **ya pisada**, así que borrarlo no habría cambiado el fondo. Mantenerlo es conservadurismo inofensivo, no una decisión load-bearing.
+3. **`text-tertiary` quedó en no-op silencioso** (no existe `--color-tertiary`): no pinta nada. Modo de falla distinto del de `.text-secondary`, que pinta mal. Ambos con cero consumidores.
+
+Lo que **sí** quedó probado: 21 clases sin capa en el build y **ninguna** colisiona con las utilidades de color; `bg-primary` → `oklch(50% .125 250)`; los valores de `.text-success/.text-warning/.text-error` **no cambian** en claro ni en oscuro; `.bg-surface` (21 consumidores) es idéntico; la familia `--radius-*` intacta; y la aserción invertida se juzgó **legítima** (se conservó la otra mitad y se agregó una guarda más fuerte sobre el valor resuelto).
+
+## Colisiones vivas y no resueltas
+- **`.shadow-sm|md|lg|xl`** están sin capa en `design-tokens.css` con los mismos nombres que las utilidades de Tailwind, así que las del proyecto **ganan en silencio**. Ahora está **medido**: los valores difieren (`shadow-sm` legacy `0 1px 2px 0 #0000000d` contra Tailwind `0 1px 3px 0 …, 0 1px 2px -1px …`; `shadow-xl` legacy `0 25px 50px -12px` contra `0 20px 25px -5px …`). Y **es alcanzable desde shadcn**: card, popover y dropdown-menu usan `shadow-sm`/`shadow-md`. Hoy no rompe nada porque las sombras quedan como estaban, pero es la misma especie de bug que WU-C1 arregló, sin arreglar. Requiere decidir qué valor debe ganar (WU-C3).
+- **`.dark .text-success|warning|error`** siguen sin capa y sobreescriben la utilidad generada en oscuro, deliberadamente, para dar el peldaño `-400`. Aceptable para el objetivo de shadcn (no son nombres del registry), pero deja en pie el patrón "clase del proyecto gana a utilidad de Tailwind" para cualquier colisión futura.
+- **`radius-*` zafó por nombre**: el proyecto usa `radius-lg`, Tailwind genera `rounded-lg`.
 
 ## Tasks
-- [x] WU0 croma de los `-50` + aliases canónicos (576 tests verdes, evidencia roja real)
-- [ ] WU-C1 retirar muertos y registrar claves canónicas (habilita el registry)
+- [x] WU0 croma de los `-50` + aliases canónicos (`5d4b6f8`; 384 tests, evidencia roja real)
+- [x] WU-C1 retirar muertos y registrar claves canónicas (`d5b8fdd`, verificado)
+- [ ] WU-C2 (dos líneas) agregar `--color-background` y `--color-foreground` a `@theme inline`
+- [ ] WU-C3 (requiere decisión) `.shadow-sm|md|lg|xl`: qué valor debe ganar
 - [ ] WU1 paleta cruda fuera de invoices-client
 - [ ] WU2 coherencia de combobox
 - [ ] WU3 consolidar helpers duplicados
@@ -76,3 +90,4 @@ Borrar `.text-primary`, `.text-secondary`, `.text-tertiary`, `.bg-primary` (muer
 
 ## Estado
 - 2026-10-01: creado. WU0 implementado; el writer lo marcó `partial` porque el objetivo completo de los aliases (utilidades generadas) no era alcanzable dentro de las superficies autorizadas — y tenía razón. La causa real resultó ser distinta de la que se creía (ver CORRECCIÓN arriba).
+- 2026-10-01: WU-C1 en `d5b8fdd`, verificado. **El puente de shadcn queda completo para las clases listadas y falso en general**: `--color-background` y `--color-foreground` NO están en `@theme inline`, así que `bg-background` y `text-foreground` siguen sin poder emitirse, y esos dos aparecen en buena parte de los componentes del registry. Son dos líneas (WU-C2).
