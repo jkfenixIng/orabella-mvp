@@ -151,8 +151,13 @@ describe("billing: subtotal por línea (FAC-01)", () => {
     });
   });
 
-  it("redondea a 2 decimales", () => {
-    expect(roundMoney(10.005)).toBe(10.01);
+  it("redondea a PESO ENTERO (regla del datafono)", () => {
+    // CAMBIÓ con la regla del peso entero: antes redondeaba a 2 decimales
+    // (10.005 → 10.01). El datafono no acepta centavos, así que el dinero
+    // calculado es entero: 10.005 → 10.
+    expect(roundMoney(10.005)).toBe(10);
+    expect(roundMoney(10.5)).toBe(11);
+    expect(roundMoney(10.4999)).toBe(10);
     expect(moneyEquals(10.004, 10.0)).toBe(true);
     expect(moneyEquals(10.02, 10.0)).toBe(false);
   });

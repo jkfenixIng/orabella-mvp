@@ -82,12 +82,43 @@ export type InvoiceStatus = z.infer<typeof invoiceStatusSchema>;
 
 const uuidSchema = z.uuid("Identificador inválido.");
 
-/** Tolerancia de centavo al comparar sumas de dinero (redondeo a 2 dec). */
+/**
+ * Tolerancia al comparar sumas de dinero. Se conserva en un centavo: con la
+ * regla del peso entero (ver `roundMoney`) todo monto es entero, así que este
+ * epsilon equivale a "exactamente igual" y a la vez sigue tolerando las filas
+ * históricas que todavía traen centavos cuando se reconcilian (031).
+ */
 export const MONEY_EPSILON = 0.01;
 
-/** Redondea a 2 decimales (numérico de dinero numeric(12,2)). */
+/**
+ * REGLA DEL PESO ENTERO: todo el dinero que la app CALCULA es un entero de
+ * pesos.
+ *
+ * Regla de negocio (dicha por el dueño; no se deduce del código): el datafono
+ * NO acepta centavos. El recargo de la tarjeta se le pasa al cliente y el
+ * total que el cliente paga EN EL DATAFONO es el monto redondeado a peso
+ * entero. Por lo tanto lo que el sistema REGISTRA tiene que ser lo mismo que
+ * el datafono COBRA: si la app guarda $1.666,65 y el datafono cobra $1.667,
+ * cada cobro con tarjeta deja un peso de descuadre entre el registro y la
+ * realidad. No es una tolerancia que se aguanta: es la unidad del dinero.
+ *
+ * Por eso este es el ÚNICO redondeo de dinero de la app y redondea a peso
+ * entero (half-up, `Math.round`). Lo importan billing, caja, nómina y
+ * comisiones (varios módulos lo RE-exportan), así que esta es la línea donde
+ * la regla se aplica a los cuatro: subtotales de línea, descuentos de línea,
+ * impuestos, recargos de tarjeta, totales, recargos de nómina, comisiones y
+ * arqueos.
+ *
+ * CUIDADO — esto NO redondea lo que se LEE de la base: reconciliar una SUMA
+ * contra un TOTAL ya guardado (`numeric(12,2)`, que todavía puede traer
+ * centavos históricos, como el CHECK de `invoices` al recalcular una emitida)
+ * exige exactitud al centavo. Ese caso usa `round2` en billing/service.ts. El
+ * SALDO COBRABLE es la excepción que sí usa esta función: `invoiceNetBalance`
+ * redondea el neto facturado a peso entero porque es el monto que el datafono
+ * cobra (ver ahí la regla completa).
+ */
 export function roundMoney(value: number): number {
-  return Math.round(value * 100) / 100;
+  return Math.round(value);
 }
 
 /** true cuando dos montos cuadran dentro de la tolerancia de centavo. */
@@ -380,7 +411,7 @@ export interface ComputedLine {
   subtotal: number;
 }
 
-/** Subtotal de una línea: qty × precio − descuento de línea. */
+/** Subtotal de una línea: qty × precio − descuento de línea (pesos enteros). */
 export function computeLineSubtotal(item: { qty: number; unit_price: number; discount: number }): ComputedLine {
   const gross = roundMoney(item.qty * item.unit_price);
   const discount = roundMoney(Math.min(item.discount, gross));
@@ -403,7 +434,8 @@ export interface TaxSnapshot {
 /**
  * FAC-03: snapshot de los impuestos ACTIVOS sobre la base
  * (subtotal − descuento de factura). Los inactivos se excluyen (suman 0).
- * Puro para probarlo sin base de datos.
+ * El monto de cada impuesto es dinero calculado: sale en pesos enteros
+ * (`roundMoney`, regla del peso entero). Puro para probarlo sin base de datos.
  */
 export function snapshotInvoiceTaxes(activeTaxes: ActiveTax[], base: number): TaxSnapshot[] {
   const taxable = Math.max(0, roundMoney(base));
@@ -428,6 +460,11 @@ export interface InvoiceTotals {
 /**
  * Recargo por método (p. ej. tarjeta 5%): fee = neto × feePercent / 100
  * por porción. El cliente paga el BRUTO (neto + recargo). Puro.
+ *
+ * Peso entero: neto, fee y bruto son pesos enteros (`roundMoney`), así que
+ * `bruto = neto + fee` es EXACTO (sin residuo de redondeo) y `bruto − fee`
+ * devuelve el mismo neto que exige el cobro (`splitPayment` / caja). Inversa
+ * exacta: `splitGrossCardFee` (billing/service.ts).
  */
 export interface CardFee {
   method_code: string;
@@ -453,6 +490,11 @@ export function computeCardFees(
  * FAC-01/FAC-03: total = subtotal − descuento + impuestos (snapshot).
  * Lanza DESCUENTO_EXCEDE cuando el descuento supera el subtotal.
  * Puro para probarlo sin base de datos.
+ *
+ * Peso entero: subtotal, descuento, base, impuestos, recargo y total son
+ * pesos enteros (`roundMoney`). La identidad `total = base + impuestos +
+ * recargo` que exige el CHECK de `invoices` se cumple entonces de forma
+ * exacta, sin la tolerancia de centavo que hacía falta con centavos.
  */
 export function computeInvoiceTotals(args: {
   items: Array<{ qty: number; unit_price: number; discount: number }>;

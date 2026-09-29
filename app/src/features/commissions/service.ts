@@ -332,6 +332,10 @@ export async function payCommissionNow(
     throw new CommissionError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const input = parsed.data;
+  // Dinero que se persiste: peso entero. Se normaliza UNA vez y es el mismo
+  // valor para la validación del pendiente, el tope de caja y la fila
+  // guardada (lo que se valida es lo que se guarda).
+  const amount = roundMoney(input.amount);
   const db = await commissionsDb();
 
   const { data: payoutEmployee } = await db
@@ -393,7 +397,7 @@ export async function payCommissionNow(
       422,
     );
   }
-  if (input.amount - pending > 0.009) {
+  if (amount - pending > 0.009) {
     throw new CommissionError(
       "COMMISSION_OVERPAID",
       `El monto supera la comisión pendiente (${pending}).`,
@@ -412,7 +416,7 @@ export async function payCommissionNow(
       methodCode: method.code,
       openingBase: Number(shift.opening_base),
       cashOutUsed: usedCashOut,
-      amount: input.amount,
+      amount,
     });
     if (violation) throw new CommissionError(violation.code, violation.message, 422);
   }
@@ -428,7 +432,7 @@ export async function payCommissionNow(
       base_subtotal: earned.baseSubtotal,
       percent_applied: earned.percentApplied,
       fixed_applied: earned.fixedApplied,
-      amount: roundMoney(input.amount),
+      amount,
       paid_by: actor.userId,
     })
     .select(PAYOUT_SELECT)
@@ -446,7 +450,7 @@ export async function payCommissionNow(
       invoice_id: input.invoice_id,
       cash_shift_id: shift.id,
       method_code: method.code,
-      amount: roundMoney(input.amount),
+      amount,
       base_subtotal: earned.baseSubtotal,
       percent_applied: earned.percentApplied,
       fixed_applied: earned.fixedApplied,

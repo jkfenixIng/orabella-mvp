@@ -25,6 +25,7 @@ import {
   registerPaymentSchema,
   resolveClosingBase,
   resolveOpeningBase,
+  roundMoney,
   sumMethodMaps,
   sumMethodTotal,
   voucherOutByMethod,
@@ -526,8 +527,13 @@ describe("cash: total de vales por turno (columna Vales)", () => {
     expect(sumMethodTotal(new Map())).toBe(0);
   });
 
-  it("redondea el total a centavos", () => {
-    expect(sumMethodTotal(new Map([["nequi", 0.1], ["efectivo", 0.2]]))).toBe(0.3);
+  it("suma en pesos enteros (sin ruido de punto flotante)", () => {
+    // CAMBIÓ con la regla del peso entero: antes sumaba 0.1 + 0.2 → 0.3.
+    expect(sumMethodTotal(new Map([["nequi", 100], ["efectivo", 200]]))).toBe(300);
+    // Un monto sub-peso no existe como dinero: lo que se normaliza es el
+    // TOTAL (100.4 + 200.4 = 300.8 → 301), igual que antes se normalizaba al
+    // centavo.
+    expect(sumMethodTotal(new Map([["nequi", 100.4], ["efectivo", 200.4]]))).toBe(301);
   });
 });
 
@@ -581,8 +587,10 @@ describe("cash: tope de salidas en efectivo = 50% de la base del turno", () => {
         amount: 40000,
       }),
     ).toBeNull();
-    // Un centavo por encima ya se rechaza.
-    expect(exceedsCashOutLimit(cashOutLimitState(base, 60000), 40000.01)).toBe(true);
+    // Un PESO por encima ya se rechaza (CAMBIÓ: antes era un centavo). Un
+    // monto con centavos no existe como dinero: se normaliza al peso.
+    expect(exceedsCashOutLimit(cashOutLimitState(base, 60000), 40000.01)).toBe(false);
+    expect(exceedsCashOutLimit(cashOutLimitState(base, 60000), 40001)).toBe(true);
   });
 
   it("un vale en efectivo que supera el tope se rechaza con el código de negocio", () => {
@@ -660,12 +668,13 @@ describe("cash: T0-a (C1) el arqueo suma cada cobro UNA vez", () => {
     ]);
   });
 
-  it("normaliza montos string y redondea a centavos por método", () => {
+  it("normaliza montos string y los lleva a peso entero por método", () => {
+    // CAMBIÓ con la regla del peso entero: antes 1000.555 → 1000.56.
     const rows = mergeShiftMoney(
       [{ amount: "1000.555", method_code: "efectivo" }],
       null,
     );
-    expect(sumShiftMoneyByMethod(rows).get("efectivo")).toBe(1000.56);
+    expect(sumShiftMoneyByMethod(rows).get("efectivo")).toBe(1001);
   });
 
   it("degrada a vacío cuando el turno no tiene cobros", () => {
@@ -686,7 +695,9 @@ describe("cash: T0-a (Defecto 1) el tope de cobro descuenta el recargo emitido",
   /**
    * Réplica pura de la condición del trigger 031
    * (`check_invoice_payments_cap`), para fijar la aritmética sin base de
-   * datos. Si alguien edita el trigger, el test estructural de abajo falla.
+   * datos. El tope es el neto facturado COBRABLE —redondeado a peso entero,
+   * porque el datafono no acepta centavos— y la tolerancia sigue en 0.009.
+   * Si alguien edita el trigger, el test estructural de abajo falla.
    */
   function capRejects(args: {
     total: number;
@@ -694,17 +705,22 @@ describe("cash: T0-a (Defecto 1) el tope de cobro descuenta el recargo emitido",
     paidNet: number;
     newNet: number;
   }): boolean {
-    return args.paidNet + args.newNet - (args.total - args.surcharge) > 0.009;
+    return args.paidNet + args.newNet - roundMoney(args.total - args.surcharge) > 0.009;
   }
 
-  it("la condición del trigger usa el NETO FACTURADO (total − surcharge)", () => {
+  it("la condición del trigger usa el NETO FACTURADO COBRABLE (round(total − surcharge))", () => {
     const body = sql.slice(sql.indexOf("check_invoice_payments_cap()"));
     expect(body).toContain("SELECT total, surcharge INTO v_total, v_surcharge");
     expect(body).toContain(
-      "v_paid_net + v_new_net - (v_total - coalesce(v_surcharge, 0)) > 0.009",
+      "v_paid_net + v_new_net - round(v_total - coalesce(v_surcharge, 0)) > 0.009",
     );
     // La versión con hueco (neto contra `total`) no puede volver.
     expect(body).not.toContain("v_paid_net + v_new_net - v_total > 0.009");
+    // Ni la que no redondeaba: rechazaba la liquidación entera de una factura
+    // legacy con centavos (9999,99 → el cobro exacto de 10000 sobraba 0,01).
+    expect(body).not.toContain(
+      "v_paid_net + v_new_net - (v_total - coalesce(v_surcharge, 0)) > 0.009",
+    );
   });
 
   it("rechaza el contraejemplo del verificador (sobrecobro del tamaño del recargo)", () => {
@@ -895,7 +911,9 @@ describe("cash: T0-a (Defecto 1/2) aritmética del recargo y del saldo (puro)", 
   /**
    * Réplica pura del tope de 031 (`trg_invoice_payments_cap`; ver el test
    * estructural de la migración más abajo y el bloque de Defecto 1): el neto
-   * cobrado nunca excede el neto facturado. Tolerancia de centavo (0.009).
+   * cobrado nunca excede el neto facturado COBRABLE —redondeado a peso entero
+   * (`roundMoney`), porque el datafono no acepta centavos—. Tolerancia de
+   * centavo (0.009).
    */
   function capRejects(args: {
     total: number;
@@ -903,7 +921,7 @@ describe("cash: T0-a (Defecto 1/2) aritmética del recargo y del saldo (puro)", 
     paidNet: number;
     newNet: number;
   }): boolean {
-    return args.paidNet + args.newNet - (args.total - args.surcharge) > 0.009;
+    return args.paidNet + args.newNet - roundMoney(args.total - args.surcharge) > 0.009;
   }
 
   it("deriva el recargo del BRUTO entregado: inversa de computeCardFees", () => {
@@ -912,13 +930,19 @@ describe("cash: T0-a (Defecto 1/2) aritmética del recargo y del saldo (puro)", 
     expect(splitGrossCardFee(4200, TARJETA)).toEqual({ net: 4000, fee: 200 });
     // Sin recargo el neto es el bruto (efectivo/nequi).
     expect(splitGrossCardFee(100000, 0)).toEqual({ net: 100000, fee: 0 });
-    // El invariante de la fila: `amount − fee_amount` es el neto, y volver a
-    // derivar del bruto reconstruye el mismo par (nada de centavos perdidos).
+    // Invariante de la fila: `amount − fee_amount` es el neto, y volver a
+    // derivar del bruto reconstruye el mismo par. Peso entero: el bruto se
+    // normaliza al peso (lo que el datafono cobra), así que `net + fee` es el
+    // bruto ENTERO y no el bruto crudo de entrada. CAMBIÓ: antes `net + fee`
+    // cuadraba al centavo contra el bruto crudo de entrada.
     for (const gross of [0.16, 1, 999.99, 4200, 105000, 1234567.89]) {
+      const whole = roundMoney(gross);
       const { net, fee } = splitGrossCardFee(gross, TARJETA);
-      expect(net + fee).toBeCloseTo(gross, 2);
+      expect(net + fee).toBe(whole);
       expect(splitGrossCardFee(net + fee, TARJETA)).toEqual({ net, fee });
     }
+    // Borde del medio peso: sube (half-up), como el total del datafono.
+    expect(splitGrossCardFee(1.5, 0)).toEqual({ net: 2, fee: 0 });
   });
 
   it("el saldo neto descuenta el recargo emitido y los recargos cobrados", () => {
@@ -1043,6 +1067,29 @@ describe("cash: T0-a (Defecto 1/2) aritmética del recargo y del saldo (puro)", 
         collections: [{ method_code: "tarjeta", gross: 105000 }],
         expect: ["OVERPAID"],
       },
+      {
+        // U1-fix: factura emitida antes de la regla del peso entero, con
+        // centavos en su neto facturado (9999,99). El datafono no acepta
+        // centavos, así que el cliente entregó 10000: el cobro entero la
+        // cierra. Antes el servicio veía 10000 − 9999,99 = 0,01 > 0,009 y la
+        // marcaba OVERPAID (y el mismo tope la habría rechazado en la BD).
+        label: "legacy con centavos: el cobro entero de 10000 la cierra",
+        total: 9999.99,
+        surcharge: 0,
+        rows: [],
+        collections: [{ method_code: "efectivo", gross: 10000 }],
+        expect: ["ACCEPT"],
+      },
+      {
+        // El sobrecobro GENUINO de la misma factura legacy sigue rechazándose:
+        // 10001 supera el neto cobrable (10000) en un peso entero.
+        label: "legacy con centavos: un peso de más sigue siendo sobrecobro",
+        total: 9999.99,
+        surcharge: 0,
+        rows: [],
+        collections: [{ method_code: "efectivo", gross: 10001 }],
+        expect: ["OVERPAID"],
+      },
     ];
     for (const flow of flows) {
       const { verdicts } = replayCash(flow);
@@ -1138,9 +1185,10 @@ describe("cash: total y número de facturas cobradas del turno (puro)", () => {
     ).toEqual({ total: 125000, count: 2 });
   });
 
-  it("normaliza montos string y degrada a cero sin cobros", () => {
+  it("normaliza montos string a peso entero y degrada a cero sin cobros", () => {
+    // CAMBIÓ con la regla del peso entero: antes 1000.555 → 1000.56.
     expect(invoiceCollectionsSummary([{ invoice_id: "f1", amount: "1000.555" }])).toEqual({
-      total: 1000.56,
+      total: 1001,
       count: 1,
     });
     expect(invoiceCollectionsSummary([])).toEqual({ total: 0, count: 0 });

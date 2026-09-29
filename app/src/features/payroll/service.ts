@@ -1329,10 +1329,14 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
       requestDate,
       settings,
     );
+    // Dinero que se persiste: peso entero. Se normaliza UNA vez y es el mismo
+    // valor para la elegibilidad, el tope de caja y la fila guardada (lo que
+    // se valida es lo que se guarda).
+    const voucherAmount = roundMoney(parsed.data.amount);
     const eligibility = checkVoucherEligibility({
       dayTotal,
       weekTotal,
-      requested: parsed.data.amount,
+      requested: voucherAmount,
       maxPerDay: settings?.max_per_day == null ? null : Number(settings.max_per_day),
       maxPerWeek: settings?.max_per_week == null ? null : Number(settings.max_per_week),
       requestDate,
@@ -1364,7 +1368,7 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
         methodCode: method.code,
         openingBase: Number(openShift.opening_base),
         cashOutUsed: usedCashOut,
-        amount: parsed.data.amount,
+        amount: voucherAmount,
       });
       if (violation) throw new PayrollError(violation.code, violation.message, 422);
     }
@@ -1373,7 +1377,7 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
       .insert({
         sede_id: actor.sedeId,
         employee_id: employee.id,
-        amount: roundMoney(parsed.data.amount),
+        amount: voucherAmount,
         request_date: requestDate,
         status,
         approved_by: autoApproved ? actor.userId : null,

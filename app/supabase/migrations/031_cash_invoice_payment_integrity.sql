@@ -135,6 +135,23 @@ COMMENT ON COLUMN public.invoice_payments.cash_shift_id IS
 --      104800 (total): se cobra de más exactamente el recargo. Con el tope
 --      contra `total - surcharge` el 2º se rechaza (104000 > 100000).
 --
+--   c) `sum(amount - fee_amount) <= total - surcharge` SIN el round() (la
+--      versión anterior a este ajuste) rechaza la liquidación legítima de una
+--      factura legacy con centavos: factura emitida con neto 9999,99
+--      (surcharge 0). El datafono no acepta centavos, así que el cliente
+--      entregó 10000 y esa es la única porción entera posible. El tope ve
+--      10000 − 9999,99 = 0,01 > 0,009 → RECHAZA; y 9999 queda 0,99 corto, así
+--      que ninguna porción entera pasa y la factura queda Emitida e impagable.
+--      Con `round(total - surcharge)` = 10000 el cobro entra exacto. La
+--      tolerancia se mantiene en 0,009: el round() no la reemplaza, la
+--      complementa (el redondeo define el TOPE; la tolerancia absorbe el ruido
+--      de las sumas `numeric` históricas).
+--
+-- NOTA DE DESPLIEGUE: esta corrección se hizo sobre el archivo 031 SIN
+-- aplicarlo a ninguna base (el archivo no se había ejecutado en ningún
+-- entorno; ver el encabezado). Si 031 ya estuviera aplicada en una base real,
+-- habría que cambiarlo en una migración NUEVA en vez de editar 031.
+--
 -- Igual que el trigger de nómina, las filas hermanas de un mismo INSERT
 -- multi-fila no son visibles para el SUM (mismo snapshot): el tope protege
 -- contra carreras entre sentencias, y las sumas exactas siguen validándose en
@@ -167,10 +184,18 @@ BEGIN
   FROM public.invoice_payments
   WHERE invoice_id = NEW.invoice_id;
 
-  -- Tope = NETO FACTURADO (total − surcharge): el recargo emitido ya viene
-  -- sumado en el bruto de cada fila y no es saldo cobrable. Misma tolerancia
-  -- de centavo que nómina (0.009).
-  IF v_paid_net + v_new_net - (v_total - coalesce(v_surcharge, 0)) > 0.009 THEN
+  -- Tope = NETO FACTURADO COBRABLE, en la unidad del cobro (peso entero):
+  -- `round(total − surcharge)` — el recargo emitido ya viene sumado en el
+  -- bruto de cada fila y no es saldo cobrable; y el datafono no acepta
+  -- centavos, así que el monto cobrable es el neto redondeado a peso entero
+  -- (misma regla que `invoiceNetBalance`, billing/service.ts). Sin el
+  -- `round()`, una factura legacy con centavos rechaza su liquidación
+  -- legítima: neto 9999,99 y el cliente entregó 10000 en el terminal; ese
+  -- cobro exacto queda 0,01 por encima del tope y ninguna otra porción entera
+  -- cuadra (9999 queda 0,99 corta), así que la factura queda impagable. La
+  -- diferencia es de a lo sumo un peso y la corrección de datos de centavos
+  -- históricos la elimina. Misma tolerancia de centavo que nómina (0.009).
+  IF v_paid_net + v_new_net - round(v_total - coalesce(v_surcharge, 0)) > 0.009 THEN
     RAISE EXCEPTION
       'El cobro supera el neto facturado de la factura (total %, recargo %, cobrado neto %, nuevo neto %)',
       v_total, coalesce(v_surcharge, 0), v_paid_net, v_new_net;
@@ -181,7 +206,7 @@ END;
 $$;
 
 COMMENT ON FUNCTION public.check_invoice_payments_cap() IS
-'T0-a (C2): la suma NETA de invoice_payments por factura nunca excede el neto facturado (invoices.total − invoices.surcharge). El recargo emitido ya viene sumado en el bruto de cada fila, así que comparar contra total dejaba un hueco del tamaño del recargo. Barrera en BD ante carreras; el servicio valida el cobro exacto. RAISE EXCEPTION plano = P0001 (el servicio lo traduce a OVERPAID).';
+'T0-a (C2): la suma NETA de invoice_payments por factura nunca excede el neto facturado COBRABLE (round(invoices.total − invoices.surcharge), peso entero: el datafono no acepta centavos). El recargo emitido ya viene sumado en el bruto de cada fila, así que comparar contra total dejaba un hueco del tamaño del recargo; y sin el round() una factura legacy con centavos rechazaba su liquidación legítima en pesos enteros. Barrera en BD ante carreras; el servicio valida el cobro exacto. RAISE EXCEPTION plano = P0001 (el servicio lo traduce a OVERPAID).';
 
 DROP TRIGGER IF EXISTS trg_invoice_payments_cap ON public.invoice_payments;
 

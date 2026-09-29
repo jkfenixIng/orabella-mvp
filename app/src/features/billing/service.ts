@@ -17,6 +17,7 @@ import {
   MONEY_EPSILON,
   normalizeCommissionFields,
   portionsMatchBalance,
+  roundMoney,
   splitPaymentSchema,
   type CreateInvoiceInput,
   type InvoiceItemInput,
@@ -508,6 +509,19 @@ async function loadCommissionRulesByEmployee(
   return byEmployee;
 }
 
+/**
+ * Redondeo de RECONCILIACIÓN (centavos): es para leer/ajustar dinero YA
+ * GUARDADO en columnas `numeric(12,2)` — no para calcular dinero nuevo.
+ *
+ * El dinero que la app CALCULA es peso entero (`roundMoney`, billing/schemas);
+ * esta función es la otra mitad de la historia: las filas históricas todavía
+ * pueden traer centavos y los cuadres que comparan SUMA contra TOTAL guardado
+ * (el CHECK de `invoices` al recalcular una emitida) tienen que coincidir al
+ * centavo con lo que hay guardado. La migración 032 (a) reporta si quedan
+ * centavos; hasta que esa decisión se tome, esos cuadres siguen al centavo.
+ * El SALDO COBRABLE es la excepción: se redondea a peso entero en
+ * `invoiceNetBalance` (ver ahí), porque el datafono no cobra centavos.
+ */
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
 }
@@ -522,9 +536,21 @@ function round2(value: number): number {
  * 019_card_fee.sql) y `invoices.total = neto facturado + invoices.surcharge`
  * — recargo EMITIDO, que no es saldo cobrable (031). Por eso:
  *
- *     netBilled    = total − surcharge
+ *     netBilled    = roundMoney(total − surcharge)
  *     netCollected = Σ(amount − fee_amount)
- *     netRemaining = netBilled − netCollected
+ *     netRemaining = max(0, netBilled − netCollected)
+ *
+ * REGLA DEL PESO ENTERO APLICADA AL COBRO: el datafono no acepta centavos, así
+ * que el monto que el cliente ENTREGA es un peso entero y el saldo cobrable
+ * también lo es. Por eso `netBilled` se redondea a peso entero: para una
+ * factura cuyo `total − surcharge` ya es entero es un NO-OP exacto (la
+ * identidad guardada se conserva), y para una factura legacy cuyo neto quedó
+ * con centavos el cobrable es el peso redondeado. En esas filas históricas el
+ * neto cobrado es entonces el redondeado, no el guardado: la diferencia es de
+ * a lo sumo un peso y la corrección de datos de centavos históricos (032) la
+ * elimina. Sin este redondeo el cobro de una factura legacy es
+ * INSATISFACIBLE — 9999 deja 0.99 y 10000 deja 0.01, los dos fuera de
+ * `MONEY_EPSILON` — y la factura queda Emitida e impagable.
  *
  * Comparar bruto contra `total` (saldo = `total − Σamount`) deja un saldo
  * MENOR que el neto pendiente en cuanto hay un cobro con recargo posterior a
@@ -534,11 +560,11 @@ function round2(value: number): number {
  * datos.
  */
 export interface InvoiceNetBalance {
-  /** Neto facturado = total − surcharge. */
+  /** Neto facturado cobrable = roundMoney(total − surcharge), en pesos enteros. */
   netBilled: number;
   /** Neto cobrado = Σ(amount − fee_amount) de invoice_payments. */
   netCollected: number;
-  /** Saldo neto pendiente; negativo solo si hubo un sobrecobro previo. */
+  /** Saldo neto pendiente, en peso entero y nunca negativo. */
   netRemaining: number;
 }
 
@@ -547,14 +573,21 @@ export function invoiceNetBalance(args: {
   surcharge?: number | string | null;
   payments: Array<{ amount: number | string; fee_amount?: number | string | null }>;
 }): InvoiceNetBalance {
-  const netBilled = round2(Number(args.total) - Number(args.surcharge ?? 0));
-  const netCollected = round2(
-    args.payments.reduce(
-      (acc, row) => acc + (Number(row.amount) - Number(row.fee_amount ?? 0)),
-      0,
-    ),
+  // El neto cobrable es el neto facturado en la unidad del cobro (peso
+  // entero): es el monto que el datafono puede cobrar. `netCollected` ya es
+  // entero (todo monto cobrable lo es desde la regla del peso entero), así que
+  // no se redondea: redondearlo al centavo era justo lo que dejaba el saldo
+  // con centavos y volvía impagable la factura legacy.
+  const netBilled = roundMoney(Number(args.total) - Number(args.surcharge ?? 0));
+  const netCollected = args.payments.reduce(
+    (acc, row) => acc + (Number(row.amount) - Number(row.fee_amount ?? 0)),
+    0,
   );
-  return { netBilled, netCollected, netRemaining: round2(netBilled - netCollected) };
+  return {
+    netBilled,
+    netCollected,
+    netRemaining: Math.max(0, netBilled - netCollected),
+  };
 }
 
 /**
@@ -573,9 +606,18 @@ export function splitGrossCardFee(
   feePercent: number,
 ): { net: number; fee: number } {
   const percent = Math.max(0, Number(feePercent) || 0);
-  const rounded = round2(Number(gross));
-  const net = round2(rounded / (1 + percent / 100));
-  return { net, fee: round2(rounded - net) };
+  // El bruto es lo que el cliente entregó en el datafono, y el datafono no
+  // acepta centavos: se normaliza a peso entero. Es lo que va a las dos filas
+  // (`invoice_payments.amount` y `payments.amount`) y a la caja.
+  const whole = roundMoney(Number(gross));
+  // Se redondea el NETO (a peso entero) y el recargo sale por DIFERENCIA:
+  // así `neto + fee == bruto` EXACTO (los dos son enteros) y
+  // `amount − fee_amount` es exactamente el neto cobrado que suman
+  // `invoiceNetBalance` y el tope de 031. Con `fee = round(neto × pct / 100)`,
+  // `round(bruto / (1 + pct/100))` devuelve ese mismo neto: la desviación de
+  // la división es menor a 0,5 y no cruza el medio. Puro.
+  const net = roundMoney(whole / (1 + percent / 100));
+  return { net, fee: whole - net };
 }
 
 // ------------------------------------------------------------------ ayudas ---
@@ -784,8 +826,9 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   // El cliente paga el bruto; pagado/saldo/cierre cuadran sin lógica especial.
   const feeOf = (methodCode: string): number => methodByCode.get(methodCode)?.feePercent ?? 0;
   const fees = computeCardFees(portions, feeOf);
-  const surcharge = round2(fees.reduce((acc, fee) => acc + fee.fee, 0));
-  const grandTotal = round2(totals.total + surcharge);
+  // Recargo y total son dinero CALCULADO: peso entero (los fee ya lo son).
+  const surcharge = roundMoney(fees.reduce((acc, fee) => acc + fee.fee, 0));
+  const grandTotal = roundMoney(totals.total + surcharge);
   const status = portions.length > 0 ? "Pagada" : "Emitida";
 
   // Validar turno de caja abierto (CAJ-01 / FAC-01): solo se emite con turno abierto.
@@ -899,9 +942,10 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
         unit_price: item.unit_price,
         discount: item.discount,
         ...normalizeCommissionFields(item),
-        subtotal:
-          Math.round(item.qty * Number(item.unit_price) * 100) / 100 -
-          Math.min(item.discount, Math.round(item.qty * Number(item.unit_price) * 100) / 100),
+        // Mismo cálculo que el subtotal de la factura: una sola fórmula
+        // (`computeLineSubtotal`) para que la línea y el total no puedan
+        // discrepar, en pesos enteros.
+        subtotal: computeLineSubtotal(item).subtotal,
       })),
     );
     if (itemsError) {
@@ -1461,6 +1505,13 @@ export async function editEmittedInvoiceItems(
     throw toBillingError(error);
   }
   const surcharge = round2(Number(detail.invoice.surcharge ?? 0));
+  // El recargo guardado se conserva tal cual (es el recargo EMITIDO, un dato
+  // histórico que puede traer centavos hasta que 032 decida): por eso el total
+  // se reconcilia con `round2` y no con la regla del peso entero. El descuento
+  // SÍ se normaliza y se vuelve a escribir más abajo: `totals` lo calculó ya
+  // en pesos enteros, y si la fila guardaba un descuento con centavos la
+  // identidad `total = subtotal − discount + tax + surcharge` del CHECK de
+  // `invoices` no cerraría y el UPDATE fallaría.
   const newTotal = round2(totals.total + surcharge);
 
   // Inventario por deltas netos por producto vía la frontera (pre-valida
@@ -1569,6 +1620,7 @@ export async function editEmittedInvoiceItems(
       .from("invoices")
       .update({
         subtotal: totals.subtotal,
+        discount: totals.discount,
         tax: totals.tax,
         surcharge,
         total: newTotal,
@@ -1700,7 +1752,7 @@ export async function splitPayment(
     parsed.data.portions,
     (code) => refs.methodByCode.get(code)?.feePercent ?? 0,
   );
-  const netSum = round2(fees.reduce((acc, fee) => acc + fee.net, 0));
+  const netSum = roundMoney(fees.reduce((acc, fee) => acc + fee.net, 0));
   // El saldo cobrable es NETO. `detail.paid` es el BRUTO cobrado, así que
   // `total − detail.paid` quedaba corto en el recargo de los cobros
   // posteriores a la emisión (o cuando un cobro con tarjeta de caja dejó su
