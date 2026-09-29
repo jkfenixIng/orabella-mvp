@@ -30,6 +30,7 @@ import {
 import { computeInvoiceItemCommission } from "@/src/features/billing/commission";
 import {
   BillingError,
+  annulInvoice,
   editEmittedInvoiceItems,
   type BillingActor,
 } from "@/src/features/billing/service";
@@ -1206,6 +1207,44 @@ const pagedStub = vi.hoisted(() => ({
 }));
 
 /**
+ * Estado propio del camino de ANULACIÓN (U6). Encendido solo por el bloque de
+ * anulación: los demás describe quedan con el doble de siempre.
+ *
+ * El doble mantiene el estado REAL de la fila `invoices` (`invoiceStatus`) y
+ * aplica la guarda de estado del UPDATE como lo haría PostgREST: si `.eq`
+ * pidió un estado que ya no es el de la fila, el UPDATE afecta 0 filas y
+ * `.single()` devuelve PGRST116. Así la carrera de dos anulaciones se puede
+ * observar de verdad, sin inventar el resultado.
+ */
+const annulStub = vi.hoisted(() => ({
+  active: false,
+  /** Estado real de la fila `invoices` mientras el bloque está activo. */
+  invoiceStatus: "Emitida",
+  /** Líneas de `invoice_items` (null = la línea de edición de siempre). */
+  items: null as Array<Record<string, unknown>> | null,
+  /** Fila de `products` (stock que la reversión devuelve). */
+  product: null as Record<string, unknown> | null,
+  /** IN de reversión insertados: cuántas veces se restauró stock. */
+  movements: [] as Array<Record<string, unknown>>,
+  /** Guardas de estado que llevó cada UPDATE de `invoices`, en orden. */
+  guards: [] as string[],
+  /** El UPDATE afecta 0 filas sin carrera (ruta de error de la guarda). */
+  updateMisses: false,
+  /** Traza `read`/`write` de `invoices`, en orden: prueba la carrera real. */
+  events: [] as string[],
+  /**
+   * Detiene el próximo UPDATE de `invoices` hasta que el test lo libere: con eso
+   * el orden de aplicación de dos anulaciones queda bajo control (la que aplica
+   * segunda es la que pierde la carrera).
+   */
+  holdNextWrite: false,
+  /** Libera la escritura detenida (lo llena el doble al detenerla). */
+  releaseWrite: null as (() => void) | null,
+  /** Aviso: hay una escritura detenida esperando a que el test la libere. */
+  onWriteHeld: null as (() => void) | null,
+}));
+
+/**
  * Total emitido ANTES del ajuste (la línea vale lo mismo). 300.000 con un cobro
  * de 200.000 es el caso REAL: factura Emitida cobrada a medias (saldo 100.000),
  * no una Emitida ya completa (esa la cierra el cobro cuando cubre el neto).
@@ -1276,25 +1315,66 @@ function stubPayment(amount: number, feeAmount = 0) {
  * como error, para que el test falle a la vista y no en silencio.
  */
 function createOverCollectionStubClient(): unknown {
-  const response = (table: string, op: string): { data: unknown; error: unknown } => {
+  const zeroRowsError = { code: "PGRST116", message: "JSON object requested, multiple (or no) rows returned", details: "The result contains 0 rows", hint: null };
+
+  const response = (
+    table: string,
+    op: string,
+    statusGuard?: string,
+  ): { data: unknown; error: unknown } => {
     if (op !== "select") {
       overCollectionStub.writes.push(`${table}.${op}`);
       if (table === "invoices" && op === "update") {
+        annulStub.events.push("write");
+        // Guarda de estado = compare-and-swap: la fila solo se pisa si sigue en
+        // el estado leído. Sin coincidencia, PostgREST afecta 0 filas.
+        if (statusGuard !== undefined && statusGuard !== annulStub.invoiceStatus) {
+          return { data: null, error: zeroRowsError };
+        }
+        if (annulStub.updateMisses) return { data: null, error: zeroRowsError };
+        if (annulStub.active) {
+          annulStub.invoiceStatus = String(overCollectionStub.invoiceUpdate?.status ?? annulStub.invoiceStatus);
+        }
         // El `total` que devuelve el UPDATE es el que el servicio ESCRIBIÓ: la
         // aserción compara contra el recálculo real y no contra un número
-        // puesto a mano en el doble.
+        // puesto a mano en el doble. La anulación no reescribe `total`: en ese
+        // camino la fila conserva el emitido.
+        const written = (overCollectionStub.invoiceUpdate ?? {}) as Record<string, unknown>;
+        const total = Number(written.total ?? (annulStub.active ? STUB_EMITTED_TOTAL : 0));
         return {
-          data: stubInvoiceRow(Number(overCollectionStub.invoiceUpdate?.total ?? 0)),
+          data: {
+            ...stubInvoiceRow(total),
+            ...(annulStub.active
+              ? {
+                  status: String(written.status ?? annulStub.invoiceStatus),
+                  cancel_reason: (written.cancel_reason as string | null) ?? null,
+                }
+              : {}),
+          },
           error: null,
         };
+      }
+      if (table === "inventory_movements" && op === "insert") {
+        // El IN de reversión ya lo registró `insert()`: acá solo se devuelve la
+        // fila como la devolvería el trigger + PostgREST.
+        return { data: annulStub.movements.at(-1) ?? null, error: null };
       }
       return { data: null, error: null };
     }
     switch (table) {
       case "invoices":
+        if (annulStub.active) {
+          annulStub.events.push("read");
+          return {
+            data: { ...stubInvoiceRow(STUB_EMITTED_TOTAL), status: annulStub.invoiceStatus },
+            error: null,
+          };
+        }
         return { data: stubInvoiceRow(STUB_EMITTED_TOTAL), error: null };
+      case "products":
+        return { data: annulStub.product, error: null };
       case "invoice_items":
-        return { data: [stubItemRow()], error: null };
+        return { data: annulStub.active && annulStub.items ? annulStub.items : [stubItemRow()], error: null };
       case "invoice_taxes":
         return { data: [], error: null };
       case "invoice_payments":
@@ -1359,18 +1439,43 @@ function createOverCollectionStubClient(): unknown {
     const orderKeys: Array<{ column: string; ascending: boolean }> = [];
     let rangeFrom = 0;
     let rangeTo = pagedStub.rowCap - 1;
+    /** Guarda de estado del UPDATE (U6): la precondición del compare-and-swap. */
+    let statusGuard: string | undefined;
     // Las tablas NO registradas en `pagedStub` conservan la respuesta fija de
     // siempre: los filtros y la ventana se aceptan y se ignoran.
     const resolve = (single: boolean) =>
       op === "select" && pagedStub.tables[table]
         ? pagedResponse(table, { filters, orderKeys, rangeFrom, rangeTo, single })
-        : response(table, op);
+        : response(table, op, statusGuard);
+    /**
+     * Cierra la consulta. Si el test pidió detener el próximo UPDATE de
+     * `invoices`, la escritura queda EN VUELO hasta que la libere: así se puede
+     * ordenar a mano cuál de dos anulaciones aplica primero.
+     */
+    const settle = (single: boolean): Promise<unknown> => {
+      if (op !== "update" || table !== "invoices" || !annulStub.holdNextWrite) {
+        return Promise.resolve(resolve(single));
+      }
+      annulStub.holdNextWrite = false;
+      return new Promise<void>((release) => {
+        annulStub.releaseWrite = release;
+        annulStub.onWriteHeld?.();
+      }).then(() => resolve(single) as unknown);
+    };
     const query: Record<string, unknown> = {
       select: () => query,
       insert: (payload?: unknown) => {
         op = "insert";
         if (table === "audit_logs") {
           overCollectionStub.auditInsert = payload as Record<string, unknown>;
+        }
+        if (table === "inventory_movements") {
+          const movement = (payload ?? {}) as Record<string, unknown>;
+          annulStub.movements.push({
+            id: `mov-${annulStub.movements.length + 1}`,
+            created_at: "2026-01-01T00:00:00.000Z",
+            ...movement,
+          });
         }
         return query;
       },
@@ -1386,6 +1491,10 @@ function createOverCollectionStubClient(): unknown {
         return query;
       },
       eq: (column: string, value: unknown) => {
+        if (table === "invoices" && column === "status") {
+          statusGuard = String(value);
+          if (annulStub.active) annulStub.guards.push(String(value));
+        }
         filters.push((row) => row[column] === value);
         return query;
       },
@@ -1408,12 +1517,12 @@ function createOverCollectionStubClient(): unknown {
         rangeTo = Math.max(0, count - 1);
         return query;
       },
-      single: () => Promise.resolve(resolve(true)),
-      maybeSingle: () => Promise.resolve(resolve(true)),
+      single: () => settle(true) as Promise<{ data: unknown; error: unknown }>,
+      maybeSingle: () => settle(true) as Promise<{ data: unknown; error: unknown }>,
       // `await` directo sobre la cadena (p. ej. `insert(...)` o
       // `delete().eq(...)`) resuelve al objeto de respuesta, igual que PostgREST.
       then: (onFulfilled?: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>
-        Promise.resolve(resolve(false)).then(onFulfilled, onRejected),
+        settle(false).then(onFulfilled, onRejected),
     };
     return query;
   };
@@ -1719,3 +1828,250 @@ describe("billing: el candado de nómina cerrada no se trunca (U5)", () => {
     expect(overCollectionStub.unexpectedQueries).toEqual([]);
   });
 });
+
+// ---------------- U6: la anulación respeta el candado y guarda el estado -----
+//
+// La auditoría cruzada entre módulos encontró dos huecos en `annulInvoice`:
+//
+// (a) La anulación estaba FUERA del candado de nómina cerrada, que las DOS
+//     ediciones sí aplican (`editInvoiceItems` / `editEmittedInvoiceItems`
+//     rechazan con PAYROLL_LOCKED). Anular una factura cuya comisión ya se pagó
+//     en un período cerrado no devuelve esa plata: el período está congelado,
+//     `commissions` solo bloquea pagos inmediatos NUEVOS sobre una anulada y la
+//     nómina solo excluye anuladas de los cálculos FUTUROS. El ingreso
+//     desaparece del reporte y la comisión queda pagada, sin reverso.
+// (b) El UPDATE de `invoices` no llevaba guarda de estado: dos anulaciones
+//     concurrentes leían el mismo estado anulable e insertaban las DOS el IN de
+//     reversión → stock restaurado dos veces.
+
+/**
+ * Línea de PRODUCTO de la factura: es el origen del IN de reversión, así que es
+ * la que hace observable cuántas veces se restauró stock.
+ */
+function annulProductItemRow() {
+  return {
+    id: overCollectionStub.ITEM_ID,
+    invoice_id: overCollectionStub.INVOICE_ID,
+    item_type: "producto",
+    product_id: PRODUCT_ID,
+    service_id: null,
+    custom_name: null,
+    employee_id: EMPLOYEE_ID,
+    qty: 2,
+    unit_price: 250000,
+    discount: 0,
+    subtotal: 500000,
+    no_commission: true,
+    commission_value: null,
+    commission_mode: "ninguna",
+    commission_percent_override: null,
+    created_at: "2026-01-01T00:00:00.000Z",
+    employees: {
+      full_name: "Ana Pérez",
+      employee_code: "E-1",
+      commission_percent: 0,
+      pay_type: "fijo",
+      payout_mode: "normal",
+    },
+  };
+}
+
+/** Producto de la sede con stock: la reversión le devuelve lo facturado. */
+function annulProductRow() {
+  return {
+    id: PRODUCT_ID,
+    sede_id: overCollectionStub.SEDE_ID,
+    sku: "SKU-1",
+    name: "Shampoo",
+    description: null,
+    stock_qty: 3,
+    min_stock: 0,
+    cost_price: null,
+    sale_price: 250000,
+    commission_value: null,
+    is_active: true,
+  };
+}
+
+describe("billing: la anulación respeta el candado de nómina y guarda el estado (U6)", () => {
+  const ACTOR: BillingActor = {
+    userId: "u-1",
+    sedeId: overCollectionStub.SEDE_ID,
+    roles: ["admin"],
+  };
+
+  function annul(motivo = "Cobro duplicado") {
+    return annulInvoice(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID, { motivo }, ACTOR);
+  }
+
+  beforeEach(() => {
+    annulStub.active = true;
+    annulStub.holdNextWrite = false;
+    annulStub.releaseWrite = null;
+    annulStub.onWriteHeld = null;
+    annulStub.invoiceStatus = "Emitida";
+    annulStub.items = null;
+    annulStub.product = null;
+    annulStub.movements.length = 0;
+    annulStub.guards.length = 0;
+    annulStub.updateMisses = false;
+    annulStub.events.length = 0;
+    overCollectionStub.payments = [];
+    overCollectionStub.invoiceUpdate = null;
+    overCollectionStub.auditInsert = null;
+    overCollectionStub.writes.length = 0;
+    overCollectionStub.unexpectedQueries.length = 0;
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+  });
+
+  afterEach(() => {
+    annulStub.active = false;
+    annulStub.holdNextWrite = false;
+    annulStub.releaseWrite?.();
+    annulStub.releaseWrite = null;
+    annulStub.onWriteHeld = null;
+    annulStub.items = null;
+    annulStub.product = null;
+    annulStub.movements.length = 0;
+    annulStub.guards.length = 0;
+    annulStub.updateMisses = false;
+    annulStub.events.length = 0;
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+  });
+
+  it("no anula una factura cuya comisión ya se pagó en un período cerrado (U6-a)", async () => {
+    seedClosedPayroll(true);
+
+    const outcome = await annul().then(
+      () => "anulado" as const,
+      (error: unknown) => error,
+    );
+
+    expect(outcome).toBeInstanceOf(BillingError);
+    expect(outcome).toMatchObject({ code: "PAYROLL_LOCKED", status: 409 });
+    // El rechazo ocurre ANTES de tocar nada: ni una fila, ni stock, ni auditoría.
+    expect(overCollectionStub.writes).toEqual([]);
+    expect(overCollectionStub.invoiceUpdate).toBeNull();
+    expect(annulStub.movements).toEqual([]);
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("control negativo: sin línea que mencione la factura, la MISMA anulación pasa (U6-a)", async () => {
+    seedClosedPayroll(false);
+
+    const detail = await annul();
+
+    expect(detail.invoice.status).toBe("Anulada");
+    expect(overCollectionStub.invoiceUpdate?.status).toBe("Anulada");
+    expect(overCollectionStub.invoiceUpdate?.cancel_reason).toBe("Cobro duplicado");
+    // Mismo volumen de historial, otra respuesta: lo que frena arriba son los
+    // datos, no un tope del doble. Y el candado lo miró TODO (pagina).
+    expect(pagedStub.windows.some((window) => window.table === "payroll_items" && window.from > 0)).toBe(true);
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("si el candado no puede completar la lectura, la anulación se RECHAZA (U6-a)", async () => {
+    seedClosedPayroll(true);
+    // El historial no se puede leer entero (falla la segunda página).
+    pagedStub.failAt = { payroll_items: [2] };
+
+    const outcome = await annul().then(
+      () => "anulado" as const,
+      (error: unknown) => error,
+    );
+
+    // Nunca un `false` por no haber podido mirar: sin historial completo no se
+    // sabe si la comisión ya estaba pagada, así que la anulación se rechaza.
+    expect(outcome).toBeInstanceOf(BillingError);
+    expect(outcome).toMatchObject({ code: "READ_INCOMPLETE" });
+    expect(overCollectionStub.writes).toEqual([]);
+    expect(overCollectionStub.invoiceUpdate).toBeNull();
+    expect(annulStub.movements).toEqual([]);
+  });
+
+  it("dos anulaciones concurrentes restauran el stock UNA sola vez (U6-b)", async () => {
+    annulStub.items = [annulProductItemRow()];
+    annulStub.product = annulProductRow();
+
+    // Las DOS anulaciones entran con la misma lectura vieja (`Emitida`) y sus
+    // dos escrituras quedan en vuelo. El doble detiene la de la primera y la
+    // aplica después de la de la segunda: es el orden real de la carrera (la
+    // que aplica segunda es la que pierde), con el intercalado bajo control.
+    annulStub.holdNextWrite = true;
+    const writeHeld = new Promise<void>((resolve) => {
+      annulStub.onWriteHeld = resolve;
+    });
+    const first = annul();
+    await writeHeld;
+    // Non-vacuidad: la primera ya leyó `Emitida` y todavía no escribió nada.
+    expect(annulStub.events).toEqual(["read"]);
+
+    const second = annul();
+    const secondResult = await second.then(
+      () => "anulado" as const,
+      (error: unknown) => error,
+    );
+    // La segunda aplica ESCRITURA y termina su reversión con la fila ya Anulada.
+    expect(secondResult).toBe("anulado");
+
+    if (annulStub.releaseWrite) annulStub.releaseWrite();
+    const firstResult = await first.then(
+      () => "anulado" as const,
+      (error: unknown) => error,
+    );
+
+    // La carrera existió de verdad: las DOS leyeron antes de la primera
+    // escritura (si el intercalado cambiara, esto falla a la vista en vez de
+    // dejar pasar la prueba por un camino que ya no es el de la carrera).
+    expect(annulStub.events).toEqual(["read", "read", "write", "write"]);
+    // El síntoma: el stock se devuelve UNA vez, no dos.
+    expect(annulStub.movements).toHaveLength(1);
+    expect(annulStub.movements[0]).toMatchObject({ product_id: PRODUCT_ID, type: "IN", qty: 2 });
+    // La que aplicó segunda afecta 0 filas y se rechaza con su código.
+    expect(firstResult).toBeInstanceOf(BillingError);
+    expect(firstResult).toMatchObject({ code: "ANNUL_CONFLICT", status: 409 });
+    // El UPDATE lleva el estado leído como precondición: compare-and-swap.
+    expect(annulStub.guards).toEqual(["Emitida", "Emitida"]);
+    // Una sola anulación: una sola auditoría.
+    expect(overCollectionStub.writes.filter((write) => write === "audit_logs.insert")).toHaveLength(1);
+  });
+
+  it("un UPDATE que afecta 0 filas se reporta con su código y no toca el stock (U6-b)", async () => {
+    annulStub.items = [annulProductItemRow()];
+    annulStub.product = annulProductRow();
+    // El estado de la fila ya no es el leído (otra operación ganó): 0 filas.
+    annulStub.updateMisses = true;
+
+    const outcome = await annul().then(
+      () => "anulado" as const,
+      (error: unknown) => error,
+    );
+
+    expect(outcome).toBeInstanceOf(BillingError);
+    expect(outcome).toMatchObject({ code: "ANNUL_CONFLICT", status: 409 });
+    expect(annulStub.guards).toEqual(["Emitida"]);
+    expect(annulStub.movements).toEqual([]);
+    expect(overCollectionStub.auditInsert).toBeNull();
+  });
+
+  it("un estado no anulable se sigue rechazando ANTES de la guarda (U6-b)", async () => {
+    annulStub.invoiceStatus = "Anulada";
+
+    const outcome = await annul().then(
+      () => "anulado" as const,
+      (error: unknown) => error,
+    );
+
+    expect(outcome).toBeInstanceOf(BillingError);
+    expect(outcome).toMatchObject({ code: "ANNUL_INVALID", status: 409 });
+    expect(overCollectionStub.writes).toEqual([]);
+    expect(annulStub.guards).toEqual([]);
+  });
+});
+

@@ -741,7 +741,7 @@ function toBillingError(error: unknown): BillingError {
   if (error instanceof PagedReadError) {
     return new BillingError(
       error.code,
-      `${error.message} La edición se rechaza: sin el historial de nómina completo no se puede saber si la comisión de esta factura ya estaba pagada.`,
+      `${error.message} La operación se rechaza: sin el historial de nómina completo no se puede saber si la comisión de esta factura ya estaba pagada.`,
       500,
     );
   }
@@ -1059,6 +1059,22 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
  * FAC-04/FAC-06: anula (solo Emitida/Pagada, motivo obligatorio). Revierte
  * stock con IN por cada producto y deja el motivo en cancel_reason.
  * Queda en audit_logs (TRA-01, T8). Solo admin.
+ *
+ * U6: dos candados que faltaban, sin cambiar la política.
+ *
+ * (a) La anulación TAMBIÉN respeta el candado de nómina cerrada que las dos
+ *     ediciones ya aplican (`editInvoiceItems` / `editEmittedInvoiceItems`,
+ *     `PAYROLL_LOCKED`). No es una exención deliberada: anular es la otra forma
+ *     de reescribir la plata de la factura, y con el período cerrado no hay
+ *     reverso posible de la comisión ya pagada (el período está congelado,
+ *     `commissions` solo bloquea pagos inmediatos NUEVOS sobre una anulada y
+ *     la nómina solo excluye anuladas de los cálculos FUTUROS). Faltaba acá,
+ *     punto.
+ *
+ * (b) El UPDATE es compare-and-swap: lleva el estado leído como precondición.
+ *     Dos anulaciones simultáneas leían el mismo estado anulable e insertaban
+ *     las DOS el IN de reversión (stock devuelto dos veces). Ahora la que
+ *     aplica segunda afecta 0 filas y se rechaza.
  */
 export async function annulInvoice(
   sedeId: string,
@@ -1081,13 +1097,42 @@ export async function annulInvoice(
     throw new BillingError("ANNUL_INVALID", annulBlockedMessage(detail.invoice.status), 409);
   }
 
+  // U6-a: mismo candado que las dos ediciones. Si la lectura del historial no
+  // se puede completar, `invoiceInClosedPayroll` LANZA (READ_INCOMPLETE) y la
+  // anulación se rechaza: nunca un `false` por no haber podido mirar.
+  if (await invoiceInClosedPayroll(db, sedeId, id)) {
+    throw new BillingError(
+      "PAYROLL_LOCKED",
+      "La factura ya entró en una nómina cerrada: al empleado pagado no se le toca, y anularla dejaría esa comisión pagada sin reverso.",
+      409,
+    );
+  }
+
+  // U6-b: el estado leído es la precondición del UPDATE. Si otra anulación (o
+  // un cobro) movió la fila entre la lectura y esta escritura, se afectan 0
+  // filas y la reversión de stock NO se ejecuta. Sin esta guarda, dos
+  // anulaciones simultáneas devolvían el stock dos veces.
   const { data: updated, error: updateError } = await db
     .from("invoices")
     .update({ status: "Anulada", cancel_reason: motivo, closed_by: actor.userId, closed_at: new Date().toISOString() })
     .eq("id", id)
+    .eq("status", detail.invoice.status)
     .select(INVOICE_SELECT)
     .single();
-  if (updateError || !updated) throw new BillingError("INTERNAL", "Error interno.", 500);
+  if (updateError || !updated) {
+    // Carrera perdida contra la guarda de estado (PGRST116 = `.single()` sin
+    // filas, el patrón del cliente Supabase y el mismo que usa el cierre de
+    // caja para SHIFT_ALREADY_CLOSED).
+    const errorCode = (updateError as { code?: string } | null)?.code;
+    if (errorCode === "PGRST116") {
+      throw new BillingError(
+        "ANNUL_CONFLICT",
+        "La factura ya no está en el estado con el que se leyó (posible anulación simultánea): no se anuló nada, vuelva a intentarlo.",
+        409,
+      );
+    }
+    throw new BillingError("INTERNAL", "Error interno.", 500);
+  }
 
   const productItems = detail.items
     .filter((item) => item.item_type === "producto" && item.product_id)
