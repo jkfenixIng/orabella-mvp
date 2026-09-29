@@ -6,6 +6,33 @@ defectos de dinero de esta ola vivieron exactamente en los bordes: el arqueo con
 cobros de factura, el recargo se perdía en el camino a caja, y el tope de sobrepago dejaba de funcionar
 pasado un límite.
 
+## Estado de los hallazgos (actualizado 2026-09-29)
+
+| # | Hallazgo | Estado |
+| --- | --- | --- |
+| 1 | Truncamiento silencioso en el cálculo de nómina | **CERRADO** `e11b561` |
+| 2 | El candado de nómina cerrada fallaba abierto | **CERRADO** `e11b561` |
+| 3 | Anulación: comisión viva sobre factura anulada + doble restauración de stock | **CERRADO** `ea696b5` |
+| 4 | `commission_payouts` sin tope en la base | **CERRADO** `7e89aa6` (migración `034`) |
+| 5 | Transiciones de vale sin guarda de estado | **CERRADO** `e6b9c4f` |
+| 6 | Pagos de nómina invisibles para el arqueo | **ABIERTO — decisión del dueño** (¿la nómina en efectivo sale del cajón?) |
+| 7 | `commission_mode` sin consumidor | **ABIERTO — decisión del dueño** (¿el modo declarado manda o se elimina el campo?) |
+| 8 | Cobros no idempotentes con compensación best-effort | **ABIERTO** (necesita claves naturales o RPC) |
+| 9 | Deltas de stock sin lock en las ediciones | **ABIERTO** |
+| 10 | Identidad con dos escritores y sin transacción | **ABIERTO** |
+| 11 | La 032 referenciada sin existir | **CERRADO** `4975d5e` — el dueño dio de baja la reparación histórica y el borrador se eliminó |
+| 12 | Columnas de entrada aceptan centavos | **ACEPTADO** — el histórico es de la era del centavo y la app no está en producción |
+
+Familia de topes, cerrada en tres tandas: `e11b561` (nómina + candado), `868d037`
+(`listEmployees(500)` --un empleado no se liquidaba--, reglas de comisión de la pantalla, `paid`/`remaining` de
+período, marca `over_tope` que mentía) y `e6b9c4f` (el empleado 51 veía su nómina vacía; `countInvoices`
+armaba una URL que en producción es un 414).
+
+Huecos adyacentes **reportados y no tocados**, con su motivo: `trg_payroll_payments_cap` (`007`) no toma
+lock de fila, así que `payroll_payments` puede tener la misma ventana que la 034 acaba de cerrar; y el
+descuento de nómina todavía escribe con un `in(...)` sin lotes (`payroll/service.ts:919`), acotado por los
+vales del período.
+
 ## Method
 Read-only, sobre el árbol ya arreglado (HEAD `2baa716`). La matriz se levantó leyendo los imports y las
 escrituras a tablas, no adivinando por nombres. Para cada par: quién llama a quién (`path:line`), el
