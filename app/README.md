@@ -42,7 +42,7 @@ npm test        # vitest run
 app/                      # App Router (layout, page, globals.css, api/v1/*)
 src/features/{admin,alerts,auth,billing,cash,commissions,inventory,payroll}/  # un módulo por feature, con README propio
 src/shared/{components,lib,config}/  # theme, api-response, supabase client/server, audit, rate-limit, env
-supabase/migrations/      # SQL versionado (001 fundación; dominio en T2→T7; endurecimiento en T8; 009→030 ampliaciones)
+supabase/migrations/      # SQL versionado (001 fundación; dominio en T2→T7; endurecimiento en T8; 009→031 ampliaciones)
 supabase/seeds/           # seeds de aceptación §11 (T8, idempotentes)
 tests/                    # suites vitest + e2e Playwright (tests/e2e/)
 ```
@@ -61,11 +61,11 @@ tests/                    # suites vitest + e2e Playwright (tests/e2e/)
   validación Zod server-side en toda escritura.
 - **Migraciones:** `supabase/migrations/NNN_*.sql`, `001_foundation.sql` solo trae
   `pgcrypto` + trigger `set_updated_at()` (sin tablas de dominio). Aplicar en
-  orden `001 → 030` en un proyecto Supabase **nuevo**; luego
+  orden `001 → 031` en un proyecto Supabase **nuevo**; luego
   `supabase/seeds/acceptance.sql` (idempotente, datos ficticios §11).
   Tras T8 (001→008) la numeración continúa con endurecimiento (017/018),
   control de caja (009/010), alertas (011–014), comisiones (016/020/027/030) y
-  ajustes de admin, factura y vales (015, 019, 021–026, 028, 029).
+  ajustes de admin, factura y vales (015, 019, 021–026, 028, 029, 031).
 
 ## Seguridad (T8 — endurecimiento)
 

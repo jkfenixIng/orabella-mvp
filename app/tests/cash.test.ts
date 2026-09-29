@@ -29,6 +29,11 @@ import {
   sumMethodTotal,
   voucherOutByMethod,
 } from "@/src/features/cash/schemas";
+import {
+  invoiceCollectionsSummary,
+  mergeShiftMoney,
+  sumShiftMoneyByMethod,
+} from "@/src/features/cash/service";
 
 // ------------------------------------------------- base encadenada (CAJ-01) ---
 
@@ -551,5 +556,333 @@ describe("cash: tope de salidas en efectivo = 50% de la base del turno", () => {
         amount: 50000,
       })?.code,
     ).toBe(CASH_OUT_LIMIT_CODE);
+  });
+});
+
+// ------------------------------ T0-a (C1): dos ledgers, cada peso una vez ---
+
+describe("cash: T0-a (C1) el arqueo suma cada cobro UNA vez", () => {
+  it("une movimientos de cajón y cobros de factura del turno", () => {
+    const rows = mergeShiftMoney(
+      [{ amount: 30000, method_code: "efectivo" }],
+      [
+        { amount: 70000, method_code: "efectivo" },
+        { amount: 20000, method_code: "nequi" },
+      ],
+    );
+    expect(rows).toHaveLength(3);
+    expect([...sumShiftMoneyByMethod(rows)]).toEqual([
+      ["efectivo", 100000],
+      ["nequi", 20000],
+    ]);
+  });
+
+  it("normaliza montos string y redondea a centavos por método", () => {
+    const rows = mergeShiftMoney(
+      [{ amount: "1000.555", method_code: "efectivo" }],
+      null,
+    );
+    expect(sumShiftMoneyByMethod(rows).get("efectivo")).toBe(1000.56);
+  });
+
+  it("degrada a vacío cuando el turno no tiene cobros", () => {
+    expect(mergeShiftMoney(null, undefined)).toEqual([]);
+    expect(sumShiftMoneyByMethod([])).toEqual(new Map());
+    expect(sumShiftMoneyByMethod(mergeShiftMoney([], [])).size).toBe(0);
+  });
+});
+
+// ------------- T0-a (Defecto 1): el tope descuenta el recargo emitido ---
+
+describe("cash: T0-a (Defecto 1) el tope de cobro descuenta el recargo emitido", () => {
+  const sql = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "031_cash_invoice_payment_integrity.sql"),
+    "utf8",
+  );
+
+  /**
+   * Réplica pura de la condición del trigger 031
+   * (`check_invoice_payments_cap`), para fijar la aritmética sin base de
+   * datos. Si alguien edita el trigger, el test estructural de abajo falla.
+   */
+  function capRejects(args: {
+    total: number;
+    surcharge: number;
+    paidNet: number;
+    newNet: number;
+  }): boolean {
+    return args.paidNet + args.newNet - (args.total - args.surcharge) > 0.009;
+  }
+
+  it("la condición del trigger usa el NETO FACTURADO (total − surcharge)", () => {
+    const body = sql.slice(sql.indexOf("check_invoice_payments_cap()"));
+    expect(body).toContain("SELECT total, surcharge INTO v_total, v_surcharge");
+    expect(body).toContain(
+      "v_paid_net + v_new_net - (v_total - coalesce(v_surcharge, 0)) > 0.009",
+    );
+    // La versión con hueco (neto contra `total`) no puede volver.
+    expect(body).not.toContain("v_paid_net + v_new_net - v_total > 0.009");
+  });
+
+  it("rechaza el contraejemplo del verificador (sobrecobro del tamaño del recargo)", () => {
+    // Factura 100000 con porción de tarjeta de neto 96000 (fee 4800):
+    // surcharge 4800, total 104800, saldo 4000.
+    const invoice = { total: 104800, surcharge: 4800 };
+    expect(invoice.total - invoice.surcharge).toBe(100000);
+    // 1er splitPayment {efectivo, 4000}: completa el neto facturado → pasa.
+    expect(capRejects({ ...invoice, paidNet: 96000, newNet: 4000 })).toBe(false);
+    // 2do splitPayment concurrente con la misma lectura vieja del saldo
+    // (4000): Σnet 104000 > 100000 → RECHAZADO (antes pasaba: 104000 ≤ 104800).
+    expect(capRejects({ ...invoice, paidNet: 100000, newNet: 4000 })).toBe(true);
+    // El bruto que habría quedado sin el tope: 108800 > 104800.
+    expect(96000 + 4800 + 4000 + 4000).toBe(108800);
+    expect(108800).toBeGreaterThan(invoice.total);
+  });
+
+  it("todos los flujos legítimos siguen pasando (neto cobrado ≤ neto facturado)", () => {
+    // [total, surcharge, paidNet, newNet, etiqueta]
+    const legit: Array<[number, number, number, number, string]> = [
+      [100000, 0, 0, 100000, "emitir con efectivo"],
+      [105000, 5000, 0, 100000, "emitir con tarjeta (neto 100000, fee 5000)"],
+      [103000, 3000, 0, 40000, "emitir mixto, porción 1 (efectivo 40000)"],
+      [103000, 3000, 0, 60000, "emitir mixto, porción 2 (tarjeta 60000)"],
+      [100000, 0, 0, 100000, "pagar después en efectivo"],
+      [100000, 0, 0, 100000, "pagar después con tarjeta (bruto 105000 > total)"],
+      [100000, 0, 40000, 60000, "parcial de caja + resto"],
+      [100000, 0, 0, 60000, "carrera: primero de dos parciales de 60000"],
+      [104800, 4800, 96000, 4000, "cobro del saldo con recargo emitido"],
+    ];
+    const rejected = legit
+      .map(([total, surcharge, paidNet, newNet, label]) => ({
+        label,
+        rejected: capRejects({ total, surcharge, paidNet, newNet }),
+      }))
+      .filter((row) => row.rejected);
+    expect(rejected).toEqual([]);
+  });
+
+  it("sigue rechazando las carreras sin recargo (no hay regresión del tope)", () => {
+    // Dos cobros completos concurrentes de 100000 sobre una factura de 100000.
+    expect(capRejects({ total: 100000, surcharge: 0, paidNet: 0, newNet: 100000 })).toBe(false);
+    expect(capRejects({ total: 100000, surcharge: 0, paidNet: 100000, newNet: 100000 })).toBe(true);
+    // Dos parciales de 60000: el segundo ya supera el neto facturado.
+    expect(capRejects({ total: 100000, surcharge: 0, paidNet: 60000, newNet: 60000 })).toBe(true);
+  });
+});
+
+// ------- T0-a (Defecto 2): el espejo primero, reversa verificada ---
+
+describe("cash: T0-a (Defecto 2) el espejo va antes que la fila de cajón", () => {
+  const service = readFileSync(
+    join(process.cwd(), "src", "features", "cash", "service.ts"),
+    "utf8",
+  );
+  const start = service.indexOf("export async function registerPayment");
+  const body = service.slice(start, service.indexOf("export async function", start + 10));
+
+  it("escribe invoice_payments antes de payments (no puede dejar un huérfano invisible)", () => {
+    const mirror = body.indexOf('.from("invoice_payments")');
+    const drawer = body.indexOf('.from("payments")');
+    expect(mirror).toBeGreaterThan(-1);
+    expect(drawer).toBeGreaterThan(mirror);
+    // La fila de cajón con factura solo existe si el espejo ya existe.
+    expect(body.slice(drawer)).toContain("invoice_id: input.invoice_id ?? null");
+  });
+
+  it("la reversa del espejo verifica el error del DELETE y grita la falla", () => {
+    expect(body).toMatch(
+      /const \{ error: rollbackError \} = await db\s*\.from\("invoice_payments"\)\s*\.delete\(\)\s*\.eq\("id", mirrorId\)/,
+    );
+    expect(body).toContain("if (rollbackError) {");
+    expect(body).toContain('"PAYMENT_ROLLBACK_FAILED"');
+    expect(body).toContain("console.error(");
+    // Ninguna reversa sobre `payments` queda sin comprobar (la del defecto).
+    expect(body).not.toContain('db.from("payments").delete()');
+  });
+
+  it("el catch externo no puede tragarse el error gritado", () => {
+    // toCashError devuelve el CashError tal cual: el código llega al caller.
+    expect(service).toContain("if (error instanceof CashError) return error;");
+    expect(body).toContain("throw toCashError(error);");
+  });
+
+  it("el espejo fallido no deja nada que revertir (P0001 → OVERPAID)", () => {
+    const mirrorBlock = body.slice(
+      body.indexOf('.from("invoice_payments")'),
+      body.indexOf('.from("payments")'),
+    );
+    expect(mirrorBlock).toContain('(mirrorError as { code?: string }).code === "P0001"');
+    expect(mirrorBlock).not.toContain(".delete()");
+  });
+});
+
+// ------------- T0-a: total y número de facturas cobradas (puro) ---
+
+describe("cash: total y número de facturas cobradas del turno (puro)", () => {
+  it("suma los cobros y cuenta facturas distintas (varias porciones = una)", () => {
+    expect(
+      invoiceCollectionsSummary([
+        { invoice_id: "f1", amount: 60000 },
+        { invoice_id: "f1", amount: 40000 },
+        { invoice_id: "f2", amount: 25000 },
+      ]),
+    ).toEqual({ total: 125000, count: 2 });
+  });
+
+  it("normaliza montos string y degrada a cero sin cobros", () => {
+    expect(invoiceCollectionsSummary([{ invoice_id: "f1", amount: "1000.555" }])).toEqual({
+      total: 1000.56,
+      count: 1,
+    });
+    expect(invoiceCollectionsSummary([])).toEqual({ total: 0, count: 0 });
+  });
+});
+
+describe("cash: T0-a (C1) los lectores ya no unen el ledger completo", () => {
+  const service = readFileSync(
+    join(process.cwd(), "src", "features", "cash", "service.ts"),
+    "utf8",
+  );
+
+  /**
+   * Cadena desde cada `.from("<tabla>")` hasta el siguiente `.from(`: cubre la
+   * consulta y su manejo de error inmediato.
+   */
+  function dbChains(source: string, table: string): string[] {
+    return source
+      .split(`.from("${table}")`)
+      .slice(1)
+      .map((chunk) => {
+        const end = chunk.indexOf(".from(");
+        return end === -1 ? chunk : chunk.slice(0, end);
+      });
+  }
+
+  it("los tres lectores de payments filtran invoice_id IS NULL", () => {
+    const readers = dbChains(service, "payments").filter((chain) =>
+      chain.trimStart().startsWith(".select("),
+    );
+    expect(readers).toHaveLength(3); // cierre, vista del día, historial
+    for (const chain of readers) {
+      expect(chain).toContain('.is("invoice_id", null)');
+    }
+  });
+
+  it("la fila espejo de invoice_payments lleva el turno que cobra", () => {
+    const mirror = dbChains(service, "invoice_payments").find((chain) =>
+      chain.trimStart().startsWith(".insert("),
+    );
+    expect(mirror).toBeDefined();
+    expect(mirror).toContain("cash_shift_id: shift.id");
+  });
+
+  it("el cierre solo pisa un turno abierto (ni doble cierre ni conteos dobles)", () => {
+    const start = service.indexOf("export async function closeShift");
+    const close = service.slice(start, service.indexOf("export async function", start + 10));
+    const updates = dbChains(close, "cash_shifts").filter((chain) =>
+      chain.trimStart().startsWith(".update("),
+    );
+    expect(updates).toHaveLength(1);
+    expect(updates[0]).toContain('.eq("status", "abierto")');
+    expect(close).toContain('"SHIFT_ALREADY_CLOSED"');
+  });
+
+  it("traduce P0001 del tope de factura a OVERPAID (C2)", () => {
+    expect(service).toContain('(mirrorError as { code?: string }).code === "P0001"');
+    expect(service).toContain(
+      'throw new CashError("OVERPAID", "El pago supera el saldo pendiente de la factura.", 422);',
+    );
+  });
+
+  it("la rama sin turno sigue viva solo por filas NULL (no solapa)", () => {
+    const fetcher = service.slice(service.indexOf("async function fetchInvoicePaymentsByShift"));
+    expect(fetcher).toContain('.is("cash_shift_id", null)');
+    expect(fetcher).toContain('.in("cash_shift_id", shiftIds)');
+  });
+});
+
+describe("billing: T0-a (C2) tope de cobro en BD traducido a OVERPAID", () => {
+  const service = readFileSync(
+    join(process.cwd(), "src", "features", "billing", "service.ts"),
+    "utf8",
+  );
+
+  it("los dos INSERT de invoice_payments traducen P0001 a OVERPAID", () => {
+    const inserts = service
+      .split('.from("invoice_payments")')
+      .slice(1)
+      .map((chunk) => {
+        const end = chunk.indexOf(".from(");
+        return end === -1 ? chunk : chunk.slice(0, end);
+      })
+      .filter((chain) => chain.trimStart().startsWith(".insert("));
+    expect(inserts).toHaveLength(2); // emitir con pago / cobrar después
+    for (const chain of inserts) {
+      expect(chain).toContain('"P0001"');
+      expect(chain).toContain('"OVERPAID"');
+    }
+  });
+});
+
+describe("migración 031_cash_invoice_payment_integrity.sql (T0-a)", () => {
+  const sql = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "031_cash_invoice_payment_integrity.sql"),
+    "utf8",
+  );
+
+  it("backfillea solo filas con cash_shift_id NULL y nunca borra", () => {
+    expect(sql).toContain("UPDATE public.invoice_payments");
+    expect(sql.match(/pay\.cash_shift_id IS NULL/g)).toHaveLength(2);
+    expect(sql).not.toMatch(/DELETE\s+FROM/i);
+    expect(sql).not.toMatch(/TRUNCATE/i);
+  });
+
+  it("atribuye primero al turno que cobró y cae al turno de emisión", () => {
+    expect(sql).toContain("FROM public.payments");
+    expect(sql).toContain("HAVING count(DISTINCT cash_shift_id) = 1");
+    expect(sql).toContain("SET cash_shift_id = inv.cash_shift_id");
+    expect(sql).toContain("FROM public.invoices AS inv");
+  });
+
+  it("el backfill corre antes de crear el trigger (orden deliberado)", () => {
+    expect(sql.indexOf("UPDATE public.invoice_payments")).toBeLessThan(
+      sql.indexOf("CREATE OR REPLACE FUNCTION public.check_invoice_payments_cap"),
+    );
+  });
+
+  it("el trigger replica trg_payroll_payments_cap y bloquea el padre", () => {
+    expect(sql).toContain("BEFORE INSERT ON public.invoice_payments");
+    expect(sql).toContain("FOR EACH ROW EXECUTE FUNCTION public.check_invoice_payments_cap()");
+    expect(sql).toContain("FOR UPDATE");
+    expect(sql).toContain("DROP TRIGGER IF EXISTS trg_invoice_payments_cap");
+    expect(sql).toContain("CREATE TRIGGER trg_invoice_payments_cap");
+    expect(sql).toContain("SET search_path = public");
+  });
+
+  it("el tope usa la porción NETA (el recargo no es saldo facturado)", () => {
+    const body = sql.slice(sql.indexOf("check_invoice_payments_cap()"));
+    expect(body).toContain("coalesce(NEW.amount, 0) - coalesce(NEW.fee_amount, 0)");
+    expect(body).toContain("sum(amount - fee_amount)");
+    expect(body).toContain("> 0.009");
+    // RAISE EXCEPTION plano = P0001, el mismo código que nómina.
+    expect(body).toContain("RAISE EXCEPTION");
+    expect(body).not.toMatch(/errcode\s*=/);
+  });
+
+  it("no crea el índice único (shift_id, phase) incompatible con los conteos", () => {
+    expect(sql).not.toMatch(/CREATE UNIQUE INDEX[\s\S]{0,200}?cash_shift_counts/);
+    // La razón y la clave correcta por línea quedan documentadas en el archivo.
+    expect(sql).toContain("cash_shift_counts (shift_id, phase, method_code");
+  });
+
+  it("documenta la re-atribución histórica y cómo listar los turnos afectados", () => {
+    // El backfill re-atribuye cobros históricos: turnos cerrados perderán
+    // dinero en su recálculo, sin asiento compensatorio (expected_cash es
+    // snapshot). Quien aplique el archivo debe poder listarlos.
+    expect(sql).toContain("RE-ATRIBUYE");
+    expect(sql).toContain("SIN asiento compensatorio");
+    expect(sql).toContain("expected_cash");
+    expect(sql).toContain("turno_emisor");
+    expect(sql).toContain("turno_cobrador");
   });
 });

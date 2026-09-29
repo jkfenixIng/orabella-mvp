@@ -859,6 +859,11 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
       );
       if (paymentsError) {
         console.error("PG invoice_payments insert:", JSON.stringify(paymentsError));
+        // Carrera perdida contra trg_invoice_payments_cap (031): mismo P0001
+        // que nómina traduce en payroll/service.ts.
+        if ((paymentsError as { code?: string }).code === "P0001") {
+          throw new BillingError("OVERPAID", "Las porciones superan el saldo pendiente.", 422);
+        }
         throw new BillingError("INTERNAL", "Error interno.", 500);
       }
     }
@@ -1648,7 +1653,14 @@ export async function splitPayment(
       cash_shift_id: payShift.id,
     })),
   );
-  if (insertError) throw new BillingError("INTERNAL", "Error interno.", 500);
+  if (insertError) {
+    // Carrera perdida contra trg_invoice_payments_cap (031): mismo P0001 que
+    // nómina traduce en payroll/service.ts.
+    if ((insertError as { code?: string }).code === "P0001") {
+      throw new BillingError("OVERPAID", "Las porciones superan el saldo pendiente.", 422);
+    }
+    throw new BillingError("INTERNAL", "Error interno.", 500);
+  }
 
   if (check.fullyPaid && detail.invoice.status === "Emitida") {
     const { data: updated, error: updateError } = await db
