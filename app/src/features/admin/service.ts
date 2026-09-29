@@ -14,6 +14,7 @@ import {
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser, hashPassword } from "@/src/features/auth/service";
+import { readAllPaged } from "@/src/shared/lib/paged";
 import { unstable_cache } from "next/cache";
 
 // Compatibilidad: la identidad de estos guardas vive en
@@ -197,6 +198,40 @@ async function fetchEmployees(sedeId: string, limit?: number): Promise<EmployeeR
     .limit(clampLimit(limit));
   if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
   return (data ?? []) as EmployeeRow[];
+}
+
+/**
+ * U7: la planta COMPLETA de la sede, sin el tope del listado.
+ *
+ * `fetchEmployees` existe para LISTAR con respuesta instantánea: 50 filas por
+ * defecto y 500 como techo interno (`clampLimit`). Ese tope es correcto para una
+ * lista de navegación y equivocado para la nómina: `calculatePayroll` armaba su
+ * alineación con `listEmployees(sedeId, 500)` y `clampLimit` recortaba a 500, así
+ * que el empleado 501 de una sede no quedaba mal pagado —quedaba AUSENTE de la
+ * nómina, sin un solo error—. El conjunto acá SÍ está acotado por la sede, así
+ * que lo correcto es leerlo entero por páginas, con `order()` determinista.
+ *
+ * Sin caché a propósito: una sede cuya última alta es de hace un minuto tiene que
+ * entrar en la nómina de hoy, y una planta cacheada es una planta incompleta (ese
+ * es exactamente el defecto que esto cierra). El fallo de la lectura se PROPAGA
+ * (`PagedReadError`): el llamador de plata lo convierte en un error de negocio a
+ * la vista, nunca en "leí lo que alcancé".
+ */
+export async function listAllEmployees(sedeId: string): Promise<EmployeeRow[]> {
+  const db = await adminDb();
+  return readAllPaged<EmployeeRow>({
+    table: "employees",
+    fetchPage: (from, to) =>
+      db
+        .from("employees")
+        .select(EMPLOYEE_SELECT)
+        .eq("sede_id", sedeId)
+        // El nombre es el orden histórico de la lista; `id` desempata para que
+        // dos homónimos no caigan en páginas distintas (ni se repitan ni falten).
+        .order("full_name")
+        .order("id")
+        .range(from, to),
+  });
 }
 
 export async function getEmployee(id: string): Promise<EmployeeRow> {
@@ -474,9 +509,10 @@ export interface PaymentMethodRow {
   name: string;
   is_active: boolean;
   arqueable: boolean;
+  fee_percent: number;
 }
 
-const PAYMENT_METHOD_SELECT = "id, sede_id, code, name, is_active, arqueable";
+const PAYMENT_METHOD_SELECT = "id, sede_id, code, name, is_active, arqueable, fee_percent";
 
 async function fetchPaymentMethods(sedeId: string, limit?: number): Promise<PaymentMethodRow[]> {
   const db = await adminDb();
@@ -503,6 +539,7 @@ export async function upsertPaymentMethod(raw: unknown): Promise<PaymentMethodRo
     name: input.name,
     ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
     ...(input.arqueable !== undefined ? { arqueable: input.arqueable } : {}),
+    ...(input.fee_percent !== undefined ? { fee_percent: input.fee_percent } : {}),
   };
   const { data, error } = await db
     .from("payment_methods")

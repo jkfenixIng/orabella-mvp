@@ -8,16 +8,19 @@ const badgeVariants = cva(
   {
     variants: {
       variant: {
+        // Las clases .bg-*-light y .text-* (design-tokens.css) son clases
+        // custom con override propio en .dark; los peldaños -50/-200/-700/-800
+        // no están expuestos en @theme y no generaban ninguna utilidad.
         default:
-          'border-primary-200 bg-primary-50 text-primary-700 dark:border-primary-800 dark:bg-primary-900 dark:text-primary-50',
+          'border-transparent bg-primary-light text-primary-color',
         secondary:
-          'border-secondary-200 bg-secondary-50 text-secondary-700 dark:border-secondary-800 dark:bg-secondary-800 dark:text-secondary-50',
+          'border-border-color bg-surface-hover text-text-secondary',
         success:
-          'border-success-200 bg-success-50 text-success-700 dark:border-success-800 dark:bg-success-900 dark:text-success-50',
+          'border-transparent bg-success-light text-success',
         warning:
-          'border-warning-200 bg-warning-50 text-warning-700 dark:border-warning-800 dark:bg-warning-900 dark:text-warning-50',
+          'border-transparent bg-warning-light text-warning',
         destructive:
-          'border-error-200 bg-error-50 text-error-700 dark:border-error-800 dark:bg-error-900 dark:text-error-50',
+          'border-transparent bg-error-light text-error',
         outline: 'border-border-color bg-transparent text-text-secondary',
       },
       size: {

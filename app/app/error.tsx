@@ -22,7 +22,7 @@ export default function AppError({
   return (
     <main className="mx-auto flex min-h-screen max-w-xl flex-col items-center justify-center gap-4 px-6 py-12 text-center">
       <h1 className="text-2xl font-semibold">Algo salió mal</h1>
-      <p className="text-sm text-slate-500 dark:text-slate-400">
+      <p className="text-sm text-text-secondary">
         Ocurrió un error inesperado al cargar esta sección. Podés intentarlo de nuevo.
       </p>
       <button

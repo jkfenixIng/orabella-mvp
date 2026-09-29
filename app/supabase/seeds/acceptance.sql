@@ -183,16 +183,18 @@ position, pay_type, salary_fixed, commission_percent)
   DO UPDATE SET percent = EXCLUDED.percent, is_active = EXCLUDED.is_active, updated_at = now();
 
   -- ------------------------------------------- métodos de pago (6, activos) ---
-  INSERT INTO public.payment_methods (sede_id, code, name, is_active)
+  INSERT INTO public.payment_methods (sede_id, code, name, is_active, fee_percent)
   VALUES
-    (v_sede, 'efectivo', 'Efectivo', true),
-    (v_sede, 'transferencia_normal', 'Transferencia / PSE', true),
-    (v_sede, 'nequi', 'Nequi', true),
-    (v_sede, 'daviplata', 'Daviplata', true),
-    (v_sede, 'bre-b', 'Bre-B', true),
-    (v_sede, 'tarjeta', 'Tarjeta', true)
+    (v_sede, 'efectivo', 'Efectivo', true, 0),
+    (v_sede, 'transferencia_normal', 'Transferencia / PSE', true, 0),
+    (v_sede, 'nequi', 'Nequi', true, 0),
+    (v_sede, 'daviplata', 'Daviplata', true, 0),
+    (v_sede, 'bre-b', 'Bre-B', true, 0),
+    (v_sede, 'tarjeta', 'Tarjeta', true, 5)
   ON CONFLICT (sede_id, code)
-  DO UPDATE SET name = EXCLUDED.name, is_active = true;
+  DO UPDATE SET name = EXCLUDED.name, is_active = true,
+    fee_percent = CASE WHEN payment_methods.fee_percent <> 0
+      THEN payment_methods.fee_percent ELSE EXCLUDED.fee_percent END;
 
   -- ----------------------- caja lista (base configurada; turnos por UI) ---
   -- Los 2 turnos/día de §11 (casos 400/200 y 300/150) se crean por UI contra

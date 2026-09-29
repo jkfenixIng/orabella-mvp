@@ -20,6 +20,142 @@ export function expectedDigitalTotal(openAmount: number, paidAmount: number, pai
   return roundMoney(roundMoney(openAmount) + roundMoney(paidAmount) - roundMoney(paidOut));
 }
 
+/** Vale tal como lo lee el arqueo para descontarlo de la caja. */
+export interface VoucherCashOutInput {
+  /** Quién autorizó: null = nunca aprobado (pendiente/rechazada). */
+  approved_by: string | null;
+  /** Método arqueable por el que salió el dinero; null = histórico sin método. */
+  method_code: string | null;
+  amount: number | string;
+}
+
+/**
+ * Regla de dinero del vale: un vale SOLO toca caja cuando fue aprobado
+ * (approved_by no nulo) y tiene método arqueable. Un vale pendiente o
+ * rechazado NUNCA afecta el arqueo; uno aprobado sí, aunque después pase a
+ * descontada en nómina (el efectivo ya salió del cajón). Puro para probarlo.
+ */
+export function isVoucherCashOut(row: VoucherCashOutInput): boolean {
+  return row.approved_by !== null && row.method_code !== null;
+}
+
+/**
+ * Salida de caja por vales aprobados, agrupada por método. Se usa como
+ * `paidOut` del arqueo (resta del esperado), igual que los pagos inmediatos
+ * de comisión. Puro para probarlo sin base de datos.
+ */
+export function voucherOutByMethod(rows: VoucherCashOutInput[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const row of rows) {
+    if (!isVoucherCashOut(row)) continue;
+    out.set(row.method_code as string, roundMoney((out.get(row.method_code as string) ?? 0) + Number(row.amount)));
+  }
+  return out;
+}
+
+/**
+ * Suma mapas de salida por método (p. ej. comisiones + vales). Los mapas
+ * ausentes se ignoran. Puro para probarlo sin base de datos.
+ */
+export function sumMethodMaps(
+  ...maps: Array<Map<string, number> | null | undefined>
+): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const map of maps) {
+    if (!map) continue;
+    for (const [code, amount] of map) {
+      out.set(code, roundMoney((out.get(code) ?? 0) + amount));
+    }
+  }
+  return out;
+}
+
+/**
+ * Total de un mapa de montos por método (p. ej. el total de vales de un
+ * turno). Un mapa ausente suma 0, de modo que la vista degrada sin romperse
+ * cuando la migración de vales no está aplicada. Puro para probarlo sin base
+ * de datos.
+ */
+export function sumMethodTotal(map: Map<string, number> | null | undefined): number {
+  if (!map) return 0;
+  let total = 0;
+  for (const amount of map.values()) total += amount;
+  return roundMoney(total);
+}
+
+/**
+ * Regla de negocio del efectivo del turno: las salidas en efectivo (vales
+ * aprobados + comisiones pagadas inmediatas) no pueden superar el 50% de la
+ * base de apertura. El otro 50% permanece físicamente en el cajón para dar
+ * vueltos y nuevos vales. El tope es INCLUSIVO: el acumulado puede llegar
+ * exactamente al límite; solo superarlo lo rechaza. Puro para probarlo sin
+ * base de datos.
+ */
+export const CASH_OUT_LIMIT_RATIO = 0.5;
+
+/** Código de negocio cuando una salida en efectivo supera el tope del turno. */
+export const CASH_OUT_LIMIT_CODE = "CASH_OUT_LIMIT_EXCEEDED";
+
+export interface CashOutLimitState {
+  /** Base de apertura del turno. */
+  base: number;
+  /** Tope de salidas en efectivo: roundMoney(base * 0.5). */
+  limit: number;
+  /** Salidas en efectivo ya acumuladas en el turno. */
+  used: number;
+  /** Disponible para nuevas salidas en efectivo (nunca negativo). */
+  available: number;
+}
+
+/** Estado del tope de salidas en efectivo para una base y un acumulado dados. */
+export function cashOutLimitState(openingBase: number, cashOutUsed: number): CashOutLimitState {
+  const base = roundMoney(openingBase);
+  const limit = roundMoney(base * CASH_OUT_LIMIT_RATIO);
+  const used = roundMoney(cashOutUsed);
+  return { base, limit, used, available: roundMoney(Math.max(0, limit - used)) };
+}
+
+/**
+ * true cuando pagar `amount` en efectivo deja el acumulado del turno por
+ * encima del tope. Al ser INCLUSIVO, un proyectado exactamente igual al
+ * límite se permite; solo el exceso de al menos un centavo se rechaza. La
+ * resta se redondea a centavos para no fallar por representación flotante
+ * (100000.01 − 100000 = 0.00999…). Puro.
+ */
+export function exceedsCashOutLimit(state: CashOutLimitState, amount: number): boolean {
+  const projected = roundMoney(state.used + roundMoney(amount));
+  return roundMoney(projected - state.limit) > 0;
+}
+
+export interface CashOutLimitViolation {
+  code: typeof CASH_OUT_LIMIT_CODE;
+  message: string;
+}
+
+/**
+ * Valida una salida en efectivo contra el tope del turno. Devuelve null si el
+ * monto cabe (acumulado dentro del tope) y el detalle del rechazo si lo
+ * supera. Solo rige para `efectivo`: los métodos digitales no tienen tope.
+ * Puro para probarlo sin base de datos.
+ */
+export function cashOutLimitViolation(args: {
+  methodCode: string;
+  openingBase: number;
+  cashOutUsed: number;
+  amount: number;
+}): CashOutLimitViolation | null {
+  if (args.methodCode !== "efectivo") return null;
+  const state = cashOutLimitState(args.openingBase, args.cashOutUsed);
+  if (!exceedsCashOutLimit(state, args.amount)) return null;
+  const amount = roundMoney(args.amount);
+  return {
+    code: CASH_OUT_LIMIT_CODE,
+    message:
+      `No se puede pagar ${amount} en efectivo: supera el máximo del 50% de la base ` +
+      `del turno (${state.base}). Quedan ${state.available} disponibles para salidas en efectivo.`,
+  };
+}
+
 export interface ShiftCountMaps {
   paid: Map<string, number>;
   open: Map<string, number>;
@@ -115,6 +251,21 @@ export const closeShiftSchema = z.object({
 });
 export type CloseShiftInput = z.infer<typeof closeShiftSchema>;
 
+/**
+ * U3: reconteo de un cierre. Un cierre firmado es INMUTABLE; la única vía de
+ * corrección es un conteo COMPLETO nuevo (mismo detalle por denominación que
+ * el cierre) más un motivo. No existe la corrección de un total tecleado: el
+ * `counts` es obligatorio y su efectivo debe cuadrar con `counted_cash`. El
+ * motivo es obligatorio (queda con quién y cuándo en `cash_shift_recounts`).
+ * Puro para probarlo sin base de datos.
+ */
+export const recountShiftSchema = z.object({
+  counted_cash: z.coerce.number({ error: "El conteo de efectivo es obligatorio." }).nonnegative("El conteo no puede ser negativo."),
+  counts: z.array(shiftCountSchema).min(1, "El detalle del reconteo es obligatorio."),
+  reason: z.string().trim().min(1, "El motivo del reconteo es obligatorio.").max(500, "Motivo muy largo."),
+});
+export type RecountShiftInput = z.infer<typeof recountShiftSchema>;
+
 /** CAJ-05: vista del día (fecha calendario yyyy-mm-dd). */
 export const dayViewSchema = z.object({
   fecha: z
@@ -149,35 +300,10 @@ export type HistoryInput = z.infer<typeof historySchema>;
 // ------------------------------------------------------------ cálculos puros ---
 
 /**
- * Business timezone. Colombia has no daylight saving time, so America/Bogota
- * is a fixed UTC-05:00 year-round. Timestamps are timestamptz (UTC); date
- * filters must carry the offset or shifts opened after 19:00 COT land on
- * the next UTC day and vanish from "today".
+ * Helpers de fecha en hora de Bogotá: viven en el módulo compartido y se
+ * re-exportan aquí para no romper a los consumidores históricos de caja.
  */
-export const BOGOTA_TZ_OFFSET = "-05:00";
-
-/** Calendar day (yyyy-mm-dd) in America/Bogota for the given instant. */
-export function bogotaDay(offsetDays = 0, now: Date = new Date()): string {
-  const shifted = new Date(now.getTime() + offsetDays * 24 * 60 * 60 * 1000);
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/Bogota",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(shifted);
-  const get = (type: string): string => parts.find((part) => part.type === type)?.value ?? "";
-  return `${get("year")}-${get("month")}-${get("day")}`;
-}
-
-/** Exact timestamptz bounds of a Bogota calendar day (inclusive). */
-export function dayBounds(fecha: string): { from: string; to: string } {
-  return { from: `${fecha}T00:00:00${BOGOTA_TZ_OFFSET}`, to: `${fecha}T23:59:59.999${BOGOTA_TZ_OFFSET}` };
-}
-
-/** Exact bounds of an inclusive Bogota date range. */
-export function rangeBounds(desde: string, hasta: string): { from: string; to: string } {
-  return { from: dayBounds(desde).from, to: dayBounds(hasta).to };
-}
+export { BOGOTA_TZ_OFFSET, bogotaDay, dayBounds, rangeBounds } from "@/src/shared/lib/dates";
 
 /**
  * CAJ-01: base con la que abre el turno. Hereda base_left del último
@@ -229,6 +355,77 @@ export function computeCashClose(args: {
     baseDifference: roundMoney(baseLeft - baseConfigurada),
     incomplete: baseLeft < baseConfigurada,
   };
+}
+
+/** Los cuatro montos que firman un cierre (o su reconteo). */
+export interface CloseAmounts {
+  counted_cash: number;
+  base_left: number;
+  cash_withdrawn: number;
+  base_difference: number;
+}
+
+/**
+ * U3: los cuatro montos de un cierre a partir de un conteo completo. Reutiliza
+ * la maquinaria del cierre (base automática `resolveClosingBase` + derivados
+ * `computeCashClose`) para que el reconteo NO tenga una aritmética paralela:
+ * el mismo conteo produce la misma base y el mismo sobre. Pura.
+ */
+export function closeAmountsFromCount(countedCash: number, baseConfigurada: number): CloseAmounts {
+  const counted_cash = roundMoney(countedCash);
+  const base_left = resolveClosingBase(counted_cash, baseConfigurada);
+  const close = computeCashClose({ countedCash: counted_cash, baseLeft: base_left, baseConfigurada });
+  return {
+    counted_cash,
+    base_left,
+    cash_withdrawn: close.cashWithdrawn,
+    base_difference: close.baseDifference,
+  };
+}
+
+/** Un reconteo son DOS versiones: la anterior congelada y la nueva. */
+export interface RecountRecord {
+  /** El cierre firmado que se conserva (nunca se pisa). */
+  previous: CloseAmounts;
+  /** La versión corregida por el reconteo. */
+  next: CloseAmounts;
+  reason: string;
+}
+
+/**
+ * U3: arma la fila de un reconteo: conserva la versión anterior y calcula la
+ * nueva con la maquinaria del cierre. El motivo es OBLIGATORIO (no se firmó un
+ * reconteo sin decir por qué). Pura para probarla sin base de datos.
+ */
+export function buildRecountRecord(args: {
+  previous: CloseAmounts;
+  countedCash: number;
+  baseConfigurada: number;
+  reason: string;
+}): RecountRecord {
+  const reason = args.reason.trim();
+  if (reason.length === 0) {
+    throw new Error("RECOUNT_REASON_REQUIRED");
+  }
+  return {
+    previous: { ...args.previous },
+    next: closeAmountsFromCount(args.countedCash, args.baseConfigurada),
+    reason,
+  };
+}
+
+/**
+ * U3: la versión que GOVIERNA un turno: el reconteo si existe, y si no el
+ * cierre firmado. Deja el desempate en un solo lugar para que la vista del
+ * día, el historial y la base del próximo turno miren lo mismo. Pura.
+ */
+export function governingClose<T extends CloseAmounts | {
+  counted_cash: number | null;
+  base_left: number | null;
+  cash_withdrawn: number | null;
+  base_difference: number | null;
+}>(signed: T, recount: CloseAmounts | null): CloseAmounts | T {
+  return recount ?? signed;
 }
 
 /**

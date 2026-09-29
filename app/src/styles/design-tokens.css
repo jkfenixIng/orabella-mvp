@@ -29,21 +29,27 @@
    Colors - Light Mode
    -------------------------------------------------------------------------- */
 :root {
-  /* Primary - Blue */
-  --color-primary: 175 82%;
-  --color-primary-50: oklch(0.96 0 0);
+  /* Primary - Blue (sin token suelto: el color de marca es la rampa) */
+  /* Peldaño -50: es el fondo de las clases `.bg-*-light` (chips de estado y
+     avisos). Antes tenía chroma 0, así que los cuatro fondos "light" del tema
+     claro salían gris casi blanco y solo el texto llevaba color. Cada -50
+     recupera el hue de su rampa con ~80% de la chroma máxima que el sRGB
+     admite en su L, y sigue siendo más claro que su -100 (la rampa queda
+     ordenada). El texto real sobre esos fondos es el peldaño -600
+     (.text-success/.text-warning/.text-error/.text-primary-color), que conserva
+     AA 4.5:1. El bloque oscuro no se toca. */
+  --color-primary-50: oklch(0.96 0.016 250);
   --color-primary-100: oklch(0.93 0.02 250);
   --color-primary-200: oklch(0.86 0.06 250);
   --color-primary-300: oklch(0.77 0.11 250);
-  --color-primary-400: oklch(0.65 0.16 250);
-  --color-primary-500: oklch(0.55 0.2 250);
-  --color-primary-600: oklch(0.48 0.23 250);
-  --color-primary-700: oklch(0.39 0.24 250);
-  --color-primary-800: oklch(0.31 0.2 250);
-  --color-primary-900: oklch(0.25 0.14 250);
+  --color-primary-400: oklch(0.72 0.11 250);
+  --color-primary-500: oklch(0.55 0.14 250);
+  --color-primary-600: oklch(0.50 0.125 250);
+  --color-primary-700: oklch(0.44 0.11 250);
+  --color-primary-800: oklch(0.31 0.078 250);
+  --color-primary-900: oklch(0.25 0.063 250);
 
-  /* Secondary - Purple/Amber */
-  --color-secondary: 260 70%;
+  /* Secondary - Purple/Amber (sin token suelto: el secundario es una superficie) */
   --color-secondary-50: oklch(0.97 0 0);
   --color-secondary-100: oklch(0.93 0.02 280);
   --color-secondary-200: oklch(0.87 0.05 280);
@@ -56,39 +62,42 @@
   --color-secondary-900: oklch(0.25 0.1 280);
 
   /* Status - Success (Emerald) */
-  --color-success-50: oklch(0.97 0 0);
+  --color-success-50: oklch(0.97 0.035 160);
   --color-success-100: oklch(0.93 0.03 160);
   --color-success-200: oklch(0.86 0.06 160);
   --color-success-300: oklch(0.77 0.1 160);
-  --color-success-400: oklch(0.65 0.16 160);
-  --color-success-500: oklch(0.55 0.2 160);
-  --color-success-600: oklch(0.45 0.23 160);
-  --color-success-700: oklch(0.36 0.18 160);
-  --color-success-800: oklch(0.29 0.13 160);
-  --color-success-900: oklch(0.24 0.08 160);
+  --color-success-400: oklch(0.65 0.132 160);
+  --color-success-500: oklch(0.55 0.111 160);
+  --color-success-600: oklch(0.45 0.091 160);
+  --color-success-700: oklch(0.36 0.073 160);
+  --color-success-800: oklch(0.29 0.059 160);
+  --color-success-900: oklch(0.24 0.048 160);
 
   /* Status - Warning (Amber) */
-  --color-warning-50: oklch(0.98 0 0);
+  /* Warning es la rampa más apretada: su -100 ya está en L 0.96, así que el -50
+     solo puede bajar hasta 0.97 y en L 0.98 el sRGB limita la chroma a 0.0109
+     (tinte imperceptible). Se baja el peldaño un paso, aún más claro que el -100. */
+  --color-warning-50: oklch(0.97 0.014 50);
   --color-warning-100: oklch(0.96 0.02 50);
-  --color-warning-200: oklch(0.9 0.08 50);
-  --color-warning-300: oklch(0.82 0.12 50);
+  --color-warning-200: oklch(0.90 0.052 50);
+  --color-warning-300: oklch(0.82 0.10 50);
   --color-warning-400: oklch(0.71 0.17 50);
-  --color-warning-500: oklch(0.61 0.19 50);
-  --color-warning-600: oklch(0.5 0.19 50);
-  --color-warning-700: oklch(0.41 0.15 50);
-  --color-warning-800: oklch(0.33 0.11 50);
+  --color-warning-500: oklch(0.61 0.145 50);
+  --color-warning-600: oklch(0.50 0.118 50);
+  --color-warning-700: oklch(0.41 0.097 50);
+  --color-warning-800: oklch(0.33 0.078 50);
   --color-warning-900: oklch(0.27 0.07 50);
 
   /* Status - Error (Red) */
-  --color-error-50: oklch(0.97 0 0);
+  --color-error-50: oklch(0.96 0.016 25);
   --color-error-100: oklch(0.93 0.03 25);
   --color-error-200: oklch(0.86 0.06 25);
   --color-error-300: oklch(0.77 0.12 25);
   --color-error-400: oklch(0.65 0.18 25);
   --color-error-500: oklch(0.55 0.2 25);
-  --color-error-600: oklch(0.45 0.2 25);
-  --color-error-700: oklch(0.36 0.16 25);
-  --color-error-800: oklch(0.29 0.12 25);
+  --color-error-600: oklch(0.45 0.164 25);
+  --color-error-700: oklch(0.36 0.131 25);
+  --color-error-800: oklch(0.29 0.105 25);
   --color-error-900: oklch(0.24 0.08 25);
 
   /* Neutrals */
@@ -107,7 +116,18 @@
   --bg-primary: theme(--color-neutral-50);
   --bg-surface: theme(--color-neutral-50);
   --bg-surface-hover: theme(--color-neutral-100);
-  --bg-surface-2: theme(--color-neutral-100);
+  /* Superficie SELECCIONADA (segmento activo de un control segmentado,
+     theme-toggle). La familia de superficies no tenía un tercer peldaño:
+     el estado seleccionado quedaba con el mismo valor que el hover (L 0.96),
+     porque las dos únicas superficies elevadas del tema claro eran el mismo
+     color. Medido contra la página (--bg-surface, L 0.98): hover L 0.96 deja un
+     paso de 0.020 —casi indistinguible—; este peldaño L 0.93 deja 0.050, el
+     mismo paso del `slate-200` original (L 0.929, paso 0.051) que la app usaba
+     antes de mover el segmento a tokens. No se usa --color-neutral-200
+     (L 0.91, paso 0.070): sobrecorrige.
+     El nombre es semántico a propósito: el consumidor pide "seleccionado", no
+     un peldaño de rampa. */
+  --bg-surface-selected: oklch(0.93 0 0);
 
   /* Borders & Dividers */
   --border-color: theme(--color-neutral-300);
@@ -116,7 +136,11 @@
   /* Text */
   --text-primary: theme(--color-neutral-900);
   --text-secondary: theme(--color-neutral-500);
-  --text-tertiary: theme(--color-neutral-400);
+  --text-tertiary: oklch(0.55 0 0);
+  /* Anillo de foco: debe existir como utilidad (`ring-ring`) y mantener >= 3:1
+     contra la superficie de su tema. Los botones primary/destructive lo dibujaban
+     en `currentColor` (blanco sobre página clara = foco invisible, WCAG 2.4.7). */
+  --ring: var(--color-primary-600);
   --text-disabled: theme(--color-neutral-300);
 
   /* Shadows */
@@ -171,34 +195,45 @@
   --color-primary-200: oklch(0.86 0.06 250);
   --color-primary-300: oklch(0.77 0.11 250);
   --color-primary-400: oklch(0.65 0.16 250);
-  --color-primary-500: oklch(0.55 0.2 250);
-  --color-primary-600: oklch(0.65 0.2 250);
-  --color-primary-700: oklch(0.72 0.17 250);
-  --color-primary-800: oklch(0.8 0.12 250);
+  --color-primary-500: oklch(0.55 0.14 250);
+  /* En oscuro la escala numérica va de claro a oscuro al revés que en claro:
+     los peldaños 600/700 se usan como FONDO de botón con texto blanco, así que
+     deben bajar de luminosidad para cumplir AA (blanco sobre 0.55 ≈ 4.74:1).
+     El rol de TEXTO en oscuro usa primary-400 (0.65), no estos peldaños. */
+  --color-primary-600: oklch(0.50 0.12 250);
+  --color-primary-700: oklch(0.48 0.122 250);
+  --color-primary-800: oklch(0.80 0.094 250);
   --color-primary-900: oklch(0.9 0.05 250);
 
   --color-secondary-50: oklch(0.97 0 0);
   --color-secondary-600: oklch(0.65 0.17 280);
   --color-secondary-700: oklch(0.72 0.14 280);
 
-  --color-success-600: oklch(0.61 0.18 160);
+  --color-success-600: oklch(0.61 0.124 160);
   --color-warning-600: oklch(0.64 0.16 50);
-  --color-error-600: oklch(0.65 0.18 25);
+  --color-error-600: oklch(0.52 0.19 25);
 
   /* Background & Surfaces */
   --bg-primary: oklch(0.12 0 0);
   --bg-surface: oklch(0.17 0 0);
   --bg-surface-hover: oklch(0.22 0 0);
-  --bg-surface-2: oklch(0.22 0 0);
+  /* En oscuro el paso actual ya era correcto (página 0.17 -> 0.22 = 0.050) y se
+     conserva tal cual: el token es semántico aunque su valor coincida con el
+     hover en este tema. Bajarlo o subirlo sería la regresión, no la mejora. */
+  --bg-surface-selected: oklch(0.22 0 0);
 
   /* Borders & Dividers */
-  --border-color: oklch(0.24 0 0);
-  --border-color-2: oklch(0.21 0 0);
+  --border-color: oklch(0.3 0 0);
+  --border-color-2: oklch(0.27 0 0);
 
   /* Text */
   --text-primary: oklch(0.95 0 0);
   --text-secondary: oklch(0.75 0 0);
-  --text-tertiary: oklch(0.55 0 0);
+  --text-tertiary: oklch(0.62 0 0);
+  /* Mismo anillo de foco que en claro: existe como utilidad (`ring-ring`) y
+     mantiene >= 3:1 contra la superficie oscura (el botón lo pintaba en
+     `currentColor`, que en oscuro tampoco garantiza contraste). */
+  --ring: var(--color-primary-400);
   --text-disabled: oklch(0.45 0 0);
 
   /* Shadows (stronger in dark mode) */
@@ -267,14 +302,11 @@ button {
    Utility Classes for Design Tokens
    -------------------------------------------------------------------------- */
 
-/* Color text utilities */
-.text-primary { color: var(--text-primary); }
-.text-secondary { color: var(--text-secondary); }
-.text-tertiary { color: var(--text-tertiary); }
-
-/* Background utilities */
-.bg-primary { background-color: var(--bg-primary); }
-.bg-surface { background-color: var(--bg-surface); }
+/* Las utilidades .text-primary, .text-secondary, .text-tertiary y .bg-primary
+   se eliminaron (cero consumidores) y .bg-surface también, porque Tailwind ya
+   la genera igual desde --color-surface. Estaban fuera de todo @layer, así que
+   ganaban en la cascada contra la utilidad homónima de @layer utilities y la
+   dejaban inservible: por eso hay que borrar la declaración, no reordenarla. */
 
 /* Border utilities */
 .border-color { border: 1px solid var(--border-color); }
@@ -302,9 +334,10 @@ button {
 /* --------------------------------------------------------------------------
    Status Colors (Semantic)
    -------------------------------------------------------------------------- */
-.text-success { color: var(--color-success-600); }
-.text-warning { color: var(--color-warning-600); }
-.text-error { color: var(--color-error-600); }
+/* .text-success/.text-warning/.text-error ya no se declaran acá: Tailwind genera
+   esas utilidades con exactamente el mismo color (var(--color-*-600)) desde las
+   claves --color-* de @theme inline. El override de .dark sí sigue acá, porque
+   Tailwind no expresa "otro token según el tema" sin duplicar la utilidad. */
 .text-primary-color { color: var(--color-primary-600); }
 
 .bg-success-light { background-color: var(--color-success-50); }

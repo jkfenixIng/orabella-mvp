@@ -1,15 +1,18 @@
 import {
   commissionPayoutSchema,
+  commissionRuleKey,
   commissionRuleSchema,
+  employeeLineCommissionOrigin,
   pendingCommission,
-  resolveLineCommission,
+  resolveEmployeeLineCommission,
   roundMoney,
   type CommissionPayoutRow,
   type CommissionRuleRow,
   type RuleRate,
 } from "./schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
-import { getOpenShift } from "@/src/features/cash/service";
+import { cashOutUsedInShift, getOpenShift } from "@/src/features/cash/service";
+import { cashOutLimitViolation } from "@/src/features/cash/schemas";
 import { listPaymentMethods } from "@/src/features/admin/service";
 
 export class CommissionError extends Error {
@@ -147,13 +150,22 @@ export interface EarnedCommission {
   baseSubtotal: number;
   percentApplied: number | null;
   fixedApplied: number | null;
+  /** Total ganado por el empleado: comisión por ítem + porcentaje del empleado. */
   earned: number;
+  /**
+   * Ganado que se puede pagar de IMMEDIATO: solo el origen "commission"
+   * (valor fijo del ítem o regla ítem×empleado). El porcentaje del empleado
+   * queda fuera: se acumula y se paga en nómina.
+   */
+  immediateEarned: number;
   lines: number;
 }
 
 /**
  * Comisión ganada por (factura, empleado): líneas sin flag × (regla o
  * tasa plana del empleado). Las líneas marcadas sin comisión no suman.
+ * Devuelve el total (`earned`) y, separado, lo pagable de inmediato
+ * (`immediateEarned`, solo origen comisión por ítem).
  */
 export async function earnedCommissionFor(
   sedeId: string,
@@ -175,7 +187,9 @@ export async function earnedCommissionFor(
 
   const { data: lines, error: linesError } = await db
     .from("invoice_items")
-    .select("item_type, product_id, service_id, qty, unit_price, subtotal, no_commission")
+    .select(
+      "item_type, product_id, service_id, qty, unit_price, subtotal, no_commission, commission_value, commission_percent_override",
+    )
     .eq("invoice_id", invoiceId)
     .eq("employee_id", employeeId);
   if (linesError) throw new CommissionError("INTERNAL", "Error interno.", 500);
@@ -187,6 +201,8 @@ export async function earnedCommissionFor(
     unit_price: number | string;
     subtotal: number | string;
     no_commission: boolean | null;
+    commission_value: number | string | null;
+    commission_percent_override: number | string | null;
   }>).filter((line) => !line.no_commission);
 
   const { data: rules, error: rulesError } = await db
@@ -196,9 +212,15 @@ export async function earnedCommissionFor(
     .eq("employee_id", employeeId)
     .eq("is_active", true);
   if (rulesError) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  const ruleByItem = new Map(
+  const ruleByItem = new Map<string, RuleRate>(
     ((rules ?? []) as Array<{ item_type: string; item_id: string; percent: number | null; amount: number | null }>).map(
-      (rule) => [`${rule.item_type}:${rule.item_id}`, rule],
+      (rule) => [
+        commissionRuleKey(rule.item_type, rule.item_id),
+        {
+          percent: rule.percent != null ? Number(rule.percent) : null,
+          amount: rule.amount != null ? Number(rule.amount) : null,
+        },
+      ],
     ),
   );
 
@@ -217,28 +239,47 @@ export async function earnedCommissionFor(
 
   let baseSubtotal = 0;
   let earned = 0;
+  let immediateEarned = 0;
   const usedRules = new Map<string, RuleRate>();
   for (const line of earning) {
     const refId = line.item_type === "producto" ? line.product_id : line.service_id;
-    const rule = refId ? ruleByItem.get(`${line.item_type}:${refId}`) : undefined;
+    const rule = refId ? ruleByItem.get(commissionRuleKey(line.item_type, refId)) : undefined;
     const subtotal = roundMoney(Number(line.subtotal));
     baseSubtotal = roundMoney(baseSubtotal + subtotal);
-    earned = roundMoney(
-      earned +
-        resolveLineCommission({
-          subtotal,
-          qty: Math.floor(Number(line.qty)),
-          rule: rule
-            ? { percent: rule.percent != null ? Number(rule.percent) : null, amount: rule.amount != null ? Number(rule.amount) : null }
-            : null,
-          flatPercent: rule ? null : flatPercent,
-        }),
-    );
-    if (rule) {
-      usedRules.set(`${line.item_type}:${refId}`, {
-        percent: rule.percent != null ? Number(rule.percent) : null,
-        amount: rule.amount != null ? Number(rule.amount) : null,
-      });
+    // El valor fijo del ítem (producto o `custom`) es la comisión: mismo
+    // insumo que nómina y detalle. Un 0 no es valor fijo (se normaliza a
+    // null, igual que en payroll/billing).
+    const commissionValue = line.commission_value ? Number(line.commission_value) : null;
+    const commissionPercentOverride =
+      line.commission_percent_override != null ? Number(line.commission_percent_override) : null;
+    const lineCommission = resolveEmployeeLineCommission({
+      itemType: line.item_type,
+      itemRefId: refId ?? null,
+      subtotal,
+      qty: Number(line.qty),
+      commissionValue,
+      commissionPercentOverride,
+      rules: ruleByItem,
+      flatPercent,
+    });
+    earned = roundMoney(earned + lineCommission);
+    // Solo la comisión por ítem (origen "commission") es pagable de inmediato;
+    // el porcentaje (del empleado o el explícito de la línea) se acumula para la
+    // nómina.
+    if (
+      employeeLineCommissionOrigin({
+        itemType: line.item_type,
+        itemRefId: refId ?? null,
+        commissionValue,
+        commissionPercentOverride,
+        rules: ruleByItem,
+        flatPercent,
+      }) === "commission"
+    ) {
+      immediateEarned = roundMoney(immediateEarned + lineCommission);
+    }
+    if (rule && refId) {
+      usedRules.set(commissionRuleKey(line.item_type, refId), rule);
     }
   }
   const uniform = usedRules.size === 1 ? [...usedRules.values()][0] : null;
@@ -247,6 +288,7 @@ export async function earnedCommissionFor(
     percentApplied: uniform?.percent ?? null,
     fixedApplied: uniform?.amount ?? null,
     earned,
+    immediateEarned,
     lines: earning.length,
   };
 }
@@ -273,13 +315,19 @@ export async function immediatePaidTotal(
 // -------------------------------------------------------------------- pagos ---
 
 const PAYOUT_SELECT =
-  "id, sede_id, employee_id, invoice_id, cash_shift_id, method_code, base_subtotal, percent_applied, fixed_applied, amount, paid_by, paid_at";
+  "id, sede_id, employee_id, invoice_id, cash_shift_id, method_code, base_subtotal, percent_applied, fixed_applied, earned_immediate, amount, paid_by, paid_at";
 
 /**
  * Paga de inmediato una comisión desde la caja del turno abierto, por
  * cualquier método activo. Valida contra el pendiente (ganado − pagado)
  * para que la misma comisión nunca se pague dos veces. Queda auditado
  * (cuánto, quién pagó, cuándo, método, factura y turno).
+ *
+ * Doble barrera: esta validación (que da el mensaje exacto del pendiente) y el
+ * tope de la base (`trg_commission_payouts_cap`, 034). La validación de código
+ * es un leer-y-escribir y pierde contra una carrera; por eso la fila lleva
+ * `earned_immediate` — el ganado que la base compara contra la suma de lo
+ * pagado, sin recalcular la regla.
  */
 export async function payCommissionNow(
   raw: unknown,
@@ -290,6 +338,10 @@ export async function payCommissionNow(
     throw new CommissionError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const input = parsed.data;
+  // Dinero que se persiste: peso entero. Se normaliza UNA vez y es el mismo
+  // valor para la validación del pendiente, el tope de caja y la fila
+  // guardada (lo que se valida es lo que se guarda).
+  const amount = roundMoney(input.amount);
   const db = await commissionsDb();
 
   const { data: payoutEmployee } = await db
@@ -339,16 +391,40 @@ export async function payCommissionNow(
     throw new CommissionError("NOTHING_EARNED", "Esa factura y empleado no tienen comisión.", 422);
   }
   const paid = await immediatePaidTotal(actor.sedeId, input.invoice_id, input.employee_id);
-  const pending = pendingCommission(earned.earned, paid);
+  // El pendiente inmediato es SOLO comisión por ítem: el porcentaje del empleado
+  // se acumula y se paga en nómina, nunca de inmediato.
+  const pending = pendingCommission(earned.immediateEarned, paid);
   if (pending <= 0) {
-    throw new CommissionError("NOTHING_PENDING", "Esa comisión ya fue pagada.", 422);
+    throw new CommissionError(
+      "NOTHING_PENDING",
+      earned.immediateEarned <= 0
+        ? "Esa factura solo tiene porcentaje del empleado: se paga en nómina, no de inmediato."
+        : "Esa comisión ya fue pagada.",
+      422,
+    );
   }
-  if (input.amount - pending > 0.009) {
+  if (amount - pending > 0.009) {
     throw new CommissionError(
       "COMMISSION_OVERPAID",
       `El monto supera la comisión pendiente (${pending}).`,
       422,
     );
+  }
+
+  // Tope de salidas en efectivo del turno (50% de la base de apertura): la
+  // comisión pagada en efectivo no puede dejar el acumulado del turno por
+  // encima del tope. Solo aplica al efectivo; los digitales no tienen tope.
+  if (method.code === "efectivo") {
+    const usedCashOut = await cashOutUsedInShift(shift.id).catch(() => {
+      throw new CommissionError("INTERNAL", "Error interno.", 500);
+    });
+    const violation = cashOutLimitViolation({
+      methodCode: method.code,
+      openingBase: Number(shift.opening_base),
+      cashOutUsed: usedCashOut,
+      amount,
+    });
+    if (violation) throw new CommissionError(violation.code, violation.message, 422);
   }
 
   const { data, error } = await db
@@ -362,12 +438,29 @@ export async function payCommissionNow(
       base_subtotal: earned.baseSubtotal,
       percent_applied: earned.percentApplied,
       fixed_applied: earned.fixedApplied,
-      amount: roundMoney(input.amount),
+      // El tope de la base (034) compara contra ESTE número: es el ganado
+      // inmediato que ya se validó arriba, no una segunda versión de la regla.
+      earned_immediate: earned.immediateEarned,
+      amount,
       paid_by: actor.userId,
     })
     .select(PAYOUT_SELECT)
     .single();
-  if (error || !data) throw new CommissionError("INTERNAL", "Error interno.", 500);
+  if (error) {
+    // Carrera perdida contra trg_commission_payouts_cap (034): P0001 = el tope
+    // acumulado de la base rechazó el pago (la suma del par ya estaba completa
+    // cuando entró esta fila). Mismo código que traducen payroll, cash y
+    // billing; la condición de negocio es la misma que valida el pendiente.
+    if ((error as { code?: string }).code === "P0001") {
+      throw new CommissionError(
+        "COMMISSION_OVERPAID",
+        "El monto supera la comisión pendiente.",
+        422,
+      );
+    }
+    throw new CommissionError("INTERNAL", "Error interno.", 500);
+  }
+  if (!data) throw new CommissionError("INTERNAL", "Error interno.", 500);
 
   await writeAudit({
     sede_id: actor.sedeId,
@@ -380,10 +473,13 @@ export async function payCommissionNow(
       invoice_id: input.invoice_id,
       cash_shift_id: shift.id,
       method_code: method.code,
-      amount: roundMoney(input.amount),
+      amount,
       base_subtotal: earned.baseSubtotal,
       percent_applied: earned.percentApplied,
       fixed_applied: earned.fixedApplied,
+      // El tope con el que la base aceptó esta fila (034): queda en la
+      // auditoría el número contra el que se comparó, no solo el pago.
+      earned_immediate: earned.immediateEarned,
     },
   });
   return data as CommissionPayoutRow;

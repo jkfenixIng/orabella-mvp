@@ -1,5 +1,6 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
+import { Alert } from "@/src/components/ui/lib/alert";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import {
@@ -27,9 +28,12 @@ export default async function InventoryPage() {
     return (
       <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-4 px-6 py-12">
         <h1 className="text-2xl font-bold">Inventario</h1>
-        <p role="alert" className="text-sm text-red-600 dark:text-red-400">
-          El usuario no tiene sede asignada.
-        </p>
+        {/* Sin sede no hay inventario que mostrar: es ESTADO (el caso hasta
+            que a alguien se le asigne una sede), así que va inline y
+            persistente. Esta vista es un Server Component: no puede emitir un
+            toast. El texto es el mismo; `destructive` deriva role="alert", el
+            mismo anuncio asertivo que antes estaba escrito a mano. */}
+        <Alert variant="destructive">El usuario no tiene sede asignada.</Alert>
       </main>
     );
   }
@@ -46,7 +50,7 @@ export default async function InventoryPage() {
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold">Inventario</h1>
-          <p className="mt-2 text-slate-600 dark:text-slate-300">
+          <p className="mt-2 text-text-secondary">
             Productos, stock, kardex y alertas de mínimo de su sede.
           </p>
         </div>

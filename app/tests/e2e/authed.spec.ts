@@ -9,16 +9,17 @@ test.skip(process.env.E2E_BACKEND !== "test", "requiere backend de pruebas");
 
 test.use({ storageState: AUTH_FILE });
 
-test("home muestra módulos con sesión", async ({ page }) => {
+test("home muestra módulos con sesión @full", async ({ page }) => {
   await page.goto("/");
   await expect(page).toHaveURL(/^.*\/$/);
   await expect(page.getByRole("region", { name: /módulos/i })).toBeVisible();
   await expect(page.getByRole("link", { name: /facturación/i })).toBeVisible();
 });
 
-test("admin carga con sesión admin", async ({ page }) => {
+test("admin carga con sesión admin @full", async ({ page }) => {
   await page.goto("/admin");
   await expect(page).toHaveURL(/\/admin/);
   await expect(page.locator("main")).toBeVisible();
   await expect(page.getByRole("heading", { name: /administración/i })).toBeVisible();
 });
+

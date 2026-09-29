@@ -9,3 +9,5 @@ tests/e2e/.auth/
 *.tsbuildinfo
 .vercel
 .env*
+# Local Pi runtime state
+.atl/

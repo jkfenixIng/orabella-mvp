@@ -2,6 +2,8 @@
 
 import { useState, type FormEvent } from "react";
 
+import { Alert } from "@/src/components/ui/lib/alert";
+
 type Step = "login" | "force-change" | "done";
 
 async function postJson(path: string, body: unknown) {
@@ -78,13 +80,13 @@ export function LoginForm({ next }: { next?: string }) {
 
   if (step === "done") {
     return (
-      <section className="rounded-lg border border-slate-300 p-6 dark:border-slate-700">
+      <section className="rounded-lg border border-border-color p-6 dark:border-border-color-2">
         <h2 className="text-lg font-semibold">Clave actualizada</h2>
-        <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
+        <p className="mt-2 text-sm text-text-secondary">
           Ya puede operar con su nueva clave.
         </p>
         <a
-          className="mt-4 inline-block rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white dark:bg-slate-800 dark:text-slate-100"
+          className="mt-4 inline-block rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700"
           href={next ?? "/"}
         >
           Entrar
@@ -94,10 +96,11 @@ export function LoginForm({ next }: { next?: string }) {
   }
 
   if (step === "force-change") {
+    // Paso forzado (AUTH-01): se unifica al patrón ámbar canónico de advertencia.
     return (
-      <section className="rounded-lg border border-amber-400 p-6 dark:border-amber-600">
+      <section className="rounded-lg bg-warning-light p-6 text-warning">
         <h2 className="text-lg font-semibold">Cambio de clave obligatorio</h2>
-        <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
+        <p className="mt-2 text-sm">
           Su clave inicial es su número de documento. Debe cambiarla antes de continuar (AUTH-01).
         </p>
         <form onSubmit={handleForceChange} className="mt-4 flex flex-col gap-3">
@@ -108,7 +111,7 @@ export function LoginForm({ next }: { next?: string }) {
               value={nueva}
               onChange={(event) => setNueva(event.target.value)}
               autoComplete="new-password"
-              className="rounded border border-slate-300 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
+              className="rounded-md border border-border-color bg-surface px-3 py-2 text-sm text-text-primary shadow-sm dark:border-border-color-2"
             />
           </label>
           <label className="flex flex-col gap-1 text-sm">
@@ -118,18 +121,22 @@ export function LoginForm({ next }: { next?: string }) {
               value={confirmar}
               onChange={(event) => setConfirmar(event.target.value)}
               autoComplete="new-password"
-              className="rounded border border-slate-300 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
+              className="rounded-md border border-border-color bg-surface px-3 py-2 text-sm text-text-primary shadow-sm dark:border-border-color-2"
             />
           </label>
           {error ? (
-            <p role="alert" className="text-sm text-red-600 dark:text-red-400">
-              {error}
-            </p>
+            // ESTADO CONFIRMADO, no derivado en vivo: el desajuste de la
+            // confirmación se detecta al enviar el formulario, no mientras se
+            // escribe (no hay validación por tecleo en este archivo). Es el
+            // desenlace de una acción enviada, así que `destructive` deriva
+            // role="alert" asertivo —el mismo anuncio que el `<p>` escribía— y
+            // queda al lado del campo que hay que corregir.
+            <Alert variant="destructive">{error}</Alert>
           ) : null}
           <button
             type="submit"
             disabled={busy}
-            className="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-slate-800 dark:text-slate-100"
+            className="rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:opacity-50"
           >
             {busy ? "Guardando…" : "Cambiar clave"}
           </button>
@@ -148,7 +155,7 @@ export function LoginForm({ next }: { next?: string }) {
           autoComplete="username"
           inputMode="numeric"
           required
-          className="rounded border border-slate-300 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
+          className="rounded-md border border-border-color bg-surface px-3 py-2 text-sm text-text-primary shadow-sm dark:border-border-color-2"
         />
       </label>
       <label className="flex flex-col gap-1 text-sm">
@@ -159,18 +166,21 @@ export function LoginForm({ next }: { next?: string }) {
           onChange={(event) => setPassword(event.target.value)}
           autoComplete="current-password"
           required
-          className="rounded border border-slate-300 px-3 py-2 dark:border-slate-700 dark:bg-slate-900"
+          className="rounded-md border border-border-color bg-surface px-3 py-2 text-sm text-text-primary shadow-sm dark:border-border-color-2"
         />
       </label>
       {error ? (
-        <p role="alert" className="text-sm text-red-600 dark:text-red-400">
-          {error}
-        </p>
+        // Mismo caso que el error del cambio forzado: la credencial rechazada
+        // es el desenlace de una acción ENVIADA (el navegador ya frena el envío
+        // vacío con `required`), no algo que se calcule mientras se teclea. Va
+        // como estado confirmado, y `destructive` conserva el anuncio asertivo
+        // que el `role="alert"` escribía a mano.
+        <Alert variant="destructive">{error}</Alert>
       ) : null}
       <button
         type="submit"
         disabled={busy}
-        className="rounded bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 dark:bg-slate-800 dark:text-slate-100"
+        className="rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:opacity-50"
       >
         {busy ? "Ingresando…" : "Ingresar"}
       </button>
