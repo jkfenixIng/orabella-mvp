@@ -1,20 +1,28 @@
 "use client";
 
-import { useRef, useState, useTransition, type FormEvent } from "react";
+import { useEffect, useRef, useState, useTransition, type FormEvent } from "react";
 import { toast } from "sonner";
 import {
   calculatePayrollAction,
   closePayrollPeriodAction,
   deletePayrollPeriodAction,
   getPeriodDetailAction,
+  listPayrollExtrasAction,
   listPeriodsAction,
   openPayrollPeriodAction,
+  payPayrollExtraAction,
   payPayrollItemAction,
 } from "@/src/features/payroll/actions";
 import type {
+  PayrollExtraRow,
   PayrollPeriodRow,
   PeriodDetail,
 } from "@/src/features/payroll/service";
+import {
+  payrollExtraGuide,
+  payrollExtraKindSchema,
+  type PayrollExtraKind,
+} from "@/src/features/payroll/schemas";
 import type { EmployeeRow, PaymentMethodRow } from "@/src/features/admin/service";
 import {
   Dialog,
@@ -94,6 +102,14 @@ function formatPayType(payType: string, percent: number | null): string {
 }
 
 const MONTHS_SHORT = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+
+/** PA-2a: etiqueta legible de cada caso extraordinario. */
+const PAYROLL_EXTRA_KIND_LABELS: Record<PayrollExtraKind, string> = {
+  despido: "Despido",
+  renuncia: "Renuncia",
+  emergencia: "Emergencia",
+  otro: "Otro",
+};
 
 /** Máximo de nombres listados en el aviso de pendientes antes de resumir. */
 const PENDING_VISIBLE_LIMIT = 8;
@@ -609,6 +625,39 @@ export function PayrollClient(props: PayrollClientProps) {
   // la UI no se congela mientras la server action responde.
   const [isViewPending, startViewTransition] = useTransition();
 
+  // PA-2a: pagos extraordinarios (nómina individual). La lista es el registro
+  // visible del módulo; el formulario es el único lugar donde se escribe un
+  // monto con motivo. `extraError` es ESTADO del diálogo (lo que sigue mal
+  // mientras no se corrija), separado del error de la página.
+  const [extras, setExtras] = useState<PayrollExtraRow[]>([]);
+  const [extraDialogOpen, setExtraDialogOpen] = useState(false);
+  const [extraError, setExtraError] = useState<string | null>(null);
+  const [extraBusy, setExtraBusy] = useState(false);
+  const [extraEmployeeId, setExtraEmployeeId] = useState("");
+  const [extraKind, setExtraKind] = useState<PayrollExtraKind | "">("");
+  const [extraReason, setExtraReason] = useState("");
+  const [extraAmount, setExtraAmount] = useState("");
+  const [extraMethodCode, setExtraMethodCode] = useState("");
+  const [extraReference, setExtraReference] = useState("");
+  const [extraDaysFrom, setExtraDaysFrom] = useState("");
+  const [extraDaysTo, setExtraDaysTo] = useState("");
+
+  // Los pagos extraordinarios no llegan por props (la página los arma para los
+  // períodos): se leen al montar. Sólo el admin tiene la superficie, así que el
+  // efecto no dispara para el empleado.
+  useEffect(() => {
+    if (!props.canAdmin) return;
+    let active = true;
+    void listPayrollExtrasAction().then((result) => {
+      if (!active) return;
+      if (result.success) setExtras(result.data);
+      else setError(`${result.code}: ${result.message}`);
+    });
+    return () => {
+      active = false;
+    };
+  }, [props.canAdmin]);
+
   // Filas del borrador: la planta activa más los empleados ya calculados que
   // hayan quedado inactivos después del cálculo (no se pierden al recalcular).
   const itemByEmployee = new Map((detail?.items ?? []).map((item) => [item.employee_id, item]));
@@ -888,6 +937,81 @@ export function PayrollClient(props: PayrollClientProps) {
     }
   }
 
+  /** PA-2a: recarga el registro visible de pagos extraordinarios. */
+  async function loadExtras() {
+    const result = (await listPayrollExtrasAction()) as ActionResult<PayrollExtraRow[]>;
+    if (show(result)) setExtras(result.data);
+  }
+
+  function closeExtraDialog() {
+    setExtraDialogOpen(false);
+    setExtraError(null);
+    setExtraEmployeeId("");
+    setExtraKind("");
+    setExtraReason("");
+    setExtraAmount("");
+    setExtraMethodCode("");
+    setExtraReference("");
+    setExtraDaysFrom("");
+    setExtraDaysTo("");
+  }
+
+  /**
+   * PA-2a: registra un pago extraordinario. El monto se escribe libre (la guía
+   * se muestra, no se aplica); el motivo es obligatorio. La validación de acá
+   * es la misma del esquema del servidor, para no ir y volver con un error.
+   */
+  async function handlePayExtra(event: FormEvent) {
+    event.preventDefault();
+    setExtraError(null);
+    const amount = toNumber(extraAmount);
+    if (!extraEmployeeId) {
+      setExtraError("Elija el empleado.");
+      return;
+    }
+    if (!extraKind) {
+      setExtraError("Elija el tipo de caso extraordinario.");
+      return;
+    }
+    if (!extraReason.trim()) {
+      setExtraError("El motivo del pago es obligatorio.");
+      return;
+    }
+    if (amount === null || amount <= 0) {
+      setExtraError("El monto debe ser mayor a 0.");
+      return;
+    }
+    if (!extraMethodCode) {
+      setExtraError("Elija el método de pago.");
+      return;
+    }
+    if (Boolean(extraDaysFrom) !== Boolean(extraDaysTo)) {
+      setExtraError("Indique las dos fechas de los días liquidados, o ninguna.");
+      return;
+    }
+    if (extraDaysFrom && extraDaysTo && extraDaysTo < extraDaysFrom) {
+      setExtraError("La fecha final no puede ser anterior a la inicial.");
+      return;
+    }
+
+    setExtraBusy(true);
+    const result = (await payPayrollExtraAction({
+      employee_id: extraEmployeeId,
+      amount,
+      method_code: extraMethodCode,
+      reference: extraReference.trim() || null,
+      reason: extraReason.trim(),
+      kind: extraKind,
+      days_from: extraDaysFrom || null,
+      days_to: extraDaysTo || null,
+    })) as ActionResult<PayrollExtraRow>;
+    setExtraBusy(false);
+    if (show(result, "Pago extraordinario registrado.")) {
+      closeExtraDialog();
+      await loadExtras();
+    }
+  }
+
   async function handleClose() {
     if (!selectedId) return;
     setBusy(true);
@@ -960,6 +1084,30 @@ export function PayrollClient(props: PayrollClientProps) {
   // Ítems del detalle con saldo pendiente de pago: bloquean el cierre del borrador.
   const pendingItems = (detail?.items ?? []).filter((item) => item.remaining > 0);
 
+  // PA-2a: la GUÍA del pago extraordinario (el sueldo prorrateado por los días
+  // que se liquidan). Se MUESTRA, nunca se aplica: el dueño fue explícito en
+  // que el sueldo mensual es la base guía y no un tope (un despido liquida
+  // prestaciones; una emergencia puede costar más). Un rango invertido lanza
+  // (misma regla que la prorata); acá se convierte en aviso, no en pantalla
+  // rota.
+  const extraEmployee = props.initialEmployees.find((row) => row.id === extraEmployeeId) ?? null;
+  let extraGuide: ReturnType<typeof payrollExtraGuide> | null = null;
+  let extraGuideInvalid = false;
+  try {
+    extraGuide = payrollExtraGuide({
+      salaryFixed: extraEmployee?.salary_fixed ?? null,
+      daysFrom: extraDaysFrom || null,
+      daysTo: extraDaysTo || null,
+      amount: toNumber(extraAmount),
+    });
+  } catch {
+    extraGuideInvalid = true;
+  }
+
+  /** Nombre del método por su código; el código si ya no está en el catálogo. */
+  const methodLabel = (code: string) =>
+    props.methods.find((row) => row.code === code)?.name ?? code;
+
   return (
     <div className="flex flex-col gap-6">
       {error && (
@@ -1011,6 +1159,278 @@ export function PayrollClient(props: PayrollClientProps) {
           {periods.length === 0 && <li className="text-sm text-text-tertiary">Sin periodos todavía.</li>}
         </ul>
       </section>
+
+      {/*
+        PA-2a: nómina individual por caso extraordinario. Es el REGISTRO
+        VISIBLE (no sólo la auditoría) de cuánto y cómo se pagó, y existe
+        porque un período cerrado no admite el pago de sus ítems. Sólo admin.
+      */}
+      {props.canAdmin && (
+        <section className={sectionClass}>
+          <h2 className="text-lg font-semibold">Pagos extraordinarios</h2>
+          <p className="mt-2 text-sm text-text-secondary">
+            Nómina individual por despido, renuncia o emergencia del empleado. No es un período: sirve
+            para pagar días que un período cerrado ya cubrió, y queda registrado cuánto y cómo se pagó.
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              setExtraError(null);
+              setExtraDialogOpen(true);
+            }}
+            className={`${buttonClass} mt-3`}
+          >
+            Registrar pago extraordinario
+          </button>
+          {extras.length === 0 ? (
+            <p className="mt-3 text-sm text-text-tertiary">
+              Sin pagos extraordinarios registrados.
+            </p>
+          ) : (
+            <div className="mt-3 overflow-x-auto">
+              <table className={cn("w-full text-left text-sm", "min-w-[880px]")}>
+                <thead>
+                  <tr className={tableHeaderClass}>
+                    <th className={tableCellClass} scope="col">
+                      Fecha
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Empleado
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Tipo
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Monto
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Método
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Motivo
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {extras.map((row) => (
+                    <tr key={row.id} className={tableRowClass}>
+                      <td className={tableCellClass}>
+                        {row.paid_at ? formatFullDate(row.paid_at.slice(0, 10)) : "—"}
+                      </td>
+                      <td className={tableCellClass}>{employeeName(row.employee_id)}</td>
+                      <td className={tableCellClass}>{PAYROLL_EXTRA_KIND_LABELS[row.kind]}</td>
+                      <td className={tableCellClass}>{formatMoney(row.amount)}</td>
+                      <td className={tableCellClass}>{methodLabel(row.method_code)}</td>
+                      <td className={tableCellClass}>{row.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* PA-2a: el formulario del pago extraordinario. */}
+      {props.canAdmin && (
+        <Dialog
+          open={extraDialogOpen}
+          onOpenChange={(open) => {
+            if (!open) closeExtraDialog();
+            else setExtraDialogOpen(true);
+          }}
+        >
+          <DialogContent className="max-w-2xl">
+            <DialogHeader>
+              <DialogTitle>Registrar pago extraordinario</DialogTitle>
+              <DialogDescription>
+                Nómina individual por despido, renuncia o emergencia. No crea ni reabre períodos:
+                puede pagar días que un período cerrado ya cubrió. El motivo es obligatorio.
+              </DialogDescription>
+            </DialogHeader>
+            <form onSubmit={handlePayExtra} className="mt-4 flex flex-col gap-4">
+              <div className="flex flex-wrap gap-3">
+                <label className={labelClass} htmlFor="payroll-extra-employee">
+                  Empleado
+                  <select
+                    id="payroll-extra-employee"
+                    value={extraEmployeeId}
+                    onChange={(event) => {
+                      setExtraEmployeeId(event.target.value);
+                      setExtraError(null);
+                    }}
+                    className={inputClass}
+                    required
+                  >
+                    <option value="">Empleado…</option>
+                    {props.initialEmployees.map((row) => (
+                      <option key={row.id} value={row.id}>
+                        {employeeName(row.id)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className={labelClass} htmlFor="payroll-extra-kind">
+                  Tipo de caso
+                  <select
+                    id="payroll-extra-kind"
+                    value={extraKind}
+                    onChange={(event) => {
+                      setExtraKind(event.target.value as PayrollExtraKind);
+                      setExtraError(null);
+                    }}
+                    className={inputClass}
+                    required
+                  >
+                    <option value="">Tipo…</option>
+                    {payrollExtraKindSchema.options.map((kind) => (
+                      <option key={kind} value={kind}>
+                        {PAYROLL_EXTRA_KIND_LABELS[kind]}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className={labelClass} htmlFor="payroll-extra-amount">
+                  Monto
+                  <input
+                    id="payroll-extra-amount"
+                    type="number"
+                    min="0"
+                    inputMode="numeric"
+                    value={extraAmount}
+                    onChange={(event) => {
+                      setExtraAmount(event.target.value);
+                      setExtraError(null);
+                    }}
+                    placeholder="0"
+                    className={tableInputClass}
+                    required
+                  />
+                </label>
+              </div>
+
+              <label className={labelClass} htmlFor="payroll-extra-reason">
+                Motivo
+                <textarea
+                  id="payroll-extra-reason"
+                  value={extraReason}
+                  onChange={(event) => {
+                    setExtraReason(event.target.value);
+                    setExtraError(null);
+                  }}
+                  rows={2}
+                  maxLength={500}
+                  placeholder="Por qué se paga (renuncia del 16 de septiembre, emergencia médica…)"
+                  className={inputClass}
+                  required
+                />
+              </label>
+
+              <div className="flex flex-wrap gap-3">
+                <label className={labelClass} htmlFor="payroll-extra-method">
+                  Método de pago
+                  <select
+                    id="payroll-extra-method"
+                    value={extraMethodCode}
+                    onChange={(event) => {
+                      setExtraMethodCode(event.target.value);
+                      setExtraError(null);
+                    }}
+                    className={inputClass}
+                    required
+                  >
+                    <option value="">Método…</option>
+                    {props.methods.map((row) => (
+                      <option key={row.id} value={row.code}>
+                        {row.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className={labelClass} htmlFor="payroll-extra-reference">
+                  Referencia (opcional)
+                  <input
+                    id="payroll-extra-reference"
+                    type="text"
+                    value={extraReference}
+                    onChange={(event) => setExtraReference(event.target.value)}
+                    maxLength={120}
+                    placeholder="N.º de comprobante o transferencia"
+                    className={inputClass}
+                  />
+                </label>
+              </div>
+
+              <div className="flex flex-wrap gap-3">
+                <label className={labelClass} htmlFor="payroll-extra-days-from">
+                  Días liquidados desde (opcional)
+                  <input
+                    id="payroll-extra-days-from"
+                    type="date"
+                    value={extraDaysFrom}
+                    onChange={(event) => {
+                      setExtraDaysFrom(event.target.value);
+                      setExtraError(null);
+                    }}
+                    className={inputClass}
+                  />
+                </label>
+                <label className={labelClass} htmlFor="payroll-extra-days-to">
+                  Hasta
+                  <input
+                    id="payroll-extra-days-to"
+                    type="date"
+                    value={extraDaysTo}
+                    onChange={(event) => {
+                      setExtraDaysTo(event.target.value);
+                      setExtraError(null);
+                    }}
+                    className={inputClass}
+                  />
+                </label>
+              </div>
+
+              <div className="rounded-md border border-border-color bg-surface-hover p-3 text-sm text-text-secondary dark:border-border-color-2">
+                <p className="font-medium text-text-primary">Guía (no es un tope)</p>
+                {extraGuideInvalid ? (
+                  <p className="mt-1">La fecha final no puede ser anterior a la inicial.</p>
+                ) : extraGuide && extraGuide.monthlySalary === null ? (
+                  <p className="mt-1">
+                    El empleado no tiene sueldo fijo configurado: no hay guía que mostrar. El monto lo
+                    define usted.
+                  </p>
+                ) : extraGuide ? (
+                  <>
+                    <p className="mt-1">
+                      {extraGuide.proratedAmount !== null
+                        ? `Porción de ${extraGuide.days} día(s) liquidado(s): ${formatMoney(extraGuide.proratedAmount)}.`
+                        : `Sueldo mensual de referencia: ${formatMoney(extraGuide.monthlySalary ?? 0)}.`}
+                    </p>
+                    {extraGuide.exceedsGuide && (
+                      <p className="mt-1">
+                        El monto supera la guía. Está permitido —un despido liquida prestaciones y una
+                        emergencia puede costar más que los días trabajados—: se registrará tal como lo
+                        escribió.
+                      </p>
+                    )}
+                  </>
+                ) : null}
+              </div>
+
+              {extraError ? <Alert variant="destructive">{extraError}</Alert> : null}
+
+              <DialogFooter>
+                <button type="button" className={ghostClass} onClick={closeExtraDialog}>
+                  Cancelar
+                </button>
+                <button type="submit" disabled={extraBusy} className={buttonClass}>
+                  {extraBusy ? "Registrando…" : "Registrar pago"}
+                </button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
 
       {props.canAdmin && (
         <Dialog

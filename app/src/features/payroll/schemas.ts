@@ -118,6 +118,60 @@ export const rejectVoucherSchema = z.object({
 });
 export type RejectVoucherInput = z.infer<typeof rejectVoucherSchema>;
 
+/**
+ * PA-2a: casos extraordinarios que justifican una nómina individual. Vocabulario
+ * CERRADO (mismo enum en el CHECK de la migración 036): el motivo libre no
+ * alcanza para contar el caso, y agregar un caso nuevo es una decisión de
+ * producto, no un texto que cada sede inventa.
+ */
+export const payrollExtraKindSchema = z.enum(["despido", "renuncia", "emergencia", "otro"]);
+export type PayrollExtraKind = z.infer<typeof payrollExtraKindSchema>;
+
+/**
+ * PA-2a: pago individual por caso extraordinario (despido, renuncia,
+ * emergencia del empleado). NO es un período de nómina y no se relaciona con
+ * `payroll_periods`: existe justamente para pagar días que un período CERRADO
+ * ya cubrió, donde `payPayrollItem` no puede entrar (assertDraftPeriod).
+ *
+ * El MOTIVO es obligatorio (no vacío) y el TIPO también: un pago de dinero sin
+ * explicación no es un registro, es un descuadre. `days_from`/`days_to` son
+ * OPCIONALES y son los días que el pago liquida: alimentan la GUÍA (ver
+ * `payrollExtraGuide`) y quedan guardados como referencia de qué se pagó. Van
+ * juntos o ninguno, y el rango tiene que ser real (fin >= inicio).
+ */
+export const payrollExtraSchema = z
+  .object({
+    employee_id: uuidSchema,
+    amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+    method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
+    reference: z.string().trim().max(120, "Referencia muy larga.").nullish(),
+    reason: z.string().trim().min(1, "El motivo del pago es obligatorio.").max(500, "Motivo muy largo."),
+    kind: payrollExtraKindSchema,
+    days_from: dateSchema.nullish(),
+    days_to: dateSchema.nullish(),
+  })
+  .superRefine((value, context) => {
+    const from = value.days_from ?? null;
+    const to = value.days_to ?? null;
+    if (from === null && to === null) return;
+    if (from === null || to === null) {
+      context.addIssue({
+        code: "custom",
+        message: "Indique las dos fechas de los días liquidados, o ninguna.",
+        path: ["days_from"],
+      });
+      return;
+    }
+    if (to < from) {
+      context.addIssue({
+        code: "custom",
+        message: "La fecha final no puede ser anterior a la inicial.",
+        path: ["days_to"],
+      });
+    }
+  });
+export type PayrollExtraInput = z.infer<typeof payrollExtraSchema>;
+
 // ------------------------------------------------------------ cálculos puros ---
 
 export interface CommissionLine {
@@ -446,6 +500,70 @@ export function prorateFixedSalary(args: {
 export interface DateRange {
   start_date: string;
   end_date: string;
+}
+
+/**
+ * PA-2a: la GUÍA de un pago extraordinario, no su tope.
+ *
+ * El dueño lo dijo explícitamente: el sueldo mensual es la BASE GUÍA de lo que
+ * corresponde a los días liquidados, NO un tope. Un pago por despido incluye
+ * la liquidación (prestaciones, indemnización) y no es la porción del sueldo;
+ * una emergencia puede costar más que los días trabajados. Por eso acá se
+ * CALCULA para MOSTRAR y nunca para bloquear: `exceedsGuide` es un aviso para
+ * quien registra el pago, no una condición de rechazo (el servicio y el CHECK
+ * de la base sólo exigen monto > 0 y motivo no vacío).
+ *
+ * Con días: la guía es la porción prorrateada del sueldo mensual de esos días
+ * (reutiliza `prorateFixedSalary`, la misma fórmula del período). Sin días: la
+ * guía es el sueldo mensual completo. Sin sueldo fijo configurado no hay guía
+ * (`null`): inventar un número sería peor que no mostrar ninguno. Un rango
+ * invertido LANZA (`INVALID_PERIOD_RANGE`), igual que la prorata.
+ * Puro para probarlo sin base de datos.
+ */
+export interface PayrollExtraGuide {
+  /** Sueldo fijo mensual del empleado (base guía); null = no configurado. */
+  monthlySalary: number | null;
+  /** Porción prorrateada de los días liquidados; null si no se indicaron días. */
+  proratedAmount: number | null;
+  /** Días del rango indicado (inclusive); null si no hay rango. */
+  days: number | null;
+  /** El monto SUPERA la guía. Es un aviso, NUNCA un rechazo. */
+  exceedsGuide: boolean;
+}
+
+export function payrollExtraGuide(args: {
+  salaryFixed: number | null | undefined;
+  daysFrom?: string | null;
+  daysTo?: string | null;
+  amount?: number | null;
+}): PayrollExtraGuide {
+  const salary = Number(args.salaryFixed ?? 0);
+  const monthlySalary = Number.isFinite(salary) && salary > 0 ? roundMoney(salary) : null;
+  const from = args.daysFrom ?? null;
+  const to = args.daysTo ?? null;
+
+  let proratedAmount: number | null = null;
+  let days: number | null = null;
+  if (from !== null && to !== null) {
+    // La prorata valida el rango (LANZA si es imposible): la guía no puede
+    // mostrar un número calculado sobre un rango que no existe.
+    const start = utcDayOf(from);
+    const end = utcDayOf(to);
+    if (start === null || end === null || end < start) {
+      throw new Error("INVALID_PERIOD_RANGE");
+    }
+    days = (end - start) / DAY_MS + 1;
+    if (monthlySalary !== null) {
+      proratedAmount = prorateFixedSalary({ salaryFixed: monthlySalary, startDate: from, endDate: to });
+    }
+  }
+
+  const guide = proratedAmount ?? monthlySalary;
+  const amount = args.amount === null || args.amount === undefined ? null : roundMoney(Number(args.amount));
+  const exceedsGuide =
+    guide !== null && amount !== null && Number.isFinite(amount) && amount - guide > 0.009;
+
+  return { monthlySalary, proratedAmount, days, exceedsGuide };
 }
 
 /**

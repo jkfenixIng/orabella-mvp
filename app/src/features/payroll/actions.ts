@@ -14,8 +14,10 @@ import {
   deletePayrollPeriod,
   getPeriodDetail,
   getVoucherSettings,
+  listPayrollExtras,
   listPeriods,
   listVouchers,
+  payPayrollExtra,
   openPayrollPeriod,
   payPayrollItem,
   rejectVoucher,
@@ -85,6 +87,37 @@ export async function payPayrollItemAction(id: string, input: unknown) {
       userId: session.userId,
       sedeId: session.sedeId,
     });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
+ * PA-2a: registra un pago de nómina individual por caso extraordinario
+ * (despido, renuncia, emergencia) con motivo y tipo. Solo admin: es nómina.
+ */
+export async function payPayrollExtraAction(input: unknown) {
+  try {
+    const session = await requirePayrollAdmin(await sessionToken());
+    const data = await payPayrollExtra(input, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+    });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
+ * PA-2a: pagos extraordinarios de la sede (el registro visible del módulo).
+ * Solo admin: es nómina, y el módulo no es de caja.
+ */
+export async function listPayrollExtrasAction() {
+  try {
+    const session = await requirePayrollAdmin(await sessionToken());
+    const data = await listPayrollExtras(session.sedeId);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

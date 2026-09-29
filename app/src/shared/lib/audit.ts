@@ -51,6 +51,12 @@ export const AUDIT_ACTIONS = {
   PAYROLL_CALCULATED: "payroll.calculated",
   PAYROLL_CLOSED: "payroll.closed",
   PAYROLL_DELETED: "payroll.deleted",
+  // PA-2a: pago de una nómina individual por caso extraordinario (despido,
+  // renuncia, emergencia). Es plata que sale de la sede sin un período detrás:
+  // tiene su propia acción para que un auditor lea el MOTIVO y el TIPO en el
+  // registro, y no un pago de nómina ordinaria más. (Pagar un ítem de un
+  // período NO se audita: ver `payPayrollItem`.)
+  PAYROLL_EXTRA_PAID: "payroll.extra_paid",
   COMMISSION_PAID: "payroll.commission_paid",
   VOUCHER_APPROVED: "voucher.approved",
   VOUCHER_REQUESTED: "voucher.requested",

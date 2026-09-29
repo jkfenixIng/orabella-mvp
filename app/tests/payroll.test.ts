@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -23,6 +23,9 @@ import {
   openPeriodSchema,
   overlapBlocksDeletion,
   payPayrollItemSchema,
+  payrollExtraGuide,
+  payrollExtraKindSchema,
+  payrollExtraSchema,
   prorateFixedSalary,
   rangesOverlap,
   rejectVoucherSchema,
@@ -51,6 +54,8 @@ import {
   rejectVoucher,
   type PayrollActor,
 } from "@/src/features/payroll/service";
+import * as payrollExtrasService from "@/src/features/payroll/service";
+import { AUDIT_ACTIONS } from "@/src/shared/lib/audit";
 import {
   getPeriodDetailAction,
   listVouchersAction,
@@ -2806,6 +2811,346 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     expect(failure).toMatchObject({ code: "READ_INCOMPLETE" });
     // No se abrió nada con una lectura incompleta.
     expect(periodInserts()).toHaveLength(0);
+  });
+});
+
+// --------------------------------- nómina extraordinaria individual (PA-2a) ---
+
+/**
+ * PA-2a — nómina individual por caso extraordinario (despido, renuncia,
+ * emergencia).
+ *
+ * EL HUECO (medido, no supuesto):
+ *   - `payPayrollItem` exige un período en BORRADOR (`assertDraftPeriod`, ver
+ *     el bloque "periodo cerrado es inmutable"): una renuncia un miércoles,
+ *     por días que ya están dentro de un período CERRADO, no tiene camino.
+ *   - `payroll_payments` no tiene columna de motivo (007_payroll.sql) y
+ *     `AUDIT_ACTIONS` no tiene acción de pago: nada registra POR QUÉ salió la
+ *     plata. Por eso `payPayrollItem` no escribe auditoría.
+ *
+ * RED: los tres huecos, uno por uno. El primer `it` de este bloque es el RED
+ * literal; el segundo fija el defecto que motiva el cambio.
+ */
+describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-admin-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const OTHER_SEDE = "99999999-9999-4999-8999-999999999999";
+  const EMPLOYEE_ID = payrollPagedStub.EMPLOYEE_ID;
+  const METHOD = {
+    id: "pm-efectivo",
+    sede_id: payrollPagedStub.SEDE_ID,
+    code: "efectivo",
+    name: "Efectivo",
+    is_active: true,
+    kind: "efectivo",
+  };
+
+  function employeeRow(salaryFixed: number | null, sedeId = payrollPagedStub.SEDE_ID) {
+    return {
+      id: EMPLOYEE_ID,
+      sede_id: sedeId,
+      user_id: null,
+      full_name: "Empleada de prueba",
+      employee_code: "E-01",
+      document: "1000000001",
+      phone: null,
+      position: "Ventas",
+      payout_mode: "normal",
+      email: null,
+      birth_date: null,
+      pay_type: "fijo",
+      salary_fixed: salaryFixed,
+      commission_percent: null,
+      is_active: true,
+    };
+  }
+
+  /**
+   * El caso que motiva PA-2a: un período CERRADO (los días ya se pagaron) con
+   * la empleada que renuncia. El pago extraordinario tiene que entrar igual.
+   */
+  function seedClosedPeriod(salaryFixed: number | null = 1_400_000) {
+    payrollPagedStub.tables = {
+      payroll_periods: [
+        {
+          id: payrollPagedStub.PERIOD_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          start_date: "2026-09-01",
+          end_date: "2026-09-30",
+          status: "cerrado",
+          created_by: "u-admin-1",
+          closed_at: "2026-09-30T23:00:00.000Z",
+          created_at: "2026-09-01T00:00:00.000Z",
+        },
+      ],
+      employees: [employeeRow(salaryFixed)],
+      payment_methods: [METHOD],
+      payroll_extras: [],
+      audit_logs: [],
+    };
+  }
+
+  function extraInput(overrides: Record<string, unknown> = {}) {
+    return {
+      employee_id: EMPLOYEE_ID,
+      amount: 1_800_000,
+      method_code: "efectivo",
+      reference: "Recibo 001",
+      reason: "Renuncia del 2026-09-16",
+      kind: "renuncia",
+      days_from: "2026-09-01",
+      days_to: "2026-09-16",
+      ...overrides,
+    };
+  }
+
+  const extraInserts = () =>
+    payrollPagedStub.inserts.filter((entry) => entry.table === "payroll_extras");
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  // --------------------------------------------------------------- RED ---
+
+  it("RED: hoy no existe la operación, ni la acción de auditoría, ni la tabla", () => {
+    // 1) No hay operación: nada registra un pago individual con motivo.
+    expect(typeof payrollExtrasService.payPayrollExtra).toBe("function");
+    // 2) No hay acción de auditoría de pago: la plata que sale no se explica.
+    expect(AUDIT_ACTIONS.PAYROLL_EXTRA_PAID).toBe("payroll.extra_paid");
+    // 3) No hay tabla: la migración 036 todavía no existe.
+    expect(
+      existsSync(join(process.cwd(), "supabase", "migrations", "036_payroll_extra_payment.sql")),
+    ).toBe(true);
+  });
+
+  it("el hueco que motiva PA-2a: un período CERRADO no admite pagar su ítem", () => {
+    // Pasa hoy y es el defecto: cerrado = inmutable, así que el pago del ítem
+    // se rechaza y no queda ningún camino para los días ya cubiertos.
+    expect(() => assertDraftPeriod("cerrado")).toThrowError("PERIOD_CLOSED");
+  });
+
+  // -------------------------------------------------------------- GREEN ---
+
+  it("registra el pago con tipo, motivo y actor, y escribe la auditoría", async () => {
+    seedClosedPeriod();
+
+    const row = await payrollExtrasService.payPayrollExtra(extraInput(), ACTOR);
+
+    expect(row).toMatchObject({
+      sede_id: payrollPagedStub.SEDE_ID,
+      employee_id: EMPLOYEE_ID,
+      amount: 1_800_000,
+      method_id: METHOD.id,
+      method_code: "efectivo",
+      reference: "Recibo 001",
+      reason: "Renuncia del 2026-09-16",
+      kind: "renuncia",
+      days_from: "2026-09-01",
+      days_to: "2026-09-16",
+      paid_by: ACTOR.userId,
+    });
+
+    // La auditoría explica el dinero: quién, cuánto, de qué tipo y por qué.
+    const audit = payrollPagedStub.inserts.find((entry) => entry.table === "audit_logs");
+    expect(audit?.payload).toMatchObject({
+      action: "payroll.extra_paid",
+      entity: "payroll_extras",
+      entity_id: row.id,
+      user_id: ACTOR.userId,
+      sede_id: payrollPagedStub.SEDE_ID,
+      metadata: {
+        employee_id: EMPLOYEE_ID,
+        amount: 1_800_000,
+        kind: "renuncia",
+        reason: "Renuncia del 2026-09-16",
+        method_code: "efectivo",
+      },
+    });
+  });
+
+  it("funciona para días ya cubiertos por un período CERRADO (el caso que motiva)", async () => {
+    seedClosedPeriod();
+    expect(() => assertDraftPeriod("cerrado")).toThrowError("PERIOD_CLOSED");
+
+    const row = await payrollExtrasService.payPayrollExtra(
+      extraInput({ kind: "despido", reason: "Despido con justa causa" }),
+      ACTOR,
+    );
+
+    expect(row.kind).toBe("despido");
+    // NO es un período: no se creó ni se tocó ninguno.
+    expect(payrollPagedStub.inserts.filter((entry) => entry.table === "payroll_periods")).toHaveLength(0);
+    expect(payrollPagedStub.updates.filter((entry) => entry.table === "payroll_periods")).toHaveLength(0);
+
+    // Y queda visible en los registros del admin (la lista del módulo).
+    const listed = await payrollExtrasService.listPayrollExtras(payrollPagedStub.SEDE_ID);
+    expect(listed.map((entry) => entry.id)).toContain(row.id);
+    expect(listed[0]).toMatchObject({ kind: "despido", reason: "Despido con justa causa" });
+  });
+
+  it("el motivo es obligatorio: vacío se rechaza sin escribir nada", async () => {
+    seedClosedPeriod();
+
+    const failure: unknown = await payrollExtrasService
+      .payPayrollExtra(extraInput({ reason: "   " }), ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(extraInserts()).toHaveLength(0);
+    expect(payrollPagedStub.inserts).toHaveLength(0);
+    // La misma regla en el esquema puro (y en el CHECK de la migración 036).
+    expect(payrollExtraSchema.safeParse(extraInput({ reason: "" })).success).toBe(false);
+    expect(payrollExtraSchema.safeParse(extraInput({ reason: undefined })).success).toBe(false);
+  });
+
+  it("control negativo: la guía NO es un tope; un monto por encima se acepta", async () => {
+    seedClosedPeriod(1_400_000);
+    // La guía de esos días es ~746.667; el pago de 9.999.999 (una liquidación
+    // total, que no es la porción del sueldo) se registra igual.
+    const row = await payrollExtrasService.payPayrollExtra(
+      extraInput({ amount: 9_999_999, kind: "despido" }),
+      ACTOR,
+    );
+    expect(row.amount).toBe(9_999_999);
+  });
+
+  it("control negativo: un método inactivo de la sede se rechaza", async () => {
+    seedClosedPeriod();
+    payrollPagedStub.tables.payment_methods = [{ ...METHOD, is_active: false }];
+
+    const failure: unknown = await payrollExtrasService
+      .payPayrollExtra(extraInput(), ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: "METHOD_INACTIVE", status: 422 });
+    expect(extraInserts()).toHaveLength(0);
+  });
+
+  it("control negativo: un empleado de OTRA sede no se paga desde esta", async () => {
+    seedClosedPeriod();
+    payrollPagedStub.tables.employees = [employeeRow(1_400_000, OTHER_SEDE)];
+
+    const failure: unknown = await payrollExtrasService
+      .payPayrollExtra(extraInput(), ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: "NOT_FOUND", status: 404 });
+    expect(extraInserts()).toHaveLength(0);
+  });
+
+  it("control negativo: los días invertidos se rechazan (el rango es real)", async () => {
+    seedClosedPeriod();
+
+    const failure: unknown = await payrollExtrasService
+      .payPayrollExtra(extraInput({ days_from: "2026-09-16", days_to: "2026-09-01" }), ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(extraInserts()).toHaveLength(0);
+  });
+});
+
+// ------------------------- guía de la nómina extraordinaria (PA-2a, pura) ---
+
+describe("payroll: la guía de la nómina extraordinaria, no un tope (PA-2a)", () => {
+  it("la guía es la porción prorrateada de los días que se liquidan", () => {
+    const guide = payrollExtraGuide({
+      salaryFixed: 1_400_000,
+      daysFrom: "2026-09-01",
+      daysTo: "2026-09-16",
+      amount: 500_000,
+    });
+
+    // 1.400.000 × 16/30 = 746.666,67 → 746.667 (peso entero, `roundMoney`).
+    expect(guide.monthlySalary).toBe(1_400_000);
+    expect(guide.days).toBe(16);
+    expect(guide.proratedAmount).toBe(746_667);
+    expect(guide.exceedsGuide).toBe(false);
+  });
+
+  it("un monto por encima de la guía se MARCA, no se bloquea", () => {
+    const guide = payrollExtraGuide({
+      salaryFixed: 1_400_000,
+      daysFrom: "2026-09-01",
+      daysTo: "2026-09-16",
+      amount: 2_000_000,
+    });
+    expect(guide.exceedsGuide).toBe(true);
+  });
+
+  it("sin días la guía es el sueldo mensual; sin sueldo fijo no hay guía", () => {
+    const withoutDays = payrollExtraGuide({ salaryFixed: 1_400_000, amount: 100 });
+    expect(withoutDays.proratedAmount).toBeNull();
+    expect(withoutDays.days).toBeNull();
+    expect(withoutDays.monthlySalary).toBe(1_400_000);
+    // La guía del mes también marca el exceso.
+    expect(payrollExtraGuide({ salaryFixed: 1_400_000, amount: 2_000_000 }).exceedsGuide).toBe(true);
+
+    const withoutSalary = payrollExtraGuide({
+      salaryFixed: null,
+      daysFrom: "2026-09-01",
+      daysTo: "2026-09-16",
+      amount: 500_000,
+    });
+    expect(withoutSalary.monthlySalary).toBeNull();
+    expect(withoutSalary.proratedAmount).toBeNull();
+    expect(withoutSalary.exceedsGuide).toBe(false);
+  });
+
+  it("control negativo: un rango invertido LANZA (no devuelve 0 en silencio)", () => {
+    expect(() =>
+      payrollExtraGuide({ salaryFixed: 1_400_000, daysFrom: "2026-09-16", daysTo: "2026-09-01" }),
+    ).toThrowError("INVALID_PERIOD_RANGE");
+  });
+
+  it("el tipo del caso es un vocabulario cerrado", () => {
+    expect(payrollExtraKindSchema.options).toEqual(["despido", "renuncia", "emergencia", "otro"]);
+    expect(payrollExtraSchema.safeParse({ kind: "otro" }).success).toBe(false); // faltan campos
+    expect(payrollExtraKindSchema.safeParse("despido").success).toBe(true);
+    expect(payrollExtraKindSchema.safeParse("vacaciones").success).toBe(false);
+  });
+});
+
+// --------------------------------- migración 036 (nómina extraordinaria) ---
+
+describe("migración 036_payroll_extra_payment.sql (PA-2a)", () => {
+  const sqlPath = join(process.cwd(), "supabase", "migrations", "036_payroll_extra_payment.sql");
+  // Lectura tolerante a la ausencia: en RED el archivo no existe todavía y el
+  // fallo tiene que ser la ASERCIÓN de cada prueba, no un error de colección
+  // que oculte los otros dos huecos.
+  const sql = existsSync(sqlPath) ? readFileSync(sqlPath, "utf8") : "";
+  /** Sin espacios de más: compara el DDL, no la indentación del archivo. */
+  const flat = sql.replace(/\s+/g, " ");
+
+  it("crea la tabla con el motivo obligatorio y el tipo acotado", () => {
+    expect(flat).toContain("CREATE TABLE IF NOT EXISTS public.payroll_extras");
+    expect(flat).toContain("CHECK (amount > 0)");
+    expect(flat).toContain("CHECK (btrim(reason) <> '')");
+    expect(flat).toContain("CHECK (kind IN ('despido', 'renuncia', 'emergencia', 'otro'))");
+  });
+
+  it("no es un período: no toca payroll_periods", () => {
+    expect(sql).not.toMatch(/ALTER TABLE public\.payroll_periods/i);
+    expect(sql).not.toMatch(/INSERT INTO public\.payroll_periods/i);
+  });
+
+  it("es idempotente y no borra ni reescribe filas", () => {
+    expect(flat).toContain("IF NOT EXISTS");
+    // Sólo cuentan los statements EJECUTABLES: el encabezado NOMBRA estas
+    // operaciones para decir que no las hace (mismo criterio que cash.test.ts).
+    expect(sql).not.toMatch(/^\s*DELETE\s+FROM/im);
+    expect(sql).not.toMatch(/^\s*UPDATE\s+public\./im);
+    expect(sql).not.toMatch(/^\s*DROP\s+(TABLE|COLUMN|SCHEMA)/im);
+    expect(sql).not.toMatch(/^\s*TRUNCATE/m);
+  });
+
+  it("explica el orden de los statements y por qué, y no se ejecutó", () => {
+    expect(sql).toContain("ORDEN DE LOS STATEMENTS");
+    expect(sql).toContain("NO ejecutado por el agente: requiere base de datos");
   });
 });
 

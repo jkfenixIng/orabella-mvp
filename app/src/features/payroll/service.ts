@@ -18,6 +18,7 @@ import {
   openPeriodSchema,
   overlapBlocksDeletion,
   payPayrollItemSchema,
+  payrollExtraSchema,
   prorateFixedSalary,
   rangesOverlap,
   requestVoucherSchema,
@@ -33,6 +34,7 @@ import {
   type CalculatePayrollInput,
   type DetailLine,
   type OpenPeriodInput,
+  type PayrollExtraKind,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { commissionRuleKey, type RuleRate } from "@/src/features/commissions/schemas";
@@ -331,6 +333,30 @@ export interface PayrollPaymentRow {
   reference: string | null;
 }
 
+/**
+ * PA-2a: un pago de nómina individual por caso extraordinario. NO es un
+ * período: no tiene `period_id`, no se calcula desde facturas y no cierra
+ * nada. Es plata que sale de la sede con su motivo y su tipo, para los días
+ * que un período (incluso uno CERRADO) ya cubrió.
+ */
+export interface PayrollExtraRow {
+  id: string;
+  sede_id: string;
+  employee_id: string;
+  amount: number;
+  method_id: string | null;
+  method_code: string;
+  reference: string | null;
+  reason: string;
+  kind: PayrollExtraKind;
+  /** Días que el pago liquida (referencia); null = pago sin días asociados. */
+  days_from: string | null;
+  days_to: string | null;
+  paid_by: string | null;
+  paid_at: string;
+  created_at: string;
+}
+
 export interface VoucherSettingsRow {
   sede_id: string;
   /** V2: null o 0 = sin tope diario general. */
@@ -372,6 +398,8 @@ const ITEM_SELECT =
   "id, period_id, employee_id, base_fixed, commissions, bonuses, deductions_vales, other_discounts, net_pay, detail_json, created_at";
 const PAYMENT_SELECT =
   "id, payroll_item_id, method_id, method_code, amount, paid_at, paid_by, reference";
+const EXTRA_SELECT =
+  "id, sede_id, employee_id, amount, method_id, method_code, reference, reason, kind, days_from, days_to, paid_by, paid_at, created_at";
 /** Columnas base (migración 007), siempre presentes. */
 const VOUCHER_SELECT_BASE =
   "id, sede_id, employee_id, amount, request_date, status, approved_by, approval_code, observation";
@@ -1162,6 +1190,140 @@ export async function payPayrollItem(
       remaining: roundMoney(Math.max(0, net - paid)),
       payments: (inserted ?? []) as PayrollPaymentRow[],
     };
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
+// ------------------------------------------------ nómina extraordinaria (PA-2a) ---
+
+/**
+ * PA-2a: registra un pago de nómina INDIVIDUAL por caso extraordinario
+ * (despido, renuncia, emergencia del empleado) y lo audita.
+ *
+ * NO es un período y no toca `payroll_periods`. Existe justamente porque
+ * `payPayrollItem` exige un período en BORRADOR (`assertDraftPeriod`): una
+ * renuncia un miércoles, por días que ya están dentro de un período CERRADO,
+ * no tiene otro camino. Acá no hay período que mirar: el pago se registra por
+ * sí mismo, con su MOTIVO (obligatorio) y su TIPO.
+ *
+ * El monto lo escribe el admin y NO se topa: el sueldo mensual es la base
+ * GUÍA (ver `payrollExtraGuide` en schemas.ts), no un límite. Un despido
+ * liquida prestaciones y no es la porción del sueldo; una emergencia puede
+ * costar más que los días trabajados. La base sólo exige `amount > 0` y un
+ * motivo no vacío.
+ *
+ * Sólo admin (vía requirePayrollAdmin en la action): es nómina, y el módulo de
+ * nómina no es de caja.
+ */
+export async function payPayrollExtra(raw: unknown, actor: PayrollActor): Promise<PayrollExtraRow> {
+  const parsed = payrollExtraSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new PayrollError("VALIDATION", validationMessage(parsed.error), 400);
+  }
+  const db = await payrollDb();
+  try {
+    // El empleado tiene que ser de la sede del actor. `getEmployee` busca por
+    // id sin filtrar sede (admin/service), así que la sede se comprueba ACÁ:
+    // sin esto un admin podría pagarle a la planta de otra sede. El código de
+    // error es el mismo NOT_FOUND de un empleado inexistente, para no revelar
+    // la planta de otras sedes.
+    const employee = await getEmployee(parsed.data.employee_id).catch((error) => {
+      throw toPayrollError(error);
+    });
+    if (employee.sede_id !== actor.sedeId) {
+      throw new PayrollError("NOT_FOUND", "Empleado no encontrado.", 404);
+    }
+
+    const methods = await listPaymentMethods(actor.sedeId).catch((error) => {
+      throw toPayrollError(error);
+    });
+    const method = methods.find((row) => row.is_active && row.code === parsed.data.method_code);
+    if (!method) {
+      throw new PayrollError(
+        "METHOD_INACTIVE",
+        `El método de pago ${parsed.data.method_code} no está activo en esta sede.`,
+        422,
+      );
+    }
+
+    const amount = roundMoney(Number(parsed.data.amount));
+    const reference = parsed.data.reference?.trim() || null;
+    const daysFrom = parsed.data.days_from ?? null;
+    const daysTo = parsed.data.days_to ?? null;
+
+    const { data, error } = await db
+      .from("payroll_extras")
+      .insert({
+        sede_id: actor.sedeId,
+        employee_id: parsed.data.employee_id,
+        amount,
+        method_id: method.id,
+        method_code: parsed.data.method_code,
+        reference,
+        reason: parsed.data.reason,
+        kind: parsed.data.kind,
+        days_from: daysFrom,
+        days_to: daysTo,
+        paid_by: actor.userId,
+      })
+      .select(EXTRA_SELECT)
+      .single();
+    if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    const row = data as PayrollExtraRow;
+
+    // PA-2a: la plata que sale sin un período detrás tiene que poder
+    // explicarse. Se audita el empleado, el monto, el TIPO, el MOTIVO y el
+    // medio de pago (más los días liquidados, si se indicaron).
+    await writeAudit({
+      sede_id: actor.sedeId,
+      user_id: actor.userId,
+      action: AUDIT_ACTIONS.PAYROLL_EXTRA_PAID,
+      entity: "payroll_extras",
+      entity_id: row.id,
+      metadata: {
+        employee_id: parsed.data.employee_id,
+        amount,
+        kind: parsed.data.kind,
+        reason: parsed.data.reason,
+        method_code: parsed.data.method_code,
+        reference,
+        days_from: daysFrom,
+        days_to: daysTo,
+      },
+    });
+
+    return row;
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
+/**
+ * PA-2a: pagos extraordinarios de la sede, del más reciente al más viejo. Es
+ * la cara VISIBLE del registro (el módulo de nómina), no sólo la auditoría.
+ * Lectura exhaustiva (U5): son pocos y un listado recortado en silencio
+ * mostraría menos plata pagada de la que salió.
+ */
+export async function listPayrollExtras(sedeId: string): Promise<PayrollExtraRow[]> {
+  try {
+    const db = await payrollDb();
+    return await readAllPayroll<PayrollExtraRow>({
+      log: "listPayrollExtras",
+      what: "pagos extraordinarios",
+      meta: { sedeId },
+      table: "payroll_extras",
+      fetchPage: (from, to) =>
+        db
+          .from("payroll_extras")
+          .select(EXTRA_SELECT)
+          .eq("sede_id", sedeId)
+          .order("paid_at", { ascending: false })
+          // `id` desempata: dos pagos con el mismo timestamp no pueden caer en
+          // páginas distintas (ni repetirse ni faltar).
+          .order("id")
+          .range(from, to),
+    });
   } catch (error) {
     throw toPayrollError(error);
   }

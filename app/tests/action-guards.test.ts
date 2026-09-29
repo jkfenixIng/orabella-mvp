@@ -17,7 +17,9 @@ import * as adminService from "@/src/features/admin/service";
 import {
   getPeriodDetailAction,
   getVoucherSettingsAction,
+  listPayrollExtrasAction,
   listPeriodsAction,
+  payPayrollExtraAction,
   payPayrollItemAction,
   requestVoucherAction,
 } from "@/src/features/payroll/actions";
@@ -718,6 +720,20 @@ const SURFACES: readonly SurfaceSpec[] = [
     kind: "payroll",
     roles: ["admin"],
     why: "paga un ítem de nómina: es parte de liquidarla, y la caja no tiene acceso al módulo.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "payPayrollExtraAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "registra un pago extraordinario (despido/renuncia/emergencia) con motivo: es plata de nómina y la caja no entra al módulo.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "listPayrollExtrasAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "lee el registro de pagos extraordinarios: es lectura de nómina completa y la caja no entra.",
   },
   {
     file: PAYROLL_ACTIONS_FILE,
@@ -1499,6 +1515,8 @@ export async function doThing() {
 const SEDE_PRUEBA = "11111111-1111-4111-8111-111111111111";
 const PERIOD_ID = "22222222-2222-4222-8222-222222222222";
 const ITEM_ID = "33333333-3333-4333-8333-333333333333";
+/** PA-2a: la planta de la prueba necesita un id con forma de uuid. */
+const EMPLEADO_ID = "44444444-4444-4444-8444-444444444444";
 
 const sessionStub = vi.hoisted(() => ({ current: null as null | SessionUser }));
 
@@ -1520,8 +1538,10 @@ vi.mock("@/src/features/auth/service", async (importOriginal) => {
 
 /**
  * Doble mínimo de PostgREST: las consultas encadenan y resuelven las filas
- * sembradas por tabla. Alcanza para las lecturas que estas pruebas ejercitan;
- * las escrituras no se ejercitan (la guarda rechaza antes de llegar ahí).
+ * sembradas por tabla. Alcanza para las lecturas que estas pruebas ejercitan.
+ * La mayoría de las escrituras no se ejercitan (la guarda rechaza antes de
+ * llegar ahí); `insert` existe sólo para el control positivo del pago
+ * extraordinario (PA-2a), que sí necesita que la escritura devuelva una fila.
  */
 vi.mock("@/src/shared/lib/supabase/server", () => ({
   createAdminClient: () => {
@@ -1530,6 +1550,18 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
       const result = { data: rows, error: null };
       const query: Record<string, unknown> = {
         select: () => query,
+        insert: (payload?: unknown) => {
+          const values = (Array.isArray(payload) ? payload : [payload]) as Array<
+            Record<string, unknown>
+          >;
+          const persisted = values.map((row, index) => ({
+            id: `fila-insertada-${index + 1}`,
+            created_at: "2026-01-31T23:59:59.000Z",
+            ...row,
+          }));
+          dbStub.rows[table] = [...rows, ...persisted];
+          return query;
+        },
         eq: () => query,
         neq: () => query,
         in: () => query,
@@ -1676,6 +1708,69 @@ describe("nómina solo admin (y el propio empleado): la caja no entra; los vales
     });
 
     expect(result).toMatchObject({ success: false, code: "FORBIDDEN" });
+  });
+
+  it("la caja NO registra un pago extraordinario (payPayrollExtraAction)", async () => {
+    seedNomina();
+    asSession(["caja"]);
+
+    const result = await payPayrollExtraAction({
+      employee_id: EMPLEADO_ID,
+      amount: 500000,
+      method_code: "efectivo",
+      reason: "Renuncia",
+      kind: "renuncia",
+    });
+
+    expect(result).toMatchObject({ success: false, code: "FORBIDDEN" });
+  });
+
+  it("la caja NO lista los pagos extraordinarios (listPayrollExtrasAction)", async () => {
+    seedNomina();
+    asSession(["caja"]);
+
+    const result = await listPayrollExtrasAction();
+
+    expect(result).toMatchObject({ success: false, code: "FORBIDDEN" });
+  });
+
+  it("control positivo: el admin registra y lista un pago extraordinario", async () => {
+    seedNomina();
+    const extra = {
+      id: "extra-1",
+      sede_id: SEDE_PRUEBA,
+      employee_id: EMPLEADO_ID,
+      amount: 500000,
+      method_id: METODO_PRUEBA.id,
+      method_code: "efectivo",
+      reference: null,
+      reason: "Renuncia",
+      kind: "renuncia",
+      days_from: null,
+      days_to: null,
+      paid_by: "u-prueba",
+      paid_at: "2026-01-20T10:00:00.000Z",
+      created_at: "2026-01-20T10:00:00.000Z",
+    };
+    dbStub.rows.payroll_extras = [extra];
+    dbStub.rows.employees = [
+      { id: EMPLEADO_ID, sede_id: SEDE_PRUEBA, user_id: null, full_name: "Empleada" },
+    ];
+    asSession(["admin"]);
+
+    const registered = await payPayrollExtraAction({
+      employee_id: EMPLEADO_ID,
+      amount: 500000,
+      method_code: "efectivo",
+      reason: "Renuncia",
+      kind: "renuncia",
+    });
+    expect(registered, JSON.stringify(registered)).toMatchObject({ success: true });
+
+    const listed = await listPayrollExtrasAction();
+    expect(listed.success).toBe(true);
+    if (!listed.success) return;
+    expect(listed.data.map((row) => row.id)).toContain("extra-1");
   });
 
   it("toda ruta de nómina rechaza a la caja con 403 FORBIDDEN", async () => {
