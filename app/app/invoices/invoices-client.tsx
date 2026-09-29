@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useTransition, type FormEvent } from "react";
+import { toast } from "sonner";
 import {
   annulInvoiceAction,
   createInvoiceAction,
@@ -27,6 +28,7 @@ import type {
   ServiceRow,
   TaxConfigRow,
 } from "@/src/features/admin/service";
+import { Alert } from "@/src/components/ui/lib/alert";
 import { Button } from "@/src/components/ui/lib/button";
 import {
   Card,
@@ -65,8 +67,6 @@ import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 const inputClass = cn(
   "flex h-10 w-full rounded-lg border border-color bg-surface px-3 text-sm text-text-primary outline-none transition-colors duration-200 placeholder:text-text-tertiary focus:border-primary-600 focus:ring-2 focus:ring-primary-600/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-border-color dark:bg-surface dark:text-text-primary",
 );
-const errorClass = cn("text-sm text-error dark:text-error-400");
-const okClass = cn("text-sm text-success dark:text-success-400");
 
 type ActionResult<T> =
   | { success: true; data: T }
@@ -293,7 +293,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
   // F1: Desde/Hasta = hoy por defecto; vaciarlas muestra todo el historial.
   const [filters, setFilters] = useState({ status: "", from: todayLocalISO(), to: todayLocalISO(), seller: "", number: "", closedBy: "", employee: "" });
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // Transición para los cambios de vista (filtros/detalle): la UI no se
   // congela mientras la server action responde.
@@ -690,7 +689,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
       }
       setDetail(result.data);
       setIsEditDialogOpen(false);
-      setNotice(
+      // EVENTO: la edición acaba de guardarse, así que va por el canal efímero
+      // (toast) y no como texto pegado a la pantalla. Antes era el estado
+      // `notice`, que se quedaba compitiendo con lo que sí importa.
+      toast.success(
         free
           ? `Factura #${result.data.invoice.consecutive_number} actualizada (nuevo total ${formatMoney(result.data.invoice.total)}).`
           : `Factura #${result.data.invoice.consecutive_number} actualizada (total intacto ${formatMoney(result.data.invoice.total)}).`,
@@ -726,7 +728,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
       setConfirmKind(null);
       return;
     }
-    setNotice(`Factura #${result.data.invoice.consecutive_number} ${result.data.invoice.status.toLowerCase()}.`);
+    // EVENTO: la emisión acaba de pasar; efímera, no estado.
+    toast.success(`Factura #${result.data.invoice.consecutive_number} ${result.data.invoice.status.toLowerCase()}.`);
     setClientName("");
     setClientDocument("");
     setDiscount("");
@@ -761,7 +764,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
     payments: Array<{ method_code: string; amount: number }>;
   } | null {
     setError(null);
-    setNotice(null);
     if (items.length === 0) {
       setError("Agregue al menos un ítem a la factura.");
       return null;
@@ -854,7 +856,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
       return;
     }
     setError(null);
-    setNotice(null);
     setBusy(true);
     let result: ActionResult<InvoiceDetail>;
     try {
@@ -869,7 +870,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
       setConfirmKind(null);
       return;
     }
-    setNotice(`Factura #${result.data.invoice.consecutive_number} anulada (stock revertido).`);
+    // EVENTO: la anulación acaba de pasar; efímera, no estado.
+    toast.success(`Factura #${result.data.invoice.consecutive_number} anulada (stock revertido).`);
     setDetail(result.data);
     setConfirmKind(null);
     await applyFilters(undefined, invoicePage);
@@ -904,7 +906,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
       return;
     }
     setError(null);
-    setNotice(null);
     setBusy(true);
     let result: ActionResult<InvoiceDetail>;
     try {
@@ -918,7 +919,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
       setError(`[${result.code}] ${result.message}`);
       return;
     }
-    setNotice(
+    // EVENTO: el cobro acaba de registrarse; efímero, no estado.
+    toast.success(
       result.data.invoice.status === "Pagada"
         ? "Cobro completo: factura pagada."
         : `Porción registrada. Saldo: ${formatMoney(result.data.remaining)}.`,
@@ -1026,7 +1028,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
     }
     if (failed.length === 0) {
       closeCommission();
-      setNotice(
+      // EVENTO: el pago acaba de pasar; efímero, no estado.
+      toast.success(
         paidCount === 1
           ? "Comisión pagada desde la caja del turno."
           : `${paidCount} comisiones pagadas desde la caja del turno.`,
@@ -1566,14 +1569,23 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         </div>
 
                         {shiftBlockReason !== null && (
-                          <p role="status" className="rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
+                          // ESTADO que bloquea, derivado EN VIVO: la caja del
+                          // turno no es el desenlace de una acción enviada, es
+                          // el caso mientras no se abra el turno. `warning` es
+                          // la precondición pendiente —el mismo par de tokens
+                          // del ámbar crudo que había— y `role="status"`
+                          // explícito (polite) evita interrumpir a quien está
+                          // llenando el formulario.
+                          <Alert variant="warning" role="status">
                             {shiftBlockReason}
-                          </p>
+                          </Alert>
                         )}
                         {error && (
-                          <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
-                            {error}
-                          </p>
+                          // ESTADO: el fallo al emitir (o la validación que
+                          // frenó el envío) sigue siendo el caso hasta que se
+                          // corrija. `destructive` deriva role="alert"
+                          // asertivo, el mismo anuncio que el `<p>` escribía.
+                          <Alert variant="destructive">{error}</Alert>
                         )}
 
                         <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 pt-4">
@@ -1598,14 +1610,21 @@ export function InvoicesClient(props: InvoicesClientProps) {
               </Dialog>
             )}
           </div>
-          {(blockNotice ?? shiftBlockReason) !== null && (
-            <p
-              role={blockNotice ? "alert" : "status"}
-              className="mt-3 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800"
-            >
-              {blockNotice ?? shiftBlockReason}
-            </p>
-          )}
+          {blockNotice !== null ? (
+            // ESTADO CONFIRMADO: la guarda de caja saltó al hacer clic, así que
+            // hay que enterarse ya. `warning` deriva role="alert" (asertivo),
+            // el mismo anuncio que el `role={blockNotice ? ...}` del marcado.
+            <Alert variant="warning" className="mt-3">
+              {blockNotice}
+            </Alert>
+          ) : shiftBlockReason !== null ? (
+            // ESTADO derivado en vivo, sin acción enviada: mismo texto y misma
+            // presentación que el anterior, pero `role="status"` (polite) para
+            // no interrumpir a quien todavía no intentó nada.
+            <Alert variant="warning" role="status" className="mt-3">
+              {shiftBlockReason}
+            </Alert>
+          ) : null}
         </CardHeader>
         <CardContent>
           <form onSubmit={applyFilters} className="mt-0 flex flex-wrap items-end gap-3">
@@ -1977,14 +1996,19 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             <div className="rounded-lg bg-slate-50 p-4">
                               <h3 className="text-sm font-bold uppercase tracking-wide text-slate-500">Operaciones</h3>
                               {shiftBlockReason !== null && (
-                                <p role="status" className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">
+                                // Mismo estado derivado en vivo que en el
+                                // formulario de emisión: precondición pendiente
+                                // (`warning`) anunciada polite.
+                                <Alert variant="warning" role="status" className="mt-2">
                                   {shiftBlockReason}
-                                </p>
+                                </Alert>
                               )}
                               {error && (
-                                <p role="alert" className="mt-2 rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+                                // ESTADO: el fallo de la operación sigue siendo
+                                // el caso; asertivo por la variante.
+                                <Alert variant="destructive" className="mt-2">
                                   {error}
-                                </p>
+                                </Alert>
                               )}
                               <div className="mt-3 flex flex-col gap-4">
                           {props.canWrite && detail.invoice.status === "Emitida" && (
@@ -2484,9 +2508,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             </div>
                             )}
                             {editError && (
-                              <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
-                                {editError}
-                              </p>
+                              // ESTADO: la validación que frena el guardado (o el
+                              // fallo del servidor) sigue siendo el caso.
+                              <Alert variant="destructive">{editError}</Alert>
                             )}
                           </div>
                           <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-6 py-4 sm:px-8">
@@ -2553,14 +2577,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
       </Card>
 
       {error && (
-        <p role="alert" className={errorClass}>
-          {error}
-        </p>
-      )}
-      {notice && (
-        <p role="status" className={okClass}>
-          {notice}
-        </p>
+        // ESTADO: el error de vista (cargar el listado) sigue siendo el caso
+        // hasta que la consulta funcione; asertivo por la variante.
+        <Alert variant="destructive">{error}</Alert>
       )}
 
       {/* Modal de ítems generalizado: crear (borrador) y edición libre de
@@ -2856,9 +2875,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 </div>
               )}
               {itemError && (
-                <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
-                  {itemError}
-                </p>
+                // ESTADO: la validación del ítem frena el alta hasta que se
+                // corrija; asertivo por la variante.
+                <Alert variant="destructive">{itemError}</Alert>
               )}
             </div>
             <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-5 py-3">
@@ -2954,9 +2973,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 nómina. No se pierde.
               </p>
               {commissionError && (
-                <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
-                  {commissionError}
-                </p>
+                // ESTADO: el fallo del pago de la comisión conserva la fila para
+                // reintentar, así que el aviso sigue siendo el caso.
+                <Alert variant="destructive">{commissionError}</Alert>
               )}
             </div>
             <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-6 py-4">
