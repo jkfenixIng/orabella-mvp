@@ -4,6 +4,7 @@ import Script from "next/script";
 import type { ReactNode } from "react";
 import { ThemeProvider } from "@/src/shared/components/theme-provider";
 import { AppShell } from "@/src/shared/components/app-shell";
+import { Toaster } from "@/src/components/ui/lib/sonner";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { countUnreadAlerts } from "@/src/features/alerts/service";
@@ -49,6 +50,10 @@ export default async function RootLayout({ children }: RootLayoutProps) {
           <AppShell roles={roles} userName={session?.user.full_name ?? null} alertsUnread={alertsUnread}>
             {children}
           </AppShell>
+          {/* Un solo Toaster en toda la app, y adentro de ThemeProvider: su
+              useTheme() necesita el contexto, y un segundo mount duplicaria
+              cada toast. */}
+          <Toaster />
         </ThemeProvider>
       </body>
     </html>
