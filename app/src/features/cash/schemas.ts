@@ -251,6 +251,21 @@ export const closeShiftSchema = z.object({
 });
 export type CloseShiftInput = z.infer<typeof closeShiftSchema>;
 
+/**
+ * U3: reconteo de un cierre. Un cierre firmado es INMUTABLE; la única vía de
+ * corrección es un conteo COMPLETO nuevo (mismo detalle por denominación que
+ * el cierre) más un motivo. No existe la corrección de un total tecleado: el
+ * `counts` es obligatorio y su efectivo debe cuadrar con `counted_cash`. El
+ * motivo es obligatorio (queda con quién y cuándo en `cash_shift_recounts`).
+ * Puro para probarlo sin base de datos.
+ */
+export const recountShiftSchema = z.object({
+  counted_cash: z.coerce.number({ error: "El conteo de efectivo es obligatorio." }).nonnegative("El conteo no puede ser negativo."),
+  counts: z.array(shiftCountSchema).min(1, "El detalle del reconteo es obligatorio."),
+  reason: z.string().trim().min(1, "El motivo del reconteo es obligatorio.").max(500, "Motivo muy largo."),
+});
+export type RecountShiftInput = z.infer<typeof recountShiftSchema>;
+
 /** CAJ-05: vista del día (fecha calendario yyyy-mm-dd). */
 export const dayViewSchema = z.object({
   fecha: z
@@ -340,6 +355,77 @@ export function computeCashClose(args: {
     baseDifference: roundMoney(baseLeft - baseConfigurada),
     incomplete: baseLeft < baseConfigurada,
   };
+}
+
+/** Los cuatro montos que firman un cierre (o su reconteo). */
+export interface CloseAmounts {
+  counted_cash: number;
+  base_left: number;
+  cash_withdrawn: number;
+  base_difference: number;
+}
+
+/**
+ * U3: los cuatro montos de un cierre a partir de un conteo completo. Reutiliza
+ * la maquinaria del cierre (base automática `resolveClosingBase` + derivados
+ * `computeCashClose`) para que el reconteo NO tenga una aritmética paralela:
+ * el mismo conteo produce la misma base y el mismo sobre. Pura.
+ */
+export function closeAmountsFromCount(countedCash: number, baseConfigurada: number): CloseAmounts {
+  const counted_cash = roundMoney(countedCash);
+  const base_left = resolveClosingBase(counted_cash, baseConfigurada);
+  const close = computeCashClose({ countedCash: counted_cash, baseLeft: base_left, baseConfigurada });
+  return {
+    counted_cash,
+    base_left,
+    cash_withdrawn: close.cashWithdrawn,
+    base_difference: close.baseDifference,
+  };
+}
+
+/** Un reconteo son DOS versiones: la anterior congelada y la nueva. */
+export interface RecountRecord {
+  /** El cierre firmado que se conserva (nunca se pisa). */
+  previous: CloseAmounts;
+  /** La versión corregida por el reconteo. */
+  next: CloseAmounts;
+  reason: string;
+}
+
+/**
+ * U3: arma la fila de un reconteo: conserva la versión anterior y calcula la
+ * nueva con la maquinaria del cierre. El motivo es OBLIGATORIO (no se firmó un
+ * reconteo sin decir por qué). Pura para probarla sin base de datos.
+ */
+export function buildRecountRecord(args: {
+  previous: CloseAmounts;
+  countedCash: number;
+  baseConfigurada: number;
+  reason: string;
+}): RecountRecord {
+  const reason = args.reason.trim();
+  if (reason.length === 0) {
+    throw new Error("RECOUNT_REASON_REQUIRED");
+  }
+  return {
+    previous: { ...args.previous },
+    next: closeAmountsFromCount(args.countedCash, args.baseConfigurada),
+    reason,
+  };
+}
+
+/**
+ * U3: la versión que GOVIERNA un turno: el reconteo si existe, y si no el
+ * cierre firmado. Deja el desempate en un solo lugar para que la vista del
+ * día, el historial y la base del próximo turno miren lo mismo. Pura.
+ */
+export function governingClose<T extends CloseAmounts | {
+  counted_cash: number | null;
+  base_left: number | null;
+  cash_withdrawn: number | null;
+  base_difference: number | null;
+}>(signed: T, recount: CloseAmounts | null): CloseAmounts | T {
+  return recount ?? signed;
 }
 
 /**

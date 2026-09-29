@@ -8,20 +8,24 @@ import {
   assertShiftCloser,
   bogotaDay,
   buildMethodViews,
+  buildRecountRecord,
   CASH_OUT_LIMIT_CODE,
   CASH_OUT_LIMIT_RATIO,
   cashOutLimitState,
   cashOutLimitViolation,
+  closeAmountsFromCount,
   closeShiftSchema,
   computeCashClose,
   dayBounds,
   dayViewSchema,
   exceedsCashOutLimit,
   expectedDigitalTotal,
+  governingClose,
   HISTORY_PAGE_SIZE,
   historySchema,
   isVoucherCashOut,
   openShiftSchema,
+  recountShiftSchema,
   registerPaymentSchema,
   resolveClosingBase,
   resolveOpeningBase,
@@ -1525,5 +1529,272 @@ describe("cash: T0-b el INSERT fallido del espejo no emite ningún DELETE", () =
     } finally {
       errorSpy.mockRestore();
     }
+  });
+});
+
+// ---------- U3: el cierre firmado es inmutable y su corrección es un reconteo ----------
+
+describe("cash: U3 un cierre firmado es inmutable y se corrige con un reconteo", () => {
+  const service = readFileSync(
+    join(process.cwd(), "src", "features", "cash", "service.ts"),
+    "utf8",
+  );
+  const actions = readFileSync(
+    join(process.cwd(), "src", "features", "cash", "actions.ts"),
+    "utf8",
+  );
+
+  /**
+   * Cadena desde cada `.from("<tabla>")` hasta el siguiente `.from(`, igual que
+   * el helper de T0-a: sirve para exigir que el reconteo INSERte y nunca
+   * UPDATEe `cash_shifts`.
+   */
+  function dbChains(source: string, table: string): string[] {
+    return source
+      .split(`.from("${table}")`)
+      .slice(1)
+      .map((chunk) => {
+        const end = chunk.indexOf(".from(");
+        return end === -1 ? chunk : chunk.slice(0, end);
+      });
+  }
+
+  it("el esquema de reconteo exige conteo completo, efectivo y motivo", () => {
+    // Control positivo: un reconteo completo pasa.
+    const ok = recountShiftSchema.safeParse({
+      counted_cash: 150000,
+      counts: [
+        { method_code: "efectivo", denomination: 50000, quantity: 3, amount: 150000 },
+      ],
+      reason: "Se contó mal el efectivo la primera vez.",
+    });
+    expect(ok.success).toBe(true);
+
+    // Conteo completo obligatorio.
+    expect(
+      recountShiftSchema.safeParse({ counted_cash: 150000, reason: "motivo" }).success,
+    ).toBe(false);
+    expect(
+      recountShiftSchema.safeParse({ counted_cash: 150000, counts: [], reason: "motivo" }).success,
+    ).toBe(false);
+    // Efectivo obligatorio.
+    expect(recountShiftSchema.safeParse({ counts: [], reason: "motivo" }).success).toBe(false);
+    // Motivo obligatorio, no vacío ni sólo espacios.
+    expect(recountShiftSchema.safeParse({ counted_cash: 150000, counts: [] }).success).toBe(false);
+    expect(
+      recountShiftSchema.safeParse({ counted_cash: 150000, counts: [], reason: "   " }).success,
+    ).toBe(false);
+  });
+
+  it("una corrección tecleada sin conteo es imposible (el esquema viejo ya no existe)", () => {
+    // Control negativo: la forma del antiguo `updateClosedShift` (contado y
+    // base a mano, sin detalle) tiene que ser RECHAZADA. Si esto pasara, el
+    // defecto seguiría vivo con otro nombre.
+    const tecleada = recountShiftSchema.safeParse({
+      counted_cash: 150000,
+      base_left: 100000,
+      observation: "corrijo el número",
+    });
+    expect(tecleada.success).toBe(false);
+    // Y no hay ninguna rama opcional que deje `counts` vacío.
+    expect(recountShiftSchema.safeParse({ reason: "mas" }).success).toBe(false);
+  });
+
+  it("reutiliza la maquinaria del cierre: mismo conteo, misma base y mismo sobre", () => {
+    // 400/200 y 300/150 del dueño, ahora por la vía del reconteo.
+    expect(closeAmountsFromCount(400000, 200000)).toEqual({
+      counted_cash: 400000,
+      base_left: 200000,
+      cash_withdrawn: 200000,
+      base_difference: 0,
+    });
+    const short = closeAmountsFromCount(150000, 300000);
+    // baseLeft automático = min(contado, configurada); recogido = 0; faltante 150000.
+    expect(short).toEqual({
+      counted_cash: 150000,
+      base_left: 150000,
+      cash_withdrawn: 0,
+      base_difference: -150000,
+    });
+    // La misma aritmética que el cierre, no una paralela.
+    const base = resolveClosingBase(150000, 300000);
+    const close = computeCashClose({ countedCash: 150000, baseLeft: base, baseConfigurada: 300000 });
+    expect(short.base_left).toBe(base);
+    expect(short.cash_withdrawn).toBe(close.cashWithdrawn);
+    expect(short.base_difference).toBe(close.baseDifference);
+  });
+
+  it("conserva la versión anterior y guarda la nueva: las DOS versiones", () => {
+    const previous = { counted_cash: 400000, base_left: 200000, cash_withdrawn: 200000, base_difference: 0 };
+    const record = buildRecountRecord({
+      previous,
+      countedCash: 150000,
+      baseConfigurada: 200000,
+      reason: "  Faltaba un billete en el conteo.  ",
+    });
+    // La anterior queda congelada, tal cual.
+    expect(record.previous).toEqual(previous);
+    // La nueva sale del conteo completo (base = min(150000, 200000)).
+    expect(record.next).toEqual({
+      counted_cash: 150000,
+      base_left: 150000,
+      cash_withdrawn: 0,
+      base_difference: -50000,
+    });
+    // El motivo viaja sin espacios sobrantes.
+    expect(record.reason).toBe("Faltaba un billete en el conteo.");
+  });
+
+  it("sin motivo no se firma un reconteo (también a nivel puro)", () => {
+    const previous = { counted_cash: 400000, base_left: 200000, cash_withdrawn: 200000, base_difference: 0 };
+    expect(() =>
+      buildRecountRecord({ previous, countedCash: 150000, baseConfigurada: 200000, reason: "   " }),
+    ).toThrow("RECOUNT_REASON_REQUIRED");
+  });
+
+  it("la versión que gobierna es el reconteo si existe; si no, el cierre firmado", () => {
+    const firmado = { counted_cash: 400000, base_left: 200000, cash_withdrawn: 200000, base_difference: 0 };
+    const corregido = { counted_cash: 150000, base_left: 150000, cash_withdrawn: 0, base_difference: -50000 };
+    // Con reconteo, gobierna la corrección (no el cierre firmado).
+    expect(governingClose(firmado, corregido)).toEqual(corregido);
+    // Sin reconteo, gobierna el cierre firmado.
+    expect(governingClose(firmado, null)).toEqual(firmado);
+    // Control negativo: un turno abierto (montos nulos) sin reconteo no se inventa.
+    const abierto = { counted_cash: null, base_left: null, cash_withdrawn: null, base_difference: null };
+    expect(governingClose(abierto, null)).toEqual(abierto);
+  });
+
+  it("todo monto del reconteo queda en peso entero (roundMoney)", () => {
+    // Contado con decimales de punto flotante: la base y los derivados se
+    // redondean a peso entero, igual que el cierre.
+    const amounts = closeAmountsFromCount(150000.4, 300000.6);
+    for (const value of Object.values(amounts)) {
+      expect(Number.isInteger(value), String(value)).toBe(true);
+    }
+    expect(amounts).toEqual({
+      counted_cash: 150000,
+      base_left: 150000,
+      cash_withdrawn: 0,
+      base_difference: -150001,
+    });
+  });
+
+  it("recontar no pisa cash_shifts: sólo INSERTA el reconteo y sus líneas", () => {
+    expect(service).not.toContain("export async function updateClosedShift");
+    const start = service.indexOf("export async function recountClosedShift");
+    expect(start, "existe recountClosedShift").toBeGreaterThan(-1);
+    const end = service.indexOf("export async function", start + 10);
+    const body = service.slice(start, end === -1 ? service.length : end);
+    // Nunca un UPDATE sobre el turno.
+    const shiftChains = dbChains(body, "cash_shifts").filter((chain) =>
+      chain.trimStart().startsWith(".update("),
+    );
+    expect(shiftChains).toEqual([]);
+    // La versión corregida entra en la tabla nueva...
+    expect(body).toContain('.from("cash_shift_recounts")');
+    expect(body).toContain("previous_counted_cash: record.previous.counted_cash");
+    // ...y las líneas por denominación, en la MISMA tabla del arqueo, fase reconteo.
+    expect(body).toContain('await insertCounts(db, shift.id, "reconteo", parsed.data.counts);');
+    // Un cierre se recontá una vez (misma barrera que el índice único).
+    expect(body).toContain("ALREADY_RECOUNTED");
+  });
+
+  it("el reconteo no se suma al cierre: fetchCountTotals lo agrupa aparte", () => {
+    const start = service.indexOf("async function fetchCountTotals");
+    const end = service.indexOf("async function", start + 10);
+    const body = service.slice(start, end === -1 ? service.length : end);
+    expect(body).toContain('row.phase === "reconteo"');
+    expect(body).toContain("entry.recount");
+    // El cierre sólo agrupa la fase cierre, no todo lo que no sea apertura.
+    expect(body).not.toContain('row.phase === "apertura" ? entry.open : entry.closed');
+  });
+
+  it("las vistas prefieren la versión corregida (día e historial)", () => {
+    // Los dos constructores de vista cierran con el reconteo cuando existe...
+    expect([...service.matchAll(/recountRow \? counts\.recount : counts\.closed/g)]).toHaveLength(2);
+    // ...y los acumulados leen la versión que gobierna, no el cierre firmado.
+    expect(service).toContain("countedCash: view.vigente.counted_cash");
+    expect(actions).toContain("countedCash: view.vigente.counted_cash");
+    // La tabla del cliente también: no queda `view.shift.base_left` como base final.
+    const client = readFileSync(join(process.cwd(), "app", "cash", "cash-client.tsx"), "utf8");
+    expect(client).toContain("formatMoney(view.vigente.base_left)");
+    expect(client).not.toContain("formatMoney(view.shift.base_left)");
+  });
+
+  it("la base del próximo turno hereda el reconteo, no el cierre firmado viejo", () => {
+    const start = service.indexOf("async function previousCloseTotals");
+    const end = service.indexOf("async function", start + 10);
+    const body = service.slice(start, end === -1 ? service.length : end);
+    expect(body).toContain("recountRow ? Number(recountRow.base_left)");
+    expect(body).toContain('recountRow ? "reconteo" : "cierre"');
+  });
+
+  it("la autorización no cambió: el reconteo sigue siendo sólo admin", () => {
+    const start = actions.indexOf("export async function recountClosedShiftAction");
+    expect(start, "existe recountClosedShiftAction").toBeGreaterThan(-1);
+    const end = actions.indexOf("export async function", start + 10);
+    const body = actions.slice(start, end === -1 ? actions.length : end);
+    expect(body).toContain("requireAdminSession");
+    expect(actions).not.toContain("updateClosedShiftAction");
+  });
+});
+
+describe("migración 033_closed_shift_recount.sql (U3)", () => {
+  const sql = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "033_closed_shift_recount.sql"),
+    "utf8",
+  );
+
+  it("el archivo existe y trae DDL real (piso anti-vacío)", () => {
+    expect(sql.length).toBeGreaterThan(1500);
+    expect(sql).toContain("ALTER TABLE public.cash_shift_counts");
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.cash_shift_recounts");
+  });
+
+  it("extiende el CHECK de phase con reconteo y lo deja re-ejecutable", () => {
+    expect(sql).toContain("DROP CONSTRAINT IF EXISTS cash_shift_counts_phase_check");
+    expect(sql).toContain("ADD CONSTRAINT cash_shift_counts_phase_check");
+    expect(sql).toContain("CHECK (phase IN ('apertura', 'cierre', 'reconteo'))");
+  });
+
+  it("la tabla guarda las DOS versiones, el motivo y el responsable", () => {
+    expect(sql).toContain("previous_counted_cash");
+    expect(sql).toContain("previous_base_left");
+    expect(sql).toContain("previous_cash_withdrawn");
+    expect(sql).toContain("previous_base_difference");
+    expect(sql).toContain("counted_cash numeric(12, 2) NOT NULL CHECK (counted_cash >= 0)");
+    expect(sql).toContain("reason text NOT NULL CHECK (length(btrim(reason)) > 0)");
+    expect(sql).toContain("recounted_by uuid NOT NULL REFERENCES public.users (id)");
+    expect(sql).toContain("recounted_at timestamptz NOT NULL DEFAULT now()");
+  });
+
+  it("a lo sumo un reconteo por cierre (barrera de la inmutabilidad)", () => {
+    expect(sql).toContain("CREATE UNIQUE INDEX IF NOT EXISTS uq_cash_shift_recounts_shift");
+    expect(sql).toContain("ON public.cash_shift_recounts (shift_id)");
+  });
+
+  it("es idempotente y NUNCA borra filas ni backfillea", () => {
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS");
+    expect(sql).toContain("CREATE UNIQUE INDEX IF NOT EXISTS");
+    // Un solo DROP EJECUTABLE (la constraint del CHECK); las menciones del
+    // encabezado explican la técnica pero no son statements.
+    expect(sql.match(/^\s*DROP CONSTRAINT IF EXISTS/gm)).toHaveLength(1);
+    expect(sql).not.toMatch(/DELETE\s+FROM/i);
+    // Sólo cuentan los statements ejecutables: el encabezado NOMBRA estas
+    // operaciones para decir que no las hace.
+    expect(sql).not.toMatch(/^\s*TRUNCATE/m);
+    expect(sql).not.toMatch(/^\s*DROP\s+(TABLE|COLUMN|SCHEMA)/im);
+    expect(sql).not.toMatch(/^\s*UPDATE\s+public\./im);
+  });
+
+  it("explica el orden de los statements y por qué, y no se ejecutó", () => {
+    expect(sql).toContain("ORDEN DE LOS STATEMENTS");
+    expect(sql.indexOf("DROP CONSTRAINT IF EXISTS cash_shift_counts_phase_check")).toBeLessThan(
+      sql.indexOf("CREATE TABLE IF NOT EXISTS public.cash_shift_recounts"),
+    );
+    expect(sql.indexOf("CREATE TABLE IF NOT EXISTS public.cash_shift_recounts")).toBeLessThan(
+      sql.indexOf("CREATE UNIQUE INDEX IF NOT EXISTS uq_cash_shift_recounts_shift"),
+    );
+    expect(sql).toContain("NO ejecutado por el agente: requiere base de datos");
   });
 });

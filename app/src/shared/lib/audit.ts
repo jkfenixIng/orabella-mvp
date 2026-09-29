@@ -42,6 +42,11 @@ export const AUDIT_ACTIONS = {
   SHIFT_OPEN_MISMATCH: "cash.shift_open_mismatch",
   SHIFT_CLOSE_MISMATCH: "cash.shift_close_mismatch",
   SHIFT_EDITED: "cash.shift_edited",
+  // El reconteo (033) NO edita el cierre: inserta una version corregida y deja
+  // la firmada intacta. Se registra con su propia accion para que un auditor no
+  // lea "el cierre se edito" donde lo que paso es lo contrario. SHIFT_EDITED se
+  // conserva porque las filas historicas de audit_logs ya usan ese valor.
+  SHIFT_RECOUNTED: "cash.shift_recounted",
   REGISTER_BASE_UPDATED: "cash.register_base_updated",
   PAYROLL_CALCULATED: "payroll.calculated",
   PAYROLL_CLOSED: "payroll.closed",

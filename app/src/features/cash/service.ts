@@ -4,15 +4,18 @@ import {
   assertNoOpenShift,
   assertShiftCloser,
   buildMethodViews,
+  buildRecountRecord,
   closeShiftSchema,
   computeCashClose,
   dayBounds,
   dayViewSchema,
   expectedDigitalTotal,
+  governingClose,
   HISTORY_PAGE_SIZE,
   historySchema,
   openShiftSchema,
   rangeBounds,
+  recountShiftSchema,
   registerPaymentSchema,
   resolveClosingBase,
   resolveOpeningBase,
@@ -21,6 +24,7 @@ import {
   sumMethodMaps,
   sumMethodTotal,
   voucherOutByMethod,
+  type CloseAmounts,
   type CloseShiftInput,
   type DayTotals,
   type MethodDifference,
@@ -191,7 +195,7 @@ export interface CashActor {
 export interface ShiftCountRow {
   id: string;
   shift_id: string;
-  phase: "apertura" | "cierre";
+  phase: "apertura" | "cierre" | "reconteo";
   method_code: string;
   denomination: number | null;
   quantity: number;
@@ -308,14 +312,28 @@ export async function checkCounts(
 }
 
 /**
- * Totales por método de los conteos de varios turnos, separados por fase.
- * Base del esperado digital acumulativo (apertura + cobrado).
+ * Totales por método de los conteos de varios turnos, separados por fase
+ * (apertura, cierre y reconteo U3). Base del esperado digital acumulativo
+ * (apertura + cobrado) y de la versión que gobierna un turno recontado.
+ *
+ * OJO: el reconteo se agrupa APARTE del cierre a propósito. Antes toda fase
+ * distinta de `apertura` caía en `closed`; con `reconteo` en esa bolsa, las
+ * líneas del reconteo se sumarían al cierre firmado y el arqueo contaría el
+ * dinero dos veces.
  */
 async function fetchCountTotals(
   db: DbClient,
   shiftIds: string[],
-): Promise<Map<string, { open: Map<string, number>; closed: Map<string, number> }>> {
-  const result = new Map<string, { open: Map<string, number>; closed: Map<string, number> }>();
+): Promise<
+  Map<
+    string,
+    { open: Map<string, number>; closed: Map<string, number>; recount: Map<string, number> }
+  >
+> {
+  const result = new Map<
+    string,
+    { open: Map<string, number>; closed: Map<string, number>; recount: Map<string, number> }
+  >();
   if (shiftIds.length === 0) return result;
   const { data, error } = await db
     .from("cash_shift_counts")
@@ -328,8 +346,17 @@ async function fetchCountTotals(
     method_code: string;
     amount: number | string;
   }>) {
-    const entry = result.get(row.shift_id) ?? { open: new Map(), closed: new Map() };
-    const target = row.phase === "apertura" ? entry.open : entry.closed;
+    const entry = result.get(row.shift_id) ?? {
+      open: new Map<string, number>(),
+      closed: new Map<string, number>(),
+      recount: new Map<string, number>(),
+    };
+    const target =
+      row.phase === "apertura"
+        ? entry.open
+        : row.phase === "reconteo"
+          ? entry.recount
+          : entry.closed;
     target.set(row.method_code, roundMoney((target.get(row.method_code) ?? 0) + Number(row.amount)));
     result.set(row.shift_id, entry);
   }
@@ -559,7 +586,7 @@ async function fetchInvoicePaymentsByShift(
 async function insertCounts(
   db: DbClient,
   shiftId: string,
-  phase: "apertura" | "cierre",
+  phase: "apertura" | "cierre" | "reconteo",
   counts: ShiftCountInput[],
 ): Promise<void> {  const rows = counts.map((line) => ({
     shift_id: shiftId,
@@ -571,6 +598,98 @@ async function insertCounts(
   }));
   const { error } = await db.from("cash_shift_counts").insert(rows);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+}
+
+/**
+ * U3: un reconteo tal como vive en `cash_shift_recounts`. Guarda las DOS
+ * versiones: `previous_*` (el cierre firmado que se conserva) y los cuatro
+ * montos corregidos, más quién, cuándo y por qué.
+ */
+export interface ShiftRecountRow {
+  id: string;
+  shift_id: string;
+  previous_counted_cash: number;
+  previous_base_left: number;
+  previous_cash_withdrawn: number;
+  previous_base_difference: number;
+  counted_cash: number;
+  base_left: number;
+  cash_withdrawn: number;
+  base_difference: number;
+  reason: string;
+  recounted_by: string;
+  recounted_at: string;
+}
+
+/** Proyección de un reconteo para las vistas (nombre en vez de uuid). */
+export interface ShiftRecountView {
+  counted_cash: number;
+  base_left: number;
+  cash_withdrawn: number;
+  base_difference: number;
+  /** El cierre firmado original, tal como quedó en `cash_shifts`. */
+  previous: CloseAmounts;
+  reason: string;
+  /** Nombre de quien recontó (null si el usuario ya no existe). */
+  recounted_by: string | null;
+  recounted_at: string;
+}
+
+const RECOUNT_SELECT =
+  "id, shift_id, previous_counted_cash, previous_base_left, previous_cash_withdrawn, previous_base_difference, counted_cash, base_left, cash_withdrawn, base_difference, reason, recounted_by, recounted_at";
+
+/** Reconteos de los turnos pedidos, uno por turno (a lo sumo existe uno). */
+async function fetchRecounts(
+  db: DbClient,
+  shiftIds: string[],
+): Promise<Map<string, ShiftRecountRow>> {
+  const result = new Map<string, ShiftRecountRow>();
+  if (shiftIds.length === 0) return result;
+  const { data, error } = await db
+    .from("cash_shift_recounts")
+    .select(RECOUNT_SELECT)
+    .in("shift_id", shiftIds);
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  for (const row of (data ?? []) as ShiftRecountRow[]) {
+    result.set(row.shift_id, row);
+  }
+  return result;
+}
+
+/** Los cuatro montos corregidos de un reconteo, listos como `CloseAmounts`. */
+function recountAmounts(row: ShiftRecountRow): CloseAmounts {
+  return {
+    counted_cash: roundMoney(Number(row.counted_cash)),
+    base_left: roundMoney(Number(row.base_left)),
+    cash_withdrawn: roundMoney(Number(row.cash_withdrawn)),
+    base_difference: roundMoney(Number(row.base_difference)),
+  };
+}
+
+/** Proyección del reconteo con las DOS versiones y quién/cuándo/por qué. */
+function recountView(row: ShiftRecountRow, actorName: string | null): ShiftRecountView {
+  return {
+    ...recountAmounts(row),
+    previous: {
+      counted_cash: roundMoney(Number(row.previous_counted_cash)),
+      base_left: roundMoney(Number(row.previous_base_left)),
+      cash_withdrawn: roundMoney(Number(row.previous_cash_withdrawn)),
+      base_difference: roundMoney(Number(row.previous_base_difference)),
+    },
+    reason: row.reason,
+    recounted_by: actorName,
+    recounted_at: row.recounted_at,
+  };
+}
+
+/** Montos firmados de un turno (los de `cash_shifts`, sin reconteo). */
+function signedAmounts(shift: CashShiftRow): CloseAmounts {
+  return {
+    counted_cash: roundMoney(Number(shift.counted_cash ?? 0)),
+    base_left: roundMoney(Number(shift.base_left ?? 0)),
+    cash_withdrawn: roundMoney(Number(shift.cash_withdrawn ?? 0)),
+    base_difference: roundMoney(Number(shift.base_difference ?? 0)),
+  };
 }
 
 /** Totales del último cierre (por método) para validar la apertura. */
@@ -589,17 +708,27 @@ async function previousCloseTotals(
     .maybeSingle();
   if (lastError) throw new CashError("INTERNAL", "Error interno.", 500);
   if (!last) return null;
+  // U3: si el último cierre fue recontado, la base que hereda el próximo turno
+  // y los totales digitales contra los que se compara la apertura son los
+  // CORREGIDOS; el cierre firmado sigue intacto en `cash_shifts` pero no
+  // gobierna la cadena.
+  const recountMap = await fetchRecounts(db, [(last as { id: string }).id]);
+  const recountRow = recountMap.get((last as { id: string }).id) ?? null;
   const { data: counts, error: countsError } = await db
     .from("cash_shift_counts")
     .select("method_code, amount")
     .eq("shift_id", (last as { id: string }).id)
-    .eq("phase", "cierre");
+    .eq("phase", recountRow ? "reconteo" : "cierre");
   if (countsError) throw new CashError("INTERNAL", "Error interno.", 500);
   const byMethod = new Map<string, number>();
   for (const row of ((counts ?? []) as Array<{ method_code: string; amount: number | string }>)) {
     byMethod.set(row.method_code, roundMoney((byMethod.get(row.method_code) ?? 0) + Number(row.amount)));
   }
-  return { baseLeft: (last as { base_left: number | null }).base_left, byMethod, hasCounts: byMethod.size > 0 };
+  return {
+    baseLeft: recountRow ? Number(recountRow.base_left) : (last as { base_left: number | null }).base_left,
+    byMethod,
+    hasCounts: byMethod.size > 0,
+  };
 }
 
 // --------------------------------------------------------------- registros ---
@@ -748,18 +877,11 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     if (openError) throw new CashError("INTERNAL", "Error interno.", 500);
     assertNoOpenShift((open ?? []).length > 0);
 
-    const { data: last, error: lastError } = await db
-      .from("cash_shifts")
-      .select("base_left")
-      .eq("cash_register_id", register.id)
-      .eq("status", "cerrado")
-      .order("closed_at", { ascending: false })
-      .order("opened_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (lastError) throw new CashError("INTERNAL", "Error interno.", 500);
-    const lastBaseLeft = (last as { base_left: number | null } | null)?.base_left ?? null;
-    const openingBase = resolveOpeningBase(lastBaseLeft, Number(register.base_configurada));
+    // U3: la base que hereda el turno sale de `previousCloseTotals`, que ya
+    // prefiere el reconteo cuando el último cierre fue corregido. Una sola
+    // lectura del último cierre para la cadena y para el chequeo digital.
+    const prev = await previousCloseTotals(db, register.id);
+    const openingBase = resolveOpeningBase(prev?.baseLeft ?? null, Number(register.base_configurada));
 
     // Pre-open count never blocks the operation: cash must match the base
     // the shift opens with (base_left from the last close, or
@@ -768,7 +890,6 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     // administrators (except on the very first open) while the shift opens
     // anyway so the business never stops.
     const declared = await checkCounts(actor.sedeId, input.counts);
-    const prev = await previousCloseTotals(db, register.id);
     const isFirstOpen = prev === null;
     const mismatches: Array<{ method_code: string; expected: number; declared: number }> = [];
     const cashDeclared = declared.get("efectivo") ?? 0;
@@ -1346,65 +1467,118 @@ export async function updateRegisterBase(
 }
 
 /**
- * CASH: edita un turno cerrado (solo admin; el gate vive en actions).
- * Recalcula el sobre y la diferencia; todo cambio queda auditado con
- * los valores anteriores. Los conteos originales no se tocan.
+ * U3: recontar un cierre (solo admin; el gate vive en actions). Un cierre
+ * firmado es INMUTABLE: `cash_shifts` nunca se pisa. La corrección exige un
+ * conteo COMPLETO nuevo (mismo detalle por denominación y totales digitales
+ * que el cierre) más un motivo; se reutiliza la maquinaria del cierre
+ * (`checkCounts`, `insertCounts`, `resolveClosingBase`, `computeCashClose`)
+ * para que no exista una aritmética paralela. El reconteo se guarda en
+ * `cash_shift_recounts` con la versión anterior congelada y la nueva, más
+ * quién y cuándo, y deja sus líneas en `cash_shift_counts` (fase `reconteo`).
+ *
+ * Un cierre se recontá UNA vez: el reconteo también queda firmado y un
+ * segundo intento se rechaza (ALREADY_RECOUNTED), no se encadena otro
+ * reconteo encima. Antes esto era `updateClosedShift`, que escribía
+ * `counted_cash`/`base_left` tecleados sin tocar los conteos por denominación
+ * y dejaba el cierre contradiciendo su propia evidencia.
  */
-export async function updateClosedShift(
+export interface RecountShiftResult {
+  /** El turno: su cierre firmado original sigue intacto. */
+  shift: CashShiftRow;
+  /** El reconteo con las dos versiones y quién/cuándo/por qué. */
+  recount: ShiftRecountRow;
+}
+
+export async function recountClosedShift(
   sedeId: string,
   id: string,
   raw: unknown,
   actor: CashActor,
-): Promise<CashShiftRow> {
-  const parsed = z.object({
-    counted_cash: z.coerce.number().nonnegative().optional(),
-    base_left: z.coerce.number().nonnegative().optional(),
-    observation: z.string().trim().max(500).nullish(),
-  }).safeParse(raw);
+): Promise<RecountShiftResult> {
+  const parsed = recountShiftSchema.safeParse(raw);
   if (!parsed.success) {
     throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const db = await cashDb();
   const shift = await getShiftOrThrow(db, sedeId, id);
   if (shift.status !== "cerrado") {
-    throw new CashError("VALIDATION", "Solo se editan turnos cerrados.", 400);
+    throw new CashError("VALIDATION", "Solo se recontán turnos cerrados.", 400);
+  }
+  const { data: existing, error: existingError } = await db
+    .from("cash_shift_recounts")
+    .select("id")
+    .eq("shift_id", shift.id)
+    .maybeSingle();
+  if (existingError) throw new CashError("INTERNAL", "Error interno.", 500);
+  if (existing) {
+    throw new CashError(
+      "ALREADY_RECOUNTED",
+      "Este cierre ya fue recontado. El reconteo también quedó firmado y no se modifica.",
+      409,
+    );
   }
   const register = await resolveRegister(db, sedeId, shift.cash_register_id);
-  const counted = parsed.data.counted_cash ?? Number(shift.counted_cash);
-  const left = parsed.data.base_left ?? Number(shift.base_left);
-  const close = computeCashClose({
-    countedCash: counted,
-    baseLeft: left,
+  // El reconteo es un conteo COMPLETO: mismas reglas que el cierre (métodos
+  // arqueables completos, efectivo por denominación). `checkCounts` devuelve el
+  // total por método; el efectivo declarado debe cuadrar con su detalle.
+  const declared = await checkCounts(sedeId, parsed.data.counts);
+  const countedFromDetail = declared.get("efectivo") ?? 0;
+  if (!moneyEquals(countedFromDetail, parsed.data.counted_cash)) {
+    throw new CashError("COUNT_MISMATCH", "El reconteo no cuadra con el detalle por denominación.", 422);
+  }
+  const record = buildRecountRecord({
+    previous: signedAmounts(shift),
+    countedCash: parsed.data.counted_cash,
     baseConfigurada: Number(register.base_configurada),
+    reason: parsed.data.reason,
   });
-  const observation = parsed.data.observation !== undefined
-    ? (parsed.data.observation?.trim() ? parsed.data.observation.trim() : null)
-    : shift.observation;
-  const { data: updated, error } = await db
-    .from("cash_shifts")
-    .update({
-      counted_cash: roundMoney(counted),
-      base_left: roundMoney(left),
-      cash_withdrawn: close.cashWithdrawn,
-      base_difference: close.baseDifference,
-      observation,
+  const { data: inserted, error } = await db
+    .from("cash_shift_recounts")
+    .insert({
+      shift_id: shift.id,
+      previous_counted_cash: record.previous.counted_cash,
+      previous_base_left: record.previous.base_left,
+      previous_cash_withdrawn: record.previous.cash_withdrawn,
+      previous_base_difference: record.previous.base_difference,
+      counted_cash: record.next.counted_cash,
+      base_left: record.next.base_left,
+      cash_withdrawn: record.next.cash_withdrawn,
+      base_difference: record.next.base_difference,
+      reason: record.reason,
+      recounted_by: actor.userId,
     })
-    .eq("id", shift.id)
-    .select(SHIFT_SELECT)
+    .select(RECOUNT_SELECT)
     .single();
-  if (error || !updated) throw new CashError("INTERNAL", "Error interno.", 500);
+  if (error || !inserted) {
+    // Carrera perdida contra el índice único por turno: otro reconteo ganó.
+    if ((error as { code?: string } | null)?.code === "23505") {
+      throw new CashError(
+        "ALREADY_RECOUNTED",
+        "Este cierre ya fue recontado. El reconteo también quedó firmado y no se modifica.",
+        409,
+      );
+    }
+    throw new CashError("INTERNAL", "Error interno.", 500);
+  }
+  const recount = inserted as ShiftRecountRow;
+  // Las líneas por denominación del reconteo viven en la MISMA tabla del
+  // arqueo, en la fase `reconteo` (033 extiende el CHECK de `phase`). Así la
+  // evidencia por denominación del reconteo es tan real como la del cierre.
+  await insertCounts(db, shift.id, "reconteo", parsed.data.counts);
   await writeAudit({
     sede_id: sedeId,
     user_id: actor.userId,
-    action: AUDIT_ACTIONS.SHIFT_EDITED,
+    action: AUDIT_ACTIONS.SHIFT_RECOUNTED,
     entity: "cash_shifts",
     entity_id: shift.id,
     metadata: {
-      previous: { counted_cash: shift.counted_cash, base_left: shift.base_left, observation: shift.observation },
-      updated: { counted_cash: roundMoney(counted), base_left: roundMoney(left), observation },
+      reason: record.reason,
+      previous: record.previous,
+      corrected: record.next,
+      recount_id: recount.id,
     },
   });
-  return updated as CashShiftRow;
+  return { shift, recount };
 }
 
 // -------------------------------------------------------- día e historial ---
@@ -1428,6 +1602,23 @@ export interface DayShiftView {
   diferencias: MethodDifference[];
   /** Revisión de los desajustes del turno (null si no hay). */
   revision: ShiftRevision | null;
+  /**
+   * U3: el reconteo del cierre, con las DOS versiones y quién/cuándo/por qué.
+   * null cuando el cierre firmado nunca se recontó.
+   */
+  recount: ShiftRecountView | null;
+  /**
+   * U3: los cuatro montos que GOVIERNA el turno. Con reconteo, los corregidos;
+   * sin reconteo, los del cierre firmado (`shift.*`). Las tablas y los
+   * acumulados leen de acá: `shift.counted_cash` es la versión ORIGINAL firmada,
+   * no la que rige, cuando hay reconteo.
+   */
+  vigente: {
+    counted_cash: number | null;
+    base_left: number | null;
+    cash_withdrawn: number | null;
+    base_difference: number | null;
+  };
   /** Quién abrió / cerró (null al cerrar si sigue abierto). */
   abierto_por: string | null;
   cerrado_por: string | null;
@@ -1521,21 +1712,36 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
     db,
     rows.map((row) => row.id),
   );
-  const names = await userNames(
+  // U3: los reconteos de los turnos leídos, para preferir la versión corregida
+  // y poder marcar en la vista que el cierre fue recontado.
+  const recountMaps = await fetchRecounts(
     db,
-    rows.flatMap((row) => [row.opened_by, row.closed_by]),
+    rows.map((row) => row.id),
   );
+  const names = await userNames(db, [
+    ...rows.flatMap((row) => [row.opened_by, row.closed_by]),
+    ...[...recountMaps.values()].map((row) => row.recounted_by),
+  ]);
 
   const views: DayShiftView[] = rows.map((shift) => {
     // T0-a (C1): `payments` sin factura + `invoice_payments` del turno.
     const list = mergeShiftMoney(paymentsByShift.get(shift.id), invoicePayMaps.get(shift.id));
     const paidByMethod = sumShiftMoneyByMethod(list);
-    const counts = countMaps.get(shift.id) ?? { open: new Map(), closed: new Map() };
+    const counts = countMaps.get(shift.id) ?? {
+      open: new Map<string, number>(),
+      closed: new Map<string, number>(),
+      recount: new Map<string, number>(),
+    };
+    const recountRow = recountMaps.get(shift.id) ?? null;
+    // U3: el arqueo lee el conteo del reconteo cuando existe; si no, el del
+    // cierre firmado. `counts.recount` vive aparte justamente para no sumarse
+    // al cierre.
     const { metodos, declarados, diferencias } = buildMethodViews({
       paid: paidByMethod,
       open: counts.open,
       paidOut: sumMethodMaps(payoutMaps.get(shift.id), voucherOutMaps.get(shift.id)),
-      closed: shift.status === "cerrado" ? counts.closed : null,
+      closed:
+        shift.status === "cerrado" ? (recountRow ? counts.recount : counts.closed) : null,
     });
     const revision = assembleShiftRevision(
       reviews.get(shift.id) ?? [],
@@ -1552,6 +1758,10 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
       declarados,
       diferencias,
       revision,
+      recount: recountRow
+        ? recountView(recountRow, names.get(recountRow.recounted_by) ?? null)
+        : null,
+      vigente: governingClose(shift, recountRow ? recountAmounts(recountRow) : null),
       abierto_por: names.get(shift.opened_by) ?? null,
       cerrado_por: shift.closed_by ? (names.get(shift.closed_by) ?? null) : null,
     };
@@ -1565,10 +1775,10 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
     totals: accumulateDayTotals(
       views.map((view) => ({
         expectedCash: view.efectivo,
-        countedCash: view.shift.counted_cash,
-        baseLeft: view.shift.base_left,
-        cashWithdrawn: view.shift.cash_withdrawn,
-        baseDifference: view.shift.base_difference,
+        countedCash: view.vigente.counted_cash,
+        baseLeft: view.vigente.base_left,
+        cashWithdrawn: view.vigente.cash_withdrawn,
+        baseDifference: view.vigente.base_difference,
         ventas: view.ventas,
       })),
     ),
@@ -1659,10 +1869,14 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
     db,
     rows.map((row) => row.id),
   );
-  const historyNames = await userNames(
+  const historyRecountMaps = await fetchRecounts(
     db,
-    rows.flatMap((row) => [row.opened_by, row.closed_by]),
+    rows.map((row) => row.id),
   );
+  const historyNames = await userNames(db, [
+    ...rows.flatMap((row) => [row.opened_by, row.closed_by]),
+    ...[...historyRecountMaps.values()].map((row) => row.recounted_by),
+  ]);
 
   return {
     desde,
@@ -1674,12 +1888,18 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
       // T0-a (C1): `payments` sin factura + `invoice_payments` del turno.
       const list = mergeShiftMoney(paymentsByShift.get(shift.id), historyInvoicePayMaps.get(shift.id));
       const paidByMethod = sumShiftMoneyByMethod(list);
-      const counts = historyCountMaps.get(shift.id) ?? { open: new Map(), closed: new Map() };
+      const counts = historyCountMaps.get(shift.id) ?? {
+        open: new Map<string, number>(),
+        closed: new Map<string, number>(),
+        recount: new Map<string, number>(),
+      };
+      const recountRow = historyRecountMaps.get(shift.id) ?? null;
       const { metodos, declarados, diferencias } = buildMethodViews({
         paid: paidByMethod,
         open: counts.open,
         paidOut: sumMethodMaps(historyPayoutMaps.get(shift.id), historyVoucherOutMaps.get(shift.id)),
-        closed: shift.status === "cerrado" ? counts.closed : null,
+        closed:
+          shift.status === "cerrado" ? (recountRow ? counts.recount : counts.closed) : null,
       });
       const revision = assembleShiftRevision(
         historyReviews.get(shift.id) ?? [],
@@ -1696,6 +1916,10 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
         declarados,
         diferencias,
         revision,
+        recount: recountRow
+          ? recountView(recountRow, historyNames.get(recountRow.recounted_by) ?? null)
+          : null,
+        vigente: governingClose(shift, recountRow ? recountAmounts(recountRow) : null),
         abierto_por: historyNames.get(shift.opened_by) ?? null,
         cerrado_por: shift.closed_by ? (historyNames.get(shift.closed_by) ?? null) : null,
       };

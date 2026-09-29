@@ -8,6 +8,7 @@ import {
   getHistoryAction,
   listDenominationsAction,
   openShiftAction,
+  recountClosedShiftAction,
 } from "@/src/features/cash/actions";
 import { listVouchersAction } from "@/src/features/payroll/actions";
 import type { VoucherRequestRow } from "@/src/features/payroll/service";
@@ -56,11 +57,17 @@ function ShiftsTable({
   methodCols,
   isAdmin,
   emptyText,
+  onRecount,
+  onShowVersions,
 }: {
   shifts: DayShiftView[];
   methodCols: PaymentMethodRow[];
   isAdmin: boolean;
   emptyText: string;
+  /** U3: abre el reconteo de un cierre (solo llega desde la columna admin). */
+  onRecount: (view: DayShiftView) => void;
+  /** U3: muestra las dos versiones de un cierre ya recontado. */
+  onShowVersions: (view: DayShiftView) => void;
 }) {
   const [justOpen, setJustOpen] = useState<Array<{
     accion: string;
@@ -97,6 +104,9 @@ function ShiftsTable({
                   <th className={shiftCellClass} scope="col">Diferencia</th>
                   <th className={shiftCellClass} scope="col">Revisada</th>
                   <th className={shiftCellClass} scope="col">Justificación</th>
+                  {/* U3: el cierre firmado es inmutable; desde acá se abre el
+                      reconteo y se ve que un turno fue corregido. */}
+                  <th className={shiftCellClass} scope="col">Reconteo</th>
                 </>
               )}
             </tr>
@@ -139,7 +149,7 @@ function ShiftsTable({
                   )}
                   <td className={shiftCellClass}>{formatMoney(view.vales)}</td>
                   <td className={shiftCellClass}>
-                    {isClosed ? formatMoney(view.shift.base_left) : "—"}
+                    {isClosed ? formatMoney(view.vigente.base_left) : "—"}
                   </td>
                   {isAdmin && (
                     <>
@@ -164,6 +174,26 @@ function ShiftsTable({
                           ""
                         )}
                       </td>
+                      <td className={shiftCellClass}>
+                        {!isClosed ? (
+                          "—"
+                        ) : view.recount ? (
+                          <span className="inline-flex items-center gap-2">
+                            <span className="font-medium text-warning">Recontado</span>
+                            <button
+                              type="button"
+                              className="underline"
+                              onClick={() => onShowVersions(view)}
+                            >
+                              Versiones
+                            </button>
+                          </span>
+                        ) : (
+                          <button type="button" className="underline" onClick={() => onRecount(view)}>
+                            Recontar
+                          </button>
+                        )}
+                      </td>
                     </>
                   )}
                 </tr>
@@ -172,7 +202,7 @@ function ShiftsTable({
             {shifts.length === 0 && (
               <tr>
               <td
-                colSpan={7 + (isAdmin ? 5 + methodCols.length : 0)}
+                colSpan={7 + (isAdmin ? 6 + methodCols.length : 0)}
                   className={cn(tableCellClass, "text-text-secondary")}
                 >
                   {emptyText}
@@ -295,6 +325,14 @@ export function CashClient(props: CashClientProps) {
   const [closeCounts, setCloseCounts] = useState<Record<string, string>>({});
   const [closeDigitals, setCloseDigitals] = useState<Record<string, string>>({});
   const [closeStep, setCloseStep] = useState<"counts" | "confirm">("counts");
+  // U3: reconteo de un cierre. El cierre firmado no se edita: se abre un
+  // conteo completo nuevo con su motivo y quedan las dos versiones.
+  const [recountTarget, setRecountTarget] = useState<DayShiftView | null>(null);
+  const [recountCounts, setRecountCounts] = useState<Record<string, string>>({});
+  const [recountDigitals, setRecountDigitals] = useState<Record<string, string>>({});
+  const [recountReason, setRecountReason] = useState("");
+  const [recountStep, setRecountStep] = useState<"counts" | "confirm">("counts");
+  const [versionsTarget, setVersionsTarget] = useState<DayShiftView | null>(null);
   // La vista del día no se carga al entrar (abrir/cerrar no la necesita):
   // solo se pide si el usuario la muestra.
   const [showDay, setShowDay] = useState(false);
@@ -399,6 +437,90 @@ export function CashClient(props: CashClientProps) {
           amount: Number((closeDigitals[method.code] ?? "").replace(/\D/g, "")) || 0,
         })),
     ];
+  }
+
+  // U3: mismo cierre del bloque anterior pero sobre el estado del reconteo. El
+  // reconteo reutiliza la forma del cierre (conteo completo por denominación +
+  // totales digitales) para no inventar un camino paralelo.
+  function recountCashTotal(): number {
+    return denominations.reduce((acc, denom) => {
+      const qty = Number(recountCounts[denom.id] ?? "0");
+      return acc + (Number.isFinite(qty) ? qty : 0) * Number(denom.value);
+    }, 0);
+  }
+
+  function buildRecountCounts(): Array<{ method_code: string; denomination: number | null; quantity: number; amount: number }> {
+    return [
+      ...denominations.map((denom) => {
+        const qty = Math.max(0, Math.floor(Number(recountCounts[denom.id] ?? "0")) || 0);
+        return { method_code: "efectivo", denomination: Number(denom.value), quantity: qty, amount: qty * Number(denom.value) };
+      }),
+      ...props.methods
+        .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
+        .map((method) => ({
+          method_code: method.code,
+          denomination: null,
+          quantity: 1,
+          amount: Number((recountDigitals[method.code] ?? "").replace(/\D/g, "")) || 0,
+        })),
+    ];
+  }
+
+  async function startRecount(view: DayShiftView): Promise<void> {
+    setRecountTarget(view);
+    setRecountCounts({});
+    setRecountDigitals({});
+    setRecountReason("");
+    setRecountStep("counts");
+    const result = await listDenominationsAction();
+    if (result.success) setDenominations(result.data);
+  }
+
+  function cancelRecount(): void {
+    setRecountTarget(null);
+    setRecountCounts({});
+    setRecountDigitals({});
+    setRecountReason("");
+    setRecountStep("counts");
+  }
+
+  async function handleRecount(event: FormEvent): Promise<void> {
+    event.preventDefault();
+    if (!recountTarget) return;
+    if (recountStep === "counts") {
+      setError(null);
+      setRecountStep("confirm");
+      return;
+    }
+    const counted = recountCashTotal();
+    setBusy(true);
+    try {
+      const result = await recountClosedShiftAction(recountTarget.shift.id, {
+        counted_cash: counted,
+        counts: buildRecountCounts(),
+        reason: recountReason,
+      });
+      // La copia de éxito no necesita la data (con `result.data.recount` el
+      // argumento se evalúa antes de que el guard la estreche).
+      if (!showResult(result, "Turno recontado. El cierre firmado queda intacto.")) {
+        // Conteo que no cuadra: volver al detalle para corregirlo, igual que
+        // hace el cierre.
+        if (result.code === "COUNT_MISMATCH") setRecountStep("counts");
+        return;
+      }
+      cancelRecount();
+      const dayResult = await getDayViewAction({ fecha: props.today, sede_id: props.sedeId });
+      if (dayResult.success) setDay(dayResult.data);
+      const histResult = await getHistoryAction({
+        desde: histDesde,
+        hasta: histHasta,
+        sede_id: props.sedeId,
+        page: histPage,
+      });
+      if (histResult.success) setHistory(histResult.data);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function handleOpen(event: FormEvent): Promise<void> {
@@ -761,6 +883,162 @@ export function CashClient(props: CashClientProps) {
         </Dialog>
       )}
 
+      {/* U3: reconteo de un cierre. Primero el conteo COMPLETO (mismo detalle
+          por denominación y totales digitales que el cierre); después el
+          motivo, que es obligatorio. El cierre firmado no se edita. */}
+      {props.isAdmin && recountTarget && (
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) cancelRecount();
+          }}
+        >
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Recontar turno cerrado</DialogTitle>
+            </DialogHeader>
+            <p className={cn("mt-1", mutedTextClass)}>
+              El cierre firmado no se modifica. Cuente otra vez billetes y monedas por
+              denominación y declare los totales digitales; el sistema guarda las dos versiones.
+            </p>
+            <form onSubmit={handleRecount} className="mt-3 flex flex-col gap-3">
+              {recountStep === "counts" ? (
+                <>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                    {denominations.map((denom) => (
+                      <label key={denom.id} className={labelClass}>
+                        <span className="inline-flex items-center gap-1.5">
+                          <PayIcon kind={denom.kind} />
+                          {denom.kind} {formatMoney(denom.value)}
+                        </span>
+                        <input
+                          className={inputClass}
+                          value={recountCounts[denom.id] ?? ""}
+                          onChange={(event) =>
+                            setRecountCounts((prev) => ({ ...prev, [denom.id]: event.target.value.replace(/\D/g, "") }))
+                          }
+                          inputMode="numeric"
+                          placeholder="0"
+                        />
+                      </label>
+                    ))}
+                  </div>
+                  {props.methods
+                    .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
+                    .map((method) => (
+                      <label key={method.id} className={labelClass}>
+                        <span className="inline-flex items-center gap-1.5">
+                          <PayIcon code={method.code} />
+                          {method.name} (total en la aplicación)
+                        </span>
+                        <input
+                          className={inputClass}
+                          value={formatMoneyInput(recountDigitals[method.code] ?? "")}
+                          onChange={(event) =>
+                            setRecountDigitals((prev) => ({ ...prev, [method.code]: stripMoneyInput(event.target.value) }))
+                          }
+                          inputMode="numeric"
+                          placeholder="0"
+                        />
+                      </label>
+                    ))}
+                </>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  <div className="flex flex-col gap-2 rounded-md bg-warning-light px-3 py-2 text-sm font-medium text-warning">
+                    <p className="font-semibold">¿Está seguro de recontar?</p>
+                    <p>
+                      Efectivo contado ahora: {formatMoney(recountCashTotal())}. Cierre original:{" "}
+                      {formatMoney(recountTarget.shift.counted_cash)}.
+                    </p>
+                    <p>El cierre original queda firmado y las dos versiones quedan visibles.</p>
+                  </div>
+                  <label className={labelClass}>
+                    Motivo del reconteo
+                    <textarea
+                      className={inputClass}
+                      rows={3}
+                      value={recountReason}
+                      onChange={(event) => setRecountReason(event.target.value)}
+                      placeholder="Explique por qué se recontá el cierre."
+                    />
+                  </label>
+                </div>
+              )}
+              <DialogFooter>
+                {recountStep === "confirm" ? (
+                  <>
+                    <button type="button" className={ghostClass} onClick={() => setRecountStep("counts")}>
+                      Volver
+                    </button>
+                    <button type="button" className={ghostClass} onClick={cancelRecount}>
+                      Cancelar
+                    </button>
+                  </>
+                ) : (
+                  <button type="button" className={ghostClass} onClick={cancelRecount}>
+                    Cancelar
+                  </button>
+                )}
+                <button
+                  type="submit"
+                  className={buttonClass}
+                  disabled={busy || (recountStep === "confirm" && recountReason.trim().length === 0)}
+                >
+                  {recountStep === "counts" ? "Continuar" : "Sí, recontar"}
+                </button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/* U3: las dos versiones de un cierre recontado, con quién y por qué. */}
+      {props.isAdmin && versionsTarget?.recount && (
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setVersionsTarget(null);
+          }}
+        >
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Versiones del cierre</DialogTitle>
+            </DialogHeader>
+            <div className="mt-2 flex flex-col gap-3 text-sm">
+              <div className="flex flex-col gap-1">
+                <p className="font-semibold">Cierre original (firmado, intacto)</p>
+                <p>
+                  Contado {formatMoney(versionsTarget.recount.previous.counted_cash)} · base{" "}
+                  {formatMoney(versionsTarget.recount.previous.base_left)} · sobre{" "}
+                  {formatMoney(versionsTarget.recount.previous.cash_withdrawn)} · diferencia{" "}
+                  {formatMoney(versionsTarget.recount.previous.base_difference)}.
+                </p>
+              </div>
+              <div className="flex flex-col gap-1">
+                <p className="font-semibold text-warning">Reconteo (gobierna)</p>
+                <p>
+                  Contado {formatMoney(versionsTarget.recount.counted_cash)} · base{" "}
+                  {formatMoney(versionsTarget.recount.base_left)} · sobre{" "}
+                  {formatMoney(versionsTarget.recount.cash_withdrawn)} · diferencia{" "}
+                  {formatMoney(versionsTarget.recount.base_difference)}.
+                </p>
+                <p className={mutedTextClass}>
+                  Motivo: «{versionsTarget.recount.reason}». Recontado por{" "}
+                  {versionsTarget.recount.recounted_by ?? "usuario desconocido"} el{" "}
+                  {formatDateTime(versionsTarget.recount.recounted_at)}.
+                </p>
+              </div>
+            </div>
+            <DialogFooter>
+              <button type="button" className={ghostClass} onClick={() => setVersionsTarget(null)}>
+                Cerrar
+              </button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
       <section className={sectionClass} aria-busy={isViewPending}>
         <h2 className="text-lg font-semibold">Vista del día</h2>
         {!showDay ? (
@@ -796,6 +1074,8 @@ export function CashClient(props: CashClientProps) {
               methodCols={methodCols}
               isAdmin={props.isAdmin}
               emptyText="Sin turnos este día."
+              onRecount={startRecount}
+              onShowVersions={setVersionsTarget}
             />
           {dayPageCount > 1 && (
             <div className="mt-3 flex items-center gap-2 text-sm">
@@ -892,6 +1172,8 @@ export function CashClient(props: CashClientProps) {
           methodCols={methodCols}
           isAdmin={props.isAdmin}
           emptyText="Sin turnos en el rango."
+          onRecount={startRecount}
+          onShowVersions={setVersionsTarget}
         />
         {histPageCount > 1 && (
           <div className="mt-3 flex items-center gap-2 text-sm">
