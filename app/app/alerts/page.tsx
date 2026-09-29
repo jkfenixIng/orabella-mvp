@@ -1,5 +1,6 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
+import { Alert } from "@/src/components/ui/lib/alert";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { listAlerts } from "@/src/features/alerts/service";
@@ -23,9 +24,12 @@ export default async function AlertsPage() {
     return (
       <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-4 px-6 py-12">
         <h1 className="text-2xl font-bold">Alertas</h1>
-        <p role="alert" className="text-sm text-error dark:text-error">
-          El usuario no tiene sede asignada.
-        </p>
+        {/* Sin sede no hay bandeja que mostrar: es ESTADO (el caso hasta que a
+            alguien se le asigne una sede), así que va inline y persistente.
+            Esta vista es un Server Component: no puede emitir un toast. El
+            texto es el mismo; `destructive` deriva role="alert", el mismo
+            anuncio asertivo que antes estaba escrito a mano. */}
+        <Alert variant="destructive">El usuario no tiene sede asignada.</Alert>
       </main>
     );
   }

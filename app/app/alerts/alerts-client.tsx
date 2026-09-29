@@ -7,9 +7,9 @@ import {
   markAlertReadAction,
 } from "@/src/features/alerts/actions";
 import type { AlertRow, AlertsResult } from "@/src/features/alerts/service";
+import { Alert } from "@/src/components/ui/lib/alert";
 import { cn } from "@/src/components/ui/lib/utils";
 import {
-  errorClass,
   ghostClass,
   inputClass,
   labelClass,
@@ -146,9 +146,11 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
   return (
     <div className="flex flex-col gap-6">
       {error && (
-        <p role="alert" className={errorClass}>
-          {error}
-        </p>
+        // Fallo al traer la página o al firmar una revisión = ESTADO: sigue
+        // siendo el caso mientras no se corrija, así que va inline y
+        // persistente arriba de la bandeja. `destructive` deriva role="alert"
+        // (asertivo), el mismo rol que antes estaba escrito a mano.
+        <Alert variant="destructive">{error}</Alert>
       )}
 
       <section className={sectionClass} aria-busy={isViewPending}>
@@ -279,6 +281,10 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
             </li>
           ))}
           {result.alerts.length === 0 && (
+            // VACÍO: el estado base de la bandeja cuando no hay nada que
+            // revisar. Describe lo esperado, no bloquea nada y nunca anunció
+            // nada (no tenía rol), así que sigue siendo texto de lista y NO se
+            // envuelve en `Alert`: eso agregaría el anuncio que hoy no existe.
             <li className={mutedTextClass}>Sin alertas.</li>
           )}
         </ul>
