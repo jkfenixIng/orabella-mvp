@@ -658,8 +658,10 @@ async function loadCommissionRulesByEmployee(
  * esta función es la otra mitad de la historia: las filas históricas todavía
  * pueden traer centavos y los cuadres que comparan SUMA contra TOTAL guardado
  * (el CHECK de `invoices` al recalcular una emitida) tienen que coincidir al
- * centavo con lo que hay guardado. La migración 032 (a) reporta si quedan
- * centavos; hasta que esa decisión se tome, esos cuadres siguen al centavo.
+ * centavo con lo que hay guardado. No hay ninguna migración que repare esos
+ * centavos —y no hace falta: la app todavía no está en producción, así que esas
+ * filas son datos de prueba descartables—. Mientras existan, esos cuadres siguen
+ * al centavo, porque el valor guardado ES el hecho.
  * El SALDO COBRABLE es la excepción: se redondea a peso entero en
  * `invoiceNetBalance` (ver ahí), porque el datafono no cobra centavos.
  */
@@ -688,8 +690,9 @@ function round2(value: number): number {
  * identidad guardada se conserva), y para una factura legacy cuyo neto quedó
  * con centavos el cobrable es el peso redondeado. En esas filas históricas el
  * neto cobrado es entonces el redondeado, no el guardado: la diferencia es de
- * a lo sumo un peso y la corrección de datos de centavos históricos (032) la
- * elimina. Sin este redondeo el cobro de una factura legacy es
+ * a lo sumo un peso, y desaparece sola en cuanto la fila deja de traer centavos
+ * (el histórico con centavos es de la era en que la app redondeaba al centavo).
+ * Sin este redondeo el cobro de una factura legacy es
  * INSATISFACIBLE — 9999 deja 0.99 y 10000 deja 0.01, los dos fuera de
  * `MONEY_EPSILON` — y la factura queda Emitida e impagable.
  *
@@ -1699,7 +1702,7 @@ export async function editEmittedInvoiceItems(
   }
   const surcharge = round2(Number(detail.invoice.surcharge ?? 0));
   // El recargo guardado se conserva tal cual (es el recargo EMITIDO, un dato
-  // histórico que puede traer centavos hasta que 032 decida): por eso el total
+  // histórico que puede traer centavos): por eso el total
   // se reconcilia con `round2` y no con la regla del peso entero. El descuento
   // SÍ se normaliza y se vuelve a escribir más abajo: `totals` lo calculó ya
   // en pesos enteros, y si la fila guardaba un descuento con centavos la

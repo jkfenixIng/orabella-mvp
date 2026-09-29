@@ -23,7 +23,7 @@ import {
 } from "@/src/features/cash/schemas";
 
 /**
- * REGLA DEL PESO ENTERO (032).
+ * REGLA DEL PESO ENTERO.
  *
  * Regla de negocio: el datafono NO acepta centavos; el recargo de la tarjeta
  * se le pasa al cliente y el total que el cliente paga EN EL DATAFONO es un
@@ -45,7 +45,7 @@ const TARJETA = 5;
 
 // ------------------------------------------------ el redondeo de la app ---
 
-describe("dinero: roundMoney redondea a PESO ENTERO (032)", () => {
+describe("dinero: roundMoney redondea a PESO ENTERO", () => {
   it("half-up: el medio peso sube, como el total del datafono", () => {
     expect(roundMoney(0.5)).toBe(1);
     expect(roundMoney(1.5)).toBe(2);
@@ -156,7 +156,7 @@ describe("dinero: línea, impuestos y total en pesos enteros", () => {
   });
 });
 
-// ------------------------------------------- recargo de tarjeta (019/032) ---
+// ------------------------------------------- recargo de tarjeta (019) ---
 
 describe("dinero: recargo de tarjeta en pesos enteros con la identidad bruto−fee=neto", () => {
   const feeOf = (code: string): number => (code === "tarjeta" ? TARJETA : 0);
@@ -336,7 +336,7 @@ describe("dinero: los invariantes del cobro siguen en pie con pesos enteros", ()
   });
 });
 
-// ------------------------------- el resto de las features de dinero (032) ---
+// ------------------------------- el resto de las features de dinero ---
 
 describe("dinero: nómina, comisiones y caja siguen la misma regla", () => {
   it("comisión de línea entera (5% de 3333.33)", () => {
@@ -404,7 +404,7 @@ describe("dinero: nómina, comisiones y caja siguen la misma regla", () => {
   });
 });
 
-// --------------------- la factura con centavos legacy (U1-fix, 032) ---
+// --------------------- la factura con centavos legacy (U1-fix) ---
 
 /**
  * El cambio al peso entero dejó INTOCABLE la única comparación de cobro: la
