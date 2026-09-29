@@ -315,13 +315,19 @@ export async function immediatePaidTotal(
 // -------------------------------------------------------------------- pagos ---
 
 const PAYOUT_SELECT =
-  "id, sede_id, employee_id, invoice_id, cash_shift_id, method_code, base_subtotal, percent_applied, fixed_applied, amount, paid_by, paid_at";
+  "id, sede_id, employee_id, invoice_id, cash_shift_id, method_code, base_subtotal, percent_applied, fixed_applied, earned_immediate, amount, paid_by, paid_at";
 
 /**
  * Paga de inmediato una comisión desde la caja del turno abierto, por
  * cualquier método activo. Valida contra el pendiente (ganado − pagado)
  * para que la misma comisión nunca se pague dos veces. Queda auditado
  * (cuánto, quién pagó, cuándo, método, factura y turno).
+ *
+ * Doble barrera: esta validación (que da el mensaje exacto del pendiente) y el
+ * tope de la base (`trg_commission_payouts_cap`, 034). La validación de código
+ * es un leer-y-escribir y pierde contra una carrera; por eso la fila lleva
+ * `earned_immediate` — el ganado que la base compara contra la suma de lo
+ * pagado, sin recalcular la regla.
  */
 export async function payCommissionNow(
   raw: unknown,
@@ -432,12 +438,29 @@ export async function payCommissionNow(
       base_subtotal: earned.baseSubtotal,
       percent_applied: earned.percentApplied,
       fixed_applied: earned.fixedApplied,
+      // El tope de la base (034) compara contra ESTE número: es el ganado
+      // inmediato que ya se validó arriba, no una segunda versión de la regla.
+      earned_immediate: earned.immediateEarned,
       amount,
       paid_by: actor.userId,
     })
     .select(PAYOUT_SELECT)
     .single();
-  if (error || !data) throw new CommissionError("INTERNAL", "Error interno.", 500);
+  if (error) {
+    // Carrera perdida contra trg_commission_payouts_cap (034): P0001 = el tope
+    // acumulado de la base rechazó el pago (la suma del par ya estaba completa
+    // cuando entró esta fila). Mismo código que traducen payroll, cash y
+    // billing; la condición de negocio es la misma que valida el pendiente.
+    if ((error as { code?: string }).code === "P0001") {
+      throw new CommissionError(
+        "COMMISSION_OVERPAID",
+        "El monto supera la comisión pendiente.",
+        422,
+      );
+    }
+    throw new CommissionError("INTERNAL", "Error interno.", 500);
+  }
+  if (!data) throw new CommissionError("INTERNAL", "Error interno.", 500);
 
   await writeAudit({
     sede_id: actor.sedeId,
@@ -454,6 +477,9 @@ export async function payCommissionNow(
       base_subtotal: earned.baseSubtotal,
       percent_applied: earned.percentApplied,
       fixed_applied: earned.fixedApplied,
+      // El tope con el que la base aceptó esta fila (034): queda en la
+      // auditoría el número contra el que se comparó, no solo el pago.
+      earned_immediate: earned.immediateEarned,
     },
   });
   return data as CommissionPayoutRow;

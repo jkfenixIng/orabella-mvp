@@ -53,6 +53,12 @@ export interface CommissionPayoutRow {
   base_subtotal: number;
   percent_applied: number | null;
   fixed_applied: number | null;
+  /**
+   * Ganado pagable DE INMEDIATO del par (factura, empleado) al momento del
+   * pago (034): es el tope que la base compara contra Σamount. `null` en las
+   * filas históricas, cuyo ganado no está en la base.
+   */
+  earned_immediate: number | null;
   amount: number;
   paid_by: string | null;
   paid_at: string;
@@ -264,7 +270,10 @@ export function employeeLineCommissionOrigin(args: {
 
 /**
  * Pendiente = ganado − pagado inmediato (nunca negativo: tope acumulado
- * contra el doble pago). Puro para probarlo sin base de datos.
+ * contra el doble pago). Puro para probarlo sin base de datos. La base impone
+ * el mismo tope de forma acumulada y con la misma tolerancia de centavo
+ * (`trg_commission_payouts_cap`, 034); esto es el mensaje exacto del negocio,
+ * aquello la barrera que sobrevive a una carrera.
  */
 export function pendingCommission(earned: number, paidImmediate: number): number {
   return roundMoney(Math.max(0, roundMoney(earned) - roundMoney(paidImmediate)));
