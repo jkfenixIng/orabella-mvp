@@ -13,6 +13,7 @@ import {
   governingClose,
   HISTORY_PAGE_SIZE,
   historySchema,
+  isVoucherCashOut,
   openShiftSchema,
   rangeBounds,
   recountShiftSchema,
@@ -410,16 +411,23 @@ async function hasVoucherOutColumns(db: DbClient): Promise<boolean> {
 }
 
 /**
- * Salidas de caja por vales aprobados, por turno y método (descuentan del
- * esperado igual que los pagos inmediatos de comisión). Solo cuentan los
- * vales aprobados: un vale pendiente/rechazado NO toca caja (regla "no toca
- * caja hasta aprobar"). Si la migración 028 no está aplicada no hay salidas.
+ * Filas de `voucher_requests` del turno que el arqueo RESTA: las APROBADAS con
+ * método arqueable (`isVoucherCashOut`). Solo cuentan esas: un vale
+ * pendiente/rechazado NO toca caja (regla "no toca caja hasta aprobar"), y uno
+ * sin método es un vale histórico que tampoco afecta el arqueo. Si la migración
+ * 028 no está aplicada no hay salidas por vale y la lista queda vacía.
+ *
+ * CL-20: es UNA sola lectura y devuelve, además del mapa por método, la LISTA
+ * que el arqueo descontó. El cierre cuenta sus filas para el token de su
+ * precondición, así que el conteo que viaja como DATO es el de las MISMAS filas
+ * que restaron del esperado y no el de una lectura aparte (que podría ver un
+ * estado posterior y dejar el token por delante del arqueo).
  */
-async function fetchVoucherOutTotals(
+async function fetchVoucherOutRows(
   db: DbClient,
   shiftIds: string[],
-): Promise<Map<string, Map<string, number>>> {
-  const result = new Map<string, Map<string, number>>();
+): Promise<Map<string, VoucherCashOutInput[]>> {
+  const result = new Map<string, VoucherCashOutInput[]>();
   if (shiftIds.length === 0) return result;
   if (!(await hasVoucherOutColumns(db))) return result;
   const { data, error } = await db
@@ -439,6 +447,23 @@ async function fetchVoucherOutTotals(
     byShift.set(row.cash_shift_id, list);
   }
   for (const [shiftId, rows] of byShift) {
+    const outs = rows.filter(isVoucherCashOut);
+    if (outs.length > 0) result.set(shiftId, outs);
+  }
+  return result;
+}
+
+/**
+ * Salidas de caja por vales aprobados, por turno y método (descuentan del
+ * esperado igual que los pagos inmediatos de comisión). Es la lista de
+ * `fetchVoucherOutRows` agrupada por método.
+ */
+async function fetchVoucherOutTotals(
+  db: DbClient,
+  shiftIds: string[],
+): Promise<Map<string, Map<string, number>>> {
+  const result = new Map<string, Map<string, number>>();
+  for (const [shiftId, rows] of await fetchVoucherOutRows(db, shiftIds)) {
     const out = voucherOutByMethod(rows);
     if (out.size > 0) result.set(shiftId, out);
   }
@@ -1659,6 +1684,28 @@ export async function closeShift(
     if (paymentsError) throw new CashError("INTERNAL", "Error interno.", 500);
     const invoicePayMaps = await fetchInvoicePaymentsByShift(db, [shift.id]);
     const invoicePays = invoicePayMaps.get(shift.id) ?? [];
+    // CL-19/CL-20: el TOKEN de los conjuntos que este arqueo usó, para que el
+    // cierre no se firme sobre un conjunto que ya cambió.
+    //
+    // El arqueo se computa ACÁ, y su escritura ocurre en la transacción de
+    // `cash_close_shift_atomic` (049), que bloquea la fila del turno DESPUÉS. El
+    // cobro (056) toma `FOR SHARE` sobre esa misma fila, así que los dos se
+    // serializan — pero el arqueo ya estaba computado cuando el lock se tomó: un
+    // cobro que se confirma entre esta lectura y ese lock es dinero que entró al
+    // turno y que el arqueo firmado NO cuenta. Lo MISMO vale, con el signo
+    // opuesto, para las dos SALIDAS que el arqueo resta (CL-20): una comisión
+    // pagada o la aprobación de un vale en el medio dejan el mismo cierre corto.
+    //
+    // El token son los CONTEO de FILAS de las CUATRO fuentes del arqueo —las dos
+    // que `mergeShiftMoney` SUMA (`payments` del turno sin factura y las
+    // `invoice_payments` atribuidas al turno) y las dos que `paidOutByMethod`
+    // RESTA (`commission_payouts` del turno y los vales aprobados del turno)—,
+    // no sus sumas: sumar dinero en SQL está prohibido en este proyecto (005,
+    // 031, 049, 050, 053), y un `count(*)` no es aritmética de dinero. Cada
+    // conteo sale de la MISMA lista que el arqueo usó —no de una lectura aparte,
+    // que podría ver un estado posterior y dejar el token por delante del
+    // arqueo— y viaja como DATO con el arqueo; la transacción lo revalida bajo el
+    // lock del turno y, si alguno difiere, RECHAZA.
     const paidByMethod = sumShiftMoneyByMethod(mergeShiftMoney(shiftPayments, invoicePays));
     // Pagos inmediatos de comisión del turno (descuentan del esperado
     // por método: lo cobrado menos lo pagado).
@@ -1675,12 +1722,21 @@ export async function closeShift(
     // Vales aprobados del turno: salida de dinero por su método (RESTAN del
     // esperado, igual que los pagos inmediatos de comisión). Un vale pendiente
     // o rechazado no toca caja (regla "no toca caja hasta aprobar").
-    const voucherOutMaps = await fetchVoucherOutTotals(db, [shift.id]);
-    const voucherOut = voucherOutMaps.get(shift.id) ?? new Map<string, number>();
+    const voucherRowsByShift = await fetchVoucherOutRows(db, [shift.id]);
+    const voucherRows = voucherRowsByShift.get(shift.id) ?? [];
+    const voucherOut = voucherOutByMethod(voucherRows);
     for (const [code, amount] of voucherOut) {
       paidOutByMethod.set(code, roundMoney((paidOutByMethod.get(code) ?? 0) + amount));
     }
     const vouchersOut = sumMethodTotal(voucherOut);
+    // CL-20: el token, con los CUATRO conjuntos ya leídos. Los dos primeros son
+    // las fuentes que el arqueo SUMA; los dos últimos, las que RESTA.
+    const collectionCounts = {
+      payments: (shiftPayments ?? []).length,
+      invoice_payments: invoicePays.length,
+      commission_payouts: (payoutRows ?? []).length,
+      voucher_requests: voucherRows.length,
+    };
     // Facturas cobradas en este turno (emitidas aquí o en turnos anteriores):
     // ya suman al esperado y al arqueo por método en `paidByMethod`.
     const { total: invoicesTotal, count: invoicesCount } = invoiceCollectionsSummary(invoicePays);
@@ -1751,6 +1807,7 @@ export async function closeShift(
         observation,
       },
       p_counts: countLines(input.counts),
+      p_collection_counts: collectionCounts,
     });
     if (updateError || !updated) {
       // CHECK expected_cash >= 0 (006_cash.sql): el turno tiene más salidas
@@ -1765,6 +1822,19 @@ export async function closeShift(
           "CASH_OUT_EXCEEDS_COLLECTED",
           "Las salidas en efectivo del turno superan el efectivo cobrado. Revise los vales y comisiones pagados en efectivo antes de cerrar.",
           422,
+        );
+      }
+      // CL-19: el arqueo que se iba a firmar quedó VIEJO. Entre la lectura del
+      // servicio y el lock del turno se confirmó un cobro (056) que cambia el
+      // `expected_cash` ya computado: la transacción lo detecta bajo el lock —la
+      // red de la migración 058— y rechaza sin escribir NADA. Es un rechazo de
+      // CONTRATO, no un fallo interno: el llamador vuelve a cerrar con un arqueo
+      // fresco y el cierre sale bien.
+      if (errorMessage.includes("ARQUEO_STALE")) {
+        throw new CashError(
+          "ARQUEO_STALE",
+          "Las colecciones del turno cambiaron mientras se cerraba: vuelva a intentar.",
+          409,
         );
       }
       // Carrera perdida contra el guard de estado: otro cierre ganó el
