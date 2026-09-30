@@ -999,10 +999,12 @@ interface BillingLine {
  * insumos. Periodo cerrado → PERIOD_CLOSED.
  *
  * La ARITMÉTICA no vive acá: `computePayrollLines` la calcula (una sola
- * fórmula) y esta función sólo la PERSISTE —upsert de ítems, vales a
- * `descontada` y auditoría—. La corrección de un período cerrado (PA-2b,
- * `correctPayrollPeriod`) reutiliza la MISMA aritmética sin persistir nada de
- * esto.
+ * fórmula) y esta función sólo la PERSISTE. La persistencia de las dos
+ * escrituras de dinero —los ítems de nómina y los vales a `descontada`— es UNA
+ * sola transacción del servidor (CL-8: el RPC `payroll_apply_atomic`, 047): o
+ * quedan las dos, o no queda ninguna. La corrección de un período cerrado
+ * (PA-2b, `correctPayrollPeriod`) reutiliza la MISMA aritmética sin persistir
+ * nada de esto.
  */
 export async function calculatePayroll(
   sedeId: string,
@@ -1045,35 +1047,52 @@ export async function calculatePayroll(
       log: "calculatePayroll",
     });
 
-    if (payload.length > 0) {
-      const { error: upsertError } = await db
-        .from("payroll_items")
-        .upsert(payload, { onConflict: "period_id,employee_id" });
-      if (upsertError) {
+    // CL-8: los ítems y el flip de los vales son UNA sola escritura. Una
+    // función SQL es UNA sentencia, y una sentencia corre ENTERA dentro de una
+    // sola transacción del servidor (PostgREST no ofrece multi-statement por
+    // request). Antes esto eran DOS requests —el upsert de `payroll_items` y
+    // después el `UPDATE` de `voucher_requests`— y un fallo entre los dos
+    // dejaba el ítem YA escrito descontando el vale mientras el vale seguía
+    // `pendiente`/`aprobada`: el empleado cobraba corto en silencio y la
+    // corrida siguiente descontaba el MISMO vale otra vez. Ya no hay "mitad del
+    // camino" donde fallar.
+    //
+    // La ARITMÉTICA no se mueve: cada monto —el descuento de vales incluido—
+    // sigue resolviéndose acá (`computePayrollLines`) y el RPC sólo ESCRIBE lo
+    // que recibe. Sin nada que escribir (ni ítems ni vales) no se abre
+    // transacción: el cálculo de un período vacío sigue sin tocar la base.
+    //
+    // PAY-07 se conserva entero: los vales descontados pasan a `descontada`
+    // —transición única y terminal, doble descuento imposible— con la MISMA
+    // precondición de estado, sólo que ahora adentro de la transacción.
+    if (payload.length > 0 || vouchersToDiscount.length > 0) {
+      const { data: applied, error: applyError } = await db.rpc("payroll_apply_atomic", {
+        p_period_id: periodId,
+        p_items: payload,
+        p_voucher_ids: vouchersToDiscount,
+      });
+      if (applyError) {
         console.error(
-          "[payroll] calculatePayroll: fallo al guardar ítems de nómina:",
+          "[payroll] calculatePayroll: fallo al aplicar ítems y vales de la nómina:",
           JSON.stringify({
             periodId,
             items: payload.length,
-            code: upsertError.code,
-            message: upsertError.message,
-            details: upsertError.details,
-            hint: upsertError.hint,
+            vales: vouchersToDiscount.length,
+            code: applyError.code,
+            message: applyError.message,
+            details: applyError.details,
+            hint: applyError.hint,
           }),
         );
         throw new PayrollError("INTERNAL", "Error interno.", 500);
       }
-    }
-
-    // PAY-07: los vales descontados pasan a descontada (transición única;
-    // descontada es terminal, doble descuento imposible).
-    if (vouchersToDiscount.length > 0) {
-      const { error: discountError } = await db
-        .from("voucher_requests")
-        .update({ status: "descontada" })
-        .in("id", vouchersToDiscount)
-        .in("status", ["pendiente", "aprobada"]);
-      if (discountError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+      // Segunda barrera en la frontera: la función ya revierte si escribió
+      // menos ítems de los que recibió, así que un conteo distinto sólo puede
+      // venir de una respuesta incoherente. Se reporta como fallo real en vez
+      // de devolver un período que la base no aplicó.
+      if (typeof applied !== "number" || applied !== payload.length) {
+        throw new PayrollError("INTERNAL", "Error interno.", 500);
+      }
     }
 
     await writeAudit({

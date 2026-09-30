@@ -1164,6 +1164,32 @@ const payrollPagedStub = vi.hoisted(() => ({
    * (la otra transacción se confirmó entre el lookup y el INSERT).
    */
   skipMarkLookupOnce: false,
+  /**
+   * CL-8: el fallo de la escritura que descuenta los vales.
+   *
+   * El punto de fallo es SEMÁNTICO y por eso sirve para los dos caminos: en el
+   * camino viejo falla el `UPDATE` suelto de `voucher_requests` (el ítem ya
+   * quedó escrito, porque es otro request); con la transacción del servidor
+   * falla el RPC entero, que revierte las DOS escrituras. Es la misma falla
+   * —"no se pudo marcar el vale"— vista desde cada mecanismo.
+   */
+  failVoucherFlip: null as string | null,
+  /**
+   * CL-8: el servidor RECHAZA el RPC. Es el rechazo de las guardas de forma y
+   * de las redes de conteo (entrada mal formada, período/empleado ausente,
+   * carrera perdida): la sentencia no escribió nada.
+   */
+  failRpcWith: null as string | null,
+  /**
+   * CL-8: payloads de ítems que la base CONFIRMÓ, uno por escritura aplicada.
+   * Un ítem con `deductions_vales` es un conocimiento del vale ya consumado:
+   * dos entradas con el mismo vale = el vale descontado DOS veces.
+   */
+  itemWrites: [] as Array<Array<Record<string, unknown>>>,
+  /** CL-8: ids de vales que cada escritura confirmada marcó `descontada`. */
+  voucherFlips: [] as string[][],
+  /** CL-8: cada llamada al RPC, con lo que la transacción recibió. */
+  rpcCalls: [] as Array<{ name: string; args: Record<string, unknown> }>,
 }));
 
 /**
@@ -1198,6 +1224,15 @@ function createPayrollPagedStubClient(): unknown {
         // PostgREST devuelve las filas que el UPDATE afectó, con el payload ya
         // aplicado: la aprobación del vale necesita esa fila de vuelta.
         const matched = rows().filter((row) => filters.every((matches) => matches(row)));
+        // CL-8: la escritura que descuenta los vales FALLA. Acá no hay
+        // transacción que revierta el ítem ya escrito: es exactamente la
+        // ventana que CL-8 cierra.
+        if (payrollPagedStub.failVoucherFlip && table === "voucher_requests") {
+          return {
+            data: null,
+            error: { code: "P0001", message: payrollPagedStub.failVoucherFlip },
+          };
+        }
         // `.single()` sobre 0 filas es PGRST116 (el patrón del cliente
         // Supabase): la señal de que el compare-and-swap perdió la carrera.
         if (single && matched.length === 0) {
@@ -1210,6 +1245,14 @@ function createPayrollPagedStubClient(): unknown {
           };
         }
         for (const row of matched) Object.assign(row, updatePayload ?? {});
+        // CL-8: el descuento por el camino SUELTO (el `UPDATE` del servicio).
+        // Queda registrado igual que el del RPC: si un test ve DOS descuentos
+        // confirmados, el vale se consumió dos veces sin importar el camino.
+        if (table === "voucher_requests" && updatePayload?.status === "descontada") {
+          payrollPagedStub.voucherFlips.push(
+            matched.map((row) => String(row.id)),
+          );
+        }
         return { data: single ? matched[0] ?? null : matched, error: null };
       }
       if (op !== "select") {
@@ -1318,6 +1361,9 @@ function createPayrollPagedStubClient(): unknown {
         }));
         payrollPagedStub.itemsUpsert = persisted;
         payrollPagedStub.tables.payroll_items = [...rows(), ...persisted];
+        // CL-8: esta escritura quedó CONFIRMADA (camino suelto). Si el descuento
+        // de los vales falla después, el ítem ya es un hecho.
+        payrollPagedStub.itemWrites.push(persisted);
         return query;
       },
       delete: () => {
@@ -1379,7 +1425,93 @@ function createPayrollPagedStubClient(): unknown {
     };
     return query;
   };
-  return { from };
+
+  /**
+   * CL-8: `payroll_apply_atomic` (047). El doble emula UNA transacción del
+   * servidor: el upsert de los ítems y el flip de los vales son UNA sola
+   * escritura, así que toma las dos tablas ANTES de escribir y, si algo falla,
+   * las restaura. La red de conteo también es del doble: si no marcó
+   * EXACTAMENTE los vales que recibió —porque otro cálculo ya los descontó—,
+   * aborta y no queda nada escrito.
+   *
+   * El `ON CONFLICT (period_id, employee_id)` sí se emula: una segunda corrida
+   * del mismo período REEMPLAZA la fila del empleado, no la duplica (es lo que
+   * hace el upsert real).
+   *
+   * El doble NO reimplementa las guardas de FORMA del SQL (jsonb válido, uuid
+   * bien formado, columnas numéricas, `detail_json` arreglo): ésas viven en la
+   * función y se prueban sobre el archivo. Lo que emula es lo que este test
+   * necesita observar: la indivisibilidad y la red de conteo.
+   */
+  const rpc = async (
+    name: string,
+    args?: Record<string, unknown>,
+  ): Promise<{ data: unknown; error: unknown }> => {
+    payrollPagedStub.rpcCalls.push({ name, args: args ?? {} });
+    if (name !== "payroll_apply_atomic") {
+      return { data: null, error: { message: `doble sin respuesta para el rpc ${name}` } };
+    }
+    const items = (args?.p_items ?? []) as Array<Record<string, unknown>>;
+    const requested = (args?.p_voucher_ids ?? []) as string[];
+    // U8/CL-8: la otra transacción escribe ANTES de que esta transacción evalúe
+    // su precondición (la carrera real). Se dispara una sola vez, y ANTES de la
+    // foto: lo que la otra transacción confirmó ya es parte del estado previo.
+    const beforeWrite = payrollPagedStub.beforeUpdate;
+    if (beforeWrite && beforeWrite.table === "voucher_requests") {
+      payrollPagedStub.beforeUpdate = null;
+      beforeWrite.run();
+    }
+    // La foto ANTES de escribir: es el rollback de la sentencia.
+    const itemSnapshot = payrollPagedStub.tables.payroll_items ?? [];
+    const vouchers = payrollPagedStub.tables.voucher_requests ?? [];
+    const voucherSnapshot = vouchers.map((row) => ({ row, status: row.status }));
+    // El rechazo del servidor (guardas de forma y redes de conteo): no se
+    // escribió nada, así que no hay nada que revertir.
+    if (payrollPagedStub.failRpcWith) {
+      return { data: null, error: { code: "P0001", message: payrollPagedStub.failRpcWith } };
+    }
+    const rollback = (message: string) => {
+      payrollPagedStub.tables.payroll_items = itemSnapshot;
+      for (const entry of voucherSnapshot) entry.row.status = entry.status;
+      return { data: null, error: { code: "P0001", message } };
+    };
+    // 1. El FLIP, con la precondición de estado: sólo desde pendiente/aprobada.
+    const flipped: string[] = [];
+    for (const id of requested) {
+      const row = vouchers.find((entry) => entry.id === id);
+      if (row && (row.status === "pendiente" || row.status === "aprobada")) {
+        row.status = "descontada";
+        flipped.push(id);
+      }
+    }
+    if (payrollPagedStub.failVoucherFlip) {
+      return rollback(payrollPagedStub.failVoucherFlip);
+    }
+    // 1b. La red de conteo: no se marcaron EXACTAMENTE los vales recibidos (uno
+    // ya estaba descontado por otro cálculo). Se aborta el par completo.
+    if (flipped.length !== requested.length) {
+      return rollback("PAYROLL_VOUCHER_CONFLICT");
+    }
+    // 2. El upsert de los ítems: ESCRIBE lo que recibió, sin recalcular nada.
+    const persisted: Array<Record<string, unknown>> = items.map((row) => ({
+      ...row,
+      id: `item-nomina-${(payrollPagedStub.rowSeq += 1)}`,
+      created_at: "2026-01-31T23:59:59.000Z",
+    }));
+    const overwritten = new Set(persisted.map((row) => `${row.period_id}|${row.employee_id}`));
+    payrollPagedStub.tables.payroll_items = [
+      ...itemSnapshot.filter((row) => !overwritten.has(`${row.period_id}|${row.employee_id}`)),
+      ...persisted,
+    ];
+    if (persisted.length > 0) {
+      payrollPagedStub.itemsUpsert = persisted;
+      payrollPagedStub.itemWrites.push(persisted);
+    }
+    payrollPagedStub.voucherFlips.push(flipped);
+    return { data: persisted.length, error: null };
+  };
+
+  return { from, rpc };
 }
 
 vi.mock("@/src/shared/lib/supabase/server", () => ({
@@ -1410,6 +1542,11 @@ function resetPayrollStubState(): void {
   payrollPagedStub.updates.length = 0;
   payrollPagedStub.uniqueKeys.length = 0;
   payrollPagedStub.skipMarkLookupOnce = false;
+  payrollPagedStub.failVoucherFlip = null;
+  payrollPagedStub.failRpcWith = null;
+  payrollPagedStub.itemWrites.length = 0;
+  payrollPagedStub.voucherFlips.length = 0;
+  payrollPagedStub.rpcCalls.length = 0;
 }
 
 // Los catálogos de admin/cash son `unstable_cache` (caché de Next). Fuera de un
@@ -5315,6 +5452,392 @@ describe("payroll: CL-5 la solicitud de vale reintentada no abre un segundo vale
     expect(sql).not.toMatch(/\bTRUNCATE\b/i);
     expect(sql).not.toMatch(/UPDATE\s+public\./i);
     expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+});
+
+
+// ---- CL-8: el cálculo de la nómina persiste ítems y vales en UNA transacción ---
+
+/**
+ * CL-8: la VENTANA MÁS CARA de las escrituras múltiples sin transacción.
+ *
+ * `calculatePayroll` escribía en DOS requests distintos contra PostgREST:
+ * primero el upsert de `payroll_items`
+ * (`src/features/payroll/service.ts:1051`) y después el `UPDATE` de
+ * `voucher_requests` a `descontada` (`service.ts:1072-1075`). Un fallo entre los
+ * dos —una escritura que falla, la conexión que se corta— dejaba el ítem YA
+ * escrito descontando el vale del neto mientras el vale seguía
+ * `pendiente`/`aprobada`:
+ *
+ *   * el empleado cobra CORTO y en silencio (el descuento ya está en la
+ *     liquidación firmada);
+ *   * el vale sigue VIGENTE, así que el cálculo siguiente lo vuelve a
+ *     descontar: el mismo vale, descontado dos veces (dos escrituras de ítem
+ *     confirmadas que lo incluyen);
+ *   * y el estado es INVISIBLE en la pantalla, porque los dos números que se
+ *     miran (el neto y el estado del vale) no están juntos en ningún lado.
+ *
+ * El arreglo es el de la casa (039/040/046): una FUNCIÓN SQL por `db.rpc(...)`.
+ * Una función es UNA sentencia y una sentencia corre ENTERA dentro de una sola
+ * transacción del servidor, así que el upsert de los ítems y el flip de los
+ * vales dejan de tener "mitad del camino". La ARITMÉTICA no se mueve: el
+ * servicio sigue calculando cada monto (incluido el descuento de vales) y la
+ * función sólo ESCRIBE lo que recibe.
+ */
+describe("payroll: el cálculo persiste ítems y vales en UNA transacción (CL-8)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-admin-cl8",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const VOUCHER_ID = "5c0e1f2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b";
+  const SALARY = 1_400_000;
+  const VALE = 100_000;
+
+  function employeeRow(overrides: Record<string, unknown> = {}) {
+    return {
+      id: payrollPagedStub.EMPLOYEE_ID,
+      sede_id: payrollPagedStub.SEDE_ID,
+      user_id: null,
+      full_name: "Empleada CL-8",
+      employee_code: "E-8",
+      document: "1000000008",
+      phone: null,
+      position: null,
+      payout_mode: "normal",
+      email: null,
+      birth_date: null,
+      pay_type: "fijo",
+      salary_fixed: SALARY,
+      commission_percent: null,
+      is_active: true,
+      ...overrides,
+    };
+  }
+
+  /** Período en borrador que cubre todo enero, un vale y la planta pedida. */
+  function seed(overrides: { voucherStatus?: string; vouchers?: Array<Record<string, unknown>>; employees?: Array<Record<string, unknown>> } = {}) {
+    payrollPagedStub.tables = {
+      payroll_periods: [
+        {
+          id: payrollPagedStub.PERIOD_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          start_date: "2026-01-01",
+          end_date: "2026-01-31",
+          status: "borrador",
+          created_by: ACTOR.userId,
+          closed_at: null,
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      employees: overrides.employees ?? [employeeRow()],
+      invoices: [],
+      invoice_items: [],
+      commission_rules: [],
+      voucher_requests:
+        overrides.vouchers ?? [
+          {
+            id: VOUCHER_ID,
+            sede_id: payrollPagedStub.SEDE_ID,
+            employee_id: payrollPagedStub.EMPLOYEE_ID,
+            amount: VALE,
+            request_date: "2026-01-15",
+            status: overrides.voucherStatus ?? "pendiente",
+            approved_by: null,
+            approval_code: null,
+            observation: null,
+          },
+        ],
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      audit_logs: [],
+    };
+  }
+
+  const voucherRow = () => payrollPagedStub.tables.voucher_requests[0];
+  /** Escrituras de ítem CONFIRMADAS: cada una descuenta los vales que incluye. */
+  const committedDiscounts = () =>
+    payrollPagedStub.itemWrites.filter((payload) =>
+      payload.some((row) => Number(row.deductions_vales ?? 0) > 0),
+    );
+  const flippedTimes = (id: string) =>
+    payrollPagedStub.voucherFlips.flat().filter((flipped) => flipped === id).length;
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  // --------------------------------------------------------------- RED ---
+
+  it("RED medido: un fallo al descontar el vale deja el ÍTEM YA ESCRITO y el vale sin marcar", async () => {
+    seed();
+    // La ventana: la escritura que marca el vale falla DESPUÉS del upsert.
+    payrollPagedStub.failVoucherFlip = "PAYROLL_VOUCHER_CONFLICT";
+
+    const outcome: unknown = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      {},
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(PayrollError);
+    expect(outcome).toMatchObject({ code: "INTERNAL", status: 500 });
+    // HOY: el ítem quedó escrito descontando el vale y NADA lo revierte (es otro
+    // request, no hay transacción). La liquidación dice que el vale se descontó.
+    expect(committedDiscounts()).toEqual([]);
+    // Y el vale sigue VIGENTE: la próxima corrida lo vuelve a descontar.
+    expect(voucherRow().status).toBe("pendiente");
+  });
+
+  it("RED medido: el vale que quedó sin marcar se descuenta OTRA VEZ en el cálculo siguiente", async () => {
+    seed();
+    payrollPagedStub.failVoucherFlip = "PAYROLL_VOUCHER_CONFLICT";
+    // La corrida que falla a mitad de camino.
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR).catch(
+      () => undefined,
+    );
+    // El reintento (la corrida siguiente).
+    payrollPagedStub.failVoucherFlip = null;
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+
+    // El vale termina marcado, pero fue DESCONTADO DOS VECES: la primera quedó
+    // escrita pese al fallo y la segunda es un descuento nuevo sobre el mismo
+    // vale. Con una sola transacción, la primera no deja nada y sólo hay una.
+    expect(voucherRow().status).toBe("descontada");
+    expect(committedDiscounts()).toHaveLength(1);
+    expect(flippedTimes(VOUCHER_ID)).toBe(1);
+  });
+
+  // ------------------------------------------------------------- GREEN ---
+
+  it("GREEN: un cálculo exitoso escribe cada ítem y descuenta cada vale EXACTAMENTE una vez", async () => {
+    seed();
+
+    const detail = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      {},
+      ACTOR,
+    );
+
+    // Una sola escritura para las dos cosas: el upsert y el flip viajan juntos.
+    expect(payrollPagedStub.rpcCalls.filter((call) => call.name === "payroll_apply_atomic")).toHaveLength(1);
+    // El flip ya NO es un request suelto.
+    expect(payrollPagedStub.updates.filter((entry) => entry.table === "voucher_requests")).toEqual([]);
+    expect(committedDiscounts()).toHaveLength(1);
+    expect(flippedTimes(VOUCHER_ID)).toBe(1);
+    expect(voucherRow().status).toBe("descontada");
+    // El resultado para quien llama NO cambia: el mismo detalle del período.
+    expect(detail.items).toHaveLength(1);
+    expect(detail.items[0]).toMatchObject({
+      employee_id: payrollPagedStub.EMPLOYEE_ID,
+      deductions_vales: VALE,
+    });
+  });
+
+  it("la transacción ESCRIBE lo que el servicio calculó: ningún monto se recalcula en SQL", async () => {
+    seed();
+
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+
+    // El payload que la base guardó es el que armó la aritmética de TypeScript:
+    // fijo del mes completo (1.400.000), el vale descontado (100.000) y el neto
+    // ya resuelto (1.300.000). Si la función sumara o restara, estos números no
+    // podrían venir dados.
+    expect(payrollPagedStub.itemWrites[0][0]).toMatchObject({
+      period_id: payrollPagedStub.PERIOD_ID,
+      employee_id: payrollPagedStub.EMPLOYEE_ID,
+      base_fixed: SALARY,
+      commissions: 0,
+      bonuses: 0,
+      deductions_vales: VALE,
+      other_discounts: 0,
+      net_pay: SALARY - VALE,
+    });
+    const args = payrollPagedStub.rpcCalls[0].args;
+    expect(args.p_period_id).toBe(payrollPagedStub.PERIOD_ID);
+    expect(args.p_voucher_ids).toEqual([VOUCHER_ID]);
+    expect((args.p_items as Array<Record<string, unknown>>)[0].net_pay).toBe(SALARY - VALE);
+  });
+
+  it("la CARRERA del vale se RECHAZA en vez de pisar el descuento ajeno, y no escribe nada", async () => {
+    // Otro cálculo descuenta el vale ENTRE la lectura del servicio y la
+    // escritura: cuando la transacción evalúa su precondición, el vale ya no
+    // está pendiente. El `UPDATE` suelto afectaba CERO filas y seguía de largo
+    // EN SILENCIO, dejando los ítems escritos sobre un descuento ajeno.
+    seed();
+    const voucher = voucherRow();
+    payrollPagedStub.beforeUpdate = {
+      table: "voucher_requests",
+      run: () => {
+        voucher.status = "descontada";
+        voucher.approved_by = "u-otro-calculo";
+      },
+    };
+
+    const outcome: unknown = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      {},
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(PayrollError);
+    expect(outcome).toMatchObject({ code: "INTERNAL", status: 500 });
+    // NADA escrito: el upsert viaja en la misma transacción y se revierte con ella.
+    expect(payrollPagedStub.itemWrites).toEqual([]);
+    expect(payrollPagedStub.tables.payroll_items).toEqual([]);
+    // El descuento ajeno NO se pisa: el vale queda como lo dejó el otro cálculo.
+    expect(voucher.status).toBe("descontada");
+    expect(voucher.approved_by).toBe("u-otro-calculo");
+  });
+
+  it("una entrada rechazada por el servidor se rechaza con CERO escrituras", async () => {
+    seed();
+    // Las guardas de forma y las redes de conteo del servidor.
+    payrollPagedStub.failRpcWith = "PAYROLL_INVALID";
+
+    const outcome: unknown = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      {},
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(PayrollError);
+    expect(outcome).toMatchObject({ code: "INTERNAL", status: 500 });
+    expect(payrollPagedStub.itemWrites).toEqual([]);
+    expect(payrollPagedStub.tables.payroll_items).toEqual([]);
+    expect(voucherRow().status).toBe("pendiente");
+    // No es vacuidad: la transacción SÍ se intentó.
+    expect(payrollPagedStub.rpcCalls).toHaveLength(1);
+  });
+
+  it("control negativo: sin vales y sin planta no se abre ninguna transacción", async () => {
+    // Si la operación no tuviera nada que escribir, el "nada escrito" de los
+    // tests de arriba también se cumpliría por vacuidad.
+    seed({ vouchers: [], employees: [] });
+
+    const detail = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      {},
+      ACTOR,
+    );
+
+    expect(payrollPagedStub.rpcCalls).toEqual([]);
+    expect(payrollPagedStub.itemWrites).toEqual([]);
+    expect(detail.items).toEqual([]);
+  });
+
+  it("control negativo: un cálculo exitoso SÍ escribe (la transacción no es un no-op)", async () => {
+    seed();
+
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+
+    expect(payrollPagedStub.itemWrites).toHaveLength(1);
+    expect(payrollPagedStub.tables.payroll_items).toHaveLength(1);
+    expect(payrollPagedStub.voucherFlips).toEqual([[VOUCHER_ID]]);
+  });
+});
+
+describe("migración 047_payroll_apply_atomic.sql (CL-8)", () => {
+  // La lectura es por test: el RED del SERVICIO corre con el archivo todavía
+  // ausente, y una lectura en el cuerpo del `describe` rompería la colección de
+  // todo el archivo en vez de fallar sólo estos tests.
+  const migration = (): { raw: string; sql: string } => {
+    const raw = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "047_payroll_apply_atomic.sql"),
+      "utf8",
+    );
+    // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+    return {
+      raw,
+      sql: raw
+        .split("\n")
+        .filter((line) => !line.trimStart().startsWith("--"))
+        .join("\n"),
+    };
+  };
+
+  it("las DOS escrituras viven en UNA función: una sentencia, una transacción", () => {
+    const { sql } = migration();
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.payroll_apply_atomic");
+    expect(sql).toContain("INSERT INTO public.payroll_items");
+    expect(sql).toContain("jsonb_array_elements(p_items)");
+    // El upsert del servicio (`onConflict: "period_id,employee_id"`) traducido.
+    expect(sql).toMatch(/ON CONFLICT\s*\(\s*period_id\s*,\s*employee_id\s*\)\s*DO UPDATE/i);
+    // El flip del vale, con la PRECONDICIÓN de estado del UPDATE actual.
+    expect(sql).toContain("UPDATE public.voucher_requests");
+    expect(sql).toMatch(/status\s*=\s*'descontada'/);
+    expect(sql).toMatch(/status\s*IN\s*\(\s*'pendiente'\s*,\s*'aprobada'\s*\)/);
+    // Orden determinista de los locks (misma disciplina que 046): sin él, dos
+    // aportes concurrentes del mismo período pueden bloquearse en ciclo.
+    expect(sql).toMatch(/ORDER BY/);
+    expect(sql).toMatch(/FOR UPDATE/);
+  });
+
+  it("tiene las DOS redes de conteo: el flip exacto y los ítems exactos", () => {
+    const { sql } = migration();
+    const diagnostics = sql.match(/GET DIAGNOSTICS/g) ?? [];
+    expect(diagnostics).toHaveLength(2);
+    expect(sql).toContain("RAISE EXCEPTION");
+    // La guarda de forma no puede caer en un NULL silencioso: el `coalesce` es
+    // lo que hace que una clave AUSENTE falle en vez de comparar contra NULL.
+    expect(sql).toMatch(/coalesce\(/);
+  });
+
+  it("NO mueve aritmética de dinero a SQL: ningún monto se recalcula", () => {
+    const { sql } = migration();
+    // La tabla ya valida `neto = bruto − vales − otros` con su CHECK de 007
+    // (validar no es calcular): esta migración no agrega una sola expresión
+    // aritmética sobre las columnas de dinero.
+    for (const column of [
+      "base_fixed",
+      "commissions",
+      "bonuses",
+      "deductions_vales",
+      "other_discounts",
+      "net_pay",
+    ]) {
+      expect(sql, column).not.toMatch(new RegExp(`${column}\\s*[+\\-*/]`));
+    }
+    expect(sql).not.toContain("CHECK");
+    expect(sql).not.toMatch(/sum\s*\(/i);
+  });
+
+  it("cierra el permiso: sólo service_role puede ejecutarla", () => {
+    const { sql } = migration();
+    expect(sql).toContain("REVOKE ALL ON FUNCTION public.payroll_apply_atomic");
+    expect(sql).toContain("FROM PUBLIC");
+    expect(sql).toContain("FROM anon");
+    expect(sql).toContain("FROM authenticated");
+    expect(sql).toContain("GRANT EXECUTE ON FUNCTION public.payroll_apply_atomic");
+    expect(sql).toContain("TO service_role");
+    expect(sql).toContain("SECURITY INVOKER");
+    expect(sql).toContain("SET search_path = public");
+  });
+
+  it("no borra ni reescribe datos: sólo la función y sus permisos", () => {
+    const { sql } = migration();
+    expect(sql).not.toMatch(/^\s*DELETE/im);
+    expect(sql).not.toMatch(/^\s*TRUNCATE/im);
+    expect(sql).not.toMatch(/^\s*ALTER TABLE/im);
+    expect(sql).not.toMatch(/^\s*CREATE INDEX/im);
+    expect(sql).not.toContain("DROP FUNCTION");
+    expect(sql).not.toContain("DROP TRIGGER");
+    expect(sql).not.toContain("DROP CONSTRAINT");
+  });
+
+  it("explica el motivo, el acoplamiento de despliegue y el costo de numeración", () => {
+    const { raw } = migration();
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+    expect(raw).toContain("ACOPLAMIENTO DE DESPLIEGUE");
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    // El número libre siguiente y el archivo hermano (046) que se espeja.
+    expect(raw).toContain("047");
+    expect(raw).toContain("046");
   });
 });
 
