@@ -80,6 +80,57 @@ function validationMessage(error: { issues: Array<{ message: string }> }): strin
   return error.issues[0]?.message ?? "Datos inválidos.";
 }
 
+/**
+ * CO-1: candado de serialización de las DOS ediciones de factura.
+ *
+ * El token es `invoices.edit_version` (migración 038): un contador que cambia en
+ * CADA edición exitosa. Reclamarlo es un compare-and-swap — se escribe
+ * `versión leída + 1` con la versión leída como precondición — y se llama ANTES
+ * de la primera escritura de la edición (ítems, stock, auditoría). Dos ediciones
+ * simultáneas de la MISMA factura leen la misma versión y calculan el mismo
+ * delta: la que aplica segunda afecta 0 filas y se rechaza acá, así que sus
+ * deltas NO se aplican dos veces. El candado es por FILA (`.eq("id", …)`), no
+ * global: editar otra factura no se bloquea.
+ *
+ * El rechazo es un error de negocio accionable (409 + `EDIT_CONFLICT`), nunca un
+ * 500: PGRST116 es el `.single()` sin filas del cliente Supabase, el mismo
+ * código que la anulación de factura mapea a `ANNUL_CONFLICT` y el cierre de
+ * caja a `SHIFT_ALREADY_CLOSED`.
+ *
+ * LÍMITE CONOCIDO (CO-1, declarado y no escondido): el candado cubre la ventana
+ * lectura→primera escritura, que es la del hallazgo; NO es una transacción. Si
+ * la ganadora ya reclamó el token y una tercera edición alcanza a leer los ítems
+ * viejos antes de que la ganadora los escriba, esa tercera lee la versión nueva
+ * (por eso reclama el token) y recalcula el delta sobre el estado viejo. Cerrar
+ * esa rendija exige que la edición entera —lectura, ítems y stock— sea UNA
+ * transacción (una función SQL/RPC): es un cambio de forma, no de candado, y
+ * queda fuera de esta unidad.
+ */
+async function claimInvoiceEdit(
+  db: DbClient,
+  invoiceId: string,
+  expectedVersion: number,
+): Promise<void> {
+  const { data, error } = await db
+    .from("invoices")
+    .update({ edit_version: expectedVersion + 1 })
+    .eq("id", invoiceId)
+    .eq("edit_version", expectedVersion)
+    .select("id")
+    .single();
+  if (error || !data) {
+    const errorCode = (error as { code?: string } | null)?.code;
+    if (errorCode === "PGRST116") {
+      throw new BillingError(
+        "EDIT_CONFLICT",
+        "Otra edición de esta factura se aplicó entre la lectura y la escritura (posible edición simultánea): no se ajustó nada. Vuelva a abrir la factura y repita la edición.",
+        409,
+      );
+    }
+    throw new BillingError("INTERNAL", "Error interno.", 500);
+  }
+}
+
 /** Roles que pueden emitir/cobrar/anular (lectura: cualquier rol de la sede). */
 const WRITER_ROLES: RoleCode[] = ["admin", "caja"];
 
@@ -122,6 +173,12 @@ export interface InvoiceRow {
   closed_at: string | null;
   cancel_reason: string | null;
   created_at: string;
+  /**
+   * CO-1: token de serialización de la edición (migración 038). Cambia en cada
+   * edición exitosa; es la precondición del compare-and-swap que rechaza la
+   * edición simultánea con EDIT_CONFLICT antes de tocar stock.
+   */
+  edit_version: number;
 }
 
 export interface InvoiceItemRow {
@@ -185,7 +242,7 @@ export interface InvoiceDetail {
 }
 
 const INVOICE_SELECT =
-  "id, sede_id, consecutive_number, client_name, client_document, subtotal, discount, tax, surcharge, total, status, user_id, cash_shift_id, closed_by, closed_at, cancel_reason, created_at";
+  "id, sede_id, consecutive_number, client_name, client_document, subtotal, discount, tax, surcharge, total, status, user_id, cash_shift_id, closed_by, closed_at, cancel_reason, created_at, edit_version";
 const ITEM_SELECT =
   "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission, commission_value, commission_mode, commission_percent_override, employees!inner(full_name, employee_code, commission_percent, pay_type, payout_mode)";
 const TAX_SELECT = "id, invoice_id, tax_code, tax_name, percent, amount";
@@ -1464,6 +1521,13 @@ export async function editInvoiceItems(
     }
   }
 
+  // CO-1: el candado se reclama ANTES de la primera escritura de la edición (y
+  // DESPUÉS de todos los rechazos por regla: un rechazo de negocio no consume
+  // el token de nadie). Si otra edición de esta factura se aplicó entre la
+  // lectura y acá, afecta 0 filas y esta se rechaza con EDIT_CONFLICT sin haber
+  // tocado nada.
+  await claimInvoiceEdit(db, invoiceId, Number(detail.invoice.edit_version));
+
   // Aplica: borra, actualiza, inserta, métodos, inventario, auditoría.
   const editReason = `Ajuste edición factura #${detail.invoice.consecutive_number} — ${motivo.slice(0, 200)}`;
   try {
@@ -1772,6 +1836,12 @@ export async function editEmittedInvoiceItems(
       throw new BillingError("INSUFFICIENT_STOCK", "Stock insuficiente para el ajuste.", 409);
     }
   }
+
+  // CO-1: el candado se reclama ANTES de la primera escritura de la edición (y
+  // DESPUÉS de todos los rechazos por regla: un rechazo de negocio no consume el
+  // token). La edición libre SÍ reescribe la fila (totales) más adelante; el
+  // candado va primero para que la perdedora no alcance a escribir ni un ítem.
+  await claimInvoiceEdit(db, invoiceId, Number(detail.invoice.edit_version));
 
   // Aplica: ítems, métodos, snapshot de impuestos, totales, inventario, auditoría.
   const editReason = `Edición libre emitida factura #${detail.invoice.consecutive_number}${motivo ? ` — ${motivo.slice(0, 200)}` : ""}`;
