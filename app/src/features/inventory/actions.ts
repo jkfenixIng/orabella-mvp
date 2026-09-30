@@ -9,7 +9,7 @@ import {
   getProduct,
   listProducts,
   lowStockAlerts,
-  registerMovement,
+  registerManualMovement,
   requireInventoryAdmin,
   requireInventoryWriter,
   requireSession,
@@ -73,7 +73,18 @@ export async function upsertProductAction(input: unknown) {
   }
 }
 
-/** Misma lógica que POST /api/v1/inventory/movements (IN: admin/caja; OUT/ADJUST: solo admin). */
+/**
+ * Misma lógica que POST /api/v1/inventory/movements (IN: admin/caja; OUT/ADJUST: solo admin).
+ *
+ * CL-6: llama a `registerManualMovement`, la frontera del camino MANUAL, que
+ * exige `idempotency_key` (uuid que la pantalla acuña al empezar el intento y
+ * reutiliza en sus reintentos). Sin marca se rechaza con VALIDATION y CERO
+ * escrituras: un envío sin marca no se puede reconocer como repetición, así que
+ * aceptarlo reabriría el defecto (un segundo movimiento y el stock movido dos
+ * veces). Con la marca repetida devuelve el movimiento ya registrado, no otro.
+ * La acción NO llama a `registerMovement` directo: ese es el punto de la
+ * frontera.
+ */
 export async function registerMovementAction(input: unknown) {
   try {
     const movementType =
@@ -83,7 +94,7 @@ export async function registerMovementAction(input: unknown) {
     const session = movementType === "IN" || movementType === undefined
       ? await requireInventoryWriter(await sessionToken())
       : await requireInventoryAdmin(await sessionToken());
-    const data = await registerMovement(input, {
+    const data = await registerManualMovement(input, {
       userId: session.userId,
       sedeId: session.sedeId,
     });

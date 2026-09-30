@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useTransition, type ChangeEvent, type FormEvent } from "react";
+import { useMemo, useRef, useState, useTransition, type ChangeEvent, type FormEvent } from "react";
 import { toast } from "sonner";
 import { Activity, PackageOpen, PackagePlus, Pencil, X } from "lucide-react";
 import {
@@ -65,6 +65,20 @@ function emptyMovementForm() {
   return { product_id: "", type: "IN", qty: "", reason: "" };
 }
 
+/**
+ * CL-6: marca nueva para un intento de movimiento manual.
+ * `crypto.randomUUID()` está en el navegador (contexto seguro) y en el runtime
+ * de Node; no hace falta ninguna dependencia nueva.
+ *
+ * El uuid viaja en el cuerpo como `idempotency_key`. El servidor lo guarda con
+ * el movimiento y, si vuelve un envío con la MISMA marca para el MISMO producto,
+ * devuelve el movimiento que ya existe en vez de escribir un segundo y mover el
+ * stock dos veces.
+ */
+function newMovementKey(): string {
+  return crypto.randomUUID();
+}
+
 interface InventoryClientProps {
   sedeId: string;
   initialProducts: ProductRow[];
@@ -89,6 +103,14 @@ export function InventoryClient(props: InventoryClientProps) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState(emptyProductForm());
   const [movement, setMovement] = useState(emptyMovementForm());
+  /**
+   * CL-6: la marca del intento de movimiento en curso. Se acuña al empezar el
+   * intento (la primera vez que se envía) y se CONSERVA si el intento falla: el
+   * reintento —volver a enviar el mismo diálogo— tiene que llevar la misma para
+   * que el servidor reconozca la repetición. Se suelta al ÉXITO y al CANCELAR,
+   * porque el siguiente envío es OTRO intento y merece otra marca.
+   */
+  const movementKeyRef = useRef<string | null>(null);
   const [movementProductQuery, setMovementProductQuery] = useState("");
   const movementProductOptions = useMemo(() => {
     const needle = movementProductQuery.trim().toLowerCase();
@@ -161,11 +183,17 @@ export function InventoryClient(props: InventoryClientProps) {
     setMovement(emptyMovementForm());
     setMovementProductQuery("");
     setError(null);
+    // Intento NUEVO: marca nueva (si no, el envío devolvería el movimiento de
+    // un intento anterior).
+    movementKeyRef.current = null;
     setMovementDialogOpen(true);
   }
 
   function cancelMovement() {
     setMovement(emptyMovementForm());
+    // CL-6: se abandona el intento, así que la marca se suelta: el próximo
+    // movimiento es otro intento.
+    movementKeyRef.current = null;
     setMovementDialogOpen(false);
   }
 
@@ -203,18 +231,28 @@ export function InventoryClient(props: InventoryClientProps) {
     setBusy(true);
     setError(null);
     const qty = toNumber(movement.qty);
+    // CL-6: la marca del INTENTO. Se acuña al empezar y se conserva si el
+    // intento falla: el reintento (enviar otra vez, sobre el mismo diálogo)
+    // tiene que llevar la misma para que el servidor reconozca la repetición.
+    const movementKey = movementKeyRef.current ?? newMovementKey();
+    movementKeyRef.current = movementKey;
     const result: ActionResult<{ movement: MovementRow; stock_qty: number }> =
       await registerMovementAction({
         product_id: movement.product_id || undefined,
         type: movement.type,
         qty: qty ?? 0,
         reason: movement.reason,
+        idempotency_key: movementKey,
       });
     setBusy(false);
     if (!result.success) {
+      // El intento NO terminó: se conserva la marca para el reintento.
       setError(result.message);
       return;
     }
+    // El intento terminó bien: el próximo movimiento es OTRO intento y merece
+    // otra marca (si no, devolvería este mismo movimiento).
+    movementKeyRef.current = null;
     // EVENTO: el movimiento acaba de registrarse; efímero, no estado.
     toast.success(`Movimiento registrado. Stock actual: ${result.data.stock_qty}.`);
     setMovement(emptyMovementForm());
