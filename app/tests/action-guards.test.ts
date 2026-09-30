@@ -1,6 +1,29 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
-import { describe, expect, it } from "vitest";
+import type { NextRequest } from "next/server";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { GET as getPayrollPeriods, POST as postPayrollPeriod } from "@/app/api/v1/payroll-periods/route";
+import {
+  DELETE as deletePayrollPeriod,
+  GET as getPayrollPeriod,
+} from "@/app/api/v1/payroll-periods/[id]/route";
+import { POST as calculatePayrollPeriod } from "@/app/api/v1/payroll-periods/[id]/calculate/route";
+import { POST as closePayrollPeriod } from "@/app/api/v1/payroll-periods/[id]/close/route";
+import { POST as postPayrollPayments } from "@/app/api/v1/payroll-items/[id]/payments/route";
+import { POST as postVoucher } from "@/app/api/v1/vouchers/route";
+import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
+import type { SessionUser } from "@/src/features/auth/service";
+import * as adminService from "@/src/features/admin/service";
+import {
+  getPeriodDetailAction,
+  getVoucherSettingsAction,
+  listPayrollExtrasAction,
+  listPeriodsAction,
+  payPayrollExtraAction,
+  payPayrollItemAction,
+  requestVoucherAction,
+} from "@/src/features/payroll/actions";
+import * as payrollService from "@/src/features/payroll/service";
 
 /* --------------------------------------------------------------------------
    Invariante estructural: toda server action exportada valida autorización.
@@ -621,6 +644,685 @@ describe("guardas de autorización en server actions", () => {
 });
 
 /* --------------------------------------------------------------------------
+   Roles exigidos por superficie: la nómina es del admin (y del empleado en lo
+   suyo); los vales siguen siendo de la caja.
+
+   Por qué existe: el bloque de arriba exige que HAYA una guarda, no que sea la
+   guarda CORRECTA. Cambiar `requirePayrollAdmin` por `requirePayrollPayer`
+   (que admite caja) dejaba todo en verde y abría la nómina a la caja — que es
+   exactamente el defecto que este bloque cierra. Acá se lee el ROL que admite
+   cada guarda (el segundo argumento de `requireSedeRole(session.roles, X)` en
+   `src/features/payroll/service.ts`, resolviendo las constantes
+   `X: RoleCode[] = [...]`) y se exige una tabla de roles por superficie, con
+   las rutas de `app/api/v1` incluidas.
+
+   Reglas derivadas (valen para cualquier superficie futura, no solo para las
+   filas de la tabla):
+   - Superficie de NÓMINA (`kind: "payroll"`): admite admin y NUNCA caja.
+   - Superficie de VALES con atención en mostrador (`cajaDebeEntrar: true`):
+     sigue admitiendo caja. Es el control anti-sobreguardia: "todo solo admin"
+     rompería los vales, que son un flujo de caja por diseño (la caja abre el
+     vale con turno abierto).
+   -------------------------------------------------------------------------- */
+
+const PAYROLL_SERVICE_FILE = "src/features/payroll/service.ts";
+const PAYROLL_ACTIONS_FILE = "src/features/payroll/actions.ts";
+
+/**
+ * Guardas que NO viven en `payroll/service.ts`, con los roles que admiten.
+ * `requireSession` (admin/service) es "cualquier rol autenticado de su sede".
+ */
+const EXTERNAL_GUARD_ROLES: Record<string, string[]> = {
+  requireSession: ["admin", "caja", "empleado"],
+  requireAdminSession: ["admin"],
+};
+
+interface SurfaceSpec {
+  /** Ruta relativa al root de la app, con separadores POSIX. */
+  file: string;
+  /** Nombre exportado: la acción o el handler HTTP (GET/POST/DELETE). */
+  name: string;
+  /** Qué datos toca: nómina (plata del personal) o vales. */
+  kind: "payroll" | "voucher";
+  /** Roles que debe admitir, en el orden en que se declaran. */
+  roles: string[];
+  /** Superficie de vales por la que la caja DEBE seguir entrando. */
+  cajaDebeEntrar?: boolean;
+  /** Por qué esa lista de roles (la decisión, no la observación). */
+  why: string;
+}
+
+/**
+ * Tabla de autorización del módulo de nómina/vales. Cada fila es una entrada
+ * alcanzable: una server action (`"use server"` convierte todo export en un
+ * endpoint POST) o un handler de `app/api/v1`. El test exige que el fuente real
+ * coincida con esta tabla.
+ */
+const SURFACES: readonly SurfaceSpec[] = [
+  // ---- acciones de nómina: solo admin (pagar un ítem incluido) ----
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "openPayrollPeriodAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "abre el periodo: generar la nómina es del admin.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "calculatePayrollAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "calcula la nómina: generar la nómina es del admin.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "payPayrollItemAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "paga un ítem de nómina: es parte de liquidarla, y la caja no tiene acceso al módulo.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "payPayrollExtraAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "registra un pago extraordinario (despido/renuncia/emergencia) con motivo: es plata de nómina y la caja no entra al módulo.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "listPayrollExtrasAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "lee el registro de pagos extraordinarios: es lectura de nómina completa y la caja no entra.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "closePayrollPeriodAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "cierra el periodo (lo vuelve inmutable): revisar la nómina es del admin.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "deletePayrollPeriodAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "borra el borrador y devuelve los vales descontados: es del admin.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "listPeriodsAction",
+    kind: "payroll",
+    roles: ["admin", "empleado"],
+    why: "el empleado necesita sus periodos para ver SU recibo (la página /payroll es admin+empleado); la caja no entra.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "getPeriodDetailAction",
+    kind: "payroll",
+    roles: ["admin", "empleado"],
+    why: "mismo caso, con alcance por fila: el admin ve todo, el empleado solo sus ítems; la caja no entra.",
+  },
+  // ---- rutas de nómina: solo admin ----
+  {
+    file: "app/api/v1/payroll-periods/route.ts",
+    name: "GET",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "lista los periodos de la sede: es lectura de nómina completa.",
+  },
+  {
+    file: "app/api/v1/payroll-periods/route.ts",
+    name: "POST",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "abre un periodo.",
+  },
+  {
+    file: "app/api/v1/payroll-periods/[id]/route.ts",
+    name: "GET",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "detalle del periodo SIN alcance por fila: si lo leyera otro rol, vería la nómina de toda la planta.",
+  },
+  {
+    file: "app/api/v1/payroll-periods/[id]/route.ts",
+    name: "DELETE",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "borra un borrador.",
+  },
+  {
+    file: "app/api/v1/payroll-periods/[id]/calculate/route.ts",
+    name: "POST",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "calcula la nómina.",
+  },
+  {
+    file: "app/api/v1/payroll-periods/[id]/close/route.ts",
+    name: "POST",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "cierra la nómina.",
+  },
+  {
+    file: "app/api/v1/payroll-items/[id]/payments/route.ts",
+    name: "POST",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "paga un ítem de nómina.",
+  },
+  // ---- vales: el módulo sigue siendo de la caja + el admin ----
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "requestVoucherAction",
+    kind: "voucher",
+    roles: ["admin", "caja"],
+    cajaDebeEntrar: true,
+    why: "la caja abre el vale al empleado con su turno abierto: es un flujo de caja por diseño.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "getVoucherSettingsAction",
+    kind: "voucher",
+    roles: ["admin", "caja", "empleado"],
+    cajaDebeEntrar: true,
+    why: "topes vigentes del vale: es lectura del flujo de vales (cualquier rol autenticado de su sede).",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "listVouchersAction",
+    kind: "voucher",
+    roles: ["admin", "caja", "empleado"],
+    cajaDebeEntrar: true,
+    why: "el admin y la caja ven todos los vales de la sede; el empleado solo los suyos (alcance por fila).",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "setVoucherLimitsAction",
+    kind: "voucher",
+    roles: ["admin"],
+    why: "configura topes: solo admin.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "approveVoucherAction",
+    kind: "voucher",
+    roles: ["admin"],
+    why: "autoriza un vale fuera de rango: solo admin.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "rejectVoucherAction",
+    kind: "voucher",
+    roles: ["admin"],
+    why: "rechaza un vale pendiente: solo admin.",
+  },
+  {
+    file: "app/api/v1/vouchers/route.ts",
+    name: "GET",
+    kind: "voucher",
+    roles: ["admin", "caja", "empleado"],
+    cajaDebeEntrar: true,
+    why: "lista de vales de la sede.",
+  },
+  {
+    file: "app/api/v1/vouchers/route.ts",
+    name: "POST",
+    kind: "voucher",
+    roles: ["admin", "caja"],
+    cajaDebeEntrar: true,
+    why: "la caja abre el vale (con turno abierto).",
+  },
+  {
+    file: "app/api/v1/vouchers/[id]/approve/route.ts",
+    name: "POST",
+    kind: "voucher",
+    roles: ["admin"],
+    why: "autoriza un vale pendiente.",
+  },
+  {
+    file: "app/api/v1/vouchers/[id]/reject/route.ts",
+    name: "POST",
+    kind: "voucher",
+    roles: ["admin"],
+    why: "rechaza un vale pendiente.",
+  },
+  {
+    file: "app/api/v1/voucher-settings/route.ts",
+    name: "GET",
+    kind: "voucher",
+    roles: ["admin", "caja", "empleado"],
+    cajaDebeEntrar: true,
+    why: "topes vigentes del vale.",
+  },
+  {
+    file: "app/api/v1/voucher-settings/route.ts",
+    name: "POST",
+    kind: "voucher",
+    roles: ["admin"],
+    why: "configura topes: solo admin.",
+  },
+];
+
+/** Lista de roles de un literal `["admin", "caja"]` (ya sin comentarios). */
+function parseRoleList(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((part) => part.trim().replace(/^["']|["']$/g, ""))
+    .filter((part) => part !== "");
+}
+
+/** Constantes `const X: RoleCode[] = [...]` del módulo de guardas. */
+function readRoleConstants(source: string): Map<string, string[]> {
+  const constants = new Map<string, string[]>();
+  const declaration = /^[\t ]*const[\t ]+([A-Za-z0-9_$]+)[\t ]*:[\t ]*RoleCode\[\][\t ]*=[\t ]*\[([^\]]*)\]/gm;
+
+  let match = declaration.exec(source);
+  while (match !== null) {
+    constants.set(match[1], parseRoleList(match[2]));
+    match = declaration.exec(source);
+  }
+
+  return constants;
+}
+
+/**
+ * Guarda -> roles admitidos. Se lee del cuerpo real de cada `export ... function
+ * requireX(...)`: el segundo argumento del gate de rol —`requireSedeRole(...)` o
+ * el helper del módulo `requirePayrollRoles(...)`—, resolviendo ese argumento
+ * contra las constantes del módulo (o un literal inline).
+ *
+ * Se limpian los comentarios pero NO los literales: los roles son strings.
+ */
+function readGuardRoles(source: string, file: string): Map<string, string[]> {
+  const constants = readRoleConstants(stripComments(source));
+  const guards = new Map<string, string[]>();
+  const gate = /(?:requireSedeRole|requirePayrollRoles)\(\s*[A-Za-z0-9_$.]*roles\s*,\s*([^)]*?)\s*\)/;
+
+  for (const guard of scanModuleSource(source, file)) {
+    const call = gate.exec(stripComments(guard.rawBody));
+    if (call === null) continue;
+
+    const argument = call[1].trim();
+    const roles = argument.startsWith("[")
+      ? parseRoleList(argument.replace(/^\[/, "").replace(/\]$/, ""))
+      : constants.get(argument);
+    if (roles !== undefined) guards.set(guard.name, roles);
+  }
+
+  return guards;
+}
+
+/** Superficie exportada -> primera guarda que invoca su cuerpo. */
+function readSurfaceGuards(source: string, file: string): Map<string, string> {
+  const guards = new Map<string, string>();
+
+  for (const surface of scanModuleSource(source, file)) {
+    const call = /\b(require[A-Z]\w*)\s*\(/.exec(surface.body);
+    if (call !== null) guards.set(surface.name, call[1]);
+  }
+
+  return guards;
+}
+
+/**
+ * Ofensa derivada de la REGLA (no de la tabla) sobre los roles resueltos: es la
+ * que sobrevive a que alguien reordene la tabla de expectativas.
+ */
+function ruleOffense(spec: SurfaceSpec, roles: string[]): string | null {
+  if (spec.kind === "payroll") {
+    if (roles.includes("caja")) {
+      return (
+        `la nómina no admite caja: admite [${roles.join(", ")}]. ` +
+        "La caja abre vales, no nómina."
+      );
+    }
+    if (!roles.includes("admin")) {
+      return `una superficie de nómina debe admitir admin: admite [${roles.join(", ")}].`;
+    }
+    return null;
+  }
+
+  if (spec.cajaDebeEntrar === true && !roles.includes("caja")) {
+    return (
+      `es un flujo de caja: debe seguir admitiendo caja, admite [${roles.join(", ")}]. ` +
+      "Cerrar los vales a la caja rompe el mostrador."
+    );
+  }
+
+  return null;
+}
+
+/**
+ * Ofensas de ROL de las superficies esperadas de UN archivo. Pura respecto del
+ * filesystem: los self-tests le pasan fuentes sintéticas.
+ */
+function surfaceRoleOffenses(args: {
+  file: string;
+  source: string;
+  expected: readonly SurfaceSpec[];
+  guardRoles: Map<string, string[]>;
+  externalGuards?: Record<string, string[]>;
+}): string[] {
+  const guards = readSurfaceGuards(args.source, args.file);
+  const external = args.externalGuards ?? EXTERNAL_GUARD_ROLES;
+  const offenses: string[] = [];
+
+  for (const spec of args.expected) {
+    if (spec.file !== args.file) continue;
+
+    const guard = guards.get(spec.name);
+    if (guard === undefined) {
+      offenses.push(
+        `${args.file}: ${spec.name} no se encontró entre las exportaciones: ` +
+          "la tabla de roles quedaría sin cubrirlo (¿se renombró o se borró?).",
+      );
+      continue;
+    }
+
+    const roles = args.guardRoles.get(guard) ?? external[guard];
+    if (roles === undefined) {
+      offenses.push(
+        `${args.file}: ${spec.name} usa '${guard}' y no se pudieron leer los roles que admite: ` +
+          "declárelos como `const X: RoleCode[] = [...]` y pásalos a `requireSedeRole(session.roles, X)`.",
+      );
+      continue;
+    }
+
+    const rule = ruleOffense(spec, roles);
+    if (rule !== null) {
+      offenses.push(`${args.file}: ${spec.name} → ${rule} (${spec.why})`);
+    } else if (roles.join(",") !== spec.roles.join(",")) {
+      offenses.push(
+        `${args.file}: ${spec.name} exige roles [${roles.join(", ")}]; la tabla espera ` +
+          `[${spec.roles.join(", ")}] (${spec.why}).`,
+      );
+    }
+  }
+
+  return offenses;
+}
+
+/** Todos los `route.ts` bajo un directorio, con separadores POSIX. */
+function readRouteFiles(directory: string): string[] {
+  const found: string[] = [];
+
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const absolute = join(directory, entry.name);
+    if (entry.isDirectory()) found.push(...readRouteFiles(absolute));
+    else if (entry.isFile() && entry.name === "route.ts") found.push(toRepoPath(absolute));
+  }
+
+  return found.sort();
+}
+
+/** ¿La ruta pertenece al módulo de nómina o al de vales? */
+function isPayrollOrVoucherRoute(file: string): boolean {
+  return file
+    .split("/")
+    .some((segment) => segment.startsWith("payroll") || segment.startsWith("voucher"));
+}
+
+const ROUTE_FILES = readRouteFiles(join(APP_ROOT, "app", "api", "v1"));
+const SURFACE_FILE_LIST: readonly string[] = [
+  PAYROLL_ACTIONS_FILE,
+  ...ROUTE_FILES.filter(isPayrollOrVoucherRoute),
+];
+
+const PAYROLL_SERVICE_SOURCE = readFileSync(join(APP_ROOT, PAYROLL_SERVICE_FILE), "utf8");
+const GUARD_ROLES = readGuardRoles(PAYROLL_SERVICE_SOURCE, PAYROLL_SERVICE_FILE);
+
+/**
+ * Matriz de guardas probadas por comportamiento (ver el bloque de abajo): qué
+ * rol admite cada una y qué rol rechaza. Es también el registro de las guardas
+ * que las superficies pueden usar.
+ */
+const GUARD_MATRIX: ReadonlyArray<{
+  guard: string;
+  module: "payroll" | "admin";
+  admite: string[];
+  rechaza: string[];
+}> = [
+  {
+    guard: "requirePayrollAdmin",
+    module: "payroll",
+    admite: ["admin"],
+    rechaza: ["caja", "empleado"],
+  },
+  {
+    guard: "requirePayrollViewer",
+    module: "payroll",
+    admite: ["admin", "empleado"],
+    rechaza: ["caja"],
+  },
+  {
+    guard: "requirePayrollPayer",
+    module: "payroll",
+    admite: ["admin", "caja"],
+    rechaza: ["empleado"],
+  },
+  {
+    // Vales: cualquier rol autenticado de su sede (lista y topes del vale).
+    guard: "requireSession",
+    module: "admin",
+    admite: ["admin", "caja", "empleado"],
+    rechaza: [],
+  },
+];
+
+/** Source de un archivo de superficie, leído del repo real. */
+function surfaceSource(file: string): string {
+  return readFileSync(join(APP_ROOT, file), "utf8");
+}
+
+describe("roles exigidos por cada superficie de nómina y de vales", () => {
+  it("la tabla cubre todas las acciones de payroll/actions.ts y todas las rutas de nómina y vales", () => {
+    const declared = new Set(
+      scanModuleSource(surfaceSource(PAYROLL_ACTIONS_FILE), PAYROLL_ACTIONS_FILE).map(
+        (surface) => surface.name,
+      ),
+    );
+    const covered = new Set(
+      SURFACES.filter((spec) => spec.file === PAYROLL_ACTIONS_FILE).map((spec) => spec.name),
+    );
+
+    const unlisted = [...declared].filter((name) => !covered.has(name));
+    expect(
+      unlisted,
+      `Acciones sin fila en la tabla de roles (una superficie sin rol declarado es una ` +
+        `superficie sin invariante): ${unlisted.join(", ")}`,
+    ).toEqual([]);
+
+    const dead = [...covered].filter((name) => !declared.has(name));
+    expect(dead, `Filas de la tabla que ya no existen en el fuente: ${dead.join(", ")}`).toEqual([]);
+
+    const routes = ROUTE_FILES.filter(isPayrollOrVoucherRoute);
+    const declaredRoutes = new Set(SURFACES.map((spec) => spec.file));
+    const unrouted = routes.filter((file) => !declaredRoutes.has(file));
+    expect(
+      unrouted,
+      `Rutas de nómina/vales sin fila en la tabla de roles: ${unrouted.join(", ")}`,
+    ).toEqual([]);
+  });
+
+  it("los roles de cada guarda se leen del fuente real (constante o literal inline)", () => {
+    expect(GUARD_ROLES.get("requirePayrollAdmin")).toEqual(["admin"]);
+
+    const unresolved = SURFACE_FILE_LIST.flatMap((file) =>
+      surfaceRoleOffenses({
+        file,
+        source: surfaceSource(file),
+        expected: SURFACES,
+        guardRoles: GUARD_ROLES,
+      }),
+    );
+
+    expect(
+      unresolved,
+      "Superficies cuyo ROL no coincide con la tabla de autorización:\n" +
+        unresolved.join("\n"),
+    ).toEqual([]);
+  });
+
+  it("la tabla no tiene filas duplicadas ni fuera del módulo", () => {
+    const ids = SURFACES.map((spec) => `${spec.file}: ${spec.name}`);
+    expect(ids.length, "la tabla de roles quedó vacía").toBeGreaterThan(0);
+    expect(new Set(ids).size, `Filas duplicadas en la tabla de roles: ${ids.join(", ")}`).toBe(
+      ids.length,
+    );
+  });
+
+  it("toda guarda usada por una superficie está declarada en la matriz de roles probada", () => {
+    const used = new Set<string>();
+    for (const file of SURFACE_FILE_LIST) {
+      for (const guard of readSurfaceGuards(surfaceSource(file), file).values()) used.add(guard);
+    }
+
+    const missing = [...used].filter((guard) => !GUARD_MATRIX.some((row) => row.guard === guard));
+    expect(
+      missing,
+      `Guardas usadas sin fila en GUARD_MATRIX (roles sin probar): ${missing.join(", ")}`,
+    ).toEqual([]);
+  });
+});
+
+/* ---- Self-tests del invariante de ROLES (fuentes sintéticas) -------------- */
+
+/** Acciones sintéticas con la ESTRUCTURA del estado previo al arreglo. */
+const FIXTURE_ROLE_PRE_FIX = `
+import {
+  payPayrollItem,
+  requirePayrollPayer,
+} from "./service";
+
+export async function payPayrollItemAction(id: string, input: unknown) {
+  const session = await requirePayrollPayer(await sessionToken());
+  return payPayrollItem(session.sedeId, id, input, session);
+}
+`;
+
+/** El mismo cuerpo, con la guarda correcta (nómina). */
+const FIXTURE_ROLE_FIXED = FIXTURE_ROLE_PRE_FIX.replace(
+  /requirePayrollPayer/g,
+  "requirePayrollAdmin",
+);
+
+/**
+ * Guardas sintéticas: una constante, un literal inline y roles solo en texto.
+ * Se cubren las DOS formas de gate: `requireSedeRole(...)` directo y el helper
+ * del módulo (`requirePayrollRoles`), que es como lo hacen las guardas reales.
+ */
+const FIXTURE_GUARD_SOURCE = `
+const ADMIN_ROLES: RoleCode[] = ["admin"];
+const PAYER_ROLES: RoleCode[] = ["admin", "caja"];
+
+/** Los roles del vale (admin y caja) se documentan acá; no se leen de acá. */
+export async function requirePayrollAdmin(token: string | null) {
+  const session = await payrollSession(token);
+  requirePayrollRoles(session.roles, ADMIN_ROLES);
+  return session;
+}
+
+export async function requirePayrollPayer(token: string | null) {
+  const session = await payrollSession(token);
+  requirePayrollRoles(session.roles, PAYER_ROLES);
+  return session;
+}
+
+export async function requireOnlyEmpleado(
+  // roles permitidos: ["empleado"] en un comentario, que no cuenta
+  token: string | null,
+) {
+  const session = await getSessionUser(token);
+  requireSedeRole(session.roles, ["empleado"]);
+  return session;
+}
+`;
+
+const FIXTURE_SURFACE_SPEC: SurfaceSpec = {
+  file: "synthetic/actions.ts",
+  name: "payPayrollItemAction",
+  kind: "payroll",
+  roles: ["admin"],
+  why: "pagar nómina es del admin.",
+};
+
+describe("self-tests del invariante de ROLES (fuentes sintéticas)", () => {
+  it("control negativo: la guarda de vales en una superficie de nómina se reporta por ROL", () => {
+    const offenses = surfaceRoleOffenses({
+      file: "synthetic/actions.ts",
+      source: FIXTURE_ROLE_PRE_FIX,
+      expected: [FIXTURE_SURFACE_SPEC],
+      guardRoles: new Map([["requirePayrollPayer", ["admin", "caja"]]]),
+    });
+
+    expect(offenses).toHaveLength(1);
+    expect(offenses[0]).toContain("payPayrollItemAction");
+    expect(offenses[0]).toContain("la nómina no admite caja");
+    expect(offenses[0]).toContain("[admin, caja]");
+    // El mismo cuerpo con la guarda correcta pasa limpio: la ofensa es de ROL,
+    // no de presencia (la guarda siempre estuvo ahí).
+    expect(
+      surfaceRoleOffenses({
+        file: "synthetic/actions.ts",
+        source: FIXTURE_ROLE_FIXED,
+        expected: [FIXTURE_SURFACE_SPEC],
+        guardRoles: new Map([["requirePayrollAdmin", ["admin"]]]),
+      }),
+    ).toEqual([]);
+  });
+
+  it("control negativo: admitir admin pero perder al empleado también se reporta", () => {
+    const offenses = surfaceRoleOffenses({
+      file: "synthetic/actions.ts",
+      source: FIXTURE_ROLE_FIXED,
+      expected: [{ ...FIXTURE_SURFACE_SPEC, roles: ["admin", "empleado"] }],
+      guardRoles: new Map([["requirePayrollAdmin", ["admin"]]]),
+    });
+
+    expect(offenses).toHaveLength(1);
+    expect(offenses[0]).toContain("exige roles [admin]; la tabla espera [admin, empleado]");
+  });
+
+  it("control negativo: una guarda desconocida no deja la superficie en el aire", () => {
+    const offenses = surfaceRoleOffenses({
+      file: "synthetic/actions.ts",
+      source: FIXTURE_ROLE_PRE_FIX,
+      expected: [FIXTURE_SURFACE_SPEC],
+      guardRoles: new Map(),
+    });
+
+    expect(offenses).toHaveLength(1);
+    expect(offenses[0]).toContain("requirePayrollPayer");
+    expect(offenses[0]).toContain("no se pudieron leer los roles");
+  });
+
+  it("los roles se leen de la constante, del literal inline y no del comentario", () => {
+    const guards = readGuardRoles(FIXTURE_GUARD_SOURCE, "synthetic/service.ts");
+
+    expect(guards.get("requirePayrollAdmin")).toEqual(["admin"]);
+    expect(guards.get("requirePayrollPayer")).toEqual(["admin", "caja"]);
+    expect(guards.get("requireOnlyEmpleado")).toEqual(["empleado"]);
+    // 3 guardas, 3 entradas: el comentario ("roles permitidos") no aporta ninguna.
+    expect([...guards.keys()]).toHaveLength(3);
+  });
+
+  it("control de cobertura: una superficie fuera de la tabla se reporta", () => {
+    const offenses = surfaceRoleOffenses({
+      file: "synthetic/actions.ts",
+      source: FIXTURE_ROLE_PRE_FIX,
+      expected: [{ ...FIXTURE_SURFACE_SPEC, name: "otraAccionDeNomina" }],
+      guardRoles: new Map([["requirePayrollPayer", ["admin", "caja"]]]),
+    });
+
+    expect(offenses).toHaveLength(1);
+    expect(offenses[0]).toContain("no se encontró entre las exportaciones");
+  });
+});
+
+/* --------------------------------------------------------------------------
    Self-tests: los helpers, contra fuentes sintéticas armadas como strings.
    No crean archivos ni tocan `src/`; son la evidencia de que la invariante de
    orden, la limpieza de comentarios/literales y el chequeo de forma de export
@@ -798,5 +1500,405 @@ export async function doThing() {
     expect(analysis.imports.direct).not.toContain("readFile");
     expect(analysis.order).toHaveLength(1);
     expect(analysis.order[0]).toContain("first service call 'mutate'");
+  });
+});
+
+/* --------------------------------------------------------------------------
+   Comportamiento: la caja no entra a la nómina y sí entra a los vales.
+
+   El bloque de arriba es estático (lee el fuente). Este ejecuta la guarda real
+   con una sesión simulada: es la prueba de que el ROL que el fuente declara es
+   el que la guarda aplica. La sesión se mockea (`getSessionUser`) y el cliente
+   de datos se reemplaza por un doble mínimo; nada toca Supabase.
+   -------------------------------------------------------------------------- */
+
+const SEDE_PRUEBA = "11111111-1111-4111-8111-111111111111";
+const PERIOD_ID = "22222222-2222-4222-8222-222222222222";
+const ITEM_ID = "33333333-3333-4333-8333-333333333333";
+/** PA-2a: la planta de la prueba necesita un id con forma de uuid. */
+const EMPLEADO_ID = "44444444-4444-4444-8444-444444444444";
+
+const sessionStub = vi.hoisted(() => ({ current: null as null | SessionUser }));
+
+const dbStub = vi.hoisted(() => ({ rows: {} as Record<string, Array<Record<string, unknown>>> }));
+
+vi.mock("next/headers", () => ({
+  cookies: async () => ({ get: () => ({ value: "token-de-prueba" }) }),
+}));
+
+vi.mock("next/cache", () => ({
+  unstable_cache: (fn: unknown) => fn,
+  revalidateTag: () => {},
+}));
+
+vi.mock("@/src/features/auth/service", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/src/features/auth/service")>();
+  return { ...actual, getSessionUser: async () => sessionStub.current };
+});
+
+/**
+ * Doble mínimo de PostgREST: las consultas encadenan y resuelven las filas
+ * sembradas por tabla. Alcanza para las lecturas que estas pruebas ejercitan.
+ * La mayoría de las escrituras no se ejercitan (la guarda rechaza antes de
+ * llegar ahí); `insert` existe sólo para el control positivo del pago
+ * extraordinario (PA-2a), que sí necesita que la escritura devuelva una fila.
+ */
+vi.mock("@/src/shared/lib/supabase/server", () => ({
+  createAdminClient: () => {
+    const from = (table: string) => {
+      const rows = dbStub.rows[table] ?? [];
+      const result = { data: rows, error: null };
+      const query: Record<string, unknown> = {
+        select: () => query,
+        insert: (payload?: unknown) => {
+          const values = (Array.isArray(payload) ? payload : [payload]) as Array<
+            Record<string, unknown>
+          >;
+          const persisted = values.map((row, index) => ({
+            id: `fila-insertada-${index + 1}`,
+            created_at: "2026-01-31T23:59:59.000Z",
+            ...row,
+          }));
+          dbStub.rows[table] = [...rows, ...persisted];
+          return query;
+        },
+        eq: () => query,
+        neq: () => query,
+        in: () => query,
+        is: () => query,
+        match: () => query,
+        order: () => query,
+        range: () => query,
+        limit: () => query,
+        maybeSingle: () => Promise.resolve({ data: rows[0] ?? null, error: null }),
+        single: () => Promise.resolve({ data: rows[0] ?? null, error: null }),
+        then: (
+          onFulfilled: (value: unknown) => unknown,
+          onRejected?: (reason: unknown) => unknown,
+        ) => Promise.resolve(result).then(onFulfilled, onRejected),
+      };
+      return query;
+    };
+
+    return { from };
+  },
+}));
+
+/** Sesión simulada: el rol es lo único que las guardas miran. */
+function asSession(roles: string[]): void {
+  sessionStub.current = {
+    user: { id: "u-prueba", sede_id: SEDE_PRUEBA },
+    roles,
+  } as unknown as SessionUser;
+}
+
+/** Request mínima: las rutas solo leen la cookie de sesión y el cuerpo. */
+function fakeRequest(): NextRequest {
+  return {
+    cookies: {
+      get: (name: string) =>
+        name === SESSION_COOKIE_NAME ? { value: "token-de-prueba" } : undefined,
+    },
+    nextUrl: { searchParams: new URLSearchParams() },
+    json: async () => ({}),
+  } as unknown as NextRequest;
+}
+
+function routeParams(id: string): { params: Promise<{ id: string }> } {
+  return { params: Promise.resolve({ id }) };
+}
+
+const PERIODO_PRUEBA = {
+  id: PERIOD_ID,
+  sede_id: SEDE_PRUEBA,
+  start_date: "2026-01-01",
+  end_date: "2026-01-31",
+  status: "borrador",
+  created_by: "u-prueba",
+  closed_at: null,
+  created_at: "2026-01-01T00:00:00.000Z",
+};
+
+const ITEM_PRUEBA = {
+  id: ITEM_ID,
+  period_id: PERIOD_ID,
+  employee_id: "emp-1",
+  base_fixed: 0,
+  commissions: 100000,
+  bonuses: 0,
+  deductions_vales: 0,
+  other_discounts: 0,
+  net_pay: 100000,
+  detail_json: [],
+  created_at: "2026-01-15T10:00:00.000Z",
+};
+
+const METODO_PRUEBA = {
+  id: "pm-1",
+  sede_id: SEDE_PRUEBA,
+  code: "efectivo",
+  name: "Efectivo",
+  is_active: true,
+  kind: "efectivo",
+};
+
+/** Cada ruta de nómina, con su llamada: es la superficie HTTP completa. */
+const PAYROLL_ROUTE_CALLS: ReadonlyArray<{ label: string; call: () => Promise<Response> }> = [
+  { label: "GET /api/v1/payroll-periods", call: () => getPayrollPeriods(fakeRequest()) },
+  { label: "POST /api/v1/payroll-periods", call: () => postPayrollPeriod(fakeRequest()) },
+  {
+    label: "GET /api/v1/payroll-periods/:id",
+    call: () => getPayrollPeriod(fakeRequest(), routeParams(PERIOD_ID)),
+  },
+  {
+    label: "DELETE /api/v1/payroll-periods/:id",
+    call: () => deletePayrollPeriod(fakeRequest(), routeParams(PERIOD_ID)),
+  },
+  {
+    label: "POST /api/v1/payroll-periods/:id/calculate",
+    call: () => calculatePayrollPeriod(fakeRequest(), routeParams(PERIOD_ID)),
+  },
+  {
+    label: "POST /api/v1/payroll-periods/:id/close",
+    call: () => closePayrollPeriod(fakeRequest(), routeParams(PERIOD_ID)),
+  },
+  {
+    label: "POST /api/v1/payroll-items/:id/payments",
+    call: () => postPayrollPayments(fakeRequest(), routeParams(ITEM_ID)),
+  },
+];
+
+/** Deja el doble con la nómina de una sede (sin tocar Supabase). */
+function seedNomina(): void {
+  dbStub.rows.payroll_periods = [PERIODO_PRUEBA];
+  dbStub.rows.payroll_items = [ITEM_PRUEBA];
+  dbStub.rows.payment_methods = [METODO_PRUEBA];
+}
+
+describe("nómina solo admin (y el propio empleado): la caja no entra; los vales sí", () => {
+  beforeEach(() => {
+    dbStub.rows = {};
+    sessionStub.current = null;
+  });
+
+  it("la caja NO lee la lista de periodos (listPeriodsAction)", async () => {
+    seedNomina();
+    asSession(["caja"]);
+
+    const result = await listPeriodsAction();
+
+    expect(result).toMatchObject({ success: false, code: "FORBIDDEN" });
+  });
+
+  it("la caja NO lee el detalle del periodo (getPeriodDetailAction)", async () => {
+    seedNomina();
+    asSession(["caja"]);
+
+    const result = await getPeriodDetailAction(PERIOD_ID);
+
+    expect(result).toMatchObject({ success: false, code: "FORBIDDEN" });
+  });
+
+  it("la caja NO paga un ítem de nómina (payPayrollItemAction)", async () => {
+    seedNomina();
+    asSession(["caja"]);
+
+    const result = await payPayrollItemAction(ITEM_ID, {
+      portions: [{ method_code: "efectivo", amount: 1000 }],
+    });
+
+    expect(result).toMatchObject({ success: false, code: "FORBIDDEN" });
+  });
+
+  it("la caja NO registra un pago extraordinario (payPayrollExtraAction)", async () => {
+    seedNomina();
+    asSession(["caja"]);
+
+    const result = await payPayrollExtraAction({
+      employee_id: EMPLEADO_ID,
+      amount: 500000,
+      method_code: "efectivo",
+      reason: "Renuncia",
+      kind: "renuncia",
+    });
+
+    expect(result).toMatchObject({ success: false, code: "FORBIDDEN" });
+  });
+
+  it("la caja NO lista los pagos extraordinarios (listPayrollExtrasAction)", async () => {
+    seedNomina();
+    asSession(["caja"]);
+
+    const result = await listPayrollExtrasAction();
+
+    expect(result).toMatchObject({ success: false, code: "FORBIDDEN" });
+  });
+
+  it("control positivo: el admin registra y lista un pago extraordinario", async () => {
+    seedNomina();
+    const extra = {
+      id: "extra-1",
+      sede_id: SEDE_PRUEBA,
+      employee_id: EMPLEADO_ID,
+      amount: 500000,
+      method_id: METODO_PRUEBA.id,
+      method_code: "efectivo",
+      reference: null,
+      reason: "Renuncia",
+      kind: "renuncia",
+      days_from: null,
+      days_to: null,
+      paid_by: "u-prueba",
+      paid_at: "2026-01-20T10:00:00.000Z",
+      created_at: "2026-01-20T10:00:00.000Z",
+    };
+    dbStub.rows.payroll_extras = [extra];
+    dbStub.rows.employees = [
+      { id: EMPLEADO_ID, sede_id: SEDE_PRUEBA, user_id: null, full_name: "Empleada" },
+    ];
+    asSession(["admin"]);
+
+    const registered = await payPayrollExtraAction({
+      employee_id: EMPLEADO_ID,
+      amount: 500000,
+      method_code: "efectivo",
+      reason: "Renuncia",
+      kind: "renuncia",
+    });
+    expect(registered, JSON.stringify(registered)).toMatchObject({ success: true });
+
+    const listed = await listPayrollExtrasAction();
+    expect(listed.success).toBe(true);
+    if (!listed.success) return;
+    expect(listed.data.map((row) => row.id)).toContain("extra-1");
+  });
+
+  it("toda ruta de nómina rechaza a la caja con 403 FORBIDDEN", async () => {
+    for (const route of PAYROLL_ROUTE_CALLS) {
+      seedNomina();
+      asSession(["caja"]);
+
+      const response = await route.call();
+
+      expect(response.status, `${route.label}: la caja no puede entrar a nómina`).toBe(403);
+      await expect(response.json()).resolves.toMatchObject({
+        success: false,
+        code: "FORBIDDEN",
+      });
+    }
+  });
+
+  it("control positivo: el admin sí lee los periodos (action y ruta)", async () => {
+    seedNomina();
+    asSession(["admin"]);
+
+    const action = await listPeriodsAction();
+    expect(action.success).toBe(true);
+    if (!action.success) return;
+    expect(action.data.map((row) => row.id)).toEqual([PERIOD_ID]);
+
+    const response = await getPayrollPeriods(fakeRequest());
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      success: true,
+      data: [{ id: PERIOD_ID }],
+    });
+  });
+
+  it("control de sobreajuste: el empleado sigue viendo SU nómina", async () => {
+    seedNomina();
+    dbStub.rows.employees = [
+      { id: "emp-1", sede_id: SEDE_PRUEBA, user_id: "u-prueba", full_name: "Empleada" },
+    ];
+    asSession(["empleado"]);
+
+    const periods = await listPeriodsAction();
+    expect(periods.success).toBe(true);
+
+    const detail = await getPeriodDetailAction(PERIOD_ID);
+    expect(detail.success).toBe(true);
+    if (!detail.success) return;
+    // Solo lo suyo: el alcance por fila sigue aplicándose para el empleado.
+    expect(detail.data.items.map((row) => row.id)).toEqual([ITEM_ID]);
+  });
+
+  it("control anti-sobreguardia: la caja SÍ entra a vales", async () => {
+    dbStub.rows.voucher_requests = [];
+    asSession(["caja"]);
+
+    const vouchers = await requestVoucherAction({});
+    expect(
+      vouchers.success === false && vouchers.code === "FORBIDDEN",
+      "la caja abre vales con turno abierto: no puede quedar fuera de vales",
+    ).toBe(false);
+
+    const settings = await getVoucherSettingsAction();
+    expect(settings.success).toBe(true);
+
+    const response = await postVoucher(fakeRequest());
+    expect(
+      response.status,
+      "POST /api/v1/vouchers: la caja no puede quedar rechazada por autorización",
+    ).not.toBe(403);
+  });
+
+  describe("matriz de guardas", () => {
+    const modules: Record<string, Record<string, unknown>> = {
+      payroll: payrollService as unknown as Record<string, unknown>,
+      admin: adminService as unknown as Record<string, unknown>,
+    };
+
+    function guardOf(row: (typeof GUARD_MATRIX)[number]): (token: string) => Promise<unknown> {
+      const fn = modules[row.module][row.guard];
+      expect(typeof fn, `${row.guard} no existe en el módulo ${row.module}`).toBe("function");
+      return fn as (token: string) => Promise<unknown>;
+    }
+
+    function outcomeOf(guard: (token: string) => Promise<unknown>): Promise<unknown> {
+      return guard("token-de-prueba").then(
+        () => null,
+        (error: unknown) => error,
+      );
+    }
+
+    it("sin sesión, toda guarda responde UNAUTHENTICATED (401)", async () => {
+      for (const row of GUARD_MATRIX) {
+        sessionStub.current = null;
+        const outcome = await outcomeOf(guardOf(row));
+        expect(outcome, `${row.guard} sin sesión`).toMatchObject({
+          code: "UNAUTHENTICATED",
+          status: 401,
+        });
+      }
+    });
+
+    it("cada guarda admite los roles que declara y rechaza los demás con FORBIDDEN (403)", async () => {
+      for (const row of GUARD_MATRIX) {
+        for (const role of row.admite) {
+          asSession([role]);
+          const outcome = await outcomeOf(guardOf(row));
+          expect(outcome, `${row.guard} debería admitir ${role}`).toBeNull();
+        }
+
+        for (const role of row.rechaza) {
+          asSession([role]);
+          const outcome = await outcomeOf(guardOf(row));
+          expect(outcome, `${row.guard} debería rechazar ${role}`).toMatchObject({
+            code: "FORBIDDEN",
+            status: 403,
+          });
+        }
+      }
+    });
+
+    it("los roles declarados en el fuente son los que la guarda aplica", () => {
+      for (const row of GUARD_MATRIX) {
+        const declared =
+          row.module === "payroll"
+            ? GUARD_ROLES.get(row.guard)
+            : EXTERNAL_GUARD_ROLES[row.guard];
+        expect(declared, `${row.guard}: roles no legibles en el fuente`).toEqual(row.admite);
+      }
+    });
   });
 });

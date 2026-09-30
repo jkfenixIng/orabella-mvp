@@ -6,6 +6,7 @@ import {
   assertPortionsMatchNet,
   buildEmployeeCommissionDetail,
   buildEmployeeDetail,
+  buildPayrollMonthToDate,
   calculatePayrollSchema,
   canDiscountVoucher,
   capPayrollDiscounts,
@@ -18,6 +19,9 @@ import {
   openPeriodSchema,
   overlapBlocksDeletion,
   payPayrollItemSchema,
+  payrollExtraSchema,
+  prorateFixedSalary,
+  rangesOverlap,
   requestVoucherSchema,
   rejectVoucherSchema,
   requiresVoucherApproval,
@@ -25,15 +29,17 @@ import {
   resolveVoucherInitialStatus,
   restoreVoucherStatus,
   roundMoney,
+  summarizePayrollItems,
   voucherApprovalCashOutViolation,
   voucherLimitsSchema,
   weekStartOf,
   type CalculatePayrollInput,
   type DetailLine,
   type OpenPeriodInput,
+  type PayrollExtraKind,
+  type PayrollMonthEmployeeRow,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
-import { getSessionUser } from "@/src/features/auth/service";
 import { commissionRuleKey, type RuleRate } from "@/src/features/commissions/schemas";
 import { cashOutUsedInShift, getOpenShiftWithOpener } from "@/src/features/cash/service";
 import { cashOutLimitViolation } from "@/src/features/cash/schemas";
@@ -51,6 +57,7 @@ import {
   getEmployee,
   listAllEmployees,
   listPaymentMethods,
+  requireSession,
 } from "@/src/features/admin/service";
 import { resolveVoucherAlert } from "@/src/features/alerts/service";
 import {
@@ -135,9 +142,22 @@ function validationMessage(error: { issues: Array<{ message: string }> }): strin
   return error.issues[0]?.message ?? "Datos inválidos.";
 }
 
-/** Escritura contable: solo admin (periodos, cálculo, cierre, vales, topes). */
+/**
+ * Administración de la nómina: solo admin. Quien genera (periodo, cálculo) y
+ * quien revisa (cierre, borrado, pago de ítems) la nómina es el administrador;
+ * la caja no tiene acceso al módulo.
+ */
 const ADMIN_ROLES: RoleCode[] = ["admin"];
-/** Pagos de nómina: admin y caja (igual que los cobros de caja en T6). */
+/**
+ * Lectura de nómina: admin y empleado. El empleado ve SU recibo —el alcance por
+ * fila lo aplica el llamador—; la caja NO entra, ni siquiera para leer.
+ */
+const VIEWER_ROLES: RoleCode[] = ["admin", "empleado"];
+/**
+ * Vales: admin y caja (la caja abre el vale al empleado con su turno abierto).
+ * Es la ÚNICA superficie que admite caja: NO usar esta guarda en nómina —por
+ * acá entraba la caja a leer y a pagar nómina.
+ */
 const PAYER_ROLES: RoleCode[] = ["admin", "caja"];
 
 export interface PayrollActor {
@@ -146,52 +166,84 @@ export interface PayrollActor {
   roles?: RoleCode[];
 }
 
+/** Sesión de nómina: autenticada, con sede, y sus roles. */
+interface PayrollSession {
+  userId: string;
+  sedeId: string;
+  roles: RoleCode[];
+}
+
 /**
- * §10 Nómina/vales: escritura solo admin de su sede (las rutas y actions
- * aplican este gate; el pago de ítems admite también caja vía
- * requirePayrollPayer).
+ * Resuelve la sesión con el guard compartido (`requireSession`: autenticada y
+ * con sede) y la reescribe a los tipos de nómina. Los errores de sesión cambian
+ * de clase, no de forma: mismo código, mismo mensaje, mismo status.
+ */
+async function payrollSession(token: string | null | undefined): Promise<PayrollSession> {
+  try {
+    const session = await requireSession(token);
+    return { userId: session.userId, sedeId: session.sedeId, roles: session.roles };
+  } catch (error) {
+    if (error instanceof AdminError) {
+      throw new PayrollError(error.code, error.message, error.status);
+    }
+    throw error;
+  }
+}
+
+/** Gate de rol de una superficie: FORBIDDEN como error de nómina. */
+function requirePayrollRoles(roles: RoleCode[], allowed: RoleCode[]): void {
+  try {
+    requireSedeRole(roles, allowed);
+  } catch (error) {
+    if (error instanceof AdminError) {
+      throw new PayrollError(error.code, error.message, error.status);
+    }
+    throw error;
+  }
+}
+
+/**
+ * §10 Nómina/vales: administrar la nómina es solo admin de su sede (las rutas y
+ * las actions aplican este gate; incluye pagar un ítem).
+ *
+ * Los vales NO usan esta guarda: el vale lo abre la caja (requirePayrollPayer).
  */
 export async function requirePayrollAdmin(
   token: string | null | undefined,
 ): Promise<PayrollActor> {
-  const session = await getSessionUser(token);
-  if (!session) {
-    throw new PayrollError("UNAUTHENTICATED", "Se requiere autenticación.", 401);
-  }
-  try {
-    requireSedeRole(session.roles, ADMIN_ROLES);
-  } catch (error) {
-    if (error instanceof AdminError) {
-      throw new PayrollError(error.code, error.message, error.status);
-    }
-    throw error;
-  }
-  if (!session.user.sede_id) {
-    throw new PayrollError("NO_SEDE", "El usuario no tiene sede asignada.", 403);
-  }
-  return { userId: session.user.id, sedeId: session.user.sede_id, roles: session.roles };
+  const session = await payrollSession(token);
+  requirePayrollRoles(session.roles, ADMIN_ROLES);
+  return session;
 }
 
-/** PAY-04: pagar un ítem admite admin y caja (el turno/caja lo respalda). */
+/**
+ * Lectura de nómina: admin de la sede y el empleado que mira SU recibo.
+ *
+ * El empleado pasa el gate y el llamador recorta por fila (`getPeriodDetail` +
+ * el filtro por legajo); la caja queda fuera: el módulo de nómina no es de caja,
+ * ni para leer (para el vale tiene /vales y requirePayrollPayer).
+ */
+export async function requirePayrollViewer(
+  token: string | null | undefined,
+): Promise<PayrollActor> {
+  const session = await payrollSession(token);
+  requirePayrollRoles(session.roles, VIEWER_ROLES);
+  return session;
+}
+
+/**
+ * Vales (PAY-04/V2): abrir un vale admite admin y caja —la caja abierta es quien
+ * lo abre con turno abierto (el servicio lo vuelve a validar)—.
+ *
+ * Solo para el flujo de vales. La nómina NO pasa por acá: usar esta guarda en
+ * una superficie de nómina vuelve a abrirle el módulo a la caja.
+ */
 export async function requirePayrollPayer(
   token: string | null | undefined,
 ): Promise<PayrollActor> {
-  const session = await getSessionUser(token);
-  if (!session) {
-    throw new PayrollError("UNAUTHENTICATED", "Se requiere autenticación.", 401);
-  }
-  try {
-    requireSedeRole(session.roles, PAYER_ROLES);
-  } catch (error) {
-    if (error instanceof AdminError) {
-      throw new PayrollError(error.code, error.message, error.status);
-    }
-    throw error;
-  }
-  if (!session.user.sede_id) {
-    throw new PayrollError("NO_SEDE", "El usuario no tiene sede asignada.", 403);
-  }
-  return { userId: session.user.id, sedeId: session.user.sede_id, roles: session.roles };
+  const session = await payrollSession(token);
+  requirePayrollRoles(session.roles, PAYER_ROLES);
+  return session;
 }
 
 function toPayrollError(error: unknown): PayrollError {
@@ -231,6 +283,15 @@ function toPayrollError(error: unknown): PayrollError {
           "SUM_MISMATCH",
           "Las porciones de pago deben sumar exactamente el neto del ítem.",
           422,
+        );
+      case "INVALID_PERIOD_RANGE":
+        // PR1: la prorata del fijo no puede calcularse sobre un rango
+        // imposible. El CHECK de 007 ya lo impide en la base; si igual llega
+        // acá, el cálculo se detiene en vez de pagar 0 en silencio.
+        return new PayrollError(
+          "INVALID_PERIOD_RANGE",
+          "El rango del período es inválido (la fecha final no puede ser anterior a la inicial).",
+          409,
         );
     }
   }
@@ -275,6 +336,30 @@ export interface PayrollPaymentRow {
   reference: string | null;
 }
 
+/**
+ * PA-2a: un pago de nómina individual por caso extraordinario. NO es un
+ * período: no tiene `period_id`, no se calcula desde facturas y no cierra
+ * nada. Es plata que sale de la sede con su motivo y su tipo, para los días
+ * que un período (incluso uno CERRADO) ya cubrió.
+ */
+export interface PayrollExtraRow {
+  id: string;
+  sede_id: string;
+  employee_id: string;
+  amount: number;
+  method_id: string | null;
+  method_code: string;
+  reference: string | null;
+  reason: string;
+  kind: PayrollExtraKind;
+  /** Días que el pago liquida (referencia); null = pago sin días asociados. */
+  days_from: string | null;
+  days_to: string | null;
+  paid_by: string | null;
+  paid_at: string;
+  created_at: string;
+}
+
 export interface VoucherSettingsRow {
   sede_id: string;
   /** V2: null o 0 = sin tope diario general. */
@@ -316,6 +401,8 @@ const ITEM_SELECT =
   "id, period_id, employee_id, base_fixed, commissions, bonuses, deductions_vales, other_discounts, net_pay, detail_json, created_at";
 const PAYMENT_SELECT =
   "id, payroll_item_id, method_id, method_code, amount, paid_at, paid_by, reference";
+const EXTRA_SELECT =
+  "id, sede_id, employee_id, amount, method_id, method_code, reference, reason, kind, days_from, days_to, paid_by, paid_at, created_at";
 /** Columnas base (migración 007), siempre presentes. */
 const VOUCHER_SELECT_BASE =
   "id, sede_id, employee_id, amount, request_date, status, approved_by, approval_code, observation";
@@ -402,9 +489,18 @@ async function attachVoucherUserNames(
 // ----------------------------------------------------------------- periodos ---
 
 /**
- * PAY-01: abre un periodo borrador por sede y rango. El índice parcial
- * uq_payroll_draft_per_range es la barrera final ante carreras (23505 →
- * mismo error de negocio).
+ * PAY-01: abre un periodo borrador por sede y rango.
+ *
+ * PR1: un DÍA se nomina una sola vez. La prorata del fijo hace que la suma de
+ * los períodos de un mes sea el sueldo SOLO si no comparten días, así que
+ * abrir un rango que solape otro (en cualquier estado: un período cerrado ya
+ * pagó esos días) se rechaza acá con el rango en conflicto a la vista. El
+ * índice único parcial de 007 sólo miraba la tupla EXACTA de los borradores:
+ * dos rangos adyacentes o cruzados pasaban sin ruido.
+ *
+ * Barreras ante carreras: la lectura y el INSERT no son atómicos, así que la
+ * restricción de exclusión de la base (migración 035) es la barrera final
+ * (23P01 → mismo error de negocio, igual que 23505 para el borrador repetido).
  */
 export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Promise<PayrollPeriodRow> {
   const parsed = openPeriodSchema.safeParse(raw);
@@ -414,6 +510,41 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
   const input: OpenPeriodInput = parsed.data;
   const db = await payrollDb();
   try {
+    // Candidatos: los períodos de la sede que tocan el rango pedido. La
+    // decisión la toma el predicado puro `rangesOverlap` (el mismo contrato que
+    // el `daterange(..., '[]') &&` de la base), pero la LECTURA es exhaustiva y
+    // falla a la vista (READ_INCOMPLETE): con una lectura recortada por el tope
+    // del Data API la guarda podría no ver el período que estorba y abrir un
+    // rango que comparte días. Acá no se decide con lo que se alcanzó a leer.
+    const candidates = await readAllPayroll<{
+      start_date: string;
+      end_date: string;
+      status: string;
+    }>({
+      log: "openPayrollPeriod",
+      what: "períodos de la sede en el rango",
+      meta: { sedeId: actor.sedeId, start: input.start_date, end: input.end_date },
+      table: "payroll_periods",
+      fetchPage: (from, to) =>
+        db
+          .from("payroll_periods")
+          .select("id, start_date, end_date, status")
+          .eq("sede_id", actor.sedeId)
+          .lte("start_date", input.end_date)
+          .gte("end_date", input.start_date)
+          .order("id")
+          .range(from, to),
+    });
+    const requested = { start_date: input.start_date, end_date: input.end_date };
+    const clash = candidates.find((row) => rangesOverlap(row, requested));
+    if (clash) {
+      throw new PayrollError(
+        "PERIOD_OVERLAP",
+        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${clash.start_date} a ${clash.end_date} (${clash.status}) de esta sede. Un día se nomina una sola vez: ajuste las fechas para que no se crucen con un período existente.`,
+        409,
+      );
+    }
+
     const { data, error } = await db
       .from("payroll_periods")
       .insert({
@@ -433,6 +564,16 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
           409,
         );
       }
+      // Carrera perdida contra `ex_payroll_periods_no_overlap` (035): otro
+      // proceso abrió un período con días en común entre la lectura y el
+      // INSERT. Es el mismo error de negocio, no un fallo interno.
+      if ((error as { code?: string }).code === "23P01") {
+        throw new PayrollError(
+          "PERIOD_OVERLAP",
+          "Otro período de esta sede quedó con días en común mientras se abría este. Un día se nomina una sola vez: revise los períodos existentes y ajuste las fechas.",
+          409,
+        );
+      }
       throw new PayrollError("INTERNAL", "Error interno.", 500);
     }
     if (!data) throw new PayrollError("INTERNAL", "Error interno.", 500);
@@ -442,17 +583,37 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
   }
 }
 
-/** Lista los periodos de la sede (más recientes primero, máx. 20). */
+/**
+ * Lista TODOS los períodos de la sede (más recientes primero).
+ *
+ * PA3: antes tenía `.limit(20)` y eso no era un tope de presentación, era un
+ * tope de HISTORIA: la pantalla se quedaba con los 20 últimos sin total, sin
+ * conteo y sin aviso, así que la sede con más de 20 períodos perdía los viejos
+ * de la vista y nada lo decía. El conjunto está acotado por la sede (un día se
+ * nomina una sola vez), así que lo correcto es leerlo entero por páginas y con
+ * `order()` determinista: sin el desempate por `id`, dos períodos con la misma
+ * fecha de inicio pueden caer en páginas distintas y repetirse o perderse.
+ */
 export async function listPeriods(sedeId: string): Promise<PayrollPeriodRow[]> {
-  const db = await payrollDb();
-  const { data, error } = await db
-    .from("payroll_periods")
-    .select(PERIOD_SELECT)
-    .eq("sede_id", sedeId)
-    .order("start_date", { ascending: false })
-    .limit(20);
-  if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as PayrollPeriodRow[];
+  try {
+    const db = await payrollDb();
+    return await readAllPayroll<PayrollPeriodRow>({
+      log: "listPeriods",
+      what: "períodos de la sede",
+      meta: { sede: sedeId },
+      table: "payroll_periods",
+      fetchPage: (from, to) =>
+        db
+          .from("payroll_periods")
+          .select(PERIOD_SELECT)
+          .eq("sede_id", sedeId)
+          .order("start_date", { ascending: false })
+          .order("id")
+          .range(from, to),
+    });
+  } catch (error) {
+    throw toPayrollError(error);
+  }
 }
 
 async function getPeriodOrThrow(db: DbClient, sedeId: string, id: string): Promise<PayrollPeriodRow> {
@@ -548,6 +709,131 @@ export async function getPeriodDetail(sedeId: string, id: string): Promise<Perio
   } catch (error) {
     // "No se pudo leer" no puede llegar como INTERNAL genérico: el código
     // READ_INCOMPLETE y la tabla/fila donde se cortó son lo accionable.
+    throw toPayrollError(error);
+  }
+}
+
+/** Ítem de nómina con lo pagado ya resuelto (lo que la vista muestra). */
+type PaidPayrollItem = PayrollItemRow & { paid: number };
+
+/**
+ * PA3: el resumen de un período —se lee sin abrirlo— y el mes a la fecha por
+ * empleado. Los períodos y el resumen salen de UNA lectura, así que la lista
+ * sabe cuántos hay sin depender de cuántos alcanzó a leer.
+ */
+export interface PayrollPeriodSummary {
+  period: PayrollPeriodRow;
+  employeeCount: number;
+  netTotal: number;
+  paidTotal: number;
+  remainingTotal: number;
+}
+
+export interface PayrollOverview {
+  summaries: PayrollPeriodSummary[];
+  months: PayrollMonthEmployeeRow[];
+}
+
+/**
+ * Los ítems de VARIOS períodos con lo pagado de cada uno resuelto.
+ *
+ * Mismas dos reglas que `getPeriodDetail`, que es plata: los ids van en lotes
+ * del tamaño que aguanta la URL (una lista sin tope termina en 414 y la
+ * lectura no ocurre) y cada lote se pagina hasta agotar, con `order("id")` para
+ * que dos corridas lean lo mismo. El fallo de cualquiera de las dos lecturas se
+ * PROPAGA (`PagedReadError`): la vista no se arma con un total calculado sobre
+ * un conjunto recortado.
+ */
+async function readPaidItemsOfPeriods(args: {
+  db: DbClient;
+  periodIds: readonly string[];
+  log: string;
+  meta: Record<string, unknown>;
+}): Promise<PaidPayrollItem[]> {
+  const items: PayrollItemRow[] = [];
+  for (const chunk of chunkIds(args.periodIds)) {
+    const rows = await readAllPayroll<PayrollItemRow>({
+      log: args.log,
+      what: "ítems de los períodos",
+      meta: { ...args.meta, periods: args.periodIds.length, ids: chunk.length },
+      table: "payroll_items",
+      fetchPage: (from, to) =>
+        args.db
+          .from("payroll_items")
+          .select(ITEM_SELECT)
+          .in("period_id", chunk)
+          .order("id")
+          .range(from, to),
+    });
+    items.push(...rows);
+  }
+
+  const paidByItem = new Map<string, number>();
+  for (const chunk of chunkIds(items.map((row) => row.id))) {
+    const payments = await readAllPayroll<{ payroll_item_id: string; amount: number | string }>({
+      log: args.log,
+      what: "pagos de los períodos",
+      meta: { ...args.meta, items: items.length, ids: chunk.length },
+      table: "payroll_payments",
+      fetchPage: (from, to) =>
+        args.db
+          .from("payroll_payments")
+          .select("payroll_item_id, amount")
+          .in("payroll_item_id", chunk)
+          .order("id")
+          .range(from, to),
+    });
+    for (const row of payments) {
+      paidByItem.set(
+        row.payroll_item_id,
+        roundMoney((paidByItem.get(row.payroll_item_id) ?? 0) + Number(row.amount)),
+      );
+    }
+  }
+
+  return items.map((item) => ({ ...item, paid: paidByItem.get(item.id) ?? 0 }));
+}
+
+/**
+ * PA3: la vista COMPLETA de la nómina de una sede, en una lectura y con dos
+ * proyecciones de los mismos datos: los totales por período y el mes a la fecha
+ * por empleado. Nada de esto mueve plata: es lectura y presentación, y las
+ * sumas quedan en peso entero (dentro de los derivadores puros de `schemas`).
+ *
+ * OJO — AUTORIZACIÓN: el resumen agrega plata de TODA la planta. Es la misma
+ * superficie que el detalle SIN alcance por fila
+ * (`GET /api/v1/payroll-periods/[id]`), así que quien llama decide: la página
+ * sólo la usa para el admin y al empleado le manda nada más que su propia fila.
+ */
+export async function listPayrollOverview(sedeId: string): Promise<PayrollOverview> {
+  try {
+    // `listPeriods` ya es exhaustiva: si se recorta, esto se cae a la vista.
+    const periods = await listPeriods(sedeId);
+    if (periods.length === 0) return { summaries: [], months: [] };
+
+    const db = await payrollDb();
+    const items = await readPaidItemsOfPeriods({
+      db,
+      periodIds: periods.map((period) => period.id),
+      log: "listPayrollOverview",
+      meta: { sede: sedeId },
+    });
+
+    const byPeriod = new Map<string, PaidPayrollItem[]>();
+    for (const item of items) {
+      const bucket = byPeriod.get(item.period_id);
+      if (bucket) bucket.push(item);
+      else byPeriod.set(item.period_id, [item]);
+    }
+
+    return {
+      summaries: periods.map((period) => ({
+        period,
+        ...summarizePayrollItems(byPeriod.get(period.id) ?? []),
+      })),
+      months: buildPayrollMonthToDate({ periods, items }),
+    };
+  } catch (error) {
     throw toPayrollError(error);
   }
 }
@@ -821,9 +1107,19 @@ export async function calculatePayroll(
     }
 
     const payload = actives.map((employee) => {
+      // PR1: el fijo de un período son SOLO sus días. `salary_fixed` es mensual
+      // (003_admin.sql): antes se pagaba completo en cada período y cuatro
+      // cierres semanales de un mes pagaban 4 × el sueldo, sin error ni aviso.
+      // La porción se calcula por los días del rango (mes por mes, redondeando
+      // una sola vez) y la suma de los períodos del mes da el sueldo siempre
+      // que no compartan días (de eso se ocupa la guarda de solape).
       const baseFixed =
         employee.pay_type === "fijo" || employee.pay_type === "mixto"
-          ? roundMoney(Number(employee.salary_fixed ?? 0))
+          ? prorateFixedSalary({
+              salaryFixed: employee.salary_fixed,
+              startDate: period.start_date,
+              endDate: period.end_date,
+            })
           : 0;
       // Misma resolución por línea que el pago inmediato: la regla ítem×empleado
       // gana sobre el porcentaje plano. Un `fijo` con regla sí comisiona; un
@@ -959,7 +1255,8 @@ async function getItemOrThrow(db: DbClient, sedeId: string, id: string): Promise
  * sede, montos > 0). Acepta abonos parciales (40% + 40% + 20% en una o
  * varias llamadas); el acumulado nunca excede el neto (además del trigger
  * trg_payroll_payments_cap). Periodo cerrado → PERIOD_CLOSED.
- * Solo admin/caja (vía requirePayrollPayer en rutas/actions).
+ * Solo admin (vía requirePayrollAdmin en rutas/actions): pagar un ítem es parte
+ * de liquidar la nómina, y el módulo de nómina no es de caja.
  */
 export async function payPayrollItem(
   sedeId: string,
@@ -1041,6 +1338,140 @@ export async function payPayrollItem(
       remaining: roundMoney(Math.max(0, net - paid)),
       payments: (inserted ?? []) as PayrollPaymentRow[],
     };
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
+// ------------------------------------------------ nómina extraordinaria (PA-2a) ---
+
+/**
+ * PA-2a: registra un pago de nómina INDIVIDUAL por caso extraordinario
+ * (despido, renuncia, emergencia del empleado) y lo audita.
+ *
+ * NO es un período y no toca `payroll_periods`. Existe justamente porque
+ * `payPayrollItem` exige un período en BORRADOR (`assertDraftPeriod`): una
+ * renuncia un miércoles, por días que ya están dentro de un período CERRADO,
+ * no tiene otro camino. Acá no hay período que mirar: el pago se registra por
+ * sí mismo, con su MOTIVO (obligatorio) y su TIPO.
+ *
+ * El monto lo escribe el admin y NO se topa: el sueldo mensual es la base
+ * GUÍA (ver `payrollExtraGuide` en schemas.ts), no un límite. Un despido
+ * liquida prestaciones y no es la porción del sueldo; una emergencia puede
+ * costar más que los días trabajados. La base sólo exige `amount > 0` y un
+ * motivo no vacío.
+ *
+ * Sólo admin (vía requirePayrollAdmin en la action): es nómina, y el módulo de
+ * nómina no es de caja.
+ */
+export async function payPayrollExtra(raw: unknown, actor: PayrollActor): Promise<PayrollExtraRow> {
+  const parsed = payrollExtraSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new PayrollError("VALIDATION", validationMessage(parsed.error), 400);
+  }
+  const db = await payrollDb();
+  try {
+    // El empleado tiene que ser de la sede del actor. `getEmployee` busca por
+    // id sin filtrar sede (admin/service), así que la sede se comprueba ACÁ:
+    // sin esto un admin podría pagarle a la planta de otra sede. El código de
+    // error es el mismo NOT_FOUND de un empleado inexistente, para no revelar
+    // la planta de otras sedes.
+    const employee = await getEmployee(parsed.data.employee_id).catch((error) => {
+      throw toPayrollError(error);
+    });
+    if (employee.sede_id !== actor.sedeId) {
+      throw new PayrollError("NOT_FOUND", "Empleado no encontrado.", 404);
+    }
+
+    const methods = await listPaymentMethods(actor.sedeId).catch((error) => {
+      throw toPayrollError(error);
+    });
+    const method = methods.find((row) => row.is_active && row.code === parsed.data.method_code);
+    if (!method) {
+      throw new PayrollError(
+        "METHOD_INACTIVE",
+        `El método de pago ${parsed.data.method_code} no está activo en esta sede.`,
+        422,
+      );
+    }
+
+    const amount = roundMoney(Number(parsed.data.amount));
+    const reference = parsed.data.reference?.trim() || null;
+    const daysFrom = parsed.data.days_from ?? null;
+    const daysTo = parsed.data.days_to ?? null;
+
+    const { data, error } = await db
+      .from("payroll_extras")
+      .insert({
+        sede_id: actor.sedeId,
+        employee_id: parsed.data.employee_id,
+        amount,
+        method_id: method.id,
+        method_code: parsed.data.method_code,
+        reference,
+        reason: parsed.data.reason,
+        kind: parsed.data.kind,
+        days_from: daysFrom,
+        days_to: daysTo,
+        paid_by: actor.userId,
+      })
+      .select(EXTRA_SELECT)
+      .single();
+    if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    const row = data as PayrollExtraRow;
+
+    // PA-2a: la plata que sale sin un período detrás tiene que poder
+    // explicarse. Se audita el empleado, el monto, el TIPO, el MOTIVO y el
+    // medio de pago (más los días liquidados, si se indicaron).
+    await writeAudit({
+      sede_id: actor.sedeId,
+      user_id: actor.userId,
+      action: AUDIT_ACTIONS.PAYROLL_EXTRA_PAID,
+      entity: "payroll_extras",
+      entity_id: row.id,
+      metadata: {
+        employee_id: parsed.data.employee_id,
+        amount,
+        kind: parsed.data.kind,
+        reason: parsed.data.reason,
+        method_code: parsed.data.method_code,
+        reference,
+        days_from: daysFrom,
+        days_to: daysTo,
+      },
+    });
+
+    return row;
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
+/**
+ * PA-2a: pagos extraordinarios de la sede, del más reciente al más viejo. Es
+ * la cara VISIBLE del registro (el módulo de nómina), no sólo la auditoría.
+ * Lectura exhaustiva (U5): son pocos y un listado recortado en silencio
+ * mostraría menos plata pagada de la que salió.
+ */
+export async function listPayrollExtras(sedeId: string): Promise<PayrollExtraRow[]> {
+  try {
+    const db = await payrollDb();
+    return await readAllPayroll<PayrollExtraRow>({
+      log: "listPayrollExtras",
+      what: "pagos extraordinarios",
+      meta: { sedeId },
+      table: "payroll_extras",
+      fetchPage: (from, to) =>
+        db
+          .from("payroll_extras")
+          .select(EXTRA_SELECT)
+          .eq("sede_id", sedeId)
+          .order("paid_at", { ascending: false })
+          // `id` desempata: dos pagos con el mismo timestamp no pueden caer en
+          // páginas distintas (ni repetirse ni faltar).
+          .order("id")
+          .range(from, to),
+    });
   } catch (error) {
     throw toPayrollError(error);
   }
