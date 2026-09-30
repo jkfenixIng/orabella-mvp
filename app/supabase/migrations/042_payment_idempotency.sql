@@ -93,7 +93,8 @@
 -- ABORTADA: la perdedora ya había leído el saldo y armado su INSERT cuando
 -- chocó con el índice, y esa sentencia no deja filas. Es el mismo canje de la
 -- 041 —perder trabajo invisible antes que pagar dos veces— sin el hueco de
--- consecutivo que allá sí existe. Se hace notar también en el código.
+-- consecutivo que allá se declaró (y que la 052 ELIMINÓ al mover la reserva
+-- adentro de la transacción de emisión). Se hace notar también en el código.
 --
 -- EL OTRO COSTO, el de la forma elegida: como la marca vive en la PRIMERA
 -- porción, una repetición de una operación de VARIAS porciones reconoce la
