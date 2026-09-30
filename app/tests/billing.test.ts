@@ -1991,7 +1991,34 @@ function createInvoiceStubClient(): unknown {
     return query;
   };
 
-  const rpc = async (name: string) => {
+  const rpc = async (name: string, args?: Record<string, unknown>) => {
+    if (name === "deduct_stock_atomic") {
+      // CL-7/046: el OUT de la emisión ya no es un `registerMovement` por
+      // producto en un bucle sin transacción, sino UNA sentencia del servidor
+      // (la deducción entera, todo-o-nada). El doble registra EXACTAMENTE lo
+      // mismo que registraba —una fila por producto, con su motivo y SIN marca
+      // de intento— y cuenta la escritura en el MISMO contador
+      // (`inserts.inventory_movements`): las aserciones de "una salida de stock
+      // por emisión" siguen significando lo mismo que antes. El contador cuenta
+      // ESCRITURAS (una sentencia), no filas; por eso suma 1 cuando hay ítems.
+      const items = (args?.p_items ?? []) as Array<{ product_id: string; qty: number }>;
+      for (const item of items) {
+        createStub.movements.push({
+          id: `movement-${createStub.movements.length + 1}`,
+          sede_id: args?.p_sede_id ?? null,
+          product_id: item.product_id,
+          type: "OUT",
+          qty: item.qty,
+          reason: args?.p_reason ?? null,
+          user_id: args?.p_user_id ?? null,
+          idempotency_key: null,
+          created_at: "2026-01-01T00:00:00.000Z",
+        });
+      }
+      createStub.inserts.inventory_movements =
+        (createStub.inserts.inventory_movements ?? 0) + (items.length > 0 ? 1 : 0);
+      return { data: items.length, error: null };
+    }
     if (name !== "next_invoice_number") {
       createStub.unexpectedQueries.push(`rpc.${name}`);
       return { data: null, error: { message: `doble de emisión: rpc desconocido ${name}` } };

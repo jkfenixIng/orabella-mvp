@@ -1144,6 +1144,16 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
     try {
       // B1: la compensación también cruza por la frontera de inventario
       // (registerMovement), nunca con insert directo a inventory_movements.
+      //
+      // CL-7/046: desde que la deducción es ATÓMICA —una sola sentencia del
+      // servidor— este bucle ya NO puede encontrarse una deducción a medias:
+      // sólo entra cuando la deducción ENTERA se aplicó y algo falló DESPUÉS
+      // (la relectura del detalle; `writeAudit` no lanza nunca —registra y
+      // devuelve `written: false`—, así que la auditoría NO es un punto de
+      // fallo de esta operación). Revertir una deducción completa sigue siendo
+      // un bucle sin transacción —la misma clase de hallazgo, reportada
+      // aparte— y el `catch` de abajo sigue tragándose su error: las dos cosas
+      // quedan declaradas, no arregladas acá.
       for (const out of outMovements.reverse()) {
         await registerMovement(
           {
