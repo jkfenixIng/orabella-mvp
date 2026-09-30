@@ -57,6 +57,12 @@ export const AUDIT_ACTIONS = {
   // registro, y no un pago de nómina ordinaria más. (Pagar un ítem de un
   // período NO se audita: ver `payPayrollItem`.)
   PAYROLL_EXTRA_PAID: "payroll.extra_paid",
+  // PA-2b: corrección de un período CERRADO. NO reabre ni pisa el período: deja
+  // un registro con las DOS versiones (la anterior congelada y la corregida),
+  // el motivo y quién corrigió. Tiene su propia acción para que un auditor no
+  // lea "la nómina se calculó" donde lo que pasó es que se corrigió una ya
+  // firmada. El metadato lleva el motivo y los totales de las dos versiones.
+  PAYROLL_PERIOD_CORRECTED: "payroll.period_corrected",
   COMMISSION_PAID: "payroll.commission_paid",
   VOUCHER_APPROVED: "voucher.approved",
   VOUCHER_REQUESTED: "voucher.requested",

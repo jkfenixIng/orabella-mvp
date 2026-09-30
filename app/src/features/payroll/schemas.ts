@@ -172,6 +172,21 @@ export const payrollExtraSchema = z
   });
 export type PayrollExtraInput = z.infer<typeof payrollExtraSchema>;
 
+/**
+ * PA-2b: corrección de un período CERRADO. El MOTIVO es obligatorio: una
+ * corrección sin explicación es un número que cambió solo, y lo que se corrige
+ * es plata ya firmada. La razón viaja a la auditoría y a la fila de la
+ * corrección (misma regla en el CHECK de la migración 037).
+ */
+export const correctPayrollPeriodSchema = z.object({
+  reason: z
+    .string()
+    .trim()
+    .min(1, "El motivo de la corrección es obligatorio.")
+    .max(500, "Motivo muy largo."),
+});
+export type CorrectPayrollPeriodInput = z.infer<typeof correctPayrollPeriodSchema>;
+
 // ------------------------------------------------------------ cálculos puros ---
 
 export interface CommissionLine {
@@ -360,6 +375,19 @@ export function assertDraftPeriod(status: string): void {
 export function assertDeletablePeriod(status: string): void {
   if (status !== "borrador") {
     throw new Error("PERIOD_NOT_DRAFT");
+  }
+}
+
+/**
+ * PA-2b: solo un período CERRADO se corrige. Un borrador no se corrige: se
+ * recalcula (es provisional y no hay versión firmada que preservar). Un
+ * período cerrado es historia y no se reabre ni se pisa: se corrige con un
+ * registro propio, con el mismo criterio que el reconteo de turno (033).
+ * Puro para probarlo sin base de datos.
+ */
+export function assertCorrectablePeriod(status: string): void {
+  if (status !== "cerrado") {
+    throw new Error("PERIOD_NOT_CLOSED");
   }
 }
 
@@ -895,6 +923,105 @@ export function summarizePayrollItems(items: readonly PayrollItemLike[]): Payrol
     remainingTotal: sumMoney(
       items.map((item) => Math.max(0, Number(item.net_pay) - Number(item.paid ?? 0))),
     ),
+  };
+}
+
+/**
+ * PA-2b: los montos de un ítem de nómina en UNA de las dos versiones de una
+ * corrección (la anterior congelada o la corregida). Estructural a propósito:
+ * sirve tanto para la fila de `payroll_items` (versión anterior) como para la
+ * fila de la corrección.
+ */
+export interface PayrollCorrectionAmounts {
+  base_fixed: number | string;
+  commissions: number | string;
+  bonuses: number | string;
+  deductions_vales: number | string;
+  other_discounts: number | string;
+  net_pay: number | string;
+}
+
+/** Una fila de la comparación: lo que decía el período, lo corregido y lo pagado. */
+export interface PayrollCorrectionRowView {
+  employee_id: string;
+  previous: PayrollCorrectionAmounts;
+  corrected: PayrollCorrectionAmounts;
+  /** Pagado a este empleado en este período (suma de `payroll_payments`). */
+  paid: number;
+  /**
+   * Diferencia a liquidar: `pagado − neto corregido`. Positiva = se pagó más
+   * de lo que la versión corregida dice que se debía (a favor de la empresa);
+   * negativa = quedó plata por pagar (a favor del empleado). La corrección NO
+   * la salda: la muestra para que se salde a mano.
+   */
+  difference: number;
+}
+
+/** Las dos versiones de un período corregido, comparadas contra lo pagado. */
+export interface PayrollCorrectionView {
+  rows: PayrollCorrectionRowView[];
+  previousNetTotal: number;
+  correctedNetTotal: number;
+  paidTotal: number;
+  differenceTotal: number;
+}
+
+/** Montos en cero para el empleado que sólo está en una de las dos versiones. */
+const NO_CORRECTION_AMOUNTS: PayrollCorrectionAmounts = {
+  base_fixed: 0,
+  commissions: 0,
+  bonuses: 0,
+  deductions_vales: 0,
+  other_discounts: 0,
+  net_pay: 0,
+};
+
+/**
+ * PA-2b: arma la comparación de un período corregido: por empleado y para el
+ * período, lo que decía la versión anterior, lo que dice la corregida y lo
+ * pagado, con la diferencia `pagado − corregido`.
+ *
+ * El orden de las filas es por `employee_id`: es determinista y no depende del
+ * orden en que el motor devolvió las filas, así que la misma corrección se lee
+ * igual siempre (la pantalla ordena por nombre del empleado para mostrar).
+ * Un empleado que sólo aparezca en la corrección se agrega con la versión
+ * anterior en cero, en vez de desaparecer de la vista.
+ * Los totales son la SUMA de las filas (peso entero, sin tolerancia): la tabla
+ * y sus totales no pueden decir cosas distintas.
+ * Puro para probarlo sin base de datos.
+ */
+export function buildPayrollCorrectionView(args: {
+  previous: ReadonlyArray<PayrollCorrectionAmounts & { employee_id: string }>;
+  corrected: ReadonlyArray<PayrollCorrectionAmounts & { employee_id: string }>;
+  paidByEmployee: ReadonlyMap<string, number>;
+}): PayrollCorrectionView {
+  const correctedByEmployee = new Map(args.corrected.map((row) => [row.employee_id, row]));
+  const employeeIds = [
+    ...new Set([
+      ...args.previous.map((row) => row.employee_id),
+      ...args.corrected.map((row) => row.employee_id),
+    ]),
+  ].sort();
+
+  const rows: PayrollCorrectionRowView[] = employeeIds.map((employeeId) => {
+    const previous = args.previous.find((row) => row.employee_id === employeeId) ?? NO_CORRECTION_AMOUNTS;
+    const corrected = correctedByEmployee.get(employeeId) ?? NO_CORRECTION_AMOUNTS;
+    const paid = roundMoney(Number(args.paidByEmployee.get(employeeId) ?? 0));
+    return {
+      employee_id: employeeId,
+      previous,
+      corrected,
+      paid,
+      difference: roundMoney(paid - roundMoney(Number(corrected.net_pay ?? 0))),
+    };
+  });
+
+  return {
+    rows,
+    previousNetTotal: sumMoney(rows.map((row) => row.previous.net_pay)),
+    correctedNetTotal: sumMoney(rows.map((row) => row.corrected.net_pay)),
+    paidTotal: sumMoney(rows.map((row) => row.paid)),
+    differenceTotal: sumMoney(rows.map((row) => row.difference)),
   };
 }
 

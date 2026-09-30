@@ -751,6 +751,20 @@ const SURFACES: readonly SurfaceSpec[] = [
   },
   {
     file: PAYROLL_ACTIONS_FILE,
+    name: "correctPayrollPeriodAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "corrige un período cerrado (registro con las dos versiones y motivo): es plata ya firmada y la caja no entra al módulo.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "getPayrollPeriodCorrectionAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "lee la corrección de un período: muestra la nómina completa de la sede (dos versiones y lo pagado) y la caja no entra.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
     name: "listPeriodsAction",
     kind: "payroll",
     roles: ["admin", "empleado"],
