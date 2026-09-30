@@ -1165,6 +1165,31 @@ const payrollPagedStub = vi.hoisted(() => ({
    */
   skipMarkLookupOnce: false,
   /**
+   * CL-16: el tope de `payroll_payments` (007 `check_payroll_payments_cap`,
+   * reescrito por 055) como lo aplica la BASE, con su lock de la fila PADRE.
+   * Apagado por defecto (mismo idioma que `uniqueKeys`): ningún bloque
+   * existente cambia de conducta.
+   */
+  capEnabled: false,
+  /**
+   * CL-16: la otra transacción. Pagó `amount` del ítem `itemId` y CONFIRMÓ entre
+   * la lectura del acumulado de este servicio y su INSERT: la ventana exacta que
+   * el lock cierra. Se consume una sola vez. `null` = no hay carrera.
+   */
+  capRace: null as { itemId: string; amount: number; method_code?: string } | null,
+  /**
+   * CL-16: qué vio cada evaluación del tope. Es la prueba de que el trigger
+   * corrió de verdad (no vacuidad): sin esto, un tope que nunca se evalúa
+   * pasaría cualquier aserción de rechazo.
+   */
+  capChecks: [] as Array<{
+    itemId: string;
+    sum: number;
+    incoming: number;
+    net: number;
+    sawConcurrent: boolean;
+  }>,
+  /**
    * CL-8: el fallo de la escritura que descuenta los vales.
    *
    * El punto de fallo es SEMÁNTICO y por eso sirve para los dos caminos: en el
@@ -1217,6 +1242,115 @@ const payrollPagedStub = vi.hoisted(() => ({
   /** CL-9: borrados efectivos del doble, por tabla (no intentos: hechos). */
   deletes: [] as Array<{ table: string; count: number }>,
 }));
+
+const MIGRATIONS_DIR = join(process.cwd(), "supabase", "migrations");
+
+/**
+ * CL-16: el cuerpo del tope de nómina que está DESPLEGADO. La 007 lo declara y
+ * la 055 lo reescribe; se toma la ÚLTIMA definición, así que quitar el lock de
+ * la 055 (o no tenerla) deja a la 007 vigente. El cuerpo se mira sin comentarios:
+ * la prosa no es la barrera.
+ */
+function deployedPayrollCapBody(): string {
+  const files = ["007_payroll.sql", "055_payroll_payments_cap_lock.sql"].filter((file) =>
+    existsSync(join(MIGRATIONS_DIR, file)),
+  );
+  const last = files[files.length - 1];
+  if (!last) return "";
+  const raw = readFileSync(join(MIGRATIONS_DIR, last), "utf8");
+  const start = raw.indexOf("CREATE OR REPLACE FUNCTION public.check_payroll_payments_cap");
+  if (start === -1) return "";
+  const body = raw.slice(start);
+  const end = body.indexOf("$$;");
+  return (end === -1 ? body : body.slice(0, end))
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+}
+
+/**
+ * CL-16: ¿el tope desplegado bloquea la fila del padre? El doble NO recibe esta
+ * respuesta del test: la lee del ARTEFACTO. Por eso el test de comportamiento
+ * se cae solo si el lock desaparece de la migración (vuelve la carrera
+ * vulnerable), en vez de afirmar una bandera que el test eligió.
+ */
+function payrollCapLocksParent(): boolean {
+  return /\bFOR\s+UPDATE\b/.test(deployedPayrollCapBody());
+}
+
+/**
+ * CL-16: el tope de `payroll_payments` como lo aplica Postgres en un trigger
+ * `BEFORE INSERT`: por cada fila, foto del acumulado del ítem y rechazo si
+ * `suma + nuevo − neto > 0,009`, con `RAISE EXCEPTION` plano (P0001).
+ *
+ * La parte que importa es la FOTO, y depende del lock:
+ *   * con el lock desplegado, el trigger esperó a que la transacción rival
+ *     confirmara y su sentencia del SUM toma una foto POSTERIOR: ve la fila
+ *     rival y la compara;
+ *   * sin el lock, la foto es la de su propia sentencia, PREVIA al commit
+ *     rival: no la ve, y las dos filas entran (el hueco de la 007).
+ */
+function applyPayrollPaymentsCap(
+  values: Array<Record<string, unknown>>,
+): { data: null; error: { code: string; message: string } } | null {
+  const locksParent = payrollCapLocksParent();
+  const payments = (): Array<Record<string, unknown>> =>
+    payrollPagedStub.tables.payroll_payments ?? [];
+  for (const row of values) {
+    const itemId = String(row.payroll_item_id ?? "");
+    // La otra transacción confirmó su fila mientras ésta esperaba el lock. Su
+    // fila es un HECHO (otra transacción ya cerró), entre o no la nuestra.
+    let seen = payments();
+    const race = payrollPagedStub.capRace;
+    const sawConcurrent = race !== null && race.itemId === itemId;
+    if (sawConcurrent && race) {
+      payrollPagedStub.capRace = null;
+      const concurrentRow: Record<string, unknown> = {
+        id: `fila-insertada-${(payrollPagedStub.rowSeq += 1)}`,
+        payroll_item_id: itemId,
+        method_id: null,
+        method_code: race.method_code ?? "efectivo",
+        amount: race.amount,
+        paid_at: "2026-01-31T23:59:59.000Z",
+        paid_by: "u-otra-transaccion",
+        reference: null,
+        idempotency_key: null,
+        created_at: "2026-01-31T23:59:59.000Z",
+      };
+      const before = payments();
+      payrollPagedStub.tables.payroll_payments = [...before, concurrentRow];
+      // Con el lock desplegado el trigger ESPERÓ y su foto es POSTERIOR al
+      // commit rival: ve la fila. Sin el lock su foto es la de su propia
+      // sentencia, ANTERIOR: no la ve y las dos filas entran (el hueco de 007).
+      seen = locksParent ? payments() : before;
+    }
+    const item = (payrollPagedStub.tables.payroll_items ?? []).find(
+      (candidate) => String(candidate.id) === itemId,
+    );
+    if (!item) {
+      return {
+        data: null,
+        error: { code: "P0001", message: `Ítem de nómina inexistente (${itemId})` },
+      };
+    }
+    const sum = seen
+      .filter((other) => String(other.payroll_item_id) === itemId)
+      .reduce((acc, other) => acc + Number(other.amount), 0);
+    const net = Number(item.net_pay);
+    const incoming = Number(row.amount ?? 0);
+    payrollPagedStub.capChecks.push({ itemId, sum, incoming, net, sawConcurrent });
+    if (sum + incoming - net > 0.009) {
+      return {
+        data: null,
+        error: {
+          code: "P0001",
+          message: `El pago supera el neto del ítem (neto ${net}, pagado ${sum}, nuevo ${incoming})`,
+        },
+      };
+    }
+  }
+  return null;
+}
 
 /**
  * Cliente Supabase falso con la conducta del Data API: aplica filtros
@@ -1328,6 +1462,14 @@ function createPayrollPagedStubClient(): unknown {
         const values = (Array.isArray(insertPayload) ? insertPayload : [insertPayload]) as Array<
           Record<string, unknown>
         >;
+        // CL-16: el tope de `payroll_payments` (007, reescrito por 055) con su
+        // lock de la fila padre. Un trigger `BEFORE INSERT` corre ANTES de los
+        // índices únicos, así que el tope se evalúa primero (mismo orden que la
+        // base). Sólo cuando el bloque lo enciende.
+        if (payrollPagedStub.capEnabled && table === "payroll_payments") {
+          const capFailure = applyPayrollPaymentsCap(values);
+          if (capFailure) return capFailure;
+        }
         // CL-2: los índices únicos de verdad. Postgres comprueba cada fila al
         // insertarla —así que verla repetida DENTRO del mismo statement de
         // varias filas también es un choque— y aborta todo: el doble no
@@ -1739,6 +1881,9 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
  */
 function resetPayrollStubState(): void {
   payrollPagedStub.tables = {};
+  payrollPagedStub.capEnabled = false;
+  payrollPagedStub.capRace = null;
+  payrollPagedStub.capChecks.length = 0;
   payrollPagedStub.failAt = {};
   payrollPagedStub.requests = {};
   payrollPagedStub.windows.length = 0;
@@ -6790,6 +6935,300 @@ describe("migración 048_payroll_admin_atomic.sql (CL-9)", () => {
     // El número libre siguiente y el archivo hermano (047) que se espeja.
     expect(raw).toContain("048");
     expect(raw).toContain("047");
+  });
+});
+
+// ---- CL-16: el tope del pago de nómina bloquea la fila del PADRE -------
+//
+// El hueco: `check_payroll_payments_cap` (007_payroll.sql) sumaba los pagos del
+// ítem y rechazaba si el total pasaba el neto, pero NO bloqueaba la fila padre.
+// Sus dos hermanos sí: `check_invoice_payments_cap` (031) bloquea la fila de
+// `invoices` y `check_commission_payouts_cap` (034) también, y el comentario de
+// la 034 dice por qué —"sin el lock, dos INSERT concurrentes leerían la misma
+// suma y los dos entrarían: el lock ES la barrera"—.
+//
+// La consecuencia: dos `payPayrollItem` concurrentes con marcas DISTINTAS (dos
+// requests, dos admins, dos pestañas) leen el mismo acumulado, los dos pasan su
+// validación y los dos insertan. El ítem queda pagado DOS veces. La marca de la
+// 042 protege el REINTENTO (mismo envío), no la CONCURRENCIA (envíos distintos).
+//
+// El doble de este bloque modela la BASE, no el test: el tope corre como un
+// trigger `BEFORE INSERT` de verdad y la presencia del lock se DERIVA del SQL
+// desplegado (`deployedPayrollCapBody`). Quitar el lock de la migración devuelve
+// la conducta vulnerable y este bloque lo ve, sin que ningún test afirme una
+// bandera que él mismo eligió.
+
+describe("payroll: el tope de pagos de nómina bloquea la fila padre (CL-16)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-cl16",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const ITEM_ID = "item-cl16";
+  const PERIOD_ID = "periodo-cl16";
+  const NET = 100000;
+  const MARK = "0a11ce55-1111-4111-8111-111111111111";
+  const OTHER_MARK = "0a11ce55-2222-4222-8222-222222222222";
+
+  /** Período en BORRADOR con su ítem (neto `netPay`) y un método activo. */
+  function seedDraftItem(netPay = NET): void {
+    payrollPagedStub.tables.payroll_periods = [
+      {
+        id: PERIOD_ID,
+        sede_id: payrollPagedStub.SEDE_ID,
+        start_date: "2026-09-01",
+        end_date: "2026-09-15",
+        status: "borrador",
+        created_by: ACTOR.userId,
+        closed_at: null,
+        created_at: "2026-09-01T00:00:00.000Z",
+      },
+    ];
+    payrollPagedStub.tables.payroll_items = [
+      {
+        id: ITEM_ID,
+        period_id: PERIOD_ID,
+        employee_id: payrollPagedStub.EMPLOYEE_ID,
+        base_fixed: netPay,
+        commissions: 0,
+        bonuses: 0,
+        deductions_vales: 0,
+        other_discounts: 0,
+        net_pay: netPay,
+        detail_json: [],
+        created_at: "2026-09-30T23:59:59.000Z",
+      },
+    ];
+    payrollPagedStub.tables.payroll_payments = [];
+    payrollPagedStub.tables.payment_methods = [
+      {
+        id: "met-efectivo",
+        sede_id: payrollPagedStub.SEDE_ID,
+        code: "efectivo",
+        name: "Efectivo",
+        is_active: true,
+        arqueable: true,
+        fee_percent: 0,
+      },
+    ];
+  }
+
+  const storedPayments = () => payrollPagedStub.tables.payroll_payments ?? [];
+  const partial = (amount: number) => ({
+    portions: [{ method_code: "efectivo", amount }],
+  });
+
+  beforeEach(() => {
+    resetPayrollStubState();
+    // El tope de la base, modelado de verdad en este bloque.
+    payrollPagedStub.capEnabled = true;
+    seedDraftItem();
+  });
+  afterEach(() => resetPayrollStubState());
+
+  it("la carrera de dos pagos distintos: el lock hace que el 2º lo rechace el TOPE", async () => {
+    // La otra transacción pagó 60.000 y confirmó entre la lectura del acumulado
+    // de ÉSTA y su INSERT. Con el lock desplegado, el SUM del trigger corre
+    // después de ese commit: ve 60.000, le suma los 60.000 entrantes y rechaza
+    // (120.000 > 100.000). Sin el lock, su foto es anterior al commit: no ve
+    // nada, pasa, y las dos filas de 60.000 entran —el ítem pagado dos veces—.
+    payrollPagedStub.capRace = { itemId: ITEM_ID, amount: 60000, method_code: "efectivo" };
+    const failure: unknown = await payrollExtrasService
+      .payPayrollItem(
+        payrollPagedStub.SEDE_ID,
+        ITEM_ID,
+        { idempotency_key: MARK, ...partial(60000) },
+        ACTOR,
+      )
+      .catch((error: unknown) => error);
+
+    // No vacuidad: el tope corrió y vio la fila de la otra transacción.
+    expect(payrollPagedStub.capChecks.at(-1)).toMatchObject({
+      itemId: ITEM_ID,
+      sum: 60000,
+      incoming: 60000,
+      net: NET,
+      sawConcurrent: true,
+    });
+    // El rechazo sale por el P0001 del tope, que el servicio traduce a OVERPAID.
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "OVERPAID", status: 422 });
+    // Sólo quedó la fila de la otra transacción: la sentencia de ésta abortó
+    // ENTERA y no dejó ninguna porción.
+    expect(storedPayments()).toHaveLength(1);
+    expect(storedPayments()[0]).toMatchObject({ amount: 60000, paid_by: "u-otra-transaccion" });
+  });
+
+  it("control: un segundo abono legítimo dentro del saldo (secuencial) sigue pasando", async () => {
+    // Sin carrera y con el tope activo: pagar en partes es el caso normal de
+    // PAY-04. Dos abonos con marcas DISTINTAS, que suman exactamente el neto, no
+    // son una repetición y el tope no tiene por qué rechazarlos.
+    const first = await payrollExtrasService.payPayrollItem(
+      payrollPagedStub.SEDE_ID,
+      ITEM_ID,
+      { idempotency_key: MARK, ...partial(60000) },
+      ACTOR,
+    );
+    const second = await payrollExtrasService.payPayrollItem(
+      payrollPagedStub.SEDE_ID,
+      ITEM_ID,
+      { idempotency_key: OTHER_MARK, ...partial(40000) },
+      ACTOR,
+    );
+
+    expect(first.paid).toBe(60000);
+    expect(second.paid).toBe(NET);
+    expect(second.remaining).toBe(0);
+    expect(storedPayments()).toHaveLength(2);
+    // El tope se evaluó en las dos y vio el acumulado REAL de cada momento.
+    expect(payrollPagedStub.capChecks).toEqual([
+      { itemId: ITEM_ID, sum: 0, incoming: 60000, net: NET, sawConcurrent: false },
+      { itemId: ITEM_ID, sum: 60000, incoming: 40000, net: NET, sawConcurrent: false },
+    ]);
+  });
+
+  it("control del control: sin carrera, el tope SÍ rechaza el exceso (no es un adorno)", async () => {
+    // El tope no es un bloque que siempre dice que sí: con el acumulado real ya
+    // escrito, el exceso se rechaza por la misma tolerancia de centavo.
+    payrollPagedStub.tables.payroll_payments = [
+      {
+        id: "pago-previo",
+        payroll_item_id: ITEM_ID,
+        method_id: null,
+        method_code: "efectivo",
+        amount: 90000,
+        paid_at: "2026-09-10T12:00:00.000Z",
+        paid_by: ACTOR.userId,
+        reference: null,
+        idempotency_key: null,
+        created_at: "2026-09-10T12:00:00.000Z",
+      },
+    ];
+    const failure: unknown = await payrollExtrasService
+      .payPayrollItem(
+        payrollPagedStub.SEDE_ID,
+        ITEM_ID,
+        { idempotency_key: MARK, ...partial(20000) },
+        ACTOR,
+      )
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "OVERPAID", status: 422 });
+    expect(storedPayments()).toHaveLength(1);
+  });
+});
+
+describe("migración 055_payroll_payments_cap_lock.sql (CL-16)", () => {
+  // La lectura es por test: el RED corre con el archivo todavía ausente, así que
+  // una lectura en el cuerpo del `describe` rompería la colección de todo el
+  // archivo en vez de fallar sólo estos tests (mismo patrón que 048).
+  const migration = (): { raw: string; sql: string } => {
+    const raw = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "055_payroll_payments_cap_lock.sql"),
+      "utf8",
+    );
+    // El SQL sin comentarios: las aserciones miran las SENTENCIAS, no la prosa
+    // que explica qué no hace el archivo.
+    return {
+      raw,
+      sql: raw
+        .split("\n")
+        .filter((line) => !line.trimStart().startsWith("--"))
+        .join("\n"),
+    };
+  };
+
+  it("reescribe la MISMA función y le agrega el lock de la fila PADRE", () => {
+    const { sql } = migration();
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.check_payroll_payments_cap()");
+    expect(sql).toContain("RETURNS trigger");
+    // El lock de la fila PADRE: `payroll_items`, el ítem que tiene el neto (el
+    // tope). Es la misma fila que en 031/034 es `invoices`.
+    expect(sql).toMatch(/FROM public\.payroll_items\b[\s\S]*?FOR UPDATE/);
+    // Y va ANTES del SUM: primero se ordena la lectura del acumulado, después
+    // se lee y recién después se decide.
+    const lock = sql.indexOf("FOR UPDATE");
+    const sum = sql.indexOf("coalesce(sum(amount), 0)");
+    expect(lock, "falta el lock de la fila del padre").toBeGreaterThan(-1);
+    expect(sum).toBeGreaterThan(lock);
+  });
+
+  it("no toca el trigger: con CREATE OR REPLACE el vínculo no se rompe", () => {
+    const { sql } = migration();
+    // El trigger `trg_payroll_payments_cap` apunta a la función por su OID;
+    // `CREATE OR REPLACE` con la misma firma lo conserva, así que no hay que
+    // recrear el trigger, ni dropearlo, ni dropear la función.
+    expect(sql).not.toMatch(/CREATE\s+TRIGGER/i);
+    expect(sql).not.toMatch(/DROP\s+TRIGGER/i);
+    expect(sql).not.toMatch(/DROP\s+FUNCTION/i);
+
+    // El trigger sigue siendo el de la 007, apuntando a la misma función.
+    const original = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "007_payroll.sql"),
+      "utf8",
+    );
+    expect(original).toContain("CREATE TRIGGER trg_payroll_payments_cap");
+    expect(original).toContain("BEFORE INSERT ON public.payroll_payments");
+    expect(original).toContain("FOR EACH ROW EXECUTE FUNCTION public.check_payroll_payments_cap()");
+  });
+
+  it("conserva la aritmética, la tolerancia de centavo y el RAISE plano (P0001)", () => {
+    const { sql } = migration();
+    // Lo ÚNICO que esta migración cambia del cuerpo es el lock: la comparación
+    // y el mensaje quedan idénticos a la 007.
+    expect(sql).toContain("v_paid + NEW.amount - v_net > 0.009");
+    expect(sql).toContain("El pago supera el neto del ítem (neto %, pagado %, nuevo %)");
+    expect(sql).toContain("Ítem de nómina inexistente (%)");
+    // Plano = sin ERRCODE: el SQLSTATE sigue siendo P0001, el que el servicio
+    // traduce a OVERPAID (422). Un ERRCODE propio rompería esa traducción.
+    expect(sql).not.toMatch(/ERRCODE/i);
+    expect(sql).not.toMatch(/[A-Z_]{4,}\s+USING/i);
+  });
+
+  it("es idempotente y no borra ni reescribe filas de datos existentes", () => {
+    const { sql } = migration();
+    // `CREATE OR REPLACE FUNCTION` y `COMMENT ON FUNCTION` se pueden correr las
+    // veces que haga falta: no fallan si ya están.
+    expect(sql).toContain("COMMENT ON FUNCTION public.check_payroll_payments_cap()");
+    expect(sql).not.toMatch(/\bDELETE\s+FROM\b/i);
+    expect(sql).not.toMatch(/\bTRUNCATE\b/i);
+    expect(sql).not.toMatch(/UPDATE\s+public\./i);
+    expect(sql).not.toMatch(/INSERT\s+INTO\s+public\./i);
+    expect(sql).not.toMatch(/^\s*ALTER TABLE/im);
+    expect(sql).not.toMatch(/^\s*CREATE INDEX/im);
+    expect(sql).not.toMatch(/^\s*DROP\b/im);
+  });
+
+  it("declara el hueco, el orden de locks, la ventana residual y el acoplamiento", () => {
+    const { raw } = migration();
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+    expect(raw).toContain("ACOPLAMIENTO DE DESPLIEGUE");
+    // El orden de los locks y la ausencia de ciclo entre los tres topes.
+    expect(raw).toContain("ORDEN DE LOS LOCKS");
+    // La ventana que el lock NO cierra, dicha y no escondida.
+    expect(raw).toContain("QUÉ CIERRA Y QUÉ NO");
+    // Por qué alcanza un CREATE OR REPLACE (el OID conserva el trigger).
+    expect(raw).toContain("CREATE OR REPLACE");
+  });
+
+  it("declara el costo de numeración y el archivo hermano que espeja", () => {
+    const { raw } = migration();
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("055");
+    expect(raw).toContain("052");
+    expect(raw).toContain("054");
+    // Los hermanos de la barrera, que son el modelo del lock de acá.
+    expect(raw).toContain("031");
+    expect(raw).toContain("034");
+  });
+
+  it("el doble deriva el lock del ARTEFACTO (es lo que hace pasar la carrera)", () => {
+    // No es una aserción sobre una bandera del test: es el vínculo entre la
+    // migración y el comportamiento. Si la 055 no existiera (o perdiera el
+    // lock), esto sería `false` y el test de la carrera pagaría dos veces.
+    expect(payrollCapLocksParent()).toBe(true);
+    expect(deployedPayrollCapBody()).toContain("FOR UPDATE");
   });
 });
 
