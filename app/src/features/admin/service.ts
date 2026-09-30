@@ -350,6 +350,53 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
     }
   }
 
+  // Red de seguridad (solo al crear): si el usuario vinculado NO tiene ningún
+  // rol, se le asigna `empleado` para que nadie quede sin acceso por olvido.
+  //
+  // CO-4: la decisión ya NO se toma desde el cliente. Un `select` seguido de un
+  // `insert` son DOS requests de PostgREST —dos transacciones— y entre ellos
+  // nada impide que otro escritor confirme un rol: la red leía "cero roles",
+  // `setUserRoles` dejaba `admin`, y el insert de la red agregaba `empleado`.
+  // El usuario terminaba con DOS roles, y el modelo del proyecto es uno por
+  // usuario (`setUserRolesSchema` exige `.length(1)`). Una relectura de
+  // compensación no arregla nada: también está sin lock y podría borrar un rol
+  // legítimo. La decisión viaja por lo tanto a UNA sentencia del servidor,
+  // `ensure_user_has_role` (migración 040), que toma el lock de la fila del
+  // usuario (`FOR UPDATE`) antes de escribir. Ese lock es el MISMO que toma
+  // `replace_user_roles` (039): los dos escritores de roles quedan
+  // serializados y el intercalado deja de ser posible.
+  //
+  // Corre ANTES de la escritura del empleado y FALLA CERRADA: si la llamada no
+  // se puede completar, no se otorga nada y la operación se aborta sin dejar
+  // una escritura a medias. Un fallo no puede convertirse en "no tiene
+  // ninguno".
+  //
+  // El rpc levanta `RAISE EXCEPTION` plano (SQLSTATE P0001) para usuario o rol
+  // inexistentes. Acá NO se traduce a un error de negocio como en
+  // `setUserRoles`: el usuario y el rol los eligió el propio servicio, así que
+  // cualquiera de los dos casos significa dato o permiso roto —el mismo
+  // contrato que ya tenía esta ruta cuando el catálogo no traía `empleado`— y
+  // se reporta como error interno.
+  //
+  // La post-condición se contrasta contra lo que la base DEVOLVIÓ (el conjunto
+  // final), nunca contra lo que se pidió: un rpc sin error que no dejó ningún
+  // rol no es un éxito. El conjunto puede traer más de un rol (un usuario
+  // arrastrado por el bug viejo): la red no lo "corrige" ni lo reporta como
+  // fallo, sólo se asegura de que no haya quedado en cero.
+  //
+  // Al actualizar (`input.id`) no se consulta: los roles no se tocan.
+  if (!input.id && userId) {
+    const { data: rolesResultantes, error: rolesError } = await db.rpc("ensure_user_has_role", {
+      p_user_id: userId,
+      p_role_code: "empleado",
+    });
+    if (rolesError) throw new AdminError("INTERNAL", "Error interno.", 500);
+    const aplicados = (Array.isArray(rolesResultantes) ? rolesResultantes : []).filter(
+      (code): code is string => typeof code === "string" && code.length > 0,
+    );
+    if (aplicados.length === 0) throw new AdminError("INTERNAL", "Error interno.", 500);
+  }
+
   const payload = {
     ...(input.id ? { id: input.id } : {}),
     sede_id: input.sede_id,
@@ -381,24 +428,6 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
     throw new AdminError("INTERNAL", "Error interno.", 500);
   }
   if (!data) throw new AdminError("INTERNAL", "Error interno.", 500);
-  // Red de seguridad (solo al crear): si el usuario vinculado quedó sin
-  // roles, se le asigna empleado para que nadie quede sin acceso por olvido.
-  if (!input.id && userId) {
-    const { data: existingRoles } = await db
-      .from("user_roles")
-      .select("id")
-      .eq("user_id", userId)
-      .limit(1);
-    if (!existingRoles || existingRoles.length === 0) {
-      const { data: empRole } = await db.from("roles").select("id").eq("code", "empleado").maybeSingle();
-      if (empRole) {
-        const { error: roleError } = await db
-          .from("user_roles")
-          .insert({ user_id: userId, role_id: (empRole as { id: string }).id });
-        if (roleError) console.error("[admin] no se pudo asignar rol empleado:", roleError.message);
-      }
-    }
-  }
   return data as EmployeeRow;
 }
 
@@ -552,37 +581,65 @@ export async function upsertPaymentMethod(raw: unknown): Promise<PaymentMethodRo
 
 // ------------------------------------------------------------------ roles ---
 /**
- * ADM-04: reemplaza el rol de un usuario (uno solo). Surte efecto en el
- * siguiente refresh de sesión porque getSessionUser lee user_roles en
- * cada request.
+ * Traduce la excepción de `replace_user_roles` a error de negocio. La función
+ * levanta `RAISE EXCEPTION` plano (SQLSTATE P0001), el mismo código que ya
+ * traducen payroll, cash, billing, commissions y los topes 031/034.
+ */
+function roleReplacementError(error: { code?: string; message?: string }): AdminError {
+  if (error.code === "P0001") {
+    const message = error.message ?? "";
+    if (message.includes("USER_NOT_FOUND")) {
+      return new AdminError("NOT_FOUND", "Usuario no encontrado.", 404);
+    }
+    if (message.includes("ROLE_NOT_FOUND")) {
+      return new AdminError("VALIDATION", "Rol desconocido.", 400);
+    }
+  }
+  return new AdminError("INTERNAL", "Error interno.", 500);
+}
+
+/**
+ * ADM-04: reemplaza el rol de un usuario (uno solo) de forma ATÓMICA.
+ *
+ * El reemplazo viaja en UNA sentencia —la función `replace_user_roles` vía
+ * `db.rpc`— y no en un DELETE + INSERT sueltos desde el cliente: PostgREST no
+ * ofrece multi-statement por request (misma nota del README de facturación para
+ * `createInvoice`), así que entre los dos statements no hay transacción. Con el
+ * INSERT fallando, el DELETE ya había confirmado y el usuario quedaba con CERO
+ * roles: `requireSedeRole` lo rechazaba con 403 en todo el app. Adentro de la
+ * función, en cambio, el DELETE y el INSERT comparten la transacción del
+ * servidor: o entra el conjunto nuevo entero, o no entra nada y queda el viejo.
+ * No es una cuestión de orden: borrar primero deja cero roles si el insert
+ * falla, e insertar primero sobre-privilegia si el delete falla. La función
+ * toma además el lock de la fila del usuario, así que dos reemplazos
+ * concurrentes se serializan en vez de intercalarse en un conjunto mezclado.
+ *
+ * Surte efecto en el siguiente refresh de sesión porque getSessionUser lee
+ * user_roles en cada request.
  */
 export async function setUserRoles(raw: unknown): Promise<{ user_id: string; roles: RoleCode[] }> {
   const parsed = setUserRolesSchema.safeParse(raw);
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const db = await adminDb();
 
-  const { data: roleRows, error: roleError } = await db
-    .from("roles")
-    .select("id, code")
-    .in("code", parsed.data.roles);
-  if (roleError) throw new AdminError("INTERNAL", "Error interno.", 500);
-  const found = ((roleRows ?? []) as Array<{ id: string; code: string }>);
-  if (found.length !== parsed.data.roles.length) {
-    throw new AdminError("VALIDATION", "Rol desconocido.", 400);
+  const { data, error } = await db.rpc("replace_user_roles", {
+    p_user_id: parsed.data.user_id,
+    p_role_codes: parsed.data.roles,
+  });
+  if (error) throw roleReplacementError(error);
+
+  // Post-condición: se reporta éxito sólo si la base devolvió el conjunto
+  // pedido. Un arreglo vacío significa "no quedó ningún rol aplicado": eso
+  // jamás es un éxito, por más que el rpc no haya dado error.
+  const aplicados = (Array.isArray(data) ? data : []).filter(
+    (code): code is RoleCode => code === "admin" || code === "empleado" || code === "caja",
+  );
+  const pedidos = parsed.data.roles;
+  if (aplicados.length !== pedidos.length || !aplicados.every((code) => pedidos.includes(code))) {
+    throw new AdminError("INTERNAL", "Error interno.", 500);
   }
 
-  const { error: deleteError } = await db
-    .from("user_roles")
-    .delete()
-    .eq("user_id", parsed.data.user_id);
-  if (deleteError) throw new AdminError("INTERNAL", "Error interno.", 500);
-
-  const { error: insertError } = await db
-    .from("user_roles")
-    .insert(found.map((role) => ({ user_id: parsed.data.user_id, role_id: role.id })));
-  if (insertError) throw new AdminError("INTERNAL", "Error interno.", 500);
-
-  return { user_id: parsed.data.user_id, roles: parsed.data.roles };
+  return { user_id: parsed.data.user_id, roles: aplicados };
 }
 
 // ------------------------------------------ listados con caché (catálogos) ---

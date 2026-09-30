@@ -253,6 +253,64 @@
 }
 
 /* --------------------------------------------------------------------------
+   Paper Palette - Hoja de factura: DOCUMENTO, no superficie del tema
+   --------------------------------------------------------------------------
+   La factura se muestra como una hoja de papel. Un papel no se temiza: la
+   hoja sigue siendo blanca y la tinta sigue siendo oscura en los dos temas,
+   igual que el resultado de una impresora no cambia porque la pantalla esté
+   en modo oscuro. Por eso esta familia NO reutiliza los roles de
+   superficie/texto del tema (que sí se invierten) y vive aparte.
+
+   Las dos formas de que el papel se "temice" solo, y las dos que la guarda
+   `tests/no-raw-palette.test.ts` cierra:
+     1. declarar un bloque `.dark` con `--paper-*`;
+     2. darle a un `--paper-*` un valor `var(--token-de-tema)`.
+   Acá no existe ninguna de las dos, a propósito: se declara UNA vez, en
+   `:root`, con literales hex, y no hay bloque `.dark` para esta familia.
+
+   Un token por valor: la hoja usa 18 colores distintos y esta familia tiene
+   exactamente 18 tokens. No se repite un color bajo dos nombres (es el
+   duplicado que ya se retiró con `--bg-surface-2` / `--muted`).
+
+   Los valores son EXACTAMENTE los que la hoja ya renderizaba con la paleta
+   cruda de Tailwind que reemplazan (medidos sobre el CSS compilado: la rampa
+   `slate`/`emerald`/`red`/`blue-50` de Tailwind es invariante de tema, no tiene
+   override en `.dark`, así que su valor es el mismo en los dos temas). Los 184
+   tokens crudos de la hoja pasaron a estos sin mover un píxel: es un cambio de
+   vocabulario, no de color. El cromo de la app (40 tokens) sigue con la paleta
+   cruda porque ahí NO existe un token del proyecto con el mismo valor. */
+:root {
+  /* Superficies de la hoja. */
+  --paper-surface: #ffffff;
+  --paper-surface-soft: #f8fafc;
+  --paper-surface-muted: #f1f5f9;
+
+  /* Filetes de tabla y de recuadro. Los dos sirven además de relleno del
+     control neutro de la hoja (botón y su hover), por eso el nombre es del
+     material y no de la propiedad: el valor es el mismo para los dos usos. */
+  --paper-line: #e2e8f0;
+  --paper-line-strong: #cad5e2;
+
+  /* Tinta, de la más oscura a la más clara. */
+  --paper-ink: #0f172b;
+  --paper-ink-secondary: #314158;
+  --paper-ink-tertiary: #45556c;
+  --paper-ink-muted: #62748e;
+  --paper-ink-soft: #90a1b9;
+
+  /* Estados de la hoja: avisos, importes de comisión, acciones destructivas y
+     los anillos de foco de los casilleros. */
+  --paper-info: #eff6ff;
+  --paper-success: #009966;
+  --paper-success-strong: #007a55;
+  --paper-success-deep: #006045;
+  --paper-danger: #e7000b;
+  --paper-danger-strong: #c10007;
+  --paper-focus-success: #00bc7d;
+  --paper-focus-danger: #fb2c36;
+}
+
+/* --------------------------------------------------------------------------
    Semantic Colors
    -------------------------------------------------------------------------- */
 :root {

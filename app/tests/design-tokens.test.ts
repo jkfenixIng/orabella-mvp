@@ -432,6 +432,30 @@ const NON_REGISTRY_COLOR_KEYS = [
   "--color-error",
   "--color-error-400",
   "--color-error-600",
+  /* Familia del PAPEL (WU5): la hoja de factura es un DOCUMENTO fijo, no un
+     color del tema, y por eso no va al registry ni reutiliza sus claves. Son
+     18 claves, una por valor; sus tokens viven en design-tokens.css sin bloque
+     `.dark` (la guarda de esa invariante está en tests/no-raw-palette.test.ts).
+     Se clasifican acá a mano, una por una, como cualquier clave nueva: la
+     guarda de cobertura sigue fallando ante cualquier otra clave sin listar. */
+  "--color-paper-surface",
+  "--color-paper-surface-soft",
+  "--color-paper-surface-muted",
+  "--color-paper-line",
+  "--color-paper-line-strong",
+  "--color-paper-ink",
+  "--color-paper-ink-secondary",
+  "--color-paper-ink-tertiary",
+  "--color-paper-ink-muted",
+  "--color-paper-ink-soft",
+  "--color-paper-info",
+  "--color-paper-success",
+  "--color-paper-success-strong",
+  "--color-paper-success-deep",
+  "--color-paper-danger",
+  "--color-paper-danger-strong",
+  "--color-paper-focus-success",
+  "--color-paper-focus-danger",
 ];
 
 /** ¿El valor terminal es un color concreto y no otra indirección? */

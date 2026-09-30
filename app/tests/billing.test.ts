@@ -33,6 +33,7 @@ import {
   annulInvoice,
   countInvoices,
   editEmittedInvoiceItems,
+  editInvoiceItems,
   getInvoiceDetail,
   listInvoices,
   type BillingActor,
@@ -1251,6 +1252,47 @@ const annulStub = vi.hoisted(() => ({
 }));
 
 /**
+ * CO-1: estado propio del camino de EDICIÓN de factura (serialización por
+ * compare-and-swap sobre `invoices.edit_version`, migración 038).
+ *
+ * El doble mantiene la versión REAL de la fila por factura y aplica la guarda
+ * `.eq("edit_version", v)` como lo haría PostgREST: si la fila ya no está en la
+ * versión que se leyó, el UPDATE afecta 0 filas y `.single()` devuelve PGRST116.
+ * Así la carrera de dos ediciones de la MISMA factura se observa de verdad, sin
+ * inventar el resultado ni el desenlace.
+ */
+const editStub = vi.hoisted(() => ({
+  active: false,
+  /** Estado real de `invoices.edit_version` por factura (id → versión). */
+  versions: {} as Record<string, number>,
+  /** Estado real de `invoices.status` por factura. */
+  statuses: {} as Record<string, string>,
+  /** Versión que llevó cada guarda `.eq("edit_version", v)`, en orden. */
+  versionGuards: [] as number[],
+  /** La guarda afecta 0 filas sin carrera (ruta de error del candado). */
+  staleGuard: false,
+  /** Movimientos de inventario insertados: cuántas veces se movió el stock. */
+  movements: [] as Array<Record<string, unknown>>,
+  /** Traza `read`/`write` de `invoices`, en orden: prueba la carrera real. */
+  events: [] as string[],
+  /**
+   * Detiene la PRÓXIMA escritura de la edición hasta que el test la libere. Con
+   * el candado, esa escritura es el compare-and-swap; sin él, la primera
+   * escritura de ítems: así la carrera se puede armar en los dos caminos y el
+   * intercalado queda bajo control (la que aplica segunda es la que pierde).
+   */
+  holdNextWrite: false,
+  /** Libera la escritura detenida (lo llena el doble al detenerla). */
+  releaseWrite: null as (() => void) | null,
+  /** Aviso: hay una escritura detenida esperando a que el test la libere. */
+  onWriteHeld: null as (() => void) | null,
+  /** Fila de `products` (el stock que la edición ajusta). */
+  product: null as Record<string, unknown> | null,
+  /** Líneas de `invoice_items` por factura; ausente = la línea de siempre. */
+  itemsByInvoice: {} as Record<string, Array<Record<string, unknown>>>,
+}));
+
+/**
  * U7: la comisión que MUESTRA la pantalla de la factura vs. la que paga la
  * nómina. Solo el bloque de U7 redefine la línea y mira los lotes de ids.
  */
@@ -1291,6 +1333,9 @@ function stubInvoiceRow(total: number) {
     closed_at: null,
     cancel_reason: null,
     created_at: "2026-01-01T00:00:00.000Z",
+    // CO-1: token de serialización de la edición (migración 038). El doble del
+    // camino de edición lo reemplaza por el valor VIVO de la fila.
+    edit_version: 0,
   };
 }
 
@@ -1337,18 +1382,61 @@ function stubPayment(amount: number, feeAmount = 0) {
 function createOverCollectionStubClient(): unknown {
   const zeroRowsError = { code: "PGRST116", message: "JSON object requested, multiple (or no) rows returned", details: "The result contains 0 rows", hint: null };
 
+  /** Contexto que la consulta encadenada le pasa a `response`. */
+  interface QueryContext {
+    /** Guarda de estado del UPDATE de anulación (U6). */
+    statusGuard?: string;
+    /** Guarda de versión del UPDATE de edición (CO-1). */
+    versionGuard?: number;
+    /** `invoices.id` pedido por el `.eq("id", …)` de esta consulta. */
+    rowId?: string;
+    /** `invoice_id` pedido por el `.eq("invoice_id", …)` de esta consulta. */
+    itemsInvoiceId?: string;
+    /** `.single()`/`.maybeSingle()`: PostgREST devuelve una fila, no una lista. */
+    single: boolean;
+  }
+
+  /**
+   * CO-1: escritura del camino de EDICIÓN. El doble mantiene la versión REAL por
+   * factura y aplica la guarda `.eq("edit_version", v)` como PostgREST: si la
+   * fila ya no está en la versión que se leyó, el UPDATE afecta 0 filas.
+   */
+  const editVersionResponse = (ctx: QueryContext): { data: unknown; error: unknown } => {
+    const id = ctx.rowId ?? overCollectionStub.INVOICE_ID;
+    const written = (overCollectionStub.invoiceUpdate ?? {}) as Record<string, unknown>;
+    const row = () => ({
+      ...stubInvoiceRow(Number(written.total ?? STUB_EMITTED_TOTAL)),
+      id,
+      status: editStub.statuses[id] ?? "Emitida",
+      edit_version: editStub.versions[id] ?? 0,
+    });
+    // El UPDATE de totales de la edición libre no lleva guarda de versión: es
+    // una escritura del MISMO dueño del candado, no un segundo candado.
+    if (ctx.versionGuard === undefined) return { data: row(), error: null };
+    if (editStub.staleGuard || ctx.versionGuard !== (editStub.versions[id] ?? 0)) {
+      return { data: null, error: zeroRowsError };
+    }
+    editStub.versions[id] = Number(written.edit_version ?? ctx.versionGuard + 1);
+    return { data: row(), error: null };
+  };
+
   const response = (
     table: string,
     op: string,
-    statusGuard?: string,
+    ctx: QueryContext,
   ): { data: unknown; error: unknown } => {
     if (op !== "select") {
       overCollectionStub.writes.push(`${table}.${op}`);
       if (table === "invoices" && op === "update") {
+        // CO-1: camino de EDICIÓN (compare-and-swap sobre `edit_version`).
+        if (editStub.active) {
+          editStub.events.push("write");
+          return editVersionResponse(ctx);
+        }
         annulStub.events.push("write");
         // Guarda de estado = compare-and-swap: la fila solo se pisa si sigue en
         // el estado leído. Sin coincidencia, PostgREST afecta 0 filas.
-        if (statusGuard !== undefined && statusGuard !== annulStub.invoiceStatus) {
+        if (ctx.statusGuard !== undefined && ctx.statusGuard !== annulStub.invoiceStatus) {
           return { data: null, error: zeroRowsError };
         }
         if (annulStub.updateMisses) return { data: null, error: zeroRowsError };
@@ -1375,14 +1463,28 @@ function createOverCollectionStubClient(): unknown {
         };
       }
       if (table === "inventory_movements" && op === "insert") {
-        // El IN de reversión ya lo registró `insert()`: acá solo se devuelve la
-        // fila como la devolvería el trigger + PostgREST.
-        return { data: annulStub.movements.at(-1) ?? null, error: null };
+        // El movimiento ya lo registró `insert()`: acá solo se devuelve la fila
+        // como la devolvería el trigger + PostgREST.
+        const movements = editStub.active ? editStub.movements : annulStub.movements;
+        return { data: movements.at(-1) ?? null, error: null };
       }
       return { data: null, error: null };
     }
     switch (table) {
       case "invoices":
+        if (editStub.active) {
+          editStub.events.push("read");
+          const id = ctx.rowId ?? overCollectionStub.INVOICE_ID;
+          return {
+            data: {
+              ...stubInvoiceRow(STUB_EMITTED_TOTAL),
+              id,
+              status: editStub.statuses[id] ?? "Emitida",
+              edit_version: editStub.versions[id] ?? 0,
+            },
+            error: null,
+          };
+        }
         if (annulStub.active) {
           annulStub.events.push("read");
           return {
@@ -1392,10 +1494,20 @@ function createOverCollectionStubClient(): unknown {
         }
         return { data: stubInvoiceRow(STUB_EMITTED_TOTAL), error: null };
       case "products":
+        if (editStub.active) {
+          // `getProductsStock` (lista) y `getProduct` (fila) comparten tabla.
+          if (ctx.single) return { data: editStub.product, error: null };
+          return { data: editStub.product ? [editStub.product] : [], error: null };
+        }
         return { data: annulStub.product, error: null };
       case "invoice_items":
         if (commissionStub.items) return { data: commissionStub.items, error: null };
-        return { data: annulStub.active && annulStub.items ? annulStub.items : [stubItemRow()], error: null };
+        if (annulStub.active && annulStub.items) return { data: annulStub.items, error: null };
+        if (editStub.active) {
+          const id = ctx.itemsInvoiceId ?? overCollectionStub.INVOICE_ID;
+          return { data: editStub.itemsByInvoice[id] ?? [stubItemRow()], error: null };
+        }
+        return { data: [stubItemRow()], error: null };
       case "invoice_taxes":
         return { data: [], error: null };
       case "invoice_payments":
@@ -1472,6 +1584,12 @@ function createOverCollectionStubClient(): unknown {
     let rangeTo = pagedStub.rowCap - 1;
     /** Guarda de estado del UPDATE (U6): la precondición del compare-and-swap. */
     let statusGuard: string | undefined;
+    /** Guarda de versión del UPDATE de edición (CO-1). */
+    let versionGuard: number | undefined;
+    /** `invoices.id` del `.eq("id", …)` de esta consulta (CO-1). */
+    let rowId: string | undefined;
+    /** `invoice_id` del `.eq("invoice_id", …)` de esta consulta (CO-1). */
+    let itemsInvoiceId: string | undefined;
     // `select(cols, { count, head })`: PostgREST responde el total sin filas.
     let countRequested = false;
     let headOnly = false;
@@ -1481,7 +1599,7 @@ function createOverCollectionStubClient(): unknown {
       const result =
         op === "select" && pagedStub.tables[table]
           ? pagedResponse(table, { filters, orderKeys, rangeFrom, rangeTo, single })
-          : response(table, op, statusGuard);
+          : response(table, op, { statusGuard, versionGuard, rowId, itemsInvoiceId, single });
       if (!countRequested) return result;
       return {
         data: headOnly ? null : (result as { data?: unknown }).data,
@@ -1490,18 +1608,24 @@ function createOverCollectionStubClient(): unknown {
       };
     };
     /**
-     * Cierra la consulta. Si el test pidió detener el próximo UPDATE de
-     * `invoices`, la escritura queda EN VUELO hasta que la libere: así se puede
-     * ordenar a mano cuál de dos anulaciones aplica primero.
+     * Cierra la consulta. Si el test pidió detener la próxima escritura de la
+     * anulación o de la edición, esa escritura queda EN VUELO hasta que la
+     * libere: así se puede ordenar a mano cuál de las dos aplica primero (la que
+     * aplica segunda es la que pierde la carrera).
      */
     const settle = (single: boolean): Promise<unknown> => {
-      if (op !== "update" || table !== "invoices" || !annulStub.holdNextWrite) {
-        return Promise.resolve(resolve(single));
-      }
-      annulStub.holdNextWrite = false;
+      const holdAnnul =
+        op === "update" && table === "invoices" && annulStub.active && annulStub.holdNextWrite;
+      // CO-1: la edición se detiene en su PRÓXIMA escritura, cualquiera sea: con
+      // el candado la primera es el compare-and-swap; sin él, la primera
+      // escritura de ítems. Así la carrera se puede armar en los dos caminos.
+      const holdEdit = op !== "select" && editStub.active && editStub.holdNextWrite;
+      if (!holdAnnul && !holdEdit) return Promise.resolve(resolve(single));
+      const holder = holdAnnul ? annulStub : editStub;
+      holder.holdNextWrite = false;
       return new Promise<void>((release) => {
-        annulStub.releaseWrite = release;
-        annulStub.onWriteHeld?.();
+        holder.releaseWrite = release;
+        holder.onWriteHeld?.();
       }).then(() => resolve(single) as unknown);
     };
     const query: Record<string, unknown> = {
@@ -1517,8 +1641,9 @@ function createOverCollectionStubClient(): unknown {
         }
         if (table === "inventory_movements") {
           const movement = (payload ?? {}) as Record<string, unknown>;
-          annulStub.movements.push({
-            id: `mov-${annulStub.movements.length + 1}`,
+          const log = editStub.active ? editStub.movements : annulStub.movements;
+          log.push({
+            id: `mov-${log.length + 1}`,
             created_at: "2026-01-01T00:00:00.000Z",
             ...movement,
           });
@@ -1541,6 +1666,12 @@ function createOverCollectionStubClient(): unknown {
           statusGuard = String(value);
           if (annulStub.active) annulStub.guards.push(String(value));
         }
+        if (table === "invoices" && column === "id") rowId = String(value);
+        if (table === "invoices" && column === "edit_version") {
+          versionGuard = Number(value);
+          if (editStub.active) editStub.versionGuards.push(Number(value));
+        }
+        if (table === "invoice_items" && column === "invoice_id") itemsInvoiceId = String(value);
         filters.push((row) => row[column] === value);
         return query;
       },
@@ -2428,3 +2559,298 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
   });
 });
 
+// --------- CO-1: dos ediciones de la MISMA factura se serializan -----------
+//
+// `editInvoiceItems` y `editEmittedInvoiceItems` leían los ítems de la factura,
+// calculaban el delta NETO por producto y lo aplicaban con `registerMovement`.
+// Entre la lectura y la escritura no había ningún candado: dos ediciones
+// simultáneas de la MISMA factura calculaban el MISMO delta y las dos lo
+// aplicaban, así que el stock se descontaba (o se devolvía) dos veces.
+//
+// El candado es un compare-and-swap sobre `invoices.edit_version` (migración
+// 038), el mismo patrón que la anulación de factura (U6: `.eq("status", …)` →
+// `ANNUL_CONFLICT`) y el cierre de caja (`.eq("status","abierto")` →
+// `SHIFT_ALREADY_CLOSED`): la edición escribe la versión SIGUIENTE solo si la
+// fila sigue en la versión que leyó, y si no, afecta 0 filas y se rechaza con
+// `EDIT_CONFLICT` (409) ANTES de la primera escritura — ítems, stock o
+// auditoría. La frontera de inventario no cambia: el ajuste sigue yendo por
+// `registerMovement`.
+//
+// `editStub` mantiene la versión REAL por factura, así que la carrera se
+// observa de verdad: la primera edición queda EN VUELO en su próxima escritura,
+// la segunda corre completa y la primera se libera después — es el orden real
+// de la carrera (la que aplica segunda es la que pierde).
+
+describe("billing: dos ediciones de la misma factura se serializan (CO-1)", () => {
+  const ACTOR: BillingActor = {
+    userId: "u-1",
+    sedeId: overCollectionStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  /** Otra factura de la misma sede: el control anti-extralimitación. */
+  const OTHER_INVOICE_ID = "77777777-7777-4777-8777-777777777777";
+  const OTHER_ITEM_ID = "88888888-8888-4888-8888-888888888888";
+  /** Cantidad final: 1 → 3. El delta es +2 (dos unidades de descuento). */
+  const QTY_DELTA = 2;
+
+  /** Línea de PRODUCTO de la factura (el origen del delta de stock). */
+  function productLine(invoiceId: string, itemId: string, qty: number, unitPrice: number) {
+    return {
+      ...annulProductItemRow(),
+      id: itemId,
+      invoice_id: invoiceId,
+      qty,
+      unit_price: unitPrice,
+      subtotal: qty * unitPrice,
+    };
+  }
+
+  /**
+   * La MISMA línea con qty 3 a 100.000: el subtotal queda intacto (300.000) y el
+   * delta es +2. Las dos ediciones concurrentes piden exactamente el mismo
+   * ajuste, que es el caso del hallazgo.
+   */
+  function payload(itemId: string) {
+    return {
+      items: [
+        {
+          id: itemId,
+          item_type: "producto",
+          product_id: PRODUCT_ID,
+          service_id: null,
+          custom_name: null,
+          employee_id: EMPLOYEE_ID,
+          qty: 1 + QTY_DELTA,
+          unit_price: 100000,
+          discount: 0,
+          no_commission: true,
+        },
+      ],
+      payments: [],
+    };
+  }
+
+  /** Edición LIBRE de emitida (cajera/turno; acá admin, que también puede). */
+  function freeEdit(
+    invoiceId = overCollectionStub.INVOICE_ID,
+    itemId = overCollectionStub.ITEM_ID,
+  ) {
+    return editEmittedInvoiceItems(overCollectionStub.SEDE_ID, invoiceId, payload(itemId), ACTOR);
+  }
+
+  /** Edición ADMIN (total inmutable + motivo): el otro camino del hallazgo. */
+  function adminEdit(
+    invoiceId = overCollectionStub.INVOICE_ID,
+    itemId = overCollectionStub.ITEM_ID,
+  ) {
+    return editInvoiceItems(
+      overCollectionStub.SEDE_ID,
+      invoiceId,
+      { ...payload(itemId), motivo: "Cantidad mal digitada" },
+      ACTOR,
+    );
+  }
+
+  /**
+   * Arranca una edición y espera —por SONDEO, sin callbacks compartidos— a que
+   * su PRÓXIMA escritura quede EN VUELO. Con el candado esa escritura es el
+   * compare-and-swap; sin él, la primera escritura de ítems: por eso el mismo
+   * control sirve para el RED y para el GREEN. Devuelve la promesa DENTRO de un
+   * objeto porque `return pending` esperaría a que la edición (detenida)
+   * termine, y el test quiere justamente lo contrario: seguir con la segunda
+   * edición mientras la primera está en vuelo.
+   */
+  async function holdFirstWrite(start: () => Promise<unknown>) {
+    editStub.holdNextWrite = true;
+    editStub.releaseWrite = null;
+    const pending = start().then(
+      () => "aplicada" as const,
+      (error: unknown) => error,
+    );
+    for (let attempt = 0; attempt < 400 && !editStub.releaseWrite; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    // Si la edición falla antes de escribir, el sondeo no ve la escritura y la
+    // prueba falla a la vista, sin quedarse esperando.
+    expect(editStub.releaseWrite).not.toBeNull();
+    // Non-vacuidad del intercalado: la primera ya leyó la factura y todavía no
+    // escribió nada, así que las dos ediciones partieron de la MISMA versión.
+    expect(editStub.events).toEqual(["read"]);
+    return { pending };
+  }
+
+  beforeEach(() => {
+    editStub.active = true;
+    editStub.versions = {};
+    editStub.statuses = {};
+    editStub.versionGuards.length = 0;
+    editStub.staleGuard = false;
+    editStub.movements.length = 0;
+    editStub.events.length = 0;
+    editStub.holdNextWrite = false;
+    editStub.releaseWrite = null;
+    editStub.onWriteHeld = null;
+    editStub.product = annulProductRow();
+    editStub.itemsByInvoice = {
+      [overCollectionStub.INVOICE_ID]: [
+        productLine(overCollectionStub.INVOICE_ID, overCollectionStub.ITEM_ID, 1, STUB_EMITTED_TOTAL),
+      ],
+      [OTHER_INVOICE_ID]: [
+        productLine(OTHER_INVOICE_ID, OTHER_ITEM_ID, 1, STUB_EMITTED_TOTAL),
+      ],
+    };
+    overCollectionStub.payments = [];
+    overCollectionStub.invoiceUpdate = null;
+    overCollectionStub.auditInsert = null;
+    overCollectionStub.writes.length = 0;
+    overCollectionStub.unexpectedQueries.length = 0;
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+    pagedStub.inFilters.length = 0;
+  });
+
+  afterEach(() => {
+    editStub.active = false;
+    editStub.holdNextWrite = false;
+    editStub.releaseWrite?.();
+    editStub.releaseWrite = null;
+    editStub.onWriteHeld = null;
+    editStub.versions = {};
+    editStub.statuses = {};
+    editStub.versionGuards.length = 0;
+    editStub.staleGuard = false;
+    editStub.movements.length = 0;
+    editStub.events.length = 0;
+    editStub.product = null;
+    editStub.itemsByInvoice = {};
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+    pagedStub.inFilters.length = 0;
+  });
+
+  it("dos ediciones libres concurrentes mueven el stock UNA sola vez", async () => {
+    const { pending: first } = await holdFirstWrite(() => freeEdit());
+
+    const second = await freeEdit().then(
+      () => "aplicada" as const,
+      (error: unknown) => error,
+    );
+    // Non-vacuidad: la segunda corrió entera y su ajuste quedó aplicado.
+    expect(second).toBe("aplicada");
+    const writesAfterWinner = overCollectionStub.writes.length;
+
+    if (editStub.releaseWrite) editStub.releaseWrite();
+    const firstResult = await first;
+
+    // El síntoma del hallazgo: el delta (+2) se aplica UNA vez, no dos.
+    expect(editStub.movements).toHaveLength(1);
+    expect(editStub.movements[0]).toMatchObject({ product_id: PRODUCT_ID, type: "OUT", qty: QTY_DELTA });
+    // La carrera existió de verdad: las DOS leyeron ANTES de la primera
+    // escritura (si el intercalado cambiara, esto falla a la vista en vez de
+    // dejar pasar la prueba por un camino que ya no es el de la carrera).
+    // Las tres escrituras: el CAS de la ganadora, su UPDATE de totales y el CAS
+    // RECHAZADO de la perdedora (que es su única escritura).
+    expect(editStub.events).toEqual(["read", "read", "write", "write", "write"]);
+    // La que aplicó segunda afecta 0 filas y se rechaza con su código.
+    expect(firstResult).toBeInstanceOf(BillingError);
+    expect(firstResult).toMatchObject({ code: "EDIT_CONFLICT", status: 409 });
+    // Las dos entraron con la MISMA versión leída: por eso la segunda pierde.
+    expect(editStub.versionGuards).toEqual([0, 0]);
+    expect(editStub.versions[overCollectionStub.INVOICE_ID]).toBe(1);
+    // El candado es la PRIMERA escritura: la perdedora no escribió nada más
+    // (ni ítems, ni stock, ni auditoría). Su única escritura es el CAS rechazado.
+    expect(overCollectionStub.writes.slice(writesAfterWinner)).toEqual(["invoices.update"]);
+    // Una sola edición aplicada: una sola auditoría.
+    expect(
+      overCollectionStub.writes.filter((write) => write === "audit_logs.insert"),
+    ).toHaveLength(1);
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("la edición admin de una PAGADA se serializa igual (mismo candado)", async () => {
+    editStub.statuses[overCollectionStub.INVOICE_ID] = "Pagada";
+
+    const { pending: first } = await holdFirstWrite(() => adminEdit());
+
+    const second = await adminEdit().then(
+      () => "aplicada" as const,
+      (error: unknown) => error,
+    );
+    expect(second).toBe("aplicada");
+
+    if (editStub.releaseWrite) editStub.releaseWrite();
+    const firstResult = await first;
+
+    expect(editStub.movements).toHaveLength(1);
+    expect(editStub.movements[0]).toMatchObject({ type: "OUT", qty: QTY_DELTA });
+    expect(firstResult).toBeInstanceOf(BillingError);
+    expect(firstResult).toMatchObject({ code: "EDIT_CONFLICT", status: 409 });
+    expect(editStub.versionGuards).toEqual([0, 0]);
+  });
+
+  it("control anti-extralimitación: la edición de OTRA factura no se bloquea", async () => {
+    const { pending: first } = await holdFirstWrite(() => freeEdit());
+
+    // Otra factura, otra línea, el mismo ajuste: mientras la primera está EN
+    // VUELO, esta pasa. Un candado global (una sola versión compartida) haría
+    // que la primera se rechazara al liberarse, y este control falla a la vista.
+    const other = await freeEdit(OTHER_INVOICE_ID, OTHER_ITEM_ID).then(
+      () => "aplicada" as const,
+      (error: unknown) => error,
+    );
+    expect(other).toBe("aplicada");
+
+    if (editStub.releaseWrite) editStub.releaseWrite();
+    const firstResult = await first;
+    expect(firstResult).toBe("aplicada");
+
+    // Dos facturas distintas: cada una con su propia versión.
+    expect(editStub.versions[overCollectionStub.INVOICE_ID]).toBe(1);
+    expect(editStub.versions[OTHER_INVOICE_ID]).toBe(1);
+    // Y cada una movió su propio ajuste: dos movimientos, uno por factura.
+    expect(editStub.movements).toHaveLength(2);
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("control negativo: una versión vencida rechaza la edición y no mueve stock", async () => {
+    // Sin carrera: la fila ya no está en la versión que se leyó, así que el
+    // UPDATE afecta 0 filas. Es la MISMA ruta de error que produce la carrera
+    // perdida, y prueba que el rechazo no depende del intercalado del test.
+    editStub.staleGuard = true;
+
+    const outcome = await freeEdit().then(
+      () => "aplicada" as const,
+      (error: unknown) => error,
+    );
+
+    expect(outcome).toBeInstanceOf(BillingError);
+    expect(outcome).toMatchObject({ code: "EDIT_CONFLICT", status: 409 });
+    // El mensaje nombra el conflicto y dice qué hacer: es un rechazo accionable,
+    // no un 500.
+    expect((outcome as BillingError).message).toContain("simultánea");
+    expect(editStub.versionGuards).toEqual([0]);
+    // Nada más que el CAS rechazado: ni stock, ni auditoría, ni una fila.
+    expect(editStub.movements).toEqual([]);
+    expect(overCollectionStub.auditInsert).toBeNull();
+    expect(overCollectionStub.writes).toEqual(["invoices.update"]);
+  });
+
+  it("una edición sin carrera sigue funcionando de punta a punta", async () => {
+    const detail = await freeEdit();
+
+    expect(detail.invoice.total).toBe(STUB_EMITTED_TOTAL);
+    // Non-vacuidad del candado: la guarda se miró, la versión avanzó y el ajuste
+    // se aplicó UNA vez.
+    expect(editStub.versionGuards).toEqual([0]);
+    expect(editStub.versions[overCollectionStub.INVOICE_ID]).toBe(1);
+    expect(editStub.movements).toHaveLength(1);
+    expect(editStub.movements[0]).toMatchObject({ type: "OUT", qty: QTY_DELTA });
+    expect(overCollectionStub.writes).toContain("invoices.update");
+    expect(overCollectionStub.writes).toContain("audit_logs.insert");
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+});

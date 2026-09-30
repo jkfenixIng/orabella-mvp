@@ -17,10 +17,12 @@ import { describe, expect, it } from "vitest";
    que sus primitivas hermanas. WU4 bajó su archivo de 246 a 224: las siete
    pastillas de estado que todavía se escribían con la paleta cruda pasaron al
    primitivo `Badge` (variantes `warning`/`success`/`secondary`/`default` y el
-   mapeo `invoiceStatusVariant`). Los 224 restantes son el cromo del papel de
-   factura (impresión, tablas, botones, inputs) y siguen siendo WU5. Sin esta
-   guarda el próximo archivo reintroduce la paleta cruda y la disparidad se
-   reabre.
+   mapeo `invoiceStatusVariant`). WU5 hizo el resto: los 184 tokens de la hoja de
+   factura (la hoja, los tres diálogos blancos y `paperInputClass`) se congelaron
+   en la familia `--paper-*`, cuyos valores son EXACTAMENTE los que ya
+   renderizaban, y quedan 40, que son el cromo de la app: ahí ningún token del
+   proyecto tiene el mismo valor en los dos temas. Sin esta guarda el próximo
+   archivo reintroduce la paleta cruda y la disparidad se reabre.
 
    Método: se cuentan TOKENS de clase completos, nunca substrings. Los lotes
    anteriores se quemaron dos veces con grep de substring:
@@ -170,16 +172,25 @@ function readProductionSources(): Map<string, string> {
 /**
  * Ofensores conocidos, con su conteo exacto. Si un archivo permitido suma o
  * pierde un token crudo, el conteo deja de coincidir y la guarda falla: así se
- * obliga a reescribir esta lista cuando WU5 limpie su archivo. WU2 ya limpió
- * `combobox.tsx`, así que no aparece acá y el test genérico lo exige limpio.
+ * obliga a reescribir esta lista en cada unidad que limpia un archivo — WU2 lo
+ * hizo con `combobox.tsx` y WU5 con los 184 tokens de la hoja de factura de
+ * `invoices-client.tsx`. Lo que queda acá es lo que NO se puede mover sin
+ * cambiar píxeles, y cada entrada dice por qué.
  */
 const ALLOWLIST = new Map<string, { hits: number; reason: string }>([
   [
     "app/invoices/invoices-client.tsx",
     {
-      hits: 224,
+      hits: 40,
       reason:
-        "WU5: unidad grande, fuera del alcance de WU1. WU4 ya bajó las pastillas de estado (246 → 224); el resto es el cromo del papel de factura.",
+        "WU5: son los 40 tokens del CROMO de la app (botón de modo cliente, pastilla de comisión, " +
+        "tabla de historial y sus botones). Los 184 de la hoja de factura ya no están: se congelaron " +
+        "en la familia `--paper-*` (documento, no tema), que renderiza igual en claro y en oscuro, y " +
+        "el reemplazo fue de vocabulario, no de píxeles. Estos 40 NO tienen un token del proyecto con " +
+        "el MISMO valor en los dos temas (text-slate-500 es #62748e en ambos, text-text-secondary es " +
+        "#737373 en claro y #aeaeae en oscuro; bg-white es #ffffff, bg-surface es #fafafa/#0f0f0f), y " +
+        "son además los únicos del archivo con socio `dark:`. Cambiarlos mueve píxeles: lo decide el " +
+        "dueño, no esta unidad. La invariante de la familia del papel se guarda aparte, más abajo.",
     },
   ],
   [
@@ -311,5 +322,133 @@ describe("paleta cruda: importa el conteo de tokens, no los substrings", () => {
       expect(source, `${path} existe en el walk`).toBeDefined();
       expect([path, ...rawPaletteTokens(source ?? "")]).toEqual([path]);
     }
+  });
+});
+
+/* --------------------------------------------------------------------------
+   Familia del papel (WU5): DOCUMENTO, no superficie del tema.
+
+   La hoja de factura se muestra como papel blanco con tinta oscura en los DOS
+   temas, así que sus colores no pueden invertirse. WU5 los congeló en la familia
+   `--paper-*` de design-tokens.css con los valores exactos que la hoja ya
+   renderizaba con la paleta cruda (los 184 tokens que salieron de
+   `app/invoices/invoices-client.tsx`), y expuso el puente `--color-paper-*`.
+   Los tokens y las claves se clasifican a mano desde design-tokens.test.ts: el
+   papel se declara deliberadamente fuera del registry.
+
+   Acá se protege UNA sola invariante —el papel no se temiza— por los dos únicos
+   caminos que existen para romperla:
+     1. declarar un bloque `.dark` con un `--paper-*`;
+     2. darle a un `--paper-*` un valor `var(--token-de-tema)`.
+   Ninguno de los dos se detecta por convención: hay que leer el CSS real, igual
+   que el resto de estas guardas.
+   -------------------------------------------------------------------------- */
+const TOKENS_PATH = join(APP_ROOT, "src", "styles", "design-tokens.css");
+const GLOBALS_PATH = join(APP_ROOT, "app", "globals.css");
+const PAPER_PREFIX = "--paper-";
+/** 18 valores distintos en la hoja, 18 tokens: uno por valor, sin duplicar. */
+const PAPER_TOKEN_COUNT = 18;
+const TOKENS_CSS = readFileSync(TOKENS_PATH, "utf8");
+const GLOBALS_CSS = readFileSync(GLOBALS_PATH, "utf8");
+
+/**
+ * Declaraciones `--x: valor;` de los bloques cuyo selector es exactamente
+ * `selector`. Misma lectura que design-tokens.test.ts: los bloques no anidan
+ * (salvo una media query que no declara tokens), así que alcanza con cortar
+ * por llaves y quedarse con el selector real, el que sigue al último `}`.
+ */
+function themeVars(css: string, selector: string): Map<string, string> {
+  const vars = new Map<string, string>();
+  const blockRe = /([^{}]*)\{([^{}]*)\}/g;
+  let block: RegExpExecArray | null;
+  while ((block = blockRe.exec(stripComments(css))) !== null) {
+    const head = block[1];
+    const selectorPart = head.slice(Math.max(head.lastIndexOf(";"), head.lastIndexOf("}")) + 1);
+    if (!selectorPart.split(",").map((part) => part.trim()).includes(selector)) {
+      continue;
+    }
+    const declRe = /(--[a-zA-Z0-9-]+)\s*:\s*([^;]+);/g;
+    let decl: RegExpExecArray | null;
+    while ((decl = declRe.exec(block[2])) !== null) {
+      vars.set(decl[1], decl[2].trim());
+    }
+  }
+  return vars;
+}
+
+/** Tokens del papel que se temizan: redefinidos en `.dark` o resueltos por `var()`. */
+function paperThemeViolations(tokensCss: string): string[] {
+  const violations: string[] = [];
+  for (const name of themeVars(tokensCss, ".dark").keys()) {
+    if (name.startsWith(PAPER_PREFIX)) {
+      violations.push(`${name}: el papel se redefine en .dark`);
+    }
+  }
+  for (const [name, value] of themeVars(tokensCss, ":root")) {
+    if (name.startsWith(PAPER_PREFIX) && /var\(/.test(value)) {
+      violations.push(`${name}: toma su valor de otro token (${value})`);
+    }
+  }
+  return violations;
+}
+
+/** Claves `--color-paper-*` de `@theme inline` y a qué token apuntan. */
+function paperBridges(css: string): Map<string, string> {
+  const block = /@theme\s+inline\s*\{([^}]*)\}/.exec(stripComments(css));
+  expect(block, "@theme inline en globals.css").not.toBeNull();
+  const bridges = new Map<string, string>();
+  for (const decl of (block as RegExpExecArray)[1].matchAll(/(--[a-zA-Z0-9-]+)\s*:\s*([^;]+);/g)) {
+    if (decl[1].startsWith("--color-paper-")) {
+      bridges.set(decl[1], decl[2].trim());
+    }
+  }
+  return bridges;
+}
+
+const PAPER_VARS = new Map(
+  [...themeVars(TOKENS_CSS, ":root")].filter(([name]) => name.startsWith(PAPER_PREFIX)),
+);
+
+describe("familia del papel: documento, no superficie del tema", () => {
+  it("son 18 tokens, uno por valor (ningún color repetido bajo dos nombres)", () => {
+    // Piso anti-vacío: si la lectura del CSS real se rompe, esta guarda pasaría sola.
+    expect(PAPER_VARS.size, "tokens --paper-* leídos del CSS real").toBeGreaterThan(0);
+    expect(PAPER_VARS.size, "tokens --paper-* en :root").toBe(PAPER_TOKEN_COUNT);
+    const values = [...PAPER_VARS.values()];
+    expect(new Set(values).size, `valores repetidos: ${values.join(", ")}`).toBe(values.length);
+  });
+
+  it("ningún --paper-* se temiza: ni bloque .dark, ni valor tomado de otro token", () => {
+    expect(paperThemeViolations(TOKENS_CSS)).toEqual([]);
+    const notLiteral = [...PAPER_VARS.values()].filter((value) => !/^#[0-9a-f]{6}$/i.test(value));
+    expect(notLiteral, "los valores deben ser literales hex fijos").toEqual([]);
+  });
+
+  it("el detector no es un sello de goma: un `.dark` o un `var()` lo hacen fallar", () => {
+    expect(paperThemeViolations(":root { --paper-ink: #0f172b; }")).toEqual([]);
+    const conDark = paperThemeViolations(
+      ":root { --paper-ink: #0f172b; }\n.dark { --paper-ink: #ffffff; }",
+    );
+    expect(conDark, "un .dark que redefine el papel").toHaveLength(1);
+    expect(conDark[0]).toContain("--paper-ink");
+    const conVar = paperThemeViolations(":root { --paper-ink: var(--text-primary); }");
+    expect(conVar, "un papel que toma su valor del tema").toHaveLength(1);
+    expect(conVar[0]).toContain("var(--text-primary)");
+  });
+
+  it("cada token del papel tiene su clave --color-paper-* y apunta a él, y a nadie más", () => {
+    const bridges = paperBridges(GLOBALS_CSS);
+    const failures: string[] = [];
+    for (const name of PAPER_VARS.keys()) {
+      const key = `--color-${name.slice(2)}`;
+      const value = bridges.get(key);
+      if (value !== `var(${name})`) {
+        failures.push(`${key}: se esperaba var(${name}), hay ${value}`);
+      }
+    }
+    if (bridges.size !== PAPER_VARS.size) {
+      failures.push(`puentes --color-paper-*: ${bridges.size}, tokens del papel: ${PAPER_VARS.size}`);
+    }
+    expect(failures).toEqual([]);
   });
 });
