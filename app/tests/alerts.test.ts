@@ -9,19 +9,22 @@ import {
   assembleShiftRevision,
   buildVoucherAlertResolution,
   reviewNoteSchema,
+  rollbackAlertDetail,
   voucherAlertFilter,
   voucherAlertRequired,
   voucherAlertResolutionNote,
 } from "@/src/features/alerts/schemas";
+import { AUDIT_ACTIONS } from "@/src/shared/lib/audit";
 
 describe("alerts: conjunto de alerta y paginado", () => {
-  it("cubre desajustes de caja, bloqueos y vales por revisar, página fija de 10", () => {
+  it("cubre desajustes de caja, bloqueos, vales por revisar y el residuo de alta, página fija de 10", () => {
     expect([...ALERT_ACTIONS]).toEqual([
       "cash.shift_open_mismatch",
       "cash.shift_close_mismatch",
       "auth.login_locked",
       "payroll.commission_paid",
       "voucher.requested",
+      "auth.user_create_rollback_failed",
     ]);
     expect(ALERTS_PAGE_SIZE).toBe(10);
   });
@@ -74,6 +77,35 @@ describe("alerts: conjunto de alerta y paginado", () => {
         true,
       )?.revisada,
     ).toBe(false);
+  });
+});
+
+describe("alerts: el residuo de un alta fallida avisa (CL-18)", () => {
+  it("la acción del residuo está en el vocabulario compartido y en la bandeja", () => {
+    // Una sola acción, compartida por el auditor y la bandeja: si divergieran,
+    // el residuo volvería a ser invisible (el defecto que CL-18 cierra).
+    expect(AUDIT_ACTIONS.USER_CREATE_ROLLBACK_FAILED).toBe("auth.user_create_rollback_failed");
+    expect([...ALERT_ACTIONS]).toContain(AUDIT_ACTIONS.USER_CREATE_ROLLBACK_FAILED);
+    expect([...ALERT_MODULES.acceso.actions]).toContain(
+      AUDIT_ACTIONS.USER_CREATE_ROLLBACK_FAILED,
+    );
+  });
+
+  it("cada alerta sigue perteneciendo a un solo módulo, incluido el residuo", () => {
+    expect([...ALERT_MODULES.acceso.actions]).toContain(AUDIT_ACTIONS.USER_CREATE_ROLLBACK_FAILED);
+    expect([...ALERT_MODULES.caja.actions]).not.toContain(
+      AUDIT_ACTIONS.USER_CREATE_ROLLBACK_FAILED,
+    );
+  });
+
+  it("el detalle nombra al usuario que quedó y el motivo, sin filtrar un documento", () => {
+    expect(rollbackAlertDetail({ email: "ana@orabella.co", motivo: "email_exists" })).toBe(
+      "El alta falló y su compensación también: quedó el usuario ana@orabella.co para reparar (motivo: email_exists).",
+    );
+    // Sin correo ni motivo el aviso sigue siendo legible (nunca "undefined").
+    expect(rollbackAlertDetail({})).toBe(
+      "El alta falló y su compensación también: quedó el usuario sin correo registrado para reparar.",
+    );
   });
 });
 

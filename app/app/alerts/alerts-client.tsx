@@ -7,6 +7,10 @@ import {
   markAlertReadAction,
 } from "@/src/features/alerts/actions";
 import type { AlertRow, AlertsResult } from "@/src/features/alerts/service";
+import {
+  ROLLBACK_ALERT_ACTION,
+  rollbackAlertDetail,
+} from "@/src/features/alerts/schemas";
 import { Alert } from "@/src/components/ui/lib/alert";
 import { cn } from "@/src/components/ui/lib/utils";
 import {
@@ -49,6 +53,11 @@ function alertDetail(alert: AlertRow): string {
   }
   if (alert.action === "auth.login_locked") {
     return "Cuenta bloqueada por intentos fallidos.";
+  }
+  if (alert.action === ROLLBACK_ALERT_ACTION) {
+    // El residuo de un alta cuya compensación falló: nombra el usuario que
+    // quedó y el motivo, que es lo que lo vuelve reparable.
+    return rollbackAlertDetail(metadata as Record<string, unknown>);
   }
   if (alert.action === "voucher.requested") {
     const meta = metadata as Record<string, unknown>;
