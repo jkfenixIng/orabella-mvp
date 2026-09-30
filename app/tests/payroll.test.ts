@@ -1190,6 +1190,32 @@ const payrollPagedStub = vi.hoisted(() => ({
   voucherFlips: [] as string[][],
   /** CL-8: cada llamada al RPC, con lo que la transacción recibió. */
   rpcCalls: [] as Array<{ name: string; args: Record<string, unknown> }>,
+  /**
+   * CL-9: el fallo de la escritura que BORRA el período, DESPUÉS de haber
+   * revertido los vales.
+   *
+   * El punto de fallo es SEMÁNTICO y por eso sirve para los dos caminos: en el
+   * camino viejo falla el `.delete()` suelto de `payroll_periods` (los vales ya
+   * quedaron revertidos, porque son otros requests); con la transacción del
+   * servidor falla el paso del DELETE y se revierte TODO, reversión incluida.
+   */
+  failDeletePeriod: null as string | null,
+  /**
+   * CL-9: el fallo de la escritura de las FILAS de la corrección, DESPUÉS de
+   * haber insertado la cabecera. Misma simetría que `failDeletePeriod`: en el
+   * camino viejo falla el INSERT suelto de
+   * `payroll_period_correction_items`; con la transacción falla ese paso y se
+   * revierte también la cabecera.
+   */
+  failCorrectionLines: null as string | null,
+  /**
+   * CL-9: escritura de OTRA transacción justo ANTES de que el RPC evalúe sus
+   * precondiciones (la carrera real). Se consume una sola vez. No es
+   * `beforeUpdate`: estos dos caminos ya no pasan por un `UPDATE` del cliente.
+   */
+  beforeRpc: null as { run: () => void } | null,
+  /** CL-9: borrados efectivos del doble, por tabla (no intentos: hechos). */
+  deletes: [] as Array<{ table: string; count: number }>,
 }));
 
 /**
@@ -1255,11 +1281,43 @@ function createPayrollPagedStubClient(): unknown {
         }
         return { data: single ? matched[0] ?? null : matched, error: null };
       }
+      if (op === "delete") {
+        // CL-9: el `.delete()` del cliente (el DELETE suelto del camino viejo).
+        // El doble borra DE VERDAD las filas que los filtros alcanzan, y
+        // arrastra lo que la FK ON DELETE CASCADE de 007 arrastra. Si el test
+        // pide el fallo SEMÁNTICO de esta escritura, contesta como la base.
+        if (payrollPagedStub.failDeletePeriod && table === "payroll_periods") {
+          return { data: null, error: { code: "P0001", message: payrollPagedStub.failDeletePeriod } };
+        }
+        const matched = rows().filter((row) => filters.every((matches) => matches(row)));
+        payrollPagedStub.deletes.push({ table, count: matched.length });
+        payrollPagedStub.tables[table] = rows().filter((row) => !filters.every((m) => m(row)));
+        if (table === "payroll_periods") {
+          const periods = new Set(matched.map((row) => String(row.id)));
+          const itemIds = new Set(
+            (payrollPagedStub.tables.payroll_items ?? [])
+              .filter((row) => periods.has(String(row.period_id)))
+              .map((row) => String(row.id)),
+          );
+          payrollPagedStub.tables.payroll_items = (payrollPagedStub.tables.payroll_items ?? []).filter(
+            (row) => !periods.has(String(row.period_id)),
+          );
+          payrollPagedStub.tables.payroll_payments = (
+            payrollPagedStub.tables.payroll_payments ?? []
+          ).filter((row) => !itemIds.has(String(row.payroll_item_id)));
+        }
+        return { data: single ? matched[0] ?? null : matched, error: null };
+      }
       if (op !== "select") {
         // INSERT: PostgREST devuelve las filas insertadas y las deja en la
         // tabla (el upsert ya persistía: `getPeriodDetail` lee después esas
         // filas). Hacía falta acá para `openPayrollPeriod`, que necesita la
         // fila de vuelta; y para poder inyectar el fallo de la BASE.
+        // CL-9: el fallo SEMÁNTICO de las filas de la corrección (el INSERT
+        // suelto del camino viejo): la cabecera ya quedó firmada.
+        if (payrollPagedStub.failCorrectionLines && table === "payroll_period_correction_items") {
+          return { data: null, error: { code: "P0001", message: payrollPagedStub.failCorrectionLines } };
+        }
         const failure = payrollPagedStub.insertError;
         if (failure && failure.table === table) {
           return {
@@ -1448,6 +1506,163 @@ function createPayrollPagedStubClient(): unknown {
     args?: Record<string, unknown>,
   ): Promise<{ data: unknown; error: unknown }> => {
     payrollPagedStub.rpcCalls.push({ name, args: args ?? {} });
+    /**
+     * CL-9: `payroll_delete_period_atomic` (048). El doble emula UNA
+     * transacción del servidor: la reversión de los vales y el borrado del
+     * período son UNA sola escritura, así que toma las tablas ANTES de escribir
+     * (después de la carrera) y, si algo falla, las restaura.
+     *
+     * El doble NO reimplementa las guardas de FORMA del SQL: ésas viven en la
+     * función y se prueban sobre el archivo. Lo que emula es lo que estos tests
+     * necesitan observar: la precondición de estado del período, el guardia de
+     * solapamiento dentro de la transacción, la red de conteo de la reversión y
+     * la indivisibilidad.
+     */
+    if (name === "payroll_delete_period_atomic") {
+      const toApproved = (args?.p_to_approved ?? []) as string[];
+      const toPending = (args?.p_to_pending ?? []) as string[];
+      const beforeWrite = payrollPagedStub.beforeRpc;
+      if (beforeWrite) {
+        payrollPagedStub.beforeRpc = null;
+        beforeWrite.run();
+      }
+      const vouchers = payrollPagedStub.tables.voucher_requests ?? [];
+      const voucherSnapshot = vouchers.map((row) => ({ row, status: row.status }));
+      const periodSnapshot = [...(payrollPagedStub.tables.payroll_periods ?? [])];
+      const itemSnapshot = [...(payrollPagedStub.tables.payroll_items ?? [])];
+      const paymentSnapshot = [...(payrollPagedStub.tables.payroll_payments ?? [])];
+      const rollback = (message: string) => {
+        for (const entry of voucherSnapshot) entry.row.status = entry.status;
+        payrollPagedStub.tables.payroll_periods = periodSnapshot;
+        payrollPagedStub.tables.payroll_items = itemSnapshot;
+        payrollPagedStub.tables.payroll_payments = paymentSnapshot;
+        return { data: null, error: { code: "P0001", message } };
+      };
+      if (payrollPagedStub.failRpcWith) {
+        return { data: null, error: { code: "P0001", message: payrollPagedStub.failRpcWith } };
+      }
+      const periods = payrollPagedStub.tables.payroll_periods ?? [];
+      const period = periods.find((row) => row.id === args?.p_period_id) ?? null;
+      // El período BLOQUEADO y su precondición de estado, dentro de la
+      // transacción: un borrado concurrente (o un cierre) rechaza, no pisa.
+      if (!period || period.status !== "borrador" || period.sede_id !== args?.p_sede_id) {
+        return rollback("PAYROLL_PERIOD_CONFLICT");
+      }
+      // El mismo guardia de solapamiento del servicio, re-evaluado acá: un
+      // período CERRADO que solapa el rango impide el borrado.
+      const overlapping = periods.some(
+        (row) =>
+          row.id !== period.id &&
+          row.sede_id === period.sede_id &&
+          row.status === "cerrado" &&
+          String(row.start_date) <= String(period.end_date) &&
+          String(row.end_date) >= String(period.start_date),
+      );
+      if (overlapping) return rollback("PERIOD_OVERLAP_AMBIGUOUS");
+      // La reversión, con la precondición `status = descontada` y su red de
+      // conteo: un vale que otro camino ya revirtió hace fallar el conteo.
+      const expected = [...toApproved, ...toPending];
+      const reverted: string[] = [];
+      for (const id of expected) {
+        const row = vouchers.find((entry) => entry.id === id && entry.sede_id === args?.p_sede_id);
+        if (row && row.status === "descontada") {
+          row.status = toApproved.includes(id) ? "aprobada" : "pendiente";
+          reverted.push(id);
+        }
+      }
+      if (reverted.length !== expected.length) return rollback("PAYROLL_VOUCHER_CONFLICT");
+      // El BORRADO del período, con su propia precondición y el arrastre de las
+      // FK ON DELETE CASCADE de 007 (ítems y, con ellos, sus pagos).
+      if (payrollPagedStub.failDeletePeriod) {
+        return rollback(payrollPagedStub.failDeletePeriod);
+      }
+      const gone = new Set([String(period.id)]);
+      const itemIds = new Set(
+        (payrollPagedStub.tables.payroll_items ?? [])
+          .filter((row) => gone.has(String(row.period_id)))
+          .map((row) => String(row.id)),
+      );
+      payrollPagedStub.tables.payroll_periods = periods.filter((row) => !gone.has(String(row.id)));
+      payrollPagedStub.tables.payroll_items = (payrollPagedStub.tables.payroll_items ?? []).filter(
+        (row) => !gone.has(String(row.period_id)),
+      );
+      payrollPagedStub.tables.payroll_payments = (
+        payrollPagedStub.tables.payroll_payments ?? []
+      ).filter((row) => !itemIds.has(String(row.payroll_item_id)));
+      payrollPagedStub.deletes.push({ table: "payroll_periods", count: 1 });
+      return { data: reverted.length, error: null };
+    }
+    /**
+     * CL-9: `payroll_correct_period_atomic` (048). Misma emulación: la cabecera
+     * y las filas de la corrección son UNA sola escritura. Devuelve la fila
+     * escrita (el SQL devuelve `to_jsonb` de la cabecera), que es lo que el
+     * servicio usa como resultado.
+     */
+    if (name === "payroll_correct_period_atomic") {
+      const headerPayload = (args?.p_correction ?? {}) as Record<string, unknown>;
+      const lines = (args?.p_items ?? []) as Array<Record<string, unknown>>;
+      const beforeWrite = payrollPagedStub.beforeRpc;
+      if (beforeWrite) {
+        payrollPagedStub.beforeRpc = null;
+        beforeWrite.run();
+      }
+      const periodSnapshot = [...(payrollPagedStub.tables.payroll_periods ?? [])];
+      const correctionSnapshot = [...(payrollPagedStub.tables.payroll_period_corrections ?? [])];
+      const lineSnapshot = [...(payrollPagedStub.tables.payroll_period_correction_items ?? [])];
+      const rollback = (message: string, code = "P0001") => {
+        payrollPagedStub.tables.payroll_periods = periodSnapshot;
+        payrollPagedStub.tables.payroll_period_corrections = correctionSnapshot;
+        payrollPagedStub.tables.payroll_period_correction_items = lineSnapshot;
+        return { data: null, error: { code, message } };
+      };
+      if (payrollPagedStub.failRpcWith) {
+        return { data: null, error: { code: "P0001", message: payrollPagedStub.failRpcWith } };
+      }
+      const period =
+        (payrollPagedStub.tables.payroll_periods ?? []).find(
+          (row) => row.id === args?.p_period_id,
+        ) ?? null;
+      if (!period || period.sede_id !== args?.p_sede_id) {
+        return rollback("PAYROLL_CORRECTION_CONFLICT");
+      }
+      if (period.status !== "cerrado") return rollback("PERIOD_NOT_CLOSED");
+      // El índice único por período (037): la corrección de otro gana.
+      if (
+        (payrollPagedStub.tables.payroll_period_corrections ?? []).some(
+          (row) => row.period_id === args?.p_period_id,
+        )
+      ) {
+        return rollback("doble: índice único (period_id) violado en payroll_period_corrections", "23505");
+      }
+      const header = {
+        id: `correccion-${(payrollPagedStub.rowSeq += 1)}`,
+        corrected_at: "2026-09-07T23:59:00.000Z",
+        ...headerPayload,
+      };
+      payrollPagedStub.tables.payroll_period_corrections = [
+        ...(payrollPagedStub.tables.payroll_period_corrections ?? []),
+        header,
+      ];
+      if (payrollPagedStub.failCorrectionLines) {
+        return rollback(payrollPagedStub.failCorrectionLines);
+      }
+      payrollPagedStub.tables.payroll_period_correction_items = [
+        ...(payrollPagedStub.tables.payroll_period_correction_items ?? []),
+        ...lines.map((row) => ({
+          id: `fila-insertada-${(payrollPagedStub.rowSeq += 1)}`,
+          // La columna que el SQL resuelve con `v_cabecera.id`: el payload sólo
+          // lleva los montos y el empleado.
+          correction_id: header.id,
+          ...row,
+        })),
+      ];
+      // Las escrituras que la transacción CONFIRMÓ: el doble las registra como
+      // los INSERT del camino viejo, así las pruebas que ya miraban `inserts`
+      // siguen midiendo lo mismo (qué quedó escrito).
+      payrollPagedStub.inserts.push({ table: "payroll_period_corrections", payload: headerPayload });
+      payrollPagedStub.inserts.push({ table: "payroll_period_correction_items", payload: lines });
+      return { data: header, error: null };
+    }
     if (name !== "payroll_apply_atomic") {
       return { data: null, error: { message: `doble sin respuesta para el rpc ${name}` } };
     }
@@ -1547,6 +1762,10 @@ function resetPayrollStubState(): void {
   payrollPagedStub.itemWrites.length = 0;
   payrollPagedStub.voucherFlips.length = 0;
   payrollPagedStub.rpcCalls.length = 0;
+  payrollPagedStub.failDeletePeriod = null;
+  payrollPagedStub.failCorrectionLines = null;
+  payrollPagedStub.beforeRpc = null;
+  payrollPagedStub.deletes.length = 0;
 }
 
 // Los catálogos de admin/cash son `unstable_cache` (caché de Next). Fuera de un
@@ -5838,6 +6057,739 @@ describe("migración 047_payroll_apply_atomic.sql (CL-8)", () => {
     // El número libre siguiente y el archivo hermano (046) que se espeja.
     expect(raw).toContain("047");
     expect(raw).toContain("046");
+  });
+});
+
+// --------------------------------------------------------------------- CL-9 ---
+//
+// El barrido de atomicidad encontró DOS ventanas más en nómina, de la MISMA
+// clase que CL-7 y CL-8: dos escrituras seguidas que tienen que ser una sola.
+//
+//   * `deletePayrollPeriod` (service.ts): revierte los vales a `aprobada` y a
+//     `pendiente` y DESPUÉS borra el período. Un fallo entre las dos deja los
+//     vales revertidos y el borrador EN PIE: los vales ya dicen una cosa
+//     (`aprobada`/`pendiente`) que ningún borrador explica, y el borrador sigue
+//     ahí con su liquidación.
+//   * `correctPayrollPeriod` (service.ts): inserta la cabecera de la corrección
+//     y DESPUÉS sus filas por empleado. Un fallo entre las dos deja la
+//     corrección FIRMADA sin sus filas; y como hay UNA corrección por período
+//     (índice único de 037), el reintento se rechaza con ALREADY_CORRECTED: un
+//     callejón sin salida. Es la familia "firmado sin su prueba", la peor
+//     estructuralmente.
+//
+// Los dos pares pasan a ser UNA función SQL por par (048), igual que 046 y 047:
+// el servicio COMPUTA (`restoreVoucherStatus`, `computePayrollLines`, la vista
+// de la corrección) y la función SÓLO ESCRIBE lo que recibe.
+
+describe("payroll: el borrado de un borrador revierte los vales y lo borra en UNA transacción (CL-9)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-admin-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const PERIOD_ID = payrollPagedStub.PERIOD_ID;
+  const EMPLOYEE_ID = payrollPagedStub.EMPLOYEE_ID;
+  const VOUCHER_APPROVED = "d1111111-1111-4111-8111-111111111111";
+  const VOUCHER_PENDING = "d2222222-2222-4222-8222-222222222222";
+  const ITEM_ID = "item-nomina-borrador";
+  const PAYMENT_ID = "pago-borrador";
+
+  /**
+   * El escenario: un borrador de enero con su ítem liquidado y su pago, y dos
+   * vales que el cálculo marcó `descontada` en el rango. Uno tenía aprobador
+   * (vuelve a `aprobada`) y el otro no (vuelve a `pendiente`).
+   */
+  function seedDraft(overrides: { overlapping?: Array<Record<string, unknown>> } = {}) {
+    payrollPagedStub.tables = {
+      payroll_periods: [
+        {
+          id: PERIOD_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          start_date: "2026-01-01",
+          end_date: "2026-01-31",
+          status: "borrador",
+          created_by: "u-admin-1",
+          closed_at: null,
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+        ...(overrides.overlapping ?? []),
+      ],
+      payroll_items: [
+        {
+          id: ITEM_ID,
+          period_id: PERIOD_ID,
+          employee_id: EMPLOYEE_ID,
+          base_fixed: 200_000,
+          commissions: 0,
+          bonuses: 0,
+          deductions_vales: 200_000,
+          other_discounts: 0,
+          net_pay: 0,
+          detail_json: [],
+          created_at: "2026-01-31T00:00:00.000Z",
+        },
+      ],
+      payroll_payments: [
+        {
+          id: PAYMENT_ID,
+          payroll_item_id: ITEM_ID,
+          method_id: null,
+          method_code: "efectivo",
+          amount: 1000,
+          paid_at: "2026-01-31T23:00:00.000Z",
+          paid_by: "u-admin-1",
+          reference: null,
+        },
+      ],
+      voucher_requests: [
+        {
+          id: VOUCHER_APPROVED,
+          sede_id: payrollPagedStub.SEDE_ID,
+          employee_id: EMPLOYEE_ID,
+          amount: 100_000,
+          request_date: "2026-01-10",
+          status: "descontada",
+          approved_by: "u-admin-1",
+          created_by: null,
+          method_code: null,
+          cash_shift_id: null,
+          approval_code: null,
+          observation: null,
+        },
+        {
+          id: VOUCHER_PENDING,
+          sede_id: payrollPagedStub.SEDE_ID,
+          employee_id: EMPLOYEE_ID,
+          amount: 100_000,
+          request_date: "2026-01-20",
+          status: "descontada",
+          approved_by: null,
+          created_by: null,
+          method_code: null,
+          cash_shift_id: null,
+          approval_code: null,
+          observation: null,
+        },
+      ],
+      employees: [],
+      invoices: [],
+      invoice_items: [],
+      commission_rules: [],
+      commission_payouts: [],
+      audit_logs: [],
+    };
+  }
+
+  const voucherRow = (id: string) =>
+    (payrollPagedStub.tables.voucher_requests ?? []).find((row) => row.id === id);
+  const voucherStatus = (id: string) => voucherRow(id)?.status;
+  const periodStillThere = () =>
+    (payrollPagedStub.tables.payroll_periods ?? []).some((row) => row.id === PERIOD_ID);
+  const deleteCalls = () =>
+    payrollPagedStub.rpcCalls.filter((call) => call.name === "payroll_delete_period_atomic");
+  const looseVoucherUpdates = () =>
+    payrollPagedStub.updates.filter((entry) => entry.table === "voucher_requests");
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  // --------------------------------------------------------------- RED ---
+
+  it("un fallo en la transacción no deja NADA a medias (RED medido: hoy deja los vales revertidos y el borrador en pie)", async () => {
+    seedDraft();
+    // El fallo semántico "no se pudo borrar el período": en el camino viejo
+    // falla el `.delete()` suelto, DESPUÉS de que los dos `UPDATE` de reversión
+    // ya quedaron confirmados (son otros requests).
+    payrollPagedStub.failDeletePeriod = "PAYROLL_DELETE_FAILED";
+
+    const outcome: unknown = await payrollExtrasService
+      .deletePayrollPeriod(payrollPagedStub.SEDE_ID, PERIOD_ID, ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(PayrollError);
+    expect(outcome).toMatchObject({ code: "INTERNAL", status: 500 });
+    // HOY: los vales quedaron revertidos y el borrador sigue en pie: lo que los
+    // vales dicen ya no lo explica ninguna nómina.
+    expect(voucherStatus(VOUCHER_APPROVED)).toBe("descontada");
+    expect(voucherStatus(VOUCHER_PENDING)).toBe("descontada");
+    expect(periodStillThere()).toBe(true);
+    // Nada escrito: la transacción se intentó y se revirtió ENTERA.
+    expect(payrollPagedStub.deletes).toEqual([]);
+    expect(deleteCalls()).toHaveLength(1);
+  });
+
+  // ------------------------------------------------------------- GREEN ---
+
+  it("GREEN: un borrado exitoso revierte cada vale a SU estado previo y borra el período con sus hijos", async () => {
+    seedDraft();
+
+    const result = await payrollExtrasService.deletePayrollPeriod(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      ACTOR,
+    );
+
+    // El shape del resultado no cambia.
+    expect(result).toEqual({ id: PERIOD_ID });
+    // UNA sola escritura para las dos cosas: la reversión y el borrado viajan
+    // juntos.
+    expect(deleteCalls()).toHaveLength(1);
+    // La reversión ya NO es un `UPDATE` suelto del cliente.
+    expect(looseVoucherUpdates()).toEqual([]);
+    // La reversión es INDIVIDUAL: aprobado → aprobada, sin aprobador →
+    // pendiente (`restoreVoucherStatus`, la misma regla de siempre).
+    expect(voucherStatus(VOUCHER_APPROVED)).toBe("aprobada");
+    expect(voucherStatus(VOUCHER_PENDING)).toBe("pendiente");
+    expect(deleteCalls()[0].args.p_to_approved).toEqual([VOUCHER_APPROVED]);
+    expect(deleteCalls()[0].args.p_to_pending).toEqual([VOUCHER_PENDING]);
+    // El período y sus hijos caen juntos (FK ON DELETE CASCADE de 007).
+    expect(periodStillThere()).toBe(false);
+    expect(payrollPagedStub.tables.payroll_items).toEqual([]);
+    expect(payrollPagedStub.tables.payroll_payments).toEqual([]);
+    expect(payrollPagedStub.deletes).toEqual([{ table: "payroll_periods", count: 1 }]);
+    // La auditoría sigue contando lo revertido.
+    const audit = payrollPagedStub.inserts.find((entry) => entry.table === "audit_logs");
+    expect(audit?.payload).toMatchObject({
+      action: AUDIT_ACTIONS.PAYROLL_DELETED,
+      entity_id: PERIOD_ID,
+      metadata: { vales_revertidos: 2 },
+    });
+  });
+
+  it("la precondición de estado no se salta: si el período dejó de ser BORRADOR, se rechaza y no se revierte nada", async () => {
+    seedDraft();
+    // La carrera real: otro admin CIERRA el borrador entre la lectura del
+    // servicio y la transacción. El `UPDATE`/`DELETE` sueltos no miraban cuántas
+    // filas tocaban; la precondición dentro de la transacción sí.
+    payrollPagedStub.beforeRpc = {
+      run: () => {
+        (payrollPagedStub.tables.payroll_periods ?? [])[0].status = "cerrado";
+      },
+    };
+
+    const outcome: unknown = await payrollExtrasService
+      .deletePayrollPeriod(payrollPagedStub.SEDE_ID, PERIOD_ID, ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(PayrollError);
+    expect(outcome).toMatchObject({ code: "PERIOD_DELETE_CONFLICT", status: 409 });
+    expect(voucherStatus(VOUCHER_APPROVED)).toBe("descontada");
+    expect(voucherStatus(VOUCHER_PENDING)).toBe("descontada");
+    expect(periodStillThere()).toBe(true);
+    expect(payrollPagedStub.deletes).toEqual([]);
+  });
+
+  it("la CARRERA de los vales se RECHAZA en vez de borrar el período con vales que ya no son suyos", async () => {
+    seedDraft();
+    // Otro borrado (el de un borrador que solapa el rango) revirtió el vale
+    // aprobado entre la lectura del servicio y la transacción.
+    payrollPagedStub.beforeRpc = {
+      run: () => {
+        const row = voucherRow(VOUCHER_APPROVED);
+        if (row) row.status = "aprobada";
+      },
+    };
+
+    const outcome: unknown = await payrollExtrasService
+      .deletePayrollPeriod(payrollPagedStub.SEDE_ID, PERIOD_ID, ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(PayrollError);
+    expect(outcome).toMatchObject({ code: "PERIOD_DELETE_CONFLICT", status: 409 });
+    // NADA se aplicó: el vale que SÍ era nuestro sigue `descontada` (no se
+    // revirtió a medias) y el borrador sigue en pie.
+    expect(voucherStatus(VOUCHER_PENDING)).toBe("descontada");
+    expect(periodStillThere()).toBe(true);
+    // El estado que dejó el otro camino no se pisa.
+    expect(voucherStatus(VOUCHER_APPROVED)).toBe("aprobada");
+  });
+
+  it("la CARRERA del solapamiento se RECHAZA: cerrar un período que solapa durante el borrado no pasa", async () => {
+    seedDraft({
+      overlapping: [
+        {
+          id: "33333333-3333-4333-8333-333333333333",
+          sede_id: payrollPagedStub.SEDE_ID,
+          start_date: "2026-01-15",
+          end_date: "2026-02-15",
+          status: "borrador",
+          created_by: "u-admin-1",
+          closed_at: null,
+          created_at: "2026-01-15T00:00:00.000Z",
+        },
+      ],
+    });
+    // El solapado era un BORRADOR cuando el servicio leyó (no bloquea: no hay
+    // plata pagada) y se CIERRA antes de la transacción. Revertir esos vales
+    // destruiría nómina ya pagada: la misma regla, re-evaluada adentro.
+    payrollPagedStub.beforeRpc = {
+      run: () => {
+        (payrollPagedStub.tables.payroll_periods ?? [])[1].status = "cerrado";
+      },
+    };
+
+    const outcome: unknown = await payrollExtrasService
+      .deletePayrollPeriod(payrollPagedStub.SEDE_ID, PERIOD_ID, ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(PayrollError);
+    expect(outcome).toMatchObject({ code: "PERIOD_OVERLAP_AMBIGUOUS", status: 409 });
+    expect(voucherStatus(VOUCHER_APPROVED)).toBe("descontada");
+    expect(voucherStatus(VOUCHER_PENDING)).toBe("descontada");
+    expect(periodStillThere()).toBe(true);
+  });
+
+  it("precondición rechazada: un período ya CERRADO no se borra y no se toca ninguna tabla", async () => {
+    seedDraft();
+    (payrollPagedStub.tables.payroll_periods ?? [])[0].status = "cerrado";
+
+    const outcome: unknown = await payrollExtrasService
+      .deletePayrollPeriod(payrollPagedStub.SEDE_ID, PERIOD_ID, ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(PayrollError);
+    expect(outcome).toMatchObject({ code: "PERIOD_NOT_DRAFT", status: 409 });
+    // Ni siquiera se abrió una transacción: la precondición frena antes.
+    expect(deleteCalls()).toEqual([]);
+    expect(payrollPagedStub.deletes).toEqual([]);
+    expect(voucherStatus(VOUCHER_APPROVED)).toBe("descontada");
+  });
+
+  it("control negativo: sin vales que revertir el borrado borra el período igual (no es un no-op)", async () => {
+    seedDraft();
+    payrollPagedStub.tables.voucher_requests = [];
+
+    const result = await payrollExtrasService.deletePayrollPeriod(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      ACTOR,
+    );
+
+    // La transacción corre igual (hay un borrado que hacer) y con los dos
+    // arreglos VACÍOS: la red de conteo de la reversión no puede confundir
+    // "cero vales pedidos" con "cero vales revertidos de los que pedí".
+    expect(result).toEqual({ id: PERIOD_ID });
+    expect(deleteCalls()).toHaveLength(1);
+    expect(deleteCalls()[0].args.p_to_approved).toEqual([]);
+    expect(deleteCalls()[0].args.p_to_pending).toEqual([]);
+    expect(periodStillThere()).toBe(false);
+  });
+});
+
+describe("payroll: la corrección de un período cerrado escribe cabecera y filas en UNA transacción (CL-9)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-admin-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const EMPLOYEE_ID = payrollPagedStub.EMPLOYEE_ID;
+  const PERIOD_ID = payrollPagedStub.PERIOD_ID;
+  const ITEM_ID = "item-nomina-corregible";
+  const WEEK = { start: "2026-09-01", end: "2026-09-07" };
+  /** Sueldo MENSUAL: 7 de 30 días son 326.667 (la versión CORRECTA). */
+  const SALARY = 1_400_000;
+  const PRORATED = 326_667;
+  const REASON = "El fijo se pagó completo y correspondía la parte de los días.";
+
+  /** El período semanal cerrado que liquidó el sueldo mensual completo. */
+  function seedClosed() {
+    payrollPagedStub.tables = {
+      payroll_periods: [
+        {
+          id: PERIOD_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          start_date: WEEK.start,
+          end_date: WEEK.end,
+          status: "cerrado",
+          created_by: "u-admin-1",
+          closed_at: "2026-09-07T23:00:00.000Z",
+          created_at: "2026-09-01T00:00:00.000Z",
+        },
+      ],
+      employees: [
+        {
+          id: EMPLOYEE_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          user_id: null,
+          full_name: "Empleada fija",
+          employee_code: "E-001",
+          document: "1000000001",
+          phone: null,
+          position: null,
+          payout_mode: "normal",
+          email: null,
+          birth_date: null,
+          pay_type: "fijo",
+          salary_fixed: SALARY,
+          commission_percent: null,
+          is_active: true,
+        },
+      ],
+      payroll_items: [
+        {
+          id: ITEM_ID,
+          period_id: PERIOD_ID,
+          employee_id: EMPLOYEE_ID,
+          base_fixed: SALARY,
+          commissions: 0,
+          bonuses: 0,
+          deductions_vales: 0,
+          other_discounts: 0,
+          net_pay: SALARY,
+          detail_json: [],
+          created_at: "2026-09-07T23:00:00.000Z",
+        },
+      ],
+      payroll_payments: [
+        {
+          id: "pago-corregible",
+          payroll_item_id: ITEM_ID,
+          method_id: null,
+          method_code: "efectivo",
+          amount: SALARY,
+          paid_at: "2026-09-07T23:30:00.000Z",
+          paid_by: "u-admin-1",
+          reference: null,
+        },
+      ],
+      payroll_period_corrections: [],
+      payroll_period_correction_items: [],
+      invoices: [],
+      invoice_items: [],
+      commission_rules: [],
+      voucher_requests: [],
+      commission_payouts: [],
+      audit_logs: [],
+    };
+  }
+
+  const correctionRows = () => payrollPagedStub.tables.payroll_period_corrections ?? [];
+  const correctionItemRows = () => payrollPagedStub.tables.payroll_period_correction_items ?? [];
+  const correctCalls = () =>
+    payrollPagedStub.rpcCalls.filter((call) => call.name === "payroll_correct_period_atomic");
+  const correct = (reason = REASON) =>
+    payrollExtrasService.correctPayrollPeriod(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      { reason },
+      ACTOR,
+    );
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  // --------------------------------------------------------------- RED ---
+
+  it("un fallo al escribir las filas no deja NADA escrito (RED medido: hoy deja la cabecera FIRMADA sin sus filas)", async () => {
+    seedClosed();
+    // El fallo semántico "no se pudieron escribir las filas de la corrección":
+    // en el camino viejo falla el INSERT suelto de las filas, DESPUÉS de que la
+    // cabecera ya quedó confirmada (son otros requests).
+    payrollPagedStub.failCorrectionLines = "PAYROLL_CORRECTION_MISMATCH";
+
+    const outcome: unknown = await correct().catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(PayrollError);
+    expect(outcome).toMatchObject({ code: "INTERNAL", status: 500 });
+    // HOY: la cabecera quedó firmada y las filas no existen; el reintento se
+    // rechaza con ALREADY_CORRECTED, así que la corrección nunca se completa.
+    expect(correctionRows()).toEqual([]);
+    expect(correctionItemRows()).toEqual([]);
+    // No es vacuidad: la transacción SÍ se intentó.
+    expect(correctCalls()).toHaveLength(1);
+  });
+
+  it("el callejón sin salida se cierra: tras un fallo, el reintento completa la corrección (RED medido: hoy se rechaza)", async () => {
+    seedClosed();
+    payrollPagedStub.failCorrectionLines = "PAYROLL_CORRECTION_MISMATCH";
+    // La corrida que falla a mitad de camino.
+    await correct().catch(() => undefined);
+    // El reintento legítimo, sin fallo inyectado.
+    payrollPagedStub.failCorrectionLines = null;
+
+    const retry: unknown = await correct().catch((error: unknown) => error);
+
+    // HOY: el reintento choca con el índice único y responde ALREADY_CORRECTED:
+    // la corrección queda firmada sin filas para siempre.
+    expect(retry).not.toBeInstanceOf(PayrollError);
+    expect(correctionRows()).toHaveLength(1);
+    expect(correctionItemRows()).toHaveLength(1);
+  });
+
+  // ------------------------------------------------------------- GREEN ---
+
+  it("GREEN: escribe la cabecera y sus filas juntas, con los montos EXACTOS que calculó el servicio", async () => {
+    seedClosed();
+
+    const result = await correct();
+
+    expect(correctCalls()).toHaveLength(1);
+    // El shape del resultado no cambia: el período, la corrección y la vista.
+    expect(result.correction).toMatchObject({
+      period_id: PERIOD_ID,
+      previous_net_total: SALARY,
+      previous_paid_total: SALARY,
+      corrected_net_total: PRORATED,
+      previous_item_count: 1,
+      corrected_item_count: 1,
+      reason: REASON,
+      corrected_by: ACTOR.userId,
+    });
+    expect(result.view.differenceTotal).toBe(SALARY - PRORATED);
+    // DATA-IN/DATA-OUT: los montos que viajan en la escritura son los que
+    // resolvió la aritmética de TypeScript —la prorata de 7/30 días de
+    // 1.400.000— y lo que quedó escrito es EXACTAMENTE ese payload.
+    const args = correctCalls()[0].args;
+    const header = args.p_correction as Record<string, unknown>;
+    const lines = args.p_items as Array<Record<string, unknown>>;
+    expect(header).toMatchObject({
+      period_id: PERIOD_ID,
+      previous_net_total: SALARY,
+      previous_paid_total: SALARY,
+      corrected_net_total: PRORATED,
+    });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      employee_id: EMPLOYEE_ID,
+      previous_net_pay: SALARY,
+      previous_paid: SALARY,
+      corrected_net_pay: PRORATED,
+    });
+    expect(
+      payrollPagedStub.inserts.find((entry) => entry.table === "payroll_period_corrections")?.payload,
+    ).toEqual(header);
+    expect(
+      payrollPagedStub.inserts.find(
+        (entry) => entry.table === "payroll_period_correction_items",
+      )?.payload,
+    ).toEqual(lines);
+    // Y quedó escrito: una cabecera y una fila, con los mismos números.
+    expect(correctionRows()).toHaveLength(1);
+    expect(correctionItemRows()).toHaveLength(1);
+    expect(correctionItemRows()[0]).toMatchObject({
+      employee_id: EMPLOYEE_ID,
+      previous_net_pay: SALARY,
+      corrected_net_pay: PRORATED,
+    });
+    // La versión firmada del período no se toca: la corrección sólo escribe.
+    expect(payrollPagedStub.updates).toEqual([]);
+    expect(payrollPagedStub.tables.payroll_items[0].net_pay).toBe(SALARY);
+  });
+
+  it("precondición rechazada: un período ya corregido se rechaza y no escribe una segunda corrección", async () => {
+    seedClosed();
+    await correct();
+
+    const outcome: unknown = await correct("Segunda corrección.").catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(PayrollError);
+    expect(outcome).toMatchObject({ code: "ALREADY_CORRECTED", status: 409 });
+    // UNA cabecera y UN juego de filas: la corrección también queda firmada.
+    expect(correctionRows()).toHaveLength(1);
+    expect(correctionItemRows()).toHaveLength(1);
+    // La segunda ni siquiera abrió una transacción.
+    expect(correctCalls()).toHaveLength(1);
+  });
+
+  it("la CARRERA de la corrección se RECHAZA (ALREADY_CORRECTED) y no escribe nada de la perdedora", async () => {
+    seedClosed();
+    // Otra corrección del MISMO período se confirma entre el chequeo del
+    // servicio y la transacción: el índice único de 037 la protege dentro.
+    payrollPagedStub.beforeRpc = {
+      run: () => {
+        payrollPagedStub.tables.payroll_period_corrections = [
+          {
+            id: "correccion-ajena",
+            period_id: PERIOD_ID,
+            reason: "Otra corrección.",
+            corrected_by: "u-otro-admin",
+            corrected_at: "2026-09-08T10:00:00.000Z",
+          },
+        ];
+      },
+    };
+
+    const outcome: unknown = await correct().catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(PayrollError);
+    expect(outcome).toMatchObject({ code: "ALREADY_CORRECTED", status: 409 });
+    // La ajena queda intacta y de la nuestra no queda NADA.
+    expect(correctionRows()).toHaveLength(1);
+    expect(correctionRows()[0].id).toBe("correccion-ajena");
+    expect(correctionItemRows()).toEqual([]);
+  });
+
+  it("la precondición del cierre no se salta: si el período dejó de estar CERRADO, se rechaza sin escribir", async () => {
+    seedClosed();
+    payrollPagedStub.beforeRpc = {
+      run: () => {
+        (payrollPagedStub.tables.payroll_periods ?? [])[0].status = "borrador";
+      },
+    };
+
+    const outcome: unknown = await correct().catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(PayrollError);
+    expect(outcome).toMatchObject({ code: "PERIOD_NOT_CLOSED", status: 409 });
+    expect(correctionRows()).toEqual([]);
+    expect(correctionItemRows()).toEqual([]);
+  });
+
+  it("control negativo: una corrección exitosa SÍ escribe y no mueve plata", async () => {
+    // Si los "nada escrito" de arriba fueran vacuidad, este control lo dice.
+    seedClosed();
+
+    await correct();
+
+    expect(correctionRows()).toHaveLength(1);
+    expect(correctionItemRows()).toHaveLength(1);
+    expect(
+      payrollPagedStub.inserts.filter(
+        (entry) =>
+          entry.table === "payroll_payments" || entry.table === "payroll_extras",
+      ),
+    ).toEqual([]);
+    expect(payrollPagedStub.tables.voucher_requests).toEqual([]);
+  });
+});
+
+describe("migración 048_payroll_admin_atomic.sql (CL-9)", () => {
+  // La lectura es por test: el RED del SERVICIO corre con el archivo todavía
+  // ausente, y una lectura en el cuerpo del `describe` rompería la colección de
+  // todo el archivo en vez de fallar sólo estos tests.
+  const migration = (): { raw: string; sql: string } => {
+    const raw = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "048_payroll_admin_atomic.sql"),
+      "utf8",
+    );
+    // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+    return {
+      raw,
+      sql: raw
+        .split("\n")
+        .filter((line) => !line.trimStart().startsWith("--"))
+        .join("\n"),
+    };
+  };
+
+  it("los DOS pares viven cada uno en UNA función: una sentencia, una transacción", () => {
+    const { sql } = migration();
+    // Par 1: la reversión de los vales y el borrado del período.
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.payroll_delete_period_atomic");
+    expect(sql).toMatch(/UPDATE public\.voucher_requests/);
+    expect(sql).toMatch(/status\s*=\s*'descontada'/);
+    expect(sql).toMatch(/DELETE FROM public\.payroll_periods/);
+    // Par 2: la cabecera de la corrección y sus filas.
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.payroll_correct_period_atomic");
+    expect(sql).toMatch(/INSERT INTO public\.payroll_period_corrections/);
+    expect(sql).toMatch(/INSERT INTO public\.payroll_period_correction_items/);
+    expect(sql).toContain("jsonb_array_elements(p_items)");
+    // Orden determinista de los locks (misma disciplina que 046 y 047): sin él,
+    // dos operaciones concurrentes sobre los mismos vales pueden bloquearse en
+    // ciclo.
+    expect(sql).toMatch(/ORDER BY/);
+    expect(sql).toMatch(/FOR UPDATE/);
+  });
+
+  it("conserva las precondiciones de estado que el servicio ya tenía", () => {
+    const { sql } = migration();
+    // El borrado exige el borrador, igual que `assertDeletablePeriod`.
+    expect(sql).toMatch(/status\s*=\s*'borrador'/);
+    // La corrección exige el período cerrado, igual que `assertCorrectablePeriod`.
+    expect(sql).toMatch(/status\s*<>\s*'cerrado'/);
+    expect(sql).toContain("PERIOD_NOT_CLOSED");
+    // Y el guardia de solapamiento contra un período CERRADO, con su código.
+    expect(sql).toContain("PERIOD_OVERLAP_AMBIGUOUS");
+    expect(sql).toMatch(/o\.status\s*=\s*'cerrado'/);
+  });
+
+  it("tiene una red de conteo por grupo de escritura, con rollback", () => {
+    const { sql } = migration();
+    // Dos por función: la reversión y el borrado; la cabecera y las filas.
+    const diagnostics = sql.match(/GET DIAGNOSTICS/g) ?? [];
+    expect(diagnostics).toHaveLength(4);
+    expect(sql).toContain("RAISE EXCEPTION");
+    expect(sql).toContain("PAYROLL_VOUCHER_CONFLICT");
+    expect(sql).toContain("PAYROLL_PERIOD_CONFLICT");
+    expect(sql).toContain("PAYROLL_CORRECTION_MISMATCH");
+    // La guarda de forma no puede caer en un NULL silencioso: el `coalesce` es
+    // lo que hace que una clave AUSENTE falle en vez de comparar contra NULL.
+    expect(sql).toMatch(/coalesce\(/);
+  });
+
+  it("NO mueve aritmética de dinero a SQL: ningún monto se recalcula", () => {
+    const { sql } = migration();
+    // Las tablas ya validan sus montos con los CHECK de 007 y 037 (validar no
+    // es calcular): esta migración no agrega una sola expresión aritmética
+    // sobre las columnas de dinero. Escribir = convertir la representación
+    // (jsonb → la columna), no operar.
+    for (const column of [
+      "previous_net_total",
+      "previous_paid_total",
+      "corrected_net_total",
+      "previous_base_fixed",
+      "previous_commissions",
+      "previous_bonuses",
+      "previous_deductions_vales",
+      "previous_other_discounts",
+      "previous_net_pay",
+      "previous_paid",
+      "corrected_base_fixed",
+      "corrected_commissions",
+      "corrected_bonuses",
+      "corrected_deductions_vales",
+      "corrected_other_discounts",
+      "corrected_net_pay",
+    ]) {
+      expect(sql, column).not.toMatch(new RegExp(`${column}\\s*[+\\-*/]`));
+    }
+    expect(sql).not.toContain("CHECK");
+    expect(sql).not.toMatch(/sum\s*\(/i);
+  });
+
+  it("cierra el permiso: sólo service_role puede ejecutarlas", () => {
+    const { sql } = migration();
+    for (const signature of [
+      "public.payroll_delete_period_atomic(uuid, uuid, uuid[], uuid[])",
+      "public.payroll_correct_period_atomic(uuid, uuid, jsonb, jsonb)",
+    ]) {
+      expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature}`);
+      expect(sql).toContain(`GRANT EXECUTE ON FUNCTION ${signature}`);
+    }
+    expect(sql).toContain("FROM PUBLIC");
+    expect(sql).toContain("FROM anon");
+    expect(sql).toContain("FROM authenticated");
+    expect(sql).toContain("TO service_role");
+    expect(sql).toContain("SECURITY INVOKER");
+    expect(sql).toContain("SET search_path = public");
+  });
+
+  it("no borra ni reescribe datos fuera de lo que la operación ya borraba", () => {
+    const { sql } = migration();
+    // El ÚNICO borrado es el del período, y con su precondición: la operación
+    // ya lo hacía, y los vales NUNCA se borran (se revierten de estado).
+    const deletes = sql.match(/DELETE FROM/g) ?? [];
+    expect(deletes).toHaveLength(1);
+    expect(sql).not.toMatch(/DELETE FROM public\.voucher_requests/);
+    expect(sql).not.toMatch(/DELETE FROM public\.payroll_items/);
+    expect(sql).not.toMatch(/UPDATE public\.payroll_items/);
+    expect(sql).not.toMatch(/UPDATE public\.payroll_period_corrections/);
+    expect(sql).not.toMatch(/^\s*TRUNCATE/im);
+    expect(sql).not.toMatch(/^\s*ALTER TABLE/im);
+    expect(sql).not.toMatch(/^\s*CREATE INDEX/im);
+    expect(sql).not.toContain("DROP FUNCTION");
+    expect(sql).not.toContain("DROP TRIGGER");
+    expect(sql).not.toContain("DROP CONSTRAINT");
+  });
+
+  it("explica el motivo, el acoplamiento de despliegue y el costo de numeración", () => {
+    const { raw } = migration();
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+    expect(raw).toContain("ACOPLAMIENTO DE DESPLIEGUE");
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    // El número libre siguiente y el archivo hermano (047) que se espeja.
+    expect(raw).toContain("048");
+    expect(raw).toContain("047");
   });
 });
 
