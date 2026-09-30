@@ -1,0 +1,252 @@
+-- 043_cash_box_payment_idempotency.sql — CL-4: reenviar el MISMO pago de cajón
+-- deja de contar el efectivo dos veces.
+--
+-- MOTIVO DEL ARCHIVO
+--
+-- `registerPayment` (src/features/cash/service.ts, ~:1105) escribe el LIBRO DE
+-- CAJÓN (`payments`) en DOS casos: cuando el pago cobra una factura —y entonces
+-- escribe además la fila espejo en `invoice_payments`— y cuando NO la cobra, y
+-- entonces esa fila del libro es la ÚNICA escritura de la operación. Las dos
+-- puertas quedaron sin marca del ENVÍO hasta que la 041 (emisión de facturas) y
+-- la 042 (abono de nómina y cobro dividido) construyeron el mecanismo, y la CL-3
+-- lo trajo a la caja... sólo para el camino CON factura: su marca vive en la
+-- fila espejo (`invoice_payments`, columna e índice de 042), y la fila del libro
+-- de cajón de ese camino se reconoce por esa marca. El camino SIN factura no
+-- tiene espejo, así que ninguna de esas columnas lo toca: la 042 lo declaró
+-- fuera de su alcance ("No toca las filas de `payments`... esa es otra puerta,
+-- con su propio análisis"), y los comentarios del esquema y de la ruta lo
+-- dejaron escrito para que nadie leyera "última puerta" donde no la hay.
+--
+-- QUÉ SE MIDIÓ (no lo que se supuso)
+--
+-- La unidad anterior midió este defecto con una sonda temporal —retirada
+-- después— y el resultado fue: un pago sin factura reintentado escribe una
+-- SEGUNDA fila en `payments`. La medición se rehizo acá como test permanente,
+-- antes de tocar el código, con el mismo desenlace:
+--
+--     expected [ { id: 'caja-1', …(8) }, …(1) ] to have a length of 1 but got 2
+--
+-- CONSECUENCIA EN DINERO: los TRES lectores del arqueo suman
+-- `payments WHERE cash_shift_id = <turno> AND invoice_id IS NULL` (el cierre,
+-- la vista del día y el historial), así que la fila duplicada suma al esperado
+-- UNA VEZ DE MÁS: el turno queda con un sobrante fantasma (o un faltante real
+-- enmascarado) del monto repetido, y la "venta" que nadie hizo aparece en el
+-- día. A diferencia del cobro de factura, acá NO hay tope que frene el
+-- reintento: este camino no tiene una obligación contra la cual compararse
+-- (cualquier monto positivo es legítimo), así que la única barrera posible es
+-- la IDENTIDAD del envío.
+--
+-- CÓMO SE RECONOCE UNA REPETICIÓN (decisión del dueño, no del agente)
+--
+-- Por una MARCA que manda el llamador: `idempotency_key` en `payments`, el
+-- mismo mecanismo de la 041 y la 042. NO por el CONTENIDO: deduplicar por
+-- contenido prohibiría dos pagos de cajón legítimos del mismo monto por el
+-- mismo método hechos en dos intentos distintos —lo normal al registrar dos
+-- movimientos iguales—; la marca es lo único que distingue "el mismo envío" de
+-- "el mismo contenido". La marca es un uuid que el llamador acuña al empezar el
+-- intento, que reutiliza en los reintentos del MISMO intento y que suelta al
+-- éxito (nunca por tecla ni por render), y se valida con la MISMA definición
+-- para las cinco puertas del dinero (`idempotencyKeySchema`,
+-- src/features/billing/schemas.ts).
+--
+-- POR QUÉ `payments` NECESITA SU PROPIA COLUMNA
+--
+-- Porque en este camino la fila del libro ES la operación completa: no hay
+-- espejo que la identifique, no hay obligación de la que colgarla y no hay
+-- tope que la frene. Guardar la marca en otra tabla exigiría un registro de
+-- operación que la 042 evaluó y descartó por caro (tabla nueva, FK, backfill
+-- conceptual y reescritura de pantallas) para lo que resuelve. Y la columna es
+-- la MISMA que ya existe en las otras dos tablas de dinero: una sola forma de
+-- reconocer una repetición en todo el sistema.
+--
+-- LA CLAVE: (`cash_shift_id`, `idempotency_key`), NO (`sede_id`, ...)
+--
+-- La fila del libro de cajón PERTENECE A UN TURNO: `cash_shift_id` es NOT NULL
+-- (006_cash.sql), es el dueño del dinero y es exactamente la columna por la que
+-- lo leen los tres lectores del arqueo. La marca se resuelve DENTRO del
+-- registro que la usó, igual que la 041 la resuelve dentro de la sede y la 042
+-- dentro del ítem de nómina o de la factura: para un pago sin factura, el
+-- registro al que la operación pertenece es el libro del turno, porque no hay
+-- URL ni obligación que lo identifique. Con la clave por turno el lookup no
+-- puede devolver el dinero de OTRO turno, y el índice queda alineado con la
+-- única dimensión que los lectores usan. Un uuid ya es único globalmente:
+-- acotarlo al turno no cuesta nada y agrega el aislamiento. La consecuencia,
+-- declarada y no escondida: la misma marca en DOS turnos son DOS operaciones
+-- (no una repetición), y un reintento que llegue con OTRO turno abierto no se
+-- reconoce; ver "LIMITACIÓN DECLARADA" abajo.
+--
+-- MECANISMO (dos barreras, en este orden)
+--
+--   1. La columna. Guarda la marca del intento de pago de cajón.
+--   2. El índice único PARCIAL. Es la barrera FINAL contra la carrera: el
+--      servicio mira la marca ANTES de insertar (así el reintento normal no
+--      escribe nada), pero entre esa lectura y el INSERT hay una ventana. Si
+--      otra operación con la MISMA marca y el MISMO turno se confirma ahí
+--      adentro, este INSERT choca con el índice (código 23505), el servicio
+--      vuelve a buscar por la marca y devuelve la fila de la ganadora. Mismo
+--      patrón de barrera final que `uq_invoices_sede_idempotency_key` (041),
+--      `uq_invoice_payments_invoice_idempotency_key` y
+--      `uq_payroll_payments_item_idempotency_key` (042),
+--      `uq_cash_shifts_open_per_register` (006) y `uq_payroll_draft_per_range`
+--      (007).
+--
+--      Parcial (`WHERE idempotency_key IS NOT NULL`) por tres razones: las
+--      filas ya registradas no tienen marca y no deben entrar al índice; una
+--      marca NULL no es una marca y no puede deduplicar nada; y las filas del
+--      camino CON factura —que quedan con marca NULL a propósito, ver abajo—
+--      no compiten con las de este camino.
+--
+-- LA ARRUGA DE 042 NO APLICA ACÁ: este camino inserta UNA sola fila (una
+-- sentencia de un objeto, no un `insert([...])` de N porciones), así que la
+-- marca vive en esa única fila, no hay porciones hermanas que enumerar y el
+-- índice nunca puede rechazar una operación legítima.
+--
+-- POR QUÉ LA FILA DEL CAMINO CON FACTURA QUEDA SIN MARCA
+--
+-- A propósito, y no por olvido: en ese camino la identidad de la operación
+-- vive en la fila espejo (`invoice_payments`, marca e índice de 042) y el
+-- servicio la reconoce por ahí antes de escribir el libro de cajón. Marcar
+-- además la fila del libro mezclaría en un mismo índice las marcas de dos
+-- caminos distintos: un cliente que reenviara la misma marca para un cobro de
+-- factura y para un pago de cajón del mismo turno haría chocar al segundo
+-- contra la fila del primero, y el servicio lo leería como "la operación ya
+-- está registrada" cuando en realidad es otra operación. Se deja el camino de
+-- factura EXACTAMENTE como lo dejó la CL-3 (su reconocimiento no cambia) y este
+-- índice sólo ve las marcas de su propia puerta.
+--
+-- COSTO DECLARADO (no se esconde)
+--
+-- AQUÍ NO SE QUEMA NINGÚN NÚMERO. `payments.id` es
+-- `uuid PRIMARY KEY DEFAULT gen_random_uuid()` (006_cash.sql), así que la tabla
+-- no tiene serie ni consecutivo y no hay hueco que declarar, ni en el camino
+-- normal ni en la carrera. Lo que sí cuesta la carrera es una sentencia
+-- ABORTADA: la perdedora ya había resuelto el turno y el método cuando chocó
+-- con el índice, y esa sentencia no deja filas. Es el mismo canje de la 042
+-- —perder trabajo invisible antes que contar el efectivo dos veces— sin el
+-- hueco de consecutivo que sí existe en la 041. Se hace notar también en el
+-- código del servicio.
+--
+-- LIMITACIÓN DECLARADA (una ventana que este índice NO cierra)
+--
+-- Como la clave incluye el turno, la marca se resuelve dentro del turno. Un
+-- reintento que llegue cuando el turno original YA se cerró y HAY OTRO abierto
+-- se resuelve contra el turno nuevo: si no trae `cash_shift_id` lo toma del
+-- turno abierto, no encuentra la marca ahí y escribe una SEGUNDA fila (en el
+-- turno nuevo). Con `cash_shift_id` explícito el reintento muere antes, en la
+-- guarda de estado, con SHIFT_CLOSED. Es la MISMA familia de la limitación ya
+-- declarada en la CL-3 para el cobro de factura ("un reintento que llegue con
+-- el turno ya cerrado o con el método inactivo se rechaza en vez de
+-- reconocerse"): el caso real del reintento —doble clic, o el navegador
+-- reenviando tras cortarse la red— ocurre segundos después, con el mismo turno
+-- abierto, y ahí la marca SÍ reconoce. Cerrar esa ventana exige ampliar la
+-- clave a la sede y mover el lookup antes de resolver el turno; no se hace acá
+-- porque CAMBIA el significado de la operación (misma marca en dos turnos
+-- pasaría a ser una sola) y porque el encargo pide la clave por turno, que es
+-- lo que la operación significa. Queda como deuda declarada, no silenciosa.
+--
+-- QUÉ NO HACE ESTE ARCHIVO
+--
+--   * No borra ni reescribe filas: `ADD COLUMN IF NOT EXISTS` con NULL (sin
+--     DEFAULT, así que no toca ninguna fila) y un índice. No hay UPDATE de
+--     datos, ni DELETE, ni TRUNCATE, ni backfill: las filas anteriores a esta
+--     migración no tienen marca y no pueden tenerla (reconstruirla sería
+--     adivinar qué filas fueron el mismo envío).
+--   * No cambia el dinero: ni la aritmética, ni el redondeo a peso entero, ni
+--     el recargo, ni el tope de salidas en efectivo del turno, ni la semántica
+--     del cajón. La columna no entra en ninguna regla de negocio; sólo reconoce
+--     envíos repetidos.
+--   * No toca el camino CON factura del mismo servicio (su marca es la de la
+--     fila espejo, 042) ni el tope de 031, ni la regla de "Pagada".
+--   * No agrega índices redundantes: el índice único parcial ya sirve la
+--     lectura por marca (el lookup del servicio).
+--
+-- ACOPLAMIENTO DE DESPLIEGUE: la 043 va ANTES que este código. Sin la columna,
+-- el lookup por marca (`findDrawerPaymentByIdempotencyKey`) falla y TODOS los
+-- pagos de cajón sin factura dan 500. Misma regla que 005/034/041/042.
+--
+-- IDEMPOTENTE Y RE-EJECUTABLE: `ADD COLUMN IF NOT EXISTS`,
+-- `CREATE UNIQUE INDEX IF NOT EXISTS` y el CHECK con `DROP CONSTRAINT IF
+-- EXISTS` + `ADD CONSTRAINT` (el patrón de 038/041/042) dejan el esquema
+-- idéntico en cada corrida. Ninguna sentencia borra filas. El runner de
+-- Supabase aplica el archivo en una transacción: o entra todo, o no entra nada.
+--
+-- ORDEN DE LOS STATEMENTS (importa y es deliberado):
+--   1. La columna. Va PRIMERO porque es el insumo del índice y del CHECK: sin
+--      ella las dos sentencias siguientes no compilarían.
+--   2. El comentario de la columna (sólo comentario): qué es la marca, dónde
+--      vive y por qué las filas anteriores quedan NULL.
+--   3. La guarda de forma (CHECK). Va ANTES del índice porque es el rechazo más
+--      barato y el más explícito: un escritor crudo que mande una marca que no
+--      es un uuid se rechaza por forma antes de llegar a la comparación del
+--      índice.
+--   4. El índice único parcial. Va AL FINAL de las sentencias ejecutables: es
+--      la barrera que el servicio usa como desenlace (23505 → relectura de la
+--      ganadora), y dejarlo al final mantiene el orden del resto de las
+--      migraciones de identidad (041, 042).
+--   5. La nota final. Qué NO protege este índice, para el que lea el tope de al
+--      lado y crea que ya está cubierto.
+--
+-- NO ejecutado por el agente: requiere base de datos.
+
+-- ===================================================================== ---
+-- 1. La MARCA del intento de pago de cajón
+-- ===================================================================== ---
+
+-- NULL a propósito: las filas ya registradas no tienen marca (la decisión del
+-- dueño es hacia adelante) y la marca es opcional a nivel de esquema porque
+-- sólo el camino SIN factura la escribe (el camino con factura deja NULL y su
+-- identidad es la fila espejo de 042). Sin DEFAULT, `ADD COLUMN` no reescribe
+-- la tabla y no hay backfill que inventar.
+ALTER TABLE public.payments
+  ADD COLUMN IF NOT EXISTS idempotency_key text NULL;
+
+-- ===================================================================== ---
+-- 2. Qué es la marca de esta tabla
+-- ===================================================================== ---
+
+COMMENT ON COLUMN public.payments.idempotency_key IS
+  'CL-4: marca de idempotencia del intento de pago de cajón (uuid que acuña el llamador al empezar el intento, se reutiliza en los reintentos del MISMO intento y se suelta al éxito). La escribe SÓLO el camino SIN factura; el camino con factura la deja NULL porque su identidad vive en la fila espejo (invoice_payments, 042). Reenviar la misma marca devuelve el pago ya registrado en vez de contar el efectivo dos veces. NULL en las filas anteriores a 043.';
+
+-- ===================================================================== ---
+-- 3. La guarda de forma: una marca es un uuid, no cualquier texto
+-- ===================================================================== ---
+
+-- El servicio valida el formato ANTES de escribir (`idempotencyKeySchema`, la
+-- MISMA definición para las cinco puertas del dinero: billing/schemas.ts), así
+-- que ningún camino del usuario puede llegar a este CHECK: es la última red
+-- para un escritor crudo (SQL, un servicio futuro) y prefiere rechazar la fila
+-- antes que guardar una marca que el lookup nunca podría reconocer.
+ALTER TABLE public.payments
+  DROP CONSTRAINT IF EXISTS payments_idempotency_key_shape;
+ALTER TABLE public.payments
+  ADD CONSTRAINT payments_idempotency_key_shape CHECK (
+    idempotency_key IS NULL
+    OR idempotency_key ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  );
+
+-- ===================================================================== ---
+-- 4. La barrera final: a lo sumo UNA operación por marca y turno
+-- ===================================================================== ---
+
+-- Parcial: la marca NULL (filas históricas y las del camino con factura) queda
+-- fuera del índice, y una marca vacía tampoco deduplica nada. Es la barrera que
+-- convierte la carrera lookup→INSERT en un 23505 que el servicio traduce en
+-- "devuelve la operación existente".
+CREATE UNIQUE INDEX IF NOT EXISTS uq_payments_shift_idempotency_key
+  ON public.payments (cash_shift_id, idempotency_key)
+  WHERE idempotency_key IS NOT NULL;
+
+-- ===================================================================== ---
+-- 5. Nota: qué NO protege este índice
+-- ===================================================================== ---
+
+-- La marca de esta migración resuelve UNA cosa: que el MISMO envío del camino
+-- SIN factura no entre dos veces en el libro de un turno. NO protege:
+--   * el camino CON factura (su identidad es la fila espejo de 042; la fila del
+--     libro queda NULL y se reconoce por la marca del espejo);
+--   * el tope de salidas en efectivo del turno ni ningún tope: acá no hay
+--     obligación contra la cual compararse (ver "MOTIVO DEL ARCHIVO");
+--   * la ventana de la LIMITACIÓN DECLARADA (el turno cambió entre el intento y
+--     su reintento): eso lo decide la clave, no el índice.
+-- La marca y los topes resuelven problemas DISTINTOS y las dos cosas siguen
+-- haciendo falta en las puertas que tienen ambos.

@@ -1073,6 +1073,66 @@ async function repeatedCollectionResult(
 }
 
 /**
+ * CL-4: la fila del LIBRO DE CAJÓN (`payments`) que YA se registró con esa
+ * marca, DENTRO DE ESE TURNO.
+ *
+ * La marca es un uuid que acuña el llamador al empezar el intento de pago y que
+ * reutiliza en los reintentos del MISMO intento; ver `idempotencyKeySchema`
+ * (billing/schemas.ts) y `registerPaymentSchema` (schemas.ts). El filtro es por
+ * TURNO: la fila del libro pertenece a un turno (`cash_shift_id` es NOT NULL y
+ * es el dueño del dinero), así que la marca se resuelve dentro del turno que la
+ * usó, el lookup nunca puede devolver el pago de OTRO turno, y la misma marca
+ * en dos turnos son dos operaciones. Es el mismo patrón que
+ * `findInvoicePaymentsByIdempotencyKey` (acá arriba, y billing/service.ts) y
+ * `findPayrollPaymentsByIdempotencyKey` (payroll/service.ts), con la clave de
+ * esta tabla: la migración 043 eligió `(cash_shift_id, idempotency_key)` y este
+ * lookup usa la MISMA clave, así que no puede devolver una fila que el índice
+ * no habría bloqueado.
+ *
+ * SÓLO MIRA EL CAMINO SIN FACTURA, por construcción: las filas del camino con
+ * factura quedan con la marca NULL (su identidad es la fila espejo de 042) y un
+ * `eq("idempotency_key", mark)` nunca las ve. Es deliberado: mezclar en un
+ * mismo índice las marcas de los dos caminos haría que la marca de un cobro de
+ * factura pudiera leerse como "el pago de cajón ya está registrado".
+ *
+ * ACÁ NO ESTÁ LA ARRUGA DE "LA MARCA EN LA PRIMERA PORCIÓN" de 042: este
+ * camino inserta UNA sola fila (una sentencia de un objeto, no un
+ * `insert([...])` de N porciones), así que la marca vive en esa única fila, el
+ * índice único parcial de 043 nunca puede rechazar una operación legítima y no
+ * hay filas hermanas que enumerar: la fila que devuelve este lookup ES la
+ * operación completa.
+ */
+async function findDrawerPaymentByIdempotencyKey(
+  db: DbClient,
+  shiftId: string,
+  idempotencyKey: string,
+): Promise<CashPaymentRow | null> {
+  const { data, error } = await db
+    .from("payments")
+    .select(PAYMENT_SELECT)
+    .eq("cash_shift_id", shiftId)
+    .eq("idempotency_key", idempotencyKey)
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  return (data as CashPaymentRow | null) ?? null;
+}
+
+/**
+ * CL-4: el resultado de una repetición reconocida del camino SIN factura: lo
+ * que la operación YA registró, sin escribir nada.
+ *
+ * El llamador recibe el MISMO `PaymentResult` que le devolvió el intento que
+ * ganó —misma fila del libro, mismo turno, `invoice_id` e `invoice_status`
+ * nulos, que es lo que este camino devuelve—, así que para él es un no-op
+ * exitoso y no un error. El turno que se devuelve es el que COBRÓ: el único
+ * que el lookup pudo encontrar, porque la marca se resuelve dentro del turno.
+ */
+function repeatedDrawerPaymentResult(payment: CashPaymentRow, shift: CashShiftRow): PaymentResult {
+  return { payment, shift, invoice_id: null, invoice_status: null };
+}
+
+/**
  * CAJ-02: registra un pago contra el turno abierto (el indicado o el
  * único abierto de la sede). Método activo, monto > 0; si trae
  * invoice_id, la factura debe existir en la sede y no estar Anulada.
@@ -1098,10 +1158,14 @@ async function repeatedCollectionResult(
  * dividido, en cambio, exige el saldo EXACTO: su reintento muere en esa
  * comprobación.
  *
- * QUÉ PASA CON UN PAGO SIN FACTURA: la marca NO se exige ni se mira. Esa fila
- * vive sólo en `payments`, que no tiene columna de marca (ver "QUÉ NO HACE ESTE
- * ARCHIVO" en 042): quedó declarada como deuda, fuera del alcance de esta
- * unidad.
+ * QUÉ PASA CON UN PAGO SIN FACTURA (CL-4): la marca también es OBLIGATORIA y
+ * ahora se mira. Esa fila vive sólo en `payments` y es la ÚNICA escritura de esa
+ * operación, así que la columna y el índice único parcial de la migración 043
+ * —`(cash_shift_id, idempotency_key)`— son su identidad. Antes de la 043 un
+ * reintento escribía una SEGUNDA fila y los tres lectores del arqueo —que suman
+ * `payments WHERE invoice_id IS NULL`— contaban el efectivo del turno dos
+ * veces; no había tope que lo frenara, porque este camino no tiene obligación
+ * contra la cual compararse.
  */
 export async function registerPayment(raw: unknown, actor: CashActor): Promise<PaymentResult> {
   const parsed = registerPaymentSchema.safeParse(raw);
@@ -1109,18 +1173,18 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
     throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const input: RegisterPaymentInput = parsed.data;
-  // CL-3: la marca del intento. El esquema la exige para el cobro de factura
-  // (`registerPaymentSchema`, con la MISMA definición para las cuatro puertas
+  // CL-3/CL-4: la marca del intento. El esquema la exige SIEMPRE
+  // (`registerPaymentSchema`, con la MISMA definición para las cinco puertas
   // del dinero); esta es la SEGUNDA red —el patrón del CHECK de forma de la
-  // 042— y además el único valor que usan el reconocimiento y la escritura, así
-  // que no pueden separarse. Un cobro de factura sin marca se rechaza acá,
+  // 042 y de la 043— y además el único valor que usan el reconocimiento y la
+  // escritura, así que no pueden separarse. Un pago sin marca se rechaza acá,
   // ANTES de leer nada y de escribir nada: sin marca no se puede reconocer una
   // repetición, y la ruta REST es justamente la superficie que reintenta.
   const mark = input.idempotency_key ?? "";
-  if (input.invoice_id && !mark) {
+  if (!mark) {
     throw new CashError(
       "VALIDATION",
-      "La marca de idempotencia es obligatoria para cobrar una factura.",
+      "La marca de idempotencia es obligatoria para registrar un pago.",
       400,
     );
   }
@@ -1222,6 +1286,31 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
       if (invoiceBalance.netCollected + cardFee.net - invoiceBalance.netBilled > 0.009) {
         throw new CashError("OVERPAID", "El pago supera el saldo pendiente de la factura.", 422);
       }
+    }
+
+    if (!input.invoice_id) {
+      // CL-4: la MARCA del camino SIN factura, antes de la ÚNICA escritura de
+      // este camino y antes de cualquier otra lectura que decida. Un reintento
+      // del MISMO envío (doble clic, o el navegador reenviando tras cortarse la
+      // red) trae la misma marca: se devuelve lo que la operación ya registró,
+      // sin escribir nada y sin contar el efectivo del turno dos veces.
+      //
+      // POR QUÉ ACÁ Y NO ANTES DEL TURNO: el turno es el DUEÑO de la fila
+      // (`cash_shift_id`) y el ALCANCE de la marca —la clave del índice de 043
+      // es `(cash_shift_id, idempotency_key)`—, así que hay que resolverlo
+      // primero. La contrapartida, declarada en la 043 como "LIMITACIÓN
+      // DECLARADA": un reintento que llegue con el turno ya cerrado se rechaza
+      // con SHIFT_CLOSED, y uno que llegue SIN `cash_shift_id` después de que
+      // se cerró el turno original y se abrió otro se resuelve contra el turno
+      // nuevo, no encuentra la marca ahí y escribe una segunda fila. El caso
+      // real del reintento —segundos después— tiene el mismo turno abierto, y
+      // ahí la marca SÍ reconoce.
+      //
+      // Va DESPUÉS de resolver el método a propósito (mismo orden que el camino
+      // con factura, que también resuelve método antes): el método inactivo se
+      // reporta como METHOD_INACTIVE, repetido o no.
+      const repeated = await findDrawerPaymentByIdempotencyKey(db, shift.id, mark);
+      if (repeated) return repeatedDrawerPaymentResult(repeated, shift);
     }
 
     // T0-a (Defecto 2): el espejo de factura va PRIMERO. `invoice_payments`
@@ -1343,10 +1432,37 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
         method_code: method.code,
         amount: gross,
         user_id: actor.userId,
+        // CL-4: la marca del intento, en la fila del libro de cajón. La lleva
+        // SOLO el camino SIN factura, donde esta fila es la ÚNICA escritura de
+        // la operación y no hay espejo que la identifique (migración 043). En
+        // el camino CON factura la marca de la operación vive en la fila espejo
+        // (`invoice_payments`, 042) —su reconocimiento no cambió— y acá queda
+        // NULL a propósito: marcar las dos mezclaría en un mismo índice las
+        // marcas de dos caminos distintos (ver "POR QUÉ LA FILA DEL CAMINO CON
+        // FACTURA QUEDA SIN MARCA" en la 043).
+        idempotency_key: input.invoice_id ? null : mark,
       })
       .select(PAYMENT_SELECT)
       .single();
     if (paymentError || !payment) {
+      // CL-4: barrera FINAL de la carrera del pago SIN factura. El lookup de
+      // arriba y este INSERT no son atómicos: si otro envío con la MISMA marca
+      // en el MISMO turno confirmó en esa ventana, este INSERT choca con el
+      // índice único parcial de 043 (23505). Acá NO hay espejo que revertir (el
+      // camino sin factura escribe UNA sola fila), así que la repetición se
+      // relee y se devuelve; sin ganadora, el 23505 no es una repetición y se
+      // reporta como fallo real en vez de disfrazarlo.
+      //
+      // COSTO DECLARADO: acá no se quema ningún número (`payments.id` es un
+      // uuid, la tabla no tiene serie); lo que se pierde es la sentencia
+      // ABORTADA de la perdedora, que ya había resuelto turno y método. Se
+      // prefiere eso —raro, y exige dos envíos con la misma marca solapados—
+      // antes que contar el efectivo del turno dos veces.
+      if (!input.invoice_id && (paymentError as { code?: string } | null)?.code === "23505") {
+        const winner = await findDrawerPaymentByIdempotencyKey(db, shift.id, mark);
+        if (winner) return repeatedDrawerPaymentResult(winner, shift);
+        throw new CashError("INTERNAL", "Error interno.", 500);
+      }
       // Reversa VERIFICADA del espejo: el error del DELETE no se traga. Si el
       // DELETE falla, la fila de cajón tampoco existe, así que el cobro queda
       // SOLO en `invoice_payments` (visible para el arqueo) y la falla se
