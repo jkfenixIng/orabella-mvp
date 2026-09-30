@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useTransition, type FormEvent } from "react";
+import { useEffect, useRef, useState, useTransition, type FormEvent } from "react";
 import { toast } from "sonner";
 import {
   annulInvoiceAction,
@@ -269,6 +269,19 @@ function todayLocalISO(): string {
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
 }
 
+/**
+ * MO-1: marca nueva para un intento de emisión. `crypto.randomUUID()` está en
+ * el navegador (contexto seguro) y en el runtime de Node; no hace falta ninguna
+ * dependencia nueva.
+ *
+ * El uuid viaja en el cuerpo del POST como `idempotency_key`. El servidor lo
+ * guarda con la factura y, si vuelve un envío con la MISMA marca, devuelve la
+ * factura que ya existe en vez de emitir una segunda.
+ */
+function newEmissionKey(): string {
+  return crypto.randomUUID();
+}
+
 export function InvoicesClient(props: InvoicesClientProps) {
   const [invoices, setInvoices] = useState<InvoiceListItem[]>(props.initialInvoices);
   const [totalInvoices, setTotalInvoices] = useState(props.initialTotal);
@@ -505,6 +518,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setDiscount("");
     setItems([]);
     setPortions([{ method_code: "efectivo", amount: "" }]);
+    // MO-1: cerrar el diálogo abandona el intento; el próximo acuña otra marca.
+    // Si el intento anterior falló y se reabre para una venta DISTINTA, esa
+    // venta no puede quedar pegada a la marca del intento abandonado.
+    emissionKeyRef.current = null;
     setCreateDialogOpen(false);
   }
 
@@ -719,24 +736,47 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setConfirmKind("emit");
   }
 
+  /**
+   * MO-1: marca de idempotencia del INTENTO de emisión en curso.
+   *
+   * Se acuña cuando el intento EMPIEZA (al confirmar la emisión) y se conserva
+   * mientras se reintenta: si la red se corta y el usuario vuelve a emitir, el
+   * servidor recibe la MISMA marca y devuelve la factura que ya existe en lugar
+   * de emitir otra. Se renueva sólo cuando el intento anterior terminó bien, o
+   * cuando el diálogo se cierra y el siguiente intento es otro distinto.
+   *
+   * No es por tecla ni por render: el borrador del formulario cambia libremente
+   * sin tocar la marca, así que deduplicar por marca NO confunde "el mismo
+   * envío" con "el mismo contenido" (dos clientes comprando lo mismo son dos
+   * facturas, porque son dos intentos distintos con dos marcas distintas).
+   */
+  const emissionKeyRef = useRef<string | null>(null);
+
   async function confirmEmit() {
     const payload = buildCreatePayload();
     if (payload === null) {
       setConfirmKind(null);
       return;
     }
+    const emissionKey = emissionKeyRef.current ?? newEmissionKey();
+    emissionKeyRef.current = emissionKey;
     setBusy(true);
     let result: ActionResult<InvoiceDetail>;
     try {
-      result = await createInvoiceAction(payload);
+      result = await createInvoiceAction({ ...payload, idempotency_key: emissionKey });
     } finally {
       setBusy(false);
     }
     if (!result.success) {
+      // El intento NO terminó: se conserva la marca. El reintento tiene que
+      // llevar la misma para que el servidor reconozca la repetición.
       setError(`[${result.code}] ${result.message}`);
       setConfirmKind(null);
       return;
     }
+    // El intento terminó bien: la próxima emisión es OTRO intento y merece otra
+    // marca (si no, la segunda venta devolvería esta misma factura).
+    emissionKeyRef.current = null;
     // EVENTO: la emisión acaba de pasar; efímera, no estado.
     toast.success(`Factura #${result.data.invoice.consecutive_number} ${result.data.invoice.status.toLowerCase()}.`);
     setClientName("");

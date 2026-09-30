@@ -84,6 +84,23 @@ export type InvoiceStatus = z.infer<typeof invoiceStatusSchema>;
 const uuidSchema = z.uuid("Identificador inválido.");
 
 /**
+ * MO-1: marca de idempotencia de la EMISIÓN (uuid que genera la pantalla).
+ *
+ * El dueño ya decidió qué hacer con dos envíos idénticos: son UNO. Y cómo se
+ * reconocen: por una MARCA que manda el cliente, no por el contenido.
+ * Deduplicar por CONTENIDO bloquearía una venta legítimamente repetida —dos
+ * clientes distintos comprando lo mismo, o el mismo cliente comprando dos
+ * veces—; la marca es lo único que distingue "el mismo envío" de "el mismo
+ * contenido".
+ *
+ * Es OBLIGATORIA: un envío sin marca no se puede reconocer como repetición, así
+ * que aceptarlo sin marca es reabrir el defecto para ESE llamador —y la ruta
+ * REST (`/api/v1/invoices`) es una superficie pública, justo la que reintenta
+ * sobre redes—. El rechazo es ruidoso (VALIDATION) y nunca silencioso.
+ */
+export const idempotencyKeySchema = z.uuid("La marca de idempotencia debe ser un UUID.");
+
+/**
  * Tolerancia al comparar sumas de dinero. Se conserva en un centavo: con la
  * regla del peso entero (ver `roundMoney`) todo monto es entero, así que este
  * epsilon equivale a "exactamente igual" y a la vez sigue tolerando las filas
@@ -237,6 +254,12 @@ export type PaymentPortionInput = z.infer<typeof paymentPortionSchema>;
 
 /** FAC-01…07: creación de factura (descuento a nivel factura + porciones). */
 export const createInvoiceSchema = z.object({
+  /**
+   * MO-1: marca del INTENTO de emisión (ver `idempotencyKeySchema`). Viaja en el
+   * cuerpo y se reutiliza en los reintentos del MISMO intento; reenviarla no
+   * emite otra factura: devuelve la que ya existe.
+   */
+  idempotency_key: idempotencyKeySchema,
   client_name: z.string().trim().max(120, "Nombre muy largo.").optional(),
   client_document: z.string().trim().max(20, "Documento inválido.").nullish(),
   items: z.array(invoiceItemSchema).min(1, "La factura exige al menos un ítem."),
