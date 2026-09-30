@@ -1,11 +1,13 @@
 import {
   approveVoucherSchema,
+  assertCorrectablePeriod,
   assertDraftPeriod,
   assertDeletablePeriod,
   assertNoOverpay,
   assertPortionsMatchNet,
   buildEmployeeCommissionDetail,
   buildEmployeeDetail,
+  buildPayrollCorrectionView,
   buildPayrollMonthToDate,
   calculatePayrollSchema,
   canDiscountVoucher,
@@ -14,6 +16,7 @@ import {
   checkVoucherCaps,
   checkVoucherEligibility,
   computeNetPay,
+  correctPayrollPeriodSchema,
   normalizeAllowedDays,
   normalizePerDayLimits,
   openPeriodSchema,
@@ -36,6 +39,7 @@ import {
   type CalculatePayrollInput,
   type DetailLine,
   type OpenPeriodInput,
+  type PayrollCorrectionView,
   type PayrollExtraKind,
   type PayrollMonthEmployeeRow,
 } from "./schemas";
@@ -58,6 +62,7 @@ import {
   listAllEmployees,
   listPaymentMethods,
   requireSession,
+  type EmployeeRow,
 } from "@/src/features/admin/service";
 import { resolveVoucherAlert } from "@/src/features/alerts/service";
 import {
@@ -272,6 +277,14 @@ function toPayrollError(error: unknown): PayrollError {
           "Solo se pueden borrar períodos en borrador; este ya está cerrado.",
           409,
         );
+      case "PERIOD_NOT_CLOSED":
+        // PA-2b: un borrador no se corrige, se recalcula. Corregir es para una
+        // liquidación ya firmada, que no tiene otra salida.
+        return new PayrollError(
+          "PERIOD_NOT_CLOSED",
+          "Solo se corrigen períodos cerrados; este está en borrador y se recalcula.",
+          409,
+        );
       case "OVERPAID":
         return new PayrollError(
           "OVERPAID",
@@ -360,6 +373,66 @@ export interface PayrollExtraRow {
   created_at: string;
 }
 
+/**
+ * PA-2b: una corrección de un período CERRADO. Guarda las DOS versiones —los
+ * totales de la versión anterior congelados y los de la corregida—, más el
+ * motivo, quién corrigió y cuándo. El período y sus ítems NO se tocan: esta
+ * fila es la versión corregida, autocontenida y legible por sí sola.
+ */
+export interface PayrollPeriodCorrectionRow {
+  id: string;
+  period_id: string;
+  /** Total neto que el período decía antes de corregir (versión anterior). */
+  previous_net_total: number;
+  /** Total pagado del período al momento de corregir (no cambia). */
+  previous_paid_total: number;
+  /** Total neto que dicen las reglas vigentes (versión corregida). */
+  corrected_net_total: number;
+  previous_item_count: number;
+  corrected_item_count: number;
+  /** Motivo obligatorio de la corrección. */
+  reason: string;
+  corrected_by: string;
+  corrected_at: string;
+}
+
+/**
+ * PA-2b: los montos por empleado de una corrección, con las dos versiones
+ * (anterior congelada y corregida) y lo pagado. Las filas se guardan para que
+ * la corrección sea autocontenida: leerla no depende de que nadie haya
+ * respetado la inmutabilidad del período.
+ */
+export interface PayrollPeriodCorrectionItemRow {
+  id: string;
+  correction_id: string;
+  employee_id: string;
+  previous_base_fixed: number;
+  previous_commissions: number;
+  previous_bonuses: number;
+  previous_deductions_vales: number;
+  previous_other_discounts: number;
+  previous_net_pay: number;
+  previous_paid: number;
+  corrected_base_fixed: number;
+  corrected_commissions: number;
+  corrected_bonuses: number;
+  corrected_deductions_vales: number;
+  corrected_other_discounts: number;
+  corrected_net_pay: number;
+}
+
+/**
+ * PA-2b: el resultado de corregir (o de leer la corrección de) un período. La
+ * vista trae la comparación ya armada: por empleado y para el período, lo que
+ * decía la versión anterior, lo que dice la corregida, lo pagado y la
+ * diferencia.
+ */
+export interface PayrollPeriodCorrectionResult {
+  period: PayrollPeriodRow;
+  correction: PayrollPeriodCorrectionRow;
+  view: PayrollCorrectionView;
+}
+
 export interface VoucherSettingsRow {
   sede_id: string;
   /** V2: null o 0 = sin tope diario general. */
@@ -403,6 +476,11 @@ const PAYMENT_SELECT =
   "id, payroll_item_id, method_id, method_code, amount, paid_at, paid_by, reference";
 const EXTRA_SELECT =
   "id, sede_id, employee_id, amount, method_id, method_code, reference, reason, kind, days_from, days_to, paid_by, paid_at, created_at";
+/** PA-2b: la corrección de un período cerrado (037). */
+const PERIOD_CORRECTION_SELECT =
+  "id, period_id, previous_net_total, previous_paid_total, corrected_net_total, previous_item_count, corrected_item_count, reason, corrected_by, corrected_at";
+const PERIOD_CORRECTION_ITEM_SELECT =
+  "id, correction_id, employee_id, previous_base_fixed, previous_commissions, previous_bonuses, previous_deductions_vales, previous_other_discounts, previous_net_pay, previous_paid, corrected_base_fixed, corrected_commissions, corrected_bonuses, corrected_deductions_vales, corrected_other_discounts, corrected_net_pay";
 /** Columnas base (migración 007), siempre presentes. */
 const VOUCHER_SELECT_BASE =
   "id, sede_id, employee_id, amount, request_date, status, approved_by, approval_code, observation";
@@ -881,6 +959,12 @@ interface BillingLine {
  * + bonos − vales pendientes/aprobados del rango (que pasan a descontada)
  * − otros = neto. Recalcular reproduce el mismo neto con los mismos
  * insumos. Periodo cerrado → PERIOD_CLOSED.
+ *
+ * La ARITMÉTICA no vive acá: `computePayrollLines` la calcula (una sola
+ * fórmula) y esta función sólo la PERSISTE —upsert de ítems, vales a
+ * `descontada` y auditoría—. La corrección de un período cerrado (PA-2b,
+ * `correctPayrollPeriod`) reutiliza la MISMA aritmética sin persistir nada de
+ * esto.
  */
 export async function calculatePayroll(
   sedeId: string,
@@ -912,6 +996,147 @@ export async function calculatePayroll(
     });
     const actives = employees.filter((row) => row.is_active);
 
+    const { payload, vouchersToDiscount } = await computePayrollLines({
+      db,
+      sedeId,
+      period,
+      // El borrador liquida la planta ACTIVA de la sede.
+      roster: actives,
+      input,
+      voucherScope: "vigentes",
+      log: "calculatePayroll",
+    });
+
+    if (payload.length > 0) {
+      const { error: upsertError } = await db
+        .from("payroll_items")
+        .upsert(payload, { onConflict: "period_id,employee_id" });
+      if (upsertError) {
+        console.error(
+          "[payroll] calculatePayroll: fallo al guardar ítems de nómina:",
+          JSON.stringify({
+            periodId,
+            items: payload.length,
+            code: upsertError.code,
+            message: upsertError.message,
+            details: upsertError.details,
+            hint: upsertError.hint,
+          }),
+        );
+        throw new PayrollError("INTERNAL", "Error interno.", 500);
+      }
+    }
+
+    // PAY-07: los vales descontados pasan a descontada (transición única;
+    // descontada es terminal, doble descuento imposible).
+    if (vouchersToDiscount.length > 0) {
+      const { error: discountError } = await db
+        .from("voucher_requests")
+        .update({ status: "descontada" })
+        .in("id", vouchersToDiscount)
+        .in("status", ["pendiente", "aprobada"]);
+      if (discountError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
+
+    await writeAudit({
+      sede_id: sedeId,
+      user_id: actor.userId,
+      action: AUDIT_ACTIONS.PAYROLL_CALCULATED,
+      entity: "payroll_periods",
+      entity_id: periodId,
+      metadata: {
+        employees: payload.length,
+        vales_descontados: vouchersToDiscount.length,
+      },
+    });
+    return getPeriodDetail(sedeId, periodId);
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
+/**
+ * Qué estados de vale descuentan el neto de un cálculo.
+ *
+ * `vigentes`: el borrador descuenta los vales pendientes/aprobados del rango y
+ * los marca `descontada` (PAY-07).
+ * `vigentes_y_descontados`: la corrección de un período cerrado vuelve a
+ * descontar ADEMÁS los vales que ESTE período ya descontó. Sin eso el neto
+ * corregido perdería el descuento del vale (ya no está pendiente) y subiría por
+ * una razón ajena a la corrección: un número que cambia de significado en
+ * silencio. El rango no es ambiguo: la restricción de exclusión de 035 impide
+ * que dos períodos de la sede compartan un solo día, así que un vale
+ * `descontada` dentro del rango pertenece a este período.
+ */
+type VoucherDiscountScope = "vigentes" | "vigentes_y_descontados";
+
+/** ¿Este vale descuenta el neto del cálculo, dado su alcance? */
+function discountsVoucher(status: string, scope: VoucherDiscountScope): boolean {
+  if (canDiscountVoucher(status)) return true;
+  return scope === "vigentes_y_descontados" && status === "descontada";
+}
+
+/** Estados de vale que se leen, según el alcance del descuento. */
+function voucherStatusesForScope(scope: VoucherDiscountScope): string[] {
+  return scope === "vigentes_y_descontados"
+    ? ["pendiente", "aprobada", "descontada"]
+    : ["pendiente", "aprobada"];
+}
+
+/** Un ítem de nómina calculado, todavía sin persistir. */
+interface PayrollItemPayload {
+  period_id: string;
+  employee_id: string;
+  base_fixed: number;
+  commissions: number;
+  bonuses: number;
+  deductions_vales: number;
+  other_discounts: number;
+  net_pay: number;
+  detail_json: DetailLine[];
+}
+
+interface PayrollLinesResult {
+  payload: PayrollItemPayload[];
+  /**
+   * Vales que ESTE cálculo descuenta por primera vez (pendiente/aprobada). Son
+   * los únicos que el borrador pasa a `descontada`; la corrección los ignora:
+   * no reescribe vales.
+   */
+  vouchersToDiscount: string[];
+}
+
+/**
+ * La aritmética de la nómina de un período (PAY-02/PAY-03), COMPARTIDA por el
+ * cálculo del borrador (`calculatePayroll`) y por la corrección de un período
+ * cerrado (PA-2b, `correctPayrollPeriod`): una sola fórmula, sin una aritmética
+ * paralela que pueda desviarse.
+ *
+ * Lee facturas vigentes del rango, sus ítems comisionables, las reglas
+ * ítem×empleado activas, los vales del rango y los pagos inmediatos ya hechos,
+ * y arma un ítem por empleado del `roster`. NO escribe nada: devuelve el
+ * payload y qué vales correspondería descontar. Quien llama decide qué hacer
+ * con eso (el borrador lo persiste y marca vales; la corrección lo guarda como
+ * la versión corregida del período cerrado).
+ *
+ * `roster` lo decide el llamador a propósito: el borrador pasa la planta ACTIVA
+ * de la sede y la corrección pasa los empleados que el período YA liquidó (un
+ * empleado dado de baja después del cierre tiene que seguir en la corrección;
+ * un alta posterior no puede aparecer en un período cerrado).
+ */
+async function computePayrollLines(args: {
+  db: DbClient;
+  sedeId: string;
+  period: PayrollPeriodRow;
+  roster: EmployeeRow[];
+  input: CalculatePayrollInput;
+  voucherScope: VoucherDiscountScope;
+  /** Nombre de la operación para el log de una lectura incompleta. */
+  log: string;
+}): Promise<PayrollLinesResult> {
+  const { db, sedeId, period, roster, input, voucherScope, log } = args;
+  const periodId = period.id;
+
     // Facturas vigentes de la sede en el rango (Anulada excluida). El rango
     // lleva offset de Bogotá: sin él la ventana corre 5 h y se pierden las
     // facturas de la noche del último día (comisión no liquidada).
@@ -922,7 +1147,7 @@ export async function calculatePayroll(
     // faltaba plata) sin un solo error. Se pagina hasta agotar, con
     // `order("id")` para que dos corridas lean exactamente lo mismo.
     const invoiceRows = await readAllPayroll<{ id: string; consecutive_number: number }>({
-      log: "calculatePayroll",
+      log,
       what: "facturas",
       meta: { periodId },
       table: "invoices",
@@ -948,7 +1173,7 @@ export async function calculatePayroll(
       for (const chunk of chunkIds(invoiceRows.map((row) => row.id))) {
         items.push(
           ...(await readAllPayroll<InvoiceItemRow>({
-            log: "calculatePayroll",
+            log,
             what: "ítems de factura",
             meta: { periodId, invoices: invoiceRows.length, ids: chunk.length },
             table: "invoice_items",
@@ -997,9 +1222,9 @@ export async function calculatePayroll(
 
     // Reglas ítem×empleado activas de la sede (mismos filtros que usa el pago
     // inmediato: sede + empleado + activa). Una sola lectura exhaustiva y se
-    // agrupan en memoria para no caer en N+1 sobre la planta activa.
+    // agrupan en memoria para no caer en N+1 sobre la planta del cálculo.
     const rulesByEmployee = new Map<string, Map<string, RuleRate>>();
-    if (actives.length > 0) {
+    if (roster.length > 0) {
       // U5: sin `.limit(5000)`. Una regla que no se lee es una comisión que se
       // liquida de menos (el `porcentaje plano` del empleado o cero, según el
       // ítem): la diferencia sale del bolsillo del empleado y no aparece en
@@ -1011,9 +1236,9 @@ export async function calculatePayroll(
         percent: number | string | null;
         amount: number | string | null;
       }>({
-        log: "calculatePayroll",
+        log,
         what: "reglas de comisión",
-        meta: { periodId, employees: actives.length },
+        meta: { periodId, employees: roster.length },
         table: "commission_rules",
         fetchPage: (from, to) =>
           db
@@ -1023,7 +1248,7 @@ export async function calculatePayroll(
             .eq("is_active", true)
             .in(
               "employee_id",
-              actives.map((employee) => employee.id),
+              roster.map((employee) => employee.id),
             )
             .order("id")
             .range(from, to),
@@ -1038,7 +1263,10 @@ export async function calculatePayroll(
       }
     }
 
-    // Vales pendientes/aprobados del rango (se descuentan y marcan).
+    // Vales del rango que descuentan el neto. El borrador descuenta los
+    // pendientes/aprobados (y los marca `descontada`); la corrección además
+    // vuelve a descontar los que ESTE período ya descontó (ver
+    // `VoucherDiscountScope`).
     // U5: sin `.limit(2000)`. Un vale que no se lee NO se descuenta del neto y
     // queda sin marcar: el descuento se pierde y el vale sigue vigente.
     const voucherRows = await readAllPayroll<{
@@ -1047,7 +1275,7 @@ export async function calculatePayroll(
       amount: number | string;
       status: string;
     }>({
-      log: "calculatePayroll",
+      log,
       what: "vales del periodo",
       meta: { periodId },
       table: "voucher_requests",
@@ -1056,15 +1284,20 @@ export async function calculatePayroll(
           .from("voucher_requests")
           .select("id, employee_id, amount, status")
           .eq("sede_id", sedeId)
-          .in("status", ["pendiente", "aprobada"])
+          .in("status", voucherStatusesForScope(voucherScope))
           .gte("request_date", period.start_date)
           .lte("request_date", period.end_date)
           .order("id")
           .range(from, to),
     });
     const valesByEmployee = new Map<string, { total: number; ids: string[] }>();
+    // Vales que ESTE cálculo descuenta por primera vez (pendiente/aprobada).
+    // Los `descontada` que la corrección vuelve a restar NO entran acá: nadie
+    // reescribe un vale ya descontado.
+    const vouchersToDiscount: string[] = [];
     for (const row of voucherRows) {
-      if (!canDiscountVoucher(row.status)) continue;
+      if (!discountsVoucher(row.status, voucherScope)) continue;
+      if (canDiscountVoucher(row.status)) vouchersToDiscount.push(row.id);
       const entry = valesByEmployee.get(row.employee_id) ?? { total: 0, ids: [] };
       entry.total = roundMoney(entry.total + Number(row.amount));
       entry.ids.push(row.id);
@@ -1084,7 +1317,7 @@ export async function calculatePayroll(
       // Y el error deja de ignorarse en silencio (antes no se miraba `error`).
       for (const chunk of chunkIds(invoiceRows.map((row) => row.id))) {
         const payouts = await readAllPayroll<{ employee_id: string; amount: number | string }>({
-          log: "calculatePayroll",
+          log,
           what: "pagos inmediatos",
           meta: { periodId, invoices: invoiceRows.length, ids: chunk.length },
           table: "commission_payouts",
@@ -1106,7 +1339,7 @@ export async function calculatePayroll(
       }
     }
 
-    const payload = actives.map((employee) => {
+    const payload = roster.map((employee) => {
       // PR1: el fijo de un período son SOLO sus días. `salary_fixed` es mensual
       // (003_admin.sql): antes se pagaba completo en cada período y cuatro
       // cierres semanales de un mes pagaban 4 × el sueldo, sin error ni aviso.
@@ -1185,53 +1418,10 @@ export async function calculatePayroll(
       };
     });
 
-    if (payload.length > 0) {
-      const { error: upsertError } = await db
-        .from("payroll_items")
-        .upsert(payload, { onConflict: "period_id,employee_id" });
-      if (upsertError) {
-        console.error(
-          "[payroll] calculatePayroll: fallo al guardar ítems de nómina:",
-          JSON.stringify({
-            periodId,
-            items: payload.length,
-            code: upsertError.code,
-            message: upsertError.message,
-            details: upsertError.details,
-            hint: upsertError.hint,
-          }),
-        );
-        throw new PayrollError("INTERNAL", "Error interno.", 500);
-      }
-    }
-
-    // PAY-07: los vales descontados pasan a descontada (transición única;
-    // descontada es terminal, doble descuento imposible).
-    const discountedIds = [...valesByEmployee.values()].flatMap((entry) => entry.ids);
-    if (discountedIds.length > 0) {
-      const { error: discountError } = await db
-        .from("voucher_requests")
-        .update({ status: "descontada" })
-        .in("id", discountedIds)
-        .in("status", ["pendiente", "aprobada"]);
-      if (discountError) throw new PayrollError("INTERNAL", "Error interno.", 500);
-    }
-
-    await writeAudit({
-      sede_id: sedeId,
-      user_id: actor.userId,
-      action: AUDIT_ACTIONS.PAYROLL_CALCULATED,
-      entity: "payroll_periods",
-      entity_id: periodId,
-      metadata: {
-        employees: payload.length,
-        vales_descontados: discountedIds.length,
-      },
-    });
-    return getPeriodDetail(sedeId, periodId);
-  } catch (error) {
-    throw toPayrollError(error);
-  }
+    // Vales que ESTE cálculo descuenta por primera vez (pendiente/aprobada).
+    // Los `descontada` que la corrección volvió a restar NO entran acá: nadie
+    // reescribe un vale ya descontado.
+    return { payload, vouchersToDiscount };
 }
 
 // -------------------------------------------------------------------- pagos ---
@@ -1623,6 +1813,297 @@ export async function deletePayrollPeriod(
       },
     });
     return { id: periodId };
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
+// ------------------------------------------- corrección de un período cerrado ---
+
+/**
+ * PA-2b: CORRIGE un período CERRADO sin reabrirlo, sin pisarlo y sin borrar
+ * nada. Es el mismo problema que el reconteo de turno (033) resuelto para la
+ * nómina: el original queda firmado y la corrección es un registro propio.
+ *
+ * EL HUECO QUE CIERRA. Un período cerrado no tiene salida cuando su liquidación
+ * quedó mal:
+ *   * no se puede borrar —`assertDeletablePeriod` exige `borrador`—;
+ *   * no se puede recalcular —`assertDraftPeriod` exige `borrador`—;
+ *   * no se pueden volver a nominar sus días —la restricción de exclusión de
+ *     035 cubre TODOS los estados—.
+ * Antes de 035 el camino era abrir un segundo período sobre los mismos días, y
+ * ESE camino era el defecto: pagaba dos veces los mismos días. Hoy no hay
+ * camino, y este es el que corresponde.
+ *
+ * QUÉ HACE. Recalcula la liquidación del período con las REGLAS VIGENTES
+ * (`computePayrollLines`, la misma aritmética de `calculatePayroll`: incluye la
+ * prorata del fijo por los días del rango) sobre los empleados que el período
+ * YA liquidó, y guarda las DOS versiones:
+ *   * la ANTERIOR congelada (los montos firmados de cada ítem, más lo pagado);
+ *   * la CORREGIDA (lo que dicen las reglas hoy).
+ * El motivo es obligatorio, queda el actor y el momento, y hay UNA corrección
+ * por período (índice único): la corrección también queda firmada.
+ *
+ * QUÉ NO HACE (la decisión del dueño, no un olvido). NO mueve plata: no paga,
+ * no descuenta, no genera un ajuste, no arrastra el saldo al período siguiente
+ * y no toca `payroll_payments` ni `payroll_extras`. Muestra la diferencia
+ * (`pagado − neto corregido`); saldarla es un acto HUMANO, con el pago
+ * extraordinario que ya existe (`payPayrollExtra`, migración 036) y un motivo
+ * que diga que es el ajuste por la corrección del período. Un claw-back
+ * automático sería un movimiento de dinero que nadie pidió.
+ *
+ * POR QUÉ LA CORRECCIÓN NO PUEDE MOVER PLATA AUNQUE QUIERA: un período cerrado
+ * no se puede pagar desde el sistema. `payPayrollItem` exige un borrador
+ * (`assertDraftPeriod`, PERIOD_CLOSED) y el único camino que escribe
+ * `payroll_payments` es ése. Aplicar los montos corregidos al registro cambia lo
+ * que el registro dice que se DEBÍA, no lo que se pagó ni lo que se puede pagar.
+ *
+ * NO ESCRIBE EN LOS VALES. El recálculo vuelve a descontar del neto los vales
+ * que ESTE período ya descontó (si no, el neto corregido perdería ese descuento
+ * y subiría por una razón ajena a la corrección), pero no marca ni revierte
+ * ninguno: los vales ya quedaron en `descontada` al liquidar y ahí siguen.
+ *
+ * Solo admin (vía `requirePayrollAdmin` en la action): es nómina.
+ */
+export async function correctPayrollPeriod(
+  sedeId: string,
+  periodId: string,
+  raw: unknown,
+  actor: PayrollActor,
+): Promise<PayrollPeriodCorrectionResult> {
+  const parsed = correctPayrollPeriodSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new PayrollError("VALIDATION", validationMessage(parsed.error), 400);
+  }
+  const db = await payrollDb();
+  try {
+    const period = await getPeriodOrThrow(db, sedeId, periodId);
+    try {
+      assertCorrectablePeriod(period.status);
+    } catch (error) {
+      throw toPayrollError(error);
+    }
+
+    // Una corrección por período: la corrección también queda firmada y no se
+    // apila una segunda encima (eso volvería a dejar la última versión editable
+    // en el lugar, el mismo defecto un nivel más abajo).
+    const { data: existing, error: existingError } = await db
+      .from("payroll_period_corrections")
+      .select("id")
+      .eq("period_id", periodId)
+      .maybeSingle();
+    if (existingError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    if (existing) {
+      throw new PayrollError(
+        "ALREADY_CORRECTED",
+        "Este período ya fue corregido. La corrección también quedó firmada y no se modifica.",
+        409,
+      );
+    }
+
+    // Versión ANTERIOR: los ítems firmados del período, con lo pagado de cada
+    // uno resuelto por la MISMA lectura del detalle (una sola forma de calcular
+    // "pagado" en el módulo).
+    const detail = await getPeriodDetail(sedeId, periodId);
+    const previousItems = detail.items;
+    if (previousItems.length === 0) {
+      throw new PayrollError(
+        "NOTHING_TO_CORRECT",
+        "El período no tiene ítems liquidados: no hay liquidación que corregir.",
+        409,
+      );
+    }
+
+    // El cálculo corre sobre los empleados que el período YA liquidó, no sobre
+    // la planta activa de hoy: un empleado dado de baja después del cierre
+    // tiene que seguir en la corrección, y un alta posterior no puede aparecer
+    // en un período que ya se cerró.
+    const roster = await listAllEmployees(sedeId).catch((error) => {
+      throw toPayrollError(error);
+    });
+    const employeeById = new Map(roster.map((row) => [row.id, row]));
+    const correctionRoster: EmployeeRow[] = [];
+    for (const item of previousItems) {
+      const employee = employeeById.get(item.employee_id);
+      if (!employee) {
+        throw new PayrollError(
+          "INTERNAL",
+          "No se pudo corregir: un empleado de la liquidación no está en la planta de la sede.",
+          500,
+        );
+      }
+      correctionRoster.push(employee);
+    }
+
+    // Los ajustes MANUALES (bonos y otros descuentos) no se recalculan: son una
+    // decisión que quedó escrita en la liquidación firmada, no el resultado de
+    // una regla. Se vuelven a aplicar tal como estaban para que la corrección
+    // cambie lo que cambian las reglas y no borre un bono por el camino.
+    const input: CalculatePayrollInput = {
+      adjustments: previousItems.map((item) => ({
+        employee_id: item.employee_id,
+        bonuses: roundMoney(Number(item.bonuses)),
+        other_discounts: roundMoney(Number(item.other_discounts)),
+      })),
+    };
+
+    const { payload } = await computePayrollLines({
+      db,
+      sedeId,
+      period,
+      roster: correctionRoster,
+      input,
+      // Vuelve a descontar los vales que este período ya descontó, y NO marca
+      // ninguno (ver `correctPayrollPeriod` arriba).
+      voucherScope: "vigentes_y_descontados",
+      log: "correctPayrollPeriod",
+    });
+
+    const view = buildPayrollCorrectionView({
+      previous: previousItems,
+      corrected: payload,
+      paidByEmployee: new Map(
+        previousItems.map((item) => [item.employee_id, Number(item.paid ?? 0)]),
+      ),
+    });
+
+    const { data: inserted, error } = await db
+      .from("payroll_period_corrections")
+      .insert({
+        period_id: periodId,
+        previous_net_total: view.previousNetTotal,
+        previous_paid_total: view.paidTotal,
+        corrected_net_total: view.correctedNetTotal,
+        previous_item_count: previousItems.length,
+        corrected_item_count: payload.length,
+        reason: parsed.data.reason,
+        corrected_by: actor.userId,
+      })
+      .select(PERIOD_CORRECTION_SELECT)
+      .single();
+    if (error || !inserted) {
+      // Carrera perdida contra el índice único por período: otra corrección ganó.
+      if ((error as { code?: string } | null)?.code === "23505") {
+        throw new PayrollError(
+          "ALREADY_CORRECTED",
+          "Este período ya fue corregido. La corrección también quedó firmada y no se modifica.",
+          409,
+        );
+      }
+      throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
+    const correction = inserted as PayrollPeriodCorrectionRow;
+
+    // Las dos versiones por empleado, en la misma tabla de la corrección: la
+    // fila es autocontenida y no depende de `payroll_items` (que sigue siendo
+    // el original firmado).
+    const { error: itemsError } = await db.from("payroll_period_correction_items").insert(
+      view.rows.map((row) => ({
+        correction_id: correction.id,
+        employee_id: row.employee_id,
+        previous_base_fixed: roundMoney(Number(row.previous.base_fixed)),
+        previous_commissions: roundMoney(Number(row.previous.commissions)),
+        previous_bonuses: roundMoney(Number(row.previous.bonuses)),
+        previous_deductions_vales: roundMoney(Number(row.previous.deductions_vales)),
+        previous_other_discounts: roundMoney(Number(row.previous.other_discounts)),
+        previous_net_pay: roundMoney(Number(row.previous.net_pay)),
+        previous_paid: roundMoney(Number(row.paid)),
+        corrected_base_fixed: roundMoney(Number(row.corrected.base_fixed)),
+        corrected_commissions: roundMoney(Number(row.corrected.commissions)),
+        corrected_bonuses: roundMoney(Number(row.corrected.bonuses)),
+        corrected_deductions_vales: roundMoney(Number(row.corrected.deductions_vales)),
+        corrected_other_discounts: roundMoney(Number(row.corrected.other_discounts)),
+        corrected_net_pay: roundMoney(Number(row.corrected.net_pay)),
+      })),
+    );
+    if (itemsError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+
+    // La auditoría lleva el motivo y los totales de las DOS versiones: un
+    // auditor tiene que poder leer qué cambió sin abrir la pantalla.
+    await writeAudit({
+      sede_id: sedeId,
+      user_id: actor.userId,
+      action: AUDIT_ACTIONS.PAYROLL_PERIOD_CORRECTED,
+      entity: "payroll_periods",
+      entity_id: periodId,
+      metadata: {
+        correction_id: correction.id,
+        reason: parsed.data.reason,
+        start_date: period.start_date,
+        end_date: period.end_date,
+        previous_net_total: view.previousNetTotal,
+        corrected_net_total: view.correctedNetTotal,
+        previous_paid_total: view.paidTotal,
+        difference_total: view.differenceTotal,
+      },
+    });
+
+    return { period, correction, view };
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
+/**
+ * PA-2b: la corrección de un período (si existe), con las dos versiones ya
+ * comparadas. `null` = el período no fue corregido. Solo admin (la action).
+ */
+export async function getPayrollPeriodCorrection(
+  sedeId: string,
+  periodId: string,
+): Promise<PayrollPeriodCorrectionResult | null> {
+  const db = await payrollDb();
+  try {
+    const period = await getPeriodOrThrow(db, sedeId, periodId);
+    const { data, error } = await db
+      .from("payroll_period_corrections")
+      .select(PERIOD_CORRECTION_SELECT)
+      .eq("period_id", periodId)
+      .maybeSingle();
+    if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    if (!data) return null;
+    const correction = data as PayrollPeriodCorrectionRow;
+
+    // Lectura exhaustiva: la corrección es el registro de una diferencia de
+    // plata y una lectura recortada mostraría menos de lo que se corrigió.
+    const items = await readAllPayroll<PayrollPeriodCorrectionItemRow>({
+      log: "getPayrollPeriodCorrection",
+      what: "ítems de la corrección",
+      meta: { periodId, correctionId: correction.id },
+      table: "payroll_period_correction_items",
+      fetchPage: (from, to) =>
+        db
+          .from("payroll_period_correction_items")
+          .select(PERIOD_CORRECTION_ITEM_SELECT)
+          .eq("correction_id", correction.id)
+          .order("employee_id")
+          .order("id")
+          .range(from, to),
+    });
+
+    const view = buildPayrollCorrectionView({
+      previous: items.map((row) => ({
+        employee_id: row.employee_id,
+        base_fixed: row.previous_base_fixed,
+        commissions: row.previous_commissions,
+        bonuses: row.previous_bonuses,
+        deductions_vales: row.previous_deductions_vales,
+        other_discounts: row.previous_other_discounts,
+        net_pay: row.previous_net_pay,
+      })),
+      corrected: items.map((row) => ({
+        employee_id: row.employee_id,
+        base_fixed: row.corrected_base_fixed,
+        commissions: row.corrected_commissions,
+        bonuses: row.corrected_bonuses,
+        deductions_vales: row.corrected_deductions_vales,
+        other_discounts: row.corrected_other_discounts,
+        net_pay: row.corrected_net_pay,
+      })),
+      paidByEmployee: new Map(items.map((row) => [row.employee_id, Number(row.previous_paid)])),
+    });
+
+    return { period, correction, view };
   } catch (error) {
     throw toPayrollError(error);
   }

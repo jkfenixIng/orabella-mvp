@@ -3,12 +3,14 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   approveVoucherSchema,
+  assertCorrectablePeriod,
   assertDeletablePeriod,
   assertDraftPeriod,
   assertNoOverpay,
   assertPortionsMatchNet,
   buildEmployeeCommissionDetail,
   buildEmployeeDetail,
+  buildPayrollCorrectionView,
   buildPayrollEmployeeIndex,
   buildPayrollMonthToDate,
   calculatePayrollSchema,
@@ -19,6 +21,7 @@ import {
   checkVoucherEligibility,
   computeLineCommission,
   computeNetPay,
+  correctPayrollPeriodSchema,
   daysInMonthWithinRange,
   groupPayrollPeriodsByMonth,
   isVoucherDayAllowed,
@@ -58,6 +61,7 @@ import {
 import {
   approveVoucher,
   calculatePayroll,
+  getPayrollPeriodCorrection,
   getPeriodDetail,
   listPayrollOverview,
   listPeriods,
@@ -3602,3 +3606,640 @@ describe("payroll: derivaciones de la vista de nómina (PA3, funciones puras)", 
   });
 });
 
+
+// ---------- PA-2b: corregir un período cerrado conservando las dos versiones ---
+//
+// Un período CERRADO y equivocado no tenía salida: no se borra
+// (`assertDeletablePeriod` exige borrador), no se recalcula (`assertDraftPeriod`
+// exige borrador) y sus días no se pueden volver a nominar (la restricción de
+// exclusión de 035 cubre TODOS los estados). Antes de 035 el camino era abrir un
+// segundo período sobre los mismos días, y ESE camino era el defecto: los pagaba
+// dos veces. La corrección es un REGISTRO con las dos versiones, con motivo, y
+// NO mueve plata: la diferencia se muestra y se salda a mano.
+describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2b)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-admin-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const OTHER_SEDE = "99999999-9999-4999-8999-999999999999";
+  const EMPLOYEE_ID = payrollPagedStub.EMPLOYEE_ID;
+  const PERIOD_ID = payrollPagedStub.PERIOD_ID;
+  const ITEM_ID = "item-nomina-1";
+  const WEEK = { start: "2026-09-01", end: "2026-09-07" };
+  /** Sueldo MENSUAL: 7 de 30 días son 326.667 (la versión CORRECTA). */
+  const SALARY = 1_400_000;
+  const PRORATED = 326_667;
+
+  function employeeFijo(sedeId = payrollPagedStub.SEDE_ID) {
+    return {
+      id: EMPLOYEE_ID,
+      sede_id: sedeId,
+      user_id: null,
+      full_name: "Empleada fija",
+      employee_code: "E-001",
+      document: "1000000001",
+      phone: null,
+      position: null,
+      payout_mode: "normal",
+      email: null,
+      birth_date: null,
+      pay_type: "fijo",
+      salary_fixed: SALARY,
+      commission_percent: null,
+      is_active: true,
+    };
+  }
+
+  /**
+   * El caso del dueño: un período semanal cerrado que liquidó el sueldo MENSUAL
+   * completo (1.400.000) cuando correspondía la parte de sus 7 días (326.667),
+   * y que ya se pagó por 1.400.000. Diferencia: 1.073.333.
+   */
+  function seedWrongClosedPeriod(overrides: {
+    item?: Record<string, unknown>;
+    payments?: Array<Record<string, unknown>>;
+    vouchers?: Array<Record<string, unknown>>;
+    sedeId?: string;
+  } = {}) {
+    const sedeId = overrides.sedeId ?? payrollPagedStub.SEDE_ID;
+    payrollPagedStub.tables = {
+      payroll_periods: [
+        {
+          id: PERIOD_ID,
+          sede_id: sedeId,
+          start_date: WEEK.start,
+          end_date: WEEK.end,
+          status: "cerrado",
+          created_by: "u-admin-1",
+          closed_at: "2026-09-07T23:00:00.000Z",
+          created_at: "2026-09-01T00:00:00.000Z",
+        },
+      ],
+      employees: [employeeFijo(sedeId)],
+      payroll_items: [
+        {
+          id: ITEM_ID,
+          period_id: PERIOD_ID,
+          employee_id: EMPLOYEE_ID,
+          base_fixed: SALARY,
+          commissions: 0,
+          bonuses: 0,
+          deductions_vales: 0,
+          other_discounts: 0,
+          net_pay: SALARY,
+          detail_json: [],
+          created_at: "2026-09-07T23:00:00.000Z",
+          ...overrides.item,
+        },
+      ],
+      payroll_payments:
+        overrides.payments ?? [
+          {
+            id: "pago-1",
+            payroll_item_id: ITEM_ID,
+            method_id: null,
+            method_code: "efectivo",
+            amount: SALARY,
+            paid_at: "2026-09-07T23:30:00.000Z",
+            paid_by: "u-admin-1",
+            reference: null,
+          },
+        ],
+      payroll_period_corrections: [],
+      payroll_period_correction_items: [],
+      invoices: [],
+      invoice_items: [],
+      commission_rules: [],
+      voucher_requests: overrides.vouchers ?? [],
+      commission_payouts: [],
+      audit_logs: [],
+    };
+  }
+
+  const correctionInserts = () =>
+    payrollPagedStub.inserts.filter((entry) => entry.table === "payroll_period_corrections");
+  const correctionItemInserts = () =>
+    payrollPagedStub.inserts.filter((entry) => entry.table === "payroll_period_correction_items");
+  const moneyInserts = () =>
+    payrollPagedStub.inserts.filter(
+      (entry) => entry.table === "payroll_payments" || entry.table === "payroll_extras",
+    );
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  // --------------------------------------------------------------- RED ---
+
+  it("RED: hoy un período cerrado no tiene salida, y faltan la operación, la acción y la tabla", () => {
+    // 1) El hueco, verificado en las funciones puras que lo cierran: un período
+    // cerrado no se borra ni se recalcula.
+    expect(() => assertDeletablePeriod("cerrado")).toThrowError("PERIOD_NOT_DRAFT");
+    expect(() => assertDraftPeriod("cerrado")).toThrowError("PERIOD_CLOSED");
+    // Y el candado que SÍ corresponde: sólo un período cerrado se corrige (un
+    // borrador se recalcula).
+    expect(() => assertCorrectablePeriod("borrador")).toThrowError("PERIOD_NOT_CLOSED");
+    expect(() => assertCorrectablePeriod("cerrado")).not.toThrow();
+    // 2) No hay operación que lo corrija sin reabrirlo.
+    expect(typeof payrollExtrasService.correctPayrollPeriod).toBe("function");
+    // 3) No hay acción de auditoría propia: corregir no es "calcular".
+    expect(AUDIT_ACTIONS.PAYROLL_PERIOD_CORRECTED).toBe("payroll.period_corrected");
+    // 4) No hay tabla donde guardar las dos versiones.
+    expect(
+      existsSync(join(process.cwd(), "supabase", "migrations", "037_payroll_period_correction.sql")),
+    ).toBe(true);
+    // 5) El motivo no era obligatorio en ningún lado.
+    expect(correctPayrollPeriodSchema.safeParse({ reason: "   " }).success).toBe(false);
+    expect(correctPayrollPeriodSchema.safeParse({ reason: undefined }).success).toBe(false);
+  });
+
+  it("el candado que hace imposible que la corrección mueva plata: un cerrado no se paga", async () => {
+    seedWrongClosedPeriod();
+    // `payPayrollItem` es el ÚNICO camino que escribe `payroll_payments`, y
+    // exige un período en BORRADOR. Aplicar los montos corregidos al registro no
+    // puede cambiar ningún pago: no hay forma de pagar desde un cerrado.
+    const failure: unknown = await payrollExtrasService
+      .payPayrollItem(
+        payrollPagedStub.SEDE_ID,
+        ITEM_ID,
+        { portions: [{ method_code: "efectivo", amount: 1 }] },
+        ACTOR,
+      )
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "PERIOD_CLOSED", status: 409 });
+    expect(payrollPagedStub.inserts.filter((entry) => entry.table === "payroll_payments")).toHaveLength(0);
+  });
+
+  // ------------------------------------------------------------- GREEN ---
+
+  it("corrige el período: recalcula con las reglas vigentes y guarda las DOS versiones", async () => {
+    seedWrongClosedPeriod();
+
+    const result = await payrollExtrasService.correctPayrollPeriod(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      { reason: "El fijo se pagó completo y correspondía la parte de los días." },
+      ACTOR,
+    );
+
+    // La versión anterior queda congelada y la corregida sale de las reglas
+    // vigentes: 7 de 30 días de 1.400.000 = 326.667 (no 1.400.000).
+    expect(result.correction).toMatchObject({
+      period_id: PERIOD_ID,
+      previous_net_total: SALARY,
+      previous_paid_total: SALARY,
+      corrected_net_total: PRORATED,
+      previous_item_count: 1,
+      corrected_item_count: 1,
+      reason: "El fijo se pagó completo y correspondía la parte de los días.",
+      corrected_by: ACTOR.userId,
+    });
+
+    // Por empleado: lo que decía, lo corregido y lo pagado, con la diferencia.
+    expect(result.view.rows).toHaveLength(1);
+    expect(result.view.rows[0]).toMatchObject({
+      employee_id: EMPLOYEE_ID,
+      paid: SALARY,
+      difference: SALARY - PRORATED,
+    });
+    expect(result.view.rows[0].previous.net_pay).toBe(SALARY);
+    expect(result.view.rows[0].corrected.net_pay).toBe(PRORATED);
+    expect(result.view.previousNetTotal).toBe(SALARY);
+    expect(result.view.correctedNetTotal).toBe(PRORATED);
+    expect(result.view.paidTotal).toBe(SALARY);
+    expect(result.view.differenceTotal).toBe(1_073_333);
+
+    // Se guardó UNA cabecera y las filas por empleado.
+    expect(correctionInserts()).toHaveLength(1);
+    expect(correctionItemInserts()).toHaveLength(1);
+    const storedItems = correctionItemInserts()[0].payload as Array<Record<string, unknown>>;
+    expect(storedItems).toHaveLength(1);
+    expect(storedItems[0]).toMatchObject({
+      employee_id: EMPLOYEE_ID,
+      previous_net_pay: SALARY,
+      previous_paid: SALARY,
+      corrected_net_pay: PRORATED,
+    });
+  });
+
+  it("la versión anterior sigue legible: el período y sus ítems NO se tocan", async () => {
+    seedWrongClosedPeriod();
+    await payrollExtrasService.correctPayrollPeriod(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      { reason: "Fijo mal prorrateado." },
+      ACTOR,
+    );
+
+    // El original firmado sigue diciendo lo mismo (y se sigue leyendo igual).
+    const stored = payrollPagedStub.tables.payroll_items.find((row) => row.id === ITEM_ID);
+    expect(stored?.net_pay).toBe(SALARY);
+    const detail = await getPeriodDetail(payrollPagedStub.SEDE_ID, PERIOD_ID);
+    expect(detail.items).toHaveLength(1);
+    expect(detail.items[0]).toMatchObject({ net_pay: SALARY, paid: SALARY });
+
+    // Ningún UPDATE en ninguna tabla: la corrección sólo inserta.
+    expect(payrollPagedStub.updates).toHaveLength(0);
+  });
+
+  it("la corrección se lee de vuelta con las dos versiones comparadas", async () => {
+    seedWrongClosedPeriod();
+    await payrollExtrasService.correctPayrollPeriod(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      { reason: "Fijo mal prorrateado." },
+      ACTOR,
+    );
+
+    const read = await getPayrollPeriodCorrection(payrollPagedStub.SEDE_ID, PERIOD_ID);
+    expect(read).not.toBeNull();
+    expect(read?.correction).toMatchObject({
+      previous_net_total: SALARY,
+      corrected_net_total: PRORATED,
+      reason: "Fijo mal prorrateado.",
+    });
+    expect(read?.view.rows[0]).toMatchObject({
+      employee_id: EMPLOYEE_ID,
+      paid: SALARY,
+      difference: 1_073_333,
+    });
+
+    // Control negativo: un período que no está en la sede no se lee (404).
+    const failure: unknown = await getPayrollPeriodCorrection(
+      payrollPagedStub.SEDE_ID,
+      "periodo-inexistente",
+    ).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: "NOT_FOUND", status: 404 });
+  });
+
+  it("una corrección por período: la segunda se rechaza y no se apila", async () => {
+    seedWrongClosedPeriod();
+    await payrollExtrasService.correctPayrollPeriod(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      { reason: "Primera corrección." },
+      ACTOR,
+    );
+
+    const failure: unknown = await payrollExtrasService
+      .correctPayrollPeriod(
+        payrollPagedStub.SEDE_ID,
+        PERIOD_ID,
+        { reason: "Segunda corrección." },
+        ACTOR,
+      )
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "ALREADY_CORRECTED", status: 409 });
+    // Una sola cabecera y un solo juego de filas: la corrección también queda
+    // firmada.
+    expect(correctionInserts()).toHaveLength(1);
+    expect(correctionItemInserts()).toHaveLength(1);
+  });
+
+  it("el motivo es obligatorio: vacío se rechaza sin escribir nada", async () => {
+    seedWrongClosedPeriod();
+
+    const failure: unknown = await payrollExtrasService
+      .correctPayrollPeriod(payrollPagedStub.SEDE_ID, PERIOD_ID, { reason: "   " }, ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(correctionInserts()).toHaveLength(0);
+    expect(payrollPagedStub.inserts).toHaveLength(0);
+  });
+
+  it("control negativo: un borrador NO se corrige (se recalcula)", async () => {
+    seedWrongClosedPeriod();
+    payrollPagedStub.tables.payroll_periods[0].status = "borrador";
+    payrollPagedStub.tables.payroll_periods[0].closed_at = null;
+
+    const failure: unknown = await payrollExtrasService
+      .correctPayrollPeriod(
+        payrollPagedStub.SEDE_ID,
+        PERIOD_ID,
+        { reason: "No debería corregirse." },
+        ACTOR,
+      )
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "PERIOD_NOT_CLOSED", status: 409 });
+    expect(correctionInserts()).toHaveLength(0);
+  });
+
+  it("control negativo: un período sin ítems no tiene nada que corregir", async () => {
+    seedWrongClosedPeriod();
+    payrollPagedStub.tables.payroll_items = [];
+
+    const failure: unknown = await payrollExtrasService
+      .correctPayrollPeriod(
+        payrollPagedStub.SEDE_ID,
+        PERIOD_ID,
+        { reason: "Sin liquidación." },
+        ACTOR,
+      )
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: "NOTHING_TO_CORRECT", status: 409 });
+    expect(correctionInserts()).toHaveLength(0);
+  });
+
+  it("control negativo: un período de OTRA sede no se corrige desde esta", async () => {
+    seedWrongClosedPeriod({ sedeId: OTHER_SEDE });
+
+    const failure: unknown = await payrollExtrasService
+      .correctPayrollPeriod(
+        payrollPagedStub.SEDE_ID,
+        PERIOD_ID,
+        { reason: "De otra sede." },
+        ACTOR,
+      )
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: "FORBIDDEN", status: 403 });
+    expect(correctionInserts()).toHaveLength(0);
+  });
+
+  it("NO mueve plata: no escribe pagos ni pagos extraordinarios, y no toca vales", async () => {
+    // Un vale que ESTE período ya descontó: el recálculo tiene que seguir
+    // restándolo del neto (si no, la corrección subiría el neto por una razón
+    // ajena a la corrección) pero sin volver a escribir el vale.
+    seedWrongClosedPeriod({
+      vouchers: [
+        {
+          id: "vale-1",
+          sede_id: payrollPagedStub.SEDE_ID,
+          employee_id: EMPLOYEE_ID,
+          amount: 100_000,
+          request_date: "2026-09-03",
+          status: "descontada",
+          approved_by: "u-admin-1",
+          approval_code: null,
+          observation: null,
+        },
+      ],
+    });
+
+    const result = await payrollExtrasService.correctPayrollPeriod(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      { reason: "Fijo mal prorrateado, con vale ya descontado." },
+      ACTOR,
+    );
+
+    // 326.667 − 100.000 = 226.667: el descuento del vale sigue en la versión
+    // corregida (no desaparece por estar ya `descontada`).
+    expect(result.view.correctedNetTotal).toBe(PRORATED - 100_000);
+    expect(result.view.rows[0].corrected.deductions_vales).toBe(100_000);
+
+    // NADA de dinero se mueve ni se reescribe:
+    expect(moneyInserts()).toHaveLength(0);
+    expect(
+      payrollPagedStub.inserts.filter((entry) => entry.table === "voucher_requests"),
+    ).toHaveLength(0);
+    expect(payrollPagedStub.updates).toHaveLength(0);
+    // El vale sigue como estaba.
+    expect(payrollPagedStub.tables.voucher_requests[0].status).toBe("descontada");
+  });
+
+  it("la corrección es una acción auditada con el motivo y los totales de las DOS versiones", async () => {
+    seedWrongClosedPeriod();
+    const result = await payrollExtrasService.correctPayrollPeriod(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      { reason: "El fijo se pagó completo y correspondía la parte de los días." },
+      ACTOR,
+    );
+
+    const audit = payrollPagedStub.inserts.find((entry) => entry.table === "audit_logs");
+    expect(audit?.payload).toMatchObject({
+      action: "payroll.period_corrected",
+      entity: "payroll_periods",
+      entity_id: PERIOD_ID,
+      user_id: ACTOR.userId,
+      sede_id: payrollPagedStub.SEDE_ID,
+      metadata: {
+        correction_id: result.correction.id,
+        reason: "El fijo se pagó completo y correspondía la parte de los días.",
+        previous_net_total: SALARY,
+        corrected_net_total: PRORATED,
+        previous_paid_total: SALARY,
+        difference_total: 1_073_333,
+      },
+    });
+    // La acción NO es la del cálculo: un auditor no puede leer "se calculó"
+    // donde lo que pasó es que se corrigió una liquidación ya firmada.
+    expect(AUDIT_ACTIONS.PAYROLL_PERIOD_CORRECTED).not.toBe(AUDIT_ACTIONS.PAYROLL_CALCULATED);
+  });
+
+  it("preserva los ajustes manuales: un bono escrito en la liquidación no se borra", async () => {
+    // El bono no sale de ninguna regla: es una decisión que quedó escrita. La
+    // corrección cambia lo que cambian las reglas (el fijo), no el bono.
+    seedWrongClosedPeriod({
+      item: { bonuses: 50_000, net_pay: SALARY + 50_000 },
+      payments: [
+        {
+          id: "pago-1",
+          payroll_item_id: ITEM_ID,
+          method_id: null,
+          method_code: "efectivo",
+          amount: SALARY + 50_000,
+          paid_at: "2026-09-07T23:30:00.000Z",
+          paid_by: "u-admin-1",
+          reference: null,
+        },
+      ],
+    });
+
+    const result = await payrollExtrasService.correctPayrollPeriod(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      { reason: "Fijo mal prorrateado." },
+      ACTOR,
+    );
+
+    expect(result.view.rows[0].corrected.bonuses).toBe(50_000);
+    expect(result.view.rows[0].corrected.net_pay).toBe(PRORATED + 50_000);
+    expect(result.view.correctedNetTotal).toBe(PRORATED + 50_000);
+  });
+});
+
+// ----------------- la comparación de la corrección (PA-2b, función pura) ---
+
+describe("payroll: la comparación de la corrección, función pura (PA-2b)", () => {
+  const amounts = (net: number) => ({
+    base_fixed: net,
+    commissions: 0,
+    bonuses: 0,
+    deductions_vales: 0,
+    other_discounts: 0,
+    net_pay: net,
+  });
+
+  it("la diferencia es pagado − neto corregido, por empleado y para el período", () => {
+    const view = buildPayrollCorrectionView({
+      previous: [{ employee_id: "e1", ...amounts(1_400_000) }],
+      corrected: [{ employee_id: "e1", ...amounts(326_667) }],
+      paidByEmployee: new Map([["e1", 1_400_000]]),
+    });
+
+    expect(view.previousNetTotal).toBe(1_400_000);
+    expect(view.correctedNetTotal).toBe(326_667);
+    expect(view.paidTotal).toBe(1_400_000);
+    expect(view.rows[0].difference).toBe(1_073_333);
+    expect(view.differenceTotal).toBe(1_073_333);
+  });
+
+  it("la diferencia es con signo: lo que quedó debiendo se ve como negativo", () => {
+    const view = buildPayrollCorrectionView({
+      previous: [{ employee_id: "e1", ...amounts(100_000) }],
+      corrected: [{ employee_id: "e1", ...amounts(400_000) }],
+      paidByEmployee: new Map([["e1", 100_000]]),
+    });
+
+    // La corrección sube lo debido y lo pagado no alcanza: −300.000.
+    expect(view.rows[0].difference).toBe(-300_000);
+    expect(view.differenceTotal).toBe(-300_000);
+    // El total es la SUMA de las filas: la tabla y sus totales no pueden decir
+    // cosas distintas.
+    expect(view.paidTotal).toBe(100_000);
+    expect(view.correctedNetTotal).toBe(400_000);
+  });
+
+  it("sin pagos, la diferencia es el neto corregido entero (nada se saldó)", () => {
+    const view = buildPayrollCorrectionView({
+      previous: [{ employee_id: "e1", ...amounts(500_000) }],
+      corrected: [{ employee_id: "e1", ...amounts(500_000) }],
+      paidByEmployee: new Map(),
+    });
+
+    expect(view.paidTotal).toBe(0);
+    expect(view.rows[0].difference).toBe(-500_000);
+  });
+
+  it("un empleado que sólo está en una versión se muestra con la otra en cero (no desaparece)", () => {
+    const view = buildPayrollCorrectionView({
+      previous: [{ employee_id: "e1", ...amounts(100_000) }],
+      corrected: [
+        { employee_id: "e1", ...amounts(100_000) },
+        { employee_id: "e2", ...amounts(200_000) },
+      ],
+      paidByEmployee: new Map([["e1", 100_000]]),
+    });
+
+    expect(view.rows.map((row) => row.employee_id)).toEqual(["e1", "e2"]);
+    expect(view.rows[1].previous.net_pay).toBe(0);
+    expect(view.rows[1].corrected.net_pay).toBe(200_000);
+    expect(view.correctedNetTotal).toBe(300_000);
+  });
+});
+
+// ----------------------------------------- migración 037 (PA-2b) ---
+
+describe("migración 037_payroll_period_correction.sql (PA-2b)", () => {
+  const sqlPath = join(process.cwd(), "supabase", "migrations", "037_payroll_period_correction.sql");
+  // Lectura tolerante a la ausencia: en RED el archivo no existe todavía y el
+  // fallo tiene que ser la ASERCIÓN de cada prueba, no un error de colección
+  // que oculte los otros huecos.
+  const sql = existsSync(sqlPath) ? readFileSync(sqlPath, "utf8") : "";
+  /** Sin espacios de más: compara el DDL, no la indentación del archivo. */
+  const flat = sql.replace(/\s+/g, " ");
+
+  it("crea las dos tablas con el motivo obligatorio y las dos versiones", () => {
+    expect(flat).toContain("CREATE TABLE IF NOT EXISTS public.payroll_period_corrections");
+    expect(flat).toContain("CREATE TABLE IF NOT EXISTS public.payroll_period_correction_items");
+    expect(flat).toContain("CHECK (btrim(reason) <> '')");
+    expect(flat).toContain("previous_net_total numeric(12, 2)");
+    expect(flat).toContain("corrected_net_total numeric(12, 2)");
+    expect(flat).toContain("previous_paid numeric(12, 2)");
+    expect(flat).toContain("corrected_net_pay numeric(12, 2)");
+  });
+
+  it("una sola corrección por período y una fila por empleado", () => {
+    expect(flat).toContain(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_payroll_period_corrections_period ON public.payroll_period_corrections (period_id)",
+    );
+    expect(flat).toContain(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_payroll_period_correction_items_employee ON public.payroll_period_correction_items (correction_id, employee_id)",
+    );
+  });
+
+  it("no reabre el período ni mueve plata: no toca las tablas de pago", () => {
+    expect(sql).not.toMatch(/ALTER TABLE public\.payroll_periods/i);
+    expect(sql).not.toMatch(/ALTER TABLE public\.payroll_items/i);
+    expect(sql).not.toMatch(/INSERT INTO public\.payroll_periods/i);
+    expect(sql).not.toMatch(/INSERT INTO public\.payroll_items/i);
+    expect(sql).not.toMatch(/INSERT INTO public\.payroll_payments/i);
+    expect(sql).not.toMatch(/INSERT INTO public\.payroll_extras/i);
+    expect(sql).not.toMatch(/INSERT INTO public\.voucher_requests/i);
+  });
+
+  it("es idempotente y no borra ni reescribe filas", () => {
+    expect(flat).toContain("IF NOT EXISTS");
+    // Sólo cuentan los statements EJECUTABLES: el encabezado NOMBRA estas
+    // operaciones para decir que no las hace (mismo criterio que cash.test.ts).
+    expect(sql).not.toMatch(/^\s*DELETE\s+FROM/im);
+    expect(sql).not.toMatch(/^\s*UPDATE\s+public\./im);
+    expect(sql).not.toMatch(/^\s*DROP\s+(TABLE|COLUMN|SCHEMA)/im);
+    expect(sql).not.toMatch(/^\s*TRUNCATE/m);
+  });
+
+  it("explica el orden de los statements, qué NO hace y no se ejecutó", () => {
+    expect(sql).toContain("ORDEN DE LOS STATEMENTS");
+    expect(sql).toContain("QUÉ NO HACE ESTE ARCHIVO");
+    expect(sql).toContain("NO ejecutado por el agente: requiere base de datos");
+    // La decisión del dueño queda escrita: la diferencia la salda un humano.
+    expect(sql).toContain("el sistema MUESTRA la diferencia y NO mueve plata por sí solo");
+  });
+});
+
+// ------------------- lo que la pantalla dice de la corrección (PA-2b) ---
+
+describe("payroll: la pantalla dice que la corrección no mueve dinero (PA-2b)", () => {
+  const client = readFileSync(
+    join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
+    "utf8",
+  );
+
+  it("nombra las tres cifras: lo que se debía, lo que se pagó y la diferencia", () => {
+    expect(client).toContain("Debido antes (versión anterior)");
+    expect(client).toContain("Debido corregido (versión vigente)");
+    expect(client).toContain("Diferencia (pagado - corregido)");
+  });
+
+  it("dice, palabra por palabra, que la diferencia NO la salda la corrección", () => {
+    expect(client).toContain(
+      "La corrección deja el registro de lo que debía pagarse; NO mueve dinero: no paga, no descuenta ni arrastra saldos.",
+    );
+    expect(client).toContain(
+      "La diferencia (pagado - corregido) NO queda saldada por la corrección: se salda con un pago extraordinario cuyo motivo diga que es el ajuste por la corrección del período.",
+    );
+  });
+
+  it("el período firmado sigue visible y se dice que la corrección no lo reescribe", () => {
+    expect(client).toContain(
+      "El período cerrado no se reabre ni se pisa: se guarda una corrección con las dos versiones y un motivo obligatorio.",
+    );
+    expect(client).toContain(
+      "La liquidación firmada del período queda intacta y se sigue mostrando tal como se cerró.",
+    );
+  });
+
+  it("el motivo de la corrección es obligatorio también en la pantalla", () => {
+    expect(client).toContain("Motivo de la corrección");
+    expect(client).toContain("El motivo de la corrección es obligatorio.");
+  });
+
+  it("no se inventa un movimiento de dinero en la copia (control negativo)", () => {
+    // Ninguna copia promete pago, descuento, ajuste automático ni arrastre.
+    expect(client).not.toContain("claw-back");
+    expect(client).not.toContain("se descontará");
+    expect(client).not.toContain("se arrastra al período siguiente");
+    expect(client).not.toContain("ajuste automático");
+  });
+});

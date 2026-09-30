@@ -11,7 +11,9 @@ import {
   approveVoucher,
   calculatePayroll,
   closePayrollPeriod,
+  correctPayrollPeriod,
   deletePayrollPeriod,
+  getPayrollPeriodCorrection,
   getPeriodDetail,
   getVoucherSettings,
   listPayrollExtras,
@@ -143,6 +145,38 @@ export async function deletePayrollPeriodAction(id: string) {
       userId: session.userId,
       sedeId: session.sedeId,
     });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
+ * PA-2b: corrige un período CERRADO sin reabrirlo ni pisarlo: recalcula con las
+ * reglas vigentes y guarda las dos versiones con el motivo. NO mueve plata.
+ * Solo admin: es nómina, y el módulo de nómina no es de caja.
+ */
+export async function correctPayrollPeriodAction(id: string, input: unknown) {
+  try {
+    const session = await requirePayrollAdmin(await sessionToken());
+    const data = await correctPayrollPeriod(session.sedeId, id, input, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+    });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
+ * PA-2b: la corrección de un período (si existe), con las dos versiones ya
+ * comparadas. Solo admin: muestra la nómina completa de la sede.
+ */
+export async function getPayrollPeriodCorrectionAction(id: string) {
+  try {
+    const session = await requirePayrollAdmin(await sessionToken());
+    const data = await getPayrollPeriodCorrection(session.sedeId, id);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

@@ -5,7 +5,9 @@ import { toast } from "sonner";
 import {
   calculatePayrollAction,
   closePayrollPeriodAction,
+  correctPayrollPeriodAction,
   deletePayrollPeriodAction,
+  getPayrollPeriodCorrectionAction,
   getPeriodDetailAction,
   listPayrollExtrasAction,
   listPeriodsAction,
@@ -15,6 +17,7 @@ import {
 } from "@/src/features/payroll/actions";
 import type {
   PayrollExtraRow,
+  PayrollPeriodCorrectionResult,
   PayrollPeriodRow,
   PayrollPeriodSummary,
   PeriodDetail,
@@ -30,6 +33,7 @@ import {
   replacePayrollMonthPeriod,
   sumMoney,
   summarizePayrollItems,
+  type PayrollCorrectionView,
   type PayrollExtraKind,
   type PayrollItemTotals,
   type PayrollMonthEmployeeRow,
@@ -122,6 +126,20 @@ const PAYROLL_EXTRA_KIND_LABELS: Record<PayrollExtraKind, string> = {
   emergencia: "Emergencia",
   otro: "Otro",
 };
+
+/**
+ * PA-2b: lo que la pantalla dice de una corrección. Se escribe UNA vez y se
+ * muestra tal cual: la corrección NO mueve dinero y la diferencia no queda
+ * saldada, y eso no puede depender de cómo se redactó cada párrafo.
+ */
+const CORRECTION_MOVES_NO_MONEY =
+  "La corrección deja el registro de lo que debía pagarse; NO mueve dinero: no paga, no descuenta ni arrastra saldos.";
+const CORRECTION_DIFFERENCE_IS_MANUAL =
+  "La diferencia (pagado - corregido) NO queda saldada por la corrección: se salda con un pago extraordinario cuyo motivo diga que es el ajuste por la corrección del período.";
+const CORRECTION_KEEPS_ORIGINAL =
+  "El período cerrado no se reabre ni se pisa: se guarda una corrección con las dos versiones y un motivo obligatorio.";
+const CORRECTION_ORIGINAL_STILL_SHOWN =
+  "La liquidación firmada del período queda intacta y se sigue mostrando tal como se cerró.";
 
 /** Máximo de nombres listados en el aviso de pendientes antes de resumir. */
 const PENDING_VISIBLE_LIMIT = 8;
@@ -325,6 +343,76 @@ function PeriodDetailTable({ items, employeeName, payLabel, onView }: PeriodDeta
             </tr>
           ))}
         </tbody>
+      </table>
+    </div>
+  );
+}
+
+/**
+ * PA-2b: la comparación de una corrección. Muestra las tres cifras —lo que el
+ * período decía antes, lo que dicen las reglas vigentes y lo pagado— y la
+ * diferencia (pagado - corregido), por empleado y para el período.
+ *
+ * NO hay ninguna acción acá y no se puede pagar desde un período cerrado: la
+ * corrección es un registro, la diferencia se salda a mano. El orden es por
+ * nombre del empleado para leer, no por id.
+ */
+function CorrectionComparison({
+  view,
+  employeeName,
+}: {
+  view: PayrollCorrectionView;
+  employeeName: (id: string) => string;
+}) {
+  const rows = [...view.rows].sort((left, right) =>
+    employeeName(left.employee_id).localeCompare(employeeName(right.employee_id), "es-CO"),
+  );
+  return (
+    <div className="mt-3 overflow-x-auto">
+      <table className={cn("w-full text-left text-sm", "min-w-[880px]")}>
+        <thead>
+          <tr className={tableHeaderClass}>
+            <th className={tableCellClass} scope="col">
+              Empleado
+            </th>
+            <th className={tableCellClass} scope="col">
+              Debido antes (versión anterior)
+            </th>
+            <th className={tableCellClass} scope="col">
+              Debido corregido (versión vigente)
+            </th>
+            <th className={tableCellClass} scope="col">
+              Pagado
+            </th>
+            <th className={tableCellClass} scope="col">
+              Diferencia (pagado - corregido)
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.employee_id} className={tableRowClass}>
+              <td className={tableCellClass}>{employeeName(row.employee_id)}</td>
+              <td className={tableCellClass}>{formatMoney(Number(row.previous.net_pay))}</td>
+              <td className={cn(tableCellClass, "font-semibold")}>
+                {formatMoney(Number(row.corrected.net_pay))}
+              </td>
+              <td className={tableCellClass}>{formatMoney(row.paid)}</td>
+              <td className={cn(tableCellClass, "font-semibold")}>{formatMoney(row.difference)}</td>
+            </tr>
+          ))}
+        </tbody>
+        <tfoot>
+          <tr className={tableRowClass}>
+            <td className={cn(tableCellClass, "font-semibold")}>Total del período</td>
+            <td className={tableCellClass}>{formatMoney(view.previousNetTotal)}</td>
+            <td className={cn(tableCellClass, "font-semibold")}>
+              {formatMoney(view.correctedNetTotal)}
+            </td>
+            <td className={tableCellClass}>{formatMoney(view.paidTotal)}</td>
+            <td className={cn(tableCellClass, "font-semibold")}>{formatMoney(view.differenceTotal)}</td>
+          </tr>
+        </tfoot>
       </table>
     </div>
   );
@@ -695,6 +783,15 @@ export function PayrollClient(props: PayrollClientProps) {
   const [extraDaysFrom, setExtraDaysFrom] = useState("");
   const [extraDaysTo, setExtraDaysTo] = useState("");
 
+  // PA-2b: la corrección del período cerrado que se está mirando, con las dos
+  // versiones ya comparadas. Es lectura del período (se recarga con el detalle)
+  // y el formulario es el único lugar donde se escribe el motivo.
+  const [correction, setCorrection] = useState<PayrollPeriodCorrectionResult | null>(null);
+  const [correctionDialogOpen, setCorrectionDialogOpen] = useState(false);
+  const [correctionReason, setCorrectionReason] = useState("");
+  const [correctionError, setCorrectionError] = useState<string | null>(null);
+  const [correctionBusy, setCorrectionBusy] = useState(false);
+
   // Los pagos extraordinarios no llegan por props (la página los arma para los
   // períodos): se leen al montar. Sólo el admin tiene la superficie, así que el
   // efecto no dispara para el empleado.
@@ -793,6 +890,20 @@ export function PayrollClient(props: PayrollClientProps) {
     setAdjustments({});
     setPortions({});
     setDetailDialogOpen(false);
+    setCorrection(null);
+    closeCorrectionDialog();
+  }
+
+  /**
+   * PA-2b: la corrección del período (o `null`). Se lee SIEMPRE al cargar el
+   * detalle: si no, la pantalla mostraría la corrección del período anterior.
+   */
+  async function loadCorrection(id: string) {
+    const result = (await getPayrollPeriodCorrectionAction(
+      id,
+    )) as ActionResult<PayrollPeriodCorrectionResult | null>;
+    if (result.success) setCorrection(result.data);
+    else setError(`${result.code}: ${result.message}`);
   }
 
   function loadDetail(id: string) {
@@ -802,6 +913,10 @@ export function PayrollClient(props: PayrollClientProps) {
         acceptDetail(result.data);
         setDetailDialogOpen(true);
       }
+      // Sólo el admin tiene la superficie de la corrección (es nómina de la
+      // sede); para el empleado se limpia para no dejar la del período previo.
+      if (props.canAdmin) await loadCorrection(id);
+      else setCorrection(null);
     });
   }
 
@@ -1084,6 +1199,40 @@ export function PayrollClient(props: PayrollClientProps) {
     setBusy(false);
     if (show(result, "Periodo cerrado.")) {
       await refreshPeriods(selectedId);
+      await loadDetail(selectedId);
+    }
+  }
+
+  function closeCorrectionDialog() {
+    setCorrectionDialogOpen(false);
+    setCorrectionReason("");
+    setCorrectionError(null);
+  }
+
+  /**
+   * PA-2b: corrige el período CERRADO. Recalcula con las reglas vigentes y
+   * guarda las dos versiones con el motivo obligatorio. NO mueve dinero: acá no
+   * hay pago, descuento ni ajuste; la diferencia se muestra y se salda a mano
+   * con un pago extraordinario. La liquidación firmada no se reabre.
+   */
+  async function handleCorrectPeriod(event: FormEvent) {
+    event.preventDefault();
+    if (!selectedId) return;
+    if (!correctionReason.trim()) {
+      setCorrectionError("El motivo de la corrección es obligatorio.");
+      return;
+    }
+    setCorrectionBusy(true);
+    const result = (await correctPayrollPeriodAction(selectedId, {
+      reason: correctionReason,
+    })) as ActionResult<PayrollPeriodCorrectionResult>;
+    setCorrectionBusy(false);
+    if (
+      show(result, "Período corregido. La corrección queda registrada y no mueve dinero.")
+    ) {
+      closeCorrectionDialog();
+      // La corrección no cambia la liquidación firmada: se recarga igual para
+      // que la pantalla lea el estado del servidor y no una copia.
       await loadDetail(selectedId);
     }
   }
@@ -1885,6 +2034,54 @@ export function PayrollClient(props: PayrollClientProps) {
                       onView={openItemDetail}
                     />
                   )}
+                  {/*
+                    PA-2b: un período cerrado y equivocado no tenía salida —no
+                    se borra, no se recalcula y sus días no se vuelven a
+                    nominar—. La corrección es un REGISTRO con las dos
+                    versiones, con motivo, y no mueve dinero. Sólo admin.
+                  */}
+                  {props.canAdmin && (
+                    <section className="mt-5 rounded-md border border-border-color p-3 dark:border-border-color-2">
+                      <h3 className="text-sm font-semibold text-text-primary">
+                        Corrección del período
+                      </h3>
+                      {correction ? (
+                        <>
+                          <p className="mt-2 text-sm text-text-secondary">
+                            {CORRECTION_MOVES_NO_MONEY}
+                          </p>
+                          <p className="mt-1 text-sm text-text-secondary">
+                            {CORRECTION_DIFFERENCE_IS_MANUAL}
+                          </p>
+                          <p className="mt-1 text-sm text-text-tertiary">
+                            {CORRECTION_ORIGINAL_STILL_SHOWN}
+                          </p>
+                          <p className="mt-2 text-xs text-text-tertiary">
+                            {`Corregido el ${new Date(correction.correction.corrected_at).toLocaleString("es-CO")} — motivo: ${correction.correction.reason}`}
+                          </p>
+                          <CorrectionComparison view={correction.view} employeeName={employeeName} />
+                        </>
+                      ) : (
+                        <>
+                          <p className="mt-2 text-sm text-text-secondary">
+                            La liquidación de este período ya está firmada. Si quedó mal, se corrige sin
+                            reabrirlo: se recalcula con las reglas vigentes y se guarda una corrección con las
+                            dos versiones. NO mueve dinero.
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setCorrectionError(null);
+                              setCorrectionDialogOpen(true);
+                            }}
+                            className={`${buttonClass} mt-3`}
+                          >
+                            Corregir período (recalcula con las reglas vigentes)
+                          </button>
+                        </>
+                      )}
+                    </section>
+                  )}
                 </>
               ) : props.canAdmin ? (
                 <>
@@ -2011,6 +2208,60 @@ export function PayrollClient(props: PayrollClientProps) {
                 Cerrar
               </button>
             </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/*
+        PA-2b: corrección de un período cerrado. El motivo es obligatorio y el
+        diálogo dice, en el mismo lugar donde se firma, que la corrección no
+        mueve dinero y que la diferencia se salda con un pago extraordinario.
+      */}
+      {props.canAdmin && selected && (
+        <Dialog
+          open={correctionDialogOpen}
+          onOpenChange={(open) => {
+            if (!open) closeCorrectionDialog();
+            else setCorrectionDialogOpen(true);
+          }}
+        >
+          <DialogContent className="max-w-xl">
+            <DialogHeader>
+              <DialogTitle>Corregir período cerrado</DialogTitle>
+              <DialogDescription>{CORRECTION_KEEPS_ORIGINAL}</DialogDescription>
+            </DialogHeader>
+            <form onSubmit={handleCorrectPeriod} className="mt-4 flex flex-col gap-4">
+              <p className="text-sm text-text-secondary">{CORRECTION_MOVES_NO_MONEY}</p>
+              <p className="text-sm text-text-secondary">{CORRECTION_DIFFERENCE_IS_MANUAL}</p>
+
+              <label className={labelClass} htmlFor="payroll-correction-reason">
+                Motivo de la corrección
+                <textarea
+                  id="payroll-correction-reason"
+                  value={correctionReason}
+                  onChange={(event) => {
+                    setCorrectionReason(event.target.value);
+                    setCorrectionError(null);
+                  }}
+                  rows={2}
+                  maxLength={500}
+                  placeholder="Por qué se corrige (por ejemplo: el fijo se pagó completo cuando correspondía la parte de los días)"
+                  className={inputClass}
+                  required
+                />
+              </label>
+
+              {correctionError ? <Alert variant="destructive">{correctionError}</Alert> : null}
+
+              <DialogFooter>
+                <button type="button" className={ghostClass} onClick={closeCorrectionDialog}>
+                  Cancelar
+                </button>
+                <button type="submit" disabled={correctionBusy} className={buttonClass}>
+                  {correctionBusy ? "Corrigiendo…" : "Corregir período"}
+                </button>
+              </DialogFooter>
+            </form>
           </DialogContent>
         </Dialog>
       )}
