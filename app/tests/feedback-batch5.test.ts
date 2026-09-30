@@ -611,10 +611,11 @@ describe("facturación y login: el texto visible no cambió", () => {
     // tenían rol): siguen en su clase de texto y NO se envuelven en `Alert`
     // —envolverlos AGREGARÍA el anuncio que hoy no existe—. Queda pineado.
     const vacios: Array<[string, string, string]> = [
+      // Los tres de la hoja pasaron a `text-paper-ink-muted` (WU5): mismo color, #62748e en claro y oscuro.
       ["Sin facturas para estos filtros.", "li", "px-3 py-4 text-sm text-text-secondary"],
-      ["Sin ítems. Agregue al menos uno para emitir.", "td", "px-3 py-4 text-center text-sm text-slate-500"],
-      ["Sin impuestos.", "li", "text-slate-500"],
-      ["Sin cobro registrado (Emitida).", "li", "text-slate-500"],
+      ["Sin ítems. Agregue al menos uno para emitir.", "td", "px-3 py-4 text-center text-sm text-paper-ink-muted"],
+      ["Sin impuestos.", "li", "text-paper-ink-muted"],
+      ["Sin cobro registrado (Emitida).", "li", "text-paper-ink-muted"],
     ];
     for (const [text, opener, style] of vacios) {
       expect(plainTextBlock(INVOICES_CLIENT_CODE, text, `<${opener}`), text).toContain(style);
