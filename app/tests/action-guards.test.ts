@@ -1562,6 +1562,15 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
     const from = (table: string) => {
       const rows = dbStub.rows[table] ?? [];
       const result = { data: rows, error: null };
+      /**
+       * CL-5: las consultas de este doble ignoran sus filtros y devuelven la
+       * primera fila sembrada. Alcanza para las guardas, pero la lectura por
+       * MARCA (el lookup del servicio, `eq("idempotency_key", …)`) tiene que
+       * responder que NO hay nada: si devolviera la fila sembrada, la prueba de
+       * abajo dejaría de ejercitar la ESCRITURA del pago extraordinario y se
+       * volvería, sin decirlo, una prueba del camino de repetición.
+       */
+      let filteredByMark = false;
       const query: Record<string, unknown> = {
         select: () => query,
         insert: (payload?: unknown) => {
@@ -1576,7 +1585,10 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
           dbStub.rows[table] = [...rows, ...persisted];
           return query;
         },
-        eq: () => query,
+        eq: (column: string) => {
+          if (column === "idempotency_key") filteredByMark = true;
+          return query;
+        },
         neq: () => query,
         in: () => query,
         is: () => query,
@@ -1584,8 +1596,10 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
         order: () => query,
         range: () => query,
         limit: () => query,
-        maybeSingle: () => Promise.resolve({ data: rows[0] ?? null, error: null }),
-        single: () => Promise.resolve({ data: rows[0] ?? null, error: null }),
+        maybeSingle: () =>
+          Promise.resolve({ data: filteredByMark ? null : (rows[0] ?? null), error: null }),
+        single: () =>
+          Promise.resolve({ data: filteredByMark ? null : (rows[0] ?? null), error: null }),
         then: (
           onFulfilled: (value: unknown) => unknown,
           onRejected?: (reason: unknown) => unknown,
@@ -1773,6 +1787,10 @@ describe("nómina solo admin (y el propio empleado): la caja no entra; los vales
     asSession(["admin"]);
 
     const registered = await payPayrollExtraAction({
+      // CL-5: la marca del intento es obligatoria (044). Acá el valor es
+      // cualquiera con forma de uuid: la prueba verifica la GUARDA y la
+      // escritura, no la idempotencia, que tiene sus propias pruebas.
+      idempotency_key: "8c1e5a37-2d64-4f09-b7a3-6e0c9b4d1f25",
       employee_id: EMPLEADO_ID,
       amount: 500000,
       method_code: "efectivo",

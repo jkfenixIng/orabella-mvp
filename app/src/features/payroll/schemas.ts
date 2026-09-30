@@ -105,8 +105,21 @@ export type VoucherLimitsInput = z.infer<typeof voucherLimitsSchema>;
  * PAY-06: solicitud de vale (monto > 0, método arqueable obligatorio, fecha
  * opcional, observación opcional). El método se elige AL CREAR el vale (la
  * caja lo sabe antes de aprobar): es el medio por el que saldrá el dinero.
+ *
+ * CL-5: la operación exige `idempotency_key`, la MARCA del intento (uuid que
+ * acuña la pantalla de vales al empezar el intento y que se reutiliza en los
+ * reintentos del MISMO intento). Es la MISMA definición que usan las otras
+ * puertas del dinero —vive en `billing/schemas.ts` y todas validan igual, en
+ * vez de tener cinco reglas que se pueden separar—. Es OBLIGATORIA: un envío
+ * sin marca no se puede reconocer como repetición, y los topes de 026 son
+ * ACUMULADOS (una obligación total, no la identidad de un envío), así que
+ * mientras `2 × monto` quepa en el día y en la semana el reintento abre un
+ * SEGUNDO vale: segunda salida de caja en el arqueo y segundo descuento de
+ * nómina. Aceptarlo sin marca es reabrir el defecto para ESE llamador; el
+ * rechazo es ruidoso (VALIDATION) y no escribe nada.
  */
 export const requestVoucherSchema = z.object({
+  idempotency_key: idempotencyKeySchema,
   employee_id: uuidSchema,
   amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
   method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
@@ -150,9 +163,20 @@ export type PayrollExtraKind = z.infer<typeof payrollExtraKindSchema>;
  * OPCIONALES y son los días que el pago liquida: alimentan la GUÍA (ver
  * `payrollExtraGuide`) y quedan guardados como referencia de qué se pagó. Van
  * juntos o ninguno, y el rango tiene que ser real (fin >= inicio).
+ *
+ * CL-5: la operación exige `idempotency_key`, la MARCA del intento (uuid que
+ * acuña la pantalla al empezar el intento y que se reutiliza en los reintentos
+ * del MISMO intento). Es la MISMA definición que usan las otras puertas del
+ * dinero —vive en `billing/schemas.ts` y todas validan igual, en vez de tener
+ * cinco reglas que se pueden separar—. Es OBLIGATORIA: un envío sin marca no se
+ * puede reconocer como repetición, y acá no hay tope que lo frene (el monto lo
+ * escribe el admin y NO se topa), así que aceptarlo sin marca es reabrir el
+ * defecto para ESE llamador: la segunda vez escribe un segundo pago. El rechazo
+ * es ruidoso (VALIDATION) y no escribe nada.
  */
 export const payrollExtraSchema = z
   .object({
+    idempotency_key: idempotencyKeySchema,
     employee_id: uuidSchema,
     amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
     method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
