@@ -38,6 +38,11 @@ import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
 import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
 import {
+  PagedReadError,
+  readAllPaged,
+  type PagedResponse,
+} from "@/src/shared/lib/paged";
+import {
   listPaymentMethods,
   AdminError,
 } from "@/src/features/admin/service";
@@ -112,6 +117,11 @@ export async function requireCashWriter(
 
 function toCashError(error: unknown): CashError {
   if (error instanceof CashError) return error;
+  // CL-21: una lectura exhaustiva que no se completó no puede degradar a
+  // "Error interno". El código de la lectura (`READ_INCOMPLETE`) y la fila donde
+  // se cortó son lo que hace accionable el fallo; perderlos sería justo lo
+  // contrario de fallar A LA VISTA.
+  if (error instanceof PagedReadError) return new CashError(error.code, error.message, 500);
   if (error instanceof AdminError) return new CashError(error.code, error.message, error.status);
   if (error instanceof BillingError) {
     if (error.code === "NOT_FOUND") return new CashError("INVOICE_NOT_FOUND", "Factura no encontrada.", 404);
@@ -365,8 +375,53 @@ async function fetchCountTotals(
 }
 
 /**
+ * CL-21: lectura EXHAUSTIVA de una fuente del arqueo.
+ *
+ * El Data API de Supabase sirve, por request, a lo sumo `max-rows` filas (1000
+ * por defecto; ver `src/shared/lib/paged.ts`). Las CUATRO lecturas que alimentan
+ * el arqueo del cierre —`payments` del turno sin factura, las `invoice_payments`
+ * atribuidas al turno, los `commission_payouts` del turno y los vales APROBADOS—
+ * no estaban paginadas, así que un turno con más filas que ese techo se leía
+ * RECORTADO y en silencio: el `expected_cash` salía corto. Desde 058/059 el
+ * recorte ya no firma un arqueo corto —el TOKEN sale de la MISMA lectura recortada
+ * y la transacción, que re-cuenta el conjunto completo, rechaza con ARQUEO_STALE—,
+ * pero el turno quedaba sin poder cerrarse NUNCA.
+ *
+ * Acá se pagina con el helper de la casa, en un orden DETERMINISTA (el `id` de la
+ * tabla: es el orden de la PAGINACIÓN, no uno de negocio) y hasta agotar el
+ * conjunto. Un fallo de cualquier página se traduce a un error de NEGOCIO
+ * accionable (`READ_INCOMPLETE`, con la tabla y la fila donde se cortó): jamás se
+ * sigue con lo que se alcanzó a leer. El mismo helper lo usan los cuatro lectores
+ * del cierre y los fetchers COMPARTIDOS con la vista del día y el historial, que
+ * heredan así la lectura completa.
+ */
+async function readAllSource<TRow>(args: {
+  table: string;
+  what: string;
+  fetchPage: (from: number, to: number) => PromiseLike<PagedResponse<TRow>>;
+}): Promise<TRow[]> {
+  try {
+    return await readAllPaged<TRow>({ table: args.table, fetchPage: args.fetchPage });
+  } catch (error) {
+    if (error instanceof PagedReadError) {
+      throw new CashError(
+        error.code,
+        `No se pudo leer ${args.what} completo: ${error.message} La operación se detuvo antes de firmar nada: con una lectura recortada, el arqueo, la colección del turno y los totales de la vista saldrían mal. Reintente y, si persiste, revise el volumen de movimientos del turno.`,
+        500,
+      );
+    }
+    throw error;
+  }
+}
+
+/**
  * Pagos inmediatos de comisión por turno y método (descuentan del
  * esperado digital en vistas y cierre).
+ *
+ * CL-21: la lectura va EXHAUSTIVA (helper de la casa). Es un fetcher
+ * COMPARTIDO por el cierre, la vista del día y el historial, así que los tres
+ * ven el conjunto completo; el conteo del token del cierre sale de las MISMAS
+ * filas que el arqueo suma/resta, no de una lectura aparte.
  */
 async function fetchPayoutTotals(
   db: DbClient,
@@ -374,16 +429,22 @@ async function fetchPayoutTotals(
 ): Promise<Map<string, Map<string, number>>> {
   const result = new Map<string, Map<string, number>>();
   if (shiftIds.length === 0) return result;
-  const { data, error } = await db
-    .from("commission_payouts")
-    .select("cash_shift_id, method_code, amount")
-    .in("cash_shift_id", shiftIds);
-  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  for (const row of (data ?? []) as Array<{
+  const rows = await readAllSource<{
     cash_shift_id: string;
     method_code: string;
     amount: number | string;
-  }>) {
+  }>({
+    table: "commission_payouts",
+    what: "los pagos de comisión del turno",
+    fetchPage: (from, to) =>
+      db
+        .from("commission_payouts")
+        .select("cash_shift_id, method_code, amount")
+        .in("cash_shift_id", shiftIds)
+        .order("id")
+        .range(from, to),
+  });
+  for (const row of rows) {
     const byMethod = result.get(row.cash_shift_id) ?? new Map<string, number>();
     byMethod.set(row.method_code, roundMoney((byMethod.get(row.method_code) ?? 0) + Number(row.amount)));
     result.set(row.cash_shift_id, byMethod);
@@ -422,6 +483,11 @@ async function hasVoucherOutColumns(db: DbClient): Promise<boolean> {
  * precondición, así que el conteo que viaja como DATO es el de las MISMAS filas
  * que restaron del esperado y no el de una lectura aparte (que podría ver un
  * estado posterior y dejar el token por delante del arqueo).
+ *
+ * CL-21: la lectura es EXHAUSTIVA (helper de la casa). El filtro de negocio
+ * (`isVoucherCashOut`) se aplica DESPUÉS, igual que antes, sobre el conjunto
+ * completo: se leen todas las filas del turno y el recorte por fila sigue
+ * pasando por el mismo predicado que transcribe 059.
  */
 async function fetchVoucherOutRows(
   db: DbClient,
@@ -430,18 +496,24 @@ async function fetchVoucherOutRows(
   const result = new Map<string, VoucherCashOutInput[]>();
   if (shiftIds.length === 0) return result;
   if (!(await hasVoucherOutColumns(db))) return result;
-  const { data, error } = await db
-    .from("voucher_requests")
-    .select("cash_shift_id, approved_by, method_code, amount")
-    .in("cash_shift_id", shiftIds);
-  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  const byShift = new Map<string, VoucherCashOutInput[]>();
-  for (const row of (data ?? []) as Array<{
+  const rows = await readAllSource<{
     cash_shift_id: string;
     approved_by: string | null;
     method_code: string | null;
     amount: number | string;
-  }>) {
+  }>({
+    table: "voucher_requests",
+    what: "los vales del turno",
+    fetchPage: (from, to) =>
+      db
+        .from("voucher_requests")
+        .select("cash_shift_id, approved_by, method_code, amount")
+        .in("cash_shift_id", shiftIds)
+        .order("id")
+        .range(from, to),
+  });
+  const byShift = new Map<string, VoucherCashOutInput[]>();
+  for (const row of rows) {
     const list = byShift.get(row.cash_shift_id) ?? [];
     list.push({ approved_by: row.approved_by, method_code: row.method_code, amount: row.amount });
     byShift.set(row.cash_shift_id, list);
@@ -557,6 +629,12 @@ export function invoiceCollectionsSummary(
  * `cash_shift_id` (idempotente, sin borrar filas); la rama queda como red de
  * seguridad para la ventana en que conviven código/migración y para las filas
  * que la migración no pudo atribuir (factura sin turno).
+ *
+ * CL-21: las TRES consultas se leen de forma EXHAUSTIVA (helper de la casa, con
+ * el `order("id")` de la paginación). Éste es el segundo ledger que el arqueo
+ * SUMA y es un fetcher COMPARTIDO por el cierre, la vista del día y el
+ * historial: los tres ven la unión completa, y el conteo del token del cierre
+ * sale de la MISMA lista que el arqueo sumó.
  */
 async function fetchInvoicePaymentsByShift(
   db: DbClient,
@@ -569,39 +647,59 @@ async function fetchInvoicePaymentsByShift(
     list.push({ invoice_id: row.invoice_id, method_code: row.method_code, amount: Number(row.amount) });
     result.set(shiftId, list);
   };
-  const { data: direct, error: directError } = await db
-    .from("invoice_payments")
-    .select("invoice_id, cash_shift_id, method_code, amount")
-    .in("cash_shift_id", shiftIds);
-  if (directError) throw new CashError("INTERNAL", "Error interno.", 500);
-  for (const row of (direct ?? []) as Array<{
+  const direct = await readAllSource<{
     invoice_id: string;
     cash_shift_id: string;
     method_code: string;
     amount: number | string;
-  }>) {
+  }>({
+    table: "invoice_payments",
+    what: "los cobros de factura del turno",
+    fetchPage: (from, to) =>
+      db
+        .from("invoice_payments")
+        .select("invoice_id, cash_shift_id, method_code, amount")
+        .in("cash_shift_id", shiftIds)
+        .order("id")
+        .range(from, to),
+  });
+  for (const row of direct) {
     push(row.cash_shift_id, row);
   }
-  const { data: invoices, error: invoicesError } = await db
-    .from("invoices")
-    .select("id, cash_shift_id")
-    .in("cash_shift_id", shiftIds);
-  if (invoicesError) throw new CashError("INTERNAL", "Error interno.", 500);
-  const shiftByInvoice = new Map(
-    ((invoices ?? []) as Array<{ id: string; cash_shift_id: string }>).map((row) => [row.id, row.cash_shift_id]),
-  );
+  const invoices = await readAllSource<{ id: string; cash_shift_id: string }>({
+    table: "invoices",
+    what: "las facturas del turno",
+    fetchPage: (from, to) =>
+      db
+        .from("invoices")
+        .select("id, cash_shift_id")
+        .in("cash_shift_id", shiftIds)
+        .order("id")
+        .range(from, to),
+  });
+  const shiftByInvoice = new Map(invoices.map((row) => [row.id, row.cash_shift_id]));
   if (shiftByInvoice.size === 0) return result;
   // C1: filas históricas sin turno atribuidas al turno de emisión de su
   // factura. Conjunto disjunto del directo (`cash_shift_id` no nulo) y de la
   // suma de `payments` (los lectores de `payments` excluyen `invoice_id`),
   // por lo que este dinero se cuenta exactamente una vez.
-  const { data: nullShiftRows, error: legacyError } = await db
-    .from("invoice_payments")
-    .select("invoice_id, method_code, amount")
-    .in("invoice_id", [...shiftByInvoice.keys()])
-    .is("cash_shift_id", null);
-  if (legacyError) throw new CashError("INTERNAL", "Error interno.", 500);
-  for (const row of (nullShiftRows ?? []) as Array<{ invoice_id: string; method_code: string; amount: number | string }>) {
+  const nullShiftRows = await readAllSource<{
+    invoice_id: string;
+    method_code: string;
+    amount: number | string;
+  }>({
+    table: "invoice_payments",
+    what: "los cobros de factura históricos del turno",
+    fetchPage: (from, to) =>
+      db
+        .from("invoice_payments")
+        .select("invoice_id, method_code, amount")
+        .in("invoice_id", [...shiftByInvoice.keys()])
+        .is("cash_shift_id", null)
+        .order("id")
+        .range(from, to),
+  });
+  for (const row of nullShiftRows) {
     const shiftId = shiftByInvoice.get(row.invoice_id);
     if (shiftId) push(shiftId, row);
   }
@@ -1676,12 +1774,25 @@ export async function closeShift(
     // de factura del turno. Un pago con factura ya vive en `invoice_payments`
     // (ledger del cobro de factura): sumarlo también desde `payments`
     // duplicaba el efectivo del turno.
-    const { data: shiftPayments, error: paymentsError } = await db
-      .from("payments")
-      .select("amount, method_code")
-      .eq("cash_shift_id", shift.id)
-      .is("invoice_id", null);
-    if (paymentsError) throw new CashError("INTERNAL", "Error interno.", 500);
+    //
+    // CL-21: las CUATRO lecturas del arqueo van EXHAUSTIVAS (helper de la casa):
+    // el tope de filas por request del Data API (1000 por defecto) deja de ser
+    // un recorte silencioso. Antes, un turno con más filas que ese techo se leía
+    // truncado y —desde 058/059, con el token saliendo de la MISMA lectura
+    // corta— el cierre RECHAZABA con ARQUEO_STALE para siempre, sin salida para
+    // el operador.
+    const shiftPayments = await readAllSource<{ amount: number | string; method_code: string }>({
+      table: "payments",
+      what: "los cobros del turno",
+      fetchPage: (from, to) =>
+        db
+          .from("payments")
+          .select("amount, method_code")
+          .eq("cash_shift_id", shift.id)
+          .is("invoice_id", null)
+          .order("id")
+          .range(from, to),
+    });
     const invoicePayMaps = await fetchInvoicePaymentsByShift(db, [shift.id]);
     const invoicePays = invoicePayMaps.get(shift.id) ?? [];
     // CL-19/CL-20: el TOKEN de los conjuntos que este arqueo usó, para que el
@@ -1709,13 +1820,21 @@ export async function closeShift(
     const paidByMethod = sumShiftMoneyByMethod(mergeShiftMoney(shiftPayments, invoicePays));
     // Pagos inmediatos de comisión del turno (descuentan del esperado
     // por método: lo cobrado menos lo pagado).
-    const { data: payoutRows, error: payoutError } = await db
-      .from("commission_payouts")
-      .select("method_code, amount")
-      .eq("cash_shift_id", shift.id);
-    if (payoutError) throw new CashError("INTERNAL", "Error interno.", 500);
+    //
+    // CL-21: lectura EXHAUSTIVA, por el mismo motivo que los ledgers de arriba.
+    const payoutRows = await readAllSource<{ method_code: string; amount: number | string }>({
+      table: "commission_payouts",
+      what: "los pagos de comisión del turno",
+      fetchPage: (from, to) =>
+        db
+          .from("commission_payouts")
+          .select("method_code, amount")
+          .eq("cash_shift_id", shift.id)
+          .order("id")
+          .range(from, to),
+    });
     const paidOutByMethod = new Map<string, number>();
-    for (const row of ((payoutRows ?? []) as Array<{ method_code: string; amount: number | string }>)) {
+    for (const row of payoutRows) {
       paidOutByMethod.set(row.method_code, roundMoney((paidOutByMethod.get(row.method_code) ?? 0) + Number(row.amount)));
     }
     const payoutsOut = roundMoney([...paidOutByMethod.values()].reduce((acc, value) => acc + value, 0));
@@ -1730,11 +1849,15 @@ export async function closeShift(
     }
     const vouchersOut = sumMethodTotal(voucherOut);
     // CL-20: el token, con los CUATRO conjuntos ya leídos. Los dos primeros son
-    // las fuentes que el arqueo SUMA; los dos últimos, las que RESTA.
+    // las fuentes que el arqueo SUMA; los dos últimos, las que RESTA. CL-21: los
+    // cuatro conteos salen de las listas EXHAUSTIVAS de arriba (cada una leída
+    // una sola vez, por páginas y en orden determinista), así que el token y el
+    // arqueo siguen mirando el MISMO conjunto: paginar una y no la otra dejaría
+    // el token por delante y produciría un ARQUEO_STALE falso.
     const collectionCounts = {
-      payments: (shiftPayments ?? []).length,
+      payments: shiftPayments.length,
       invoice_payments: invoicePays.length,
-      commission_payouts: (payoutRows ?? []).length,
+      commission_payouts: payoutRows.length,
       voucher_requests: voucherRows.length,
     };
     // Facturas cobradas en este turno (emitidas aquí o en turnos anteriores):
@@ -2152,21 +2275,31 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
 
   let paymentsByShift = new Map<string, Array<{ amount: number; method_code: string }>>();
   if (rows.length > 0) {
-    const { data: payments, error: paymentsError } = await db
-      .from("payments")
-      .select("cash_shift_id, amount, method_code")
-      .in(
-        "cash_shift_id",
-        rows.map((row) => row.id),
-      )
-      .is("invoice_id", null);
-    if (paymentsError) throw new CashError("INTERNAL", "Error interno.", 500);
-    paymentsByShift = new Map();
-    for (const row of (payments ?? []) as Array<{
+    // CL-21: lectura EXHAUSTIVA. `payments` sin factura es la MISMA fuente que
+    // suma el arqueo del cierre, así que el tope de filas por request del Data
+    // API (1000 por defecto) dejaría la venta del día —y el efectivo de la
+    // vista— calculados sobre un conjunto recortado, en silencio.
+    const payments = await readAllSource<{
       cash_shift_id: string;
       amount: number | string;
       method_code: string;
-    }>) {
+    }>({
+      table: "payments",
+      what: "los cobros del día",
+      fetchPage: (pageFrom, pageTo) =>
+        db
+          .from("payments")
+          .select("cash_shift_id, amount, method_code")
+          .in(
+            "cash_shift_id",
+            rows.map((row) => row.id),
+          )
+          .is("invoice_id", null)
+          .order("id")
+          .range(pageFrom, pageTo),
+    });
+    paymentsByShift = new Map();
+    for (const row of payments) {
       const list = paymentsByShift.get(row.cash_shift_id) ?? [];
       list.push({ amount: Number(row.amount), method_code: row.method_code });
       paymentsByShift.set(row.cash_shift_id, list);
@@ -2309,21 +2442,30 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
 
   let paymentsByShift = new Map<string, Array<{ amount: number; method_code: string }>>();
   if (rows.length > 0) {
-    const { data: payments, error: paymentsError } = await db
-      .from("payments")
-      .select("cash_shift_id, amount, method_code")
-      .in(
-        "cash_shift_id",
-        rows.map((row) => row.id),
-      )
-      .is("invoice_id", null);
-    if (paymentsError) throw new CashError("INTERNAL", "Error interno.", 500);
-    paymentsByShift = new Map();
-    for (const row of (payments ?? []) as Array<{
+    // CL-21: la MISMA lectura exhaustiva que el cierre (el fetcher es el mismo
+    // para la vista del día y el historial): la página del historial no puede
+    // mostrar una venta recortada por el tope de filas por request.
+    const payments = await readAllSource<{
       cash_shift_id: string;
       amount: number | string;
       method_code: string;
-    }>) {
+    }>({
+      table: "payments",
+      what: "los cobros del historial",
+      fetchPage: (pageFrom, pageTo) =>
+        db
+          .from("payments")
+          .select("cash_shift_id, amount, method_code")
+          .in(
+            "cash_shift_id",
+            rows.map((row) => row.id),
+          )
+          .is("invoice_id", null)
+          .order("id")
+          .range(pageFrom, pageTo),
+    });
+    paymentsByShift = new Map();
+    for (const row of payments) {
       const list = paymentsByShift.get(row.cash_shift_id) ?? [];
       list.push({ amount: Number(row.amount), method_code: row.method_code });
       paymentsByShift.set(row.cash_shift_id, list);
