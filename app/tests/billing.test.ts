@@ -32,6 +32,7 @@ import {
   BillingError,
   annulInvoice,
   countInvoices,
+  createInvoice,
   editEmittedInvoiceItems,
   editInvoiceItems,
   getInvoiceDetail,
@@ -49,6 +50,12 @@ import { buildEmployeeCommissionDetail } from "@/src/features/payroll/schemas";
 const EMPLOYEE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const PRODUCT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const SERVICE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+/**
+ * MO-1: marcas de idempotencia de los tests. Son dos para poder probar que dos
+ * envíos DISTINTOS siguen siendo dos facturas (venta repetida legítima).
+ */
+const IDEMPOTENCY_KEY = "0f9a2f5e-6c1d-4f2b-9c3a-5d7e8f9a0b1c";
+const OTHER_IDEMPOTENCY_KEY = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
 
 function productItem(overrides: Record<string, unknown> = {}) {
   return {
@@ -135,15 +142,32 @@ describe("billing schemas: línea con un solo origen (FAC-01)", () => {
 });
 
 describe("billing schemas: factura exige ítems (cliente opcional)", () => {
+  // MO-1: desde que la emisión exige MARCA de idempotencia, los payloads de
+  // este bloque la llevan. El contrato del cuerpo ganó un campo obligatorio;
+  // las aserciones no cambian (cliente vacío válido, sin ítems inválido).
   it("rechaza sin ítems; cliente vacío es válido (opcional)", () => {
     expect(
-      createInvoiceSchema.safeParse({ client_name: "  ", items: [productItem()] }).success,
+      createInvoiceSchema.safeParse({
+        idempotency_key: IDEMPOTENCY_KEY,
+        client_name: "  ",
+        items: [productItem()],
+      }).success,
     ).toBe(true);
-    expect(createInvoiceSchema.safeParse({ client_name: "Ana", items: [] }).success).toBe(false);
+    expect(
+      createInvoiceSchema.safeParse({
+        idempotency_key: IDEMPOTENCY_KEY,
+        client_name: "Ana",
+        items: [],
+      }).success,
+    ).toBe(false);
   });
 
   it("client_document es opcional y el descuento arranca en 0", () => {
-    const parsed = createInvoiceSchema.safeParse({ client_name: "Ana", items: [productItem()] });
+    const parsed = createInvoiceSchema.safeParse({
+      idempotency_key: IDEMPOTENCY_KEY,
+      client_name: "Ana",
+      items: [productItem()],
+    });
     expect(parsed.success).toBe(true);
     if (parsed.success) {
       expect(parsed.data.client_document ?? null).toBe(null);
@@ -1293,6 +1317,55 @@ const editStub = vi.hoisted(() => ({
 }));
 
 /**
+ * MO-1: estado propio del camino de EMISIÓN (idempotencia de la factura).
+ *
+ * Encendido solo por el bloque de idempotencia: los demás describe siguen con
+ * el doble de siempre. Mantiene el estado REAL que decide el defecto —las filas
+ * de `invoices`, los consecutivos que devolvió `next_invoice_number` y cuántas
+ * veces se escribió cada tabla—, y aplica de verdad los dos índices únicos de
+ * la migración 041: un INSERT que repita `(sede_id, consecutive_number)` o
+ * `(sede_id, idempotency_key)` responde 23505 y NO agrega fila, como Postgres.
+ */
+const createStub = vi.hoisted(() => ({
+  active: false,
+  SEDE_ID: "11111111-1111-4111-8111-111111111111",
+  SHIFT_ID: "77777777-7777-4777-8777-777777777777",
+  /** Filas de `invoices` realmente escritas (columnas de INVOICE_SELECT + la marca). */
+  invoices: [] as Array<Record<string, unknown>>,
+  /** Líneas, impuestos y porciones escritos: cuántas veces se movió cada cosa. */
+  items: [] as Array<Record<string, unknown>>,
+  payments: [] as Array<Record<string, unknown>>,
+  /** Movimientos de inventario: la salida de stock de cada emisión. */
+  movements: [] as Array<Record<string, unknown>>,
+  /** Consecutivos devueltos por next_invoice_number, en orden de reserva. */
+  consecutives: [] as number[],
+  /** Escrituras PEDIDAS por tabla (un intento cuenta aunque choque con el índice). */
+  inserts: {} as Record<string, number>,
+  /** Saltea el próximo lookup por marca: arma la ventana de la carrera. */
+  skipLookupOnce: false,
+  /** Consultas que el doble no sabe responder: debe quedar SIEMPRE vacío. */
+  unexpectedQueries: [] as string[],
+  /** Producto de la sede con stock de sobra para descontar. */
+  product: {
+    id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    sede_id: "11111111-1111-4111-8111-111111111111",
+    name: "Crema de prueba",
+    sku: "CRE-01",
+    stock_qty: 50,
+    commission_value: 100,
+    is_active: true,
+  } as Record<string, unknown>,
+  /** Turno abierto de la sede: el emisor es quien lo abrió. */
+  shift: {
+    id: "77777777-7777-4777-8777-777777777777",
+    sede_id: "11111111-1111-4111-8111-111111111111",
+    status: "abierto",
+    opened_by: "u-1",
+    opened_at: "2026-01-01T00:00:00.000Z",
+  } as Record<string, unknown> | null,
+}));
+
+/**
  * U7: la comisión que MUESTRA la pantalla de la factura vs. la que paga la
  * nómina. Solo el bloque de U7 redefine la línea y mira los lotes de ids.
  */
@@ -1709,9 +1782,227 @@ function createOverCollectionStubClient(): unknown {
   return { from };
 }
 
+/**
+ * MO-1: doble del cliente Supabase para el camino de EMISIÓN.
+ *
+ * No sustituye la frontera de inventario ni la aritmética: `deductStock`,
+ * `registerMovement`, `planStockDeduction`, `computeInvoiceTotals` y `loadDetail`
+ * son los de producción y corren de verdad contra este doble. Lo que el doble
+ * mantiene es el ESTADO que decide el defecto (filas, consecutivos, escrituras)
+ * y las dos barreras únicas de la migración 041.
+ */
+function createInvoiceStubClient(): unknown {
+  const from = (table: string) => {
+    let op = "select";
+    let single = false;
+    let askedIdempotencyKey = false;
+    let payload: Record<string, unknown> = {};
+    const filters: Array<(row: Record<string, unknown>) => boolean> = [];
+
+    const matches = (row: Record<string, unknown>) => filters.every((test) => test(row));
+
+    const resolve = (): { data: unknown; error: unknown } => {
+      if (table === "invoices") {
+        if (op === "select") {
+          if (askedIdempotencyKey && createStub.skipLookupOnce) {
+            // La carrera: cuando esta emisión miró, la otra todavía no había
+            // confirmado. Se consume una sola vez.
+            createStub.skipLookupOnce = false;
+            return { data: null, error: null };
+          }
+          return { data: createStub.invoices.find(matches) ?? null, error: null };
+        }
+        if (op === "insert") {
+          const key = (payload.idempotency_key ?? null) as string | null;
+          const clash = (column: string, value: unknown) =>
+            createStub.invoices.some(
+              (row) => row.sede_id === payload.sede_id && row[column] === value,
+            );
+          // Barrera REAL de 041: la marca repetida gana sobre cualquier otra
+          // lectura, igual que el índice único parcial de Postgres.
+          if (key !== null && clash("idempotency_key", key)) {
+            return {
+              data: null,
+              error: {
+                code: "23505",
+                message: 'duplicate key value violates unique constraint "uq_invoices_sede_idempotency_key"',
+              },
+            };
+          }
+          if (clash("consecutive_number", payload.consecutive_number)) {
+            return {
+              data: null,
+              error: {
+                code: "23505",
+                message: 'duplicate key value violates unique constraint "invoices_sede_id_consecutive_number_key"',
+              },
+            };
+          }
+          const row: Record<string, unknown> = {
+            id: `invoice-${createStub.invoices.length + 1}`,
+            client_name: null,
+            client_document: null,
+            cash_shift_id: null,
+            closed_by: null,
+            closed_at: null,
+            cancel_reason: null,
+            edit_version: 0,
+            created_at: "2026-01-01T00:00:00.000Z",
+            ...payload,
+          };
+          createStub.invoices.push(row);
+          return { data: row, error: null };
+        }
+      }
+      if (table === "invoice_items") {
+        if (op === "insert") {
+          createStub.items.push({
+            ...payload,
+            id: `item-${createStub.items.length + 1}`,
+            created_at: "2026-01-01T00:00:00.000Z",
+            // Join embebido de ITEM_SELECT en `loadDetail`.
+            employees: {
+              full_name: "Empleada de prueba",
+              employee_code: "E-01",
+              commission_percent: 35,
+              pay_type: "porcentaje",
+              payout_mode: "normal",
+            },
+          });
+          return { data: null, error: null };
+        }
+        return { data: createStub.items, error: null };
+      }
+      if (table === "invoice_payments") {
+        if (op === "insert") {
+          createStub.payments.push({
+            ...payload,
+            id: `payment-${createStub.payments.length + 1}`,
+            created_at: "2026-01-01T00:00:00.000Z",
+          });
+          return { data: null, error: null };
+        }
+        return { data: createStub.payments, error: null };
+      }
+      if (table === "invoice_taxes") {
+        return { data: op === "insert" ? null : [], error: null };
+      }
+      if (table === "products") {
+        // El sondeo de `resolveProductSelect` (columna `commission_value`) y
+        // `getProductsStock` leen en lista; `getProduct` lee en single.
+        if (op !== "select") return { data: null, error: null };
+        return { data: single ? createStub.product : [createStub.product], error: null };
+      }
+      if (table === "employees") {
+        return {
+          data: [
+            {
+              id: EMPLOYEE_ID,
+              sede_id: createStub.SEDE_ID,
+              full_name: "Empleada de prueba",
+            },
+          ],
+          error: null,
+        };
+      }
+      // El detalle resuelve la comisión con las reglas ítem×empleado (U7): sin
+      // reglas cargadas, la lectura exhaustiva tiene que agotar en la primera
+      // página, no fallar.
+      if (table === "commission_rules") return { data: [], error: null };
+      if (table === "cash_shifts") return { data: createStub.shift, error: null };
+      if (table === "users") return { data: { full_name: "Cajera de prueba" }, error: null };
+      if (table === "inventory_movements") {
+        if (op === "insert") {
+          const movement = {
+            ...payload,
+            id: `movement-${createStub.movements.length + 1}`,
+            created_at: "2026-01-01T00:00:00.000Z",
+          };
+          createStub.movements.push(movement);
+          return { data: movement, error: null };
+        }
+        return { data: createStub.movements, error: null };
+      }
+      if (table === "audit_logs") return { data: null, error: null };
+      createStub.unexpectedQueries.push(`${table}.${op}`);
+      return { data: null, error: { message: `doble de emisión sin respuesta para ${table}.${op}` } };
+    };
+
+    const settle = () => Promise.resolve(resolve());
+    const query: Record<string, unknown> = {
+      select: () => query,
+      insert: (value?: unknown) => {
+        op = "insert";
+        const first = Array.isArray(value) ? value[0] : value;
+        payload = (first ?? {}) as Record<string, unknown>;
+        createStub.inserts[table] = (createStub.inserts[table] ?? 0) + 1;
+        return query;
+      },
+      update: (value?: unknown) => {
+        op = "update";
+        payload = (value ?? {}) as Record<string, unknown>;
+        return query;
+      },
+      delete: () => {
+        op = "delete";
+        return query;
+      },
+      eq: (column: string, value: unknown) => {
+        if (column === "idempotency_key") askedIdempotencyKey = true;
+        filters.push((row) => row[column] === value);
+        return query;
+      },
+      in: (column: string, values: readonly unknown[]) => {
+        const set = new Set(values);
+        filters.push((row) => set.has(row[column]));
+        return query;
+      },
+      order: () => query,
+      limit: () => query,
+      range: () => query,
+      gte: () => query,
+      lte: () => query,
+      single: () => {
+        single = true;
+        return settle();
+      },
+      maybeSingle: () => {
+        single = true;
+        return settle();
+      },
+      then: (onFulfilled?: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        settle().then(onFulfilled, onRejected),
+    };
+    return query;
+  };
+
+  const rpc = async (name: string) => {
+    if (name !== "next_invoice_number") {
+      createStub.unexpectedQueries.push(`rpc.${name}`);
+      return { data: null, error: { message: `doble de emisión: rpc desconocido ${name}` } };
+    }
+    // El consecutivo solo avanza cuando se RESERVA: así el hueco de la carrera
+    // queda a la vista en lugar de esconderse.
+    const next = createStub.consecutives.length + 1;
+    createStub.consecutives.push(next);
+    return { data: next, error: null };
+  };
+
+  return { from, rpc };
+}
+
 vi.mock("@/src/shared/lib/supabase/server", () => ({
-  createAdminClient: () => createOverCollectionStubClient(),
+  createAdminClient: () => billingStubClient(),
 }));
+
+/**
+ * El doble que ve cada camino. El de emisión (MO-1) solo existe cuando su
+ * bloque lo enciende; el resto del archivo conserva el doble de siempre, así
+ * que ningún describe existente cambia de comportamiento.
+ */
+function billingStubClient(): unknown {
+  return createStub.active ? createInvoiceStubClient() : createOverCollectionStubClient();
+}
 
 vi.mock("@/src/features/admin/service", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/src/features/admin/service")>();
@@ -2852,5 +3143,216 @@ describe("billing: dos ediciones de la misma factura se serializan (CO-1)", () =
     expect(overCollectionStub.writes).toContain("invoices.update");
     expect(overCollectionStub.writes).toContain("audit_logs.insert");
     expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+});
+
+// ------------- MO-1: la emisión repetida no emite dos veces ----------------
+//
+// El defecto: `createInvoice` reservaba un consecutivo e insertaba la factura
+// sin mirar nada del ENVÍO, así que reenviar la MISMA emisión (doble clic, o el
+// navegador reintentando tras cortarse la red) reservaba un NUEVO consecutivo y
+// escribía una SEGUNDA factura con su propia salida de stock y su propia
+// comisión.
+//
+// La decisión del dueño: dos envíos idénticos son UNA factura, y se reconocen
+// por la MARCA que manda la pantalla, no por el contenido. Deduplicar por
+// CONTENIDO bloquearía una venta legítimamente repetida —dos clientes distintos
+// comprando lo mismo, o el mismo cliente comprando dos veces—; la marca es lo
+// único que distingue "el mismo envío" de "el mismo contenido".
+
+/** Emisión de una línea de producto con su cobro completo en efectivo. */
+function emissionPayload(extra: Record<string, unknown> = {}) {
+  return {
+    idempotency_key: IDEMPOTENCY_KEY,
+    items: [
+      {
+        item_type: "producto",
+        product_id: PRODUCT_ID,
+        employee_id: EMPLOYEE_ID,
+        qty: 2,
+        unit_price: 35000,
+        discount: 0,
+        no_commission: false,
+        commission_value: 1000,
+        commission_mode: "comision",
+      },
+    ],
+    discount: 0,
+    payments: [{ method_code: "efectivo", amount: 70000 }],
+    ...extra,
+  };
+}
+
+describe("billing: la emisión repetida no emite dos veces (MO-1)", () => {
+  const ACTOR: BillingActor = { userId: "u-1", sedeId: createStub.SEDE_ID, roles: ["admin"] };
+
+  beforeEach(() => {
+    createStub.active = true;
+    createStub.invoices = [];
+    createStub.items = [];
+    createStub.payments = [];
+    createStub.movements = [];
+    createStub.consecutives = [];
+    createStub.inserts = {};
+    createStub.skipLookupOnce = false;
+    createStub.unexpectedQueries = [];
+  });
+
+  afterEach(() => {
+    createStub.active = false;
+  });
+
+  it("reenviar la misma emisión devuelve la MISMA factura: una fila, un consecutivo, una salida de stock, una comisión", async () => {
+    const first = await createInvoice(emissionPayload(), ACTOR);
+    const second = await createInvoice(emissionPayload(), ACTOR);
+
+    // Hoy esto es DOS: el `[1, 2]` del segundo expect es el defecto verbatim.
+    expect(createStub.consecutives).toEqual([1]);
+    expect(createStub.invoices).toHaveLength(1);
+    // El reintento es un NO-OP EXITOSO para el llamador: la misma factura, no
+    // un error de negocio.
+    expect(second.invoice.id).toBe(first.invoice.id);
+    expect(second.invoice.consecutive_number).toBe(first.invoice.consecutive_number);
+    expect(second.invoice.total).toBe(first.invoice.total);
+    expect(second.invoice.status).toBe("Pagada");
+    // Una sola escritura de cada cosa: la comisión vive en la ÚNICA línea
+    // (payroll la deriva de ahí), así que una línea es una comisión.
+    expect(createStub.inserts.invoice_items).toBe(1);
+    expect(createStub.items).toHaveLength(1);
+    expect(createStub.items[0]).toMatchObject({ commission_mode: "comision", commission_value: 1000 });
+    expect(createStub.inserts.invoice_payments).toBe(1);
+    expect(createStub.inserts.inventory_movements).toBe(1);
+    // El reintento ni siquiera INTENTÓ escribir la factura: lo detectó antes.
+    expect(createStub.inserts.invoices).toBe(1);
+    expect(createStub.movements).toHaveLength(1);
+    expect(createStub.movements[0]).toMatchObject({ type: "OUT", qty: 2 });
+    expect(createStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("control de no-extralimitación: dos marcas distintas son DOS facturas", async () => {
+    // Un "solo una factura" global pasaría el caso anterior y sería incorrecto:
+    // esto es una venta repetida legítima (mismo contenido, envío distinto).
+    const first = await createInvoice(emissionPayload(), ACTOR);
+    const second = await createInvoice(
+      emissionPayload({ idempotency_key: OTHER_IDEMPOTENCY_KEY }),
+      ACTOR,
+    );
+
+    expect(createStub.consecutives).toEqual([1, 2]);
+    expect(createStub.invoices).toHaveLength(2);
+    expect(second.invoice.id).not.toBe(first.invoice.id);
+    expect(second.invoice.consecutive_number).toBe(2);
+    expect(createStub.movements).toHaveLength(2);
+    expect(createStub.items).toHaveLength(2);
+    // Y reenviar la SEGUNDA marca sigue devolviendo la segunda factura, no la
+    // primera: el mapa es por marca.
+    const repeat = await createInvoice(
+      emissionPayload({ idempotency_key: OTHER_IDEMPOTENCY_KEY }),
+      ACTOR,
+    );
+    expect(repeat.invoice.id).toBe(second.invoice.id);
+    expect(createStub.invoices).toHaveLength(2);
+    expect(createStub.consecutives).toEqual([1, 2]);
+  });
+
+  it("la carrera (misma marca entre el lookup y el INSERT) devuelve la factura existente y deja el consecutivo como hueco reportado", async () => {
+    const first = await createInvoice(emissionPayload(), ACTOR);
+    // La otra emisión se confirmó entre el lookup y el INSERT de esta: el doble
+    // saltea el lookup para armar exactamente esa ventana.
+    createStub.skipLookupOnce = true;
+
+    const second = await createInvoice(emissionPayload(), ACTOR);
+
+    // Devuelve la factura de la ganadora: el reintento sigue siendo un no-op.
+    expect(second.invoice.id).toBe(first.invoice.id);
+    expect(createStub.invoices).toHaveLength(1);
+    // No vacuidad: el INSERT de la segunda SÍ se intentó (dos intentos, una
+    // fila). Si el lookup hubiera encontrado la marca, el segundo INSERT no
+    // existiría y este camino nunca se habría ejercitado.
+    expect(createStub.inserts.invoices).toBe(2);
+    // COSTO DECLARADO, no escondido: la perdedora reservó el consecutivo 2, el
+    // índice único cortó su INSERT y esa reserva quedó SIN factura. Dos
+    // consecutivos reservados, una factura: el hueco es real y está a la vista.
+    expect(createStub.consecutives).toEqual([1, 2]);
+    expect(createStub.consecutives.length - createStub.invoices.length).toBe(1);
+    // Nada más se escribió: sin segunda línea, sin segundo movimiento.
+    expect(createStub.items).toHaveLength(1);
+    expect(createStub.movements).toHaveLength(1);
+  });
+
+  it("una marca mal formada se rechaza y no reserva consecutivo ni escribe nada", async () => {
+    const outcome = await createInvoice(
+      emissionPayload({ idempotency_key: "no-es-un-uuid" }),
+      ACTOR,
+    ).then(
+      () => "emitida" as const,
+      (error: unknown) => error,
+    );
+
+    expect(outcome).toBeInstanceOf(BillingError);
+    expect(outcome).toMatchObject({ code: "VALIDATION", status: 400 });
+    // La validación corre ANTES de cualquier escritura: el rechazo es barato.
+    expect(createStub.consecutives).toEqual([]);
+    expect(createStub.invoices).toEqual([]);
+    expect(createStub.movements).toEqual([]);
+  });
+
+  it("una emisión SIN marca se rechaza: no es un passthrough sin protección", async () => {
+    // Decisión explícita: la marca es OBLIGATORIA. Aceptar un envío sin marca es
+    // reabrir el defecto para ese llamador —y la ruta REST es una superficie
+    // pública, justo la que reintenta sobre redes—. El rechazo es ruidoso.
+    const payload = emissionPayload();
+    delete (payload as { idempotency_key?: unknown }).idempotency_key;
+
+    const outcome = await createInvoice(payload, ACTOR).then(
+      () => "emitida" as const,
+      (error: unknown) => error,
+    );
+
+    expect(outcome).toBeInstanceOf(BillingError);
+    expect(outcome).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(createStub.consecutives).toEqual([]);
+    expect(createStub.invoices).toEqual([]);
+  });
+
+  it("control negativo: la marca manda, no el contenido (misma marca, contenido distinto = la factura ya emitida)", async () => {
+    const first = await createInvoice(emissionPayload(), ACTOR);
+    // Mismo envío (misma marca) con el carrito cambiado: se reconoce por la
+    // marca y NO se emite una segunda factura con el contenido nuevo.
+    const second = await createInvoice(
+      emissionPayload({ discount: 5000, payments: [{ method_code: "efectivo", amount: 65000 }] }),
+      ACTOR,
+    );
+
+    expect(second.invoice.id).toBe(first.invoice.id);
+    expect(second.invoice.total).toBe(70000);
+    expect(createStub.invoices).toHaveLength(1);
+    expect(createStub.consecutives).toEqual([1]);
+  });
+
+  it("la migración 041 guarda la marca con un índice único PARCIAL y no reescribe filas", () => {
+    const raw = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "041_invoice_idempotency.sql"),
+      "utf8",
+    );
+    // La prosa explica justamente lo que NO hace el archivo y nombra esas
+    // sentencias; las aserciones de abajo miran el SQL, sin los comentarios.
+    const sql = raw
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("--"))
+      .join("\n");
+    // La columna nace NULL: las filas ya emitidas no tienen marca y no hay
+    // backfill que inventar.
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS idempotency_key");
+    // La barrera final: a lo sumo una factura por marca y sede.
+    expect(sql).toContain("CREATE UNIQUE INDEX IF NOT EXISTS uq_invoices_sede_idempotency_key");
+    expect(sql).toContain("ON public.invoices (sede_id, idempotency_key)");
+    // PARCIAL: las filas históricas (marca NULL) quedan fuera del índice.
+    expect(sql).toContain("WHERE idempotency_key IS NOT NULL");
+    // No borra ni reescribe filas ni toca el consecutivo de 005.
+    expect(sql).not.toMatch(/\bDELETE\s+FROM\b/i);
+    expect(sql).not.toMatch(/\bTRUNCATE\b/i);
+    expect(sql).not.toMatch(/UPDATE\s+public\.invoices\b/i);
+    expect(sql).not.toMatch(/consecutive_number/);
   });
 });

@@ -50,6 +50,13 @@ export async function GET(request: NextRequest) {
  * POST /api/v1/invoices — crea la factura (solo admin/caja).
  * Mismo servicio que createInvoiceAction: consecutivo con lock, snapshot
  * de impuestos activos, OUT de stock, porciones que cuadran con el total.
+ *
+ * MO-1 (idempotencia): el cuerpo exige `idempotency_key` (uuid del intento de
+ * emisión). Es una superficie pública y los reintentos sobre una red cortada
+ * son exactamente su caso de uso, así que la marca NO es opcional: sin ella
+ * responde VALIDATION (400) en vez de emitir sin protección. Reenviar la misma
+ * marca devuelve la factura que ya existe —un no-op exitoso para el llamador—
+ * con el mismo 201, en lugar de emitir una segunda factura.
  */
 export async function POST(request: NextRequest) {
   try {

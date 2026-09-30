@@ -85,7 +85,15 @@ export async function getInvoiceAction(id: string) {
   }
 }
 
-/** Misma lógica que POST /api/v1/invoices (solo admin/caja). */
+/**
+ * Misma lógica que POST /api/v1/invoices (solo admin/caja).
+ *
+ * MO-1: el cuerpo debe traer `idempotency_key` (uuid que la pantalla acuña al
+ * empezar el intento y reutiliza en sus reintentos). Sin marca el servicio
+ * rechaza con VALIDATION: un envío sin marca no se puede reconocer como
+ * repetición, así que aceptarlo reabriría el defecto. Con la marca repetida el
+ * servicio devuelve la factura ya emitida, no otra.
+ */
 export async function createInvoiceAction(input: unknown) {
   try {
     const session = await requireBillingWriter(await sessionToken());

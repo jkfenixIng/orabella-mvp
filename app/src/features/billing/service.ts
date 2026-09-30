@@ -959,6 +959,34 @@ export interface BillingActor {
 }
 
 /**
+ * MO-1: la factura que ya se emitió con esa marca, si existe.
+ *
+ * La marca es un uuid que genera la PANTALLA al empezar el intento y que viaja
+ * en el cuerpo; se reutiliza en los reintentos del MISMO intento. Deduplicar por
+ * CONTENIDO sería otra cosa y estaría mal: dos clientes distintos comprando lo
+ * mismo, o el mismo cliente comprando dos veces, son ventas legítimamente
+ * repetidas y no deben colapsarse. La marca es lo único que distingue "el mismo
+ * envío" de "el mismo contenido".
+ *
+ * El filtro es por SEDE: la marca se resuelve dentro del tenant que la usó y el
+ * detalle de una factura de otra sede nunca se devuelve por acá.
+ */
+async function findInvoiceByIdempotencyKey(
+  db: DbClient,
+  sedeId: string,
+  idempotencyKey: string,
+): Promise<InvoiceRow | null> {
+  const { data, error } = await db
+    .from("invoices")
+    .select(INVOICE_SELECT)
+    .eq("sede_id", sedeId)
+    .eq("idempotency_key", idempotencyKey)
+    .maybeSingle();
+  if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
+  return (data as InvoiceRow | null) ?? null;
+}
+
+/**
  * FAC-01…07: crea la factura (consecutivo con lock, snapshot de
  * impuestos activos, OUT de stock por producto vía deductStock,
  * porciones que cuadran). Estado inicial Emitida; si las porciones
@@ -971,6 +999,15 @@ export interface BillingActor {
  * PostgREST no ofrece multi-statement en una transacción, así que ante
  * fallo posterior a la reserva se intenta limpieza best-effort (ver
  * cleanupFailedInvoice) y se documenta en la migración 005.
+ *
+ * MO-1 (idempotencia): el orden empieza por la MARCA
+ * (`idempotency_key`, migración 041). Un reintento del MISMO envío se detecta
+ * ANTES de reservar el consecutivo y devuelve la factura ya emitida —no-op
+ * exitoso para el llamador—, así que el camino normal de la repetición no
+ * consume consecutivo. La ventana entre ese lookup y el INSERT la cubre el
+ * índice único parcial (sede_id, idempotency_key): la perdedora de la carrera
+ * devuelve la factura de la ganadora y su consecutivo ya reservado queda como
+ * HUECO declarado (ver el comentario en el manejo de 23505).
  */
 export async function createInvoice(raw: unknown, actor: BillingActor): Promise<InvoiceDetail> {
   const parsed = createInvoiceSchema.safeParse(raw);
@@ -979,6 +1016,14 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   }
   const input: CreateInvoiceInput = parsed.data;
   const db = await billingDb();
+
+  // MO-1: la MARCA primero, ANTES de reservar el consecutivo y antes de validar
+  // catálogos. Un reintento (doble clic, o el navegador reenviando tras cortarse
+  // la red) trae la MISMA marca: se devuelve la factura que ya existe y no se
+  // reserva nada. El reintento es un no-op EXITOSO para el llamador, no un
+  // error; y como no hay reserva, tampoco hay hueco en la serie.
+  const alreadyEmitted = await findInvoiceByIdempotencyKey(db, actor.sedeId, input.idempotency_key);
+  if (alreadyEmitted) return loadDetail(db, alreadyEmitted);
 
   let refs: ValidatedRefs;
   let stockMap: Map<string, StockEntry>;
@@ -1114,6 +1159,9 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
       .insert({
         sede_id: actor.sedeId,
         consecutive_number: consecutive,
+        // MO-1: la marca queda EN LA FILA. Su índice único parcial (041) es la
+        // barrera final: sin ella, la carrera del lookup-INSERT escribiría dos.
+        idempotency_key: input.idempotency_key,
         client_name: input.client_name?.trim() || null,
         client_document: input.client_document?.trim() || null,
         subtotal: totals.subtotal,
@@ -1132,6 +1180,25 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
     if (invoiceError || !invoice) {
       console.error("PG invoice insert:", JSON.stringify(invoiceError));
       if ((invoiceError as { code?: string } | null)?.code === "23505") {
+        // Dos índices únicos pueden dar 23505 acá: el consecutivo
+        // (sede_id, consecutive_number) y la marca (sede_id, idempotency_key).
+        // Manda la MARCA: si otra emisión con la misma marca se confirmó entre
+        // el lookup de arriba y este INSERT (la carrera), su factura es la
+        // respuesta y este intento no escribe una segunda.
+        //
+        // COSTO DECLARADO, no escondido: en ese camino la perdedora ya reservó
+        // su consecutivo, y esa reserva queda SIN factura: un hueco en la serie
+        // de la sede. Se prefiere el hueco —visible y raro, exige dos envíos con
+        // la misma marca solapados— antes que una segunda factura, que es plata
+        // cobrada dos veces. El hueco se documenta también en la migración 041.
+        const winner = await findInvoiceByIdempotencyKey(
+          db,
+          actor.sedeId,
+          input.idempotency_key,
+        );
+        if (winner) return loadDetail(db, winner);
+        // Sin factura con esa marca, el choque es del CONSECUTIVO: comportamiento
+        // de siempre (barrera final de 005).
         throw new BillingError("DUPLICATE_NUMBER", "Consecutivo duplicado, reintente la emisión.", 409);
       }
       throw new BillingError("INTERNAL", "Error interno.", 500);
