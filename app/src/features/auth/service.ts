@@ -121,22 +121,18 @@ export function isResetTokenUsable(args: {
 }
 
 /**
- * CL-15: acción propia de este módulo para el residuo de un alta cuya
- * compensación también falló.
- *
- * El vocabulario compartido (`AUDIT_ACTIONS` en `@/src/shared/lib/audit`) es la
- * lista de acciones OPERATIVAS que la bandeja de alertas de 011 filtra; ésta no
- * lo es —describe trabajo de REPARACIÓN, no un desvío de la operación—, así que
- * se declara acá y no se toca el módulo compartido. `audit_logs.action` es
- * texto libre: un auditor la lee igual, y es la fila que convierte un residuo
- * silencioso en trabajo pendiente.
+ * CL-18: mensaje del error de negocio que ve el usuario cuando el CAS de la
+ * clave pierde la carrera. Describe lo que pasó SIN revelar nada: dice que la
+ * clave cambió por debajo y que hay que reintentar; nunca qué hash quedó ni
+ * quién lo escribió.
  */
-const AUDIT_USER_CREATE_ROLLBACK_FAILED = "auth.user_create_rollback_failed";
+export const PASSWORD_CHANGED_ELSEWHERE_ERROR =
+  "La clave cambió mientras se procesaba el cambio. Intente de nuevo.";
 
 /**
  * ¿El fallo de un `rpc` es una DECISIÓN del contrato (un `RAISE EXCEPTION` de
- * las funciones de 054, siempre SQLSTATE P0001) y no una falla del sistema? El
- * mensaje es el vocabulario compartido entre el archivo y este módulo.
+ * las funciones de 054/057, siempre SQLSTATE P0001) y no una falla del sistema?
+ * El mensaje es el vocabulario compartido entre el archivo y este módulo.
  */
 function esRechazoDeRpc(
   error: { code?: string; message?: string } | null,
@@ -480,14 +476,14 @@ export async function changeUserPassword(args: {
   const matches = await verifyPassword(parsed.data.actual, (user as { password_hash: string }).password_hash);
   if (!matches) throw new AuthError("INVALID_CREDENTIALS", "La clave actual no es correcta.", 401);
 
-  // CL-15: la clave nueva y la expulsión de las DEMÁS sesiones viajan en UNA
-  // sentencia del servidor (054, `change_user_password`), que conserva la
-  // sesión actual. Antes eran dos requests de PostgREST —dos transacciones— y
-  // un fallo entre ellos dejaba la clave YA cambiada con todas las otras
-  // sesiones vivas: exactamente lo contrario del propósito del cambio. La
-  // verificación de la clave actual sigue acá, en tiempo constante, con el hash
-  // leído de `users`: la función recibe el hash NUEVO ya calculado y nunca ve la
-  // clave en claro.
+  // CL-18: la clave nueva, la expulsión de las DEMÁS sesiones y el CAS sobre
+  // el hash leído viajan en UNA sentencia del servidor (057,
+  // `change_user_password`). El hash que se leyó arriba para verificar la clave
+  // actual viaja como PRECONDICIÓN: la función lo compara contra la fila
+  // bloqueada y, si otro escritor legítimo (un admin restableciendo, una
+  // recuperación confirmada) escribió en el medio, aborta sin escribir nada.
+  // Perder la carrera deja de ser un pisado silencioso y pasa a ser un error de
+  // negocio que el usuario puede accionar.
   //
   // La post-condición —"ninguna otra sesión viva"— se comprueba ADENTRO de la
   // función, sobre la fila bloqueada: si no se cumple, la transacción entera se
@@ -496,8 +492,17 @@ export async function changeUserPassword(args: {
     p_user_id: args.userId,
     p_password_hash: await hashPassword(parsed.data.nueva),
     p_current_token_hash: args.currentTokenHash,
+    p_expected_password_hash: (user as { password_hash: string }).password_hash,
   });
-  if (changeError) throw new AuthError("INTERNAL", "Error interno.", 500);
+  if (changeError) {
+    // El CAS perdió: la clave cambió por debajo entre la lectura y la
+    // escritura. Es un rechazo DE CONTRATO (P0001), no un 500: el usuario
+    // reintenta con la clave que ahora tiene.
+    if (esRechazoDeRpc(changeError, "PASSWORD_CHANGED_ELSEWHERE")) {
+      throw new AuthError("PASSWORD_CHANGED_ELSEWHERE", PASSWORD_CHANGED_ELSEWHERE_ERROR, 409);
+    }
+    throw new AuthError("INTERNAL", "Error interno.", 500);
+  }
 
   const changed = user as { id: string; sede_id: string | null };
   await writeAudit({
@@ -646,7 +651,7 @@ async function discardCreatedUser(
   await writeAudit({
     sede_id: args.sedeId,
     user_id: null,
-    action: AUDIT_USER_CREATE_ROLLBACK_FAILED,
+    action: AUDIT_ACTIONS.USER_CREATE_ROLLBACK_FAILED,
     entity: "users",
     entity_id: args.userId,
     metadata: { email: args.email, motivo: args.motivo },

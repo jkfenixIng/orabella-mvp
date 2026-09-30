@@ -123,7 +123,8 @@
 -- ABORTADA: la perdedora ya había resuelto el turno y el método cuando chocó
 -- con el índice, y esa sentencia no deja filas. Es el mismo canje de la 042
 -- —perder trabajo invisible antes que contar el efectivo dos veces— sin el
--- hueco de consecutivo que sí existe en la 041. Se hace notar también en el
+-- hueco de consecutivo que se declaró en la 041 (y que la 052 ELIMINÓ al mover
+-- la reserva adentro de la transacción de emisión). Se hace notar también en el
 -- código del servicio.
 --
 -- LIMITACIÓN DECLARADA (una ventana que este índice NO cierra)

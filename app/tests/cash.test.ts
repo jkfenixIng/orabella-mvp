@@ -1544,6 +1544,21 @@ const paymentStub = vi.hoisted(() => ({
   noConfirmOnce: false,
   /** Transacciones de cobro pedidas, en orden. */
   rpcCalls: [] as Array<{ name: string; args: Record<string, unknown> }>,
+  /**
+   * CL-17: el estado del turno. La transacción de la 056 lo bloquea con
+   * `FOR SHARE` y lo revalida: si está `cerrado`, el cobro rechaza con
+   * `SHIFT_CLOSED` en vez de escribir su dinero en un turno cerrado.
+   */
+  shiftStatus: "abierto",
+  /**
+   * CL-17: un `closeShift` que gana la carrera entre la lectura del servicio y
+   * la transacción. El doble cierra el turno antes de revalidarlo, que es la
+   * ventana (b) de CL-17.
+   */
+  closeShiftBeforeCommit: false,
+  /** CL-17: los DATOS DE CIERRE que la factura quedó con, si se cerró. */
+  invoiceClosedBy: null as string | null,
+  invoiceClosedAt: null as string | null,
 }));
 
 /** Las columnas de `PAYMENT_SELECT` (service.ts): el shape que el servicio lee. */
@@ -1597,7 +1612,7 @@ function createStubSupabaseClient(): unknown {
           base_left: null,
           cash_withdrawn: null,
           base_difference: null,
-          status: "abierto",
+          status: paymentStub.shiftStatus,
           observation: null,
         },
         ...paymentStub.extraShifts,
@@ -1846,6 +1861,22 @@ function createStubSupabaseClient(): unknown {
       return { data: null, error: { message: `doble sin respuesta para el rpc ${name}` } };
     }
     paymentStub.rpcCalls.push({ name, args });
+    // CL-17: el TURNO se bloquea (`FOR SHARE`) ANTES de la factura (orden global
+    // `cash_shifts > invoices`). El cierre concurrente se dispara acá: lo que la
+    // otra transacción confirmó es parte del estado que esta transacción va a
+    // leer bajo el lock.
+    if (paymentStub.closeShiftBeforeCommit) {
+      paymentStub.closeShiftBeforeCommit = false;
+      paymentStub.shiftStatus = "cerrado";
+    }
+    if (args.p_shift_id !== paymentStub.SHIFT_ID) {
+      return { data: null, error: { code: "P0001", message: "SHIFT_NOT_FOUND" } };
+    }
+    if (paymentStub.shiftStatus !== "abierto") {
+      // El turno que se cerró a mitad del cobro: la transacción lo revalida
+      // sobre la fila bloqueada y rechaza SIN escribir nada.
+      return { data: null, error: { code: "P0001", message: "SHIFT_CLOSED" } };
+    }
     // La carrera por el ESTADO se dispara antes del lock: lo que la otra
     // transacción confirmó es parte del estado que esta transacción va a leer.
     if (paymentStub.raceAnnulOnce) {
@@ -1954,7 +1985,15 @@ function createStubSupabaseClient(): unknown {
     // 5) COMMIT: los tres grupos.
     paymentStub.ledger.push(mirrorRow);
     paymentStub.drawer.push(drawerRow);
-    if (args.p_mark_paid === true) paymentStub.invoiceStatus = "Pagada";
+    if (args.p_mark_paid === true) {
+      paymentStub.invoiceStatus = "Pagada";
+      // CL-17: el cierre ESCRITO con sus datos —el usuario que cobra y el
+      // instante que mandó el servicio—, que es lo que la factura Pagada tiene
+      // que dejar. El doble los toma del DATO, como la función de la 056: si el
+      // servicio no los manda, siguen en NULL (el defecto).
+      paymentStub.invoiceClosedBy = (args.p_user_id ?? null) as string | null;
+      paymentStub.invoiceClosedAt = (args.p_closed_at ?? null) as string | null;
+    }
     return {
       data: {
         payment: project(drawerRow, PAYMENT_COLUMNS),
@@ -2633,6 +2672,12 @@ describe("cash: CL-14 el cobro de una factura es UNA transacción", () => {
     paymentStub.raceAnnulOnce = false;
     paymentStub.noConfirmOnce = false;
     paymentStub.rpcCalls.length = 0;
+    // CL-17: el turno abierto y la factura aún sin cierre; el cierre concurrente
+    // se arma por prueba.
+    paymentStub.shiftStatus = "abierto";
+    paymentStub.closeShiftBeforeCommit = false;
+    paymentStub.invoiceClosedBy = null;
+    paymentStub.invoiceClosedAt = null;
   });
 
   it("el éxito escribe el espejo, el cajón y el cierre, con el MISMO contenido de siempre", async () => {
@@ -2843,6 +2888,311 @@ describe("cash: CL-14 el cobro de una factura es UNA transacción", () => {
   });
 });
 
+// ------- CL-17: la factura se cierra CON sus datos y el turno no se cierra a mitad -------
+
+/**
+ * CL-17: los dos huecos que le quedaban al cobro de caja.
+ *
+ * HUECO (a): la transacción de la 053 escribía los MISMOS campos que el UPDATE
+ * suelto —`cash_shift_id` y `status`— y NO escribía `closed_by`/`closed_at`. Una
+ * factura cobrada completa por caja quedaba `Pagada` con `closed_at` NULL, contra
+ * el contrato que la columna tiene escrito en el esquema (025) y contra lo que el
+ * mismo cobro dividido SÍ escribe (050). MEDIDO ANTES DEL ARREGLO (verbatim):
+ *
+ *     expected null to deeply equal Any<String>   (invoices.closed_at)
+ *
+ * HUECO (b): el turno se leía en el SERVICIO y la transacción no lo miraba. Un
+ * `closeShift` (049) entre esa lectura y el commit dejaba la fila de cajón
+ * escrita en un turno YA cerrado —la FK toma `FOR KEY SHARE`, que no compite con
+ * el `FOR NO KEY UPDATE` del cierre—. MEDIDO ANTES DEL ARREGLO (verbatim), con el
+ * doble sirviendo el turno como la función previa (sin lock):
+ *
+ *     expected [ { id: 'caja-1', …(9) } ] to deeply equal []   (payments)
+ *     expected { …(4) } to be an instance of CashError
+ *     expected CashError { code: 'OVERPAID', status: 422 } to match object
+ *       { code: 'SHIFT_CLOSED', status: 409 }
+ *
+ * El doble modela el contrato de la función de la 056: el turno se bloquea
+ * (`FOR SHARE`) y se revalida ANTES de la factura, y el cierre se escribe con el
+ * `p_closed_at`/`p_user_id` que manda el servicio. La migración se verifica
+ * aparte, sobre el archivo.
+ */
+describe("cash: CL-17 el cobro cierra la factura con sus datos y no cae en un turno cerrado", () => {
+  const ACTOR = { userId: "u-1", sedeId: paymentStub.SEDE_ID };
+  const MARK = "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908";
+  const collection = (mark = MARK, amount = 100000) => ({
+    cash_shift_id: paymentStub.SHIFT_ID,
+    invoice_id: paymentStub.INVOICE_ID,
+    method_code: "efectivo",
+    amount,
+    idempotency_key: mark,
+  });
+
+  beforeEach(() => {
+    paymentStub.unexpectedQueries.length = 0;
+    paymentStub.ledger.length = 0;
+    paymentStub.drawer.length = 0;
+    paymentStub.invoiceStatus = "Emitida";
+    paymentStub.inserts = {};
+    paymentStub.rpcCalls.length = 0;
+    paymentStub.shiftStatus = "abierto";
+    paymentStub.closeShiftBeforeCommit = false;
+    paymentStub.invoiceClosedBy = null;
+    paymentStub.invoiceClosedAt = null;
+  });
+
+  it("Gap 1: la factura se cierra CON responsable e instante, no con `closed_at` NULL", async () => {
+    const result = await registerPayment(collection(), ACTOR);
+
+    expect(paymentStub.invoiceStatus).toBe("Pagada");
+    // El DATO que la función de la 056 escribe: el usuario que cobra y el
+    // instante que resolvió el SERVICIO (mismo reloj que 049 y 050).
+    expect(paymentStub.invoiceClosedBy).toBe("u-1");
+    expect(paymentStub.invoiceClosedAt).toEqual(expect.any(String));
+    expect(paymentStub.invoiceClosedAt).not.toBe("");
+    expect(result.invoice_status).toBe("Pagada");
+    // El cierre viaja en la MISMA transacción que el dinero: no hay ventana.
+    expect(paymentStub.rpcCalls).toHaveLength(1);
+    expect(paymentStub.ledger).toHaveLength(1);
+    expect(paymentStub.drawer).toHaveLength(1);
+    expect(paymentStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("un cobro PARCIAL no escribe datos de cierre: la factura sigue Emitida", async () => {
+    await registerPayment(collection(MARK, 50000), ACTOR);
+
+    // El cierre se escribe SÓLO cuando el servicio decidió cerrar (`p_mark_paid`):
+    // un parcial deja la factura Emitida con su saldo, sin `closed_by`/`closed_at`.
+    expect(paymentStub.invoiceStatus).toBe("Emitida");
+    expect(paymentStub.invoiceClosedBy).toBeNull();
+    expect(paymentStub.invoiceClosedAt).toBeNull();
+  });
+
+  it("Gap 2: el turno que se cierra a mitad del cobro lo RECHAZA, sin escribir nada", async () => {
+    // El cierre concurrente gana la carrera entre la lectura del servicio y el
+    // commit: la transacción lo revalida sobre la fila bloqueada.
+    paymentStub.closeShiftBeforeCommit = true;
+
+    const failure: unknown = await registerPayment(collection(), ACTOR).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(CashError);
+    expect(failure).toMatchObject({ code: "SHIFT_CLOSED", status: 409 });
+    // Nada escrito: ni el espejo, ni el libro de cajón, ni el cierre.
+    expect(paymentStub.ledger).toEqual([]);
+    expect(paymentStub.drawer).toEqual([]);
+    expect(paymentStub.invoiceStatus).toBe("Emitida");
+    expect(paymentStub.invoiceClosedAt).toBeNull();
+    expect(paymentStub.deleteCalls).toEqual([]);
+    // No vacuidad: la transacción SÍ se intentó y el rechazo es de ADENTRO.
+    expect(paymentStub.rpcCalls).toHaveLength(1);
+    expect(paymentStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("el reintento del MISMO intento COMPLETA el cobro cuando el turno vuelve a estar abierto", async () => {
+    paymentStub.closeShiftBeforeCommit = true;
+    await registerPayment(collection(), ACTOR).catch((error: unknown) => error);
+    expect(paymentStub.ledger).toEqual([]);
+
+    // La transacción rechazada no dejó marca (se revirtió entera), así que el
+    // reintento, con el turno abierto, es una operación NUEVA que termina el
+    // cobro en vez de un no-op sobre una factura abierta para siempre.
+    paymentStub.shiftStatus = "abierto";
+    const retry = await registerPayment(collection(), ACTOR);
+
+    expect(retry.invoice_status).toBe("Pagada");
+    expect(paymentStub.ledger).toHaveLength(1);
+    expect(paymentStub.drawer).toHaveLength(1);
+    expect(paymentStub.invoiceClosedAt).toEqual(expect.any(String));
+    expect(paymentStub.invoiceClosedBy).toBe("u-1");
+  });
+
+  it("la repetición sigue siendo un no-op: no vuelve a escribir ni a cerrar", async () => {
+    const first = await registerPayment(collection(), ACTOR);
+    const closedAt = paymentStub.invoiceClosedAt;
+    const repeat = await registerPayment(collection(), ACTOR);
+
+    // La marca de la 042 se sigue mirando ANTES de cualquier escritura: el
+    // arreglo no puede convertir una repetición en un segundo cobro.
+    expect(repeat).toEqual(first);
+    expect(paymentStub.ledger).toHaveLength(1);
+    expect(paymentStub.drawer).toHaveLength(1);
+    expect(paymentStub.rpcCalls).toHaveLength(1);
+    expect(paymentStub.invoiceClosedAt).toBe(closedAt);
+  });
+
+  it("control negativo: el turno ya cerrado se rechaza en el servicio, sin llamar al RPC", async () => {
+    // La precondición de LECTURA sigue viva (y sigue siendo la primera puerta):
+    // un turno ya cerrado no llega ni a la transacción.
+    paymentStub.shiftStatus = "cerrado";
+
+    const failure: unknown = await registerPayment(collection(), ACTOR).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(CashError);
+    expect(failure).toMatchObject({ code: "SHIFT_CLOSED", status: 409 });
+    expect(paymentStub.rpcCalls).toHaveLength(0);
+    expect(paymentStub.ledger).toEqual([]);
+    expect(paymentStub.drawer).toEqual([]);
+  });
+
+  it("el servicio manda el instante del cierre como DATO (no lo inventa la función)", async () => {
+    await registerPayment(collection(), ACTOR);
+
+    const args = paymentStub.rpcCalls[0].args;
+    expect(typeof args.p_closed_at).toBe("string");
+    expect(args.p_user_id).toBe("u-1");
+    expect(args.p_shift_id).toBe(paymentStub.SHIFT_ID);
+    expect(args.p_mark_paid).toBe(true);
+  });
+});
+
+// ------- CL-17: la migración 056 -------
+
+describe("migración 056_collection_closes_invoice.sql (CL-17)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "056_collection_closes_invoice.sql"),
+    "utf8",
+  );
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+  // El texto de los `COMMENT ON …` es PROSA que viaja como string, no DDL.
+  const ddl = sql.replace(/COMMENT ON FUNCTION[\s\S]*?';\n/g, "");
+
+  it("piso anti-vacío: el archivo existe y trae DDL real", () => {
+    expect(raw.length).toBeGreaterThan(15000);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("dropea las DOS firmas viejas y crea las nuevas (una sola sentencia cada una)", () => {
+    // PostgreSQL identifica la función por su firma: sin el DROP quedaría viva la
+    // sobrecarga vieja, sin lock de turno y sin datos de cierre.
+    expect(sql).toContain(
+      "DROP FUNCTION IF EXISTS public.cash_invoice_payment_atomic(uuid, uuid, uuid, uuid, boolean, boolean, jsonb)",
+    );
+    expect(sql).toContain(
+      "DROP FUNCTION IF EXISTS public.invoice_split_payment_atomic(uuid, uuid, uuid, timestamptz, boolean, jsonb)",
+    );
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.cash_invoice_payment_atomic\(\s*p_sede_id uuid,\s*p_shift_id uuid,\s*p_invoice_id uuid,\s*p_user_id uuid,\s*p_closed_at timestamptz,/,
+    );
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.invoice_split_payment_atomic\(\s*p_sede_id uuid,\s*p_invoice_id uuid,\s*p_shift_id uuid,\s*p_user_id uuid,\s*p_closed_at timestamptz,/,
+    );
+  });
+
+  it("bloquea el TURNO con FOR SHARE y lo revalida ANTES de la factura", () => {
+    // El orden global: cash_shifts > invoices. El `FOR SHARE` del turno tiene que
+    // aparecer ANTES del `FOR UPDATE` de la factura, y la revalidación después.
+    expect(sql).toContain("FROM public.cash_shifts s");
+    expect(sql).toContain("FOR SHARE OF s");
+    expect(sql).toContain("v_turno.status <> 'abierto'");
+    expect(sql).toContain("'SHIFT_CLOSED'");
+    expect(sql).toContain("'SHIFT_NOT_FOUND'");
+    const shiftsLock = sql.indexOf("FOR SHARE OF s");
+    const invoicesLock = sql.indexOf("FOR UPDATE OF i");
+    expect(shiftsLock).toBeGreaterThan(-1);
+    expect(invoicesLock).toBeGreaterThan(shiftsLock);
+    // El `FOR KEY SHARE` —el lock que hoy toma la FK— NO alcanza: se declara.
+    expect(raw).toContain("FOR KEY SHARE");
+  });
+
+  it("Gap 1: el cierre de caja escribe closed_by y closed_at, sólo si se cierra", () => {
+    const update = sql.slice(
+      sql.indexOf("UPDATE public.invoices"),
+      sql.indexOf("RETURNING * INTO v_factura"),
+    );
+    expect(update).toMatch(/status = CASE WHEN p_mark_paid THEN 'Pagada'/);
+    expect(update).toMatch(/closed_by = CASE WHEN p_mark_paid THEN p_user_id/);
+    expect(update).toMatch(/closed_at = CASE WHEN p_mark_paid THEN p_closed_at/);
+  });
+
+  it("el cobro dividido exige que TODAS las porciones sean del turno bloqueado", () => {
+    expect(sql).toMatch(/\(item ->> 'cash_shift_id'\)::uuid <> p_shift_id/);
+  });
+
+  it("no mueve aritmética de dinero a SQL: ningún monto se recalcula", () => {
+    for (const column of [
+      "amount",
+      "fee_amount",
+      "fee_percent",
+      "total",
+      "surcharge",
+      "subtotal",
+      "discount",
+      "tax",
+    ]) {
+      expect(ddl, column).not.toMatch(new RegExp(`${column}\\s*[+\\-*/]`));
+    }
+    expect(ddl).not.toContain("CHECK");
+    expect(ddl).not.toMatch(/sum\s*\(/i);
+    expect(ddl).not.toMatch(/round\s*\(/i);
+    expect(ddl).not.toMatch(/trg_invoice_payments_cap/);
+    expect(ddl).not.toMatch(/invoices\.total/);
+  });
+
+  it("conserva las redes de conteo y las precondiciones de estado", () => {
+    // Las mismas redes de 050/053: dos en el cobro dividido, tres en caja.
+    expect(sql.match(/GET DIAGNOSTICS/g) ?? []).toHaveLength(5);
+    expect(sql).toContain("PAYMENT_MISMATCH");
+    expect(sql).toContain("PAYMENT_INVALID");
+    expect(sql).toMatch(/v_factura\.status = 'Anulada'/);
+    expect(sql).toContain("ANNUL_INVALID");
+    expect(sql).toContain("INVOICE_NOT_FOUND");
+  });
+
+  it("cierra el permiso de las dos funciones nuevas: sólo service_role", () => {
+    for (const signature of [
+      "public.cash_invoice_payment_atomic(uuid, uuid, uuid, uuid, timestamptz, boolean, boolean, jsonb)",
+      "public.invoice_split_payment_atomic(uuid, uuid, uuid, uuid, timestamptz, boolean, jsonb)",
+    ]) {
+      expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature}`);
+      expect(sql).toContain(`GRANT EXECUTE ON FUNCTION ${signature}`);
+      expect(sql).toContain(`ALTER FUNCTION ${signature} SET search_path = public`);
+    }
+    expect(sql).toContain("FROM PUBLIC");
+    expect(sql).toContain("FROM anon");
+    expect(sql).toContain("FROM authenticated");
+    expect(sql).toContain("TO service_role");
+    expect(sql).toContain("SECURITY INVOKER");
+  });
+
+  it("no borra ni reescribe FILAS: sólo reemplaza funciones y ajusta permisos", () => {
+    expect(sql.match(/CREATE OR REPLACE FUNCTION/g) ?? []).toHaveLength(2);
+    expect(sql.match(/^ALTER FUNCTION/gm) ?? []).toHaveLength(2);
+    expect(sql.match(/^COMMENT ON FUNCTION/gm) ?? []).toHaveLength(2);
+    // El único DROP es el de las DOS sobrecargas de función (objetos, no filas).
+    expect(sql.match(/DROP FUNCTION IF EXISTS/g) ?? []).toHaveLength(2);
+    expect(sql).not.toMatch(/\bDELETE\b/);
+    expect(sql).not.toMatch(/^\s*TRUNCATE/im);
+    expect(sql).not.toMatch(/^\s*DROP TABLE/im);
+    expect(sql).not.toMatch(/^\s*ALTER TABLE/im);
+    expect(sql).not.toMatch(/^\s*CREATE INDEX/im);
+    expect(sql).not.toMatch(/updated_at/);
+    // Dos UPDATE EJECUTABLES: el estado de caja y el cierre del dividido.
+    expect(sql.match(/UPDATE public\./g) ?? []).toHaveLength(2);
+  });
+
+  it("declara el orden de locks, el reloj, el acoplamiento, la numeración y las ventanas", () => {
+    expect(raw).toContain("ORDEN GLOBAL DE LOCKS");
+    expect(raw).toContain("QUÉ RELOJ PARA `closed_at`");
+    expect(raw).toContain("ACOPLAMIENTO DE DESPLIEGUE");
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("VENTANAS DECLARADAS");
+    // El número asignado, el archivo hermano que se espeja y los números ajenos
+    // que NO se tocan.
+    expect(raw).toContain("056");
+    expect(raw).toContain("053");
+    expect(raw).toContain("055");
+    expect(raw).toContain("057");
+  });
+});
+
 // ---------- CL-3: el cobro de caja de una factura, repetido, no cobra dos veces ----------
 
 /**
@@ -2933,6 +3283,11 @@ describe("cash: CL-3 el reintento de un cobro de factura no cobra dos veces", ()
     paymentStub.inserts = {};
     paymentStub.skipMarkLookupOnce = false;
     paymentStub.stalePaymentsOnce = null;
+    paymentStub.shiftStatus = "abierto";
+    paymentStub.closeShiftBeforeCommit = false;
+    paymentStub.invoiceClosedBy = null;
+    paymentStub.invoiceClosedAt = null;
+    paymentStub.rpcCalls.length = 0;
   });
 
   it("el reintento del MISMO envío escribe el espejo UNA vez (el dinero se cobra una vez)", async () => {
