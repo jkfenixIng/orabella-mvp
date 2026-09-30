@@ -584,21 +584,32 @@ async function fetchInvoicePaymentsByShift(
   return result;
 }
 
-async function insertCounts(
-  db: DbClient,
-  shiftId: string,
-  phase: "apertura" | "cierre" | "reconteo",
-  counts: ShiftCountInput[],
-): Promise<void> {  const rows = counts.map((line) => ({
-    shift_id: shiftId,
-    phase,
+/**
+ * CL-10: las líneas de un conteo como DATO, listas para viajar al RPC que las
+ * escribe. El servicio COMPUTA —qué métodos y qué denominaciones se cuentan
+ * (`checkCounts`) y el monto ya redondeado de cada línea— y la función SQL sólo
+ * INSERTA lo que recibe: el `shift_id` y la fase de cada fila los pone la
+ * transacción que la escribe (`apertura`, `cierre` o `reconteo`), no el
+ * llamador.
+ *
+ * Antes esto era `insertCounts`, que además de armar las filas abría su PROPIO
+ * request de escritura contra `cash_shift_counts`. Esa escritura suelta era la
+ * mitad de las TRES ventanas que CL-10 cierra: el turno (o el cierre, o el
+ * reconteo) se escribía en un request y sus líneas en el siguiente, así que un
+ * fallo entre los dos dejaba la operación firmada sin su evidencia.
+ */
+function countLines(counts: ShiftCountInput[]): Array<{
+  method_code: string;
+  denomination: number | null;
+  quantity: number;
+  amount: number;
+}> {
+  return counts.map((line) => ({
     method_code: line.method_code,
     denomination: line.denomination ?? null,
     quantity: line.quantity,
     amount: roundMoney(line.amount),
   }));
-  const { error } = await db.from("cash_shift_counts").insert(rows);
-  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
 }
 
 /**
@@ -908,21 +919,35 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     }
     // (open-mismatch audit is written after creation, filed against the shift)
 
-    const { data: created, error: createError } = await db
-      .from("cash_shifts")
-      .insert({
-        cash_register_id: register.id,
-        sede_id: actor.sedeId,
-        opened_by: actor.userId,
-        opening_base: openingBase,
-        expected_cash: 0,
-        status: "abierto",
-      })
-      .select(SHIFT_SELECT)
-      .single();
+    // CL-10: el turno y su arqueo de apertura son UNA sola escritura. Una
+    // función SQL es UNA sentencia, y una sentencia corre ENTERA dentro de una
+    // sola transacción del servidor (PostgREST no ofrece multi-statement por
+    // request). Antes esto eran DOS requests —el INSERT del turno y después el
+    // de sus líneas de conteo— y un fallo entre los dos dejaba el turno ABIERTO
+    // sin su arqueo: la base con la que abrió el cajón sin respaldo por
+    // denominación, el esperado digital del cierre sin su punto de partida, y el
+    // desajuste de la apertura sin nada contra lo que compararse. El reintento
+    // tampoco lo arreglaba: el índice parcial de 006 ya veía un turno abierto.
+    // Ya no hay "mitad del camino" donde fallar.
+    //
+    // La ARITMÉTICA no se mueve: la base del turno sale de `resolveOpeningBase`
+    // y cada línea del conteo de `checkCounts` (con su monto ya redondeado en
+    // `countLines`); el RPC sólo ESCRIBE lo que recibe y devuelve el turno
+    // escrito, con las mismas columnas que el servicio leía con SHIFT_SELECT.
+    const { data: created, error: createError } = await db.rpc("cash_open_shift_atomic", {
+      p_sede_id: actor.sedeId,
+      p_register_id: register.id,
+      p_opened_by: actor.userId,
+      p_opening_base: openingBase,
+      p_counts: countLines(input.counts),
+    });
     if (createError) {
-      // Carrera perdida contra uq_cash_shifts_open_per_register.
-      if ((createError as { code?: string }).code === "23505") {
+      // Carrera perdida contra uq_cash_shifts_open_per_register (23505, la
+      // barrera final de la base) o contra el guardia de "un turno abierto por
+      // caja" re-evaluado dentro de la transacción.
+      const code = (createError as { code?: string }).code;
+      const message = String((createError as { message?: string }).message ?? "");
+      if (code === "23505" || message.includes("SHIFT_ALREADY_OPEN")) {
         throw new CashError(
           "SHIFT_ALREADY_OPEN",
           "Ya hay un turno abierto en esta caja. Ciérrelo antes de abrir otro.",
@@ -932,7 +957,7 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
       throw new CashError("INTERNAL", "Error interno.", 500);
     }
     if (!created) throw new CashError("INTERNAL", "Error interno.", 500);
-    await insertCounts(db, (created as CashShiftRow).id, "apertura", input.counts);
+    const shift = created as CashShiftRow;
     // Filed against the created shift (not the register) so the shift's
     // review state can be joined from the day/history views.
     if (mismatches.length > 0 && !isFirstOpen) {
@@ -941,11 +966,11 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
         user_id: actor.userId,
         action: AUDIT_ACTIONS.SHIFT_OPEN_MISMATCH,
         entity: "cash_shifts",
-        entity_id: (created as CashShiftRow).id,
+        entity_id: shift.id,
         metadata: { opening_base: openingBase, mismatches },
       });
     }
-    return { shift: created as CashShiftRow, mismatches, firstOpen: isFirstOpen };
+    return { shift, mismatches, firstOpen: isFirstOpen };
   } catch (error) {
     throw toCashError(error);
   }
@@ -1664,31 +1689,43 @@ export async function closeShift(
     });
     const observation = input.observation?.trim() ? input.observation.trim() : null;
 
-    const { data: updated, error: updateError } = await db
-      .from("cash_shifts")
-      .update({
+    // CL-10: el cierre del turno y su arqueo son UNA sola escritura. Una
+    // función SQL es UNA sentencia, y una sentencia corre ENTERA dentro de una
+    // sola transacción del servidor (PostgREST no ofrece multi-statement por
+    // request). Antes esto eran DOS requests —el UPDATE que pisaba el turno a
+    // `cerrado` y después el INSERT de sus líneas de conteo— y un fallo entre
+    // los dos dejaba el cierre FIRMADO sin su evidencia: el turno con su total,
+    // su base dejada, su recogido y su sobre, y ninguna línea que dijera cuántos
+    // billetes de cada valor había. Peor: era un CALLEJÓN SIN SALIDA, porque el
+    // compare-and-swap de abajo sólo pisa un turno `abierto`, así que el
+    // reintento respondía SHIFT_ALREADY_CLOSED y el conteo por denominación
+    // —que es lo que hace real a un arqueo— no se podía volver a escribir.
+    //
+    // La ARITMÉTICA no se mueve: el esperado sale del arqueo del turno, la base
+    // dejada de `resolveClosingBase`, el recogido y el sobre de
+    // `computeCashClose`, y cada línea del conteo de `checkCounts`; el RPC sólo
+    // ESCRIBE lo que recibe y devuelve el turno escrito.
+    const { data: updated, error: updateError } = await db.rpc("cash_close_shift_atomic", {
+      p_sede_id: sedeId,
+      p_shift_id: shift.id,
+      p_closed_by: actor.userId,
+      p_closed_at: new Date().toISOString(),
+      p_close: {
         expected_cash: expectedCash,
         counted_cash: roundMoney(input.counted_cash),
         base_left: roundMoney(baseLeft),
         cash_withdrawn: close.cashWithdrawn,
         base_difference: close.baseDifference,
         observation,
-        status: "cerrado",
-        closed_at: new Date().toISOString(),
-        closed_by: actor.userId,
-      })
-      .eq("id", shift.id)
-      // T0-a: el cierre solo pisa un turno ABIERTO. Dos cierres simultáneos
-      // (doble clic) leerían "abierto" los dos; el segundo UPDATE afecta 0
-      // filas y así no puede reescribir un cierre ya confirmado ni duplicar
-      // los conteos de cierre.
-      .eq("status", "abierto")
-      .select(SHIFT_SELECT)
-      .single();
+      },
+      p_counts: countLines(input.counts),
+    });
     if (updateError || !updated) {
       // CHECK expected_cash >= 0 (006_cash.sql): el turno tiene más salidas
       // en efectivo (vales/comisiones) que efectivo cobrado. Es una regla de
-      // negocio, no un fallo interno: se reporta con su código y ayuda.
+      // negocio, no un fallo interno: se reporta con su código y ayuda. El CHECK
+      // no se replicó en la función a propósito (ver la migración 049): la
+      // transacción la deja hablar y acá se traduce igual que antes.
       const errorCode = (updateError as { code?: string } | null)?.code;
       const errorMessage = (updateError as { message?: string } | null)?.message ?? "";
       if (errorCode === "23514" && /expected_cash/i.test(errorMessage)) {
@@ -1698,15 +1735,17 @@ export async function closeShift(
           422,
         );
       }
-      // Carrera perdida contra el guard de estado: otro cierre ganó primero
-      // (PGRST116 = .single() sin filas, el patrón del cliente Supabase).
-      if (errorCode === "PGRST116") {
+      // Carrera perdida contra el guard de estado: otro cierre ganó el
+      // compare-and-swap primero. Antes la detectaba el `.single()` sin filas
+      // del UPDATE suelto (PGRST116); ahora la detecta la red de conteo de la
+      // transacción —el UPDATE afecta 0 filas— con el MISMO error de negocio y
+      // el MISMO estado, y sin dejar los conteos de este intento escritos.
+      if (errorMessage.includes("SHIFT_ALREADY_CLOSED")) {
         throw new CashError("SHIFT_ALREADY_CLOSED", "El turno ya está cerrado.", 409);
       }
       throw new CashError("INTERNAL", "Error interno.", 500);
     }
     const closed = updated as CashShiftRow;
-    await insertCounts(db, shift.id, "cierre", input.counts);
     await writeAudit({
       sede_id: sedeId,
       user_id: actor.userId,
@@ -1784,7 +1823,7 @@ export async function updateRegisterBase(
  * firmado es INMUTABLE: `cash_shifts` nunca se pisa. La corrección exige un
  * conteo COMPLETO nuevo (mismo detalle por denominación y totales digitales
  * que el cierre) más un motivo; se reutiliza la maquinaria del cierre
- * (`checkCounts`, `insertCounts`, `resolveClosingBase`, `computeCashClose`)
+ * (`checkCounts`, `countLines`, `resolveClosingBase`, `computeCashClose`)
  * para que no exista una aritmética paralela. El reconteo se guarda en
  * `cash_shift_recounts` con la versión anterior congelada y la nueva, más
  * quién y cuándo, y deja sus líneas en `cash_shift_counts` (fase `reconteo`).
@@ -1845,10 +1884,26 @@ export async function recountClosedShift(
     baseConfigurada: Number(register.base_configurada),
     reason: parsed.data.reason,
   });
-  const { data: inserted, error } = await db
-    .from("cash_shift_recounts")
-    .insert({
-      shift_id: shift.id,
+  // CL-10: el reconteo y su detalle por denominación son UNA sola escritura.
+  // Una función SQL es UNA sentencia, y una sentencia corre ENTERA dentro de
+  // una sola transacción del servidor (PostgREST no ofrece multi-statement por
+  // request). Antes esto eran DOS requests —la fila del reconteo con las dos
+  // versiones y después sus líneas de conteo— y un fallo entre los dos dejaba
+  // el reconteo FIRMADO sin su detalle; y también era un callejón sin salida,
+  // porque el índice único por turno de 033 hace que el reintento responda
+  // ALREADY_RECOUNTED. Rompía justo la promesa que el reconteo existe para
+  // cumplir: las DOS versiones, cada una con su evidencia por denominación.
+  //
+  // La ARITMÉTICA no se mueve: las dos versiones salen de `buildRecountRecord`
+  // (la anterior congelada de `signedAmounts`, la corregida de
+  // `resolveClosingBase` + `computeCashClose`) y cada línea del conteo nuevo de
+  // `checkCounts`; el RPC sólo ESCRIBE lo que recibe y devuelve el reconteo
+  // escrito, con las mismas columnas que el servicio leía con RECOUNT_SELECT.
+  const { data: inserted, error } = await db.rpc("cash_recount_shift_atomic", {
+    p_sede_id: sedeId,
+    p_shift_id: shift.id,
+    p_recounted_by: actor.userId,
+    p_recount: {
       previous_counted_cash: record.previous.counted_cash,
       previous_base_left: record.previous.base_left,
       previous_cash_withdrawn: record.previous.cash_withdrawn,
@@ -1858,26 +1913,35 @@ export async function recountClosedShift(
       cash_withdrawn: record.next.cash_withdrawn,
       base_difference: record.next.base_difference,
       reason: record.reason,
-      recounted_by: actor.userId,
-    })
-    .select(RECOUNT_SELECT)
-    .single();
+    },
+    // Las líneas por denominación del reconteo las escribe la transacción en la
+    // MISMA tabla del arqueo, en la fase `reconteo` (033 extiende el CHECK de
+    // `phase`). Así la evidencia por denominación del reconteo es tan real como
+    // la del cierre, y viaja ENTERA con la fila del reconteo: no hay mitad del
+    // camino donde quedar firmada sin ella.
+    p_counts: countLines(parsed.data.counts),
+  });
   if (error || !inserted) {
-    // Carrera perdida contra el índice único por turno: otro reconteo ganó.
-    if ((error as { code?: string } | null)?.code === "23505") {
+    const errorCode = (error as { code?: string } | null)?.code;
+    const errorMessage = String((error as { message?: string } | null)?.message ?? "");
+    // Carrera perdida contra el índice único por turno (23505) o contra el
+    // reconteo "uno por turno" re-evaluado dentro de la transacción: otro
+    // reconteo ganó.
+    if (errorCode === "23505" || errorMessage.includes("ALREADY_RECOUNTED")) {
       throw new CashError(
         "ALREADY_RECOUNTED",
         "Este cierre ya fue recontado. El reconteo también quedó firmado y no se modifica.",
         409,
       );
     }
+    // El turno dejó de estar cerrado entre la lectura y la transacción: el
+    // MISMO rechazo que el servicio da antes de llamar.
+    if (errorMessage.includes("SHIFT_NOT_CLOSED")) {
+      throw new CashError("VALIDATION", "Solo se recontán turnos cerrados.", 400);
+    }
     throw new CashError("INTERNAL", "Error interno.", 500);
   }
   const recount = inserted as ShiftRecountRow;
-  // Las líneas por denominación del reconteo viven en la MISMA tabla del
-  // arqueo, en la fase `reconteo` (033 extiende el CHECK de `phase`). Así la
-  // evidencia por denominación del reconteo es tan real como la del cierre.
-  await insertCounts(db, shift.id, "reconteo", parsed.data.counts);
   await writeAudit({
     sede_id: sedeId,
     user_id: actor.userId,
