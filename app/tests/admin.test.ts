@@ -74,6 +74,19 @@ const postgrest = vi.hoisted(() => ({
   failRpc: null as null | { fn: string; error: { code: string; message: string } },
   /** `ensure_user_has_role` responde éxito sin aplicar nada (control negativo). */
   ensureAppliesNothing: false,
+  /**
+   * CL-15: fallo inyectable en CUALQUIER escritura de una tabla (insert,
+   * upsert o delete). Es el mismo punto de fallo para el `upsert` suelto de la
+   * implementación vieja y para la escritura de adentro de la función de 054,
+   * así que UNA prueba describe el mismo fallo en las dos.
+   */
+  failWriteTabla: null as null | { table: string; error: { code: string; message: string } },
+  /**
+   * CL-15: intercalado de otro escritor justo ANTES de la primera escritura de
+   * la operación (el `upsert` suelto viejo o la sentencia de 054): es el punto
+   * exacto de la carrera de unicidad del alta.
+   */
+  antesDeEscribir: null as null | (() => void),
   /** Retiene el rpc en vuelo hasta `liberar()` (prueba de concurrencia). */
   hold: false,
   pendientes: [] as Array<() => void>,
@@ -200,6 +213,7 @@ function aplicarEnsure(args: Record<string, unknown>): { data: unknown; error: u
 function aplicarRpc(fn: string, args: Record<string, unknown>): { data: unknown; error: unknown } {
   if (postgrest.failRpc?.fn === fn) return { data: null, error: postgrest.failRpc.error };
   if (fn === "ensure_user_has_role") return aplicarEnsure(args);
+  if (fn === "upsert_employee_atomic") return aplicarUpsertEmpleadoAtomico(args);
   if (fn !== "replace_user_roles") {
     return {
       data: null,
@@ -231,6 +245,82 @@ function aplicarRpc(fn: string, args: Record<string, unknown>): { data: unknown;
   return { data: aplicados.map((rol) => String(rol.code)).sort(), error: null };
 }
 
+/**
+ * Modelo de `upsert_employee_atomic` (054, CL-15): UNA sentencia, UNA
+ * transacción. El estado nuevo se calcula ENTERO —usuario, rol y legajo— antes
+ * de confirmarlo, así que un fallo inyectado en cualquiera de las tres
+ * escrituras no deja NINGUNA fila: ni el usuario, ni el rol, ni el legajo. Eso
+ * es exactamente lo que el cliente no podía garantizar con tres requests.
+ *
+ * La red de seguridad de roles (040) es PARTE de la misma sentencia: por eso ya
+ * no viaja como un rpc aparte, y por eso el lock de la fila del usuario —el
+ * mismo de `replace_user_roles`— sigue serializando a los dos escritores.
+ */
+function aplicarUpsertEmpleadoAtomico(args: Record<string, unknown>): {
+  data: unknown;
+  error: unknown;
+} {
+  const empleado = (args.p_employee ?? {}) as Record<string, unknown>;
+  const crear = (args.p_create_user ?? null) as Record<string, unknown> | null;
+  let usuarios = memoryRows("users");
+  let rolesDelUsuario = memoryRows("user_roles");
+  let userId = args.p_user_id ? String(args.p_user_id) : null;
+
+  if (crear) {
+    // Unicidad REAL de 002_auth.sql (`users.id_number` y `users.email`).
+    if (usuarios.some((fila) => fila.id_number === crear.id_number)) {
+      return { data: null, error: { code: "P0001", message: "USER_EXISTS" } };
+    }
+    if (crear.email && usuarios.some((fila) => fila.email === crear.email)) {
+      return { data: null, error: { code: "P0001", message: "USER_EXISTS" } };
+    }
+    if (postgrest.failWriteTabla?.table === "users") {
+      return { data: null, error: postgrest.failWriteTabla.error };
+    }
+    userId = `usuario-generado-${usuarios.length + 1}`;
+    // AUTH-01: la clave inicial es el documento y el cambio es obligatorio.
+    usuarios = [...usuarios, { ...crear, id: userId, must_change_password: true }];
+  } else if (!userId || !usuarios.some((fila) => fila.id === userId)) {
+    return { data: null, error: { code: "P0001", message: "USER_NOT_FOUND" } };
+  }
+
+  // 040 dentro de la misma sentencia: el `NOT EXISTS` es la intención literal
+  // de la red ("sólo si no tiene NINGÚN rol"), no "agregá este rol".
+  const pedido = String(args.p_role_code ?? "");
+  const rol = memoryRows("roles").find((fila) => fila.code === pedido);
+  if (!rol) return { data: null, error: { code: "P0001", message: "ROLE_NOT_FOUND" } };
+  if (!rolesDelUsuario.some((fila) => fila.user_id === userId) && !postgrest.ensureAppliesNothing) {
+    rolesDelUsuario = [...rolesDelUsuario, { user_id: userId, role_id: rol.id }];
+  }
+
+  const fallo =
+    postgrest.failWriteTabla?.table === "employees"
+      ? postgrest.failWriteTabla.error
+      : postgrest.failWrite?.table === "employees"
+        ? postgrest.failWrite.error
+        : null;
+  if (fallo) return { data: null, error: fallo };
+
+  // Red de seguridad final: la sentencia no puede confirmar un usuario sin
+  // ningún rol (`requireSedeRole` lo rechazaría en toda la aplicación).
+  if (!rolesDelUsuario.some((fila) => fila.user_id === userId)) {
+    return { data: null, error: { code: "P0001", message: "ROLE_NOT_FOUND" } };
+  }
+
+  // Recién acá se CONFIRMA: hasta este punto no se tocó ninguna fila.
+  const fila = {
+    ...empleado,
+    id: `empleado-generado-${memoryRows("employees").length + 1}`,
+    user_id: userId,
+    is_active: empleado.is_active ?? true,
+    payout_mode: empleado.payout_mode ?? "nomina",
+  };
+  postgrest.rows.users = usuarios;
+  postgrest.rows.user_roles = rolesDelUsuario;
+  postgrest.rows.employees = [...memoryRows("employees"), fila];
+  return { data: { ...fila }, error: null };
+}
+
 function createStubClient() {
   const from = (table: string) => {
     const filtros: Filtro[] = [];
@@ -243,7 +333,6 @@ function createStubClient() {
     const run = (): { data: unknown; error: unknown } => {
       if (ejecutado) return ejecutado;
       let filas = memoryRows(table);
-
       // Fallo de lectura inyectable: lo que se prueba es que un error de
       // lectura NUNCA se convierta en "el usuario no tiene roles".
       if (modo === "select" && postgrest.failRead?.table === table) {
@@ -268,9 +357,14 @@ function createStubClient() {
       }
 
       if (modo === "delete") {
+        postgrest.antesDeEscribir?.();
         postgrest.singleWrites.push(`${table}.delete`);
         if (postgrest.failWrite?.table === table && postgrest.failWrite.op === "delete") {
           ejecutado = { data: null, error: postgrest.failWrite.error };
+          return ejecutado;
+        }
+        if (postgrest.failWriteTabla?.table === table) {
+          ejecutado = { data: null, error: postgrest.failWriteTabla.error };
           return ejecutado;
         }
         postgrest.rows[table] = filas.filter((fila) => !cumpleFiltros(fila, filtros));
@@ -279,6 +373,7 @@ function createStubClient() {
       }
 
       if (modo === "insert") {
+        postgrest.antesDeEscribir?.();
         if (table === "user_roles") {
           postgrest.antesDeEscribirRol?.();
           // El otro escritor pudo REEMPLAZAR el arreglo de filas: el insert
@@ -324,7 +419,12 @@ function createStubClient() {
       }
 
       if (modo === "upsert") {
+        postgrest.antesDeEscribir?.();
         postgrest.singleWrites.push(`${table}.upsert`);
+        if (postgrest.failWriteTabla?.table === table) {
+          ejecutado = { data: null, error: postgrest.failWriteTabla.error };
+          return ejecutado;
+        }
         const nuevas = (Array.isArray(payload) ? payload : [payload]) as Array<
           Record<string, unknown>
         >;
@@ -415,7 +515,10 @@ function createStubClient() {
     postgrest.rpcCalls.push({ fn, args });
     const ejecutar = () => {
       // El intercalado de la carrera ocurre justo antes de que la red escriba.
-      if (fn === "ensure_user_has_role") postgrest.antesDeEscribirRol?.();
+      if (fn === "ensure_user_has_role" || fn === "upsert_employee_atomic") {
+        postgrest.antesDeEscribirRol?.();
+      }
+      postgrest.antesDeEscribir?.();
       return aplicarRpc(fn, args);
     };
     if (postgrest.hold) {
@@ -994,8 +1097,11 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
     expect(memoryRows("employees")).toHaveLength(1);
     expect(rolesPersistidos()).toEqual(["admin"]);
     expect(escriturasDeRoles()).toEqual([]);
-    // La decisión viaja en UNA sentencia: la función del servidor.
-    expect(postgrest.rpcCalls.map((llamada) => llamada.fn)).toEqual(["ensure_user_has_role"]);
+    // La decisión viaja en UNA sentencia del servidor: desde CL-15 esa
+    // sentencia es la del alta completa (`upsert_employee_atomic`, 054), que
+    // lleva adentro la red de seguridad de 040. La propiedad que se fija —una
+    // sola sentencia, cero escrituras sueltas de `user_roles`— es la misma.
+    expect(postgrest.rpcCalls.map((llamada) => llamada.fn)).toEqual(["upsert_employee_atomic"]);
   });
 
   it("a quien YA es `empleado` no se le vuelve a insertar el rol", async () => {
@@ -1047,8 +1153,8 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(postgrest.rpcCalls.map((llamada) => llamada.fn).sort()).toEqual([
-      "ensure_user_has_role",
       "replace_user_roles",
+      "upsert_employee_atomic",
     ]);
     expect(escriturasDeRoles()).toEqual([]);
 
@@ -1069,7 +1175,8 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
     // es la mitad del read-then-insert que CO-4 cierra, así que ya no existe.
     expect(postgrest.selects.filter((select) => select.table === "user_roles")).toEqual([]);
     expect(escriturasDeRoles()).toEqual([]);
-    expect(postgrest.rpcCalls.map((llamada) => llamada.fn)).toEqual(["ensure_user_has_role"]);
+    // La red viaja DENTRO de la sentencia del alta (054), no como un rpc propio.
+    expect(postgrest.rpcCalls.map((llamada) => llamada.fn)).toEqual(["upsert_employee_atomic"]);
     // Y ninguna lectura que quede puede pedir una columna inexistente (CO-3):
     // `user_roles` no tiene `id` (PK compuesta (user_id, role_id), 002_auth.sql).
     expect(columnasReales("user_roles").has("id")).toBe(false);
@@ -1085,7 +1192,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
   it("un fallo de la red NO otorga rol: falla cerrado y sin escribir", async () => {
     sembrar([]);
     postgrest.failRpc = {
-      fn: "ensure_user_has_role",
+      fn: "upsert_employee_atomic",
       error: { code: "57014", message: "canceling statement due to statement timeout" },
     };
 
@@ -1158,8 +1265,8 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
   it("un fallo REAL de la escritura de la red sí se propaga (no queda en un console.error)", async () => {
     sembrar([]);
     postgrest.failRpc = {
-      fn: "ensure_user_has_role",
-      error: { code: "42501", message: "permission denied for function ensure_user_has_role" },
+      fn: "upsert_employee_atomic",
+      error: { code: "42501", message: "permission denied for function upsert_employee_atomic" },
     };
 
     await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
@@ -1261,5 +1368,229 @@ describe("migración 003_admin.sql (T3)", () => {
     expect(sql).toContain("'IVA'");
     expect(sql).toContain("19");
     expect(sql).toContain("'ICA'");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CL-15: el alta de empleado deja de poder quedar a medias.
+//
+// `upsertEmployee` escribía el usuario (si no existía), le aseguraba un rol
+// (040) y DESPUÉS insertaba el legajo: tres requests de PostgREST, tres
+// transacciones distintas, porque PostgREST no ofrece multi-statement por
+// request. Un fallo en el medio dejaba un usuario con login y rol pero SIN
+// legajo. El par de escrituras pasa a ser UNA sentencia del servidor
+// (`upsert_employee_atomic`, migración 054), que lleva adentro la red de
+// seguridad de 040.
+// ---------------------------------------------------------------------------
+
+describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
+  function sembrarSinUsuario(): void {
+    postgrest.rows = {};
+    postgrest.rows.users = [];
+    postgrest.rows.roles = ROLES_CATALOGO.map((rol) => ({ ...rol }));
+    postgrest.rows.user_roles = [];
+    postgrest.rows.employees = [];
+  }
+
+  /** El usuario de acceso ya existe (vínculo automático por documento). */
+  function sembrarConUsuarioVinculado(): void {
+    sembrarSinUsuario();
+    postgrest.rows.users = [
+      { id: USUARIO_ID, sede_id: SEDE_A, id_number: "123456", full_name: "Carolina Rojas" },
+    ];
+  }
+
+  function usuarios(): Array<Record<string, unknown>> {
+    return memoryRows("users");
+  }
+
+  /** Roles persistidos (las pruebas de este bloque tienen a lo sumo un usuario). */
+  function rolesPersistidos(): string[] {
+    return memoryRows("user_roles")
+      .map((fila) => codeDeRol(String(fila.role_id)))
+      .sort();
+  }
+
+  function escriturasSueltas(): string[] {
+    return postgrest.singleWrites.filter(
+      (escritura) =>
+        escritura.startsWith("users.") ||
+        escritura.startsWith("user_roles.") ||
+        escritura.startsWith("employees."),
+    );
+  }
+
+  beforeEach(() => {
+    postgrest.singleWrites.length = 0;
+    postgrest.rpcCalls.length = 0;
+    postgrest.selects.length = 0;
+    postgrest.failWrite = null;
+    postgrest.failWriteTabla = null;
+    postgrest.failRead = null;
+    postgrest.failRpc = null;
+    postgrest.antesDeEscribir = null;
+    postgrest.antesDeEscribirRol = null;
+    postgrest.rpcAppliesNothing = false;
+    postgrest.ensureAppliesNothing = false;
+  });
+
+  it("un fallo del legajo no deja usuario con login y rol pero SIN legajo", async () => {
+    sembrarSinUsuario();
+    postgrest.failWriteTabla = {
+      table: "employees",
+      error: { code: "42501", message: "permission denied for table employees" },
+    };
+
+    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+      code: "INTERNAL",
+      status: 500,
+    });
+
+    // EL HALLAZGO: el usuario creado, con su rol, y sin legajo que lo respalde.
+    // Sin transacción, esas dos escrituras ya estaban confirmadas.
+    expect(usuarios()).toEqual([]);
+    expect(rolesPersistidos()).toEqual([]);
+    expect(memoryRows("employees")).toEqual([]);
+  });
+
+  it("con un usuario YA vinculado, un fallo del legajo no le deja el rol igual", async () => {
+    sembrarConUsuarioVinculado();
+    postgrest.failWriteTabla = {
+      table: "employees",
+      error: { code: "42501", message: "permission denied for table employees" },
+    };
+
+    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+      code: "INTERNAL",
+      status: 500,
+    });
+
+    // El usuario previo NO se toca (no es nuestro) y tampoco se le otorga nada.
+    expect(usuarios()).toHaveLength(1);
+    expect(rolesPersistidos()).toEqual([]);
+    expect(memoryRows("employees")).toEqual([]);
+  });
+
+  it("un fallo al crear el usuario no deja legajo suelto", async () => {
+    sembrarSinUsuario();
+    postgrest.failWriteTabla = {
+      table: "users",
+      error: { code: "42501", message: "permission denied for table users" },
+    };
+
+    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+      code: "INTERNAL",
+      status: 500,
+    });
+
+    expect(usuarios()).toEqual([]);
+    expect(rolesPersistidos()).toEqual([]);
+    expect(memoryRows("employees")).toEqual([]);
+  });
+
+  it("el alta viaja en UNA sentencia: cero escrituras sueltas", async () => {
+    sembrarSinUsuario();
+
+    const fila = await upsertEmployee(baseEmployee());
+
+    expect(fila.full_name).toBe("Carolina Rojas");
+    expect(postgrest.rpcCalls.map((llamada) => llamada.fn)).toEqual(["upsert_employee_atomic"]);
+    expect(escriturasSueltas()).toEqual([]);
+    expect(usuarios()).toHaveLength(1);
+    expect(rolesPersistidos()).toEqual(["empleado"]);
+    expect(memoryRows("employees")).toHaveLength(1);
+  });
+
+  it("una carrera perdida contra el índice del código sigue dando EMPLOYEE_CODE_TAKEN", async () => {
+    sembrarSinUsuario();
+    postgrest.failWriteTabla = {
+      table: "employees",
+      error: {
+        code: "23505",
+        message: 'duplicate key value violates unique constraint "uq_employees_sede_code"',
+      },
+    };
+
+    await expect(
+      upsertEmployee(baseEmployee({ employee_code: "EMP-01" })),
+    ).rejects.toMatchObject({ code: "EMPLOYEE_CODE_TAKEN", status: 409 });
+
+    // Nada a medias: ni usuario, ni rol, ni legajo.
+    expect(usuarios()).toEqual([]);
+    expect(rolesPersistidos()).toEqual([]);
+    expect(memoryRows("employees")).toEqual([]);
+  });
+
+  it("documento repetido por carrera: la unicidad de users se conserva", async () => {
+    sembrarSinUsuario();
+    postgrest.antesDeEscribir = () => {
+      postgrest.rows.users = [
+        { id: "otro", sede_id: SEDE_B, id_number: "123456", full_name: "Otra sede" },
+      ];
+    };
+
+    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+      code: "INTERNAL",
+      status: 500,
+    });
+
+    expect(usuarios()).toHaveLength(1); // el de la carrera, no el nuestro
+    expect(rolesPersistidos()).toEqual([]);
+    expect(memoryRows("employees")).toEqual([]);
+  });
+
+  it("un rol desconocido en el catálogo no deja el legajo escrito", async () => {
+    sembrarSinUsuario();
+    postgrest.rows.roles = ROLES_CATALOGO.filter((rol) => rol.code !== "empleado").map(
+      (rol) => ({ ...rol }),
+    );
+
+    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+      code: "INTERNAL",
+      status: 500,
+    });
+
+    expect(usuarios()).toEqual([]);
+    expect(memoryRows("employees")).toEqual([]);
+    expect(escriturasSueltas()).toEqual([]);
+  });
+});
+
+describe("migración 054_identity_atomic.sql: la función del alta de empleado (CL-15)", () => {
+  const sql = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "054_identity_atomic.sql"),
+    "utf8",
+  );
+
+  it("crea la función que el alta de empleado llama por rpc", () => {
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.upsert_employee_atomic");
+    expect(sql).toContain("p_employee jsonb, p_user_id uuid, p_create_user jsonb, p_role_code text");
+    expect(sql).toContain("RETURNS jsonb");
+  });
+
+  it("escribe el usuario, su rol y el legajo en la MISMA sentencia", () => {
+    const insercionEmpleado = sql.indexOf("INSERT INTO public.employees");
+    expect(insercionEmpleado).toBeGreaterThan(-1);
+    expect(sql.indexOf("INSERT INTO public.users")).toBeLessThan(insercionEmpleado);
+    expect(sql.indexOf("public.ensure_user_has_role")).toBeLessThan(insercionEmpleado);
+    expect(sql).toContain("FOR UPDATE");
+    // La red de seguridad es la de 040, no una copia: una sola dueña de la
+    // invariante "un rol por usuario".
+    expect(sql).toContain("PERFORM public.ensure_user_has_role");
+  });
+
+  it("aborta en vez de confirmar un legajo sin usuario con rol", () => {
+    expect(sql).toContain("RAISE EXCEPTION 'EMPLOYEE_INVALID'");
+    expect(sql).toContain("RAISE EXCEPTION 'USER_NOT_FOUND'");
+    expect(sql).toContain("RAISE EXCEPTION 'USER_EXISTS'");
+    expect(sql).toContain("GET DIAGNOSTICS");
+  });
+
+  it("cierra el permiso: sólo service_role puede ejecutarla", () => {
+    const firma = "public.upsert_employee_atomic(jsonb, uuid, jsonb, text)";
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${firma} FROM PUBLIC`);
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${firma} FROM anon`);
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${firma} FROM authenticated`);
+    expect(sql).toContain(`GRANT EXECUTE ON FUNCTION ${firma} TO service_role`);
   });
 });
