@@ -300,6 +300,21 @@ const invStub = vi.hoisted(() => ({
   forceClashOnce: false,
   /** Esconde a la ganadora: sin ella el 23505 no es una repetición. */
   hideWinner: false,
+  /**
+   * CL-7: ordinal (1-based) de la escritura de movimiento que FALLA, contando
+   * INTENTOS. Es la falla "a mitad de camino" del hallazgo: con el bucle, la
+   * primera escritura ya había movido el stock cuando cae la segunda.
+   */
+  failMovementWriteOn: null as number | null,
+  /**
+   * CL-7: hace que el RPC falle con ese mensaje (`RAISE EXCEPTION` del
+   * servidor) SIN escribir nada: es el rechazo de la CARRERA del trigger
+   * (INSUFFICIENT_STOCK) y el de la red de seguridad del conteo
+   * (PRODUCT_NOT_FOUND).
+   */
+  failDeductionWith: null as string | null,
+  /** Veces que el servicio llamó al RPC de deducción (no vacuidad). */
+  deductionCalls: 0,
   nextId: 0,
 }));
 
@@ -313,6 +328,9 @@ function resetInventoryStub(): void {
   invStub.skipMovementLookupOnce = false;
   invStub.forceClashOnce = false;
   invStub.hideWinner = false;
+  invStub.failMovementWriteOn = null;
+  invStub.failDeductionWith = null;
+  invStub.deductionCalls = 0;
   invStub.nextId = 0;
 }
 
@@ -350,6 +368,80 @@ function stockOf(id: string = invStub.PRODUCT_ID): number {
  * se registra en `unexpectedQueries`, para que el test falle a la vista.
  */
 function createInventoryStubClient(): unknown {
+  /**
+   * CL-7: UNA escritura de movimiento, con el contrato de 004 en el MISMO orden
+   * que Postgres: el BEFORE ROW trigger del stock (que rechaza el OUT que deja
+   * negativo), después el índice único parcial y recién entonces el AFTER ROW
+   * trigger que aplica el stock. La usan el INSERT de la tabla —el camino de
+   * `registerMovement`— y el RPC `deduct_stock_atomic`, que es el camino de la
+   * deducción multi-producto: así los dos caminos se prueban con las MISMAS
+   * barreras y el doble no puede "arreglar" uno de los dos.
+   *
+   * Devuelve la fila CRUDA (cada llamador decide qué proyectar) o el error.
+   */
+  const writeMovement = (
+    payload: Record<string, unknown>,
+  ): { row?: Record<string, unknown>; error?: unknown } => {
+    // El contador mide INTENTOS, no éxitos: es lo que permite hacer caer la
+    // N-ésima escritura.
+    invStub.movementInserts += 1;
+    if (invStub.failMovementWriteOn === invStub.movementInserts) {
+      return { error: { code: "XX000", message: "fallo de escritura simulado" } };
+    }
+    const product = invStub.products.find((row) => row.id === payload.product_id);
+    const qty = Number(payload.qty);
+    // trg_inventory_no_negative (BEFORE INSERT): el OUT nunca deja negativo.
+    if (payload.type === "OUT" && Number(product?.stock_qty ?? 0) < qty) {
+      return { error: { code: "P0001", message: "INSUFFICIENT_STOCK" } };
+    }
+    // Índice único PARCIAL (product_id, idempotency_key) WHERE NOT NULL.
+    const mark = (payload.idempotency_key ?? null) as string | null;
+    if (invStub.forceClashOnce) {
+      invStub.forceClashOnce = false;
+      invStub.movementClashes += 1;
+      return {
+        error: {
+          code: "23505",
+          message:
+            'duplicate key value violates unique constraint "uq_inventory_movements_product_idempotency_key"',
+        },
+      };
+    }
+    if (
+      invStub.enforceMarkIndex &&
+      mark !== null &&
+      invStub.movements.some(
+        (row) => row.product_id === payload.product_id && row.idempotency_key === mark,
+      )
+    ) {
+      invStub.movementClashes += 1;
+      return {
+        error: {
+          code: "23505",
+          message:
+            'duplicate key value violates unique constraint "uq_inventory_movements_product_idempotency_key"',
+        },
+      };
+    }
+    const row = {
+      id: `mov-${(invStub.nextId += 1)}`,
+      ...payload,
+      idempotency_key: mark,
+      created_at: "2026-01-01T00:00:00.000Z",
+    };
+    invStub.movements.push(row);
+    // trg_inventory_apply_stock (AFTER INSERT): IN suma, OUT resta, ADJUST fija.
+    if (product) {
+      product.stock_qty =
+        payload.type === "IN"
+          ? Number(product.stock_qty) + qty
+          : payload.type === "OUT"
+            ? Number(product.stock_qty) - qty
+            : qty;
+    }
+    return { row };
+  };
+
   const from = (table: string) => {
     let op = "select";
     let cols = "";
@@ -383,61 +475,12 @@ function createInventoryStubClient(): unknown {
           invStub.unexpectedQueries.push(`${table}.insert`);
           return { data: null, error: { message: `stub sin respuesta para ${table}.insert` } };
         }
-        invStub.movementInserts += 1;
-        const product = invStub.products.find((row) => row.id === payload.product_id);
-        const qty = Number(payload.qty);
-        // trg_inventory_no_negative (BEFORE INSERT): el OUT nunca deja negativo.
-        if (payload.type === "OUT" && Number(product?.stock_qty ?? 0) < qty) {
-          return { data: null, error: { code: "P0001", message: "INSUFFICIENT_STOCK" } };
-        }
-        // Índice único PARCIAL (product_id, idempotency_key) WHERE NOT NULL.
-        const mark = (payload.idempotency_key ?? null) as string | null;
-        if (invStub.forceClashOnce) {
-          invStub.forceClashOnce = false;
-          invStub.movementClashes += 1;
-          return {
-            data: null,
-            error: {
-              code: "23505",
-              message:
-                'duplicate key value violates unique constraint "uq_inventory_movements_product_idempotency_key"',
-            },
-          };
-        }
-        if (
-          invStub.enforceMarkIndex &&
-          mark !== null &&
-          invStub.movements.some(
-            (row) => row.product_id === payload.product_id && row.idempotency_key === mark,
-          )
-        ) {
-          invStub.movementClashes += 1;
-          return {
-            data: null,
-            error: {
-              code: "23505",
-              message:
-                'duplicate key value violates unique constraint "uq_inventory_movements_product_idempotency_key"',
-            },
-          };
-        }
-        const row = {
-          id: `mov-${(invStub.nextId += 1)}`,
-          ...payload,
-          idempotency_key: mark,
-          created_at: "2026-01-01T00:00:00.000Z",
+        const written = writeMovement(payload);
+        if (written.error) return { data: null, error: written.error };
+        return {
+          data: projection(written.row as Record<string, unknown>),
+          error: null,
         };
-        invStub.movements.push(row);
-        // trg_inventory_apply_stock (AFTER INSERT): IN suma, OUT resta, ADJUST fija.
-        if (product) {
-          product.stock_qty =
-            payload.type === "IN"
-              ? Number(product.stock_qty) + qty
-              : payload.type === "OUT"
-                ? Number(product.stock_qty) - qty
-                : qty;
-        }
-        return { data: projection(row), error: null };
       }
 
       switch (table) {
@@ -515,7 +558,60 @@ function createInventoryStubClient(): unknown {
     return query;
   };
 
-  return { from };
+  /**
+   * `deduct_stock_atomic` (CL-7, migración 046): el doble emula UNA transacción
+   * del servidor. Toma el snapshot del stock y del kardex ANTES de escribir y,
+   * si CUALQUIER escritura falla, restaura los dos: no queda nada descontado,
+   * igual que el rollback de la sentencia real. Devuelve cuántos movimientos
+   * aplicó (el servicio contrasta ese número contra lo que pidió).
+   *
+   * El doble NO reimplementa las guardas de FORMA del SQL (jsonb válido, un
+   * movimiento por producto): esas viven en la función y se prueban sobre el
+   * archivo. Lo que emula es lo que este test necesita observar: la
+   * indivisibilidad.
+   */
+  const rpc = async (
+    name: string,
+    args?: Record<string, unknown>,
+  ): Promise<{ data: unknown; error: unknown }> => {
+    if (name !== "deduct_stock_atomic") {
+      invStub.unexpectedQueries.push(`rpc.${name}`);
+      return { data: null, error: { message: `stub sin respuesta para el rpc ${name}` } };
+    }
+    const items = (args?.p_items ?? []) as Array<{ product_id: string; qty: number }>;
+    invStub.deductionCalls += 1;
+    // El rechazo del servidor: la sentencia entera se revierte, así que no se
+    // escribe nada (es la CARRERA del stock y la red de seguridad del conteo).
+    if (invStub.failDeductionWith) {
+      return { data: null, error: { code: "P0001", message: invStub.failDeductionWith } };
+    }
+    const stockSnapshot = invStub.products.map((row) => ({ row, stock_qty: row.stock_qty }));
+    const movementsSnapshot = invStub.movements.length;
+    let applied = 0;
+    for (const item of items) {
+      const written = writeMovement({
+        sede_id: args?.p_sede_id ?? null,
+        product_id: item.product_id,
+        type: "OUT",
+        qty: item.qty,
+        reason: args?.p_reason ?? null,
+        user_id: args?.p_user_id ?? null,
+        // La deducción de FACTURACIÓN no lleva marca (045): su puerta es la
+        // marca de la FACTURA (041) y su fila queda FUERA del índice parcial.
+        idempotency_key: null,
+      });
+      if (written.error) {
+        // ROLLBACK: el kardex vuelve a su largo previo y el stock a su foto.
+        invStub.movements.length = movementsSnapshot;
+        for (const entry of stockSnapshot) entry.row.stock_qty = entry.stock_qty;
+        return { data: null, error: written.error };
+      }
+      applied += 1;
+    }
+    return { data: applied, error: null };
+  };
+
+  return { from, rpc };
 }
 
 vi.mock("@/src/shared/lib/supabase/server", () => ({
@@ -820,5 +916,238 @@ describe("migración 045_inventory_movement_idempotency.sql (CL-6)", () => {
     expect(raw).toContain("VENTANAS DECLARADAS");
     expect(raw).toContain("ORDEN DE LOS STATEMENTS");
     expect(raw).toContain("NO ejecutado por el agente: requiere base de datos");
+  });
+});
+
+/**
+ * Clase CL-7: ESCRITURAS MÚLTIPLES SIN TRANSACCIÓN — el descuento de stock de
+ * una venta multi-producto.
+ *
+ * `deductStock` registraba UN movimiento por producto en un BUCLE sin
+ * transacción: cada `registerMovement` es un request distinto contra PostgREST
+ * (que no ofrece multi-statement por request) y el trigger del stock escribe al
+ * confirmarse cada uno. Un fallo en la MITAD del bucle —una escritura que falla,
+ * una conexión que se corta, el trigger que rechaza el tercer producto— dejaba
+ * el descuento de los anteriores YA CONFIRMADO: la venta cobrada con el stock a
+ * medias y sin ninguna compensación en este camino (`cleanupFailedInvoice` sólo
+ * compensa lo que `planned` alcanzó a devolver, y una deducción que falla no
+ * devuelve nada).
+ *
+ * El arreglo es el de la casa (039/040): una FUNCIÓN SQL por `db.rpc(...)`. Una
+ * función es UNA sentencia, y una sentencia corre ENTERA dentro de una sola
+ * transacción del servidor: o se aplican TODOS los movimientos, o no se aplica
+ * ninguno. La deducción deja de ser un bucle de escrituras y pasa a ser una
+ * sola escritura: no hay "mitad del camino" donde fallar.
+ */
+describe("inventory: el descuento multi-producto es todo-o-nada (CL-7)", () => {
+  const actor = { userId: "u-caja", sedeId: invStub.SEDE_ID };
+
+  beforeEach(() => {
+    resetInventoryStub();
+    seedStockProduct();
+    seedStockProduct(invStub.OTHER_PRODUCT_ID, 10);
+  });
+
+  it("ROJO/VERDE: un fallo a mitad del descuento no deja NADA descontado", async () => {
+    // La SEGUNDA escritura falla: con el bucle, la primera ya movió el stock.
+    invStub.failMovementWriteOn = 2;
+
+    const outcome = await deductStock(
+      actor,
+      [
+        { product_id: invStub.PRODUCT_ID, qty: 2 },
+        { product_id: invStub.OTHER_PRODUCT_ID, qty: 3 },
+      ],
+      "FACTURA #1",
+    ).then(
+      () => "descontado" as const,
+      (error: unknown) => error,
+    );
+
+    expect(outcome).toBeInstanceOf(InventoryError);
+    expect(outcome).toMatchObject({ code: "INTERNAL", status: 500 });
+    // El síntoma, verbatim: hoy la primera mitad quedó descontada (8 en vez de
+    // 10) y su movimiento quedó en el kardex. Con una sola transacción no queda
+    // NADA: ni stock movido ni fila de kardex.
+    expect(stockOf()).toBe(10);
+    expect(stockOf(invStub.OTHER_PRODUCT_ID)).toBe(10);
+    expect(invStub.movements).toEqual([]);
+    // No vacuidad: el intento SÍ recorrió el camino de escritura y la falla cayó
+    // DESPUÉS de la primera (dos intentos, no cero).
+    expect(invStub.movementInserts).toBe(2);
+  });
+
+  it("GREEN: un descuento exitoso descuenta cada producto EXACTAMENTE una vez", async () => {
+    const planned = await deductStock(
+      actor,
+      [
+        { product_id: invStub.PRODUCT_ID, qty: 2 },
+        // Dos líneas del MISMO producto: el plan las agrega en UN movimiento.
+        { product_id: invStub.PRODUCT_ID, qty: 1 },
+        { product_id: invStub.OTHER_PRODUCT_ID, qty: 3 },
+      ],
+      "FACTURA #2",
+    );
+
+    expect(planned).toEqual([
+      { product_id: invStub.PRODUCT_ID, qty: 3 },
+      { product_id: invStub.OTHER_PRODUCT_ID, qty: 3 },
+    ]);
+    expect(stockOf()).toBe(7);
+    expect(stockOf(invStub.OTHER_PRODUCT_ID)).toBe(7);
+    // Un producto, un movimiento: la agregación del plan no se duplica al
+    // escribir, y ningún producto queda descontado dos veces.
+    expect(invStub.movements).toHaveLength(2);
+    expect(
+      invStub.movements.filter((row) => row.product_id === invStub.PRODUCT_ID),
+    ).toHaveLength(1);
+    expect(invStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("control negativo: el descuento SÍ escribe (no es un no-op silencioso) y sin marca de intento", async () => {
+    // Si la deducción no escribiera nada, el "nada descontado" del fallo se
+    // cumpliría por VACUIDAD. Este test pincha que escribe de verdad.
+    await deductStock(actor, [{ product_id: invStub.PRODUCT_ID, qty: 2 }], "FACTURA #3");
+
+    expect(invStub.movementInserts).toBe(1);
+    expect(stockOf()).toBe(8);
+    expect(invStub.movements[0]).toMatchObject({
+      product_id: invStub.PRODUCT_ID,
+      sede_id: invStub.SEDE_ID,
+      type: "OUT",
+      qty: 2,
+      reason: "FACTURA #3",
+      user_id: "u-caja",
+      // La deducción NO lleva marca (045): su puerta es la marca de la FACTURA.
+      idempotency_key: null,
+    });
+  });
+
+  it("control de no-extralimitación: una venta sin productos no escribe nada", async () => {
+    const planned = await deductStock(
+      actor,
+      [{ product_id: null, qty: 4 }],
+      "FACTURA #4",
+    );
+
+    expect(planned).toEqual([]);
+    expect(invStub.movementInserts).toBe(0);
+    expect(invStub.movements).toEqual([]);
+    expect(stockOf()).toBe(10);
+  });
+
+  it("la CARRERA del stock llega como 409 y sin ningún movimiento escrito", async () => {
+    // El plan validó contra la lectura y el trigger rechaza igual: el stock
+    // cambió en el medio. El rechazo llega por la transacción del servidor, así
+    // que NADA quedó descontado —el mismo 409 de negocio que antes traducía el
+    // trigger, no un INTERNAL—.
+    invStub.failDeductionWith = "INSUFFICIENT_STOCK";
+
+    const outcome = await deductStock(
+      actor,
+      [
+        { product_id: invStub.PRODUCT_ID, qty: 2 },
+        { product_id: invStub.OTHER_PRODUCT_ID, qty: 3 },
+      ],
+      "FACTURA #5",
+    ).then(
+      () => "descontado" as const,
+      (error: unknown) => error,
+    );
+
+    expect(outcome).toBeInstanceOf(InventoryError);
+    expect(outcome).toMatchObject({ code: "INSUFFICIENT_STOCK", status: 409 });
+    expect(invStub.movements).toEqual([]);
+    expect(stockOf()).toBe(10);
+    expect(stockOf(invStub.OTHER_PRODUCT_ID)).toBe(10);
+    // No vacuidad: el RPC SÍ se llamó y su error se tradujo.
+    expect(invStub.deductionCalls).toBe(1);
+  });
+
+  it("la red de seguridad del conteo llega como 404 y sin ningún movimiento escrito", async () => {
+    // El `JOIN` por sede de la función escribe menos filas si un producto no es
+    // de la sede pedida: la red de seguridad aborta y revierte todo.
+    invStub.failDeductionWith = "PRODUCT_NOT_FOUND";
+
+    const outcome = await deductStock(
+      actor,
+      [{ product_id: invStub.PRODUCT_ID, qty: 2 }],
+      "FACTURA #6",
+    ).then(
+      () => "descontado" as const,
+      (error: unknown) => error,
+    );
+
+    expect(outcome).toBeInstanceOf(InventoryError);
+    expect(outcome).toMatchObject({ code: "NOT_FOUND", status: 404 });
+    expect(invStub.movements).toEqual([]);
+    expect(stockOf()).toBe(10);
+    expect(invStub.deductionCalls).toBe(1);
+  });
+});
+
+describe("migración 046_stock_deduction_atomicity.sql (CL-7)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "046_stock_deduction_atomicity.sql"),
+    "utf8",
+  );
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("la deducción entera vive en UNA función: una sentencia, una transacción", () => {
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.deduct_stock_atomic");
+    expect(sql).toContain("INSERT INTO public.inventory_movements");
+    expect(sql).toContain("jsonb_array_elements(p_items)");
+    // Orden determinista del lock por producto (el BEFORE ROW trigger de 004
+    // toma FOR UPDATE por fila): sin él, dos deducciones con productos
+    // solapados en orden distinto se bloquean mutuamente.
+    expect(sql).toContain("ORDER BY p.id");
+  });
+
+  it("escribe la marca en NULL: la fila de facturación queda FUERA del índice de 045", () => {
+    const insertBlock = sql.slice(
+      sql.indexOf("INSERT INTO public.inventory_movements"),
+      sql.indexOf("GET DIAGNOSTICS"),
+    );
+    expect(insertBlock).toContain("idempotency_key");
+    expect(insertBlock).toMatch(/idempotency_key\)[\s\S]*\bNULL\b/);
+  });
+
+  it("exige UN movimiento por producto y una red de seguridad que revierte todo", () => {
+    expect(sql).toContain("count(DISTINCT");
+    expect(sql).toContain("GET DIAGNOSTICS");
+    expect(sql).toContain("RAISE EXCEPTION");
+  });
+
+  it("cierra el permiso: sólo service_role puede ejecutarla", () => {
+    expect(sql).toContain("REVOKE ALL ON FUNCTION public.deduct_stock_atomic");
+    expect(sql).toContain("FROM PUBLIC");
+    expect(sql).toContain("FROM anon");
+    expect(sql).toContain("FROM authenticated");
+    expect(sql).toContain("GRANT EXECUTE ON FUNCTION public.deduct_stock_atomic");
+    expect(sql).toContain("TO service_role");
+  });
+
+  it("no borra ni reescribe datos, y no toca el stock, los triggers ni la aritmética", () => {
+    expect(sql).not.toMatch(/^\s*DELETE/im);
+    expect(sql).not.toMatch(/^\s*UPDATE\s/im);
+    expect(sql).not.toMatch(/^\s*TRUNCATE/im);
+    expect(sql).not.toMatch(/^\s*ALTER TABLE/im);
+    expect(sql).not.toMatch(/^\s*CREATE INDEX/im);
+    expect(sql).not.toContain("DROP TRIGGER");
+    expect(sql).not.toContain("DROP FUNCTION");
+    expect(sql).not.toContain("products.stock_qty =");
+    expect(sql).not.toContain("inventory_apply_stock()");
+    expect(sql).not.toContain("inventory_no_negative_stock()");
+  });
+
+  it("declara el costo de numeración, el acoplamiento de despliegue y las ventanas", () => {
+    expect(raw).toContain("032 no existe y no existirá");
+    expect(raw).toContain("046");
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos");
+    expect(raw).toContain("VENTANAS DECLARADAS");
   });
 });

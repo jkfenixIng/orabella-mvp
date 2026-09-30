@@ -526,6 +526,35 @@ function toStockError(error: unknown): InventoryError {
 }
 
 /**
+ * CL-7: el error del RPC `deduct_stock_atomic` (046) traducido al MISMO
+ * contrato de negocio que el plan puro y que el trigger de 004: falta de stock
+ * ⇒ 409, producto ausente ⇒ 404, cualquier otra cosa ⇒ INTERNAL.
+ *
+ * La forma del error es la de PostgREST —un objeto `{code, message, …}`, no un
+ * `Error`—, así que no sirve el `instanceof` de `toStockError`: lo único
+ * confiable es el mensaje de la `RAISE EXCEPTION` del servidor.
+ *
+ * El mensaje de la falta de stock es el mismo que ya devolvía el trigger al
+ * pasar por `registerMovement`: acá, por definición, el rechazo viene de la
+ * CARRERA (el stock cambió después de la lectura con la que el plan validó), y
+ * el RPC no puede decir qué producto falló sin otra lectura.
+ */
+function toRpcDeductionError(error: { message?: unknown } | null): InventoryError {
+  const message = String(error?.message ?? "");
+  if (message.includes("INSUFFICIENT_STOCK")) {
+    return new InventoryError(
+      "INSUFFICIENT_STOCK",
+      "Stock insuficiente: el movimiento dejaría el stock negativo.",
+      409,
+    );
+  }
+  if (message.includes("PRODUCT_NOT_FOUND")) {
+    return new InventoryError("NOT_FOUND", "Producto no encontrado.", 404);
+  }
+  return new InventoryError("INTERNAL", "Error interno.", 500);
+}
+
+/**
  * B1/FAC-06 (frontera modular): descuenta stock para una venta.
  * Momento único del descuento: AL EMITIR la factura. Pagar después
  * (splitPayment) NO descuenta; anular revierte con IN; editar ajusta
@@ -533,8 +562,22 @@ function toStockError(error: unknown): InventoryError {
  *
  * Valida todo ANTES de mover (existencia, sede, stock suficiente con
  * mensaje por producto, 409, nunca INTERNAL por falta de stock) y luego
- * registra un OUT por producto vía registerMovement (trigger aplica el
- * stock y bloquea carreras con el mismo 409).
+ * aplica la deducción ENTERA con una sola llamada al RPC
+ * `deduct_stock_atomic` (046).
+ *
+ * CL-7: POR QUÉ NO ES UN BUCLE. Antes esto era un `registerMovement` por
+ * producto: cada uno un request distinto contra PostgREST, con el trigger del
+ * stock escribiendo al confirmarse cada uno, así que un fallo a mitad del bucle
+ * dejaba los descuentos anteriores YA confirmados —stock y kardex a medias, sin
+ * compensación en este camino—. Una función es UNA sentencia y una sentencia
+ * corre entera en UNA transacción del servidor: o se aplican TODOS los
+ * movimientos, o no se aplica ninguno. Es el mismo mecanismo de 039/040 y la
+ * respuesta de la casa a que PostgREST no ofrezca multi-statement.
+ *
+ * Los movimientos se escriben SIN marca de intento: la deducción de una emisión
+ * no tiene intento de cliente, su puerta es la marca de la FACTURA (041) y su
+ * fila queda fuera del índice parcial de la 045. La marca opcional de
+ * `registerMovement` no se toca: este camino simplemente ya no pasa por ahí.
  */
 export async function deductStock(
   actor: { userId: string; sedeId: string },
@@ -555,15 +598,21 @@ export async function deductStock(
   } catch (error) {
     throw toStockError(error);
   }
-  try {
-    for (const item of planned) {
-      await registerMovement(
-        { product_id: item.product_id, type: "OUT", qty: item.qty, reason },
-        actor,
-      );
-    }
-  } catch (error) {
-    throw toStockError(error);
+
+  const db = await inventoryDb();
+  const { data: applied, error } = await db.rpc("deduct_stock_atomic", {
+    p_sede_id: actor.sedeId,
+    p_user_id: actor.userId,
+    p_reason: reason,
+    p_items: planned.map((item) => ({ product_id: item.product_id, qty: item.qty })),
+  });
+  if (error) throw toRpcDeductionError(error as { message?: unknown } | null);
+  // Segunda barrera en la frontera: la función ya revierte si escribió menos de
+  // lo pedido, así que un conteo distinto sólo puede venir de una respuesta
+  // incoherente. Se reporta como fallo real en vez de devolver un `planned` que
+  // la base no aplicó.
+  if (typeof applied !== "number" || applied !== planned.length) {
+    throw new InventoryError("INTERNAL", "Error interno.", 500);
   }
   return planned;
 }
