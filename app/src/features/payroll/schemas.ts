@@ -778,3 +778,392 @@ export function canDiscountVoucher(status: string): boolean {
 export function canReviewVoucher(status: string): boolean {
   return status === "pendiente";
 }
+
+// ------------------------------- vista de la nómina (PA3) ---
+//
+// Con muchos pagos al mes, la pantalla de nómina tiene que poder leerse sin
+// abrir cada período: cuántos empleados liquidó, cuánto neto hay, cuánto se pagó
+// y cuánto queda, agrupado por mes, y qué lleva cada persona en el mes y contra
+// qué períodos. Todo esto es PRESENTACIÓN: se deriva de datos ya liquidados y NO
+// mueve plata (no decide montos, no topa nada, no bloquea nada). Las funciones
+// de acá son puras para poder probarlas sin base de datos.
+//
+// Los tipos de entrada son ESTRUCTURALES a propósito: este módulo es la capa de
+// reglas puras y no puede importar `service` (es el servicio el que importa
+// este módulo).
+
+/** Período, en los campos que la vista necesita para agrupar y etiquetar. */
+export interface PayrollPeriodLike extends DateRange {
+  id: string;
+  status: string;
+}
+
+/** Ítem ya liquidado con lo pagado resuelto (el servicio lo arma al leer). */
+export interface PayrollItemLike {
+  id: string;
+  period_id: string;
+  employee_id: string;
+  base_fixed: number | string;
+  net_pay: number | string;
+  paid: number | string;
+}
+
+/** Totales de un período: lo que se lee sin abrirlo. */
+export interface PayrollItemTotals {
+  /** Cuántos empleados liquidó el período (una fila por empleado). */
+  employeeCount: number;
+  netTotal: number;
+  paidTotal: number;
+  remainingTotal: number;
+}
+
+/** Un período dentro del mes de un empleado ("contra qué" se le pagó). */
+export interface PayrollMonthPeriodEntry {
+  periodId: string;
+  start_date: string;
+  end_date: string;
+  status: string;
+  net: number;
+  paid: number;
+  remaining: number;
+  /** Fijo liquidado (ya prorrateado) de este empleado en este período. */
+  fixed: number;
+  /** Días del período que caen en ESTE mes (el numerador de la prorata). */
+  days: number;
+}
+
+/**
+ * PA3: lo que un empleado lleva en un mes. El mes es el de la fecha de INICIO
+ * del período y los días son los de ese mes: un período que cruza el fin de mes
+ * se prorratea en los dos meses (`prorateFixedSalary`), así que sus días y su
+ * fijo aparecen en el mes donde empieza, que es la parte que ahí se liquida.
+ */
+export interface PayrollMonthEmployeeRow {
+  /** Mes del calendario del período, `yyyy-mm`. */
+  month: string;
+  employeeId: string;
+  netTotal: number;
+  paidTotal: number;
+  remainingTotal: number;
+  /** Fijo liquidado (ya prorrateado por el servidor) de los períodos del mes. */
+  fixedTotal: number;
+  /** Días nominados del mes (la parte de cada período que cae en él). */
+  days: number;
+  periods: PayrollMonthPeriodEntry[];
+}
+
+/** Datos del empleado que la vista de nómina necesita para una fila (ADM-08). */
+export interface PayrollEmployeeView {
+  id: string;
+  full_name: string;
+  employee_code: string | null;
+  document: string | null;
+  /** Lo que la columna de liquidación muestra (fijo/porcentaje/mixto). */
+  pay_type: string;
+  commission_percent: number | null;
+  /** Base mensual de la prorata: se muestra, no se aplica. */
+  salary_fixed: number | null;
+}
+
+/**
+ * Suma de montos para MOSTRAR: se redondea a peso entero en cada paso
+ * (`roundMoney`), sin tolerancia. Una suma que no cierra al peso haría ver un
+ * total distinto del que se puede pagar.
+ */
+export function sumMoney(values: readonly (number | string | null | undefined)[]): number {
+  let total = 0;
+  for (const value of values) {
+    const numeric = Number(value ?? 0);
+    if (Number.isFinite(numeric)) total = roundMoney(total + numeric);
+  }
+  return total;
+}
+
+/**
+ * Totales de un período a partir de sus ítems con lo pagado resuelto.
+ *
+ * El saldo de cada fila es `max(0, neto − pagado)`, el MISMO criterio que
+ * `getPeriodDetail` (una fila nunca muestra saldo negativo), y el total del
+ * período es la suma de lo que muestran sus filas: la lista y el detalle no
+ * pueden decir cosas distintas del mismo período.
+ */
+export function summarizePayrollItems(items: readonly PayrollItemLike[]): PayrollItemTotals {
+  return {
+    employeeCount: items.length,
+    netTotal: sumMoney(items.map((item) => item.net_pay)),
+    paidTotal: sumMoney(items.map((item) => item.paid)),
+    remainingTotal: sumMoney(
+      items.map((item) => Math.max(0, Number(item.net_pay) - Number(item.paid ?? 0))),
+    ),
+  };
+}
+
+/** Mes del calendario (`yyyy-mm`) de una fecha `yyyy-mm-dd`; null si no es fecha. */
+export function monthKeyOf(dateIso: string): string | null {
+  const day = utcDayOf(dateIso);
+  if (day === null) return null;
+  const date = new Date(day);
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+/**
+ * Días de `[startDate, endDate]` que caen dentro de un mes del calendario: el
+ * numerador de la prorata (`prorateFixedSalary`), que se muestra para que el
+ * fijo de los días nominados sea legible y no un número suelto. Una fecha
+ * imposible o un mes que el rango no toca dan 0: nunca se inventan días.
+ */
+export function daysInMonthWithinRange(month: string, startDate: string, endDate: string): number {
+  const match = /^(\d{4})-(\d{2})$/.exec(month.trim());
+  if (!match) return 0;
+  const month0 = Number(match[2]) - 1;
+  if (month0 < 0 || month0 > 11) return 0;
+  const start = utcDayOf(startDate);
+  const end = utcDayOf(endDate);
+  if (start === null || end === null || end < start) return 0;
+  const monthStart = Date.UTC(Number(match[1]), month0, 1);
+  const monthEnd = Date.UTC(Number(match[1]), month0 + 1, 0);
+  const from = Math.max(start, monthStart);
+  const to = Math.min(end, monthEnd);
+  if (to < from) return 0;
+  return (to - from) / DAY_MS + 1;
+}
+
+const MONTHS_LONG = [
+  "enero",
+  "febrero",
+  "marzo",
+  "abril",
+  "mayo",
+  "junio",
+  "julio",
+  "agosto",
+  "septiembre",
+  "octubre",
+  "noviembre",
+  "diciembre",
+];
+
+/**
+ * Etiqueta legible de un mes del calendario ("septiembre 2026"). No usa el
+ * locale del runtime: el nombre del mes es el mismo en el servidor y en el
+ * navegador, y no depende de datos de locale que puedan faltar.
+ */
+export function payrollMonthLabel(month: string): string {
+  const match = /^(\d{4})-(\d{2})$/.exec(month.trim());
+  if (!match) return month;
+  const month0 = Number(match[2]) - 1;
+  if (month0 < 0 || month0 > 11) return month;
+  return `${MONTHS_LONG[month0]} ${match[1]}`;
+}
+
+/**
+ * Conteo de la lista de períodos: SIEMPRE contra el total. La lista se leía
+ * recortada en 20 sin decirlo, y un total que no se nombra es un recorte
+ * invisible. `shown === total` es el caso normal (la lectura es completa); el
+ * otro texto existe para cuando el filtro de estado recorta la vista.
+ */
+export function payrollPeriodCountLabel(args: { total: number; shown: number }): string {
+  const noun = args.total === 1 ? "período" : "períodos";
+  if (args.shown === args.total) return `${args.total} ${noun} en la sede.`;
+  return `Mostrando ${args.shown} de ${args.total} ${noun}.`;
+}
+
+/** Períodos agrupados por el mes del calendario de su fecha de inicio. */
+export interface PayrollMonthGroup<TRow extends PayrollPeriodLike = PayrollPeriodLike> {
+  month: string;
+  periods: TRow[];
+}
+
+/**
+ * Agrupa por mes para que un mes con muchos pagos sea navegable: el mes más
+ * reciente primero y, dentro del mes, el período más reciente primero. Un
+ * período con fecha de inicio ilegible no se pierde: cae al grupo sin mes
+ * etiquetable y la vista lo muestra aparte en vez de esconderlo.
+ *
+ * Es genérica en la fila: el llamador recupera EXACTAMENTE el tipo de período
+ * que pasó (la vista además necesita `closed_at`, que no es del agrupador).
+ */
+export function groupPayrollPeriodsByMonth<TRow extends PayrollPeriodLike>(
+  periods: readonly TRow[],
+): PayrollMonthGroup<TRow>[] {
+  const byMonth = new Map<string, TRow[]>();
+  for (const period of periods) {
+    const month = monthKeyOf(period.start_date) ?? "";
+    const bucket = byMonth.get(month);
+    if (bucket) bucket.push(period);
+    else byMonth.set(month, [period]);
+  }
+  return [...byMonth.entries()]
+    .map(([month, rows]) => ({
+      month,
+      periods: [...rows].sort((left, right) => (left.start_date < right.start_date ? 1 : -1)),
+    }))
+    .sort((left, right) => (left.month < right.month ? 1 : -1));
+}
+
+/**
+ * Mes a la fecha por empleado: qué lleva liquidado y pagado en cada mes y
+ * contra qué períodos, con el fijo prorrateado y los días nominados a la vista.
+ * Se ordena por mes descendente y, dentro del mes, por identificación del
+ * empleado ascendente, para que dos corridas den exactamente lo mismo.
+ */
+export function buildPayrollMonthToDate(args: {
+  periods: readonly PayrollPeriodLike[];
+  items: readonly PayrollItemLike[];
+}): PayrollMonthEmployeeRow[] {
+  const periodById = new Map(args.periods.map((period) => [period.id, period]));
+  /** Por mes: los empleados que tienen algo liquidado ese mes. */
+  const employees = new Map<string, Set<string>>();
+  /** Por mes y empleado: el detalle de cada período, para acumular sin reescribir. */
+  const details = new Map<string, Map<string, Map<string, PayrollMonthPeriodEntry>>>();
+
+  for (const item of args.items) {
+    const period = periodById.get(item.period_id);
+    if (!period) continue;
+    const month = monthKeyOf(period.start_date);
+    if (month === null) continue;
+
+    const monthEmployees = employees.get(month) ?? new Set<string>();
+    employees.set(month, monthEmployees);
+    monthEmployees.add(item.employee_id);
+
+    const byEmployee = details.get(month) ?? new Map<string, Map<string, PayrollMonthPeriodEntry>>();
+    details.set(month, byEmployee);
+    const byPeriod = byEmployee.get(item.employee_id) ?? new Map<string, PayrollMonthPeriodEntry>();
+    byEmployee.set(item.employee_id, byPeriod);
+
+    const net = roundMoney(Number(item.net_pay));
+    const paid = roundMoney(Number(item.paid ?? 0));
+    const remaining = roundMoney(Math.max(0, net - paid));
+    const fixed = roundMoney(Number(item.base_fixed));
+
+    const entry = byPeriod.get(period.id);
+    if (entry) {
+      entry.net = roundMoney(entry.net + net);
+      entry.paid = roundMoney(entry.paid + paid);
+      entry.remaining = roundMoney(entry.remaining + remaining);
+      entry.fixed = roundMoney(entry.fixed + fixed);
+    } else {
+      byPeriod.set(period.id, {
+        periodId: period.id,
+        start_date: period.start_date,
+        end_date: period.end_date,
+        status: period.status,
+        net,
+        paid,
+        remaining,
+        fixed,
+        days: daysInMonthWithinRange(month, period.start_date, period.end_date),
+      });
+    }
+  }
+
+  const rows: PayrollMonthEmployeeRow[] = [];
+  for (const [month, monthEmployees] of employees) {
+    for (const employeeId of monthEmployees) {
+      rows.push(
+        monthRowFrom(month, employeeId, [...(details.get(month)?.get(employeeId)?.values() ?? [])]),
+      );
+    }
+  }
+
+  return rows.sort(compareMonthRows);
+}
+
+/** Orden de la vista: mes más reciente primero y, dentro del mes, por legajo. */
+function compareMonthRows(left: PayrollMonthEmployeeRow, right: PayrollMonthEmployeeRow): number {
+  if (left.month !== right.month) return left.month < right.month ? 1 : -1;
+  return left.employeeId < right.employeeId ? -1 : 1;
+}
+
+/**
+ * Totales de una fila del mes, recalculados SÓLO con sus períodos. Después de
+ * `roundMoney` todos los montos son enteros, así que la suma de los totales de
+ * los períodos es exacta (no depende del orden).
+ */
+function monthRowFrom(
+  month: string,
+  employeeId: string,
+  periods: readonly PayrollMonthPeriodEntry[],
+): PayrollMonthEmployeeRow {
+  const sorted = [...periods].sort((left, right) => (left.start_date < right.start_date ? -1 : 1));
+  return {
+    month,
+    employeeId,
+    netTotal: sumMoney(sorted.map((entry) => entry.net)),
+    paidTotal: sumMoney(sorted.map((entry) => entry.paid)),
+    remainingTotal: sumMoney(sorted.map((entry) => entry.remaining)),
+    fixedTotal: sumMoney(sorted.map((entry) => entry.fixed)),
+    days: sorted.reduce((acc, entry) => acc + entry.days, 0),
+    periods: sorted,
+  };
+}
+
+/**
+ * Reemplaza la porción de UN período dentro del mes a la fecha, con los ítems
+ * que acaba de devolver el detalle (o con NINGUNO si el borrador se borró).
+ *
+ * Por qué existe: el mes a la fecha se lee del servidor al abrir la pantalla,
+ * pero el admin paga, recalcula, cierra o borra dentro de la sesión. Sin esto,
+ * el número que acaba de cambiar seguiría mostrándose viejo hasta recargar —y
+ * un total viejo al lado de una acción recién hecha es una mentira, no un dato
+ * desactualizado—. Los períodos que el detalle no toca quedan intactos.
+ */
+export function replacePayrollMonthPeriod(args: {
+  rows: readonly PayrollMonthEmployeeRow[];
+  period: PayrollPeriodLike;
+  items: readonly PayrollItemLike[];
+}): PayrollMonthEmployeeRow[] {
+  const month = monthKeyOf(args.period.start_date);
+  if (month === null) return [...args.rows];
+
+  // 1. Fuera la porción vieja de ESTE período (y las filas que se quedan sin nada).
+  const next: PayrollMonthEmployeeRow[] = [];
+  for (const row of args.rows) {
+    const periods = row.periods.filter((entry) => entry.periodId !== args.period.id);
+    if (periods.length === row.periods.length) {
+      next.push(row);
+      continue;
+    }
+    if (periods.length === 0) continue;
+    next.push(monthRowFrom(row.month, row.employeeId, periods));
+  }
+
+  // 2. Adentro la porción fresca. Sólo se agrega o se completa: la fila puede
+  //    tener OTROS períodos del mismo mes, que no se pierden.
+  const fresh = buildPayrollMonthToDate({ periods: [args.period], items: args.items });
+  for (const row of fresh) {
+    const index = next.findIndex(
+      (other) => other.month === row.month && other.employeeId === row.employeeId,
+    );
+    if (index === -1) next.push(row);
+    else next[index] = monthRowFrom(row.month, row.employeeId, [...next[index].periods, ...row.periods]);
+  }
+
+  return next.sort(compareMonthRows);
+}
+
+/** Índice de la planta por id: nombrar una fila no recorre la planta entera. */
+export function buildPayrollEmployeeIndex(
+  employees: readonly PayrollEmployeeView[],
+): Map<string, PayrollEmployeeView> {
+  const index = new Map<string, PayrollEmployeeView>();
+  for (const employee of employees) index.set(employee.id, employee);
+  return index;
+}
+
+/**
+ * Nombre legible del empleado: nombre + ID interno (el `employee_code`; si no
+ * está definido, el documento), igual que en vales, para distinguir homónimos.
+ * Un id que no está en la planta (un empleado dado de baja y borrado) cae al
+ * fragmento del id: es una degradación EXPLÍCITA, nunca un nombre inventado.
+ */
+export function payrollEmployeeName(
+  index: ReadonlyMap<string, PayrollEmployeeView>,
+  id: string,
+): string {
+  const found = index.get(id);
+  if (!found) return id.slice(0, 8);
+  const internalId = found.employee_code ? found.employee_code : found.document;
+  return `${found.full_name} (${internalId})`;
+}

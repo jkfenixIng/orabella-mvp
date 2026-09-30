@@ -6,6 +6,7 @@ import {
   assertPortionsMatchNet,
   buildEmployeeCommissionDetail,
   buildEmployeeDetail,
+  buildPayrollMonthToDate,
   calculatePayrollSchema,
   canDiscountVoucher,
   capPayrollDiscounts,
@@ -28,6 +29,7 @@ import {
   resolveVoucherInitialStatus,
   restoreVoucherStatus,
   roundMoney,
+  summarizePayrollItems,
   voucherApprovalCashOutViolation,
   voucherLimitsSchema,
   weekStartOf,
@@ -35,6 +37,7 @@ import {
   type DetailLine,
   type OpenPeriodInput,
   type PayrollExtraKind,
+  type PayrollMonthEmployeeRow,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { commissionRuleKey, type RuleRate } from "@/src/features/commissions/schemas";
@@ -580,17 +583,37 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
   }
 }
 
-/** Lista los periodos de la sede (más recientes primero, máx. 20). */
+/**
+ * Lista TODOS los períodos de la sede (más recientes primero).
+ *
+ * PA3: antes tenía `.limit(20)` y eso no era un tope de presentación, era un
+ * tope de HISTORIA: la pantalla se quedaba con los 20 últimos sin total, sin
+ * conteo y sin aviso, así que la sede con más de 20 períodos perdía los viejos
+ * de la vista y nada lo decía. El conjunto está acotado por la sede (un día se
+ * nomina una sola vez), así que lo correcto es leerlo entero por páginas y con
+ * `order()` determinista: sin el desempate por `id`, dos períodos con la misma
+ * fecha de inicio pueden caer en páginas distintas y repetirse o perderse.
+ */
 export async function listPeriods(sedeId: string): Promise<PayrollPeriodRow[]> {
-  const db = await payrollDb();
-  const { data, error } = await db
-    .from("payroll_periods")
-    .select(PERIOD_SELECT)
-    .eq("sede_id", sedeId)
-    .order("start_date", { ascending: false })
-    .limit(20);
-  if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as PayrollPeriodRow[];
+  try {
+    const db = await payrollDb();
+    return await readAllPayroll<PayrollPeriodRow>({
+      log: "listPeriods",
+      what: "períodos de la sede",
+      meta: { sede: sedeId },
+      table: "payroll_periods",
+      fetchPage: (from, to) =>
+        db
+          .from("payroll_periods")
+          .select(PERIOD_SELECT)
+          .eq("sede_id", sedeId)
+          .order("start_date", { ascending: false })
+          .order("id")
+          .range(from, to),
+    });
+  } catch (error) {
+    throw toPayrollError(error);
+  }
 }
 
 async function getPeriodOrThrow(db: DbClient, sedeId: string, id: string): Promise<PayrollPeriodRow> {
@@ -686,6 +709,131 @@ export async function getPeriodDetail(sedeId: string, id: string): Promise<Perio
   } catch (error) {
     // "No se pudo leer" no puede llegar como INTERNAL genérico: el código
     // READ_INCOMPLETE y la tabla/fila donde se cortó son lo accionable.
+    throw toPayrollError(error);
+  }
+}
+
+/** Ítem de nómina con lo pagado ya resuelto (lo que la vista muestra). */
+type PaidPayrollItem = PayrollItemRow & { paid: number };
+
+/**
+ * PA3: el resumen de un período —se lee sin abrirlo— y el mes a la fecha por
+ * empleado. Los períodos y el resumen salen de UNA lectura, así que la lista
+ * sabe cuántos hay sin depender de cuántos alcanzó a leer.
+ */
+export interface PayrollPeriodSummary {
+  period: PayrollPeriodRow;
+  employeeCount: number;
+  netTotal: number;
+  paidTotal: number;
+  remainingTotal: number;
+}
+
+export interface PayrollOverview {
+  summaries: PayrollPeriodSummary[];
+  months: PayrollMonthEmployeeRow[];
+}
+
+/**
+ * Los ítems de VARIOS períodos con lo pagado de cada uno resuelto.
+ *
+ * Mismas dos reglas que `getPeriodDetail`, que es plata: los ids van en lotes
+ * del tamaño que aguanta la URL (una lista sin tope termina en 414 y la
+ * lectura no ocurre) y cada lote se pagina hasta agotar, con `order("id")` para
+ * que dos corridas lean lo mismo. El fallo de cualquiera de las dos lecturas se
+ * PROPAGA (`PagedReadError`): la vista no se arma con un total calculado sobre
+ * un conjunto recortado.
+ */
+async function readPaidItemsOfPeriods(args: {
+  db: DbClient;
+  periodIds: readonly string[];
+  log: string;
+  meta: Record<string, unknown>;
+}): Promise<PaidPayrollItem[]> {
+  const items: PayrollItemRow[] = [];
+  for (const chunk of chunkIds(args.periodIds)) {
+    const rows = await readAllPayroll<PayrollItemRow>({
+      log: args.log,
+      what: "ítems de los períodos",
+      meta: { ...args.meta, periods: args.periodIds.length, ids: chunk.length },
+      table: "payroll_items",
+      fetchPage: (from, to) =>
+        args.db
+          .from("payroll_items")
+          .select(ITEM_SELECT)
+          .in("period_id", chunk)
+          .order("id")
+          .range(from, to),
+    });
+    items.push(...rows);
+  }
+
+  const paidByItem = new Map<string, number>();
+  for (const chunk of chunkIds(items.map((row) => row.id))) {
+    const payments = await readAllPayroll<{ payroll_item_id: string; amount: number | string }>({
+      log: args.log,
+      what: "pagos de los períodos",
+      meta: { ...args.meta, items: items.length, ids: chunk.length },
+      table: "payroll_payments",
+      fetchPage: (from, to) =>
+        args.db
+          .from("payroll_payments")
+          .select("payroll_item_id, amount")
+          .in("payroll_item_id", chunk)
+          .order("id")
+          .range(from, to),
+    });
+    for (const row of payments) {
+      paidByItem.set(
+        row.payroll_item_id,
+        roundMoney((paidByItem.get(row.payroll_item_id) ?? 0) + Number(row.amount)),
+      );
+    }
+  }
+
+  return items.map((item) => ({ ...item, paid: paidByItem.get(item.id) ?? 0 }));
+}
+
+/**
+ * PA3: la vista COMPLETA de la nómina de una sede, en una lectura y con dos
+ * proyecciones de los mismos datos: los totales por período y el mes a la fecha
+ * por empleado. Nada de esto mueve plata: es lectura y presentación, y las
+ * sumas quedan en peso entero (dentro de los derivadores puros de `schemas`).
+ *
+ * OJO — AUTORIZACIÓN: el resumen agrega plata de TODA la planta. Es la misma
+ * superficie que el detalle SIN alcance por fila
+ * (`GET /api/v1/payroll-periods/[id]`), así que quien llama decide: la página
+ * sólo la usa para el admin y al empleado le manda nada más que su propia fila.
+ */
+export async function listPayrollOverview(sedeId: string): Promise<PayrollOverview> {
+  try {
+    // `listPeriods` ya es exhaustiva: si se recorta, esto se cae a la vista.
+    const periods = await listPeriods(sedeId);
+    if (periods.length === 0) return { summaries: [], months: [] };
+
+    const db = await payrollDb();
+    const items = await readPaidItemsOfPeriods({
+      db,
+      periodIds: periods.map((period) => period.id),
+      log: "listPayrollOverview",
+      meta: { sede: sedeId },
+    });
+
+    const byPeriod = new Map<string, PaidPayrollItem[]>();
+    for (const item of items) {
+      const bucket = byPeriod.get(item.period_id);
+      if (bucket) bucket.push(item);
+      else byPeriod.set(item.period_id, [item]);
+    }
+
+    return {
+      summaries: periods.map((period) => ({
+        period,
+        ...summarizePayrollItems(byPeriod.get(period.id) ?? []),
+      })),
+      months: buildPayrollMonthToDate({ periods, items }),
+    };
+  } catch (error) {
     throw toPayrollError(error);
   }
 }
