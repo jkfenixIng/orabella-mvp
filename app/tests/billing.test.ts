@@ -1214,9 +1214,84 @@ const overCollectionStub = vi.hoisted(() => ({
   auditInsert: null as Record<string, unknown> | null,
   /** Escrituras observadas, en orden (`tabla.op`). */
   writes: [] as string[],
+  /**
+   * CL-12: impuestos ACTIVOS de la sede (lo que responde `listTaxes`). Vacío en
+   * todos los bloques menos el de la edición libre, que necesita un snapshot de
+   * impuestos NO vacío para poder probar que el reemplazo es todo-o-nada.
+   */
+  taxes: [] as Array<{
+    code: string;
+    name: string;
+    percent: number;
+    is_active: boolean;
+  }>,
   /** Consultas que el doble no sabe responder: debe quedar SIEMPRE vacío. */
   unexpectedQueries: [] as string[],
 }));
+
+/**
+ * CL-11: cola de locks por FILA. Modela el `SELECT … FOR UPDATE` de la
+ * transacción de la 050: el segundo llamador ESPERA a que el primero suelte la
+ * fila, en vez de leer su estado viejo y escribir por su lado. Es lo que hace
+ * observable la serialización (y lo que impide el intercalado que producía el
+ * estado parcial). Devuelve también si TUVO que esperar, para poder trazarlo.
+ */
+function createRowLocks(): (
+  key: string,
+  onContended: () => void,
+) => Promise<{ release: () => void; waited: boolean }> {
+  const held = new Map<string, Promise<void>>();
+  return async (key, onContended) => {
+    const previous = held.get(key);
+    if (previous) onContended();
+    let release: () => void = () => {};
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const queue = (previous ?? Promise.resolve()).then(() => current);
+    held.set(key, queue);
+    await previous;
+    return {
+      waited: previous !== undefined,
+      release: () => {
+        release();
+        if (held.get(key) === queue) held.delete(key);
+      },
+    };
+  };
+}
+
+/**
+ * CL-11: los locks por fila son de MÓDULO, no del doble.
+ *
+ * `createAdminClient()` devuelve una instancia nueva en cada llamada al servicio
+ * (`billingDb()`), así que un mapa por instancia no serializaría NADA: dos
+ * llamadas al mismo servicio tendrían cada una su cola. En la base el lock es
+ * uno solo —la fila—, y eso es lo que el doble tiene que modelar.
+ */
+const annulRowLocks = createRowLocks();
+const splitRowLocks = createRowLocks();
+/**
+ * CL-12: el lock de la fila de la FACTURA en las dos ediciones. Es el MISMO
+ * candado que la 038 pedía desde el cliente (`edit_version`), ahora tomado por
+ * `SELECT … FOR UPDATE` dentro de la transacción (051): la edición que llega
+ * segunda ESPERA a la primera en vez de leer su estado viejo y escribir por su
+ * lado.
+ */
+const editRowLocks = createRowLocks();
+
+/**
+ * Espera —con techo— a que el doble registre algo. Se usa para aseverar un
+ * intercalado ("la segunda edición quedó esperando el lock") sin depender de un
+ * tick ni de un temporizador fijo.
+ */
+async function waitFor(predicate: () => boolean, budgetMs = 400): Promise<boolean> {
+  const deadline = Date.now() + budgetMs;
+  while (!predicate() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return predicate();
+}
 
 /**
  * Datos paginables del candado de nómina (U5). Solo las tablas registradas acá
@@ -1274,6 +1349,28 @@ const annulStub = vi.hoisted(() => ({
   releaseWrite: null as (() => void) | null,
   /** Aviso: hay una escritura detenida esperando a que el test la libere. */
   onWriteHeld: null as (() => void) | null,
+  /**
+   * CL-11: el N-ésimo movimiento de reversión NO se puede escribir (la
+   * conexión se corta, el trigger rechaza). Es el fallo que cae ENTRE las dos
+   * escrituras de la anulación y deja el estado parcial: sirve para medir la
+   * ventana hoy y para probar el rollback después. `null` = no se inyecta.
+   */
+  failMovementAt: null as number | null,
+  /**
+   * CL-11: traza del RPC `invoice_annul_atomic`, en orden. `wait` = el llamador
+   * encontró el lock de la fila tomado (en vez de leer el estado viejo) y
+   * `resume` = lo obtuvo; `commit` = la transacción escribió y confirmó. Es la
+   * prueba de que la segunda anulación ESPERA a la primera.
+   */
+  rpcEvents: [] as string[],
+  /** CL-11: transacciones de anulación que CONFIRMARON (escribieron filas). */
+  commits: 0,
+  /**
+   * CL-11: aviso de que una anulación quedó ESPERANDO el lock de la fila. El
+   * test lo espera para aseverar el intercalado sin depender de un tick: sin
+   * esto, la aserción podría correr antes de que la segunda llegue al RPC.
+   */
+  onLockWait: null as (() => void) | null,
 }));
 
 /**
@@ -1318,9 +1415,71 @@ const editStub = vi.hoisted(() => ({
   onWriteHeld: null as (() => void) | null,
   /** Fila de `products` (el stock que la edición ajusta). */
   product: null as Record<string, unknown> | null,
+  /**
+   * CL-12: los productos de la sede que la consulta PIDE (`.in("id", …)`), para
+   * que una edición pueda tocar DOS productos y escribir DOS movimientos: con
+   * una sola fila fija, el "stock a medias" de una edición multi-producto no se
+   * puede medir. Vacío = se usa `product` (los bloques de antes).
+   */
+  products: [] as Array<Record<string, unknown>>,
   /** Líneas de `invoice_items` por factura; ausente = la línea de siempre. */
   itemsByInvoice: {} as Record<string, Array<Record<string, unknown>>>,
+
+  /**
+   * CL-12: `invoice_taxes` por factura. La edición libre REEMPLAZA el snapshot
+   * (borra el que leyó e inserta el que computó), así que el doble tiene que
+   * poder mostrar las filas que quedaron: sin eso, "no se escribió nada" y "se
+   * escribió todo" se verían iguales.
+   */
+  taxesByInvoice: {} as Record<string, Array<Record<string, unknown>>>,
+  /**
+   * CL-12: la escritura de ESTE grupo no se puede aplicar. En la ruta VIEJA —la
+   * que mide el RED— cada escritura es un request suelto desde el cliente; en la
+   * transacción (051) es un GRUPO de escritura. El nombre del grupo es el MISMO
+   * en las dos rutas, para que la prueba del antes y la del después se lean
+   * igual (el mapa está en `legacyEditWriteFails`).
+   */
+  failWriteKind: null as EditWriteKind | null,
+  /**
+   * Con `failWriteKind = "movements"`: cuál de los N movimientos (0 = el
+   * primero). En la ruta vieja cada movimiento es un request y el N-ésimo es el
+   * que falla —el stock queda A MEDIAS—; en la transacción los N son UNA
+   * sentencia y el grupo falla entero (el offset no elige una fila: dentro de
+   * una sentencia no hay filas a medio escribir).
+   */
+  failWriteOffset: 0,
+  /**
+   * CL-12: traza del RPC de edición, en orden. `wait` = el llamador encontró el
+   * lock de la fila tomado; `resume` = lo obtuvo; `commit` = la transacción
+   * escribió y confirmó; `reject` = la precondición o un grupo la abortaron.
+   */
+  rpcEvents: [] as string[],
+  /** CL-12: transacciones de edición que CONFIRMARON (escribieron filas). */
+  commits: 0,
+  /** Aviso: una edición quedó ESPERANDO el lock de la fila. */
+  onLockWait: null as (() => void) | null,
 }));
+
+/**
+ * CL-12: el doble modela las DOS rutas de la edición a propósito.
+ *
+ * La de HOY es la transacción del RPC (los tres campos de arriba), y es la que
+ * usan los describes. La de ANTES —la que la edición escribía desde el cliente—
+ * sigue modelada (`editVersionResponse`, el `insert()` de movimientos y
+ * `legacyEditWriteFails`) porque es la que hace REPRODUCIBLE el RED: con el
+ * código previo a la 051, `editStub.failWriteKind` cae en la escritura de
+ * cliente equivalente y el test vuelve a medir los ítems escritos, el stock a
+ * medias y el token avanzado. Sin eso, la medición del defecto se perdería.
+ */
+type EditWriteKind =
+  | "invoice"
+  | "taxes-remove"
+  | "taxes-insert"
+  | "items-remove"
+  | "items-update"
+  | "items-insert"
+  | "payments"
+  | "movements";
 
 /**
  * MO-1: estado propio del camino de EMISIÓN (idempotencia de la factura).
@@ -1461,6 +1620,12 @@ function stubPayment(amount: number, feeAmount = 0) {
 function createOverCollectionStubClient(): unknown {
   const zeroRowsError = { code: "PGRST116", message: "JSON object requested, multiple (or no) rows returned", details: "The result contains 0 rows", hint: null };
 
+  /**
+   * CL-11: el error de escritura inyectado por `annulStub.failMovementAt`. Se
+   * consume UNA sola vez, en la escritura que lo armó.
+   */
+  let forcedWriteError: { code: string; message: string } | null = null;
+
   /** Contexto que la consulta encadenada le pasa a `response`. */
   interface QueryContext {
     /** Guarda de estado del UPDATE de anulación (U6). */
@@ -1473,6 +1638,8 @@ function createOverCollectionStubClient(): unknown {
     itemsInvoiceId?: string;
     /** `.single()`/`.maybeSingle()`: PostgREST devuelve una fila, no una lista. */
     single: boolean;
+    /** CL-12: ids que la consulta de `products` pidió (`.eq`/`.in`). */
+    productIds?: string[];
   }
 
   /**
@@ -1507,6 +1674,35 @@ function createOverCollectionStubClient(): unknown {
     return { data: row(), error: null };
   };
 
+  /**
+   * CL-12 (ruta VIEJA, la que mide el RED): a qué escritura de cliente
+   * corresponde cada GRUPO de la transacción. Es el mismo nombre de grupo en las
+   * dos rutas, así que la prueba del antes y la del después se leen igual.
+   *
+   * `movements` NO está acá: el N-ésimo movimiento se cae al construir el INSERT
+   * (si no, la fila quedaría contada como escrita cuando la escritura falló).
+   */
+  const legacyEditWriteFails = (table: string, op: string): boolean => {
+    switch (editStub.failWriteKind) {
+      case "invoice":
+        return table === "invoices" && op === "update";
+      case "taxes-remove":
+        return table === "invoice_taxes" && op === "delete";
+      case "taxes-insert":
+        return table === "invoice_taxes" && op === "insert";
+      case "items-remove":
+        return table === "invoice_items" && op === "delete";
+      case "items-update":
+        return table === "invoice_items" && op === "update";
+      case "items-insert":
+        return table === "invoice_items" && op === "insert";
+      case "payments":
+        return table === "invoice_payments" && op === "update";
+      default:
+        return false;
+    }
+  };
+
   const response = (
     table: string,
     op: string,
@@ -1514,6 +1710,20 @@ function createOverCollectionStubClient(): unknown {
   ): { data: unknown; error: unknown } => {
     if (op !== "select") {
       overCollectionStub.writes.push(`${table}.${op}`);
+      // CL-11: el fallo inyectado aborta ESTA escritura (y sólo el camino que
+      // la pidió): es el fallo que hoy cae entre las dos escrituras.
+      if (forcedWriteError) {
+        const injected = forcedWriteError;
+        forcedWriteError = null;
+        return { data: null, error: injected };
+      }
+      // CL-12: el fallo de la EDICIÓN, escrito como grupo. En la ruta vieja
+      // —la de hoy— cada grupo de la transacción es un request suelto: acá es
+      // donde se puede medir que un fallo a mitad de la secuencia deja los
+      // ítems y el stock a medias con la versión ya avanzada.
+      if (editStub.active && legacyEditWriteFails(table, op)) {
+        return { data: null, error: { code: "08006", message: "connection closed" } };
+      }
       if (table === "invoices" && op === "update") {
         // CO-1: camino de EDICIÓN (compare-and-swap sobre `edit_version`).
         if (editStub.active) {
@@ -1579,14 +1789,33 @@ function createOverCollectionStubClient(): unknown {
             error: null,
           };
         }
-        return { data: stubInvoiceRow(STUB_EMITTED_TOTAL), error: null };
-      case "products":
-        if (editStub.active) {
-          // `getProductsStock` (lista) y `getProduct` (fila) comparten tabla.
-          if (ctx.single) return { data: editStub.product, error: null };
-          return { data: editStub.product ? [editStub.product] : [], error: null };
-        }
-        return { data: annulStub.product, error: null };
+        return {
+          data: {
+            ...stubInvoiceRow(STUB_EMITTED_TOTAL),
+            // CL-12: la versión REAL de la fila, también fuera del bloque de
+            // edición: la transacción escribe `edit_version` y una lectura
+            // posterior tiene que ver lo que se escribió.
+            edit_version: editStub.versions[ctx.rowId ?? overCollectionStub.INVOICE_ID] ?? 0,
+          },
+          error: null,
+        };
+      case "products": {
+        if (!editStub.active) return { data: annulStub.product, error: null };
+        // `getProductsStock` (lista, por `.in("id", …)`) y `getProduct` (fila,
+        // por `.eq("id", …)`) comparten tabla: el doble sirve las filas que la
+        // consulta PIDE —no una sola fija— porque una edición puede tocar DOS
+        // productos (y escribir DOS movimientos de stock).
+        const rows =
+          editStub.products.length > 0
+            ? editStub.products
+            : editStub.product
+              ? [editStub.product]
+              : [];
+        const wanted = ctx.productIds ?? [];
+        const match = wanted.length > 0 ? rows.filter((row) => wanted.includes(String(row.id))) : rows;
+        if (ctx.single) return { data: match[0] ?? null, error: null };
+        return { data: match, error: null };
+      }
       case "invoice_items":
         if (commissionStub.items) return { data: commissionStub.items, error: null };
         if (annulStub.active && annulStub.items) return { data: annulStub.items, error: null };
@@ -1595,8 +1824,10 @@ function createOverCollectionStubClient(): unknown {
           return { data: editStub.itemsByInvoice[id] ?? [stubItemRow()], error: null };
         }
         return { data: [stubItemRow()], error: null };
-      case "invoice_taxes":
-        return { data: [], error: null };
+      case "invoice_taxes": {
+        const id = ctx.itemsInvoiceId ?? overCollectionStub.INVOICE_ID;
+        return { data: editStub.taxesByInvoice[id] ?? [], error: null };
+      }
       case "invoice_payments":
         return { data: overCollectionStub.payments, error: null };
       case "commission_rules":
@@ -1677,6 +1908,8 @@ function createOverCollectionStubClient(): unknown {
     let rowId: string | undefined;
     /** `invoice_id` del `.eq("invoice_id", …)` de esta consulta (CO-1). */
     let itemsInvoiceId: string | undefined;
+    /** CL-12: ids del `.eq`/`.in` de `products` (qué filas sirve el doble). */
+    let productIds: string[] | undefined;
     // `select(cols, { count, head })`: PostgREST responde el total sin filas.
     let countRequested = false;
     let headOnly = false;
@@ -1686,7 +1919,7 @@ function createOverCollectionStubClient(): unknown {
       const result =
         op === "select" && pagedStub.tables[table]
           ? pagedResponse(table, { filters, orderKeys, rangeFrom, rangeTo, single })
-          : response(table, op, { statusGuard, versionGuard, rowId, itemsInvoiceId, single });
+          : response(table, op, { statusGuard, versionGuard, rowId, itemsInvoiceId, single, productIds });
       if (!countRequested) return result;
       return {
         data: headOnly ? null : (result as { data?: unknown }).data,
@@ -1729,6 +1962,17 @@ function createOverCollectionStubClient(): unknown {
         if (table === "inventory_movements") {
           const movement = (payload ?? {}) as Record<string, unknown>;
           const log = editStub.active ? editStub.movements : annulStub.movements;
+          // CL-11: la N-ésima reversión no se escribe: el fallo cae a mitad del
+          // bucle de `registerMovement` (hoy) o dentro de la transacción (050).
+          // CL-12: lo mismo para el N-ésimo movimiento de una EDICIÓN —el fallo
+          // que hoy cae entre los ítems y el stock—, con `failWriteOffset`.
+          const lateMovementFailure = editStub.active
+            ? editStub.failWriteKind === "movements" && log.length === editStub.failWriteOffset
+            : annulStub.failMovementAt === log.length + 1;
+          if (lateMovementFailure) {
+            forcedWriteError = { code: "08006", message: "connection closed" };
+            return query;
+          }
           log.push({
             id: `mov-${log.length + 1}`,
             created_at: "2026-01-01T00:00:00.000Z",
@@ -1760,11 +2004,13 @@ function createOverCollectionStubClient(): unknown {
           if (editStub.active) editStub.versionGuards.push(Number(value));
         }
         if (table === "invoice_items" && column === "invoice_id") itemsInvoiceId = String(value);
+        if (table === "products" && column === "id") productIds = [String(value)];
         filters.push((row) => row[column] === value);
         return query;
       },
       in: (column: string, values: readonly unknown[]) => {
         if (table === "commission_rules") commissionStub.inSizes.push(values.length);
+        if (table === "products" && column === "id") productIds = values.map(String);
         pagedStub.inFilters.push({ table, column, count: values.length });
         const set = new Set(values);
         filters.push((row) => set.has(row[column]));
@@ -1794,7 +2040,340 @@ function createOverCollectionStubClient(): unknown {
     return query;
   };
 
-  return { from };
+  /**
+   * CL-12: `invoice_edit_items_atomic` / `invoice_edit_emitted_atomic` (051).
+   *
+   * El doble modela la TRANSACCIÓN y, sobre todo, el REEMPLAZO: los ítems —y el
+   * snapshot de impuestos— son una colección que se REEMPLAZA (se borra la que
+   * se leyó y se inserta la nueva), no un apéndice. Por eso trabaja sobre un
+   * estado APARTE (`staged`) y sólo lo publica si TODOS los grupos aplicaron: un
+   * grupo que falla no deja medio reemplazo, deja el reemplazo entero sin hacer
+   * —la colección anterior, intacta—. Un doble que escribiera directo sobre
+   * `editStub.itemsByInvoice` no podría representar eso: el fallo de la segunda
+   * mitad del reemplazo ya habría borrado la primera, que es exactamente el
+   * estado a medias que este bloque mide.
+   */
+  const runEditTransaction = async (
+    isEmittedEdit: boolean,
+    args?: Record<string, unknown>,
+  ): Promise<{ data: unknown; error: unknown }> => {
+    const edit = (args?.p_edit ?? {}) as Record<string, unknown>;
+    const id = String(args?.p_invoice_id ?? overCollectionStub.INVOICE_ID);
+    const sedeId = String(args?.p_sede_id ?? overCollectionStub.SEDE_ID);
+    const userId = args?.p_user_id ?? null;
+    const expectedVersion = Number(args?.p_expected_version ?? 0);
+    const expectedStatus = String(args?.p_expected_status ?? "Emitida");
+
+    const release = await editRowLocks(id, () => {
+      editStub.rpcEvents.push("wait");
+      editStub.onLockWait?.();
+    });
+    editStub.rpcEvents.push(release.waited ? "resume" : "lock");
+    try {
+      // Donde el test detiene la transacción: con el lock de la fila TOMADO y
+      // antes de releer la precondición. Es el intercalado real de CL-1 (la
+      // factura se anula entre la lectura del servicio y la transacción) y el de
+      // CO-1 (la segunda edición espera este lock).
+      if (editStub.holdNextWrite) {
+        editStub.holdNextWrite = false;
+        await new Promise<void>((resolve) => {
+          editStub.releaseWrite = resolve;
+          editStub.onWriteHeld?.();
+        });
+      }
+      // La precondición del candado (versión + estado), RELEÍDA de la fila
+      // BLOQUEADA y no del dato que mandó el llamador: es la mitad que el
+      // servicio ya decidió y la 051 la repite adentro.
+      editStub.versionGuards.push(expectedVersion);
+      editStub.statusGuards.push(expectedStatus);
+      if (
+        editStub.staleGuard ||
+        (editStub.versions[id] ?? 0) !== expectedVersion ||
+        (editStub.statuses[id] ?? "Emitida") !== expectedStatus
+      ) {
+        editStub.rpcEvents.push("reject");
+        editStub.events.push("write");
+        return { data: null, error: { code: "P0001", message: "EDIT_CONFLICT" } };
+      }
+
+      const list = (key: string): Array<Record<string, unknown>> =>
+        Array.isArray(edit[key]) ? (edit[key] as Array<Record<string, unknown>>) : [];
+      const removeIds = list("items_remove").map((row) => String(row));
+      const updates = list("items_update");
+      const inserts = list("items_insert");
+      const paymentsPayload = list("payments");
+      const movementsPayload = list("movements");
+      const taxesRemoveIds = list("taxes_remove").map((row) => String(row));
+      const taxesPayload = list("taxes");
+      const totals = (edit.totals ?? {}) as Record<string, unknown>;
+
+      const staged = {
+        items: [...(editStub.itemsByInvoice[id] ?? [stubItemRow()])],
+        taxes: [...(editStub.taxesByInvoice[id] ?? [])],
+        payments: overCollectionStub.payments.map((row) => ({ ...row })) as Array<
+          Record<string, unknown>
+        >,
+        movements: [] as Array<Record<string, unknown>>,
+        invoiceUpdate: {} as Record<string, unknown>,
+        itemsWritten: 0,
+      };
+
+      // Los grupos, uno por sentencia de la 051 y en su MISMO orden.
+      const groups: Array<{ kind: EditWriteKind; trace: string; run: () => void }> = [];
+      groups.push({
+        kind: "invoice",
+        trace: "invoices.update",
+        run: () => {
+          // La edición ADMIN escribe SÓLO el token: el total es inmutable y su
+          // función no tiene un grupo capaz de escribir dinero. La LIBRE
+          // reescribe los totales en la MISMA sentencia que el token.
+          staged.invoiceUpdate = isEmittedEdit
+            ? {
+                edit_version: expectedVersion + 1,
+                subtotal: totals.subtotal,
+                discount: totals.discount,
+                tax: totals.tax,
+                surcharge: totals.surcharge,
+                total: totals.total,
+              }
+            : { edit_version: expectedVersion + 1 };
+        },
+      });
+      if (isEmittedEdit) {
+        groups.push({
+          kind: "taxes-remove",
+          trace: "invoice_taxes.delete",
+          run: () => {
+            staged.taxes = staged.taxes.filter((row) => !taxesRemoveIds.includes(String(row.id)));
+          },
+        });
+        groups.push({
+          kind: "taxes-insert",
+          trace: "invoice_taxes.insert",
+          run: () => {
+            staged.taxes = taxesPayload.map((tax, index) => ({
+              id: `tax-${id}-${index + 1}`,
+              invoice_id: id,
+              tax_code: tax.tax_code,
+              tax_name: tax.tax_name,
+              percent: tax.percent,
+              amount: tax.amount,
+            }));
+          },
+        });
+      }
+      groups.push({
+        kind: "items-remove",
+        trace: "invoice_items.delete",
+        run: () => {
+          staged.items = staged.items.filter((row) => !removeIds.includes(String(row.id)));
+          staged.itemsWritten += removeIds.length;
+        },
+      });
+      groups.push({
+        kind: "items-update",
+        trace: "invoice_items.update",
+        run: () => {
+          for (const update of updates) {
+            const index = staged.items.findIndex((row) => String(row.id) === String(update.id));
+            if (index === -1) continue;
+            staged.items[index] = { ...staged.items[index], ...update };
+          }
+          staged.itemsWritten += updates.length;
+        },
+      });
+      groups.push({
+        kind: "items-insert",
+        trace: "invoice_items.insert",
+        run: () => {
+          for (const item of inserts) {
+            staged.items.push({
+              id: `item-${id}-${staged.items.length + 1}`,
+              invoice_id: id,
+              created_at: "2026-01-01T00:00:00.000Z",
+              employees: {
+                full_name: "Empleada de prueba",
+                employee_code: "E-01",
+                commission_percent: 35,
+                pay_type: "porcentaje",
+                payout_mode: "normal",
+              },
+              ...item,
+            });
+          }
+          staged.itemsWritten += inserts.length;
+        },
+      });
+      groups.push({
+        kind: "payments",
+        trace: "invoice_payments.update",
+        run: () => {
+          for (const payment of paymentsPayload) {
+            const index = staged.payments.findIndex((row) => String(row.id) === String(payment.id));
+            if (index === -1) continue;
+            staged.payments[index] = {
+              ...staged.payments[index],
+              method_code: payment.method_code,
+              method_id: payment.method_id,
+            };
+          }
+        },
+      });
+      groups.push({
+        kind: "movements",
+        trace: "inventory_movements.insert",
+        run: () => {
+          for (const movement of movementsPayload) {
+            staged.movements.push({
+              id: `mov-${id}-${staged.movements.length + 1}`,
+              created_at: "2026-01-01T00:00:00.000Z",
+              sede_id: sedeId,
+              product_id: movement.product_id,
+              type: movement.type,
+              qty: movement.qty,
+              reason: movement.reason,
+              user_id: userId,
+              idempotency_key: null,
+            });
+          }
+        },
+      });
+
+      for (const group of groups) {
+        // La escritura se PIDIÓ (queda trazada aunque revierta), pero si es el
+        // grupo que el test marcó como imposible, la transacción aborta y NADA
+        // de lo staged se publica.
+        overCollectionStub.writes.push(group.trace);
+        if (editStub.failWriteKind === group.kind) {
+          editStub.rpcEvents.push("reject");
+          return { data: null, error: { code: "08006", message: "connection closed" } };
+        }
+        group.run();
+      }
+
+      // COMMIT: se publica el estado staged, ENTERO.
+      editStub.versions[id] = expectedVersion + 1;
+      editStub.itemsByInvoice[id] = staged.items;
+      editStub.taxesByInvoice[id] = staged.taxes;
+      overCollectionStub.payments = staged.payments as typeof overCollectionStub.payments;
+      editStub.movements.push(...staged.movements);
+      overCollectionStub.invoiceUpdate = staged.invoiceUpdate;
+      editStub.events.push("write");
+      editStub.commits += 1;
+      editStub.rpcEvents.push("commit");
+      const total = isEmittedEdit ? Number(totals.total ?? STUB_EMITTED_TOTAL) : STUB_EMITTED_TOTAL;
+      return {
+        data: {
+          invoice: {
+            ...stubInvoiceRow(total),
+            id,
+            status: expectedStatus,
+            edit_version: expectedVersion + 1,
+            ...(isEmittedEdit
+              ? {
+                  subtotal: totals.subtotal,
+                  discount: totals.discount,
+                  tax: totals.tax,
+                  surcharge: totals.surcharge,
+                  total: totals.total,
+                }
+              : {}),
+          },
+          items: staged.itemsWritten,
+          movements: staged.movements.length,
+        },
+        error: null,
+      };
+    } finally {
+      release.release();
+    }
+  };
+
+  /**
+   * CL-11: `invoice_annul_atomic` (050). El doble modela la TRANSACCIÓN: toma el
+   * lock de la fila de la factura, RELEE la precondición sobre la fila bloqueada
+   * y aplica sus DOS grupos de escritura —la factura y las reversiones de
+   * stock— o ninguno. Escribe las MISMAS filas que el camino viejo (el payload
+   * de `overCollectionStub.invoiceUpdate` y las de `annulStub.movements`), así
+   * que las aserciones de "exactamente lo mismo" siguen significando lo mismo.
+   */
+  const rpc = async (name: string, args?: Record<string, unknown>) => {
+    // CL-12: las dos ediciones, cada una UNA transacción.
+    if (name === "invoice_edit_items_atomic") return runEditTransaction(false, args);
+    if (name === "invoice_edit_emitted_atomic") return runEditTransaction(true, args);
+    if (name !== "invoice_annul_atomic") {
+      overCollectionStub.unexpectedQueries.push(`rpc.${name}`);
+      return { data: null, error: { message: `doble sin respuesta para rpc.${name}` } };
+    }
+    const invoiceId = String(args?.p_invoice_id ?? "");
+    const expected = String(args?.p_expected_status ?? "");
+    const release = await annulRowLocks(invoiceId, () => {
+      annulStub.rpcEvents.push("wait");
+      annulStub.onLockWait?.();
+    });
+    annulStub.rpcEvents.push(release.waited ? "resume" : "lock");
+    try {
+      // La precondición, releída de la fila BLOQUEADA (no del dato del llamador).
+      annulStub.guards.push(expected);
+      if (annulStub.updateMisses || annulStub.invoiceStatus !== expected) {
+        annulStub.rpcEvents.push("reject");
+        return { data: null, error: { code: "P0001", message: "ANNUL_CONFLICT" } };
+      }
+      const items = (args?.p_items ?? []) as Array<Record<string, unknown>>;
+      // El fallo inyectado: la transacción no puede terminar su segundo grupo
+      // (los movimientos), así que NO se aplica ninguno de los dos.
+      if (annulStub.failMovementAt !== null && annulStub.failMovementAt <= items.length) {
+        return { data: null, error: { code: "08006", message: "connection closed" } };
+      }
+      // Donde el test detiene la transacción: después del lock, antes de escribir.
+      if (annulStub.holdNextWrite) {
+        annulStub.holdNextWrite = false;
+        await new Promise<void>((resolve) => {
+          annulStub.releaseWrite = resolve;
+          annulStub.onWriteHeld?.();
+        });
+      }
+      // COMMIT: los dos grupos, o nada.
+      const motivo = String(args?.p_motivo ?? "");
+      overCollectionStub.invoiceUpdate = {
+        status: "Anulada",
+        cancel_reason: motivo,
+        closed_by: args?.p_user_id ?? null,
+        closed_at: args?.p_closed_at ?? null,
+      };
+      overCollectionStub.writes.push("invoices.update", "inventory_movements.insert");
+      annulStub.invoiceStatus = "Anulada";
+      for (const item of items) {
+        annulStub.movements.push({
+          id: `mov-${annulStub.movements.length + 1}`,
+          created_at: "2026-01-01T00:00:00.000Z",
+          sede_id: overCollectionStub.SEDE_ID,
+          product_id: item.product_id,
+          type: "IN",
+          qty: item.qty,
+          reason: item.reason,
+          user_id: args?.p_user_id ?? null,
+          idempotency_key: null,
+        });
+      }
+      annulStub.commits += 1;
+      annulStub.rpcEvents.push("commit");
+      return {
+        data: {
+          ...stubInvoiceRow(STUB_EMITTED_TOTAL),
+          status: "Anulada",
+          cancel_reason: motivo,
+          closed_by: args?.p_user_id ?? null,
+          closed_at: args?.p_closed_at ?? null,
+        },
+        error: null,
+      };
+    } finally {
+      release.release();
+    }
+  };
+
+  return { from, rpc };
 }
 
 /**
@@ -2066,6 +2645,19 @@ const payStub = vi.hoisted(() => ({
    * exacta. El intercalado se arma, no se inventa el desenlace.
    */
   stalePaymentsOnce: null as Array<Record<string, unknown>> | null,
+  /**
+   * CL-11: la escritura que CIERRA la factura (el paso a `Pagada`) no se puede
+   * aplicar una vez. Dentro de `invoice_split_payment_atomic` es un fallo a
+   * mitad de la transacción: las porciones ya escritas se revierten con ella.
+   */
+  failCloseOnce: false,
+  /** Payload del UPDATE de `invoices`: lo que el servicio realmente escribió. */
+  invoiceUpdate: null as Record<string, unknown> | null,
+  /**
+   * CL-11: traza del RPC `invoice_split_payment_atomic`, en orden (`lock`,
+   * `wait`, `resume`): prueba que el cobro serializa por la fila de la factura.
+   */
+  rpcEvents: [] as string[],
   /** Consultas que el doble no sabe responder: debe quedar SIEMPRE vacío. */
   unexpectedQueries: [] as string[],
 }));
@@ -2143,6 +2735,7 @@ function createSplitStubClient(): unknown {
         // El cobro que completa la factura la pasa a Pagada: el doble lo
         // escribe de verdad, para que la lectura siguiente lo vea.
         const written = (payload ?? {}) as Record<string, unknown>;
+        payStub.invoiceUpdate = written;
         const matched = matching();
         for (const row of matched) Object.assign(row, written);
         return { data: single ? matched[0] ?? null : matched, error: null };
@@ -2261,7 +2854,115 @@ function createSplitStubClient(): unknown {
     return query;
   };
 
-  return { from };
+  /**
+   * CL-11: `invoice_split_payment_atomic` (050). El doble modela la
+   * TRANSACCIÓN: toma el lock de la fila de la factura, relee su precondición
+   * (una factura Anulada no admite cobros), evalúa las DOS barreras reales del
+   * INSERT —el tope de 031 y el índice único parcial de la 042— y aplica sus dos
+   * grupos —las porciones y el cierre— o NINGUNO. Nada se escribe hasta el
+   * final: si algo falla, el doble no deja ni una fila, como la transacción.
+   * Cuenta UNA escritura pedida por llamada (no una por porción), que es lo que
+   * ya significaba `payInserts()`.
+   */
+  const rpc = async (name: string, args?: Record<string, unknown>) => {
+    if (name !== "invoice_split_payment_atomic") {
+      payStub.unexpectedQueries.push(`rpc.${name}`);
+      return { data: null, error: { message: `doble de cobro: rpc desconocido ${name}` } };
+    }
+    const invoiceId = String(args?.p_invoice_id ?? "");
+    const release = await splitRowLocks(invoiceId, () => {
+      payStub.rpcEvents.push("wait");
+    });
+    payStub.rpcEvents.push(release.waited ? "resume" : "lock");
+    try {
+      const invoice = payStub.invoices.find((row) => row.id === invoiceId);
+      if (!invoice) {
+        return { data: null, error: { code: "P0001", message: "INVOICE_NOT_FOUND" } };
+      }
+      if (invoice.status === "Anulada") {
+        return { data: null, error: { code: "P0001", message: "ANNUL_INVALID" } };
+      }
+      const values = (args?.p_portions ?? []) as Array<Record<string, unknown>>;
+      // La factura del cobro la identifica el PARÁMETRO de la operación (la URL),
+      // no cada porción: así lo escribe la función.
+      const withInvoice: Array<Record<string, unknown>> = values.map((row) => ({
+        invoice_id: invoiceId,
+        ...row,
+      }));
+      // El INSERT de las porciones: UNA sentencia (el contador cuenta la
+      // escritura PEDIDA, aunque choque, como contaba el `.insert` de antes).
+      payStub.inserts.invoice_payments = (payStub.inserts.invoice_payments ?? 0) + 1;
+      // 1) El tope de cobro (031) es un trigger BEFORE INSERT: corre ANTES de que
+      //    la fila entre al índice, y su suma solo ve lo YA confirmado (las
+      //    filas hermanas del mismo INSERT comparten el snapshot).
+      for (const row of withInvoice) {
+        const paidNet = payStub.payments
+          .filter((candidate) => candidate.invoice_id === row.invoice_id)
+          .reduce(
+            (acc, candidate) => acc + (Number(candidate.amount) - Number(candidate.fee_amount ?? 0)),
+            0,
+          );
+        const newNet = Number(row.amount) - Number(row.fee_amount ?? 0);
+        const cap = Math.round(Number(invoice.total) - Number(invoice.surcharge ?? 0));
+        if (paidNet + newNet - cap > 0.009) {
+          return {
+            data: null,
+            error: { code: "P0001", message: "El cobro supera el neto facturado de la factura" },
+          };
+        }
+      }
+      // 2) El índice único PARCIAL (042): la marca no nula choca contra lo
+      //    confirmado Y contra las filas anteriores del MISMO INSERT, y aborta la
+      //    sentencia entera (no se persiste ninguna fila).
+      const clashes = withInvoice.some((row, index) => {
+        const mark = row.idempotency_key;
+        if (mark === null || mark === undefined) return false;
+        const keyed = (other: Record<string, unknown>) =>
+          other.invoice_id === row.invoice_id && other.idempotency_key === mark;
+        return [
+          ...payStub.payments.filter((other) => other.invoice_id === row.invoice_id),
+          ...withInvoice.slice(0, index),
+        ].some(keyed);
+      });
+      if (clashes) {
+        return {
+          data: null,
+          error: {
+            code: "23505",
+            message:
+              'duplicate key value violates unique constraint "uq_invoice_payments_invoice_idempotency_key"',
+          },
+        };
+      }
+      // 3) La escritura que CIERRA la factura, dentro de la MISMA transacción:
+      //    si falla, las porciones de arriba se revierten con ella.
+      if (args?.p_mark_paid === true && payStub.failCloseOnce) {
+        payStub.failCloseOnce = false;
+        return { data: null, error: { code: "P0001", message: "PAYMENT_MISMATCH" } };
+      }
+      // COMMIT: los dos grupos, o nada.
+      const persisted = withInvoice.map((row, index) => ({
+        id: `pago-${payStub.payments.length + index + 1}`,
+        created_at: "2026-01-01T00:00:00.000Z",
+        ...row,
+      }));
+      payStub.payments.push(...persisted);
+      if (args?.p_mark_paid === true) {
+        const closed = {
+          status: "Pagada",
+          closed_by: args?.p_user_id ?? null,
+          closed_at: args?.p_closed_at ?? null,
+        };
+        payStub.invoiceUpdate = closed;
+        Object.assign(invoice, closed);
+      }
+      return { data: { invoice: { ...invoice }, portions: persisted.length }, error: null };
+    } finally {
+      release.release();
+    }
+  };
+
+  return { from, rpc };
 }
 
 vi.mock("@/src/shared/lib/supabase/server", () => ({
@@ -2301,7 +3002,8 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
   } as Awaited<ReturnType<typeof actual.listPaymentMethods>>[number];
   return {
     ...actual,
-    listTaxes: async () => [] as Awaited<ReturnType<typeof actual.listTaxes>>,
+    listTaxes: async () =>
+      overCollectionStub.taxes as unknown as Awaited<ReturnType<typeof actual.listTaxes>>,
     listPaymentMethods: async () =>
       [method, transfer] as Awaited<ReturnType<typeof actual.listPaymentMethods>>,
     listServices: async () => [] as Awaited<ReturnType<typeof actual.listServices>>,
@@ -2602,7 +3304,7 @@ describe("billing: el candado de nómina cerrada no se trunca (U5)", () => {
  * Línea de PRODUCTO de la factura: es el origen del IN de reversión, así que es
  * la que hace observable cuántas veces se restauró stock.
  */
-function annulProductItemRow() {
+function annulProductItemRow(overrides: Record<string, unknown> = {}) {
   return {
     id: overCollectionStub.ITEM_ID,
     invoice_id: overCollectionStub.INVOICE_ID,
@@ -2627,6 +3329,7 @@ function annulProductItemRow() {
       pay_type: "fijo",
       payout_mode: "normal",
     },
+    ...overrides,
   };
 }
 
@@ -2663,6 +3366,7 @@ describe("billing: la anulación respeta el candado de nómina y guarda el estad
     annulStub.holdNextWrite = false;
     annulStub.releaseWrite = null;
     annulStub.onWriteHeld = null;
+    annulStub.onLockWait = null;
     annulStub.invoiceStatus = "Emitida";
     annulStub.items = null;
     annulStub.product = null;
@@ -2670,6 +3374,9 @@ describe("billing: la anulación respeta el candado de nómina y guarda el estad
     annulStub.guards.length = 0;
     annulStub.updateMisses = false;
     annulStub.events.length = 0;
+    annulStub.rpcEvents.length = 0;
+    annulStub.commits = 0;
+    annulStub.failMovementAt = null;
     overCollectionStub.payments = [];
     overCollectionStub.invoiceUpdate = null;
     overCollectionStub.auditInsert = null;
@@ -2687,12 +3394,16 @@ describe("billing: la anulación respeta el candado de nómina y guarda el estad
     annulStub.releaseWrite?.();
     annulStub.releaseWrite = null;
     annulStub.onWriteHeld = null;
+    annulStub.onLockWait = null;
     annulStub.items = null;
     annulStub.product = null;
     annulStub.movements.length = 0;
     annulStub.guards.length = 0;
     annulStub.updateMisses = false;
     annulStub.events.length = 0;
+    annulStub.rpcEvents.length = 0;
+    annulStub.commits = 0;
+    annulStub.failMovementAt = null;
     pagedStub.tables = {};
     pagedStub.failAt = {};
     pagedStub.requests = {};
@@ -2749,50 +3460,61 @@ describe("billing: la anulación respeta el candado de nómina y guarda el estad
     expect(annulStub.movements).toEqual([]);
   });
 
-  it("dos anulaciones concurrentes restauran el stock UNA sola vez (U6-b)", async () => {
+  it("dos anulaciones concurrentes restauran el stock UNA sola vez (U6-b, CL-11)", async () => {
     annulStub.items = [annulProductItemRow()];
     annulStub.product = annulProductRow();
 
-    // Las DOS anulaciones entran con la misma lectura vieja (`Emitida`) y sus
-    // dos escrituras quedan en vuelo. El doble detiene la de la primera y la
-    // aplica después de la de la segunda: es el orden real de la carrera (la
-    // que aplica segunda es la que pierde), con el intercalado bajo control.
+    // CL-11: la anulación entera es UNA transacción, así que el doble detiene la
+    // transacción de la primera DESPUÉS de tomar el lock de la fila y ANTES de
+    // escribir: la segunda queda esperando ese lock, que es exactamente lo que
+    // hace `FOR UPDATE` en la base. El intercalado sigue bajo control (la que
+    // aplica segunda es la que pierde), pero ya no es "las dos leen y después
+    // las dos escriben": ése era el intercalado que producía el doble stock.
     annulStub.holdNextWrite = true;
     const writeHeld = new Promise<void>((resolve) => {
       annulStub.onWriteHeld = resolve;
     });
     const first = annul();
     await writeHeld;
-    // Non-vacuidad: la primera ya leyó `Emitida` y todavía no escribió nada.
-    expect(annulStub.events).toEqual(["read"]);
+    // Non-vacuidad: la primera ya tiene el lock de la fila y no escribió nada.
+    expect(annulStub.rpcEvents).toEqual(["lock"]);
 
+    const lockWait = new Promise<void>((resolve) => {
+      annulStub.onLockWait = resolve;
+    });
     const second = annul();
-    const secondResult = await second.then(
-      () => "anulado" as const,
-      (error: unknown) => error,
-    );
-    // La segunda aplica ESCRITURA y termina su reversión con la fila ya Anulada.
-    expect(secondResult).toBe("anulado");
+    // La segunda ESPERA el lock: no lee el estado viejo ni escribe por su lado.
+    await lockWait;
+    expect(annulStub.rpcEvents).toEqual(["lock", "wait"]);
+    // Las DOS lecturas de estado que quedaron registradas son la MISMA foto
+    // (`Emitida`): la carrera existió de verdad y lo que la resuelve es la
+    // transacción, no una relectura oportuna.
+    expect(annulStub.events).toEqual(["read", "read"]);
 
     if (annulStub.releaseWrite) annulStub.releaseWrite();
     const firstResult = await first.then(
       () => "anulado" as const,
       (error: unknown) => error,
     );
+    const secondResult = await second.then(
+      () => "anulado" as const,
+      (error: unknown) => error,
+    );
 
-    // La carrera existió de verdad: las DOS leyeron antes de la primera
-    // escritura (si el intercalado cambiara, esto falla a la vista en vez de
-    // dejar pasar la prueba por un camino que ya no es el de la carrera).
-    expect(annulStub.events).toEqual(["read", "read", "write", "write"]);
+    // La que tomó el lock gana; la que esperaba pierde y se rechaza.
+    expect(firstResult).toBe("anulado");
+    expect(secondResult).toBeInstanceOf(BillingError);
+    expect(secondResult).toMatchObject({ code: "ANNUL_CONFLICT", status: 409 });
     // El síntoma: el stock se devuelve UNA vez, no dos.
     expect(annulStub.movements).toHaveLength(1);
     expect(annulStub.movements[0]).toMatchObject({ product_id: PRODUCT_ID, type: "IN", qty: 2 });
-    // La que aplicó segunda afecta 0 filas y se rechaza con su código.
-    expect(firstResult).toBeInstanceOf(BillingError);
-    expect(firstResult).toMatchObject({ code: "ANNUL_CONFLICT", status: 409 });
-    // El UPDATE lleva el estado leído como precondición: compare-and-swap.
+    // Una sola transacción escribió (la perdedora no dejó ni una fila),
+    expect(annulStub.commits).toBe(1);
+    // la precondición se revalidó ADENTRO sobre la fila bloqueada —las dos la
+    // llevaron, la segunda la encontró falsa—,
     expect(annulStub.guards).toEqual(["Emitida", "Emitida"]);
-    // Una sola anulación: una sola auditoría.
+    expect(annulStub.rpcEvents).toEqual(["lock", "wait", "commit", "resume", "reject"]);
+    // y una sola anulación deja una sola auditoría.
     expect(overCollectionStub.writes.filter((write) => write === "audit_logs.insert")).toHaveLength(1);
   });
 
@@ -2826,6 +3548,169 @@ describe("billing: la anulación respeta el candado de nómina y guarda el estad
     expect(outcome).toMatchObject({ code: "ANNUL_INVALID", status: 409 });
     expect(overCollectionStub.writes).toEqual([]);
     expect(annulStub.guards).toEqual([]);
+  });
+});
+
+// ---------- CL-11: la anulación entera, en UNA transacción ----------
+//
+// `annulInvoice` escribía DOS veces: la factura a `Anulada` (con su
+// compare-and-swap) y DESPUÉS las N reversiones de stock, un `registerMovement`
+// por línea de producto. Son dos requests distintos contra PostgREST, que no
+// ofrece multi-statement por request: un fallo entre los dos dejaba la factura
+// Anulada con el stock devuelto A MEDIAS, y como el compare-and-swap sólo pisa
+// una factura en el estado leído, el reintento ya no encontraba una factura
+// anulable: un callejón sin salida sin compensación.
+//
+// El doble modela la transacción de la 050: el RPC toma el lock de la fila
+// (`wait` cuando ya está tomado, en vez de leer el estado viejo), revalida la
+// precondición y aplica sus DOS grupos de escritura —o ninguno—.
+describe("billing: la anulación es UNA transacción (CL-11)", () => {
+  const ACTOR: BillingActor = {
+    userId: "u-1",
+    sedeId: overCollectionStub.SEDE_ID,
+    roles: ["admin"],
+  };
+
+  function annul(motivo = "Cobro duplicado") {
+    return annulInvoice(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID, { motivo }, ACTOR);
+  }
+
+  /** Segunda línea de PRODUCTO: dos reversiones = el bucle de ayer. */
+  function secondProductLine() {
+    return annulProductItemRow({ id: "99999999-9999-4999-8999-999999999998", qty: 3 });
+  }
+
+  beforeEach(() => {
+    annulStub.active = true;
+    annulStub.holdNextWrite = false;
+    annulStub.releaseWrite = null;
+    annulStub.onWriteHeld = null;
+    annulStub.onLockWait = null;
+    annulStub.invoiceStatus = "Emitida";
+    annulStub.items = null;
+    annulStub.product = null;
+    annulStub.movements.length = 0;
+    annulStub.guards.length = 0;
+    annulStub.updateMisses = false;
+    annulStub.events.length = 0;
+    annulStub.failMovementAt = null;
+    annulStub.rpcEvents.length = 0;
+    annulStub.commits = 0;
+    overCollectionStub.payments = [];
+    overCollectionStub.invoiceUpdate = null;
+    overCollectionStub.auditInsert = null;
+    overCollectionStub.writes.length = 0;
+    overCollectionStub.unexpectedQueries.length = 0;
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+  });
+
+  afterEach(() => {
+    annulStub.active = false;
+    annulStub.holdNextWrite = false;
+    annulStub.releaseWrite?.();
+    annulStub.releaseWrite = null;
+    annulStub.onWriteHeld = null;
+    annulStub.onLockWait = null;
+    annulStub.items = null;
+    annulStub.product = null;
+    annulStub.movements.length = 0;
+    annulStub.guards.length = 0;
+    annulStub.updateMisses = false;
+    annulStub.events.length = 0;
+    annulStub.failMovementAt = null;
+    annulStub.rpcEvents.length = 0;
+    annulStub.commits = 0;
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+  });
+
+  it("un fallo entre las dos escrituras no deja NADA escrito, y el reintento COMPLETA la anulación", async () => {
+    annulStub.items = [annulProductItemRow(), secondProductLine()];
+    annulStub.product = annulProductRow();
+    // La SEGUNDA reversión no se puede escribir: el fallo cae entre las dos
+    // escrituras de la anulación.
+    annulStub.failMovementAt = 2;
+
+    const failure: unknown = await annul().catch((error: unknown) => error);
+
+    // MEDIDO ANTES DEL ARREGLO (verbatim, con el código previo a la 050): la
+    // factura quedaba `Anulada`, el stock a medias (una de dos líneas) y el
+    // reintento moría con `ANNUL_INVALID` —callejón sin salida—.
+    // Ahora la anulación es UNA transacción: o se escriben las dos cosas, o
+    // ninguna.
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(annulStub.invoiceStatus).toBe("Emitida");
+    expect(annulStub.movements).toEqual([]);
+    expect(annulStub.commits).toBe(0);
+
+    // El reintento del MISMO intento COMPLETA la operación entera: no hay
+    // estado a medias que lo bloquee.
+    annulStub.failMovementAt = null;
+    const detail = await annul();
+
+    expect(detail.invoice.status).toBe("Anulada");
+    expect(annulStub.movements.map((row) => row.qty)).toEqual([2, 3]);
+    expect(annulStub.commits).toBe(1);
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("el camino de éxito escribe EXACTAMENTE las filas de siempre (una IN por línea, con su motivo)", async () => {
+    annulStub.items = [annulProductItemRow()];
+    annulStub.product = annulProductRow();
+
+    const detail = await annul("Cobro duplicado");
+
+    expect(detail.invoice.status).toBe("Anulada");
+    // La fila de la factura: los MISMOS cuatro campos, con los MISMOS valores.
+    expect(overCollectionStub.invoiceUpdate).toEqual({
+      status: "Anulada",
+      cancel_reason: "Cobro duplicado",
+      closed_by: "u-1",
+      closed_at: expect.any(String),
+    });
+    // El movimiento: la MISMA fila que escribía `registerMovement`, sin marca de
+    // intento (la anulación no tiene intento de cliente: la cubre el CAS).
+    // DATO DE ENTRADA → FILA ESCRITA: el motivo lo arma `buildReversalReasons`
+    // (TypeScript) y viaja como dato; la función no lo construye ni lo traduce.
+    const expected = buildReversalReasons({
+      consecutiveNumber: 7,
+      motivo: "Cobro duplicado",
+      productItems: [{ product_id: PRODUCT_ID, qty: 2 }],
+    });
+    expect(
+      annulStub.movements.map((row) => ({
+        product_id: row.product_id,
+        qty: row.qty,
+        reason: row.reason,
+      })),
+    ).toEqual(expected);
+    expect(annulStub.movements[0]).toMatchObject({
+      sede_id: overCollectionStub.SEDE_ID,
+      type: "IN",
+      user_id: "u-1",
+      idempotency_key: null,
+    });
+    expect(annulStub.commits).toBe(1);
+  });
+
+  it("control negativo: una factura sin líneas de producto se anula con CERO movimientos (el arreglo vacío es legal)", async () => {
+    // A diferencia de la deducción de la emisión (046, que rechaza el arreglo
+    // vacío porque una venta sin productos no descuenta nada), la reversión de
+    // una factura de servicios es VACÍA y la anulación tiene que pasar: la
+    // transacción escribe la factura y no escribe ningún movimiento.
+    annulStub.items = [];
+
+    const detail = await annul();
+
+    expect(detail.invoice.status).toBe("Anulada");
+    expect(annulStub.movements).toEqual([]);
+    expect(annulStub.commits).toBe(1);
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
   });
 });
 
@@ -3146,15 +4031,21 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
 // 038), el mismo patrón que la anulación de factura (U6: `.eq("status", …)` →
 // `ANNUL_CONFLICT`) y el cierre de caja (`.eq("status","abierto")` →
 // `SHIFT_ALREADY_CLOSED`): la edición escribe la versión SIGUIENTE solo si la
-// fila sigue en la versión que leyó, y si no, afecta 0 filas y se rechaza con
-// `EDIT_CONFLICT` (409) ANTES de la primera escritura — ítems, stock o
-// auditoría. La frontera de inventario no cambia: el ajuste sigue yendo por
-// `registerMovement`.
+// fila sigue en la versión que leyó, y si no se rechaza con `EDIT_CONFLICT`
+// (409) sin tocar los ítems, el stock ni la auditoría.
 //
-// `editStub` mantiene la versión REAL por factura, así que la carrera se
-// observa de verdad: la primera edición queda EN VUELO en su próxima escritura,
-// la segunda corre completa y la primera se libera después — es el orden real
-// de la carrera (la que aplica segunda es la que pierde).
+// CL-12: el candado ya no se reclama desde el cliente. Vive DENTRO de la
+// transacción de la edición (051): `FOR UPDATE` sobre la fila de la factura y
+// `(versión, estado)` en el `WHERE` de la MISMA sentencia que escribe. Con eso,
+// una edición concurrente ESPERA el lock de la fila y después se rechaza (antes,
+// la perdedora alcanzaba a reclamar su token y el fallo a mitad de la secuencia
+// dejaba el estado parcial con el token avanzado). El ajuste de stock tampoco
+// pasa ya por `registerMovement`: viaja como DATO y lo escribe la transacción.
+//
+// `editStub` mantiene la versión REAL por factura y el RPC la contrasta sobre la
+// fila bloqueada, así que la carrera se observa de verdad: la primera edición
+// toma el lock y queda EN VUELO, la segunda ESPERA ese lock, y la que lo esperó
+// es la que pierde.
 
 describe("billing: dos ediciones de la misma factura se serializan (CO-1)", () => {
   const ACTOR: BillingActor = {
@@ -3309,39 +4200,49 @@ describe("billing: dos ediciones de la misma factura se serializan (CO-1)", () =
     pagedStub.inFilters.length = 0;
   });
 
-  it("dos ediciones libres concurrentes mueven el stock UNA sola vez", async () => {
+  it("dos ediciones libres concurrentes mueven el stock UNA sola vez (CL-12: en la transacción)", async () => {
+    const commitsBefore = editStub.commits;
     const { pending: first } = await holdFirstWrite(() => freeEdit());
 
-    const second = await freeEdit().then(
+    // CL-12: el candado dejó de ser un compare-and-swap desde el cliente y pasó
+    // a ser el `FOR UPDATE` de la fila DENTRO de la transacción. La segunda
+    // edición pide el MISMO lock de fila y ESPERA —no lee el estado viejo ni
+    // escribe por su lado—: la que tomó el lock gana, la que esperó evalúa su
+    // precondición contra la versión nueva y se rechaza.
+    const second = freeEdit().then(
       () => "aplicada" as const,
       (error: unknown) => error,
     );
-    // Non-vacuidad: la segunda corrió entera y su ajuste quedó aplicado.
-    expect(second).toBe("aplicada");
-    const writesAfterWinner = overCollectionStub.writes.length;
-
+    // La traza se mira a partir de lo que ya había: los bloques de antes
+    // comparten el doble y sus ediciones también dejan rastro.
+    const eventsBefore = editStub.rpcEvents.length;
+    const waited = await waitFor(() => editStub.rpcEvents.slice(eventsBefore).includes("wait"));
     if (editStub.releaseWrite) editStub.releaseWrite();
+    const secondResult = await second;
     const firstResult = await first;
 
+    // Non-vacuidad del intercalado: la segunda ESPERÓ el lock de la fila. Si el
+    // candado no estuviera adentro, correría entera y este expect falla a la
+    // vista, en vez de dejar pasar la prueba por un camino que ya no existe.
+    expect(waited, "la segunda edición esperó el lock de la fila").toBe(true);
     // El síntoma del hallazgo: el delta (+2) se aplica UNA vez, no dos.
     expect(editStub.movements).toHaveLength(1);
     expect(editStub.movements[0]).toMatchObject({ product_id: PRODUCT_ID, type: "OUT", qty: QTY_DELTA });
     // La carrera existió de verdad: las DOS leyeron ANTES de la primera
-    // escritura (si el intercalado cambiara, esto falla a la vista en vez de
-    // dejar pasar la prueba por un camino que ya no es el de la carrera).
-    // Las tres escrituras: el CAS de la ganadora, su UPDATE de totales y el CAS
-    // RECHAZADO de la perdedora (que es su única escritura).
-    expect(editStub.events).toEqual(["read", "read", "write", "write", "write"]);
-    // La que aplicó segunda afecta 0 filas y se rechaza con su código.
-    expect(firstResult).toBeInstanceOf(BillingError);
-    expect(firstResult).toMatchObject({ code: "EDIT_CONFLICT", status: 409 });
+    // escritura. Las escrituras de `invoices` son DOS: el grupo de la ganadora
+    // —UNA sentencia que pisa la versión (y los totales, en la libre)— y el CAS
+    // RECHAZADO de la perdedora, que es su única escritura.
+    expect(editStub.events).toEqual(["read", "read", "write", "write"]);
+    expect(editStub.rpcEvents.slice(-5)).toEqual(["lock", "wait", "commit", "resume", "reject"]);
+    // La que TOMÓ el lock gana; la que esperó pierde con su código.
+    expect(firstResult).toBe("aplicada");
+    expect(secondResult).toBeInstanceOf(BillingError);
+    expect(secondResult).toMatchObject({ code: "EDIT_CONFLICT", status: 409 });
     // Las dos entraron con la MISMA versión leída: por eso la segunda pierde.
     expect(editStub.versionGuards).toEqual([0, 0]);
     expect(editStub.versions[overCollectionStub.INVOICE_ID]).toBe(1);
-    // El candado es la PRIMERA escritura: la perdedora no escribió nada más
-    // (ni ítems, ni stock, ni auditoría). Su única escritura es el CAS rechazado.
-    expect(overCollectionStub.writes.slice(writesAfterWinner)).toEqual(["invoices.update"]);
-    // Una sola edición aplicada: una sola auditoría.
+    // Una sola transacción confirmó y una sola edición dejó su auditoría.
+    expect(editStub.commits - commitsBefore).toBe(1);
     expect(
       overCollectionStub.writes.filter((write) => write === "audit_logs.insert"),
     ).toHaveLength(1);
@@ -3349,24 +4250,33 @@ describe("billing: dos ediciones de la misma factura se serializan (CO-1)", () =
   });
 
   it("la edición admin de una PAGADA se serializa igual (mismo candado)", async () => {
+    const commitsBefore = editStub.commits;
     editStub.statuses[overCollectionStub.INVOICE_ID] = "Pagada";
 
     const { pending: first } = await holdFirstWrite(() => adminEdit());
 
-    const second = await adminEdit().then(
+    const second = adminEdit().then(
       () => "aplicada" as const,
       (error: unknown) => error,
     );
-    expect(second).toBe("aplicada");
-
+    // CL-12: la segunda espera el lock de la fila; la que lo tomó gana y la que
+    // esperó se rechaza. El candado es el MISMO para las dos ediciones y para
+    // una factura PAGADA. La traza se mira a partir de lo que ya había (los
+    // bloques de antes comparten el doble).
+    const eventsBefore = editStub.rpcEvents.length;
+    const waited = await waitFor(() => editStub.rpcEvents.slice(eventsBefore).includes("wait"));
     if (editStub.releaseWrite) editStub.releaseWrite();
+    const secondResult = await second;
     const firstResult = await first;
 
+    expect(waited, "la segunda edición esperó el lock de la fila").toBe(true);
     expect(editStub.movements).toHaveLength(1);
     expect(editStub.movements[0]).toMatchObject({ type: "OUT", qty: QTY_DELTA });
-    expect(firstResult).toBeInstanceOf(BillingError);
-    expect(firstResult).toMatchObject({ code: "EDIT_CONFLICT", status: 409 });
+    expect(firstResult).toBe("aplicada");
+    expect(secondResult).toBeInstanceOf(BillingError);
+    expect(secondResult).toMatchObject({ code: "EDIT_CONFLICT", status: 409 });
     expect(editStub.versionGuards).toEqual([0, 0]);
+    expect(editStub.commits - commitsBefore).toBe(1);
   });
 
   it("control anti-extralimitación: la edición de OTRA factura no se bloquea", async () => {
@@ -3410,10 +4320,14 @@ describe("billing: dos ediciones de la misma factura se serializan (CO-1)", () =
     // no un 500.
     expect((outcome as BillingError).message).toContain("simultánea");
     expect(editStub.versionGuards).toEqual([0]);
-    // Nada más que el CAS rechazado: ni stock, ni auditoría, ni una fila.
+    // Nada más que el CAS rechazado: ni stock, ni auditoría, ni una fila. CL-12:
+    // el rechazo lo produce la transacción, así que no escribió NADA (antes
+    // quedaba trazado el UPDATE del candado: la escritura que el cliente
+    // mandaba y que afectaba 0 filas).
     expect(editStub.movements).toEqual([]);
     expect(overCollectionStub.auditInsert).toBeNull();
-    expect(overCollectionStub.writes).toEqual(["invoices.update"]);
+    expect(editStub.rpcEvents.slice(-1)).toEqual(["reject"]);
+    expect(overCollectionStub.writes).toEqual([]);
   });
 
   it("una edición sin carrera sigue funcionando de punta a punta", async () => {
@@ -3451,8 +4365,16 @@ describe("billing: dos ediciones de la misma factura se serializan (CO-1)", () =
 //
 // El intercalado es real, no simulado: la edición se detiene EN su candado, el
 // test mueve el estado de la fila como lo haría la anulación que ganó esa
-// ventana, y recién ahí la libera. El doble aplica `.eq("status", v)` como
-// PostgREST, así que una guarda que el servicio no mande no puede rechazar nada.
+// ventana, y recién ahí la libera. El doble aplica la precondición sobre la fila
+// bloqueada, así que una guarda que el servicio no mande no puede rechazar nada.
+//
+// CL-12: el candado dejó de reclamarse desde el cliente y ahora VIVE en la
+// transacción de la edición (051), con `FOR UPDATE` sobre la fila y `(versión,
+// estado)` en el `WHERE`. Estos tests no cambian de significado —siguen probando
+// que una edición en vuelo NO se aplica sobre una factura que dejó de estar en el
+// estado leído—; lo que cambió es dónde se evalúa la guarda. La edición se detiene
+// ahora con el LOCK de la fila tomado y antes de releer la precondición, que es el
+// intercalado real: la lectura del servicio ya ocurrió y la transacción todavía no.
 
 describe("billing: el candado de edición cubre el estado de la factura (CL-1)", () => {
   const ACTOR: BillingActor = {
@@ -3621,7 +4543,10 @@ describe("billing: el candado de edición cubre el estado de la factura (CL-1)",
     expect(editStub.versions, "el CAS no aplicó: la versión de la fila no avanzó").toEqual({});
     expect(editStub.movements).toEqual([]);
     expect(overCollectionStub.auditInsert).toBeNull();
-    expect(overCollectionStub.writes).toEqual(["invoices.update"]);
+    // CL-12: la transacción rechazada no escribió NADA (antes quedaba trazado el
+    // UPDATE del candado desde el cliente, que afectaba 0 filas).
+    expect(editStub.rpcEvents.slice(-1)).toEqual(["reject"]);
+    expect(overCollectionStub.writes).toEqual([]);
     expect(overCollectionStub.unexpectedQueries).toEqual([]);
   });
 
@@ -3636,7 +4561,8 @@ describe("billing: el candado de edición cubre el estado de la factura (CL-1)",
     expect(outcome).toMatchObject({ code: "EDIT_CONFLICT", status: 409 });
     expect(editStub.statusGuards).toEqual(["Emitida"]);
     expect(editStub.movements).toEqual([]);
-    expect(overCollectionStub.writes).toEqual(["invoices.update"]);
+    expect(editStub.rpcEvents.slice(-1)).toEqual(["reject"]);
+    expect(overCollectionStub.writes).toEqual([]);
   });
 
   it("control anti-extralimitación: la edición legítima sigue aplicándose con su estado", async () => {
@@ -3662,7 +4588,637 @@ describe("billing: el candado de edición cubre el estado de la factura (CL-1)",
   });
 });
 
-// ------------- MO-1: la emisión repetida no emite dos veces ----------------
+// ------------- CL-12: las DOS ediciones, en UNA transacción ----------------
+//
+// `editInvoiceItems` (edición admin, total INMUTABLE) y
+// `editEmittedInvoiceItems` (edición libre de una emitida, total RECALCULADO)
+// escribían su edición como una SECUENCIA de requests sueltos contra PostgREST
+// —que no ofrece multi-statement por request—: borrar los ítems que sobran,
+// actualizar los que cambian, insertar los nuevos, cambiar los métodos de pago,
+// (en la libre) reemplazar el snapshot de impuestos y pisar los totales, y
+// DESPUÉS aplicar el ajuste de stock por delta, un `registerMovement` por
+// producto. Un fallo a mitad de esa secuencia dejaba los ítems (y los
+// impuestos, y los totales) YA escritos, el stock a medias y —peor— el token de
+// serialización `edit_version` (038) YA avanzado: el candado de la edición
+// siguiente la rechaza con EDIT_CONFLICT, así que el ajuste que faltaba no se
+// aplicaba NUNCA. En la edición libre, además, el cierre de turno se firma
+// ARRIBA de ese estado.
+//
+// CL-12 cierra las dos ventanas con UNA FUNCIÓN SQL por edición (051), llamada
+// por `db.rpc`: una función es UNA sentencia y una sentencia corre ENTERA dentro
+// de una sola transacción del servidor. El servicio COMPUTA todo —el diff de
+// ítems, los subtotales, el snapshot de impuestos, los totales, el delta NETO de
+// stock por producto, el motivo del kardex, la reconciliación del total
+// inmutable— y la función sólo ESCRIBE filas, en el mismo orden en que la
+// edición las escribía.
+//
+// EL REEMPLAZO, QUE ES LO DISTINTO DE ESTAS DOS VENTANAS: a diferencia de la
+// anulación (050) o del cobro (050) —que AGREGAN filas—, acá la edición
+// REEMPLAZA una colección: los ítems (borra los que leyó, actualiza los que
+// cambian, inserta los nuevos) y, en la libre, el snapshot de impuestos (borra
+// el que leyó e inserta el que computó). "Todo o nada" en un reemplazo quiere
+// decir las DOS mitades: o queda la colección anterior COMPLETA, o queda la
+// nueva COMPLETA. Un fallo entre el borrado y la inserción es el peor de los
+// casos —la colección vacía, que no es ninguna de las dos—, y es exactamente lo
+// que la transacción hace imposible. Por eso el doble trabaja sobre un estado
+// APARTE y lo publica entero: un doble que escribiera directo sobre la colección
+// no podría representar el rollback (el borrado ya habría pasado).
+describe("billing: las dos ediciones de factura son UNA transacción (CL-12)", () => {
+  const ACTOR: BillingActor = {
+    userId: "u-1",
+    sedeId: overCollectionStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  /** Segundo producto de la sede: la edición toca DOS y escribe DOS movimientos. */
+  const PRODUCT_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc";
+  const ITEM_A = overCollectionStub.ITEM_ID;
+  const ITEM_B = "99999999-9999-4999-8999-999999999998";
+  const ITEM_C = "99999999-9999-4999-8999-999999999997";
+  const ADMIN_MOTIVO = "Cantidad mal digitada";
+  /** El motivo del kardex lo arma el SERVICIO (TypeScript) y viaja como dato. */
+  const ADMIN_REASON = `Ajuste edición factura #7 — ${ADMIN_MOTIVO}`;
+  const FREE_REASON = "Edición libre emitida factura #7";
+  /** Impuesto ACTIVO de la sede: la edición libre reemplaza su snapshot. */
+  const IVA_19 = { code: "IVA", name: "IVA 19", percent: 19, is_active: true };
+
+  function productRow(id: string, stockQty = 5) {
+    return { ...annulProductRow(), id, stock_qty: stockQty };
+  }
+
+  /** Línea de PRODUCTO: es el origen del delta de stock. */
+  function productLine(itemId: string, productId: string, qty: number, unitPrice: number) {
+    return annulProductItemRow({
+      id: itemId,
+      product_id: productId,
+      qty,
+      unit_price: unitPrice,
+      subtotal: qty * unitPrice,
+    });
+  }
+
+  /** Línea CUSTOM: se puede quitar sin mover stock (no es de producto). */
+  function customLine(itemId: string, name: string, unitPrice: number) {
+    return annulProductItemRow({
+      id: itemId,
+      item_type: "custom",
+      product_id: null,
+      custom_name: name,
+      qty: 1,
+      unit_price: unitPrice,
+      subtotal: unitPrice,
+    });
+  }
+
+  /**
+   * Edición ADMIN con el subtotal INTACTO (300.000): las tres líneas originales
+   * suman 300.000 y las dos nuevas también (150.000 + 150.000), así que
+   * `assertEditReconciles` pasa. Los DELTAS de stock son +1 (A), +1 (B) y −1 (C,
+   * que se quita) → TRES movimientos, el escenario multi-producto del hallazgo.
+   */
+  function adminPayload() {
+    return {
+      items: [
+        {
+          id: ITEM_A,
+          item_type: "producto",
+          product_id: PRODUCT_ID,
+          service_id: null,
+          custom_name: null,
+          employee_id: EMPLOYEE_ID,
+          qty: 2,
+          unit_price: 75000,
+          discount: 0,
+          no_commission: true,
+        },
+        {
+          id: ITEM_B,
+          item_type: "producto",
+          product_id: PRODUCT_B,
+          service_id: null,
+          custom_name: null,
+          employee_id: EMPLOYEE_ID,
+          qty: 2,
+          unit_price: 75000,
+          discount: 0,
+          no_commission: true,
+        },
+      ],
+      payments: [],
+      motivo: ADMIN_MOTIVO,
+    };
+  }
+
+  /** Edición LIBRE: el total se RECALCULA (y con IVA activo hay snapshot). */
+  function freePayload() {
+    return {
+      items: [
+        {
+          id: ITEM_A,
+          item_type: "producto",
+          product_id: PRODUCT_ID,
+          service_id: null,
+          custom_name: null,
+          employee_id: EMPLOYEE_ID,
+          qty: 3,
+          unit_price: 100000,
+          discount: 0,
+          no_commission: true,
+        },
+        {
+          id: ITEM_B,
+          item_type: "producto",
+          product_id: PRODUCT_B,
+          service_id: null,
+          custom_name: null,
+          employee_id: EMPLOYEE_ID,
+          qty: 2,
+          unit_price: 100000,
+          discount: 0,
+          no_commission: true,
+        },
+        {
+          item_type: "custom",
+          custom_name: "Propina",
+          product_id: null,
+          service_id: null,
+          employee_id: EMPLOYEE_ID,
+          qty: 1,
+          unit_price: 50000,
+          discount: 0,
+          no_commission: true,
+        },
+      ],
+      payments: [],
+    };
+  }
+
+  function adminEdit() {
+    return editInvoiceItems(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID, adminPayload(), ACTOR);
+  }
+
+  function freeEdit() {
+    return editEmittedInvoiceItems(
+      overCollectionStub.SEDE_ID,
+      overCollectionStub.INVOICE_ID,
+      freePayload(),
+      ACTOR,
+    );
+  }
+
+  /** Estado de la colección de ítems de la factura, tal como quedó. */
+  function itemsById(): Record<string, Record<string, unknown>> {
+    return Object.fromEntries(
+      (editStub.itemsByInvoice[overCollectionStub.INVOICE_ID] ?? []).map((row) => [String(row.id), row]),
+    );
+  }
+
+  /**
+   * Lo que el SERVICIO computa para el ajuste de stock de una edición: el delta
+   * NETO por producto, con su tipo y el motivo del kardex. Se recalcula acá con
+   * la MISMA regla de producción para poder contrastarlo contra las filas que la
+   * función escribió (DATO DE ENTRADA → FILA ESCRITA).
+   */
+  function expectedMoves(
+    before: Array<{ product_id: string | null; qty: number }>,
+    after: Array<{ product_id: string | null; qty: number }>,
+    reason: string,
+  ) {
+    const sum = (rows: Array<{ product_id: string | null; qty: number }>) => {
+      const map = new Map<string, number>();
+      for (const row of rows) {
+        if (!row.product_id) continue;
+        map.set(row.product_id, (map.get(row.product_id) ?? 0) + Number(row.qty));
+      }
+      return map;
+    };
+    const oldQty = sum(before);
+    const newQty = sum(after);
+    const ids = [...new Set([...oldQty.keys(), ...newQty.keys()])];
+    return ids
+      .map((id) => ({ product_id: id, delta: (newQty.get(id) ?? 0) - (oldQty.get(id) ?? 0) }))
+      .filter((move) => move.delta !== 0)
+      .map((move) => ({
+        product_id: move.product_id,
+        type: move.delta > 0 ? "OUT" : "IN",
+        qty: Math.abs(move.delta),
+        reason,
+      }));
+  }
+
+  /** Las filas de `inventory_movements` como las escribió la transacción. */
+  function writtenMoves() {
+    return editStub.movements
+      .map((row) => ({
+        product_id: row.product_id,
+        type: row.type,
+        qty: row.qty,
+        reason: row.reason,
+      }))
+      .sort((left, right) => String(left.product_id).localeCompare(String(right.product_id)));
+  }
+
+  beforeEach(() => {
+    editStub.active = true;
+    editStub.versions = {};
+    editStub.statuses = {};
+    editStub.versionGuards.length = 0;
+    editStub.statusGuards.length = 0;
+    editStub.staleGuard = false;
+    editStub.movements.length = 0;
+    editStub.events.length = 0;
+    editStub.holdNextWrite = false;
+    editStub.releaseWrite = null;
+    editStub.onWriteHeld = null;
+    editStub.onLockWait = null;
+    editStub.rpcEvents.length = 0;
+    editStub.commits = 0;
+    editStub.failWriteKind = null;
+    editStub.failWriteOffset = 0;
+    editStub.product = null;
+    editStub.products = [productRow(PRODUCT_ID), productRow(PRODUCT_B)];
+    editStub.itemsByInvoice = {
+      [overCollectionStub.INVOICE_ID]: [
+        productLine(ITEM_A, PRODUCT_ID, 1, 100000),
+        productLine(ITEM_B, PRODUCT_B, 1, 100000),
+        customLine(ITEM_C, "Corte y peinado", 100000),
+      ],
+    };
+    editStub.taxesByInvoice = {};
+    overCollectionStub.taxes = [];
+    overCollectionStub.payments = [];
+    overCollectionStub.invoiceUpdate = null;
+    overCollectionStub.auditInsert = null;
+    overCollectionStub.writes.length = 0;
+    overCollectionStub.unexpectedQueries.length = 0;
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+    pagedStub.inFilters.length = 0;
+  });
+
+  afterEach(() => {
+    editStub.active = false;
+    editStub.holdNextWrite = false;
+    editStub.releaseWrite?.();
+    editStub.releaseWrite = null;
+    editStub.onWriteHeld = null;
+    editStub.onLockWait = null;
+    editStub.versions = {};
+    editStub.statuses = {};
+    editStub.versionGuards.length = 0;
+    editStub.statusGuards.length = 0;
+    editStub.staleGuard = false;
+    editStub.movements.length = 0;
+    editStub.events.length = 0;
+    editStub.rpcEvents.length = 0;
+    editStub.commits = 0;
+    editStub.failWriteKind = null;
+    editStub.failWriteOffset = 0;
+    editStub.product = null;
+    editStub.products = [];
+    editStub.itemsByInvoice = {};
+    editStub.taxesByInvoice = {};
+    overCollectionStub.taxes = [];
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+    pagedStub.inFilters.length = 0;
+  });
+
+  it("RED/GREEN: un fallo entre los ítems y el stock no deja NADA escrito, y el reintento COMPLETA la edición admin", async () => {
+    // El SEGUNDO movimiento de stock no se puede escribir: el fallo cae entre
+    // los ítems (ya escritos) y el resto del stock.
+    editStub.failWriteKind = "movements";
+    editStub.failWriteOffset = 1;
+
+    const failure: unknown = await adminEdit().catch((error: unknown) => error);
+
+    // MEDIDO ANTES DEL ARREGLO (verbatim, con el código previo a la 051): los
+    // ítems quedaban YA escritos, el token `edit_version` quedaba en 1 y el
+    // stock a medias (el primero de los dos movimientos entró y el segundo no).
+    // En UNA sola aserción para que el RED se lea ENTERO: acá salía
+    //   { moves: [{ type: "OUT", qty: 1 }], version: 1, commit: 0 }
+    // —stock a medias y token avanzado— con los ítems ya reemplazados (sus
+    // escrituras quedaron trazadas en `writes`), y el reintento del MISMO
+    // intento moría en EDIT_CONFLICT: el ajuste no se aplicaba nunca.
+    //
+    // Ahora la edición es UNA transacción: o se escriben TODOS los grupos, o
+    // ninguno. El intento SÍ llegó a pedir la escritura (no vacuidad), pero no
+    // publicó ni una fila.
+    expect({
+      moves: writtenMoves().map((move) => ({ type: move.type, qty: move.qty })),
+      version: editStub.versions[overCollectionStub.INVOICE_ID] ?? 0,
+      commits: editStub.commits,
+    }).toEqual({ moves: [], version: 0, commits: 0 });
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(overCollectionStub.writes).toContain("inventory_movements.insert");
+    expect(editStub.movements).toEqual([]);
+    expect(editStub.versions[overCollectionStub.INVOICE_ID] ?? 0).toBe(0);
+    expect(editStub.commits).toBe(0);
+    // La colección de ítems quedó EXACTAMENTE como estaba: las tres líneas.
+    expect(Object.keys(itemsById()).sort()).toEqual([ITEM_A, ITEM_B, ITEM_C].sort());
+    expect(itemsById()[ITEM_A]).toMatchObject({ qty: 1, unit_price: 100000, subtotal: 100000 });
+    expect(overCollectionStub.auditInsert).toBeNull();
+
+    // El reintento del MISMO intento COMPLETA la edición entera: no hay estado a
+    // medias ni un token que lo bloquee.
+    editStub.failWriteKind = null;
+    const writesBeforeRetry = overCollectionStub.writes.length;
+    const detail = await adminEdit();
+
+    expect(detail.invoice.edit_version).toBe(1);
+    expect(editStub.versions[overCollectionStub.INVOICE_ID]).toBe(1);
+    expect(editStub.commits).toBe(1);
+    expect(Object.keys(itemsById()).sort()).toEqual([ITEM_A, ITEM_B].sort());
+    expect(itemsById()[ITEM_A]).toMatchObject({ qty: 2, unit_price: 75000, subtotal: 150000 });
+    expect(itemsById()[ITEM_B]).toMatchObject({ qty: 2, unit_price: 75000, subtotal: 150000 });
+    expect(writtenMoves()).toEqual(
+      expectedMoves(
+        [
+          { product_id: PRODUCT_ID, qty: 1 },
+          { product_id: PRODUCT_B, qty: 1 },
+          { product_id: null, qty: 1 },
+        ],
+        [
+          { product_id: PRODUCT_ID, qty: 2 },
+          { product_id: PRODUCT_B, qty: 2 },
+        ],
+        ADMIN_REASON,
+      ),
+    );
+    // Los grupos, EN EL ORDEN de la 051, y una sola confirmación: la auditoría
+    // sigue siendo la última escritura y va FUERA de la transacción.
+    expect(overCollectionStub.writes.slice(writesBeforeRetry)).toEqual([
+      "invoices.update",
+      "invoice_items.delete",
+      "invoice_items.update",
+      "invoice_items.insert",
+      "invoice_payments.update",
+      "inventory_movements.insert",
+      "audit_logs.insert",
+    ]);
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("la edición admin escribe EXACTAMENTE las filas de siempre (y SÓLO el token en la factura)", async () => {
+    await adminEdit();
+
+    // La fila de la factura: SÓLO el token. La función de la edición admin no
+    // tiene un grupo capaz de escribir dinero —el total es INMUTABLE—, así que
+    // la inmutabilidad deja de ser una regla que el llamador promete.
+    expect(overCollectionStub.invoiceUpdate).toEqual({ edit_version: 1 });
+    // Las DOS líneas del kardex, con su tipo, su cantidad y el motivo que armó
+    // el servicio (la función no arma texto: escribe el dato).
+    expect(writtenMoves()).toEqual(
+      [
+        { product_id: PRODUCT_ID, type: "OUT", qty: 1, reason: ADMIN_REASON },
+        { product_id: PRODUCT_B, type: "OUT", qty: 1, reason: ADMIN_REASON },
+      ].sort((left, right) => String(left.product_id).localeCompare(String(right.product_id))),
+    );
+    // La frontera de inventario no cambia: sin marca de intento (la edición no
+    // tiene una), con la sede y con el responsable.
+    expect(editStub.movements[0]).toMatchObject({
+      sede_id: overCollectionStub.SEDE_ID,
+      user_id: "u-1",
+      idempotency_key: null,
+    });
+    // La auditoría sigue FUERA de la transacción y con las MISMAS cifras.
+    expect(overCollectionStub.auditInsert).toMatchObject({
+      action: "invoice.edited",
+      entity: "invoices",
+      entity_id: overCollectionStub.INVOICE_ID,
+      metadata: { motivo: ADMIN_MOTIVO, items_before: 3, items_added: 0 },
+    });
+    expect((overCollectionStub.auditInsert?.metadata as { inventory_moves: unknown[] }).inventory_moves).toHaveLength(2);
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("control negativo: una edición sin cambios escribe SÓLO el token (los grupos vacíos son legales)", async () => {
+    // El MISMO contenido que la factura ya tiene: ni borrados, ni cambios, ni
+    // altas, ni un solo movimiento de stock. La transacción escribe el token y
+    // nada más —los grupos vacíos pasan sus redes de conteo (0 = 0)—, que es lo
+    // que hace legal editar una factura de servicios sin tocar el kardex.
+    const detail = await editEmittedInvoiceItems(
+      overCollectionStub.SEDE_ID,
+      overCollectionStub.INVOICE_ID,
+      {
+        items: [
+          {
+            id: ITEM_A,
+            item_type: "producto",
+            product_id: PRODUCT_ID,
+            service_id: null,
+            custom_name: null,
+            employee_id: EMPLOYEE_ID,
+            qty: 1,
+            unit_price: 100000,
+            discount: 0,
+            no_commission: true,
+          },
+          {
+            id: ITEM_B,
+            item_type: "producto",
+            product_id: PRODUCT_B,
+            service_id: null,
+            custom_name: null,
+            employee_id: EMPLOYEE_ID,
+            qty: 1,
+            unit_price: 100000,
+            discount: 0,
+            no_commission: true,
+          },
+          {
+            id: ITEM_C,
+            item_type: "custom",
+            product_id: null,
+            service_id: null,
+            custom_name: "Corte y peinado",
+            employee_id: EMPLOYEE_ID,
+            qty: 1,
+            unit_price: 100000,
+            discount: 0,
+            no_commission: true,
+          },
+        ],
+        payments: [],
+      },
+      ACTOR,
+    );
+
+    expect(detail.invoice.edit_version).toBe(1);
+    expect(editStub.movements).toEqual([]);
+    expect(editStub.commits).toBe(1);
+    // Las tres líneas siguen siendo las mismas (ni una fila borrada de más).
+    expect(Object.keys(itemsById()).sort()).toEqual([ITEM_A, ITEM_B, ITEM_C].sort());
+    expect(overCollectionStub.writes).toEqual([
+      "invoices.update",
+      "invoice_taxes.delete",
+      "invoice_taxes.insert",
+      "invoice_items.delete",
+      "invoice_items.update",
+      "invoice_items.insert",
+      "invoice_payments.update",
+      "inventory_movements.insert",
+      "audit_logs.insert",
+    ]);
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("la edición libre escribe EXACTAMENTE lo que el servicio computa: impuestos, totales, ítems y stock", async () => {
+    overCollectionStub.taxes = [IVA_19];
+    // El snapshot VIEJO de la factura: es el que el reemplazo tiene que borrar.
+    editStub.taxesByInvoice[overCollectionStub.INVOICE_ID] = [
+      {
+        id: "cccccccc-cccc-4ccc-8ccc-ccccccccccc1",
+        invoice_id: overCollectionStub.INVOICE_ID,
+        tax_code: "IVA",
+        tax_name: "IVA 19",
+        percent: 19,
+        amount: 30000,
+      },
+    ];
+
+    const payload = freePayload();
+    const detail = await freeEdit();
+
+    // DATO DE ENTRADA → FILA ESCRITA: los totales y el snapshot los computa
+    // `computeInvoiceTotals`/`snapshotInvoiceTaxes` en TypeScript; la función
+    // escribe los números VERBATIM (escribe = convertir la representación, no
+    // operar). Se recalcula acá con la MISMA función de producción.
+    const totals = computeInvoiceTotals({
+      items: payload.items,
+      discount: 0,
+      activeTaxes: [{ code: IVA_19.code, name: IVA_19.name, percent: IVA_19.percent }],
+    });
+    expect(overCollectionStub.invoiceUpdate).toEqual({
+      edit_version: 1,
+      subtotal: totals.subtotal,
+      discount: totals.discount,
+      tax: totals.tax,
+      surcharge: 0,
+      total: totals.total,
+    });
+    expect(detail.invoice.total).toBe(totals.total);
+    expect(
+      (editStub.taxesByInvoice[overCollectionStub.INVOICE_ID] ?? []).map((row) => ({
+        tax_code: row.tax_code,
+        tax_name: row.tax_name,
+        percent: row.percent,
+        amount: row.amount,
+      })),
+    ).toEqual(totals.taxes);
+    // La colección de ítems: la línea que se quitó no está, las dos que cambiaron
+    // están con su subtotal recomputado y la nueva está con su nombre recortado.
+    expect(Object.keys(itemsById()).sort()).toEqual([ITEM_A, ITEM_B, "item-" + overCollectionStub.INVOICE_ID + "-3"].sort());
+    expect(itemsById()[ITEM_A]).toMatchObject({ qty: 3, unit_price: 100000, subtotal: 300000 });
+    expect(itemsById()[ITEM_B]).toMatchObject({ qty: 2, unit_price: 100000, subtotal: 200000 });
+    expect(editStub.movements).toHaveLength(2);
+    expect(writtenMoves()).toEqual(
+      expectedMoves(
+        [
+          { product_id: PRODUCT_ID, qty: 1 },
+          { product_id: PRODUCT_B, qty: 1 },
+        ],
+        [
+          { product_id: PRODUCT_ID, qty: 3 },
+          { product_id: PRODUCT_B, qty: 2 },
+        ],
+        FREE_REASON,
+      ),
+    );
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("el reemplazo del snapshot de impuestos es todo-o-nada: un fallo al insertarlo deja el VIEJO intacto, y el reintento lo reemplaza", async () => {
+    overCollectionStub.taxes = [IVA_19];
+    const oldTax = {
+      id: "cccccccc-cccc-4ccc-8ccc-ccccccccccc1",
+      invoice_id: overCollectionStub.INVOICE_ID,
+      tax_code: "IVA",
+      tax_name: "IVA 19",
+      percent: 19,
+      amount: 30000,
+    };
+    editStub.taxesByInvoice[overCollectionStub.INVOICE_ID] = [oldTax];
+    // El INSERT del snapshot nuevo no se puede aplicar: es la SEGUNDA mitad del
+    // reemplazo, con el borrado ya pedido.
+    editStub.failWriteKind = "taxes-insert";
+
+    const failure: unknown = await freeEdit().catch((error: unknown) => error);
+
+    // MEDIDO ANTES DEL ARREGLO (verbatim, con el código previo a la 051): el
+    // snapshot viejo YA estaba BORRADO y el nuevo no había entrado —la factura
+    // quedaba SIN impuestos—, con los ítems escritos y el token avanzado. En UNA
+    // sola aserción para que el RED se lea ENTERO: acá salía
+    //   { taxes: [], version: 1, total: null, moves: 0 }
+    // y el reintento moría en EDIT_CONFLICT con la factura sin impuestos.
+    // Con la 051 el reemplazo entero se revierte: o el snapshot viejo COMPLETO,
+    // o el nuevo COMPLETO.
+    expect({
+      taxes: editStub.taxesByInvoice[overCollectionStub.INVOICE_ID] ?? [],
+      version: editStub.versions[overCollectionStub.INVOICE_ID] ?? 0,
+      total: overCollectionStub.invoiceUpdate?.total ?? null,
+      moves: editStub.movements.length,
+    }).toEqual({ taxes: [oldTax], version: 0, total: null, moves: 0 });
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(overCollectionStub.writes).toContain("invoice_taxes.insert");
+    expect(overCollectionStub.invoiceUpdate).toBeNull();
+    expect(editStub.versions[overCollectionStub.INVOICE_ID] ?? 0).toBe(0);
+    expect(Object.keys(itemsById()).sort()).toEqual([ITEM_A, ITEM_B, ITEM_C].sort());
+    expect(editStub.movements).toEqual([]);
+    expect(editStub.commits).toBe(0);
+
+    // El reintento reemplaza el snapshot entero y cierra la edición.
+    editStub.failWriteKind = null;
+    const detail = await freeEdit();
+
+    const totals = computeInvoiceTotals({
+      items: freePayload().items,
+      discount: 0,
+      activeTaxes: [{ code: IVA_19.code, name: IVA_19.name, percent: IVA_19.percent }],
+    });
+    expect(detail.invoice.total).toBe(totals.total);
+    expect(editStub.taxesByInvoice[overCollectionStub.INVOICE_ID]).toHaveLength(1);
+    expect(editStub.taxesByInvoice[overCollectionStub.INVOICE_ID]?.[0]).toMatchObject({
+      tax_code: "IVA",
+      percent: 19,
+      amount: totals.taxes[0]?.amount,
+    });
+    expect(editStub.movements).toHaveLength(2);
+    expect(editStub.commits).toBe(1);
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("una edición que pierde el candado se RECHAZA sin escribir una sola fila (las dos ediciones)", async () => {
+    // El token ya no es el que se leyó: es la MISMA ruta de error que produce
+    // una edición concurrente que gana la carrera. Las dos ediciones la tienen.
+    for (const run of [adminEdit, freeEdit]) {
+      editStub.staleGuard = true;
+      editStub.versions[overCollectionStub.INVOICE_ID] = 0;
+      const before = overCollectionStub.writes.length;
+
+      const outcome: unknown = await run().catch((error: unknown) => error);
+
+      expect(outcome).toBeInstanceOf(BillingError);
+      expect(outcome).toMatchObject({ code: "EDIT_CONFLICT", status: 409 });
+      expect((outcome as BillingError).message).toContain("simultánea");
+      // Ni el token, ni los ítems, ni los impuestos, ni el stock, ni la
+      // auditoría: la transacción rechazada no escribió NADA.
+      expect(overCollectionStub.writes.slice(before)).toEqual([]);
+      expect(editStub.versions[overCollectionStub.INVOICE_ID] ?? 0).toBe(0);
+      expect(editStub.movements).toEqual([]);
+      expect(Object.keys(itemsById()).sort()).toEqual([ITEM_A, ITEM_B, ITEM_C].sort());
+      expect(overCollectionStub.auditInsert).toBeNull();
+      expect(editStub.rpcEvents.slice(-1)).toEqual(["reject"]);
+      editStub.staleGuard = false;
+      editStub.rpcEvents.length = 0;
+    }
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+});
+
 //
 // El defecto: `createInvoice` reservaba un consecutivo e insertaba la factura
 // sin mirar nada del ENVÍO, así que reenviar la MISMA emisión (doble clic, o el
@@ -3953,6 +5509,9 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     payStub.inserts = {};
     payStub.skipMarkLookupOnce = false;
     payStub.stalePaymentsOnce = null;
+    payStub.failCloseOnce = false;
+    payStub.invoiceUpdate = null;
+    payStub.rpcEvents.length = 0;
     payStub.unexpectedQueries = [];
     payStub.active = true;
     seedInvoice(payStub.INVOICE_ID, 7);
@@ -4098,6 +5657,29 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     expect(payInserts()).toBe(0);
   });
 
+  it("el tope de 031 sigue traduciéndose a OVERPAID cuando la marca NO es una repetición", async () => {
+    // El primer cobro cierra la factura...
+    await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    // ...y un SEGUNDO intento distinto entra con una lectura VIEJA del saldo (el
+    // doble le sirve la foto previa una sola vez), con lo que pasa la
+    // comprobación exacta y llega a escribir: ahí lo rechaza el tope de 031
+    // (P0001) y, como su marca no está registrada, NO es una repetición.
+    payStub.stalePaymentsOnce = [];
+
+    const failure: unknown = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      closeInvoice(payStub.INVOICE_ID, TOTAL, OTHER_MARK),
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "OVERPAID", status: 422 });
+    // El cobro rechazado no dejó NADA: ni su porción ni un cambio de estado.
+    expect(payStub.payments).toHaveLength(1);
+    expect(payInserts()).toBe(2);
+  });
+
   it("una marca faltante o mal formada se rechaza con CERO escrituras", async () => {
     // Decisión explícita, igual que en la emisión: la marca es OBLIGATORIA. Un
     // envío sin marca no se puede reconocer como repetición, y la ruta REST es
@@ -4139,5 +5721,813 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
         portions: [{ method_code: "efectivo", amount: TOTAL }],
       }).success,
     ).toBe(true);
+  });
+
+  // ---- CL-11: el cobro y el cierre de la factura, en UNA transacción ---
+  //
+  // `splitPayment` escribía DOS veces: las N porciones (el dinero que entra) y
+  // DESPUÉS el paso a `Pagada`. Un fallo entre los dos dejaba las porciones
+  // escritas con la factura todavía Emitida: el dinero cobrado, el saldo en cero
+  // —así que ningún cobro posterior podía completarlo— y la factura que nunca se
+  // cerraba.
+
+  it("un fallo en la transacción no deja NADA escrito, y el reintento COMPLETA el cobro", async () => {
+    // El paso a `Pagada` (la SEGUNDA escritura) no se puede aplicar. Antes de la
+    // 050 eso dejaba las porciones ya escritas; ahora la transacción entera se
+    // revierte.
+    payStub.failCloseOnce = true;
+
+    const failure: unknown = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      closeInvoice(payStub.INVOICE_ID),
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    // MEDIDO ANTES DEL ARREGLO (verbatim, con el código previo a la 050): la
+    // porción quedaba escrita (el dinero cobrado), la factura seguía Emitida con
+    // el saldo cobrable en CERO, el reintento era un no-op que la devolvía
+    // abierta y ningún cobro posterior podía cerrarla (OVERPAID). La factura
+    // nunca se cerraba.
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(payStub.payments).toEqual([]);
+    const invoice = () => payStub.invoices.find((row) => row.id === payStub.INVOICE_ID) as Record<string, unknown>;
+    expect(invoice().status).toBe("Emitida");
+    // No vacuidad: el intento SÍ llegó a pedir la escritura de las porciones
+    // (la transacción las revirtió, no es que nunca se hayan pedido).
+    expect(payInserts()).toBe(1);
+
+    // El reintento del MISMO intento COMPLETA el cobro entero.
+    const retry = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      closeInvoice(payStub.INVOICE_ID),
+      ACTOR,
+    );
+
+    expect(retry.invoice.status).toBe("Pagada");
+    expect(payStub.payments).toHaveLength(1);
+    expect(payStub.payments[0].idempotency_key).toBe(MARK);
+    expect(invoice().status).toBe("Pagada");
+  });
+
+  it("el camino de éxito escribe EXACTAMENTE las porciones que computa el servicio", async () => {
+    const portions = [
+      { method_code: "efectivo", amount: 60000 },
+      { method_code: "transferencia", amount: 40000 },
+    ];
+
+    const result = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      { idempotency_key: MARK, portions },
+      ACTOR,
+    );
+
+    // DATO DE ENTRADA → FILA ESCRITA: el reparto por método (neto, recargo,
+    // bruto) lo computa `computeCardFees` en TypeScript y la función lo escribe
+    // verbatim. Se recalcula acá con la MISMA función de producción.
+    const expected = computeCardFees(portions, () => 0);
+    expect(
+      payStub.payments.map((row) => ({
+        method_code: row.method_code,
+        amount: row.amount,
+        fee_percent: row.fee_percent,
+        fee_amount: row.fee_amount,
+      })),
+    ).toEqual(
+      expected.map((fee) => ({
+        method_code: fee.method_code,
+        amount: fee.gross,
+        fee_percent: fee.feePercent,
+        fee_amount: fee.fee,
+      })),
+    );
+    // Y el cierre de la factura: los MISMOS tres campos de siempre.
+    expect(result.invoice.status).toBe("Pagada");
+    expect(payStub.invoiceUpdate).toEqual({
+      status: "Pagada",
+      closed_by: "u-1",
+      closed_at: expect.any(String),
+    });
+    expect(payStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("una factura anulada se rechaza con CERO escrituras (la precondición también se revalida adentro)", async () => {
+    const invoice = payStub.invoices.find((row) => row.id === payStub.INVOICE_ID) as Record<string, unknown>;
+    invoice.status = "Anulada";
+
+    const failure: unknown = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      closeInvoice(payStub.INVOICE_ID),
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "ANNUL_INVALID", status: 409 });
+    expect(payStub.payments).toEqual([]);
+    expect(payInserts()).toBe(0);
+    expect(invoice.status).toBe("Anulada");
+  });
+});
+
+// ---------------- CL-11: el diff del servicio vive en la persistencia ---
+//
+// Tercera de las tres comprobaciones de "no se movió aritmética de dinero a
+// SQL": el diff del servicio toca SÓLO el bloque de escritura. Las dos
+// operaciones cambian su forma de persistir —dos requests sueltos pasan a ser
+// una transacción— y nada más: el estado anulable, el candado de nómina, el
+// texto de la reversión, el reparto por método, el saldo, la igualdad exacta y
+// la decisión `Pagada` siguen siendo líneas de TypeScript.
+
+describe("billing: CL-11 el diff del servicio vive en el bloque de persistencia", () => {
+  const service = readFileSync(
+    join(process.cwd(), "src", "features", "billing", "service.ts"),
+    "utf8",
+  );
+
+  /** Cuerpo del `export async function <name>` (hasta la siguiente exportada). */
+  function bodyOf(name: string): string {
+    const start = service.indexOf(`export async function ${name}`);
+    expect(start, `existe ${name}`).toBeGreaterThan(-1);
+    const end = service.indexOf("export async function", start + 10);
+    return service.slice(start, end === -1 ? service.length : end);
+  }
+
+  it("las DOS operaciones escriben por RPC y ninguna abre una escritura suelta", () => {
+    const cases = [
+      { name: "annulInvoice", rpc: "invoice_annul_atomic" },
+      { name: "splitPayment", rpc: "invoice_split_payment_atomic" },
+    ] as const;
+
+    for (const item of cases) {
+      const body = bodyOf(item.name);
+      // UNA transacción por operación: ni dos `rpc` por un descuido, ni uno de
+      // menos.
+      expect(body.match(/db\.rpc\(/g) ?? [], item.name).toHaveLength(1);
+      expect(body, item.name).toContain(`db.rpc("${item.rpc}"`);
+      // La factura ya no se escribe desde el cliente en ninguna de las dos.
+      expect(body, item.name).not.toContain('.from("invoices")');
+    }
+    // La anulación ya no escribe sus reversiones con `registerMovement` (045 la
+    // listaba entre sus llamadores de facturación) ni toca la tabla del kardex.
+    const annul = bodyOf("annulInvoice");
+    expect(annul).not.toContain("registerMovement(");
+    expect(annul).not.toContain("inventory_movements");
+    // El cobro ya no inserta sus porciones desde el cliente.
+    const split = bodyOf("splitPayment");
+    expect(split).not.toContain('.from("invoice_payments")');
+    expect(split).not.toContain(".insert(");
+  });
+
+  it("la aritmética y las decisiones de plata se quedan en TypeScript: viajan como DATO", () => {
+    // La anulación: qué se revierte y con qué motivo.
+    const annul = bodyOf("annulInvoice");
+    expect(annul).toContain("canAnnulStatus(");
+    expect(annul).toContain("invoiceInClosedPayroll(");
+    expect(annul).toContain("buildReversalReasons(");
+    expect(annul).toContain("p_items: reversals.map(");
+    // El cobro: el reparto por método, el saldo, la igualdad exacta y la
+    // decisión de cerrar la factura — exactamente las líneas que ya estaban.
+    const split = bodyOf("splitPayment");
+    expect(split).toContain("computeCardFees(");
+    expect(split).toContain("invoiceNetBalance({");
+    expect(split).toContain("moneyEquals(");
+    expect(split).toContain("balance.netCollected + netSum - balance.netBilled");
+    expect(split).toContain(
+      'const closesInvoice = fullyPaid && detail.invoice.status === "Emitida"',
+    );
+    expect(split).toContain("p_mark_paid: closesInvoice,");
+    expect(split).toContain("p_portions: fees.map(");
+    // Y la marca de la 042 se sigue buscando ANTES de la escritura: una
+    // repetición no llega a la transacción.
+    expect(split.indexOf("findInvoicePaymentsByIdempotencyKey(")).toBeLessThan(
+      split.indexOf('db.rpc("invoice_split_payment_atomic"'),
+    );
+  });
+
+  it("las funciones escriben las MISMAS columnas que el servicio leía con INVOICE_SELECT", () => {
+    // La lista no es una transcripción a mano: es la del `select(...)` con el
+    // que el servicio leía esa fila, y es la que el `jsonb_build_object` de la
+    // 050 devuelve (ver el bloque de la migración).
+    const match = /const INVOICE_SELECT =\s*\n?\s*"([^"]+)"/.exec(service);
+    expect(match, "INVOICE_SELECT").not.toBeNull();
+    const columns = (match as RegExpExecArray)[1].split(",").map((column) => column.trim());
+    expect(columns).toEqual([
+      "id",
+      "sede_id",
+      "consecutive_number",
+      "client_name",
+      "client_document",
+      "subtotal",
+      "discount",
+      "tax",
+      "surcharge",
+      "total",
+      "status",
+      "user_id",
+      "cash_shift_id",
+      "closed_by",
+      "closed_at",
+      "cancel_reason",
+      "created_at",
+      "edit_version",
+    ]);
+    const sql = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "050_billing_state_atomic.sql"),
+      "utf8",
+    );
+    for (const column of columns) expect(sql, column).toContain(`'${column}'`);
+  });
+});
+
+// ---------------- CL-11: la migración 050 ----------------
+
+describe("migración 050_billing_state_atomic.sql (CL-11)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "050_billing_state_atomic.sql"),
+    "utf8",
+  );
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("piso anti-vacío: el archivo existe y trae DDL real", () => {
+    expect(raw.length).toBeGreaterThan(15000);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("las DOS operaciones viven cada una en UNA función: una sentencia, una transacción", () => {
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.invoice_annul_atomic");
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.invoice_split_payment_atomic");
+    // Los grupos de escritura de cada operación, en la misma función.
+    expect(sql).toMatch(/UPDATE public\.invoices/);
+    expect(sql).toMatch(/INSERT INTO public\.inventory_movements/);
+    expect(sql).toMatch(/INSERT INTO public\.invoice_payments/);
+    // Las reversiones y las porciones llegan como ARREGLO (nunca una fila por
+    // request).
+    expect(sql).toMatch(/jsonb_array_elements\(p_items\)/);
+    expect(sql).toMatch(/jsonb_array_elements\(p_portions\)/);
+    // El lock de la fila de la factura (el punto de serialización del dinero).
+    expect(sql).toMatch(/FOR UPDATE/);
+    // Orden determinista de los locks de stock (el orden del trigger de 004).
+    expect(sql).toMatch(/ORDER BY p\.id/);
+    // Las porciones NO llevan orden: se conserva el del llamador (la fila de
+    // identidad de la 042 es la primera).
+    expect(sql).toMatch(/FROM jsonb_array_elements\(p_portions\) AS item;/);
+  });
+
+  it("conserva las precondiciones de estado que el servicio ya tenía", () => {
+    // El compare-and-swap de la anulación, adentro de la transacción.
+    expect(sql).toMatch(/v_factura\.status <> p_expected_status/);
+    expect(sql).toMatch(/i\.status = p_expected_status/);
+    expect(sql).toContain("ANNUL_CONFLICT");
+    // La factura anulada no admite cobros.
+    expect(sql).toMatch(/v_factura\.status = 'Anulada'/);
+    expect(sql).toContain("ANNUL_INVALID");
+    // La marca de la 042: a lo sumo UNA porción marcada (la premisa del índice).
+    expect(sql).toMatch(/v_marcadas > 1/);
+  });
+
+  it("tiene una red de conteo por grupo de escritura, con rollback", () => {
+    // Cuatro: el CAS de la factura y las reversiones en la anulación; las
+    // porciones y el cierre en el cobro.
+    expect(sql.match(/GET DIAGNOSTICS/g) ?? []).toHaveLength(4);
+    expect(sql).toContain("RAISE EXCEPTION");
+    expect(sql).toContain("ANNUL_CONFLICT");
+    expect(sql).toContain("PRODUCT_NOT_FOUND");
+    expect(sql).toContain("PAYMENT_MISMATCH");
+    // La guarda de forma no puede caer en un NULL silencioso: el `coalesce` es
+    // lo que hace que una clave AUSENTE falle en vez de comparar contra NULL
+    // (la misma trampa que 046–049 documentan).
+    expect(sql).toMatch(/coalesce\(/);
+  });
+
+  it("NO mueve aritmética de dinero a SQL: ningún monto se recalcula", () => {
+    // Las tablas ya validan sus montos con los CHECK de 005/019 (validar no es
+    // calcular): esta migración no agrega una sola expresión aritmética sobre
+    // las columnas de dinero. Escribir = convertir la representación
+    // (jsonb → la columna), no operar. Los textos de los `COMMENT ON …` se
+    // excluyen: son PROSA que viaja como string, no sentencias.
+    const ddl = sql.replace(/COMMENT ON FUNCTION[\s\S]*?';\n/g, "");
+    for (const column of [
+      "amount",
+      "fee_amount",
+      "fee_percent",
+      "qty",
+      "subtotal",
+      "discount",
+      "tax",
+      "surcharge",
+      "total",
+    ]) {
+      expect(ddl, column).not.toMatch(new RegExp(`${column}\\s*[+\\-*/]`));
+    }
+    expect(ddl).not.toContain("CHECK");
+    expect(ddl).not.toMatch(/sum\s*\(/i);
+    expect(ddl).not.toMatch(/round\s*\(/i);
+    // El stock lo sigue aplicando EXCLUSIVAMENTE el trigger de 004: acá no se
+    // escribe una sola columna de stock ni se redefinen sus funciones.
+    expect(ddl).not.toContain("stock_qty");
+    expect(ddl).not.toContain("inventory_apply_stock");
+    expect(ddl).not.toContain("inventory_no_negative_stock");
+    expect(sql).not.toContain("DROP TRIGGER");
+  });
+
+  it("escribe la marca en NULL en las reversiones: quedan FUERA del índice de la 045", () => {
+    const insertBlock = sql.slice(
+      sql.indexOf("INSERT INTO public.inventory_movements"),
+      sql.indexOf("PRODUCT_NOT_FOUND"),
+    );
+    expect(insertBlock).toContain("idempotency_key");
+    expect(insertBlock).toMatch(/idempotency_key\)[\s\S]*\bNULL\b/);
+  });
+
+  it("devuelve EXACTAMENTE lo que el servicio leía (mismo shape)", () => {
+    // Tres devoluciones: la factura de la anulación, y la factura + el conteo de
+    // porciones del cobro. Cada una lista sus columnas, sin `to_jsonb` de la
+    // fila entera (que agregaría `updated_at`, que el servicio nunca leyó).
+    expect(sql.match(/jsonb_build_object\(/g) ?? []).toHaveLength(3);
+    expect(sql).toMatch(/'portions', v_escritos/);
+  });
+
+  it("cierra el permiso: sólo service_role puede ejecutarlas", () => {
+    for (const signature of [
+      "public.invoice_annul_atomic(uuid, uuid, uuid, timestamptz, text, text, jsonb)",
+      "public.invoice_split_payment_atomic(uuid, uuid, uuid, timestamptz, boolean, jsonb)",
+    ]) {
+      expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature}`);
+      expect(sql).toContain(`GRANT EXECUTE ON FUNCTION ${signature}`);
+    }
+    expect(sql).toContain("FROM PUBLIC");
+    expect(sql).toContain("FROM anon");
+    expect(sql).toContain("FROM authenticated");
+    expect(sql).toContain("TO service_role");
+    expect(sql).toContain("SECURITY INVOKER");
+    expect(sql).toContain("SET search_path = public");
+  });
+
+  it("no borra ni reescribe datos: sólo las funciones y sus permisos", () => {
+    expect(sql.match(/CREATE OR REPLACE FUNCTION/g) ?? []).toHaveLength(2);
+    expect(sql.match(/^ALTER FUNCTION/gm) ?? []).toHaveLength(2);
+    expect(sql.match(/^COMMENT ON FUNCTION/gm) ?? []).toHaveLength(2);
+    // Ningún borrado, y dos UPDATE EJECUTABLES: los mismos que el servicio ya
+    // hacía (la anulación y el paso a Pagada).
+    expect(sql).not.toMatch(/\bDELETE\b/);
+    expect(sql).not.toMatch(/^\s*TRUNCATE/im);
+    expect(sql.match(/UPDATE public\./g) ?? []).toHaveLength(2);
+    // `updated_at` lo sigue escribiendo el trigger de 005, no esta migración.
+    expect(sql).not.toMatch(/updated_at/);
+    expect(sql).not.toMatch(/^\s*ALTER TABLE/im);
+    expect(sql).not.toMatch(/^\s*CREATE INDEX/im);
+    expect(sql).not.toContain("DROP FUNCTION");
+    expect(sql).not.toContain("DROP CONSTRAINT");
+  });
+
+  it("declara el acoplamiento, el costo de numeración y las ventanas", () => {
+    expect(raw).toContain("ACOPLAMIENTO DE DESPLIEGUE");
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("VENTANAS DECLARADAS");
+    expect(raw).toContain("050");
+    expect(raw).toContain("049");
+  });
+
+  it("declara lo que se midió del trigger del stock: el IN no pasa por la guarda", () => {
+    // El acoplamiento con la frontera de inventario (el "giro" del stock): la
+    // reversión NO reusa `deduct_stock_atomic` (escribe OUT y rechaza el
+    // producto repetido) y su IN no toma el lock del BEFORE ROW.
+    expect(raw).toContain("trg_inventory_no_negative");
+    expect(raw).toContain("trg_inventory_apply_stock");
+    expect(raw).toMatch(/IF NEW\.type = 'OUT'/);
+    expect(raw).toContain("deduct_stock_atomic");
+    expect(raw).toContain("count(DISTINCT product_id)");
+  });
+});
+
+// ---------------- CL-12: el diff del servicio vive en la persistencia ---
+//
+// Tercera de las tres comprobaciones de "no se movió aritmética de dinero a
+// SQL": las DOS ediciones cambian su forma de persistir —la secuencia de
+// requests sueltos pasa a ser una transacción— y nada más. El diff de ítems, el
+// subtotal de cada línea, el snapshot de impuestos, los totales, el delta NETO de
+// stock con su motivo, el candado y la reconciliación del total inmutable siguen
+// siendo líneas de TypeScript.
+//
+// (La segunda comprobación —el DATO DE ENTRADA → FILA ESCRITA— vive en el
+// describe de CL-12 de arriba: los ítems, los impuestos, los totales y los
+// movimientos se contrastan contra las funciones de producción que los computan.)
+
+describe("billing: CL-12 el diff del servicio vive en el bloque de persistencia", () => {
+  // El archivo se normaliza a LF: el repositorio lo guarda en CRLF y las
+  // aserciones de abajo miran LÍNEAS (`\n}\n` cierra una función).
+  const service = readFileSync(
+    join(process.cwd(), "src", "features", "billing", "service.ts"),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+
+  /** Cuerpo de `export async function <name>` (hasta su llave de cierre). */
+  function bodyOf(name: string): string {
+    const start = service.indexOf(`export async function ${name}(`);
+    expect(start, `existe ${name}`).toBeGreaterThan(-1);
+    const end = service.indexOf("\n}\n", start);
+    expect(end, `${name} cierra`).toBeGreaterThan(start);
+    return service.slice(start, end + 2);
+  }
+
+  /** Cuerpo de una función interna de módulo (`function <name>(`). */
+  function functionBody(name: string): string {
+    const start = service.indexOf(`\nfunction ${name}(`);
+    expect(start, `existe ${name}`).toBeGreaterThan(-1);
+    const end = service.indexOf("\n}\n", start);
+    expect(end, `${name} cierra`).toBeGreaterThan(start);
+    return service.slice(start, end + 2);
+  }
+
+  it("las DOS ediciones escriben por RPC y ninguna abre una escritura suelta", () => {
+    const cases = [
+      { name: "editInvoiceItems", rpc: "invoice_edit_items_atomic" },
+      { name: "editEmittedInvoiceItems", rpc: "invoice_edit_emitted_atomic" },
+    ] as const;
+
+    for (const item of cases) {
+      const body = bodyOf(item.name);
+      // UNA transacción por edición: ni dos `rpc` por un descuido, ni uno de
+      // menos.
+      expect(body.match(/db\.rpc\(/g) ?? [], item.name).toHaveLength(1);
+      expect(body, item.name).toContain(`db.rpc("${item.rpc}"`);
+      // Ninguna escritura suelta: ni la factura, ni los ítems, ni los impuestos,
+      // ni los cobros, ni el kardex (el kardex lo escribe la función).
+      for (const table of [
+        "invoices",
+        "invoice_items",
+        "invoice_taxes",
+        "invoice_payments",
+        "inventory_movements",
+      ]) {
+        expect(body, `${item.name} no escribe ${table}`).not.toContain(`.from("${table}")`);
+      }
+      // El ajuste de stock ya no pasa por la frontera de inventario del cliente:
+      // viaja como DATO y lo escribe la función.
+      expect(body, item.name).not.toContain("registerMovement(");
+      // Y el candado ya no se reclama desde el cliente.
+      expect(body, item.name).not.toContain("claimInvoiceEdit");
+    }
+  });
+
+  it("el candado de la 038 se movió adentro: viaja como precondición de la transacción", () => {
+    // El compare-and-swap del cliente ya no existe en ninguna parte del módulo.
+    expect(service).not.toContain("claimInvoiceEdit");
+    // Las dos ediciones llevan las DOS mitades de la precondición (versión y
+    // estado, CL-1) leídas antes de llamar: la función las contrasta contra la
+    // fila bloqueada.
+    for (const name of ["editInvoiceItems", "editEmittedInvoiceItems"] as const) {
+      const body = bodyOf(name);
+      expect(body, name).toContain("p_expected_version: Number(detail.invoice.edit_version)");
+      expect(body, name).toContain("p_expected_status: detail.invoice.status");
+    }
+  });
+
+  it("la aritmética y las decisiones de plata se quedan en TypeScript: viajan como DATO", () => {
+    // La edición ADMIN: la reconciliación del total inmutable, el candado de
+    // nómina, el pre-chequeo de stock y las dos proyecciones computadas.
+    const admin = bodyOf("editInvoiceItems");
+    expect(admin).toContain("assertEditReconciles(");
+    expect(admin).toContain("invoiceInClosedPayroll(");
+    expect(admin).toContain("planStockDeduction(");
+    expect(admin).toContain("editItemColumns(next)");
+    expect(admin).toContain("buildEditStockMoves({");
+    expect(admin).toContain("items_remove: diff.removed.map(");
+    expect(admin).toContain("movements: inventoryMoves,");
+    // El subtotal de cada línea y los campos de comisión: `computeLineSubtotal`
+    // y `normalizeCommissionFields`, en la proyección del ítem.
+    const columns = functionBody("editItemColumns");
+    expect(columns).toContain("computeLineSubtotal(");
+    expect(columns).toContain("normalizeCommissionFields(");
+    // El delta NETO por producto y su tipo: el signo del delta decide OUT/IN y la
+    // cantidad absoluta es lo que se escribe. Nada de esto cruza a SQL.
+    const moves = functionBody("buildEditStockMoves");
+    expect(moves).toContain('type: delta > 0 ? "OUT" : "IN"');
+    expect(moves).toContain("Math.abs(delta)");
+
+    // La edición LIBRE: los totales, el snapshot, el saldo y el gate de
+    // sobre-cobro — exactamente las líneas que ya estaban.
+    const free = bodyOf("editEmittedInvoiceItems");
+    expect(free).toContain("computeInvoiceTotals(");
+    expect(free).toContain("invoiceNetBalance({");
+    expect(free).toContain("overCollectedEdit(");
+    expect(free).toContain("overCollectedEditMessage(");
+    expect(free).toContain("taxes_remove: detail.taxes.map(");
+    expect(free).toContain("taxes: totals.taxes.map(");
+    expect(free).toContain("total: newTotal,");
+    expect(free).toContain("surcharge,");
+    // Y el candado de nómina que la libre comparte con la admin.
+    expect(free).toContain("invoiceInClosedPayroll(");
+  });
+
+  it("la auditoría queda FUERA de la transacción en las dos ediciones", () => {
+    for (const name of ["editInvoiceItems", "editEmittedInvoiceItems"] as const) {
+      const body = bodyOf(name);
+      // El RPC se llama ANTES de la auditoría: la fila de auditoría no forma
+      // parte de la transacción (es el mismo límite que declaran 049 y 050).
+      expect(body.indexOf('db.rpc("'), name).toBeLessThan(body.indexOf("await writeAudit("));
+    }
+  });
+});
+
+// ---------------- CL-12: la migración 051 ----------------
+
+describe("migración 051_invoice_edit_atomic.sql (CL-12)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "051_invoice_edit_atomic.sql"),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+  /**
+   * El DDL EJECUTABLE: sin los cuerpos de las funciones (donde vive la
+   * operación) y sin los textos de los `COMMENT ON …` (que son PROSA que viaja
+   * como string, no sentencias). Es lo que la migración ejecuta fuera de las
+   * funciones.
+   */
+  const ddl = sql
+    .replace(/AS \$\$[\s\S]*?\n\$\$;/g, "AS $$ ... $$;")
+    .replace(/COMMENT ON FUNCTION[\s\S]*?';\n/g, "");
+
+  it("piso anti-vacío: el archivo existe y trae DDL real", () => {
+    expect(raw.length).toBeGreaterThan(15000);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("las DOS ediciones viven cada una en UNA función: una sentencia, una transacción", () => {
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.invoice_edit_items_atomic");
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.invoice_edit_emitted_atomic");
+    // Los grupos de escritura de cada edición, cada uno en UNA sentencia.
+    expect(sql).toMatch(/UPDATE public\.invoices/);
+    expect(sql).toMatch(/DELETE FROM public\.invoice_items/);
+    expect(sql).toMatch(/UPDATE public\.invoice_items/);
+    expect(sql).toMatch(/INSERT INTO public\.invoice_items/);
+    expect(sql).toMatch(/UPDATE public\.invoice_payments/);
+    expect(sql).toMatch(/INSERT INTO public\.inventory_movements/);
+    // Los del reemplazo: el snapshot de impuestos, que se borra y se inserta.
+    expect(sql).toMatch(/DELETE FROM public\.invoice_taxes/);
+    expect(sql).toMatch(/INSERT INTO public\.invoice_taxes/);
+    // Los grupos llegan como ARREGLO, uno por clave de `p_edit` (nunca una fila
+    // por request).
+    for (const key of [
+      "items_remove",
+      "items_update",
+      "items_insert",
+      "payments",
+      "movements",
+      "taxes_remove",
+      "taxes",
+    ]) {
+      expect(sql, key).toContain(`p_edit -> '${key}'`);
+    }
+    expect(sql).toMatch(/jsonb_array_elements\(coalesce\(p_edit -> 'items_update'/);
+    // Una clave AUSENTE es un arreglo vacío: el caso legal de "no hay nada de ese
+    // grupo" (0 = 0 en las redes de conteo).
+    expect(sql.match(/\[\]'::jsonb/g) ?? []).not.toHaveLength(0);
+    // El lock de la fila de la factura (el punto de serialización de la 038 y
+    // del dinero de esa factura) y el orden determinista de los locks de stock.
+    expect(sql).toMatch(/FOR UPDATE OF i/);
+    expect(sql).toMatch(/ORDER BY p\.id/);
+  });
+
+  it("mueve el candado de la 038 adentro: la precondición (versión + estado) sobre la fila bloqueada", () => {
+    // El token se escribe con la versión leída como precondición, en su propio
+    // WHERE, y la fila se relee bloqueada antes.
+    expect(sql).toMatch(/edit_version = p_expected_version \+ 1/);
+    expect(sql).toMatch(/i\.edit_version = p_expected_version/);
+    expect(sql).toMatch(/i\.status = p_expected_status/);
+    expect(sql).toMatch(/v_factura\.edit_version <> p_expected_version/);
+    expect(sql).toMatch(/v_factura\.status <> p_expected_status/);
+    expect(sql).toContain("EDIT_CONFLICT");
+    // El estado leído sigue siendo la OTRA mitad (CL-1) y la fila tiene que ser
+    // de la sede del actor.
+    expect(sql).toMatch(/i\.sede_id = p_sede_id/);
+  });
+
+  it("tiene una red de conteo por grupo de escritura, con rollback", () => {
+    // Catorce: seis en la edición admin (la factura, los tres de ítems, los
+    // cobros y los movimientos) y ocho en la libre (los seis MÁS el borrado y la
+    // inserción del snapshot de impuestos).
+    expect(sql.match(/GET DIAGNOSTICS/g) ?? []).toHaveLength(14);
+    expect(sql).toContain("RAISE EXCEPTION");
+    expect(sql).toContain("EDIT_CONFLICT");
+    expect(sql).toContain("ITEM_MISMATCH");
+    expect(sql).toContain("PAYMENT_MISMATCH");
+    expect(sql).toContain("TAX_MISMATCH");
+    expect(sql).toContain("PRODUCT_NOT_FOUND");
+    // La guarda de forma no puede caer en un NULL silencioso: el `coalesce` es
+    // lo que hace que una clave AUSENTE falle en vez de comparar contra NULL (la
+    // misma trampa que 046–050 documentan).
+    expect((sql.match(/coalesce\(/g) ?? []).length).toBeGreaterThan(10);
+  });
+
+  it("el REEMPLAZO se cuenta en las DOS mitades: lo que se leyó y lo que se computó", () => {
+    // El borrado de ítems y el del snapshot viejo van por ID y por factura, y su
+    // cuenta es contra los ids RECIBIDOS: un reemplazo se puede contar así, un
+    // `DELETE ... WHERE invoice_id = …` a ciegas no.
+    expect(sql).toMatch(/DELETE FROM public\.invoice_items d[\s\S]*?AND d\.id IN/);
+    expect(sql).toMatch(/DELETE FROM public\.invoice_taxes t[\s\S]*?AND t\.id IN/);
+    // Y las dos inserciones del reemplazo se cuentan contra lo que llegó.
+    expect(sql.match(/INSERT INTO public\.invoice_taxes/g) ?? []).toHaveLength(1);
+    expect(sql.match(/INSERT INTO public\.invoice_items/g) ?? []).toHaveLength(2);
+  });
+
+  it("el UPDATE y el INSERT de ítems escriben LAS MISMAS columnas", () => {
+    // Las dos proyecciones tienen que coincidir columna por columna: si se
+    // separan, una línea editada y una línea nueva quedarían con datos distintos
+    // sin que nada lo note.
+    const updateBlock = sql.slice(
+      sql.indexOf("UPDATE public.invoice_items d"),
+      sql.indexOf("INSERT INTO public.invoice_items"),
+    );
+    const insertBlock = sql.slice(
+      sql.indexOf("INSERT INTO public.invoice_items", sql.indexOf("INSERT INTO public.invoice_items") + 1),
+      sql.indexOf("GET DIAGNOSTICS", sql.indexOf("INSERT INTO public.invoice_items", sql.indexOf("INSERT INTO public.invoice_items") + 1)),
+    );
+    const columns = [
+      "item_type",
+      "product_id",
+      "service_id",
+      "custom_name",
+      "employee_id",
+      "qty",
+      "unit_price",
+      "discount",
+      "no_commission",
+      "commission_value",
+      "commission_mode",
+      "commission_percent_override",
+      "subtotal",
+    ];
+    for (const column of columns) {
+      expect(updateBlock, `update ${column}`).toContain(`item ->> '${column}'`);
+      expect(insertBlock, `insert ${column}`).toContain(`item ->> '${column}'`);
+    }
+    // La edición admin escribe SÓLO el token en la factura: su función no tiene
+    // un grupo capaz de escribir dinero. Es la inmutabilidad del total como
+    // AUSENCIA, no como promesa del llamador.
+    const adminBlock = sql.slice(
+      sql.indexOf("CREATE OR REPLACE FUNCTION public.invoice_edit_items_atomic"),
+      sql.indexOf("CREATE OR REPLACE FUNCTION public.invoice_edit_emitted_atomic"),
+    );
+    const adminInvoiceUpdate = adminBlock.slice(
+      adminBlock.indexOf("UPDATE public.invoices"),
+      adminBlock.indexOf("RETURNING * INTO v_factura;"),
+    );
+    expect(adminInvoiceUpdate).toContain("SET edit_version = p_expected_version + 1");
+    for (const column of ["subtotal", "discount", "tax", "surcharge", "total"]) {
+      expect(adminInvoiceUpdate, `admin no escribe ${column}`).not.toMatch(
+        new RegExp(`SET[\\s\\S]*${column}\\s*=`),
+      );
+    }
+  });
+
+  it("NO mueve aritmética de dinero a SQL: ningún monto se recalcula", () => {
+    // Las tablas ya validan sus montos con los CHECK de 005/019 (validar no es
+    // calcular): esta migración no agrega una sola expresión aritmética sobre
+    // las columnas de dinero. Los CUERPOS de las funciones son las únicas
+    // sentencias que escriben: si la aritmética de dinero se hubiera mudado a
+    // SQL, estaría acá. Escribir = convertir la representación (jsonb → la
+    // columna), no operar.
+    const bodies = (sql.match(/AS \$\$[\s\S]*?\n\$\$;/g) ?? []).join("\n");
+    expect(bodies.length).toBeGreaterThan(5000);
+    for (const column of [
+      "amount",
+      "percent",
+      "qty",
+      "unit_price",
+      "subtotal",
+      "discount",
+      "tax",
+      "surcharge",
+      "total",
+      "commission_value",
+    ]) {
+      expect(bodies, column).not.toMatch(new RegExp(`${column}\\s*[+\\-*/]`));
+    }
+    // Ninguna agregación ni redondeo: el subtotal, los impuestos y el total
+    // llegan calculados.
+    expect(bodies).not.toMatch(/sum\s*\(/i);
+    expect(bodies).not.toMatch(/round\s*\(/i);
+    expect(bodies).not.toMatch(/count\s*\(/i);
+    expect(bodies).not.toContain("CHECK");
+    // El stock lo sigue aplicando EXCLUSIVAMENTE el trigger de 004: acá no se
+    // escribe una sola columna de stock ni se redefinen sus funciones.
+    expect(bodies).not.toContain("stock_qty");
+    expect(bodies).not.toContain("inventory_apply_stock");
+    expect(bodies).not.toContain("inventory_no_negative");
+    expect(sql).not.toContain("DROP TRIGGER");
+    // La única escritura sobre `products` es una LECTURA para el JOIN del kardex
+    // (la sede del producto), nunca un UPDATE.
+    expect(bodies).not.toMatch(/UPDATE public\.products/);
+  });
+
+  it("escribe la marca en NULL en los movimientos: quedan FUERA del índice de la 045", () => {
+    const inserts = sql.match(/INSERT INTO public\.inventory_movements[\s\S]*?ORDER BY p\.id;/g) ?? [];
+    expect(inserts).toHaveLength(2);
+    for (const block of inserts) {
+      expect(block).toContain("idempotency_key");
+      expect(block).toMatch(/idempotency_key\)[\s\S]*?\bNULL\b/);
+    }
+  });
+
+  it("devuelve EXACTAMENTE lo que el servicio leía (mismo shape)", () => {
+    // Cuatro devoluciones: la factura y los conteos de cada edición. Cada una
+    // lista sus columnas, sin `to_jsonb` de la fila entera (que agregaría
+    // `updated_at`, que el servicio nunca leyó).
+    expect(sql.match(/jsonb_build_object\(/g) ?? []).toHaveLength(4);
+    expect(sql.match(/'items', v_items_escritos/g) ?? []).toHaveLength(2);
+    expect(sql.match(/'movements', v_movimientos/g) ?? []).toHaveLength(2);
+    // Las mismas columnas de INVOICE_SELECT, en las dos.
+    for (const column of [
+      "consecutive_number",
+      "client_document",
+      "cancel_reason",
+      "closed_by",
+      "closed_at",
+      "cash_shift_id",
+      "edit_version",
+    ]) {
+      expect(sql.match(new RegExp(`'${column}'`, "g")) ?? []).toHaveLength(2);
+    }
+  });
+
+  it("cierra el permiso: sólo service_role puede ejecutarlas", () => {
+    for (const signature of [
+      "public.invoice_edit_items_atomic(uuid, uuid, uuid, integer, text, jsonb)",
+      "public.invoice_edit_emitted_atomic(uuid, uuid, uuid, integer, text, jsonb)",
+    ]) {
+      expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature}`);
+      expect(sql).toContain(`GRANT EXECUTE ON FUNCTION ${signature}`);
+    }
+    expect(sql).toContain("FROM PUBLIC");
+    expect(sql).toContain("FROM anon");
+    expect(sql).toContain("FROM authenticated");
+    expect(sql).toContain("TO service_role");
+    expect(sql).toContain("SECURITY INVOKER");
+    expect(sql).toContain("SET search_path = public");
+  });
+
+  it("la migración sólo crea funciones y permisos: no toca el esquema ni los datos", () => {
+    expect(sql.match(/CREATE OR REPLACE FUNCTION/g) ?? []).toHaveLength(2);
+    expect(sql.match(/^ALTER FUNCTION/gm) ?? []).toHaveLength(2);
+    expect(sql.match(/^COMMENT ON FUNCTION/gm) ?? []).toHaveLength(2);
+    // El DDL SIN los cuerpos de las funciones: lo que la migración ejecuta
+    // fuera de ellas no tiene una sola sentencia de datos. Los DELETE/INSERT/
+    // UPDATE que el archivo contiene son la OPERACIÓN de la edición (el
+    // reemplazo de ítems e impuestos) y viven ADENTRO de la transacción de esa
+    // operación, no son una migración de datos.
+    expect(ddl).not.toMatch(/\bDELETE\b/);
+    expect(ddl).not.toMatch(/\bINSERT\b/);
+    expect(ddl).not.toMatch(/\bUPDATE public\./);
+    expect(ddl).not.toMatch(/^\s*ALTER TABLE/im);
+    expect(ddl).not.toMatch(/^\s*CREATE INDEX/im);
+    expect(ddl).not.toMatch(/^\s*TRUNCATE/im);
+    expect(sql).not.toContain("DROP FUNCTION");
+    expect(sql).not.toContain("DROP CONSTRAINT");
+    // `updated_at` lo sigue escribiendo el trigger de 005, no esta migración.
+    expect(sql).not.toMatch(/updated_at/);
+    // Los seis UPDATE y los cinco INSERT/TRES DELETE de los cuerpos: las MISMAS
+    // escrituras que el servicio ya hacía.
+    expect(sql.match(/UPDATE public\./g) ?? []).toHaveLength(6);
+    expect(sql.match(/INSERT INTO public\./g) ?? []).toHaveLength(5);
+    expect(sql.match(/DELETE FROM public\./g) ?? []).toHaveLength(3);
+  });
+
+  it("declara el acoplamiento, el costo de numeración y las ventanas", () => {
+    expect(raw).toContain("ACOPLAMIENTO DE DESPLIEGUE");
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("VENTANAS DECLARADAS");
+    expect(raw).toContain("051");
+    expect(raw).toContain("050");
+    expect(raw).toContain("038");
+    expect(raw).toContain("032 no existe");
+  });
+
+  it("declara el REEMPLAZO y lo que se midió de las dos ventanas", () => {
+    // El archivo tiene que decir qué significa todo-o-nada cuando la operación
+    // reemplaza una colección en vez de agregar filas, y de dónde salen las
+    // líneas que se midieron.
+    expect(raw).toContain("REEMPLAZO");
+    expect(raw).toContain("editInvoiceItems");
+    expect(raw).toContain("editEmittedInvoiceItems");
+    expect(raw).toContain("invoice_taxes");
+    expect(raw).toContain("CIERRE DEL TURNO");
+    expect(raw).toContain("EDIT_CONFLICT");
+    // Las líneas que se MIDIERON: las dos ventanas, con su archivo y su línea.
+    expect(raw).toContain("service.ts:1516");
+    expect(raw).toContain("service.ts:1765");
+    expect(raw).toContain("idempotency_key");
+    expect(raw).toContain("INMUTABLE");
   });
 });
