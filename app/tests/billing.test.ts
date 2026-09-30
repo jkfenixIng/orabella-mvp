@@ -3006,6 +3006,17 @@ const payStub = vi.hoisted(() => ({
    * `wait`, `resume`): prueba que el cobro serializa por la fila de la factura.
    */
   rpcEvents: [] as string[],
+  /**
+   * CL-17: el estado del turno. La transacción de la 056 lo bloquea con
+   * `FOR SHARE` y lo revalida: si está `cerrado`, el cobro rechaza con
+   * `SHIFT_CLOSED` en vez de escribir sus porciones en un turno cerrado.
+   */
+  shiftStatus: "abierto",
+  /**
+   * CL-17: un `closeShift` que gana la carrera entre la lectura del servicio y
+   * la transacción. El doble cierra el turno antes de revalidarlo.
+   */
+  closeShiftBeforeCommit: false,
   /** Consultas que el doble no sabe responder: debe quedar SIEMPRE vacío. */
   unexpectedQueries: [] as string[],
 }));
@@ -3038,7 +3049,7 @@ function createSplitStubClient(): unknown {
           base_left: null,
           cash_withdrawn: 0,
           base_difference: null,
-          status: "abierto",
+          status: payStub.shiftStatus,
           observation: null,
         },
       ];
@@ -3216,6 +3227,20 @@ function createSplitStubClient(): unknown {
     if (name !== "invoice_split_payment_atomic") {
       payStub.unexpectedQueries.push(`rpc.${name}`);
       return { data: null, error: { message: `doble de cobro: rpc desconocido ${name}` } };
+    }
+    // CL-17: el TURNO se bloquea (`FOR SHARE`) ANTES de la factura (orden global
+    // `cash_shifts > invoices`). El cierre concurrente se dispara acá.
+    if (payStub.closeShiftBeforeCommit) {
+      payStub.closeShiftBeforeCommit = false;
+      payStub.shiftStatus = "cerrado";
+    }
+    if (String(args?.p_shift_id ?? "") !== payStub.SHIFT_ID) {
+      return { data: null, error: { code: "P0001", message: "SHIFT_NOT_FOUND" } };
+    }
+    if (payStub.shiftStatus !== "abierto") {
+      // El turno que se cerró a mitad del cobro: la transacción lo revalida
+      // sobre la fila bloqueada y rechaza SIN escribir nada.
+      return { data: null, error: { code: "P0001", message: "SHIFT_CLOSED" } };
     }
     const invoiceId = String(args?.p_invoice_id ?? "");
     const release = await splitRowLocks(invoiceId, () => {
@@ -6250,6 +6275,8 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     payStub.rpcEvents.length = 0;
     payStub.unexpectedQueries = [];
     payStub.active = true;
+    payStub.shiftStatus = "abierto";
+    payStub.closeShiftBeforeCommit = false;
     seedInvoice(payStub.INVOICE_ID, 7);
   });
 
@@ -6566,6 +6593,83 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     expect(payInserts()).toBe(0);
     expect(invoice.status).toBe("Anulada");
   });
+
+  // ---- CL-17: el TURNO se bloquea y se revalida dentro de la transacción ---
+  //
+  // El cobro dividido lee el turno abierto en el SERVICIO y después escribe sus
+  // porciones con ese `cash_shift_id`. Entre la lectura y el commit cabe un
+  // `closeShift` (049), y la transacción no lo miraba: las porciones caían en un
+  // turno YA cerrado. MEDIDO ANTES DEL ARREGLO (verbatim):
+  //
+  //     expected BillingError { code: 'OVERPAID', status: 422 } to match object
+  //       { code: 'NO_OPEN_SHIFT', status: 409 }
+  //     expected [ { id: 'pago-1', …(9) } ] to deeply equal []   (invoice_payments)
+
+  it("CL-17: el turno que se cierra a mitad del cobro lo RECHAZA, sin escribir nada", async () => {
+    payStub.closeShiftBeforeCommit = true;
+
+    const failure: unknown = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      closeInvoice(payStub.INVOICE_ID),
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "NO_OPEN_SHIFT", status: 409 });
+    // Nada escrito: ni una porción, ni el cierre de la factura.
+    expect(payStub.payments).toEqual([]);
+    expect(payInserts()).toBe(0);
+    expect(payStub.invoiceUpdate).toBeNull();
+    const invoice = payStub.invoices.find((row) => row.id === payStub.INVOICE_ID) as Record<string, unknown>;
+    expect(invoice.status).toBe("Emitida");
+    expect(payStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("CL-17: el reintento COMPLETA el cobro cuando el turno vuelve a estar abierto", async () => {
+    payStub.closeShiftBeforeCommit = true;
+    await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      closeInvoice(payStub.INVOICE_ID),
+      ACTOR,
+    ).catch((error: unknown) => error);
+    expect(payStub.payments).toEqual([]);
+
+    // La transacción rechazada no dejó marca (se revirtió entera): el reintento
+    // con el turno abierto es una operación NUEVA que termina el cobro.
+    payStub.shiftStatus = "abierto";
+    const retry = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      closeInvoice(payStub.INVOICE_ID),
+      ACTOR,
+    );
+
+    expect(retry.invoice.status).toBe("Pagada");
+    expect(payStub.payments).toHaveLength(1);
+    expect(payStub.invoiceUpdate).toEqual({
+      status: "Pagada",
+      closed_by: "u-1",
+      closed_at: expect.any(String),
+    });
+  });
+
+  it("control negativo: con el turno abierto el mismo cobro cierra la factura", async () => {
+    const result = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      closeInvoice(payStub.INVOICE_ID),
+      ACTOR,
+    );
+
+    // El lock del turno no puede romper el camino feliz: con el turno abierto el
+    // cobro cierra la factura con sus datos de cierre, como siempre.
+    expect(result.invoice.status).toBe("Pagada");
+    expect(payStub.payments).toHaveLength(1);
+    expect(payStub.invoiceUpdate).toMatchObject({ status: "Pagada", closed_by: "u-1" });
+    expect(payStub.unexpectedQueries).toEqual([]);
+  });
 });
 
 // ---------------- CL-11: el diff del servicio vive en la persistencia ---
@@ -6675,6 +6779,92 @@ describe("billing: CL-11 el diff del servicio vive en el bloque de persistencia"
       "utf8",
     );
     for (const column of columns) expect(sql, column).toContain(`'${column}'`);
+  });
+
+  it("CL-17: el cobro manda el TURNO a la transacción y traduce su cierre", () => {
+    // El turno viaja como DATO (parámetro de la operación) además de dentro de
+    // cada porción: es el turno que la función BLOQUEA y al que exige que
+    // pertenezcan TODAS las porciones.
+    const split = bodyOf("splitPayment");
+    expect(split).toContain("p_shift_id: payShift.id");
+    // Y el rechazo de adentro (SHIFT_CLOSED/SHIFT_NOT_FOUND, que llegan con el
+    // SQLSTATE del tope P0001) se traduce al MISMO error que el servicio usa
+    // para "no hay caja abierta", mirando el MENSAJE antes que el código.
+    expect(split).toContain('message.includes("SHIFT_CLOSED")');
+    expect(split).toContain('message.includes("SHIFT_NOT_FOUND")');
+    expect(split).toContain('"NO_OPEN_SHIFT",');
+    expect(split).toContain("No hay caja abierta: abre tu turno para pagar.");
+    expect(split.indexOf('message.includes("SHIFT_CLOSED")')).toBeLessThan(
+      split.indexOf('if (code === "23505" || code === "P0001")'),
+    );
+  });
+});
+
+// ---------------- CL-17: la migración 056 ----------------
+
+describe("migración 056_collection_closes_invoice.sql (CL-17)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "056_collection_closes_invoice.sql"),
+    "utf8",
+  );
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+  const ddl = sql.replace(/COMMENT ON FUNCTION[\s\S]*?';\n/g, "");
+
+  it("piso anti-vacío: el archivo existe y trae DDL real", () => {
+    expect(raw.length).toBeGreaterThan(15000);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("dropea la firma vieja del cobro dividido y crea la nueva", () => {
+    expect(sql).toContain(
+      "DROP FUNCTION IF EXISTS public.invoice_split_payment_atomic(uuid, uuid, uuid, timestamptz, boolean, jsonb)",
+    );
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.invoice_split_payment_atomic\(\s*p_sede_id uuid,\s*p_invoice_id uuid,\s*p_shift_id uuid,\s*p_user_id uuid,\s*p_closed_at timestamptz,/,
+    );
+  });
+
+  it("el cobro dividido bloquea el TURNO (FOR SHARE) antes de la factura y lo revalida", () => {
+    // El orden global `cash_shifts > invoices` es la propiedad que hace que el
+    // lock no pueda deadlockear con `closeShift` (que sólo toma el turno).
+    expect(sql).toContain("FROM public.cash_shifts s");
+    expect(sql).toContain("FOR SHARE OF s");
+    expect(sql).toContain("v_turno.status <> 'abierto'");
+    expect(sql).toContain("'SHIFT_CLOSED'");
+    const shiftsLock = sql.indexOf("FOR SHARE OF s");
+    const invoicesLock = sql.indexOf("FOR UPDATE OF i");
+    expect(shiftsLock).toBeGreaterThan(-1);
+    expect(invoicesLock).toBeGreaterThan(shiftsLock);
+    // Y todas las porciones pertenecen al turno bloqueado.
+    expect(sql).toMatch(/\(item ->> 'cash_shift_id'\)::uuid <> p_shift_id/);
+  });
+
+  it("conserva el cierre del dividido con sus datos y las redes de conteo", () => {
+    const splitStart = sql.indexOf("CREATE OR REPLACE FUNCTION public.invoice_split_payment_atomic");
+    const update = sql.slice(
+      sql.indexOf("UPDATE public.invoices", splitStart),
+      sql.indexOf("RETURNING * INTO v_factura", splitStart),
+    );
+    expect(update).toMatch(/status = 'Pagada'/);
+    expect(update).toMatch(/closed_by = p_user_id/);
+    expect(update).toMatch(/closed_at = p_closed_at/);
+    expect(sql.match(/GET DIAGNOSTICS/g) ?? []).toHaveLength(5);
+    expect(sql).toContain("PAYMENT_MISMATCH");
+  });
+
+  it("cierra el permiso de las dos funciones y no mueve aritmética de dinero", () => {
+    expect(sql).toContain(
+      "GRANT EXECUTE ON FUNCTION public.invoice_split_payment_atomic(uuid, uuid, uuid, uuid, timestamptz, boolean, jsonb) TO service_role",
+    );
+    expect(sql).toContain("SECURITY INVOKER");
+    for (const column of ["amount", "fee_amount", "total", "surcharge"]) {
+      expect(ddl, column).not.toMatch(new RegExp(`${column}\\s*[+\\-*/]`));
+    }
+    expect(ddl).not.toMatch(/round\s*\(/i);
+    expect(ddl).not.toMatch(/invoices\.total/);
   });
 });
 

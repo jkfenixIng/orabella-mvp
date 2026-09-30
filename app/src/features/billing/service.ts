@@ -2435,9 +2435,23 @@ export async function splitPayment(
   // no rechaza a una operación legítima de varias porciones, y el choque aborta
   // la sentencia ENTERA y con ella la transacción—, y el número de porciones que
   // la función devuelve se contrasta contra las que se pidieron.
+  //
+  // CL-17: la 056 agregó a esa transacción el lock del TURNO (arriba, como
+  // parámetro). Un `closeShift` concurrente ya no puede cerrar el turno a mitad
+  // del cobro; la transacción lo revalida y rechaza con `SHIFT_CLOSED`, que
+  // abajo se traduce al mismo error de negocio que el servicio ya usa para "no
+  // hay caja abierta". El cierre de la factura con sus datos (`closed_by`,
+  // `closed_at`) ya viajaba y no cambia.
   const { data: written, error: payError } = await db.rpc("invoice_split_payment_atomic", {
     p_sede_id: sedeId,
     p_invoice_id: id,
+    // CL-17: el TURNO que cobra, como PARÁMETRO de la operación (no sólo dentro
+    // de cada porción). La función lo bloquea (`FOR SHARE`) ANTES de bloquear la
+    // factura —orden global `cash_shifts > invoices`— y lo revalida: un
+    // `closeShift` concurrente ya no puede cerrar el turno a mitad del cobro, así
+    // que las porciones no pueden caer en un turno recién cerrado. Además exige
+    // que TODAS las porciones pertenezcan a ese turno.
+    p_shift_id: payShift.id,
     p_user_id: actor.userId,
     p_closed_at: new Date().toISOString(),
     p_mark_paid: closesInvoice,
@@ -2461,6 +2475,17 @@ export async function splitPayment(
     const message = String((payError as { message?: unknown } | null)?.message ?? "");
     if (message.includes("ANNUL_INVALID")) {
       throw new BillingError("ANNUL_INVALID", annulBlockedMessage("Anulada"), 409);
+    }
+    // CL-17: el turno se cerró entre la lectura del servicio y el commit. La
+    // transacción lo revalida sobre la fila bloqueada y rechaza; acá se traduce
+    // al MISMO error de negocio con el que el servicio responde cuando no hay
+    // caja abierta, en vez de un OVERPAID que no tiene nada que ver.
+    if (message.includes("SHIFT_CLOSED") || message.includes("SHIFT_NOT_FOUND")) {
+      throw new BillingError(
+        "NO_OPEN_SHIFT",
+        "No hay caja abierta: abre tu turno para pagar.",
+        409,
+      );
     }
     // Dos barreras pueden rechazar este INSERT, dentro de la transacción, y el
     // código lo dice: el tope de 031 (trigger BEFORE INSERT → P0001) y el índice
