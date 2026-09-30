@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { moneyEquals, roundMoney } from "@/src/features/billing/schemas";
+import { idempotencyKeySchema, moneyEquals, roundMoney } from "@/src/features/billing/schemas";
 
 export { moneyEquals, roundMoney };
 
@@ -228,13 +228,48 @@ export const openShiftSchema = z.object({
 });
 export type OpenShiftInput = z.infer<typeof openShiftSchema>;
 
-/** CAJ-02: pago contra el turno (factura opcional; método del catálogo, monto > 0). */
-export const registerPaymentSchema = z.object({
-  cash_shift_id: uuidSchema.optional(),
-  invoice_id: uuidSchema.nullish(),
-  method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
-  amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
-});
+/** CAJ-02: pago contra el turno (factura opcional; método del catálogo, monto > 0).
+ *
+ * CL-3: cuando el pago trae `invoice_id` —el cobro de una factura desde la
+ * caja, la puerta de caja donde un reintento duplicaba dinero— el cuerpo exige
+ * `idempotency_key`, la MISMA marca del intento que la emisión de factura, el
+ * abono de nómina y el cobro dividido (`idempotencyKeySchema`, acá arriba: una
+ * sola definición para las cuatro puertas del dinero). Es lo que permite
+ * reconocer un reintento —doble clic, o el navegador reenviando tras cortarse
+ * la red— como la MISMA operación en vez de como un cobro nuevo.
+ *
+ * La marca es OBLIGATORIA ahí y no opcional: este camino acepta montos
+ * PARCIALES, así que el tope de 031 no frena el reintento (con 2 × entrante ≤
+ * saldo, entra dos veces) y un envío sin marca no se puede reconocer. El
+ * rechazo es ruidoso (VALIDATION 400, CERO escrituras) y la ruta REST —que es
+ * justamente la superficie que más reintenta— queda avisada en su comentario.
+ *
+ * Para un pago SIN factura la marca no se exige: su fila vive sólo en
+ * `payments`, que no tiene columna de marca (042 declaró esa puerta fuera de su
+ * alcance), así que aceptarla ahí sería aceptar un campo que no hace nada. Esa
+ * puerta sigue SIN marca, y es un duplicado real MEDIDO (un pago de cajón
+ * reintentado escribe una segunda fila en `payments` y el arqueo suma las dos):
+ * cerrarla exige columna e índice en `payments`, es decir una migración, y
+ * quedó fuera del alcance de esta unidad.
+ */
+export const registerPaymentSchema = z
+  .object({
+    cash_shift_id: uuidSchema.optional(),
+    invoice_id: uuidSchema.nullish(),
+    method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
+    amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+    /** CL-3: marca del INTENTO de cobro (uuid); obligatoria si hay factura. */
+    idempotency_key: idempotencyKeySchema.optional(),
+  })
+  .superRefine((value, context) => {
+    if (value.invoice_id && !value.idempotency_key) {
+      context.addIssue({
+        code: "custom",
+        path: ["idempotency_key"],
+        message: "La marca de idempotencia es obligatoria para cobrar una factura.",
+      });
+    }
+  });
 export type RegisterPaymentInput = z.infer<typeof registerPaymentSchema>;
 
 /**
