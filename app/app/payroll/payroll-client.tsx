@@ -754,6 +754,25 @@ export function PayrollClient(props: PayrollClientProps) {
   // Contador para claves estables de las filas de porciones (no usar el índice:
   // al quitar una fila intermedia el índice cambia y React reusaría el input equivocado).
   const portionKeyRef = useRef(0);
+  /**
+   * CL-2: marca de idempotencia del INTENTO de pago, por ítem.
+   *
+   * Se acuña cuando el intento EMPIEZA (al confirmar el pago de ese ítem) y se
+   * conserva mientras el intento se reintenta: si la red se corta y el usuario
+   * vuelve a oprimir Pagar, el servidor recibe la MISMA marca y devuelve el pago
+   * ya registrado, en vez de pagar otra vez. Se renueva sólo cuando el intento
+   * anterior terminó bien, o cuando el desglose se cierra (el siguiente intento
+   * es otro distinto).
+   *
+   * Es un mapa por ÍTEM y no una marca sola: la identidad de la operación es
+   * (ítem, marca) —el ítem es el que identifica la URL—, y así un intento fallido
+   * del ítem A no le presta su marca a un pago del ítem B.
+   *
+   * No es por tecla ni por render: los montos y los métodos del borrador cambian
+   * libremente sin tocar la marca, así que dos abonos legítimos del mismo monto
+   * son dos intentos con dos marcas (dos pagos), no una repetición.
+   */
+  const paymentKeyRef = useRef(new Map<string, string>());
   // Ajustes por empleado al calcular (bonos y otros descuentos editables).
   const [adjustments, setAdjustments] = useState<
     Record<string, Partial<Record<AdjustmentField, string>>>
@@ -889,6 +908,10 @@ export function PayrollClient(props: PayrollClientProps) {
     setDetailTargetId(null);
     setAdjustments({});
     setPortions({});
+    // CL-2: cerrar el desglose abandona los intentos de pago pendientes; el
+    // próximo acuña marcas nuevas. Si un intento falló y se reabre el desglose
+    // para OTRO pago, ese pago no puede quedar pegado a la marca abandonada.
+    paymentKeyRef.current.clear();
     setDetailDialogOpen(false);
     setCorrection(null);
     closeCorrectionDialog();
@@ -1107,11 +1130,22 @@ export function PayrollClient(props: PayrollClientProps) {
       return;
     }
     setBusy(true);
+    // CL-2: la marca del INTENTO. Se acuña al empezar y se conserva si el
+    // intento falla (el reintento tiene que llevar la misma para que el
+    // servidor reconozca la repetición en vez de pagar dos veces). `crypto`
+    // existe en el navegador (contexto seguro) y en el runtime de Node: no
+    // hace falta ninguna dependencia nueva.
+    const paymentKey = paymentKeyRef.current.get(item.id) ?? crypto.randomUUID();
+    paymentKeyRef.current.set(item.id, paymentKey);
     const result = (await payPayrollItemAction(item.id, {
+      idempotency_key: paymentKey,
       portions: parts,
     })) as ActionResult<{ paid: number; remaining: number }>;
     setBusy(false);
     if (show(result, "Pago registrado.")) {
+      // El intento TERMINÓ bien: el próximo pago de este ítem es OTRO intento y
+      // merece otra marca (si no, devolvería este mismo pago).
+      paymentKeyRef.current.delete(item.id);
       setPortions((prev) => ({ ...prev, [item.id]: [] }));
       if (selectedId) await loadDetail(selectedId);
     }

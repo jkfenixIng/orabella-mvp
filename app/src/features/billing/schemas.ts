@@ -495,8 +495,24 @@ export function assertEditReconciles(args: {
   }
 }
 
-/** FAC-07: cobro dividido (las porciones deben cuadrar con el saldo). */
+/**
+ * FAC-07: cobro dividido (las porciones deben cuadrar con el saldo).
+ *
+ * CL-2: el cobro exige `idempotency_key`, la MISMA marca del intento que la
+ * emisión y el abono de nómina (`idempotencyKeySchema`, acá arriba: una sola
+ * definición para las tres puertas del dinero). Es lo que permite reconocer un
+ * reintento —doble clic, o el navegador reenviando tras cortarse la red— como
+ * la MISMA operación en vez de como un cobro nuevo, y es OBLIGATORIA: sin marca
+ * el envío no se puede reconocer como repetición, así que se rechaza con
+ * VALIDATION y CERO escrituras.
+ *
+ * Importa más de lo que parece: `splitPayment` exige que las porciones igualen
+ * el saldo EXACTO, así que un reintento de un cobro ya registrado no llegaba ni
+ * a insertar —moría con OVERPAID, como si fuera un cobro nuevo—. La marca lo
+ * convierte en el no-op que el llamador espera.
+ */
 export const splitPaymentSchema = z.object({
+  idempotency_key: idempotencyKeySchema,
   portions: z.array(paymentPortionSchema).min(1, "Indique al menos una porción de pago."),
 });
 export type SplitPaymentInput = z.infer<typeof splitPaymentSchema>;

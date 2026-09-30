@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { moneyEquals, roundMoney } from "@/src/features/billing/schemas";
+import { idempotencyKeySchema, moneyEquals, roundMoney } from "@/src/features/billing/schemas";
 import { cashOutLimitViolation } from "@/src/features/cash/schemas";
 import {
   lineHasCommissionBasis,
@@ -61,8 +61,20 @@ export const payrollPortionSchema = z.object({
 });
 export type PayrollPortionInput = z.infer<typeof payrollPortionSchema>;
 
-/** PAY-04: pago del ítem en porciones (deben sumar el neto exacto). */
+/**
+ * PAY-04: pago del ítem en porciones (deben sumar el neto exacto).
+ *
+ * CL-2: la operación exige `idempotency_key`, la MARCA del intento (uuid que
+ * genera la pantalla y que se reutiliza en los reintentos del MISMO intento).
+ * Es la MISMA definición que usa el cobro de factura —vive en
+ * `billing/schemas.ts` y las dos puertas del dinero validan igual, en vez de
+ * tener dos reglas que se pueden separar—. Es OBLIGATORIA: un envío sin marca
+ * no se puede reconocer como repetición, así que aceptarlo sin marca es reabrir
+ * el defecto (pagar dos veces) para ESE llamador, y la ruta REST es la
+ * superficie que más reintenta. El rechazo es ruidoso y no escribe nada.
+ */
 export const payPayrollItemSchema = z.object({
+  idempotency_key: idempotencyKeySchema,
   portions: z.array(payrollPortionSchema).min(1, "Indique al menos una porción de pago."),
 });
 export type PayPayrollItemInput = z.infer<typeof payPayrollItemSchema>;
