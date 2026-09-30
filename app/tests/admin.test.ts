@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -14,7 +14,7 @@ import {
   taxConfigSchema,
 } from "@/src/features/admin/schemas";
 import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
-import { AdminError, setUserRoles } from "@/src/features/admin/service";
+import { AdminError, setUserRoles, upsertEmployee } from "@/src/features/admin/service";
 
 const SEDE_A = "11111111-1111-4111-8111-111111111111";
 const SEDE_B = "22222222-2222-4222-8222-222222222222";
@@ -51,6 +51,15 @@ const postgrest = vi.hoisted(() => ({
     op: "insert" | "delete";
     error: { code: string; message: string };
   },
+  /** `select()` pedidos: { tabla, columnas } (CO-3: la columna leída importa). */
+  selects: [] as Array<{ table: string; columns: string }>,
+  /** Fallo de lectura inyectable en una tabla (PostgREST devuelve error). */
+  failRead: null as null | { table: string; error: { code: string; message: string } },
+  /**
+   * Intercalado de otro escritor: se llama después de una lectura, para poder
+   * meter una escritura concurrente entre la lectura y el insert de la red.
+   */
+  despuesDeLeer: null as null | ((table: string) => void),
   /** El rpc responde éxito pero sin aplicar nada (control negativo). */
   rpcAppliesNothing: false,
   /** Retiene el rpc en vuelo hasta `liberar()` (prueba de concurrencia). */
@@ -67,10 +76,63 @@ const ROLES_CATALOGO = [
   { id: "cccccccc-3333-4333-8333-cccccccccccc", code: "caja" },
 ];
 
-type Filtro = { column: string; values: unknown[] };
+/**
+ * Columnas REALES de las tablas que toca esta ruta, leídas de las migraciones
+ * (nunca de una lista escrita a mano). El doble las usa para RECHAZAR un
+ * `select` sobre una columna inexistente, como lo hace PostgREST: sin eso la
+ * prueba no podría reproducir el defecto de CO-3, porque `user_roles` no tiene
+ * `id` (su PK es `(user_id, role_id)`, `002_auth.sql`).
+ */
+const COLUMNAS_REALES: Record<string, Set<string>> = (() => {
+  const tablas = ["users", "roles", "user_roles", "employees"];
+  const porTabla: Record<string, Set<string>> = Object.fromEntries(
+    tablas.map((tabla) => [tabla, new Set<string>()]),
+  );
+  const dir = join(process.cwd(), "supabase", "migrations");
+  for (const archivo of readdirSync(dir).filter((nombre) => nombre.endsWith(".sql")).sort()) {
+    const sql = readFileSync(join(dir, archivo), "utf8");
+    for (const tabla of tablas) {
+      const cuerpo = sql.match(
+        new RegExp(`CREATE TABLE public\\.${tabla}\\s*\\(([\\s\\S]*?)\\n\\);`),
+      )?.[1];
+      for (const linea of (cuerpo ?? "").split("\n")) {
+        const columna = linea
+          .split("--")[0]
+          .match(/^\s{2}([a-z_][a-z0-9_]*)\s+(uuid|text|boolean|integer|timestamptz|numeric|date)\b/);
+        if (columna) porTabla[tabla].add(columna[1]);
+      }
+      for (const alter of sql.matchAll(new RegExp(`ALTER TABLE public\\.${tabla}\\b[\\s\\S]*?;`, "g"))) {
+        for (const agregada of alter[0].matchAll(/ADD COLUMN (?:IF NOT EXISTS )?([a-z_][a-z0-9_]*)/g)) {
+          porTabla[tabla].add(agregada[1]);
+        }
+      }
+    }
+  }
+  return porTabla;
+})();
+
+function columnasReales(tabla: string): Set<string> {
+  return COLUMNAS_REALES[tabla] ?? new Set<string>();
+}
+
+/** Columnas que un `select()` pide y la tabla NO tiene (PostgREST: 42703). */
+function columnasDesconocidas(tabla: string, columns: string): string[] {
+  const reales = columnasReales(tabla);
+  if (reales.size === 0) return [];
+  return columns
+    .split(",")
+    .map((columna) => columna.trim())
+    .filter((columna) => columna.length > 0 && !columna.includes("(") && !reales.has(columna));
+}
+
+type Filtro = { column: string; values: unknown[]; negate?: boolean };
 
 function cumpleFiltros(row: Record<string, unknown>, filtros: Filtro[]): boolean {
-  return filtros.every((filtro) => filtro.values.includes(row[filtro.column]));
+  return filtros.every((filtro) =>
+    filtro.negate
+      ? !filtro.values.includes(row[filtro.column])
+      : filtro.values.includes(row[filtro.column]),
+  );
 }
 
 function memoryRows(table: string): Array<Record<string, unknown>> {
@@ -121,13 +183,38 @@ function aplicarRpc(fn: string, args: Record<string, unknown>): { data: unknown;
 function createStubClient() {
   const from = (table: string) => {
     const filtros: Filtro[] = [];
-    let modo: "select" | "delete" | "insert" = "select";
+    let modo: "select" | "delete" | "insert" | "upsert" = "select";
     let payload: unknown;
+    let columnas: string | undefined;
+    let onConflict: string | undefined;
     let ejecutado: { data: unknown; error: unknown } | null = null;
 
     const run = (): { data: unknown; error: unknown } => {
       if (ejecutado) return ejecutado;
       const filas = memoryRows(table);
+
+      // Fallo de lectura inyectable: lo que se prueba es que un error de
+      // lectura NUNCA se convierta en "el usuario no tiene roles".
+      if (modo === "select" && postgrest.failRead?.table === table) {
+        ejecutado = { data: null, error: postgrest.failRead.error };
+        return ejecutado;
+      }
+
+      // PostgREST falla la request COMPLETA si el `select` pide una columna que
+      // la tabla no tiene (42703): no devuelve filas vacías.
+      if (columnas) {
+        const inexistentes = columnasDesconocidas(table, columnas);
+        if (inexistentes.length > 0) {
+          ejecutado = {
+            data: null,
+            error: {
+              code: "42703",
+              message: `column ${table}.${inexistentes.join(", ")} does not exist`,
+            },
+          };
+          return ejecutado;
+        }
+      }
 
       if (modo === "delete") {
         postgrest.singleWrites.push(`${table}.delete`);
@@ -157,17 +244,64 @@ function createStubClient() {
           ejecutado = { data: null, error: { code: "23503", message: "viola la FK de users" } };
           return ejecutado;
         }
+        // PK real de 002_auth.sql: (user_id, role_id). Un segundo insert de la
+        // misma fila es 23505, no una fila duplicada inventada.
+        if (
+          table === "user_roles" &&
+          valores.some((nueva) =>
+            filas.some(
+              (fila) => fila.user_id === nueva.user_id && fila.role_id === nueva.role_id,
+            ),
+          )
+        ) {
+          ejecutado = {
+            data: null,
+            error: { code: "23505", message: "duplicate key value violates unique constraint \"user_roles_pkey\"" },
+          };
+          return ejecutado;
+        }
         postgrest.rows[table] = [...filas, ...valores];
         ejecutado = { data: null, error: null };
         return ejecutado;
       }
 
+      if (modo === "upsert") {
+        postgrest.singleWrites.push(`${table}.upsert`);
+        const nuevas = (Array.isArray(payload) ? payload : [payload]) as Array<
+          Record<string, unknown>
+        >;
+        const clave = onConflict ?? "id";
+        const escritas: Array<Record<string, unknown>> = [];
+        for (const nueva of nuevas) {
+          // `id` lo genera la base (gen_random_uuid): el doble lo inventa para
+          // que la fila devuelta tenga identidad, como en el servidor.
+          const completa: Record<string, unknown> = {
+            ...nueva,
+            id: nueva.id ?? `generado-${filas.length + escritas.length + 1}`,
+          };
+          const previa = filas.findIndex((fila) => fila[clave] === completa[clave]);
+          if (previa >= 0) filas[previa] = { ...filas[previa], ...completa };
+          else filas.push(completa);
+          escritas.push(completa);
+        }
+        postgrest.rows[table] = filas;
+        ejecutado = { data: escritas, error: null };
+        return ejecutado;
+      }
+
       ejecutado = { data: filas.filter((fila) => cumpleFiltros(fila, filtros)), error: null };
+      postgrest.despuesDeLeer?.(table);
       return ejecutado;
     };
 
     const query: Record<string, unknown> = {
-      select: () => query,
+      select: (columns?: string) => {
+        if (columns) {
+          columnas = columns;
+          postgrest.selects.push({ table, columns });
+        }
+        return query;
+      },
       delete: () => {
         modo = "delete";
         return query;
@@ -177,8 +311,18 @@ function createStubClient() {
         payload = values;
         return query;
       },
+      upsert: (values?: unknown, options?: { onConflict?: string }) => {
+        modo = "upsert";
+        payload = values;
+        onConflict = options?.onConflict;
+        return query;
+      },
       eq: (column: string, value: unknown) => {
         filtros.push({ column, values: [value] });
+        return query;
+      },
+      neq: (column: string, value: unknown) => {
+        filtros.push({ column, values: [value], negate: true });
         return query;
       },
       in: (column: string, values: unknown[]) => {
@@ -190,7 +334,11 @@ function createStubClient() {
       order: () => query,
       limit: () => query,
       range: () => query,
-      single: () => Promise.resolve(run()),
+      single: () => {
+        const resultado = run();
+        const primera = (resultado.data as Array<Record<string, unknown>> | null)?.[0] ?? null;
+        return Promise.resolve({ data: primera, error: resultado.error });
+      },
       maybeSingle: () => {
         const resultado = run();
         return Promise.resolve({
@@ -248,7 +396,9 @@ describe("admin: reemplazo de roles atómico (ADM-04 / CO-2)", () => {
     postgrest.rows = {};
     postgrest.singleWrites.length = 0;
     postgrest.rpcCalls.length = 0;
+    postgrest.selects.length = 0;
     postgrest.failWrite = null;
+    postgrest.failRead = null;
     postgrest.rpcAppliesNothing = false;
     postgrest.hold = false;
     postgrest.pendientes.length = 0;
@@ -647,6 +797,168 @@ describe("migración 039_atomic_role_replacement.sql (CO-2)", () => {
 
   it("declara que el agente no la ejecutó", () => {
     expect(sql).toContain("NO ejecutado por el agente: requiere base de datos");
+  });
+});
+
+// -------------------------- red de seguridad de roles al crear (CO-3) ---
+describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
+  const EMPLEADO_ID = "99999999-9999-4999-8999-999999999999";
+
+  /**
+   * El usuario de acceso existe con el documento del empleado: el vínculo es
+   * automático por documento, así que esta es la ruta real de `upsertEmployee`
+   * y no la de crear usuario.
+   */
+  function sembrar(roles: string[]): void {
+    postgrest.rows.users = [
+      { id: USUARIO_ID, sede_id: SEDE_A, id_number: "123456", full_name: "Carolina Rojas" },
+    ];
+    postgrest.rows.roles = ROLES_CATALOGO.map((rol) => ({ ...rol }));
+    postgrest.rows.user_roles = roles.map((code) => ({
+      user_id: USUARIO_ID,
+      role_id: ROLES_CATALOGO.find((rol) => rol.code === code)?.id,
+    }));
+    postgrest.rows.employees = [];
+  }
+
+  function rolesPersistidos(): string[] {
+    return memoryRows("user_roles")
+      .filter((fila) => fila.user_id === USUARIO_ID)
+      .map((fila) => codeDeRol(String(fila.role_id)))
+      .sort();
+  }
+
+  function escriturasDeRoles(): string[] {
+    return postgrest.singleWrites.filter((escritura) => escritura.startsWith("user_roles."));
+  }
+
+  beforeEach(() => {
+    postgrest.rows = {};
+    postgrest.singleWrites.length = 0;
+    postgrest.rpcCalls.length = 0;
+    postgrest.selects.length = 0;
+    postgrest.failWrite = null;
+    postgrest.failRead = null;
+    postgrest.despuesDeLeer = null;
+    postgrest.rpcAppliesNothing = false;
+    postgrest.hold = false;
+    postgrest.pendientes.length = 0;
+  });
+
+  it("a quien ya tiene OTRO rol no se le agrega `empleado` (un rol por usuario)", async () => {
+    sembrar(["admin"]);
+
+    await upsertEmployee(baseEmployee());
+
+    // El empleado sí se creó: la prueba corre por la red de seguridad.
+    expect(memoryRows("employees")).toHaveLength(1);
+    expect(rolesPersistidos()).toEqual(["admin"]);
+    expect(escriturasDeRoles()).toEqual([]);
+  });
+
+  it("a quien YA es `empleado` no se le vuelve a insertar el rol", async () => {
+    sembrar(["empleado"]);
+
+    await upsertEmployee(baseEmployee());
+
+    expect(rolesPersistidos()).toEqual(["empleado"]);
+    expect(escriturasDeRoles()).toEqual([]);
+  });
+
+  it("a quien NO tiene ningún rol igual se le asigna `empleado` (la intención sobrevive)", async () => {
+    sembrar([]);
+
+    await upsertEmployee(baseEmployee());
+
+    expect(rolesPersistidos()).toEqual(["empleado"]);
+  });
+
+  it("la lectura de «ya tiene rol» usa una columna que EXISTE en user_roles", async () => {
+    sembrar([]);
+
+    await upsertEmployee(baseEmployee());
+
+    // `user_roles` no tiene `id` (PK compuesta (user_id, role_id), 002_auth.sql):
+    // pedirla hacía que PostgREST devolviera error y la red creyera "sin roles".
+    const reales = columnasReales("user_roles");
+    expect(reales.size).toBeGreaterThan(0);
+    expect(reales.has("id")).toBe(false);
+    const lecturas = postgrest.selects.filter((select) => select.table === "user_roles");
+    expect(lecturas.length).toBeGreaterThan(0);
+    for (const lectura of lecturas) {
+      for (const columna of lectura.columns.split(",")) {
+        expect(reales.has(columna.trim()), `la red lee «${columna}», que no existe`).toBe(true);
+      }
+    }
+  });
+
+  it("un fallo de lectura NO otorga rol: falla cerrado y sin escribir", async () => {
+    sembrar([]);
+    postgrest.failRead = {
+      table: "user_roles",
+      error: { code: "57014", message: "canceling statement due to statement timeout" },
+    };
+
+    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+      code: "INTERNAL",
+      status: 500,
+    });
+
+    // No se otorga nada y tampoco queda un empleado escrito a medias.
+    expect(rolesPersistidos()).toEqual([]);
+    expect(escriturasDeRoles()).toEqual([]);
+    expect(postgrest.singleWrites).toEqual([]);
+  });
+
+  it("una carrera perdida (23505 sobre la PK) no se reporta como fallo ni duplica roles", async () => {
+    sembrar([]);
+    // Otro escritor asigna `empleado` entre la lectura y el insert: la fila que
+    // la red intenta insertar ya está, así que el resultado deseado existe.
+    postgrest.despuesDeLeer = (tabla) => {
+      if (tabla !== "user_roles") return;
+      postgrest.rows.user_roles = [
+        { user_id: USUARIO_ID, role_id: ROLES_CATALOGO.find((rol) => rol.code === "empleado")?.id },
+      ];
+    };
+
+    await upsertEmployee(baseEmployee());
+
+    expect(rolesPersistidos()).toEqual(["empleado"]);
+  });
+
+  it("un fallo REAL del insert sí se propaga (no queda en un console.error)", async () => {
+    sembrar([]);
+    postgrest.failWrite = {
+      table: "user_roles",
+      op: "insert",
+      error: { code: "23503", message: "viola la FK de roles" },
+    };
+
+    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+      code: "INTERNAL",
+      status: 500,
+    });
+
+    expect(rolesPersistidos()).toEqual([]);
+  });
+
+  it("control negativo: al actualizar un empleado la red no lee ni escribe roles", async () => {
+    sembrar(["admin"]);
+    postgrest.rows.employees = [
+      {
+        id: EMPLEADO_ID,
+        sede_id: SEDE_A,
+        user_id: USUARIO_ID,
+        employee_code: "EMP-01",
+        document: "123456",
+      },
+    ];
+
+    await upsertEmployee(baseEmployee({ id: EMPLEADO_ID, employee_code: "EMP-01" }));
+
+    expect(postgrest.selects.filter((select) => select.table === "user_roles")).toEqual([]);
+    expect(escriturasDeRoles()).toEqual([]);
+    expect(rolesPersistidos()).toEqual(["admin"]);
   });
 });
 

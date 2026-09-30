@@ -350,6 +350,45 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
     }
   }
 
+  // Red de seguridad (solo al crear): si el usuario vinculado NO tiene ningún
+  // rol, se le asigna `empleado` para que nadie quede sin acceso por olvido.
+  //
+  // Se lee una columna que EXISTE: `user_roles` no tiene `id` (su clave
+  // primaria es (user_id, role_id), 002_auth.sql). Pedir una columna
+  // inexistente hacía que PostgREST devolviera error y, como solo se miraba
+  // `data`, el error se perdía: el arreglo quedaba nulo SIEMPRE y la red creía
+  // que el usuario no tenía ningún rol. Para quien ya era `admin` eso
+  // insertaba un segundo rol, y el modelo del proyecto es UN rol por usuario
+  // (`setUserRolesSchema` rechaza toda lista que no tenga exactamente uno).
+  //
+  // La decisión se toma ANTES de escribir el empleado, y FALLA CERRADA: si la
+  // lectura no se puede completar no sabemos qué roles tiene, así que no se
+  // otorga nada y la operación se aborta sin dejar una escritura a medias. Un
+  // fallo de lectura no puede convertirse en "no tiene ninguno".
+  //
+  // Al actualizar (`input.id`) no se consulta: los roles no se tocan.
+  let empleadoRoleId: string | null = null;
+  if (!input.id && userId) {
+    const { data: rolesActuales, error: rolesError } = await db
+      .from("user_roles")
+      .select("role_id")
+      .eq("user_id", userId)
+      .limit(1);
+    if (rolesError) throw new AdminError("INTERNAL", "Error interno.", 500);
+    if (!rolesActuales || rolesActuales.length === 0) {
+      const { data: empRole, error: empRoleError } = await db
+        .from("roles")
+        .select("id")
+        .eq("code", "empleado")
+        .maybeSingle();
+      // El catálogo se siembra en 002_auth.sql: si `empleado` falta, el
+      // problema es de datos y se reporta, en vez de dejar a la persona sin
+      // acceso en silencio.
+      if (empRoleError || !empRole) throw new AdminError("INTERNAL", "Error interno.", 500);
+      empleadoRoleId = (empRole as { id: string }).id;
+    }
+  }
+
   const payload = {
     ...(input.id ? { id: input.id } : {}),
     sede_id: input.sede_id,
@@ -381,22 +420,19 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
     throw new AdminError("INTERNAL", "Error interno.", 500);
   }
   if (!data) throw new AdminError("INTERNAL", "Error interno.", 500);
-  // Red de seguridad (solo al crear): si el usuario vinculado quedó sin
-  // roles, se le asigna empleado para que nadie quede sin acceso por olvido.
-  if (!input.id && userId) {
-    const { data: existingRoles } = await db
+  // Único otorgamiento de rol de esta ruta, ya con el empleado escrito: se
+  // inserta el rol resuelto arriba (nada si el usuario ya tenía alguno).
+  if (empleadoRoleId && userId) {
+    const { error: roleError } = await db
       .from("user_roles")
-      .select("id")
-      .eq("user_id", userId)
-      .limit(1);
-    if (!existingRoles || existingRoles.length === 0) {
-      const { data: empRole } = await db.from("roles").select("id").eq("code", "empleado").maybeSingle();
-      if (empRole) {
-        const { error: roleError } = await db
-          .from("user_roles")
-          .insert({ user_id: userId, role_id: (empRole as { id: string }).id });
-        if (roleError) console.error("[admin] no se pudo asignar rol empleado:", roleError.message);
-      }
+      .insert({ user_id: userId, role_id: empleadoRoleId });
+    // 23505 es la PK (user_id, role_id): la fila ya estaba, o sea el usuario YA
+    // es `empleado`, que es justo el estado que esta red buscaba. Es una
+    // carrera perdida contra otro escritor, no una escritura fallida: el
+    // resultado deseado está en la base. Cualquier OTRO error (FK, permisos)
+    // se propaga: un fallo de escritura no queda solo en un console.error.
+    if (roleError && (roleError as { code?: string }).code !== "23505") {
+      throw new AdminError("INTERNAL", "Error interno.", 500);
     }
   }
   return data as EmployeeRow;
