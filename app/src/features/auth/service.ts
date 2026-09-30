@@ -120,6 +120,31 @@ export function isResetTokenUsable(args: {
   return !args.used && args.expiresAt.getTime() > now.getTime();
 }
 
+/**
+ * CL-15: acción propia de este módulo para el residuo de un alta cuya
+ * compensación también falló.
+ *
+ * El vocabulario compartido (`AUDIT_ACTIONS` en `@/src/shared/lib/audit`) es la
+ * lista de acciones OPERATIVAS que la bandeja de alertas de 011 filtra; ésta no
+ * lo es —describe trabajo de REPARACIÓN, no un desvío de la operación—, así que
+ * se declara acá y no se toca el módulo compartido. `audit_logs.action` es
+ * texto libre: un auditor la lee igual, y es la fila que convierte un residuo
+ * silencioso en trabajo pendiente.
+ */
+const AUDIT_USER_CREATE_ROLLBACK_FAILED = "auth.user_create_rollback_failed";
+
+/**
+ * ¿El fallo de un `rpc` es una DECISIÓN del contrato (un `RAISE EXCEPTION` de
+ * las funciones de 054, siempre SQLSTATE P0001) y no una falla del sistema? El
+ * mensaje es el vocabulario compartido entre el archivo y este módulo.
+ */
+function esRechazoDeRpc(
+  error: { code?: string; message?: string } | null,
+  codigo: string,
+): boolean {
+  return Boolean(error && error.code === "P0001" && error.message === codigo);
+}
+
 export interface SessionValidity {
   valid: boolean;
   reason: "ok" | "revoked" | "expired" | "inactive";
@@ -455,22 +480,25 @@ export async function changeUserPassword(args: {
   const matches = await verifyPassword(parsed.data.actual, (user as { password_hash: string }).password_hash);
   if (!matches) throw new AuthError("INVALID_CREDENTIALS", "La clave actual no es correcta.", 401);
 
-  const { error: updateError } = await db
-    .from("users")
-    .update({
-      password_hash: await hashPassword(parsed.data.nueva),
-      must_change_password: false,
-      failed_attempts: 0,
-      locked_until: null,
-    })
-    .eq("id", args.userId);
-  if (updateError) throw new AuthError("INTERNAL", "Error interno.", 500);
+  // CL-15: la clave nueva y la expulsión de las DEMÁS sesiones viajan en UNA
+  // sentencia del servidor (054, `change_user_password`), que conserva la
+  // sesión actual. Antes eran dos requests de PostgREST —dos transacciones— y
+  // un fallo entre ellos dejaba la clave YA cambiada con todas las otras
+  // sesiones vivas: exactamente lo contrario del propósito del cambio. La
+  // verificación de la clave actual sigue acá, en tiempo constante, con el hash
+  // leído de `users`: la función recibe el hash NUEVO ya calculado y nunca ve la
+  // clave en claro.
+  //
+  // La post-condición —"ninguna otra sesión viva"— se comprueba ADENTRO de la
+  // función, sobre la fila bloqueada: si no se cumple, la transacción entera se
+  // revierte y la clave no cambia.
+  const { error: changeError } = await db.rpc("change_user_password", {
+    p_user_id: args.userId,
+    p_password_hash: await hashPassword(parsed.data.nueva),
+    p_current_token_hash: args.currentTokenHash,
+  });
+  if (changeError) throw new AuthError("INTERNAL", "Error interno.", 500);
 
-  // Revoca las demás sesiones; la actual se mantiene (AUTH-02).
-  let query = db.from("sessions").update({ revoked: true }).eq("user_id", args.userId).eq("revoked", false);
-  if (args.currentTokenHash) query = query.neq("token_hash", args.currentTokenHash);
-  const { error: revokeError } = await query;
-  if (revokeError) throw new AuthError("INTERNAL", "Error interno.", 500);
   const changed = user as { id: string; sede_id: string | null };
   await writeAudit({
     sede_id: changed.sede_id,
@@ -523,10 +551,16 @@ export async function confirmPasswordReset(
   const parsed = resetPasswordSchema.safeParse(raw);
   if (!parsed.success) throw new AuthError("VALIDATION", validationMessage(parsed.error), 400);
   const db = await adminDb();
+  const tokenHash = hashToken(parsed.data.token);
+
+  // Lectura de CORTESÍA: da el 400 sin tocar nada cuando el token ya no sirve.
+  // La comprobación que MANDA es la de adentro de `confirm_password_reset`
+  // (054), sobre la fila bloqueada: entre esta lectura y esa sentencia, otro
+  // puede haber usado el token.
   const { data: reset, error } = await db
     .from("password_resets")
     .select("id, user_id, token_hash, expires_at, used")
-    .eq("token_hash", hashToken(parsed.data.token))
+    .eq("token_hash", tokenHash)
     .maybeSingle();
   if (error) throw new AuthError("INTERNAL", "Error interno.", 500);
   const row = reset as PasswordResetRow | null;
@@ -537,32 +571,104 @@ export async function confirmPasswordReset(
     throw new AuthError("RESET_TOKEN_INVALID", "Token inválido o vencido.", 400);
   }
 
-  const { error: markError } = await db
-    .from("password_resets")
-    .update({ used: true })
-    .eq("id", row.id)
-    .eq("used", false);
-  if (markError) throw new AuthError("INTERNAL", "Error interno.", 500);
-
-  const { error: updateError } = await db
-    .from("users")
-    .update({
-      password_hash: await hashPassword(parsed.data.nueva),
-      must_change_password: false,
-      failed_attempts: 0,
-      locked_until: null,
-    })
-    .eq("id", row.user_id);
-  if (updateError) throw new AuthError("INTERNAL", "Error interno.", 500);
-
-  await db.from("sessions").update({ revoked: true }).eq("user_id", row.user_id);
+  // CL-15: la marca de un solo uso (el CAS), la clave y la revocación de las
+  // sesiones viajan en UNA sentencia del servidor (054). Antes eran tres
+  // requests de PostgREST —tres transacciones— y un fallo entre la marca y la
+  // clave dejaba el token QUEMADO con la clave SIN CAMBIAR: el enlace ya no
+  // servía ("usado"), la clave vieja seguía siendo la válida y, sin otro camino
+  // de recuperación en el MVP, la cuenta quedaba inaccesible PARA SIEMPRE. Es
+  // el único hallazgo del barrido que era un callejón sin salida, y por eso la
+  // marca y la clave son ahora indivisibles.
+  const { error: resetError } = await db.rpc("confirm_password_reset", {
+    p_token_hash: tokenHash,
+    p_password_hash: await hashPassword(parsed.data.nueva),
+    p_now: now.toISOString(),
+  });
+  if (resetError) {
+    // Un token que se consumió (o venció) entre la lectura de arriba y la
+    // sentencia: la función lo rechaza con el MISMO error que el usuario ya
+    // conoce, y no escribió nada.
+    if (esRechazoDeRpc(resetError, "RESET_TOKEN_INVALID")) {
+      throw new AuthError("RESET_TOKEN_INVALID", "Token inválido o vencido.", 400);
+    }
+    throw new AuthError("INTERNAL", "Error interno.", 500);
+  }
   return { changed: true };
+}
+
+type AdminDb = Awaited<ReturnType<typeof adminDb>>;
+
+/**
+ * CL-15: compensación del alta de usuario cuando el espejo en Supabase Auth
+ * falla.
+ *
+ * El espejo es un sistema EXTERNO y no puede entrar en la transacción de
+ * `create_user_with_role`, así que la única salida es deshacer lo escrito —y
+ * hacerlo VERIFICADO y AUDIBLE—:
+ *
+ *   1. `discard_created_user` (054) borra el usuario dentro de su propia
+ *      transacción, con red de conteo y red de seguridad: `users` y sus
+ *      `user_roles` (ON DELETE CASCADE, 002) se van juntos.
+ *   2. El llamador vuelve a LEER la tabla. La función ya verificó adentro, pero
+ *      el rastro que se escribe unas líneas más abajo tiene que describir lo
+ *      que el llamador pudo OBSERVAR, no lo que la función prometió: una
+ *      compensación que contesta éxito sin haber borrado también tiene que ser
+ *      audible.
+ *   3. Si el borrado no se pudo hacer o no se pudo verificar, el residuo queda
+ *      AUDITADO en `audit_logs` (más el error en consola). Un residuo silencioso
+ *      es exactamente el defecto que esta unidad cierra: el alta falla, el
+ *      usuario queda y nadie se entera.
+ *
+ * La fila de auditoría nombra el usuario que quedó, su correo y el motivo
+ * estructurado: JAMÁS una clave, un hash ni un token.
+ */
+async function discardCreatedUser(
+  db: AdminDb,
+  args: { userId: string; sedeId: string | null; email: string; motivo: string },
+): Promise<void> {
+  let removido = false;
+  try {
+    const { error } = await db.rpc("discard_created_user", { p_user_id: args.userId });
+    if (!error) {
+      const { data: resto, error: readError } = await db
+        .from("users")
+        .select("id")
+        .eq("id", args.userId)
+        .maybeSingle();
+      removido = !readError && !resto;
+    }
+  } catch {
+    removido = false;
+  }
+
+  if (removido) return;
+
+  await writeAudit({
+    sede_id: args.sedeId,
+    user_id: null,
+    action: AUDIT_USER_CREATE_ROLLBACK_FAILED,
+    entity: "users",
+    entity_id: args.userId,
+    metadata: { email: args.email, motivo: args.motivo },
+  });
+  console.error(
+    "[auth] el alta falló y su compensación también: quedó el usuario",
+    args.userId,
+    "para reparar a mano.",
+  );
 }
 
 /**
  * AUTH-04/07: alta solo por admin. Clave inicial = documento con cambio
  * forzado (AUTH-01). Crea la fila en users + roles y la espeja en
  * Supabase Auth Admin con el email real (futura JWT/RLS; ver README).
+ *
+ * CL-15: el par `users` + `user_roles` viaja en UNA sentencia del servidor
+ * (054, `create_user_with_role`). Antes eran dos requests de PostgREST y un
+ * fallo entre ellos dejaba al usuario insertado sin sus roles; peor, la
+ * compensación del espejo fallido borraba sin mirar el resultado de su propio
+ * borrado. El espejo sigue afuera de la transacción —es otro sistema— y su
+ * fallo ahora se compensa de forma VERIFICADA y AUDIBLE.
  */
 export async function adminCreateUser(raw: unknown): Promise<{ id: string }> {
   const parsed = adminCreateUserSchema.safeParse(raw);
@@ -593,9 +699,8 @@ export async function adminCreateUser(raw: unknown): Promise<{ id: string }> {
     throw new AuthError("VALIDATION", "Rol desconocido.", 400);
   }
 
-  const { data: created, error: insertError } = await db
-    .from("users")
-    .insert({
+  const { data: createdId, error: createError } = await db.rpc("create_user_with_role", {
+    p_user: {
       sede_id: input.sede_id ?? null,
       email: input.email,
       phone: input.phone ?? null,
@@ -603,29 +708,47 @@ export async function adminCreateUser(raw: unknown): Promise<{ id: string }> {
       id_number: input.documento,
       password_hash: await hashPassword(input.documento),
       full_name: input.full_name,
-      must_change_password: true,
-    })
-    .select("id")
-    .single();
-  if (insertError || !created) throw new AuthError("INTERNAL", "Error interno.", 500);
-  const userId = (created as { id: string }).id;
+    },
+    p_role_codes: input.roles,
+  });
+  if (createError) {
+    // Un rol que no está en el catálogo conserva su error de negocio (el
+    // pre-chequeo de arriba ya devolvía éste); una carrera de unicidad y todo
+    // lo demás es un error interno, igual que hoy.
+    if (esRechazoDeRpc(createError, "ROLE_NOT_FOUND")) {
+      throw new AuthError("VALIDATION", "Rol desconocido.", 400);
+    }
+    throw new AuthError("INTERNAL", "Error interno.", 500);
+  }
+  if (typeof createdId !== "string" || createdId.length === 0) {
+    throw new AuthError("INTERNAL", "Error interno.", 500);
+  }
+  const userId = createdId;
 
-  try {
-    const { error: rolesError } = await db
-      .from("user_roles")
-      .insert(roleIds.map((role_id) => ({ user_id: userId, role_id })));
-    if (rolesError) throw rolesError;
-
-    // Espejo en Supabase Auth (email real, user_metadata.id_number).
-    const { error: authError } = await db.auth.admin.createUser({
+  // El espejo en Supabase Auth es OTRO sistema: no es una fila de esta base y
+  // no puede entrar en la transacción de la línea de arriba. Un fallo acá se
+  // compensa deshaciendo lo escrito, y si la compensación también falla el
+  // residuo queda AUDITADO (ver `discardCreatedUser`).
+  const { error: authError } = await db.auth.admin.createUser({
+    email: input.email,
+    password: input.documento,
+    email_confirm: true,
+    user_metadata: { id_number: input.documento, full_name: input.full_name },
+  });
+  if (authError) {
+    await discardCreatedUser(db, {
+      userId,
+      sedeId: input.sede_id ?? null,
       email: input.email,
-      password: input.documento,
-      email_confirm: true,
-      user_metadata: { id_number: input.documento, full_name: input.full_name },
+      // El motivo se guarda ESTRUCTURADO (código/estado del proveedor) y no como
+      // el texto libre que devuelva el otro sistema: un mensaje ajeno no puede
+      // terminar escribiendo en la auditoría algo que el usuario mandó.
+      motivo: String(
+        (authError as { code?: string; status?: number }).code ??
+          (authError as { status?: number }).status ??
+          "auth_error",
+      ),
     });
-    if (authError) throw authError;
-  } catch {
-    await db.from("users").delete().eq("id", userId);
     throw new AuthError("INTERNAL", "Error interno.", 500);
   }
 

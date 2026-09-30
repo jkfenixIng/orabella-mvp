@@ -19,6 +19,7 @@ import {
   type EditInvoiceItemInput,
   moneyEquals,
   nextConsecutiveNumbers,
+  normalizeCommissionFields,
   overCollectedEdit,
   overCollectedEditMessage,
   portionsMatchBalance,
@@ -31,6 +32,7 @@ import { computeInvoiceItemCommission } from "@/src/features/billing/commission"
 import {
   BillingError,
   annulInvoice,
+  buildInvoiceOutReasonTemplate,
   countInvoices,
   createInvoice,
   editEmittedInvoiceItems,
@@ -378,9 +380,14 @@ describe("billing: frontera modular con inventario (B1)", () => {
   );
 
   it("descuenta al emitir vía la frontera de inventory/service", () => {
-    expect(service).toContain("deductStock");
+    // CL-13: el descuento dejó de ser un segundo request del cliente —el plan se
+    // computa con la frontera de inventario (`getProductsStock` +
+    // `planStockDeduction`) y viaja como DATO (`p_out_items`) a la transacción de
+    // la emisión, que lo escribe con `deduct_stock_atomic` (046), con su conteo y
+    // su trigger. Billing sigue sin tocar las tablas de inventario.
     expect(service).toContain("planStockDeduction");
     expect(service).toContain("getProductsStock");
+    expect(service).toContain("p_out_items:");
   });
 
   it("billing no toca tablas de inventory directo (products, inventory_movements)", () => {
@@ -1482,14 +1489,44 @@ type EditWriteKind =
   | "movements";
 
 /**
- * MO-1: estado propio del camino de EMISIÓN (idempotencia de la factura).
+ * CL-13: qué punto de la emisión falla. El nombre del grupo es el MISMO en las
+ * dos rutas que el doble modela a propósito —en la ruta VIEJA cada grupo es un
+ * request suelto del cliente; en la transacción del RPC son grupos de UNA
+ * sentencia—, para que la medición del defecto y la prueba del arreglo se lean
+ * igual. `detail` no es un grupo de escritura: es la RELECTURA del detalle
+ * (`loadDetail`), el único punto de fallo que le queda a la emisión después de
+ * que la deducción de 046 se volvió atómica.
+ */
+type EmissionGroup = "invoice" | "items" | "taxes" | "payments" | "stock" | "detail";
+
+/**
+ * CL-13: qué paso de la COMPENSACIÓN de la ruta vieja (`cleanupFailedInvoice`)
+ * no se puede aplicar. Es el fallo que el `catch {}` de esa compensación se
+ * tragaba en silencio.
+ */
+type CompensationStep = "stock" | "payments" | "taxes" | "items" | "invoice";
+
+/**
+ * MO-1 + CL-13: estado propio del camino de EMISIÓN (idempotencia de la factura
+ * y atomicidad de la emisión).
  *
- * Encendido solo por el bloque de idempotencia: los demás describe siguen con
- * el doble de siempre. Mantiene el estado REAL que decide el defecto —las filas
- * de `invoices`, los consecutivos que devolvió `next_invoice_number` y cuántas
- * veces se escribió cada tabla—, y aplica de verdad los dos índices únicos de
- * la migración 041: un INSERT que repita `(sede_id, consecutive_number)` o
- * `(sede_id, idempotency_key)` responde 23505 y NO agrega fila, como Postgres.
+ * Encendido solo por el bloque de idempotencia y el de atomicidad: los demás
+ * describe siguen con el doble de siempre. Mantiene el estado REAL que decide
+ * el defecto —las filas de `invoices`, los consecutivos que devolvió
+ * `next_invoice_number` y cuántas veces se escribió cada tabla—, y aplica de
+ * verdad los dos índices únicos de la migración 041: un INSERT que repita
+ * `(sede_id, consecutive_number)` o `(sede_id, idempotency_key)` responde 23505
+ * y NO agrega fila, como Postgres.
+ *
+ * CL-13: el mismo doble modela las DOS rutas del camino de emisión. La de HOY es
+ * la transacción del RPC `invoice_create_atomic` (una sentencia, todos los grupos
+ * o ninguno, y el consecutivo reservado ADENTRO) y es la que usan los describes.
+ * La de ANTES —la secuencia de requests sueltos del cliente más la compensación
+ * de `cleanupFailedInvoice`— sigue modelada porque es la que hace REPRODUCIBLE
+ * el RED: con el código previo a la 052, los mismos flags de fallo caen en las
+ * escrituras equivalentes y el test vuelve a medir el residuo silencioso (la
+ * factura viva con su dinero borrado, o el kardex con su OUT y su IN para una
+ * factura que no existe). Sin eso, la medición del defecto se perdería.
  */
 const createStub = vi.hoisted(() => ({
   active: false,
@@ -1499,6 +1536,12 @@ const createStub = vi.hoisted(() => ({
   invoices: [] as Array<Record<string, unknown>>,
   /** Líneas, impuestos y porciones escritos: cuántas veces se movió cada cosa. */
   items: [] as Array<Record<string, unknown>>,
+  /**
+   * CL-13: filas de `invoice_taxes` (el snapshot). La ruta vieja las contaba
+   * pero no las guardaba; ahora se guardan COMPLETAS —una fila por impuesto
+   * activo— para poder afirmar que el grupo escribe lo que el servicio computó.
+   */
+  taxes: [] as Array<Record<string, unknown>>,
   payments: [] as Array<Record<string, unknown>>,
   /** Movimientos de inventario: la salida de stock de cada emisión. */
   movements: [] as Array<Record<string, unknown>>,
@@ -1510,6 +1553,18 @@ const createStub = vi.hoisted(() => ({
   skipLookupOnce: false,
   /** Consultas que el doble no sabe responder: debe quedar SIEMPRE vacío. */
   unexpectedQueries: [] as string[],
+  /** CL-13: el grupo (o la relectura) que falla. `null` = camino normal. */
+  failGroup: null as EmissionGroup | null,
+  /** CL-13: el paso de la compensación de la ruta vieja que falla. */
+  failCompensation: null as CompensationStep | null,
+  /** CL-13: pasos de compensación EJECUTADOS, en orden (ruta vieja). */
+  compensationSteps: [] as string[],
+  /** CL-13: transacciones de emisión que CONFIRMARON (escribieron filas). */
+  commits: 0,
+  /** CL-13: traza del RPC de emisión, en orden (`reject` / `commit`). */
+  rpcEvents: [] as string[],
+  /** CL-13: llamadas al RPC, con sus argumentos: el DATO que viajó. */
+  rpcCalls: [] as Array<{ name: string; args: Record<string, unknown> }>,
   /** Producto de la sede con stock de sobra para descontar. */
   product: {
     id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
@@ -2386,11 +2441,229 @@ function createOverCollectionStubClient(): unknown {
  * y las dos barreras únicas de la migración 041.
  */
 function createInvoiceStubClient(): unknown {
+  /**
+   * CL-13: los pasos de la COMPENSACIÓN de la ruta vieja. El doble los registra
+   * —para poder afirmar que la transacción NO compensa porque no hay nada que
+   * compensar— y permite inyectar el fallo de UNO: es exactamente el fallo que
+   * el `catch {}` de `cleanupFailedInvoice` se tragaba.
+   */
+  const compensate = (
+    step: CompensationStep,
+    apply: () => void,
+  ): { data: unknown; error: unknown } => {
+    createStub.compensationSteps.push(step);
+    if (createStub.failCompensation === step) {
+      return { data: null, error: { code: "08006", message: "connection closed" } };
+    }
+    apply();
+    return { data: null, error: null };
+  };
+
+  /** Grupo que falla, como error de escritura: en la ruta vieja es un request
+   *  del cliente y en la transacción es un grupo de la misma sentencia; en las
+   *  dos, el grupo NO se aplica. */
+  const writeFailure = (): { data: unknown; error: unknown } => ({
+    data: null,
+    error: { code: "08006", message: "connection closed" },
+  });
+
+  /** Fila de `invoice_items` tal como la escribe el camino de emisión (el join
+   *  embebido de ITEM_SELECT es de `loadDetail`). */
+  const pushItemRows = (invoiceId: string, rows: Array<Record<string, unknown>>) => {
+    for (const row of rows) {
+      createStub.items.push({
+        ...row,
+        invoice_id: invoiceId,
+        id: `item-${createStub.items.length + 1}`,
+        created_at: "2026-01-01T00:00:00.000Z",
+        employees: {
+          full_name: "Empleada de prueba",
+          employee_code: "E-01",
+          commission_percent: 35,
+          pay_type: "porcentaje",
+          payout_mode: "normal",
+        },
+      });
+    }
+  };
+
+  /** Fila de `invoice_taxes`: el snapshot COMPLETO, una fila por impuesto. */
+  const pushTaxRows = (invoiceId: string, rows: Array<Record<string, unknown>>) => {
+    for (const row of rows) {
+      createStub.taxes.push({
+        ...row,
+        invoice_id: invoiceId,
+        id: `tax-${createStub.taxes.length + 1}`,
+      });
+    }
+  };
+
+  /** Fila de `invoice_payments`: la porción que escribía el cliente. */
+  const pushPaymentRows = (invoiceId: string, rows: Array<Record<string, unknown>>) => {
+    for (const row of rows) {
+      createStub.payments.push({
+        ...row,
+        invoice_id: invoiceId,
+        id: `payment-${createStub.payments.length + 1}`,
+        created_at: "2026-01-01T00:00:00.000Z",
+      });
+    }
+  };
+
+  /** Fila del kardex: el OUT de la emisión (la deducción la escribe el RPC). */
+  const pushMovements = (rows: Array<Record<string, unknown>>) => {
+    for (const row of rows) {
+      createStub.movements.push({
+        ...row,
+        id: `movement-${createStub.movements.length + 1}`,
+        created_at: "2026-01-01T00:00:00.000Z",
+      });
+    }
+  };
+
+  /**
+   * CL-13: el motivo del OUT como lo rinde la función: la plantilla trae el
+   * token UNA vez y la PRIMERA ocurrencia se sustituye por el consecutivo que la
+   * transacción reservó (el `overlay` del SQL). Si el token no está, la
+   * transacción rechaza con OUT_REASON_INVALID, igual que la función.
+   */
+  const OUT_REASON_TOKEN = "{consecutivo}";
+  const renderOutReason = (template: string, consecutive: number): string | null => {
+    if (!template.includes(OUT_REASON_TOKEN)) return null;
+    return template.replace(OUT_REASON_TOKEN, String(consecutive));
+  };
+
+  /**
+   * CL-13: el doble de la TRANSACCIÓN de emisión (`invoice_create_atomic`, 052).
+   *
+   * Modela lo que decide el defecto, no lo que el test quiere oír: (a) la
+   * barrera de la marca de la 041 se evalúa ADENTRO y su choque no escribe una
+   * fila; (b) el consecutivo se reserva ADENTRO y sólo existe si la transacción
+   * CONFIRMA —un aborto lo revierte, igual que el incremento de
+   * `invoice_sequences`—; (c) los cuatro grupos de escritura (la factura, las
+   * líneas, el snapshot de impuestos y las porciones) más el grupo de stock, o se
+   * aplican TODOS o ninguno; (d) el motivo del OUT se rinde sustituyendo el
+   * token por el consecutivo reservado, con la misma regla que la función (la
+   * PRIMERA ocurrencia, como el `overlay` del SQL) y su ausencia rechaza con
+   * OUT_REASON_INVALID; (e) el turno abierto es una precondición que se vuelve a
+   * comprobar sobre la fila leída.
+   */
+  const createInvoiceTransaction = (args?: Record<string, unknown>) => {
+    const sedeId = String(args?.p_sede_id ?? "");
+    const mark = String(args?.p_idempotency_key ?? "");
+    const invoice = (args?.p_invoice ?? {}) as Record<string, unknown>;
+    const items = (args?.p_items ?? []) as Array<Record<string, unknown>>;
+    const taxes = (args?.p_taxes ?? []) as Array<Record<string, unknown>>;
+    const payments = (args?.p_payments ?? []) as Array<Record<string, unknown>>;
+    const outItems = (args?.p_out_items ?? []) as Array<{ product_id: string; qty: number }>;
+    // Una tentativa cuenta aunque la transacción aborte: el contador tiene el
+    // MISMO significado que en la ruta vieja (escrituras PEDIDAS por tabla).
+    createStub.inserts.invoices = (createStub.inserts.invoices ?? 0) + 1;
+
+    // La precondición del turno, releída de la fila que el servicio ya leyó: la
+    // transacción no es un camino para saltear una guarda.
+    const shift = createStub.shift;
+    if (!shift || shift.id !== args?.p_cash_shift_id || shift.status !== "abierto") {
+      createStub.rpcEvents.push("reject");
+      return { data: null, error: { code: "P0001", message: "SHIFT_NOT_OPEN" } };
+    }
+    // La barrera de la 041, adentro: la marca repetida aborta la transacción
+    // entera (y con ella la reserva del consecutivo).
+    if (
+      createStub.invoices.some((row) => row.sede_id === sedeId && row.idempotency_key === mark)
+    ) {
+      createStub.rpcEvents.push("reject");
+      return {
+        data: null,
+        error: {
+          code: "23505",
+          message: 'duplicate key value violates unique constraint "uq_invoices_sede_idempotency_key"',
+        },
+      };
+    }
+    // El grupo que falla aborta la transacción ENTERA: no se escribe un solo
+    // grupo, y el consecutivo —que se reserva adentro— no llega a existir.
+    if (createStub.failGroup !== null && createStub.failGroup !== "detail") {
+      createStub.rpcEvents.push("reject");
+      if (createStub.failGroup === "stock") {
+        return { data: null, error: { code: "P0001", message: "INSUFFICIENT_STOCK" } };
+      }
+      if (createStub.failGroup === "payments") {
+        return {
+          data: null,
+          error: {
+            code: "P0001",
+            message:
+              "El cobro supera el neto facturado de la factura (total 70000, recargo 0, cobrado neto 0, nuevo neto 70000)",
+          },
+        };
+      }
+      return { data: null, error: { code: "08006", message: "connection closed" } };
+    }
+    // El motivo del OUT: la plantilla tiene que traer el token y se sustituye con
+    // el consecutivo que esta MISMA transacción reservó.
+    const consecutive = createStub.consecutives.length + 1;
+    const reason = renderOutReason(String(args?.p_out_reason ?? ""), consecutive);
+    if (outItems.length > 0 && reason === null) {
+      createStub.rpcEvents.push("reject");
+      return { data: null, error: { code: "P0001", message: "OUT_REASON_INVALID" } };
+    }
+
+    // COMMIT: o se aplican todos los grupos, o ninguno.
+    createStub.consecutives.push(consecutive);
+    const row: Record<string, unknown> = {
+      id: `invoice-${createStub.invoices.length + 1}`,
+      cancel_reason: null,
+      edit_version: 0,
+      created_at: "2026-01-01T00:00:00.000Z",
+      ...invoice,
+      sede_id: sedeId,
+      consecutive_number: consecutive,
+      idempotency_key: mark,
+      user_id: args?.p_user_id ?? null,
+      cash_shift_id: args?.p_cash_shift_id ?? null,
+    };
+    createStub.invoices.push(row);
+    const invoiceId = String(row.id);
+    pushItemRows(invoiceId, items);
+    createStub.inserts.invoice_items =
+      (createStub.inserts.invoice_items ?? 0) + (items.length > 0 ? 1 : 0);
+    pushTaxRows(invoiceId, taxes);
+    createStub.inserts.invoice_taxes =
+      (createStub.inserts.invoice_taxes ?? 0) + (taxes.length > 0 ? 1 : 0);
+    // `cash_shift_id` no viaja por porción: la función escribe el escalar (el
+    // mismo valor en todas, como lo hacía el cliente).
+    pushPaymentRows(
+      invoiceId,
+      payments.map((portion) => ({ ...portion, cash_shift_id: args?.p_cash_shift_id ?? null })),
+    );
+    createStub.inserts.invoice_payments =
+      (createStub.inserts.invoice_payments ?? 0) + (payments.length > 0 ? 1 : 0);
+    pushMovements(
+      outItems.map((item) => ({
+        sede_id: sedeId,
+        product_id: item.product_id,
+        type: "OUT",
+        qty: item.qty,
+        reason,
+        user_id: args?.p_user_id ?? null,
+        idempotency_key: null,
+      })),
+    );
+    createStub.inserts.inventory_movements =
+      (createStub.inserts.inventory_movements ?? 0) + (outItems.length > 0 ? 1 : 0);
+    createStub.commits += 1;
+    createStub.rpcEvents.push("commit");
+    return { data: row, error: null };
+  };
+
   const from = (table: string) => {
     let op = "select";
     let single = false;
     let askedIdempotencyKey = false;
     let payload: Record<string, unknown> = {};
+    /** Filas VERBATIM de un INSERT multi-fila (`payload` guarda la primera). */
+    let insertedRows: Array<Record<string, unknown>> = [];
     const filters: Array<(row: Record<string, unknown>) => boolean> = [];
 
     const matches = (row: Record<string, unknown>) => filters.every((test) => test(row));
@@ -2407,6 +2680,10 @@ function createInvoiceStubClient(): unknown {
           return { data: createStub.invoices.find(matches) ?? null, error: null };
         }
         if (op === "insert") {
+          // CL-13: el grupo de la FACTURA (el primer grupo de escritura). En la
+          // ruta vieja es el INSERT del cliente; en la transacción, el mismo
+          // grupo dentro de la sentencia.
+          if (createStub.failGroup === "invoice") return writeFailure();
           const key = (payload.idempotency_key ?? null) as string | null;
           const clash = (column: string, value: unknown) =>
             createStub.invoices.some(
@@ -2447,39 +2724,86 @@ function createInvoiceStubClient(): unknown {
           createStub.invoices.push(row);
           return { data: row, error: null };
         }
+        if (op === "delete") {
+          // CL-13 ruta VIEJA: la compensación borra la factura (después de sus
+          // líneas, sus impuestos y sus porciones).
+          //
+          // El doble modela el ON DELETE CASCADE de las FK de 005: borrar la
+          // factura arrastra sus hijos —PORQUE LA BASE LO HACE— y por eso los
+          // cuatro `DELETE` de la compensación NO pesan lo mismo: un error en el
+          // borrado de una línea, de un impuesto o de una porción queda TAPADO
+          // por el borrado de la factura que viene después, y el único borrado
+          // que de verdad carga el peso es el de la factura. Sin este cascade el
+          // doble mostraría filas huérfanas que en la base son imposibles.
+          return compensate("invoice", () => {
+            const doomed = createStub.invoices.filter((row) => matches(row)).map((row) => row.id);
+            createStub.invoices = createStub.invoices.filter((row) => !matches(row));
+            createStub.items = createStub.items.filter((row) => !doomed.includes(row.invoice_id));
+            createStub.taxes = createStub.taxes.filter((row) => !doomed.includes(row.invoice_id));
+            createStub.payments = createStub.payments.filter(
+              (row) => !doomed.includes(row.invoice_id),
+            );
+          });
+        }
       }
       if (table === "invoice_items") {
         if (op === "insert") {
-          createStub.items.push({
-            ...payload,
-            id: `item-${createStub.items.length + 1}`,
-            created_at: "2026-01-01T00:00:00.000Z",
-            // Join embebido de ITEM_SELECT en `loadDetail`.
-            employees: {
-              full_name: "Empleada de prueba",
-              employee_code: "E-01",
-              commission_percent: 35,
-              pay_type: "porcentaje",
-              payout_mode: "normal",
-            },
-          });
+          // CL-13: el grupo de las líneas. En la ruta vieja es un request suelto
+          // y el fallo NO escribe nada; en la transacción aborta los cuatro
+          // grupos.
+          if (createStub.failGroup === "items") return writeFailure();
+          pushItemRows(String(payload.invoice_id), insertedRows);
           return { data: null, error: null };
         }
-        return { data: createStub.items, error: null };
+        if (op === "delete") {
+          return compensate("items", () => {
+            createStub.items = createStub.items.filter((row) => !matches(row));
+          });
+        }
+        // La RELECTURA del detalle (`loadDetail`): el punto de fallo que le
+        // queda a la emisión después de la deducción atómica de 046.
+        if (createStub.failGroup === "detail") {
+          createStub.failGroup = null;
+          return writeFailure();
+        }
+        return { data: createStub.items.filter(matches), error: null };
       }
       if (table === "invoice_payments") {
         if (op === "insert") {
-          createStub.payments.push({
-            ...payload,
-            id: `payment-${createStub.payments.length + 1}`,
-            created_at: "2026-01-01T00:00:00.000Z",
-          });
+          // CL-13: el grupo del dinero que entra. El P0001 del tope de 031 es su
+          // fallo real (el servicio lo traduce a OVERPAID).
+          if (createStub.failGroup === "payments") {
+            return {
+              data: null,
+              error: {
+                code: "P0001",
+                message:
+                  "El cobro supera el neto facturado de la factura (total 70000, recargo 0, cobrado neto 0, nuevo neto 70000)",
+              },
+            };
+          }
+          pushPaymentRows(String(payload.invoice_id), insertedRows);
           return { data: null, error: null };
         }
-        return { data: createStub.payments, error: null };
+        if (op === "delete") {
+          return compensate("payments", () => {
+            createStub.payments = createStub.payments.filter((row) => !matches(row));
+          });
+        }
+        return { data: createStub.payments.filter(matches), error: null };
       }
       if (table === "invoice_taxes") {
-        return { data: op === "insert" ? null : [], error: null };
+        if (op === "insert") {
+          if (createStub.failGroup === "taxes") return writeFailure();
+          pushTaxRows(String(payload.invoice_id), insertedRows);
+          return { data: null, error: null };
+        }
+        if (op === "delete") {
+          return compensate("taxes", () => {
+            createStub.taxes = createStub.taxes.filter((row) => !matches(row));
+          });
+        }
+        return { data: createStub.taxes.filter(matches), error: null };
       }
       if (table === "products") {
         // El sondeo de `resolveProductSelect` (columna `commission_value`) y
@@ -2512,6 +2836,15 @@ function createInvoiceStubClient(): unknown {
             id: `movement-${createStub.movements.length + 1}`,
             created_at: "2026-01-01T00:00:00.000Z",
           };
+          // CL-13: el ÚNICO IN que escribe este doble es el de la REVERSIÓN de la
+          // compensación de la ruta vieja (`registerMovement` con type IN): se
+          // registra como paso y se puede hacer fallar. La emisión no escribe
+          // ningún IN.
+          if (payload.type === "IN") {
+            return compensate("stock", () => {
+              createStub.movements.push(movement);
+            });
+          }
           createStub.movements.push(movement);
           return { data: movement, error: null };
         }
@@ -2527,8 +2860,12 @@ function createInvoiceStubClient(): unknown {
       select: () => query,
       insert: (value?: unknown) => {
         op = "insert";
-        const first = Array.isArray(value) ? value[0] : value;
-        payload = (first ?? {}) as Record<string, unknown>;
+        // El contador cuenta ESCRITURAS (una sentencia), no filas: es el mismo
+        // significado que tiene en la transacción del RPC.
+        insertedRows = (Array.isArray(value) ? value : [value ?? {}]) as Array<
+          Record<string, unknown>
+        >;
+        payload = (insertedRows[0] ?? {}) as Record<string, unknown>;
         createStub.inserts[table] = (createStub.inserts[table] ?? 0) + 1;
         return query;
       },
@@ -2571,6 +2908,7 @@ function createInvoiceStubClient(): unknown {
   };
 
   const rpc = async (name: string, args?: Record<string, unknown>) => {
+    createStub.rpcCalls.push({ name, args: (args ?? {}) as Record<string, unknown> });
     if (name === "deduct_stock_atomic") {
       // CL-7/046: el OUT de la emisión ya no es un `registerMovement` por
       // producto en un bucle sin transacción, sino UNA sentencia del servidor
@@ -2580,10 +2918,16 @@ function createInvoiceStubClient(): unknown {
       // (`inserts.inventory_movements`): las aserciones de "una salida de stock
       // por emisión" siguen significando lo mismo que antes. El contador cuenta
       // ESCRITURAS (una sentencia), no filas; por eso suma 1 cuando hay ítems.
+      //
+      // CL-13: en la transacción de la 052 este RPC es el GRUPO DE STOCK, y en
+      // la ruta vieja es el request suelto de la deducción: el fallo se inyecta
+      // en los dos casos con el MISMO flag.
+      if (createStub.failGroup === "stock") {
+        return { data: null, error: { code: "P0001", message: "INSUFFICIENT_STOCK" } };
+      }
       const items = (args?.p_items ?? []) as Array<{ product_id: string; qty: number }>;
-      for (const item of items) {
-        createStub.movements.push({
-          id: `movement-${createStub.movements.length + 1}`,
+      pushMovements(
+        items.map((item) => ({
           sede_id: args?.p_sede_id ?? null,
           product_id: item.product_id,
           type: "OUT",
@@ -2591,19 +2935,23 @@ function createInvoiceStubClient(): unknown {
           reason: args?.p_reason ?? null,
           user_id: args?.p_user_id ?? null,
           idempotency_key: null,
-          created_at: "2026-01-01T00:00:00.000Z",
-        });
-      }
+        })),
+      );
       createStub.inserts.inventory_movements =
         (createStub.inserts.inventory_movements ?? 0) + (items.length > 0 ? 1 : 0);
       return { data: items.length, error: null };
+    }
+    if (name === "invoice_create_atomic") {
+      return createInvoiceTransaction(args);
     }
     if (name !== "next_invoice_number") {
       createStub.unexpectedQueries.push(`rpc.${name}`);
       return { data: null, error: { message: `doble de emisión: rpc desconocido ${name}` } };
     }
     // El consecutivo solo avanza cuando se RESERVA: así el hueco de la carrera
-    // queda a la vista en lugar de esconderse.
+    // queda a la vista en lugar de esconderse. Es la reserva de la RUTA VIEJA
+    // (un request suelto ANTES de la factura); en la transacción de la 052 la
+    // reserva es de adentro y se aplica —o se revierte— con ella.
     const next = createStub.consecutives.length + 1;
     createStub.consecutives.push(next);
     return { data: next, error: null };
@@ -5327,10 +5675,10 @@ describe("billing: la emisión repetida no emite dos veces (MO-1)", () => {
     expect(createStub.consecutives).toEqual([1, 2]);
   });
 
-  it("la carrera (misma marca entre el lookup y el INSERT) devuelve la factura existente y deja el consecutivo como hueco reportado", async () => {
+  it("la carrera (misma marca entre el lookup y la escritura) devuelve la factura existente y NO quema el consecutivo", async () => {
     const first = await createInvoice(emissionPayload(), ACTOR);
-    // La otra emisión se confirmó entre el lookup y el INSERT de esta: el doble
-    // saltea el lookup para armar exactamente esa ventana.
+    // La otra emisión se confirmó entre el lookup y la escritura de esta: el
+    // doble saltea el lookup para armar exactamente esa ventana.
     createStub.skipLookupOnce = true;
 
     const second = await createInvoice(emissionPayload(), ACTOR);
@@ -5338,15 +5686,18 @@ describe("billing: la emisión repetida no emite dos veces (MO-1)", () => {
     // Devuelve la factura de la ganadora: el reintento sigue siendo un no-op.
     expect(second.invoice.id).toBe(first.invoice.id);
     expect(createStub.invoices).toHaveLength(1);
-    // No vacuidad: el INSERT de la segunda SÍ se intentó (dos intentos, una
-    // fila). Si el lookup hubiera encontrado la marca, el segundo INSERT no
+    // No vacuidad: la escritura de la segunda SÍ se intentó (dos intentos, una
+    // fila). Si el lookup hubiera encontrado la marca, el segundo intento no
     // existiría y este camino nunca se habría ejercitado.
     expect(createStub.inserts.invoices).toBe(2);
-    // COSTO DECLARADO, no escondido: la perdedora reservó el consecutivo 2, el
-    // índice único cortó su INSERT y esa reserva quedó SIN factura. Dos
-    // consecutivos reservados, una factura: el hueco es real y está a la vista.
-    expect(createStub.consecutives).toEqual([1, 2]);
-    expect(createStub.consecutives.length - createStub.invoices.length).toBe(1);
+    // ANTES (041): la perdedora de la carrera ya había reservado el consecutivo
+    // 2 —fuera de la transacción— y el choque del índice único la dejaba SIN
+    // factura: un hueco en la serie, declarado como costo.
+    // AHORA (052, CL-13): la reserva es de la MISMA transacción que el choque, así
+    // que la perdedora la REVIERTE con ella. Un consecutivo, una factura, ningún
+    // hueco: los dos arreglos tienen el mismo largo.
+    expect(createStub.consecutives).toEqual([1]);
+    expect(createStub.consecutives.length).toBe(createStub.invoices.length);
     // Nada más se escribió: sin segunda línea, sin segundo movimiento.
     expect(createStub.items).toHaveLength(1);
     expect(createStub.movements).toHaveLength(1);
@@ -5426,6 +5777,391 @@ describe("billing: la emisión repetida no emite dos veces (MO-1)", () => {
     expect(sql).not.toMatch(/\bTRUNCATE\b/i);
     expect(sql).not.toMatch(/UPDATE\s+public\.invoices\b/i);
     expect(sql).not.toMatch(/consecutive_number/);
+  });
+});
+
+// ------------- CL-13: la emisión es UNA transacción -------------------------
+//
+// LA VENTANA MEDIDA. `createInvoice` reservaba el consecutivo e insertaba la
+// factura, sus líneas, sus impuestos, sus porciones y la deducción de stock como
+// una SECUENCIA de requests sueltos contra PostgREST (que no ofrece
+// multi-statement por request), y la compensaba con `cleanupFailedInvoice`: un
+// bucle de reversiones y cuatro `DELETE`, cada uno su propia sentencia, todos
+// DENTRO de un `catch {}` que se tragaba su propio error. Si la compensación
+// fallaba a mitad —el borrado de las líneas no se puede aplicar, la conexión se
+// corta— quedaba un RESIDUO SILENCIOSO: una factura VIVA con su dinero ya
+// borrado y su stock ya devuelto (y entonces una anulación posterior devolvería
+// el stock OTRA vez), o el borrado completo con el kardex conservando su OUT y
+// su IN de una factura que no existe. Nadie se enteraba de nada más que del
+// error original.
+//
+// MECANISMO (a): una FUNCIÓN, `invoice_create_atomic` (052). Es la respuesta de
+// la casa a "PostgREST no tiene transacción multi-statement" (005, 039–051) y la
+// misma decisión que tomaron los seis gemelos: una función es UNA sentencia, y
+// una sentencia corre ENTERA dentro de una sola transacción del servidor. Los
+// grupos de escritura de la emisión —la factura, las líneas, el snapshot de
+// impuestos, las porciones y el OUT de stock— pasan a ser grupos de la MISMA
+// sentencia: o se escriben TODOS, o no se escribe ninguno, y con ellos se
+// revierte la reserva del consecutivo. No hay compensación, así que no hay
+// `catch {}` que trague nada y no hay residuo que reparar.
+//
+// EL CONSECUTIVO (y por qué se mueve adentro). Reservarlo era un request aparte
+// ANTES de la factura: un fallo posterior lo dejaba quemado —un hueco en la
+// serie, uno de los dos residuos que el hallazgo nombra—. Adentro, el incremento
+// de `invoice_sequences` (005) pertenece a la MISMA transacción: si la emisión
+// aborta, la reserva se revierte con ella y la serie queda SIN huecos. Lo único
+// que no conocía el servicio al armar el pedido es el número, y el único texto
+// que depende de él es el motivo del OUT: viaja como PLANTILLA con un token
+// (`FACTURA #{consecutivo} — Cliente`, armado por `buildInvoiceOutReason`, la
+// MISMA función de formato) y la transacción sustituye la PRIMERA ocurrencia con
+// el número que ella reservó. El texto, el separador y el recorte siguen siendo
+// de TypeScript: la función no arma una frase, sustituye un número.
+
+const THIRD_IDEMPOTENCY_KEY = "2b3c4d5e-6f70-4a8b-9c0d-1e2f3a4b5c6d";
+
+describe("billing: la emisión es UNA transacción (CL-13)", () => {
+  const ACTOR: BillingActor = { userId: "u-1", sedeId: createStub.SEDE_ID, roles: ["admin"] };
+
+  /** Emisión de siempre, con nombre de cliente para poder mirar el motivo del OUT. */
+  function emit(extra: Record<string, unknown> = {}) {
+    return createInvoice(emissionPayload({ client_name: "Ana Ruiz", ...extra }), ACTOR);
+  }
+
+  /**
+   * INVARIANTE DE ESTADO, la misma para las dos rutas: después de un fallo, o no
+   * quedó NADA escrito, o quedó una emisión COMPLETA y coherente (su factura, sus
+   * líneas, su dinero y su propia salida de stock, sin una sola reversión). Una
+   * factura viva con su stock devuelto, o con su dinero borrado, es el residuo; y
+   * un kardex con su OUT y su IN para una factura que no existe también —"nada
+   * escrito" quiere decir ninguna fila, no una ida y vuelta—.
+   */
+  function assertNoResidue() {
+    if (createStub.invoices.length === 0) {
+      expect(createStub.items).toEqual([]);
+      expect(createStub.taxes).toEqual([]);
+      expect(createStub.payments).toEqual([]);
+      expect(createStub.movements).toEqual([]);
+      return;
+    }
+    expect(createStub.invoices).toHaveLength(1);
+    expect(createStub.items.length).toBeGreaterThan(0);
+    expect(createStub.payments.length).toBeGreaterThan(0);
+    expect(createStub.movements.map((row) => row.type)).toEqual(["OUT"]);
+  }
+
+  beforeEach(() => {
+    createStub.active = true;
+    createStub.invoices = [];
+    createStub.items = [];
+    createStub.taxes = [];
+    createStub.payments = [];
+    createStub.movements = [];
+    createStub.consecutives = [];
+    createStub.inserts = {};
+    createStub.skipLookupOnce = false;
+    createStub.failGroup = null;
+    createStub.failCompensation = null;
+    createStub.compensationSteps = [];
+    createStub.commits = 0;
+    createStub.rpcEvents = [];
+    createStub.rpcCalls = [];
+    createStub.unexpectedQueries = [];
+  });
+
+  afterEach(() => {
+    createStub.active = false;
+    createStub.failGroup = null;
+    createStub.failCompensation = null;
+    overCollectionStub.taxes = [];
+  });
+
+  it("un fallo cuya compensación TAMBIÉN falla no deja residuo ni silencio (MEDIDO)", async () => {
+    // El fallo cae en medio de la secuencia de escrituras: el grupo de stock no
+    // se puede aplicar (la carrera de stock que el plan pre-verificado no vio) y
+    // la factura, sus líneas y sus porciones YA se escribieron. En la ruta VIEJA
+    // eso dispara la compensación, y la compensación TAMBIÉN falla. El paso que
+    // falla es el ÚLTIMO borrado —el de la FACTURA—, y no es un detalle: con el
+    // ON DELETE CASCADE de 005, un error en el borrado de las líneas, de los
+    // impuestos o de las porciones queda tapado por el borrado de la factura que
+    // viene después. El borrado que de verdad carga el peso es el de la factura,
+    // y es el que este test rompe.
+    createStub.failGroup = "stock";
+    createStub.failCompensation = "invoice";
+
+    const failure: unknown = await emit().catch((error: unknown) => error);
+
+    // El llamador recibe el error ORIGINAL: nada le dice que la compensación
+    // falló ni qué quedó a medias. Eso es la parte silenciosa. (Además, el
+    // código no LEE el resultado de ningún `DELETE`: un borrado que devuelve error
+    // ni siquiera entra al `catch {}`.)
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "INSUFFICIENT_STOCK", status: 409 });
+    // MEDIDO ANTES DEL ARREGLO (verbatim, con el código previo a la 052): la
+    // compensación borraba las porciones y los impuestos, su último borrado
+    // fallaba y el error quedaba en el aire. Quedaba una factura VIVA que el
+    // sistema da por `Pagada` con CERO porciones registradas —el dinero cobrado
+    // desaparecido de una factura que sigue ahí— y con su stock sin descontar,
+    // sin que nadie se entere más que del error original.
+    // Ahora la emisión es UNA transacción: o se escribieron los cinco grupos, o
+    // ninguno, y no hay compensación que pueda fallar.
+    assertNoResidue();
+    // El mecanismo, no la prosa: la transacción NO compensa porque no hay nada
+    // que compensar (el servidor revierte solo); la ruta vieja compensaba y su
+    // `catch {}` se tragaba el fallo.
+    expect(createStub.compensationSteps).toEqual([]);
+  });
+
+  it("el tope de cobro de 031 (P0001) sigue traduciéndose a OVERPAID, y sin residuo", async () => {
+    // La cuarta puerta del tope de cobro que traducía P0001 a OVERPAID era el
+    // INSERT del cliente de la emisión; ahora la traducción vive en el error del
+    // RPC (`toRpcCreateError`) y el contrato de negocio es el MISMO: el mismo
+    // código, el mismo mensaje y el mismo 422.
+    createStub.failGroup = "payments";
+
+    const failure: unknown = await emit().catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "OVERPAID", status: 422 });
+    expect((failure as BillingError).message).toBe("Las porciones superan el saldo pendiente.");
+    assertNoResidue();
+    expect(createStub.consecutives).toEqual([]);
+  });
+
+  it("el camino de éxito escribe EXACTAMENTE las filas de siempre (dato computado → fila escrita)", async () => {
+    // Un impuesto ACTIVO: el snapshot tiene que viajar completo y su monto es el
+    // que computa `snapshotInvoiceTaxes`.
+    overCollectionStub.taxes = [{ code: "IVA", name: "IVA 19%", percent: 19, is_active: true }];
+    const payload = emissionPayload({
+      client_name: "Ana Ruiz",
+      payments: [{ method_code: "efectivo", amount: 83300 }],
+    });
+    const lines = payload.items.map((item) => invoiceItemSchema.parse(item));
+
+    const detail = await emit({
+      payments: [{ method_code: "efectivo", amount: 83300 }],
+    });
+
+    // El consecutivo lo reserva la MISMA transacción (005, adentro).
+    expect(createStub.consecutives).toEqual([1]);
+    expect(createStub.commits).toBe(1);
+    // La factura: los montos de `computeInvoiceTotals` con el impuesto activo,
+    // escritos verbatim.
+    const totals = computeInvoiceTotals({
+      items: lines,
+      discount: 0,
+      activeTaxes: [{ code: "IVA", name: "IVA 19%", percent: 19 }],
+    });
+    expect(createStub.invoices[0]).toMatchObject({
+      sede_id: createStub.SEDE_ID,
+      consecutive_number: 1,
+      idempotency_key: IDEMPOTENCY_KEY,
+      client_name: "Ana Ruiz",
+      client_document: null,
+      subtotal: totals.subtotal,
+      discount: totals.discount,
+      tax: totals.tax,
+      surcharge: 0,
+      total: totals.total,
+      status: "Pagada",
+      user_id: "u-1",
+      cash_shift_id: createStub.SHIFT_ID,
+      closed_by: "u-1",
+    });
+    expect(createStub.invoices[0]?.closed_at).toEqual(expect.any(String));
+    // El snapshot de impuestos: el grupo ENTERO, con el monto computado.
+    expect(createStub.taxes).toHaveLength(1);
+    expect(createStub.taxes[0]).toMatchObject({
+      invoice_id: createStub.invoices[0]?.id,
+      ...totals.taxes[0],
+    });
+    // La línea: el subtotal de `computeLineSubtotal` y los campos de comisión de
+    // `normalizeCommissionFields`.
+    expect(createStub.items).toHaveLength(1);
+    expect(createStub.items[0]).toMatchObject({
+      invoice_id: createStub.invoices[0]?.id,
+      item_type: "producto",
+      product_id: PRODUCT_ID,
+      service_id: null,
+      employee_id: EMPLOYEE_ID,
+      qty: 2,
+      unit_price: 35000,
+      discount: 0,
+      subtotal: computeLineSubtotal(lines[0]).subtotal,
+      ...normalizeCommissionFields(lines[0]),
+    });
+    // La porción: el bruto y el recargo de `computeCardFees` (efectivo, 0%).
+    const fees = computeCardFees(payload.payments, () => 0);
+    expect(createStub.payments).toHaveLength(1);
+    expect(createStub.payments[0]).toMatchObject({
+      invoice_id: createStub.invoices[0]?.id,
+      method_code: "efectivo",
+      amount: fees[0].gross,
+      fee_percent: fees[0].feePercent,
+      fee_amount: fees[0].fee,
+      cash_shift_id: createStub.SHIFT_ID,
+    });
+    // El kardex: UN OUT por la deducción (046), con el motivo de
+    // `buildInvoiceOutReason` —el del consecutivo que reservó la transacción—.
+    expect(createStub.movements).toHaveLength(1);
+    expect(createStub.movements[0]).toMatchObject({
+      sede_id: createStub.SEDE_ID,
+      product_id: PRODUCT_ID,
+      type: "OUT",
+      qty: 2,
+      user_id: "u-1",
+      idempotency_key: null,
+      reason: buildInvoiceOutReason(1, "Ana Ruiz"),
+    });
+    // Una ESCRITURA por grupo, como antes (una sentencia cada uno).
+    expect(createStub.inserts).toMatchObject({
+      invoices: 1,
+      invoice_items: 1,
+      invoice_taxes: 1,
+      invoice_payments: 1,
+      inventory_movements: 1,
+    });
+    // Y el detalle que recibe el llamador es el de la factura escrita.
+    expect(detail.invoice.total).toBe(totals.total);
+    expect(detail.remaining).toBe(0);
+    expect(createStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("un fallo de un grupo dentro de la transacción no deja NADA escrito: ni una fila, ni el consecutivo", async () => {
+    createStub.failGroup = "stock";
+
+    const failure: unknown = await emit().catch((error: unknown) => error);
+
+    // El contrato de negocio del camino de stock NO cambia: el mismo código y
+    // el mismo 409 que devolvía el bucle viejo.
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "INSUFFICIENT_STOCK", status: 409 });
+    assertNoResidue();
+    // El consecutivo NO se quema: la reserva es de la MISMA transacción y se
+    // revierte con ella. La serie no tiene hueco en ningún camino.
+    expect(createStub.consecutives).toEqual([]);
+    expect(createStub.commits).toBe(0);
+    // Y no hay nada que compensar: no queda un `catch {}` que tragarse el fallo.
+    expect(createStub.compensationSteps).toEqual([]);
+    // El reintento del MISMO intento (la marca no se consumió) emite la factura
+    // completa: no quedó un estado a medias que lo bloquee.
+    createStub.failGroup = null;
+    const detail = await emit();
+    expect(detail.invoice.consecutive_number).toBe(1);
+    expect(createStub.consecutives).toEqual([1]);
+    expect(createStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("la relectura del detalle NO borra una emisión ya confirmada, y el reintento la devuelve", async () => {
+    createStub.failGroup = "detail";
+
+    const failure: unknown = await emit().catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "INTERNAL", status: 500 });
+    // El fallo es de LECTURA, posterior a la escritura. MEDIDO: este caso ya era
+    // el menos malo de la ruta vieja —`return loadDetail(...)` devolvía la
+    // promesa SIN `await` dentro del `try`, así que su rechazo escapaba y la
+    // compensación no corría— y dejaba una emisión completa; lo que NO podía
+    // decir era que la emisión SÍ se había hecho, y el llamador veía un fallo de
+    // emisión con una factura viva (que el reintento de la 041 resolvía de
+    // casualidad).
+    // Con la transacción, el commit es UNO y anterior a la lectura: la emisión
+    // quedó COMPLETA, no hay compensación posible ni deseable, y el reintento del
+    // MISMO envío devuelve la factura — no es casualidad, es el contrato de 041.
+    assertNoResidue();
+    expect(createStub.commits).toBe(1);
+    expect(createStub.compensationSteps).toEqual([]);
+    // El reintento del MISMO envío (la marca de 041) devuelve la factura ya
+    // emitida: el cliente no necesita reparar nada.
+    const detail = await emit();
+    expect(detail.invoice.consecutive_number).toBe(1);
+    expect(createStub.invoices).toHaveLength(1);
+    expect(createStub.consecutives).toEqual([1]);
+    expect(createStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("el consecutivo se rinde en TODOS los caminos: se consume, no se reserva en la repetición y NO se quema al fallar", async () => {
+    await emit();
+    expect(createStub.consecutives).toEqual([1]);
+
+    // La repetición de la MISMA marca ni reserva (041): es un no-op.
+    await emit();
+    expect(createStub.consecutives).toEqual([1]);
+
+    await emit({ idempotency_key: OTHER_IDEMPOTENCY_KEY });
+    expect(createStub.consecutives).toEqual([1, 2]);
+
+    // Un fallo a mitad de la transacción NO quema el 3.
+    createStub.failGroup = "items";
+    const failure: unknown = await emit({ idempotency_key: THIRD_IDEMPOTENCY_KEY }).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(createStub.consecutives).toEqual([1, 2]);
+    // Y como no se quemó, el MISMO intento reintentado toma el 3: la serie sigue
+    // CONTINUA, sin hueco, en el camino de éxito y en el de fallo.
+    createStub.failGroup = null;
+    const retried = await emit({ idempotency_key: THIRD_IDEMPOTENCY_KEY });
+    expect(retried.invoice.consecutive_number).toBe(3);
+    expect(createStub.consecutives).toEqual([1, 2, 3]);
+    expect(createStub.invoices).toHaveLength(3);
+    expect(createStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("la repetición (041) sigue siendo un no-op: una sola transacción y un solo consecutivo", async () => {
+    const first = await emit();
+    const second = await emit();
+
+    expect(second.invoice.id).toBe(first.invoice.id);
+    expect(createStub.commits).toBe(1);
+    expect(createStub.invoices).toHaveLength(1);
+    expect(createStub.consecutives).toEqual([1]);
+    // La repetición se resuelve ANTES de la transacción (el lookup de la 041):
+    // el RPC se llamó UNA sola vez.
+    expect(
+      createStub.rpcCalls.filter((call) => call.name === "invoice_create_atomic"),
+    ).toHaveLength(1);
+    expect(createStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("control negativo: un fallo con la marca A no la consume (no queda una emisión fantasma)", async () => {
+    createStub.failGroup = "stock";
+    const failure: unknown = await emit().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(BillingError);
+    createStub.failGroup = null;
+
+    // Otra venta, otra marca: se emite y NO reconoce la marca A.
+    const other = await emit({ idempotency_key: OTHER_IDEMPOTENCY_KEY });
+    expect(other.invoice.consecutive_number).toBe(1);
+    // El MISMO intento fallido, reintentado: emite de verdad (no hay factura
+    // fantasma que lo haga pasar por repetido) y la serie sigue continua.
+    const retried = await emit();
+    expect(retried.invoice.consecutive_number).toBe(2);
+    expect(createStub.invoices).toHaveLength(2);
+    expect(createStub.consecutives).toEqual([1, 2]);
+    expect(createStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("los grupos viajan como DATO en UN solo request: la marca, el turno y los arreglos completos", async () => {
+    await emit();
+
+    const calls = createStub.rpcCalls.filter((call) => call.name === "invoice_create_atomic");
+    expect(calls).toHaveLength(1);
+    const args = calls[0].args;
+    expect(args).toMatchObject({
+      p_sede_id: createStub.SEDE_ID,
+      p_user_id: "u-1",
+      p_cash_shift_id: createStub.SHIFT_ID,
+      p_idempotency_key: IDEMPOTENCY_KEY,
+    });
+    // Los cuatro grupos son ARREGLOS (nunca una fila por request) y el motivo del
+    // OUT es una PLANTILLA: el consecutivo lo pone la transacción.
+    expect(args.p_items).toHaveLength(1);
+    expect(args.p_payments).toHaveLength(1);
+    expect(args.p_out_items).toEqual([{ product_id: PRODUCT_ID, qty: 2 }]);
+    expect(String(args.p_out_reason)).toContain("{consecutivo}");
+    // Auditoría del acto: sigue FUERA de la transacción (posterior al commit).
+    expect(createStub.commits).toBe(1);
   });
 });
 
@@ -6529,5 +7265,319 @@ describe("migración 051_invoice_edit_atomic.sql (CL-12)", () => {
     expect(raw).toContain("service.ts:1765");
     expect(raw).toContain("idempotency_key");
     expect(raw).toContain("INMUTABLE");
+  });
+});
+
+// ---------------- CL-13: la emisión vive en UNA transacción ---
+//
+// Cuarta de las comprobaciones de "no se movió aritmética de dinero a SQL": la
+// emisión cambia su forma de persistir —la secuencia de requests sueltos con su
+// compensación pasa a ser una transacción— y nada más. Los subtotales de línea,
+// el snapshot de impuestos, los totales, el recargo, el estado, el plan de stock
+// y el motivo del kardex siguen siendo líneas de TypeScript.
+//
+// (La comprobación DATO DE ENTRADA → FILA ESCRITA vive en el describe de CL-13
+// de arriba, contra las funciones de producción que computan cada dato.)
+
+describe("billing: CL-13 la emisión vive en UNA transacción", () => {
+  // El archivo se normaliza a LF: el repositorio lo guarda en CRLF y las
+  // aserciones de abajo miran LÍNEAS (`\n}\n` cierra una función).
+  const service = readFileSync(
+    join(process.cwd(), "src", "features", "billing", "service.ts"),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+
+  /** Cuerpo de `export async function <name>` (hasta su llave de cierre). */
+  function bodyOf(name: string): string {
+    const start = service.indexOf(`export async function ${name}(`);
+    expect(start, `existe ${name}`).toBeGreaterThan(-1);
+    const end = service.indexOf("\n}\n", start);
+    expect(end, `${name} cierra`).toBeGreaterThan(start);
+    return service.slice(start, end + 2);
+  }
+
+  it("la emisión escribe por RPC y no abre una sola escritura suelta", () => {
+    const body = bodyOf("createInvoice");
+    // UNA transacción: ni dos `rpc` por un descuido, ni uno de menos.
+    expect(body.match(/db\.rpc\(/g) ?? []).toHaveLength(1);
+    expect(body).toContain('db.rpc("invoice_create_atomic"');
+    // Ninguna escritura suelta: ni la factura, ni los ítems, ni los impuestos,
+    // ni los cobros, ni el kardex (el kardex lo escribe la función).
+    for (const table of [
+      "invoices",
+      "invoice_items",
+      "invoice_taxes",
+      "invoice_payments",
+      "inventory_movements",
+    ]) {
+      expect(body, `createInvoice no escribe ${table}`).not.toContain(`.from("${table}")`);
+    }
+    // Y el descuento de stock dejó de ser un request del cliente.
+    expect(body).not.toContain("registerMovement(");
+    // El consecutivo ya no se reserva desde el cliente: lo reserva la
+    // transacción (es lo que evita el hueco).
+    expect(body).not.toContain("next_invoice_number");
+  });
+
+  it("la compensación desaparece: no queda un `catch {}` que tragarse su propio fallo", () => {
+    // El defecto medido: si la compensación fallaba, el error se lo tragaba el
+    // `catch {}` y el residuo quedaba sin que nadie lo supiera. Ninguna de las
+    // dos cosas existe más.
+    expect(service).not.toContain("cleanupFailedInvoice");
+    const body = bodyOf("createInvoice");
+    expect(body).not.toContain("catch {");
+    expect(body).not.toContain(".delete(");
+    // Y no hay compensación porque no hay nada que compensar: el servidor
+    // revierte la transacción entera.
+    expect(body).toContain('db.rpc("invoice_create_atomic"');
+  });
+
+  it("la aritmética y las decisiones de plata se quedan en TypeScript: viajan como DATO", () => {
+    const body = bodyOf("createInvoice");
+    // Los subtotales de línea, los totales, el snapshot, el recargo, el estado,
+    // el plan de stock y el motivo: exactamente las líneas que ya estaban.
+    expect(body).toContain("computeInvoiceTotals(");
+    expect(body).toContain("computeLineSubtotal(");
+    expect(body).toContain("computeCardFees(");
+    expect(body).toContain("roundMoney(");
+    expect(body).toContain("normalizeCommissionFields(");
+    expect(body).toContain("planStockDeduction(");
+    expect(body).toContain("buildInvoiceOutReasonTemplate(");
+    expect(body).toContain("portionsMatchBalance(");
+    expect(body).toContain("insufficientStockError(");
+    // Los cinco grupos viajan como ARREGLOS computados, en UN solo pedido.
+    expect(body).toContain("p_items: input.items.map(");
+    expect(body).toContain("p_taxes: totals.taxes.map(");
+    expect(body).toContain("p_payments: fees.map(");
+    expect(body).toContain("p_out_items: stockPlan.map(");
+    expect(body).toContain("p_invoice: {");
+  });
+
+  it("la marca (041) se busca ANTES de la transacción y la auditoría queda FUERA", () => {
+    const body = bodyOf("createInvoice");
+    // Una repetición no llega a la transacción: el lookup de la marca va primero.
+    expect(body.indexOf("findInvoiceByIdempotencyKey(")).toBeLessThan(
+      body.indexOf('db.rpc("invoice_create_atomic"'),
+    );
+    // La auditoría se escribe DESPUÉS del commit (fuera de la transacción), como
+    // en las anulaciones y las ediciones: no es un punto de fallo de estado.
+    expect(body.indexOf('db.rpc("invoice_create_atomic"')).toBeLessThan(
+      body.indexOf("await writeAudit("),
+    );
+  });
+
+  it("la PLANTILLA del motivo sale de la misma función de formato (el texto no se duplica)", () => {
+    // `buildInvoiceOutReasonTemplate` usa `buildInvoiceOutReason` con un
+    // consecutivo sentinela y sustituye SÓLO el sentinela: el texto, el separador
+    // y el recorte siguen decidiéndose en un solo lugar.
+    expect(service).toContain("buildInvoiceOutReasonTemplate");
+    expect(service).toContain("buildInvoiceOutReason(OUT_REASON_SENTINEL");
+    expect(service).toContain("const OUT_REASON_TOKEN = \"{consecutivo}\"");
+    // `String.replace` con un patrón de texto reemplaza sólo la PRIMERA
+    // ocurrencia: un nombre de cliente no puede confundirse con el número.
+    const start = service.indexOf("export function buildInvoiceOutReasonTemplate");
+    const end = service.indexOf("\n}\n", start);
+    const template = service.slice(start, end + 2);
+    expect(template).toContain(".replace(");
+    expect(template).not.toContain("replaceAll");
+    // Y el contrato del token se comporta: la plantilla rinde el texto de
+    // `buildInvoiceOutReason` con el número reemplazado por el token.
+    expect(buildInvoiceOutReasonTemplate("Ana Ruiz")).toBe("FACTURA #{consecutivo} — Ana Ruiz");
+    expect(buildInvoiceOutReasonTemplate(null)).toBe(
+      "FACTURA #{consecutivo} — Cliente sin nombre",
+    );
+    expect(buildInvoiceOutReasonTemplate("Ana Ruiz").replace("{consecutivo}", "7")).toBe(
+      buildInvoiceOutReason(7, "Ana Ruiz"),
+    );
+  });
+});
+
+// ---------------- CL-13: la migración 052 ----------------
+
+describe("migración 052_invoice_create_atomic.sql (CL-13)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "052_invoice_create_atomic.sql"),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+  /**
+   * El DDL EJECUTABLE: sin los textos de los `COMMENT ON …` (que son PROSA que
+   * viaja como string, no sentencias) y sin los cuerpos de las funciones.
+   */
+  const ddl = sql
+    .replace(/AS \$\$[\s\S]*?\n\$\$;/g, "AS $$ ... $$;")
+    .replace(/COMMENT ON FUNCTION[\s\S]*?';\n/g, "");
+
+  it("piso anti-vacío: el archivo existe y trae DDL real", () => {
+    expect(raw.length).toBeGreaterThan(15000);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("la emisión entera vive en UNA función: una sentencia, una transacción", () => {
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.invoice_create_atomic");
+    // La reserva del consecutivo, ADENTRO (la autoridad de 005).
+    expect(sql).toContain("public.next_invoice_number(p_sede_id)");
+    // Los grupos de escritura, cada uno en UNA sentencia.
+    expect(sql).toMatch(/INSERT INTO public\.invoices/);
+    expect(sql).toMatch(/INSERT INTO public\.invoice_items/);
+    expect(sql).toMatch(/INSERT INTO public\.invoice_taxes/);
+    expect(sql).toMatch(/INSERT INTO public\.invoice_payments/);
+    // El stock lo escribe la función de 046: una sola escritura, y la misma.
+    expect(sql).toContain("public.deduct_stock_atomic(p_sede_id, p_user_id, v_motivo, p_out_items)");
+    // Los grupos llegan como ARREGLO (nunca una fila por request).
+    for (const key of ["p_items", "p_taxes", "p_payments", "p_out_items"]) {
+      expect(sql, key).toContain(`jsonb_array_elements(${key})`);
+    }
+    // La precondición del turno, sobre la fila bloqueada.
+    expect(sql).toMatch(/FOR UPDATE OF s/);
+    expect(sql).toContain("'abierto'");
+    expect(sql).toContain("SHIFT_NOT_OPEN");
+    // El motivo del OUT: la plantilla se sustituye SÓLO en su primera
+    // ocurrencia (overlay), no con `replace` (que sustituye todas).
+    expect(sql).toContain("'{consecutivo}'");
+    expect(sql).toContain("overlay(");
+    expect(sql).toContain("strpos(");
+    expect(sql).not.toMatch(/replace\s*\(/i);
+  });
+
+  it("tiene una red de conteo por grupo de escritura, con rollback", () => {
+    // Cuatro grupos que insertan filas en ESTA función (la factura, las líneas,
+    // los impuestos y las porciones); el grupo de stock tiene la suya adentro de
+    // 046 y acá se contrasta su respuesta.
+    expect(sql.match(/GET DIAGNOSTICS/g) ?? []).toHaveLength(4);
+    for (const code of [
+      "INVOICE_MISMATCH",
+      "ITEM_MISMATCH",
+      "TAX_MISMATCH",
+      "PAYMENT_MISMATCH",
+      "MOVEMENT_MISMATCH",
+      "INVOICE_INVALID",
+      "OUT_REASON_INVALID",
+    ]) {
+      expect(sql, code).toContain(code);
+    }
+    // La guarda de forma no puede caer en un NULL silencioso: el `coalesce` es
+    // lo que hace que una clave AUSENTE falle en vez de comparar contra NULL (la
+    // misma trampa que 046–051 documentan).
+    expect(sql).toMatch(/coalesce\(/);
+    // Y el cast a integer sólo se evalúa cuando el texto ya validó su forma.
+    expect(sql).toMatch(/WHEN coalesce\(item ->> 'qty', ''\) ~ '\^\[0-9\]\{1,9\}\$'/);
+  });
+
+  it("conserva las precondiciones y los datos que el servicio ya tenía", () => {
+    // La MARCA del intento (041): obligatoria, con la forma del CHECK, y escrita
+    // en la fila. Su barrera (el índice único parcial) se evalúa adentro.
+    expect(sql).toContain("p_idempotency_key");
+    expect(sql).toMatch(/idempotency_key,[\s\S]*?p_idempotency_key/);
+    // La factura nace cerrada con su estado y su instante, y las porciones
+    // llevan el turno (el MISMO escalar en todas las filas).
+    expect(sql).toContain("(p_invoice ->> 'closed_at')::timestamptz");
+    expect(sql).toMatch(/p_cash_shift_id\n\s+FROM jsonb_array_elements\(p_payments\)/);
+    // El orden de las porciones se conserva (sin ORDER BY: el de la 042).
+    expect(sql).toMatch(/FROM jsonb_array_elements\(p_payments\) AS item;/);
+  });
+
+  it("NO mueve aritmética de dinero a SQL: ningún monto se recalcula", () => {
+    // Las tablas ya validan sus montos con los CHECK de 005/019/020/030 (validar
+    // no es calcular): esta migración no agrega una sola expresión aritmética
+    // sobre las columnas de dinero. Escribir = convertir la representación
+    // (jsonb → la columna), no operar. Los textos de los `COMMENT ON …` se
+    // excluyen: son PROSA que viaja como string, no sentencias.
+    const withoutComments = sql.replace(/COMMENT ON FUNCTION[\s\S]*?';\n/g, "");
+    for (const column of [
+      "amount",
+      "fee_amount",
+      "fee_percent",
+      "qty",
+      "subtotal",
+      "discount",
+      "tax",
+      "surcharge",
+      "total",
+    ]) {
+      expect(withoutComments, column).not.toMatch(new RegExp(`${column}\\s*[+\\-*/]`));
+    }
+    expect(withoutComments).not.toContain("CHECK");
+    expect(withoutComments).not.toMatch(/sum\s*\(/i);
+    expect(withoutComments).not.toMatch(/round\s*\(/i);
+    // El stock lo sigue aplicando EXCLUSIVAMENTE el trigger de 004: acá no se
+    // escribe una sola columna de stock ni se redefinen sus funciones.
+    expect(withoutComments).not.toContain("stock_qty");
+    expect(withoutComments).not.toContain("inventory_apply_stock");
+    expect(withoutComments).not.toContain("inventory_no_negative_stock");
+    expect(sql).not.toContain("DROP TRIGGER");
+    // Ni se redefinen las dos autoridades que la función LLAMA.
+    expect(sql.match(/CREATE OR REPLACE FUNCTION/g) ?? []).toHaveLength(1);
+  });
+
+  it("devuelve EXACTAMENTE lo que el servicio leía (mismo shape)", () => {
+    expect(sql.match(/jsonb_build_object\(/g) ?? []).toHaveLength(1);
+    const match = /const INVOICE_SELECT =\s*\n?\s*"([^"]+)"/.exec(
+      readFileSync(join(process.cwd(), "src", "features", "billing", "service.ts"), "utf8"),
+    );
+    expect(match, "INVOICE_SELECT").not.toBeNull();
+    for (const column of (match as RegExpExecArray)[1].split(",").map((c) => c.trim())) {
+      expect(sql, column).toContain(`'${column}'`);
+    }
+  });
+
+  it("cierra el permiso: sólo service_role puede ejecutarla", () => {
+    const signature =
+      "public.invoice_create_atomic(uuid, uuid, uuid, text, jsonb, jsonb, jsonb, jsonb, text, jsonb)";
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature} FROM PUBLIC`);
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature} FROM anon`);
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature} FROM authenticated`);
+    expect(sql).toContain(`GRANT EXECUTE ON FUNCTION ${signature} TO service_role`);
+    expect(sql).toContain("SECURITY INVOKER");
+    expect(sql).toContain("SET search_path = public");
+  });
+
+  it("no borra ni reescribe datos: sólo la función y sus permisos", () => {
+    expect(sql.match(/CREATE OR REPLACE FUNCTION/g) ?? []).toHaveLength(1);
+    expect(sql.match(/^ALTER FUNCTION/gm) ?? []).toHaveLength(1);
+    expect(sql.match(/^COMMENT ON FUNCTION/gm) ?? []).toHaveLength(1);
+    // Ningún borrado ni reescritura de filas, y ningún cambio de esquema.
+    expect(sql).not.toMatch(/\bDELETE\b/);
+    expect(sql).not.toMatch(/\bTRUNCATE\b/i);
+    expect(sql).not.toMatch(/\bUPDATE public\./);
+    expect(ddl).not.toMatch(/^\s*ALTER TABLE/im);
+    expect(ddl).not.toMatch(/^\s*CREATE INDEX/im);
+    expect(sql).not.toContain("DROP FUNCTION");
+    expect(sql).not.toContain("DROP CONSTRAINT");
+    // `updated_at` lo sigue escribiendo el trigger de 005.
+    expect(sql).not.toMatch(/updated_at/);
+  });
+
+  it("declara el acoplamiento, el costo de numeración y las ventanas", () => {
+    expect(raw).toContain("ACOPLAMIENTO DE DESPLIEGUE");
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("VENTANAS DECLARADAS");
+    expect(raw).toContain("052");
+    expect(raw).toContain("051");
+    expect(raw).toContain("032 no existe");
+    // La decisión central, escrita: la reserva se mueve adentro y NO se quema
+    // ningún consecutivo en ningún rechazo.
+    expect(raw).toContain("LA NUMERACIÓN");
+    expect(raw).toContain("NO se quema ningún consecutivo");
+    expect(raw).toContain("se REVIERTE");
+    expect(raw).toContain("COSTO DECLARADO DE LA RESERVA ADENTRO");
+  });
+
+  it("declara lo que se midió: la ventana, la compensación y el residuo", () => {
+    // El archivo tiene que decir de dónde salen las líneas que se midieron y qué
+    // era exactamente lo que quedaba a medias.
+    expect(raw).toContain("cleanupFailedInvoice");
+    expect(raw).toContain("createInvoice");
+    expect(raw).toContain("Compensación fallo emisión factura #N");
+    expect(raw).toContain("Best-effort: el error original manda");
+    // Y por qué NO se eligió la compensación robusta y audible.
+    expect(raw).toContain("auditable");
+    expect(raw).toContain("writeAudit");
+    expect(raw).toContain("046");
+    expect(raw).toContain("041");
   });
 });

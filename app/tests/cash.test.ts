@@ -101,7 +101,7 @@ function blankStringsAndComments(source: string): string {
 }
 
 /**
- * Cuerpo de la primera rama que empieza con `marker` (p. ej. `if (mirrorError) {`),
+ * Cuerpo de la primera rama que empieza con `marker` (p. ej. `if (!result?.payment) {`),
  * delimitado por llaves balanceadas.
  *
  * T0-b: reemplaza al recorte con `indexOf`/`slice`, que degradaba a `""` (o a un
@@ -786,9 +786,20 @@ describe("cash: T0-a (Defecto 1) el tope de cobro descuenta el recargo emitido",
   });
 });
 
-// ------- T0-a (Defecto 2): el espejo primero, reversa verificada ---
+// ------- CL-14: el cobro escribe por UNA transacción (053) -------
 
-describe("cash: T0-a (Defecto 2) el espejo va antes que la fila de cajón", () => {
+/**
+ * CL-14: la forma del cobro de una factura, medida SOBRE EL CÓDIGO. Este bloque
+ * reemplaza al de "el espejo va antes que la fila de cajón" (T0-a, Defecto 2):
+ * ese orden y su reversa verificada existían para que ninguna falla dejara un
+ * `payments` con `invoice_id` sin su espejo, y para compensar el par
+ * espejo+cajón cuando el segundo fallaba. Con la 053 las TRES escrituras son UNA
+ * transacción, así que el orden dejó de ser una guarda y la compensación dejó de
+ * existir: lo que se pincha ahora es que la transacción SEA la escritura (y que
+ * no haya quedado ninguna escritura suelta ni ningún DELETE de dinero), no una
+ * secuencia de dos requests que hay que ordenar.
+ */
+describe("cash: CL-14 el cobro de una factura escribe por UNA transacción (053)", () => {
   const service = readFileSync(
     join(process.cwd(), "src", "features", "cash", "service.ts"),
     "utf8",
@@ -796,24 +807,53 @@ describe("cash: T0-a (Defecto 2) el espejo va antes que la fila de cajón", () =
   const start = service.indexOf("export async function registerPayment");
   const body = service.slice(start, service.indexOf("export async function", start + 10));
 
-  it("escribe invoice_payments antes de payments (no puede dejar un huérfano invisible)", () => {
-    const mirror = body.indexOf('.from("invoice_payments")');
-    const drawer = body.indexOf('.from("payments")');
-    expect(mirror).toBeGreaterThan(-1);
-    expect(drawer).toBeGreaterThan(mirror);
-    // La fila de cajón con factura solo existe si el espejo ya existe.
-    expect(body.slice(drawer)).toContain("invoice_id: input.invoice_id ?? null");
+  it("el cobro CON factura escribe con UNA `rpc`, y ninguna de sus tres filas por su cuenta", () => {
+    // La transacción de la 053: el espejo, el libro de cajón y el estado de la
+    // factura, en UNA sentencia (una sentencia corre entera o no corre).
+    expect(body).toContain('db.rpc("cash_invoice_payment_atomic"');
+    // Ninguna escritura suelta del cliente sobre las dos tablas del dinero ni
+    // sobre el estado de la factura: si alguna volviera, volvería también la
+    // ventana entre ella y las otras dos.
+    const writes = ["invoice_payments", "payments", "invoices"].flatMap((table) =>
+      body
+        .split(`.from("${table}")`)
+        .slice(1)
+        .map((chunk) => {
+          const end = chunk.indexOf(".from(");
+          return (end === -1 ? chunk : chunk.slice(0, end)).trimStart();
+        }),
+    );
+    const loose = writes.filter(
+      (chain) => chain.startsWith(".insert(") || chain.startsWith(".update("),
+    );
+    // La única escritura suelta que queda es el pago SIN factura (CL-4), cuya
+    // fila ES la operación entera.
+    expect(loose).toHaveLength(1);
+    expect(loose[0]).toContain("idempotency_key: mark");
   });
 
-  it("la reversa del espejo verifica el error del DELETE y grita la falla", () => {
-    expect(body).toMatch(
-      /const \{ error: rollbackError \} = await db\s*\.from\("invoice_payments"\)\s*\.delete\(\)\s*\.eq\("id", mirrorId\)/,
-    );
-    expect(body).toContain("if (rollbackError) {");
-    expect(body).toContain('"PAYMENT_ROLLBACK_FAILED"');
-    expect(body).toContain("console.error(");
-    // Ninguna reversa sobre `payments` queda sin comprobar (la del defecto).
-    expect(body).not.toContain('db.from("payments").delete()');
+  it("ya no hay compensación del par: NINGÚN DELETE de dinero en el camino del cobro", () => {
+    // La reversa del espejo —el DELETE por id y su aviso PAYMENT_ROLLBACK_FAILED—
+    // era la compensación del par espejo+cajón. Con los tres grupos en UNA
+    // transacción no hay nada que compensar: el rollback es del servidor. La
+    // negación se mide sobre el código SIN comentarios (la prosa del bloque
+    // explica la compensación retirada y nombra su código).
+    const code = blankStringsAndComments(body);
+    expect(code).not.toContain(".delete()");
+    expect(body).not.toContain('"PAYMENT_ROLLBACK_FAILED"');
+    expect(body).not.toContain("mirrorId");
+    // Lo que SÍ queda es el código del estado heredado: el reintento que
+    // reconoce un cobro a medias de ANTES (espejo sin cajón) tiene que seguir
+    // diciendo la verdad sobre esa avería (vive en `repeatedCollectionResult`).
+    expect(service).toContain('"PAYMENT_ROLLBACK_FAILED"');
+    expect(service).toContain("async function repeatedCollectionResult");
+  });
+
+  it("las dos barreras del INSERT se siguen atendiendo igual (P0001 del tope y 23505 de la marca)", () => {
+    expect(body).toContain('const code = (payError as { code?: string } | null)?.code;');
+    expect(body).toContain('if (code === "23505" || code === "P0001") {');
+    expect(body).toContain('throw new CashError("OVERPAID", "El pago supera el saldo pendiente de la factura.", 422);');
+    expect(body).toContain("findInvoicePaymentsByIdempotencyKey(db, input.invoice_id, mark)");
   });
 
   it("el catch externo no puede tragarse el error gritado", () => {
@@ -822,44 +862,28 @@ describe("cash: T0-a (Defecto 2) el espejo va antes que la fila de cajón", () =
     expect(body).toContain("throw toCashError(error);");
   });
 
-  it("el espejo fallido no deja nada que revertir (P0001 → OVERPAID)", () => {
-    const mirrorBlock = body.slice(
-      body.indexOf('.from("invoice_payments")'),
-      body.indexOf('.from("payments")'),
-    );
-    expect(mirrorBlock).toContain('const code = (mirrorError as { code?: string } | null)?.code;');
-    // CL-3: la misma rama reconoce TAMBIÉN el 23505 del índice único de
-    // identidad (042): las dos barreras del INSERT se atienden igual.
-    expect(mirrorBlock).toContain('if (code === "23505" || code === "P0001") {');
-    expect(mirrorBlock).toContain('throw new CashError("OVERPAID", "El pago supera el saldo pendiente de la factura.", 422);');
-    // El recorte es la rama del INSERT fallido, que es la que no tiene fila que
-    // borrar. La rama del insert SIN fila confirmada sí compensa (Defecto 3,
-    // asertado aparte): su `.delete()` vive después de este recorte.
-    //
-    // T0-b: antes este tramo salía de `slice(indexOf("if (mirrorError) {"),
-    // indexOf("if (!mirror) {"))`. Con esos dos índices invertidos (o en -1) el
-    // recorte quedaba vacío y la negación de abajo pasaba sin mirar nada. Ahora
-    // cada rama se extrae por llaves balanceadas (falla si no existe o no
-    // cierra) y el orden se asevera de forma explícita.
-    const mirrorErrorStart = body.indexOf("if (mirrorError) {");
-    const notMirrorStart = body.indexOf("if (!mirror) {");
-    expect(mirrorErrorStart, "la rama del INSERT fallido debe existir").toBeGreaterThan(-1);
-    expect(notMirrorStart, "la rama sin fila confirmada debe existir").toBeGreaterThan(-1);
-    expect(notMirrorStart, "`!mirror` va después de `mirrorError`").toBeGreaterThan(
-      mirrorErrorStart,
-    );
-    const mirrorErrorBranch = extractBranch(body, "if (mirrorError) {");
-    const notMirrorBranch = extractBranch(body, "if (!mirror) {");
-    // Positivas de contenido: si el recorte se rompiera, estas dos fallan.
-    expect(mirrorErrorBranch).toContain('"OVERPAID"');
-    expect(notMirrorBranch).toContain('.eq("id", mirrorIdCandidate)');
-    // Y solo entonces la negación, sobre un bloque que existe de verdad.
-    expect(mirrorErrorBranch).not.toContain(".delete()");
+  it("las precondiciones de la transacción se traducen por MENSAJE antes que por código", () => {
+    // La función revalida adentro y sus `RAISE EXCEPTION` salen con el MISMO
+    // SQLSTATE del tope de 031 (P0001), así que el mensaje se mira ANTES: si no,
+    // un cobro sobre una factura anulada se leería como "se pasó del tope".
+    const messageCheck = body.indexOf('message.includes("ANNUL_INVALID")');
+    const codeCheck = body.indexOf('if (code === "23505" || code === "P0001")');
+    expect(messageCheck).toBeGreaterThan(-1);
+    expect(codeCheck).toBeGreaterThan(messageCheck);
+    expect(body).toContain('throw new CashError("ANNUL_INVALID", "No se puede cobrar una factura anulada.", 409);');
+    expect(body).toContain('throw new CashError("INVOICE_NOT_FOUND", "Factura no encontrada.", 404);');
   });
 });
 
 // ------- T0-a (Defecto 1/2): recargo derivado del bruto y saldo NETO -------
 
+/**
+ * CL-14: la aritmética del cobro sigue siendo del SERVICIO. El bloque cambia de
+ * dónde LEE su evidencia (antes: el `.insert` del espejo; ahora: el objeto
+ * `p_collection` que viaja a la transacción de la 053), no lo que exige: el
+ * reparto del recargo, el bruto redondeado una sola vez y el cierre por NETO
+ * siguen computados en TypeScript y escritos verbatim por la base.
+ */
 describe("cash: T0-a (Defecto 1/2) el cobro de caja deriva el recargo del BRUTO", () => {
   const service = readFileSync(
     join(process.cwd(), "src", "features", "cash", "service.ts"),
@@ -867,14 +891,15 @@ describe("cash: T0-a (Defecto 1/2) el cobro de caja deriva el recargo del BRUTO"
   );
   const start = service.indexOf("export async function registerPayment");
   const body = service.slice(start, service.indexOf("export async function", start + 10));
-  const mirror = body.slice(
-    body.indexOf('.from("invoice_payments")'),
-    body.indexOf('.from("payments")'),
+  /** El objeto que viaja como DATO a `cash_invoice_payment_atomic` (053). */
+  const collection = body.slice(
+    body.indexOf("p_collection: {"),
+    body.indexOf("if (payError)"),
   );
 
-  it("la fila espejo lleva el recargo y el porcentaje, no el DEFAULT 0", () => {
-    expect(mirror).toContain("fee_percent: feePercent");
-    expect(mirror).toContain("fee_amount: cardFee.fee");
+  it("el cobro lleva el recargo y el porcentaje, no el DEFAULT 0", () => {
+    expect(collection).toContain("fee_percent: feePercent");
+    expect(collection).toContain("fee_amount: cardFee.fee");
     // El porcentaje sale del método cobrado (payment_methods.fee_percent: el
     // mismo snapshot que escribe billing al emitir; 019).
     expect(body).toContain("Math.max(0, Number(method.fee_percent) || 0)");
@@ -883,7 +908,7 @@ describe("cash: T0-a (Defecto 1/2) el cobro de caja deriva el recargo del BRUTO"
   it("el bruto se redondea una sola vez y es el que va a las dos filas", () => {
     expect(body).toContain("const gross = roundMoney(input.amount);");
     expect(body).toContain("splitGrossCardFee(gross, feePercent)");
-    expect(body).toContain("amount: gross");
+    expect(collection).toContain("amount: gross");
     // El INSERT crudo (sin centavos normalizados) no puede volver: la fila
     // espejo y la de cajón tienen que guardar el mismo monto.
     expect(body).not.toContain("amount: input.amount");
@@ -894,32 +919,40 @@ describe("cash: T0-a (Defecto 1/2) el cobro de caja deriva el recargo del BRUTO"
     expect(body).toContain(
       "invoiceBalance.netCollected + cardFee.net - invoiceBalance.netBilled > 0.009",
     );
+    // La DECISIÓN se toma acá y viaja como booleano: la función no compara el
+    // cobrado contra el facturado ni una vez.
     expect(body).toContain(
       "moneyEquals(roundMoney(invoiceBalance.netCollected + cardFee.net), invoiceBalance.netBilled)",
     );
+    expect(body).toContain("p_mark_paid: markPaid");
+    expect(body).toContain("p_set_shift: setShift");
     // Los dos chequeos viejos (bruto de caja contra el total) no pueden volver.
     expect(body).not.toContain("roundMoney(invoicePaid + input.amount)");
     expect(body).not.toContain("moneyEquals(paid, invoiceTotal)");
   });
 
-  it("el id del espejo se conoce ANTES del INSERT (compensación exacta)", () => {
-    const declared = body.indexOf("const mirrorIdCandidate = randomUUID();");
-    expect(declared).toBeGreaterThan(-1);
-    expect(declared).toBeLessThan(body.indexOf('.from("invoice_payments")'));
-    expect(mirror).toContain("id: mirrorIdCandidate,");
+  it("la marca del intento viaja como DATO, en la ÚNICA fila espejo (042)", () => {
+    expect(collection).toContain("idempotency_key: mark");
+    expect(collection).toContain("method_code: method.code");
+    expect(collection).toContain("method_id: method.id");
   });
 
-  it("Defecto 3: la rama sin fila confirmada compensa por id y grita", () => {
-    const branch = body.slice(
-      body.indexOf("if (!mirror)"),
-      body.indexOf("mirrorId = mirrorIdCandidate"),
-    );
+  it("sin compensación por id: el espejo nace con el DEFAULT de su columna", () => {
+    // El id del espejo se generaba ANTES del INSERT para que la compensación
+    // fuera exacta por id (nunca por factura+turno+método+monto, que podría
+    // borrar un cobro legítimo anterior). Con la transacción no hay compensación
+    // y no hay id que adelantar: la columna de 005 lo resuelve.
+    expect(body).not.toContain("randomUUID");
+    expect(collection).not.toMatch(/^\s*id:/m);
+  });
+
+  it("la transacción sin confirmación se grita con su código propio, sin compensar", () => {
+    const branch = extractBranch(body, "if (!result?.payment) {");
     expect(branch).toContain("console.error(");
-    expect(branch).toContain('.eq("id", mirrorIdCandidate)');
-    // Compensación fallida: mismo desenlace ya conocido para el operador.
-    expect(branch).toContain('"PAYMENT_ROLLBACK_FAILED"');
-    // Compensada: nada quedó escrito y se dice con código propio (no genérico).
     expect(branch).toContain('"MIRROR_UNCONFIRMED"');
+    expect(branch).not.toContain(".delete()");
+    expect(branch).not.toContain('"PAYMENT_ROLLBACK_FAILED"');
+    // Nada quedó escrito y se dice con un código propio (no genérico).
     expect(branch).not.toContain('"INTERNAL"');
   });
 });
@@ -1268,12 +1301,20 @@ describe("cash: T0-a (C1) los lectores ya no unen el ledger completo", () => {
     expect(selects).toHaveLength(5);
   });
 
-  it("la fila espejo de invoice_payments lleva el turno que cobra", () => {
-    const mirror = dbChains(service, "invoice_payments").find((chain) =>
-      chain.trimStart().startsWith(".insert("),
+  it("la transacción escribe el turno que COBRA en las dos filas del dinero", () => {
+    // El turno viaja como PARÁMETRO de la operación (`p_shift_id`) y la función
+    // lo escribe tanto en el espejo (`invoice_payments.cash_shift_id`, el que
+    // suma el arqueo) como en el libro de cajón y en el enlace de la factura.
+    // Antes esto se medía en el `.insert` del espejo; ahora donde está.
+    expect(service.slice(service.indexOf("export async function registerPayment"))).toContain(
+      "p_shift_id: shift.id",
     );
-    expect(mirror).toBeDefined();
-    expect(mirror).toContain("cash_shift_id: shift.id");
+    const migration = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "053_cash_payment_state_atomic.sql"),
+      "utf8",
+    );
+    expect(migration).toMatch(/cash_shift_id/,);
+    expect(migration).toContain("p_shift_id");
   });
 
   it("el cierre solo pisa un turno abierto (ni doble cierre ni conteos dobles)", () => {
@@ -1296,9 +1337,16 @@ describe("cash: T0-a (C1) los lectores ya no unen el ledger completo", () => {
   });
 
   it("traduce P0001 del tope de factura a OVERPAID (C2)", () => {
-    expect(service).toContain('const code = (mirrorError as { code?: string } | null)?.code;');
-    expect(service).toContain('if (code === "23505" || code === "P0001") {');
-    expect(service).toContain(
+    // CL-14: el INSERT del espejo ya no es una sentencia del cliente: viaja
+    // DENTRO de `cash_invoice_payment_atomic`, cuya red deja pasar el SQLSTATE
+    // de la base. Lo que se exige es lo mismo de siempre, en su hogar nuevo: el
+    // P0001 del tope (031) y el 23505 de la marca (042) se reconocen igual, y
+    // sin ganadora con esa marca el rechazo es OVERPAID.
+    const start = service.indexOf("export async function registerPayment");
+    const body = service.slice(start, service.indexOf("export async function", start + 10));
+    expect(body).toContain('const code = (payError as { code?: string } | null)?.code;');
+    expect(body).toContain('if (code === "23505" || code === "P0001") {');
+    expect(body).toContain(
       'throw new CashError("OVERPAID", "El pago supera el saldo pendiente de la factura.", 422);',
     );
   });
@@ -1316,15 +1364,14 @@ describe("billing: T0-a (C2) tope de cobro en BD traducido a OVERPAID", () => {
     "utf8",
   );
 
-  it("las dos puertas de invoice_payments traducen P0001 a OVERPAID (INSERT directo y RPC)", () => {
-    // CL-11: la puerta del COBRO ya no escribe con un `.insert` del cliente: su
-    // escritura ES la transacción de la 050 (`invoice_split_payment_atomic`), y
-    // por eso el conteo baja de 2 a 1. NO se afloja nada: se cambia DÓNDE se
-    // pincha, no QUÉ se exige —el rechazo del mismo tope de 031 (P0001) se sigue
-    // traduciendo a OVERPAID en las dos puertas, la emisión acá abajo y el cobro
-    // en su hogar nuevo—. La puerta del cobro además queda cubierta EN RUNTIME
-    // por `el tope de 031 sigue traduciéndose a OVERPAID cuando la marca NO es
-    // una repetición` (tests/billing.test.ts).
+  it("las dos puertas de invoice_payments traducen el tope de 031 a OVERPAID (transacción de emisión y RPC de cobro)", () => {
+    // CL-11 (050) + CL-13 (052): NINGUNA de las dos puertas escribe
+    // `invoice_payments` con un `.insert` del cliente — la emisión escribe por
+    // `invoice_create_atomic` y el cobro por `invoice_split_payment_atomic`—,
+    // así que el conteo baja de 1 a 0. NO se afloja nada: se cambia DÓNDE se
+    // pincha, no QUÉ se exige. El tope de 031 (P0001) se sigue traduciendo al
+    // MISMO OVERPAID en las dos puertas, y cada una queda pinchada en su hogar
+    // nuevo; las dos están además cubiertas EN RUNTIME (tests/billing.test.ts).
     const inserts = service
       .split('.from("invoice_payments")')
       .slice(1)
@@ -1333,11 +1380,15 @@ describe("billing: T0-a (C2) tope de cobro en BD traducido a OVERPAID", () => {
         return end === -1 ? chunk : chunk.slice(0, end);
       })
       .filter((chain) => chain.trimStart().startsWith(".insert("));
-    expect(inserts).toHaveLength(1); // emitir con pago: el cobro va por la 050
-    for (const chain of inserts) {
-      expect(chain).toContain('"P0001"');
-      expect(chain).toContain('"OVERPAID"');
-    }
+    expect(inserts).toHaveLength(0); // las DOS puertas escriben por transacción
+
+    // La PRIMERA puerta, en su hogar nuevo: la emisión escribe por
+    // `invoice_create_atomic` y traduce el MISMO tope de 031 a OVERPAID.
+    const create = service.slice(service.indexOf("function toRpcCreateError"));
+    expect(create).toContain('if (message.includes("El cobro supera")) {');
+    expect(create).toContain(
+      'return new BillingError("OVERPAID", "Las porciones superan el saldo pendiente.", 422);',
+    );
 
     // La SEGUNDA puerta, en su hogar nuevo: el cobro dividido escribe por la
     // transacción de la 050 y traduce el MISMO P0001 del tope a OVERPAID.
@@ -1439,16 +1490,6 @@ const paymentStub = vi.hoisted(() => ({
   mirrorError: null as { code?: string; message?: string } | null,
   mirrorData: null as { id: string } | null,
   rollbackError: null as { message?: string } | null,
-  /**
-   * CL-3: modo TABLA EN MEMORIA. Con `true` el doble mantiene las filas REALES
-   * de `invoice_payments` (el dinero cobrado de la factura) y de `payments` (el
-   * libro de cajón) y aplica las DOS barreras de la base con sus códigos
-   * reales: el tope de 031 (P0001, trigger BEFORE INSERT) y el índice único
-   * parcial de 042 (23505). Apagado (el valor por defecto), se comporta como
-   * antes de CL-3: responde `mirrorError`/`mirrorData`, que es lo que necesitan
-   * los tests del espejo fallido (T0-b) para forzar cada falla del INSERT.
-   */
-  ledgerMode: false,
   /** Filas REALES de `invoice_payments` (lo que suma el arqueo). */
   ledger: [] as Array<Record<string, unknown>>,
   /** Filas REALES de `payments` (el libro de cajón del turno). */
@@ -1477,7 +1518,46 @@ const paymentStub = vi.hoisted(() => ({
    * fila confirmada. El intercalado se arma, no se inventa el desenlace.
    */
   stalePaymentsOnce: null as Array<Record<string, unknown>> | null,
+  /**
+   * CL-14: la falla del TERCER grupo de escritura del cobro —el UPDATE de la
+   * factura, que la enlaza al turno o la pasa a Pagada—, consumida UNA vez. Es
+   * la falla que el defecto no compensaba: el espejo y el libro de cajón ya
+   * estaban escritos y el dinero quedaba cobrado con la factura abierta. En el
+   * camino viejo el doble la devuelve desde el UPDATE suelto; en la
+   * transacción, desde `cash_invoice_payment_atomic` —las dos veces sin tocar
+   * el estado, porque un UPDATE fallido no escribe—.
+   */
+  failInvoiceCloseOnce: false,
+  /**
+   * CL-14: una ANULACIÓN que gana la carrera entre la lectura del servicio y la
+   * transacción. El doble pisa el estado de la factura justo antes de que la
+   * transacción lea su fila bloqueada: es la precondición de estado que la
+   * función revalida adentro.
+   */
+  raceAnnulOnce: false,
+  /**
+   * CL-14: la transacción no CONFIRMA (devuelve sin fila y sin error). No es un
+   * desenlace del SQL —la función siempre devuelve su jsonb o revienta—, es el
+   * piso de la rama defensiva del servicio: un cobro que no se puede confirmar
+   * no puede reportarse como exitoso.
+   */
+  noConfirmOnce: false,
+  /** Transacciones de cobro pedidas, en orden. */
+  rpcCalls: [] as Array<{ name: string; args: Record<string, unknown> }>,
 }));
+
+/** Las columnas de `PAYMENT_SELECT` (service.ts): el shape que el servicio lee. */
+const PAYMENT_COLUMNS = [
+  "id",
+  "sede_id",
+  "cash_shift_id",
+  "invoice_id",
+  "method_id",
+  "method_code",
+  "amount",
+  "user_id",
+  "created_at",
+];
 
 /**
  * Cliente Supabase falso y encadenable del camino de `registerPayment`.
@@ -1486,10 +1566,16 @@ const paymentStub = vi.hoisted(() => ({
  * registra en `unexpectedQueries` y vuelve como error, para que el test falle a
  * la vista en vez de en silencio.
  *
- * CL-3: en `ledgerMode` mantiene el ESTADO que decide el defecto —las filas
- * cobradas y el libro de cajón— y las dos barreras de la base. La aritmética NO
- * se sustituye: `invoiceNetBalance` y `splitGrossCardFee` son los de producción
- * y corren de verdad contra este doble.
+ * CL-14: el doble mantiene el ESTADO que decide el defecto —las filas cobradas
+ * y el libro de cajón— y aplica las DOS barreras de la base con sus códigos
+ * reales: el tope de 031 (P0001) y el índice único parcial de 042 (23505). La
+ * aritmética NO se sustituye: `invoiceNetBalance` y `splitGrossCardFee` son los
+ * de producción y corren de verdad contra este doble.
+ *
+ * Las ESCRITURAS sueltas de `invoice_payments` ya no las pide el servicio (el
+ * cobro entero va por `cash_invoice_payment_atomic`), pero el doble las sigue
+ * emulando —con sus dos barreras— porque es su modelo de la tabla: la
+ * compensación por DELETE que las acompañaba es la que se retiró.
  */
 function createStubSupabaseClient(): unknown {
   const rowsOf = (table: string): Array<Record<string, unknown>> => {
@@ -1539,9 +1625,22 @@ function createStubSupabaseClient(): unknown {
     let payload: unknown;
     const filterColumns: string[] = [];
     const filters: Array<[string, unknown]> = [];
+    /**
+     * CL-14: las columnas pedidas en el `.select(...)`. PostgREST devuelve SÓLO
+     * esas columnas y el doble ahora lo respeta: es lo que hace comparable la
+     * fila que devuelve la transacción (que arma su jsonb con las columnas de
+     * PAYMENT_SELECT) con la que devuelve un `select(PAYMENT_SELECT)` posterior.
+     * Sin esto, la comparación de una repetición contra su intento original
+     * mediría una diferencia que sólo existe en el doble.
+     */
+    let columns: string[] | null = null;
 
     const matching = (): Array<Record<string, unknown>> =>
       rowsOf(table).filter((row) => filters.every(([column, value]) => row[column] === value));
+
+    /** Proyecta a las columnas pedidas: el shape que el servicio lee de verdad. */
+    const shape = (rows: Array<Record<string, unknown>>): Array<Record<string, unknown>> =>
+      columns === null ? rows : rows.map((row) => project(row, columns as string[]));
 
     const respond = (): { data: unknown; error: unknown } => {
       if (table === "invoice_payments" && op === "delete") {
@@ -1556,10 +1655,19 @@ function createStubSupabaseClient(): unknown {
         // El cobro que completa la factura la pasa a Pagada: el doble lo escribe
         // de verdad, para que la lectura siguiente lo vea.
         const written = (payload ?? {}) as Record<string, unknown>;
+        if (table === "invoices" && paymentStub.failInvoiceCloseOnce) {
+          // CL-14: el tercer grupo de escritura falla (camino viejo: el UPDATE
+          // suelto). Nada cambia de estado: un UPDATE que falla no escribe.
+          paymentStub.failInvoiceCloseOnce = false;
+          return {
+            data: null,
+            error: { code: "23514", message: "el cierre de la factura falló" },
+          };
+        }
         if (table === "invoices" && typeof written.status === "string") {
           paymentStub.invoiceStatus = written.status;
         }
-        const matched = matching();
+        const matched = shape(matching());
         return { data: single ? matched[0] ?? null : matched, error: null };
       }
       if (op === "insert") {
@@ -1568,7 +1676,6 @@ function createStubSupabaseClient(): unknown {
           if (paymentStub.mirrorError) {
             return { data: paymentStub.mirrorData, error: paymentStub.mirrorError };
           }
-          if (!paymentStub.ledgerMode) return { data: paymentStub.mirrorData, error: null };
           const row = (payload ?? {}) as Record<string, unknown>;
           // 1) El tope de cobro (031) es un trigger BEFORE INSERT: corre ANTES
           //    de que la fila entre al índice.
@@ -1611,7 +1718,8 @@ function createStubSupabaseClient(): unknown {
             ...row,
           };
           paymentStub.ledger.push(persisted);
-          return { data: single ? persisted : [persisted], error: null };
+          const rows = shape([persisted]);
+          return { data: single ? rows[0] : rows, error: null };
         }
         if (table === "payments") {
           if (paymentStub.drawerError) {
@@ -1644,7 +1752,8 @@ function createStubSupabaseClient(): unknown {
             ...row,
           };
           paymentStub.drawer.push(persisted);
-          return { data: single ? persisted : [persisted], error: null };
+          const rows = shape([persisted]);
+          return { data: single ? rows[0] : rows, error: null };
         }
         return { data: null, error: { message: `doble sin respuesta para el insert en ${table}` } };
       }
@@ -1665,12 +1774,17 @@ function createStubSupabaseClient(): unknown {
         paymentStub.skipMarkLookupOnce = false;
         return { data: single ? null : [], error: null };
       }
-      const matched = matching();
+      const matched = shape(matching());
       return { data: single ? matched[0] ?? null : matched, error: null };
     };
 
     const query: Record<string, unknown> = {
-      select: () => query,
+      select: (value?: unknown) => {
+        if (typeof value === "string" && value.trim() !== "*") {
+          columns = value.split(",").map((column) => column.trim());
+        }
+        return query;
+      },
       insert: (value?: unknown) => {
         op = "insert";
         payload = value;
@@ -1708,7 +1822,149 @@ function createStubSupabaseClient(): unknown {
     return query;
   };
 
-  return { from };
+  /**
+   * CL-14: `cash_invoice_payment_atomic`. El doble modela la TRANSACCIÓN: lee la
+   * fila de la factura bloqueada y revalida su precondición (una factura
+   * Anulada no admite cobros), evalúa las DOS barreras reales del INSERT del
+   * espejo —el tope de 031 (P0001) y el índice único parcial de la 042 (23505)—
+   * y aplica sus TRES grupos —el espejo, el libro de cajón y el cierre/enlace de
+   * la factura— o NINGUNO. Nada se escribe hasta el COMMIT: si algo falla, el
+   * doble no deja ni una fila, como la transacción del servidor.
+   *
+   * El doble NO reimplementa las guardas de FORMA del SQL (regex de uuids y
+   * montos, `coalesce`, `jsonb_typeof`): ésas viven en la función y se prueban
+   * sobre el archivo. Lo que emula es lo que estos tests necesitan observar: la
+   * indivisibilidad, la precondición de estado DENTRO de la transacción y las
+   * dos barreras de la base con sus códigos reales.
+   */
+  const rpc = async (
+    name: string,
+    args: Record<string, unknown> = {},
+  ): Promise<{ data: unknown; error: unknown }> => {
+    if (name !== "cash_invoice_payment_atomic") {
+      paymentStub.unexpectedQueries.push(`rpc.${name}`);
+      return { data: null, error: { message: `doble sin respuesta para el rpc ${name}` } };
+    }
+    paymentStub.rpcCalls.push({ name, args });
+    // La carrera por el ESTADO se dispara antes del lock: lo que la otra
+    // transacción confirmó es parte del estado que esta transacción va a leer.
+    if (paymentStub.raceAnnulOnce) {
+      paymentStub.raceAnnulOnce = false;
+      paymentStub.invoiceStatus = "Anulada";
+    }
+
+    // 1) La fila de la factura, bloqueada, y su precondición releída DE LA FILA.
+    if (paymentStub.invoiceStatus === "Anulada") {
+      return { data: null, error: { code: "P0001", message: "ANNUL_INVALID" } };
+    }
+
+    // 1.b) La transacción no CONFIRMA ni escribe: es el único desenlace en el
+    //      que lo que el servicio afirma en esa rama —nada quedó escrito— es
+    //      cierto (una función que devuelve NULL antes de escribir).
+    if (paymentStub.noConfirmOnce) {
+      paymentStub.noConfirmOnce = false;
+      return { data: null, error: null };
+    }
+
+    const collection = (args.p_collection ?? {}) as Record<string, unknown>;
+
+    // 2) El grupo 1: el ESPEJO (`invoice_payments`), con la marca de la 042. El
+    //    contador cuenta la escritura PEDIDA, como contaba el `.insert` suelto:
+    //    la sentencia corre y es la transacción la que la revierte. El tope de
+    //    031 (BEFORE INSERT → P0001) y el índice de la 042 (23505) corren
+    //    ADENTRO, con el SQLSTATE real que el servicio ya traducía.
+    paymentStub.inserts.invoice_payments = (paymentStub.inserts.invoice_payments ?? 0) + 1;
+    if (paymentStub.mirrorError) {
+      return { data: paymentStub.mirrorData, error: paymentStub.mirrorError };
+    }
+    const mirrorRow: Record<string, unknown> = {
+      id: `espejo-${paymentStub.ledger.length + 1}`,
+      invoice_id: args.p_invoice_id,
+      method_id: collection.method_id ?? null,
+      method_code: collection.method_code,
+      amount: collection.amount,
+      fee_percent: collection.fee_percent,
+      fee_amount: collection.fee_amount,
+      cash_shift_id: args.p_shift_id,
+      created_at: "2026-09-30T00:00:00.000Z",
+      idempotency_key: collection.idempotency_key ?? null,
+    };
+    const paidNet = paymentStub.ledger
+      .filter((candidate) => candidate.invoice_id === mirrorRow.invoice_id)
+      .reduce(
+        (acc, candidate) =>
+          acc + (Number(candidate.amount) - Number(candidate.fee_amount ?? 0)),
+        0,
+      );
+    const newNet = Number(mirrorRow.amount) - Number(mirrorRow.fee_amount ?? 0);
+    const cap = Math.round(paymentStub.INVOICE_TOTAL - paymentStub.INVOICE_SURCHARGE);
+    if (paidNet + newNet - cap > 0.009) {
+      return {
+        data: null,
+        error: { code: "P0001", message: "El cobro supera el neto facturado de la factura" },
+      };
+    }
+    const mark = mirrorRow.idempotency_key;
+    if (mark !== null && mark !== undefined) {
+      const clashes = paymentStub.ledger.some(
+        (other) => other.invoice_id === mirrorRow.invoice_id && other.idempotency_key === mark,
+      );
+      if (clashes) {
+        return {
+          data: null,
+          error: {
+            code: "23505",
+            message:
+              'duplicate key value violates unique constraint "uq_invoice_payments_invoice_idempotency_key"',
+          },
+        };
+      }
+    }
+
+    // 3) El grupo 2: el LIBRO DE CAJÓN (`payments`), SIN marca a propósito (043:
+    //    la identidad de este camino vive en la fila espejo).
+    paymentStub.inserts.payments = (paymentStub.inserts.payments ?? 0) + 1;
+    if (paymentStub.drawerError) {
+      return { data: null, error: paymentStub.drawerError };
+    }
+    const drawerRow: Record<string, unknown> = {
+      id: `caja-${paymentStub.drawer.length + 1}`,
+      sede_id: args.p_sede_id,
+      cash_shift_id: args.p_shift_id,
+      invoice_id: args.p_invoice_id,
+      method_id: collection.method_id ?? null,
+      method_code: collection.method_code,
+      amount: collection.amount,
+      user_id: args.p_user_id,
+      created_at: "2026-09-30T00:00:00.000Z",
+      idempotency_key: null,
+    };
+
+    // 4) El grupo 3: el cierre/enlace de la factura, SÓLO si el servicio lo
+    //    decidió (`p_set_shift` / `p_mark_paid`). Si el grupo no corre, no hay
+    //    nada que pueda fallar ahí —y por eso un cobro PARCIAL no tiene esta
+    //    ventana—.
+    if (args.p_set_shift === true || args.p_mark_paid === true) {
+      if (paymentStub.failInvoiceCloseOnce) {
+        paymentStub.failInvoiceCloseOnce = false;
+        return { data: null, error: { code: "23514", message: "el cierre de la factura falló" } };
+      }
+    }
+
+    // 5) COMMIT: los tres grupos.
+    paymentStub.ledger.push(mirrorRow);
+    paymentStub.drawer.push(drawerRow);
+    if (args.p_mark_paid === true) paymentStub.invoiceStatus = "Pagada";
+    return {
+      data: {
+        payment: project(drawerRow, PAYMENT_COLUMNS),
+        invoice: { id: args.p_invoice_id, status: paymentStub.invoiceStatus },
+      },
+      error: null,
+    };
+  };
+
+  return { from, rpc };
 }
 
 // ------- CL-10: el CICLO DEL TURNO (apertura, cierre y reconteo) -------
@@ -2221,7 +2477,15 @@ vi.mock("@/src/features/billing/service", async (importOriginal) => {
   return { ...actual, getInvoiceDetail: detail };
 });
 
-describe("cash: T0-b el INSERT fallido del espejo no emite ningún DELETE", () => {
+/**
+ * CL-14: la falla del cobro ya no deja nada que compensar. Este bloque
+ * reemplaza al de "el INSERT fallido del espejo no emite ningún DELETE" (T0-b),
+ * que medía la CONTRAPARTIDA de aquella compensación: que un INSERT fallido del
+ * espejo no disparara el DELETE. La compensación entera se retiró (el rollback
+ * es del servidor), así que lo que se pincha ahora es que NINGUNA falla deje
+ * nada escrito y que NINGUNA emita un DELETE de dinero.
+ */
+describe("cash: CL-14 una falla del cobro no deja nada escrito (sin compensación)", () => {
   /** CL-3: el cobro de una factura ahora exige la marca del intento. */
   const MARK = "7c1e5a90-3b48-4d22-9e6f-0a1b2c3d4e5f";
   const input = {
@@ -2239,60 +2503,343 @@ describe("cash: T0-b el INSERT fallido del espejo no emite ningún DELETE", () =
     paymentStub.mirrorError = null;
     paymentStub.mirrorData = null;
     paymentStub.rollbackError = null;
-    paymentStub.ledgerMode = false;
     paymentStub.ledger.length = 0;
     paymentStub.drawer.length = 0;
     paymentStub.invoiceStatus = "Emitida";
     paymentStub.inserts = {};
     paymentStub.skipMarkLookupOnce = false;
     paymentStub.stalePaymentsOnce = null;
+    paymentStub.noConfirmOnce = false;
+    paymentStub.failInvoiceCloseOnce = false;
+    paymentStub.rpcCalls.length = 0;
   });
 
-  it("P0001 del tope: rechaza OVERPAID y no emite DELETE", async () => {
+  it("P0001 del tope: rechaza OVERPAID y no deja nada escrito", async () => {
     paymentStub.mirrorError = { code: "P0001", message: "cap" };
     const failure: unknown = await registerPayment(input, actor).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(CashError);
     expect(failure).toMatchObject({ code: "OVERPAID", status: 422 });
+    expect(paymentStub.ledger).toEqual([]);
+    expect(paymentStub.drawer).toEqual([]);
     expect(paymentStub.deleteCalls).toEqual([]);
     expect(paymentStub.unexpectedQueries).toEqual([]);
   });
 
-  it("error genérico del INSERT: rechaza INTERNAL y no emite DELETE", async () => {
+  it("error genérico de la transacción: rechaza INTERNAL y no deja nada escrito", async () => {
     paymentStub.mirrorError = { code: "23514", message: "check_violation" };
     const failure: unknown = await registerPayment(input, actor).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(CashError);
     expect(failure).toMatchObject({ code: "INTERNAL", status: 500 });
+    expect(paymentStub.ledger).toEqual([]);
+    expect(paymentStub.drawer).toEqual([]);
     expect(paymentStub.deleteCalls).toEqual([]);
     expect(paymentStub.unexpectedQueries).toEqual([]);
   });
 
-  it("control positivo: sin fila confirmada la compensación SÍ se emite", async () => {
-    // Si el doble dejara de observar el DELETE, esta positiva falla: es lo que
-    // convierte a las dos negaciones de arriba en una guarda y no en un vacío.
+  it("la rama sin confirmación existe y grita (control positivo del código propio)", async () => {
+    // Sin esta positiva, la negación de abajo podría estar pasando sobre una
+    // rama muerta: acá el doble devuelve la transacción SIN fila y el servicio
+    // tiene que decir exactamente eso —nada escrito, reintentable—, con su
+    // propio código y no con un INTERNAL genérico.
+    paymentStub.noConfirmOnce = true;
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const failure: unknown = await registerPayment(input, actor).catch((error: unknown) => error);
       expect(failure).toMatchObject({ code: "MIRROR_UNCONFIRMED", status: 500 });
       expect(errorSpy).toHaveBeenCalled();
-      expect(paymentStub.deleteCalls).toEqual(["invoice_payments"]);
+      expect(paymentStub.ledger).toEqual([]);
+      expect(paymentStub.drawer).toEqual([]);
+      expect(paymentStub.deleteCalls).toEqual([]);
       expect(paymentStub.unexpectedQueries).toEqual([]);
     } finally {
       errorSpy.mockRestore();
     }
   });
 
-  it("control positivo: si la compensación también falla, se emite el DELETE y se grita", async () => {
-    paymentStub.rollbackError = { message: "network" };
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    try {
-      const failure: unknown = await registerPayment(input, actor).catch((error: unknown) => error);
-      expect(failure).toMatchObject({ code: "PAYMENT_ROLLBACK_FAILED", status: 500 });
-      expect(errorSpy).toHaveBeenCalled();
-      expect(paymentStub.deleteCalls).toEqual(["invoice_payments"]);
-      expect(paymentStub.unexpectedQueries).toEqual([]);
-    } finally {
-      errorSpy.mockRestore();
-    }
+  it("control positivo del OBSERVADOR: un DELETE del cliente sí se registra (la negación no es vacía)", async () => {
+    // La compensación se retiró: el cobro no emite NINGÚN DELETE. Para que
+    // `deleteCalls == []` signifique algo, el observador tiene que estar vivo:
+    // un DELETE emitido contra el doble se registra. Es la positiva que reemplaza
+    // a la del DELETE de compensación (que ya no existe como código).
+    const client = createStubSupabaseClient() as unknown as {
+      from: (table: string) => { delete: () => { eq: (c: string, v: unknown) => Promise<unknown> } };
+    };
+    await client.from("invoice_payments").delete().eq("id", "espejo-1");
+    expect(paymentStub.deleteCalls).toEqual(["invoice_payments"]);
+  });
+});
+
+// ---- CL-14: el cobro de una factura (espejo + cajón + estado) es UNA transacción ----
+
+/**
+ * CL-14: la ÚLTIMA ventana de caja, y la peor de todas: un cobro cuyo asiento
+ * de dinero queda escrito pero cuyo estado nunca llega.
+ *
+ * EL DEFECTO, medido en `registerPayment` (service.ts): el cobro escribía, en
+ * orden, la fila espejo de la factura (`invoice_payments`, el dinero que suma el
+ * arqueo), la fila del libro de cajón (`payments`) y —TERCERO— el estado de la
+ * factura (`invoices`: el enlace al turno y el paso a `Pagada`). El PAR
+ * espejo+cajón sí estaba compensado y lo gritaba (`PAYMENT_ROLLBACK_FAILED`),
+ * pero el UPDATE del estado NO tenía compensación ninguna: una falla ahí dejaba
+ * el dinero COBRADO —las dos filas escritas, el arqueo sumándolo— con la factura
+ * `Emitida` para siempre. Y no se arregla solo: el saldo cobrable quedó en CERO
+ * (la fila espejo está escrita), así que ningún cobro posterior puede cerrarla —
+ * `invoiceNetBalance` da saldo 0 y una porción nueva se rechaza con OVERPAID—, y
+ * el reintento del MISMO envío, con la marca de la 042, es un no-op que devuelve
+ * la factura ABIERTA. La caja cobró y el sistema no lo registra como cobrado.
+ *
+ * EL MECANISMO es el de la casa: una FUNCIÓN SQL es UNA sentencia, y una
+ * sentencia corre ENTERA dentro de una sola transacción del servidor
+ * (PostgREST no ofrece multi-statement por request). `cash_invoice_payment_atomic`
+ * escribe los TRES grupos —el espejo, el cajón y el estado— o NINGUNO. La
+ * compensación del par deja de existir porque deja de hacer falta: ya no hay
+ * una mitad del camino donde fallar.
+ *
+ * LA ARITMÉTICA NO SE MUEVE: el bruto (`roundMoney`), el reparto del recargo
+ * (`splitGrossCardFee`), el saldo (`invoiceNetBalance`), el tope del 031, la
+ * decisión `Pagada` (`moneyEquals`) y el look-up de la marca siguen en
+ * TypeScript. La función sólo ESCRIBE lo que recibe.
+ */
+describe("cash: CL-14 el cobro de una factura es UNA transacción", () => {
+  const ACTOR = { userId: "u-1", sedeId: paymentStub.SEDE_ID };
+  const MARK = "4d5e6f70-8a9b-4c1d-9e2f-3a4b5c6d7e8f";
+  /** Cobro que COMPLETA el saldo (100000 de 100000): es el que cierra la factura. */
+  const collection = (mark = MARK, amount = 100000) => ({
+    cash_shift_id: paymentStub.SHIFT_ID,
+    invoice_id: paymentStub.INVOICE_ID,
+    method_code: "efectivo",
+    amount,
+    idempotency_key: mark,
+  });
+
+  const mirrorInserts = () => paymentStub.inserts.invoice_payments ?? 0;
+  const drawerInserts = () => paymentStub.inserts.payments ?? 0;
+
+  beforeEach(() => {
+    paymentStub.deleteCalls.length = 0;
+    paymentStub.unexpectedQueries.length = 0;
+    paymentStub.mirrorError = null;
+    paymentStub.mirrorData = null;
+    paymentStub.rollbackError = null;
+    paymentStub.ledger.length = 0;
+    paymentStub.drawer.length = 0;
+    paymentStub.invoiceStatus = "Emitida";
+    paymentStub.inserts = {};
+    paymentStub.skipMarkLookupOnce = false;
+    paymentStub.skipDrawerMarkLookupOnce = false;
+    paymentStub.stalePaymentsOnce = null;
+    paymentStub.drawerError = null;
+    paymentStub.failInvoiceCloseOnce = false;
+    paymentStub.raceAnnulOnce = false;
+    paymentStub.noConfirmOnce = false;
+    paymentStub.rpcCalls.length = 0;
+  });
+
+  it("el éxito escribe el espejo, el cajón y el cierre, con el MISMO contenido de siempre", async () => {
+    const result = await registerPayment(collection(), ACTOR);
+
+    // UNA transacción para el cobro: ni una escritura suelta del cliente.
+    expect(paymentStub.rpcCalls.map((call) => call.name)).toEqual([
+      "cash_invoice_payment_atomic",
+    ]);
+    // El espejo, columna por columna: el dinero, el turno que cobra y la marca
+    // del intento (042). El id lo pone la columna (gen_random_uuid): la
+    // compensación por id ya no existe.
+    expect(paymentStub.ledger).toEqual([
+      {
+        id: "espejo-1",
+        invoice_id: paymentStub.INVOICE_ID,
+        method_id: paymentStub.METHOD_ID,
+        method_code: "efectivo",
+        amount: 100000,
+        fee_percent: 0,
+        fee_amount: 0,
+        cash_shift_id: paymentStub.SHIFT_ID,
+        created_at: "2026-09-30T00:00:00.000Z",
+        idempotency_key: MARK,
+      },
+    ]);
+    // El libro de cajón, con el usuario que cobró y SIN marca (043: la
+    // identidad de este camino vive en la fila espejo).
+    expect(paymentStub.drawer).toEqual([
+      {
+        id: "caja-1",
+        sede_id: paymentStub.SEDE_ID,
+        cash_shift_id: paymentStub.SHIFT_ID,
+        invoice_id: paymentStub.INVOICE_ID,
+        method_id: paymentStub.METHOD_ID,
+        method_code: "efectivo",
+        amount: 100000,
+        user_id: "u-1",
+        created_at: "2026-09-30T00:00:00.000Z",
+        idempotency_key: null,
+      },
+    ]);
+    // Y el estado, dentro de la MISMA transacción.
+    expect(paymentStub.invoiceStatus).toBe("Pagada");
+    expect(result).toMatchObject({
+      invoice_id: paymentStub.INVOICE_ID,
+      invoice_status: "Pagada",
+    });
+    expect(result.payment).toMatchObject({ id: "caja-1", amount: 100000 });
+    expect(result.shift.id).toBe(paymentStub.SHIFT_ID);
+    expect(paymentStub.deleteCalls).toEqual([]);
+    expect(paymentStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("la aritmética viaja como DATO: la función no recalcula el recargo ni el cierre", async () => {
+    await registerPayment(collection(), ACTOR);
+
+    const args = paymentStub.rpcCalls[0].args;
+    // El reparto entero, computado por `splitGrossCardFee` en el servicio y
+    // escrito verbatim por la función: acá no hay una sola suma de dinero.
+    expect(args.p_collection).toEqual({
+      method_id: paymentStub.METHOD_ID,
+      method_code: "efectivo",
+      amount: 100000,
+      fee_percent: 0,
+      fee_amount: 0,
+      idempotency_key: MARK,
+    });
+    // La DECISIÓN de cerrar la factura es del servicio (invoiceNetBalance +
+    // moneyEquals) y viaja como booleano; el enlace al turno, ídem.
+    expect(args.p_mark_paid).toBe(true);
+    expect(args.p_set_shift).toBe(false);
+    expect(args.p_shift_id).toBe(paymentStub.SHIFT_ID);
+    expect(args.p_invoice_id).toBe(paymentStub.INVOICE_ID);
+    expect(args.p_sede_id).toBe(paymentStub.SEDE_ID);
+    expect(args.p_user_id).toBe("u-1");
+  });
+
+  it("una falla al CERRAR la factura no deja el dinero cobrado (nada escrito)", async () => {
+    paymentStub.failInvoiceCloseOnce = true;
+
+    const failure: unknown = await registerPayment(collection(), ACTOR).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(CashError);
+    expect(failure).toMatchObject({ code: "INTERNAL", status: 500 });
+    // MEDIDO ANTES DEL ARREGLO (verbatim, con el código previo a la 053): acá el
+    // espejo y el cajón YA ESTABAN escritos (el dinero cobrado, el arqueo
+    // sumándolo) y la factura seguía Emitida —con su saldo en cero, cerrable
+    // nunca—:
+    //   expected [ { …(10) } ] to have a length of 0 but got 1   (ledger)
+    //   expected 'Emitida' to be 'Pagada'                        (reintento)
+    expect(paymentStub.ledger).toEqual([]);
+    expect(paymentStub.drawer).toEqual([]);
+    expect(paymentStub.invoiceStatus).toBe("Emitida");
+    // Las sentencias CORRIERON dentro de la transacción y la transacción las
+    // revirtió: no es que no se haya intentado escribir.
+    expect(mirrorInserts()).toBe(1);
+    expect(drawerInserts()).toBe(1);
+    // Y no hay ninguna compensación: no hay nada que compensar.
+    expect(paymentStub.deleteCalls).toEqual([]);
+    expect(paymentStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("el REINTENTO del mismo envío COMPLETA el cobro (la factura queda Pagada)", async () => {
+    paymentStub.failInvoiceCloseOnce = true;
+    await registerPayment(collection(), ACTOR).catch((error: unknown) => error);
+
+    const retry = await registerPayment(collection(), ACTOR);
+
+    // El intento fallido no dejó marca (la transacción la revirtió con el
+    // resto), así que el reintento es una operación NUEVA que termina el cobro
+    // en vez de un no-op sobre una factura abierta para siempre.
+    expect(paymentStub.ledger).toHaveLength(1);
+    expect(paymentStub.ledger[0]).toMatchObject({ amount: 100000, idempotency_key: MARK });
+    expect(paymentStub.drawer).toHaveLength(1);
+    expect(paymentStub.invoiceStatus).toBe("Pagada");
+    expect(retry).toMatchObject({
+      invoice_id: paymentStub.INVOICE_ID,
+      invoice_status: "Pagada",
+    });
+    expect(retry.payment).toMatchObject({ id: "caja-1", amount: 100000 });
+    // Dos intentos de escritura (el revertido y el que quedó), una sola fila.
+    expect(mirrorInserts()).toBe(2);
+    expect(paymentStub.deleteCalls).toEqual([]);
+  });
+
+  it("una falla del libro de cajón revierte TAMBIÉN el espejo y no cierra la factura", async () => {
+    paymentStub.drawerError = { code: "23514", message: "el libro de cajón rechazó la fila" };
+
+    const failure: unknown = await registerPayment(collection(), ACTOR).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(CashError);
+    expect(failure).toMatchObject({ code: "INTERNAL", status: 500 });
+    // Antes esto lo resolvía un DELETE de compensación del espejo; ahora lo
+    // resuelve la transacción, y el desenlace observable es el mismo: NADA.
+    expect(paymentStub.ledger).toEqual([]);
+    expect(paymentStub.drawer).toEqual([]);
+    expect(paymentStub.invoiceStatus).toBe("Emitida");
+    expect(paymentStub.deleteCalls).toEqual([]);
+    expect(paymentStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("la anulación que gana la carrera rechaza el cobro y no escribe NADA", async () => {
+    // La factura se anula entre la lectura del servicio y la transacción: la
+    // fila bloqueada ya ve `Anulada`, así que el cobro se rechaza adentro.
+    paymentStub.raceAnnulOnce = true;
+
+    const failure: unknown = await registerPayment(collection(), ACTOR).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(CashError);
+    expect(failure).toMatchObject({ code: "ANNUL_INVALID", status: 409 });
+    expect(paymentStub.ledger).toEqual([]);
+    expect(paymentStub.drawer).toEqual([]);
+    // No vacuidad: la transacción SÍ se intentó (el rechazo es de adentro).
+    expect(paymentStub.rpcCalls).toHaveLength(1);
+    expect(mirrorInserts()).toBe(0);
+    expect(paymentStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("control negativo: después del cobro completo, la MISMA marca sigue siendo un no-op", async () => {
+    const first = await registerPayment(collection(), ACTOR);
+    const repeat = await registerPayment(collection(), ACTOR);
+
+    // El arreglo no puede convertir una repetición legítima en un segundo
+    // cobro: la marca de la 042 se sigue mirando ANTES de cualquier escritura.
+    expect(repeat).toEqual(first);
+    expect(paymentStub.ledger).toHaveLength(1);
+    expect(paymentStub.drawer).toHaveLength(1);
+    expect(mirrorInserts()).toBe(1);
+    expect(drawerInserts()).toBe(1);
+    // El segundo envío ni siquiera llegó a la transacción.
+    expect(paymentStub.rpcCalls).toHaveLength(1);
+    expect(repeat.invoice_status).toBe("Pagada");
+  });
+
+  it("una repetición sobre un cobro a medias de ANTES (espejo sin cajón) se sigue reportando", async () => {
+    // Estado heredado de la ventana ya cerrada: la fila espejo sin su fila de
+    // cajón. Es el único desenlace que le queda a PAYMENT_ROLLBACK_FAILED: la
+    // transacción no puede VOLVER a producirlo, pero la observación de lo ya
+    // escrito (el reintento reconoce por marca) tiene que seguir diciendo la
+    // verdad sobre esa avería.
+    paymentStub.ledger.push({
+      id: "espejo-heredado",
+      invoice_id: paymentStub.INVOICE_ID,
+      method_id: paymentStub.METHOD_ID,
+      method_code: "efectivo",
+      amount: 100000,
+      fee_percent: 0,
+      fee_amount: 0,
+      cash_shift_id: paymentStub.SHIFT_ID,
+      created_at: "2026-09-30T00:00:00.000Z",
+      idempotency_key: MARK,
+    });
+
+    const failure: unknown = await registerPayment(collection(), ACTOR).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(CashError);
+    expect(failure).toMatchObject({ code: "PAYMENT_ROLLBACK_FAILED", status: 500 });
+    expect(drawerInserts()).toBe(0);
   });
 });
 
@@ -2316,9 +2863,10 @@ describe("cash: T0-b el INSERT fallido del espejo no emite ningún DELETE", () =
  * MARCA del intento que manda el llamador, no por el contenido.
  *
  * LA FORMA: acá NO está la arruga de "la marca en la primera porción" de 042.
- * Este camino escribe UNA sola fila (un `insert` de un objeto, no de un
- * arreglo), así que la marca vive en esa única fila, el índice único parcial
- * nunca puede rechazar una operación legítima y no hay hermanas que enumerar.
+ * Este camino escribe UNA sola fila en `invoice_payments` (desde CL-14, por la
+ * transacción de la 053, pero sigue siendo una sola), así que la marca vive en
+ * esa única fila, el índice único parcial nunca puede rechazar una operación
+ * legítima y no hay hermanas que enumerar.
  */
 describe("cash: CL-3 el reintento de un cobro de factura no cobra dos veces", () => {
   const ACTOR = { userId: "u-1", sedeId: paymentStub.SEDE_ID };
@@ -2379,7 +2927,6 @@ describe("cash: CL-3 el reintento de un cobro de factura no cobra dos veces", ()
     paymentStub.mirrorError = null;
     paymentStub.mirrorData = null;
     paymentStub.rollbackError = null;
-    paymentStub.ledgerMode = true;
     paymentStub.ledger.length = 0;
     paymentStub.drawer.length = 0;
     paymentStub.invoiceStatus = "Emitida";
@@ -2658,7 +3205,6 @@ describe("cash: CL-4 el reintento de un pago de cajón sin factura no cuenta el 
     paymentStub.mirrorError = null;
     paymentStub.mirrorData = null;
     paymentStub.rollbackError = null;
-    paymentStub.ledgerMode = true;
     paymentStub.ledger.length = 0;
     paymentStub.drawer.length = 0;
     paymentStub.invoiceStatus = "Emitida";
@@ -4108,5 +4654,175 @@ describe("migración 049_cash_shift_atomic.sql (CL-10)", () => {
     // El número libre siguiente y el archivo hermano (048) que se espeja.
     expect(raw).toContain("049");
     expect(raw).toContain("048");
+  });
+});
+
+// ---------------- CL-14: la migración 053 ----------------
+
+describe("migración 053_cash_payment_state_atomic.sql (CL-14)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "053_cash_payment_state_atomic.sql"),
+    "utf8",
+  );
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+  // El texto de los `COMMENT ON …` es PROSA que viaja como string, no DDL.
+  const ddl = sql.replace(/COMMENT ON FUNCTION[\s\S]*?';\n/g, "");
+
+  it("piso anti-vacío: el archivo existe y trae DDL real", () => {
+    expect(raw.length).toBeGreaterThan(15000);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("la operación vive en UNA función: una sentencia, una transacción", () => {
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.cash_invoice_payment_atomic");
+    // Los TRES grupos de escritura del cobro, en la misma función: el espejo de
+    // la factura, el libro de cajón del turno y el estado de la factura.
+    expect(sql).toMatch(/INSERT INTO public\.invoice_payments/);
+    expect(sql).toMatch(/INSERT INTO public\.payments/);
+    expect(sql).toMatch(/UPDATE public\.invoices/);
+    // El lock de la fila de la factura: el punto de serialización de su dinero
+    // (el mismo que toma el tope de 031 y la anulación de la 050).
+    expect(sql).toMatch(/FOR UPDATE OF i/);
+  });
+
+  it("conserva las precondiciones de estado que el servicio ya tenía", () => {
+    // La factura anulada no admite cobros, releído de la fila bloqueada.
+    expect(sql).toMatch(/v_factura\.status = 'Anulada'/);
+    expect(sql).toContain("ANNUL_INVALID");
+    expect(sql).toContain("INVOICE_NOT_FOUND");
+    // Y la marca del intento (042/043) es obligatoria: este camino escribe UNA
+    // sola fila en `invoice_payments`, y esa fila es la operación.
+    expect(sql).toMatch(/coalesce\(p_collection ->> 'idempotency_key', ''\)/);
+    expect(sql).toContain("'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'");
+    expect(raw).toContain("MARCA NO ES OPCIONAL acá");
+  });
+
+  it("tiene UNA red de conteo por grupo de escritura, con rollback", () => {
+    // Tres: el espejo, el libro de cajón y el estado de la factura.
+    expect(sql.match(/GET DIAGNOSTICS/g) ?? []).toHaveLength(3);
+    expect(sql).toContain("RAISE EXCEPTION");
+    expect(sql).toContain("PAYMENT_MISMATCH");
+    // La guarda de forma no puede caer en un NULL silencioso: el `coalesce` es
+    // lo que hace que una clave AUSENTE falle en vez de comparar contra NULL
+    // (la misma trampa que 046–050 documentan).
+    expect(sql).toMatch(/coalesce\(/);
+  });
+
+  it("NO mueve aritmética de dinero a SQL: ningún monto se recalcula", () => {
+    // Los montos ya se validan con los CHECK de 005/006/019 (validar no es
+    // calcular): esta migración no agrega una sola expresión aritmética sobre
+    // las columnas de dinero. Escribir = convertir la representación
+    // (jsonb → la columna), no operar.
+    for (const column of [
+      "amount",
+      "fee_amount",
+      "fee_percent",
+      "total",
+      "surcharge",
+      "subtotal",
+      "discount",
+      "tax",
+    ]) {
+      expect(ddl, column).not.toMatch(new RegExp(`${column}\\s*[+\\-*/]`));
+    }
+    expect(ddl).not.toContain("CHECK");
+    expect(ddl).not.toMatch(/sum\s*\(/i);
+    expect(ddl).not.toMatch(/round\s*\(/i);
+    expect(ddl).not.toMatch(/trg_invoice_payments_cap/);
+    expect(ddl).not.toMatch(/invoices\.total/);
+  });
+
+  it("la decisión `Pagada` y el enlace al turno viajan como DATO (no se recalculan)", () => {
+    // El grupo 3 escribe el estado DECIDIDO por el servicio: dos booleanos
+    // (`p_set_shift`, `p_mark_paid`) y ningún cálculo de saldo. Si la decisión
+    // se hubiera movido a SQL, acá habría una comparación del cobrado contra el
+    // facturado (`moneyEquals`, `netCollected`, `netBilled`).
+    expect(sql).toMatch(/IF p_set_shift OR p_mark_paid THEN/);
+    expect(sql).toMatch(/CASE WHEN p_mark_paid THEN 'Pagada'/);
+    expect(sql).toMatch(/CASE WHEN p_set_shift THEN p_shift_id/);
+    expect(ddl).not.toContain("netCollected");
+    expect(ddl).not.toContain("netBilled");
+    expect(ddl).not.toContain("moneyEquals");
+  });
+
+  it("escribe los MISMOS campos del estado que el servicio, y ni uno más", () => {
+    // El UPDATE del grupo 3: el turno que cobra y el estado. `closed_by` y
+    // `closed_at` NO se escriben, porque el camino de caja tampoco los escribía
+    // (asimetría declarada frente a la 050, conservada a propósito).
+    const update = sql.slice(
+      sql.indexOf("UPDATE public.invoices"),
+      sql.indexOf("RETURNING * INTO v_factura"),
+    );
+    expect(update).toMatch(/cash_shift_id/);
+    expect(update).toMatch(/status/);
+    expect(update).not.toMatch(/closed_at/);
+    expect(update).not.toMatch(/closed_by/);
+    expect(raw).toContain("LA ASIMETRÍA QUE SE CONSERVA");
+  });
+
+  it("devuelve la fila del libro de cajón con las columnas que el servicio lee", () => {
+    // Dos `jsonb_build_object` anidados: el cobro escrito y el estado de la
+    // factura. Las columnas son las de PAYMENT_SELECT, sin `to_jsonb` de la fila
+    // entera (que agregaría `idempotency_key`, que el servicio nunca leyó).
+    expect(sql.match(/jsonb_build_object\(/g) ?? []).toHaveLength(3);
+    for (const column of PAYMENT_COLUMNS) expect(sql, column).toContain(`'${column}',`);
+    expect(sql).toContain("'status', v_factura.status");
+    expect(sql).not.toContain("to_jsonb");
+  });
+
+  it("cierra el permiso: sólo service_role puede ejecutarla", () => {
+    const signature =
+      "public.cash_invoice_payment_atomic(uuid, uuid, uuid, uuid, boolean, boolean, jsonb)";
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature}`);
+    expect(sql).toContain(`GRANT EXECUTE ON FUNCTION ${signature}`);
+    expect(sql).toContain("FROM PUBLIC");
+    expect(sql).toContain("FROM anon");
+    expect(sql).toContain("FROM authenticated");
+    expect(sql).toContain("TO service_role");
+    expect(sql).toContain("SECURITY INVOKER");
+    expect(sql).toContain("SET search_path = public");
+    expect(sql.match(/^ALTER FUNCTION/gm) ?? []).toHaveLength(1);
+  });
+
+  it("no borra ni reescribe datos: sólo la función y sus permisos", () => {
+    expect(sql.match(/CREATE OR REPLACE FUNCTION/g) ?? []).toHaveLength(1);
+    expect(sql.match(/^COMMENT ON FUNCTION/gm) ?? []).toHaveLength(1);
+    expect(sql).not.toMatch(/\bDELETE\b/);
+    expect(sql).not.toMatch(/^\s*TRUNCATE/im);
+    // Un solo UPDATE EJECUTABLE: el del estado de la factura, el MISMO que el
+    // servicio ya hacía.
+    expect(sql.match(/UPDATE public\./g) ?? []).toHaveLength(1);
+    expect(sql).not.toMatch(/UPDATE public\.invoice_payments/);
+    expect(sql).not.toMatch(/UPDATE public\.payments/);
+    // `updated_at` lo sigue escribiendo el trigger de 005/006, no esta migración.
+    expect(sql).not.toMatch(/updated_at/);
+    expect(sql).not.toMatch(/^\s*ALTER TABLE/im);
+    expect(sql).not.toMatch(/^\s*CREATE INDEX/im);
+    expect(sql).not.toContain("DROP FUNCTION");
+    expect(sql).not.toContain("DROP TRIGGER");
+    expect(sql).not.toContain("DROP CONSTRAINT");
+  });
+
+  it("declara el acoplamiento, el costo de numeración y las ventanas", () => {
+    expect(raw).toContain("ACOPLAMIENTO DE DESPLIEGUE");
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("VENTANAS DECLARADAS");
+    // El número asignado, el archivo hermano (050) que se espeja y el número de
+    // otra unidad en vuelo que NO se toca.
+    expect(raw).toContain("053");
+    expect(raw).toContain("050");
+    expect(raw).toContain("052");
+  });
+
+  it("declara la ventana del turno que este archivo NO cierra", () => {
+    // El estado del turno se resuelve en el servicio: un turno puede cerrarse
+    // entre esa lectura y el commit. Se declara (con su costo) en vez de
+    // esconderse: cerrarlo exigiría un segundo punto de serialización por cobro.
+    expect(raw).toContain("EL ESTADO DEL TURNO se lee en el SERVICIO");
+    expect(raw).toContain("un SEGUNDO punto de serialización en");
   });
 });
