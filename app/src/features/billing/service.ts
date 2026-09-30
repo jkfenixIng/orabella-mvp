@@ -97,6 +97,17 @@ function validationMessage(error: { issues: Array<{ message: string }> }): strin
  * código que la anulación de factura mapea a `ANNUL_CONFLICT` y el cierre de
  * caja a `SHIFT_ALREADY_CLOSED`.
  *
+ * CL-1: la precondición es `(estado, versión)`, no solo la versión, porque el
+ * estado es la OTRA mitad de la decisión. La edición decide con el estado que
+ * LEYÓ —Anulada es terminal y la edición libre rechaza Pagada— y esa lectura no
+ * es la fila: entre el `read` y este candado cabe una anulación (que revierte
+ * stock) o un cobro que cierre la factura. Sin la guarda de estado, esa edición
+ * en vuelo se aplicaba igual sobre la fila ya terminal: los ítems, el stock y
+ * las comisiones quedaban escritos DESPUÉS del hecho. La forma es la del hermano
+ * `annulInvoice` (`.eq("id", …).eq("status", …)`). Las 0 filas siguen saliendo
+ * por el MISMO `EDIT_CONFLICT` (409): lo que cambia para la carrera es el
+ * mensaje, que ahora también nombra el estado.
+ *
  * LÍMITE CONOCIDO (CO-1, declarado y no escondido): el candado cubre la ventana
  * lectura→primera escritura, que es la del hallazgo; NO es una transacción. Si
  * la ganadora ya reclamó el token y una tercera edición alcanza a leer los ítems
@@ -110,12 +121,14 @@ async function claimInvoiceEdit(
   db: DbClient,
   invoiceId: string,
   expectedVersion: number,
+  expectedStatus: string,
 ): Promise<void> {
   const { data, error } = await db
     .from("invoices")
     .update({ edit_version: expectedVersion + 1 })
     .eq("id", invoiceId)
     .eq("edit_version", expectedVersion)
+    .eq("status", expectedStatus)
     .select("id")
     .single();
   if (error || !data) {
@@ -123,7 +136,7 @@ async function claimInvoiceEdit(
     if (errorCode === "PGRST116") {
       throw new BillingError(
         "EDIT_CONFLICT",
-        "Otra edición de esta factura se aplicó entre la lectura y la escritura (posible edición simultánea): no se ajustó nada. Vuelva a abrir la factura y repita la edición.",
+        "El estado de la factura cambió entre la lectura y la escritura, o se aplicó otra edición (posible edición simultánea): no se ajustó nada. Vuelva a abrir la factura y repita la edición.",
         409,
       );
     }
@@ -1593,7 +1606,12 @@ export async function editInvoiceItems(
   // el token de nadie). Si otra edición de esta factura se aplicó entre la
   // lectura y acá, afecta 0 filas y esta se rechaza con EDIT_CONFLICT sin haber
   // tocado nada.
-  await claimInvoiceEdit(db, invoiceId, Number(detail.invoice.edit_version));
+  await claimInvoiceEdit(
+    db,
+    invoiceId,
+    Number(detail.invoice.edit_version),
+    detail.invoice.status,
+  );
 
   // Aplica: borra, actualiza, inserta, métodos, inventario, auditoría.
   const editReason = `Ajuste edición factura #${detail.invoice.consecutive_number} — ${motivo.slice(0, 200)}`;
@@ -1908,7 +1926,12 @@ export async function editEmittedInvoiceItems(
   // DESPUÉS de todos los rechazos por regla: un rechazo de negocio no consume el
   // token). La edición libre SÍ reescribe la fila (totales) más adelante; el
   // candado va primero para que la perdedora no alcance a escribir ni un ítem.
-  await claimInvoiceEdit(db, invoiceId, Number(detail.invoice.edit_version));
+  await claimInvoiceEdit(
+    db,
+    invoiceId,
+    Number(detail.invoice.edit_version),
+    detail.invoice.status,
+  );
 
   // Aplica: ítems, métodos, snapshot de impuestos, totales, inventario, auditoría.
   const editReason = `Edición libre emitida factura #${detail.invoice.consecutive_number}${motivo ? ` — ${motivo.slice(0, 200)}` : ""}`;

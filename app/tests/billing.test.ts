@@ -1293,6 +1293,11 @@ const editStub = vi.hoisted(() => ({
   statuses: {} as Record<string, string>,
   /** Versión que llevó cada guarda `.eq("edit_version", v)`, en orden. */
   versionGuards: [] as number[],
+  /**
+   * CL-1: estado que llevó cada guarda `.eq("status", s)` del camino de edición,
+   * en orden. La otra mitad de la precondición del compare-and-swap.
+   */
+  statusGuards: [] as string[],
   /** La guarda afecta 0 filas sin carrera (ruta de error del candado). */
   staleGuard: false,
   /** Movimientos de inventario insertados: cuántas veces se movió el stock. */
@@ -1477,15 +1482,23 @@ function createOverCollectionStubClient(): unknown {
   const editVersionResponse = (ctx: QueryContext): { data: unknown; error: unknown } => {
     const id = ctx.rowId ?? overCollectionStub.INVOICE_ID;
     const written = (overCollectionStub.invoiceUpdate ?? {}) as Record<string, unknown>;
+    const status = () => editStub.statuses[id] ?? "Emitida";
     const row = () => ({
       ...stubInvoiceRow(Number(written.total ?? STUB_EMITTED_TOTAL)),
       id,
-      status: editStub.statuses[id] ?? "Emitida",
+      status: status(),
       edit_version: editStub.versions[id] ?? 0,
     });
     // El UPDATE de totales de la edición libre no lleva guarda de versión: es
     // una escritura del MISMO dueño del candado, no un segundo candado.
     if (ctx.versionGuard === undefined) return { data: row(), error: null };
+    // CL-1: el estado es la OTRA mitad de la precondición, y se evalúa como
+    // PostgREST: la fila solo se pisa si SIGUE en el estado leído. La anulación
+    // que gane la ventana lectura→candado deja la guarda sin coincidencia y el
+    // UPDATE afecta 0 filas.
+    if (ctx.statusGuard !== undefined && ctx.statusGuard !== status()) {
+      return { data: null, error: zeroRowsError };
+    }
     if (editStub.staleGuard || ctx.versionGuard !== (editStub.versions[id] ?? 0)) {
       return { data: null, error: zeroRowsError };
     }
@@ -1738,6 +1751,7 @@ function createOverCollectionStubClient(): unknown {
         if (table === "invoices" && column === "status") {
           statusGuard = String(value);
           if (annulStub.active) annulStub.guards.push(String(value));
+          if (editStub.active) editStub.statusGuards.push(String(value));
         }
         if (table === "invoices" && column === "id") rowId = String(value);
         if (table === "invoices" && column === "edit_version") {
@@ -2975,6 +2989,7 @@ describe("billing: dos ediciones de la misma factura se serializan (CO-1)", () =
     editStub.versions = {};
     editStub.statuses = {};
     editStub.versionGuards.length = 0;
+    editStub.statusGuards.length = 0;
     editStub.staleGuard = false;
     editStub.movements.length = 0;
     editStub.events.length = 0;
@@ -3011,6 +3026,7 @@ describe("billing: dos ediciones de la misma factura se serializan (CO-1)", () =
     editStub.versions = {};
     editStub.statuses = {};
     editStub.versionGuards.length = 0;
+    editStub.statusGuards.length = 0;
     editStub.staleGuard = false;
     editStub.movements.length = 0;
     editStub.events.length = 0;
@@ -3142,6 +3158,236 @@ describe("billing: dos ediciones de la misma factura se serializan (CO-1)", () =
     expect(editStub.movements[0]).toMatchObject({ type: "OUT", qty: QTY_DELTA });
     expect(overCollectionStub.writes).toContain("invoices.update");
     expect(overCollectionStub.writes).toContain("audit_logs.insert");
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+});
+
+// ------------- CL-1: el candado de edición cubre el ESTADO ----------------
+//
+// `claimInvoiceEdit` reclamaba el token de edición con un compare-and-swap
+// sobre `invoices.edit_version` y nada más. La edición decide con la lectura que
+// la abre (`getInvoiceDetail`): Anulada es terminal y la edición libre rechaza
+// Pagada. Pero esa lectura no es la fila: entre el `read` y el candado cabe otra
+// escritura —una anulación, que además revierte stock, o un cobro que cierra la
+// factura—, y la edición en vuelo aplicaba igual sobre la fila ya anulada o ya
+// pagada. El estado quedaba bien y los ítems, el stock y las comisiones se
+// escribían DESPUÉS del hecho terminal.
+//
+// El precedente hermano es `annulInvoice`, que ya hace
+// `.eq("id", id).eq("status", detail.invoice.status)` y mapea las 0 filas a
+// `ANNUL_CONFLICT`. Acá el estado entra en el MISMO compare-and-swap y las 0
+// filas siguen saliendo por el MISMO `EDIT_CONFLICT` (409): lo que cambia para
+// la carrera es el mensaje —ahora nombra el estado—, no el código.
+//
+// El intercalado es real, no simulado: la edición se detiene EN su candado, el
+// test mueve el estado de la fila como lo haría la anulación que ganó esa
+// ventana, y recién ahí la libera. El doble aplica `.eq("status", v)` como
+// PostgREST, así que una guarda que el servicio no mande no puede rechazar nada.
+
+describe("billing: el candado de edición cubre el estado de la factura (CL-1)", () => {
+  const ACTOR: BillingActor = {
+    userId: "u-1",
+    sedeId: overCollectionStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  /** Cantidad final: 1 → 3. El delta es +2 (dos unidades de descuento). */
+  const QTY_DELTA = 2;
+
+  /** Línea de PRODUCTO de la factura (el origen del delta de stock). */
+  function productLine(invoiceId: string, itemId: string, qty: number, unitPrice: number) {
+    return {
+      ...annulProductItemRow(),
+      id: itemId,
+      invoice_id: invoiceId,
+      qty,
+      unit_price: unitPrice,
+      subtotal: qty * unitPrice,
+    };
+  }
+
+  /** La MISMA línea con qty 3 a 100.000: el subtotal queda intacto (300.000). */
+  function payload(itemId: string) {
+    return {
+      items: [
+        {
+          id: itemId,
+          item_type: "producto",
+          product_id: PRODUCT_ID,
+          service_id: null,
+          custom_name: null,
+          employee_id: EMPLOYEE_ID,
+          qty: 1 + QTY_DELTA,
+          unit_price: 100000,
+          discount: 0,
+          no_commission: true,
+        },
+      ],
+      payments: [],
+    };
+  }
+
+  /** Edición ADMIN (total inmutable + motivo). */
+  function adminEdit() {
+    return editInvoiceItems(
+      overCollectionStub.SEDE_ID,
+      overCollectionStub.INVOICE_ID,
+      { ...payload(overCollectionStub.ITEM_ID), motivo: "Cantidad mal digitada" },
+      ACTOR,
+    );
+  }
+
+  /** Edición LIBRE de emitida (cajera/turno; acá admin, que también puede). */
+  function freeEdit() {
+    return editEmittedInvoiceItems(
+      overCollectionStub.SEDE_ID,
+      overCollectionStub.INVOICE_ID,
+      payload(overCollectionStub.ITEM_ID),
+      ACTOR,
+    );
+  }
+
+  /**
+   * Arranca una edición y espera —por SONDEO, igual que el bloque CO-1— a que su
+   * próxima escritura (el compare-and-swap) quede EN VUELO. Con la edición
+   * detenida se mueve el estado de la fila y recién ahí se libera: la edición ya
+   * leyó Emitida y el candado evalúa el estado NUEVO.
+   */
+  async function startHeldEdit(start: () => Promise<unknown>): Promise<{ pending: unknown }> {
+    editStub.holdNextWrite = true;
+    editStub.releaseWrite = null;
+    const pending = start().then(
+      () => "aplicada" as const,
+      (error: unknown) => error,
+    );
+    for (let attempt = 0; attempt < 400 && !editStub.releaseWrite; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    // Si la edición falla antes de escribir, el sondeo no ve la escritura y la
+    // prueba falla a la vista, sin quedarse esperando.
+    expect(editStub.releaseWrite).not.toBeNull();
+    // Non-vacuidad del intercalado: la edición ya leyó la factura y todavía no
+    // escribió nada (el candado es su primera escritura).
+    expect(editStub.events).toEqual(["read"]);
+    // La promesa vuelve DENTRO de un objeto a propósito: `return pending` en una
+    // función async adoptaría la promesa y esperaría a que la edición (detenida)
+    // termine —justo lo contrario de lo que el test necesita.
+    return { pending };
+  }
+
+  beforeEach(() => {
+    editStub.active = true;
+    editStub.versions = {};
+    editStub.statuses = {};
+    editStub.versionGuards.length = 0;
+    editStub.statusGuards.length = 0;
+    editStub.staleGuard = false;
+    editStub.movements.length = 0;
+    editStub.events.length = 0;
+    editStub.holdNextWrite = false;
+    editStub.releaseWrite = null;
+    editStub.onWriteHeld = null;
+    editStub.product = annulProductRow();
+    editStub.itemsByInvoice = {
+      [overCollectionStub.INVOICE_ID]: [
+        productLine(overCollectionStub.INVOICE_ID, overCollectionStub.ITEM_ID, 1, STUB_EMITTED_TOTAL),
+      ],
+    };
+    overCollectionStub.payments = [];
+    overCollectionStub.invoiceUpdate = null;
+    overCollectionStub.auditInsert = null;
+    overCollectionStub.writes.length = 0;
+    overCollectionStub.unexpectedQueries.length = 0;
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+    pagedStub.inFilters.length = 0;
+  });
+
+  afterEach(() => {
+    editStub.active = false;
+    editStub.holdNextWrite = false;
+    editStub.releaseWrite?.();
+    editStub.releaseWrite = null;
+    editStub.onWriteHeld = null;
+    editStub.versions = {};
+    editStub.statuses = {};
+    editStub.versionGuards.length = 0;
+    editStub.statusGuards.length = 0;
+    editStub.staleGuard = false;
+    editStub.movements.length = 0;
+    editStub.events.length = 0;
+    editStub.product = null;
+    editStub.itemsByInvoice = {};
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+    pagedStub.inFilters.length = 0;
+  });
+
+  it("una edición en vuelo NO se aplica si la factura se anula entre la lectura y el candado", async () => {
+    const { pending } = await startHeldEdit(() => adminEdit());
+
+    // La anulación gana la ventana lectura→candado: deja la fila terminal (y
+    // revierte stock, fuera de este doble). Es el desenlace que la edición ya
+    // había leído como Emitida.
+    editStub.statuses[overCollectionStub.INVOICE_ID] = "Anulada";
+    if (editStub.releaseWrite) editStub.releaseWrite();
+
+    const outcome = await pending;
+    // El síntoma del hallazgo: la edición se aplicaba igual sobre la anulada.
+    expect(outcome).toBeInstanceOf(BillingError);
+    expect(outcome).toMatchObject({ code: "EDIT_CONFLICT", status: 409 });
+    // El rechazo es accionable y nombra lo que pasó: el estado se movió.
+    expect((outcome as BillingError).message).toContain("estado");
+    expect((outcome as BillingError).message).toContain("simultánea");
+    // La precondición de estado salió de la LECTURA (Emitida), no de re-leer la
+    // fila ya anulada: el candado compara contra lo que se decidió.
+    expect(editStub.statusGuards).toEqual(["Emitida"]);
+    // Y no se ajustó nada: ni el token avanzó (el doble solo anota la versión
+    // cuando el CAS APLICA), ni hubo stock, ni auditoría, ni una segunda
+    // escritura (la única es el CAS rechazado).
+    expect(editStub.versions, "el CAS no aplicó: la versión de la fila no avanzó").toEqual({});
+    expect(editStub.movements).toEqual([]);
+    expect(overCollectionStub.auditInsert).toBeNull();
+    expect(overCollectionStub.writes).toEqual(["invoices.update"]);
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("lo mismo si el cobro cierra la factura (Pagada) entre la lectura y el candado", async () => {
+    const { pending } = await startHeldEdit(() => freeEdit());
+
+    editStub.statuses[overCollectionStub.INVOICE_ID] = "Pagada";
+    if (editStub.releaseWrite) editStub.releaseWrite();
+
+    const outcome = await pending;
+    expect(outcome).toBeInstanceOf(BillingError);
+    expect(outcome).toMatchObject({ code: "EDIT_CONFLICT", status: 409 });
+    expect(editStub.statusGuards).toEqual(["Emitida"]);
+    expect(editStub.movements).toEqual([]);
+    expect(overCollectionStub.writes).toEqual(["invoices.update"]);
+  });
+
+  it("control anti-extralimitación: la edición legítima sigue aplicándose con su estado", async () => {
+    const outcome = await freeEdit().then(
+      () => "aplicada" as const,
+      (error: unknown) => error,
+    );
+
+    expect(outcome).toBe("aplicada");
+    // El candado llevó las DOS mitades de la precondición, y el estado que se
+    // leyó: sin carrera la guarda coincide y la edición pasa.
+    expect(editStub.statusGuards).toEqual(["Emitida"]);
+    expect(editStub.versionGuards).toEqual([0]);
+    expect(editStub.versions[overCollectionStub.INVOICE_ID]).toBe(1);
+    // Y el ajuste se aplicó UNA vez.
+    expect(editStub.movements).toHaveLength(1);
+    expect(editStub.movements[0]).toMatchObject({
+      product_id: PRODUCT_ID,
+      type: "OUT",
+      qty: QTY_DELTA,
+    });
     expect(overCollectionStub.unexpectedQueries).toEqual([]);
   });
 });
