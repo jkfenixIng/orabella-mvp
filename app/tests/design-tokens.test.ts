@@ -554,6 +554,52 @@ function lightStatusTints() {
   }));
 }
 
+/* --------------------------------------------------------------------------
+   Escala de sombras (D6).
+
+   El defecto: el MISMO nombre —`.shadow-sm|md|lg|xl`— estaba declarado dos
+   veces, una sin capa en design-tokens.css y otra que Tailwind emite dentro de
+   `@layer utilities` desde su tema por defecto. Ganaba la del proyecto, pero por
+   ACCIDENTE de cascada (una regla sin capa gana a cualquier capa), no por
+   decisión; y la utilidad de Tailwind seguía emitiéndose con la receta del
+   registry. Importa ahora que entran componentes del registry: pedir
+   `shadow-sm` tiene que dar la identidad del proyecto porque SÍ, no porque la
+   regla del proyecto esté escrita en un lugar más fuerte de la cascada.
+
+   La decisión (del dueño) es que ganen los valores del proyecto. Estas guardas
+   verifican las tres mitades de esa decisión, y ninguna alcanza sola:
+   1. la declaración oficial: `@theme inline` mapea --shadow* a los tokens vivos;
+   2. el retiro del duplicado: ninguna regla `.shadow-*` sin capa en
+      design-tokens.css, con control negativo del propio lector de clases;
+   3. que la colisión fuera real: la receta del registry existe, es OTRA, y la
+      declaración oficial resuelve al token del proyecto y no a ella.
+   -------------------------------------------------------------------------- */
+
+/** Peldaños de la escala de sombras que el proyecto declara y usa. */
+const SHADOW_SCALE = ["sm", "md", "lg", "xl"] as const;
+
+/**
+ * El OTRO lado de la colisión: la escala por defecto de sombras de Tailwind.
+ * Se lee del paquete instalado (`index.css` es el CSS que resuelve
+ * `@import "tailwindcss"`) en vez de transcribirla, para que un cambio de
+ * versión de Tailwind vuelva a medir la colisión en lugar de dejar la guarda
+ * afirmando algo que ya no es cierto.
+ */
+const TAILWIND_THEME_PATH = join(APP_ROOT, "node_modules", "tailwindcss", "index.css");
+const TAILWIND_THEME_CSS = readFileSync(TAILWIND_THEME_PATH, "utf8");
+
+/**
+ * Valor de `--shadow*` en el tema por defecto de Tailwind, o null si ese
+ * nombre ya no está declarado allí (la guarda rompe en vez de saltear).
+ * Se extrae con una lectura directa y no con `readThemeVars` porque ese helper
+ * corta en el primer bloque sin llaves anidadas y el tema de Tailwind contiene
+ * `@keyframes` adentro.
+ */
+function registryShadow(name: string): string | null {
+  const match = new RegExp(`(?:^|[;{])\\s*${name}\\s*:\\s*([^;{}]+);`).exec(TAILWIND_THEME_CSS);
+  return match ? match[1].replace(/\s+/g, " ").trim() : null;
+}
+
 describe("design tokens: guardas de contrato", () => {
   it("ningún token de color pide más chroma de la que el sRGB puede mostrar", () => {
     const outOfGamut = collectOklchTokens(TOKENS_CSS)
@@ -1027,13 +1073,122 @@ describe("design tokens: guardas de contrato", () => {
     expect(themeInline.get("--color-destructive")).toBe("var(--color-error-600)");
   });
 
-  it("los .shadow-* locales siguen intactos: su valor difiere del que genera Tailwind", () => {
-    const declared = bareClassNames(TOKENS_CSS);
-    for (const name of ["shadow-sm", "shadow-md", "shadow-lg", "shadow-xl"]) {
-      expect(declared, `${name} debe seguir declarada`).toContain(name);
+  it("la escala de sombras del proyecto es oficial por DECLARACIÓN, no por cascada", () => {
+    const failures: string[] = [];
+    for (const step of SHADOW_SCALE) {
+      const key = `--shadow-${step}`;
+      // La mitad que hace la diferencia: la utilidad la emite Tailwind desde su
+      // tema, así que lo que Tailwind mira es ESTA clave. Antes no existía y por
+      // eso el valor del proyecto llegaba por cascada (o no llegaba nunca).
+      if (themeInline.get(key) !== `var(${key})`) {
+        const raw = themeInline.get(key) ?? "(ausente)";
+        failures.push(
+          `${key}: se esperaba var(${key}) en globals.css @theme inline, hay ${raw}`,
+        );
+        continue;
+      }
+      // El token tiene que existir en los DOS temas y cambiar entre ellos: si no
+      // cambiara, la clave no necesitaría ser `inline`.
+      const light = requireVar(lightVars, key, "design-tokens.css :root");
+      const dark = requireVar(darkVars, key, "design-tokens.css .dark");
+      if (light === dark) {
+        failures.push(`${key}: mismo valor en claro y oscuro (${light})`);
+      }
     }
-    // No se toca lo que no se puede probar igual: `.shadow-sm` local = 1px/2px
-    // con el token del proyecto; el de Tailwind (v4) = 1px/3px con su default.
-    expect(readDeclaration(TOKENS_CSS, ".shadow-sm", "box-shadow")).toBe("var(--shadow-sm)");
+    // `shadow` (suelta) no tiene receta propia en el proyecto: se aliasa al sm
+    // del proyecto, igual que el registry la aliasa a su propio sm. Sin esto, un
+    // componente del registry que pida `shadow` vuelve a salir con el registry.
+    if (themeInline.get("--shadow") !== "var(--shadow-sm)") {
+      failures.push(
+        `--shadow: se esperaba var(--shadow-sm), hay ${themeInline.get("--shadow") ?? "(ausente)"}`,
+      );
+    }
+    expect(failures).toEqual([]);
+
+    // Cobertura: ninguna sombra declarada por el proyecto puede quedar sin
+    // puente. Es lo que impide que un --shadow-* nuevo o revivido vuelva a
+    // ganar por cascada en vez de por declaración.
+    const unmapped = [...lightVars.keys()]
+      .filter((name) => name.startsWith("--shadow"))
+      .filter((name) => !themeInline.has(name));
+    expect(unmapped, "tokens --shadow* de design-tokens.css sin clave en @theme inline").toEqual(
+      [],
+    );
+  });
+
+  it("el duplicado sin capa se retiró: ninguna clase `.shadow-*` compite con la utilidad", () => {
+    const declared = bareClassNames(TOKENS_CSS);
+    // Control negativo del lector: sobre una muestra sintética que reproduce el
+    // patrón retirado, la detección TIENE que dispararse. Sin esto, un lector
+    // roto (o un `bareClassNames` que devolviera []) dejaría pasar la aserción
+    // de abajo sin haber medido nada.
+    expect(bareClassNames(".shadow-sm { box-shadow: var(--shadow-sm); }")).toEqual(["shadow-sm"]);
+    // Piso anti-vacío sobre el archivo REAL, la otra mitad del control: el
+    // lector sigue viendo las clases sueltas que el archivo sí declara.
+    for (const stillThere of ["border-color", "radius-lg", "bg-success-light"]) {
+      expect(declared, `${stillThere} debería seguir declarada en design-tokens.css`).toContain(
+        stillThere,
+      );
+    }
+    expect(declared.filter((name) => name.startsWith("shadow"))).toEqual([]);
+
+    // El token muerto que duplicaba el nombre de la utilidad: ni en claro ni en
+    // oscuro de design-tokens.css, y tampoco mapeado en @theme inline. `shadow-2xl`
+    // (la clase) sigue existiendo: lo que se retiró fue el token que nadie leía.
+    expect(lightVars.has("--shadow-2xl"), "design-tokens.css :root").toBe(false);
+    expect(darkVars.has("--shadow-2xl"), "design-tokens.css .dark").toBe(false);
+    expect(themeInline.has("--shadow-2xl"), "globals.css @theme inline").toBe(false);
+  });
+
+  it("la declaración oficial resuelve al token del proyecto y NO a la receta del registry", () => {
+    // Piso anti-vacío: si el tema de Tailwind no se dejara leer, la medición no
+    // valdría nada y el test tiene que romper, no saltear.
+    expect(TAILWIND_THEME_CSS.length, "node_modules/tailwindcss/index.css").toBeGreaterThan(
+      10_000,
+    );
+
+    const failures: string[] = [];
+    for (const step of SHADOW_SCALE) {
+      const key = `--shadow-${step}`;
+      const registry = registryShadow(key);
+      if (registry === null) {
+        failures.push(`${key}: el tema de Tailwind ya no lo declara; hay que releer esta guarda`);
+        continue;
+      }
+      const light = requireVar(lightVars, key, "design-tokens.css :root");
+      const dark = requireVar(darkVars, key, "design-tokens.css .dark");
+      // Si la receta del registry fuera igual a la del proyecto en los dos
+      // temas, no habría colisión que medir y este test pasaría por trivial.
+      if (registry === light && registry === dark) {
+        failures.push(
+          `${key}: el registry coincide con el proyecto (${registry}); no hay colisión`,
+        );
+      }
+      // La utilidad resuelve por el tema de Tailwind: la clave tiene que llevar
+      // al token del proyecto en claro y en oscuro, y nunca a la receta del otro.
+      const resolvedLight = resolveConcrete(key, [lightVars, darkTheme, themeInline]);
+      const resolvedDark = resolveConcrete(key, [darkTheme, lightVars, themeInline]);
+      if (resolvedLight !== light) {
+        failures.push(`${key}: en claro resuelve a ${resolvedLight ?? "(nada)"} de ${light}`);
+      }
+      if (resolvedDark !== dark) {
+        failures.push(`${key}: en oscuro resuelve a ${resolvedDark ?? "(nada)"} de ${dark}`);
+      }
+      if (resolvedLight === registry || resolvedDark === registry) {
+        failures.push(`${key}: la utilidad resuelve a la receta del registry (${registry})`);
+      }
+    }
+
+    // Por qué `--shadow` puede aliasarse a `--shadow-sm` sin inventar un
+    // peldaño: en el registry el alias suelto vale exactamente lo mismo que su
+    // sm. Medido, no supuesto; si dejaran de coincidir, el puente habría que
+    // releerlo.
+    const registryAlias = registryShadow("--shadow");
+    const registrySm = registryShadow("--shadow-sm");
+    expect(registryAlias, "--shadow en el tema de Tailwind").not.toBeNull();
+    expect(registrySm, "--shadow-sm en el tema de Tailwind").not.toBeNull();
+    expect(registryAlias, "--shadow vs --shadow-sm en el tema de Tailwind").toBe(registrySm);
+
+    expect(failures).toEqual([]);
   });
 });
