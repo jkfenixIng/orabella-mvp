@@ -296,9 +296,14 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
   const db = await adminDb();
 
   // Vínculo automático por documento (no editable): el usuario de acceso
-  // es el de la sede con el mismo documento; sin coincidencia se crea
-  // automáticamente (nunca se pide creación manual).
-  // El user_id que traiga el input se ignora a propósito.
+  // es el de la sede con el mismo documento. El user_id que traiga el input se
+  // ignora a propósito.
+  //
+  // CL-15: si NO hay coincidencia, el usuario NO se crea acá. La creación viaja
+  // adentro de `upsert_employee_atomic` (054), en la MISMA sentencia que el rol
+  // y el legajo: un usuario creado desde el cliente era la mitad de la ventana
+  // —quedaba con login y rol, y sin legajo, cuando la escritura siguiente
+  // fallaba—.
   const { data: linked, error: linkedError } = await db
     .from("users")
     .select("id")
@@ -306,25 +311,7 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
     .eq("id_number", input.document)
     .maybeSingle();
   if (linkedError) throw new AdminError("INTERNAL", "Error interno.", 500);
-  let userId = (linked as { id: string } | null)?.id ?? null;
-  if (!userId && !input.id) {
-    const { data: createdUser, error: createError } = await db
-      .from("users")
-      .insert({
-        sede_id: input.sede_id,
-        email: input.email?.trim() ? input.email.trim() : null,
-        phone: input.phone ?? null,
-        id_type: "CC",
-        id_number: input.document,
-        password_hash: await hashPassword(input.document),
-        full_name: input.full_name,
-        must_change_password: true,
-      })
-      .select("id")
-      .single();
-    if (createError || !createdUser) throw new AdminError("INTERNAL", "Error interno.", 500);
-    userId = (createdUser as { id: string }).id;
-  }
+  const userId = (linked as { id: string } | null)?.id ?? null;
   if (userId) {
     let takenQuery = db.from("employees").select("id").eq("user_id", userId).limit(1);
     if (input.id) takenQuery = takenQuery.neq("id", input.id);
@@ -350,8 +337,9 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
     }
   }
 
-  // Red de seguridad (solo al crear): si el usuario vinculado NO tiene ningún
-  // rol, se le asigna `empleado` para que nadie quede sin acceso por olvido.
+  // Red de seguridad de roles (solo al crear): si el usuario vinculado NO tiene
+  // ningún rol, se le asigna `empleado` para que nadie quede sin acceso por
+  // olvido.
   //
   // CO-4: la decisión ya NO se toma desde el cliente. Un `select` seguido de un
   // `insert` son DOS requests de PostgREST —dos transacciones— y entre ellos
@@ -360,47 +348,39 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
   // El usuario terminaba con DOS roles, y el modelo del proyecto es uno por
   // usuario (`setUserRolesSchema` exige `.length(1)`). Una relectura de
   // compensación no arregla nada: también está sin lock y podría borrar un rol
-  // legítimo. La decisión viaja por lo tanto a UNA sentencia del servidor,
-  // `ensure_user_has_role` (migración 040), que toma el lock de la fila del
-  // usuario (`FOR UPDATE`) antes de escribir. Ese lock es el MISMO que toma
-  // `replace_user_roles` (039): los dos escritores de roles quedan
-  // serializados y el intercalado deja de ser posible.
+  // legítimo. La decisión viaja por lo tanto a UNA sentencia del servidor —hoy
+  // `upsert_employee_atomic` (054), que COMPONE `ensure_user_has_role` (040) y
+  // toma el lock de la fila del usuario (`FOR UPDATE`) antes de escribir—. Ese
+  // lock es el MISMO que toma `replace_user_roles` (039): los dos escritores de
+  // roles quedan serializados y el intercalado deja de ser posible.
   //
-  // Corre ANTES de la escritura del empleado y FALLA CERRADA: si la llamada no
-  // se puede completar, no se otorga nada y la operación se aborta sin dejar
-  // una escritura a medias. Un fallo no puede convertirse en "no tiene
-  // ninguno".
+  // CL-15: además, el alta ENTERA —el usuario si hay que crearlo, su rol y el
+  // legajo— viaja en esa misma sentencia. Antes eran hasta TRES requests de
+  // PostgREST: el `insert` del usuario, el rpc de la red de seguridad y el
+  // `upsert` del empleado. Un fallo entre ellos dejaba un usuario con login y
+  // rol pero SIN legajo —puede entrar y no existe como empleado—, y el legajo
+  // quedaba sin la persona que lo respalda. Adentro de una transacción no hay
+  // "entre ellos": o se escriben las tres cosas, o no se escribe ninguna.
   //
-  // El rpc levanta `RAISE EXCEPTION` plano (SQLSTATE P0001) para usuario o rol
-  // inexistentes. Acá NO se traduce a un error de negocio como en
-  // `setUserRoles`: el usuario y el rol los eligió el propio servicio, así que
-  // cualquiera de los dos casos significa dato o permiso roto —el mismo
-  // contrato que ya tenía esta ruta cuando el catálogo no traía `empleado`— y
-  // se reporta como error interno.
+  // Las comprobaciones de negocio de arriba (`USER_ALREADY_LINKED`,
+  // `EMPLOYEE_CODE_TAKEN`) SIGUEN mandando para el error legible, y la función
+  // las repite adentro sobre la fila bloqueada, que es lo que las vuelve
+  // verdaderas al momento de escribir.
   //
-  // La post-condición se contrasta contra lo que la base DEVOLVIÓ (el conjunto
-  // final), nunca contra lo que se pidió: un rpc sin error que no dejó ningún
-  // rol no es un éxito. El conjunto puede traer más de un rol (un usuario
-  // arrastrado por el bug viejo): la red no lo "corrige" ni lo reporta como
-  // fallo, sólo se asegura de que no haya quedado en cero.
+  // El rpc levanta `RAISE EXCEPTION` plano (SQLSTATE P0001, o el 23505 del
+  // índice parcial de `employee_code`) cuando el usuario o el rol no existen.
+  // Acá NO se traduce a un error de negocio como en `setUserRoles`: el usuario
+  // y el rol los eligió el propio servicio, así que cualquiera de los dos casos
+  // significa dato o permiso roto —el mismo contrato que ya tenía esta ruta
+  // cuando el catálogo no traía `empleado`— y se reporta como error interno. El
+  // único 23505 que se traduce es el del código de empleado, que es el mismo
+  // contrato de carrera que ya tenía el `upsert` suelto.
   //
-  // Al actualizar (`input.id`) no se consulta: los roles no se tocan.
-  if (!input.id && userId) {
-    const { data: rolesResultantes, error: rolesError } = await db.rpc("ensure_user_has_role", {
-      p_user_id: userId,
-      p_role_code: "empleado",
-    });
-    if (rolesError) throw new AdminError("INTERNAL", "Error interno.", 500);
-    const aplicados = (Array.isArray(rolesResultantes) ? rolesResultantes : []).filter(
-      (code): code is string => typeof code === "string" && code.length > 0,
-    );
-    if (aplicados.length === 0) throw new AdminError("INTERNAL", "Error interno.", 500);
-  }
-
-  const payload = {
-    ...(input.id ? { id: input.id } : {}),
+  // Al actualizar (`input.id`) no se consulta: los roles no se tocan, y el
+  // legajo se sigue escribiendo con su `upsert` de siempre (UNA escritura, que
+  // no necesita transacción para ser atómica).
+  const camposDelEmpleado = {
     sede_id: input.sede_id,
-    user_id: userId,
     full_name: input.full_name,
     employee_code: code,
     document: input.document,
@@ -413,6 +393,43 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
     salary_fixed: input.salary_fixed ?? null,
     commission_percent: input.commission_percent ?? null,
     ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
+  };
+
+  if (!input.id) {
+    const { data: creado, error: altaError } = await db.rpc("upsert_employee_atomic", {
+      p_employee: camposDelEmpleado,
+      p_user_id: userId,
+      p_create_user: userId
+        ? null
+        : {
+            sede_id: input.sede_id,
+            email: input.email?.trim() ? input.email.trim() : null,
+            phone: input.phone ?? null,
+            id_type: "CC",
+            id_number: input.document,
+            password_hash: await hashPassword(input.document),
+            full_name: input.full_name,
+          },
+      p_role_code: "empleado",
+    });
+    if (altaError) {
+      if ((altaError as { code?: string }).code === "23505") {
+        throw new AdminError(
+          "EMPLOYEE_CODE_TAKEN",
+          "El código de empleado ya existe en esta sede.",
+          409,
+        );
+      }
+      throw new AdminError("INTERNAL", "Error interno.", 500);
+    }
+    if (!creado) throw new AdminError("INTERNAL", "Error interno.", 500);
+    return creado as EmployeeRow;
+  }
+
+  const payload = {
+    ...(input.id ? { id: input.id } : {}),
+    ...camposDelEmpleado,
+    user_id: userId,
   };
   const { data, error } = await db
     .from("employees")

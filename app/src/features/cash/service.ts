@@ -48,7 +48,6 @@ import {
   type InvoiceNetBalance,
   type InvoicePaymentRow,
 } from "@/src/features/billing/service";
-import { randomUUID } from "node:crypto";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { getShiftReviews } from "@/src/features/alerts/service";
 import { assembleShiftRevision, type ShiftRevision } from "@/src/features/alerts/schemas";
@@ -999,8 +998,9 @@ export interface PaymentResult {
  * (payroll/service.ts).
  *
  * ACÁ NO ESTÁ LA ARRUGA DE "LA MARCA EN LA PRIMERA PORCIÓN": este camino escribe
- * UNA sola fila en `invoice_payments` (una sentencia de un objeto, no un
- * `insert([...])` de N porciones), así que la marca vive en esa única fila, el
+ * UNA sola fila en `invoice_payments` (desde CL-14 la escribe la transacción de
+ * la 053, y sigue siendo una sola: un objeto en `p_collection`, no un arreglo de
+ * N porciones), así que la marca vive en esa única fila, el
  * índice único parcial de 042 nunca puede rechazar una operación legítima de
  * varias porciones, y no hay filas hermanas que enumerar: la fila que devuelve
  * este lookup ES la operación completa.
@@ -1049,10 +1049,13 @@ async function findInvoicePaymentsByIdempotencyKey(
  *     viejo sería reportar un estado que ya no es.
  *
  * Si el intento ganador dejó la fila espejo pero NO la del libro de cajón, esa
- * es exactamente la avería que el intento original reporta como
- * `PAYMENT_ROLLBACK_FAILED` (el dinero está en la factura y en el arqueo, pero
- * no en el libro del turno): la repetición reporta lo mismo en vez de inventar
- * un no-op exitoso sobre un estado roto. Mismo desenlace, mismo código.
+ * es exactamente la avería que CL-14 cerró: las dos filas se escriben en UNA
+ * transacción, así que el intento original ya no puede producir ese estado. Lo
+ * que sí puede es ENCONTRARLO: un cobro escrito ANTES de la 053 quedó con esa
+ * mitad, y la repetición de su mismo envío tiene que seguir diciendo la verdad
+ * sobre esa avería (el dinero está en la factura y en el arqueo, pero no en el
+ * libro del turno) en vez de inventar un no-op exitoso sobre un estado roto.
+ * Mismo desenlace, mismo código: `PAYMENT_ROLLBACK_FAILED`.
  */
 async function repeatedCollectionResult(
   db: DbClient,
@@ -1165,12 +1168,14 @@ function repeatedDrawerPaymentResult(payment: CashPaymentRow, shift: CashShiftRo
  * Consolidación T5/T0-a: el cobro de factura vive en `invoice_payments` (el
  * ledger del cobro, con `cash_shift_id` = turno que COBRA) y se refleja en
  * `payments` (por turno, PRD §9.1, con `user_id`: el único rastro de quién
- * cobró). El espejo se escribe PRIMERO y la fila de cajón después, para que
- * ninguna falla pueda dejar un `payments` con `invoice_id` sin espejo: los
- * tres lectores del arqueo filtran `invoice_id IS NULL`, así que ese huérfano
- * sería dinero invisible (Defecto 2). Si las porciones completan el total, la
- * factura pasa a Pagada y se vincula al turno (`cash_shift_id`). Solo
- * admin/caja (vía requireCashWriter en rutas/actions).
+ * cobró). CL-14: el espejo, la fila de cajón y el ESTADO de la factura se
+ * escriben en UNA transacción (`cash_invoice_payment_atomic`, migración 053),
+ * así que ya no hay un "antes" y un "después" donde una falla pueda dejar el
+ * dinero cobrado con la factura abierta —el huérfano invisible del Defecto 2 y
+ * el estado parcial que quedaba para siempre—. Si el neto cobrado completa el
+ * neto facturado, la factura pasa a Pagada y se vincula al turno
+ * (`cash_shift_id`), dentro de esa misma transacción. Solo admin/caja (vía
+ * requireCashWriter en rutas/actions).
  *
  * CL-3 (idempotencia): cuando el pago trae `invoice_id`, el cuerpo exige la
  * MARCA del intento (`idempotency_key`, migración 042: columna e índice único
@@ -1338,63 +1343,107 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
       if (repeated) return repeatedDrawerPaymentResult(repeated, shift);
     }
 
-    // T0-a (Defecto 2): el espejo de factura va PRIMERO. `invoice_payments`
-    // es el ledger del cobro de factura y el arqueo lo lee por
-    // `cash_shift_id` (el turno que COBRA: sin ese turno el cobro se sumaba
-    // dos veces, C1). El ORDEN importa: la fila de cajón (`payments`, con
-    // `invoice_id`) se escribe SOLO cuando el espejo ya existe, así ninguna
-    // falla puede dejar un `payments` con `invoice_id` que el arqueo ignora
-    // (los tres lectores filtran `invoice_id IS NULL`): el dinero nunca queda
-    // invisible. Si el espejo falla, no hay nada que revertir.
+    // CL-14: el cobro de una factura es UNA transacción (migración 053). Antes
+    // eran TRES requests contra PostgREST —la fila espejo (`invoice_payments`,
+    // el dinero que suma el arqueo), la fila del libro de cajón (`payments`) y,
+    // TERCERO, el estado de la factura— y el tercero no tenía compensación
+    // ninguna: una falla ahí dejaba el dinero COBRADO (las dos filas escritas)
+    // con la factura `Emitida` para siempre —el saldo cobrable quedó en cero,
+    // así que ningún cobro posterior podía cerrarla, y el reintento del MISMO
+    // envío, con la marca de la 042, era un no-op que devolvía la factura
+    // abierta—.
     //
-    // T0-a (Defecto 1): el espejo lleva el recargo de la porción
-    // (`fee_percent` + `fee_amount`) para que `amount − fee_amount` sea el neto
-    // cobrado, que es lo que suman el tope de 031, el saldo de la factura y el
-    // reporte del recargo. Sin él, `fee_amount` tomaba su DEFAULT 0 y el
-    // recargo de la caja era irrecuperable.
-    let mirrorId: string | null = null;
+    // El PAR espejo+cajón se compensaba a mano y se gritaba
+    // (`PAYMENT_ROLLBACK_FAILED`): esa compensación YA NO EXISTE, porque ya no
+    // hace falta. `cash_invoice_payment_atomic` escribe los TRES grupos dentro
+    // de la transacción de UNA sentencia —o ninguno—, y el desenlace observable
+    // de una falla es el mismo que la compensación buscaba (NADA escrito), sin
+    // un DELETE de dinero y sin ventana entre el rollback y el error.
+    //
+    // LA ARITMÉTICA NO SE MUEVE A SQL. Siguen acá, antes de llamar: el bruto
+    // (`gross`, redondeado UNA vez con `roundMoney`), el reparto del recargo
+    // (`splitGrossCardFee`), el saldo (`invoiceNetBalance`), su tope de 031, la
+    // marca de la 042 y la decisión `Pagada` (`moneyEquals`, abajo). La función
+    // escribe cada columna verbatim y no compara el cobrado contra el facturado
+    // ni una vez.
+    let writtenPayment: CashPaymentRow | null = null;
     if (input.invoice_id) {
-      // El id se genera acá: la columna es `uuid PRIMARY KEY DEFAULT
-      // gen_random_uuid()` (005_billing.sql). Tenerlo ANTES del INSERT hace que
-      // toda compensación sea EXACTA por id — nunca por (factura, turno,
-      // método, monto), que podría borrar también un cobro legítimo anterior
-      // idéntico.
-      const mirrorIdCandidate = randomUUID();
-      const { data: mirror, error: mirrorError } = await db
-        .from("invoice_payments")
-        .insert({
-          id: mirrorIdCandidate,
-          invoice_id: input.invoice_id,
+      // Las DOS decisiones del estado, tomadas acá y enviadas como booleanos:
+      //
+      //   * enlazar la factura al turno que COBRA, sólo si no tenía turno (una
+      //     factura emitida en el turno de A y cobrada en el de B pertenece al
+      //     turno que cobra);
+      //   * cerrarla, cuando el NETO cobrado cubre el neto facturado: con el
+      //     recargo de un cobro POSTERIOR a la emisión el bruto supera `total`,
+      //     así que comparar el bruto contra total dejaba en Emitida una factura
+      //     con el neto ya completo.
+      //
+      // El recargo (`fee_percent` + `fee_amount`) viaja en el mismo objeto: es
+      // lo que hace que `amount − fee_amount` sea el neto cobrado, que es lo que
+      // suman el tope de 031, el saldo de la factura y el reporte del recargo.
+      // Sin él, `fee_amount` tomaba su DEFAULT 0 y el recargo de la caja era
+      // irrecuperable (T0-a, Defecto 1).
+      const setShift = !invoiceShiftId;
+      // `invoiceBalance !== null` es la guarda de TIPO: el saldo se resolvió en el
+      // primer bloque de este camino, y TypeScript no correlaciona los dos `if`.
+      const markPaid =
+        invoiceStatus === "Emitida" &&
+        invoiceBalance !== null &&
+        moneyEquals(roundMoney(invoiceBalance.netCollected + cardFee.net), invoiceBalance.netBilled);
+      // CL-3: la marca del intento en la ÚNICA fila espejo de este camino (una
+      // sentencia de un objeto: la arruga de "la marca en la primera porción" de
+      // 042 no aplica acá). Es la barrera final de la carrera, con el índice
+      // único parcial de 042, que ahora corre DENTRO de la transacción.
+      const { data: written, error: payError } = await db.rpc("cash_invoice_payment_atomic", {
+        p_sede_id: actor.sedeId,
+        p_shift_id: shift.id,
+        p_invoice_id: input.invoice_id,
+        p_user_id: actor.userId,
+        p_set_shift: setShift,
+        p_mark_paid: markPaid,
+        p_collection: {
           method_id: method.id,
           method_code: method.code,
           amount: gross,
           fee_percent: feePercent,
           fee_amount: cardFee.fee,
-          cash_shift_id: shift.id,
-          // CL-3: la marca del intento, en la ÚNICA fila que este camino
-          // escribe (una sentencia de un objeto: la arruga de "la marca en la
-          // primera porción" de 042 no aplica acá). Es la barrera final de la
-          // carrera, con el índice único parcial de 042.
           idempotency_key: mark,
-        })
-        .select("id")
-        .single();
-      if (mirrorError) {
-        // Dos barreras pueden rechazar este INSERT, y el código lo dice: el
-        // tope de 031 (trigger BEFORE INSERT → P0001) y el índice único parcial
-        // de identidad de la 042 (23505). El orden depende de cuál llegue
-        // primero —el trigger de fila corre ANTES de la comprobación del
-        // índice—, así que las dos se atienden igual: si la marca YA está
-        // registrada, esto es una repetición y la respuesta es lo que dejó la
-        // ganadora.
-        const code = (mirrorError as { code?: string } | null)?.code;
+        },
+      });
+      if (payError) {
+        const code = (payError as { code?: string } | null)?.code;
+        const message = String((payError as { message?: unknown } | null)?.message ?? "");
+        // Las precondiciones que la transacción revalida ADENTRO sobre la fila
+        // bloqueada —una factura Anulada, una factura que ya no está— salen con
+        // su MENSAJE y con el MISMO SQLSTATE del tope de 031 (P0001), así que el
+        // mensaje se mira ANTES que el código: si no, un cobro sobre una factura
+        // anulada se leería como "se pasó del tope".
+        if (message.includes("ANNUL_INVALID")) {
+          throw new CashError("ANNUL_INVALID", "No se puede cobrar una factura anulada.", 409);
+        }
+        if (message.includes("INVOICE_NOT_FOUND")) {
+          throw new CashError("INVOICE_NOT_FOUND", "Factura no encontrada.", 404);
+        }
+        if (message.includes("PAYMENT_INVALID") || message.includes("PAYMENT_MISMATCH")) {
+          // Una entrada a medio formar o una red de conteo que no cuadró: es una
+          // invariante rota del llamador o de la base, no un rechazo de negocio.
+          throw new CashError("INTERNAL", "Error interno.", 500);
+        }
+        // Dos barreras pueden rechazar el INSERT del espejo, DENTRO de la
+        // transacción, y el código lo dice: el tope de 031 (trigger BEFORE
+        // INSERT → P0001) y el índice único parcial de identidad de la 042
+        // (23505). El orden depende de cuál llegue primero —el trigger de fila
+        // corre ANTES de la comprobación del índice—, así que las dos se atienden
+        // igual: si la marca YA está registrada, esto es una repetición y la
+        // respuesta es lo que dejó la ganadora.
         if (code === "23505" || code === "P0001") {
           // COSTO DECLARADO: acá no se quema ningún número (`invoice_payments`
           // no tiene consecutivo: su `id` es un uuid), lo que se pierde es la
-          // sentencia ABORTADA de la perdedora, que ya había leído el saldo. Se
+          // transacción ABORTADA de la perdedora, que ya había leído el saldo. Se
           // prefiere eso —raro, y exige dos envíos con la misma marca
           // solapados— antes que cobrar dos veces. La factura tampoco pasa a
-          // Pagada dos veces: el UPDATE va después y es idempotente por estado.
+          // Pagada dos veces: el cierre va en la MISMA transacción que el espejo
+          // y sólo escribe si el servicio lo decidió.
           const winner = await findInvoicePaymentsByIdempotencyKey(db, input.invoice_id, mark);
           if (winner.length > 0) {
             return repeatedCollectionResult(db, actor, input.invoice_id, winner[0]);
@@ -1407,19 +1456,24 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
         }
         throw new CashError("INTERNAL", "Error interno.", 500);
       }
-      if (!mirror) {
-        // Defecto 3: esta rama no puede quedar muda ni sin compensar.
-        // PostgREST no debería responder sin error y sin fila; si pasa, la
-        // compensación es exacta (el DELETE solo puede tocar la fila que
-        // acabamos de intentar insertar; 0 filas si nunca llegó a existir) y
-        // se grita. Si la compensación también falla no se sabe qué quedó
-        // escrito: mismo desenlace que la reversa de la fila de cajón.
-        const { error: unconfirmedError } = await db
-          .from("invoice_payments")
-          .delete()
-          .eq("id", mirrorIdCandidate);
+      // La transacción devuelve SU propia fila (el libro de cajón escrito, con
+      // las columnas de PAYMENT_SELECT) y el estado que dejó la factura: el
+      // llamador no necesita otra lectura y no hay ventana entre la escritura y
+      // el resultado.
+      const result = written as {
+        payment?: CashPaymentRow | null;
+        invoice?: { status?: string | null } | null;
+      } | null;
+      if (!result?.payment) {
+        // La transacción no confirmó su escritura. No es un desenlace del SQL
+        // —la función devuelve su jsonb o revienta, y si revienta el error llega
+        // arriba—, así que es una invariante rota en la frontera y se grita. Como
+        // la escritura es INDIVISIBLE, lo único honesto que se puede afirmar es
+        // que NO hay un cobro confirmado: no quedó una mitad escrita que
+        // compensar. Es el desenlace que este camino ya nombraba
+        // (`MIRROR_UNCONFIRMED`), ahora sin compensación de por medio.
         console.error(
-          "PG invoice_payments insert sin fila:",
+          "RPC cash_invoice_payment_atomic sin confirmación:",
           JSON.stringify({
             invoice_id: input.invoice_id,
             shift_id: shift.id,
@@ -1427,123 +1481,72 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
             amount: gross,
             fee_percent: feePercent,
             fee_amount: cardFee.fee,
-            mirror_id: mirrorIdCandidate,
-            compensation_error: unconfirmedError,
           }),
         );
-        if (unconfirmedError) {
-          throw new CashError(
-            "PAYMENT_ROLLBACK_FAILED",
-            "El cobro quedó registrado en la factura y en el arqueo, pero no en el libro de caja del turno. No reintente: avise al administrador.",
-            500,
-          );
-        }
         throw new CashError(
           "MIRROR_UNCONFIRMED",
           "No se pudo confirmar el registro del cobro en la factura; no quedó nada escrito. Reintente.",
           500,
         );
       }
-      mirrorId = mirrorIdCandidate;
-    }
-
-    const { data: payment, error: paymentError } = await db
-      .from("payments")
-      .insert({
-        sede_id: actor.sedeId,
-        cash_shift_id: shift.id,
-        invoice_id: input.invoice_id ?? null,
-        method_id: method.id,
-        method_code: method.code,
-        amount: gross,
-        user_id: actor.userId,
-        // CL-4: la marca del intento, en la fila del libro de cajón. La lleva
-        // SOLO el camino SIN factura, donde esta fila es la ÚNICA escritura de
-        // la operación y no hay espejo que la identifique (migración 043). En
-        // el camino CON factura la marca de la operación vive en la fila espejo
-        // (`invoice_payments`, 042) —su reconocimiento no cambió— y acá queda
-        // NULL a propósito: marcar las dos mezclaría en un mismo índice las
-        // marcas de dos caminos distintos (ver "POR QUÉ LA FILA DEL CAMINO CON
-        // FACTURA QUEDA SIN MARCA" en la 043).
-        idempotency_key: input.invoice_id ? null : mark,
-      })
-      .select(PAYMENT_SELECT)
-      .single();
-    if (paymentError || !payment) {
-      // CL-4: barrera FINAL de la carrera del pago SIN factura. El lookup de
-      // arriba y este INSERT no son atómicos: si otro envío con la MISMA marca
-      // en el MISMO turno confirmó en esa ventana, este INSERT choca con el
-      // índice único parcial de 043 (23505). Acá NO hay espejo que revertir (el
-      // camino sin factura escribe UNA sola fila), así que la repetición se
-      // relee y se devuelve; sin ganadora, el 23505 no es una repetición y se
-      // reporta como fallo real en vez de disfrazarlo.
-      //
-      // COSTO DECLARADO: acá no se quema ningún número (`payments.id` es un
-      // uuid, la tabla no tiene serie); lo que se pierde es la sentencia
-      // ABORTADA de la perdedora, que ya había resuelto turno y método. Se
-      // prefiere eso —raro, y exige dos envíos con la misma marca solapados—
-      // antes que contar el efectivo del turno dos veces.
-      if (!input.invoice_id && (paymentError as { code?: string } | null)?.code === "23505") {
-        const winner = await findDrawerPaymentByIdempotencyKey(db, shift.id, mark);
-        if (winner) return repeatedDrawerPaymentResult(winner, shift);
+      writtenPayment = result.payment;
+      // El estado de la factura es el que la transacción DEJÓ ESCRITO (o el que
+      // dejó intacto): se devuelve eso, no una suposición del llamador.
+      if (result.invoice?.status) invoiceStatus = result.invoice.status;
+    } else {
+      // CL-4: el pago SIN factura. Su ÚNICA escritura es esta fila del libro de
+      // cajón (`payments`), sin espejo: UNA sentencia ya es una transacción y no
+      // tiene nada que compartir con la transacción de la 053 (no hay espejo ni
+      // estado de factura que escribir). La marca del intento la lleva ESTA fila
+      // (columna e índice de 043): es la identidad de la operación, porque no hay
+      // un espejo que la identifique.
+      const { data: payment, error: paymentError } = await db
+        .from("payments")
+        .insert({
+          sede_id: actor.sedeId,
+          cash_shift_id: shift.id,
+          invoice_id: null,
+          method_id: method.id,
+          method_code: method.code,
+          amount: gross,
+          user_id: actor.userId,
+          // La marca del intento, en la fila del libro de cajón (043).
+          idempotency_key: mark,
+        })
+        .select(PAYMENT_SELECT)
+        .single();
+      if (paymentError || !payment) {
+        // CL-4: barrera FINAL de la carrera del pago SIN factura. El lookup de
+        // arriba y este INSERT no son atómicos: si otro envío con la MISMA marca
+        // en el MISMO turno confirmó en esa ventana, este INSERT choca con el
+        // índice único parcial de 043 (23505). Acá NO hay espejo que revertir (el
+        // camino sin factura escribe UNA sola fila), así que la repetición se
+        // relee y se devuelve; sin ganadora, el 23505 no es una repetición y se
+        // reporta como fallo real en vez de disfrazarlo.
+        //
+        // COSTO DECLARADO: acá no se quema ningún número (`payments.id` es un
+        // uuid, la tabla no tiene serie); lo que se pierde es la sentencia
+        // ABORTADA de la perdedora, que ya había resuelto turno y método. Se
+        // prefiere eso —raro, y exige dos envíos con la misma marca solapados—
+        // antes que contar el efectivo del turno dos veces.
+        if ((paymentError as { code?: string } | null)?.code === "23505") {
+          const winner = await findDrawerPaymentByIdempotencyKey(db, shift.id, mark);
+          if (winner) return repeatedDrawerPaymentResult(winner, shift);
+        }
         throw new CashError("INTERNAL", "Error interno.", 500);
       }
-      // Reversa VERIFICADA del espejo: el error del DELETE no se traga. Si el
-      // DELETE falla, la fila de cajón tampoco existe, así que el cobro queda
-      // SOLO en `invoice_payments` (visible para el arqueo) y la falla se
-      // grita en vez de dejar un huérfano invisible.
-      if (mirrorId) {
-        const { error: rollbackError } = await db
-          .from("invoice_payments")
-          .delete()
-          .eq("id", mirrorId);
-        if (rollbackError) {
-          console.error(
-            "PG invoice_payments rollback:",
-            JSON.stringify({
-              invoice_id: input.invoice_id,
-              shift_id: shift.id,
-              amount: gross,
-              method_code: method.code,
-              mirror_id: mirrorId,
-              rollback_error: rollbackError,
-            }),
-          );
-          throw new CashError(
-            "PAYMENT_ROLLBACK_FAILED",
-            "El cobro quedó registrado en la factura y en el arqueo, pero no en el libro de caja del turno. No reintente: avise al administrador.",
-            500,
-          );
-        }
-      }
+      writtenPayment = payment as CashPaymentRow;
+    }
+
+    if (!writtenPayment) {
+      // Inalcanzable por construcción (cada rama de arriba asigna una fila o
+      // lanza), pero el tipo y la garantía de la respuesta lo exigen: ninguna
+      // respuesta puede salir sin el cobro que se registró.
       throw new CashError("INTERNAL", "Error interno.", 500);
     }
 
-    if (input.invoice_id && invoiceBalance) {
-      const updates: Record<string, unknown> = {};
-      if (!invoiceShiftId) updates.cash_shift_id = shift.id;
-      // La factura queda Pagada cuando el NETO cobrado cubre el neto
-      // facturado: con el recargo de un cobro posterior a la emisión el bruto
-      // supera `total`, así que comparar el bruto contra total dejaba en
-      // Emitida una factura con el neto ya completo.
-      if (
-        invoiceStatus === "Emitida" &&
-        moneyEquals(roundMoney(invoiceBalance.netCollected + cardFee.net), invoiceBalance.netBilled)
-      ) {
-        updates.status = "Pagada";
-        invoiceStatus = "Pagada";
-      }
-      if (Object.keys(updates).length > 0) {
-        const { error: updateError } = await db
-          .from("invoices")
-          .update(updates)
-          .eq("id", input.invoice_id);
-        if (updateError) throw new CashError("INTERNAL", "Error interno.", 500);
-      }
-    }
-
     return {
-      payment: payment as CashPaymentRow,
+      payment: writtenPayment,
       shift,
       invoice_id: input.invoice_id ?? null,
       invoice_status: invoiceStatus,

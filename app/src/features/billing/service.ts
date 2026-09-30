@@ -35,13 +35,11 @@ import {
 import { dayBounds } from "@/src/shared/lib/dates";
 import { listPaymentMethods, listServices, listTaxes } from "@/src/features/admin/service";
 import {
-  deductStock,
   getProductsStock,
-  registerMovement,
   InventoryError,
   type StockEntry,
 } from "@/src/features/inventory/service";
-import { planStockDeduction } from "@/src/features/inventory/schemas";
+import { planStockDeduction, type PlannedDeduction } from "@/src/features/inventory/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import {
   chunkIds,
@@ -1047,27 +1045,128 @@ async function findInvoiceByIdempotencyKey(
 }
 
 /**
- * FAC-01…07: crea la factura (consecutivo con lock, snapshot de
- * impuestos activos, OUT de stock por producto vía deductStock,
- * porciones que cuadran). Estado inicial Emitida; si las porciones
- * suman el total → Pagada. B1: este es el MOMENTO ÚNICO del descuento;
+ * CL-13: el error del RPC de EMISIÓN (052) traducido al MISMO contrato de
+ * negocio que la emisión devolvía antes.
+ *
+ * La forma del error es la de PostgREST —un objeto `{code, message, …}`, no un
+ * `Error`— y todas las `RAISE EXCEPTION` de la función salen con el MISMO
+ * SQLSTATE (P0001: el de un `RAISE EXCEPTION` plano, que es también el del
+ * trigger de stock de 004 y el del tope de cobro de 031), así que lo único
+ * confiable es el MENSAJE, igual que en `deductStock` (046),
+ * `toRpcAnnulError` (050) y `toRpcEditError` (051).
+ *
+ *   * `INSUFFICIENT_STOCK` — el trigger de 004 rechazó un OUT que dejaría el
+ *     stock negativo (la foto que tomó `planStockDeduction` puede haber quedado
+ *     vieja: la guarda que manda es la del trigger, y corre ADENTRO). Es el
+ *     MISMO 409 y el MISMO mensaje que devolvía `deductStock`.
+ *   * `PRODUCT_NOT_FOUND` — la red de conteo de la deducción: el producto no
+ *     existe o es de otra sede. Es el MISMO 404 que devolvía `getProduct`.
+ *   * `SHIFT_NOT_OPEN` — la precondición del turno se vuelve a comprobar sobre
+ *     la fila bloqueada y en la ventana lectura→escritura el turno se cerró. Es
+ *     el MISMO código, el MISMO mensaje y el MISMO 409 que ya devolvía la
+ *     comprobación del servicio: el llamador no ve una diferencia.
+ *   * el tope de cobro de 031 (su `RAISE EXCEPTION` nombra el neto facturado)
+ *     es el MISMO 422 `OVERPAID` que ya traducía el INSERT de las porciones.
+ *   * `INVOICE_INVALID`, `ITEM_MISMATCH`, `TAX_MISMATCH`, `PAYMENT_MISMATCH`,
+ *     `MOVEMENT_MISMATCH`, `OUT_REASON_INVALID` y `SEDE_NOT_FOUND` no deberían
+ *     poder llegar desde acá: la entrada la arma este mismo módulo y los conteos
+ *     los hace la función. Si llegan, es un fallo real y se reporta como
+ *     INTERNAL en vez de disfrazarse.
+ */
+function toRpcCreateError(error: { message?: unknown } | null): BillingError {
+  const message = String(error?.message ?? "");
+  if (message.includes("INSUFFICIENT_STOCK")) {
+    return new BillingError(
+      "INSUFFICIENT_STOCK",
+      "Stock insuficiente: el movimiento dejaría el stock negativo.",
+      409,
+    );
+  }
+  if (message.includes("PRODUCT_NOT_FOUND")) {
+    return new BillingError("NOT_FOUND", "Producto no encontrado.", 404);
+  }
+  if (message.includes("SHIFT_NOT_OPEN")) {
+    return new BillingError("NO_OPEN_SHIFT", "No hay caja abierta: abre tu turno para emitir.", 409);
+  }
+  if (message.includes("El cobro supera")) {
+    return new BillingError("OVERPAID", "Las porciones superan el saldo pendiente.", 422);
+  }
+  return new BillingError("INTERNAL", "Error interno.", 500);
+}
+
+/**
+ * CL-13: el token que la transacción de emisión sustituye por el consecutivo, y
+ * el motivo del OUT como PLANTILLA.
+ *
+ * El motivo sale de `buildInvoiceOutReason` —la MISMA función de formato, con un
+ * consecutivo SENTINELA imposible (`-1`: el CHECK de 005 exige
+ * `consecutive_number > 0`)— y el sentinela se reemplaza por el token. Así el
+ * texto (`FACTURA #`, el separador, el recorte y el respaldo de nombre) no se
+ * duplica en ningún lado: lo decide TypeScript una sola vez, y la transacción
+ * —donde nace el número— sólo sustituye la PRIMERA ocurrencia por el
+ * consecutivo que ella reservó. `String.replace` con un patrón de texto
+ * reemplaza sólo la primera, así que un nombre de cliente que contuviera el
+ * sentinela no puede confundirse con el número.
+ */
+const OUT_REASON_TOKEN = "{consecutivo}";
+const OUT_REASON_SENTINEL = -1;
+
+export function buildInvoiceOutReasonTemplate(clientName: string | null | undefined): string {
+  return buildInvoiceOutReason(OUT_REASON_SENTINEL, clientName).replace(
+    `#${OUT_REASON_SENTINEL}`,
+    `#${OUT_REASON_TOKEN}`,
+  );
+}
+
+/**
+ * FAC-01…07: crea la factura (consecutivo, snapshot de impuestos activos, OUT de
+ * stock por producto, porciones que cuadran). Estado inicial Emitida; si las
+ * porciones suman el total → Pagada. B1: este es el MOMENTO ÚNICO del descuento;
  * pagar después no descuenta de nuevo.
  *
- * Orden anti-huecos (FAC-05): valida todo y pre-verifica stock ANTES de
- * reservar el número vía rpc next_invoice_number(); el UNIQUE
- * (sede_id, consecutive_number) es la barrera final contra duplicados.
- * PostgREST no ofrece multi-statement en una transacción, así que ante
- * fallo posterior a la reserva se intenta limpieza best-effort (ver
- * cleanupFailedInvoice) y se documenta en la migración 005.
+ * MO-1 (idempotencia): el orden empieza por la MARCA (`idempotency_key`,
+ * migración 041). Un reintento del MISMO envío se detecta ANTES de cualquier
+ * escritura y devuelve la factura ya emitida —no-op exitoso para el
+ * llamador—, así que el camino normal de la repetición no escribe ni reserva
+ * nada. La ventana entre ese lookup y la escritura la cubre el índice único
+ * parcial (sede_id, idempotency_key), que ahora se evalúa DENTRO de la misma
+ * transacción que la emisión.
  *
- * MO-1 (idempotencia): el orden empieza por la MARCA
- * (`idempotency_key`, migración 041). Un reintento del MISMO envío se detecta
- * ANTES de reservar el consecutivo y devuelve la factura ya emitida —no-op
- * exitoso para el llamador—, así que el camino normal de la repetición no
- * consume consecutivo. La ventana entre ese lookup y el INSERT la cubre el
- * índice único parcial (sede_id, idempotency_key): la perdedora de la carrera
- * devuelve la factura de la ganadora y su consecutivo ya reservado queda como
- * HUECO declarado (ver el comentario en el manejo de 23505).
+ * CL-13: LA EMISIÓN ES UNA TRANSACCIÓN (RPC `invoice_create_atomic`, migración
+ * 052). Antes era una SECUENCIA de requests sueltos —el consecutivo, la factura,
+ * las líneas, los impuestos, las porciones y la deducción— compensada por su
+ * rutina de limpieza best-effort: un bucle de reversiones y cuatro `DELETE`
+ * dentro de un `catch {}` que se tragaba su propio error: si la compensación
+ * fallaba a mitad, quedaba una factura viva con su dinero borrado y su stock ya
+ * devuelto (y una anulación posterior devolvía el stock OTRA vez), sin que nadie
+ * se enterara más que del error original. Ahora los cinco grupos de escritura
+ * —la factura, las líneas, el snapshot de impuestos, las porciones y el OUT de
+ * stock— son grupos de la MISMA sentencia del servidor: o se escriben todos, o no
+ * se escribe ninguno. **No hay compensación**, así que no hay `catch {}` que
+ * tragarse nada y no hay residuo que reparar. La rutina desapareció con este
+ * cambio: el registro de qué hacía y de dónde salieron las líneas que se midieron
+ * queda en la migración 052.
+ *
+ * El CONSECUTIVO se reserva ADENTRO (`next_invoice_number`, 005): el incremento
+ * de `invoice_sequences` pertenece a la misma transacción, así que un fallo lo
+ * REVIERTE con ella y la serie queda sin huecos —ni el que dejaba un fallo
+ * posterior a la reserva, ni el que dejaba la carrera de la 041—. El servicio
+ * ya no reserva nada: sólo computa y manda DATOS.
+ *
+ * QUÉ SIGUE COMPUTANDO EL SERVICIO (y no cruza a SQL): los subtotales por línea
+ * (`computeLineSubtotal`), el snapshot de impuestos y los totales
+ * (`computeInvoiceTotals`), el recargo por método (`computeCardFees`), el total
+ * con recargo, el estado (`Emitida`/`Pagada`), los campos de comisión
+ * (`normalizeCommissionFields`), el plan de stock agregado por producto
+ * (`planStockDeduction`) y el motivo del OUT. La función sólo escribe lo que
+ * recibe.
+ *
+ * LO QUE SIGUE IGUAL: el pre-chequeo de stock con su mensaje de negocio por
+ * producto (que ahora es una red de negocio, no la forma de evitar huecos: el
+ * hueco ya no puede existir), el turno abierto con su regla de dueño/admin, el
+ * `SPLIT_MISMATCH` de las porciones, la marca OBLIGATORIA y su lookup previo, la
+ * auditoría FUERA de la transacción (`writeAudit` no lanza: a lo sumo falta la
+ * fila de auditoría, nunca una escritura a medias) y el detalle devuelto.
  */
 export async function createInvoice(raw: unknown, actor: BillingActor): Promise<InvoiceDetail> {
   const parsed = createInvoiceSchema.safeParse(raw);
@@ -1087,13 +1186,23 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
 
   let refs: ValidatedRefs;
   let stockMap: Map<string, StockEntry>;
+  // CL-13: el plan de stock se computa UNA sola vez —agregado por producto— y
+  // viaja como DATO a la transacción, que es quien lo escribe (vía
+  // `deduct_stock_atomic`, 046). Antes se computaba dos veces —el pre-chequeo de
+  // acá y el de `deductStock`, con otra lectura del stock— y el resultado del
+  // primero se descartaba. Ahora la guarda de negocio y el dato son el MISMO
+  // cálculo.
+  let stockPlan: PlannedDeduction[];
   try {
     refs = await loadRefs(actor.sedeId);
     stockMap = await validateItemRefs(actor.sedeId, input.items);
-    // B1/FAC-05: pre-verifica stock ANTES de reservar el consecutivo (sin
-    // huecos). El descuento real ocurre tras insertar ítems vía deductStock.
+    // B1/FAC-05: pre-verifica stock con mensaje de negocio POR PRODUCTO. Ya no es
+    // la forma de evitar un hueco en la serie —el hueco no puede existir: la
+    // reserva es de la transacción— sino la guarda que le dice al operador QUÉ
+    // producto falta, ANTES de escribir nada. La autoridad final sigue siendo el
+    // trigger de 004, que corre adentro.
     try {
-      planStockDeduction(
+      stockPlan = planStockDeduction(
         input.items.map((item) => ({ product_id: item.product_id, qty: item.qty })),
         new Map(
           [...stockMap].map(([id, entry]) => [id, { name: entry.name, stock_qty: entry.stock_qty }]),
@@ -1176,211 +1285,120 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
     cashShiftId = openShift.id;
   }
 
-  const { data: seq, error: seqError } = await db.rpc("next_invoice_number", {
+  // CL-13: LA EMISIÓN ENTERA, en UNA sentencia del servidor. El consecutivo
+  // (005), la factura, sus líneas, su snapshot de impuestos, sus porciones y el
+  // OUT de stock (046) son grupos de la MISMA transacción: o se escriben todos,
+  // o no se escribe ninguno —y con ellos se revierte la reserva del
+  // consecutivo—. La clave está en que acá NO se manda un número: la función lo
+  // reserva adentro y lo sustituye en la plantilla del motivo del OUT.
+  const { data: written, error: createError } = await db.rpc("invoice_create_atomic", {
     p_sede_id: actor.sedeId,
+    p_user_id: actor.userId,
+    p_cash_shift_id: cashShiftId,
+    p_idempotency_key: input.idempotency_key,
+    p_invoice: {
+      client_name: input.client_name?.trim() || null,
+      client_document: input.client_document?.trim() || null,
+      subtotal: totals.subtotal,
+      discount: totals.discount,
+      tax: totals.tax,
+      surcharge,
+      total: grandTotal,
+      status,
+      closed_by: status === "Pagada" ? actor.userId : null,
+      closed_at: status === "Pagada" ? new Date().toISOString() : null,
+    },
+    p_items: input.items.map((item) => ({
+      item_type: item.item_type,
+      product_id: item.product_id ?? null,
+      service_id: item.service_id ?? null,
+      custom_name: item.custom_name?.trim() || null,
+      employee_id: item.employee_id,
+      qty: item.qty,
+      unit_price: item.unit_price,
+      discount: item.discount,
+      ...normalizeCommissionFields(item),
+      // Mismo cálculo que el subtotal de la factura: una sola fórmula
+      // (`computeLineSubtotal`) para que la línea y el total no puedan
+      // discrepar, en pesos enteros.
+      subtotal: computeLineSubtotal(item).subtotal,
+    })),
+    p_taxes: totals.taxes.map((tax) => ({
+      tax_code: tax.tax_code,
+      tax_name: tax.tax_name,
+      percent: tax.percent,
+      amount: tax.amount,
+    })),
+    // `cash_shift_id` NO viaja por porción: es el mismo en todas (la sede tiene
+    // un turno abierto) y la función escribe el escalar en cada fila.
+    p_payments: fees.map((fee) => ({
+      method_id: methodByCode.get(fee.method_code)?.id ?? null,
+      method_code: fee.method_code,
+      amount: fee.gross,
+      fee_percent: fee.feePercent,
+      fee_amount: fee.fee,
+    })),
+    // El motivo del OUT como PLANTILLA (ver `buildInvoiceOutReasonTemplate`): el
+    // consecutivo lo conoce la transacción, que lo reserva, no el servicio.
+    p_out_reason: buildInvoiceOutReasonTemplate(input.client_name),
+    // El plan de stock: QUÉ se descuenta, agregado por producto, lo computó
+    // `planStockDeduction`. La función lo escribe vía `deduct_stock_atomic`
+    // (046), con su conteo y el trigger de 004 como autoridad final.
+    p_out_items: stockPlan.map((item) => ({ product_id: item.product_id, qty: item.qty })),
   });
-  if (seqError || typeof seq !== "number") {
-    throw new BillingError("INTERNAL", "No se pudo reservar el consecutivo.", 500);
-  }
-  const consecutive = seq as number;
-
-  // Limpieza best-effort si algo falla después de reservar el número.
-  let invoiceId: string | null = null;
-  const outMovements: Array<{ product_id: string; qty: number }> = [];
-  const cleanupFailedInvoice = async () => {
-    try {
-      // B1: la compensación también cruza por la frontera de inventario
-      // (registerMovement), nunca con insert directo a inventory_movements.
+  if (createError || !written) {
+    console.error("PG invoice_create_atomic:", JSON.stringify(createError));
+    if ((createError as { code?: string } | null)?.code === "23505") {
+      // Dos índices únicos pueden dar 23505 acá: el consecutivo
+      // (sede_id, consecutive_number) y la marca (sede_id, idempotency_key).
+      // Manda la MARCA: si otra emisión con la misma marca se confirmó entre el
+      // lookup de arriba y esta transacción (la carrera), su factura es la
+      // respuesta y este intento no escribe una segunda.
       //
-      // CL-7/046: desde que la deducción es ATÓMICA —una sola sentencia del
-      // servidor— este bucle ya NO puede encontrarse una deducción a medias:
-      // sólo entra cuando la deducción ENTERA se aplicó y algo falló DESPUÉS
-      // (la relectura del detalle; `writeAudit` no lanza nunca —registra y
-      // devuelve `written: false`—, así que la auditoría NO es un punto de
-      // fallo de esta operación). Revertir una deducción completa sigue siendo
-      // un bucle sin transacción —la misma clase de hallazgo, reportada
-      // aparte— y el `catch` de abajo sigue tragándose su error: las dos cosas
-      // quedan declaradas, no arregladas acá.
-      for (const out of outMovements.reverse()) {
-        await registerMovement(
-          {
-            product_id: out.product_id,
-            type: "IN",
-            qty: out.qty,
-            reason: `Compensación fallo emisión factura #${consecutive}`,
-          },
-          actor,
-        );
-      }
-      if (invoiceId) {
-        await db.from("invoice_payments").delete().eq("invoice_id", invoiceId);
-        await db.from("invoice_taxes").delete().eq("invoice_id", invoiceId);
-        await db.from("invoice_items").delete().eq("invoice_id", invoiceId);
-        await db.from("invoices").delete().eq("id", invoiceId);
-      }
-    } catch {
-      // Best-effort: el error original manda (queda auditado en la respuesta).
+      // CL-13: SIN COSTO DE NUMERACIÓN. La reserva del consecutivo pertenece a
+      // esta misma transacción, así que el choque la REVIERTE con ella: la
+      // perdedora de la carrera NO quema ningún número. El hueco que la 041
+      // documentaba como costo declarado ya no puede existir —y con él se fue la
+      // última razón para que el servicio reservara por su cuenta—.
+      const winner = await findInvoiceByIdempotencyKey(db, actor.sedeId, input.idempotency_key);
+      if (winner) return loadDetail(db, winner);
+      // Sin factura con esa marca, el choque es del CONSECUTIVO: comportamiento
+      // de siempre (barrera final de 005).
+      throw new BillingError("DUPLICATE_NUMBER", "Consecutivo duplicado, reintente la emisión.", 409);
     }
-  };
-
-  try {
-    const { data: invoice, error: invoiceError } = await db
-      .from("invoices")
-      .insert({
-        sede_id: actor.sedeId,
-        consecutive_number: consecutive,
-        // MO-1: la marca queda EN LA FILA. Su índice único parcial (041) es la
-        // barrera final: sin ella, la carrera del lookup-INSERT escribiría dos.
-        idempotency_key: input.idempotency_key,
-        client_name: input.client_name?.trim() || null,
-        client_document: input.client_document?.trim() || null,
-        subtotal: totals.subtotal,
-        discount: totals.discount,
-        tax: totals.tax,
-        surcharge,
-        total: grandTotal,
-        status,
-        user_id: actor.userId,
-        cash_shift_id: cashShiftId,
-        closed_by: status === "Pagada" ? actor.userId : null,
-        closed_at: status === "Pagada" ? new Date().toISOString() : null,
-      })
-      .select(INVOICE_SELECT)
-      .single();
-    if (invoiceError || !invoice) {
-      console.error("PG invoice insert:", JSON.stringify(invoiceError));
-      if ((invoiceError as { code?: string } | null)?.code === "23505") {
-        // Dos índices únicos pueden dar 23505 acá: el consecutivo
-        // (sede_id, consecutive_number) y la marca (sede_id, idempotency_key).
-        // Manda la MARCA: si otra emisión con la misma marca se confirmó entre
-        // el lookup de arriba y este INSERT (la carrera), su factura es la
-        // respuesta y este intento no escribe una segunda.
-        //
-        // COSTO DECLARADO, no escondido: en ese camino la perdedora ya reservó
-        // su consecutivo, y esa reserva queda SIN factura: un hueco en la serie
-        // de la sede. Se prefiere el hueco —visible y raro, exige dos envíos con
-        // la misma marca solapados— antes que una segunda factura, que es plata
-        // cobrada dos veces. El hueco se documenta también en la migración 041.
-        const winner = await findInvoiceByIdempotencyKey(
-          db,
-          actor.sedeId,
-          input.idempotency_key,
-        );
-        if (winner) return loadDetail(db, winner);
-        // Sin factura con esa marca, el choque es del CONSECUTIVO: comportamiento
-        // de siempre (barrera final de 005).
-        throw new BillingError("DUPLICATE_NUMBER", "Consecutivo duplicado, reintente la emisión.", 409);
-      }
-      throw new BillingError("INTERNAL", "Error interno.", 500);
-    }
-    invoiceId = (invoice as InvoiceRow).id;
-
-    const { error: itemsError } = await db.from("invoice_items").insert(
-      input.items.map((item) => ({
-        invoice_id: invoiceId,
-        item_type: item.item_type,
-        product_id: item.product_id ?? null,
-        service_id: item.service_id ?? null,
-        custom_name: item.custom_name?.trim() || null,
-        employee_id: item.employee_id,
-        qty: item.qty,
-        unit_price: item.unit_price,
-        discount: item.discount,
-        ...normalizeCommissionFields(item),
-        // Mismo cálculo que el subtotal de la factura: una sola fórmula
-        // (`computeLineSubtotal`) para que la línea y el total no puedan
-        // discrepar, en pesos enteros.
-        subtotal: computeLineSubtotal(item).subtotal,
-      })),
-    );
-    if (itemsError) {
-      console.error("PG invoice_items insert:", JSON.stringify(itemsError));
-      throw new BillingError("INTERNAL", "Error interno.", 500);
-    }
-
-    if (totals.taxes.length > 0) {
-      const { error: taxesError } = await db.from("invoice_taxes").insert(
-        totals.taxes.map((tax) => ({
-          invoice_id: invoiceId,
-          tax_code: tax.tax_code,
-          tax_name: tax.tax_name,
-          percent: tax.percent,
-          amount: tax.amount,
-        })),
-      );
-      if (taxesError) {
-        console.error("PG invoice_taxes insert:", JSON.stringify(taxesError));
-        throw new BillingError("INTERNAL", "Error interno.", 500);
-      }
-    }
-
-    if (portions.length > 0) {
-      const { error: paymentsError } = await db.from("invoice_payments").insert(
-        fees.map((fee) => ({
-          invoice_id: invoiceId,
-          method_id: methodByCode.get(fee.method_code)?.id ?? null,
-          method_code: fee.method_code,
-          amount: fee.gross,
-          fee_percent: fee.feePercent,
-          fee_amount: fee.fee,
-          cash_shift_id: cashShiftId,
-        })),
-      );
-      if (paymentsError) {
-        console.error("PG invoice_payments insert:", JSON.stringify(paymentsError));
-        // Carrera perdida contra trg_invoice_payments_cap (031): mismo P0001
-        // que nómina traduce en payroll/service.ts.
-        if ((paymentsError as { code?: string }).code === "P0001") {
-          throw new BillingError("OVERPAID", "Las porciones superan el saldo pendiente.", 422);
-        }
-        throw new BillingError("INTERNAL", "Error interno.", 500);
-      }
-    }
-
-    // B1/FAC-06, momento único: AL EMITIR se descuenta el stock de cada
-    // ítem producto vía la frontera de inventario (deductStock valida y
-    // registra los OUT). Pagar después (splitPayment) NO descuenta de
-    // nuevo; anular revierte con IN; editar ajusta por deltas.
-    const outReason = buildInvoiceOutReason(consecutive, input.client_name);
-    try {
-      const planned = await deductStock(
-        actor,
-        input.items.map((item) => ({ product_id: item.product_id, qty: item.qty })),
-        outReason,
-      );
-      for (const item of planned) {
-        outMovements.push({ product_id: item.product_id, qty: item.qty });
-      }
-    } catch (error) {
-      throw toBillingError(error);
-    }
-
-    // Audit log para creación de factura (con info de admin override si aplica)
-    await writeAudit({
-      sede_id: actor.sedeId,
-      user_id: actor.userId,
-      action: AUDIT_ACTIONS.INVOICE_CREATED,
-      entity: "invoices",
-      entity_id: invoiceId,
-      metadata: {
-        consecutive_number: consecutive,
-        client_name: input.client_name,
-        total: grandTotal,
-        surcharge,
-        card_fees: fees.filter((fee) => fee.fee > 0),
-        status,
-        cash_shift_id: cashShiftId,
-        admin_override: adminOverrideJustification,
-        portions_count: portions.length,
-        items_count: input.items.length,
-      },
-    });
-
-    return loadDetail(db, invoice as InvoiceRow);
-  } catch (error) {
-    await cleanupFailedInvoice();
-    throw toBillingError(error);
+    // Cualquier otro rechazo de la transacción NO escribió una sola fila: no hay
+    // nada que compensar ni residuo que reparar. El código de negocio se traduce
+    // como siempre (`toRpcCreateError`).
+    throw toRpcCreateError(createError as { message?: unknown } | null);
   }
+  const invoice = written as InvoiceRow;
+  const consecutive = invoice.consecutive_number;
+
+  // Audit log para creación de factura (con info de admin override si aplica).
+  // FUERA de la transacción, como en las anulaciones y las ediciones: no es un
+  // punto de fallo de estado (`writeAudit` no lanza), así que a lo sumo falta la
+  // fila de auditoría, nunca una escritura a medias.
+  await writeAudit({
+    sede_id: actor.sedeId,
+    user_id: actor.userId,
+    action: AUDIT_ACTIONS.INVOICE_CREATED,
+    entity: "invoices",
+    entity_id: invoice.id,
+    metadata: {
+      consecutive_number: consecutive,
+      client_name: input.client_name,
+      total: grandTotal,
+      surcharge,
+      card_fees: fees.filter((fee) => fee.fee > 0),
+      status,
+      cash_shift_id: cashShiftId,
+      admin_override: adminOverrideJustification,
+      portions_count: portions.length,
+      items_count: input.items.length,
+    },
+  });
+
+  return loadDetail(db, invoice);
 }
 
 // ------------------------------------------------------------------ anular ---
