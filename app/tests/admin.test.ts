@@ -56,12 +56,24 @@ const postgrest = vi.hoisted(() => ({
   /** Fallo de lectura inyectable en una tabla (PostgREST devuelve error). */
   failRead: null as null | { table: string; error: { code: string; message: string } },
   /**
-   * Intercalado de otro escritor: se llama después de una lectura, para poder
-   * meter una escritura concurrente entre la lectura y el insert de la red.
+   * Intercalado de otro escritor: se llama justo antes de que la red escriba
+   * el rol, es decir entre la decisión y la escritura —el punto exacto de la
+   * carrera—. Se dispara tanto antes del insert suelto de la implementación
+   * vieja como antes del rpc de la nueva, así que la MISMA prueba describe el
+   * mismo intercalado en ambas.
    */
-  despuesDeLeer: null as null | ((table: string) => void),
+  antesDeEscribirRol: null as null | (() => void),
   /** El rpc responde éxito pero sin aplicar nada (control negativo). */
   rpcAppliesNothing: false,
+  /**
+   * Fallo inyectable en un rpc puntual: con la red de seguridad ya dentro de
+   * una función, un timeout o un permiso denegado llegan por acá y no por
+   * `failRead`/`failWrite` (el cliente ya no lee ni escribe `user_roles` de
+   * forma suelta).
+   */
+  failRpc: null as null | { fn: string; error: { code: string; message: string } },
+  /** `ensure_user_has_role` responde éxito sin aplicar nada (control negativo). */
+  ensureAppliesNothing: false,
   /** Retiene el rpc en vuelo hasta `liberar()` (prueba de concurrencia). */
   hold: false,
   pendientes: [] as Array<() => void>,
@@ -148,7 +160,46 @@ function codeDeRol(roleId: string): string {
  * calcula antes de confirmarlo; cualquier fallo devuelve el error sin haber
  * tocado ninguna fila (el DELETE interno también se revierte).
  */
+/**
+ * Modelo de `ensure_user_has_role` (CO-4): también UNA sentencia, UNA
+ * transacción. El lock de la fila del usuario no se imita esperando: el doble
+ * sólo confirma el estado nuevo al final, así que dos llamadas simultáneas se
+ * resuelven una después de la otra —igual que la transacción real, que
+ * serializa por el lock—. Lo que la prueba fija del código es que la red de
+ * seguridad ya no decide desde el cliente.
+ */
+function aplicarEnsure(args: Record<string, unknown>): { data: unknown; error: unknown } {
+  const userId = String(args.p_user_id);
+  const pedido = String(args.p_role_code ?? "");
+
+  if (!memoryRows("users").some((usuario) => usuario.id === userId)) {
+    return { data: null, error: { code: "P0001", message: "USER_NOT_FOUND" } };
+  }
+
+  const rol = memoryRows("roles").find((fila) => fila.code === pedido);
+  if (!rol) return { data: null, error: { code: "P0001", message: "ROLE_NOT_FOUND" } };
+  if (postgrest.ensureAppliesNothing) return { data: [], error: null };
+
+  // La intención de la red: sólo escribe si el usuario NO tiene NINGÚN rol.
+  const existentes = memoryRows("user_roles").filter((fila) => fila.user_id === userId);
+  if (existentes.length === 0) {
+    postgrest.rows.user_roles = [
+      ...memoryRows("user_roles"),
+      { user_id: userId, role_id: rol.id },
+    ];
+  }
+
+  // Post-condición real: el conjunto que quedó, no el que se pidió.
+  const resultantes = memoryRows("user_roles")
+    .filter((fila) => fila.user_id === userId)
+    .map((fila) => codeDeRol(String(fila.role_id)))
+    .sort();
+  return { data: resultantes, error: null };
+}
+
 function aplicarRpc(fn: string, args: Record<string, unknown>): { data: unknown; error: unknown } {
+  if (postgrest.failRpc?.fn === fn) return { data: null, error: postgrest.failRpc.error };
+  if (fn === "ensure_user_has_role") return aplicarEnsure(args);
   if (fn !== "replace_user_roles") {
     return {
       data: null,
@@ -191,7 +242,7 @@ function createStubClient() {
 
     const run = (): { data: unknown; error: unknown } => {
       if (ejecutado) return ejecutado;
-      const filas = memoryRows(table);
+      let filas = memoryRows(table);
 
       // Fallo de lectura inyectable: lo que se prueba es que un error de
       // lectura NUNCA se convierta en "el usuario no tiene roles".
@@ -228,6 +279,13 @@ function createStubClient() {
       }
 
       if (modo === "insert") {
+        if (table === "user_roles") {
+          postgrest.antesDeEscribirRol?.();
+          // El otro escritor pudo REEMPLAZAR el arreglo de filas: el insert
+          // real lee las filas confirmadas al momento de escribir, no la
+          // foto tomada antes del intercalado.
+          filas = memoryRows(table);
+        }
         postgrest.singleWrites.push(`${table}.insert`);
         if (postgrest.failWrite?.table === table && postgrest.failWrite.op === "insert") {
           ejecutado = { data: null, error: postgrest.failWrite.error };
@@ -290,7 +348,6 @@ function createStubClient() {
       }
 
       ejecutado = { data: filas.filter((fila) => cumpleFiltros(fila, filtros)), error: null };
-      postgrest.despuesDeLeer?.(table);
       return ejecutado;
     };
 
@@ -356,12 +413,17 @@ function createStubClient() {
 
   const rpc = (fn: string, args: Record<string, unknown>) => {
     postgrest.rpcCalls.push({ fn, args });
+    const ejecutar = () => {
+      // El intercalado de la carrera ocurre justo antes de que la red escriba.
+      if (fn === "ensure_user_has_role") postgrest.antesDeEscribirRol?.();
+      return aplicarRpc(fn, args);
+    };
     if (postgrest.hold) {
       return new Promise((resolve) => {
-        postgrest.pendientes.push(() => resolve(aplicarRpc(fn, args)));
+        postgrest.pendientes.push(() => resolve(ejecutar()));
       });
     }
-    return Promise.resolve(aplicarRpc(fn, args));
+    return Promise.resolve(ejecutar());
   };
 
   return { from, rpc };
@@ -800,6 +862,82 @@ describe("migración 039_atomic_role_replacement.sql (CO-2)", () => {
   });
 });
 
+describe("migración 040_ensure_user_has_role.sql (CO-4)", () => {
+  const sql = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "040_ensure_user_has_role.sql"),
+    "utf8",
+  );
+
+  it("crea la función que la red de seguridad llama por rpc", () => {
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.ensure_user_has_role");
+    expect(sql).toContain("p_user_id uuid, p_role_code text");
+    expect(sql).toContain("RETURNS text[]");
+  });
+
+  it("toma el lock de la fila del usuario ANTES de escribir el rol", () => {
+    const lock = sql.indexOf("FOR UPDATE");
+    const insercion = sql.indexOf("INSERT INTO public.user_roles");
+
+    expect(lock, "falta el candado de la fila del usuario").toBeGreaterThan(-1);
+    expect(insercion).toBeGreaterThan(lock);
+    // El mismo lock que 039: es lo que serializa a los dos escritores de roles.
+    expect(sql).toContain("FROM public.users u");
+  });
+
+  it("escribe SÓLO si el usuario no tiene ningún rol (la intención de la red)", () => {
+    expect(sql).toContain("AND NOT EXISTS (");
+    expect(sql).toContain("SELECT 1 FROM public.user_roles ur WHERE ur.user_id = p_user_id");
+  });
+
+  it("valida el rol y aborta sin aplicar un subconjunto silencioso", () => {
+    expect(sql).toContain("RAISE EXCEPTION 'ROLE_NOT_FOUND'");
+    expect(sql).toContain("RAISE EXCEPTION 'USER_NOT_FOUND'");
+    expect(sql).toContain("IF v_rol IS NULL THEN");
+  });
+
+  it("devuelve el conjunto final y aborta si quedó vacío (nunca cero roles)", () => {
+    expect(sql).toContain("GET DIAGNOSTICS v_filas = ROW_COUNT");
+    expect(sql).toContain("v_tenia_roles AND v_filas <> 0");
+    expect(sql).toContain("NOT v_tenia_roles AND v_filas <> 1");
+    expect(sql).toContain("array_agg(r.code ORDER BY r.code)");
+    expect(sql).toContain("cardinality(v_resultantes) = 0");
+    expect(sql).toContain("RETURN v_resultantes");
+  });
+
+  it("no borra ni reescribe filas de datos existentes", () => {
+    // Se miran SENTENCIAS (ancladas al inicio de línea), no la prosa del
+    // encabezado, que justamente explica qué no hace el archivo.
+    expect(sql).not.toMatch(/^\s*DELETE FROM public\./im);
+    expect(sql).not.toMatch(/^\s*UPDATE\s+public\./im);
+    expect(sql).not.toMatch(/^\s*TRUNCATE/im);
+    expect(sql).not.toMatch(/^\s*ALTER TABLE/im);
+  });
+
+  it("es idempotente, con search_path fijo y sin DEFINER", () => {
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION");
+    expect(sql).toContain("SECURITY INVOKER");
+    expect(sql).not.toContain("SECURITY DEFINER");
+    expect(sql).toContain(
+      "ALTER FUNCTION public.ensure_user_has_role(uuid, text) SET search_path = public",
+    );
+  });
+
+  it("cierra el permiso: sólo service_role puede ejecutarla", () => {
+    expect(sql).toContain("REVOKE ALL ON FUNCTION public.ensure_user_has_role(uuid, text) FROM PUBLIC");
+    expect(sql).toContain("REVOKE ALL ON FUNCTION public.ensure_user_has_role(uuid, text) FROM anon");
+    expect(sql).toContain(
+      "REVOKE ALL ON FUNCTION public.ensure_user_has_role(uuid, text) FROM authenticated",
+    );
+    expect(sql).toContain(
+      "GRANT EXECUTE ON FUNCTION public.ensure_user_has_role(uuid, text) TO service_role",
+    );
+  });
+
+  it("declara que el agente no la ejecutó", () => {
+    expect(sql).toContain("NO ejecutado por el agente: requiere base de datos");
+  });
+});
+
 // -------------------------- red de seguridad de roles al crear (CO-3) ---
 describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
   const EMPLEADO_ID = "99999999-9999-4999-8999-999999999999";
@@ -839,8 +977,10 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
     postgrest.selects.length = 0;
     postgrest.failWrite = null;
     postgrest.failRead = null;
-    postgrest.despuesDeLeer = null;
     postgrest.rpcAppliesNothing = false;
+    postgrest.failRpc = null;
+    postgrest.ensureAppliesNothing = false;
+    postgrest.antesDeEscribirRol = null;
     postgrest.hold = false;
     postgrest.pendientes.length = 0;
   });
@@ -854,6 +994,8 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
     expect(memoryRows("employees")).toHaveLength(1);
     expect(rolesPersistidos()).toEqual(["admin"]);
     expect(escriturasDeRoles()).toEqual([]);
+    // La decisión viaja en UNA sentencia: la función del servidor.
+    expect(postgrest.rpcCalls.map((llamada) => llamada.fn)).toEqual(["ensure_user_has_role"]);
   });
 
   it("a quien YA es `empleado` no se le vuelve a insertar el rol", async () => {
@@ -873,29 +1015,77 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
     expect(rolesPersistidos()).toEqual(["empleado"]);
   });
 
-  it("la lectura de «ya tiene rol» usa una columna que EXISTE en user_roles", async () => {
+  it("carrera red-de-seguridad + reemplazo: nunca dos roles (CO-4)", async () => {
+    sembrar([]);
+    // El intercalado del hallazgo, en su punto exacto: la red ya decidió
+    // "este usuario no tiene ningún rol" y TODAVÍA no escribió, cuando otro
+    // escritor (`setUserRoles` → `replace_user_roles`) confirma `admin`.
+    postgrest.antesDeEscribirRol = () => {
+      postgrest.rows.user_roles = [
+        { user_id: USUARIO_ID, role_id: ROLES_CATALOGO.find((rol) => rol.code === "admin")?.id },
+      ];
+    };
+
+    await upsertEmployee(baseEmployee());
+
+    // El modelo del proyecto es UN rol por usuario (`setUserRolesSchema` exige
+    // `.length(1)`): quedar con `admin` + `empleado` es el defecto, no un
+    // detalle. Gana el conjunto del otro escritor, porque la red ya no agrega
+    // nada cuando el usuario tiene algún rol.
+    expect(rolesPersistidos()).toEqual(["admin"]);
+  });
+
+  it("carrera simultánea red-de-seguridad + reemplazo: un conjunto, nunca la unión", async () => {
+    sembrar([]);
+
+    // Los dos rpc quedan EN VUELO a la vez: el resultado final se mira después
+    // de liberarlos, no el orden de llegada.
+    postgrest.hold = true;
+    const empleado = upsertEmployee(baseEmployee());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const reemplazo = setUserRoles({ user_id: USUARIO_ID, roles: ["admin"] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(postgrest.rpcCalls.map((llamada) => llamada.fn).sort()).toEqual([
+      "ensure_user_has_role",
+      "replace_user_roles",
+    ]);
+    expect(escriturasDeRoles()).toEqual([]);
+
+    postgrest.liberar();
+    const [a, b] = await Promise.allSettled([empleado, reemplazo]);
+    expect([a.status, b.status]).toEqual(["fulfilled", "fulfilled"]);
+    // Serializados por el lock de la fila del usuario: el conjunto final es
+    // uno de los dos, jamás `admin` + `empleado`.
+    expect(rolesPersistidos()).toHaveLength(1);
+  });
+
+  it("la red ya no lee ni escribe `user_roles` desde el cliente: la decisión es del servidor", async () => {
     sembrar([]);
 
     await upsertEmployee(baseEmployee());
 
-    // `user_roles` no tiene `id` (PK compuesta (user_id, role_id), 002_auth.sql):
-    // pedirla hacía que PostgREST devolviera error y la red creyera "sin roles".
-    const reales = columnasReales("user_roles");
-    expect(reales.size).toBeGreaterThan(0);
-    expect(reales.has("id")).toBe(false);
-    const lecturas = postgrest.selects.filter((select) => select.table === "user_roles");
-    expect(lecturas.length).toBeGreaterThan(0);
-    for (const lectura of lecturas) {
+    // La red vieja leía una columna de `user_roles` para decidir; esa lectura
+    // es la mitad del read-then-insert que CO-4 cierra, así que ya no existe.
+    expect(postgrest.selects.filter((select) => select.table === "user_roles")).toEqual([]);
+    expect(escriturasDeRoles()).toEqual([]);
+    expect(postgrest.rpcCalls.map((llamada) => llamada.fn)).toEqual(["ensure_user_has_role"]);
+    // Y ninguna lectura que quede puede pedir una columna inexistente (CO-3):
+    // `user_roles` no tiene `id` (PK compuesta (user_id, role_id), 002_auth.sql).
+    expect(columnasReales("user_roles").has("id")).toBe(false);
+    for (const lectura of postgrest.selects) {
+      const reales = columnasReales(lectura.table);
+      if (reales.size === 0) continue;
       for (const columna of lectura.columns.split(",")) {
-        expect(reales.has(columna.trim()), `la red lee «${columna}», que no existe`).toBe(true);
+        expect(reales.has(columna.trim()), `se lee «${columna}», que no existe`).toBe(true);
       }
     }
   });
 
-  it("un fallo de lectura NO otorga rol: falla cerrado y sin escribir", async () => {
+  it("un fallo de la red NO otorga rol: falla cerrado y sin escribir", async () => {
     sembrar([]);
-    postgrest.failRead = {
-      table: "user_roles",
+    postgrest.failRpc = {
+      fn: "ensure_user_has_role",
       error: { code: "57014", message: "canceling statement due to statement timeout" },
     };
 
@@ -904,34 +1094,19 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       status: 500,
     });
 
-    // No se otorga nada y tampoco queda un empleado escrito a medias.
+    // No se otorga nada y tampoco queda un empleado escrito a medias: la red
+    // corre ANTES de la escritura del empleado.
     expect(rolesPersistidos()).toEqual([]);
     expect(escriturasDeRoles()).toEqual([]);
     expect(postgrest.singleWrites).toEqual([]);
   });
 
-  it("una carrera perdida (23505 sobre la PK) no se reporta como fallo ni duplica roles", async () => {
+  it("usuario inexistente: aborta con INTERNAL y sin escribir nada", async () => {
     sembrar([]);
-    // Otro escritor asigna `empleado` entre la lectura y el insert: la fila que
-    // la red intenta insertar ya está, así que el resultado deseado existe.
-    postgrest.despuesDeLeer = (tabla) => {
-      if (tabla !== "user_roles") return;
-      postgrest.rows.user_roles = [
-        { user_id: USUARIO_ID, role_id: ROLES_CATALOGO.find((rol) => rol.code === "empleado")?.id },
-      ];
-    };
-
-    await upsertEmployee(baseEmployee());
-
-    expect(rolesPersistidos()).toEqual(["empleado"]);
-  });
-
-  it("un fallo REAL del insert sí se propaga (no queda en un console.error)", async () => {
-    sembrar([]);
-    postgrest.failWrite = {
-      table: "user_roles",
-      op: "insert",
-      error: { code: "23503", message: "viola la FK de roles" },
+    // El usuario desaparece entre el vínculo por documento y la red: la
+    // función del servidor no puede dejar el rol, así que aborta.
+    postgrest.antesDeEscribirRol = () => {
+      postgrest.rows.users = [];
     };
 
     await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
@@ -940,6 +1115,86 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
     });
 
     expect(rolesPersistidos()).toEqual([]);
+    expect(postgrest.singleWrites).toEqual([]);
+  });
+
+  it("rol desconocido en el catálogo: aborta con INTERNAL y sin escribir nada", async () => {
+    sembrar([]);
+    // El catálogo se siembra en 002_auth.sql: si `empleado` falta, el problema
+    // es de datos y se reporta, en vez de dejar a la persona sin acceso.
+    postgrest.rows.roles = ROLES_CATALOGO.filter((rol) => rol.code !== "empleado").map((rol) => ({
+      ...rol,
+    }));
+
+    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+      code: "INTERNAL",
+      status: 500,
+    });
+
+    expect(rolesPersistidos()).toEqual([]);
+    expect(postgrest.singleWrites).toEqual([]);
+  });
+
+  it("carrera con otro otorgamiento del MISMO rol: ni falla ni duplica (la PK ya no es el mecanismo)", async () => {
+    sembrar([]);
+    // Otro escritor deja `empleado` justo antes de la red: la PK
+    // `(user_id, role_id)` ya no puede chocar, porque la función sólo escribe
+    // si el usuario no tiene NINGÚN rol.
+    postgrest.antesDeEscribirRol = () => {
+      postgrest.rows.user_roles = [
+        {
+          user_id: USUARIO_ID,
+          role_id: ROLES_CATALOGO.find((rol) => rol.code === "empleado")?.id,
+        },
+      ];
+    };
+
+    await upsertEmployee(baseEmployee());
+
+    expect(rolesPersistidos()).toEqual(["empleado"]);
+    expect(escriturasDeRoles()).toEqual([]);
+  });
+
+  it("un fallo REAL de la escritura de la red sí se propaga (no queda en un console.error)", async () => {
+    sembrar([]);
+    postgrest.failRpc = {
+      fn: "ensure_user_has_role",
+      error: { code: "42501", message: "permission denied for function ensure_user_has_role" },
+    };
+
+    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+      code: "INTERNAL",
+      status: 500,
+    });
+
+    expect(rolesPersistidos()).toEqual([]);
+  });
+
+  it("control negativo: si la base no dejó ningún rol, el servicio no reporta éxito", async () => {
+    sembrar([]);
+    // El rpc contesta sin error pero sin haber aplicado nada: el conjunto
+    // devuelto (vacío) es la post-condición real y contradice la promesa de la
+    // red, así que no puede terminar en un alta "exitosa".
+    postgrest.ensureAppliesNothing = true;
+
+    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+      code: "INTERNAL",
+      status: 500,
+    });
+
+    expect(rolesPersistidos()).toEqual([]);
+    expect(postgrest.singleWrites).toEqual([]);
+  });
+
+  it("un conjunto viejo de dos roles no rompe la red (no se reporta un falso fallo)", async () => {
+    sembrar(["admin", "empleado"]);
+
+    // La red reporta el conjunto que la base DEVOLVIÓ, sin asumir que tiene un
+    // solo rol: un usuario arrastrado por el bug viejo se deja como está.
+    await upsertEmployee(baseEmployee());
+
+    expect(rolesPersistidos()).toEqual(["admin", "empleado"]);
+    expect(escriturasDeRoles()).toEqual([]);
   });
 
   it("control negativo: al actualizar un empleado la red no lee ni escribe roles", async () => {
@@ -959,6 +1214,8 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
     expect(postgrest.selects.filter((select) => select.table === "user_roles")).toEqual([]);
     expect(escriturasDeRoles()).toEqual([]);
     expect(rolesPersistidos()).toEqual(["admin"]);
+    // Tampoco llama la función de la red: al actualizar, los roles no se tocan.
+    expect(postgrest.rpcCalls).toEqual([]);
   });
 });
 
