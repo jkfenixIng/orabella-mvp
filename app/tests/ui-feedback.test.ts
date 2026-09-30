@@ -213,9 +213,12 @@ describe("Alert: clases de estado del vocabulario del proyecto", () => {
 
   it("las ocho clases resuelven a algo declarado, y el resolver no es un sello de goma", () => {
     // Pisos: si el walk o el parseo se rompen, la guarda no debe pasar sola.
-    // design-tokens.css declara 21 clases sueltas hoy; el piso queda apenas
-    // debajo para no volverse una fecha de vencimiento si se borra una muerta.
-    expect(declaredClasses.size, "clases sueltas en design-tokens.css").toBeGreaterThanOrEqual(20);
+    // design-tokens.css declara 17 clases sueltas hoy (21 hasta D6, que retiro
+    // las 4 reglas .shadow-* sin capa del duplicado de sombras); el piso queda
+    // apenas debajo para no volverse una fecha de vencimiento si se borra una
+    // muerta. Este numero NO dice nada de las clases de estado: las aserciones
+    // semanticas de abajo son las que las exigen.
+    expect(declaredClasses.size, "clases sueltas en design-tokens.css").toBeGreaterThanOrEqual(16);
     expect(generatedUtilities.size, "utilidades derivadas de @theme inline").toBeGreaterThan(20);
 
     for (const variant of VARIANTS) {

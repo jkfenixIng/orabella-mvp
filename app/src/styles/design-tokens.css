@@ -143,12 +143,20 @@
   --ring: var(--color-primary-600);
   --text-disabled: theme(--color-neutral-300);
 
-  /* Shadows */
+  /* Shadows (la escala es la del proyecto: Tailwind emite la utilidad desde el
+     puente `@theme inline` de globals.css, que mapea --shadow* a estos tokens
+     vivos; por eso la sombra ya no se declara como clase suelta acá). */
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
   --shadow-lg: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
   --shadow-xl: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
-  --shadow-2xl: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+  /* --shadow-2xl se retiró: era un token MUERTO. Ninguna regla leía
+     `var(--shadow-2xl)` y la única utilidad que lleva ese nombre —`shadow-2xl`,
+     7 usos en app/invoices/invoices-client.tsx— resolvía contra la escala por
+     defecto de Tailwind (mismo valor en claro por casualidad: 0.25). Mapearlo
+     en @theme inline habría subido su alfa en oscuro de 0.25 a 0.8 y habría
+     cambiado esos modales de facturación: una regresión visual que nadie pidió.
+     Sin consumidores, el nombre duplicado se va. */
 
   /* Border Radius */
   --radius-sm: 0.25rem;    /* 4px */
@@ -241,7 +249,7 @@
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
   --shadow-xl: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
-  --shadow-2xl: 0 25px 50px -12px rgba(0, 0, 0, 0.8);
+  /* --shadow-2xl se retiró acá también: token muerto (ver la nota en :root). */
 }
 
 /* --------------------------------------------------------------------------
@@ -312,11 +320,19 @@ button {
 .border-color { border: 1px solid var(--border-color); }
 .border-color-2 { border: 1px solid var(--border-color-2); }
 
-/* Shadow utilities */
-.shadow-sm { box-shadow: var(--shadow-sm); }
-.shadow-md { box-shadow: var(--shadow-md); }
-.shadow-lg { box-shadow: var(--shadow-lg); }
-.shadow-xl { box-shadow: var(--shadow-xl); }
+/* Shadow utilities: eliminadas. `.shadow-sm|md|lg|xl` vivían acá SIN CAPA, con
+   el mismo nombre que las utilidades que Tailwind genera desde su tema, y
+   ganaban en la cascada solo por eso: una regla sin capa gana a `@layer
+   utilities`. Eso hacía que el valor del proyecto se impusiera por accidente y
+   que, al mismo tiempo, la utilidad de Tailwind siguiera emitiéndose con la
+   receta del registry (y con otro `--tw-shadow`, que es el que reaparece cuando
+   un anillo de foco gana el shorthand `box-shadow`).
+   La escala tiene ahora UNA sola declaración: globals.css mapea --shadow* en
+   `@theme inline` a estos tokens vivos y Tailwind emite la utilidad con
+   `--tw-shadow: var(--shadow-*)`, en ambos temas.
+   Ninguna de estas cuatro clases vuelve como regla suelta: una regla sin capa
+   con el nombre de una utilidad de Tailwind es exactamente el bug que este
+   cambio retira. */
 
 /* Radius utilities */
 .radius-sm { border-radius: var(--radius-sm); }

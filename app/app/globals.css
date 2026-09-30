@@ -93,6 +93,44 @@
   --color-destructive-foreground: var(--destructive-foreground);
   --color-border: var(--color-border-color);
   --color-input: var(--color-border-color);
+
+  /* ----------------------------------------------------------------------
+     Escala de sombras: puente OFICIAL de los tokens del proyecto.
+
+     design-tokens.css declara --shadow-sm|md|lg|xl en :root y en .dark, pero
+     hasta ahora las sombras del proyecto ganaban por ACCIDENTE DE CASCADA, no
+     por decisión: sus reglas .shadow-* vivían SIN CAPA en design-tokens.css y
+     una regla sin capa gana a cualquier capa (`@layer theme, base, components,
+     utilities`, según node_modules/tailwindcss/index.css). Tailwind, mientras
+     tanto, emitía la receta de su registry inlineada en su propia .shadow-*, así
+     que el MISMO nombre significaba dos cosas distintas: cuál ganaba dependía
+     de dónde estuviera escrita la regla, no de una elección.
+
+     Con estas claves la utilidad que Tailwind emite para shadow/sm/md/lg/xl
+     resuelve contra el token VIVO del proyecto (`var(--shadow-*)`), así que el
+     valor es el de la identidad por DECLARACIÓN y en los dos temas. Un
+     componente que llegue del registry pide `shadow-sm` y recibe el del
+     proyecto sin depender de la cascada ni de que su regla sea la última.
+     `inline` mantiene la referencia viva: si se fijara el literal, el .dark de
+     design-tokens.css dejaría de aplicar.
+
+     `--shadow` (la utilidad suelta `shadow`) no tiene receta propia en el
+     proyecto. Se declara como alias del --shadow-sm del proyecto igual que el
+     registry lo aliasa a su propio sm (index.css declara `--shadow` y
+     `--shadow-sm` con el mismo valor, ya en su bloque "Deprecated"): sin esta
+     línea, un componente del registry que pida `shadow` volvería a salir con la
+     receta del registry. No tiene consumidores en la app (verificado), así que
+     no cambia nada de lo que ya se renderiza.
+
+     El patrón de clave auto-referente (`--x: var(--x)`) es el que ya usan las
+     nueve claves --color-* de arriba: Tailwind emite la auto-referencia dentro
+     de `@layer theme` y la declaración real y sin capa del proyecto gana, así
+     que el token sigue siendo el de design-tokens.css. */
+  --shadow: var(--shadow-sm);
+  --shadow-sm: var(--shadow-sm);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: var(--shadow-lg);
+  --shadow-xl: var(--shadow-xl);
 }
 
 :root {

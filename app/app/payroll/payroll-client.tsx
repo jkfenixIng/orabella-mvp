@@ -1,20 +1,40 @@
 "use client";
 
-import { useRef, useState, useTransition, type FormEvent } from "react";
+import { useEffect, useRef, useState, useTransition, type FormEvent } from "react";
 import { toast } from "sonner";
 import {
   calculatePayrollAction,
   closePayrollPeriodAction,
   deletePayrollPeriodAction,
   getPeriodDetailAction,
+  listPayrollExtrasAction,
   listPeriodsAction,
   openPayrollPeriodAction,
+  payPayrollExtraAction,
   payPayrollItemAction,
 } from "@/src/features/payroll/actions";
 import type {
+  PayrollExtraRow,
   PayrollPeriodRow,
+  PayrollPeriodSummary,
   PeriodDetail,
 } from "@/src/features/payroll/service";
+import {
+  buildPayrollEmployeeIndex,
+  groupPayrollPeriodsByMonth,
+  payrollEmployeeName,
+  payrollExtraGuide,
+  payrollExtraKindSchema,
+  payrollMonthLabel,
+  payrollPeriodCountLabel,
+  replacePayrollMonthPeriod,
+  sumMoney,
+  summarizePayrollItems,
+  type PayrollExtraKind,
+  type PayrollItemTotals,
+  type PayrollMonthEmployeeRow,
+  type PayrollMonthGroup,
+} from "@/src/features/payroll/schemas";
 import type { EmployeeRow, PaymentMethodRow } from "@/src/features/admin/service";
 import {
   Dialog,
@@ -95,8 +115,24 @@ function formatPayType(payType: string, percent: number | null): string {
 
 const MONTHS_SHORT = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
 
+/** PA-2a: etiqueta legible de cada caso extraordinario. */
+const PAYROLL_EXTRA_KIND_LABELS: Record<PayrollExtraKind, string> = {
+  despido: "Despido",
+  renuncia: "Renuncia",
+  emergencia: "Emergencia",
+  otro: "Otro",
+};
+
 /** Máximo de nombres listados en el aviso de pendientes antes de resumir. */
 const PENDING_VISIBLE_LIMIT = 8;
+
+/**
+ * PA3: máximo de períodos listados dentro del diálogo de apertura antes de
+ * resumir. La lectura de períodos ya no se recorta (la sede con más de 20
+ * perdía historia), así que el diálogo nombra el total y dice cuántos quedan
+ * fuera en vez de renderizar cientos de filas sin decirlo.
+ */
+const PERIOD_VISIBLE_LIMIT = 12;
 
 interface SimpleDate {
   year: number;
@@ -112,7 +148,7 @@ function parseIsoDate(value: string): SimpleDate | null {
 }
 
 /** Etiqueta compacta de un periodo ("1–15 sep"); si comparten mes, un solo nombre. */
-function formatPeriodLabel(row: PayrollPeriodRow): string {
+function formatPeriodLabel(row: { start_date: string; end_date: string }): string {
   const start = parseIsoDate(row.start_date);
   const end = parseIsoDate(row.end_date);
   if (!start || !end) return `${row.start_date} → ${row.end_date}`;
@@ -154,10 +190,60 @@ function findOverlappingPeriod(
   return rows.find((row) => start <= row.end_date && end >= row.start_date) ?? null;
 }
 
+/** Días de un rango inclusivo (mismo criterio que la prorata del servidor). */
+function rangeDayCount(start: string, end: string): number {
+  const [startY, startM, startD] = start.split("-").map(Number);
+  const [endY, endM, endD] = end.split("-").map(Number);
+  const days =
+    Math.round((Date.UTC(endY, endM - 1, endD) - Date.UTC(startY, startM - 1, startD)) / 86_400_000) + 1;
+  return Number.isFinite(days) && days > 0 ? days : 0;
+}
+
+/**
+ * PR1: la base del fijo, a la vista. El fijo de un período NO es el sueldo del
+ * mes: es la parte que corresponde a sus días (el servidor prorratea el sueldo
+ * mensual por los días nominados). Sin esta nota el administrador ve un número
+ * sin explicación —que era el defecto: cada período pagaba el sueldo completo—.
+ * Presentación pura: los días salen del rango del período que ya está cargado.
+ */
+function FixedBasisNote({ start, end }: { start: string; end: string }) {
+  const days = rangeDayCount(start, end);
+  return (
+    <p className="mt-3 text-xs text-text-tertiary">
+      Fijo de estos días: la parte del sueldo mensual que corresponde a los {days}{" "}
+      {days === 1 ? "día" : "días"} del período ({start} a {end}) es el máximo que se paga por
+      ellos; si el período cruza el fin de mes, el sueldo se prorratea en los dos meses. Las
+      comisiones y los bonos van aparte, encima del fijo; los mismos días no se pueden nominar
+      en otro período de la sede.
+    </p>
+  );
+}
+
+/** Totales por período, indexados por id para leerlos en la lista y por mes. */
+function indexPeriodTotals(rows: readonly PayrollPeriodSummary[]): Record<string, PayrollItemTotals> {
+  const index: Record<string, PayrollItemTotals> = {};
+  for (const row of rows) {
+    index[row.period.id] = {
+      employeeCount: row.employeeCount,
+      netTotal: row.netTotal,
+      paidTotal: row.paidTotal,
+      remainingTotal: row.remainingTotal,
+    };
+  }
+  return index;
+}
+
 interface PayrollClientProps {
   sedeId: string;
   initialEmployees: EmployeeRow[];
   initialPeriods: PayrollPeriodRow[];
+  /**
+   * PA3: totales por período (neto, pagado, saldo y cuántos empleados liquidó).
+   * Agregan plata de TODA la planta, así que llegan vacíos para el empleado.
+   */
+  initialSummaries: PayrollPeriodSummary[];
+  /** PA3: mes a la fecha por empleado (mismo motivo: es de toda la planta). */
+  initialMonthToDate: PayrollMonthEmployeeRow[];
   methods: PaymentMethodRow[];
   canAdmin: boolean;
   canPay: boolean;
@@ -183,7 +269,7 @@ function PeriodDetailTable({ items, employeeName, payLabel, onView }: PeriodDeta
               Empleado
             </th>
             <th className={tableCellClass} scope="col">
-              Fijo
+              Fijo (días)
             </th>
             <th className={tableCellClass} scope="col">
               Comisiones
@@ -283,7 +369,7 @@ function DraftPayrollTable({
               Empleado
             </th>
             <th className={tableCellClass} scope="col">
-              Fijo
+              Fijo (días)
             </th>
             <th className={tableCellClass} scope="col">
               Comisiones
@@ -553,6 +639,18 @@ export function PayrollClient(props: PayrollClientProps) {
   const [selectedId, setSelectedId] = useState<string | null>(props.initialPeriods[0]?.id ?? null);
   const [detail, setDetail] = useState<PeriodDetail | null>(null);
   const [detailTargetId, setDetailTargetId] = useState<string | null>(null);
+  // PA3: el resumen por período y el mes a la fecha llegan leídos del servidor
+  // (agregan plata de TODA la planta) y se PISAN con el detalle más fresco de
+  // cada período: abrir, calcular, pagar, cerrar o borrar. Es estado, no
+  // derivación, porque el servidor es la única fuente de un agregado de la sede
+  // y lo único que lo actualiza es una lectura suya.
+  const [summaries, setSummaries] = useState<Record<string, PayrollItemTotals>>(() =>
+    indexPeriodTotals(props.initialSummaries),
+  );
+  const [monthRows, setMonthRows] = useState<PayrollMonthEmployeeRow[]>(props.initialMonthToDate);
+  // Filtro de estado de la lista y mes que se está mirando en "pagos del mes".
+  const [statusFilter, setStatusFilter] = useState<string>("todos");
+  const [monthFilter, setMonthFilter] = useState<string>("");
   // Un solo canal de ESTADO: lo que sigue siendo el caso mientras no se
   // corrija (fallo de acción o validación incompleta). Lo que acaba de pasar
   // (éxito) es EVENTO y sale por `toast`, no por estado.
@@ -579,6 +677,39 @@ export function PayrollClient(props: PayrollClientProps) {
   // Transición para los cambios de vista (detalle del periodo / vales):
   // la UI no se congela mientras la server action responde.
   const [isViewPending, startViewTransition] = useTransition();
+
+  // PA-2a: pagos extraordinarios (nómina individual). La lista es el registro
+  // visible del módulo; el formulario es el único lugar donde se escribe un
+  // monto con motivo. `extraError` es ESTADO del diálogo (lo que sigue mal
+  // mientras no se corrija), separado del error de la página.
+  const [extras, setExtras] = useState<PayrollExtraRow[]>([]);
+  const [extraDialogOpen, setExtraDialogOpen] = useState(false);
+  const [extraError, setExtraError] = useState<string | null>(null);
+  const [extraBusy, setExtraBusy] = useState(false);
+  const [extraEmployeeId, setExtraEmployeeId] = useState("");
+  const [extraKind, setExtraKind] = useState<PayrollExtraKind | "">("");
+  const [extraReason, setExtraReason] = useState("");
+  const [extraAmount, setExtraAmount] = useState("");
+  const [extraMethodCode, setExtraMethodCode] = useState("");
+  const [extraReference, setExtraReference] = useState("");
+  const [extraDaysFrom, setExtraDaysFrom] = useState("");
+  const [extraDaysTo, setExtraDaysTo] = useState("");
+
+  // Los pagos extraordinarios no llegan por props (la página los arma para los
+  // períodos): se leen al montar. Sólo el admin tiene la superficie, así que el
+  // efecto no dispara para el empleado.
+  useEffect(() => {
+    if (!props.canAdmin) return;
+    let active = true;
+    void listPayrollExtrasAction().then((result) => {
+      if (!active) return;
+      if (result.success) setExtras(result.data);
+      else setError(`${result.code}: ${result.message}`);
+    });
+    return () => {
+      active = false;
+    };
+  }, [props.canAdmin]);
 
   // Filas del borrador: la planta activa más los empleados ya calculados que
   // hayan quedado inactivos después del cálculo (no se pierden al recalcular).
@@ -643,6 +774,18 @@ export function PayrollClient(props: PayrollClientProps) {
     }
   }
 
+  /**
+   * Acepta el detalle MÁS FRESCO de un período. Es la única lectura de nómina
+   * que vuelve de una acción, así que es la que pisa el resumen del período y su
+   * porción del mes a la fecha: sin esto, el monto que el admin acaba de pagar
+   * (o recalcular) seguiría mostrándose viejo en la lista hasta recargar.
+   */
+  function acceptDetail(next: PeriodDetail) {
+    setDetail(next);
+    setSummaries((prev) => ({ ...prev, [next.period.id]: summarizePayrollItems(next.items) }));
+    setMonthRows((prev) => replacePayrollMonthPeriod({ rows: prev, period: next.period, items: next.items }));
+  }
+
   // Inventory-style cancel: closing the dialog always resets its state.
   function closeDetail() {
     setDetail(null);
@@ -656,7 +799,7 @@ export function PayrollClient(props: PayrollClientProps) {
     setSelectedId(id);    startViewTransition(async () => {
       const result = (await getPeriodDetailAction(id)) as ActionResult<PeriodDetail>;
       if (show(result)) {
-        setDetail(result.data);
+        acceptDetail(result.data);
         setDetailDialogOpen(true);
       }
     });
@@ -710,7 +853,7 @@ export function PayrollClient(props: PayrollClientProps) {
     })) as ActionResult<PeriodDetail>;
     setBusy(false);
     if (calculated.success) {
-      setDetail(calculated.data);
+      acceptDetail(calculated.data);
       setDetailDialogOpen(true);
       // EVENTO: el período recién abierto y calculado. Es la única salida de
       // éxito que no pasa por `show()` porque este flujo tiene dos desenlaces.
@@ -750,7 +893,7 @@ export function PayrollClient(props: PayrollClientProps) {
     })) as ActionResult<PeriodDetail>;
     setBusy(false);
     if (show(result, "Borrador recalculado: vales pendientes/aprobados quedaron descontados.")) {
-      setDetail(result.data);
+      acceptDetail(result.data);
     }
   }
 
@@ -859,6 +1002,81 @@ export function PayrollClient(props: PayrollClientProps) {
     }
   }
 
+  /** PA-2a: recarga el registro visible de pagos extraordinarios. */
+  async function loadExtras() {
+    const result = (await listPayrollExtrasAction()) as ActionResult<PayrollExtraRow[]>;
+    if (show(result)) setExtras(result.data);
+  }
+
+  function closeExtraDialog() {
+    setExtraDialogOpen(false);
+    setExtraError(null);
+    setExtraEmployeeId("");
+    setExtraKind("");
+    setExtraReason("");
+    setExtraAmount("");
+    setExtraMethodCode("");
+    setExtraReference("");
+    setExtraDaysFrom("");
+    setExtraDaysTo("");
+  }
+
+  /**
+   * PA-2a: registra un pago extraordinario. El monto se escribe libre (la guía
+   * se muestra, no se aplica); el motivo es obligatorio. La validación de acá
+   * es la misma del esquema del servidor, para no ir y volver con un error.
+   */
+  async function handlePayExtra(event: FormEvent) {
+    event.preventDefault();
+    setExtraError(null);
+    const amount = toNumber(extraAmount);
+    if (!extraEmployeeId) {
+      setExtraError("Elija el empleado.");
+      return;
+    }
+    if (!extraKind) {
+      setExtraError("Elija el tipo de caso extraordinario.");
+      return;
+    }
+    if (!extraReason.trim()) {
+      setExtraError("El motivo del pago es obligatorio.");
+      return;
+    }
+    if (amount === null || amount <= 0) {
+      setExtraError("El monto debe ser mayor a 0.");
+      return;
+    }
+    if (!extraMethodCode) {
+      setExtraError("Elija el método de pago.");
+      return;
+    }
+    if (Boolean(extraDaysFrom) !== Boolean(extraDaysTo)) {
+      setExtraError("Indique las dos fechas de los días liquidados, o ninguna.");
+      return;
+    }
+    if (extraDaysFrom && extraDaysTo && extraDaysTo < extraDaysFrom) {
+      setExtraError("La fecha final no puede ser anterior a la inicial.");
+      return;
+    }
+
+    setExtraBusy(true);
+    const result = (await payPayrollExtraAction({
+      employee_id: extraEmployeeId,
+      amount,
+      method_code: extraMethodCode,
+      reference: extraReference.trim() || null,
+      reason: extraReason.trim(),
+      kind: extraKind,
+      days_from: extraDaysFrom || null,
+      days_to: extraDaysTo || null,
+    })) as ActionResult<PayrollExtraRow>;
+    setExtraBusy(false);
+    if (show(result, "Pago extraordinario registrado.")) {
+      closeExtraDialog();
+      await loadExtras();
+    }
+  }
+
   async function handleClose() {
     if (!selectedId) return;
     setBusy(true);
@@ -883,8 +1101,20 @@ export function PayrollClient(props: PayrollClientProps) {
     setBusy(false);
     if (show(result, "Borrador borrado.")) {
       setConfirmDeleteOpen(false);
+      const removed = periods.find((row) => row.id === selectedId) ?? null;
       closeDetail();
       setSelectedId(null);
+      // El período borrado sale también del resumen y del mes a la fecha: si
+      // quedara, la vista seguiría mostrando plata de un período que ya no
+      // existe (y cuyos pagos se devolvieron).
+      if (removed) {
+        setSummaries((prev) => {
+          const rest = { ...prev };
+          delete rest[removed.id];
+          return rest;
+        });
+        setMonthRows((prev) => replacePayrollMonthPeriod({ rows: prev, period: removed, items: [] }));
+      }
       await refreshPeriods();
     }
   }
@@ -909,13 +1139,13 @@ export function PayrollClient(props: PayrollClientProps) {
    * Nombre legible del empleado: nombre + ID interno (el código de empleado
    * `employee_code`; si no está definido, el documento). Nunca el número de
    * documento solo, para distinguir homónimos igual que en vales.
+   *
+   * PA3: la planta se indexa UNA sola vez. Antes cada nombre era un `find`
+   * sobre la lista, y la lista venía recortada en 50, así que más allá de ese
+   * tope el nombre caía al fragmento del id.
    */
-  const employeeName = (id: string) => {
-    const found = props.initialEmployees.find((row) => row.id === id);
-    if (!found) return id.slice(0, 8);
-    const internalId = found.employee_code ? found.employee_code : found.document;
-    return `${found.full_name} (${internalId})`;
-  };
+  const employeeIndex = buildPayrollEmployeeIndex(props.initialEmployees);
+  const employeeName = (id: string) => payrollEmployeeName(employeeIndex, id);
 
   /**
    * Tipo de pago del empleado (fijo/porcentaje/mixto y su porcentaje) para la
@@ -923,13 +1153,84 @@ export function PayrollClient(props: PayrollClientProps) {
    * empleado, igual que el nombre.
    */
   const employeePayLabel = (id: string) => {
-    const found = props.initialEmployees.find((row) => row.id === id);
+    const found = employeeIndex.get(id);
     if (!found) return "Sin definir";
     return formatPayType(found.pay_type, found.commission_percent);
   };
 
+  /**
+   * PA3: la lista se filtra por estado y se agrupa por mes, para que un mes con
+   * muchos pagos sea navegable. El conteo se lee SIEMPRE contra el total.
+   */
+  const statusOptions = [...new Set(periods.map((row) => row.status))].sort();
+  const visiblePeriods =
+    statusFilter === "todos" ? periods : periods.filter((row) => row.status === statusFilter);
+  const periodGroups = groupPayrollPeriodsByMonth(visiblePeriods);
+
+  /**
+   * Totales de un mes: SÓLO si TODOS sus períodos tienen resumen. Con uno sin
+   * resumen el total de la fila mentiría por omisión, así que se dice. Los
+   * montos van en peso entero (`sumMoney` sobre `roundMoney`).
+   */
+  function groupTotals(group: PayrollMonthGroup<PayrollPeriodRow>) {
+    const totals = group.periods.map((row) => summaries[row.id]);
+    if (totals.some((row) => row === undefined)) return null;
+    return {
+      net: sumMoney(totals.map((row) => row?.netTotal ?? 0)),
+      paid: sumMoney(totals.map((row) => row?.paidTotal ?? 0)),
+      remaining: sumMoney(totals.map((row) => row?.remainingTotal ?? 0)),
+    };
+  }
+
+  /** Resumen de un período en la lista: se lee sin abrirlo. */
+  function periodSummaryText(row: PayrollPeriodRow): string {
+    const totals = summaries[row.id];
+    if (!totals) return "Abra el período para ver sus totales.";
+    const employees = totals.employeeCount === 1 ? "1 empleado" : `${totals.employeeCount} empleados`;
+    return `${employees} · Neto ${formatMoney(totals.netTotal)} · Pagado ${formatMoney(totals.paidTotal)} · Saldo ${formatMoney(totals.remainingTotal)}`;
+  }
+
+  // PA3: mes a la fecha por empleado del mes elegido (el más reciente por defecto).
+  const monthOptions = [...new Set(monthRows.map((row) => row.month))].sort().reverse();
+  const activeMonth = monthFilter || monthOptions[0] || "";
+  const monthView = monthRows.filter((row) => row.month === activeMonth);
+
+  /** Sueldo mensual del empleado: la base de la prorata, a la vista. */
+  function monthSalaryLabel(id: string): string {
+    const found = employeeIndex.get(id);
+    if (!found) return "Empleado fuera de la planta.";
+    if (found.salary_fixed === null || Number(found.salary_fixed) <= 0) {
+      return "Sin sueldo fijo configurado.";
+    }
+    return `Sueldo mensual ${formatMoney(found.salary_fixed)}.`;
+  }
+
   // Ítems del detalle con saldo pendiente de pago: bloquean el cierre del borrador.
   const pendingItems = (detail?.items ?? []).filter((item) => item.remaining > 0);
+
+  // PA-2a: la GUÍA del pago extraordinario (el sueldo prorrateado por los días
+  // que se liquidan). Se MUESTRA, nunca se aplica: el dueño fue explícito en
+  // que el sueldo mensual es la base guía y no un tope (un despido liquida
+  // prestaciones; una emergencia puede costar más). Un rango invertido lanza
+  // (misma regla que la prorata); acá se convierte en aviso, no en pantalla
+  // rota.
+  const extraEmployee = props.initialEmployees.find((row) => row.id === extraEmployeeId) ?? null;
+  let extraGuide: ReturnType<typeof payrollExtraGuide> | null = null;
+  let extraGuideInvalid = false;
+  try {
+    extraGuide = payrollExtraGuide({
+      salaryFixed: extraEmployee?.salary_fixed ?? null,
+      daysFrom: extraDaysFrom || null,
+      daysTo: extraDaysTo || null,
+      amount: toNumber(extraAmount),
+    });
+  } catch {
+    extraGuideInvalid = true;
+  }
+
+  /** Nombre del método por su código; el código si ya no está en el catálogo. */
+  const methodLabel = (code: string) =>
+    props.methods.find((row) => row.code === code)?.name ?? code;
 
   return (
     <div className="flex flex-col gap-6">
@@ -942,8 +1243,34 @@ export function PayrollClient(props: PayrollClientProps) {
       )}
 
       <section className={sectionClass}>
-        <h2 className="text-lg font-semibold">Periodos</h2>
-        {props.initialEmployees.length === 0 && (
+        <h2 className="text-lg font-semibold">Períodos</h2>
+        {props.canAdmin && (
+          <p className="mt-2 text-sm text-text-secondary">
+            {/* PA3: el conteo se lee SIEMPRE contra el total (la lista se
+                recortaba en 20 sin decirlo) y el resumen de cada período evita
+                tener que abrirlo para saber cuánto hay y a cuántos empleados. */}
+            {payrollPeriodCountLabel({ total: periods.length, shown: visiblePeriods.length })}
+          </p>
+        )}
+        {props.canAdmin && (
+          <label className={labelClass} htmlFor="payroll-status-filter">
+            Estado
+            <select
+              id="payroll-status-filter"
+              value={statusFilter}
+              onChange={(event) => setStatusFilter(event.target.value)}
+              className={inputClass}
+            >
+              <option value="todos">Todos los estados</option>
+              {statusOptions.map((status) => (
+                <option key={status} value={status}>
+                  {status}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+        {props.canAdmin && props.initialEmployees.length === 0 && (
           // VACÍO: no es un aviso, es el estado base de la sede sin planta.
           <p className="mt-2 text-sm text-text-secondary">
             Aún no hay empleados en la sede: créelos en /admin antes de liquidar.
@@ -961,27 +1288,442 @@ export function PayrollClient(props: PayrollClientProps) {
             Abrir período
           </button>
         )}
-        <ul className="mt-3 flex flex-col gap-2">
-          {periods.map((row) => (
-            <li key={row.id} className="flex flex-wrap items-center gap-3 text-sm">
-              <button
-                type="button"
-                onClick={() => loadDetail(row.id)}
-                disabled={isViewPending}
-                aria-current={row.id === selectedId ? "true" : undefined}
-                className={ghostClass}
-              >
-                {row.start_date} → {row.end_date}
-              </button>
-              <Badge variant="secondary">{row.status}</Badge>
-              {row.status === "cerrado" && row.closed_at && (
-                <span className="text-xs text-text-tertiary">Cerrado: {new Date(row.closed_at).toLocaleString("es-CO")}</span>
-              )}
-            </li>
-          ))}
-          {periods.length === 0 && <li className="text-sm text-text-tertiary">Sin periodos todavía.</li>}
-        </ul>
+        {/* PA3: agrupados por mes, el más reciente primero, para que un mes con
+            muchos pagos se pueda recorrer sin perder de vista los totales. */}
+        {periodGroups.map((group) => {
+          const totals = groupTotals(group);
+          return (
+            <div key={group.month || "sin-mes"} className="mt-4">
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <h3 className="text-sm font-semibold text-text-primary">
+                  {group.month ? payrollMonthLabel(group.month) : "Sin mes determinable"}
+                </h3>
+                {props.canAdmin && (
+                  <p className="text-xs text-text-tertiary">
+                    {group.periods.length === 1 ? "1 período" : `${group.periods.length} períodos`}
+                    {totals
+                      ? ` · Neto ${formatMoney(totals.net)} · Pagado ${formatMoney(totals.paid)} · Saldo ${formatMoney(totals.remaining)}`
+                      : " · Totales parciales: abra los períodos sin resumen."}
+                  </p>
+                )}
+              </div>
+              <ul className="mt-2 flex flex-col gap-2">
+                {group.periods.map((row) => (
+                  <li key={row.id} className="flex flex-wrap items-center gap-3 text-sm">
+                    <button
+                      type="button"
+                      onClick={() => loadDetail(row.id)}
+                      disabled={isViewPending}
+                      aria-current={row.id === selectedId ? "true" : undefined}
+                      className={ghostClass}
+                    >
+                      {row.start_date} → {row.end_date}
+                    </button>
+                    <Badge variant="secondary">{row.status}</Badge>
+                    {props.canAdmin && (
+                      <span className="text-xs text-text-secondary">{periodSummaryText(row)}</span>
+                    )}
+                    {row.status === "cerrado" && row.closed_at && (
+                      <span className="text-xs text-text-tertiary">Cerrado: {new Date(row.closed_at).toLocaleString("es-CO")}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          );
+        })}
+        {visiblePeriods.length === 0 && (
+          <p className="mt-3 text-sm text-text-tertiary">
+            {periods.length === 0
+              ? "Sin periodos todavía."
+              : `Ningún período con estado ${statusFilter}.`}
+          </p>
+        )}
       </section>
+
+      {/*
+        PA-2a: nómina individual por caso extraordinario. Es el REGISTRO
+        VISIBLE (no sólo la auditoría) de cuánto y cómo se pagó, y existe
+        porque un período cerrado no admite el pago de sus ítems. Sólo admin.
+      */}
+      {props.canAdmin && (
+        <section className={sectionClass}>
+          <h2 className="text-lg font-semibold">Pagos extraordinarios</h2>
+          <p className="mt-2 text-sm text-text-secondary">
+            Nómina individual por despido, renuncia o emergencia del empleado. No es un período: sirve
+            para pagar días que un período cerrado ya cubrió, y queda registrado cuánto y cómo se pagó.
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              setExtraError(null);
+              setExtraDialogOpen(true);
+            }}
+            className={`${buttonClass} mt-3`}
+          >
+            Registrar pago extraordinario
+          </button>
+          {extras.length === 0 ? (
+            <p className="mt-3 text-sm text-text-tertiary">
+              Sin pagos extraordinarios registrados.
+            </p>
+          ) : (
+            <div className="mt-3 overflow-x-auto">
+              <table className={cn("w-full text-left text-sm", "min-w-[880px]")}>
+                <thead>
+                  <tr className={tableHeaderClass}>
+                    <th className={tableCellClass} scope="col">
+                      Fecha
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Empleado
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Tipo
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Monto
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Método
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Motivo
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {extras.map((row) => (
+                    <tr key={row.id} className={tableRowClass}>
+                      <td className={tableCellClass}>
+                        {row.paid_at ? formatFullDate(row.paid_at.slice(0, 10)) : "—"}
+                      </td>
+                      <td className={tableCellClass}>{employeeName(row.employee_id)}</td>
+                      <td className={tableCellClass}>{PAYROLL_EXTRA_KIND_LABELS[row.kind]}</td>
+                      <td className={tableCellClass}>{formatMoney(row.amount)}</td>
+                      <td className={tableCellClass}>{methodLabel(row.method_code)}</td>
+                      <td className={tableCellClass}>{row.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
+
+      {/*
+        PA3: pagos del mes por empleado. Es la respuesta práctica a "qué lleva
+        cada persona este mes": lo liquidado, lo pagado y el saldo, contra qué
+        períodos, con el fijo prorrateado por los días nominados a la vista.
+        Solo admin: agrega plata de TODA la planta (el mismo dato que el detalle
+        sin alcance por fila). Se LEE, no se aplica: la porción prorrateada no
+        topa ni bloquea nada.
+      */}
+      {props.canAdmin && (
+        <section className={sectionClass}>
+          <h2 className="text-lg font-semibold">Pagos del mes por empleado</h2>
+          <p className="mt-2 text-sm text-text-secondary">
+            Lo que cada empleado lleva liquidado y pagado en el mes, y contra qué períodos. El fijo
+            se muestra prorrateado por los días nominados: el sueldo mensual es la base, no lo que se
+            paga en cada período. Un período que cruza el fin de mes se prorratea en los dos meses y
+            acá aparece en el mes donde empieza. Los pagos extraordinarios individuales
+            (despido, renuncia, emergencia) NO entran en estos totales: no pertenecen a ningún
+            período y están listados en su propia sección.
+          </p>
+          {monthOptions.length === 0 ? (
+            <p className="mt-3 text-sm text-text-tertiary">
+              Sin pagos de nómina registrados todavía.
+            </p>
+          ) : (
+            <>
+              <label className={labelClass} htmlFor="payroll-month-filter">
+                Mes
+                <select
+                  id="payroll-month-filter"
+                  value={activeMonth}
+                  onChange={(event) => setMonthFilter(event.target.value)}
+                  className={inputClass}
+                >
+                  {monthOptions.map((month) => (
+                    <option key={month} value={month}>
+                      {payrollMonthLabel(month)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="mt-3 overflow-x-auto">
+                <table className={cn("w-full text-left text-sm", "min-w-[960px]")}>
+                  <thead>
+                    <tr className={tableHeaderClass}>
+                      <th className={tableCellClass} scope="col">
+                        Empleado
+                      </th>
+                      <th className={tableCellClass} scope="col">
+                        Fijo prorrateado (días)
+                      </th>
+                      <th className={tableCellClass} scope="col">
+                        Neto
+                      </th>
+                      <th className={tableCellClass} scope="col">
+                        Pagado
+                      </th>
+                      <th className={tableCellClass} scope="col">
+                        Saldo
+                      </th>
+                      <th className={tableCellClass} scope="col">
+                        Períodos
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {monthView.map((row) => (
+                      <tr key={`${row.month}-${row.employeeId}`} className={tableRowClass}>
+                        <td className={tableCellClass}>
+                          <span className="block">{employeeName(row.employeeId)}</span>
+                          <span className="block text-xs text-text-tertiary">
+                            {monthSalaryLabel(row.employeeId)}
+                          </span>
+                        </td>
+                        <td className={tableCellClass}>
+                          <span className="block">{formatMoney(row.fixedTotal)}</span>
+                          <span className="block text-xs text-text-tertiary">
+                            {row.days === 1 ? "1 día nominado" : `${row.days} días nominados`}
+                          </span>
+                        </td>
+                        <td className={tableCellClass}>{formatMoney(row.netTotal)}</td>
+                        <td className={tableCellClass}>{formatMoney(row.paidTotal)}</td>
+                        <td className={cn(tableCellClass, "font-semibold")}>
+                          {formatMoney(row.remainingTotal)}
+                        </td>
+                        <td className={tableCellClass}>
+                          <ul className="flex flex-col gap-0.5">
+                            {row.periods.map((entry) => (
+                              <li key={entry.periodId}>
+                                {formatPeriodLabel(entry)} ({entry.status}): neto{" "}
+                                {formatMoney(entry.net)}, pagado {formatMoney(entry.paid)}, saldo{" "}
+                                {formatMoney(entry.remaining)}
+                              </li>
+                            ))}
+                          </ul>
+                        </td>
+                      </tr>
+                    ))}
+                    {monthView.length === 0 && (
+                      <tr className={tableRowClass}>
+                        <td className={tableCellClass} colSpan={6}>
+                          {`Sin pagos de nómina en ${payrollMonthLabel(activeMonth)}.`}
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </section>
+      )}
+
+      {/* PA-2a: el formulario del pago extraordinario. */}
+      {props.canAdmin && (
+        <Dialog
+          open={extraDialogOpen}
+          onOpenChange={(open) => {
+            if (!open) closeExtraDialog();
+            else setExtraDialogOpen(true);
+          }}
+        >
+          <DialogContent className="max-w-2xl">
+            <DialogHeader>
+              <DialogTitle>Registrar pago extraordinario</DialogTitle>
+              <DialogDescription>
+                Nómina individual por despido, renuncia o emergencia. No crea ni reabre períodos:
+                puede pagar días que un período cerrado ya cubrió. El motivo es obligatorio.
+              </DialogDescription>
+            </DialogHeader>
+            <form onSubmit={handlePayExtra} className="mt-4 flex flex-col gap-4">
+              <div className="flex flex-wrap gap-3">
+                <label className={labelClass} htmlFor="payroll-extra-employee">
+                  Empleado
+                  <select
+                    id="payroll-extra-employee"
+                    value={extraEmployeeId}
+                    onChange={(event) => {
+                      setExtraEmployeeId(event.target.value);
+                      setExtraError(null);
+                    }}
+                    className={inputClass}
+                    required
+                  >
+                    <option value="">Empleado…</option>
+                    {props.initialEmployees.map((row) => (
+                      <option key={row.id} value={row.id}>
+                        {employeeName(row.id)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className={labelClass} htmlFor="payroll-extra-kind">
+                  Tipo de caso
+                  <select
+                    id="payroll-extra-kind"
+                    value={extraKind}
+                    onChange={(event) => {
+                      setExtraKind(event.target.value as PayrollExtraKind);
+                      setExtraError(null);
+                    }}
+                    className={inputClass}
+                    required
+                  >
+                    <option value="">Tipo…</option>
+                    {payrollExtraKindSchema.options.map((kind) => (
+                      <option key={kind} value={kind}>
+                        {PAYROLL_EXTRA_KIND_LABELS[kind]}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className={labelClass} htmlFor="payroll-extra-amount">
+                  Monto
+                  <input
+                    id="payroll-extra-amount"
+                    type="number"
+                    min="0"
+                    inputMode="numeric"
+                    value={extraAmount}
+                    onChange={(event) => {
+                      setExtraAmount(event.target.value);
+                      setExtraError(null);
+                    }}
+                    placeholder="0"
+                    className={tableInputClass}
+                    required
+                  />
+                </label>
+              </div>
+
+              <label className={labelClass} htmlFor="payroll-extra-reason">
+                Motivo
+                <textarea
+                  id="payroll-extra-reason"
+                  value={extraReason}
+                  onChange={(event) => {
+                    setExtraReason(event.target.value);
+                    setExtraError(null);
+                  }}
+                  rows={2}
+                  maxLength={500}
+                  placeholder="Por qué se paga (renuncia del 16 de septiembre, emergencia médica…)"
+                  className={inputClass}
+                  required
+                />
+              </label>
+
+              <div className="flex flex-wrap gap-3">
+                <label className={labelClass} htmlFor="payroll-extra-method">
+                  Método de pago
+                  <select
+                    id="payroll-extra-method"
+                    value={extraMethodCode}
+                    onChange={(event) => {
+                      setExtraMethodCode(event.target.value);
+                      setExtraError(null);
+                    }}
+                    className={inputClass}
+                    required
+                  >
+                    <option value="">Método…</option>
+                    {props.methods.map((row) => (
+                      <option key={row.id} value={row.code}>
+                        {row.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className={labelClass} htmlFor="payroll-extra-reference">
+                  Referencia (opcional)
+                  <input
+                    id="payroll-extra-reference"
+                    type="text"
+                    value={extraReference}
+                    onChange={(event) => setExtraReference(event.target.value)}
+                    maxLength={120}
+                    placeholder="N.º de comprobante o transferencia"
+                    className={inputClass}
+                  />
+                </label>
+              </div>
+
+              <div className="flex flex-wrap gap-3">
+                <label className={labelClass} htmlFor="payroll-extra-days-from">
+                  Días liquidados desde (opcional)
+                  <input
+                    id="payroll-extra-days-from"
+                    type="date"
+                    value={extraDaysFrom}
+                    onChange={(event) => {
+                      setExtraDaysFrom(event.target.value);
+                      setExtraError(null);
+                    }}
+                    className={inputClass}
+                  />
+                </label>
+                <label className={labelClass} htmlFor="payroll-extra-days-to">
+                  Hasta
+                  <input
+                    id="payroll-extra-days-to"
+                    type="date"
+                    value={extraDaysTo}
+                    onChange={(event) => {
+                      setExtraDaysTo(event.target.value);
+                      setExtraError(null);
+                    }}
+                    className={inputClass}
+                  />
+                </label>
+              </div>
+
+              <div className="rounded-md border border-border-color bg-surface-hover p-3 text-sm text-text-secondary dark:border-border-color-2">
+                <p className="font-medium text-text-primary">Guía (no es un tope)</p>
+                {extraGuideInvalid ? (
+                  <p className="mt-1">La fecha final no puede ser anterior a la inicial.</p>
+                ) : extraGuide && extraGuide.monthlySalary === null ? (
+                  <p className="mt-1">
+                    El empleado no tiene sueldo fijo configurado: no hay guía que mostrar. El monto lo
+                    define usted.
+                  </p>
+                ) : extraGuide ? (
+                  <>
+                    <p className="mt-1">
+                      {extraGuide.proratedAmount !== null
+                        ? `Porción de ${extraGuide.days} día(s) liquidado(s): ${formatMoney(extraGuide.proratedAmount)}.`
+                        : `Sueldo mensual de referencia: ${formatMoney(extraGuide.monthlySalary ?? 0)}.`}
+                    </p>
+                    {extraGuide.exceedsGuide && (
+                      <p className="mt-1">
+                        El monto supera la guía. Está permitido —un despido liquida prestaciones y una
+                        emergencia puede costar más que los días trabajados—: se registrará tal como lo
+                        escribió.
+                      </p>
+                    )}
+                  </>
+                ) : null}
+              </div>
+
+              {extraError ? <Alert variant="destructive">{extraError}</Alert> : null}
+
+              <DialogFooter>
+                <button type="button" className={ghostClass} onClick={closeExtraDialog}>
+                  Cancelar
+                </button>
+                <button type="submit" disabled={extraBusy} className={buttonClass}>
+                  {extraBusy ? "Registrando…" : "Registrar pago"}
+                </button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
 
       {props.canAdmin && (
         <Dialog
@@ -1037,14 +1779,26 @@ export function PayrollClient(props: PayrollClientProps) {
                   // de la lista), no bloquea nada y nunca anunció nada.
                   <p className="mt-1">Sin períodos todavía: este será el primero.</p>
                 ) : (
-                  <ul className="mt-1 flex flex-col gap-1">
-                    {periods.map((row) => (
-                      <li key={row.id} className="flex items-center justify-between gap-3">
-                        <span>{formatPeriodLabel(row)}</span>
-                        <span className="text-xs text-text-tertiary">{row.status}</span>
-                      </li>
-                    ))}
-                  </ul>
+                  <>
+                    <p className="mt-1">
+                      {periods.length === 1
+                        ? "1 período registrado."
+                        : `${periods.length} períodos registrados.`}
+                    </p>
+                    <ul className="mt-1 flex flex-col gap-1">
+                      {periods.slice(0, PERIOD_VISIBLE_LIMIT).map((row) => (
+                        <li key={row.id} className="flex items-center justify-between gap-3">
+                          <span>{formatPeriodLabel(row)}</span>
+                          <span className="text-xs text-text-tertiary">{row.status}</span>
+                        </li>
+                      ))}
+                    </ul>
+                    {periods.length > PERIOD_VISIBLE_LIMIT && (
+                      <p className="mt-1">
+                        {`y ${periods.length - PERIOD_VISIBLE_LIMIT} más (vea la lista de períodos de la pantalla).`}
+                      </p>
+                    )}
+                  </>
                 )}
                 {suggestedStart && (
                   <p className="mt-2">
@@ -1122,6 +1876,7 @@ export function PayrollClient(props: PayrollClientProps) {
                   <p className="mt-2 text-sm text-text-secondary">
                     Periodo cerrado. La liquidación quedó registrada.
                   </p>
+                  <FixedBasisNote start={selected.start_date} end={selected.end_date} />
                   {detail && (
                     <PeriodDetailTable
                       items={detail.items}
@@ -1137,6 +1892,7 @@ export function PayrollClient(props: PayrollClientProps) {
                     Tabla del borrador: ajuste bonos y otros descuentos por empleado y recalcule si hubo
                     cambios.
                   </p>
+                  <FixedBasisNote start={selected.start_date} end={selected.end_date} />
                   <DraftPayrollTable
                     rows={draftRows}
                     employeeName={employeeName}
