@@ -22,6 +22,7 @@ import {
   roundMoney,
   splitPaymentSchema,
   type CreateInvoiceInput,
+  type EditInvoiceItemInput,
   type InvoiceItemInput,
   type PaymentPortionInput,
 } from "./schemas";
@@ -80,69 +81,26 @@ function validationMessage(error: { issues: Array<{ message: string }> }): strin
   return error.issues[0]?.message ?? "Datos inválidos.";
 }
 
-/**
- * CO-1: candado de serialización de las DOS ediciones de factura.
- *
- * El token es `invoices.edit_version` (migración 038): un contador que cambia en
- * CADA edición exitosa. Reclamarlo es un compare-and-swap — se escribe
- * `versión leída + 1` con la versión leída como precondición — y se llama ANTES
- * de la primera escritura de la edición (ítems, stock, auditoría). Dos ediciones
- * simultáneas de la MISMA factura leen la misma versión y calculan el mismo
- * delta: la que aplica segunda afecta 0 filas y se rechaza acá, así que sus
- * deltas NO se aplican dos veces. El candado es por FILA (`.eq("id", …)`), no
- * global: editar otra factura no se bloquea.
- *
- * El rechazo es un error de negocio accionable (409 + `EDIT_CONFLICT`), nunca un
- * 500: PGRST116 es el `.single()` sin filas del cliente Supabase, el mismo
- * código que la anulación de factura mapea a `ANNUL_CONFLICT` y el cierre de
- * caja a `SHIFT_ALREADY_CLOSED`.
- *
- * CL-1: la precondición es `(estado, versión)`, no solo la versión, porque el
- * estado es la OTRA mitad de la decisión. La edición decide con el estado que
- * LEYÓ —Anulada es terminal y la edición libre rechaza Pagada— y esa lectura no
- * es la fila: entre el `read` y este candado cabe una anulación (que revierte
- * stock) o un cobro que cierre la factura. Sin la guarda de estado, esa edición
- * en vuelo se aplicaba igual sobre la fila ya terminal: los ítems, el stock y
- * las comisiones quedaban escritos DESPUÉS del hecho. La forma es la del hermano
- * `annulInvoice` (`.eq("id", …).eq("status", …)`). Las 0 filas siguen saliendo
- * por el MISMO `EDIT_CONFLICT` (409): lo que cambia para la carrera es el
- * mensaje, que ahora también nombra el estado.
- *
- * LÍMITE CONOCIDO (CO-1, declarado y no escondido): el candado cubre la ventana
- * lectura→primera escritura, que es la del hallazgo; NO es una transacción. Si
- * la ganadora ya reclamó el token y una tercera edición alcanza a leer los ítems
- * viejos antes de que la ganadora los escriba, esa tercera lee la versión nueva
- * (por eso reclama el token) y recalcula el delta sobre el estado viejo. Cerrar
- * esa rendija exige que la edición entera —lectura, ítems y stock— sea UNA
- * transacción (una función SQL/RPC): es un cambio de forma, no de candado, y
- * queda fuera de esta unidad.
- */
-async function claimInvoiceEdit(
-  db: DbClient,
-  invoiceId: string,
-  expectedVersion: number,
-  expectedStatus: string,
-): Promise<void> {
-  const { data, error } = await db
-    .from("invoices")
-    .update({ edit_version: expectedVersion + 1 })
-    .eq("id", invoiceId)
-    .eq("edit_version", expectedVersion)
-    .eq("status", expectedStatus)
-    .select("id")
-    .single();
-  if (error || !data) {
-    const errorCode = (error as { code?: string } | null)?.code;
-    if (errorCode === "PGRST116") {
-      throw new BillingError(
-        "EDIT_CONFLICT",
-        "El estado de la factura cambió entre la lectura y la escritura, o se aplicó otra edición (posible edición simultánea): no se ajustó nada. Vuelva a abrir la factura y repita la edición.",
-        409,
-      );
-    }
-    throw new BillingError("INTERNAL", "Error interno.", 500);
-  }
-}
+// CO-1 / CL-1 / CL-12: los DOS candados que protegen una edición de factura.
+//
+// El token es `invoices.edit_version` (migración 038): un contador que cambia en
+// CADA edición exitosa, y la precondición es `(versión, estado)` —CL-1: el estado
+// es la OTRA mitad de la decisión, porque la edición decide con el estado que
+// LEYÓ (`Anulada` es terminal, la libre rechaza `Pagada`) y entre esa lectura y
+// la escritura cabe una anulación o un cobro—. El candado es por FILA, no global:
+// editar otra factura no se bloquea.
+//
+// CO-1 lo reclamaba desde el cliente con un compare-and-swap (un `UPDATE` de
+// `edit_version` con las dos guardas en el `WHERE`, ANTES de la primera escritura
+// de la edición) y declaraba su propio límite: no era una transacción, así que
+// una tercera edición podía leer los ítems viejos después de que la ganadora
+// reclamara el token. CL-12 cierra ese límite moviendo el candado ADENTRO de la
+// transacción: el token se escribe en la MISMA sentencia que la edición, con
+// `(versión, estado)` como precondición en su `WHERE` y la fila bloqueada con
+// `FOR UPDATE` (migración 051). Una edición concurrente ESPERA el lock de la fila
+// y después se RECHAZA con `EDIT_CONFLICT` (409) sin escribir una sola fila. El
+// rechazo sigue siendo el MISMO error de negocio accionable de siempre —nunca un
+// 500— y su traducción desde el RPC vive en `toRpcEditError`.
 
 /** Roles que pueden emitir/cobrar/anular (lectura: cualquier rol de la sede). */
 const WRITER_ROLES: RoleCode[] = ["admin", "caja"];
@@ -1004,6 +962,54 @@ function toRpcAnnulError(error: { code?: unknown; message?: unknown } | null): B
   return new BillingError("INTERNAL", "Error interno.", 500);
 }
 
+/**
+ * CL-12: el error del RPC de EDICIÓN (051) traducido al MISMO contrato de negocio
+ * que la edición devolvía antes.
+ *
+ * La forma del error es la de PostgREST —un objeto `{code, message, …}`, no un
+ * `Error`— y todas sus `RAISE EXCEPTION` salen con el MISMO SQLSTATE (P0001: el
+ * de un `RAISE EXCEPTION` plano, que es también el del trigger de stock de 004),
+ * así que lo único confiable es el MENSAJE, igual que en `deductStock` (046) y
+ * en `toRpcAnnulError` (050).
+ *
+ *   * `EDIT_CONFLICT` — la versión o el estado de la fila ya no son los que el
+ *     servicio leyó (otra edición, o una anulación, o un cobro, ganaron la
+ *     carrera): la transacción no escribió NADA. Es el MISMO código, el MISMO
+ *     mensaje y el MISMO 409 que el servicio devolvía cuando perdía el
+ *     compare-and-swap en el cliente (PGRST116). `INVOICE_NOT_FOUND` —la fila
+ *     desapareció entre la lectura y la escritura— sale por el mismo código: en
+ *     el camino viejo también terminaba en EDIT_CONFLICT, porque el `.single()`
+ *     sin filas era el mismo PGRST116.
+ *   * `PRODUCT_NOT_FOUND` — la red de conteo del ajuste: un producto no existe o
+ *     es de otra sede, y la edición NO se aplicó. Es el MISMO 404 que devolvía
+ *     `getProduct` cuando el bucle de ajustes pasaba por `registerMovement`.
+ *   * `INSUFFICIENT_STOCK` — el trigger de stock de 004 rechazó un OUT que
+ *     dejaría el stock negativo (la foto que tomó `planStockDeduction` puede
+ *     haber quedado vieja: la guarda que manda es la del trigger, y corre
+ *     ADENTRO). Es el MISMO 409 y el MISMO mensaje de `registerMovement`.
+ *   * `EDIT_INVALID` (entrada mal formada), `ITEM_MISMATCH`, `PAYMENT_MISMATCH` y
+ *     `TAX_MISMATCH` no deberían poder llegar desde acá: la entrada la arma este
+ *     mismo módulo y los conteos los hace la función. Si llegan, es un fallo real
+ *     y se reporta como INTERNAL en vez de disfrazarse.
+ */
+function toRpcEditError(error: { code?: unknown; message?: unknown } | null): BillingError {
+  const message = String(error?.message ?? "");
+  if (message.includes("EDIT_CONFLICT") || message.includes("INVOICE_NOT_FOUND")) {
+    return new BillingError(
+      "EDIT_CONFLICT",
+      "El estado de la factura cambió entre la lectura y la escritura, o se aplicó otra edición (posible edición simultánea): no se ajustó nada. Vuelva a abrir la factura y repita la edición.",
+      409,
+    );
+  }
+  if (message.includes("INSUFFICIENT_STOCK")) {
+    return new BillingError("INSUFFICIENT_STOCK", "Stock insuficiente para el ajuste.", 409);
+  }
+  if (message.includes("PRODUCT_NOT_FOUND")) {
+    return new BillingError("NOT_FOUND", "Producto no encontrado.", 404);
+  }
+  return new BillingError("INTERNAL", "Error interno.", 500);
+}
+
 // ------------------------------------------------------------------ crear ---
 
 export interface BillingActor {
@@ -1504,6 +1510,63 @@ export async function annulInvoice(
 // ------------------------------------------------------------------ editar ---
 
 /**
+ * CL-12: las columnas de UNA línea de ítem, tal como la edición las escribe.
+ *
+ * Es la MISMA proyección para la actualización y para la inserción (por eso una
+ * sola función: dos listas de columnas al lado de la otra es un lugar donde se
+ * separan sin que nadie lo note), y es la proyección que antes escribía el
+ * cliente en cada `update`/`insert`: el `subtotal` sale de `computeLineSubtotal`
+ * y los campos de comisión de `normalizeCommissionFields`, en TypeScript. La
+ * función de la 051 la escribe verbatim.
+ */
+function editItemColumns(item: EditInvoiceItemInput): Record<string, unknown> {
+  const line = computeLineSubtotal({ qty: item.qty, unit_price: item.unit_price, discount: item.discount });
+  return {
+    item_type: item.item_type,
+    product_id: item.product_id ?? null,
+    service_id: item.service_id ?? null,
+    custom_name: item.custom_name?.trim() || null,
+    employee_id: item.employee_id,
+    qty: item.qty,
+    unit_price: item.unit_price,
+    discount: item.discount,
+    ...normalizeCommissionFields(item),
+    subtotal: line.subtotal,
+  };
+}
+
+/**
+ * CL-12: el ajuste de stock de una edición, computado acá y enviado como DATO.
+ *
+ * El delta es NETO por producto (la suma de las cantidades viejas contra la suma
+ * de las nuevas), y el tipo sale de su signo: OUT si la factura lleva más
+ * unidades que antes, IN si lleva menos. Los deltas que quedan en cero no
+ * escriben un movimiento: no movieron stock. El motivo es el mismo para todos
+ * los movimientos de una edición (el del kardex, con el consecutivo de la
+ * factura) y lo arma el llamador.
+ */
+function buildEditStockMoves(args: {
+  productIds: string[];
+  oldQtyByProduct: Map<string, number>;
+  newQtyByProduct: Map<string, number>;
+  reason: string;
+}): Array<{ product_id: string; type: "IN" | "OUT"; qty: number; reason: string }> {
+  const moves: Array<{ product_id: string; type: "IN" | "OUT"; qty: number; reason: string }> = [];
+  for (const productId of args.productIds) {
+    const delta =
+      (args.newQtyByProduct.get(productId) ?? 0) - (args.oldQtyByProduct.get(productId) ?? 0);
+    if (delta === 0) continue;
+    moves.push({
+      product_id: productId,
+      type: delta > 0 ? "OUT" : "IN",
+      qty: Math.abs(delta),
+      reason: args.reason,
+    });
+  }
+  return moves;
+}
+
+/**
  * Edición admin de factura (total INMUTABLE): corrige ítems y métodos de
  * pago con motivo obligatorio. Reglas:
  * - Empleado/comisión/cant./precio bloqueados si la factura ya entró en
@@ -1512,6 +1575,17 @@ export async function annulInvoice(
  * - Cambios de método solo entre iguales recargos.
  * - ANULADA es terminal: no se edita. Inventario se reajusta por deltas.
  * - Todo queda en audit_logs con motivo + antes/después.
+ *
+ * CL-12: la edición entera —el candado de la 038 incluido— es UNA transacción
+ * (RPC `invoice_edit_items_atomic`, migración 051). Antes eran requests sueltos
+ * —el token, el borrado, las actualizaciones, las altas, los cobros y un
+ * `registerMovement` por producto— y un fallo a mitad dejaba los ítems escritos,
+ * el stock a medias y el token avanzado, con el reintento rechazado por el
+ * propio candado: un callejón sin salida. Ahora o se escriben todas las filas, o
+ * ninguna. Lo que NO cambia: qué se escribe —el diff, los subtotales, el delta
+ * de stock y su motivo— se computa acá, en TypeScript, y viaja como DATO; y la
+ * inmutabilidad del total es ESTRUCTURAL, porque la función no tiene un grupo
+ * capaz de escribir dinero.
  */
 export async function editInvoiceItems(
   sedeId: string,
@@ -1660,96 +1734,83 @@ export async function editInvoiceItems(
     }
   }
 
-  // CO-1: el candado se reclama ANTES de la primera escritura de la edición (y
-  // DESPUÉS de todos los rechazos por regla: un rechazo de negocio no consume
-  // el token de nadie). Si otra edición de esta factura se aplicó entre la
-  // lectura y acá, afecta 0 filas y esta se rechaza con EDIT_CONFLICT sin haber
-  // tocado nada.
-  await claimInvoiceEdit(
-    db,
-    invoiceId,
-    Number(detail.invoice.edit_version),
-    detail.invoice.status,
-  );
-
-  // Aplica: borra, actualiza, inserta, métodos, inventario, auditoría.
+  // CL-12: la edición entera —el candado de la 038 incluido— es UNA transacción
+  // (RPC `invoice_edit_items_atomic`, migración 051). El servicio ya computó TODO
+  // lo que hay que escribir: el diff de `diffInvoiceItems`, el subtotal de cada
+  // línea (`computeLineSubtotal`), el delta NETO por producto con su tipo y el
+  // motivo del kardex. La función sólo escribe filas.
+  //
+  // El candado deja de reclamarse desde el cliente: viaja como la precondición
+  // `(versión, estado)` que la función contrasta contra la fila BLOQUEADA, así que
+  // una edición concurrente ESPERA y se rechaza con `EDIT_CONFLICT` sin escribir
+  // una sola fila. Antes, la perdedora alcanzaba a reclamar su token y el fallo a
+  // mitad de la secuencia dejaba la factura con los ítems escritos, el stock a
+  // medias y el token avanzado —sin forma de reintentar—.
   const editReason = `Ajuste edición factura #${detail.invoice.consecutive_number} — ${motivo.slice(0, 200)}`;
-  try {
-    for (const row of diff.removed) {
-      const { error } = await db.from("invoice_items").delete().eq("id", row.id);
-      if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
-    }
-    for (const { old, next } of diff.changed) {
-      const line = computeLineSubtotal({ qty: next.qty, unit_price: next.unit_price, discount: next.discount });
-      const { error } = await db
-        .from("invoice_items")
-        .update({
-          item_type: next.item_type,
-          product_id: next.product_id ?? null,
-          service_id: next.service_id ?? null,
-          custom_name: next.custom_name?.trim() || null,
-          employee_id: next.employee_id,
-          qty: next.qty,
-          unit_price: next.unit_price,
-          discount: next.discount,
-          ...normalizeCommissionFields(next),
-          subtotal: line.subtotal,
-        })
-        .eq("id", old.id);
-      if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
-    }
-    for (const item of diff.added) {
-      const line = computeLineSubtotal({ qty: item.qty, unit_price: item.unit_price, discount: item.discount });
-      const { error } = await db.from("invoice_items").insert({
-        invoice_id: invoiceId,
-        item_type: item.item_type,
-        product_id: item.product_id ?? null,
-        service_id: item.service_id ?? null,
-        custom_name: item.custom_name?.trim() || null,
-        employee_id: item.employee_id,
-        qty: item.qty,
-        unit_price: item.unit_price,
-        discount: item.discount,
-        ...normalizeCommissionFields(item),
-        subtotal: line.subtotal,
-      });
-      if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
-    }
-    for (const payment of input.payments) {
-      const method = refs.methodByCode.get(payment.method_code);
-      const { error } = await db
-        .from("invoice_payments")
-        .update({ method_code: payment.method_code, method_id: method?.id ?? null })
-        .eq("id", payment.id);
-      if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
-    }
-    const inventoryMoves: Array<{ product_id: string; qty: number; type: "IN" | "OUT" }> = [];
-    for (const productId of productIds) {
-      const delta = (newQtyByProduct.get(productId) ?? 0) - (oldQtyByProduct.get(productId) ?? 0);
-      if (delta === 0) continue;
-      const type = delta > 0 ? "OUT" : "IN";
-      await registerMovement({ product_id: productId, type, qty: Math.abs(delta), reason: editReason }, actor);
-      inventoryMoves.push({ product_id: productId, qty: Math.abs(delta), type });
-    }
-    await writeAudit({
-      sede_id: actor.sedeId,
-      user_id: actor.userId,
-      action: AUDIT_ACTIONS.INVOICE_EDITED,
-      entity: "invoices",
-      entity_id: invoiceId,
-      metadata: {
-        consecutive_number: detail.invoice.consecutive_number,
-        motivo,
-        total: Number(detail.invoice.total),
-        items_before: diff.removed.length + diff.changed.length,
-        items_added: diff.added.length,
-        inventory_moves: inventoryMoves,
-      },
-    });
-  } catch (error) {
-    throw toBillingError(error);
+  const inventoryMoves = buildEditStockMoves({
+    productIds,
+    oldQtyByProduct,
+    newQtyByProduct,
+    reason: editReason,
+  });
+  const { data: written, error: editError } = await db.rpc("invoice_edit_items_atomic", {
+    p_sede_id: sedeId,
+    p_invoice_id: invoiceId,
+    p_user_id: actor.userId,
+    p_expected_version: Number(detail.invoice.edit_version),
+    p_expected_status: detail.invoice.status,
+    p_edit: {
+      items_remove: diff.removed.map((row) => row.id),
+      items_update: diff.changed.map(({ old, next }) => ({ id: old.id, ...editItemColumns(next) })),
+      items_insert: diff.added.map((item) => editItemColumns(item)),
+      // Los cobros: los MISMOS ids y los MISMOS montos (la igualdad de ids ya se
+      // validó arriba); lo único que cambia es el método, y su recargo igual.
+      payments: input.payments.map((payment) => ({
+        id: payment.id,
+        method_code: payment.method_code,
+        method_id: refs.methodByCode.get(payment.method_code)?.id ?? null,
+      })),
+      movements: inventoryMoves,
+    },
+  });
+  if (editError || !written) {
+    throw toRpcEditError(editError as { code?: unknown; message?: unknown } | null);
   }
-  return loadDetail(db, { ...detail.invoice } as InvoiceRow);
+
+  // Segunda barrera en la frontera: la función ya revierte si escribió menos de
+  // lo pedido, así que un conteo distinto sólo puede venir de una respuesta
+  // incoherente. Se reporta como fallo real en vez de devolver un detalle que la
+  // base no escribió.
+  const result = written as { invoice: InvoiceRow; items: number; movements: number };
+  if (
+    result.items !== diff.removed.length + diff.changed.length + diff.added.length ||
+    result.movements !== inventoryMoves.length
+  ) {
+    throw new BillingError("INTERNAL", "Error interno.", 500);
+  }
+
+  // La auditoría queda FUERA de la transacción (el mismo límite que 049 y 050):
+  // es un INSERT posterior y `writeAudit` no lanza, así que a lo sumo falta la
+  // fila de auditoría, nunca una escritura a medias. Las cifras son las de
+  // siempre, con el motivo y los movimientos que el servicio CREYÓ escribir.
+  await writeAudit({
+    sede_id: actor.sedeId,
+    user_id: actor.userId,
+    action: AUDIT_ACTIONS.INVOICE_EDITED,
+    entity: "invoices",
+    entity_id: invoiceId,
+    metadata: {
+      consecutive_number: detail.invoice.consecutive_number,
+      motivo,
+      total: Number(detail.invoice.total),
+      items_before: diff.removed.length + diff.changed.length,
+      items_added: diff.added.length,
+      inventory_moves: inventoryMoves.map(({ product_id, qty, type }) => ({ product_id, qty, type })),
+    },
+  });
+  // La fila ESCRITA por la transacción (no la leída): sin una segunda lectura y
+  // sin su ventana.
+  return loadDetail(db, result.invoice);
 }
 
 /**
@@ -1761,6 +1822,16 @@ export async function editInvoiceItems(
  *
  * Separa el camino de la edición admin estricta (editInvoiceItems): Pagada
  * sigue con motivo obligatorio + total inmutable; Anulada es terminal.
+ *
+ * CL-12: la edición libre entera —el candado de la 038 incluido— es UNA
+ * transacción (RPC `invoice_edit_emitted_atomic`, migración 051), la MISMA forma
+ * de la admin MÁS el REEMPLAZO del snapshot de impuestos y los totales
+ * recalculados. El reemplazo es lo que la vuelve distinta: entre el `DELETE` del
+ * snapshot viejo y el `INSERT` del nuevo había una ventana en la que la factura
+ * quedaba SIN impuestos —que no es ni el snapshot anterior ni el nuevo—, y el
+ * cierre de turno se firmaba ARRIBA de ese estado. Ahora las dos mitades del
+ * reemplazo —y los totales, y el stock— son la misma transacción: o queda la
+ * colección ANTERIOR completa, o queda la NUEVA completa.
  */
 export async function editEmittedInvoiceItems(
   sedeId: string,
@@ -1981,138 +2052,106 @@ export async function editEmittedInvoiceItems(
     }
   }
 
-  // CO-1: el candado se reclama ANTES de la primera escritura de la edición (y
-  // DESPUÉS de todos los rechazos por regla: un rechazo de negocio no consume el
-  // token). La edición libre SÍ reescribe la fila (totales) más adelante; el
-  // candado va primero para que la perdedora no alcance a escribir ni un ítem.
-  await claimInvoiceEdit(
-    db,
-    invoiceId,
-    Number(detail.invoice.edit_version),
-    detail.invoice.status,
-  );
-
-  // Aplica: ítems, métodos, snapshot de impuestos, totales, inventario, auditoría.
+  // CL-12: la edición libre entera —el candado de la 038 incluido— es UNA
+  // transacción (RPC `invoice_edit_emitted_atomic`, migración 051). Es la MISMA
+  // forma que la edición admin MÁS el REEMPLAZO del snapshot de impuestos y los
+  // totales recalculados, que es lo que esta edición agrega: los tres siguen
+  // computándose acá y viajan como DATO.
+  //
+  // El candado deja de reclamarse desde el cliente: viaja como la precondición
+  // `(versión, estado)` que la función contrasta contra la fila BLOQUEADA. Antes,
+  // la perdedora reclamaba el token y el fallo a mitad de la secuencia dejaba los
+  // ítems, los impuestos y los totales escritos, el stock a medias y el token
+  // avanzado —con el cierre de turno firmándose arriba de ese estado—.
   const editReason = `Edición libre emitida factura #${detail.invoice.consecutive_number}${motivo ? ` — ${motivo.slice(0, 200)}` : ""}`;
-  try {
-    for (const row of diff.removed) {
-      const { error } = await db.from("invoice_items").delete().eq("id", row.id);
-      if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
-    }
-    for (const { old, next } of diff.changed) {
-      const line = computeLineSubtotal({ qty: next.qty, unit_price: next.unit_price, discount: next.discount });
-      const { error } = await db
-        .from("invoice_items")
-        .update({
-          item_type: next.item_type,
-          product_id: next.product_id ?? null,
-          service_id: next.service_id ?? null,
-          custom_name: next.custom_name?.trim() || null,
-          employee_id: next.employee_id,
-          qty: next.qty,
-          unit_price: next.unit_price,
-          discount: next.discount,
-          ...normalizeCommissionFields(next),
-          subtotal: line.subtotal,
-        })
-        .eq("id", old.id);
-      if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
-    }
-    for (const item of diff.added) {
-      const line = computeLineSubtotal({ qty: item.qty, unit_price: item.unit_price, discount: item.discount });
-      const { error } = await db.from("invoice_items").insert({
-        invoice_id: invoiceId,
-        item_type: item.item_type,
-        product_id: item.product_id ?? null,
-        service_id: item.service_id ?? null,
-        custom_name: item.custom_name?.trim() || null,
-        employee_id: item.employee_id,
-        qty: item.qty,
-        unit_price: item.unit_price,
-        discount: item.discount,
-        ...normalizeCommissionFields(item),
-        subtotal: line.subtotal,
-      });
-      if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
-    }
-    for (const payment of input.payments) {
-      const method = refs.methodByCode.get(payment.method_code);
-      const { error } = await db
-        .from("invoice_payments")
-        .update({ method_code: payment.method_code, method_id: method?.id ?? null })
-        .eq("id", payment.id);
-      if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
-    }
-    const { error: taxesDeleteError } = await db.from("invoice_taxes").delete().eq("invoice_id", invoiceId);
-    if (taxesDeleteError) throw new BillingError("INTERNAL", "Error interno.", 500);
-    if (totals.taxes.length > 0) {
-      const { error: taxesError } = await db.from("invoice_taxes").insert(
-        totals.taxes.map((tax) => ({
-          invoice_id: invoiceId,
-          tax_code: tax.tax_code,
-          tax_name: tax.tax_name,
-          percent: tax.percent,
-          amount: tax.amount,
-        })),
-      );
-      if (taxesError) throw new BillingError("INTERNAL", "Error interno.", 500);
-    }
-    const { data: updated, error: updateError } = await db
-      .from("invoices")
-      .update({
+  const inventoryMoves = buildEditStockMoves({
+    productIds,
+    oldQtyByProduct,
+    newQtyByProduct,
+    reason: editReason,
+  });
+  const { data: written, error: editError } = await db.rpc("invoice_edit_emitted_atomic", {
+    p_sede_id: sedeId,
+    p_invoice_id: invoiceId,
+    p_user_id: actor.userId,
+    p_expected_version: Number(detail.invoice.edit_version),
+    p_expected_status: detail.invoice.status,
+    p_edit: {
+      items_remove: diff.removed.map((row) => row.id),
+      items_update: diff.changed.map(({ old, next }) => ({ id: old.id, ...editItemColumns(next) })),
+      items_insert: diff.added.map((item) => editItemColumns(item)),
+      payments: input.payments.map((payment) => ({
+        id: payment.id,
+        method_code: payment.method_code,
+        method_id: refs.methodByCode.get(payment.method_code)?.id ?? null,
+      })),
+      movements: inventoryMoves,
+      // El REEMPLAZO del snapshot: los ids del que se LEYÓ y el que se computó,
+      // con su monto ya calculado por `snapshotInvoiceTaxes` (FAC-03).
+      taxes_remove: detail.taxes.map((tax) => tax.id),
+      taxes: totals.taxes.map((tax) => ({
+        tax_code: tax.tax_code,
+        tax_name: tax.tax_name,
+        percent: tax.percent,
+        amount: tax.amount,
+      })),
+      // Y los cinco números de la factura: los que computó `computeInvoiceTotals`
+      // (más el recargo EMITIDO que esta edición conserva, ya sumado en
+      // `newTotal`).
+      totals: {
         subtotal: totals.subtotal,
         discount: totals.discount,
         tax: totals.tax,
         surcharge,
         total: newTotal,
-      })
-      .eq("id", invoiceId)
-      .select(INVOICE_SELECT)
-      .single();
-    if (updateError || !updated) throw new BillingError("INTERNAL", "Error interno.", 500);
-    const inventoryMoves: Array<{ product_id: string; qty: number; type: "IN" | "OUT" }> = [];
-    for (const productId of productIds) {
-      const delta = (newQtyByProduct.get(productId) ?? 0) - (oldQtyByProduct.get(productId) ?? 0);
-      if (delta === 0) continue;
-      const type = delta > 0 ? "OUT" : "IN";
-      await registerMovement({ product_id: productId, type, qty: Math.abs(delta), reason: editReason }, actor);
-      inventoryMoves.push({ product_id: productId, qty: Math.abs(delta), type });
-    }
-    await writeAudit({
-      sede_id: actor.sedeId,
-      user_id: actor.userId,
-      action: AUDIT_ACTIONS.INVOICE_EDITED,
-      entity: "invoices",
-      entity_id: invoiceId,
-      metadata: {
-        consecutive_number: detail.invoice.consecutive_number,
-        modo: "libre_emitida",
-        motivo,
-        admin_override: isAdmin && detail.invoice.user_id !== actor.userId,
-        total_antes: Number(detail.invoice.total),
-        total_nuevo: newTotal,
-        // La confirmación convierte el sobre-cobro en un acto DELIBERADO y
-        // explicable después: la MISMA acción INVOICE_EDITED (la que ya cubre
-        // esta edición) deja el rastro de que hubo confirmación y las cifras del
-        // aviso. No se inventa una acción nueva: `AUDIT_ACTIONS` es el
-        // vocabulario cerrado del sistema (src/shared/lib/audit.ts) y este
-        // ajuste ya se audita como INVOICE_EDITED.
-        ...(sobreCobro
-          ? {
-              bajo_cobrado_confirmado: true,
-              cobrado_neto: sobreCobro.cobrado,
-              bajo_cobrado_diferencia: sobreCobro.diferencia,
-            }
-          : {}),
-        items_before: diff.removed.length + diff.changed.length,
-        items_added: diff.added.length,
-        inventory_moves: inventoryMoves,
       },
-    });
-    return loadDetail(db, updated as InvoiceRow);
-  } catch (error) {
-    throw toBillingError(error);
+    },
+  });
+  if (editError || !written) {
+    throw toRpcEditError(editError as { code?: unknown; message?: unknown } | null);
   }
+
+  // Segunda barrera en la frontera (la misma de la edición admin).
+  const result = written as { invoice: InvoiceRow; items: number; movements: number };
+  if (
+    result.items !== diff.removed.length + diff.changed.length + diff.added.length ||
+    result.movements !== inventoryMoves.length
+  ) {
+    throw new BillingError("INTERNAL", "Error interno.", 500);
+  }
+
+  await writeAudit({
+    sede_id: actor.sedeId,
+    user_id: actor.userId,
+    action: AUDIT_ACTIONS.INVOICE_EDITED,
+    entity: "invoices",
+    entity_id: invoiceId,
+    metadata: {
+      consecutive_number: detail.invoice.consecutive_number,
+      modo: "libre_emitida",
+      motivo,
+      admin_override: isAdmin && detail.invoice.user_id !== actor.userId,
+      total_antes: Number(detail.invoice.total),
+      total_nuevo: newTotal,
+      // La confirmación convierte el sobre-cobro en un acto DELIBERADO y
+      // explicable después: la MISMA acción INVOICE_EDITED (la que ya cubre
+      // esta edición) deja el rastro de que hubo confirmación y las cifras del
+      // aviso. No se inventa una acción nueva: `AUDIT_ACTIONS` es el
+      // vocabulario cerrado del sistema (src/shared/lib/audit.ts) y este
+      // ajuste ya se audita como INVOICE_EDITED.
+      ...(sobreCobro
+        ? {
+            bajo_cobrado_confirmado: true,
+            cobrado_neto: sobreCobro.cobrado,
+            bajo_cobrado_diferencia: sobreCobro.diferencia,
+          }
+        : {}),
+      items_before: diff.removed.length + diff.changed.length,
+      items_added: diff.added.length,
+      inventory_moves: inventoryMoves.map(({ product_id, qty, type }) => ({ product_id, qty, type })),
+    },
+  });
+  return loadDetail(db, result.invoice);
 }
 
 /** ¿Alguna línea de `detail_json` menciona esta factura? */
