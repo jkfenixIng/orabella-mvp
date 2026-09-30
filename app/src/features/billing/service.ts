@@ -97,6 +97,17 @@ function validationMessage(error: { issues: Array<{ message: string }> }): strin
  * código que la anulación de factura mapea a `ANNUL_CONFLICT` y el cierre de
  * caja a `SHIFT_ALREADY_CLOSED`.
  *
+ * CL-1: la precondición es `(estado, versión)`, no solo la versión, porque el
+ * estado es la OTRA mitad de la decisión. La edición decide con el estado que
+ * LEYÓ —Anulada es terminal y la edición libre rechaza Pagada— y esa lectura no
+ * es la fila: entre el `read` y este candado cabe una anulación (que revierte
+ * stock) o un cobro que cierre la factura. Sin la guarda de estado, esa edición
+ * en vuelo se aplicaba igual sobre la fila ya terminal: los ítems, el stock y
+ * las comisiones quedaban escritos DESPUÉS del hecho. La forma es la del hermano
+ * `annulInvoice` (`.eq("id", …).eq("status", …)`). Las 0 filas siguen saliendo
+ * por el MISMO `EDIT_CONFLICT` (409): lo que cambia para la carrera es el
+ * mensaje, que ahora también nombra el estado.
+ *
  * LÍMITE CONOCIDO (CO-1, declarado y no escondido): el candado cubre la ventana
  * lectura→primera escritura, que es la del hallazgo; NO es una transacción. Si
  * la ganadora ya reclamó el token y una tercera edición alcanza a leer los ítems
@@ -110,12 +121,14 @@ async function claimInvoiceEdit(
   db: DbClient,
   invoiceId: string,
   expectedVersion: number,
+  expectedStatus: string,
 ): Promise<void> {
   const { data, error } = await db
     .from("invoices")
     .update({ edit_version: expectedVersion + 1 })
     .eq("id", invoiceId)
     .eq("edit_version", expectedVersion)
+    .eq("status", expectedStatus)
     .select("id")
     .single();
   if (error || !data) {
@@ -123,7 +136,7 @@ async function claimInvoiceEdit(
     if (errorCode === "PGRST116") {
       throw new BillingError(
         "EDIT_CONFLICT",
-        "Otra edición de esta factura se aplicó entre la lectura y la escritura (posible edición simultánea): no se ajustó nada. Vuelva a abrir la factura y repita la edición.",
+        "El estado de la factura cambió entre la lectura y la escritura, o se aplicó otra edición (posible edición simultánea): no se ajustó nada. Vuelva a abrir la factura y repita la edición.",
         409,
       );
     }
@@ -1593,7 +1606,12 @@ export async function editInvoiceItems(
   // el token de nadie). Si otra edición de esta factura se aplicó entre la
   // lectura y acá, afecta 0 filas y esta se rechaza con EDIT_CONFLICT sin haber
   // tocado nada.
-  await claimInvoiceEdit(db, invoiceId, Number(detail.invoice.edit_version));
+  await claimInvoiceEdit(
+    db,
+    invoiceId,
+    Number(detail.invoice.edit_version),
+    detail.invoice.status,
+  );
 
   // Aplica: borra, actualiza, inserta, métodos, inventario, auditoría.
   const editReason = `Ajuste edición factura #${detail.invoice.consecutive_number} — ${motivo.slice(0, 200)}`;
@@ -1908,7 +1926,12 @@ export async function editEmittedInvoiceItems(
   // DESPUÉS de todos los rechazos por regla: un rechazo de negocio no consume el
   // token). La edición libre SÍ reescribe la fila (totales) más adelante; el
   // candado va primero para que la perdedora no alcance a escribir ni un ítem.
-  await claimInvoiceEdit(db, invoiceId, Number(detail.invoice.edit_version));
+  await claimInvoiceEdit(
+    db,
+    invoiceId,
+    Number(detail.invoice.edit_version),
+    detail.invoice.status,
+  );
 
   // Aplica: ítems, métodos, snapshot de impuestos, totales, inventario, auditoría.
   const editReason = `Edición libre emitida factura #${detail.invoice.consecutive_number}${motivo ? ` — ${motivo.slice(0, 200)}` : ""}`;
@@ -2118,12 +2141,59 @@ async function readAllClosedPeriods(db: DbClient, sedeId: string): Promise<strin
 // ------------------------------------------------------------------ cobrar ---
 
 /**
+ * CL-2: las porciones de un cobro que YA se registraron con esa marca, si las
+ * hay.
+ *
+ * La marca es un uuid que genera la PANTALLA al empezar el intento de cobro y
+ * que viaja en el cuerpo; se reutiliza en los reintentos del MISMO intento. El
+ * filtro es por FACTURA: la marca se resuelve dentro de la factura que la usó
+ * (la que identifica la URL), así que el lookup nunca puede devolver el cobro
+ * de otra factura. Las porciones hermanas de una misma operación no llevan
+ * marca (ver 042), así que esto devuelve la operación por su fila de identidad;
+ * la respuesta de la repetición no depende de esto (devuelve el detalle
+ * completo de la factura).
+ */
+async function findInvoicePaymentsByIdempotencyKey(
+  db: DbClient,
+  invoiceId: string,
+  idempotencyKey: string,
+): Promise<InvoicePaymentRow[]> {
+  const { data, error } = await db
+    .from("invoice_payments")
+    .select(`${PAYMENT_SELECT}, idempotency_key`)
+    .eq("invoice_id", invoiceId)
+    .eq("idempotency_key", idempotencyKey);
+  if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
+  return (data ?? []) as InvoicePaymentRow[];
+}
+
+/**
  * FAC-07: registra porciones de pago (métodos activos) contra el saldo.
  * Rechaza sobrepago; si las porciones completan el total → Pagada.
  * Solo admin/caja (vía requireBillingWriter en rutas/actions).
  *
  * B1: pagar NO mueve stock — el descuento ocurrió al emitir (momento
  * único FAC-06). Descontar aquí duplicaría la salida.
+ *
+ * CL-2 (idempotencia): el orden empieza por la MARCA
+ * (`idempotency_key`, migración 042), después de saber que la factura existe y
+ * no está Anulada, y ANTES de leer el saldo, de las guardas de turno y de
+ * cualquier escritura. Un reintento del MISMO envío devuelve el detalle ya
+ * cobrado como un no-op EXITOSO.
+ *
+ * POR QUÉ ANTES DEL SALDO: el cobro exige que las porciones igualen el saldo
+ * EXACTO. Después de un cobro bueno el saldo queda en cero, así que el
+ * reintento no es que "cobre dos veces": moría con OVERPAID y el usuario veía
+ * un error por una operación que sí se registró. La marca se mira antes para
+ * que la repetición se reconozca en vez de confundirse con un cobro nuevo.
+ *
+ * POR QUÉ DESPUÉS DE LA ANULACIÓN Y NO ANTES DE LAS GUARDAS DE TURNO: la
+ * anulación es una guarda de estado sobre el dinero de la factura y va primero
+ * (una factura anulada no admite cobros, repetidos o no); las guardas de turno
+ * son sobre QUIÉN cobra y no sobre la repetición, así que una repetición —que
+ * no escribe nada— no depende de que la caja siga abierta ni de que el turno
+ * siga siendo del mismo cajero. La autorización del llamador (requireBillingWriter)
+ * sigue aplicándose en la action y en la ruta.
  */
 export async function splitPayment(
   sedeId: string,
@@ -2140,6 +2210,18 @@ export async function splitPayment(
   if (detail.invoice.status === "Anulada") {
     throw new BillingError("ANNUL_INVALID", annulBlockedMessage("Anulada"), 409);
   }
+
+  // CL-2: la MARCA primero, ANTES de leer el saldo y antes de cualquier
+  // escritura. Un reintento (doble clic, o el navegador reenviando tras
+  // cortarse la red) trae la MISMA marca: se devuelve el detalle que ya quedó
+  // cobrado y no se escribe nada. Sin esto, el reintento moría con OVERPAID
+  // (el saldo ya está en cero) sin reconocerse como repetición.
+  const repeated = await findInvoicePaymentsByIdempotencyKey(
+    db,
+    id,
+    parsed.data.idempotency_key,
+  );
+  if (repeated.length > 0) return getInvoiceDetail(sedeId, id);
 
   // F2: el cobro exige caja abierta (CAJ-02). Solo la caja dueña del
   // turno o un administrador puede pagar o anular.
@@ -2211,7 +2293,12 @@ export async function splitPayment(
   const payShift = openShift;
 
   const { error: insertError } = await db.from("invoice_payments").insert(
-    fees.map((fee) => ({
+    // CL-2: UNA sola sentencia multi-fila y la MARCA SÓLO en la primera
+    // porción (las demás NULL). Es lo que hace sonora la forma: el índice único
+    // parcial (042) no rechaza a una operación legítima de varias porciones, y
+    // el choque aborta la sentencia ENTERA, así que ninguna porción duplicada
+    // puede sobrevivir.
+    fees.map((fee, index) => ({
       invoice_id: id,
       method_id: refs.methodByCode.get(fee.method_code)?.id ?? null,
       method_code: fee.method_code,
@@ -2219,13 +2306,35 @@ export async function splitPayment(
       fee_percent: fee.feePercent,
       fee_amount: fee.fee,
       cash_shift_id: payShift.id,
+      idempotency_key: index === 0 ? parsed.data.idempotency_key : null,
     })),
   );
   if (insertError) {
-    // Carrera perdida contra trg_invoice_payments_cap (031): mismo P0001 que
-    // nómina traduce en payroll/service.ts.
-    if ((insertError as { code?: string }).code === "P0001") {
-      throw new BillingError("OVERPAID", "Las porciones superan el saldo pendiente.", 422);
+    // Dos barreras pueden rechazar este INSERT, y el código lo dice: el tope de
+    // 031 (trigger BEFORE INSERT → P0001) y el índice único parcial de identidad
+    // de la 042 (23505). El orden depende de cuál llegue primero —el trigger de
+    // fila corre ANTES de la comprobación del índice—, así que las dos se
+    // atienden igual: si la marca YA está registrada, esto es una repetición y
+    // la respuesta es el detalle de la ganadora.
+    const code = (insertError as { code?: string } | null)?.code;
+    if (code === "23505" || code === "P0001") {
+      // COSTO DECLARADO: acá no se quema ningún número (`invoice_payments` no
+      // tiene consecutivo); lo que se pierde es la sentencia ABORTADA de la
+      // perdedora, que ya había leído el saldo. Se prefiere eso —raro, y exige
+      // dos envíos con la misma marca solapados— antes que cobrar dos veces.
+      // (La factura tampoco pasa a Pagada dos veces: el UPDATE va después y es
+      // idempotente por estado.)
+      const winner = await findInvoicePaymentsByIdempotencyKey(
+        db,
+        id,
+        parsed.data.idempotency_key,
+      );
+      if (winner.length > 0) return getInvoiceDetail(sedeId, id);
+      // Sin cobro con esa marca, el rechazo es el de siempre: el tope.
+      if (code === "P0001") {
+        throw new BillingError("OVERPAID", "Las porciones superan el saldo pendiente.", 422);
+      }
+      throw new BillingError("INTERNAL", "Error interno.", 500);
     }
     throw new BillingError("INTERNAL", "Error interno.", 500);
   }

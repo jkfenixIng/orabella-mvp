@@ -543,6 +543,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setDetail(null);
     setMotivo("");
     setSplitDraft({ method_code: "efectivo", amount: "" });
+    // CL-2: cerrar el desglose abandona cualquier cobro a medias; el próximo
+    // cobro es otro intento y acuña su propia marca.
+    payKeyRef.current = null;
     setDetailDialogOpen(false);
   }
 
@@ -752,6 +755,28 @@ export function InvoicesClient(props: InvoicesClientProps) {
    */
   const emissionKeyRef = useRef<string | null>(null);
 
+  /**
+   * CL-2: marca de idempotencia del INTENTO de cobro (splitPayment).
+   *
+   * Misma mecánica que la emisión: se acuña cuando el intento EMPIEZA (al
+   * confirmar el cobro) y se conserva mientras se reintenta —si la red se corta
+   * y el usuario vuelve a confirmar, el servidor recibe la MISMA marca y
+   * devuelve el detalle ya cobrado en vez de tratarlo como un cobro nuevo—. Se
+   * renueva cuando el intento terminó bien, y al cancelar la confirmación: si
+   * el cobro se abandona, el próximo intento es otro y no puede heredar la marca.
+   *
+   * No es por tecla ni por render: el borrador del cobro (método y monto) cambia
+   * libremente sin tocar la marca, así que dos cobros legítimos distintos son dos
+   * intentos con dos marcas.
+   */
+  const payKeyRef = useRef<string | null>(null);
+
+  /** Cancelar la confirmación abandona el intento: se suelta su marca (CL-2). */
+  function cancelConfirm() {
+    if (confirmKind === "pay") payKeyRef.current = null;
+    setConfirmKind(null);
+  }
+
   async function confirmEmit() {
     const payload = buildCreatePayload();
     if (payload === null) {
@@ -956,18 +981,28 @@ export function InvoicesClient(props: InvoicesClientProps) {
     }
     setError(null);
     setBusy(true);
+    // CL-2: la marca del INTENTO. Se acuña al empezar y se conserva si el
+    // intento falla: el reintento (confirmar otra vez, sobre el mismo diálogo)
+    // tiene que llevar la misma para que el servidor reconozca la repetición.
+    const payKey = payKeyRef.current ?? crypto.randomUUID();
+    payKeyRef.current = payKey;
     let result: ActionResult<InvoiceDetail>;
     try {
       result = await splitPaymentAction(detail.invoice.id, {
+        idempotency_key: payKey,
         portions: [{ method_code: splitDraft.method_code, amount }],
       });
     } finally {
       setBusy(false);
     }
     if (!result.success) {
+      // El intento NO terminó: se conserva la marca para el reintento.
       setError(`[${result.code}] ${result.message}`);
       return;
     }
+    // El intento terminó bien: el próximo cobro es OTRO intento y merece otra
+    // marca (si no, devolvería este mismo cobro).
+    payKeyRef.current = null;
     // EVENTO: el cobro acaba de registrarse; efímero, no estado.
     toast.success(
       result.data.invoice.status === "Pagada"
@@ -3076,7 +3111,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
       <Dialog
         open={confirmKind !== null}
         onOpenChange={(open) => {
-          if (!open && !busy) setConfirmKind(null);
+          if (!open && !busy) cancelConfirm();
         }}
       >
         <DialogContent className="max-w-sm border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
@@ -3114,7 +3149,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
             <div className="flex flex-wrap items-center justify-end gap-3 px-6 py-4">
               <button
                 type="button"
-                onClick={() => setConfirmKind(null)}
+                onClick={cancelConfirm}
                 disabled={busy}
                 className="h-10 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-paper-ink-secondary hover:bg-paper-surface-muted disabled:opacity-50"
               >

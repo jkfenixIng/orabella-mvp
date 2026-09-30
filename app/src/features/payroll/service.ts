@@ -1441,12 +1441,78 @@ async function getItemOrThrow(db: DbClient, sedeId: string, id: string): Promise
 }
 
 /**
+ * CL-2: las porciones que YA se registraron con esa marca, si las hay.
+ *
+ * La marca es un uuid que genera la PANTALLA al empezar el intento de pago y
+ * que viaja en el cuerpo; se reutiliza en los reintentos del MISMO intento. El
+ * filtro es por ÍTEM: la marca se resuelve dentro del ítem que la usó (el que
+ * identifica la URL), así que el lookup nunca puede devolver el pago de otro
+ * ítem. Devuelve las filas MARCADAS: para una operación de varias porciones es
+ * la fila de IDENTIDAD de la operación, no sus hermanas (no llevan marca: ver
+ * 042). El monto real no queda a medias igual —el acumulado se relee aparte—,
+ * y es el costo declarado de la opción elegida (la marca en la primera
+ * porción, sin columna de ordinal).
+ */
+async function findPayrollPaymentsByIdempotencyKey(
+  db: DbClient,
+  itemId: string,
+  idempotencyKey: string,
+): Promise<PayrollPaymentRow[]> {
+  const { data, error } = await db
+    .from("payroll_payments")
+    .select(`${PAYMENT_SELECT}, idempotency_key`)
+    .eq("payroll_item_id", itemId)
+    .eq("idempotency_key", idempotencyKey);
+  if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+  return (data ?? []) as PayrollPaymentRow[];
+}
+
+/**
+ * CL-2: total YA pagado del ítem, en peso entero. Es la lectura del acumulado
+ * que decide el tope, y la que devuelve el estado real en los caminos donde el
+ * servicio NO escribe (repetición reconocida y carrera perdida).
+ */
+async function readPaidTotal(db: DbClient, itemId: string): Promise<number> {
+  const { data, error } = await db
+    .from("payroll_payments")
+    .select("amount")
+    .eq("payroll_item_id", itemId);
+  if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+  return roundMoney(
+    ((data ?? []) as Array<{ amount: number | string }>).reduce(
+      (acc, row) => acc + Number(row.amount),
+      0,
+    ),
+  );
+}
+
+/**
  * PAY-04: paga un ítem en porciones por método (métodos activos de la
  * sede, montos > 0). Acepta abonos parciales (40% + 40% + 20% en una o
  * varias llamadas); el acumulado nunca excede el neto (además del trigger
  * trg_payroll_payments_cap). Periodo cerrado → PERIOD_CLOSED.
  * Solo admin (vía requirePayrollAdmin en rutas/actions): pagar un ítem es parte
  * de liquidar la nómina, y el módulo de nómina no es de caja.
+ *
+ * CL-2 (idempotencia): el orden empieza por la MARCA
+ * (`idempotency_key`, migración 042), DESPUÉS de las guardas de estado —el
+ * período cerrado es un candado de dinero (PAY-01) y va primero— y ANTES de
+ * leer el acumulado y de insertar. Un reintento del MISMO envío (doble clic, o
+ * el navegador reenviando tras cortarse la red) se reconoce y devuelve el
+ * resultado ya registrado como un no-op EXITOSO: no vuelve a pagar. Antes de
+ * esto, con 2 × entrante ≤ saldo el reintento pagaba DOS veces, y el tope de
+ * 007 no lo veía porque no salta: un tope no es una identidad.
+ *
+ * Las porciones entran en UNA sola sentencia multi-fila y la marca vive SÓLO en
+ * la primera (el resto NULL): por eso el índice único parcial `(payroll_item_id,
+ * idempotency_key)` no rechaza a una operación de varias porciones, y el 23505
+ * de una repetición aborta la sentencia entera —ninguna porción sobrevive
+ * (ver 042, "una operación no es una fila")—.
+ *
+ * COSTO DECLARADO: acá NO se quema ningún número, porque `payroll_payments` no
+ * tiene consecutivo (`id` es uuid). Lo que cuesta la carrera es una sentencia
+ * ABORTADA: la perdedora ya había leído el acumulado cuando chocó con el
+ * índice, y esa sentencia no deja filas.
  */
 export async function payPayrollItem(
   sedeId: string,
@@ -1468,6 +1534,31 @@ export async function payPayrollItem(
       throw toPayrollError(error);
     }
 
+    // CL-2: la MARCA primero, ANTES de leer el acumulado y antes de cualquier
+    // escritura —y antes de revalidar catálogos: una repetición ya registrada no
+    // necesita volver a validar el método con el que se pagó entonces—.
+    // El candado del período cerrado va antes que esto a propósito: es una
+    // guarda de estado sobre el dinero (PAY-01) y no cambia entre el intento y
+    // su reintento (pagar no cierra el período).
+    const repeated = await findPayrollPaymentsByIdempotencyKey(
+      db,
+      itemId,
+      parsed.data.idempotency_key,
+    );
+    if (repeated.length > 0) {
+      // El intento ya está registrado: no-op EXITOSO para el llamador, con el
+      // mismo estado que devolvió la primera vez y CERO escrituras. El total se
+      // relee en vez de suponerlo: es el acumulado real del ítem, y por eso el
+      // `paid`/`remaining` de la repetición son exactos aunque la operación
+      // tuviera varias porciones. `payments` trae las filas MARCADAS (la
+      // identidad de la operación): las hermanas no llevan marca y no se
+      // pueden atribuir a esta operación sin adivinar (costo declarado de la
+      // forma elegida, ver 042).
+      const paid = await readPaidTotal(db, itemId);
+      const net = roundMoney(Number(item.net_pay));
+      return { item, paid, remaining: roundMoney(Math.max(0, net - paid)), payments: repeated };
+    }
+
     const methods = await listPaymentMethods(sedeId).catch((error) => {
       throw toPayrollError(error);
     });
@@ -1482,17 +1573,7 @@ export async function payPayrollItem(
       }
     }
 
-    const { data: existing, error: existingError } = await db
-      .from("payroll_payments")
-      .select("amount")
-      .eq("payroll_item_id", itemId);
-    if (existingError) throw new PayrollError("INTERNAL", "Error interno.", 500);
-    const alreadyPaid = roundMoney(
-      ((existing ?? []) as Array<{ amount: number | string }>).reduce(
-        (acc, row) => acc + Number(row.amount),
-        0,
-      ),
-    );
+    const alreadyPaid = await readPaidTotal(db, itemId);
     const net = roundMoney(Number(item.net_pay));
     const incoming = roundMoney(parsed.data.portions.reduce((acc, row) => acc + Number(row.amount), 0));
     try {
@@ -1504,17 +1585,54 @@ export async function payPayrollItem(
     const { data: inserted, error: insertError } = await db
       .from("payroll_payments")
       .insert(
-        parsed.data.portions.map((portion) => ({
+        // CL-2: UNA sola sentencia multi-fila y la MARCA SÓLO en la primera
+        // porción (las demás NULL). Es lo que hace sonora la forma: el índice
+        // único parcial (042) no rechaza a una operación legítima de varias
+        // porciones, y el 23505 de una repetición aborta la sentencia ENTERA,
+        // así que ninguna porción duplicada puede sobrevivir.
+        parsed.data.portions.map((portion, index) => ({
           payroll_item_id: itemId,
           method_id: activeByCode.get(portion.method_code)?.id ?? null,
           method_code: portion.method_code,
           amount: roundMoney(Number(portion.amount)),
           paid_by: actor.userId,
           reference: portion.reference?.trim() || null,
+          idempotency_key: index === 0 ? parsed.data.idempotency_key : null,
         })),
       )
       .select(PAYMENT_SELECT);
     if (insertError) {
+      // Dos barreras pueden rechazar este INSERT, y el código lo dice: el tope
+      // de 007 (trigger BEFORE INSERT → P0001) y el índice único parcial de
+      // identidad de la 042 (23505).
+      if ((insertError as { code?: string }).code === "23505") {
+        // Carrera contra el índice: otra operación con la MISMA marca se
+        // confirmó entre el lookup de arriba y este INSERT. Su operación es la
+        // respuesta y esta no escribe nada —el 23505 aborta la sentencia
+        // entera, así que no quedó ninguna porción a medias—.
+        //
+        // COSTO DECLARADO: acá no se quema ningún número (`payroll_payments` no
+        // tiene consecutivo); lo que se pierde es la sentencia abortada. Se
+        // prefiere eso —raro, y exige dos envíos con la misma marca solapados—
+        // antes que pagar dos veces.
+        const winner = await findPayrollPaymentsByIdempotencyKey(
+          db,
+          itemId,
+          parsed.data.idempotency_key,
+        );
+        if (winner.length > 0) {
+          const paid = await readPaidTotal(db, itemId);
+          return {
+            item,
+            paid,
+            remaining: roundMoney(Math.max(0, net - paid)),
+            payments: winner,
+          };
+        }
+        // Sin operación con esa marca, el choque no es de identidad: es un
+        // fallo real y se reporta como tal (no hay "ganadora" que devolver).
+        throw new PayrollError("INTERNAL", "Error interno.", 500);
+      }
       // Carrera perdida contra trg_payroll_payments_cap.
       if ((insertError as { code?: string }).code === "P0001") {
         throw new PayrollError("OVERPAID", "Las porciones superan el neto del ítem.", 422);

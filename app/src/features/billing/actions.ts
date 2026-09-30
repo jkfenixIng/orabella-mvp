@@ -152,7 +152,16 @@ export async function annulInvoiceAction(id: string, input: unknown) {
   }
 }
 
-/** Misma lógica que POST /api/v1/invoices/:id/payments/split (solo admin/caja). */
+/**
+ * Misma lógica que POST /api/v1/invoices/:id/payments/split (solo admin/caja).
+ *
+ * CL-2: el cuerpo debe traer `idempotency_key` (uuid que la pantalla acuña al
+ * empezar el intento de cobro y reutiliza en sus reintentos). Sin marca el
+ * servicio rechaza con VALIDATION: un envío sin marca no se puede reconocer como
+ * repetición. Con la marca repetida devuelve el detalle ya cobrado —un no-op
+ * exitoso— en vez de morir con OVERPAID, que es lo que hacía el reintento de un
+ * cobro ya registrado.
+ */
 export async function splitPaymentAction(id: string, input: unknown) {
   try {
     const session = await requireBillingWriter(await sessionToken());

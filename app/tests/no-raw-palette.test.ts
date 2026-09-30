@@ -188,7 +188,7 @@ const ALLOWLIST = new Map<string, { hits: number; reason: string }>([
         "en la familia `--paper-*` (documento, no tema), que renderiza igual en claro y en oscuro, y " +
         "el reemplazo fue de vocabulario, no de píxeles. Estos 40 NO tienen un token del proyecto con " +
         "el MISMO valor en los dos temas (text-slate-500 es #62748e en ambos, text-text-secondary es " +
-        "#737373 en claro y #aeaeae en oscuro; bg-white es #ffffff, bg-surface es #fafafa/#0f0f0f), y " +
+        "#606060 en claro y #aeaeae en oscuro; bg-white es #ffffff, bg-surface es #f8f8f8/#0f0f0f), y " +
         "son además los únicos del archivo con socio `dark:`. Cambiarlos mueve píxeles: lo decide el " +
         "dueño, no esta unidad. La invariante de la familia del papel se guarda aparte, más abajo.",
     },
