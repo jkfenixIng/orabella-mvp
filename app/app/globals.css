@@ -131,6 +131,39 @@
   --shadow-md: var(--shadow-md);
   --shadow-lg: var(--shadow-lg);
   --shadow-xl: var(--shadow-xl);
+
+  /* ----------------------------------------------------------------------
+     Puente de la familia del PAPEL (hoja de factura).
+
+     Un documento, no una superficie del tema: estos 18 valores son literales
+     fijos declarados en design-tokens.css, sin bloque `.dark`, y estas claves
+     solo existen para que Tailwind emita las utilidades que la hoja usa
+     (`bg-paper-surface`, `text-paper-ink`, `border-paper-line`, ...).
+
+     Cada clave apunta a su token homónimo y a ninguno más: si alguien la
+     redirigiera a un token del tema, el papel se temizaría. La guarda
+     `tests/no-raw-palette.test.ts` exige esa correspondencia uno a uno, que
+     los valores sean literales y que no exista un `.dark` para ellos.
+
+     Son 18 claves, una por valor: tampoco acá se duplica un color. */
+  --color-paper-surface: var(--paper-surface);
+  --color-paper-surface-soft: var(--paper-surface-soft);
+  --color-paper-surface-muted: var(--paper-surface-muted);
+  --color-paper-line: var(--paper-line);
+  --color-paper-line-strong: var(--paper-line-strong);
+  --color-paper-ink: var(--paper-ink);
+  --color-paper-ink-secondary: var(--paper-ink-secondary);
+  --color-paper-ink-tertiary: var(--paper-ink-tertiary);
+  --color-paper-ink-muted: var(--paper-ink-muted);
+  --color-paper-ink-soft: var(--paper-ink-soft);
+  --color-paper-info: var(--paper-info);
+  --color-paper-success: var(--paper-success);
+  --color-paper-success-strong: var(--paper-success-strong);
+  --color-paper-success-deep: var(--paper-success-deep);
+  --color-paper-danger: var(--paper-danger);
+  --color-paper-danger-strong: var(--paper-danger-strong);
+  --color-paper-focus-success: var(--paper-focus-success);
+  --color-paper-focus-danger: var(--paper-focus-danger);
 }
 
 :root {
