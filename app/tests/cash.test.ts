@@ -2363,6 +2363,51 @@ function createShiftStubSupabaseClient(): unknown {
       if (!shift) return rollback("SHIFT_NOT_FOUND");
       // La precondición de estado, leída de la fila BLOQUEADA: otro cierre ganó.
       if (shift.status !== "abierto") return rollback("SHIFT_ALREADY_CLOSED");
+      // CL-19: la PRECONDICIÓN del conjunto de cobros, evaluada BAJO el lock del
+      // turno (esto es lo que la función de la migración 058 hace entre su 2.2 y
+      // su 2.3). El doble RE-CUENTA las MISMAS dos fuentes que el servicio sumó
+      // —`payments` del turno sin factura y las `invoice_payments` atribuidas al
+      // turno, la unión de las directas y las históricas sin turno cuya factura
+      // pertenece al turno— y rechaza si alguno de los dos conteo difiere del
+      // token que el llamador mandó. No suma ningún monto: cuenta filas.
+      //
+      // CL-20: la MISMA precondición cubre las DOS SALIDAS que el arqueo resta
+      // —`commission_payouts` del turno y los vales APROBADOS con método del
+      // turno (`approved_by` y `method_code` no nulos, la misma regla de
+      // `isVoucherCashOut`)—, porque un pago o una aprobación confirmados en el
+      // medio también dejan el arqueo firmado corto. Cuatro conteo, ninguna
+      // suma.
+      const token = (args.p_collection_counts ?? {}) as Record<string, unknown>;
+      const invoicesOfShift = new Set(
+        (shiftStub.tables.invoices ?? [])
+          .filter((row) => row.cash_shift_id === args.p_shift_id)
+          .map((row) => row.id),
+      );
+      const countedPayments = (shiftStub.tables.payments ?? []).filter(
+        (row) => row.cash_shift_id === args.p_shift_id && (row.invoice_id ?? null) === null,
+      ).length;
+      const countedInvoicePayments = (shiftStub.tables.invoice_payments ?? []).filter(
+        (row) =>
+          row.cash_shift_id === args.p_shift_id ||
+          ((row.cash_shift_id ?? null) === null && invoicesOfShift.has(row.invoice_id)),
+      ).length;
+      const countedCommissionPayouts = (shiftStub.tables.commission_payouts ?? []).filter(
+        (row) => row.cash_shift_id === args.p_shift_id,
+      ).length;
+      const countedVoucherRequests = (shiftStub.tables.voucher_requests ?? []).filter(
+        (row) =>
+          row.cash_shift_id === args.p_shift_id &&
+          (row.approved_by ?? null) !== null &&
+          (row.method_code ?? null) !== null,
+      ).length;
+      if (
+        countedPayments !== Number(token.payments) ||
+        countedInvoicePayments !== Number(token.invoice_payments) ||
+        countedCommissionPayouts !== Number(token.commission_payouts) ||
+        countedVoucherRequests !== Number(token.voucher_requests)
+      ) {
+        return rollback("ARQUEO_STALE");
+      }
       const close = (args.p_close ?? {}) as Record<string, unknown>;
       // El CHECK de 006 dentro de la transacción: la regla de negocio que el
       // servicio traduce a CASH_OUT_EXCEEDS_COLLECTED no se movió ni se
@@ -4840,6 +4885,719 @@ describe("cash: CL-10 el diff del servicio vive en el bloque de persistencia", (
   });
 });
 
+// -------------------------------------------------------------------- CL-19 ---
+//
+// El cierre computa el arqueo en el SERVICIO, ANTES de su transacción:
+// `closeShift` lee los dos ledgers del turno —`payments` sin factura y las
+// `invoice_payments` atribuidas al turno— y de ahí sale `expected_cash`. La
+// transacción del cierre (049) bloquea la fila del turno DESPUÉS, y el cobro
+// (056) toma `FOR SHARE` sobre esa MISMA fila: los dos se serializan, pero el
+// arqueo ya estaba computado cuando el lock se tomó. Un cobro que se confirma
+// entre la lectura y el lock queda FUERA del arqueo firmado, y el cierre firma
+// un `expected_cash` corto por dinero que sí entró al turno.
+//
+// CL-19 cierra esa ventana con una PRECONDICIÓN (CAS), no con un recálculo: el
+// servicio manda, junto con el arqueo, el TOKEN del conjunto de cobros que leyó
+// —los CONTEO de filas de las dos fuentes, no sus sumas: sumar dinero en SQL
+// está prohibido en este proyecto— y la transacción, BAJO EL LOCK DEL TURNO,
+// vuelve a contar esas filas y RECHAZA el cierre si alguna cambió.
+describe("cash: CL-19 el cierre no firma un arqueo que ya no corresponde", () => {
+  const ACTOR = { userId: shiftStub.USER_ID, sedeId: shiftStub.SEDE_ID };
+  /** El cierre del caso 300/200 del dueño: 6 × 50 000 contados sobre 300 000 cobrados. */
+  const CLOSE_INPUT = {
+    counted_cash: 300000,
+    counts: [{ method_code: "efectivo", denomination: 50000, quantity: 6, amount: 300000 }],
+    confirmed: true as const,
+  };
+
+  /** Un turno abierto con 300 000 cobrados en efectivo y sin salidas. */
+  function seedOpenShift(): void {
+    shiftStub.tables = {
+      cash_registers: [
+        {
+          id: shiftStub.REGISTER_ID,
+          sede_id: shiftStub.SEDE_ID,
+          name: "Caja única",
+          base_configurada: shiftStub.BASE_CONFIGURADA,
+          is_active: true,
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      cash_denominations: [
+        {
+          id: "den-50000",
+          sede_id: shiftStub.SEDE_ID,
+          kind: "billete",
+          value: 50000,
+          is_active: true,
+        },
+      ],
+      cash_shifts: [
+        {
+          id: shiftStub.SHIFT_ID,
+          cash_register_id: shiftStub.REGISTER_ID,
+          sede_id: shiftStub.SEDE_ID,
+          opened_by: shiftStub.USER_ID,
+          closed_by: null,
+          opened_at: "2026-09-30T12:00:00.000Z",
+          closed_at: null,
+          opening_base: 200000,
+          expected_cash: 0,
+          counted_cash: null,
+          base_left: null,
+          cash_withdrawn: null,
+          base_difference: null,
+          status: "abierto",
+          observation: null,
+        },
+      ],
+      // El único movimiento del turno: un cobro de cajón SIN factura.
+      payments: [
+        {
+          id: "pago-1",
+          sede_id: shiftStub.SEDE_ID,
+          cash_shift_id: shiftStub.SHIFT_ID,
+          invoice_id: null,
+          method_code: "efectivo",
+          amount: 300000,
+        },
+      ],
+      invoice_payments: [],
+      invoices: [],
+      commission_payouts: [],
+      voucher_requests: [],
+      cash_shift_counts: [],
+      cash_shift_recounts: [],
+    };
+  }
+
+  const shifts = () => shiftStub.tables.cash_shifts ?? [];
+  const counts = () => shiftStub.tables.cash_shift_counts ?? [];
+  const closeCalls = () =>
+    shiftStub.rpcCalls.filter((call) => call.name === "cash_close_shift_atomic");
+  const loose = () => shiftStub.looseWrites.filter((entry) => entry.table !== "audit_logs");
+  const close = (raw: unknown = CLOSE_INPUT) =>
+    closeShift(shiftStub.SEDE_ID, shiftStub.SHIFT_ID, raw, ACTOR);
+  /** El efectivo que REALMENTE entró al turno, leído del ledger. */
+  const collectedCash = (): number =>
+    (shiftStub.tables.payments ?? [])
+      .filter((row) => row.cash_shift_id === shiftStub.SHIFT_ID && row.invoice_id == null)
+      .reduce((acc, row) => acc + Number(row.amount), 0);
+  /** El mismo turno, ya CERRADO con su arqueo: el punto de partida del reconteo. */
+  function seedClosedShift(): void {
+    seedOpenShift();
+    Object.assign(shifts()[0], {
+      status: "cerrado",
+      closed_by: shiftStub.USER_ID,
+      closed_at: "2026-09-30T13:00:00.000Z",
+      expected_cash: 300000,
+      counted_cash: 300000,
+      base_left: 200000,
+      cash_withdrawn: 100000,
+      base_difference: 0,
+    });
+    shiftStub.tables.cash_shift_counts = [
+      {
+        id: "conteo-cierre",
+        shift_id: shiftStub.SHIFT_ID,
+        phase: "cierre",
+        method_code: "efectivo",
+        denomination: 50000,
+        quantity: 6,
+        amount: 300000,
+      },
+    ];
+  }
+
+  beforeEach(() => {
+    resetShiftStub();
+    shiftStub.lifecycle = true;
+  });
+  afterEach(() => resetShiftStub());
+
+  it("un cobro que se confirma entre la lectura del arqueo y el lock hace que el cierre RECHAZE (ARQUEO_STALE) y no escriba NADA", async () => {
+    seedOpenShift();
+    // El cobro que entra en el medio: 100 000 en efectivo, al MISMO turno.
+    shiftStub.beforeRpc = () => {
+      shiftStub.tables.payments = [
+        ...(shiftStub.tables.payments ?? []),
+        {
+          id: "pago-2",
+          sede_id: shiftStub.SEDE_ID,
+          cash_shift_id: shiftStub.SHIFT_ID,
+          invoice_id: null,
+          method_code: "efectivo",
+          amount: 100000,
+        },
+      ];
+    };
+
+    const outcome: unknown = await close().catch((error: unknown) => error);
+
+    // Es un rechazo de CONTRATO con su código propio y su mensaje accionable,
+    // no un fallo interno.
+    expect(outcome).toBeInstanceOf(CashError);
+    expect(outcome).toMatchObject({ code: "ARQUEO_STALE", status: 409 });
+    expect((outcome as CashError).message).toBe(
+      "Las colecciones del turno cambiaron mientras se cerraba: vuelva a intentar.",
+    );
+    // Y no quedó NADA escrito: el turno sigue ABIERTO y sin arqueo de cierre
+    // —ni siquiera la fila de auditoría, que el servicio escribe después—.
+    expect(shifts()[0]).toMatchObject({ status: "abierto", expected_cash: 0 });
+    expect(counts()).toEqual([]);
+    expect(shiftStub.tables.cash_shift_recounts ?? []).toEqual([]);
+    expect(shiftStub.inserts.filter((entry) => entry.table === "audit_logs")).toEqual([]);
+    // No es vacuidad del doble: la transacción SÍ se pidió y ninguna escritura
+    // suelta salió de la operación.
+    expect(closeCalls()).toHaveLength(1);
+    expect(loose()).toEqual([]);
+  });
+
+  it("el reintento con un arqueo FRESCO cierra, y ahora el arqueo SÍ cuenta el cobro", async () => {
+    seedOpenShift();
+    shiftStub.beforeRpc = () => {
+      shiftStub.tables.payments = [
+        ...(shiftStub.tables.payments ?? []),
+        {
+          id: "pago-2",
+          sede_id: shiftStub.SEDE_ID,
+          cash_shift_id: shiftStub.SHIFT_ID,
+          invoice_id: null,
+          method_code: "efectivo",
+          amount: 100000,
+        },
+      ];
+    };
+    await close().catch(() => undefined);
+
+    // El reintento: el servicio vuelve a leer los ledgers (ahora sí ve el cobro),
+    // computa el arqueo con él y manda un token que coincide con la base.
+    const result = await close();
+
+    expect(result.shift.status).toBe("cerrado");
+    // El arqueo firmado es el del dinero que REALMENTE entró: 400 000, no 300 000.
+    expect(collectedCash()).toBe(400000);
+    expect(shifts()[0]).toMatchObject({
+      status: "cerrado",
+      expected_cash: 400000,
+      counted_cash: 300000,
+    });
+    // Y el cierre quedó firmado CON su evidencia.
+    expect(counts()).toHaveLength(1);
+    expect(counts()[0]).toMatchObject({ phase: "cierre", amount: 300000 });
+  });
+
+  it("un cobro de FACTURA que entra en el medio también se rechaza: el token cubre las dos fuentes", async () => {
+    seedOpenShift();
+    // El segundo ledger del arqueo: una porción de `invoice_payments` atribuida al
+    // turno que se confirma entre la lectura y el lock. La primera fuente del
+    // token no cambia; la segunda sí.
+    shiftStub.beforeRpc = () => {
+      shiftStub.tables.invoice_payments = [
+        ...(shiftStub.tables.invoice_payments ?? []),
+        {
+          id: "cobro-1",
+          invoice_id: "factura-1",
+          cash_shift_id: shiftStub.SHIFT_ID,
+          method_code: "efectivo",
+          amount: 100000,
+        },
+      ];
+    };
+
+    const outcome: unknown = await close().catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(CashError);
+    expect(outcome).toMatchObject({ code: "ARQUEO_STALE", status: 409 });
+    expect(shifts()[0].status).toBe("abierto");
+    expect(counts()).toEqual([]);
+  });
+
+  it("las filas HISTÓRICAS sin turno también cuentan en el token (la unión de `fetchInvoicePaymentsByShift`)", async () => {
+    seedOpenShift();
+    // Una fila histórica del ledger de factura: su cobro no lleva turno, y el
+    // arqueo la atribuye a la factura, que sí pertenece a este turno. El token
+    // tiene que contarla IGUAL que el conteo de la transacción; si no, el cierre
+    // se rechazaría contra una base que no cambió.
+    shiftStub.tables.invoices = [
+      { id: "factura-1", sede_id: shiftStub.SEDE_ID, cash_shift_id: shiftStub.SHIFT_ID },
+    ];
+    shiftStub.tables.invoice_payments = [
+      {
+        id: "cobro-historico",
+        invoice_id: "factura-1",
+        cash_shift_id: null,
+        method_code: "efectivo",
+        amount: 50000,
+      },
+    ];
+
+    // Control positivo: con la fila histórica quieta, el cierre pasa —el token la
+    // cuenta de las dos puntas—.
+    const result = await close();
+    expect(result.shift.status).toBe("cerrado");
+
+    // Y una SEGUNDA fila histórica que entra en el medio se rechaza.
+    seedOpenShift();
+    shiftStub.tables.invoices = [
+      { id: "factura-1", sede_id: shiftStub.SEDE_ID, cash_shift_id: shiftStub.SHIFT_ID },
+    ];
+    shiftStub.tables.invoice_payments = [
+      {
+        id: "cobro-historico",
+        invoice_id: "factura-1",
+        cash_shift_id: null,
+        method_code: "efectivo",
+        amount: 50000,
+      },
+    ];
+    shiftStub.beforeRpc = () => {
+      shiftStub.tables.invoice_payments = [
+        ...(shiftStub.tables.invoice_payments ?? []),
+        {
+          id: "cobro-historico-2",
+          invoice_id: "factura-1",
+          cash_shift_id: null,
+          method_code: "efectivo",
+          amount: 50000,
+        },
+      ];
+    };
+
+    const outcome: unknown = await close().catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(CashError);
+    expect(outcome).toMatchObject({ code: "ARQUEO_STALE", status: 409 });
+    expect(shifts()[0].status).toBe("abierto");
+    expect(counts()).toEqual([]);
+  });
+
+  it("el token viaja como DATO: los CONTEO de las dos fuentes que el arqueo sumó", async () => {
+    seedOpenShift();
+    // Una segunda fuente real: dos porciones del ledger de factura del turno.
+    shiftStub.tables.invoice_payments = [
+      {
+        id: "cobro-1",
+        invoice_id: "factura-1",
+        cash_shift_id: shiftStub.SHIFT_ID,
+        method_code: "efectivo",
+        amount: 100000,
+      },
+      {
+        id: "cobro-2",
+        invoice_id: "factura-1",
+        cash_shift_id: shiftStub.SHIFT_ID,
+        method_code: "efectivo",
+        amount: 50000,
+      },
+    ];
+
+    await close();
+
+    // Un cobro de cajón sin factura y dos porciones de factura: 1 y 2, contados
+    // —NO sumados—. Si el token fuera una suma, estos números serían 300 000 y
+    // 150 000. CL-20: el mismo objeto lleva los DOS conteo de las salidas que el
+    // arqueo resta, en cero porque este turno no tiene ninguna.
+    expect(closeCalls()[0].args.p_collection_counts).toEqual({
+      payments: 1,
+      invoice_payments: 2,
+      commission_payouts: 0,
+      voucher_requests: 0,
+    });
+  });
+
+  it("el RECONTEO no lleva token: corregir un cierre firmado es otra operación", async () => {
+    seedClosedShift();
+
+    const result = await recountClosedShift(
+      shiftStub.SEDE_ID,
+      shiftStub.SHIFT_ID,
+      {
+        counted_cash: 400000,
+        counts: [{ method_code: "efectivo", denomination: 50000, quantity: 8, amount: 400000 }],
+        reason: "Faltaba un billete en el conteo.",
+      },
+      ACTOR,
+    );
+
+    const recountCalls = shiftStub.rpcCalls.filter(
+      (call) => call.name === "cash_recount_shift_atomic",
+    );
+    expect(recountCalls).toHaveLength(1);
+    expect(recountCalls[0].args).not.toHaveProperty("p_collection_counts");
+    expect(result.recount.counted_cash).toBe(400000);
+  });
+
+  it("control negativo: la misma operación SIN el cobro en el medio sí cierra (los «no escribió» no son vacuidad)", async () => {
+    seedOpenShift();
+
+    const result = await close();
+
+    expect(result.shift.status).toBe("cerrado");
+    // Y el arqueo firmado es exactamente el dinero del ledger: no es que el
+    // cierre firme cualquier cosa cuando nadie cambió el conjunto.
+    expect(collectedCash()).toBe(shifts()[0].expected_cash);
+    expect(counts()).toHaveLength(1);
+  });
+
+  it("un turno SIN cobros cierra igual: un token en CERO es un token válido", async () => {
+    seedOpenShift();
+    // La otra punta del contrato: un ledger VACÍO no puede quedar sin poder
+    // cerrarse por una precondición que confunda «cero» con «no vino».
+    shiftStub.tables.payments = [];
+
+    await close();
+
+    expect(closeCalls()[0].args.p_collection_counts).toEqual({
+      payments: 0,
+      invoice_payments: 0,
+      commission_payouts: 0,
+      voucher_requests: 0,
+    });
+    expect(shifts()[0]).toMatchObject({ status: "cerrado", expected_cash: 0 });
+  });
+
+  it("el servicio arma el token con las MISMAS filas que suman y restan el arqueo y traduce el rechazo", () => {
+    const service = readFileSync(
+      join(process.cwd(), "src", "features", "cash", "service.ts"),
+      "utf8",
+    );
+    const start = service.indexOf("export async function closeShift");
+    const close = service.slice(start, service.indexOf("export async function", start + 10));
+    // El token sale de las CUATRO listas que el arqueo usa —las dos que une y las
+    // dos que resta—, contadas —no sumadas—, y viaja como DATO en la llamada al
+    // RPC. El conteo de vales sale de la MISMA lista que el arqueo descuenta
+    // (`fetchVoucherOutRows`), no de una lectura aparte.
+    expect(close).toContain("const collectionCounts = {");
+    expect(close).toContain("payments: (shiftPayments ?? []).length");
+    expect(close).toContain("invoice_payments: invoicePays.length");
+    expect(close).toContain("commission_payouts: (payoutRows ?? []).length");
+    expect(close).toContain("voucher_requests: voucherRows.length");
+    expect(close).toContain("const voucherRows = voucherRowsByShift.get(shift.id) ?? []");
+    expect(close).toContain("voucherOutByMethod(voucherRows)");
+    expect(close).toContain("p_collection_counts: collectionCounts");
+    // Y el rechazo de la transacción se traduce a su código propio.
+    expect(close).toContain('errorMessage.includes("ARQUEO_STALE")');
+    expect(close).toContain('"ARQUEO_STALE",');
+    expect(close).toContain(
+      '"Las colecciones del turno cambiaron mientras se cerraba: vuelva a intentar.",',
+    );
+    // La aritmética del arqueo no se movió: se sigue computando en TypeScript.
+    expect(close).toContain("computeCashClose({");
+    expect(close).toContain("expectedDigitalTotal(");
+  });
+});
+
+// ---------------------------------------------------------------- CL-20 ---
+//
+// El arqueo no SÓLO suma cobros: también RESTA dos salidas de caja —los pagos
+// inmediatos de comisión (`commission_payouts` del turno) y los vales APROBADOS
+// del turno (`voucher_requests` con `approved_by` y `method_code` no nulos)—. El
+// token de CL-19 (058) cuenta las dos fuentes que el arqueo SUMA y no estas dos,
+// así que un pago de comisión o la aprobación de un vale confirmados entre la
+// lectura del servicio y el lock del turno dejan el MISMO cierre firmado que la
+// 058 vino a eliminar: un `expected_cash` corto, con los dos conteo de 058
+// intactos —así que su precondición no dispara—.
+//
+// CL-20 extiende la MISMA precondición con el MISMO mecanismo: dos CONTEO de
+// filas más en el token, recontados por la transacción BAJO EL LOCK DEL TURNO.
+describe("cash: CL-20 el cierre tampoco firma un arqueo al que le faltan las SALIDAS", () => {
+  const ACTOR = { userId: shiftStub.USER_ID, sedeId: shiftStub.SEDE_ID };
+  /** El cierre del caso 300/200 del dueño: 6 × 50 000 contados sobre 300 000 cobrados. */
+  const CLOSE_INPUT = {
+    counted_cash: 300000,
+    counts: [{ method_code: "efectivo", denomination: 50000, quantity: 6, amount: 300000 }],
+    confirmed: true as const,
+  };
+
+  /** Un turno abierto con 300 000 cobrados en efectivo y ninguna salida. */
+  function seedOpenShift(): void {
+    shiftStub.tables = {
+      cash_registers: [
+        {
+          id: shiftStub.REGISTER_ID,
+          sede_id: shiftStub.SEDE_ID,
+          name: "Caja única",
+          base_configurada: shiftStub.BASE_CONFIGURADA,
+          is_active: true,
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      cash_denominations: [
+        {
+          id: "den-50000",
+          sede_id: shiftStub.SEDE_ID,
+          kind: "billete",
+          value: 50000,
+          is_active: true,
+        },
+      ],
+      cash_shifts: [
+        {
+          id: shiftStub.SHIFT_ID,
+          cash_register_id: shiftStub.REGISTER_ID,
+          sede_id: shiftStub.SEDE_ID,
+          opened_by: shiftStub.USER_ID,
+          closed_by: null,
+          opened_at: "2026-09-30T12:00:00.000Z",
+          closed_at: null,
+          opening_base: 200000,
+          expected_cash: 0,
+          counted_cash: null,
+          base_left: null,
+          cash_withdrawn: null,
+          base_difference: null,
+          status: "abierto",
+          observation: null,
+        },
+      ],
+      // El único movimiento del turno: un cobro de cajón SIN factura.
+      payments: [
+        {
+          id: "pago-1",
+          sede_id: shiftStub.SEDE_ID,
+          cash_shift_id: shiftStub.SHIFT_ID,
+          invoice_id: null,
+          method_code: "efectivo",
+          amount: 300000,
+        },
+      ],
+      invoice_payments: [],
+      invoices: [],
+      commission_payouts: [],
+      voucher_requests: [],
+      cash_shift_counts: [],
+      cash_shift_recounts: [],
+    };
+  }
+
+  const shifts = () => shiftStub.tables.cash_shifts ?? [];
+  const counts = () => shiftStub.tables.cash_shift_counts ?? [];
+  const closeCalls = () =>
+    shiftStub.rpcCalls.filter((call) => call.name === "cash_close_shift_atomic");
+  const close = (raw: unknown = CLOSE_INPUT) =>
+    closeShift(shiftStub.SEDE_ID, shiftStub.SHIFT_ID, raw, ACTOR);
+  /** El efectivo que REALMENTE entró al turno, leído del ledger de cobros. */
+  const collectedCash = (): number =>
+    (shiftStub.tables.payments ?? [])
+      .filter((row) => row.cash_shift_id === shiftStub.SHIFT_ID && row.invoice_id == null)
+      .reduce((acc, row) => acc + Number(row.amount), 0);
+  /**
+   * El efectivo que REALMENTE salió del cajón del turno, leído de los DOS
+   * ledgers de salida: las comisiones pagadas y los vales APROBADOS (la MISMA
+   * regla de `isVoucherCashOut` que aplica el arqueo).
+   */
+  const paidOutCash = (): number => {
+    const payouts = (shiftStub.tables.commission_payouts ?? []).filter(
+      (row) => row.cash_shift_id === shiftStub.SHIFT_ID && row.method_code === "efectivo",
+    );
+    const vouchers = (shiftStub.tables.voucher_requests ?? []).filter(
+      (row) =>
+        row.cash_shift_id === shiftStub.SHIFT_ID &&
+        row.method_code === "efectivo" &&
+        isVoucherCashOut({
+          approved_by: (row.approved_by ?? null) as string | null,
+          method_code: (row.method_code ?? null) as string | null,
+          amount: row.amount as number,
+        }),
+    );
+    return [...payouts, ...vouchers].reduce((acc, row) => acc + Number(row.amount), 0);
+  };
+
+  beforeEach(() => {
+    resetShiftStub();
+    shiftStub.lifecycle = true;
+  });
+  afterEach(() => resetShiftStub());
+
+  it("un pago de comisión que se confirma entre la lectura del arqueo y el lock hace RECHAZAR el cierre (ARQUEO_STALE) y no escribe NADA", async () => {
+    seedOpenShift();
+    // La salida que entra en el medio: una comisión pagada en EFECTIVO al MISMO
+    // turno. Las dos fuentes del token de 058 no cambian —por eso su precondición
+    // no la ve—; el token de CL-20 sí.
+    shiftStub.beforeRpc = () => {
+      shiftStub.tables.commission_payouts = [
+        ...(shiftStub.tables.commission_payouts ?? []),
+        {
+          id: "comision-1",
+          cash_shift_id: shiftStub.SHIFT_ID,
+          method_code: "efectivo",
+          amount: 100000,
+        },
+      ];
+    };
+
+    const outcome: unknown = await close().catch((error: unknown) => error);
+
+    // Es un rechazo de CONTRATO con el MISMO código y el MISMO mensaje que el de
+    // la 058: es la misma precondición, extendida.
+    expect(outcome).toBeInstanceOf(CashError);
+    expect(outcome).toMatchObject({ code: "ARQUEO_STALE", status: 409 });
+    expect((outcome as CashError).message).toBe(
+      "Las colecciones del turno cambiaron mientras se cerraba: vuelva a intentar.",
+    );
+    // Y no quedó NADA escrito: el turno sigue ABIERTO y sin arqueo de cierre
+    // —ni siquiera la fila de auditoría, que el servicio escribe después—.
+    expect(shifts()[0]).toMatchObject({ status: "abierto", expected_cash: 0 });
+    expect(counts()).toEqual([]);
+    expect(shiftStub.tables.cash_shift_recounts ?? []).toEqual([]);
+    expect(shiftStub.inserts.filter((entry) => entry.table === "audit_logs")).toEqual([]);
+    // No es vacuidad del doble: la transacción SÍ se pidió.
+    expect(closeCalls()).toHaveLength(1);
+  });
+
+  it("un vale APROBADO que se confirma entre la lectura del arqueo y el lock también hace RECHAZAR el cierre", async () => {
+    seedOpenShift();
+    shiftStub.beforeRpc = () => {
+      shiftStub.tables.voucher_requests = [
+        ...(shiftStub.tables.voucher_requests ?? []),
+        {
+          id: "vale-1",
+          cash_shift_id: shiftStub.SHIFT_ID,
+          approved_by: shiftStub.USER_ID,
+          method_code: "efectivo",
+          amount: 100000,
+        },
+      ];
+    };
+
+    const outcome: unknown = await close().catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(CashError);
+    expect(outcome).toMatchObject({ code: "ARQUEO_STALE", status: 409 });
+    expect(shifts()[0].status).toBe("abierto");
+    expect(counts()).toEqual([]);
+  });
+
+  it("el reintento con un arqueo FRESCO cierra, y ahora el arqueo SÍ RESTA la salida", async () => {
+    seedOpenShift();
+    shiftStub.beforeRpc = () => {
+      shiftStub.tables.commission_payouts = [
+        ...(shiftStub.tables.commission_payouts ?? []),
+        {
+          id: "comision-1",
+          cash_shift_id: shiftStub.SHIFT_ID,
+          method_code: "efectivo",
+          amount: 100000,
+        },
+      ];
+    };
+    await close().catch(() => undefined);
+
+    // El reintento: el servicio vuelve a leer los cuatro conjuntos (ahora sí ve
+    // la salida), computa el arqueo con ella y manda un token que coincide.
+    const result = await close();
+
+    expect(result.shift.status).toBe("cerrado");
+    // El arqueo firmado es el del dinero que REALMENTE quedó: el efectivo cobrado
+    // menos la salida en efectivo. Ésta es la aserción que mide el defecto: con el
+    // código previo a este archivo el cierre quedaba firmado con 300 000 (el
+    // `expected 300000 to be 200000` del RED).
+    expect(shifts()[0].expected_cash).toBe(collectedCash() - paidOutCash());
+    expect(shifts()[0].expected_cash).toBe(200000);
+    expect(counts()).toHaveLength(1);
+  });
+
+  it("las DOS fuentes de 058 siguen cubiertas: un cobro de cajón en el medio se rechaza igual", async () => {
+    seedOpenShift();
+    shiftStub.beforeRpc = () => {
+      shiftStub.tables.payments = [
+        ...(shiftStub.tables.payments ?? []),
+        {
+          id: "pago-2",
+          sede_id: shiftStub.SEDE_ID,
+          cash_shift_id: shiftStub.SHIFT_ID,
+          invoice_id: null,
+          method_code: "efectivo",
+          amount: 100000,
+        },
+      ];
+    };
+
+    const outcome: unknown = await close().catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(CashError);
+    expect(outcome).toMatchObject({ code: "ARQUEO_STALE", status: 409 });
+    expect(shifts()[0].status).toBe("abierto");
+  });
+
+  it("un vale PENDIENTE o SIN MÉTODO no se cuenta: no toca el arqueo y no rechaza un cierre legítimo", async () => {
+    seedOpenShift();
+    // Las dos formas de un vale que el arqueo NO resta (`isVoucherCashOut`):
+    // pendiente (sin `approved_by`) y sin método (histórico). Contar TODAS las
+    // filas del turno sería un token más grueso que el arqueo, y este cierre —que
+    // no cambia el número firmado— se rechazaría sin motivo.
+    shiftStub.tables.voucher_requests = [
+      {
+        id: "vale-pendiente",
+        cash_shift_id: shiftStub.SHIFT_ID,
+        approved_by: null,
+        method_code: "efectivo",
+        amount: 50000,
+      },
+      {
+        id: "vale-sin-metodo",
+        cash_shift_id: shiftStub.SHIFT_ID,
+        approved_by: shiftStub.USER_ID,
+        method_code: null,
+        amount: 50000,
+      },
+    ];
+
+    const result = await close();
+
+    expect(result.shift.status).toBe("cerrado");
+    // El arqueo no restó ninguno de los dos y el token tampoco los contó.
+    expect(shifts()[0].expected_cash).toBe(collectedCash());
+    expect(closeCalls()[0].args.p_collection_counts).toMatchObject({ voucher_requests: 0 });
+  });
+
+  it("el token viaja como DATO: los CONTEO de las CUATRO entradas del arqueo (nunca sus sumas)", async () => {
+    seedOpenShift();
+    // Dos salidas reales del turno, una por cada fuente nueva: una comisión
+    // pagada y un vale aprobado. Los montos son 100 000 y 50 000: si el token
+    // fuera una suma, esos números aparecerían acá.
+    shiftStub.tables.commission_payouts = [
+      {
+        id: "comision-1",
+        cash_shift_id: shiftStub.SHIFT_ID,
+        method_code: "efectivo",
+        amount: 100000,
+      },
+    ];
+    shiftStub.tables.voucher_requests = [
+      {
+        id: "vale-1",
+        cash_shift_id: shiftStub.SHIFT_ID,
+        approved_by: shiftStub.USER_ID,
+        method_code: "efectivo",
+        amount: 50000,
+      },
+    ];
+
+    await close();
+
+    expect(closeCalls()[0].args.p_collection_counts).toEqual({
+      payments: 1,
+      invoice_payments: 0,
+      commission_payouts: 1,
+      voucher_requests: 1,
+    });
+    // Y el arqueo firmado es el efectivo cobrado menos las dos salidas.
+    expect(shifts()[0].expected_cash).toBe(300000 - 150000);
+  });
+
+  it("control negativo: la misma operación SIN movimiento en el medio sí cierra (los «no escribió» no son vacuidad)", async () => {
+    seedOpenShift();
+
+    const result = await close();
+
+    expect(result.shift.status).toBe("cerrado");
+    expect(shifts()[0].expected_cash).toBe(collectedCash());
+    expect(counts()).toHaveLength(1);
+  });
+});
+
 describe("migración 049_cash_shift_atomic.sql (CL-10)", () => {
   const migration = (): { raw: string; sql: string } => {
     const raw = readFileSync(
@@ -5179,5 +5937,466 @@ describe("migración 053_cash_payment_state_atomic.sql (CL-14)", () => {
     // esconderse: cerrarlo exigiría un segundo punto de serialización por cobro.
     expect(raw).toContain("EL ESTADO DEL TURNO se lee en el SERVICIO");
     expect(raw).toContain("un SEGUNDO punto de serialización en");
+  });
+});
+
+// ---------------- CL-19: la migración 058 ----------------
+
+describe("migración 058_close_arqueo_consistency.sql (CL-19)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "058_close_arqueo_consistency.sql"),
+    "utf8",
+  );
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+  // Y sin el texto de los `COMMENT ON …`, que es prosa que viaja como string.
+  const ddl = sql.replace(/COMMENT ON FUNCTION[\s\S]*?';\n/g, "");
+  const signature =
+    "public.cash_close_shift_atomic(uuid, uuid, uuid, timestamptz, jsonb, jsonb, jsonb)";
+
+  it("piso anti-vacío: el archivo existe y trae DDL real", () => {
+    expect(raw.length).toBeGreaterThan(15000);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("reemplaza la firma de SEIS argumentos por la de SIETE (la precondición es obligatoria)", () => {
+    // Sin el DROP, `CREATE OR REPLACE` dejaría viva la versión de 049 —la que
+    // cierra firmando el arqueo sin comprobar el conjunto de cobros—: un bypass
+    // silencioso de la precondición que este archivo agrega.
+    expect(sql).toContain(
+      "DROP FUNCTION IF EXISTS public.cash_close_shift_atomic(uuid, uuid, uuid, timestamptz, jsonb, jsonb);",
+    );
+    // El `DROP` va PRIMERO, y no borra la firma nueva (que todavía no existe).
+    expect(sql.trimStart().startsWith("DROP FUNCTION IF EXISTS")).toBe(true);
+    expect(sql).not.toContain(`DROP FUNCTION IF EXISTS ${signature}`);
+    // Y la firma nueva es la que se crea, con el token como séptimo argumento.
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.cash_close_shift_atomic");
+    expect(sql).toContain("p_collection_counts jsonb\n)");
+    expect(sql.match(/CREATE OR REPLACE FUNCTION/g) ?? []).toHaveLength(1);
+  });
+
+  it("evalúa la precondición BAJO el lock del turno, entre el estado y la escritura", () => {
+    const lock = sql.indexOf("FOR UPDATE OF s");
+    const state = sql.indexOf("v_turno.status <> 'abierto'");
+    const forma = sql.indexOf("p_collection_counts IS NULL");
+    const conteoPayments = sql.indexOf("SELECT count(*) INTO v_payments");
+    const conteoInvoice = sql.indexOf("SELECT count(*) INTO v_invoice_payments");
+    const stale = sql.indexOf("ARQUEO_STALE");
+    const update = sql.indexOf("UPDATE public.cash_shifts");
+    expect(forma).toBeGreaterThan(-1);
+    expect(lock).toBeGreaterThan(-1);
+    expect(update).toBeGreaterThan(-1);
+    // La FORMA del token se valida antes de tocar la fila; el CONTEO va después
+    // del lock (si no, la precondición no valdría nada) y antes de escribir.
+    expect(forma).toBeLessThan(lock);
+    expect(state).toBeGreaterThan(lock);
+    expect(lock).toBeLessThan(conteoPayments);
+    expect(conteoPayments).toBeLessThan(conteoInvoice);
+    expect(conteoInvoice).toBeLessThan(stale);
+    expect(stale).toBeLessThan(update);
+  });
+
+  it("el token es OBLIGATORIO: su ausencia es SHIFT_INVALID, jamás «no compares»", () => {
+    // La misma regla que 057 dejó escrita: una firma mal llamada no puede
+    // degradar al comportamiento sin la precondición.
+    expect(ddl).toContain("p_collection_counts IS NULL");
+    expect(ddl).toContain("jsonb_typeof(p_collection_counts) <> 'object'");
+    expect(ddl).toContain("coalesce(p_collection_counts ->> 'payments', '')");
+    expect(ddl).toContain("coalesce(p_collection_counts ->> 'invoice_payments', '')");
+    expect(ddl).toMatch(/RAISE EXCEPTION 'SHIFT_INVALID'/);
+  });
+
+  it("RECUENTA las dos fuentes del arqueo —y la unión de la segunda—, sin sumar un peso", () => {
+    // Fuente 1: el libro de cajón del turno, SIN factura (el mismo predicado que
+    // la lectura del servicio).
+    expect(ddl).toMatch(/SELECT count\(\*\) INTO v_payments[\s\S]*?FROM public\.payments p/);
+    expect(ddl).toMatch(/p\.cash_shift_id = p_shift_id/);
+    expect(ddl).toMatch(/p\.invoice_id IS NULL/);
+    // Fuente 2: las porciones atribuidas al turno, la UNIÓN que describe
+    // `fetchInvoicePaymentsByShift`: las directas más las históricas sin turno
+    // cuya factura pertenece al turno.
+    expect(ddl).toMatch(
+      /SELECT count\(\*\) INTO v_invoice_payments[\s\S]*?FROM public\.invoice_payments ip/,
+    );
+    expect(ddl).toMatch(/ip\.cash_shift_id = p_shift_id/);
+    expect(ddl).toMatch(/ip\.cash_shift_id IS NULL/);
+    expect(ddl).toMatch(/i\.cash_shift_id = p_shift_id/);
+    expect(ddl).toMatch(/FROM public\.invoices i/);
+    // Y la comparación contra el token, con el rechazo propio.
+    expect(ddl).toMatch(
+      /IF v_payments <> \(p_collection_counts ->> 'payments'\)::bigint[\s\S]*?OR v_invoice_payments <> \(p_collection_counts ->> 'invoice_payments'\)::bigint/,
+    );
+    expect(ddl).toContain("RAISE EXCEPTION 'ARQUEO_STALE'");
+    // La otra punta del acoplamiento: el fetcher del servicio describe los MISMOS
+    // tres predicados. Si alguien cambia una regla de atribución, este test cae.
+    const service = readFileSync(
+      join(process.cwd(), "src", "features", "cash", "service.ts"),
+      "utf8",
+    );
+    const fetcher = service.slice(
+      service.indexOf("async function fetchInvoicePaymentsByShift"),
+    );
+    expect(fetcher).toContain('.in("cash_shift_id", shiftIds)');
+    expect(fetcher).toContain('.in("invoice_id", [...shiftByInvoice.keys()])');
+    expect(fetcher).toContain('.is("cash_shift_id", null)');
+  });
+
+  it("NO mueve aritmética de dinero a SQL: los dos conteo son `count(*)`, no `sum(...)`", () => {
+    // Contar filas no es operar sobre dinero: es lo ÚNICO que la función agrega.
+    // Un `sum(amount)` sería exactamente la aritmética que este proyecto prohíbe
+    // mover (005, 031, 049, 050, 053), y un `count(amount)` contaría un monto en
+    // vez de una fila.
+    expect(ddl.match(/count\(\*\)/g) ?? []).toHaveLength(2);
+    expect(ddl.match(/count\s*\(/gi) ?? []).toHaveLength(2);
+    expect(ddl).not.toMatch(/sum\s*\(/i);
+    expect(ddl).not.toMatch(/avg\s*\(/i);
+    expect(ddl).not.toMatch(/round\s*\(/i);
+    expect(ddl).not.toContain("CHECK");
+    // Ninguna columna de dinero entra en una operación. Escribir = convertir la
+    // representación (jsonb → la columna), no calcular.
+    for (const column of [
+      "opening_base",
+      "expected_cash",
+      "counted_cash",
+      "base_left",
+      "cash_withdrawn",
+      "base_difference",
+      "amount",
+      "denomination",
+      "quantity",
+    ]) {
+      expect(ddl, column).not.toMatch(new RegExp(`${column}\\s*[+\\-*/]`));
+    }
+  });
+
+  it("conserva TODAS las precondiciones y las DOS redes de conteo de 049", () => {
+    // El CAS del cierre, el estado leído de la fila bloqueada y el mismo
+    // `status = 'abierto'` en el WHERE del UPDATE.
+    expect(sql).toMatch(/v_turno\.status <> 'abierto'/);
+    expect(sql).toMatch(/AND s\.status = 'abierto'/);
+    expect(sql).toContain("SHIFT_ALREADY_CLOSED");
+    expect(sql).toContain("SHIFT_NOT_FOUND");
+    // Las dos redes: el turno actualizado y las líneas escritas.
+    expect(sql.match(/GET DIAGNOSTICS/g) ?? []).toHaveLength(2);
+    expect(sql).toContain("SHIFT_COUNT_MISMATCH");
+    // El conteo COMPLETO y las guardas de FORMA (la misma trampa del `coalesce`).
+    expect(sql).toContain("jsonb_array_length(p_counts) = 0");
+    expect(sql).toMatch(/coalesce\(item ->> 'amount', ''\)/);
+    expect(sql).toContain("jsonb_build_object(");
+  });
+
+  it("devuelve EXACTAMENTE las columnas que el servicio leía (el shape no cambia)", () => {
+    expect(sql.match(/jsonb_build_object\(/g) ?? []).toHaveLength(1);
+    for (const column of SHIFT_COLUMNS) expect(sql, column).toContain(`'${column}'`);
+    expect(sql).not.toContain("to_jsonb");
+  });
+
+  it("cierra el permiso de la firma nueva: sólo service_role puede ejecutarla", () => {
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature} FROM PUBLIC`);
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature} FROM anon`);
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature} FROM authenticated`);
+    expect(sql).toContain(`GRANT EXECUTE ON FUNCTION ${signature} TO service_role`);
+    expect(sql).toContain("SECURITY INVOKER");
+    expect(sql).not.toContain("SECURITY DEFINER");
+    expect(sql).toContain("SET search_path = public");
+    expect(sql.match(/^ALTER FUNCTION/gm) ?? []).toHaveLength(1);
+    expect(sql.match(/^COMMENT ON FUNCTION/gm) ?? []).toHaveLength(1);
+  });
+
+  it("no toca los otros dos caminos de 049 ni borra datos: sólo la función del cierre", () => {
+    // La apertura y el reconteo no tienen esta ventana y no se reescriben.
+    expect(sql).not.toContain("cash_open_shift_atomic");
+    expect(sql).not.toContain("cash_recount_shift_atomic");
+    // Ningún borrado de datos, y un solo UPDATE EJECUTABLE: el del turno.
+    expect(sql).not.toMatch(/\bDELETE\b/);
+    expect(sql).not.toMatch(/^\s*TRUNCATE/im);
+    expect(sql.match(/UPDATE public\./g) ?? []).toHaveLength(1);
+    expect(sql).not.toMatch(/UPDATE public\.cash_shift_counts/);
+    expect(sql).not.toMatch(/^\s*ALTER TABLE/im);
+    expect(sql).not.toMatch(/^\s*CREATE INDEX/im);
+    expect(sql).not.toContain("DROP TABLE");
+    expect(sql).not.toContain("DROP TRIGGER");
+    expect(sql).not.toContain("DROP CONSTRAINT");
+  });
+
+  it("declara el motivo, el acoplamiento de despliegue, el costo de numeración y las ventanas", () => {
+    expect(raw).toContain("ACOPLAMIENTO DE DESPLIEGUE");
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("VENTANAS DECLARADAS");
+    // El número asignado, el archivo hermano (049) que se espeja y el DROP que
+    // copia de 057.
+    expect(raw).toContain("058");
+    expect(raw).toContain("049");
+    expect(raw).toContain("057");
+    // Y el techo duro del proyecto, escrito en el archivo.
+    expect(raw).toContain("sumar dinero en SQL está prohibido");
+  });
+
+  it("declara las ventanas que el token NO cubre, con su propuesta", () => {
+    // El arqueo también RESTA salidas (comisiones y vales aprobados) y el token
+    // no las cuenta: se declara en vez de esconderse, con la extensión concreta
+    // —más CONTEO, nunca sumas— que la cerraría.
+    expect(raw).toContain("commission_payouts");
+    expect(raw).toContain("voucher_requests");
+    expect(raw).toContain("comisión o la aprobación de un vale");
+    // Y el techo de filas por request del Data API, que el token hereda de las
+    // MISMAS lecturas: fallo CERRADO y ruidoso, con su propuesta de paginado.
+    expect(raw).toContain("max-rows");
+    expect(raw).toContain("readAllPaged");
+    // Y la ventana que NINGÚN conteo puede cerrar: el método de una porción que
+    // la edición de factura (051) cambia sin cambiar una fila.
+    expect(raw).toContain("051");
+    expect(raw).toContain("method_code");
+  });
+
+  it("explica por qué el token son CONTEO y no sumas, y por qué hacía falta el DROP", () => {
+    expect(raw).toContain("DROP FUNCTION");
+    expect(raw).toContain("sobrecarga");
+    expect(raw).toContain("aritmética de dinero");
+    expect(raw).toContain("ARQUEO_STALE");
+  });
+});
+
+
+// ---------------- CL-20: la migración 059 ----------------
+
+describe("migración 059_close_arqueo_outflows.sql (CL-20)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "059_close_arqueo_outflows.sql"),
+    "utf8",
+  );
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+  // Y sin el texto de los `COMMENT ON …`, que es prosa que viaja como string.
+  const ddl = sql.replace(/COMMENT ON FUNCTION[\s\S]*?';\n/g, "");
+  const signature =
+    "public.cash_close_shift_atomic(uuid, uuid, uuid, timestamptz, jsonb, jsonb, jsonb)";
+
+  it("piso anti-vacío: el archivo existe y trae DDL real", () => {
+    expect(raw.length).toBeGreaterThan(15000);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("la firma NO cambia: la extensión entra en el jsonb, así que no hay DROP", () => {
+    // La firma es la MISMA de 058 (siete argumentos, el token como objeto jsonb):
+    // con `CREATE OR REPLACE` la función se REEMPLAZA en vez de crear una
+    // sobrecarga, y no puede quedar viva ninguna versión sin la precondición
+    // extendida. Por eso NO hace falta —ni se hace— un `DROP FUNCTION`.
+    expect(sql).not.toContain("DROP FUNCTION");
+    expect(sql).not.toContain("DROP");
+    expect(sql.match(/CREATE OR REPLACE FUNCTION/g) ?? []).toHaveLength(1);
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.cash_close_shift_atomic");
+    expect(sql).toContain("p_collection_counts jsonb\n)");
+    // El resto de los statements nombran la MISMA firma: si alguien la cambiara,
+    // el ALTER/REVOKE/GRANT apuntarían a una función distinta de la creada.
+    for (const statement of ["ALTER FUNCTION", "REVOKE ALL ON FUNCTION", "GRANT EXECUTE ON FUNCTION", "COMMENT ON FUNCTION"]) {
+      expect(sql, statement).toContain(`${statement} ${signature}`);
+    }
+  });
+
+  it("evalúa la precondición BAJO el lock del turno, entre el estado y la escritura", () => {
+    const lock = sql.indexOf("FOR UPDATE OF s");
+    const state = sql.indexOf("v_turno.status <> 'abierto'");
+    const forma = sql.indexOf("p_collection_counts IS NULL");
+    const conteoPayments = sql.indexOf("SELECT count(*) INTO v_payments");
+    const conteoInvoice = sql.indexOf("SELECT count(*) INTO v_invoice_payments");
+    const conteoPayouts = sql.indexOf("SELECT count(*) INTO v_commission_payouts");
+    const conteoVouchers = sql.indexOf("SELECT count(*) INTO v_voucher_requests");
+    const stale = sql.indexOf("ARQUEO_STALE");
+    const update = sql.indexOf("UPDATE public.cash_shifts");
+    // La FORMA del token se valida antes de tocar la fila; los CUATRO CONTEO van
+    // después del lock (si no, la precondición no valdría nada) y antes de
+    // escribir.
+    expect(forma).toBeGreaterThan(-1);
+    expect(forma).toBeLessThan(lock);
+    expect(state).toBeGreaterThan(lock);
+    expect(lock).toBeLessThan(conteoPayments);
+    expect(conteoPayments).toBeLessThan(conteoInvoice);
+    expect(conteoInvoice).toBeLessThan(conteoPayouts);
+    expect(conteoPayouts).toBeLessThan(conteoVouchers);
+    expect(conteoVouchers).toBeLessThan(stale);
+    expect(stale).toBeLessThan(update);
+  });
+
+  it("el token es OBLIGATORIO: las CUATRO claves se exigen por forma, su ausencia es SHIFT_INVALID", () => {
+    // La misma regla que 057 y 058 dejaron escrita: una firma mal llamada no
+    // puede degradar al comportamiento sin la precondición. Y acá el llamador que
+    // mande SOLO las dos claves de 058 recibe SHIFT_INVALID: la migración no es
+    // compatible hacia atrás con la app vieja, a propósito.
+    expect(ddl).toContain("p_collection_counts IS NULL");
+    expect(ddl).toContain("jsonb_typeof(p_collection_counts) <> 'object'");
+    for (const key of ["payments", "invoice_payments", "commission_payouts", "voucher_requests"]) {
+      expect(ddl, key).toContain(`coalesce(p_collection_counts ->> '${key}', '')`);
+    }
+    expect(ddl.match(/coalesce\(p_collection_counts ->>/g) ?? []).toHaveLength(4);
+    expect(ddl).toMatch(/RAISE EXCEPTION 'SHIFT_INVALID'/);
+  });
+
+  it("RECUENTA las CUATRO entradas del arqueo —y la unión de la segunda—, sin sumar un peso", () => {
+    // Fuente 1: el libro de cajón del turno, SIN factura (el mismo predicado que
+    // la lectura del servicio).
+    expect(ddl).toMatch(/SELECT count\(\*\) INTO v_payments[\s\S]*?FROM public\.payments p/);
+    expect(ddl).toMatch(/p\.cash_shift_id = p_shift_id/);
+    expect(ddl).toMatch(/p\.invoice_id IS NULL/);
+    // Fuente 2: las porciones atribuidas al turno, la UNIÓN que describe
+    // `fetchInvoicePaymentsByShift`: las directas más las históricas sin turno
+    // cuya factura pertenece al turno.
+    expect(ddl).toMatch(
+      /SELECT count\(\*\) INTO v_invoice_payments[\s\S]*?FROM public\.invoice_payments ip/,
+    );
+    expect(ddl).toMatch(/ip\.cash_shift_id = p_shift_id/);
+    expect(ddl).toMatch(/ip\.cash_shift_id IS NULL/);
+    expect(ddl).toMatch(/i\.cash_shift_id = p_shift_id/);
+    expect(ddl).toMatch(/FROM public\.invoices i/);
+    // Fuente 3 (CL-20): los pagos inmediatos de comisión del turno, TODOS.
+    expect(ddl).toMatch(
+      /SELECT count\(\*\) INTO v_commission_payouts[\s\S]*?FROM public\.commission_payouts cp/,
+    );
+    expect(ddl).toMatch(/cp\.cash_shift_id = p_shift_id/);
+    // Fuente 4 (CL-20): los vales del turno que el arqueo RESTA, con el predicado
+    // de `isVoucherCashOut` (aprobado Y con método). La otra punta del
+    // acoplamiento: el fetcher del servicio entrega ya filtradas esas mismas filas.
+    expect(ddl).toMatch(
+      /SELECT count\(\*\) INTO v_voucher_requests[\s\S]*?FROM public\.voucher_requests vr/,
+    );
+    expect(ddl).toMatch(/vr\.cash_shift_id = p_shift_id/);
+    expect(ddl).toMatch(/vr\.approved_by IS NOT NULL/);
+    expect(ddl).toMatch(/vr\.method_code IS NOT NULL/);
+    const service = readFileSync(
+      join(process.cwd(), "src", "features", "cash", "service.ts"),
+      "utf8",
+    );
+    const fetcher = service.slice(service.indexOf("async function fetchVoucherOutRows"));
+    expect(fetcher).toContain('.in("cash_shift_id", shiftIds)');
+    expect(fetcher).toContain("rows.filter(isVoucherCashOut)");
+    // Y la comparación de los CUATRO contra el token, con el MISMO rechazo de 058.
+    expect(ddl).toMatch(
+      /IF v_payments <> \(p_collection_counts ->> 'payments'\)::bigint[\s\S]*?OR v_invoice_payments <> \(p_collection_counts ->> 'invoice_payments'\)::bigint[\s\S]*?OR v_commission_payouts <> \(p_collection_counts ->> 'commission_payouts'\)::bigint[\s\S]*?OR v_voucher_requests <> \(p_collection_counts ->> 'voucher_requests'\)::bigint/,
+    );
+    expect(ddl).toContain("RAISE EXCEPTION 'ARQUEO_STALE'");
+  });
+
+  it("NO mueve aritmética de dinero a SQL: los CUATRO conteo son `count(*)`, no `sum(...)`", () => {
+    // Contar filas no es operar sobre dinero: es lo ÚNICO que la función agrega
+    // (dos `count(*)` más que 058, los mismos que ya tenía). Un `sum(amount)`
+    // sería exactamente la aritmética que este proyecto prohíbe mover (005, 031,
+    // 049, 050, 053), y un `count(amount)` contaría un monto en vez de una fila.
+    expect(ddl.match(/count\(\*\)/g) ?? []).toHaveLength(4);
+    expect(ddl.match(/count\s*\(/gi) ?? []).toHaveLength(4);
+    expect(ddl).not.toMatch(/sum\s*\(/i);
+    expect(ddl).not.toMatch(/avg\s*\(/i);
+    expect(ddl).not.toMatch(/round\s*\(/i);
+    expect(ddl).not.toContain("CHECK");
+    // Ninguna columna de dinero entra en una operación. Escribir = convertir la
+    // representación (jsonb → la columna), no calcular.
+    for (const column of [
+      "opening_base",
+      "expected_cash",
+      "counted_cash",
+      "base_left",
+      "cash_withdrawn",
+      "base_difference",
+      "amount",
+      "denomination",
+      "quantity",
+    ]) {
+      expect(ddl, column).not.toMatch(new RegExp(`${column}\\s*[+\\-*/]`));
+    }
+  });
+
+  it("conserva TODAS las precondiciones, el CAS y las DOS redes de conteo de 049/058", () => {
+    expect(sql).toMatch(/v_turno\.status <> 'abierto'/);
+    expect(sql).toMatch(/AND s\.status = 'abierto'/);
+    expect(sql).toContain("SHIFT_ALREADY_CLOSED");
+    expect(sql).toContain("SHIFT_NOT_FOUND");
+    // Las dos redes: el turno actualizado y las líneas escritas.
+    expect(sql.match(/GET DIAGNOSTICS/g) ?? []).toHaveLength(2);
+    expect(sql).toContain("SHIFT_COUNT_MISMATCH");
+    // El conteo COMPLETO y las guardas de FORMA (la misma trampa del `coalesce`).
+    expect(sql).toContain("jsonb_array_length(p_counts) = 0");
+    expect(sql).toMatch(/coalesce\(item ->> 'amount', ''\)/);
+    expect(sql).toContain("jsonb_build_object(");
+  });
+
+  it("devuelve EXACTAMENTE las columnas que el servicio leía (el shape no cambia)", () => {
+    expect(sql.match(/jsonb_build_object\(/g) ?? []).toHaveLength(1);
+    for (const column of SHIFT_COLUMNS) expect(sql, column).toContain(`'${column}'`);
+    expect(sql).not.toContain("to_jsonb");
+  });
+
+  it("cierra el permiso: sólo service_role puede ejecutarla", () => {
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature} FROM PUBLIC`);
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature} FROM anon`);
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature} FROM authenticated`);
+    expect(sql).toContain(`GRANT EXECUTE ON FUNCTION ${signature} TO service_role`);
+    expect(sql).toContain("SECURITY INVOKER");
+    expect(sql).not.toContain("SECURITY DEFINER");
+    expect(sql).toContain("SET search_path = public");
+    expect(sql.match(/^ALTER FUNCTION/gm) ?? []).toHaveLength(1);
+    expect(sql.match(/^COMMENT ON FUNCTION/gm) ?? []).toHaveLength(1);
+  });
+
+  it("no toca los otros dos caminos de 049 ni borra datos: sólo la función del cierre", () => {
+    expect(sql).not.toContain("cash_open_shift_atomic");
+    expect(sql).not.toContain("cash_recount_shift_atomic");
+    expect(sql).not.toMatch(/\bDELETE\b/);
+    expect(sql).not.toMatch(/^\s*TRUNCATE/im);
+    // Un solo UPDATE EJECUTABLE: el del turno, el MISMO que el servicio ya hacía.
+    expect(sql.match(/UPDATE public\./g) ?? []).toHaveLength(1);
+    expect(sql).not.toMatch(/UPDATE public\.cash_shift_counts/);
+    expect(sql).not.toMatch(/^\s*ALTER TABLE/im);
+    expect(sql).not.toMatch(/^\s*CREATE INDEX/im);
+    expect(sql).not.toContain("DROP TABLE");
+    expect(sql).not.toContain("DROP TRIGGER");
+    expect(sql).not.toContain("DROP CONSTRAINT");
+  });
+
+  it("declara el motivo, el acoplamiento, el costo de numeración y las ventanas", () => {
+    expect(raw).toContain("ACOPLAMIENTO DE DESPLIEGUE");
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("VENTANAS DECLARADAS");
+    // El número asignado y los archivos hermanos: la 058 que extiende y la 049
+    // que reescribe.
+    expect(raw).toContain("059");
+    expect(raw).toContain("058");
+    expect(raw).toContain("049");
+    // El techo duro del proyecto, escrito en el archivo.
+    expect(raw).toContain("sumar dinero en SQL está prohibido");
+    // Por qué NO hay DROP (la firma no cambia) — la decisión contraria a la 058.
+    expect(raw).toContain("POR QUÉ NO HAY `DROP FUNCTION`");
+    expect(raw).toContain("sobrecarga");
+  });
+
+  it("reporta las DOS ventanas que declaró 058 y qué hace esta unidad con cada una", () => {
+    // (a) El MÉTODO de una porción que la edición de factura (051) cambia sin
+    // cambiar una fila: es la ventana que ningún conteo cierra. Se reporta —con
+    // su costo— y NO se arregla acá.
+    expect(raw).toContain("051");
+    expect(raw).toContain("EL MÉTODO DE UNA PORCIÓN");
+    expect(raw).toContain("method_code");
+    // (b) El techo de filas por request del Data API (`max-rows`): el token lo
+    // hereda de las CUATRO lecturas y esta unidad AMPLÍA su superficie. Fallo
+    // CERRADO y ruidoso, con su propuesta de paginado, reportado y no arreglado.
+    expect(raw).toContain("max-rows");
+    expect(raw).toContain("readAllPaged");
+    expect(raw).toContain("CUATRO lecturas");
+    // Y la ventana nueva que esta unidad sí introduce: el CONTENIDO de un vale
+    // re-aprobado, sin escritor conocido.
+    expect(raw).toContain("approveVoucher");
+  });
+
+  it("declara el acoplamiento de despliegue en las DOS direcciones", () => {
+    // App nueva + archivo sin aplicar: las claves de más se ignoran y el cierre
+    // FUNCIONA (degradación silenciosa, por eso van juntos). Archivo aplicado +
+    // app vieja: SHIFT_INVALID y nada escrito (falla CERRADO).
+    expect(raw).toContain("degradación SILENCIOSA");
+    expect(raw).toContain("SHIFT_INVALID");
+    expect(raw).toContain("028");
   });
 });
