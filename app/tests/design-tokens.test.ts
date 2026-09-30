@@ -976,6 +976,104 @@ describe("design tokens: guardas de contrato", () => {
     expect(parseOklch(darkMuted as string), `oscuro: ${darkMuted}`).not.toBeNull();
   });
 
+  /* ------------------------------------------------------------------------
+     CL-1: ninguna declaración de token se resuelve en BUILD TIME con `theme()`.
+
+     `theme()` (la función de Tailwind v4) se resuelve al compilar contra el TEMA
+     de Tailwind. La rampa `--color-neutral-*` del proyecto se declara en un
+     `:root` sin capa, fuera de `@theme`, así que `theme()` nunca la veía: los
+     ocho tokens que la usaban —--bg-primary, --bg-surface, --bg-surface-hover,
+     --border-color, --border-color-2, --text-primary, --text-secondary y
+     --text-disabled— salían del CSS compilado con el neutral POR DEFECTO de
+     Tailwind:
+
+       token              declarado acá             emitido con theme()    Δ canal
+       --text-secondary   oklch(0.49 0 0)  #606060  oklch(55.6% 0 none) #737373  19
+       --border-color     oklch(0.83 0 0)  #c7c7c7  oklch(87% 0 none)   #d4d4d4  13
+       --text-disabled    oklch(0.83 0 0)  #c7c7c7  oklch(87% 0 none)   #d4d4d4  13
+       --text-primary     oklch(0.17 0 0)  #0f0f0f  oklch(20.5% 0 none) #171717   8
+       --border-color-2   oklch(0.91 0 0)  #e1e1e1  oklch(92.2% 0 none) #e5e5e5   4
+       --bg-surface-hover oklch(0.96 0 0)  #f2f2f2  oklch(97% 0 none)   #f5f5f5   3
+       --bg-surface       oklch(0.98 0 0)  #f8f8f8  oklch(98.5% 0 none) #fafafa   2
+       --bg-primary       oklch(0.98 0 0)  #f8f8f8  oklch(98.5% 0 none) #fafafa   2
+
+     (medido compilando globals.css con @tailwindcss/postcss y convirtiendo oklch
+     a sRGB; el Δ es la mayor diferencia por canal)
+
+     Por qué el resto de esta suite no lo veía: `resolveConcrete` sigue
+     `theme(--x)` igual que `var(--x)` y llegaba al valor declarado por el
+     proyecto, o sea el test medía la INTENCIÓN mientras el navegador medía otra
+     cosa. Esta guarda mide el TEXTO de la declaración, que es lo único que
+     distingue las dos formas.
+
+     El arreglo usa `var(--color-neutral-N)`: la referencia queda viva y resuelve
+     a la rampa de este archivo, cuya declaración sin capa gana a la copia de la
+     rampa por defecto que Tailwind emite dentro de `@layer theme` (medido en el
+     CSS compilado). Nada de eso vale si un peldaño usado deja de estar
+     declarado, así que la guarda exige las dos mitades.
+     ------------------------------------------------------------------------ */
+
+  /** Peldaños de la rampa neutral que consumen los tokens de superficie/texto/borde. */
+  const NEUTRAL_RAMP_CONSUMERS: Array<[token: string, step: string]> = [
+    ["--bg-primary", "50"],
+    ["--bg-surface", "50"],
+    ["--bg-surface-hover", "100"],
+    ["--border-color", "300"],
+    ["--border-color-2", "200"],
+    ["--text-primary", "900"],
+    ["--text-secondary", "500"],
+    ["--text-disabled", "300"],
+  ];
+
+  /**
+   * Referencias a `theme(--token)` del CSS dado, sin comentarios: una mención en
+   * prosa (esta misma cabecera nombra el patrón retirado) no se compila y no debe
+   * hacer fallar la guarda, mientras que la declaración real sí.
+   */
+  function themeFunctionRefs(css: string): string[] {
+    return [
+      ...css
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .matchAll(/\btheme\(\s*(--[a-zA-Z0-9-]+)\s*\)/g),
+    ].map((match) => match[1]);
+  }
+
+  it("ninguna declaración de token se resuelve con theme() y las ocho usan la rampa del proyecto (CL-1)", () => {
+    // Control negativo del lector: sobre una muestra sintética que reproduce el
+    // patrón retirado, la detección TIENE que dispararse. Sin esto, un lector
+    // roto —o que devolviera [] sin haber mirado el archivo— dejaría pasar la
+    // aserción de abajo sin haber medido nada.
+    expect(themeFunctionRefs(":root { --text-secondary: theme(--color-neutral-500); }")).toEqual([
+      "--color-neutral-500",
+    ]);
+    // La otra mitad del control: una mención en un comentario NO debe dispararlo.
+    expect(themeFunctionRefs("/* antes era theme(--color-neutral-500) */")).toEqual([]);
+
+    // El archivo real, entero: ninguna referencia a `theme()` en la capa de
+    // tokens ni en el puente. Ahí `theme()` resolvería contra el tema de
+    // Tailwind, y todos los valores del proyecto viven fuera de `@theme`.
+    expect(themeFunctionRefs(TOKENS_CSS), "design-tokens.css").toEqual([]);
+    expect(themeFunctionRefs(GLOBALS_CSS), "globals.css").toEqual([]);
+
+    const failures: string[] = [];
+    for (const [name, step] of NEUTRAL_RAMP_CONSUMERS) {
+      const raw = requireVar(lightVars, name, "design-tokens.css :root");
+      if (raw !== `var(--color-neutral-${step})`) {
+        failures.push(`${name}: ${raw} (se esperaba var(--color-neutral-${step}))`);
+      }
+      // El peldaño tiene que existir de verdad en la rampa del proyecto: si
+      // desapareciera, `var()` no falla, cae en silencio a la copia de
+      // `@layer theme` y el token vuelve a mentir sin que nada lo diga.
+      if (!lightVars.has(`--color-neutral-${step}`)) {
+        failures.push(`--color-neutral-${step}: no está declarado en :root`);
+      }
+    }
+    expect(failures).toEqual([]);
+    // Piso anti-vacío: la tabla cubre los OCHO tokens que usaban `theme()`; si
+    // alguien la recorta, la guarda deja de medir el defecto.
+    expect(NEUTRAL_RAMP_CONSUMERS).toHaveLength(8);
+  });
+
   it("las dos claves base del registry (background/foreground) existen y resuelven en ambos temas", () => {
     const globalsDark = readThemeVars(GLOBALS_CSS, ".dark");
     const failures: string[] = [];
