@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { idempotencyKeySchema } from "@/src/features/billing/schemas";
 
 /** INV-02: tipos de movimiento del kardex. */
 export const movementTypeSchema = z.enum(["IN", "OUT", "ADJUST"]);
@@ -48,14 +49,45 @@ export type ProductInput = z.infer<typeof productSchema>;
 /**
  * INV-02: movimiento con motivo obligatorio. qty > 0 (igual que el CHECK
  * de la migración). En ADJUST, qty es el nivel absoluto que se fija.
+ *
+ * CL-6: `idempotency_key` es la marca del INTENTO (ver `idempotencyKeySchema`,
+ * billing/schemas.ts: una sola definición para todas las puertas que la usan).
+ * Acá es OPCIONAL a propósito: este esquema lo comparte la función
+ * `registerMovement`, que también llaman los caminos de FACTURACIÓN (emisión,
+ * anulación, edición) y esos NO tienen un intento propio del cliente —ya están
+ * cubiertos por la marca de la factura, el testigo de edición y el
+ * compare-and-swap de anulación—, así que exigirles una marca sería inventarles
+ * un intento que no existe. Obligarla acá rompería esos llamadores. La marca se
+ * exige en `manualMovementSchema`, la frontera del camino MANUAL.
  */
 export const movementSchema = z.object({
   product_id: uuidSchema,
   type: movementTypeSchema,
   qty: z.coerce.number().int("Cantidad entera.").positive("La cantidad debe ser mayor a 0."),
   reason: z.string().trim().min(1, "Motivo requerido.").max(500, "Motivo muy largo."),
+  /** CL-6: marca del INTENTO; opcional en la función compartida (ver arriba). */
+  idempotency_key: idempotencyKeySchema.optional(),
 });
 export type MovementInput = z.infer<typeof movementSchema>;
+
+/**
+ * CL-6: el movimiento MANUAL —el que registra una persona desde la pantalla de
+ * inventario o desde la ruta REST— exige la MARCA del intento. Es la MISMA
+ * definición (`idempotencyKeySchema`), sólo que obligatoria: un envío sin marca
+ * no se puede reconocer como repetición, así que aceptarlo sin marca es reabrir
+ * el defecto (un reintento escribe un segundo movimiento y mueve el stock dos
+ * veces) para ESE llamador. El rechazo es ruidoso (VALIDATION 400) y no escribe
+ * nada.
+ *
+ * Por qué la obligatoriedad vive acá y no en `movementSchema`: porque los
+ * llamadores de FACTURACIÓN de `registerMovement` no tienen un intento propio
+ * que marcar. Esta frontera es la del camino manual: la server action y la
+ * ruta REST validan con ESTE esquema antes de tocar la base.
+ */
+export const manualMovementSchema = movementSchema.extend({
+  idempotency_key: idempotencyKeySchema,
+});
+export type ManualMovementInput = z.infer<typeof manualMovementSchema>;
 
 /** INV-05: búsqueda por fragmento de nombre o SKU (insensible a caja). */
 export function matchesProductQuery(

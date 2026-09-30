@@ -1,11 +1,12 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyMovementStock,
   areSkusConflicting,
   filterLowStock,
   isLowStock,
+  manualMovementSchema,
   matchesProductQuery,
   movementSchema,
   normalizeSku,
@@ -13,6 +14,12 @@ import {
   productSchema,
   sortKardexAscending,
 } from "@/src/features/inventory/schemas";
+import {
+  InventoryError,
+  deductStock,
+  registerManualMovement,
+  registerMovement,
+} from "@/src/features/inventory/service";
 
 const SEDE_A = "11111111-1111-4111-8111-111111111111";
 const SEDE_B = "22222222-2222-4222-8222-222222222222";
@@ -258,5 +265,560 @@ describe("migración 027_products_commission.sql (I1)", () => {
   it("documenta que la línea de factura manda sobre la sugerencia", () => {
     expect(sql).toContain("Precarga la comisión de la línea");
     expect(sql).toContain("el valor editado en la línea manda");
+  });
+});
+
+/**
+ * CL-6: el MOVIMIENTO MANUAL de inventario reintentado.
+ *
+ * Estado del doble de Supabase. `vi.hoisted` lo iza junto con los `vi.mock`,
+ * que en Vitest se ejecutan antes de los imports estáticos del archivo.
+ */
+const invStub = vi.hoisted(() => ({
+  SEDE_ID: "11111111-1111-4111-8111-111111111111",
+  OTHER_SEDE_ID: "22222222-2222-4222-8222-222222222222",
+  PRODUCT_ID: "33333333-3333-4333-8333-333333333333",
+  OTHER_PRODUCT_ID: "44444444-4444-4444-8444-444444444444",
+  /** Filas de `products`: el doble les mueve el stock como el trigger real. */
+  products: [] as Array<Record<string, unknown>>,
+  /** Filas de `inventory_movements` (el kardex que el doble escribe de verdad). */
+  movements: [] as Array<Record<string, unknown>>,
+  /** Consultas que el doble no sabe responder (debe quedar siempre vacío). */
+  unexpectedQueries: [] as string[],
+  /** INSERT de movimientos INTENTADOS (sin marca de éxito): no vacuidad. */
+  movementInserts: 0,
+  /** Choques contra el índice único parcial (prueba de que la carrera corrió). */
+  movementClashes: 0,
+  /** Emulación del contrato del índice parcial. */
+  enforceMarkIndex: true,
+  /**
+   * Saltea UNA vez el lookup por marca: arma la ventana de la carrera (otra
+   * transacción con la MISMA marca se confirmó entre el lookup y el INSERT).
+   */
+  skipMovementLookupOnce: false,
+  /** Fuerza UN 23505 en el INSERT (carrera cuya ganadora ya no está). */
+  forceClashOnce: false,
+  /** Esconde a la ganadora: sin ella el 23505 no es una repetición. */
+  hideWinner: false,
+  nextId: 0,
+}));
+
+function resetInventoryStub(): void {
+  invStub.products.length = 0;
+  invStub.movements.length = 0;
+  invStub.unexpectedQueries.length = 0;
+  invStub.movementInserts = 0;
+  invStub.movementClashes = 0;
+  invStub.enforceMarkIndex = true;
+  invStub.skipMovementLookupOnce = false;
+  invStub.forceClashOnce = false;
+  invStub.hideWinner = false;
+  invStub.nextId = 0;
+}
+
+/** Producto de la sede del actor (el stock es el estado que el doble mueve). */
+function seedStockProduct(
+  id: string = invStub.PRODUCT_ID,
+  stock = 10,
+  sedeId: string = invStub.SEDE_ID,
+): void {
+  invStub.products.push({
+    id,
+    sede_id: sedeId,
+    sku: `SKU-${id.slice(0, 4)}`,
+    name: "Shampoo",
+    description: null,
+    stock_qty: stock,
+    min_stock: 2,
+    cost_price: null,
+    sale_price: null,
+    commission_value: null,
+    is_active: true,
+  });
+}
+
+function stockOf(id: string = invStub.PRODUCT_ID): number {
+  return Number(invStub.products.find((row) => row.id === id)?.stock_qty ?? 0);
+}
+
+/**
+ * Cliente Supabase falso y encadenable. Responde lo que consulta el camino de
+ * `registerMovement` y emula el contrato de 004 en el INSERT, en el MISMO orden
+ * que Postgres: el BEFORE ROW trigger del stock (que rechaza el OUT que deja
+ * negativo), después el índice único, y recién entonces el AFTER trigger que
+ * aplica el stock. Cualquier consulta que no sepa responder vuelve como error y
+ * se registra en `unexpectedQueries`, para que el test falle a la vista.
+ */
+function createInventoryStubClient(): unknown {
+  const from = (table: string) => {
+    let op = "select";
+    let cols = "";
+    let payload: Record<string, unknown> = {};
+    const eqFilters: Record<string, unknown> = {};
+    let inIds: string[] | null = null;
+
+    /**
+     * Proyección de `MOVEMENT_SELECT`: el doble no devuelve más columnas que las
+     * que PostgREST devolvería (las del `select` que pidió el servicio).
+     */
+    const projection = (row: Record<string, unknown>) => {
+      const all: Record<string, unknown> = {
+        id: row.id,
+        sede_id: row.sede_id,
+        product_id: row.product_id,
+        type: row.type,
+        qty: row.qty,
+        reason: row.reason,
+        user_id: row.user_id,
+        created_at: row.created_at,
+      };
+      const wanted = cols.trim() === "" ? Object.keys(all) : cols.split(",").map((c) => c.trim());
+      return Object.fromEntries(wanted.filter((column) => column in all).map((column) => [column, all[column]]));
+    };
+
+    const resolve = async (): Promise<{ data: unknown; error: unknown }> => {
+      if (op === "insert") {
+        if (table === "audit_logs") return { data: null, error: null };
+        if (table !== "inventory_movements") {
+          invStub.unexpectedQueries.push(`${table}.insert`);
+          return { data: null, error: { message: `stub sin respuesta para ${table}.insert` } };
+        }
+        invStub.movementInserts += 1;
+        const product = invStub.products.find((row) => row.id === payload.product_id);
+        const qty = Number(payload.qty);
+        // trg_inventory_no_negative (BEFORE INSERT): el OUT nunca deja negativo.
+        if (payload.type === "OUT" && Number(product?.stock_qty ?? 0) < qty) {
+          return { data: null, error: { code: "P0001", message: "INSUFFICIENT_STOCK" } };
+        }
+        // Índice único PARCIAL (product_id, idempotency_key) WHERE NOT NULL.
+        const mark = (payload.idempotency_key ?? null) as string | null;
+        if (invStub.forceClashOnce) {
+          invStub.forceClashOnce = false;
+          invStub.movementClashes += 1;
+          return {
+            data: null,
+            error: {
+              code: "23505",
+              message:
+                'duplicate key value violates unique constraint "uq_inventory_movements_product_idempotency_key"',
+            },
+          };
+        }
+        if (
+          invStub.enforceMarkIndex &&
+          mark !== null &&
+          invStub.movements.some(
+            (row) => row.product_id === payload.product_id && row.idempotency_key === mark,
+          )
+        ) {
+          invStub.movementClashes += 1;
+          return {
+            data: null,
+            error: {
+              code: "23505",
+              message:
+                'duplicate key value violates unique constraint "uq_inventory_movements_product_idempotency_key"',
+            },
+          };
+        }
+        const row = {
+          id: `mov-${(invStub.nextId += 1)}`,
+          ...payload,
+          idempotency_key: mark,
+          created_at: "2026-01-01T00:00:00.000Z",
+        };
+        invStub.movements.push(row);
+        // trg_inventory_apply_stock (AFTER INSERT): IN suma, OUT resta, ADJUST fija.
+        if (product) {
+          product.stock_qty =
+            payload.type === "IN"
+              ? Number(product.stock_qty) + qty
+              : payload.type === "OUT"
+                ? Number(product.stock_qty) - qty
+                : qty;
+        }
+        return { data: projection(row), error: null };
+      }
+
+      switch (table) {
+        case "products": {
+          if (eqFilters.id !== undefined) {
+            const found = invStub.products.find((row) => row.id === eqFilters.id);
+            return { data: found ? { ...found } : null, error: null };
+          }
+          if (inIds) {
+            return {
+              data: invStub.products
+                .filter((row) => inIds?.includes(row.id as string))
+                .map((row) => ({ ...row })),
+              error: null,
+            };
+          }
+          // Sonda de columna (commission_value) y listados.
+          return { data: invStub.products.map((row) => ({ ...row })), error: null };
+        }
+        case "inventory_movements": {
+          // Lookup por MARCA (el que la 045 hace posible). Se reconoce por su
+          // filtro; devuelve la fila que la marca identifica dentro del
+          // PRODUCTO, o nada. La ventana de la carrera se arma salteándolo UNA
+          // vez, y `hideWinner` lo deja ciego para el caso sin ganadora.
+          if (eqFilters.idempotency_key !== undefined) {
+            if (invStub.skipMovementLookupOnce) {
+              invStub.skipMovementLookupOnce = false;
+              return { data: null, error: null };
+            }
+            if (invStub.hideWinner) return { data: null, error: null };
+            const winner = invStub.movements.find(
+              (row) =>
+                row.product_id === eqFilters.product_id &&
+                row.idempotency_key === eqFilters.idempotency_key,
+            );
+            return { data: winner ? projection(winner) : null, error: null };
+          }
+          invStub.unexpectedQueries.push(`inventory_movements.${op}`);
+          return { data: null, error: { message: `stub sin respuesta para ${table}.${op}` } };
+        }
+        default:
+          invStub.unexpectedQueries.push(`${table}.${op}`);
+          return { data: null, error: { message: `stub sin respuesta para ${table}.${op}` } };
+      }
+    };
+
+    const query: Record<string, unknown> = {
+      select: (value?: string) => {
+        cols = String(value ?? "");
+        return query;
+      },
+      insert: (value: Record<string, unknown>) => {
+        op = "insert";
+        payload = value;
+        return query;
+      },
+      eq: (column: string, value: unknown) => {
+        eqFilters[column] = value;
+        return query;
+      },
+      in: (_column: string, values: string[]) => {
+        inIds = values;
+        return query;
+      },
+      order: () => query,
+      limit: () => query,
+      single: () => resolve(),
+      maybeSingle: () => resolve(),
+      // `await` directo sobre la cadena resuelve al objeto de respuesta.
+      then: (
+        onFulfilled?: (value: unknown) => unknown,
+        onRejected?: (reason: unknown) => unknown,
+      ) => resolve().then(onFulfilled, onRejected),
+    };
+    return query;
+  };
+
+  return { from };
+}
+
+vi.mock("@/src/shared/lib/supabase/server", () => ({
+  createAdminClient: () => createInventoryStubClient(),
+}));
+
+describe("inventory: el movimiento manual reintentado no mueve el stock dos veces (CL-6)", () => {
+  const actor = { userId: "u-caja", sedeId: invStub.SEDE_ID };
+  /** Marca del INTENTO: la acuña la pantalla y la conserva el reintento. */
+  const MARK = "1e5b7c4a-8d29-4f36-a0b1-c7d3e9f2a5b8";
+  /** Otra marca = OTRO intento (control de no-extralimitación). */
+  const OTHER_MARK = "c6f2a809-3b14-4e57-92d8-0a4b7c1e6f93";
+
+  const manualMovement = (overrides: Record<string, unknown> = {}) => ({
+    product_id: invStub.PRODUCT_ID,
+    type: "IN",
+    qty: 5,
+    reason: "Conteo físico",
+    idempotency_key: MARK,
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    resetInventoryStub();
+    seedStockProduct();
+  });
+
+  it("ROJO/VERDE: el reintento del MISMO movimiento manual escribe UNA vez y mueve el stock UNA vez", async () => {
+    const first = await registerMovement(manualMovement(), actor);
+    // El reintento: el navegador reenvía el MISMO envío (misma marca).
+    const second = await registerMovement(manualMovement(), actor);
+
+    expect(invStub.movements).toHaveLength(1);
+    expect(stockOf()).toBe(15);
+    expect(second.movement.id).toBe(first.movement.id);
+    expect(second.stock_qty).toBe(first.stock_qty);
+    // No vacuidad: el primer intento SÍ escribió, y el reintento no intentó
+    // escribir (lo reconoció el lookup, antes del INSERT).
+    expect(invStub.movementInserts).toBe(1);
+    expect(invStub.movementClashes).toBe(0);
+  });
+
+  it("control de no-extralimitación: otra MARCA es otro intento y escribe de nuevo", async () => {
+    await registerMovement(manualMovement(), actor);
+    await registerMovement(manualMovement({ idempotency_key: OTHER_MARK }), actor);
+
+    expect(invStub.movements).toHaveLength(2);
+    expect(stockOf()).toBe(20);
+  });
+
+  it("la marca es OBLIGATORIA en la frontera manual y opcional en la función compartida", () => {
+    const sinMarca = { product_id: invStub.PRODUCT_ID, type: "IN", qty: 5, reason: "Conteo" };
+    // Compartida: opcional, porque los caminos de facturación no tienen intento propio.
+    expect(movementSchema.safeParse(sinMarca).success).toBe(true);
+    // Frontera manual: obligatoria (y con la MISMA definición de marca que el dinero).
+    expect(manualMovementSchema.safeParse(sinMarca).success).toBe(false);
+    expect(manualMovementSchema.safeParse({ ...sinMarca, idempotency_key: MARK }).success).toBe(true);
+    expect(
+      manualMovementSchema.safeParse({ ...sinMarca, idempotency_key: "no-es-un-uuid" }).success,
+    ).toBe(false);
+  });
+
+  it("el camino MANUAL (registerManualMovement) es idempotente de punta a punta", async () => {
+    const first = await registerManualMovement(manualMovement(), actor);
+    const second = await registerManualMovement(manualMovement(), actor);
+
+    expect(invStub.movements).toHaveLength(1);
+    expect(stockOf()).toBe(15);
+    expect(second).toEqual(first);
+    expect(invStub.movementInserts).toBe(1);
+  });
+
+  it("sin marca o con marca mal formada la frontera manual rechaza con 400 y CERO escrituras", async () => {
+    const sinMarca = await registerManualMovement(
+      { product_id: invStub.PRODUCT_ID, type: "IN", qty: 5, reason: "Conteo físico" },
+      actor,
+    ).then(
+      () => "escrito" as const,
+      (error: unknown) => error,
+    );
+    const malFormada = await registerManualMovement(
+      manualMovement({ idempotency_key: "no-es-un-uuid" }),
+      actor,
+    ).then(
+      () => "escrito" as const,
+      (error: unknown) => error,
+    );
+
+    expect(sinMarca).toBeInstanceOf(InventoryError);
+    expect(sinMarca).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(malFormada).toBeInstanceOf(InventoryError);
+    expect(malFormada).toMatchObject({ code: "VALIDATION", status: 400 });
+    // El rechazo corre ANTES de cualquier escritura: sin fila y con el stock intacto.
+    expect(invStub.movements).toHaveLength(0);
+    expect(invStub.movementInserts).toBe(0);
+    expect(stockOf()).toBe(10);
+    expect(invStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("un reintento de OUT se reconoce aunque el stock ya bajó (el lookup corre antes de la aritmética)", async () => {
+    const first = await registerManualMovement(manualMovement({ type: "OUT", qty: 10 }), actor);
+    expect(stockOf()).toBe(0);
+
+    // Con la aritmética primero, este reintento moriría con INSUFFICIENT_STOCK:
+    // el primer intento YA movió el stock. El lookup lo reconoce antes.
+    const again = await registerManualMovement(manualMovement({ type: "OUT", qty: 10 }), actor);
+
+    expect(again.movement.id).toBe(first.movement.id);
+    expect(stockOf()).toBe(0);
+    expect(invStub.movements).toHaveLength(1);
+  });
+
+  it("control negativo: manda la MARCA, no el contenido (misma marca con otro tipo, cantidad y motivo)", async () => {
+    const first = await registerManualMovement(manualMovement(), actor);
+    const second = await registerManualMovement(
+      manualMovement({ type: "ADJUST", qty: 99, reason: "Otro motivo" }),
+      actor,
+    );
+
+    expect(second.movement.id).toBe(first.movement.id);
+    expect(second.movement.type).toBe("IN");
+    expect(second.movement.qty).toBe(5);
+    expect(invStub.movements).toHaveLength(1);
+    expect(stockOf()).toBe(15);
+  });
+
+  it("la carrera (misma marca entre el lookup y el INSERT) relee a la ganadora y no escribe una segunda fila", async () => {
+    const first = await registerManualMovement(manualMovement(), actor);
+    // La otra transacción se confirmó entre el lookup y el INSERT de esta: el
+    // doble saltea el lookup para armar exactamente esa ventana.
+    invStub.skipMovementLookupOnce = true;
+
+    const second = await registerManualMovement(manualMovement(), actor);
+
+    expect(second.movement.id).toBe(first.movement.id);
+    expect(second.stock_qty).toBe(15);
+    expect(invStub.movements).toHaveLength(1);
+    expect(stockOf()).toBe(15);
+    // No vacuidad: el INSERT de la segunda SÍ se intentó (dos intentos, una
+    // fila) y el choque contra el índice único parcial fue lo que lo cortó.
+    expect(invStub.movementInserts).toBe(2);
+    expect(invStub.movementClashes).toBe(1);
+  });
+
+  it("la carrera SIN ganadora no se disfraza de repetición: INTERNAL, sin filas y sin mover el stock", async () => {
+    invStub.forceClashOnce = true;
+    invStub.hideWinner = true;
+
+    const outcome = await registerManualMovement(manualMovement(), actor).then(
+      () => "escrito" as const,
+      (error: unknown) => error,
+    );
+
+    expect(outcome).toBeInstanceOf(InventoryError);
+    expect(outcome).toMatchObject({ code: "INTERNAL", status: 500 });
+    expect(invStub.movements).toHaveLength(0);
+    expect(stockOf()).toBe(10);
+    expect(invStub.movementClashes).toBe(1);
+  });
+
+  it("multi-identidad de la clave (product_id, idempotency_key): la MISMA marca en OTRO producto es OTRA operación", async () => {
+    seedStockProduct(invStub.OTHER_PRODUCT_ID, 4);
+
+    const first = await registerManualMovement(manualMovement(), actor);
+    const second = await registerManualMovement(
+      manualMovement({ product_id: invStub.OTHER_PRODUCT_ID }),
+      actor,
+    );
+
+    expect(invStub.movements).toHaveLength(2);
+    expect(stockOf()).toBe(15);
+    expect(stockOf(invStub.OTHER_PRODUCT_ID)).toBe(9);
+    // Y repetir el segundo sigue siendo UNA repetición, no una tercera fila.
+    const repeat = await registerManualMovement(
+      manualMovement({ product_id: invStub.OTHER_PRODUCT_ID }),
+      actor,
+    );
+    expect(repeat.movement.id).toBe(second.movement.id);
+    expect(first.movement.id).not.toBe(second.movement.id);
+    expect(invStub.movements).toHaveLength(2);
+  });
+
+  it("la marca se resuelve dentro de la sede del actor: un producto de otra sede se rechaza con 403 y sin escrituras", async () => {
+    const AJENO = "55555555-5555-4555-8555-555555555555";
+    seedStockProduct(AJENO, 7, invStub.OTHER_SEDE_ID);
+
+    const outcome = await registerManualMovement(
+      manualMovement({ product_id: AJENO }),
+      actor,
+    ).then(
+      () => "escrito" as const,
+      (error: unknown) => error,
+    );
+
+    expect(outcome).toBeInstanceOf(InventoryError);
+    expect(outcome).toMatchObject({ code: "FORBIDDEN", status: 403 });
+    expect(invStub.movements).toHaveLength(0);
+    expect(stockOf(AJENO)).toBe(7);
+  });
+
+  it("control de no-extralimitación: el camino de FACTURACIÓN descuenta stock SIN marca (la marca es opcional ahí)", async () => {
+    const planned = await deductStock(
+      actor,
+      [{ product_id: invStub.PRODUCT_ID, qty: 2 }],
+      "FACTURA #1",
+    );
+
+    expect(planned).toEqual([{ product_id: invStub.PRODUCT_ID, qty: 2 }]);
+    expect(invStub.movements).toHaveLength(1);
+    expect(invStub.movements[0]).toMatchObject({
+      type: "OUT",
+      qty: 2,
+      reason: "FACTURA #1",
+      // Sin marca: la fila queda FUERA del índice parcial de la 045.
+      idempotency_key: null,
+    });
+    expect(stockOf()).toBe(8);
+    // El mismo descuento por el camino de facturación vuelve a descontar: esa
+    // puerta la cierra la MARCA DE LA FACTURA (041), no una marca que este
+    // camino no tiene. Deduplicar por CONTENIDO acá sería el error opuesto.
+    await deductStock(actor, [{ product_id: invStub.PRODUCT_ID, qty: 2 }], "FACTURA #1");
+    expect(invStub.movements).toHaveLength(2);
+    expect(stockOf()).toBe(6);
+  });
+
+  it("la frontera MANUAL (server action y ruta REST) llama a registerManualMovement y NO a registerMovement", () => {
+    const sources = [
+      readFileSync(join(process.cwd(), "src", "features", "inventory", "actions.ts"), "utf8"),
+      readFileSync(
+        join(process.cwd(), "app", "api", "v1", "inventory", "movements", "route.ts"),
+        "utf8",
+      ),
+    ];
+
+    for (const source of sources) {
+      const imported = source.match(
+        /import\s*\{([^}]*)\}\s*from\s*"(?:\.\/|@\/src\/features\/inventory\/)service"/,
+      );
+      expect(imported).not.toBeNull();
+      const names = (imported?.[1] ?? "").split(",").map((name) => name.trim());
+      expect(names).toContain("registerManualMovement");
+      // El camino manual no puede saltar la frontera: si importara la función
+      // compartida, un envío sin marca volvería a escribir sin control.
+      expect(names).not.toContain("registerMovement");
+      expect(source).toMatch(/await registerManualMovement\(/);
+    }
+  });
+});
+
+describe("migración 045_inventory_movement_idempotency.sql (CL-6)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "045_inventory_movement_idempotency.sql"),
+    "utf8",
+  );
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("agrega la marca nullable y re-ejecutable, con guarda de forma", () => {
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS idempotency_key text NULL");
+    expect(sql).toContain(
+      "DROP CONSTRAINT IF EXISTS inventory_movements_idempotency_key_shape",
+    );
+    expect(sql).toContain("[0-9a-f]{8}");
+    expect(sql).toContain("COMMENT ON COLUMN public.inventory_movements.idempotency_key");
+  });
+
+  it("la barrera final es un índice único PARCIAL sobre (product_id, idempotency_key)", () => {
+    expect(sql).toContain(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_movements_product_idempotency_key",
+    );
+    expect(sql).toContain("ON public.inventory_movements (product_id, idempotency_key)");
+    expect(sql).toContain("WHERE idempotency_key IS NOT NULL");
+  });
+
+  it("no borra ni reescribe filas de datos, y no toca el stock ni los triggers", () => {
+    expect(sql).not.toMatch(/^\s*DELETE/im);
+    expect(sql).not.toMatch(/^\s*UPDATE\s/im);
+    expect(sql).not.toMatch(/^\s*TRUNCATE/im);
+    expect(sql).not.toMatch(/^\s*ALTER COLUMN/im);
+    expect(sql).not.toMatch(/^\s*CREATE OR REPLACE FUNCTION/im);
+    expect(sql).not.toContain("DROP TRIGGER");
+    expect(sql).not.toContain("products.stock_qty =");
+  });
+
+  it("justifica la clave del índice contra la alternativa por sede", () => {
+    expect(raw).toContain("LA CLAVE DEL ÍNDICE");
+    expect(raw).toContain("POR QUÉ NO `(sede_id, idempotency_key)`");
+    expect(raw).toContain("el mismo\n-- `eq` set");
+  });
+
+  it("declara el costo de numeración, el acoplamiento de despliegue y las ventanas", () => {
+    // El costo de NUMERACIÓN de la tabla: ninguno (no hay serie que quemar).
+    expect(raw).toContain("AQUÍ NO SE QUEMA NINGÚN NÚMERO");
+    expect(raw).toContain("uuid PRIMARY KEY DEFAULT gen_random_uuid()");
+    expect(raw).toContain("kardex tampoco es una serie numerada");
+    // El costo de numeración del ARCHIVO: 045, el siguiente libre.
+    expect(raw).toContain("032 no existe y no existirá");
+    expect(raw).toContain("045 va ANTES que este código");
+    expect(raw).toContain("VENTANAS DECLARADAS");
+    expect(raw).toContain("ORDEN DE LOS STATEMENTS");
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos");
   });
 });
