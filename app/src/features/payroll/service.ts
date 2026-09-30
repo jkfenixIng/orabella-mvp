@@ -1947,6 +1947,40 @@ export async function closePayrollPeriod(
   }
 }
 
+/** PAY-01: el rechazo por solapamiento con un período CERRADO. Una sola
+ * redacción: la usan el chequeo previo del servicio y la traducción del
+ * rechazo que devuelve el RPC (CL-9), porque es el mismo rechazo. */
+const PERIOD_OVERLAP_MESSAGE =
+  "No se puede borrar: otro período CERRADO de la sede solapa este rango y no se puede determinar qué vales pertenecen a este borrador sin revertir una nómina ya pagada.";
+
+/**
+ * CL-9: el error del RPC `payroll_delete_period_atomic` (048) traducido al
+ * contrato de negocio del borrado.
+ *
+ * La forma del error es la de PostgREST —un objeto `{code, message, …}`, no un
+ * `Error`—, así que lo único confiable es el mensaje de la `RAISE EXCEPTION`
+ * del servidor (misma lección que `toRpcDeductionError`, inventario). Los dos
+ * rechazos de ESTADO —el período dejó de ser borrador, o los vales cambiaron
+ * bajo los pies— comparten código y mensaje: para quien llama son la misma cosa
+ * (el borrador ya no se puede borrar como se leyó) y la acción es la misma:
+ * releer y reintentar. El solapamiento conserva el código y el mensaje que el
+ * servicio ya devolvía antes de escribir, porque es el mismo rechazo.
+ */
+function toRpcDeletePeriodError(error: { message?: unknown } | null): PayrollError {
+  const message = String(error?.message ?? "");
+  if (message.includes("PERIOD_OVERLAP_AMBIGUOUS")) {
+    return new PayrollError("PERIOD_OVERLAP_AMBIGUOUS", PERIOD_OVERLAP_MESSAGE, 409);
+  }
+  if (message.includes("PAYROLL_PERIOD_CONFLICT") || message.includes("PAYROLL_VOUCHER_CONFLICT")) {
+    return new PayrollError(
+      "PERIOD_DELETE_CONFLICT",
+      "No se pudo borrar el período: el borrador o sus vales cambiaron mientras se borraba. Vuelva a intentar.",
+      409,
+    );
+  }
+  return new PayrollError("INTERNAL", "Error interno.", 500);
+}
+
 /**
  * PAY-01: borra un período en BORRADOR (es provisional, no historia). Solo
  * admin (lo aplican ruta/action).
@@ -1963,6 +1997,16 @@ export async function closePayrollPeriod(
  *   revertir esos vales destruiría historia. Solapar con otros borradores no
  *   bloquea, pues nada está pagado y el borrador restante puede recalcularse.
  *   El estado previo se infiere de `approved_by` (ver restoreVoucherStatus).
+ *
+ * CL-9: la reversión y el borrado son UNA sola transacción del servidor (RPC
+ * `payroll_delete_period_atomic`, 048): o quedan los vales revertidos Y el
+ * período borrado, o no queda nada. Un fallo en el medio ya no puede dejar los
+ * vales revertidos con el borrador en pie. La regla de a qué estado vuelve cada
+ * vale sigue siendo la de acá (`restoreVoucherStatus`), y las precondiciones
+ * —sólo borrador, y el solapamiento con un período CERRADO— se re-verifican
+ * dentro de la transacción: un borrado concurrente o un cierre son un rechazo
+ * (PERIOD_DELETE_CONFLICT / PERIOD_OVERLAP_AMBIGUOUS), nunca un pisotón
+ * silencioso.
  */
 export async function deletePayrollPeriod(
   sedeId: string,
@@ -1995,11 +2039,7 @@ export async function deletePayrollPeriod(
       (row) => row.status,
     );
     if (overlapBlocksDeletion(overlappingStatuses)) {
-      throw new PayrollError(
-        "PERIOD_OVERLAP_AMBIGUOUS",
-        "No se puede borrar: otro período CERRADO de la sede solapa este rango y no se puede determinar qué vales pertenecen a este borrador sin revertir una nómina ya pagada.",
-        409,
-      );
+      throw new PayrollError("PERIOD_OVERLAP_AMBIGUOUS", PERIOD_OVERLAP_MESSAGE, 409);
     }
 
     // Devuelve a su estado previo los vales que este borrador descontó.
@@ -2018,26 +2058,52 @@ export async function deletePayrollPeriod(
     const backToPending = voucherRows
       .filter((row) => restoreVoucherStatus(row.approved_by) === "pendiente")
       .map((row) => row.id);
-    if (backToApproved.length > 0) {
-      const { error } = await db
-        .from("voucher_requests")
-        .update({ status: "aprobada" })
-        .in("id", backToApproved)
-        .eq("status", "descontada");
-      if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
-    }
-    if (backToPending.length > 0) {
-      const { error } = await db
-        .from("voucher_requests")
-        .update({ status: "pendiente" })
-        .in("id", backToPending)
-        .eq("status", "descontada");
-      if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
-    }
 
-    // Los ítems (y por cascada sus pagos) caen con el período.
-    const { error: deleteError } = await db.from("payroll_periods").delete().eq("id", periodId);
-    if (deleteError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    // CL-9: la reversión de los vales y el borrado del período son UNA sola
+    // escritura. Una función SQL es UNA sentencia, y una sentencia corre ENTERA
+    // dentro de una sola transacción del servidor (PostgREST no ofrece
+    // multi-statement por request). Antes esto eran DOS requests de reversión
+    // —uno por estado destino— y DESPUÉS el `DELETE` del período: un fallo en el
+    // medio dejaba los vales YA revertidos y el borrador EN PIE —los vales
+    // diciendo `aprobada`/`pendiente` mientras la liquidación que los descontaba
+    // seguía ahí—, o la reversión a medias con el borrador todavía en pie. Ya no
+    // hay "mitad del camino" donde fallar.
+    //
+    // La REGLA no se mueve: quién vuelve a `aprobada` y quién a `pendiente` lo
+    // sigue decidiendo `restoreVoucherStatus` acá, y el RPC sólo escribe los dos
+    // grupos que recibe. Las precondiciones que el servicio ya revisaba —sólo
+    // borrador, y el solapamiento con un período CERRADO— las repite el RPC
+    // adentro de la transacción, sobre la fila bloqueada: no son un camino que
+    // la transacción saltee, son un rechazo que la transacción no puede perder.
+    const { data: reverted, error: revertError } = await db.rpc("payroll_delete_period_atomic", {
+      p_sede_id: sedeId,
+      p_period_id: periodId,
+      p_to_approved: backToApproved,
+      p_to_pending: backToPending,
+    });
+    if (revertError) {
+      console.error(
+        "[payroll] deletePayrollPeriod: fallo al revertir los vales y borrar el período:",
+        JSON.stringify({
+          periodId,
+          a_aprobada: backToApproved.length,
+          a_pendiente: backToPending.length,
+          code: revertError.code,
+          message: revertError.message,
+          details: revertError.details,
+          hint: revertError.hint,
+        }),
+      );
+      throw toRpcDeletePeriodError(revertError);
+    }
+    // Segunda barrera en la frontera: la función ya revierte si no revirtió
+    // exactamente los vales que recibió, así que un conteo distinto sólo puede
+    // venir de una respuesta incoherente. Se reporta como fallo real en vez de
+    // devolver un borrado que la base no aplicó.
+    const expectedReverts = backToApproved.length + backToPending.length;
+    if (typeof reverted !== "number" || reverted !== expectedReverts) {
+      throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
 
     await writeAudit({
       sede_id: sedeId,
@@ -2048,7 +2114,7 @@ export async function deletePayrollPeriod(
       metadata: {
         start_date: period.start_date,
         end_date: period.end_date,
-        vales_revertidos: backToApproved.length + backToPending.length,
+        vales_revertidos: expectedReverts,
       },
     });
     return { id: periodId };
@@ -2103,6 +2169,13 @@ export async function deletePayrollPeriod(
  * ninguno: los vales ya quedaron en `descontada` al liquidar y ahí siguen.
  *
  * Solo admin (vía `requirePayrollAdmin` en la action): es nómina.
+ *
+ * CL-9: la cabecera de la corrección y sus filas por empleado se escriben en UNA
+ * sola transacción del servidor (RPC `payroll_correct_period_atomic`, 048): o
+ * quedan las dos, o no queda ninguna. Un fallo en el medio ya no puede dejar la
+ * corrección firmada sin sus filas —que era un callejón sin salida, porque el
+ * índice único por período rechaza el reintento con ALREADY_CORRECTED—. La
+ * aritmética sigue siendo la de acá: el RPC sólo escribe lo que recibe.
  */
 export async function correctPayrollPeriod(
   sedeId: string,
@@ -2206,22 +2279,75 @@ export async function correctPayrollPeriod(
       ),
     });
 
-    const { data: inserted, error } = await db
-      .from("payroll_period_corrections")
-      .insert({
-        period_id: periodId,
-        previous_net_total: view.previousNetTotal,
-        previous_paid_total: view.paidTotal,
-        corrected_net_total: view.correctedNetTotal,
-        previous_item_count: previousItems.length,
-        corrected_item_count: payload.length,
-        reason: parsed.data.reason,
-        corrected_by: actor.userId,
-      })
-      .select(PERIOD_CORRECTION_SELECT)
-      .single();
-    if (error || !inserted) {
-      // Carrera perdida contra el índice único por período: otra corrección ganó.
+    // CL-9: la cabecera de la corrección y sus filas por empleado son UNA sola
+    // escritura. Una función SQL es UNA sentencia, y una sentencia corre ENTERA
+    // dentro de una sola transacción del servidor (PostgREST no ofrece
+    // multi-statement por request). Antes esto eran DOS requests: el INSERT de
+    // la cabecera y después el de las filas. Un fallo entre los dos dejaba la
+    // corrección FIRMADA sin sus filas —y sin salida: el índice único por
+    // período de 037 (una corrección por período) hace que el reintento
+    // responda ALREADY_CORRECTED—, que es la peor de las ventanas de estado
+    // parcial: un registro firmado sin su prueba. Ya no hay "mitad del camino"
+    // donde fallar.
+    //
+    // La ARITMÉTICA no se mueve: la cabecera y las filas de las dos versiones
+    // salen de `computePayrollLines` y de `buildPayrollCorrectionView`, acá
+    // arriba, y el RPC sólo ESCRIBE lo que recibe. Las precondiciones
+    // (`assertCorrectablePeriod`: sólo un período CERRADO, de la sede del actor)
+    // y la barrera de "una por período" se re-verifican dentro de la
+    // transacción, con la fila del período bloqueada: una carrera se rechaza
+    // (ALREADY_CORRECTED) en vez de dejar nada escrito.
+    const correctionPayload = {
+      period_id: periodId,
+      previous_net_total: view.previousNetTotal,
+      previous_paid_total: view.paidTotal,
+      corrected_net_total: view.correctedNetTotal,
+      previous_item_count: previousItems.length,
+      corrected_item_count: payload.length,
+      reason: parsed.data.reason,
+      corrected_by: actor.userId,
+    };
+    // Las dos versiones por empleado, en la misma tabla de la corrección: la
+    // fila es autocontenida y no depende de `payroll_items` (que sigue siendo
+    // el original firmado).
+    const correctionItemPayload = view.rows.map((row) => ({
+      employee_id: row.employee_id,
+      previous_base_fixed: roundMoney(Number(row.previous.base_fixed)),
+      previous_commissions: roundMoney(Number(row.previous.commissions)),
+      previous_bonuses: roundMoney(Number(row.previous.bonuses)),
+      previous_deductions_vales: roundMoney(Number(row.previous.deductions_vales)),
+      previous_other_discounts: roundMoney(Number(row.previous.other_discounts)),
+      previous_net_pay: roundMoney(Number(row.previous.net_pay)),
+      previous_paid: roundMoney(Number(row.paid)),
+      corrected_base_fixed: roundMoney(Number(row.corrected.base_fixed)),
+      corrected_commissions: roundMoney(Number(row.corrected.commissions)),
+      corrected_bonuses: roundMoney(Number(row.corrected.bonuses)),
+      corrected_deductions_vales: roundMoney(Number(row.corrected.deductions_vales)),
+      corrected_other_discounts: roundMoney(Number(row.corrected.other_discounts)),
+      corrected_net_pay: roundMoney(Number(row.corrected.net_pay)),
+    }));
+
+    const { data: applied, error } = await db.rpc("payroll_correct_period_atomic", {
+      p_sede_id: sedeId,
+      p_period_id: periodId,
+      p_correction: correctionPayload,
+      p_items: correctionItemPayload,
+    });
+    if (error) {
+      console.error(
+        "[payroll] correctPayrollPeriod: fallo al escribir la corrección y sus filas:",
+        JSON.stringify({
+          periodId,
+          filas: correctionItemPayload.length,
+          code: error.code,
+          message: error.message,
+          details: error.details,
+          hint: error.hint,
+        }),
+      );
+      // Carrera perdida contra el índice único por período: otra corrección ganó
+      // (o la ya existente que el chequeo de arriba no llegó a ver). La base
+      // abortó la transacción ENTERA: no queda nada escrito.
       if ((error as { code?: string } | null)?.code === "23505") {
         throw new PayrollError(
           "ALREADY_CORRECTED",
@@ -2229,33 +2355,31 @@ export async function correctPayrollPeriod(
           409,
         );
       }
+      // La precondición de estado, re-verificada por el RPC sobre la fila
+      // bloqueada: el mismo rechazo que el servicio ya devolvía antes.
+      if (String((error as { message?: string }).message ?? "").includes("PERIOD_NOT_CLOSED")) {
+        throw new PayrollError(
+          "PERIOD_NOT_CLOSED",
+          "Solo se corrigen períodos cerrados; este está en borrador y se recalcula.",
+          409,
+        );
+      }
       throw new PayrollError("INTERNAL", "Error interno.", 500);
     }
-    const correction = inserted as PayrollPeriodCorrectionRow;
-
-    // Las dos versiones por empleado, en la misma tabla de la corrección: la
-    // fila es autocontenida y no depende de `payroll_items` (que sigue siendo
-    // el original firmado).
-    const { error: itemsError } = await db.from("payroll_period_correction_items").insert(
-      view.rows.map((row) => ({
-        correction_id: correction.id,
-        employee_id: row.employee_id,
-        previous_base_fixed: roundMoney(Number(row.previous.base_fixed)),
-        previous_commissions: roundMoney(Number(row.previous.commissions)),
-        previous_bonuses: roundMoney(Number(row.previous.bonuses)),
-        previous_deductions_vales: roundMoney(Number(row.previous.deductions_vales)),
-        previous_other_discounts: roundMoney(Number(row.previous.other_discounts)),
-        previous_net_pay: roundMoney(Number(row.previous.net_pay)),
-        previous_paid: roundMoney(Number(row.paid)),
-        corrected_base_fixed: roundMoney(Number(row.corrected.base_fixed)),
-        corrected_commissions: roundMoney(Number(row.corrected.commissions)),
-        corrected_bonuses: roundMoney(Number(row.corrected.bonuses)),
-        corrected_deductions_vales: roundMoney(Number(row.corrected.deductions_vales)),
-        corrected_other_discounts: roundMoney(Number(row.corrected.other_discounts)),
-        corrected_net_pay: roundMoney(Number(row.corrected.net_pay)),
-      })),
-    );
-    if (itemsError) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    // Segunda barrera en la frontera: la función ya revierte si no escribió
+    // exactamente las filas que recibió, así que una cabecera incoherente sólo
+    // puede venir de una respuesta que no es la que la base aplicó. Se reporta
+    // como fallo real en vez de devolver una corrección que la base no firmó.
+    const inserted = applied as PayrollPeriodCorrectionRow | null;
+    if (
+      !inserted ||
+      typeof inserted.id !== "string" ||
+      inserted.period_id !== periodId ||
+      Number(inserted.corrected_item_count) !== payload.length
+    ) {
+      throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
+    const correction = inserted;
 
     // La auditoría lleva el motivo y los totales de las DOS versiones: un
     // auditor tiene que poder leer qué cambió sin abrir la pantalla.
