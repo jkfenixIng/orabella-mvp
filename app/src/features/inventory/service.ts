@@ -1,6 +1,7 @@
 import {
   applyMovementStock,
   filterLowStock,
+  manualMovementSchema,
   matchesProductQuery,
   movementSchema,
   normalizeSku,
@@ -271,6 +272,73 @@ export interface RegisterMovementResult {
 }
 
 /**
+ * CL-6: el movimiento del PRODUCTO que YA se registró con esa marca, si existe.
+ *
+ * La marca es un uuid que acuña la pantalla al empezar el intento de movimiento
+ * y que reutiliza en los reintentos del MISMO intento; ver `idempotencyKeySchema`
+ * (billing/schemas.ts) y `manualMovementSchema` (schemas.ts). El filtro es por el
+ * PRODUCTO: el registro de esta operación es el producto —es donde vive el stock,
+ * es la dimensión del kardex (`idx_movements_product_created`) y es lo que el
+ * servicio resuelve y valida dentro de la sede del actor ANTES de este lookup—,
+ * así que el lookup nunca puede devolver el movimiento de otro producto ni el de
+ * otra sede, y la misma marca en dos productos distintos son DOS operaciones.
+ * La clave del índice de la 045 es la MISMA (`product_id, idempotency_key`): el
+ * `eq` de este lookup y la clave del índice son el mismo conjunto, así que este
+ * lookup no puede devolver una fila que el índice no habría bloqueado.
+ *
+ * La SEDE NO entra en la clave porque no agrega identidad: `products.sede_id`
+ * determina la sede de la fila y el servicio exige que sea la del actor
+ * (`resolveSedeOrThrow`) antes de llegar acá, así que la marca se resuelve dentro
+ * del tenant que la usó y este lookup no puede filtrar el movimiento de otra
+ * sede. La MISMA marca para OTRO producto es OTRA operación (agregar la sede a
+ * la clave, en cambio, colapsaría dos movimientos legítimos de productos
+ * distintos de la misma sede bajo una sola marca, y devolvería el movimiento del
+ * producto equivocado como si fuera la repetición del que se pidió).
+ */
+async function findMovementByIdempotencyKey(
+  db: Awaited<ReturnType<typeof inventoryDb>>,
+  productId: string,
+  idempotencyKey: string,
+): Promise<MovementRow | null> {
+  const { data, error } = await db
+    .from("inventory_movements")
+    .select(MOVEMENT_SELECT)
+    .eq("product_id", productId)
+    .eq("idempotency_key", idempotencyKey)
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
+  return (data as MovementRow | null) ?? null;
+}
+
+/**
+ * CL-6: frontera del movimiento MANUAL. Valida con `manualMovementSchema`, que
+ * exige `idempotency_key` (la marca del INTENTO), y delega en `registerMovement`.
+ *
+ * Por qué existe: `registerMovement` la comparten el camino manual y el de
+ * FACTURACIÓN (emisión, anulación, edición), y esos últimos no tienen un intento
+ * propio del cliente. La marca se exige SOLO acá, en la puerta del camino manual
+ * (la server action `registerMovementAction` y la ruta
+ * `POST /api/v1/inventory/movements` llaman a ESTA función, y ninguna llama a
+ * `registerMovement` directo), así que no se le inventa un intento a la
+ * facturación.
+ *
+ * El rechazo es ruidoso y NO escribe nada: la validación corre ANTES de la
+ * primera lectura y de la primera escritura (el movimiento y el stock quedan
+ * intactos).
+ */
+export async function registerManualMovement(
+  raw: unknown,
+  actor: { userId: string; sedeId: string },
+): Promise<RegisterMovementResult> {
+  const parsed = manualMovementSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new InventoryError("VALIDATION", validationMessage(parsed.error), 400);
+  }
+  return registerMovement(parsed.data, actor);
+}
+
+/**
  * INV-02/INV-03/INV-04: registra un movimiento y devuelve el stock
  * resultante. IN suma, OUT resta (bloqueado si quedaría negativo),
  * ADJUST fija el nivel con motivo obligatorio.
@@ -279,6 +347,30 @@ export interface RegisterMovementResult {
  * escritor); aquí se pre-verifica con applyMovementStock para un error de
  * negocio claro y se traduce la excepción INSUFFICIENT_STOCK del trigger
  * (carreras concurrentes) al mismo código 409.
+ *
+ * CL-6 (idempotencia): si el movimiento trae la MARCA del intento
+ * (`idempotency_key`, columna e índice único parcial de la 045), el orden
+ * empieza por el producto —`getProduct` + `resolveSedeOrThrow`, que es lo que
+ * valida el registro dentro de la sede del actor, así el lookup no puede
+ * devolver el movimiento de otra sede— y sigue con el lookup por marca ANTES de
+ * la aritmética y de cualquier escritura. Un reintento del MISMO envío (doble
+ * clic, o el navegador reenviando tras cortarse la red) se reconoce y devuelve
+ * el movimiento ya registrado como un no-op EXITOSO: no escribe una segunda
+ * fila y no mueve el stock otra vez.
+ *
+ * POR QUÉ EL LOOKUP VA ANTES DE LA ARITMÉTICA: `applyMovementStock` rechaza el
+ * OUT que dejaría el stock negativo. Como el primer intento YA movió el stock,
+ * un reintento evaluado contra el stock de AHORA moriría con INSUFFICIENT_STOCK
+ * —un error por una operación que SÍ se registró—. Es el mismo razonamiento de
+ * CL-2/CL-3/CL-5 para las puertas del dinero.
+ *
+ * POR QUÉ LA MARCA ES OPCIONAL ACÁ: a esta función la llaman también los caminos
+ * de FACTURACIÓN, que no tienen un intento propio del cliente y ya están
+ * cubiertos por sus propias guardas (la marca de la emisión, el testigo de
+ * serialización de la edición, el compare-and-swap de la anulación). La
+ * obligatoriedad vive en la frontera manual (`registerManualMovement` /
+ * `manualMovementSchema`). El detalle del índice y de la clave está escrito en
+ * la 045.
  */
 export async function registerMovement(
   raw: unknown,
@@ -293,6 +385,23 @@ export async function registerMovement(
 
   const product = await getProduct(input.product_id);
   resolveSedeOrThrow(actor.sedeId, product.sede_id);
+
+  // CL-6: la MARCA del intento, ANTES de la aritmética y de cualquier
+  // escritura. El reintento del MISMO envío trae la misma marca: se devuelve el
+  // movimiento ya registrado, sin escribir y sin recalcular contra el stock que
+  // el primer intento ya movió. El stock que se informa es el de AHORA (leído
+  // en esta misma llamada): el reintento no mueve nada y en el caso real —doble
+  // clic o reenvío segundos después, sin otra escritura en el medio— coincide
+  // con el que devolvió el primer intento. Es el stock vigente, no una foto de
+  // la primera respuesta.
+  if (input.idempotency_key) {
+    const repeated = await findMovementByIdempotencyKey(
+      db,
+      input.product_id,
+      input.idempotency_key,
+    );
+    if (repeated) return { movement: repeated, stock_qty: product.stock_qty };
+  }
 
   try {
     applyMovementStock(product.stock_qty, input.type, input.qty);
@@ -316,6 +425,10 @@ export async function registerMovement(
       qty: input.qty,
       reason: input.reason,
       user_id: actor.userId,
+      // CL-6: la marca del intento. Sin marca queda NULL y la fila queda FUERA
+      // del índice parcial de la 045 (los caminos de facturación, que no
+      // tienen intento propio, no entran al índice y no compiten con nadie).
+      idempotency_key: input.idempotency_key ?? null,
     })
     .select(MOVEMENT_SELECT)
     .single();
@@ -326,6 +439,32 @@ export async function registerMovement(
         "Stock insuficiente: el movimiento dejaría el stock negativo.",
         409,
       );
+    }
+    // CL-6: carrera perdida contra el índice único parcial de la 045 (23505). El
+    // lookup de arriba y este INSERT no son atómicos: si otro envío con la MISMA
+    // marca para el MISMO producto se confirmó en esa ventana, la repetición se
+    // relee y se devuelve. Sin ganadora, el 23505 NO es una repetición y se
+    // reporta como fallo real (INTERNAL) en vez de disfrazarlo de éxito.
+    //
+    // El chequeo de INSUFFICIENT_STOCK va primero porque el trigger BEFORE ROW
+    // del stock (004) corre antes de la comprobación del índice: un OUT que
+    // además dejaría el stock negativo llega como INSUFFICIENT_STOCK, no como
+    // 23505. Es una ventana declarada (ver la 045): el rechazo es ruidoso y la
+    // misma marca sigue reconociendo cuando la guarda se levanta.
+    if (
+      input.idempotency_key &&
+      (error as { code?: string } | null)?.code === "23505"
+    ) {
+      const winner = await findMovementByIdempotencyKey(
+        db,
+        input.product_id,
+        input.idempotency_key,
+      );
+      if (winner) {
+        const current = await getProduct(product.id);
+        return { movement: winner, stock_qty: current.stock_qty };
+      }
+      throw new InventoryError("INTERNAL", "Error interno.", 500);
     }
     throw new InventoryError("INTERNAL", "Error interno.", 500);
   }
