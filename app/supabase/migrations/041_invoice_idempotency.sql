@@ -46,16 +46,25 @@
 --      globalmente, así que acotarlo por sede no cuesta nada y agrega el
 --      aislamiento.
 --
--- COSTO DECLARADO (no se esconde)
+-- COSTO DECLARADO (no se esconde) — Y YA NO EXISTE
 --
--- En el camino de la CARRERA, la perdedora ya reservó su consecutivo antes de
--- chocar con el índice, y esa reserva queda SIN factura: un HUECO en la serie de
--- la sede. Se prefiere el hueco —visible y raro, exige dos envíos con la misma
--- marca solapados dentro de esa ventana— antes que una segunda factura, que es
--- dinero cobrado dos veces. El camino NORMAL de la repetición (marca ya emitida)
--- se detecta antes de reservar y NO deja hueco. El otro hueco posible ya existía
--- desde 005: un fallo posterior a la reserva obliga a la limpieza best-effort de
--- `cleanupFailedInvoice`, que borra la factura pero no devuelve el número.
+-- En el camino de la CARRERA, la perdedora reservaba su consecutivo antes de
+-- chocar con el índice, y esa reserva quedaba SIN factura: un HUECO en la serie
+-- de la sede. Ese fue el canje declarado en su momento —visible y raro, exige dos
+-- envíos con la misma marca solapados dentro de esa ventana— antes que una
+-- segunda factura, que es dinero cobrado dos veces.
+--
+-- **CORRECCIÓN (CL-13, migración 052): ese hueco ya NO PUEDE EXISTIR.** La 052
+-- movió la reserva del consecutivo ADENTRO de la transacción de emisión, así que
+-- la perdedora de la carrera REVIERTE su reserva al abortar y la serie queda
+-- continua. Lo que sigue costando la carrera es una sentencia ABORTADA (trabajo
+-- invisible, ninguna fila), no un número. El camino NORMAL de la repetición
+-- (marca ya emitida) se detecta antes de reservar y nunca dejó hueco.
+--
+-- El otro hueco posible también quedó cerrado por la misma razón: un fallo
+-- posterior a la reserva obligaba a la limpieza best-effort de
+-- `cleanupFailedInvoice`; con la 052 la emisión entera es UNA transacción, así
+-- que ese camino tampoco deja un número sin factura.
 --
 -- QUÉ NO HACE ESTE ARCHIVO
 --

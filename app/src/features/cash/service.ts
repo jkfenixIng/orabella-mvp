@@ -1366,6 +1366,16 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
     // marca de la 042 y la decisión `Pagada` (`moneyEquals`, abajo). La función
     // escribe cada columna verbatim y no compara el cobrado contra el facturado
     // ni una vez.
+    //
+    // CL-17: la 056 agregó DOS cosas a esa transacción. (1) Escribe los DATOS
+    // DEL CIERRE cuando la factura se cierra: `closed_by` (el usuario que cobra)
+    // y `closed_at` (el instante que resuelve el SERVICIO, arriba), que era el
+    // hueco que dejaba una factura `Pagada` con `closed_at` NULL. (2) Bloquea la
+    // fila del TURNO antes de la de la factura —orden global
+    // `cash_shifts > invoices`— y la revalida: un `closeShift` concurrente ya no
+    // puede cerrar el turno a mitad del cobro, así que este cobro no puede
+    // escribir su fila de cajón en un turno recién cerrado; pierde ruidosamente
+    // con `SHIFT_CLOSED` (traducido abajo) y sin escribir nada.
     let writtenPayment: CashPaymentRow | null = null;
     if (input.invoice_id) {
       // Las DOS decisiones del estado, tomadas acá y enviadas como booleanos:
@@ -1399,6 +1409,13 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
         p_shift_id: shift.id,
         p_invoice_id: input.invoice_id,
         p_user_id: actor.userId,
+        // CL-17: el INSTANTE del cierre, resuelto acá (el SERVICIO) como en el
+        // cierre de turno (049) y en el cobro dividido y la anulación (050): la
+        // función lo escribe VERBATIM cuando la factura se cierra. Antes este
+        // camino no lo mandaba y una factura `Pagada` quedaba con `closed_at`
+        // NULL, contradiciendo el contrato de la columna (025) y dejando la
+        // columna "Cerrada" del listado en guion sobre una factura cerrada.
+        p_closed_at: new Date().toISOString(),
         p_set_shift: setShift,
         p_mark_paid: markPaid,
         p_collection: {
@@ -1413,16 +1430,28 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
       if (payError) {
         const code = (payError as { code?: string } | null)?.code;
         const message = String((payError as { message?: unknown } | null)?.message ?? "");
-        // Las precondiciones que la transacción revalida ADENTRO sobre la fila
-        // bloqueada —una factura Anulada, una factura que ya no está— salen con
-        // su MENSAJE y con el MISMO SQLSTATE del tope de 031 (P0001), así que el
-        // mensaje se mira ANTES que el código: si no, un cobro sobre una factura
-        // anulada se leería como "se pasó del tope".
+        // Las precondiciones que la transacción revalida ADENTRO sobre las filas
+        // bloqueadas —una factura Anulada, una factura que ya no está, el TURNO
+        // que se cerró a mitad del cobro— salen con su MENSAJE y con el MISMO
+        // SQLSTATE del tope de 031 (P0001), así que el mensaje se mira ANTES que
+        // el código: si no, un cobro sobre una factura anulada —o sobre un turno
+        // recién cerrado— se leería como "se pasó del tope".
         if (message.includes("ANNUL_INVALID")) {
           throw new CashError("ANNUL_INVALID", "No se puede cobrar una factura anulada.", 409);
         }
         if (message.includes("INVOICE_NOT_FOUND")) {
           throw new CashError("INVOICE_NOT_FOUND", "Factura no encontrada.", 404);
+        }
+        // CL-17: el turno se cerró entre la lectura del servicio y el commit.
+        // La transacción lo revalida sobre la fila bloqueada y rechaza; el
+        // llamador recibe el MISMO error de negocio que recibía cuando lo leía
+        // ya cerrado, en vez de un OVERPAID que no tiene nada que ver.
+        if (message.includes("SHIFT_CLOSED")) {
+          throw new CashError("SHIFT_CLOSED", "El turno ya está cerrado.", 409);
+        }
+        if (message.includes("SHIFT_NOT_FOUND")) {
+          // Mismo código que `getShiftOrThrow` cuando el turno no existe.
+          throw new CashError("NOT_FOUND", "Turno no encontrado.", 404);
         }
         if (message.includes("PAYMENT_INVALID") || message.includes("PAYMENT_MISMATCH")) {
           // Una entrada a medio formar o una red de conteo que no cuadró: es una

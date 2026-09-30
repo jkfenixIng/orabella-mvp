@@ -35,6 +35,15 @@ export const AUDIT_ACTIONS = {
   LOGIN_FAILED: "auth.login_failed",
   LOGIN_LOCKED: "auth.login_locked",
   PASSWORD_CHANGED: "auth.password_changed",
+  // CL-15/CL-18: el alta de usuario falló, su compensación del espejo en
+  // Supabase Auth TAMBIÉN falló, y quedó un usuario huérfano para reparar a
+  // mano. No describe una operación de negocio sino un TRABAJO DE REPARACIÓN:
+  // vive igual en este vocabulario —y no en una cadena suelta del módulo—
+  // porque la bandeja de alertas filtra por acciones de esta lista. La acción
+  // declarada localmente en el servicio de auth dejaba el residuo auditable
+  // pero INVISIBLE en toda pantalla; con la entrada acá, la bandeja lo muestra
+  // junto al resto de los desvíos que exigen una decisión humana.
+  USER_CREATE_ROLLBACK_FAILED: "auth.user_create_rollback_failed",
   INVOICE_CREATED: "invoice.created",
   INVOICE_EDITED: "invoice.edited",
   INVOICE_ANNULLED: "invoice.annulled",

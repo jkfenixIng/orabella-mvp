@@ -1,9 +1,22 @@
 import { z } from "zod";
 
 /**
+ * Acción del residuo de un alta de usuario cuya compensación también falló
+ * (CL-15/CL-18). Es trabajo de REPARACIÓN y por eso avisa en la bandeja, igual
+ * que un bloqueo de cuenta. El valor tiene que coincidir con
+ * `AUDIT_ACTIONS.USER_CREATE_ROLLBACK_FAILED` del vocabulario compartido; se
+ * escribe literal a propósito: este módulo lo importa un Client Component
+ * (`alerts-client.tsx`) y `src/shared/lib/audit.ts` es SOLO SERVIDOR, así que
+ * no se puede importar acá sin arrastrar la superficie de service_role al
+ * bundle del navegador. `tests/alerts.test.ts` fija la igualdad entre los dos.
+ */
+export const ROLLBACK_ALERT_ACTION = "auth.user_create_rollback_failed";
+export const ROLLBACK_ALERT_ENTITY = "users";
+
+/**
  * Bandeja admin: subconjunto de `audit_logs` que genera un aviso
- * (desajustes de caja y cuentas bloqueadas). El resto de la auditoría
- * sigue existiendo pero no interrumpe ni avisa.
+ * (desajustes de caja, cuentas bloqueadas y el residuo de un alta). El resto
+ * de la auditoría sigue existiendo pero no interrumpe ni avisa.
  */
 export const ALERT_ACTIONS = [
   "cash.shift_open_mismatch",
@@ -11,6 +24,7 @@ export const ALERT_ACTIONS = [
   "auth.login_locked",
   "payroll.commission_paid",
   "voucher.requested",
+  ROLLBACK_ALERT_ACTION,
 ] as const;
 export type AlertAction = (typeof ALERT_ACTIONS)[number];
 
@@ -25,7 +39,7 @@ export const ALERT_MODULES = {
   },
   acceso: {
     label: "Acceso",
-    actions: ["auth.login_locked"],
+    actions: ["auth.login_locked", ROLLBACK_ALERT_ACTION],
   },
 } as const;
 export type AlertModule = keyof typeof ALERT_MODULES;
@@ -126,6 +140,22 @@ export function voucherAlertFilter(
     entity_id: voucherId,
     is_read: false,
   };
+}
+
+/**
+ * Detalle del residuo de un alta fallida para la bandeja: nombra el usuario
+ * que quedó y POR QUÉ, sin filtrar jamás una clave ni un hash (la clave inicial
+ * del MVP es el documento, así que el detalle toma el CORREO del metadato y
+ * nunca el documento). Puro para probarlo sin base de datos.
+ */
+export function rollbackAlertDetail(metadata: Record<string, unknown>): string {
+  const email = typeof metadata.email === "string" && metadata.email ? metadata.email : null;
+  const motivo =
+    typeof metadata.motivo === "string" && metadata.motivo ? metadata.motivo : null;
+  const sujeto = email ?? "sin correo registrado";
+  return `El alta falló y su compensación también: quedó el usuario ${sujeto} para reparar${
+    motivo ? ` (motivo: ${motivo})` : ""
+  }.`;
 }
 
 export interface ShiftAuditState {

@@ -27,6 +27,7 @@ import {
   requestResetSchema,
   resetPasswordSchema,
 } from "@/src/features/auth/schemas";
+import { AUDIT_ACTIONS } from "@/src/shared/lib/audit";
 
 describe("auth schemas (Zod, sin red)", () => {
   it("login acepta documento+clave y recorta espacios", () => {
@@ -340,15 +341,26 @@ function confirmResetAtomico(args: Record<string, unknown>): {
   return { data: true, error: null };
 }
 
-/** Modelo de `change_user_password` (054): la clave y la revocación, atómicas. */
+/** Modelo de `change_user_password` (054 + CL-18/057): la clave y la revocación,
+ * atómicas, y el CAS sobre el hash leído como precondición. */
 function cambiarClaveAtomico(args: Record<string, unknown>): {
   data: unknown;
   error: unknown;
 } {
   const userId = String(args.p_user_id);
   if (!args.p_password_hash) return { data: null, error: p0001("PASSWORD_INVALID") };
+  // CL-18: la precondición del CAS es obligatoria; sin ella la llamada no es la
+  // de 057 y se rechaza (el modelo NUNCA aplica un cambio sin CAS).
+  const esperado = args.p_expected_password_hash;
+  if (!esperado) return { data: null, error: p0001("PASSWORD_INVALID") };
   if (!filasDe("users").some((usuario) => usuario.id === userId)) {
     return { data: null, error: p0001("USER_NOT_FOUND") };
+  }
+  const vigente = String(
+    filasDe("users").find((usuario) => usuario.id === userId)?.password_hash ?? "",
+  );
+  if (vigente !== String(esperado)) {
+    return { data: null, error: p0001("PASSWORD_CHANGED_ELSEWHERE") };
   }
   if (postgrest.rpcNoAplica) return { data: 0, error: null };
   if (
@@ -913,6 +925,65 @@ describe("auth: cambio de clave atómico (CL-15 / AUTH-02)", () => {
     await expect(verifyPassword(CLAVE_VIEJA, hashDeLaClave())).resolves.toBe(true);
     expect(sesionesVivas()).toEqual([TOKEN_ACTUAL, TOKEN_AJENO].sort());
   });
+
+  it("una escritura ajena entre la lectura y el cambio NO se pisa en silencio (CL-18)", async () => {
+    await sembrar();
+    // La ventana declarada: el usuario ya verificó su clave contra el hash
+    // leído, y ANTES de su escritura otro escritor legítimo (un admin) cambia
+    // la fila. Sin CAS, la intervención del admin desaparece sin rastro.
+    postgrest.antesDeEscribir = () => {
+      postgrest.rows.users = filasDe("users").map((fila) => ({
+        ...fila,
+        password_hash: "hash-puesto-por-el-admin",
+        must_change_password: true,
+      }));
+    };
+
+    await expect(cambiar("Nueva123")).rejects.toMatchObject({
+      code: "PASSWORD_CHANGED_ELSEWHERE",
+      status: 409,
+    });
+
+    // El error es de negocio y accionable (nunca un 500 genérico), y la
+    // escritura ajena sigue EN PIE: es lo que el usuario tiene que volver a
+    // mirar antes de reintentar.
+    expect(hashDeLaClave()).toBe("hash-puesto-por-el-admin");
+    expect(filasDe("users")[0]?.must_change_password).toBe(true);
+    await expect(verifyPassword("Nueva123", hashDeLaClave())).resolves.toBe(false);
+    // Nada se revocó: una carrera perdida no expulsa sesiones.
+    expect(sesionesVivas()).toEqual([TOKEN_ACTUAL, TOKEN_AJENO].sort());
+  });
+
+  it("el CAS es de ESA fila: que otro usuario cambie no rechaza el cambio propio (control negativo)", async () => {
+    await sembrar();
+    postgrest.rows.users = [
+      ...filasDe("users"),
+      { id: "otro-usuario", sede_id: SEDE, password_hash: "hash-de-otro" },
+    ];
+    postgrest.antesDeEscribir = () => {
+      postgrest.rows.users = filasDe("users").map((fila) =>
+        fila.id === "otro-usuario" ? { ...fila, password_hash: "hash-de-otro-nuevo" } : fila,
+      );
+    };
+
+    await expect(cambiar("Nueva123")).resolves.toEqual({ changed: true });
+
+    await expect(verifyPassword("Nueva123", hashDeLaClave())).resolves.toBe(true);
+    expect(sesionesVivas()).toEqual([TOKEN_ACTUAL]);
+  });
+
+  it("el cambio exitoso sigue igual y deja como base el hash que leyó", async () => {
+    await sembrar();
+    const base = hashDeLaClave();
+
+    await expect(cambiar("Nueva123")).resolves.toEqual({ changed: true });
+
+    // La precondición del CAS viaja como el hash que el servicio LEYÓ para
+    // verificar la clave actual: la comparación en tiempo constante sigue
+    // siendo sobre el mismo valor que la base tiene que encontrar.
+    const llamada = postgrest.rpcCalls.find((entry) => entry.fn === "change_user_password");
+    expect(llamada?.args.p_expected_password_hash).toBe(base);
+  });
 });
 
 // ------------------------------------------------ alta de usuario (AUTH-04/07) ---
@@ -1003,6 +1074,9 @@ describe("auth: alta de usuario atómica (CL-15 / AUTH-04)", () => {
     });
     // Y jamás un secreto: la clave inicial ES el documento del alta.
     expect(JSON.stringify(rastro[0])).not.toContain(ALTA.documento);
+    // El rastro usa la acción del VOCABULARIO COMPARTIDO: es lo que hace que la
+    // bandeja (y su filtro) puedan verlo, en vez de una cadena local paralela.
+    expect(rastro[0].action).toBe(AUDIT_ACTIONS.USER_CREATE_ROLLBACK_FAILED);
   });
 
   it("la compensación que MIENTE (dice que borró y no borró) también es audible", async () => {
@@ -1016,6 +1090,7 @@ describe("auth: alta de usuario atómica (CL-15 / AUTH-04)", () => {
     // llamador es la que convierte el silencio en rastro.
     expect(usuarios()).toHaveLength(1);
     expect(rastroDeCompensacion()).toHaveLength(1);
+    expect(rastroDeCompensacion()[0].action).toBe(AUDIT_ACTIONS.USER_CREATE_ROLLBACK_FAILED);
   });
 
   it("un espejo fallido con compensación exitosa no deja NADA (ni un rastro falso)", async () => {
@@ -1178,6 +1253,67 @@ describe("migración 054_identity_atomic.sql (CL-15)", () => {
       expect(sql).toContain(`REVOKE ALL ON FUNCTION ${firma} FROM authenticated`);
       expect(sql).toContain(`GRANT EXECUTE ON FUNCTION ${firma} TO service_role`);
     }
+  });
+
+  it("declara que el agente no la ejecutó", () => {
+    expect(sql).toContain("NO ejecutado por el agente: requiere base de datos");
+  });
+});
+
+// ----------------------------------------------------- migración 057 (CL-18) ---
+
+describe("migración 057_identity_password_cas.sql (CL-18)", () => {
+  const sql = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "057_identity_password_cas.sql"),
+    "utf8",
+  );
+
+  it("reemplaza la firma vieja por la de cuatro parámetros (el CAS es obligatorio)", () => {
+    // Sin el DROP, `CREATE OR REPLACE` dejaría viva la versión sin CAS y
+    // cualquiera podría llamarla para saltarse la precondición.
+    expect(sql).toContain("DROP FUNCTION IF EXISTS public.change_user_password(uuid, text, text)");
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.change_user_password");
+    expect(sql).toContain(
+      "p_user_id uuid,\n  p_password_hash text,\n  p_current_token_hash text,\n  p_expected_password_hash text",
+    );
+  });
+
+  it("compara el hash bajo el candado y aborta con el código propio de la carrera", () => {
+    expect(sql).toContain("FOR UPDATE");
+    expect(sql).toContain("IS DISTINCT FROM p_expected_password_hash");
+    expect(sql).toContain("RAISE EXCEPTION 'PASSWORD_CHANGED_ELSEWHERE'");
+    // La clave no se escribe si el CAS no pasó: el UPDATE exige el mismo hash.
+    expect(sql).toContain("AND password_hash = p_expected_password_hash");
+    expect(sql).toContain("GET DIAGNOSTICS v_filas = ROW_COUNT");
+  });
+
+  it("conserva la post-condición de 054: ninguna otra sesión viva", () => {
+    expect(sql).toContain("UPDATE public.sessions");
+    expect(sql).toContain("AND revoked = false");
+    expect(sql).toContain("SESSIONS_NOT_REVOKED");
+  });
+
+  it("es idempotente, con search_path fijo y sin DEFINER", () => {
+    expect(sql).toContain("DROP FUNCTION IF EXISTS");
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION");
+    expect(sql).toContain("SECURITY INVOKER");
+    expect(sql).not.toContain("SECURITY DEFINER");
+    expect(sql).toContain("SET search_path = public");
+  });
+
+  it("cierra el permiso de la firma nueva: sólo service_role puede ejecutarla", () => {
+    const firma = "public.change_user_password(uuid, text, text, text)";
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${firma} FROM PUBLIC`);
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${firma} FROM anon`);
+    expect(sql).toContain(`REVOKE ALL ON FUNCTION ${firma} FROM authenticated`);
+    expect(sql).toContain(`GRANT EXECUTE ON FUNCTION ${firma} TO service_role`);
+  });
+
+  it("no borra ni reescribe filas de datos existentes", () => {
+    expect(sql).not.toMatch(/^\s*DELETE\s+FROM/im);
+    expect(sql).not.toMatch(/^\s*TRUNCATE/im);
+    expect(sql).not.toMatch(/^\s*ALTER\s+TABLE/im);
+    expect(sql).not.toMatch(/^\s*DROP\s+(TABLE|COLUMN|DATABASE)/im);
   });
 
   it("declara que el agente no la ejecutó", () => {
