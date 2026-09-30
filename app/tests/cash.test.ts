@@ -37,6 +37,8 @@ import {
 import {
   CashError,
   closeShift,
+  getDayView,
+  getHistory,
   invoiceCollectionsSummary,
   mergeShiftMoney,
   openShift,
@@ -2051,6 +2053,30 @@ const shiftStub = vi.hoisted(() => ({
   beforeRpc: null as null | (() => void),
   /** SELECTs sobre tablas que el doble no conoce (debería quedar siempre vacío). */
   unknownSelects: [] as string[],
+  /**
+   * CL-21: el techo de filas por REQUEST del Data API (`max-rows`: 1000 por
+   * defecto). Es lo que convierte un `select` sin paginar en una lectura
+   * RECORTADA y silenciosa, y es el defecto que este bloque mide.
+   */
+  rowCap: 1000,
+  /**
+   * CL-21: las VENTANAS pedidas, en orden (`range`/`limit`), con el `order()`
+   * que las acompaña. Es la prueba observable de que una lectura va por páginas
+   * y en un orden determinista, no de que el test espere un texto.
+   */
+  windows: [] as Array<{
+    table: string;
+    from: number;
+    to: number;
+    order: string[];
+    filters: string[];
+  }>,
+  /** Consultas pedidas por tabla: permite inyectar el fallo de UNA página. */
+  requests: {} as Record<string, number>,
+  /** Fallo inyectado en la consulta N de una tabla (`failAt.payments = [2]`). */
+  failAt: {} as Record<string, number[]>,
+  /** Fallo inyectado en una lectura concreta (tabla + columna filtrada). */
+  failSelects: [] as Array<{ table: string; filter: string; message: string }>,
   rowSeq: 0,
 }));
 
@@ -2066,6 +2092,7 @@ const SHIFT_TABLES = new Set([
   "invoice_payments",
   "invoices",
   "payments",
+  "users",
   "voucher_requests",
 ]);
 
@@ -2139,17 +2166,71 @@ function createShiftStubSupabaseClient(): unknown {
     let op: "select" | "insert" | "update" | "delete" = "select";
     let single = false;
     let payload: unknown;
-    let cap: number | null = null;
+    /**
+     * CL-21: la ventana PEDIDA, con el techo por request de `shiftStub.rowCap`
+     * que modela el `max-rows` del Data API. Un `select` sin `range`/`limit` pide
+     * la ventana por defecto (0..rowCap-1) y el servidor devuelve a lo sumo
+     * `rowCap` filas: sin esto la truncación no existiría en el doble y el test
+     * no probaría nada.
+     */
+    let rangeFrom = 0;
+    let rangeTo = shiftStub.rowCap - 1;
+    /** El `order()` pedido: el doble ORDENA de verdad (la paginación lo exige). */
+    const orderKeys: Array<{ column: string; ascending: boolean }> = [];
+    /** Columnas filtradas, en orden: identifica QUÉ lectura se está pidiendo. */
+    const filterColumns: string[] = [];
+    let countMode: "exact" | null = null;
+    let headOnly = false;
     const filters: Array<(row: Record<string, unknown>) => boolean> = [];
 
     const matching = (): Array<Record<string, unknown>> =>
       rowsOf(table).filter((row) => filters.every((fn) => fn(row)));
 
-    const respond = (): { data: unknown; error: unknown } => {
+    const respond = (): { data: unknown; error: unknown; count?: number | null } => {
       if (op === "select") {
         if (!SHIFT_TABLES.has(table)) shiftStub.unknownSelects.push(table);
-        const matched = cap === null ? matching() : matching().slice(0, cap);
-        return { data: single ? (matched[0] ?? null) : matched, error: null };
+        // CL-21: el fallo de una LECTURA concreta (tabla + columna filtrada) y
+        // el de una PÁGINA concreta (la consulta N de la tabla). Los dos son
+        // fallos de TRANSPORTE: el doble no devuelve filas, devuelve el error.
+        const failure = shiftStub.failSelects.find(
+          (entry) => entry.table === table && filterColumns.includes(entry.filter),
+        );
+        if (failure) {
+          return { data: null, error: { code: "P0001", message: failure.message } };
+        }
+        const request = (shiftStub.requests[table] = (shiftStub.requests[table] ?? 0) + 1);
+        if ((shiftStub.failAt[table] ?? []).includes(request)) {
+          return {
+            data: null,
+            error: {
+              code: "P0001",
+              message: `doble: fallo inyectado en ${table} (consulta ${request})`,
+            },
+          };
+        }
+        const to = Math.min(rangeTo, rangeFrom + shiftStub.rowCap - 1);
+        shiftStub.windows.push({
+          table,
+          from: rangeFrom,
+          to,
+          order: orderKeys.map((key) => key.column),
+          filters: [...filterColumns],
+        });
+        const filtered = matching();
+        for (const key of [...orderKeys].reverse()) {
+          filtered.sort((left, right) => {
+            const a = String(left[key.column] ?? "");
+            const b = String(right[key.column] ?? "");
+            if (a === b) return 0;
+            return (a < b ? -1 : 1) * (key.ascending ? 1 : -1);
+          });
+        }
+        const window = filtered.slice(rangeFrom, to + 1);
+        return {
+          data: headOnly ? null : single ? (window[0] ?? null) : window,
+          count: countMode === "exact" ? filtered.length : null,
+          error: null,
+        };
       }
       shiftStub.looseWrites.push({ table, op });
       if (op === "insert") {
@@ -2228,7 +2309,11 @@ function createShiftStubSupabaseClient(): unknown {
     };
 
     const query: Record<string, unknown> = {
-      select: () => query,
+      select: (_columns?: unknown, options?: { count?: string; head?: boolean }) => {
+        if (options?.count === "exact") countMode = "exact";
+        if (options?.head) headOnly = true;
+        return query;
+      },
       insert: (value?: unknown) => {
         op = "insert";
         payload = value;
@@ -2244,23 +2329,47 @@ function createShiftStubSupabaseClient(): unknown {
         return query;
       },
       eq: (column: string, value: unknown) => {
+        filterColumns.push(column);
         filters.push((row) => row[column] === value);
         return query;
       },
       in: (column: string, values: readonly unknown[]) => {
+        filterColumns.push(column);
         const set = new Set(values);
         filters.push((row) => set.has(row[column]));
         return query;
       },
       is: (column: string, value: unknown) => {
+        filterColumns.push(column);
         filters.push((row) =>
           value === null ? row[column] === null || row[column] === undefined : row[column] === value,
         );
         return query;
       },
-      order: () => query,
+      // CL-21: los filtros de rango de las vistas (día e historial). El doble
+      // compara como strings, igual que el Data API compara ISO-8601.
+      gte: (column: string, value: unknown) => {
+        filterColumns.push(column);
+        filters.push((row) => String(row[column] ?? "") >= String(value));
+        return query;
+      },
+      lte: (column: string, value: unknown) => {
+        filterColumns.push(column);
+        filters.push((row) => String(row[column] ?? "") <= String(value));
+        return query;
+      },
+      order: (column: string, options?: { ascending?: boolean }) => {
+        orderKeys.push({ column, ascending: options?.ascending !== false });
+        return query;
+      },
+      range: (start: number, end: number) => {
+        rangeFrom = start;
+        rangeTo = end;
+        return query;
+      },
       limit: (count: number) => {
-        cap = count;
+        rangeFrom = 0;
+        rangeTo = Math.max(0, count - 1);
         return query;
       },
       single: () => {
@@ -2501,6 +2610,11 @@ function resetShiftStub(): void {
   shiftStub.failCounts = null;
   shiftStub.beforeRpc = null;
   shiftStub.unknownSelects.length = 0;
+  shiftStub.rowCap = 1000;
+  shiftStub.windows.length = 0;
+  shiftStub.requests = {};
+  shiftStub.failAt = {};
+  shiftStub.failSelects.length = 0;
   shiftStub.rowSeq = 0;
 }
 
@@ -5269,10 +5383,16 @@ describe("cash: CL-19 el cierre no firma un arqueo que ya no corresponde", () =>
     // RPC. El conteo de vales sale de la MISMA lista que el arqueo descuenta
     // (`fetchVoucherOutRows`), no de una lectura aparte.
     expect(close).toContain("const collectionCounts = {");
-    expect(close).toContain("payments: (shiftPayments ?? []).length");
+    expect(close).toContain("payments: shiftPayments.length");
     expect(close).toContain("invoice_payments: invoicePays.length");
-    expect(close).toContain("commission_payouts: (payoutRows ?? []).length");
+    expect(close).toContain("commission_payouts: payoutRows.length");
     expect(close).toContain("voucher_requests: voucherRows.length");
+    // CL-21: las dos listas que lee el propio cierre salen de la lectura
+    // EXHAUSTIVA (y el conteo es el `length` de ESA lista, no el de una lectura
+    // aparte): el token y el arqueo no pueden mirar conjuntos distintos.
+    expect(close.match(/readAllSource</g) ?? []).toHaveLength(2);
+    expect(close).toContain('table: "payments"');
+    expect(close).toContain('table: "commission_payouts"');
     expect(close).toContain("const voucherRows = voucherRowsByShift.get(shift.id) ?? []");
     expect(close).toContain("voucherOutByMethod(voucherRows)");
     expect(close).toContain("p_collection_counts: collectionCounts");
@@ -5285,6 +5405,461 @@ describe("cash: CL-19 el cierre no firma un arqueo que ya no corresponde", () =>
     // La aritmética del arqueo no se movió: se sigue computando en TypeScript.
     expect(close).toContain("computeCashClose({");
     expect(close).toContain("expectedDigitalTotal(");
+  });
+});
+
+// -------------------------------------------------------------------- CL-21 ---
+//
+// Las CUATRO lecturas que alimentan el arqueo del cierre —`payments` del turno
+// sin factura y las `invoice_payments` atribuidas al turno (las que SUMA), más
+// los `commission_payouts` del turno y los vales APROBADOS (las que RESTA)— no
+// estaban paginadas, y dos de sus fetchers son COMPARTIDOS con la vista del día
+// y el historial. El Data API de Supabase sirve, por request, a lo sumo
+// `max-rows` filas (1000 por defecto): un turno con más movimiento que ese techo
+// se leía RECORTADO y en silencio.
+//
+// Desde 058/059 el recorte ya no firma un arqueo corto —el TOKEN sale de la
+// MISMA lectura recortada y la transacción RECHAZA con ARQUEO_STALE— , pero el
+// resultado era un CALLEJÓN SIN SALIDA: ese turno no se podía cerrar nunca, y el
+// operador no tenía salida.
+//
+// El arreglo no toca la aritmética, ni el token, ni la precondición: las mismas
+// cuatro fuentes se leen EXHAUSTIVAS con el helper de la casa (`readAllPaged`),
+// en un orden determinista (el `id` de la tabla, el orden de la PAGINACIÓN), y
+// una lectura que no se complete falla A LA VISTA. El doble ya modela el techo
+// por request del Data API (`shiftStub.rowCap`), así que la truncación existe en
+// el test y no hace falta afirmar sobre el texto del servicio.
+describe("cash: CL-21 el arqueo lee sus CUATRO fuentes de forma exhaustiva", () => {
+  const ACTOR = { userId: shiftStub.USER_ID, sedeId: shiftStub.SEDE_ID };
+  /** Más filas que el techo por request del Data API: el turno «ocupado». */
+  const BUSY = 1200;
+  /** El conteo declarado: el efectivo real en «billetes» de 1 000. */
+  const COUNTED = 2162000;
+  const CLOSE_INPUT = {
+    counted_cash: COUNTED,
+    counts: [{ method_code: "efectivo", denomination: 1000, quantity: 2162, amount: COUNTED }],
+    confirmed: true as const,
+  };
+
+  /**
+   * Un turno ABIERTO de la fecha del día con MÁS filas que el techo en las cuatro
+   * fuentes: 1 200 cobros de cajón, 1 200 cobros de factura (+ 2 históricos sin
+   * turno), 1 200 comisiones pagadas y 1 200 vales aprobados (más uno pendiente,
+   * que NO toca caja). Todo en efectivo, para que el arqueo sea legible.
+   */
+  function seedBusyShift(): void {
+    shiftStub.tables = {
+      cash_registers: [
+        {
+          id: shiftStub.REGISTER_ID,
+          sede_id: shiftStub.SEDE_ID,
+          name: "Caja única",
+          base_configurada: shiftStub.BASE_CONFIGURADA,
+          is_active: true,
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      cash_denominations: [
+        {
+          id: "den-1000",
+          sede_id: shiftStub.SEDE_ID,
+          kind: "billete",
+          value: 1000,
+          is_active: true,
+        },
+      ],
+      users: [{ id: shiftStub.USER_ID, full_name: "Cajero de prueba" }],
+      cash_shifts: [
+        {
+          id: shiftStub.SHIFT_ID,
+          cash_register_id: shiftStub.REGISTER_ID,
+          sede_id: shiftStub.SEDE_ID,
+          opened_by: shiftStub.USER_ID,
+          closed_by: null,
+          // La hora de Bogotá, como la escriben las vistas: así los filtros de
+          // rango de `getDayView`/`getHistory` comparan de verdad.
+          opened_at: "2026-09-30T13:00:00-05:00",
+          closed_at: null,
+          opening_base: shiftStub.BASE_CONFIGURADA,
+          expected_cash: 0,
+          counted_cash: null,
+          base_left: null,
+          cash_withdrawn: null,
+          base_difference: null,
+          status: "abierto",
+          observation: null,
+        },
+      ],
+      payments: Array.from({ length: BUSY }, (_, index) => ({
+        id: `pago-${String(index).padStart(4, "0")}`,
+        sede_id: shiftStub.SEDE_ID,
+        cash_shift_id: shiftStub.SHIFT_ID,
+        invoice_id: null,
+        method_code: "efectivo",
+        amount: 1000,
+      })),
+      invoices: [
+        { id: "factura-1", sede_id: shiftStub.SEDE_ID, cash_shift_id: shiftStub.SHIFT_ID },
+      ],
+      invoice_payments: [
+        ...Array.from({ length: BUSY }, (_, index) => ({
+          id: `cobro-${String(index).padStart(4, "0")}`,
+          invoice_id: `factura-${String(index).padStart(4, "0")}`,
+          cash_shift_id: shiftStub.SHIFT_ID,
+          method_code: "efectivo",
+          amount: 1000,
+        })),
+        // Las dos HISTÓRICAS sin turno: la unión que describe
+        // `fetchInvoicePaymentsByShift` (su factura sí pertenece al turno).
+        { id: "cobro-h1", invoice_id: "factura-1", cash_shift_id: null, method_code: "efectivo", amount: 1000 },
+        { id: "cobro-h2", invoice_id: "factura-1", cash_shift_id: null, method_code: "efectivo", amount: 1000 },
+      ],
+      commission_payouts: Array.from({ length: BUSY }, (_, index) => ({
+        id: `comision-${String(index).padStart(4, "0")}`,
+        cash_shift_id: shiftStub.SHIFT_ID,
+        method_code: "efectivo",
+        amount: 100,
+      })),
+      voucher_requests: [
+        ...Array.from({ length: BUSY }, (_, index) => ({
+          id: `vale-${String(index).padStart(4, "0")}`,
+          cash_shift_id: shiftStub.SHIFT_ID,
+          approved_by: shiftStub.USER_ID,
+          method_code: "efectivo",
+          amount: 100,
+        })),
+        // Un vale PENDIENTE: no toca caja y no entra ni al arqueo ni al token.
+        {
+          id: "vale-pendiente",
+          cash_shift_id: shiftStub.SHIFT_ID,
+          approved_by: null,
+          method_code: "efectivo",
+          amount: 100,
+        },
+      ],
+      cash_shift_counts: [],
+      cash_shift_recounts: [],
+      audit_logs: [],
+    };
+  }
+
+  /** Un turno abierto con DOS cobros: el control negativo, por debajo del techo. */
+  function seedSmallShift(): void {
+    seedBusyShift();
+    shiftStub.tables.payments = (shiftStub.tables.payments ?? []).slice(0, 2);
+    shiftStub.tables.invoice_payments = [];
+    shiftStub.tables.invoices = [];
+    shiftStub.tables.commission_payouts = [];
+    shiftStub.tables.voucher_requests = [];
+  }
+
+  const shifts = () => shiftStub.tables.cash_shifts ?? [];
+  const counts = () => shiftStub.tables.cash_shift_counts ?? [];
+  const closeCalls = () =>
+    shiftStub.rpcCalls.filter((call) => call.name === "cash_close_shift_atomic");
+  const close = (raw: unknown = CLOSE_INPUT) =>
+    closeShift(shiftStub.SEDE_ID, shiftStub.SHIFT_ID, raw, ACTOR);
+  /** El efectivo que REALMENTE entró al turno, leído de las dos fuentes que SUMA. */
+  const collectedCash = (): number => {
+    const drawer = (shiftStub.tables.payments ?? []).filter(
+      (row) => row.cash_shift_id === shiftStub.SHIFT_ID && row.invoice_id == null,
+    );
+    const invoiceIds = new Set(
+      (shiftStub.tables.invoices ?? [])
+        .filter((row) => row.cash_shift_id === shiftStub.SHIFT_ID)
+        .map((row) => row.id),
+    );
+    const invoiced = (shiftStub.tables.invoice_payments ?? []).filter(
+      (row) =>
+        row.cash_shift_id === shiftStub.SHIFT_ID ||
+        (row.cash_shift_id == null && invoiceIds.has(row.invoice_id)),
+    );
+    return [...drawer, ...invoiced].reduce((acc, row) => acc + Number(row.amount), 0);
+  };
+  /** El efectivo que REALMENTE salió: comisiones pagadas + vales aprobados con método. */
+  const paidOutCash = (): number => {
+    const payouts = (shiftStub.tables.commission_payouts ?? []).filter(
+      (row) => row.cash_shift_id === shiftStub.SHIFT_ID && row.method_code === "efectivo",
+    );
+    const vouchers = (shiftStub.tables.voucher_requests ?? []).filter(
+      (row) =>
+        row.cash_shift_id === shiftStub.SHIFT_ID &&
+        isVoucherCashOut({
+          approved_by: (row.approved_by ?? null) as string | null,
+          method_code: (row.method_code ?? null) as string | null,
+          amount: row.amount as number,
+        }) &&
+        row.method_code === "efectivo",
+    );
+    return [...payouts, ...vouchers].reduce((acc, row) => acc + Number(row.amount), 0);
+  };
+  /** El TOKEN completo, contado sobre las CUATRO fuentes del doble. */
+  const fullToken = () => {
+    const invoiceIds = new Set(
+      (shiftStub.tables.invoices ?? [])
+        .filter((row) => row.cash_shift_id === shiftStub.SHIFT_ID)
+        .map((row) => row.id),
+    );
+    return {
+      payments: (shiftStub.tables.payments ?? []).filter(
+        (row) => row.cash_shift_id === shiftStub.SHIFT_ID && row.invoice_id == null,
+      ).length,
+      invoice_payments: (shiftStub.tables.invoice_payments ?? []).filter(
+        (row) =>
+          row.cash_shift_id === shiftStub.SHIFT_ID ||
+          (row.cash_shift_id == null && invoiceIds.has(row.invoice_id)),
+      ).length,
+      commission_payouts: (shiftStub.tables.commission_payouts ?? []).filter(
+        (row) => row.cash_shift_id === shiftStub.SHIFT_ID,
+      ).length,
+      voucher_requests: (shiftStub.tables.voucher_requests ?? []).filter(
+        (row) =>
+          row.cash_shift_id === shiftStub.SHIFT_ID &&
+          row.approved_by != null &&
+          row.method_code != null,
+      ).length,
+    };
+  };
+  /**
+   * Las ventanas de las lecturas del ARQUEO (tabla + `filters` con
+   * `cash_shift_id`), sin la sonda de columnas de vales —que es un `limit(1)`
+   * aparte y no pagina—.
+   */
+  const arqueoWindows = (table: string) =>
+    shiftStub.windows.filter(
+      (window) => window.table === table && window.filters.includes("cash_shift_id"),
+    );
+
+  beforeEach(() => {
+    resetShiftStub();
+    shiftStub.lifecycle = true;
+  });
+  afterEach(() => resetShiftStub());
+
+  it("GREEN: un turno con más filas que el techo del Data API se cierra con el arqueo COMPLETO", async () => {
+    seedBusyShift();
+    // No es vacuidad del fixture: las cuatro fuentes superan el techo por request.
+    expect(BUSY).toBeGreaterThan(shiftStub.rowCap);
+
+    const result = await close();
+
+    // El cierre FIRMA (antes del arreglo rechazaba con ARQUEO_STALE para siempre).
+    expect(result.shift.status).toBe("cerrado");
+    // Y firma el número del conjunto COMPLETO: lo cobrado real menos lo pagado real.
+    expect(shifts()[0].expected_cash).toBe(collectedCash() - paidOutCash());
+    expect(shifts()[0].expected_cash).toBe(2162000);
+    // La evidencia del cierre también quedó escrita.
+    expect(counts()).toHaveLength(1);
+    expect(counts()[0]).toMatchObject({ phase: "cierre", amount: COUNTED });
+  });
+
+  it("el TOKEN y el arqueo salen de la MISMA lectura: el token es el conteo del conjunto completo", async () => {
+    seedBusyShift();
+
+    await close();
+
+    // El token que viajó en el RPC es el conteo de las CUATRO fuentes COMPLETAS,
+    // leídas de las mismas listas que el arqueo sumó/restó. Si el arqueo se
+    // paginara y el token no (o al revés), acá faltaría dinero o el conteo
+    // quedaría corto, y la transacción rechazaría con ARQUEO_STALE.
+    expect(closeCalls()).toHaveLength(1);
+    expect(closeCalls()[0].args.p_collection_counts).toEqual(fullToken());
+    expect(closeCalls()[0].args.p_collection_counts).toEqual({
+      payments: BUSY,
+      invoice_payments: BUSY + 2,
+      commission_payouts: BUSY,
+      voucher_requests: BUSY,
+    });
+    // Y el arqueo se computó sobre esas MISMAS filas: el esperado es
+    // `collectedCash() - paidOutCash()` (arriba), no sobre una ventana.
+    expect(shifts()[0].expected_cash).toBe(collectedCash() - paidOutCash());
+  });
+
+  it("las CUATRO fuentes se leen por PÁGINAS y con un orden determinista", async () => {
+    seedBusyShift();
+
+    await close();
+
+    for (const table of ["payments", "invoice_payments", "commission_payouts", "voucher_requests"]) {
+      const windows = arqueoWindows(table);
+      // Más de una página: el conjunto no entró en una sola ventana.
+      expect(windows.length, table).toBeGreaterThan(1);
+      // La primera ventana es la del techo por request, y NINGUNA lectura va sin
+      // `order()`: sin orden, dos páginas pueden repetir o perder filas.
+      expect(windows[0], table).toMatchObject({ from: 0, to: shiftStub.rowCap - 1, order: ["id"] });
+      for (const window of windows) expect(window.order, table).toEqual(["id"]);
+      // Y las páginas de CADA lectura avanzan sin huecos ni solapes. Se agrupan
+      // por los filtros, que es lo que identifica la consulta: una fuente con
+      // dos consultas (la unión de `invoice_payments`: directas + históricas)
+      // tiene dos lecturas, y cada una empieza en 0.
+      const byRead = new Map<string, Array<(typeof shiftStub.windows)[number]>>();
+      for (const window of windows) {
+        const key = window.filters.join(",");
+        byRead.set(key, [...(byRead.get(key) ?? []), window]);
+      }
+      for (const [key, group] of byRead) {
+        expect(group.map((window) => window.from), `${table} (${key})`).toEqual(
+          Array.from({ length: group.length }, (_, index) => index * shiftStub.rowCap),
+        );
+        for (const window of group) {
+          expect(window.to, `${table} (${key})`).toBe(window.from + shiftStub.rowCap - 1);
+        }
+      }
+    }
+  });
+
+  it("una lectura que NO se completa falla A LA VISTA: READ_INCOMPLETE, sin firmar NADA", async () => {
+    seedBusyShift();
+    // La SEGUNDA página de los cobros del turno no llega: el doble devuelve el
+    // error de transporte, no un conjunto recortado.
+    shiftStub.failAt = { payments: [2] };
+
+    const outcome: unknown = await close().catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(CashError);
+    expect(outcome).toMatchObject({ code: "READ_INCOMPLETE", status: 500 });
+    // El mensaje dice QUÉ no se pudo leer y DÓNDE se cortó: es accionable.
+    expect((outcome as CashError).message).toContain("los cobros del turno");
+    expect((outcome as CashError).message).toContain("fila 1000");
+    // Y no quedó NADA: el turno sigue abierto, sin arqueo de cierre, sin
+    // escritura suelta y sin haber llamado siquiera a la transacción.
+    expect(shifts()[0]).toMatchObject({ status: "abierto", expected_cash: 0 });
+    expect(counts()).toEqual([]);
+    expect(shiftStub.looseWrites.filter((entry) => entry.table !== "audit_logs")).toEqual([]);
+    expect(closeCalls()).toEqual([]);
+  });
+
+  it("control negativo: por debajo del techo se lee en UNA página y el cierre sale igual", async () => {
+    seedSmallShift();
+    const small = {
+      counted_cash: 2000,
+      counts: [{ method_code: "efectivo", denomination: 1000, quantity: 2, amount: 2000 }],
+      confirmed: true as const,
+    };
+
+    const result = await close(small);
+
+    expect(result.shift.status).toBe("cerrado");
+    // Las cuatro fuentes entran en una sola página (no hay paginación espuria)…
+    for (const table of ["payments", "invoice_payments", "commission_payouts", "voucher_requests"]) {
+      for (const window of arqueoWindows(table)) {
+        expect(window, table).toMatchObject({ from: 0, to: shiftStub.rowCap - 1, order: ["id"] });
+      }
+    }
+    expect(arqueoWindows("payments")).toHaveLength(1);
+    expect(arqueoWindows("commission_payouts")).toHaveLength(1);
+    expect(arqueoWindows("voucher_requests")).toHaveLength(1);
+    // …y el arqueo es el de TODAS las filas, no el de una ventana vacía.
+    expect(collectedCash()).toBe(2000);
+    expect(shifts()[0].expected_cash).toBe(2000);
+    expect(closeCalls()[0].args.p_collection_counts).toEqual({
+      payments: 2,
+      invoice_payments: 0,
+      commission_payouts: 0,
+      voucher_requests: 0,
+    });
+  });
+
+  it("la vista del DÍA ve el conjunto completo (ventas y vales del turno ocupado)", async () => {
+    seedBusyShift();
+
+    const day = await getDayView(shiftStub.SEDE_ID, { fecha: "2026-09-30" });
+
+    expect(day.shifts).toHaveLength(1);
+    // La venta del día es la de TODAS las filas (dos fuentes > techo), en pesos.
+    expect(day.shifts[0].ventas).toBe(collectedCash());
+    expect(day.shifts[0].ventas).toBe(2402000);
+    expect(day.shifts[0].efectivo).toBe(2402000);
+    // Los vales por turno también salen de una lectura exhaustiva.
+    expect(day.shifts[0].vales).toBe(120000);
+    // Y el acumulado del día cuadra con la suma de turnos.
+    expect(day.totals.ventas).toBe(2402000);
+    // La lectura del día va por páginas y ordenada, igual que la del cierre.
+    const windows = arqueoWindows("payments");
+    expect(windows.length).toBeGreaterThan(1);
+    for (const window of windows) expect(window.order).toEqual(["id"]);
+  });
+
+  it("el HISTORIAL ve el conjunto completo de la misma fuente", async () => {
+    seedBusyShift();
+
+    const history = await getHistory(shiftStub.SEDE_ID, {
+      desde: "2026-09-01",
+      hasta: "2026-09-30",
+    });
+
+    expect(history.total).toBe(1);
+    expect(history.shifts).toHaveLength(1);
+    expect(history.shifts[0].ventas).toBe(collectedCash());
+    expect(history.shifts[0].ventas).toBe(2402000);
+    expect(history.shifts[0].vales).toBe(120000);
+    expect(arqueoWindows("commission_payouts").length).toBeGreaterThan(1);
+  });
+
+  it("la vista del día falla A LA VISTA si una de sus lecturas no se completa", async () => {
+    seedBusyShift();
+    shiftStub.failAt = { payments: [2] };
+
+    const outcome: unknown = await getDayView(shiftStub.SEDE_ID, { fecha: "2026-09-30" }).catch(
+      (error: unknown) => error,
+    );
+
+    // No hay una vista con la venta recortada: hay un error de negocio.
+    expect(outcome).toBeInstanceOf(CashError);
+    expect(outcome).toMatchObject({ code: "READ_INCOMPLETE", status: 500 });
+  });
+
+  it("la PRECONDICIÓN sigue viva: un cobro confirmado en el medio RECHAZA aunque el conjunto se lea entero", async () => {
+    seedBusyShift();
+    // La otra transacción confirma UN cobro más entre la lectura y el lock. Con
+    // las cuatro fuentes completas, el token sigue siendo el de la lectura: el
+    // conteo de la base pasa a 1 201 y la transacción rechaza.
+    shiftStub.beforeRpc = () => {
+      shiftStub.tables.payments = [
+        ...(shiftStub.tables.payments ?? []),
+        {
+          id: "pago-nuevo",
+          sede_id: shiftStub.SEDE_ID,
+          cash_shift_id: shiftStub.SHIFT_ID,
+          invoice_id: null,
+          method_code: "efectivo",
+          amount: 1000,
+        },
+      ];
+    };
+
+    const outcome: unknown = await close().catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(CashError);
+    expect(outcome).toMatchObject({ code: "ARQUEO_STALE", status: 409 });
+    expect(shifts()[0]).toMatchObject({ status: "abierto", expected_cash: 0 });
+    expect(counts()).toEqual([]);
+  });
+
+  it("el reintento con el arqueo fresco cierra y cuenta el cobro que llegó", async () => {
+    seedBusyShift();
+    shiftStub.beforeRpc = () => {
+      shiftStub.tables.payments = [
+        ...(shiftStub.tables.payments ?? []),
+        {
+          id: "pago-nuevo",
+          sede_id: shiftStub.SEDE_ID,
+          cash_shift_id: shiftStub.SHIFT_ID,
+          invoice_id: null,
+          method_code: "efectivo",
+          amount: 1000,
+        },
+      ];
+      shiftStub.beforeRpc = null;
+    };
+    await close().catch(() => undefined);
+
+    const result = await close();
+
+    expect(result.shift.status).toBe("cerrado");
+    // El arqueo firmado ahora SÍ cuenta el cobro que se confirmó en el medio.
+    expect(shifts()[0].expected_cash).toBe(collectedCash() - paidOutCash());
+    expect(shifts()[0].expected_cash).toBe(2163000);
   });
 });
 
