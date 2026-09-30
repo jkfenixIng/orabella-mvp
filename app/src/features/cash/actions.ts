@@ -49,7 +49,14 @@ export async function openShiftAction(input: unknown) {
   }
 }
 
-/** Misma lógica que POST /api/v1/cash/payments (solo admin/caja). */
+/**
+ * Misma lógica que POST /api/v1/cash/payments (solo admin/caja).
+ *
+ * CL-3: el mismo contrato de la ruta —un cobro con `invoice_id` exige
+ * `idempotency_key` (uuid del intento) o se rechaza con VALIDATION 400—. Hoy
+ * ninguna pantalla llama a esta action (el formulario de cobro no existe en
+ * `/cash`), así que el llamador real de la puerta es la ruta REST.
+ */
 export async function registerPaymentAction(input: unknown) {
   try {
     const session = await requireCashWriter(await sessionToken());

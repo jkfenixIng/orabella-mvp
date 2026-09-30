@@ -773,6 +773,25 @@ export function PayrollClient(props: PayrollClientProps) {
    * son dos intentos con dos marcas (dos pagos), no una repetición.
    */
   const paymentKeyRef = useRef(new Map<string, string>());
+  /**
+   * CL-5: marca de idempotencia del INTENTO de pago extraordinario (PA-2a).
+   *
+   * Una sola marca (no un mapa): el formulario escribe UN pago a la vez, así que
+   * su identidad es (empleado, marca) y el registro del intento alcanza con una
+   * marca mientras el diálogo está abierto. Se acuña cuando el intento EMPIEZA
+   * (al confirmar) y se conserva si el intento falla: el reintento tiene que
+   * llevar la misma para que el servidor reconozca la repetición en vez de
+   * escribir un segundo pago extraordinario. Se suelta cuando el intento termina
+   * bien y al cerrar el diálogo.
+   *
+   * Acá no hay tope que frene nada: el monto lo escribe el admin y NO se topa
+   * (decisión del dueño, 036). Por eso la marca es la única barrera posible.
+   *
+   * No es por tecla ni por render: los campos del formulario (monto, motivo,
+   * tipo, días) cambian libremente sin tocar la marca, así que dos pagos
+   * legítimos distintos son dos intentos con dos marcas.
+   */
+  const extraKeyRef = useRef<string | null>(null);
   // Ajustes por empleado al calcular (bonos y otros descuentos editables).
   const [adjustments, setAdjustments] = useState<
     Record<string, Partial<Record<AdjustmentField, string>>>
@@ -1168,6 +1187,11 @@ export function PayrollClient(props: PayrollClientProps) {
     setExtraReference("");
     setExtraDaysFrom("");
     setExtraDaysTo("");
+    // CL-5: cerrar el diálogo abandona el intento de pago extraordinario; el
+    // próximo pago es otro intento y acuña su propia marca. Si el intento
+    // anterior falló y se reabre para pagar OTRA cosa, ese pago no puede quedar
+    // pegado a la marca abandonada.
+    extraKeyRef.current = null;
   }
 
   /**
@@ -1209,7 +1233,15 @@ export function PayrollClient(props: PayrollClientProps) {
     }
 
     setExtraBusy(true);
+    // CL-5: la marca del INTENTO. Se acuña al empezar y se conserva si el
+    // intento falla (el reintento tiene que llevar la misma para que el servidor
+    // reconozca la repetición en vez de escribir un segundo pago extraordinario).
+    // `crypto` existe en el navegador (contexto seguro) y en el runtime de Node:
+    // no hace falta ninguna dependencia nueva.
+    const extraKey = extraKeyRef.current ?? crypto.randomUUID();
+    extraKeyRef.current = extraKey;
     const result = (await payPayrollExtraAction({
+      idempotency_key: extraKey,
       employee_id: extraEmployeeId,
       amount,
       method_code: extraMethodCode,
@@ -1221,6 +1253,8 @@ export function PayrollClient(props: PayrollClientProps) {
     })) as ActionResult<PayrollExtraRow>;
     setExtraBusy(false);
     if (show(result, "Pago extraordinario registrado.")) {
+      // El intento TERMINÓ bien: el próximo pago es OTRO intento y merece otra
+      // marca (si no, devolvería este mismo pago). `closeExtraDialog` la suelta.
       closeExtraDialog();
       await loadExtras();
     }

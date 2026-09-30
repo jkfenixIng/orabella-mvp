@@ -289,14 +289,23 @@ describe("cash: base automática del cierre (CAJ-04, arqueo escondido)", () => {
 
 describe("cash: pagos contra el turno con método activo y monto > 0 (CAJ-02)", () => {
   it("acepta pago con método y monto válido, factura opcional", () => {
+    // CL-4: la marca del intento es obligatoria en los DOS caminos (con y sin
+    // factura): sin ella un reintento no se puede reconocer.
     expect(
-      registerPaymentSchema.safeParse({ method_code: "efectivo", amount: 50000 }).success,
+      registerPaymentSchema.safeParse({
+        method_code: "efectivo",
+        amount: 50000,
+        idempotency_key: "1f2e3d4c-5b6a-4c7d-8e9f-0a1b2c3d4e5f",
+      }).success,
     ).toBe(true);
     expect(
       registerPaymentSchema.safeParse({
         method_code: "nequi",
         amount: 25000,
         invoice_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        // CL-3: cobrar una factura exige la marca del intento (ver el bloque
+        // CL-3 de abajo para la contractura completa).
+        idempotency_key: "1f2e3d4c-5b6a-4c7d-8e9f-0a1b2c3d4e5f",
       }).success,
     ).toBe(true);
   });
@@ -814,7 +823,11 @@ describe("cash: T0-a (Defecto 2) el espejo va antes que la fila de cajón", () =
       body.indexOf('.from("invoice_payments")'),
       body.indexOf('.from("payments")'),
     );
-    expect(mirrorBlock).toContain('(mirrorError as { code?: string }).code === "P0001"');
+    expect(mirrorBlock).toContain('const code = (mirrorError as { code?: string } | null)?.code;');
+    // CL-3: la misma rama reconoce TAMBIÉN el 23505 del índice único de
+    // identidad (042): las dos barreras del INSERT se atienden igual.
+    expect(mirrorBlock).toContain('if (code === "23505" || code === "P0001") {');
+    expect(mirrorBlock).toContain('throw new CashError("OVERPAID", "El pago supera el saldo pendiente de la factura.", 422);');
     // El recorte es la rama del INSERT fallido, que es la que no tiene fila que
     // borrar. La rama del insert SIN fila confirmada sí compensa (Defecto 3,
     // asertado aparte): su `.delete()` vive después de este recorte.
@@ -1220,13 +1233,35 @@ describe("cash: T0-a (C1) los lectores ya no unen el ledger completo", () => {
   }
 
   it("los tres lectores de payments filtran invoice_id IS NULL", () => {
-    const readers = dbChains(service, "payments").filter((chain) =>
+    const selects = dbChains(service, "payments").filter((chain) =>
       chain.trimStart().startsWith(".select("),
     );
-    expect(readers).toHaveLength(3); // cierre, vista del día, historial
+    // Los tres LECTORES del arqueo (cierre, vista del día, historial) excluyen
+    // los pagos con factura: ese dinero ya vive en `invoice_payments` y sumarlo
+    // acá lo contaría dos veces.
+    const readers = selects.filter((chain) => chain.includes('.is("invoice_id", null)'));
+    expect(readers).toHaveLength(3);
     for (const chain of readers) {
       expect(chain).toContain('.is("invoice_id", null)');
     }
+    // CL-3: la CUARTA cadena de `payments` es otra cosa —la búsqueda de la fila
+    // de cajón del intento GANADOR, para devolverla en una repetición— y filtra
+    // por factura EXACTA, no por ausencia de factura. Se pincha para que el
+    // conjunto de arriba no pueda crecer en silencio.
+    const repeatLookups = selects.filter((chain) =>
+      chain.includes('.eq("invoice_id", winner.invoice_id)'),
+    );
+    expect(repeatLookups).toHaveLength(1);
+    // CL-4: la QUINTA cadena de `payments` es el lookup por MARCA del libro de
+    // cajón (el pago SIN factura, cuya identidad es esa fila), que filtra por
+    // TURNO y marca, no por factura. Se pincha por la misma razón que la
+    // anterior: que el conjunto no pueda crecer en silencio, porque ninguna de
+    // estas cadenas es un lector del arqueo.
+    const markLookups = selects.filter((chain) =>
+      chain.includes('.eq("idempotency_key", idempotencyKey)'),
+    );
+    expect(markLookups).toHaveLength(1);
+    expect(selects).toHaveLength(5);
   });
 
   it("la fila espejo de invoice_payments lleva el turno que cobra", () => {
@@ -1249,7 +1284,8 @@ describe("cash: T0-a (C1) los lectores ya no unen el ledger completo", () => {
   });
 
   it("traduce P0001 del tope de factura a OVERPAID (C2)", () => {
-    expect(service).toContain('(mirrorError as { code?: string }).code === "P0001"');
+    expect(service).toContain('const code = (mirrorError as { code?: string } | null)?.code;');
+    expect(service).toContain('if (code === "23505" || code === "P0001") {');
     expect(service).toContain(
       'throw new CashError("OVERPAID", "El pago supera el saldo pendiente de la factura.", 422);',
     );
@@ -1359,6 +1395,14 @@ const paymentStub = vi.hoisted(() => ({
   SHIFT_ID: "22222222-2222-4222-8222-222222222222",
   INVOICE_ID: "33333333-3333-4333-8333-333333333333",
   METHOD_ID: "55555555-5555-4555-8555-555555555555",
+  /**
+   * CL-3: el tope de 031 que replica el doble. La factura del test es la misma
+   * que sirve el detalle (100000, sin recargo), así que el tope usa su
+   * aritmética REAL: neto cobrado + neto nuevo ≤ round(total − recargo), con la
+   * misma tolerancia de centavo que el trigger.
+   */
+  INVOICE_TOTAL: 100000,
+  INVOICE_SURCHARGE: 0,
   /** Tablas borradas, en orden: el registro que hace observable el DELETE. */
   deleteCalls: [] as string[],
   /** Consultas que el doble no sabe responder (debería quedar siempre vacío). */
@@ -1366,62 +1410,271 @@ const paymentStub = vi.hoisted(() => ({
   mirrorError: null as { code?: string; message?: string } | null,
   mirrorData: null as { id: string } | null,
   rollbackError: null as { message?: string } | null,
+  /**
+   * CL-3: modo TABLA EN MEMORIA. Con `true` el doble mantiene las filas REALES
+   * de `invoice_payments` (el dinero cobrado de la factura) y de `payments` (el
+   * libro de cajón) y aplica las DOS barreras de la base con sus códigos
+   * reales: el tope de 031 (P0001, trigger BEFORE INSERT) y el índice único
+   * parcial de 042 (23505). Apagado (el valor por defecto), se comporta como
+   * antes de CL-3: responde `mirrorError`/`mirrorData`, que es lo que necesitan
+   * los tests del espejo fallido (T0-b) para forzar cada falla del INSERT.
+   */
+  ledgerMode: false,
+  /** Filas REALES de `invoice_payments` (lo que suma el arqueo). */
+  ledger: [] as Array<Record<string, unknown>>,
+  /** Filas REALES de `payments` (el libro de cajón del turno). */
+  drawer: [] as Array<Record<string, unknown>>,
+  /** Estado REAL de la factura: el cobro que la completa la pasa a Pagada. */
+  invoiceStatus: "Emitida",
+  /** Escrituras PEDIDAS por tabla (un intento cuenta aunque choque). */
+  inserts: {} as Record<string, number>,
+  /** Saltea el próximo lookup por marca: arma la ventana de la carrera. */
+  skipMarkLookupOnce: false,
+  /**
+   * CL-4: saltea el próximo lookup por marca del LIBRO DE CAJÓN (`payments`).
+   * Es la misma ventana que `skipMarkLookupOnce`, pero de la otra puerta: el
+   * camino sin factura resuelve su turno ANTES del lookup, así que el flag del
+   * espejo no sirve para armarla.
+   */
+  skipDrawerMarkLookupOnce: false,
+  /** Error forzado del INSERT en `payments` (control negativo del 23505). */
+  drawerError: null as { code?: string; message?: string } | null,
+  /** Turnos ADICIONALES de la sede, para el escenario multi-turno de CL-4. */
+  extraShifts: [] as Array<Record<string, unknown>>,
+  /**
+   * Snapshot viejo de `invoice_payments` que el detalle sirve UNA sola vez: es
+   * la lectura desactualizada del saldo con la que la carrera pasa la
+   * comprobación del servicio y llega hasta el INSERT, donde el tope SÍ ve la
+   * fila confirmada. El intercalado se arma, no se inventa el desenlace.
+   */
+  stalePaymentsOnce: null as Array<Record<string, unknown>> | null,
 }));
 
 /**
- * Cliente Supabase falso y encadenable. Solo responde lo que el camino de
- * `registerPayment` consulta de verdad (`cash_shifts`, `invoice_payments`);
- * cualquier otra consulta se registra en `unexpectedQueries` y vuelve como
- * error, para que el test falle a la vista en vez de en silencio.
+ * Cliente Supabase falso y encadenable del camino de `registerPayment`.
+ * Responde lo que ese camino consulta de verdad (`cash_shifts`,
+ * `invoice_payments`, `payments`, `invoices`); cualquier otra consulta se
+ * registra en `unexpectedQueries` y vuelve como error, para que el test falle a
+ * la vista en vez de en silencio.
+ *
+ * CL-3: en `ledgerMode` mantiene el ESTADO que decide el defecto —las filas
+ * cobradas y el libro de cajón— y las dos barreras de la base. La aritmética NO
+ * se sustituye: `invoiceNetBalance` y `splitGrossCardFee` son los de producción
+ * y corren de verdad contra este doble.
  */
 function createStubSupabaseClient(): unknown {
-  const respond = (
-    table: string,
-    op: "select" | "insert" | "delete",
-  ): { data: unknown; error: unknown } => {
-    if (table === "cash_shifts" && op === "select") {
-      return {
-        data: {
+  const rowsOf = (table: string): Array<Record<string, unknown>> => {
+    if (table === "invoice_payments") return paymentStub.ledger;
+    if (table === "payments") return paymentStub.drawer;
+    if (table === "cash_shifts") {
+      return [
+        {
           id: paymentStub.SHIFT_ID,
+          cash_register_id: "reg-1",
           sede_id: paymentStub.SEDE_ID,
-          status: "abierto",
           opened_by: "u-1",
+          closed_by: null,
+          opened_at: "2026-09-30T00:00:00.000Z",
+          closed_at: null,
+          opening_base: 0,
+          expected_cash: 0,
+          counted_cash: null,
+          base_left: null,
+          cash_withdrawn: null,
+          base_difference: null,
+          status: "abierto",
+          observation: null,
         },
-        error: null,
-      };
+        ...paymentStub.extraShifts,
+      ];
     }
-    if (table === "invoice_payments" && op === "insert") {
-      return { data: paymentStub.mirrorData, error: paymentStub.mirrorError };
+    if (table === "invoices") {
+      return [
+        {
+          id: paymentStub.INVOICE_ID,
+          sede_id: paymentStub.SEDE_ID,
+          status: paymentStub.invoiceStatus,
+          total: paymentStub.INVOICE_TOTAL,
+          surcharge: paymentStub.INVOICE_SURCHARGE,
+          cash_shift_id: paymentStub.SHIFT_ID,
+        },
+      ];
     }
-    if (table === "invoice_payments" && op === "delete") {
-      paymentStub.deleteCalls.push(table);
-      return { data: null, error: paymentStub.rollbackError };
-    }
-    paymentStub.unexpectedQueries.push(`${table}.${op}`);
-    return { data: null, error: { message: `stub sin respuesta para ${table}.${op}` } };
+    paymentStub.unexpectedQueries.push(`${table}.select`);
+    return [];
   };
 
   const from = (table: string) => {
-    let op: "select" | "insert" | "delete" = "select";
+    let op: "select" | "insert" | "update" | "delete" = "select";
+    let single = false;
+    let payload: unknown;
+    const filterColumns: string[] = [];
+    const filters: Array<[string, unknown]> = [];
+
+    const matching = (): Array<Record<string, unknown>> =>
+      rowsOf(table).filter((row) => filters.every(([column, value]) => row[column] === value));
+
+    const respond = (): { data: unknown; error: unknown } => {
+      if (table === "invoice_payments" && op === "delete") {
+        paymentStub.deleteCalls.push(table);
+        for (const row of matching()) {
+          const at = paymentStub.ledger.indexOf(row);
+          if (at >= 0) paymentStub.ledger.splice(at, 1);
+        }
+        return { data: null, error: paymentStub.rollbackError };
+      }
+      if (op === "update") {
+        // El cobro que completa la factura la pasa a Pagada: el doble lo escribe
+        // de verdad, para que la lectura siguiente lo vea.
+        const written = (payload ?? {}) as Record<string, unknown>;
+        if (table === "invoices" && typeof written.status === "string") {
+          paymentStub.invoiceStatus = written.status;
+        }
+        const matched = matching();
+        return { data: single ? matched[0] ?? null : matched, error: null };
+      }
+      if (op === "insert") {
+        paymentStub.inserts[table] = (paymentStub.inserts[table] ?? 0) + 1;
+        if (table === "invoice_payments") {
+          if (paymentStub.mirrorError) {
+            return { data: paymentStub.mirrorData, error: paymentStub.mirrorError };
+          }
+          if (!paymentStub.ledgerMode) return { data: paymentStub.mirrorData, error: null };
+          const row = (payload ?? {}) as Record<string, unknown>;
+          // 1) El tope de cobro (031) es un trigger BEFORE INSERT: corre ANTES
+          //    de que la fila entre al índice.
+          const paidNet = paymentStub.ledger
+            .filter((candidate) => candidate.invoice_id === row.invoice_id)
+            .reduce(
+              (acc, candidate) =>
+                acc + (Number(candidate.amount) - Number(candidate.fee_amount ?? 0)),
+              0,
+            );
+          const newNet = Number(row.amount) - Number(row.fee_amount ?? 0);
+          const cap = Math.round(paymentStub.INVOICE_TOTAL - paymentStub.INVOICE_SURCHARGE);
+          if (paidNet + newNet - cap > 0.009) {
+            return {
+              data: null,
+              error: { code: "P0001", message: "El cobro supera el neto facturado de la factura" },
+            };
+          }
+          // 2) El índice único PARCIAL (042): la marca no nula choca contra lo
+          //    confirmado y aborta la sentencia entera.
+          const mark = row.idempotency_key;
+          if (mark !== null && mark !== undefined) {
+            const clashes = paymentStub.ledger.some(
+              (other) => other.invoice_id === row.invoice_id && other.idempotency_key === mark,
+            );
+            if (clashes) {
+              return {
+                data: null,
+                error: {
+                  code: "23505",
+                  message:
+                    'duplicate key value violates unique constraint "uq_invoice_payments_invoice_idempotency_key"',
+                },
+              };
+            }
+          }
+          const persisted = {
+            id: `espejo-${paymentStub.ledger.length + 1}`,
+            created_at: "2026-09-30T00:00:00.000Z",
+            ...row,
+          };
+          paymentStub.ledger.push(persisted);
+          return { data: single ? persisted : [persisted], error: null };
+        }
+        if (table === "payments") {
+          if (paymentStub.drawerError) {
+            return { data: null, error: paymentStub.drawerError };
+          }
+          const row = (payload ?? {}) as Record<string, unknown>;
+          // CL-4: el índice único PARCIAL de 043 —a lo sumo una operación por
+          // marca y turno—. La marca NULL (las filas del camino con factura y
+          // las históricas) queda FUERA del índice, igual que en el real.
+          const mark = row.idempotency_key;
+          if (mark !== null && mark !== undefined) {
+            const clashes = paymentStub.drawer.some(
+              (other) =>
+                other.cash_shift_id === row.cash_shift_id && other.idempotency_key === mark,
+            );
+            if (clashes) {
+              return {
+                data: null,
+                error: {
+                  code: "23505",
+                  message:
+                    'duplicate key value violates unique constraint "uq_payments_shift_idempotency_key"',
+                },
+              };
+            }
+          }
+          const persisted = {
+            id: `caja-${paymentStub.drawer.length + 1}`,
+            created_at: "2026-09-30T00:00:00.000Z",
+            ...row,
+          };
+          paymentStub.drawer.push(persisted);
+          return { data: single ? persisted : [persisted], error: null };
+        }
+        return { data: null, error: { message: `doble sin respuesta para el insert en ${table}` } };
+      }
+      // SELECT. `skipMarkLookupOnce` saltea el próximo lookup POR MARCA: es la
+      // ventana en la que la ganadora confirmó después de esta lectura.
+      // CL-4: el libro de cajón tiene su propio flag, porque su lookup filtra
+      // las MISMAS dos columnas (`cash_shift_id`, `idempotency_key`) pero vive
+      // en otra tabla.
+      if (
+        table === "payments" &&
+        filterColumns.includes("idempotency_key") &&
+        paymentStub.skipDrawerMarkLookupOnce
+      ) {
+        paymentStub.skipDrawerMarkLookupOnce = false;
+        return { data: single ? null : [], error: null };
+      }
+      if (filterColumns.includes("idempotency_key") && paymentStub.skipMarkLookupOnce) {
+        paymentStub.skipMarkLookupOnce = false;
+        return { data: single ? null : [], error: null };
+      }
+      const matched = matching();
+      return { data: single ? matched[0] ?? null : matched, error: null };
+    };
+
     const query: Record<string, unknown> = {
       select: () => query,
-      insert: () => {
+      insert: (value?: unknown) => {
         op = "insert";
+        payload = value;
+        return query;
+      },
+      update: (value?: unknown) => {
+        op = "update";
+        payload = value;
         return query;
       },
       delete: () => {
         op = "delete";
         return query;
       },
-      eq: () => query,
+      eq: (column: string, value: unknown) => {
+        filterColumns.push(column);
+        filters.push([column, value]);
+        return query;
+      },
       order: () => query,
       limit: () => query,
-      single: () => Promise.resolve(respond(table, op)),
-      maybeSingle: () => Promise.resolve(respond(table, op)),
+      single: () => {
+        single = true;
+        return Promise.resolve(respond());
+      },
+      maybeSingle: () => {
+        single = true;
+        return Promise.resolve(respond());
+      },
       // `await` directo sobre la cadena (p. ej. `delete().eq(...)`) resuelve al
       // objeto de respuesta, igual que el PostgREST real.
       then: (onFulfilled?: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>
-        Promise.resolve(respond(table, op)).then(onFulfilled, onRejected),
+        Promise.resolve(respond()).then(onFulfilled, onRejected),
     };
     return query;
   };
@@ -1453,26 +1706,38 @@ vi.mock("@/src/features/billing/service", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/src/features/billing/service")>();
   // Solo se sustituye la lectura del detalle: `invoiceNetBalance` y
   // `splitGrossCardFee` siguen siendo los reales (vienen del spread).
-  const detail = {
-    invoice: {
-      id: paymentStub.INVOICE_ID,
-      sede_id: paymentStub.SEDE_ID,
-      status: "Emitida",
-      total: 100000,
-      surcharge: 0,
-      cash_shift_id: paymentStub.SHIFT_ID,
-    },
-    payments: [],
-  } as unknown as Awaited<ReturnType<typeof actual.getInvoiceDetail>>;
-  return { ...actual, getInvoiceDetail: async () => detail };
+  //
+  // CL-3: el detalle se arma con el ESTADO del doble —las filas ya cobradas y el
+  // estado real de la factura—, así que la aritmética del saldo que decide corre
+  // de verdad contra lo que el intento anterior escribió. Sin eso, un test
+  // podría afirmar un reintento mientras el saldo no ve nada.
+  const detail = async () => {
+    const payments = paymentStub.stalePaymentsOnce ?? paymentStub.ledger;
+    paymentStub.stalePaymentsOnce = null;
+    return {
+      invoice: {
+        id: paymentStub.INVOICE_ID,
+        sede_id: paymentStub.SEDE_ID,
+        status: paymentStub.invoiceStatus,
+        total: paymentStub.INVOICE_TOTAL,
+        surcharge: paymentStub.INVOICE_SURCHARGE,
+        cash_shift_id: paymentStub.SHIFT_ID,
+      },
+      payments,
+    } as unknown as Awaited<ReturnType<typeof actual.getInvoiceDetail>>;
+  };
+  return { ...actual, getInvoiceDetail: detail };
 });
 
 describe("cash: T0-b el INSERT fallido del espejo no emite ningún DELETE", () => {
+  /** CL-3: el cobro de una factura ahora exige la marca del intento. */
+  const MARK = "7c1e5a90-3b48-4d22-9e6f-0a1b2c3d4e5f";
   const input = {
     cash_shift_id: paymentStub.SHIFT_ID,
     invoice_id: paymentStub.INVOICE_ID,
     method_code: "efectivo",
     amount: 50000,
+    idempotency_key: MARK,
   };
   const actor = { userId: "u-1", sedeId: paymentStub.SEDE_ID };
 
@@ -1482,6 +1747,13 @@ describe("cash: T0-b el INSERT fallido del espejo no emite ningún DELETE", () =
     paymentStub.mirrorError = null;
     paymentStub.mirrorData = null;
     paymentStub.rollbackError = null;
+    paymentStub.ledgerMode = false;
+    paymentStub.ledger.length = 0;
+    paymentStub.drawer.length = 0;
+    paymentStub.invoiceStatus = "Emitida";
+    paymentStub.inserts = {};
+    paymentStub.skipMarkLookupOnce = false;
+    paymentStub.stalePaymentsOnce = null;
   });
 
   it("P0001 del tope: rechaza OVERPAID y no emite DELETE", async () => {
@@ -1529,6 +1801,578 @@ describe("cash: T0-b el INSERT fallido del espejo no emite ningún DELETE", () =
     } finally {
       errorSpy.mockRestore();
     }
+  });
+});
+
+// ---------- CL-3: el cobro de caja de una factura, repetido, no cobra dos veces ----------
+
+/**
+ * CL-3: la puerta de CAJA donde un reintento duplicaba dinero, y la única que
+ * acepta montos PARCIALES.
+ *
+ * EL DEFECTO, medido: `registerPayment` (service.ts) escribe el espejo de la
+ * factura (`invoice_payments`) SIN marca del envío y —a diferencia del cobro
+ * dividido— acepta una porción MENOR que el saldo. El tope de 031 usa la misma
+ * aritmética (neto cobrado + neto nuevo ≤ neto facturado), así que con
+ * 2 × entrante ≤ saldo tampoco frena nada: un cobro parcial reintentado
+ * insertaba el espejo DOS veces y el arqueo —que suma ese ledger— cobraba el
+ * dinero dos veces. El test de abajo lo pincha con la fila espejo como unidad
+ * de medida.
+ *
+ * LA DECISIÓN es la misma de la emisión (041), del abono de nómina y del cobro
+ * dividido (042): dos envíos iguales son UNA operación, y se reconocen por la
+ * MARCA del intento que manda el llamador, no por el contenido.
+ *
+ * LA FORMA: acá NO está la arruga de "la marca en la primera porción" de 042.
+ * Este camino escribe UNA sola fila (un `insert` de un objeto, no de un
+ * arreglo), así que la marca vive en esa única fila, el índice único parcial
+ * nunca puede rechazar una operación legítima y no hay hermanas que enumerar.
+ */
+describe("cash: CL-3 el reintento de un cobro de factura no cobra dos veces", () => {
+  const ACTOR = { userId: "u-1", sedeId: paymentStub.SEDE_ID };
+  /** Marca del intento; la segunda existe para el control de no-sobrealcance. */
+  const MARK = "6b1f9d3e-4a27-4c58-9f10-2d7e5b8c0a31";
+  const OTHER_MARK = "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f";
+
+  /**
+   * Cobro PARCIAL por defecto (50000 de 100000): deja saldo, así que el tope de
+   * 031 —y la comprobación del servicio, que usan la MISMA aritmética— pasan
+   * las dos veces. Es exactamente el caso del defecto.
+   */
+  const collection = (mark = MARK, amount = 50000) => ({
+    cash_shift_id: paymentStub.SHIFT_ID,
+    invoice_id: paymentStub.INVOICE_ID,
+    method_code: "efectivo",
+    amount,
+    idempotency_key: mark,
+  });
+
+  const mirrorInserts = () => paymentStub.inserts.invoice_payments ?? 0;
+  const drawerInserts = () => paymentStub.inserts.payments ?? 0;
+
+  /**
+   * La ganadora de una carrera: su fila espejo (con la marca) y su fila de
+   * cajón, ya confirmadas. Se siembran para que el intento perdedor tenga
+   * contra quién chocar, y para que el reconocimiento tenga algo que releer.
+   */
+  function seedWinner(amount: number, mark: string): void {
+    paymentStub.ledger.push({
+      id: "espejo-ganador",
+      invoice_id: paymentStub.INVOICE_ID,
+      method_id: paymentStub.METHOD_ID,
+      method_code: "efectivo",
+      amount,
+      fee_percent: 0,
+      fee_amount: 0,
+      cash_shift_id: paymentStub.SHIFT_ID,
+      created_at: "2026-09-30T00:00:00.000Z",
+      idempotency_key: mark,
+    });
+    paymentStub.drawer.push({
+      id: "caja-ganador",
+      sede_id: paymentStub.SEDE_ID,
+      cash_shift_id: paymentStub.SHIFT_ID,
+      invoice_id: paymentStub.INVOICE_ID,
+      method_id: paymentStub.METHOD_ID,
+      method_code: "efectivo",
+      amount,
+      user_id: "u-1",
+      created_at: "2026-09-30T00:00:00.000Z",
+    });
+  }
+
+  beforeEach(() => {
+    paymentStub.deleteCalls.length = 0;
+    paymentStub.unexpectedQueries.length = 0;
+    paymentStub.mirrorError = null;
+    paymentStub.mirrorData = null;
+    paymentStub.rollbackError = null;
+    paymentStub.ledgerMode = true;
+    paymentStub.ledger.length = 0;
+    paymentStub.drawer.length = 0;
+    paymentStub.invoiceStatus = "Emitida";
+    paymentStub.inserts = {};
+    paymentStub.skipMarkLookupOnce = false;
+    paymentStub.stalePaymentsOnce = null;
+  });
+
+  it("el reintento del MISMO envío escribe el espejo UNA vez (el dinero se cobra una vez)", async () => {
+    const first = await registerPayment(collection(), ACTOR);
+    const repeat = await registerPayment(collection(), ACTOR);
+
+    // El dinero cobrado, medido donde el arqueo lo suma: UNA sola fila espejo.
+    expect(paymentStub.ledger).toHaveLength(1);
+    expect(paymentStub.ledger[0]).toMatchObject({ amount: 50000, idempotency_key: MARK });
+    expect(mirrorInserts()).toBe(1);
+    expect(drawerInserts()).toBe(1);
+    // Y el reintento es un no-op EXITOSO: el mismo resultado, sin escribir nada.
+    expect(repeat).toEqual(first);
+    expect(paymentStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("una marca DISTINTA sí cobra otra vez (control de no-sobrealcance)", async () => {
+    await registerPayment(collection(MARK), ACTOR);
+    await registerPayment(collection(OTHER_MARK), ACTOR);
+
+    // La marca reconoce UNA operación, no encadena cobros: dos intentos
+    // distintos con el mismo monto son dos cobros parciales legítimos.
+    expect(paymentStub.ledger).toHaveLength(2);
+    expect(paymentStub.ledger.map((row) => row.idempotency_key)).toEqual([MARK, OTHER_MARK]);
+    expect(mirrorInserts()).toBe(2);
+    expect(drawerInserts()).toBe(2);
+    // Y con el segundo se completa el saldo: la factura queda Pagada.
+    expect(paymentStub.invoiceStatus).toBe("Pagada");
+  });
+
+  it("un cobro que COMPLETA el saldo también se reconoce (la marca va antes del saldo)", async () => {
+    const first = await registerPayment(collection(MARK, 100000), ACTOR);
+    expect(paymentStub.invoiceStatus).toBe("Pagada");
+
+    const repeat = await registerPayment(collection(MARK, 100000), ACTOR);
+
+    // Sin la marca ANTES de la comprobación del saldo, este reintento moría con
+    // OVERPAID (el saldo ya está en cero) por una operación que SÍ se registró:
+    // es la misma historia que el cobro dividido, y acá el tope tampoco lo salva.
+    expect(repeat).toEqual(first);
+    expect(paymentStub.ledger).toHaveLength(1);
+    expect(mirrorInserts()).toBe(1);
+    expect(drawerInserts()).toBe(1);
+  });
+
+  it("la carrera por el ÍNDICE (23505) relee a la ganadora", async () => {
+    seedWinner(50000, MARK);
+    // La ganadora confirmó DESPUÉS de la lectura de esta petición: el lookup por
+    // marca no la vio y este intento llega al INSERT, donde choca con el índice
+    // único parcial de 042.
+    paymentStub.skipMarkLookupOnce = true;
+
+    const result = await registerPayment(collection(), ACTOR);
+
+    // No vacuidad: el INSERT se intentó (si el lookup lo hubiera frenado, este
+    // contador sería 0) y lo frenó el índice.
+    expect(mirrorInserts()).toBe(1);
+    expect(paymentStub.ledger).toHaveLength(1);
+    // Y no escribió un segundo libro de cajón: devuelve el de la ganadora.
+    expect(drawerInserts()).toBe(0);
+    expect(result.payment).toMatchObject({ id: "caja-ganador", amount: 50000 });
+    expect(result.invoice_id).toBe(paymentStub.INVOICE_ID);
+    expect(paymentStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("la carrera por el TOPE (P0001) relee a la ganadora", async () => {
+    seedWinner(100000, MARK);
+    // La lectura del saldo es vieja (no ve a la ganadora) y la marca tampoco se
+    // vio: esta petición pasa la comprobación del servicio y llega al INSERT,
+    // donde el trigger de 031 SÍ ve la fila confirmada y rechaza.
+    paymentStub.stalePaymentsOnce = [];
+    paymentStub.skipMarkLookupOnce = true;
+
+    const result = await registerPayment(collection(MARK, 50000), ACTOR);
+
+    expect(mirrorInserts()).toBe(1);
+    expect(paymentStub.ledger).toHaveLength(1);
+    expect(drawerInserts()).toBe(0);
+    expect(result.payment).toMatchObject({ id: "caja-ganador", amount: 100000 });
+  });
+
+  it("control negativo: sin ganadora, un 23505 NO se disfraza de repetición", async () => {
+    paymentStub.mirrorError = {
+      code: "23505",
+      message: 'duplicate key value violates unique constraint "uq_invoice_payments_invoice_idempotency_key"',
+    };
+
+    const failure: unknown = await registerPayment(collection(), ACTOR).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(CashError);
+    expect(failure).toMatchObject({ code: "INTERNAL", status: 500 });
+    expect(paymentStub.ledger).toHaveLength(0);
+    expect(drawerInserts()).toBe(0);
+  });
+
+  it("control negativo: una marca nueva no vuelve cobrable lo que el saldo rechaza", async () => {
+    seedWinner(90000, OTHER_MARK);
+
+    const failure: unknown = await registerPayment(collection(MARK, 50000), ACTOR).catch(
+      (error: unknown) => error,
+    );
+
+    // La marca no relaja la aritmética: el saldo y el tope siguen mandando.
+    expect(failure).toBeInstanceOf(CashError);
+    expect(failure).toMatchObject({ code: "OVERPAID", status: 422 });
+    expect(mirrorInserts()).toBe(0);
+    expect(paymentStub.ledger).toHaveLength(1);
+  });
+
+  it("una marca faltante o mal formada se rechaza con CERO escrituras", async () => {
+    // La marca es OBLIGATORIA para cobrar una factura: un envío sin marca no se
+    // puede reconocer como repetición, y la ruta REST es justo la superficie que
+    // reintenta sobre redes. El rechazo es ruidoso y no escribe nada.
+    const withoutMark: unknown = await registerPayment(
+      { ...collection(), idempotency_key: undefined },
+      ACTOR,
+    ).catch((error: unknown) => error);
+    const malformed: unknown = await registerPayment(
+      { ...collection(), idempotency_key: "no-es-un-uuid" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(withoutMark).toBeInstanceOf(CashError);
+    expect(withoutMark).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(malformed).toBeInstanceOf(CashError);
+    expect(malformed).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(mirrorInserts()).toBe(0);
+    expect(drawerInserts()).toBe(0);
+    expect(paymentStub.ledger).toHaveLength(0);
+  });
+
+  it("un pago SIN factura exige marca y sigue escribiendo sólo el cajón", async () => {
+    const result = await registerPayment(
+      {
+        cash_shift_id: paymentStub.SHIFT_ID,
+        method_code: "efectivo",
+        amount: 30000,
+        idempotency_key: MARK,
+      },
+      ACTOR,
+    );
+
+    // La fila de un pago sin factura vive sólo en `payments`: la marca la lleva
+    // ESA fila (columna e índice de 043, CL-4), que es la única escritura de la
+    // operación. Antes de la 043 este envío no exigía marca y un reintento
+    // escribía una segunda fila que el arqueo sumaba dos veces.
+    expect(paymentStub.drawer).toHaveLength(1);
+    expect(paymentStub.drawer[0]).toMatchObject({
+      invoice_id: null,
+      amount: 30000,
+      idempotency_key: MARK,
+    });
+    expect(paymentStub.ledger).toHaveLength(0);
+    expect(mirrorInserts()).toBe(0);
+    expect(result.invoice_id).toBeNull();
+    expect(result.invoice_status).toBeNull();
+  });
+
+  it("el esquema exige la marca para cobrar una factura (y también para un pago de cajón)", () => {
+    const base = { method_code: "efectivo", amount: 50000 };
+    // Pago sin factura: la marca TAMBIÉN se exige (CL-4). Su fila vive en
+    // `payments`, que a partir de la 043 tiene columna de marca: sin ella el
+    // reintento duplicaba el efectivo del turno.
+    expect(registerPaymentSchema.safeParse(base).success).toBe(false);
+    expect(registerPaymentSchema.safeParse({ ...base, invoice_id: null }).success).toBe(false);
+    expect(registerPaymentSchema.safeParse({ ...base, idempotency_key: MARK }).success).toBe(true);
+    // Cobro de factura: sin marca o con una mal formada, se rechaza.
+    expect(
+      registerPaymentSchema.safeParse({ ...base, invoice_id: paymentStub.INVOICE_ID }).success,
+    ).toBe(false);
+    expect(
+      registerPaymentSchema.safeParse({
+        ...base,
+        invoice_id: paymentStub.INVOICE_ID,
+        idempotency_key: "no-es-un-uuid",
+      }).success,
+    ).toBe(false);
+    expect(
+      registerPaymentSchema.safeParse({
+        ...base,
+        invoice_id: paymentStub.INVOICE_ID,
+        idempotency_key: MARK,
+      }).success,
+    ).toBe(true);
+  });
+});
+
+// ---- CL-4: el pago de cajón SIN factura, repetido, no cuenta el efectivo dos veces ----
+
+/**
+ * CL-4: la puerta contigua de CL-3, en el MISMO `registerPayment`.
+ *
+ * EL DEFECTO, medido: un pago SIN factura escribe UNA sola fila —la del libro
+ * de cajón (`payments`), sin espejo— y esa fila no tiene marca. Un reintento del
+ * MISMO envío (doble clic, o el navegador reenviando tras cortarse la red)
+ * escribe una SEGUNDA fila, y los TRES lectores del arqueo suman
+ * `payments WHERE invoice_id IS NULL`: el efectivo del turno se cuenta dos
+ * veces. No hay tope que lo frene: este camino no tiene obligación contra la
+ * cual compararse, así que la única barrera posible es la IDENTIDAD del envío.
+ */
+describe("cash: CL-4 el reintento de un pago de cajón sin factura no cuenta el efectivo dos veces", () => {
+  const ACTOR = { userId: "u-1", sedeId: paymentStub.SEDE_ID };
+  const MARK = "4f8a2c61-9d0b-4e35-b7a2-1c6f9e0d8b47";
+  /** Segunda marca: control de NO sobrealcance (otra operación, no una repetición). */
+  const OTHER_MARK = "9b3d7e15-6c02-4a8f-8d51-3e7a0b6c2f94";
+  /** Turno B: el escenario multi-turno prueba que la clave del índice es por turno. */
+  const SHIFT_B = "77777777-7777-4777-8777-777777777777";
+
+  /** Pago de cajón sin factura: su fila vive SÓLO en `payments`. */
+  const drawerPayment = (mark = MARK, amount = 30000, shiftId = paymentStub.SHIFT_ID) => ({
+    cash_shift_id: shiftId,
+    method_code: "efectivo",
+    amount,
+    idempotency_key: mark,
+  });
+  const drawerInserts = () => paymentStub.inserts.payments ?? 0;
+
+  /**
+   * El efectivo que el arqueo suma del turno: los tres lectores de producción
+   * usan `payments WHERE cash_shift_id = <turno> AND invoice_id IS NULL`, así
+   * que la medida del defecto es esta suma, no la cantidad de filas.
+   */
+  const shiftCash = (shiftId: string): number =>
+    paymentStub.drawer
+      .filter((row) => row.cash_shift_id === shiftId && row.invoice_id === null)
+      .reduce((acc, row) => acc + Number(row.amount), 0);
+
+  /** Un turno abierto más de la sede (para el escenario multi-turno). */
+  function seedShift(id: string): void {
+    paymentStub.extraShifts.push({
+      id,
+      cash_register_id: "reg-2",
+      sede_id: paymentStub.SEDE_ID,
+      opened_by: "u-1",
+      closed_by: null,
+      opened_at: "2026-09-30T01:00:00.000Z",
+      closed_at: null,
+      opening_base: 0,
+      expected_cash: 0,
+      counted_cash: null,
+      base_left: null,
+      cash_withdrawn: null,
+      base_difference: null,
+      status: "abierto",
+      observation: null,
+    });
+  }
+
+  /** La ganadora de una carrera en el libro de cajón, ya confirmada. */
+  function seedDrawerWinner(amount: number, mark: string, shiftId = paymentStub.SHIFT_ID): void {
+    paymentStub.drawer.push({
+      id: "caja-ganador",
+      sede_id: paymentStub.SEDE_ID,
+      cash_shift_id: shiftId,
+      invoice_id: null,
+      method_id: paymentStub.METHOD_ID,
+      method_code: "efectivo",
+      amount,
+      user_id: "u-1",
+      created_at: "2026-09-30T00:00:00.000Z",
+      idempotency_key: mark,
+    });
+  }
+
+  beforeEach(() => {
+    paymentStub.deleteCalls.length = 0;
+    paymentStub.unexpectedQueries.length = 0;
+    paymentStub.mirrorError = null;
+    paymentStub.mirrorData = null;
+    paymentStub.rollbackError = null;
+    paymentStub.ledgerMode = true;
+    paymentStub.ledger.length = 0;
+    paymentStub.drawer.length = 0;
+    paymentStub.invoiceStatus = "Emitida";
+    paymentStub.inserts = {};
+    paymentStub.skipMarkLookupOnce = false;
+    paymentStub.skipDrawerMarkLookupOnce = false;
+    paymentStub.drawerError = null;
+    paymentStub.extraShifts.length = 0;
+    paymentStub.stalePaymentsOnce = null;
+  });
+
+  it("RED medido, ahora GREEN: el reintento del MISMO envío escribe el libro de cajón UNA vez (el efectivo se cuenta una vez)", async () => {
+    const first = await registerPayment(drawerPayment(), ACTOR);
+    const repeat = await registerPayment(drawerPayment(), ACTOR);
+
+    // El efectivo del turno, medido donde el arqueo lo suma: una sola fila.
+    expect(paymentStub.drawer).toHaveLength(1);
+    expect(drawerInserts()).toBe(1);
+    expect(shiftCash(paymentStub.SHIFT_ID)).toBe(30000);
+    expect(paymentStub.drawer[0]).toMatchObject({
+      invoice_id: null,
+      amount: 30000,
+      idempotency_key: MARK,
+    });
+    expect(paymentStub.ledger).toHaveLength(0);
+    // Y el reintento es un no-op EXITOSO: el mismo resultado, sin escribir nada.
+    expect(repeat).toEqual(first);
+    expect(repeat.invoice_id).toBeNull();
+    expect(repeat.invoice_status).toBeNull();
+    expect(paymentStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("una marca DISTINTA sí registra otro pago (control de no-sobrealcance)", async () => {
+    await registerPayment(drawerPayment(MARK), ACTOR);
+    await registerPayment(drawerPayment(OTHER_MARK), ACTOR);
+
+    // La marca reconoce UNA operación, no encadena pagos: dos movimientos
+    // legítimos del mismo monto y método son dos operaciones.
+    expect(paymentStub.drawer).toHaveLength(2);
+    expect(paymentStub.drawer.map((row) => row.idempotency_key)).toEqual([MARK, OTHER_MARK]);
+    expect(shiftCash(paymentStub.SHIFT_ID)).toBe(60000);
+    expect(drawerInserts()).toBe(2);
+  });
+
+  it("la clave es por TURNO: la marca de un turno no choca con la de otro, y cada uno reconoce la suya", async () => {
+    seedShift(SHIFT_B);
+    // El turno A registró SU operación con esta marca.
+    await registerPayment(drawerPayment(MARK, 30000, paymentStub.SHIFT_ID), ACTOR);
+    // El turno B registra OTRA operación: la marca se resuelve DENTRO del turno
+    // (`(cash_shift_id, idempotency_key)`), así que el mismo uuid en otro turno
+    // no es una repetición ni choca contra el índice de la 043. La alternativa
+    // —clave por sede— rechazaría esta fila con 23505.
+    const other = await registerPayment(drawerPayment(MARK, 50000, SHIFT_B), ACTOR);
+    expect(paymentStub.drawer).toHaveLength(2);
+    expect(other.payment).toMatchObject({ cash_shift_id: SHIFT_B, amount: 50000 });
+    expect(other.shift.id).toBe(SHIFT_B);
+    // Y cada turno reconoce la SUYA sin tocar la del otro: el lookup no cruza
+    // turnos (si cruzara, el reintento del B devolvería la fila del A).
+    const repeatB = await registerPayment(drawerPayment(MARK, 50000, SHIFT_B), ACTOR);
+    expect(repeatB.payment).toMatchObject({ cash_shift_id: SHIFT_B, amount: 50000 });
+    expect(paymentStub.drawer).toHaveLength(2);
+    expect(shiftCash(paymentStub.SHIFT_ID)).toBe(30000);
+    expect(shiftCash(SHIFT_B)).toBe(50000);
+  });
+
+  it("la carrera por el ÍNDICE (23505) relee a la ganadora", async () => {
+    seedDrawerWinner(30000, MARK);
+    // La ganadora confirmó DESPUÉS de la lectura de esta petición: el lookup por
+    // marca no la vio y este intento llega al INSERT, donde choca con el índice
+    // único parcial de 043.
+    paymentStub.skipDrawerMarkLookupOnce = true;
+
+    const result = await registerPayment(drawerPayment(), ACTOR);
+
+    // No vacuidad: el INSERT se intentó (si el lookup lo hubiera frenado, este
+    // contador sería 0) y lo frenó el índice.
+    expect(drawerInserts()).toBe(1);
+    expect(paymentStub.drawer).toHaveLength(1);
+    expect(shiftCash(paymentStub.SHIFT_ID)).toBe(30000);
+    expect(result.payment).toMatchObject({ id: "caja-ganador", amount: 30000 });
+    expect(result.invoice_id).toBeNull();
+    expect(paymentStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("control negativo: sin ganadora, un 23505 NO se disfraza de repetición", async () => {
+    paymentStub.drawerError = {
+      code: "23505",
+      message: 'duplicate key value violates unique constraint "uq_payments_shift_idempotency_key"',
+    };
+
+    const failure: unknown = await registerPayment(drawerPayment(), ACTOR).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(CashError);
+    expect(failure).toMatchObject({ code: "INTERNAL", status: 500 });
+    expect(paymentStub.drawer).toHaveLength(0);
+  });
+
+  it("una marca faltante o mal formada se rechaza con CERO escrituras", async () => {
+    // La marca es OBLIGATORIA también sin factura: un envío sin marca no se
+    // puede reconocer como repetición, y la ruta REST es justo la superficie que
+    // reintenta sobre redes. El rechazo es ruidoso y no escribe nada.
+    const withoutMark: unknown = await registerPayment(
+      { ...drawerPayment(), idempotency_key: undefined },
+      ACTOR,
+    ).catch((error: unknown) => error);
+    const malformed: unknown = await registerPayment(
+      { ...drawerPayment(), idempotency_key: "no-es-un-uuid" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(withoutMark).toBeInstanceOf(CashError);
+    expect(withoutMark).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(malformed).toBeInstanceOf(CashError);
+    expect(malformed).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(paymentStub.drawer).toHaveLength(0);
+    expect(drawerInserts()).toBe(0);
+    expect(paymentStub.ledger).toHaveLength(0);
+  });
+
+  it("el esquema exige la marca en los DOS caminos (con y sin factura)", () => {
+    const base = { method_code: "efectivo", amount: 50000 };
+    // Sin marca no hay reconocimiento posible: se rechaza en los dos caminos.
+    expect(registerPaymentSchema.safeParse(base).success).toBe(false);
+    expect(registerPaymentSchema.safeParse({ ...base, invoice_id: null }).success).toBe(false);
+    expect(registerPaymentSchema.safeParse({ ...base, idempotency_key: "no-es-un-uuid" }).success).toBe(
+      false,
+    );
+    expect(
+      registerPaymentSchema.safeParse({ ...base, invoice_id: paymentStub.INVOICE_ID }).success,
+    ).toBe(false);
+    // Con la marca, los dos pasan.
+    expect(registerPaymentSchema.safeParse({ ...base, idempotency_key: MARK }).success).toBe(true);
+    expect(
+      registerPaymentSchema.safeParse({
+        ...base,
+        invoice_id: paymentStub.INVOICE_ID,
+        idempotency_key: MARK,
+      }).success,
+    ).toBe(true);
+  });
+
+  it("límite: el camino CON factura deja el libro de cajón SIN marca (su identidad es el espejo)", async () => {
+    // La marca de la 043 es la de ESTA puerta: las filas del cobro de factura
+    // llevan la marca en la fila espejo (042) y el libro de cajón queda NULL,
+    // así que un mismo uuid no puede leerse como "el pago de cajón ya está
+    // registrado" cuando en realidad es otra operación.
+    await registerPayment(
+      {
+        cash_shift_id: paymentStub.SHIFT_ID,
+        invoice_id: paymentStub.INVOICE_ID,
+        method_code: "efectivo",
+        amount: 50000,
+        idempotency_key: MARK,
+      },
+      ACTOR,
+    );
+
+    expect(paymentStub.ledger).toHaveLength(1);
+    expect(paymentStub.ledger[0]).toMatchObject({ idempotency_key: MARK });
+    expect(paymentStub.drawer).toHaveLength(1);
+    expect(paymentStub.drawer[0].idempotency_key).toBeNull();
+  });
+
+  it("la migración 043 agrega la marca con un índice único PARCIAL por turno y no reescribe filas", () => {
+    const raw = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "043_cash_box_payment_idempotency.sql"),
+      "utf8",
+    );
+    // La prosa explica justamente lo que NO hace el archivo y nombra esas
+    // sentencias; las aserciones de abajo miran el SQL, sin los comentarios.
+    const sql = raw
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("--"))
+      .join("\n");
+    // La columna nace NULL: las filas ya registradas no tienen marca y no hay
+    // backfill que inventar.
+    expect(sql).toContain("ALTER TABLE public.payments");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS idempotency_key text NULL");
+    // La guarda de forma: una marca es un uuid, no cualquier texto.
+    expect(sql).toContain("payments_idempotency_key_shape");
+    // La barrera final: a lo sumo una operación por marca y TURNO.
+    expect(sql).toContain("CREATE UNIQUE INDEX IF NOT EXISTS uq_payments_shift_idempotency_key");
+    expect(sql).toContain("ON public.payments (cash_shift_id, idempotency_key)");
+    // PARCIAL: las marcas NULL (históricas y las del camino con factura) quedan
+    // fuera del índice.
+    expect(sql).toContain("WHERE idempotency_key IS NOT NULL");
+    // No borra ni reescribe filas, y no toca el camino de factura ni el tope.
+    expect(sql).not.toMatch(/\bDELETE\s+FROM\b/i);
+    expect(sql).not.toMatch(/\bTRUNCATE\b/i);
+    expect(sql).not.toMatch(/\bUPDATE\s+public\.\w+/i);
+    // El camino de factura no se toca: ninguna sentencia ejecutable apunta a
+    // `invoice_payments` (la cadena aparece sólo en la prosa, explicando por qué
+    // la fila del libro de esa puerta queda NULL).
+    expect(sql).not.toMatch(/ALTER TABLE public\.invoice_payments/);
+    expect(sql).not.toMatch(/ON public\.invoice_payments/);
+    // Idempotente y declarada como NO ejecutada por el agente.
+    expect(sql).toContain("CREATE UNIQUE INDEX IF NOT EXISTS");
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos");
+    // La clave elegida y su justificación están escritas, no supuestas: las dos
+    // candidatas del encargo y la razón por la que se eligió la del turno.
+    expect(raw).toContain("cash_shift_id");
+    expect(raw).toContain("sede_id");
+    expect(raw).toContain("LIMITACIÓN DECLARADA");
+    expect(raw).toContain("COSTO DECLARADO");
   });
 });
 

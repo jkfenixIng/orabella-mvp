@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { moneyEquals, roundMoney } from "@/src/features/billing/schemas";
+import { idempotencyKeySchema, moneyEquals, roundMoney } from "@/src/features/billing/schemas";
 
 export { moneyEquals, roundMoney };
 
@@ -228,13 +228,52 @@ export const openShiftSchema = z.object({
 });
 export type OpenShiftInput = z.infer<typeof openShiftSchema>;
 
-/** CAJ-02: pago contra el turno (factura opcional; método del catálogo, monto > 0). */
-export const registerPaymentSchema = z.object({
-  cash_shift_id: uuidSchema.optional(),
-  invoice_id: uuidSchema.nullish(),
-  method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
-  amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
-});
+/** CAJ-02: pago contra el turno (factura opcional; método del catálogo, monto > 0).
+ *
+ * CL-3: el cuerpo exige `idempotency_key`, la MISMA marca del intento que la
+ * emisión de factura, el abono de nómina y el cobro dividido
+ * (`idempotencyKeySchema`, acá arriba: una sola definición para las CINCO
+ * puertas del dinero). Es lo que permite reconocer un reintento —doble clic, o
+ * el navegador reenviando tras cortarse la red— como la MISMA operación en vez
+ * de como un cobro nuevo.
+ *
+ * PARA EL COBRO DE UNA FACTURA la marca es OBLIGATORIA y no opcional: este
+ * camino acepta montos PARCIALES, así que el tope de 031 no frena el reintento
+ * (con 2 × entrante ≤ saldo, entra dos veces) y un envío sin marca no se puede
+ * reconocer. La marca vive en la fila espejo (`invoice_payments`, 042).
+ *
+ * CL-4: para un pago SIN factura también es OBLIGATORIA, y ahí la marca vive en
+ * la fila del LIBRO DE CAJÓN (`payments`), que es la ÚNICA escritura de esa
+ * operación: sin marca, un reintento escribía una SEGUNDA fila y los tres
+ * lectores del arqueo —que suman `payments WHERE invoice_id IS NULL`— contaban
+ * el efectivo del turno DOS veces. Este camino no tiene obligación contra la
+ * cual compararse (cualquier monto positivo es legítimo), así que la identidad
+ * del envío es la ÚNICA barrera posible; ver migración 043.
+ *
+ * El rechazo es ruidoso en los dos casos (VALIDATION 400, CERO escrituras y
+ * NINGUNA lectura), y la ruta REST —que es justamente la superficie que más
+ * reintenta— queda avisada en su comentario. Una entrega sin marca no se puede
+ * reconocer como repetición: aceptarla sería aceptar un pago que se duplica al
+ * primer reintento.
+ */
+export const registerPaymentSchema = z
+  .object({
+    cash_shift_id: uuidSchema.optional(),
+    invoice_id: uuidSchema.nullish(),
+    method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
+    amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+    /** CL-3/CL-4: marca del INTENTO de pago (uuid); obligatoria siempre. */
+    idempotency_key: idempotencyKeySchema.optional(),
+  })
+  .superRefine((value, context) => {
+    if (!value.idempotency_key) {
+      context.addIssue({
+        code: "custom",
+        path: ["idempotency_key"],
+        message: "La marca de idempotencia es obligatoria para registrar un pago.",
+      });
+    }
+  });
 export type RegisterPaymentInput = z.infer<typeof registerPaymentSchema>;
 
 /**

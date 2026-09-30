@@ -632,22 +632,44 @@ describe("payroll: tope con aprobación obligatoria (PAY-05/PAY-06)", () => {
   });
 
   it("solicitud exige monto > 0 y rechazo exige motivo", () => {
+    // CL-5: la marca del intento es obligatoria (la misma definición para todas
+    // las puertas del dinero). El cuerpo válido la lleva; sin ella —o con una que
+    // no es uuid— se rechaza con CERO escrituras.
+    const idempotency_key = "6d2f9b14-7a35-4e08-9c61-2b8e4d0f7a53";
+    expect(
+      requestVoucherSchema.safeParse({
+        idempotency_key,
+        employee_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        amount: 50000,
+        method_code: "efectivo",
+      }).success,
+    ).toBe(true);
     expect(
       requestVoucherSchema.safeParse({
         employee_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         amount: 50000,
         method_code: "efectivo",
       }).success,
-    ).toBe(true);
+    ).toBe(false);
+    expect(
+      requestVoucherSchema.safeParse({
+        idempotency_key: "no-es-un-uuid",
+        employee_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        amount: 50000,
+        method_code: "efectivo",
+      }).success,
+    ).toBe(false);
     // El método arqueable se elige AL CREAR el vale: es obligatorio.
     expect(
       requestVoucherSchema.safeParse({
+        idempotency_key,
         employee_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         amount: 50000,
       }).success,
     ).toBe(false);
     expect(
       requestVoucherSchema.safeParse({
+        idempotency_key,
         employee_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         amount: 0,
         method_code: "efectivo",
@@ -1112,6 +1134,15 @@ const payrollPagedStub = vi.hoisted(() => ({
   /** Payload de cada INSERT (auditoría y demás): qué se registró de verdad. */
   inserts: [] as Array<{ table: string; payload: unknown }>,
   /**
+   * CL-5: consecutivo de las filas que el doble inserta. En la base `id` es
+   * `uuid DEFAULT gen_random_uuid()`: dos filas NUNCA comparten id, ni las de
+   * dos INSERT distintos de una sola fila. El doble numeraba por índice DENTRO
+   * del statement, así que dos pagos distintos se llamaban los dos
+   * `fila-insertada-1` —imposible en la tabla real— y cualquier aserción sobre
+   * la identidad de dos pagos legítimos medía un artefacto del doble.
+   */
+  rowSeq: 0,
+  /**
    * PR1: falla el INSERT de `table` con este código. El doble tiene que poder
    * responder como la BASE (una restricción violada, `23P01`), no sólo como un
    * cliente feliz: si no, la carrera contra la restricción de exclusión no se
@@ -1220,8 +1251,8 @@ function createPayrollPagedStubClient(): unknown {
             };
           }
         }
-        const persisted = values.map((row, index) => ({
-          id: `fila-insertada-${index + 1}`,
+        const persisted = values.map((row) => ({
+          id: `fila-insertada-${(payrollPagedStub.rowSeq += 1)}`,
           created_at: "2026-01-31T23:59:59.000Z",
           closed_at: null,
           ...row,
@@ -1280,9 +1311,9 @@ function createPayrollPagedStubClient(): unknown {
       upsert: (value?: unknown) => {
         op = "upsert";
         // El upsert persiste de verdad: `getPeriodDetail` lee después estas filas.
-        const persisted = (Array.isArray(value) ? value : [value]).map((row, index) => ({
+        const persisted = (Array.isArray(value) ? value : [value]).map((row) => ({
           ...(row as Record<string, unknown>),
-          id: `item-nomina-${index + 1}`,
+          id: `item-nomina-${(payrollPagedStub.rowSeq += 1)}`,
           created_at: "2026-01-31T23:59:59.000Z",
         }));
         payrollPagedStub.itemsUpsert = persisted;
@@ -1374,6 +1405,7 @@ function resetPayrollStubState(): void {
     roles: ["empleado"],
   };
   payrollPagedStub.inserts.length = 0;
+  payrollPagedStub.rowSeq = 0;
   payrollPagedStub.insertError = null;
   payrollPagedStub.updates.length = 0;
   payrollPagedStub.uniqueKeys.length = 0;
@@ -2978,6 +3010,10 @@ describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
 
   function extraInput(overrides: Record<string, unknown> = {}) {
     return {
+      // CL-5: la marca del intento es obligatoria desde la 044. Todas las
+      // pruebas de PA-2a llevan la suya (cada llamada de estas pruebas es un
+      // intento distinto); las aserciones no cambiaron.
+      idempotency_key: "2d7a4e91-6c05-4b38-a7f2-9e1d0c8b5a36",
       employee_id: EMPLOYEE_ID,
       amount: 1_800_000,
       method_code: "efectivo",
@@ -4674,3 +4710,611 @@ describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
     expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
   });
 });
+
+// ---- CL-5: la nómina extraordinaria reintentada no paga dos veces ---
+
+/**
+ * CL-5: la puerta que NO tiene obligación contra la cual compararse. El monto
+ * del pago extraordinario es a propósito SIN TOPE (036: "El monto lo escribe el
+ * admin y NO se topa"), así que no hay pendiente, ni cuota, ni serie: cualquier
+ * monto positivo es legítimo. Sin identidad del ENVÍO, un reintento (doble
+ * clic, o el navegador reenviando tras cortarse la red) registra SIEMPRE un
+ * segundo pago extraordinario: plata que sale dos veces y que la nómina no
+ * recupera sola.
+ *
+ * LA CLAVE: (`employee_id`, `idempotency_key`). El pago extraordinario NO tiene
+ * período ni ítem —esa es su razón de ser (036): existe justo para pagar días
+ * que un período CERRADO ya cubrió—, así que su único registro es el EMPLEADO:
+ * es a quien el pago significa ("le pagué a X") y es la dimensión del historial
+ * del módulo (`idx_payroll_extras_employee_paid_at`). La sede no entra en la
+ * clave porque no agrega identidad: el servicio resuelve al empleado y exige
+ * que sea de la sede del actor (uno ajeno es NOT_FOUND antes del lookup), así
+ * que el lookup no puede devolver el pago de otra sede. La misma marca con otro
+ * empleado es OTRA operación y hay prueba.
+ *
+ * LA ARRUGA DE 042 NO APLICA ACÁ: este camino inserta UNA sola fila, así que la
+ * marca vive en esa única fila, no hay porciones hermanas que enumerar y el
+ * índice nunca puede rechazar una operación legítima.
+ *
+ * EL DECIDIR DEL ADMIN NO CAMBIA: el monto sigue sin tope y la guía sigue
+ * siendo guía. Lo único que cambia es que el MISMO envío no entra dos veces.
+ */
+describe("payroll: CL-5 la nómina extraordinaria reintentada no paga dos veces", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-admin-extras",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const EMPLOYEE_ID = payrollPagedStub.EMPLOYEE_ID;
+  const EMPLOYEE_2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const METHOD = {
+    id: "pm-efectivo-cl5",
+    sede_id: payrollPagedStub.SEDE_ID,
+    code: "efectivo",
+    name: "Efectivo",
+    is_active: true,
+    arqueable: true,
+    fee_percent: 0,
+  };
+  const MARK = "9f3b1d7c-4a86-4e02-b5c1-7d90e2f4a6b3";
+  const OTHER_MARK = "d1c8e540-2f79-4a63-9b04-6e3a1c7f8d25";
+
+  function employeeRow(id = EMPLOYEE_ID) {
+    return {
+      id,
+      sede_id: payrollPagedStub.SEDE_ID,
+      user_id: null,
+      full_name: `Empleada ${id.slice(0, 4)}`,
+      employee_code: null,
+      document: "1000000001",
+      phone: null,
+      position: null,
+      payout_mode: "normal",
+      email: null,
+      birth_date: null,
+      pay_type: "fijo",
+      salary_fixed: 1_400_000,
+      commission_percent: null,
+      is_active: true,
+    };
+  }
+
+  /** Empleada, un método de pago activo y el registro de pagos vacío. */
+  function seed(salaryFixed = 1_400_000): void {
+    payrollPagedStub.tables.employees = [
+      { ...employeeRow(), salary_fixed: salaryFixed },
+      { ...employeeRow(EMPLOYEE_2), salary_fixed: salaryFixed },
+    ];
+    payrollPagedStub.tables.payment_methods = [METHOD];
+    payrollPagedStub.tables.payroll_extras = [];
+  }
+
+  function extraInput(overrides: Record<string, unknown> = {}) {
+    return {
+      idempotency_key: MARK,
+      employee_id: EMPLOYEE_ID,
+      amount: 1_800_000,
+      method_code: "efectivo",
+      reference: "Recibo 001",
+      reason: "Renuncia del 2026-09-16",
+      kind: "renuncia",
+      days_from: "2026-09-01",
+      days_to: "2026-09-16",
+      ...overrides,
+    };
+  }
+
+  const storedExtras = () => payrollPagedStub.tables.payroll_extras ?? [];
+  const extraInserts = () =>
+    payrollPagedStub.inserts.filter((entry) => entry.table === "payroll_extras");
+
+  beforeEach(() => {
+    resetPayrollStubState();
+    // El índice único PARCIAL de la 044, aplicado como lo hace Postgres.
+    payrollPagedStub.uniqueKeys = [
+      { table: "payroll_extras", columns: ["employee_id", "idempotency_key"] },
+    ];
+    seed();
+  });
+  afterEach(() => resetPayrollStubState());
+
+  it("RED: hoy el pago extraordinario reintentado escribe SIEMPRE un segundo pago", async () => {
+    const first = await payrollExtrasService.payPayrollExtra(extraInput(), ACTOR);
+    const second = await payrollExtrasService.payPayrollExtra(extraInput(), ACTOR);
+
+    // HOY: dos filas de 1.800.000 (3.600.000 pagados). No hay tope ni
+    // obligación que lo frene: el monto lo escribe el admin y no se topa.
+    expect(storedExtras()).toHaveLength(1);
+    expect(first.id).toBe(second.id);
+    expect(extraInserts()).toHaveLength(1);
+  });
+
+  it("la repetición devuelve el MISMO pago escribiendo nada (no-op exitoso)", async () => {
+    const first = await payrollExtrasService.payPayrollExtra(extraInput(), ACTOR);
+    const repeat = await payrollExtrasService.payPayrollExtra(extraInput(), ACTOR);
+
+    expect(repeat).toEqual(first);
+    expect(repeat.id).toBe(first.id);
+    // El reintento ni siquiera INTENTÓ escribir: lo reconoció antes.
+    expect(extraInserts()).toHaveLength(1);
+    expect(storedExtras()).toHaveLength(1);
+    // Y no deja rastro doble: una sola auditoría, la del pago que ocurrió.
+    expect(payrollPagedStub.inserts.filter((entry) => entry.table === "audit_logs")).toHaveLength(1);
+  });
+
+  it("control de no-extralimitación: dos marcas distintas son DOS pagos (el admin sigue pagando lo que decida)", async () => {
+    const first = await payrollExtrasService.payPayrollExtra(extraInput(), ACTOR);
+    const second = await payrollExtrasService.payPayrollExtra(
+      extraInput({ idempotency_key: OTHER_MARK }),
+      ACTOR,
+    );
+
+    expect(second.id).not.toBe(first.id);
+    expect(storedExtras()).toHaveLength(2);
+    expect(extraInserts()).toHaveLength(2);
+    // Y repetir la SEGUNDA marca devuelve la SEGUNDA operación, no la primera.
+    const repeat = await payrollExtrasService.payPayrollExtra(
+      extraInput({ idempotency_key: OTHER_MARK }),
+      ACTOR,
+    );
+    expect(repeat.id).toBe(second.id);
+    expect(storedExtras()).toHaveLength(2);
+  });
+
+  it("la carrera (misma marca entre el lookup y el INSERT) relee a la ganadora", async () => {
+    const first = await payrollExtrasService.payPayrollExtra(extraInput(), ACTOR);
+    // La otra transacción se confirmó entre el lookup y el INSERT: el doble
+    // saltea el lookup UNA vez para armar exactamente esa ventana.
+    payrollPagedStub.skipMarkLookupOnce = true;
+
+    const second = await payrollExtrasService.payPayrollExtra(extraInput(), ACTOR);
+
+    expect(second.id).toBe(first.id);
+    expect(storedExtras()).toHaveLength(1);
+    // No vacuidad: el INSERT de la segunda SÍ se intentó y el índice lo frenó
+    // (dos intentos, una fila).
+    expect(extraInserts()).toHaveLength(2);
+  });
+
+  it("una marca faltante o mal formada se rechaza con CERO escrituras", async () => {
+    const withoutMark: unknown = await payrollExtrasService
+      .payPayrollExtra(extraInput({ idempotency_key: undefined }), ACTOR)
+      .catch((error: unknown) => error);
+    const malformed: unknown = await payrollExtrasService
+      .payPayrollExtra(extraInput({ idempotency_key: "no-es-un-uuid" }), ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(withoutMark).toBeInstanceOf(PayrollError);
+    expect(withoutMark).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(malformed).toBeInstanceOf(PayrollError);
+    expect(malformed).toMatchObject({ code: "VALIDATION", status: 400 });
+    // La validación corre ANTES de cualquier lectura y de cualquier escritura.
+    expect(extraInserts()).toHaveLength(0);
+    expect(storedExtras()).toHaveLength(0);
+    // La misma regla en el esquema puro (y en el CHECK de forma de la 044).
+    expect(payrollExtraSchema.safeParse(extraInput({ idempotency_key: undefined })).success).toBe(false);
+    expect(payrollExtraSchema.safeParse(extraInput({ idempotency_key: "x" })).success).toBe(false);
+    expect(payrollExtraSchema.safeParse(extraInput()).success).toBe(true);
+  });
+
+  it("multi-identidad: la misma marca para OTRO empleado es OTRA operación", async () => {
+    const first = await payrollExtrasService.payPayrollExtra(extraInput(), ACTOR);
+    const other = await payrollExtrasService.payPayrollExtra(
+      extraInput({ employee_id: EMPLOYEE_2 }),
+      ACTOR,
+    );
+
+    expect(other.id).not.toBe(first.id);
+    expect(storedExtras()).toHaveLength(2);
+    // Cada una reconoce la SUYA: la marca se resuelve dentro del empleado.
+    const repeatOther = await payrollExtrasService.payPayrollExtra(
+      extraInput({ employee_id: EMPLOYEE_2 }),
+      ACTOR,
+    );
+    expect(repeatOther.id).toBe(other.id);
+    expect(storedExtras()).toHaveLength(2);
+  });
+
+  it("la marca se reconoce aunque el método se haya desactivado después (el método no es la identidad)", async () => {
+    // El lookup va apenas el REGISTRO (el empleado) queda validado, porque la
+    // operación no se identifica por el método: un reintento que llega con el
+    // método ya inactivo se reconoce —no se pierde plata ni se duplica—. Un
+    // pago NUEVO con el método inactivo sigue rechazándose (METHOD_INACTIVE).
+    const first = await payrollExtrasService.payPayrollExtra(extraInput(), ACTOR);
+    payrollPagedStub.tables.payment_methods = [{ ...METHOD, is_active: false }];
+
+    const repeat = await payrollExtrasService.payPayrollExtra(extraInput(), ACTOR);
+    expect(repeat.id).toBe(first.id);
+    expect(storedExtras()).toHaveLength(1);
+
+    const fresh: unknown = await payrollExtrasService
+      .payPayrollExtra(extraInput({ idempotency_key: OTHER_MARK }), ACTOR)
+      .catch((error: unknown) => error);
+    expect(fresh).toMatchObject({ code: "METHOD_INACTIVE", status: 422 });
+  });
+
+  it("control negativo: el monto sigue SIN TOPE (la marca no es un cap)", async () => {
+    // La decisión del dueño no cambia: el monto lo escribe el admin y no se
+    // topa. Dos intentos DISTINTOS con montos enormes entran los dos.
+    const first = await payrollExtrasService.payPayrollExtra(
+      extraInput({ amount: 9_999_999, kind: "despido" }),
+      ACTOR,
+    );
+    const second = await payrollExtrasService.payPayrollExtra(
+      extraInput({ idempotency_key: OTHER_MARK, amount: 9_999_999, kind: "despido" }),
+      ACTOR,
+    );
+
+    expect(first.amount).toBe(9_999_999);
+    expect(second.amount).toBe(9_999_999);
+    expect(storedExtras()).toHaveLength(2);
+  });
+
+  it("la migración 044 deja la marca con un índice único PARCIAL y no reescribe filas", () => {
+    const raw = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "044_remaining_payment_idempotency.sql"),
+      "utf8",
+    );
+    const sql = raw
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("--"))
+      .join("\n");
+    expect(sql).toContain("ALTER TABLE public.payroll_extras");
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS idempotency_key");
+    expect(sql).toContain(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_payroll_extras_employee_idempotency_key",
+    );
+    expect(sql).toContain("ON public.payroll_extras (employee_id, idempotency_key)");
+    expect(sql).toMatch(/WHERE idempotency_key IS NOT NULL/);
+    expect(sql).toContain("payroll_extras_idempotency_key_shape");
+    expect(sql).not.toMatch(/\bDELETE\s+FROM\b/i);
+    expect(sql).not.toMatch(/\bTRUNCATE\b/i);
+    expect(sql).not.toMatch(/UPDATE\s+public\./i);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+});
+
+// ---- CL-5: la solicitud de vale reintentada no abre un segundo vale ---
+
+/**
+ * CL-5: la puerta de la CAJA que no tiene obligación individual. Los topes de
+ * 026 (día y semana) son ACUMULADOS: una obligación TOTAL, no la identidad de un
+ * envío. Mientras `2 × monto` quepa en el día y en la semana, un reintento
+ * (doble clic, o el navegador reenviando tras cortarse la red) abría un SEGUNDO
+ * vale: segunda salida de caja en el arqueo y segundo descuento en la nómina.
+ * Se midió antes de tocar el código (dos vales APROBADOS con el mismo cuerpo) y
+ * esa medición es la primera prueba de acá.
+ *
+ * LA CLAVE: (`employee_id`, `idempotency_key`). El vale es una OBLIGACIÓN del
+ * empleado —es lo que la nómina descuenta y es la dimensión de los topes
+ * acumulados de 026, `idx_voucher_requests_employee_date`—, así que el registro
+ * de la operación es el empleado. El TURNO NO ENTRA, deliberadamente: el turno
+ * es el dueño del EFECTIVO que sale, no lo que el vale ES, y meterlo costaría el
+ * defecto mismo —un reintento que llegue después de que el turno original se
+ * cerró y se abrió OTRO resolvería contra el turno nuevo, no encontraría su
+ * marca ahí y abriría el segundo vale—. Sin el turno, ese reintento se reconoce.
+ * La sede tampoco entra: el servicio valida que el empleado sea de la sede del
+ * actor antes del lookup, así que no puede cruzar de sede. La misma marca para
+ * otro empleado es OTRA operación, y hay prueba.
+ *
+ * LA ARRUGA DE 042 NO APLICA ACÁ: un solo vale por llamada, una sola fila.
+ */
+describe("payroll: CL-5 la solicitud de vale reintentada no abre un segundo vale", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-cajero-vale",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const EMPLOYEE_ID = payrollPagedStub.EMPLOYEE_ID;
+  const EMPLOYEE_2 = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const SHIFT_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  const OTHER_SHIFT_ID = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+  const METHOD = {
+    id: "pm-efectivo-vale",
+    sede_id: payrollPagedStub.SEDE_ID,
+    code: "efectivo",
+    name: "Efectivo",
+    is_active: true,
+    arqueable: true,
+    fee_percent: 0,
+  };
+  const MARK = "4a8d2f61-9b03-4c75-8e12-5d7f0a3b6c94";
+  const OTHER_MARK = "e7b1c395-36a0-4d84-a502-8c1f9e4d7b20";
+  const DAY = "2026-09-30";
+
+  function employeeRow(id: string) {
+    return {
+      id,
+      sede_id: payrollPagedStub.SEDE_ID,
+      user_id: null,
+      full_name: `Empleada ${id.slice(0, 4)}`,
+      employee_code: null,
+      document: "1000000001",
+      phone: null,
+      position: null,
+      payout_mode: "normal",
+      email: null,
+      birth_date: null,
+      pay_type: "fijo",
+      salary_fixed: 1_400_000,
+      commission_percent: null,
+      is_active: true,
+    };
+  }
+
+  /** Caja abierta del actor, dos empleadas, un método arqueable y sin vales. */
+  function seed(): void {
+    payrollPagedStub.tables.cash_shifts = [
+      {
+        id: SHIFT_ID,
+        sede_id: payrollPagedStub.SEDE_ID,
+        cash_register_id: null,
+        opened_by: ACTOR.userId,
+        closed_by: null,
+        opened_at: "2026-09-30T08:00:00.000Z",
+        closed_at: null,
+        opening_base: 500000,
+        expected_cash: null,
+        counted_cash: null,
+        base_left: null,
+        cash_withdrawn: null,
+        base_difference: null,
+        status: "abierto",
+        observation: null,
+      },
+    ];
+    payrollPagedStub.tables.users = [
+      { id: ACTOR.userId, full_name: "Cajera", sede_id: payrollPagedStub.SEDE_ID },
+    ];
+    payrollPagedStub.tables.employees = [employeeRow(EMPLOYEE_ID), employeeRow(EMPLOYEE_2)];
+    payrollPagedStub.tables.payment_methods = [METHOD];
+    payrollPagedStub.tables.voucher_settings = [
+      {
+        sede_id: payrollPagedStub.SEDE_ID,
+        max_per_day: 200000,
+        max_per_week: 400000,
+        allowed_days: null,
+        per_day_limits: null,
+      },
+    ];
+    payrollPagedStub.tables.voucher_requests = [];
+    payrollPagedStub.tables.audit_logs = [];
+  }
+
+  function voucherInput(overrides: Record<string, unknown> = {}) {
+    return {
+      idempotency_key: MARK,
+      employee_id: EMPLOYEE_ID,
+      amount: 50000,
+      method_code: "efectivo",
+      request_date: DAY,
+      ...overrides,
+    };
+  }
+
+  const storedVouchers = () => payrollPagedStub.tables.voucher_requests ?? [];
+  const voucherInserts = () =>
+    payrollPagedStub.inserts.filter((entry) => entry.table === "voucher_requests");
+  const auditInserts = () =>
+    payrollPagedStub.inserts.filter((entry) => entry.table === "audit_logs");
+
+  beforeEach(() => {
+    resetPayrollStubState();
+    // El índice único PARCIAL de la 044, aplicado como lo hace Postgres.
+    payrollPagedStub.uniqueKeys = [
+      { table: "voucher_requests", columns: ["employee_id", "idempotency_key"] },
+    ];
+    seed();
+  });
+  afterEach(() => resetPayrollStubState());
+
+  it("RED medido: el mismo vale pedido dos veces abre DOS vales (2 × monto ≤ topes)", async () => {
+    const first = await payrollExtrasService.requestVoucher(voucherInput(), ACTOR);
+    const second = await payrollExtrasService.requestVoucher(voucherInput(), ACTOR);
+
+    // HOY (antes de la 044): dos vales de 50.000, los DOS aprobados —el segundo
+    // sale de la caja y se descuenta de la nómina igual que el primero—, y los
+    // topes de 026 no lo ven: 50.000 + 50.000 ≤ 200.000 del día. Con la marca: UNO.
+    expect(storedVouchers()).toHaveLength(1);
+    expect(second.voucher.id).toBe(first.voucher.id);
+    expect(first.auto_approved).toBe(true);
+    expect(second.auto_approved).toBe(true);
+    expect(storedVouchers().reduce((acc, row) => acc + Number(row.amount), 0)).toBe(50000);
+  });
+
+  it("la repetición devuelve el MISMO vale escribiendo nada (no-op exitoso)", async () => {
+    const first = await payrollExtrasService.requestVoucher(voucherInput(), ACTOR);
+    const repeat = await payrollExtrasService.requestVoucher(voucherInput(), ACTOR);
+
+    expect(repeat.voucher.id).toBe(first.voucher.id);
+    expect(repeat.voucher.status).toBe(first.voucher.status);
+    expect(repeat.auto_approved).toBe(first.auto_approved);
+    expect(repeat.requires_approval).toBe(first.requires_approval);
+    // El reintento ni siquiera INTENTÓ escribir: lo reconoció antes.
+    expect(voucherInserts()).toHaveLength(1);
+    expect(storedVouchers()).toHaveLength(1);
+    // Y no deja rastro doble: una sola auditoría, la del vale que ocurrió.
+    expect(auditInserts()).toHaveLength(1);
+  });
+
+  it("la repetición NO vuelve a decidir la elegibilidad (los topes acumulados ya incluyen el primer vale)", async () => {
+    // Si la repetición reevaluara el tope con los totales de AHORA, este envío
+    // —190.000 con tope diario de 200.000— daría 190.000 + 190.000 > 200.000 y
+    // respondería "pendiente, fuera de rango" sobre un vale que SÍ se abrió
+    // dentro de rango. Devuelve el ESTADO REGISTRADO: aprobado y utilizable.
+    const first = await payrollExtrasService.requestVoucher(
+      voucherInput({ amount: 190000 }),
+      ACTOR,
+    );
+    const repeat = await payrollExtrasService.requestVoucher(
+      voucherInput({ amount: 190000 }),
+      ACTOR,
+    );
+
+    expect(first.auto_approved).toBe(true);
+    expect(repeat.voucher.id).toBe(first.voucher.id);
+    expect(repeat.auto_approved).toBe(true);
+    expect(repeat.requires_approval).toBe(false);
+    expect(storedVouchers()).toHaveLength(1);
+  });
+
+  it("control de no-extralimitación: dos marcas distintas son DOS vales", async () => {
+    const first = await payrollExtrasService.requestVoucher(voucherInput(), ACTOR);
+    const second = await payrollExtrasService.requestVoucher(
+      voucherInput({ idempotency_key: OTHER_MARK }),
+      ACTOR,
+    );
+
+    expect(second.voucher.id).not.toBe(first.voucher.id);
+    expect(storedVouchers()).toHaveLength(2);
+    expect(voucherInserts()).toHaveLength(2);
+    // Y repetir la SEGUNDA marca devuelve la SEGUNDA operación, no la primera.
+    const repeat = await payrollExtrasService.requestVoucher(
+      voucherInput({ idempotency_key: OTHER_MARK }),
+      ACTOR,
+    );
+    expect(repeat.voucher.id).toBe(second.voucher.id);
+    expect(storedVouchers()).toHaveLength(2);
+  });
+
+  it("control negativo: los topes de 026 siguen decidiendo (fuera de rango queda PENDIENTE, no se rechaza)", async () => {
+    // La marca no cambia la aritmética ni la decisión: con una marca NUEVA, un
+    // vale que pasa el tope del día entra igual que antes, y entra PENDIENTE
+    // (alerta para el admin). Lo único que la marca impide es repetir el MISMO
+    // envío.
+    await payrollExtrasService.requestVoucher(voucherInput({ amount: 190000 }), ACTOR);
+    const overCap = await payrollExtrasService.requestVoucher(
+      voucherInput({ idempotency_key: OTHER_MARK, amount: 50000 }),
+      ACTOR,
+    );
+
+    expect(storedVouchers()).toHaveLength(2);
+    expect(overCap.requires_approval).toBe(true);
+    expect(overCap.auto_approved).toBe(false);
+    expect(overCap.voucher.status).toBe("pendiente");
+    expect(overCap.over_day).toBe(true);
+  });
+
+  it("la carrera (misma marca entre el lookup y el INSERT) relee a la ganadora", async () => {
+    const first = await payrollExtrasService.requestVoucher(voucherInput(), ACTOR);
+    // La otra transacción se confirmó entre el lookup y el INSERT: el doble
+    // saltea el lookup UNA vez para armar exactamente esa ventana.
+    payrollPagedStub.skipMarkLookupOnce = true;
+
+    const second = await payrollExtrasService.requestVoucher(voucherInput(), ACTOR);
+
+    expect(second.voucher.id).toBe(first.voucher.id);
+    expect(storedVouchers()).toHaveLength(1);
+    // No vacuidad: el INSERT de la segunda SÍ se intentó y el índice lo frenó
+    // (dos intentos, una fila).
+    expect(voucherInserts()).toHaveLength(2);
+  });
+
+  it("una marca faltante o mal formada se rechaza con CERO escrituras", async () => {
+    const withoutMark: unknown = await payrollExtrasService
+      .requestVoucher(voucherInput({ idempotency_key: undefined }), ACTOR)
+      .catch((error: unknown) => error);
+    const malformed: unknown = await payrollExtrasService
+      .requestVoucher(voucherInput({ idempotency_key: "no-es-un-uuid" }), ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(withoutMark).toBeInstanceOf(PayrollError);
+    expect(withoutMark).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(malformed).toBeInstanceOf(PayrollError);
+    expect(malformed).toMatchObject({ code: "VALIDATION", status: 400 });
+    // La validación corre ANTES de cualquier lectura y de cualquier escritura.
+    expect(voucherInserts()).toHaveLength(0);
+    expect(storedVouchers()).toHaveLength(0);
+    // La misma regla en el esquema puro (y en el CHECK de forma de la 044).
+    expect(requestVoucherSchema.safeParse(voucherInput({ idempotency_key: undefined })).success).toBe(false);
+    expect(requestVoucherSchema.safeParse(voucherInput({ idempotency_key: "x" })).success).toBe(false);
+    expect(requestVoucherSchema.safeParse(voucherInput()).success).toBe(true);
+  });
+
+  it("multi-identidad: la misma marca para OTRO empleado es OTRA operación", async () => {
+    const first = await payrollExtrasService.requestVoucher(voucherInput(), ACTOR);
+    const other = await payrollExtrasService.requestVoucher(
+      voucherInput({ employee_id: EMPLOYEE_2 }),
+      ACTOR,
+    );
+
+    expect(other.voucher.id).not.toBe(first.voucher.id);
+    expect(storedVouchers()).toHaveLength(2);
+    // Cada una reconoce la SUYA: la marca se resuelve dentro del empleado.
+    const repeatOther = await payrollExtrasService.requestVoucher(
+      voucherInput({ employee_id: EMPLOYEE_2 }),
+      ACTOR,
+    );
+    expect(repeatOther.voucher.id).toBe(other.voucher.id);
+    expect(storedVouchers()).toHaveLength(2);
+  });
+
+  it("la clave NO mira el turno: un reintento que llega con OTRO turno abierto se reconoce igual", async () => {
+    // Con el turno dentro de la clave, este reintento no encontraría su marca y
+    // abriría el segundo vale: justo el defecto que la 044 cierra. Por eso el
+    // turno NO entra.
+    const first = await payrollExtrasService.requestVoucher(voucherInput(), ACTOR);
+    payrollPagedStub.tables.cash_shifts = [
+      { ...(payrollPagedStub.tables.cash_shifts?.[0] ?? {}), id: OTHER_SHIFT_ID },
+    ];
+
+    const repeat = await payrollExtrasService.requestVoucher(voucherInput(), ACTOR);
+
+    expect(repeat.voucher.id).toBe(first.voucher.id);
+    expect(storedVouchers()).toHaveLength(1);
+  });
+
+  it("limitación declarada: un reintento que llega SIN caja abierta se rechaza, no se reconoce", async () => {
+    // Misma familia que CL-3/CL-4: las guardas de la CAJA van antes del lookup
+    // (deciden si esta caja puede entregar dinero). El caso real del reintento
+    // ocurre segundos después, con la misma caja abierta, y ahí la marca SÍ
+    // reconoce. No se pierde plata: el rechazo es ruidoso y, con la caja abierta
+    // de nuevo, la misma marca sigue reconociendo.
+    const first = await payrollExtrasService.requestVoucher(voucherInput(), ACTOR);
+    payrollPagedStub.tables.cash_shifts = [];
+
+    const failure: unknown = await payrollExtrasService
+      .requestVoucher(voucherInput(), ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "NO_OPEN_SHIFT", status: 409 });
+    expect(storedVouchers()).toHaveLength(1);
+    expect(first.voucher.id).toBe(storedVouchers()[0]?.id);
+  });
+
+  it("la migración 044 cierra la tercera puerta con su marca, su forma y su índice parcial", () => {
+    const raw = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "044_remaining_payment_idempotency.sql"),
+      "utf8",
+    );
+    const sql = raw
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("--"))
+      .join("\n");
+    expect(sql).toContain("ALTER TABLE public.voucher_requests");
+    // Tres tablas: comisión, pago extraordinario y vale; tres columnas nullables.
+    expect(sql.match(/ADD COLUMN IF NOT EXISTS idempotency_key/g)).toHaveLength(3);
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS idempotency_key text NULL");
+    expect(sql).toContain(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_voucher_requests_employee_idempotency_key",
+    );
+    expect(sql).toContain("ON public.voucher_requests (employee_id, idempotency_key)");
+    expect(sql.match(/WHERE idempotency_key IS NOT NULL/g)).toHaveLength(3);
+    expect(sql.match(/full replace/g) ?? []).toHaveLength(0);
+    expect(sql).toContain("voucher_requests_idempotency_key_shape");
+    // La clave NO lleva el turno: se declara y se ve en el SQL.
+    expect(sql).not.toMatch(/voucher_requests \([^)]*cash_shift_id/);
+    expect(raw).toContain("el TURNO NO ENTRA");
+    // El costo de numeración se declara para las TRES tablas (uuid: ninguno).
+    expect(raw).toContain("voucher_requests.id` también (007_payroll.sql)");
+    // Ya no queda ninguna puerta declarada abierta.
+    expect(raw).not.toContain("NO CIERRA LA TERCERA PUERTA");
+    expect(raw).toContain("MOVIMIENTO MANUAL DE INVENTARIO");
+    expect(sql).not.toMatch(/\bDELETE\s+FROM\b/i);
+    expect(sql).not.toMatch(/\bTRUNCATE\b/i);
+    expect(sql).not.toMatch(/UPDATE\s+public\./i);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+});
+

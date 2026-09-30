@@ -476,6 +476,44 @@ const PAYMENT_SELECT =
   "id, payroll_item_id, method_id, method_code, amount, paid_at, paid_by, reference";
 const EXTRA_SELECT =
   "id, sede_id, employee_id, amount, method_id, method_code, reference, reason, kind, days_from, days_to, paid_by, paid_at, created_at";
+
+/**
+ * CL-5: el pago extraordinario que YA se registró con esa marca, PARA ESE
+ * EMPLEADO.
+ *
+ * La marca es un uuid que acuña la pantalla al empezar el intento y que
+ * reutiliza en los reintentos del MISMO intento; ver `idempotencyKeySchema`
+ * (billing/schemas.ts) y `payrollExtraSchema` (schemas.ts). El filtro es por
+ * EMPLEADO: el pago extraordinario no tiene período ni ítem —esa es su razón de
+ * ser (036): existe para pagar días que un período CERRADO ya cubrió—, así que
+ * su único registro es el empleado, que es a quien el pago significa y la
+ * dimensión del historial del módulo (`idx_payroll_extras_employee_paid_at`).
+ * Con la clave por empleado el lookup nunca puede devolver el pago de otra
+ * persona, y la misma marca para dos empleados son DOS operaciones. La clave
+ * del índice de la 044 es la MISMA (`employee_id, idempotency_key`), así que el
+ * `eq` de este lookup y la clave del índice son el mismo conjunto: el lookup no
+ * puede devolver una fila que el índice no habría bloqueado.
+ *
+ * La sede NO entra en la clave porque no agrega identidad: el servicio resuelve
+ * al empleado y exige que sea de la sede del actor (uno ajeno es NOT_FOUND)
+ * antes de llegar acá, así que este lookup corre después de esa validación y no
+ * puede devolver el pago de otra sede.
+ */
+async function findPayrollExtraByIdempotencyKey(
+  db: DbClient,
+  employeeId: string,
+  idempotencyKey: string,
+): Promise<PayrollExtraRow | null> {
+  const { data, error } = await db
+    .from("payroll_extras")
+    .select(EXTRA_SELECT)
+    .eq("employee_id", employeeId)
+    .eq("idempotency_key", idempotencyKey)
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+  return (data as PayrollExtraRow | null) ?? null;
+}
 /** PA-2b: la corrección de un período cerrado (037). */
 const PERIOD_CORRECTION_SELECT =
   "id, period_id, previous_net_total, previous_paid_total, corrected_net_total, previous_item_count, corrected_item_count, reason, corrected_by, corrected_at";
@@ -1671,6 +1709,36 @@ export async function payPayrollItem(
  *
  * Sólo admin (vía requirePayrollAdmin en la action): es nómina, y el módulo de
  * nómina no es de caja.
+ *
+ * CL-5 (idempotencia): el orden empieza por la MARCA del intento
+ * (`idempotency_key`, columna e índice único parcial de la 044) apenas el
+ * REGISTRO —el empleado— queda validado dentro de la sede del actor, y ANTES de
+ * resolver el método y de insertar. Un reintento del MISMO envío (doble clic, o
+ * el navegador reenviando tras cortarse la red) se reconoce y devuelve el pago
+ * ya registrado como un no-op EXITOSO: no escribe un segundo pago. Antes de
+ * esto no había NADA que lo frenara, porque el monto es a propósito SIN TOPE:
+ * no hay obligación contra la cual comparar, así que un reintento era siempre
+ * un segundo pago extraordinario.
+ *
+ * POR QUÉ ACÁ Y NO DESPUÉS DEL MÉTODO: la operación no se identifica por el
+ * método —`method_code` es el medio por el que salió el dinero, no lo que el
+ * pago ES—, así que no hay razón para hacer esperar a la repetición por una
+ * guarda que sólo llena una columna de una escritura que la repetición no hace.
+ * La contrapartida es una propiedad, no una limitación: un reintento que llega
+ * con el método ya inactivo se reconoce igual (no se duplica ni se pierde
+ * plata); lo que sigue rechazándose es un pago NUEVO con el método inactivo
+ * (METHOD_INACTIVE).
+ *
+ * LA ARRUGA DE 042 NO APLICA ACÁ: este camino inserta UNA sola fila (una
+ * sentencia de un objeto, no un `insert([...])` de N porciones), así que la
+ * marca vive en esa única fila, no hay porciones hermanas que enumerar y el
+ * índice único parcial nunca puede rechazar una operación legítima.
+ *
+ * COSTO DECLARADO: acá NO se quema ningún número (`payroll_extras.id` es un
+ * uuid: la tabla no tiene serie ni consecutivo). Lo que cuesta la carrera es una
+ * sentencia ABORTADA: la perdedora ya había resuelto el empleado y el método
+ * cuando chocó con el índice, y esa sentencia no deja filas. Mismo canje que
+ * 041/042/043 —perder trabajo invisible antes que pagar dos veces—.
  */
 export async function payPayrollExtra(raw: unknown, actor: PayrollActor): Promise<PayrollExtraRow> {
   const parsed = payrollExtraSchema.safeParse(raw);
@@ -1690,6 +1758,19 @@ export async function payPayrollExtra(raw: unknown, actor: PayrollActor): Promis
     if (employee.sede_id !== actor.sedeId) {
       throw new PayrollError("NOT_FOUND", "Empleado no encontrado.", 404);
     }
+
+    // CL-5: la MARCA del intento, apenas el empleado queda validado dentro de la
+    // sede del actor y ANTES de cualquier escritura. Un reintento del MISMO envío
+    // trae la misma marca: se devuelve el pago ya registrado, sin escribir un
+    // segundo pago extraordinario. Acá no hay pendiente ni tope contra el cual
+    // comparar (el monto lo escribe el admin y no se topa), así que la IDENTIDAD
+    // del envío es la única barrera posible: no hay nada más que mirar.
+    const repeated = await findPayrollExtraByIdempotencyKey(
+      db,
+      parsed.data.employee_id,
+      parsed.data.idempotency_key,
+    );
+    if (repeated) return repeated;
 
     const methods = await listPaymentMethods(actor.sedeId).catch((error) => {
       throw toPayrollError(error);
@@ -1722,10 +1803,31 @@ export async function payPayrollExtra(raw: unknown, actor: PayrollActor): Promis
         days_from: daysFrom,
         days_to: daysTo,
         paid_by: actor.userId,
+        // CL-5: la marca del intento. Es la identidad de ESTA operación dentro
+        // del empleado: el índice único parcial de la 044 y el lookup de arriba
+        // usan la misma clave. Sin ella no habría forma de distinguir "el mismo
+        // envío" de "dos pagos extraordinarios legítimos al mismo empleado".
+        idempotency_key: parsed.data.idempotency_key,
       })
       .select(EXTRA_SELECT)
       .single();
-    if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    if (error || !data) {
+      // CL-5: carrera perdida contra el índice único parcial de la 044 (23505).
+      // El lookup de arriba y este INSERT no son atómicos: si otro envío con la
+      // MISMA marca para el MISMO empleado se confirmó en esa ventana, la
+      // repetición se relee y se devuelve. Sin ganadora, el 23505 no es una
+      // repetición y se reporta como fallo real en vez de disfrazarlo.
+      if ((error as { code?: string } | null)?.code === "23505") {
+        const winner = await findPayrollExtraByIdempotencyKey(
+          db,
+          parsed.data.employee_id,
+          parsed.data.idempotency_key,
+        );
+        if (winner) return winner;
+        throw new PayrollError("INTERNAL", "Error interno.", 500);
+      }
+      throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
     const row = data as PayrollExtraRow;
 
     // PA-2a: la plata que sale sin un período detrás tiene que poder
@@ -2389,6 +2491,74 @@ export interface VoucherRequestResult {
 }
 
 /**
+ * CL-5: el vale que YA se registró con esa marca, PARA ESE EMPLEADO.
+ *
+ * La marca es un uuid que acuña la pantalla de vales al empezar el intento y
+ * que reutiliza en los reintentos del MISMO intento; ver `idempotencyKeySchema`
+ * (billing/schemas.ts) y `requestVoucherSchema` (schemas.ts). El filtro es por
+ * EMPLEADO: el vale es una OBLIGACIÓN del empleado —es lo que la nómina
+ * descuenta y es la dimensión de los topes acumulados de 026
+ * (`idx_voucher_requests_employee_date`)—, así que el registro de la operación
+ * es el empleado y el lookup nunca puede devolver el vale de otra persona. La
+ * clave del índice de la 044 es la MISMA (`employee_id, idempotency_key`): el
+ * `eq` de este lookup y la clave del índice son el mismo conjunto, así que este
+ * lookup no puede devolver una fila que el índice no habría bloqueado.
+ *
+ * EL TURNO NO ENTRA EN LA CLAVE, a propósito: el turno es el dueño del EFECTIVO
+ * que sale (y es lo que suma el arqueo), pero no es lo que el vale ES, y
+ * meterlo costaría el defecto mismo: un reintento que llegue después de que el
+ * turno original se cerró y se abrió OTRO resolvería contra el turno nuevo, no
+ * encontraría su marca ahí y abriría el SEGUNDO vale que esta puerta existe
+ * para evitar. Sin el turno en la clave, ese reintento se reconoce. La
+ * seguridad de sede no se pierde por eso: el servicio valida que el empleado
+ * sea de la sede del actor (uno ajeno es NOT_FOUND) ANTES de llegar acá, así
+ * que este lookup no puede cruzar de sede. La misma marca para dos empleados
+ * son DOS operaciones.
+ */
+async function findVoucherRequestByIdempotencyKey(
+  db: DbClient,
+  employeeId: string,
+  idempotencyKey: string,
+): Promise<VoucherRequestRow | null> {
+  const { data, error } = await db
+    .from("voucher_requests")
+    .select(await resolveVoucherSelect(db))
+    .eq("employee_id", employeeId)
+    .eq("idempotency_key", idempotencyKey)
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+  return data ? normalizeVoucher(data as unknown as Record<string, unknown>) : null;
+}
+
+/**
+ * CL-5: el resultado de una repetición reconocida: el VALE que ya existe y su
+ * ESTADO, sin escribir nada.
+ *
+ * La repetición NO vuelve a evaluar la elegibilidad, y es deliberado: los topes
+ * de 026 son ACUMULADOS y reevaluarlos con los totales de AHORA respondería
+ * otra pregunta —podría decir "hoy el tope ya está lleno" sobre un vale que se
+ * abrió cuando no lo estaba—. Lo que sí es exacto es la fila y su estado:
+ * `requires_approval` es "el vale sigue esperando al admin" y `auto_approved`
+ * es "el vale entró aprobado y es utilizable de una", que es lo que la pantalla
+ * necesita para decir la verdad. Los tres flags de RANGO son los INSUMOS de la
+ * decisión original —el admin los ve en la auditoría de la alerta, escrita al
+ * solicitar—, no estado guardado en la fila: se devuelven en falso y el estado
+ * del vale es el que manda. Queda declarado, no escondido.
+ */
+function repeatedVoucherResult(repeated: VoucherRequestRow): VoucherRequestResult {
+  const approved = repeated.status === "aprobada";
+  return {
+    voucher: repeated,
+    requires_approval: repeated.status === "pendiente",
+    over_day: false,
+    over_week: false,
+    day_not_allowed: false,
+    auto_approved: approved,
+  };
+}
+
+/**
  * PAY-05/PAY-06 + item 5 (nuevo flujo): la CAJA (turno abierto) abre el vale
  * del empleado que se acerca al mostrador. Exige turno abierto y ser su dueño
  * (o admin); el método arqueable se elige aquí. Valida topes día/semana
@@ -2402,6 +2572,49 @@ export interface VoucherRequestResult {
  * rechaza después, ese dinero salió del cajón pero el sistema no lo registra
  * (rechazar no toca caja): el cierre puede mostrar un faltante no explicado
  * por el sistema. Trade-off aceptado.
+ *
+ * CL-5 (idempotencia): el orden resuelve primero al DUEÑO del registro (el
+ * empleado, que tiene que ser de la sede del actor) y las guardas de la caja
+ * (turno abierto y ser su dueño o admin), DESPUÉS mira la MARCA del intento
+ * (`idempotency_key`, columna e índice único parcial de la 044) y recién
+ * entonces resuelve el método y evalúa los topes. Un reintento del MISMO envío
+ * (doble clic, o el navegador reenviando tras cortarse la red) se reconoce y
+ * devuelve el vale ya registrado como un no-op EXITOSO: no abre un segundo vale
+ * —ni una segunda salida de caja en el arqueo ni un segundo descuento en la
+ * nómina—. Antes de esto no había nada que lo frenara: los topes de 026 son
+ * ACUMULADOS, así que mientras `2 × monto` cupiera el reintento entraba.
+ *
+ * POR QUÉ ACÁ Y NO MÁS ARRIBA: la marca se resuelve dentro del EMPLEADO, que es
+ * el registro de la operación (la obligación que descuenta la nómina y la
+ * dimensión de los topes de 026), así que el empleado tiene que estar validado
+ * dentro de la sede del actor antes del lookup —si no, el lookup podría devolver
+ * el vale de otra sede—. Las guardas de la CAJA van primero porque son las que
+ * deciden si esta caja puede entregar dinero; la contrapartida, declarada como
+ * en CL-3/CL-4: un reintento que llegue con el turno ya CERRADO, o con la caja
+ * abierta a nombre de otro, recibe el rechazo de estado
+ * (NO_OPEN_SHIFT/SHIFT_NOT_OWNER) en vez del reconocimiento. El caso real del
+ * reintento —doble clic, o el navegador tras cortarse la red— ocurre segundos
+ * después, con la misma caja abierta, y ahí la marca SÍ reconoce. No se pierde
+ * plata: el rechazo es ruidoso y, con la caja abierta de nuevo, la misma marca
+ * sigue reconociendo (la clave no lleva el turno, así que un reintento con OTRO
+ * turno abierto también se reconoce).
+ *
+ * POR QUÉ ANTES DE LOS TOPES: se evita la familia de error que CL-3 documentó
+ * —un reintento rechazado "por pasarse del tope" cuando en realidad la
+ * operación ya está registrada— y, sobre todo, se evita que el propio tope
+ * ACUMULADO del reintento sea el que decide: el acumulado ya incluye el vale del
+ * primer intento, así que el reintento es precisamente el caso en que la
+ * aritmética engañaría. Ver `repeatedVoucherResult` para qué se devuelve.
+ *
+ * LA ARRUGA DE 042 NO APLICA ACÁ: este camino inserta UNA sola fila (una
+ * sentencia de un objeto), así que la marca vive en esa única fila, no hay
+ * porciones hermanas que enumerar y el índice único parcial nunca puede
+ * rechazar una operación legítima.
+ *
+ * COSTO DECLARADO: acá NO se quema ningún número (`voucher_requests.id` es un
+ * uuid: la tabla no tiene serie ni consecutivo). Lo que cuesta la carrera es una
+ * sentencia ABORTADA: la perdedora ya había resuelto el empleado, la caja y su
+ * método cuando chocó con el índice, y esa sentencia no deja filas.
  */
 export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise<VoucherRequestResult> {
   const parsed = requestVoucherSchema.safeParse(raw);
@@ -2432,6 +2645,30 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
         403,
       );
     }
+    // CL-5: el EMPLEADO es el registro de la operación, así que se resuelve (y
+    // se valida contra la sede del actor) ANTES de mirar la marca: es lo que
+    // impide que el lookup devuelva el vale de otra sede. El orden de las dos
+    // guardas —turno y empleado— sólo cambia CUÁL de los dos errores ve una
+    // petición que incumple los dos; el empleado va primero porque es el registro
+    // que la marca necesita.
+    const employee = await getEmployee(parsed.data.employee_id).catch((error) => {
+      throw toPayrollError(error);
+    });
+    try {
+      resolveSede(actor.sedeId, employee.sede_id);
+    } catch (error) {
+      throw toPayrollError(error);
+    }
+    // CL-5: la MARCA del intento, antes de resolver el método, antes de evaluar
+    // los topes acumulados y antes de cualquier escritura. Un reintento del
+    // MISMO envío trae la misma marca: se devuelve el vale ya registrado, sin
+    // abrir un segundo vale (segunda salida de caja y segundo descuento).
+    const repeated = await findVoucherRequestByIdempotencyKey(
+      db,
+      employee.id,
+      parsed.data.idempotency_key,
+    );
+    if (repeated) return repeatedVoucherResult(repeated);
     // Método de pago arqueable: del catálogo real de la sede, no hardcodeado.
     const methods = await listPaymentMethods(actor.sedeId).catch((error) => {
       throw toPayrollError(error);
@@ -2445,14 +2682,6 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
         `El método de pago ${parsed.data.method_code} no está activo o no es arqueable en esta sede.`,
         422,
       );
-    }
-    const employee = await getEmployee(parsed.data.employee_id).catch((error) => {
-      throw toPayrollError(error);
-    });
-    try {
-      resolveSede(actor.sedeId, employee.sede_id);
-    } catch (error) {
-      throw toPayrollError(error);
     }
     // Día del vale en hora de Bogotá: el default de la BD (CURRENT_DATE) usa
     // el día UTC y a partir de las 19:00 COT adelanta la fecha un día.
@@ -2520,10 +2749,32 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
         observation,
         ...(hasMethodColumns ? { method_code: method.code, cash_shift_id: openShift.id } : {}),
         ...(hasCreatedByColumn ? { created_by: actor.userId } : {}),
+        // CL-5: la marca del intento. Es la identidad de ESTA operación dentro
+        // del empleado: el índice único parcial de la 044 y el lookup de arriba
+        // usan la misma clave. Sin ella, un reintento era siempre un segundo
+        // vale —segunda salida de caja y segundo descuento de nómina— porque
+        // los topes de 026 son acumulados, no identidad.
+        idempotency_key: parsed.data.idempotency_key,
       })
       .select(voucherSelect)
       .single();
-    if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    if (error || !data) {
+      // CL-5: carrera perdida contra el índice único parcial de la 044 (23505).
+      // El lookup de arriba y este INSERT no son atómicos: si otro envío con la
+      // MISMA marca para el MISMO empleado se confirmó en esa ventana, la
+      // repetición se relee y se devuelve. Sin ganadora, el 23505 no es una
+      // repetición y se reporta como fallo real en vez de disfrazarlo.
+      if ((error as { code?: string } | null)?.code === "23505") {
+        const winner = await findVoucherRequestByIdempotencyKey(
+          db,
+          employee.id,
+          parsed.data.idempotency_key,
+        );
+        if (winner) return repeatedVoucherResult(winner);
+        throw new PayrollError("INTERNAL", "Error interno.", 500);
+      }
+      throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
     const [created] = await attachVoucherUserNames(db, [
       normalizeVoucher(data as unknown as Record<string, unknown>),
     ]);

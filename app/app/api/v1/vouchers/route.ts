@@ -43,6 +43,14 @@ export async function GET(request: NextRequest) {
  * el servicio exige turno abierto y dueño o admin). El método arqueable se
  * elige al crear. Dentro de rango se genera directo; fuera de rango queda
  * pendiente (alerta voucher.requested) para autorización del admin.
+ *
+ * CONTRATO (CL-5): el cuerpo exige `idempotency_key` —un uuid por INTENTO del
+ * cliente, conservado mientras se reintenta y soltado al exito—, igual que las
+ * rutas de emision, de cobro y de pago. Un llamador que no la mande recibe 400
+ * VALIDATION sin escribir nada: sin marca no se puede reconocer una repeticion, y
+ * un vale reintentado abriria un SEGUNDO vale (segunda salida de caja y segundo
+ * descuento de nomina). Una repeticion con la misma marca devuelve el mismo vale
+ * con su estado registrado, sin volver a evaluar los topes acumulados.
  */
 export async function POST(request: NextRequest) {
   try {
