@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useRef, useState, type FormEvent, type ReactNode } from "react";
 import { toast } from "sonner";
 import {
   approveVoucherAction,
@@ -108,6 +108,31 @@ export function VouchersClient(props: VouchersClientProps) {
   const [dateTo, setDateTo] = useState("");
   // V1: sin topes configurados no se puede solicitar; el alta vive en un modal.
   const [isCreateOpen, setIsCreateOpen] = useState(false);
+  /**
+   * CL-5: marca de idempotencia del INTENTO de solicitud de vale.
+   *
+   * Una sola marca (no un mapa): el modal abre UN vale a la vez, así que su
+   * identidad es (empleado, marca) y el registro del intento alcanza con una
+   * marca mientras el diálogo está abierto. Se acuña cuando el intento EMPIEZA
+   * (al enviar el formulario) y se conserva si el intento falla: el reintento
+   * tiene que llevar la misma para que el servidor devuelva el vale ya
+   * registrado en vez de abrir un segundo vale —con su segunda salida de caja en
+   * el arqueo y su segundo descuento en la nómina—. Se suelta cuando el intento
+   * termina bien y al cerrar el diálogo.
+   *
+   * Acá no hay nada más que frene un reintento: los topes de 026 son
+   * ACUMULADOS (día y semana), no la identidad de un envío, así que mientras
+   * `2 × monto` quepa el segundo vale entra. Por eso la marca es la única
+   * barrera posible.
+   *
+   * No es por tecla ni por render: monto, método y observación cambian
+   * libremente sin tocar la marca, así que dos vales legítimos distintos son dos
+   * intentos con dos marcas.
+   *
+   * `crypto.randomUUID()` está en el navegador (contexto seguro) y en el runtime
+   * de Node: no hace falta ninguna dependencia nueva.
+   */
+  const voucherKeyRef = useRef<string | null>(null);
   const configured = settings !== null;
   // La caja abierta es quien abre el vale: sin turno abierto, o si el turno
   // es de otro y no soy admin, se bloquea (el servidor vuelve a validar).
@@ -193,9 +218,15 @@ export function VouchersClient(props: VouchersClientProps) {
       return;
     }
     setBusy(true);
+    // CL-5: la marca del INTENTO. Se acuña al empezar y se conserva si el
+    // intento falla (el reintento tiene que llevar la misma para que el servidor
+    // devuelva el vale ya registrado en vez de abrir un segundo vale).
+    const voucherKey = voucherKeyRef.current ?? crypto.randomUUID();
+    voucherKeyRef.current = voucherKey;
     // La fecha del vale la asigna el backend (día de la solicitud) y el turno
     // de caja lo toma del turno abierto; el frontend no los envía.
     const result = (await requestVoucherAction({
+      idempotency_key: voucherKey,
       employee_id: voucherEmployee,
       amount,
       method_code: voucherMethod,
@@ -215,9 +246,20 @@ export function VouchersClient(props: VouchersClientProps) {
       setVoucherAmount("");
       setVoucherMethod("");
       setVoucherNote("");
-      setIsCreateOpen(false);
+      closeCreateDialog();
       await refreshVouchers();
     }
+  }
+
+  /**
+   * Cierra el alta de vale. CL-5: es también el CANCELAR —los dos caminos pasan
+   * por acá—, así que abandonar el intento suelta su marca: si el intento
+   * anterior falló y se reabre el modal para otro vale, ese vale no puede quedar
+   * pegado a la marca abandonada (el servidor devolvería el vale viejo).
+   */
+  function closeCreateDialog() {
+    voucherKeyRef.current = null;
+    setIsCreateOpen(false);
   }
 
   async function handleApprove(id: string) {
@@ -355,7 +397,7 @@ export function VouchersClient(props: VouchersClientProps) {
           <Dialog
             open={isCreateOpen}
             onOpenChange={(open) => {
-              if (!open) setIsCreateOpen(false);
+              if (!open) closeCreateDialog();
               else setIsCreateOpen(true);
             }}
           >
@@ -412,7 +454,7 @@ export function VouchersClient(props: VouchersClientProps) {
                   <input value={voucherNote} onChange={(event) => setVoucherNote(event.target.value)} className={inputClass} />
                 </label>
                 <DialogFooter>
-                  <button type="button" className={ghostClass} onClick={() => setIsCreateOpen(false)}>
+                  <button type="button" className={ghostClass} onClick={closeCreateDialog}>
                     Cancelar
                   </button>
                   <button type="submit" disabled={busy} className={buttonClass}>

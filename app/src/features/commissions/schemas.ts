@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { moneyEquals, roundMoney } from "@/src/features/billing/schemas";
+import { idempotencyKeySchema, moneyEquals, roundMoney } from "@/src/features/billing/schemas";
 
 export { moneyEquals, roundMoney };
 
@@ -34,8 +34,20 @@ export interface CommissionRuleRow {
   is_active: boolean;
 }
 
-/** Pago inmediato de comisión desde la caja del turno. */
+/**
+ * Pago inmediato de comisión desde la caja del turno.
+ *
+ * CL-5: la operación exige `idempotency_key`, la MARCA del intento (uuid que
+ * acuña la pantalla al empezar el intento y que se reutiliza en los reintentos
+ * del MISMO intento). Es la MISMA definición que usan las otras cuatro puertas
+ * del dinero —vive en `billing/schemas.ts` y todas validan igual, en vez de
+ * tener cinco reglas que se pueden separar—. Es OBLIGATORIA: un envío sin marca
+ * no se puede reconocer como repetición, así que aceptarlo sin marca es reabrir
+ * el defecto (pagar la comisión dos veces) para ESE llamador. El rechazo es
+ * ruidoso (VALIDATION) y no escribe nada.
+ */
 export const commissionPayoutSchema = z.object({
+  idempotency_key: idempotencyKeySchema,
   invoice_id: uuidSchema,
   employee_id: uuidSchema,
   amount: z.coerce.number().positive("El monto debe ser mayor a 0."),

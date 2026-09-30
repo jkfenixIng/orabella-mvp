@@ -777,6 +777,24 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setConfirmKind(null);
   }
 
+  /**
+   * CL-5: marca de idempotencia del INTENTO de pago inmediato de comisión, una
+   * por EMPLEADO: el modal paga la comisión de varios empleados en un mismo
+   * envío y cada fila es su propia operación (el servidor identifica la
+   * operación por el par factura × empleado).
+   *
+   * Misma mecánica que el cobro y la emisión: se acuña cuando el intento
+   * EMPIEZA (al confirmar) y se conserva mientras se reintenta —si la red se
+   * corta y el usuario vuelve a confirmar, el servidor recibe la MISMA marca
+   * para ese empleado y devuelve el pago ya registrado en vez de pagar la
+   * comisión dos veces—. Se suelta cuando el intento de esa fila termina bien, y
+   * al cerrar el modal: si el pago se abandona, el próximo intento es otro y no
+   * puede heredar la marca. No es por tecla ni por render: cambiar el método de
+   * una fila no toca su marca, así que dos pagos legítimos del mismo par son dos
+   * intentos con dos marcas.
+   */
+  const commissionKeyRef = useRef(new Map<string, string>());
+
   async function confirmEmit() {
     const payload = buildCreatePayload();
     if (payload === null) {
@@ -1071,6 +1089,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setCommissionRows([]);
     setCommissionError(null);
     setCommissionInvoice(null);
+    // CL-5: cerrar el modal abandona los intentos de comisión a medias; el
+    // próximo pago de cada empleado es otro intento y acuña su propia marca. Si
+    // el intento anterior falló y se reabre para pagar OTRA vez, esa operación
+    // no puede quedar pegada a la marca abandonada.
+    commissionKeyRef.current.clear();
     if (detail) setDetailDialogOpen(true);
   }
 
@@ -1083,9 +1106,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
     const failed: CommissionPayRow[] = [];
     try {
       for (const [index, row] of commissionRows.entries()) {
+        // CL-5: la marca del INTENTO de este empleado. Se acuña al empezar y se
+        // conserva si el intento falla (el reintento tiene que llevar la misma
+        // para que el servidor reconozca la repetición en vez de pagar dos
+        // veces). `crypto` existe en el navegador (contexto seguro) y en el
+        // runtime de Node: no hace falta ninguna dependencia nueva.
+        const payoutKey =
+          commissionKeyRef.current.get(row.employee_id) ?? crypto.randomUUID();
+        commissionKeyRef.current.set(row.employee_id, payoutKey);
         let result: Awaited<ReturnType<typeof payCommissionNowAction>>;
         try {
           result = await payCommissionNowAction({
+            idempotency_key: payoutKey,
             invoice_id: commissionInvoice.id,
             employee_id: row.employee_id,
             amount: row.pending,
@@ -1101,6 +1133,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
           break;
         }
         if (result.success) {
+          // El intento TERMINÓ bien: el próximo pago de este empleado es OTRO
+          // intento y merece otra marca (si no, devolvería este mismo pago).
+          commissionKeyRef.current.delete(row.employee_id);
           paidCount += 1;
         } else {
           failed.push(row);
