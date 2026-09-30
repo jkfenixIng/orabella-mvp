@@ -37,6 +37,7 @@ import {
   editInvoiceItems,
   getInvoiceDetail,
   listInvoices,
+  splitPayment,
   type BillingActor,
 } from "@/src/features/billing/service";
 import {
@@ -2005,16 +2006,249 @@ function createInvoiceStubClient(): unknown {
   return { from, rpc };
 }
 
+/**
+ * CL-2: estado propio del camino de COBRO DIVIDIDO (`splitPayment`).
+ *
+ * Encendido solo por el bloque de idempotencia del cobro: los demás describe
+ * siguen con el doble de siempre. Mantiene el estado REAL que decide el
+ * defecto —las filas de `invoices` y de `invoice_payments`, y cuántas veces se
+ * escribió cada tabla— y aplica de verdad las DOS barreras de la 042/031: el
+ * tope de cobro (trigger `BEFORE INSERT`, que suma solo lo YA confirmado porque
+ * las filas hermanas de un mismo INSERT no se ven entre sí) y el índice único
+ * parcial por marca (que sí ve las filas anteriores del mismo INSERT, como
+ * Postgres al insertarlas).
+ */
+const payStub = vi.hoisted(() => ({
+  active: false,
+  SEDE_ID: "11111111-1111-4111-8111-111111111111",
+  INVOICE_ID: "33333333-3333-4333-8333-333333333333",
+  OTHER_INVOICE_ID: "33333333-3333-4333-8333-333333333334",
+  METHOD_ID: "55555555-5555-4555-8555-555555555555",
+  SHIFT_ID: "77777777-7777-4777-8777-777777777777",
+  /** Filas REALES de `invoices`, con su estado (el cobro las pasa a Pagada). */
+  invoices: [] as Array<Record<string, unknown>>,
+  /** Filas REALES de `invoice_payments`: el dinero cobrado. */
+  payments: [] as Array<Record<string, unknown>>,
+  /** Escrituras PEDIDAS por tabla (un intento cuenta aunque choque). */
+  inserts: {} as Record<string, number>,
+  /** Saltea el próximo lookup por marca: arma la ventana de la carrera. */
+  skipMarkLookupOnce: false,
+  /**
+   * Snapshot de `invoice_payments` servido UNA sola vez: la lectura VIEJA del
+   * saldo con la que dos cobros concurrentes pasan los dos la comprobación
+   * exacta. El intercalado se arma, no se inventa el desenlace.
+   */
+  stalePaymentsOnce: null as Array<Record<string, unknown>> | null,
+  /** Consultas que el doble no sabe responder: debe quedar SIEMPRE vacío. */
+  unexpectedQueries: [] as string[],
+}));
+
+/**
+ * CL-2: doble del cliente Supabase para el camino de COBRO DIVIDIDO.
+ *
+ * No sustituye la aritmética: `invoiceNetBalance`, `computeCardFees` y
+ * `loadDetail` son los de producción y corren de verdad contra este doble. Lo
+ * que el doble mantiene es el ESTADO que decide el defecto y las barreras de
+ * la base.
+ */
+function createSplitStubClient(): unknown {
+  const rowsOf = (table: string): Array<Record<string, unknown>> => {
+    if (table === "invoices") return payStub.invoices;
+    if (table === "invoice_payments") return payStub.payments;
+    if (table === "cash_shifts") {
+      return [
+        {
+          id: payStub.SHIFT_ID,
+          cash_register_id: "reg-1",
+          sede_id: payStub.SEDE_ID,
+          opened_by: "u-1",
+          closed_by: null,
+          opened_at: "2026-01-01T00:00:00.000Z",
+          closed_at: null,
+          opening_base: 0,
+          expected_cash: 0,
+          counted_cash: null,
+          base_left: null,
+          cash_withdrawn: 0,
+          base_difference: null,
+          status: "abierto",
+          observation: null,
+        },
+      ];
+    }
+    if (table === "users") return [{ id: "u-1", full_name: "Cajera de prueba" }];
+    // La factura de prueba no tiene líneas ni impuestos: el detalle los lee
+    // vacíos y la comisión no entra en juego (el cobro no la toca).
+    if (table === "invoice_items" || table === "invoice_taxes") return [];
+    if (table === "commission_rules") return [];
+    payStub.unexpectedQueries.push(`${table}.select`);
+    return [];
+  };
+
+  const known = new Set([
+    "invoices",
+    "invoice_payments",
+    "invoice_items",
+    "invoice_taxes",
+    "cash_shifts",
+    "users",
+    "commission_rules",
+  ]);
+
+  const from = (table: string) => {
+    let op = "select";
+    let single = false;
+    let payload: unknown;
+    const filters: Array<(row: Record<string, unknown>) => boolean> = [];
+    const filterColumns: string[] = [];
+
+    const matching = () => rowsOf(table).filter((row) => filters.every((test) => test(row)));
+
+    /** Columnas del payload (una fila o varias, como manda PostgREST). */
+    const payloadRows = (): Array<Record<string, unknown>> =>
+      (Array.isArray(payload) ? payload : [payload ?? {}]) as Array<Record<string, unknown>>;
+
+    const resolve = (): { data: unknown; error: unknown } => {
+      if (!known.has(table)) {
+        return { data: null, error: { message: `doble de cobro sin respuesta para ${table}.${op}` } };
+      }
+      if (table === "invoices" && op === "update") {
+        // El cobro que completa la factura la pasa a Pagada: el doble lo
+        // escribe de verdad, para que la lectura siguiente lo vea.
+        const written = (payload ?? {}) as Record<string, unknown>;
+        const matched = matching();
+        for (const row of matched) Object.assign(row, written);
+        return { data: single ? matched[0] ?? null : matched, error: null };
+      }
+      if ("insert" === op) {
+        if (table !== "invoice_payments") {
+          return { data: single ? payloadRows()[0] ?? null : payloadRows(), error: null };
+        }
+        const values = payloadRows();
+        // 1) El tope de cobro (031) es un trigger BEFORE INSERT: corre ANTES de
+        //    que la fila entre al índice, y su SUM solo ve lo YA confirmado
+        //    (las filas hermanas del mismo INSERT comparten el snapshot).
+        for (const row of values) {
+          const invoice = payStub.invoices.find((candidate) => candidate.id === row.invoice_id);
+          if (!invoice) {
+            return { data: null, error: { code: "23503", message: "Factura inexistente" } };
+          }
+          const paidNet = payStub.payments
+            .filter((candidate) => candidate.invoice_id === row.invoice_id)
+            .reduce(
+              (acc, candidate) =>
+                acc + (Number(candidate.amount) - Number(candidate.fee_amount ?? 0)),
+              0,
+            );
+          const newNet = Number(row.amount) - Number(row.fee_amount ?? 0);
+          const cap = Math.round(Number(invoice.total) - Number(invoice.surcharge ?? 0));
+          if (paidNet + newNet - cap > 0.009) {
+            return {
+              data: null,
+              error: { code: "P0001", message: "El cobro supera el neto facturado de la factura" },
+            };
+          }
+        }
+        // 2) El índice único PARCIAL (042): la marca no nula choca contra lo
+        //    confirmado Y contra las filas anteriores del MISMO INSERT, y
+        //    aborta la sentencia entera (no se persiste ninguna fila).
+        const clashes = values.some((row, index) => {
+          const mark = row.idempotency_key;
+          if (mark === null || mark === undefined) return false;
+          const keyed = (other: Record<string, unknown>) =>
+            other.invoice_id === row.invoice_id && other.idempotency_key === mark;
+          return [
+            ...payStub.payments.filter((other) => other.invoice_id === row.invoice_id),
+            ...values.slice(0, index),
+          ].some(keyed);
+        });
+        if (clashes) {
+          return {
+            data: null,
+            error: {
+              code: "23505",
+              message:
+                'duplicate key value violates unique constraint "uq_invoice_payments_invoice_idempotency_key"',
+            },
+          };
+        }
+        const persisted = values.map((row, index) => ({
+          id: `pago-${payStub.payments.length + index + 1}`,
+          created_at: "2026-01-01T00:00:00.000Z",
+          ...row,
+        }));
+        payStub.payments.push(...persisted);
+        return { data: single ? persisted[0] ?? null : persisted, error: null };
+      }
+      if (table === "invoice_payments" && payStub.stalePaymentsOnce !== null) {
+        const snapshot = payStub.stalePaymentsOnce;
+        payStub.stalePaymentsOnce = null;
+        return { data: single ? snapshot[0] ?? null : snapshot, error: null };
+      }
+      if (filterColumns.includes("idempotency_key") && payStub.skipMarkLookupOnce) {
+        payStub.skipMarkLookupOnce = false;
+        return { data: single ? null : [], error: null };
+      }
+      const matched = matching();
+      return { data: single ? matched[0] ?? null : matched, error: null };
+    };
+
+    const query: Record<string, unknown> = {
+      select: () => query,
+      insert: (value?: unknown) => {
+        op = "insert";
+        payload = value;
+        payStub.inserts[table] = (payStub.inserts[table] ?? 0) + 1;
+        return query;
+      },
+      update: (value?: unknown) => {
+        op = "update";
+        payload = value;
+        return query;
+      },
+      eq: (column: string, value: unknown) => {
+        filterColumns.push(column);
+        filters.push((row) => row[column] === value);
+        return query;
+      },
+      in: (column: string, values: readonly unknown[]) => {
+        filterColumns.push(column);
+        const set = new Set(values);
+        filters.push((row) => set.has(row[column]));
+        return query;
+      },
+      order: () => query,
+      limit: () => query,
+      range: () => query,
+      single: () => {
+        single = true;
+        return Promise.resolve(resolve());
+      },
+      maybeSingle: () => {
+        single = true;
+        return Promise.resolve(resolve());
+      },
+      then: (onFulfilled?: (value: unknown) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve(resolve()).then(onFulfilled, onRejected),
+    };
+    return query;
+  };
+
+  return { from };
+}
+
 vi.mock("@/src/shared/lib/supabase/server", () => ({
   createAdminClient: () => billingStubClient(),
 }));
 
 /**
- * El doble que ve cada camino. El de emisión (MO-1) solo existe cuando su
- * bloque lo enciende; el resto del archivo conserva el doble de siempre, así
- * que ningún describe existente cambia de comportamiento.
+ * El doble que ve cada camino. Los propios de emisión (MO-1) y de cobro
+ * dividido (CL-2) solo existen cuando su bloque los enciende; el resto del
+ * archivo conserva el doble de siempre, así que ningún describe existente
+ * cambia de comportamiento.
  */
 function billingStubClient(): unknown {
+  if (payStub.active) return createSplitStubClient();
   return createStub.active ? createInvoiceStubClient() : createOverCollectionStubClient();
 }
 
@@ -2029,11 +2263,20 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
     arqueable: true,
     fee_percent: 0,
   } as Awaited<ReturnType<typeof actual.listPaymentMethods>>[number];
+  // CL-2: el segundo método existe porque una operación de cobro puede tener
+  // DOS porciones (una por método) y esa es justo la arruga que la marca debe
+  // respetar. Sin recargo: el cobro no cambia de aritmética, solo de forma.
+  const transfer = {
+    ...method,
+    id: payStub.METHOD_ID,
+    code: "transferencia",
+    name: "Transferencia",
+  } as Awaited<ReturnType<typeof actual.listPaymentMethods>>[number];
   return {
     ...actual,
     listTaxes: async () => [] as Awaited<ReturnType<typeof actual.listTaxes>>,
     listPaymentMethods: async () =>
-      [method] as Awaited<ReturnType<typeof actual.listPaymentMethods>>,
+      [method, transfer] as Awaited<ReturnType<typeof actual.listPaymentMethods>>,
     listServices: async () => [] as Awaited<ReturnType<typeof actual.listServices>>,
   };
 });
@@ -3600,5 +3843,274 @@ describe("billing: la emisión repetida no emite dos veces (MO-1)", () => {
     expect(sql).not.toMatch(/\bTRUNCATE\b/i);
     expect(sql).not.toMatch(/UPDATE\s+public\.invoices\b/i);
     expect(sql).not.toMatch(/consecutive_number/);
+  });
+});
+
+// ------------- CL-2: el cobro repetido no cobra dos veces -------------------
+//
+// El defecto reportado: `splitPayment` leía el saldo y DESPUÉS insertaba las
+// porciones en `invoice_payments`, sin ninguna marca del ENVÍO y sin barrera de
+// identidad, igual que `payPayrollItem`.
+//
+// LO MEDIDO, que corrige el diagnóstico: en el cobro de factura el dinero NO se
+// cobra dos veces. `splitPayment` exige que el NETO de las porciones iguale el
+// SALDO exacto, así que después de un cobro bueno el saldo queda en cero y el
+// reintento no llega ni a insertar: muere en la comprobación del saldo con
+// OVERPAID (422). Lo que sí falta es el RECONOCIMIENTO: el reintento de una
+// operación que SÍ se registró no se reconoce como repetición, y la protección
+// descansa en una coincidencia aritmética (el cobro exacto) más el tope de 031
+// —que sí frena la carrera concurrente— en vez de en la identidad del envío.
+// Un cambio futuro de esa regla (permitir abonos parciales desde acá) abriría
+// la puerta al doble cobro sin que nada lo avise. El test de abajo PINCHA las
+// dos cosas: hoy no hay doble cobro, y hoy el reintento NO se reconoce.
+//
+// La decisión es la misma de la emisión (MO-1, 041) y del abono de nómina
+// (CL-2, 042): dos envíos iguales son UNA operación y se reconocen por la MARCA
+// que manda la pantalla, no por el contenido.
+//
+// LA ARRUGA, resuelta acá: una operación NO es una fila. El cobro inserta N
+// porciones (una por método) en UNA sola sentencia multi-fila, así que un
+// índice único sobre la marca a secas rechazaría la SEGUNDA porción de una
+// operación legítima. La marca vive SÓLO en la primera porción y el índice es
+// PARCIAL sobre (invoice_id, idempotency_key) WHERE NOT NULL: el 23505 aborta el
+// INSERT completo, así que ninguna porción de una repetición sobrevive.
+
+describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
+  const ACTOR: BillingActor = {
+    userId: "u-1",
+    sedeId: payStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  /** Marca del intento; la segunda existe para el control de no-extralimitación. */
+  const MARK = "8d4e2b6a-5c39-4e71-a2b8-9f0d3c6e1a47";
+  const OTHER_MARK = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+  const TOTAL = 100000;
+
+  /** Factura Emitida sin cobros (una o dos, para el control de alcance). */
+  function seedInvoice(id: string, consecutive: number, total = TOTAL): void {
+    payStub.invoices.push({
+      id,
+      sede_id: payStub.SEDE_ID,
+      consecutive_number: consecutive,
+      client_name: null,
+      client_document: null,
+      subtotal: total,
+      discount: 0,
+      tax: 0,
+      surcharge: 0,
+      total,
+      status: "Emitida",
+      user_id: "u-1",
+      cash_shift_id: payStub.SHIFT_ID,
+      closed_by: null,
+      closed_at: null,
+      cancel_reason: null,
+      created_at: "2026-01-01T00:00:00.000Z",
+      edit_version: 0,
+    });
+  }
+
+  const payInserts = () => payStub.inserts.invoice_payments ?? 0;
+
+  /** Cobro de una sola porción que cierra el saldo. */
+  function closeInvoice(invoiceId: string, amount = TOTAL, mark = MARK) {
+    return {
+      idempotency_key: mark,
+      portions: [{ method_code: "efectivo", amount }],
+    };
+  }
+
+  beforeEach(() => {
+    payStub.invoices = [];
+    payStub.payments = [];
+    payStub.inserts = {};
+    payStub.skipMarkLookupOnce = false;
+    payStub.stalePaymentsOnce = null;
+    payStub.unexpectedQueries = [];
+    payStub.active = true;
+    seedInvoice(payStub.INVOICE_ID, 7);
+  });
+
+  afterEach(() => {
+    payStub.active = false;
+  });
+
+  it("RED: hoy el reintento del MISMO cobro no se reconoce (y el doble cobro no ocurre por el cobro exacto)", async () => {
+    const first = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const second: unknown = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      closeInvoice(payStub.INVOICE_ID),
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    // LO MEDIDO, en una aserción para que no se pierda: hoy el reintento NO
+    // escribe una segunda fila. El cobro exacto y el tope de 031 ya lo frenan.
+    expect(payStub.payments).toHaveLength(1);
+    expect(payInserts()).toBe(1);
+    // Y lo que falta: que se reconozca como repetición en vez de morir en el
+    // saldo. HOY: BillingError OVERPAID (422). Con la marca: el mismo detalle.
+    expect(second).not.toBeInstanceOf(BillingError);
+    expect(second).toMatchObject({ invoice: { id: first.invoice.id, status: "Pagada" } });
+    expect((second as { payments: unknown[] }).payments).toHaveLength(1);
+  });
+
+  it("la repetición devuelve el MISMO resultado escribiendo nada (no-op exitoso)", async () => {
+    const first = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const repeat = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+
+    expect(repeat.invoice.id).toBe(first.invoice.id);
+    expect(repeat.invoice.status).toBe("Pagada");
+    expect(repeat.invoice.total).toBe(first.invoice.total);
+    expect(repeat.paid).toBe(first.paid);
+    expect(repeat.remaining).toBe(0);
+    // El reintento ni siquiera INTENTÓ escribir: lo reconoció antes.
+    expect(payInserts()).toBe(1);
+    expect(payStub.payments).toHaveLength(1);
+    expect(payStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("la carrera (lectura vieja del saldo + marca ya confirmada) relee a la ganadora", async () => {
+    const first = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    // La otra petición leyó el saldo ANTES de que la ganadora confirmara (el
+    // doble le sirve el snapshot viejo una sola vez) y tampoco vio la marca (el
+    // doble saltea ese lookup una vez): así pasa la comprobación exacta y llega
+    // al INSERT como pasaría en la base, sin que el test invente el desenlace.
+    payStub.stalePaymentsOnce = [];
+    payStub.skipMarkLookupOnce = true;
+
+    const second = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+
+    // El reintento sigue siendo un no-op: devuelve la factura de la ganadora.
+    expect(second.invoice.id).toBe(first.invoice.id);
+    expect(second.invoice.status).toBe("Pagada");
+    expect(payStub.payments).toHaveLength(1);
+    // No vacuidad: el INSERT de la segunda SÍ se intentó y lo frenó el tope de
+    // 031 (el trigger corre ANTES del índice y ve la fila confirmada). Sin el
+    // reconocimiento por marca, ese camino terminaba en OVERPAID.
+    expect(payInserts()).toBe(2);
+    // Y el lookup del reintento lo ve a la ganadora: su fila es la que quedó.
+    expect(payStub.payments).toHaveLength(1);
+    expect(payStub.payments[0].idempotency_key).toBe(MARK);
+  });
+
+  it("control de no-extralimitación: dos marcas distintas son DOS cobros", async () => {
+    // Un "un solo cobro por factura" global pasaría el primer caso y estaría
+    // mal. En esta puerta el cobro exacto impide un segundo cobro sobre la
+    // MISMA factura (el saldo queda en cero), así que el control se hace con
+    // dos facturas: la marca reconoce UNA operación, no encadena cobros.
+    seedInvoice(payStub.OTHER_INVOICE_ID, 8);
+    const first = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const second = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.OTHER_INVOICE_ID,
+      closeInvoice(payStub.OTHER_INVOICE_ID, TOTAL, OTHER_MARK),
+      ACTOR,
+    );
+
+    expect(payStub.payments).toHaveLength(2);
+    expect(payInserts()).toBe(2);
+    expect(second.invoice.id).not.toBe(first.invoice.id);
+    expect(second.invoice.status).toBe("Pagada");
+    // Y repetir la SEGUNDA marca devuelve la SEGUNDA factura, no la primera.
+    const repeat = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.OTHER_INVOICE_ID,
+      closeInvoice(payStub.OTHER_INVOICE_ID, TOTAL, OTHER_MARK),
+      ACTOR,
+    );
+    expect(payStub.payments).toHaveLength(2);
+    expect(repeat.invoice.id).toBe(second.invoice.id);
+  });
+
+  it("una operación de VARIAS porciones no la rechaza su propio índice único", async () => {
+    // La arruga: dos porciones (una por método) en UNA sola operación.
+    const portions = {
+      idempotency_key: MARK,
+      portions: [
+        { method_code: "efectivo", amount: 60000 },
+        { method_code: "transferencia", amount: 40000 },
+      ],
+    };
+    const result = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, portions, ACTOR);
+
+    // UNA sentencia multi-fila (no dos inserts fila por fila): es la premisa de
+    // la que depende que el 23505 aborte la operación entera.
+    expect(payInserts()).toBe(1);
+    expect(payStub.payments).toHaveLength(2);
+    // La marca vive SOLO en la primera porción: si estuviera en las dos, el
+    // propio índice la rechazaría (y el doble, como Postgres, lo haría).
+    expect(payStub.payments[0]).toMatchObject({
+      idempotency_key: MARK,
+      amount: 60000,
+      method_code: "efectivo",
+    });
+    expect(payStub.payments[1]).toMatchObject({ idempotency_key: null, amount: 40000 });
+    expect(result.invoice.status).toBe("Pagada");
+
+    // Y repetir ESA operación también es un no-op: las dos porciones.
+    const repeat = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, portions, ACTOR);
+    expect(payStub.payments).toHaveLength(2);
+    expect(payInserts()).toBe(1);
+    expect(repeat.payments).toHaveLength(2);
+  });
+
+  it("control negativo: la marca no cambia la aritmética del cobro", async () => {
+    // Una marca nueva NO convierte en cobrable lo que el saldo rechaza: la
+    // comprobación exacta y el tope siguen mandando, con marca o sin ella.
+    const failure: unknown = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      closeInvoice(payStub.INVOICE_ID, 60000),
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "SUM_MISMATCH", status: 422 });
+    expect(payStub.payments).toHaveLength(0);
+    expect(payInserts()).toBe(0);
+  });
+
+  it("una marca faltante o mal formada se rechaza con CERO escrituras", async () => {
+    // Decisión explícita, igual que en la emisión: la marca es OBLIGATORIA. Un
+    // envío sin marca no se puede reconocer como repetición, y la ruta REST es
+    // pública: es justo la que reintenta sobre redes. El rechazo es ruidoso.
+    const withoutMark: unknown = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      { portions: [{ method_code: "efectivo", amount: TOTAL }] },
+      ACTOR,
+    ).catch((error: unknown) => error);
+    const malformed: unknown = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      { idempotency_key: "no-es-un-uuid", portions: [{ method_code: "efectivo", amount: TOTAL }] },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(withoutMark).toBeInstanceOf(BillingError);
+    expect(withoutMark).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(malformed).toBeInstanceOf(BillingError);
+    expect(malformed).toMatchObject({ code: "VALIDATION", status: 400 });
+    // La validación corre ANTES de leer el detalle y de cualquier escritura.
+    expect(payInserts()).toBe(0);
+    expect(payStub.payments).toHaveLength(0);
+  });
+
+  it("el esquema exige la marca y mantiene la exigencia de porciones", () => {
+    expect(splitPaymentSchema.safeParse({ portions: [] }).success).toBe(false);
+    expect(
+      splitPaymentSchema.safeParse({ portions: [{ method_code: "efectivo", amount: TOTAL }] }).success,
+    ).toBe(false);
+    expect(
+      splitPaymentSchema.safeParse({ idempotency_key: "no-es-un-uuid", portions: [{ method_code: "efectivo", amount: TOTAL }] })
+        .success,
+    ).toBe(false);
+    expect(
+      splitPaymentSchema.safeParse({
+        idempotency_key: MARK,
+        portions: [{ method_code: "efectivo", amount: TOTAL }],
+      }).success,
+    ).toBe(true);
   });
 });

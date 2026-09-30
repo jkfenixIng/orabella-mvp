@@ -479,13 +479,32 @@ describe("payroll: pago dividido suma el neto exacto (PAY-04)", () => {
     );
   });
 
-  it("el esquema exige porciones con método y monto > 0", () => {
+  it("el esquema exige porciones con método y monto > 0, y la marca del intento (CL-2)", () => {
+    // CL-2: el cuerpo del pago ganó un campo obligatorio, la marca del intento.
+    const mark = "3f1c8a2e-9d47-4b6e-8f21-0c5a7b3d9e14";
+    expect(
+      payPayrollItemSchema.safeParse({
+        idempotency_key: mark,
+        portions: [{ method_code: "efectivo", amount: 100000 }],
+      }).success,
+    ).toBe(true);
+    // Sin marca no hay forma de reconocer una repetición, y una marca mal
+    // formada no la reconocería nunca: las dos se rechazan antes de escribir.
     expect(
       payPayrollItemSchema.safeParse({ portions: [{ method_code: "efectivo", amount: 100000 }] }).success,
-    ).toBe(true);
-    expect(payPayrollItemSchema.safeParse({ portions: [] }).success).toBe(false);
+    ).toBe(false);
     expect(
-      payPayrollItemSchema.safeParse({ portions: [{ method_code: "efectivo", amount: 0 }] }).success,
+      payPayrollItemSchema.safeParse({
+        idempotency_key: "no-es-un-uuid",
+        portions: [{ method_code: "efectivo", amount: 100000 }],
+      }).success,
+    ).toBe(false);
+    expect(payPayrollItemSchema.safeParse({ idempotency_key: mark, portions: [] }).success).toBe(false);
+    expect(
+      payPayrollItemSchema.safeParse({
+        idempotency_key: mark,
+        portions: [{ method_code: "efectivo", amount: 0 }],
+      }).success,
     ).toBe(false);
   });
 });
@@ -1101,6 +1120,19 @@ const payrollPagedStub = vi.hoisted(() => ({
   insertError: null as { table: string; code: string } | null,
   /** Payload de cada UPDATE, por tabla: si la escritura ocurrió o no. */
   updates: [] as Array<{ table: string; payload: unknown }>,
+  /**
+   * CL-2: índices únicos PARCIALES (columnas de marca no nula) que el doble
+   * aplica de verdad. Un INSERT que los repita responde 23505 y NO persiste
+   * NINGUNA fila: en Postgres la sentencia entera aborta, y eso es
+   * exactamente lo que hace sonora la opción "la marca en la primera fila".
+   * Vacío = la tabla se comporta como antes (ningún bloque existente cambia).
+   */
+  uniqueKeys: [] as Array<{ table: string; columns: string[] }>,
+  /**
+   * CL-2: saltea UNA vez el lookup por marca: arma la ventana de la carrera
+   * (la otra transacción se confirmó entre el lookup y el INSERT).
+   */
+  skipMarkLookupOnce: false,
 }));
 
 /**
@@ -1164,6 +1196,30 @@ function createPayrollPagedStubClient(): unknown {
         const values = (Array.isArray(insertPayload) ? insertPayload : [insertPayload]) as Array<
           Record<string, unknown>
         >;
+        // CL-2: los índices únicos de verdad. Postgres comprueba cada fila al
+        // insertarla —así que verla repetida DENTRO del mismo statement de
+        // varias filas también es un choque— y aborta todo: el doble no
+        // persiste nada, igual que la sentencia que falla.
+        for (const key of payrollPagedStub.uniqueKeys) {
+          if (key.table !== table) continue;
+          const nonNull = (row: Record<string, unknown>) =>
+            key.columns.every((column) => row[column] !== null && row[column] !== undefined);
+          const sameKey = (left: Record<string, unknown>, right: Record<string, unknown>) =>
+            key.columns.every((column) => left[column] === right[column]);
+          const clash = values.some((row, index) =>
+            nonNull(row) &&
+            [...rows(), ...values.slice(0, index)].some((other) => nonNull(other) && sameKey(other, row)),
+          );
+          if (clash) {
+            return {
+              data: null,
+              error: {
+                code: "23505",
+                message: `doble: índice único (${key.columns.join(", ")}) violado en ${table}`,
+              },
+            };
+          }
+        }
         const persisted = values.map((row, index) => ({
           id: `fila-insertada-${index + 1}`,
           created_at: "2026-01-31T23:59:59.000Z",
@@ -1183,6 +1239,14 @@ function createPayrollPagedStubClient(): unknown {
       const index = (payrollPagedStub.requests[table] = (payrollPagedStub.requests[table] ?? 0) + 1);
       if ((payrollPagedStub.failAt[table] ?? []).includes(index)) {
         return { data: null, error: { message: `doble: fallo inyectado en ${table} (request ${index})` } };
+      }
+      // CL-2: la carrera del reintento. Cuando la consulta es la del lookup por
+      // marca y el test pidió saltearla, el doble contesta "no hay nada" como
+      // si la otra transacción todavía no hubiera confirmado. Se consume una
+      // sola vez.
+      if (filterColumns.includes("idempotency_key") && payrollPagedStub.skipMarkLookupOnce) {
+        payrollPagedStub.skipMarkLookupOnce = false;
+        return { data: single ? null : [], error: null };
       }
       const to = Math.min(rangeTo, rangeFrom + payrollPagedStub.rowCap - 1);
       payrollPagedStub.windows.push({ table, from: rangeFrom, to, order: orderKeys.map((key) => key.column) });
@@ -1312,6 +1376,8 @@ function resetPayrollStubState(): void {
   payrollPagedStub.inserts.length = 0;
   payrollPagedStub.insertError = null;
   payrollPagedStub.updates.length = 0;
+  payrollPagedStub.uniqueKeys.length = 0;
+  payrollPagedStub.skipMarkLookupOnce = false;
 }
 
 // Los catálogos de admin/cash son `unstable_cache` (caché de Next). Fuera de un
@@ -3762,7 +3828,11 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
       .payPayrollItem(
         payrollPagedStub.SEDE_ID,
         ITEM_ID,
-        { portions: [{ method_code: "efectivo", amount: 1 }] },
+        {
+          // CL-2: el cuerpo del pago exige ahora la marca del intento.
+          idempotency_key: "3f1c8a2e-9d47-4b6e-8f21-0c5a7b3d9e14",
+          portions: [{ method_code: "efectivo", amount: 1 }],
+        },
         ACTOR,
       )
       .catch((error: unknown) => error);
@@ -4241,5 +4311,366 @@ describe("payroll: la pantalla dice que la corrección no mueve dinero (PA-2b)",
     expect(client).not.toContain("se descontará");
     expect(client).not.toContain("se arrastra al período siguiente");
     expect(client).not.toContain("ajuste automático");
+  });
+});
+
+// ------------- CL-2: el abono parcial repetido no paga dos veces ------------
+//
+// El defecto: `payPayrollItem` leía el acumulado (`alreadyPaid`) y DESPUÉS
+// insertaba las porciones, sin ninguna marca del ENVÍO y sin barrera de
+// identidad. Reenviar el MISMO abono parcial —doble clic, o el navegador
+// reintentando tras cortarse la red— releía el mismo acumulado y volvía a
+// insertar: la única barrera era `trg_payroll_payments_cap` (007), y ese tope
+// sólo salta cuando el total DOBLADO supera `net_pay`. Con 2 × entrante ≤ saldo
+// el reintento paga dos veces, sin que nada lo note.
+//
+// La decisión es la misma que en la emisión de facturas (MO-1, migración 041):
+// dos envíos iguales son UNA operación y se reconocen por una MARCA que manda
+// la pantalla, no por el contenido. Deduplicar por contenido prohibiría dos
+// abonos legítimos del mismo monto y del mismo método hechos en dos intentos
+// distintos —lo normal en un pago por partes—, así que la marca es lo único que
+// distingue "el mismo envío" de "el mismo contenido".
+//
+// LA ARRUGA, resuelta acá: una operación NO es una fila. `payPayrollItem`
+// inserta N porciones (una por método) en UNA sola sentencia multi-fila, así que
+// un índice único sobre la marca a secas rechazaría la SEGUNDA porción de una
+// operación legítima. La marca vive entonces SÓLO en la primera porción y el
+// índice es PARCIAL sobre (payroll_item_id, idempotency_key) WHERE NOT NULL.
+// La premisa —una sola sentencia— es la que hace sonora la forma: el 23505
+// aborta el INSERT completo, así que ninguna porción de la repetición sobrevive.
+// Si las porciones se insertaran fila por fila, esta opción no serviría y habría
+// que pasar a un registro de operación en una fila aparte.
+
+describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const ITEM_ID = "item-cl2";
+  const PERIOD_ID = "periodo-cl2";
+  const NET = 100000;
+  /** Marca del intento; la segunda existe para el control de no-extralimitación. */
+  const MARK = "3f1c8a2e-9d47-4b6e-8f21-0c5a7b3d9e14";
+  const OTHER_MARK = "5b2d9c7f-4e18-4a3b-9d60-1f8c2e5a7b43";
+
+  /** Período en BORRADOR con su ítem (neto `netPay`) y dos métodos activos. */
+  function seedDraftItem(netPay = NET): void {
+    payrollPagedStub.tables.payroll_periods = [
+      {
+        id: PERIOD_ID,
+        sede_id: payrollPagedStub.SEDE_ID,
+        start_date: "2026-09-01",
+        end_date: "2026-09-15",
+        status: "borrador",
+        created_by: ACTOR.userId,
+        closed_at: null,
+        created_at: "2026-09-01T00:00:00.000Z",
+      },
+    ];
+    payrollPagedStub.tables.payroll_items = [
+      {
+        id: ITEM_ID,
+        period_id: PERIOD_ID,
+        employee_id: payrollPagedStub.EMPLOYEE_ID,
+        base_fixed: netPay,
+        commissions: 0,
+        bonuses: 0,
+        deductions_vales: 0,
+        other_discounts: 0,
+        net_pay: netPay,
+        detail_json: [],
+        created_at: "2026-09-30T23:59:59.000Z",
+      },
+    ];
+    payrollPagedStub.tables.payroll_payments = [];
+    payrollPagedStub.tables.payment_methods = [
+      {
+        id: "met-efectivo",
+        sede_id: payrollPagedStub.SEDE_ID,
+        code: "efectivo",
+        name: "Efectivo",
+        is_active: true,
+        arqueable: true,
+        fee_percent: 0,
+      },
+      {
+        id: "met-transferencia",
+        sede_id: payrollPagedStub.SEDE_ID,
+        code: "transferencia",
+        name: "Transferencia",
+        is_active: true,
+        arqueable: true,
+        fee_percent: 0,
+      },
+    ];
+  }
+
+  const storedPayments = () => payrollPagedStub.tables.payroll_payments ?? [];
+  const paymentInserts = () =>
+    payrollPagedStub.inserts.filter((entry) => entry.table === "payroll_payments");
+
+  /** Abono parcial por un solo método. */
+  function partial(amount: number, method = "efectivo") {
+    return { portions: [{ method_code: method, amount }] };
+  }
+
+  beforeEach(() => {
+    resetPayrollStubState();
+    // El índice único PARCIAL de la 042, aplicado como lo hace Postgres.
+    payrollPagedStub.uniqueKeys = [
+      { table: "payroll_payments", columns: ["payroll_item_id", "idempotency_key"] },
+    ];
+    seedDraftItem();
+  });
+  afterEach(() => resetPayrollStubState());
+
+  it("RED: hoy el abono parcial reintentado paga DOS veces (2 x entrante <= saldo)", async () => {
+    const first = await payrollExtrasService.payPayrollItem(
+      payrollPagedStub.SEDE_ID,
+      ITEM_ID,
+      { idempotency_key: MARK, ...partial(30000) },
+      ACTOR,
+    );
+    const second = await payrollExtrasService.payPayrollItem(
+      payrollPagedStub.SEDE_ID,
+      ITEM_ID,
+      { idempotency_key: MARK, ...partial(30000) },
+      ACTOR,
+    );
+
+    // HOY: dos filas de 30.000 (60.000 pagados de un neto de 100.000) y el
+    // tope de 007 no lo ve: 2 × 30.000 ≤ 70.000 de saldo. Con la marca: UNA.
+    expect(storedPayments()).toHaveLength(1);
+    expect(storedPayments()[0]).toMatchObject({
+      amount: 30000,
+      method_code: "efectivo",
+      idempotency_key: MARK,
+    });
+    expect(first.paid).toBe(30000);
+    expect(second.paid).toBe(first.paid);
+  });
+
+  it("la repetición devuelve el MISMO resultado escribiendo nada (no-op exitoso)", async () => {
+    const first = await payrollExtrasService.payPayrollItem(
+      payrollPagedStub.SEDE_ID,
+      ITEM_ID,
+      { idempotency_key: MARK, ...partial(30000) },
+      ACTOR,
+    );
+    const repeat = await payrollExtrasService.payPayrollItem(
+      payrollPagedStub.SEDE_ID,
+      ITEM_ID,
+      { idempotency_key: MARK, ...partial(30000) },
+      ACTOR,
+    );
+
+    expect(repeat.paid).toBe(first.paid);
+    expect(repeat.remaining).toBe(first.remaining);
+    expect(repeat.item.id).toBe(first.item.id);
+    expect(repeat.payments.map((row) => row.id)).toEqual(first.payments.map((row) => row.id));
+    // El reintento ni siquiera INTENTÓ escribir: lo reconoció antes.
+    expect(paymentInserts()).toHaveLength(1);
+    expect(storedPayments()).toHaveLength(1);
+  });
+
+  it("control de no-extralimitación: dos marcas distintas son DOS abonos (y cada marca sigue siendo la suya)", async () => {
+    // Un "un solo pago por ítem" global pasaría el caso anterior y estaría mal:
+    // pagar en partes es el caso normal de PAY-04.
+    const first = await payrollExtrasService.payPayrollItem(
+      payrollPagedStub.SEDE_ID,
+      ITEM_ID,
+      { idempotency_key: MARK, ...partial(30000) },
+      ACTOR,
+    );
+    const second = await payrollExtrasService.payPayrollItem(
+      payrollPagedStub.SEDE_ID,
+      ITEM_ID,
+      { idempotency_key: OTHER_MARK, ...partial(30000) },
+      ACTOR,
+    );
+
+    expect(storedPayments()).toHaveLength(2);
+    expect(paymentInserts()).toHaveLength(2);
+    expect(first.paid).toBe(30000);
+    expect(second.paid).toBe(60000);
+    // Y repetir la SEGUNDA marca devuelve la SEGUNDA operación, no la primera:
+    // el reconocimiento es por (ítem, marca).
+    const repeat = await payrollExtrasService.payPayrollItem(
+      payrollPagedStub.SEDE_ID,
+      ITEM_ID,
+      { idempotency_key: OTHER_MARK, ...partial(30000) },
+      ACTOR,
+    );
+    expect(storedPayments()).toHaveLength(2);
+    expect(repeat.paid).toBe(60000);
+    // La repetición devuelve la SEGUNDA operación (su fila), no la primera: el
+    // reconocimiento es por (ítem, marca).
+    expect(repeat.payments[0]).toBe(storedPayments()[1]);
+    expect(repeat.payments[0]).not.toBe(storedPayments()[0]);
+  });
+
+  it("la carrera (misma marca entre el lookup y el INSERT) relee a la ganadora", async () => {
+    const first = await payrollExtrasService.payPayrollItem(
+      payrollPagedStub.SEDE_ID,
+      ITEM_ID,
+      { idempotency_key: MARK, ...partial(30000) },
+      ACTOR,
+    );
+    // La otra transacción se confirmó entre el lookup y el INSERT: el doble
+    // saltea el lookup una vez para armar exactamente esa ventana.
+    payrollPagedStub.skipMarkLookupOnce = true;
+
+    const second = await payrollExtrasService.payPayrollItem(
+      payrollPagedStub.SEDE_ID,
+      ITEM_ID,
+      { idempotency_key: MARK, ...partial(30000) },
+      ACTOR,
+    );
+
+    // El reintento sigue siendo un no-op: devuelve la operación de la ganadora.
+    expect(second.paid).toBe(first.paid);
+    expect(second.payments.map((row) => row.id)).toEqual(first.payments.map((row) => row.id));
+    expect(storedPayments()).toHaveLength(1);
+    // No vacuidad: el INSERT de la segunda SÍ se intentó (dos intentos, una
+    // fila). Si el lookup la hubiera visto, el camino del 23505 no existiría.
+    expect(paymentInserts()).toHaveLength(2);
+  });
+
+  it("una operación de VARIAS porciones no la rechaza su propio índice único", async () => {
+    // La arruga: 40% + 20% en una sola operación (una porción por método).
+    const result = await payrollExtrasService.payPayrollItem(
+      payrollPagedStub.SEDE_ID,
+      ITEM_ID,
+      {
+        idempotency_key: MARK,
+        portions: [
+          { method_code: "efectivo", amount: 40000 },
+          { method_code: "transferencia", amount: 20000 },
+        ],
+      },
+      ACTOR,
+    );
+
+    // UNA sentencia multi-fila (no dos inserts fila por fila): es la premisa de
+    // la que depende que el 23505 aborte la operación entera.
+    expect(paymentInserts()).toHaveLength(1);
+    expect(storedPayments()).toHaveLength(2);
+    // La marca vive SOLO en la primera porción: si estuviera en las dos, el
+    // propio índice la rechazaría (y el doble, como Postgres, lo haría).
+    expect(storedPayments()[0]).toMatchObject({ idempotency_key: MARK, amount: 40000 });
+    expect(storedPayments()[1]).toMatchObject({ idempotency_key: null, amount: 20000 });
+    expect(result.paid).toBe(60000);
+
+    // Y repetir ESA operación también es un no-op: no escribe nada y el dinero
+    // vuelve exacto (el acumulado se relee).
+    const repeat = await payrollExtrasService.payPayrollItem(
+      payrollPagedStub.SEDE_ID,
+      ITEM_ID,
+      {
+        idempotency_key: MARK,
+        portions: [
+          { method_code: "efectivo", amount: 40000 },
+          { method_code: "transferencia", amount: 20000 },
+        ],
+      },
+      ACTOR,
+    );
+    expect(storedPayments()).toHaveLength(2);
+    expect(paymentInserts()).toHaveLength(1);
+    expect(repeat.paid).toBe(60000);
+    // COSTO DECLARADO de la forma elegida: la marca vive en la PRIMERA porción,
+    // así que la repetición devuelve la fila de identidad de la operación y no
+    // sus hermanas (no llevan marca y atribuirlas sería adivinar). El monto
+    // (`paid`/`remaining`) sí es el real, porque se relee del acumulado.
+    expect(repeat.payments).toHaveLength(1);
+    expect(repeat.payments[0]).toBe(storedPayments()[0]);
+  });
+
+  it("control negativo: la marca no cambia la aritmética del dinero", async () => {
+    // La primera operación entra; la segunda (marca NUEVA, o sea otro intento)
+    // supera el saldo y se rechaza EXACTAMENTE como antes: con marca o sin
+    // ella, el tope y el redondeo son los mismos.
+    await payrollExtrasService.payPayrollItem(
+      payrollPagedStub.SEDE_ID,
+      ITEM_ID,
+      { idempotency_key: MARK, ...partial(30000) },
+      ACTOR,
+    );
+    const failure: unknown = await payrollExtrasService
+      .payPayrollItem(
+        payrollPagedStub.SEDE_ID,
+        ITEM_ID,
+        { idempotency_key: OTHER_MARK, ...partial(80000) },
+        ACTOR,
+      )
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "OVERPAID", status: 422 });
+    expect(storedPayments()).toHaveLength(1);
+    expect(paymentInserts()).toHaveLength(1);
+  });
+
+  it("una marca faltante o mal formada se rechaza con CERO escrituras", async () => {
+    // Decisión explícita, igual que en la emisión: la marca es OBLIGATORIA. Un
+    // envío sin marca no se puede reconocer como repetición, así que aceptarlo
+    // es reabrir el defecto para ESE llamador —y la ruta REST es pública y es
+    // justo la que reintenta sobre redes—. El rechazo es ruidoso (VALIDATION).
+    const withoutMark: unknown = await payrollExtrasService
+      .payPayrollItem(payrollPagedStub.SEDE_ID, ITEM_ID, partial(30000), ACTOR)
+      .catch((error: unknown) => error);
+    const malformed: unknown = await payrollExtrasService
+      .payPayrollItem(
+        payrollPagedStub.SEDE_ID,
+        ITEM_ID,
+        { idempotency_key: "no-es-un-uuid", ...partial(30000) },
+        ACTOR,
+      )
+      .catch((error: unknown) => error);
+
+    expect(withoutMark).toBeInstanceOf(PayrollError);
+    expect(withoutMark).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(malformed).toBeInstanceOf(PayrollError);
+    expect(malformed).toMatchObject({ code: "VALIDATION", status: 400 });
+    // La validación corre ANTES de cualquier lectura de acumulado y de
+    // cualquier escritura.
+    expect(paymentInserts()).toHaveLength(0);
+    expect(storedPayments()).toHaveLength(0);
+  });
+
+  it("la migración 042 deja la marca con un índice único PARCIAL y no reescribe filas", () => {
+    const raw = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "042_payment_idempotency.sql"),
+      "utf8",
+    );
+    // La prosa explica lo que el archivo NO hace y nombra esas sentencias; las
+    // aserciones de abajo miran el SQL, sin los comentarios.
+    const sql = raw
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("--"))
+      .join("\n");
+    // La columna nace NULL: las filas históricas no tienen marca, sin backfill.
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS idempotency_key");
+    // Las dos puertas: nómina y cobro de factura.
+    expect(sql).toContain("ALTER TABLE public.payroll_payments");
+    expect(sql).toContain("ALTER TABLE public.invoice_payments");
+    // La barrera final: a lo sumo UNA operación por marca y registro.
+    expect(sql).toContain(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_payroll_payments_item_idempotency_key",
+    );
+    expect(sql).toContain("ON public.payroll_payments (payroll_item_id, idempotency_key)");
+    expect(sql).toContain(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_invoice_payments_invoice_idempotency_key",
+    );
+    expect(sql).toContain("ON public.invoice_payments (invoice_id, idempotency_key)");
+    // PARCIAL: las filas históricas (marca NULL) y las porciones hermanas de una
+    // misma operación quedan fuera del índice.
+    expect(sql.match(/WHERE idempotency_key IS NOT NULL/g)).toHaveLength(2);
+    // No borra ni reescribe filas: no hay backfill que inventar.
+    expect(sql).not.toMatch(/\bDELETE\s+FROM\b/i);
+    expect(sql).not.toMatch(/\bTRUNCATE\b/i);
+    expect(sql).not.toMatch(/UPDATE\s+public\./i);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
   });
 });

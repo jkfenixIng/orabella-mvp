@@ -81,6 +81,12 @@ export async function calculatePayrollAction(id: string, input: unknown) {
  *
  * Pagar un ítem es parte de liquidar la nómina: era la superficie por la que la
  * caja entraba al módulo (requirePayrollPayer). Esa guarda quedó para los vales.
+ *
+ * CL-2: el cuerpo debe traer `idempotency_key` (uuid que la pantalla acuña al
+ * empezar el intento y reutiliza en sus reintentos). Sin marca el servicio
+ * rechaza con VALIDATION: un envío sin marca no se puede reconocer como
+ * repetición, así que aceptarlo reabriría el defecto (pagar dos veces). Con la
+ * marca repetida el servicio devuelve el pago ya registrado, no otro.
  */
 export async function payPayrollItemAction(id: string, input: unknown) {
   try {
