@@ -1316,7 +1316,15 @@ describe("billing: T0-a (C2) tope de cobro en BD traducido a OVERPAID", () => {
     "utf8",
   );
 
-  it("los dos INSERT de invoice_payments traducen P0001 a OVERPAID", () => {
+  it("las dos puertas de invoice_payments traducen P0001 a OVERPAID (INSERT directo y RPC)", () => {
+    // CL-11: la puerta del COBRO ya no escribe con un `.insert` del cliente: su
+    // escritura ES la transacción de la 050 (`invoice_split_payment_atomic`), y
+    // por eso el conteo baja de 2 a 1. NO se afloja nada: se cambia DÓNDE se
+    // pincha, no QUÉ se exige —el rechazo del mismo tope de 031 (P0001) se sigue
+    // traduciendo a OVERPAID en las dos puertas, la emisión acá abajo y el cobro
+    // en su hogar nuevo—. La puerta del cobro además queda cubierta EN RUNTIME
+    // por `el tope de 031 sigue traduciéndose a OVERPAID cuando la marca NO es
+    // una repetición` (tests/billing.test.ts).
     const inserts = service
       .split('.from("invoice_payments")')
       .slice(1)
@@ -1325,11 +1333,20 @@ describe("billing: T0-a (C2) tope de cobro en BD traducido a OVERPAID", () => {
         return end === -1 ? chunk : chunk.slice(0, end);
       })
       .filter((chain) => chain.trimStart().startsWith(".insert("));
-    expect(inserts).toHaveLength(2); // emitir con pago / cobrar después
+    expect(inserts).toHaveLength(1); // emitir con pago: el cobro va por la 050
     for (const chain of inserts) {
       expect(chain).toContain('"P0001"');
       expect(chain).toContain('"OVERPAID"');
     }
+
+    // La SEGUNDA puerta, en su hogar nuevo: el cobro dividido escribe por la
+    // transacción de la 050 y traduce el MISMO P0001 del tope a OVERPAID.
+    const split = service.slice(service.indexOf("export async function splitPayment"));
+    expect(split).toContain('db.rpc("invoice_split_payment_atomic"');
+    expect(split).toContain('if (code === "23505" || code === "P0001") {');
+    expect(split).toContain(
+      'throw new BillingError("OVERPAID", "Las porciones superan el saldo pendiente.", 422);',
+    );
   });
 });
 

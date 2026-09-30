@@ -1219,6 +1219,49 @@ const overCollectionStub = vi.hoisted(() => ({
 }));
 
 /**
+ * CL-11: cola de locks por FILA. Modela el `SELECT … FOR UPDATE` de la
+ * transacción de la 050: el segundo llamador ESPERA a que el primero suelte la
+ * fila, en vez de leer su estado viejo y escribir por su lado. Es lo que hace
+ * observable la serialización (y lo que impide el intercalado que producía el
+ * estado parcial). Devuelve también si TUVO que esperar, para poder trazarlo.
+ */
+function createRowLocks(): (
+  key: string,
+  onContended: () => void,
+) => Promise<{ release: () => void; waited: boolean }> {
+  const held = new Map<string, Promise<void>>();
+  return async (key, onContended) => {
+    const previous = held.get(key);
+    if (previous) onContended();
+    let release: () => void = () => {};
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const queue = (previous ?? Promise.resolve()).then(() => current);
+    held.set(key, queue);
+    await previous;
+    return {
+      waited: previous !== undefined,
+      release: () => {
+        release();
+        if (held.get(key) === queue) held.delete(key);
+      },
+    };
+  };
+}
+
+/**
+ * CL-11: los locks por fila son de MÓDULO, no del doble.
+ *
+ * `createAdminClient()` devuelve una instancia nueva en cada llamada al servicio
+ * (`billingDb()`), así que un mapa por instancia no serializaría NADA: dos
+ * llamadas al mismo servicio tendrían cada una su cola. En la base el lock es
+ * uno solo —la fila—, y eso es lo que el doble tiene que modelar.
+ */
+const annulRowLocks = createRowLocks();
+const splitRowLocks = createRowLocks();
+
+/**
  * Datos paginables del candado de nómina (U5). Solo las tablas registradas acá
  * entran al camino FIEL a PostgREST del doble (`eq`/`in` de verdad, orden por
  * `order()`, ventana real de `range`/`limit`). Sin esto un doble que devuelve
@@ -1274,6 +1317,28 @@ const annulStub = vi.hoisted(() => ({
   releaseWrite: null as (() => void) | null,
   /** Aviso: hay una escritura detenida esperando a que el test la libere. */
   onWriteHeld: null as (() => void) | null,
+  /**
+   * CL-11: el N-ésimo movimiento de reversión NO se puede escribir (la
+   * conexión se corta, el trigger rechaza). Es el fallo que cae ENTRE las dos
+   * escrituras de la anulación y deja el estado parcial: sirve para medir la
+   * ventana hoy y para probar el rollback después. `null` = no se inyecta.
+   */
+  failMovementAt: null as number | null,
+  /**
+   * CL-11: traza del RPC `invoice_annul_atomic`, en orden. `wait` = el llamador
+   * encontró el lock de la fila tomado (en vez de leer el estado viejo) y
+   * `resume` = lo obtuvo; `commit` = la transacción escribió y confirmó. Es la
+   * prueba de que la segunda anulación ESPERA a la primera.
+   */
+  rpcEvents: [] as string[],
+  /** CL-11: transacciones de anulación que CONFIRMARON (escribieron filas). */
+  commits: 0,
+  /**
+   * CL-11: aviso de que una anulación quedó ESPERANDO el lock de la fila. El
+   * test lo espera para aseverar el intercalado sin depender de un tick: sin
+   * esto, la aserción podría correr antes de que la segunda llegue al RPC.
+   */
+  onLockWait: null as (() => void) | null,
 }));
 
 /**
@@ -1461,6 +1526,12 @@ function stubPayment(amount: number, feeAmount = 0) {
 function createOverCollectionStubClient(): unknown {
   const zeroRowsError = { code: "PGRST116", message: "JSON object requested, multiple (or no) rows returned", details: "The result contains 0 rows", hint: null };
 
+  /**
+   * CL-11: el error de escritura inyectado por `annulStub.failMovementAt`. Se
+   * consume UNA sola vez, en la escritura que lo armó.
+   */
+  let forcedWriteError: { code: string; message: string } | null = null;
+
   /** Contexto que la consulta encadenada le pasa a `response`. */
   interface QueryContext {
     /** Guarda de estado del UPDATE de anulación (U6). */
@@ -1514,6 +1585,13 @@ function createOverCollectionStubClient(): unknown {
   ): { data: unknown; error: unknown } => {
     if (op !== "select") {
       overCollectionStub.writes.push(`${table}.${op}`);
+      // CL-11: el fallo inyectado aborta ESTA escritura (y sólo el camino que
+      // la pidió): es el fallo que hoy cae entre las dos escrituras.
+      if (forcedWriteError) {
+        const injected = forcedWriteError;
+        forcedWriteError = null;
+        return { data: null, error: injected };
+      }
       if (table === "invoices" && op === "update") {
         // CO-1: camino de EDICIÓN (compare-and-swap sobre `edit_version`).
         if (editStub.active) {
@@ -1729,6 +1807,12 @@ function createOverCollectionStubClient(): unknown {
         if (table === "inventory_movements") {
           const movement = (payload ?? {}) as Record<string, unknown>;
           const log = editStub.active ? editStub.movements : annulStub.movements;
+          // CL-11: la N-ésima reversión no se escribe: el fallo cae a mitad del
+          // bucle de `registerMovement` (hoy) o dentro de la transacción (050).
+          if (!editStub.active && annulStub.failMovementAt === log.length + 1) {
+            forcedWriteError = { code: "08006", message: "connection closed" };
+            return query;
+          }
           log.push({
             id: `mov-${log.length + 1}`,
             created_at: "2026-01-01T00:00:00.000Z",
@@ -1794,7 +1878,88 @@ function createOverCollectionStubClient(): unknown {
     return query;
   };
 
-  return { from };
+  /**
+   * CL-11: `invoice_annul_atomic` (050). El doble modela la TRANSACCIÓN: toma el
+   * lock de la fila de la factura, RELEE la precondición sobre la fila bloqueada
+   * y aplica sus DOS grupos de escritura —la factura y las reversiones de
+   * stock— o ninguno. Escribe las MISMAS filas que el camino viejo (el payload
+   * de `overCollectionStub.invoiceUpdate` y las de `annulStub.movements`), así
+   * que las aserciones de "exactamente lo mismo" siguen significando lo mismo.
+   */
+  const rpc = async (name: string, args?: Record<string, unknown>) => {
+    if (name !== "invoice_annul_atomic") {
+      overCollectionStub.unexpectedQueries.push(`rpc.${name}`);
+      return { data: null, error: { message: `doble sin respuesta para rpc.${name}` } };
+    }
+    const invoiceId = String(args?.p_invoice_id ?? "");
+    const expected = String(args?.p_expected_status ?? "");
+    const release = await annulRowLocks(invoiceId, () => {
+      annulStub.rpcEvents.push("wait");
+      annulStub.onLockWait?.();
+    });
+    annulStub.rpcEvents.push(release.waited ? "resume" : "lock");
+    try {
+      // La precondición, releída de la fila BLOQUEADA (no del dato del llamador).
+      annulStub.guards.push(expected);
+      if (annulStub.updateMisses || annulStub.invoiceStatus !== expected) {
+        annulStub.rpcEvents.push("reject");
+        return { data: null, error: { code: "P0001", message: "ANNUL_CONFLICT" } };
+      }
+      const items = (args?.p_items ?? []) as Array<Record<string, unknown>>;
+      // El fallo inyectado: la transacción no puede terminar su segundo grupo
+      // (los movimientos), así que NO se aplica ninguno de los dos.
+      if (annulStub.failMovementAt !== null && annulStub.failMovementAt <= items.length) {
+        return { data: null, error: { code: "08006", message: "connection closed" } };
+      }
+      // Donde el test detiene la transacción: después del lock, antes de escribir.
+      if (annulStub.holdNextWrite) {
+        annulStub.holdNextWrite = false;
+        await new Promise<void>((resolve) => {
+          annulStub.releaseWrite = resolve;
+          annulStub.onWriteHeld?.();
+        });
+      }
+      // COMMIT: los dos grupos, o nada.
+      const motivo = String(args?.p_motivo ?? "");
+      overCollectionStub.invoiceUpdate = {
+        status: "Anulada",
+        cancel_reason: motivo,
+        closed_by: args?.p_user_id ?? null,
+        closed_at: args?.p_closed_at ?? null,
+      };
+      overCollectionStub.writes.push("invoices.update", "inventory_movements.insert");
+      annulStub.invoiceStatus = "Anulada";
+      for (const item of items) {
+        annulStub.movements.push({
+          id: `mov-${annulStub.movements.length + 1}`,
+          created_at: "2026-01-01T00:00:00.000Z",
+          sede_id: overCollectionStub.SEDE_ID,
+          product_id: item.product_id,
+          type: "IN",
+          qty: item.qty,
+          reason: item.reason,
+          user_id: args?.p_user_id ?? null,
+          idempotency_key: null,
+        });
+      }
+      annulStub.commits += 1;
+      annulStub.rpcEvents.push("commit");
+      return {
+        data: {
+          ...stubInvoiceRow(STUB_EMITTED_TOTAL),
+          status: "Anulada",
+          cancel_reason: motivo,
+          closed_by: args?.p_user_id ?? null,
+          closed_at: args?.p_closed_at ?? null,
+        },
+        error: null,
+      };
+    } finally {
+      release.release();
+    }
+  };
+
+  return { from, rpc };
 }
 
 /**
@@ -2066,6 +2231,19 @@ const payStub = vi.hoisted(() => ({
    * exacta. El intercalado se arma, no se inventa el desenlace.
    */
   stalePaymentsOnce: null as Array<Record<string, unknown>> | null,
+  /**
+   * CL-11: la escritura que CIERRA la factura (el paso a `Pagada`) no se puede
+   * aplicar una vez. Dentro de `invoice_split_payment_atomic` es un fallo a
+   * mitad de la transacción: las porciones ya escritas se revierten con ella.
+   */
+  failCloseOnce: false,
+  /** Payload del UPDATE de `invoices`: lo que el servicio realmente escribió. */
+  invoiceUpdate: null as Record<string, unknown> | null,
+  /**
+   * CL-11: traza del RPC `invoice_split_payment_atomic`, en orden (`lock`,
+   * `wait`, `resume`): prueba que el cobro serializa por la fila de la factura.
+   */
+  rpcEvents: [] as string[],
   /** Consultas que el doble no sabe responder: debe quedar SIEMPRE vacío. */
   unexpectedQueries: [] as string[],
 }));
@@ -2143,6 +2321,7 @@ function createSplitStubClient(): unknown {
         // El cobro que completa la factura la pasa a Pagada: el doble lo
         // escribe de verdad, para que la lectura siguiente lo vea.
         const written = (payload ?? {}) as Record<string, unknown>;
+        payStub.invoiceUpdate = written;
         const matched = matching();
         for (const row of matched) Object.assign(row, written);
         return { data: single ? matched[0] ?? null : matched, error: null };
@@ -2261,7 +2440,115 @@ function createSplitStubClient(): unknown {
     return query;
   };
 
-  return { from };
+  /**
+   * CL-11: `invoice_split_payment_atomic` (050). El doble modela la
+   * TRANSACCIÓN: toma el lock de la fila de la factura, relee su precondición
+   * (una factura Anulada no admite cobros), evalúa las DOS barreras reales del
+   * INSERT —el tope de 031 y el índice único parcial de la 042— y aplica sus dos
+   * grupos —las porciones y el cierre— o NINGUNO. Nada se escribe hasta el
+   * final: si algo falla, el doble no deja ni una fila, como la transacción.
+   * Cuenta UNA escritura pedida por llamada (no una por porción), que es lo que
+   * ya significaba `payInserts()`.
+   */
+  const rpc = async (name: string, args?: Record<string, unknown>) => {
+    if (name !== "invoice_split_payment_atomic") {
+      payStub.unexpectedQueries.push(`rpc.${name}`);
+      return { data: null, error: { message: `doble de cobro: rpc desconocido ${name}` } };
+    }
+    const invoiceId = String(args?.p_invoice_id ?? "");
+    const release = await splitRowLocks(invoiceId, () => {
+      payStub.rpcEvents.push("wait");
+    });
+    payStub.rpcEvents.push(release.waited ? "resume" : "lock");
+    try {
+      const invoice = payStub.invoices.find((row) => row.id === invoiceId);
+      if (!invoice) {
+        return { data: null, error: { code: "P0001", message: "INVOICE_NOT_FOUND" } };
+      }
+      if (invoice.status === "Anulada") {
+        return { data: null, error: { code: "P0001", message: "ANNUL_INVALID" } };
+      }
+      const values = (args?.p_portions ?? []) as Array<Record<string, unknown>>;
+      // La factura del cobro la identifica el PARÁMETRO de la operación (la URL),
+      // no cada porción: así lo escribe la función.
+      const withInvoice: Array<Record<string, unknown>> = values.map((row) => ({
+        invoice_id: invoiceId,
+        ...row,
+      }));
+      // El INSERT de las porciones: UNA sentencia (el contador cuenta la
+      // escritura PEDIDA, aunque choque, como contaba el `.insert` de antes).
+      payStub.inserts.invoice_payments = (payStub.inserts.invoice_payments ?? 0) + 1;
+      // 1) El tope de cobro (031) es un trigger BEFORE INSERT: corre ANTES de que
+      //    la fila entre al índice, y su suma solo ve lo YA confirmado (las
+      //    filas hermanas del mismo INSERT comparten el snapshot).
+      for (const row of withInvoice) {
+        const paidNet = payStub.payments
+          .filter((candidate) => candidate.invoice_id === row.invoice_id)
+          .reduce(
+            (acc, candidate) => acc + (Number(candidate.amount) - Number(candidate.fee_amount ?? 0)),
+            0,
+          );
+        const newNet = Number(row.amount) - Number(row.fee_amount ?? 0);
+        const cap = Math.round(Number(invoice.total) - Number(invoice.surcharge ?? 0));
+        if (paidNet + newNet - cap > 0.009) {
+          return {
+            data: null,
+            error: { code: "P0001", message: "El cobro supera el neto facturado de la factura" },
+          };
+        }
+      }
+      // 2) El índice único PARCIAL (042): la marca no nula choca contra lo
+      //    confirmado Y contra las filas anteriores del MISMO INSERT, y aborta la
+      //    sentencia entera (no se persiste ninguna fila).
+      const clashes = withInvoice.some((row, index) => {
+        const mark = row.idempotency_key;
+        if (mark === null || mark === undefined) return false;
+        const keyed = (other: Record<string, unknown>) =>
+          other.invoice_id === row.invoice_id && other.idempotency_key === mark;
+        return [
+          ...payStub.payments.filter((other) => other.invoice_id === row.invoice_id),
+          ...withInvoice.slice(0, index),
+        ].some(keyed);
+      });
+      if (clashes) {
+        return {
+          data: null,
+          error: {
+            code: "23505",
+            message:
+              'duplicate key value violates unique constraint "uq_invoice_payments_invoice_idempotency_key"',
+          },
+        };
+      }
+      // 3) La escritura que CIERRA la factura, dentro de la MISMA transacción:
+      //    si falla, las porciones de arriba se revierten con ella.
+      if (args?.p_mark_paid === true && payStub.failCloseOnce) {
+        payStub.failCloseOnce = false;
+        return { data: null, error: { code: "P0001", message: "PAYMENT_MISMATCH" } };
+      }
+      // COMMIT: los dos grupos, o nada.
+      const persisted = withInvoice.map((row, index) => ({
+        id: `pago-${payStub.payments.length + index + 1}`,
+        created_at: "2026-01-01T00:00:00.000Z",
+        ...row,
+      }));
+      payStub.payments.push(...persisted);
+      if (args?.p_mark_paid === true) {
+        const closed = {
+          status: "Pagada",
+          closed_by: args?.p_user_id ?? null,
+          closed_at: args?.p_closed_at ?? null,
+        };
+        payStub.invoiceUpdate = closed;
+        Object.assign(invoice, closed);
+      }
+      return { data: { invoice: { ...invoice }, portions: persisted.length }, error: null };
+    } finally {
+      release.release();
+    }
+  };
+
+  return { from, rpc };
 }
 
 vi.mock("@/src/shared/lib/supabase/server", () => ({
@@ -2602,7 +2889,7 @@ describe("billing: el candado de nómina cerrada no se trunca (U5)", () => {
  * Línea de PRODUCTO de la factura: es el origen del IN de reversión, así que es
  * la que hace observable cuántas veces se restauró stock.
  */
-function annulProductItemRow() {
+function annulProductItemRow(overrides: Record<string, unknown> = {}) {
   return {
     id: overCollectionStub.ITEM_ID,
     invoice_id: overCollectionStub.INVOICE_ID,
@@ -2627,6 +2914,7 @@ function annulProductItemRow() {
       pay_type: "fijo",
       payout_mode: "normal",
     },
+    ...overrides,
   };
 }
 
@@ -2663,6 +2951,7 @@ describe("billing: la anulación respeta el candado de nómina y guarda el estad
     annulStub.holdNextWrite = false;
     annulStub.releaseWrite = null;
     annulStub.onWriteHeld = null;
+    annulStub.onLockWait = null;
     annulStub.invoiceStatus = "Emitida";
     annulStub.items = null;
     annulStub.product = null;
@@ -2670,6 +2959,9 @@ describe("billing: la anulación respeta el candado de nómina y guarda el estad
     annulStub.guards.length = 0;
     annulStub.updateMisses = false;
     annulStub.events.length = 0;
+    annulStub.rpcEvents.length = 0;
+    annulStub.commits = 0;
+    annulStub.failMovementAt = null;
     overCollectionStub.payments = [];
     overCollectionStub.invoiceUpdate = null;
     overCollectionStub.auditInsert = null;
@@ -2687,12 +2979,16 @@ describe("billing: la anulación respeta el candado de nómina y guarda el estad
     annulStub.releaseWrite?.();
     annulStub.releaseWrite = null;
     annulStub.onWriteHeld = null;
+    annulStub.onLockWait = null;
     annulStub.items = null;
     annulStub.product = null;
     annulStub.movements.length = 0;
     annulStub.guards.length = 0;
     annulStub.updateMisses = false;
     annulStub.events.length = 0;
+    annulStub.rpcEvents.length = 0;
+    annulStub.commits = 0;
+    annulStub.failMovementAt = null;
     pagedStub.tables = {};
     pagedStub.failAt = {};
     pagedStub.requests = {};
@@ -2749,50 +3045,61 @@ describe("billing: la anulación respeta el candado de nómina y guarda el estad
     expect(annulStub.movements).toEqual([]);
   });
 
-  it("dos anulaciones concurrentes restauran el stock UNA sola vez (U6-b)", async () => {
+  it("dos anulaciones concurrentes restauran el stock UNA sola vez (U6-b, CL-11)", async () => {
     annulStub.items = [annulProductItemRow()];
     annulStub.product = annulProductRow();
 
-    // Las DOS anulaciones entran con la misma lectura vieja (`Emitida`) y sus
-    // dos escrituras quedan en vuelo. El doble detiene la de la primera y la
-    // aplica después de la de la segunda: es el orden real de la carrera (la
-    // que aplica segunda es la que pierde), con el intercalado bajo control.
+    // CL-11: la anulación entera es UNA transacción, así que el doble detiene la
+    // transacción de la primera DESPUÉS de tomar el lock de la fila y ANTES de
+    // escribir: la segunda queda esperando ese lock, que es exactamente lo que
+    // hace `FOR UPDATE` en la base. El intercalado sigue bajo control (la que
+    // aplica segunda es la que pierde), pero ya no es "las dos leen y después
+    // las dos escriben": ése era el intercalado que producía el doble stock.
     annulStub.holdNextWrite = true;
     const writeHeld = new Promise<void>((resolve) => {
       annulStub.onWriteHeld = resolve;
     });
     const first = annul();
     await writeHeld;
-    // Non-vacuidad: la primera ya leyó `Emitida` y todavía no escribió nada.
-    expect(annulStub.events).toEqual(["read"]);
+    // Non-vacuidad: la primera ya tiene el lock de la fila y no escribió nada.
+    expect(annulStub.rpcEvents).toEqual(["lock"]);
 
+    const lockWait = new Promise<void>((resolve) => {
+      annulStub.onLockWait = resolve;
+    });
     const second = annul();
-    const secondResult = await second.then(
-      () => "anulado" as const,
-      (error: unknown) => error,
-    );
-    // La segunda aplica ESCRITURA y termina su reversión con la fila ya Anulada.
-    expect(secondResult).toBe("anulado");
+    // La segunda ESPERA el lock: no lee el estado viejo ni escribe por su lado.
+    await lockWait;
+    expect(annulStub.rpcEvents).toEqual(["lock", "wait"]);
+    // Las DOS lecturas de estado que quedaron registradas son la MISMA foto
+    // (`Emitida`): la carrera existió de verdad y lo que la resuelve es la
+    // transacción, no una relectura oportuna.
+    expect(annulStub.events).toEqual(["read", "read"]);
 
     if (annulStub.releaseWrite) annulStub.releaseWrite();
     const firstResult = await first.then(
       () => "anulado" as const,
       (error: unknown) => error,
     );
+    const secondResult = await second.then(
+      () => "anulado" as const,
+      (error: unknown) => error,
+    );
 
-    // La carrera existió de verdad: las DOS leyeron antes de la primera
-    // escritura (si el intercalado cambiara, esto falla a la vista en vez de
-    // dejar pasar la prueba por un camino que ya no es el de la carrera).
-    expect(annulStub.events).toEqual(["read", "read", "write", "write"]);
+    // La que tomó el lock gana; la que esperaba pierde y se rechaza.
+    expect(firstResult).toBe("anulado");
+    expect(secondResult).toBeInstanceOf(BillingError);
+    expect(secondResult).toMatchObject({ code: "ANNUL_CONFLICT", status: 409 });
     // El síntoma: el stock se devuelve UNA vez, no dos.
     expect(annulStub.movements).toHaveLength(1);
     expect(annulStub.movements[0]).toMatchObject({ product_id: PRODUCT_ID, type: "IN", qty: 2 });
-    // La que aplicó segunda afecta 0 filas y se rechaza con su código.
-    expect(firstResult).toBeInstanceOf(BillingError);
-    expect(firstResult).toMatchObject({ code: "ANNUL_CONFLICT", status: 409 });
-    // El UPDATE lleva el estado leído como precondición: compare-and-swap.
+    // Una sola transacción escribió (la perdedora no dejó ni una fila),
+    expect(annulStub.commits).toBe(1);
+    // la precondición se revalidó ADENTRO sobre la fila bloqueada —las dos la
+    // llevaron, la segunda la encontró falsa—,
     expect(annulStub.guards).toEqual(["Emitida", "Emitida"]);
-    // Una sola anulación: una sola auditoría.
+    expect(annulStub.rpcEvents).toEqual(["lock", "wait", "commit", "resume", "reject"]);
+    // y una sola anulación deja una sola auditoría.
     expect(overCollectionStub.writes.filter((write) => write === "audit_logs.insert")).toHaveLength(1);
   });
 
@@ -2826,6 +3133,169 @@ describe("billing: la anulación respeta el candado de nómina y guarda el estad
     expect(outcome).toMatchObject({ code: "ANNUL_INVALID", status: 409 });
     expect(overCollectionStub.writes).toEqual([]);
     expect(annulStub.guards).toEqual([]);
+  });
+});
+
+// ---------- CL-11: la anulación entera, en UNA transacción ----------
+//
+// `annulInvoice` escribía DOS veces: la factura a `Anulada` (con su
+// compare-and-swap) y DESPUÉS las N reversiones de stock, un `registerMovement`
+// por línea de producto. Son dos requests distintos contra PostgREST, que no
+// ofrece multi-statement por request: un fallo entre los dos dejaba la factura
+// Anulada con el stock devuelto A MEDIAS, y como el compare-and-swap sólo pisa
+// una factura en el estado leído, el reintento ya no encontraba una factura
+// anulable: un callejón sin salida sin compensación.
+//
+// El doble modela la transacción de la 050: el RPC toma el lock de la fila
+// (`wait` cuando ya está tomado, en vez de leer el estado viejo), revalida la
+// precondición y aplica sus DOS grupos de escritura —o ninguno—.
+describe("billing: la anulación es UNA transacción (CL-11)", () => {
+  const ACTOR: BillingActor = {
+    userId: "u-1",
+    sedeId: overCollectionStub.SEDE_ID,
+    roles: ["admin"],
+  };
+
+  function annul(motivo = "Cobro duplicado") {
+    return annulInvoice(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID, { motivo }, ACTOR);
+  }
+
+  /** Segunda línea de PRODUCTO: dos reversiones = el bucle de ayer. */
+  function secondProductLine() {
+    return annulProductItemRow({ id: "99999999-9999-4999-8999-999999999998", qty: 3 });
+  }
+
+  beforeEach(() => {
+    annulStub.active = true;
+    annulStub.holdNextWrite = false;
+    annulStub.releaseWrite = null;
+    annulStub.onWriteHeld = null;
+    annulStub.onLockWait = null;
+    annulStub.invoiceStatus = "Emitida";
+    annulStub.items = null;
+    annulStub.product = null;
+    annulStub.movements.length = 0;
+    annulStub.guards.length = 0;
+    annulStub.updateMisses = false;
+    annulStub.events.length = 0;
+    annulStub.failMovementAt = null;
+    annulStub.rpcEvents.length = 0;
+    annulStub.commits = 0;
+    overCollectionStub.payments = [];
+    overCollectionStub.invoiceUpdate = null;
+    overCollectionStub.auditInsert = null;
+    overCollectionStub.writes.length = 0;
+    overCollectionStub.unexpectedQueries.length = 0;
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+  });
+
+  afterEach(() => {
+    annulStub.active = false;
+    annulStub.holdNextWrite = false;
+    annulStub.releaseWrite?.();
+    annulStub.releaseWrite = null;
+    annulStub.onWriteHeld = null;
+    annulStub.onLockWait = null;
+    annulStub.items = null;
+    annulStub.product = null;
+    annulStub.movements.length = 0;
+    annulStub.guards.length = 0;
+    annulStub.updateMisses = false;
+    annulStub.events.length = 0;
+    annulStub.failMovementAt = null;
+    annulStub.rpcEvents.length = 0;
+    annulStub.commits = 0;
+    pagedStub.tables = {};
+    pagedStub.failAt = {};
+    pagedStub.requests = {};
+    pagedStub.windows.length = 0;
+  });
+
+  it("un fallo entre las dos escrituras no deja NADA escrito, y el reintento COMPLETA la anulación", async () => {
+    annulStub.items = [annulProductItemRow(), secondProductLine()];
+    annulStub.product = annulProductRow();
+    // La SEGUNDA reversión no se puede escribir: el fallo cae entre las dos
+    // escrituras de la anulación.
+    annulStub.failMovementAt = 2;
+
+    const failure: unknown = await annul().catch((error: unknown) => error);
+
+    // MEDIDO ANTES DEL ARREGLO (verbatim, con el código previo a la 050): la
+    // factura quedaba `Anulada`, el stock a medias (una de dos líneas) y el
+    // reintento moría con `ANNUL_INVALID` —callejón sin salida—.
+    // Ahora la anulación es UNA transacción: o se escriben las dos cosas, o
+    // ninguna.
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(annulStub.invoiceStatus).toBe("Emitida");
+    expect(annulStub.movements).toEqual([]);
+    expect(annulStub.commits).toBe(0);
+
+    // El reintento del MISMO intento COMPLETA la operación entera: no hay
+    // estado a medias que lo bloquee.
+    annulStub.failMovementAt = null;
+    const detail = await annul();
+
+    expect(detail.invoice.status).toBe("Anulada");
+    expect(annulStub.movements.map((row) => row.qty)).toEqual([2, 3]);
+    expect(annulStub.commits).toBe(1);
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("el camino de éxito escribe EXACTAMENTE las filas de siempre (una IN por línea, con su motivo)", async () => {
+    annulStub.items = [annulProductItemRow()];
+    annulStub.product = annulProductRow();
+
+    const detail = await annul("Cobro duplicado");
+
+    expect(detail.invoice.status).toBe("Anulada");
+    // La fila de la factura: los MISMOS cuatro campos, con los MISMOS valores.
+    expect(overCollectionStub.invoiceUpdate).toEqual({
+      status: "Anulada",
+      cancel_reason: "Cobro duplicado",
+      closed_by: "u-1",
+      closed_at: expect.any(String),
+    });
+    // El movimiento: la MISMA fila que escribía `registerMovement`, sin marca de
+    // intento (la anulación no tiene intento de cliente: la cubre el CAS).
+    // DATO DE ENTRADA → FILA ESCRITA: el motivo lo arma `buildReversalReasons`
+    // (TypeScript) y viaja como dato; la función no lo construye ni lo traduce.
+    const expected = buildReversalReasons({
+      consecutiveNumber: 7,
+      motivo: "Cobro duplicado",
+      productItems: [{ product_id: PRODUCT_ID, qty: 2 }],
+    });
+    expect(
+      annulStub.movements.map((row) => ({
+        product_id: row.product_id,
+        qty: row.qty,
+        reason: row.reason,
+      })),
+    ).toEqual(expected);
+    expect(annulStub.movements[0]).toMatchObject({
+      sede_id: overCollectionStub.SEDE_ID,
+      type: "IN",
+      user_id: "u-1",
+      idempotency_key: null,
+    });
+    expect(annulStub.commits).toBe(1);
+  });
+
+  it("control negativo: una factura sin líneas de producto se anula con CERO movimientos (el arreglo vacío es legal)", async () => {
+    // A diferencia de la deducción de la emisión (046, que rechaza el arreglo
+    // vacío porque una venta sin productos no descuenta nada), la reversión de
+    // una factura de servicios es VACÍA y la anulación tiene que pasar: la
+    // transacción escribe la factura y no escribe ningún movimiento.
+    annulStub.items = [];
+
+    const detail = await annul();
+
+    expect(detail.invoice.status).toBe("Anulada");
+    expect(annulStub.movements).toEqual([]);
+    expect(annulStub.commits).toBe(1);
+    expect(overCollectionStub.unexpectedQueries).toEqual([]);
   });
 });
 
@@ -3953,6 +4423,9 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     payStub.inserts = {};
     payStub.skipMarkLookupOnce = false;
     payStub.stalePaymentsOnce = null;
+    payStub.failCloseOnce = false;
+    payStub.invoiceUpdate = null;
+    payStub.rpcEvents.length = 0;
     payStub.unexpectedQueries = [];
     payStub.active = true;
     seedInvoice(payStub.INVOICE_ID, 7);
@@ -4098,6 +4571,29 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     expect(payInserts()).toBe(0);
   });
 
+  it("el tope de 031 sigue traduciéndose a OVERPAID cuando la marca NO es una repetición", async () => {
+    // El primer cobro cierra la factura...
+    await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    // ...y un SEGUNDO intento distinto entra con una lectura VIEJA del saldo (el
+    // doble le sirve la foto previa una sola vez), con lo que pasa la
+    // comprobación exacta y llega a escribir: ahí lo rechaza el tope de 031
+    // (P0001) y, como su marca no está registrada, NO es una repetición.
+    payStub.stalePaymentsOnce = [];
+
+    const failure: unknown = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      closeInvoice(payStub.INVOICE_ID, TOTAL, OTHER_MARK),
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "OVERPAID", status: 422 });
+    // El cobro rechazado no dejó NADA: ni su porción ni un cambio de estado.
+    expect(payStub.payments).toHaveLength(1);
+    expect(payInserts()).toBe(2);
+  });
+
   it("una marca faltante o mal formada se rechaza con CERO escrituras", async () => {
     // Decisión explícita, igual que en la emisión: la marca es OBLIGATORIA. Un
     // envío sin marca no se puede reconocer como repetición, y la ruta REST es
@@ -4139,5 +4635,388 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
         portions: [{ method_code: "efectivo", amount: TOTAL }],
       }).success,
     ).toBe(true);
+  });
+
+  // ---- CL-11: el cobro y el cierre de la factura, en UNA transacción ---
+  //
+  // `splitPayment` escribía DOS veces: las N porciones (el dinero que entra) y
+  // DESPUÉS el paso a `Pagada`. Un fallo entre los dos dejaba las porciones
+  // escritas con la factura todavía Emitida: el dinero cobrado, el saldo en cero
+  // —así que ningún cobro posterior podía completarlo— y la factura que nunca se
+  // cerraba.
+
+  it("un fallo en la transacción no deja NADA escrito, y el reintento COMPLETA el cobro", async () => {
+    // El paso a `Pagada` (la SEGUNDA escritura) no se puede aplicar. Antes de la
+    // 050 eso dejaba las porciones ya escritas; ahora la transacción entera se
+    // revierte.
+    payStub.failCloseOnce = true;
+
+    const failure: unknown = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      closeInvoice(payStub.INVOICE_ID),
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    // MEDIDO ANTES DEL ARREGLO (verbatim, con el código previo a la 050): la
+    // porción quedaba escrita (el dinero cobrado), la factura seguía Emitida con
+    // el saldo cobrable en CERO, el reintento era un no-op que la devolvía
+    // abierta y ningún cobro posterior podía cerrarla (OVERPAID). La factura
+    // nunca se cerraba.
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(payStub.payments).toEqual([]);
+    const invoice = () => payStub.invoices.find((row) => row.id === payStub.INVOICE_ID) as Record<string, unknown>;
+    expect(invoice().status).toBe("Emitida");
+    // No vacuidad: el intento SÍ llegó a pedir la escritura de las porciones
+    // (la transacción las revirtió, no es que nunca se hayan pedido).
+    expect(payInserts()).toBe(1);
+
+    // El reintento del MISMO intento COMPLETA el cobro entero.
+    const retry = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      closeInvoice(payStub.INVOICE_ID),
+      ACTOR,
+    );
+
+    expect(retry.invoice.status).toBe("Pagada");
+    expect(payStub.payments).toHaveLength(1);
+    expect(payStub.payments[0].idempotency_key).toBe(MARK);
+    expect(invoice().status).toBe("Pagada");
+  });
+
+  it("el camino de éxito escribe EXACTAMENTE las porciones que computa el servicio", async () => {
+    const portions = [
+      { method_code: "efectivo", amount: 60000 },
+      { method_code: "transferencia", amount: 40000 },
+    ];
+
+    const result = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      { idempotency_key: MARK, portions },
+      ACTOR,
+    );
+
+    // DATO DE ENTRADA → FILA ESCRITA: el reparto por método (neto, recargo,
+    // bruto) lo computa `computeCardFees` en TypeScript y la función lo escribe
+    // verbatim. Se recalcula acá con la MISMA función de producción.
+    const expected = computeCardFees(portions, () => 0);
+    expect(
+      payStub.payments.map((row) => ({
+        method_code: row.method_code,
+        amount: row.amount,
+        fee_percent: row.fee_percent,
+        fee_amount: row.fee_amount,
+      })),
+    ).toEqual(
+      expected.map((fee) => ({
+        method_code: fee.method_code,
+        amount: fee.gross,
+        fee_percent: fee.feePercent,
+        fee_amount: fee.fee,
+      })),
+    );
+    // Y el cierre de la factura: los MISMOS tres campos de siempre.
+    expect(result.invoice.status).toBe("Pagada");
+    expect(payStub.invoiceUpdate).toEqual({
+      status: "Pagada",
+      closed_by: "u-1",
+      closed_at: expect.any(String),
+    });
+    expect(payStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("una factura anulada se rechaza con CERO escrituras (la precondición también se revalida adentro)", async () => {
+    const invoice = payStub.invoices.find((row) => row.id === payStub.INVOICE_ID) as Record<string, unknown>;
+    invoice.status = "Anulada";
+
+    const failure: unknown = await splitPayment(
+      payStub.SEDE_ID,
+      payStub.INVOICE_ID,
+      closeInvoice(payStub.INVOICE_ID),
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "ANNUL_INVALID", status: 409 });
+    expect(payStub.payments).toEqual([]);
+    expect(payInserts()).toBe(0);
+    expect(invoice.status).toBe("Anulada");
+  });
+});
+
+// ---------------- CL-11: el diff del servicio vive en la persistencia ---
+//
+// Tercera de las tres comprobaciones de "no se movió aritmética de dinero a
+// SQL": el diff del servicio toca SÓLO el bloque de escritura. Las dos
+// operaciones cambian su forma de persistir —dos requests sueltos pasan a ser
+// una transacción— y nada más: el estado anulable, el candado de nómina, el
+// texto de la reversión, el reparto por método, el saldo, la igualdad exacta y
+// la decisión `Pagada` siguen siendo líneas de TypeScript.
+
+describe("billing: CL-11 el diff del servicio vive en el bloque de persistencia", () => {
+  const service = readFileSync(
+    join(process.cwd(), "src", "features", "billing", "service.ts"),
+    "utf8",
+  );
+
+  /** Cuerpo del `export async function <name>` (hasta la siguiente exportada). */
+  function bodyOf(name: string): string {
+    const start = service.indexOf(`export async function ${name}`);
+    expect(start, `existe ${name}`).toBeGreaterThan(-1);
+    const end = service.indexOf("export async function", start + 10);
+    return service.slice(start, end === -1 ? service.length : end);
+  }
+
+  it("las DOS operaciones escriben por RPC y ninguna abre una escritura suelta", () => {
+    const cases = [
+      { name: "annulInvoice", rpc: "invoice_annul_atomic" },
+      { name: "splitPayment", rpc: "invoice_split_payment_atomic" },
+    ] as const;
+
+    for (const item of cases) {
+      const body = bodyOf(item.name);
+      // UNA transacción por operación: ni dos `rpc` por un descuido, ni uno de
+      // menos.
+      expect(body.match(/db\.rpc\(/g) ?? [], item.name).toHaveLength(1);
+      expect(body, item.name).toContain(`db.rpc("${item.rpc}"`);
+      // La factura ya no se escribe desde el cliente en ninguna de las dos.
+      expect(body, item.name).not.toContain('.from("invoices")');
+    }
+    // La anulación ya no escribe sus reversiones con `registerMovement` (045 la
+    // listaba entre sus llamadores de facturación) ni toca la tabla del kardex.
+    const annul = bodyOf("annulInvoice");
+    expect(annul).not.toContain("registerMovement(");
+    expect(annul).not.toContain("inventory_movements");
+    // El cobro ya no inserta sus porciones desde el cliente.
+    const split = bodyOf("splitPayment");
+    expect(split).not.toContain('.from("invoice_payments")');
+    expect(split).not.toContain(".insert(");
+  });
+
+  it("la aritmética y las decisiones de plata se quedan en TypeScript: viajan como DATO", () => {
+    // La anulación: qué se revierte y con qué motivo.
+    const annul = bodyOf("annulInvoice");
+    expect(annul).toContain("canAnnulStatus(");
+    expect(annul).toContain("invoiceInClosedPayroll(");
+    expect(annul).toContain("buildReversalReasons(");
+    expect(annul).toContain("p_items: reversals.map(");
+    // El cobro: el reparto por método, el saldo, la igualdad exacta y la
+    // decisión de cerrar la factura — exactamente las líneas que ya estaban.
+    const split = bodyOf("splitPayment");
+    expect(split).toContain("computeCardFees(");
+    expect(split).toContain("invoiceNetBalance({");
+    expect(split).toContain("moneyEquals(");
+    expect(split).toContain("balance.netCollected + netSum - balance.netBilled");
+    expect(split).toContain(
+      'const closesInvoice = fullyPaid && detail.invoice.status === "Emitida"',
+    );
+    expect(split).toContain("p_mark_paid: closesInvoice,");
+    expect(split).toContain("p_portions: fees.map(");
+    // Y la marca de la 042 se sigue buscando ANTES de la escritura: una
+    // repetición no llega a la transacción.
+    expect(split.indexOf("findInvoicePaymentsByIdempotencyKey(")).toBeLessThan(
+      split.indexOf('db.rpc("invoice_split_payment_atomic"'),
+    );
+  });
+
+  it("las funciones escriben las MISMAS columnas que el servicio leía con INVOICE_SELECT", () => {
+    // La lista no es una transcripción a mano: es la del `select(...)` con el
+    // que el servicio leía esa fila, y es la que el `jsonb_build_object` de la
+    // 050 devuelve (ver el bloque de la migración).
+    const match = /const INVOICE_SELECT =\s*\n?\s*"([^"]+)"/.exec(service);
+    expect(match, "INVOICE_SELECT").not.toBeNull();
+    const columns = (match as RegExpExecArray)[1].split(",").map((column) => column.trim());
+    expect(columns).toEqual([
+      "id",
+      "sede_id",
+      "consecutive_number",
+      "client_name",
+      "client_document",
+      "subtotal",
+      "discount",
+      "tax",
+      "surcharge",
+      "total",
+      "status",
+      "user_id",
+      "cash_shift_id",
+      "closed_by",
+      "closed_at",
+      "cancel_reason",
+      "created_at",
+      "edit_version",
+    ]);
+    const sql = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "050_billing_state_atomic.sql"),
+      "utf8",
+    );
+    for (const column of columns) expect(sql, column).toContain(`'${column}'`);
+  });
+});
+
+// ---------------- CL-11: la migración 050 ----------------
+
+describe("migración 050_billing_state_atomic.sql (CL-11)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "050_billing_state_atomic.sql"),
+    "utf8",
+  );
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("piso anti-vacío: el archivo existe y trae DDL real", () => {
+    expect(raw.length).toBeGreaterThan(15000);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("las DOS operaciones viven cada una en UNA función: una sentencia, una transacción", () => {
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.invoice_annul_atomic");
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.invoice_split_payment_atomic");
+    // Los grupos de escritura de cada operación, en la misma función.
+    expect(sql).toMatch(/UPDATE public\.invoices/);
+    expect(sql).toMatch(/INSERT INTO public\.inventory_movements/);
+    expect(sql).toMatch(/INSERT INTO public\.invoice_payments/);
+    // Las reversiones y las porciones llegan como ARREGLO (nunca una fila por
+    // request).
+    expect(sql).toMatch(/jsonb_array_elements\(p_items\)/);
+    expect(sql).toMatch(/jsonb_array_elements\(p_portions\)/);
+    // El lock de la fila de la factura (el punto de serialización del dinero).
+    expect(sql).toMatch(/FOR UPDATE/);
+    // Orden determinista de los locks de stock (el orden del trigger de 004).
+    expect(sql).toMatch(/ORDER BY p\.id/);
+    // Las porciones NO llevan orden: se conserva el del llamador (la fila de
+    // identidad de la 042 es la primera).
+    expect(sql).toMatch(/FROM jsonb_array_elements\(p_portions\) AS item;/);
+  });
+
+  it("conserva las precondiciones de estado que el servicio ya tenía", () => {
+    // El compare-and-swap de la anulación, adentro de la transacción.
+    expect(sql).toMatch(/v_factura\.status <> p_expected_status/);
+    expect(sql).toMatch(/i\.status = p_expected_status/);
+    expect(sql).toContain("ANNUL_CONFLICT");
+    // La factura anulada no admite cobros.
+    expect(sql).toMatch(/v_factura\.status = 'Anulada'/);
+    expect(sql).toContain("ANNUL_INVALID");
+    // La marca de la 042: a lo sumo UNA porción marcada (la premisa del índice).
+    expect(sql).toMatch(/v_marcadas > 1/);
+  });
+
+  it("tiene una red de conteo por grupo de escritura, con rollback", () => {
+    // Cuatro: el CAS de la factura y las reversiones en la anulación; las
+    // porciones y el cierre en el cobro.
+    expect(sql.match(/GET DIAGNOSTICS/g) ?? []).toHaveLength(4);
+    expect(sql).toContain("RAISE EXCEPTION");
+    expect(sql).toContain("ANNUL_CONFLICT");
+    expect(sql).toContain("PRODUCT_NOT_FOUND");
+    expect(sql).toContain("PAYMENT_MISMATCH");
+    // La guarda de forma no puede caer en un NULL silencioso: el `coalesce` es
+    // lo que hace que una clave AUSENTE falle en vez de comparar contra NULL
+    // (la misma trampa que 046–049 documentan).
+    expect(sql).toMatch(/coalesce\(/);
+  });
+
+  it("NO mueve aritmética de dinero a SQL: ningún monto se recalcula", () => {
+    // Las tablas ya validan sus montos con los CHECK de 005/019 (validar no es
+    // calcular): esta migración no agrega una sola expresión aritmética sobre
+    // las columnas de dinero. Escribir = convertir la representación
+    // (jsonb → la columna), no operar. Los textos de los `COMMENT ON …` se
+    // excluyen: son PROSA que viaja como string, no sentencias.
+    const ddl = sql.replace(/COMMENT ON FUNCTION[\s\S]*?';\n/g, "");
+    for (const column of [
+      "amount",
+      "fee_amount",
+      "fee_percent",
+      "qty",
+      "subtotal",
+      "discount",
+      "tax",
+      "surcharge",
+      "total",
+    ]) {
+      expect(ddl, column).not.toMatch(new RegExp(`${column}\\s*[+\\-*/]`));
+    }
+    expect(ddl).not.toContain("CHECK");
+    expect(ddl).not.toMatch(/sum\s*\(/i);
+    expect(ddl).not.toMatch(/round\s*\(/i);
+    // El stock lo sigue aplicando EXCLUSIVAMENTE el trigger de 004: acá no se
+    // escribe una sola columna de stock ni se redefinen sus funciones.
+    expect(ddl).not.toContain("stock_qty");
+    expect(ddl).not.toContain("inventory_apply_stock");
+    expect(ddl).not.toContain("inventory_no_negative_stock");
+    expect(sql).not.toContain("DROP TRIGGER");
+  });
+
+  it("escribe la marca en NULL en las reversiones: quedan FUERA del índice de la 045", () => {
+    const insertBlock = sql.slice(
+      sql.indexOf("INSERT INTO public.inventory_movements"),
+      sql.indexOf("PRODUCT_NOT_FOUND"),
+    );
+    expect(insertBlock).toContain("idempotency_key");
+    expect(insertBlock).toMatch(/idempotency_key\)[\s\S]*\bNULL\b/);
+  });
+
+  it("devuelve EXACTAMENTE lo que el servicio leía (mismo shape)", () => {
+    // Tres devoluciones: la factura de la anulación, y la factura + el conteo de
+    // porciones del cobro. Cada una lista sus columnas, sin `to_jsonb` de la
+    // fila entera (que agregaría `updated_at`, que el servicio nunca leyó).
+    expect(sql.match(/jsonb_build_object\(/g) ?? []).toHaveLength(3);
+    expect(sql).toMatch(/'portions', v_escritos/);
+  });
+
+  it("cierra el permiso: sólo service_role puede ejecutarlas", () => {
+    for (const signature of [
+      "public.invoice_annul_atomic(uuid, uuid, uuid, timestamptz, text, text, jsonb)",
+      "public.invoice_split_payment_atomic(uuid, uuid, uuid, timestamptz, boolean, jsonb)",
+    ]) {
+      expect(sql).toContain(`REVOKE ALL ON FUNCTION ${signature}`);
+      expect(sql).toContain(`GRANT EXECUTE ON FUNCTION ${signature}`);
+    }
+    expect(sql).toContain("FROM PUBLIC");
+    expect(sql).toContain("FROM anon");
+    expect(sql).toContain("FROM authenticated");
+    expect(sql).toContain("TO service_role");
+    expect(sql).toContain("SECURITY INVOKER");
+    expect(sql).toContain("SET search_path = public");
+  });
+
+  it("no borra ni reescribe datos: sólo las funciones y sus permisos", () => {
+    expect(sql.match(/CREATE OR REPLACE FUNCTION/g) ?? []).toHaveLength(2);
+    expect(sql.match(/^ALTER FUNCTION/gm) ?? []).toHaveLength(2);
+    expect(sql.match(/^COMMENT ON FUNCTION/gm) ?? []).toHaveLength(2);
+    // Ningún borrado, y dos UPDATE EJECUTABLES: los mismos que el servicio ya
+    // hacía (la anulación y el paso a Pagada).
+    expect(sql).not.toMatch(/\bDELETE\b/);
+    expect(sql).not.toMatch(/^\s*TRUNCATE/im);
+    expect(sql.match(/UPDATE public\./g) ?? []).toHaveLength(2);
+    // `updated_at` lo sigue escribiendo el trigger de 005, no esta migración.
+    expect(sql).not.toMatch(/updated_at/);
+    expect(sql).not.toMatch(/^\s*ALTER TABLE/im);
+    expect(sql).not.toMatch(/^\s*CREATE INDEX/im);
+    expect(sql).not.toContain("DROP FUNCTION");
+    expect(sql).not.toContain("DROP CONSTRAINT");
+  });
+
+  it("declara el acoplamiento, el costo de numeración y las ventanas", () => {
+    expect(raw).toContain("ACOPLAMIENTO DE DESPLIEGUE");
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("VENTANAS DECLARADAS");
+    expect(raw).toContain("050");
+    expect(raw).toContain("049");
+  });
+
+  it("declara lo que se midió del trigger del stock: el IN no pasa por la guarda", () => {
+    // El acoplamiento con la frontera de inventario (el "giro" del stock): la
+    // reversión NO reusa `deduct_stock_atomic` (escribe OUT y rechaza el
+    // producto repetido) y su IN no toma el lock del BEFORE ROW.
+    expect(raw).toContain("trg_inventory_no_negative");
+    expect(raw).toContain("trg_inventory_apply_stock");
+    expect(raw).toMatch(/IF NEW\.type = 'OUT'/);
+    expect(raw).toContain("deduct_stock_atomic");
+    expect(raw).toContain("count(DISTINCT product_id)");
   });
 });
