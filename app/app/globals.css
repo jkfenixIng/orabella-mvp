@@ -226,6 +226,58 @@ body {
   color: var(--foreground);
 }
 
+/* --------------------------------------------------------------------------
+   Tinte por tipo del toast (WU-D): sonner 2.x solo aplica sus variables por
+   tipo (`--success-bg`, `--error-text`, ...) bajo `richColors`, y sus valores
+   de fábrica son la paleta propia de sonner (hsl), no la del proyecto. Este
+   bloque las redirige a los tokens del proyecto, con un valor por tema.
+
+   Por qué dos bloques y no un `var(--color-*-50)` global: ese peldaño NO se
+   invierte en `.dark` (lo que se invierte es la CLASE `.dark .bg-*-light`, con
+   literales oklch propios en design-tokens.css), así que un -50 global dejaría
+   el toast casi blanco en oscuro. El bloque claro usa el mismo par que el
+   Alert y el Badge (`-50` de fondo + `-600` de texto); el bloque oscuro usa el
+   MISMO literal de fondo que `.dark .bg-*-light` y el `-400` de texto que usa
+   `.dark .text-*`. El borde es `transparent` en los dos temas, igual que las
+   variantes con tinte del Alert y del Badge (`border-transparent`).
+
+   Por qué el prefijo `html`: sonner inyecta su CSS en runtime con un `<style>`
+   que el navegador coloca DESPUÉS de esta hoja, así que un selector de igual
+   especificidad (`[data-sonner-toaster][data-sonner-theme='...']`) perdería por
+   orden. `html [...]` suma un punto de especificidad y gana sin `!important`
+   y sin depender del orden de inyección. No se toca `--normal-*`: el toast sin
+   tipo conserva la superficie del proyecto en ambos temas.
+   -------------------------------------------------------------------------- */
+html [data-sonner-toaster][data-sonner-theme='light'] {
+  --success-bg: var(--color-success-50);
+  --success-text: var(--color-success-600);
+  --success-border: transparent;
+  --warning-bg: var(--color-warning-50);
+  --warning-text: var(--color-warning-600);
+  --warning-border: transparent;
+  --error-bg: var(--color-error-50);
+  --error-text: var(--color-error-600);
+  --error-border: transparent;
+  --info-bg: var(--color-primary-50);
+  --info-text: var(--color-primary-600);
+  --info-border: transparent;
+}
+
+html [data-sonner-toaster][data-sonner-theme='dark'] {
+  --success-bg: oklch(0.14 0.04 160);
+  --success-text: var(--color-success-400);
+  --success-border: transparent;
+  --warning-bg: oklch(0.14 0.07 50);
+  --warning-text: var(--color-warning-400);
+  --warning-border: transparent;
+  --error-bg: oklch(0.14 0.06 25);
+  --error-text: var(--color-error-400);
+  --error-border: transparent;
+  --info-bg: oklch(0.14 0.06 250);
+  --info-text: var(--color-primary-400);
+  --info-border: transparent;
+}
+
 /* Accesibilidad: respeta la preferencia de reducir movimiento del SO. */
 @media (prefers-reduced-motion: reduce) {
   *,

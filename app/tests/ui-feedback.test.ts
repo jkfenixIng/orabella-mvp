@@ -408,3 +408,167 @@ describe("toast: dependencia y montaje único", () => {
     }
   });
 });
+
+/* --------------------------------------------------------------------------
+   Tinte por tipo del toast (WU-D).
+
+   En sonner 2.x las variables por tipo solo aplican bajo `richColors` y sus
+   valores de fábrica son la paleta propia de sonner; el override vive en
+   globals.css con un valor por tema. Regla de la casa: se afirma sobre código
+   sin comentarios y por valores completos, nunca por substrings.
+   -------------------------------------------------------------------------- */
+
+describe("toast: tinte por tipo con tokens del proyecto (WU-D)", () => {
+  /** Código sin comentarios: la cabecera de sonner.tsx nombra `richColors` en
+   *  prosa y esa mención no puede contar como la prop aplicada en el JSX. */
+  const SONNER_CODE = SONNER_TSX.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+
+  const LIGHT_TOAST_SELECTOR = "html [data-sonner-toaster][data-sonner-theme='light']";
+  const DARK_TOAST_SELECTOR = "html [data-sonner-toaster][data-sonner-theme='dark']";
+
+  /** Tinte por tipo: el par (fondo, texto) es el mismo que Alert/Badge usan
+   *  para ese estado; `info` usa la rampa de marca, igual que alertVariants. */
+  const TOAST_TINTS = [
+    {
+      type: "success",
+      lightBg: "var(--color-success-50)",
+      lightText: "var(--color-success-600)",
+      darkText: "var(--color-success-400)",
+      darkBgClass: "bg-success-light",
+    },
+    {
+      type: "warning",
+      lightBg: "var(--color-warning-50)",
+      lightText: "var(--color-warning-600)",
+      darkText: "var(--color-warning-400)",
+      darkBgClass: "bg-warning-light",
+    },
+    {
+      type: "error",
+      lightBg: "var(--color-error-50)",
+      lightText: "var(--color-error-600)",
+      darkText: "var(--color-error-400)",
+      darkBgClass: "bg-error-light",
+    },
+    {
+      type: "info",
+      lightBg: "var(--color-primary-50)",
+      lightText: "var(--color-primary-600)",
+      darkText: "var(--color-primary-400)",
+      darkBgClass: "bg-primary-light",
+    },
+  ];
+
+  /** Literal de fondo que `.dark .bg-*-light` declara en design-tokens.css. */
+  function darkTintLiteral(bgClass: string): string {
+    const bodies = ruleBodies(TOKENS_CSS, `.dark .${bgClass}`);
+    const match = /background-color\s*:\s*([^;]+);/.exec(bodies.join(" "));
+    expect(match, `.dark .${bgClass} debe declarar background-color`).not.toBeNull();
+    return (match as RegExpExecArray)[1].trim();
+  }
+
+  /** Nombres de token dentro de los `var(--x)` de un valor (vacío si no hay). */
+  function varRefs(value: string): string[] {
+    return [...value.matchAll(/var\((--[a-zA-Z0-9-]+)\)/g)].map((match) => match[1]);
+  }
+
+  it("richColors se enciende en el JSX del Toaster (sin él no hay tinte que pisar)", () => {
+    // Hasta el spread: el primer `/>` del archivo cierra un icono, no el
+    // Toaster, así que el JSX se corta por `{...props}` en vez de por `/>`.
+    // Esto afirma presencia Y orden a la vez: la prop va antes del spread y
+    // quien pase richColors={false} recupera el uniforme.
+    const openTag = SONNER_CODE.slice(
+      SONNER_CODE.indexOf("<Sonner"),
+      SONNER_CODE.indexOf("{...props}"),
+    );
+    expect(openTag.length).toBeGreaterThan("<Sonner".length);
+    // Token completo: la mención en prosa ya se recortó con los comentarios.
+    expect(openTag, "prop richColors antes del spread").toMatch(/(^|\s)richColors(\s|$)/);
+  });
+
+  it("cada tipo declara sus tres variables en los dos temas, con el valor exacto", () => {
+    const lightVars = blockVars(GLOBALS_CSS, LIGHT_TOAST_SELECTOR);
+    const darkVars = blockVars(GLOBALS_CSS, DARK_TOAST_SELECTOR);
+    // Piso anti-vacío: sin estos tamaños un selector roto pasaría solo.
+    expect(lightVars.size, "variables en el bloque claro").toBe(12);
+    expect(darkVars.size, "variables en el bloque oscuro").toBe(12);
+    for (const tint of TOAST_TINTS) {
+      expect(lightVars.get(`--${tint.type}-bg`), `${tint.type} fondo claro`).toBe(tint.lightBg);
+      expect(lightVars.get(`--${tint.type}-text`), `${tint.type} texto claro`).toBe(tint.lightText);
+      expect(lightVars.get(`--${tint.type}-border`), `${tint.type} borde claro`).toBe("transparent");
+      expect(darkVars.get(`--${tint.type}-text`), `${tint.type} texto oscuro`).toBe(tint.darkText);
+      expect(darkVars.get(`--${tint.type}-border`), `${tint.type} borde oscuro`).toBe("transparent");
+    }
+  });
+
+  it("el fondo oscuro es el literal de `.dark .bg-*-light`: ni token sin invertir ni invento", () => {
+    const darkVars = blockVars(GLOBALS_CSS, DARK_TOAST_SELECTOR);
+    for (const tint of TOAST_TINTS) {
+      const toastBg = darkVars.get(`--${tint.type}-bg`);
+      const classBg = darkTintLiteral(tint.darkBgClass);
+      expect(classBg, `.dark .${tint.darkBgClass}`).toMatch(/^oklch\(/);
+      // Igualdad exacta entre archivos: si un lado se mueve, esto falla.
+      expect(toastBg, `--${tint.type}-bg vs .dark .${tint.darkBgClass}`).toBe(classBg);
+    }
+  });
+
+  it("los tokens referenciados existen en la cascada real", () => {
+    const lightVars = blockVars(GLOBALS_CSS, LIGHT_TOAST_SELECTOR);
+    const darkVars = blockVars(GLOBALS_CSS, DARK_TOAST_SELECTOR);
+    for (const tint of TOAST_TINTS) {
+      for (const token of varRefs(lightVars.get(`--${tint.type}-bg`) as string)) {
+        expect(rootVars.has(token), `${token} en :root`).toBe(true);
+      }
+      for (const token of varRefs(lightVars.get(`--${tint.type}-text`) as string)) {
+        expect(rootVars.has(token), `${token} en :root`).toBe(true);
+      }
+      for (const token of varRefs(darkVars.get(`--${tint.type}-text`) as string)) {
+        expect(darkCascade.has(token), `${token} en la cascada oscura`).toBe(true);
+      }
+    }
+  });
+
+  it("el fallo documentado está ausente: ningún -50 en oscuro, ninguna paleta ajena", () => {
+    // Control del detector: sobre una muestra con el patrón retirado, TIENE que
+    // dispararse; si el lector estuviera roto, la aserción real pasaría sola.
+    expect(varRefs("var(--color-success-50)")).toEqual(["--color-success-50"]);
+    expect(varRefs("transparent")).toEqual([]);
+
+    for (const selector of [LIGHT_TOAST_SELECTOR, DARK_TOAST_SELECTOR]) {
+      for (const [, value] of blockVars(GLOBALS_CSS, selector)) {
+        expect(value, `${selector}: ${value}`).not.toMatch(/hsla?\(|#[0-9a-fA-F]/);
+      }
+    }
+    const darkRefs = [...blockVars(GLOBALS_CSS, DARK_TOAST_SELECTOR).values()].flatMap(varRefs);
+    const fifties = darkRefs.filter((token) => token.endsWith("-50"));
+    expect(fifties, "el bloque oscuro no puede pedir ningún peldaño -50").toEqual([]);
+  });
+
+  it("el override gana por especificidad, no por orden ni por !important", () => {
+    // Sonner inyecta su CSS en runtime DESPUÉS de esta hoja: un selector de
+    // igual especificidad perdería por orden. El prefijo `html` suma un punto.
+    expect(ruleBodies(GLOBALS_CSS, LIGHT_TOAST_SELECTOR).length).toBeGreaterThan(0);
+    expect(ruleBodies(GLOBALS_CSS, DARK_TOAST_SELECTOR).length).toBeGreaterThan(0);
+    // La versión perdedora (misma especificidad que la de sonner) no existe.
+    expect(
+      ruleBodies(GLOBALS_CSS, "[data-sonner-toaster][data-sonner-theme='light']"),
+      "selector claro sin prefijo",
+    ).toEqual([]);
+    expect(
+      ruleBodies(GLOBALS_CSS, "[data-sonner-toaster][data-sonner-theme='dark']"),
+      "selector oscuro sin prefijo",
+    ).toEqual([]);
+    for (const selector of [LIGHT_TOAST_SELECTOR, DARK_TOAST_SELECTOR]) {
+      expect(ruleBodies(GLOBALS_CSS, selector).join(" "), selector).not.toContain("!important");
+    }
+  });
+
+  it("el toast sin tipo no se toca: ningún --normal-* en los bloques de tinte", () => {
+    for (const selector of [LIGHT_TOAST_SELECTOR, DARK_TOAST_SELECTOR]) {
+      const normals = [...blockVars(GLOBALS_CSS, selector).keys()].filter((name) =>
+        name.startsWith("--normal-"),
+      );
+      expect(normals, selector).toEqual([]);
+    }
+  });
+});

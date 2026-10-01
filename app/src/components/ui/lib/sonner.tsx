@@ -32,14 +32,16 @@ import { Toaster as Sonner, type ToasterProps } from 'sonner'
    4. `closeButton`: el defecto que esta primitiva viene a arreglar es el
       mensaje que no se va nunca. El toast se va solo y además se puede cerrar.
 
-   NO se activa `richColors`. En sonner 2.x las variables por tipo
-   (`--success-bg`, `--error-bg`, …) solo aplican bajo `[data-rich-colors='true']`
-   y sus valores en oscuro son la paleta propia de sonner, no la del proyecto.
-   Pisarlas con `--color-*-50` tampoco sirve: ese peldaño NO se invierte en
-   `.dark` (lo que se invierte es la CLASE `.dark .bg-*-light`), así que en
-   oscuro el toast quedaría casi blanco. O sea: el tinte por tipo necesita un
-   override en `globals.css`, que está fuera de esta unidad de trabajo. Hasta
-   entonces, superficie uniforme del proyecto + icono distinto por tipo.
+   `richColors` SÍ está activo (WU-D): en sonner 2.x las variables por tipo
+   (`--success-bg`, `--error-bg`, …) solo aplican bajo `[data-rich-colors='true']`,
+   así que sin esta prop no hay tinte que pisar. Sus valores de fábrica son la
+   paleta propia de sonner, no la del proyecto, y pisarlas con `--color-*-50`
+   tampoco sirve: ese peldaño NO se invierte en `.dark` (lo que se invierte es
+   la CLASE `.dark .bg-*-light`), así que en oscuro el toast quedaría casi
+   blanco. Por eso el tinte vive en un override en `globals.css` con un valor
+   por tema (claro: el mismo par `-50`/`-600` del Alert; oscuro: el literal de
+   `.dark .bg-*-light` + `-400`), y acá solo se enciende la prop. El toast sin
+   tipo sigue en la superficie uniforme del proyecto + icono distinto por tipo.
    -------------------------------------------------------------------------- */
 
 const Toaster = ({ ...props }: ToasterProps) => {
@@ -50,6 +52,7 @@ const Toaster = ({ ...props }: ToasterProps) => {
       theme={theme as ToasterProps['theme']}
       position="top-right"
       closeButton
+      richColors
       className="toaster group"
       icons={{
         success: <CircleCheck className="size-4" />,

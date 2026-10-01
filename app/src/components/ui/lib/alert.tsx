@@ -52,8 +52,9 @@ export const DEFAULT_ALERT_VARIANT: AlertVariant = 'info'
  *   leyendo. Es lo correcto para confirmaciones y datos: success e info no
  *   necesitan interrumpir a nadie.
  * - `alert` (aria-live=assertive) interrumpe. Solo se justifica cuando el
- *   mensaje describe algo que el usuario tiene que atender ya: warning y
- *   destructive.
+ *   usuario debe actuar antes de continuar: warning y destructive. Un aviso
+ *   inline persiste en el orden de lectura y se lee igual sin interrumpir;
+ *   lo persistente por sí solo no pide assertive.
  *
  * Un `role="status"` global para las cuatro variantes dejaría los errores
  * mudos hasta que el foco vuelva; un `role="alert"` global gritaría cada
