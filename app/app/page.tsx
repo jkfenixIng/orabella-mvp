@@ -2,6 +2,7 @@ import Link from "next/link";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { Calculator, Package, Receipt, Settings, Ticket, TriangleAlert, Wallet } from "lucide-react";
+import { PageContainer, PageHeader } from "@/src/components/ui/lib/page";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { countUnreadAlerts } from "@/src/features/alerts/service";
@@ -70,15 +71,18 @@ export default async function HomePage() {
     isAdmin && sedeId ? await countUnreadAlerts(sedeId, "caja").catch(() => 0) : 0;
 
   return (
-    <main className="mx-auto flex min-h-screen w-full max-w-4xl flex-col gap-8 px-6 py-12">
-      <header>
+    <PageContainer>
+      {/* Hero de inicio: el antetítulo "Bienvenido a" no lo modela `PageHeader`,
+          así que se conserva inline. El `gap-1` (4px) mantiene la misma
+          separación que tenía el `mt-1` del `<h1>`: el `<h1>` —siempre
+          `text-3xl font-bold`— lo pone el primitivo. */}
+      <div className="flex flex-col gap-1">
         <p className="text-sm font-medium text-text-tertiary">Bienvenido a</p>
-        <h1 className="mt-1 text-3xl font-bold">Orabella</h1>
-        <p className="mt-2 text-text-secondary">
-          El sistema de su negocio de belleza: ventas, caja, inventario y personal en un solo lugar.
-          Elija un módulo para empezar.
-        </p>
-      </header>
+        <PageHeader
+          title="Orabella"
+          description="El sistema de su negocio de belleza: ventas, caja, inventario y personal en un solo lugar. Elija un módulo para empezar."
+        />
+      </div>
 
       {/* Alerta de error: mismo shape que el aviso ámbar canónico, con tokens de error. */}
       {unreadAlerts > 0 ? (
@@ -149,6 +153,6 @@ export default async function HomePage() {
           ))}
         </ul>
       </section>
-    </main>
+    </PageContainer>
   );
 }

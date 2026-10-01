@@ -1,6 +1,7 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { Alert } from "@/src/components/ui/lib/alert";
+import { PageContainer, PageHeader } from "@/src/components/ui/lib/page";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { listAllEmployees, listPaymentMethods } from "@/src/features/admin/service";
@@ -27,15 +28,15 @@ export default async function PayrollPage() {
   const sedeId = session.user.sede_id;
   if (!sedeId) {
     return (
-      <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-4 px-6 py-12">
-        <h1 className="text-2xl font-bold">Nómina</h1>
+      <PageContainer size="narrow">
+        <PageHeader title="Nómina" />
         {/* Sin sede no hay nómina que mostrar: es ESTADO (el caso hasta que a
             alguien se le asigne una sede), así que va inline y persistente.
             Esta vista es un Server Component: no puede emitir un toast. El
             texto es el mismo; `destructive` deriva role="alert", el mismo
             anuncio asertivo que antes estaba escrito a mano. */}
         <Alert variant="destructive">El usuario no tiene sede asignada.</Alert>
-      </main>
+      </PageContainer>
     );
   }
 
@@ -70,15 +71,11 @@ export default async function PayrollPage() {
     : employees.filter((row) => row.user_id === session.user.id);
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-5xl flex-col gap-6 px-6 py-12">
-      <header className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-bold">Nómina</h1>
-          <p className="mt-2 text-text-secondary">
-            Periodos con cálculo desde facturación y pago por porciones.
-          </p>
-        </div>
-      </header>
+    <PageContainer size="wide">
+      <PageHeader
+        title="Nómina"
+        description="Periodos con cálculo desde facturación y pago por porciones."
+      />
       <PayrollClient
         sedeId={sedeId}
         initialEmployees={visibleEmployees}
@@ -89,6 +86,6 @@ export default async function PayrollPage() {
         canAdmin={canAdmin}
         canPay={canPay}
       />
-    </main>
+    </PageContainer>
   );
 }
