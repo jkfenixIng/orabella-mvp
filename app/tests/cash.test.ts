@@ -51,6 +51,7 @@ import {
   splitGrossCardFee,
 } from "@/src/features/billing/service";
 import { AUDIT_ACTIONS } from "@/src/shared/lib/audit";
+import { IN_FILTER_CHUNK_SIZE } from "@/src/shared/lib/paged";
 
 // ------------------------------------------------------ helpers de recorte ---
 
@@ -1356,7 +1357,12 @@ describe("cash: T0-a (C1) los lectores ya no unen el ledger completo", () => {
   it("la rama sin turno sigue viva solo por filas NULL (no solapa)", () => {
     const fetcher = service.slice(service.indexOf("async function fetchInvoicePaymentsByShift"));
     expect(fetcher).toContain('.is("cash_shift_id", null)');
-    expect(fetcher).toContain('.in("cash_shift_id", shiftIds)');
+    // 414: el filtro por turno sigue siendo el mismo; lo que cambió es que la
+    // lista viaja TROCEADA (`chunk` de `readAllSourceInChunks`) y su origen
+    // sigue siendo `shiftIds`.
+    expect(fetcher).toContain("readAllSourceInChunks");
+    expect(fetcher).toContain("values: shiftIds");
+    expect(fetcher).toContain('.in("cash_shift_id", chunk)');
   });
 });
 
@@ -2077,6 +2083,12 @@ const shiftStub = vi.hoisted(() => ({
   failAt: {} as Record<string, number[]>,
   /** Fallo inyectado en una lectura concreta (tabla + columna filtrada). */
   failSelects: [] as Array<{ table: string; filter: string; message: string }>,
+  /**
+   * 414: el TAMAÑO de cada `.in(...)`, por request (tabla + columna filtrada).
+   * Es la prueba observable de que ninguna lista de ids viaja en una sola URL:
+   * con `chunkIds`, ningún lote supera `IN_FILTER_CHUNK_SIZE`.
+   */
+  inSizes: [] as Array<{ table: string; column: string; size: number }>,
   rowSeq: 0,
 }));
 
@@ -2335,6 +2347,7 @@ function createShiftStubSupabaseClient(): unknown {
       },
       in: (column: string, values: readonly unknown[]) => {
         filterColumns.push(column);
+        shiftStub.inSizes.push({ table, column, size: values.length });
         const set = new Set(values);
         filters.push((row) => set.has(row[column]));
         return query;
@@ -2615,6 +2628,7 @@ function resetShiftStub(): void {
   shiftStub.requests = {};
   shiftStub.failAt = {};
   shiftStub.failSelects.length = 0;
+  shiftStub.inSizes.length = 0;
   shiftStub.rowSeq = 0;
 }
 
@@ -6614,9 +6628,40 @@ describe("migración 058_close_arqueo_consistency.sql (CL-19)", () => {
     const fetcher = service.slice(
       service.indexOf("async function fetchInvoicePaymentsByShift"),
     );
-    expect(fetcher).toContain('.in("cash_shift_id", shiftIds)');
-    expect(fetcher).toContain('.in("invoice_id", [...shiftByInvoice.keys()])');
+    // Los MISMOS tres predicados; el filtro viaja TROCEADO con `chunkIds` (el
+    // origen de cada lista sigue fijado en `values`).
+    expect(fetcher).toContain("readAllSourceInChunks");
+    expect(fetcher).toContain("values: shiftIds");
+    expect(fetcher).toContain('.in("cash_shift_id", chunk)');
+    expect(fetcher).toContain("values: [...shiftByInvoice.keys()]");
+    expect(fetcher).toContain('.in("invoice_id", chunk)');
     expect(fetcher).toContain('.is("cash_shift_id", null)');
+    // F1: trocar los DOS `values` (darle a la directa `[...shiftByInvoice.keys()]` y a la histórica `shiftIds`, dejando los `.in(..., chunk)`) pasa todos los tokens sueltos de arriba, deja las dos consultas vacías y borra del arqueo toda colección de factura; por eso la lista y su columna se afirman POR BLOQUE.
+    const bloqueDirecto = fetcher.slice(
+      fetcher.indexOf('what: "los cobros de factura del turno"'),
+      fetcher.indexOf('what: "las facturas del turno"'),
+    );
+    const bloqueHistorico = fetcher.slice(
+      fetcher.indexOf('what: "los cobros de factura históricos del turno"'),
+      fetcher.indexOf("for (const row of nullShiftRows)"),
+    );
+    expect(bloqueDirecto).toContain("values: shiftIds");
+    expect(bloqueDirecto).toContain('.in("cash_shift_id", chunk)');
+    expect(bloqueDirecto).not.toContain("values: [...shiftByInvoice.keys()]");
+    expect(bloqueDirecto).not.toContain('.in("invoice_id"');
+    expect(bloqueDirecto.indexOf("values:")).toBeLessThan(
+      bloqueDirecto.indexOf('.in("cash_shift_id", chunk)'),
+    );
+    expect(bloqueHistorico).toContain("values: [...shiftByInvoice.keys()]");
+    expect(bloqueHistorico).toContain('.in("invoice_id", chunk)');
+    expect(bloqueHistorico).toContain('.is("cash_shift_id", null)');
+    expect(bloqueHistorico).not.toContain("values: shiftIds");
+    expect(bloqueHistorico.indexOf("values: [...shiftByInvoice.keys()]")).toBeLessThan(
+      bloqueHistorico.indexOf('.in("invoice_id", chunk)'),
+    );
+    expect(bloqueHistorico.indexOf('.in("invoice_id", chunk)')).toBeLessThan(
+      bloqueHistorico.indexOf('.is("cash_shift_id", null)'),
+    );
   });
 
   it("NO mueve aritmética de dinero a SQL: los dos conteo son `count(*)`, no `sum(...)`", () => {
@@ -6848,7 +6893,10 @@ describe("migración 059_close_arqueo_outflows.sql (CL-20)", () => {
       "utf8",
     );
     const fetcher = service.slice(service.indexOf("async function fetchVoucherOutRows"));
-    expect(fetcher).toContain('.in("cash_shift_id", shiftIds)');
+    // 414: mismo filtro, lista troceada; el origen sigue fijado en `values`.
+    expect(fetcher).toContain("readAllSourceInChunks");
+    expect(fetcher).toContain("values: shiftIds");
+    expect(fetcher).toContain('.in("cash_shift_id", chunk)');
     expect(fetcher).toContain("rows.filter(isVoucherCashOut)");
     // Y la comparación de los CUATRO contra el token, con el MISMO rechazo de 058.
     expect(ddl).toMatch(
@@ -6973,5 +7021,316 @@ describe("migración 059_close_arqueo_outflows.sql (CL-20)", () => {
     expect(raw).toContain("degradación SILENCIOSA");
     expect(raw).toContain("SHIFT_INVALID");
     expect(raw).toContain("028");
+  });
+});
+
+// -------------------------------------------------------------------- 414 ---
+//
+// Los filtros de PostgREST viajan en la URL. Toda lista `.in(...)` que crece con
+// el volumen —turnos, o las facturas y los usuarios de esos turnos— termina en
+// 414 (URI Too Long) y la lectura NO ocurre. El arqueo, la vista del día y el
+// historial comparten fetchers, así que el mismo `.in` sin tope dejaba sin salida
+// a las tres pantallas. El arreglo no toca la aritmética: deduplica, trocea con
+// `chunkIds` (100 uuids por URL) y pagina CADA lote con el contrato de CL-21.
+//
+// La vista del día acota a 50 turnos y el historial a `HISTORY_PAGE_SIZE` por
+// página, así que la lista de ids de TURNO no puede pasar de 100 en esos caminos;
+// las listas que SÍ crecen SIN tope son la de `invoice_id` (muchas facturas por
+// turno) y la de usuarios distintos (`userNames`). El bloque mide las dos cosas:
+// ningún lote supera el tope de la URL y el conjunto leído es el COMPLETO.
+describe("cash: 414 los filtros .in(...) de caja van troceados", () => {
+  /** Turnos del «día ancho»: la vista del día los acota a 50. */
+  const SHIFTS = 50;
+  /** Facturas por turno: 12 × 50 = 600 ids, muy por encima del tope de la URL. */
+  const INVOICES_PER_SHIFT = 12;
+  /** Líneas de conteo por turno: 21 × 50 = 1050, por encima del `max-rows`. */
+  const COUNTS_PER_SHIFT = 21;
+  const PAYMENTS_PER_SHIFT = 3;
+  const DIRECT_INVOICE_PAYMENTS_PER_SHIFT = 2;
+  const VOUCHERS_PER_SHIFT = 2;
+  /** La venta de UN turno: cajón (3 × 1000) + cobros de factura (2 × 500). */
+  const SHIFT_SALES = PAYMENTS_PER_SHIFT * 1000 + DIRECT_INVOICE_PAYMENTS_PER_SHIFT * 500;
+
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const shiftId = (shift: number) => `turno-${pad(shift)}`;
+  const invoiceId = (shift: number, index: number) => `factura-${pad(shift)}-${pad(index)}`;
+  const openedAt = (shift: number) => `2026-09-30T08:${pad(shift)}:00-05:00`;
+
+  /**
+   * Un día con 50 turnos CERRADOS. Cada uno fue abierto y cerrado por usuarios
+   * DISTINTOS (100 ids) y el primero tiene además un reconteo por un usuario más
+   * (101): así `userNames` recibe más ids que los que aguanta una URL. Cada turno
+   * trae facturas, cobros, comisiones, vales y líneas de conteo.
+   */
+  function seedWideDay(): void {
+    const users: Array<Record<string, unknown>> = [];
+    for (let shift = 0; shift < SHIFTS; shift += 1) {
+      users.push({ id: `u-open-${pad(shift)}`, full_name: `Abre ${shift}` });
+      users.push({ id: `u-close-${pad(shift)}`, full_name: `Cierra ${shift}` });
+    }
+    users.push({ id: "u-recount", full_name: "Recontó" });
+    shiftStub.tables = {
+      cash_registers: [
+        {
+          id: shiftStub.REGISTER_ID,
+          sede_id: shiftStub.SEDE_ID,
+          name: "Caja única",
+          base_configurada: shiftStub.BASE_CONFIGURADA,
+          is_active: true,
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      users,
+      cash_shifts: Array.from({ length: SHIFTS }, (_, shift) => ({
+        id: shiftId(shift),
+        cash_register_id: shiftStub.REGISTER_ID,
+        sede_id: shiftStub.SEDE_ID,
+        opened_by: `u-open-${pad(shift)}`,
+        closed_by: `u-close-${pad(shift)}`,
+        opened_at: openedAt(shift),
+        closed_at: `2026-09-30T09:${pad(shift)}:00-05:00`,
+        opening_base: 0,
+        expected_cash: 0,
+        counted_cash: 0,
+        base_left: 0,
+        cash_withdrawn: 0,
+        base_difference: 0,
+        status: "cerrado",
+        observation: null,
+      })),
+      payments: Array.from({ length: SHIFTS }).flatMap((_, shift) =>
+        Array.from({ length: PAYMENTS_PER_SHIFT }, (_, index) => ({
+          id: `pago-${pad(shift)}-${index}`,
+          sede_id: shiftStub.SEDE_ID,
+          cash_shift_id: shiftId(shift),
+          invoice_id: null,
+          method_code: "efectivo",
+          amount: 1000,
+        })),
+      ),
+      invoices: Array.from({ length: SHIFTS }).flatMap((_, shift) =>
+        Array.from({ length: INVOICES_PER_SHIFT }, (_, index) => ({
+          id: invoiceId(shift, index),
+          sede_id: shiftStub.SEDE_ID,
+          cash_shift_id: shiftId(shift),
+        })),
+      ),
+      // Cobros de factura DIRECTOS (con turno): los históricos sin turno no se
+      // siembran, así que la unión no puede solapar ni contar dos veces.
+      invoice_payments: Array.from({ length: SHIFTS }).flatMap((_, shift) =>
+        Array.from({ length: DIRECT_INVOICE_PAYMENTS_PER_SHIFT }, (_, index) => ({
+          id: `cobro-${pad(shift)}-${index}`,
+          invoice_id: invoiceId(shift, index),
+          cash_shift_id: shiftId(shift),
+          method_code: "efectivo",
+          amount: 500,
+        })),
+      ),
+      commission_payouts: Array.from({ length: SHIFTS }).flatMap((_, shift) =>
+        Array.from({ length: 2 }, (_, index) => ({
+          id: `comision-${pad(shift)}-${index}`,
+          cash_shift_id: shiftId(shift),
+          method_code: "efectivo",
+          amount: 50,
+        })),
+      ),
+      voucher_requests: Array.from({ length: SHIFTS }).flatMap((_, shift) => [
+        ...Array.from({ length: VOUCHERS_PER_SHIFT }, (_, index) => ({
+          id: `vale-${pad(shift)}-${index}`,
+          cash_shift_id: shiftId(shift),
+          approved_by: shiftStub.USER_ID,
+          method_code: "efectivo",
+          amount: 100,
+        })),
+        // Un vale PENDIENTE: no toca caja (misma regla de `isVoucherCashOut`).
+        {
+          id: `vale-pendiente-${pad(shift)}`,
+          cash_shift_id: shiftId(shift),
+          approved_by: null,
+          method_code: "efectivo",
+          amount: 100,
+        },
+      ]),
+      // Líneas de conteo en la fase del CIERRE y en un método DIGITAL (así
+      // aparecen en `declarados`): 1050 filas superan el `max-rows` por request.
+      cash_shift_counts: Array.from({ length: SHIFTS }).flatMap((_, shift) =>
+        Array.from({ length: COUNTS_PER_SHIFT }, (_, line) => ({
+          id: `conteo-${pad(shift)}-${pad(line)}`,
+          shift_id: shiftId(shift),
+          phase: "cierre",
+          method_code: "tarjeta",
+          denomination: null,
+          quantity: 1,
+          amount: 100,
+        })),
+      ),
+      // Un reconteo del PRIMER turno, por un usuario DISTINTO de los 100: es el
+      // id 101 de `userNames`. No toca la venta, que es lo que el test afirma.
+      cash_shift_recounts: [
+        {
+          id: "reconteo-01",
+          shift_id: shiftId(0),
+          previous_counted_cash: 0,
+          previous_base_left: 0,
+          previous_cash_withdrawn: 0,
+          previous_base_difference: 0,
+          counted_cash: 0,
+          base_left: 0,
+          cash_withdrawn: 0,
+          base_difference: 0,
+          reason: "Conteo corregido.",
+          recounted_by: "u-recount",
+          recounted_at: "2026-09-30T10:00:00-05:00",
+        },
+      ],
+      audit_logs: [],
+    };
+  }
+
+  const inChunks = (table: string, column: string) =>
+    shiftStub.inSizes.filter((entry) => entry.table === table && entry.column === column);
+  const sizeSum = (entries: Array<{ size: number }>) =>
+    entries.reduce((acc, entry) => acc + entry.size, 0);
+
+  beforeEach(() => {
+    resetShiftStub();
+    shiftStub.lifecycle = true;
+  });
+  afterEach(() => resetShiftStub());
+
+  it("la vista del día trocea TODO filtro .in(...) y ve el conjunto COMPLETO", async () => {
+    seedWideDay();
+
+    const day = await getDayView(shiftStub.SEDE_ID, { fecha: "2026-09-30" });
+
+    // Ninguna lista de ids viajó en una sola URL: el tope es el de la casa.
+    expect(shiftStub.inSizes.length).toBeGreaterThan(0);
+    for (const entry of shiftStub.inSizes) {
+      expect(entry.size, `${entry.table}.${entry.column}`).toBeLessThanOrEqual(IN_FILTER_CHUNK_SIZE);
+    }
+    // La lista de facturas (600 ids) SÍ excede la URL: va en seis lotes de 100.
+    const invoiceChunks = inChunks("invoice_payments", "invoice_id");
+    expect(invoiceChunks.map((entry) => entry.size)).toEqual([100, 100, 100, 100, 100, 100]);
+    expect(sizeSum(invoiceChunks)).toBe(SHIFTS * INVOICES_PER_SHIFT);
+    // Los usuarios distintos (101: 50 aperturas + 50 cierres + 1 reconteo).
+    const userChunks = inChunks("users", "id");
+    expect(userChunks).toHaveLength(2);
+    expect(Math.max(...userChunks.map((entry) => entry.size))).toBe(IN_FILTER_CHUNK_SIZE);
+    expect(sizeSum(userChunks)).toBe(101);
+    // La venta del día es la del conjunto COMPLETO: ni recorte ni doble conteo.
+    expect(day.totals.turnos).toBe(SHIFTS);
+    expect(day.totals.ventas).toBe(SHIFTS * SHIFT_SALES);
+    for (const view of day.shifts) expect(view.ventas).toBe(SHIFT_SALES);
+    // Y los conteos —1050 filas, por encima del techo por request— se leen
+    // enteros: el ÚLTIMO turno declara el total de sus 21 líneas, que solo
+    // existen en la SEGUNDA página.
+    expect(shiftStub.requests.cash_shift_counts).toBe(2);
+    expect(day.shifts[SHIFTS - 1].declarados).toEqual([
+      { method_code: "tarjeta", amount: COUNTS_PER_SHIFT * 100 },
+    ]);
+    // Los vales APROBADOS del último turno (el pendiente no toca caja).
+    expect(day.shifts[SHIFTS - 1].vales).toBe(VOUCHERS_PER_SHIFT * 100);
+  });
+
+  it("el historial trocea sus filtros y ve la página COMPLETA", async () => {
+    seedWideDay();
+
+    const history = await getHistory(shiftStub.SEDE_ID, {
+      desde: "2026-09-01",
+      hasta: "2026-09-30",
+    });
+
+    // La página son 10 turnos (el tope del historial) y cada uno viene ENTERO.
+    expect(history.total).toBe(SHIFTS);
+    expect(history.shifts).toHaveLength(HISTORY_PAGE_SIZE);
+    for (const view of history.shifts) expect(view.ventas).toBe(SHIFT_SALES);
+    for (const entry of shiftStub.inSizes) {
+      expect(entry.size, `${entry.table}.${entry.column}`).toBeLessThanOrEqual(IN_FILTER_CHUNK_SIZE);
+    }
+    // 10 turnos × 12 facturas = 120 ids: la lista viaja en DOS lotes.
+    const invoiceChunks = inChunks("invoice_payments", "invoice_id");
+    expect(invoiceChunks.map((entry) => entry.size)).toEqual([100, 20]);
+    expect(sizeSum(invoiceChunks)).toBe(HISTORY_PAGE_SIZE * INVOICES_PER_SHIFT);
+  });
+
+  it("un lote POSTERIOR que falla se ve A LA VISTA: READ_INCOMPLETE, jamás un total corto", async () => {
+    seedWideDay();
+    // El SEGUNDO lote de facturas no llega. Las consultas a `invoice_payments`
+    // son: (1) la lectura directa por turno, (2) el primer lote de históricos y
+    // (3) el segundo, que es el que falla.
+    shiftStub.failAt = { invoice_payments: [3] };
+
+    const outcome: unknown = await getDayView(shiftStub.SEDE_ID, { fecha: "2026-09-30" }).catch(
+      (error: unknown) => error,
+    );
+
+    // No hay una vista con la venta recortada: hay un error de negocio.
+    expect(outcome).toBeInstanceOf(CashError);
+    expect(outcome).toMatchObject({ code: "READ_INCOMPLETE", status: 500 });
+    expect((outcome as CashError).message).toContain("los cobros de factura históricos del turno");
+  });
+
+  it("una lista vacía corta el circuito: no se emite NINGUNA consulta .in(...)", async () => {
+    // Sin turnos en la fecha, todas las listas de ids están vacías.
+    const day = await getDayView(shiftStub.SEDE_ID, { fecha: "2026-09-30" });
+
+    expect(day.shifts).toEqual([]);
+    expect(shiftStub.inSizes).toEqual([]);
+    for (const table of [
+      "payments",
+      "invoice_payments",
+      "invoices",
+      "cash_shift_counts",
+      "cash_shift_recounts",
+      "commission_payouts",
+      "voucher_requests",
+      "users",
+    ]) {
+      expect(shiftStub.requests[table] ?? 0, table).toBe(0);
+    }
+  });
+
+  it("un usuario repetido va UNA sola vez: la lista de usuarios se deduplica antes de trocear", async () => {
+    // Cinco turnos abiertos y cerrados por el MISMO usuario: la lista cruda trae
+    // el id diez veces y el dedupe lo deja una sola.
+    shiftStub.tables = {
+      cash_registers: [
+        {
+          id: shiftStub.REGISTER_ID,
+          sede_id: shiftStub.SEDE_ID,
+          name: "Caja única",
+          base_configurada: shiftStub.BASE_CONFIGURADA,
+          is_active: true,
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      users: [{ id: shiftStub.USER_ID, full_name: "Cajero de prueba" }],
+      cash_shifts: Array.from({ length: 5 }, (_, index) => ({
+        id: `turno-dedupe-${index}`,
+        cash_register_id: shiftStub.REGISTER_ID,
+        sede_id: shiftStub.SEDE_ID,
+        opened_by: shiftStub.USER_ID,
+        closed_by: shiftStub.USER_ID,
+        opened_at: `2026-09-30T1${index}:00:00-05:00`,
+        closed_at: `2026-09-30T1${index}:30:00-05:00`,
+        opening_base: 0,
+        expected_cash: 0,
+        counted_cash: 0,
+        base_left: 0,
+        cash_withdrawn: 0,
+        base_difference: 0,
+        status: "cerrado",
+        observation: null,
+      })),
+      audit_logs: [],
+    };
+
+    const day = await getDayView(shiftStub.SEDE_ID, { fecha: "2026-09-30" });
+
+    expect(day.shifts).toHaveLength(5);
+    // Diez ids crudos (abrió y cerró) y UNA sola consulta, con un solo id.
+    expect(inChunks("users", "id")).toEqual([{ table: "users", column: "id", size: 1 }]);
+    expect(day.shifts[0].abierto_por).toBe("Cajero de prueba");
+    expect(day.shifts[0].cerrado_por).toBe("Cajero de prueba");
   });
 });

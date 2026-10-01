@@ -38,6 +38,7 @@ import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
 import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
 import {
+  chunkIds,
   PagedReadError,
   readAllPaged,
   type PagedResponse,
@@ -346,17 +347,27 @@ async function fetchCountTotals(
     { open: Map<string, number>; closed: Map<string, number>; recount: Map<string, number> }
   >();
   if (shiftIds.length === 0) return result;
-  const { data, error } = await db
-    .from("cash_shift_counts")
-    .select("shift_id, phase, method_code, amount")
-    .in("shift_id", shiftIds);
-  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  for (const row of (data ?? []) as Array<{
+  // CL-21 (hermano 414): el `.in` viaja troceado y CADA lote paginado. Trocear
+  // solo no alcanza: ~100 turnos × sus líneas de conteo superan el techo por
+  // request del Data API y el recorte volvería en silencio.
+  const rows = await readAllSourceInChunks<{
     shift_id: string;
     phase: string;
     method_code: string;
     amount: number | string;
-  }>) {
+  }>({
+    table: "cash_shift_counts",
+    what: "los conteos del turno",
+    values: shiftIds,
+    fetchPage: (chunk, from, to) =>
+      db
+        .from("cash_shift_counts")
+        .select("shift_id, phase, method_code, amount")
+        .in("shift_id", chunk)
+        .order("id")
+        .range(from, to),
+  });
+  for (const row of rows) {
     const entry = result.get(row.shift_id) ?? {
       open: new Map<string, number>(),
       closed: new Map<string, number>(),
@@ -415,6 +426,33 @@ async function readAllSource<TRow>(args: {
 }
 
 /**
+ * Lectura exhaustiva de un filtro `.in(...)` cuyo tamaño depende del volumen:
+ * deduplica, trocea con `chunkIds` (la URL aguanta 100 uuids) y pagina CADA lote
+ * con el contrato de `readAllSource`. El conjunto devuelto es exacto: ni recorte
+ * silencioso (techo por request de `max-rows`) ni 414.
+ */
+async function readAllSourceInChunks<TRow>(args: {
+  table: string;
+  what: string;
+  values: readonly string[];
+  fetchPage: (values: string[], from: number, to: number) => PromiseLike<PagedResponse<TRow>>;
+}): Promise<TRow[]> {
+  const unique = [...new Set(args.values)];
+  if (unique.length === 0) return [];
+  const rows: TRow[] = [];
+  for (const chunk of chunkIds(unique)) {
+    rows.push(
+      ...(await readAllSource<TRow>({
+        table: args.table,
+        what: args.what,
+        fetchPage: (from, to) => args.fetchPage(chunk, from, to),
+      })),
+    );
+  }
+  return rows;
+}
+
+/**
  * Pagos inmediatos de comisión por turno y método (descuentan del
  * esperado digital en vistas y cierre).
  *
@@ -429,18 +467,19 @@ async function fetchPayoutTotals(
 ): Promise<Map<string, Map<string, number>>> {
   const result = new Map<string, Map<string, number>>();
   if (shiftIds.length === 0) return result;
-  const rows = await readAllSource<{
+  const rows = await readAllSourceInChunks<{
     cash_shift_id: string;
     method_code: string;
     amount: number | string;
   }>({
     table: "commission_payouts",
     what: "los pagos de comisión del turno",
-    fetchPage: (from, to) =>
+    values: shiftIds,
+    fetchPage: (chunk, from, to) =>
       db
         .from("commission_payouts")
         .select("cash_shift_id, method_code, amount")
-        .in("cash_shift_id", shiftIds)
+        .in("cash_shift_id", chunk)
         .order("id")
         .range(from, to),
   });
@@ -496,7 +535,7 @@ async function fetchVoucherOutRows(
   const result = new Map<string, VoucherCashOutInput[]>();
   if (shiftIds.length === 0) return result;
   if (!(await hasVoucherOutColumns(db))) return result;
-  const rows = await readAllSource<{
+  const rows = await readAllSourceInChunks<{
     cash_shift_id: string;
     approved_by: string | null;
     method_code: string | null;
@@ -504,11 +543,12 @@ async function fetchVoucherOutRows(
   }>({
     table: "voucher_requests",
     what: "los vales del turno",
-    fetchPage: (from, to) =>
+    values: shiftIds,
+    fetchPage: (chunk, from, to) =>
       db
         .from("voucher_requests")
         .select("cash_shift_id, approved_by, method_code, amount")
-        .in("cash_shift_id", shiftIds)
+        .in("cash_shift_id", chunk)
         .order("id")
         .range(from, to),
   });
@@ -647,7 +687,7 @@ async function fetchInvoicePaymentsByShift(
     list.push({ invoice_id: row.invoice_id, method_code: row.method_code, amount: Number(row.amount) });
     result.set(shiftId, list);
   };
-  const direct = await readAllSource<{
+  const direct = await readAllSourceInChunks<{
     invoice_id: string;
     cash_shift_id: string;
     method_code: string;
@@ -655,25 +695,27 @@ async function fetchInvoicePaymentsByShift(
   }>({
     table: "invoice_payments",
     what: "los cobros de factura del turno",
-    fetchPage: (from, to) =>
+    values: shiftIds,
+    fetchPage: (chunk, from, to) =>
       db
         .from("invoice_payments")
         .select("invoice_id, cash_shift_id, method_code, amount")
-        .in("cash_shift_id", shiftIds)
+        .in("cash_shift_id", chunk)
         .order("id")
         .range(from, to),
   });
   for (const row of direct) {
     push(row.cash_shift_id, row);
   }
-  const invoices = await readAllSource<{ id: string; cash_shift_id: string }>({
+  const invoices = await readAllSourceInChunks<{ id: string; cash_shift_id: string }>({
     table: "invoices",
     what: "las facturas del turno",
-    fetchPage: (from, to) =>
+    values: shiftIds,
+    fetchPage: (chunk, from, to) =>
       db
         .from("invoices")
         .select("id, cash_shift_id")
-        .in("cash_shift_id", shiftIds)
+        .in("cash_shift_id", chunk)
         .order("id")
         .range(from, to),
   });
@@ -683,18 +725,19 @@ async function fetchInvoicePaymentsByShift(
   // factura. Conjunto disjunto del directo (`cash_shift_id` no nulo) y de la
   // suma de `payments` (los lectores de `payments` excluyen `invoice_id`),
   // por lo que este dinero se cuenta exactamente una vez.
-  const nullShiftRows = await readAllSource<{
+  const nullShiftRows = await readAllSourceInChunks<{
     invoice_id: string;
     method_code: string;
     amount: number | string;
   }>({
     table: "invoice_payments",
     what: "los cobros de factura históricos del turno",
-    fetchPage: (from, to) =>
+    values: [...shiftByInvoice.keys()],
+    fetchPage: (chunk, from, to) =>
       db
         .from("invoice_payments")
         .select("invoice_id, method_code, amount")
-        .in("invoice_id", [...shiftByInvoice.keys()])
+        .in("invoice_id", chunk)
         .is("cash_shift_id", null)
         .order("id")
         .range(from, to),
@@ -779,12 +822,20 @@ async function fetchRecounts(
 ): Promise<Map<string, ShiftRecountRow>> {
   const result = new Map<string, ShiftRecountRow>();
   if (shiftIds.length === 0) return result;
-  const { data, error } = await db
-    .from("cash_shift_recounts")
-    .select(RECOUNT_SELECT)
-    .in("shift_id", shiftIds);
-  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  for (const row of (data ?? []) as ShiftRecountRow[]) {
+  // CL-21 (hermano 414): el `.in` viaja troceado y paginado, como los conteos.
+  const rows = await readAllSourceInChunks<ShiftRecountRow>({
+    table: "cash_shift_recounts",
+    what: "los reconteos del turno",
+    values: shiftIds,
+    fetchPage: (chunk, from, to) =>
+      db
+        .from("cash_shift_recounts")
+        .select(RECOUNT_SELECT)
+        .in("shift_id", chunk)
+        .order("id")
+        .range(from, to),
+  });
+  for (const row of rows) {
     result.set(row.shift_id, row);
   }
   return result;
@@ -2233,11 +2284,16 @@ async function userNames(
 ): Promise<Map<string, string>> {
   const ids = [...new Set(userIds.filter((id): id is string => !!id))];
   if (ids.length === 0) return new Map();
-  const { data, error } = await db.from("users").select("id, full_name").in("id", ids);
-  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
   const names = new Map<string, string>();
-  for (const row of (data ?? []) as Array<{ id: string; full_name: string }>) {
-    names.set(row.id, row.full_name);
+  // Hermano 414: un turno puede tener muchos usuarios distintos (abrió, cerró,
+  // reconteos); la lista deduplicada viaja en lotes que aguantan la URL. Es
+  // SOLO display: conserva el error INTERNAL, no el READ_INCOMPLETE del arqueo.
+  for (const chunk of chunkIds(ids)) {
+    const { data, error } = await db.from("users").select("id, full_name").in("id", chunk);
+    if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+    for (const row of (data ?? []) as Array<{ id: string; full_name: string }>) {
+      names.set(row.id, row.full_name);
+    }
   }
   return names;
 }
@@ -2279,21 +2335,19 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
     // suma el arqueo del cierre, así que el tope de filas por request del Data
     // API (1000 por defecto) dejaría la venta del día —y el efectivo de la
     // vista— calculados sobre un conjunto recortado, en silencio.
-    const payments = await readAllSource<{
+    const payments = await readAllSourceInChunks<{
       cash_shift_id: string;
       amount: number | string;
       method_code: string;
     }>({
       table: "payments",
       what: "los cobros del día",
-      fetchPage: (pageFrom, pageTo) =>
+      values: rows.map((row) => row.id),
+      fetchPage: (chunk, pageFrom, pageTo) =>
         db
           .from("payments")
           .select("cash_shift_id, amount, method_code")
-          .in(
-            "cash_shift_id",
-            rows.map((row) => row.id),
-          )
+          .in("cash_shift_id", chunk)
           .is("invoice_id", null)
           .order("id")
           .range(pageFrom, pageTo),
@@ -2445,21 +2499,19 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
     // CL-21: la MISMA lectura exhaustiva que el cierre (el fetcher es el mismo
     // para la vista del día y el historial): la página del historial no puede
     // mostrar una venta recortada por el tope de filas por request.
-    const payments = await readAllSource<{
+    const payments = await readAllSourceInChunks<{
       cash_shift_id: string;
       amount: number | string;
       method_code: string;
     }>({
       table: "payments",
       what: "los cobros del historial",
-      fetchPage: (pageFrom, pageTo) =>
+      values: rows.map((row) => row.id),
+      fetchPage: (chunk, pageFrom, pageTo) =>
         db
           .from("payments")
           .select("cash_shift_id, amount, method_code")
-          .in(
-            "cash_shift_id",
-            rows.map((row) => row.id),
-          )
+          .in("cash_shift_id", chunk)
           .is("invoice_id", null)
           .order("id")
           .range(pageFrom, pageTo),
