@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useState } from "react";
 import { toast } from "sonner";
 import {
   Dialog,
@@ -13,14 +13,15 @@ import { upsertEmployeeAction } from "@/src/features/admin/actions";
 import { adminCreateUserAction } from "@/src/features/auth/actions";
 import type { EmployeeRow, SedeUserRow } from "@/src/features/admin/service";
 import type { RoleCode } from "@/src/features/auth/schemas";
-import { Alert } from "@/src/components/ui/lib/alert";
+import { DataTable } from "@/src/components/ui/lib/data-table";
+import { EmptyState } from "@/src/components/ui/lib/empty-state";
+import { FormDialog } from "@/src/components/ui/lib/form-dialog";
 import {
   buttonClass,
   ghostClass,
   inputClass,
   labelClass,
   linkButtonClass,
-  mutedTextClass,
   sectionClass,
   sectionTitleClass,
   stackClass,
@@ -139,8 +140,8 @@ export function EmployeesSection({
     setError(null);
   }
 
-  async function handleSubmit(event: FormEvent) {
-    event.preventDefault();
+  // `FormDialog` ya cortó el submit nativo: acá solo va la lógica.
+  async function handleSubmit() {
     setBusy(true);
     setError(null);
     // Alta conjunta: primero el usuario (reutiliza nombre, documento,
@@ -224,53 +225,51 @@ export function EmployeesSection({
           />
         </label>
         {visibleRows.length === 0 ? (
-          <p className={`mt-2 ${mutedTextClass}`}>
+          <EmptyState className="mt-2">
             {rows.length === 0 ? "Aún no hay empleados en esta sede." : "Sin resultados para ese filtro."}
-          </p>
+          </EmptyState>
         ) : (
-          <div className="mt-3 overflow-x-auto">
-            <table className="min-w-full text-left text-sm">
-              <thead>
-                <tr className={tableHeaderClass}>
-                  <th className="whitespace-nowrap py-1 pr-3">Nombre</th>
-                  <th className="whitespace-nowrap py-1 pr-3">Documento</th>
-                  <th className="whitespace-nowrap py-1 pr-3">Cargo</th>
-                  <th className="whitespace-nowrap py-1 pr-3">Estado</th>
-                  <th className="whitespace-nowrap py-1 pr-3">Ver</th>
-                  <th className="whitespace-nowrap py-1 pr-3">Editar</th>
+          <DataTable minWidth="none" wrapperClassName="mt-3">
+            <thead>
+              <tr className={tableHeaderClass}>
+                <th className="whitespace-nowrap py-1 pr-3">Nombre</th>
+                <th className="whitespace-nowrap py-1 pr-3">Documento</th>
+                <th className="whitespace-nowrap py-1 pr-3">Cargo</th>
+                <th className="whitespace-nowrap py-1 pr-3">Estado</th>
+                <th className="whitespace-nowrap py-1 pr-3">Ver</th>
+                <th className="whitespace-nowrap py-1 pr-3">Editar</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleRows.map((row) => (
+                <tr key={row.id} className={tableRowClass}>
+                  <td className="max-w-48 truncate whitespace-nowrap py-1 pr-3" title={row.full_name}>
+                    {row.full_name}
+                  </td>
+                  <td className="whitespace-nowrap py-1 pr-3">{row.document}</td>
+                  <td className="whitespace-nowrap py-1 pr-3">{row.position ?? "—"}</td>
+                  <td className="whitespace-nowrap py-1 pr-3">{row.is_active ? "Activo" : "Inactivo"}</td>
+                  <td className="whitespace-nowrap py-1 pr-3">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setError(null);
+                        setDialog({ mode: "view", id: row.id });
+                      }}
+                      className={linkButtonClass}
+                    >
+                      Consultar
+                    </button>
+                  </td>
+                  <td className="whitespace-nowrap py-1 pr-3">
+                    <button type="button" onClick={() => openEdit(row)} className={linkButtonClass}>
+                      Editar
+                    </button>
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {visibleRows.map((row) => (
-                  <tr key={row.id} className={tableRowClass}>
-                    <td className="max-w-48 truncate whitespace-nowrap py-1 pr-3" title={row.full_name}>
-                      {row.full_name}
-                    </td>
-                    <td className="whitespace-nowrap py-1 pr-3">{row.document}</td>
-                    <td className="whitespace-nowrap py-1 pr-3">{row.position ?? "—"}</td>
-                    <td className="whitespace-nowrap py-1 pr-3">{row.is_active ? "Activo" : "Inactivo"}</td>
-                    <td className="whitespace-nowrap py-1 pr-3">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setError(null);
-                          setDialog({ mode: "view", id: row.id });
-                        }}
-                        className={linkButtonClass}
-                      >
-                        Consultar
-                      </button>
-                    </td>
-                    <td className="whitespace-nowrap py-1 pr-3">
-                      <button type="button" onClick={() => openEdit(row)} className={linkButtonClass}>
-                        Editar
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+              ))}
+            </tbody>
+          </DataTable>
         )}
       </section>
 
@@ -359,17 +358,22 @@ export function EmployeesSection({
         </DialogContent>
       </Dialog>
 
-      <Dialog
+      {/* `lg`: el formulario es de dos columnas, como el que escribía el
+          archivo a mano. El título, el error y el pie los pone la primitiva. */}
+      <FormDialog
         open={dialog?.mode === "create" || dialog?.mode === "edit"}
         onOpenChange={(open) => {
           if (!open) closeDialog();
         }}
+        title={dialog?.mode === "edit" ? "Editar empleado" : "Nuevo empleado"}
+        onSubmit={handleSubmit}
+        busy={busy}
+        submitLabel={dialog?.mode === "edit" ? "Guardar cambios" : "Crear empleado"}
+        busyLabel="Guardando…"
+        error={error}
+        size="lg"
       >
-        <DialogContent className="max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>{dialog?.mode === "edit" ? "Editar empleado" : "Nuevo empleado"}</DialogTitle>
-          </DialogHeader>
-          <form onSubmit={handleSubmit} className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <label className={labelClass}>
               Nombre completo
               <input
@@ -546,26 +550,8 @@ export function EmployeesSection({
               />
               Activo
             </label>
-            {error ? (
-              // ESTADO: el fallo al guardar sigue siendo el caso mientras no se
-              // corrija, así que va inline y persistente. `destructive` deriva
-              // role="alert" asertivo, el mismo anuncio que el `<p role="alert">`
-              // escribía a mano antes.
-              <Alert variant="destructive" className="sm:col-span-2">
-                {error}
-              </Alert>
-            ) : null}
-            <DialogFooter className="sm:col-span-2">
-              <button type="button" onClick={closeDialog} className={ghostClass}>
-                Cancelar
-              </button>
-              <button type="submit" disabled={busy} className={buttonClass}>
-                {busy ? "Guardando…" : dialog?.mode === "edit" ? "Guardar cambios" : "Crear empleado"}
-              </button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+        </div>
+      </FormDialog>
     </div>
   );
 }

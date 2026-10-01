@@ -272,7 +272,7 @@ describe("detector del panel admin: no es un sello de goma", () => {
     expect(EMPLOYEES_CODE.length, "employees-section.tsx").toBeGreaterThan(14_000);
     expect(METHODS_CODE.length, "methods-section.tsx").toBeGreaterThan(3_500);
     expect(TAXES_CODE.length, "taxes-section.tsx").toBeGreaterThan(3_500);
-    expect(USERS_CODE.length, "users-section.tsx").toBeGreaterThan(8_000);
+    expect(USERS_CODE.length, "users-section.tsx").toBeGreaterThan(7_000);
     expect(VALES_CODE.length, "vales-section.tsx").toBeGreaterThan(11_000);
     // Anclas de contenido: confirman que leímos los archivos correctos.
     expect(ADMIN_PAGE_CODE).toContain("export default async function AdminPage");
@@ -297,14 +297,15 @@ describe("detector del panel admin: no es un sello de goma", () => {
       ["users-section.tsx", USERS_TSX],
       ["vales-section.tsx", VALES_TSX],
     ];
-    // Las cuatro que aún escriben un Alert propio explican el criterio al lado
-    // del markup, y por eso citan el rol en un comentario. `taxes` y `methods`
-    // ya NO escriben un Alert: quedó adentro de `FormDialog`, así que la
-    // explicación del criterio vive en la primitiva y no en la sección.
+    // Las tres que aún escriben un Alert propio explican el criterio al lado
+    // del markup, y por eso citan el rol en un comentario. `taxes`, `methods`
+    // y `employees` ya NO escriben un Alert: quedó adentro de `FormDialog`, así
+    // que la explicación del criterio vive en la primitiva y no en la sección
+    // (el comentario de employees se fue con el Alert que explicaba).
     expect(
       SECCIONES.filter(([, raw]) => adHocRoles(raw).length > 0).map(([name]) => name),
       "secciones que citan el rol en comentarios",
-    ).toEqual(["cash-section.tsx", "employees-section.tsx", "users-section.tsx", "vales-section.tsx"]);
+    ).toEqual(["cash-section.tsx", "users-section.tsx", "vales-section.tsx"]);
     expect(adHocRoles(TAXES_TSX).length, "taxes-section.tsx crudo").toBe(0);
     expect(adHocRoles(CASH_TSX).length, "cash-section.tsx crudo").toBeGreaterThan(0);
     expect(adHocRoles(CASH_CODE), "cash-section.tsx sin comentarios").toEqual([]);
@@ -347,7 +348,6 @@ describe("admin: lo efímero va por el toast (evento)", () => {
       [METHODS_CODE, '"Método creado."'],
       [TAXES_CODE, '"Impuesto actualizado."'],
       [TAXES_CODE, '"Impuesto creado."'],
-      [USERS_CODE, '"Usuario creado con su rol."'],
       [USERS_CODE, "`Clave de ${row.full_name} restablecida a su documento; deberá cambiarla al entrar.`"],
       [USERS_CODE, "`Rol de ${row.full_name} actualizado.`"],
       [VALES_CODE, '"Configuración de vales actualizada."'],
@@ -422,12 +422,13 @@ describe("admin: lo persistente va por Alert (estado)", () => {
     expect(estados, "estados de fallo declarados").toBe(8);
   });
 
-  it("las cuatro superficies que escriben su propio Alert lo hacen una sola vez y con ninguna otra variante", () => {
-    // Las que NO migraron al diálogo: la página, empleados, usuarios y vales.
+  it("las tres superficies que escriben su propio Alert lo hacen una sola vez y con ninguna otra variante", () => {
+    // Las que NO migraron al diálogo: la página, usuarios y vales. `employees`
+    // migró: su error de alta lo muestra el `FormDialog`, y esta cuenta (una
+    // apertura, una variante) pasó a ser la guarda del grupo de abajo.
     // Aquí la cuenta de `<Alert` sigue siendo la guarda, sin cambios.
     const expected: Array<[string, string]> = [
       ["app/admin/page.tsx", ADMIN_PAGE_CODE],
-      ["app/admin/admin-sections/employees-section.tsx", EMPLOYEES_CODE],
       ["app/admin/admin-sections/users-section.tsx", USERS_CODE],
       ["app/admin/admin-sections/vales-section.tsx", VALES_CODE],
     ];
@@ -443,7 +444,7 @@ describe("admin: lo persistente va por Alert (estado)", () => {
     }
   });
 
-  it("impuestos y métodos: el error del alta lo muestra el diálogo, y la sección no escribe ninguno", () => {
+  it("impuestos, métodos y empleados: el error del alta lo muestra el diálogo, y la sección no escribe ninguno", () => {
     // Antes contaban UN Alert. Ahora cuentan CERO, y por eso la cuenta sola ya
     // no prueba nada: la afirmación fuerte es la positiva del cableado —
     // `error={error}` le llega al `FormDialog`— más la negativa de que la
@@ -451,6 +452,7 @@ describe("admin: lo persistente va por Alert (estado)", () => {
     for (const [path, code] of [
       ["app/admin/admin-sections/methods-section.tsx", METHODS_CODE],
       ["app/admin/admin-sections/taxes-section.tsx", TAXES_CODE],
+      ["app/admin/admin-sections/employees-section.tsx", EMPLOYEES_CODE],
     ] as Array<[string, string]>) {
       expect(code, `${path}: sin Alert propio`).not.toMatch(ALERT_IMPORT);
       expect(alertOpenerCount(code), `${path}: Alert`).toBe(0);
@@ -502,7 +504,7 @@ describe("admin: lo persistente va por Alert (estado)", () => {
   });
 
   it("el fallo al guardar es estado: Alert destructivo junto al formulario, o adentro del diálogo", () => {
-    // Las tres que migraron al diálogo: el estado de ESE formulario se lo
+    // Las cuatro que migraron al diálogo: el estado de ESE formulario se lo
     // pasa la sección a `FormDialog`, que lo pinta como
     // `Alert variant="destructive"` adentro. Antes la affirmación era que el
     // `Alert` LITERAL estuviera en la sección; ahora es que el estado llegue al
@@ -511,6 +513,7 @@ describe("admin: lo persistente va por Alert (estado)", () => {
       ["taxes-section.tsx", TAXES_CODE, "error"],
       ["methods-section.tsx", METHODS_CODE, "error"],
       ["cash-section.tsx", CASH_CODE, "addError"],
+      ["employees-section.tsx", EMPLOYEES_CODE, "error"],
     ] as Array<[string, string, string]>) {
       // El setter se deriva del nombre del estado (`error` -> `setError`).
       const setter = `set${state[0]?.toUpperCase()}${state.slice(1)}`;
@@ -524,18 +527,15 @@ describe("admin: lo persistente va por Alert (estado)", () => {
         new RegExp(`<Alert\\s+variant="destructive"[^>]*>\\s*\\{${state}\\}`),
       );
     }
-    // `vales-section.tsx` no migró: conserva su `Alert` literal, y `users` y
-    // `employees` los suyos con la clase extra que cada uno ya tenía.
+    // `vales-section.tsx` no migró: conserva su `Alert` literal, y `users` el
+    // suyo con la clase extra que ya tenía (su confirmar y su guardar son
+    // acciones sobre el estado de la propia sección, no de un formulario).
     expect(VALES_CODE).toMatch(
       /<Alert\s+variant="destructive"[\s\S]{0,40}\{error\}[\s\S]{0,20}<\/Alert>/,
     );
     expect(VALES_CODE).toContain("const [error, setError] = useState<string | null>(null)");
-    // Los dos que llevan una clase extra la conservan.
     expect(USERS_CODE).toMatch(
       /<Alert\s+variant="destructive"\s+className="mt-3">\s*\{error\}\s*<\/Alert>/,
-    );
-    expect(EMPLOYEES_CODE).toMatch(
-      /<Alert\s+variant="destructive"\s+className="sm:col-span-2">\s*\{error\}\s*<\/Alert>/,
     );
   });
 
@@ -546,7 +546,6 @@ describe("admin: lo persistente va por Alert (estado)", () => {
       [EMPLOYEES_CODE, '"El correo del empleado es obligatorio para crear su acceso."'],
       [EMPLOYEES_CODE, "`[${created.code}] ${created.message}`"],
       [USERS_CODE, '"Seleccione un rol."'],
-      [USERS_CODE, "`[${result.code}] ${result.message}`"],
       [VALES_CODE, '"Elija al menos un día permitido."'],
       [VALES_CODE, '"Indique el tope de al menos un día."'],
       [VALES_CODE, '"Indique un tope diario mayor a 0."'],
@@ -610,7 +609,6 @@ describe("admin: el texto visible no cambió (cambia el canal, no la copia)", ()
       [METHODS_CODE, "Método creado."],
       [TAXES_CODE, "Impuesto actualizado."],
       [TAXES_CODE, "Impuesto creado."],
-      [USERS_CODE, "Usuario creado con su rol."],
       [USERS_CODE, "Clave de ${row.full_name} restablecida a su documento; deberá cambiarla al entrar."],
       [USERS_CODE, "Rol de ${row.full_name} actualizado."],
       [USERS_CODE, "Seleccione un rol."],
@@ -640,12 +638,21 @@ describe("admin: el texto visible no cambió (cambia el canal, no la copia)", ()
     expect(EMPLOYEES_CODE).not.toContain("Empleado guardado.");
     expect(VALES_CODE).not.toContain("Vales actualizados.");
     expect(ADMIN_PAGE_CODE).not.toContain("Sin sede asignada.");
+    // El diálogo muerto de "Nuevo usuario" de `users-section.tsx` se ELIMINÓ:
+    // `setCreateOpen` solo se llamaba con `false`, así que ese `Dialog` nunca
+    // pudo abrir y su alta duplicaba la que `employees-section.tsx` hace con su
+    // checkbox "Crear usuario de acceso". La copia, su toast y la acción van
+    // con él: se afirman AUSENTES en usuarios y presentes solo en el empleado.
+    expect(USERS_CODE).not.toContain("Usuario creado con su rol.");
+    expect(USERS_CODE).not.toContain("Nuevo usuario");
+    expect(USERS_CODE).not.toMatch(/adminCreateUserAction/);
+    expect(EMPLOYEES_CODE).toMatch(/adminCreateUserAction/);
   });
 
   it("los vacíos de las siete superficies siguen siendo el baseline mudo: sin Alert y sin anuncio", () => {
     // Describen lo esperado, no bloquean nada y nunca anunció nada (no
-    // tenían rol): cuatro ya son `EmptyState` y cuatro siguen en su `<p>` de
-    // texto apagado. Los dos son el MISMO baseline, así que se afirman igual:
+    // tenían rol): los ocho ya son `EmptyState`, que sigue siendo texto
+    // apagado y NO lleva `role` ni `aria-live`. Se afirman igual en todos:
     // la apertura que corresponde, el espaciado que ya tenía, y —esto es lo
     // que el helper existe para proteger— NUNCA un `Alert` ni un `aria-live`.
     // Envolverlos en `Alert` agregaría un anuncio que hoy no existe.
@@ -654,10 +661,10 @@ describe("admin: el texto visible no cambió (cambia el canal, no la copia)", ()
       [CASH_CODE, "Aún no hay denominaciones registradas.", "<EmptyState", "mt-3"],
       [METHODS_CODE, "Aún no hay métodos de pago configurados en esta sede.", "<EmptyState", "mt-2"],
       [TAXES_CODE, "Aún no hay impuestos configurados en esta sede.", "<EmptyState", "mt-2"],
-      [USERS_CODE, "Aún no hay usuarios en esta sede.", "<p", "mutedTextClass"],
-      [EMPLOYEES_CODE, "Aún no hay empleados en esta sede.", "<p", "mutedTextClass"],
-      [EMPLOYEES_CODE, "Sin resultados para ese filtro.", "<p", "mutedTextClass"],
-      [VALES_CODE, "Sin configurar: los vales no tienen límite.", "<p", "text-text-secondary"],
+      [USERS_CODE, "Aún no hay usuarios en esta sede.", "<EmptyState", "mt-2"],
+      [EMPLOYEES_CODE, "Aún no hay empleados en esta sede.", "<EmptyState", "mt-2"],
+      [EMPLOYEES_CODE, "Sin resultados para ese filtro.", "<EmptyState", "mt-2"],
+      [VALES_CODE, "Sin configurar: los vales no tienen límite.", "<EmptyState", "mt-1"],
     ];
     for (const [code, text, opener, style] of empties) {
       const block = plainTextBlock(code, text);
@@ -667,20 +674,50 @@ describe("admin: el texto visible no cambió (cambia el canal, no la copia)", ()
       // un lector de pantalla anuncie. El `Alert` ya lo pineó `plainTextBlock`.
       expect(block, `${text}: anuncia`).not.toMatch(/aria-live|\brole\s*=/);
     }
-    // Los cuatro migrados toman el primitivo, no una copia de su estilo. Y los
-    // dos que además pezcan de TODO `Alert` (impuestos y métodos) no pueden
-    // importarlo: caja conserva el suyo para las dos acciones de fila, y por
-    // eso no se le exige lo mismo.
+    // Los ocho toman el primitivo, no una copia de su estilo. Y los que además
+    // pezcan de TODO `Alert` (impuestos, métodos y empleados, que ya no
+    // escriben ninguno) no pueden importarlo: caja conserva el suyo para las
+    // dos acciones de fila, y usuarios y vales para sus errores de fila y
+    // de guardado.
     for (const [code, text, sinAlert] of [
       [CASH_CODE, "Aún no hay cajas registradas en esta sede.", false],
       [CASH_CODE, "Aún no hay denominaciones registradas.", false],
       [METHODS_CODE, "Aún no hay métodos de pago configurados en esta sede.", true],
       [TAXES_CODE, "Aún no hay impuestos configurados en esta sede.", true],
+      [USERS_CODE, "Aún no hay usuarios en esta sede.", false],
+      [EMPLOYEES_CODE, "Aún no hay empleados en esta sede.", true],
     ] as Array<[string, string, boolean]>) {
       expect(code, `${text}: import de EmptyState`).toMatch(EMPTY_STATE_MODULE);
       if (sinAlert) {
         expect(code, `${text}: sin Alert`).not.toMatch(ALERT_IMPORT);
       }
     }
+  });
+});
+
+/* ==========================================================================
+   Admin: la tabla pasa por el primitivo (DataTable)
+   ========================================================================== */
+describe("admin: la tabla pasa por el primitivo (DataTable)", () => {
+  it("empleados y usuarios renderizan su tabla con DataTable, sin piso ni envoltorio a mano", () => {
+    // Es el primer consumidor del primitivo: las dos tablas del panel vivían
+    // en `<div className="overflow-x-auto">` + `<table className="min-w-full
+    // text-left text-sm">` escritos a mano. El piso es `none` porque la tabla
+    // era `min-w-full`: adoptar el primitivo NO puede inventar un ancho que
+    // la tabla nunca tuvo (la escala está pineada en `ux-data-table.test.ts`).
+    for (const [path, code] of [
+      ["app/admin/admin-sections/employees-section.tsx", EMPLOYEES_CODE],
+      ["app/admin/admin-sections/users-section.tsx", USERS_CODE],
+    ] as Array<[string, string]>) {
+      expect(code, `${path}: import de DataTable`).toMatch(
+        /from\s*["']@\/src\/components\/ui\/lib\/data-table["']/,
+      );
+      expect(code, `${path}: envoltorio a mano ya no está`).not.toMatch(/<table\b/);
+      expect(code, `${path}: DataTable con piso explícito`).toMatch(/<DataTable\b[\s\S]*?minWidth="none"/);
+    }
+    // `vales-section.tsx` no tiene tabla: nada que migrar, y no debe
+    // importar el primitivo para fingir que sí.
+    expect(VALES_CODE).not.toMatch(/<table\b/);
+    expect(VALES_CODE).not.toMatch(/from\s*["']@\/src\/components\/ui\/lib\/data-table["']/);
   });
 });

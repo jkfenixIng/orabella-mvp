@@ -12,6 +12,7 @@ import {
 import { setVoucherLimitsAction } from "@/src/features/payroll/actions";
 import type { VoucherSettingsRow } from "@/src/features/payroll/service";
 import { Alert } from "@/src/components/ui/lib/alert";
+import { EmptyState } from "@/src/components/ui/lib/empty-state";
 import {
   buttonClass,
   ghostClass,
@@ -260,11 +261,13 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
     <div className={stackClass}>
       <section className={sectionClass} aria-label="Configuración de vales">
         <h2 className={sectionTitleClass}>Configuración de vales</h2>
-        <p className="mt-1 text-sm text-text-secondary">
-          {settings
-            ? `Actual: ${describeVoucherSettings(settings)}.`
-            : "Sin configurar: los vales no tienen límite."}
-        </p>
+        {settings ? (
+          <p className="mt-1 text-sm text-text-secondary">
+            {`Actual: ${describeVoucherSettings(settings)}.`}
+          </p>
+        ) : (
+          <EmptyState className="mt-1">Sin configurar: los vales no tienen límite.</EmptyState>
+        )}
 
         <form onSubmit={handleSubmit} className="mt-4 flex flex-col gap-5">
           <fieldset className="flex flex-col gap-2">
