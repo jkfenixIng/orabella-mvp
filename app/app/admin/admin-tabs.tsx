@@ -16,6 +16,7 @@ import { TaxesSection } from "./admin-sections/taxes-section";
 import { MethodsSection } from "./admin-sections/methods-section";
 import { ValesSection } from "./admin-sections/vales-section";
 import { CashSection } from "./admin-sections/cash-section";
+import { Tabs, TabsList, TabsPanel, TabsTrigger } from "@/src/components/ui/lib/tabs";
 import type { ActionResult } from "./admin-shared";
 
 type Tab = "empleados" | "roles" | "impuestos" | "metodos" | "vales" | "caja";
@@ -51,61 +52,51 @@ export function AdminTabs(props: AdminTabsProps) {
   }
 
   return (
-    <div className="flex flex-col gap-4">
-      <div
-        className="inline-flex flex-wrap items-center gap-1 rounded-lg border border-border-color bg-surface p-1 shadow-sm dark:border-border-color-2"
-        role="tablist"
-        aria-label="Secciones de administración"
-      >
+    <Tabs
+      value={tab}
+      onValueChange={(next) => setTab(next as Tab)}
+      label="Secciones de administración"
+      className="gap-4"
+    >
+      <TabsList>
         {TABS.map((option) => (
-          <button
-            key={option.value}
-            type="button"
-            role="tab"
-            aria-selected={tab === option.value}
-            onClick={() => setTab(option.value)}
-            className={
-              tab === option.value
-                ? "rounded-md bg-primary-600 px-3 py-1 text-sm text-white"
-                : "rounded-md px-3 py-1 text-sm text-text-secondary hover:bg-surface-hover"
-            }
-          >
+          <TabsTrigger key={option.value} value={option.value}>
             {option.label}
-          </button>
+          </TabsTrigger>
         ))}
-      </div>
+      </TabsList>
 
-      {tab === "empleados" ? (
+      <TabsPanel value="empleados">
         <EmployeesSection
           sedeId={props.sedeId}
           initial={props.initialEmployees}
           users={users}
           onUsersChanged={() => void refreshUsers()}
         />
-      ) : null}
-      {tab === "roles" ? (
+      </TabsPanel>
+      <TabsPanel value="roles">
         <UsersSection
           key={users.map((user) => user.id).join(",")}
           sedeId={props.sedeId}
           initial={users}
           currentUserId={props.currentUserId}
         />
-      ) : null}
-      {tab === "impuestos" ? (
+      </TabsPanel>
+      <TabsPanel value="impuestos">
         <TaxesSection sedeId={props.sedeId} initial={props.initialTaxes} />
-      ) : null}
-      {tab === "metodos" ? (
+      </TabsPanel>
+      <TabsPanel value="metodos">
         <MethodsSection sedeId={props.sedeId} initial={props.initialMethods} />
-      ) : null}
-      {tab === "vales" ? (
+      </TabsPanel>
+      <TabsPanel value="vales">
         <ValesSection initial={props.initialVoucherSettings} />
-      ) : null}
-      {tab === "caja" ? (
+      </TabsPanel>
+      <TabsPanel value="caja">
         <CashSection
           initialRegisters={props.initialRegisters}
           initialDenominations={props.initialDenominations}
         />
-      ) : null}
-    </div>
+      </TabsPanel>
+    </Tabs>
   );
 }
