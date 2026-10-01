@@ -56,7 +56,7 @@ Consecuencias que se respetan:
 ## Tasks
 - [x] WU-A primitivos `Alert` + toast (`sonner`) — `bf74ca5`, verificado
 - [x] WU-B módulo de referencia → **`services`** (elegido por evidencia: no aparece en ningún spec) — `e9e51d0`, verificado
-- [ ] WU-C migración del resto, con los specs que correspondan (tanda 3, previsión vales en `26349cc`; resto pendiente)
+- [x] WU-C migración del resto, con los specs que correspondan (services `e9e51d0`, alerts `ea759b2`, vales `4dc8d2b`, nómina `ac05651`, previsión vales `26349cc`, caja `8df0ba9`, login `7a3396b`, facturación `e03261e`, admin `3b9b48a`, inventario `02fb198`)
 - [x] WU-D (follow-up) tinte por tipo del toast: necesita un override en `globals.css` — `0709aa0`, verificado
 - [x] WU-E (follow-up) corregir el criterio en el comentario de `alertRole()` — `0709aa0`, verificado (solo comentario)
 
@@ -95,3 +95,4 @@ Matices que dejo la verificacion del test de `services`:
 - 2026-10-01: la tanda 2 encontro una **cita obsoleta** en `app/tests/design-tokens.test.ts:211-212`, que afirmaba que el par de tokens de warning tenia consumidores reales en `payroll-client.tsx:1142` y `vouchers-client.tsx:346,351`. Esas clases ya no viven ahi. Se corrige en la tanda 3, sin tocar ninguna asercion de ese archivo.
 - 2026-10-01: `26349cc` (WU-C, tanda 3, previsión vales): aviso en vivo de fuera de rango (`Alert` warning con `role=status` explícito) más `ConfirmDialog` al enviar fuera de rango; `feedback-batch2.test.ts` extendido solo en vales; según mensaje del commit, seis mutaciones acusadas con restauración SHA-256, gate re-verificado por el padre.
 - 2026-10-01: `0709aa0` (WU-D y WU-E): tinte por tipo del toast con override en `globals.css` más `richColors`, siete tests probados por mutación según mensaje; criterio de `alertRole()` corregido a solo comentario sin cambio de conducta ni de suite; según mensaje del commit, gate re-verificado por el padre.
+- 2026-10-01: WU-C cerrada. Migración de código completa (caja `8df0ba9`, login `7a3396b`, facturación `e03261e`, admin `3b9b48a`, inventario `02fb198`); trabajo restante solo el selector de `auth.setup.ts` y este documento.
