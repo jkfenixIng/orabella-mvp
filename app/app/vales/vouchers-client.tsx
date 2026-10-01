@@ -20,10 +20,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/src/components/ui/lib/dialog";
+import { ConfirmDialog } from "@/src/components/ui/lib/form-dialog";
 import { Combobox } from "@/src/components/ui/lib/combobox";
 import { Alert } from "@/src/components/ui/lib/alert";
 import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 import type { ActionResult } from "@/src/shared/lib/api-response";
+import { bogotaDay } from "@/src/shared/lib/dates";
+import { checkVoucherEligibility, weekStartOf } from "@/src/features/payroll/schemas";
 import { toNumber } from "@/src/shared/lib/format";
 import { cn } from "@/src/components/ui/lib/utils";
 import {
@@ -108,6 +111,10 @@ export function VouchersClient(props: VouchersClientProps) {
   const [dateTo, setDateTo] = useState("");
   // V1: sin topes configurados no se puede solicitar; el alta vive en un modal.
   const [isCreateOpen, setIsCreateOpen] = useState(false);
+  // V1 (previsión): el fuera de rango no se envía directo: abre la
+  // confirmación que dice que nacerá pendiente en revisión del admin. En
+  // rango este diálogo nunca se abre.
+  const [outOfRangeConfirmOpen, setOutOfRangeConfirmOpen] = useState(false);
   /**
    * CL-5: marca de idempotencia del INTENTO de solicitud de vale.
    *
@@ -159,6 +166,55 @@ export function VouchersClient(props: VouchersClientProps) {
     if (day > 0) parts.push(`día ${formatMoney(day)}`);
     if (week > 0) parts.push(`semana ${formatMoney(week)}`);
     return parts.length > 0 ? parts.join(" · ") : "sin topes";
+  })();
+  // V1 (previsión, no veredicto): ¿este borrador nacería PENDIENTE en
+  // revisión del admin? Se deriva en vivo de lo que la pantalla YA tiene —los
+  // topes de `settings` más los acumulados de los `vouchers` cargados—, sin
+  // llamada nueva: la fecha la asigna el backend (día de la solicitud en
+  // Bogotá) y los acumulados son los vigentes que el servicio sumaría
+  // (pendiente/aprobada del empleado en el día y en la semana). La
+  // elegibilidad la decide LA MISMA función pura que usa el servicio, así que
+  // el aviso anticipa su veredicto en vez de adivinarlo. `null` = en rango (o
+  // sin nada que decir todavía): no hay aviso y el envío sigue directo.
+  const voucherReviewNotice = (() => {
+    if (!configured) return null;
+    if (!voucherEmployee) return null;
+    const requested = toNumber(voucherAmount);
+    if (requested === null || requested <= 0) return null;
+    // El mismo día que el backend va a asignar: avisar sobre otro día sería
+    // prometer lo que no va a pasar.
+    const today = bogotaDay();
+    const weekStart = weekStartOf(today);
+    let dayTotal = 0;
+    let weekTotal = 0;
+    for (const row of vouchers) {
+      if (row.employee_id !== voucherEmployee) continue;
+      if (row.status !== "pendiente" && row.status !== "aprobada") continue;
+      // Misma semana = mismo lunes: equivale a la ventana [lunes, lunes+6]
+      // del servicio sin aritmética de fechas en el cliente.
+      if (weekStartOf(row.request_date) !== weekStart) continue;
+      weekTotal = weekTotal + Number(row.amount);
+      if (row.request_date === today) dayTotal = dayTotal + Number(row.amount);
+    }
+    const eligibility = checkVoucherEligibility({
+      dayTotal,
+      weekTotal,
+      requested,
+      maxPerDay: settings?.max_per_day == null ? null : Number(settings.max_per_day),
+      maxPerWeek: settings?.max_per_week == null ? null : Number(settings.max_per_week),
+      requestDate: today,
+      allowedDays: settings?.allowed_days ?? null,
+      perDayLimits: settings?.per_day_limits ?? null,
+    });
+    const overCap = eligibility.overDay || eligibility.overWeek;
+    if (!overCap && !eligibility.dayNotAllowed) return null;
+    if (overCap && eligibility.dayNotAllowed) {
+      return "Este vale supera el tope vigente y hoy no es un día permitido: nacerá pendiente y el admin debe autorizarlo.";
+    }
+    if (eligibility.dayNotAllowed) {
+      return "Hoy no es un día permitido para vales: este vale nacerá pendiente y el admin debe autorizarlo.";
+    }
+    return "Este vale supera el tope vigente: nacerá pendiente y el admin debe autorizarlo.";
   })();
 
   function show<T>(result: ActionResult<T>, okText?: string): result is { success: true; data: T } {
@@ -217,6 +273,18 @@ export function VouchersClient(props: VouchersClientProps) {
       setError("Elija el método de pago por el que saldrá el dinero.");
       return;
     }
+    // V1: fuera de rango no se envía todavía: primero se confirma que nacerá
+    // pendiente en revisión del admin. En rango se sigue directo, como antes.
+    if (voucherReviewNotice !== null && !outOfRangeConfirmOpen) {
+      setOutOfRangeConfirmOpen(true);
+      return;
+    }
+    await submitVoucherRequest(amount);
+  }
+
+  // El envío real del vale: la MISMA llamada con el MISMO payload de siempre.
+  // Llega acá directo (en rango) o tras confirmar (fuera de rango).
+  async function submitVoucherRequest(amount: number) {
     setBusy(true);
     // CL-5: la marca del INTENTO. Se acuña al empezar y se conserva si el
     // intento falla (el reintento tiene que llevar la misma para que el servidor
@@ -233,6 +301,10 @@ export function VouchersClient(props: VouchersClientProps) {
       observation: voucherNote || undefined,
     })) as ActionResult<VoucherRequestResult>;
     setBusy(false);
+    // V1: la confirmación cumplió su papel en cuanto el intento obtuvo
+    // respuesta: el éxito o el fallo se muestran donde siempre (toast y Alert
+    // del alta, que queda al descubierto). No se reabre ni se reintenta sola.
+    setOutOfRangeConfirmOpen(false);
     if (
       show(
         result,
@@ -394,6 +466,7 @@ export function VouchersClient(props: VouchersClientProps) {
           </Alert>
         )}
         {props.canIssue && (
+          <>
           <Dialog
             open={isCreateOpen}
             onOpenChange={(open) => {
@@ -453,6 +526,18 @@ export function VouchersClient(props: VouchersClientProps) {
                   Observación (opcional)
                   <input value={voucherNote} onChange={(event) => setVoucherNote(event.target.value)} className={inputClass} />
                 </label>
+                {voucherReviewNotice && (
+                  // V1: aviso DERIVADO EN VIVO mientras se escribe (no el
+                  // desenlace de una acción enviada): presentación `Alert`
+                  // con `role="status"` explícito (polite). `warning`
+                  // derivaría `alert` (asertivo), e interrumpir un cálculo en
+                  // curso es el sobreanuncio que el estándar prohíbe (§1).
+                  // Solo existe cuando hay algo que decir: con el aviso en
+                  // `null` no se renderiza nada.
+                  <Alert variant="warning" role="status">
+                    {voucherReviewNotice}
+                  </Alert>
+                )}
                 <DialogFooter>
                   <button type="button" className={ghostClass} onClick={closeCreateDialog}>
                     Cancelar
@@ -464,6 +549,29 @@ export function VouchersClient(props: VouchersClientProps) {
               </form>
             </DialogContent>
           </Dialog>
+          {/* V1: fuera de rango no nace directo: confirma que nacerá PENDIENTE
+              en revisión del admin. En rango este diálogo nunca se abre y el
+              envío sigue directo, como antes. */}
+          <ConfirmDialog
+            open={outOfRangeConfirmOpen}
+            onOpenChange={(open) => {
+              if (!open) setOutOfRangeConfirmOpen(false);
+            }}
+            title="Solicitar vale fuera de rango"
+            description={voucherReviewNotice}
+            confirmLabel="Solicitar igual"
+            busyLabel="Solicitando…"
+            variant="default"
+            busy={busy}
+            onConfirm={() => {
+              // El aviso solo existe con monto válido, pero la carga útil
+              // nunca se inventa: sin monto no se envía nada.
+              const amount = toNumber(voucherAmount);
+              if (amount === null) return;
+              void submitVoucherRequest(amount);
+            }}
+          />
+          </>
         )}
         <div className="mt-4 flex flex-wrap items-end gap-3">
           <label className={labelClass}>

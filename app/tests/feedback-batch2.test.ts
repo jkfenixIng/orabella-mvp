@@ -174,7 +174,6 @@ describe("detector de roles ad-hoc: no es un sello de goma", () => {
     const modules: Array<[string, string]> = [
       ["app/alerts/alerts-client.tsx", ALERTS_CLIENT_CODE],
       ["app/alerts/page.tsx", ALERTS_PAGE_CODE],
-      ["app/vales/vouchers-client.tsx", VALES_CLIENT_CODE],
       ["app/vales/page.tsx", VALES_PAGE_CODE],
       ["app/payroll/page.tsx", PAYROLL_PAGE_CODE],
     ];
@@ -189,6 +188,15 @@ describe("detector de roles ad-hoc: no es un sello de goma", () => {
     expect(
       [...PAYROLL_CLIENT_CODE.matchAll(/<Alert variant="destructive" role="status">/g)],
     ).toHaveLength(2);
+    // Excepción DELIBERADA (vales): UN `role="status"` explícito sobre el
+    // aviso previo del fuera de rango, que se deriva en vivo del formulario
+    // (empleado + monto) y por eso anuncia `polite` (test dedicado más
+    // abajo). Cualquier otro `role=` en vales sigue siendo el defecto que
+    // esta guarda caza.
+    expect(adHocRoles(VALES_CLIENT_CODE), "excepción deliberada (vales)").toEqual(["role="]);
+    expect(
+      [...VALES_CLIENT_CODE.matchAll(/<Alert variant="warning" role="status">/g)],
+    ).toHaveLength(1);
   });
 });
 
@@ -390,6 +398,131 @@ describe("vales: el texto visible no cambió (cambia el canal, no la copia)", ()
       expect(lines[0], text).not.toContain("Alert");
       expect(lines[0], text).toContain("text-text-tertiary");
     }
+  });
+});
+
+/* ==========================================================================
+   Vales: el fuera de rango avisa ANTES de crearse (V1).
+
+   El defecto era de previsión: un vale sobre el tope (o en día no permitido)
+   se creaba sin aviso y el usuario se enteraba después, cuando ya estaba
+   pendiente en revisión del admin. La foresight usa lo que la pantalla YA
+   tiene (topes de `settings` + acumulados de los `vouchers` cargados, misma
+   función pura de elegibilidad que el servicio): sin llamada nueva, sin
+   cambio de contrato, sin cambiar el veredicto — solo se anticipa.
+
+   Dos superficies, una por momento (tabla §1 del estándar):
+   - Mientras se escribe -> señal derivada en vivo: presentación `Alert` con
+     `role="status"` EXPLÍCITO (polite). `warning` derivaría `alert`
+     (asertivo) e interrumpir un cálculo en curso es el sobreanuncio que el
+     estándar prohíbe. Solo existe cuando hay algo que decir.
+   - Al enviar fuera de rango -> `ConfirmDialog` (confirmación en proceso
+     delicado) cuya descripción dice la consecuencia: nacerá PENDIENTE en
+     revisión del admin. En rango el envío sigue directo, como antes.
+   ========================================================================== */
+describe("vales: el fuera de rango avisa antes de crearse (V1)", () => {
+  /**
+   * El aviso previo, recortado a su construcción: desde
+   * `const voucherReviewNotice` hasta el cierre de su IIFE. Así los
+   * `return null` se afirman sobre el constructor y no sobre todo el archivo.
+   */
+  function reviewNotice(): string {
+    const start = VALES_CLIENT_CODE.indexOf("const voucherReviewNotice = ");
+    expect(start, "constructor del aviso previo").toBeGreaterThan(-1);
+    const end = VALES_CLIENT_CODE.indexOf("})();", start);
+    expect(end, "cierre del constructor del aviso previo").toBeGreaterThan(start);
+    return VALES_CLIENT_CODE.slice(start, end);
+  }
+
+  it("el aviso previo existe y es polite por decisión explícita, no por defecto", () => {
+    // Se pinea el atributo ESCRITO, no el rol derivado: si alguien borra el
+    // `role="status"` "porque el warning ya avisa", el aviso pasaría a
+    // asertivo e interrumpiría a quien teclea, y esto acusa.
+    const lines = linesWith(VALES_CLIENT_CODE, '<Alert variant="warning" role="status">');
+    expect(lines).toHaveLength(1);
+    expect(alertsWithExplicitStatusRole(VALES_CLIENT_CODE, "warning")).toBe(1);
+    // CONTROL NEGATIVO: el detector discrimina la variante (heredado del pin
+    // de nómina): un `status` sobre otra variante no cuenta como este aviso.
+    expect(alertsWithExplicitStatusRole(VALES_CLIENT_CODE, "destructive")).toBe(0);
+  });
+
+  it("el aviso solo aparece cuando hay algo que decir", () => {
+    // Render condicional: con el aviso en `null` no se renderiza nada (ni un
+    // Alert vacío ni texto suelto).
+    expect(VALES_CLIENT_CODE).toMatch(
+      /\{\s*voucherReviewNotice\s*&&\s*\(\s*<Alert\s+variant="warning"\s+role="status">/,
+    );
+    const notice = reviewNotice();
+    // Sin nada que decir: sin configurar, sin empleado, sin monto válido o
+    // en rango. Cada `return null` es un caso que apaga el aviso.
+    for (const guard of [
+      "if (!configured) return null",
+      "if (!voucherEmployee) return null",
+      "if (requested === null || requested <= 0) return null",
+      "if (!overCap && !eligibility.dayNotAllowed) return null",
+    ]) {
+      expect(notice, guard).toContain(guard);
+    }
+  });
+
+  it("el aviso dice la consecuencia explícita: pendiente en revisión del admin", () => {
+    const notice = reviewNotice();
+    // Las tres formas (tope, día, ambas) terminan en la misma consecuencia.
+    // Se pinea el literal COMPLETO de cada una: un `toContain("pendiente")`
+    // pasaría con cualquier mención casual y sería decorativo.
+    for (const copy of [
+      '"Este vale supera el tope vigente: nacerá pendiente y el admin debe autorizarlo."',
+      '"Hoy no es un día permitido para vales: este vale nacerá pendiente y el admin debe autorizarlo."',
+      '"Este vale supera el tope vigente y hoy no es un día permitido: nacerá pendiente y el admin debe autorizarlo."',
+    ]) {
+      expect(notice, copy).toContain(copy);
+    }
+  });
+
+  it("el fuera de rango se confirma: la consecuencia va en la descripción", () => {
+    // Superficie (tabla §1): confirmar algo delicado -> `ConfirmDialog` con
+    // título + descripción; el cuerpo dice la consecuencia, no "¿seguro?".
+    expect(VALES_CLIENT_CODE).toMatch(
+      /import\s*\{\s*ConfirmDialog\s*\}\s*from\s*["']@\/src\/components\/ui\/lib\/form-dialog["']/,
+    );
+    const dialogs = linesWith(VALES_CLIENT_CODE, "<ConfirmDialog");
+    expect(dialogs).toHaveLength(1);
+    expect(VALES_CLIENT_CODE).toContain('title="Solicitar vale fuera de rango"');
+    expect(VALES_CLIENT_CODE).toMatch(
+      /<ConfirmDialog[\s\S]{0,600}description=\{voucherReviewNotice\}/,
+    );
+    expect(VALES_CLIENT_CODE).toContain('confirmLabel="Solicitar igual"');
+    // Control negativo del "¿seguro?": no hay copia genérica de confirmación.
+    expect(VALES_CLIENT_CODE).not.toContain("¿Seguro?");
+  });
+
+  it("la puerta: el submit decide, solo el confirmado envía", () => {
+    const decide = functionBody(VALES_CLIENT_CODE, "async function handleRequestVoucher");
+    // Fuera de rango: abre la confirmación y vuelve sin enviar.
+    expect(decide).toContain("if (voucherReviewNotice !== null && !outOfRangeConfirmOpen) {");
+    expect(decide).toContain("setOutOfRangeConfirmOpen(true)");
+    // En rango: camino directo al envío, como antes.
+    expect(decide).toContain("await submitVoucherRequest(amount)");
+    // El que decide NO llama a la acción: el envío vive solo en el confirmado.
+    expect(decide).not.toContain("requestVoucherAction");
+    const sender = functionBody(VALES_CLIENT_CODE, "async function submitVoucherRequest");
+    expect(sender).toContain("requestVoucherAction({");
+  });
+
+  it("en rango el envío no cambió: misma acción, mismo payload", () => {
+    const sender = functionBody(VALES_CLIENT_CODE, "async function submitVoucherRequest");
+    for (const line of [
+      "idempotency_key: voucherKey,",
+      "employee_id: voucherEmployee,",
+      "amount,",
+      "method_code: voucherMethod,",
+      "observation: voucherNote || undefined,",
+    ]) {
+      expect(sender, line).toContain(line);
+    }
+    // El desenlace tampoco: el diálogo se cierra y la lista se refresca.
+    expect(sender).toContain("closeCreateDialog();");
+    expect(sender).toContain("await refreshVouchers();");
   });
 });
 
