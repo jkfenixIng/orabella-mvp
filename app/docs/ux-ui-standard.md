@@ -307,6 +307,7 @@ veces con grep de substring: `text-text-primary` termina en `text-primary`, y
 | `ux-structure.test.ts` **(nuevo)** | El shell copiado en un `page.tsx`, y `min-h-screen` en un hijo del shell |
 | `ux-dialog.test.ts` **(nuevo)** | Un `DialogContent` sin `DialogTitle` |
 | `ux-tabs.test.ts` **(nuevo)** | `role="tablist"` sin `tabpanel` en el mismo archivo |
+| `ux-data-table.test.ts` **(nuevo)** | Un `min-w-[Npx]` inventado fuera del primitivo (allowlist exacta de la deuda) |
 | `ux-empty-state.test.ts` **(nuevo)** | `EmptyState` sin `role` ni `aria-live`, con tokens del proyecto |
 | `ux-adoption.test.ts` **(nuevo)** | Ningún `DialogContent` sin `DialogTitle` en el árbol (allowlist exacta); sin `role="tab*"` ni `min-w-[Npx]` a mano en admin |
 

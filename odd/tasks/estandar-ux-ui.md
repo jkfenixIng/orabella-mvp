@@ -120,13 +120,23 @@ Antes de planificar se verificó contra el código, no contra la prosa:
 - [x] **WU5a** `DataTable` + `tests/ux-data-table.test.ts` (render real con
   `react-dom/server`). Primitivo sin migrar. Deuda medida: **18** valores
   `min-w-[Npx]` inventados, en allowlist con conteo exacto por archivo.
-- [ ] **WU6** Refactor de `/admin` como implementación de referencia: `Tabs` en
-  `admin-tabs.tsx`, las tres secciones inline (Impuestos, Métodos, Caja) →
-  `FormDialog`, confirmación en la baja de denominaciones, ancho de página,
-  `EmptyState` en los 7 vacíos, `DataTable` en las tablas, y
-  `tests/ux-adoption.test.ts`.
-- [ ] **WU7** Cierre: gate completo, actualización de `odd/tasks/` y README del
-  módulo admin.
+- [x] **WU6** Refactor de `/admin` como implementación de referencia, en tres
+  commits: `Tabs` en `admin-tabs.tsx` (WU6a); las tres secciones inline
+  (Impuestos, Métodos, Caja) → `FormDialog` + `ConfirmDialog` para la baja
+  (WU6b, con `feedback-batch4` re-based del mecanismo al resultado);
+  empleados/usuarios/vales → `FormDialog`/`DataTable`/`EmptyState` con el
+  diálogo muerto "Nuevo usuario" eliminado (WU6c). `DataTable` consigue su
+  primer consumidor (empleados y usuarios, `minWidth="none"`).
+  `tests/ux-adoption.test.ts` cierra el loop (WU6d).
+- [x] **WU8** (pedido del dueño en mitad de la tanda) Login + cambio forzado:
+  toggles de visibilidad con `aria-pressed`, pista en vivo derivada en `info`
+  que no bloquea el envío, panel ámbar a mano → `Alert warning`, botones a
+  `buttonClass`. `feedback-batch5` re-based a 2 fallos confirmados + 1 señal
+  derivada + 1 panel, con mutaciones.
+- [x] **WU7** Cierre: gate completo en serie por el padre (`typecheck` 0 ·
+  `eslint` 0 errores · **34 archivos / 1442 tests** · `next build` ✓ 22/22),
+  10 commits aislados por unidad en `feat/orabella-mvp` (sin push), casillas
+  marcadas y fila faltante de `ux-data-table` agregada a la tabla §10.
 
 ## Acceptance
 - Existe un `app/docs/ux-ui-standard.md` que decide casos, no que enuncia deseos.
@@ -154,8 +164,8 @@ Antes de planificar se verificó contra el código, no contra la prosa:
 - 2026-10-01: WU6d (esta unidad) terminado: `tests/ux-empty-state.test.ts`
   (contrato del `EmptyState` mudo) + `tests/ux-adoption.test.ts` (adopción en
   todo el árbol, con allowlist exacta de los 6 diálogos de facturación bajo
-  F1) y reconciliación de docs. WU7 (gate final en serie + cierre, dueño: el
-  parent) queda abierto.
+  F1) y reconciliación de docs. WU7 (gate final en serie + cierre) ejecutado
+  por el padre: 34 archivos / 1442 tests, build 22/22, 10 commits.
 
 ### Hallazgos que corrigieron al padre (no al revés)
 1. **El warning de Radix no existe en esta versión.** Instruí verificar el aviso
