@@ -25,8 +25,8 @@ setup("login admin de pruebas", async ({ page }) => {
   const forceHeading = page.getByRole("heading", { name: /cambio de clave/i });
   const modules = page.getByRole("region", { name: /módulos/i });
   // El anunciador de rutas de Next (__next-route-announcer__) también usa
-  // role=alert vacío: los errores reales viven en <p role=alert> del form.
-  const alert = page.locator("form p[role=alert]");
+  // role=alert vacío: los errores reales viven en el Alert del form (un div con role=alert).
+  const alert = page.locator("form [role=alert]");
   await expect(forceHeading.or(modules).or(alert)).toBeVisible({ timeout: 60_000 });
 
   // Cambio forzado la primera vez (AUTH-01): clave 8+ con letra y número.
