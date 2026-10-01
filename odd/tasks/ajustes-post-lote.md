@@ -47,7 +47,7 @@ Out:
 - [ ] **N1** Nómina: listado de períodos escalable (filtro/organización para un año de datos).
 - [x] **I1** Inventario: combobox con filtro — cerrado el 2026-09-25 por decisión del usuario. La premisa era falsa: en `app/app/inventory/inventory-client.tsx:549-572` no hay un `<select>` sino un `Select` de Radix con un `Input` de filtro embebido (`movementProductQuery`, `:110-118`), y el `Combobox` canónico ya existe en `src/components/ui/lib/combobox.tsx` (usado en facturación). El usuario confirmó que inventario/productos está bien como está. Residuo anotado, fuera de alcance: `listProducts` tope en 50 (`src/features/inventory/service.ts:46-49`), así que con catálogo real el filtro no alcanza.
 - [ ] **N2** Nómina individual auditada (un empleado, con registro de quién y por qué). **BLOQUEADO hasta precisar la regla de negocio.**
-- [ ] **F1** Facturación: uniformidad de los 6 modales (`DialogHeader/Footer`, tokens); conservar la hoja de factura.
+- [x] **F1** Facturación: uniformidad de los 6 modales (`DialogHeader/Footer`, tokens); conservar la hoja de factura. Cerrado el 2026-10-01: los 6 `DialogContent` llevan `DialogHeader` neutro + `DialogTitle` sr-only derivado del texto visible (edición y comisión agregan `DialogDescription` sr-only del párrafo explicativo); hoja `--paper-*`, chrome y flujos intactos.
 - [x] **B1** Fix TZ en `app/src/features/admin/schemas.ts:117` ("no futura" con día Bogotá) — commit `19d6798`.
 - [ ] **M1** (opcional, requiere decisión) Default de `voucher_requests.request_date` al día Bogotá.
 

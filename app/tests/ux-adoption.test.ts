@@ -91,18 +91,11 @@ function readProductionSources(): Map<string, string> {
  * falla. Misma honestidad que `no-raw-palette.test.ts`: lo permitido es lo que
  * otra tanda ya posee, no una aspiración.
  */
-const TITLE_ALLOWLIST = new Map<string, { titleless: number; reason: string }>([
-  [
-    "app/invoices/invoices-client.tsx",
-    {
-      titleless: 6,
-      reason:
-        "F1 en `odd/tasks/ajustes-post-lote.md`: los 6 `DialogContent` sin " +
-        "`DialogTitle` heredados. Su uniformidad (`DialogHeader`/`Footer`, " +
-        "tokens) es una tanda propia diferida, no deuda olvidada.",
-    },
-  ],
-]);
+// Vacía desde F1 en `odd/tasks/ajustes-post-lote.md`: los 6 `DialogContent` de
+// facturación ya llevan su `DialogTitle`, así que ningún archivo necesita
+// permiso: cualquier diálogo sin título —en cualquier archivo— falla la guarda
+// de abajo. La lista se conserva (vacía) para no cambiar el mecanismo.
+const TITLE_ALLOWLIST = new Map<string, { titleless: number; reason: string }>([]);
 
 const SOURCES = readProductionSources();
 
@@ -254,15 +247,15 @@ describe("control negativo: la guarda de nombre accesible acusa de verdad", () =
     expect(dialogsWithoutTitle(sample)).toEqual(["<DialogContent>"]);
   });
 
-  it("un SÉPTIMO diálogo sin título en facturación rompería la allowlist exacta", () => {
-    // El fuente real, más el bloque que alguien agregaría: el conteo deja de
-    // ser 6 y la afirmación de arriba falla. Sin conteo exacto, este séptimo
-    // pasaría de largo.
+  it("un diálogo sin título en facturación rompería la guarda absoluta", () => {
+    // La allowlist se retiró (F1: 6 → 0): el fuente real ya no tiene bloques
+    // sin título, así que UN solo bloque roto en memoria basta para acusarlo.
+    // Sin el predicado por bloque, este pasaría de largo.
     const real = SOURCES.get("app/invoices/invoices-client.tsx") ?? "";
-    expect(real, "el archivo permitido está en el walk").not.toBe("");
-    const withSeventh = `${real}<DialogContent><p>nuevo modal</p></DialogContent>`;
-    expect(dialogsWithoutTitle(withSeventh)).toHaveLength(7);
-    expect(7).not.toBe(TITLE_ALLOWLIST.get("app/invoices/invoices-client.tsx")?.titleless);
+    expect(real, "el archivo está en el walk").not.toBe("");
+    expect(dialogsWithoutTitle(real)).toEqual([]);
+    const withBroken = `${real}<DialogContent><p>nuevo modal</p></DialogContent>`;
+    expect(dialogsWithoutTitle(withBroken)).toHaveLength(1);
   });
 
   it("un diálogo sin título en CUALQUIER otro archivo se acusa por bloque", () => {

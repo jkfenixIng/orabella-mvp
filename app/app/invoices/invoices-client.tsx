@@ -41,6 +41,9 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
 } from "@/src/components/ui/lib/dialog";
 import { Input } from "@/src/components/ui/lib/input";
 import { Label } from "@/src/components/ui/lib/label";
@@ -1344,6 +1347,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 </button>
                 <DialogContent className="max-w-5xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
                   <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
+                    <DialogHeader className="block">
+                      <DialogTitle className="sr-only">FACTURA DE VENTA</DialogTitle>
                     <div className="border-b-4 border-double border-paper-line-strong px-6 py-5 sm:px-8">
                       <div className="flex flex-wrap items-start justify-between gap-4">
                         <div>
@@ -1359,6 +1364,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         </div>
                       </div>
                     </div>
+                    </DialogHeader>
                     <form onSubmit={submitInvoice} className="flex flex-col gap-5 px-6 py-5 sm:px-8">
                       <div className="grid gap-4 sm:grid-cols-2">
                         <label className="flex flex-col gap-1 text-sm font-medium">
@@ -1948,6 +1954,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     >
                     <DialogContent className="max-w-4xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
                       <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
+                        <DialogHeader className="block">
+                          <DialogTitle className="sr-only">FACTURA #{detail.invoice.consecutive_number} {detail.invoice.status}</DialogTitle>
                         <div className="border-b-4 border-double border-paper-line-strong px-6 py-5 sm:px-8">
                           <div className="flex flex-wrap items-start justify-between gap-4">
                             <div>
@@ -1974,6 +1982,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             </div>
                           </div>
                         </div>
+                        </DialogHeader>
                         <div className="flex flex-col gap-5 px-6 py-5 sm:px-8">
                           <div className="grid gap-4 sm:grid-cols-2 text-sm">
                             <p>
@@ -2236,6 +2245,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     >
                       <DialogContent className="max-w-5xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
                         <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
+                          <DialogHeader className="block">
+                            <DialogTitle className="sr-only">EDITAR FACTURA #{detail?.invoice.consecutive_number ?? "—"}</DialogTitle>
+                            <DialogDescription className="sr-only">
+                              {isFreeEdit
+                                ? "Edición libre de emitida (sin motivo, el total se recalcula)"
+                                : "Edición con motivo y auditoría"}
+                            </DialogDescription>
                           <div className="border-b-4 border-double border-paper-line-strong px-6 py-5 sm:px-8">
                             <div className="flex flex-wrap items-start justify-between gap-4">
                               <div>
@@ -2260,6 +2276,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               </div>
                             </div>
                           </div>
+                          </DialogHeader>
                           <div className="flex flex-col gap-5 px-6 py-5 sm:px-8">
                             {!isFreeEdit && (
                               <label className="flex flex-col gap-1 text-sm font-medium">
@@ -2735,6 +2752,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
       >
         <DialogContent className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
           <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
+            <DialogHeader className="block">
+              <DialogTitle className="sr-only">
+                {itemDialogTarget === "edit" ? "Agregar ítem a la edición" : "Agregar ítem"}
+              </DialogTitle>
             <div className="border-b border-paper-line px-5 py-3">
               <h2 className="text-lg font-bold">
                 {itemDialogTarget === "edit" ? "Agregar ítem a la edición" : "Agregar ítem"}
@@ -2746,6 +2767,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 )}
               </p>
             </div>
+            </DialogHeader>
             <div className="flex flex-col gap-3 px-5 py-3">
               <div>
                 <p className="mb-2 text-sm font-medium">Tipo</p>
@@ -3063,6 +3085,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
           }}
         >
           <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
+            <DialogHeader className="block">
+              <DialogTitle className="sr-only">Pagar comisión al empleado</DialogTitle>
+              <DialogDescription className="sr-only">
+                {commissionInvoice ? `Factura #${commissionInvoice.number}` : "Factura"} · el pago
+                sale de la caja del turno abierto.
+              </DialogDescription>
             <div className="border-b border-paper-line px-6 py-4">
               <h2 className="text-lg font-bold">Pagar comisión al empleado</h2>
               <p className="text-sm text-paper-ink-muted">
@@ -3070,6 +3098,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 pago sale de la caja del turno abierto.
               </p>
             </div>
+            </DialogHeader>
             <div className="flex flex-col gap-4 px-6 py-4">
               {commissionRows.map((row, index) => (
                 <div key={row.employee_id} className="rounded-lg border border-paper-line p-3">
@@ -3151,6 +3180,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
       >
         <DialogContent className="max-w-sm border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
           <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
+            <DialogHeader className="block">
+              <DialogTitle className="sr-only">
+                {confirmKind === "bajo_cobrado"
+                  ? "Total por debajo de lo cobrado"
+                  : confirmKind === "annul"
+                    ? "Anular factura"
+                    : confirmKind === "pay"
+                      ? "Pagar factura"
+                      : hasImmediatePayment
+                        ? "Emitir y pagar"
+                        : "Emitir factura"}
+              </DialogTitle>
             <div className="px-6 pt-5">
               <h2 className="text-lg font-bold">
                 {confirmKind === "bajo_cobrado"
@@ -3181,6 +3222,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       : `¿Está seguro de emitir la factura por ${formatMoney(draftGrandTotal)}? Esta acción genera un registro permanente que no se podrá eliminar.`}
               </p>
             </div>
+            </DialogHeader>
             <div className="flex flex-wrap items-center justify-end gap-3 px-6 py-4">
               <button
                 type="button"
