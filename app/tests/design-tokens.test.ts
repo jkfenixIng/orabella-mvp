@@ -251,7 +251,7 @@ const STATUS_PAIRS: StatusPair[] = [
     darkTextSelector: ".dark .text-success",
   },
   {
-    label: "aviso ámbar (page.tsx, cash-client.tsx, login-form.tsx, payroll-client.tsx, vouchers-client.tsx)",
+    label: "aviso ámbar (page.tsx, cash-client.tsx, login-form.tsx)",
     ramp: "--color-warning",
     bg: "--color-warning-50",
     fg: "--color-warning-600",
