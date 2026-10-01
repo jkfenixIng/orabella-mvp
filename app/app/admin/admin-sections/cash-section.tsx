@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useState } from "react";
 import { toast } from "sonner";
 import {
   deleteDenominationAction,
@@ -9,19 +9,37 @@ import {
 } from "@/src/features/cash/actions";
 import type { CashDenominationRow, CashRegisterRow } from "@/src/features/cash/service";
 import { Alert } from "@/src/components/ui/lib/alert";
+import { EmptyState } from "@/src/components/ui/lib/empty-state";
+import { ConfirmDialog, FormDialog } from "@/src/components/ui/lib/form-dialog";
 import {
   buttonClass,
   inputClass,
   labelClass,
   linkButtonClass,
   listItemClass,
-  mutedTextClass,
   sectionClass,
   sectionTitleClass,
   stackClass,
 } from "../admin-styles";
 import { formatMoney, type ActionResult } from "../admin-shared";
 
+/**
+ * Tres superficies y, por lo tanto, tres estados de fallo distintos (estándar
+ * §1, "un hecho, un canal"):
+ *
+ *  - "Base de caja": la base es un ajuste POR FILA, así que el guardado sigue
+ *    inline y su error, inline y persistente, en el `Alert` de la sección.
+ *  - "Denominaciones", alta: es un formulario de creación, o sea un diálogo;
+ *    su error lo muestra `FormDialog` adentro.
+ *  - "Denominaciones", Activar/Desactivar y eliminar: acciones de fila.
+ *    Desactivar es reversible y queda inline; eliminar es IRREVERSIBLE, así
+ *    que pasa por `ConfirmDialog`. Las dos comparten el `Alert` de la lista
+ *    porque son la misma superficie.
+ *
+ * Antes estas tres compartían UN `error` que se pintaba siempre en el mismo
+ * sitio: el fallo de la base aparecía dentro de la sección de denominaciones y
+ * el del alta se leía pegado a una lista con la que no tenía nada que ver.
+ */
 export function CashSection({
   initialRegisters,
   initialDenominations,
@@ -34,23 +52,48 @@ export function CashSection({
   const [baseDrafts, setBaseDrafts] = useState<Record<string, string>>({});
   const [newKind, setNewKind] = useState("billete");
   const [newValue, setNewValue] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<CashDenominationRow | null>(null);
+  const [baseError, setBaseError] = useState<string | null>(null);
+  const [addError, setAddError] = useState<string | null>(null);
+  const [denominationError, setDenominationError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  function openAdd() {
+    setNewKind("billete");
+    setNewValue("");
+    setAddError(null);
+    setAddOpen(true);
+  }
+
+  function closeAdd() {
+    setAddOpen(false);
+    setAddError(null);
+  }
+
+  function openDelete(row: CashDenominationRow) {
+    setDenominationError(null);
+    setPendingDelete(row);
+  }
+
+  function closeDelete() {
+    setPendingDelete(null);
+  }
 
   async function handleBase(registerId: string) {
     const raw = (baseDrafts[registerId] ?? "").replace(/\D/g, "");
     if (raw === "") {
-      setError("Indique la nueva base.");
+      setBaseError("Indique la nueva base.");
       return;
     }
     setBusy(true);
-    setError(null);
+    setBaseError(null);
     const result: ActionResult<CashRegisterRow> = await updateRegisterBaseAction(registerId, {
       base_configurada: Number(raw),
     });
     setBusy(false);
     if (!result.success) {
-      setError(result.message);
+      setBaseError(result.message);
       return;
     }
     setRegisters((current) => current.map((row) => (row.id === result.data.id ? result.data : row)));
@@ -58,32 +101,33 @@ export function CashSection({
     toast.success("Base actualizada.");
   }
 
-  async function handleAddDenomination(event: FormEvent) {
-    event.preventDefault();
+  // `FormDialog` ya cortó el submit nativo: acá solo va la lógica.
+  async function handleAddDenomination() {
     const value = Number(newValue.replace(/\D/g, ""));
     if (!Number.isFinite(value) || value <= 0) {
-      setError("Indique un valor mayor a 0.");
+      setAddError("Indique un valor mayor a 0.");
       return;
     }
     setBusy(true);
-    setError(null);
+    setAddError(null);
     const result: ActionResult<CashDenominationRow> = await upsertDenominationAction({
       kind: newKind,
       value,
     });
     setBusy(false);
     if (!result.success) {
-      setError(result.message);
+      setAddError(result.message);
       return;
     }
     setDenominations((current) => [...current, result.data].sort((a, b) => b.value - a.value));
     setNewValue("");
     toast.success("Denominación agregada.");
+    closeAdd();
   }
 
   async function toggleDenomination(row: CashDenominationRow) {
     setBusy(true);
-    setError(null);
+    setDenominationError(null);
     const result: ActionResult<CashDenominationRow> = await upsertDenominationAction({
       id: row.id,
       kind: row.kind,
@@ -92,7 +136,7 @@ export function CashSection({
     });
     setBusy(false);
     if (!result.success) {
-      setError(result.message);
+      setDenominationError(result.message);
       return;
     }
     setDenominations((current) => current.map((item) => (item.id === row.id ? result.data : item)));
@@ -101,11 +145,15 @@ export function CashSection({
 
   async function removeDenomination(id: string) {
     setBusy(true);
-    setError(null);
+    setDenominationError(null);
     const result = await deleteDenominationAction(id);
     setBusy(false);
+    // `ConfirmDialog` no tiene prop de error: el fallo cierra la confirmación y
+    // queda en el `Alert` de la lista, que es donde el usuario puede leerlo y
+    // reintentar. Dejarlo abierto taparía el mensaje detrás del overlay.
+    setPendingDelete(null);
     if (!result.success) {
-      setError(result.message);
+      setDenominationError(result.message);
       return;
     }
     setDenominations((current) => current.filter((item) => item.id !== id));
@@ -117,7 +165,7 @@ export function CashSection({
       <section className={sectionClass} aria-label="Base de caja">
         <h2 className={sectionTitleClass}>Base de caja</h2>
         {registers.length === 0 ? (
-          <p className={`mt-2 ${mutedTextClass}`}>Aún no hay cajas registradas en esta sede.</p>
+          <EmptyState className="mt-2">Aún no hay cajas registradas en esta sede.</EmptyState>
         ) : (
           <ul className="mt-2 flex flex-col gap-2">
             {registers.map((row) => (
@@ -139,28 +187,23 @@ export function CashSection({
             ))}
           </ul>
         )}
+        {baseError ? (
+          // ESTADO: el guardado de la base es una acción de fila y su fallo es
+          // el caso hasta que se corrija, así que va inline y persistente, al
+          // lado de la lista que lo produce. `destructive` deriva role="alert".
+          <Alert variant="destructive" className="mt-3">{baseError}</Alert>
+        ) : null}
       </section>
 
       <section className={sectionClass} aria-label="Denominaciones">
-        <h2 className={sectionTitleClass}>Denominaciones ({denominations.length})</h2>
-        <form onSubmit={handleAddDenomination} className="mt-3 flex flex-wrap items-end gap-3">
-          <label className={labelClass}>
-            Tipo
-            <select value={newKind} onChange={(event) => setNewKind(event.target.value)} className={inputClass}>
-              <option value="billete">Billete</option>
-              <option value="moneda">Moneda</option>
-            </select>
-          </label>
-          <label className={labelClass}>
-            Valor
-            <input value={newValue} onChange={(event) => setNewValue(event.target.value)} inputMode="numeric" className={inputClass} />
-          </label>
-          <button type="submit" disabled={busy} className={buttonClass}>
-            {busy ? "Agregando…" : "Agregar"}
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h2 className={sectionTitleClass}>Denominaciones ({denominations.length})</h2>
+          <button type="button" onClick={openAdd} className={buttonClass}>
+            Nueva denominación
           </button>
-        </form>
+        </div>
         {denominations.length === 0 ? (
-          <p className={`mt-3 ${mutedTextClass}`}>Aún no hay denominaciones registradas.</p>
+          <EmptyState className="mt-3">Aún no hay denominaciones registradas.</EmptyState>
         ) : (
           <ul className="mt-3 flex flex-col gap-2">
             {denominations.map((row) => (
@@ -172,7 +215,7 @@ export function CashSection({
                   <button type="button" disabled={busy} onClick={() => toggleDenomination(row)} className={linkButtonClass}>
                     {row.is_active ? "Desactivar" : "Activar"}
                   </button>
-                  <button type="button" disabled={busy} onClick={() => removeDenomination(row.id)} className={linkButtonClass}>
+                  <button type="button" disabled={busy} onClick={() => openDelete(row)} className={linkButtonClass}>
                     Eliminar
                   </button>
                 </div>
@@ -180,14 +223,67 @@ export function CashSection({
             ))}
           </ul>
         )}
-        {error ? (
-          // ESTADO: el fallo al guardar sigue siendo el caso mientras no se
-          // corrija, así que va inline y persistente. `destructive` deriva
-          // role="alert" asertivo, el mismo anuncio que el `<p role="alert">`
-          // escribía a mano antes.
-          <Alert variant="destructive">{error}</Alert>
+        {denominationError ? (
+          // ESTADO: el fallo de una acción de fila (activar/desactivar o la
+          // baja confirmada) sigue siendo el caso hasta que se corrija, así que
+          // queda inline y persistente en la lista que lo produce.
+          <Alert variant="destructive" className="mt-3">{denominationError}</Alert>
         ) : null}
       </section>
+
+      {/* `lg`: los dos campos van side by side, como el formulario inline que
+          reemplazó este diálogo. */}
+      <FormDialog
+        open={addOpen}
+        onOpenChange={(open) => {
+          if (!open) closeAdd();
+        }}
+        title="Nueva denominación"
+        onSubmit={handleAddDenomination}
+        busy={busy}
+        submitLabel="Agregar"
+        busyLabel="Agregando…"
+        error={addError}
+        size="lg"
+      >
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <label className={labelClass}>
+            Tipo
+            <select value={newKind} onChange={(event) => setNewKind(event.target.value)} className={inputClass}>
+              <option value="billete">Billete</option>
+              <option value="moneda">Moneda</option>
+            </select>
+          </label>
+          <label className={labelClass}>
+            Valor
+            <input value={newValue} onChange={(event) => setNewValue(event.target.value)} inputMode="numeric" className={inputClass} />
+          </label>
+        </div>
+      </FormDialog>
+
+      {/* La baja es un `delete` sin reversa: por eso la confirmación es
+          explícita y el cuerpo dice qué se pierde. */}
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) closeDelete();
+        }}
+        title="Eliminar denominación"
+        description={
+          pendingDelete
+            ? `Se elimina la denominación de ${formatMoney(pendingDelete.value)} y no se puede deshacer.`
+            : null
+        }
+        confirmLabel="Eliminar"
+        busyLabel="Eliminando…"
+        variant="destructive"
+        busy={busy}
+        onConfirm={() => {
+          if (pendingDelete) {
+            void removeDenomination(pendingDelete.id);
+          }
+        }}
+      />
     </div>
   );
 }

@@ -21,9 +21,19 @@ import { describe, expect, it } from "vitest";
                 su rol."): efímero -> `toast`.
    - VACÍO   -> el estado base de una lista o tabla ("Aún no hay usuarios en
                 esta sede."): describe lo esperado, NO bloquea nada y NUNCA
-                anunció nada. Sigue siendo texto plano y NO se envuelve en
-                `Alert`: envolverlo AGREGARÍA un anuncio que hoy no existe.
-                Queda comentado y pineado.
+                anunció nada. Los cuatro vacíos de `taxes`, `methods` y `cash`
+                migraron a `EmptyState`, que sigue siendo texto apagado y NO
+                lleva `role` ni `aria-live`: envolverlo en `Alert` AGREGARÍA un
+                anuncio que hoy no existe. Queda comentado y pineado.
+
+   DÓNDE SE PINTA EL ESTADO DE UN FALLO AL GUARDAR. El criterio de arriba no
+   cambió; cambió dónde se ve, porque el alta de impuestos, métodos y
+   denominaciones migró de un formulario pegado a la lista a un `FormDialog`
+   (estándar §1). El `Alert` que la sección pintaba a mano lo muestra ahora el
+   DIÁLOGO, adentro, y la sección no se inventa un segundo aviso. Por eso la
+   guarda dejó de contar `<Alert>` y cuenta CANALES: un canal por estado de
+   fallo —inline o del diálogo— y nunca los dos, que era el "un hecho, un
+   canal" de §1 medido sobre el estado que lo anuncia.
    - DERIVADO EN VIVO -> un aviso que se CALCULA del formulario mientras el
                 usuario escribe, no el desenlace de una acción enviada: conserva
                 la presentación `Alert` pero pasa `role="status"` explícito
@@ -114,18 +124,60 @@ function linesWith(source: string, text: string): string[] {
 }
 
 /**
- * El bloque `<p>` que contiene un texto, desde su etiqueta de apertura hasta el
- * texto. Sirve para los vacíos escritos en varias líneas (la clase va en el
- * `<p>` y el texto dos renglones abajo), donde `linesWith` no alcanza.
+ * El bloque del placeholder vacío, desde la etiqueta que lo abre hasta el
+ * texto. Sirve para los vacíos escritos en varias líneas (la clase va en la
+ * apertura y el texto dos renglones abajo), donde `linesWith` no alcanza.
+ *
+ * Acepta las DOS formas que dejó la migración a `EmptyState`: el `<p …>` que
+ * sigue escrito a mano y el `<EmptyState …>` del primitivo. Se elige la
+ * apertura MÁS CERCANA al texto, y como `EmptyState` RENDERIZA un `<p>`, el
+ * `<p>` anterior en el archivo siempre queda más lejos: el máximo de los dos
+ * `lastIndexOf` da la apertura correcta en los dos casos. Lo que se afirma del
+ * bloque es el mismo en los dos: el vacío NO se envuelve en `Alert`.
  */
 function plainTextBlock(source: string, text: string): string {
   const index = source.indexOf(text);
   expect(index, `no se encontró ${text}`).toBeGreaterThan(-1);
-  const open = source.lastIndexOf("<p", index);
-  expect(open, `<p> de ${text}`).toBeGreaterThan(-1);
+  const open = Math.max(
+    source.lastIndexOf("<p", index),
+    source.lastIndexOf("<EmptyState", index),
+  );
+  expect(open, `<p> o <EmptyState> de ${text}`).toBeGreaterThan(-1);
   const block = source.slice(open, index + text.length);
   expect(block, `${text} envuelto en Alert`).not.toContain("Alert");
   return block;
+}
+
+/**
+ * Los ESTADOS DE FALLO declarados en el módulo: un `useState<string | null>`
+ * cuyo nombre es el de un error. El nombre importa porque la misma forma la
+ * tienen `editingId`, `busyId` y `confirmResetId`, que no son estados de
+ * fallo; se distinguen por el sufijo, y ese sufijo es justo lo que el código
+ * nuevo tuvo que dejar de asumir como siempre `error`.
+ */
+function errorStates(source: string): string[] {
+  return [...source.matchAll(/const\s*\[\s*(\w*[Ee]rror\w*)\s*,\s*set\w+\s*\]\s*=\s*useState<string\s*\|\s*null>/g)]
+    .map((match) => match[1]);
+}
+
+/**
+ * Dónde se anuncia un estado de fallo: en un `Alert` inline de la sección, o
+ * en la prop `error` de un `FormDialog` (que la pinta como
+ * `Alert variant="destructive"` adentro — ver `tests/ux-dialog.test.ts`).
+ *
+ * Devuelve TODOS los canales que encuentra, no el primero: el invariante que
+ * se afirma arriba es que hay exactamente uno, así que un segundo canal tiene
+ * que poder verse.
+ */
+function errorChannels(source: string, state: string): string[] {
+  const channels: string[] = [];
+  if (new RegExp(`<Alert\\s+variant="destructive"[^>]*>\\s*\\{${state}\\}`).test(source)) {
+    channels.push("Alert");
+  }
+  if (new RegExp(`error=\\{${state}\\}`).test(source)) {
+    channels.push("FormDialog");
+  }
+  return channels;
 }
 
 /** Cuántos `Alert` abre el módulo (para que el conteo no se vuelva decorativo). */
@@ -154,6 +206,8 @@ function alertsWithExplicitStatusRole(source: string): number {
 }
 
 const ALERT_IMPORT = /import\s*\{\s*Alert\s*\}\s*from\s*["']@\/src\/components\/ui\/lib\/alert["']/;
+const FORM_DIALOG_MODULE = /from\s*["']@\/src\/components\/ui\/lib\/form-dialog["']/;
+const EMPTY_STATE_MODULE = /from\s*["']@\/src\/components\/ui\/lib\/empty-state["']/;
 const SONNER_TOAST_IMPORT = /import\s*\{\s*toast\s*\}\s*from\s*["']sonner["']/;
 
 /* ==========================================================================
@@ -193,6 +247,24 @@ describe("detector del panel admin: no es un sello de goma", () => {
     expect(adHocRoles("const role = 'admin';")).toEqual([]);
   });
 
+  it("el detector de canales acusa el error nuevo: un estado en dos canales, o en ninguno", () => {
+    // Tras la migración a `FormDialog` el fallo posible ya no es "un segundo
+    // `<Alert>`" sino dos cosas distintas: un estado pintado por la sección Y
+    // pasado al diálogo (el mismo hecho dicho dos veces), y un estado que no
+    // llega a ningún canal (un fallo que no se lee). El detector tiene que
+    // ver las dos.
+    const dosCanales = 'const [error, setError] = useState<string | null>(null);<FormDialog error={error} /><Alert variant="destructive">{error}</Alert>';
+    expect(errorStates(dosCanales)).toEqual(["error"]);
+    expect(errorChannels(dosCanales, "error")).toEqual(["Alert", "FormDialog"]);
+    const sinCanal = "const [error, setError] = useState<string | null>(null);";
+    expect(errorChannels(sinCanal, "error")).toEqual([]);
+    // Y el estado que NO es de fallo no entra: `editingId` tiene la misma forma
+    // de `useState` y no puede contarse como un canal de error.
+    expect(
+      errorStates("const [editingId, setEditingId] = useState<string | null>(null);const [busy, setBusy] = useState(false);"),
+    ).toEqual([]);
+  });
+
   it("los siete archivos se leyeron de verdad (si el walk se rompe, esto falla)", () => {
     // Pisos: un archivo vacío o mal leído no debe dejar pasar las guardas solas.
     expect(ADMIN_PAGE_CODE.length, "admin/page.tsx").toBeGreaterThan(1_500);
@@ -217,15 +289,23 @@ describe("detector del panel admin: no es un sello de goma", () => {
     // explican por qué `destructive` deriva `role="alert"`. Si el stripper
     // dejara de funcionar, la guarda de "ningún rol ad-hoc" fallaría sola y este
     // test documenta por qué eso sería un falso positivo, no una regresión.
-    const rawWithMentions = [
-      CASH_TSX,
-      EMPLOYEES_TSX,
-      METHODS_TSX,
-      TAXES_TSX,
-      USERS_TSX,
-      VALES_TSX,
-    ].filter((raw) => adHocRoles(raw).length > 0);
-    expect(rawWithMentions.length, "secciones que citan el rol en comentarios").toBe(6);
+    const SECCIONES: Array<[string, string]> = [
+      ["cash-section.tsx", CASH_TSX],
+      ["employees-section.tsx", EMPLOYEES_TSX],
+      ["methods-section.tsx", METHODS_TSX],
+      ["taxes-section.tsx", TAXES_TSX],
+      ["users-section.tsx", USERS_TSX],
+      ["vales-section.tsx", VALES_TSX],
+    ];
+    // Las cuatro que aún escriben un Alert propio explican el criterio al lado
+    // del markup, y por eso citan el rol en un comentario. `taxes` y `methods`
+    // ya NO escriben un Alert: quedó adentro de `FormDialog`, así que la
+    // explicación del criterio vive en la primitiva y no en la sección.
+    expect(
+      SECCIONES.filter(([, raw]) => adHocRoles(raw).length > 0).map(([name]) => name),
+      "secciones que citan el rol en comentarios",
+    ).toEqual(["cash-section.tsx", "employees-section.tsx", "users-section.tsx", "vales-section.tsx"]);
+    expect(adHocRoles(TAXES_TSX).length, "taxes-section.tsx crudo").toBe(0);
     expect(adHocRoles(CASH_TSX).length, "cash-section.tsx crudo").toBeGreaterThan(0);
     expect(adHocRoles(CASH_CODE), "cash-section.tsx sin comentarios").toEqual([]);
     // Y el stripper no borra código real: solo comentarios.
@@ -313,15 +393,41 @@ describe("admin: lo efímero va por el toast (evento)", () => {
    Admin: lo persistente va por Alert (estado)
    ========================================================================== */
 describe("admin: lo persistente va por Alert (estado)", () => {
-  it("cada superficie tiene exactamente un Alert destructivo para su estado de fallo", () => {
-    // Un sitio de error por módulo: el fallo al guardar (o la falta de sede en
-    // la página). Si apareciera un segundo Alert, el conteo lo delata.
+  it("un canal por estado de fallo, y es el de estado: inline o el del diálogo", () => {
+    // El invariante que sobrevive a la migración a `FormDialog`, medido sobre
+    // el ESTADO que se anuncia y no sobre la etiqueta que lo pinta: cada estado
+    // de fallo se anuncia por EXACTAMENTE un canal. Antes era "un Alert por
+    // módulo"; ahora es "un canal por estado", que además delata el error
+    // nuevo: un estado del diálogo pintado también como Alert en la sección
+    // (dos canales para un hecho), o un estado sin ningún canal (un fallo que
+    // no se lee).
+    let estados = 0;
+    for (const [path, code] of MODULES) {
+      for (const state of errorStates(code)) {
+        estados += 1;
+        const channels = errorChannels(code, state);
+        expect(channels, `${path}: ${state} se anuncia por ${channels.length} canales`).toHaveLength(1);
+        // El canal del diálogo solo vale si el diálogo ES la primitiva: un
+        // `error={x}` pasado a otra cosa no sería un estado de estado.
+        if (channels[0] === "FormDialog") {
+          expect(code, `${path}: ${state} por un form-dialog`).toMatch(FORM_DIALOG_MODULE);
+          expect(code, `${path}: ${state} por un <FormDialog>`).toMatch(/<FormDialog\b/);
+        }
+      }
+    }
+    // Piso anti-vacío: si el detector dejara de encontrar estados, la guarda
+    // de arriba pasaría sola. Son ocho: los seis módulos cliente declaran al
+    // menos uno, y `cash-section.tsx` declara TRES (base, alta del diálogo y
+    // acciones de fila) donde antes había uno solo compartido.
+    expect(estados, "estados de fallo declarados").toBe(8);
+  });
+
+  it("las cuatro superficies que escriben su propio Alert lo hacen una sola vez y con ninguna otra variante", () => {
+    // Las que NO migraron al diálogo: la página, empleados, usuarios y vales.
+    // Aquí la cuenta de `<Alert` sigue siendo la guarda, sin cambios.
     const expected: Array<[string, string]> = [
       ["app/admin/page.tsx", ADMIN_PAGE_CODE],
-      ["app/admin/admin-sections/cash-section.tsx", CASH_CODE],
       ["app/admin/admin-sections/employees-section.tsx", EMPLOYEES_CODE],
-      ["app/admin/admin-sections/methods-section.tsx", METHODS_CODE],
-      ["app/admin/admin-sections/taxes-section.tsx", TAXES_CODE],
       ["app/admin/admin-sections/users-section.tsx", USERS_CODE],
       ["app/admin/admin-sections/vales-section.tsx", VALES_CODE],
     ];
@@ -337,19 +443,93 @@ describe("admin: lo persistente va por Alert (estado)", () => {
     }
   });
 
-  it("el fallo al guardar es estado: Alert destructivo junto al formulario", () => {
-    // El Alert envuelve EXACTAMENTE el error de cada sección.
+  it("impuestos y métodos: el error del alta lo muestra el diálogo, y la sección no escribe ninguno", () => {
+    // Antes contaban UN Alert. Ahora cuentan CERO, y por eso la cuenta sola ya
+    // no prueba nada: la afirmación fuerte es la positiva del cableado —
+    // `error={error}` le llega al `FormDialog`— más la negativa de que la
+    // sección conserve un segundo aviso del mismo estado.
     for (const [path, code] of [
-      ["cash-section.tsx", CASH_CODE],
-      ["methods-section.tsx", METHODS_CODE],
-      ["taxes-section.tsx", TAXES_CODE],
-      ["vales-section.tsx", VALES_CODE],
+      ["app/admin/admin-sections/methods-section.tsx", METHODS_CODE],
+      ["app/admin/admin-sections/taxes-section.tsx", TAXES_CODE],
     ] as Array<[string, string]>) {
-      expect(code, path).toMatch(/<Alert\s+variant="destructive"[\s\S]{0,40}\{error\}[\s\S]{0,20}<\/Alert>/);
+      expect(code, `${path}: sin Alert propio`).not.toMatch(ALERT_IMPORT);
+      expect(alertOpenerCount(code), `${path}: Alert`).toBe(0);
+      expect(alertsWithVariant(code, "destructive"), `${path}: destructivo`).toBe(0);
+      expect(code, `${path}: el error va al FormDialog`).toMatch(
+        /<FormDialog\b[\s\S]*?\berror=\{error\}/,
+      );
+      expect(code, `${path}: el formulario inline ya no está`).not.toMatch(/<form\b/);
+    }
+  });
+
+  it("caja: tres superficies de acción y tres canales, ninguno compartido", () => {
+    // La base es un ajuste POR FILA (inline, con su `Alert` al lado); el alta
+    // es un formulario (diálogo, con su error adentro); activar/desactivar y la
+    // baja confirmada son de fila (inline, con el `Alert` de la lista). Los dos
+    // `Alert` que quedan están cada uno atado a UN estado, y el tercero al
+    // diálogo: por eso la cuenta es 2 y no 1, y por eso se afirma cada atadura.
+    expect(CASH_CODE, "import de Alert").toMatch(ALERT_IMPORT);
+    expect(alertOpenerCount(CASH_CODE), "Alert").toBe(2);
+    expect(alertsWithVariant(CASH_CODE, "destructive"), "destructivo").toBe(2);
+    expect(alertsWithVariant(CASH_CODE, "warning"), "warning").toBe(0);
+    expect(CASH_CODE).toMatch(/<Alert\s+variant="destructive"[^>]*>\s*\{baseError\}\s*<\/Alert>/);
+    expect(CASH_CODE).toMatch(
+      /<Alert\s+variant="destructive"[^>]*>\s*\{denominationError\}\s*<\/Alert>/,
+    );
+    expect(CASH_CODE, "el error del alta va al FormDialog").toMatch(
+      /<FormDialog\b[\s\S]*?\berror=\{addError\}/,
+    );
+    // La baja es destructiva e irreversible: la fila NO la dispara, solo abre
+    // la confirmación, y el `delete` queda detrás del `onConfirm` del diálogo.
+    // Antes era un segundo clic en `Eliminar`, sin preguntar nada.
+    expect(CASH_CODE, "la baja se dispara desde un click de la fila").not.toMatch(
+      /onClick=\{[^}]*removeDenomination/,
+    );
+    expect(CASH_CODE, "la fila abre la confirmación").toMatch(/onClick=\{\(\) => openDelete\(/);
+    const onConfirm = CASH_CODE.indexOf("onConfirm={");
+    expect(onConfirm, "ConfirmDialog sin onConfirm").toBeGreaterThan(-1);
+    expect(
+      CASH_CODE.slice(onConfirm, CASH_CODE.indexOf("/>", onConfirm)),
+      "el onConfirm no borra la denominación",
+    ).toContain("removeDenomination(");
+    // Y la baja se llama en UN solo lugar: si alguien la cablea también en la
+    // fila, el conteo sube y esta guarda lo delata.
+    expect(CASH_CODE.match(/removeDenomination\(/g) ?? []).toHaveLength(2);
+    expect(CASH_CODE, "baja sin ConfirmDialog").toMatch(/<ConfirmDialog\b/);
+    // Y no quedó el `error` compartido de antes, que pintaba el fallo de la
+    // base dentro de la sección de denominaciones.
+    expect(CASH_CODE, "estado de error único").not.toMatch(/const \[error, setError\]/);
+  });
+
+  it("el fallo al guardar es estado: Alert destructivo junto al formulario, o adentro del diálogo", () => {
+    // Las tres que migraron al diálogo: el estado de ESE formulario se lo
+    // pasa la sección a `FormDialog`, que lo pinta como
+    // `Alert variant="destructive"` adentro. Antes la affirmación era que el
+    // `Alert` LITERAL estuviera en la sección; ahora es que el estado llegue al
+    // diálogo y que la sección NO lo pinte además por su cuenta.
+    for (const [path, code, state] of [
+      ["taxes-section.tsx", TAXES_CODE, "error"],
+      ["methods-section.tsx", METHODS_CODE, "error"],
+      ["cash-section.tsx", CASH_CODE, "addError"],
+    ] as Array<[string, string, string]>) {
+      // El setter se deriva del nombre del estado (`error` -> `setError`).
+      const setter = `set${state[0]?.toUpperCase()}${state.slice(1)}`;
       expect(code, `${path}: useState de error`).toContain(
-        "const [error, setError] = useState<string | null>(null)",
+        `const [${state}, ${setter}] = useState<string | null>(null)`,
+      );
+      expect(code, `${path}: el error llega al diálogo`).toMatch(
+        new RegExp(`<FormDialog\\b[\\s\\S]*?\\berror=\\{${state}\\}`),
+      );
+      expect(code, `${path}: Alert del mismo estado en la sección`).not.toMatch(
+        new RegExp(`<Alert\\s+variant="destructive"[^>]*>\\s*\\{${state}\\}`),
       );
     }
+    // `vales-section.tsx` no migró: conserva su `Alert` literal, y `users` y
+    // `employees` los suyos con la clase extra que cada uno ya tenía.
+    expect(VALES_CODE).toMatch(
+      /<Alert\s+variant="destructive"[\s\S]{0,40}\{error\}[\s\S]{0,20}<\/Alert>/,
+    );
+    expect(VALES_CODE).toContain("const [error, setError] = useState<string | null>(null)");
     // Los dos que llevan una clase extra la conservan.
     expect(USERS_CODE).toMatch(
       /<Alert\s+variant="destructive"\s+className="mt-3">\s*\{error\}\s*<\/Alert>/,
@@ -375,7 +555,12 @@ describe("admin: lo persistente va por Alert (estado)", () => {
     for (const [code, text] of blocking) {
       const lines = linesWith(code, text);
       expect(lines, text).toHaveLength(1);
-      expect(lines[0], text).toMatch(/setError\(/);
+      // El setter ya no se llama siempre `setError`: caja tiene un estado por
+      // superficie (`setBaseError`, `setAddError`, `setDenominationError`). Lo
+      // que se sigue exigiendo es lo importante — el mensaje de bloqueo va a
+      // un ESTADO de error, no a texto suelto ni a un toast— y ese es el
+      // prefijo `set…Error(`.
+      expect(lines[0], text).toMatch(/set[A-Za-z]*Error\(/);
     }
     // El tope inválido se arma con el nombre del día: mismo canal.
     expect(VALES_CODE).toMatch(/setError\(`Tope inválido para \$\{DAY_NAMES\[day - 1\]\?\.label \?\? day\}\.`\)/);
@@ -457,23 +642,45 @@ describe("admin: el texto visible no cambió (cambia el canal, no la copia)", ()
     expect(ADMIN_PAGE_CODE).not.toContain("Sin sede asignada.");
   });
 
-  it("los vacíos de las siete superficies siguen siendo texto plano, no avisos", () => {
-    // Describen lo esperado, no bloquean nada y nunca anunciaron nada (no
-    // tenían rol): siguen en su clase de texto y NO se envuelven en `Alert`
-    // (eso agregaría un anuncio que hoy no existe). Queda pineado.
-    const empties: Array<[string, string, string]> = [
-      [CASH_CODE, "Aún no hay cajas registradas en esta sede.", "mutedTextClass"],
-      [CASH_CODE, "Aún no hay denominaciones registradas.", "mutedTextClass"],
-      [METHODS_CODE, "Aún no hay métodos de pago configurados en esta sede.", "mutedTextClass"],
-      [TAXES_CODE, "Aún no hay impuestos configurados en esta sede.", "mutedTextClass"],
-      [USERS_CODE, "Aún no hay usuarios en esta sede.", "mutedTextClass"],
-      [EMPLOYEES_CODE, "Aún no hay empleados en esta sede.", "mutedTextClass"],
-      [EMPLOYEES_CODE, "Sin resultados para ese filtro.", "mutedTextClass"],
-      [VALES_CODE, "Sin configurar: los vales no tienen límite.", "text-text-secondary"],
+  it("los vacíos de las siete superficies siguen siendo el baseline mudo: sin Alert y sin anuncio", () => {
+    // Describen lo esperado, no bloquean nada y nunca anunció nada (no
+    // tenían rol): cuatro ya son `EmptyState` y cuatro siguen en su `<p>` de
+    // texto apagado. Los dos son el MISMO baseline, así que se afirman igual:
+    // la apertura que corresponde, el espaciado que ya tenía, y —esto es lo
+    // que el helper existe para proteger— NUNCA un `Alert` ni un `aria-live`.
+    // Envolverlos en `Alert` agregaría un anuncio que hoy no existe.
+    const empties: Array<[string, string, string, string]> = [
+      [CASH_CODE, "Aún no hay cajas registradas en esta sede.", "<EmptyState", "mt-2"],
+      [CASH_CODE, "Aún no hay denominaciones registradas.", "<EmptyState", "mt-3"],
+      [METHODS_CODE, "Aún no hay métodos de pago configurados en esta sede.", "<EmptyState", "mt-2"],
+      [TAXES_CODE, "Aún no hay impuestos configurados en esta sede.", "<EmptyState", "mt-2"],
+      [USERS_CODE, "Aún no hay usuarios en esta sede.", "<p", "mutedTextClass"],
+      [EMPLOYEES_CODE, "Aún no hay empleados en esta sede.", "<p", "mutedTextClass"],
+      [EMPLOYEES_CODE, "Sin resultados para ese filtro.", "<p", "mutedTextClass"],
+      [VALES_CODE, "Sin configurar: los vales no tienen límite.", "<p", "text-text-secondary"],
     ];
-    for (const [code, text, style] of empties) {
+    for (const [code, text, opener, style] of empties) {
       const block = plainTextBlock(code, text);
-      expect(block, text).toContain(style);
+      expect(block, `${text}: apertura`).toContain(opener);
+      expect(block, `${text}: clase`).toContain(style);
+      // El vacío es mudo a propósito: sin `role` ni `aria-live` hay nada que
+      // un lector de pantalla anuncie. El `Alert` ya lo pineó `plainTextBlock`.
+      expect(block, `${text}: anuncia`).not.toMatch(/aria-live|\brole\s*=/);
+    }
+    // Los cuatro migrados toman el primitivo, no una copia de su estilo. Y los
+    // dos que además pezcan de TODO `Alert` (impuestos y métodos) no pueden
+    // importarlo: caja conserva el suyo para las dos acciones de fila, y por
+    // eso no se le exige lo mismo.
+    for (const [code, text, sinAlert] of [
+      [CASH_CODE, "Aún no hay cajas registradas en esta sede.", false],
+      [CASH_CODE, "Aún no hay denominaciones registradas.", false],
+      [METHODS_CODE, "Aún no hay métodos de pago configurados en esta sede.", true],
+      [TAXES_CODE, "Aún no hay impuestos configurados en esta sede.", true],
+    ] as Array<[string, string, boolean]>) {
+      expect(code, `${text}: import de EmptyState`).toMatch(EMPTY_STATE_MODULE);
+      if (sinAlert) {
+        expect(code, `${text}: sin Alert`).not.toMatch(ALERT_IMPORT);
+      }
     }
   });
 });

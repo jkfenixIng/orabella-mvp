@@ -1,18 +1,17 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useState } from "react";
 import { toast } from "sonner";
 import { upsertPaymentMethodAction } from "@/src/features/admin/actions";
 import type { PaymentMethodRow } from "@/src/features/admin/service";
-import { Alert } from "@/src/components/ui/lib/alert";
+import { EmptyState } from "@/src/components/ui/lib/empty-state";
+import { FormDialog } from "@/src/components/ui/lib/form-dialog";
 import {
   buttonClass,
-  ghostClass,
   inputClass,
   labelClass,
   linkButtonClass,
   listItemClass,
-  mutedTextClass,
   sectionClass,
   sectionTitleClass,
   stackClass,
@@ -21,21 +20,43 @@ import type { ActionResult } from "../admin-shared";
 
 const EMPTY_METHOD = { code: "efectivo", name: "", is_active: true, arqueable: true };
 
+/**
+ * Alta y edición de un método de pago: `FormDialog`, no un formulario pegado
+ * debajo de la lista. Mismo criterio que en `taxes-section.tsx` (estándar §1):
+ * el alta es secundaria del listado, y el error del intento lo muestra el
+ * diálogo porque es el estado de ESE formulario.
+ */
 export function MethodsSection({ sedeId, initial }: { sedeId: string; initial: PaymentMethodRow[] }) {
   const [rows, setRows] = useState(initial);
   const [form, setForm] = useState(EMPTY_METHOD);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  function openCreate() {
+    setEditingId(null);
+    setForm(EMPTY_METHOD);
+    setError(null);
+    setDialogOpen(true);
+  }
 
   function startEdit(row: PaymentMethodRow) {
     setEditingId(row.id);
     setForm({ code: row.code, name: row.name, is_active: row.is_active, arqueable: row.arqueable });
     setError(null);
+    setDialogOpen(true);
   }
 
-  async function handleSubmit(event: FormEvent) {
-    event.preventDefault();
+  function closeDialog() {
+    setDialogOpen(false);
+    setEditingId(null);
+    setForm(EMPTY_METHOD);
+    setError(null);
+  }
+
+  // `FormDialog` ya cortó el submit nativo: acá solo va la lógica.
+  async function handleSubmit() {
     setBusy(true);
     setError(null);
     const result: ActionResult<PaymentMethodRow> = await upsertPaymentMethodAction({
@@ -57,18 +78,22 @@ export function MethodsSection({ sedeId, initial }: { sedeId: string; initial: P
       return [...current, result.data];
     });
     toast.success(editingId ? "Método actualizado." : "Método creado.");
-    setEditingId(null);
-    setForm(EMPTY_METHOD);
+    closeDialog();
   }
 
   return (
     <div className={stackClass}>
       <section className={sectionClass} aria-label="Listado de métodos de pago">
-        <h2 className={sectionTitleClass}>Métodos de pago ({rows.length})</h2>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h2 className={sectionTitleClass}>Métodos de pago ({rows.length})</h2>
+          <button type="button" onClick={openCreate} className={buttonClass}>
+            Nuevo método
+          </button>
+        </div>
         {rows.length === 0 ? (
-          <p className={`mt-2 ${mutedTextClass}`}>
+          <EmptyState className="mt-2">
             Aún no hay métodos de pago configurados en esta sede.
-          </p>
+          </EmptyState>
         ) : (
           <ul className="mt-2 flex flex-col gap-2">
             {rows.map((row) => (
@@ -87,11 +112,21 @@ export function MethodsSection({ sedeId, initial }: { sedeId: string; initial: P
         )}
       </section>
 
-      <section className={sectionClass} aria-label="Formulario de método de pago">
-        <h2 className={sectionTitleClass}>
-          {editingId ? "Editar método" : "Nuevo método"}
-        </h2>
-        <form onSubmit={handleSubmit} className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+      {/* `lg`: el formulario es de dos columnas. Título, error y pie son de la
+          primitiva, así que esta sección ya no decide cómo se falla. */}
+      <FormDialog
+        open={dialogOpen}
+        onOpenChange={(open) => {
+          if (!open) closeDialog();
+        }}
+        title={editingId ? "Editar método" : "Nuevo método"}
+        onSubmit={handleSubmit}
+        busy={busy}
+        submitLabel={editingId ? "Guardar cambios" : "Crear método"}
+        error={error}
+        size="lg"
+      >
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <label className={labelClass}>
             Código
             <select
@@ -131,32 +166,8 @@ export function MethodsSection({ sedeId, initial }: { sedeId: string; initial: P
             />
             Se arquea (desactívelo si no se puede contar, p. ej. tarjeta por terminal)
           </label>
-          {error ? (
-            // ESTADO: el fallo al guardar sigue siendo el caso mientras no se
-            // corrija, así que va inline y persistente. `destructive` deriva
-            // role="alert" asertivo, el mismo anuncio que el `<p role="alert">`
-            // escribía a mano antes.
-            <Alert variant="destructive">{error}</Alert>
-          ) : null}
-          <div className="flex gap-2">
-            <button type="submit" disabled={busy} className={buttonClass}>
-              {busy ? "Guardando…" : editingId ? "Guardar cambios" : "Crear método"}
-            </button>
-            {editingId ? (
-              <button
-                type="button"
-                onClick={() => {
-                  setEditingId(null);
-                  setForm(EMPTY_METHOD);
-                }}
-                className={ghostClass}
-              >
-                Cancelar
-              </button>
-            ) : null}
-          </div>
-        </form>
-      </section>
+        </div>
+      </FormDialog>
     </div>
   );
 }
