@@ -68,3 +68,13 @@ políticas RLS con TODO, seeds).
 ## Límites de lectura
 
 - Navegación instantánea: `listSedes`/`listEmployees`/`listServices`/`listTaxes`/`listPaymentMethods` acotados a 50 filas por defecto (límite explícito 500 solo para validaciones internas de facturación/nómina).
+
+## UI
+
+- Sub-menú con el primitivo `Tabs`; crear y editar pasan por `FormDialog`; la
+  baja de una denominación pide `ConfirmDialog`; las tablas de empleados y
+  usuarios usan `DataTable`; los vacíos usan `EmptyState`; el reseteo de clave
+  se confirma en la propia fila (confirmación inline, no diálogo).
+- El diálogo "Nuevo usuario" se eliminó: los usuarios se crean con el
+  empleado, así que ese diálogo nunca podía ser el segundo camino.
+- Vocabulario y superficies: `app/docs/ux-ui-standard.md`.

@@ -307,6 +307,8 @@ veces con grep de substring: `text-text-primary` termina en `text-primary`, y
 | `ux-structure.test.ts` **(nuevo)** | El shell copiado en un `page.tsx`, y `min-h-screen` en un hijo del shell |
 | `ux-dialog.test.ts` **(nuevo)** | Un `DialogContent` sin `DialogTitle` |
 | `ux-tabs.test.ts` **(nuevo)** | `role="tablist"` sin `tabpanel` en el mismo archivo |
+| `ux-empty-state.test.ts` **(nuevo)** | `EmptyState` sin `role` ni `aria-live`, con tokens del proyecto |
+| `ux-adoption.test.ts` **(nuevo)** | Ningún `DialogContent` sin `DialogTitle` en el árbol (allowlist exacta); sin `role="tab*"` ni `min-w-[Npx]` a mano en admin |
 
 Una guarda se prueba **por mutación**: se rompe el código a propósito y se
 confirma que falla. Una guarda que no se probó por mutación no se sabe si mira.
@@ -336,6 +338,7 @@ Anotada acá para que no se pierda y para que nadie la «arregle» por sorpresa.
 
 | Deuda | Dueño |
 |---|---|
+| El login (fallos confirmados, AUTH-01, pista en vivo) | ✅ WU-C, lote 5 |
 | Los 6 modales de `invoices-client.tsx` sin `DialogTitle` | Tanda propia (F1 en `odd/tasks/ajustes-post-lote.md`) |
 | Filtros de alertas sin UX real | Tanda propia (A1) |
 | El listado de períodos de nómina no escala a un año | Tanda propia (N1) |

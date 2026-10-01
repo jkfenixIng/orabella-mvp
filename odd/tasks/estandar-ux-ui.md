@@ -147,6 +147,15 @@ Antes de planificar se verificó contra el código, no contra la prosa:
   tests** · `next build` ✓ 22/22.
   El relevamiento exhaustivo se colgó por timeout y **no se reemplazó**: la
   evidencia de las 6 falencias es la que midió el padre sobre el árbol.
+- 2026-10-01: WU6c terminado: primer consumidor de `DataTable` (empleados y
+  usuarios), diálogo muerto "Nuevo usuario" eliminado (el alta vive con el
+  empleado), `tests/feedback-batch4.test.ts` re-based con verificación por
+  mutación.
+- 2026-10-01: WU6d (esta unidad) terminado: `tests/ux-empty-state.test.ts`
+  (contrato del `EmptyState` mudo) + `tests/ux-adoption.test.ts` (adopción en
+  todo el árbol, con allowlist exacta de los 6 diálogos de facturación bajo
+  F1) y reconciliación de docs. WU7 (gate final en serie + cierre, dueño: el
+  parent) queda abierto.
 
 ### Hallazgos que corrigieron al padre (no al revés)
 1. **El warning de Radix no existe en esta versión.** Instruí verificar el aviso
