@@ -55,10 +55,10 @@ Consecuencias que se respetan:
 
 ## Tasks
 - [x] WU-A primitivos `Alert` + toast (`sonner`) — `bf74ca5`, verificado
-- [ ] WU-B módulo de referencia → **`services`** (elegido por evidencia: no aparece en ningún spec)
-- [ ] WU-C migración del resto, con los specs que correspondan
-- [ ] WU-D (follow-up) tinte por tipo del toast: necesita un override en `globals.css`
-- [ ] WU-E (follow-up) corregir el criterio en el comentario de `alertRole()`
+- [x] WU-B módulo de referencia → **`services`** (elegido por evidencia: no aparece en ningún spec) — `e9e51d0`, verificado
+- [ ] WU-C migración del resto, con los specs que correspondan (tanda 3, previsión vales en `26349cc`; resto pendiente)
+- [x] WU-D (follow-up) tinte por tipo del toast: necesita un override en `globals.css` — `0709aa0`, verificado
+- [x] WU-E (follow-up) corregir el criterio en el comentario de `alertRole()` — `0709aa0`, verificado (solo comentario)
 
 ## WU-A — resultado y follow-ups (2026-10-01)
 Commit `bf74ca5`. Gate: vitest 452/452 (baseline 436), typecheck, lint y `next build` 22/22.
@@ -93,3 +93,5 @@ Matices que dejo la verificacion del test de `services`:
 - 2026-10-01: el writer de la tanda 2 reporto honestamente dos consecuencias de ARIA. Una se acepta (tres avisos bloqueantes pasan de cortes a asertivo por la politica del primitivo). La otra **NO se acepta como vino** y se refina en la tanda 3: dos avisos de rango de nomina **derivados en vivo** mientras se escriben las fechas ganaron un anuncio asertivo donde antes no habia ninguno. Interrumpir en un calculo en vivo es el anti-patron de sobre-anuncio; corresponden `role="status"` explicitos sobre la presentacion de `Alert`, usando la prop `role` que el primitivo ya expone. **No se toca `alert.tsx`** para esto: cambiarlo invalidaria su verificacion.
 - 2026-10-01: se ejercita criterio en vez de ritual: la tanda 2 **no** paso por un verificador dedicado. UI pura, sin datos ni autorizacion; patron ya verificado dos veces; 35 aserciones nuevas con controles negativos; y el riesgo real -- que el split de la union `message` dejara algun camino sin salida -- lo revise leyendo el diff, donde cada `setMessage` previo tiene su contraparte. El gate de build si se corrio.
 - 2026-10-01: la tanda 2 encontro una **cita obsoleta** en `app/tests/design-tokens.test.ts:211-212`, que afirmaba que el par de tokens de warning tenia consumidores reales en `payroll-client.tsx:1142` y `vouchers-client.tsx:346,351`. Esas clases ya no viven ahi. Se corrige en la tanda 3, sin tocar ninguna asercion de ese archivo.
+- 2026-10-01: `26349cc` (WU-C, tanda 3, previsión vales): aviso en vivo de fuera de rango (`Alert` warning con `role=status` explícito) más `ConfirmDialog` al enviar fuera de rango; `feedback-batch2.test.ts` extendido solo en vales; según mensaje del commit, seis mutaciones acusadas con restauración SHA-256, gate re-verificado por el padre.
+- 2026-10-01: `0709aa0` (WU-D y WU-E): tinte por tipo del toast con override en `globals.css` más `richColors`, siete tests probados por mutación según mensaje; criterio de `alertRole()` corregido a solo comentario sin cambio de conducta ni de suite; según mensaje del commit, gate re-verificado por el padre.
