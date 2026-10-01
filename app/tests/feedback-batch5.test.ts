@@ -39,13 +39,35 @@ import { describe, expect, it } from "vitest";
                 texto plano y NO se envuelve en `Alert`: envolverlo AGREGARÍA un
                 anuncio que hoy no existe. Queda comentado y pineado.
 
-   Login entra con una decisión explícita: sus dos mensajes son FALLOS
-   CONFIRMADOS (credencial rechazada, confirmación que no coincide), no
-   validaciones derivadas en vivo. El formulario no valida mientras se teclea
-   (la presencia la frena el navegador con `required`), así que `destructive`
-   conserva el anuncio asertivo que el `role="alert"` escribía a mano. Si algún
-   día aparece una validación por tecleo, esta guarda la obliga a venir con
-   `role="status"`.
+   Login entra con una decisión explícita, ahora con CUATRO Alert:
+
+   - DOS FALLOS CONFIRMADOS (credencial rechazada, confirmación que no
+     coincide): `destructive`, no validaciones derivadas en vivo. El envío no
+     se valida mientras se teclea —la presencia la frena el navegador con
+     `required`—, así que `destructive` conserva el anuncio asertivo que el
+     `role="alert"` escribía a mano.
+   - UN ESTADO CONFIRMADO POR POLÍTICA: el paso AUTH-01 (cambio forzado de
+     clave) era una sección ámbar escrita a mano con el par
+     `bg-warning-light` + `text-warning` —el antipatrón que §9 del estándar
+     prohíbe: estilos fuera de la primitiva—. Es exactamente el par que
+     deriva la variante `warning`, así que ahora lo consume por la primitiva:
+     mismo render, una sola ARIA por clase de mensaje.
+   - UN ESTADO DERIVADO EN VIVO: la pista de requisitos de la clave nueva (8+
+     caracteres, letra y número) se calcula de `nueva` mientras se escribe.
+     Es una PISTA: no bloquea el envío (la validación real sigue siendo el
+     Zod del servidor, `changePasswordSchema`) y puede decir "le falta" como
+     "cumple", así que NO va en `destructive` —ese canal queda reservado para
+     los dos fallos confirmados—. Va como `Alert variant="info"`: el par
+     neutro de marca, y `info` DERIVA `role="status"` (polite) en la
+     primitiva, de modo que el canal derivado no necesita ningún rol escrito
+     a mano y el archivo conserva CERO overrides. Es el mismo caso que el
+     SKU de inventario (`destructive` + `role="status"`), con una variante
+     neutral porque acá no bloquea. Y queda condicionado: con el campo vacío
+     no se renderiza nada (criterio VACÍO: no agregar un anuncio que hoy no
+     existe); un checklist siempre visible sería un anuncio permanente que
+     la pantalla de hoy no tiene. Si la pista llegara a BLOQUEAR el envío
+     (disabled o return), la guarda de abajo la acusa: tendría que decidir
+     variante y rol de nuevo.
 
    CARRY-OVER DEL LOTE 6: este lote declaró como superficie los portadores de rol
    y dejó afuera, por eso mismo, un aviso SIN rol que sí es un mensaje del
@@ -194,7 +216,7 @@ function alertOpenerCount(source: string): number {
  * pasó por bueno sin serlo. Acá no hay `Badge`, pero el detector no depende de
  * eso.
  */
-function alertsWithVariant(source: string, variant: "warning" | "destructive"): number {
+function alertsWithVariant(source: string, variant: "warning" | "destructive" | "info"): number {
   const re = new RegExp(`<Alert\\s+variant="${variant}"`, "g");
   return [...source.matchAll(re)].length;
 }
@@ -253,6 +275,9 @@ describe("detector de roles y de Alert: no es un sello de goma", () => {
     expect(alertsWithVariant('<Alert variant="warning">x</Alert>', "warning")).toBe(1);
     expect(alertsWithVariant('<Badge variant="warning">Bajo mínimo</Badge>', "warning")).toBe(0);
     expect(alertsWithVariant('<Alert variant="destructive">x</Alert>', "warning")).toBe(0);
+    // El canal derivado del login es `info`: el detector también lo cuenta.
+    expect(alertsWithVariant('<Alert variant="info" className="text-xs">x</Alert>', "info")).toBe(1);
+    expect(alertsWithVariant('<Alert variant="warning">x</Alert>', "info")).toBe(0);
     // El conteo de aperturas también exige la etiqueta completa.
     expect(alertOpenerCount('<Badge variant="warning">x</Badge>')).toBe(0);
     expect(alertOpenerCount('<Alert variant="destructive">x</Alert>')).toBe(1);
@@ -520,29 +545,83 @@ describe("facturación y login: lo persistente va por Alert (estado)", () => {
     expect(alertsWithExplicitStatusRole(INVOICES_PAGE_CODE)).toBe(0);
   });
 
-  it("el login decide: credencial rechazada y confirmación desajustada son fallos CONFIRMADOS", () => {
-    // La decisión explícita de esta unidad. No es un aviso derivado en vivo: el
-    // formulario no valida mientras se teclea —la presencia de documento y
-    // clave la frena el navegador con `required`— y el texto solo existe después
-    // de enviar. Es el desenlace de una acción enviada, así que `destructive`
-    // conserva el mismo anuncio asertivo que el `role="alert"` escribía a mano.
+  it("el login decide: dos fallos confirmados, el paso AUTH-01 y una pista derivada", () => {
+    // La decisión explícita de esta unidad, actualizada (WU7). Los dos fallos
+    // no son avisos derivados en vivo: el formulario no valida el envío
+    // mientras se teclea —la presencia de documento y clave la frena el
+    // navegador con `required`— y el texto solo existe después de enviar. Es
+    // el desenlace de una acción enviada, así que `destructive` conserva el
+    // mismo anuncio asertivo que el `role="alert"` escribía a mano.
     expect(LOGIN_FORM_CODE).toMatch(ALERT_IMPORT);
-    expect(alertOpenerCount(LOGIN_FORM_CODE)).toBe(2);
+    // Cuatro Alert: los dos fallos confirmados (destructive), el paso AUTH-01
+    // (warning) y la pista de requisitos (info). Antes de WU7 eran dos: el
+    // paso AUTH-01 era una sección ámbar a mano sin Alert y la pista no
+    // existía. Si aparece un Alert de más, el conteo lo delata.
+    expect(alertOpenerCount(LOGIN_FORM_CODE)).toBe(4);
     expect(alertsWithVariant(LOGIN_FORM_CODE, "destructive")).toBe(2);
-    expect(alertsWithVariant(LOGIN_FORM_CODE, "warning")).toBe(0);
+    // El panel ámbar a mano (§9: estilos fuera de la primitiva) se migró a la
+    // variante canónica `warning`: antes de WU7 este conteo era 0 y el par
+    // bg-warning-light + text-warning se escribía a mano.
+    expect(alertsWithVariant(LOGIN_FORM_CODE, "warning")).toBe(1);
+    // El canal derivado en vivo es SEPARADO de los dos fallos confirmados y
+    // único: una sola pista, con la variante neutra de marca (info).
+    expect(alertsWithVariant(LOGIN_FORM_CODE, "info")).toBe(1);
+    // El override polite escrito a mano sigue en CERO —también para el canal
+    // derivado—: `info` ya deriva `role="status"` en la primitiva, así que
+    // escribirlo sería redundante y no es una decisión. La guarda PISA que el
+    // archivo no acumule overrides por inercia: si mañana un canal nuevo
+    // necesita un rol explícito, tiene que venir con su justificación aquí.
     expect(alertsWithExplicitStatusRole(LOGIN_FORM_CODE)).toBe(0);
+    // La pista se DERIVA de `nueva` y solo existe cuando hay algo que decir:
+    // es `null` con el campo vacío y el `<Alert` que la muestra queda
+    // condicionado (criterio VACÍO: no se anuncia lo que no existe).
+    expect(LOGIN_FORM_CODE).toMatch(/const nuevaFeed: string \| null =/);
+    // VACÍO pineado con dientes: con el campo vacío la señal es `null` (nada
+    // que decir, nada que anunciar). Sin este ancla, `? "siempre visible"`
+    // pasaba la guarda y el hint se anunciaba en la pantalla inicial vacía.
+    expect(LOGIN_FORM_CODE).toMatch(/nueva\.length === 0\s*\?\s*null/);
+    expect(LOGIN_FORM_CODE).toMatch(/\{nuevaFeed \? \(/);
+    // La pista no bloquea el envío (es un HINT; la validación real es el Zod
+    // del servidor): ni el botón ni el handler la consultan.
+    expect(LOGIN_FORM_CODE, "pista bloqueando el botón").not.toMatch(/disabled=\{[^}]*nueva/);
+    const handlerStart = LOGIN_FORM_CODE.indexOf("async function handleForceChange");
+    const handlerBody = LOGIN_FORM_CODE.slice(handlerStart, LOGIN_FORM_CODE.indexOf("if (step === \"done\")"));
+    expect(handlerBody, "pista bloqueando el envío").not.toContain("nuevaRulesOk");
+    expect(handlerBody, "pista bloqueando el envío").not.toContain("nuevaFeed");
     // Las dos copias fijas siguen ahí, y las dos salen del mismo estado `error`.
     for (const copy of ['"Documento o clave inválidos."', '"La confirmación no coincide."', '"No se pudo cambiar la clave."']) {
       const lines = linesWith(LOGIN_FORM_CODE, copy);
       expect(lines, copy).toHaveLength(1);
       expect(lines[0], copy).toMatch(/setError\(/);
     }
-    // Sin validación por tecleo: ningún `onChange` toca el error. Si apareciera
-    // una, el aviso derivado tendría que venir con `role="status"` (polite) y
-    // esta guarda obliga a decidirlo.
+    // Sin validación por tecleo del ERROR: ningún `onChange` lo toca. La pista
+    // de arriba es otro canal (se pina condicional y polito, no por `error`).
     for (const line of LOGIN_FORM_CODE.split("\n").filter((l) => l.includes("setError("))) {
       expect(line, line).not.toMatch(/onChange/);
     }
+  });
+
+  it("los tres campos de clave conservan sus atributos de registro y su toggle", () => {
+    // Toggle de visibilidad en los TRES campos (login, nueva, confirmar):
+    // un solo helper, tres llamadas. El `{` ancla a las LLAMADAS (`{passwordToggle(`)
+    // y deja fuera la definición (`function passwordToggle(`): sin el ancla el
+    // conteo daba 4 en código sano y la guarda fallaba sin haber defecto.
+    // Si alguien borra un toggle, el conteo lo delata; los iconos van
+    // `aria-hidden` y el nombre accesible viene
+    // del `aria-label` del botón (con `aria-pressed` para el estado).
+    expect([...LOGIN_FORM_CODE.matchAll(/\{passwordToggle\(show/g)]).toHaveLength(3);
+    expect(LOGIN_FORM_CODE).toMatch(/aria-pressed=\{show\}/);
+    expect(LOGIN_FORM_CODE).toMatch(/aria-hidden="true"/);
+    expect(LOGIN_FORM_CODE).toMatch(/import \{ Eye, EyeOff \} from "lucide-react"/);
+    // Atributos de registro intactos (el spec e2e de Playwright pina los dos
+    // `required` del paso login; acá se asegura a nivel fuente).
+    expect([...LOGIN_FORM_CODE.matchAll(/\brequired\b/g)]).toHaveLength(2);
+    expect([...LOGIN_FORM_CODE.matchAll(/autoComplete="new-password"/g)]).toHaveLength(2);
+    expect(LOGIN_FORM_CODE).toContain('autoComplete="current-password"');
+    expect(LOGIN_FORM_CODE).toContain('autoComplete="username"');
+    // La pista habla de los requisitos EXACTOS del servidor (no inveta uno).
+    expect(LOGIN_FORM_CODE).toContain("8+ caracteres, letra y número");
+    expect(LOGIN_FORM_CODE).toMatch(/nueva\.length >= 8 && \/\[A-Za-z\]\/\.test\(nueva\) && \/\[0-9\]\/\.test\(nueva\)/);
   });
 });
 
