@@ -91,7 +91,8 @@ WITH esperado (version, tipo, tabla, objeto, firma, marcador, para_que) AS (
     ('056', 'function',    NULL,                       'cash_invoice_payment_atomic',   'uuid, uuid, uuid, uuid, timestamptz, boolean, boolean, jsonb', NULL, 'cobro de factura que cierra la factura'),
     ('057', 'function',    NULL,                       'change_user_password',          'uuid, text, text, text', NULL, 'cambio de contrasena con CAS'),
     ('058', 'function',    NULL,                       'cash_close_shift_atomic',       'uuid, uuid, uuid, timestamptz, jsonb, jsonb, jsonb', NULL, 'cierre con consistencia de arqueo'),
-    ('059', 'functiondef', NULL,                       'cash_close_shift_atomic',       'uuid, uuid, uuid, timestamptz, jsonb, jsonb, jsonb', 'v_commission_payouts', 'cierre que resta las salidas del arqueo')
+    ('059', 'functiondef', NULL,                       'cash_close_shift_atomic',       'uuid, uuid, uuid, timestamptz, jsonb, jsonb, jsonb', 'v_commission_payouts', 'cierre que resta las salidas del arqueo'),
+    ('060', 'functiondef', NULL,                       'invoice_create_atomic',         'uuid, uuid, uuid, text, jsonb, jsonb, jsonb, jsonb, text, jsonb', 'fix-060', 'emision con las guardas de conteo ANTES del INSERT')
 )
 SELECT
   e.version,

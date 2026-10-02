@@ -738,6 +738,15 @@ BEGIN
   --      son conversiones de representación (jsonb → la columna), no
   --      operaciones. `nullif(… , '')` convierte la clave ausente en NULL, que es
   --      lo que el servicio mandaba para una línea sin producto/servicio/valor.
+  --
+  -- 1.12 Red de seguridad: tantas líneas como elementos llegaron. Sin esta red,
+  --      un subconjunto silencioso dejaría una factura con su total completo y
+  --      sin todas sus líneas (y la nómina pagando comisiones de menos). El
+  --      conteo va ANTES del INSERT: un `SELECT ... INTO` posterior pisaría el
+  --      `ROW_COUNT` que mide el `GET DIAGNOSTICS` de abajo.
+  -- fix-060: esperados ANTES del INSERT
+  SELECT jsonb_array_length(p_items) INTO v_esperados;
+
   INSERT INTO public.invoice_items
     (invoice_id, item_type, product_id, service_id, custom_name, employee_id,
      qty, unit_price, discount, no_commission, commission_value,
@@ -759,11 +768,6 @@ BEGIN
     (item ->> 'subtotal')::numeric
   FROM jsonb_array_elements(p_items) AS item;
 
-  -- 1.12 Red de seguridad: tantas líneas como elementos llegaron. Sin esta red,
-  --      un subconjunto silencioso dejaría una factura con su total completo y
-  --      sin todas sus líneas (y la nómina pagando comisiones de menos).
-  SELECT jsonb_array_length(p_items) INTO v_esperados;
-
   GET DIAGNOSTICS v_escritos = ROW_COUNT;
 
   IF v_escritos <> v_esperados THEN
@@ -773,6 +777,13 @@ BEGIN
   -- 1.13 GRUPO 3: el SNAPSHOT DE IMPUESTOS, UNA sentencia (y ninguna fila
   --      cuando no hay impuestos activos: `0 = 0` es legal). El monto y el
   --      porcentaje vienen computados.
+  --
+  -- 1.14 Red de seguridad: tantos impuestos como llegaron. El conteo va ANTES
+  --      del INSERT: un `SELECT ... INTO` posterior pisaría el `ROW_COUNT` que
+  --      mide el `GET DIAGNOSTICS` de abajo.
+  -- fix-060: esperados ANTES del INSERT
+  SELECT jsonb_array_length(p_taxes) INTO v_esperados;
+
   INSERT INTO public.invoice_taxes
     (invoice_id, tax_code, tax_name, percent, amount)
   SELECT
@@ -782,9 +793,6 @@ BEGIN
     (item ->> 'percent')::numeric,
     (item ->> 'amount')::numeric
   FROM jsonb_array_elements(p_taxes) AS item;
-
-  -- 1.14 Red de seguridad: tantos impuestos como llegaron.
-  SELECT jsonb_array_length(p_taxes) INTO v_esperados;
 
   GET DIAGNOSTICS v_escritos = ROW_COUNT;
 
@@ -801,6 +809,15 @@ BEGIN
   --      El ORDEN de las porciones se conserva (no hay `ORDER BY`, a
   --      propósito): pertenecen a una transacción que ya tiene el lock de su
   --      turno y de su factura, y nadie puede verlas antes del commit.
+  --
+  -- 1.16 Red de seguridad: tantas porciones como llegaron. El tope de cobro de
+  --      031 (`trg_invoice_payments_cap`) corre dentro de esta sentencia con su
+  --      propio P0001, y el servicio lo traduce a OVERPAID como siempre. El
+  --      conteo va ANTES del INSERT: un `SELECT ... INTO` posterior pisaría el
+  --      `ROW_COUNT` que mide el `GET DIAGNOSTICS` de abajo.
+  -- fix-060: esperados ANTES del INSERT
+  SELECT jsonb_array_length(p_payments) INTO v_esperados;
+
   INSERT INTO public.invoice_payments
     (invoice_id, method_id, method_code, amount, fee_percent, fee_amount, cash_shift_id)
   SELECT
@@ -812,11 +829,6 @@ BEGIN
     (item ->> 'fee_amount')::numeric,
     p_cash_shift_id
   FROM jsonb_array_elements(p_payments) AS item;
-
-  -- 1.16 Red de seguridad: tantas porciones como llegaron. El tope de cobro de
-  --      031 (`trg_invoice_payments_cap`) corre dentro de esta sentencia con su
-  --      propio P0001, y el servicio lo traduce a OVERPAID como siempre.
-  SELECT jsonb_array_length(p_payments) INTO v_esperados;
 
   GET DIAGNOSTICS v_escritos = ROW_COUNT;
 
