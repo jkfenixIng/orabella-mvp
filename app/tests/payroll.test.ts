@@ -101,7 +101,6 @@ import {
   openPayrollPeriod,
   PayrollError,
   rejectVoucher,
-  setPayrollStartDate,
   type PayrollActor,
 } from "@/src/features/payroll/service";
 import { listAllEmployees, listEmployees } from "@/src/features/admin/service";
@@ -11934,40 +11933,18 @@ describe("payroll: la fecha de arranque de la nómina de la sede (F10, servicio)
   beforeEach(() => resetPayrollStubState());
   afterEach(() => resetPayrollStubState());
 
-  it("configurar la fecha va y vuelve; limpiarla también, y una fecha inválida no escribe", async () => {
+  it("sin la migración 068 la lectura no configura y no se vuelve error interno", async () => {
     seed({ startDate: null });
-    expect(await getPayrollStartDate(SEDE)).toBeNull();
-    expect(await setPayrollStartDate({ payroll_start_date: "2026-10-05" }, ACTOR)).toEqual({
-      payroll_start_date: "2026-10-05",
-    });
-    expect(await getPayrollStartDate(SEDE)).toBe("2026-10-05");
-    const writes = payrollPagedStub.updates.filter((entry) => entry.table === "sedes").length;
-    const failure: unknown = await setPayrollStartDate(
-      { payroll_start_date: "05/10/2026" },
-      ACTOR,
-    ).catch((error: unknown) => error);
-    expect(failure).toBeInstanceOf(PayrollError);
-    expect(failure).toMatchObject({ code: "VALIDATION", status: 400 });
-    expect(payrollPagedStub.updates.filter((entry) => entry.table === "sedes").length).toBe(writes);
-    // Volver a «sin configurar» es un estado legal, no un error.
-    expect(await setPayrollStartDate({ payroll_start_date: null }, ACTOR)).toEqual({
-      payroll_start_date: null,
-    });
-    expect(await getPayrollStartDate(SEDE)).toBeNull();
-  });
-
-  it("sin la migración 068 la lectura no configura y la escritura avisa", async () => {
-    seed({ startDate: null });
-    // 42703 = undefined_column: la columna todavía no existe en la base.
+    // 42703 = undefined_column: la columna todavía no existe en la base. La
+    // degradación es de la LECTURA; la escritura ya no está en este módulo (la
+    // resuelve la superficie de plataforma, que responde con su propio mensaje).
     payrollPagedStub.failOn = { table: "sedes", filter: "id", code: "42703" };
     expect(await getPayrollStartDate(SEDE)).toBeNull();
-    const failure: unknown = await setPayrollStartDate(
-      { payroll_start_date: "2026-10-05" },
-      ACTOR,
-    ).catch((error: unknown) => error);
-    expect(failure).toBeInstanceOf(PayrollError);
-    expect(failure).toMatchObject({ code: "VALIDATION", status: 409 });
-    expect((failure as PayrollError).message).toContain("068");
+    // Con la columna presente, la lectura devuelve lo que la sede tenga: la
+    // fecha es de la plataforma, pero el módulo la sigue leyendo.
+    payrollPagedStub.failOn = null;
+    seed({ startDate: "2026-10-05" });
+    expect(await getPayrollStartDate(SEDE)).toBe("2026-10-05");
   });
 
   it("rechaza abrir un período anterior a la fecha, nombrando la fecha", async () => {
@@ -12095,14 +12072,18 @@ describe("payroll: la fecha de arranque de la nómina de la sede (F10, servicio)
     }
   });
 
-  it("la lectura y la escritura van a la columna de la 068 (guarda de fuente)", () => {
+  it("la LECTURA va a la columna de la 068 y la escritura NO quedó en este módulo (guarda de fuente)", () => {
     const service = readFileSync(
       join(process.cwd(), "src", "features", "payroll", "service.ts"),
       "utf8",
     );
     expect(service).toContain('.from("sedes")');
     expect(service).toContain('.select("id, payroll_start_date")');
-    expect(service).toContain("update({ payroll_start_date: parsed.data.payroll_start_date })");
+    // G3b: la escritura de la fecha es de la plataforma. Si volviera a haber un
+    // `UPDATE` de la columna acá, el módulo tendría una segunda puerta para
+    // cambiar de qué fecha arranca la nómina de la sede.
+    expect(service).not.toContain("setPayrollStartDate");
+    expect(service).not.toMatch(/update\(\{\s*payroll_start_date/);
   });
 });
 
@@ -12127,12 +12108,24 @@ describe("payroll: la fecha de arranque de la nómina (F10/G3b): la escritura sa
       join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
       "utf8",
     );
+    const schemas = readFileSync(
+      join(process.cwd(), "src", "features", "payroll", "schemas.ts"),
+      "utf8",
+    );
     // Control positivo: el módulo sigue exportando la LECTURA.
     expect(actions).toContain("export async function getPayrollStartDateAction");
     // G3b: la ESCRITURA salió. Ni la action, ni el formulario, ni su campo.
     expect(actions).not.toContain("setPayrollStartDateAction");
     expect(client).not.toContain("setPayrollStartDateAction");
     expect(client).not.toContain('id="payroll-start-date"');
+    // Y el CUERPO de la escritura se fue con ella: un validador sin puerta que
+    // lo use es la forma que esta guarda quiere impedir.
+    expect(schemas).not.toContain("setPayrollStartDateSchema");
+    expect(schemas).not.toContain("SetPayrollStartDateInput");
+    // Control positivo del símbolo que la plataforma SÍ valida: `payrollStart-
+    // DateSchema` es otro símbolo (el que usa `setPlatformPayrollStartDate`) y
+    // quitarlo rompería la escritura que acaba de mudarse.
+    expect(schemas).toContain("export const payrollStartDateSchema");
     // La forma del módulo: una acción borrada no puede quedar accesible.
     expect(payrollActions).not.toHaveProperty("setPayrollStartDateAction");
   });

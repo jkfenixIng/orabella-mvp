@@ -57,12 +57,6 @@ const dateSchema = z
  */
 export const payrollStartDateSchema = dateSchema.nullable();
 
-/** F10: cuerpo para configurar (o limpiar) la fecha de arranque de la nómina. */
-export const setPayrollStartDateSchema = z.object({
-  payroll_start_date: payrollStartDateSchema,
-});
-export type SetPayrollStartDateInput = z.infer<typeof setPayrollStartDateSchema>;
-
 /**
  * PAY-01/F7: apertura de un período borrador por sede y CICLO.
  *

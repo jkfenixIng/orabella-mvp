@@ -621,17 +621,25 @@ siguiente es completo y vuelve a 750.000.
 
 ### Configurarlo
 
-`getPayrollStartDate(sedeId)` / `setPayrollStartDate({ payroll_start_date },
-actor)` en `service.ts`: la lectura y la escritura con el guard de admin en la
-superficie (`requirePayrollAdmin`), como el resto del módulo. La escritura valida
-la forma de la fecha (`setPayrollStartDateSchema`; una fecha futura es legal: la
-implementación puede arrancar en el ciclo que viene) y `null` vuelve a «sin
-configurar». Si la 068 no está aplicada (columna inexistente, `42703`), la
-lectura devuelve `null` —sin fecha, el módulo hace lo de hoy— y la escritura
-responde un mensaje accionable que nombra la migración, en vez del error crudo de
-la base.
+La CONFIGURACIÓN de la fecha ya no es de este módulo: es de la superficie de
+PLATAFORMA. `setPlatformPayrollStartDate({ sede_id, payroll_start_date }, actor)`
+en `platform/service.ts`, expuesta por `setPlatformPayrollStartDateAction` para
+el rol `superadmin`, es la ÚNICA escritura de la columna y deja AUDITORÍA
+(`platform.payroll_start_date_set`: actor, sede objetivo y los dos valores, el
+anterior y el nuevo). Valida la forma de la fecha con el mismo esquema que este
+módulo (`payrollStartDateSchema`, que la plataforma reutiliza desde acá: una
+fecha futura es legal porque la implementación puede arrancar en el ciclo que
+viene) y `null` vuelve a «sin configurar». Si la 068 no está aplicada (columna
+inexistente, `42703`), la escritura responde un mensaje accionable que nombra la
+migración, en vez del error crudo de la base.
 
-Equivalente manual, UNA línea (el control de la pantalla hace lo mismo):
+Lo que queda acá es la LECTURA: `getPayrollStartDate(sedeId)` en `service.ts`, con
+el guard de admin en la superficie (`requirePayrollAdmin`), como el resto del
+módulo. Es la que alimentan el aviso de pendientes y el diálogo de apertura, los
+dos pisos de los ciclos que se ofrecen y se abren. Con la 068 sin aplicada
+devuelve `null` —sin fecha, el módulo hace lo de hoy— en vez de un error interno.
+
+Equivalente manual, UNA línea (la superficie de plataforma hace lo mismo):
 
 ```sql
 UPDATE public.sedes SET payroll_start_date = '2026-10-05' WHERE id = '<sede>';
@@ -663,10 +671,12 @@ UPDATE public.sedes SET payroll_start_date = '2026-10-05' WHERE id = '<sede>';
   fecha (`isRangeBeforePayrollStart`, que rechaza nombrando la fecha). El
   servidor sigue siendo la autoridad.
 
-Léase `getPayrollStartDate` / `setPayrollStartDate` en `service.ts` y
-`getPayrollStartDateAction` / `setPayrollStartDateAction` en `actions.ts` (solo
-admin, `requirePayrollAdmin`; declaradas en la tabla de roles de
-`tests/action-guards.test.ts`).
+Léase `getPayrollStartDate` en `service.ts` y `getPayrollStartDateAction` en
+`actions.ts` (solo admin, `requirePayrollAdmin`; declaradas en la tabla de roles de
+`tests/action-guards.test.ts`). La ESCRITURA ya no es una superficie de este módulo:
+vive en `platform/service.ts` y `platform/actions.ts`
+(`setPlatformPayrollStartDate` / `setPlatformPayrollStartDateAction`, solo
+`superadmin`), con su propia fila en esa misma tabla.
 
 ## Detalle de la liquidación: facturas y vales (F6)
 

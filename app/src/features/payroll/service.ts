@@ -41,7 +41,6 @@ import {
   resolveVoucherInitialStatus,
   restoreVoucherStatus,
   roundMoney,
-  setPayrollStartDateSchema,
   splitCommissionByOrigin,
   summarizePayrollItems,
   voucherApprovalCashOutViolation,
@@ -869,6 +868,12 @@ export async function listPeriods(sedeId: string): Promise<PayrollPeriodRow[]> {
  * dos superficies, así el aviso y el servicio no pueden discrepar de desde
  * cuándo existe la nómina de la sede.
  *
+ * La ESCRITURA ya no vive acá: la configuración se muda a la superficie de
+ * plataforma (`setPlatformPayrollStartDate`, acción auditada
+ * `platform.payroll_start_date_set`), que es la única que escribe la columna.
+ * Acá queda la LECTURA, que es la que necesitan el aviso de pendientes y el
+ * diálogo de apertura.
+ *
  * Degradación por migración pendiente: si la 068 todavía no se aplicó, la
  * columna no existe y PostgREST responde 42703 (`undefined_column`). Ese caso NO
  * se convierte en error interno: sin fecha configurada el módulo conserva el
@@ -893,56 +898,6 @@ export async function getPayrollStartDate(sedeId: string): Promise<string | null
   }
   const row = data as unknown as { payroll_start_date?: string | null } | null;
   return row?.payroll_start_date ?? null;
-}
-
-/**
- * F10: configura (o limpia, con `null`) la fecha de arranque de la nómina de la
- * sede. SOLO admin: la aplica `requirePayrollAdmin` en la action y en la ruta,
- * igual que el resto del módulo (el servicio no re-valida el rol, la guarda vive
- * en la superficie que resuelve la sesión).
- *
- * NO se valida contra los períodos existentes y NO se reescribe historia: la
- * fecha es una DECLARACIÓN de negocio y los períodos anteriores que ya existan
- * (heredados, de antes de F10) se quedan como están. Lo que cambia desde ahora es
- * lo que se OFRECE y se ABRE (F10 en `pendingPayrollSettlements` y en
- * `openPayrollPeriod`).
- *
- * `null` es un estado legal: vuelve a «sin configurar» y el aviso regresa a su
- * cota anterior (la historia de la sede).
- *
- * Si la 068 no está aplicada, el UPDATE falla con 42703 y se responde con un
- * mensaje accionable en vez del error crudo de la base: el admin no puede
- * configurar lo que la base todavía no tiene.
- */
-export async function setPayrollStartDate(
-  raw: unknown,
-  actor: PayrollActor,
-): Promise<{ payroll_start_date: string | null }> {
-  const parsed = setPayrollStartDateSchema.safeParse(raw);
-  if (!parsed.success) {
-    throw new PayrollError("VALIDATION", validationMessage(parsed.error), 400);
-  }
-  const db = await payrollDb();
-  const { data, error } = await db
-    .from("sedes")
-    .update({ payroll_start_date: parsed.data.payroll_start_date })
-    .eq("id", actor.sedeId)
-    .select("id, payroll_start_date")
-    .maybeSingle();
-  if (error) {
-    const failure = error as { code?: string | null; message?: string | null };
-    if (failure.code === "42703" || /payroll_start_date/i.test(failure.message ?? "")) {
-      throw new PayrollError(
-        "VALIDATION",
-        "La fecha de inicio de la nómina todavía no se puede configurar en esta base: falta aplicar la migración 068.",
-        409,
-      );
-    }
-    throw new PayrollError("INTERNAL", "Error interno.", 500);
-  }
-  if (!data) throw new PayrollError("NOT_FOUND", "La sede no existe.", 404);
-  const row = data as unknown as { payroll_start_date?: string | null };
-  return { payroll_start_date: row.payroll_start_date ?? null };
 }
 
 async function getPeriodOrThrow(db: DbClient, sedeId: string, id: string): Promise<PayrollPeriodRow> {

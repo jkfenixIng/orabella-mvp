@@ -68,6 +68,25 @@ function readText(...segments: string[]): string {
 
 const MIGRATION_NAMES = readdirSync(MIGRATIONS_DIR).filter((f) => /^0\d\d_.*\.sql$/.test(f));
 
+/**
+ * Margen para las pruebas que LEEN el disco.
+ *
+ * Estas pruebas abren los 69 archivos de `supabase/migrations` de forma
+ * síncrona. El guardián es rápido: la prueba más pesada mide 16 ms con la máquina
+ * descargada y ~47 ms con el dev cargado, y el mismo recorrido sobre los 69
+ * archivos, medido por fuera, da ~2 ms. El límite por defecto de vitest (5000 ms
+ * por prueba) no está midiendo al guardián sino a la MÁQUINA: con un `next dev`
+ * compilando al lado, la lectura del disco se estira y una prueba sana se reporta
+ * como caída por tiempo.
+ *
+ * Por eso el margen es explícito y generoso: 30 s contra ~47 ms medidos son más
+ * de tres órdenes de magnitud de holgura. Lo que se amplía es la ESPERA, no la
+ * comparación: las aserciones son las mismas, una regresión real del detector
+ * sigue fallando por comparación, y un disco que de verdad se cuelga sigue
+ * fallando a los 30 s.
+ */
+const FILE_SCAN_TIMEOUT_MS = 30_000;
+
 /** Las tres guardas corregidas de la emisión: el COUNT y la ESCRITURA que mide. */
 const GUARD_PAIRS: ReadonlyArray<{ count: string; insert: string }> = [
   { count: "SELECT jsonb_array_length(p_items) INTO v_esperados;", insert: "INSERT INTO public.invoice_items" },
@@ -91,7 +110,7 @@ describe("orden de las redes de conteo (ROW_COUNT) en las migraciones 0xx", () =
     // Si esto falla, hay un archivo con la guarda invertida: el mensaje nombra
     // el archivo y la sentencia culpable.
     expect(offenders).toEqual([]);
-  });
+  }, FILE_SCAN_TIMEOUT_MS);
 
   it("el detector CAZA la forma vieja de 052 (prueba positiva del guardián)", () => {
     // Recorte verbatim del defecto: el `SELECT ... INTO` metido entre el INSERT
@@ -142,12 +161,12 @@ describe("orden de las redes de conteo (ROW_COUNT) en las migraciones 0xx", () =
         expect(afterInsert, `${name} :: diagnostico`).toContain("GET DIAGNOSTICS v_escritos = ROW_COUNT;");
       }
     }
-  });
+  }, FILE_SCAN_TIMEOUT_MS);
 
   it("el diagnóstico de migraciones reconoce la 060 por el marcador del cuerpo", () => {
     const diagnostics = readText(DIAGNOSTICS_PATH);
     // Una fila para la 060 con el mecanismo `functiondef` de 055/059.
     expect(diagnostics).toMatch(/\('060',\s*'functiondef'/);
     expect(diagnostics).toContain("'fix-060'");
-  });
+  }, FILE_SCAN_TIMEOUT_MS);
 });
