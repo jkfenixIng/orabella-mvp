@@ -49,12 +49,31 @@ repositorio:
 npm run create:superadmin
 ```
 
-### Variables: se leen del ENTORNO de la corrida (no de `.env.local`)
+### Variables: el script carga los archivos de entorno del proyecto
+
+El script arranca cargando los archivos de entorno del proyecto con
+`loadEnvConfig` de `@next/env` —el mecanismo canónico de Next, que ya viene con
+`next`—, así que lee los MISMOS archivos que la app (`.env.local` entre ellos)
+**antes** de mirar las variables. Con `.env.local` presente, lo único que hay que
+definir a mano es `SUPERADMIN_PASSWORD`:
 
 | Variable | Qué es |
 |---|---|
-| `SUPERADMIN_PASSWORD` | La clave de la cuenta. **Obligatoria y sin valor por defecto**: si falta o viene vacía, el script no escribe nada y falla. Es la ÚNICA variable propia del script. |
-| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Las mismas de la app: el script usa `createAdminClient()` (service_role), y el host de la URL es lo que imprime antes de escribir. |
+| `SUPERADMIN_PASSWORD` | La clave de la cuenta. **Obligatoria y sin valor por defecto**: si falta o viene vacía, el script no escribe nada y falla. Es la ÚNICA variable propia del script y la única que NO va en `.env.local`. |
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Las mismas de la app: salen de `.env.local` y el script usa `createAdminClient()` (service_role). El host de la URL es lo que imprime antes de escribir. |
+
+**Precedencia:** lo que YA está en el entorno del proceso **gana** sobre el
+archivo (es la precedencia normal de Next, y el script la impone de forma
+explícita para que no dependa de un detalle interno). Así el dueño puede apuntar
+a otra base a propósito, sin editar ningún archivo.
+
+El script dice de dónde salieron las credenciales —solo nombres de archivo, nunca
+valores—:
+
+```text
+[superadmin] entorno: archivos cargados: .env.local, .env — el entorno del proceso tiene prioridad sobre ellos
+[superadmin] entorno: no se encontraron archivos de entorno; se usa sólo el entorno del proceso
+```
 
 **No hay variable de destino ni de sede.** El destino no se declara: cada entorno
 tiene su propio `.env` y el script imprime el HOST de Supabase al que le escribe
@@ -65,19 +84,45 @@ la asegura el script (ver abajo).
 ni en este README, ni en una prueba— y **no hay clave por defecto**, porque el
 respaldo silencioso termina siendo la clave de producción. Vive solo en el
 entorno con el que se corre el script; a la base baja únicamente su hash scrypt
-(`hashPassword` de la app). El script tampoco lee `.env.local`: el entorno de la
-corrida se declara a mano, para que un archivo local no decida contra qué base se
-escribe una credencial.
+(`hashPassword` de la app). El cargador leería la clave si estuviera en
+`.env.local`, y por eso la decisión es **no ponerla ahí**: la credencial se define
+en el entorno de la corrida, no en un archivo.
 
 El documento es el MISMO en los dos entornos; lo único que cambia es el valor de
-las variables:
+las variables (y el `.env.local` de cada máquina):
 
 ```bash
 # PRUEBAS y producción se distinguen por el VALOR y por el host que el script imprime.
-export SUPERADMIN_PASSWORD='...'         # solo en este shell, nunca en un archivo del repo
-export NEXT_PUBLIC_SUPABASE_URL='https://<proyecto>.supabase.co'
-export NEXT_PUBLIC_SUPABASE_ANON_KEY='...'
-export SUPABASE_SERVICE_ROLE_KEY='...'
+export SUPERADMIN_PASSWORD='...'   # la ÚNICA a mano; sale del shell, nunca de un archivo
+npm run create:superadmin
+```
+
+Si la máquina NO tiene `.env.local` (o se corre desde otro directorio), hay que
+definir también las tres de Supabase en el entorno, porque no hay archivo del que
+salgan.
+
+### Definir la clave en el shell (la trampa que ya nos costó una corrida)
+
+La clave es la única variable que se define a mano, y **cómo se define depende del
+shell**:
+
+```powershell
+# PowerShell: `set VAR=valor` NO define una variable de entorno (es un alias de
+# Set-Variable: la variable existe en la sesión, pero los procesos hijos NO la
+# heredan, así que npm/node no la ven). Se usa $env:, y vale sólo para esa ventana.
+$env:SUPERADMIN_PASSWORD = '...'
+npm run create:superadmin
+```
+
+```cmd
+:: cmd.exe: `set VAR=valor` SÍ define una variable de entorno (sólo para esa ventana).
+set SUPERADMIN_PASSWORD=...
+npm run create:superadmin
+```
+
+```bash
+# sh/bash: `export` para que el proceso hijo la herede (sólo esa ventana).
+export SUPERADMIN_PASSWORD='...'
 npm run create:superadmin
 ```
 
@@ -155,13 +200,14 @@ fijar de forma portable en `cmd.exe` y en `sh`—, así que la entrada del
 Si algún día se agrega un runner propio (`tsx`), la entrada se cambia por
 `tsx scripts/create-superadmin.ts` y el script no se toca.
 
-**El script se corre DESDE la máquina del dueño**, contra la base remota, con esas
-variables en el entorno: no hace parte del despliegue de la app y no se ejecuta
-desde el servidor de producción. Necesita, por lo tanto, un checkout del
-repositorio con las dependencias de desarrollo instaladas (`npm ci`). Si algún día
-tiene que correrse en un entorno que no las tenga, hay que **declarar el runner**
-en el proyecto —`tsx`, por ejemplo—: eso sería su propia unidad, con su propio
-cambio de `package.json` y de `package-lock.json` y su propio gate.
+**El script se corre DESDE la máquina del dueño**, contra la base remota, con las
+credenciales que salen de su `.env.local` (o del entorno del proceso, que tiene
+prioridad): no hace parte del despliegue de la app y no se ejecuta desde el
+servidor de producción. Necesita, por lo tanto, un checkout del repositorio con
+las dependencias de desarrollo instaladas (`npm ci`). Si algún día tiene que
+correrse en un entorno que no las tenga, hay que **declarar el runner** en el
+proyecto —`tsx`, por ejemplo—: eso sería su propia unidad, con su propio cambio
+de `package.json` y de `package-lock.json` y su propio gate.
 
 Si el runner no está instalado, el arranque lo dice en vez de morir con el error
 de Node sobre un módulo que no encuentra:

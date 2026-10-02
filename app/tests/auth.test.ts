@@ -32,7 +32,13 @@ import {
 } from "@/src/features/auth/schemas";
 import { requirePlatformAdmin } from "@/src/features/platform/service";
 import { AUDIT_ACTIONS } from "@/src/shared/lib/audit";
-import { main, provisionarSuperadmin, NOMBRE_SEDE_PLATAFORMA } from "@/scripts/create-superadmin";
+import {
+  main,
+  provisionarSuperadmin,
+  cargarEntornoDeProyecto,
+  NOMBRE_SEDE_PLATAFORMA,
+  type CargadorDeEntorno,
+} from "@/scripts/create-superadmin";
 
 describe("auth schemas (Zod, sin red)", () => {
   it("login acepta documento+clave y recorta espacios", () => {
@@ -1484,6 +1490,12 @@ describe("auth: la sesión real lleva el rol de plataforma hasta la guarda (G1)"
 describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () => {
   const CLAVE_FICTICIA = "clave-ficticia-de-prueba";
   const OTRA_CLAVE_FICTICIA = "otra-clave-ficticia-de-prueba";
+  /** Credencial FICTICIA: nada con pinta de real, tampoco en una prueba. */
+  const CLAVE_DE_SERVICIO_FICTICIA = "credencial-ficticia-de-prueba";
+  /** Cargador sin archivos: las pruebas de `main()` no tocan el disco. */
+  const SIN_ARCHIVOS: CargadorDeEntorno = () => ({ loadedEnvFiles: [] });
+  /** Lo que había en el entorno antes de que una prueba escribiera la ficticia. */
+  const CLAVE_DE_SERVICIO_PREVIA = process.env.SUPABASE_SERVICE_ROLE_KEY;
   const EXIT_CODE_INICIAL = process.exitCode;
 
   function sembrar(): void {
@@ -1554,10 +1566,76 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
   });
 
   afterEach(() => {
+    // El cargador falso escribe una credencial ficticia en el entorno: se
+    // restaura lo que había para no dejarla pegada al resto de la suite.
+    if (CLAVE_DE_SERVICIO_PREVIA === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    else process.env.SUPABASE_SERVICE_ROLE_KEY = CLAVE_DE_SERVICIO_PREVIA;
     // `main()` marca `process.exitCode`: la suite no puede terminar con el
     // código de un script que se negó a correr.
     process.exitCode = EXIT_CODE_INICIAL;
     vi.unstubAllEnvs();
+  });
+
+  it("carga los archivos de entorno del proyecto, y el entorno del proceso GANA sobre el archivo", () => {
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "https://desde-el-proceso.supabase.co");
+    let dirRecibido = "";
+    const cargador: CargadorDeEntorno = (dir) => {
+      dirRecibido = dir;
+      // El archivo PISA todo lo que traiga, incluso lo que ya estaba en el
+      // entorno: así la precedencia la tiene que garantizar el script, no el
+      // cargador.
+      process.env.NEXT_PUBLIC_SUPABASE_URL = "https://desde-el-archivo.supabase.co";
+      process.env.SUPABASE_SERVICE_ROLE_KEY = CLAVE_DE_SERVICIO_FICTICIA;
+      return { loadedEnvFiles: [{ path: ".env.local" }, { path: ".env" }] };
+    };
+
+    const archivos = cargarEntornoDeProyecto("/proyecto", cargador);
+
+    expect(dirRecibido).toBe("/proyecto");
+    expect(archivos).toEqual([".env.local", ".env"]);
+    // Lo que ya estaba en el entorno del proceso sigue mandando...
+    expect(process.env.NEXT_PUBLIC_SUPABASE_URL).toBe("https://desde-el-proceso.supabase.co");
+    // ...y lo que sólo venía del archivo queda cargado.
+    expect(process.env.SUPABASE_SERVICE_ROLE_KEY).toBe(CLAVE_DE_SERVICIO_FICTICIA);
+  });
+
+  it("dice de dónde salieron las credenciales: imprime los archivos cargados y ningún valor", async () => {
+    sembrar();
+    vi.stubEnv("SUPERADMIN_PASSWORD", CLAVE_FICTICIA);
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "https://proyecto-de-prueba.supabase.co");
+    const salida = capturarSalida();
+    const cargador: CargadorDeEntorno = () => ({
+      loadedEnvFiles: [{ path: ".env.local" }, { path: ".env" }],
+    });
+
+    await main(cargador);
+
+    expect(process.exitCode).toBeFalsy();
+    const todo = [...salida.lineas, ...salida.avisos, ...salida.errores].join("\n");
+    expect(todo).toContain("archivos cargados: .env.local, .env");
+    // Solo NOMBRES de archivo: ningún valor sale por la salida del script.
+    expect(todo).not.toContain(CLAVE_FICTICIA);
+    salida.restaurar();
+  });
+
+  it("sin archivos de entorno ni variables de Supabase, el aviso de credenciales faltantes sigue saliendo", async () => {
+    sembrar();
+    vi.stubEnv("SUPERADMIN_PASSWORD", CLAVE_FICTICIA);
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", undefined);
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", undefined);
+    vi.stubEnv("SUPABASE_SERVICE_ROLE_KEY", undefined);
+    const salida = capturarSalida();
+
+    await main(SIN_ARCHIVOS);
+
+    expect(process.exitCode).toBe(1);
+    // Dijo de dónde salieron (o no) las credenciales...
+    expect(salida.lineas.join("\n")).toContain("no se encontraron archivos de entorno");
+    // ...y el aviso de siempre sigue saliendo, antes de tocar la base.
+    expect(salida.errores.join("\n")).toContain("NEXT_PUBLIC_SUPABASE_URL");
+    expect(postgrest.rpcCalls).toEqual([]);
+    expect(postgrest.writes).toEqual([]);
+    salida.restaurar();
   });
 
   it("crea la sede de plataforma INACTIVA y el hash que escribe VERIFICA con `verifyPassword`", async () => {
@@ -1604,7 +1682,7 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
     vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "https://proyecto-de-prueba.supabase.co");
     const salida = capturarSalida();
 
-    await main();
+    await main(SIN_ARCHIVOS);
 
     expect(process.exitCode).toBe(1);
     // La clave se valida ANTES de tocar la base: ninguna lectura ni escritura.
@@ -1620,7 +1698,7 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
     vi.stubEnv("SUPERADMIN_PASSWORD", "   ");
     const salida = capturarSalida();
 
-    await main();
+    await main(SIN_ARCHIVOS);
 
     expect(process.exitCode).toBe(1);
     expect(postgrest.rpcCalls).toEqual([]);
@@ -1727,7 +1805,7 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
     vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "https://proyecto-de-prueba.supabase.co");
     const salida = capturarSalida();
 
-    await main();
+    await main(SIN_ARCHIVOS);
 
     expect(process.exitCode).toBeFalsy();
     expect(salida.avisos.join("\n")).toContain("ACTIVA");
@@ -1755,7 +1833,7 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
     vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "https://proyecto-de-prueba.supabase.co");
     const salida = capturarSalida();
 
-    await main();
+    await main(SIN_ARCHIVOS);
 
     expect(process.exitCode).toBeFalsy();
     const todo = [...salida.lineas, ...salida.errores, ...salida.avisos].join("\n");

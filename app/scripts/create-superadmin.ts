@@ -66,15 +66,33 @@
  *   * NO escribe auditoría: el vocabulario de `audit_logs` no tiene una acción
  *     de aprovisionamiento y este script no es una operación de la aplicación.
  *
+ * DE DÓNDE SALEN LAS CREDENCIALES DE SUPABASE (y de dónde NO)
+ *   El script CARGA los archivos de entorno del proyecto con el mecanismo
+ *   canónico de Next (`loadEnvConfig` de `@next/env`, que ya viene con `next`),
+ *   así que `NEXT_PUBLIC_SUPABASE_URL` y `SUPABASE_SERVICE_ROLE_KEY` salen de
+ *   `.env.local` sin pegarlas a mano en el terminal —que es la fricción que
+ *   termina en la clave pegada en el lugar equivocado o en la base equivocada—.
+ *   Imprime los NOMBRES de los archivos que cargó (nunca valores) para que se
+ *   sepa de dónde salieron las credenciales.
+ *
+ *   PRECEDENCIA: lo que YA está en el entorno del proceso GANA sobre el archivo.
+ *   `@next/env` ya lo hace así (trabaja sobre un snapshot del entorno); acá se
+ *   vuelve a imponer de forma explícita para que la garantía esté escrita y
+ *   probada en este archivo, y no heredada de un detalle interno. Así el dueño
+ *   puede apuntar a otra base a propósito sin editar archivos.
+ *
+ *   `SUPERADMIN_PASSWORD` NO va en ningún archivo: es la credencial y se define
+ *   en el entorno de la corrida (ver el README). El cargador la leería si
+ *   estuviera en `.env.local`, y por eso el README dice que no se ponga ahí.
+ *
  * CÓMO SE CORRE
- *   `npm run create:superadmin` con las variables en el entorno de la corrida
- *   (ver el README de la app). No lee `.env.local`: el entorno de la corrida es
- *   el que se declara a mano, y nadie quiere que un archivo local decida contra
- *   qué base se escribe una credencial. El script imprime el host de Supabase
- *   ANTES de escribir: ese es el chequeo humano de a qué instalación le escribe
- *   —cada entorno tiene su propio `.env`—.
+ *   `npm run create:superadmin`. El script imprime de qué archivos de entorno
+ *   salieron las credenciales y el host de Supabase ANTES de escribir: ese es el
+ *   chequeo humano de a qué instalación le escribe.
  */
 
+import { basename } from "node:path";
+import { loadEnvConfig } from "@next/env";
 import { esRechazoDeRpc, hashPassword, verifyPassword } from "@/src/features/auth/service";
 
 // ---------------------------------------------------------------- contrato ---
@@ -113,6 +131,50 @@ export class SuperadminError extends Error {
 }
 
 type Entorno = Record<string, string | undefined>;
+
+// ------------------------------------------------------ entorno del proyecto ---
+
+/**
+ * Lo que el script necesita del cargador de entorno (el resto de la firma de
+ * `loadEnvConfig` es opcional). Se declara para poder inyectarlo en las pruebas
+ * sin tocar el disco ni los archivos de entorno reales.
+ */
+export type CargadorDeEntorno = (
+  dir: string,
+  dev?: boolean,
+  log?: { info: (...args: unknown[]) => void; error: (...args: unknown[]) => void },
+) => { loadedEnvFiles: Array<{ path: string }> };
+
+/**
+ * Logger del cargador: silencia el ruido normal de Next, pero NO sus fallos. Un
+ * archivo ilegible o mal formado tiene que verse, prefijado y en su contexto.
+ */
+const LOGGER_DE_ENTORNO = {
+  info: () => {},
+  error: (...args: unknown[]) => console.error("[superadmin] entorno:", ...args),
+};
+
+/**
+ * Carga los archivos de entorno del proyecto —la MISMA lista que arma Next según
+ * `NODE_ENV` (con `.env.local` entre ellos; en `NODE_ENV=test` Next lo omite)— y
+ * devuelve sus NOMBRES, que son lo único que el script imprime de ellos.
+ *
+ * PRECEDENCIA: se guarda el entorno que YA tenía el proceso y se vuelve a imponer
+ * después de cargar, así lo que el shell declaró gana sobre el archivo y el dueño
+ * puede apuntar a otra base a propósito. `@next/env` ya respeta esa precedencia;
+ * hacerlo acá deja la garantía escrita y probada en vez de heredada.
+ */
+export function cargarEntornoDeProyecto(
+  dir: string = process.cwd(),
+  cargar: CargadorDeEntorno = loadEnvConfig,
+): string[] {
+  const previas = { ...process.env };
+  const { loadedEnvFiles } = cargar(dir, undefined, LOGGER_DE_ENTORNO);
+  for (const [clave, valor] of Object.entries(previas)) {
+    if (valor !== undefined) process.env[clave] = valor;
+  }
+  return loadedEnvFiles.map((archivo) => basename(archivo.path));
+}
 
 // ---------------------------------------------------------------- entradas ---
 
@@ -446,11 +508,22 @@ function hostDe(url: string): string {
 }
 
 /**
- * Punto de entrada. NUNCA imprime la clave ni el hash: solo el host de destino,
- * la sede y lo que quedó escrito.
+ * Punto de entrada. NUNCA imprime la clave ni el hash: solo de dónde salió el
+ * entorno, el host de destino, la sede y lo que quedó escrito.
  */
-export async function main(): Promise<void> {
+export async function main(cargar?: CargadorDeEntorno): Promise<void> {
   try {
+    // PRIMERO el entorno: de acá salen la URL y la service_role key (y hasta la
+    // clave, si alguien la puso en un archivo). Después de esto, cualquier
+    // lectura de `process.env` ve lo que dejaron los archivos, con el shell
+    // ganando sobre ellos.
+    const archivos = cargarEntornoDeProyecto(process.cwd(), cargar);
+    console.log(
+      archivos.length > 0
+        ? `[superadmin] entorno: archivos cargados: ${archivos.join(", ")} — el entorno del proceso tiene prioridad sobre ellos`
+        : "[superadmin] entorno: no se encontraron archivos de entorno; se usa sólo el entorno del proceso",
+    );
+
     const clave = leerClave(process.env);
     const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
     if (!url) {
