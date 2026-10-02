@@ -2118,3 +2118,81 @@ describe("migración 069_superadmin_role.sql (G1)", () => {
     expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
   });
 });
+
+// ---------------------------------------- nombres de sede únicos (G2) ---
+
+describe("migración 070_sedes_unique_name.sql (G2)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "070_sedes_unique_name.sql"),
+    "utf8",
+  );
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  /**
+   * Destino del índice único, en una sola línea. Es el detector que usan las
+   * pruebas de abajo: si el CREATE desapareciera, dejara de ser único o dejara
+   * de normalizar el nombre, devuelve `null` u otra cosa y la prueba cae.
+   */
+  function destinoIndiceUnicoSede(fuente: string): string | null {
+    const destino = fuente.match(
+      /CREATE UNIQUE INDEX IF NOT EXISTS uq_sedes_name\s+ON public\.sedes\s*\(([^;]*?)\);/s,
+    );
+    return destino ? destino[1].replace(/\s+/g, " ").trim() : null;
+  }
+
+  it("crea, una sola vez, un índice único sobre el nombre normalizado", () => {
+    expect(destinoIndiceUnicoSede(sql)).toBe("lower(btrim(name))");
+    expect(sql.match(/CREATE UNIQUE INDEX\b/g)).toHaveLength(1);
+    expect(sql).not.toMatch(/CREATE INDEX\b/);
+  });
+
+  it("aborta antes de crear el índice si ya hay nombres repetidos y los lista", () => {
+    // El pre-vuelo agrupa por la MISMA clave normalizada y cuenta.
+    expect(sql).toContain("GROUP BY lower(btrim(name))");
+    expect(sql).toContain("HAVING count(*) > 1");
+    // El mensaje dice que aborta, que no toca filas y qué hacer.
+    expect(sql).toContain("migración 070 ABORTADA");
+    expect(sql).toMatch(/renombre las sedes repetidas/i);
+    expect(sql).toContain("No se borró, renombró ni fusionó ninguna fila");
+    // Aborta con excepción; no es un aviso que siga de largo.
+    expect(sql).toContain("RAISE EXCEPTION");
+  });
+
+  it("es re-ejecutable y no toca datos ni otras tablas", () => {
+    expect(sql).toContain("CREATE UNIQUE INDEX IF NOT EXISTS uq_sedes_name");
+    expect(sql).not.toMatch(/^\s*DELETE\b/im);
+    expect(sql).not.toMatch(/^\s*UPDATE\b/im);
+    expect(sql).not.toMatch(/^\s*TRUNCATE\b/im);
+    expect(sql).not.toMatch(/^\s*ALTER TABLE\b/im);
+    // Sólo `sedes`: ninguna otra tabla del esquema entra en una sentencia.
+    expect(sql).toMatch(/public\.sedes\b/);
+    expect(sql).not.toMatch(/public\.(users|employees|roles|user_roles|sessions)\b/);
+  });
+
+  it("declara el motivo, la numeración libre y que no se ejecutó", () => {
+    expect(raw).toContain("Plataforma (sistema)");
+    expect(raw).toContain("lower(btrim(name))");
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("control negativo: el detector no es un sello de goma", () => {
+    // Un índice sobre `name` crudo (sin normalizar) NO pasa el detector: es
+    // justo la debilidad que 070 corrige.
+    const sinNormalizar =
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_sedes_name ON public.sedes (name);\n";
+    expect(destinoIndiceUnicoSede(sinNormalizar)).toBe("name");
+    expect(destinoIndiceUnicoSede(sinNormalizar)).not.toBe("lower(btrim(name))");
+    // Sin el CREATE (archivo ausente o recortado), el detector devuelve null.
+    expect(destinoIndiceUnicoSede("SELECT 1;\n")).toBeNull();
+    // Y un índice NO único tampoco cuenta como la barrera.
+    expect(
+      destinoIndiceUnicoSede(
+        "CREATE INDEX IF NOT EXISTS uq_sedes_name ON public.sedes (lower(btrim(name)));\n",
+      ),
+    ).toBeNull();
+  });
+});
