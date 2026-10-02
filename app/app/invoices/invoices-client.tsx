@@ -1247,6 +1247,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setPortions((prev) => prev.map((row, i) => (i === firstEmpty ? { ...row, amount: value } : row)));
   }
 
+  // Totalizar pago (detalle): el monto del cobro es NETO, igual que las
+  // porciones de la emisión; el recargo de tarjeta lo suma el servidor al
+  // total, no al monto. Fuente: el saldo NETO pendiente que ya trae el detalle.
+  const splitRemaining = detail ? Math.max(0, Number(detail.remaining)) : 0;
+  const canTotalizeSplit = splitRemaining > 0;
+
+  function totalizeSplitPayment() {
+    if (splitRemaining <= 0) return;
+    const value = String(Math.round(splitRemaining * 100) / 100);
+    setSplitDraft((prev) => ({ ...prev, amount: value }));
+  }
+
   // Métodos ya usados en otras porciones: cada método se cobra una sola vez.
   const usedMethodCodes = new Set(portions.map((portion) => portion.method_code));
   const firstFreeMethod =
@@ -2176,7 +2188,21 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 />
                               </label>
                               </div>
-                              <div>
+                              <div className="flex flex-wrap items-center gap-3">
+                              <button
+                                type="button"
+                                disabled={!canTotalizeSplit || busy}
+                                title={
+                                  canTotalizeSplit
+                                    ? "Rellena el monto con el saldo neto pendiente"
+                                    : "Nada por rellenar"
+                                }
+                                onClick={totalizeSplitPayment}
+                                className="flex h-10 items-center gap-2 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-paper-ink-secondary hover:bg-paper-surface-soft disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                <Banknote className="h-4 w-4" aria-hidden="true" />
+                                Totalizar pago
+                              </button>
                               <button
                                 type="submit"
                                 disabled={busy}
