@@ -17,6 +17,7 @@ import {
   checkVoucherEligibility,
   computeNetPay,
   correctPayrollPeriodSchema,
+  mixedAbsorbedDetailLine,
   monthKeyOf,
   normalizeAllowedDays,
   normalizePerDayLimits,
@@ -24,15 +25,17 @@ import {
   overlapBlocksDeletion,
   payPayrollItemSchema,
   payrollExtraSchema,
-  prorateFixedSalary,
   rangesOverlap,
   requestVoucherSchema,
   rejectVoucherSchema,
   requiresVoucherApproval,
+  resolveFixedSalaryForPeriod,
+  resolveMixedBlock,
   resolveVoucherDayCap,
   resolveVoucherInitialStatus,
   restoreVoucherStatus,
   roundMoney,
+  splitCommissionByOrigin,
   summarizePayrollItems,
   voucherApprovalCashOutViolation,
   voucherLimitsSchema,
@@ -319,6 +322,11 @@ export interface PayrollPeriodRow {
   sede_id: string;
   start_date: string;
   end_date: string;
+  /**
+   * F3: cadencia del período (`payroll_periods.frequency`, 063). `null` = sin
+   * cadencia definida: el fijo se prorratea por días calendario, como hoy.
+   */
+  frequency: string | null;
   status: string;
   created_by: string | null;
   closed_at: string | null;
@@ -478,7 +486,7 @@ export interface VoucherRequestRow {
 }
 
 const PERIOD_SELECT =
-  "id, sede_id, start_date, end_date, status, created_by, closed_at, created_at";
+  "id, sede_id, start_date, end_date, frequency, status, created_by, closed_at, created_at";
 const ITEM_SELECT =
   "id, period_id, employee_id, base_fixed, commissions, bonuses, deductions_vales, other_discounts, net_pay, detail_json, voucher_total, created_at";
 const PAYMENT_SELECT =
@@ -1652,20 +1660,25 @@ async function computePayrollLines(args: {
     }
 
     const payload = roster.map((employee) => {
-      // PR1: el fijo de un período son SOLO sus días. `salary_fixed` es mensual
-      // (003_admin.sql): antes se pagaba completo en cada período y cuatro
-      // cierres semanales de un mes pagaban 4 × el sueldo, sin error ni aviso.
-      // La porción se calcula por los días del rango (mes por mes, redondeando
-      // una sola vez) y la suma de los períodos del mes da el sueldo siempre
-      // que no compartan días (de eso se ocupa la guarda de solape).
-      const baseFixed =
+      // F3: la cadencia del PERÍODO decide el fijo (decisión del dueño,
+      // 2026-10-01). Si falta la cadencia del período o la del empleado, sigue
+      // rigiendo el prorrateo por días de hoy; si coinciden, el fijo es
+      // `mensual × fracción` (1/4, 1/2, 1) sobre el mes comercial de 30 días; si
+      // el empleado tiene OTRA cadencia, acá cobra 0 fijo porque lo paga su
+      // propio ciclo. Todo eso vive en la función pura
+      // `resolveFixedSalaryForPeriod`, que también dice en `basis` cuál de las
+      // tres reglas se aplicó. Un `porcentaje` no cobra fijo: no hay fracción.
+      const fixedResolution =
         employee.pay_type === "fijo" || employee.pay_type === "mixto"
-          ? prorateFixedSalary({
+          ? resolveFixedSalaryForPeriod({
               salaryFixed: employee.salary_fixed,
+              employeeFrequency: employee.pay_frequency ?? null,
+              periodFrequency: period.frequency,
               startDate: period.start_date,
               endDate: period.end_date,
             })
-          : 0;
+          : { amount: 0, basis: "prorated" as const, fraction: null };
+      const baseFixed = fixedResolution.amount;
       // Misma resolución por línea que el pago inmediato: la regla ítem×empleado
       // gana sobre el porcentaje plano. Un `fijo` con regla sí comisiona; un
       // `fijo` sin reglas sigue sin detalle (comisión 0). `no_aplica` no entra.
@@ -1693,9 +1706,38 @@ async function computePayrollLines(args: {
         })),
         rules: rulesByEmployee.get(employee.id) ?? new Map<string, RuleRate>(),
       });
-      const { detail, commissions: earnedCommissions } = buildEmployeeDetail(detailInput);
+      const { detail: rawDetail, commissions: earnedCommissions } = buildEmployeeDetail(detailInput);
+      /** El detalle que se PERSISTE: las líneas reales más, si hubo, el ajuste visible del mixto. */
+      let detail = rawDetail;
       const paidImmediate = paidImmediateByEmployee.get(employee.id) ?? 0;
-      const commissions = roundMoney(Math.max(0, earnedCommissions - paidImmediate));
+      // La comisión base de este período, sin el pago inmediato ya hecho.
+      let earnedForPay = earnedCommissions;
+      // F3: regla del MIXTO. Aplica sólo cuando la cadencia está definida (si
+      // falta cualquiera de las dos, el camino es el de hoy y nada cambia). El
+      // bloque fijo + porcentajes paga `max(básico, porcentajes de servicios)`,
+      // y la comparación es SOLO contra esos porcentajes: las comisiones fijas
+      // por producto se siguen sumando. `resolveMixedBlock` reparte sobre las
+      // columnas de siempre (`base_fixed` = básico; la parte porcentual de
+      // `commissions` = `max(0, porcentajes − básico)`) y devuelve el absorbido.
+      if (employee.pay_type === "mixto" && fixedResolution.basis !== "prorated") {
+        const { fixed: fixedCommissions, percent: servicePercent } = splitCommissionByOrigin({
+          commissions: earnedCommissions,
+          detail,
+        });
+        const mixed = resolveMixedBlock({ baseFixed, fixedCommissions, servicePercent });
+        if (mixed.absorbed > 0) {
+          // El absorbido queda VISIBLE como una línea más del detalle (su monto
+          // va en negativo), para que los porcentajes no desaparezcan entre las
+          // columnas y para que la suma de `detail_json` siga dando exactamente
+          // `commissions`.
+          detail = buildEmployeeDetail([
+            ...detail,
+            mixedAbsorbedDetailLine({ employeeId: employee.id, absorbed: mixed.absorbed }),
+          ]).detail;
+        }
+        earnedForPay = mixed.commissions;
+      }
+      const commissions = roundMoney(Math.max(0, earnedForPay - paidImmediate));
       const adjustment = adjustments.get(employee.id);
       const bonuses = roundMoney(adjustment?.bonuses ?? 0);
       // NV-01: la deuda ENTRANTE entra dentro de `other_discounts`. La igualdad

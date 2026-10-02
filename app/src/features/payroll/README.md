@@ -108,6 +108,71 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   payroll_periods/items/payments + voucher_settings/requests, §10
   Nómina/vales, plan paso 6 (§12).
 
+## Cadencia de pago y regla del mixto (F3)
+
+Las migraciones `063_nomina_frecuencias.sql` (columnas) y `064` (deuda de
+vales) ya están aplicadas. `employees.pay_frequency` y
+`payroll_periods.frequency` son `text NULL` con catálogo cerrado
+`semanal | quincenal | mensual`. **NULL no es un valor más: es la AUSENCIA de
+cadencia** y conserva el comportamiento de hoy (el fijo se prorratea por los
+días calendario del período con `prorateFixedSalary`). Mientras falte la
+cadencia de cualquiera de los dos lados, ningún camino existente cambia.
+
+### Fracción del fijo por cadencia
+
+Cuando el período y el empleado TIENEN cadencia, la del PERÍODO decide quién
+cobra el fijo y con qué fracción, sobre un **mes comercial de 30 días** (el mes
+se cuenta como 4 semanas):
+
+| Cadencia del período | Fracción | Fijo del período (ej. mensual 1.500.000) |
+| -------------------- | -------- | ---------------------------------------- |
+| `semanal`            | `1/4`    | 375.000                                  |
+| `quincenal`          | `1/2`    | 750.000                                  |
+| `mensual`            | `1`      | 1.500.000                                |
+
+- **Coinciden**: el fijo es `mensual × fracción`, sin mirar los días del rango.
+- **Difieren**: el empleado cobra **0 fijo** en ese período; lo paga su propio
+  ciclo y pagarlo acá también lo pagaría dos veces. El caso está en
+  `resolveFixedSalaryForPeriod`, que devuelve en `basis` cuál de las tres reglas
+  aplicó (`cadence`, `other-cadence` o `prorated`), explícito y no inferido.
+- **Consecuencia aceptada por el dueño (2026-10-01)**: `1/4` por semana paga
+  ≈ 13 sueldos al año (52,14 semanas), no 12. El mes comercial de 30 días es lo
+  que produce esa cuenta; no se reabre la decisión.
+
+### Regla del mixto
+
+Un empleado `mixto` cobra, por su bloque fijo + porcentajes, **el MAYOR** entre
+su básico del período y los porcentajes de SERVICIOS del período:
+
+| Básico del período | Porcentajes de servicios | Bloque fijo + porcentajes |
+| ------------------ | ------------------------ | ------------------------- |
+| 300.000            | 400.000                  | 400.000                   |
+| 300.000            | 200.000                  | 300.000                   |
+
+- La comparación es **solo contra los porcentajes de servicios**. Las
+  comisiones fijas por producto NO entran al máximo y se siguen sumando como
+  hasta hoy (`básico 300.000`, `porcentajes 400.000`, `producto 50.000` →
+  450.000).
+- La regla se reparte sobre las columnas EXISTENTES, sin mover la identidad
+  `neto = base_fixed + commissions + bonuses − deductions_vales − other_discounts`:
+  - `base_fixed` sigue llevando el básico del período;
+  - la parte porcentual de `commissions` pasa a `max(0, porcentajes − básico)`;
+  - `max(básico, porcentajes)` = `base_fixed + la parte porcentual de
+    commissions`.
+- El porcentaje que el básico ABSORBE (`min(básico, porcentajes)`) se ve en el
+  detalle como una **línea de ajuste** (`item_type = "ajuste_mixto"`, con su
+  monto en negativo): así los porcentajes no desaparecen entre las columnas y la
+  suma de `detail_json` vuelve a dar exactamente `commissions`. La línea no
+  menciona ninguna factura, así que el candado de nómina cerrada no la confunde
+  con una.
+- `fijo` y `porcentaje` conservan sus reglas de siempre salvo la fracción del
+  fijo de arriba.
+
+Las funciones puras viven en `schemas.ts` (`fixedFractionForFrequency`,
+`resolveFixedSalaryForPeriod`, `resolveMixedBlock`, `mixedAbsorbedDetailLine`) y
+el cálculo de `computePayrollLines` (`service.ts`) las usa tal cual, tanto en el
+borrador como en la corrección de un período cerrado.
+
 ## Límites de lectura
 
 - Navegación instantánea: `listPeriods` acotado a 20 periodos recientes, `listVouchers` a 50 vales recientes; la pantalla de vales nace acotada al día de hoy (Bogotá, `date_from`/`date_to` incluyentes) y amplía —o limpia— ese rango desde sus filtros de fecha; el detalle del periodo (ítems + saldos) se carga bajo demanda al seleccionar.

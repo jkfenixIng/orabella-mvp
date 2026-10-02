@@ -677,6 +677,179 @@ export function prorateFixedSalary(args: {
   return roundMoney(total);
 }
 
+// ------------------------------------------------ F3: cadencia y regla mixta ---
+
+/**
+ * F3: cadencia de pago. Es la MISMA lista cerrada que declara el CHECK de
+ * `employees.pay_frequency` y `payroll_periods.frequency` (migración 063) y la
+ * que pregunta la ficha del empleado (unidad de EMPLEADOS). `null` no es un
+ * valor más: es la AUSENCIA de cadencia, y conserva el comportamiento de hoy.
+ */
+export const payFrequencySchema = z.enum(["semanal", "quincenal", "mensual"]);
+export type PayFrequency = z.infer<typeof payFrequencySchema>;
+
+/** F3: cadencia válida, o null cuando no viene o no es una de las tres. */
+export function normalizePayFrequency(value: string | null | undefined): PayFrequency | null {
+  return value === "semanal" || value === "quincenal" || value === "mensual" ? value : null;
+}
+
+/**
+ * F3: fracción del sueldo MENSUAL que paga cada cadencia sobre un mes comercial
+ * de 30 días (el mes se cuenta como 4 semanas): semanal = 1/4, quincenal = 1/2,
+ * mensual = 1. Sin cadencia no hay fracción (`null`): el fijo se sigue
+ * prorrateando por los días calendario del período (`prorateFixedSalary`).
+ *
+ * Consecuencia ACEPTADA por el dueño (2026-10-01), que esta función no
+ * contradice ni reabre: 1/4 por semana paga ≈ 13 sueldos al año (52,14
+ * semanas), no 12. El mes comercial de 30 días es justamente lo que produce esa
+ * cuenta.
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function fixedFractionForFrequency(frequency: string | null | undefined): number | null {
+  switch (normalizePayFrequency(frequency)) {
+    case "semanal":
+      return 1 / 4;
+    case "quincenal":
+      return 1 / 2;
+    case "mensual":
+      return 1;
+    default:
+      return null;
+  }
+}
+
+/**
+ * F3: cómo se resolvió el fijo de un período. `basis` hace EXPLÍCITA la regla
+ * aplicada en vez de dejarla deducir del monto:
+ *  - "cadence": el período y el empleado comparten cadencia; el fijo es
+ *    `mensual × fracción`.
+ *  - "other-cadence": el empleado tiene otra cadencia; en este período cobra 0
+ *    fijo porque lo paga su propio ciclo.
+ *  - "prorated": falta alguna de las dos cadencias y rige el comportamiento de
+ *    hoy (prorrateo por días calendario).
+ */
+export interface FixedSalaryResolution {
+  amount: number;
+  basis: "cadence" | "other-cadence" | "prorated";
+  fraction: number | null;
+}
+
+/**
+ * F3: fijo del período según la cadencia (decisión del dueño, 2026-10-01).
+ *
+ * La cadencia del PERÍODO decide quién cobra el fijo y con qué fracción:
+ *  - Si falta la cadencia del período o la del empleado (NULL en cualquiera de
+ *    los dos lados), rige el comportamiento de HOY: `prorateFixedSalary` por
+ *    días calendario. Ningún camino existente cambia mientras la cadencia no
+ *    esté definida.
+ *  - Si las dos cadencias coinciden, el fijo es `mensual × fracción` (1/4, 1/2,
+ *    1) sobre el mes comercial de 30 días, sin mirar los días del rango.
+ *  - Si el empleado tiene OTRA cadencia, en este período cobra 0 fijo: lo paga
+ *    su propio ciclo, y pagarlo acá también lo pagaría dos veces.
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function resolveFixedSalaryForPeriod(args: {
+  salaryFixed: number | null | undefined;
+  employeeFrequency: string | null | undefined;
+  periodFrequency: string | null | undefined;
+  startDate: string;
+  endDate: string;
+}): FixedSalaryResolution {
+  const salary = Number(args.salaryFixed ?? 0);
+  if (!Number.isFinite(salary) || salary <= 0) {
+    return { amount: 0, basis: "prorated", fraction: null };
+  }
+  const periodFrequency = normalizePayFrequency(args.periodFrequency);
+  const employeeFrequency = normalizePayFrequency(args.employeeFrequency);
+  if (periodFrequency === null || employeeFrequency === null) {
+    return {
+      amount: prorateFixedSalary({
+        salaryFixed: salary,
+        startDate: args.startDate,
+        endDate: args.endDate,
+      }),
+      basis: "prorated",
+      fraction: null,
+    };
+  }
+  const fraction = fixedFractionForFrequency(periodFrequency);
+  if (employeeFrequency !== periodFrequency) {
+    return { amount: 0, basis: "other-cadence", fraction };
+  }
+  return { amount: roundMoney(salary * (fraction ?? 0)), basis: "cadence", fraction };
+}
+
+/**
+ * F3: reparto del bloque fijo + porcentajes de un empleado `mixto` sobre las
+ * columnas EXISTENTES de `payroll_items` (la identidad no se mueve:
+ * neto = base_fixed + comisiones + bonos − vales − otros).
+ *
+ * Regla del dueño (2026-10-01): el mixto cobra el MAYOR entre su básico del
+ * período y los porcentajes de SERVICIOS del período. La comparación es SOLO
+ * contra los porcentajes de servicios: las comisiones fijas por producto NO
+ * entran en el máximo y se siguen sumando como hasta hoy.
+ *
+ * Reparto:
+ *  - `base_fixed` sigue llevando el básico del período.
+ *  - la parte porcentual de `commissions` pasa a `max(0, porcentajes − básico)`.
+ *  - `absorbed` = `min(básico, porcentajes)` es exactamente lo que deja de
+ *    sumarse (el porcentaje que el básico absorbió).
+ *  - las comisiones fijas por producto se suman aparte.
+ * Con eso `base_fixed + commissions` = `max(básico, porcentajes) + fijas`.
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function resolveMixedBlock(args: {
+  baseFixed: number;
+  fixedCommissions: number;
+  servicePercent: number;
+}): { absorbed: number; commissions: number } {
+  const baseFixed = roundMoney(Math.max(0, args.baseFixed));
+  const fixedCommissions = roundMoney(Math.max(0, args.fixedCommissions));
+  const servicePercent = roundMoney(Math.max(0, args.servicePercent));
+  const absorbed = roundMoney(Math.min(baseFixed, servicePercent));
+  return {
+    absorbed,
+    commissions: roundMoney(fixedCommissions + Math.max(0, servicePercent - baseFixed)),
+  };
+}
+
+/** F3: `item_type` de la línea de ajuste que hace visible el absorbido. */
+export const MIXED_ABSORBED_ITEM_TYPE = "ajuste_mixto";
+
+/**
+ * F3: línea de AJUSTE que muestra el porcentaje absorbido por el básico en el
+ * detalle del mixto. Es lo necesario para que el lector no vea los porcentajes
+ * desaparecer: sin ella, `detail_json` mostraría los porcentajes completos y
+ * `commissions` un monto menor, sin explicación.
+ *
+ * Su `commission` es NEGATIVA (el absorbido que no se suma) y mantiene la
+ * reproducibilidad: la suma de las líneas de `detail_json` vuelve a dar
+ * exactamente `commissions`. Conserva la forma de las demás líneas; el
+ * `item_type` propio la distingue de una factura real y no menciona ninguna
+ * factura, así que el candado de nómina cerrada no la confunde con una.
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function mixedAbsorbedDetailLine(args: { employeeId: string; absorbed: number }): DetailLine {
+  return {
+    employee_id: args.employeeId,
+    invoice_id: MIXED_ABSORBED_ITEM_TYPE,
+    consecutive_number: null,
+    item_id: MIXED_ABSORBED_ITEM_TYPE,
+    item_type: MIXED_ABSORBED_ITEM_TYPE,
+    qty: 1,
+    unit_price: 0,
+    line_subtotal: 0,
+    commission: roundMoney(-Math.max(0, args.absorbed)),
+    commission_origin: "none",
+    commission_percent: null,
+    commission_value: null,
+  };
+}
+
 /** Rango de fechas inclusivo en ambos extremos (mismo contrato que el rango). */
 export interface DateRange {
   start_date: string;

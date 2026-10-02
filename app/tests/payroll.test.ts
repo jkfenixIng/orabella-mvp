@@ -24,8 +24,11 @@ import {
   correctPayrollPeriodSchema,
   daysInMonthWithinRange,
   detailLineCommissionOrigin,
+  fixedFractionForFrequency,
   groupPayrollPeriodsByMonth,
   isVoucherDayAllowed,
+  MIXED_ABSORBED_ITEM_TYPE,
+  mixedAbsorbedDetailLine,
   nextPeriodStartDate,
   normalizeAllowedDays,
   normalizePerDayLimits,
@@ -38,8 +41,11 @@ import {
   payrollExtraSchema,
   payrollMonthLabel,
   payrollPeriodCountLabel,
+  payFrequencySchema,
   prorateFixedSalary,
   rangesOverlap,
+  resolveFixedSalaryForPeriod,
+  resolveMixedBlock,
   splitCommissionByOrigin,
   rejectVoucherSchema,
   replacePayrollMonthPeriod,
@@ -2480,6 +2486,10 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
     email: null,
     birth_date: null,
     pay_type: "porcentaje",
+    // F3: el legajo sin cadencia es el estado heredado (el fijo se prorratea
+    // por días). Se declara para que el tipo pueda apretarse después sin
+    // cambiar esta prueba.
+    pay_frequency: null,
     salary_fixed: null,
     commission_percent: 10,
     is_active: true,
@@ -2644,6 +2654,274 @@ describe("payroll: el cálculo lee todas las filas (U5)", () => {
     expect(failure).toMatchObject({ code: "READ_INCOMPLETE" });
     // Control de vacuidad: no se persistió NADA (ni una nómina recortada).
     expect(payrollPagedStub.itemsUpsert).toBeNull();
+  });
+});
+
+// ------------------------------------------- F3: cadencia y regla del mixto ---
+
+describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+
+  interface SeedEmployee {
+    pay_type: string;
+    pay_frequency: string | null;
+    salary_fixed: number | null;
+    commission_percent: number | null;
+  }
+  interface SeedLine {
+    employeeIndex?: number;
+    item_type: string;
+    subtotal: number;
+    commission_value?: number | null;
+  }
+
+  /** Siembra el período, la planta y las facturas Pagada del rango. */
+  function seed(args: {
+    periodFrequency: string | null;
+    startDate?: string;
+    endDate?: string;
+    employees: SeedEmployee[];
+    lines?: SeedLine[];
+  }) {
+    payrollPagedStub.tables = {
+      payroll_periods: [
+        {
+          id: payrollPagedStub.PERIOD_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          start_date: args.startDate ?? "2026-01-01",
+          end_date: args.endDate ?? "2026-01-31",
+          frequency: args.periodFrequency,
+          status: "borrador",
+          created_by: "u-1",
+          closed_at: null,
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      employees: args.employees.map((employee, index) => ({
+        id: `empleado-${index + 1}`,
+        sede_id: payrollPagedStub.SEDE_ID,
+        user_id: null,
+        full_name: `Empleado ${index + 1}`,
+        employee_code: null,
+        document: String(10_000_000 + index),
+        phone: null,
+        position: null,
+        payout_mode: "nomina",
+        email: null,
+        birth_date: null,
+        pay_type: employee.pay_type,
+        pay_frequency: employee.pay_frequency,
+        salary_fixed: employee.salary_fixed,
+        commission_percent: employee.commission_percent,
+        is_active: true,
+      })),
+      invoices: [],
+      invoice_items: [],
+      commission_rules: [],
+      voucher_requests: [],
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      audit_logs: [],
+    };
+    const invoices: Array<Record<string, unknown>> = [];
+    const items: Array<Record<string, unknown>> = [];
+    for (const [index, line] of (args.lines ?? []).entries()) {
+      const suffix = String(index + 1).padStart(3, "0");
+      invoices.push({
+        id: `factura-${suffix}`,
+        consecutive_number: index + 1,
+        sede_id: payrollPagedStub.SEDE_ID,
+        status: "Pagada",
+        created_at: "2026-01-05T12:00:00.000Z",
+      });
+      items.push({
+        id: `linea-${suffix}`,
+        invoice_id: `factura-${suffix}`,
+        item_type: line.item_type,
+        employee_id: `empleado-${(line.employeeIndex ?? 0) + 1}`,
+        qty: 1,
+        unit_price: line.subtotal,
+        subtotal: line.subtotal,
+        no_commission: false,
+        commission_value: line.commission_value ?? null,
+        commission_percent_override: null,
+        product_id: line.item_type === "producto" ? "producto-1" : null,
+        service_id: line.item_type === "servicio" ? payrollPagedStub.SERVICE_ID : null,
+      });
+    }
+    payrollPagedStub.tables.invoices = invoices;
+    payrollPagedStub.tables.invoice_items = items;
+  }
+
+  function itemFor(employeeId: string): Record<string, unknown> {
+    const item = (payrollPagedStub.itemsUpsert ?? []).find((row) => row.employee_id === employeeId);
+    expect(item, `sin ítem para ${employeeId}`).toBeDefined();
+    return item as Record<string, unknown>;
+  }
+
+  function detailLinesOf(item: Record<string, unknown>): Array<{ item_type: string; commission: number }> {
+    return (item.detail_json ?? []) as Array<{ item_type: string; commission: number }>;
+  }
+
+  function detailSum(item: Record<string, unknown>): number {
+    return detailLinesOf(item).reduce((acc, line) => acc + Number(line.commission), 0);
+  }
+
+  /** La identidad del CHECK de `payroll_items`, en cada caso. */
+  function expectIdentity(item: Record<string, unknown>) {
+    expect(Number(item.net_pay)).toBe(
+      Number(item.base_fixed) +
+        Number(item.commissions) +
+        Number(item.bonuses) -
+        Number(item.deductions_vales) -
+        Number(item.other_discounts),
+    );
+  }
+
+  beforeEach(() => {
+    resetPayrollStubState();
+    payrollPagedStub.session = { userId: "u-1", sedeId: payrollPagedStub.SEDE_ID, roles: ["admin"] };
+  });
+
+  it("semanal que coincide: el fijo es mensual/4, no el prorrateo de los días", async () => {
+    seed({
+      periodFrequency: "semanal",
+      startDate: "2026-01-01",
+      endDate: "2026-01-07",
+      employees: [
+        { pay_type: "fijo", pay_frequency: "semanal", salary_fixed: 1_500_000, commission_percent: null },
+      ],
+    });
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    const item = itemFor("empleado-1");
+    expect(item.base_fixed).toBe(375_000);
+    expect(item.commissions).toBe(0);
+    expect(item.net_pay).toBe(375_000);
+    // El prorrateo de esos 7 días de enero daría 338.710: la cadencia manda.
+    expect(item.base_fixed).not.toBe(
+      prorateFixedSalary({ salaryFixed: 1_500_000, startDate: "2026-01-01", endDate: "2026-01-07" }),
+    );
+    expectIdentity(item);
+  });
+
+  it("quincenal y mensual que coinciden: la mitad y el mes completo", async () => {
+    seed({
+      periodFrequency: "quincenal",
+      employees: [
+        { pay_type: "fijo", pay_frequency: "quincenal", salary_fixed: 1_500_000, commission_percent: null },
+      ],
+    });
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    expect(itemFor("empleado-1").base_fixed).toBe(750_000);
+
+    seed({
+      periodFrequency: "mensual",
+      employees: [
+        { pay_type: "fijo", pay_frequency: "mensual", salary_fixed: 1_500_000, commission_percent: null },
+      ],
+    });
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    expect(itemFor("empleado-1").base_fixed).toBe(1_500_000);
+    expectIdentity(itemFor("empleado-1"));
+  });
+
+  it("cadencia DISTINTA: el empleado cobra 0 fijo en el período", async () => {
+    seed({
+      periodFrequency: "semanal",
+      employees: [
+        { pay_type: "fijo", pay_frequency: "mensual", salary_fixed: 1_500_000, commission_percent: null },
+      ],
+    });
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    const item = itemFor("empleado-1");
+    expect(item.base_fixed).toBe(0);
+    expect(item.net_pay).toBe(0);
+    expectIdentity(item);
+  });
+
+  it("sin cadencia en el período ni en el legajo rige el prorrateo por días de hoy", async () => {
+    seed({
+      periodFrequency: null,
+      startDate: "2026-01-01",
+      endDate: "2026-01-07",
+      employees: [{ pay_type: "fijo", pay_frequency: null, salary_fixed: 1_500_000, commission_percent: null }],
+    });
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    const item = itemFor("empleado-1");
+    expect(item.base_fixed).toBe(
+      prorateFixedSalary({ salaryFixed: 1_500_000, startDate: "2026-01-01", endDate: "2026-01-07" }),
+    );
+    expect(item.base_fixed).toBe(338_710);
+    expect(item.base_fixed).not.toBe(375_000);
+    expectIdentity(item);
+  });
+
+  it("mixto: básico 300.000 con 400.000 de porcentajes paga 400.000", async () => {
+    seed({
+      periodFrequency: "semanal",
+      employees: [
+        { pay_type: "mixto", pay_frequency: "semanal", salary_fixed: 1_200_000, commission_percent: 10 },
+      ],
+      lines: [{ item_type: "servicio", subtotal: 4_000_000 }],
+    });
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    const item = itemFor("empleado-1");
+    // 1.200.000 / 4 = 300.000 de básico del período; 10% de 4.000.000 = 400.000.
+    expect(item.base_fixed).toBe(300_000);
+    expect(item.commissions).toBe(100_000); // 400.000 − 300.000
+    expect(item.net_pay).toBe(400_000); // el mayor
+    expect(detailSum(item)).toBe(100_000); // el detalle reproduce commissions
+    expectIdentity(item);
+  });
+
+  it("mixto: básico 300.000 con 200.000 paga 300.000 y muestra el absorbido", async () => {
+    seed({
+      periodFrequency: "semanal",
+      employees: [
+        { pay_type: "mixto", pay_frequency: "semanal", salary_fixed: 1_200_000, commission_percent: 10 },
+      ],
+      lines: [{ item_type: "servicio", subtotal: 2_000_000 }],
+    });
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    const item = itemFor("empleado-1");
+    expect(item.base_fixed).toBe(300_000);
+    expect(item.commissions).toBe(0); // los porcentajes se absorben
+    expect(item.net_pay).toBe(300_000);
+    // El absorbido queda VISIBLE como una línea negativa: no desaparece.
+    const absorbed = detailLinesOf(item).filter((line) => line.item_type === MIXED_ABSORBED_ITEM_TYPE);
+    expect(absorbed).toHaveLength(1);
+    expect(absorbed[0].commission).toBe(-200_000);
+    expect(detailSum(item)).toBe(0);
+    expectIdentity(item);
+  });
+
+  it("mixto: porcentajes sobre el básico y comisiones fijas por producto se pagan las dos", async () => {
+    seed({
+      periodFrequency: "semanal",
+      employees: [
+        { pay_type: "mixto", pay_frequency: "semanal", salary_fixed: 1_200_000, commission_percent: 10 },
+      ],
+      lines: [
+        { item_type: "servicio", subtotal: 4_000_000 }, // 10% → 400.000
+        { item_type: "producto", subtotal: 500_000, commission_value: 50_000 }, // fija
+      ],
+    });
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    const item = itemFor("empleado-1");
+    // El mayor (400.000) + la comisión fija del producto (50.000).
+    expect(item.base_fixed).toBe(300_000);
+    expect(item.commissions).toBe(150_000); // 50.000 fijas + 100.000 del exceso
+    expect(item.net_pay).toBe(450_000);
+    expect(detailSum(item)).toBe(150_000);
+    const absorbed = detailLinesOf(item).filter((line) => line.item_type === MIXED_ABSORBED_ITEM_TYPE);
+    expect(absorbed).toHaveLength(1);
+    expect(absorbed[0].commission).toBe(-300_000);
+    expectIdentity(item);
   });
 });
 
@@ -3921,6 +4199,104 @@ describe("payroll: la prorata del fijo, fórmula (función pura, PR1)", () => {
     expect(rangesOverlap(week, { start_date: "2026-09-03", end_date: "2026-09-04" })).toBe(true);
     expect(rangesOverlap(week, { start_date: "2026-08-01", end_date: "2026-09-30" })).toBe(true);
     expect(rangesOverlap(week, week)).toBe(true);
+  });
+});
+
+describe("payroll: la fracción del fijo por cadencia (F3, función pura)", () => {
+  const SALARY = 1_500_000;
+  const resolve = (
+    employeeFrequency: string | null | undefined,
+    periodFrequency: string | null | undefined,
+    salaryFixed: number | null = SALARY,
+  ) =>
+    resolveFixedSalaryForPeriod({
+      salaryFixed,
+      employeeFrequency,
+      periodFrequency,
+      startDate: "2026-09-01",
+      endDate: "2026-09-07",
+    });
+
+  it("la tabla del dueño: semanal 1/4, quincenal 1/2, mensual 1, sin cadencia null", () => {
+    expect(fixedFractionForFrequency("semanal")).toBe(1 / 4);
+    expect(fixedFractionForFrequency("quincenal")).toBe(1 / 2);
+    expect(fixedFractionForFrequency("mensual")).toBe(1);
+    expect(fixedFractionForFrequency(null)).toBeNull();
+    expect(fixedFractionForFrequency(undefined)).toBeNull();
+    expect(fixedFractionForFrequency("anual")).toBeNull();
+    // El catálogo es CERRADO y el mismo que pregunta la ficha del empleado (F2).
+    expect(payFrequencySchema.safeParse("semanal").success).toBe(true);
+    expect(payFrequencySchema.safeParse("anual").success).toBe(false);
+  });
+
+  it("con la MISMA cadencia paga mensual × fracción, no los días del rango", () => {
+    expect(resolve("semanal", "semanal")).toEqual({ amount: 375_000, basis: "cadence", fraction: 1 / 4 });
+    expect(resolve("quincenal", "quincenal").amount).toBe(750_000);
+    expect(resolve("mensual", "mensual").amount).toBe(1_500_000);
+    // La semana de 7 días de septiembre daría 350.000 por días: la cadencia manda.
+    const byDays = prorateFixedSalary({ salaryFixed: SALARY, startDate: "2026-09-01", endDate: "2026-09-07" });
+    expect(byDays).toBe(350_000);
+    expect(resolve("semanal", "semanal").amount).not.toBe(byDays);
+  });
+
+  it("con cadencia DISTINTA el empleado cobra 0 fijo en ese período", () => {
+    expect(resolve("mensual", "semanal")).toEqual({ amount: 0, basis: "other-cadence", fraction: 1 / 4 });
+    expect(resolve("semanal", "mensual").amount).toBe(0);
+    expect(resolve("quincenal", "semanal").amount).toBe(0);
+    expect(resolve("semanal", "quincenal").amount).toBe(0);
+  });
+
+  it("sin cadencia en CUALQUIERA de los dos lados rige el prorrateo por días de hoy", () => {
+    const expected = prorateFixedSalary({ salaryFixed: SALARY, startDate: "2026-09-01", endDate: "2026-09-07" });
+    const pairs: Array<[string | null | undefined, string | null | undefined]> = [
+      [null, null],
+      [null, "semanal"],
+      ["semanal", null],
+      [undefined, undefined],
+      ["", "semanal"],
+      ["semanal", "desconocida"],
+    ];
+    for (const [employeeFrequency, periodFrequency] of pairs) {
+      const resolution = resolve(employeeFrequency, periodFrequency);
+      expect(resolution.basis, `${String(employeeFrequency)}/${String(periodFrequency)}`).toBe("prorated");
+      expect(resolution.amount, `${String(employeeFrequency)}/${String(periodFrequency)}`).toBe(expected);
+    }
+  });
+
+  it("sin sueldo no hay base que fraccionar", () => {
+    expect(resolve("semanal", "semanal", null).amount).toBe(0);
+    expect(resolve("semanal", "semanal", 0).amount).toBe(0);
+  });
+});
+
+describe("payroll: la regla del mixto, el mayor contra los porcentajes (F3, función pura)", () => {
+  it("los dos casos del dueño, con su aritmética", () => {
+    // Básico 300.000 con 400.000 de porcentajes → 400.000.
+    const over = resolveMixedBlock({ baseFixed: 300_000, fixedCommissions: 0, servicePercent: 400_000 });
+    expect(over).toEqual({ absorbed: 300_000, commissions: 100_000 });
+    expect(300_000 + over.commissions).toBe(400_000);
+    // Básico 300.000 con 200.000 → 300.000 (los porcentajes se absorben).
+    const below = resolveMixedBlock({ baseFixed: 300_000, fixedCommissions: 0, servicePercent: 200_000 });
+    expect(below).toEqual({ absorbed: 200_000, commissions: 0 });
+    expect(300_000 + below.commissions).toBe(300_000);
+  });
+
+  it("las comisiones fijas por producto NO entran al máximo y se suman aparte", () => {
+    const over = resolveMixedBlock({ baseFixed: 300_000, fixedCommissions: 50_000, servicePercent: 400_000 });
+    expect(over.commissions).toBe(150_000);
+    expect(300_000 + over.commissions).toBe(450_000); // max(300,400) + 50
+    const below = resolveMixedBlock({ baseFixed: 300_000, fixedCommissions: 50_000, servicePercent: 200_000 });
+    expect(below.commissions).toBe(50_000);
+    expect(300_000 + below.commissions).toBe(350_000); // max(300,200) + 50
+  });
+
+  it("la línea de absorbido es negativa y conserva la forma del detalle", () => {
+    const line = mixedAbsorbedDetailLine({ employeeId: "emp-1", absorbed: 200_000 });
+    expect(line.commission).toBe(-200_000);
+    expect(line.item_type).toBe(MIXED_ABSORBED_ITEM_TYPE);
+    expect(line.item_id).toBe(MIXED_ABSORBED_ITEM_TYPE);
+    expect(line.invoice_id).toBe(MIXED_ABSORBED_ITEM_TYPE);
+    expect(buildEmployeeDetail([line]).commissions).toBe(-200_000);
   });
 });
 
