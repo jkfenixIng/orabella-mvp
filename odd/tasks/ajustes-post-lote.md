@@ -41,15 +41,15 @@ Out:
 - Migraciones: no aplicar SQL de escritura (el MCP de Supabase apunta a PRODUCCIÓN); PRUEBAS lo aplica el usuario.
 
 ## Tasks
-- [ ] **C1** Sistema de color por roles (acción / estado / texto) — el azul eléctrico y los estados gritones. Auditoría de tokens relanzada el 2026-09-25 (scout read-only): inventario de tokens y exposición `@theme inline`, consumidores por rol, tokens muertos, pasos invertidos, matriz de contraste WCAG, headroom de chroma, coherencia de superficies y 2-4 direcciones propuestas con valores exactos. Sin fix hasta cerrar la auditoría y decidir la dirección.
-- [ ] **V1** Vales: advertir ANTES de crear un vale que supera el tope, con mensaje explícito de que quedará en revisión del admin.
-- [ ] **A1** Alertas: rehacer filtros con UX real.
-- [ ] **N1** Nómina: listado de períodos escalable (filtro/organización para un año de datos).
+- [x] **C1** Sistema de color por roles (acción / estado / texto) — el azul eléctrico y los estados gritones. Auditoría de tokens relanzada el 2026-09-25 (scout read-only): inventario de tokens y exposición `@theme inline`, consumidores por rol, tokens muertos, pasos invertidos, matriz de contraste WCAG, headroom de chroma, coherencia de superficies y 2-4 direcciones propuestas con valores exactos. Sin fix hasta cerrar la auditoría y decidir la dirección. Nota 2026-10-01: la evidencia de chroma del documento está desactualizada (primary-600 claro ahora es `oklch(0.50 0.125 250)`, escala oscura cambiada, remanente HSL eliminado) y los pasos oscuros `primary-800/900` parecen sin consumidores; auditoría abierta, sin dirección decidida, sin fix. Cerrado con dirección A por decisión del usuario 2026-10-01 (8 pasos expuestos desaturados en design-tokens.css; design-tokens.test.ts sin cambios, 28/28).
+- [x] **V1** Vales: advertir ANTES de crear un vale que supera el tope, con mensaje explícito de que quedará en revisión del admin. Cerrado en `26349cc`: pronóstico en vivo fuera de rango con `Alert warning role=status` + `ConfirmDialog` con copia de consecuencia; tests en `feedback-batch2.test.ts:423-510`.
+- [x] **A1** Alertas: rehacer filtros con UX real. Cerrado con barra de filtros (Select de módulo + Desde/Hasta + toggle no leídas, rango en listAlerts, 5 tests nuevos); gate GREEN del padre (tsc 0, 1460/1460).
+- [x] **N1** Nómina: listado de períodos escalable (filtro/organización para un año de datos). Cerrado con esfuerzo PA3: `<select>` de estado + agrupación por mes en `payroll-client.tsx:1471-1508`, `listPeriods` sin truncar con paginación completa en `service.ts:705-729`, ayuda de agrupación en `schemas.ts:1149` con tests en `payroll.test.ts:3777,4082`. Residuo: sin filtro por año/rango de fechas, solo si se solicita.
 - [x] **I1** Inventario: combobox con filtro — cerrado el 2026-09-25 por decisión del usuario. La premisa era falsa: en `app/app/inventory/inventory-client.tsx:549-572` no hay un `<select>` sino un `Select` de Radix con un `Input` de filtro embebido (`movementProductQuery`, `:110-118`), y el `Combobox` canónico ya existe en `src/components/ui/lib/combobox.tsx` (usado en facturación). El usuario confirmó que inventario/productos está bien como está. Residuo anotado, fuera de alcance: `listProducts` tope en 50 (`src/features/inventory/service.ts:46-49`), así que con catálogo real el filtro no alcanza.
 - [ ] **N2** Nómina individual auditada (un empleado, con registro de quién y por qué). **BLOQUEADO hasta precisar la regla de negocio.**
 - [x] **F1** Facturación: uniformidad de los 6 modales (`DialogHeader/Footer`, tokens); conservar la hoja de factura. Cerrado el 2026-10-01: los 6 `DialogContent` llevan `DialogHeader` neutro + `DialogTitle` sr-only derivado del texto visible (edición y comisión agregan `DialogDescription` sr-only del párrafo explicativo); hoja `--paper-*`, chrome y flujos intactos.
 - [x] **B1** Fix TZ en `app/src/features/admin/schemas.ts:117` ("no futura" con día Bogotá) — commit `19d6798`.
-- [ ] **M1** (opcional, requiere decisión) Default de `voucher_requests.request_date` al día Bogotá.
+- [x] **M1** (opcional, requiere decisión) Default de `voucher_requests.request_date` al día Bogotá. Resuelto sin migración (el código manda bogotaDay() explícito en service.ts:2831; default CURRENT_DATE nunca dispara; sin archivo 060).
 
 ## Evidence
 ### C1 — evidencia ya verificada (2026-09-24)
@@ -69,7 +69,7 @@ Out:
 - Sin migración, sin cambios de esquema de BD: la validación es de aplicación.
 
 ### Estado del árbol al abrir el lote
-- HEAD `2a31627` (`feat/orabella-mvp`).
+- HEAD `718ed5b` (`feat/orabella-mvp`).
 - Sin commitear y ajenos a este lote: `app/app/vales/loading.tsx` (residual de la migración a tokens: 2 clases ad-hoc → `text-text-secondary` / `border-border-color`) y `opencode.json` (regenerado por gentle-ai, bloque de agentes administrados). `.codegraph/` sin trackear.
 
 ## Verification evidence
