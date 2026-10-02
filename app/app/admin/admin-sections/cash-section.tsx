@@ -22,6 +22,7 @@ import {
   stackClass,
 } from "../admin-styles";
 import { formatMoney, type ActionResult } from "../admin-shared";
+import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 
 /**
  * Tres superficies y, por lo tanto, tres estados de fallo distintos (estándar
@@ -174,8 +175,8 @@ export function CashSection({
                   <strong>{row.name}</strong> · base actual {formatMoney(row.base_configurada)}
                 </span>
                 <input
-                  value={baseDrafts[row.id] ?? ""}
-                  onChange={(event) => setBaseDrafts((current) => ({ ...current, [row.id]: event.target.value }))}
+                  value={formatMoneyInput(baseDrafts[row.id] ?? "")}
+                  onChange={(event) => setBaseDrafts((current) => ({ ...current, [row.id]: stripMoneyInput(event.target.value) }))}
                   inputMode="numeric"
                   placeholder="Nueva base"
                   className={inputClass}
@@ -256,7 +257,7 @@ export function CashSection({
           </label>
           <label className={labelClass}>
             Valor
-            <input value={newValue} onChange={(event) => setNewValue(event.target.value)} inputMode="numeric" className={inputClass} />
+            <input value={formatMoneyInput(newValue)} onChange={(event) => setNewValue(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
           </label>
         </div>
       </FormDialog>

@@ -49,6 +49,7 @@ import {
 } from "@/src/features/commissions/schemas";
 import { IN_FILTER_CHUNK_SIZE } from "@/src/shared/lib/paged";
 import { buildEmployeeCommissionDetail } from "@/src/features/payroll/schemas";
+import { sameEmployeeProductLine } from "@/app/invoices/invoices-client";
 
 const EMPLOYEE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const PRODUCT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -7769,5 +7770,264 @@ describe("migración 052_invoice_create_atomic.sql (CL-13)", () => {
     expect(raw).toContain("writeAudit");
     expect(raw).toContain("046");
     expect(raw).toContain("041");
+  });
+});
+
+// ---------------- UX-EMPLEADO: el producto repetido se juzga por empleado ----------------
+
+/**
+ * Al emitir o editar una factura, el MISMO producto con el MISMO empleado no se
+ * duplica: se avisa en `itemError` y se guía a la fila existente para subir la
+ * cantidad. Con OTRO empleado la línea nueva es legítima (precio, comisión y
+ * descuento por línea), así que se agrega sin aviso. La regla vive en
+ * `invoices-client.tsx`; acá se prueban sus dos mitades: la decisión pura y las
+ * costuras del marcado/alta que la consumen.
+ */
+describe("invoices-client: el producto repetido con el MISMO empleado se frena y guía a la fila", () => {
+  const source = readFileSync(
+    join(process.cwd(), "app", "invoices", "invoices-client.tsx"),
+    "utf8",
+  );
+
+  const PRODUCT = "producto-1";
+  const EMPLOYEE_A = "empleado-a";
+  const EMPLOYEE_B = "empleado-b";
+  const draftLine = (overrides: Partial<{ item_type: string; ref_id: string; employee_id: string }>) => ({
+    item_type: "producto",
+    ref_id: PRODUCT,
+    employee_id: EMPLOYEE_A,
+    ...overrides,
+  });
+
+  it("piso anti-vacío: el cliente se leyó de verdad", () => {
+    expect(source.length).toBeGreaterThan(130_000);
+    expect(source).toContain("export function InvoicesClient(props: InvoicesClientProps)");
+  });
+
+  it("mismo producto y mismo empleado: devuelve la fila (1-based)", () => {
+    const lines = [draftLine({ ref_id: "otro-producto" }), draftLine({})];
+    expect(sameEmployeeProductLine(lines, PRODUCT, EMPLOYEE_A)).toBe(2);
+  });
+
+  it("mismo producto con OTRO empleado: no hay coincidencia y la línea se permite", () => {
+    const lines = [draftLine({ employee_id: EMPLOYEE_B })];
+    expect(sameEmployeeProductLine(lines, PRODUCT, EMPLOYEE_A)).toBeNull();
+  });
+
+  it("CONTROL NEGATIVO: sin empleado en el borrador no se marca ninguna fila", () => {
+    // La regla es por empleado; sin empleado no se puede afirmar la coincidencia.
+    expect(sameEmployeeProductLine([draftLine({})], PRODUCT, "")).toBeNull();
+    // Y tampoco hay coincidencia sin producto, ni con un servicio homónimo.
+    expect(sameEmployeeProductLine([draftLine({})], "", EMPLOYEE_A)).toBeNull();
+    expect(sameEmployeeProductLine([draftLine({ item_type: "servicio" })], PRODUCT, EMPLOYEE_A)).toBeNull();
+  });
+
+  it("al editar, la propia fila no se cuenta (excludeIndex)", () => {
+    expect(sameEmployeeProductLine([draftLine({})], PRODUCT, EMPLOYEE_A, 0)).toBeNull();
+    expect(sameEmployeeProductLine([draftLine({}), draftLine({})], PRODUCT, EMPLOYEE_A, 0)).toBe(2);
+  });
+
+  it("el alta frena el duplicado y escribe el aviso en itemError antes de agregar", () => {
+    const handler = source.slice(
+      source.indexOf("function addItemFromDialog()"),
+      source.indexOf("// Inventory-style cancel: closing the dialog always resets its draft."),
+    );
+    // La coincidencia se busca con el producto y el empleado del borrador.
+    expect(handler).toContain("sameEmployeeProductLine(list, itemDraft.ref_id, itemDraft.employee_id)");
+    // Se exige empleado ANTES de juzgar el duplicado y el bloqueo va ANTES de
+    // empujar la línea: no se agrega nada cuando hay coincidencia.
+    expect(handler.indexOf("Elija el empleado que atiende.")).toBeLessThan(
+      handler.indexOf("sameEmployeeProductLine(list"),
+    );
+    expect(handler.indexOf("sameEmployeeProductLine(list")).toBeLessThan(
+      handler.indexOf("setItems((prev) => [...prev, draft])"),
+    );
+    // Sólo se frena cuando HAY coincidencia: con otro empleado `line` es null y
+    // el alta cae al `setItems`/`setEditItems` de siempre.
+    expect(handler).toContain("if (line != null) {");
+    expect(handler).toContain("setItems((prev) => [...prev, draft]);");
+    expect(handler).toContain("setEditItems((prev) => [...prev, { ...draft, discount: 0 }]);");
+    // El aviso nombra la fila y pide subir la cantidad allí; la fila se resalta.
+    expect(handler).toMatch(/ya está en \$\{where\}, fila \$\{line\}, con este empleado/);
+    expect(handler).toContain("Aumente la cantidad en esa fila en vez de agregar otra línea.");
+    expect(handler).toContain("setSteeredRow({ target: itemDialogTarget, index: line - 1 })");
+  });
+
+  it("la opción del producto se marca SÓLO con el mismo empleado y el deshabilitado no se usa", () => {
+    // Diálogo compartido de alta (crear y agregar a la edición).
+    expect(source).toMatch(/sameEmployeeProductLine\(\s*itemDialogTarget === "edit" \? editItems : items,/);
+    // Fila en edición: ignora su propia línea con el índice.
+    expect(source).toContain("sameEmployeeProductLine(editItems, row.id, item.employee_id, index)");
+    // La marca reusa `description` (nunca `disabled`, que borraría el caso
+    // legítimo del otro empleado).
+    expect(source).toMatch(/ya está en \$\{where\}, fila \$\{line\}/);
+    expect(source).toContain("ya está en la edición, fila ${line}");
+    expect(source).not.toContain("disabled: true");
+  });
+
+  it("la cantidad de la fila de la factura es editable y alimenta los totales vivos", () => {
+    // La fila de la factura emite la cantidad a través de `patchDraftItem`,
+    // filtrada por la máscara de cantidad (ver el bloque siguiente).
+    expect(source).toContain("patchDraftItem(index, { qty: stripQuantityInput(event.target.value) })");
+    // El subtotal y el total siguen derivándose de `items`.
+    expect(source).toContain("const draftSubtotal = items.reduce((acc, item) => {");
+    expect(source).toMatch(/const qty = toNumber\(item\.qty\) \?\? 0;/);
+  });
+});
+
+/**
+ * La cantidad de una línea es un entero positivo: una letra tecleada no puede
+ * llegar al estado. `inputMode="numeric"` NO lo impide (es una pista del
+ * teclado, no una validación), así que los tres campos de cantidad de
+ * `invoices-client.tsx` pasan por `stripQuantityInput` antes de escribir el
+ * estado. Este bloque es la guarda de fuente: falla si alguien quita el cable.
+ */
+describe("invoices-client: los campos de cantidad sólo aceptan dígitos", () => {
+  const source = readFileSync(
+    join(process.cwd(), "app", "invoices", "invoices-client.tsx"),
+    "utf8",
+  );
+
+  /**
+   * Línea de `onChange` del campo cuya llamada al estado empieza con `call`.
+   * Devuelve "" si el campo no existe, para que la guarda falle en vez de
+   * pasar sola.
+   */
+  function quantityOnChange(text: string, call: string): string {
+    const at = text.indexOf(call);
+    if (at === -1) return "";
+    const start = text.lastIndexOf("onChange", at);
+    if (start === -1) return "";
+    const end = text.indexOf("\n", start);
+    return text.slice(start, end === -1 ? text.length : end);
+  }
+
+  it("piso anti-vacío: el cliente se leyó de verdad", () => {
+    expect(source.length).toBeGreaterThan(130_000);
+    expect(source).toContain("stripQuantityInput");
+  });
+
+  it("la fila de alta filtra la cantidad antes de escribir el estado", () => {
+    const line = quantityOnChange(source, "patchDraftItem(index, { qty:");
+    expect(line, "campo cantidad de alta").not.toBe("");
+    expect(line).toContain("stripQuantityInput(event.target.value)");
+    expect(line).not.toContain("qty: event.target.value");
+  });
+
+  it("la fila de edición filtra la cantidad antes de escribir el estado", () => {
+    const line = quantityOnChange(source, "patchEditItem(index, { qty:");
+    expect(line, "campo cantidad de edición").not.toBe("");
+    expect(line).toContain("stripQuantityInput(event.target.value)");
+    expect(line).not.toContain("qty: event.target.value");
+  });
+
+  it("el diálogo de ítem filtra la cantidad antes de escribir el estado", () => {
+    const line = quantityOnChange(source, "patchDraft({ qty:");
+    expect(line, "campo cantidad del diálogo").not.toBe("");
+    expect(line).toContain("stripQuantityInput(event.target.value)");
+    expect(line).not.toContain("qty: event.target.value");
+  });
+
+  it("el detector no es un sello de goma (control negativo)", () => {
+    const fake =
+      '<input onChange={(event) => patchDraftItem(index, { qty: event.target.value })} />';
+    const line = quantityOnChange(fake, "patchDraftItem(index, { qty:");
+    expect(line).not.toBe("");
+    // Sin el cable al helper, la misma guarda falla.
+    expect(line).not.toContain("stripQuantityInput");
+    // Sin el ancla no hay línea: la guarda falla en vez de pasar sola.
+    expect(quantityOnChange(fake, "patchEditItem(index, { qty:")).toBe("");
+  });
+});
+
+/* ==========================================================================
+   Facturas: cada campo numérico pasa por SU máscara (guarda de fuente)
+
+   `inputMode="numeric"`/`"decimal"` son pistas del teclado, no validaciones:
+   una letra tecleada llegaba al estado. Cada campo numérico de
+   `invoices-client.tsx` pasa ahora por la máscara que le corresponde —dinero,
+   cantidad entera o porcentaje— antes de escribir el estado. Esta guarda falla
+   si alguien quita el cable a la máscara o vuelve a leer el valor crudo.
+   ========================================================================== */
+describe("invoices-client: cada campo numérico pasa por su máscara (guarda de fuente)", () => {
+  const source = readFileSync(
+    join(process.cwd(), "app", "invoices", "invoices-client.tsx"),
+    "utf8",
+  );
+
+  /**
+   * Bloque `onChange={...}` cuyo cuerpo contiene `anchor`; `occurrence` elige
+   * la aparición cuando el ancla se repite. Devuelve "" si el ancla no existe,
+   * para que la guarda falle en vez de pasar sola.
+   */
+  function onChangeBlock(text: string, anchor: string, occurrence = 0): string {
+    let at = -1;
+    let from = 0;
+    for (let i = 0; i <= occurrence; i += 1) {
+      at = text.indexOf(anchor, from);
+      if (at === -1) return "";
+      from = at + anchor.length;
+    }
+    const start = text.lastIndexOf("onChange={", at);
+    if (start === -1) return "";
+    let depth = 0;
+    for (let i = start + "onChange=".length; i < text.length; i += 1) {
+      const ch = text[i];
+      if (ch === "{") depth += 1;
+      else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) return text.slice(start, i + 1);
+      }
+    }
+    return text.slice(start);
+  }
+
+  /** El campo lleva la máscara y NO además el valor crudo. */
+  function assertMasked(block: string, mask: string): void {
+    expect(block).not.toBe("");
+    expect(block).toContain(`strip${mask}Input(event.target.value)`);
+    expect(block).not.toContain("Number(event.target.value)");
+    expect(block).not.toContain(": event.target.value");
+  }
+
+  it("piso anti-vacío: el cliente se leyó de verdad", () => {
+    expect(source.length).toBeGreaterThan(130_000);
+    expect(source).toContain("stripPercentageInput");
+  });
+
+  it("el filtro Nº Factura usa la máscara de cantidad (entero)", () => {
+    assertMasked(onChangeBlock(source, "setFilters({ ...filters, number:"), "Quantity");
+  });
+
+  it("el % override del ítem en edición usa la máscara de porcentaje", () => {
+    const block = onChangeBlock(source, 'placeholder="% ítem"');
+    assertMasked(block, "Percentage");
+    expect(block).toContain("patchEditItem(index, {");
+  });
+
+  it("el % override del diálogo usa la máscara de porcentaje", () => {
+    const block = onChangeBlock(source, 'placeholder="Ej. 15"');
+    assertMasked(block, "Percentage");
+    expect(block).toContain("patchDraft({");
+  });
+
+  it("los dos valores de comisión del diálogo usan la máscara de dinero", () => {
+    // Los dos campos comparten placeholder (producto y personalizado): se
+    // cubren por aparición para que perder la máscara en cualquiera falle.
+    for (const occurrence of [0, 1]) {
+      const block = onChangeBlock(source, 'placeholder="Ej. 10000"', occurrence);
+      assertMasked(block, "Money");
+    }
+  });
+
+  it("el detector no es un sello de goma (control negativo)", () => {
+    const fake = `onChange={(event) => patchDraft({ commission_value: event.target.value === "" ? null : Number(event.target.value) })}`;
+    const block = onChangeBlock(fake, "commission_value:");
+    expect(block).not.toBe("");
+    // Sin el cable a la máscara, la misma guarda falla.
+    expect(block).not.toContain("stripMoneyInput(event.target.value)");
+    expect(block).toContain("Number(event.target.value)");
+    // Sin el ancla no hay bloque: la guarda falla en vez de pasar sola.
+    expect(onChangeBlock(fake, "no-existe:")).toBe("");
   });
 });

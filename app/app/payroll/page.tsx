@@ -81,7 +81,6 @@ export default async function PayrollPage() {
         initialEmployees={visibleEmployees}
         initialPeriods={periods}
         initialSummaries={overview?.summaries ?? []}
-        initialMonthToDate={overview?.months ?? []}
         methods={methods.filter((row) => row.is_active)}
         canAdmin={canAdmin}
         canPay={canPay}

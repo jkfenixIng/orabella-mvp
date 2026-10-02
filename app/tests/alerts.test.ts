@@ -23,11 +23,35 @@ describe("alerts: conjunto de alerta y paginado", () => {
       "cash.shift_open_mismatch",
       "cash.shift_close_mismatch",
       "auth.login_locked",
-      "payroll.commission_paid",
       "voucher.requested",
       "auth.user_create_rollback_failed",
     ]);
     expect(ALERTS_PAGE_SIZE).toBe(10);
+  });
+
+  it("la comisión pagada no es alerta: fuera del catálogo, de los módulos y del conjunto de `.in`", () => {
+    const comisionPagada = "payroll.commission_paid";
+    // Sigue siendo traza de auditoría (el vocabulario compartido no se toca),
+    // pero ya no interrumpe la bandeja ni suma a la insignia ni al módulo Caja.
+    expect(AUDIT_ACTIONS.COMMISSION_PAID).toBe(comisionPagada);
+    expect([...ALERT_ACTIONS]).not.toContain(comisionPagada);
+    expect([...ALERT_MODULES.caja.actions]).not.toContain(comisionPagada);
+    // El conjunto que `service.ts` pasa a `.in("action", acciones)`: sin módulo
+    // usa ALERT_ACTIONS; con módulo, las acciones de ese módulo.
+    const conjuntosDeFiltro = [
+      [...ALERT_ACTIONS],
+      ...Object.values(ALERT_MODULES).map((modulo) => [...modulo.actions]),
+    ];
+    for (const conjunto of conjuntosDeFiltro) {
+      expect(conjunto).not.toContain(comisionPagada);
+    }
+    // Control negativo: si alguien la reincorpora, el guard falla (test en rojo).
+    expect(() =>
+      expect([...ALERT_ACTIONS, comisionPagada]).not.toContain(comisionPagada),
+    ).toThrow();
+    expect(() =>
+      expect([...ALERT_MODULES.caja.actions, comisionPagada]).not.toContain(comisionPagada),
+    ).toThrow();
   });
 
   it("página 1 y todas por defecto; rechaza página inválida", () => {

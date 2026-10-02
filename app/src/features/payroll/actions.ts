@@ -17,6 +17,7 @@ import {
   getPeriodDetail,
   getVoucherSettings,
   listPayrollExtras,
+  listPayrollMonthRows,
   listPeriods,
   listVouchers,
   payPayrollExtra,
@@ -126,6 +127,25 @@ export async function listPayrollExtrasAction() {
   try {
     const session = await requirePayrollAdmin(await sessionToken());
     const data = await listPayrollExtras(session.sedeId);
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
+ * PA3 (consulta puntual): los pagos de UN mes de UN empleado. Es la misma
+ * lectura del panorama acotada a la consulta que el admin hace en la pantalla:
+ * el mes de toda la planta ya no viaja al abrir, viaja cuando se pide.
+ */
+export async function listPayrollMonthRowsAction(input: { month: string; employeeId: string }) {
+  try {
+    const session = await requirePayrollAdmin(await sessionToken());
+    const data = await listPayrollMonthRows({
+      sedeId: session.sedeId,
+      month: input.month,
+      employeeId: input.employeeId,
+    });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -276,7 +296,15 @@ export async function requestVoucherAction(input: unknown) {
 }
 
 /** Vales de la sede (admin/caja ven todo; empleado solo los suyos; máx. 50 por defecto). */
-export async function listVouchersAction(input: { status?: string; employee_id?: string; request_date?: string; sede_id?: string; limit?: number }) {
+export async function listVouchersAction(input: {
+  status?: string;
+  employee_id?: string;
+  request_date?: string;
+  date_from?: string;
+  date_to?: string;
+  sede_id?: string;
+  limit?: number;
+}) {
   try {
     const session = await requireSession(await sessionToken());
     const sedeId = resolveSede(session.sedeId, input.sede_id);
@@ -293,6 +321,8 @@ export async function listVouchersAction(input: { status?: string; employee_id?:
       status: input.status,
       employee_id: employeeId,
       request_date: input.request_date,
+      date_from: input.date_from,
+      date_to: input.date_to,
       limit: input.limit,
     });
     return { success: true as const, data };

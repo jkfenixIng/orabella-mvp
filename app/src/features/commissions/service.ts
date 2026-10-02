@@ -164,6 +164,34 @@ export interface EarnedCommission {
 }
 
 /**
+ * Decisión del dueño (2026-10-01): la comisión de una factura existe cuando la
+ * factura está Pagada. Con la factura pagada el destino de la comisión ya quedó
+ * definido —se pagó de inmediato, o se dejó para la nómina—; con una factura
+ * Emitida todavía no hay comisión en juego. La nómina ya filtra por el mismo
+ * estado; esta es la guarda del pago inmediato.
+ */
+export function canPayCommissionImmediately(status: string): boolean {
+  return status === "Pagada";
+}
+
+/**
+ * Rechaza la factura que no habilita el pago inmediato. Anulada conserva su
+ * código propio; cualquier otro estado no pagado es `INVOICE_NOT_PAID`.
+ */
+function assertInvoicePaid(status: string): void {
+  if (status === "Anulada") {
+    throw new CommissionError("INVOICE_ANNULLED", "La factura está anulada.", 422);
+  }
+  if (!canPayCommissionImmediately(status)) {
+    throw new CommissionError(
+      "INVOICE_NOT_PAID",
+      "La factura debe estar Pagada para pagar la comisión.",
+      422,
+    );
+  }
+}
+
+/**
  * Comisión ganada por (factura, empleado): líneas sin flag × (regla o
  * tasa plana del empleado). Las líneas marcadas sin comisión no suman.
  * Devuelve el total (`earned`) y, separado, lo pagable de inmediato
@@ -183,9 +211,7 @@ export async function earnedCommissionFor(
     .maybeSingle();
   if (invoiceError) throw new CommissionError("INTERNAL", "Error interno.", 500);
   if (!invoice) throw new CommissionError("NOT_FOUND", "Factura no encontrada.", 404);
-  if ((invoice as { status: string }).status === "Anulada") {
-    throw new CommissionError("INVOICE_ANNULLED", "La factura está anulada.", 422);
-  }
+  assertInvoicePaid((invoice as { status: string }).status);
 
   const { data: lines, error: linesError } = await db
     .from("invoice_items")
@@ -516,6 +542,22 @@ export async function payCommissionNow(
     });
     if (violation) throw new CommissionError(violation.code, violation.message, 422);
   }
+
+  // Defensa en profundidad: `earnedCommissionFor` ya exigió `Pagada`, pero el
+  // estado pudo cambiar entre esa lectura y este INSERT (anulación o cobro en
+  // vuelo). Este camino escribe plata, así que la guarda no vive solo en la
+  // lectura previa: se relee la factura justo antes de escribir y se vuelve a
+  // exigir el mismo estado. Corre DESPUÉS del reconocimiento de la marca CL-5,
+  // así que un reintento ya registrado sigue siendo un no-op exitoso.
+  const { data: payoutInvoice, error: payoutInvoiceError } = await db
+    .from("invoices")
+    .select("id, status")
+    .eq("id", input.invoice_id)
+    .eq("sede_id", actor.sedeId)
+    .maybeSingle();
+  if (payoutInvoiceError) throw new CommissionError("INTERNAL", "Error interno.", 500);
+  if (!payoutInvoice) throw new CommissionError("NOT_FOUND", "Factura no encontrada.", 404);
+  assertInvoicePaid((payoutInvoice as { status: string }).status);
 
   const { data, error } = await db
     .from("commission_payouts")

@@ -11,11 +11,15 @@ import { computeInvoiceItemCommission } from "@/src/features/billing/commission"
 import {
   commissionRuleKey,
   employeeLineCommissionOrigin,
+  employeeLineCommissionPercent,
   lineHasCommissionBasis,
   resolveEmployeeLineCommission,
   type RuleRate,
 } from "@/src/features/commissions/schemas";
-import { buildEmployeeCommissionDetail } from "@/src/features/payroll/schemas";
+import {
+  buildEmployeeCommissionDetail,
+  splitCommissionByOrigin,
+} from "@/src/features/payroll/schemas";
 
 const EMPLOYEE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const SERVICE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
@@ -308,7 +312,7 @@ describe("comisión por línea según el modo (030)", () => {
     ).toBe("percent");
   });
 
-  it("producto comision sin valor: cae a la regla ítem×empleado (no al %)", () => {
+  it("producto comision sin valor: usa la regla ítem×empleado (no el % plano) y su origen es percent", () => {
     const rules = new Map<string, RuleRate>([
       [commissionRuleKey("producto", PRODUCT_ID), { percent: 10, amount: null }],
     ]);
@@ -323,6 +327,9 @@ describe("comisión por línea según el modo (030)", () => {
         flatPercent: 35,
       }),
     ).toBe(10000);
+    // La regla manda (10% -> 10.000, no el 35% plano del empleado) y como es
+    // SOLO porcentual su origen es `percent`, no `commission`: no se paga de
+    // inmediato, se acumula para la nómina.
     expect(
       employeeLineCommissionOrigin({
         itemType: "producto",
@@ -331,7 +338,7 @@ describe("comisión por línea según el modo (030)", () => {
         rules,
         flatPercent: 35,
       }),
-    ).toBe("commission");
+    ).toBe("percent");
   });
 
   it("ninguna: la línea no comisiona (0) aunque el empleado tenga porcentaje", () => {
@@ -562,5 +569,211 @@ describe("paridad: inmediato ≡ nómina ≡ detalle (porcentaje explícito)", (
         flatPercent: null,
       }),
     ).toBe("percent");
+  });
+});
+
+// --------------------------------------- origen y tasa en el detalle de nómina ---
+
+describe("detalle de nómina: origen y tasa para reclasificar la comisión", () => {
+  it("una línea por porcentaje lleva origen percent y la tasa aplicada", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: EMPLOYEE_ID,
+      payoutMode: "nomina",
+      payType: "porcentaje",
+      commissionPercent: 10,
+      lines: [
+        {
+          invoice_id: "inv-1",
+          consecutive_number: 1,
+          item_id: "svc",
+          item_type: "servicio",
+          qty: 1,
+          unit_price: 100000,
+          line_subtotal: 100000,
+          commission_value: null,
+          item_ref_id: SERVICE_ID,
+        },
+      ],
+      rules: NO_RULES,
+    });
+    expect(detail[0].commission_origin).toBe("percent");
+    expect(detail[0].commission_percent).toBe(10);
+    expect(detail[0].commission).toBe(10000);
+  });
+
+  it("el porcentaje explícito de la línea es también la tasa que se muestra", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: EMPLOYEE_ID,
+      payoutMode: "nomina",
+      payType: "fijo",
+      commissionPercent: null,
+      lines: [
+        {
+          invoice_id: "inv-1",
+          consecutive_number: 1,
+          item_id: "custom",
+          item_type: "custom",
+          qty: 1,
+          unit_price: 200000,
+          line_subtotal: 200000,
+          commission_value: null,
+          item_ref_id: null,
+          commission_percent_override: 15,
+        },
+      ],
+      rules: NO_RULES,
+    });
+    expect(detail[0].commission_origin).toBe("percent");
+    expect(detail[0].commission_percent).toBe(15);
+    expect(detail[0].commission).toBe(30000);
+    expect(
+      employeeLineCommissionPercent({
+        itemType: "custom",
+        itemRefId: null,
+        commissionValue: null,
+        commissionPercentOverride: 15,
+        rules: NO_RULES,
+        flatPercent: null,
+      }),
+    ).toBe(15);
+  });
+
+  it("una línea de producto con valor fijo es origen commission y sin tasa", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: EMPLOYEE_ID,
+      payoutMode: "nomina",
+      payType: "porcentaje",
+      commissionPercent: 10,
+      lines: [
+        {
+          invoice_id: "inv-1",
+          consecutive_number: 1,
+          item_id: "prod",
+          item_type: "producto",
+          qty: 3,
+          unit_price: 1000,
+          line_subtotal: 3000,
+          commission_value: 1000,
+          item_ref_id: PRODUCT_ID,
+        },
+      ],
+      rules: NO_RULES,
+    });
+    expect(detail[0].commission_origin).toBe("commission");
+    expect(detail[0].commission_percent).toBeNull();
+    expect(detail[0].commission).toBe(3000);
+  });
+
+  it("la reclasificación conserva el total: fija + porcentaje === comisiones", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: EMPLOYEE_ID,
+      payoutMode: "nomina",
+      payType: "porcentaje",
+      commissionPercent: 10,
+      lines: [
+        {
+          invoice_id: "inv-1",
+          consecutive_number: 1,
+          item_id: "svc",
+          item_type: "servicio",
+          qty: 1,
+          unit_price: 100000,
+          line_subtotal: 100000,
+          commission_value: null,
+          item_ref_id: SERVICE_ID,
+        },
+        {
+          invoice_id: "inv-1",
+          consecutive_number: 2,
+          item_id: "prod",
+          item_type: "producto",
+          qty: 3,
+          unit_price: 1000,
+          line_subtotal: 3000,
+          commission_value: 1000,
+          item_ref_id: PRODUCT_ID,
+        },
+      ],
+      rules: NO_RULES,
+    });
+    const commissions = detail.reduce((acc, row) => acc + row.commission, 0);
+    const split = splitCommissionByOrigin({ commissions, detail });
+    expect(split.percent).toBe(10000);
+    expect(split.fixed).toBe(3000);
+    expect(split.fixed + split.percent).toBe(commissions);
+  });
+
+  // ------------------------- regla ítem×empleado solo porcentual (FIX 1b) ---
+  //
+  // Una fila de `commission_rules` con `percent > 0` y `amount` vacío es
+  // PURAMENTE porcentual. Antes se clasificaba como fija solo por existir la
+  // regla; el monto y el origen ahora salen de la misma resolución.
+  it("una regla solo porcentual clasifica `percent` y el monto es el del porcentaje", () => {
+    const rules = new Map<string, RuleRate>([
+      [commissionRuleKey("producto", PRODUCT_ID), { percent: 20, amount: null }],
+    ]);
+    expect(
+      employeeLineCommissionOrigin({
+        itemType: "producto",
+        itemRefId: PRODUCT_ID,
+        commissionValue: null,
+        rules,
+        flatPercent: null,
+      }),
+    ).toBe("percent");
+    expect(
+      employeeLineCommissionPercent({
+        itemType: "producto",
+        itemRefId: PRODUCT_ID,
+        commissionValue: null,
+        rules,
+        flatPercent: null,
+      }),
+    ).toBe(20);
+
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: EMPLOYEE_ID,
+      payoutMode: "nomina",
+      payType: "porcentaje",
+      commissionPercent: 10,
+      lines: [
+        {
+          invoice_id: "inv-1",
+          consecutive_number: 1,
+          item_id: "prod",
+          item_type: "producto",
+          qty: 1,
+          unit_price: 100000,
+          line_subtotal: 100000,
+          commission_value: null,
+          item_ref_id: PRODUCT_ID,
+        },
+      ],
+      rules,
+    });
+    expect(detail[0].commission_origin).toBe("percent");
+    // 100.000 × 20% = 20.000: el monto sale del porcentaje de la REGLA, no del
+    // porcentaje plano del empleado (10% daría 10.000).
+    expect(detail[0].commission).toBe(20000);
+    expect(detail[0].commission_percent).toBe(20);
+  });
+
+  it("una regla con valor fijo, o mixta, sigue siendo `commission` (el fijo manda)", () => {
+    const fixedOnly = new Map<string, RuleRate>([
+      [commissionRuleKey("producto", PRODUCT_ID), { percent: null, amount: 1000 }],
+    ]);
+    const mixed = new Map<string, RuleRate>([
+      [commissionRuleKey("producto", PRODUCT_ID), { percent: 20, amount: 1000 }],
+    ]);
+    const args = {
+      itemType: "producto",
+      itemRefId: PRODUCT_ID,
+      commissionValue: null,
+      flatPercent: null,
+    };
+    expect(employeeLineCommissionOrigin({ ...args, rules: fixedOnly })).toBe("commission");
+    expect(employeeLineCommissionOrigin({ ...args, rules: mixed })).toBe("commission");
+    // Y no hay tasa que mostrar: el origen no es `percent`.
+    expect(employeeLineCommissionPercent({ ...args, rules: mixed })).toBeNull();
   });
 });

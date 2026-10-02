@@ -10,6 +10,7 @@ import {
   roundMoney,
   snapshotInvoiceTaxes,
 } from "@/src/features/billing/schemas";
+import { stripPercentageInput, stripQuantityInput } from "@/src/shared/lib/money";
 import { invoiceNetBalance, splitGrossCardFee } from "@/src/features/billing/service";
 import { computeLineCommission, computeNetPay } from "@/src/features/payroll/schemas";
 import {
@@ -485,5 +486,127 @@ describe("dinero: la factura con centavos legacy se cierra en pesos enteros", ()
     for (const input of enteros) {
       expect(invoiceNetBalance(input)).toEqual(antes(input));
     }
+  });
+});
+
+// --------------------- la máscara de CANTIDAD ---
+
+/**
+ * La cantidad de una línea es un entero positivo (billing e inventario usan
+ * `z.coerce.number().int().positive()`). `inputMode="numeric"` NO impide
+ * teclear una letra: el navegador la acepta y el estado la recibe. Este helper
+ * es la puerta que deja pasar solo dígitos, antes de que el valor llegue al
+ * estado.
+ */
+describe("cantidad: stripQuantityInput deja SOLO dígitos", () => {
+  it("descarta letras tecleadas y pegadas", () => {
+    expect(stripQuantityInput("12a")).toBe("12");
+    expect(stripQuantityInput("a12")).toBe("12");
+    expect(stripQuantityInput("1a2b3")).toBe("123");
+    expect(stripQuantityInput("Cantidad: 3 unidades")).toBe("3");
+    expect(stripQuantityInput("abc")).toBe("");
+  });
+
+  it("descarta espacios y separadores (el pegado con formato no sobrevive)", () => {
+    expect(stripQuantityInput("1 2")).toBe("12");
+    expect(stripQuantityInput(" 7 ")).toBe("7");
+    expect(stripQuantityInput("12,5")).toBe("125");
+    expect(stripQuantityInput("12.5")).toBe("125");
+    expect(stripQuantityInput("1.234")).toBe("1234");
+    expect(stripQuantityInput("-5")).toBe("5");
+  });
+
+  it("descarta dígitos de ancho completo (no son dígitos ASCII)", () => {
+    expect(stripQuantityInput("１２")).toBe("");
+    expect(stripQuantityInput("1２")).toBe("1");
+  });
+
+  it("el texto vacío sigue vacío (el campo puede quedar en blanco)", () => {
+    expect(stripQuantityInput("")).toBe("");
+    expect(stripQuantityInput("   ")).toBe("");
+  });
+
+  it("una cantidad válida vuelve sin cambios", () => {
+    expect(stripQuantityInput("7")).toBe("7");
+    expect(stripQuantityInput("1000")).toBe("1000");
+    expect(stripQuantityInput("42")).toBe("42");
+  });
+
+  it("quita ceros a la izquierda pero conserva el cero solo", () => {
+    // Igual que la máscara de dinero: "007" es 7, y "0" se puede teclear.
+    expect(stripQuantityInput("007")).toBe("7");
+    expect(stripQuantityInput("00")).toBe("0");
+    expect(stripQuantityInput("0")).toBe("0");
+    expect(stripQuantityInput("0001234")).toBe("1234");
+  });
+
+  it("es pura: el mismo texto rinde siempre el mismo resultado", () => {
+    const entrada = " 12a,5 ";
+    expect(stripQuantityInput(entrada)).toBe(stripQuantityInput(entrada));
+    expect(stripQuantityInput(entrada)).toBe("125");
+  });
+});
+
+// --------------------- la máscara de PORCENTAJE ---
+
+/**
+ * Un porcentaje SÍ lleva decimales (0–100, `z.coerce.number()`), así que su
+ * máscara no puede descartar el separador como sí hacen las de dinero y
+ * cantidad. El defecto que este bloque fija es preciso: una máscara de SOLO
+ * dígitos convertiría `7,5` en `75` (siete y medio en setenta y cinco).
+ *
+ * La máscara conserva dígitos y como máximo UN separador decimal, acepta coma
+ * y punto, y normaliza la coma a punto para que `Number(...)` la entienda.
+ */
+describe("porcentaje: stripPercentageInput conserva los decimales", () => {
+  it("acepta coma y punto, y normaliza la coma a punto", () => {
+    expect(stripPercentageInput("7,5")).toBe("7.5");
+    expect(stripPercentageInput("7.5")).toBe("7.5");
+    expect(stripPercentageInput("0,5")).toBe("0.5");
+    expect(stripPercentageInput("99,99")).toBe("99.99");
+  });
+
+  it("deja UN solo separador cuando el texto trae varios", () => {
+    // El primero es el decimal; los demás se descartan y sus dígitos se pegan
+    // a los decimales. Nunca reaparece un segundo separador.
+    expect(stripPercentageInput("7..5")).toBe("7.5");
+    expect(stripPercentageInput("7,5,5")).toBe("7.55");
+    expect(stripPercentageInput("7.5.5")).toBe("7.55");
+    expect((stripPercentageInput("7,5,5").match(/[.,]/g) ?? []).length).toBe(1);
+  });
+
+  it("descarta letras, espacios, signos y símbolos", () => {
+    expect(stripPercentageInput("12a")).toBe("12");
+    expect(stripPercentageInput("a12")).toBe("12");
+    expect(stripPercentageInput(" 7,5 ")).toBe("7.5");
+    expect(stripPercentageInput("abc")).toBe("");
+    expect(stripPercentageInput("7%")).toBe("7");
+    expect(stripPercentageInput("-7,5")).toBe("7.5");
+    expect(stripPercentageInput("＄7,5")).toBe("7.5");
+  });
+
+  it("el texto vacío (y el que queda sin dígitos) sigue vacío", () => {
+    expect(stripPercentageInput("")).toBe("");
+    expect(stripPercentageInput("   ")).toBe("");
+    expect(stripPercentageInput("abc")).toBe("");
+    // Un separador suelto no es un número: queda en blanco, no en un punto.
+    expect(stripPercentageInput(",")).toBe("");
+    expect(stripPercentageInput(".")).toBe("");
+  });
+
+  it("un porcentaje ya válido vuelve sin cambios", () => {
+    expect(stripPercentageInput("100")).toBe("100");
+    expect(stripPercentageInput("0")).toBe("0");
+    expect(stripPercentageInput("30")).toBe("30");
+    expect(stripPercentageInput("7.5")).toBe("7.5");
+  });
+
+  it("el control negativo: una máscara ciega a los decimales SÍ rompe 7,5", () => {
+    // Control contra `stripQuantityInput` (solo dígitos): sobre el MISMO texto
+    // produce 75. Es la razón de que el porcentaje tenga su propia máscara; el
+    // primer renglón es el contrato real, el segundo documenta el defecto
+    // evitado y no una prueba de la máscara de cantidad.
+    expect(stripPercentageInput("7,5")).toBe("7.5");
+    expect(stripQuantityInput("7,5")).toBe("75");
   });
 });

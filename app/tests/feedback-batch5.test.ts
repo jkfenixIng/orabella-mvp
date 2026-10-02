@@ -746,3 +746,97 @@ describe("facturación: el recargo del cobro en edición es estado derivado en v
     expect(alertsWithVariant(INVOICES_CLIENT_CODE, "destructive")).toBe(7);
   });
 });
+
+/* ==========================================================================
+   El cobro del detalle también totaliza (mismo gesto que la emisión)
+   ========================================================================== */
+describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", () => {
+  // El bloque del formulario de cobro del detalle, acotado del `submitSplit` al
+  // primer `</form>`: el botón de la emisión (`Totalizar pagos`, PLURAL) queda
+  // fuera del recorte y no puede prestarle sus atributos por vecindad difusa.
+  const splitFormStart = INVOICES_CLIENT_CODE.indexOf("onSubmit={submitSplit}");
+  const splitFormEnd = INVOICES_CLIENT_CODE.indexOf("</form>", splitFormStart);
+  const SPLIT_FORM = INVOICES_CLIENT_CODE.slice(splitFormStart, splitFormEnd);
+
+  // El botón nuevo, recortado de su `<button` al cierre de la etiqueta.
+  const labelIndex = SPLIT_FORM.indexOf("Totalizar pago");
+  const buttonStart = SPLIT_FORM.lastIndexOf("<button", labelIndex);
+  const TOTALIZE_BUTTON = SPLIT_FORM.slice(buttonStart, SPLIT_FORM.indexOf(">", labelIndex));
+
+  it("el recorte del formulario de cobro es real (si el walk se rompe, esto falla)", () => {
+    expect(splitFormStart, "onSubmit={submitSplit}").toBeGreaterThan(-1);
+    expect(splitFormEnd, "</form> del cobro").toBeGreaterThan(splitFormStart);
+    expect(SPLIT_FORM).toContain("splitDraft.method_code");
+    expect(SPLIT_FORM).toContain("splitDraft.amount");
+    expect(SPLIT_FORM).toContain("Pagar");
+    // El recorte del botón nuevo tampoco puede ser degenerado: sin estas
+    // anclas, un `indexOf` en -1 devolvía un trozo arbitrario y el control
+    // negativo de abajo pasaba por la razón equivocada.
+    expect(labelIndex, "etiqueta Totalizar pago en el cobro").toBeGreaterThan(-1);
+    expect(buttonStart, "apertura <button del totalizar").toBeGreaterThan(-1);
+    expect(TOTALIZE_BUTTON, "recorte del botón").toContain("onClick=");
+    // El plural de la emisión NO está acá: si el recorte trajera el formulario
+    // de emisión, esta guarda lo delata antes que cualquier otra.
+    expect(SPLIT_FORM).not.toContain("Totalizar pagos");
+  });
+
+  it("existe pegado a Pagar, es `type=\"button\"` y espeja la forma de la emisión", () => {
+    expect(TOTALIZE_BUTTON).toContain("Totalizar pago");
+    // `type="button"` es la garantía de que NO puede enviar el formulario.
+    expect(TOTALIZE_BUTTON).toContain('type="button"');
+    expect(TOTALIZE_BUTTON).toContain("onClick={totalizeSplitPayment}");
+    // Misma forma de botón que el `Totalizar pagos` de la emisión: contorno de
+    // papel, sin relleno, y el mismo disable visible.
+    expect(TOTALIZE_BUTTON).toContain("border-paper-line-strong");
+    expect(TOTALIZE_BUTTON).toContain("disabled:cursor-not-allowed disabled:opacity-50");
+    // El `title` espeja el de la creación, con el singular del detalle (acá se
+    // cobra UNA porción, no varias).
+    expect(TOTALIZE_BUTTON).toContain("Rellena el monto con el saldo neto pendiente");
+    expect(TOTALIZE_BUTTON).toContain("Nada por rellenar");
+    // Va ANTES del submit y en el mismo contenedor: queda "immediately next to".
+    expect(buttonStart).toBeLessThan(SPLIT_FORM.indexOf('type="submit"'));
+  });
+
+  it("control negativo: NO es el submit; el único submit sigue siendo Pagar", () => {
+    expect(TOTALIZE_BUTTON).not.toContain('type="submit"');
+    // Un solo submit y un solo button en todo el formulario de cobro: si el
+    // totalizar se colara como submit, el conteo pasaría a 2 y fallaría.
+    expect([...SPLIT_FORM.matchAll(/type="submit"/g)]).toHaveLength(1);
+    expect([...SPLIT_FORM.matchAll(/type="button"/g)]).toHaveLength(1);
+    // El submit del formulario es el que dice "Pagar", y no el totalizar.
+    const submitIdx = SPLIT_FORM.indexOf('type="submit"');
+    const SUBMIT_BUTTON = SPLIT_FORM.slice(
+      SPLIT_FORM.lastIndexOf("<button", submitIdx),
+      SPLIT_FORM.indexOf("</button>", submitIdx),
+    );
+    expect(SUBMIT_BUTTON).toContain("Pagar");
+    expect(SUBMIT_BUTTON).not.toContain("Totalizar pago");
+  });
+
+  it("el handler escribe el saldo NETO del detalle, redondeado a 2 como la emisión", () => {
+    // Fuente del gesto: el saldo NETO que ya trae el detalle
+    // (`service.ts`: `remaining: round2(max(0, netRemaining))`). Se pina el
+    // campo para que el gesto no se reapunte a `total` (que es BRUTO).
+    expect(INVOICES_CLIENT_CODE).toMatch(
+      /const splitRemaining = detail \? Math\.max\(0, Number\(detail\.remaining\)\) : 0;/,
+    );
+    expect(INVOICES_CLIENT_CODE).toMatch(/function totalizeSplitPayment\(\) \{/);
+    const handlerStart = INVOICES_CLIENT_CODE.indexOf("function totalizeSplitPayment()");
+    const HANDLER = INVOICES_CLIENT_CODE.slice(handlerStart, INVOICES_CLIENT_CODE.indexOf("\n  }", handlerStart));
+    // Escribe el monto del borrador de cobro con el NETO pendiente…
+    expect(HANDLER).toContain("setSplitDraft((prev) => ({ ...prev, amount: value }))");
+    expect(HANDLER).toContain("Math.round(splitRemaining * 100) / 100");
+    // …y SOLO con eso: el recargo lo suma el servidor al TOTAL, no al monto. Si
+    // alguien metiera `surcharge` o un `fee`, este control lo acusa.
+    expect(HANDLER).not.toMatch(/surcharge|\bfee\b/);
+  });
+
+  it("se desactiva con el mismo criterio que la emisión: nada que rellenar o `busy`", () => {
+    expect(INVOICES_CLIENT_CODE).toMatch(/const canTotalizeSplit = splitRemaining > 0;/);
+    expect(SPLIT_FORM).toMatch(/disabled=\{!canTotalizeSplit \|\| busy\}/);
+  });
+
+  it("no se tocó el envío: el cobro sigue mandando una porción con el monto del borrador", () => {
+    expect(INVOICES_CLIENT_CODE).toContain("portions: [{ method_code: splitDraft.method_code, amount }],");
+  });
+});

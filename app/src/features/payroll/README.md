@@ -26,9 +26,11 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
 - Servicio (`service.ts`): `openPayrollPeriod` (23505 del índice →
   `PERIOD_DRAFT_EXISTS`), `calculatePayroll` (fijo según `pay_type`
   fijo/mixto + comisiones desde `invoice_items` del rango por `employee_id`
-  —solo facturas no anuladas— con `detail_json` por factura/ítem; el fijo
-  queda sin reporte; bonos/otros por ajustes; vales pendientes/aprobados del
-  rango se descuentan y pasan a descontada; recalcular reproduce el neto),
+  —regla de negocio: solo facturas `Pagada`; una `Emitida` no comisiona— con
+  `detail_json` por factura/ítem; el fijo queda sin reporte; bonos/otros por
+  ajustes; vales pendientes/aprobados del rango se descuentan y pasan a
+  descontada, y los ya `descontada` del rango siguen contando al recalcular;
+  recalcular reproduce el mismo neto),
   `payPayrollItem` (porciones con métodos activos, montos > 0; abonos
   parciales permitidos —40/40/20 en una o varias llamadas— y el acumulado
   nunca excede el neto), `closePayrollPeriod` (inmutable: `assertDraftPeriod`
@@ -79,4 +81,4 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
 
 ## Límites de lectura
 
-- Navegación instantánea: `listPeriods` acotado a 20 periodos recientes, `listVouchers` a 50 vales recientes; el detalle del periodo (ítems + saldos) se carga bajo demanda al seleccionar.
+- Navegación instantánea: `listPeriods` acotado a 20 periodos recientes, `listVouchers` a 50 vales recientes; la pantalla de vales nace acotada al día de hoy (Bogotá, `date_from`/`date_to` incluyentes) y amplía —o limpia— ese rango desde sus filtros de fecha; el detalle del periodo (ítems + saldos) se carga bajo demanda al seleccionar.

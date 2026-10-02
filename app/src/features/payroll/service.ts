@@ -17,6 +17,7 @@ import {
   checkVoucherEligibility,
   computeNetPay,
   correctPayrollPeriodSchema,
+  monthKeyOf,
   normalizeAllowedDays,
   normalizePerDayLimits,
   openPeriodSchema,
@@ -863,6 +864,13 @@ export interface PayrollOverview {
 async function readPaidItemsOfPeriods(args: {
   db: DbClient;
   periodIds: readonly string[];
+  /**
+   * Filtro OPCIONAL por empleado (consulta puntual del mes): acota la lectura a
+   * las filas de ESA persona en los períodos dados, en vez de traer las de toda
+   * la planta para descartarlas después. Sin `employeeId` la lectura es la de
+   * siempre (todos los empleados de los períodos).
+   */
+  employeeId?: string;
   log: string;
   meta: Record<string, unknown>;
 }): Promise<PaidPayrollItem[]> {
@@ -871,15 +879,23 @@ async function readPaidItemsOfPeriods(args: {
     const rows = await readAllPayroll<PayrollItemRow>({
       log: args.log,
       what: "ítems de los períodos",
-      meta: { ...args.meta, periods: args.periodIds.length, ids: chunk.length },
+      meta: {
+        ...args.meta,
+        periods: args.periodIds.length,
+        ids: chunk.length,
+        ...(args.employeeId !== undefined ? { employee: args.employeeId } : {}),
+      },
       table: "payroll_items",
-      fetchPage: (from, to) =>
-        args.db
+      fetchPage: (from, to) => {
+        let query = args.db
           .from("payroll_items")
           .select(ITEM_SELECT)
-          .in("period_id", chunk)
-          .order("id")
-          .range(from, to),
+          .in("period_id", chunk);
+        if (args.employeeId !== undefined) {
+          query = query.eq("employee_id", args.employeeId);
+        }
+        return query.order("id").range(from, to);
+      },
     });
     items.push(...rows);
   }
@@ -949,6 +965,54 @@ export async function listPayrollOverview(sedeId: string): Promise<PayrollOvervi
       })),
       months: buildPayrollMonthToDate({ periods, items }),
     };
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
+/** Un mes del calendario en la forma canónica `yyyy-mm`. */
+const PAYROLL_MONTH_PATTERN = /^\d{4}-\d{2}$/;
+
+/**
+ * PA3 (consulta puntual): lo que UN empleado lleva liquidado y pagado en UN
+ * mes, leído SÓLO cuando el admin elige ese mes y ese empleado.
+ *
+ * Es la MISMA proyección que `listPayrollOverview().months` —la fila del mes
+ * con sus períodos, el fijo prorrateado y los días nominados a la vista—, pero
+ * acotada en las dos dimensiones que la pantalla ya no trae al abrir:
+ *   * el MES filtra los períodos (la fecha de INICIO define el mes, igual que
+ *     `buildPayrollMonthToDate`, así que un período que cruza el fin de mes se
+ *     prorratea en el mes donde empieza);
+ *   * el EMPLEADO acota la lectura de ítems en la consulta, no después.
+ * Sin filas para ese par (mes, empleado) devuelve `[]`: no cae a los datos de
+ * otro empleado ni de otro mes.
+ */
+export async function listPayrollMonthRows(args: {
+  sedeId: string;
+  month: string;
+  employeeId: string;
+}): Promise<PayrollMonthEmployeeRow[]> {
+  try {
+    if (!PAYROLL_MONTH_PATTERN.test(args.month)) {
+      throw new PayrollError("VALIDATION", "Mes inválido (use yyyy-mm).", 400);
+    }
+    const monthPeriods = (await listPeriods(args.sedeId)).filter(
+      (period) => monthKeyOf(period.start_date) === args.month,
+    );
+    if (monthPeriods.length === 0) return [];
+
+    const db = await payrollDb();
+    const items = await readPaidItemsOfPeriods({
+      db,
+      periodIds: monthPeriods.map((period) => period.id),
+      employeeId: args.employeeId,
+      log: "listPayrollMonthRows",
+      meta: { sede: args.sedeId, month: args.month, employee: args.employeeId },
+    });
+
+    return buildPayrollMonthToDate({ periods: monthPeriods, items }).filter(
+      (row) => row.month === args.month && row.employeeId === args.employeeId,
+    );
   } catch (error) {
     throw toPayrollError(error);
   }
@@ -1043,7 +1107,17 @@ export async function calculatePayroll(
       // El borrador liquida la planta ACTIVA de la sede.
       roster: actives,
       input,
-      voucherScope: "vigentes",
+      // El borrador descuenta los vales vigentes del rango y ADEMÁS cuenta los
+      // que ESTE período ya descontó: al aplicar, los vales pasan a
+      // `descontada` y recalcular con solo `vigentes` los leería como 0 —el
+      // descuento desaparecía del neto sin que nadie lo revirtiera—. El rango
+      // `request_date` es el mismo y la restricción de exclusión de 035 impide
+      // que dos períodos de la sede compartan un día, así que un vale
+      // `descontada` dentro del rango pertenece a este período y no se puede
+      // contar dos veces. Los que se marcan siguen siendo solo
+      // pendiente/aprobada (`vouchersToDiscount`): un `descontada` no se
+      // reescribe.
+      voucherScope: "vigentes_y_descontados",
       log: "calculatePayroll",
     });
 
@@ -1115,15 +1189,16 @@ export async function calculatePayroll(
 /**
  * Qué estados de vale descuentan el neto de un cálculo.
  *
- * `vigentes`: el borrador descuenta los vales pendientes/aprobados del rango y
- * los marca `descontada` (PAY-07).
- * `vigentes_y_descontados`: la corrección de un período cerrado vuelve a
- * descontar ADEMÁS los vales que ESTE período ya descontó. Sin eso el neto
- * corregido perdería el descuento del vale (ya no está pendiente) y subiría por
- * una razón ajena a la corrección: un número que cambia de significado en
- * silencio. El rango no es ambiguo: la restricción de exclusión de 035 impide
- * que dos períodos de la sede compartan un solo día, así que un vale
- * `descontada` dentro del rango pertenece a este período.
+ * `vigentes`: solo los vales pendientes/aprobados del rango; los `descontada`
+ * no cuentan.
+ * `vigentes_y_descontados`: además de los pendientes/aprobados, cuenta los
+ * vales que ESTE período ya descontó. Sin eso, todo recálculo posterior a la
+ * aplicación perdería el descuento (el vale ya no está pendiente) y el neto
+ * subiría por una razón ajena al recálculo: un número que cambia de significado
+ * en silencio. Lo usan el borrador al recalcular y la corrección de un período
+ * cerrado. El rango `request_date` no es ambiguo: la restricción de exclusión
+ * de 035 impide que dos períodos de la sede compartan un solo día, así que un
+ * vale `descontada` dentro del rango pertenece a este período y a ninguno más.
  */
 type VoucherDiscountScope = "vigentes" | "vigentes_y_descontados";
 
@@ -1194,9 +1269,13 @@ async function computePayrollLines(args: {
   const { db, sedeId, period, roster, input, voucherScope, log } = args;
   const periodId = period.id;
 
-    // Facturas vigentes de la sede en el rango (Anulada excluida). El rango
-    // lleva offset de Bogotá: sin él la ventana corre 5 h y se pierden las
-    // facturas de la noche del último día (comisión no liquidada).
+    // Facturas de la sede en el rango de las que sale comisión. REGLA DE
+    // NEGOCIO (decisión del dueño, 2026-10-01): la comisión se gana cuando la
+    // factura queda `Pagada`; una factura solo `Emitida` —o anulada después— no
+    // comisiona ("de dónde saldría ese dinero"). Por eso el filtro es `= Pagada`
+    // y no "≠ Anulada": lo segundo contaba como comisión facturas que todavía no
+    // habían entrado a caja. El rango lleva offset de Bogotá: sin él la ventana
+    // corre 5 h y se pierden las facturas de la noche del último día.
     const invoiceRange = rangeBounds(period.start_date, period.end_date);
     // U5: lectura exhaustiva. El `.limit(2000)` de antes era un tope de
     // TRANSPORTE tomado por tope de negocio: una sede con más facturas en el
@@ -1213,7 +1292,7 @@ async function computePayrollLines(args: {
           .from("invoices")
           .select("id, consecutive_number")
           .eq("sede_id", sedeId)
-          .neq("status", "Anulada")
+          .eq("status", "Pagada")
           .gte("created_at", invoiceRange.from)
           .lte("created_at", invoiceRange.to)
           .order("id")
@@ -2970,16 +3049,32 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
   }
 }
 
-/** Lista los vales de la sede (filtro opcional por estado/empleado/fecha, máx. 50 recientes). */
+/**
+ * Lista los vales de la sede (filtro opcional por estado/empleado/fecha, máx. 50 recientes).
+ *
+ * Fechas: `request_date` es la igualdad exacta que usa caja; `date_from`/`date_to`
+ * son un rango INCLUSIVO sobre `request_date` (columna `date`, sin aritmética de
+ * zona horaria). Si se manda `request_date`, éste manda y el rango se ignora.
+ * Los extremos del rango se validan con el mismo formato (yyyy-mm-dd).
+ */
 export async function listVouchers(
   sedeId: string,
-  filters: { status?: string; employee_id?: string; request_date?: string; limit?: number } = {},
+  filters: {
+    status?: string;
+    employee_id?: string;
+    request_date?: string;
+    date_from?: string;
+    date_to?: string;
+    limit?: number;
+  } = {},
 ): Promise<VoucherRequestRow[]> {
   if (filters.status !== undefined && !["pendiente", "aprobada", "rechazada", "descontada"].includes(filters.status)) {
     throw new PayrollError("VALIDATION", "Estado de filtro inválido.", 400);
   }
-  if (filters.request_date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(filters.request_date)) {
-    throw new PayrollError("VALIDATION", "Fecha inválida (use yyyy-mm-dd).", 400);
+  for (const date of [filters.request_date, filters.date_from, filters.date_to]) {
+    if (date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      throw new PayrollError("VALIDATION", "Fecha inválida (use yyyy-mm-dd).", 400);
+    }
   }
   const limit = filters.limit === undefined ? 50 : Math.min(200, Math.max(1, Math.floor(filters.limit)));
   const db = await payrollDb();
@@ -2991,7 +3086,15 @@ export async function listVouchers(
     .limit(limit);
   if (filters.status) query = query.eq("status", filters.status);
   if (filters.employee_id) query = query.eq("employee_id", filters.employee_id);
-  if (filters.request_date) query = query.eq("request_date", filters.request_date);
+  if (filters.request_date) {
+    query = query.eq("request_date", filters.request_date);
+  } else if (filters.date_from !== undefined && filters.date_from === filters.date_to) {
+    // Extremos iguales: un solo valor exacto, el mismo camino que caja.
+    query = query.eq("request_date", filters.date_from);
+  } else {
+    if (filters.date_from !== undefined) query = query.gte("request_date", filters.date_from);
+    if (filters.date_to !== undefined) query = query.lte("request_date", filters.date_to);
+  }
   const { data, error } = await query;
   if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
   const rows = ((data ?? []) as unknown as Array<Record<string, unknown>>).map(normalizeVoucher);

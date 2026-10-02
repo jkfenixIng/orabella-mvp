@@ -79,6 +79,8 @@ interface VouchersClientProps {
   shiftOwn: boolean;
   /** Nombre de quien abrió la caja (para el aviso de bloqueo). */
   shiftOwner: string | null;
+  /** Día de Bogotá con el que nace el rango por defecto del listado (hoy). */
+  today: string;
   canAdmin: boolean;
   canIssue: boolean;
 }
@@ -103,12 +105,17 @@ export function VouchersClient(props: VouchersClientProps) {
   // colisionar con reviewTarget (aprobar/rechazar) ni con isCreateOpen.
   const [detailTarget, setDetailTarget] = useState<VoucherRequestRow | null>(null);
   const [busy, setBusy] = useState(false);
-  // Filtros del listado: se aplican en cliente sobre los vales ya cargados
-  // (el backend no expone un filtro combinado, así que se resuelve aquí).
+  // Filtros del listado: estado y empleado se aplican en cliente sobre los
+  // vales ya cargados; el rango de fechas va al SERVIDOR (ver
+  // `refreshVouchers`).
   const [statusFilter, setStatusFilter] = useState("");
   const [employeeFilter, setEmployeeFilter] = useState("");
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
+  // Rango de fechas del listado: por defecto, HOY (el mismo día que calculó el
+  // servidor y bajó como prop, para que no puedan discrepar). El rango se
+  // aplica en el SERVIDOR: cambiar las fechas re-consulta con la ventana que
+  // muestran los inputs. Vaciar los dos extremos = sin límite de fecha.
+  const [dateFrom, setDateFrom] = useState(props.today);
+  const [dateTo, setDateTo] = useState(props.today);
   // V1: sin topes configurados no se puede solicitar; el alta vive en un modal.
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   // V1 (previsión): el fuera de rango no se envía directo: abre la
@@ -257,9 +264,31 @@ export function VouchersClient(props: VouchersClientProps) {
     return found ? `${found.name} (${code})` : code;
   }
 
-  async function refreshVouchers() {
-    const result = (await listVouchersAction({})) as ActionResult<VoucherRequestRow[]>;
+  /**
+   * Re-consulta el listado en el servidor con el rango de fechas que muestran
+   * los inputs. No alcanza con filtrar la página ya cargada: una fecha más
+   * amplia tiene que poder traer filas que el servidor todavía no mandó. Vaciar
+   * un extremo manda ese lado sin acotar. El `override` aplica el valor recién
+   * tecleado sin esperar al re-render del estado.
+   */
+  async function refreshVouchers(override?: { from?: string; to?: string }) {
+    const from = override?.from ?? dateFrom;
+    const to = override?.to ?? dateTo;
+    const result = (await listVouchersAction({
+      date_from: from !== "" ? from : undefined,
+      date_to: to !== "" ? to : undefined,
+    })) as ActionResult<VoucherRequestRow[]>;
     if (result.success) setVouchers(result.data);
+  }
+
+  function handleDateFromChange(value: string) {
+    setDateFrom(value);
+    void refreshVouchers({ from: value });
+  }
+
+  function handleDateToChange(value: string) {
+    setDateTo(value);
+    void refreshVouchers({ to: value });
   }
 
   async function handleRequestVoucher(event: FormEvent) {
@@ -392,16 +421,25 @@ export function VouchersClient(props: VouchersClientProps) {
     closeReview();
   }
 
-  // Filtrado en cliente: estado exacto, empleado por nombre/ID interno y rango
-  // de fechas de solicitud (request_date es ISO yyyy-mm-dd, comparable como texto).
+  // Filtrado en cliente: estado exacto y empleado por nombre/ID interno. El
+  // rango de fechas NO se filtra acá: va al servidor (ver `refreshVouchers`),
+  // y recortar la página ya cargada escondería filas que la consulta nueva no
+  // llegó a traer.
   const filteredVouchers = vouchers.filter((row) => {
     if (statusFilter !== "" && row.status !== statusFilter) return false;
-    if (dateFrom !== "" && row.request_date < dateFrom) return false;
-    if (dateTo !== "" && row.request_date > dateTo) return false;
     const query = employeeFilter.trim().toLowerCase();
     if (query !== "" && !employeeName(row.employee_id).toLowerCase().includes(query)) return false;
     return true;
   });
+
+  // Copy del vacío cuando hay una ventana de fechas puesta: nombrarla evita
+  // decir "todavía" sobre un resultado que solo cubre [desde, hasta].
+  const emptyRangeText =
+    dateFrom !== "" && dateTo !== ""
+      ? `Sin vales entre ${dateFrom} y ${dateTo}.`
+      : dateFrom !== ""
+        ? `Sin vales desde ${dateFrom}.`
+        : `Sin vales hasta ${dateTo}.`;
 
   return (
     <div className="flex flex-col gap-6">
@@ -602,7 +640,7 @@ export function VouchersClient(props: VouchersClientProps) {
             <input
               type="date"
               value={dateFrom}
-              onChange={(event) => setDateFrom(event.target.value)}
+              onChange={(event) => handleDateFromChange(event.target.value)}
               className={inputClass}
             />
           </label>
@@ -611,16 +649,22 @@ export function VouchersClient(props: VouchersClientProps) {
             <input
               type="date"
               value={dateTo}
-              onChange={(event) => setDateTo(event.target.value)}
+              onChange={(event) => handleDateToChange(event.target.value)}
               className={inputClass}
             />
           </label>
         </div>
         {vouchers.length === 0 ? (
-          // VACÍO: el estado base de la lista.
-          <p className="mt-4 text-sm text-text-tertiary">Sin vales todavía.</p>
+          // VACÍO: el servidor no trajo filas para el rango pedido. Con el rango
+          // por defecto (hoy) el vacío es "hoy no hay", no "nunca hubo": si hay
+          // fechas, el mensaje nombra la ventana. Sin fechas, es el buzón vacío.
+          dateFrom === "" && dateTo === "" ? (
+            <p className="mt-4 text-sm text-text-tertiary">Sin vales todavía.</p>
+          ) : (
+            <p className="mt-4 text-sm text-text-tertiary">{emptyRangeText}</p>
+          )
         ) : filteredVouchers.length === 0 ? (
-          // VACÍO con filtros puestos: mismo caso que arriba.
+          // VACÍO con filtros de estado/empleado puestos sobre filas cargadas.
           <p className="mt-4 text-sm text-text-tertiary">Sin vales para estos filtros.</p>
         ) : (
           <div className="mt-4 overflow-x-auto">

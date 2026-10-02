@@ -1594,3 +1594,145 @@ describe("migración 054_identity_atomic.sql: la función del alta de empleado (
     expect(sql).toContain(`GRANT EXECUTE ON FUNCTION ${firma} TO service_role`);
   });
 });
+
+/* ==========================================================================
+   Admin: cada campo numérico de las secciones pasa por SU máscara (guarda)
+
+   `inputMode="numeric"`/`"decimal"` son pistas del teclado, no validaciones:
+   una letra llegaba al estado. Los montos (base de caja, denominación,
+   salario, topes de vales) pasan por `stripMoneyInput` y los porcentajes
+   (comisión del empleado, impuesto) por `stripPercentageInput`, que conserva
+   los decimales. Esta guarda falla si alguien vuelve a leer el valor crudo.
+   ========================================================================== */
+describe("admin: los campos numéricos de las secciones pasan por su máscara (guarda de fuente)", () => {
+  const sectionPath = (file: string): string =>
+    join(process.cwd(), "app", "admin", "admin-sections", file);
+  const cash = readFileSync(sectionPath("cash-section.tsx"), "utf8");
+  const employees = readFileSync(sectionPath("employees-section.tsx"), "utf8");
+  const taxes = readFileSync(sectionPath("taxes-section.tsx"), "utf8");
+  const vales = readFileSync(sectionPath("vales-section.tsx"), "utf8");
+
+  /**
+   * Bloque `onChange={...}` cuyo cuerpo contiene `anchor`; `occurrence` elige
+   * la aparición cuando el ancla se repite. Devuelve "" si el ancla no existe,
+   * para que la guarda falle en vez de pasar sola.
+   */
+  function onChangeBlock(text: string, anchor: string, occurrence = 0): string {
+    let at = -1;
+    let from = 0;
+    for (let i = 0; i <= occurrence; i += 1) {
+      at = text.indexOf(anchor, from);
+      if (at === -1) return "";
+      from = at + anchor.length;
+    }
+    const start = text.lastIndexOf("onChange={", at);
+    if (start === -1) return "";
+    let depth = 0;
+    for (let i = start + "onChange=".length; i < text.length; i += 1) {
+      const ch = text[i];
+      if (ch === "{") depth += 1;
+      else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) return text.slice(start, i + 1);
+      }
+    }
+    return text.slice(start);
+  }
+
+  /** El campo lleva la máscara y NO además el valor crudo. */
+  function assertMasked(block: string, mask: string, raw: string): void {
+    expect(block).not.toBe("");
+    expect(block).toContain(`strip${mask}Input(event.target.value)`);
+    expect(block).not.toContain(raw);
+  }
+
+  it("piso anti-vacío: las cuatro secciones se leyeron de verdad", () => {
+    expect(cash.length).toBeGreaterThan(5_000);
+    expect(employees.length).toBeGreaterThan(5_000);
+    expect(taxes.length).toBeGreaterThan(3_000);
+    expect(vales.length).toBeGreaterThan(5_000);
+    expect(cash).toContain("stripMoneyInput");
+    expect(taxes).toContain("stripPercentageInput");
+  });
+
+  it("la nueva base de caja usa la máscara de dinero", () => {
+    assertMasked(
+      onChangeBlock(cash, 'placeholder="Nueva base"'),
+      "Money",
+      "[row.id]: event.target.value",
+    );
+    expect(cash).toContain('value={formatMoneyInput(baseDrafts[row.id] ?? "")}');
+  });
+
+  it("el valor de la nueva denominación usa la máscara de dinero", () => {
+    assertMasked(
+      onChangeBlock(cash, "setNewValue(stripMoneyInput"),
+      "Money",
+      "setNewValue(event.target.value)",
+    );
+    expect(cash).toContain("value={formatMoneyInput(newValue)}");
+  });
+
+  it("el salario fijo usa la máscara de dinero", () => {
+    assertMasked(
+      onChangeBlock(employees, 'placeholder="1400000"'),
+      "Money",
+      "salary_fixed: event.target.value",
+    );
+    expect(employees).toContain("value={formatMoneyInput(form.salary_fixed)}");
+  });
+
+  it("el % de comisión del empleado usa la máscara de porcentaje", () => {
+    assertMasked(
+      onChangeBlock(employees, 'placeholder="30"'),
+      "Percentage",
+      "commission_percent: event.target.value",
+    );
+  });
+
+  it("el % del impuesto usa la máscara de porcentaje", () => {
+    assertMasked(
+      onChangeBlock(taxes, "stripPercentageInput(event.target.value)"),
+      "Percentage",
+      "percent: event.target.value",
+    );
+  });
+
+  it("el tope semanal de vales usa la máscara de dinero", () => {
+    assertMasked(
+      onChangeBlock(vales, 'placeholder="500000"'),
+      "Money",
+      "setMaxWeek(event.target.value)",
+    );
+    expect(vales).toContain("value={formatMoneyInput(maxWeek)}");
+  });
+
+  it("el tope diario de vales usa la máscara de dinero", () => {
+    assertMasked(
+      onChangeBlock(vales, 'placeholder="200000"', 0),
+      "Money",
+      "setMaxDay(event.target.value)",
+    );
+    expect(vales).toContain("value={formatMoneyInput(maxDay)}");
+  });
+
+  it("el tope propio por día usa la máscara de dinero", () => {
+    assertMasked(
+      onChangeBlock(vales, 'placeholder="200000"', 1),
+      "Money",
+      "[day]: event.target.value",
+    );
+    expect(vales).toContain('value={formatMoneyInput(perDayValues[day] ?? "")}');
+  });
+
+  it("el detector no es un sello de goma (control negativo)", () => {
+    const fake = `<input onChange={(event) => setNewValue(event.target.value)} />`;
+    const block = onChangeBlock(fake, "setNewValue(");
+    expect(block).not.toBe("");
+    // Sin el cable a la máscara, la misma guarda falla.
+    expect(block).not.toContain("stripMoneyInput(event.target.value)");
+    expect(block).toContain("setNewValue(event.target.value)");
+    // Sin el ancla no hay bloque: la guarda falla en vez de pasar sola.
+    expect(onChangeBlock(fake, "no-existe:")).toBe("");
+  });
+});

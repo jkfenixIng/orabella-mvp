@@ -66,7 +66,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { cn } from "@/src/components/ui/lib/utils";
-import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import { formatMoney, formatMoneyInput, stripMoneyInput, stripPercentageInput, stripQuantityInput } from "@/src/shared/lib/money";
 import type { ActionResult } from "@/src/shared/lib/api-response";
 import { toNumber } from "@/src/shared/lib/format";
 
@@ -112,6 +112,31 @@ function emptyItem(): ItemDraft {
   // Servicio por defecto: siempre comisiona el % del empleado. El
   // personalizado arranca sin comisión y exige elegir el modo.
   return { item_type: "servicio", ref_id: "", custom_name: "", employee_id: "", qty: "1", unit_price: "", no_commission: false, commission_value: null, commission_mode: "porcentaje", commission_percent_override: null };
+}
+
+/**
+ * UX-EMPLEADO: fila (1-based) del borrador que ya tiene el MISMO producto con
+ * el MISMO empleado, o `null`. La regla es por empleado: el mismo producto con
+ * OTRO empleado es una línea legítima (precio, comisión y descuento por línea),
+ * así que no se marca ni se frena. Sin producto o sin empleado no hay
+ * coincidencia posible. `excludeIndex` ignora la propia fila al editar una
+ * existente.
+ */
+export function sameEmployeeProductLine(
+  lines: ReadonlyArray<{ item_type: string; ref_id: string; employee_id: string }>,
+  productId: string,
+  employeeId: string,
+  excludeIndex = -1,
+): number | null {
+  if (!productId || !employeeId) return null;
+  const index = lines.findIndex(
+    (line, i) =>
+      i !== excludeIndex &&
+      line.item_type === "producto" &&
+      line.ref_id === productId &&
+      line.employee_id === employeeId,
+  );
+  return index === -1 ? null : index + 1;
 }
 
 /**
@@ -316,6 +341,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
   const [itemDialogTarget, setItemDialogTarget] = useState<"create" | "edit">("create");
   const [itemDraft, setItemDraft] = useState<ItemDraft>(emptyItem());
   const [itemError, setItemError] = useState<string | null>(null);
+  // UX-EMPLEADO: fila resaltada cuando un producto repetido del MISMO empleado
+  // frena el alta; guía la mirada a la línea donde subir la cantidad.
+  const [steeredRow, setSteeredRow] = useState<{ target: "create" | "edit"; index: number } | null>(null);
   const [portions, setPortions] = useState<PortionDraft[]>([
     { method_code: "efectivo", amount: "" },
   ]);
@@ -453,6 +481,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
   function openItemDialog(target: "create" | "edit" = "create") {
     setItemDraft(emptyItem());
     setItemError(null);
+    setSteeredRow(null);
     setItemDialogTarget(target);
     setIsItemDialogOpen(true);
   }
@@ -480,6 +509,21 @@ export function InvoicesClient(props: InvoicesClientProps) {
     if (!itemDraft.employee_id) {
       setItemError("Elija el empleado que atiende.");
       return;
+    }
+    if (itemDraft.item_type === "producto") {
+      // UX-EMPLEADO: el mismo producto con el MISMO empleado ya está en la
+      // factura; se frena la línea duplicada y se guía a subir la cantidad en
+      // la fila existente. Con otro empleado la línea nueva es legítima.
+      const list = itemDialogTarget === "edit" ? editItems : items;
+      const line = sameEmployeeProductLine(list, itemDraft.ref_id, itemDraft.employee_id);
+      if (line != null) {
+        const where = itemDialogTarget === "edit" ? "la edición" : "la factura";
+        setItemError(
+          `El producto ya está en ${where}, fila ${line}, con este empleado. Aumente la cantidad en esa fila en vez de agregar otra línea.`,
+        );
+        setSteeredRow({ target: itemDialogTarget, index: line - 1 });
+        return;
+      }
     }
     const qty = toNumber(itemDraft.qty);
     const price = toNumber(itemDraft.unit_price);
@@ -511,6 +555,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     } else {
       setItems((prev) => [...prev, draft]);
     }
+    setSteeredRow(null);
     setIsItemDialogOpen(false);
   }
 
@@ -1247,6 +1292,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setPortions((prev) => prev.map((row, i) => (i === firstEmpty ? { ...row, amount: value } : row)));
   }
 
+  // Totalizar pago (detalle): el monto del cobro es NETO, igual que las
+  // porciones de la emisión; el recargo de tarjeta lo suma el servidor al
+  // total, no al monto. Fuente: el saldo NETO pendiente que ya trae el detalle.
+  const splitRemaining = detail ? Math.max(0, Number(detail.remaining)) : 0;
+  const canTotalizeSplit = splitRemaining > 0;
+
+  function totalizeSplitPayment() {
+    if (splitRemaining <= 0) return;
+    const value = String(Math.round(splitRemaining * 100) / 100);
+    setSplitDraft((prev) => ({ ...prev, amount: value }));
+  }
+
   // Métodos ya usados en otras porciones: cada método se cobra una sola vez.
   const usedMethodCodes = new Set(portions.map((portion) => portion.method_code));
   const firstFreeMethod =
@@ -1409,9 +1466,24 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 const lineQty = toNumber(item.qty) ?? 0;
                                 const linePrice = toNumber(item.unit_price) ?? 0;
                                 return (
-                                  <tr key={index} className="border-t border-paper-line align-top">
+                                  <tr
+                                    key={index}
+                                    className={cn(
+                                      "border-t border-paper-line align-top",
+                                      steeredRow?.target === "create" && steeredRow.index === index && "bg-paper-surface-muted",
+                                    )}
+                                  >
                                     <td className="px-3 py-2 font-semibold">{index + 1}</td>
-                                    <td className="whitespace-nowrap px-3 py-2">{item.qty}</td>
+                                    <td className="px-3 py-2">
+                                      <input
+                                        className={`${paperInputClass} w-20`}
+                                        value={item.qty}
+                                        onChange={(event) => patchDraftItem(index, { qty: stripQuantityInput(event.target.value) })}
+                                        placeholder="1"
+                                        inputMode="numeric"
+                                        aria-label={`Ítem ${index + 1} cantidad`}
+                                      />
+                                    </td>
                                     <td className="min-w-[200px] px-3 py-2">
                                       <p className="font-medium">{draftItemName(item)}</p>
                                       <p className="text-xs text-paper-ink-muted">
@@ -1832,7 +1904,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
               <Input
                 className={inputClass}
                 value={filters.number}
-                onChange={(event) => setFilters({ ...filters, number: event.target.value })}
+                onChange={(event) => setFilters({ ...filters, number: stripQuantityInput(event.target.value) })}
                 placeholder="#123"
                 inputMode="numeric"
               />
@@ -2176,7 +2248,21 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 />
                               </label>
                               </div>
-                              <div>
+                              <div className="flex flex-wrap items-center gap-3">
+                              <button
+                                type="button"
+                                disabled={!canTotalizeSplit || busy}
+                                title={
+                                  canTotalizeSplit
+                                    ? "Rellena el monto con el saldo neto pendiente"
+                                    : "Nada por rellenar"
+                                }
+                                onClick={totalizeSplitPayment}
+                                className="flex h-10 items-center gap-2 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-paper-ink-secondary hover:bg-paper-surface-soft disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                <Banknote className="h-4 w-4" aria-hidden="true" />
+                                Totalizar pago
+                              </button>
                               <button
                                 type="submit"
                                 disabled={busy}
@@ -2313,13 +2399,19 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     const employee = props.employees.find((row) => row.id === item.employee_id);
                                     const fixedPay = isFixedPayEmployee(employee);
                                     return (
-                                      <tr key={item.id ?? `nuevo-${index}`} className="border-t border-paper-line align-top">
+                                      <tr
+                                        key={item.id ?? `nuevo-${index}`}
+                                        className={cn(
+                                          "border-t border-paper-line align-top",
+                                          steeredRow?.target === "edit" && steeredRow.index === index && "bg-paper-surface-muted",
+                                        )}
+                                      >
                                         <td className="px-3 py-2 font-semibold">{index + 1}</td>
                                         <td className="px-3 py-2">
                                           <input
                                             className={`${paperInputClass} w-20`}
                                             value={item.qty}
-                                            onChange={(event) => patchEditItem(index, { qty: event.target.value })}
+                                            onChange={(event) => patchEditItem(index, { qty: stripQuantityInput(event.target.value) })}
                                             placeholder="1"
                                             inputMode="numeric"
                                             aria-label={`Editar ítem ${index + 1} cantidad`}
@@ -2339,11 +2431,17 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                               placeholder="Producto…"
                                               options={props.products
                                                 .filter((row) => row.is_active)
-                                                .map((row) => ({
-                                                  value: row.id,
-                                                  label: row.name,
-                                                  description: `Stock: ${row.stock_qty}`,
-                                                }))}
+                                                .map((row) => {
+                                                  const line = sameEmployeeProductLine(editItems, row.id, item.employee_id, index);
+                                                  return {
+                                                    value: row.id,
+                                                    label: row.name,
+                                                    description:
+                                                      line == null
+                                                        ? `Stock: ${row.stock_qty}`
+                                                        : `Stock: ${row.stock_qty} · ya está en la edición, fila ${line}`,
+                                                  };
+                                                })}
                                               ariaLabel={`Editar ítem ${index + 1} producto`}
                                               filterPlaceholder="Escriba para filtrar…"
                                             />
@@ -2515,19 +2613,17 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                 {item.commission_mode === "porcentaje" &&
                                                   (fixedPay ? (
                                                     <input
-                                                      type="number"
                                                       className={`${paperInputClass} h-9 w-28 text-right`}
                                                       value={item.commission_percent_override ?? ""}
                                                       onChange={(event) =>
                                                         patchEditItem(index, {
                                                           commission_percent_override:
-                                                            event.target.value === "" ? null : Number(event.target.value),
+                                                            event.target.value === ""
+                                                              ? null
+                                                              : Number(stripPercentageInput(event.target.value)),
                                                         })
                                                       }
                                                       placeholder="% ítem"
-                                                      min={0}
-                                                      max={100}
-                                                      step={0.5}
                                                       inputMode="decimal"
                                                       aria-label={`Editar ítem ${index + 1} porcentaje`}
                                                       title="Porcentaje del subtotal para este ítem."
@@ -2824,11 +2920,22 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     placeholder="Buscar producto…"
                     options={props.products
                       .filter((row) => row.is_active)
-                      .map((row) => ({
-                        value: row.id,
-                        label: row.name,
-                        description: `Stock: ${row.stock_qty}`,
-                      }))}
+                      .map((row) => {
+                        const line = sameEmployeeProductLine(
+                          itemDialogTarget === "edit" ? editItems : items,
+                          row.id,
+                          itemDraft.employee_id,
+                        );
+                        const where = itemDialogTarget === "edit" ? "la edición" : "la factura";
+                        return {
+                          value: row.id,
+                          label: row.name,
+                          description:
+                            line == null
+                              ? `Stock: ${row.stock_qty}`
+                              : `Stock: ${row.stock_qty} · ya está en ${where}, fila ${line}`,
+                        };
+                      })}
                     ariaLabel="Producto del ítem"
                     filterPlaceholder="Escriba para filtrar…"
                   />
@@ -2890,7 +2997,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   <input
                     className={paperInputClass}
                     value={itemDraft.qty}
-                    onChange={(event) => patchDraft({ qty: event.target.value })}
+                    onChange={(event) => patchDraft({ qty: stripQuantityInput(event.target.value) })}
                     placeholder="1"
                     inputMode="numeric"
                   />
@@ -2935,19 +3042,16 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       <label className="flex flex-col gap-1 text-sm font-medium">
                         Valor de la comisión ($)
                         <input
-                          type="number"
                           className={paperInputClass}
-                          value={itemDraft.commission_value ?? ""}
+                          value={formatMoneyInput(itemDraft.commission_value == null ? "" : String(itemDraft.commission_value))}
                           onChange={(event) =>
                             patchDraft({
                               commission_value:
-                                event.target.value === "" ? null : Number(event.target.value),
+                                event.target.value.trim() === "" ? null : Number(stripMoneyInput(event.target.value)),
                             })
                           }
                           placeholder="Ej. 10000"
-                          min={0}
-                          step={100}
-                          inputMode="decimal"
+                          inputMode="numeric"
                         />
                       </label>
                       <p className="text-xs text-paper-ink-muted">
@@ -2986,19 +3090,16 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       <label className="flex flex-col gap-1 text-sm font-medium">
                         Valor de la comisión ($)
                         <input
-                          type="number"
                           className={paperInputClass}
-                          value={itemDraft.commission_value ?? ""}
+                          value={formatMoneyInput(itemDraft.commission_value == null ? "" : String(itemDraft.commission_value))}
                           onChange={(event) =>
                             patchDraft({
                               commission_value:
-                                event.target.value === "" ? null : Number(event.target.value),
+                                event.target.value.trim() === "" ? null : Number(stripMoneyInput(event.target.value)),
                             })
                           }
                           placeholder="Ej. 10000"
-                          min={0}
-                          step={100}
-                          inputMode="decimal"
+                          inputMode="numeric"
                         />
                       </label>
                       <p className="text-xs text-paper-ink-muted">
@@ -3011,19 +3112,15 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       <label className="flex flex-col gap-1 text-sm font-medium">
                         Porcentaje para este ítem (%)
                         <input
-                          type="number"
                           className={paperInputClass}
                           value={itemDraft.commission_percent_override ?? ""}
                           onChange={(event) =>
                             patchDraft({
                               commission_percent_override:
-                                event.target.value === "" ? null : Number(event.target.value),
+                                event.target.value === "" ? null : Number(stripPercentageInput(event.target.value)),
                             })
                           }
                           placeholder="Ej. 15"
-                          min={0}
-                          max={100}
-                          step={0.5}
                           inputMode="decimal"
                         />
                       </label>
