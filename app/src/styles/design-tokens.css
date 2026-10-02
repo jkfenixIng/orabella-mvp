@@ -44,7 +44,7 @@
   --color-primary-300: oklch(0.77 0.11 250);
   --color-primary-400: oklch(0.72 0.11 250);
   --color-primary-500: oklch(0.55 0.14 250);
-  --color-primary-600: oklch(0.50 0.125 250);
+  --color-primary-600: oklch(0.50 0.105 250);
   --color-primary-700: oklch(0.44 0.11 250);
   --color-primary-800: oklch(0.31 0.078 250);
   --color-primary-900: oklch(0.25 0.063 250);
@@ -66,9 +66,9 @@
   --color-success-100: oklch(0.93 0.03 160);
   --color-success-200: oklch(0.86 0.06 160);
   --color-success-300: oklch(0.77 0.1 160);
-  --color-success-400: oklch(0.65 0.132 160);
+  --color-success-400: oklch(0.66 0.105 160);
   --color-success-500: oklch(0.55 0.111 160);
-  --color-success-600: oklch(0.45 0.091 160);
+  --color-success-600: oklch(0.45 0.075 160);
   --color-success-700: oklch(0.36 0.073 160);
   --color-success-800: oklch(0.29 0.059 160);
   --color-success-900: oklch(0.24 0.048 160);
@@ -81,9 +81,9 @@
   --color-warning-100: oklch(0.96 0.02 50);
   --color-warning-200: oklch(0.90 0.052 50);
   --color-warning-300: oklch(0.82 0.10 50);
-  --color-warning-400: oklch(0.71 0.17 50);
+  --color-warning-400: oklch(0.72 0.13 50);
   --color-warning-500: oklch(0.61 0.145 50);
-  --color-warning-600: oklch(0.50 0.118 50);
+  --color-warning-600: oklch(0.50 0.095 50);
   --color-warning-700: oklch(0.41 0.097 50);
   --color-warning-800: oklch(0.33 0.078 50);
   --color-warning-900: oklch(0.27 0.07 50);
@@ -93,9 +93,9 @@
   --color-error-100: oklch(0.93 0.03 25);
   --color-error-200: oklch(0.86 0.06 25);
   --color-error-300: oklch(0.77 0.12 25);
-  --color-error-400: oklch(0.65 0.18 25);
+  --color-error-400: oklch(0.66 0.14 25);
   --color-error-500: oklch(0.55 0.2 25);
-  --color-error-600: oklch(0.45 0.164 25);
+  --color-error-600: oklch(0.45 0.135 25);
   --color-error-700: oklch(0.36 0.131 25);
   --color-error-800: oklch(0.29 0.105 25);
   --color-error-900: oklch(0.24 0.08 25);
@@ -220,7 +220,7 @@
   --color-primary-100: oklch(0.93 0.02 250);
   --color-primary-200: oklch(0.86 0.06 250);
   --color-primary-300: oklch(0.77 0.11 250);
-  --color-primary-400: oklch(0.65 0.16 250);
+  --color-primary-400: oklch(0.66 0.125 250);
   --color-primary-500: oklch(0.55 0.14 250);
   /* En oscuro la escala numérica va de claro a oscuro al revés que en claro:
      los peldaños 600/700 se usan como FONDO de botón con texto blanco, así que
