@@ -177,14 +177,11 @@ export interface EmployeeRow {
    * `null` es «sin cadencia definida»: el fijo se prorratea por los días del
    * período, que es el comportamiento de hoy.
    *
-   * OPCIONAL en el TIPO a propósito: la columna existe y `EMPLOYEE_SELECT` la
-   * trae SIEMPRE, pero el camino de lectura de la nómina todavía no la usa (la
-   * fracción del fijo es la unidad de CÁLCULO) y sus pruebas arman el legajo sin
-   * ella; declararla requerida obligaría a tocar otro módulo en esta unidad. El
-   * valor real de la fila llega igual, y la guarda de fuente del `select` lo
-   * fija.
+   * REQUERIDA: `EMPLOYEE_SELECT` la trae siempre, así que el tipo no puede
+   * mentir dejándola opcional. Una fila sin la clave sería un legajo leído con
+   * un `select` incompleto, no un caso válido.
    */
-  pay_frequency?: string | null;
+  pay_frequency: string | null;
   salary_fixed: number | null;
   commission_percent: number | null;
   is_active: boolean;
