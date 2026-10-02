@@ -2223,7 +2223,23 @@ export function PayrollClient(props: PayrollClientProps) {
                 {periods.length === 0 ? (
                   // VACÍO dentro del diálogo: describe lo esperado (el primero
                   // de la lista), no bloquea nada y nunca anunció nada.
-                  <p className="mt-1">Sin períodos todavía: este será el primero.</p>
+                  <>
+                    <p className="mt-1">Sin períodos todavía: este será el primero.</p>
+                    {/* F5: la PRIMERA liquidación (la sede todavía no tiene
+                        períodos) suele cubrir solo los días desde que arrancó
+                        el negocio. El rango corto es válido: el sistema
+                        prorratea el ciclo parcial y lo que falte para completar
+                        el ciclo se carga en los ajustes por empleado que YA
+                        existen en el borrador (bonos u otros descuentos), sin
+                        campos ni columnas nuevas. Es una nota informativa: va
+                        en texto plano, como los otros vacíos del diálogo. */}
+                    <p className="mt-1">
+                      La primera liquidación suele ser un rango corto, desde el día en que
+                      arrancaron: el sistema prorratea esos días. Si quieren completar el ciclo,
+                      carguen el complemento como bono u otro descuento por empleado en el
+                      borrador.
+                    </p>
+                  </>
                 ) : (
                   <>
                     <p className="mt-1">

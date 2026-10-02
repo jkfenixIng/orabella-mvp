@@ -22,6 +22,8 @@ import {
   computeLineCommission,
   computeNetPay,
   correctPayrollPeriodSchema,
+  cycleDaysForFrequency,
+  cycleProrationFactor,
   daysInMonthWithinRange,
   detailLineCommissionOrigin,
   fixedFractionForFrequency,
@@ -34,6 +36,7 @@ import {
   normalizePerDayLimits,
   openPeriodSchema,
   overlapBlocksDeletion,
+  PAY_CYCLE_DAYS,
   payPayrollItemSchema,
   payrollEmployeeName,
   payrollExtraGuide,
@@ -44,6 +47,7 @@ import {
   payFrequencySchema,
   periodCadenceBucket,
   periodExcludesEmployeeByCadence,
+  periodRangeDays,
   prorateFixedSalary,
   rangesOverlap,
   resolveFixedSalaryForPeriod,
@@ -4254,13 +4258,13 @@ describe("payroll: la fracción del fijo por cadencia (F3, función pura)", () =
     employeeFrequency: string | null | undefined,
     periodFrequency: string | null | undefined,
     salaryFixed: number | null = SALARY,
+    range: { startDate: string; endDate: string } = { startDate: "2026-09-01", endDate: "2026-09-07" },
   ) =>
     resolveFixedSalaryForPeriod({
       salaryFixed,
       employeeFrequency,
       periodFrequency,
-      startDate: "2026-09-01",
-      endDate: "2026-09-07",
+      ...range,
     });
 
   it("la tabla del dueño: semanal 1/4, quincenal 1/2, mensual 1, sin cadencia null", () => {
@@ -4276,10 +4280,15 @@ describe("payroll: la fracción del fijo por cadencia (F3, función pura)", () =
     expect(payFrequencySchema.safeParse("anual").success).toBe(false);
   });
 
-  it("con la MISMA cadencia paga mensual × fracción, no los días del rango", () => {
+  it("con la MISMA cadencia y el ciclo COMPLETO paga mensual × fracción, no los días del rango", () => {
+    // F5: la fracción del dueño paga un ciclo COMPLETO. El rango de 7 días de
+    // septiembre es el ciclo natural del semanal, pero es un ciclo PARCIAL del
+    // quincenal (15) y del mensual (30): por eso cada caso usa SU ciclo natural
+    // y los montos de la tabla del dueño (375.000 / 750.000 / 1.500.000) siguen
+    // enteros. Los ciclos parciales tienen su propio bloque más abajo.
     expect(resolve("semanal", "semanal")).toEqual({ amount: 375_000, basis: "cadence", fraction: 1 / 4 });
-    expect(resolve("quincenal", "quincenal").amount).toBe(750_000);
-    expect(resolve("mensual", "mensual").amount).toBe(1_500_000);
+    expect(resolve("quincenal", "quincenal", SALARY, { startDate: "2026-09-01", endDate: "2026-09-15" }).amount).toBe(750_000);
+    expect(resolve("mensual", "mensual", SALARY, { startDate: "2026-09-01", endDate: "2026-09-30" }).amount).toBe(1_500_000);
     // La semana de 7 días de septiembre daría 350.000 por días: la cadencia manda.
     const byDays = prorateFixedSalary({ salaryFixed: SALARY, startDate: "2026-09-01", endDate: "2026-09-07" });
     expect(byDays).toBe(350_000);
@@ -4313,6 +4322,127 @@ describe("payroll: la fracción del fijo por cadencia (F3, función pura)", () =
   it("sin sueldo no hay base que fraccionar", () => {
     expect(resolve("semanal", "semanal", null).amount).toBe(0);
     expect(resolve("semanal", "semanal", 0).amount).toBe(0);
+  });
+});
+
+describe("payroll: la primera nómina prorratea el ciclo PARCIAL (F5, función pura)", () => {
+  const SALARY = 1_500_000;
+  /** Fijo resuelto del período; el empleado comparte la cadencia salvo que se diga otra. */
+  const resolve = (
+    periodFrequency: string | null | undefined,
+    startDate: string,
+    endDate: string,
+    employeeFrequency: string | null | undefined = periodFrequency,
+  ) =>
+    resolveFixedSalaryForPeriod({
+      salaryFixed: SALARY,
+      employeeFrequency,
+      periodFrequency,
+      startDate,
+      endDate,
+    });
+  /** La identidad de `payroll_items`, en cada caso (sin comisiones ni vales acá). */
+  const expectIdentity = (amount: number, bonuses = 0, vales = 0, otherDiscounts = 0) => {
+    expect(computeNetPay({ baseFixed: amount, commissions: 0, bonuses, vales, otherDiscounts })).toBe(
+      amount + bonuses - vales - otherDiscounts,
+    );
+  };
+
+  it("el caso concreto del dueño: mensual 1.500.000, semanal y un período de 4 días", () => {
+    // 1.500.000 / 4 × 4/7 = 214.285,71 → 214.286 (redondeo ÚNICO, peso entero).
+    const resolution = resolve("semanal", "2026-10-01", "2026-10-04");
+    expect(resolution).toEqual({ amount: 214_286, basis: "cadence", fraction: 1 / 4 });
+    expectIdentity(resolution.amount);
+  });
+
+  it("ciclos parciales de quincenal y mensual sobre la misma base comercial", () => {
+    // Quincenal: 1.500.000 / 2 × 10/15 = 500.000.
+    const quincenal = resolve("quincenal", "2026-10-01", "2026-10-10");
+    expect(quincenal.amount).toBe(500_000);
+    expect(quincenal.basis).toBe("cadence");
+    expectIdentity(quincenal.amount);
+    // Mensual: 1.500.000 × 20/30 = 1.000.000.
+    const mensual = resolve("mensual", "2026-10-01", "2026-10-20");
+    expect(mensual.amount).toBe(1_000_000);
+    expect(mensual.basis).toBe("cadence");
+    expectIdentity(mensual.amount);
+  });
+
+  it("el ciclo COMPLETO no cambia para las tres cadencias", () => {
+    const semanal = resolve("semanal", "2026-10-01", "2026-10-07").amount;
+    const quincenal = resolve("quincenal", "2026-10-01", "2026-10-15").amount;
+    const mensual = resolve("mensual", "2026-10-01", "2026-10-30").amount;
+    expect(semanal).toBe(375_000);
+    expect(quincenal).toBe(750_000);
+    expect(mensual).toBe(1_500_000);
+    expectIdentity(semanal, 10_000, 5_000, 2_000);
+    expectIdentity(quincenal);
+    expectIdentity(mensual);
+  });
+
+  it("un rango MÁS LARGO que el ciclo se topa en la fracción entera, nunca más", () => {
+    // 31 días de enero: el semanal paga 1/4, no 31/7 × 1/4; tampoco el mensual
+    // paga 31/30 de la fracción. El tope es el ciclo completo.
+    const semanal = resolve("semanal", "2026-01-01", "2026-01-31").amount;
+    const quincenal = resolve("quincenal", "2026-01-01", "2026-01-31").amount;
+    const mensual = resolve("mensual", "2026-01-01", "2026-01-31").amount;
+    expect(semanal).toBe(375_000);
+    expect(quincenal).toBe(750_000);
+    expect(mensual).toBe(1_500_000);
+    expectIdentity(semanal);
+    expectIdentity(quincenal);
+    expectIdentity(mensual);
+    expect(cycleProrationFactor({ frequency: "semanal", startDate: "2026-01-01", endDate: "2026-01-31" })).toBe(1);
+  });
+
+  it("el factor puro: días del ciclo, días del rango y su cociente", () => {
+    expect(cycleDaysForFrequency("semanal")).toBe(7);
+    expect(cycleDaysForFrequency("quincenal")).toBe(15);
+    expect(cycleDaysForFrequency("mensual")).toBe(30);
+    expect(cycleDaysForFrequency(null)).toBeNull();
+    expect(cycleDaysForFrequency("anual")).toBeNull();
+    expect(PAY_CYCLE_DAYS).toEqual({ semanal: 7, quincenal: 15, mensual: 30 });
+    // El rango cuenta los DOS extremos y un rango imposible no inventa días.
+    expect(periodRangeDays("2026-10-01", "2026-10-04")).toBe(4);
+    expect(periodRangeDays("2026-10-01", "2026-10-01")).toBe(1);
+    expect(periodRangeDays("2026-10-04", "2026-10-01")).toBeNull();
+    expect(cycleProrationFactor({ frequency: "semanal", startDate: "2026-10-01", endDate: "2026-10-04" })).toBeCloseTo(4 / 7, 12);
+    // Sin cadencia no hay ciclo: el factor es 1 y la rama prorrateada manda.
+    expect(cycleProrationFactor({ frequency: null, startDate: "2026-10-01", endDate: "2026-10-04" })).toBe(1);
+  });
+
+  it("sin cadencia en cualquiera de los dos lados el prorrateo por días queda intacto", () => {
+    const byDays = prorateFixedSalary({ salaryFixed: SALARY, startDate: "2026-10-01", endDate: "2026-10-04" });
+    const pairs: Array<[string | null | undefined, string | null | undefined]> = [
+      [null, null],
+      [null, "semanal"],
+      ["semanal", null],
+      [undefined, undefined],
+      ["anual", "semanal"],
+    ];
+    for (const [employeeFrequency, periodFrequency] of pairs) {
+      const resolution = resolve(periodFrequency, "2026-10-01", "2026-10-04", employeeFrequency);
+      expect(resolution.basis, `${String(employeeFrequency)}/${String(periodFrequency)}`).toBe("prorated");
+      expect(resolution.amount, `${String(employeeFrequency)}/${String(periodFrequency)}`).toBe(byDays);
+      expectIdentity(resolution.amount);
+    }
+  });
+
+  it("la exclusión por cadencia distinta y la regla del mixto siguen igual", () => {
+    // Exclusión (F4): con cadencia distinta el fijo es 0, sin importar el ciclo.
+    expect(resolve("semanal", "2026-10-01", "2026-10-04", "quincenal")).toEqual({
+      amount: 0,
+      basis: "other-cadence",
+      fraction: 1 / 4,
+    });
+    // Mixto (F3): el básico PRORRATEADO compite contra los porcentajes de servicios.
+    const base = resolve("semanal", "2026-10-01", "2026-10-04").amount; // 214.286
+    const over = resolveMixedBlock({ baseFixed: base, fixedCommissions: 0, servicePercent: 400_000 });
+    expect(base + over.commissions).toBe(400_000);
+    const below = resolveMixedBlock({ baseFixed: base, fixedCommissions: 0, servicePercent: 100_000 });
+    expect(base + below.commissions).toBe(base);
+    // La identidad se sostiene con los dos bloques y con descuentos.
+    expectIdentity(base + over.commissions, 50_000, 20_000, 10_000);
   });
 });
 

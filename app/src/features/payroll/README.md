@@ -130,7 +130,9 @@ se cuenta como 4 semanas):
 | `quincenal`          | `1/2`    | 750.000                                  |
 | `mensual`            | `1`      | 1.500.000                                |
 
-- **Coinciden**: el fijo es `mensual × fracción`, sin mirar los días del rango.
+- **Coinciden**: el fijo es `mensual × fracción` sobre el ciclo completo; si el
+  rango del período es MÁS CORTO que ese ciclo, la fracción se prorratea (F5,
+  ver abajo).
 - **Difieren**: el empleado queda **FUERA del período entero** (F4): no se le
   arma ítem, no se le liquidan comisiones y sus facturas del rango no entran a
   ninguna parte. Lo paga su propio ciclo y pagarlo en los dos lo pagaría dos
@@ -142,6 +144,50 @@ se cuenta como 4 semanas):
 - **Consecuencia aceptada por el dueño (2026-10-01)**: `1/4` por semana paga
   ≈ 13 sueldos al año (52,14 semanas), no 12. El mes comercial de 30 días es lo
   que produce esa cuenta; no se reabre la decisión.
+
+### Prorrateo del ciclo parcial y primera nómina (F5)
+
+La plataforma se entrega a mitad de semana, así que la primera liquidación cubre
+solo unos pocos días (el caso real: 4). Con la fracción entera, un empleado
+semanal cobraría un ciclo COMPLETO por 4 días: un sobrepago. Por eso, cuando las
+dos cadencias coinciden y el rango del período es más corto que el ciclo natural
+de la cadencia, la fracción se escala:
+
+```
+fijo = mensual × fracción × (días del período / días del ciclo)
+```
+
+Los días del ciclo salen del MISMO mes comercial de 30 días de la fracción:
+semanal = 7, quincenal = 15, mensual = 30. El redondeo es UNO solo, a peso
+entero (`roundMoney`), como todo el módulo.
+
+| Cadencia   | Ciclo | Período de ejemplo | Fijo (mensual 1.500.000)         |
+| ---------- | ----- | ------------------ | -------------------------------- |
+| `semanal`  | 7     | 4 días             | `1.500.000 / 4 × 4/7 = 214.286`   |
+| `quincenal`| 15    | 10 días            | `1.500.000 / 2 × 10/15 = 500.000` |
+| `mensual`  | 30    | 20 días            | `1.500.000 × 20/30 = 1.000.000`   |
+
+- **Ciclo completo sin cambios**: un rango de 7, 15 o 30 días paga `375.000`,
+  `750.000` y `1.500.000` respectivamente; el prorrateo no toca el ciclo entero.
+- **Tope del ciclo**: si el rango alcanza o pasa el ciclo, la fracción se topa
+  en el ciclo completo (`1/4`, `1/2`, `1`) y NUNCA paga más de un ciclo. Un
+  período de un mes natural (28…31 días) paga el ciclo entero, no `31/30` de la
+  fracción. Para pagar dos ciclos harían falta dos períodos.
+- **Sin cadencia**: si falta la del período o la del empleado, rige el
+  prorrateo por días calendario de siempre (`prorateFixedSalary`), intacto; la
+  exclusión por cadencia distinta (F4) y la regla del mixto tampoco cambian.
+- **El complemento se carga con lo que YA existe**: si el negocio quiere pagar
+  igual el primer ciclo completo, la diferencia va en los ajustes por empleado
+  del borrador (`bonuses` / `other_discounts`, PAY-02). No hay campo, columna ni
+  migración nuevos, y la identidad de `payroll_items` no se mueve.
+- **En pantalla**: al abrir el primer período de una sede (sin períodos
+  previos), el diálogo "Abrir período" avisa en texto plano que la primera
+  liquidación suele ser un rango corto desde el día en que arrancaron y que el
+  complemento va en los ajustes por empleado del borrador.
+
+Las funciones puras del prorrateo viven en `schemas.ts` (`PAY_CYCLE_DAYS`,
+`cycleDaysForFrequency`, `periodRangeDays`, `cycleProrationFactor`) y
+`resolveFixedSalaryForPeriod` las aplica.
 
 ### Regla del mixto
 

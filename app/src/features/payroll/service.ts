@@ -1723,15 +1723,18 @@ async function computePayrollLines(args: {
     }
 
     const payload = payableRoster.map((employee) => {
-      // F3/F4: la cadencia del PERÍODO decide el fijo (decisión del dueño,
+      // F3/F4/F5: la cadencia del PERÍODO decide el fijo (decisión del dueño,
       // 2026-10-01). Si falta la cadencia del período o la del empleado, sigue
       // rigiendo el prorrateo por días de hoy; si coinciden, el fijo es
-      // `mensual × fracción` (1/4, 1/2, 1) sobre el mes comercial de 30 días.
-      // El empleado que tiene OTRA cadencia ya NO llega acá: `payableRoster` lo
-      // excluyó arriba (`periodExcludesEmployeeByCadence`), porque su ciclo es el
-      // que lo paga. Todo esto vive en la función pura
-      // `resolveFixedSalaryForPeriod`, que también dice en `basis` cuál de las
-      // tres reglas se aplicó. Un `porcentaje` no cobra fijo: no hay fracción.
+      // `mensual × fracción` (1/4, 1/2, 1) sobre el mes comercial de 30 días,
+      // con el ciclo PARCIAL prorrateado por `días del período / días del ciclo`
+      // y topado en la fracción entera cuando el rango alcanza o pasa el ciclo
+      // (la primera liquidación suele ser un rango corto). El empleado que tiene
+      // OTRA cadencia ya NO llega acá: `payableRoster` lo excluyó arriba
+      // (`periodExcludesEmployeeByCadence`), porque su ciclo es el que lo paga.
+      // Todo esto vive en la función pura `resolveFixedSalaryForPeriod`, que
+      // también dice en `basis` cuál de las tres reglas se aplicó. Un
+      // `porcentaje` no cobra fijo: no hay fracción.
       const fixedResolution =
         employee.pay_type === "fijo" || employee.pay_type === "mixto"
           ? resolveFixedSalaryForPeriod({

@@ -771,6 +771,67 @@ export function fixedFractionForFrequency(frequency: string | null | undefined):
 }
 
 /**
+ * F5: días del ciclo NATURAL de cada cadencia sobre el MISMO mes comercial de
+ * 30 días que ya fija `fixedFractionForFrequency`: semanal = 7, quincenal = 15,
+ * mensual = 30. Es la unidad con la que se prorratea el ciclo parcial de la
+ * primera nómina (`1.500.000 / 4 × 4/7 = 214.286`): la fracción del dueño paga
+ * un ciclo COMPLETO, y un período más corto paga la parte proporcional de ese
+ * ciclo. Sin cadencia no hay ciclo (`null`): rige el prorrateo por días de hoy.
+ */
+export const PAY_CYCLE_DAYS: Record<PayFrequency, number> = {
+  semanal: 7,
+  quincenal: 15,
+  mensual: 30,
+};
+
+/** F5: días del ciclo de una cadencia, o `null` cuando no hay cadencia definida. */
+export function cycleDaysForFrequency(frequency: string | null | undefined): number | null {
+  const normalized = normalizePayFrequency(frequency);
+  return normalized === null ? null : PAY_CYCLE_DAYS[normalized];
+}
+
+/**
+ * F5: días que cubre `[startDate, endDate]` contando los DOS extremos (el mismo
+ * rango inclusivo del período). Un rango imposible devuelve `null`: el llamador
+ * decide, y en la ruta de cadencia eso conserva el comportamiento de hoy.
+ */
+export function periodRangeDays(startDate: string, endDate: string): number | null {
+  const start = utcDayOf(startDate);
+  const end = utcDayOf(endDate);
+  if (start === null || end === null || end < start) return null;
+  return (end - start) / DAY_MS + 1;
+}
+
+/**
+ * F5: factor con el que se escala la fracción de la cadencia cuando el período
+ * cubre un ciclo PARCIAL (la primera liquidación suele ser un rango corto, desde
+ * el día en que arrancó el negocio).
+ *
+ *  - Rango MÁS CORTO que el ciclo natural → `días del período / días del ciclo`
+ *    (semanal 4 días → `4/7`).
+ *  - Rango IGUAL o MÁS LARGO → `1`: se paga el ciclo completo y NUNCA más de
+ *    uno. Un período de un mes natural (28…31 días) no puede pagar 31/30 de una
+ *    fracción: el tope evita que un rango que se pasa por uno o dos días pague
+ *    de más. Si se quisiera pagar dos ciclos, serían dos períodos.
+ *  - Sin cadencia o con un rango imposible → `1`, que deja la fracción como
+ *    estaba (esa rama la gobierna `basis = "prorated"`).
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function cycleProrationFactor(args: {
+  frequency: string | null | undefined;
+  startDate: string;
+  endDate: string;
+}): number {
+  const cycleDays = cycleDaysForFrequency(args.frequency);
+  const rangeDays = periodRangeDays(args.startDate, args.endDate);
+  if (cycleDays === null || rangeDays === null) return 1;
+  // TOPE del ciclo: un rango más largo que el ciclo no paga más de la fracción.
+  if (rangeDays >= cycleDays) return 1;
+  return rangeDays / cycleDays;
+}
+
+/**
  * F3: cómo se resolvió el fijo de un período. `basis` hace EXPLÍCITA la regla
  * aplicada en vez de dejarla deducir del monto:
  *  - "cadence": el período y el empleado comparten cadencia; el fijo es
@@ -798,7 +859,12 @@ export interface FixedSalaryResolution {
  *    días calendario. Ningún camino existente cambia mientras la cadencia no
  *    esté definida.
  *  - Si las dos cadencias coinciden, el fijo es `mensual × fracción` (1/4, 1/2,
- *    1) sobre el mes comercial de 30 días, sin mirar los días del rango.
+ *    1) sobre el mes comercial de 30 días. Si el rango cubre un ciclo PARCIAL
+ *    (F5: la primera liquidación suele ser corta), la fracción se escala por
+ *    `días del período / días del ciclo`; si el rango llega al ciclo completo o
+ *    lo pasa, se topa en la fracción entera y nunca paga más de un ciclo. El
+ *    redondeo es UNO solo, a peso entero (`roundMoney`), igual que todo el
+ *    módulo.
  *  - Si el empleado tiene OTRA cadencia, en este período cobra 0 fijo: lo paga
  *    su propio ciclo, y pagarlo acá también lo pagaría dos veces.
  *
@@ -832,7 +898,15 @@ export function resolveFixedSalaryForPeriod(args: {
   if (employeeFrequency !== periodFrequency) {
     return { amount: 0, basis: "other-cadence", fraction };
   }
-  return { amount: roundMoney(salary * (fraction ?? 0)), basis: "cadence", fraction };
+  // F5: la fracción paga un ciclo COMPLETO; el ciclo parcial se prorratea. El
+  // `fraction` que se devuelve sigue siendo el de la cadencia (1/4, 1/2, 1) y el
+  // prorrateo del rango ya viene aplicado en `amount`.
+  const proration = cycleProrationFactor({
+    frequency: periodFrequency,
+    startDate: args.startDate,
+    endDate: args.endDate,
+  });
+  return { amount: roundMoney(salary * (fraction ?? 0) * proration), basis: "cadence", fraction };
 }
 
 /**
