@@ -1,10 +1,11 @@
 # Módulo `alerts` — bandeja del admin
 
 Las alertas son filas de `audit_logs` con acciones del conjunto de alerta
-(`ALERT_ACTIONS` en `schemas.ts`: desajustes de caja, cuenta bloqueada,
-comisión pagada, vale solicitado y **el residuo de un alta cuya compensación
-también falló**, `auth.user_create_rollback_failed`). El resto de la auditoría no
-avisa.
+(`ALERT_ACTIONS` en `schemas.ts`: desajustes de caja, cuenta bloqueada, vale
+solicitado y **el residuo de un alta cuya compensación también falló**,
+`auth.user_create_rollback_failed`). El resto de la auditoría no avisa: la
+comisión pagada se audita (`payroll.commission_paid`) pero no es alerta, porque
+es un evento rutinario que no pide ninguna acción del admin.
 
 - Migración `011_alert_inbox.sql`: `is_read`/`read_at` en `audit_logs` +
   índice de sin leer por sede. Sin cambios a RLS (la app opera con
