@@ -75,6 +75,8 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
   const [result, setResult] = useState<AlertsResult>(initial);
   const [unreadOnly, setUnreadOnly] = useState(true);
   const [module, setModule] = useState<"caja" | "acceso" | undefined>(undefined);
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [isViewPending, startViewTransition] = useTransition();
@@ -84,7 +86,13 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
 
   const pageCount = Math.max(1, Math.ceil(result.total / result.pageSize));
 
-  function fetchAlerts(page: number, unread: boolean, mod: "caja" | "acceso" | undefined): void {
+  function fetchAlerts(
+    page: number,
+    unread: boolean,
+    mod: "caja" | "acceso" | undefined,
+    from: string,
+    to: string,
+  ): void {
     startViewTransition(async () => {
       setBusy(true);
       try {
@@ -92,6 +100,8 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
           unreadOnly: unread,
           page,
           module: mod,
+          from: from === "" ? undefined : from,
+          to: to === "" ? undefined : to,
         });
         if (!fetched.success) {
           setError(fetched.message);
@@ -101,6 +111,8 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
         setResult(fetched.data);
         setUnreadOnly(unread);
         setModule(mod);
+        setDateFrom(from);
+        setDateTo(to);
       } finally {
         setBusy(false);
       }
@@ -122,7 +134,7 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
       setError(null);
       setReviewingId(null);
       setReviewNote("");
-      fetchAlerts(result.page, unreadOnly, module);
+      fetchAlerts(result.page, unreadOnly, module, dateFrom, dateTo);
       // La insignia del menú vive en el layout (servidor): refrescarla.
       router.refresh();
     } finally {
@@ -141,53 +153,54 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
       )}
 
       <section className={sectionClass} aria-busy={isViewPending}>
-        <div className="flex flex-wrap items-center gap-2">
-          <span className={mutedTextClass}>Estado:</span>
-          <button
-            type="button"
-            className={ghostClass}
-            aria-pressed={!unreadOnly}
-            disabled={busy || isViewPending}
-            onClick={() => fetchAlerts(1, false, module)}
-          >
-            Todas
-          </button>
+        <div className="flex flex-wrap items-end gap-3">
+          <label className={labelClass}>
+            Módulo
+            <select
+              value={module ?? ""}
+              disabled={busy || isViewPending}
+              onChange={(event) => {
+                const next =
+                  event.target.value === ""
+                    ? undefined
+                    : (event.target.value as "caja" | "acceso");
+                fetchAlerts(1, unreadOnly, next, dateFrom, dateTo);
+              }}
+              className={inputClass}
+            >
+              <option value="">Todos</option>
+              <option value="caja">Caja</option>
+              <option value="acceso">Acceso</option>
+            </select>
+          </label>
+          <label className={labelClass}>
+            Desde
+            <input
+              type="date"
+              value={dateFrom}
+              disabled={busy || isViewPending}
+              onChange={(event) => fetchAlerts(1, unreadOnly, module, event.target.value, dateTo)}
+              className={inputClass}
+            />
+          </label>
+          <label className={labelClass}>
+            Hasta
+            <input
+              type="date"
+              value={dateTo}
+              disabled={busy || isViewPending}
+              onChange={(event) => fetchAlerts(1, unreadOnly, module, dateFrom, event.target.value)}
+              className={inputClass}
+            />
+          </label>
           <button
             type="button"
             className={ghostClass}
             aria-pressed={unreadOnly}
             disabled={busy || isViewPending}
-            onClick={() => fetchAlerts(1, true, module)}
+            onClick={() => fetchAlerts(1, !unreadOnly, module, dateFrom, dateTo)}
           >
             Sin leer
-          </button>
-          <span className={cn("ml-2", mutedTextClass)}>Módulo:</span>
-          <button
-            type="button"
-            className={ghostClass}
-            aria-pressed={module === undefined}
-            disabled={busy || isViewPending}
-            onClick={() => fetchAlerts(1, unreadOnly, undefined)}
-          >
-            Todos
-          </button>
-          <button
-            type="button"
-            className={ghostClass}
-            aria-pressed={module === "caja"}
-            disabled={busy || isViewPending}
-            onClick={() => fetchAlerts(1, unreadOnly, "caja")}
-          >
-            Caja
-          </button>
-          <button
-            type="button"
-            className={ghostClass}
-            aria-pressed={module === "acceso"}
-            disabled={busy || isViewPending}
-            onClick={() => fetchAlerts(1, unreadOnly, "acceso")}
-          >
-            Acceso
           </button>
         </div>
 
@@ -282,7 +295,7 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
               type="button"
               className={ghostClass}
               disabled={result.page <= 1 || busy || isViewPending}
-              onClick={() => fetchAlerts(result.page - 1, unreadOnly, module)}
+              onClick={() => fetchAlerts(result.page - 1, unreadOnly, module, dateFrom, dateTo)}
             >
               Anterior
             </button>
@@ -293,7 +306,7 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
               type="button"
               className={ghostClass}
               disabled={result.page >= pageCount || busy || isViewPending}
-              onClick={() => fetchAlerts(result.page + 1, unreadOnly, module)}
+              onClick={() => fetchAlerts(result.page + 1, unreadOnly, module, dateFrom, dateTo)}
             >
               Siguiente
             </button>

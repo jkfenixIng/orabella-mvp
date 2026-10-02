@@ -24,13 +24,15 @@ function toFailure(error: unknown): { success: false; code: string; message: str
 }
 
 /** Misma lógica que GET /api/v1/alerts (solo admin). */
-export async function getAlertsAction(input: { unreadOnly?: boolean; page?: number; module?: "caja" | "acceso"; sede_id?: string }) {
+export async function getAlertsAction(input: { unreadOnly?: boolean; page?: number; module?: "caja" | "acceso"; from?: string; to?: string; sede_id?: string }) {
   try {
     const session = await requireAdminSession(await sessionToken());
     const data = await listAlerts(resolveSede(session.sedeId, input.sede_id), {
       unreadOnly: input.unreadOnly,
       page: input.page,
       module: input.module,
+      from: input.from || undefined,
+      to: input.to || undefined,
     });
     return { success: true as const, data };
   } catch (error) {

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { dayBounds } from "@/src/shared/lib/dates";
 
 /**
  * Acción del residuo de un alta de usuario cuya compensación también falló
@@ -47,12 +48,41 @@ export type AlertModule = keyof typeof ALERT_MODULES;
 /** Página fija de la bandeja (igual que el historial de caja). */
 export const ALERTS_PAGE_SIZE = 10;
 
-export const alertsQuerySchema = z.object({
-  unreadOnly: z.boolean().default(false),
-  page: z.coerce.number().int().min(1).default(1),
-  module: z.enum(["caja", "acceso"]).optional(),
-});
+/** Fecha calendario (yyyy-mm-dd) para el filtro de la bandeja. */
+const alertDateString = (message: string): z.ZodString =>
+  z
+    .string()
+    .trim()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, message);
+
+export const alertsQuerySchema = z
+  .object({
+    unreadOnly: z.boolean().default(false),
+    page: z.coerce.number().int().min(1).default(1),
+    module: z.enum(["caja", "acceso"]).optional(),
+    from: alertDateString("Fecha inicial inválida (use yyyy-mm-dd).").optional(),
+    to: alertDateString("Fecha final inválida (use yyyy-mm-dd).").optional(),
+  })
+  .superRefine((value, context) => {
+    // Igual que el historial de caja: rango invertido se rechaza por el
+    // camino de validación existente (AlertError VALIDATION, 400).
+    if (value.from && value.to && value.from > value.to) {
+      context.addIssue({ code: "custom", message: "El rango de fechas es inválido." });
+    }
+  });
 export type AlertsQueryInput = z.infer<typeof alertsQuerySchema>;
+
+/**
+ * Ventana inclusiva (timestamptz, hora de Bogotá) del rango de la bandeja.
+ * Cada extremo es opcional: sin `from` no hay piso y sin `to` no hay techo.
+ * Pura para probar la semántica de la ventana sin base de datos.
+ */
+export function alertDateBounds(from?: string, to?: string): { from?: string; to?: string } {
+  const bounds: { from?: string; to?: string } = {};
+  if (from) bounds.from = dayBounds(from).from;
+  if (to) bounds.to = dayBounds(to).to;
+  return bounds;
+}
 
 /** Revisar exige dejar traza escrita de lo sucedido (obligatoria). */
 export const reviewNoteSchema = z.object({

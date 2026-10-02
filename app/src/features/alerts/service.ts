@@ -2,6 +2,7 @@ import {
   ALERT_ACTIONS,
   ALERT_MODULES,
   ALERTS_PAGE_SIZE,
+  alertDateBounds,
   alertsQuerySchema,
   buildVoucherAlertResolution,
   reviewNoteSchema,
@@ -113,8 +114,11 @@ export async function listAlerts(
   if (!parsed.success) {
     throw new AlertError("VALIDATION", validationMessage(parsed.error), 400);
   }
-  const { unreadOnly, page, module } = parsed.data;
+  const { unreadOnly, page, module, from, to } = parsed.data;
   const actions = module ? [...ALERT_MODULES[module].actions] : [...ALERT_ACTIONS];
+  // Rango inclusivo en hora de Bogotá (igual que facturación): cada extremo
+  // se aplica solo cuando viene, sobre la misma consulta (sin RPC nuevo).
+  const bounds = alertDateBounds(from, to);
   const db = await alertsDb();
   let countQuery = db
     .from("audit_logs")
@@ -122,6 +126,8 @@ export async function listAlerts(
     .eq("sede_id", sedeId)
     .in("action", actions);
   if (unreadOnly) countQuery = countQuery.eq("is_read", false);
+  if (bounds.from) countQuery = countQuery.gte("created_at", bounds.from);
+  if (bounds.to) countQuery = countQuery.lte("created_at", bounds.to);
   const { count, error: countError } = await countQuery;
   if (countError) throw toAlertError(countError);
   const total = count ?? 0;
@@ -132,6 +138,8 @@ export async function listAlerts(
     .eq("sede_id", sedeId)
     .in("action", actions);
   if (unreadOnly) query = query.eq("is_read", false);
+  if (bounds.from) query = query.gte("created_at", bounds.from);
+  if (bounds.to) query = query.lte("created_at", bounds.to);
   const { data, error } = await query
     .order("created_at", { ascending: false })
     .range(offset, offset + ALERTS_PAGE_SIZE - 1);

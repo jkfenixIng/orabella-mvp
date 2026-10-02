@@ -3,6 +3,7 @@ import {
   ALERT_ACTIONS,
   ALERT_MODULES,
   ALERTS_PAGE_SIZE,
+  alertDateBounds,
   VOUCHER_ALERT_ACTION,
   VOUCHER_ALERT_ENTITY,
   alertsQuerySchema,
@@ -77,6 +78,80 @@ describe("alerts: conjunto de alerta y paginado", () => {
         true,
       )?.revisada,
     ).toBe(false);
+  });
+});
+
+describe("alerts: filtro por rango de fechas", () => {
+  it("acepta desde/hasta opcionales y los conserva", () => {
+    const parsed = alertsQuerySchema.safeParse({
+      unreadOnly: true,
+      module: "caja",
+      from: "2026-09-01",
+      to: "2026-09-30",
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data).toEqual({
+        unreadOnly: true,
+        page: 1,
+        module: "caja",
+        from: "2026-09-01",
+        to: "2026-09-30",
+      });
+    }
+  });
+
+  it("acepta un solo extremo y sin rango (comportamiento anterior intacto)", () => {
+    expect(alertsQuerySchema.safeParse({ from: "2026-09-01" }).success).toBe(true);
+    expect(alertsQuerySchema.safeParse({ to: "2026-09-30" }).success).toBe(true);
+    const parsed = alertsQuerySchema.safeParse({});
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data).toEqual({ unreadOnly: false, page: 1 });
+    }
+  });
+
+  it("rechaza fechas inválidas y rango invertido por el camino de validación", () => {
+    expect(alertsQuerySchema.safeParse({ from: "01-09-2026" }).success).toBe(false);
+    expect(alertsQuerySchema.safeParse({ to: "septiembre" }).success).toBe(false);
+    const inverted = alertsQuerySchema.safeParse({ from: "2026-09-30", to: "2026-09-01" });
+    expect(inverted.success).toBe(false);
+    if (!inverted.success) {
+      expect(inverted.error.issues[0]?.message).toBe("El rango de fechas es inválido.");
+    }
+  });
+
+  it("módulo+sin leer siguen intactos, también combinados con rango", () => {
+    const parsed = alertsQuerySchema.safeParse({
+      unreadOnly: true,
+      module: "acceso",
+      page: 2,
+      from: "2026-09-01",
+      to: "2026-09-01",
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data).toEqual({
+        unreadOnly: true,
+        page: 2,
+        module: "acceso",
+        from: "2026-09-01",
+        to: "2026-09-01",
+      });
+    }
+    expect(alertsQuerySchema.safeParse({ module: "otro" }).success).toBe(false);
+  });
+
+  it("la ventana es inclusiva en hora de Bogotá (cubre el día completo)", () => {
+    expect(alertDateBounds("2026-09-01", "2026-09-30")).toEqual({
+      from: "2026-09-01T00:00:00-05:00",
+      to: "2026-09-30T23:59:59.999-05:00",
+    });
+    expect(alertDateBounds()).toEqual({});
+    expect(alertDateBounds("2026-09-01")).toEqual({ from: "2026-09-01T00:00:00-05:00" });
+    expect(alertDateBounds(undefined, "2026-09-30")).toEqual({
+      to: "2026-09-30T23:59:59.999-05:00",
+    });
   });
 });
 
