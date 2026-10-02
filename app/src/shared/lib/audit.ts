@@ -83,6 +83,21 @@ export const AUDIT_ACTIONS = {
   // anterior y el nuevo, y no la confunda con el negocio. NO entra a ningún
   // catálogo de alertas: es una decisión de configuración, no un desvío.
   PLATFORM_PAYROLL_START_DATE_SET: "platform.payroll_start_date_set",
+  // G5: la cuenta de plataforma ALTA una sede de la instalación. Es la entrada
+  // que antes no existía: hasta acá las sedes se creaban desde la administración
+  // de otra sede, sin rastro. Tiene su propia acción para que un auditor lea
+  // «la plataforma creó la sede X» con los datos con que la nombró, y no la
+  // confunda con una edición de una sede ya existente. NO entra a ningún
+  // catálogo de alertas: es una decisión de configuración, no un desvío.
+  PLATFORM_SEDE_CREATED: "platform.sede_created",
+  // G5: la plataforma decide QUIÉN ADMINISTRA una sede. Cambia el poder de una
+  // persona sobre una sede entera —quién entra a su caja, su nómina y su
+  // facturación—, así que se audita con el cambio CONCRETO: de qué roles a
+  // cuáles. El nombre del rol es el dato que un auditor necesita para reconstruir
+  // la decisión; sin los dos conjuntos el registro sólo diría "se cambió algo".
+  // NO entra a ningún catálogo de alertas: es una decisión de configuración, no
+  // un desvío.
+  PLATFORM_SEDE_ROLES_SET: "platform.sede_roles_set",
 } as const;
 
 /**

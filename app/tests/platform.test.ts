@@ -3,13 +3,20 @@ import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionUser } from "@/src/features/auth/service";
 import {
+  createPlatformSedeAction,
   listPlatformSedesAction,
+  listPlatformSedeUsersAction,
   setPlatformPayrollStartDateAction,
+  setPlatformSedeUserRolesAction,
 } from "@/src/features/platform/actions";
 import {
+  createPlatformSede,
   listPlatformSedes,
+  listPlatformSedeUsers,
   requirePlatformAdmin,
   setPlatformPayrollStartDate,
+  setPlatformSedeUserRoles,
+  type PlatformActor,
 } from "@/src/features/platform/service";
 import { AUDIT_ACTIONS } from "@/src/shared/lib/audit";
 
@@ -39,14 +46,28 @@ const sessionStub = vi.hoisted(() => ({ current: null as null | SessionUser }));
 
 const dbStub = vi.hoisted(() => ({
   sedes: [] as Array<Record<string, unknown>>,
-  /** Lecturas reales contra `sedes`: 0 prueba que la guarda rechazó antes. */
+  /** Usuarios sembrados por sede (G5). */
+  users: [] as Array<Record<string, unknown>>,
+  /** Filas de `user_roles` aplanadas: `{ user_id, code }` (G5). */
+  user_roles: [] as Array<{ user_id: string; code: string }>,
+  /** Lecturas reales contra la base: 0 prueba que la guarda rechazó antes. */
   reads: 0,
-  /** Escrituras reales contra `sedes`: 0 prueba que el rechazo no escribió. */
+  /** Escrituras reales contra `sedes` por `update`: 0 prueba que no se editó. */
   writes: 0,
+  /** Altas reales contra `sedes` por `insert`. */
+  inserts: 0,
+  /** Llamadas al rpc atómico de reemplazo de roles (039). */
+  rpcs: [] as Array<{ fn: string; args: Record<string, unknown> }>,
   /** Simula 068 sin aplicar: `select` con la columna falla con 42703. */
   sinColumnaNomina: false,
   /** Fallo genérico de la base (no es columna faltante). */
   fail: false,
+  /** Fallo inyectable en el rpc (P0001 y compañía). */
+  failRpc: null as null | { code: string; message: string },
+  /** El rpc responde éxito pero sin aplicar el conjunto pedido. */
+  rpcAppliesNothing: false,
+  /** Secuencia para los ids de las sedes creadas. */
+  nextId: 0,
 }));
 
 /** Entradas de auditoría capturadas: la unidad prueba lo que la fecha deja. */
@@ -80,11 +101,12 @@ vi.mock("@/src/shared/lib/audit", async (importOriginal) => {
 });
 
 /**
- * Doble mínimo de PostgREST: la lectura encadena `select().order().order()` y
- * resuelve contra las filas sembradas; la escritura encadena
- * `update().eq().select().maybeSingle()` y muta la fila sembrada. Modela lo
- * único que importa acá:
- *   * `reads`/`writes` cuentan accesos reales (la guarda no debe producir uno).
+ * Doble mínimo de PostgREST: la lectura de sedes encadena
+ * `select().order().order()` y resuelve contra las filas sembradas; la escritura
+ * encadena `update().eq().select().maybeSingle()` y muta la fila sembrada.
+ * Modela lo único que importa acá:
+ *   * `reads`/`writes`/`inserts`/`rpcs` cuentan accesos reales (la guarda no debe
+ *     producir uno).
  *   * `order` ordena como lo pide el servicio y `select` proyecta las columnas
  *     pedidas: la relectura sin la 068 no puede devolver la fecha que no pidió.
  *   * `eq("id", …)` acota a la sede pedida y `maybeSingle` responde esa fila (o
@@ -92,14 +114,23 @@ vi.mock("@/src/shared/lib/audit", async (importOriginal) => {
  *   * `sinColumnaNomina` reproduce el 42703 de la 068 sin aplicar, que la
  *     lectura degrada a «sin configurar» releyendo sin la columna y que la
  *     escritura traduce a un mensaje accionable.
+ *   * `insert` en `sedes` RESPETA el índice `uq_sedes_name` de la 070 sobre
+ *     `lower(btrim(name))`: no es un interruptor sino el modelo de la base, así
+ *     que un nombre repetido produce el 23505 real, con su código y su mensaje.
+ *   * `rpc("replace_user_roles", …)` es UNA sentencia: aplica el conjunto entero
+ *     o nada, igual que la función 039 con su transacción y su candado.
  */
 vi.mock("@/src/shared/lib/supabase/server", () => ({
   createAdminClient: () => {
     const from = (table: string) => {
       let columnas: string[] = [];
       const ordenes: string[] = [];
+      const filtros: Record<string, unknown> = {};
       let filtroId: string | null = null;
       let escrito: Record<string, unknown> | null = null;
+      let insertado: Record<string, unknown> | null = null;
+      /** El `insert` chocó con `uq_sedes_name`: la fila se devuelve con 23505. */
+      let insertadoDuplicado = false;
 
       const tieneColumnaNomina = () => columnas.includes("payroll_start_date");
       const errorColumna = () => ({
@@ -115,14 +146,8 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
               Object.fromEntries(columnas.map((columna) => [columna, fila[columna]])),
             );
 
-      const filaObjetivo = () => dbStub.sedes.find((fila) => fila.id === filtroId) ?? null;
-
-      const resultadoLista = (): { data: unknown; error: unknown } => {
-        if (table !== "sedes") return { data: [], error: null };
-        dbStub.reads += 1;
-        if (dbStub.fail) return { data: null, error: { code: "XX000", message: "fallo simulado" } };
-        if (tieneColumnaNomina() && dbStub.sinColumnaNomina) return { data: null, error: errorColumna() };
-        const ordenadas = [...dbStub.sedes].sort((a, b) => {
+      const ordenar = (filas: Array<Record<string, unknown>>) =>
+        [...filas].sort((a, b) => {
           for (const columna of ordenes) {
             const izq = String(a[columna] ?? "");
             const der = String(b[columna] ?? "");
@@ -130,20 +155,60 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
           }
           return 0;
         });
-        return { data: proyectar(ordenadas), error: null };
+
+      const filaObjetivo = () => dbStub.sedes.find((fila) => fila.id === filtroId) ?? null;
+
+      /** `user_roles` no se proyecta columna por columna: trae `roles(code)`. */
+      const filasDeUserRoles = (): Array<Record<string, unknown>> => {
+        const pedidos = filtros.__in as string[] | undefined;
+        return dbStub.user_roles
+          .filter((fila) =>
+            pedidos !== undefined
+              ? pedidos.includes(fila.user_id)
+              : fila.user_id === filtros.user_id,
+          )
+          .map((fila) => ({ user_id: fila.user_id, roles: { code: fila.code } }));
+      };
+
+      const resultadoLista = (): { data: unknown; error: unknown } => {
+        dbStub.reads += 1;
+        if (dbStub.fail) return { data: null, error: { code: "XX000", message: "fallo simulado" } };
+
+        if (table === "sedes") {
+          if (tieneColumnaNomina() && dbStub.sinColumnaNomina) return { data: null, error: errorColumna() };
+          return { data: proyectar(ordenar(dbStub.sedes)), error: null };
+        }
+        if (table === "users") {
+          const deLaSede = dbStub.users.filter(
+            (fila) =>
+              (filtros.sede_id === undefined || fila.sede_id === filtros.sede_id) &&
+              (filtros.id === undefined || fila.id === filtros.id),
+          );
+          return { data: proyectar(ordenar(deLaSede)), error: null };
+        }
+        if (table === "user_roles") return { data: filasDeUserRoles(), error: null };
+        return { data: [], error: null };
       };
 
       const resultadoFila = (): { data: unknown; error: unknown } => {
-        if (table !== "sedes") return { data: null, error: null };
         dbStub.reads += 1;
         if (dbStub.fail) return { data: null, error: { code: "XX000", message: "fallo simulado" } };
-        if (tieneColumnaNomina() && dbStub.sinColumnaNomina) return { data: null, error: errorColumna() };
-        const fila = filaObjetivo();
-        if (fila === null) return { data: null, error: null };
-        // La escritura se APLICA al resolver: `eq("id", …)` es lo único que la
-        // acota, igual que en PostgREST.
-        if (escrito !== null) Object.assign(fila, escrito);
-        return { data: proyectar([fila])[0], error: null };
+
+        if (table === "sedes") {
+          if (tieneColumnaNomina() && dbStub.sinColumnaNomina) return { data: null, error: errorColumna() };
+          const fila = filaObjetivo();
+          if (fila === null) return { data: null, error: null };
+          // La escritura se APLICA al resolver: `eq("id", …)` es lo único que la
+          // acota, igual que en PostgREST.
+          if (escrito !== null) Object.assign(fila, escrito);
+          return { data: proyectar([fila])[0], error: null };
+        }
+        if (table === "users") {
+          const fila = dbStub.users.find((item) => item.id === filtros.id) ?? null;
+          if (fila === null) return { data: null, error: null };
+          return { data: proyectar([fila])[0], error: null };
+        }
+        return { data: null, error: null };
       };
 
       const query: Record<string, unknown> = {
@@ -160,11 +225,56 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
           if (table === "sedes") dbStub.writes += 1;
           return query;
         },
+        insert: (payload: Record<string, unknown>) => {
+          if (table === "sedes") {
+            dbStub.inserts += 1;
+            const fila: Record<string, unknown> = {
+              address: null,
+              phone: null,
+              is_active: true,
+              ...payload,
+              id: `sede-nueva-${(dbStub.nextId += 1)}`,
+            };
+            // 070: `uq_sedes_name` es UNIQUE sobre `lower(btrim(name))`, así que
+            // el espaciado y las mayúsculas no esquivan el choque.
+            const normalizado = String(fila.name).trim().toLowerCase();
+            const repetido = dbStub.sedes.some(
+              (existente) => String(existente.name).trim().toLowerCase() === normalizado,
+            );
+            if (repetido) {
+              insertadoDuplicado = true;
+              return query;
+            }
+            dbStub.sedes.push(fila);
+            insertado = fila;
+          }
+          return query;
+        },
         eq: (columna: string, valor: string) => {
+          filtros[columna] = valor;
           if (columna === "id") filtroId = valor;
           return query;
         },
+        in: (columna: string, valores: string[]) => {
+          filtros[`__in_${columna}`] = valores;
+          if (columna === "user_id") filtros.__in = valores;
+          return query;
+        },
         maybeSingle: () => Promise.resolve(resultadoFila()),
+        single: () =>
+          Promise.resolve(
+            insertadoDuplicado
+              ? {
+                  data: null,
+                  error: {
+                    code: "23505",
+                    message: 'duplicate key value violates unique constraint "uq_sedes_name"',
+                  },
+                }
+              : insertado === null
+                ? { data: null, error: null }
+                : { data: proyectar([insertado])[0], error: null },
+          ),
         then: (
           onFulfilled: (value: unknown) => unknown,
           onRejected?: (reason: unknown) => unknown,
@@ -172,7 +282,28 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
       };
       return query;
     };
-    return { from };
+
+    /**
+     * `replace_user_roles` (039) es UNA sentencia con transacción y candado:
+     * reemplaza el conjunto entero o no aplica nada. Acá se imita ese efecto
+     * observable —nunca un DELETE y un INSERT sueltos— para que la post-condición
+     * del servicio se pueda ejercitar.
+     */
+    const rpc = (fn: string, args: Record<string, unknown>) => {
+      if (fn !== "replace_user_roles") {
+        return Promise.resolve({ data: null, error: { code: "42883", message: "no such function" } });
+      }
+      dbStub.rpcs.push({ fn, args });
+      if (dbStub.failRpc) return Promise.resolve({ data: null, error: dbStub.failRpc });
+      if (dbStub.rpcAppliesNothing) return Promise.resolve({ data: [], error: null });
+      const userId = args.p_user_id as string;
+      const codes = (args.p_role_codes as string[]) ?? [];
+      dbStub.user_roles = dbStub.user_roles.filter((fila) => fila.user_id !== userId);
+      for (const code of codes) dbStub.user_roles.push({ user_id: userId, code });
+      return Promise.resolve({ data: [...codes].sort(), error: null });
+    };
+
+    return { from, rpc };
   },
 }));
 
@@ -198,12 +329,50 @@ function sembrarSedes(): void {
   ];
 }
 
+const USUARIO_CENTRO_ADMIN = "aaaaaaa1-1111-4111-8111-aaaaaaaaaaaa";
+const USUARIO_CENTRO_CAJA = "aaaaaaa2-2222-4222-8222-aaaaaaaaaaaa";
+const USUARIO_NORTE = "bbbbbbb1-3333-4333-8333-bbbbbbbbbbbb";
+const USUARIO_PLATAFORMA = "ccccccc1-4444-4444-8444-cccccccccccc";
+
+/** Dos usuarios en Centro y uno en Norte: la lista es cross-sede y debe notarlo. */
+function sembrarUsuarios(): void {
+  dbStub.users = [
+    { id: USUARIO_CENTRO_CAJA, sede_id: SEDE_CENTRO, full_name: "Carla Caja", id_number: "101" },
+    {
+      id: USUARIO_CENTRO_ADMIN,
+      sede_id: SEDE_CENTRO,
+      full_name: "Andrés Admin",
+      id_number: "102",
+    },
+    { id: USUARIO_NORTE, sede_id: SEDE_NORTE, full_name: "Nina Norte", id_number: "103" },
+    {
+      id: USUARIO_PLATAFORMA,
+      sede_id: SEDE_PLATAFORMA,
+      full_name: "Dueña de la plataforma",
+      id_number: "001",
+    },
+  ];
+  dbStub.user_roles = [
+    { user_id: USUARIO_CENTRO_ADMIN, code: "empleado" },
+    { user_id: USUARIO_CENTRO_CAJA, code: "caja" },
+    { user_id: USUARIO_NORTE, code: "admin" },
+    { user_id: USUARIO_PLATAFORMA, code: "superadmin" },
+  ];
+}
+
 beforeEach(() => {
   dbStub.sedes = [];
+  dbStub.users = [];
+  dbStub.user_roles = [];
   dbStub.reads = 0;
   dbStub.writes = 0;
+  dbStub.inserts = 0;
+  dbStub.rpcs = [];
   dbStub.sinColumnaNomina = false;
   dbStub.fail = false;
+  dbStub.failRpc = null;
+  dbStub.rpcAppliesNothing = false;
+  dbStub.nextId = 0;
   sessionStub.current = null;
   auditStub.entries = [];
 });
@@ -603,7 +772,10 @@ describe("plataforma: estructura de la escritura (G3b)", () => {
   it("la escritura es una función de plataforma: no usa resolveSede y re-aplica el rol", () => {
     const body = functionBody(readSource(SERVICE_FILE), "setPlatformPayrollStartDate");
     expect(body, "no se encontró `setPlatformPayrollStartDate` en el servicio").not.toBe("");
-    expect(body).not.toContain("resolveSede");
+    // Sin comentarios: la frontera citada al documentar la función (y la de las
+    // funciones vecinas de G5) no es una llamada. El defecto que este chequeo
+    // persigue es CÓDIGO.
+    expect(stripComments(body)).not.toContain("resolveSede");
     expect(body).toContain("PLATFORM_ROLES");
     // La sede objetivo viaja ELEGIDA en el cuerpo: no se infiere de la sesión.
     expect(body).toContain("sede_id");
@@ -631,5 +803,549 @@ describe("plataforma: estructura de la escritura (G3b)", () => {
 
     // La isla tampoco reconoce la sede del sistema por su nombre.
     expect(hardcodesPlatformName(isla)).toBe(false);
+  });
+});
+
+/* --------------------------------------------------------------------------
+   G5 — la plataforma ADMINISTRA la instalación: crea sedes y decide quién
+   administra cada una.
+
+   Las dos mitades del bloque, con el método de casa:
+
+   1. COMPORTAMIENTO — el alta y el reemplazo de roles contra el doble de
+      PostgREST, que modela el índice `uq_sedes_name` (070) y la sentencia
+      atómica `replace_user_roles` (039). Fija lo que la unidad promete: el
+      duplicado NO se puede crear, el `id` del cuerpo NO edita, el conjunto
+      asignable es el de sede (el rol de plataforma no se otorga ni se quita), un
+      usuario de otra sede es un 403, y las dos mutaciones dejan auditoría con el
+      cambio concreto.
+   2. ESTRUCTURA — los archivos reales se leen del disco (mismo patrón que
+      `tests/action-guards.test.ts`), con control negativo por predicado.
+   -------------------------------------------------------------------------- */
+
+const NOMBRE_PLATAFORMA = "Plataforma (sistema)";
+
+describe("plataforma: el alta de una sede (G5)", () => {
+  it("crea la sede con la fila de `003_admin.sql` y la devuelve", async () => {
+    sembrarSedes();
+    asSession(["superadmin"]);
+
+    const result = await createPlatformSedeAction({
+      name: "Sur",
+      address: "Calle 1 #2-3",
+      phone: "3001234567",
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data).toMatchObject({
+      name: "Sur",
+      address: "Calle 1 #2-3",
+      phone: "3001234567",
+      is_active: true,
+    });
+    expect(dbStub.inserts).toBe(1);
+    // La sede existe de verdad en la tabla: no es una respuesta de mentira.
+    expect(dbStub.sedes.map((sede) => sede.name)).toContain("Sur");
+  });
+
+  it("una sede sin dirección ni teléfono guarda `null`, no una cadena vacía", async () => {
+    sembrarSedes();
+    asSession(["superadmin"]);
+
+    const result = await createPlatformSedeAction({ name: "Sur", address: null, phone: null });
+
+    expect(result.success).toBe(true);
+    expect(dbStub.sedes.find((sede) => sede.name === "Sur")).toMatchObject({
+      address: null,
+      phone: null,
+    });
+  });
+
+  it("un `id` en el cuerpo NO edita: la sede se crea y las demás quedan intactas", async () => {
+    sembrarSedes();
+    asSession(["superadmin"]);
+
+    const result = await createPlatformSedeAction({ id: SEDE_CENTRO, name: "Nueva" });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    // El `id` ni siquiera llega a la escritura (el esquema lo omite).
+    expect(result.data.id).not.toBe(SEDE_CENTRO);
+    expect(dbStub.sedes.find((sede) => sede.id === SEDE_CENTRO)?.name).toBe("Centro");
+    expect(dbStub.inserts).toBe(1);
+    expect(dbStub.writes).toBe(0);
+  });
+
+  it("un nombre repetido se rechaza con el error de casa que NOMBRA la sede", async () => {
+    sembrarSedes();
+    asSession(["superadmin"]);
+
+    const result = await createPlatformSedeAction({ name: "Norte" });
+
+    expect(result).toMatchObject({ success: false, code: "SEDE_NAME_TAKEN" });
+    if (result.success) return;
+    // El mensaje nombra la sede que ya existe: un "ya existe" sin decir cuál no
+    // le sirve a quien está creando.
+    expect(result.message).toContain("Norte");
+    // No se escribió nada ni se auditó un alta que no ocurrió.
+    expect(dbStub.sedes).toHaveLength(3);
+    expect(auditStub.entries).toHaveLength(0);
+  });
+
+  it("el choque es el de la 070: también con otras mayúsculas y espaciado", async () => {
+    sembrarSedes();
+    asSession(["superadmin"]);
+
+    const result = await createPlatformSedeAction({ name: "  norte  " });
+
+    // El índice es UNIQUE sobre `lower(btrim(name))`: el doble lo modela, así que
+    // la normalización se verifica acá y no en un comentario.
+    expect(result).toMatchObject({ success: false, code: "SEDE_NAME_TAKEN" });
+    expect(dbStub.sedes).toHaveLength(3);
+  });
+
+  it("la fila de la sede del sistema NO se puede crear dos veces", async () => {
+    sembrarSedes();
+    asSession(["superadmin"]);
+
+    const result = await createPlatformSedeAction({ name: NOMBRE_PLATAFORMA });
+
+    expect(result).toMatchObject({ success: false, code: "SEDE_NAME_TAKEN" });
+    if (result.success) return;
+    expect(result.message).toContain(NOMBRE_PLATAFORMA);
+    expect(dbStub.sedes.filter((sede) => sede.name === NOMBRE_PLATAFORMA)).toHaveLength(1);
+  });
+
+  it("la auditoría del alta lleva el actor, la sede nueva y los datos del nombre", async () => {
+    sembrarSedes();
+    asSession(["superadmin"]);
+
+    await createPlatformSedeAction({ name: "Sur", address: null, phone: "3001234567" });
+
+    expect(AUDIT_ACTIONS.PLATFORM_SEDE_CREATED).toBe("platform.sede_created");
+    expect(auditStub.entries).toHaveLength(1);
+    const entrada = auditStub.entries[0];
+    expect(entrada.action).toBe("platform.sede_created");
+    expect(entrada.entity).toBe("sedes");
+    expect(entrada.user_id).toBe("u-plataforma");
+    expect(entrada.sede_id).toBe(entrada.entity_id);
+    expect(entrada.metadata).toEqual({
+      name: "Sur",
+      address: null,
+      phone: "3001234567",
+      is_active: true,
+    });
+  });
+
+  it("un nombre vacío no escribe ni audita", async () => {
+    sembrarSedes();
+    asSession(["superadmin"]);
+
+    const result = await createPlatformSedeAction({ name: "   " });
+
+    expect(result).toMatchObject({ success: false, code: "VALIDATION" });
+    expect(dbStub.inserts).toBe(0);
+    expect(auditStub.entries).toHaveLength(0);
+  });
+
+  it("un admin de sede NO crea sedes: FORBIDDEN y NADA escrito", async () => {
+    sembrarSedes();
+    asSession(["admin"]);
+
+    const result = await createPlatformSedeAction({ name: "Sur" });
+
+    expect(result).toMatchObject({ success: false, code: "FORBIDDEN" });
+    expect(result).not.toHaveProperty("data");
+    // El rechazo es ANTES de tocar la base: ni lectura, ni escritura.
+    expect(dbStub.reads).toBe(0);
+    expect(dbStub.inserts).toBe(0);
+    expect(auditStub.entries).toHaveLength(0);
+  });
+
+  it("el alta misma re-aplica el rol (no depende del llamador)", async () => {
+    sembrarSedes();
+
+    await expect(
+      createPlatformSede(
+        { name: "Sur" },
+        { userId: "u", sedeId: SEDE_PLATAFORMA, roles: ["admin"] },
+      ),
+    ).rejects.toMatchObject({ code: "FORBIDDEN", status: 403 });
+    expect(dbStub.inserts).toBe(0);
+  });
+});
+
+describe("plataforma: los usuarios de una sede y sus roles (G5)", () => {
+  it("lista los usuarios de la sede ELEGIDA, con su rol, y no los de otra", async () => {
+    sembrarSedes();
+    sembrarUsuarios();
+    asSession(["superadmin"]);
+
+    const result = await listPlatformSedeUsersAction({ sede_id: SEDE_CENTRO });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    // Orden por nombre; los de Norte y los de la fila del sistema no aparecen.
+    expect(result.data.map((row) => row.id)).toEqual([USUARIO_CENTRO_ADMIN, USUARIO_CENTRO_CAJA]);
+    expect(result.data.map((row) => row.full_name)).toEqual(["Andrés Admin", "Carla Caja"]);
+    expect(result.data[0].roles).toEqual(["empleado"]);
+    expect(result.data[1].roles).toEqual(["caja"]);
+  });
+
+  it("es una lectura cross-sede: pide la sede pedida, no la del actor", async () => {
+    sembrarSedes();
+    sembrarUsuarios();
+    asSession(["superadmin"]);
+
+    // El actor está anclado a la fila del sistema y pide los usuarios de NORTE.
+    const result = await listPlatformSedeUsersAction({ sede_id: SEDE_NORTE });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.map((row) => row.id)).toEqual([USUARIO_NORTE]);
+  });
+
+  it("asigna `admin`: el reemplazo es una sola llamada al rpc atómico", async () => {
+    sembrarSedes();
+    sembrarUsuarios();
+    asSession(["superadmin"]);
+
+    const result = await setPlatformSedeUserRolesAction({
+      sede_id: SEDE_CENTRO,
+      user_id: USUARIO_CENTRO_CAJA,
+      roles: ["admin"],
+    });
+
+    expect(result).toEqual({
+      success: true,
+      data: { sede_id: SEDE_CENTRO, user_id: USUARIO_CENTRO_CAJA, roles: ["admin"] },
+    });
+    // UNA sentencia (039), no un DELETE + un INSERT sueltos.
+    expect(dbStub.rpcs).toEqual([
+      {
+        fn: "replace_user_roles",
+        args: { p_user_id: USUARIO_CENTRO_CAJA, p_role_codes: ["admin"] },
+      },
+    ]);
+    expect(dbStub.user_roles.filter((fila) => fila.user_id === USUARIO_CENTRO_CAJA)).toEqual([
+      { user_id: USUARIO_CENTRO_CAJA, code: "admin" },
+    ]);
+  });
+
+  it("la auditoría del cambio dice qué roles tenía y cuáles quedan", async () => {
+    sembrarSedes();
+    sembrarUsuarios();
+    asSession(["superadmin"]);
+
+    await setPlatformSedeUserRolesAction({
+      sede_id: SEDE_CENTRO,
+      user_id: USUARIO_CENTRO_ADMIN,
+      roles: ["admin"],
+    });
+
+    expect(AUDIT_ACTIONS.PLATFORM_SEDE_ROLES_SET).toBe("platform.sede_roles_set");
+    expect(auditStub.entries).toHaveLength(1);
+    expect(auditStub.entries[0]).toMatchObject({
+      sede_id: SEDE_CENTRO,
+      user_id: "u-plataforma",
+      action: "platform.sede_roles_set",
+      entity: "users",
+      entity_id: USUARIO_CENTRO_ADMIN,
+      metadata: { previous_roles: ["empleado"], new_roles: ["admin"] },
+    });
+  });
+
+  it("quitar `admin` es dejar el rol que sí corresponde, y queda auditado", async () => {
+    sembrarSedes();
+    sembrarUsuarios();
+    asSession(["superadmin"]);
+
+    const result = await setPlatformSedeUserRolesAction({
+      sede_id: SEDE_NORTE,
+      user_id: USUARIO_NORTE,
+      roles: ["empleado"],
+    });
+
+    expect(result.success).toBe(true);
+    expect(auditStub.entries[0]?.metadata).toEqual({
+      previous_roles: ["admin"],
+      new_roles: ["empleado"],
+    });
+  });
+
+  it("otorgar el rol de plataforma desde acá se rechaza: NADA se escribe", async () => {
+    sembrarSedes();
+    sembrarUsuarios();
+    asSession(["superadmin"]);
+
+    const result = await setPlatformSedeUserRolesAction({
+      sede_id: SEDE_CENTRO,
+      user_id: USUARIO_CENTRO_CAJA,
+      roles: ["superadmin"],
+    });
+
+    expect(result).toMatchObject({ success: false, code: "FORBIDDEN" });
+    expect(result).not.toHaveProperty("data");
+    // Ni una lectura, ni una llamada al rpc: el rechazo es ANTES de la base.
+    expect(dbStub.reads).toBe(0);
+    expect(dbStub.rpcs).toEqual([]);
+    expect(auditStub.entries).toHaveLength(0);
+    // Y el rol del usuario sigue siendo el que tenía.
+    expect(dbStub.user_roles.filter((fila) => fila.user_id === USUARIO_CENTRO_CAJA)).toEqual([
+      { user_id: USUARIO_CENTRO_CAJA, code: "caja" },
+    ]);
+  });
+
+  it("un usuario de OTRA sede se rechaza con el 403 de casa", async () => {
+    sembrarSedes();
+    sembrarUsuarios();
+    asSession(["superadmin"]);
+
+    const result = await setPlatformSedeUserRolesAction({
+      sede_id: SEDE_CENTRO,
+      user_id: USUARIO_NORTE,
+      roles: ["admin"],
+    });
+
+    expect(result).toMatchObject({ success: false, code: "FORBIDDEN" });
+    expect(dbStub.rpcs).toEqual([]);
+    expect(auditStub.entries).toHaveLength(0);
+    expect(dbStub.user_roles.filter((fila) => fila.user_id === USUARIO_NORTE)).toEqual([
+      { user_id: USUARIO_NORTE, code: "admin" },
+    ]);
+  });
+
+  it("un usuario que no existe no llega al rpc", async () => {
+    sembrarSedes();
+    sembrarUsuarios();
+    asSession(["superadmin"]);
+
+    const result = await setPlatformSedeUserRolesAction({
+      sede_id: SEDE_CENTRO,
+      user_id: "99999999-9999-4999-8999-999999999999",
+      roles: ["admin"],
+    });
+
+    expect(result).toMatchObject({ success: false, code: "NOT_FOUND" });
+    expect(dbStub.rpcs).toEqual([]);
+  });
+
+  it("la fila de la plataforma no se administra a sí misma", async () => {
+    sembrarSedes();
+    sembrarUsuarios();
+    asSession(["superadmin"]);
+
+    const result = await setPlatformSedeUserRolesAction({
+      sede_id: SEDE_PLATAFORMA,
+      user_id: USUARIO_PLATAFORMA,
+      roles: ["admin"],
+    });
+
+    // El reconocimiento es por el anclaje (`fila.id === actor.sedeId`), no por el
+    // nombre de la fila: renombrarla no abre la puerta.
+    expect(result).toMatchObject({ success: false, code: "FORBIDDEN" });
+    expect(dbStub.reads).toBe(0);
+    expect(dbStub.rpcs).toEqual([]);
+  });
+
+  it("no se le puede arrancar el rol a una cuenta de plataforma", async () => {
+    sembrarSedes();
+    sembrarUsuarios();
+    asSession(["superadmin"]);
+
+    // Un usuario que ya tiene un rol NO asignable desde sede queda fuera del
+    // reemplazo: es la misma defensa que aplica `setUserRoles` en el negocio.
+    dbStub.users.push({
+      id: "ddddddd1-5555-4555-8555-dddddddddddd",
+      sede_id: SEDE_CENTRO,
+      full_name: "Cuenta de plataforma",
+      id_number: "777",
+    });
+    dbStub.user_roles.push({
+      user_id: "ddddddd1-5555-4555-8555-dddddddddddd",
+      code: "superadmin",
+    });
+
+    const result = await setPlatformSedeUserRolesAction({
+      sede_id: SEDE_CENTRO,
+      user_id: "ddddddd1-5555-4555-8555-dddddddddddd",
+      roles: ["empleado"],
+    });
+
+    expect(result).toMatchObject({ success: false, code: "FORBIDDEN" });
+    expect(dbStub.rpcs).toEqual([]);
+    expect(auditStub.entries).toHaveLength(0);
+  });
+
+  it("si el rpc responde sin aplicar nada, NO es un éxito", async () => {
+    sembrarSedes();
+    sembrarUsuarios();
+    dbStub.rpcAppliesNothing = true;
+    asSession(["superadmin"]);
+
+    const result = await setPlatformSedeUserRolesAction({
+      sede_id: SEDE_CENTRO,
+      user_id: USUARIO_CENTRO_CAJA,
+      roles: ["admin"],
+    });
+
+    expect(result).toMatchObject({ success: false, code: "INTERNAL" });
+    // El usuario conserva el conjunto viejo: la post-condición no pasa por alto
+    // un rpc "sin error" que no escribió nada.
+    expect(dbStub.user_roles.filter((fila) => fila.user_id === USUARIO_CENTRO_CAJA)).toEqual([
+      { user_id: USUARIO_CENTRO_CAJA, code: "caja" },
+    ]);
+  });
+
+  it("el `USER_NOT_FOUND` del rpc se traduce a 404", async () => {
+    sembrarSedes();
+    sembrarUsuarios();
+    dbStub.failRpc = { code: "P0001", message: "USER_NOT_FOUND" };
+    asSession(["superadmin"]);
+
+    const result = await setPlatformSedeUserRolesAction({
+      sede_id: SEDE_CENTRO,
+      user_id: USUARIO_CENTRO_CAJA,
+      roles: ["admin"],
+    });
+
+    expect(result).toMatchObject({ success: false, code: "NOT_FOUND" });
+    expect(auditStub.entries).toHaveLength(0);
+  });
+
+  it("un admin de sede NO llega ni a la lista ni al cambio de roles", async () => {
+    sembrarSedes();
+    sembrarUsuarios();
+    asSession(["admin"]);
+
+    const listado = await listPlatformSedeUsersAction({ sede_id: SEDE_CENTRO });
+    const cambio = await setPlatformSedeUserRolesAction({
+      sede_id: SEDE_CENTRO,
+      user_id: USUARIO_CENTRO_CAJA,
+      roles: ["admin"],
+    });
+
+    expect(listado).toMatchObject({ success: false, code: "FORBIDDEN" });
+    expect(cambio).toMatchObject({ success: false, code: "FORBIDDEN" });
+    expect(dbStub.reads).toBe(0);
+    expect(dbStub.rpcs).toEqual([]);
+  });
+
+  it("las dos funciones re-aplican el rol por sí mismas", async () => {
+    sembrarSedes();
+    sembrarUsuarios();
+    const actor = {
+      userId: "u",
+      sedeId: SEDE_PLATAFORMA,
+      roles: ["admin"],
+    } satisfies PlatformActor;
+
+    await expect(
+      listPlatformSedeUsers({ sede_id: SEDE_CENTRO }, actor),
+    ).rejects.toMatchObject({ code: "FORBIDDEN", status: 403 });
+    await expect(
+      setPlatformSedeUserRoles(
+        { sede_id: SEDE_CENTRO, user_id: USUARIO_CENTRO_CAJA, roles: ["admin"] },
+        actor,
+      ),
+    ).rejects.toMatchObject({ code: "FORBIDDEN", status: 403 });
+    expect(dbStub.reads).toBe(0);
+  });
+});
+
+describe("plataforma: estructura de la administración de sedes (G5)", () => {
+  const servicio = readSource(SERVICE_FILE);
+  const acciones = readSource("src/features/platform/actions.ts");
+  const isla = readSource(CLIENT_FILE);
+
+  it("las tres funciones re-aplican el rol y no usan la frontera del negocio", () => {
+    for (const nombre of [
+      "createPlatformSede",
+      "listPlatformSedeUsers",
+      "setPlatformSedeUserRoles",
+    ]) {
+      const body = functionBody(servicio, nombre);
+      expect(body, `no se encontró \`${nombre}\` en el servicio`).not.toBe("");
+      expect(stripComments(body)).toContain("PLATFORM_ROLES");
+      expect(stripComments(body)).not.toContain("resolveSede");
+    }
+
+    // Control negativo: una función que resolviera la sede del actor se reporta.
+    const sintetico = `export async function createPlatformSede(raw: unknown, actor: PlatformActor) {
+  const sede = resolveSede(actor.sedeId);
+  return db.from("sedes").insert({ name: raw }).eq("id", sede);
+}`;
+    expect(stripComments(functionBody(sintetico, "createPlatformSede"))).toContain("resolveSede");
+  });
+
+  it("el cuerpo del alta NO admite `id`: desde la plataforma no se edita una sede", () => {
+    // El `id` se omite del esquema, así que ni siquiera llega a la escritura.
+    expect(servicio).toContain("sedeSchema.omit({ id: true })");
+
+    const campos = /const \{([^}]*)\} = parsed\.data;/.exec(
+      stripComments(functionBody(servicio, "createPlatformSede")),
+    );
+    expect(campos, "no se encontró la lectura del cuerpo validado del alta").not.toBeNull();
+    expect(campos?.[1], "el cuerpo del alta no puede leer un `id`").not.toContain("id");
+
+    // Control negativo: leer el `id` se reporta, porque es justo lo que abriría
+    // la edición por `upsert`.
+    const sintetico = `export async function createPlatformSede(raw: unknown) {
+  const parsed = createPlatformSedeSchema.safeParse(raw);
+  const { name, id } = parsed.data;
+  return db.from("sedes").upsert({ id, name });
+}`;
+    const leido = /const \{([^}]*)\} = parsed\.data;/.exec(stripComments(sintetico));
+    expect(leido?.[1]).toContain("id");
+  });
+
+  it("el reemplazo de roles viaja en el rpc atómico, no en escrituras sueltas", () => {
+    const body = stripComments(functionBody(servicio, "setPlatformSedeUserRoles"));
+    expect(body).toContain('db.rpc("replace_user_roles"');
+    // Un DELETE + un INSERT sueltos serían DOS sentencias sin transacción.
+    expect(body).not.toContain('from("user_roles").insert');
+    expect(body).not.toContain('from("user_roles").delete');
+  });
+
+  it("el conjunto asignable es el de sede: el rol de plataforma no se ofrece", () => {
+    // El cuerpo acepta el catálogo completo (para poder responder 403 con el
+    // motivo) y la puerta decide; el filtro es `isSedeAssignableRole`, la misma
+    //derivación que usa el negocio.
+    const body = stripComments(functionBody(servicio, "setPlatformSedeUserRoles"));
+    expect(body).toContain("isSedeAssignableRole");
+    expect(body).toContain("FORBIDDEN");
+
+    // Y la pantalla no lo ofrece: su lista de opciones es la de sede.
+    const opciones = /const OPCIONES_DE_ROL[\s\S]*?\n\];/.exec(stripComments(isla));
+    expect(opciones, "no se encontró la lista de roles de la pantalla").not.toBeNull();
+    expect(opciones?.[0]).not.toContain("superadmin");
+    for (const valor of ["admin", "caja", "empleado"]) {
+      expect(opciones?.[0], `la pantalla no ofrece el rol ${valor}`).toContain(`"${valor}"`);
+    }
+  });
+
+  it("la pantalla reconoce la fila del sistema por la marca de dato, no por su nombre", () => {
+    expect(hardcodesPlatformName(isla)).toBe(false);
+    expect(hardcodesPlatformName(readSource(PAGE_FILE))).toBe(false);
+    // La fila del sistema no ofrece ni nómina ni roles: se decide por `is_platform`.
+    expect(stripComments(readSource(PAGE_FILE))).toContain("sede.is_platform");
+  });
+
+  it("las dos acciones de G5 quedan declaradas en el vocabulario cerrado", () => {
+    expect(AUDIT_ACTIONS.PLATFORM_SEDE_CREATED).toBe("platform.sede_created");
+    expect(AUDIT_ACTIONS.PLATFORM_SEDE_ROLES_SET).toBe("platform.sede_roles_set");
+    expect(stripComments(acciones)).not.toContain("platform.sede_created");
+    expect(stripComments(acciones)).not.toContain("platform.sede_roles_set");
+  });
+
+  it("no entran a ningún catálogo de alertas: son configuración, no desvíos", () => {
+    for (const archivo of ["src/features/alerts/service.ts", "src/features/alerts/schemas.ts"]) {
+      const fuente = readSource(archivo);
+      expect(fuente, `${archivo} menciona una acción de G5`).not.toContain("PLATFORM_SEDE_CREATED");
+      expect(fuente, `${archivo} menciona una acción de G5`).not.toContain("PLATFORM_SEDE_ROLES_SET");
+      expect(fuente).not.toContain("platform.sede_created");
+      expect(fuente).not.toContain("platform.sede_roles_set");
+    }
   });
 });

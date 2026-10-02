@@ -2,13 +2,11 @@ import {
   employeeSchema,
   normalizeEmployeeCode,
   paymentMethodSchema,
-  sedeSchema,
   serviceSchema,
   setUserRolesSchema,
   taxConfigSchema,
   type EmployeeInput,
   type PaymentMethodInput,
-  type SedeInput,
   type ServiceInput,
   type TaxConfigInput,
 } from "./schemas";
@@ -116,49 +114,7 @@ export async function requireSession(token: string | null | undefined): Promise<
  * re-exportado arriba).
  */
 
-// ----------------------------------------------------------------- sedes ---
-export interface SedeRow {
-  id: string;
-  name: string;
-  address: string | null;
-  phone: string | null;
-  is_active: boolean;
-}
-
-async function fetchSedes(limit?: number): Promise<SedeRow[]> {
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("sedes")
-    .select("id, name, address, phone, is_active")
-    .order("name")
-    .limit(clampLimit(limit));
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as SedeRow[];
-}
-
-/** ADM-01: crea o actualiza una sede (upsert por id). */
-export async function upsertSede(raw: unknown): Promise<SedeRow> {
-  const parsed = sedeSchema.safeParse(raw);
-  if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
-  const input: SedeInput = parsed.data;
-  const db = await adminDb();
-  const payload = {
-    ...(input.id ? { id: input.id } : {}),
-    name: input.name,
-    address: input.address ?? null,
-    phone: input.phone ?? null,
-    ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
-  };
-  const { data, error } = await db
-    .from("sedes")
-    .upsert(payload, { onConflict: "id" })
-    .select("id, name, address, phone, is_active")
-    .single();
-  if (error || !data) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return data as SedeRow;
-}
-
-// ------------------------------------------------------------- employees ---
+// ------------------------------------------------------------- empleados ---
 export interface EmployeeRow {
   id: string;
   sede_id: string;
@@ -719,11 +675,11 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
 }
 
 // ------------------------------------------ listados con caché (catálogos) ---
-
-export const listSedes = unstable_cache(fetchSedes, ["catalog:sedes"], {
-  tags: ["catalog:sedes"],
-  revalidate: CATALOG_TTL_SECONDS,
-});
+//
+// G5: la lista de sedes (`listSedes`, etiqueta `catalog:sedes`) se eliminó con
+// sus dos acciones. El negocio ya no lee ni escribe sedes: la instalación se
+// administra desde la plataforma, que tiene su propia lectura cross-sede
+// (`listPlatformSedes`, sin caché) y su propio alta.
 
 export const listEmployees = unstable_cache(fetchEmployees, ["catalog:employees"], {
   tags: ["catalog:employees"],

@@ -22,6 +22,7 @@ import {
 } from "@/src/features/auth/schemas";
 import { requireSedeRole, resolveSede, type SedeRole } from "@/src/shared/lib/sede";
 import { AdminError, setUserRoles, upsertEmployee } from "@/src/features/admin/service";
+import * as adminActions from "@/src/features/admin/actions";
 
 const SEDE_A = "11111111-1111-4111-8111-111111111111";
 const SEDE_B = "22222222-2222-4222-8222-222222222222";
@@ -2194,5 +2195,87 @@ describe("migración 070_sedes_unique_name.sql (G2)", () => {
         "CREATE INDEX IF NOT EXISTS uq_sedes_name ON public.sedes (lower(btrim(name)));\n",
       ),
     ).toBeNull();
+  });
+});
+
+// -------------------------------------- G5: las sedes salen del alcance ---
+
+/**
+ * G5 cierra los dos agujeros que el negocio tenía sobre la instalación:
+ * `listSedesAction` (guardada solo por `requireSession`, así que CUALQUIER rol
+ * logueado listaba todas las sedes) y `upsertSedeAction` (guardada por
+ * `requireAdminSession`, así que el admin de CUALQUIER sede creaba y editaba
+ * sedes, incluida la fila de la sede del sistema).
+ *
+ * El mapa de consumidores salió vacío —ni una sola referencia en la app— así que
+ * no hubo que reubicar ninguna pantalla: se eliminaron y la administración de la
+ * instalación pasó a la superficie de plataforma, que tiene su propia lectura
+ * cross-sede y su propio alta.
+ *
+ * El bloque afirma las DOS mitades del cierre: que las acciones ya no se
+ * exportan (lo que un admin de sede tenía alcanzable como endpoint POST, porque
+ * `"use server"` convierte cada export en uno) y que el módulo del negocio ya no
+ * tiene con qué leer ni escribir la tabla `sedes`.
+ */
+describe("G5: el admin de una sede ya no lista ni escribe sedes", () => {
+  const acciones = readFileSync(join(process.cwd(), "src", "features", "admin", "actions.ts"), "utf8");
+  const servicio = readFileSync(join(process.cwd(), "src", "features", "admin", "service.ts"), "utf8");
+
+  /** Código sin comentarios: una puerta citada al documentar el cierre no cuenta. */
+  function sinComentarios(source: string): string {
+    return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  }
+
+  it("las dos acciones desaparecieron del módulo alcanzable", () => {
+    for (const nombre of ["listSedesAction", "upsertSedeAction"]) {
+      expect(
+        nombre in adminActions,
+        `${nombre} sigue exportada: "use server" la deja alcanzable como endpoint POST`,
+      ).toBe(false);
+      expect(acciones).not.toContain(`export async function ${nombre}`);
+    }
+  });
+
+  it("sus funciones de servicio también (no se \"re-ubicaron\" con otro nombre)", () => {
+    for (const nombre of ["upsertSede", "listSedes", "fetchSedes", "SedeRow"]) {
+      // `String.raw` y no una plantilla pelada: en una plantilla normal `\s`
+      // vale `s`, así que el patrón compilado era `export s+(?:async s+...)` y
+      // NUNCA podía encontrar una declaración exportada (guarda que no puede
+      // fallar). Con `String.raw` el `\s` llega crudo al motor como clase de
+      // espacio, que es lo que el detector afirma detectar.
+      const declaracion = new RegExp(
+        String.raw`export\s+(?:async\s+function|const|function|interface|type)\s+${nombre}\b`,
+      );
+      expect(servicio, `admin/service.ts todavía declara ${nombre}`).not.toMatch(declaracion);
+      // Sin comentarios: el aviso que documenta el cierre NOMBRA a las funciones
+      // que se quitaron, y nombrarlas al explicar no es declararlas.
+      expect(sinComentarios(acciones)).not.toContain(nombre);
+    }
+  });
+
+  it("el negocio ya no alcanza la tabla `sedes` ni su etiqueta de caché", () => {
+    expect(sinComentarios(servicio)).not.toContain('from("sedes")');
+    expect(sinComentarios(acciones)).not.toContain("catalog:sedes");
+    expect(sinComentarios(acciones)).not.toContain('from("sedes")');
+  });
+
+  it("lo que sí tiene consumidores se quedó: usuarios y roles de la propia sede", () => {
+    // Control de sobre-eliminación: estas dos tienen pantalla que las llama
+    // (`app/admin/admin-tabs.tsx` y `app/admin/admin-sections/users-section.tsx`)
+    // y siguen siendo del admin de su sede.
+    for (const nombre of ["listSedeUsersAction", "setUserRolesAction"]) {
+      expect(nombre in adminActions, `${nombre} no debía tocarse`).toBe(true);
+    }
+  });
+
+  it("el esquema de la fila de sede queda declarado, con su prueba", () => {
+    const schemas = readFileSync(
+      join(process.cwd(), "src", "features", "admin", "schemas.ts"),
+      "utf8",
+    );
+    expect(schemas).toContain("export const sedeSchema");
+    // La forma de la fila es la que la plataforma importa para su alta: una sola
+    // definición para los dos caminos de escritura.
+    expect(schemas).toContain("export type SedeInput");
   });
 });

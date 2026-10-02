@@ -9,7 +9,6 @@ import {
   listEmployees,
   listPaymentMethods,
   listSedeUsers,
-  listSedes,
   listServices,
   listTaxes,
   requireAdminSession,
@@ -18,7 +17,6 @@ import {
   setUserRoles,
   upsertEmployee,
   upsertPaymentMethod,
-  upsertSede,
   upsertService,
   upsertTaxConfig,
 } from "./service";
@@ -163,27 +161,22 @@ export async function upsertPaymentMethodAction(input: unknown) {
   }
 }
 
-/** Sedes para el selector del admin (requiere sesión). */
-export async function listSedesAction() {
-  try {
-    await requireSession(await sessionToken());
-    return { success: true as const, data: await listSedes() };
-  } catch (error) {
-    return toFailure(error);
-  }
-}
-
-/** ADM-01: crear/actualizar sede (solo admin). */
-export async function upsertSedeAction(input: unknown) {
-  try {
-    await requireAdminSession(await sessionToken());
-    const data = await upsertSede(input);
-    revalidateTag("catalog:sedes");
-    return { success: true as const, data };
-  } catch (error) {
-    return toFailure(error);
-  }
-}
+/**
+ * G5: aquí YA NO hay ninguna acción de sedes.
+ *
+ * Existían dos y las dos eran agujeros: `listSedesAction` guardada solo por
+ * `requireSession` (cualquier rol logueado listaba TODAS las sedes) y
+ * `upsertSedeAction` guardada por `requireAdminSession` (el admin de CUALQUIER
+ * sede creaba y editaba sedes, incluida la fila de la sede del sistema). Sus
+ * equivalentes están en `src/features/platform/actions.ts`: el alta es de la
+ * plataforma y la lectura es `listPlatformSedes`, que es cross-sede y marca la
+ * fila del sistema con su bandera de dato.
+ *
+ * Se eliminaron y no se re-ubicaron: ninguna tenía consumidores (ni una sola
+ * referencia en la app), y conservar una segunda lectura de sedes con otro
+ * contrato detrás de una caché de una hora sería peor que no tenerla. La
+ * superficie de plataforma NO depende de ninguna lectura del negocio.
+ */
 
 /** ADM-04: asignar roles a un usuario (solo admin). */
 export async function setUserRolesAction(input: unknown) {

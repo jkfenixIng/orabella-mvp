@@ -10,12 +10,17 @@ import {
   requirePlatformAdmin,
   type PlatformActor,
 } from "@/src/features/platform/service";
-import { PlataformaPayrollStartDateForm } from "./plataforma-client";
+import {
+  PlataformaCreateSedeForm,
+  PlataformaPayrollStartDateForm,
+  PlataformaSedeRolesSection,
+} from "./plataforma-client";
+import { sectionClass, sectionTitleClass } from "@/src/shared/lib/ui-styles";
 
 export const dynamic = "force-dynamic";
 
 /**
- * G3a/G3b — SUPERFICIE de plataforma.
+ * G3a/G3b/G5 — SUPERFICIE de plataforma.
  *
  * Solo la cuenta con el rol `superadmin` la ve: la guarda `requirePlatformAdmin`
  * es la primera llamada y es la única puerta. Quien no pasa NO ve una pantalla
@@ -23,11 +28,15 @@ export const dynamic = "force-dynamic";
  * sesión pero le falta el rol. Es el mismo criterio que usan `/admin` y
  * `/payroll` para una página que no le corresponde a su rol.
  *
- * Lista las sedes de la instalación (cross-sede) con su estado y su fecha de
- * inicio de nómina, y por cada sede del negocio ofrece el formulario que la
- * configura. La escritura NO vive acá: la isla cliente pide la acción de
- * plataforma, que re-aplica la guarda en el servidor. La fila de la sede del
- * sistema se reconoce por su marca de dato (`is_platform`), nunca por su nombre.
+ * Administra la INSTALACIÓN, no el negocio: lista las sedes de la instalación,
+ * las crea, decide quién administra cada una y configura desde cuándo opera su
+ * nómina. Las escrituras NO viven acá: las islas cliente piden las acciones de
+ * plataforma, que re-aplican la guarda en el servidor.
+ *
+ * La fila de la sede del sistema se reconoce por su marca de dato
+ * (`is_platform`), nunca por su nombre: es donde se ancla la cuenta de
+ * plataforma (G2), no es una sede del negocio, y por eso no ofrece ni la fecha
+ * de nómina ni la gestión de sus usuarios.
  */
 export default async function PlataformaPage() {
   const store = await cookies();
@@ -50,13 +59,18 @@ export default async function PlataformaPage() {
     <PageContainer>
       <PageHeader
         title="Plataforma"
-        description="Estado de la instalación: las sedes y la fecha desde la que opera su nómina."
+        description="Configuración de la instalación: las sedes, quién administra cada una y desde cuándo opera su nómina."
       />
       <p className="text-sm text-text-secondary">
-        El estado de la instalación lo ve únicamente la cuenta de plataforma y la
-        fecha de inicio de la nómina la configura solo desde acá, para cualquier
-        sede. La sede del sistema no es una sede del negocio.
+        El estado de la instalación lo ve únicamente la cuenta de plataforma. Desde
+        acá se crean las sedes, se decide quién administra cada una y se configura la
+        fecha de inicio de su nómina. La sede del sistema no es una sede del negocio.
       </p>
+
+      <section className={sectionClass} aria-label="Alta de sede">
+        <h2 className={sectionTitleClass}>Crear una sede</h2>
+        <PlataformaCreateSedeForm />
+      </section>
 
       {sedes.length === 0 ? (
         <EmptyState>Todavía no hay sedes en la instalación.</EmptyState>
@@ -80,11 +94,14 @@ export default async function PlataformaPage() {
                   plataforma.
                 </p>
               ) : (
-                <PlataformaPayrollStartDateForm
-                  sedeId={sede.id}
-                  sedeName={sede.name}
-                  initialPayrollStartDate={sede.payroll_start_date}
-                />
+                <>
+                  <PlataformaPayrollStartDateForm
+                    sedeId={sede.id}
+                    sedeName={sede.name}
+                    initialPayrollStartDate={sede.payroll_start_date}
+                  />
+                  <PlataformaSedeRolesSection sedeId={sede.id} sedeName={sede.name} />
+                </>
               )}
             </li>
           ))}
