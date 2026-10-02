@@ -346,9 +346,27 @@ function PeriodDetailTable({ items, employeeName, payLabel, onView }: PeriodDeta
                 <td className={tableCellClass}>{formatMoney(commission.fixed)}</td>
                 <td className={tableCellClass}>{formatMoney(commission.percent)}</td>
                 <td className={tableCellClass}>{formatMoney(item.bonuses)}</td>
-                {/* El signo es solo presentación: el vale se guarda positivo. */}
+                {/*
+                  NV-01: la celda muestra el TOTAL REAL de vales del período
+                  (`voucher_total`), no el descuento que el tope recortó al
+                  bruto. Si el tope aplicó menos de lo que el empleado gastó,
+                  el monto APLICADO se dice al lado para que la resta del neto
+                  se pueda leer; la deuda que queda pendiente se muestra aparte
+                  y solo cuando existe. El signo es solo presentación: el vale
+                  se guarda positivo.
+                */}
                 <td className={tableCellClass} title={voucherCellTitle(item)}>
-                  {`-${formatMoney(item.deductions_vales)}`}
+                  <span className="block">{`-${formatMoney(item.voucher_total)}`}</span>
+                  {item.deductions_vales < item.voucher_total && (
+                    <span className="block text-xs text-text-tertiary">
+                      {`aplicado ${formatMoney(item.deductions_vales)}`}
+                    </span>
+                  )}
+                  {item.pending_debt > 0 && (
+                    <span className="block text-xs text-text-tertiary">
+                      {`deuda pendiente ${formatMoney(item.pending_debt)}`}
+                    </span>
+                  )}
                 </td>
                 <td className={tableCellClass}>{`-${formatMoney(item.other_discounts)}`}</td>
                 <td className={cn(tableCellClass, "font-semibold")}>{formatMoney(item.net_pay)}</td>
@@ -542,9 +560,30 @@ function DraftPayrollTable({
                     className={tableInputClass}
                   />
                 </td>
-                {/* El signo es solo presentación: el vale se guarda positivo. */}
+                {/*
+                  NV-01: mismo criterio que la tabla cerrada —el total REAL de
+                  vales, el monto aplicado al lado cuando el tope recortó, y la
+                  deuda pendiente solo cuando existe—. El signo es solo
+                  presentación: el vale se guarda positivo.
+                */}
                 <td className={tableCellClass} title={item ? voucherCellTitle(item) : undefined}>
-                  {item ? `-${formatMoney(item.deductions_vales)}` : "—"}
+                  {item ? (
+                    <>
+                      <span className="block">{`-${formatMoney(item.voucher_total)}`}</span>
+                      {item.deductions_vales < item.voucher_total && (
+                        <span className="block text-xs text-text-tertiary">
+                          {`aplicado ${formatMoney(item.deductions_vales)}`}
+                        </span>
+                      )}
+                      {item.pending_debt > 0 && (
+                        <span className="block text-xs text-text-tertiary">
+                          {`deuda pendiente ${formatMoney(item.pending_debt)}`}
+                        </span>
+                      )}
+                    </>
+                  ) : (
+                    "—"
+                  )}
                 </td>
                 <td className={tableCellClass}>
                   {/* El signo es solo presentación: el descuento se guarda positivo. */}

@@ -8998,3 +8998,85 @@ describe("payroll-client: los campos de monto pasan por la máscara de dinero (g
   });
 });
 
+/* ==========================================================================
+   NV-01 (UI): la columna de vales muestra el TOTAL REAL, no el recorte.
+
+   El defecto que midió el dueño: un vale de 50.000 sobre un bruto de 20.000
+   se mostraba como 20.000 —exactamente la comisión de un empleado de
+   porcentaje sin bonos—, porque `capPayrollDiscounts` recortaba el descuento
+   al bruto y ese recorte era lo que la celda mostraba. «Vales son vales»: las
+   dos tablas de liquidación (la cerrada `PeriodDetailTable` y el borrador
+   `DraftPayrollTable`) muestran ahora `voucher_total` —la suma REAL del
+   período—, dicen al lado cuánto se APLICÓ cuando el tope recortó, y dejan ver
+   la deuda pendiente de la fila SOLO cuando existe. Guarda de fuente: sin DOM,
+   sobre el texto real del cliente.
+   ========================================================================== */
+describe("payroll-client: la columna de vales muestra el total real (NV-01, guarda de fuente)", () => {
+  const source = readFileSync(
+    join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
+    "utf8",
+  );
+
+  /** Cuántas veces aparece un fragmento literal en el fuente. */
+  function count(text: string, needle: string): number {
+    return text.split(needle).length - 1;
+  }
+
+  /** El cableado completo: la condición ENVUELVE al texto, no convive con él. */
+  function wired(condition: string, text: string): number {
+    const pattern = new RegExp(
+      `${condition.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} && \\([\\s\\S]{0,200}${text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+      "g",
+    );
+    return [...source.matchAll(pattern)].length;
+  }
+
+  it("piso anti-vacío: el cliente se leyó de verdad", () => {
+    expect(source.length).toBeGreaterThan(20_000);
+    expect(source).toContain("export function PayrollClient");
+  });
+
+  it("las DOS tablas muestran el total REAL de vales con el signo de descuento", () => {
+    // Una ocurrencia por tabla: `PeriodDetailTable` y `DraftPayrollTable`.
+    expect(count(source, "-${formatMoney(item.voucher_total)}")).toBe(2);
+    // El descuento APLICADO ya NO es el valor de la celda: la celda vieja era
+    // justo este fragmento, y muestra lo que el tope persistió.
+    expect(count(source, "-${formatMoney(item.deductions_vales)}")).toBe(0);
+  });
+
+  it("el monto APLICADO se muestra al lado cuando el tope lo recortó", () => {
+    // La condición ES el recorte: si aplicado y total coinciden no hay nada
+    // que explicar y el monto aplicado no se repite.
+    expect(count(source, "item.deductions_vales < item.voucher_total")).toBe(2);
+    expect(count(source, "aplicado ${formatMoney(item.deductions_vales)}")).toBe(2);
+    // Cableado: la condición envuelve el texto en las dos tablas.
+    expect(wired("item.deductions_vales < item.voucher_total", "aplicado ${formatMoney(item.deductions_vales)}")).toBe(2);
+  });
+
+  it("la deuda pendiente se muestra por fila, y SOLO cuando es mayor a 0", () => {
+    expect(count(source, "item.pending_debt > 0")).toBe(2);
+    expect(count(source, "deuda pendiente ${formatMoney(item.pending_debt)}")).toBe(2);
+    expect(wired("item.pending_debt > 0", "deuda pendiente ${formatMoney(item.pending_debt)}")).toBe(2);
+  });
+
+  it("el detector no es un sello de goma (control negativo)", () => {
+    // El marcado VIEJO: el valor aplicado como valor de la celda, sin monto
+    // secundario y sin deuda. Las tres guardas fallan sobre él.
+    const viejo =
+      "<td title={voucherCellTitle(item)}>{" +
+      "`-${formatMoney(item.deductions_vales)}`" +
+      "}</td>";
+    expect(count(viejo, "-${formatMoney(item.voucher_total)}")).toBe(0);
+    expect(count(viejo, "-${formatMoney(item.deductions_vales)}")).toBe(1);
+    expect(count(viejo, "item.deductions_vales < item.voucher_total")).toBe(0);
+    expect(count(viejo, "aplicado ${formatMoney(item.deductions_vales)}")).toBe(0);
+    expect(count(viejo, "item.pending_debt > 0")).toBe(0);
+    expect(count(viejo, "deuda pendiente ${formatMoney(item.pending_debt)}")).toBe(0);
+    // Sin la guarda de «mayor a 0» el texto suelto no cuenta como cableado: se
+    // exige la condición, no una mención casual.
+    const siempre = "{`deuda pendiente ${formatMoney(item.pending_debt)}`}";
+    expect(count(siempre, "item.pending_debt > 0")).toBe(0);
+    expect(wired("item.pending_debt > 0", "deuda pendiente ${formatMoney(item.pending_debt)}")).toBe(2);
+  });
+});
+
