@@ -108,6 +108,31 @@ export function commissionRuleKey(itemType: string, itemId: string): string {
 }
 
 /**
+ * Regla ítem×empleado que aplica a la línea (no hay regla sin `itemRefId`: un
+ * ítem personalizado no es de catálogo). Compartida por la resolución de origen,
+ * la de la tasa y la del monto, para que las tres miren la MISMA regla.
+ */
+function ruleFor(args: {
+  itemType: string;
+  itemRefId: string | null;
+  rules: Map<string, RuleRate>;
+}): RuleRate | null {
+  return args.itemRefId != null
+    ? args.rules.get(commissionRuleKey(args.itemType, args.itemRefId)) ?? null
+    : null;
+}
+
+/**
+ * ¿La regla aporta un valor FIJO por unidad? Un `amount` vacío o 0 no es fijo:
+ * una regla con solo `percent` es PURAMENTE porcentual aunque exista la fila.
+ * Distinguirlo es lo que separa una regla que se paga de inmediato de una que
+ * se acumula para la nómina.
+ */
+function ruleHasFixedAmount(rule: RuleRate): boolean {
+  return rule.amount != null && roundMoney(rule.amount) > 0;
+}
+
+/**
  * true cuando la comisión de la línea es por VALOR FIJO del ítem: productos y
  * personalizados con `commission_value` (> 0). El 0 no es comisión fija: la
  * nómina y el detalle normalizan `commission_value ? … : null`.
@@ -257,7 +282,15 @@ export function resolveEmployeeLineCommission(args: {
  *  - "none": la línea no aporta comisión (ver `lineHasCommissionBasis`).
  * Puro para probarlo sin base de datos.
  */
-export function employeeLineCommissionOrigin(args: {
+export type CommissionOrigin = "commission" | "percent" | "none";
+
+/**
+ * Argumentos compartidos por la resolución de origen (`employeeLineCommissionOrigin`)
+ * y de la tasa aplicada (`employeeLineCommissionPercent`). Son los mismos que
+ * consume `resolveEmployeeLineCommission`, para que origen, tasa y monto no se
+ * puedan separar.
+ */
+export interface EmployeeLineCommissionArgs {
   itemType: string;
   itemRefId: string | null;
   /** Valor fijo de comisión del ítem (producto o `custom`), si la línea lo trae. */
@@ -266,18 +299,42 @@ export function employeeLineCommissionOrigin(args: {
   commissionPercentOverride?: number | null;
   rules: Map<string, RuleRate>;
   flatPercent: number | null;
-}): "commission" | "percent" | "none" {
-  const rule =
-    args.itemRefId != null
-      ? args.rules.get(commissionRuleKey(args.itemType, args.itemRefId)) ?? null
-      : null;
+}
+
+export function employeeLineCommissionOrigin(args: EmployeeLineCommissionArgs): CommissionOrigin {
+  const rule = ruleFor(args);
   if (args.itemType === "producto") {
     if (args.commissionValue) return "commission";
-    return rule ? "commission" : "none";
+    if (!rule) return "none";
+    // Regla ítem×empleado: el valor fijo por unidad manda (también en una regla
+    // mixta); una regla SOLO porcentual es "percent" y no se paga de inmediato.
+    if (ruleHasFixedAmount(rule)) return "commission";
+    return rule.percent != null && roundMoney(rule.percent) > 0 ? "percent" : "none";
   }
   if (args.itemType === "custom" && args.commissionValue) return "commission";
-  if (rule) return "commission";
+  if (rule) {
+    if (ruleHasFixedAmount(rule)) return "commission";
+    return rule.percent != null && roundMoney(rule.percent) > 0 ? "percent" : "none";
+  }
   return effectiveFlatPercent(args) != null ? "percent" : "none";
+}
+
+/**
+ * Tasa de porcentaje APLICADA a la línea cuando su origen es "percent" (el
+ * porcentaje del empleado o, si no lo tiene, el explícito de la línea). Es la
+ * MISMA fuente que usa `resolveEmployeeLineCommission` para calcular el monto,
+ * así que la tasa que se muestra y el monto que se cobra no se pueden separar.
+ * Devuelve `null` en cualquier otro origen: ahí el monto no salió de un
+ * porcentaje y no hay tasa que mostrar.
+ * Puro para probarlo sin base de datos.
+ */
+export function employeeLineCommissionPercent(args: EmployeeLineCommissionArgs): number | null {
+  if (employeeLineCommissionOrigin(args) !== "percent") return null;
+  // Una regla porcentual manda sobre el porcentaje plano del empleado: la tasa
+  // que se muestra tiene que ser la que `resolveEmployeeLineCommission` aplicó.
+  const rule = ruleFor(args);
+  if (rule && rule.percent != null) return Number(rule.percent);
+  return effectiveFlatPercent(args);
 }
 
 /**

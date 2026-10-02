@@ -10,6 +10,7 @@ import {
   getPayrollPeriodCorrectionAction,
   getPeriodDetailAction,
   listPayrollExtrasAction,
+  listPayrollMonthRowsAction,
   listPeriodsAction,
   openPayrollPeriodAction,
   payPayrollExtraAction,
@@ -24,13 +25,16 @@ import type {
 } from "@/src/features/payroll/service";
 import {
   buildPayrollEmployeeIndex,
+  detailLineCommissionOrigin,
   groupPayrollPeriodsByMonth,
+  nextPeriodStartDate,
   payrollEmployeeName,
   payrollExtraGuide,
   payrollExtraKindSchema,
   payrollMonthLabel,
   payrollPeriodCountLabel,
-  replacePayrollMonthPeriod,
+  roundMoney,
+  splitCommissionByOrigin,
   sumMoney,
   summarizePayrollItems,
   type PayrollCorrectionView,
@@ -63,7 +67,7 @@ import {
 } from "@/src/shared/lib/ui-styles";
 import type { ActionResult } from "@/src/shared/lib/api-response";
 import { toNumber } from "@/src/shared/lib/format";
-import { formatMoney } from "@/src/shared/lib/money";
+import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 
 /** Acción destructiva (borrar borrador): contorno y texto en rojo, separada de las demás. */
 const dangerOutlineClass = cn(
@@ -102,6 +106,30 @@ function detailLineLabel(itemType: string): string {
 /** Porcentaje sin decimales innecesarios (10 → "10", 10.5 → "10.5"). */
 function formatPercent(value: number): string {
   return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)));
+}
+
+/**
+ * Texto de ayuda del celular de vales: el número es el TOTAL del período de los
+ * vales del empleado (puede sumar varios), no el vale puntual que la pantalla de
+ * vales muestra por separado. Cuando los descuentos consumen todo el bruto, el
+ * tope de descuentos (`capPayrollDiscounts`) recorta el monto respecto a la suma
+ * real de vales; se dice para que la cifra no se lea como "la suma de los vales".
+ * Solo presentación: no recalcula ni mueve el monto.
+ */
+function voucherCellTitle(item: {
+  base_fixed: number;
+  commissions: number;
+  bonuses: number;
+  deductions_vales: number;
+  other_discounts: number;
+}): string {
+  const base =
+    "Total de los vales del período de este empleado (puede sumar varios vales). Se descuenta del neto.";
+  const gross = roundMoney(item.base_fixed + item.commissions + item.bonuses);
+  const discounts = roundMoney(item.deductions_vales + item.other_discounts);
+  return gross > 0 && discounts >= gross
+    ? `${base} El descuento topa contra el bruto ganado del período.`
+    : base;
 }
 
 /**
@@ -182,23 +210,6 @@ function formatFullDate(value: string): string {
   return `${date.day} ${MONTHS_SHORT[date.month - 1]} ${date.year}`;
 }
 
-/** Día siguiente a una fecha yyyy-mm-dd (aritmética UTC, solo fechas). */
-function nextDay(value: string): string {
-  const date = parseIsoDate(value);
-  if (!date) return "";
-  const next = new Date(Date.UTC(date.year, date.month - 1, date.day + 1));
-  return next.toISOString().slice(0, 10);
-}
-
-/** Último fin de periodo registrado (los rangos llegan ordenados desc). */
-function latestEndDate(rows: PayrollPeriodRow[]): string | null {
-  let latest: string | null = null;
-  for (const row of rows) {
-    if (latest === null || row.end_date > latest) latest = row.end_date;
-  }
-  return latest;
-}
-
 /** Primer periodo cuyo rango se solapa con [start, end] (fechas ISO comparables como texto). */
 function findOverlappingPeriod(
   rows: PayrollPeriodRow[],
@@ -260,8 +271,6 @@ interface PayrollClientProps {
    * Agregan plata de TODA la planta, así que llegan vacíos para el empleado.
    */
   initialSummaries: PayrollPeriodSummary[];
-  /** PA3: mes a la fecha por empleado (mismo motivo: es de toda la planta). */
-  initialMonthToDate: PayrollMonthEmployeeRow[];
   methods: PaymentMethodRow[];
   canAdmin: boolean;
   canPay: boolean;
@@ -280,7 +289,7 @@ interface PeriodDetailTableProps {
 function PeriodDetailTable({ items, employeeName, payLabel, onView }: PeriodDetailTableProps) {
   return (
     <div className="mt-4 overflow-x-auto">
-      <table className={cn("w-full text-left text-sm", "min-w-[960px]")}>
+      <table className={cn("w-full text-left text-sm", "min-w-[1040px]")}>
         <thead>
           <tr className={tableHeaderClass}>
             <th className={tableCellClass} scope="col">
@@ -290,16 +299,19 @@ function PeriodDetailTable({ items, employeeName, payLabel, onView }: PeriodDeta
               Fijo (días)
             </th>
             <th className={tableCellClass} scope="col">
-              Comisiones
+              Comisión fija
+            </th>
+            <th className={tableCellClass} scope="col">
+              Comisión por porcentaje
             </th>
             <th className={tableCellClass} scope="col">
               Bonos
             </th>
             <th className={tableCellClass} scope="col">
-              Vales
+              Vales (descuento)
             </th>
             <th className={tableCellClass} scope="col">
-              Otros
+              Otros (descuento)
             </th>
             <th className={tableCellClass} scope="col">
               Neto
@@ -316,32 +328,45 @@ function PeriodDetailTable({ items, employeeName, payLabel, onView }: PeriodDeta
           </tr>
         </thead>
         <tbody>
-          {items.map((item) => (
-            <tr key={item.id} className={tableRowClass}>
-              <td className={tableCellClass}>
-                <span className="block">{employeeName(item.employee_id)}</span>
-                <span className="block text-xs text-text-tertiary">{payLabel(item.employee_id)}</span>
-              </td>
-              <td className={tableCellClass}>{formatMoney(item.base_fixed)}</td>
-              <td className={tableCellClass}>{formatMoney(item.commissions)}</td>
-              <td className={tableCellClass}>{formatMoney(item.bonuses)}</td>
-              <td className={tableCellClass}>{formatMoney(item.deductions_vales)}</td>
-              <td className={tableCellClass}>{formatMoney(item.other_discounts)}</td>
-              <td className={cn(tableCellClass, "font-semibold")}>{formatMoney(item.net_pay)}</td>
-              <td className={tableCellClass}>{formatMoney(item.paid)}</td>
-              <td className={tableCellClass}>{formatMoney(item.remaining)}</td>
-              <td className={tableCellClass}>
-                <button
-                  type="button"
-                  onClick={() => onView(item)}
-                  aria-label={`Ver el desglose de ${employeeName(item.employee_id)}`}
-                  className={ghostClass}
-                >
-                  Ver
-                </button>
-              </td>
-            </tr>
-          ))}
+          {items.map((item) => {
+            // Reclasificación sin mover el total: fija = comisiones − porcentaje.
+            const commission = splitCommissionByOrigin({
+              commissions: item.commissions,
+              detail: item.detail_json,
+            });
+            return (
+              <tr key={item.id} className={tableRowClass}>
+                <td className={tableCellClass}>
+                  <span className="block">{employeeName(item.employee_id)}</span>
+                  <span className="block text-xs text-text-tertiary">
+                    {payLabel(item.employee_id)}
+                  </span>
+                </td>
+                <td className={tableCellClass}>{formatMoney(item.base_fixed)}</td>
+                <td className={tableCellClass}>{formatMoney(commission.fixed)}</td>
+                <td className={tableCellClass}>{formatMoney(commission.percent)}</td>
+                <td className={tableCellClass}>{formatMoney(item.bonuses)}</td>
+                {/* El signo es solo presentación: el vale se guarda positivo. */}
+                <td className={tableCellClass} title={voucherCellTitle(item)}>
+                  {`-${formatMoney(item.deductions_vales)}`}
+                </td>
+                <td className={tableCellClass}>{`-${formatMoney(item.other_discounts)}`}</td>
+                <td className={cn(tableCellClass, "font-semibold")}>{formatMoney(item.net_pay)}</td>
+                <td className={tableCellClass}>{formatMoney(item.paid)}</td>
+                <td className={tableCellClass}>{formatMoney(item.remaining)}</td>
+                <td className={tableCellClass}>
+                  <button
+                    type="button"
+                    onClick={() => onView(item)}
+                    aria-label={`Ver el desglose de ${employeeName(item.employee_id)}`}
+                    className={ghostClass}
+                  >
+                    Ver
+                  </button>
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -460,16 +485,19 @@ function DraftPayrollTable({
               Fijo (días)
             </th>
             <th className={tableCellClass} scope="col">
-              Comisiones
+              Comisión fija
+            </th>
+            <th className={tableCellClass} scope="col">
+              Comisión por porcentaje
             </th>
             <th className={tableCellClass} scope="col">
               Bonos
             </th>
             <th className={tableCellClass} scope="col">
-              Vales
+              Vales (descuento)
             </th>
             <th className={tableCellClass} scope="col">
-              Otros
+              Otros (descuento)
             </th>
             <th className={tableCellClass} scope="col">
               Neto
@@ -488,6 +516,10 @@ function DraftPayrollTable({
         <tbody>
           {rows.map((row) => {
             const item = row.item;
+            // Reclasificación sin mover el total: fija = comisiones − porcentaje.
+            const commission = item
+              ? splitCommissionByOrigin({ commissions: item.commissions, detail: item.detail_json })
+              : null;
             return (
               <tr key={row.employeeId} className={tableRowClass}>
                 <td className={tableCellClass}>
@@ -495,29 +527,37 @@ function DraftPayrollTable({
                   <span className="block text-xs text-text-tertiary">{payLabel(row.employeeId)}</span>
                 </td>
                 <td className={tableCellClass}>{item ? formatMoney(item.base_fixed) : "—"}</td>
-                <td className={tableCellClass}>{item ? formatMoney(item.commissions) : "—"}</td>
+                <td className={tableCellClass}>
+                  {commission ? formatMoney(commission.fixed) : "—"}
+                </td>
+                <td className={tableCellClass}>
+                  {commission ? formatMoney(commission.percent) : "—"}
+                </td>
                 <td className={tableCellClass}>
                   <input
-                    type="number"
-                    min="0"
                     inputMode="numeric"
-                    value={adjustmentValue(row.employeeId, "bonuses")}
-                    onChange={(event) => onAdjustmentChange(row.employeeId, "bonuses", event.target.value)}
+                    value={formatMoneyInput(adjustmentValue(row.employeeId, "bonuses"))}
+                    onChange={(event) => onAdjustmentChange(row.employeeId, "bonuses", stripMoneyInput(event.target.value))}
                     aria-label={`Bonos de ${employeeName(row.employeeId)}`}
                     className={tableInputClass}
                   />
                 </td>
-                <td className={tableCellClass}>{item ? formatMoney(item.deductions_vales) : "—"}</td>
+                {/* El signo es solo presentación: el vale se guarda positivo. */}
+                <td className={tableCellClass} title={item ? voucherCellTitle(item) : undefined}>
+                  {item ? `-${formatMoney(item.deductions_vales)}` : "—"}
+                </td>
                 <td className={tableCellClass}>
-                  <input
-                    type="number"
-                    min="0"
-                    inputMode="numeric"
-                    value={adjustmentValue(row.employeeId, "others")}
-                    onChange={(event) => onAdjustmentChange(row.employeeId, "others", event.target.value)}
-                    aria-label={`Otros descuentos de ${employeeName(row.employeeId)}`}
-                    className={tableInputClass}
-                  />
+                  {/* El signo es solo presentación: el descuento se guarda positivo. */}
+                  <span className="inline-flex items-center gap-1">
+                    <span aria-hidden="true">−</span>
+                    <input
+                      inputMode="numeric"
+                      value={formatMoneyInput(adjustmentValue(row.employeeId, "others"))}
+                      onChange={(event) => onAdjustmentChange(row.employeeId, "others", stripMoneyInput(event.target.value))}
+                      aria-label={`Otros descuentos de ${employeeName(row.employeeId)}`}
+                      className={tableInputClass}
+                    />
+                  </span>
                 </td>
                 <td className={cn(tableCellClass, "font-semibold")}>
                   {item ? formatMoney(item.net_pay) : "—"}
@@ -543,7 +583,7 @@ function DraftPayrollTable({
           })}
           {rows.length === 0 && (
             <tr className={tableRowClass}>
-              <td className={tableCellClass} colSpan={10}>
+              <td className={tableCellClass} colSpan={11}>
                 No hay empleados activos para liquidar.
               </td>
             </tr>
@@ -607,8 +647,14 @@ function ExpandedItemPanel({
           {item.detail_json.map((line) => (
             <li key={line.item_id}>
               Factura #{line.consecutive_number ?? "?"} · {detailLineLabel(line.item_type)} × {line.qty} a{" "}
-              {formatMoney(line.unit_price)} = {formatMoney(line.line_subtotal)} → comisión{" "}
-              {formatMoney(line.commission)}
+              {formatMoney(line.unit_price)} = {formatMoney(line.line_subtotal)} →{" "}
+              {detailLineCommissionOrigin(line) === "percent"
+                ? `comisión por porcentaje ${formatMoney(line.commission)}${
+                    line.commission_percent != null
+                      ? ` (${formatPercent(line.commission_percent)}%)`
+                      : ""
+                  }`
+                : `comisión fija ${formatMoney(line.commission)}`}
             </li>
           ))}
         </ul>
@@ -656,11 +702,9 @@ function ExpandedItemPanel({
                     </td>
                     <td className={tableCellClass}>
                       <input
-                        type="number"
-                        min="0"
                         inputMode="numeric"
-                        value={portion.amount}
-                        onChange={(event) => onPortionChange(portion.key, { amount: event.target.value })}
+                        value={formatMoneyInput(portion.amount)}
+                        onChange={(event) => onPortionChange(portion.key, { amount: stripMoneyInput(event.target.value) })}
                         aria-label={`Monto de la porción ${index + 1}`}
                         placeholder="0"
                         className={tableInputClass}
@@ -727,18 +771,27 @@ export function PayrollClient(props: PayrollClientProps) {
   const [selectedId, setSelectedId] = useState<string | null>(props.initialPeriods[0]?.id ?? null);
   const [detail, setDetail] = useState<PeriodDetail | null>(null);
   const [detailTargetId, setDetailTargetId] = useState<string | null>(null);
-  // PA3: el resumen por período y el mes a la fecha llegan leídos del servidor
-  // (agregan plata de TODA la planta) y se PISAN con el detalle más fresco de
-  // cada período: abrir, calcular, pagar, cerrar o borrar. Es estado, no
-  // derivación, porque el servidor es la única fuente de un agregado de la sede
-  // y lo único que lo actualiza es una lectura suya.
+  // PA3: el resumen por período llega leído del servidor (agrega plata de TODA
+  // la planta) y se PISA con el detalle más fresco de cada período: abrir,
+  // calcular, pagar, cerrar o borrar. Es estado, no derivación, porque el
+  // servidor es la única fuente de un agregado de la sede y lo único que lo
+  // actualiza es una lectura suya.
   const [summaries, setSummaries] = useState<Record<string, PayrollItemTotals>>(() =>
     indexPeriodTotals(props.initialSummaries),
   );
-  const [monthRows, setMonthRows] = useState<PayrollMonthEmployeeRow[]>(props.initialMonthToDate);
-  // Filtro de estado de la lista y mes que se está mirando en "pagos del mes".
+  // Filtro de estado de la lista de períodos.
   const [statusFilter, setStatusFilter] = useState<string>("todos");
-  const [monthFilter, setMonthFilter] = useState<string>("");
+  // PA3 (consulta puntual): "pagos del mes por empleado" NO llega leído del
+  // servidor. El formulario guarda lo ELEGIDO y `monthQuery` lo ÚLTIMO
+  // consultado con su resultado; `null` es el estado previo a la consulta, que
+  // no muestra tabla ni número alguno.
+  const [queryMonth, setQueryMonth] = useState<string>("");
+  const [queryEmployeeId, setQueryEmployeeId] = useState<string>("");
+  const [monthQuery, setMonthQuery] = useState<{
+    month: string;
+    employeeId: string;
+    rows: PayrollMonthEmployeeRow[];
+  } | null>(null);
   // Un solo canal de ESTADO: lo que sigue siendo el caso mientras no se
   // corrija (fallo de acción o validación incompleta). Lo que acaba de pasar
   // (éxito) es EVENTO y sale por `toast`, no por estado.
@@ -911,14 +964,13 @@ export function PayrollClient(props: PayrollClientProps) {
 
   /**
    * Acepta el detalle MÁS FRESCO de un período. Es la única lectura de nómina
-   * que vuelve de una acción, así que es la que pisa el resumen del período y su
-   * porción del mes a la fecha: sin esto, el monto que el admin acaba de pagar
-   * (o recalcular) seguiría mostrándose viejo en la lista hasta recargar.
+   * que vuelve de una acción, así que es la que pisa el resumen del período: sin
+   * esto, el monto que el admin acaba de pagar (o recalcular) seguiría
+   * mostrándose viejo en la lista hasta recargar.
    */
   function acceptDetail(next: PeriodDetail) {
     setDetail(next);
     setSummaries((prev) => ({ ...prev, [next.period.id]: summarizePayrollItems(next.items) }));
-    setMonthRows((prev) => replacePayrollMonthPeriod({ rows: prev, period: next.period, items: next.items }));
   }
 
   // Inventory-style cancel: closing the dialog always resets its state.
@@ -970,6 +1022,15 @@ export function PayrollClient(props: PayrollClientProps) {
     }
     if (endDate < startDate) {
       setOpenError("La fecha final no puede ser anterior a la inicial.");
+      return;
+    }
+    // Mismo piso que el `min` del campo, pero dicho con la fecha válida: si el
+    // usuario la escribe a mano, el aviso nombra el día a partir del cual sí.
+    const minimumStart = nextPeriodStartDate(periods);
+    if (minimumStart !== null && startDate < minimumStart) {
+      setOpenError(
+        `El período no puede empezar antes del ${formatFullDate(minimumStart)}: ese es el día siguiente al fin del último período registrado.`,
+      );
       return;
     }
     const collision = findOverlappingPeriod(periods, startDate, endDate);
@@ -1321,16 +1382,15 @@ export function PayrollClient(props: PayrollClientProps) {
       const removed = periods.find((row) => row.id === selectedId) ?? null;
       closeDetail();
       setSelectedId(null);
-      // El período borrado sale también del resumen y del mes a la fecha: si
-      // quedara, la vista seguiría mostrando plata de un período que ya no
-      // existe (y cuyos pagos se devolvieron).
+      // El período borrado sale también del resumen: si quedara, la vista
+      // seguiría mostrando plata de un período que ya no existe (y cuyos pagos
+      // se devolvieron).
       if (removed) {
         setSummaries((prev) => {
           const rest = { ...prev };
           delete rest[removed.id];
           return rest;
         });
-        setMonthRows((prev) => replacePayrollMonthPeriod({ rows: prev, period: removed, items: [] }));
       }
       await refreshPeriods();
     }
@@ -1345,8 +1405,9 @@ export function PayrollClient(props: PayrollClientProps) {
     : null;
 
   // Ayuda para elegir el rango del nuevo periodo, construida solo con `periods`.
-  const lastEnd = latestEndDate(periods);
-  const suggestedStart = lastEnd ? nextDay(lastEnd) : null;
+  // El piso es el día siguiente al último fin liquidado (función pura del
+  // esquema): `null` cuando aún no hay períodos, o sea el primero es libre.
+  const suggestedStart = nextPeriodStartDate(periods);
   const draftPeriods = periods.filter((row) => row.status === "borrador");
   const rangeInvalid = Boolean(startDate && endDate && endDate < startDate);
   const overlap =
@@ -1407,10 +1468,33 @@ export function PayrollClient(props: PayrollClientProps) {
     return `${employees} · Neto ${formatMoney(totals.netTotal)} · Pagado ${formatMoney(totals.paidTotal)} · Saldo ${formatMoney(totals.remainingTotal)}`;
   }
 
-  // PA3: mes a la fecha por empleado del mes elegido (el más reciente por defecto).
-  const monthOptions = [...new Set(monthRows.map((row) => row.month))].sort().reverse();
-  const activeMonth = monthFilter || monthOptions[0] || "";
-  const monthView = monthRows.filter((row) => row.month === activeMonth);
+  // PA3 (consulta puntual): los meses que se pueden consultar, derivados de los
+  // períodos que la pantalla ya tiene (la fecha de INICIO define el mes, la
+  // misma regla que la lectura del servidor). El más reciente primero.
+  const monthOptions = groupPayrollPeriodsByMonth(periods)
+    .map((group) => group.month)
+    .filter((month) => month !== "");
+
+  /**
+   * PA3 (consulta puntual): el admin pide los pagos de UN mes de UN empleado.
+   * Es una lectura del servidor (agrega plata de la sede) envuelta en la
+   * transición de vista, para que la UI no se congele mientras responde. El
+   * resultado reemplaza al anterior; `monthQuery` nace en `null` (nada leído) y
+   * aquí pasa a tener lo consultado.
+   */
+  function handleMonthQuery(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!queryMonth || !queryEmployeeId) return;
+    startViewTransition(async () => {
+      const result = (await listPayrollMonthRowsAction({
+        month: queryMonth,
+        employeeId: queryEmployeeId,
+      })) as ActionResult<PayrollMonthEmployeeRow[]>;
+      if (show(result)) {
+        setMonthQuery({ month: queryMonth, employeeId: queryEmployeeId, rows: result.data });
+      }
+    });
+  }
 
   /** Sueldo mensual del empleado: la base de la prorata, a la vista. */
   function monthSalaryLabel(id: string): string {
@@ -1498,6 +1582,9 @@ export function PayrollClient(props: PayrollClientProps) {
             type="button"
             onClick={() => {
               setOpenError(null);
+              // Prefija el piso (editable): el caso común —abrir el período
+              // que sigue al último liquidado— queda a un clic.
+              setStartDate(nextPeriodStartDate(periods) ?? "");
               setOpenDialogOpen(true);
             }}
             className={`${buttonClass} mt-3`}
@@ -1648,95 +1735,131 @@ export function PayrollClient(props: PayrollClientProps) {
             (despido, renuncia, emergencia) NO entran en estos totales: no pertenecen a ningún
             período y están listados en su propia sección.
           </p>
-          {monthOptions.length === 0 ? (
+          {/*
+            PA3 (consulta puntual): el mes y el empleado los ELIGE el admin; la
+            lectura no ocurre antes. La transición de vista (`isViewPending`) es
+            la misma del resto de la pantalla, así que la UI no se congela
+            mientras el servidor responde.
+          */}
+          <form onSubmit={handleMonthQuery} className="mt-3 flex flex-wrap items-end gap-3">
+            <label className={labelClass} htmlFor="payroll-month-filter">
+              Mes
+              <select
+                id="payroll-month-filter"
+                value={queryMonth}
+                onChange={(event) => setQueryMonth(event.target.value)}
+                className={inputClass}
+                required
+              >
+                <option value="">Mes…</option>
+                {monthOptions.map((month) => (
+                  <option key={month} value={month}>
+                    {payrollMonthLabel(month)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className={labelClass} htmlFor="payroll-month-employee">
+              Empleado
+              <select
+                id="payroll-month-employee"
+                value={queryEmployeeId}
+                onChange={(event) => setQueryEmployeeId(event.target.value)}
+                className={inputClass}
+                required
+              >
+                <option value="">Empleado…</option>
+                {props.initialEmployees.map((row) => (
+                  <option key={row.id} value={row.id}>
+                    {employeeName(row.id)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="submit"
+              disabled={!queryMonth || !queryEmployeeId || isViewPending}
+              className={buttonClass}
+            >
+              {isViewPending ? "Consultando…" : "Consultar"}
+            </button>
+          </form>
+          {monthQuery === null ? (
+            // Antes de la consulta no hay tabla ni número: la pantalla sólo pide
+            // el mes y el empleado.
             <p className="mt-3 text-sm text-text-tertiary">
-              Sin pagos de nómina registrados todavía.
+              Elija mes y empleado para consultar sus pagos.
             </p>
+          ) : isViewPending ? (
+            <p className="mt-3 text-sm text-text-tertiary">Consultando…</p>
           ) : (
-            <>
-              <label className={labelClass} htmlFor="payroll-month-filter">
-                Mes
-                <select
-                  id="payroll-month-filter"
-                  value={activeMonth}
-                  onChange={(event) => setMonthFilter(event.target.value)}
-                  className={inputClass}
-                >
-                  {monthOptions.map((month) => (
-                    <option key={month} value={month}>
-                      {payrollMonthLabel(month)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <div className="mt-3 overflow-x-auto">
-                <table className={cn("w-full text-left text-sm", "min-w-[960px]")}>
-                  <thead>
-                    <tr className={tableHeaderClass}>
-                      <th className={tableCellClass} scope="col">
-                        Empleado
-                      </th>
-                      <th className={tableCellClass} scope="col">
-                        Fijo prorrateado (días)
-                      </th>
-                      <th className={tableCellClass} scope="col">
-                        Neto
-                      </th>
-                      <th className={tableCellClass} scope="col">
-                        Pagado
-                      </th>
-                      <th className={tableCellClass} scope="col">
-                        Saldo
-                      </th>
-                      <th className={tableCellClass} scope="col">
-                        Períodos
-                      </th>
+            <div className="mt-3 overflow-x-auto">
+              <table className={cn("w-full text-left text-sm", "min-w-[960px]")}>
+                <thead>
+                  <tr className={tableHeaderClass}>
+                    <th className={tableCellClass} scope="col">
+                      Empleado
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Fijo prorrateado (días)
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Neto
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Pagado
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Saldo
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Períodos
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {monthQuery.rows.map((row) => (
+                    <tr key={`${row.month}-${row.employeeId}`} className={tableRowClass}>
+                      <td className={tableCellClass}>
+                        <span className="block">{employeeName(row.employeeId)}</span>
+                        <span className="block text-xs text-text-tertiary">
+                          {monthSalaryLabel(row.employeeId)}
+                        </span>
+                      </td>
+                      <td className={tableCellClass}>
+                        <span className="block">{formatMoney(row.fixedTotal)}</span>
+                        <span className="block text-xs text-text-tertiary">
+                          {row.days === 1 ? "1 día nominado" : `${row.days} días nominados`}
+                        </span>
+                      </td>
+                      <td className={tableCellClass}>{formatMoney(row.netTotal)}</td>
+                      <td className={tableCellClass}>{formatMoney(row.paidTotal)}</td>
+                      <td className={cn(tableCellClass, "font-semibold")}>
+                        {formatMoney(row.remainingTotal)}
+                      </td>
+                      <td className={tableCellClass}>
+                        <ul className="flex flex-col gap-0.5">
+                          {row.periods.map((entry) => (
+                            <li key={entry.periodId}>
+                              {formatPeriodLabel(entry)} ({entry.status}): neto{" "}
+                              {formatMoney(entry.net)}, pagado {formatMoney(entry.paid)}, saldo{" "}
+                              {formatMoney(entry.remaining)}
+                            </li>
+                          ))}
+                        </ul>
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {monthView.map((row) => (
-                      <tr key={`${row.month}-${row.employeeId}`} className={tableRowClass}>
-                        <td className={tableCellClass}>
-                          <span className="block">{employeeName(row.employeeId)}</span>
-                          <span className="block text-xs text-text-tertiary">
-                            {monthSalaryLabel(row.employeeId)}
-                          </span>
-                        </td>
-                        <td className={tableCellClass}>
-                          <span className="block">{formatMoney(row.fixedTotal)}</span>
-                          <span className="block text-xs text-text-tertiary">
-                            {row.days === 1 ? "1 día nominado" : `${row.days} días nominados`}
-                          </span>
-                        </td>
-                        <td className={tableCellClass}>{formatMoney(row.netTotal)}</td>
-                        <td className={tableCellClass}>{formatMoney(row.paidTotal)}</td>
-                        <td className={cn(tableCellClass, "font-semibold")}>
-                          {formatMoney(row.remainingTotal)}
-                        </td>
-                        <td className={tableCellClass}>
-                          <ul className="flex flex-col gap-0.5">
-                            {row.periods.map((entry) => (
-                              <li key={entry.periodId}>
-                                {formatPeriodLabel(entry)} ({entry.status}): neto{" "}
-                                {formatMoney(entry.net)}, pagado {formatMoney(entry.paid)}, saldo{" "}
-                                {formatMoney(entry.remaining)}
-                              </li>
-                            ))}
-                          </ul>
-                        </td>
-                      </tr>
-                    ))}
-                    {monthView.length === 0 && (
-                      <tr className={tableRowClass}>
-                        <td className={tableCellClass} colSpan={6}>
-                          {`Sin pagos de nómina en ${payrollMonthLabel(activeMonth)}.`}
-                        </td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </>
+                  ))}
+                  {monthQuery.rows.length === 0 && (
+                    <tr className={tableRowClass}>
+                      <td className={tableCellClass} colSpan={6}>
+                        {`Sin pagos de nómina de ${employeeName(monthQuery.employeeId)} en ${payrollMonthLabel(monthQuery.month)}.`}
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
           )}
         </section>
       )}
@@ -1804,12 +1927,10 @@ export function PayrollClient(props: PayrollClientProps) {
                   Monto
                   <input
                     id="payroll-extra-amount"
-                    type="number"
-                    min="0"
                     inputMode="numeric"
-                    value={extraAmount}
+                    value={formatMoneyInput(extraAmount)}
                     onChange={(event) => {
-                      setExtraAmount(event.target.value);
+                      setExtraAmount(stripMoneyInput(event.target.value));
                       setExtraError(null);
                     }}
                     placeholder="0"
@@ -1969,6 +2090,7 @@ export function PayrollClient(props: PayrollClientProps) {
                       setStartDate(event.target.value);
                       setOpenError(null);
                     }}
+                    min={suggestedStart ?? undefined}
                     className={inputClass}
                     required
                   />

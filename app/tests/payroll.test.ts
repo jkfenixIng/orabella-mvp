@@ -23,8 +23,10 @@ import {
   computeNetPay,
   correctPayrollPeriodSchema,
   daysInMonthWithinRange,
+  detailLineCommissionOrigin,
   groupPayrollPeriodsByMonth,
   isVoucherDayAllowed,
+  nextPeriodStartDate,
   normalizeAllowedDays,
   normalizePerDayLimits,
   openPeriodSchema,
@@ -38,6 +40,7 @@ import {
   payrollPeriodCountLabel,
   prorateFixedSalary,
   rangesOverlap,
+  splitCommissionByOrigin,
   rejectVoucherSchema,
   replacePayrollMonthPeriod,
   requestVoucherSchema,
@@ -56,6 +59,7 @@ import {
 } from "@/src/features/payroll/schemas";
 import {
   commissionRuleKey,
+  employeeLineCommissionPercent,
   resolveEmployeeLineCommission,
 } from "@/src/features/commissions/schemas";
 import {
@@ -63,6 +67,7 @@ import {
   calculatePayroll,
   getPayrollPeriodCorrection,
   getPeriodDetail,
+  listPayrollMonthRows,
   listPayrollOverview,
   listPeriods,
   openPayrollPeriod,
@@ -452,6 +457,444 @@ describe("payroll: detalle de comisiones con la resolución compartida (PAY-02/P
     );
     // 250000 × 8% = 20000 + 1000 × 2 = 22000.
     expect(detail[0].commission).toBe(22000);
+  });
+
+  it("marca el origen y la tasa de una línea por porcentaje (con decimales)", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "porcentaje",
+      commissionPercent: 7.5,
+      lines: [
+        line({
+          item_id: "svc",
+          item_type: "servicio",
+          item_ref_id: "svc-1",
+          qty: 1,
+          unit_price: 123456,
+          line_subtotal: 123456,
+        }),
+      ],
+      rules: new Map(),
+    });
+    expect(detail).toHaveLength(1);
+    expect(detail[0].commission_origin).toBe("percent");
+    expect(detail[0].commission_percent).toBe(7.5);
+    // 123456 × 7.5% = 9259.2 → 9259: la tasa y el monto salen de la misma
+    // resolución y el dinero del sistema es a peso entero (roundMoney).
+    expect(detail[0].commission).toBe(9259);
+    expect(
+      employeeLineCommissionPercent({
+        itemType: "servicio",
+        itemRefId: "svc-1",
+        commissionValue: null,
+        rules: new Map(),
+        flatPercent: 7.5,
+      }),
+    ).toBe(7.5);
+  });
+
+  it("una línea fija/producto no lleva tasa y su origen es commission", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "porcentaje",
+      commissionPercent: 10,
+      lines: [line({ commission_value: 1000 })],
+      rules: new Map(),
+    });
+    expect(detail[0].commission_origin).toBe("commission");
+    expect(detail[0].commission_percent).toBeNull();
+    expect(
+      employeeLineCommissionPercent({
+        itemType: "producto",
+        itemRefId: "prod-1",
+        commissionValue: 1000,
+        rules: new Map(),
+        flatPercent: 10,
+      }),
+    ).toBeNull();
+  });
+
+  it("reclasificación: fija + porcentaje suman EXACTAMENTE las comisiones del ítem", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "porcentaje",
+      commissionPercent: 7.5,
+      lines: [
+        line({
+          item_id: "svc",
+          item_type: "servicio",
+          item_ref_id: "svc-1",
+          qty: 1,
+          unit_price: 123456,
+          line_subtotal: 123456,
+        }),
+        line({ item_id: "prod", commission_value: 1000 }),
+      ],
+      rules: new Map(),
+    });
+    const { commissions } = buildEmployeeDetail(detail);
+    const split = splitCommissionByOrigin({ commissions, detail });
+    expect(split.percent).toBe(9259);
+    expect(split.fixed).toBe(1000);
+    expect(split.fixed + split.percent).toBe(commissions);
+  });
+
+  it("la parte fija se DERIVA por resta: con pago inmediato descontado, el total no se mueve", () => {
+    const detail = buildEmployeeCommissionDetail({
+      employeeId: "emp-1",
+      payoutMode: "nomina",
+      payType: "porcentaje",
+      commissionPercent: 7.5,
+      lines: [
+        line({
+          item_id: "svc",
+          item_type: "servicio",
+          item_ref_id: "svc-1",
+          qty: 1,
+          unit_price: 123456,
+          line_subtotal: 123456,
+        }),
+        line({ item_id: "prod", commission_value: 1000 }),
+      ],
+      rules: new Map(),
+    });
+    // La nómina persiste `earned − pagado inmediato`: solo el producto (1000)
+    // pudo pagarse de inmediato, así que el total baja a 9259 y la parte fija
+    // se absorbe por completo. Las dos columnas siguen sumando el total.
+    const netOfImmediate = 9259;
+    const split = splitCommissionByOrigin({ commissions: netOfImmediate, detail });
+    expect(split.percent).toBe(9259);
+    expect(split.fixed).toBe(0);
+    expect(split.fixed + split.percent).toBe(netOfImmediate);
+  });
+
+  it("la parte porcentual con decimales se redondea a peso y las columnas siguen cuadrando", () => {
+    // 123456 × 7.5% = 9259.2: el porcentaje puede producir fracción de peso,
+    // pero el dinero es a peso entero (roundMoney). La parte fija derivada por
+    // resta garantiza fija + porcentaje === total redondeado, sin deriva.
+    const detail = [{ commission: 9259.2, commission_origin: "percent" as const }];
+    const split = splitCommissionByOrigin({ commissions: 9259.2, detail });
+    expect(split.percent).toBe(9259);
+    expect(split.fixed).toBe(0);
+    expect(split.fixed + split.percent).toBe(Math.round(9259.2));
+  });
+
+  it("el invariante se sostiene aunque el porcentaje supere el total (tope, no negativo)", () => {
+    const detail = [{ commission: 10, commission_origin: "percent" as const }];
+    const split = splitCommissionByOrigin({ commissions: 6, detail });
+    expect(split.percent).toBe(6);
+    expect(split.fixed).toBe(0);
+    expect(split.fixed + split.percent).toBe(6);
+  });
+
+  // ---------------------------------- filas viejas sin `commission_origin` ---
+  //
+  // El `commission_origin` solo lo escribe el calculador: los ítems guardados
+  // ANTES del cambio no lo traen y un período CERRADO no se puede recalcular.
+  // El origen se DEDUCE al leer, con lo que la fila ya guarda, para que el
+  // porcentaje no siga apareciendo como comisión fija.
+  it("una línea vieja por porcentaje se deduce `percent` y NO cae en la parte fija", () => {
+    // Fila persistida por la versión anterior: servicio con el % del empleado,
+    // sin `commission_origin` y sin `commission_percent`.
+    const oldLine = {
+      item_type: "servicio",
+      commission_value: null,
+      line_subtotal: 100000,
+      commission: 10000, // 100000 × 10%
+      qty: 1,
+    };
+    expect(detailLineCommissionOrigin(oldLine)).toBe("percent");
+
+    const split = splitCommissionByOrigin({
+      commissions: 10000,
+      detail: [{ ...oldLine, commission_percent: undefined }],
+    });
+    expect(split.percent).toBe(10000);
+    expect(split.fixed).toBe(0);
+    expect(split.fixed + split.percent).toBe(10000);
+  });
+
+  it("una línea vieja de producto con valor fijo se deduce `commission`", () => {
+    expect(
+      detailLineCommissionOrigin({
+        item_type: "producto",
+        commission_value: 1000,
+        line_subtotal: 3000,
+        commission: 3000,
+        qty: 3,
+      }),
+    ).toBe("commission");
+  });
+
+  it("una línea vieja sin comisión no tiene origen que mostrar", () => {
+    expect(
+      detailLineCommissionOrigin({
+        item_type: "servicio",
+        commission_value: null,
+        line_subtotal: 100000,
+        commission: 0,
+        qty: 1,
+      }),
+    ).toBe("none");
+  });
+
+  it("una fila vieja mixta (porcentaje + valor fijo) cuadra el total en ambas columnas", () => {
+    const oldDetail = [
+      {
+        item_type: "servicio",
+        commission_value: null,
+        line_subtotal: 100000,
+        commission: 10000,
+        qty: 1,
+      },
+      {
+        item_type: "producto",
+        commission_value: 1000,
+        line_subtotal: 3000,
+        commission: 3000,
+        qty: 3,
+      },
+    ];
+    const total = 13000;
+    const split = splitCommissionByOrigin({ commissions: total, detail: oldDetail });
+    expect(split.percent).toBe(10000);
+    expect(split.fixed).toBe(3000);
+    expect(split.fixed + split.percent).toBe(total);
+  });
+
+  it("el origen persistido manda sobre la deducción (no se pisa lo que el cálculo ya marcó)", () => {
+    expect(
+      detailLineCommissionOrigin({
+        item_type: "producto",
+        commission_value: 1000,
+        line_subtotal: 3000,
+        commission: 3000,
+        qty: 3,
+        commission_origin: "percent",
+      }),
+    ).toBe("percent");
+  });
+});
+
+// ------------------- comisión solo de facturas PAGADAS (regla del dueño) ---
+//
+// Decisión del dueño (2026-10-01): la comisión se gana cuando la factura queda
+// `Pagada`. Una factura `Emitida` —o anulada después— no comisiona: el dinero no
+// entró a caja. El filtro de la lectura de nómina es `= Pagada`, no "≠ Anulada".
+describe("payroll: la comisión solo sale de facturas Pagada (regla del dueño)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const SUBTOTAL = 10_000;
+
+  function employeeRow() {
+    return {
+      id: payrollPagedStub.EMPLOYEE_ID,
+      sede_id: payrollPagedStub.SEDE_ID,
+      user_id: null,
+      full_name: "Empleada pagada",
+      employee_code: "E-9",
+      document: "1000000009",
+      phone: null,
+      position: null,
+      payout_mode: "normal",
+      email: null,
+      birth_date: null,
+      pay_type: "porcentaje",
+      salary_fixed: null,
+      commission_percent: 10,
+      is_active: true,
+    };
+  }
+
+  function seedInvoices(statuses: string[]) {
+    const invoices = statuses.map((status, index) => ({
+      id: `factura-${index + 1}`,
+      consecutive_number: index + 1,
+      sede_id: payrollPagedStub.SEDE_ID,
+      status,
+      created_at: "2026-01-15T12:00:00.000Z",
+    }));
+    const items = invoices.map((invoice) => ({
+      id: `linea-${invoice.id}`,
+      invoice_id: invoice.id,
+      item_type: "servicio",
+      employee_id: payrollPagedStub.EMPLOYEE_ID,
+      qty: 1,
+      unit_price: SUBTOTAL,
+      subtotal: SUBTOTAL,
+      no_commission: false,
+      commission_value: null,
+      commission_percent_override: null,
+      product_id: null,
+      service_id: payrollPagedStub.SERVICE_ID,
+    }));
+    payrollPagedStub.tables = {
+      payroll_periods: [
+        {
+          id: payrollPagedStub.PERIOD_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          start_date: "2026-01-01",
+          end_date: "2026-01-31",
+          status: "borrador",
+          created_by: ACTOR.userId,
+          closed_at: null,
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      employees: [employeeRow()],
+      invoices,
+      invoice_items: items,
+      commission_rules: [],
+      voucher_requests: [],
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      audit_logs: [],
+    };
+  }
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  it("una factura `Emitida` NO comisiona; una `Pagada` sí", async () => {
+    seedInvoices(["Pagada", "Emitida", "Anulada"]);
+
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+
+    const persisted = payrollPagedStub.itemsUpsert ?? [];
+    expect(persisted).toHaveLength(1);
+    // Tres líneas idénticas de 10.000 al 10%: solo la pagada suma 1.000.
+    expect(persisted[0].commissions).toBe(1_000);
+    // Y el detalle lista solo la pagada: las otras no aportan línea.
+    expect(persisted[0].detail_json).toHaveLength(1);
+  });
+
+  it("control: sin ninguna factura pagada la comisión es 0", async () => {
+    seedInvoices(["Emitida", "Anulada"]);
+
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+
+    const persisted = payrollPagedStub.itemsUpsert ?? [];
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0].commissions).toBe(0);
+    expect(persisted[0].detail_json).toHaveLength(0);
+  });
+});
+
+// --------- el vale ya descontado sigue contando al recalcular el borrador ---
+//
+// Al aplicar, los vales del período pasan a `descontada`. Si el recálculo leyera
+// solo `pendiente|aprobada`, el descuento desaparecería del neto aunque los
+// vales siguieran descontados: la nómina mostraría más plata de la que el vale
+// ya consumió. El borrador cuenta los `descontada` DENTRO del rango del período;
+// la restricción de exclusión de 035 garantiza que ese vale es de este período.
+describe("payroll: el vale ya descontado se sigue contando al recalcular el borrador", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const SALARY = 1_400_000;
+
+  function employeeRow() {
+    return {
+      id: payrollPagedStub.EMPLOYEE_ID,
+      sede_id: payrollPagedStub.SEDE_ID,
+      user_id: null,
+      full_name: "Empleada con vale",
+      employee_code: "E-10",
+      document: "10000000010",
+      phone: null,
+      position: null,
+      payout_mode: "normal",
+      email: null,
+      birth_date: null,
+      pay_type: "fijo",
+      salary_fixed: SALARY,
+      commission_percent: null,
+      is_active: true,
+    };
+  }
+
+  function voucher(id: string, requestDate: string, amount: number) {
+    return {
+      id,
+      sede_id: payrollPagedStub.SEDE_ID,
+      employee_id: payrollPagedStub.EMPLOYEE_ID,
+      amount,
+      request_date: requestDate,
+      status: "descontada",
+      approved_by: "u-1",
+      approval_code: null,
+      observation: null,
+      method_code: "efectivo",
+      cash_shift_id: null,
+      created_by: "u-1",
+    };
+  }
+
+  function seed(vouchers: Array<Record<string, unknown>>) {
+    payrollPagedStub.tables = {
+      payroll_periods: [
+        {
+          id: payrollPagedStub.PERIOD_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          start_date: "2026-01-01",
+          end_date: "2026-01-31",
+          status: "borrador",
+          created_by: ACTOR.userId,
+          closed_at: null,
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      employees: [employeeRow()],
+      invoices: [],
+      invoice_items: [],
+      commission_rules: [],
+      voucher_requests: vouchers,
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      audit_logs: [],
+    };
+  }
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  it("un vale `descontada` del rango se vuelve a descontar (no queda en 0)", async () => {
+    seed([voucher("vale-1", "2026-01-15", 100_000)]);
+
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+
+    const persisted = payrollPagedStub.itemsUpsert ?? [];
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0].deductions_vales).toBe(100_000);
+    expect(persisted[0].net_pay).toBe(SALARY - 100_000);
+    // Un vale ya descontado no se reescribe: no entra a `p_voucher_ids`.
+    expect(payrollPagedStub.rpcCalls[0].args.p_voucher_ids).toEqual([]);
+    expect(payrollPagedStub.voucherFlips.flat()).toEqual([]);
+  });
+
+  it("un vale `descontada` de OTRO período (fuera del rango) no se cuenta", async () => {
+    seed([
+      voucher("vale-1", "2026-01-15", 100_000),
+      voucher("vale-otro", "2025-12-20", 50_000),
+    ]);
+
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+
+    const persisted = payrollPagedStub.itemsUpsert ?? [];
+    expect(persisted).toHaveLength(1);
+    // Solo el vale del rango: 100.000, no 150.000.
+    expect(persisted[0].deductions_vales).toBe(100_000);
+    expect(persisted[0].net_pay).toBe(SALARY - 100_000);
   });
 });
 
@@ -1984,7 +2427,8 @@ describe("payroll: el cálculo lee todas las filas (U5)", () => {
         id: `factura-${suffix}`,
         consecutive_number: index,
         sede_id: payrollPagedStub.SEDE_ID,
-        status: "Emitida",
+        // Pagada: solo las facturas pagadas comisionan (regla del dueño).
+        status: "Pagada",
         // Dentro del rango del período: el filtro `created_at` de la lectura es real.
         created_at: "2026-01-15T12:00:00.000Z",
       });
@@ -2305,7 +2749,8 @@ describe("payroll: la alineación de la planta se lee completa (U7)", () => {
         id: `factura-${suffix}`,
         consecutive_number: index,
         sede_id: payrollPagedStub.SEDE_ID,
-        status: "Emitida",
+        // Pagada: solo las facturas pagadas comisionan (regla del dueño).
+        status: "Pagada",
         created_at: "2026-01-15T12:00:00.000Z",
       });
       items.push({
@@ -2973,6 +3418,104 @@ describe("payroll: el empleado logueado se ubica en la planta completa (U8)", ()
   });
 });
 
+// --------------------------- rango de fechas del listado de vales ---
+//
+// La pantalla de vales nace acotada al día de hoy y amplía —o limpia— ese
+// rango desde sus filtros de fecha. El rango viaja al SERVIDOR: `date_from` y
+// `date_to` acotan `request_date` de forma INCLUSIVA (columna `date`, sin
+// aritmética de zona horaria). El camino exacto de caja (`request_date`) queda
+// intacto. Estos tests cubren las dos puntas, cada punta sola, el rango
+// limpiado (sin cota) y la igualdad exacta de caja.
+describe("payroll: el listado de vales acepta un rango de fechas inclusivo (pantalla de vales)", () => {
+  const SEDE = payrollPagedStub.SEDE_ID;
+
+  function voucher(id: string, fecha: string): Record<string, unknown> {
+    return {
+      id,
+      sede_id: SEDE,
+      employee_id: payrollPagedStub.EMPLOYEE_ID,
+      amount: 50000,
+      request_date: fecha,
+      status: "aprobada",
+      approved_by: "u-1",
+      approval_code: null,
+      observation: null,
+      method_code: "efectivo",
+      cash_shift_id: null,
+      created_by: "u-1",
+    };
+  }
+
+  /**
+   * Sesión admin (sin el override de `employee_id` del rol empleado) y cinco
+   * vales en fechas dispares, con dos el mismo día para probar las dos puntas.
+   */
+  function seedVales(): void {
+    payrollPagedStub.session = { userId: "u-1", sedeId: SEDE, roles: ["admin"] };
+    payrollPagedStub.tables.users = [];
+    payrollPagedStub.tables.voucher_requests = [
+      voucher("v-05", "2026-01-05"),
+      voucher("v-10a", "2026-01-10"),
+      voucher("v-10b", "2026-01-10"),
+      voucher("v-15", "2026-01-15"),
+      voucher("v-20", "2026-01-20"),
+    ];
+  }
+
+  /** Ids ordenados: la guarda afirma PERTENENCIA, no el orden del `order by`. */
+  async function ids(input: Parameters<typeof listVouchersAction>[0]): Promise<string[]> {
+    const result = await listVouchersAction(input);
+    expect(result.success).toBe(true);
+    if (!result.success) return [];
+    return result.data.map((row) => row.id).sort();
+  }
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  it("ambos extremos: inclusivo en las dos puntas", async () => {
+    seedVales();
+    expect(await ids({ date_from: "2026-01-10", date_to: "2026-01-15" })).toEqual(
+      ["v-10a", "v-10b", "v-15"].sort(),
+    );
+  });
+
+  it("solo `date_from`: sin tope superior", async () => {
+    seedVales();
+    expect(await ids({ date_from: "2026-01-10" })).toEqual(
+      ["v-10a", "v-10b", "v-15", "v-20"].sort(),
+    );
+  });
+
+  it("solo `date_to`: sin piso inferior", async () => {
+    seedVales();
+    expect(await ids({ date_to: "2026-01-10" })).toEqual(
+      ["v-05", "v-10a", "v-10b"].sort(),
+    );
+  });
+
+  it("sin fechas: el listado NO acota por fecha (filtros limpiados = todo)", async () => {
+    seedVales();
+    expect(await ids({})).toEqual(
+      ["v-05", "v-10a", "v-10b", "v-15", "v-20"].sort(),
+    );
+  });
+
+  it("extremos iguales: un solo día exacto", async () => {
+    seedVales();
+    expect(await ids({ date_from: "2026-01-10", date_to: "2026-01-10" })).toEqual(
+      ["v-10a", "v-10b"].sort(),
+    );
+  });
+
+  it("el camino de caja (`request_date` exacto) no cambió", async () => {
+    seedVales();
+    expect(await ids({ request_date: "2026-01-10", limit: 200, sede_id: SEDE })).toEqual(
+      ["v-10a", "v-10b"].sort(),
+    );
+  });
+});
+
 // ------------------------------------- prorata del fijo y solape (PR1) ---
 //
 // El fijo de un período (`base_fixed`) es la parte del sueldo MENSUAL que
@@ -3101,7 +3644,8 @@ describe("payroll: el fijo es la parte del sueldo mensual de los DÍAS del perí
           id: "factura-1",
           consecutive_number: 1,
           sede_id: payrollPagedStub.SEDE_ID,
-          status: "Emitida",
+          // Pagada: solo las facturas pagadas comisionan (regla del dueño).
+          status: "Pagada",
           created_at: "2026-09-03T12:00:00.000Z",
         },
       ],
@@ -3282,6 +3826,120 @@ describe("payroll: la prorata del fijo, fórmula (función pura, PR1)", () => {
     expect(rangesOverlap(week, { start_date: "2026-09-03", end_date: "2026-09-04" })).toBe(true);
     expect(rangesOverlap(week, { start_date: "2026-08-01", end_date: "2026-09-30" })).toBe(true);
     expect(rangesOverlap(week, week)).toBe(true);
+  });
+});
+
+describe("payroll: el piso del período nuevo, función pura (regla del dueño 2026-10-01)", () => {
+  it("sin períodos no hay piso: el primero es libre", () => {
+    expect(nextPeriodStartDate([])).toBeNull();
+  });
+
+  it("`null` es SOLO para la lista vacía: con cualquier período hay piso", () => {
+    const nonEmpty: Array<Array<{ start_date: string; end_date: string }>> = [
+      [{ start_date: "2026-09-01", end_date: "2026-09-07" }],
+      [
+        { start_date: "2026-09-01", end_date: "2026-09-07" },
+        { start_date: "2026-09-08", end_date: "2026-09-14" },
+      ],
+      [{ start_date: "2026-12-31", end_date: "2026-12-31" }],
+    ];
+    for (const periods of nonEmpty) {
+      expect(nextPeriodStartDate(periods), JSON.stringify(periods)).not.toBeNull();
+    }
+  });
+
+  it("un solo período: el piso es el día siguiente a su fin", () => {
+    expect(nextPeriodStartDate([{ start_date: "2026-09-01", end_date: "2026-09-07" }])).toBe(
+      "2026-09-08",
+    );
+  });
+
+  it("varios desordenados: manda el fin MÁS LEJANO, no el último de la lista", () => {
+    // El más lejano (2026-09-30) está en la tercera fila, no en la última.
+    expect(
+      nextPeriodStartDate([
+        { start_date: "2026-09-15", end_date: "2026-09-21" },
+        { start_date: "2026-09-01", end_date: "2026-09-07" },
+        { start_date: "2026-09-22", end_date: "2026-09-30" },
+        { start_date: "2026-09-08", end_date: "2026-09-14" },
+      ]),
+    ).toBe("2026-10-01");
+  });
+
+  it("períodos contiguos: el piso sigue al último día liquidado (no lo repite)", () => {
+    expect(
+      nextPeriodStartDate([
+        { start_date: "2026-09-01", end_date: "2026-09-07" },
+        { start_date: "2026-09-08", end_date: "2026-09-14" },
+      ]),
+    ).toBe("2026-09-15");
+  });
+
+  it("con un hueco: el piso NO es el hueco, es el día siguiente al último fin", () => {
+    expect(
+      nextPeriodStartDate([
+        { start_date: "2026-09-01", end_date: "2026-09-07" },
+        { start_date: "2026-09-20", end_date: "2026-09-26" },
+      ]),
+    ).toBe("2026-09-27");
+  });
+
+  it("borde de mes: el fin de marzo salta al 1 de abril", () => {
+    expect(nextPeriodStartDate([{ start_date: "2026-03-01", end_date: "2026-03-31" }])).toBe(
+      "2026-04-01",
+    );
+    expect(nextPeriodStartDate([{ start_date: "2026-01-01", end_date: "2026-01-31" }])).toBe(
+      "2026-02-01",
+    );
+  });
+
+  it("borde de año: el 31 de diciembre salta al 1 de enero del año siguiente", () => {
+    expect(nextPeriodStartDate([{ start_date: "2026-12-25", end_date: "2026-12-31" }])).toBe(
+      "2027-01-01",
+    );
+    // Y el año bisiesto no se salta febrero.
+    expect(nextPeriodStartDate([{ start_date: "2028-02-01", end_date: "2028-02-28" }])).toBe(
+      "2028-02-29",
+    );
+  });
+
+  it("no muta la entrada", () => {
+    const periods = [
+      { start_date: "2026-09-01", end_date: "2026-09-07" },
+      { start_date: "2026-12-31", end_date: "2026-12-31" },
+    ];
+    const snapshot = JSON.parse(JSON.stringify(periods));
+    nextPeriodStartDate(periods);
+    expect(periods).toEqual(snapshot);
+  });
+});
+
+describe("payroll: el diálogo de apertura usa el piso del helper (guarda de fuente)", () => {
+  const client = readFileSync(join(process.cwd(), "app", "payroll", "payroll-client.tsx"), "utf8");
+
+  it("el piso sale del helper, no de aritmética local", () => {
+    expect(client).toContain("const suggestedStart = nextPeriodStartDate(periods);");
+    // El `min` del campo de inicio ES ese piso.
+    expect(client).toContain("min={suggestedStart ?? undefined}");
+  });
+
+  it("al abrir el diálogo se PREFIJA la fecha con el helper", () => {
+    expect(client).toContain('setStartDate(nextPeriodStartDate(periods) ?? "")');
+  });
+
+  it("el envío nombra la fecha válida siguiente y conserva la guarda de solape", () => {
+    expect(client).toContain("El período no puede empezar antes del");
+    // Sigue delegando en el solape y el servidor sigue siendo la autoridad.
+    expect(client).toContain("findOverlappingPeriod(periods, startDate, endDate)");
+  });
+
+  it("control negativo: nada de piso vacío, literal ni prefill hardcodeado", () => {
+    expect(client).not.toMatch(/min=\{undefined\}/);
+    expect(client).not.toMatch(/min="20\d{2}-\d{2}-\d{2}"/);
+    expect(client).not.toMatch(/setStartDate\("20\d{2}-\d{2}-\d{2}"\)/);
+    // No conviven dos implementaciones de "día siguiente".
+    expect(client).not.toContain("function nextDay(");
+    expect(client).not.toContain("latestEndDate(");
   });
 });
 
@@ -4022,18 +4680,18 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     });
   });
 
-  it("el mes a la fecha por empleado: lo pagado y contra qué períodos", async () => {
+  it("los pagos del mes de un empleado: lo pagado y contra qué períodos (consulta puntual)", async () => {
     seedLegibilityFixture();
 
-    const { months } = await listPayrollOverview(SEDE);
+    const rows = await listPayrollMonthRows({
+      sedeId: SEDE,
+      month: "2026-09",
+      employeeId: "emp-01",
+    });
 
-    expect(months.map((row) => `${row.month}/${row.employeeId}`)).toEqual([
-      "2026-10/emp-01",
-      "2026-09/emp-01",
-      "2026-09/emp-02",
-    ]);
-    const september = months[1];
-    expect(september).toMatchObject({
+    // La consulta devuelve SOLO la fila del par (mes, empleado).
+    expect(rows.map((row) => `${row.month}/${row.employeeId}`)).toEqual(["2026-09/emp-01"]);
+    expect(rows[0]).toMatchObject({
       netTotal: 1900000,
       paidTotal: 1300000,
       remainingTotal: 600000,
@@ -4041,8 +4699,8 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
       days: 30,
     });
     // Contra qué períodos: los dos de septiembre, en orden de fecha.
-    expect(september.periods.map((row) => row.periodId)).toEqual([P1, P2]);
-    expect(september.periods[0]).toMatchObject({
+    expect(rows[0].periods.map((row) => row.periodId)).toEqual([P1, P2]);
+    expect(rows[0].periods[0]).toMatchObject({
       status: "borrador",
       net: 1000000,
       paid: 400000,
@@ -4050,6 +4708,31 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
       fixed: 800000,
       days: 15,
     });
+  });
+
+  it("la consulta del mes está acotada por mes Y por empleado", async () => {
+    seedLegibilityFixture();
+
+    // Octubre tiene pagos de emp-01 (P3) pero NINGUNO de emp-02: la consulta de
+    // emp-02 en octubre devuelve vacío, no los datos de su compañero.
+    expect(
+      await listPayrollMonthRows({ sedeId: SEDE, month: "2026-10", employeeId: "emp-02" }),
+    ).toEqual([]);
+
+    // El mismo mes, el empleado que SÍ tiene pagos: una sola fila, con los
+    // períodos de ESE mes (ninguno de septiembre).
+    const october = await listPayrollMonthRows({
+      sedeId: SEDE,
+      month: "2026-10",
+      employeeId: "emp-01",
+    });
+    expect(october.map((row) => `${row.month}/${row.employeeId}`)).toEqual(["2026-10/emp-01"]);
+    expect(october[0]).toMatchObject({
+      netTotal: 1100000,
+      paidTotal: 200000,
+      remainingTotal: 900000,
+    });
+    expect(october[0].periods.map((row) => row.periodId)).toEqual([P3]);
   });
 
   it("control negativo: una fila con más pagado que neto no resta del saldo", async () => {
@@ -4062,14 +4745,27 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
 
     const p1 = overview.summaries.find((row) => row.period.id === P1);
     expect(p1).toMatchObject({ paidTotal: 1100000, remainingTotal: 600000 });
+
+    // La misma base, por la consulta puntual: el saldo de la fila tampoco se
+    // inventa negativo (el pagado que supera el neto no descuenta de más).
+    const september = await listPayrollMonthRows({
+      sedeId: SEDE,
+      month: "2026-09",
+      employeeId: "emp-02",
+    });
+    expect(september[0]).toMatchObject({
+      netTotal: 500000,
+      paidTotal: 700000,
+      remainingTotal: 0,
+    });
   });
 
-  it("control negativo: un mes sin períodos no aparece en la vista", async () => {
+  it("control negativo: un mes sin períodos no devuelve filas", async () => {
     seedLegibilityFixture();
 
-    const { months } = await listPayrollOverview(SEDE);
-
-    expect(months.map((row) => row.month)).not.toContain("2026-11");
+    expect(
+      await listPayrollMonthRows({ sedeId: SEDE, month: "2026-11", employeeId: "emp-01" }),
+    ).toEqual([]);
   });
 
   it("el conteo de la lista se lee contra el total (no hay recorte mudo)", () => {
@@ -7229,6 +7925,95 @@ describe("migración 055_payroll_payments_cap_lock.sql (CL-16)", () => {
     // lock), esto sería `false` y el test de la carrera pagaría dos veces.
     expect(payrollCapLocksParent()).toBe(true);
     expect(deployedPayrollCapBody()).toContain("FOR UPDATE");
+  });
+});
+
+/* ==========================================================================
+   Nómina: los montos sólo aceptan dígitos con formato de dinero (guarda)
+
+   `inputMode="numeric"` no impide teclear una letra. Los cuatro campos de
+   MONTO de `payroll-client.tsx` —bonos, otros descuentos, monto de la porción
+   y monto extra— se guardan como dígitos con `stripMoneyInput` y se muestran
+   con `formatMoneyInput`, igual que el dinero del resto de la app. Esta guarda
+   falla si alguien vuelve a leer el valor crudo.
+   ========================================================================== */
+describe("payroll-client: los campos de monto pasan por la máscara de dinero (guarda de fuente)", () => {
+  const source = readFileSync(
+    join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
+    "utf8",
+  );
+
+  /** Bloque `onChange={...}` cuyo cuerpo contiene `anchor` ("" si no existe). */
+  function onChangeBlock(text: string, anchor: string): string {
+    const at = text.indexOf(anchor);
+    if (at === -1) return "";
+    const start = text.lastIndexOf("onChange={", at);
+    if (start === -1) return "";
+    let depth = 0;
+    for (let i = start + "onChange={".length; i < text.length; i += 1) {
+      const ch = text[i];
+      if (ch === "{") depth += 1;
+      else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) return text.slice(start, i + 1);
+      }
+    }
+    return text.slice(start);
+  }
+
+  /** El campo lleva la máscara y NO además el valor crudo. */
+  function assertMasked(block: string, raw: string): void {
+    expect(block).not.toBe("");
+    expect(block).toContain("stripMoneyInput(event.target.value)");
+    expect(block).not.toContain(raw);
+  }
+
+  it("piso anti-vacío: el cliente se leyó de verdad", () => {
+    expect(source.length).toBeGreaterThan(20_000);
+    expect(source).toContain("stripMoneyInput");
+  });
+
+  it("los bonos del empleado usan la máscara de dinero", () => {
+    assertMasked(
+      onChangeBlock(source, 'onAdjustmentChange(row.employeeId, "bonuses"'),
+      'onAdjustmentChange(row.employeeId, "bonuses", event.target.value)',
+    );
+    expect(source).toContain('value={formatMoneyInput(adjustmentValue(row.employeeId, "bonuses"))}');
+  });
+
+  it("los otros descuentos usan la máscara de dinero", () => {
+    assertMasked(
+      onChangeBlock(source, 'onAdjustmentChange(row.employeeId, "others"'),
+      'onAdjustmentChange(row.employeeId, "others", event.target.value)',
+    );
+    expect(source).toContain('value={formatMoneyInput(adjustmentValue(row.employeeId, "others"))}');
+  });
+
+  it("el monto de la porción usa la máscara de dinero", () => {
+    assertMasked(
+      onChangeBlock(source, "onPortionChange(portion.key, { amount:"),
+      "onPortionChange(portion.key, { amount: event.target.value })",
+    );
+    expect(source).toContain("value={formatMoneyInput(portion.amount)}");
+  });
+
+  it("el monto extra de nómina usa la máscara de dinero", () => {
+    assertMasked(
+      onChangeBlock(source, "setExtraAmount(stripMoneyInput"),
+      "setExtraAmount(event.target.value)",
+    );
+    expect(source).toContain("value={formatMoneyInput(extraAmount)}");
+  });
+
+  it("el detector no es un sello de goma (control negativo)", () => {
+    const fake = `<input onChange={(event) => setExtraAmount(event.target.value)} />`;
+    const block = onChangeBlock(fake, "setExtraAmount(");
+    expect(block).not.toBe("");
+    // Sin el cable a la máscara, la misma guarda falla.
+    expect(block).not.toContain("stripMoneyInput(event.target.value)");
+    expect(block).toContain("setExtraAmount(event.target.value)");
+    // Sin el ancla no hay bloque: la guarda falla en vez de pasar sola.
+    expect(onChangeBlock(fake, "no-existe:")).toBe("");
   });
 });
 

@@ -737,6 +737,13 @@ const SURFACES: readonly SurfaceSpec[] = [
   },
   {
     file: PAYROLL_ACTIONS_FILE,
+    name: "listPayrollMonthRowsAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "lee los pagos de un mes de un empleado: es lectura de nómina y la caja no entra.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
     name: "closePayrollPeriodAction",
     kind: "payroll",
     roles: ["admin"],

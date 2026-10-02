@@ -2,8 +2,11 @@ import { z } from "zod";
 import { idempotencyKeySchema, moneyEquals, roundMoney } from "@/src/features/billing/schemas";
 import { cashOutLimitViolation } from "@/src/features/cash/schemas";
 import {
+  employeeLineCommissionOrigin,
+  employeeLineCommissionPercent,
   lineHasCommissionBasis,
   resolveEmployeeLineCommission,
+  type CommissionOrigin,
   type RuleRate,
 } from "@/src/features/commissions/schemas";
 
@@ -240,6 +243,21 @@ export interface CommissionLine {
 export interface DetailLine extends CommissionLine {
   employee_id: string;
   commission_value: number | null;
+  /**
+   * Origen de la comisión de la línea, con la MISMA precedencia que el monto
+   * (`employeeLineCommissionOrigin`): "commission" = valor fijo del ítem o
+   * regla ítem×empleado; "percent" = porcentaje del empleado o explícito de la
+   * línea. Es opcional a propósito: las filas ya persistidas antes de este
+   * cambio no lo traen, y el origen se DEDUCE al leerlas con
+   * `detailLineCommissionOrigin` (la clasificación vieja las mostraba todas
+   * como fijas).
+   */
+  commission_origin?: CommissionOrigin;
+  /**
+   * Tasa aplicada cuando el origen es "percent"; `null`/ausente en los otros.
+   * Sale de la misma fuente que el monto (`employeeLineCommissionPercent`).
+   */
+  commission_percent?: number | null;
 }
 
 /**
@@ -370,27 +388,126 @@ export function buildEmployeeCommissionDetail(args: {
         flatPercent,
       }),
     )
-    .map((line) => ({
-      employee_id: args.employeeId,
-      invoice_id: line.invoice_id,
-      consecutive_number: line.consecutive_number,
-      item_id: line.item_id,
-      item_type: line.item_type,
-      qty: line.qty,
-      unit_price: line.unit_price,
-      line_subtotal: roundMoney(line.line_subtotal),
-      commission: resolveEmployeeLineCommission({
+    .map((line) => {
+      // Origen, tasa y monto se resuelven con los MISMOS argumentos: la tasa que
+      // se muestra en el detalle no puede separarse del monto que se paga.
+      const resolution = {
         itemType: line.item_type,
         itemRefId: line.item_ref_id,
-        subtotal: line.line_subtotal,
-        qty: line.qty,
         commissionValue: line.commission_value,
         commissionPercentOverride: line.commission_percent_override ?? null,
         rules: args.rules,
         flatPercent,
-      }),
-      commission_value: line.commission_value,
-    }));
+      };
+      return {
+        employee_id: args.employeeId,
+        invoice_id: line.invoice_id,
+        consecutive_number: line.consecutive_number,
+        item_id: line.item_id,
+        item_type: line.item_type,
+        qty: line.qty,
+        unit_price: line.unit_price,
+        line_subtotal: roundMoney(line.line_subtotal),
+        commission: resolveEmployeeLineCommission({
+          ...resolution,
+          subtotal: line.line_subtotal,
+          qty: line.qty,
+        }),
+        commission_origin: employeeLineCommissionOrigin(resolution),
+        commission_percent: employeeLineCommissionPercent(resolution),
+        commission_value: line.commission_value,
+      };
+    });
+}
+
+/**
+ * Origen de la comisión de una línea del detalle cuando la fila NO lo trae.
+ *
+ * Las filas persistidas ANTES de que el detalle guardara `commission_origin` no
+ * lo tienen, y las de un período CERRADO no se pueden recalcular
+ * (`assertDraftPeriod`). Deducirlo al LEER es lo único que hace que vuelvan a
+ * mostrarse bien, sin tocar la base y sin recalcular comisiones: solo se
+ * clasifica lo que la propia fila ya guarda.
+ *
+ * Precedencia (misma idea que `employeeLineCommissionOrigin`, con lo que la
+ * fila sí guarda: las reglas ítem×empleado no se persisten en el detalle):
+ *  1. el origen explícito manda;
+ *  2. valor fijo del ítem (producto o personalizado con `commission_value` > 0)
+ *     es "commission";
+ *  3. una línea sin comisión no tiene origen que mostrar ("none");
+ *  4. una comisión > 0 sin subtotal no pudo salir de un porcentaje (un
+ *     porcentaje de un subtotal 0 es 0): es "commission";
+ *  5. el porcentaje del empleado, cuando la fila lo guarda
+ *     (`commission_percent`), confirma "percent";
+ *  6. si nada decidió antes, el TIPO de ítem lo hace: un servicio o un
+ *     personalizado sin valor solo comisionan por porcentaje, así que van a
+ *     "percent"; un producto sin valor viene de una regla ítem×empleado y se
+ *     queda en "commission" (el caso histórico, que era lo único que se
+ *     mostraba bien).
+ * Puro para probarlo sin base de datos.
+ */
+export function detailLineCommissionOrigin(line: {
+  commission: number;
+  commission_origin?: CommissionOrigin;
+  item_type?: string;
+  commission_value?: number | null;
+  line_subtotal?: number;
+  qty?: number;
+  commission_percent?: number | null;
+}): CommissionOrigin {
+  if (line.commission_origin) return line.commission_origin;
+  if (
+    (line.item_type === "producto" || line.item_type === "custom") &&
+    line.commission_value != null &&
+    line.commission_value > 0
+  ) {
+    return "commission";
+  }
+  if (line.commission <= 0) return "none";
+  if ((line.line_subtotal ?? 0) <= 0) return "commission";
+  if (line.commission_percent != null && line.commission_percent > 0) return "percent";
+  if (line.item_type === "producto") return "commission";
+  return "percent";
+}
+
+/**
+ * Reclasificación de la comisión de un ítem en sus dos orígenes para MOSTRAR:
+ * la parte fija/producto y la parte por porcentaje. El total NO cambia.
+ *
+ * El porcentaje es la suma de las líneas con origen "percent" (cada una ya
+ * viene redondeada a peso entero por `resolveEmployeeLineCommission`) y se topa
+ * al total para que la resta nunca dé negativo. La parte fija se DERIVA por resta
+ * (`total − porcentaje`): así las dos columnas suman EXACTAMENTE el total
+ * almacenado aunque la suma de las líneas no cierre por redondeo. Una línea
+ * porcentual nunca se paga de inmediato, así que en la práctica el porcentaje
+ * siempre es menor o igual al total y el tope no recorta nada.
+ * Puro para probarlo sin base de datos.
+ *
+ * Cada línea se clasifica con `detailLineCommissionOrigin`: las filas viejas,
+ * sin `commission_origin`, también entran al porcentaje que les corresponde.
+ */
+export function splitCommissionByOrigin(args: {
+  commissions: number;
+  detail: Array<
+    Pick<DetailLine, "commission" | "commission_percent"> & {
+      commission_origin?: CommissionOrigin;
+      item_type?: string;
+      commission_value?: number | null;
+      line_subtotal?: number;
+      qty?: number;
+    }
+  >;
+}): { fixed: number; percent: number } {
+  const total = roundMoney(args.commissions);
+  const percentLines = roundMoney(
+    args.detail.reduce(
+      (acc, line) =>
+        detailLineCommissionOrigin(line) === "percent" ? acc + line.commission : acc,
+      0,
+    ),
+  );
+  const percent = Math.min(percentLines, total);
+  return { fixed: roundMoney(total - percent), percent };
 }
 
 /**
@@ -640,6 +757,33 @@ export function payrollExtraGuide(args: {
  */
 export function rangesOverlap(left: DateRange, right: DateRange): boolean {
   return left.start_date <= right.end_date && left.end_date >= right.start_date;
+}
+
+/**
+ * PR1/PAY-01 (regla del dueño, 2026-10-01): primera fecha de inicio ADMISIBLE
+ * para un período NUEVO de la sede. Es el día SIGUIENTE al fin más lejano ya
+ * registrado, sin importar el orden ni el estado de los períodos. Sin períodos
+ * no hay piso (`null`): el primero es libre.
+ *
+ * Por qué "día siguiente" y no "ese mismo fin": el fin del período anterior ya
+ * está liquidado, así que empezar ahí compartiría un día (el solape que la
+ * migración 035 y el servicio rechazan). Los rangos ADYACENTES no se solapan
+ * (fin 2026-12-31 → inicio 2027-01-01).
+ *
+ * TOTAL: no lanza con una lista vacía, tiene en cuenta el fin MÁS LEJANO
+ * aunque la entrada llegue desordenada, y no muta la lista. Puro para probarlo
+ * sin base de datos. Borde de año incluido: 2026-12-31 → 2027-01-01.
+ */
+export function nextPeriodStartDate(periods: readonly DateRange[]): string | null {
+  if (periods.length === 0) return null;
+  let latestEnd: number | null = null;
+  for (const period of periods) {
+    const end = utcDayOf(period.end_date);
+    if (end === null) continue;
+    if (latestEnd === null || end > latestEnd) latestEnd = end;
+  }
+  if (latestEnd === null) return null;
+  return new Date(latestEnd + DAY_MS).toISOString().slice(0, 10);
 }
 
 export interface VoucherCapCheck {
