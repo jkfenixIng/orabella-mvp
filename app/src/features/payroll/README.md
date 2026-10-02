@@ -12,7 +12,9 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   (`period_id` cascade, `employee_id`, `base_fixed`/`commissions`/`bonuses`
   default 0, `deductions_vales`/`other_discounts` default 0, `net_pay` con
   CHECK neto = base + comisiones + bonos − vales − otros con tolerancia de
-  centavo, `detail_json` jsonb por factura/ítem; unique
+  centavo, `detail_json` jsonb por factura/ítem, `adjustment_reason` text NULL
+  —el motivo escrito del ajuste manual, migración
+  `067_payroll_adjustment_reason.sql`; F8—; unique
   `period_id,employee_id`), `payroll_payments` (`payroll_item_id` cascade,
   `method_id` + snapshot `method_code`, `amount > 0`, `paid_at` default now,
   `paid_by`, `reference`; trigger `check_payroll_payments_cap`: la suma por
@@ -84,7 +86,8 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   `GET/POST /voucher-settings` (topes; extra fuera del listado mínimo para
   la UI).
 - UI (`/payroll`, español): periodos (abrir, ver, calcular con ajustes
-  bonos/otros por empleado, tabla fijo/comisiones/bonos/vales/otros/neto
+  bonos/otros por empleado y su motivo obligatorio —F8—, tabla
+  fijo/comisiones/bonos/vales/otros/motivo/neto
   con pagado/saldo, detalle expandible por factura/ítem, pagar por
   porciones `método:monto`, cerrar; cerrado muestra inmutabilidad), vales
   (topes vigentes + guardar, caja abre con empleado/monto/método arqueable,
@@ -110,6 +113,62 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
 - PRD: §5.6 PAY-01…04, §5.7 PAY-05…07, §9
   payroll_periods/items/payments + voucher_settings/requests, §10
   Nómina/vales, plan paso 6 (§12).
+
+## El motivo del ajuste manual es obligatorio (F8, 067)
+
+Decisión del dueño (2026-10-01): **TODO** ajuste manual lleva su motivo escrito,
+siempre, no sólo en la primera liquidación. El admin carga bonos y otros
+descuentos por empleado en el borrador; sin un motivo, una diferencia en la
+liquidación sólo la podía explicar la memoria de quien la cargó.
+
+### Dónde vive y por qué viaja con el monto
+
+`payroll_items.adjustment_reason text NULL` (migración
+`067_payroll_adjustment_reason.sql`, con su COMMENT). NULL es «sin ajuste
+manual»: cuando `bonuses` y `other_discounts` son 0 no hay nada que explicar. La
+columna vive en la MISMA fila que el monto que justifica y se escribe en la
+MISMA sentencia (`payroll_apply_atomic`), cuya firma de cuatro parámetros NO
+cambia: el motivo viaja dentro de cada ítem como `adjustment_reason`, igual que
+`voucher_excess`. Es deliberado: si el monto y su explicación fueran dos
+escrituras, un fallo entre las dos dejaría una diferencia sin rastro. El ajuste y
+su motivo se confirman o se revierten JUNTOS.
+
+### La regla
+
+- Con `bonuses != 0` u `other_discounts != 0` el motivo es **obligatorio**.
+- Sin ajuste no se pide, y un motivo suelto **se descarta** (nunca se persiste
+  sin monto): la columna queda NULL. La invariante es «motivo presente ⇔ ajuste
+  manual presente».
+- La forma (no vacío después de recortar, ≤ 200 caracteres) se valida en el
+  esquema del servicio (`employeeAdjustmentSchema`) y en la guarda 1.1 de
+  `payroll_apply_atomic`; un motivo vacío o desmedido se rechaza con
+  `PAYROLL_INVALID` en la base.
+- La obligación se valida en `calculatePayroll` —el único camino que CARGA
+  ajustes manuales— con un `VALIDATION` (400) que **nombra al empleado** y dice
+  qué falta: una llamada directa al servicio (ruta REST, server action) no puede
+  colar un ajuste sin motivo. La corrección de un período cerrado NO pasa por esa
+  guarda a propósito: no crea ajustes, reproduce los que la liquidación firmada
+  ya tenía (con su motivo) y no debe romperse con las liquidaciones anteriores a
+  F8.
+- La identidad de `payroll_items` no cambia: el motivo no entra en la igualdad
+  del neto.
+
+### En pantalla
+
+En la tabla del borrador, cada fila gana un campo **Motivo del ajuste** junto a
+Bonos y Otros (descuento); se anuncia como obligatorio (`aria-required` y el
+marcador «Motivo (obligatorio)») cuando la fila lleva ajuste, y se valida al
+recalcular reusando el canal de error que ya existe. En la tabla cerrada y en el
+detalle, el motivo guardado se muestra tal cual, para que una liquidación firmada
+pueda responder «por qué este empleado tiene este ajuste» sin depender de nadie.
+
+### La nota de la primera liquidación (F5, corregida)
+
+La nota del diálogo decía que la primera liquidación «suele ser un rango corto»;
+eso dejó de ser cierto cuando los ciclos empezaron a embaldosar el calendario:
+cada período NUEVO es un ciclo completo y la fracción del fijo es la entera. La
+nota ahora dice eso, y que cualquier complemento se carga como ajuste **con su
+motivo**.
 
 ## Borrado de un borrador con historia de deuda (066)
 
@@ -212,13 +271,15 @@ entero (`roundMoney`), como todo el módulo.
   prorrateo por días calendario de siempre (`prorateFixedSalary`), intacto; la
   exclusión por cadencia distinta (F4) y la regla del mixto tampoco cambian.
 - **El complemento se carga con lo que YA existe**: si el negocio quiere pagar
-  igual el primer ciclo completo, la diferencia va en los ajustes por empleado
-  del borrador (`bonuses` / `other_discounts`, PAY-02). No hay campo, columna ni
-  migración nuevos, y la identidad de `payroll_items` no se mueve.
-- **En pantalla**: al abrir el primer período de una sede (sin períodos
-  previos), el diálogo "Abrir período" avisa en texto plano que la primera
-  liquidación suele ser un rango corto desde el día en que arrancaron y que el
-  complemento va en los ajustes por empleado del borrador.
+  una diferencia, va en los ajustes por empleado del borrador (`bonuses` /
+  `other_discounts`, PAY-02), y desde F8
+  **cada ajuste manual exige su motivo escrito** (ver abajo). No hay campo de
+  monto nuevo, columna ni migración adicionales, y la identidad de
+  `payroll_items` no se mueve.
+- **En pantalla**: al abrir el primer período de una sede (sin períodos previos),
+  el diálogo "Abrir período" dice en texto plano que la primera liquidación es
+  un **ciclo completo** —igual que las siguientes— y que cualquier complemento
+  va en los ajustes por empleado del borrador, con su motivo.
 
 Las funciones puras del prorrateo viven en `schemas.ts` (`PAY_CYCLE_DAYS`,
 `cycleDaysForFrequency`, `periodRangeDays`, `cycleProrationFactor`) y

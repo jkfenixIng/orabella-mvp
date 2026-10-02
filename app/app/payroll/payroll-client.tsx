@@ -31,6 +31,7 @@ import type {
 } from "@/src/features/payroll/service";
 import type { InvoiceDetail } from "@/src/features/billing/service";
 import {
+  ADJUSTMENT_REASON_MAX_LENGTH,
   buildPayrollEmployeeIndex,
   detailLineCommissionOrigin,
   groupPayrollPeriodsByMonth,
@@ -370,6 +371,9 @@ function PeriodDetailTable({ items, employeeName, payLabel, onView, onViewSource
               Otros (descuento)
             </th>
             <th className={tableCellClass} scope="col">
+              Motivo del ajuste
+            </th>
+            <th className={tableCellClass} scope="col">
               Neto
             </th>
             <th className={tableCellClass} scope="col">
@@ -416,6 +420,13 @@ function PeriodDetailTable({ items, employeeName, payLabel, onView, onViewSource
                   <span className="block">{`-${formatMoney(item.voucher_total)}`}</span>
                 </td>
                 <td className={tableCellClass}>{`-${formatMoney(item.other_discounts)}`}</td>
+                {/*
+                  F8: la respuesta a «¿por qué este empleado tiene este ajuste?».
+                  El motivo se guarda en el ítem (misma fila y misma
+                  transacción que el monto) y acá se muestra tal cual: una
+                  liquidación cerrada tiene que poder explicarse sola.
+                */}
+                <td className={tableCellClass}>{item.adjustment_reason ?? "—"}</td>
                 <td className={cn(tableCellClass, "font-semibold")}>{formatMoney(item.net_pay)}</td>
                 <td className={tableCellClass}>{formatMoney(item.paid)}</td>
                 <td className={tableCellClass}>{formatMoney(item.remaining)}</td>
@@ -522,7 +533,8 @@ function CorrectionComparison({
   );
 }
 
-type AdjustmentField = "bonuses" | "others";
+type AdjustmentMoneyField = "bonuses" | "others";
+type AdjustmentField = AdjustmentMoneyField | "reason";
 
 interface DraftRow {
   employeeId: string;
@@ -533,7 +545,8 @@ interface DraftPayrollTableProps {
   rows: DraftRow[];
   employeeName: (id: string) => string;
   payLabel: (id: string) => string;
-  adjustmentValue: (employeeId: string, field: AdjustmentField) => string;
+  adjustmentValue: (employeeId: string, field: AdjustmentMoneyField) => string;
+  adjustmentReasonValue: (employeeId: string) => string;
   onAdjustmentChange: (employeeId: string, field: AdjustmentField, value: string) => void;
   onView: (item: DetailItem) => void;
   onViewSources: (item: DetailItem) => void;
@@ -550,6 +563,7 @@ function DraftPayrollTable({
   employeeName,
   payLabel,
   adjustmentValue,
+  adjustmentReasonValue,
   onAdjustmentChange,
   onView,
   onViewSources,
@@ -581,6 +595,9 @@ function DraftPayrollTable({
               Otros (descuento)
             </th>
             <th className={tableCellClass} scope="col">
+              Motivo del ajuste
+            </th>
+            <th className={tableCellClass} scope="col">
               Neto
             </th>
             <th className={tableCellClass} scope="col">
@@ -597,6 +614,21 @@ function DraftPayrollTable({
         <tbody>
           {rows.map((row) => {
             const item = row.item;
+            // F8: el motivo es obligatorio en cuanto la fila tiene un bono o un
+            // descuento distinto de 0. Se DERIVA del valor que se está
+            // editando, no de lo ya persistido, así el campo acompaña el
+            // número que el admin acaba de escribir.
+            const reasonRequired =
+              (toNumber(adjustmentValue(row.employeeId, "bonuses")) ?? 0) !== 0 ||
+              (toNumber(adjustmentValue(row.employeeId, "others")) ?? 0) !== 0;
+            const reasonValue = adjustmentReasonValue(row.employeeId);
+            // F8 (visibilidad): el aviso del motivo faltante vive DENTRO del
+            // diálogo, en la MISMA celda del motivo. El error de la página queda
+            // detrás del modal abierto —el admin no lo ve y cree que el botón no
+            // responde—, así que el aviso va donde está escribiendo. Se deriva
+            // del valor que se está editando: aparece con el monto y desaparece
+            // apenas el motivo existe.
+            const reasonMissing = reasonRequired && reasonValue.trim() === "";
             // Reclasificación sin mover el total: fija = comisiones − porcentaje.
             const commission = item
               ? splitCommissionByOrigin({ commissions: item.commissions, detail: item.detail_json })
@@ -651,6 +683,33 @@ function DraftPayrollTable({
                     />
                   </span>
                 </td>
+                {/*
+                  F8: el motivo viaja con el monto. Es un campo de texto sin
+                  máscara de dinero; `aria-required` y el marcador «Motivo
+                  (obligatorio)» lo anuncian cuando la fila lleva ajuste. La
+                  guarda de verdad vive en el servicio; la comprobación de la
+                  pantalla nombra al empleado y, ahora, avisa INLINE junto al
+                  campo (texto plano, nunca un `Alert` ni un `role=` a mano).
+                */}
+                <td className={tableCellClass}>
+                  <input
+                    type="text"
+                    value={reasonValue}
+                    onChange={(event) => onAdjustmentChange(row.employeeId, "reason", event.target.value)}
+                    maxLength={ADJUSTMENT_REASON_MAX_LENGTH}
+                    aria-label={`Motivo del ajuste de ${employeeName(row.employeeId)}`}
+                    aria-required={reasonRequired}
+                    placeholder={reasonRequired ? "Motivo (obligatorio)" : "—"}
+                    className={tableInputClass}
+                  />
+                  {/* El aviso vive pegado al campo, no en el error de la
+                      página: con el diálogo abierto ese error queda detrás. */}
+                  {reasonMissing && (
+                    <p className="mt-1 text-xs text-error">
+                      {`Falta el motivo del ajuste de ${employeeName(row.employeeId)}.`}
+                    </p>
+                  )}
+                </td>
                 <td className={cn(tableCellClass, "font-semibold")}>
                   {item ? formatMoney(item.net_pay) : "—"}
                 </td>
@@ -686,7 +745,7 @@ function DraftPayrollTable({
           })}
           {rows.length === 0 && (
             <tr className={tableRowClass}>
-              <td className={tableCellClass} colSpan={11}>
+              <td className={tableCellClass} colSpan={12}>
                 No hay empleados activos para liquidar.
               </td>
             </tr>
@@ -1288,12 +1347,23 @@ export function PayrollClient(props: PayrollClientProps) {
    * tocó, el monto ya calculado del ítem (así la tabla "viene" con lo
    * calculado y recalcular no borra los ajustes previos).
    */
-  function adjustmentValue(employeeId: string, field: AdjustmentField): string {
+  function adjustmentValue(employeeId: string, field: AdjustmentMoneyField): string {
     const edited = adjustments[employeeId]?.[field];
     if (edited !== undefined) return edited;
     const item = itemByEmployee.get(employeeId);
     if (!item) return "";
     return String(field === "bonuses" ? item.bonuses : item.other_discounts);
+  }
+
+  /**
+   * F8: motivo vigente de un ajuste. Igual que los montos, si el admin todavía
+   * no lo tocó se muestra el motivo ya persistido del ítem (así recalcular no
+   * borra el escrito antes).
+   */
+  function adjustmentReasonValue(employeeId: string): string {
+    const edited = adjustments[employeeId]?.reason;
+    if (edited !== undefined) return edited;
+    return itemByEmployee.get(employeeId)?.adjustment_reason ?? "";
   }
 
   function updateAdjustment(employeeId: string, field: AdjustmentField, value: string) {
@@ -1473,11 +1543,34 @@ export function PayrollClient(props: PayrollClientProps) {
    */
   async function handleRecalculate() {
     if (!selectedId) return;
-    const list = draftRows.map((row) => ({
-      employee_id: row.employeeId,
-      bonuses: toNumber(adjustmentValue(row.employeeId, "bonuses")) ?? 0,
-      other_discounts: toNumber(adjustmentValue(row.employeeId, "others")) ?? 0,
-    }));
+    // F8: el motivo es obligatorio cuando la fila lleva un bono o un descuento.
+    // Se rechaza acá con el canal de error que el módulo ya usa (el Alert de la
+    // página), nombrando al empleado, para que el admin no mande un envío que el
+    // servicio va a rechazar igual. La guarda de verdad es la del servicio: esto
+    // es sólo la respuesta inmediata en pantalla.
+    const missingReason = draftRows.find((row) => {
+      const hasAdjustment =
+        (toNumber(adjustmentValue(row.employeeId, "bonuses")) ?? 0) !== 0 ||
+        (toNumber(adjustmentValue(row.employeeId, "others")) ?? 0) !== 0;
+      return hasAdjustment && adjustmentReasonValue(row.employeeId).trim() === "";
+    });
+    if (missingReason) {
+      setError(
+        `Falta el motivo del ajuste de ${employeeName(missingReason.employeeId)}: escriba por qué se carga el bono o el descuento.`,
+      );
+      return;
+    }
+    const list = draftRows.map((row) => {
+      const reason = adjustmentReasonValue(row.employeeId).trim();
+      return {
+        employee_id: row.employeeId,
+        bonuses: toNumber(adjustmentValue(row.employeeId, "bonuses")) ?? 0,
+        other_discounts: toNumber(adjustmentValue(row.employeeId, "others")) ?? 0,
+        // Un motivo sin ajuste se envía como null: el servicio lo descarta y la
+        // columna queda NULL («sin ajuste manual»), nunca un motivo suelto.
+        adjustment_reason: reason === "" ? null : reason,
+      };
+    });
     setBusy(true);
     const result = (await calculatePayrollAction(selectedId, {
       adjustments: list,
@@ -2604,19 +2697,20 @@ export function PayrollClient(props: PayrollClientProps) {
                   // de la lista), no bloquea nada y nunca anunció nada.
                   <>
                     <p className="mt-1">Sin períodos todavía: este será el primero.</p>
-                    {/* F5: la PRIMERA liquidación (la sede todavía no tiene
-                        períodos) suele cubrir solo los días desde que arrancó
-                        el negocio. El rango corto es válido: el sistema
-                        prorratea el ciclo parcial y lo que falte para completar
-                        el ciclo se carga en los ajustes por empleado que YA
-                        existen en el borrador (bonos u otros descuentos), sin
-                        campos ni columnas nuevas. Es una nota informativa: va
-                        en texto plano, como los otros vacíos del diálogo. */}
+                    {/* F5 corregido (F8): cada período NUEVO es un CICLO
+                        COMPLETO —el rango sale del ciclo elegido y los ciclos
+                        embaldosan el calendario—, así que la primera
+                        liquidación ya NO es un rango corto: paga la fracción
+                        entera de la cadencia, igual que las siguientes. Si hay
+                        que completar algo (por ejemplo, días que el ciclo no
+                        alcanza a cubrir), se carga como bono u otro descuento
+                        por empleado en el borrador, y ESE ajuste exige su
+                        motivo. Nota informativa en texto plano, como los otros
+                        vacíos del diálogo. */}
                     <p className="mt-1">
-                      La primera liquidación suele ser un rango corto, desde el día en que
-                      arrancaron: el sistema prorratea esos días. Si quieren completar el ciclo,
-                      carguen el complemento como bono u otro descuento por empleado en el
-                      borrador.
+                      La primera liquidación es un ciclo completo, igual que las siguientes: el
+                      sistema paga la fracción entera de la cadencia. Si hay que completar algo, se
+                      carga como bono u otro descuento por empleado en el borrador, con su motivo.
                     </p>
                   </>
                 ) : (
@@ -2788,6 +2882,7 @@ export function PayrollClient(props: PayrollClientProps) {
                     employeeName={employeeName}
                     payLabel={employeePayLabel}
                     adjustmentValue={adjustmentValue}
+                    adjustmentReasonValue={adjustmentReasonValue}
                     onAdjustmentChange={updateAdjustment}
                     onView={openItemDetail}
                     onViewSources={(item) =>

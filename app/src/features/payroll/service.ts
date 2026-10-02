@@ -356,6 +356,15 @@ export interface PayrollItemRow {
    * lo que el empleado gastó en vales.
    */
   voucher_total: number;
+  /**
+   * F8 (migración 067): el motivo escrito del ajuste manual (bonos u otros
+   * descuentos) de ESTE ítem. `null` = sin ajuste manual: cuando `bonuses` y
+   * `other_discounts` son 0 no hay nada que explicar. Con un ajuste distinto de
+   * 0 es obligatorio. Viaja en la misma fila —y por lo tanto en la misma
+   * transacción— que el monto que justifica, para que la liquidación pueda
+   * responder «por qué este empleado tiene este ajuste» sin depender de nadie.
+   */
+  adjustment_reason: string | null;
   created_at: string;
 }
 
@@ -492,7 +501,7 @@ export interface VoucherRequestRow {
 const PERIOD_SELECT =
   "id, sede_id, start_date, end_date, frequency, status, created_by, closed_at, created_at";
 const ITEM_SELECT =
-  "id, period_id, employee_id, base_fixed, commissions, bonuses, deductions_vales, other_discounts, net_pay, detail_json, voucher_total, created_at";
+  "id, period_id, employee_id, base_fixed, commissions, bonuses, deductions_vales, other_discounts, net_pay, detail_json, voucher_total, adjustment_reason, created_at";
 const PAYMENT_SELECT =
   "id, payroll_item_id, method_id, method_code, amount, paid_at, paid_by, reference";
 const EXTRA_SELECT =
@@ -1338,6 +1347,46 @@ interface BillingLine {
 }
 
 /**
+ * F8: TODO ajuste manual lleva su motivo (decisión del dueño, 2026-10-01).
+ *
+ * El motivo no es un adorno de la pantalla: es la explicación que queda escrita
+ * junto al monto. Sin él, una diferencia en una liquidación sólo la puede
+ * explicar la memoria de quien la cargó, y cuando el empleado pregunta no hay
+ * nada que mostrar. Por eso la regla se valida ACÁ —el único camino que carga
+ * ajustes manuales— y no sólo en el formulario: una llamada directa al servicio
+ * (la ruta REST, una server action, un script) no puede colar un bono o un
+ * descuento sin motivo.
+ *
+ * El mensaje NOMBRA al empleado (el esquema de entrada no conoce los nombres,
+ * sólo el id) y dice qué falta; el servicio tiene la planta a mano. Un motivo
+ * en blanco cuenta como ausente. Cuando no hay ajuste manual la regla no aplica:
+ * no hay nada que justificar y `computePayrollLines` descarta cualquier motivo
+ * suelto para que la columna quede NULL.
+ *
+ * La corrección de un período cerrado NO pasa por acá a propósito: no CREA
+ * ajustes, reproduce los que la liquidación firmada ya tenía (con su motivo
+ * escrito), y exigirle un motivo nuevo a un ajuste heredado rompería la
+ * corrección de las liquidaciones anteriores a F8.
+ */
+function assertAdjustmentReasons(
+  adjustments: CalculatePayrollInput["adjustments"],
+  nameById: Map<string, string>,
+): void {
+  for (const adjustment of adjustments) {
+    if (adjustment.bonuses === 0 && adjustment.other_discounts === 0) continue;
+    const reason = (adjustment.adjustment_reason ?? "").trim();
+    if (reason.length === 0) {
+      const who = nameById.get(adjustment.employee_id) ?? adjustment.employee_id;
+      throw new PayrollError(
+        "VALIDATION",
+        `Falta el motivo del ajuste de ${who}: escriba por qué se carga el bono o el descuento.`,
+        400,
+      );
+    }
+  }
+}
+
+/**
  * PAY-02/PAY-03/PAY-07: calcula (o recalcula) el borrador.
  *
  * Por empleado activo de la sede: fijo según pay_type (fijo/mixto cobran
@@ -1384,6 +1433,14 @@ export async function calculatePayroll(
       throw toPayrollError(error);
     });
     const actives = employees.filter((row) => row.is_active);
+    // F8: antes de calcular nada, todo ajuste manual tiene que traer su motivo.
+    // Es un rechazo de contrato (VALIDATION, 400) que nombra al empleado, y es
+    // el punto por el que pasan la server action y la ruta REST: ningún
+    // llamador puede cargar un bono o un descuento sin justificarlo.
+    assertAdjustmentReasons(
+      input.adjustments,
+      new Map(actives.map((row) => [row.id, row.full_name])),
+    );
 
     const { payload, vouchersToDiscount, carriesToApply } = await computePayrollLines({
       db,
@@ -2010,6 +2067,17 @@ async function computePayrollLines(args: {
       // `payroll_discount_carries`. La deuda manual del ajuste se suma con la
       // deuda arrastrada: para el empleado, las dos son "otros descuentos".
       const manualOtherDiscounts = roundMoney(adjustment?.other_discounts ?? 0);
+      // F8: el motivo del ajuste manual. Sólo existe cuando hay un ajuste
+      // (bono o descuento manual distinto de 0): un motivo sin monto no explica
+      // nada y se DESCARTA (nunca se persiste suelto), así la columna queda NULL
+      // —«sin ajuste manual»— salvo cuando justifica una cifra real. El
+      // descuento por DEUDA entrante no cuenta como ajuste manual: entra al
+      // total de `other_discounts` pero no es una decisión del admin, así que no
+      // exige ni conserva motivo.
+      const adjustmentReason =
+        bonuses !== 0 || manualOtherDiscounts !== 0
+          ? (adjustment?.adjustment_reason ?? "").trim() || null
+          : null;
       const incomingDebt = carriesByEmployee.get(employee.id) ?? 0;
       const otherDiscounts = roundMoney(manualOtherDiscounts + incomingDebt);
       // El TOTAL REAL de vales del período, sin recorte: es el valor que la
@@ -2063,6 +2131,7 @@ async function computePayrollLines(args: {
         base_fixed: baseFixed,
         commissions,
         bonuses,
+        adjustment_reason: adjustmentReason,
         deductions_vales: applied.vales,
         other_discounts: applied.otherDiscounts,
         net_pay: net,
@@ -2856,6 +2925,10 @@ export async function correctPayrollPeriod(
         employee_id: item.employee_id,
         bonuses: roundMoney(Number(item.bonuses)),
         other_discounts: roundMoney(Number(item.other_discounts)),
+        // F8: el motivo escrito viaja con el ajuste que la liquidación firmada
+        // ya explicaba; la corrección lo reproduce tal como estaba en vez de
+        // borrarlo por el camino.
+        adjustment_reason: item.adjustment_reason ?? null,
       })),
     };
 

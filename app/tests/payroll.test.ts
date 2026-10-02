@@ -10297,3 +10297,432 @@ describe("payroll-client: el modal de facturas y vales (F6, guarda de fuente)", 
     expect(viejo.split("onViewSources(item)").length - 1).toBe(0);
   });
 });
+
+/* ==========================================================================
+   F8 (decisión del dueño, 2026-10-01): TODO ajuste manual lleva su motivo.
+
+   El defecto: el admin escribe bonos y otros descuentos por empleado sin
+   justificación; la diferencia de una liquidación sólo la podía explicar la
+   memoria de quien la cargó. El motivo es obligatorio y viaja en la MISMA fila
+   que el monto (misma transacción): no puede quedar el ajuste aplicado y su
+   explicación ausente, ni al revés.
+   ========================================================================== */
+describe("payroll: TODO ajuste manual lleva su motivo (F8)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-admin-f8",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const EMPLOYEE_NAME = "Empleada F8";
+  /** Motivo real, con espacios a los lados para probar el recorte. */
+  const REASON = "Bono por cierre de inventario de enero";
+  const SALARY = 1_400_000;
+
+  function seed() {
+    payrollPagedStub.tables = {
+      payroll_periods: [
+        {
+          id: payrollPagedStub.PERIOD_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          start_date: "2026-01-01",
+          end_date: "2026-01-31",
+          status: "borrador",
+          created_by: ACTOR.userId,
+          closed_at: null,
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      employees: [
+        {
+          id: payrollPagedStub.EMPLOYEE_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          user_id: null,
+          full_name: EMPLOYEE_NAME,
+          employee_code: "E-F8",
+          document: "1000000008",
+          phone: null,
+          position: null,
+          payout_mode: "normal",
+          email: null,
+          birth_date: null,
+          pay_type: "fijo",
+          pay_frequency: null,
+          salary_fixed: SALARY,
+          commission_percent: null,
+          is_active: true,
+        },
+      ],
+      invoices: [],
+      invoice_items: [],
+      commission_rules: [],
+      voucher_requests: [],
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      payroll_discount_carries: [],
+      audit_logs: [],
+    };
+  }
+
+  const persistedItem = () => payrollPagedStub.tables.payroll_items[0];
+  const itemPayload = (): Record<string, unknown> =>
+    (payrollPagedStub.rpcCalls[0]?.args.p_items as Array<Record<string, unknown>>)?.[0] ?? {};
+
+  /** La identidad del CHECK de `payroll_items` (tolerancia de un centavo). */
+  function expectIdentity(item: Record<string, unknown>) {
+    const identity =
+      Number(item.base_fixed) +
+      Number(item.commissions) +
+      Number(item.bonuses) -
+      Number(item.deductions_vales) -
+      Number(item.other_discounts);
+    expect(Math.abs(Number(item.net_pay) - identity)).toBeLessThan(0.01);
+    expect(Number(item.net_pay)).toBeGreaterThanOrEqual(0);
+  }
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  // ------------------------------------------------------------------- RED ---
+
+  it("RED: un ajuste sin motivo se rechaza (VALIDATION) y el mensaje nombra al empleado", async () => {
+    seed();
+
+    const outcome: unknown = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      { adjustments: [{ employee_id: payrollPagedStub.EMPLOYEE_ID, bonuses: 50_000 }] },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(outcome).toBeInstanceOf(PayrollError);
+    expect(outcome).toMatchObject({ code: "VALIDATION", status: 400 });
+    // El mensaje NOMBRA al empleado y dice qué falta: no es un error genérico.
+    expect((outcome as Error).message).toContain(EMPLOYEE_NAME);
+    expect((outcome as Error).message.toLowerCase()).toContain("motivo");
+    // Nada escrito: el rechazo ocurre ANTES de la transacción.
+    expect(payrollPagedStub.rpcCalls).toEqual([]);
+    expect(payrollPagedStub.itemWrites).toEqual([]);
+    expect(payrollPagedStub.tables.payroll_items).toEqual([]);
+  });
+
+  it("el descuento manual también exige motivo, y un motivo en blanco cuenta como ausente", async () => {
+    seed();
+
+    const withoutReason: unknown = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      { adjustments: [{ employee_id: payrollPagedStub.EMPLOYEE_ID, other_discounts: 10_000 }] },
+      ACTOR,
+    ).catch((error: unknown) => error);
+    expect(withoutReason).toMatchObject({ code: "VALIDATION", status: 400 });
+
+    // Un motivo que sólo tiene espacios no justifica nada.
+    const blank: unknown = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      {
+        adjustments: [
+          { employee_id: payrollPagedStub.EMPLOYEE_ID, bonuses: 1_000, adjustment_reason: "   " },
+        ],
+      },
+      ACTOR,
+    ).catch((error: unknown) => error);
+    expect(blank).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(payrollPagedStub.rpcCalls).toEqual([]);
+  });
+
+  it("un motivo de más de 200 caracteres se rechaza antes de escribir", async () => {
+    seed();
+
+    const outcome: unknown = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      {
+        adjustments: [
+          {
+            employee_id: payrollPagedStub.EMPLOYEE_ID,
+            bonuses: 1_000,
+            adjustment_reason: "x".repeat(201),
+          },
+        ],
+      },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(outcome).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect((outcome as Error).message).toContain("200");
+    expect(payrollPagedStub.rpcCalls).toEqual([]);
+  });
+
+  // ---------------------------------------------------------------- GREEN ---
+
+  it("GREEN: con motivo el ajuste se persiste, se lee de vuelta y viaja en el payload", async () => {
+    seed();
+
+    const detail = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      {
+        adjustments: [
+          {
+            employee_id: payrollPagedStub.EMPLOYEE_ID,
+            bonuses: 50_000,
+            adjustment_reason: `  ${REASON}  `,
+          },
+        ],
+      },
+      ACTOR,
+    );
+
+    // El motivo se recorta y viaja tal cual en el ítem que se escribe.
+    expect(detail.items[0].adjustment_reason).toBe(REASON);
+    expect(persistedItem().adjustment_reason).toBe(REASON);
+    expect(itemPayload().adjustment_reason).toBe(REASON);
+    expect(payrollPagedStub.itemWrites[0][0].adjustment_reason).toBe(REASON);
+    // El monto y su motivo entran en la MISMA fila.
+    expect(detail.items[0].bonuses).toBe(50_000);
+    expectIdentity(persistedItem());
+  });
+
+  it("sin ajuste no se exige motivo y la columna queda NULL (el payload igual lleva la clave)", async () => {
+    seed();
+
+    const detail = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      {
+        adjustments: [
+          { employee_id: payrollPagedStub.EMPLOYEE_ID, bonuses: 0, other_discounts: 0 },
+        ],
+      },
+      ACTOR,
+    );
+
+    expect(detail.items[0].adjustment_reason).toBeNull();
+    expect(persistedItem().adjustment_reason).toBeNull();
+    // La clave SIEMPRE viaja en el payload, con null cuando no hay ajuste.
+    expect("adjustment_reason" in itemPayload()).toBe(true);
+    expect(itemPayload().adjustment_reason).toBeNull();
+    expectIdentity(persistedItem());
+  });
+
+  it("un motivo sin ajuste se DESCARTA: nunca queda una justificación huérfana", async () => {
+    seed();
+
+    const detail = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      {
+        adjustments: [
+          {
+            employee_id: payrollPagedStub.EMPLOYEE_ID,
+            bonuses: 0,
+            other_discounts: 0,
+            adjustment_reason: "un motivo que no justifica ningún monto",
+          },
+        ],
+      },
+      ACTOR,
+    );
+
+    expect(detail.items[0].adjustment_reason).toBeNull();
+    expect(persistedItem().adjustment_reason).toBeNull();
+    expectIdentity(persistedItem());
+  });
+
+  it("la identidad del neto no cambia: el motivo no entra en la aritmética", async () => {
+    seed();
+
+    const detail = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      payrollPagedStub.PERIOD_ID,
+      {
+        adjustments: [
+          {
+            employee_id: payrollPagedStub.EMPLOYEE_ID,
+            bonuses: 50_000,
+            other_discounts: 10_000,
+            adjustment_reason: REASON,
+          },
+        ],
+      },
+      ACTOR,
+    );
+
+    const item = detail.items[0];
+    expect(item.bonuses).toBe(50_000);
+    expect(item.other_discounts).toBe(10_000);
+    expectIdentity(persistedItem());
+    expectIdentity(item as unknown as Record<string, unknown>);
+  });
+});
+
+/* ==========================================================================
+   F8: la migración 067 declaró la columna del motivo y conservó la firma de
+   `payroll_apply_atomic` (cuatro parámetros, el cuarto con DEFAULT).
+   ========================================================================== */
+describe("migración 067_payroll_adjustment_reason.sql (F8)", () => {
+  const migration = (): { raw: string; sql: string } => {
+    const raw = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "067_payroll_adjustment_reason.sql"),
+      "utf8",
+    );
+    return {
+      raw,
+      sql: raw
+        .split("\n")
+        .filter((line) => !line.trimStart().startsWith("--"))
+        .join("\n"),
+    };
+  };
+
+  it("agrega la columna con su COMMENT y dice qué significa NULL", () => {
+    const { raw, sql } = migration();
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS adjustment_reason text NULL");
+    expect(raw).toContain("COMMENT ON COLUMN public.payroll_items.adjustment_reason IS");
+    expect(raw).toContain("NULL = sin ajuste manual");
+    // La numeración estaba libre y el archivo la justifica.
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("mantiene la firma de CUATRO parámetros y no crea una sobrecarga", () => {
+    const { sql } = migration();
+    expect(sql.match(/CREATE OR REPLACE FUNCTION public\.payroll_apply_atomic/g)).toHaveLength(1);
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.payroll_apply_atomic\(\s*p_period_id uuid,\s*p_items jsonb,\s*p_voucher_ids uuid\[\],\s*p_carry_ids uuid\[\] DEFAULT '\{\}'\s*\)/,
+    );
+    expect(sql).not.toMatch(/DROP FUNCTION/i);
+    // El ALTER/ACL/COMMENT se re-emiten con la MISMA firma.
+    expect(sql).toContain("ALTER FUNCTION public.payroll_apply_atomic(uuid, jsonb, uuid[], uuid[]) SET search_path = public;");
+    expect(sql).toContain("REVOKE ALL ON FUNCTION public.payroll_apply_atomic(uuid, jsonb, uuid[], uuid[]) FROM PUBLIC;");
+    expect(sql).toContain("GRANT EXECUTE ON FUNCTION public.payroll_apply_atomic(uuid, jsonb, uuid[], uuid[]) TO service_role;");
+  });
+
+  it("escribe el motivo en el INSERT y en el ON CONFLICT DO UPDATE", () => {
+    const { sql } = migration();
+    expect(sql).toContain("adjustment_reason)");
+    expect(sql).toContain("(item ->> 'adjustment_reason')");
+    expect(sql).toContain("adjustment_reason = EXCLUDED.adjustment_reason;");
+  });
+
+  it("valida la forma del motivo: no vacío después de recortar y ≤ 200 caracteres", () => {
+    const { sql } = migration();
+    expect(sql).toContain("jsonb_typeof(item -> 'adjustment_reason') <> 'null'");
+    expect(sql).toContain("jsonb_typeof(item -> 'adjustment_reason') <> 'string'");
+    expect(sql).toContain("char_length(btrim(item ->> 'adjustment_reason')) < 1");
+    expect(sql).toContain("char_length(btrim(item ->> 'adjustment_reason')) > 200");
+  });
+});
+
+/* ==========================================================================
+   F8: el cableado del motivo en la pantalla (guarda de fuente).
+
+   El campo del motivo vive junto a los bonos y otros descuentos; se marca
+   obligatorio cuando la fila lleva ajuste; la tabla cerrada muestra el motivo
+   guardado. La guarda no agrega `<Alert>` ni `role=`: el aviso es texto plano
+   (por eso `tests/feedback-batch2.test.ts` sigue verde).
+
+   F8-visibilidad: el motivo faltante se avisa INLINE, en la MISMA celda del
+   motivo, porque el error de la página queda DETRÁS del diálogo abierto y el
+   admin no lo ve. El aviso nombra al empleado y desaparece apenas se escribe.
+   ========================================================================== */
+describe("payroll-client: el motivo del ajuste (F8, guarda de fuente)", () => {
+  const source = readFileSync(
+    join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
+    "utf8",
+  );
+
+  /**
+   * El aviso INLINE del motivo faltante: un `<p>` de texto plano en la celda
+   * del motivo, con la copia que nombra al empleado de la fila. No es `Alert`
+   * (movería el conteo de `feedback-batch2`) ni lleva `role=` a mano.
+   */
+  const INLINE_REASON_NOTICE =
+    /<p className="mt-1 text-xs text-error">\s*\{`Falta el motivo del ajuste de \$\{employeeName\(row\.employeeId\)\}\.`\}\s*<\/p>/;
+
+  /**
+   * El `<td>` que envuelve el input del motivo. Corta en su `</td>` desde la
+   * `aria-label` del campo, así el aviso solo cuenta si está en ESA celda.
+   */
+  function reasonCellBody(candidate: string): string {
+    const input = candidate.indexOf(
+      "aria-label={`Motivo del ajuste de ${employeeName(row.employeeId)}`}",
+    );
+    expect(input, "input del motivo").toBeGreaterThan(-1);
+    const open = candidate.lastIndexOf("<td className={tableCellClass}>", input);
+    const close = candidate.indexOf("</td>", input);
+    return candidate.slice(open, close + "</td>".length);
+  }
+
+  it("piso anti-vacío: el cliente se leyó de verdad", () => {
+    expect(source.length).toBeGreaterThan(20_000);
+    expect(source).toContain("adjustmentReasonValue");
+  });
+
+  it("cada fila del borrador tiene el campo de motivo, cableado al mismo registro", () => {
+    expect(source).toContain("aria-label={`Motivo del ajuste de ${employeeName(row.employeeId)}`}");
+    expect(source).toContain('onAdjustmentChange(row.employeeId, "reason", event.target.value)');
+    expect(source).toContain('adjustment_reason: reason === "" ? null : reason,');
+    expect(source).toContain("aria-required={reasonRequired}");
+    expect(source).toContain("Motivo (obligatorio)");
+  });
+
+  it("el motivo faltante se avisa INLINE, junto a la fila, y nombra al empleado", () => {
+    // El aviso vive en la MISMA celda del motivo, pegado al input y dentro del
+    // diálogo: el error de la página queda detrás del modal abierto.
+    const cell = reasonCellBody(source);
+    expect(cell, "aviso inline del motivo faltante").toMatch(INLINE_REASON_NOTICE);
+    // Texto plano: un `Alert` o un `role=` movería las guardas de feedback-batch2.
+    expect(cell).not.toContain("<Alert");
+    expect(cell).not.toMatch(/\brole\s*=/);
+    // Se deriva de la MISMA condición que marca el campo obligatorio, y deja de
+    // mostrarse apenas el motivo existe (`reasonValue.trim() !== ""`).
+    expect(source).toContain('const reasonMissing = reasonRequired && reasonValue.trim() === "";');
+    expect(source).toContain("const reasonValue = adjustmentReasonValue(row.employeeId);");
+  });
+
+  it("el detector del aviso inline no es un sello de goma (control negativo)", () => {
+    // El marcado VIEJO de esta unidad: el input del motivo, sin el aviso inline
+    // (la respuesta vivía solo en el error de la página). La misma guarda que
+    // afirma el aviso tiene que rechazarlo.
+    const viejo = [
+      '<td className={tableCellClass}>',
+      '  <input',
+      '    aria-label={`Motivo del ajuste de ${employeeName(row.employeeId)}`}',
+      '  />',
+      "</td>",
+    ].join("\n");
+    const cell = reasonCellBody(viejo);
+    expect(cell).not.toMatch(INLINE_REASON_NOTICE);
+    expect(cell).not.toContain("reasonMissing");
+    // Y la condición inline no estaba: el aviso es nuevo, no un falso positivo.
+    expect(viejo.includes("reasonMissing")).toBe(false);
+  });
+
+  it("la tabla cerrada muestra el motivo guardado (auditoría)", () => {
+    expect(source).toContain('{item.adjustment_reason ?? "—"}');
+  });
+
+  it("la nota vieja de la primera nómina se reemplazó por lo que pasa de verdad", () => {
+    expect(source).not.toContain("suele ser un rango corto");
+    expect(source).toContain("La primera liquidación es un ciclo completo");
+  });
+
+  it("el detector no es un sello de goma (control negativo)", () => {
+    // El marcado VIEJO, sin motivo: ninguna de las señales de la guarda está.
+    const viejo =
+      '<td><input aria-label={`Bonos de ${employeeName(row.employeeId)}`} /></td>';
+    expect(viejo.includes("adjustmentReasonValue")).toBe(false);
+    expect(viejo.includes('onAdjustmentChange(row.employeeId, "reason"')).toBe(false);
+    expect(viejo.includes("aria-required={reasonRequired}")).toBe(false);
+    expect(viejo.includes("adjustment_reason")).toBe(false);
+    // Y la copia vieja existe: el `not.toContain` de arriba no pasa solo.
+    expect(
+      "La primera liquidación suele ser un rango corto, desde el día en que arrancaron.".includes(
+        "suele ser un rango corto",
+      ),
+    ).toBe(true);
+  });
+});

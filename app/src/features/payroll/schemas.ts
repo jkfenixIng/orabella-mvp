@@ -96,11 +96,35 @@ export const openPeriodSchema = z
   });
 export type OpenPeriodInput = z.infer<typeof openPeriodSchema>;
 
+/**
+ * F8 (migración 067): longitud máxima del motivo de un ajuste manual. El mismo
+ * tope vive en la guarda de forma de `payroll_apply_atomic`, para que un motivo
+ * desmedido se rechace en el contrato y no llegue a la columna.
+ */
+export const ADJUSTMENT_REASON_MAX_LENGTH = 200;
+
 /** PAY-02: ajustes manuales por empleado al calcular (bonos y otros descuentos). */
 export const employeeAdjustmentSchema = z.object({
   employee_id: uuidSchema,
   bonuses: z.coerce.number().nonnegative("Los bonos no pueden ser negativos.").default(0),
   other_discounts: z.coerce.number().nonnegative("Los descuentos no pueden ser negativos.").default(0),
+  /**
+   * F8: el motivo escrito del ajuste. Viaja en la MISMA fila que el monto que
+   * justifica (`payroll_items.adjustment_reason`, 067) y con él se confirma o se
+   * revierte. `null`/ausente = sin motivo: el servicio lo exige cuando hay un
+   * bono o un descuento distinto de 0 y lo descarta cuando no hay ajuste
+   * (decisión del dueño, 2026-10-01: todo ajuste manual lleva su motivo). La
+   * regla cruzada vive en el servicio porque el mensaje tiene que nombrar al
+   * empleado y el esquema no conoce los nombres.
+   */
+  adjustment_reason: z
+    .string()
+    .trim()
+    .max(
+      ADJUSTMENT_REASON_MAX_LENGTH,
+      `El motivo no puede superar los ${ADJUSTMENT_REASON_MAX_LENGTH} caracteres.`,
+    )
+    .nullish(),
 });
 export type EmployeeAdjustment = z.infer<typeof employeeAdjustmentSchema>;
 
