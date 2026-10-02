@@ -34,6 +34,11 @@ import {
   toNumber,
   type ActionResult,
 } from "../admin-shared";
+import {
+  formatMoneyInput,
+  stripMoneyInput,
+  stripPercentageInput,
+} from "@/src/shared/lib/money";
 
 const EMPTY_EMPLOYEE = {
   full_name: "",
@@ -522,10 +527,10 @@ export function EmployeesSection({
             <label className={labelClass}>
               Salario fijo mensual (fijo/mixto)
               <input
-                value={form.salary_fixed}
-                onChange={(event) => setForm({ ...form, salary_fixed: event.target.value })}
+                value={formatMoneyInput(form.salary_fixed)}
+                onChange={(event) => setForm({ ...form, salary_fixed: stripMoneyInput(event.target.value) })}
                 placeholder="1400000"
-                inputMode="decimal"
+                inputMode="numeric"
                 className={inputClass}
               />
               <span className="text-xs text-text-tertiary">
@@ -536,7 +541,7 @@ export function EmployeesSection({
               Comisión % (porcentaje/mixto, 0–100)
               <input
                 value={form.commission_percent}
-                onChange={(event) => setForm({ ...form, commission_percent: event.target.value })}
+                onChange={(event) => setForm({ ...form, commission_percent: stripPercentageInput(event.target.value) })}
                 placeholder="30"
                 inputMode="decimal"
                 className={inputClass}

@@ -23,6 +23,7 @@ import {
   stackClass,
 } from "../admin-styles";
 import { formatMoney, toNumber, type ActionResult } from "../admin-shared";
+import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 
 /** Días ISO (1=lunes…7=domingo) con su nombre corto. */
 const DAY_NAMES: Array<{ day: number; label: string }> = [
@@ -335,10 +336,10 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
             <label className={`${labelClass} max-w-xs`}>
               Tope por semana
               <input
-                value={maxWeek}
-                onChange={(event) => setMaxWeek(event.target.value)}
+                value={formatMoneyInput(maxWeek)}
+                onChange={(event) => setMaxWeek(stripMoneyInput(event.target.value))}
                 placeholder="500000"
-                inputMode="decimal"
+                inputMode="numeric"
                 className={inputClass}
               />
             </label>
@@ -371,10 +372,10 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
                 <label className={`${labelClass} max-w-xs`}>
                   Tope diario
                   <input
-                    value={maxDay}
-                    onChange={(event) => setMaxDay(event.target.value)}
+                    value={formatMoneyInput(maxDay)}
+                    onChange={(event) => setMaxDay(stripMoneyInput(event.target.value))}
                     placeholder="200000"
-                    inputMode="decimal"
+                    inputMode="numeric"
                     className={inputClass}
                   />
                 </label>
@@ -384,12 +385,12 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
                     <label key={day} className={labelClass}>
                       {DAY_NAMES[day - 1]?.label ?? day}
                       <input
-                        value={perDayValues[day] ?? ""}
+                        value={formatMoneyInput(perDayValues[day] ?? "")}
                         onChange={(event) =>
-                          setPerDayValues((prev) => ({ ...prev, [day]: event.target.value }))
+                          setPerDayValues((prev) => ({ ...prev, [day]: stripMoneyInput(event.target.value) }))
                         }
                         placeholder="200000"
-                        inputMode="decimal"
+                        inputMode="numeric"
                         className={inputClass}
                       />
                     </label>

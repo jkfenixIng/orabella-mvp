@@ -1311,3 +1311,110 @@ describe("inventory: botón de ayuda del SKU (guarda de fuente)", () => {
     expect(proposalButtonBlock('<Button type="button">Generar</Button>')).toBe("");
   });
 });
+
+/* ==========================================================================
+   Inventario: la cantidad del movimiento sólo acepta dígitos (guarda de fuente)
+
+   La cantidad de un movimiento es un entero positivo (`movementSchema`).
+   `inputMode="numeric"` es una pista del teclado, no una validación: una letra
+   tecleada llegaba al estado. El campo pasa por `stripQuantityInput` antes de
+   escribir el estado; esta guarda falla si alguien quita el cable.
+   ========================================================================== */
+describe("inventory: la cantidad del movimiento sólo acepta dígitos (guarda de fuente)", () => {
+  const source = readFileSync(
+    join(process.cwd(), "app", "inventory", "inventory-client.tsx"),
+    "utf8",
+  );
+
+  /**
+   * Línea de `onChange` del campo cuya llamada al estado empieza con `call`.
+   * Devuelve "" si el campo no existe, para que la guarda falle en vez de
+   * pasar sola.
+   */
+  function quantityOnChange(text: string, call: string): string {
+    const at = text.indexOf(call);
+    if (at === -1) return "";
+    const start = text.lastIndexOf("onChange", at);
+    if (start === -1) return "";
+    const end = text.indexOf("\n", start);
+    return text.slice(start, end === -1 ? text.length : end);
+  }
+
+  it("piso anti-vacío: el cliente se leyó de verdad", () => {
+    expect(source.length).toBeGreaterThan(20_000);
+    expect(source).toContain("stripQuantityInput");
+  });
+
+  it("la cantidad del movimiento filtra antes de escribir el estado", () => {
+    const line = quantityOnChange(source, "setMovement({ ...movement, qty:");
+    expect(line, "campo cantidad del movimiento").not.toBe("");
+    expect(line).toContain("stripQuantityInput(event.target.value)");
+    expect(line).not.toContain("qty: event.target.value");
+  });
+
+  it("el detector no es un sello de goma (control negativo)", () => {
+    const fake =
+      '<Input onChange={(event) => setMovement({ ...movement, qty: event.target.value })} />';
+    const line = quantityOnChange(fake, "setMovement({ ...movement, qty:");
+    expect(line).not.toBe("");
+    // Sin el cable al helper, la misma guarda falla.
+    expect(line).not.toContain("stripQuantityInput");
+    // Sin el ancla no hay línea: la guarda falla en vez de pasar sola.
+    expect(quantityOnChange(fake, "setMovement({ ...otro, qty:")).toBe("");
+  });
+});
+
+/* ==========================================================================
+   Inventario: el stock mínimo del producto sólo acepta dígitos (guarda)
+
+   El stock mínimo es un entero (`productSchema`). `inputMode="numeric"` es
+   una pista del teclado, no una validación: una letra tecleada llegaba al
+   estado. El campo pasa por `stripQuantityInput` antes de escribir el estado;
+   esta guarda falla si alguien quita el cable.
+   ========================================================================== */
+describe("inventory: el stock mínimo del producto sólo acepta dígitos (guarda de fuente)", () => {
+  const source = readFileSync(
+    join(process.cwd(), "app", "inventory", "inventory-client.tsx"),
+    "utf8",
+  );
+
+  /** Bloque `onChange={...}` cuyo cuerpo contiene `anchor` ("" si no existe). */
+  function onChangeBlock(text: string, anchor: string): string {
+    const at = text.indexOf(anchor);
+    if (at === -1) return "";
+    const start = text.lastIndexOf("onChange={", at);
+    if (start === -1) return "";
+    let depth = 0;
+    for (let i = start + "onChange=".length; i < text.length; i += 1) {
+      const ch = text[i];
+      if (ch === "{") depth += 1;
+      else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) return text.slice(start, i + 1);
+      }
+    }
+    return text.slice(start);
+  }
+
+  it("piso anti-vacío: el cliente se leyó de verdad", () => {
+    expect(source.length).toBeGreaterThan(20_000);
+    expect(source).toContain("stripQuantityInput");
+  });
+
+  it("el stock mínimo filtra antes de escribir el estado", () => {
+    const block = onChangeBlock(source, "min_stock: stripQuantityInput");
+    expect(block, "campo stock mínimo").not.toBe("");
+    expect(block).toContain("stripQuantityInput(event.target.value)");
+    expect(block).not.toContain("min_stock: event.target.value");
+  });
+
+  it("el detector no es un sello de goma (control negativo)", () => {
+    const fake = `<Input onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, min_stock: event.target.value })} />`;
+    const block = onChangeBlock(fake, "min_stock:");
+    expect(block).not.toBe("");
+    // Sin el cable al helper, la misma guarda falla.
+    expect(block).not.toContain("stripQuantityInput(event.target.value)");
+    // Sin el ancla no hay bloque: la guarda falla en vez de pasar sola.
+    expect(onChangeBlock(fake, "no-existe:")).toBe("");
+  });
+});

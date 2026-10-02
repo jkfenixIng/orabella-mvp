@@ -36,7 +36,7 @@ import {
   SelectValue,
 } from "@/src/components/ui/lib/select";
 import { cn } from "@/src/components/ui/lib/utils";
-import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import { formatMoney, formatMoneyInput, stripMoneyInput, stripQuantityInput } from "@/src/shared/lib/money";
 import type { ActionResult } from "@/src/shared/lib/api-response";
 import { toNumber } from "@/src/shared/lib/format";
 import {
@@ -544,7 +544,7 @@ export function InventoryClient(props: InventoryClientProps) {
                 className={inputClass}
                 value={form.min_stock}
                 inputMode="numeric"
-                onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, min_stock: event.target.value })}
+                onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, min_stock: stripQuantityInput(event.target.value) })}
               />
             </Label>
             <Label htmlFor="product-is-active" className={cn(labelClass, "flex-row items-center")}>
@@ -663,7 +663,7 @@ export function InventoryClient(props: InventoryClientProps) {
                   className={inputClass}
                   value={movement.qty}
                   inputMode="numeric"
-                  onChange={(event: ChangeEvent<HTMLInputElement>) => setMovement({ ...movement, qty: event.target.value })}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) => setMovement({ ...movement, qty: stripQuantityInput(event.target.value) })}
                   required
                 />
               </Label>

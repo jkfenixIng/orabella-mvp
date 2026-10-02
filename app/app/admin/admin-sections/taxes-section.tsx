@@ -17,6 +17,7 @@ import {
   stackClass,
 } from "../admin-styles";
 import { toNumber, type ActionResult } from "../admin-shared";
+import { stripPercentageInput } from "@/src/shared/lib/money";
 
 const EMPTY_TAX = { code: "IVA", name: "", percent: "", is_active: false };
 
@@ -150,7 +151,7 @@ export function TaxesSection({ sedeId, initial }: { sedeId: string; initial: Tax
             Porcentaje (0–100)
             <input
               value={form.percent}
-              onChange={(event) => setForm({ ...form, percent: event.target.value })}
+              onChange={(event) => setForm({ ...form, percent: stripPercentageInput(event.target.value) })}
               inputMode="decimal"
               className={inputClass}
             />

@@ -19,7 +19,7 @@ import {
   DialogTitle,
 } from "@/src/components/ui/lib/dialog";
 import { cn } from "@/src/components/ui/lib/utils";
-import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import { formatMoney, formatMoneyInput, stripMoneyInput, stripQuantityInput } from "@/src/shared/lib/money";
 import type { ActionResult } from "@/src/shared/lib/api-response";
 import { toNumber } from "@/src/shared/lib/format";
 import {
@@ -244,7 +244,7 @@ export function ServicesClient(props: ServicesClientProps) {
                   value={form.duracion_min}
                   inputMode="numeric"
                   placeholder="30"
-                  onChange={(event) => setForm({ ...form, duracion_min: event.target.value })}
+                  onChange={(event) => setForm({ ...form, duracion_min: stripQuantityInput(event.target.value) })}
                 />
               </Label>
               <Label htmlFor="service-duration-max" className={labelClass}>
@@ -255,7 +255,7 @@ export function ServicesClient(props: ServicesClientProps) {
                   value={form.duracion_max}
                   inputMode="numeric"
                   placeholder="60"
-                  onChange={(event) => setForm({ ...form, duracion_max: event.target.value })}
+                  onChange={(event) => setForm({ ...form, duracion_max: stripQuantityInput(event.target.value) })}
                 />
               </Label>
               <Label htmlFor="service-description" className={cn(labelClass, "sm:col-span-2")}>

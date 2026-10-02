@@ -187,3 +187,60 @@ describe("servicios: el texto visible no cambió (cambia el canal, no la copia)"
     expect(lines[0]).not.toContain("Alert");
   });
 });
+
+/* --------------------------------------------------------------------------
+   Servicios: las duraciones sólo aceptan dígitos (guarda de fuente)
+
+   La duración mínima y máxima son MINUTOS enteros. `inputMode="numeric"` es
+   una pista del teclado, no una validación: una letra tecleada llegaba al
+   estado. Los dos campos pasan por `stripQuantityInput` antes de escribir el
+   estado; esta guarda falla si alguien quita el cable.
+   -------------------------------------------------------------------------- */
+describe("servicios: las duraciones sólo aceptan dígitos (guarda de fuente)", () => {
+  /** Bloque `onChange={...}` cuyo cuerpo contiene `anchor` ("" si no existe). */
+  function onChangeBlock(text: string, anchor: string): string {
+    const at = text.indexOf(anchor);
+    if (at === -1) return "";
+    const start = text.lastIndexOf("onChange={", at);
+    if (start === -1) return "";
+    let depth = 0;
+    for (let i = start + "onChange=".length; i < text.length; i += 1) {
+      const ch = text[i];
+      if (ch === "{") depth += 1;
+      else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) return text.slice(start, i + 1);
+      }
+    }
+    return text.slice(start);
+  }
+
+  it("piso anti-vacío: el cliente se leyó de verdad", () => {
+    expect(CLIENT_TSX.length).toBeGreaterThan(5_000);
+    expect(CLIENT_TSX).toContain("stripQuantityInput");
+  });
+
+  it("la duración mínima filtra antes de escribir el estado", () => {
+    const block = onChangeBlock(CLIENT_TSX, "duracion_min: stripQuantityInput");
+    expect(block, "campo duración mínima").not.toBe("");
+    expect(block).toContain("stripQuantityInput(event.target.value)");
+    expect(block).not.toContain("duracion_min: event.target.value");
+  });
+
+  it("la duración máxima filtra antes de escribir el estado", () => {
+    const block = onChangeBlock(CLIENT_TSX, "duracion_max: stripQuantityInput");
+    expect(block, "campo duración máxima").not.toBe("");
+    expect(block).toContain("stripQuantityInput(event.target.value)");
+    expect(block).not.toContain("duracion_max: event.target.value");
+  });
+
+  it("el detector no es un sello de goma (control negativo)", () => {
+    const fake = `<Input onChange={(event) => setForm({ ...form, duracion_min: event.target.value })} />`;
+    const block = onChangeBlock(fake, "duracion_min:");
+    expect(block).not.toBe("");
+    // Sin el cable al helper, la misma guarda falla.
+    expect(block).not.toContain("stripQuantityInput(event.target.value)");
+    // Sin el ancla no hay bloque: la guarda falla en vez de pasar sola.
+    expect(onChangeBlock(fake, "no-existe:")).toBe("");
+  });
+});
