@@ -42,6 +42,8 @@ import {
   payrollMonthLabel,
   payrollPeriodCountLabel,
   payFrequencySchema,
+  periodCadenceBucket,
+  periodExcludesEmployeeByCadence,
   prorateFixedSalary,
   rangesOverlap,
   resolveFixedSalaryForPeriod,
@@ -2830,7 +2832,7 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
     expectIdentity(itemFor("empleado-1"));
   });
 
-  it("cadencia DISTINTA: el empleado cobra 0 fijo en el período", async () => {
+  it("cadencia DISTINTA: el empleado queda FUERA del período, sin ítem (F4)", async () => {
     seed({
       periodFrequency: "semanal",
       employees: [
@@ -2838,9 +2840,53 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
       ],
     });
     await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    // F4: antes F3 le escribía un ítem en 0 fijo. Ahora la exclusión ocurre al
+    // armar el conjunto de empleados, así que NO hay fila: nada aguas abajo
+    // (ítems, totales, resúmenes) ve al excluido.
+    expect(payrollPagedStub.itemsUpsert).toBeNull();
+    // Sin ítems, sin vales y sin deudas no se abre transacción: el período no
+    // se tocó.
+    expect(payrollPagedStub.rpcCalls).toHaveLength(0);
+  });
+
+  it("cadencia distinta: tampoco se le liquidan comisiones (facturas fuera de la ventana) (F4)", async () => {
+    seed({
+      periodFrequency: "semanal",
+      employees: [
+        { pay_type: "mixto", pay_frequency: "mensual", salary_fixed: 1_200_000, commission_percent: 10 },
+      ],
+      // Factura Pagada DENTRO del rango del período y del empleado excluido.
+      lines: [{ item_type: "servicio", subtotal: 4_000_000 }],
+    });
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    // La comisión de 400.000 NO aparece en ninguna parte: no hay ítem que la
+    // lleve y no hay `detail_json` con la factura. Es lo que evita liquidar dos
+    // veces la misma factura cuando el semanal y el mensual se superponen.
+    expect(payrollPagedStub.itemsUpsert).toBeNull();
+    expect(payrollPagedStub.itemWrites).toEqual([]);
+    expect(payrollPagedStub.rpcCalls).toHaveLength(0);
+  });
+
+  it("cadencia indefinida en el legajo: conserva el prorrateo por días Y las comisiones (F4)", async () => {
+    seed({
+      periodFrequency: "semanal",
+      startDate: "2026-01-01",
+      endDate: "2026-01-07",
+      employees: [
+        { pay_type: "mixto", pay_frequency: null, salary_fixed: 1_200_000, commission_percent: 10 },
+      ],
+      lines: [{ item_type: "servicio", subtotal: 4_000_000 }],
+    });
+    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
     const item = itemFor("empleado-1");
-    expect(item.base_fixed).toBe(0);
-    expect(item.net_pay).toBe(0);
+    // Falta la cadencia del empleado: rige el comportamiento de HOY, exacto.
+    expect(item.base_fixed).toBe(
+      prorateFixedSalary({ salaryFixed: 1_200_000, startDate: "2026-01-01", endDate: "2026-01-07" }),
+    );
+    expect(item.base_fixed).not.toBe(300_000); // no la fracción mensual/4
+    expect(item.commissions).toBe(400_000); // 10% de 4.000.000, como hoy
+    expect(item.net_pay).toBe(Math.round(item.base_fixed as number) + 400_000);
+    expect(detailSum(item)).toBe(400_000);
     expectIdentity(item);
   });
 
@@ -4224,7 +4270,8 @@ describe("payroll: la fracción del fijo por cadencia (F3, función pura)", () =
     expect(fixedFractionForFrequency(null)).toBeNull();
     expect(fixedFractionForFrequency(undefined)).toBeNull();
     expect(fixedFractionForFrequency("anual")).toBeNull();
-    // El catálogo es CERRADO y el mismo que pregunta la ficha del empleado (F2).
+    // El catálogo es CERRADO y el mismo que pregunta la ficha del empleado (F2)
+    // y el diálogo del período (F4).
     expect(payFrequencySchema.safeParse("semanal").success).toBe(true);
     expect(payFrequencySchema.safeParse("anual").success).toBe(false);
   });
@@ -4266,6 +4313,44 @@ describe("payroll: la fracción del fijo por cadencia (F3, función pura)", () =
   it("sin sueldo no hay base que fraccionar", () => {
     expect(resolve("semanal", "semanal", null).amount).toBe(0);
     expect(resolve("semanal", "semanal", 0).amount).toBe(0);
+  });
+});
+
+describe("payroll: la cadencia del período, exclusión y cubo de solape (F4, función pura)", () => {
+  it("el cubo de cadencia es `coalesce(frequency, '')`: NULL y undefined son la cadena vacía", () => {
+    expect(periodCadenceBucket(null)).toBe("");
+    expect(periodCadenceBucket(undefined)).toBe("");
+    expect(periodCadenceBucket("semanal")).toBe("semanal");
+    expect(periodCadenceBucket("mensual")).toBe("mensual");
+  });
+
+  it("excluye SÓLO cuando las dos cadencias están definidas y difieren", () => {
+    expect(
+      periodExcludesEmployeeByCadence({ employeeFrequency: "mensual", periodFrequency: "semanal" }),
+    ).toBe(true);
+    expect(
+      periodExcludesEmployeeByCadence({ employeeFrequency: "semanal", periodFrequency: "quincenal" }),
+    ).toBe(true);
+    expect(
+      periodExcludesEmployeeByCadence({ employeeFrequency: "semanal", periodFrequency: "semanal" }),
+    ).toBe(false);
+    // Cualquiera de los dos lados sin cadencia conserva el comportamiento de hoy.
+    expect(
+      periodExcludesEmployeeByCadence({ employeeFrequency: null, periodFrequency: "semanal" }),
+    ).toBe(false);
+    expect(
+      periodExcludesEmployeeByCadence({ employeeFrequency: "semanal", periodFrequency: null }),
+    ).toBe(false);
+    expect(
+      periodExcludesEmployeeByCadence({ employeeFrequency: null, periodFrequency: null }),
+    ).toBe(false);
+    expect(
+      periodExcludesEmployeeByCadence({ employeeFrequency: undefined, periodFrequency: undefined }),
+    ).toBe(false);
+    // Un valor fuera del catálogo es AUSENCIA, no otra cadencia.
+    expect(
+      periodExcludesEmployeeByCadence({ employeeFrequency: "anual", periodFrequency: "semanal" }),
+    ).toBe(false);
   });
 });
 
@@ -4383,13 +4468,40 @@ describe("payroll: el piso del período nuevo, función pura (regla del dueño 2
     nextPeriodStartDate(periods);
     expect(periods).toEqual(snapshot);
   });
+
+  it("F4: el piso es de la MISMA cadencia; otro ciclo no lo impone", () => {
+    const periods = [
+      { start_date: "2026-09-01", end_date: "2026-09-30", frequency: "mensual" },
+      { start_date: "2026-09-01", end_date: "2026-09-07", frequency: "semanal" },
+    ];
+    // El semanal que sigue: día después del último semanal. El mensual llega
+    // más lejos, pero puede superponerse A PROPÓSITO y no impone piso.
+    expect(nextPeriodStartDate(periods, "semanal")).toBe("2026-09-08");
+    // El mensual: día después del último mensual.
+    expect(nextPeriodStartDate(periods, "mensual")).toBe("2026-10-01");
+    // Un ciclo sin períodos no tiene piso (su primero es libre).
+    expect(nextPeriodStartDate(periods, "quincenal")).toBeNull();
+  });
+
+  it("F4: sin cadencia (o sin decirla) se acotan solo los períodos sin cadencia", () => {
+    const periods = [
+      { start_date: "2026-09-01", end_date: "2026-09-07" },
+      { start_date: "2026-09-01", end_date: "2026-09-30", frequency: "mensual" },
+    ];
+    // El cubo vacío es el de los períodos heredados: solo esos acotan.
+    expect(nextPeriodStartDate(periods)).toBe("2026-09-08");
+    expect(nextPeriodStartDate(periods, null)).toBe("2026-09-08");
+    expect(nextPeriodStartDate(periods, "")).toBe("2026-09-08");
+  });
 });
 
 describe("payroll: el diálogo de apertura usa el piso del helper (guarda de fuente)", () => {
   const client = readFileSync(join(process.cwd(), "app", "payroll", "payroll-client.tsx"), "utf8");
 
   it("el piso sale del helper, no de aritmética local", () => {
-    expect(client).toContain("const suggestedStart = nextPeriodStartDate(periods);");
+    // F4: el piso se evalúa POR CADENCIA (`openFrequency`), la misma que el
+    // usuario eligió y la misma que acota la guarda del servicio.
+    expect(client).toContain("const suggestedStart = nextPeriodStartDate(periods, openFrequency);");
     // El `min` del campo de inicio ES ese piso.
     expect(client).toContain("min={suggestedStart ?? undefined}");
   });
@@ -4400,8 +4512,23 @@ describe("payroll: el diálogo de apertura usa el piso del helper (guarda de fue
 
   it("el envío nombra la fecha válida siguiente y conserva la guarda de solape", () => {
     expect(client).toContain("El período no puede empezar antes del");
-    // Sigue delegando en el solape y el servidor sigue siendo la autoridad.
-    expect(client).toContain("findOverlappingPeriod(periods, startDate, endDate)");
+    // Sigue delegando en el solape, ahora acotado por cadencia (F4), y el
+    // servidor sigue siendo la autoridad.
+    expect(client).toContain("findOverlappingPeriod(periods, startDate, endDate, openFrequency)");
+  });
+
+  it("F4: el diálogo elige la cadencia, la envía y usa el mismo cubo que la base", () => {
+    // El control existe con su etiqueta legible y la opción explícita.
+    expect(client).toContain("Cadencia del período");
+    expect(client).toContain('id="payroll-open-frequency"');
+    expect(client).toContain('label: "Sin cadencia"');
+    // Viaja en el cuerpo de la apertura; "Sin cadencia" va como null.
+    expect(client).toContain('frequency: openFrequency === "" ? null : openFrequency');
+    // La guarda en vivo compara con `coalesce(frequency, '')`, el cubo de 063.
+    expect(client).toContain("periodCadenceBucket(frequency)");
+    // Y el piso de fecha también es por cadencia: sin esto, el diálogo mostraría
+    // "sin solape" y luego bloquearía el rango que la guarda sí admite.
+    expect(client).toContain("const minimumStart = nextPeriodStartDate(periods, openFrequency);");
   });
 
   it("control negativo: nada de piso vacío, literal ni prefill hardcodeado", () => {
@@ -4436,12 +4563,20 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     };
   }
 
-  function periodRow(id: string, start: string, end: string, status = "borrador", sedeId = payrollPagedStub.SEDE_ID) {
+  function periodRow(
+    id: string,
+    start: string,
+    end: string,
+    status = "borrador",
+    sedeId = payrollPagedStub.SEDE_ID,
+    frequency: string | null = null,
+  ) {
     return {
       id,
       sede_id: sedeId,
       start_date: start,
       end_date: end,
+      frequency,
       status,
       created_by: "u-1",
       closed_at: status === "cerrado" ? "2026-09-08T00:00:00.000Z" : null,
@@ -4522,6 +4657,104 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     );
 
     expect(created).toMatchObject({ start_date: "2026-09-01", end_date: "2026-09-07" });
+  });
+
+  it("F4: persiste la cadencia elegida y sin cadencia deja NULL", async () => {
+    for (const frequency of ["semanal", "quincenal", "mensual", null] as const) {
+      seedPeriods([]);
+      payrollPagedStub.inserts.length = 0;
+
+      const created = await openPayrollPeriod(
+        { start_date: "2026-09-01", end_date: "2026-09-07", frequency },
+        ACTOR,
+      );
+
+      expect(created.frequency, String(frequency)).toBe(frequency);
+      const inserts = periodInserts();
+      expect(inserts, String(frequency)).toHaveLength(1);
+      expect((inserts[0].payload as { frequency?: string | null }).frequency, String(frequency)).toBe(
+        frequency,
+      );
+    }
+  });
+
+  it("F4: rechaza una cadencia fuera del catálogo cerrado (nada se escribe)", async () => {
+    seedPeriods([]);
+
+    const failure: unknown = await openPayrollPeriod(
+      { start_date: "2026-09-01", end_date: "2026-09-07", frequency: "anual" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(periodInserts()).toHaveLength(0);
+  });
+
+  it("F4: dos cadencias DISTINTAS de la misma sede pueden compartir días", async () => {
+    seedPeriods([
+      periodRow("periodo-semanal", "2026-09-01", "2026-09-07", "borrador", payrollPagedStub.SEDE_ID, "semanal"),
+    ]);
+
+    const created = await openPayrollPeriod(
+      { start_date: "2026-09-01", end_date: "2026-09-30", frequency: "mensual" },
+      ACTOR,
+    );
+
+    expect(created).toMatchObject({
+      start_date: "2026-09-01",
+      end_date: "2026-09-30",
+      frequency: "mensual",
+    });
+    expect(periodInserts()).toHaveLength(1);
+  });
+
+  it("F4: una cadencia definida NO choca con un período heredado sin cadencia", async () => {
+    seedPeriods([periodRow("periodo-heredado", "2026-09-01", "2026-09-07")]);
+
+    const created = await openPayrollPeriod(
+      { start_date: "2026-09-05", end_date: "2026-09-12", frequency: "semanal" },
+      ACTOR,
+    );
+
+    expect(created).toMatchObject({ frequency: "semanal", start_date: "2026-09-05" });
+  });
+
+  it("F4: la MISMA cadencia sigue bloqueando, con el rango en el mensaje", async () => {
+    seedPeriods([
+      periodRow("periodo-1", "2026-09-01", "2026-09-07", "borrador", payrollPagedStub.SEDE_ID, "semanal"),
+    ]);
+
+    const failure: unknown = await openPayrollPeriod(
+      { start_date: "2026-09-05", end_date: "2026-09-12", frequency: "semanal" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
+    expect((failure as PayrollError).message).toContain("2026-09-01 a 2026-09-07");
+    expect(periodInserts()).toHaveLength(0);
+  });
+
+  it("F4: dos períodos SIN cadencia siguen siendo mutuamente excluyentes (protección heredada)", async () => {
+    // La base compara `coalesce(frequency, '')`: dos NULL caen en el MISMO cubo
+    // y siguen bloqueándose. Sin esta regla, los períodos heredados dejarían de
+    // protegerse EN SILENCIO.
+    seedPeriods([periodRow("periodo-1", "2026-09-01", "2026-09-07")]);
+
+    const inherited: unknown = await openPayrollPeriod(
+      { start_date: "2026-09-05", end_date: "2026-09-12" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+    expect(inherited).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
+
+    const explicitNull: unknown = await openPayrollPeriod(
+      { start_date: "2026-09-05", end_date: "2026-09-12", frequency: null },
+      ACTOR,
+    ).catch((error: unknown) => error);
+    expect(explicitNull).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
+
+    expect(periodInserts()).toHaveLength(0);
   });
 
   it("una carrera perdida (23P01 de la restricción) es el MISMO error de negocio", async () => {

@@ -16,6 +16,20 @@ export { moneyEquals, roundMoney };
 export const payrollStatusSchema = z.enum(["borrador", "cerrado"]);
 export type PayrollStatus = z.infer<typeof payrollStatusSchema>;
 
+/**
+ * F3/F4: cadencia de pago. Es la MISMA lista cerrada que declara el CHECK de
+ * `employees.pay_frequency` y `payroll_periods.frequency` (migración 063), la
+ * que pregunta la ficha del empleado (unidad de EMPLEADOS) y la que elige el
+ * diálogo de apertura del período (F4). `null` no es un valor más: es la
+ * AUSENCIA de cadencia, y conserva el comportamiento de hoy.
+ *
+ * Vive ARRIBA, antes de `openPeriodSchema`, porque el período la valida con el
+ * MISMO catálogo (una sola definición: si el enum se moviera en un lado y no en
+ * el otro, la nómina aceptaría una cadencia que no sabe liquidar).
+ */
+export const payFrequencySchema = z.enum(["semanal", "quincenal", "mensual"]);
+export type PayFrequency = z.infer<typeof payFrequencySchema>;
+
 /** PAY-06: estados del vale (descontada y rechazada son terminales). */
 export const voucherStatusSchema = z.enum(["pendiente", "aprobada", "rechazada", "descontada"]);
 export type VoucherStatus = z.infer<typeof voucherStatusSchema>;
@@ -31,6 +45,11 @@ export const openPeriodSchema = z
   .object({
     start_date: dateSchema,
     end_date: dateSchema,
+    // F4: cadencia del período. ABIERTA a `null`/ausente —la cadencia es
+    // OPCIONAL y su ausencia conserva el período de hoy— y CERRADA a los tres
+    // valores que la nómina sabe liquidar, igual que la ficha del empleado. Un
+    // cuarto valor no es una cadencia: es un envío inválido (VALIDATION).
+    frequency: payFrequencySchema.nullish(),
   })
   .superRefine((value, context) => {
     if (value.end_date < value.start_date) {
@@ -679,18 +698,50 @@ export function prorateFixedSalary(args: {
 
 // ------------------------------------------------ F3: cadencia y regla mixta ---
 
-/**
- * F3: cadencia de pago. Es la MISMA lista cerrada que declara el CHECK de
- * `employees.pay_frequency` y `payroll_periods.frequency` (migración 063) y la
- * que pregunta la ficha del empleado (unidad de EMPLEADOS). `null` no es un
- * valor más: es la AUSENCIA de cadencia, y conserva el comportamiento de hoy.
- */
-export const payFrequencySchema = z.enum(["semanal", "quincenal", "mensual"]);
-export type PayFrequency = z.infer<typeof payFrequencySchema>;
-
 /** F3: cadencia válida, o null cuando no viene o no es una de las tres. */
 export function normalizePayFrequency(value: string | null | undefined): PayFrequency | null {
   return value === "semanal" || value === "quincenal" || value === "mensual" ? value : null;
+}
+
+/**
+ * F4: el "cubo de cadencia" con el que la BASE compara dos períodos en
+ * `ex_payroll_periods_no_overlap` (063): `coalesce(frequency, '')`.
+ *
+ * En una restricción de exclusión gist un NULL NO es igual a otro NULL, así que
+ * la base convierte la ausencia de cadencia en la cadena vacía para que dos
+ * períodos SIN cadencia sigan siendo mutuamente excluyentes. El servicio TIENE
+ * que comparar con el MISMO cubo: comparar la columna pelada soltaría en
+ * silencio los períodos heredados (todos NULL) y debilitaría la protección de
+ * siempre. Puro para probarlo sin base de datos.
+ */
+export function periodCadenceBucket(frequency: string | null | undefined): string {
+  return frequency ?? "";
+}
+
+/**
+ * F4: true cuando el empleado NO pertenece a este período por cadencia: las
+ * DOS están definidas y DIFIEREN. La regla del dueño (2026-10-01) lo excluye
+ * ENTERO del período —sin fijo y sin comisiones, con sus facturas fuera de la
+ * ventana— porque lo paga su propio ciclo.
+ *
+ * Si CUALQUIERA de las dos cadencias faltan (NULL = "sin cadencia definida") el
+ * predicado es false y rige el comportamiento de hoy: prorrateo por días más
+ * comisiones. Es deliberado que la comparación use las cadencias NORMALIZADAS
+ * (un valor fuera del catálogo es ausencia, no una cadencia distinta).
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function periodExcludesEmployeeByCadence(args: {
+  employeeFrequency: string | null | undefined;
+  periodFrequency: string | null | undefined;
+}): boolean {
+  const employeeFrequency = normalizePayFrequency(args.employeeFrequency);
+  const periodFrequency = normalizePayFrequency(args.periodFrequency);
+  return (
+    employeeFrequency !== null &&
+    periodFrequency !== null &&
+    employeeFrequency !== periodFrequency
+  );
 }
 
 /**
@@ -725,7 +776,10 @@ export function fixedFractionForFrequency(frequency: string | null | undefined):
  *  - "cadence": el período y el empleado comparten cadencia; el fijo es
  *    `mensual × fracción`.
  *  - "other-cadence": el empleado tiene otra cadencia; en este período cobra 0
- *    fijo porque lo paga su propio ciclo.
+ *    fijo porque lo paga su propio ciclo. La unidad de PERÍODOS (F4) ya deja
+ *    FUERA a ese empleado antes de calcular (`periodExcludesEmployeeByCadence`),
+ *    así que este valor describe la clasificación pura; ninguna línea de nómina
+ *    se genera con `basis = "other-cadence"`.
  *  - "prorated": falta alguna de las dos cadencias y rige el comportamiento de
  *    hoy (prorrateo por días calendario).
  */
@@ -933,24 +987,39 @@ export function rangesOverlap(left: DateRange, right: DateRange): boolean {
 }
 
 /**
- * PR1/PAY-01 (regla del dueño, 2026-10-01): primera fecha de inicio ADMISIBLE
- * para un período NUEVO de la sede. Es el día SIGUIENTE al fin más lejano ya
- * registrado, sin importar el orden ni el estado de los períodos. Sin períodos
- * no hay piso (`null`): el primero es libre.
+ * PR1/PAY-01/F4 (regla del dueño, 2026-10-01): primera fecha de inicio
+ * ADMISIBLE para un período NUEVO de la sede **en la MISMA cadencia** que el
+ * período que se va a abrir. Es el día SIGUIENTE al fin más lejano ya
+ * registrado EN ESE CICLO, sin importar el orden ni el estado. Sin períodos de
+ * ese ciclo no hay piso (`null`): el primero es libre.
+ *
+ * El piso es POR CICLO porque la guarda de solape también lo es (063): un
+ * período semanal y uno mensual pueden compartir días A PROPÓSITO, así que un
+ * período de otra cadencia NO puede imponer piso. Cuando se omite la cadencia
+ * el cubo es el vacío (`coalesce(frequency, '')`, el de los períodos
+ * heredados): los períodos sin cadencia se siguen acotando entre sí, que es la
+ * protección de siempre.
  *
  * Por qué "día siguiente" y no "ese mismo fin": el fin del período anterior ya
  * está liquidado, así que empezar ahí compartiría un día (el solape que la
- * migración 035 y el servicio rechazan). Los rangos ADYACENTES no se solapan
+ * migración 063 y el servicio rechazan). Los rangos ADYACENTES no se solapan
  * (fin 2026-12-31 → inicio 2027-01-01).
  *
  * TOTAL: no lanza con una lista vacía, tiene en cuenta el fin MÁS LEJANO
  * aunque la entrada llegue desordenada, y no muta la lista. Puro para probarlo
  * sin base de datos. Borde de año incluido: 2026-12-31 → 2027-01-01.
  */
-export function nextPeriodStartDate(periods: readonly DateRange[]): string | null {
+export function nextPeriodStartDate(
+  periods: readonly (DateRange & { frequency?: string | null })[],
+  frequency: string | null | undefined = null,
+): string | null {
   if (periods.length === 0) return null;
+  const bucket = periodCadenceBucket(frequency);
   let latestEnd: number | null = null;
   for (const period of periods) {
+    // F4: un período de OTRA cadencia comparte días sin conflicto, así que no
+    // impone piso. Comparar sin el cubo bloquearía el solape que el dueño quiere.
+    if (periodCadenceBucket(period.frequency ?? null) !== bucket) continue;
     const end = utcDayOf(period.end_date);
     if (end === null) continue;
     if (latestEnd === null || end > latestEnd) latestEnd = end;

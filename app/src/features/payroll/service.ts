@@ -22,6 +22,8 @@ import {
   normalizeAllowedDays,
   normalizePerDayLimits,
   openPeriodSchema,
+  periodCadenceBucket,
+  periodExcludesEmployeeByCadence,
   overlapBlocksDeletion,
   payPayrollItemSchema,
   payrollExtraSchema,
@@ -631,8 +633,17 @@ async function attachVoucherUserNames(
  * índice único parcial de 007 sólo miraba la tupla EXACTA de los borradores:
  * dos rangos adyacentes o cruzados pasaban sin ruido.
  *
+ * F4: la guarda está acotada por CADENCIA, igual que la restricción de la base
+ * (063). Un día se nomina una sola vez DENTRO DEL MISMO CICLO: dos períodos de
+ * la misma sede solo pueden compartir días si su cadencia DIFIERE (el semanal y
+ * el mensual se superponen a propósito). La comparación usa el mismo cubo que
+ * el índice, `coalesce(frequency, '')`: un NULL pelado sería distinto de otro
+ * NULL y los períodos SIN cadencia dejarían de protegerse EN SILENCIO (dos
+ * períodos heredados sí comparten días). Los dos NULL caen en el mismo cubo
+ * vacío, así que la protección de siempre sigue viva.
+ *
  * Barreras ante carreras: la lectura y el INSERT no son atómicos, así que la
- * restricción de exclusión de la base (migración 035) es la barrera final
+ * restricción de exclusión de la base (migración 063) es la barrera final
  * (23P01 → mismo error de negocio, igual que 23505 para el borrador repetido).
  */
 export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Promise<PayrollPeriodRow> {
@@ -652,6 +663,7 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
     const candidates = await readAllPayroll<{
       start_date: string;
       end_date: string;
+      frequency: string | null;
       status: string;
     }>({
       log: "openPayrollPeriod",
@@ -661,15 +673,27 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
       fetchPage: (from, to) =>
         db
           .from("payroll_periods")
-          .select("id, start_date, end_date, status")
+          // `frequency` viaja en la lectura porque la guarda la necesita: sin
+          // ella no se puede saber si el período que estorba es del MISMO ciclo.
+          .select("id, start_date, end_date, frequency, status")
           .eq("sede_id", actor.sedeId)
           .lte("start_date", input.end_date)
           .gte("end_date", input.start_date)
           .order("id")
           .range(from, to),
     });
-    const requested = { start_date: input.start_date, end_date: input.end_date };
-    const clash = candidates.find((row) => rangesOverlap(row, requested));
+    const requested = {
+      start_date: input.start_date,
+      end_date: input.end_date,
+      frequency: input.frequency ?? null,
+    };
+    // El MISMO cubo que `coalesce(frequency, '')` de la restricción (063):
+    // colisiona el período que comparte días Y cae en el mismo cubo de cadencia.
+    const requestedBucket = periodCadenceBucket(requested.frequency);
+    const clash = candidates.find(
+      (row) =>
+        periodCadenceBucket(row.frequency) === requestedBucket && rangesOverlap(row, requested),
+    );
     if (clash) {
       throw new PayrollError(
         "PERIOD_OVERLAP",
@@ -684,6 +708,9 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
         sede_id: actor.sedeId,
         start_date: input.start_date,
         end_date: input.end_date,
+        // F4: la cadencia se PERSISTE con el período. `null` es un valor legal
+        // (sin cadencia definida) y es lo que deja el período de hoy.
+        frequency: input.frequency ?? null,
         status: "borrador",
         created_by: actor.userId,
       })
@@ -1364,6 +1391,35 @@ async function computePayrollLines(args: {
   const { db, sedeId, period, roster, input, voucherScope, log } = args;
   const periodId = period.id;
 
+    // F4: EXCLUSIÓN POR CADENCIA (regla del dueño, 2026-10-01). Cuando las DOS
+    // cadencias están definidas y DIFIEREN, el empleado queda FUERA de este
+    // período: no se le arma ítem, no se le lee regla y sus facturas Pagada del
+    // rango no entran en `detail_json` ni en las comisiones. Se paga en su
+    // propio ciclo. Por eso la exclusión vive acá, al armar el conjunto de
+    // empleados: nada aguas abajo (ítems, totales, resúmenes, corrección) ve al
+    // excluido. Si CUALQUIERA de las dos cadencias falta (NULL = sin cadencia
+    // definida), el empleado entra y rige el comportamiento de hoy (prorrateo
+    // por días más comisiones).
+    //
+    // EXCLUIR LAS COMISIONES ES PARTE DE LA EXCLUSIÓN, no un extra: con un
+    // período semanal y uno mensual que se superponen A PROPÓSITO, una factura
+    // del rango cae en los dos. Si el empleado mensual comisionara en el período
+    // semanal (o al revés), la MISMA factura se liquidaría dos veces. Su ciclo
+    // es el único que la cuenta.
+    const payableRoster = roster.filter(
+      (employee) =>
+        !periodExcludesEmployeeByCadence({
+          employeeFrequency: employee.pay_frequency ?? null,
+          periodFrequency: period.frequency,
+        }),
+    );
+    // La identidad de quienes SÍ cobran este período. Además de acotar los
+    // ítems, acota las dos escrituras que consumen compromisos del empleado
+    // (vales marcados `descontada` y deudas marcadas aplicadas): marcar el vale
+    // o la deuda de un excluido SIN descontarlo del neto sería consumirlo sin
+    // haber pagado, y su propio ciclo ya no podría descontarlo.
+    const payableEmployeeIds = new Set(payableRoster.map((employee) => employee.id));
+
     // Facturas de la sede en el rango de las que sale comisión. REGLA DE
     // NEGOCIO (decisión del dueño, 2026-10-01): la comisión se gana cuando la
     // factura queda `Pagada`; una factura solo `Emitida` —o anulada después— no
@@ -1455,7 +1511,7 @@ async function computePayrollLines(args: {
     // inmediato: sede + empleado + activa). Una sola lectura exhaustiva y se
     // agrupan en memoria para no caer en N+1 sobre la planta del cálculo.
     const rulesByEmployee = new Map<string, Map<string, RuleRate>>();
-    if (roster.length > 0) {
+    if (payableRoster.length > 0) {
       // U5: sin `.limit(5000)`. Una regla que no se lee es una comisión que se
       // liquida de menos (el `porcentaje plano` del empleado o cero, según el
       // ítem): la diferencia sale del bolsillo del empleado y no aparece en
@@ -1479,7 +1535,7 @@ async function computePayrollLines(args: {
             .eq("is_active", true)
             .in(
               "employee_id",
-              roster.map((employee) => employee.id),
+              payableRoster.map((employee) => employee.id),
             )
             .order("id")
             .range(from, to),
@@ -1528,6 +1584,10 @@ async function computePayrollLines(args: {
     const vouchersToDiscount: string[] = [];
     for (const row of voucherRows) {
       if (!discountsVoucher(row.status, voucherScope)) continue;
+      // F4: el vale de un empleado EXCLUIDO por cadencia no se marca: no hay
+      // ítem que lo descuente, así que marcarlo lo consumiría sin descontar
+      // nada. Queda pendiente para el ciclo propio del empleado.
+      if (!payableEmployeeIds.has(row.employee_id)) continue;
       if (canDiscountVoucher(row.status)) vouchersToDiscount.push(row.id);
       const entry = valesByEmployee.get(row.employee_id) ?? { total: 0, ids: [] };
       entry.total = roundMoney(entry.total + Number(row.amount));
@@ -1621,8 +1681,11 @@ async function computePayrollLines(args: {
       );
     }
     // Los ids que la transacción marca aplicados son SOLO los que estaban
-    // pendientes: los ya aplicados a este período no se vuelven a marcar.
-    const carriesToApply = pendingCarryRows.filter(isEarlierCarry).map((row) => row.id);
+    // pendientes y pertenecen a un empleado que SÍ cobra este período (F4: la
+    // deuda de un excluido no se consume sin descontarse).
+    const carriesToApply = pendingCarryRows
+      .filter((row) => isEarlierCarry(row) && payableEmployeeIds.has(row.employee_id))
+      .map((row) => row.id);
 
     const adjustments = new Map(
       input.adjustments.map((row) => [row.employee_id, row]),
@@ -1659,13 +1722,14 @@ async function computePayrollLines(args: {
       }
     }
 
-    const payload = roster.map((employee) => {
-      // F3: la cadencia del PERÍODO decide el fijo (decisión del dueño,
+    const payload = payableRoster.map((employee) => {
+      // F3/F4: la cadencia del PERÍODO decide el fijo (decisión del dueño,
       // 2026-10-01). Si falta la cadencia del período o la del empleado, sigue
       // rigiendo el prorrateo por días de hoy; si coinciden, el fijo es
-      // `mensual × fracción` (1/4, 1/2, 1) sobre el mes comercial de 30 días; si
-      // el empleado tiene OTRA cadencia, acá cobra 0 fijo porque lo paga su
-      // propio ciclo. Todo eso vive en la función pura
+      // `mensual × fracción` (1/4, 1/2, 1) sobre el mes comercial de 30 días.
+      // El empleado que tiene OTRA cadencia ya NO llega acá: `payableRoster` lo
+      // excluyó arriba (`periodExcludesEmployeeByCadence`), porque su ciclo es el
+      // que lo paga. Todo esto vive en la función pura
       // `resolveFixedSalaryForPeriod`, que también dice en `basis` cuál de las
       // tres reglas se aplicó. Un `porcentaje` no cobra fijo: no hay fracción.
       const fixedResolution =

@@ -131,10 +131,14 @@ se cuenta como 4 semanas):
 | `mensual`            | `1`      | 1.500.000                                |
 
 - **Coinciden**: el fijo es `mensual × fracción`, sin mirar los días del rango.
-- **Difieren**: el empleado cobra **0 fijo** en ese período; lo paga su propio
-  ciclo y pagarlo acá también lo pagaría dos veces. El caso está en
-  `resolveFixedSalaryForPeriod`, que devuelve en `basis` cuál de las tres reglas
-  aplicó (`cadence`, `other-cadence` o `prorated`), explícito y no inferido.
+- **Difieren**: el empleado queda **FUERA del período entero** (F4): no se le
+  arma ítem, no se le liquidan comisiones y sus facturas del rango no entran a
+  ninguna parte. Lo paga su propio ciclo y pagarlo en los dos lo pagaría dos
+  veces; con un semanal y un mensual que se superponen a propósito, la misma
+  factura podría liquidarse dos veces si solo se excluyera el fijo. El caso está
+  en `resolveFixedSalaryForPeriod` como clasificación pura (`basis =
+  "other-cadence"`), pero la exclusión real ocurre ANTES de calcular, en
+  `computePayrollLines` (`periodExcludesEmployeeByCadence`).
 - **Consecuencia aceptada por el dueño (2026-10-01)**: `1/4` por semana paga
   ≈ 13 sueldos al año (52,14 semanas), no 12. El mes comercial de 30 días es lo
   que produce esa cuenta; no se reabre la decisión.
@@ -172,6 +176,52 @@ Las funciones puras viven en `schemas.ts` (`fixedFractionForFrequency`,
 `resolveFixedSalaryForPeriod`, `resolveMixedBlock`, `mixedAbsorbedDetailLine`) y
 el cálculo de `computePayrollLines` (`service.ts`) las usa tal cual, tanto en el
 borrador como en la corrección de un período cerrado.
+
+## Cadencia del período, solape y exclusión (F4)
+
+El diálogo de apertura de `/payroll` incluye la **cadencia del período**
+(`Semanal (mensual / 4)`, `Quincenal (mensual / 2)`, `Mensual (mes completo)` y
+`Sin cadencia`). `Sin cadencia` persiste `NULL` y conserva el período de hoy. El
+catálogo es el mismo `payFrequencySchema` (`semanal | quincenal | mensual`, más
+`null` como ausencia) que valida la ficha del empleado; un cuarto valor se
+rechaza con `VALIDATION`.
+
+### La guarda de solape, acotada por cadencia
+
+La restricción `ex_payroll_periods_no_overlap` (063) es
+`EXCLUDE USING gist (sede_id =, coalesce(frequency, '') =, daterange(...) &&)`.
+`openPayrollPeriod` aplica la MISMA regla antes del INSERT: un período estorba
+sólo si comparte días **y** cae en el mismo **cubo de cadencia**
+(`periodCadenceBucket`, `coalesce(frequency, '')`). El NULL es el cubo vacío: dos
+períodos sin cadencia siguen siendo mutuamente excluyentes (protección heredada)
+y un período con cadencia convive con un heredado sin ella. La base sigue siendo
+la barrera final (23P01 → `PERIOD_OVERLAP`).
+
+### Exclusión del empleado de otro ciclo
+
+Cuando las DOS cadencias están definidas y **difieren**, el empleado se excluye
+en `computePayrollLines` al armar el conjunto de empleados: no hay ítem, no hay
+comisiones y su factura del rango no entra en ningún `detail_json` ni en ningún
+total. La misma lista acota las escrituras que consumen compromisos del empleado
+(vales marcados `descontada` y deudas marcadas aplicadas): no se consume el vale
+o la deuda de un excluido si no hay ítem que los descuente; quedan para su
+propio ciclo. Si CUALQUIERA de las dos cadencias falta, rige el comportamiento
+de hoy (prorrateo por días más comisiones).
+
+En la pantalla, el excluido sigue apareciendo en la tabla del borrador con los
+montos en blanco (`—`), que es como ya se renderiza un empleado sin ítem; la
+tabla del período (cerrado o ya calculado) sólo lista ítems, así que no lo
+inventa con ceros.
+
+### El piso de fecha, por cadencia
+
+`nextPeriodStartDate` acepta la cadencia y sólo mira los períodos del MISMO
+cubo: su piso es el día siguiente al fin más lejano de ese ciclo. Un período de
+otra cadencia puede superponerse A PROPÓSITO y no impone piso. El diálogo lo
+recalcula con la cadencia elegida (`openFrequency`), así que el aviso en vivo y
+la validación de envío coinciden con la guarda del servicio y de la base. Sin
+cadencia, el cubo es el vacío (`coalesce(frequency, '')`) y sólo acotan los
+períodos sin cadencia, que es la protección heredada.
 
 ## Límites de lectura
 

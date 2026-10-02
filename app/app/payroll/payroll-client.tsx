@@ -33,6 +33,7 @@ import {
   payrollExtraKindSchema,
   payrollMonthLabel,
   payrollPeriodCountLabel,
+  periodCadenceBucket,
   roundMoney,
   splitCommissionByOrigin,
   sumMoney,
@@ -42,6 +43,7 @@ import {
   type PayrollItemTotals,
   type PayrollMonthEmployeeRow,
   type PayrollMonthGroup,
+  type PayFrequency,
 } from "@/src/features/payroll/schemas";
 import type { EmployeeRow, PaymentMethodRow } from "@/src/features/admin/service";
 import {
@@ -87,6 +89,21 @@ const PAY_TYPE_LABELS: Record<string, string> = {
   porcentaje: "Porcentaje",
   mixto: "Mixto",
 };
+
+/**
+ * F4: opciones de la cadencia del PERÍODO que se abre. El valor vacío es "Sin
+ * cadencia": deja la columna en NULL y CONSERVA el comportamiento de hoy (el
+ * fijo se prorratea por los días del período y la guarda de solape no cambia).
+ * Las otras tres declaran el ciclo del rango y dicen en DINERO qué parte del
+ * salario fijo mensual paga: semanal un cuarto, quincenal la mitad, mensual el
+ * mes completo. La cadencia acota qué empleados entran al período.
+ */
+const OPEN_PAY_FREQUENCY_OPTIONS = [
+  { value: "", label: "Sin cadencia" },
+  { value: "semanal", label: "Semanal (mensual / 4)" },
+  { value: "quincenal", label: "Quincenal (mensual / 2)" },
+  { value: "mensual", label: "Mensual (mes completo)" },
+] as const;
 
 /**
  * Etiqueta legible del tipo de línea del desglose de comisiones. El
@@ -210,13 +227,28 @@ function formatFullDate(value: string): string {
   return `${date.day} ${MONTHS_SHORT[date.month - 1]} ${date.year}`;
 }
 
-/** Primer periodo cuyo rango se solapa con [start, end] (fechas ISO comparables como texto). */
+/**
+ * F4: primer período que COLISIONA con [start, end]: comparte días y cae en el
+ * MISMO cubo de cadencia (`coalesce(frequency, '')`, el de la restricción de
+ * 063). Es la MISMA regla que aplican el servicio y la base: un semanal y un
+ * mensual pueden superponerse; dos del mismo ciclo —o los dos sin cadencia— no.
+ * El servidor sigue siendo la autoridad; esto es el aviso en vivo del diálogo.
+ */
 function findOverlappingPeriod(
   rows: PayrollPeriodRow[],
   start: string,
   end: string,
+  frequency: string | null,
 ): PayrollPeriodRow | null {
-  return rows.find((row) => start <= row.end_date && end >= row.start_date) ?? null;
+  const bucket = periodCadenceBucket(frequency);
+  return (
+    rows.find(
+      (row) =>
+        periodCadenceBucket(row.frequency) === bucket &&
+        start <= row.end_date &&
+        end >= row.start_date,
+    ) ?? null
+  );
 }
 
 /** Días de un rango inclusivo (mismo criterio que la prorata del servidor). */
@@ -840,6 +872,9 @@ export function PayrollClient(props: PayrollClientProps) {
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [openDialogOpen, setOpenDialogOpen] = useState(false);
+  // F4: cadencia elegida para el PERÍODO que se abre. El valor vacío es "Sin
+  // cadencia" y viaja como `null` (deja el período como hoy).
+  const [openFrequency, setOpenFrequency] = useState<"" | PayFrequency>("");
   const [openError, setOpenError] = useState<string | null>(null);
   // Pagos: porciones por ítem (método y monto como campos separados en tabla).
   const [portions, setPortions] = useState<Record<string, PortionDraft[]>>({});
@@ -1065,17 +1100,19 @@ export function PayrollClient(props: PayrollClientProps) {
     }
     // Mismo piso que el `min` del campo, pero dicho con la fecha válida: si el
     // usuario la escribe a mano, el aviso nombra el día a partir del cual sí.
-    const minimumStart = nextPeriodStartDate(periods);
+    // F4: el piso es de la MISMA cadencia — un período de otro ciclo puede
+    // compartir días y no impone piso.
+    const minimumStart = nextPeriodStartDate(periods, openFrequency);
     if (minimumStart !== null && startDate < minimumStart) {
       setOpenError(
-        `El período no puede empezar antes del ${formatFullDate(minimumStart)}: ese es el día siguiente al fin del último período registrado.`,
+        `El período no puede empezar antes del ${formatFullDate(minimumStart)}: ese es el día siguiente al fin del último período registrado de esta cadencia.`,
       );
       return;
     }
-    const collision = findOverlappingPeriod(periods, startDate, endDate);
+    const collision = findOverlappingPeriod(periods, startDate, endDate, openFrequency);
     if (collision) {
       setOpenError(
-        `El rango se solapa con ${formatPeriodLabel(collision)} (${collision.status}). Ajuste las fechas.`,
+        `El rango se solapa con ${formatPeriodLabel(collision)} (${collision.status}). Ajuste las fechas o la cadencia.`,
       );
       return;
     }
@@ -1084,6 +1121,7 @@ export function PayrollClient(props: PayrollClientProps) {
     const result = (await openPayrollPeriodAction({
       start_date: startDate,
       end_date: endDate,
+      frequency: openFrequency === "" ? null : openFrequency,
     })) as ActionResult<PayrollPeriodRow>;
     if (!result.success) {
       setBusy(false);
@@ -1093,6 +1131,7 @@ export function PayrollClient(props: PayrollClientProps) {
     const created = result.data;
     setStartDate("");
     setEndDate("");
+    setOpenFrequency("");
     setOpenDialogOpen(false);
     await refreshPeriods(created.id);
 
@@ -1128,6 +1167,7 @@ export function PayrollClient(props: PayrollClientProps) {
   function closeOpenDialog() {
     setStartDate("");
     setEndDate("");
+    setOpenFrequency("");
     setOpenError(null);
     setOpenDialogOpen(false);
   }
@@ -1444,13 +1484,17 @@ export function PayrollClient(props: PayrollClientProps) {
     : null;
 
   // Ayuda para elegir el rango del nuevo periodo, construida solo con `periods`.
-  // El piso es el día siguiente al último fin liquidado (función pura del
-  // esquema): `null` cuando aún no hay períodos, o sea el primero es libre.
-  const suggestedStart = nextPeriodStartDate(periods);
+  // El piso es el día siguiente al último fin liquidado DE LA MISMA CADENCIA
+  // (función pura del esquema): `null` cuando aún no hay períodos de ese ciclo,
+  // o sea el primero es libre. Cambia con la cadencia elegida; un período de
+  // otro ciclo se puede superponer y no impone piso.
+  const suggestedStart = nextPeriodStartDate(periods, openFrequency);
   const draftPeriods = periods.filter((row) => row.status === "borrador");
   const rangeInvalid = Boolean(startDate && endDate && endDate < startDate);
   const overlap =
-    startDate && endDate && !rangeInvalid ? findOverlappingPeriod(periods, startDate, endDate) : null;
+    startDate && endDate && !rangeInvalid
+      ? findOverlappingPeriod(periods, startDate, endDate, openFrequency)
+      : null;
 
   /**
    * Nombre legible del empleado: nombre + ID interno (el código de empleado
@@ -1621,6 +1665,7 @@ export function PayrollClient(props: PayrollClientProps) {
             type="button"
             onClick={() => {
               setOpenError(null);
+              setOpenFrequency("");
               // Prefija el piso (editable): el caso común —abrir el período
               // que sigue al último liquidado— queda a un clic.
               setStartDate(nextPeriodStartDate(periods) ?? "");
@@ -2114,7 +2159,7 @@ export function PayrollClient(props: PayrollClientProps) {
             <DialogHeader>
               <DialogTitle>Abrir período</DialogTitle>
               <DialogDescription>
-                Elija el rango de fechas. El período se abre en borrador.
+                Elija el rango de fechas y la cadencia. El período se abre en borrador.
               </DialogDescription>
             </DialogHeader>
             <form onSubmit={handleOpen} className="mt-4 flex flex-col gap-4">
@@ -2150,6 +2195,29 @@ export function PayrollClient(props: PayrollClientProps) {
                 </label>
               </div>
 
+              <label className={labelClass} htmlFor="payroll-open-frequency">
+                Cadencia del período
+                <select
+                  id="payroll-open-frequency"
+                  value={openFrequency}
+                  onChange={(event) => {
+                    setOpenFrequency(event.target.value as "" | PayFrequency);
+                    setOpenError(null);
+                  }}
+                  className={inputClass}
+                >
+                  {OPEN_PAY_FREQUENCY_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <span className="mt-1 block text-xs text-text-tertiary">
+                  Sin cadencia conserva el cálculo de hoy. Con cadencia, el período paga el fijo de
+                  ese ciclo y deja fuera a los empleados de otro ciclo.
+                </span>
+              </label>
+
               <div className="rounded-md border border-border-color bg-surface-hover p-3 text-sm text-text-secondary dark:border-border-color-2">
                 <p className="font-medium text-text-primary">Períodos existentes</p>
                 {periods.length === 0 ? (
@@ -2181,7 +2249,7 @@ export function PayrollClient(props: PayrollClientProps) {
                 {suggestedStart && (
                   <p className="mt-2">
                     Sugerencia: empiece el {formatFullDate(suggestedStart)}, día siguiente al último período
-                    registrado.
+                    registrado de esta cadencia.
                   </p>
                 )}
                 {draftPeriods.length > 0 && (
@@ -2189,7 +2257,7 @@ export function PayrollClient(props: PayrollClientProps) {
                     {draftPeriods.length === 1
                       ? "Hay un período en borrador"
                       : `Hay ${draftPeriods.length} períodos en borrador`}
-                    : no se pueden solapar rangos.
+                    : no se pueden solapar rangos del mismo ciclo.
                   </p>
                 )}
               </div>
