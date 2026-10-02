@@ -40,22 +40,57 @@ const dateSchema = z
   .trim()
   .regex(/^\d{4}-\d{2}-\d{2}$/, "Fecha inválida (use yyyy-mm-dd).");
 
-/** PAY-01: apertura de un periodo borrador por sede y rango. */
+/**
+ * PAY-01/F7: apertura de un período borrador por sede y CICLO.
+ *
+ * F7 (regla del dueño, 2026-10-01): el rango NO es libre. El período se cierra
+ * al ciclo de su cadencia ("último domingo a este sábado"; quincenal dos
+ * semanas, mensual cuatro), así que el formulario manda la CADENCIA y el
+ * CIERRE DEL CICLO (el sábado que lo cierra) y el servidor deriva
+ * `start_date`/`end_date`. Elegir un lunes es imposible por construcción, no
+ * "desaconsejado".
+ *
+ * `frequency` es OBLIGATORIA para un período NUEVO: "sin cadencia" ya no es una
+ * opción del diálogo. NULL sigue siendo legal SOLO como dato heredado —los
+ * períodos ya abiertos conservan su cálculo por la vía F3/F5— y no se puede
+ * pedir por acá.
+ *
+ * `start_date`/`end_date` siguen aceptándose por compatibilidad, pero son una
+ * SEGUNDA opinión: si vienen y no coinciden con el ciclo derivado, el envío se
+ * rechaza. La única fuente de verdad es `frequency` + `cycle_end_date`.
+ */
 export const openPeriodSchema = z
   .object({
-    start_date: dateSchema,
-    end_date: dateSchema,
-    // F4: cadencia del período. ABIERTA a `null`/ausente —la cadencia es
-    // OPCIONAL y su ausencia conserva el período de hoy— y CERRADA a los tres
-    // valores que la nómina sabe liquidar, igual que la ficha del empleado. Un
-    // cuarto valor no es una cadencia: es un envío inválido (VALIDATION).
-    frequency: payFrequencySchema.nullish(),
+    frequency: payFrequencySchema,
+    cycle_end_date: dateSchema,
+    start_date: dateSchema.optional(),
+    end_date: dateSchema.optional(),
   })
   .superRefine((value, context) => {
-    if (value.end_date < value.start_date) {
+    const cycle = payrollCycleRange({
+      frequency: value.frequency,
+      cycleEndDate: value.cycle_end_date,
+    });
+    if (cycle === null) {
       context.addIssue({
         code: "custom",
-        message: "La fecha final no puede ser anterior a la inicial.",
+        message: "El cierre del ciclo debe ser un sábado.",
+        path: ["cycle_end_date"],
+      });
+      return;
+    }
+    if (value.start_date !== undefined && value.start_date !== cycle.start_date) {
+      context.addIssue({
+        code: "custom",
+        message: "La fecha de inicio no coincide con el ciclo de la cadencia.",
+        path: ["start_date"],
+      });
+    }
+    if (value.end_date !== undefined && value.end_date !== cycle.end_date) {
+      context.addIssue({
+        code: "custom",
+        message: "La fecha final no coincide con el ciclo de la cadencia.",
+        path: ["end_date"],
       });
     }
   });
@@ -802,12 +837,189 @@ export function periodRangeDays(startDate: string, endDate: string): number | nu
   return (end - start) / DAY_MS + 1;
 }
 
+// -------------------------------------- F7: ciclo cerrado (domingo–sábado) ---
+
 /**
- * F5: factor con el que se escala la fracción de la cadencia cuando el período
- * cubre un ciclo PARCIAL (la primera liquidación suele ser un rango corto, desde
- * el día en que arrancó el negocio).
+ * F7: días de CALENDARIO del ciclo cerrado de cada cadencia: semanal = 1 semana
+ * = 7 días, quincenal = 2 semanas = 14, mensual = 4 semanas = 28. Es la unidad
+ * con la que la nómina se cierra al ciclo (domingo a sábado) y NO es
+ * `PAY_CYCLE_DAYS` (7/15/30), que es la base COMERCIAL de 30 días con la que se
+ * prorratea un rango que no llega a ser un ciclo.
+ */
+export const PAY_CYCLE_CALENDAR_DAYS: Record<PayFrequency, number> = {
+  semanal: 7,
+  quincenal: 14,
+  mensual: 28,
+};
+
+/** F7: días del ciclo cerrado de una cadencia, o `null` sin cadencia definida. */
+export function calendarCycleDaysForFrequency(frequency: string | null | undefined): number | null {
+  const normalized = normalizePayFrequency(frequency);
+  return normalized === null ? null : PAY_CYCLE_CALENDAR_DAYS[normalized];
+}
+
+/** Día de la semana UTC de un día (ms): 0 = domingo … 6 = sábado. */
+function utcWeekday(dayMs: number): number {
+  return new Date(dayMs).getUTCDay();
+}
+
+/** Fecha yyyy-mm-dd del día UTC (ms), con la misma aritmética UTC del módulo. */
+function isoDayOf(dayMs: number): string {
+  return new Date(dayMs).toISOString().slice(0, 10);
+}
+
+/** Sábado en o ANTES del día dado (ms): el cierre del ciclo que lo contiene. */
+function saturdayOnOrBefore(dayMs: number): number {
+  return dayMs - ((utcWeekday(dayMs) + 1) % 7) * DAY_MS;
+}
+
+/** Sábado en o DESPUÉS del día dado (ms): cierra el ciclo que lo contiene. */
+function saturdayOnOrAfter(dayMs: number): number {
+  return dayMs + ((6 - utcWeekday(dayMs) + 7) % 7) * DAY_MS;
+}
+
+/** F7: rango inclusivo de UN ciclo cerrado (domingo a sábado). */
+export interface PayrollCycleRange {
+  start_date: string;
+  end_date: string;
+}
+
+/**
+ * F7: deriva el rango de UN ciclo cerrado de la cadencia.
  *
- *  - Rango MÁS CORTO que el ciclo natural → `días del período / días del ciclo`
+ *  - Con `cycleEndDate` (el sábado que cierra el ciclo), valida que sea sábado
+ *    y devuelve `[end − (días−1), end]`.
+ *  - Con `referenceDate`, devuelve el ciclo que CONTIENE esa fecha (su cierre es
+ *    el sábado en o después de ella).
+ *  - Sin cadencia, con una fecha imposible o con un cierre que no es sábado,
+ *    devuelve `null`: el llamador decide, y el período NUEVO rechaza el envío.
+ *
+ * Puro para probarlo sin base de datos. Es la ÚNICA aritmética de ciclos: el
+ * diálogo, el esquema y el servicio la comparten.
+ */
+export function payrollCycleRange(args: {
+  frequency: string | null | undefined;
+  cycleEndDate?: string | null;
+  referenceDate?: string | null;
+}): PayrollCycleRange | null {
+  const cycleDays = calendarCycleDaysForFrequency(args.frequency);
+  if (cycleDays === null) return null;
+  const explicit = args.cycleEndDate ?? null;
+  const reference = args.referenceDate ?? null;
+  let end: number | null = null;
+  if (explicit !== null) {
+    const day = utcDayOf(explicit);
+    if (day === null || utcWeekday(day) !== 6) return null;
+    end = day;
+  } else if (reference !== null) {
+    const day = utcDayOf(reference);
+    if (day === null) return null;
+    end = saturdayOnOrAfter(day);
+  }
+  if (end === null) return null;
+  const start = end - (cycleDays - 1) * DAY_MS;
+  return { start_date: isoDayOf(start), end_date: isoDayOf(end) };
+}
+
+/**
+ * F7: sábado que cierra el ÚLTIMO ciclo COMPLETADO a la fecha de referencia. Un
+ * ciclo se completa cuando ya pasó su sábado, así que el cierre es el sábado
+ * ANTERIOR a la referencia: el domingo se liquida la semana que terminó el día
+ * anterior (el caso real del dueño).
+ */
+export function lastCompletedCycleEndDate(referenceDate: string): string | null {
+  const day = utcDayOf(referenceDate);
+  if (day === null) return null;
+  return isoDayOf(saturdayOnOrBefore(day - DAY_MS));
+}
+
+/** F7: opción de ciclo para el diálogo: su rango y su etiqueta legible. */
+export interface PayrollCycleOption extends PayrollCycleRange {
+  label: string;
+}
+
+const MONTHS_SHORT_ES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+
+/** Etiqueta de un rango de ciclo ("30 ago – 5 sep 2026"; "1 – 7 sep 2026"). */
+function cycleRangeLabel(startMs: number, endMs: number): string {
+  const start = new Date(startMs);
+  const end = new Date(endMs);
+  const sameMonth =
+    start.getUTCMonth() === end.getUTCMonth() && start.getUTCFullYear() === end.getUTCFullYear();
+  const startText = sameMonth
+    ? `${start.getUTCDate()}`
+    : `${start.getUTCDate()} ${MONTHS_SHORT_ES[start.getUTCMonth()]}`;
+  return `${startText} – ${end.getUTCDate()} ${MONTHS_SHORT_ES[end.getUTCMonth()]} ${end.getUTCFullYear()}`;
+}
+
+/**
+ * F7: los últimos `count` ciclos COMPLETADOS de la cadencia, el más reciente
+ * primero. Es la lista que alimenta el selector del diálogo: cada opción lleva
+ * su etiqueta con el rango YA calculado, así el dueño VE qué ciclo elige y las
+ * fechas no se escriben a mano. El primero es el que se ofrece por defecto (la
+ * liquidación del domingo cubre la semana que cerró el sábado anterior).
+ *
+ * Sin cadencia no hay ciclos (`[]`), igual que `payrollCycleRange` devuelve
+ * `null`: la ausencia de cadencia no inventa un ciclo.
+ */
+export function lastCompletedPayrollCycles(args: {
+  frequency: string | null | undefined;
+  referenceDate: string;
+  count?: number;
+}): PayrollCycleOption[] {
+  const cycleDays = calendarCycleDaysForFrequency(args.frequency);
+  if (cycleDays === null) return [];
+  const lastEnd = utcDayOf(lastCompletedCycleEndDate(args.referenceDate) ?? "");
+  if (lastEnd === null) return [];
+  const count = Math.max(0, Math.trunc(args.count ?? 8));
+  const options: PayrollCycleOption[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const end = lastEnd - index * cycleDays * DAY_MS;
+    const start = end - (cycleDays - 1) * DAY_MS;
+    options.push({
+      start_date: isoDayOf(start),
+      end_date: isoDayOf(end),
+      label: cycleRangeLabel(start, end),
+    });
+  }
+  return options;
+}
+
+/**
+ * F7: true cuando `[startDate, endDate]` es EXACTAMENTE un ciclo cerrado de la
+ * cadencia. La regla, literal: el rango empieza DOMINGO, termina SÁBADO y dura
+ * 7, 14 o 28 días contando los DOS extremos. Un lunes, un rango de 8/13/29 días
+ * o uno corrido un día NO son un ciclo; sin cadencia tampoco hay ciclo.
+ *
+ * Puro para probarlo sin base de datos. Es la misma verdad que `payrollCycleRange`
+ * construye, comprobada desde el rango en vez de desde el cierre.
+ */
+export function isPayrollCycleRange(args: {
+  frequency: string | null | undefined;
+  startDate: string;
+  endDate: string;
+}): boolean {
+  const cycleDays = calendarCycleDaysForFrequency(args.frequency);
+  if (cycleDays === null) return false;
+  const start = utcDayOf(args.startDate);
+  const end = utcDayOf(args.endDate);
+  if (start === null || end === null || end < start) return false;
+  if (utcWeekday(start) !== 0) return false;
+  if (utcWeekday(end) !== 6) return false;
+  return (end - start) / DAY_MS + 1 === cycleDays;
+}
+
+/**
+ * F5/F7: factor con el que se escala la fracción de la cadencia cuando el
+ * período cubre un ciclo PARCIAL (la primera liquidación suele ser un rango
+ * corto, desde el día en que arrancó el negocio).
+ *
+ *  - Rango que ES un ciclo cerrado de la cadencia (F7: domingo a sábado, 7/14/28
+ *    días) → `1`: el ciclo paga la fracción entera aunque la base comercial de
+ *    30 días sea más larga. El mensual de 4 semanas son 28 días, no 30: sin
+ *    esto un cierre mensual pagaría 28/30 del sueldo y los 13 cierres del año
+ *    no serían 13 sueldos (la consecuencia aceptada por el dueño).
+ *  - Rango MÁS CORTO que el ciclo comercial → `días del período / días del ciclo`
  *    (semanal 4 días → `4/7`).
  *  - Rango IGUAL o MÁS LARGO → `1`: se paga el ciclo completo y NUNCA más de
  *    uno. Un período de un mes natural (28…31 días) no puede pagar 31/30 de una
@@ -826,6 +1038,16 @@ export function cycleProrationFactor(args: {
   const cycleDays = cycleDaysForFrequency(args.frequency);
   const rangeDays = periodRangeDays(args.startDate, args.endDate);
   if (cycleDays === null || rangeDays === null) return 1;
+  // F7: un ciclo cerrado paga la fracción entera (el mensual son 28 días, no 30).
+  if (
+    isPayrollCycleRange({
+      frequency: args.frequency,
+      startDate: args.startDate,
+      endDate: args.endDate,
+    })
+  ) {
+    return 1;
+  }
   // TOPE del ciclo: un rango más largo que el ciclo no paga más de la fracción.
   if (rangeDays >= cycleDays) return 1;
   return rangeDays / cycleDays;

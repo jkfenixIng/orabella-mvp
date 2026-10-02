@@ -261,11 +261,13 @@ borrador como en la corrección de un período cerrado.
 ## Cadencia del período, solape y exclusión (F4)
 
 El diálogo de apertura de `/payroll` incluye la **cadencia del período**
-(`Semanal (mensual / 4)`, `Quincenal (mensual / 2)`, `Mensual (mes completo)` y
-`Sin cadencia`). `Sin cadencia` persiste `NULL` y conserva el período de hoy. El
-catálogo es el mismo `payFrequencySchema` (`semanal | quincenal | mensual`, más
-`null` como ausencia) que valida la ficha del empleado; un cuarto valor se
-rechaza con `VALIDATION`.
+(`Semanal (mensual / 4)`, `Quincenal (mensual / 2)`, `Mensual (mes completo)`).
+Desde F7 la cadencia es OBLIGATORIA en un período nuevo: no hay opción "Sin
+cadencia" y el rango sale del ciclo elegido (ver "Ciclo cerrado del período
+(F7)"). El catálogo es el mismo `payFrequencySchema` (`semanal | quincenal |
+mensual`) que valida la ficha del empleado; un cuarto valor se rechaza con
+`VALIDATION`. `NULL` sigue existiendo SOLO como dato heredado y no se puede
+pedir por la apertura.
 
 ### La guarda de solape, acotada por cadencia
 
@@ -303,6 +305,80 @@ recalcula con la cadencia elegida (`openFrequency`), así que el aviso en vivo y
 la validación de envío coinciden con la guarda del servicio y de la base. Sin
 cadencia, el cubo es el vacío (`coalesce(frequency, '')`) y sólo acotan los
 períodos sin cadencia, que es la protección heredada.
+
+## Ciclo cerrado del período (F7)
+
+Regla del dueño (2026-10-01): los períodos NO son fechas libres. La nómina se
+cierra siempre al ciclo de su cadencia, de **domingo a sábado**, y el rango se
+**deriva** del ciclo. Elegir un lunes (o cualquier rango que no sea un ciclo) es
+imposible por construcción, no una recomendación.
+
+| Cadencia    | Ciclo     | Días | Rango de ejemplo        |
+| ----------- | --------- | ---- | ----------------------- |
+| `semanal`   | 1 semana  | 7    | 2026-08-30 → 2026-09-05 |
+| `quincenal` | 2 semanas | 14   | 2026-08-30 → 2026-09-12 |
+| `mensual`   | 4 semanas | 28   | 2026-08-30 → 2026-09-26 |
+
+Las tres empiezan el domingo y cierran el sábado. Consecuencia ACEPTADA por el
+dueño: el mensual de 4 semanas da 13 liquidaciones al año en vez de 12 (igual
+que el semanal, que ya pagaba ≈13 sueldos). No se reabre.
+
+### La derivación
+
+Las funciones puras viven en `schemas.ts` y las comparten el diálogo, el
+esquema y el servicio:
+
+- `PAY_CYCLE_CALENDAR_DAYS` / `calendarCycleDaysForFrequency`: 7, 14 y 28. NO
+es `PAY_CYCLE_DAYS` (7/15/30), que sigue siendo la base COMERCIAL de 30 días
+con la que se prorratea un rango que no es un ciclo.
+- `payrollCycleRange({ frequency, cycleEndDate })`: dado el **sábado que cierra
+el ciclo**, devuelve `[end − (días − 1), end]`. Con `referenceDate` devuelve el
+ciclo que CONTIENE esa fecha (su cierre es el sábado en o después de ella). Sin
+cadencia, con una fecha imposible o con un cierre que no es sábado, devuelve
+`null`.
+- `lastCompletedCycleEndDate(referenceDate)`: el sábado ANTERIOR a la fecha de
+referencia. Un ciclo se completa cuando ya pasó su sábado; el domingo se liquida
+la semana que cerró el sábado anterior.
+- `lastCompletedPayrollCycles({ frequency, referenceDate, count })`: los últimos
+ciclos completados, el más reciente PRIMERO, cada uno con su `label` y su rango.
+Es la lista del selector; el primero es el ciclo por defecto.
+- `isPayrollCycleRange({ frequency, startDate, endDate })`: **true solo si** el
+rango empieza DOMINGO, termina SÁBADO y dura 7, 14 o 28 días contando los dos
+extremos. Un lunes, un rango de 8/13/29 días, uno corrido un día o uno del
+largo de otra cadencia son `false`.
+
+### El período nuevo: sin rango libre
+
+`openPeriodSchema` exige `frequency` y `cycle_end_date` (el sábado de cierre).
+`start_date`/`end_date` siguen aceptándose por compatibilidad, pero son una
+segunda opinión: si no coinciden con el ciclo derivado, el envío se rechaza
+(`VALIDATION`). `openPayrollPeriod` DERIVA `start_date`/`end_date` con
+`payrollCycleRange` y no acepta un rango arbitrario; la guarda de solape, el
+piso de fecha y el mapeo de `23P01` siguen vigentes. Con los ciclos embaldosando
+el calendario, la guarda por cadencia es lo que impide liquidar dos veces el
+mismo ciclo: el semanal y el mensual se superponen a propósito, dos del mismo
+ciclo no.
+
+Un período NUEVO sin cadencia ya no es válido: "sin cadencia" desapareció del
+diálogo. Los períodos HEREDADOS con `frequency = NULL` no se tocan y siguen
+calculándose por la vía F3/F5 (`prorateFixedSalary`), exactamente como hoy.
+
+### El ciclo completo paga la fracción entera
+
+Un rango que ES un ciclo cerrado paga la fracción entera de la cadencia (1/4,
+1/2, 1) aunque la base comercial de 30 días sea más larga: el mensual de 4
+semanas son 28 días, y sin esta regla pagaría `28/30` del sueldo y los 13
+cierres del año no serían 13 sueldos. El prorrateo del ciclo parcial (F5) sigue
+intacto para los rangos que NO son un ciclo (los heredados).
+
+### En pantalla
+
+El diálogo "Abrir período" reemplaza los dos campos de fecha por **dos
+selectores**: la cadencia y el **ciclo a liquidar**. Cada opción del selector de
+ciclos muestra su rango ya calculado (p. ej. `27 sep – 3 oct 2026`), y debajo se
+lee el rango derivado en texto. Al cambiar la cadencia, el selector se recalcula
+y se ofrece el último ciclo completado de la cadencia nueva. La nota de la
+primera liquidación (F5) y los avisos del diálogo siguen en su lugar.
 
 ## Detalle de la liquidación: facturas y vales (F6)
 

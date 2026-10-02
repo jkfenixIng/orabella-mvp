@@ -27,6 +27,7 @@ import {
   periodExcludesEmployeeByCadence,
   overlapBlocksDeletion,
   payPayrollItemSchema,
+  payrollCycleRange,
   payrollExtraSchema,
   rangesOverlap,
   requestVoucherSchema,
@@ -646,6 +647,15 @@ async function attachVoucherUserNames(
  * Barreras ante carreras: la lectura y el INSERT no son atómicos, así que la
  * restricción de exclusión de la base (migración 063) es la barrera final
  * (23P01 → mismo error de negocio, igual que 23505 para el borrador repetido).
+ *
+ * F7: el rango NO lo elige el llamador. El período NUEVO se cierra al CICLO de
+ * su cadencia (domingo a sábado; quincenal 2 semanas, mensual 4), así que el
+ * cuerpo trae `frequency` + `cycle_end_date` y acá se DERIVA
+ * `start_date`/`end_date` con `payrollCycleRange`. Un rango libre —o un lunes—
+ * es imposible: el esquema exige la cadencia y el cierre del ciclo, y rechaza
+ * cualquier `start_date`/`end_date` que no coincida con el ciclo derivado. Los
+ * períodos heredados sin cadencia (NULL) no se tocan: siguen leyéndose y
+ * calculándose como hoy.
  */
 export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Promise<PayrollPeriodRow> {
   const parsed = openPeriodSchema.safeParse(raw);
@@ -653,6 +663,15 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
     throw new PayrollError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const input: OpenPeriodInput = parsed.data;
+  // F7: la ÚNICA fuente de verdad del rango es el ciclo. El esquema ya validó
+  // que el cierre sea sábado; el guardia repite la verdad para el tipo.
+  const cycle = payrollCycleRange({
+    frequency: input.frequency,
+    cycleEndDate: input.cycle_end_date,
+  });
+  if (cycle === null) {
+    throw new PayrollError("VALIDATION", "El cierre del ciclo debe ser un sábado.", 400);
+  }
   const db = await payrollDb();
   try {
     // Candidatos: los períodos de la sede que tocan el rango pedido. La
@@ -669,7 +688,7 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
     }>({
       log: "openPayrollPeriod",
       what: "períodos de la sede en el rango",
-      meta: { sedeId: actor.sedeId, start: input.start_date, end: input.end_date },
+      meta: { sedeId: actor.sedeId, start: cycle.start_date, end: cycle.end_date },
       table: "payroll_periods",
       fetchPage: (from, to) =>
         db
@@ -678,15 +697,15 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
           // ella no se puede saber si el período que estorba es del MISMO ciclo.
           .select("id, start_date, end_date, frequency, status")
           .eq("sede_id", actor.sedeId)
-          .lte("start_date", input.end_date)
-          .gte("end_date", input.start_date)
+          .lte("start_date", cycle.end_date)
+          .gte("end_date", cycle.start_date)
           .order("id")
           .range(from, to),
     });
     const requested = {
-      start_date: input.start_date,
-      end_date: input.end_date,
-      frequency: input.frequency ?? null,
+      start_date: cycle.start_date,
+      end_date: cycle.end_date,
+      frequency: input.frequency,
     };
     // El MISMO cubo que `coalesce(frequency, '')` de la restricción (063):
     // colisiona el período que comparte días Y cae en el mismo cubo de cadencia.
@@ -707,11 +726,12 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
       .from("payroll_periods")
       .insert({
         sede_id: actor.sedeId,
-        start_date: input.start_date,
-        end_date: input.end_date,
-        // F4: la cadencia se PERSISTE con el período. `null` es un valor legal
-        // (sin cadencia definida) y es lo que deja el período de hoy.
-        frequency: input.frequency ?? null,
+        start_date: cycle.start_date,
+        end_date: cycle.end_date,
+        // F7: la cadencia se PERSISTE con el período y es OBLIGATORIA en un
+        // período nuevo. NULL ya no se puede pedir por acá; sólo queda en los
+        // períodos heredados, que no se reescriben.
+        frequency: input.frequency,
         status: "borrador",
         created_by: actor.userId,
       })

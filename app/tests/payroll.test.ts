@@ -14,6 +14,7 @@ import {
   buildPayrollEmployeeIndex,
   buildPayrollMonthToDate,
   calculatePayrollSchema,
+  calendarCycleDaysForFrequency,
   canDiscountVoucher,
   canReviewVoucher,
   capPayrollDiscounts,
@@ -28,7 +29,10 @@ import {
   detailLineCommissionOrigin,
   fixedFractionForFrequency,
   groupPayrollPeriodsByMonth,
+  isPayrollCycleRange,
   isVoucherDayAllowed,
+  lastCompletedCycleEndDate,
+  lastCompletedPayrollCycles,
   MIXED_ABSORBED_ITEM_TYPE,
   mixedAbsorbedDetailLine,
   nextPeriodStartDate,
@@ -36,8 +40,10 @@ import {
   normalizePerDayLimits,
   openPeriodSchema,
   overlapBlocksDeletion,
+  PAY_CYCLE_CALENDAR_DAYS,
   PAY_CYCLE_DAYS,
   payPayrollItemSchema,
+  payrollCycleRange,
   payrollEmployeeName,
   payrollExtraGuide,
   payrollExtraKindSchema,
@@ -975,16 +981,42 @@ describe("payroll: periodo cerrado es inmutable (PAY-01)", () => {
     expect(() => assertDraftPeriod("cerrado")).toThrowError("PERIOD_CLOSED");
   });
 
-  it("apertura exige fin >= inicio", () => {
-    expect(openPeriodSchema.safeParse({ start_date: "2026-09-01", end_date: "2026-09-15" }).success).toBe(
-      true,
-    );
-    expect(openPeriodSchema.safeParse({ start_date: "2026-09-15", end_date: "2026-09-01" }).success).toBe(
-      false,
-    );
-    expect(openPeriodSchema.safeParse({ start_date: "01/09/2026", end_date: "2026-09-15" }).success).toBe(
-      false,
-    );
+  it("F7: apertura exige cadencia y cierre de ciclo (ya no hay rango libre)", () => {
+    // El rango sale del ciclo: la cadencia y el sábado que cierra el ciclo son
+    // obligatorios, y un envío sin ellos no es una apertura.
+    expect(
+      openPeriodSchema.safeParse({ frequency: "semanal", cycle_end_date: "2026-09-05" }).success,
+    ).toBe(true);
+    // Un cierre que no es sábado no cierra ningún ciclo.
+    expect(
+      openPeriodSchema.safeParse({ frequency: "semanal", cycle_end_date: "2026-09-04" }).success,
+    ).toBe(false);
+    // Sin cadencia: los períodos NUEVOS ya no pueden quedar en NULL.
+    expect(openPeriodSchema.safeParse({ cycle_end_date: "2026-09-05" }).success).toBe(false);
+    expect(
+      openPeriodSchema.safeParse({ frequency: null, cycle_end_date: "2026-09-05" }).success,
+    ).toBe(false);
+    // Una fecha imposible no se normaliza.
+    expect(
+      openPeriodSchema.safeParse({ frequency: "semanal", cycle_end_date: "2026-02-30" }).success,
+    ).toBe(false);
+    // El rango enviado, si viene, tiene que coincidir con el ciclo derivado.
+    expect(
+      openPeriodSchema.safeParse({
+        frequency: "semanal",
+        cycle_end_date: "2026-09-05",
+        start_date: "2026-08-30",
+        end_date: "2026-09-05",
+      }).success,
+    ).toBe(true);
+    expect(
+      openPeriodSchema.safeParse({
+        frequency: "semanal",
+        cycle_end_date: "2026-09-05",
+        start_date: "2026-08-31",
+        end_date: "2026-09-05",
+      }).success,
+    ).toBe(false);
   });
 
   it("cálculo acepta ajustes por empleado (bonos y otros descuentos)", () => {
@@ -4468,6 +4500,159 @@ describe("payroll: la primera nómina prorratea el ciclo PARCIAL (F5, función p
   });
 });
 
+describe("payroll: el ciclo cerrado de la cadencia (F7, función pura)", () => {
+  it("la tabla de ciclos: 1, 2 y 4 semanas, todas domingo a sábado", () => {
+    expect(PAY_CYCLE_CALENDAR_DAYS).toEqual({ semanal: 7, quincenal: 14, mensual: 28 });
+    expect(calendarCycleDaysForFrequency("semanal")).toBe(7);
+    expect(calendarCycleDaysForFrequency("quincenal")).toBe(14);
+    expect(calendarCycleDaysForFrequency("mensual")).toBe(28);
+    expect(calendarCycleDaysForFrequency(null)).toBeNull();
+    expect(calendarCycleDaysForFrequency("anual")).toBeNull();
+    // Las tres cadencias comparten el domingo de inicio y cierran el sábado.
+    expect(payrollCycleRange({ frequency: "semanal", cycleEndDate: "2026-09-05" })).toEqual({
+      start_date: "2026-08-30",
+      end_date: "2026-09-05",
+    });
+    expect(payrollCycleRange({ frequency: "quincenal", cycleEndDate: "2026-09-12" })).toEqual({
+      start_date: "2026-08-30",
+      end_date: "2026-09-12",
+    });
+    expect(payrollCycleRange({ frequency: "mensual", cycleEndDate: "2026-09-26" })).toEqual({
+      start_date: "2026-08-30",
+      end_date: "2026-09-26",
+    });
+  });
+
+  it("con una fecha de referencia devuelve el ciclo que la contiene", () => {
+    // Miércoles 2026-09-02: su ciclo semanal cierra el sábado 2026-09-05.
+    expect(payrollCycleRange({ frequency: "semanal", referenceDate: "2026-09-02" })).toEqual({
+      start_date: "2026-08-30",
+      end_date: "2026-09-05",
+    });
+    // El domingo 2026-08-30 ya pertenece a la semana que cierra el 2026-09-05.
+    expect(payrollCycleRange({ frequency: "semanal", referenceDate: "2026-08-30" })?.end_date).toBe(
+      "2026-09-05",
+    );
+    // Sin cadencia, con un cierre que no es sábado o con una fecha imposible no
+    // hay ciclo que derivar.
+    expect(payrollCycleRange({ frequency: null, cycleEndDate: "2026-09-05" })).toBeNull();
+    expect(payrollCycleRange({ frequency: "semanal", cycleEndDate: "2026-09-04" })).toBeNull();
+    expect(payrollCycleRange({ frequency: "semanal", cycleEndDate: "2026-02-30" })).toBeNull();
+    expect(payrollCycleRange({ frequency: "semanal" })).toBeNull();
+  });
+
+  it("el último ciclo COMPLETADO es el sábado anterior a la referencia", () => {
+    // El domingo 2026-10-04 se liquida la semana que cerró el sábado 2026-10-03.
+    expect(lastCompletedCycleEndDate("2026-10-04")).toBe("2026-10-03");
+    // El propio sábado todavía no está completo: manda el anterior.
+    expect(lastCompletedCycleEndDate("2026-10-03")).toBe("2026-09-26");
+    expect(lastCompletedCycleEndDate("2026-10-05")).toBe("2026-10-03");
+    expect(lastCompletedCycleEndDate("2026-02-30")).toBeNull();
+  });
+
+  it("la lista de ciclos completados: el más reciente PRIMERO y con su rango", () => {
+    const semanal = lastCompletedPayrollCycles({
+      frequency: "semanal",
+      referenceDate: "2026-10-04",
+      count: 3,
+    });
+    expect(semanal).toHaveLength(3);
+    expect(semanal[0]).toMatchObject({
+      start_date: "2026-09-27",
+      end_date: "2026-10-03",
+      label: "27 sep – 3 oct 2026",
+    });
+    expect(semanal[1]).toMatchObject({ start_date: "2026-09-20", end_date: "2026-09-26" });
+    expect(semanal[2]).toMatchObject({ start_date: "2026-09-13", end_date: "2026-09-19" });
+    // El quincenal avanza de dos en dos semanas y el mensual de cuatro.
+    const quincenal = lastCompletedPayrollCycles({
+      frequency: "quincenal",
+      referenceDate: "2026-10-04",
+      count: 2,
+    });
+    expect(quincenal[0]).toMatchObject({ start_date: "2026-09-20", end_date: "2026-10-03" });
+    expect(quincenal[1]).toMatchObject({ start_date: "2026-09-06", end_date: "2026-09-19" });
+    const mensual = lastCompletedPayrollCycles({
+      frequency: "mensual",
+      referenceDate: "2026-10-04",
+      count: 2,
+    });
+    expect(mensual[0]).toMatchObject({ start_date: "2026-09-06", end_date: "2026-10-03" });
+    expect(mensual[1]).toMatchObject({ start_date: "2026-08-09", end_date: "2026-09-05" });
+    // Sin cadencia no hay ciclos que ofrecer.
+    expect(lastCompletedPayrollCycles({ frequency: null, referenceDate: "2026-10-04" })).toEqual([]);
+  });
+
+  it("el validador: domingo a sábado y 7, 14 o 28 días, EXACTO", () => {
+    expect(isPayrollCycleRange({ frequency: "semanal", startDate: "2026-08-30", endDate: "2026-09-05" })).toBe(true);
+    expect(isPayrollCycleRange({ frequency: "quincenal", startDate: "2026-08-30", endDate: "2026-09-12" })).toBe(true);
+    expect(isPayrollCycleRange({ frequency: "mensual", startDate: "2026-08-30", endDate: "2026-09-26" })).toBe(true);
+    // Un lunes no empieza un ciclo, aunque dure 7 días.
+    expect(isPayrollCycleRange({ frequency: "semanal", startDate: "2026-08-31", endDate: "2026-09-06" })).toBe(false);
+    // 8, 13 y 29 días no son un ciclo.
+    expect(isPayrollCycleRange({ frequency: "semanal", startDate: "2026-08-30", endDate: "2026-09-06" })).toBe(false);
+    expect(isPayrollCycleRange({ frequency: "quincenal", startDate: "2026-08-30", endDate: "2026-09-11" })).toBe(false);
+    expect(isPayrollCycleRange({ frequency: "mensual", startDate: "2026-08-30", endDate: "2026-09-27" })).toBe(false);
+    // Domingo a sábado pero del largo de OTRA cadencia: tampoco es SU ciclo.
+    expect(isPayrollCycleRange({ frequency: "semanal", startDate: "2026-08-30", endDate: "2026-09-12" })).toBe(false);
+    expect(isPayrollCycleRange({ frequency: "mensual", startDate: "2026-08-30", endDate: "2026-09-12" })).toBe(false);
+    // Un rango corrido un día tampoco.
+    expect(isPayrollCycleRange({ frequency: "semanal", startDate: "2026-08-31", endDate: "2026-09-05" })).toBe(false);
+    expect(isPayrollCycleRange({ frequency: "semanal", startDate: "2026-08-30", endDate: "2026-09-04" })).toBe(false);
+    // Sin cadencia, o con una fecha imposible, no hay ciclo.
+    expect(isPayrollCycleRange({ frequency: null, startDate: "2026-08-30", endDate: "2026-09-05" })).toBe(false);
+    expect(isPayrollCycleRange({ frequency: "semanal", startDate: "2026-02-30", endDate: "2026-09-05" })).toBe(false);
+  });
+
+  it("un ciclo cerrado paga la fracción ENTERA (28 días mensuales son un mes, no 30)", () => {
+    // El mensual de 4 semanas son 28 días: con la base comercial de 30 pagaría
+    // 28/30 y los 13 cierres del año no serían 13 sueldos. El ciclo manda.
+    expect(
+      resolveFixedSalaryForPeriod({
+        salaryFixed: 1_500_000,
+        employeeFrequency: "semanal",
+        periodFrequency: "semanal",
+        startDate: "2026-08-30",
+        endDate: "2026-09-05",
+      }),
+    ).toEqual({ amount: 375_000, basis: "cadence", fraction: 1 / 4 });
+    expect(
+      resolveFixedSalaryForPeriod({
+        salaryFixed: 1_500_000,
+        employeeFrequency: "quincenal",
+        periodFrequency: "quincenal",
+        startDate: "2026-08-30",
+        endDate: "2026-09-12",
+      }).amount,
+    ).toBe(750_000);
+    expect(
+      resolveFixedSalaryForPeriod({
+        salaryFixed: 1_500_000,
+        employeeFrequency: "mensual",
+        periodFrequency: "mensual",
+        startDate: "2026-08-30",
+        endDate: "2026-09-26",
+      }).amount,
+    ).toBe(1_500_000);
+  });
+
+  it("el período heredado sin cadencia sigue prorrateando por días, intacto", () => {
+    // F7 no toca la vía F3/F5: un período con NULL (o un empleado sin cadencia)
+    // conserva `prorateFixedSalary` como hasta hoy.
+    const legacy = resolveFixedSalaryForPeriod({
+      salaryFixed: 1_500_000,
+      employeeFrequency: null,
+      periodFrequency: null,
+      startDate: "2026-08-30",
+      endDate: "2026-09-05",
+    });
+    expect(legacy.basis).toBe("prorated");
+    expect(legacy.amount).toBe(
+      prorateFixedSalary({ salaryFixed: 1_500_000, startDate: "2026-08-30", endDate: "2026-09-05" }),
+    );
+  });
+});
+
 describe("payroll: la cadencia del período, exclusión y cubo de solape (F4, función pura)", () => {
   it("el cubo de cadencia es `coalesce(frequency, '')`: NULL y undefined son la cadena vacía", () => {
     expect(periodCadenceBucket(null)).toBe("");
@@ -4650,37 +4835,43 @@ describe("payroll: el piso del período nuevo, función pura (regla del dueño 2
 describe("payroll: el diálogo de apertura usa el piso del helper (guarda de fuente)", () => {
   const client = readFileSync(join(process.cwd(), "app", "payroll", "payroll-client.tsx"), "utf8");
 
-  it("el piso sale del helper, no de aritmética local", () => {
-    // F4: el piso se evalúa POR CADENCIA (`openFrequency`), la misma que el
+  it("el piso de fecha sigue saliendo del helper y por cadencia", () => {
+    // F4/F7: el piso se evalúa POR CADENCIA (`openFrequency`), la misma que el
     // usuario eligió y la misma que acota la guarda del servicio.
     expect(client).toContain("const suggestedStart = nextPeriodStartDate(periods, openFrequency);");
-    // El `min` del campo de inicio ES ese piso.
-    expect(client).toContain("min={suggestedStart ?? undefined}");
-  });
-
-  it("al abrir el diálogo se PREFIJA la fecha con el helper", () => {
-    expect(client).toContain('setStartDate(nextPeriodStartDate(periods) ?? "")');
-  });
-
-  it("el envío nombra la fecha válida siguiente y conserva la guarda de solape", () => {
-    expect(client).toContain("El período no puede empezar antes del");
-    // Sigue delegando en el solape, ahora acotado por cadencia (F4), y el
-    // servidor sigue siendo la autoridad.
-    expect(client).toContain("findOverlappingPeriod(periods, startDate, endDate, openFrequency)");
-  });
-
-  it("F4: el diálogo elige la cadencia, la envía y usa el mismo cubo que la base", () => {
-    // El control existe con su etiqueta legible y la opción explícita.
-    expect(client).toContain("Cadencia del período");
-    expect(client).toContain('id="payroll-open-frequency"');
-    expect(client).toContain('label: "Sin cadencia"');
-    // Viaja en el cuerpo de la apertura; "Sin cadencia" va como null.
-    expect(client).toContain('frequency: openFrequency === "" ? null : openFrequency');
     // La guarda en vivo compara con `coalesce(frequency, '')`, el cubo de 063.
     expect(client).toContain("periodCadenceBucket(frequency)");
-    // Y el piso de fecha también es por cadencia: sin esto, el diálogo mostraría
-    // "sin solape" y luego bloquearía el rango que la guarda sí admite.
+    // El envío nombra la fecha válida siguiente y conserva la guarda de solape.
+    expect(client).toContain("El período no puede empezar antes del");
+    expect(client).toContain("findOverlappingPeriod(periods, startDate, endDate, openFrequency)");
     expect(client).toContain("const minimumStart = nextPeriodStartDate(periods, openFrequency);");
+  });
+
+  it("F7: el diálogo elige la cadencia y el CICLO; el rango se deriva", () => {
+    // El control de cadencia existe con su etiqueta legible.
+    expect(client).toContain("Cadencia del período");
+    expect(client).toContain('id="payroll-open-frequency"');
+    // El selector de ciclos existe y muestra el rango YA calculado en la opción.
+    expect(client).toContain("Ciclo a liquidar");
+    expect(client).toContain('id="payroll-open-cycle"');
+    expect(client).toContain("{option.label}");
+    // La lista sale de la función pura y el rango, del cierre elegido.
+    expect(client).toContain("lastCompletedPayrollCycles({");
+    expect(client).toContain("payrollCycleRange({");
+    // Viaja en el cuerpo de la apertura: cadencia + cierre de ciclo, sin rango.
+    expect(client).toContain("frequency: openFrequency,");
+    expect(client).toContain("cycle_end_date: openCycleEnd,");
+  });
+
+  it("F7: no queda la opción 'Sin cadencia' ni campos de fecha libres", () => {
+    expect(client).not.toContain('label: "Sin cadencia"');
+    // Los dos campos del rango desaparecieron del diálogo de apertura.
+    expect(client).not.toContain('id="payroll-open-start"');
+    expect(client).not.toContain('id="payroll-open-end"');
+    // El prefill de la fecha con el helper ya no existe: el ciclo por defecto
+    // sale de `lastCompletedPayrollCycles`.
+    expect(client).not.toContain('setStartDate(nextPeriodStartDate(periods) ?? "")');
+    expect(client).toContain("setOpenCycleEnd(");
   });
 
   it("control negativo: nada de piso vacío, literal ni prefill hardcodeado", () => {
@@ -4742,29 +4933,29 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
   beforeEach(() => resetPayrollStubState());
   afterEach(() => resetPayrollStubState());
 
-  it("rechaza abrir un período que comparte días con otro de la sede", async () => {
-    seedPeriods([periodRow("periodo-1", "2026-09-01", "2026-09-07")]);
+  it("rechaza abrir un ciclo que comparte días con otro de la sede", async () => {
+    seedPeriods([periodRow("periodo-1", "2026-08-01", "2026-09-30", "borrador", payrollPagedStub.SEDE_ID, "semanal")]);
 
     const failure: unknown = await openPayrollPeriod(
-      { start_date: "2026-09-05", end_date: "2026-09-12" },
+      { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     ).catch((error: unknown) => error);
 
     expect(failure).toBeInstanceOf(PayrollError);
     expect(failure).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
-    // El mensaje nombra los DOS rangos: el pedido y el que estorba.
+    // El mensaje nombra los DOS rangos: el DERIVADO del ciclo y el que estorba.
     const message = (failure as PayrollError).message;
-    expect(message).toContain("2026-09-05 a 2026-09-12");
-    expect(message).toContain("2026-09-01 a 2026-09-07");
+    expect(message).toContain("2026-08-30 a 2026-09-05");
+    expect(message).toContain("2026-08-01 a 2026-09-30");
     // Nada se escribió: la guarda corre ANTES del INSERT.
     expect(periodInserts()).toHaveLength(0);
   });
 
   it("compartir UN solo día ya bloquea", async () => {
-    seedPeriods([periodRow("periodo-1", "2026-09-01", "2026-09-07")]);
+    seedPeriods([periodRow("periodo-1", "2026-09-05", "2026-09-05", "borrador", payrollPagedStub.SEDE_ID, "semanal")]);
 
     const failure: unknown = await openPayrollPeriod(
-      { start_date: "2026-09-07", end_date: "2026-09-14" },
+      { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     ).catch((error: unknown) => error);
 
@@ -4772,28 +4963,29 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
   });
 
   it("también bloquea contra un período CERRADO: esos días ya se pagaron", async () => {
-    seedPeriods([periodRow("periodo-1", "2026-09-01", "2026-09-07", "cerrado")]);
+    seedPeriods([periodRow("periodo-1", "2026-08-30", "2026-09-05", "cerrado", payrollPagedStub.SEDE_ID, "semanal")]);
 
     const failure: unknown = await openPayrollPeriod(
-      { start_date: "2026-08-28", end_date: "2026-09-02" },
+      { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     ).catch((error: unknown) => error);
 
     expect(failure).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
-    expect((failure as PayrollError).message).toContain("2026-09-01 a 2026-09-07");
+    expect((failure as PayrollError).message).toContain("2026-08-30 a 2026-09-05");
   });
 
-  it("control negativo: el rango ADYACENTE (empieza el día siguiente) se abre", async () => {
-    seedPeriods([periodRow("periodo-1", "2026-09-01", "2026-09-07")]);
+  it("control negativo: el ciclo ADYACENTE (el siguiente) se abre", async () => {
+    seedPeriods([periodRow("periodo-1", "2026-08-23", "2026-08-29", "borrador", payrollPagedStub.SEDE_ID, "semanal")]);
 
     const created = await openPayrollPeriod(
-      { start_date: "2026-09-08", end_date: "2026-09-14" },
+      { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     );
 
     expect(created).toMatchObject({
-      start_date: "2026-09-08",
-      end_date: "2026-09-14",
+      start_date: "2026-08-30",
+      end_date: "2026-09-05",
+      frequency: "semanal",
       status: "borrador",
       sede_id: payrollPagedStub.SEDE_ID,
     });
@@ -4801,40 +4993,62 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
   });
 
   it("control negativo: el solape es por SEDE (otra sede no bloquea)", async () => {
-    seedPeriods([periodRow("periodo-otra", "2026-09-01", "2026-09-07", "borrador", OTHER_SEDE)]);
+    seedPeriods([periodRow("periodo-otra", "2026-08-30", "2026-09-05", "borrador", OTHER_SEDE, "semanal")]);
 
     const created = await openPayrollPeriod(
-      { start_date: "2026-09-01", end_date: "2026-09-07" },
+      { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     );
 
-    expect(created).toMatchObject({ start_date: "2026-09-01", end_date: "2026-09-07" });
+    expect(created).toMatchObject({ start_date: "2026-08-30", end_date: "2026-09-05" });
   });
 
-  it("F4: persiste la cadencia elegida y sin cadencia deja NULL", async () => {
-    for (const frequency of ["semanal", "quincenal", "mensual", null] as const) {
+  it("F7: persiste la cadencia y el rango DERIVADO del ciclo", async () => {
+    const cycles = [
+      { frequency: "semanal", cycle_end_date: "2026-09-05", start_date: "2026-08-30", end_date: "2026-09-05" },
+      { frequency: "quincenal", cycle_end_date: "2026-09-12", start_date: "2026-08-30", end_date: "2026-09-12" },
+      { frequency: "mensual", cycle_end_date: "2026-09-26", start_date: "2026-08-30", end_date: "2026-09-26" },
+    ] as const;
+    for (const cycle of cycles) {
       seedPeriods([]);
       payrollPagedStub.inserts.length = 0;
 
-      const created = await openPayrollPeriod(
-        { start_date: "2026-09-01", end_date: "2026-09-07", frequency },
-        ACTOR,
-      );
+      const created = await openPayrollPeriod(cycle, ACTOR);
 
-      expect(created.frequency, String(frequency)).toBe(frequency);
+      expect(created, cycle.frequency).toMatchObject({
+        frequency: cycle.frequency,
+        start_date: cycle.start_date,
+        end_date: cycle.end_date,
+      });
       const inserts = periodInserts();
-      expect(inserts, String(frequency)).toHaveLength(1);
-      expect((inserts[0].payload as { frequency?: string | null }).frequency, String(frequency)).toBe(
-        frequency,
-      );
+      expect(inserts, cycle.frequency).toHaveLength(1);
+      expect(inserts[0].payload, cycle.frequency).toMatchObject({
+        frequency: cycle.frequency,
+        start_date: cycle.start_date,
+        end_date: cycle.end_date,
+      });
     }
+  });
+
+  it("F7: un período NUEVO sin cadencia se rechaza (NULL es solo dato heredado)", async () => {
+    seedPeriods([]);
+
+    for (const body of [
+      { cycle_end_date: "2026-09-05" },
+      { frequency: null, cycle_end_date: "2026-09-05" },
+    ]) {
+      const failure: unknown = await openPayrollPeriod(body, ACTOR).catch((error: unknown) => error);
+      expect(failure, JSON.stringify(body)).toBeInstanceOf(PayrollError);
+      expect(failure).toMatchObject({ code: "VALIDATION", status: 400 });
+    }
+    expect(periodInserts()).toHaveLength(0);
   });
 
   it("F4: rechaza una cadencia fuera del catálogo cerrado (nada se escribe)", async () => {
     seedPeriods([]);
 
     const failure: unknown = await openPayrollPeriod(
-      { start_date: "2026-09-01", end_date: "2026-09-07", frequency: "anual" },
+      { frequency: "anual", cycle_end_date: "2026-09-05" },
       ACTOR,
     ).catch((error: unknown) => error);
 
@@ -4843,69 +5057,109 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     expect(periodInserts()).toHaveLength(0);
   });
 
-  it("F4: dos cadencias DISTINTAS de la misma sede pueden compartir días", async () => {
-    seedPeriods([
-      periodRow("periodo-semanal", "2026-09-01", "2026-09-07", "borrador", payrollPagedStub.SEDE_ID, "semanal"),
-    ]);
+  it("F7: rechaza un rango del cliente que no coincide con su ciclo", async () => {
+    seedPeriods([]);
+
+    // Corrido un día: el ciclo derivado empieza el domingo 2026-08-30.
+    const shifted: unknown = await openPayrollPeriod(
+      {
+        frequency: "semanal",
+        cycle_end_date: "2026-09-05",
+        start_date: "2026-08-31",
+        end_date: "2026-09-05",
+      },
+      ACTOR,
+    ).catch((error: unknown) => error);
+    expect(shifted).toBeInstanceOf(PayrollError);
+    expect(shifted).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(periodInserts()).toHaveLength(0);
+
+    // Y el rango CORRECTO se acepta: el cliente puede mandarlo, pero el ciclo
+    // derivado sigue siendo la única fuente de verdad.
+    const created = await openPayrollPeriod(
+      {
+        frequency: "semanal",
+        cycle_end_date: "2026-09-05",
+        start_date: "2026-08-30",
+        end_date: "2026-09-05",
+      },
+      ACTOR,
+    );
+    expect(created).toMatchObject({ start_date: "2026-08-30", end_date: "2026-09-05" });
+    expect(periodInserts()).toHaveLength(1);
+  });
+
+  it("F7: rechaza un cierre que no es sábado (nada se escribe)", async () => {
+    seedPeriods([]);
+
+    const failure: unknown = await openPayrollPeriod(
+      { frequency: "semanal", cycle_end_date: "2026-09-04" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(periodInserts()).toHaveLength(0);
+  });
+
+  it("F7: la PRIMERA liquidación de una sede usa el mismo control de ciclo", async () => {
+    seedPeriods([]);
 
     const created = await openPayrollPeriod(
-      { start_date: "2026-09-01", end_date: "2026-09-30", frequency: "mensual" },
+      { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     );
 
     expect(created).toMatchObject({
-      start_date: "2026-09-01",
-      end_date: "2026-09-30",
+      start_date: "2026-08-30",
+      end_date: "2026-09-05",
+      frequency: "semanal",
+    });
+    expect(periodInserts()).toHaveLength(1);
+  });
+
+  it("F4: dos cadencias DISTINTAS de la misma sede pueden compartir días", async () => {
+    seedPeriods([
+      periodRow("periodo-semanal", "2026-08-30", "2026-09-05", "borrador", payrollPagedStub.SEDE_ID, "semanal"),
+    ]);
+
+    const created = await openPayrollPeriod(
+      { frequency: "mensual", cycle_end_date: "2026-09-26" },
+      ACTOR,
+    );
+
+    expect(created).toMatchObject({
+      start_date: "2026-08-30",
+      end_date: "2026-09-26",
       frequency: "mensual",
     });
     expect(periodInserts()).toHaveLength(1);
   });
 
   it("F4: una cadencia definida NO choca con un período heredado sin cadencia", async () => {
-    seedPeriods([periodRow("periodo-heredado", "2026-09-01", "2026-09-07")]);
+    seedPeriods([periodRow("periodo-heredado", "2026-08-30", "2026-09-05")]);
 
     const created = await openPayrollPeriod(
-      { start_date: "2026-09-05", end_date: "2026-09-12", frequency: "semanal" },
+      { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     );
 
-    expect(created).toMatchObject({ frequency: "semanal", start_date: "2026-09-05" });
+    expect(created).toMatchObject({ frequency: "semanal", start_date: "2026-08-30", end_date: "2026-09-05" });
   });
 
-  it("F4: la MISMA cadencia sigue bloqueando, con el rango en el mensaje", async () => {
+  it("F4/F7: la MISMA cadencia bloquea el MISMO ciclo (segunda liquidación del ciclo)", async () => {
     seedPeriods([
-      periodRow("periodo-1", "2026-09-01", "2026-09-07", "borrador", payrollPagedStub.SEDE_ID, "semanal"),
+      periodRow("periodo-1", "2026-08-30", "2026-09-05", "borrador", payrollPagedStub.SEDE_ID, "semanal"),
     ]);
 
     const failure: unknown = await openPayrollPeriod(
-      { start_date: "2026-09-05", end_date: "2026-09-12", frequency: "semanal" },
+      { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     ).catch((error: unknown) => error);
 
     expect(failure).toBeInstanceOf(PayrollError);
     expect(failure).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
-    expect((failure as PayrollError).message).toContain("2026-09-01 a 2026-09-07");
-    expect(periodInserts()).toHaveLength(0);
-  });
-
-  it("F4: dos períodos SIN cadencia siguen siendo mutuamente excluyentes (protección heredada)", async () => {
-    // La base compara `coalesce(frequency, '')`: dos NULL caen en el MISMO cubo
-    // y siguen bloqueándose. Sin esta regla, los períodos heredados dejarían de
-    // protegerse EN SILENCIO.
-    seedPeriods([periodRow("periodo-1", "2026-09-01", "2026-09-07")]);
-
-    const inherited: unknown = await openPayrollPeriod(
-      { start_date: "2026-09-05", end_date: "2026-09-12" },
-      ACTOR,
-    ).catch((error: unknown) => error);
-    expect(inherited).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
-
-    const explicitNull: unknown = await openPayrollPeriod(
-      { start_date: "2026-09-05", end_date: "2026-09-12", frequency: null },
-      ACTOR,
-    ).catch((error: unknown) => error);
-    expect(explicitNull).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
-
+    expect((failure as PayrollError).message).toContain("2026-08-30 a 2026-09-05");
     expect(periodInserts()).toHaveLength(0);
   });
 
@@ -4916,7 +5170,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     payrollPagedStub.insertError = { table: "payroll_periods", code: "23P01" };
 
     const failure: unknown = await openPayrollPeriod(
-      { start_date: "2026-09-08", end_date: "2026-09-14" },
+      { frequency: "semanal", cycle_end_date: "2026-09-12" },
       ACTOR,
     ).catch((error: unknown) => error);
 
@@ -4927,13 +5181,13 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
   });
 
   it("si la lectura de períodos no se completa, ABRIR se detiene (no decide con menos)", async () => {
-    seedPeriods([periodRow("periodo-1", "2026-09-01", "2026-09-07")]);
+    seedPeriods([periodRow("periodo-1", "2026-08-30", "2026-09-05", "borrador", payrollPagedStub.SEDE_ID, "semanal")]);
     // La primera página de la lectura de períodos falla: con el conjunto
     // recortado la guarda podría no ver el período que estorba.
     payrollPagedStub.failAt = { payroll_periods: [1] };
 
     const failure: unknown = await openPayrollPeriod(
-      { start_date: "2026-09-08", end_date: "2026-09-14" },
+      { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     ).catch((error: unknown) => error);
 
