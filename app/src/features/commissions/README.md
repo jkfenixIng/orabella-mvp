@@ -7,6 +7,13 @@ El porcentaje del empleado no se paga acá: se acumula y se liquida en la nómin
 (`payroll`). El modo de comisión de cada línea de factura se declara en
 `billing` (`commissionModeSchema`); este módulo resuelve el valor y paga.
 
+El pago inmediato SOLO aplica a facturas `Pagada` (regla del dueño,
+2026-10-01): con la factura pagada el destino de la comisión ya quedó definido
+—se pagó de inmediato, o se dejó para la nómina—; con una factura `Emitida`
+todavía no hay comisión en juego. La guarda vive en el servidor: la lectura de
+la factura rechaza con `INVOICE_NOT_PAID` (y `INVOICE_ANNULLED` si está
+anulada), y `payCommissionNow` la vuelve a exigir antes de insertar el pago.
+
 - Tablas (migración `016_commissions.sql`): `commission_rules` (`sede_id`,
   `item_type` producto/servicio, `item_id` polimórfico y sin FK —lo valida el
   servicio—, `employee_id` ON DELETE CASCADE, `percent` 0–100 y/o `amount`
@@ -31,13 +38,15 @@ El porcentaje del empleado no se paga acá: se acumula y se liquida en la nómin
   `sede_id,item_type,item_id,employee_id`; 23505 → `RULE_CONFLICT`),
   `deleteCommissionRule` (404 si la regla no es de la sede),
   `earnedCommissionFor` (líneas sin `no_commission` × regla o tasa plana;
-  devuelve `earned` y, separado, `immediateEarned` con solo el origen comisión
-  por ítem), `immediatePaidTotal`, `payCommissionNow` (exige turno abierto,
-  método activo, empleado distinto de `no_aplica`, tope `ganado − pagado` y el
-  tope de salida en efectivo del turno) y `listCommissionPayouts`. Errores
+  exige que la factura esté `Pagada` y devuelve `earned` y, separado,
+  `immediateEarned` con solo el origen comisión por ítem), `immediatePaidTotal`,
+  `payCommissionNow` (exige factura `Pagada`, turno abierto, método activo,
+  empleado distinto de `no_aplica`, tope `ganado − pagado` y el tope de salida
+  en efectivo del turno; relee el estado de la factura antes de insertar) y
+  `listCommissionPayouts`. Errores
   tipados con `CommissionError` (`NO_OPEN_SHIFT`, `NOTHING_EARNED`,
   `NOTHING_PENDING`, `COMMISSION_OVERPAID`, `METHOD_INACTIVE`,
-  `COMMISSION_NOT_APPLICABLE`, `INVOICE_ANNULLED`, …). Reutiliza
+  `COMMISSION_NOT_APPLICABLE`, `INVOICE_NOT_PAID`, `INVOICE_ANNULLED`, …). Reutiliza
   `requireSession`/`requireAdminSession` (admin), `requireCashWriter`,
   `getOpenShift`/`cashOutUsedInShift` + `cashOutLimitViolation` (caja),
   `listPaymentMethods` (admin) y `writeAudit` (auditoría).

@@ -14,6 +14,7 @@ import {
 } from "@/src/features/commissions/schemas";
 import {
   CommissionError,
+  canPayCommissionImmediately,
   payCommissionNow,
 } from "@/src/features/commissions/service";
 import {
@@ -474,6 +475,36 @@ describe("commissions: el pago inmediato solo ofrece comisiones (no el % del emp
     ).toBe("none");
   });
 
+  it("una regla por ítem SOLO porcentual no es inmediata: el origen es `percent`, no `commission`", () => {
+    // `percent > 0` con `amount` vacío es puramente porcentual: antes se
+    // clasificaba como fija por existir la fila de la regla y entraba al pago
+    // inmediato; ahora el origen y el monto salen de la MISMA resolución.
+    const percentRule = new Map<string, RuleRate>([
+      [commissionRuleKey("producto", "prod-tinte"), { percent: 20, amount: null }],
+    ]);
+    const origin = employeeLineCommissionOrigin({
+      itemType: "producto",
+      itemRefId: "prod-tinte",
+      commissionValue: null,
+      rules: percentRule,
+      flatPercent,
+    });
+    expect(origin).toBe("percent");
+
+    // El ganado se calcula igual (100.000 × 20%) pero NO engrosa el pendiente
+    // inmediato: el porcentaje se acumula y se paga en nómina.
+    const earned = resolveEmployeeLineCommission({
+      itemType: "producto",
+      itemRefId: "prod-tinte",
+      subtotal: 100000,
+      qty: 1,
+      rules: percentRule,
+      flatPercent,
+    });
+    expect(earned).toBe(20000);
+    expect(origin === "commission" ? earned : 0).toBe(0);
+  });
+
   it("el pendiente inmediato incluye SOLO el producto (1000), nunca el % del servicio (14700)", () => {
     const service = split(serviceLine);
     const product = split(productLine);
@@ -698,6 +729,20 @@ const payoutStub = vi.hoisted(() => ({
   /** `false` = no hay turno abierto (la guarda que corre ANTES del lookup). */
   shiftOpen: true,
   /**
+   * Estado de la factura que el doble devuelve. Regla del dueño: solo `Pagada`
+   * habilita el pago inmediato, así que el camino del dinero usa `Pagada` (el
+   * fixture anterior devolvía `Emitida` y ocultaba el hueco).
+   */
+  invoiceStatus: "Pagada" as string,
+  /**
+   * Estado que la factura pasa a tener DESPUÉS de la primera lectura: emula el
+   * cambio de estado en vuelo entre la carga y la relectura previa al INSERT.
+   * `null` = el estado no cambia.
+   */
+  invoiceStatusAfterFirstRead: null as string | null,
+  /** Lecturas de `invoices` (prueba de la relectura previa al INSERT). */
+  invoiceReads: 0,
+  /**
    * CL-5: el TURNO que el doble devuelve. Existe para poder cambiar de turno
    * entre el intento y su reintento (la ventana que la 044 declara sin cerrar).
    */
@@ -733,6 +778,9 @@ function resetPayoutStub(): void {
   payoutStub.insertAttempts = 0;
   payoutStub.shiftOpen = true;
   payoutStub.shiftId = "55555555-5555-4555-8555-555555555555";
+  payoutStub.invoiceStatus = "Pagada";
+  payoutStub.invoiceStatusAfterFirstRead = null;
+  payoutStub.invoiceReads = 0;
   payoutStub.nextId = 0;
   payoutStub.gate = null;
 }
@@ -902,14 +950,23 @@ function createPayoutStubClient(): unknown {
               : { pay_type: "fijo", commission_percent: null },
             error: null,
           };
-        case "invoices":
-          // CL-5: eco del id consultado. La prueba de multi-identidad usa una
-          // SEGUNDA factura y el doble tiene que comportarse como la base (la
-          // fila que el filtro pidió), no devolver siempre la primera.
+        case "invoices": {
+          // Eco del id consultado. La prueba de multi-identidad usa una SEGUNDA
+          // factura y el doble tiene que comportarse como la base (la fila que
+          // el filtro pidió), no devolver siempre la primera. El estado es el
+          // que la factura tiene de verdad: `Pagada` habilita el pago (regla
+          // del dueño); `invoiceStatusAfterFirstRead` emula un cambio de estado
+          // entre la carga y la relectura previa al INSERT.
+          payoutStub.invoiceReads += 1;
+          const status =
+            payoutStub.invoiceStatusAfterFirstRead !== null && payoutStub.invoiceReads > 1
+              ? payoutStub.invoiceStatusAfterFirstRead
+              : payoutStub.invoiceStatus;
           return {
-            data: { id: (eqFilters.id as string) ?? payoutStub.INVOICE_ID, status: "Emitida" },
+            data: { id: (eqFilters.id as string) ?? payoutStub.INVOICE_ID, status },
             error: null,
           };
+        }
         case "invoice_items":
           return {
             data: [
@@ -1475,5 +1532,116 @@ describe("commissions: CL-5 el pago inmediato reintentado no paga la comisión d
     expect(sql).not.toMatch(/\bTRUNCATE\b/i);
     expect(sql).not.toMatch(/UPDATE\s+public\./i);
     expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+});
+
+// ------------- pago inmediato solo de facturas PAGADAS (regla del dueño) ---
+//
+// Decisión del dueño (2026-10-01): la comisión de una factura existe cuando la
+// factura está Pagada. Pagada, el destino de la comisión ya quedó definido —se
+// pagó de inmediato, o se dejó para la nómina—; con una factura Emitida todavía
+// no hay comisión en juego. La UI ya gatea el modal, pero la autoridad es el
+// SERVIDOR: `Emitida` se rechaza aunque se llame a la acción/servicio directo, y
+// Anulada se sigue rechazando. Antes el doble devolvía `Emitida` y las pruebas
+// del pago pasaban: esa era la prueba de que el servidor no exigía el estado.
+describe("commissions: el pago inmediato exige factura Pagada (regla del dueño)", () => {
+  const actor = { userId: "u-cajero", sedeId: payoutStub.SEDE_ID };
+  const MARK = "3d7f0a52-9c14-4e68-b2f1-8a5c6e0d7b43";
+  const input = {
+    invoice_id: payoutStub.INVOICE_ID,
+    employee_id: payoutStub.EMPLOYEE_ID,
+    method_code: payoutStub.METHOD_CODE,
+    idempotency_key: MARK,
+  };
+
+  beforeEach(() => {
+    resetPayoutStub();
+  });
+  afterEach(() => {
+    resetPayoutStub();
+  });
+
+  it("una factura Pagada paga (el fixture del camino del dinero es un pago real)", async () => {
+    // El fixture anterior era `Emitida`; este es el estado que producción
+    // permite pagar, así que las pruebas de dinero corren sobre un pago válido.
+    expect(payoutStub.invoiceStatus).toBe("Pagada");
+    const row = await payCommissionNow({ ...input, amount: 5000 }, actor);
+
+    expect(row.amount).toBe(5000);
+    expect(payoutStub.payouts).toHaveLength(1);
+    expect(payoutStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("una factura `Emitida` se rechaza y NO inserta ninguna fila", async () => {
+    payoutStub.invoiceStatus = "Emitida";
+    const failure: unknown = await payCommissionNow({ ...input, amount: 5000 }, actor).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(CommissionError);
+    expect(failure).toMatchObject({
+      code: "INVOICE_NOT_PAID",
+      message: "La factura debe estar Pagada para pagar la comisión.",
+      status: 422,
+    });
+    // La guarda corre ANTES de cualquier escritura: ni fila, ni intento, ni traza.
+    expect(payoutStub.insertAttempts).toBe(0);
+    expect(payoutStub.payouts).toHaveLength(0);
+    expect(payoutStub.audits).toHaveLength(0);
+    expect(payoutStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("una factura anulada se sigue rechazando con su código propio", async () => {
+    payoutStub.invoiceStatus = "Anulada";
+    const failure: unknown = await payCommissionNow({ ...input, amount: 5000 }, actor).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(CommissionError);
+    expect(failure).toMatchObject({ code: "INVOICE_ANNULLED", status: 422 });
+    expect(payoutStub.insertAttempts).toBe(0);
+    expect(payoutStub.payouts).toHaveLength(0);
+  });
+
+  it("defensa en profundidad: si el estado deja de ser Pagada entre la carga y el INSERT, no hay pago", async () => {
+    // La relectura previa al INSERT es una SEGUNDA barrera independiente de la
+    // carga: emula la anulación en vuelo entre las dos lecturas (la ventana que
+    // una sola lectura no cubre). El pago NO entra.
+    payoutStub.invoiceStatusAfterFirstRead = "Anulada";
+    const failure: unknown = await payCommissionNow({ ...input, amount: 5000 }, actor).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(CommissionError);
+    expect(failure).toMatchObject({ code: "INVOICE_ANNULLED", status: 422 });
+    // Dos lecturas de la factura: la carga y la relectura; cero escrituras.
+    expect(payoutStub.invoiceReads).toBe(2);
+    expect(payoutStub.insertAttempts).toBe(0);
+    expect(payoutStub.payouts).toHaveLength(0);
+  });
+
+  it("control negativo: la guarda NO es `≠ Anulada`, exige `Pagada` (el defecto no vuelve)", async () => {
+    // La versión defectuosa aceptaba cualquier estado distinto de Anulada, así
+    // que `Emitida` pasaba. Se emula esa función y se exige que la guarda real
+    // discrepe: si alguien la relaja a `!== "Anulada"`, esta prueba se cae.
+    const defectuosa = (status: string): boolean => status !== "Anulada";
+    expect(defectuosa("Emitida")).toBe(true);
+    expect(canPayCommissionImmediately("Emitida")).toBe(false);
+    expect(canPayCommissionImmediately("Pagada")).toBe(true);
+    expect(() =>
+      expect(canPayCommissionImmediately("Emitida")).toBe(defectuosa("Emitida")),
+    ).toThrow();
+
+    // Y la conducta completa: `Emitida` no entra, `Pagada` sí.
+    payoutStub.invoiceStatus = "Emitida";
+    const refused: unknown = await payCommissionNow({ ...input, amount: 5000 }, actor).catch(
+      (error: unknown) => error,
+    );
+    expect(refused).toBeInstanceOf(CommissionError);
+    expect(payoutStub.payouts).toHaveLength(0);
+
+    payoutStub.invoiceStatus = "Pagada";
+    await payCommissionNow({ ...input, amount: 5000 }, actor);
+    expect(payoutStub.payouts).toHaveLength(1);
   });
 });
