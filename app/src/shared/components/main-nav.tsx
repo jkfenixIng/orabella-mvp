@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState, useEffect } from "react";
-import { Bell, Calculator, House, Package, Receipt, Settings, Sparkles, Ticket, Wallet, type LucideIcon } from "lucide-react";
+import { Bell, Calculator, House, Package, Receipt, Settings, ShieldCheck, Sparkles, Ticket, Wallet, type LucideIcon } from "lucide-react";
 import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 
 interface NavLink {
@@ -92,6 +92,21 @@ const NAV_GROUPS: NavGroup[] = [
           description: "Desajustes de caja y cuentas bloqueadas",
           Icon: Bell,
           roles: ["admin"],
+        },
+      ],
+  },
+  {
+    id: "instalacion",
+    label: "Instalación",
+      links: [
+        {
+          href: "/plataforma",
+          label: "Plataforma",
+          description: "Sedes de la instalación y su nómina",
+          Icon: ShieldCheck,
+          // Solo la cuenta con el rol de plataforma. El filtro fail-closed de
+          // abajo la deja invisible para todos los demás sin código nuevo.
+          roles: ["superadmin"],
         },
       ],
   },
