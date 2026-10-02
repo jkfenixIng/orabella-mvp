@@ -5,7 +5,7 @@ import { PageContainer, PageHeader } from "@/src/components/ui/lib/page";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { listAllEmployees, listPaymentMethods } from "@/src/features/admin/service";
-import { listPayrollOverview, listPeriods } from "@/src/features/payroll/service";
+import { getPayrollStartDate, listPayrollOverview, listPeriods } from "@/src/features/payroll/service";
 import { PayrollClient } from "./payroll-client";
 
 export const dynamic = "force-dynamic";
@@ -57,10 +57,14 @@ export default async function PayrollPage() {
   // que SOLO el admin lo recibe. Al empleado se le manda únicamente su propia
   // fila: pasarle la planta entera sería exponerle documentos, teléfonos y
   // sueldos ajenos.
-  const [employees, methods, overview] = await Promise.all([
+  const [employees, methods, overview, payrollStartDate] = await Promise.all([
     listAllEmployees(sedeId),
     listPaymentMethods(sedeId),
     canAdmin ? listPayrollOverview(sedeId) : null,
+    // F10: la fecha desde la que la nómina OPERA en la sede. Sólo el admin la
+    // usa (es el control de configuración de la pantalla): al empleado no se le
+    // manda la configuración de la sede, sólo su recibo.
+    canAdmin ? getPayrollStartDate(sedeId) : null,
   ]);
 
   // El admin ya tiene los períodos dentro del resumen: se usan esos y la lectura
@@ -81,6 +85,7 @@ export default async function PayrollPage() {
         initialEmployees={visibleEmployees}
         initialPeriods={periods}
         initialSummaries={overview?.summaries ?? []}
+        initialPayrollStartDate={payrollStartDate ?? null}
         methods={methods.filter((row) => row.is_active)}
         canAdmin={canAdmin}
         canPay={canPay}

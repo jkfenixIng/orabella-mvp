@@ -791,6 +791,20 @@ const SURFACES: readonly SurfaceSpec[] = [
     roles: ["admin", "empleado"],
     why: "lee las facturas y vales de la liquidación de UN empleado (alcance por fila: el empleado solo la suya); es lectura de nómina y la caja no entra.",
   },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "getPayrollStartDateAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "F10: lee desde cuándo existe la nómina de la sede. Es configuración de nómina (y el piso de los ciclos que se ofrecen), no del recibo del empleado: la caja no entra.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "setPayrollStartDateAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "F10: fija la fecha de inicio de la nómina de la sede (configuración de nómina, solo admin).",
+  },
   // ---- rutas de nómina: solo admin ----
   {
     file: "app/api/v1/payroll-periods/route.ts",

@@ -31,6 +31,7 @@ import {
   groupPayrollPeriodsByMonth,
   isPayrollCycleRange,
   isPayrollCycleSettled,
+  isRangeBeforePayrollStart,
   isVoucherDayAllowed,
   lastCompletedCycleEndDate,
   lastCompletedPayrollCycles,
@@ -62,6 +63,7 @@ import {
   rangesOverlap,
   resolveFixedSalaryForPeriod,
   resolveMixedBlock,
+  resolveOpenPayrollRange,
   splitCommissionByOrigin,
   rejectVoucherSchema,
   replacePayrollMonthPeriod,
@@ -90,6 +92,7 @@ import {
   calculatePayroll,
   getPayrollPeriodCorrection,
   getPayrollSettlementSources,
+  getPayrollStartDate,
   getPeriodDetail,
   groupSettlementInvoices,
   listPayrollMonthRows,
@@ -98,6 +101,7 @@ import {
   openPayrollPeriod,
   PayrollError,
   rejectVoucher,
+  setPayrollStartDate,
   type PayrollActor,
 } from "@/src/features/payroll/service";
 import { listAllEmployees, listEmployees } from "@/src/features/admin/service";
@@ -105,8 +109,10 @@ import * as payrollExtrasService from "@/src/features/payroll/service";
 import { AUDIT_ACTIONS } from "@/src/shared/lib/audit";
 import {
   getPayrollSettlementSourcesAction,
+  getPayrollStartDateAction,
   getPeriodDetailAction,
   listVouchersAction,
+  setPayrollStartDateAction,
 } from "@/src/features/payroll/actions";
 import type { AdminSession } from "@/src/features/admin/service";
 import {
@@ -1611,8 +1617,11 @@ const payrollPagedStub = vi.hoisted(() => ({
    * Largo de cada `in(...)`: prueba de que los ids se parten (URL de 414).
    */
   inFilters: [] as Array<{ table: string; column: string; count: number }>,
-  /** Falla el select de `table` cuando entre sus filtros está `filter`. */
-  failOn: null as { table: string; filter: string } | null,
+  /**
+   * Falla la lectura (o la escritura) de `table` cuando entre sus filtros está
+   * `filter`, con el `code` indicado (F10: `42703` = columna inexistente).
+   */
+  failOn: null as { table: string; filter: string; code?: string } | null,
   /**
    * U8: simula la ESCRITURA concurrente de otra transacción (la nómina que
    * descuenta el vale) justo antes de que el UPDATE del servicio evalúe sus
@@ -1876,6 +1885,23 @@ function createPayrollPagedStubClient(): unknown {
           payrollPagedStub.beforeUpdate = null;
           beforeUpdate.run();
         }
+        // F10: la escritura puede fallar por el MISMO motivo inyectado que la
+        // lectura (la columna que la migración todavía no agregó): el doble
+        // contesta como la base, no como un cliente feliz.
+        const updateFailure = payrollPagedStub.failOn;
+        if (
+          updateFailure &&
+          updateFailure.table === table &&
+          filterColumns.includes(updateFailure.filter)
+        ) {
+          return {
+            data: null,
+            error: {
+              code: updateFailure.code ?? null,
+              message: `doble: fallo inyectado en ${table} (filtro ${updateFailure.filter})`,
+            },
+          };
+        }
         // PostgREST devuelve las filas que el UPDATE afectó, con el payload ya
         // aplicado: la aprobación del vale necesita esa fila de vuelta.
         const matched = rows().filter((row) => filters.every((matches) => matches(row)));
@@ -2002,7 +2028,10 @@ function createPayrollPagedStubClient(): unknown {
       if (failOn && failOn.table === table && filterColumns.includes(failOn.filter)) {
         return {
           data: null,
-          error: { message: `doble: fallo inyectado en ${table} (filtro ${failOn.filter})` },
+          error: {
+            code: failOn.code ?? null,
+            message: `doble: fallo inyectado en ${table} (filtro ${failOn.filter})`,
+          },
         };
       }
       const index = (payrollPagedStub.requests[table] = (payrollPagedStub.requests[table] ?? 0) + 1);
@@ -5312,87 +5341,174 @@ describe("payroll: el piso del período nuevo, función pura (regla del dueño 2
   });
 });
 
-describe("payroll: el diálogo de apertura y su fecha sugerida (guarda de fuente)", () => {
+describe("payroll-client: el diálogo de apertura DERIVADO (F10, guarda de fuente)", () => {
   const client = readFileSync(join(process.cwd(), "app", "payroll", "payroll-client.tsx"), "utf8");
 
-  it("la fecha sugerida sigue saliendo del helper y por cadencia", () => {
-    // F4/F7: el helper se evalúa POR CADENCIA (`openFrequency`), la misma que el
-    // usuario eligió y la misma que acota la guarda del servicio. F9: es la
-    // SUGERENCIA del diálogo —el ciclo que sigue—, ya no el piso del envío.
-    expect(client).toContain("const suggestedStart = nextPeriodStartDate(periods, openFrequency);");
-    // La guarda en vivo compara con `coalesce(frequency, '')`, el cubo de 063.
-    expect(client).toContain("periodCadenceBucket(frequency)");
-    // El envío conserva la guarda de solape, que nombra el período en conflicto.
-    expect(client).toContain("findOverlappingPeriod(periods, startDate, endDate, openFrequency)");
+  /**
+   * El marcado del diálogo de apertura, recortado a SU contenido: la guarda de
+   * "no hay fechas ni cadencia" sólo tiene sentido sobre el diálogo (la pantalla
+   * sí tiene el campo de la fecha de inicio de la nómina, que es la
+   * CONFIGURACIÓN de la sede, no el rango de un período).
+   */
+  const dialog = (): string => {
+    const start = client.indexOf("<DialogTitle>Abrir período</DialogTitle>");
+    expect(start, "título del diálogo de apertura").toBeGreaterThan(-1);
+    const end = client.indexOf("</DialogContent>", start);
+    expect(end, "cierre del diálogo de apertura").toBeGreaterThan(start);
+    return client.slice(start, end);
+  };
+
+  it("el diálogo NO pregunta: sin selector de cadencia, sin ciclo libre y sin campo de fecha", () => {
+    const open = dialog();
+    // F10: la cadencia y el rango ya NO son una pregunta del diálogo.
+    expect(open).not.toContain("Cadencia del período");
+    expect(open).not.toContain('id="payroll-open-frequency"');
+    expect(open).not.toContain('id="payroll-open-cycle"');
+    // Ningún `<select>`: la única entrada es la lista de ciclos pendientes.
+    expect(open).not.toContain("<select");
+    // Ningún campo de fecha dentro del diálogo, ni un `min`/`max` con fecha.
+    expect(open).not.toContain('type="date"');
+    expect(open).not.toMatch(/min="20\d{2}-\d{2}-\d{2}"/);
+    expect(open).not.toMatch(/max="20\d{2}-\d{2}-\d{2}"/);
+    // El estado viejo del selector tampoco vive: sin él no hay ciclo que fijar.
+    for (const removed of [
+      "openFrequency",
+      "openCycleEnd",
+      "pinnedCycle",
+      "cycleMarker",
+      "lastCompletedPayrollCycles",
+      "payrollCycleRange(",
+      "OPEN_PAY_FREQUENCY_OPTIONS",
+    ]) {
+      expect(client, removed).not.toContain(removed);
+    }
+    // Y el ciclo SÍ sigue a la vista, como lista que se confirma: la etiqueta
+    // del legend y la de cada opción.
+    expect(open).toContain("Ciclo a liquidar");
+    expect(open).toContain("{`Ciclo ${entry.frequency} ${entry.label}`}");
+    expect(open).toContain('name="payroll-open-target"');
+    // El envío sigue llevando cadencia + cierre, sin rango escrito.
+    expect(client).toContain("frequency: openTarget.frequency,");
+    expect(client).toContain("cycle_end_date: openTarget.end_date,");
+    expect(client).not.toContain('id="payroll-open-start"');
+    expect(client).not.toContain('id="payroll-open-end"');
+    expect(client).not.toContain('label: "Sin cadencia"');
   });
 
-  it("F9: el envío bloquea con la regla de liquidación, no con el piso del día siguiente", () => {
-    // La guarda del envío (`handleOpen`) decide con la MISMA regla pura del aviso y
-    // de las marcas del selector, sobre el ciclo que se DERIVA de la cadencia
-    // elegida: así el diálogo no puede contradecir al aviso que lo abrió.
+  it("el rango sale del ÚNICO validador, con la fecha de arranque de la sede", () => {
+    // La MISMA función pura que aplica el servicio antes del INSERT: un ciclo
+    // COMPLETO o el primer ciclo recortado a la fecha. El cliente no calcula su
+    // propia forma de rango.
+    expect(client).toMatch(
+      /const openResolution =\s*openTarget === null\s*\? null\s*: resolveOpenPayrollRange\(\{\s*frequency: openTarget\.frequency,\s*cycleEndDate: openTarget\.end_date,\s*payrollStartDate,\s*periods,\s*\}\);/,
+    );
+    // El rango mostrado y el enviado salen de esa resolución.
+    expect(client).toContain("const startDate = openResolution?.ok ? openResolution.start_date : \"\";");
+    expect(client).toContain("const endDate = openResolution?.ok ? openResolution.end_date : \"\";");
+    expect(client).toContain("openResolution.trimmed");
+    // La ayuda del control (fuera del diálogo) es la que explica la fecha.
+    expect(client).toContain('id="payroll-start-date"');
+    expect(client).toContain("Nada anterior a esa fecha existe para el sistema");
+  });
+
+  it("la única entrada es el aviso: el ciclo pendiente queda ELEGIDO y se confirma", () => {
+    // Del aviso se llega con el ciclo de ESA entrada; el botón "Abrir período"
+    // abre en el más atrasado (la lista ya viene ordenada así) y si no hay
+    // ninguno lo dice en vez de ofrecer algo arbitrario.
+    expect(client).toContain("function openPendingSettlement(entry: PendingPayrollSettlement) {");
+    expect(client).toContain("setOpenTarget(entry);");
+    expect(client).toContain("setOpenTarget(pendingSettlements[0] ?? null);");
+    expect(client).toContain("onClick={() => openPendingSettlement(entry)}");
+    expect(client).toContain("No hay ciclos cerrados sin liquidar en esta sede: no hay período que abrir.");
+    // Confirmar no elige nada: el botón se bloquea sin ciclo pendiente elegido.
+    expect(client).toContain("disabled={busy || openTarget === null}");
+    // El diálogo NO puede abrir un rango que no salga de un ciclo pendiente.
+    const open = dialog();
+    expect(open).toContain("pendingSettlements.map((entry) => (");
+    expect(open).not.toContain("openResolution.start_date =");
+  });
+
+  it("F9/F10: el envío bloquea con la regla de LIQUIDACIÓN y la de la FECHA de arranque", () => {
+    // La guarda del envío (`handleOpen`) repite las DOS verdades del ciclo
+    // elegido con las MISMAS funciones puras del aviso y del servicio, así el
+    // diálogo no puede contradecir a quien lo abrió.
     const submit = client.slice(
       client.indexOf("async function handleOpen"),
       client.indexOf("function closeOpenDialog"),
     );
     expect(submit.length).toBeGreaterThan(500);
     expect(submit).toMatch(
-      /isPayrollCycleSettled\(\{\s*periods,\s*frequency: openFrequency,\s*cycle: \{ start_date: startDate, end_date: endDate \},\s*\}\)/,
+      /isPayrollCycleSettled\(\{\s*periods,\s*frequency: openTarget\.frequency,\s*cycle: \{ start_date: startDate, end_date: endDate \},\s*\}\)/,
     );
     expect(submit).toContain("Este ciclo ya tiene su liquidación para la cadencia elegida");
-    // El piso del día siguiente YA NO decide el envío (aserción MOVIDA: antes se
-    // exigía `const minimumStart = nextPeriodStartDate(...)`): contradecía a un
-    // ciclo genuinamente sin liquidar —el hueco a mitad de la historia que el aviso
-    // ofrece abrir— y rompía su promesa con un "no puede empezar antes de X".
+    // F10: y el rango anterior al arranque se rechaza NOMBRANDO LA FECHA, con la
+    // MISMA regla que el aviso y el servicio (`isRangeBeforePayrollStart`).
+    expect(submit).toMatch(
+      /isRangeBeforePayrollStart\(\{ payrollStartDate, startDate, endDate \}\)/,
+    );
+    expect(submit).toContain(
+      'setOpenError(\n        `El período no puede empezar antes del ${payrollStartDate}: la nómina de esta sede arranca ese día y nada anterior existe para el sistema.`,\n      );',
+    );
+    // El piso del "día siguiente al último período" YA NO existe en ninguna forma.
     expect(submit).not.toContain("nextPeriodStartDate");
-    expect(submit).not.toContain("El período no puede empezar antes del");
     expect(submit).not.toContain("minimumStart");
     // CONTROL NEGATIVO: el detector no es un sello de goma — el texto VIEJO trae
-    // las dos señales que la guarda prohíbe y ninguna de las que exige.
+    // el piso prohibido y ninguna de las dos reglas que la guarda exige.
     const viejo = [
       "const minimumStart = nextPeriodStartDate(periods, openFrequency);",
       'setOpenError(`El período no puede empezar antes del ${formatFullDate(minimumStart)}: ese es el día siguiente al fin del último período registrado de esta cadencia.`);',
     ].join("\n");
     expect(viejo).not.toContain("isPayrollCycleSettled({");
+    expect(viejo).not.toContain("isRangeBeforePayrollStart(");
     expect(viejo).toContain("minimumStart");
-    expect(viejo).toContain("El período no puede empezar antes del");
-    // Y la fecha sugerida SÍ sigue saliendo del helper: no se tiró la función.
-    expect(client).toContain("const suggestedStart = nextPeriodStartDate(periods, openFrequency);");
+    // El botón que decide el envío vive en el diálogo: sin ciclo pendiente no hay
+    // envío posible.
+    expect(client).toContain("disabled={busy || openTarget === null}");
   });
 
-  it("F7: el diálogo elige la cadencia y el CICLO; el rango se deriva", () => {
-    // El control de cadencia existe con su etiqueta legible.
-    expect(client).toContain("Cadencia del período");
-    expect(client).toContain('id="payroll-open-frequency"');
-    // El selector de ciclos existe y muestra el rango YA calculado en la opción.
-    expect(client).toContain("Ciclo a liquidar");
-    expect(client).toContain('id="payroll-open-cycle"');
-    expect(client).toContain("{option.label}");
-    // La lista sale de la función pura y el rango, del cierre elegido.
-    expect(client).toContain("lastCompletedPayrollCycles({");
-    expect(client).toContain("payrollCycleRange({");
-    // Viaja en el cuerpo de la apertura: cadencia + cierre de ciclo, sin rango.
-    expect(client).toContain("frequency: openFrequency,");
-    expect(client).toContain("cycle_end_date: openCycleEnd,");
-  });
-
-  it("F7: no queda la opción 'Sin cadencia' ni campos de fecha libres", () => {
-    expect(client).not.toContain('label: "Sin cadencia"');
-    // Los dos campos del rango desaparecieron del diálogo de apertura.
-    expect(client).not.toContain('id="payroll-open-start"');
-    expect(client).not.toContain('id="payroll-open-end"');
-    // El prefill de la fecha con el helper ya no existe: el ciclo por defecto
-    // sale de `lastCompletedPayrollCycles`.
-    expect(client).not.toContain('setStartDate(nextPeriodStartDate(periods) ?? "")');
-    expect(client).toContain("setOpenCycleEnd(");
+  it("control negativo: el marcado VIEJO (dos selectores) no pasa las guardas nuevas", () => {
+    const viejo = [
+      '<DialogTitle>Abrir período</DialogTitle>',
+      '<DialogDescription>Elija la cadencia y el ciclo.</DialogDescription>',
+      "Cadencia del período",
+      '<select id="payroll-open-frequency" value={openFrequency}>',
+      '{OPEN_PAY_FREQUENCY_OPTIONS.map((option) => (',
+      '<select id="payroll-open-cycle" value={openCycleEnd}>',
+      '{openCycleOptions.map((option) => (',
+      '<option key={option.end_date} value={option.end_date}>',
+      '{option.label}',
+      '{cycleMarker(option)}',
+      '</select>',
+      'id="payroll-open-start"',
+      'type="date"',
+      '</DialogContent>',
+    ].join("\n");
+    // El viejo trae EXACTAMENTE lo que la guarda prohíbe dentro del diálogo...
+    expect(viejo).toContain("Cadencia del período");
+    expect(viejo).toContain('<select id="payroll-open-cycle"');
+    expect(viejo).toContain('type="date"');
+    expect(viejo).toContain("cycleMarker");
+    expect(viejo).toContain("openFrequency");
+    // ...y NINGUNA de las señales que la guarda exige.
+    expect(viejo).not.toContain('name="payroll-open-target"');
+    expect(viejo).not.toContain("Ciclo a liquidar");
+    expect(viejo).not.toContain("setOpenTarget(entry);");
+    expect(viejo).not.toContain("resolveOpenPayrollRange({");
+    // Y el fuente REAL no los tiene (control positivo del mismo detector).
+    const open = dialog();
+    expect(open).not.toContain('id="payroll-open-cycle"');
+    expect(open).not.toContain("cycleMarker");
+    expect(open).toContain('name="payroll-open-target"');
   });
 
   it("control negativo: nada de piso vacío, literal ni prefill hardcodeado", () => {
     expect(client).not.toMatch(/min=\{undefined\}/);
-    expect(client).not.toMatch(/min="20\d{2}-\d{2}-\d{2}"/);
     expect(client).not.toMatch(/setStartDate\("20\d{2}-\d{2}-\d{2}"\)/);
     // No conviven dos implementaciones de "día siguiente".
     expect(client).not.toContain("function nextDay(");
     expect(client).not.toContain("latestEndDate(");
+    expect(client).not.toContain("lastCompletedPayrollCycles(");
+    expect(client).not.toContain("nextPeriodStartDate(");
   });
 });
 
@@ -11311,7 +11427,7 @@ describe("payroll-client: el motivo del ajuste (F8, guarda de fuente)", () => {
   });
 });
 
-describe("payroll-client: el aviso de ciclos pendientes y las marcas del selector (F9, guarda de fuente)", () => {
+describe("payroll-client: el aviso de ciclos pendientes y la entrada DERIVADA del diálogo (F9/F10, guarda de fuente)", () => {
   const source = readFileSync(join(process.cwd(), "app", "payroll", "payroll-client.tsx"), "utf8");
 
   it("piso anti-vacío: el cliente se leyó de verdad", () => {
@@ -11320,13 +11436,17 @@ describe("payroll-client: el aviso de ciclos pendientes y las marcas del selecto
   });
 
   it("la lista sale de la función pura y de los datos que la pantalla YA tiene", () => {
-    // Sin lectura nueva: los períodos (estado del cliente) y la planta que llega
-    // como prop. Un `select` por cadencia sería N consultas para el mismo dato.
+    // Sin lectura nueva: los períodos (estado del cliente), la planta que llega
+    // como prop y la fecha de arranque (prop del servidor). Un `select` por
+    // cadencia sería N consultas para el mismo dato.
     expect(source).toMatch(
-      /const pendingSettlements = props\.canAdmin\s*\?\s*pendingPayrollSettlements\(\{\s*periods,\s*employees: props\.initialEmployees,\s*referenceDate: bogotaDay\(\),/,
+      /const pendingSettlements = props\.canAdmin\s*\?\s*pendingPayrollSettlements\(\{\s*periods,\s*employees: props\.initialEmployees,\s*referenceDate: bogotaDay\(\),\s*payrollStartDate,\s*\}\)/,
     );
     // Sólo el admin: el aviso nombra a la planta de la sede.
     expect(source).toContain("props.canAdmin && pendingSettlements.length > 0");
+    // F10: la fecha llega leída del servidor (SSR) y es la MISMA cota del aviso.
+    expect(source).toContain("props.initialPayrollStartDate");
+    expect(source).toContain("payrollStartDate,\n      })");
   });
 
   it("el aviso nombra cadencia, ciclo y gente, dentro de un Alert de aviso sin rol a mano", () => {
@@ -11344,28 +11464,39 @@ describe("payroll-client: el aviso de ciclos pendientes y las marcas del selecto
     // Ningún `role=` escrito a mano en el aviso (movería el pin de feedback-batch2).
     const notice = source.indexOf('<Alert variant="warning" className="mt-3">');
     expect(source.slice(notice, notice + 220)).not.toMatch(/\brole\s*=/);
+    // F10: con la fecha sin configurar, el aviso INVITA a fijarla (y el control
+    // no se esconde: se sigue viendo arriba).
+    expect(source).toContain("Fije la fecha de inicio de la nómina (arriba) para que el sistema sepa desde cuándo");
+    expect(source).toContain('id="payroll-start-date"');
   });
 
-  it("cada pendiente abre el diálogo YA posicionado en su cadencia y su ciclo", () => {
+  it("cada pendiente abre el diálogo con SU ciclo ya elegido (F10: no se elige nada más)", () => {
     expect(source).toContain("function openPendingSettlement(entry: PendingPayrollSettlement) {");
-    expect(source).toContain("setOpenFrequency(entry.frequency);");
-    expect(source).toContain("setPinnedCycle(entry);");
-    expect(source).toContain("setOpenCycleEnd(entry.end_date);");
+    expect(source).toContain("setOpenTarget(entry);");
     expect(source).toContain("onClick={() => openPendingSettlement(entry)}");
-    // Y el ciclo anclado entra al selector aunque sea más viejo que los últimos
-    // ofrecidos: elegir un ciclo distinto abriría el período equivocado.
-    expect(source).toMatch(
-      /\? \[pinnedCycle, \.\.\.recentCycles\]\s*: recentCycles;/,
-    );
+    // El botón "Abrir período" nace en el más atrasado (la lista ya viene
+    // ordenada así; `null` cuando no hay ninguno: el diálogo lo dice).
+    expect(source).toContain("setOpenTarget(pendingSettlements[0] ?? null);");
+    // El estado viejo del selector (cadencia + ciclo + ancla) YA NO EXISTE: si
+    // volviera, volvería la elección arbitraria que F10 quitó.
+    expect(source).not.toContain("setOpenFrequency(");
+    expect(source).not.toContain("setOpenCycleEnd(");
+    expect(source).not.toContain("setPinnedCycle(");
+    expect(source).not.toContain("pinnedCycle");
   });
 
-  it("el selector marca cada ciclo como liquidado o pendiente con la MISMA regla del aviso", () => {
-    expect(source).toContain(
-      "return isPayrollCycleSettled({ periods, frequency: openFrequency, cycle })",
-    );
-    expect(source).toContain('? " — ya liquidado"');
-    expect(source).toContain(': " — por liquidar"');
-    expect(source).toMatch(/\{option\.label\}\s*\{cycleMarker\(option\)\}/);
+  it("el aviso y el diálogo comparten la MISMA regla de liquidación y de fecha", () => {
+    // La regla de "ya liquidado" sigue siendo la misma del aviso, pero ahora
+    // decide sobre el ciclo ELEGIDO (no sobre una opción de un selector).
+    expect(source).toContain("isPayrollCycleSettled({");
+    expect(source).toContain("frequency: openTarget.frequency,");
+    expect(source).toContain("cycle: { start_date: startDate, end_date: endDate },");
+    expect(source).not.toContain("frequency: openFrequency");
+    // La marca del selector desapareció con el selector: no hay dos verdades
+    // sobre el mismo ciclo (la del aviso y la de la opción).
+    expect(source).not.toContain("cycleMarker");
+    expect(source).not.toContain('? " — ya liquidado"');
+    expect(source).not.toContain(': " — por liquidar"');
   });
 
   it("control negativo: con el marcado viejo la guarda no pasa", () => {
@@ -11392,5 +11523,674 @@ describe("payroll-client: el aviso de ciclos pendientes y las marcas del selecto
       "return `Falta liquidar el ciclo ${entry.frequency} ${entry.label} (${employees}: ${who}).`;",
     ).not.toBe(viejo);
     expect(source).not.toContain("<p>Períodos</p>");
+  });
+});
+
+/* ==========================================================================
+   F10: la fecha de arranque de la nómina de la sede (migración 068).
+
+   El sistema conoce DESDE CUÁNDO opera la nómina —«la fecha de inicio de la
+   implementación»— y nada anterior existe para él: el aviso de pendientes no
+   ofrece ciclos anteriores, la apertura no los acepta y el PRIMER ciclo de cada
+   cadencia se recorta a la fecha y se prorroga con la regla de F5. Las dos
+   superficies usan la MISMA regla (`isRangeBeforePayrollStart`) y el ÚNICO
+   validador de la forma del rango (`resolveOpenPayrollRange`).
+   ========================================================================== */
+describe("payroll: la fecha de arranque de la nómina (F10, función pura)", () => {
+  /** Jueves 2026-10-01: el ciclo semanal que lo contiene cierra el sábado 3. */
+  const START = "2026-10-01";
+
+  type Period = { start_date: string; end_date: string; frequency?: string | null };
+
+  function resolve(
+    frequency: "semanal" | "quincenal" | "mensual",
+    cycleEndDate: string,
+    payrollStartDate: string | null = START,
+    periods: Period[] = [],
+  ) {
+    return resolveOpenPayrollRange({ frequency, cycleEndDate, payrollStartDate, periods });
+  }
+
+  it("acepta el ciclo COMPLETO cuando empieza en la fecha o después", () => {
+    // El ciclo que EMPIEZA el mismo día del arranque ya es completo: la fecha es
+    // su primer día, no un recorte.
+    expect(resolve("semanal", "2026-10-03", "2026-09-27")).toEqual({
+      ok: true,
+      start_date: "2026-09-27",
+      end_date: "2026-10-03",
+      trimmed: false,
+    });
+    // Y un ciclo posterior también.
+    expect(resolve("semanal", "2026-10-10")).toEqual({
+      ok: true,
+      start_date: "2026-10-04",
+      end_date: "2026-10-10",
+      trimmed: false,
+    });
+  });
+
+  it("el PRIMER ciclo —el que CONTIENE la fecha— se recorta a la fecha, en las tres cadencias", () => {
+    expect(resolve("semanal", "2026-10-03")).toEqual({
+      ok: true,
+      start_date: "2026-10-01",
+      end_date: "2026-10-03",
+      trimmed: true,
+    });
+    expect(resolve("quincenal", "2026-10-10")).toEqual({
+      ok: true,
+      start_date: "2026-10-01",
+      end_date: "2026-10-10",
+      trimmed: true,
+    });
+    expect(resolve("mensual", "2026-10-24")).toEqual({
+      ok: true,
+      start_date: "2026-10-01",
+      end_date: "2026-10-24",
+      trimmed: true,
+    });
+  });
+
+  it("un ciclo que CIERRA antes de la fecha se rechaza; un cierre que no es sábado no es un ciclo", () => {
+    // El ciclo semanal que cierra el 26 de septiembre terminó ANTES del arranque.
+    expect(resolve("semanal", "2026-09-26")).toEqual({ ok: false, reason: "before-start" });
+    expect(resolve("quincenal", "2026-09-26")).toEqual({ ok: false, reason: "before-start" });
+    // El sábado del cierre es parte del ciclo; el domingo no es un cierre.
+    expect(resolve("semanal", "2026-10-04")).toEqual({ ok: false, reason: "not-a-cycle" });
+  });
+
+  it("el recorte SÓLO vale como PRIMERO: con historia en la MISMA cadencia se rechaza", () => {
+    const semanal: Period = { start_date: "2026-11-01", end_date: "2026-11-07", frequency: "semanal" };
+    expect(resolve("semanal", "2026-10-03", START, [semanal])).toEqual({
+      ok: false,
+      reason: "not-first-cycle",
+    });
+    // La historia de OTRA cadencia no tacha el primer ciclo de ésta.
+    expect(
+      resolve("semanal", "2026-10-03", START, [{ ...semanal, frequency: "mensual" }]),
+    ).toMatchObject({ ok: true, start_date: "2026-10-01", trimmed: true });
+    // Un período HEREDADO sin cadencia tampoco es historia de la cadencia.
+    expect(resolve("semanal", "2026-10-03", START, [{ ...semanal, frequency: null }])).toMatchObject(
+      { ok: true, trimmed: true },
+    );
+    // Y un ciclo COMPLETO posterior sigue siendo válido con historia.
+    expect(resolve("semanal", "2026-10-10", START, [semanal])).toMatchObject({
+      ok: true,
+      start_date: "2026-10-04",
+      trimmed: false,
+    });
+  });
+
+  it("sin fecha configurada no hay cota ni recorte: la forma de hoy", () => {
+    const history: Period[] = [
+      { start_date: "2026-01-01", end_date: "2026-01-14", frequency: "quincenal" },
+    ];
+    expect(resolve("quincenal", "2026-10-10", null, history)).toEqual({
+      ok: true,
+      start_date: "2026-09-27",
+      end_date: "2026-10-10",
+      trimmed: false,
+    });
+    // Un ciclo ANTERIOR a cualquier fecha imaginada se sigue aceptando: sin fecha
+    // declarada, la cota es la historia de la sede (comportamiento de hoy).
+    expect(resolve("semanal", "2026-09-26", null)).toMatchObject({ ok: true, trimmed: false });
+    expect(
+      resolveOpenPayrollRange({ frequency: "semanal", cycleEndDate: "2026-09-26", periods: [] }),
+    ).toMatchObject({ ok: true, start_date: "2026-09-20", end_date: "2026-09-26" });
+  });
+
+  it("`isRangeBeforePayrollStart` compara por el ÚLTIMO día del rango", () => {
+    expect(
+      isRangeBeforePayrollStart({
+        payrollStartDate: null,
+        startDate: "2020-01-01",
+        endDate: "2020-01-07",
+      }),
+    ).toBe(false);
+    expect(
+      isRangeBeforePayrollStart({
+        payrollStartDate: START,
+        startDate: "2026-09-20",
+        endDate: "2026-09-26",
+      }),
+    ).toBe(true);
+    // El día del arranque todavía es parte de la nómina: cierra ahí, no antes.
+    expect(
+      isRangeBeforePayrollStart({
+        payrollStartDate: START,
+        startDate: "2026-09-27",
+        endDate: "2026-10-01",
+      }),
+    ).toBe(false);
+    // Un rango que CONTIENE la fecha no es anterior: es el primero, y se recorta.
+    expect(
+      isRangeBeforePayrollStart({
+        payrollStartDate: START,
+        startDate: "2026-09-27",
+        endDate: "2026-10-03",
+      }),
+    ).toBe(false);
+    // Una fecha imposible no acota (mismo criterio que el resto del módulo).
+    expect(
+      isRangeBeforePayrollStart({
+        payrollStartDate: "2026-02-30",
+        startDate: "2026-01-01",
+        endDate: "2026-01-07",
+      }),
+    ).toBe(false);
+  });
+
+  it("la prorrata de F5 paga el primer ciclo recortado, con los números del dueño", () => {
+    // Quincenal, 1.500.000: el primer ciclo va del arranque al sábado del ciclo
+    // (1–10 de octubre, 10 días) y paga 1.500.000 × 1/2 × 10/15 = 500.000. Esa
+    // liquidación INCLUYE la primera semana (1–3 de octubre), que no se pagó
+    // aparte; el ciclo quincenal siguiente es completo y paga 750.000.
+    const first = resolveOpenPayrollRange({
+      frequency: "quincenal",
+      cycleEndDate: "2026-10-10",
+      payrollStartDate: START,
+      periods: [],
+    });
+    expect(first).toMatchObject({ ok: true, start_date: "2026-10-01", end_date: "2026-10-10", trimmed: true });
+    if (!first.ok) throw new Error("el primer ciclo tenía que resolverse");
+    expect(
+      resolveFixedSalaryForPeriod({
+        salaryFixed: 1_500_000,
+        employeeFrequency: "quincenal",
+        periodFrequency: "quincenal",
+        startDate: first.start_date,
+        endDate: first.end_date,
+      }),
+    ).toEqual({ amount: 500_000, basis: "cadence", fraction: 1 / 2 });
+    // El ciclo completo (el que la nómina hubiera pagado sin la fecha) son
+    // 750.000: el recorte es su parte, no una cifra nueva.
+    expect(
+      resolveFixedSalaryForPeriod({
+        salaryFixed: 1_500_000,
+        employeeFrequency: "quincenal",
+        periodFrequency: "quincenal",
+        startDate: "2026-09-27",
+        endDate: "2026-10-10",
+      }).amount,
+    ).toBe(750_000);
+    // El siguiente ciclo es COMPLETO: vuelve a la fracción entera.
+    expect(
+      resolveFixedSalaryForPeriod({
+        salaryFixed: 1_500_000,
+        employeeFrequency: "quincenal",
+        periodFrequency: "quincenal",
+        startDate: "2026-10-11",
+        endDate: "2026-10-24",
+      }).amount,
+    ).toBe(750_000);
+    // Semanal: 1.500.000 × 1/4 × 3/7 = 160.714,29 → 160.714.
+    expect(
+      resolveFixedSalaryForPeriod({
+        salaryFixed: 1_500_000,
+        employeeFrequency: "semanal",
+        periodFrequency: "semanal",
+        startDate: "2026-10-01",
+        endDate: "2026-10-03",
+      }).amount,
+    ).toBe(160_714);
+    // Mensual: 1.500.000 × 1 × 24/30 = 1.200.000.
+    expect(
+      resolveFixedSalaryForPeriod({
+        salaryFixed: 1_500_000,
+        employeeFrequency: "mensual",
+        periodFrequency: "mensual",
+        startDate: "2026-10-01",
+        endDate: "2026-10-24",
+      }).amount,
+    ).toBe(1_200_000);
+  });
+});
+
+describe("payroll: los ciclos pendientes con la fecha de arranque (F10, función pura)", () => {
+  /** Domingo 2026-10-04: el último ciclo CERRADO es el sábado 2026-10-03. */
+  const REFERENCE = "2026-10-04";
+  const EMPLOYEE = { full_name: "Ana", pay_frequency: "semanal", is_active: true };
+
+  function period(start: string, end: string, frequency: string | null = "semanal") {
+    return { start_date: start, end_date: end, frequency };
+  }
+
+  it("un ciclo que cierra ANTES de la fecha no es pendiente; el que la contiene sale RECORTADO", () => {
+    const periods = [period("2026-08-09", "2026-08-15")];
+    // Sin fecha: la cota es la historia de la sede (el comportamiento de hoy) y
+    // el ciclo del 20 al 26 de septiembre SÍ se reporta.
+    const legacy = pendingPayrollSettlements({
+      periods,
+      employees: [EMPLOYEE],
+      referenceDate: REFERENCE,
+      limit: 20,
+    }).map((row) => `${row.start_date}..${row.end_date}`);
+    expect(legacy).toContain("2026-09-20..2026-09-26");
+    // Con fecha (lunes 28 de septiembre): nada ANTERIOR a esa fecha, y el ciclo
+    // que la contiene se reporta recortado — el rango que se va a abrir.
+    const bounded = pendingPayrollSettlements({
+      periods,
+      employees: [EMPLOYEE],
+      referenceDate: REFERENCE,
+      limit: 20,
+      payrollStartDate: "2026-09-28",
+    });
+    expect(bounded.map((row) => `${row.start_date}..${row.end_date}`)).toEqual([
+      "2026-09-28..2026-10-03",
+    ]);
+    expect(bounded[0]).toMatchObject({ label: "28 sep – 3 oct 2026" });
+  });
+
+  it("con la fecha configurada y SIN períodos, el aviso reporta el primer ciclo", () => {
+    // La sede nueva: todavía no liquidó nada. El primer ciclo es justamente lo
+    // que falta, y la fecha de arranque es su piso.
+    expect(
+      pendingPayrollSettlements({
+        periods: [],
+        employees: [EMPLOYEE],
+        referenceDate: REFERENCE,
+        payrollStartDate: "2026-09-28",
+      }),
+    ).toEqual([
+      {
+        frequency: "semanal",
+        start_date: "2026-09-28",
+        end_date: "2026-10-03",
+        label: "28 sep – 3 oct 2026",
+        employeeCount: 1,
+        employeeNames: ["Ana"],
+      },
+    ]);
+    // Sin fecha no hay historia que reportar: el comportamiento de hoy no cambia.
+    expect(
+      pendingPayrollSettlements({ periods: [], employees: [EMPLOYEE], referenceDate: REFERENCE }),
+    ).toEqual([]);
+  });
+
+  it("una fecha FUTURA no reporta nada hasta que cierre el ciclo que la contiene", () => {
+    const quincenal = { full_name: "Ana", pay_frequency: "quincenal", is_active: true };
+    // El lunes 5 de octubre cae en el ciclo quincenal que cierra el sábado 10. El
+    // domingo 4, el último ciclo cerrado (el 3) es ANTERIOR a la fecha.
+    expect(
+      pendingPayrollSettlements({
+        periods: [],
+        employees: [quincenal],
+        referenceDate: "2026-10-04",
+        payrollStartDate: "2026-10-05",
+      }),
+    ).toEqual([]);
+    // El domingo siguiente ese ciclo ya cerró: se reporta recortado a la fecha.
+    expect(
+      pendingPayrollSettlements({
+        periods: [],
+        employees: [quincenal],
+        referenceDate: "2026-10-11",
+        payrollStartDate: "2026-10-05",
+      })[0],
+    ).toMatchObject({
+      start_date: "2026-10-05",
+      end_date: "2026-10-10",
+      label: "5 – 10 oct 2026",
+    });
+  });
+
+  it("el aviso y el servicio dicen lo MISMO: cada entrada se resuelve al rango que reporta", () => {
+    const startDate = "2026-08-10";
+    const entries = pendingPayrollSettlements({
+      periods: [],
+      employees: [EMPLOYEE],
+      referenceDate: REFERENCE,
+      payrollStartDate: startDate,
+      limit: 20,
+    });
+    // Ocho ciclos semanales: siete completos y el primero recortado al arranque.
+    expect(entries).toHaveLength(8);
+    expect(entries).toContainEqual(
+      expect.objectContaining({ start_date: "2026-08-10", end_date: "2026-08-15" }),
+    );
+    expect(entries).toContainEqual(
+      expect.objectContaining({ start_date: "2026-09-27", end_date: "2026-10-03" }),
+    );
+    for (const entry of entries) {
+      expect(
+        resolveOpenPayrollRange({
+          frequency: entry.frequency,
+          cycleEndDate: entry.end_date,
+          payrollStartDate: startDate,
+          periods: [],
+        }),
+        entry.label,
+      ).toMatchObject({
+        ok: true,
+        start_date: entry.start_date,
+        end_date: entry.end_date,
+      });
+    }
+  });
+});
+
+describe("payroll: la fecha de arranque de la nómina de la sede (F10, servicio)", () => {
+  const SEDE = payrollPagedStub.SEDE_ID;
+  const ACTOR: PayrollActor = { userId: "u-1", sedeId: SEDE, roles: ["admin"] };
+
+  function seed(args: { periods?: Array<Record<string, unknown>>; startDate?: string | null } = {}) {
+    payrollPagedStub.tables = {
+      sedes: [{ id: SEDE, name: "Sede principal", payroll_start_date: args.startDate ?? null }],
+      payroll_periods: args.periods ?? [],
+      invoices: [],
+      invoice_items: [],
+      commission_rules: [],
+      voucher_requests: [],
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      audit_logs: [],
+    };
+  }
+
+  function periodRow(
+    id: string,
+    start: string,
+    end: string,
+    frequency: string | null = "semanal",
+  ) {
+    return {
+      id,
+      sede_id: SEDE,
+      start_date: start,
+      end_date: end,
+      frequency,
+      status: "borrador",
+      created_by: "u-1",
+      closed_at: null,
+      created_at: "2026-09-01T00:00:00.000Z",
+    };
+  }
+
+  function employeeRow() {
+    return {
+      id: "emp-1",
+      sede_id: SEDE,
+      user_id: null,
+      full_name: "Ana López",
+      employee_code: "E-01",
+      document: "1000",
+      phone: null,
+      position: null,
+      payout_mode: "normal",
+      email: null,
+      birth_date: null,
+      pay_type: "fijo",
+      pay_frequency: "semanal",
+      salary_fixed: 1500000,
+      commission_percent: null,
+      is_active: true,
+    };
+  }
+
+  const periodInserts = () =>
+    payrollPagedStub.inserts.filter((entry) => entry.table === "payroll_periods");
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  it("configurar la fecha va y vuelve; limpiarla también, y una fecha inválida no escribe", async () => {
+    seed({ startDate: null });
+    expect(await getPayrollStartDate(SEDE)).toBeNull();
+    expect(await setPayrollStartDate({ payroll_start_date: "2026-10-05" }, ACTOR)).toEqual({
+      payroll_start_date: "2026-10-05",
+    });
+    expect(await getPayrollStartDate(SEDE)).toBe("2026-10-05");
+    const writes = payrollPagedStub.updates.filter((entry) => entry.table === "sedes").length;
+    const failure: unknown = await setPayrollStartDate(
+      { payroll_start_date: "05/10/2026" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(payrollPagedStub.updates.filter((entry) => entry.table === "sedes").length).toBe(writes);
+    // Volver a «sin configurar» es un estado legal, no un error.
+    expect(await setPayrollStartDate({ payroll_start_date: null }, ACTOR)).toEqual({
+      payroll_start_date: null,
+    });
+    expect(await getPayrollStartDate(SEDE)).toBeNull();
+  });
+
+  it("sin la migración 068 la lectura no configura y la escritura avisa", async () => {
+    seed({ startDate: null });
+    // 42703 = undefined_column: la columna todavía no existe en la base.
+    payrollPagedStub.failOn = { table: "sedes", filter: "id", code: "42703" };
+    expect(await getPayrollStartDate(SEDE)).toBeNull();
+    const failure: unknown = await setPayrollStartDate(
+      { payroll_start_date: "2026-10-05" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "VALIDATION", status: 409 });
+    expect((failure as PayrollError).message).toContain("068");
+  });
+
+  it("rechaza abrir un período anterior a la fecha, nombrando la fecha", async () => {
+    seed({ startDate: "2026-10-01" });
+    const failure: unknown = await openPayrollPeriod(
+      { frequency: "semanal", cycle_end_date: "2026-09-26" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect((failure as PayrollError).message).toContain("2026-10-01");
+    expect((failure as PayrollError).message).toContain("antes");
+    // La guarda corre ANTES del INSERT: nada se escribió.
+    expect(periodInserts()).toHaveLength(0);
+  });
+
+  it("el PRIMER ciclo de la cadencia se abre RECORTADO a la fecha", async () => {
+    seed({ startDate: "2026-10-01" });
+    const row = await openPayrollPeriod(
+      { frequency: "quincenal", cycle_end_date: "2026-10-10" },
+      ACTOR,
+    );
+    expect(row).toMatchObject({
+      start_date: "2026-10-01",
+      end_date: "2026-10-10",
+      frequency: "quincenal",
+      status: "borrador",
+    });
+    expect(periodInserts()).toHaveLength(1);
+    expect(periodInserts()[0].payload).toMatchObject({
+      start_date: "2026-10-01",
+      end_date: "2026-10-10",
+      frequency: "quincenal",
+    });
+  });
+
+  it("un ciclo que necesitaría recorte cuando la cadencia ya tiene períodos se rechaza", async () => {
+    // El ciclo del 27 sep al 3 oct contiene la fecha, pero la cadencia semanal
+    // ya tiene su período: el recorte ya no sería «el primero».
+    seed({
+      startDate: "2026-10-01",
+      periods: [periodRow("p-1", "2026-11-01", "2026-11-07")],
+    });
+    const failure: unknown = await openPayrollPeriod(
+      { frequency: "semanal", cycle_end_date: "2026-10-03" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect((failure as PayrollError).message).toContain("2026-10-01");
+    expect(periodInserts()).toHaveLength(0);
+  });
+
+  it("un ciclo COMPLETO sigue abriéndose en las tres cadencias con la fecha configurada", async () => {
+    const cases = [
+      { frequency: "semanal", cycle_end_date: "2026-10-10", start: "2026-10-04", end: "2026-10-10" },
+      { frequency: "quincenal", cycle_end_date: "2026-10-10", start: "2026-09-27", end: "2026-10-10" },
+      { frequency: "mensual", cycle_end_date: "2026-10-24", start: "2026-09-27", end: "2026-10-24" },
+    ] as const;
+    for (const item of cases) {
+      seed({ startDate: "2026-09-01" });
+      const row = await openPayrollPeriod(
+        { frequency: item.frequency, cycle_end_date: item.cycle_end_date },
+        ACTOR,
+      );
+      expect(row, item.frequency).toMatchObject({
+        start_date: item.start,
+        end_date: item.end,
+        frequency: item.frequency,
+      });
+    }
+  });
+
+  it("sin fecha (o sin la columna) se conserva el comportamiento de hoy", async () => {
+    // Ni siquiera hay fila de sede: la lectura devuelve null y el período se abre
+    // como siempre (la cota sigue siendo la historia de la sede).
+    payrollPagedStub.tables = {
+      payroll_periods: [],
+      invoices: [],
+      invoice_items: [],
+      commission_rules: [],
+      voucher_requests: [],
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      audit_logs: [],
+    };
+    expect(await getPayrollStartDate(SEDE)).toBeNull();
+    expect(
+      await openPayrollPeriod({ frequency: "semanal", cycle_end_date: "2026-09-05" }, ACTOR),
+    ).toMatchObject({ start_date: "2026-08-30", end_date: "2026-09-05" });
+    // Con la fecha en NULL tampoco hay cota: un ciclo muy anterior se abre igual.
+    seed({ startDate: null });
+    expect(
+      await openPayrollPeriod({ frequency: "semanal", cycle_end_date: "2026-09-05" }, ACTOR),
+    ).toMatchObject({ start_date: "2026-08-30", end_date: "2026-09-05" });
+  });
+
+  it("el resumen de la sede acota el aviso y reporta el primer ciclo de una sede sin historia", async () => {
+    // Reloj congelado en el domingo 2026-10-04 (Bogotá), la misma convención de
+    // las pruebas de F9: el último ciclo cerrado es el sábado 2026-10-03.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-04T15:00:00.000Z"));
+    try {
+      seed({ startDate: "2026-09-28" });
+      payrollPagedStub.tables.employees = [employeeRow()];
+      const overview = await listPayrollOverview(SEDE);
+      expect(overview.pendingSettlements).toEqual([
+        {
+          frequency: "semanal",
+          start_date: "2026-09-28",
+          end_date: "2026-10-03",
+          label: "28 sep – 3 oct 2026",
+          employeeCount: 1,
+          employeeNames: ["Ana López"],
+        },
+      ]);
+      // Sin fecha configurada, la MISMA sede sin períodos no reporta nada.
+      seed({ startDate: null });
+      payrollPagedStub.tables.employees = [employeeRow()];
+      const legacy = await listPayrollOverview(SEDE);
+      expect(legacy.pendingSettlements).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("la lectura y la escritura van a la columna de la 068 (guarda de fuente)", () => {
+    const service = readFileSync(
+      join(process.cwd(), "src", "features", "payroll", "service.ts"),
+      "utf8",
+    );
+    expect(service).toContain('.from("sedes")');
+    expect(service).toContain('.select("id, payroll_start_date")');
+    expect(service).toContain("update({ payroll_start_date: parsed.data.payroll_start_date })");
+  });
+});
+
+describe("payroll: la fecha de arranque de la nómina por la action y por SSR (F10)", () => {
+  const SEDE = payrollPagedStub.SEDE_ID;
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  function seedSede(startDate: string | null = null) {
+    payrollPagedStub.tables = {
+      sedes: [{ id: SEDE, name: "Sede principal", payroll_start_date: startDate }],
+    };
+  }
+
+  it("el admin la escribe y la lee por la action; los demás roles no la tocan", async () => {
+    seedSede(null);
+    payrollPagedStub.session = { userId: "u-admin", sedeId: SEDE, roles: ["admin"] };
+    expect(await setPayrollStartDateAction({ payroll_start_date: "2026-10-05" })).toEqual({
+      success: true,
+      data: { payroll_start_date: "2026-10-05" },
+    });
+    expect(await getPayrollStartDateAction()).toEqual({ success: true, data: "2026-10-05" });
+    // La caja abre vales, no configura la nómina: la guarda es `requirePayrollAdmin`.
+    payrollPagedStub.session = { userId: "u-caja", sedeId: SEDE, roles: ["caja"] };
+    const deniedWrite = await setPayrollStartDateAction({ payroll_start_date: "2027-01-01" });
+    expect(deniedWrite).toMatchObject({ success: false, code: "FORBIDDEN" });
+    // Y el empleado tampoco la lee: es configuración de la sede.
+    payrollPagedStub.session = { userId: "u-emp", sedeId: SEDE, roles: ["empleado"] };
+    const deniedRead = await getPayrollStartDateAction();
+    expect(deniedRead).toMatchObject({ success: false, code: "FORBIDDEN" });
+    // Ninguno de los dos rechazos escribió: la fecha sigue siendo la del admin.
+    expect(await getPayrollStartDate(SEDE)).toBe("2026-10-05");
+  });
+
+  it("un fallo del servicio se devuelve con su código, no como un éxito vacío", async () => {
+    seedSede(null);
+    payrollPagedStub.session = { userId: "u-admin", sedeId: SEDE, roles: ["admin"] };
+    const invalid = await setPayrollStartDateAction({ payroll_start_date: "05/10/2026" });
+    expect(invalid).toMatchObject({ success: false, code: "VALIDATION" });
+    expect(await getPayrollStartDate(SEDE)).toBeNull();
+  });
+
+  it("la página la lee con el servicio y la pasa como valor inicial (SSR)", () => {
+    const page = readFileSync(join(process.cwd(), "app", "payroll", "page.tsx"), "utf8");
+    // Sólo el admin: al empleado se le manda su recibo, no la configuración de
+    // la sede (la action también rechaza a cualquier otro rol).
+    expect(page).toContain("canAdmin ? getPayrollStartDate(sedeId) : null");
+    expect(page).toContain("initialPayrollStartDate={payrollStartDate ?? null}");
+    // Control negativo: la lectura NO se hizo para todos los roles.
+    expect(page).not.toContain("getPayrollStartDate(sedeId),\n  ]);");
+  });
+});
+
+describe("migración 068_payroll_start_date.sql (F10)", () => {
+  const migration = (): { raw: string; sql: string } => {
+    const raw = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "068_payroll_start_date.sql"),
+      "utf8",
+    );
+    return {
+      raw,
+      sql: raw
+        .split("\n")
+        .filter((line) => !line.trimStart().startsWith("--"))
+        .join("\n"),
+    };
+  };
+
+  it("agrega la columna con su COMMENT y explica qué significa NULL", () => {
+    const { raw, sql } = migration();
+    expect(sql).toContain("ADD COLUMN IF NOT EXISTS payroll_start_date date NULL");
+    expect(raw).toContain("COMMENT ON COLUMN public.sedes.payroll_start_date IS");
+    expect(raw).toContain("NULL = todavía NO configurada");
+    expect(raw).toContain("Nada ANTERIOR a esta fecha existe para el sistema");
+    // La numeración estaba libre y el archivo la justifica.
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("es idempotente, no migra datos y no inventa una fecha", () => {
+    const { sql } = migration();
+    expect(sql.match(/ALTER TABLE public\.sedes/g)).toHaveLength(1);
+    expect(sql).toContain("IF NOT EXISTS");
+    expect(sql).not.toMatch(/\bINSERT\b/i);
+    expect(sql).not.toMatch(/\bUPDATE\s+public/i);
+    expect(sql).not.toMatch(/\bDELETE\b/i);
+    expect(sql).not.toMatch(/NOT NULL/);
+    // Sin DEFAULT: ninguna sede queda con una fecha que el dueño no eligió.
+    expect(sql).not.toMatch(/DEFAULT/i);
   });
 });

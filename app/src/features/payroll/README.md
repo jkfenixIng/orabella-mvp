@@ -85,6 +85,10 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   `POST /vouchers/:id/approve`, `POST /vouchers/:id/reject`,
   `GET/POST /voucher-settings` (topes; extra fuera del listado mínimo para
   la UI).
+- Fecha de inicio de la nómina (migración `068_payroll_start_date.sql`):
+  `sedes.payroll_start_date date NULL` — la fecha desde la que la nómina OPERA
+  en la sede. `NULL` = todavía no configurada (y el módulo se comporta como hoy).
+  F10: ver "Fecha de inicio de la nómina de la sede".
 - UI (`/payroll`, español): periodos (abrir, ver, calcular con ajustes
   bonos/otros por empleado y su motivo obligatorio —F8—, tabla
   fijo/comisiones/bonos/vales/otros/motivo/neto
@@ -365,7 +369,7 @@ montos en blanco (`—`), que es como ya se renderiza un empleado sin ítem; la
 tabla del período (cerrado o ya calculado) sólo lista ítems, así que no lo
 inventa con ceros.
 
-### La fecha sugerida, por cadencia (ya no es la guarda del envío)
+### El piso por cadencia: nunca fue la guarda del envío
 
 `nextPeriodStartDate` acepta la cadencia y sólo mira los períodos del MISMO
 cubo: devuelve el día siguiente al fin más lejano de ese ciclo. Un período de
@@ -373,18 +377,20 @@ otra cadencia puede superponerse A PROPÓSITO y no la mueve. Sin cadencia, el cu
 es el vacío (`coalesce(frequency, '')`) y sólo acotan los períodos sin cadencia,
 que es la protección heredada.
 
-F9: ese valor es SÓLO la **sugerencia** que el diálogo muestra para el ciclo que
-sigue; NO es la guarda del envío. Como piso era más estricto que el servidor
+F9/F10: ese valor NO es la guarda del envío, y desde F10 tampoco se muestra en
+el diálogo (que no pregunta nada). Como piso era más estricto que el servidor
 —floorea el inicio en el día siguiente al `end_date` más lejano, no en el
 "próximo ciclo sin liquidar"—, un ciclo de un **hueco a mitad de la historia**
 (una cadencia que nunca se liquidó mientras las otras sí, o un borrador borrado
 entre ciclos cerrados) caía por debajo del piso y el diálogo rechazaba con "el
 período no puede empezar antes de X" el ciclo que el aviso acababa de ofrecer.
-La guarda del envío (`handleOpen`) es ahora la MISMA regla del aviso y de las
-marcas del selector: **un ciclo ya liquidado no se puede abrir**
-(`isPayrollCycleSettled` sobre el ciclo derivado) y cualquier ciclo sin liquidar
-pasa para que decida el servidor (`openPayrollPeriod`). La guarda de solape del
-mismo cubo se conserva, con el mensaje que nombra el período en conflicto.
+La guarda del envío (`handleOpen`) es la MISMA regla del aviso: **un ciclo ya
+liquidado no se puede abrir** (`isPayrollCycleSettled` sobre el ciclo elegido) y
+cualquier ciclo sin liquidar pasa para que decida el servidor
+(`openPayrollPeriod`). F10 agregó la segunda verdad al mismo lugar:
+`isRangeBeforePayrollStart` rechaza el ciclo anterior al arranque de la nómina
+nombrando la fecha. La guarda de solape del mismo cubo se conserva, con el
+mensaje que nombra el período en conflicto.
 
 ## Ciclo cerrado del período (F7)
 
@@ -421,7 +427,9 @@ referencia. Un ciclo se completa cuando ya pasó su sábado; el domingo se liqui
 la semana que cerró el sábado anterior.
 - `lastCompletedPayrollCycles({ frequency, referenceDate, count })`: los últimos
 ciclos completados, el más reciente PRIMERO, cada uno con su `label` y su rango.
-Es la lista del selector; el primero es el ciclo por defecto.
+F10: ya no alimenta ningún selector —el diálogo no pregunta ciclos—; sigue siendo
+la derivación pura de "qué ciclos ya cerraron" (la usan las pruebas y cualquier
+superficie que necesite esa lista).
 - `isPayrollCycleRange({ frequency, startDate, endDate })`: **true solo si** el
 rango empieza DOMINGO, termina SÁBADO y dura 7, 14 o 28 días contando los dos
 extremos. Un lunes, un rango de 8/13/29 días, uno corrido un día o uno del
@@ -432,14 +440,15 @@ largo de otra cadencia son `false`.
 `openPeriodSchema` exige `frequency` y `cycle_end_date` (el sábado de cierre).
 `start_date`/`end_date` siguen aceptándose por compatibilidad, pero son una
 segunda opinión: si no coinciden con el ciclo derivado, el envío se rechaza
-(`VALIDATION`). `openPayrollPeriod` DERIVA `start_date`/`end_date` con
-`payrollCycleRange` y no acepta un rango arbitrario; la guarda de solape, la
-regla de ciclo ya liquidado (la del envío del diálogo) y el mapeo de `23P01`
-siguen vigentes. Con los ciclos embaldosando el calendario, la guarda por
-cadencia es lo que impide liquidar dos veces el mismo ciclo: el semanal y el
-mensual se superponen a propósito, dos del mismo ciclo no. Un período heredado
-sin cadencia tampoco se puede tapar con uno nuevo con cadencia: ver "La guarda
-de solape, acotada por cadencia".
+(`VALIDATION`). `openPayrollPeriod` DERIVA el rango con `payrollCycleRange` y,
+con la fecha de arranque configurada, con `resolveOpenPayrollRange` (ciclo
+completo o primer ciclo recortado; ver "Fecha de inicio de la nómina de la
+sede"), y no acepta un rango arbitrario; la guarda de solape, la regla de ciclo
+ya liquidado y el mapeo de `23P01` siguen vigentes. Con los ciclos embaldosando
+el calendario, la guarda por cadencia es lo que impide liquidar dos veces el
+mismo ciclo: el semanal y el mensual se superponen a propósito, dos del mismo
+ciclo no. Un período heredado sin cadencia tampoco se puede tapar con uno nuevo
+con cadencia: ver "La guarda de solape, acotada por cadencia".
 
 Un período NUEVO sin cadencia ya no es válido: "sin cadencia" desapareció del
 diálogo. Los períodos HEREDADOS con `frequency = NULL` no se tocan y siguen
@@ -455,12 +464,13 @@ intacto para los rangos que NO son un ciclo (los heredados).
 
 ### En pantalla
 
-El diálogo "Abrir período" reemplaza los dos campos de fecha por **dos
-selectores**: la cadencia y el **ciclo a liquidar**. Cada opción del selector de
-ciclos muestra su rango ya calculado (p. ej. `27 sep – 3 oct 2026`), y debajo se
-lee el rango derivado en texto. Al cambiar la cadencia, el selector se recalcula
-y se ofrece el último ciclo completado de la cadencia nueva. La nota de la
-primera liquidación (F5) y los avisos del diálogo siguen en su lugar.
+F10: el diálogo "Abrir período" NO tiene ningún control propio de rango: no hay
+campos de fecha, ni selector de cadencia, ni selector de ciclos. La única
+entrada es el aviso de ciclos cerrados sin liquidar (ver "Fecha de inicio de la
+nómina de la sede"): su ciclo queda elegido, la lista de pendientes se ofrece
+con el MÁS ATRASADO preseleccionado, y debajo se lee el rango derivado en texto.
+La nota de la primera liquidación (F5/F10) y los avisos del diálogo siguen en su
+lugar.
 
 ## Ciclos cerrados que faltan por liquidar (F9)
 
@@ -510,6 +520,13 @@ existía). Consecuencia directa y deliberada: **sin ningún período no se repor
 NADA** —una sede sin historia no tiene atraso—, y un ciclo que terminó antes del
 primer período tampoco aparece.
 
+F10 (068): cuando la sede tiene **fecha de arranque configurada**, esa fecha
+REEMPLAZA a la evidencia de la historia como cota del aviso —no se combina por el
+máximo: la fecha es la autoridad sobre dónde empieza la nómina— y el aviso sigue
+vivo aunque la sede no tenga ningún período, porque en una sede nueva el primer
+ciclo es justamente lo que falta liquidar. Ver "Fecha de inicio de la nómina de
+la sede".
+
 ### El tope
 
 `PENDING_SETTLEMENT_LIMIT` (3) ciclos **por cadencia**, tomando los más
@@ -526,19 +543,130 @@ porque es un pendiente que exige acción, no un fallo de la pantalla):
 > Falta liquidar el ciclo quincenal 20 sep – 3 oct 2026 (3 empleados con esa
 > cadencia: Ana López, Beto Ruiz y Caro Díaz).
 
-Cada entrada es un botón que abre el diálogo **ya posicionado** en su cadencia y
-su ciclo, así el ciclo atrasado no hay que buscarlo a mano. Además, el selector
-de ciclos marca cada opción con **`— ya liquidado`** o **`— por liquidar`**,
-calculado con la MISMA regla que el aviso (`isPayrollCycleSettled`), para que la
-elección deje de ser confusa. Cuando el ciclo pendiente es más antiguo que los
-últimos ofrecidos, su opción se agrega igual al selector: elegir un ciclo
-distinto del que el estado tiene elegido abriría el período equivocado.
+Cada entrada es un botón que abre el diálogo **ya posicionado** en su ciclo, así
+el atraso no hay que buscarlo a mano. F10: ese botón es la ÚNICA entrada al
+diálogo de apertura —el selector de cadencia y el de ciclos ya no existen, y la
+lista del diálogo es la de los pendientes, la más atrasada primero y
+preseleccionada—, así que el aviso y lo que se abre no pueden discrepar. La
+regla de qué está liquidado sigue siendo `isPayrollCycleSettled` (la misma del
+servicio), ahora aplicada al ciclo elegido.
 
 La pantalla deriva la lista de los períodos y la planta que YA llegan leídos (el
 resumen de la sede y `listAllEmployees`): **no agrega ninguna lectura por
 cadencia**. El servicio la expone además en `listPayrollOverview`, con UNA lectura
 más de la planta (paginada y acotada por sede) para que el resumen de la sede sea
 completo por sí solo.
+
+## Fecha de inicio de la nómina de la sede (F10, 068)
+
+Decisión del dueño (2026-10-01): el sistema tiene que saber **desde cuándo**
+opera la nómina —«la fecha de inicio de la implementación»— para no volver a
+apuntar a fechas anteriores. **Nada anterior a esa fecha existe para el
+sistema**: no se ofrece, no se liquida y no se puede abrir.
+
+`sedes.payroll_start_date date NULL` (migración 068) guarda esa fecha. Es una
+columna de la SEDE y no de cada período: sobrevive a cada liquidación y hay UNA
+sola por sede (una tabla de configuración aparte haría indistinguible «sin fila»
+de «sin configurar»). `NULL` significa «todavía no configurada» y conserva el
+comportamiento de hoy —el aviso se detiene en el arranque de la historia de la
+sede (F9)—, así que **aplicar la 068 no cambia ninguna liquidación**: el cambio
+empieza cuando el admin fija la fecha. Sin DEFAULT y sin backfill: ninguna sede
+queda con una fecha que el dueño no eligió.
+
+### La regla, en un solo lugar
+
+`isRangeBeforePayrollStart({ payrollStartDate, startDate, endDate })` es la única
+definición de «es anterior»: un rango lo es cuando su **último día** es anterior
+a la fecha. La usan las dos superficies que deciden, y por eso no pueden
+discrepar:
+
+- `pendingPayrollSettlements` no reporta un ciclo que cierre antes de la fecha.
+  Con la fecha configurada, su cota REEMPLAZA al arranque por evidencia de F9 (no
+  se combina por el máximo) y el aviso sigue aunque la sede todavía no tenga
+  períodos. El rango reportado es el que se va a ABRIR: si la fecha cae dentro
+  del ciclo, la entrada sale recortada (`28 sep – 3 oct 2026` y no
+  `27 sep – 3 oct 2026`).
+- `openPayrollPeriod` rechaza con `VALIDATION` (400), antes del INSERT, un ciclo
+  que cierre antes de la fecha y **nombra la fecha** en el mensaje.
+
+### El primer ciclo se recorta (y lo paga la prorrata de F5)
+
+`resolveOpenPayrollRange({ frequency, cycleEndDate, payrollStartDate, periods })`
+es el ÚNICO validador de la forma del rango y acepta **exactamente dos formas**:
+
+1. Un **ciclo completo** de la cadencia (domingo a sábado; 7/14/28 días). Es la
+   forma normal de todos los ciclos posteriores al primero, y también la del
+   primer ciclo cuando empieza el mismo día del arranque o después.
+2. El **primer ciclo** —el que CONTIENE la fecha de arranque— **recortado** a esa
+   fecha: empieza el día del arranque y termina el sábado de su ciclo. Sólo vale
+   como PRIMERO: si esa MISMA cadencia ya tiene períodos, el recorte se rechaza
+   (`not-first-cycle`), porque la única primera liquidación de la cadencia ya
+   ocurrió. Un período HEREDADO sin cadencia no es historia de la cadencia; sí lo
+   es la de otra cadencia.
+
+El recorte no inventa aritmética: el rango más corto lo paga la prorrata de ciclo
+parcial de F5 (`días del período / días del ciclo`). Con un sueldo mensual de
+1.500.000 y un arranque el jueves 1 de octubre de 2026:
+
+| Cadencia  | Primer ciclo        | Fracción | Prorrata | Pago      |
+| --------- | ------------------- | -------- | -------- | --------- |
+| quincenal | 1 – 10 oct (10 días) | 1/2      | 10/15    | 500.000   |
+| semanal   | 1 – 3 oct (3 días)   | 1/4      | 3/7      | 160.714   |
+| mensual   | 1 – 24 oct (24 días) | 1        | 24/30    | 1.200.000 |
+
+El caso que el dueño describió: el empleado **quincenal** cobra su primera
+liquidación del 1 al 10 de octubre (500.000) y esa liquidación **incluye la
+primera semana** (1–3 de octubre), que no se pagó aparte; el ciclo quincenal
+siguiente es completo y vuelve a 750.000.
+
+### Configurarlo
+
+`getPayrollStartDate(sedeId)` / `setPayrollStartDate({ payroll_start_date },
+actor)` en `service.ts`: la lectura y la escritura con el guard de admin en la
+superficie (`requirePayrollAdmin`), como el resto del módulo. La escritura valida
+la forma de la fecha (`setPayrollStartDateSchema`; una fecha futura es legal: la
+implementación puede arrancar en el ciclo que viene) y `null` vuelve a «sin
+configurar». Si la 068 no está aplicada (columna inexistente, `42703`), la
+lectura devuelve `null` —sin fecha, el módulo hace lo de hoy— y la escritura
+responde un mensaje accionable que nombra la migración, en vez del error crudo de
+la base.
+
+Equivalente manual, UNA línea (el control de la pantalla hace lo mismo):
+
+```sql
+UPDATE public.sedes SET payroll_start_date = '2026-10-05' WHERE id = '<sede>';
+```
+
+### En pantalla
+
+- **El control de la fecha** (sólo admin, en la pantalla de nómina): etiqueta
+  "Fecha de inicio de la nómina", el campo y la ayuda que dice que nada anterior
+  a esa fecha existe para el sistema (y que el primer ciclo de cada cadencia se
+  liquida desde ahí). Está siempre visible —tampoco cuando ya está configurada:
+  se puede corregir y se puede volver a «sin configurar» dejando el campo vacío—
+  y, cuando está en NULL, la ayuda y el aviso invitan a fijarla. Es
+  deliberadamente MÍNIMO (etiqueta, campo y ayuda, sin disposición propia)
+  porque la CONFIGURACIÓN se muda a la superficie de plataforma (super admin):
+  esta pantalla conserva la LECTURA, que es la que el aviso y el diálogo
+  necesitan. La fecha llega leída del servidor como valor inicial
+  (`initialPayrollStartDate`, mismo patrón que `initialPeriods`).
+- **El diálogo de apertura no pregunta nada**: ya no hay selector de cadencia ni
+  de ciclo, y no hay ningún campo de fecha. La única entrada es el aviso de
+  ciclos pendientes: cada entrada (o el botón "Abrir período", que nace en la
+  MÁS ATRASADA) abre el diálogo con ese ciclo ya elegido y una lista de los
+  pendientes —el más atrasado primero, preseleccionado— que sólo se confirma. El
+  rango se muestra derivado ("Del 1 oct 2026 al 10 oct 2026 (10 días)") y un
+  ciclo recortado lo dice: "Primer ciclo recortado…". Sin ciclos pendientes el
+  diálogo no ofrece nada y lo dice.
+- La guarda del envío repite las DOS verdades del servidor con las mismas
+  funciones puras: la regla de liquidación (`isPayrollCycleSettled`) y la de la
+  fecha (`isRangeBeforePayrollStart`, que rechaza nombrando la fecha). El
+  servidor sigue siendo la autoridad.
+
+Léase `getPayrollStartDate` / `setPayrollStartDate` en `service.ts` y
+`getPayrollStartDateAction` / `setPayrollStartDateAction` en `actions.ts` (solo
+admin, `requirePayrollAdmin`; declaradas en la tabla de roles de
+`tests/action-guards.test.ts`).
 
 ## Detalle de la liquidación: facturas y vales (F6)
 

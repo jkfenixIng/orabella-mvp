@@ -17,6 +17,7 @@ import {
   openPayrollPeriodAction,
   payPayrollExtraAction,
   payPayrollItemAction,
+  setPayrollStartDateAction,
 } from "@/src/features/payroll/actions";
 import { getInvoiceAction } from "@/src/features/billing/actions";
 import type {
@@ -36,9 +37,7 @@ import {
   detailLineCommissionOrigin,
   groupPayrollPeriodsByMonth,
   isPayrollCycleSettled,
-  lastCompletedPayrollCycles,
-  nextPeriodStartDate,
-  payrollCycleRange,
+  isRangeBeforePayrollStart,
   payrollEmployeeName,
   payrollExtraGuide,
   payrollExtraKindSchema,
@@ -46,6 +45,8 @@ import {
   payrollPeriodCountLabel,
   pendingPayrollSettlements,
   periodCadenceBucket,
+  periodRangeDays,
+  resolveOpenPayrollRange,
   roundMoney,
   splitCommissionByOrigin,
   sumMoney,
@@ -55,7 +56,6 @@ import {
   type PayrollItemTotals,
   type PayrollMonthEmployeeRow,
   type PayrollMonthGroup,
-  type PayFrequency,
   type PendingPayrollSettlement,
 } from "@/src/features/payroll/schemas";
 import type { EmployeeRow, PaymentMethodRow } from "@/src/features/admin/service";
@@ -103,34 +103,6 @@ const PAY_TYPE_LABELS: Record<string, string> = {
   porcentaje: "Porcentaje",
   mixto: "Mixto",
 };
-
-/**
- * F4/F7: opciones de la cadencia del PERÍODO que se abre. Las tres declaran el
- * ciclo del rango (domingo a sábado) y dicen en DINERO qué parte del salario
- * fijo mensual paga cada ciclo: semanal un cuarto, quincenal la mitad, mensual
- * el mes completo. Ya NO existe "Sin cadencia": un período NUEVO siempre lleva
- * cadencia, y su rango sale del ciclo elegido. La cadencia acota qué empleados
- * entran al período.
- */
-const OPEN_PAY_FREQUENCY_OPTIONS = [
-  { value: "semanal", label: "Semanal (mensual / 4)" },
-  { value: "quincenal", label: "Quincenal (mensual / 2)" },
-  { value: "mensual", label: "Mensual (mes completo)" },
-] as const;
-
-/**
- * F7: cadencia que se ofrece por defecto al abrir el diálogo. Es la más común
- * y la única que se liquida todos los domingos; el usuario puede cambiarla y
- * el selector de ciclos se recalcula solo.
- */
-const DEFAULT_PAY_FREQUENCY: PayFrequency = "semanal";
-
-/**
- * F7: cuántos ciclos completados se ofrecen en el selector. Alcanza para
- * retroceder varias liquidaciones sin listar una historia sin fin; el ciclo
- * por defecto es SIEMPRE el primero (el último completado).
- */
-const OPEN_CYCLE_OPTION_LIMIT = 8;
 
 /**
  * Etiqueta legible del tipo de línea del desglose de comisiones. El
@@ -343,6 +315,12 @@ interface PayrollClientProps {
   sedeId: string;
   initialEmployees: EmployeeRow[];
   initialPeriods: PayrollPeriodRow[];
+  /**
+   * F10: la fecha desde la que la nómina OPERA en la sede (`null` = todavía no
+   * configurada). La lee el servidor y llega como valor inicial, igual que los
+   * períodos y los totales: es configuración de la sede y sólo el admin la usa.
+   */
+  initialPayrollStartDate: string | null;
   /**
    * PA3: totales por período (neto, pagado, saldo y cuántos empleados liquidó).
    * Agregan plata de TODA la planta, así que llegan vacíos para el empleado.
@@ -1207,20 +1185,22 @@ export function PayrollClient(props: PayrollClientProps) {
   // (éxito) es EVENTO y sale por `toast`, no por estado.
   const [error, setError] = useState<string | null>(null);
 
-  // Periodo: abrir (el rango NO se escribe: sale del ciclo de la cadencia).
-  // F7: el usuario elige la cadencia y el ciclo, y el rango se deriva de ahí.
+  // F10: la fecha desde la que la nómina OPERA en la sede. Es ESTADO de la sede
+  // —no configuración local— porque el servidor es su única fuente: llega
+  // leída de la página y la acción devuelve la fecha escrita. `null` =
+  // todavía no configurada, que conserva el comportamiento de hoy.
+  const [payrollStartDate, setPayrollStartDate] = useState<string | null>(
+    props.initialPayrollStartDate,
+  );
+  // Borrador del control de la fecha: lo que el admin escribió todavía sin
+  // guardar (vacío = volver a «sin configurar»).
+  const [startDateDraft, setStartDateDraft] = useState(props.initialPayrollStartDate ?? "");
+
+  // F10: abrir un período NO se pregunta. La única entrada al diálogo es el
+  // aviso de ciclos pendientes: su ciclo queda ELEGIDO y el rango se DERIVA de
+  // la fecha de arranque de la sede. `openTarget` es ese ciclo pendiente.
   const [openDialogOpen, setOpenDialogOpen] = useState(false);
-  const [openFrequency, setOpenFrequency] = useState<PayFrequency>(DEFAULT_PAY_FREQUENCY);
-  // Cierre (sábado) del ciclo elegido. Vacío mientras el diálogo no se abrió.
-  const [openCycleEnd, setOpenCycleEnd] = useState("");
-  /**
-   * F9: el ciclo pendiente con el que se abrió el diálogo, cuando se llegó por
-   * el aviso del atraso. Se conserva para que su opción siga en el selector
-   * aunque el atraso sea más antiguo que los últimos ciclos ofrecidos: si la
-   * opción faltara, el `<select>` mostraría otro ciclo del que el estado tiene
-   * elegido y se abriría el período equivocado.
-   */
-  const [pinnedCycle, setPinnedCycle] = useState<PendingPayrollSettlement | null>(null);
+  const [openTarget, setOpenTarget] = useState<PendingPayrollSettlement | null>(null);
   const [openError, setOpenError] = useState<string | null>(null);
   // Pagos: porciones por ítem (método y monto como campos separados en tabla).
   const [portions, setPortions] = useState<Record<string, PortionDraft[]>>({});
@@ -1466,41 +1446,55 @@ export function PayrollClient(props: PayrollClientProps) {
   }
 
   /**
-   * F7: abre el diálogo con la cadencia por defecto y su ciclo más reciente ya
-   * elegido. El dueño liquida el domingo la semana que cerró el sábado anterior,
-   * así que el ciclo por defecto es el último COMPLETADO; el selector permite
-   * retroceder a otro.
+   * F10: abre el diálogo en el ciclo pendiente MÁS ATRASADO. La lista de
+   * pendientes ya viene ordenada así (lo más vencido primero), y si está vacía
+   * el diálogo lo dice: no hay rango que elegir ni período que abrir.
    */
   function openPeriodDialog() {
     setOpenError(null);
-    setPinnedCycle(null);
-    setOpenFrequency(DEFAULT_PAY_FREQUENCY);
-    setOpenCycleEnd(
-      lastCompletedPayrollCycles({
-        frequency: DEFAULT_PAY_FREQUENCY,
-        referenceDate: bogotaDay(),
-        count: OPEN_CYCLE_OPTION_LIMIT,
-      })[0]?.end_date ?? "",
-    );
+    setOpenTarget(pendingSettlements[0] ?? null);
     setOpenDialogOpen(true);
   }
 
   /**
-   * F9: abre el diálogo ya POSICIONADO en el ciclo que el aviso acaba de
-   * nombrar: la cadencia del ciclo y su cierre quedan elegidos, así el admin no
-   * tiene que buscar a mano el ciclo atrasado entre las opciones.
+   * F9/F10: abre el diálogo ya POSICIONADO en el ciclo que el aviso acaba de
+   * nombrar. Es la única entrada: el ciclo queda elegido y su rango se deriva
+   * (completo, o el primero recortado a la fecha de arranque de la sede).
    */
   function openPendingSettlement(entry: PendingPayrollSettlement) {
     setOpenError(null);
-    setOpenFrequency(entry.frequency);
-    setPinnedCycle(entry);
-    setOpenCycleEnd(entry.end_date);
+    setOpenTarget(entry);
     setOpenDialogOpen(true);
+  }
+
+  /**
+   * F10: guarda la fecha de inicio de la nómina de la sede (vacío = «sin
+   * configurar»). El éxito es EVENTO (`show` → toast); el fallo queda como
+   * estado del módulo. Con la fecha nueva se suelta el ciclo elegido: el que
+   * estaba puede quedar ANTERIOR a la fecha y el aviso se recalcula con la cota
+   * nueva.
+   */
+  async function handleSaveStartDate(event: FormEvent) {
+    event.preventDefault();
+    const written = startDateDraft.trim() === "" ? null : startDateDraft.trim();
+    setBusy(true);
+    const result = (await setPayrollStartDateAction({
+      payroll_start_date: written,
+    })) as ActionResult<{ payroll_start_date: string | null }>;
+    setBusy(false);
+    if (!show(result, "Fecha de inicio de la nómina guardada.")) return;
+    setPayrollStartDate(result.data.payroll_start_date);
+    setStartDateDraft(result.data.payroll_start_date ?? "");
+    setOpenTarget(null);
   }
 
   async function handleOpen(event: FormEvent) {
     event.preventDefault();
-    if (!startDate || !endDate || openCycleEnd === "") {
+    if (openTarget === null) {
+      setOpenError("No hay ciclos cerrados sin liquidar: no hay período que abrir.");
+      return;
+    }
+    if (!startDate || !endDate) {
       setOpenError("Indique el rango del período.");
       return;
     }
@@ -1508,22 +1502,21 @@ export function PayrollClient(props: PayrollClientProps) {
       setOpenError("La fecha final no puede ser anterior a la inicial.");
       return;
     }
-    // F9 corregido: la guarda de apertura YA NO es el piso del "día siguiente al
-    // último período de la cadencia". Ese piso contradecía a un ciclo
-    // genuinamente SIN liquidar: con un hueco a mitad de la historia (una
-    // cadencia que nunca se liquidó mientras las otras sí, o un borrador borrado
-    // entre ciclos cerrados) el aviso ofrecía abrir ese ciclo y el propio
-    // diálogo lo rechazaba con "el período no puede empezar antes de X", así que
-    // la promesa del aviso la rompía nuestra guarda.
-    //
-    // La guarda ahora repite la MISMA regla del aviso y de las marcas del
-    // selector (`isPayrollCycleSettled`): sólo bloquea el ciclo que YA está
-    // liquidado por su cadencia —o cubierto por un período heredado sin cadencia,
-    // que le pagó a todo el plantel— y deja pasar cualquier ciclo sin liquidar.
-    // La autoridad de "ya liquidado" y de "se solapa" sigue siendo el servidor
-    // (`openPayrollPeriod`, guarda por cubo de cadencia más la restricción de la
-    // base), que decide sobre lo que el cliente no puede ver.
-    const collision = findOverlappingPeriod(periods, startDate, endDate, openFrequency);
+    // F10: la guarda de apertura repite las DOS verdades del servidor sobre el
+    // ciclo elegido, con las MISMAS funciones puras que el aviso y el servicio:
+    // no se abre un ciclo ANTERIOR al arranque de la nómina
+    // (`isRangeBeforePayrollStart`, la regla única de la fecha) y no se abre uno
+    // que YA tiene su liquidación (`isPayrollCycleSettled`). El rango del primer
+    // ciclo —recortado a la fecha— sale de `resolveOpenPayrollRange`, el mismo
+    // validador que el servicio aplica antes del INSERT; la autoridad final
+    // sigue siendo el servidor, que decide sobre lo que el cliente no ve.
+    if (isRangeBeforePayrollStart({ payrollStartDate, startDate, endDate })) {
+      setOpenError(
+        `El período no puede empezar antes del ${payrollStartDate}: la nómina de esta sede arranca ese día y nada anterior existe para el sistema.`,
+      );
+      return;
+    }
+    const collision = findOverlappingPeriod(periods, startDate, endDate, openTarget.frequency);
     if (collision) {
       setOpenError(
         `El rango se solapa con ${formatPeriodLabel(collision)} (${collision.status}). Ajuste las fechas o la cadencia.`,
@@ -1532,7 +1525,7 @@ export function PayrollClient(props: PayrollClientProps) {
     }
     const settledCycle = isPayrollCycleSettled({
       periods,
-      frequency: openFrequency,
+      frequency: openTarget.frequency,
       cycle: { start_date: startDate, end_date: endDate },
     });
     if (settledCycle) {
@@ -1543,9 +1536,11 @@ export function PayrollClient(props: PayrollClientProps) {
     }
     setOpenError(null);
     setBusy(true);
+    // F10: el cuerpo lleva la CADENCIA del ciclo pendiente y su CIERRE. No hay
+    // fechas en el envío: el rango (y su recorte) lo deriva el servidor.
     const result = (await openPayrollPeriodAction({
-      frequency: openFrequency,
-      cycle_end_date: openCycleEnd,
+      frequency: openTarget.frequency,
+      cycle_end_date: openTarget.end_date,
     })) as ActionResult<PayrollPeriodRow>;
     if (!result.success) {
       setBusy(false);
@@ -1553,8 +1548,7 @@ export function PayrollClient(props: PayrollClientProps) {
       return;
     }
     const created = result.data;
-    setOpenCycleEnd("");
-    setOpenFrequency(DEFAULT_PAY_FREQUENCY);
+    setOpenTarget(null);
     setOpenDialogOpen(false);
     await refreshPeriods(created.id);
 
@@ -1588,9 +1582,7 @@ export function PayrollClient(props: PayrollClientProps) {
 
   // Cerrar el modal de apertura siempre limpia su estado (mismo criterio que closeDetail).
   function closeOpenDialog() {
-    setOpenCycleEnd("");
-    setOpenFrequency(DEFAULT_PAY_FREQUENCY);
-    setPinnedCycle(null);
+    setOpenTarget(null);
     setOpenError(null);
     setOpenDialogOpen(false);
   }
@@ -1992,47 +1984,46 @@ export function PayrollClient(props: PayrollClientProps) {
     ? detail?.items.find((item) => item.id === detailTargetId) ?? null
     : null;
 
-  // Ayuda para elegir el rango del nuevo periodo, construida solo con `periods`.
-  // F9: es SÓLO una SUGERENCIA —el ciclo que sigue al último fin registrado DE LA
-  // MISMA CADENCIA (función pura del esquema); `null` cuando aún no hay períodos
-  // de ese ciclo, o sea el primero es libre—, NO un piso: con un hueco a mitad de
-  // la historia el ciclo del hueco sigue sin liquidar y se puede abrir (la guarda
-  // del envío es la regla de liquidación, no esta fecha). Cambia con la cadencia
-  // elegida; un período de otro ciclo se puede superponer y no la mueve.
-  const suggestedStart = nextPeriodStartDate(periods, openFrequency);
-  // F7: el ciclo elegido y su rango. Es la ÚNICA fuente del rango de un período
-  // NUEVO: no hay campos de fecha. `startDate`/`endDate` son los valores
-  // DERIVADOS, que alimentan la guarda en vivo y el envío.
-  const openCycle = payrollCycleRange({
-    frequency: openFrequency,
-    cycleEndDate: openCycleEnd === "" ? null : openCycleEnd,
-  });
-  const startDate = openCycle?.start_date ?? "";
-  const endDate = openCycle?.end_date ?? "";
-  // F7: los últimos ciclos COMPLETADOS de la cadencia, el más reciente primero.
-  // Cada opción lleva su etiqueta con el rango ya calculado.
-  const recentCycles = lastCompletedPayrollCycles({
-    frequency: openFrequency,
-    referenceDate: bogotaDay(),
-    count: OPEN_CYCLE_OPTION_LIMIT,
-  });
-  // F9: un ciclo pendiente puede ser MÁS ANTIGUO que los últimos ofrecidos si el
-  // atraso es viejo. Si el elegido no está en la lista, su opción se agrega al
-  // principio: el `<select>` nunca muestra un ciclo distinto del que el estado
-  // tiene elegido (elegir el equivocado abriría el período equivocado).
-  const openCycleOptions =
-    pinnedCycle !== null &&
-    !recentCycles.some((option) => option.end_date === pinnedCycle.end_date)
-      ? [pinnedCycle, ...recentCycles]
-      : recentCycles;
+  // F10: el ciclo pendiente elegido y SU RANGO. El rango no se escribe ni se
+  // elige: sale del ÚNICO validador de la forma del período
+  // (`resolveOpenPayrollRange`), el mismo que el servicio aplica antes del
+  // INSERT —un ciclo COMPLETO de la cadencia, o el PRIMER ciclo recortado a la
+  // fecha de arranque de la sede—. `openResolution` es `null` sólo mientras el
+  // diálogo no eligió nada; `startDate`/`endDate` alimentan la guarda en vivo,
+  // el texto del diálogo y el envío.
+  const openResolution =
+    openTarget === null
+      ? null
+      : resolveOpenPayrollRange({
+          frequency: openTarget.frequency,
+          cycleEndDate: openTarget.end_date,
+          payrollStartDate,
+          periods,
+        });
+  const startDate = openResolution?.ok ? openResolution.start_date : "";
+  const endDate = openResolution?.ok ? openResolution.end_date : "";
+  // F10: el rango derivado, en palabras, y la nota del PRIMER ciclo recortado.
+  // El día del rango se muestra porque un ciclo recortado paga menos que uno
+  // completo (la prorrata de F5), y eso no puede sorprender al admin.
+  const openCycleDays = periodRangeDays(startDate, endDate);
+  const openRangeText =
+    openResolution === null || !openResolution.ok
+      ? null
+      : `Del ${formatFullDate(startDate)} al ${formatFullDate(endDate)}${
+          openCycleDays === null ? "" : ` (${openCycleDays} ${openCycleDays === 1 ? "día" : "días"})`
+        }. Las fechas se calculan solas: no hay campos de fecha.`;
+  const openTrimmedNote =
+    openResolution === null || !openResolution.ok || !openResolution.trimmed
+      ? null
+      : `Primer ciclo recortado: la nómina de esta sede arranca el ${formatFullDate(startDate)} y este ciclo se liquida desde ahí. Su fijo se prorratea por los días del rango (la regla de la primera liquidación).`;
   const draftPeriods = periods.filter((row) => row.status === "borrador");
-  // Guarda defensiva conservada: con ciclos el rango derivado siempre termina
-  // después de empezar, así que no puede dispararse; se deja a la vista por si
-  // el día de mañana el rango volviera a tener otra fuente.
+  // Guarda defensiva conservada: el rango resuelto siempre termina después de
+  // empezar, así que no puede dispararse; se deja a la vista por si el día de
+  // mañana el rango volviera a tener otra fuente.
   const rangeInvalid = Boolean(startDate && endDate && endDate < startDate);
   const overlap =
     startDate && endDate && !rangeInvalid
-      ? findOverlappingPeriod(periods, startDate, endDate, openFrequency)
+      ? findOverlappingPeriod(periods, startDate, endDate, openTarget?.frequency ?? null)
       : null;
 
   /**
@@ -2074,26 +2065,20 @@ export function PayrollClient(props: PayrollClientProps) {
    * N consultas para el mismo dato— y usa la MISMA función pura que el servicio,
    * así que la lista y el resumen de la sede no pueden discrepar. Sólo el admin:
    * es información de la nómina de la sede.
+   *
+   * F10: la fecha de arranque de la sede acota el aviso (un ciclo que cierra
+   * antes no existe para el sistema) y, configurada, también reporta el primer
+   * ciclo de una sede que todavía no tiene períodos. Es la MISMA función y la
+   * MISMA cota que el servicio, así que el aviso y el resumen no discrepan.
    */
   const pendingSettlements = props.canAdmin
     ? pendingPayrollSettlements({
         periods,
         employees: props.initialEmployees,
         referenceDate: bogotaDay(),
+        payrollStartDate,
       })
     : [];
-
-  /**
-   * F9: marca de un ciclo en el selector del diálogo. Dice si ese ciclo YA tiene
-   * liquidación de su cadencia o si sigue pendiente, con la MISMA regla que usa
-   * el aviso (`isPayrollCycleSettled`), para que el selector y el aviso no puedan
-   * decir cosas distintas del mismo ciclo.
-   */
-  function cycleMarker(cycle: { start_date: string; end_date: string }): string {
-    return isPayrollCycleSettled({ periods, frequency: openFrequency, cycle })
-      ? " — ya liquidado"
-      : " — por liquidar";
-  }
 
   /**
    * Totales de un mes: SÓLO si TODOS sus períodos tienen resumen. Con uno sin
@@ -2196,6 +2181,41 @@ export function PayrollClient(props: PayrollClientProps) {
       <section className={sectionClass}>
         <h2 className="text-lg font-semibold">Períodos</h2>
         {/*
+          F10: la fecha desde la que la nómina OPERA en la sede. El control NO
+          se esconde —tampoco cuando ya está configurada: se puede corregir y se
+          puede volver a «sin configurar» (campo vacío)—, y cuando está en NULL
+          la ayuda invita a fijarla. Nada anterior a esa fecha existe para el
+          sistema. Es configuración de nómina, así que sólo el admin la ve. El
+          éxito de la escritura es EVENTO (toast, por `show`) y el fallo queda
+          como estado del módulo, en el canal de los demás fallos de acción.
+          Deliberadamente MÍNIMO (etiqueta, campo y ayuda, sin disposición
+          propia): la configuración se va a mudar a la superficie de plataforma
+          y esta pantalla sólo conserva la LECTURA que el diálogo y el aviso
+          necesitan.
+        */}
+        {props.canAdmin && (
+          <form onSubmit={handleSaveStartDate} className="mt-3">
+            <label className={labelClass} htmlFor="payroll-start-date">
+              Fecha de inicio de la nómina
+              <input
+                id="payroll-start-date"
+                type="date"
+                value={startDateDraft}
+                onChange={(event) => setStartDateDraft(event.target.value)}
+                className={inputClass}
+              />
+            </label>
+            <button type="submit" disabled={busy} className={`${buttonClass} mt-2`}>
+              {busy ? "Guardando…" : "Guardar fecha"}
+            </button>
+            <p className="mt-1 text-xs text-text-tertiary">
+              {payrollStartDate === null
+                ? "Sin configurar: fíjela para que la nómina sepa desde cuándo liquidar. Nada anterior a esa fecha existe para el sistema: no se ofrece como ciclo y no se puede abrir."
+                : `La nómina de esta sede arranca el ${formatFullDate(payrollStartDate)}: nada anterior a esa fecha existe para el sistema. El primer ciclo de cada cadencia se liquida desde ahí. Para volver a «sin configurar», deje el campo vacío y guarde.`}
+            </p>
+          </form>
+        )}
+        {/*
           F9: el atraso, a la vista donde el admin aterriza. Un ciclo que ya
           cerró y no tiene liquidación es plata que la sede debe: mientras el
           aviso no existía, una sede podía liquidar semanal durante meses y
@@ -2204,6 +2224,11 @@ export function PayrollClient(props: PayrollClientProps) {
           así que va inline y persistente. `warning` (no `destructive`) porque
           no es un fallo de la pantalla: es un pendiente que exige acción, y la
           variante deriva su propio rol, sin escribirlo a mano.
+
+          F10: cada entrada es la ÚNICA puerta al diálogo de apertura (su ciclo
+          queda elegido y el rango se deriva), y cuando la fecha de arranque no
+          está configurada el aviso invita a fijarla: sin fecha, la cota sigue
+          siendo la historia de la sede.
         */}
         {props.canAdmin && pendingSettlements.length > 0 && (
           <Alert variant="warning" className="mt-3">
@@ -2225,9 +2250,15 @@ export function PayrollClient(props: PayrollClientProps) {
               ))}
             </ul>
             <p className="mt-1">
-              Cada uno abre el diálogo ya posicionado en su cadencia y su ciclo, listo para
-              liquidarlo.
+              Cada uno abre el diálogo con su ciclo ya elegido y listo para liquidarlo: el rango
+              sale del ciclo y de la fecha de inicio de la nómina.
             </p>
+            {payrollStartDate === null && (
+              <p className="mt-1">
+                Fije la fecha de inicio de la nómina (arriba) para que el sistema sepa desde cuándo
+                liquidar: nada anterior a esa fecha existe para el sistema.
+              </p>
+            )}
           </Alert>
         )}
         {props.canAdmin && (
@@ -2754,79 +2785,74 @@ export function PayrollClient(props: PayrollClientProps) {
             <DialogHeader>
               <DialogTitle>Abrir período</DialogTitle>
               <DialogDescription>
-                Elija la cadencia y el ciclo. El rango sale del ciclo y el período se abre en
-                borrador.
+                Elija una liquidación pendiente. No hay fechas que escribir ni cadencia que
+                elegir: el rango sale del ciclo cerrado y de la fecha de inicio de la nómina, y el
+                período se abre en borrador.
               </DialogDescription>
             </DialogHeader>
             <form onSubmit={handleOpen} className="mt-4 flex flex-col gap-4">
-              <label className={labelClass} htmlFor="payroll-open-frequency">
-                Cadencia del período
-                <select
-                  id="payroll-open-frequency"
-                  value={openFrequency}
-                  onChange={(event) => {
-                    const next = event.target.value as PayFrequency;
-                    setOpenFrequency(next);
-                    // F9: al cambiar de cadencia el ciclo anclado deja de
-                    // pertenecer al selector: se suelta para que no quede una
-                    // opción de OTRA cadencia en la lista.
-                    setPinnedCycle(null);
-                    // El ciclo por defecto de la cadencia nueva es el último
-                    // completado: al cambiar de cadencia el selector se
-                    // recalcula y no queda un ciclo de la cadencia anterior.
-                    setOpenCycleEnd(
-                      lastCompletedPayrollCycles({
-                        frequency: next,
-                        referenceDate: bogotaDay(),
-                        count: OPEN_CYCLE_OPTION_LIMIT,
-                      })[0]?.end_date ?? "",
-                    );
-                    setOpenError(null);
-                  }}
-                  className={inputClass}
-                  required
-                >
-                  {OPEN_PAY_FREQUENCY_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
+              {pendingSettlements.length === 0 ? (
+                // VACÍO dentro del diálogo: describe lo esperado, no bloquea nada y
+                // nunca anunció nada. Sin ciclos cerrados sin liquidar no hay rango
+                // que elegir —ni período que abrir—, así que el diálogo no ofrece
+                // ninguna opción libre.
+                <p className="text-sm text-text-secondary">
+                  No hay ciclos cerrados sin liquidar en esta sede: no hay período que abrir.
+                  Cuando un ciclo cierre sin su liquidación aparecerá en el aviso de la pantalla, y
+                  desde ahí se abre.
+                </p>
+              ) : (
+                <fieldset className="flex flex-col gap-2">
+                  <legend className={labelClass}>
+                    Ciclo a liquidar
+                    <span className="mt-1 block text-xs font-normal text-text-tertiary">
+                      Son los ciclos ya cerrados que todavía no tienen liquidación, el más atrasado
+                      primero. Al elegir uno quedan derivados su cadencia y su rango.
+                    </span>
+                  </legend>
+                  {pendingSettlements.map((entry) => (
+                    <label
+                      key={`${entry.frequency}-${entry.end_date}`}
+                      className="flex items-start gap-2 rounded-md border border-border-color p-2 text-sm text-text-secondary dark:border-border-color-2"
+                    >
+                      <input
+                        type="radio"
+                        name="payroll-open-target"
+                        value={`${entry.frequency}-${entry.end_date}`}
+                        checked={
+                          openTarget?.frequency === entry.frequency &&
+                          openTarget?.end_date === entry.end_date
+                        }
+                        onChange={() => {
+                          setOpenError(null);
+                          setOpenTarget(entry);
+                        }}
+                        className="mt-1"
+                      />
+                      <span>
+                        <span className="block font-medium text-text-primary">
+                          {`Ciclo ${entry.frequency} ${entry.label}`}
+                        </span>
+                        <span className="mt-1 block text-xs text-text-tertiary">
+                          {entry.employeeCount === 1
+                            ? "1 empleado con esa cadencia"
+                            : `${entry.employeeCount} empleados con esa cadencia`}
+                          {entry.employeeNames.length > 0
+                            ? `: ${entry.employeeNames.join(", ")}`
+                            : ""}
+                        </span>
+                      </span>
+                    </label>
                   ))}
-                </select>
-                <span className="mt-1 block text-xs text-text-tertiary">
-                  El período se cierra al ciclo de la cadencia: domingo a sábado. Paga el fijo de
-                  ese ciclo y deja fuera a los empleados de otro ciclo.
-                </span>
-              </label>
+                </fieldset>
+              )}
 
-              <label className={labelClass} htmlFor="payroll-open-cycle">
-                Ciclo a liquidar
-                <select
-                  id="payroll-open-cycle"
-                  value={openCycleEnd}
-                  onChange={(event) => {
-                    setOpenCycleEnd(event.target.value);
-                    setOpenError(null);
-                  }}
-                  className={inputClass}
-                  required
-                >
-                  {openCycleOptions.length === 0 ? (
-                    <option value="">Sin ciclos disponibles</option>
-                  ) : (
-                    openCycleOptions.map((option) => (
-                      <option key={option.end_date} value={option.end_date}>
-                        {option.label}
-                        {cycleMarker(option)}
-                      </option>
-                    ))
-                  )}
-                </select>
-                <span className="mt-1 block text-xs text-text-tertiary">
-                  {openCycle === null
-                    ? "Elija una cadencia para ver sus ciclos."
-                    : `Del ${formatFullDate(openCycle.start_date)} al ${formatFullDate(openCycle.end_date)}. Las fechas se calculan solas a partir del ciclo.`}
-                </span>
-              </label>
+              {openRangeText !== null && (
+                <p className="text-xs text-text-tertiary">{openRangeText}</p>
+              )}
+              {openTrimmedNote !== null && (
+                <p className="text-xs text-text-tertiary">{openTrimmedNote}</p>
+              )}
 
               <div className="rounded-md border border-border-color bg-surface-hover p-3 text-sm text-text-secondary dark:border-border-color-2">
                 <p className="font-medium text-text-primary">Períodos existentes</p>
@@ -2835,20 +2861,25 @@ export function PayrollClient(props: PayrollClientProps) {
                   // de la lista), no bloquea nada y nunca anunció nada.
                   <>
                     <p className="mt-1">Sin períodos todavía: este será el primero.</p>
-                    {/* F5 corregido (F8): cada período NUEVO es un CICLO
-                        COMPLETO —el rango sale del ciclo elegido y los ciclos
-                        embaldosan el calendario—, así que la primera
-                        liquidación ya NO es un rango corto: paga la fracción
-                        entera de la cadencia, igual que las siguientes. Si hay
-                        que completar algo (por ejemplo, días que el ciclo no
-                        alcanza a cubrir), se carga como bono u otro descuento
-                        por empleado en el borrador, y ESE ajuste exige su
-                        motivo. Nota informativa en texto plano, como los otros
-                        vacíos del diálogo. */}
+                    {/* F5 corregido (F8) + F10: cada período NUEVO sale de un
+                        ciclo CERRADO —el rango no se escribe—, así que paga la
+                        fracción entera de la cadencia, igual que las
+                        siguientes. La EXCEPCIÓN es el primer ciclo de cada
+                        cadencia cuando la fecha de inicio de la nómina cae
+                        dentro de él: se recorta a esa fecha y se prorratea por
+                        los días del rango (la regla del ciclo parcial de F5).
+                        Si hay que completar algo (por ejemplo, días que el
+                        ciclo no alcanza a cubrir), se carga como bono u otro
+                        descuento por empleado en el borrador, y ESE ajuste
+                        exige su motivo. Nota informativa en texto plano, como
+                        los otros vacíos del diálogo. */}
                     <p className="mt-1">
                       La primera liquidación es un ciclo completo, igual que las siguientes: el
-                      sistema paga la fracción entera de la cadencia. Si hay que completar algo, se
-                      carga como bono u otro descuento por empleado en el borrador, con su motivo.
+                      sistema paga la fracción entera de la cadencia. La excepción es el primer
+                      ciclo de cada cadencia cuando la fecha de inicio de la nómina cae dentro de
+                      él: se recorta a esa fecha y paga solo los días del rango. Si hay que
+                      completar algo, se carga como bono u otro descuento por empleado en el
+                      borrador, con su motivo.
                     </p>
                   </>
                 ) : (
@@ -2872,12 +2903,6 @@ export function PayrollClient(props: PayrollClientProps) {
                       </p>
                     )}
                   </>
-                )}
-                {suggestedStart && (
-                  <p className="mt-2">
-                    Sugerencia: empiece el {formatFullDate(suggestedStart)}, día siguiente al último período
-                    registrado de esta cadencia.
-                  </p>
                 )}
                 {draftPeriods.length > 0 && (
                   <p className="mt-2 text-text-tertiary">
@@ -2918,7 +2943,7 @@ export function PayrollClient(props: PayrollClientProps) {
                 <button type="button" className={ghostClass} onClick={closeOpenDialog}>
                   Cancelar
                 </button>
-                <button type="submit" disabled={busy} className={buttonClass}>
+                <button type="submit" disabled={busy || openTarget === null} className={buttonClass}>
                   {busy ? "Creando…" : "Crear"}
                 </button>
               </DialogFooter>

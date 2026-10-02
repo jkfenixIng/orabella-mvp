@@ -15,6 +15,7 @@ import {
   deletePayrollPeriod,
   getPayrollPeriodCorrection,
   getPayrollSettlementSources,
+  getPayrollStartDate,
   getPeriodDetail,
   getVoucherSettings,
   listPayrollExtras,
@@ -29,6 +30,7 @@ import {
   requirePayrollAdmin,
   requirePayrollPayer,
   requirePayrollViewer,
+  setPayrollStartDate,
   setVoucherLimits,
 } from "./service";
 
@@ -274,6 +276,39 @@ export async function getPayrollSettlementSourcesAction(periodId: string, employ
       targetEmployeeId = mine?.id ?? "sin-acceso";
     }
     const data = await getPayrollSettlementSources(session.sedeId, periodId, targetEmployeeId);
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
+ * F10: la fecha desde la que la nómina OPERA en la sede (la fecha de inicio de
+ * la implementación). Nada anterior a esa fecha existe para el sistema. Es
+ * configuración de nómina: la lee y la escribe SOLO el admin de la sede.
+ */
+export async function getPayrollStartDateAction() {
+  try {
+    const session = await requirePayrollAdmin(await sessionToken());
+    const data = await getPayrollStartDate(session.sedeId);
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
+ * F10: fija (o limpia, con `null`) la fecha de inicio de la nómina de la sede.
+ * Misma lógica que `setVoucherLimitsAction`: solo admin, validación en el
+ * servicio.
+ */
+export async function setPayrollStartDateAction(input: unknown) {
+  try {
+    const session = await requirePayrollAdmin(await sessionToken());
+    const data = await setPayrollStartDate(input, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+    });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
