@@ -1968,7 +1968,9 @@ function createStubSupabaseClient(): unknown {
     }
     const drawerRow: Record<string, unknown> = {
       id: `caja-${paymentStub.drawer.length + 1}`,
-      sede_id: args.p_sede_id,
+      // La fila del cajón toma la SEDE DEL TURNO que la función bloquea (la
+      // instalación es de una sola sede, 071): ya no llega en la llamada.
+      sede_id: paymentStub.SEDE_ID,
       cash_shift_id: args.p_shift_id,
       invoice_id: args.p_invoice_id,
       method_id: collection.method_id ?? null,
@@ -2439,8 +2441,10 @@ function createShiftStubSupabaseClient(): unknown {
       }));
 
     if (name === "cash_open_shift_atomic") {
+      // La caja YA NO se filtra por la sede del llamador (071): la función la
+      // bloquea por id y de esa misma fila toma la sede que escribe el turno.
       const register = (shiftStub.tables.cash_registers ?? []).find(
-        (row) => row.id === args.p_register_id && row.sede_id === args.p_sede_id,
+        (row) => row.id === args.p_register_id,
       );
       if (!register) return rollback("SHIFT_REGISTER_NOT_FOUND");
       const alreadyOpen = (shiftStub.tables.cash_shifts ?? []).some(
@@ -2450,7 +2454,7 @@ function createShiftStubSupabaseClient(): unknown {
       const created: Record<string, unknown> = {
         id: `turno-${(shiftStub.rowSeq += 1)}`,
         cash_register_id: args.p_register_id,
-        sede_id: args.p_sede_id,
+        sede_id: register.sede_id,
         opened_by: args.p_opened_by,
         closed_by: null,
         opened_at: "2026-09-30T12:00:00.000Z",
@@ -2480,7 +2484,7 @@ function createShiftStubSupabaseClient(): unknown {
 
     if (name === "cash_close_shift_atomic") {
       const shift = (shiftStub.tables.cash_shifts ?? []).find(
-        (row) => row.id === args.p_shift_id && row.sede_id === args.p_sede_id,
+        (row) => row.id === args.p_shift_id,
       );
       if (!shift) return rollback("SHIFT_NOT_FOUND");
       // La precondición de estado, leída de la fila BLOQUEADA: otro cierre ganó.
@@ -2568,7 +2572,7 @@ function createShiftStubSupabaseClient(): unknown {
 
     if (name === "cash_recount_shift_atomic") {
       const shift = (shiftStub.tables.cash_shifts ?? []).find(
-        (row) => row.id === args.p_shift_id && row.sede_id === args.p_sede_id,
+        (row) => row.id === args.p_shift_id,
       );
       if (!shift) return rollback("SHIFT_NOT_FOUND");
       if (shift.status !== "cerrado") return rollback("SHIFT_NOT_CLOSED");
@@ -2925,7 +2929,9 @@ describe("cash: CL-14 el cobro de una factura es UNA transacción", () => {
     expect(args.p_set_shift).toBe(false);
     expect(args.p_shift_id).toBe(paymentStub.SHIFT_ID);
     expect(args.p_invoice_id).toBe(paymentStub.INVOICE_ID);
-    expect(args.p_sede_id).toBe(paymentStub.SEDE_ID);
+    // La SEDE NO viaja: es la de la instalación (071) y la función la toma del
+    // turno que bloquea. Mandarla sería una segunda frontera por RPC.
+    expect(args).not.toHaveProperty("p_sede_id");
     expect(args.p_user_id).toBe("u-1");
   });
 
@@ -3245,6 +3251,10 @@ describe("migración 056_collection_closes_invoice.sql (CL-17)", () => {
   it("dropea las DOS firmas viejas y crea las nuevas (una sola sentencia cada una)", () => {
     // PostgreSQL identifica la función por su firma: sin el DROP quedaría viva la
     // sobrecarga vieja, sin lock de turno y sin datos de cierre.
+    //
+    // HISTORIA, NO ESTADO: estas aserciones fijan el archivo 056 tal como se
+    // aplicó, con su parámetro de sede. La vigente es la de 071 (que lo sacó);
+    // se afirma en la suite de 071, más abajo.
     expect(sql).toContain(
       "DROP FUNCTION IF EXISTS public.cash_invoice_payment_atomic(uuid, uuid, uuid, uuid, boolean, boolean, jsonb)",
     );
@@ -7332,5 +7342,137 @@ describe("cash: 414 los filtros .in(...) de caja van troceados", () => {
     expect(inChunks("users", "id")).toEqual([{ table: "users", column: "id", size: 1 }]);
     expect(day.shifts[0].abierto_por).toBe("Cajero de prueba");
     expect(day.shifts[0].cerrado_por).toBe("Cajero de prueba");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 071_rpc_single_sede.sql: la caja re-emite sus CUATRO funciones sin el
+// parámetro de sede.
+//
+// LO QUE ESTA SUITE FIJA (y antes fijaba contra la firma vieja): 049, 058, 059 y
+// 056 declaraban `p_sede_id` al principio de la firma y filtraban por `sede_id`
+// en el turno y en la factura. Con una sola sede, ese parámetro es una frontera
+// más dentro de una base que ya tiene una, y la firma que declara la base tiene
+// que ser EXACTAMENTE la que manda el servidor: un `p_sede_id` de sobra hace
+// fallar al llamador nuevo, y una sobrecarga vieja viva deja pasar al viejo sin
+// que nadie lo note. El orden es DROP y después CREATE, por eso.
+// ---------------------------------------------------------------------------
+
+describe("migración 071_rpc_single_sede.sql (caja)", () => {
+  const path = join(process.cwd(), "supabase", "migrations", "071_rpc_single_sede.sql");
+  const raw = readFileSync(path, "utf8").replace(/\r\n/g, "\n");
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("piso anti-vacío: el archivo existe y trae DDL real", () => {
+    expect(raw.length).toBeGreaterThan(15000);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("las CUATRO funciones de caja se crean SIN el parámetro de sede", () => {
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.cash_open_shift_atomic\(\s*p_register_id uuid,\s*p_opened_by uuid,\s*p_opening_base numeric,\s*p_counts jsonb\s*\)/,
+    );
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.cash_close_shift_atomic\(\s*p_shift_id uuid,\s*p_closed_by uuid,\s*p_closed_at timestamptz,\s*p_close jsonb,\s*p_counts jsonb,\s*p_collection_counts jsonb\s*\)/,
+    );
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.cash_recount_shift_atomic\(\s*p_shift_id uuid,\s*p_recounted_by uuid,\s*p_recount jsonb,\s*p_counts jsonb\s*\)/,
+    );
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.cash_invoice_payment_atomic\(\s*p_shift_id uuid,\s*p_invoice_id uuid,\s*p_user_id uuid,\s*p_closed_at timestamptz,\s*p_set_shift boolean,\s*p_mark_paid boolean,\s*p_collection jsonb\s*\)/,
+    );
+    expect(sql).not.toMatch(/\bsede_id\s*=\s*p_sede_id/);
+    expect(sql).not.toContain("p_sede_id IS NULL");
+    expect(sql).not.toContain("p_sede_id");
+  });
+
+  it("dropea la firma VIEJA de las CUATRO antes de crear la nueva", () => {
+    const drops = [
+      "DROP FUNCTION IF EXISTS public.cash_open_shift_atomic(uuid, uuid, uuid, numeric, jsonb)",
+      "DROP FUNCTION IF EXISTS public.cash_close_shift_atomic(uuid, uuid, uuid, timestamptz, jsonb, jsonb, jsonb)",
+      "DROP FUNCTION IF EXISTS public.cash_recount_shift_atomic(uuid, uuid, uuid, jsonb, jsonb)",
+      "DROP FUNCTION IF EXISTS public.cash_invoice_payment_atomic(uuid, uuid, uuid, uuid, timestamptz, boolean, boolean, jsonb)",
+    ];
+    for (const statement of drops) {
+      expect(sql).toContain(statement);
+      const name = statement.slice(statement.indexOf("public.") + 7, statement.indexOf("("));
+      expect(sql.indexOf(statement)).toBeLessThan(
+        sql.indexOf(`CREATE OR REPLACE FUNCTION public.${name}`),
+      );
+    }
+  });
+
+  it("la SEDE que se ESCRIBE sale de la fila bloqueada: la CAJA al abrir, el TURNO al cobrar", () => {
+    // Abrir un turno: la caja bloqueada pasa a `SELECT r.sede_id … FOR UPDATE`
+    // y su sede es la que escribe el turno. Cobrar: la fila del libro de cajón
+    // toma la del turno que ya está bloqueado con `FOR SHARE`.
+    expect(sql).toMatch(
+      /SELECT r\.sede_id\s*\n\s*INTO v_sede\s*\n\s*FROM public\.cash_registers r\s*\n\s*WHERE r\.id = p_register_id\s*\n\s*FOR UPDATE OF r;/,
+    );
+    expect(sql).toContain("(p_register_id, v_sede, p_opened_by, p_opening_base, 0, 'abierto')");
+    expect(sql).toContain("(v_turno.sede_id,");
+  });
+
+  it("el permiso y el search_path viajan con la firma NUEVA, y el comentario también", () => {
+    for (const signature of [
+      "cash_open_shift_atomic(uuid, uuid, numeric, jsonb)",
+      "cash_close_shift_atomic(uuid, uuid, timestamptz, jsonb, jsonb, jsonb)",
+      "cash_recount_shift_atomic(uuid, uuid, jsonb, jsonb)",
+      "cash_invoice_payment_atomic(uuid, uuid, uuid, timestamptz, boolean, boolean, jsonb)",
+    ]) {
+      expect(sql).toContain(`ALTER FUNCTION public.${signature} SET search_path = public;`);
+      expect(sql).toContain(`REVOKE ALL ON FUNCTION public.${signature} FROM PUBLIC;`);
+      expect(sql).toContain(`REVOKE ALL ON FUNCTION public.${signature} FROM anon;`);
+      expect(sql).toContain(
+        `REVOKE ALL ON FUNCTION public.${signature} FROM authenticated;`,
+      );
+      expect(sql).toContain(`GRANT EXECUTE ON FUNCTION public.${signature} TO service_role;`);
+      expect(sql).toContain(`COMMENT ON FUNCTION public.${signature} IS`);
+    }
+  });
+
+  it("conserva los locks, su ORDEN y las precondiciones: el cambio es de firma", () => {
+    // El cierre y el reconteo siguen bloqueando el turno con `FOR UPDATE`; el
+    // cobro sigue bloqueándolo con `FOR SHARE` ANTES de la factura. El orden se
+    // mira DENTRO del cuerpo del cobro, que es donde el orden global importa.
+    expect(sql).toContain("FOR UPDATE OF s");
+    expect(sql).toContain("FOR SHARE OF s");
+    const cobro = sql.slice(
+      sql.indexOf("CREATE OR REPLACE FUNCTION public.cash_invoice_payment_atomic"),
+      sql.indexOf("$$;", sql.indexOf("CREATE OR REPLACE FUNCTION public.cash_invoice_payment_atomic")),
+    );
+    expect(cobro.indexOf("FOR SHARE OF s")).toBeGreaterThan(-1);
+    expect(cobro.indexOf("FOR SHARE OF s")).toBeLessThan(cobro.indexOf("FOR UPDATE OF i"));
+    // El token de las CUATRO entradas del arqueo (CL-19/CL-20) sigue siendo
+    // obligatorio, con su rechazo.
+    expect(sql).toContain("ARQUEO_STALE");
+    for (const code of [
+      "SHIFT_INVALID",
+      "SHIFT_REGISTER_NOT_FOUND",
+      "SHIFT_ALREADY_OPEN",
+      "SHIFT_NOT_FOUND",
+      "SHIFT_ALREADY_CLOSED",
+      "SHIFT_NOT_CLOSED",
+      "SHIFT_COUNT_MISMATCH",
+      "SHIFT_WRITE_MISMATCH",
+      "ALREADY_RECOUNTED",
+      "SHIFT_CLOSED",
+      "PAYMENT_INVALID",
+      "PAYMENT_MISMATCH",
+      "ANNUL_INVALID",
+    ]) {
+      expect(sql).toContain(`RAISE EXCEPTION '${code}'`);
+    }
+  });
+
+  it("NO borra la columna ni toca las políticas: ése es el paso irreversible de otra unidad", () => {
+    expect(sql).not.toMatch(/DROP COLUMN/i);
+    expect(sql).not.toMatch(/ALTER TABLE/i);
+    expect(sql).not.toMatch(/\bPOLICY\b/i);
+    expect(raw).toContain("POR QUÉ ESTE ARCHIVO CORRE ANTES DEL BORRADO DE LA COLUMNA");
   });
 });

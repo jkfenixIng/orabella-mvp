@@ -2869,7 +2869,6 @@ export async function deletePayrollPeriod(
     // adentro de la transacción, sobre la fila bloqueada: no son un camino que
     // la transacción saltee, son un rechazo que la transacción no puede perder.
     const { data: reverted, error: revertError } = await db.rpc("payroll_delete_period_atomic", {
-      p_sede_id: sedeId,
       p_period_id: periodId,
       p_to_approved: backToApproved,
       p_to_pending: backToPending,
@@ -3125,7 +3124,6 @@ export async function correctPayrollPeriod(
     }));
 
     const { data: applied, error } = await db.rpc("payroll_correct_period_atomic", {
-      p_sede_id: sedeId,
       p_period_id: periodId,
       p_correction: correctionPayload,
       p_items: correctionItemPayload,

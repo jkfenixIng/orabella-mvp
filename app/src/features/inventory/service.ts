@@ -601,7 +601,6 @@ export async function deductStock(
 
   const db = await inventoryDb();
   const { data: applied, error } = await db.rpc("deduct_stock_atomic", {
-    p_sede_id: actor.sedeId,
     p_user_id: actor.userId,
     p_reason: reason,
     p_items: planned.map((item) => ({ product_id: item.product_id, qty: item.qty })),

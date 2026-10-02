@@ -2228,7 +2228,9 @@ function createPayrollPagedStubClient(): unknown {
       const period = periods.find((row) => row.id === args?.p_period_id) ?? null;
       // El período BLOQUEADO y su precondición de estado, dentro de la
       // transacción: un borrado concurrente (o un cierre) rechaza, no pisa.
-      if (!period || period.status !== "borrador" || period.sede_id !== args?.p_sede_id) {
+      // La sede ya NO es un parámetro de la función (071): es la de la
+      // instalación, así que el doble no la filtra.
+      if (!period || period.status !== "borrador") {
         return rollback("PAYROLL_PERIOD_CONFLICT");
       }
       // El mismo guardia de solapamiento del servicio, re-evaluado acá: un
@@ -2247,7 +2249,7 @@ function createPayrollPagedStubClient(): unknown {
       const expected = [...toApproved, ...toPending];
       const reverted: string[] = [];
       for (const id of expected) {
-        const row = vouchers.find((entry) => entry.id === id && entry.sede_id === args?.p_sede_id);
+        const row = vouchers.find((entry) => entry.id === id);
         if (row && row.status === "descontada") {
           row.status = toApproved.includes(id) ? "aprobada" : "pendiente";
           reverted.push(id);
@@ -2318,7 +2320,7 @@ function createPayrollPagedStubClient(): unknown {
         (payrollPagedStub.tables.payroll_periods ?? []).find(
           (row) => row.id === args?.p_period_id,
         ) ?? null;
-      if (!period || period.sede_id !== args?.p_sede_id) {
+      if (!period) {
         return rollback("PAYROLL_CORRECTION_CONFLICT");
       }
       if (period.status !== "cerrado") return rollback("PERIOD_NOT_CLOSED");
@@ -12199,5 +12201,128 @@ describe("migración 068_payroll_start_date.sql (F10)", () => {
     expect(sql).not.toMatch(/NOT NULL/);
     // Sin DEFAULT: ninguna sede queda con una fecha que el dueño no eligió.
     expect(sql).not.toMatch(/DEFAULT/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 071_rpc_single_sede.sql: la nómina re-emite sus dos funciones de administración
+// SIN el parámetro de sede.
+//
+// LO QUE ESTA SUITE FIJA (y antes fijaba mal): 048 declaraba las dos funciones
+// con `p_sede_id` al principio de la firma y filtraba por `sede_id` en el
+// período, en los vales y en el empleado. Con la instalación de una sola sede,
+// ese parámetro es una segunda frontera dentro de una base que ya tiene una, y
+// la firma que declara la base tiene que ser EXACTAMENTE la que manda el
+// servidor: si queda un `p_sede_id` de más, el llamador nuevo falla ruidoso; si
+// queda una sobrecarga viva de la vieja, el llamador viejo sigue pasando sin
+// que nadie lo note. Por eso el archivo dropea la firma vieja ANTES de crear la
+// nueva.
+// ---------------------------------------------------------------------------
+
+describe("migración 071_rpc_single_sede.sql (nómina)", () => {
+  const path = join(process.cwd(), "supabase", "migrations", "071_rpc_single_sede.sql");
+  const raw = existsSync(path) ? readFileSync(path, "utf8").replace(/\r\n/g, "\n") : "";
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("piso anti-vacío: el archivo existe y trae DDL real", () => {
+    expect(raw.length).toBeGreaterThan(15000);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("las DOS funciones de administración se crean SIN el parámetro de sede", () => {
+    // La firma es lo que se afirma: `p_period_id` al principio y NADA de sede.
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.payroll_delete_period_atomic\(\s*p_period_id uuid,\s*p_to_approved uuid\[\],\s*p_to_pending uuid\[\]\s*\)/,
+    );
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.payroll_correct_period_atomic\(\s*p_period_id uuid,\s*p_correction jsonb,\s*p_items jsonb\s*\)/,
+    );
+    // Y el predicado de sede NO está: si volviera, la firma y el cuerpo
+    // dejarían de contar la misma historia.
+    expect(sql).not.toMatch(/payroll_(?:delete|correct)_period_atomic\(\s*p_sede_id/);
+    expect(sql).not.toContain("p_sede_id IS NULL");
+    expect(sql).not.toMatch(/\bsede_id\s*=\s*p_sede_id/);
+    expect(sql).not.toContain("p_sede_id");
+  });
+
+  it("dropea la firma VIEJA antes de crear la nueva: sin la sobrecarga no hay dos funciones", () => {
+    // El orden importa: un `CREATE OR REPLACE` con otra lista de parámetros no
+    // reemplaza nada, deja la vieja viva al lado de la nueva.
+    const dropDelete = sql.indexOf(
+      "DROP FUNCTION IF EXISTS public.payroll_delete_period_atomic(uuid, uuid, uuid[], uuid[])",
+    );
+    const dropCorrect = sql.indexOf(
+      "DROP FUNCTION IF EXISTS public.payroll_correct_period_atomic(uuid, uuid, jsonb, jsonb)",
+    );
+    const createDelete = sql.indexOf(
+      "CREATE OR REPLACE FUNCTION public.payroll_delete_period_atomic",
+    );
+    const createCorrect = sql.indexOf(
+      "CREATE OR REPLACE FUNCTION public.payroll_correct_period_atomic",
+    );
+    expect(dropDelete).toBeGreaterThan(-1);
+    expect(dropCorrect).toBeGreaterThan(-1);
+    expect(dropDelete).toBeLessThan(createDelete);
+    expect(dropCorrect).toBeLessThan(createCorrect);
+  });
+
+  it("el permiso y el search_path viajan con la firma NUEVA, y el comentario también", () => {
+    for (const signature of [
+      "payroll_delete_period_atomic(uuid, uuid[], uuid[])",
+      "payroll_correct_period_atomic(uuid, jsonb, jsonb)",
+    ]) {
+      const name = signature.slice(0, signature.indexOf("("));
+      // Un ACL sobre la firma vieja no alcanzaría a la función nueva: el
+      // permiso se concede por firma y por eso tiene que repetirse.
+      expect(sql).toContain(`ALTER FUNCTION public.${signature} SET search_path = public;`);
+      expect(sql).toContain(`REVOKE ALL ON FUNCTION public.${signature} FROM PUBLIC;`);
+      expect(sql).toContain(`REVOKE ALL ON FUNCTION public.${signature} FROM anon;`);
+      expect(sql).toContain(
+        `REVOKE ALL ON FUNCTION public.${signature} FROM authenticated;`,
+      );
+      expect(sql).toContain(`GRANT EXECUTE ON FUNCTION public.${signature} TO service_role;`);
+      // Y cada una conserva SUS redes de conteo, DICHA en su propio comentario:
+      // el cambio es de firma, no de comportamiento. El texto del COMMENT viaja
+      // como string en la línea siguiente, así que se lee con la suya.
+      const commentLines = sql.split("\n");
+      const commentAt = commentLines.findIndex((line) =>
+        line.startsWith(`COMMENT ON FUNCTION public.${name}(`),
+      );
+      const comment = commentLines.slice(commentAt, commentAt + 2).join("\n");
+      expect(commentAt).toBeGreaterThan(-1);
+      expect(comment).toContain("CL-9:");
+      if (name === "payroll_delete_period_atomic") {
+        expect(comment).toContain("PAYROLL_VOUCHER_CONFLICT");
+        expect(comment).toContain("PAYROLL_PERIOD_CONFLICT");
+        expect(comment).toContain("PERIOD_OVERLAP_AMBIGUOUS");
+      } else {
+        expect(comment).toContain("PAYROLL_CORRECTION_MISMATCH");
+        expect(comment).toContain("PERIOD_NOT_CLOSED");
+      }
+    }
+  });
+
+  it("NO borra la columna ni toca las políticas: ése es el paso irreversible de otra unidad", () => {
+    // El archivo va ANTES del borrado a propósito: mientras la columna existe,
+    // quitarle el parámetro deja honestos los puntos de llamada, y el
+    // `DROP COLUMN` queda como el último paso, sin vuelta atrás.
+    expect(sql).not.toMatch(/DROP COLUMN/i);
+    expect(sql).not.toMatch(/ALTER TABLE/i);
+    expect(sql).not.toMatch(/\bPOLICY\b/i);
+    expect(sql).not.toMatch(/ROW LEVEL SECURITY/i);
+    // Y lo dice, para que el orden de la serie no dependa de la memoria.
+    expect(raw).toContain("POR QUÉ ESTE ARCHIVO CORRE ANTES DEL BORRADO DE LA COLUMNA");
+    expect(raw).toContain("resolveSede");
+  });
+
+  it("no toca la cadena de la LIQUIDACIÓN: payroll_apply_atomic nunca llevaba p_sede_id", () => {
+    // `payroll_apply_atomic` (047, y sus versiones de 061/062/064/067) toma la
+    // sede del PERÍODO que bloquea: no hay parámetro que quitarle y este
+    // archivo no lo re-emite.
+    expect(sql).not.toContain("payroll_apply_atomic");
   });
 });

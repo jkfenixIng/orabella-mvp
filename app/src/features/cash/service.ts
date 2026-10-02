@@ -1108,7 +1108,6 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     // `countLines`); el RPC sólo ESCRIBE lo que recibe y devuelve el turno
     // escrito, con las mismas columnas que el servicio leía con SHIFT_SELECT.
     const { data: created, error: createError } = await db.rpc("cash_open_shift_atomic", {
-      p_sede_id: actor.sedeId,
       p_register_id: register.id,
       p_opened_by: actor.userId,
       p_opening_base: openingBase,
@@ -1579,7 +1578,6 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
       // 042 no aplica acá). Es la barrera final de la carrera, con el índice
       // único parcial de 042, que ahora corre DENTRO de la transacción.
       const { data: written, error: payError } = await db.rpc("cash_invoice_payment_atomic", {
-        p_sede_id: actor.sedeId,
         p_shift_id: shift.id,
         p_invoice_id: input.invoice_id,
         p_user_id: actor.userId,
@@ -1968,7 +1966,6 @@ export async function closeShift(
     // `computeCashClose`, y cada línea del conteo de `checkCounts`; el RPC sólo
     // ESCRIBE lo que recibe y devuelve el turno escrito.
     const { data: updated, error: updateError } = await db.rpc("cash_close_shift_atomic", {
-      p_sede_id: sedeId,
       p_shift_id: shift.id,
       p_closed_by: actor.userId,
       p_closed_at: new Date().toISOString(),
@@ -2176,7 +2173,6 @@ export async function recountClosedShift(
   // `checkCounts`; el RPC sólo ESCRIBE lo que recibe y devuelve el reconteo
   // escrito, con las mismas columnas que el servicio leía con RECOUNT_SELECT.
   const { data: inserted, error } = await db.rpc("cash_recount_shift_atomic", {
-    p_sede_id: sedeId,
     p_shift_id: shift.id,
     p_recounted_by: actor.userId,
     p_recount: {

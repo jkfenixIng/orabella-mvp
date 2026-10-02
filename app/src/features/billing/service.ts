@@ -1292,7 +1292,6 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   // consecutivo—. La clave está en que acá NO se manda un número: la función lo
   // reserva adentro y lo sustituye en la plantilla del motivo del OUT.
   const { data: written, error: createError } = await db.rpc("invoice_create_atomic", {
-    p_sede_id: actor.sedeId,
     p_user_id: actor.userId,
     p_cash_shift_id: cashShiftId,
     p_idempotency_key: input.idempotency_key,
@@ -1491,7 +1490,6 @@ export async function annulInvoice(
   });
 
   const { data: written, error: annulError } = await db.rpc("invoice_annul_atomic", {
-    p_sede_id: sedeId,
     p_invoice_id: id,
     p_user_id: actor.userId,
     // El instante lo resuelve el servicio, como en el cierre de caja (049): la
@@ -1772,7 +1770,6 @@ export async function editInvoiceItems(
     reason: editReason,
   });
   const { data: written, error: editError } = await db.rpc("invoice_edit_items_atomic", {
-    p_sede_id: sedeId,
     p_invoice_id: invoiceId,
     p_user_id: actor.userId,
     p_expected_version: Number(detail.invoice.edit_version),
@@ -2089,7 +2086,6 @@ export async function editEmittedInvoiceItems(
     reason: editReason,
   });
   const { data: written, error: editError } = await db.rpc("invoice_edit_emitted_atomic", {
-    p_sede_id: sedeId,
     p_invoice_id: invoiceId,
     p_user_id: actor.userId,
     p_expected_version: Number(detail.invoice.edit_version),
@@ -2443,7 +2439,6 @@ export async function splitPayment(
   // hay caja abierta". El cierre de la factura con sus datos (`closed_by`,
   // `closed_at`) ya viajaba y no cambia.
   const { data: written, error: payError } = await db.rpc("invoice_split_payment_atomic", {
-    p_sede_id: sedeId,
     p_invoice_id: id,
     // CL-17: el TURNO que cobra, como PARÁMETRO de la operación (no sólo dentro
     // de cada porción). La función lo bloquea (`FOR SHARE`) ANTES de bloquear la
