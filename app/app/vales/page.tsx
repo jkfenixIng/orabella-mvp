@@ -10,6 +10,7 @@ import {
   getVoucherSettings,
   listVouchers,
 } from "@/src/features/payroll/service";
+import { bogotaDay } from "@/src/shared/lib/dates";
 import { VouchersClient } from "./vouchers-client";
 
 export const dynamic = "force-dynamic";
@@ -39,10 +40,14 @@ export default async function ValesPage() {
     );
   }
 
+  // Por defecto la pantalla muestra SOLO los vales de hoy (día de Bogotá). El
+  // rango se calcula UNA vez acá y baja como prop para que servidor y cliente
+  // no puedan discrepar; ampliarlo (o limpiarlo) es cosa del cliente.
+  const today = bogotaDay();
   const [employees, settings, vouchers, methods, shift] = await Promise.all([
     listEmployees(sedeId),
     getVoucherSettings(sedeId),
-    listVouchers(sedeId),
+    listVouchers(sedeId, { date_from: today, date_to: today }),
     listPaymentMethods(sedeId),
     getOpenShiftWithOpener(sedeId),
   ]);
@@ -70,6 +75,7 @@ export default async function ValesPage() {
         initialSettings={settings}
         initialVouchers={ownId ? vouchers.filter((row) => row.employee_id === ownId) : vouchers}
         initialMethods={methods.filter((row) => row.is_active && row.arqueable)}
+        today={today}
         shiftOpen={shiftOpen}
         shiftOwn={shiftOwn}
         shiftOwner={shiftOwner}
