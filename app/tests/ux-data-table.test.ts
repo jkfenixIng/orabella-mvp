@@ -137,14 +137,19 @@ function readProductionSources(): Map<string, string> {
  * La deuda preexistente, con su conteo EXACTO por archivo (medido sobre el
  * árbol real, no copiado del enunciado). Son los pisos que ya existían antes de
  * este primitivo y que otra unidad migra; esta unidad no toca ningún consumidor.
- * Si un archivo permitido suma o pierde un piso, el conteo deja de coincidir y
- * la guarda falla.
+ * Si un archivo permitido suma un piso, el conteo deja de coincidir y la guarda
+ * falla: un `min-w-[Npx]` nuevo es deuda nueva.
+ *
+ * Y si una unidad MIGRA un consumidor al primitivo, el número BAJA en la misma
+ * medida: ese es el modo de pagar la deuda. Las dos tablas de liquidación de
+ * `payroll-client.tsx` ya lo hicieron (6 → 4); el archivo todavía tiene cuatro
+ * pisos a mano, pero ninguno es el de esas dos tablas.
  */
 const ALLOWLIST = new Map<string, number>([
   ["app/cash/cash-client.tsx", 1],
   ["app/inventory/inventory-client.tsx", 2],
   ["app/invoices/invoices-client.tsx", 7],
-  ["app/payroll/payroll-client.tsx", 6],
+  ["app/payroll/payroll-client.tsx", 4],
   ["app/services/services-client.tsx", 1],
   ["app/vales/vouchers-client.tsx", 1],
 ]);
@@ -340,8 +345,228 @@ describe("la escala vive una sola vez: en el primitivo", () => {
       }
     }
     expect(failures).toEqual([]);
-    // Los seis archivos que ya tenían pisos, y 18 en total: si un séptimo
+    // Los seis archivos que ya tenían pisos, y 16 en total: si un séptimo
     // apareciera sin entrar acá, el test de arriba ya lo habría marcado.
-    expect([...ALLOWLIST.values()].reduce((total, hits) => total + hits, 0)).toBe(18);
+    // La cifra BAJA cuando una unidad migra un consumidor al primitivo: las dos
+    // tablas de liquidación de `payroll-client.tsx` dejaron de escribir su
+    // `min-w-[1040px]` a mano (6 → 4) y esa deuda queda pagada, no escondida.
+    expect([...ALLOWLIST.values()].reduce((total, hits) => total + hits, 0)).toBe(16);
   });
 });
+
+/* --------------------------------------------------------------------------
+   LAS DOS TABLAS DE LIQUIDACIÓN YA PASAN POR EL PRIMITIVO.
+
+   La queja del dueño: «hay que ajustar el diseño de la liquidación para que
+   aproveche el espacio en pantalla porque queda muy espichado». Medido, el
+   cuello de botella NO era el piso de la tabla sino el diálogo: `max-w-6xl`
+   con `p-6` y un `pr-1` dejaban 1098px útiles en CUALQUIER monitor, y las 12
+   columnas piden unos 1450. La tabla se ajustaba a ese tope y por eso leía
+   apretada.
+
+   LO QUE ESTA GUARDA AFIRMA, del archivo real y por fuente (mismo método que
+   las guardas de consumidor de este archivo: sin DOM no hay props):
+     1. las dos tablas se montan por `DataTable`, con el paso `2xl` de la escala
+        compartida y sin carril escrito a mano;
+     2. conservan las 12 columnas, en el mismo orden (esto es un ajuste de
+        diseño, no una poda de contenido);
+     3. el dinero va a la derecha con cifras tabulares y ningún encabezado se
+        apila.
+
+   LA CELDA DE VALES ES LA EXCEPCIÓN DECLARADA: `tests/payroll.test.ts`
+   congela su apertura literal porque esa columna es la regla del dueño. El
+   valor se alinea en el `<span>` interno, y esta guarda afirma la excepción
+   para que nadie la lea como un descuido ni la "arregle" rompiendo la otra.
+   -------------------------------------------------------------------------- */
+
+const PAYROLL_CLIENT_PATH = "app/payroll/payroll-client.tsx";
+
+/** Las dos tablas de liquidación, por el componente que las monta. */
+const SETTLEMENT_TABLES = ["PeriodDetailTable", "DraftPayrollTable"] as const;
+
+/** Las 12 columnas, en orden. Ninguna se quita: la tabla deja de apretar, no de informar. */
+const SETTLEMENT_COLUMNS = [
+  "Empleado",
+  "Fijo (días)",
+  "Comisión fija",
+  "Comisión por porcentaje",
+  "Bonos",
+  "Vales (descuento)",
+  "Otros (descuento)",
+  "Motivo del ajuste",
+  "Neto",
+  "Pagado",
+  "Saldo",
+  "Detalle",
+] as const;
+
+/** 9 de las 12 son dinero: todas menos Empleado, Motivo del ajuste y Detalle. */
+const MONEY_COLUMNS = 9;
+
+/** El paso del primitivo que estas dos tablas usan: el mismo piso, con nombre. */
+const PRIMITIVE_USE = '<DataTable minWidth="2xl" wrapperClassName="mt-4">';
+
+/** El bloque de un componente: de su firma hasta la siguiente `function`. */
+function componentBlock(source: string, name: string): string {
+  const start = source.indexOf(`function ${name}(`);
+  if (start === -1) return "";
+  const next = source.indexOf("\nfunction ", start);
+  return next === -1 ? source.slice(start) : source.slice(start, next);
+}
+
+/** Los `<th scope="col">` del bloque, con la clase que reciben y su rótulo. */
+function tableHeaders(block: string): { className: string; label: string }[] {
+  const pattern = /<th className=\{([^}]+)\} scope="col">\s*([^<]*?)\s*<\/th>/g;
+  return [...block.matchAll(pattern)].map((match) => ({
+    className: match[1],
+    label: match[2],
+  }));
+}
+
+/** Cuántos `<td>` de dinero hay: los planos y el de `font-semibold` (Neto). */
+function moneyCellCount(block: string): number {
+  const plain = block.match(/<td className=\{moneyCellClass\}>/g) ?? [];
+  const bold = block.match(/<td className=\{cn\(moneyCellClass, "font-semibold"\)\}>/g) ?? [];
+  return plain.length + bold.length;
+}
+
+/** Encabezados que no son de las dos clases de nowrap: los que se apilan. */
+function wrappingHeaders(block: string): string[] {
+  return tableHeaders(block)
+    .filter((header) => header.className !== "headCellClass" && header.className !== "moneyHeadClass")
+    .map((header) => header.label);
+}
+
+describe("las tablas de liquidación de nómina pasan por `DataTable`", () => {
+  const source = SOURCES.get(PAYROLL_CLIENT_PATH) ?? "";
+
+  it("piso anti-vacío: el cliente se leyó y las dos tablas existen", () => {
+    expect(source.length).toBeGreaterThan(20_000);
+    for (const name of SETTLEMENT_TABLES) {
+      expect(componentBlock(source, name).length, name).toBeGreaterThan(1_000);
+    }
+  });
+
+  it("cada tabla se monta por el primitivo, con el paso `2xl` de la escala", () => {
+    for (const name of SETTLEMENT_TABLES) {
+      const block = componentBlock(source, name);
+      expect(block.split(PRIMITIVE_USE).length - 1, `${name}: abre con DataTable`).toBe(1);
+      // Y cierra con el primitivo, no con un `</table>` suelto.
+      expect(block.split("</DataTable>").length - 1, `${name}: cierra con DataTable`).toBe(1);
+    }
+    // Las dos, y solo dos: este carril no se multiplica.
+    expect(source.split("<DataTable ").length - 1).toBe(SETTLEMENT_TABLES.length);
+  });
+
+  it("ninguna de las dos escribe su propio carril ni su propio piso de ancho", () => {
+    for (const name of SETTLEMENT_TABLES) {
+      const block = componentBlock(source, name);
+      expect(stripComments(block), `${name}: carril a mano`).not.toContain("overflow-x-auto");
+      expect(inventedMinWidths(block), `${name}: piso a mano`).toEqual([]);
+    }
+  });
+
+  it("la deuda del archivo bajó: los cuatro pisos que quedan son de otras tablas", () => {
+    // El 6 → 4 de la allowlist no es borrar un token suelto: los dos que
+    // faltan son los que el primitivo renderiza hoy por su cuenta, y las dos
+    // tablas que los tenían ya no los escriben.
+    expect(inventedMinWidths(source)).toHaveLength(ALLOWLIST.get(PAYROLL_CLIENT_PATH) ?? -1);
+    for (const name of SETTLEMENT_TABLES) {
+      expect(componentBlock(source, name), `${name}: piso propio`).not.toContain("min-w-[1040px]");
+    }
+  });
+
+  it("las 12 columnas siguen ahí, en el mismo orden, en las dos tablas", () => {
+    for (const name of SETTLEMENT_TABLES) {
+      const headers = tableHeaders(componentBlock(source, name));
+      expect(headers.length, `${name}: número de columnas`).toBe(SETTLEMENT_COLUMNS.length);
+      expect(headers.map((header) => header.label), `${name}: rótulos`).toEqual([
+        ...SETTLEMENT_COLUMNS,
+      ]);
+    }
+  });
+
+  it("el dinero va a la derecha con cifras tabulares, y su encabezado con él", () => {
+    // La clase es local del módulo (el estándar compartido no crece por una
+    // tabla), pero lo que se afirma es lo que dice: la columna numérica se lee
+    // en vertical.
+    expect(source).toMatch(/const\s+moneyCellClass\s*=\s*cn\([^)]*"text-right tabular-nums/);
+    expect(source).toMatch(/const\s+moneyHeadClass\s*=\s*cn\([^)]*"whitespace-nowrap text-right/);
+    for (const name of SETTLEMENT_TABLES) {
+      const block = componentBlock(source, name);
+      const money = tableHeaders(block).filter((header) => header.className === "moneyHeadClass");
+      expect(money.length, `${name}: encabezados de dinero`).toBe(MONEY_COLUMNS);
+      // Y las celdas: 8 en la cerrada (bonos y otros son valores fijos) y 6 en
+      // el borrador (los dos campos de ajuste son inputs `text-right` de por sí).
+      expect(moneyCellCount(block), `${name}: celdas de dinero`).toBe(
+        name === "PeriodDetailTable" ? 8 : 6,
+      );
+    }
+  });
+
+  it("la celda de vales conserva la apertura congelada y alinea el valor adentro", () => {
+    const celdas: [string, string][] = [
+      ["PeriodDetailTable", '<td className={tableCellClass} title={voucherCellTitle(item)}>'],
+      [
+        "DraftPayrollTable",
+        '<td className={tableCellClass} title={item ? voucherCellTitle(item) : undefined}>',
+      ],
+    ];
+    for (const [name, opening] of celdas) {
+      const block = componentBlock(source, name);
+      expect(block, `${name}: apertura congelada`).toContain(opening);
+      const start = block.indexOf(opening);
+      const cell = block.slice(start, block.indexOf("</td>", start));
+      expect(cell, `${name}: el valor de vales se alinea`).toContain(
+        '<span className="block text-right tabular-nums">',
+      );
+      // Sigue siendo SOLO el total real: alinear no=coló de vuelta el desglose
+      // que el dueño rechazó.
+      expect(cell.split("-${formatMoney(item.voucher_total)}").length - 1, `${name}: total`).toBe(1);
+      expect(cell, `${name}: sin aplicado`).not.toContain("item.deductions_vales");
+      expect(cell, `${name}: sin deuda`).not.toContain("item.pending_debt");
+    }
+  });
+
+  it("ningún encabezado se apila: los 12 de cada tabla llevan `whitespace-nowrap`", () => {
+    // El síntoma visible del «espichado» era un rótulo de tres palabras partido
+    // en cuatro renglones dentro de una columna de 67px.
+    expect(source).toMatch(/const\s+headCellClass\s*=\s*cn\([^)]*"whitespace-nowrap"/);
+    for (const name of SETTLEMENT_TABLES) {
+      expect(wrappingHeaders(componentBlock(source, name)), `${name}: rótulos apilados`).toEqual([]);
+    }
+  });
+
+  it("el detector no es un sello de goma (control negativo)", () => {
+    // El marcado VIEJO de la queja: dos columnas de muestra, carril y piso a
+    // mano, dinero a la izquierda y rótulos que se apilan. El MISMO predicado
+    // tiene que acusarlo, o las guardas de arriba no afirmarían nada.
+    const viejo = [
+      "function PeriodDetailTable() {",
+      "  return (",
+      '    <div className="mt-4 overflow-x-auto">',
+      '      <table className={cn("w-full text-left text-sm", "min-w-[1040px]")}>',
+      '        <thead><tr className={tableHeaderClass}>',
+      '          <th className={tableCellClass} scope="col">Empleado</th>',
+      '          <th className={tableCellClass} scope="col">Neto</th>',
+      "        </tr></thead>",
+      "        <tbody>",
+      '          <tr><td className={tableCellClass}>{formatMoney(item.net_pay)}</td></tr>',
+      "        </tbody>",
+      "      </table>",
+      "    </div>",
+      "  );",
+      "}",
+    ].join("\n");
+    expect(viejo.split(PRIMITIVE_USE).length - 1).toBe(0);
+    expect(stripComments(viejo)).toContain("overflow-x-auto");
+    expect(inventedMinWidths(viejo)).toEqual(["min-w-[1040px]"]);
+    // El detector de columnas no se infla: dos rótulos son dos, no doce.
+    expect(tableHeaders(viejo)).toHaveLength(2);
+    expect(tableHeaders(viejo).length).not.toBe(SETTLEMENT_COLUMNS.length);
+    // Y el de dinero y el de rótulos apilados también acusan lo viejo.
+    expect(moneyCellCount(viejo)).toBe(0);
+    expect(wrappingHeaders(viejo)).toEqual(["Empleado", "Neto"]);
+  });
+});
+
