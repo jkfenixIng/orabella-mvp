@@ -2143,11 +2143,17 @@ function createPayrollPagedStubClient(): unknown {
       const periodSnapshot = [...(payrollPagedStub.tables.payroll_periods ?? [])];
       const itemSnapshot = [...(payrollPagedStub.tables.payroll_items ?? [])];
       const paymentSnapshot = [...(payrollPagedStub.tables.payroll_payments ?? [])];
+      // PAY-01 (066): la deuda también entra en la foto. Se clona cada fila
+      // porque el `SET NULL` de `applied_period_id` muta el objeto.
+      const carrySnapshot = (payrollPagedStub.tables.payroll_discount_carries ?? []).map(
+        (row) => ({ ...row }),
+      );
       const rollback = (message: string) => {
         for (const entry of voucherSnapshot) entry.row.status = entry.status;
         payrollPagedStub.tables.payroll_periods = periodSnapshot;
         payrollPagedStub.tables.payroll_items = itemSnapshot;
         payrollPagedStub.tables.payroll_payments = paymentSnapshot;
+        payrollPagedStub.tables.payroll_discount_carries = carrySnapshot;
         return { data: null, error: { code: "P0001", message } };
       };
       if (payrollPagedStub.failRpcWith) {
@@ -2201,6 +2207,19 @@ function createPayrollPagedStubClient(): unknown {
       payrollPagedStub.tables.payroll_payments = (
         payrollPagedStub.tables.payroll_payments ?? []
       ).filter((row) => !itemIds.has(String(row.payroll_item_id)));
+      // PAY-01 (066): las FK de `payroll_discount_carries` al período ya tienen
+      // `ON DELETE`: la deuda que el borrador PRODUJO (`origin_period_id`) cae
+      // CON él (CASCADE), y la que CONSUMIÓ (`applied_period_id`) vuelve a
+      // PENDIENTE (SET NULL), porque borrar los ítems deshace la absorción y el
+      // período de ORIGEN sigue existiendo. Las dos mutaciones son parte de la
+      // MISMA transacción que el borrado.
+      payrollPagedStub.tables.payroll_discount_carries = (
+        payrollPagedStub.tables.payroll_discount_carries ?? []
+      )
+        .filter((row) => !gone.has(String(row.origin_period_id)))
+        .map((row) =>
+          gone.has(String(row.applied_period_id)) ? { ...row, applied_period_id: null } : row,
+        );
       payrollPagedStub.deletes.push({ table: "payroll_periods", count: 1 });
       return { data: reverted.length, error: null };
     }
@@ -8377,6 +8396,7 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
     payrollPagedStub.rpcCalls.filter((call) => call.name === "payroll_delete_period_atomic");
   const looseVoucherUpdates = () =>
     payrollPagedStub.updates.filter((entry) => entry.table === "voucher_requests");
+  const carryRows = () => payrollPagedStub.tables.payroll_discount_carries ?? [];
 
   beforeEach(() => resetPayrollStubState());
   afterEach(() => resetPayrollStubState());
@@ -8561,6 +8581,104 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
     expect(deleteCalls()[0].args.p_to_approved).toEqual([]);
     expect(deleteCalls()[0].args.p_to_pending).toEqual([]);
     expect(periodStillThere()).toBe(false);
+  });
+
+  // ------------------------------------------ deuda y borrado (066) ---
+
+  it("PAY-01 (066): borrar un borrador que PRODUJO una deuda la borra CON él (CASCADE)", async () => {
+    seedDraft();
+    // El sobrante de un vale mayor que el bruto del período (061): una deuda
+    // PENDIENTE cuyo origen es ESTE borrador. Antes de la 066 esta fila
+    // bloqueaba el `DELETE` del período con un 23503 y el borrado moría con
+    // `INTERNAL: Error interno.`.
+    payrollPagedStub.tables.payroll_discount_carries = [
+      {
+        id: "deuda-producida",
+        sede_id: payrollPagedStub.SEDE_ID,
+        employee_id: EMPLOYEE_ID,
+        amount: 30_000,
+        origin_period_id: PERIOD_ID,
+        applied_period_id: null,
+        origin_kind: "voucher_excess",
+      },
+    ];
+
+    const result = await payrollExtrasService.deletePayrollPeriod(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      ACTOR,
+    );
+
+    // El borrado se completa y la deuda que el borrador generó se va con él:
+    // la misma transacción revirtió los vales que la causaron, así que ya no
+    // tiene causa. Conservarla sería una deuda sin vale que la explique.
+    expect(result).toEqual({ id: PERIOD_ID });
+    expect(periodStillThere()).toBe(false);
+    expect(carryRows()).toEqual([]);
+  });
+
+  it("PAY-01 (066): borrar un borrador que CONSUMIÓ una deuda la devuelve a PENDIENTE (SET NULL)", async () => {
+    seedDraft();
+    // Una deuda de un período ANTERIOR que ESTE borrador absorbió dentro de
+    // `other_discounts` (062): `applied_period_id` apunta a este borrador. Al
+    // borrarlo, borrar sus ítems deshace la absorción y la deuda debe volver a
+    // estar pendiente, porque su período de ORIGEN sigue existiendo.
+    payrollPagedStub.tables.payroll_discount_carries = [
+      {
+        id: "deuda-consumida",
+        sede_id: payrollPagedStub.SEDE_ID,
+        employee_id: EMPLOYEE_ID,
+        amount: 15_000,
+        origin_period_id: "11111111-1111-4111-8111-111111111111",
+        applied_period_id: PERIOD_ID,
+        origin_kind: "voucher_excess",
+      },
+    ];
+
+    await payrollExtrasService.deletePayrollPeriod(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      ACTOR,
+    );
+
+    // La fila NO se pierde: se posterga. El origen queda intacto (es la
+    // trazabilidad) y el borrador consumidor desaparece de `applied_period_id`.
+    expect(carryRows()).toHaveLength(1);
+    expect(carryRows()[0]).toMatchObject({
+      id: "deuda-consumida",
+      amount: 15_000,
+      origin_period_id: "11111111-1111-4111-8111-111111111111",
+      applied_period_id: null,
+    });
+  });
+
+  it("PAY-01 (066): borrar un borrador sin deuda no toca la deuda de otros períodos", async () => {
+    seedDraft();
+    // Una deuda ajena: ni su origen ni su aplicación son este borrador. El
+    // CASCADE y el SET NULL están acotados a las filas que referencian el
+    // período borrado; las demás quedan EXACTAMENTE igual.
+    const ajena = {
+      id: "deuda-de-otro-periodo",
+      sede_id: payrollPagedStub.SEDE_ID,
+      employee_id: EMPLOYEE_ID,
+      amount: 7_000,
+      origin_period_id: "11111111-1111-4111-8111-111111111111",
+      applied_period_id: "33333333-3333-4333-8333-333333333333",
+      origin_kind: "carry_remainder",
+    };
+    payrollPagedStub.tables.payroll_discount_carries = [ajena];
+
+    const result = await payrollExtrasService.deletePayrollPeriod(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      ACTOR,
+    );
+
+    expect(result).toEqual({ id: PERIOD_ID });
+    expect(periodStillThere()).toBe(false);
+    // La fila ajena conserva su `applied_period_id`: no se confunde "el
+    // período que borré" con "un período cualquiera".
+    expect(carryRows()).toEqual([ajena]);
   });
 });
 
@@ -8978,6 +9096,83 @@ describe("migración 048_payroll_admin_atomic.sql (CL-9)", () => {
     // El número libre siguiente y el archivo hermano (047) que se espeja.
     expect(raw).toContain("048");
     expect(raw).toContain("047");
+  });
+});
+
+describe("migración 066_payroll_carry_delete_fks.sql (PAY-01)", () => {
+  const migration = (): { raw: string; sql: string } => {
+    const raw = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "066_payroll_carry_delete_fks.sql"),
+      "utf8",
+    );
+    return {
+      raw,
+      sql: raw
+        .split("\n")
+        .filter((line) => !line.trimStart().startsWith("--"))
+        .join("\n"),
+    };
+  };
+
+  it("re-declara las DOS FK con su ON DELETE y con el nombre por defecto de Postgres", () => {
+    const { sql } = migration();
+    // Los nombres que Postgres asignó a las declaraciones en línea de 061; se
+    // vuelven a usar en el ADD para que un re-run no acumule restricciones.
+    expect(sql).toContain(
+      "DROP CONSTRAINT IF EXISTS payroll_discount_carries_origin_period_id_fkey",
+    );
+    expect(sql).toContain(
+      "DROP CONSTRAINT IF EXISTS payroll_discount_carries_applied_period_id_fkey",
+    );
+    expect(sql).toContain(
+      "ADD CONSTRAINT payroll_discount_carries_origin_period_id_fkey",
+    );
+    expect(sql).toContain(
+      "ADD CONSTRAINT payroll_discount_carries_applied_period_id_fkey",
+    );
+    // El origen cae con el borrador; la aplicación vuelve a PENDIENTE.
+    expect(sql).toMatch(
+      /FOREIGN KEY \(origin_period_id\) REFERENCES public\.payroll_periods \(id\)\s*ON DELETE CASCADE/,
+    );
+    expect(sql).toMatch(
+      /FOREIGN KEY \(applied_period_id\) REFERENCES public\.payroll_periods \(id\)\s*ON DELETE SET NULL/,
+    );
+    // `origin_period_id` es NOT NULL: `SET NULL` no es una opción para él.
+    expect(sql).not.toMatch(/FOREIGN KEY \(origin_period_id\)[^;]*ON DELETE SET NULL/);
+  });
+
+  it("sólo toca las dos FK: ni datos, ni otra tabla, ni otra columna", () => {
+    const { sql } = migration();
+    // Cuatro sentencias: dos DROP y dos ADD, todas sobre la misma tabla.
+    expect(sql.match(/ALTER TABLE/g) ?? []).toHaveLength(4);
+    expect(sql.match(/DROP CONSTRAINT IF EXISTS/g) ?? []).toHaveLength(2);
+    expect(sql.match(/ADD CONSTRAINT/g) ?? []).toHaveLength(2);
+    const tables = new Set(
+      (sql.match(/ALTER TABLE public\.\w+/g) ?? []).map((entry) => entry.split(".")[1]),
+    );
+    expect([...tables]).toEqual(["payroll_discount_carries"]);
+    // Ninguna migración de datos ni cambio de columna/índice/RLS.
+    expect(sql).not.toMatch(/INSERT INTO/i);
+    expect(sql).not.toMatch(/UPDATE public\./i);
+    expect(sql).not.toMatch(/DELETE FROM/i);
+    expect(sql).not.toMatch(/ADD COLUMN/i);
+    expect(sql).not.toMatch(/DROP COLUMN/i);
+    expect(sql).not.toMatch(/CREATE INDEX/i);
+    expect(sql).not.toMatch(/CREATE TABLE/i);
+  });
+
+  it("explica por qué el NO ACTION de 061 era incorrecto y el costo de numeración", () => {
+    const { raw } = migration();
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    // El motivo: el borrador SÍ se borra y la deuda lo bloqueaba con un 23503.
+    expect(raw).toContain("payroll_delete_period_atomic");
+    expect(raw).toContain("23503");
+    expect(raw).toContain("origin_period_id");
+    expect(raw).toContain("applied_period_id");
+    // El número libre siguiente y el archivo hermano que se espeja.
+    expect(raw).toContain("066");
+    expect(raw).toContain("065");
   });
 });
 

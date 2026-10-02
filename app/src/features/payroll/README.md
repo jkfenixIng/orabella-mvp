@@ -24,7 +24,8 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   caja que abrió el vale), `approval_code` (histórico, ya sin uso),
   `observation`; descontada y rechazada terminales).
 - Vales reales y deuda del sobrante (migraciones `061_payroll_voucher_debt.sql`,
-  `062_payroll_carry_apply.sql` y `064_payroll_partial_carry.sql`):
+  `062_payroll_carry_apply.sql`, `064_payroll_partial_carry.sql` y
+  `066_payroll_carry_delete_fks.sql`):
   `payroll_items.voucher_total` guarda el
   **total REAL** de vales del empleado en el rango del período, FUERA de la
   igualdad del neto; `deductions_vales` sigue siendo lo que se **aplicó**
@@ -94,7 +95,9 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   pago dividido exacto 40/40/20, `SUM_MISMATCH`/`OVERPAID`, cerrado
   inmutable (`PERIOD_CLOSED`), tope día/semana con aprobación obligatoria,
   semana desde el lunes, estado inicial directo/pendiente por rango,
-  terminales sin doble descuento, y texto de las migraciones 007/024/026/028.
+  terminales sin doble descuento, el borrado de un borrador con historia de
+  deuda (la producida cae con el borrador, la consumida vuelve a pendiente;
+  migración 066), y texto de las migraciones 007/024/026/028/048/066.
 - RLS: deny-by-default; políticas por sede endurecidas en T8
   (`008_hardening.sql`: `TODO(seguridad-T7)` cerrado, claim
   `app_metadata.sede_id`).
@@ -107,6 +110,38 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
 - PRD: §5.6 PAY-01…04, §5.7 PAY-05…07, §9
   payroll_periods/items/payments + voucher_settings/requests, §10
   Nómina/vales, plan paso 6 (§12).
+
+## Borrado de un borrador con historia de deuda (066)
+
+Un borrador se borra con `deletePayrollPeriod` → `payroll_delete_period_atomic`
+(048): la reversión de los vales y el `DELETE` del período son UNA sola
+transacción. Hasta la `065`, ese borrado moría con `INTERNAL: Error interno.`
+cuando el período tenía historia de deuda. Las dos FK de
+`payroll_discount_carries` a `payroll_periods` (`origin_period_id` y
+`applied_period_id`) se declararon en la 061 SIN `ON DELETE` —eran las ÚNICAS
+de la tabla que referencian el período y las únicas sin cláusula—, así que el
+`DELETE` del paso 1.7 levantaba un `23503` que revertía la transacción entera y
+`toRpcDeletePeriodError` no tenía (ni podía tener) una rama para él. Se
+reproduce con UN solo vale mayor que el bruto del empleado en el período: el
+sobrante crea la deuda y el borrador deja de poder borrarse.
+
+La `066_payroll_carry_delete_fks.sql` re-declara las dos FK con la cláusula que
+les faltaba, sin tocar la tabla ni migrar datos. La semántica de cada una en el
+borrado:
+
+- **Deuda PRODUCIDA por el borrador** (`origin_period_id`): `ON DELETE
+  CASCADE`. La deuda se va CON el borrador, y es correcto: la misma transacción
+  revierte los vales que la causaron, así que la deuda se queda sin causa.
+  Conservarla sería una deuda sin vale que la explique. `origin_period_id` es
+  `NOT NULL`, así que `SET NULL` no es una opción para él.
+- **Deuda CONSUMIDA por el borrador** (`applied_period_id`): `ON DELETE SET
+  NULL`. La deuda vuelve a **PENDIENTE**: borrar los ítems deshace la absorción,
+  y el período de ORIGEN sigue existiendo, así que un ciclo POSTERIOR la vuelve
+  a aplicar. No se pierde: se posterga. La columna es nullable (NULL =
+  pendiente), que es justo el estado al que hay que volver.
+
+El `CASCADE` y el `SET NULL` están acotados a las filas que referencian el
+período borrado: la deuda de otros períodos queda intacta.
 
 ## Cadencia de pago y regla del mixto (F3)
 
