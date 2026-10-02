@@ -50,6 +50,7 @@ const EMPTY_EMPLOYEE = {
   email: "",
   birth_date: "",
   pay_type: "fijo",
+  pay_frequency: "",
   salary_fixed: "",
   commission_percent: "",
   is_active: true,
@@ -64,6 +65,28 @@ function payTypeLabel(payType: string): string {
   if (payType === "fijo") return "Fijo";
   if (payType === "porcentaje") return "Porcentaje";
   return "Mixto";
+}
+
+/**
+ * F2: opciones de la cadencia de pago. El valor vacío es "sin definir": deja la
+ * columna en NULL y CONSERVA el cálculo de hoy (el fijo se prorratea por los
+ * días calendario del período). Las otras tres dicen en DINERO qué parte del
+ * salario fijo mensual paga la nómina: semanal un cuarto, quincenal la mitad,
+ * mensual el mes completo. Es la única copia de esa lista: el `select`, la
+ * ayuda y el detalle la leen de acá.
+ */
+const PAY_FREQUENCY_OPTIONS = [
+  { value: "", label: "Sin definir" },
+  { value: "semanal", label: "Semanal (mensual / 4)" },
+  { value: "quincenal", label: "Quincenal (mensual / 2)" },
+  { value: "mensual", label: "Mensual (mes completo)" },
+] as const;
+
+function payFrequencyLabel(payFrequency: string | null | undefined): string {
+  return (
+    PAY_FREQUENCY_OPTIONS.find((option) => option.value === (payFrequency ?? ""))?.label ??
+    "Sin definir"
+  );
 }
 
 export function EmployeesSection({
@@ -130,6 +153,7 @@ export function EmployeesSection({
       email: row.email ?? "",
       birth_date: row.birth_date ?? "",
       pay_type: row.pay_type,
+      pay_frequency: row.pay_frequency ?? "",
       salary_fixed: row.salary_fixed != null ? String(row.salary_fixed) : "",
       commission_percent: row.commission_percent != null ? String(row.commission_percent) : "",
       is_active: row.is_active,
@@ -192,6 +216,7 @@ export function EmployeesSection({
       phone: form.phone.trim() === "" ? null : form.phone,
       position: form.position.trim() === "" ? null : form.position,
       pay_type: form.pay_type,
+      pay_frequency: form.pay_frequency === "" ? null : form.pay_frequency,
       salary_fixed: toNumber(form.salary_fixed),
       commission_percent: toNumber(form.commission_percent),
       is_active: form.is_active,
@@ -309,6 +334,10 @@ export function EmployeesSection({
               <div>
                 <dt className="text-text-secondary">Sueldo</dt>
                 <dd className="font-medium">{payTypeLabel(dialogRow.pay_type)}</dd>
+              </div>
+              <div>
+                <dt className="text-text-secondary">Frecuencia de pago</dt>
+                <dd className="font-medium">{payFrequencyLabel(dialogRow.pay_frequency)}</dd>
               </div>
               {(dialogRow.pay_type === "fijo" || dialogRow.pay_type === "mixto") && (
                 <div>
@@ -535,6 +564,25 @@ export function EmployeesSection({
               />
               <span className="text-xs text-text-tertiary">
                 Es el sueldo por MES: la nómina paga la parte que corresponde a los días del período.
+              </span>
+            </label>
+            <label className={labelClass}>
+              Frecuencia de pago
+              <select
+                value={form.pay_frequency}
+                onChange={(event) => setForm({ ...form, pay_frequency: event.target.value })}
+                className={inputClass}
+              >
+                {PAY_FREQUENCY_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <span className="text-xs text-text-tertiary">
+                Cómo se paga el salario fijo mensual: semanal, un cuarto (mensual / 4);
+                quincenal, la mitad (mensual / 2); mensual, el mes completo. «Sin definir»
+                conserva el cálculo de hoy: el fijo se prorratea por los días del período.
               </span>
             </label>
             <label className={labelClass}>

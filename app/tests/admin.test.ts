@@ -7,6 +7,7 @@ import {
   employeeSchema,
   isEmployeeCodeMissing,
   normalizeEmployeeCode,
+  payFrequencySchema,
   paymentMethodSchema,
   sedeSchema,
   serviceSchema,
@@ -754,6 +755,36 @@ describe("admin schemas: empleado y pay_type coherente (ADM-08)", () => {
     expect(
       checkPayCoherence({ pay_type: "mixto", salary_fixed: 1, commission_percent: 5 }),
     ).toBeNull();
+  });
+});
+
+describe("admin schemas: cadencia de pago del empleado (F2)", () => {
+  it("acepta las tres cadencias, null y la clave ausente; rechaza cualquier otro valor", () => {
+    for (const cadencia of ["semanal", "quincenal", "mensual"]) {
+      expect(
+        employeeSchema.safeParse(baseEmployee({ pay_frequency: cadencia })).success,
+        `debería aceptar ${cadencia}`,
+      ).toBe(true);
+    }
+    // `null` es «sin cadencia definida»: un valor LEGAL, no un hueco.
+    expect(employeeSchema.safeParse(baseEmployee({ pay_frequency: null })).success).toBe(true);
+    // La clave ausente también: es el estado de todo legajo anterior a F2.
+    expect(employeeSchema.safeParse(baseEmployee()).success).toBe(true);
+
+    for (const invalida of ["diario", "Semanal", "semanal ", "quincenal (x)", "", 4, true]) {
+      expect(
+        employeeSchema.safeParse(baseEmployee({ pay_frequency: invalida })).success,
+        `debería rechazar ${JSON.stringify(invalida)}`,
+      ).toBe(false);
+    }
+  });
+
+  it("el catálogo del esquema es el cerrado de la columna y no admite null por sí solo", () => {
+    for (const cadencia of ["semanal", "quincenal", "mensual"]) {
+      expect(payFrequencySchema.safeParse(cadencia).success, cadencia).toBe(true);
+    }
+    expect(payFrequencySchema.safeParse("diario").success).toBe(false);
+    expect(payFrequencySchema.safeParse(null).success).toBe(false);
   });
 });
 
@@ -1734,5 +1765,233 @@ describe("admin: los campos numéricos de las secciones pasan por su máscara (g
     expect(block).toContain("setNewValue(event.target.value)");
     // Sin el ancla no hay bloque: la guarda falla en vez de pasar sola.
     expect(onChangeBlock(fake, "no-existe:")).toBe("");
+  });
+});
+
+/* ==========================================================================
+   F2: la cadencia de pago del empleado
+
+   El alta y la edición divergen en el camino de escritura: la EDICIÓN usa el
+   `upsert` suelto de PostgREST (escribe las columnas POR NOMBRE), y el ALTA usa
+   el rpc `upsert_employee_atomic` (054), que escribía una LISTA DE COLUMNAS
+   FIJA e ignoraba la cadencia en silencio. Por eso F2 trae una migración (065)
+   que reemplaza la función con la misma firma y le agrega la clave.
+   ========================================================================== */
+describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", () => {
+  /** El legajo que existía antes de F2: sin cadencia. */
+  const EDIT_ID = "66666666-6666-4666-8666-666666666666";
+
+  function sembrarLegajos(): void {
+    postgrest.rows = {};
+    postgrest.rows.users = [];
+    postgrest.rows.roles = ROLES_CATALOGO.map((rol) => ({ ...rol }));
+    postgrest.rows.user_roles = [];
+    postgrest.rows.employees = [];
+  }
+
+  beforeEach(() => {
+    sembrarLegajos();
+    postgrest.singleWrites.length = 0;
+    postgrest.rpcCalls.length = 0;
+    postgrest.selects.length = 0;
+    postgrest.failRpc = null;
+    postgrest.failWrite = null;
+    postgrest.failWriteTabla = null;
+    postgrest.failRead = null;
+    postgrest.hold = false;
+  });
+
+  it("el alta escribe la cadencia en el legajo y la devuelve en la fila", async () => {
+    const fila = await upsertEmployee(baseEmployee({ pay_frequency: "semanal" }));
+
+    expect(fila.pay_frequency).toBe("semanal");
+    expect(memoryRows("employees")[0]?.pay_frequency).toBe("semanal");
+    // Viaja DENTRO de `p_employee`: el rpc es la única escritura del alta.
+    expect(postgrest.rpcCalls.map((llamada) => llamada.fn)).toEqual(["upsert_employee_atomic"]);
+    expect(postgrest.rpcCalls[0]?.args.p_employee).toMatchObject({ pay_frequency: "semanal" });
+    expect(postgrest.singleWrites).toEqual([]);
+  });
+
+  it("null es un valor legal: el legajo queda sin cadencia y la clave igual viaja", async () => {
+    const fila = await upsertEmployee(baseEmployee({ pay_frequency: null }));
+
+    expect(fila.pay_frequency).toBeNull();
+    expect(memoryRows("employees")[0]?.pay_frequency).toBeNull();
+    expect(postgrest.rpcCalls[0]?.args.p_employee).toMatchObject({ pay_frequency: null });
+  });
+
+  it("sin la clave también queda en null: la cadencia no se inventa ni se hereda", async () => {
+    const fila = await upsertEmployee(baseEmployee());
+
+    expect(fila.pay_frequency).toBeNull();
+    expect(memoryRows("employees")[0]?.pay_frequency).toBeNull();
+  });
+
+  it("la edición persiste la cadencia por el upsert suelto (el alta no se llama)", async () => {
+    postgrest.rows.employees = [
+      {
+        id: EDIT_ID,
+        sede_id: SEDE_A,
+        user_id: null,
+        full_name: "Carolina Rojas",
+        document: "123456",
+        pay_type: "fijo",
+        pay_frequency: null,
+        salary_fixed: 1000000,
+        is_active: true,
+      },
+    ];
+
+    const fila = await upsertEmployee(baseEmployee({ id: EDIT_ID, pay_frequency: "quincenal" }));
+
+    expect(fila.pay_frequency).toBe("quincenal");
+    expect(memoryRows("employees")[0]?.pay_frequency).toBe("quincenal");
+    // La edición no crea usuarios ni roles: es UNA escritura suelta.
+    expect(postgrest.rpcCalls).toEqual([]);
+    expect(postgrest.singleWrites).toContain("employees.upsert");
+  });
+
+  it("un valor fuera del catálogo se rechaza ANTES de escribir: ni rpc, ni upsert, ni fila", async () => {
+    await expect(upsertEmployee(baseEmployee({ pay_frequency: "diario" }))).rejects.toMatchObject({
+      code: "VALIDATION",
+      status: 400,
+    });
+
+    expect(postgrest.rpcCalls).toEqual([]);
+    expect(postgrest.singleWrites).toEqual([]);
+    expect(memoryRows("employees")).toEqual([]);
+  });
+
+  // ---- guardas de fuente: el select, la migración y la UI -----------------
+  const serviceSource = readFileSync(
+    join(process.cwd(), "src", "features", "admin", "service.ts"),
+    "utf8",
+  );
+  const employeesSection = readFileSync(
+    join(process.cwd(), "app", "admin", "admin-sections", "employees-section.tsx"),
+    "utf8",
+  );
+  const migration065 = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "065_employee_pay_frequency.sql"),
+    "utf8",
+  );
+
+  /** Columnas de la constante `EMPLOYEE_SELECT` real. */
+  function employeeSelectColumns(source: string): string[] {
+    const match = source.match(/const EMPLOYEE_SELECT =\s*"([^"]*)"/);
+    if (!match) return [];
+    return match[1].split(",").map((columna) => columna.trim());
+  }
+
+  /** Valores del catálogo de cadencias de la UI (el `""` es «Sin definir»). */
+  function cadenceValues(source: string): string[] {
+    const block = source.match(/const PAY_FREQUENCY_OPTIONS = \[([\s\S]*?)\] as const;/);
+    if (!block) return [];
+    return [...block[1].matchAll(/value: "([^"]*)"/g)].map((match) => match[1]);
+  }
+
+  /** Columnas del INSERT del legajo dentro de `upsert_employee_atomic`. */
+  function insertedEmployeeColumns(sql: string): string[] {
+    const insert = sql.match(/INSERT INTO public\.employees\s*\(([\s\S]*?)\)\s*\n\s*VALUES/);
+    if (!insert) return [];
+    return insert[1].split(",").map((columna) => columna.trim());
+  }
+
+  /** El SQL fuera del cuerpo PL/pgSQL (donde vive la migración de datos). */
+  function outsideFunctionBody(sql: string): string {
+    return sql.replace(/\$\$[\s\S]*?\$\$/g, "");
+  }
+
+  it("el select de empleados LEE la cadencia: sin eso, la fila volvería sin ella", () => {
+    expect(employeeSelectColumns(serviceSource)).toContain("pay_frequency");
+  });
+
+  it("la UI ofrece la cadencia en el alta y la edición, con la fracción en dinero y «Sin definir»", () => {
+    // El `""` es «Sin definir»: deja la columna en NULL y conserva el cálculo de hoy.
+    expect(cadenceValues(employeesSection)).toEqual(["", "semanal", "quincenal", "mensual"]);
+    expect(employeesSection).toContain("value={form.pay_frequency}");
+    expect(employeesSection).toContain(
+      "setForm({ ...form, pay_frequency: event.target.value })",
+    );
+    // Alta: el formulario nace en «Sin definir». Edición: se hidrata de la fila.
+    expect(employeesSection).toMatch(/pay_frequency: "",\s*\n\s*salary_fixed: "",/);
+    expect(employeesSection).toContain("pay_frequency: row.pay_frequency ?? \"\",");
+    // La ayuda dice en DINERO qué paga cada cadencia y qué significa no elegir.
+    expect(employeesSection).toContain("mensual / 4");
+    expect(employeesSection).toContain("mensual / 2");
+    expect(employeesSection).toContain("mes completo");
+    expect(employeesSection).toContain("conserva el cálculo de hoy");
+    // El detalle también la muestra.
+    expect(employeesSection).toContain("{payFrequencyLabel(dialogRow.pay_frequency)}");
+  });
+
+  it("«Sin definir» viaja como null: nunca se manda la cadena vacía a la base", () => {
+    expect(employeesSection).toContain(
+      'pay_frequency: form.pay_frequency === "" ? null : form.pay_frequency,',
+    );
+  });
+
+  it("la migración 065 reemplaza la función con la MISMA firma y le agrega la cadencia", () => {
+    expect(migration065).toContain("CREATE OR REPLACE FUNCTION public.upsert_employee_atomic(");
+    expect(migration065).toContain(
+      "p_employee jsonb, p_user_id uuid, p_create_user jsonb, p_role_code text",
+    );
+    expect(migration065).toContain("RETURNS jsonb");
+    // La clave es OPCIONAL y su valor PRESENTE se valida contra el catálogo cerrado.
+    expect(migration065).toContain("p_employee ? 'pay_frequency'");
+    expect(migration065).toContain("NOT IN ('semanal', 'quincenal', 'mensual')");
+    // Se ESCRIBE en el legajo y se DEVUELVE en la fila.
+    expect(insertedEmployeeColumns(migration065)).toContain("pay_frequency");
+    expect(migration065).toContain("'pay_frequency', v_fila.pay_frequency");
+    // El contrato de la función (search_path, ACL, COMMENT) se re-emite.
+    const firma = "public.upsert_employee_atomic(jsonb, uuid, jsonb, text)";
+    expect(migration065).toContain(
+      `ALTER FUNCTION ${firma} SET search_path = public;`,
+    );
+    expect(migration065).toContain(`REVOKE ALL ON FUNCTION ${firma} FROM PUBLIC`);
+    expect(migration065).toContain(`REVOKE ALL ON FUNCTION ${firma} FROM anon`);
+    expect(migration065).toContain(`REVOKE ALL ON FUNCTION ${firma} FROM authenticated`);
+    expect(migration065).toContain(`GRANT EXECUTE ON FUNCTION ${firma} TO service_role`);
+    expect(migration065).toContain(`COMMENT ON FUNCTION ${firma} IS`);
+  });
+
+  it("la 065 no migra datos ni toca la columna (eso es la 063) y declara que no se ejecutó", () => {
+    const sqlSinComentarios = migration065
+      .split("\n")
+      .filter((linea) => !linea.trimStart().startsWith("--"))
+      .join("\n");
+    // Fuera del cuerpo de la función no hay una sola sentencia de datos ni DDL
+    // de tabla: los legajos existentes quedan con su cadencia como está.
+    const fueraDelCuerpo = outsideFunctionBody(sqlSinComentarios);
+    expect(fueraDelCuerpo).not.toMatch(/\b(INSERT|UPDATE|DELETE)\b/);
+    expect(fueraDelCuerpo).not.toMatch(/\bALTER TABLE\b/);
+    expect(fueraDelCuerpo).not.toMatch(/\bDROP\b/);
+    // Idempotente: reemplaza, no crea otra sobrecarga.
+    expect(sqlSinComentarios).not.toMatch(/^CREATE FUNCTION/m);
+    expect(migration065).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("control negativo de los detectores de fuente (no son sellos de goma)", () => {
+    expect(employeeSelectColumns('const EMPLOYEE_SELECT =\n  "id, full_name";')).not.toContain(
+      "pay_frequency",
+    );
+    expect(cadenceValues("<select></select>")).toEqual([]);
+    expect(
+      cadenceValues('const PAY_FREQUENCY_OPTIONS = [{ value: "diario", label: "Diario" }] as const;'),
+    ).toEqual(["diario"]);
+    expect(insertedEmployeeColumns("INSERT INTO public.employees (sede_id) VALUES (1);")).not.toContain(
+      "pay_frequency",
+    );
+    expect(insertedEmployeeColumns("SELECT 1;")).toEqual([]);
+    // La migración falsa (sin la clave) NO pasa el detector de la escritura.
+    expect(
+      insertedEmployeeColumns(
+        "INSERT INTO public.employees (sede_id)\n  VALUES ((x)::uuid)",
+      ),
+    ).not.toContain("pay_frequency");
+    // Y la UI no estrena las primitivas ni los roles que otras guardas pinean.
+    expect(employeesSection).not.toMatch(/\brole\s*=\s*["'{]/);
+    expect(employeesSection).not.toMatch(/<Badge\b/);
+    expect(employeesSection).not.toMatch(/<Alert\b/);
   });
 });

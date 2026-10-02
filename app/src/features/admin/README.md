@@ -20,6 +20,12 @@ impuestos por sede (inician inactivos en 0), métodos de pago Colombia por sede.
   sin login) pero UNIQUE; coherencia `pay_type` (fijo exige `salary_fixed`
   sin comisión, porcentaje exige `commission_percent` sin fijo, mixto exige
   ambos) vía `checkPayCoherence` + `superRefine` en Zod.
+- F2: `pay_frequency` (semanal/quincenal/mensual, catálogo cerrado vía
+  `payFrequencySchema`) opcional en alta y edición; `null` es «sin cadencia
+  definida» y conserva el cálculo de hoy (el fijo se prorratea por los días del
+  período). El alta viaja por `upsert_employee_atomic`, y la migración
+  `065_employee_pay_frequency.sql` reemplaza esa función con la MISMA firma para
+  que escriba la columna (la 054 la ignoraba en silencio).
 - ADM-04: `setUserRoles` reemplaza roles (doble rol permitido); surte efecto
   en el siguiente request porque `getSessionUser` lee `user_roles` siempre.
 - ADM-05: `upsertService` con `duracion_min <= duracion_max` (Zod + CHECK).
@@ -75,6 +81,10 @@ políticas RLS con TODO, seeds).
   baja de una denominación pide `ConfirmDialog`; las tablas de empleados y
   usuarios usan `DataTable`; los vacíos usan `EmptyState`; el reseteo de clave
   se confirma en la propia fila (confirmación inline, no diálogo).
+- La frecuencia de pago del empleado se pregunta en el mismo `FormDialog` de
+  alta/edición (select con «Sin definir» + la fracción en dinero de cada
+  cadencia) y se muestra en el detalle; `Sin definir` guarda `null` y no cambia
+  nada.
 - El diálogo "Nuevo usuario" se eliminó: los usuarios se crean con el
   empleado, así que ese diálogo nunca podía ser el segundo camino.
 - Vocabulario y superficies: `app/docs/ux-ui-standard.md`.

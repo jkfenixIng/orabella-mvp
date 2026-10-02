@@ -172,6 +172,19 @@ export interface EmployeeRow {
   email: string | null;
   birth_date: string | null;
   pay_type: string;
+  /**
+   * F2: cadencia acordada con el empleado (`employees.pay_frequency`, 063).
+   * `null` es «sin cadencia definida»: el fijo se prorratea por los días del
+   * período, que es el comportamiento de hoy.
+   *
+   * OPCIONAL en el TIPO a propósito: la columna existe y `EMPLOYEE_SELECT` la
+   * trae SIEMPRE, pero el camino de lectura de la nómina todavía no la usa (la
+   * fracción del fijo es la unidad de CÁLCULO) y sus pruebas arman el legajo sin
+   * ella; declararla requerida obligaría a tocar otro módulo en esta unidad. El
+   * valor real de la fila llega igual, y la guarda de fuente del `select` lo
+   * fija.
+   */
+  pay_frequency?: string | null;
   salary_fixed: number | null;
   commission_percent: number | null;
   is_active: boolean;
@@ -186,7 +199,7 @@ export interface SedeUserRow {
 }
 
 const EMPLOYEE_SELECT =
-  "id, sede_id, user_id, full_name, employee_code, document, phone, position, payout_mode, email, birth_date, pay_type, salary_fixed, commission_percent, is_active";
+  "id, sede_id, user_id, full_name, employee_code, document, phone, position, payout_mode, email, birth_date, pay_type, pay_frequency, salary_fixed, commission_percent, is_active";
 
 async function fetchEmployees(sedeId: string, limit?: number): Promise<EmployeeRow[]> {
   const db = await adminDb();
@@ -390,6 +403,11 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
     email: input.email?.trim() ? input.email.trim() : null,
     birth_date: input.birth_date?.trim() ? input.birth_date : null,
     pay_type: input.pay_type,
+    // F2: la cadencia viaja en la MISMA escritura que el resto del legajo, tanto
+    // en el alta (dentro de `p_employee`, que la escribe la 065) como en la
+    // edición (el `upsert` suelto escribe las columnas por nombre). El nulo es
+    // "sin cadencia definida" y no cambia el cálculo de hoy.
+    pay_frequency: input.pay_frequency ?? null,
     salary_fixed: input.salary_fixed ?? null,
     commission_percent: input.commission_percent ?? null,
     ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
