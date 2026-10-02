@@ -14,6 +14,7 @@ import {
   correctPayrollPeriod,
   deletePayrollPeriod,
   getPayrollPeriodCorrection,
+  getPayrollSettlementSources,
   getPeriodDetail,
   getVoucherSettings,
   listPayrollExtras,
@@ -246,6 +247,34 @@ export async function getPeriodDetailAction(id: string) {
     const mine = (await listAllEmployees(session.sedeId)).find((row) => row.user_id === session.userId);
     const ownId = mine?.id ?? "sin-acceso";
     return { success: true as const, data: { ...data, items: data.items.filter((item) => item.employee_id === ownId) } };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
+ * F6: las facturas, el ajuste del mixto y los vales de la liquidación de UN
+ * empleado de UN período, para el modal "Ver facturas y vales".
+ *
+ * Mismo alcance por fila que `getPeriodDetailAction`: el admin ve al empleado
+ * que pida; el empleado logueado solo puede abrir SU liquidación, así que su
+ * `employeeId` se reemplaza por el suyo (no se le devuelve la de otro). La caja
+ * no entra al módulo (`requirePayrollViewer`). Una lectura incompleta no se
+ * degrada a vacío: sale con el código accionable de `toFailure`.
+ */
+export async function getPayrollSettlementSourcesAction(periodId: string, employeeId: string) {
+  try {
+    const session = await requirePayrollViewer(await sessionToken());
+    const isManager = (session.roles ?? []).includes("admin");
+    let targetEmployeeId = employeeId;
+    if (!isManager) {
+      // Mismo motivo que en el detalle del período: la planta COMPLETA (no el
+      // listado recortado a 50) para ubicar al empleado logueado.
+      const mine = (await listAllEmployees(session.sedeId)).find((row) => row.user_id === session.userId);
+      targetEmployeeId = mine?.id ?? "sin-acceso";
+    }
+    const data = await getPayrollSettlementSources(session.sedeId, periodId, targetEmployeeId);
+    return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
   }

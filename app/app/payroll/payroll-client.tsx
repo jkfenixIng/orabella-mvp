@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useTransition, type FormEvent } from "react";
+import { useEffect, useRef, useState, useTransition, type FormEvent, type ReactNode } from "react";
 import { toast } from "sonner";
 import {
   calculatePayrollAction,
@@ -8,21 +8,28 @@ import {
   correctPayrollPeriodAction,
   deletePayrollPeriodAction,
   getPayrollPeriodCorrectionAction,
+  getPayrollSettlementSourcesAction,
   getPeriodDetailAction,
   listPayrollExtrasAction,
   listPayrollMonthRowsAction,
   listPeriodsAction,
+  listVouchersAction,
   openPayrollPeriodAction,
   payPayrollExtraAction,
   payPayrollItemAction,
 } from "@/src/features/payroll/actions";
+import { getInvoiceAction } from "@/src/features/billing/actions";
 import type {
   PayrollExtraRow,
   PayrollPeriodCorrectionResult,
   PayrollPeriodRow,
   PayrollPeriodSummary,
+  PayrollSettlementSources,
+  PayrollSettlementVoucher,
   PeriodDetail,
+  VoucherRequestRow,
 } from "@/src/features/payroll/service";
+import type { InvoiceDetail } from "@/src/features/billing/service";
 import {
   buildPayrollEmployeeIndex,
   detailLineCommissionOrigin,
@@ -315,10 +322,11 @@ interface PeriodDetailTableProps {
   employeeName: (id: string) => string;
   payLabel: (id: string) => string;
   onView: (item: DetailItem) => void;
+  onViewSources: (item: DetailItem) => void;
 }
 
 /** Tabla del detalle del periodo (solo presentación). */
-function PeriodDetailTable({ items, employeeName, payLabel, onView }: PeriodDetailTableProps) {
+function PeriodDetailTable({ items, employeeName, payLabel, onView, onViewSources }: PeriodDetailTableProps) {
   return (
     <div className="mt-4 overflow-x-auto">
       <table className={cn("w-full text-left text-sm", "min-w-[1040px]")}>
@@ -405,14 +413,28 @@ function PeriodDetailTable({ items, employeeName, payLabel, onView }: PeriodDeta
                 <td className={tableCellClass}>{formatMoney(item.paid)}</td>
                 <td className={tableCellClass}>{formatMoney(item.remaining)}</td>
                 <td className={tableCellClass}>
-                  <button
-                    type="button"
-                    onClick={() => onView(item)}
-                    aria-label={`Ver el desglose de ${employeeName(item.employee_id)}`}
-                    className={ghostClass}
-                  >
-                    Ver
-                  </button>
+                  <span className="inline-flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => onView(item)}
+                      aria-label={`Ver el desglose de ${employeeName(item.employee_id)}`}
+                      className={ghostClass}
+                    >
+                      Ver
+                    </button>
+                    {/*
+                      F6: abre el modal con las facturas y los vales que
+                      componen ESTA liquidación, con el detalle de cada uno.
+                    */}
+                    <button
+                      type="button"
+                      onClick={() => onViewSources(item)}
+                      aria-label={`Ver facturas y vales de ${employeeName(item.employee_id)}`}
+                      className={ghostClass}
+                    >
+                      Ver facturas y vales
+                    </button>
+                  </span>
                 </td>
               </tr>
             );
@@ -507,6 +529,7 @@ interface DraftPayrollTableProps {
   adjustmentValue: (employeeId: string, field: AdjustmentField) => string;
   onAdjustmentChange: (employeeId: string, field: AdjustmentField, value: string) => void;
   onView: (item: DetailItem) => void;
+  onViewSources: (item: DetailItem) => void;
 }
 
 /**
@@ -522,6 +545,7 @@ function DraftPayrollTable({
   adjustmentValue,
   onAdjustmentChange,
   onView,
+  onViewSources,
 }: DraftPayrollTableProps) {
   return (
     <div className="mt-4 overflow-x-auto">
@@ -637,14 +661,25 @@ function DraftPayrollTable({
                 <td className={tableCellClass}>{item ? formatMoney(item.remaining) : "—"}</td>
                 <td className={tableCellClass}>
                   {item ? (
-                    <button
-                      type="button"
-                      onClick={() => onView(item)}
-                      aria-label={`Ver el desglose de ${employeeName(row.employeeId)}`}
-                      className={ghostClass}
-                    >
-                      Ver
-                    </button>
+                    <span className="inline-flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => onView(item)}
+                        aria-label={`Ver el desglose de ${employeeName(row.employeeId)}`}
+                        className={ghostClass}
+                      >
+                        Ver
+                      </button>
+                      {/* F6: mismo modal de facturas y vales que la tabla cerrada. */}
+                      <button
+                        type="button"
+                        onClick={() => onViewSources(item)}
+                        aria-label={`Ver facturas y vales de ${employeeName(row.employeeId)}`}
+                        className={ghostClass}
+                      >
+                        Ver facturas y vales
+                      </button>
+                    </span>
                   ) : (
                     "—"
                   )}
@@ -837,6 +872,208 @@ function ExpandedItemPanel({
   );
 }
 
+/** Campo de solo lectura del detalle de una factura o un vale. */
+function SourceDetailField({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <dt className="text-xs uppercase tracking-wide text-text-tertiary">{label}</dt>
+      <dd className="break-words text-sm text-text-primary">{children}</dd>
+    </div>
+  );
+}
+
+interface SettlementSourcesPanelProps {
+  sources: PayrollSettlementSources | null;
+  busy: boolean;
+  invoiceTargetId: string | null;
+  invoiceDetail: InvoiceDetail | null;
+  invoiceBusy: boolean;
+  voucherTargetId: string | null;
+  voucherDetail: VoucherRequestRow | null;
+  voucherBusy: boolean;
+  employeeName: (id: string) => string;
+  onViewInvoice: (invoiceId: string) => void;
+  onViewVoucher: (voucher: PayrollSettlementVoucher) => void;
+}
+
+/**
+ * F6: contenido del modal "Ver facturas y vales": las dos listas del empleado
+ * (facturas y vales) y el detalle de la fila elegida, en un panel EN LÍNEA (no
+ * otro diálogo). El detalle de la factura sale de la lectura EXISTENTE de
+ * facturación (`getInvoiceAction`) y el del vale de la lectura existente de
+ * vales (`listVouchersAction`): acá no se duplica ninguna consulta.
+ *
+ * El ajuste del mixto (`ajuste_mixto`) NO es una factura: se muestra aparte, con
+ * su monto y su explicación, para que el lector no lo confunda con un
+ * consecutivo. Los vacíos describen lo esperado ("no tiene facturas/vales") y
+ * son texto plano, no un aviso.
+ */
+function SettlementSourcesPanel({
+  sources,
+  busy,
+  invoiceTargetId,
+  invoiceDetail,
+  invoiceBusy,
+  voucherTargetId,
+  voucherDetail,
+  voucherBusy,
+  employeeName,
+  onViewInvoice,
+  onViewVoucher,
+}: SettlementSourcesPanelProps) {
+  return (
+    <div className="mt-3 flex flex-col gap-5">
+      {busy && !sources ? (
+        <p className="text-sm text-text-tertiary">Leyendo facturas y vales…</p>
+      ) : null}
+
+      {sources?.adjustment ? (
+        <section className="rounded-md border border-border-color p-3 dark:border-border-color-2">
+          <h3 className="text-sm font-semibold text-text-primary">Ajuste del mixto</h3>
+          <p className="mt-1 text-sm text-text-secondary">
+            {`El básico absorbió ${formatMoney(-sources.adjustment.commission)} de los porcentajes de servicios: ese porcentaje no se suma aparte. Se muestra en negativo para que la suma del detalle cuadre con las comisiones.`}
+          </p>
+          <p className="mt-1 text-sm font-semibold text-text-primary">
+            {formatMoney(sources.adjustment.commission)}
+          </p>
+        </section>
+      ) : null}
+
+      <section>
+        <h3 className="text-sm font-semibold text-text-primary">Facturas de la liquidación</h3>
+        {sources && sources.invoices.length === 0 ? (
+          <p className="mt-1 text-sm text-text-tertiary">
+            La liquidación no tiene facturas: no hubo comisiones por factura en este período.
+          </p>
+        ) : null}
+        <ul className="mt-2 flex flex-col gap-2">
+          {(sources?.invoices ?? []).map((invoice) => (
+            <li
+              key={invoice.invoice_id}
+              className="rounded border border-border-color p-2 dark:border-border-color-2"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-sm text-text-primary">
+                  {`Factura #${invoice.consecutive_number ?? "sin consecutivo"}`}
+                </span>
+                <span className="text-sm text-text-secondary">
+                  {`Comisión de la liquidación: ${formatMoney(invoice.commission)}`}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => onViewInvoice(invoice.invoice_id)}
+                  aria-label={`Ver el detalle de la factura ${invoice.consecutive_number ?? "sin consecutivo"}`}
+                  className={ghostClass}
+                >
+                  Ver detalle
+                </button>
+              </div>
+              {invoiceTargetId === invoice.invoice_id ? (
+                <div className="mt-2 rounded bg-surface-hover p-2">
+                  {invoiceBusy ? (
+                    <p className="text-xs text-text-tertiary">Leyendo la factura…</p>
+                  ) : invoiceDetail ? (
+                    <>
+                      <dl className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                        <SourceDetailField label="Consecutivo">
+                          {invoiceDetail.invoice.consecutive_number}
+                        </SourceDetailField>
+                        <SourceDetailField label="Estado">{invoiceDetail.invoice.status}</SourceDetailField>
+                        <SourceDetailField label="Cliente">
+                          {invoiceDetail.invoice.client_name ?? "—"}
+                        </SourceDetailField>
+                        <SourceDetailField label="Fecha">
+                          {new Date(invoiceDetail.invoice.created_at).toLocaleString("es-CO")}
+                        </SourceDetailField>
+                        <SourceDetailField label="Total">
+                          {formatMoney(invoiceDetail.invoice.total)}
+                        </SourceDetailField>
+                        <SourceDetailField label="Pagado">{formatMoney(invoiceDetail.paid)}</SourceDetailField>
+                        <SourceDetailField label="Saldo">{formatMoney(invoiceDetail.remaining)}</SourceDetailField>
+                      </dl>
+                      <ul className="mt-2 flex flex-col gap-1 text-xs text-text-secondary">
+                        {invoiceDetail.items.map((item) => (
+                          <li key={item.id}>
+                            {`${item.custom_name ?? detailLineLabel(item.item_type)} × ${item.qty} = ${formatMoney(item.subtotal)}`}
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  ) : (
+                    <p className="text-xs text-text-tertiary">No se pudo abrir la factura.</p>
+                  )}
+                </div>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <section>
+        <h3 className="text-sm font-semibold text-text-primary">Vales de la liquidación</h3>
+        {sources && sources.vouchers.length === 0 ? (
+          <p className="mt-1 text-sm text-text-tertiary">
+            La liquidación no tiene vales: no hubo vales descontados en este período.
+          </p>
+        ) : null}
+        <ul className="mt-2 flex flex-col gap-2">
+          {(sources?.vouchers ?? []).map((voucher) => (
+            <li key={voucher.id} className="rounded border border-border-color p-2 dark:border-border-color-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-sm text-text-primary">{formatFullDate(voucher.request_date)}</span>
+                <span className="text-sm text-text-secondary">{formatMoney(voucher.amount)}</span>
+                <span className="text-sm text-text-secondary">{voucher.status}</span>
+                <button
+                  type="button"
+                  onClick={() => onViewVoucher(voucher)}
+                  aria-label={`Ver el detalle del vale del ${voucher.request_date}`}
+                  className={ghostClass}
+                >
+                  Ver detalle
+                </button>
+              </div>
+              {voucherTargetId === voucher.id ? (
+                <div className="mt-2 rounded bg-surface-hover p-2">
+                  {voucherBusy ? (
+                    <p className="text-xs text-text-tertiary">Leyendo el vale…</p>
+                  ) : voucherDetail ? (
+                    <dl className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      <SourceDetailField label="Empleado">
+                        {employeeName(voucherDetail.employee_id)}
+                      </SourceDetailField>
+                      <SourceDetailField label="Monto">{formatMoney(voucherDetail.amount)}</SourceDetailField>
+                      <SourceDetailField label="Fecha de solicitud">
+                        {voucherDetail.request_date}
+                      </SourceDetailField>
+                      <SourceDetailField label="Estado">{voucherDetail.status}</SourceDetailField>
+                      <SourceDetailField label="Método de pago">
+                        {voucherDetail.method_code ?? "—"}
+                      </SourceDetailField>
+                      <SourceDetailField label="Creado por">
+                        {voucherDetail.created_by_name ?? "—"}
+                      </SourceDetailField>
+                      {voucherDetail.approved_by_name ? (
+                        <SourceDetailField label="Aprobado por">
+                          {voucherDetail.approved_by_name}
+                        </SourceDetailField>
+                      ) : null}
+                      <SourceDetailField label="Observación">
+                        {voucherDetail.observation ?? "-"}
+                      </SourceDetailField>
+                    </dl>
+                  ) : (
+                    <p className="text-xs text-text-tertiary">No se pudo abrir el vale.</p>
+                  )}
+                </div>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      </section>
+    </div>
+  );
+}
+
 export function PayrollClient(props: PayrollClientProps) {
   const [periods, setPeriods] = useState<PayrollPeriodRow[]>(props.initialPeriods);
   const [selectedId, setSelectedId] = useState<string | null>(props.initialPeriods[0]?.id ?? null);
@@ -957,6 +1194,24 @@ export function PayrollClient(props: PayrollClientProps) {
   const [correctionError, setCorrectionError] = useState<string | null>(null);
   const [correctionBusy, setCorrectionBusy] = useState(false);
 
+  /**
+   * F6: las fuentes de la liquidación (facturas, ajuste del mixto y vales) del
+   * empleado cuyo modal está abierto. `sourcesTarget` guarda a QUIÉN y de QUÉ
+   * período pertenece, para que el modal no pueda mostrar las fuentes de otro
+   * empleado si el usuario cambia de período mientras carga.
+   */
+  const [sourcesTarget, setSourcesTarget] = useState<{ periodId: string; employeeId: string } | null>(null);
+  const [sources, setSources] = useState<PayrollSettlementSources | null>(null);
+  const [sourcesBusy, setSourcesBusy] = useState(false);
+  /** F6: detalle de la factura abierta con la lectura existente de facturación. */
+  const [invoiceTargetId, setInvoiceTargetId] = useState<string | null>(null);
+  const [invoiceDetail, setInvoiceDetail] = useState<InvoiceDetail | null>(null);
+  const [invoiceBusy, setInvoiceBusy] = useState(false);
+  /** F6: detalle del vale abierto con la lectura existente de vales. */
+  const [voucherTargetId, setVoucherTargetId] = useState<string | null>(null);
+  const [voucherDetail, setVoucherDetail] = useState<VoucherRequestRow | null>(null);
+  const [voucherBusy, setVoucherBusy] = useState(false);
+
   // Los pagos extraordinarios no llegan por props (la página los arma para los
   // períodos): se leen al montar. Sólo el admin tiene la superficie, así que el
   // efecto no dispara para el empleado.
@@ -1060,6 +1315,8 @@ export function PayrollClient(props: PayrollClientProps) {
     setDetailDialogOpen(false);
     setCorrection(null);
     closeCorrectionDialog();
+    // F6: cerrar la liquidación cierra también su modal de facturas y vales.
+    closeSettlementSources();
   }
 
   /**
@@ -1262,6 +1519,69 @@ export function PayrollClient(props: PayrollClientProps) {
     if (itemPortions(item.id).length > 0) return;
     const row = createPortion(item, []);
     setPortions((prev) => (prev[item.id]?.length ? prev : { ...prev, [item.id]: [row] }));
+  }
+
+  /**
+   * F6: abre el modal "Ver facturas y vales" de la liquidación de un empleado.
+   * El empleado logueado solo puede abrir la suya (el alcance por fila lo aplica
+   * la action, igual que el detalle del período).
+   */
+  async function openSettlementSources(periodId: string, employeeId: string) {
+    setSourcesTarget({ periodId, employeeId });
+    setSources(null);
+    setSourcesBusy(true);
+    // El detalle de una fila anterior no sobrevive al cambio de empleado.
+    setInvoiceTargetId(null);
+    setInvoiceDetail(null);
+    setVoucherTargetId(null);
+    setVoucherDetail(null);
+    const result = (await getPayrollSettlementSourcesAction(
+      periodId,
+      employeeId,
+    )) as ActionResult<PayrollSettlementSources>;
+    setSourcesBusy(false);
+    if (show(result)) setSources(result.data);
+  }
+
+  function closeSettlementSources() {
+    setSourcesTarget(null);
+    setSources(null);
+    setSourcesBusy(false);
+    setInvoiceTargetId(null);
+    setInvoiceDetail(null);
+    setVoucherTargetId(null);
+    setVoucherDetail(null);
+  }
+
+  /**
+   * F6: detalle de una factura con la lectura EXISTENTE de facturación
+   * (`getInvoiceAction`): no se duplica la consulta ni el alcance por sede.
+   */
+  async function openInvoiceDetail(invoiceId: string) {
+    setInvoiceTargetId(invoiceId);
+    setInvoiceDetail(null);
+    setInvoiceBusy(true);
+    const result = (await getInvoiceAction(invoiceId)) as ActionResult<InvoiceDetail>;
+    setInvoiceBusy(false);
+    if (show(result)) setInvoiceDetail(result.data);
+  }
+
+  /**
+   * F6: detalle de un vale con la lectura EXISTENTE de vales
+   * (`listVouchersAction`): se filtra por el mismo empleado y la MISMA fecha de
+   * solicitud del vale de la liquidación, y se elige la fila por id.
+   */
+  async function openVoucherDetail(voucher: PayrollSettlementVoucher) {
+    setVoucherTargetId(voucher.id);
+    setVoucherDetail(null);
+    setVoucherBusy(true);
+    const result = (await listVouchersAction({
+      employee_id: sourcesTarget?.employeeId,
+      request_date: voucher.request_date,
+      limit: 200,
+    })) as ActionResult<VoucherRequestRow[]>;
+    setVoucherBusy(false);
+    if (show(result)) setVoucherDetail(result.data.find((row) => row.id === voucher.id) ?? null);
   }
 
   async function handlePay(item: DetailItem) {
@@ -2345,6 +2665,9 @@ export function PayrollClient(props: PayrollClientProps) {
                       employeeName={employeeName}
                       payLabel={employeePayLabel}
                       onView={openItemDetail}
+                      onViewSources={(item) =>
+                        void openSettlementSources(selected.id, item.employee_id)
+                      }
                     />
                   )}
                   {/*
@@ -2410,6 +2733,9 @@ export function PayrollClient(props: PayrollClientProps) {
                     adjustmentValue={adjustmentValue}
                     onAdjustmentChange={updateAdjustment}
                     onView={openItemDetail}
+                    onViewSources={(item) =>
+                      void openSettlementSources(selected.id, item.employee_id)
+                    }
                   />
                   {pendingItems.length > 0 && (
                     // ESTADO que bloquea el cierre de la nómina: el botón
@@ -2466,6 +2792,9 @@ export function PayrollClient(props: PayrollClientProps) {
                     employeeName={employeeName}
                     payLabel={employeePayLabel}
                     onView={openItemDetail}
+                    onViewSources={(item) =>
+                      void openSettlementSources(selected.id, item.employee_id)
+                    }
                   />
                 )
               )}
@@ -2518,6 +2847,50 @@ export function PayrollClient(props: PayrollClientProps) {
             />
             <DialogFooter className="mt-4">
               <button type="button" className={ghostClass} onClick={() => setDetailTargetId(null)}>
+                Cerrar
+              </button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/*
+        F6: modal "Ver facturas y vales" de la liquidación de UN empleado.
+        Apilado sobre el detalle del período y con su propio `DialogTitle`.
+      */}
+      {sourcesTarget && (
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) closeSettlementSources();
+          }}
+        >
+          <DialogContent className="max-w-3xl">
+            <DialogHeader>
+              <DialogTitle>
+                {`Facturas y vales de ${employeeName(sourcesTarget.employeeId)}`}
+              </DialogTitle>
+              <DialogDescription>
+                Las facturas y los vales que componen esta liquidación, con el detalle de cada uno.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="max-h-[calc(100dvh-12rem)] overflow-y-auto pr-1">
+              <SettlementSourcesPanel
+                sources={sources}
+                busy={sourcesBusy}
+                invoiceTargetId={invoiceTargetId}
+                invoiceDetail={invoiceDetail}
+                invoiceBusy={invoiceBusy}
+                voucherTargetId={voucherTargetId}
+                voucherDetail={voucherDetail}
+                voucherBusy={voucherBusy}
+                employeeName={employeeName}
+                onViewInvoice={(invoiceId) => void openInvoiceDetail(invoiceId)}
+                onViewVoucher={(voucher) => void openVoucherDetail(voucher)}
+              />
+            </div>
+            <DialogFooter className="mt-4">
+              <button type="button" className={ghostClass} onClick={closeSettlementSources}>
                 Cerrar
               </button>
             </DialogFooter>

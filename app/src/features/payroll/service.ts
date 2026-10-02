@@ -18,6 +18,7 @@ import {
   computeNetPay,
   correctPayrollPeriodSchema,
   mixedAbsorbedDetailLine,
+  MIXED_ABSORBED_ITEM_TYPE,
   monthKeyOf,
   normalizeAllowedDays,
   normalizePerDayLimits,
@@ -921,6 +922,181 @@ export async function getPeriodDetail(sedeId: string, id: string): Promise<Perio
 
 /** Ítem de nómina con lo pagado ya resuelto (lo que la vista muestra). */
 type PaidPayrollItem = PayrollItemRow & { paid: number };
+
+/**
+ * F6: una factura de la liquidación, agrupada desde `detail_json`. El detalle
+ * persistido guarda una línea por factura/ítem; para el modal "Ver facturas y
+ * vales" la unidad es la FACTURA, así que sus líneas se suman en una sola
+ * comisión.
+ *
+ * `consecutive_number` es el consecutivo REAL de la factura y se lee tal cual
+ * del detalle; no se completa con el `invoice_id` ni con la posición (inventar
+ * un número sería peor que mostrarlo ausente). `date` no viaja: el detalle no
+ * guarda la fecha de la factura y este read no consulta la tabla `invoices`.
+ */
+export interface PayrollSettlementInvoice {
+  invoice_id: string;
+  consecutive_number: number | null;
+  /** Comisión de ESTA liquidación por la factura (suma de todas sus líneas). */
+  commission: number;
+}
+
+/**
+ * F6: el ajuste del mixto (`item_type = "ajuste_mixto"`, F3). NO es una factura:
+ * es el porcentaje que el básico absorbió, visible con su monto en negativo para
+ * que la suma del detalle siga dando las comisiones. Se devuelve aparte para que
+ * el modal lo muestre como ajuste y jamás como "Factura #ajuste_mixto".
+ */
+export interface PayrollSettlementAdjustment {
+  /** Negativo: el porcentaje absorbido que ya no se suma. */
+  commission: number;
+}
+
+/**
+ * F6: un vale del período que entró al descuento de ESTA liquidación. Solo la
+ * identidad mínima para listarlo; el detalle se abre con la lectura de vales ya
+ * existente (`listVouchers`).
+ */
+export interface PayrollSettlementVoucher {
+  id: string;
+  request_date: string;
+  amount: number;
+  status: string;
+}
+
+/**
+ * F6: las fuentes de la liquidación de UN empleado en UN período. Las facturas
+ * salen de `detail_json` (la liquidación es la dueña del detalle); los vales se
+ * leen con la MISMA forma que el cálculo (sede + `request_date` en el rango +
+ * el alcance de estados que descuenta), acotados por empleado.
+ */
+export interface PayrollSettlementSources {
+  invoices: PayrollSettlementInvoice[];
+  adjustment: PayrollSettlementAdjustment | null;
+  vouchers: PayrollSettlementVoucher[];
+}
+
+/**
+ * F6: agrupa el `detail_json` de UN ítem por factura y separa el ajuste del
+ * mixto.
+ *
+ * El ajuste usa el MISMO marcador como `invoice_id` (`mixedAbsorbedDetailLine`),
+ * así que sin separarlo por `item_type` aparecería como una factura con
+ * consecutivo nulo; se acumula aparte y su signo se conserva. Una línea sin
+ * `invoice_id` no tiene factura que abrir y no inventa una fila. La suma se
+ * redondea con la misma aritmética del módulo (`roundMoney`).
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function groupSettlementInvoices(detail: readonly DetailLine[]): {
+  invoices: PayrollSettlementInvoice[];
+  adjustment: PayrollSettlementAdjustment | null;
+} {
+  const byInvoice = new Map<string, PayrollSettlementInvoice>();
+  let absorbed = 0;
+  for (const line of detail) {
+    if (line.item_type === MIXED_ABSORBED_ITEM_TYPE) {
+      absorbed = roundMoney(absorbed + Number(line.commission));
+      continue;
+    }
+    if (!line.invoice_id) continue;
+    const current = byInvoice.get(line.invoice_id) ?? {
+      invoice_id: line.invoice_id,
+      consecutive_number: line.consecutive_number ?? null,
+      commission: 0,
+    };
+    current.commission = roundMoney(current.commission + Number(line.commission));
+    byInvoice.set(line.invoice_id, current);
+  }
+  return {
+    invoices: [...byInvoice.values()],
+    adjustment: absorbed !== 0 ? { commission: absorbed } : null,
+  };
+}
+
+/**
+ * F6: las fuentes de la liquidación —facturas, ajuste del mixto y vales— de UN
+ * empleado de UN período.
+ *
+ * El alcance es la clave de la lectura: el período se valida contra la sede del
+ * actor (`getPeriodOrThrow`), el ítem se lee por `period_id` + `employee_id` y
+ * los vales por `sede_id` + `employee_id` + el rango de fechas del período. No
+ * puede devolver la nómina de otra sede ni la de otro empleado, y no consulta
+ * ninguna tabla nueva: las facturas ya están en `detail_json`.
+ *
+ * Sin ítem no hay liquidación: se devuelve vacío y NO se leen los vales del
+ * rango. Esos vales no entraron a este período —el cálculo no los tocó (por
+ * ejemplo, el empleado quedó excluido por cadencia)— y mostrarlos como si
+ * fueran de la liquidación inventaría una relación que no existe.
+ *
+ * Las dos lecturas son exhaustivas (`readAllPayroll`): una lectura recortada
+ * mostraría menos facturas o menos vales que los que la liquidación tiene.
+ */
+export async function getPayrollSettlementSources(
+  sedeId: string,
+  periodId: string,
+  employeeId: string,
+): Promise<PayrollSettlementSources> {
+  try {
+    const db = await payrollDb();
+    const period = await getPeriodOrThrow(db, sedeId, periodId);
+    const items = await readAllPayroll<{ detail_json: DetailLine[] | null }>({
+      log: "getPayrollSettlementSources",
+      what: "ítem del empleado en el período",
+      meta: { periodId, employeeId },
+      table: "payroll_items",
+      fetchPage: (from, to) =>
+        db
+          .from("payroll_items")
+          .select("detail_json")
+          .eq("period_id", periodId)
+          .eq("employee_id", employeeId)
+          .order("id")
+          .range(from, to),
+    });
+    if (items.length === 0) {
+      return { invoices: [], adjustment: null, vouchers: [] };
+    }
+    const grouped = groupSettlementInvoices(items[0].detail_json ?? []);
+    // Misma forma que el cálculo (`voucherStatusesForScope("vigentes_y_descontados")`:
+    // pendiente/aprobada/descontada): un vale ya descontado por este período
+    // sigue siendo parte de la liquidación y tiene que verse.
+    const voucherRows = await readAllPayroll<{
+      id: string;
+      request_date: string;
+      amount: number | string;
+      status: string;
+    }>({
+      log: "getPayrollSettlementSources",
+      what: "vales del empleado en el período",
+      meta: { periodId, employeeId },
+      table: "voucher_requests",
+      fetchPage: (from, to) =>
+        db
+          .from("voucher_requests")
+          .select("id, request_date, amount, status")
+          .eq("sede_id", sedeId)
+          .eq("employee_id", employeeId)
+          .in("status", voucherStatusesForScope("vigentes_y_descontados"))
+          .gte("request_date", period.start_date)
+          .lte("request_date", period.end_date)
+          .order("id")
+          .range(from, to),
+    });
+    return {
+      invoices: grouped.invoices,
+      adjustment: grouped.adjustment,
+      vouchers: voucherRows.map((row) => ({
+        id: row.id,
+        request_date: row.request_date,
+        amount: roundMoney(Number(row.amount)),
+        status: row.status,
+      })),
+    };
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
 
 /**
  * PA3: el resumen de un período —se lee sin abrirlo— y el mes a la fecha por

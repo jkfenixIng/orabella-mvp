@@ -269,6 +269,67 @@ la validación de envío coinciden con la guarda del servicio y de la base. Sin
 cadencia, el cubo es el vacío (`coalesce(frequency, '')`) y sólo acotan los
 períodos sin cadencia, que es la protección heredada.
 
+## Detalle de la liquidación: facturas y vales (F6)
+
+Desde el detalle de una liquidación (`el diálogo "Liquidación X → Y"`), cada fila
+de la tabla tiene un botón **"Ver facturas y vales"** que abre un modal con las
+dos listas de ese empleado y el detalle de cada una. Sirve tanto para el período
+cerrado como para el borrador (mismo botón en las dos tablas) y para el empleado
+en su propio recibo.
+
+### La lectura
+
+`getPayrollSettlementSources(sedeId, periodId, employeeId)` devuelve las fuentes
+de la liquidación de UN empleado de UN período, sin tabla ni columna nuevas:
+
+- **Facturas**: se agrupan desde `payroll_items.detail_json`. El detalle guarda
+  una línea por factura/ítem, así que el read las **suma por `invoice_id`** y
+  devuelve `{ invoice_id, consecutive_number, commission }` —una fila por
+  factura—. No se consulta `invoices`: el detalle persistido ya es la fuente de
+  la comisión líquida y no guarda la fecha de la factura, por eso el modal no
+  muestra fecha de factura.
+- **Ajuste del mixto**: la línea `item_type = "ajuste_mixto"` (F3) NO es una
+  factura. Se separa con su monto (negativo) en `adjustment`; una línea sin
+  `invoice_id` tampoco inventa una fila.
+- **Vales**: se leen de `voucher_requests` con la **misma forma que el cálculo**
+  (sede + `request_date` dentro del rango + `voucherStatusesForScope("vigentes_y_descontados")`:
+  pendiente/aprobada/descontada), acotados por empleado. Devuelve solo
+  `{ id, request_date, amount, status }`; el detalle se abre con la lectura de
+  vales existente.
+
+El alcance es la clave: el período se valida contra la sede del actor
+(`getPeriodOrThrow`), el ítem por `period_id` + `employee_id` y los vales por
+`sede_id` + `employee_id`, así que no puede devolver la nómina de otra sede ni la
+de otro empleado. **Sin ítem no hay liquidación**: el read devuelve todo vacío y
+no lee los vales del rango (esos vales no entraron a este período: el cálculo no
+los tocó, por ejemplo por exclusión de cadencia). Las dos lecturas son
+exhaustivas (`readAllPayroll`): una lectura recortada mostraría menos fuentes que
+las reales.
+
+La action `getPayrollSettlementSourcesAction(periodId, employeeId)` es el mismo
+alcance por fila que `getPeriodDetailAction`: el admin abre el empleado que pida;
+el empleado logueado solo la suya (su legajo se resuelve contra la planta
+completa y reemplaza el pedido). La caja no entra al módulo
+(`requirePayrollViewer`).
+
+### El modal
+
+- **Facturas de la liquidación**: una fila por factura con su consecutivo y la
+  comisión que ESTA liquidación le asignó, más un botón **"Ver detalle"** que
+  abre la factura con la lectura EXISTENTE de facturación (`getInvoiceAction`),
+  en un panel en línea dentro del mismo modal (consecutivo, estado, cliente,
+  fecha, total/pagado/saldo y sus ítems).
+- **Vales de la liquidación**: una fila por vale con fecha, monto y estado, más
+  un botón **"Ver detalle"** que abre el vale con la lectura EXISTENTE de vales
+  (`listVouchersAction`, filtrada por el mismo empleado y la misma fecha de
+  solicitud).
+- **Ajuste del mixto**: bloque aparte que explica que el básico absorbió ese
+  porcentaje y que ya no se suma aparte, con el monto en negativo tal como vive
+  en `detail_json`. Nunca se rotula como "Factura #ajuste_mixto".
+- **Vacíos honestos**: "La liquidación no tiene facturas…" / "…no tiene vales…"
+  son texto plano (estado esperado, no un aviso) y describen que el período no
+tuvo comisiones por factura o vales descontados.
+
 ## Límites de lectura
 
 - Navegación instantánea: `listPeriods` acotado a 20 periodos recientes, `listVouchers` a 50 vales recientes; la pantalla de vales nace acotada al día de hoy (Bogotá, `date_from`/`date_to` incluyentes) y amplía —o limpia— ese rango desde sus filtros de fecha; el detalle del periodo (ítems + saldos) se carga bajo demanda al seleccionar.

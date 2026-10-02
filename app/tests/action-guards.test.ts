@@ -784,6 +784,13 @@ const SURFACES: readonly SurfaceSpec[] = [
     roles: ["admin", "empleado"],
     why: "mismo caso, con alcance por fila: el admin ve todo, el empleado solo sus ítems; la caja no entra.",
   },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "getPayrollSettlementSourcesAction",
+    kind: "payroll",
+    roles: ["admin", "empleado"],
+    why: "lee las facturas y vales de la liquidación de UN empleado (alcance por fila: el empleado solo la suya); es lectura de nómina y la caja no entra.",
+  },
   // ---- rutas de nómina: solo admin ----
   {
     file: "app/api/v1/payroll-periods/route.ts",
