@@ -2208,14 +2208,22 @@ describe("migración 070_sedes_unique_name.sql (G2)", () => {
  * sedes, incluida la fila de la sede del sistema).
  *
  * El mapa de consumidores salió vacío —ni una sola referencia en la app— así que
- * no hubo que reubicar ninguna pantalla: se eliminaron y la administración de la
- * instalación pasó a la superficie de plataforma, que tiene su propia lectura
- * cross-sede y su propio alta.
+ * no hubo que reubicar ninguna pantalla: se eliminaron. La instalación pasó a la
+ * superficie de plataforma, que desde la decisión de UNA SOLA SEDE sólo configura
+ * la instalación (la fecha de la nómina): ya no hay lista de sedes ni alta que
+ * reubicar, y el alta de una segunda sede no es una operación que la instalación
+ * admita.
  *
  * El bloque afirma las DOS mitades del cierre: que las acciones ya no se
  * exportan (lo que un admin de sede tenía alcanzable como endpoint POST, porque
  * `"use server"` convierte cada export en uno) y que el módulo del negocio ya no
  * tiene con qué leer ni escribir la tabla `sedes`.
+ *
+ * LO QUE EL NEGOCIO CONSERVA (decisión del dueño, 2026-10-01): el admin de la
+ * sede sigue administers su gente —usuarios y roles de SU sede— y el rol de
+ * plataforma no se otorga ni se quita desde acá (`setUserRoles` rechaza ambas
+ * direcciones). Lo que se retiró fue la ESTRUCTURA de sedes, no la gestión de
+ * personas.
  */
 describe("G5: el admin de una sede ya no lista ni escribe sedes", () => {
   const acciones = readFileSync(join(process.cwd(), "src", "features", "admin", "actions.ts"), "utf8");
@@ -2262,10 +2270,15 @@ describe("G5: el admin de una sede ya no lista ni escribe sedes", () => {
   it("lo que sí tiene consumidores se quedó: usuarios y roles de la propia sede", () => {
     // Control de sobre-eliminación: estas dos tienen pantalla que las llama
     // (`app/admin/admin-tabs.tsx` y `app/admin/admin-sections/users-section.tsx`)
-    // y siguen siendo del admin de su sede.
+    // y siguen siendo del admin de su sede. La decisión del dueño (2026-10-01) es
+    // explícita: la estructura de sedes se retiró, la gestión de personas no.
     for (const nombre of ["listSedeUsersAction", "setUserRolesAction"]) {
       expect(nombre in adminActions, `${nombre} no debía tocarse`).toBe(true);
     }
+    // Y la pestaña que las monta sigue viva: la retirada fue la de las sedes, no
+    // la de la gestión de usuarios.
+    const pestañas = readFileSync(join(process.cwd(), "app", "admin", "admin-tabs.tsx"), "utf8");
+    expect(pestañas).toContain("UsersSection");
   });
 
   it("el esquema de la fila de sede queda declarado, con su prueba", () => {
@@ -2274,8 +2287,10 @@ describe("G5: el admin de una sede ya no lista ni escribe sedes", () => {
       "utf8",
     );
     expect(schemas).toContain("export const sedeSchema");
-    // La forma de la fila es la que la plataforma importa para su alta: una sola
-    // definición para los dos caminos de escritura.
+    // Su último consumidor era el ALTA de sedes en la plataforma, que se retiró
+    // con la decisión de una sola sede: el esquema queda declarado pero sin
+    // consumidor en producción, y quitarlo (o conservarlo para la unidad que
+    // elimina la tabla) es de esa unidad, no de ésta.
     expect(schemas).toContain("export type SedeInput");
   });
 });

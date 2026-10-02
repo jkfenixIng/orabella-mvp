@@ -76,28 +76,18 @@ export const AUDIT_ACTIONS = {
   VOUCHER_APPROVED: "voucher.approved",
   VOUCHER_REQUESTED: "voucher.requested",
   VOUCHER_REJECTED: "voucher.rejected",
-  // G3b: la fecha de inicio de la nómina de una sede la configura SOLO la
-  // cuenta de plataforma, para CUALQUIER sede. Antes cambiaba sin rastro y es
-  // una fecha que mueve meses de dinero: queda con su propia acción para que un
-  // auditor lea «la plataforma configuró la nómina de la sede X» con el valor
-  // anterior y el nuevo, y no la confunda con el negocio. NO entra a ningún
-  // catálogo de alertas: es una decisión de configuración, no un desvío.
+  // La fecha de inicio de la nómina de la INSTALACIÓN la configura SOLO la cuenta
+  // de plataforma. Antes cambiaba sin rastro y es una fecha que mueve meses de
+  // dinero: queda con su propia acción para que un auditor lea «la plataforma
+  // configuró la nómina» con el valor anterior y el nuevo, y no la confunda con
+  // el negocio. NO entra a ningún catálogo de alertas: es una decisión de
+  // configuración, no un desvío.
   PLATFORM_PAYROLL_START_DATE_SET: "platform.payroll_start_date_set",
-  // G5: la cuenta de plataforma ALTA una sede de la instalación. Es la entrada
-  // que antes no existía: hasta acá las sedes se creaban desde la administración
-  // de otra sede, sin rastro. Tiene su propia acción para que un auditor lea
-  // «la plataforma creó la sede X» con los datos con que la nombró, y no la
-  // confunda con una edición de una sede ya existente. NO entra a ningún
-  // catálogo de alertas: es una decisión de configuración, no un desvío.
-  PLATFORM_SEDE_CREATED: "platform.sede_created",
-  // G5: la plataforma decide QUIÉN ADMINISTRA una sede. Cambia el poder de una
-  // persona sobre una sede entera —quién entra a su caja, su nómina y su
-  // facturación—, así que se audita con el cambio CONCRETO: de qué roles a
-  // cuáles. El nombre del rol es el dato que un auditor necesita para reconstruir
-  // la decisión; sin los dos conjuntos el registro sólo diría "se cambió algo".
-  // NO entra a ningún catálogo de alertas: es una decisión de configuración, no
-  // un desvío.
-  PLATFORM_SEDE_ROLES_SET: "platform.sede_roles_set",
+  // `platform.sede_created` y `platform.sede_roles_set` (la alta de sedes y los
+  // roles por sede) se retiraron del vocabulario con la decisión de una sola sede:
+  // ya no hay esa operación que auditar. Las filas YA escritas en `audit_logs` con
+  // esos valores se conservan tal cual, como las de `SHIFT_EDITED`: el registro
+  // histórico no se reescribe.
 } as const;
 
 /**

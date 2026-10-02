@@ -126,38 +126,39 @@ export SUPERADMIN_PASSWORD='...'
 npm run create:superadmin
 ```
 
-### La sede de plataforma
+### La sede de la instalación
 
 `users.sede_id` es NOT NULL (003_admin.sql), así que la cuenta tiene que
-pertenecer a alguna sede. Pedirla por variable obligaba a elegir una sede de
-CLIENTE para una cuenta que está para ajustar el SISTEMA. En su lugar, el script
-**asegura** una fila de `sedes` llamada `Plataforma (sistema)`:
+pertenecer a alguna sede. La instalación es de **una sola sede** (decisión del
+dueño, 2026-10-01), así que esa sede es LA SEDE DEL NEGOCIO y no hace falta una
+fila aparte que represente al sistema: el script **no escribe en `sedes`** —no
+crea, no activa ni desactiva ninguna fila— y se ancla a la que ya existe.
 
-- **Idempotente por NOMBRE**: si la fila ya existe la usa, y no crea otra.
-  `sedes` no tiene `code` ni unicidad por nombre, así que el nombre es la única
-  clave estable; si aparecen dos filas con ese nombre, el script falla en vez de
-  elegir una al azar (y relee después de crear, para que dos corridas
-  simultáneas tampoco dejen dos).
-- Se crea con **`is_active = false`**: no es una sede operativa. Si la fila ya
-  existía **ACTIVA**, el script la usa igual y lo dice con un AVISO: no cambia el
-  estado de una sede que no creó.
-- Si la sede no se puede asegurar, **falla antes de tocar la cuenta**.
+- **La resolución es la MISMA que usa la capa de plataforma**
+  (`leerSedeDeLaInstalacion`, `src/features/platform/service.ts`): la única fila
+  **activa** de `sedes`. Se decide por DATO (`is_active`), nunca por el nombre de
+  la fila: renombrarla no cambia qué es la instalación.
+- Si **no hay exactamente una** sede activa, el script **falla antes de tocar la
+  cuenta**: con cero no hay dónde anclar, y con dos o más la instalación ya no es
+  de una sola sede. Ninguna de las dos la decide el script.
+- Las filas **inactivas** que queden —p. ej. la `Plataforma (sistema)` que creó la
+  versión anterior de este script— no son la instalación: el script no las
+  toca, no las cuenta y no las ofrece. Su limpieza es de la unidad que elimina la
+  columna.
 - **No se relaja `users.sede_id` ni se toca `resolveSede`/`requireSedeRole`**
-  (`src/shared/lib/sede.ts`): esa frontera sostiene el aislamiento por sede de
-  todas las rutas del negocio, y aflojarla para una cuenta lo propagaría a cada
-  guarda. La sede de plataforma es la representación honesta de "no es una sede
-  de cliente". Las guardas son puras sobre `sede_id` y no miran
-  `sedes.is_active`, así que una sede inactiva no deja a la cuenta afuera de
-  nada.
+  (`src/shared/lib/sede.ts`). `resolveSede` **no es plomería de sede**: con
+  `service_role` —que bypasea RLS— es la frontera de tenant de todas las rutas
+  del negocio, y la columna `sede_id` sigue existiendo. Se retira junto con la
+  migración que la relaje, no antes.
 - Si la cuenta estaba anclada a otra sede, la corrida **la re-ancla a la sede de
-  plataforma y lo dice** (cambiar de sede cambia lo que esa cuenta ve del
-  negocio: no puede ser mudo).
+  la instalación y lo dice** (cambiar de sede cambia lo que esa cuenta ve del
+  negocio: no puede ser mudo). El ROL no se toca: `setUserRoles` rechaza otorgar
+  o quitar `superadmin` desde la administración de la sede.
 
-**Nota (pendiente para G4):** el script crea la sede inactiva para que no se
-ofrezca en los flujos del negocio, pero **hoy nada la excluye por `is_active`**:
-`fetchSedes` (`src/features/admin/service.ts:123`) selecciona TODAS las sedes y
-solo está expuesta por `listSedesAction` (`src/features/admin/actions.ts:167`),
-que no tiene ningún consumidor en la interfaz. Cerrarlo es de G4.
+**Consecuencia visible:** al anclar la cuenta a la sede del negocio, el admin de
+la sede la ve en su pestaña de Roles (`Administración de plataforma`, rol
+`superadmin`). No puede cambiarle el rol —`setUserRoles` lo rechaza en las dos
+direcciones— pero la fila aparece sin un rol asignable marcado.
 
 ### La cuenta ajusta el sistema, no opera el negocio
 
@@ -171,8 +172,7 @@ permisos**, y eso es deliberado.
 
 - **Idempotente**: la primera corrida crea la cuenta; las siguientes **actualizan**
   la clave y limpian el bloqueo por intentos. Nunca crea una segunda cuenta, ni
-  una segunda sede de plataforma, ni duplica el rol: `replace_user_roles` deja
-  exactamente `superadmin`.
+  duplica el rol: `replace_user_roles` deja exactamente `superadmin`.
 - **Verifica de punta a punta**: al final vuelve a leer el hash guardado y
   comprueba que verifica con `verifyPassword()` —la misma función del login— con
   la clave del entorno. Si no verifica, falla en vez de dejar una cuenta que no
@@ -280,6 +280,12 @@ Escrito para que nadie cuente con una segunda línea de defensa que no existe.
   (`src/shared/lib/sede.ts:46`), `requireSedeRole()` (`:35`) y los filtros
   `sede_id` que cada servicio aplica a mano antes de consultar. Un guard
   olvidado es una brecha total, no un agujero parcial: no hay nada detrás.
+  **`resolveSede` no es plomería de sede**: con la base bypassando RLS, es la
+  frontera de tenant de cada ruta —rechaza tanto un `sede_id` que venga en el
+  cuerpo de una petición como una fila cargada de otra sede— y como
+  `users.sede_id` y las demás columnas por sede siguen existiendo, es hoy la
+  única que queda. No la cuenta como dos barreras ni como una barrera "por
+  sede": es la única, y se retira con la migración que relaje la columna.
 - **Qué escriben las migraciones (dato, no protección).** Los bullets de abajo
   describen el esquema, y el esquema sí trae aislamiento por sede:
   `008_hardening.sql:147-166` revoca las 20 políticas `USING (true)` de T2–T7 y

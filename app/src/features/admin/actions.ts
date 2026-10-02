@@ -167,15 +167,21 @@ export async function upsertPaymentMethodAction(input: unknown) {
  * Existían dos y las dos eran agujeros: `listSedesAction` guardada solo por
  * `requireSession` (cualquier rol logueado listaba TODAS las sedes) y
  * `upsertSedeAction` guardada por `requireAdminSession` (el admin de CUALQUIER
- * sede creaba y editaba sedes, incluida la fila de la sede del sistema). Sus
- * equivalentes están en `src/features/platform/actions.ts`: el alta es de la
- * plataforma y la lectura es `listPlatformSedes`, que es cross-sede y marca la
- * fila del sistema con su bandera de dato.
+ * sede creaba y editaba sedes, incluida la fila de la sede del sistema).
  *
  * Se eliminaron y no se re-ubicaron: ninguna tenía consumidores (ni una sola
  * referencia en la app), y conservar una segunda lectura de sedes con otro
- * contrato detrás de una caché de una hora sería peor que no tenerla. La
- * superficie de plataforma NO depende de ninguna lectura del negocio.
+ * contrato detrás de una caché de una hora sería peor que no tenerla.
+ *
+ * Y ya no hay una lectura que reubicar: la instalación es de UNA SOLA SEDE
+ * (decisión del dueño, 2026-10-01), así que la capa de plataforma
+ * (`src/features/platform`) configura la INSTALACIÓN —la fecha de inicio de su
+ * nómina— y resuelve su sede por dato (la única fila activa de `sedes`), no
+ * leyendo un catálogo para que alguien elija.
+ *
+ * Lo que el negocio conserva es la gestión de personas de SU sede
+ * (`listSedeUsers`/`setUserRoles`, con su pestaña en `/admin`), y el rol de
+ * plataforma no se otorga ni se quita desde acá.
  */
 
 /** ADM-04: asignar roles a un usuario (solo admin). */

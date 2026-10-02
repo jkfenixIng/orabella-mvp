@@ -703,42 +703,13 @@ interface SurfaceSpec {
  * coincida con esta tabla.
  */
 const SURFACES: readonly SurfaceSpec[] = [
-  // ---- plataforma: solo la cuenta con el rol `superadmin` (G3a) ----
-  {
-    file: PLATFORM_ACTIONS_FILE,
-    name: "listPlatformSedesAction",
-    kind: "platform",
-    roles: ["superadmin"],
-    why: "lista TODAS las sedes de la instalación: es la superficie de plataforma y ningún rol de sede entra.",
-  },
+  // ---- plataforma: solo la cuenta con el rol `superadmin` ----
   {
     file: PLATFORM_ACTIONS_FILE,
     name: "setPlatformPayrollStartDateAction",
     kind: "platform",
     roles: ["superadmin"],
-    why: "G3b: configura la fecha de inicio de la nómina de la sede ELEGIDA, para cualquier sede. Es configuración de plataforma: ningún rol de sede la cambia.",
-  },
-  // ---- G5: alta de sedes y quién administra cada una ----
-  {
-    file: PLATFORM_ACTIONS_FILE,
-    name: "createPlatformSedeAction",
-    kind: "platform",
-    roles: ["superadmin"],
-    why: "G5: crea una sede de la instalación. Antes el admin de CUALQUIER sede podía crearlas y editarlas (`upsertSedeAction`); el alta es configuración de plataforma y ningún rol de sede la hace.",
-  },
-  {
-    file: PLATFORM_ACTIONS_FILE,
-    name: "listPlatformSedeUsersAction",
-    kind: "platform",
-    roles: ["superadmin"],
-    why: "G5: lee los usuarios de la sede ELEGIDA para decidir quién la administra. Es el directorio completo de esa sede: es de plataforma, ningún rol de sede entra.",
-  },
-  {
-    file: PLATFORM_ACTIONS_FILE,
-    name: "setPlatformSedeUserRolesAction",
-    kind: "platform",
-    roles: ["superadmin"],
-    why: "G5: cambia qué rol tiene un usuario de la sede ELEGIDA. Mover ese poder es configuración de plataforma: ningún rol de sede lo hace. El conjunto asignable es el de sede, así que esta fila NO abre la puerta al rol de plataforma.",
+    why: "Configura la fecha de inicio de la nómina de la INSTALACIÓN (de una sola sede). Es configuración de plataforma: ningún rol de sede la cambia, y no hay otra sede a la que elegirle una fecha.",
   },
   // ---- acciones de nómina: solo admin (pagar un ítem incluido) ----
   {

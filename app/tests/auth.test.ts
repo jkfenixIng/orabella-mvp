@@ -36,7 +36,6 @@ import {
   main,
   provisionarSuperadmin,
   cargarEntornoDeProyecto,
-  NOMBRE_SEDE_PLATAFORMA,
   type CargadorDeEntorno,
 } from "@/scripts/create-superadmin";
 
@@ -614,8 +613,9 @@ function createStubClient() {
         }
         if (table === "sedes") {
           // `sedes.id` también lo genera la base (003_admin.sql). El doble lo
-          // inventa para que el alta de la sede de plataforma devuelva una
-          // identidad y la cuenta pueda anclarse a ella.
+          // inventa para que un alta de sede —la que ya no hace el script de
+          // aprovisionamiento, pero sí el doble de otras rutas— devuelva una
+          // identidad real.
           for (const [indice, nueva] of valores.entries()) {
             if (!nueva.id) nueva.id = `sede-generada-${filasDe("sedes").length + indice + 1}`;
           }
@@ -1478,11 +1478,12 @@ describe("auth: la sesión real lleva el rol de plataforma hasta la guarda (G1)"
  *   2. AUSENCIA DE CLAVE POR DEFECTO. Sin `SUPERADMIN_PASSWORD` el script se
  *      niega y no escribe NADA. El respaldo silencioso es el defecto clásico:
  *      termina siendo la clave de producción.
- *   3. LA SEDE DE PLATAFORMA. La cuenta no se ancla a una sede de cliente: el
- *      script asegura `Plataforma (sistema)` (idempotente por nombre, inactiva) y
- *      la usa. Se fija que se asegura UNA vez, que una segunda corrida no crea
- *      otra, que si no se puede asegurar no se toca la cuenta y que una sede
- *      duplicada se rechaza en vez de resolverse al azar.
+ *   3. LA SEDE DE LA INSTALACIÓN. La instalación es de UNA SOLA SEDE, así que la
+ *      cuenta se ancla a LA SEDE DEL NEGOCIO y el script no crea ninguna fila de
+ *      `sedes`. Se fija que no escriba en esa tabla, que no le importe una fila
+ *      inactiva que no es la instalación, y que los dos estados imposibles (ninguna
+ *      sede activa, dos o más) se rechacen ANTES de tocar la cuenta y sin elegir una
+ *      al azar.
  *
  * Las claves de esta suite son FICTICIAS a propósito: así como la clave real no
  * vive en el repositorio, tampoco vive en una prueba.
@@ -1498,10 +1499,18 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
   const CLAVE_DE_SERVICIO_PREVIA = process.env.SUPABASE_SERVICE_ROLE_KEY;
   const EXIT_CODE_INICIAL = process.exitCode;
 
+  /**
+   * Fila que NO es la instalación: la que esta capa creó antes de la decisión de
+   * una sola sede. Inactiva, y con su nombre propio: el script tiene que resolver
+   * la instalación por DATO (`is_active`), nunca por el nombre de la fila.
+   */
+  const SEDE_VIEJA_DE_PLATAFORMA = "00000000-0000-4000-8000-000000000001";
+  const NOMBRE_SEDE_VIEJA = "Plataforma (sistema)";
+
   function sembrar(): void {
     postgrest.rows = {};
-    // La sede de plataforma NO se siembra: la asegura el script.
-    postgrest.rows.sedes = [];
+    // La instalación es de UNA sede, ya existente: el script NO la crea.
+    postgrest.rows.sedes = [{ id: SEDE, name: "Sede principal", is_active: true }];
     postgrest.rows.roles = [{ id: "rol-superadmin", code: "superadmin" }];
     postgrest.rows.users = [];
     postgrest.rows.user_roles = [];
@@ -1511,8 +1520,9 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
     return filasDe("users").find((fila) => fila.id_number === "superadmin");
   }
 
-  function sedesDePlataforma(): Array<Record<string, unknown>> {
-    return filasDe("sedes").filter((fila) => fila.name === NOMBRE_SEDE_PLATAFORMA);
+  /** Filas de `sedes` tal como quedaron: el script no debe escribir ninguna. */
+  function filasDeSedes(): Array<Record<string, unknown>> {
+    return filasDe("sedes");
   }
 
   function rolesDeLaCuenta(): Array<Record<string, unknown>> {
@@ -1638,22 +1648,18 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
     salida.restaurar();
   });
 
-  it("crea la sede de plataforma INACTIVA y el hash que escribe VERIFICA con `verifyPassword`", async () => {
+  it("se ancla a la sede activa de la INSTALACIÓN y el hash que escribe VERIFICA con `verifyPassword`", async () => {
     sembrar();
 
     const resultado = await provisionarSuperadmin({ clave: CLAVE_FICTICIA });
 
-    // La sede de plataforma: UNA fila, con el nombre de sistema y sin ser una
-    // sede operativa (`is_active = false`).
-    expect(resultado.sede).toMatchObject({
-      name: NOMBRE_SEDE_PLATAFORMA,
-      creada: true,
-      is_active: false,
-    });
-    expect(sedesDePlataforma()).toHaveLength(1);
-    expect(sedesDePlataforma()[0]?.is_active).toBe(false);
+    // La instalación es la sede activa que YA existe: el script la usa tal cual.
+    expect(resultado.sede).toMatchObject({ id: SEDE, name: "Sede principal" });
+    // Y NO escribe en `sedes`: ni la crea, ni la activa, ni la desactiva.
+    expect(postgrest.writes.filter((escritura) => escritura.startsWith("sedes."))).toEqual([]);
+    expect(filasDeSedes()).toHaveLength(1);
     // La cuenta queda anclada a ESA sede.
-    expect(cuenta()?.sede_id).toBe(resultado.sede.id);
+    expect(cuenta()?.sede_id).toBe(SEDE);
 
     const hash = hashGuardado();
     expect(resultado.accion).toBe("creada");
@@ -1706,7 +1712,7 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
     salida.restaurar();
   });
 
-  it("la segunda corrida no crea otra cuenta ni otra sede, y no duplica el rol", async () => {
+  it("la segunda corrida no crea otra cuenta y no duplica el rol", async () => {
     sembrar();
 
     const primera = await provisionarSuperadmin({ clave: CLAVE_FICTICIA });
@@ -1714,11 +1720,11 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
 
     expect(primera.accion).toBe("creada");
     expect(segunda.accion).toBe("actualizada");
-    // La sede de plataforma se aseguró UNA vez: la segunda corrida la reusa.
-    expect(primera.sede.creada).toBe(true);
-    expect(segunda.sede.creada).toBe(false);
+    // La misma sede de instalación en las dos corridas: no se elige otra.
     expect(segunda.sede.id).toBe(primera.sede.id);
-    expect(sedesDePlataforma()).toHaveLength(1);
+    // Y `sedes` sigue como estaba: el aprovisionamiento no escribe en esa tabla.
+    expect(filasDeSedes()).toHaveLength(1);
+    expect(filasDeSedes()[0]).toMatchObject({ id: SEDE, is_active: true });
     // UNA cuenta con el documento `superadmin`, no dos (la unicidad de 002 y la
     // lectura previa del script son las dos redes).
     expect(filasDe("users")).toHaveLength(1);
@@ -1729,19 +1735,37 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
     // (volver a correr el script repone la credencial del entorno).
     await expect(verifyPassword(OTRA_CLAVE_FICTICIA, hashGuardado())).resolves.toBe(true);
     await expect(verifyPassword(CLAVE_FICTICIA, hashGuardado())).resolves.toBe(false);
-    // Reusar la sede no la modifica.
-    expect(sedesDePlataforma()[0]?.is_active).toBe(false);
   });
 
-  it("si la sede de plataforma no se puede asegurar, falla ANTES de tocar la cuenta", async () => {
+  it("una fila que NO es la instalación no la desorienta: se ancla a la activa", async () => {
     sembrar();
-    postgrest.failWrite = {
-      label: "sedes.insert",
-      error: { code: "42501", message: "permission denied for table sedes" },
-    };
+    // La fila que dejó la versión anterior de esta capa, con su nombre de sistema.
+    // No es la instalación —está inactiva— y no debe cambiar ni contarse.
+    postgrest.rows.sedes.push({
+      id: SEDE_VIEJA_DE_PLATAFORMA,
+      name: NOMBRE_SEDE_VIEJA,
+      is_active: false,
+    });
+
+    const resultado = await provisionarSuperadmin({ clave: CLAVE_FICTICIA });
+
+    expect(resultado.sede.id).toBe(SEDE);
+    expect(cuenta()?.sede_id).toBe(SEDE);
+    // La fila vieja queda exactamente como estaba: ni se borra ni se activa.
+    expect(filasDeSedes().find((fila) => fila.id === SEDE_VIEJA_DE_PLATAFORMA)).toMatchObject({
+      name: NOMBRE_SEDE_VIEJA,
+      is_active: false,
+    });
+  });
+
+  it("sin ninguna sede activa falla ANTES de tocar la cuenta", async () => {
+    sembrar();
+    postgrest.rows.sedes = [
+      { id: SEDE_VIEJA_DE_PLATAFORMA, name: NOMBRE_SEDE_VIEJA, is_active: false },
+    ];
 
     await expect(provisionarSuperadmin({ clave: CLAVE_FICTICIA })).rejects.toMatchObject({
-      codigo: "SEDE_FALLIDA",
+      codigo: "SEDE_AUSENTE",
     });
 
     expect(filasDe("users")).toEqual([]);
@@ -1749,11 +1773,11 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
     expect(postgrest.rpcCalls).toEqual([]);
   });
 
-  it("dos sedes con el nombre de plataforma se rechazan: no elige una al azar", async () => {
+  it("con dos sedes activas se rechaza: no elige una al azar", async () => {
     sembrar();
     postgrest.rows.sedes = [
-      { id: "sede-a", name: NOMBRE_SEDE_PLATAFORMA, is_active: false },
-      { id: "sede-b", name: NOMBRE_SEDE_PLATAFORMA, is_active: false },
+      { id: SEDE, name: "Sede principal", is_active: true },
+      { id: SEDE_VIEJA_DE_PLATAFORMA, name: NOMBRE_SEDE_VIEJA, is_active: true },
     ];
 
     await expect(provisionarSuperadmin({ clave: CLAVE_FICTICIA })).rejects.toMatchObject({
@@ -1761,58 +1785,43 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
     });
 
     expect(filasDe("users")).toEqual([]);
+    expect(filasDe("sedes")).toHaveLength(2);
   });
 
-  it("si otra corrida crea la sede en el medio, la red de conteo lo detecta", async () => {
-    sembrar();
-    let inyectado = false;
-    // Intercalado de otro escritor, justo antes de la primera escritura: la
-    // lectura del script ya dijo "no existe" y el INSERT todavía no aplicó.
-    postgrest.antesDeEscribir = () => {
-      if (inyectado) return;
-      inyectado = true;
-      postgrest.rows.sedes = [
-        ...filasDe("sedes"),
-        { id: "sede-fantasma", name: NOMBRE_SEDE_PLATAFORMA, is_active: false },
-      ];
-    };
-
-    await expect(provisionarSuperadmin({ clave: CLAVE_FICTICIA })).rejects.toMatchObject({
-      codigo: "SEDE_DUPLICADA",
-    });
-
-    expect(filasDe("users")).toEqual([]);
-  });
-
-  it("una cuenta anclada a otra sede se re-ancla a la de plataforma y lo dice", async () => {
+  it("una cuenta anclada a otra sede se re-ancla a la de la instalación y lo dice", async () => {
     sembrar();
     const primera = await provisionarSuperadmin({ clave: CLAVE_FICTICIA });
-    // Estado a corregir: la cuenta quedó apuntando a una sede de negocio.
-    postgrest.rows.users = filasDe("users").map((fila) => ({ ...fila, sede_id: SEDE }));
+    // Estado a corregir: la cuenta quedó apuntando a una sede que ya no es la
+    // instalación (la fila vieja que dejó la versión anterior del script).
+    postgrest.rows.users = filasDe("users").map((fila) => ({
+      ...fila,
+      sede_id: SEDE_VIEJA_DE_PLATAFORMA,
+    }));
 
     const segunda = await provisionarSuperadmin({ clave: OTRA_CLAVE_FICTICIA });
 
     expect(segunda.sede.id).toBe(primera.sede.id);
-    expect(cuenta()?.sede_id).toBe(primera.sede.id);
+    expect(cuenta()?.sede_id).toBe(SEDE);
     // Cambiar de sede cambia lo que la cuenta ve del negocio: no puede ser mudo.
     expect(segunda.avisos.join(" | ")).toContain("otra sede");
   });
 
-  it("una sede de plataforma ACTIVA se usa con AVISO y sin cambiarle el estado", async () => {
+  it("sin ninguna sede activa el CLI lo dice con palabras y no escribe nada", async () => {
     sembrar();
-    postgrest.rows.sedes = [{ id: SEDE, name: NOMBRE_SEDE_PLATAFORMA, is_active: true }];
+    postgrest.rows.sedes = [
+      { id: SEDE_VIEJA_DE_PLATAFORMA, name: NOMBRE_SEDE_VIEJA, is_active: false },
+    ];
     vi.stubEnv("SUPERADMIN_PASSWORD", CLAVE_FICTICIA);
     vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "https://proyecto-de-prueba.supabase.co");
     const salida = capturarSalida();
 
     await main(SIN_ARCHIVOS);
 
-    expect(process.exitCode).toBeFalsy();
-    expect(salida.avisos.join("\n")).toContain("ACTIVA");
-    // El script NO cambia el estado de una sede que no creó...
-    expect(filasDe("sedes")[0]?.is_active).toBe(true);
-    // ...y la cuenta sí queda anclada a ella.
-    expect(cuenta()?.sede_id).toBe(SEDE);
+    // El mensaje dice QUÉ hacer (activar la sede del negocio), no sólo el código.
+    expect(process.exitCode).toBe(1);
+    expect(salida.errores.join("\n")).toContain("sede activa");
+    expect(cuenta()).toBeUndefined();
+    expect(postgrest.rpcCalls).toEqual([]);
     salida.restaurar();
   });
 
@@ -1827,7 +1836,7 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
     expect(filasDe("users")).toEqual([]);
   });
 
-  it("imprime el host de destino y la sede de plataforma, y nunca la clave", async () => {
+  it("imprime el host de destino y la sede de la instalación, y nunca la clave", async () => {
     sembrar();
     vi.stubEnv("SUPERADMIN_PASSWORD", CLAVE_FICTICIA);
     vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "https://proyecto-de-prueba.supabase.co");
@@ -1839,11 +1848,9 @@ describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () 
     const todo = [...salida.lineas, ...salida.errores, ...salida.avisos].join("\n");
     // El host de Supabase: es el chequeo humano de a qué base se le escribe.
     expect(todo).toContain("proyecto-de-prueba.supabase.co");
-    // El nombre Y el id de la sede de plataforma.
-    const sedeId = String(sedesDePlataforma()[0]?.id ?? "");
-    expect(sedeId.length).toBeGreaterThan(0);
-    expect(todo).toContain(NOMBRE_SEDE_PLATAFORMA);
-    expect(todo).toContain(sedeId);
+    // El nombre Y el id de la sede a la que quedó anclada la cuenta.
+    expect(todo).toContain("Sede principal");
+    expect(todo).toContain(SEDE);
     // La credencial NUNCA sale por la salida del script.
     expect(todo).not.toContain(CLAVE_FICTICIA);
     salida.restaurar();

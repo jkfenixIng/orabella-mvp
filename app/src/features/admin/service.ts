@@ -677,9 +677,14 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
 // ------------------------------------------ listados con caché (catálogos) ---
 //
 // G5: la lista de sedes (`listSedes`, etiqueta `catalog:sedes`) se eliminó con
-// sus dos acciones. El negocio ya no lee ni escribe sedes: la instalación se
-// administra desde la plataforma, que tiene su propia lectura cross-sede
-// (`listPlatformSedes`, sin caché) y su propio alta.
+// sus dos acciones. El negocio ya no lee ni escribe la tabla `sedes`: sólo lo
+// hace la capa de plataforma, para resolver cuál es la sede de la instalación
+// (la única fila activa) y configurar su fecha de nómina.
+//
+// La columna `sede_id` sigue existiendo, y con ella `resolveSede`
+// (`src/shared/lib/sede.ts`): con `service_role` bypassing RLS, esa guarda es la
+// frontera de tenant de las rutas del negocio, no plomería de sede. Se retira
+// junto con la migración que relaje la columna, no antes.
 
 export const listEmployees = unstable_cache(fetchEmployees, ["catalog:employees"], {
   tags: ["catalog:employees"],
