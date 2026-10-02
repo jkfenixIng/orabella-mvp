@@ -14,7 +14,13 @@ import {
   setUserRolesSchema,
   taxConfigSchema,
 } from "@/src/features/admin/schemas";
-import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
+import {
+  isRoleCode,
+  isSedeAssignableRole,
+  roleCodeSchema,
+  type RoleCode,
+} from "@/src/features/auth/schemas";
+import { requireSedeRole, resolveSede, type SedeRole } from "@/src/shared/lib/sede";
 import { AdminError, setUserRoles, upsertEmployee } from "@/src/features/admin/service";
 
 const SEDE_A = "11111111-1111-4111-8111-111111111111";
@@ -100,6 +106,7 @@ const ROLES_CATALOGO = [
   { id: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", code: "admin" },
   { id: "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb", code: "empleado" },
   { id: "cccccccc-3333-4333-8333-cccccccccccc", code: "caja" },
+  { id: "dddddddd-4444-4444-8444-dddddddddddd", code: "superadmin" },
 ];
 
 /**
@@ -548,6 +555,9 @@ describe("admin: reemplazo de roles atómico (ADM-04 / CO-2)", () => {
     postgrest.rows.user_roles = codes.map((code) => ({
       user_id: USUARIO_ID,
       role_id: ROLES_CATALOGO.find((rol) => rol.code === code)?.id,
+      // El embed que resuelve PostgREST (`roles(code)`): es lo que lee la
+      // lectura previa del servicio para saber qué roles tiene HOY el usuario.
+      roles: { code },
     }));
   }
 
@@ -665,6 +675,30 @@ describe("admin: reemplazo de roles atómico (ADM-04 / CO-2)", () => {
     ).rejects.toBeInstanceOf(AdminError);
 
     expect(rolesPersistidos()).toEqual(["empleado"]);
+  });
+
+  it("G1: un admin de sede NO puede otorgar `superadmin`: rechaza y no escribe", async () => {
+    sembrar(["empleado"]);
+
+    await expect(
+      setUserRoles({ user_id: USUARIO_ID, roles: ["superadmin"] }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN", status: 403 });
+
+    // La puerta se cerró ANTES del rpc: no hay sentencia ni escritura suelta.
+    expect(postgrest.rpcCalls).toEqual([]);
+    expect(postgrest.singleWrites).toEqual([]);
+    expect(rolesPersistidos()).toEqual(["empleado"]);
+  });
+
+  it("G1: un admin de sede NO puede quitarle `superadmin` a quien lo tiene: rechaza y no escribe", async () => {
+    sembrar(["superadmin"]);
+
+    await expect(
+      setUserRoles({ user_id: USUARIO_ID, roles: ["admin"] }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN", status: 403 });
+
+    expect(postgrest.rpcCalls).toEqual([]);
+    expect(rolesPersistidos()).toEqual(["superadmin"]);
   });
 });
 
@@ -1993,5 +2027,94 @@ describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", ()
     expect(employeesSection).not.toMatch(/\brole\s*=\s*["'{]/);
     expect(employeesSection).not.toMatch(/<Badge\b/);
     expect(employeesSection).not.toMatch(/<Alert\b/);
+  });
+});
+
+// ---------------------------------------------------- plataforma (G1) ---
+
+describe("roles: vocabulario de plataforma (G1)", () => {
+  it("roleCodeSchema acepta `superadmin` y sigue rechazando un código desconocido", () => {
+    expect(roleCodeSchema.safeParse("superadmin").success).toBe(true);
+    expect(roleCodeSchema.safeParse("dueño").success).toBe(false);
+    expect(isRoleCode("superadmin")).toBe(true);
+    expect(isRoleCode("dueño")).toBe(false);
+  });
+
+  it("el espejo `SedeRole` es estructuralmente idéntico a `RoleCode` (ida y vuelta compilan)", () => {
+    const desdeEspejo: SedeRole[] = ["admin", "empleado", "caja", "superadmin"];
+    const comoCodigos: RoleCode[] = desdeEspejo;
+    const vuelta: SedeRole[] = comoCodigos;
+    expect(vuelta).toContain("superadmin");
+  });
+
+  it("setUserRolesSchema acepta el código; es el SERVICIO quien lo rechaza", () => {
+    // El esquema (en admin/schemas, fuera del alcance de G1) no puede estrecharse
+    // acá: por eso la puerta real es el servicio.
+    expect(
+      setUserRolesSchema.safeParse({ user_id: SEDE_A, roles: ["superadmin"] }).success,
+    ).toBe(true);
+    expect(setUserRolesSchema.safeParse({ user_id: SEDE_A, roles: ["dueño"] }).success).toBe(false);
+  });
+
+  it("la lista asignable desde sede excluye el rol de plataforma", () => {
+    expect(isSedeAssignableRole("admin")).toBe(true);
+    expect(isSedeAssignableRole("empleado")).toBe(true);
+    expect(isSedeAssignableRole("caja")).toBe(true);
+    expect(isSedeAssignableRole("superadmin")).toBe(false);
+  });
+});
+
+describe("admin: la UI de usuarios no ofrece el rol de plataforma (guarda de fuente, G1)", () => {
+  const fuente = readFileSync(
+    join(process.cwd(), "app", "admin", "admin-sections", "users-section.tsx"),
+    "utf8",
+  );
+
+  it("construye la lista asignable filtrando `superadmin` y la usa en los radios", () => {
+    expect(fuente).toContain(
+      'ROLE_OPTIONS.filter((option) => option.value !== "superadmin")',
+    );
+    expect(fuente).toContain("ASSIGNABLE_ROLE_OPTIONS.map(");
+    // La lista cruda del panel NO se vuelve a ofrecer en esta pantalla
+    // (cuidado con el prefijo: `ASSIGNABLE_ROLE_OPTIONS.map` contiene esa
+    // subcadena, por eso se exige que NO venga precedida de `ASSIGNABLE_`).
+    expect(fuente).not.toMatch(/(?<!ASSIGNABLE_)ROLE_OPTIONS\.map\(/);
+  });
+});
+
+describe("migración 069_superadmin_role.sql (G1)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "069_superadmin_role.sql"),
+    "utf8",
+  );
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("ensancha el CHECK por su nombre real, con el cuarto código", () => {
+    expect(sql).toContain("DROP CONSTRAINT IF EXISTS roles_code_check");
+    expect(sql).toContain("ADD CONSTRAINT roles_code_check");
+    expect(sql).toContain("CHECK (code IN ('admin', 'empleado', 'caja', 'superadmin'))");
+    expect(raw).toContain("roles_code_check");
+  });
+
+  it("inserta la fila del catálogo de forma idempotente", () => {
+    expect(sql).toContain("INSERT INTO public.roles (code, description)");
+    expect(sql).toContain("'superadmin'");
+    expect(sql).toContain("ON CONFLICT (code) DO NOTHING");
+  });
+
+  it("es idempotente, no migra datos y toca solo el catálogo", () => {
+    expect(sql.match(/\bINSERT INTO\b/g)).toHaveLength(1);
+    expect(sql).not.toMatch(/public\.(users|user_roles|sessions)/);
+    expect(sql).not.toMatch(/\bADD COLUMN\b/i);
+    expect(sql).not.toMatch(/\bUPDATE\b/i);
+    expect(sql).not.toMatch(/\bDELETE\b/i);
+  });
+
+  it("declara el nombre real de la constraint, la numeración libre y que no se ejecutó", () => {
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
   });
 });

@@ -13,6 +13,7 @@ import {
   confirmPasswordReset,
   createPasswordResetToken,
   createSessionToken,
+  getSessionUser,
   hashPassword,
   hashToken,
   isAccountLocked,
@@ -23,10 +24,13 @@ import {
 import {
   adminCreateUserSchema,
   changePasswordSchema,
+  isRoleCode,
   loginSchema,
   requestResetSchema,
   resetPasswordSchema,
+  sedeAssignableRoleSchema,
 } from "@/src/features/auth/schemas";
+import { requirePlatformAdmin } from "@/src/features/platform/service";
 import { AUDIT_ACTIONS } from "@/src/shared/lib/audit";
 
 describe("auth schemas (Zod, sin red)", () => {
@@ -76,6 +80,24 @@ describe("auth schemas (Zod, sin red)", () => {
     ).toBe(false);
     expect(adminCreateUserSchema.safeParse({ ...base, roles: [] }).success).toBe(false);
     expect(adminCreateUserSchema.safeParse({ ...base, id_type: "XX" }).success).toBe(false);
+  });
+
+  it("G1: el vocabulario distingue el rol de plataforma del asignable desde sede", () => {
+    // El catálogo completo conoce `superadmin`...
+    expect(isRoleCode("superadmin")).toBe(true);
+    expect(isRoleCode("admin")).toBe(true);
+    expect(isRoleCode("dueño")).toBe(false);
+    // ...pero el alta desde una sede NO lo acepta.
+    expect(sedeAssignableRoleSchema.safeParse("superadmin").success).toBe(false);
+    expect(sedeAssignableRoleSchema.safeParse("admin").success).toBe(true);
+    const base = {
+      email: "caja@orabella.co",
+      documento: "123456",
+      id_type: "CC",
+      full_name: "Caja Uno",
+      roles: ["superadmin"],
+    } as const;
+    expect(adminCreateUserSchema.safeParse(base).success).toBe(false);
   });
 });
 
@@ -1318,5 +1340,78 @@ describe("migración 057_identity_password_cas.sql (CL-18)", () => {
 
   it("declara que el agente no la ejecutó", () => {
     expect(sql).toContain("NO ejecutado por el agente: requiere base de datos");
+  });
+});
+
+/* --------------------------------------------------------------------------
+   G1: la SESIÓN REAL transporta el rol de plataforma.
+
+   Este bloque NO mockea `getSessionUser`: ejercita el camino real contra el
+   doble de PostgREST de este archivo. Es la prueba que faltaba para no dar por
+   cubierta la guarda con una sesión simulada: si el filtro de roles de la
+   sesión descarta `superadmin`, `getSessionUser` lo pierde y la guarda nunca
+   pasa, aunque el resto del mundo devuelva verde.
+   -------------------------------------------------------------------------- */
+
+describe("auth: la sesión real lleva el rol de plataforma hasta la guarda (G1)", () => {
+  const SESION_ID = "88888888-8888-4888-8888-888888888888";
+  const TOKEN = "token-de-sesion-de-plataforma";
+
+  /**
+   * `roles(code)` es el embed que resuelve PostgREST: el doble devuelve la fila
+   * con el objeto embebido, que es exactamente lo que `getSessionUser` lee.
+   */
+  function sembrarSesion(roles: string[]): void {
+    postgrest.rows = {};
+    postgrest.rows.users = [
+      { id: USUARIO, sede_id: SEDE, full_name: "Dueño", is_active: true },
+    ];
+    postgrest.rows.sessions = [
+      {
+        id: SESION_ID,
+        user_id: USUARIO,
+        token_hash: hashToken(TOKEN),
+        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        revoked: false,
+        last_activity_at: new Date().toISOString(),
+      },
+    ];
+    postgrest.rows.user_roles = roles.map((code) => ({
+      user_id: USUARIO,
+      role_id: `rol-${code}`,
+      roles: { code },
+    }));
+  }
+
+  beforeEach(() => {
+    postgrest.rows = {};
+  });
+
+  it("getSessionUser conserva `superadmin`: el filtro de la sesión ya no lo descarta", async () => {
+    sembrarSesion(["superadmin"]);
+
+    const session = await getSessionUser(TOKEN);
+
+    expect(session?.roles).toEqual(["superadmin"]);
+  });
+
+  it("una sesión con `superadmin` LLEGA a la guarda; sin él, no pasa", async () => {
+    sembrarSesion(["superadmin"]);
+    const actor = await requirePlatformAdmin(TOKEN);
+    expect(actor).toMatchObject({ userId: USUARIO, sedeId: SEDE, roles: ["superadmin"] });
+
+    sembrarSesion(["admin"]);
+    await expect(requirePlatformAdmin(TOKEN)).rejects.toMatchObject({
+      code: "FORBIDDEN",
+      status: 403,
+    });
+  });
+
+  it("sin sesión: UNAUTHENTICATED (401)", async () => {
+    postgrest.rows = {};
+    await expect(requirePlatformAdmin(null)).rejects.toMatchObject({
+      code: "UNAUTHENTICATED",
+      status: 401,
+    });
   });
 });

@@ -12,7 +12,7 @@ import {
   type ServiceInput,
   type TaxConfigInput,
 } from "./schemas";
-import type { RoleCode } from "@/src/features/auth/schemas";
+import { isRoleCode, isSedeAssignableRole, type RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser, hashPassword } from "@/src/features/auth/service";
 import { readAllPaged } from "@/src/shared/lib/paged";
 import { unstable_cache } from "next/cache";
@@ -286,7 +286,7 @@ export async function listSedeUsers(sedeId: string): Promise<SedeUserRow[]> {
         ? [row.roles.code]
         : [];
     for (const code of codes) {
-      if (code !== "admin" && code !== "empleado" && code !== "caja") continue;
+      if (!isRoleCode(code)) continue;
       byUser.set(row.user_id, [...(byUser.get(row.user_id) ?? []), code]);
     }
   }
@@ -613,6 +613,31 @@ export async function upsertPaymentMethod(raw: unknown): Promise<PaymentMethodRo
 
 // ------------------------------------------------------------------ roles ---
 /**
+ * Códigos de rol que el usuario tiene HOY, leídos de la base.
+ *
+ * Es la lectura previa del reemplazo: la administración de una sede no puede
+ * QUITARLE un rol de plataforma a nadie, y `replace_user_roles` reemplaza el
+ * conjunto entero, así que la única forma de saber si el cambio lo revocaría es
+ * mirar el conjunto actual antes de pedirlo.
+ */
+async function currentRoleCodes(userId: string): Promise<RoleCode[]> {
+  const db = await adminDb();
+  const { data, error } = await db
+    .from("user_roles")
+    .select("roles(code)")
+    .eq("user_id", userId);
+  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
+  const codes: RoleCode[] = [];
+  for (const row of (data ?? []) as unknown as Array<{
+    roles: { code: string } | Array<{ code: string }> | null;
+  }>) {
+    const embedded = Array.isArray(row.roles) ? row.roles : row.roles ? [row.roles] : [];
+    for (const item of embedded) if (isRoleCode(item.code)) codes.push(item.code);
+  }
+  return codes;
+}
+
+/**
  * Traduce la excepción de `replace_user_roles` a error de negocio. La función
  * levanta `RAISE EXCEPTION` plano (SQLSTATE P0001), el mismo código que ya
  * traducen payroll, cash, billing, commissions y los topes 031/034.
@@ -652,6 +677,27 @@ function roleReplacementError(error: { code?: string; message?: string }): Admin
 export async function setUserRoles(raw: unknown): Promise<{ user_id: string; roles: RoleCode[] }> {
   const parsed = setUserRolesSchema.safeParse(raw);
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
+
+  // G1: el catálogo ya incluye `superadmin`, así que validar "el código existe"
+  // dejó de alcanzar —ese era exactamente el agujero—. La administración de una
+  // sede SOLO toca roles asignables desde sede; el rol de plataforma se rechaza
+  // ANTES del rpc, así que la base no escribe nada: ni lo otorga ni lo quita.
+  if (parsed.data.roles.some((rol) => !isSedeAssignableRole(rol))) {
+    throw new AdminError(
+      "FORBIDDEN",
+      "El rol de plataforma solo se administra desde la plataforma.",
+      403,
+    );
+  }
+  const rolesActuales = await currentRoleCodes(parsed.data.user_id);
+  if (rolesActuales.some((rol) => !isSedeAssignableRole(rol))) {
+    throw new AdminError(
+      "FORBIDDEN",
+      "El rol de plataforma solo se administra desde la plataforma.",
+      403,
+    );
+  }
+
   const db = await adminDb();
 
   const { data, error } = await db.rpc("replace_user_roles", {
@@ -663,9 +709,7 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
   // Post-condición: se reporta éxito sólo si la base devolvió el conjunto
   // pedido. Un arreglo vacío significa "no quedó ningún rol aplicado": eso
   // jamás es un éxito, por más que el rpc no haya dado error.
-  const aplicados = (Array.isArray(data) ? data : []).filter(
-    (code): code is RoleCode => code === "admin" || code === "empleado" || code === "caja",
-  );
+  const aplicados = (Array.isArray(data) ? data : []).filter(isSedeAssignableRole);
   const pedidos = parsed.data.roles;
   if (aplicados.length !== pedidos.length || !aplicados.every((code) => pedidos.includes(code))) {
     throw new AdminError("INTERNAL", "Error interno.", 500);

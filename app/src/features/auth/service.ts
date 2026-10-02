@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import {
   adminCreateUserSchema,
   changePasswordSchema,
+  isRoleCode,
   loginSchema,
   requestResetSchema,
   resetPasswordSchema,
@@ -288,7 +289,7 @@ async function findUserByDocument(documento: string): Promise<{
   if (roleError) throw new AuthError("INTERNAL", "Error interno.", 500);
   const roles = ((roleRows ?? []) as unknown as Array<{ roles: { code: string } | null }>)
     .map((r) => r.roles?.code)
-    .filter((code): code is RoleCode => code === "admin" || code === "empleado" || code === "caja");
+    .filter(isRoleCode);
   return { user: row, roles };
 }
 
@@ -449,7 +450,7 @@ export async function getSessionUser(
     .eq("user_id", sessionRow.user_id);
   const roles = ((roleRows ?? []) as unknown as Array<{ roles: { code: string } | null }>)
     .map((r) => r.roles?.code)
-    .filter((code): code is RoleCode => code === "admin" || code === "empleado" || code === "caja");
+    .filter(isRoleCode);
   return { user: user as AuthUserRow, roles, session: sessionRow };
 }
 

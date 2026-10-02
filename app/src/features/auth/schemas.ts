@@ -4,9 +4,44 @@ import { z } from "zod";
 export const idTypeSchema = z.enum(["CC", "CE", "PPT", "PEP", "otro"]);
 export type IdType = z.infer<typeof idTypeSchema>;
 
-/** Roles fijos del MVP (AUTH-07). Sin permisos granulares. */
-export const roleCodeSchema = z.enum(["admin", "empleado", "caja"]);
+/**
+ * Roles fijos del MVP (AUTH-07) más el rol de PLATAFORMA `superadmin` (G1).
+ * `superadmin` existe en el catálogo (069) para la cuenta del dueño, pero NO se
+ * asigna ni se quita desde la administración de una sede: para eso está
+ * `sedeAssignableRoleSchema`. Sin permisos granulares.
+ */
+export const roleCodeSchema = z.enum(["admin", "empleado", "caja", "superadmin"]);
 export type RoleCode = z.infer<typeof roleCodeSchema>;
+
+/**
+ * Verdadero si `code` es uno de los códigos del catálogo. Derivado del esquema
+ * —y no de una lista de literales repetida— para que agregar un rol nuevo no
+ * obligue a acordarse de cada punto que filtra roles: el defecto que dejaba al
+ * `superadmin` fuera de la sesión.
+ */
+export function isRoleCode(code: unknown): code is RoleCode {
+  return roleCodeSchema.safeParse(code).success;
+}
+
+/**
+ * Esquema de los roles que la administración de una SEDE puede asignar o
+ * quitar. `superadmin` queda FUERA: solo lo otorga la plataforma.
+ */
+export const sedeAssignableRoleSchema = z.enum(["admin", "empleado", "caja"]);
+export type SedeAssignableRole = z.infer<typeof sedeAssignableRoleSchema>;
+
+/**
+ * ÚNICA lista de roles asignables desde sede, derivada del esquema. La
+ * comparten las DOS puertas que otorgan un rol (el alta `adminCreateUserSchema`
+ * y el reemplazo `setUserRoles`), para que no existan dos listas que puedan
+ * divergir.
+ */
+export const SEDE_ASSIGNABLE_ROLES = sedeAssignableRoleSchema.options;
+
+/** Verdadero si `code` es un rol asignable desde la administración de una sede. */
+export function isSedeAssignableRole(code: unknown): code is SedeAssignableRole {
+  return sedeAssignableRoleSchema.safeParse(code).success;
+}
 
 /** Documento de acceso: el "usuario" del login (AUTH-01). */
 const documentoSchema = z
@@ -64,7 +99,7 @@ export const adminCreateUserSchema = z.object({
   id_type: idTypeSchema,
   full_name: z.string().trim().min(2, "Nombre requerido.").max(120),
   phone: z.string().trim().max(30).optional(),
-  roles: z.array(roleCodeSchema).length(1, "Un solo rol por usuario."),
+  roles: z.array(sedeAssignableRoleSchema).length(1, "Un solo rol por usuario."),
   sede_id: z.uuid("Sede inválida.").nullable().optional(),
 });
 export type AdminCreateUserInput = z.infer<typeof adminCreateUserSchema>;

@@ -22,11 +22,13 @@ export class SedeError extends Error {
 }
 
 /**
- * Roles del MVP. Unión duplicada a propósito (no se importa desde
- * features/auth para no acoplar shared → features); es estructuralmente
- * idéntica a `RoleCode`, por lo que ambas son asignables entre sí.
+ * Roles del MVP más el rol de plataforma `superadmin` (G1). Unión duplicada a
+ * propósito (no se importa desde features/auth para no acoplar shared →
+ * features); es estructuralmente idéntica a `RoleCode`, por lo que ambas son
+ * asignables entre sí. Si una agrega un código y la otra no, la asignación
+ * recíproca deja de compilar: el espejo se mantiene a la vista del typecheck.
  */
-export type SedeRole = "admin" | "empleado" | "caja";
+export type SedeRole = "admin" | "empleado" | "caja" | "superadmin";
 
 /**
  * TRA/NFR-02: verifica que la sesión tenga al menos uno de los roles

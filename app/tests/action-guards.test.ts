@@ -14,6 +14,7 @@ import { POST as postVoucher } from "@/app/api/v1/vouchers/route";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import type { SessionUser } from "@/src/features/auth/service";
 import * as adminService from "@/src/features/admin/service";
+import { requirePlatformAdmin } from "@/src/features/platform/service";
 import {
   getPeriodDetailAction,
   getVoucherSettingsAction,
@@ -1960,5 +1961,52 @@ describe("nómina solo admin (y el propio empleado): la caja no entra; los vales
         expect(declared, `${row.guard}: roles no legibles en el fuente`).toEqual(row.admite);
       }
     });
+  });
+});
+
+/* --------------------------------------------------------------------------
+   G1: la guarda de PLATAFORMA.
+
+   `requirePlatformAdmin` es la única puerta a `/plataforma`. Su rol se lee del
+   fuente con la misma maquinaria que las guardas de nómina (`const X:
+   RoleCode[] = [...]` + `requireSedeRole(session.roles, X)`), y se ejecuta con
+   la sesión simulada para fijar el comportamiento.
+
+   El camino REAL de la sesión (que `getSessionUser` no descarte `superadmin`)
+   se prueba en tests/auth.test.ts, sin mockear `getSessionUser`: acá la sesión
+   es el doble que aísla a la guarda del resto del mundo.
+   -------------------------------------------------------------------------- */
+
+describe("plataforma: requirePlatformAdmin (G1)", () => {
+  const PLATFORM_SERVICE_FILE = "src/features/platform/service.ts";
+
+  it("los roles declarados en el fuente son los que la guarda aplica", () => {
+    const guards = readGuardRoles(surfaceSource(PLATFORM_SERVICE_FILE), PLATFORM_SERVICE_FILE);
+    expect(guards.get("requirePlatformAdmin")).toEqual(["superadmin"]);
+  });
+
+  it("sin sesión: UNAUTHENTICATED (401)", async () => {
+    sessionStub.current = null;
+    await expect(requirePlatformAdmin("token-de-prueba")).rejects.toMatchObject({
+      code: "UNAUTHENTICATED",
+      status: 401,
+    });
+  });
+
+  it("admite `superadmin` y rechaza los demás roles con FORBIDDEN (403)", async () => {
+    asSession(["superadmin"]);
+    await expect(requirePlatformAdmin("token-de-prueba")).resolves.toMatchObject({
+      userId: "u-prueba",
+      sedeId: SEDE_PRUEBA,
+      roles: ["superadmin"],
+    });
+
+    for (const rol of ["admin", "caja", "empleado"]) {
+      asSession([rol]);
+      await expect(requirePlatformAdmin("token-de-prueba")).rejects.toMatchObject({
+        code: "FORBIDDEN",
+        status: 403,
+      });
+    }
   });
 });
