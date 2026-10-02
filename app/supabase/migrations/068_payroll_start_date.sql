@@ -1,0 +1,94 @@
+-- 068_payroll_start_date.sql — F10: la nómina de la sede tiene FECHA DE INICIO.
+--
+-- MOTIVO DEL ARCHIVO (decisión del dueño, 2026-10-01)
+--
+-- Hasta hoy la nómina no sabe DESDE CUÁNDO opera la sede ("la fecha de inicio de
+-- la implementación"): la cadencia se liquidó hacia atrás todo lo que la historia
+-- de períodos permitiera, y el diálogo de apertura podía alcanzar ciclos
+-- anteriores al día en que el negocio empezó a usar el módulo. Eso produce
+-- liquidaciones que no existen: días que nadie trabajó bajo este sistema y plata
+-- que nadie acordó. El dueño lo pide explícito: el sistema tiene que conocer la
+-- fecha de arranque para no volver a apuntar a fechas anteriores, y «nada
+-- anterior a la fecha de inicio de la implementación existe para el sistema».
+--
+-- QUÉ HACE ESTE ARCHIVO (y qué NO)
+--
+--   1. Agrega `sedes.payroll_start_date date NULL` con su COMMENT: la fecha
+--      desde la que la nómina opera en esa sede.
+--   2. NADA MÁS. No migra datos (ninguna fila se escribe), no agrega CHECK, no
+--      agrega índice y no toca la guarda de solape (063) ni el cálculo.
+--
+-- POR QUÉ VIVE EN `sedes` Y NO EN UNA TABLA DE CONFIGURACIÓN APARTE
+--
+-- Es una propiedad de la SEDE —junto con su nombre y su dirección—, no del
+-- período: sobrevive a cada liquidación y es UNA sola por sede. La alternativa
+-- (una tabla `payroll_settings` por sede, como `voucher_settings`) separaría el
+-- dato del objeto al que pertenece y volvería a introducir el problema que
+-- `voucher_settings` ya tiene: la ausencia de fila es indistinguible de la
+-- ausencia de configuración. Con una columna NULL en `sedes` hay UNA sola
+-- lectura y un solo estado «sin configurar».
+--
+-- NULL ES UN ESTADO LEGAL: «TODAVÍA NO CONFIGURADA»
+--
+-- No hay DEFAULT y no se backfillea con la fecha de hoy: una fecha inventada
+-- sería una decisión del producto tomada en una migración, y el dueño no la
+-- tomó. NULL significa «sin configurar» y conserva EXACTAMENTE el comportamiento
+-- de hoy: el aviso de pendientes se detiene en el arranque de la historia de la
+-- sede (F9, regla 4) y ningún ciclo se recorta. Por eso esta migración, sola, no
+-- cambia ninguna liquidación: el cambio de conducta empieza cuando el admin fija
+-- la fecha, y es deliberado que ninguna sede existente cambie de comportamiento
+-- por el hecho de aplicar el archivo.
+--
+-- SIN CHECK DE FORMA NI DE RANGO
+--
+-- `date` ya rechaza una fecha imposible (`2026-02-30`) en el propio tipo, y no
+-- hay cota superior que tenga sentido: el modo de falla que importa es una fecha
+-- en el FUTURO (dejaría la nómina sin ciclos por ofrecer), y el contrato
+-- (`setPayrollStartDateSchema`) la rechaza con un mensaje en español antes de
+-- escribir. Poner además un CHECK ataría la columna a una regla que cambia con
+-- el calendario, y la fecha de arranque es un dato de negocio, no una invariante
+-- estructural.
+--
+-- IDEMPOTENTE Y RE-EJECUTABLE: `ADD COLUMN IF NOT EXISTS` y un `COMMENT` que se
+-- re-emite dejan el esquema idéntico en cada corrida. El runner de Supabase
+-- aplica el archivo en una transacción: o entra todo, o no entra nada.
+--
+-- COSTO DE NUMERACIÓN: 068 es el siguiente libre (la serie llega a
+-- `067_payroll_adjustment_reason.sql`); este archivo NO renumera ni toca ningún
+-- archivo anterior.
+--
+-- NO ejecutado por el agente: requiere base de datos.
+
+-- ===================================================================== ---
+-- 1. La fecha de arranque de la nómina de la sede
+-- ===================================================================== ---
+
+ALTER TABLE public.sedes
+  ADD COLUMN IF NOT EXISTS payroll_start_date date NULL;
+
+COMMENT ON COLUMN public.sedes.payroll_start_date IS
+  'F10: fecha desde la que la nómina OPERA en esta sede (la fecha de inicio de la implementación). Nada ANTERIOR a esta fecha existe para el sistema: no se ofrece ni se liquida ningún ciclo que cierre antes, un período nuevo no puede empezar antes, y el PRIMER ciclo de cada cadencia —el que contiene esta fecha— se recorta a ella y se paga con la prorrata del ciclo parcial (F5). Es una fecha de calendario (yyyy-mm-dd, la convención del módulo), no un instante. NULL = todavía NO configurada: el aviso de pendientes conserva el comportamiento anterior (se detiene en el arranque de la historia de la sede) y la pantalla invita al admin a fijarla. Ninguna sede existente cambia de comportamiento por aplicar esta migración: el cambio empieza cuando se fija la fecha.';
+
+-- ===================================================================== ---
+-- 2. Cómo verifica el dueño (SOLO LECTURA; nada de acá cambia datos)
+-- ===================================================================== ---
+--
+--   * La columna existe, es `date` y admite NULL:
+--
+--       -- SELECT column_name, data_type, is_nullable
+--       --   FROM information_schema.columns
+--       --  WHERE table_schema = 'public' AND table_name = 'sedes'
+--       --    AND column_name = 'payroll_start_date';
+--
+--   * Ninguna sede quedó con fecha por el hecho de aplicar el archivo:
+--
+--       -- SELECT id, name, payroll_start_date FROM public.sedes ORDER BY name;
+--
+--   * Configurar una sede es UNA línea (el admin lo hace desde la pantalla de
+--     nómina; esto es el equivalente manual):
+--
+--       -- UPDATE public.sedes SET payroll_start_date = '2026-10-05' WHERE id = '<sede>';
+--
+--   * Volver a «sin configurar» es la misma línea con NULL:
+--
+--       -- UPDATE public.sedes SET payroll_start_date = NULL WHERE id = '<sede>';

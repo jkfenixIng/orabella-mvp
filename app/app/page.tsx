@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { Calculator, Package, Receipt, Settings, Ticket, TriangleAlert, Wallet } from "lucide-react";
+import { Calculator, Package, Receipt, Settings, ShieldCheck, Ticket, TriangleAlert, Wallet } from "lucide-react";
 import { PageContainer, PageHeader } from "@/src/components/ui/lib/page";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
@@ -51,6 +51,13 @@ const MODULES = [
     purpose: "Solicite y apruebe vales para empleados con topes.",
     Icon: Ticket,
     roles: ["admin", "caja", "empleado"],
+  },
+  {
+    href: "/plataforma",
+    name: "Plataforma",
+    purpose: "Estado de la instalación: las sedes y su fecha de inicio de nómina.",
+    Icon: ShieldCheck,
+    roles: ["superadmin"],
   },
 ] as const;
 

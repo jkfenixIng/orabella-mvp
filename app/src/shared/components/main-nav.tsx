@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState, useEffect } from "react";
-import { Bell, Calculator, House, Package, Receipt, Settings, Sparkles, Ticket, Wallet, type LucideIcon } from "lucide-react";
+import { Bell, Calculator, House, Package, Receipt, Settings, ShieldCheck, Sparkles, Ticket, Wallet, type LucideIcon } from "lucide-react";
 import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 
 interface NavLink {
@@ -95,6 +95,21 @@ const NAV_GROUPS: NavGroup[] = [
         },
       ],
   },
+  {
+    id: "instalacion",
+    label: "Instalación",
+      links: [
+        {
+          href: "/plataforma",
+          label: "Plataforma",
+          description: "Sedes de la instalación y su nómina",
+          Icon: ShieldCheck,
+          // Solo la cuenta con el rol de plataforma. El filtro fail-closed de
+          // abajo la deja invisible para todos los demás sin código nuevo.
+          roles: ["superadmin"],
+        },
+      ],
+  },
 ];
 
 function isActive(pathname: string, href: string): boolean {
@@ -103,6 +118,31 @@ function isActive(pathname: string, href: string): boolean {
 
 function groupHasActive(pathname: string, group: NavGroup): boolean {
   return group.links.some((link) => isActive(pathname, link.href));
+}
+
+/**
+ * Sello de marca junto al wordmark "Orabella". Es decorativo: el texto contiguo
+ * ya nombra la marca, así que va `aria-hidden` y el `alt` queda para impresión
+ * o CSS caído. Dos decisiones deliberadas:
+ *   - `border border-border-color-2` es el borde del sistema: en claro el disco
+ *     blanco del sello se despega de la superficie, y el mismo token sirve en
+ *     oscuro sin variante `dark:`.
+ *   - el redondeo usa la clase `radius-full` de `design-tokens.css`, no la
+ *     utilidad `rounded-full`: en este archivo esa utilidad es la firma de
+ *     pastilla que vigila `badge-adoption.test.ts` (allowlist de 1: el contador
+ *     de alertas), y un logo no debe mover ese conteo.
+ */
+function SealMark() {
+  return (
+    <img
+      src="/orabella-logo.png"
+      alt="Orabella"
+      width={28}
+      height={28}
+      className="h-7 w-7 shrink-0 border border-border-color-2 radius-full"
+      aria-hidden="true"
+    />
+  );
 }
 
 export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; userName: string | null; alertsUnread: number }) {
@@ -243,7 +283,12 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
     <>
       {/* Barra superior: visible en móvil y tableta */}
       <header className="sticky top-0 z-30 flex items-center justify-between gap-3 border-b border-border-color bg-surface px-4 py-3 lg:hidden dark:border-border-color-2">
-        <Link href="/" className="text-lg font-bold" aria-label="Orabella inicio">
+        <Link
+          href="/"
+          className="flex items-center gap-2 text-lg font-bold"
+          aria-label="Orabella inicio"
+        >
+          <SealMark />
           Orabella
         </Link>
         <button
@@ -274,7 +319,10 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
             className="absolute left-0 top-0 flex h-full w-72 flex-col gap-4 overflow-y-auto bg-surface p-4"
           >
             <div className="flex items-center justify-between">
-              <span className="text-lg font-bold">Orabella</span>
+              <span className="flex items-center gap-2 text-lg font-bold">
+                <SealMark />
+                Orabella
+              </span>
               <button
                 type="button"
                 aria-label="Cerrar menú"
@@ -301,7 +349,12 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
       >
         <div className="flex items-center justify-between gap-2">
           {!sidebarCollapsed && (
-            <Link href="/" className="text-lg font-bold" aria-label="Orabella inicio">
+            <Link
+              href="/"
+              className="flex items-center gap-2 text-lg font-bold"
+              aria-label="Orabella inicio"
+            >
+              <SealMark />
               Orabella
             </Link>
           )}

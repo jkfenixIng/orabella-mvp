@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import {
   adminCreateUserSchema,
   changePasswordSchema,
+  isRoleCode,
   loginSchema,
   requestResetSchema,
   resetPasswordSchema,
@@ -132,9 +133,11 @@ export const PASSWORD_CHANGED_ELSEWHERE_ERROR =
 /**
  * ¿El fallo de un `rpc` es una DECISIÓN del contrato (un `RAISE EXCEPTION` de
  * las funciones de 054/057, siempre SQLSTATE P0001) y no una falla del sistema?
- * El mensaje es el vocabulario compartido entre el archivo y este módulo.
+ * El mensaje es el vocabulario compartido entre el archivo y este módulo, y
+ * también lo lee `scripts/create-superadmin.ts` (G2) para traducir los rechazos
+ * de `create_user_with_role`/`replace_user_roles` sin copiar el código P0001.
  */
-function esRechazoDeRpc(
+export function esRechazoDeRpc(
   error: { code?: string; message?: string } | null,
   codigo: string,
 ): boolean {
@@ -288,7 +291,7 @@ async function findUserByDocument(documento: string): Promise<{
   if (roleError) throw new AuthError("INTERNAL", "Error interno.", 500);
   const roles = ((roleRows ?? []) as unknown as Array<{ roles: { code: string } | null }>)
     .map((r) => r.roles?.code)
-    .filter((code): code is RoleCode => code === "admin" || code === "empleado" || code === "caja");
+    .filter(isRoleCode);
   return { user: row, roles };
 }
 
@@ -449,7 +452,7 @@ export async function getSessionUser(
     .eq("user_id", sessionRow.user_id);
   const roles = ((roleRows ?? []) as unknown as Array<{ roles: { code: string } | null }>)
     .map((r) => r.roles?.code)
-    .filter((code): code is RoleCode => code === "admin" || code === "empleado" || code === "caja");
+    .filter(isRoleCode);
   return { user: user as AuthUserRow, roles, session: sessionRow };
 }
 

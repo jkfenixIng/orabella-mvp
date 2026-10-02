@@ -16,6 +16,20 @@ export { moneyEquals, roundMoney };
 export const payrollStatusSchema = z.enum(["borrador", "cerrado"]);
 export type PayrollStatus = z.infer<typeof payrollStatusSchema>;
 
+/**
+ * F3/F4: cadencia de pago. Es la MISMA lista cerrada que declara el CHECK de
+ * `employees.pay_frequency` y `payroll_periods.frequency` (migración 063), la
+ * que pregunta la ficha del empleado (unidad de EMPLEADOS) y la que elige el
+ * diálogo de apertura del período (F4). `null` no es un valor más: es la
+ * AUSENCIA de cadencia, y conserva el comportamiento de hoy.
+ *
+ * Vive ARRIBA, antes de `openPeriodSchema`, porque el período la valida con el
+ * MISMO catálogo (una sola definición: si el enum se moviera en un lado y no en
+ * el otro, la nómina aceptaría una cadencia que no sabe liquidar).
+ */
+export const payFrequencySchema = z.enum(["semanal", "quincenal", "mensual"]);
+export type PayFrequency = z.infer<typeof payFrequencySchema>;
+
 /** PAY-06: estados del vale (descontada y rechazada son terminales). */
 export const voucherStatusSchema = z.enum(["pendiente", "aprobada", "rechazada", "descontada"]);
 export type VoucherStatus = z.infer<typeof voucherStatusSchema>;
@@ -26,27 +40,121 @@ const dateSchema = z
   .trim()
   .regex(/^\d{4}-\d{2}-\d{2}$/, "Fecha inválida (use yyyy-mm-dd).");
 
-/** PAY-01: apertura de un periodo borrador por sede y rango. */
+/**
+ * F10 (decisión del dueño, 2026-10-01): la fecha desde la que la nómina OPERA
+ * en la sede («la fecha de inicio de la implementación»). Es un día en la forma
+ * canónica `yyyy-mm-dd` —la MISMA convención de fechas del módulo—, no un
+ * instante.
+ *
+ * No se rechaza una fecha futura: que la implementación arranque en el ciclo
+ * que viene es el caso normal que el dueño describió, no un error de tipeo. La
+ * fecha se guarda tal como el admin la elige y la regla del ciclo recortado la
+ * resuelve sea cual sea el día de la semana.
+ *
+ * `null` es un estado LEGAL y significa «todavía no configurada»: sin fecha no
+ * hay cota nueva y el módulo conserva el comportamiento de hoy (la historia de
+ * la sede).
+ */
+export const payrollStartDateSchema = dateSchema.nullable();
+
+/** F10: cuerpo para configurar (o limpiar) la fecha de arranque de la nómina. */
+export const setPayrollStartDateSchema = z.object({
+  payroll_start_date: payrollStartDateSchema,
+});
+export type SetPayrollStartDateInput = z.infer<typeof setPayrollStartDateSchema>;
+
+/**
+ * PAY-01/F7: apertura de un período borrador por sede y CICLO.
+ *
+ * F7 (regla del dueño, 2026-10-01): el rango NO es libre. El período se cierra
+ * al ciclo de su cadencia ("último domingo a este sábado"; quincenal dos
+ * semanas, mensual cuatro), así que el formulario manda la CADENCIA y el
+ * CIERRE DEL CICLO (el sábado que lo cierra) y el servidor deriva
+ * `start_date`/`end_date`. Elegir un lunes es imposible por construcción, no
+ * "desaconsejado".
+ *
+ * `frequency` es OBLIGATORIA para un período NUEVO: "sin cadencia" ya no es una
+ * opción del diálogo. NULL sigue siendo legal SOLO como dato heredado —los
+ * períodos ya abiertos conservan su cálculo por la vía F3/F5— y no se puede
+ * pedir por acá.
+ *
+ * `start_date`/`end_date` siguen aceptándose por compatibilidad, pero son una
+ * SEGUNDA opinión: si vienen y no coinciden con el ciclo derivado, el envío se
+ * rechaza. La única fuente de verdad es `frequency` + `cycle_end_date`.
+ *
+ * F10: la forma del rango que se persiste la resuelve `resolveOpenPayrollRange`
+ * —el ÚNICO validador de las DOS formas admisibles: un ciclo COMPLETO o el
+ * PRIMER ciclo recortado a la fecha de arranque— porque el recorte depende de
+ * la sede (su fecha de arranque y los períodos que ya tiene) y este esquema es
+ * puro. La segunda opinión de `start_date`/`end_date` sigue siendo sobre el
+ * CIELO del ciclo elegido: el recorte lo agrega el servicio, no el llamador.
+ */
 export const openPeriodSchema = z
   .object({
-    start_date: dateSchema,
-    end_date: dateSchema,
+    frequency: payFrequencySchema,
+    cycle_end_date: dateSchema,
+    start_date: dateSchema.optional(),
+    end_date: dateSchema.optional(),
   })
   .superRefine((value, context) => {
-    if (value.end_date < value.start_date) {
+    const cycle = payrollCycleRange({
+      frequency: value.frequency,
+      cycleEndDate: value.cycle_end_date,
+    });
+    if (cycle === null) {
       context.addIssue({
         code: "custom",
-        message: "La fecha final no puede ser anterior a la inicial.",
+        message: "El cierre del ciclo debe ser un sábado.",
+        path: ["cycle_end_date"],
+      });
+      return;
+    }
+    if (value.start_date !== undefined && value.start_date !== cycle.start_date) {
+      context.addIssue({
+        code: "custom",
+        message: "La fecha de inicio no coincide con el ciclo de la cadencia.",
+        path: ["start_date"],
+      });
+    }
+    if (value.end_date !== undefined && value.end_date !== cycle.end_date) {
+      context.addIssue({
+        code: "custom",
+        message: "La fecha final no coincide con el ciclo de la cadencia.",
+        path: ["end_date"],
       });
     }
   });
 export type OpenPeriodInput = z.infer<typeof openPeriodSchema>;
+
+/**
+ * F8 (migración 067): longitud máxima del motivo de un ajuste manual. El mismo
+ * tope vive en la guarda de forma de `payroll_apply_atomic`, para que un motivo
+ * desmedido se rechace en el contrato y no llegue a la columna.
+ */
+export const ADJUSTMENT_REASON_MAX_LENGTH = 200;
 
 /** PAY-02: ajustes manuales por empleado al calcular (bonos y otros descuentos). */
 export const employeeAdjustmentSchema = z.object({
   employee_id: uuidSchema,
   bonuses: z.coerce.number().nonnegative("Los bonos no pueden ser negativos.").default(0),
   other_discounts: z.coerce.number().nonnegative("Los descuentos no pueden ser negativos.").default(0),
+  /**
+   * F8: el motivo escrito del ajuste. Viaja en la MISMA fila que el monto que
+   * justifica (`payroll_items.adjustment_reason`, 067) y con él se confirma o se
+   * revierte. `null`/ausente = sin motivo: el servicio lo exige cuando hay un
+   * bono o un descuento distinto de 0 y lo descarta cuando no hay ajuste
+   * (decisión del dueño, 2026-10-01: todo ajuste manual lleva su motivo). La
+   * regla cruzada vive en el servicio porque el mensaje tiene que nombrar al
+   * empleado y el esquema no conoce los nombres.
+   */
+  adjustment_reason: z
+    .string()
+    .trim()
+    .max(
+      ADJUSTMENT_REASON_MAX_LENGTH,
+      `El motivo no puede superar los ${ADJUSTMENT_REASON_MAX_LENGTH} caracteres.`,
+    )
+    .nullish(),
 });
 export type EmployeeAdjustment = z.infer<typeof employeeAdjustmentSchema>;
 
@@ -677,6 +785,809 @@ export function prorateFixedSalary(args: {
   return roundMoney(total);
 }
 
+// ------------------------------------------------ F3: cadencia y regla mixta ---
+
+/** F3: cadencia válida, o null cuando no viene o no es una de las tres. */
+export function normalizePayFrequency(value: string | null | undefined): PayFrequency | null {
+  return value === "semanal" || value === "quincenal" || value === "mensual" ? value : null;
+}
+
+/**
+ * F4: el "cubo de cadencia" con el que la BASE compara dos períodos en
+ * `ex_payroll_periods_no_overlap` (063): `coalesce(frequency, '')`.
+ *
+ * En una restricción de exclusión gist un NULL NO es igual a otro NULL, así que
+ * la base convierte la ausencia de cadencia en la cadena vacía para que dos
+ * períodos SIN cadencia sigan siendo mutuamente excluyentes. El servicio TIENE
+ * que comparar con el MISMO cubo: comparar la columna pelada soltaría en
+ * silencio los períodos heredados (todos NULL) y debilitaría la protección de
+ * siempre. Puro para probarlo sin base de datos.
+ */
+export function periodCadenceBucket(frequency: string | null | undefined): string {
+  return frequency ?? "";
+}
+
+/**
+ * F4: true cuando el empleado NO pertenece a este período por cadencia: las
+ * DOS están definidas y DIFIEREN. La regla del dueño (2026-10-01) lo excluye
+ * ENTERO del período —sin fijo y sin comisiones, con sus facturas fuera de la
+ * ventana— porque lo paga su propio ciclo.
+ *
+ * Si CUALQUIERA de las dos cadencias faltan (NULL = "sin cadencia definida") el
+ * predicado es false y rige el comportamiento de hoy: prorrateo por días más
+ * comisiones. Es deliberado que la comparación use las cadencias NORMALIZADAS
+ * (un valor fuera del catálogo es ausencia, no una cadencia distinta).
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function periodExcludesEmployeeByCadence(args: {
+  employeeFrequency: string | null | undefined;
+  periodFrequency: string | null | undefined;
+}): boolean {
+  const employeeFrequency = normalizePayFrequency(args.employeeFrequency);
+  const periodFrequency = normalizePayFrequency(args.periodFrequency);
+  return (
+    employeeFrequency !== null &&
+    periodFrequency !== null &&
+    employeeFrequency !== periodFrequency
+  );
+}
+
+/**
+ * F3: fracción del sueldo MENSUAL que paga cada cadencia sobre un mes comercial
+ * de 30 días (el mes se cuenta como 4 semanas): semanal = 1/4, quincenal = 1/2,
+ * mensual = 1. Sin cadencia no hay fracción (`null`): el fijo se sigue
+ * prorrateando por los días calendario del período (`prorateFixedSalary`).
+ *
+ * Consecuencia ACEPTADA por el dueño (2026-10-01), que esta función no
+ * contradice ni reabre: 1/4 por semana paga ≈ 13 sueldos al año (52,14
+ * semanas), no 12. El mes comercial de 30 días es justamente lo que produce esa
+ * cuenta.
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function fixedFractionForFrequency(frequency: string | null | undefined): number | null {
+  switch (normalizePayFrequency(frequency)) {
+    case "semanal":
+      return 1 / 4;
+    case "quincenal":
+      return 1 / 2;
+    case "mensual":
+      return 1;
+    default:
+      return null;
+  }
+}
+
+/**
+ * F5: días del ciclo NATURAL de cada cadencia sobre el MISMO mes comercial de
+ * 30 días que ya fija `fixedFractionForFrequency`: semanal = 7, quincenal = 15,
+ * mensual = 30. Es la unidad con la que se prorratea el ciclo parcial de la
+ * primera nómina (`1.500.000 / 4 × 4/7 = 214.286`): la fracción del dueño paga
+ * un ciclo COMPLETO, y un período más corto paga la parte proporcional de ese
+ * ciclo. Sin cadencia no hay ciclo (`null`): rige el prorrateo por días de hoy.
+ */
+export const PAY_CYCLE_DAYS: Record<PayFrequency, number> = {
+  semanal: 7,
+  quincenal: 15,
+  mensual: 30,
+};
+
+/** F5: días del ciclo de una cadencia, o `null` cuando no hay cadencia definida. */
+export function cycleDaysForFrequency(frequency: string | null | undefined): number | null {
+  const normalized = normalizePayFrequency(frequency);
+  return normalized === null ? null : PAY_CYCLE_DAYS[normalized];
+}
+
+/**
+ * F5: días que cubre `[startDate, endDate]` contando los DOS extremos (el mismo
+ * rango inclusivo del período). Un rango imposible devuelve `null`: el llamador
+ * decide, y en la ruta de cadencia eso conserva el comportamiento de hoy.
+ */
+export function periodRangeDays(startDate: string, endDate: string): number | null {
+  const start = utcDayOf(startDate);
+  const end = utcDayOf(endDate);
+  if (start === null || end === null || end < start) return null;
+  return (end - start) / DAY_MS + 1;
+}
+
+// -------------------------------------- F7: ciclo cerrado (domingo–sábado) ---
+
+/**
+ * F7: días de CALENDARIO del ciclo cerrado de cada cadencia: semanal = 1 semana
+ * = 7 días, quincenal = 2 semanas = 14, mensual = 4 semanas = 28. Es la unidad
+ * con la que la nómina se cierra al ciclo (domingo a sábado) y NO es
+ * `PAY_CYCLE_DAYS` (7/15/30), que es la base COMERCIAL de 30 días con la que se
+ * prorratea un rango que no llega a ser un ciclo.
+ */
+export const PAY_CYCLE_CALENDAR_DAYS: Record<PayFrequency, number> = {
+  semanal: 7,
+  quincenal: 14,
+  mensual: 28,
+};
+
+/** F7: días del ciclo cerrado de una cadencia, o `null` sin cadencia definida. */
+export function calendarCycleDaysForFrequency(frequency: string | null | undefined): number | null {
+  const normalized = normalizePayFrequency(frequency);
+  return normalized === null ? null : PAY_CYCLE_CALENDAR_DAYS[normalized];
+}
+
+/** Día de la semana UTC de un día (ms): 0 = domingo … 6 = sábado. */
+function utcWeekday(dayMs: number): number {
+  return new Date(dayMs).getUTCDay();
+}
+
+/** Fecha yyyy-mm-dd del día UTC (ms), con la misma aritmética UTC del módulo. */
+function isoDayOf(dayMs: number): string {
+  return new Date(dayMs).toISOString().slice(0, 10);
+}
+
+/** Sábado en o ANTES del día dado (ms): el cierre del ciclo que lo contiene. */
+function saturdayOnOrBefore(dayMs: number): number {
+  return dayMs - ((utcWeekday(dayMs) + 1) % 7) * DAY_MS;
+}
+
+/** Sábado en o DESPUÉS del día dado (ms): cierra el ciclo que lo contiene. */
+function saturdayOnOrAfter(dayMs: number): number {
+  return dayMs + ((6 - utcWeekday(dayMs) + 7) % 7) * DAY_MS;
+}
+
+/** F7: rango inclusivo de UN ciclo cerrado (domingo a sábado). */
+export interface PayrollCycleRange {
+  start_date: string;
+  end_date: string;
+}
+
+/**
+ * F7: deriva el rango de UN ciclo cerrado de la cadencia.
+ *
+ *  - Con `cycleEndDate` (el sábado que cierra el ciclo), valida que sea sábado
+ *    y devuelve `[end − (días−1), end]`.
+ *  - Con `referenceDate`, devuelve el ciclo que CONTIENE esa fecha (su cierre es
+ *    el sábado en o después de ella).
+ *  - Sin cadencia, con una fecha imposible o con un cierre que no es sábado,
+ *    devuelve `null`: el llamador decide, y el período NUEVO rechaza el envío.
+ *
+ * Puro para probarlo sin base de datos. Es la ÚNICA aritmética de ciclos: el
+ * diálogo, el esquema y el servicio la comparten.
+ */
+export function payrollCycleRange(args: {
+  frequency: string | null | undefined;
+  cycleEndDate?: string | null;
+  referenceDate?: string | null;
+}): PayrollCycleRange | null {
+  const cycleDays = calendarCycleDaysForFrequency(args.frequency);
+  if (cycleDays === null) return null;
+  const explicit = args.cycleEndDate ?? null;
+  const reference = args.referenceDate ?? null;
+  let end: number | null = null;
+  if (explicit !== null) {
+    const day = utcDayOf(explicit);
+    if (day === null || utcWeekday(day) !== 6) return null;
+    end = day;
+  } else if (reference !== null) {
+    const day = utcDayOf(reference);
+    if (day === null) return null;
+    end = saturdayOnOrAfter(day);
+  }
+  if (end === null) return null;
+  const start = end - (cycleDays - 1) * DAY_MS;
+  return { start_date: isoDayOf(start), end_date: isoDayOf(end) };
+}
+
+/**
+ * F7: sábado que cierra el ÚLTIMO ciclo COMPLETADO a la fecha de referencia. Un
+ * ciclo se completa cuando ya pasó su sábado, así que el cierre es el sábado
+ * ANTERIOR a la referencia: el domingo se liquida la semana que terminó el día
+ * anterior (el caso real del dueño).
+ */
+export function lastCompletedCycleEndDate(referenceDate: string): string | null {
+  const day = utcDayOf(referenceDate);
+  if (day === null) return null;
+  return isoDayOf(saturdayOnOrBefore(day - DAY_MS));
+}
+
+/** F7: opción de ciclo para el diálogo: su rango y su etiqueta legible. */
+export interface PayrollCycleOption extends PayrollCycleRange {
+  label: string;
+}
+
+const MONTHS_SHORT_ES = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+
+/** Etiqueta de un rango de ciclo ("30 ago – 5 sep 2026"; "1 – 7 sep 2026"). */
+function cycleRangeLabel(startMs: number, endMs: number): string {
+  const start = new Date(startMs);
+  const end = new Date(endMs);
+  const sameMonth =
+    start.getUTCMonth() === end.getUTCMonth() && start.getUTCFullYear() === end.getUTCFullYear();
+  const startText = sameMonth
+    ? `${start.getUTCDate()}`
+    : `${start.getUTCDate()} ${MONTHS_SHORT_ES[start.getUTCMonth()]}`;
+  return `${startText} – ${end.getUTCDate()} ${MONTHS_SHORT_ES[end.getUTCMonth()]} ${end.getUTCFullYear()}`;
+}
+
+/**
+ * F7: los últimos `count` ciclos COMPLETADOS de la cadencia, el más reciente
+ * primero. Es la lista que alimenta el selector del diálogo: cada opción lleva
+ * su etiqueta con el rango YA calculado, así el dueño VE qué ciclo elige y las
+ * fechas no se escriben a mano. El primero es el que se ofrece por defecto (la
+ * liquidación del domingo cubre la semana que cerró el sábado anterior).
+ *
+ * Sin cadencia no hay ciclos (`[]`), igual que `payrollCycleRange` devuelve
+ * `null`: la ausencia de cadencia no inventa un ciclo.
+ */
+export function lastCompletedPayrollCycles(args: {
+  frequency: string | null | undefined;
+  referenceDate: string;
+  count?: number;
+}): PayrollCycleOption[] {
+  const cycleDays = calendarCycleDaysForFrequency(args.frequency);
+  if (cycleDays === null) return [];
+  const lastEnd = utcDayOf(lastCompletedCycleEndDate(args.referenceDate) ?? "");
+  if (lastEnd === null) return [];
+  const count = Math.max(0, Math.trunc(args.count ?? 8));
+  const options: PayrollCycleOption[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const end = lastEnd - index * cycleDays * DAY_MS;
+    const start = end - (cycleDays - 1) * DAY_MS;
+    options.push({
+      start_date: isoDayOf(start),
+      end_date: isoDayOf(end),
+      label: cycleRangeLabel(start, end),
+    });
+  }
+  return options;
+}
+
+/**
+ * F7: true cuando `[startDate, endDate]` es EXACTAMENTE un ciclo cerrado de la
+ * cadencia. La regla, literal: el rango empieza DOMINGO, termina SÁBADO y dura
+ * 7, 14 o 28 días contando los DOS extremos. Un lunes, un rango de 8/13/29 días
+ * o uno corrido un día NO son un ciclo; sin cadencia tampoco hay ciclo.
+ *
+ * Puro para probarlo sin base de datos. Es la misma verdad que `payrollCycleRange`
+ * construye, comprobada desde el rango en vez de desde el cierre.
+ */
+export function isPayrollCycleRange(args: {
+  frequency: string | null | undefined;
+  startDate: string;
+  endDate: string;
+}): boolean {
+  const cycleDays = calendarCycleDaysForFrequency(args.frequency);
+  if (cycleDays === null) return false;
+  const start = utcDayOf(args.startDate);
+  const end = utcDayOf(args.endDate);
+  if (start === null || end === null || end < start) return false;
+  if (utcWeekday(start) !== 0) return false;
+  if (utcWeekday(end) !== 6) return false;
+  return (end - start) / DAY_MS + 1 === cycleDays;
+}
+
+/**
+ * F5/F7: factor con el que se escala la fracción de la cadencia cuando el
+ * período cubre un ciclo PARCIAL (la primera liquidación suele ser un rango
+ * corto, desde el día en que arrancó el negocio).
+ *
+ *  - Rango que ES un ciclo cerrado de la cadencia (F7: domingo a sábado, 7/14/28
+ *    días) → `1`: el ciclo paga la fracción entera aunque la base comercial de
+ *    30 días sea más larga. El mensual de 4 semanas son 28 días, no 30: sin
+ *    esto un cierre mensual pagaría 28/30 del sueldo y los 13 cierres del año
+ *    no serían 13 sueldos (la consecuencia aceptada por el dueño).
+ *  - Rango MÁS CORTO que el ciclo comercial → `días del período / días del ciclo`
+ *    (semanal 4 días → `4/7`).
+ *  - Rango IGUAL o MÁS LARGO → `1`: se paga el ciclo completo y NUNCA más de
+ *    uno. Un período de un mes natural (28…31 días) no puede pagar 31/30 de una
+ *    fracción: el tope evita que un rango que se pasa por uno o dos días pague
+ *    de más. Si se quisiera pagar dos ciclos, serían dos períodos.
+ *  - Sin cadencia o con un rango imposible → `1`, que deja la fracción como
+ *    estaba (esa rama la gobierna `basis = "prorated"`).
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function cycleProrationFactor(args: {
+  frequency: string | null | undefined;
+  startDate: string;
+  endDate: string;
+}): number {
+  const cycleDays = cycleDaysForFrequency(args.frequency);
+  const rangeDays = periodRangeDays(args.startDate, args.endDate);
+  if (cycleDays === null || rangeDays === null) return 1;
+  // F7: un ciclo cerrado paga la fracción entera (el mensual son 28 días, no 30).
+  if (
+    isPayrollCycleRange({
+      frequency: args.frequency,
+      startDate: args.startDate,
+      endDate: args.endDate,
+    })
+  ) {
+    return 1;
+  }
+  // TOPE del ciclo: un rango más largo que el ciclo no paga más de la fracción.
+  if (rangeDays >= cycleDays) return 1;
+  return rangeDays / cycleDays;
+}
+
+// ------------------- F10: fecha de arranque de la nómina de la sede ---
+
+/**
+ * F10: ¿este rango queda ENTERO antes del arranque de la nómina?
+ *
+ * LA regla de la fecha de arranque, en UNA sola definición: un rango es
+ * ANTERIOR cuando su ÚLTIMO día es anterior a la fecha. El detector de
+ * pendientes la usa para no ofrecer un ciclo anterior y el servicio la usa para
+ * rechazar la apertura de un período anterior, así que el aviso y el servicio no
+ * pueden decir cosas distintas del mismo ciclo.
+ *
+ * Un rango que CONTIENE la fecha (empieza antes y termina después) NO queda
+ * antes: es el ciclo en el que arranca la nómina y se RECORTA a la fecha (ver
+ * `resolveOpenPayrollRange`) — es el PRIMER ciclo, no un ciclo anterior.
+ *
+ * Sin fecha configurada (`null`) no hay cota: `false`, y el llamador conserva
+ * el comportamiento de hoy.
+ */
+export function isRangeBeforePayrollStart(args: {
+  payrollStartDate: string | null | undefined;
+  startDate: string;
+  endDate: string;
+}): boolean {
+  const start = utcDayOf(args.payrollStartDate ?? "");
+  if (start === null) return false;
+  const end = utcDayOf(args.endDate);
+  if (end === null) return false;
+  return end < start;
+}
+
+/** F10: por qué un ciclo NO se puede abrir. */
+export type OpenPayrollRangeRejection = "not-a-cycle" | "before-start" | "not-first-cycle";
+
+/** F10: el rango que se persiste, con `trimmed` a la vista. */
+export interface OpenPayrollRange extends PayrollCycleRange {
+  /**
+   * F10: true cuando el ciclo se RECORTÓ a la fecha de arranque. Es el PRIMER
+   * ciclo de la cadencia: paga una parte del ciclo y la prorrata de F5 ya lo
+   * resuelve por el rango (no hay aritmética nueva).
+   */
+  trimmed: boolean;
+}
+
+/** F10: el rango admisible, o el motivo del rechazo. */
+export type OpenPayrollRangeResolution =
+  | ({ ok: true } & OpenPayrollRange)
+  | { ok: false; reason: OpenPayrollRangeRejection };
+
+/**
+ * F10: el ÚNICO validador de la forma de un período NUEVO, con la fecha de
+ * arranque y la historia de la cadencia a la vista. Acepta EXACTAMENTE dos
+ * formas y rechaza todo lo demás:
+ *
+ *   1. Un ciclo COMPLETO de la cadencia (domingo a sábado, 7/14/28 días): la
+ *      forma normal de todos los ciclos posteriores al primero.
+ *   2. El PRIMER ciclo —el que CONTIENE la fecha de arranque— RECORTADO a esa
+ *      fecha: empieza el día del arranque y termina el sábado del ciclo. Sólo
+ *      vale como PRIMERO: con otro período de la MISMA cadencia ya registrado,
+ *      el recorte dejaría de ser «el primero» y se rechaza
+ *      (`not-first-cycle`), porque la única primera liquidación de la cadencia
+ *      ya ocurrió.
+ *
+ * Un ciclo que cierra ANTES de la fecha no existe para el sistema
+ * (`before-start`): no se ofrece ni se liquida. Un cierre que no es sábado, o
+ * una fecha imposible, no es un ciclo (`not-a-cycle`) — la misma verdad de
+ * `payrollCycleRange`.
+ *
+ * Sin fecha configurada no hay recorte ni cota: todos los ciclos completos son
+ * válidos y el comportamiento es el de hoy.
+ *
+ * `frequency` viaja aparte (y no dentro del ciclo) porque no toda cadencia con
+ * historia la tiene en sus períodos: los heredados son `NULL` y NO son historia
+ * de ninguna cadencia.
+ *
+ * Puro para probarlo sin base de datos. Es la MISMA verdad que el detector de
+ * pendientes (`isRangeBeforePayrollStart`) y la que el servicio aplica antes del
+ * INSERT.
+ */
+export function resolveOpenPayrollRange(args: {
+  frequency: PayFrequency;
+  cycleEndDate: string;
+  payrollStartDate?: string | null;
+  periods: readonly (DateRange & { frequency?: string | null })[];
+}): OpenPayrollRangeResolution {
+  const cycle = payrollCycleRange({ frequency: args.frequency, cycleEndDate: args.cycleEndDate });
+  if (cycle === null) return { ok: false, reason: "not-a-cycle" };
+  const startBound = args.payrollStartDate ?? null;
+  if (startBound === null) return { ok: true, ...cycle, trimmed: false };
+  const boundary = utcDayOf(startBound);
+  const cycleStart = utcDayOf(cycle.start_date);
+  if (boundary === null || cycleStart === null) return { ok: false, reason: "not-a-cycle" };
+  // Un ciclo que cierra antes de la fecha es ANTERIOR: la misma regla que el
+  // aviso de pendientes. La fecha es el ÚLTIMO día que el período puede tocar.
+  if (
+    isRangeBeforePayrollStart({
+      payrollStartDate: startBound,
+      startDate: cycle.start_date,
+      endDate: cycle.end_date,
+    })
+  ) {
+    return { ok: false, reason: "before-start" };
+  }
+  // El ciclo arranca DESPUÉS de la fecha: es un ciclo completo, la forma normal.
+  if (cycleStart >= boundary) return { ok: true, ...cycle, trimmed: false };
+  // El ciclo CONTIENE la fecha: es el PRIMER ciclo y se recorta a la fecha. Su
+  // único título es ser el primero: con historia en la MISMA cadencia, el
+  // recorte ya no es «la primera liquidación» y se rechaza.
+  const bucket = periodCadenceBucket(args.frequency);
+  const hasCadenceHistory = args.periods.some(
+    (period) => periodCadenceBucket(period.frequency ?? null) === bucket,
+  );
+  if (hasCadenceHistory) return { ok: false, reason: "not-first-cycle" };
+  return { ok: true, start_date: startBound, end_date: cycle.end_date, trimmed: true };
+}
+
+// ------------------- F9: ciclos cerrados que faltan por liquidar ---
+
+/**
+ * F9 (pedido del dueño, 2026-10-02): cuántos ciclos PENDIENTES se listan por
+ * cadencia. La pantalla avisa de los que faltan, no de una historia sin fin: con
+ * una sede que viene atrasada hace meses, los tres ciclos más recientes de cada
+ * cadencia alcanzan para que el atraso se vea, y el tope evita que el aviso
+ * crezca sin control. El tope es POR CADENCIA: una cadencia muy atrasada no
+ * puede tapar a las otras dos.
+ */
+export const PENDING_SETTLEMENT_LIMIT = 3;
+
+/**
+ * F9: cuántos NOMBRES lleva cada entrada pendiente. Los nombres ya están en
+ * memoria (vienen con la planta), así que nombrar a unos pocos es gratis; el
+ * tope sólo evita una entrada ilegible cuando la cadencia tiene mucha gente. El
+ * `employeeCount` sigue diciendo el total.
+ */
+export const PENDING_SETTLEMENT_NAME_LIMIT = 3;
+
+/** F9: un ciclo cerrado de la sede que todavía no tiene liquidación. */
+export interface PendingPayrollSettlement {
+  /** Cadencia del ciclo (y de los empleados que cobran por ella). */
+  frequency: PayFrequency;
+  start_date: string;
+  end_date: string;
+  /** Etiqueta legible del rango (`20 sep – 3 oct 2026`), la misma del selector. */
+  label: string;
+  /** Cuántos empleados ACTIVOS de la sede cobran con esa cadencia. */
+  employeeCount: number;
+  /** Hasta `PENDING_SETTLEMENT_NAME_LIMIT` nombres, en orden determinista. */
+  employeeNames: string[];
+}
+
+/**
+ * F9: true cuando la sede YA pagó los días de ese ciclo por esa cadencia. Cubre
+ * por SOLAPE (`rangesOverlap`, la misma cuenta de la base y el servicio), no por
+ * coincidencia exacta: un período que comparte días ya pagó esos días.
+ *
+ * La CADENCIA se compara con una asimetría deliberada:
+ *  - Un período de la MISMA cadencia cubre: es su liquidación.
+ *  - Un período de OTRA cadencia NO cubre: el semanal y el mensual comparten días
+ *    A PROPÓSITO (regla del dueño), así que uno no tacha al otro.
+ *  - Un período HEREDADO sin cadencia (`NULL`, de antes de F7) cubre CUALQUIER
+ *    cadencia: no lo acotaba ningún ciclo, así que pagó el fijo a todo el plantel
+ *    y esos días ya salieron de la nómina. Tratarlo como un cubo más —el `''` de
+ *    `coalesce(frequency, '')`, que la guarda de solape sí usa— dejaría el ciclo
+ *    reportándose como pendiente para siempre y el aviso gritaría de más: un
+ *    aviso que grita de más deja de mirarse.
+ *
+ * Reutiliza `periodCadenceBucket` y `rangesOverlap` —las MISMAS reglas del
+ * servicio, la guarda y la base— en vez de repetir aritmética. Puro para
+ * probarlo sin base de datos: es también lo que el selector y la guarda de
+ * apertura del diálogo usan para decidir si un ciclo se puede liquidar, así que
+ * el aviso, las marcas del selector y el diálogo no pueden decir cosas distintas
+ * del mismo ciclo.
+ */
+export function isPayrollCycleSettled(args: {
+  periods: readonly (DateRange & { frequency?: string | null })[];
+  frequency: string | null | undefined;
+  cycle: DateRange;
+}): boolean {
+  const cadence = normalizePayFrequency(args.frequency);
+  if (cadence === null) return false;
+  return args.periods.some((period) => {
+    if (!rangesOverlap(period, args.cycle)) return false;
+    const bucket = periodCadenceBucket(period.frequency ?? null);
+    // Cubo vacío = período heredado sin cadencia: le pagó a todos, así que cubre.
+    return bucket === "" || bucket === cadence;
+  });
+}
+
+/**
+ * F9: los ciclos CERRADOS de la sede que todavía no tienen liquidación, por
+ * cadencia, con lo que la pantalla necesita para decir "falta liquidar esto" y
+ * para abrirlo ya posicionado en ese ciclo.
+ *
+ * Reglas (todas puras, sin base de datos):
+ *  1. Sólo cuenta una cadencia cuando AL MENOS UN empleado ACTIVO la tiene. Sin
+ *     gente de esa cadencia no hay nada que liquidar y no se reporta (un `null` o
+ *     un valor fuera del catálogo es ausencia de cadencia, no una cadencia más).
+ *  2. Sólo cuenta un ciclo ya CERRADO: su sábado es anterior a la fecha de
+ *     referencia (`lastCompletedCycleEndDate`, la misma cuenta de F7). El ciclo en
+ *     curso no se reporta: todavía no ha terminado.
+ *  3. Un ciclo CUBIERTO no se reporta (`isPayrollCycleSettled`): lo cubre un
+ *     período de su MISMA cadencia —el que se solapa o coincide exactamente ya se
+ *     liquidó o se está liquidando en borrador— o un período HEREDADO sin
+ *     cadencia, que le pagó a todo el plantel.
+ *  4. No se reporta historia ANTERIOR a la sede: el recorrido se detiene en el
+ *     arranque del primer período de la sede —antes de eso no había nada que
+ *     liquidar— y sin ningún período NI fecha de arranque no se reporta NADA.
+ *     Un ciclo que terminó antes de ese arranque no aparece.
+ *  5. La lista se TOPA en `limit` ciclos (3 por defecto) POR CADENCIA, tomando
+ *     los más recientes, y se ordena con el más atrasado PRIMERO (por fecha de
+ *     cierre) para que lo más vencido se vea arriba.
+ *
+ * F10: `payrollStartDate` (la fecha desde la que la nómina opera en la sede)
+ * REEMPLAZA el arranque por evidencia de la regla 4 cuando está configurada. La
+ * fecha es la autoridad sobre dónde empieza la historia de la sede —«nada
+ * anterior a la fecha de inicio de la implementación existe para el sistema»—,
+ * así que un ciclo que cierra antes NO se reporta (la regla de
+ * `isRangeBeforePayrollStart`), y con la fecha configurada el aviso también
+ * reporta cuando la sede TODAVÍA no tiene ningún período: el primer ciclo es
+ * justamente lo que falta liquidar. Las dos cotas NO se combinan por el máximo:
+ * la fecha manda, porque el arranque por evidencia era sólo el mejor dato
+ * disponible cuando no había una fecha declarada.
+ *
+ * `referenceDate` es un día de Bogotá (lo resuelve el llamador, `bogotaDay()`), la
+ * MISMA convención de fechas del resto del módulo.
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function pendingPayrollSettlements(args: {
+  periods: readonly (DateRange & { frequency?: string | null })[];
+  employees: readonly {
+    full_name: string;
+    pay_frequency?: string | null;
+    is_active?: boolean;
+  }[];
+  referenceDate: string;
+  limit?: number;
+  /** F10: fecha de arranque de la nómina de la sede; `null` = sin configurar. */
+  payrollStartDate?: string | null;
+}): PendingPayrollSettlement[] {
+  const lastEnd = utcDayOf(lastCompletedCycleEndDate(args.referenceDate) ?? "");
+  if (lastEnd === null) return [];
+
+  // F10: con la fecha de arranque configurada, el piso del recorrido ES la
+  // fecha (regla 4 reemplazada): nada anterior a ella existe para el sistema. La
+  // fecha se parsea una sola vez; una fecha imposible no acota (mismo criterio
+  // que `isRangeBeforePayrollStart`).
+  const declaredStart = utcDayOf(args.payrollStartDate ?? "");
+  // Regla 4 por evidencia (SIN fecha configurada): el arranque de la sede es la
+  // fecha de inicio MÁS ANTIGUA registrada. Antes de ahí no había nada que
+  // liquidar, así que el recorrido se detiene ahí.
+  let historyStart: number | null = null;
+  for (const period of args.periods) {
+    const start = utcDayOf(period.start_date);
+    if (start === null) continue;
+    if (historyStart === null || start < historyStart) historyStart = start;
+  }
+  const floor = declaredStart ?? historyStart;
+  // Sin períodos y sin fecha no hay historia de la sede: nada que reportar.
+  if (floor === null) return [];
+
+  // Regla 1: la planta que importa es la ACTIVA. Un empleado dado de baja no
+  // puede dejar un aviso de "falta liquidar" que nunca se pueda cerrar.
+  const namesByFrequency = new Map<PayFrequency, string[]>();
+  for (const employee of args.employees) {
+    if (employee.is_active === false) continue;
+    const frequency = normalizePayFrequency(employee.pay_frequency ?? null);
+    if (frequency === null) continue;
+    const bucket = namesByFrequency.get(frequency);
+    if (bucket) bucket.push(employee.full_name);
+    else namesByFrequency.set(frequency, [employee.full_name]);
+  }
+
+  const limit = Math.max(0, Math.trunc(args.limit ?? PENDING_SETTLEMENT_LIMIT));
+  if (limit === 0) return [];
+
+  const pending: PendingPayrollSettlement[] = [];
+  // El catálogo cerrado es UNA sola definición (`payFrequencySchema.options`):
+  // una cadencia nueva entra acá sin tocar este recorrido.
+  for (const frequency of payFrequencySchema.options) {
+    const cadenceNames = namesByFrequency.get(frequency);
+    if (cadenceNames === undefined || cadenceNames.length === 0) continue;
+    const cycleDays = calendarCycleDaysForFrequency(frequency);
+    if (cycleDays === null) continue;
+
+    let found = 0;
+    // Del ciclo completado MÁS RECIENTE hacia atrás: los primeros sin cubrir son
+    // los que el tope conserva.
+    for (let end = lastEnd; end >= floor; end -= cycleDays * DAY_MS) {
+      const start = end - (cycleDays - 1) * DAY_MS;
+      const cycle = { start_date: isoDayOf(start), end_date: isoDayOf(end) };
+      // F10: un ciclo ANTERIOR al arranque de la nómina no existe para el
+      // sistema: no se ofrece ni se liquida (la MISMA regla que el servicio).
+      if (
+        isRangeBeforePayrollStart({
+          payrollStartDate: args.payrollStartDate,
+          startDate: cycle.start_date,
+          endDate: cycle.end_date,
+        })
+      ) {
+        break;
+      }
+      if (isPayrollCycleSettled({ periods: args.periods, frequency, cycle })) continue;
+      // F10: el rango REPORTADO es el que se va a abrir. Cuando la fecha de
+      // arranque cae DENTRO de este ciclo, es el PRIMER ciclo de la cadencia y
+      // su rango se recorta a la fecha (la MISMA forma que el servicio persiste),
+      // así el aviso dice lo que se va a liquidar y no un ciclo completo que la
+      // nómina nunca va a pagar como tal.
+      const reportedStart = declaredStart !== null && declaredStart > start ? declaredStart : start;
+      pending.push({
+        frequency,
+        start_date: isoDayOf(reportedStart),
+        end_date: cycle.end_date,
+        label: cycleRangeLabel(reportedStart, end),
+        employeeCount: cadenceNames.length,
+        // Orden determinista: el mismo atraso se lee igual en cada corrida, sin
+        // depender del orden en que la planta llegó del servidor.
+        employeeNames: [...cadenceNames].sort().slice(0, PENDING_SETTLEMENT_NAME_LIMIT),
+      });
+      found += 1;
+      if (found >= limit) break;
+    }
+  }
+
+  // El más atrasado primero: por fecha de CIERRE (la que marca el atraso) y, a
+  // igualdad, por el orden del catálogo de cadencias.
+  return pending.sort((left, right) => {
+    if (left.end_date !== right.end_date) return left.end_date < right.end_date ? -1 : 1;
+    return (
+      payFrequencySchema.options.indexOf(left.frequency) -
+      payFrequencySchema.options.indexOf(right.frequency)
+    );
+  });
+}
+
+/**
+ * F3: cómo se resolvió el fijo de un período. `basis` hace EXPLÍCITA la regla
+ * aplicada en vez de dejarla deducir del monto:
+ *  - "cadence": el período y el empleado comparten cadencia; el fijo es
+ *    `mensual × fracción`.
+ *  - "other-cadence": el empleado tiene otra cadencia; en este período cobra 0
+ *    fijo porque lo paga su propio ciclo. La unidad de PERÍODOS (F4) ya deja
+ *    FUERA a ese empleado antes de calcular (`periodExcludesEmployeeByCadence`),
+ *    así que este valor describe la clasificación pura; ninguna línea de nómina
+ *    se genera con `basis = "other-cadence"`.
+ *  - "prorated": falta alguna de las dos cadencias y rige el comportamiento de
+ *    hoy (prorrateo por días calendario).
+ */
+export interface FixedSalaryResolution {
+  amount: number;
+  basis: "cadence" | "other-cadence" | "prorated";
+  fraction: number | null;
+}
+
+/**
+ * F3: fijo del período según la cadencia (decisión del dueño, 2026-10-01).
+ *
+ * La cadencia del PERÍODO decide quién cobra el fijo y con qué fracción:
+ *  - Si falta la cadencia del período o la del empleado (NULL en cualquiera de
+ *    los dos lados), rige el comportamiento de HOY: `prorateFixedSalary` por
+ *    días calendario. Ningún camino existente cambia mientras la cadencia no
+ *    esté definida.
+ *  - Si las dos cadencias coinciden, el fijo es `mensual × fracción` (1/4, 1/2,
+ *    1) sobre el mes comercial de 30 días. Si el rango cubre un ciclo PARCIAL
+ *    (F5: la primera liquidación suele ser corta), la fracción se escala por
+ *    `días del período / días del ciclo`; si el rango llega al ciclo completo o
+ *    lo pasa, se topa en la fracción entera y nunca paga más de un ciclo. El
+ *    redondeo es UNO solo, a peso entero (`roundMoney`), igual que todo el
+ *    módulo.
+ *  - Si el empleado tiene OTRA cadencia, en este período cobra 0 fijo: lo paga
+ *    su propio ciclo, y pagarlo acá también lo pagaría dos veces.
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function resolveFixedSalaryForPeriod(args: {
+  salaryFixed: number | null | undefined;
+  employeeFrequency: string | null | undefined;
+  periodFrequency: string | null | undefined;
+  startDate: string;
+  endDate: string;
+}): FixedSalaryResolution {
+  const salary = Number(args.salaryFixed ?? 0);
+  if (!Number.isFinite(salary) || salary <= 0) {
+    return { amount: 0, basis: "prorated", fraction: null };
+  }
+  const periodFrequency = normalizePayFrequency(args.periodFrequency);
+  const employeeFrequency = normalizePayFrequency(args.employeeFrequency);
+  if (periodFrequency === null || employeeFrequency === null) {
+    return {
+      amount: prorateFixedSalary({
+        salaryFixed: salary,
+        startDate: args.startDate,
+        endDate: args.endDate,
+      }),
+      basis: "prorated",
+      fraction: null,
+    };
+  }
+  const fraction = fixedFractionForFrequency(periodFrequency);
+  if (employeeFrequency !== periodFrequency) {
+    return { amount: 0, basis: "other-cadence", fraction };
+  }
+  // F5: la fracción paga un ciclo COMPLETO; el ciclo parcial se prorratea. El
+  // `fraction` que se devuelve sigue siendo el de la cadencia (1/4, 1/2, 1) y el
+  // prorrateo del rango ya viene aplicado en `amount`.
+  const proration = cycleProrationFactor({
+    frequency: periodFrequency,
+    startDate: args.startDate,
+    endDate: args.endDate,
+  });
+  return { amount: roundMoney(salary * (fraction ?? 0) * proration), basis: "cadence", fraction };
+}
+
+/**
+ * F3: reparto del bloque fijo + porcentajes de un empleado `mixto` sobre las
+ * columnas EXISTENTES de `payroll_items` (la identidad no se mueve:
+ * neto = base_fixed + comisiones + bonos − vales − otros).
+ *
+ * Regla del dueño (2026-10-01): el mixto cobra el MAYOR entre su básico del
+ * período y los porcentajes de SERVICIOS del período. La comparación es SOLO
+ * contra los porcentajes de servicios: las comisiones fijas por producto NO
+ * entran en el máximo y se siguen sumando como hasta hoy.
+ *
+ * Reparto:
+ *  - `base_fixed` sigue llevando el básico del período.
+ *  - la parte porcentual de `commissions` pasa a `max(0, porcentajes − básico)`.
+ *  - `absorbed` = `min(básico, porcentajes)` es exactamente lo que deja de
+ *    sumarse (el porcentaje que el básico absorbió).
+ *  - las comisiones fijas por producto se suman aparte.
+ * Con eso `base_fixed + commissions` = `max(básico, porcentajes) + fijas`.
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function resolveMixedBlock(args: {
+  baseFixed: number;
+  fixedCommissions: number;
+  servicePercent: number;
+}): { absorbed: number; commissions: number } {
+  const baseFixed = roundMoney(Math.max(0, args.baseFixed));
+  const fixedCommissions = roundMoney(Math.max(0, args.fixedCommissions));
+  const servicePercent = roundMoney(Math.max(0, args.servicePercent));
+  const absorbed = roundMoney(Math.min(baseFixed, servicePercent));
+  return {
+    absorbed,
+    commissions: roundMoney(fixedCommissions + Math.max(0, servicePercent - baseFixed)),
+  };
+}
+
+/** F3: `item_type` de la línea de ajuste que hace visible el absorbido. */
+export const MIXED_ABSORBED_ITEM_TYPE = "ajuste_mixto";
+
+/**
+ * F3: línea de AJUSTE que muestra el porcentaje absorbido por el básico en el
+ * detalle del mixto. Es lo necesario para que el lector no vea los porcentajes
+ * desaparecer: sin ella, `detail_json` mostraría los porcentajes completos y
+ * `commissions` un monto menor, sin explicación.
+ *
+ * Su `commission` es NEGATIVA (el absorbido que no se suma) y mantiene la
+ * reproducibilidad: la suma de las líneas de `detail_json` vuelve a dar
+ * exactamente `commissions`. Conserva la forma de las demás líneas; el
+ * `item_type` propio la distingue de una factura real y no menciona ninguna
+ * factura, así que el candado de nómina cerrada no la confunde con una.
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function mixedAbsorbedDetailLine(args: { employeeId: string; absorbed: number }): DetailLine {
+  return {
+    employee_id: args.employeeId,
+    invoice_id: MIXED_ABSORBED_ITEM_TYPE,
+    consecutive_number: null,
+    item_id: MIXED_ABSORBED_ITEM_TYPE,
+    item_type: MIXED_ABSORBED_ITEM_TYPE,
+    qty: 1,
+    unit_price: 0,
+    line_subtotal: 0,
+    commission: roundMoney(-Math.max(0, args.absorbed)),
+    commission_origin: "none",
+    commission_percent: null,
+    commission_value: null,
+  };
+}
+
 /** Rango de fechas inclusivo en ambos extremos (mismo contrato que el rango). */
 export interface DateRange {
   start_date: string;
@@ -760,24 +1671,39 @@ export function rangesOverlap(left: DateRange, right: DateRange): boolean {
 }
 
 /**
- * PR1/PAY-01 (regla del dueño, 2026-10-01): primera fecha de inicio ADMISIBLE
- * para un período NUEVO de la sede. Es el día SIGUIENTE al fin más lejano ya
- * registrado, sin importar el orden ni el estado de los períodos. Sin períodos
- * no hay piso (`null`): el primero es libre.
+ * PR1/PAY-01/F4 (regla del dueño, 2026-10-01): primera fecha de inicio
+ * ADMISIBLE para un período NUEVO de la sede **en la MISMA cadencia** que el
+ * período que se va a abrir. Es el día SIGUIENTE al fin más lejano ya
+ * registrado EN ESE CICLO, sin importar el orden ni el estado. Sin períodos de
+ * ese ciclo no hay piso (`null`): el primero es libre.
+ *
+ * El piso es POR CICLO porque la guarda de solape también lo es (063): un
+ * período semanal y uno mensual pueden compartir días A PROPÓSITO, así que un
+ * período de otra cadencia NO puede imponer piso. Cuando se omite la cadencia
+ * el cubo es el vacío (`coalesce(frequency, '')`, el de los períodos
+ * heredados): los períodos sin cadencia se siguen acotando entre sí, que es la
+ * protección de siempre.
  *
  * Por qué "día siguiente" y no "ese mismo fin": el fin del período anterior ya
  * está liquidado, así que empezar ahí compartiría un día (el solape que la
- * migración 035 y el servicio rechazan). Los rangos ADYACENTES no se solapan
+ * migración 063 y el servicio rechazan). Los rangos ADYACENTES no se solapan
  * (fin 2026-12-31 → inicio 2027-01-01).
  *
  * TOTAL: no lanza con una lista vacía, tiene en cuenta el fin MÁS LEJANO
  * aunque la entrada llegue desordenada, y no muta la lista. Puro para probarlo
  * sin base de datos. Borde de año incluido: 2026-12-31 → 2027-01-01.
  */
-export function nextPeriodStartDate(periods: readonly DateRange[]): string | null {
+export function nextPeriodStartDate(
+  periods: readonly (DateRange & { frequency?: string | null })[],
+  frequency: string | null | undefined = null,
+): string | null {
   if (periods.length === 0) return null;
+  const bucket = periodCadenceBucket(frequency);
   let latestEnd: number | null = null;
   for (const period of periods) {
+    // F4: un período de OTRA cadencia comparte días sin conflicto, así que no
+    // impone piso. Comparar sin el cubo bloquearía el solape que el dueño quiere.
+    if (periodCadenceBucket(period.frequency ?? null) !== bucket) continue;
     const end = utcDayOf(period.end_date);
     if (end === null) continue;
     if (latestEnd === null || end > latestEnd) latestEnd = end;

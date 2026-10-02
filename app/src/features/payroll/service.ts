@@ -17,22 +17,32 @@ import {
   checkVoucherEligibility,
   computeNetPay,
   correctPayrollPeriodSchema,
+  mixedAbsorbedDetailLine,
+  MIXED_ABSORBED_ITEM_TYPE,
   monthKeyOf,
   normalizeAllowedDays,
   normalizePerDayLimits,
   openPeriodSchema,
+  periodCadenceBucket,
+  periodExcludesEmployeeByCadence,
   overlapBlocksDeletion,
   payPayrollItemSchema,
+  payrollCycleRange,
   payrollExtraSchema,
-  prorateFixedSalary,
+  pendingPayrollSettlements,
   rangesOverlap,
   requestVoucherSchema,
   rejectVoucherSchema,
   requiresVoucherApproval,
+  resolveFixedSalaryForPeriod,
+  resolveMixedBlock,
+  resolveOpenPayrollRange,
   resolveVoucherDayCap,
   resolveVoucherInitialStatus,
   restoreVoucherStatus,
   roundMoney,
+  setPayrollStartDateSchema,
+  splitCommissionByOrigin,
   summarizePayrollItems,
   voucherApprovalCashOutViolation,
   voucherLimitsSchema,
@@ -43,6 +53,7 @@ import {
   type PayrollCorrectionView,
   type PayrollExtraKind,
   type PayrollMonthEmployeeRow,
+  type PendingPayrollSettlement,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { commissionRuleKey, type RuleRate } from "@/src/features/commissions/schemas";
@@ -319,6 +330,11 @@ export interface PayrollPeriodRow {
   sede_id: string;
   start_date: string;
   end_date: string;
+  /**
+   * F3: cadencia del período (`payroll_periods.frequency`, 063). `null` = sin
+   * cadencia definida: el fijo se prorratea por días calendario, como hoy.
+   */
+  frequency: string | null;
   status: string;
   created_by: string | null;
   closed_at: string | null;
@@ -336,6 +352,23 @@ export interface PayrollItemRow {
   other_discounts: number;
   net_pay: number;
   detail_json: DetailLine[];
+  /**
+   * NV-01: total REAL de vales del empleado en el rango del período, sin el
+   * recorte del tope. Vive FUERA de la igualdad del neto (el CHECK sigue siendo
+   * `neto = base_fixed + commissions + bonuses − deductions_vales −
+   * other_discounts`): `deductions_vales` es lo que se aplicó y esta columna es
+   * lo que el empleado gastó en vales.
+   */
+  voucher_total: number;
+  /**
+   * F8 (migración 067): el motivo escrito del ajuste manual (bonos u otros
+   * descuentos) de ESTE ítem. `null` = sin ajuste manual: cuando `bonuses` y
+   * `other_discounts` son 0 no hay nada que explicar. Con un ajuste distinto de
+   * 0 es obligatorio. Viaja en la misma fila —y por lo tanto en la misma
+   * transacción— que el monto que justifica, para que la liquidación pueda
+   * responder «por qué este empleado tiene este ajuste» sin depender de nadie.
+   */
+  adjustment_reason: string | null;
   created_at: string;
 }
 
@@ -470,9 +503,9 @@ export interface VoucherRequestRow {
 }
 
 const PERIOD_SELECT =
-  "id, sede_id, start_date, end_date, status, created_by, closed_at, created_at";
+  "id, sede_id, start_date, end_date, frequency, status, created_by, closed_at, created_at";
 const ITEM_SELECT =
-  "id, period_id, employee_id, base_fixed, commissions, bonuses, deductions_vales, other_discounts, net_pay, detail_json, created_at";
+  "id, period_id, employee_id, base_fixed, commissions, bonuses, deductions_vales, other_discounts, net_pay, detail_json, voucher_total, adjustment_reason, created_at";
 const PAYMENT_SELECT =
   "id, payroll_item_id, method_id, method_code, amount, paid_at, paid_by, reference";
 const EXTRA_SELECT =
@@ -615,9 +648,42 @@ async function attachVoucherUserNames(
  * índice único parcial de 007 sólo miraba la tupla EXACTA de los borradores:
  * dos rangos adyacentes o cruzados pasaban sin ruido.
  *
+ * F4: la guarda está acotada por CADENCIA, igual que la restricción de la base
+ * (063). Un día se nomina una sola vez DENTRO DEL MISMO CICLO: dos períodos de
+ * la misma sede solo pueden compartir días si su cadencia DIFIERE (el semanal y
+ * el mensual se superponen a propósito). La comparación usa el mismo cubo que
+ * el índice, `coalesce(frequency, '')`: un NULL pelado sería distinto de otro
+ * NULL y los períodos SIN cadencia dejarían de protegerse EN SILENCIO (dos
+ * períodos heredados sí comparten días). Los dos NULL caen en el mismo cubo
+ * vacío, así que la protección de siempre sigue viva.
+ *
+ * F9: además, un período nuevo CON cadencia se rechaza si se superpone con un
+ * período HEREDADO sin cadencia de la misma sede. El cubo vacío es distinto del
+ * de las tres cadencias, así que la guarda por cubo no lo vería, pero el
+ * heredado le pagó el fijo a TODO el plantel (no lo acotaba ningún ciclo):
+ * abrir encima un rango con cadencia pagaría dos veces los mismos días. La
+ * guarda entre cadencias DISTINTAS no se toca.
+ *
  * Barreras ante carreras: la lectura y el INSERT no son atómicos, así que la
- * restricción de exclusión de la base (migración 035) es la barrera final
+ * restricción de exclusión de la base (migración 063) es la barrera final
  * (23P01 → mismo error de negocio, igual que 23505 para el borrador repetido).
+ *
+ * F7: el rango NO lo elige el llamador. El período NUEVO se cierra al CICLO de
+ * su cadencia (domingo a sábado; quincenal 2 semanas, mensual 4), así que el
+ * cuerpo trae `frequency` + `cycle_end_date` y acá se DERIVA
+ * `start_date`/`end_date` con `payrollCycleRange`. Un rango libre —o un lunes—
+ * es imposible: el esquema exige la cadencia y el cierre del ciclo, y rechaza
+ * cualquier `start_date`/`end_date` que no coincida con el ciclo derivado. Los
+ * períodos heredados sin cadencia (NULL) no se tocan: siguen leyéndose y
+ * calculándose como hoy.
+ *
+ * F10: la FORMA del rango la resuelve `resolveOpenPayrollRange` —un ciclo
+ * COMPLETO, o el PRIMER ciclo de la cadencia RECORTADO a la fecha de arranque de
+ * la sede (migración 068)— y nada más. Un ciclo que cierra antes de esa fecha no
+ * existe para el sistema y se rechaza nombrando la fecha; un recorte que ya no
+ * sería «el primero» (la cadencia tiene períodos) también. El recorte reusa la
+ * prorrata de ciclo parcial de F5 (`cycleProrationFactor` ve un rango más corto
+ * y paga `días / días del ciclo`): no hay aritmética nueva.
  */
 export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Promise<PayrollPeriodRow> {
   const parsed = openPeriodSchema.safeParse(raw);
@@ -625,39 +691,90 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
     throw new PayrollError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const input: OpenPeriodInput = parsed.data;
+  // F7: la ÚNICA fuente de verdad del rango es el ciclo. El esquema ya validó
+  // que el cierre sea sábado; el guardia repite la verdad para el tipo.
+  const cycle = payrollCycleRange({
+    frequency: input.frequency,
+    cycleEndDate: input.cycle_end_date,
+  });
+  if (cycle === null) {
+    throw new PayrollError("VALIDATION", "El cierre del ciclo debe ser un sábado.", 400);
+  }
   const db = await payrollDb();
   try {
-    // Candidatos: los períodos de la sede que tocan el rango pedido. La
-    // decisión la toma el predicado puro `rangesOverlap` (el mismo contrato que
-    // el `daterange(..., '[]') &&` de la base), pero la LECTURA es exhaustiva y
-    // falla a la vista (READ_INCOMPLETE): con una lectura recortada por el tope
-    // del Data API la guarda podría no ver el período que estorba y abrir un
-    // rango que comparte días. Acá no se decide con lo que se alcanzó a leer.
-    const candidates = await readAllPayroll<{
-      start_date: string;
-      end_date: string;
-      status: string;
-    }>({
-      log: "openPayrollPeriod",
-      what: "períodos de la sede en el rango",
-      meta: { sedeId: actor.sedeId, start: input.start_date, end: input.end_date },
-      table: "payroll_periods",
-      fetchPage: (from, to) =>
-        db
-          .from("payroll_periods")
-          .select("id, start_date, end_date, status")
-          .eq("sede_id", actor.sedeId)
-          .lte("start_date", input.end_date)
-          .gte("end_date", input.start_date)
-          .order("id")
-          .range(from, to),
+    // F10: la fecha de arranque de la sede entra ANTES de resolver el rango: es
+    // la cota de «nada anterior existe para el sistema».
+    const payrollStartDate = await getPayrollStartDate(actor.sedeId);
+    // F10: los períodos de la sede, en UNA lectura exhaustiva. La necesitan las
+    // dos decisiones de abajo: la guarda de solape (antes era la lectura
+    // filtrada por el rango, con el MISMO contrato —la decisión la toma
+    // `rangesOverlap`, pero la LECTURA es completa y falla a la vista
+    // (READ_INCOMPLETE): con una lectura recortada por el tope del Data API la
+    // guarda podría no ver el período que estorba y abrir un rango que comparte
+    // días—) y la regla de F10, que necesita saber si la CADENCIA ya tiene
+    // historia y no sólo si ese ciclo está tocado.
+    const sedePeriods = await listPeriods(actor.sedeId);
+    // F10: la ÚNICA decisión de la FORMA del rango que se persiste. Acepta un
+    // ciclo COMPLETO de la cadencia o el PRIMER ciclo —el que CONTIENE la fecha
+    // de arranque— RECORTADO a esa fecha, y sólo como primera liquidación de la
+    // cadencia. Todo lo demás se rechaza acá, antes de escribir.
+    const resolution = resolveOpenPayrollRange({
+      frequency: input.frequency,
+      cycleEndDate: input.cycle_end_date,
+      payrollStartDate,
+      periods: sedePeriods,
     });
-    const requested = { start_date: input.start_date, end_date: input.end_date };
-    const clash = candidates.find((row) => rangesOverlap(row, requested));
+    if (!resolution.ok) {
+      if (resolution.reason === "before-start") {
+        throw new PayrollError(
+          "VALIDATION",
+          `El período no puede empezar antes del ${payrollStartDate}: la nómina de esta sede arranca ese día y nada anterior existe para el sistema.`,
+          400,
+        );
+      }
+      if (resolution.reason === "not-first-cycle") {
+        throw new PayrollError(
+          "VALIDATION",
+          `El ciclo ${cycle.start_date} a ${cycle.end_date} contiene la fecha de inicio de la nómina (${payrollStartDate}), pero esta cadencia ya tiene períodos: el primer ciclo recortado sólo se abre como PRIMERA liquidación de la cadencia. Elija un ciclo completo posterior.`,
+          400,
+        );
+      }
+      throw new PayrollError("VALIDATION", "El cierre del ciclo debe ser un sábado.", 400);
+    }
+    const requested = {
+      start_date: resolution.start_date,
+      end_date: resolution.end_date,
+      frequency: input.frequency,
+    };
+    // El MISMO cubo que `coalesce(frequency, '')` de la restricción (063):
+    // colisiona el período que comparte días Y cae en el mismo cubo de cadencia.
+    const requestedBucket = periodCadenceBucket(requested.frequency);
+    const clash = sedePeriods.find(
+      (row) =>
+        periodCadenceBucket(row.frequency) === requestedBucket && rangesOverlap(row, requested),
+    );
     if (clash) {
       throw new PayrollError(
         "PERIOD_OVERLAP",
         `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${clash.start_date} a ${clash.end_date} (${clash.status}) de esta sede. Un día se nomina una sola vez: ajuste las fechas para que no se crucen con un período existente.`,
+        409,
+      );
+    }
+    // F9: un período HEREDADO sin cadencia (`frequency` NULL, de antes de F7) es un
+    // cubo DISTINTO del de las tres cadencias, así que la guarda de arriba no lo
+    // ve: un período nuevo con cadencia podía superponerse con él. Pero ese
+    // heredado no lo acotaba ningún ciclo, así que le pagó el fijo a TODO el
+    // plantel: abrir encima un rango con cadencia pagaría dos veces los mismos
+    // días. Se rechaza acá, antes del INSERT, con el período heredado a la vista.
+    // La guarda entre cadencias DISTINTAS no se toca: el semanal y el mensual
+    // siguen superponiéndose a propósito (regla del dueño).
+    const legacyClash = sedePeriods.find(
+      (row) => periodCadenceBucket(row.frequency) === "" && rangesOverlap(row, requested),
+    );
+    if (legacyClash) {
+      throw new PayrollError(
+        "PERIOD_OVERLAP",
+        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${legacyClash.start_date} a ${legacyClash.end_date} (${legacyClash.status}) de esta sede, que no tiene cadencia: ese período heredado pagó el fijo a todo el plantel, así que abrir este rango pagaría dos veces los mismos días. Ajuste las fechas para que no se crucen.`,
         409,
       );
     }
@@ -666,8 +783,15 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
       .from("payroll_periods")
       .insert({
         sede_id: actor.sedeId,
-        start_date: input.start_date,
-        end_date: input.end_date,
+        // F10: el rango ya resuelto (ciclo completo o primer ciclo recortado a
+        // la fecha de arranque). El recorte NO cambia el cálculo: el rango más
+        // corto se prorratea con la regla de F5, la misma del ciclo parcial.
+        start_date: resolution.start_date,
+        end_date: resolution.end_date,
+        // F7: la cadencia se PERSISTE con el período y es OBLIGATORIA en un
+        // período nuevo. NULL ya no se puede pedir por acá; sólo queda en los
+        // períodos heredados, que no se reescriben.
+        frequency: input.frequency,
         status: "borrador",
         created_by: actor.userId,
       })
@@ -733,6 +857,94 @@ export async function listPeriods(sedeId: string): Promise<PayrollPeriodRow[]> {
   }
 }
 
+// ------------------------------- F10: fecha de arranque de la nómina ---
+
+/**
+ * F10 (decisión del dueño, 2026-10-01): la fecha desde la que la nómina OPERA en
+ * la sede —«la fecha de inicio de la implementación»—, o `null` cuando todavía
+ * no está configurada.
+ *
+ * Es la MISMA fuente para el aviso de pendientes y para la apertura de un
+ * período: una sola lectura (`sedes.payroll_start_date`, migración 068) para las
+ * dos superficies, así el aviso y el servicio no pueden discrepar de desde
+ * cuándo existe la nómina de la sede.
+ *
+ * Degradación por migración pendiente: si la 068 todavía no se aplicó, la
+ * columna no existe y PostgREST responde 42703 (`undefined_column`). Ese caso NO
+ * se convierte en error interno: sin fecha configurada el módulo conserva el
+ * comportamiento de hoy, que es exactamente el estado en el que está la base
+ * mientras la columna no exista. Cualquier otro fallo se propaga.
+ *
+ * La sede inexistente tampoco es un error acá: devuelve `null`, porque «no hay
+ * fecha» es la respuesta correcta para todo lo que pregunta desde cuándo existe
+ * la nómina (la sede sin fila no tiene ninguna).
+ */
+export async function getPayrollStartDate(sedeId: string): Promise<string | null> {
+  const db = await payrollDb();
+  const { data, error } = await db
+    .from("sedes")
+    .select("id, payroll_start_date")
+    .eq("id", sedeId)
+    .maybeSingle();
+  if (error) {
+    const failure = error as { code?: string | null; message?: string | null };
+    if (failure.code === "42703" || /payroll_start_date/i.test(failure.message ?? "")) return null;
+    throw new PayrollError("INTERNAL", "Error interno.", 500);
+  }
+  const row = data as unknown as { payroll_start_date?: string | null } | null;
+  return row?.payroll_start_date ?? null;
+}
+
+/**
+ * F10: configura (o limpia, con `null`) la fecha de arranque de la nómina de la
+ * sede. SOLO admin: la aplica `requirePayrollAdmin` en la action y en la ruta,
+ * igual que el resto del módulo (el servicio no re-valida el rol, la guarda vive
+ * en la superficie que resuelve la sesión).
+ *
+ * NO se valida contra los períodos existentes y NO se reescribe historia: la
+ * fecha es una DECLARACIÓN de negocio y los períodos anteriores que ya existan
+ * (heredados, de antes de F10) se quedan como están. Lo que cambia desde ahora es
+ * lo que se OFRECE y se ABRE (F10 en `pendingPayrollSettlements` y en
+ * `openPayrollPeriod`).
+ *
+ * `null` es un estado legal: vuelve a «sin configurar» y el aviso regresa a su
+ * cota anterior (la historia de la sede).
+ *
+ * Si la 068 no está aplicada, el UPDATE falla con 42703 y se responde con un
+ * mensaje accionable en vez del error crudo de la base: el admin no puede
+ * configurar lo que la base todavía no tiene.
+ */
+export async function setPayrollStartDate(
+  raw: unknown,
+  actor: PayrollActor,
+): Promise<{ payroll_start_date: string | null }> {
+  const parsed = setPayrollStartDateSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new PayrollError("VALIDATION", validationMessage(parsed.error), 400);
+  }
+  const db = await payrollDb();
+  const { data, error } = await db
+    .from("sedes")
+    .update({ payroll_start_date: parsed.data.payroll_start_date })
+    .eq("id", actor.sedeId)
+    .select("id, payroll_start_date")
+    .maybeSingle();
+  if (error) {
+    const failure = error as { code?: string | null; message?: string | null };
+    if (failure.code === "42703" || /payroll_start_date/i.test(failure.message ?? "")) {
+      throw new PayrollError(
+        "VALIDATION",
+        "La fecha de inicio de la nómina todavía no se puede configurar en esta base: falta aplicar la migración 068.",
+        409,
+      );
+    }
+    throw new PayrollError("INTERNAL", "Error interno.", 500);
+  }
+  if (!data) throw new PayrollError("NOT_FOUND", "La sede no existe.", 404);
+  const row = data as unknown as { payroll_start_date?: string | null };
+  return { payroll_start_date: row.payroll_start_date ?? null };
+}
+
 async function getPeriodOrThrow(db: DbClient, sedeId: string, id: string): Promise<PayrollPeriodRow> {
   const { data, error } = await db
     .from("payroll_periods")
@@ -752,7 +964,19 @@ async function getPeriodOrThrow(db: DbClient, sedeId: string, id: string): Promi
 
 export interface PeriodDetail {
   period: PayrollPeriodRow;
-  items: Array<PayrollItemRow & { paid: number; remaining: number }>;
+  items: Array<
+    PayrollItemRow & {
+      paid: number;
+      remaining: number;
+      /**
+       * NV-01: deuda PENDIENTE del empleado originada en ESTE período (el
+       * sobrante de vales que el período produjo y todavía no se aplicó). Se
+       * lee acotada por sede y por período de origen, y se atribuye por
+       * empleado: no puede mostrar la deuda de otra sede ni la de otro empleado.
+       */
+      pending_debt: number;
+    }
+  >;
 }
 
 /**
@@ -816,11 +1040,45 @@ export async function getPeriodDetail(sedeId: string, id: string): Promise<Perio
         }
       }
     }
+    // NV-01: la deuda PENDIENTE que ESTE período produjo (el sobrante de vales
+    // que todavía no se aplicó), para que la pantalla la muestre aparte del
+    // neto. La lectura es ACOTADA por sede y por período de origen y se
+    // atribuye por empleado: no puede mostrar la deuda de otra sede ni la de
+    // otro empleado. Una deuda ya aplicada no está pendiente y no aparece.
+    const pendingDebtByEmployee = new Map<string, number>();
+    {
+      const debtRows = await readAllPayroll<{ employee_id: string; amount: number | string }>({
+        log: "getPeriodDetail",
+        what: "deuda pendiente de vales",
+        meta: { periodId: id },
+        table: "payroll_discount_carries",
+        fetchPage: (from, to) =>
+          db
+            .from("payroll_discount_carries")
+            .select("employee_id, amount")
+            .eq("sede_id", sedeId)
+            .eq("origin_period_id", id)
+            .is("applied_period_id", null)
+            .order("id")
+            .range(from, to),
+      });
+      for (const row of debtRows) {
+        pendingDebtByEmployee.set(
+          row.employee_id,
+          roundMoney((pendingDebtByEmployee.get(row.employee_id) ?? 0) + Number(row.amount)),
+        );
+      }
+    }
     return {
       period,
       items: rows.map((item) => {
         const paid = paidByItem.get(item.id) ?? 0;
-        return { ...item, paid, remaining: roundMoney(Math.max(0, Number(item.net_pay) - paid)) };
+        return {
+          ...item,
+          paid,
+          remaining: roundMoney(Math.max(0, Number(item.net_pay) - paid)),
+          pending_debt: pendingDebtByEmployee.get(item.employee_id) ?? 0,
+        };
       }),
     };
   } catch (error) {
@@ -832,6 +1090,181 @@ export async function getPeriodDetail(sedeId: string, id: string): Promise<Perio
 
 /** Ítem de nómina con lo pagado ya resuelto (lo que la vista muestra). */
 type PaidPayrollItem = PayrollItemRow & { paid: number };
+
+/**
+ * F6: una factura de la liquidación, agrupada desde `detail_json`. El detalle
+ * persistido guarda una línea por factura/ítem; para el modal "Ver facturas y
+ * vales" la unidad es la FACTURA, así que sus líneas se suman en una sola
+ * comisión.
+ *
+ * `consecutive_number` es el consecutivo REAL de la factura y se lee tal cual
+ * del detalle; no se completa con el `invoice_id` ni con la posición (inventar
+ * un número sería peor que mostrarlo ausente). `date` no viaja: el detalle no
+ * guarda la fecha de la factura y este read no consulta la tabla `invoices`.
+ */
+export interface PayrollSettlementInvoice {
+  invoice_id: string;
+  consecutive_number: number | null;
+  /** Comisión de ESTA liquidación por la factura (suma de todas sus líneas). */
+  commission: number;
+}
+
+/**
+ * F6: el ajuste del mixto (`item_type = "ajuste_mixto"`, F3). NO es una factura:
+ * es el porcentaje que el básico absorbió, visible con su monto en negativo para
+ * que la suma del detalle siga dando las comisiones. Se devuelve aparte para que
+ * el modal lo muestre como ajuste y jamás como "Factura #ajuste_mixto".
+ */
+export interface PayrollSettlementAdjustment {
+  /** Negativo: el porcentaje absorbido que ya no se suma. */
+  commission: number;
+}
+
+/**
+ * F6: un vale del período que entró al descuento de ESTA liquidación. Solo la
+ * identidad mínima para listarlo; el detalle se abre con la lectura de vales ya
+ * existente (`listVouchers`).
+ */
+export interface PayrollSettlementVoucher {
+  id: string;
+  request_date: string;
+  amount: number;
+  status: string;
+}
+
+/**
+ * F6: las fuentes de la liquidación de UN empleado en UN período. Las facturas
+ * salen de `detail_json` (la liquidación es la dueña del detalle); los vales se
+ * leen con la MISMA forma que el cálculo (sede + `request_date` en el rango +
+ * el alcance de estados que descuenta), acotados por empleado.
+ */
+export interface PayrollSettlementSources {
+  invoices: PayrollSettlementInvoice[];
+  adjustment: PayrollSettlementAdjustment | null;
+  vouchers: PayrollSettlementVoucher[];
+}
+
+/**
+ * F6: agrupa el `detail_json` de UN ítem por factura y separa el ajuste del
+ * mixto.
+ *
+ * El ajuste usa el MISMO marcador como `invoice_id` (`mixedAbsorbedDetailLine`),
+ * así que sin separarlo por `item_type` aparecería como una factura con
+ * consecutivo nulo; se acumula aparte y su signo se conserva. Una línea sin
+ * `invoice_id` no tiene factura que abrir y no inventa una fila. La suma se
+ * redondea con la misma aritmética del módulo (`roundMoney`).
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function groupSettlementInvoices(detail: readonly DetailLine[]): {
+  invoices: PayrollSettlementInvoice[];
+  adjustment: PayrollSettlementAdjustment | null;
+} {
+  const byInvoice = new Map<string, PayrollSettlementInvoice>();
+  let absorbed = 0;
+  for (const line of detail) {
+    if (line.item_type === MIXED_ABSORBED_ITEM_TYPE) {
+      absorbed = roundMoney(absorbed + Number(line.commission));
+      continue;
+    }
+    if (!line.invoice_id) continue;
+    const current = byInvoice.get(line.invoice_id) ?? {
+      invoice_id: line.invoice_id,
+      consecutive_number: line.consecutive_number ?? null,
+      commission: 0,
+    };
+    current.commission = roundMoney(current.commission + Number(line.commission));
+    byInvoice.set(line.invoice_id, current);
+  }
+  return {
+    invoices: [...byInvoice.values()],
+    adjustment: absorbed !== 0 ? { commission: absorbed } : null,
+  };
+}
+
+/**
+ * F6: las fuentes de la liquidación —facturas, ajuste del mixto y vales— de UN
+ * empleado de UN período.
+ *
+ * El alcance es la clave de la lectura: el período se valida contra la sede del
+ * actor (`getPeriodOrThrow`), el ítem se lee por `period_id` + `employee_id` y
+ * los vales por `sede_id` + `employee_id` + el rango de fechas del período. No
+ * puede devolver la nómina de otra sede ni la de otro empleado, y no consulta
+ * ninguna tabla nueva: las facturas ya están en `detail_json`.
+ *
+ * Sin ítem no hay liquidación: se devuelve vacío y NO se leen los vales del
+ * rango. Esos vales no entraron a este período —el cálculo no los tocó (por
+ * ejemplo, el empleado quedó excluido por cadencia)— y mostrarlos como si
+ * fueran de la liquidación inventaría una relación que no existe.
+ *
+ * Las dos lecturas son exhaustivas (`readAllPayroll`): una lectura recortada
+ * mostraría menos facturas o menos vales que los que la liquidación tiene.
+ */
+export async function getPayrollSettlementSources(
+  sedeId: string,
+  periodId: string,
+  employeeId: string,
+): Promise<PayrollSettlementSources> {
+  try {
+    const db = await payrollDb();
+    const period = await getPeriodOrThrow(db, sedeId, periodId);
+    const items = await readAllPayroll<{ detail_json: DetailLine[] | null }>({
+      log: "getPayrollSettlementSources",
+      what: "ítem del empleado en el período",
+      meta: { periodId, employeeId },
+      table: "payroll_items",
+      fetchPage: (from, to) =>
+        db
+          .from("payroll_items")
+          .select("detail_json")
+          .eq("period_id", periodId)
+          .eq("employee_id", employeeId)
+          .order("id")
+          .range(from, to),
+    });
+    if (items.length === 0) {
+      return { invoices: [], adjustment: null, vouchers: [] };
+    }
+    const grouped = groupSettlementInvoices(items[0].detail_json ?? []);
+    // Misma forma que el cálculo (`voucherStatusesForScope("vigentes_y_descontados")`:
+    // pendiente/aprobada/descontada): un vale ya descontado por este período
+    // sigue siendo parte de la liquidación y tiene que verse.
+    const voucherRows = await readAllPayroll<{
+      id: string;
+      request_date: string;
+      amount: number | string;
+      status: string;
+    }>({
+      log: "getPayrollSettlementSources",
+      what: "vales del empleado en el período",
+      meta: { periodId, employeeId },
+      table: "voucher_requests",
+      fetchPage: (from, to) =>
+        db
+          .from("voucher_requests")
+          .select("id, request_date, amount, status")
+          .eq("sede_id", sedeId)
+          .eq("employee_id", employeeId)
+          .in("status", voucherStatusesForScope("vigentes_y_descontados"))
+          .gte("request_date", period.start_date)
+          .lte("request_date", period.end_date)
+          .order("id")
+          .range(from, to),
+    });
+    return {
+      invoices: grouped.invoices,
+      adjustment: grouped.adjustment,
+      vouchers: voucherRows.map((row) => ({
+        id: row.id,
+        request_date: row.request_date,
+        amount: roundMoney(Number(row.amount)),
+        status: row.status,
+      })),
+    };
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
 
 /**
  * PA3: el resumen de un período —se lee sin abrirlo— y el mes a la fecha por
@@ -849,6 +1282,14 @@ export interface PayrollPeriodSummary {
 export interface PayrollOverview {
   summaries: PayrollPeriodSummary[];
   months: PayrollMonthEmployeeRow[];
+  /**
+   * F9: los ciclos ya CERRADOS de la sede que todavía no tienen liquidación por
+   * cadencia, con la gente que cobra así. Es lo que la pantalla necesita para
+   * decir «falta liquidar el ciclo quincenal del 20 sep al 3 oct» en vez de que
+   * el atraso se descubra meses después. Sólo lo recibe el admin: agrega la
+   * planta de la sede (la misma superficie que el resumen de arriba).
+   */
+  pendingSettlements: PendingPayrollSettlement[];
 }
 
 /**
@@ -941,15 +1382,31 @@ export async function listPayrollOverview(sedeId: string): Promise<PayrollOvervi
   try {
     // `listPeriods` ya es exhaustiva: si se recorta, esto se cae a la vista.
     const periods = await listPeriods(sedeId);
-    if (periods.length === 0) return { summaries: [], months: [] };
+    // F10: la fecha de arranque de la sede acota el aviso de pendientes. Se lee
+    // SIEMPRE, también sin períodos: con la fecha configurada, la sede que
+    // todavía no liquidó nada tiene justamente su PRIMER ciclo pendiente.
+    const payrollStartDate = await getPayrollStartDate(sedeId);
+    // F9 regla 4 (sin F10): sin períodos no hay historia de la sede y el resumen
+    // no inventa pendientes. Con la fecha de arranque configurada SÍ hay piso
+    // —la fecha—, así que el aviso sigue su curso y reporta el primer ciclo.
+    if (periods.length === 0 && payrollStartDate === null) {
+      return { summaries: [], months: [], pendingSettlements: [] };
+    }
 
     const db = await payrollDb();
-    const items = await readPaidItemsOfPeriods({
-      db,
-      periodIds: periods.map((period) => period.id),
-      log: "listPayrollOverview",
-      meta: { sede: sedeId },
-    });
+    // F9: la planta es UNA lectura más (paginada, acotada por sede), no una por
+    // cadencia: el aviso de pendientes necesita saber quién cobra con cada
+    // cadencia y cuántos son. Va en paralelo con los ítems, así que no serializa
+    // la lectura. Un fallo de cualquiera de las dos se propaga igual.
+    const [items, employees] = await Promise.all([
+      readPaidItemsOfPeriods({
+        db,
+        periodIds: periods.map((period) => period.id),
+        log: "listPayrollOverview",
+        meta: { sede: sedeId },
+      }),
+      listAllEmployees(sedeId),
+    ]);
 
     const byPeriod = new Map<string, PaidPayrollItem[]>();
     for (const item of items) {
@@ -964,6 +1421,12 @@ export async function listPayrollOverview(sedeId: string): Promise<PayrollOvervi
         ...summarizePayrollItems(byPeriod.get(period.id) ?? []),
       })),
       months: buildPayrollMonthToDate({ periods, items }),
+      pendingSettlements: pendingPayrollSettlements({
+        periods,
+        employees,
+        referenceDate: bogotaDay(),
+        payrollStartDate,
+      }),
     };
   } catch (error) {
     throw toPayrollError(error);
@@ -1053,6 +1516,46 @@ interface BillingLine {
 }
 
 /**
+ * F8: TODO ajuste manual lleva su motivo (decisión del dueño, 2026-10-01).
+ *
+ * El motivo no es un adorno de la pantalla: es la explicación que queda escrita
+ * junto al monto. Sin él, una diferencia en una liquidación sólo la puede
+ * explicar la memoria de quien la cargó, y cuando el empleado pregunta no hay
+ * nada que mostrar. Por eso la regla se valida ACÁ —el único camino que carga
+ * ajustes manuales— y no sólo en el formulario: una llamada directa al servicio
+ * (la ruta REST, una server action, un script) no puede colar un bono o un
+ * descuento sin motivo.
+ *
+ * El mensaje NOMBRA al empleado (el esquema de entrada no conoce los nombres,
+ * sólo el id) y dice qué falta; el servicio tiene la planta a mano. Un motivo
+ * en blanco cuenta como ausente. Cuando no hay ajuste manual la regla no aplica:
+ * no hay nada que justificar y `computePayrollLines` descarta cualquier motivo
+ * suelto para que la columna quede NULL.
+ *
+ * La corrección de un período cerrado NO pasa por acá a propósito: no CREA
+ * ajustes, reproduce los que la liquidación firmada ya tenía (con su motivo
+ * escrito), y exigirle un motivo nuevo a un ajuste heredado rompería la
+ * corrección de las liquidaciones anteriores a F8.
+ */
+function assertAdjustmentReasons(
+  adjustments: CalculatePayrollInput["adjustments"],
+  nameById: Map<string, string>,
+): void {
+  for (const adjustment of adjustments) {
+    if (adjustment.bonuses === 0 && adjustment.other_discounts === 0) continue;
+    const reason = (adjustment.adjustment_reason ?? "").trim();
+    if (reason.length === 0) {
+      const who = nameById.get(adjustment.employee_id) ?? adjustment.employee_id;
+      throw new PayrollError(
+        "VALIDATION",
+        `Falta el motivo del ajuste de ${who}: escriba por qué se carga el bono o el descuento.`,
+        400,
+      );
+    }
+  }
+}
+
+/**
  * PAY-02/PAY-03/PAY-07: calcula (o recalcula) el borrador.
  *
  * Por empleado activo de la sede: fijo según pay_type (fijo/mixto cobran
@@ -1099,8 +1602,16 @@ export async function calculatePayroll(
       throw toPayrollError(error);
     });
     const actives = employees.filter((row) => row.is_active);
+    // F8: antes de calcular nada, todo ajuste manual tiene que traer su motivo.
+    // Es un rechazo de contrato (VALIDATION, 400) que nombra al empleado, y es
+    // el punto por el que pasan la server action y la ruta REST: ningún
+    // llamador puede cargar un bono o un descuento sin justificarlo.
+    assertAdjustmentReasons(
+      input.adjustments,
+      new Map(actives.map((row) => [row.id, row.full_name])),
+    );
 
-    const { payload, vouchersToDiscount } = await computePayrollLines({
+    const { payload, vouchersToDiscount, carriesToApply } = await computePayrollLines({
       db,
       sedeId,
       period,
@@ -1139,11 +1650,18 @@ export async function calculatePayroll(
     // PAY-07 se conserva entero: los vales descontados pasan a `descontada`
     // —transición única y terminal, doble descuento imposible— con la MISMA
     // precondición de estado, sólo que ahora adentro de la transacción.
-    if (payload.length > 0 || vouchersToDiscount.length > 0) {
+    // NV-01: la deuda ENTRANTE del empleado también viaja en la transacción:
+    // los ids de las deudas que este cálculo absorbe en `other_discounts` se
+    // marcan aplicados en el MISMO RPC. Sin esa atomicidad, el descuento podría
+    // quedar escrito mientras el marcado falla, y la deuda se aplicaría otra
+    // vez. Sin nada que escribir (ni ítems, ni vales, ni deudas) no se abre
+    // transacción.
+    if (payload.length > 0 || vouchersToDiscount.length > 0 || carriesToApply.length > 0) {
       const { data: applied, error: applyError } = await db.rpc("payroll_apply_atomic", {
         p_period_id: periodId,
         p_items: payload,
         p_voucher_ids: vouchersToDiscount,
+        p_carry_ids: carriesToApply,
       });
       if (applyError) {
         console.error(
@@ -1226,6 +1744,17 @@ interface PayrollItemPayload {
   other_discounts: number;
   net_pay: number;
   detail_json: DetailLine[];
+  /** NV-01: total REAL de vales del período (sin el recorte del tope). */
+  voucher_total: number;
+  /** NV-01: sobrante del vale que el tope no pudo aplicar (> 0 lo registra). */
+  voucher_excess: number;
+  /**
+   * NV-02: parte de la deuda ENTRANTE que el tope NO alcanzó a descontar. El
+   * RPC la re-registra como deuda PENDIENTE del mismo empleado con ESTE período
+   * como origen; sin esto el sobrante de la deuda se perdonaría en silencio.
+   * Vale 0 cuando la deuda entrante no entró o se consumió completa.
+   */
+  debt_remainder: number;
 }
 
 interface PayrollLinesResult {
@@ -1236,6 +1765,21 @@ interface PayrollLinesResult {
    * no reescribe vales.
    */
   vouchersToDiscount: string[];
+  /**
+   * NV-01: deudas de sobrantes de vales de períodos ANTERIORES que este cálculo
+   * absorbe en `other_discounts`. El borrador las pasa al RPC para que la MISMA
+   * transacción las marque aplicadas; la corrección las ignora (no mueve la
+   * deuda, igual que no reescribe vales).
+   */
+  carriesToApply: string[];
+}
+
+/** NV-01: una deuda de sobrante de vales, como la lee el cálculo. */
+interface PayrollCarryRow {
+  id: string;
+  employee_id: string;
+  amount: number | string;
+  origin_period_id: string;
 }
 
 /**
@@ -1268,6 +1812,35 @@ async function computePayrollLines(args: {
 }): Promise<PayrollLinesResult> {
   const { db, sedeId, period, roster, input, voucherScope, log } = args;
   const periodId = period.id;
+
+    // F4: EXCLUSIÓN POR CADENCIA (regla del dueño, 2026-10-01). Cuando las DOS
+    // cadencias están definidas y DIFIEREN, el empleado queda FUERA de este
+    // período: no se le arma ítem, no se le lee regla y sus facturas Pagada del
+    // rango no entran en `detail_json` ni en las comisiones. Se paga en su
+    // propio ciclo. Por eso la exclusión vive acá, al armar el conjunto de
+    // empleados: nada aguas abajo (ítems, totales, resúmenes, corrección) ve al
+    // excluido. Si CUALQUIERA de las dos cadencias falta (NULL = sin cadencia
+    // definida), el empleado entra y rige el comportamiento de hoy (prorrateo
+    // por días más comisiones).
+    //
+    // EXCLUIR LAS COMISIONES ES PARTE DE LA EXCLUSIÓN, no un extra: con un
+    // período semanal y uno mensual que se superponen A PROPÓSITO, una factura
+    // del rango cae en los dos. Si el empleado mensual comisionara en el período
+    // semanal (o al revés), la MISMA factura se liquidaría dos veces. Su ciclo
+    // es el único que la cuenta.
+    const payableRoster = roster.filter(
+      (employee) =>
+        !periodExcludesEmployeeByCadence({
+          employeeFrequency: employee.pay_frequency ?? null,
+          periodFrequency: period.frequency,
+        }),
+    );
+    // La identidad de quienes SÍ cobran este período. Además de acotar los
+    // ítems, acota las dos escrituras que consumen compromisos del empleado
+    // (vales marcados `descontada` y deudas marcadas aplicadas): marcar el vale
+    // o la deuda de un excluido SIN descontarlo del neto sería consumirlo sin
+    // haber pagado, y su propio ciclo ya no podría descontarlo.
+    const payableEmployeeIds = new Set(payableRoster.map((employee) => employee.id));
 
     // Facturas de la sede en el rango de las que sale comisión. REGLA DE
     // NEGOCIO (decisión del dueño, 2026-10-01): la comisión se gana cuando la
@@ -1360,7 +1933,7 @@ async function computePayrollLines(args: {
     // inmediato: sede + empleado + activa). Una sola lectura exhaustiva y se
     // agrupan en memoria para no caer en N+1 sobre la planta del cálculo.
     const rulesByEmployee = new Map<string, Map<string, RuleRate>>();
-    if (roster.length > 0) {
+    if (payableRoster.length > 0) {
       // U5: sin `.limit(5000)`. Una regla que no se lee es una comisión que se
       // liquida de menos (el `porcentaje plano` del empleado o cero, según el
       // ítem): la diferencia sale del bolsillo del empleado y no aparece en
@@ -1384,7 +1957,7 @@ async function computePayrollLines(args: {
             .eq("is_active", true)
             .in(
               "employee_id",
-              roster.map((employee) => employee.id),
+              payableRoster.map((employee) => employee.id),
             )
             .order("id")
             .range(from, to),
@@ -1433,12 +2006,108 @@ async function computePayrollLines(args: {
     const vouchersToDiscount: string[] = [];
     for (const row of voucherRows) {
       if (!discountsVoucher(row.status, voucherScope)) continue;
+      // F4: el vale de un empleado EXCLUIDO por cadencia no se marca: no hay
+      // ítem que lo descuente, así que marcarlo lo consumiría sin descontar
+      // nada. Queda pendiente para el ciclo propio del empleado.
+      if (!payableEmployeeIds.has(row.employee_id)) continue;
       if (canDiscountVoucher(row.status)) vouchersToDiscount.push(row.id);
       const entry = valesByEmployee.get(row.employee_id) ?? { total: 0, ids: [] };
       entry.total = roundMoney(entry.total + Number(row.amount));
       entry.ids.push(row.id);
       valesByEmployee.set(row.employee_id, entry);
     }
+
+    // NV-01: DEUDA ENTRANTE del empleado. Hay DOS conjuntos y los dos entran al
+    // descuento del período:
+    //   * las PENDIENTES (`applied_period_id IS NULL`) de períodos ANTERIORES:
+    //     este cálculo las absorbe en `other_discounts` y las marca aplicadas
+    //     en la MISMA transacción (su id viaja en `carriesToApply`);
+    //   * las YA APLICADAS A ESTE PERÍODO (`applied_period_id = periodId`): un
+    //     cálculo previo de ESTE período las consumió, así que siguen
+    //     descontando en el recálculo para que el neto no cambie; NO se vuelven
+    //     a marcar (ya están consumidas y una deuda se aplica UNA vez).
+    //
+    // El sobrante que ESTE período produce todavía no existe al leer (lo
+    // registra el RPC al aplicar), y si ya existe de un cálculo previo su
+    // origen es este mismo período: por eso el filtro compara las FECHAS del
+    // período de ORIGEN y descarta todo lo que no sea estrictamente anterior.
+    // Una deuda de este período nunca se aplica a sí misma, y una de un período
+    // posterior tampoco entra. La restricción de exclusión de 035 impide que
+    // dos períodos de la sede compartan un día, así que el origen es anterior o
+    // posterior, nunca solapado.
+    const pendingCarryRows = await readAllPayroll<PayrollCarryRow>({
+      log,
+      what: "deudas pendientes de vales",
+      meta: { periodId },
+      table: "payroll_discount_carries",
+      fetchPage: (from, to) =>
+        db
+          .from("payroll_discount_carries")
+          .select("id, employee_id, amount, origin_period_id")
+          .eq("sede_id", sedeId)
+          .is("applied_period_id", null)
+          .order("id")
+          .range(from, to),
+    });
+    const appliedHereCarryRows = await readAllPayroll<PayrollCarryRow>({
+      log,
+      what: "deudas ya aplicadas a este período",
+      meta: { periodId },
+      table: "payroll_discount_carries",
+      fetchPage: (from, to) =>
+        db
+          .from("payroll_discount_carries")
+          .select("id, employee_id, amount, origin_period_id")
+          .eq("sede_id", sedeId)
+          .eq("applied_period_id", periodId)
+          .order("id")
+          .range(from, to),
+    });
+    const carryRows = [...pendingCarryRows, ...appliedHereCarryRows];
+    // Las fechas del período de ORIGEN de cada deuda: `end_date` es lo que
+    // decide si el origen es ANTERIOR al período que se calcula. Se leen en
+    // lotes (la lista de ids no puede ir entera en la URL) y por páginas.
+    const originIds = [...new Set(carryRows.map((row) => row.origin_period_id))];
+    const originEndById = new Map<string, string>();
+    for (const chunk of chunkIds(originIds)) {
+      const originPeriods = await readAllPayroll<{ id: string; end_date: string }>({
+        log,
+        what: "períodos de origen de las deudas",
+        meta: { periodId, origins: originIds.length, ids: chunk.length },
+        table: "payroll_periods",
+        fetchPage: (from, to) =>
+          db
+            .from("payroll_periods")
+            .select("id, end_date")
+            .in("id", chunk)
+            .order("id")
+            .range(from, to),
+      });
+      for (const row of originPeriods) originEndById.set(row.id, row.end_date);
+    }
+    // Una deuda solo se aplica si su período de ORIGEN termina ANTES de que
+    // empiece el que se calcula.
+    const isEarlierCarry = (row: PayrollCarryRow): boolean => {
+      const originEnd = originEndById.get(row.origin_period_id);
+      return originEnd !== undefined && originEnd < period.start_date;
+    };
+    // Deuda APLICABLE por empleado: el total que entra a `other_discounts`. Una
+    // deuda cuyo origen no es estrictamente anterior a este período se ignora
+    // por completo (no se suma ni se marca).
+    const carriesByEmployee = new Map<string, number>();
+    for (const row of carryRows) {
+      if (!isEarlierCarry(row)) continue;
+      carriesByEmployee.set(
+        row.employee_id,
+        roundMoney((carriesByEmployee.get(row.employee_id) ?? 0) + Number(row.amount)),
+      );
+    }
+    // Los ids que la transacción marca aplicados son SOLO los que estaban
+    // pendientes y pertenecen a un empleado que SÍ cobra este período (F4: la
+    // deuda de un excluido no se consume sin descontarse).
+    const carriesToApply = pendingCarryRows
+      .filter((row) => isEarlierCarry(row) && payableEmployeeIds.has(row.employee_id))
+      .map((row) => row.id);
 
     const adjustments = new Map(
       input.adjustments.map((row) => [row.employee_id, row]),
@@ -1475,21 +2144,30 @@ async function computePayrollLines(args: {
       }
     }
 
-    const payload = roster.map((employee) => {
-      // PR1: el fijo de un período son SOLO sus días. `salary_fixed` es mensual
-      // (003_admin.sql): antes se pagaba completo en cada período y cuatro
-      // cierres semanales de un mes pagaban 4 × el sueldo, sin error ni aviso.
-      // La porción se calcula por los días del rango (mes por mes, redondeando
-      // una sola vez) y la suma de los períodos del mes da el sueldo siempre
-      // que no compartan días (de eso se ocupa la guarda de solape).
-      const baseFixed =
+    const payload = payableRoster.map((employee) => {
+      // F3/F4/F5: la cadencia del PERÍODO decide el fijo (decisión del dueño,
+      // 2026-10-01). Si falta la cadencia del período o la del empleado, sigue
+      // rigiendo el prorrateo por días de hoy; si coinciden, el fijo es
+      // `mensual × fracción` (1/4, 1/2, 1) sobre el mes comercial de 30 días,
+      // con el ciclo PARCIAL prorrateado por `días del período / días del ciclo`
+      // y topado en la fracción entera cuando el rango alcanza o pasa el ciclo
+      // (la primera liquidación suele ser un rango corto). El empleado que tiene
+      // OTRA cadencia ya NO llega acá: `payableRoster` lo excluyó arriba
+      // (`periodExcludesEmployeeByCadence`), porque su ciclo es el que lo paga.
+      // Todo esto vive en la función pura `resolveFixedSalaryForPeriod`, que
+      // también dice en `basis` cuál de las tres reglas se aplicó. Un
+      // `porcentaje` no cobra fijo: no hay fracción.
+      const fixedResolution =
         employee.pay_type === "fijo" || employee.pay_type === "mixto"
-          ? prorateFixedSalary({
+          ? resolveFixedSalaryForPeriod({
               salaryFixed: employee.salary_fixed,
+              employeeFrequency: employee.pay_frequency ?? null,
+              periodFrequency: period.frequency,
               startDate: period.start_date,
               endDate: period.end_date,
             })
-          : 0;
+          : { amount: 0, basis: "prorated" as const, fraction: null };
+      const baseFixed = fixedResolution.amount;
       // Misma resolución por línea que el pago inmediato: la regla ítem×empleado
       // gana sobre el porcentaje plano. Un `fijo` con regla sí comisiona; un
       // `fijo` sin reglas sigue sin detalle (comisión 0). `no_aplica` no entra.
@@ -1517,23 +2195,98 @@ async function computePayrollLines(args: {
         })),
         rules: rulesByEmployee.get(employee.id) ?? new Map<string, RuleRate>(),
       });
-      const { detail, commissions: earnedCommissions } = buildEmployeeDetail(detailInput);
+      const { detail: rawDetail, commissions: earnedCommissions } = buildEmployeeDetail(detailInput);
+      /** El detalle que se PERSISTE: las líneas reales más, si hubo, el ajuste visible del mixto. */
+      let detail = rawDetail;
       const paidImmediate = paidImmediateByEmployee.get(employee.id) ?? 0;
-      const commissions = roundMoney(Math.max(0, earnedCommissions - paidImmediate));
+      // La comisión base de este período, sin el pago inmediato ya hecho.
+      let earnedForPay = earnedCommissions;
+      // F3: regla del MIXTO. Aplica sólo cuando la cadencia está definida (si
+      // falta cualquiera de las dos, el camino es el de hoy y nada cambia). El
+      // bloque fijo + porcentajes paga `max(básico, porcentajes de servicios)`,
+      // y la comparación es SOLO contra esos porcentajes: las comisiones fijas
+      // por producto se siguen sumando. `resolveMixedBlock` reparte sobre las
+      // columnas de siempre (`base_fixed` = básico; la parte porcentual de
+      // `commissions` = `max(0, porcentajes − básico)`) y devuelve el absorbido.
+      if (employee.pay_type === "mixto" && fixedResolution.basis !== "prorated") {
+        const { fixed: fixedCommissions, percent: servicePercent } = splitCommissionByOrigin({
+          commissions: earnedCommissions,
+          detail,
+        });
+        const mixed = resolveMixedBlock({ baseFixed, fixedCommissions, servicePercent });
+        if (mixed.absorbed > 0) {
+          // El absorbido queda VISIBLE como una línea más del detalle (su monto
+          // va en negativo), para que los porcentajes no desaparezcan entre las
+          // columnas y para que la suma de `detail_json` siga dando exactamente
+          // `commissions`.
+          detail = buildEmployeeDetail([
+            ...detail,
+            mixedAbsorbedDetailLine({ employeeId: employee.id, absorbed: mixed.absorbed }),
+          ]).detail;
+        }
+        earnedForPay = mixed.commissions;
+      }
+      const commissions = roundMoney(Math.max(0, earnedForPay - paidImmediate));
       const adjustment = adjustments.get(employee.id);
       const bonuses = roundMoney(adjustment?.bonuses ?? 0);
-      const otherDiscounts = roundMoney(adjustment?.other_discounts ?? 0);
+      // NV-01: la deuda ENTRANTE entra dentro de `other_discounts`. La igualdad
+      // del CHECK no distingue de dónde viene un descuento, así que la deuda se
+      // absorbe sin tocar la identidad ni el signo de los vales; su trazabilidad
+      // (de qué período salió y en cuál se aplicó) vive en
+      // `payroll_discount_carries`. La deuda manual del ajuste se suma con la
+      // deuda arrastrada: para el empleado, las dos son "otros descuentos".
+      const manualOtherDiscounts = roundMoney(adjustment?.other_discounts ?? 0);
+      // F8: el motivo del ajuste manual. Sólo existe cuando hay un ajuste
+      // (bono o descuento manual distinto de 0): un motivo sin monto no explica
+      // nada y se DESCARTA (nunca se persiste suelto), así la columna queda NULL
+      // —«sin ajuste manual»— salvo cuando justifica una cifra real. El
+      // descuento por DEUDA entrante no cuenta como ajuste manual: entra al
+      // total de `other_discounts` pero no es una decisión del admin, así que no
+      // exige ni conserva motivo.
+      const adjustmentReason =
+        bonuses !== 0 || manualOtherDiscounts !== 0
+          ? (adjustment?.adjustment_reason ?? "").trim() || null
+          : null;
+      const incomingDebt = carriesByEmployee.get(employee.id) ?? 0;
+      const otherDiscounts = roundMoney(manualOtherDiscounts + incomingDebt);
+      // El TOTAL REAL de vales del período, sin recorte: es el valor que la
+      // columna "Vales" debe mostrar y el que revela el sobrante.
       const vales = valesByEmployee.get(employee.id)?.total ?? 0;
       // El neto nunca queda negativo: si vales + otros supera el bruto, el
       // descuento efectivo se topa al bruto para que el neto persistido (0)
       // sea consistente con el CHECK de payroll_items
-      // (neto = bruto − vales − otros). El exceso se absorbe, no se arrastra
-      // como deuda; el recorte va primero a other_discounts y luego a vales.
+      // (neto = bruto − vales − otros). `deductions_vales` sigue siendo el
+      // descuento APLICADO (topeado); el sobrante que el tope no pudo aplicar
+      // se registra como deuda del empleado (voucher_excess) para el período
+      // siguiente.
       const applied = capPayrollDiscounts({
         gross: roundMoney(baseFixed + commissions + bonuses),
         vales,
         otherDiscounts,
       });
+      // El sobrante es la parte del total REAL que el tope NO aplicó. Sin
+      // recorte vale 0 y no genera deuda.
+      const voucherExcess = roundMoney(Math.max(0, vales - applied.vales));
+      // NV-02: de la deuda entrante SOLO se consume lo que el tope APLICÓ de
+      // verdad. `applied.otherDiscounts` es el total que quedó aplicado en esa
+      // columna y `manualOtherDiscounts` es la parte que el admin escribió a
+      // mano: la diferencia es la porción de la DEUDA que entró al neto. Se
+      // acota a `incomingDebt` (el tope nunca aplica más que manual + deuda) y
+      // a 0 (un tope que ni alcanza para el descuento manual no absorbe deuda).
+      // El resto, `incomingDebt − absorbedDebt`, NO se perdona: viaja como
+      // `debt_remainder` y el RPC lo re-registra PENDIENTE en la MISMA
+      // transacción, para que lo aplique un período POSTERIOR. El orden del
+      // tope no cambia (vales primero y después otros) y no hace falta: la
+      // deuda se suma dentro de `other_discounts`, así que el total pendiente
+      // es el mismo con cualquier orden y lo único que importa es que el
+      // reparto entre consumido y pendiente sea exacto.
+      const absorbedDebt = roundMoney(
+        Math.max(
+          0,
+          Math.min(incomingDebt, roundMoney(applied.otherDiscounts - manualOtherDiscounts)),
+        ),
+      );
+      const debtRemainder = roundMoney(incomingDebt - absorbedDebt);
       const net = computeNetPay({
         baseFixed,
         commissions,
@@ -1547,17 +2300,23 @@ async function computePayrollLines(args: {
         base_fixed: baseFixed,
         commissions,
         bonuses,
+        adjustment_reason: adjustmentReason,
         deductions_vales: applied.vales,
         other_discounts: applied.otherDiscounts,
         net_pay: net,
         detail_json: detail,
+        voucher_total: vales,
+        voucher_excess: voucherExcess,
+        debt_remainder: debtRemainder,
       };
     });
 
     // Vales que ESTE cálculo descuenta por primera vez (pendiente/aprobada).
     // Los `descontada` que la corrección volvió a restar NO entran acá: nadie
-    // reescribe un vale ya descontado.
-    return { payload, vouchersToDiscount };
+    // reescribe un vale ya descontado. Las deudas entrantes viajan aparte
+    // (`carriesToApply`) para que el borrador las marque en la misma
+    // transacción; la corrección las ignora.
+    return { payload, vouchersToDiscount, carriesToApply };
 }
 
 // -------------------------------------------------------------------- pagos ---
@@ -2335,6 +3094,10 @@ export async function correctPayrollPeriod(
         employee_id: item.employee_id,
         bonuses: roundMoney(Number(item.bonuses)),
         other_discounts: roundMoney(Number(item.other_discounts)),
+        // F8: el motivo escrito viaja con el ajuste que la liquidación firmada
+        // ya explicaba; la corrección lo reproduce tal como estaba en vez de
+        // borrarlo por el camino.
+        adjustment_reason: item.adjustment_reason ?? null,
       })),
     };
 

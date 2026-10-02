@@ -75,14 +75,16 @@ CREATE TRIGGER trg_users_updated_at
 -- ---------------------------------------------------------------- roles ---
 CREATE TABLE public.roles (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  code text UNIQUE NOT NULL CHECK (code IN ('admin', 'empleado', 'caja')),
+  -- G1: el catálogo incluye el rol de PLATAFORMA `superadmin` (ver 069).
+  code text UNIQUE NOT NULL CHECK (code IN ('admin', 'empleado', 'caja', 'superadmin')),
   description text
 );
 
 INSERT INTO public.roles (code, description) VALUES
   ('admin', 'Administración total de su sede (AUTH-07).'),
   ('empleado', 'Operación asignada de su sede (AUTH-07).'),
-  ('caja', 'Facturación y caja de su sede (AUTH-07).');
+  ('caja', 'Facturación y caja de su sede (AUTH-07).'),
+  ('superadmin', 'G1: administración de la plataforma (sedes, módulos por sede y sus administradores). NO es un rol de sede.');
 
 -- ----------------------------------------------------------- user_roles ---
 CREATE TABLE public.user_roles (

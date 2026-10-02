@@ -14,6 +14,8 @@ import { POST as postVoucher } from "@/app/api/v1/vouchers/route";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import type { SessionUser } from "@/src/features/auth/service";
 import * as adminService from "@/src/features/admin/service";
+import * as platformService from "@/src/features/platform/service";
+import { requirePlatformAdmin } from "@/src/features/platform/service";
 import {
   getPeriodDetailAction,
   getVoucherSettingsAction,
@@ -667,6 +669,8 @@ describe("guardas de autorización en server actions", () => {
 
 const PAYROLL_SERVICE_FILE = "src/features/payroll/service.ts";
 const PAYROLL_ACTIONS_FILE = "src/features/payroll/actions.ts";
+const PLATFORM_SERVICE_FILE = "src/features/platform/service.ts";
+const PLATFORM_ACTIONS_FILE = "src/features/platform/actions.ts";
 
 /**
  * Guardas que NO viven en `payroll/service.ts`, con los roles que admiten.
@@ -682,8 +686,8 @@ interface SurfaceSpec {
   file: string;
   /** Nombre exportado: la acción o el handler HTTP (GET/POST/DELETE). */
   name: string;
-  /** Qué datos toca: nómina (plata del personal) o vales. */
-  kind: "payroll" | "voucher";
+  /** Qué datos toca: nómina (plata del personal), vales o la superficie de plataforma. */
+  kind: "payroll" | "voucher" | "platform";
   /** Roles que debe admitir, en el orden en que se declaran. */
   roles: string[];
   /** Superficie de vales por la que la caja DEBE seguir entrando. */
@@ -699,6 +703,21 @@ interface SurfaceSpec {
  * coincida con esta tabla.
  */
 const SURFACES: readonly SurfaceSpec[] = [
+  // ---- plataforma: solo la cuenta con el rol `superadmin` (G3a) ----
+  {
+    file: PLATFORM_ACTIONS_FILE,
+    name: "listPlatformSedesAction",
+    kind: "platform",
+    roles: ["superadmin"],
+    why: "lista TODAS las sedes de la instalación: es la superficie de plataforma y ningún rol de sede entra.",
+  },
+  {
+    file: PLATFORM_ACTIONS_FILE,
+    name: "setPlatformPayrollStartDateAction",
+    kind: "platform",
+    roles: ["superadmin"],
+    why: "G3b: configura la fecha de inicio de la nómina de la sede ELEGIDA, para cualquier sede. Es configuración de plataforma: ningún rol de sede la cambia.",
+  },
   // ---- acciones de nómina: solo admin (pagar un ítem incluido) ----
   {
     file: PAYROLL_ACTIONS_FILE,
@@ -783,6 +802,20 @@ const SURFACES: readonly SurfaceSpec[] = [
     kind: "payroll",
     roles: ["admin", "empleado"],
     why: "mismo caso, con alcance por fila: el admin ve todo, el empleado solo sus ítems; la caja no entra.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "getPayrollSettlementSourcesAction",
+    kind: "payroll",
+    roles: ["admin", "empleado"],
+    why: "lee las facturas y vales de la liquidación de UN empleado (alcance por fila: el empleado solo la suya); es lectura de nómina y la caja no entra.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "getPayrollStartDateAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "F10: lee desde cuándo existe la nómina de la sede. Es configuración de nómina (y el piso de los ciclos que se ofrecen), no del recibo del empleado: la caja no entra. G3b: la ESCRITURA salió de nómina; esta fila cubre solo la lectura que el aviso y el diálogo necesitan.",
   },
   // ---- rutas de nómina: solo admin ----
   {
@@ -1089,11 +1122,20 @@ function isPayrollOrVoucherRoute(file: string): boolean {
 const ROUTE_FILES = readRouteFiles(join(APP_ROOT, "app", "api", "v1"));
 const SURFACE_FILE_LIST: readonly string[] = [
   PAYROLL_ACTIONS_FILE,
+  PLATFORM_ACTIONS_FILE,
   ...ROUTE_FILES.filter(isPayrollOrVoucherRoute),
 ];
 
 const PAYROLL_SERVICE_SOURCE = readFileSync(join(APP_ROOT, PAYROLL_SERVICE_FILE), "utf8");
-const GUARD_ROLES = readGuardRoles(PAYROLL_SERVICE_SOURCE, PAYROLL_SERVICE_FILE);
+const PLATFORM_SERVICE_SOURCE = readFileSync(join(APP_ROOT, PLATFORM_SERVICE_FILE), "utf8");
+/**
+ * Guardas de los módulos con tabla de autorización, en un solo mapa: las de
+ * nómina (`payroll/service.ts`) y la de plataforma (`platform/service.ts`).
+ */
+const GUARD_ROLES = new Map([
+  ...readGuardRoles(PAYROLL_SERVICE_SOURCE, PAYROLL_SERVICE_FILE),
+  ...readGuardRoles(PLATFORM_SERVICE_SOURCE, PLATFORM_SERVICE_FILE),
+]);
 
 /**
  * Matriz de guardas probadas por comportamiento (ver el bloque de abajo): qué
@@ -1102,10 +1144,17 @@ const GUARD_ROLES = readGuardRoles(PAYROLL_SERVICE_SOURCE, PAYROLL_SERVICE_FILE)
  */
 const GUARD_MATRIX: ReadonlyArray<{
   guard: string;
-  module: "payroll" | "admin";
+  module: "payroll" | "admin" | "platform";
   admite: string[];
   rechaza: string[];
 }> = [
+  {
+    // G3a: la superficie de plataforma solo la abre el rol `superadmin`.
+    guard: "requirePlatformAdmin",
+    module: "platform",
+    admite: ["superadmin"],
+    rechaza: ["admin", "caja", "empleado"],
+  },
   {
     guard: "requirePayrollAdmin",
     module: "payroll",
@@ -1138,15 +1187,21 @@ function surfaceSource(file: string): string {
   return readFileSync(join(APP_ROOT, file), "utf8");
 }
 
-describe("roles exigidos por cada superficie de nómina y de vales", () => {
-  it("la tabla cubre todas las acciones de payroll/actions.ts y todas las rutas de nómina y vales", () => {
+describe("roles exigidos por cada superficie de nómina, de vales y de plataforma", () => {
+  it("la tabla cubre todas las acciones de nómina y de plataforma, y todas las rutas de nómina y vales", () => {
+    // La cobertura va por PAREJA (archivo, acción): un mismo nombre en otro
+    // módulo no queda sombreado por una fila de nómina (mismo criterio que la
+    // allowlist de acciones públicas).
+    const actionFiles = [PAYROLL_ACTIONS_FILE, PLATFORM_ACTIONS_FILE];
     const declared = new Set(
-      scanModuleSource(surfaceSource(PAYROLL_ACTIONS_FILE), PAYROLL_ACTIONS_FILE).map(
-        (surface) => surface.name,
+      actionFiles.flatMap((file) =>
+        scanModuleSource(surfaceSource(file), file).map((surface) => `${file}: ${surface.name}`),
       ),
     );
     const covered = new Set(
-      SURFACES.filter((spec) => spec.file === PAYROLL_ACTIONS_FILE).map((spec) => spec.name),
+      SURFACES.filter((spec) => actionFiles.includes(spec.file)).map(
+        (spec) => `${spec.file}: ${spec.name}`,
+      ),
     );
 
     const unlisted = [...declared].filter((name) => !covered.has(name));
@@ -1885,6 +1940,7 @@ describe("nómina solo admin (y el propio empleado): la caja no entra; los vales
     const modules: Record<string, Record<string, unknown>> = {
       payroll: payrollService as unknown as Record<string, unknown>,
       admin: adminService as unknown as Record<string, unknown>,
+      platform: platformService as unknown as Record<string, unknown>,
     };
 
     function guardOf(row: (typeof GUARD_MATRIX)[number]): (token: string) => Promise<unknown> {
@@ -1933,11 +1989,54 @@ describe("nómina solo admin (y el propio empleado): la caja no entra; los vales
     it("los roles declarados en el fuente son los que la guarda aplica", () => {
       for (const row of GUARD_MATRIX) {
         const declared =
-          row.module === "payroll"
-            ? GUARD_ROLES.get(row.guard)
-            : EXTERNAL_GUARD_ROLES[row.guard];
+          GUARD_ROLES.get(row.guard) ?? EXTERNAL_GUARD_ROLES[row.guard];
         expect(declared, `${row.guard}: roles no legibles en el fuente`).toEqual(row.admite);
       }
     });
+  });
+});
+
+/* --------------------------------------------------------------------------
+   G1: la guarda de PLATAFORMA.
+
+   `requirePlatformAdmin` es la única puerta a `/plataforma`. Su rol se lee del
+   fuente con la misma maquinaria que las guardas de nómina (`const X:
+   RoleCode[] = [...]` + `requireSedeRole(session.roles, X)`), y se ejecuta con
+   la sesión simulada para fijar el comportamiento.
+
+   El camino REAL de la sesión (que `getSessionUser` no descarte `superadmin`)
+   se prueba en tests/auth.test.ts, sin mockear `getSessionUser`: acá la sesión
+   es el doble que aísla a la guarda del resto del mundo.
+   -------------------------------------------------------------------------- */
+
+describe("plataforma: requirePlatformAdmin (G1)", () => {
+  it("los roles declarados en el fuente son los que la guarda aplica", () => {
+    const guards = readGuardRoles(surfaceSource(PLATFORM_SERVICE_FILE), PLATFORM_SERVICE_FILE);
+    expect(guards.get("requirePlatformAdmin")).toEqual(["superadmin"]);
+  });
+
+  it("sin sesión: UNAUTHENTICATED (401)", async () => {
+    sessionStub.current = null;
+    await expect(requirePlatformAdmin("token-de-prueba")).rejects.toMatchObject({
+      code: "UNAUTHENTICATED",
+      status: 401,
+    });
+  });
+
+  it("admite `superadmin` y rechaza los demás roles con FORBIDDEN (403)", async () => {
+    asSession(["superadmin"]);
+    await expect(requirePlatformAdmin("token-de-prueba")).resolves.toMatchObject({
+      userId: "u-prueba",
+      sedeId: SEDE_PRUEBA,
+      roles: ["superadmin"],
+    });
+
+    for (const rol of ["admin", "caja", "empleado"]) {
+      asSession([rol]);
+      await expect(requirePlatformAdmin("token-de-prueba")).rejects.toMatchObject({
+        code: "FORBIDDEN",
+        status: 403,
+      });
+    }
   });
 });

@@ -6,6 +6,13 @@ import { bogotaDay } from "@/src/shared/lib/dates";
 export const payTypeSchema = z.enum(["fijo", "porcentaje", "mixto"]);
 export type PayType = z.infer<typeof payTypeSchema>;
 
+/** F2: cadencia de pago acordada con el empleado (`employees.pay_frequency`,
+ * 063). Semanal paga el fijo mensual / 4, quincenal / 2 y mensual completo,
+ * sobre un mes comercial de 30 días; la fracción la aplica la nómina. Es un
+ * catálogo CERRADO: una cuarta cadencia no es algo que la nómina sepa liquidar. */
+export const payFrequencySchema = z.enum(["semanal", "quincenal", "mensual"]);
+export type PayFrequency = z.infer<typeof payFrequencySchema>;
+
 /** ADM-07: catálogo de métodos de pago de Colombia por sede. */
 export const paymentMethodCodeSchema = z.enum([
   "efectivo",
@@ -117,6 +124,10 @@ export const employeeSchema = z
       .refine((value) => value <= bogotaDay(), "La fecha no puede ser futura.")
       .nullish(),
     pay_type: payTypeSchema,
+    // F2: OPCIONAL y `nullish`. El nulo es un valor legal y significa "sin
+    // cadencia definida": el fijo se sigue prorrateando por los días del
+    // período, que es el comportamiento de hoy. Sólo se cierra el catálogo.
+    pay_frequency: payFrequencySchema.nullish(),
     salary_fixed: z.coerce.number().nonnegative("El salario no puede ser negativo.").nullish(),
     commission_percent: z.coerce
       .number()

@@ -7,13 +7,20 @@ import {
   employeeSchema,
   isEmployeeCodeMissing,
   normalizeEmployeeCode,
+  payFrequencySchema,
   paymentMethodSchema,
   sedeSchema,
   serviceSchema,
   setUserRolesSchema,
   taxConfigSchema,
 } from "@/src/features/admin/schemas";
-import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
+import {
+  isRoleCode,
+  isSedeAssignableRole,
+  roleCodeSchema,
+  type RoleCode,
+} from "@/src/features/auth/schemas";
+import { requireSedeRole, resolveSede, type SedeRole } from "@/src/shared/lib/sede";
 import { AdminError, setUserRoles, upsertEmployee } from "@/src/features/admin/service";
 
 const SEDE_A = "11111111-1111-4111-8111-111111111111";
@@ -99,6 +106,7 @@ const ROLES_CATALOGO = [
   { id: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", code: "admin" },
   { id: "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb", code: "empleado" },
   { id: "cccccccc-3333-4333-8333-cccccccccccc", code: "caja" },
+  { id: "dddddddd-4444-4444-8444-dddddddddddd", code: "superadmin" },
 ];
 
 /**
@@ -547,6 +555,9 @@ describe("admin: reemplazo de roles atómico (ADM-04 / CO-2)", () => {
     postgrest.rows.user_roles = codes.map((code) => ({
       user_id: USUARIO_ID,
       role_id: ROLES_CATALOGO.find((rol) => rol.code === code)?.id,
+      // El embed que resuelve PostgREST (`roles(code)`): es lo que lee la
+      // lectura previa del servicio para saber qué roles tiene HOY el usuario.
+      roles: { code },
     }));
   }
 
@@ -665,6 +676,30 @@ describe("admin: reemplazo de roles atómico (ADM-04 / CO-2)", () => {
 
     expect(rolesPersistidos()).toEqual(["empleado"]);
   });
+
+  it("G1: un admin de sede NO puede otorgar `superadmin`: rechaza y no escribe", async () => {
+    sembrar(["empleado"]);
+
+    await expect(
+      setUserRoles({ user_id: USUARIO_ID, roles: ["superadmin"] }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN", status: 403 });
+
+    // La puerta se cerró ANTES del rpc: no hay sentencia ni escritura suelta.
+    expect(postgrest.rpcCalls).toEqual([]);
+    expect(postgrest.singleWrites).toEqual([]);
+    expect(rolesPersistidos()).toEqual(["empleado"]);
+  });
+
+  it("G1: un admin de sede NO puede quitarle `superadmin` a quien lo tiene: rechaza y no escribe", async () => {
+    sembrar(["superadmin"]);
+
+    await expect(
+      setUserRoles({ user_id: USUARIO_ID, roles: ["admin"] }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN", status: 403 });
+
+    expect(postgrest.rpcCalls).toEqual([]);
+    expect(rolesPersistidos()).toEqual(["superadmin"]);
+  });
 });
 
 function baseEmployee(overrides: Record<string, unknown> = {}) {
@@ -754,6 +789,36 @@ describe("admin schemas: empleado y pay_type coherente (ADM-08)", () => {
     expect(
       checkPayCoherence({ pay_type: "mixto", salary_fixed: 1, commission_percent: 5 }),
     ).toBeNull();
+  });
+});
+
+describe("admin schemas: cadencia de pago del empleado (F2)", () => {
+  it("acepta las tres cadencias, null y la clave ausente; rechaza cualquier otro valor", () => {
+    for (const cadencia of ["semanal", "quincenal", "mensual"]) {
+      expect(
+        employeeSchema.safeParse(baseEmployee({ pay_frequency: cadencia })).success,
+        `debería aceptar ${cadencia}`,
+      ).toBe(true);
+    }
+    // `null` es «sin cadencia definida»: un valor LEGAL, no un hueco.
+    expect(employeeSchema.safeParse(baseEmployee({ pay_frequency: null })).success).toBe(true);
+    // La clave ausente también: es el estado de todo legajo anterior a F2.
+    expect(employeeSchema.safeParse(baseEmployee()).success).toBe(true);
+
+    for (const invalida of ["diario", "Semanal", "semanal ", "quincenal (x)", "", 4, true]) {
+      expect(
+        employeeSchema.safeParse(baseEmployee({ pay_frequency: invalida })).success,
+        `debería rechazar ${JSON.stringify(invalida)}`,
+      ).toBe(false);
+    }
+  });
+
+  it("el catálogo del esquema es el cerrado de la columna y no admite null por sí solo", () => {
+    for (const cadencia of ["semanal", "quincenal", "mensual"]) {
+      expect(payFrequencySchema.safeParse(cadencia).success, cadencia).toBe(true);
+    }
+    expect(payFrequencySchema.safeParse("diario").success).toBe(false);
+    expect(payFrequencySchema.safeParse(null).success).toBe(false);
   });
 });
 
@@ -1734,5 +1799,400 @@ describe("admin: los campos numéricos de las secciones pasan por su máscara (g
     expect(block).toContain("setNewValue(event.target.value)");
     // Sin el ancla no hay bloque: la guarda falla en vez de pasar sola.
     expect(onChangeBlock(fake, "no-existe:")).toBe("");
+  });
+});
+
+/* ==========================================================================
+   F2: la cadencia de pago del empleado
+
+   El alta y la edición divergen en el camino de escritura: la EDICIÓN usa el
+   `upsert` suelto de PostgREST (escribe las columnas POR NOMBRE), y el ALTA usa
+   el rpc `upsert_employee_atomic` (054), que escribía una LISTA DE COLUMNAS
+   FIJA e ignoraba la cadencia en silencio. Por eso F2 trae una migración (065)
+   que reemplaza la función con la misma firma y le agrega la clave.
+   ========================================================================== */
+describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", () => {
+  /** El legajo que existía antes de F2: sin cadencia. */
+  const EDIT_ID = "66666666-6666-4666-8666-666666666666";
+
+  function sembrarLegajos(): void {
+    postgrest.rows = {};
+    postgrest.rows.users = [];
+    postgrest.rows.roles = ROLES_CATALOGO.map((rol) => ({ ...rol }));
+    postgrest.rows.user_roles = [];
+    postgrest.rows.employees = [];
+  }
+
+  beforeEach(() => {
+    sembrarLegajos();
+    postgrest.singleWrites.length = 0;
+    postgrest.rpcCalls.length = 0;
+    postgrest.selects.length = 0;
+    postgrest.failRpc = null;
+    postgrest.failWrite = null;
+    postgrest.failWriteTabla = null;
+    postgrest.failRead = null;
+    postgrest.hold = false;
+  });
+
+  it("el alta escribe la cadencia en el legajo y la devuelve en la fila", async () => {
+    const fila = await upsertEmployee(baseEmployee({ pay_frequency: "semanal" }));
+
+    expect(fila.pay_frequency).toBe("semanal");
+    expect(memoryRows("employees")[0]?.pay_frequency).toBe("semanal");
+    // Viaja DENTRO de `p_employee`: el rpc es la única escritura del alta.
+    expect(postgrest.rpcCalls.map((llamada) => llamada.fn)).toEqual(["upsert_employee_atomic"]);
+    expect(postgrest.rpcCalls[0]?.args.p_employee).toMatchObject({ pay_frequency: "semanal" });
+    expect(postgrest.singleWrites).toEqual([]);
+  });
+
+  it("null es un valor legal: el legajo queda sin cadencia y la clave igual viaja", async () => {
+    const fila = await upsertEmployee(baseEmployee({ pay_frequency: null }));
+
+    expect(fila.pay_frequency).toBeNull();
+    expect(memoryRows("employees")[0]?.pay_frequency).toBeNull();
+    expect(postgrest.rpcCalls[0]?.args.p_employee).toMatchObject({ pay_frequency: null });
+  });
+
+  it("sin la clave también queda en null: la cadencia no se inventa ni se hereda", async () => {
+    const fila = await upsertEmployee(baseEmployee());
+
+    expect(fila.pay_frequency).toBeNull();
+    expect(memoryRows("employees")[0]?.pay_frequency).toBeNull();
+  });
+
+  it("la edición persiste la cadencia por el upsert suelto (el alta no se llama)", async () => {
+    postgrest.rows.employees = [
+      {
+        id: EDIT_ID,
+        sede_id: SEDE_A,
+        user_id: null,
+        full_name: "Carolina Rojas",
+        document: "123456",
+        pay_type: "fijo",
+        pay_frequency: null,
+        salary_fixed: 1000000,
+        is_active: true,
+      },
+    ];
+
+    const fila = await upsertEmployee(baseEmployee({ id: EDIT_ID, pay_frequency: "quincenal" }));
+
+    expect(fila.pay_frequency).toBe("quincenal");
+    expect(memoryRows("employees")[0]?.pay_frequency).toBe("quincenal");
+    // La edición no crea usuarios ni roles: es UNA escritura suelta.
+    expect(postgrest.rpcCalls).toEqual([]);
+    expect(postgrest.singleWrites).toContain("employees.upsert");
+  });
+
+  it("un valor fuera del catálogo se rechaza ANTES de escribir: ni rpc, ni upsert, ni fila", async () => {
+    await expect(upsertEmployee(baseEmployee({ pay_frequency: "diario" }))).rejects.toMatchObject({
+      code: "VALIDATION",
+      status: 400,
+    });
+
+    expect(postgrest.rpcCalls).toEqual([]);
+    expect(postgrest.singleWrites).toEqual([]);
+    expect(memoryRows("employees")).toEqual([]);
+  });
+
+  // ---- guardas de fuente: el select, la migración y la UI -----------------
+  const serviceSource = readFileSync(
+    join(process.cwd(), "src", "features", "admin", "service.ts"),
+    "utf8",
+  );
+  const employeesSection = readFileSync(
+    join(process.cwd(), "app", "admin", "admin-sections", "employees-section.tsx"),
+    "utf8",
+  );
+  const migration065 = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "065_employee_pay_frequency.sql"),
+    "utf8",
+  );
+
+  /** Columnas de la constante `EMPLOYEE_SELECT` real. */
+  function employeeSelectColumns(source: string): string[] {
+    const match = source.match(/const EMPLOYEE_SELECT =\s*"([^"]*)"/);
+    if (!match) return [];
+    return match[1].split(",").map((columna) => columna.trim());
+  }
+
+  /** Valores del catálogo de cadencias de la UI (el `""` es «Sin definir»). */
+  function cadenceValues(source: string): string[] {
+    const block = source.match(/const PAY_FREQUENCY_OPTIONS = \[([\s\S]*?)\] as const;/);
+    if (!block) return [];
+    return [...block[1].matchAll(/value: "([^"]*)"/g)].map((match) => match[1]);
+  }
+
+  /** Columnas del INSERT del legajo dentro de `upsert_employee_atomic`. */
+  function insertedEmployeeColumns(sql: string): string[] {
+    const insert = sql.match(/INSERT INTO public\.employees\s*\(([\s\S]*?)\)\s*\n\s*VALUES/);
+    if (!insert) return [];
+    return insert[1].split(",").map((columna) => columna.trim());
+  }
+
+  /** El SQL fuera del cuerpo PL/pgSQL (donde vive la migración de datos). */
+  function outsideFunctionBody(sql: string): string {
+    return sql.replace(/\$\$[\s\S]*?\$\$/g, "");
+  }
+
+  it("el select de empleados LEE la cadencia: sin eso, la fila volvería sin ella", () => {
+    expect(employeeSelectColumns(serviceSource)).toContain("pay_frequency");
+  });
+
+  it("la UI ofrece la cadencia en el alta y la edición, con la fracción en dinero y «Sin definir»", () => {
+    // El `""` es «Sin definir»: deja la columna en NULL y conserva el cálculo de hoy.
+    expect(cadenceValues(employeesSection)).toEqual(["", "semanal", "quincenal", "mensual"]);
+    expect(employeesSection).toContain("value={form.pay_frequency}");
+    expect(employeesSection).toContain(
+      "setForm({ ...form, pay_frequency: event.target.value })",
+    );
+    // Alta: el formulario nace en «Sin definir». Edición: se hidrata de la fila.
+    expect(employeesSection).toMatch(/pay_frequency: "",\s*\n\s*salary_fixed: "",/);
+    expect(employeesSection).toContain("pay_frequency: row.pay_frequency ?? \"\",");
+    // La ayuda dice en DINERO qué paga cada cadencia y qué significa no elegir.
+    expect(employeesSection).toContain("mensual / 4");
+    expect(employeesSection).toContain("mensual / 2");
+    expect(employeesSection).toContain("mes completo");
+    expect(employeesSection).toContain("conserva el cálculo de hoy");
+    // El detalle también la muestra.
+    expect(employeesSection).toContain("{payFrequencyLabel(dialogRow.pay_frequency)}");
+  });
+
+  it("«Sin definir» viaja como null: nunca se manda la cadena vacía a la base", () => {
+    expect(employeesSection).toContain(
+      'pay_frequency: form.pay_frequency === "" ? null : form.pay_frequency,',
+    );
+  });
+
+  it("la migración 065 reemplaza la función con la MISMA firma y le agrega la cadencia", () => {
+    expect(migration065).toContain("CREATE OR REPLACE FUNCTION public.upsert_employee_atomic(");
+    expect(migration065).toContain(
+      "p_employee jsonb, p_user_id uuid, p_create_user jsonb, p_role_code text",
+    );
+    expect(migration065).toContain("RETURNS jsonb");
+    // La clave es OPCIONAL y su valor PRESENTE se valida contra el catálogo cerrado.
+    expect(migration065).toContain("p_employee ? 'pay_frequency'");
+    expect(migration065).toContain("NOT IN ('semanal', 'quincenal', 'mensual')");
+    // Se ESCRIBE en el legajo y se DEVUELVE en la fila.
+    expect(insertedEmployeeColumns(migration065)).toContain("pay_frequency");
+    expect(migration065).toContain("'pay_frequency', v_fila.pay_frequency");
+    // El contrato de la función (search_path, ACL, COMMENT) se re-emite.
+    const firma = "public.upsert_employee_atomic(jsonb, uuid, jsonb, text)";
+    expect(migration065).toContain(
+      `ALTER FUNCTION ${firma} SET search_path = public;`,
+    );
+    expect(migration065).toContain(`REVOKE ALL ON FUNCTION ${firma} FROM PUBLIC`);
+    expect(migration065).toContain(`REVOKE ALL ON FUNCTION ${firma} FROM anon`);
+    expect(migration065).toContain(`REVOKE ALL ON FUNCTION ${firma} FROM authenticated`);
+    expect(migration065).toContain(`GRANT EXECUTE ON FUNCTION ${firma} TO service_role`);
+    expect(migration065).toContain(`COMMENT ON FUNCTION ${firma} IS`);
+  });
+
+  it("la 065 no migra datos ni toca la columna (eso es la 063) y declara que no se ejecutó", () => {
+    const sqlSinComentarios = migration065
+      .split("\n")
+      .filter((linea) => !linea.trimStart().startsWith("--"))
+      .join("\n");
+    // Fuera del cuerpo de la función no hay una sola sentencia de datos ni DDL
+    // de tabla: los legajos existentes quedan con su cadencia como está.
+    const fueraDelCuerpo = outsideFunctionBody(sqlSinComentarios);
+    expect(fueraDelCuerpo).not.toMatch(/\b(INSERT|UPDATE|DELETE)\b/);
+    expect(fueraDelCuerpo).not.toMatch(/\bALTER TABLE\b/);
+    expect(fueraDelCuerpo).not.toMatch(/\bDROP\b/);
+    // Idempotente: reemplaza, no crea otra sobrecarga.
+    expect(sqlSinComentarios).not.toMatch(/^CREATE FUNCTION/m);
+    expect(migration065).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("control negativo de los detectores de fuente (no son sellos de goma)", () => {
+    expect(employeeSelectColumns('const EMPLOYEE_SELECT =\n  "id, full_name";')).not.toContain(
+      "pay_frequency",
+    );
+    expect(cadenceValues("<select></select>")).toEqual([]);
+    expect(
+      cadenceValues('const PAY_FREQUENCY_OPTIONS = [{ value: "diario", label: "Diario" }] as const;'),
+    ).toEqual(["diario"]);
+    expect(insertedEmployeeColumns("INSERT INTO public.employees (sede_id) VALUES (1);")).not.toContain(
+      "pay_frequency",
+    );
+    expect(insertedEmployeeColumns("SELECT 1;")).toEqual([]);
+    // La migración falsa (sin la clave) NO pasa el detector de la escritura.
+    expect(
+      insertedEmployeeColumns(
+        "INSERT INTO public.employees (sede_id)\n  VALUES ((x)::uuid)",
+      ),
+    ).not.toContain("pay_frequency");
+    // Y la UI no estrena las primitivas ni los roles que otras guardas pinean.
+    expect(employeesSection).not.toMatch(/\brole\s*=\s*["'{]/);
+    expect(employeesSection).not.toMatch(/<Badge\b/);
+    expect(employeesSection).not.toMatch(/<Alert\b/);
+  });
+});
+
+// ---------------------------------------------------- plataforma (G1) ---
+
+describe("roles: vocabulario de plataforma (G1)", () => {
+  it("roleCodeSchema acepta `superadmin` y sigue rechazando un código desconocido", () => {
+    expect(roleCodeSchema.safeParse("superadmin").success).toBe(true);
+    expect(roleCodeSchema.safeParse("dueño").success).toBe(false);
+    expect(isRoleCode("superadmin")).toBe(true);
+    expect(isRoleCode("dueño")).toBe(false);
+  });
+
+  it("el espejo `SedeRole` es estructuralmente idéntico a `RoleCode` (ida y vuelta compilan)", () => {
+    const desdeEspejo: SedeRole[] = ["admin", "empleado", "caja", "superadmin"];
+    const comoCodigos: RoleCode[] = desdeEspejo;
+    const vuelta: SedeRole[] = comoCodigos;
+    expect(vuelta).toContain("superadmin");
+  });
+
+  it("setUserRolesSchema acepta el código; es el SERVICIO quien lo rechaza", () => {
+    // El esquema (en admin/schemas, fuera del alcance de G1) no puede estrecharse
+    // acá: por eso la puerta real es el servicio.
+    expect(
+      setUserRolesSchema.safeParse({ user_id: SEDE_A, roles: ["superadmin"] }).success,
+    ).toBe(true);
+    expect(setUserRolesSchema.safeParse({ user_id: SEDE_A, roles: ["dueño"] }).success).toBe(false);
+  });
+
+  it("la lista asignable desde sede excluye el rol de plataforma", () => {
+    expect(isSedeAssignableRole("admin")).toBe(true);
+    expect(isSedeAssignableRole("empleado")).toBe(true);
+    expect(isSedeAssignableRole("caja")).toBe(true);
+    expect(isSedeAssignableRole("superadmin")).toBe(false);
+  });
+});
+
+describe("admin: la UI de usuarios no ofrece el rol de plataforma (guarda de fuente, G1)", () => {
+  const fuente = readFileSync(
+    join(process.cwd(), "app", "admin", "admin-sections", "users-section.tsx"),
+    "utf8",
+  );
+
+  it("construye la lista asignable filtrando `superadmin` y la usa en los radios", () => {
+    expect(fuente).toContain(
+      'ROLE_OPTIONS.filter((option) => option.value !== "superadmin")',
+    );
+    expect(fuente).toContain("ASSIGNABLE_ROLE_OPTIONS.map(");
+    // La lista cruda del panel NO se vuelve a ofrecer en esta pantalla
+    // (cuidado con el prefijo: `ASSIGNABLE_ROLE_OPTIONS.map` contiene esa
+    // subcadena, por eso se exige que NO venga precedida de `ASSIGNABLE_`).
+    expect(fuente).not.toMatch(/(?<!ASSIGNABLE_)ROLE_OPTIONS\.map\(/);
+  });
+});
+
+describe("migración 069_superadmin_role.sql (G1)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "069_superadmin_role.sql"),
+    "utf8",
+  );
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("ensancha el CHECK por su nombre real, con el cuarto código", () => {
+    expect(sql).toContain("DROP CONSTRAINT IF EXISTS roles_code_check");
+    expect(sql).toContain("ADD CONSTRAINT roles_code_check");
+    expect(sql).toContain("CHECK (code IN ('admin', 'empleado', 'caja', 'superadmin'))");
+    expect(raw).toContain("roles_code_check");
+  });
+
+  it("inserta la fila del catálogo de forma idempotente", () => {
+    expect(sql).toContain("INSERT INTO public.roles (code, description)");
+    expect(sql).toContain("'superadmin'");
+    expect(sql).toContain("ON CONFLICT (code) DO NOTHING");
+  });
+
+  it("es idempotente, no migra datos y toca solo el catálogo", () => {
+    expect(sql.match(/\bINSERT INTO\b/g)).toHaveLength(1);
+    expect(sql).not.toMatch(/public\.(users|user_roles|sessions)/);
+    expect(sql).not.toMatch(/\bADD COLUMN\b/i);
+    expect(sql).not.toMatch(/\bUPDATE\b/i);
+    expect(sql).not.toMatch(/\bDELETE\b/i);
+  });
+
+  it("declara el nombre real de la constraint, la numeración libre y que no se ejecutó", () => {
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+});
+
+// ---------------------------------------- nombres de sede únicos (G2) ---
+
+describe("migración 070_sedes_unique_name.sql (G2)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "070_sedes_unique_name.sql"),
+    "utf8",
+  );
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  /**
+   * Destino del índice único, en una sola línea. Es el detector que usan las
+   * pruebas de abajo: si el CREATE desapareciera, dejara de ser único o dejara
+   * de normalizar el nombre, devuelve `null` u otra cosa y la prueba cae.
+   */
+  function destinoIndiceUnicoSede(fuente: string): string | null {
+    const destino = fuente.match(
+      /CREATE UNIQUE INDEX IF NOT EXISTS uq_sedes_name\s+ON public\.sedes\s*\(([^;]*?)\);/s,
+    );
+    return destino ? destino[1].replace(/\s+/g, " ").trim() : null;
+  }
+
+  it("crea, una sola vez, un índice único sobre el nombre normalizado", () => {
+    expect(destinoIndiceUnicoSede(sql)).toBe("lower(btrim(name))");
+    expect(sql.match(/CREATE UNIQUE INDEX\b/g)).toHaveLength(1);
+    expect(sql).not.toMatch(/CREATE INDEX\b/);
+  });
+
+  it("aborta antes de crear el índice si ya hay nombres repetidos y los lista", () => {
+    // El pre-vuelo agrupa por la MISMA clave normalizada y cuenta.
+    expect(sql).toContain("GROUP BY lower(btrim(name))");
+    expect(sql).toContain("HAVING count(*) > 1");
+    // El mensaje dice que aborta, que no toca filas y qué hacer.
+    expect(sql).toContain("migración 070 ABORTADA");
+    expect(sql).toMatch(/renombre las sedes repetidas/i);
+    expect(sql).toContain("No se borró, renombró ni fusionó ninguna fila");
+    // Aborta con excepción; no es un aviso que siga de largo.
+    expect(sql).toContain("RAISE EXCEPTION");
+  });
+
+  it("es re-ejecutable y no toca datos ni otras tablas", () => {
+    expect(sql).toContain("CREATE UNIQUE INDEX IF NOT EXISTS uq_sedes_name");
+    expect(sql).not.toMatch(/^\s*DELETE\b/im);
+    expect(sql).not.toMatch(/^\s*UPDATE\b/im);
+    expect(sql).not.toMatch(/^\s*TRUNCATE\b/im);
+    expect(sql).not.toMatch(/^\s*ALTER TABLE\b/im);
+    // Sólo `sedes`: ninguna otra tabla del esquema entra en una sentencia.
+    expect(sql).toMatch(/public\.sedes\b/);
+    expect(sql).not.toMatch(/public\.(users|employees|roles|user_roles|sessions)\b/);
+  });
+
+  it("declara el motivo, la numeración libre y que no se ejecutó", () => {
+    expect(raw).toContain("Plataforma (sistema)");
+    expect(raw).toContain("lower(btrim(name))");
+    expect(raw).toContain("COSTO DE NUMERACIÓN");
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("control negativo: el detector no es un sello de goma", () => {
+    // Un índice sobre `name` crudo (sin normalizar) NO pasa el detector: es
+    // justo la debilidad que 070 corrige.
+    const sinNormalizar =
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_sedes_name ON public.sedes (name);\n";
+    expect(destinoIndiceUnicoSede(sinNormalizar)).toBe("name");
+    expect(destinoIndiceUnicoSede(sinNormalizar)).not.toBe("lower(btrim(name))");
+    // Sin el CREATE (archivo ausente o recortado), el detector devuelve null.
+    expect(destinoIndiceUnicoSede("SELECT 1;\n")).toBeNull();
+    // Y un índice NO único tampoco cuenta como la barrera.
+    expect(
+      destinoIndiceUnicoSede(
+        "CREATE INDEX IF NOT EXISTS uq_sedes_name ON public.sedes (lower(btrim(name)));\n",
+      ),
+    ).toBeNull();
   });
 });

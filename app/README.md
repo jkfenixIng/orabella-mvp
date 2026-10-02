@@ -36,6 +36,186 @@ npm run lint    # eslint .
 npm test        # vitest run
 ```
 
+## Cuenta de plataforma (`superadmin`)
+
+La capa de plataforma (ver `odd/tasks/plataforma-super-admin.md`) se administra
+con UNA sola cuenta: documento `superadmin` con el rol `superadmin`, anclada a la
+**sede de plataforma**. Esa cuenta **no** se crea desde la administración de una
+sede —`adminCreateUser` no admite
+ese rol, que solo otorga la plataforma— así que se aprovisiona con un script del
+repositorio:
+
+```bash
+npm run create:superadmin
+```
+
+### Variables: el script carga los archivos de entorno del proyecto
+
+El script arranca cargando los archivos de entorno del proyecto con
+`loadEnvConfig` de `@next/env` —el mecanismo canónico de Next, que ya viene con
+`next`—, así que lee los MISMOS archivos que la app (`.env.local` entre ellos)
+**antes** de mirar las variables. Con `.env.local` presente, lo único que hay que
+definir a mano es `SUPERADMIN_PASSWORD`:
+
+| Variable | Qué es |
+|---|---|
+| `SUPERADMIN_PASSWORD` | La clave de la cuenta. **Obligatoria y sin valor por defecto**: si falta o viene vacía, el script no escribe nada y falla. Es la ÚNICA variable propia del script y la única que NO va en `.env.local`. |
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Las mismas de la app: salen de `.env.local` y el script usa `createAdminClient()` (service_role). El host de la URL es lo que imprime antes de escribir. |
+
+**Precedencia:** lo que YA está en el entorno del proceso **gana** sobre el
+archivo (es la precedencia normal de Next, y el script la impone de forma
+explícita para que no dependa de un detalle interno). Así el dueño puede apuntar
+a otra base a propósito, sin editar ningún archivo.
+
+El script dice de dónde salieron las credenciales —solo nombres de archivo, nunca
+valores—:
+
+```text
+[superadmin] entorno: archivos cargados: .env.local, .env — el entorno del proceso tiene prioridad sobre ellos
+[superadmin] entorno: no se encontraron archivos de entorno; se usa sólo el entorno del proceso
+```
+
+**No hay variable de destino ni de sede.** El destino no se declara: cada entorno
+tiene su propio `.env` y el script imprime el HOST de Supabase al que le escribe
+justo antes de tocar nada —ese es el chequeo humano—. Y la sede ya no se elige:
+la asegura el script (ver abajo).
+
+**La clave no está en el repositorio** —no está en `.env.example`, ni en un seed,
+ni en este README, ni en una prueba— y **no hay clave por defecto**, porque el
+respaldo silencioso termina siendo la clave de producción. Vive solo en el
+entorno con el que se corre el script; a la base baja únicamente su hash scrypt
+(`hashPassword` de la app). El cargador leería la clave si estuviera en
+`.env.local`, y por eso la decisión es **no ponerla ahí**: la credencial se define
+en el entorno de la corrida, no en un archivo.
+
+El documento es el MISMO en los dos entornos; lo único que cambia es el valor de
+las variables (y el `.env.local` de cada máquina):
+
+```bash
+# PRUEBAS y producción se distinguen por el VALOR y por el host que el script imprime.
+export SUPERADMIN_PASSWORD='...'   # la ÚNICA a mano; sale del shell, nunca de un archivo
+npm run create:superadmin
+```
+
+Si la máquina NO tiene `.env.local` (o se corre desde otro directorio), hay que
+definir también las tres de Supabase en el entorno, porque no hay archivo del que
+salgan.
+
+### Definir la clave en el shell (la trampa que ya nos costó una corrida)
+
+La clave es la única variable que se define a mano, y **cómo se define depende del
+shell**:
+
+```powershell
+# PowerShell: `set VAR=valor` NO define una variable de entorno (es un alias de
+# Set-Variable: la variable existe en la sesión, pero los procesos hijos NO la
+# heredan, así que npm/node no la ven). Se usa $env:, y vale sólo para esa ventana.
+$env:SUPERADMIN_PASSWORD = '...'
+npm run create:superadmin
+```
+
+```cmd
+:: cmd.exe: `set VAR=valor` SÍ define una variable de entorno (sólo para esa ventana).
+set SUPERADMIN_PASSWORD=...
+npm run create:superadmin
+```
+
+```bash
+# sh/bash: `export` para que el proceso hijo la herede (sólo esa ventana).
+export SUPERADMIN_PASSWORD='...'
+npm run create:superadmin
+```
+
+### La sede de plataforma
+
+`users.sede_id` es NOT NULL (003_admin.sql), así que la cuenta tiene que
+pertenecer a alguna sede. Pedirla por variable obligaba a elegir una sede de
+CLIENTE para una cuenta que está para ajustar el SISTEMA. En su lugar, el script
+**asegura** una fila de `sedes` llamada `Plataforma (sistema)`:
+
+- **Idempotente por NOMBRE**: si la fila ya existe la usa, y no crea otra.
+  `sedes` no tiene `code` ni unicidad por nombre, así que el nombre es la única
+  clave estable; si aparecen dos filas con ese nombre, el script falla en vez de
+  elegir una al azar (y relee después de crear, para que dos corridas
+  simultáneas tampoco dejen dos).
+- Se crea con **`is_active = false`**: no es una sede operativa. Si la fila ya
+  existía **ACTIVA**, el script la usa igual y lo dice con un AVISO: no cambia el
+  estado de una sede que no creó.
+- Si la sede no se puede asegurar, **falla antes de tocar la cuenta**.
+- **No se relaja `users.sede_id` ni se toca `resolveSede`/`requireSedeRole`**
+  (`src/shared/lib/sede.ts`): esa frontera sostiene el aislamiento por sede de
+  todas las rutas del negocio, y aflojarla para una cuenta lo propagaría a cada
+  guarda. La sede de plataforma es la representación honesta de "no es una sede
+  de cliente". Las guardas son puras sobre `sede_id` y no miran
+  `sedes.is_active`, así que una sede inactiva no deja a la cuenta afuera de
+  nada.
+- Si la cuenta estaba anclada a otra sede, la corrida **la re-ancla a la sede de
+  plataforma y lo dice** (cambiar de sede cambia lo que esa cuenta ve del
+  negocio: no puede ser mudo).
+
+**Nota (pendiente para G4):** el script crea la sede inactiva para que no se
+ofrezca en los flujos del negocio, pero **hoy nada la excluye por `is_active`**:
+`fetchSedes` (`src/features/admin/service.ts:123`) selecciona TODAS las sedes y
+solo está expuesta por `listSedesAction` (`src/features/admin/actions.ts:167`),
+que no tiene ningún consumidor en la interfaz. Cerrarlo es de G4.
+
+### La cuenta ajusta el sistema, no opera el negocio
+
+El conjunto de roles se fija **exactamente en `["superadmin"]`** en cada corrida
+(`replace_user_roles` reemplaza el conjunto, no agrega). Esa es la DEFINICIÓN de
+la cuenta, no una limitación pendiente: la cuenta existe para ajustar el sistema
+y **no** para operar el negocio. Caja, facturas y nómina le quedan **sin
+permisos**, y eso es deliberado.
+
+### Qué hace (y qué no)
+
+- **Idempotente**: la primera corrida crea la cuenta; las siguientes **actualizan**
+  la clave y limpian el bloqueo por intentos. Nunca crea una segunda cuenta, ni
+  una segunda sede de plataforma, ni duplica el rol: `replace_user_roles` deja
+  exactamente `superadmin`.
+- **Verifica de punta a punta**: al final vuelve a leer el hash guardado y
+  comprueba que verifica con `verifyPassword()` —la misma función del login— con
+  la clave del entorno. Si no verifica, falla en vez de dejar una cuenta que no
+  puede entrar.
+- Deja `must_change_password = false`: AUTH-01 fuerza el cambio cuando la clave
+  inicial es el documento, pero acá la clave la eligió el despliegue y tiene que
+  servir para entrar.
+- **No habilita una cuenta deshabilitada**: si `users.is_active = false`, falla en
+  vez de deshacer en silencio una decisión del dueño.
+- No escribe auditoría: el vocabulario de `audit_logs` no tiene una acción de
+  aprovisionamiento y esto no es una operación de la aplicación.
+
+### El runner (por qué el script de `package.json` se ve así)
+
+El proyecto no tiene `tsx` ni `ts-node`, y el script tiene que importar el
+`hashPassword` de la app (con el alias `@/`) para que el hash no pueda divergir
+del que verifica el login. El runner disponible es `jiti`: **no está declarado en
+`devDependencies`**, pero queda instalado y fijado en `package-lock.json` como
+dependencia de desarrollo porque `@tailwindcss/node` (y `vite`, como peer) lo
+exigen; por eso **el script se corre en una copia del repo con las dependencias
+de desarrollo instaladas** (con `--omit=dev` no hay runner). El CLI de `jiti` no
+resuelve el alias `@/` sin la variable `JITI_TSCONFIG_PATHS` —que no se puede
+fijar de forma portable en `cmd.exe` y en `sh`—, así que la entrada del
+`package.json` levanta `jiti` con `{ tsconfigPaths: true }` y llama a `main()`.
+Si algún día se agrega un runner propio (`tsx`), la entrada se cambia por
+`tsx scripts/create-superadmin.ts` y el script no se toca.
+
+**El script se corre DESDE la máquina del dueño**, contra la base remota, con las
+credenciales que salen de su `.env.local` (o del entorno del proceso, que tiene
+prioridad): no hace parte del despliegue de la app y no se ejecuta desde el
+servidor de producción. Necesita, por lo tanto, un checkout del repositorio con
+las dependencias de desarrollo instaladas (`npm ci`). Si algún día tiene que
+correrse en un entorno que no las tenga, hay que **declarar el runner** en el
+proyecto —`tsx`, por ejemplo—: eso sería su propia unidad, con su propio cambio
+de `package.json` y de `package-lock.json` y su propio gate.
+
+Si el runner no está instalado, el arranque lo dice en vez de morir con el error
+de Node sobre un módulo que no encuentra:
+
+```text
+[superadmin] Falta el runner TypeScript: este comando necesita las dependencias de desarrollo instaladas en el checkout, con npm ci y sin --omit=dev. jiti no es una dependencia declarada del proyecto: llega con @tailwindcss/node y vite. Ver el README: Cuenta de plataforma.
+```
+
 ## Estructura
 
 ```text
@@ -45,6 +225,7 @@ src/shared/{components,lib,config}/  # theme, api-response, supabase client/serv
 supabase/migrations/      # SQL versionado (001 fundación; dominio en T2→T7; endurecimiento en T8; 009→031 ampliaciones)
 supabase/seeds/           # seeds de aceptación §11 (T8, idempotentes)
 tests/                    # suites vitest + e2e Playwright (tests/e2e/)
+scripts/                  # operaciones de despliegue fuera de la app (alta de la cuenta de plataforma, G2)
 ```
 
 ## Convenciones

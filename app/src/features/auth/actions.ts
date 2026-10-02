@@ -16,6 +16,7 @@ import {
   requestPasswordReset,
 } from "./service";
 import { AdminError, requireAdminSession } from "@/src/features/admin/service";
+import type { RoleCode } from "./schemas";
 
 const isProduction = process.env.NODE_ENV === "production";
 
@@ -122,7 +123,10 @@ export async function adminCreateUserAction(input: {
   id_type: "CC" | "CE" | "PPT" | "PEP" | "otro";
   full_name: string;
   phone?: string;
-  roles: Array<"admin" | "empleado" | "caja">;
+  // El runtime lo acota `adminCreateUserSchema` (`sedeAssignableRoleSchema`):
+  // `superadmin` NO se crea desde acá. El tipo se ensancha a `RoleCode` para no
+  // tener una cuarta lista de literales que pueda quedar desactualizada.
+  roles: RoleCode[];
   sede_id?: string | null;
 }) {
   try {

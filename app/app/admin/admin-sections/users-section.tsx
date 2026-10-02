@@ -20,6 +20,13 @@ import {
 } from "../admin-styles";
 import { ROLE_OPTIONS, type ActionResult } from "../admin-shared";
 
+/**
+ * Roles que esta pantalla puede asignar. `superadmin` es de PLATAFORMA: no se
+ * otorga ni se quita desde una sede. El filtro es la puerta de la interfaz; el
+ * servicio (`setUserRoles`) rechaza el mismo código aunque llegue por la action.
+ */
+const ASSIGNABLE_ROLE_OPTIONS = ROLE_OPTIONS.filter((option) => option.value !== "superadmin");
+
 export function UsersSection({
   initial,
   currentUserId,
@@ -128,7 +135,7 @@ export function UsersSection({
                     </td>
                     <td className="whitespace-nowrap py-1 pr-3">
                       <span className="flex flex-wrap gap-3">
-                        {ROLE_OPTIONS.map((option) => (
+                        {ASSIGNABLE_ROLE_OPTIONS.map((option) => (
                           <label key={option.value} className="flex items-center gap-1">
                             <input
                               type="radio"

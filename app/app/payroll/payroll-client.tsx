@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useTransition, type FormEvent } from "react";
+import { useEffect, useRef, useState, useTransition, type FormEvent, type ReactNode } from "react";
 import { toast } from "sonner";
 import {
   calculatePayrollAction,
@@ -8,31 +8,44 @@ import {
   correctPayrollPeriodAction,
   deletePayrollPeriodAction,
   getPayrollPeriodCorrectionAction,
+  getPayrollSettlementSourcesAction,
   getPeriodDetailAction,
   listPayrollExtrasAction,
   listPayrollMonthRowsAction,
   listPeriodsAction,
+  listVouchersAction,
   openPayrollPeriodAction,
   payPayrollExtraAction,
   payPayrollItemAction,
 } from "@/src/features/payroll/actions";
+import { getInvoiceAction } from "@/src/features/billing/actions";
 import type {
   PayrollExtraRow,
   PayrollPeriodCorrectionResult,
   PayrollPeriodRow,
   PayrollPeriodSummary,
+  PayrollSettlementSources,
+  PayrollSettlementVoucher,
   PeriodDetail,
+  VoucherRequestRow,
 } from "@/src/features/payroll/service";
+import type { InvoiceDetail } from "@/src/features/billing/service";
 import {
+  ADJUSTMENT_REASON_MAX_LENGTH,
   buildPayrollEmployeeIndex,
   detailLineCommissionOrigin,
   groupPayrollPeriodsByMonth,
-  nextPeriodStartDate,
+  isPayrollCycleSettled,
+  isRangeBeforePayrollStart,
   payrollEmployeeName,
   payrollExtraGuide,
   payrollExtraKindSchema,
   payrollMonthLabel,
   payrollPeriodCountLabel,
+  pendingPayrollSettlements,
+  periodCadenceBucket,
+  periodRangeDays,
+  resolveOpenPayrollRange,
   roundMoney,
   splitCommissionByOrigin,
   sumMoney,
@@ -42,6 +55,7 @@ import {
   type PayrollItemTotals,
   type PayrollMonthEmployeeRow,
   type PayrollMonthGroup,
+  type PendingPayrollSettlement,
 } from "@/src/features/payroll/schemas";
 import type { EmployeeRow, PaymentMethodRow } from "@/src/features/admin/service";
 import {
@@ -66,6 +80,7 @@ import {
   tableRowClass,
 } from "@/src/shared/lib/ui-styles";
 import type { ActionResult } from "@/src/shared/lib/api-response";
+import { bogotaDay } from "@/src/shared/lib/dates";
 import { toNumber } from "@/src/shared/lib/format";
 import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 
@@ -210,13 +225,46 @@ function formatFullDate(value: string): string {
   return `${date.day} ${MONTHS_SHORT[date.month - 1]} ${date.year}`;
 }
 
-/** Primer periodo cuyo rango se solapa con [start, end] (fechas ISO comparables como texto). */
+/**
+ * F9: texto de un ciclo pendiente en el aviso. Nombra la cadencia, el rango del
+ * ciclo y a quién le toca; cuando la cadencia tiene más gente que nombres,
+ * resume el resto con el conteo (que siempre dice el total).
+ */
+function pendingSettlementText(entry: PendingPayrollSettlement): string {
+  const employees =
+    entry.employeeCount === 1
+      ? "1 empleado con esa cadencia"
+      : `${entry.employeeCount} empleados con esa cadencia`;
+  const extra = entry.employeeCount - entry.employeeNames.length;
+  const who =
+    extra > 0
+      ? `${entry.employeeNames.join(", ")} y ${extra} más`
+      : entry.employeeNames.join(", ");
+  return `Falta liquidar el ciclo ${entry.frequency} ${entry.label} (${employees}: ${who}).`;
+}
+
+/**
+ * F4: primer período que COLISIONA con [start, end]: comparte días y cae en el
+ * MISMO cubo de cadencia (`coalesce(frequency, '')`, el de la restricción de
+ * 063). Es la MISMA regla que aplican el servicio y la base: un semanal y un
+ * mensual pueden superponerse; dos del mismo ciclo —o los dos sin cadencia— no.
+ * El servidor sigue siendo la autoridad; esto es el aviso en vivo del diálogo.
+ */
 function findOverlappingPeriod(
   rows: PayrollPeriodRow[],
   start: string,
   end: string,
+  frequency: string | null,
 ): PayrollPeriodRow | null {
-  return rows.find((row) => start <= row.end_date && end >= row.start_date) ?? null;
+  const bucket = periodCadenceBucket(frequency);
+  return (
+    rows.find(
+      (row) =>
+        periodCadenceBucket(row.frequency) === bucket &&
+        start <= row.end_date &&
+        end >= row.start_date,
+    ) ?? null
+  );
 }
 
 /** Días de un rango inclusivo (mismo criterio que la prorata del servidor). */
@@ -267,6 +315,12 @@ interface PayrollClientProps {
   initialEmployees: EmployeeRow[];
   initialPeriods: PayrollPeriodRow[];
   /**
+   * F10: la fecha desde la que la nómina OPERA en la sede (`null` = todavía no
+   * configurada). La lee el servidor y llega como valor inicial, igual que los
+   * períodos y los totales: es configuración de la sede y sólo el admin la usa.
+   */
+  initialPayrollStartDate: string | null;
+  /**
    * PA3: totales por período (neto, pagado, saldo y cuántos empleados liquidó).
    * Agregan plata de TODA la planta, así que llegan vacíos para el empleado.
    */
@@ -283,10 +337,11 @@ interface PeriodDetailTableProps {
   employeeName: (id: string) => string;
   payLabel: (id: string) => string;
   onView: (item: DetailItem) => void;
+  onViewSources: (item: DetailItem) => void;
 }
 
 /** Tabla del detalle del periodo (solo presentación). */
-function PeriodDetailTable({ items, employeeName, payLabel, onView }: PeriodDetailTableProps) {
+function PeriodDetailTable({ items, employeeName, payLabel, onView, onViewSources }: PeriodDetailTableProps) {
   return (
     <div className="mt-4 overflow-x-auto">
       <table className={cn("w-full text-left text-sm", "min-w-[1040px]")}>
@@ -312,6 +367,9 @@ function PeriodDetailTable({ items, employeeName, payLabel, onView }: PeriodDeta
             </th>
             <th className={tableCellClass} scope="col">
               Otros (descuento)
+            </th>
+            <th className={tableCellClass} scope="col">
+              Motivo del ajuste
             </th>
             <th className={tableCellClass} scope="col">
               Neto
@@ -346,23 +404,53 @@ function PeriodDetailTable({ items, employeeName, payLabel, onView }: PeriodDeta
                 <td className={tableCellClass}>{formatMoney(commission.fixed)}</td>
                 <td className={tableCellClass}>{formatMoney(commission.percent)}</td>
                 <td className={tableCellClass}>{formatMoney(item.bonuses)}</td>
-                {/* El signo es solo presentación: el vale se guarda positivo. */}
+                {/*
+                  Regla del dueño (2026-10-01): «vales es solo vales y punto».
+                  La celda muestra ÚNICAMENTE el total REAL de vales del período
+                  (`voucher_total`) con el signo de descuento. Antes imprimía
+                  además `aplicado` y `deuda pendiente`; el aplicado igualaba la
+                  comisión en el caso del dueño y la columna terminaba nombrando
+                  la comisión bajo otra etiqueta. Esa conciliación vive en el
+                  modal «Ver facturas y vales», que es donde se lee el desglose.
+                  El signo es solo presentación: el vale se guarda positivo.
+                */}
                 <td className={tableCellClass} title={voucherCellTitle(item)}>
-                  {`-${formatMoney(item.deductions_vales)}`}
+                  <span className="block">{`-${formatMoney(item.voucher_total)}`}</span>
                 </td>
                 <td className={tableCellClass}>{`-${formatMoney(item.other_discounts)}`}</td>
+                {/*
+                  F8: la respuesta a «¿por qué este empleado tiene este ajuste?».
+                  El motivo se guarda en el ítem (misma fila y misma
+                  transacción que el monto) y acá se muestra tal cual: una
+                  liquidación cerrada tiene que poder explicarse sola.
+                */}
+                <td className={tableCellClass}>{item.adjustment_reason ?? "—"}</td>
                 <td className={cn(tableCellClass, "font-semibold")}>{formatMoney(item.net_pay)}</td>
                 <td className={tableCellClass}>{formatMoney(item.paid)}</td>
                 <td className={tableCellClass}>{formatMoney(item.remaining)}</td>
                 <td className={tableCellClass}>
-                  <button
-                    type="button"
-                    onClick={() => onView(item)}
-                    aria-label={`Ver el desglose de ${employeeName(item.employee_id)}`}
-                    className={ghostClass}
-                  >
-                    Ver
-                  </button>
+                  <span className="inline-flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => onView(item)}
+                      aria-label={`Ver el desglose de ${employeeName(item.employee_id)}`}
+                      className={ghostClass}
+                    >
+                      Ver
+                    </button>
+                    {/*
+                      F6: abre el modal con las facturas y los vales que
+                      componen ESTA liquidación, con el detalle de cada uno.
+                    */}
+                    <button
+                      type="button"
+                      onClick={() => onViewSources(item)}
+                      aria-label={`Ver facturas y vales de ${employeeName(item.employee_id)}`}
+                      className={ghostClass}
+                    >
+                      Ver facturas y vales
+                    </button>
+                  </span>
                 </td>
               </tr>
             );
@@ -443,7 +531,8 @@ function CorrectionComparison({
   );
 }
 
-type AdjustmentField = "bonuses" | "others";
+type AdjustmentMoneyField = "bonuses" | "others";
+type AdjustmentField = AdjustmentMoneyField | "reason";
 
 interface DraftRow {
   employeeId: string;
@@ -454,9 +543,11 @@ interface DraftPayrollTableProps {
   rows: DraftRow[];
   employeeName: (id: string) => string;
   payLabel: (id: string) => string;
-  adjustmentValue: (employeeId: string, field: AdjustmentField) => string;
+  adjustmentValue: (employeeId: string, field: AdjustmentMoneyField) => string;
+  adjustmentReasonValue: (employeeId: string) => string;
   onAdjustmentChange: (employeeId: string, field: AdjustmentField, value: string) => void;
   onView: (item: DetailItem) => void;
+  onViewSources: (item: DetailItem) => void;
 }
 
 /**
@@ -470,8 +561,10 @@ function DraftPayrollTable({
   employeeName,
   payLabel,
   adjustmentValue,
+  adjustmentReasonValue,
   onAdjustmentChange,
   onView,
+  onViewSources,
 }: DraftPayrollTableProps) {
   return (
     <div className="mt-4 overflow-x-auto">
@@ -500,6 +593,9 @@ function DraftPayrollTable({
               Otros (descuento)
             </th>
             <th className={tableCellClass} scope="col">
+              Motivo del ajuste
+            </th>
+            <th className={tableCellClass} scope="col">
               Neto
             </th>
             <th className={tableCellClass} scope="col">
@@ -516,6 +612,21 @@ function DraftPayrollTable({
         <tbody>
           {rows.map((row) => {
             const item = row.item;
+            // F8: el motivo es obligatorio en cuanto la fila tiene un bono o un
+            // descuento distinto de 0. Se DERIVA del valor que se está
+            // editando, no de lo ya persistido, así el campo acompaña el
+            // número que el admin acaba de escribir.
+            const reasonRequired =
+              (toNumber(adjustmentValue(row.employeeId, "bonuses")) ?? 0) !== 0 ||
+              (toNumber(adjustmentValue(row.employeeId, "others")) ?? 0) !== 0;
+            const reasonValue = adjustmentReasonValue(row.employeeId);
+            // F8 (visibilidad): el aviso del motivo faltante vive DENTRO del
+            // diálogo, en la MISMA celda del motivo. El error de la página queda
+            // detrás del modal abierto —el admin no lo ve y cree que el botón no
+            // responde—, así que el aviso va donde está escribiendo. Se deriva
+            // del valor que se está editando: aparece con el monto y desaparece
+            // apenas el motivo existe.
+            const reasonMissing = reasonRequired && reasonValue.trim() === "";
             // Reclasificación sin mover el total: fija = comisiones − porcentaje.
             const commission = item
               ? splitCommissionByOrigin({ commissions: item.commissions, detail: item.detail_json })
@@ -542,9 +653,20 @@ function DraftPayrollTable({
                     className={tableInputClass}
                   />
                 </td>
-                {/* El signo es solo presentación: el vale se guarda positivo. */}
+                {/*
+                  Regla del dueño (2026-10-01): mismo criterio que la tabla
+                  cerrada —la celda muestra SOLO el total REAL de vales
+                  (`voucher_total`), sin líneas secundarias—. La conciliación del
+                  monto aplicado y de la deuda vive en el modal «Ver facturas y
+                  vales». El signo es solo presentación: el vale se guarda
+                  positivo.
+                */}
                 <td className={tableCellClass} title={item ? voucherCellTitle(item) : undefined}>
-                  {item ? `-${formatMoney(item.deductions_vales)}` : "—"}
+                  {item ? (
+                    <span className="block">{`-${formatMoney(item.voucher_total)}`}</span>
+                  ) : (
+                    "—"
+                  )}
                 </td>
                 <td className={tableCellClass}>
                   {/* El signo es solo presentación: el descuento se guarda positivo. */}
@@ -559,6 +681,33 @@ function DraftPayrollTable({
                     />
                   </span>
                 </td>
+                {/*
+                  F8: el motivo viaja con el monto. Es un campo de texto sin
+                  máscara de dinero; `aria-required` y el marcador «Motivo
+                  (obligatorio)» lo anuncian cuando la fila lleva ajuste. La
+                  guarda de verdad vive en el servicio; la comprobación de la
+                  pantalla nombra al empleado y, ahora, avisa INLINE junto al
+                  campo (texto plano, nunca un `Alert` ni un `role=` a mano).
+                */}
+                <td className={tableCellClass}>
+                  <input
+                    type="text"
+                    value={reasonValue}
+                    onChange={(event) => onAdjustmentChange(row.employeeId, "reason", event.target.value)}
+                    maxLength={ADJUSTMENT_REASON_MAX_LENGTH}
+                    aria-label={`Motivo del ajuste de ${employeeName(row.employeeId)}`}
+                    aria-required={reasonRequired}
+                    placeholder={reasonRequired ? "Motivo (obligatorio)" : "—"}
+                    className={tableInputClass}
+                  />
+                  {/* El aviso vive pegado al campo, no en el error de la
+                      página: con el diálogo abierto ese error queda detrás. */}
+                  {reasonMissing && (
+                    <p className="mt-1 text-xs text-error">
+                      {`Falta el motivo del ajuste de ${employeeName(row.employeeId)}.`}
+                    </p>
+                  )}
+                </td>
                 <td className={cn(tableCellClass, "font-semibold")}>
                   {item ? formatMoney(item.net_pay) : "—"}
                 </td>
@@ -566,14 +715,25 @@ function DraftPayrollTable({
                 <td className={tableCellClass}>{item ? formatMoney(item.remaining) : "—"}</td>
                 <td className={tableCellClass}>
                   {item ? (
-                    <button
-                      type="button"
-                      onClick={() => onView(item)}
-                      aria-label={`Ver el desglose de ${employeeName(row.employeeId)}`}
-                      className={ghostClass}
-                    >
-                      Ver
-                    </button>
+                    <span className="inline-flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => onView(item)}
+                        aria-label={`Ver el desglose de ${employeeName(row.employeeId)}`}
+                        className={ghostClass}
+                      >
+                        Ver
+                      </button>
+                      {/* F6: mismo modal de facturas y vales que la tabla cerrada. */}
+                      <button
+                        type="button"
+                        onClick={() => onViewSources(item)}
+                        aria-label={`Ver facturas y vales de ${employeeName(row.employeeId)}`}
+                        className={ghostClass}
+                      >
+                        Ver facturas y vales
+                      </button>
+                    </span>
                   ) : (
                     "—"
                   )}
@@ -583,7 +743,7 @@ function DraftPayrollTable({
           })}
           {rows.length === 0 && (
             <tr className={tableRowClass}>
-              <td className={tableCellClass} colSpan={11}>
+              <td className={tableCellClass} colSpan={12}>
                 No hay empleados activos para liquidar.
               </td>
             </tr>
@@ -766,6 +926,233 @@ function ExpandedItemPanel({
   );
 }
 
+/** Campo de solo lectura del detalle de una factura o un vale. */
+function SourceDetailField({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <dt className="text-xs uppercase tracking-wide text-text-tertiary">{label}</dt>
+      <dd className="break-words text-sm text-text-primary">{children}</dd>
+    </div>
+  );
+}
+
+interface SettlementSourcesPanelProps {
+  sources: PayrollSettlementSources | null;
+  /**
+   * F6/regla del dueño (2026-10-01): el ítem de nómina del empleado.
+   *
+   * Es la fuente del monto APLICADO (`deductions_vales`, lo que el neto
+   * descuenta de verdad) y de la deuda PENDIENTE (`pending_debt`) que la
+   * columna de vales ya no imprime. Vive acá y no en la lectura de fuentes
+   * porque el detalle del período ya lo trae leído: no se duplica consulta.
+   */
+  item: DetailItem | null;
+  busy: boolean;
+  invoiceTargetId: string | null;
+  invoiceDetail: InvoiceDetail | null;
+  invoiceBusy: boolean;
+  voucherTargetId: string | null;
+  voucherDetail: VoucherRequestRow | null;
+  voucherBusy: boolean;
+  employeeName: (id: string) => string;
+  onViewInvoice: (invoiceId: string) => void;
+  onViewVoucher: (voucher: PayrollSettlementVoucher) => void;
+}
+
+/**
+ * F6: contenido del modal "Ver facturas y vales": las dos listas del empleado
+ * (facturas y vales) y el detalle de la fila elegida, en un panel EN LÍNEA (no
+ * otro diálogo). El detalle de la factura sale de la lectura EXISTENTE de
+ * facturación (`getInvoiceAction`) y el del vale de la lectura existente de
+ * vales (`listVouchersAction`): acá no se duplica ninguna consulta.
+ *
+ * El ajuste del mixto (`ajuste_mixto`) NO es una factura: se muestra aparte, con
+ * su monto y su explicación, para que el lector no lo confunda con un
+ * consecutivo. Los vacíos describen lo esperado ("no tiene facturas/vales") y
+ * son texto plano, no un aviso.
+ *
+ * Regla del dueño (2026-10-01): «vales es solo vales y punto». La columna de
+ * vales de las dos tablas muestra solo el total; la conciliación —cuánto
+ * descontó el neto y cuánta deuda quedó— se lee acá, junto a los vales que la
+ * componen, y solo cuando cada cifra aplica.
+ */
+function SettlementSourcesPanel({
+  sources,
+  item,
+  busy,
+  invoiceTargetId,
+  invoiceDetail,
+  invoiceBusy,
+  voucherTargetId,
+  voucherDetail,
+  voucherBusy,
+  employeeName,
+  onViewInvoice,
+  onViewVoucher,
+}: SettlementSourcesPanelProps) {
+  return (
+    <div className="mt-3 flex flex-col gap-5">
+      {busy && !sources ? (
+        <p className="text-sm text-text-tertiary">Leyendo facturas y vales…</p>
+      ) : null}
+
+      {sources?.adjustment ? (
+        <section className="rounded-md border border-border-color p-3 dark:border-border-color-2">
+          <h3 className="text-sm font-semibold text-text-primary">Ajuste del mixto</h3>
+          <p className="mt-1 text-sm text-text-secondary">
+            {`El básico absorbió ${formatMoney(-sources.adjustment.commission)} de los porcentajes de servicios: ese porcentaje no se suma aparte. Se muestra en negativo para que la suma del detalle cuadre con las comisiones.`}
+          </p>
+          <p className="mt-1 text-sm font-semibold text-text-primary">
+            {formatMoney(sources.adjustment.commission)}
+          </p>
+        </section>
+      ) : null}
+
+      <section>
+        <h3 className="text-sm font-semibold text-text-primary">Facturas de la liquidación</h3>
+        {sources && sources.invoices.length === 0 ? (
+          <p className="mt-1 text-sm text-text-tertiary">
+            La liquidación no tiene facturas: no hubo comisiones por factura en este período.
+          </p>
+        ) : null}
+        <ul className="mt-2 flex flex-col gap-2">
+          {(sources?.invoices ?? []).map((invoice) => (
+            <li
+              key={invoice.invoice_id}
+              className="rounded border border-border-color p-2 dark:border-border-color-2"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-sm text-text-primary">
+                  {`Factura #${invoice.consecutive_number ?? "sin consecutivo"}`}
+                </span>
+                <span className="text-sm text-text-secondary">
+                  {`Comisión de la liquidación: ${formatMoney(invoice.commission)}`}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => onViewInvoice(invoice.invoice_id)}
+                  aria-label={`Ver el detalle de la factura ${invoice.consecutive_number ?? "sin consecutivo"}`}
+                  className={ghostClass}
+                >
+                  Ver detalle
+                </button>
+              </div>
+              {invoiceTargetId === invoice.invoice_id ? (
+                <div className="mt-2 rounded bg-surface-hover p-2">
+                  {invoiceBusy ? (
+                    <p className="text-xs text-text-tertiary">Leyendo la factura…</p>
+                  ) : invoiceDetail ? (
+                    <>
+                      <dl className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                        <SourceDetailField label="Consecutivo">
+                          {invoiceDetail.invoice.consecutive_number}
+                        </SourceDetailField>
+                        <SourceDetailField label="Estado">{invoiceDetail.invoice.status}</SourceDetailField>
+                        <SourceDetailField label="Cliente">
+                          {invoiceDetail.invoice.client_name ?? "—"}
+                        </SourceDetailField>
+                        <SourceDetailField label="Fecha">
+                          {new Date(invoiceDetail.invoice.created_at).toLocaleString("es-CO")}
+                        </SourceDetailField>
+                        <SourceDetailField label="Total">
+                          {formatMoney(invoiceDetail.invoice.total)}
+                        </SourceDetailField>
+                        <SourceDetailField label="Pagado">{formatMoney(invoiceDetail.paid)}</SourceDetailField>
+                        <SourceDetailField label="Saldo">{formatMoney(invoiceDetail.remaining)}</SourceDetailField>
+                      </dl>
+                      <ul className="mt-2 flex flex-col gap-1 text-xs text-text-secondary">
+                        {invoiceDetail.items.map((item) => (
+                          <li key={item.id}>
+                            {`${item.custom_name ?? detailLineLabel(item.item_type)} × ${item.qty} = ${formatMoney(item.subtotal)}`}
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  ) : (
+                    <p className="text-xs text-text-tertiary">No se pudo abrir la factura.</p>
+                  )}
+                </div>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <section>
+        <h3 className="text-sm font-semibold text-text-primary">Vales de la liquidación</h3>
+        {sources && sources.vouchers.length === 0 ? (
+          <p className="mt-1 text-sm text-text-tertiary">
+            La liquidación no tiene vales: no hubo vales descontados en este período.
+          </p>
+        ) : null}
+        <ul className="mt-2 flex flex-col gap-2">
+          {(sources?.vouchers ?? []).map((voucher) => (
+            <li key={voucher.id} className="rounded border border-border-color p-2 dark:border-border-color-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-sm text-text-primary">{formatFullDate(voucher.request_date)}</span>
+                <span className="text-sm text-text-secondary">{formatMoney(voucher.amount)}</span>
+                <span className="text-sm text-text-secondary">{voucher.status}</span>
+                <button
+                  type="button"
+                  onClick={() => onViewVoucher(voucher)}
+                  aria-label={`Ver el detalle del vale del ${voucher.request_date}`}
+                  className={ghostClass}
+                >
+                  Ver detalle
+                </button>
+              </div>
+              {voucherTargetId === voucher.id ? (
+                <div className="mt-2 rounded bg-surface-hover p-2">
+                  {voucherBusy ? (
+                    <p className="text-xs text-text-tertiary">Leyendo el vale…</p>
+                  ) : voucherDetail ? (
+                    <dl className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      <SourceDetailField label="Empleado">
+                        {employeeName(voucherDetail.employee_id)}
+                      </SourceDetailField>
+                      <SourceDetailField label="Monto">{formatMoney(voucherDetail.amount)}</SourceDetailField>
+                      <SourceDetailField label="Fecha de solicitud">
+                        {voucherDetail.request_date}
+                      </SourceDetailField>
+                      <SourceDetailField label="Estado">{voucherDetail.status}</SourceDetailField>
+                      <SourceDetailField label="Método de pago">
+                        {voucherDetail.method_code ?? "—"}
+                      </SourceDetailField>
+                      <SourceDetailField label="Creado por">
+                        {voucherDetail.created_by_name ?? "—"}
+                      </SourceDetailField>
+                      {voucherDetail.approved_by_name ? (
+                        <SourceDetailField label="Aprobado por">
+                          {voucherDetail.approved_by_name}
+                        </SourceDetailField>
+                      ) : null}
+                      <SourceDetailField label="Observación">
+                        {voucherDetail.observation ?? "-"}
+                      </SourceDetailField>
+                    </dl>
+                  ) : (
+                    <p className="text-xs text-text-tertiary">No se pudo abrir el vale.</p>
+                  )}
+                </div>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+        {item && item.deductions_vales < item.voucher_total ? (
+          <p className="mt-2 text-sm text-text-secondary">
+            {`Del total de vales, el neto de este período descuenta ${formatMoney(item.deductions_vales)}: el tope de descuentos no aplicó el resto.`}
+          </p>
+        ) : null}
+        {item && item.pending_debt > 0 ? (
+          <p className="mt-1 text-sm text-text-secondary">
+            {`Queda una deuda de ${formatMoney(item.pending_debt)} originada en este período: es el sobrante de vales que el tope no alcanzó a descontar.`}
+          </p>
+        ) : null}
+      </section>
+    </div>
+  );
+}
+
 export function PayrollClient(props: PayrollClientProps) {
   const [periods, setPeriods] = useState<PayrollPeriodRow[]>(props.initialPeriods);
   const [selectedId, setSelectedId] = useState<string | null>(props.initialPeriods[0]?.id ?? null);
@@ -797,10 +1184,19 @@ export function PayrollClient(props: PayrollClientProps) {
   // (éxito) es EVENTO y sale por `toast`, no por estado.
   const [error, setError] = useState<string | null>(null);
 
-  // Periodo: abrir (el rango se pide en el modal, no en la vista principal).
-  const [startDate, setStartDate] = useState("");
-  const [endDate, setEndDate] = useState("");
+  // F10: la fecha desde la que la nómina OPERA en la sede. Es ESTADO de la sede
+  // —no configuración local— porque el servidor es su única fuente: llega
+  // leída de la página (SSR). `null` = todavía no configurada, que conserva el
+  // comportamiento de hoy. G3b: la ESCRITURA salió de esta pantalla —la
+  // configura solo la plataforma—; acá queda la LECTURA que el aviso y el
+  // diálogo necesitan.
+  const [payrollStartDate] = useState<string | null>(props.initialPayrollStartDate);
+
+  // F10: abrir un período NO se pregunta. La única entrada al diálogo es el
+  // aviso de ciclos pendientes: su ciclo queda ELEGIDO y el rango se DERIVA de
+  // la fecha de arranque de la sede. `openTarget` es ese ciclo pendiente.
   const [openDialogOpen, setOpenDialogOpen] = useState(false);
+  const [openTarget, setOpenTarget] = useState<PendingPayrollSettlement | null>(null);
   const [openError, setOpenError] = useState<string | null>(null);
   // Pagos: porciones por ítem (método y monto como campos separados en tabla).
   const [portions, setPortions] = useState<Record<string, PortionDraft[]>>({});
@@ -883,6 +1279,24 @@ export function PayrollClient(props: PayrollClientProps) {
   const [correctionError, setCorrectionError] = useState<string | null>(null);
   const [correctionBusy, setCorrectionBusy] = useState(false);
 
+  /**
+   * F6: las fuentes de la liquidación (facturas, ajuste del mixto y vales) del
+   * empleado cuyo modal está abierto. `sourcesTarget` guarda a QUIÉN y de QUÉ
+   * período pertenece, para que el modal no pueda mostrar las fuentes de otro
+   * empleado si el usuario cambia de período mientras carga.
+   */
+  const [sourcesTarget, setSourcesTarget] = useState<{ periodId: string; employeeId: string } | null>(null);
+  const [sources, setSources] = useState<PayrollSettlementSources | null>(null);
+  const [sourcesBusy, setSourcesBusy] = useState(false);
+  /** F6: detalle de la factura abierta con la lectura existente de facturación. */
+  const [invoiceTargetId, setInvoiceTargetId] = useState<string | null>(null);
+  const [invoiceDetail, setInvoiceDetail] = useState<InvoiceDetail | null>(null);
+  const [invoiceBusy, setInvoiceBusy] = useState(false);
+  /** F6: detalle del vale abierto con la lectura existente de vales. */
+  const [voucherTargetId, setVoucherTargetId] = useState<string | null>(null);
+  const [voucherDetail, setVoucherDetail] = useState<VoucherRequestRow | null>(null);
+  const [voucherBusy, setVoucherBusy] = useState(false);
+
   // Los pagos extraordinarios no llegan por props (la página los arma para los
   // períodos): se leen al montar. Sólo el admin tiene la superficie, así que el
   // efecto no dispara para el empleado.
@@ -938,12 +1352,23 @@ export function PayrollClient(props: PayrollClientProps) {
    * tocó, el monto ya calculado del ítem (así la tabla "viene" con lo
    * calculado y recalcular no borra los ajustes previos).
    */
-  function adjustmentValue(employeeId: string, field: AdjustmentField): string {
+  function adjustmentValue(employeeId: string, field: AdjustmentMoneyField): string {
     const edited = adjustments[employeeId]?.[field];
     if (edited !== undefined) return edited;
     const item = itemByEmployee.get(employeeId);
     if (!item) return "";
     return String(field === "bonuses" ? item.bonuses : item.other_discounts);
+  }
+
+  /**
+   * F8: motivo vigente de un ajuste. Igual que los montos, si el admin todavía
+   * no lo tocó se muestra el motivo ya persistido del ítem (así recalcular no
+   * borra el escrito antes).
+   */
+  function adjustmentReasonValue(employeeId: string): string {
+    const edited = adjustments[employeeId]?.reason;
+    if (edited !== undefined) return edited;
+    return itemByEmployee.get(employeeId)?.adjustment_reason ?? "";
   }
 
   function updateAdjustment(employeeId: string, field: AdjustmentField, value: string) {
@@ -986,6 +1411,8 @@ export function PayrollClient(props: PayrollClientProps) {
     setDetailDialogOpen(false);
     setCorrection(null);
     closeCorrectionDialog();
+    // F6: cerrar la liquidación cierra también su modal de facturas y vales.
+    closeSettlementSources();
   }
 
   /**
@@ -1014,8 +1441,34 @@ export function PayrollClient(props: PayrollClientProps) {
     });
   }
 
+  /**
+   * F10: abre el diálogo en el ciclo pendiente MÁS ATRASADO. La lista de
+   * pendientes ya viene ordenada así (lo más vencido primero), y si está vacía
+   * el diálogo lo dice: no hay rango que elegir ni período que abrir.
+   */
+  function openPeriodDialog() {
+    setOpenError(null);
+    setOpenTarget(pendingSettlements[0] ?? null);
+    setOpenDialogOpen(true);
+  }
+
+  /**
+   * F9/F10: abre el diálogo ya POSICIONADO en el ciclo que el aviso acaba de
+   * nombrar. Es la única entrada: el ciclo queda elegido y su rango se deriva
+   * (completo, o el primero recortado a la fecha de arranque de la sede).
+   */
+  function openPendingSettlement(entry: PendingPayrollSettlement) {
+    setOpenError(null);
+    setOpenTarget(entry);
+    setOpenDialogOpen(true);
+  }
+
   async function handleOpen(event: FormEvent) {
     event.preventDefault();
+    if (openTarget === null) {
+      setOpenError("No hay ciclos cerrados sin liquidar: no hay período que abrir.");
+      return;
+    }
     if (!startDate || !endDate) {
       setOpenError("Indique el rango del período.");
       return;
@@ -1024,27 +1477,45 @@ export function PayrollClient(props: PayrollClientProps) {
       setOpenError("La fecha final no puede ser anterior a la inicial.");
       return;
     }
-    // Mismo piso que el `min` del campo, pero dicho con la fecha válida: si el
-    // usuario la escribe a mano, el aviso nombra el día a partir del cual sí.
-    const minimumStart = nextPeriodStartDate(periods);
-    if (minimumStart !== null && startDate < minimumStart) {
+    // F10: la guarda de apertura repite las DOS verdades del servidor sobre el
+    // ciclo elegido, con las MISMAS funciones puras que el aviso y el servicio:
+    // no se abre un ciclo ANTERIOR al arranque de la nómina
+    // (`isRangeBeforePayrollStart`, la regla única de la fecha) y no se abre uno
+    // que YA tiene su liquidación (`isPayrollCycleSettled`). El rango del primer
+    // ciclo —recortado a la fecha— sale de `resolveOpenPayrollRange`, el mismo
+    // validador que el servicio aplica antes del INSERT; la autoridad final
+    // sigue siendo el servidor, que decide sobre lo que el cliente no ve.
+    if (isRangeBeforePayrollStart({ payrollStartDate, startDate, endDate })) {
       setOpenError(
-        `El período no puede empezar antes del ${formatFullDate(minimumStart)}: ese es el día siguiente al fin del último período registrado.`,
+        `El período no puede empezar antes del ${payrollStartDate}: la nómina de esta sede arranca ese día y nada anterior existe para el sistema.`,
       );
       return;
     }
-    const collision = findOverlappingPeriod(periods, startDate, endDate);
+    const collision = findOverlappingPeriod(periods, startDate, endDate, openTarget.frequency);
     if (collision) {
       setOpenError(
-        `El rango se solapa con ${formatPeriodLabel(collision)} (${collision.status}). Ajuste las fechas.`,
+        `El rango se solapa con ${formatPeriodLabel(collision)} (${collision.status}). Ajuste las fechas o la cadencia.`,
+      );
+      return;
+    }
+    const settledCycle = isPayrollCycleSettled({
+      periods,
+      frequency: openTarget.frequency,
+      cycle: { start_date: startDate, end_date: endDate },
+    });
+    if (settledCycle) {
+      setOpenError(
+        "Este ciclo ya tiene su liquidación para la cadencia elegida (o lo cubre un período heredado sin cadencia, que pagó a todo el plantel). Elija otro ciclo.",
       );
       return;
     }
     setOpenError(null);
     setBusy(true);
+    // F10: el cuerpo lleva la CADENCIA del ciclo pendiente y su CIERRE. No hay
+    // fechas en el envío: el rango (y su recorte) lo deriva el servidor.
     const result = (await openPayrollPeriodAction({
-      start_date: startDate,
-      end_date: endDate,
+      frequency: openTarget.frequency,
+      cycle_end_date: openTarget.end_date,
     })) as ActionResult<PayrollPeriodRow>;
     if (!result.success) {
       setBusy(false);
@@ -1052,8 +1523,7 @@ export function PayrollClient(props: PayrollClientProps) {
       return;
     }
     const created = result.data;
-    setStartDate("");
-    setEndDate("");
+    setOpenTarget(null);
     setOpenDialogOpen(false);
     await refreshPeriods(created.id);
 
@@ -1087,8 +1557,7 @@ export function PayrollClient(props: PayrollClientProps) {
 
   // Cerrar el modal de apertura siempre limpia su estado (mismo criterio que closeDetail).
   function closeOpenDialog() {
-    setStartDate("");
-    setEndDate("");
+    setOpenTarget(null);
     setOpenError(null);
     setOpenDialogOpen(false);
   }
@@ -1100,11 +1569,34 @@ export function PayrollClient(props: PayrollClientProps) {
    */
   async function handleRecalculate() {
     if (!selectedId) return;
-    const list = draftRows.map((row) => ({
-      employee_id: row.employeeId,
-      bonuses: toNumber(adjustmentValue(row.employeeId, "bonuses")) ?? 0,
-      other_discounts: toNumber(adjustmentValue(row.employeeId, "others")) ?? 0,
-    }));
+    // F8: el motivo es obligatorio cuando la fila lleva un bono o un descuento.
+    // Se rechaza acá con el canal de error que el módulo ya usa (el Alert de la
+    // página), nombrando al empleado, para que el admin no mande un envío que el
+    // servicio va a rechazar igual. La guarda de verdad es la del servicio: esto
+    // es sólo la respuesta inmediata en pantalla.
+    const missingReason = draftRows.find((row) => {
+      const hasAdjustment =
+        (toNumber(adjustmentValue(row.employeeId, "bonuses")) ?? 0) !== 0 ||
+        (toNumber(adjustmentValue(row.employeeId, "others")) ?? 0) !== 0;
+      return hasAdjustment && adjustmentReasonValue(row.employeeId).trim() === "";
+    });
+    if (missingReason) {
+      setError(
+        `Falta el motivo del ajuste de ${employeeName(missingReason.employeeId)}: escriba por qué se carga el bono o el descuento.`,
+      );
+      return;
+    }
+    const list = draftRows.map((row) => {
+      const reason = adjustmentReasonValue(row.employeeId).trim();
+      return {
+        employee_id: row.employeeId,
+        bonuses: toNumber(adjustmentValue(row.employeeId, "bonuses")) ?? 0,
+        other_discounts: toNumber(adjustmentValue(row.employeeId, "others")) ?? 0,
+        // Un motivo sin ajuste se envía como null: el servicio lo descarta y la
+        // columna queda NULL («sin ajuste manual»), nunca un motivo suelto.
+        adjustment_reason: reason === "" ? null : reason,
+      };
+    });
     setBusy(true);
     const result = (await calculatePayrollAction(selectedId, {
       adjustments: list,
@@ -1183,6 +1675,69 @@ export function PayrollClient(props: PayrollClientProps) {
     if (itemPortions(item.id).length > 0) return;
     const row = createPortion(item, []);
     setPortions((prev) => (prev[item.id]?.length ? prev : { ...prev, [item.id]: [row] }));
+  }
+
+  /**
+   * F6: abre el modal "Ver facturas y vales" de la liquidación de un empleado.
+   * El empleado logueado solo puede abrir la suya (el alcance por fila lo aplica
+   * la action, igual que el detalle del período).
+   */
+  async function openSettlementSources(periodId: string, employeeId: string) {
+    setSourcesTarget({ periodId, employeeId });
+    setSources(null);
+    setSourcesBusy(true);
+    // El detalle de una fila anterior no sobrevive al cambio de empleado.
+    setInvoiceTargetId(null);
+    setInvoiceDetail(null);
+    setVoucherTargetId(null);
+    setVoucherDetail(null);
+    const result = (await getPayrollSettlementSourcesAction(
+      periodId,
+      employeeId,
+    )) as ActionResult<PayrollSettlementSources>;
+    setSourcesBusy(false);
+    if (show(result)) setSources(result.data);
+  }
+
+  function closeSettlementSources() {
+    setSourcesTarget(null);
+    setSources(null);
+    setSourcesBusy(false);
+    setInvoiceTargetId(null);
+    setInvoiceDetail(null);
+    setVoucherTargetId(null);
+    setVoucherDetail(null);
+  }
+
+  /**
+   * F6: detalle de una factura con la lectura EXISTENTE de facturación
+   * (`getInvoiceAction`): no se duplica la consulta ni el alcance por sede.
+   */
+  async function openInvoiceDetail(invoiceId: string) {
+    setInvoiceTargetId(invoiceId);
+    setInvoiceDetail(null);
+    setInvoiceBusy(true);
+    const result = (await getInvoiceAction(invoiceId)) as ActionResult<InvoiceDetail>;
+    setInvoiceBusy(false);
+    if (show(result)) setInvoiceDetail(result.data);
+  }
+
+  /**
+   * F6: detalle de un vale con la lectura EXISTENTE de vales
+   * (`listVouchersAction`): se filtra por el mismo empleado y la MISMA fecha de
+   * solicitud del vale de la liquidación, y se elige la fila por id.
+   */
+  async function openVoucherDetail(voucher: PayrollSettlementVoucher) {
+    setVoucherTargetId(voucher.id);
+    setVoucherDetail(null);
+    setVoucherBusy(true);
+    const result = (await listVouchersAction({
+      employee_id: sourcesTarget?.employeeId,
+      request_date: voucher.request_date,
+      limit: 200,
+    })) as ActionResult<VoucherRequestRow[]>;
+    setVoucherBusy(false);
+    if (show(result)) setVoucherDetail(result.data.find((row) => row.id === voucher.id) ?? null);
   }
 
   async function handlePay(item: DetailItem) {
@@ -1404,14 +1959,47 @@ export function PayrollClient(props: PayrollClientProps) {
     ? detail?.items.find((item) => item.id === detailTargetId) ?? null
     : null;
 
-  // Ayuda para elegir el rango del nuevo periodo, construida solo con `periods`.
-  // El piso es el día siguiente al último fin liquidado (función pura del
-  // esquema): `null` cuando aún no hay períodos, o sea el primero es libre.
-  const suggestedStart = nextPeriodStartDate(periods);
+  // F10: el ciclo pendiente elegido y SU RANGO. El rango no se escribe ni se
+  // elige: sale del ÚNICO validador de la forma del período
+  // (`resolveOpenPayrollRange`), el mismo que el servicio aplica antes del
+  // INSERT —un ciclo COMPLETO de la cadencia, o el PRIMER ciclo recortado a la
+  // fecha de arranque de la sede—. `openResolution` es `null` sólo mientras el
+  // diálogo no eligió nada; `startDate`/`endDate` alimentan la guarda en vivo,
+  // el texto del diálogo y el envío.
+  const openResolution =
+    openTarget === null
+      ? null
+      : resolveOpenPayrollRange({
+          frequency: openTarget.frequency,
+          cycleEndDate: openTarget.end_date,
+          payrollStartDate,
+          periods,
+        });
+  const startDate = openResolution?.ok ? openResolution.start_date : "";
+  const endDate = openResolution?.ok ? openResolution.end_date : "";
+  // F10: el rango derivado, en palabras, y la nota del PRIMER ciclo recortado.
+  // El día del rango se muestra porque un ciclo recortado paga menos que uno
+  // completo (la prorrata de F5), y eso no puede sorprender al admin.
+  const openCycleDays = periodRangeDays(startDate, endDate);
+  const openRangeText =
+    openResolution === null || !openResolution.ok
+      ? null
+      : `Del ${formatFullDate(startDate)} al ${formatFullDate(endDate)}${
+          openCycleDays === null ? "" : ` (${openCycleDays} ${openCycleDays === 1 ? "día" : "días"})`
+        }. Las fechas se calculan solas: no hay campos de fecha.`;
+  const openTrimmedNote =
+    openResolution === null || !openResolution.ok || !openResolution.trimmed
+      ? null
+      : `Primer ciclo recortado: la nómina de esta sede arranca el ${formatFullDate(startDate)} y este ciclo se liquida desde ahí. Su fijo se prorratea por los días del rango (la regla de la primera liquidación).`;
   const draftPeriods = periods.filter((row) => row.status === "borrador");
+  // Guarda defensiva conservada: el rango resuelto siempre termina después de
+  // empezar, así que no puede dispararse; se deja a la vista por si el día de
+  // mañana el rango volviera a tener otra fuente.
   const rangeInvalid = Boolean(startDate && endDate && endDate < startDate);
   const overlap =
-    startDate && endDate && !rangeInvalid ? findOverlappingPeriod(periods, startDate, endDate) : null;
+    startDate && endDate && !rangeInvalid
+      ? findOverlappingPeriod(periods, startDate, endDate, openTarget?.frequency ?? null)
+      : null;
 
   /**
    * Nombre legible del empleado: nombre + ID interno (el código de empleado
@@ -1444,6 +2032,28 @@ export function PayrollClient(props: PayrollClientProps) {
   const visiblePeriods =
     statusFilter === "todos" ? periods : periods.filter((row) => row.status === statusFilter);
   const periodGroups = groupPayrollPeriodsByMonth(visiblePeriods);
+
+  /**
+   * F9: los ciclos ya CERRADOS que sigue sin liquidar la sede, por cadencia (el
+   * atraso que nadie notaba). Sale de los períodos y la planta que la pantalla
+   * YA tiene cargados: no agrega ninguna lectura —un `select` por cadencia serían
+   * N consultas para el mismo dato— y usa la MISMA función pura que el servicio,
+   * así que la lista y el resumen de la sede no pueden discrepar. Sólo el admin:
+   * es información de la nómina de la sede.
+   *
+   * F10: la fecha de arranque de la sede acota el aviso (un ciclo que cierra
+   * antes no existe para el sistema) y, configurada, también reporta el primer
+   * ciclo de una sede que todavía no tiene períodos. Es la MISMA función y la
+   * MISMA cota que el servicio, así que el aviso y el resumen no discrepan.
+   */
+  const pendingSettlements = props.canAdmin
+    ? pendingPayrollSettlements({
+        periods,
+        employees: props.initialEmployees,
+        referenceDate: bogotaDay(),
+        payrollStartDate,
+      })
+    : [];
 
   /**
    * Totales de un mes: SÓLO si TODOS sus períodos tienen resumen. Con uno sin
@@ -1545,6 +2155,60 @@ export function PayrollClient(props: PayrollClientProps) {
 
       <section className={sectionClass}>
         <h2 className="text-lg font-semibold">Períodos</h2>
+        {/*
+          F10/G3b: la fecha desde la que la nómina OPERA en la sede ya no se
+          configura acá. El control salió de esta pantalla: la fecha la fija la
+          plataforma, para cualquier sede, y el admin de la sede solo la lee.
+          Esta pantalla conserva la LECTURA porque el aviso de ciclos pendientes
+          y el diálogo de apertura la necesitan para acotar los ciclos. El
+          detalle de la fecha vive en el aviso de abajo, junto a los pendientes.
+        */}
+        {/*
+          F9: el atraso, a la vista donde el admin aterriza. Un ciclo que ya
+          cerró y no tiene liquidación es plata que la sede debe: mientras el
+          aviso no existía, una sede podía liquidar semanal durante meses y
+          nunca pagarle su ciclo a quien cobra quincenal, sin que nadie lo
+          notara. ESTADO, no evento: sigue ahí hasta que el ciclo se liquide,
+          así que va inline y persistente. `warning` (no `destructive`) porque
+          no es un fallo de la pantalla: es un pendiente que exige acción, y la
+          variante deriva su propio rol, sin escribirlo a mano.
+
+          F10: cada entrada es la ÚNICA puerta al diálogo de apertura (su ciclo
+          queda elegido y el rango se deriva), y cuando la fecha de arranque no
+          está configurada el aviso invita a fijarla: sin fecha, la cota sigue
+          siendo la historia de la sede.
+        */}
+        {props.canAdmin && pendingSettlements.length > 0 && (
+          <Alert variant="warning" className="mt-3">
+            <p>
+              Hay ciclos ya cerrados sin liquidar. Mientras sigan pendientes, los empleados que
+              cobran por esas cadencias no reciben su pago.
+            </p>
+            <ul className="mt-1 flex flex-col gap-1">
+              {pendingSettlements.map((entry) => (
+                <li key={`${entry.frequency}-${entry.end_date}`}>
+                  <button
+                    type="button"
+                    onClick={() => openPendingSettlement(entry)}
+                    className="text-left font-medium text-text-primary underline"
+                  >
+                    {pendingSettlementText(entry)}
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <p className="mt-1">
+              Cada uno abre el diálogo con su ciclo ya elegido y listo para liquidarlo: el rango
+              sale del ciclo y de la fecha de inicio de la nómina.
+            </p>
+            {payrollStartDate === null && (
+              <p className="mt-1">
+                La fecha de inicio de la nómina la configura la plataforma. Mientras no esté
+                fijada, el sistema no tiene una cota desde la cual liquidar.
+              </p>
+            )}
+          </Alert>
+        )}
         {props.canAdmin && (
           <p className="mt-2 text-sm text-text-secondary">
             {/* PA3: el conteo se lee SIEMPRE contra el total (la lista se
@@ -1580,13 +2244,7 @@ export function PayrollClient(props: PayrollClientProps) {
         {props.canAdmin && (
           <button
             type="button"
-            onClick={() => {
-              setOpenError(null);
-              // Prefija el piso (editable): el caso común —abrir el período
-              // que sigue al último liquidado— queda a un clic.
-              setStartDate(nextPeriodStartDate(periods) ?? "");
-              setOpenDialogOpen(true);
-            }}
+            onClick={openPeriodDialog}
             className={`${buttonClass} mt-3`}
           >
             Abrir período
@@ -2075,48 +2733,103 @@ export function PayrollClient(props: PayrollClientProps) {
             <DialogHeader>
               <DialogTitle>Abrir período</DialogTitle>
               <DialogDescription>
-                Elija el rango de fechas. El período se abre en borrador.
+                Elija una liquidación pendiente. No hay fechas que escribir ni cadencia que
+                elegir: el rango sale del ciclo cerrado y de la fecha de inicio de la nómina, y el
+                período se abre en borrador.
               </DialogDescription>
             </DialogHeader>
             <form onSubmit={handleOpen} className="mt-4 flex flex-col gap-4">
-              <div className="flex flex-wrap gap-3">
-                <label className={labelClass} htmlFor="payroll-open-start">
-                  Inicio
-                  <input
-                    id="payroll-open-start"
-                    type="date"
-                    value={startDate}
-                    onChange={(event) => {
-                      setStartDate(event.target.value);
-                      setOpenError(null);
-                    }}
-                    min={suggestedStart ?? undefined}
-                    className={inputClass}
-                    required
-                  />
-                </label>
-                <label className={labelClass} htmlFor="payroll-open-end">
-                  Fin
-                  <input
-                    id="payroll-open-end"
-                    type="date"
-                    value={endDate}
-                    onChange={(event) => {
-                      setEndDate(event.target.value);
-                      setOpenError(null);
-                    }}
-                    className={inputClass}
-                    required
-                  />
-                </label>
-              </div>
+              {pendingSettlements.length === 0 ? (
+                // VACÍO dentro del diálogo: describe lo esperado, no bloquea nada y
+                // nunca anunció nada. Sin ciclos cerrados sin liquidar no hay rango
+                // que elegir —ni período que abrir—, así que el diálogo no ofrece
+                // ninguna opción libre.
+                <p className="text-sm text-text-secondary">
+                  No hay ciclos cerrados sin liquidar en esta sede: no hay período que abrir.
+                  Cuando un ciclo cierre sin su liquidación aparecerá en el aviso de la pantalla, y
+                  desde ahí se abre.
+                </p>
+              ) : (
+                <fieldset className="flex flex-col gap-2">
+                  <legend className={labelClass}>
+                    Ciclo a liquidar
+                    <span className="mt-1 block text-xs font-normal text-text-tertiary">
+                      Son los ciclos ya cerrados que todavía no tienen liquidación, el más atrasado
+                      primero. Al elegir uno quedan derivados su cadencia y su rango.
+                    </span>
+                  </legend>
+                  {pendingSettlements.map((entry) => (
+                    <label
+                      key={`${entry.frequency}-${entry.end_date}`}
+                      className="flex items-start gap-2 rounded-md border border-border-color p-2 text-sm text-text-secondary dark:border-border-color-2"
+                    >
+                      <input
+                        type="radio"
+                        name="payroll-open-target"
+                        value={`${entry.frequency}-${entry.end_date}`}
+                        checked={
+                          openTarget?.frequency === entry.frequency &&
+                          openTarget?.end_date === entry.end_date
+                        }
+                        onChange={() => {
+                          setOpenError(null);
+                          setOpenTarget(entry);
+                        }}
+                        className="mt-1"
+                      />
+                      <span>
+                        <span className="block font-medium text-text-primary">
+                          {`Ciclo ${entry.frequency} ${entry.label}`}
+                        </span>
+                        <span className="mt-1 block text-xs text-text-tertiary">
+                          {entry.employeeCount === 1
+                            ? "1 empleado con esa cadencia"
+                            : `${entry.employeeCount} empleados con esa cadencia`}
+                          {entry.employeeNames.length > 0
+                            ? `: ${entry.employeeNames.join(", ")}`
+                            : ""}
+                        </span>
+                      </span>
+                    </label>
+                  ))}
+                </fieldset>
+              )}
+
+              {openRangeText !== null && (
+                <p className="text-xs text-text-tertiary">{openRangeText}</p>
+              )}
+              {openTrimmedNote !== null && (
+                <p className="text-xs text-text-tertiary">{openTrimmedNote}</p>
+              )}
 
               <div className="rounded-md border border-border-color bg-surface-hover p-3 text-sm text-text-secondary dark:border-border-color-2">
                 <p className="font-medium text-text-primary">Períodos existentes</p>
                 {periods.length === 0 ? (
                   // VACÍO dentro del diálogo: describe lo esperado (el primero
                   // de la lista), no bloquea nada y nunca anunció nada.
-                  <p className="mt-1">Sin períodos todavía: este será el primero.</p>
+                  <>
+                    <p className="mt-1">Sin períodos todavía: este será el primero.</p>
+                    {/* F5 corregido (F8) + F10: cada período NUEVO sale de un
+                        ciclo CERRADO —el rango no se escribe—, así que paga la
+                        fracción entera de la cadencia, igual que las
+                        siguientes. La EXCEPCIÓN es el primer ciclo de cada
+                        cadencia cuando la fecha de inicio de la nómina cae
+                        dentro de él: se recorta a esa fecha y se prorratea por
+                        los días del rango (la regla del ciclo parcial de F5).
+                        Si hay que completar algo (por ejemplo, días que el
+                        ciclo no alcanza a cubrir), se carga como bono u otro
+                        descuento por empleado en el borrador, y ESE ajuste
+                        exige su motivo. Nota informativa en texto plano, como
+                        los otros vacíos del diálogo. */}
+                    <p className="mt-1">
+                      La primera liquidación es un ciclo completo, igual que las siguientes: el
+                      sistema paga la fracción entera de la cadencia. La excepción es el primer
+                      ciclo de cada cadencia cuando la fecha de inicio de la nómina cae dentro de
+                      él: se recorta a esa fecha y paga solo los días del rango. Si hay que
+                      completar algo, se carga como bono u otro descuento por empleado en el
+                      borrador, con su motivo.
+                    </p>
+                  </>
                 ) : (
                   <>
                     <p className="mt-1">
@@ -2139,37 +2852,29 @@ export function PayrollClient(props: PayrollClientProps) {
                     )}
                   </>
                 )}
-                {suggestedStart && (
-                  <p className="mt-2">
-                    Sugerencia: empiece el {formatFullDate(suggestedStart)}, día siguiente al último período
-                    registrado.
-                  </p>
-                )}
                 {draftPeriods.length > 0 && (
                   <p className="mt-2 text-text-tertiary">
                     {draftPeriods.length === 1
                       ? "Hay un período en borrador"
                       : `Hay ${draftPeriods.length} períodos en borrador`}
-                    : no se pueden solapar rangos.
+                    : no se pueden solapar rangos del mismo ciclo.
                   </p>
                 )}
               </div>
 
               {rangeInvalid ? (
-                // ESTADO calculado en vivo: mientras el rango sea inválido el
-                // botón Crear no puede producir una apertura válida. Antes era
-                // un <p> con la clase de error y sin rol; ahora el canal es el
-                // mismo que el de los otros dos avisos del diálogo.
+                // ESTADO calculado en vivo. Con el ciclo como única fuente del
+                // rango esta rama no puede dispararse (el ciclo siempre termina
+                // después de empezar); se conserva como guarda defensiva y como
+                // el canal ya adoptado para el rango inválido, no como UI viva.
                 //
                 // `role="status"` explícito (polite): este aviso se DERIVA del
-                // formulario mientras el usuario escribe las fechas, no es el
-                // desenlace de una acción enviada. `destructive` derivaría
-                // `alert` (asertivo), y una región asertiva que interrumpe a
-                // quien está tecleando es el antipatrón de sobreanuncio.
-                // Bloquea la creación, sí, pero está en orden de lectura justo
-                // al lado de los campos: con `polite` alcanza. Los fallos
-                // confirmados del mismo archivo (arriba, `{error}`) siguen
-                // asertivos porque hay que enterarse antes de salir.
+                // formulario, no es el desenlace de una acción enviada.
+                // `destructive` derivaría `alert` (asertivo), y una región
+                // asertiva que interrumpe a quien está eligiendo es el
+                // antipatrón de sobreanuncio. Los fallos confirmados del mismo
+                // archivo (arriba, `{error}`) siguen asertivos porque hay que
+                // enterarse antes de salir.
                 <Alert variant="destructive" role="status">
                   La fecha final no puede ser anterior a la inicial.
                 </Alert>
@@ -2186,7 +2891,7 @@ export function PayrollClient(props: PayrollClientProps) {
                 <button type="button" className={ghostClass} onClick={closeOpenDialog}>
                   Cancelar
                 </button>
-                <button type="submit" disabled={busy} className={buttonClass}>
+                <button type="submit" disabled={busy || openTarget === null} className={buttonClass}>
                   {busy ? "Creando…" : "Crear"}
                 </button>
               </DialogFooter>
@@ -2222,6 +2927,9 @@ export function PayrollClient(props: PayrollClientProps) {
                       employeeName={employeeName}
                       payLabel={employeePayLabel}
                       onView={openItemDetail}
+                      onViewSources={(item) =>
+                        void openSettlementSources(selected.id, item.employee_id)
+                      }
                     />
                   )}
                   {/*
@@ -2285,8 +2993,12 @@ export function PayrollClient(props: PayrollClientProps) {
                     employeeName={employeeName}
                     payLabel={employeePayLabel}
                     adjustmentValue={adjustmentValue}
+                    adjustmentReasonValue={adjustmentReasonValue}
                     onAdjustmentChange={updateAdjustment}
                     onView={openItemDetail}
+                    onViewSources={(item) =>
+                      void openSettlementSources(selected.id, item.employee_id)
+                    }
                   />
                   {pendingItems.length > 0 && (
                     // ESTADO que bloquea el cierre de la nómina: el botón
@@ -2343,6 +3055,9 @@ export function PayrollClient(props: PayrollClientProps) {
                     employeeName={employeeName}
                     payLabel={employeePayLabel}
                     onView={openItemDetail}
+                    onViewSources={(item) =>
+                      void openSettlementSources(selected.id, item.employee_id)
+                    }
                   />
                 )
               )}
@@ -2395,6 +3110,51 @@ export function PayrollClient(props: PayrollClientProps) {
             />
             <DialogFooter className="mt-4">
               <button type="button" className={ghostClass} onClick={() => setDetailTargetId(null)}>
+                Cerrar
+              </button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/*
+        F6: modal "Ver facturas y vales" de la liquidación de UN empleado.
+        Apilado sobre el detalle del período y con su propio `DialogTitle`.
+      */}
+      {sourcesTarget && (
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) closeSettlementSources();
+          }}
+        >
+          <DialogContent className="max-w-3xl">
+            <DialogHeader>
+              <DialogTitle>
+                {`Facturas y vales de ${employeeName(sourcesTarget.employeeId)}`}
+              </DialogTitle>
+              <DialogDescription>
+                Las facturas y los vales que componen esta liquidación, con el detalle de cada uno.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="max-h-[calc(100dvh-12rem)] overflow-y-auto pr-1">
+              <SettlementSourcesPanel
+                sources={sources}
+                item={itemByEmployee.get(sourcesTarget.employeeId) ?? null}
+                busy={sourcesBusy}
+                invoiceTargetId={invoiceTargetId}
+                invoiceDetail={invoiceDetail}
+                invoiceBusy={invoiceBusy}
+                voucherTargetId={voucherTargetId}
+                voucherDetail={voucherDetail}
+                voucherBusy={voucherBusy}
+                employeeName={employeeName}
+                onViewInvoice={(invoiceId) => void openInvoiceDetail(invoiceId)}
+                onViewVoucher={(voucher) => void openVoucherDetail(voucher)}
+              />
+            </div>
+            <DialogFooter className="mt-4">
+              <button type="button" className={ghostClass} onClick={closeSettlementSources}>
                 Cerrar
               </button>
             </DialogFooter>
