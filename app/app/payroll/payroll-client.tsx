@@ -387,26 +387,17 @@ function PeriodDetailTable({ items, employeeName, payLabel, onView, onViewSource
                 <td className={tableCellClass}>{formatMoney(commission.percent)}</td>
                 <td className={tableCellClass}>{formatMoney(item.bonuses)}</td>
                 {/*
-                  NV-01: la celda muestra el TOTAL REAL de vales del período
-                  (`voucher_total`), no el descuento que el tope recortó al
-                  bruto. Si el tope aplicó menos de lo que el empleado gastó,
-                  el monto APLICADO se dice al lado para que la resta del neto
-                  se pueda leer; la deuda que queda pendiente se muestra aparte
-                  y solo cuando existe. El signo es solo presentación: el vale
-                  se guarda positivo.
+                  Regla del dueño (2026-10-01): «vales es solo vales y punto».
+                  La celda muestra ÚNICAMENTE el total REAL de vales del período
+                  (`voucher_total`) con el signo de descuento. Antes imprimía
+                  además `aplicado` y `deuda pendiente`; el aplicado igualaba la
+                  comisión en el caso del dueño y la columna terminaba nombrando
+                  la comisión bajo otra etiqueta. Esa conciliación vive en el
+                  modal «Ver facturas y vales», que es donde se lee el desglose.
+                  El signo es solo presentación: el vale se guarda positivo.
                 */}
                 <td className={tableCellClass} title={voucherCellTitle(item)}>
                   <span className="block">{`-${formatMoney(item.voucher_total)}`}</span>
-                  {item.deductions_vales < item.voucher_total && (
-                    <span className="block text-xs text-text-tertiary">
-                      {`aplicado ${formatMoney(item.deductions_vales)}`}
-                    </span>
-                  )}
-                  {item.pending_debt > 0 && (
-                    <span className="block text-xs text-text-tertiary">
-                      {`deuda pendiente ${formatMoney(item.pending_debt)}`}
-                    </span>
-                  )}
                 </td>
                 <td className={tableCellClass}>{`-${formatMoney(item.other_discounts)}`}</td>
                 <td className={cn(tableCellClass, "font-semibold")}>{formatMoney(item.net_pay)}</td>
@@ -617,26 +608,16 @@ function DraftPayrollTable({
                   />
                 </td>
                 {/*
-                  NV-01: mismo criterio que la tabla cerrada —el total REAL de
-                  vales, el monto aplicado al lado cuando el tope recortó, y la
-                  deuda pendiente solo cuando existe—. El signo es solo
-                  presentación: el vale se guarda positivo.
+                  Regla del dueño (2026-10-01): mismo criterio que la tabla
+                  cerrada —la celda muestra SOLO el total REAL de vales
+                  (`voucher_total`), sin líneas secundarias—. La conciliación del
+                  monto aplicado y de la deuda vive en el modal «Ver facturas y
+                  vales». El signo es solo presentación: el vale se guarda
+                  positivo.
                 */}
                 <td className={tableCellClass} title={item ? voucherCellTitle(item) : undefined}>
                   {item ? (
-                    <>
-                      <span className="block">{`-${formatMoney(item.voucher_total)}`}</span>
-                      {item.deductions_vales < item.voucher_total && (
-                        <span className="block text-xs text-text-tertiary">
-                          {`aplicado ${formatMoney(item.deductions_vales)}`}
-                        </span>
-                      )}
-                      {item.pending_debt > 0 && (
-                        <span className="block text-xs text-text-tertiary">
-                          {`deuda pendiente ${formatMoney(item.pending_debt)}`}
-                        </span>
-                      )}
-                    </>
+                    <span className="block">{`-${formatMoney(item.voucher_total)}`}</span>
                   ) : (
                     "—"
                   )}
@@ -884,6 +865,15 @@ function SourceDetailField({ label, children }: { label: string; children: React
 
 interface SettlementSourcesPanelProps {
   sources: PayrollSettlementSources | null;
+  /**
+   * F6/regla del dueño (2026-10-01): el ítem de nómina del empleado.
+   *
+   * Es la fuente del monto APLICADO (`deductions_vales`, lo que el neto
+   * descuenta de verdad) y de la deuda PENDIENTE (`pending_debt`) que la
+   * columna de vales ya no imprime. Vive acá y no en la lectura de fuentes
+   * porque el detalle del período ya lo trae leído: no se duplica consulta.
+   */
+  item: DetailItem | null;
   busy: boolean;
   invoiceTargetId: string | null;
   invoiceDetail: InvoiceDetail | null;
@@ -907,9 +897,15 @@ interface SettlementSourcesPanelProps {
  * su monto y su explicación, para que el lector no lo confunda con un
  * consecutivo. Los vacíos describen lo esperado ("no tiene facturas/vales") y
  * son texto plano, no un aviso.
+ *
+ * Regla del dueño (2026-10-01): «vales es solo vales y punto». La columna de
+ * vales de las dos tablas muestra solo el total; la conciliación —cuánto
+ * descontó el neto y cuánta deuda quedó— se lee acá, junto a los vales que la
+ * componen, y solo cuando cada cifra aplica.
  */
 function SettlementSourcesPanel({
   sources,
+  item,
   busy,
   invoiceTargetId,
   invoiceDetail,
@@ -1069,6 +1065,16 @@ function SettlementSourcesPanel({
             </li>
           ))}
         </ul>
+        {item && item.deductions_vales < item.voucher_total ? (
+          <p className="mt-2 text-sm text-text-secondary">
+            {`Del total de vales, el neto de este período descuenta ${formatMoney(item.deductions_vales)}: el tope de descuentos no aplicó el resto.`}
+          </p>
+        ) : null}
+        {item && item.pending_debt > 0 ? (
+          <p className="mt-1 text-sm text-text-secondary">
+            {`Queda una deuda de ${formatMoney(item.pending_debt)} originada en este período: es el sobrante de vales que el tope no alcanzó a descontar.`}
+          </p>
+        ) : null}
       </section>
     </div>
   );
@@ -2877,6 +2883,7 @@ export function PayrollClient(props: PayrollClientProps) {
             <div className="max-h-[calc(100dvh-12rem)] overflow-y-auto pr-1">
               <SettlementSourcesPanel
                 sources={sources}
+                item={itemByEmployee.get(sourcesTarget.employeeId) ?? null}
                 busy={sourcesBusy}
                 invoiceTargetId={invoiceTargetId}
                 invoiceDetail={invoiceDetail}

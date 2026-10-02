@@ -9365,84 +9365,144 @@ describe("payroll-client: los campos de monto pasan por la máscara de dinero (g
 });
 
 /* ==========================================================================
-   NV-01 (UI): la columna de vales muestra el TOTAL REAL, no el recorte.
+   NV-01 + regla del dueño (2026-10-01): «vales es solo vales y punto».
 
-   El defecto que midió el dueño: un vale de 50.000 sobre un bruto de 20.000
-   se mostraba como 20.000 —exactamente la comisión de un empleado de
-   porcentaje sin bonos—, porque `capPayrollDiscounts` recortaba el descuento
-   al bruto y ese recorte era lo que la celda mostraba. «Vales son vales»: las
-   dos tablas de liquidación (la cerrada `PeriodDetailTable` y el borrador
-   `DraftPayrollTable`) muestran ahora `voucher_total` —la suma REAL del
-   período—, dicen al lado cuánto se APLICÓ cuando el tope recortó, y dejan ver
-   la deuda pendiente de la fila SOLO cuando existe. Guarda de fuente: sin DOM,
-   sobre el texto real del cliente.
+   El defecto que midió el dueño: un vale de 50.000 sobre un bruto de 7.000 se
+   mostraba como la comisión del período —`capPayrollDiscounts` recortaba el
+   descuento al bruto y ese recorte era lo que la celda mostraba—. La primera
+   corrección (NV-01) puso el TOTAL REAL en la celda, pero dejó al lado dos
+   líneas secundarias, `aplicado $ X` y `deuda pendiente $ Y`; en el caso del
+   dueño el `aplicado` volvía a igualar la comisión, así que la columna seguía
+   nombrando la comisión bajo otra etiqueta.
+
+   Ahora las DOS tablas de liquidación (la cerrada `PeriodDetailTable` y el
+   borrador `DraftPayrollTable`) muestran ÚNICAMENTE `voucher_total` —la suma
+   REAL del período— con el signo de descuento. La conciliación (cuánto
+   descontó el neto y cuánta deuda quedó) se movió al modal "Facturas y vales
+   de <empleado>", donde el lector va a reconciliar, y cada cifra aparece SOLO
+   cuando aplica. Guarda de fuente: sin DOM, sobre el texto real del cliente.
    ========================================================================== */
-describe("payroll-client: la columna de vales muestra el total real (NV-01, guarda de fuente)", () => {
+describe("payroll-client: la columna de vales muestra solo el total real (regla del dueño, guarda de fuente)", () => {
   const source = readFileSync(
     join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
     "utf8",
   );
 
-  /** Cuántas veces aparece un fragmento literal en el fuente. */
+  /** Cuántas veces aparece un fragmento literal en un texto. */
   function count(text: string, needle: string): number {
     return text.split(needle).length - 1;
   }
 
-  /** El cableado completo: la condición ENVUELVE al texto, no convive con él. */
-  function wired(condition: string, text: string): number {
+  /** Cableado: la condición introduce la rama que contiene al texto. */
+  function wired(text: string, condition: string, needle: string): number {
+    const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const pattern = new RegExp(
-      `${condition.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} && \\([\\s\\S]{0,200}${text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+      `${escape(condition)}(?: &&| \\?) \\([\\s\\S]{0,240}${escape(needle)}`,
       "g",
     );
-    return [...source.matchAll(pattern)].length;
+    return [...text.matchAll(pattern)].length;
+  }
+
+  /**
+   * Los bloques `<td>` de la columna de vales, uno por tabla: desde su apertura
+   * (el `title` la identifica) hasta su cierre. Ese bloque es el que NO puede
+   * volver a tener líneas secundarias.
+   */
+  function voucherCells(text: string): string[] {
+    const openings = [
+      "<td className={tableCellClass} title={voucherCellTitle(item)}>",
+      "<td className={tableCellClass} title={item ? voucherCellTitle(item) : undefined}>",
+    ];
+    const cells: string[] = [];
+    for (const opening of openings) {
+      const start = text.indexOf(opening);
+      if (start === -1) continue;
+      const end = text.indexOf("</td>", start);
+      if (end === -1) continue;
+      cells.push(text.slice(start, end + "</td>".length));
+    }
+    return cells;
+  }
+
+  /**
+   * El bloque del modal "Facturas y vales": de las props del panel (donde vive
+   * el ítem que trae las cifras) al componente que lo usa.
+   */
+  function sourcesPanel(text: string): string {
+    const start = text.indexOf("interface SettlementSourcesPanelProps {");
+    const end = text.indexOf("export function PayrollClient(", start);
+    return start === -1 || end === -1 ? "" : text.slice(start, end);
   }
 
   it("piso anti-vacío: el cliente se leyó de verdad", () => {
     expect(source.length).toBeGreaterThan(20_000);
     expect(source).toContain("export function PayrollClient");
+    expect(voucherCells(source)).toHaveLength(2);
+    expect(sourcesPanel(source).length).toBeGreaterThan(1_000);
   });
 
-  it("las DOS tablas muestran el total REAL de vales con el signo de descuento", () => {
+  it("las DOS celdas de vales muestran solo el total real, sin `aplicado` ni `deuda pendiente`", () => {
     // Una ocurrencia por tabla: `PeriodDetailTable` y `DraftPayrollTable`.
     expect(count(source, "-${formatMoney(item.voucher_total)}")).toBe(2);
-    // El descuento APLICADO ya NO es el valor de la celda: la celda vieja era
-    // justo este fragmento, y muestra lo que el tope persistió.
+    // El descuento APLICADO no es el valor de la celda, ni antes ni ahora.
     expect(count(source, "-${formatMoney(item.deductions_vales)}")).toBe(0);
+    // Y las dos líneas secundarias que el dueño rechazó se fueron del archivo:
+    // su texto no sobrevive en ninguna otra celda ni en el `title`.
+    expect(count(source, "aplicado ${formatMoney(item.deductions_vales)}")).toBe(0);
+    expect(count(source, "deuda pendiente ${formatMoney(item.pending_debt)}")).toBe(0);
+    for (const cell of voucherCells(source)) {
+      expect(count(cell, "-${formatMoney(item.voucher_total)}")).toBe(1);
+      expect(count(cell, "item.deductions_vales")).toBe(0);
+      expect(count(cell, "item.pending_debt")).toBe(0);
+      // El `title` accesible sigue: no es clutter visible ni un monto suelto.
+      expect(cell).toContain("voucherCellTitle(");
+    }
   });
 
-  it("el monto APLICADO se muestra al lado cuando el tope lo recortó", () => {
-    // La condición ES el recorte: si aplicado y total coinciden no hay nada
-    // que explicar y el monto aplicado no se repite.
-    expect(count(source, "item.deductions_vales < item.voucher_total")).toBe(2);
-    expect(count(source, "aplicado ${formatMoney(item.deductions_vales)}")).toBe(2);
-    // Cableado: la condición envuelve el texto en las dos tablas.
-    expect(wired("item.deductions_vales < item.voucher_total", "aplicado ${formatMoney(item.deductions_vales)}")).toBe(2);
-  });
-
-  it("la deuda pendiente se muestra por fila, y SOLO cuando es mayor a 0", () => {
-    expect(count(source, "item.pending_debt > 0")).toBe(2);
-    expect(count(source, "deuda pendiente ${formatMoney(item.pending_debt)}")).toBe(2);
-    expect(wired("item.pending_debt > 0", "deuda pendiente ${formatMoney(item.pending_debt)}")).toBe(2);
+  it("el modal de facturas y vales es donde ahora se concilian el monto aplicado y la deuda", () => {
+    const panel = sourcesPanel(source);
+    // El monto aplicado se explica SOLO cuando difiere del total: si coinciden,
+    // repetirlo sería nombrar de nuevo el total del período (la queja del dueño).
+    expect(count(panel, "item.deductions_vales < item.voucher_total")).toBe(1);
+    expect(wired(panel, "item.deductions_vales < item.voucher_total", "formatMoney(item.deductions_vales)")).toBe(1);
+    // La deuda, SOLO cuando existe.
+    expect(count(panel, "item.pending_debt > 0")).toBe(1);
+    expect(wired(panel, "item.pending_debt > 0", "formatMoney(item.pending_debt)")).toBe(1);
+    // El panel recibe el ítem del empleado y el modal lo resuelve desde el
+    // detalle ya leído: sin ítem no hay cifras que conciliar.
+    expect(panel).toContain("item: DetailItem | null");
+    expect(count(source, "item={itemByEmployee.get(sourcesTarget.employeeId) ?? null}")).toBe(1);
   });
 
   it("el detector no es un sello de goma (control negativo)", () => {
-    // El marcado VIEJO: el valor aplicado como valor de la celda, sin monto
-    // secundario y sin deuda. Las tres guardas fallan sobre él.
+    // El marcado que el dueño rechazó: el total en la celda MÁS las dos líneas
+    // secundarias. Si alguien las re-agrega, la guarda de la celda las ve.
     const viejo =
-      "<td title={voucherCellTitle(item)}>{" +
-      "`-${formatMoney(item.deductions_vales)}`" +
-      "}</td>";
-    expect(count(viejo, "-${formatMoney(item.voucher_total)}")).toBe(0);
-    expect(count(viejo, "-${formatMoney(item.deductions_vales)}")).toBe(1);
-    expect(count(viejo, "item.deductions_vales < item.voucher_total")).toBe(0);
-    expect(count(viejo, "aplicado ${formatMoney(item.deductions_vales)}")).toBe(0);
-    expect(count(viejo, "item.pending_debt > 0")).toBe(0);
-    expect(count(viejo, "deuda pendiente ${formatMoney(item.pending_debt)}")).toBe(0);
-    // Sin la guarda de «mayor a 0» el texto suelto no cuenta como cableado: se
-    // exige la condición, no una mención casual.
-    const siempre = "{`deuda pendiente ${formatMoney(item.pending_debt)}`}";
-    expect(count(siempre, "item.pending_debt > 0")).toBe(0);
-    expect(wired("item.pending_debt > 0", "deuda pendiente ${formatMoney(item.pending_debt)}")).toBe(2);
+      '<td className={tableCellClass} title={voucherCellTitle(item)}>\n' +
+      '  <span className="block">{`-${formatMoney(item.voucher_total)}`}</span>\n' +
+      '  {item.deductions_vales < item.voucher_total && (\n' +
+      '    <span className="block text-xs text-text-tertiary">\n' +
+      '      {`aplicado ${formatMoney(item.deductions_vales)}`}\n' +
+      '    </span>\n' +
+      '  )}\n' +
+      '  {item.pending_debt > 0 && (\n' +
+      '    <span className="block text-xs text-text-tertiary">\n' +
+      '      {`deuda pendiente ${formatMoney(item.pending_debt)}`}\n' +
+      '    </span>\n' +
+      '  )}\n' +
+      '</td>';
+    expect(voucherCells(viejo)).toHaveLength(1);
+    const cell = voucherCells(viejo)[0];
+    // El total sigue ahí: lo que delata la regresión es lo secundario.
+    expect(count(cell, "-${formatMoney(item.voucher_total)}")).toBe(1);
+    expect(count(cell, "-${formatMoney(item.deductions_vales)}")).toBe(0);
+    expect(count(cell, "item.deductions_vales")).toBeGreaterThan(0);
+    expect(count(cell, "item.pending_debt")).toBeGreaterThan(0);
+    // El cableado del modal sí se lee sobre la rama: la misma deuda bien
+    // escrita cuenta, y suelta (sin condición) no.
+    expect(wired(viejo, "item.pending_debt > 0", "formatMoney(item.pending_debt)")).toBe(1);
+    const suelta = "{`Queda una deuda de ${formatMoney(item.pending_debt)}`}";
+    expect(wired(suelta, "item.pending_debt > 0", "formatMoney(item.pending_debt)")).toBe(0);
   });
 });
 
