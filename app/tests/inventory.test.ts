@@ -12,6 +12,7 @@ import {
   normalizeSku,
   planStockDeduction,
   productSchema,
+  proposeSku,
   sortKardexAscending,
 } from "@/src/features/inventory/schemas";
 import {
@@ -72,6 +73,89 @@ describe("inventory schemas: producto (INV-01)", () => {
     expect(
       areSkusConflicting({ sedeIdA: SEDE_A, skuA: "SH-001", sedeIdB: SEDE_B, skuB: "SH-001" }),
     ).toBe(false);
+  });
+});
+
+describe("inventory: propuesta de SKU desde el nombre (ayuda del alta)", () => {
+  it("deriva la base del nombre: sin acentos ni diacríticos, en mayúsculas", () => {
+    expect(proposeSku("Shampú de Ñandú", [])).toBe("SHAMPU-DE-NANDU");
+    expect(proposeSku("Jabón líquido", [])).toBe("JABON-LIQUIDO");
+  });
+
+  it("colapsa puntuación, símbolos y espacios en un solo separador", () => {
+    expect(proposeSku("  Shampoo   H&S / 2x1 (500 ml) ", [])).toBe("SHAMPOO-H-S-2X1-500-ML");
+    expect(proposeSku("A__B--C", [])).toBe("A-B-C");
+  });
+
+  it("recorta los separadores de los extremos y nunca deja uno colgando", () => {
+    expect(proposeSku("--SH-001--", [])).toBe("SH-001");
+    for (const name of ["...", "   ", "¿?", "  Shampoo  ", "ÁÉÍ-ÓÚ"]) {
+      const sku = proposeSku(name, []);
+      expect(sku.startsWith("-"), name).toBe(false);
+      expect(sku.endsWith("-"), name).toBe(false);
+    }
+  });
+
+  it("cae a una base fija cuando el nombre no aporta ningún alfanumérico", () => {
+    expect(proposeSku("", [])).toBe("PROD");
+    expect(proposeSku("   ", [])).toBe("PROD");
+    expect(proposeSku("¡$%&/()=?", [])).toBe("PROD");
+  });
+
+  it("recorta a 40 caracteres, sufijo incluido, sin cortar dejando separador final", () => {
+    expect(proposeSku("A".repeat(80), [])).toHaveLength(40);
+
+    const tokens = Array.from({ length: 20 }, (_, index) => `TOKEN${index + 1}`).join(" ");
+    const sku = proposeSku(tokens, []);
+    expect(sku.length).toBeLessThanOrEqual(40);
+    expect(sku.endsWith("-")).toBe(false);
+
+    // Con la base ya tomada, el sufijo también entra en el tope de 40.
+    const withSuffix = proposeSku(tokens, [sku]);
+    expect(withSuffix.length).toBeLessThanOrEqual(40);
+    expect(withSuffix).not.toBe(sku);
+    expect(withSuffix.endsWith("-")).toBe(false);
+  });
+
+  it("desambigua contra los SKU ya cargados con la regla de la app (trim + mayúsculas)", () => {
+    expect(proposeSku("Shampoo", [])).toBe("SHAMPOO");
+    expect(proposeSku("Shampoo", [" shampoo "])).toBe("SHAMPOO-2");
+    expect(proposeSku("Shampoo", ["SHAMPOO", "SHAMPOO-2"])).toBe("SHAMPOO-3");
+    expect(proposeSku("Shampoo", ["SHAMPOO-3", "SHAMPOO", "SHAMPOO-2"])).toBe("SHAMPOO-4");
+  });
+
+  it("no agrega sufijo cuando la base está libre (control negativo)", () => {
+    const sku = proposeSku("Shampoo", ["JABON", "SH-001"]);
+    expect(sku).toBe("SHAMPOO");
+    expect(sku).not.toContain("-2");
+  });
+
+  it("es determinista: mismos argumentos, mismo resultado, sin importar el orden", () => {
+    const taken = ["SHAMPOO", "SHAMPOO-2", "SHAMPOO-3"];
+    const first = proposeSku("Shampoo", taken);
+    expect(first).toBe("SHAMPOO-4");
+    expect(proposeSku("Shampoo", taken)).toBe(first);
+    expect(proposeSku("Shampoo", [...taken].reverse())).toBe(first);
+  });
+
+  it("el resultado siempre pasa el esquema del producto (no vacío, <= 40)", () => {
+    const names = [
+      "",
+      "   ",
+      "¡$%&/()=?",
+      "Shampú de Ñandú",
+      "A".repeat(80),
+      `Shampú de Ñandú ${"A".repeat(60)}`,
+    ];
+    for (const name of names) {
+      const sku = proposeSku(name, []);
+      expect(sku.length, name).toBeGreaterThan(0);
+      expect(sku.length, name).toBeLessThanOrEqual(40);
+      expect(
+        productSchema.safeParse(baseProduct({ name: name.trim() || "Producto", sku })).success,
+        name,
+      ).toBe(true);
+    }
   });
 });
 
@@ -1149,5 +1233,81 @@ describe("migración 046_stock_deduction_atomicity.sql (CL-7)", () => {
     expect(raw).toContain("046");
     expect(raw).toContain("NO ejecutado por el agente: requiere base de datos");
     expect(raw).toContain("VENTANAS DECLARADAS");
+  });
+});
+
+/* ==========================================================================
+   Inventario: botón de ayuda del SKU (guarda de fuente)
+
+   El botón es de UI y este paquete corre sin DOM (`environment: "node"`), así
+   que la guarda afirma el criterio sobre el TEXTO del cliente real —el mismo
+   estilo mixto que el resto de `tests/`—: existe, es `type="button"` (no
+   envía el formulario), tiene nombre accesible y `title`, y está cableado al
+   helper puro contra los SKU ya cargados.
+   ========================================================================== */
+describe("inventory: botón de ayuda del SKU (guarda de fuente)", () => {
+  const source = readFileSync(
+    join(process.cwd(), "app", "inventory", "inventory-client.tsx"),
+    "utf8",
+  );
+
+  /** El bloque del botón: desde su `<Button` hasta el `</Button>`, anclado por el id. */
+  function proposalButtonBlock(text: string): string {
+    const anchor = text.indexOf('id="product-sku-propose"');
+    if (anchor === -1) return "";
+    const start = text.lastIndexOf("<Button", anchor);
+    const end = text.indexOf("</Button>", anchor);
+    return start === -1 || end === -1 ? "" : text.slice(start, end + "</Button>".length);
+  }
+
+  /** El cuerpo del handler de la propuesta (hasta su `}` de cierre a 2 espacios). */
+  function handlerBody(text: string, name: string): string {
+    const start = text.indexOf(`function ${name}`);
+    if (start === -1) return "";
+    const end = text.indexOf("\n  }", start);
+    return end === -1 ? "" : text.slice(start, end);
+  }
+
+  it("existe, es type=\"button\" y tiene nombre accesible y title", () => {
+    const block = proposalButtonBlock(source);
+    expect(block, "bloque del botón del SKU").not.toBe("");
+    expect(block).toContain('type="button"');
+    expect(block).not.toContain('type="submit"');
+    expect(block).toMatch(/aria-label="[^"]*SKU[^"]*"/);
+    expect(block).toMatch(/title="[^"]+"/);
+  });
+
+  it("se importa el helper y el handler propone contra los SKU cargados", () => {
+    expect(source).toMatch(
+      /import \{ proposeSku \} from "@\/src\/features\/inventory\/schemas"/,
+    );
+    const block = proposalButtonBlock(source);
+    expect(block).toContain("onClick={proposeSkuFromName}");
+
+    const body = handlerBody(source, "proposeSkuFromName");
+    expect(body, "handler proposeSkuFromName").not.toBe("");
+    expect(body).toContain("proposeSku(");
+    // Misma regla que el aviso `skuTaken`: el propio producto en edición queda
+    // fuera, así que después de generar el aviso lee limpio.
+    expect(body).toContain("row.id !== editingId");
+    expect(body).toContain("row.sku");
+    expect(body).toContain("setForm(");
+  });
+
+  it("no rellena el campo al abrir el diálogo (control negativo)", () => {
+    // La propuesta vive en su handler: abrir el alta no la invoca.
+    const body = handlerBody(source, "startProductDialog");
+    expect(body, "handler startProductDialog").not.toBe("");
+    expect(body).not.toContain("proposeSku");
+  });
+
+  it("el detector no es un sello de goma (control negativo)", () => {
+    const fake =
+      '<Button type="submit" id="product-sku-propose" onClick={proposeSkuFromName}>Generar</Button>';
+    const block = proposalButtonBlock(fake);
+    expect(block).not.toBe("");
+    expect(block).not.toContain('type="button"');
+    // Sin el ancla no hay bloque: la guarda falla en vez de pasar sola.
+    expect(proposalButtonBlock('<Button type="button">Generar</Button>')).toBe("");
   });
 });

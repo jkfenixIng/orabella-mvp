@@ -16,6 +16,69 @@ export function normalizeSku(sku: string | null | undefined): string {
   return (sku ?? "").trim().toUpperCase();
 }
 
+/** Tope del campo `sku` en `productSchema`; también el de la propuesta. */
+const PROPOSED_SKU_MAX_LENGTH = 40;
+/** Base de reserva cuando el nombre no aporta ningún alfanumérico. */
+const PROPOSED_SKU_FALLBACK = "PROD";
+
+/**
+ * INV-01: deriva la base de un SKU a partir del NOMBRE del producto.
+ *
+ * Sin acentos ni diacríticos (se borran las marcas combinantes: `ñ` → `n`,
+ * `á` → `a`), en mayúsculas, sólo `[A-Z0-9]`, con los tramos no alfanuméricos
+ * colapsados en un solo `-` y los separadores de los extremos recortados. Si
+ * no queda nada (un nombre sólo de signos) la base es `PROD`.
+ */
+function skuBaseFromName(name: string): string {
+  const base = name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return base === "" ? PROPOSED_SKU_FALLBACK : base;
+}
+
+/** Recorta a `max` sin dejar un separador colgando al final. */
+function capSku(value: string, max: number): string {
+  return value.slice(0, Math.max(0, max)).replace(/-+$/g, "");
+}
+
+/**
+ * INV-01: propone un SKU a partir del NOMBRE del producto (puro, sin BD).
+ *
+ * Lo usa el botón de ayuda del formulario de alta, para quien no sabe qué SKU
+ * escribir. La base sale del nombre —`"Shampú de Ñandú"` → `SHAMPU-DE-NANDU`,
+ * `"¡$%&/()=?"` → `PROD`— y se desambigua contra los SKU ya cargados con la
+ * MISMA regla de unicidad de la app (trim + mayúsculas, `normalizeSku`):
+ * primero la base, y si está tomada `-2`, `-3`, … hasta encontrar una libre.
+ *
+ * El resultado siempre cumple el campo `sku` de `productSchema` (no vacío y de
+ * 40 caracteres o menos) y es determinista: los mismos argumentos devuelven el
+ * mismo SKU, sin importar el orden de `takenSkus`. El sufijo entra en el tope
+ * de 40 —la base se recorta para que quepa— y el recorte nunca deja un `-`
+ * colgando al final.
+ */
+export function proposeSku(name: string, takenSkus: readonly string[]): string {
+  const base = skuBaseFromName(name);
+  const taken = new Set(takenSkus.map((sku) => normalizeSku(sku)));
+
+  const plain = capSku(base, PROPOSED_SKU_MAX_LENGTH);
+  if (!taken.has(plain)) return plain;
+
+  for (let n = 2; n <= 10_000; n += 1) {
+    const suffix = `-${n}`;
+    const candidate = `${capSku(base, PROPOSED_SKU_MAX_LENGTH - suffix.length)}${suffix}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+
+  // Inalcanzable con datos reales (haría falta una lista con 10 000 variantes
+  // del mismo nombre): se devuelve la última candidata, que sigue cumpliendo el
+  // esquema, en vez de dejar la propuesta vacía.
+  const lastSuffix = "-10000";
+  return `${capSku(base, PROPOSED_SKU_MAX_LENGTH - lastSuffix.length)}${lastSuffix}`;
+}
+
 /**
  * INV-01: conflicto de SKU a nivel app (además del UNIQUE (sede_id, sku)).
  * Dos SKU normalizados iguales en la misma sede colisionan.

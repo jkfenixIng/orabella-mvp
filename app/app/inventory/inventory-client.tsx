@@ -13,6 +13,7 @@ import type {
   MovementRow,
   ProductRow,
 } from "@/src/features/inventory/service";
+import { proposeSku } from "@/src/features/inventory/schemas";
 import { Alert } from "@/src/components/ui/lib/alert";
 import { Badge } from "@/src/components/ui/lib/badge";
 import { Button } from "@/src/components/ui/lib/button";
@@ -177,6 +178,22 @@ export function InventoryClient(props: InventoryClientProps) {
     setEditingId(null);
     setForm(emptyProductForm());
     setProductDialogOpen(false);
+  }
+
+  /**
+   * AYUDA del SKU: el usuario presiona el botón y obtiene un SKU propuesto a
+   * partir del NOMBRE del producto, libre de choques con los SKU ya cargados.
+   *
+   * Se calcula contra `products` excluyendo el producto en edición: es la MISMA
+   * regla que el aviso `skuTaken` (que compara por `row.id !== editingId`), así
+   * que después de generar el aviso lee limpio y Guardar no queda bloqueado.
+   * Sólo cambia el campo al presionar: no rellena nada al abrir el diálogo.
+   */
+  function proposeSkuFromName() {
+    const takenSkus = products
+      .filter((row) => row.id !== editingId)
+      .map((row) => row.sku);
+    setForm({ ...form, sku: proposeSku(form.name, takenSkus) });
   }
 
   function openMovementDialog() {
@@ -453,14 +470,33 @@ export function InventoryClient(props: InventoryClientProps) {
           <form onSubmit={handleProductSubmit} className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
             <Label htmlFor="product-sku" className={labelClass}>
               SKU *
-              <Input
-                id="product-sku"
-                className={inputClass}
-                value={form.sku}
-                onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, sku: event.target.value })}
-                placeholder="SH-001"
-                required
-              />
+              <span className="flex items-center gap-2">
+                <Input
+                  id="product-sku"
+                  className={cn(inputClass, "flex-1")}
+                  value={form.sku}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, sku: event.target.value })}
+                  placeholder="SH-001"
+                  required
+                />
+                {/*
+                  AYUDA: para quien no sabe qué SKU escribir. Propone uno a
+                  partir del nombre del producto y lo escribe en el campo. Es
+                  un evento del usuario (`type="button"` para no enviar el
+                  formulario), no un relleno automático.
+                */}
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  id="product-sku-propose"
+                  title="Genera un SKU único a partir del nombre del producto."
+                  aria-label="Generar SKU a partir del nombre del producto"
+                  onClick={proposeSkuFromName}
+                >
+                  Generar
+                </Button>
+              </span>
               <span className="text-xs text-text-tertiary">
                 Código único por sede (p. ej. SH-001 para shampoo).
               </span>
