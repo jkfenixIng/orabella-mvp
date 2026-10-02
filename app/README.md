@@ -39,8 +39,9 @@ npm test        # vitest run
 ## Cuenta de plataforma (`superadmin`)
 
 La capa de plataforma (ver `odd/tasks/plataforma-super-admin.md`) se administra
-con UNA sola cuenta: documento `superadmin` con el rol `superadmin`. Esa cuenta
-**no** se crea desde la administración de una sede —`adminCreateUser` no admite
+con UNA sola cuenta: documento `superadmin` con el rol `superadmin`, anclada a la
+**sede de plataforma**. Esa cuenta **no** se crea desde la administración de una
+sede —`adminCreateUser` no admite
 ese rol, que solo otorga la plataforma— así que se aprovisiona con un script del
 repositorio:
 
@@ -52,10 +53,13 @@ npm run create:superadmin
 
 | Variable | Qué es |
 |---|---|
-| `SUPERADMIN_PASSWORD` | La clave de la cuenta. **Obligatoria y sin valor por defecto**: si falta o viene vacía, el script no escribe nada y falla. |
-| `SUPERADMIN_SEDE_ID` | Uuid de la sede a la que pertenece la cuenta (`users.sede_id` es NOT NULL). Obligatoria: no hay sede por defecto. |
-| `SUPERADMIN_TARGET` | `pruebas` o `produccion`. Obligatoria: es la confirmación explícita del destino, y el script imprime el host de Supabase al que apunta antes de escribir. |
-| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Las mismas de la app: el script usa `createAdminClient()` (service_role). |
+| `SUPERADMIN_PASSWORD` | La clave de la cuenta. **Obligatoria y sin valor por defecto**: si falta o viene vacía, el script no escribe nada y falla. Es la ÚNICA variable propia del script. |
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Las mismas de la app: el script usa `createAdminClient()` (service_role), y el host de la URL es lo que imprime antes de escribir. |
+
+**No hay variable de destino ni de sede.** El destino no se declara: cada entorno
+tiene su propio `.env` y el script imprime el HOST de Supabase al que le escribe
+justo antes de tocar nada —ese es el chequeo humano—. Y la sede ya no se elige:
+la asegura el script (ver abajo).
 
 **La clave no está en el repositorio** —no está en `.env.example`, ni en un seed,
 ni en este README, ni en una prueba— y **no hay clave por defecto**, porque el
@@ -69,21 +73,61 @@ El documento es el MISMO en los dos entornos; lo único que cambia es el valor d
 las variables:
 
 ```bash
-# PRUEBAS y producción se distinguen por el VALOR, no por el usuario.
+# PRUEBAS y producción se distinguen por el VALOR y por el host que el script imprime.
 export SUPERADMIN_PASSWORD='...'         # solo en este shell, nunca en un archivo del repo
-export SUPERADMIN_SEDE_ID='<uuid de la sede>'
-export SUPERADMIN_TARGET='pruebas'       # o 'produccion'
 export NEXT_PUBLIC_SUPABASE_URL='https://<proyecto>.supabase.co'
 export NEXT_PUBLIC_SUPABASE_ANON_KEY='...'
 export SUPABASE_SERVICE_ROLE_KEY='...'
 npm run create:superadmin
 ```
 
+### La sede de plataforma
+
+`users.sede_id` es NOT NULL (003_admin.sql), así que la cuenta tiene que
+pertenecer a alguna sede. Pedirla por variable obligaba a elegir una sede de
+CLIENTE para una cuenta que está para ajustar el SISTEMA. En su lugar, el script
+**asegura** una fila de `sedes` llamada `Plataforma (sistema)`:
+
+- **Idempotente por NOMBRE**: si la fila ya existe la usa, y no crea otra.
+  `sedes` no tiene `code` ni unicidad por nombre, así que el nombre es la única
+  clave estable; si aparecen dos filas con ese nombre, el script falla en vez de
+  elegir una al azar (y relee después de crear, para que dos corridas
+  simultáneas tampoco dejen dos).
+- Se crea con **`is_active = false`**: no es una sede operativa. Si la fila ya
+  existía **ACTIVA**, el script la usa igual y lo dice con un AVISO: no cambia el
+  estado de una sede que no creó.
+- Si la sede no se puede asegurar, **falla antes de tocar la cuenta**.
+- **No se relaja `users.sede_id` ni se toca `resolveSede`/`requireSedeRole`**
+  (`src/shared/lib/sede.ts`): esa frontera sostiene el aislamiento por sede de
+  todas las rutas del negocio, y aflojarla para una cuenta lo propagaría a cada
+  guarda. La sede de plataforma es la representación honesta de "no es una sede
+  de cliente". Las guardas son puras sobre `sede_id` y no miran
+  `sedes.is_active`, así que una sede inactiva no deja a la cuenta afuera de
+  nada.
+- Si la cuenta estaba anclada a otra sede, la corrida **la re-ancla a la sede de
+  plataforma y lo dice** (cambiar de sede cambia lo que esa cuenta ve del
+  negocio: no puede ser mudo).
+
+**Nota (pendiente para G4):** el script crea la sede inactiva para que no se
+ofrezca en los flujos del negocio, pero **hoy nada la excluye por `is_active`**:
+`fetchSedes` (`src/features/admin/service.ts:123`) selecciona TODAS las sedes y
+solo está expuesta por `listSedesAction` (`src/features/admin/actions.ts:167`),
+que no tiene ningún consumidor en la interfaz. Cerrarlo es de G4.
+
+### La cuenta ajusta el sistema, no opera el negocio
+
+El conjunto de roles se fija **exactamente en `["superadmin"]`** en cada corrida
+(`replace_user_roles` reemplaza el conjunto, no agrega). Esa es la DEFINICIÓN de
+la cuenta, no una limitación pendiente: la cuenta existe para ajustar el sistema
+y **no** para operar el negocio. Caja, facturas y nómina le quedan **sin
+permisos**, y eso es deliberado.
+
 ### Qué hace (y qué no)
 
 - **Idempotente**: la primera corrida crea la cuenta; las siguientes **actualizan**
-  la clave y limpian el bloqueo por intentos. Nunca crea una segunda cuenta ni
-  duplica el rol: `replace_user_roles` deja exactamente `superadmin`.
+  la clave y limpian el bloqueo por intentos. Nunca crea una segunda cuenta, ni
+  una segunda sede de plataforma, ni duplica el rol: `replace_user_roles` deja
+  exactamente `superadmin`.
 - **Verifica de punta a punta**: al final vuelve a leer el hash guardado y
   comprueba que verifica con `verifyPassword()` —la misma función del login— con
   la clave del entorno. Si no verifica, falla en vez de dejar una cuenta que no

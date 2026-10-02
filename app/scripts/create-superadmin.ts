@@ -3,9 +3,9 @@
  *
  * QUÉ HACE
  *   Deja en la base UNA cuenta con el rol de plataforma `superadmin` (069) y con
- *   la clave que traiga la variable de entorno. Es idempotente: la primera
- *   corrida la crea y las siguientes actualizan su clave; nunca crea una segunda
- *   cuenta ni duplica el rol.
+ *   la clave que traiga la variable de entorno, anclada a la SEDE DE PLATAFORMA.
+ *   Es idempotente: la primera corrida la crea y las siguientes actualizan su
+ *   clave; nunca crea una segunda cuenta ni duplica el rol.
  *
  * POR QUÉ ES UN SCRIPT Y NO PARTE DEL ALTA DE USUARIOS
  *   `adminCreateUser` (auth/service.ts) NO puede crear esta cuenta: su esquema
@@ -23,33 +23,44 @@
  *   `hashPassword()` de la app —el mismo módulo cuyo `verifyPassword()` usa el
  *   login—, para que el hash no pueda divergir del que la aplicación espera.
  *
- * LA SEDE (por qué es obligatoria y no tiene respaldo)
- *   `users.sede_id` es NOT NULL (003_admin.sql): toda cuenta pertenece a una
- *   sede, también la de plataforma —el rol es ADICIONAL, no una sede nueva—.
- *   La sede viene en `SUPERADMIN_SEDE_ID` y NO tiene valor por defecto: un
- *   respaldo silencioso ("la primera sede") es la forma de dejar la cuenta en la
- *   sede equivocada sin que nadie lo note. Si el id no existe en `sedes`, el
- *   script falla antes de escribir.
+ * LA SEDE DE PLATAFORMA (decisión del dueño: el super admin no es del negocio)
+ *   `users.sede_id` es NOT NULL (003_admin.sql), así que la cuenta tiene que
+ *   pertenecer a ALGUNA sede. Pedirla por variable obligaba al dueño a elegir
+ *   una sede de CLIENTE para una cuenta que está para ajustar el SISTEMA. En su
+ *   lugar, el script asegura una fila de `sedes` llamada `Plataforma (sistema)`:
+ *   la representación honesta de "no es una sede de cliente".
  *
- * EL DESTINO (por qué hay que declararlo)
- *   `SUPERADMIN_TARGET` (`pruebas` | `produccion`) es la confirmación explícita
- *   de a qué instalación se le va a escribir: el script se niega a correr sin
- *   ella y la imprime junto con el host de Supabase al que apunta. Un script de
- *   credenciales que adivina su destino es el que termina creando la cuenta de
- *   producción con la clave de pruebas.
+ *   * Idempotente POR NOMBRE: `sedes` no tiene `code` ni unicidad por nombre
+ *     (003_admin.sql), así que el nombre es la única clave estable. Si la fila
+ *     existe se USA tal como está —el script no cambia el estado de una sede que
+ *     no creó: si la encuentra ACTIVA, avisa— y si no existe se crea con
+ *     `is_active = false` para que no sea una sede operativa.
+ *   * Si la sede no se puede asegurar, el script FALLA ANTES de tocar la cuenta.
+ *   * NO se relaja `users.sede_id` ni se toca `resolveSede` ni `requireSedeRole`
+ *     (`src/shared/lib/sede.ts`): esa frontera es la que sostiene el aislamiento
+ *     por sede de todas las rutas del negocio, y aflojarla para una cuenta lo
+ *     propagaría a cada guarda. Para el negocio, la cuenta sigue siendo un
+ *     usuario de una sede; el privilegio de plataforma viene del ROL (G1). Las
+ *     guardas son PURAS sobre `sede_id` y no miran `sedes.is_active`, así que la
+ *     sede inactiva no deja a la cuenta afuera de nada.
  *
  * QUÉ ESCRIBE (y qué no)
  *   * Crea la cuenta con `create_user_with_role` (054): `users` + `user_roles`
  *     en UNA sentencia, igual que el alta de la app. No hay inserts a mano.
  *   * Aplica el rol con `replace_user_roles` (039) en los DOS caminos y
  *     contrasta el conjunto que la base devuelve: si no es exactamente
- *     `superadmin`, falla. La cuenta queda con ese rol y ningún otro.
+ *     `superadmin`, falla. Esa ES la definición de la cuenta: ajusta el sistema
+ *     y NO opera el negocio —caja, facturas y nómina le quedan sin permisos, a
+ *     propósito—, así que el conjunto no se amplía nunca.
  *   * Deja `must_change_password = false`: AUTH-01 pide cambio obligatorio
  *     cuando la clave inicial es el documento, pero acá la clave es la del
  *     entorno y el despliegue ya la eligió; con el cambio forzado la clave
  *     desplegada sería de un solo uso y volver a correr el script la repondría.
  *   * Limpia el bloqueo (`locked_until`, `failed_attempts`): es la salida
  *     operativa cuando la cuenta quedó bloqueada por intentos.
+ *   * Re-ancla la cuenta a la sede de plataforma si estaba en otra sede, y lo
+ *     dice (cambiar de sede cambia lo que esa cuenta ve del negocio: no puede ser
+ *     silencioso).
  *   * NO habilita una cuenta deshabilitada (`is_active = false`): eso es una
  *     decisión del dueño y el script falla en vez de deshacerla en silencio.
  *   * NO escribe auditoría: el vocabulario de `audit_logs` no tiene una acción
@@ -59,10 +70,11 @@
  *   `npm run create:superadmin` con las variables en el entorno de la corrida
  *   (ver el README de la app). No lee `.env.local`: el entorno de la corrida es
  *   el que se declara a mano, y nadie quiere que un archivo local decida contra
- *   qué base se escribe una credencial.
+ *   qué base se escribe una credencial. El script imprime el host de Supabase
+ *   ANTES de escribir: ese es el chequeo humano de a qué instalación le escribe
+ *   —cada entorno tiene su propio `.env`—.
  */
 
-import { z } from "zod";
 import { esRechazoDeRpc, hashPassword, verifyPassword } from "@/src/features/auth/service";
 
 // ---------------------------------------------------------------- contrato ---
@@ -77,21 +89,17 @@ export const DOCUMENTO_PLATAFORMA = "superadmin";
 export const NOMBRE_PLATAFORMA = "Administración de plataforma";
 /** `otro` es el único tipo de identificación honesto: no es un documento de nadie. */
 export const TIPO_ID_PLATAFORMA = "otro";
-/** El rol de plataforma del catálogo (069). */
+/** El rol de plataforma del catálogo (069). Es el ÚNICO rol de esta cuenta. */
 export const ROL_PLATAFORMA = "superadmin";
 
-export const VAR_CLAVE = "SUPERADMIN_PASSWORD";
-export const VAR_SEDE = "SUPERADMIN_SEDE_ID";
-export const VAR_DESTINO = "SUPERADMIN_TARGET";
-
 /**
- * ÚNICO destino declarable. La lista se deriva del esquema —y no se escribe dos
- * veces— para que agregar un entorno no deje un valor válido sin declarar
- * (mismo criterio que `SEDE_ASSIGNABLE_ROLES` en auth/schemas.ts).
+ * Nombre de la SEDE DE PLATAFORMA: se lee como lo que es (no es una sede de
+ * cliente) y es la clave de identidad de la fila, porque `sedes` no tiene
+ * `code`.
  */
-export const destinoSchema = z.enum(["pruebas", "produccion"]);
-export type DestinoPlataforma = z.infer<typeof destinoSchema>;
-export const DESTINOS: readonly DestinoPlataforma[] = destinoSchema.options;
+export const NOMBRE_SEDE_PLATAFORMA = "Plataforma (sistema)";
+
+export const VAR_CLAVE = "SUPERADMIN_PASSWORD";
 
 /** Fallo de NEGOCIO del script: `codigo` es el contrato que las pruebas fijan. */
 export class SuperadminError extends Error {
@@ -125,56 +133,31 @@ export function leerClave(env: Entorno): string {
   return clave;
 }
 
-/**
- * El uuid de la sede. Acá SÍ se recortan espacios: es un identificador, no una
- * credencial, y un salto de línea de un archivo de despliegue no puede cambiar
- * qué sede se eligió.
- */
-export function leerSede(env: Entorno): string {
-  const sede = env[VAR_SEDE]?.trim();
-  if (!sede) {
-    throw new SuperadminError(
-      "SEDE_AUSENTE",
-      `${VAR_SEDE} no está definida: la cuenta de plataforma también pertenece a una sede (users.sede_id es NOT NULL) y no hay sede por defecto.`,
-    );
-  }
-  const parsed = z.uuid().safeParse(sede);
-  if (!parsed.success) {
-    throw new SuperadminError(
-      "SEDE_INVALIDA",
-      `${VAR_SEDE} no es un uuid válido. Use el id de la fila de public.sedes.`,
-    );
-  }
-  return parsed.data;
-}
-
-export function leerDestino(env: Entorno): DestinoPlataforma {
-  const destino = env[VAR_DESTINO]?.trim();
-  if (!destino) {
-    throw new SuperadminError(
-      "DESTINO_AUSENTE",
-      `${VAR_DESTINO} no está definida: escriba "pruebas" o "produccion" para declarar a qué instalación se le va a escribir.`,
-    );
-  }
-  const parsed = destinoSchema.safeParse(destino);
-  if (!parsed.success) {
-    throw new SuperadminError(
-      "DESTINO_DESCONOCIDO",
-      `${VAR_DESTINO} debe ser "pruebas" o "produccion", no "${destino}".`,
-    );
-  }
-  return parsed.data;
-}
-
 // ---------------------------------------------------------- contra la base ---
+
+export interface SedeDePlataforma {
+  id: string;
+  name: string;
+  is_active: boolean;
+  /** `true` solo en la corrida que la creó: es lo que hace visible el "no creó otra". */
+  creada: boolean;
+}
 
 export interface ResultadoAprovisionamiento {
   /** `creada` la primera vez, `actualizada` en las corridas siguientes. */
   accion: "creada" | "actualizada";
   userId: string;
-  sedeNombre: string;
+  sede: SedeDePlataforma;
+  /** Lo que hay que decir en voz alta. Vacío cuando no hubo nada que avisar. */
+  avisos: string[];
   /** El conjunto que la base confirmó que aplicó (contraste de `replace_user_roles`). */
   roles: string[];
+}
+
+interface FilaSede {
+  id: string;
+  name: string;
+  is_active: boolean;
 }
 
 /**
@@ -187,42 +170,106 @@ async function adminDb() {
   return createAdminClient();
 }
 
+type Db = Awaited<ReturnType<typeof adminDb>>;
+
 /**
- * Deja la cuenta de plataforma con la clave recibida. Idempotente por
- * construcción: primero LEE la cuenta por documento y decide entre crear y
- * actualizar; la unicidad de `users.id_number` (002) es la red de la base si dos
- * procesos llegan a la vez.
+ * Asegura la SEDE DE PLATAFORMA y devuelve la fila que existe al final: la que
+ * ya estaba o la que se acaba de crear. Nunca crea una segunda fila con el mismo
+ * nombre, y falla antes de que nadie toque la cuenta.
+ */
+async function asegurarSedeDePlataforma(db: Db): Promise<SedeDePlataforma> {
+  const { data: filasData, error: lecturaError } = await db
+    .from("sedes")
+    .select("id, name, is_active")
+    .eq("name", NOMBRE_SEDE_PLATAFORMA);
+  if (lecturaError) {
+    throw new SuperadminError(
+      "LECTURA_FALLIDA",
+      `No se pudo leer la sede de plataforma: ${lecturaError.message}`,
+    );
+  }
+  const filas = (filasData ?? []) as FilaSede[];
+
+  // Red de conteo: dos filas con el mismo nombre dejarían a cada corrida anclada
+  // a una sede distinta, en silencio.
+  if (filas.length > 1) {
+    throw new SuperadminError(
+      "SEDE_DUPLICADA",
+      `Hay ${filas.length} sedes llamadas "${NOMBRE_SEDE_PLATAFORMA}". Deje una sola y vuelva a intentar.`,
+    );
+  }
+
+  if (filas.length === 1) {
+    return { ...filas[0], creada: false };
+  }
+
+  // `is_active = false`: la sede de plataforma no es una sede operativa. Es
+  // `false` explícito y no el default de la columna (`true`, 003_admin.sql).
+  const { data: creadaData, error: altaError } = await db
+    .from("sedes")
+    .insert({ name: NOMBRE_SEDE_PLATAFORMA, is_active: false })
+    .select("id, name, is_active")
+    .single();
+  if (altaError || !creadaData) {
+    throw new SuperadminError(
+      "SEDE_FALLIDA",
+      `No se pudo crear la sede de plataforma: ${altaError?.message ?? "la base no devolvió la fila creada"}.`,
+    );
+  }
+
+  // Red de conteo (mismo criterio que las funciones de 054): la lectura de
+  // arriba y esta escritura no son una transacción, así que otra corrida pudo
+  // crear la misma sede en el medio. Se relee y se falla si quedó más de una.
+  const { data: verificacion, error: verificacionError } = await db
+    .from("sedes")
+    .select("id")
+    .eq("name", NOMBRE_SEDE_PLATAFORMA);
+  if (verificacionError) {
+    throw new SuperadminError(
+      "LECTURA_FALLIDA",
+      `No se pudo verificar la sede de plataforma: ${verificacionError.message}`,
+    );
+  }
+  const total = (verificacion ?? []) as Array<{ id: string }>;
+  if (total.length !== 1) {
+    throw new SuperadminError(
+      "SEDE_DUPLICADA",
+      `Quedaron ${total.length} sedes llamadas "${NOMBRE_SEDE_PLATAFORMA}": deje una sola y vuelva a intentar.`,
+    );
+  }
+
+  return { ...(creadaData as FilaSede), creada: true };
+}
+
+/**
+ * Deja la cuenta de plataforma con la clave recibida, anclada a la sede de
+ * plataforma. Idempotente por construcción: primero asegura la sede, después LEE
+ * la cuenta por documento y decide entre crear y actualizar; la unicidad de
+ * `users.id_number` (002) es la red de la base si dos procesos llegan a la vez.
  */
 export async function provisionarSuperadmin(args: {
   clave: string;
-  sedeId: string;
 }): Promise<ResultadoAprovisionamiento> {
   const db = await adminDb();
 
-  // 1. La sede tiene que EXISTIR. `users.sede_id` es NOT NULL con FK a `sedes`:
-  //    un uuid inventado haría fallar el alta —o, peor, dejaría la cuenta sin
-  //    sede si algún día la columna se relajara—, así que se comprueba antes de
-  //    escribir una sola fila.
-  const { data: sedeData, error: sedeError } = await db
-    .from("sedes")
-    .select("id, name")
-    .eq("id", args.sedeId)
-    .maybeSingle();
-  if (sedeError) {
-    throw new SuperadminError("LECTURA_FALLIDA", `No se pudo leer la sede: ${sedeError.message}`);
-  }
-  if (!sedeData) {
-    throw new SuperadminError(
-      "SEDE_DESCONOCIDA",
-      `No hay ninguna sede con id ${args.sedeId}. Consulte el catálogo (select id, name from public.sedes) y vuelva a intentar.`,
+  // 1. La SEDE, ANTES de tocar la cuenta: una cuenta sin sede no puede existir
+  //    (`users.sede_id` es NOT NULL) y una sede a medias es peor que un script
+  //    que no corrió.
+  const sede = await asegurarSedeDePlataforma(db);
+
+  const avisos: string[] = [];
+  if (sede.is_active) {
+    // El script no deshace el estado de una sede que no creó: lo dice y sigue,
+    // para que la rotación de la clave no dependa de otra decisión.
+    avisos.push(
+      `la sede "${sede.name}" ya existía y está ACTIVA. El script no cambia el estado de una sede existente: revísela para que no se ofrezca como sede del negocio.`,
     );
   }
-  const sede = sedeData as { id: string; name: string };
 
   // 2. ¿Ya existe la cuenta? La decisión crear/actualizar sale de esta lectura.
   const { data: cuentaData, error: cuentaError } = await db
     .from("users")
-    .select("id, is_active")
+    .select("id, sede_id, is_active")
     .eq("id_number", DOCUMENTO_PLATAFORMA)
     .maybeSingle();
   if (cuentaError) {
@@ -277,20 +324,27 @@ export async function provisionarSuperadmin(args: {
     accion = "creada";
   } else {
     // 3b. Actualización. Una cuenta deshabilitada NO se rehabilita acá.
-    const cuenta = cuentaData as { id: string; is_active: boolean };
+    const cuenta = cuentaData as { id: string; sede_id: string | null; is_active: boolean };
     if (!cuenta.is_active) {
       throw new SuperadminError(
         "CUENTA_INACTIVA",
         `La cuenta ${DOCUMENTO_PLATAFORMA} existe pero está deshabilitada (users.is_active = false). El script no deshace esa decisión: habilítela a mano si eso es lo que quiere.`,
       );
     }
+    if (cuenta.sede_id !== sede.id) {
+      // Cambiar de sede cambia lo que la cuenta ve del negocio: se hace, porque
+      // la cuenta es de plataforma, pero se DICE.
+      avisos.push(
+        `la cuenta estaba anclada a otra sede (${cuenta.sede_id ?? "sin sede"}): se ancló a "${sede.name}".`,
+      );
+    }
     userId = cuenta.id;
     accion = "actualizada";
   }
 
-  // 4. La credencial y el estado de acceso, en UNA escritura. Se hacen en los
-  //    DOS caminos —también en el alta— para que el estado final sea el mismo y
-  //    no dependa de cuál de los dos caminos se tomó.
+  // 4. La credencial, el estado de acceso y la SEDE, en UNA escritura. Se hacen
+  //    en los DOS caminos —también en el alta— para que el estado final sea el
+  //    mismo y no dependa de cuál de los dos caminos se tomó.
   const { error: credencialError } = await db
     .from("users")
     .update({
@@ -300,6 +354,7 @@ export async function provisionarSuperadmin(args: {
       must_change_password: false,
       failed_attempts: 0,
       locked_until: null,
+      sede_id: sede.id,
     })
     .eq("id", userId);
   if (credencialError) {
@@ -313,7 +368,7 @@ export async function provisionarSuperadmin(args: {
   //    `replace_user_roles` (039) es la función de la casa para escribir roles y
   //    su retorno es el conjunto aplicado —el llamador no da por hecho lo que
   //    pidió—. Reemplazar (y no agregar) es deliberado: la cuenta queda con el
-  //    rol de plataforma y ningún otro, en cada corrida.
+  //    rol de plataforma y ningún otro, en cada corrida. Esa es su definición.
   const { data: rolesData, error: rolError } = await db.rpc("replace_user_roles", {
     p_user_id: userId,
     p_role_codes: [ROL_PLATAFORMA],
@@ -343,7 +398,7 @@ export async function provisionarSuperadmin(args: {
   //    con la clave desplegada es peor que un script que no corrió.
   const { data: guardadoData, error: guardadoError } = await db
     .from("users")
-    .select("password_hash, must_change_password")
+    .select("password_hash, must_change_password, sede_id")
     .eq("id", userId)
     .maybeSingle();
   if (guardadoError || !guardadoData) {
@@ -352,7 +407,11 @@ export async function provisionarSuperadmin(args: {
       `No se pudo releer la credencial guardada: ${guardadoError?.message ?? "la cuenta no está"}.`,
     );
   }
-  const guardado = guardadoData as { password_hash: string; must_change_password: boolean };
+  const guardado = guardadoData as {
+    password_hash: string;
+    must_change_password: boolean;
+    sede_id: string | null;
+  };
   if (
     !(await verifyPassword(args.clave, guardado.password_hash)) ||
     guardado.must_change_password
@@ -362,8 +421,14 @@ export async function provisionarSuperadmin(args: {
       "La clave guardada no verifica contra la del entorno. Revise la variable y vuelva a intentar.",
     );
   }
+  if (guardado.sede_id !== sede.id) {
+    throw new SuperadminError(
+      "SEDE_NO_ANCLADA",
+      `La cuenta quedó en la sede ${guardado.sede_id ?? "sin sede"} en vez de "${sede.name}".`,
+    );
+  }
 
-  return { accion, userId, sedeNombre: sede.name, roles };
+  return { accion, userId, sede, avisos, roles };
 }
 
 // -------------------------------------------------------------------- CLI ---
@@ -381,14 +446,12 @@ function hostDe(url: string): string {
 }
 
 /**
- * Punto de entrada. NUNCA imprime la clave ni el hash: solo el destino, la sede
- * y lo que quedó escrito.
+ * Punto de entrada. NUNCA imprime la clave ni el hash: solo el host de destino,
+ * la sede y lo que quedó escrito.
  */
 export async function main(): Promise<void> {
   try {
     const clave = leerClave(process.env);
-    const sedeId = leerSede(process.env);
-    const destino = leerDestino(process.env);
     const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
     if (!url) {
       throw new SuperadminError(
@@ -397,16 +460,18 @@ export async function main(): Promise<void> {
       );
     }
 
-    console.log(`[superadmin] destino declarado: ${destino} — Supabase: ${hostDe(url)}`);
-    if (destino === "produccion") {
-      console.log("[superadmin] PRODUCCIÓN: esta corrida escribe en la base de producción.");
-    }
-    console.log(`[superadmin] sede: ${sedeId}`);
+    // El host, ANTES de escribir: es el chequeo humano de a qué base se le
+    // escribe (cada entorno tiene su propio `.env`).
+    console.log(`[superadmin] Supabase: ${hostDe(url)}`);
 
-    const resultado = await provisionarSuperadmin({ clave, sedeId });
+    const resultado = await provisionarSuperadmin({ clave });
 
     console.log(
-      `[superadmin] cuenta ${DOCUMENTO_PLATAFORMA} ${resultado.accion}: usuario ${resultado.userId} — sede ${resultado.sedeNombre} — roles [${resultado.roles.join(", ")}]`,
+      `[superadmin] sede de plataforma: ${resultado.sede.name} — ${resultado.sede.id} (${resultado.sede.creada ? "creada" : "ya existía"})`,
+    );
+    for (const aviso of resultado.avisos) console.warn(`[superadmin] AVISO: ${aviso}`);
+    console.log(
+      `[superadmin] cuenta ${DOCUMENTO_PLATAFORMA} ${resultado.accion}: usuario ${resultado.userId} — roles [${resultado.roles.join(", ")}]`,
     );
     console.log(
       "[superadmin] la clave del entorno verifica contra el hash guardado (scrypt, hashPassword de la app).",
