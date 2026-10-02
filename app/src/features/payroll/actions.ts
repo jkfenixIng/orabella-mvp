@@ -30,7 +30,6 @@ import {
   requirePayrollAdmin,
   requirePayrollPayer,
   requirePayrollViewer,
-  setPayrollStartDate,
   setVoucherLimits,
 } from "./service";
 
@@ -283,32 +282,17 @@ export async function getPayrollSettlementSourcesAction(periodId: string, employ
 }
 
 /**
- * F10: la fecha desde la que la nómina OPERA en la sede (la fecha de inicio de
- * la implementación). Nada anterior a esa fecha existe para el sistema. Es
- * configuración de nómina: la lee y la escribe SOLO el admin de la sede.
+ * F10/G3b: la fecha desde la que la nómina OPERA en la sede (la fecha de inicio
+ * de la implementación). Nada anterior a esa fecha existe para el sistema.
+ *
+ * La LECTURA sigue en nómina porque el aviso de ciclos pendientes y el diálogo
+ * de apertura la necesitan; la ESCRITURA se movió a la plataforma (G3b): el
+ * admin de la sede ya no puede cambiarla.
  */
 export async function getPayrollStartDateAction() {
   try {
     const session = await requirePayrollAdmin(await sessionToken());
     const data = await getPayrollStartDate(session.sedeId);
-    return { success: true as const, data };
-  } catch (error) {
-    return toFailure(error);
-  }
-}
-
-/**
- * F10: fija (o limpia, con `null`) la fecha de inicio de la nómina de la sede.
- * Misma lógica que `setVoucherLimitsAction`: solo admin, validación en el
- * servicio.
- */
-export async function setPayrollStartDateAction(input: unknown) {
-  try {
-    const session = await requirePayrollAdmin(await sessionToken());
-    const data = await setPayrollStartDate(input, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

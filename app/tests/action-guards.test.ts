@@ -711,6 +711,13 @@ const SURFACES: readonly SurfaceSpec[] = [
     roles: ["superadmin"],
     why: "lista TODAS las sedes de la instalación: es la superficie de plataforma y ningún rol de sede entra.",
   },
+  {
+    file: PLATFORM_ACTIONS_FILE,
+    name: "setPlatformPayrollStartDateAction",
+    kind: "platform",
+    roles: ["superadmin"],
+    why: "G3b: configura la fecha de inicio de la nómina de la sede ELEGIDA, para cualquier sede. Es configuración de plataforma: ningún rol de sede la cambia.",
+  },
   // ---- acciones de nómina: solo admin (pagar un ítem incluido) ----
   {
     file: PAYROLL_ACTIONS_FILE,
@@ -808,14 +815,7 @@ const SURFACES: readonly SurfaceSpec[] = [
     name: "getPayrollStartDateAction",
     kind: "payroll",
     roles: ["admin"],
-    why: "F10: lee desde cuándo existe la nómina de la sede. Es configuración de nómina (y el piso de los ciclos que se ofrecen), no del recibo del empleado: la caja no entra.",
-  },
-  {
-    file: PAYROLL_ACTIONS_FILE,
-    name: "setPayrollStartDateAction",
-    kind: "payroll",
-    roles: ["admin"],
-    why: "F10: fija la fecha de inicio de la nómina de la sede (configuración de nómina, solo admin).",
+    why: "F10: lee desde cuándo existe la nómina de la sede. Es configuración de nómina (y el piso de los ciclos que se ofrecen), no del recibo del empleado: la caja no entra. G3b: la ESCRITURA salió de nómina; esta fila cubre solo la lectura que el aviso y el diálogo necesitan.",
   },
   // ---- rutas de nómina: solo admin ----
   {

@@ -112,8 +112,8 @@ import {
   getPayrollStartDateAction,
   getPeriodDetailAction,
   listVouchersAction,
-  setPayrollStartDateAction,
 } from "@/src/features/payroll/actions";
+import * as payrollActions from "@/src/features/payroll/actions";
 import type { AdminSession } from "@/src/features/admin/service";
 import {
   chunkIds,
@@ -5406,9 +5406,10 @@ describe("payroll-client: el diálogo de apertura DERIVADO (F10, guarda de fuent
     expect(client).toContain("const startDate = openResolution?.ok ? openResolution.start_date : \"\";");
     expect(client).toContain("const endDate = openResolution?.ok ? openResolution.end_date : \"\";");
     expect(client).toContain("openResolution.trimmed");
-    // La ayuda del control (fuera del diálogo) es la que explica la fecha.
-    expect(client).toContain('id="payroll-start-date"');
-    expect(client).toContain("Nada anterior a esa fecha existe para el sistema");
+    // G3b: el control de la fecha salió de la pantalla (la configura la
+    // plataforma). Lo que queda es la LECTURA que el diálogo usa para acotar.
+    expect(client).not.toContain('id="payroll-start-date"');
+    expect(client).toContain("isRangeBeforePayrollStart({ payrollStartDate, startDate, endDate })");
   });
 
   it("la única entrada es el aviso: el ciclo pendiente queda ELEGIDO y se confirma", () => {
@@ -11464,10 +11465,10 @@ describe("payroll-client: el aviso de ciclos pendientes y la entrada DERIVADA de
     // Ningún `role=` escrito a mano en el aviso (movería el pin de feedback-batch2).
     const notice = source.indexOf('<Alert variant="warning" className="mt-3">');
     expect(source.slice(notice, notice + 220)).not.toMatch(/\brole\s*=/);
-    // F10: con la fecha sin configurar, el aviso INVITA a fijarla (y el control
-    // no se esconde: se sigue viendo arriba).
-    expect(source).toContain("Fije la fecha de inicio de la nómina (arriba) para que el sistema sepa desde cuándo");
-    expect(source).toContain('id="payroll-start-date"');
+    // F10/G3b: con la fecha sin configurar, el aviso dice quién la configura
+    // (la plataforma): el control ya no vive en esta pantalla.
+    expect(source).toContain("La fecha de inicio de la nómina la configura la plataforma");
+    expect(source).not.toContain('id="payroll-start-date"');
   });
 
   it("cada pendiente abre el diálogo con SU ciclo ya elegido (F10: no se elige nada más)", () => {
@@ -12105,7 +12106,7 @@ describe("payroll: la fecha de arranque de la nómina de la sede (F10, servicio)
   });
 });
 
-describe("payroll: la fecha de arranque de la nómina por la action y por SSR (F10)", () => {
+describe("payroll: la fecha de arranque de la nómina (F10/G3b): la escritura salió a la plataforma", () => {
   const SEDE = payrollPagedStub.SEDE_ID;
 
   beforeEach(() => resetPayrollStubState());
@@ -12117,38 +12118,51 @@ describe("payroll: la fecha de arranque de la nómina por la action y por SSR (F
     };
   }
 
-  it("el admin la escribe y la lee por la action; los demás roles no la tocan", async () => {
-    seedSede(null);
-    payrollPagedStub.session = { userId: "u-admin", sedeId: SEDE, roles: ["admin"] };
-    expect(await setPayrollStartDateAction({ payroll_start_date: "2026-10-05" })).toEqual({
-      success: true,
-      data: { payroll_start_date: "2026-10-05" },
-    });
-    expect(await getPayrollStartDateAction()).toEqual({ success: true, data: "2026-10-05" });
-    // La caja abre vales, no configura la nómina: la guarda es `requirePayrollAdmin`.
-    payrollPagedStub.session = { userId: "u-caja", sedeId: SEDE, roles: ["caja"] };
-    const deniedWrite = await setPayrollStartDateAction({ payroll_start_date: "2027-01-01" });
-    expect(deniedWrite).toMatchObject({ success: false, code: "FORBIDDEN" });
-    // Y el empleado tampoco la lee: es configuración de la sede.
-    payrollPagedStub.session = { userId: "u-emp", sedeId: SEDE, roles: ["empleado"] };
-    const deniedRead = await getPayrollStartDateAction();
-    expect(deniedRead).toMatchObject({ success: false, code: "FORBIDDEN" });
-    // Ninguno de los dos rechazos escribió: la fecha sigue siendo la del admin.
-    expect(await getPayrollStartDate(SEDE)).toBe("2026-10-05");
+  it("nómina ya no expone la escritura: la action no existe y la pantalla no la pide", () => {
+    const actions = readFileSync(
+      join(process.cwd(), "src", "features", "payroll", "actions.ts"),
+      "utf8",
+    );
+    const client = readFileSync(
+      join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
+      "utf8",
+    );
+    // Control positivo: el módulo sigue exportando la LECTURA.
+    expect(actions).toContain("export async function getPayrollStartDateAction");
+    // G3b: la ESCRITURA salió. Ni la action, ni el formulario, ni su campo.
+    expect(actions).not.toContain("setPayrollStartDateAction");
+    expect(client).not.toContain("setPayrollStartDateAction");
+    expect(client).not.toContain('id="payroll-start-date"');
+    // La forma del módulo: una acción borrada no puede quedar accesible.
+    expect(payrollActions).not.toHaveProperty("setPayrollStartDateAction");
   });
 
-  it("un fallo del servicio se devuelve con su código, no como un éxito vacío", async () => {
-    seedSede(null);
+  it("un admin de sede ya no puede cambiarla por nómina y NADA se escribe", async () => {
+    seedSede("2026-01-01");
     payrollPagedStub.session = { userId: "u-admin", sedeId: SEDE, roles: ["admin"] };
-    const invalid = await setPayrollStartDateAction({ payroll_start_date: "05/10/2026" });
-    expect(invalid).toMatchObject({ success: false, code: "VALIDATION" });
-    expect(await getPayrollStartDate(SEDE)).toBeNull();
+    // No hay action de escritura que invocar: el módulo de nómina no la expone.
+    expect(payrollActions).not.toHaveProperty("setPayrollStartDateAction");
+    // Y la fecha sigue siendo la que dejó la plataforma: nadie la tocó.
+    expect(await getPayrollStartDate(SEDE)).toBe("2026-01-01");
+  });
+
+  it("la LECTURA sigue alimentando el aviso y el diálogo (la conserva nómina)", async () => {
+    seedSede("2026-10-05");
+    // El admin la lee: es la cota que usan el aviso de pendientes y el diálogo.
+    payrollPagedStub.session = { userId: "u-admin", sedeId: SEDE, roles: ["admin"] };
+    expect(await getPayrollStartDateAction()).toEqual({ success: true, data: "2026-10-05" });
+    // La caja abre vales, no lee la configuración de nómina.
+    payrollPagedStub.session = { userId: "u-caja", sedeId: SEDE, roles: ["caja"] };
+    expect(await getPayrollStartDateAction()).toMatchObject({ success: false, code: "FORBIDDEN" });
+    // Y el empleado tampoco la lee: es configuración de la sede.
+    payrollPagedStub.session = { userId: "u-emp", sedeId: SEDE, roles: ["empleado"] };
+    expect(await getPayrollStartDateAction()).toMatchObject({ success: false, code: "FORBIDDEN" });
   });
 
   it("la página la lee con el servicio y la pasa como valor inicial (SSR)", () => {
     const page = readFileSync(join(process.cwd(), "app", "payroll", "page.tsx"), "utf8");
     // Sólo el admin: al empleado se le manda su recibo, no la configuración de
-    // la sede (la action también rechaza a cualquier otro rol).
+    // la sede (la action de lectura también rechaza a cualquier otro rol).
     expect(page).toContain("canAdmin ? getPayrollStartDate(sedeId) : null");
     expect(page).toContain("initialPayrollStartDate={payrollStartDate ?? null}");
     // Control negativo: la lectura NO se hizo para todos los roles.

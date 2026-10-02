@@ -17,7 +17,6 @@ import {
   openPayrollPeriodAction,
   payPayrollExtraAction,
   payPayrollItemAction,
-  setPayrollStartDateAction,
 } from "@/src/features/payroll/actions";
 import { getInvoiceAction } from "@/src/features/billing/actions";
 import type {
@@ -1187,14 +1186,11 @@ export function PayrollClient(props: PayrollClientProps) {
 
   // F10: la fecha desde la que la nómina OPERA en la sede. Es ESTADO de la sede
   // —no configuración local— porque el servidor es su única fuente: llega
-  // leída de la página y la acción devuelve la fecha escrita. `null` =
-  // todavía no configurada, que conserva el comportamiento de hoy.
-  const [payrollStartDate, setPayrollStartDate] = useState<string | null>(
-    props.initialPayrollStartDate,
-  );
-  // Borrador del control de la fecha: lo que el admin escribió todavía sin
-  // guardar (vacío = volver a «sin configurar»).
-  const [startDateDraft, setStartDateDraft] = useState(props.initialPayrollStartDate ?? "");
+  // leída de la página (SSR). `null` = todavía no configurada, que conserva el
+  // comportamiento de hoy. G3b: la ESCRITURA salió de esta pantalla —la
+  // configura solo la plataforma—; acá queda la LECTURA que el aviso y el
+  // diálogo necesitan.
+  const [payrollStartDate] = useState<string | null>(props.initialPayrollStartDate);
 
   // F10: abrir un período NO se pregunta. La única entrada al diálogo es el
   // aviso de ciclos pendientes: su ciclo queda ELEGIDO y el rango se DERIVA de
@@ -1465,27 +1461,6 @@ export function PayrollClient(props: PayrollClientProps) {
     setOpenError(null);
     setOpenTarget(entry);
     setOpenDialogOpen(true);
-  }
-
-  /**
-   * F10: guarda la fecha de inicio de la nómina de la sede (vacío = «sin
-   * configurar»). El éxito es EVENTO (`show` → toast); el fallo queda como
-   * estado del módulo. Con la fecha nueva se suelta el ciclo elegido: el que
-   * estaba puede quedar ANTERIOR a la fecha y el aviso se recalcula con la cota
-   * nueva.
-   */
-  async function handleSaveStartDate(event: FormEvent) {
-    event.preventDefault();
-    const written = startDateDraft.trim() === "" ? null : startDateDraft.trim();
-    setBusy(true);
-    const result = (await setPayrollStartDateAction({
-      payroll_start_date: written,
-    })) as ActionResult<{ payroll_start_date: string | null }>;
-    setBusy(false);
-    if (!show(result, "Fecha de inicio de la nómina guardada.")) return;
-    setPayrollStartDate(result.data.payroll_start_date);
-    setStartDateDraft(result.data.payroll_start_date ?? "");
-    setOpenTarget(null);
   }
 
   async function handleOpen(event: FormEvent) {
@@ -2181,40 +2156,13 @@ export function PayrollClient(props: PayrollClientProps) {
       <section className={sectionClass}>
         <h2 className="text-lg font-semibold">Períodos</h2>
         {/*
-          F10: la fecha desde la que la nómina OPERA en la sede. El control NO
-          se esconde —tampoco cuando ya está configurada: se puede corregir y se
-          puede volver a «sin configurar» (campo vacío)—, y cuando está en NULL
-          la ayuda invita a fijarla. Nada anterior a esa fecha existe para el
-          sistema. Es configuración de nómina, así que sólo el admin la ve. El
-          éxito de la escritura es EVENTO (toast, por `show`) y el fallo queda
-          como estado del módulo, en el canal de los demás fallos de acción.
-          Deliberadamente MÍNIMO (etiqueta, campo y ayuda, sin disposición
-          propia): la configuración se va a mudar a la superficie de plataforma
-          y esta pantalla sólo conserva la LECTURA que el diálogo y el aviso
-          necesitan.
+          F10/G3b: la fecha desde la que la nómina OPERA en la sede ya no se
+          configura acá. El control salió de esta pantalla: la fecha la fija la
+          plataforma, para cualquier sede, y el admin de la sede solo la lee.
+          Esta pantalla conserva la LECTURA porque el aviso de ciclos pendientes
+          y el diálogo de apertura la necesitan para acotar los ciclos. El
+          detalle de la fecha vive en el aviso de abajo, junto a los pendientes.
         */}
-        {props.canAdmin && (
-          <form onSubmit={handleSaveStartDate} className="mt-3">
-            <label className={labelClass} htmlFor="payroll-start-date">
-              Fecha de inicio de la nómina
-              <input
-                id="payroll-start-date"
-                type="date"
-                value={startDateDraft}
-                onChange={(event) => setStartDateDraft(event.target.value)}
-                className={inputClass}
-              />
-            </label>
-            <button type="submit" disabled={busy} className={`${buttonClass} mt-2`}>
-              {busy ? "Guardando…" : "Guardar fecha"}
-            </button>
-            <p className="mt-1 text-xs text-text-tertiary">
-              {payrollStartDate === null
-                ? "Sin configurar: fíjela para que la nómina sepa desde cuándo liquidar. Nada anterior a esa fecha existe para el sistema: no se ofrece como ciclo y no se puede abrir."
-                : `La nómina de esta sede arranca el ${formatFullDate(payrollStartDate)}: nada anterior a esa fecha existe para el sistema. El primer ciclo de cada cadencia se liquida desde ahí. Para volver a «sin configurar», deje el campo vacío y guarde.`}
-            </p>
-          </form>
-        )}
         {/*
           F9: el atraso, a la vista donde el admin aterriza. Un ciclo que ya
           cerró y no tiene liquidación es plata que la sede debe: mientras el
@@ -2255,8 +2203,8 @@ export function PayrollClient(props: PayrollClientProps) {
             </p>
             {payrollStartDate === null && (
               <p className="mt-1">
-                Fije la fecha de inicio de la nómina (arriba) para que el sistema sepa desde cuándo
-                liquidar: nada anterior a esa fecha existe para el sistema.
+                La fecha de inicio de la nómina la configura la plataforma. Mientras no esté
+                fijada, el sistema no tiene una cota desde la cual liquidar.
               </p>
             )}
           </Alert>

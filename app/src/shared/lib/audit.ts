@@ -76,6 +76,13 @@ export const AUDIT_ACTIONS = {
   VOUCHER_APPROVED: "voucher.approved",
   VOUCHER_REQUESTED: "voucher.requested",
   VOUCHER_REJECTED: "voucher.rejected",
+  // G3b: la fecha de inicio de la nómina de una sede la configura SOLO la
+  // cuenta de plataforma, para CUALQUIER sede. Antes cambiaba sin rastro y es
+  // una fecha que mueve meses de dinero: queda con su propia acción para que un
+  // auditor lea «la plataforma configuró la nómina de la sede X» con el valor
+  // anterior y el nuevo, y no la confunda con el negocio. NO entra a ningún
+  // catálogo de alertas: es una decisión de configuración, no un desvío.
+  PLATFORM_PAYROLL_START_DATE_SET: "platform.payroll_start_date_set",
 } as const;
 
 /**

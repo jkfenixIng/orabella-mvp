@@ -10,11 +10,12 @@ import {
   requirePlatformAdmin,
   type PlatformActor,
 } from "@/src/features/platform/service";
+import { PlataformaPayrollStartDateForm } from "./plataforma-client";
 
 export const dynamic = "force-dynamic";
 
 /**
- * G3a — SUPERFICIE de plataforma.
+ * G3a/G3b — SUPERFICIE de plataforma.
  *
  * Solo la cuenta con el rol `superadmin` la ve: la guarda `requirePlatformAdmin`
  * es la primera llamada y es la única puerta. Quien no pasa NO ve una pantalla
@@ -22,8 +23,11 @@ export const dynamic = "force-dynamic";
  * sesión pero le falta el rol. Es el mismo criterio que usan `/admin` y
  * `/payroll` para una página que no le corresponde a su rol.
  *
- * Solo LECTURA: lista las sedes de la instalación (cross-sede) con su estado y
- * su fecha de inicio de nómina. Sin acciones y sin datos de negocio.
+ * Lista las sedes de la instalación (cross-sede) con su estado y su fecha de
+ * inicio de nómina, y por cada sede del negocio ofrece el formulario que la
+ * configura. La escritura NO vive acá: la isla cliente pide la acción de
+ * plataforma, que re-aplica la guarda en el servidor. La fila de la sede del
+ * sistema se reconoce por su marca de dato (`is_platform`), nunca por su nombre.
  */
 export default async function PlataformaPage() {
   const store = await cookies();
@@ -49,8 +53,9 @@ export default async function PlataformaPage() {
         description="Estado de la instalación: las sedes y la fecha desde la que opera su nómina."
       />
       <p className="text-sm text-text-secondary">
-        Esta pantalla es de solo lectura y la ve únicamente la cuenta de
-        plataforma. La sede del sistema no es una sede del negocio.
+        El estado de la instalación lo ve únicamente la cuenta de plataforma y la
+        fecha de inicio de la nómina la configura solo desde acá, para cualquier
+        sede. La sede del sistema no es una sede del negocio.
       </p>
 
       {sedes.length === 0 ? (
@@ -74,11 +79,13 @@ export default async function PlataformaPage() {
                   No es una sede del negocio: es donde se ancla la cuenta de
                   plataforma.
                 </p>
-              ) : null}
-              <p className="text-sm text-text-secondary">
-                Inicio de nómina:{" "}
-                {sede.payroll_start_date ?? "Sin configurar"}
-              </p>
+              ) : (
+                <PlataformaPayrollStartDateForm
+                  sedeId={sede.id}
+                  sedeName={sede.name}
+                  initialPayrollStartDate={sede.payroll_start_date}
+                />
+              )}
             </li>
           ))}
         </ul>
