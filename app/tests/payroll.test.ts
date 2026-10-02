@@ -2033,6 +2033,18 @@ function createPayrollPagedStubClient(): unknown {
         filters.push((row) => String(row[column] ?? "") <= String(value));
         return query;
       },
+      // `.is(col, null)` del cliente Supabase: la lectura de pendientes
+      // (`applied_period_id IS NULL`). `null` matchea también la columna
+      // ausente, que en el doble es lo mismo que la columna NULL.
+      is: (column: string, value: unknown) => {
+        filterColumns.push(column);
+        filters.push((row) =>
+          value === null
+            ? row[column] === null || row[column] === undefined
+            : row[column] === value,
+        );
+        return query;
+      },
       in: (column: string, values: readonly unknown[]) => {
         filterColumns.push(column);
         payrollPagedStub.inFilters.push({ table, column, count: values.length });
@@ -2265,6 +2277,12 @@ function createPayrollPagedStubClient(): unknown {
     const itemSnapshot = payrollPagedStub.tables.payroll_items ?? [];
     const vouchers = payrollPagedStub.tables.voucher_requests ?? [];
     const voucherSnapshot = vouchers.map((row) => ({ row, status: row.status }));
+    // NV-01: la deuda (saliente y consumida) también entra en la foto: la
+    // transacción del doble la revierte entera si algo falla. Se clona cada
+    // fila porque el marcado muta `applied_period_id` en el objeto.
+    const carrySnapshot = (payrollPagedStub.tables.payroll_discount_carries ?? []).map(
+      (row) => ({ ...row }),
+    );
     // El rechazo del servidor (guardas de forma y redes de conteo): no se
     // escribió nada, así que no hay nada que revertir.
     if (payrollPagedStub.failRpcWith) {
@@ -2272,6 +2290,7 @@ function createPayrollPagedStubClient(): unknown {
     }
     const rollback = (message: string) => {
       payrollPagedStub.tables.payroll_items = itemSnapshot;
+      payrollPagedStub.tables.payroll_discount_carries = carrySnapshot;
       for (const entry of voucherSnapshot) entry.row.status = entry.status;
       return { data: null, error: { code: "P0001", message } };
     };
@@ -2308,6 +2327,82 @@ function createPayrollPagedStubClient(): unknown {
       payrollPagedStub.itemWrites.push(persisted);
     }
     payrollPagedStub.voucherFlips.push(flipped);
+    // 3. La DEUDA saliente (061, paso 1.6): por cada ítem con voucher_excess > 0
+    //    se inserta UNA fila PENDIENTE con el período como origen, y sólo si no
+    //    existe ya una deuda del mismo empleado originada en ese período
+    //    (recalcular no duplica). NV-02: la guarda acota además por
+    //    `origin_kind` —el default histórico es 'voucher_excess'— para no
+    //    confundir este sobrante con el sobrante de la deuda (paso 3b).
+    const carries = payrollPagedStub.tables.payroll_discount_carries ?? [];
+    const periodRow = (payrollPagedStub.tables.payroll_periods ?? []).find(
+      (row) => row.id === args?.p_period_id,
+    );
+    const carryKind = (carry: Record<string, unknown>) =>
+      String(carry.origin_kind ?? "voucher_excess");
+    const newCarries = items
+      .filter((row) => Number(row.voucher_excess ?? 0) > 0)
+      .filter(
+        (row) =>
+          !carries.some(
+            (carry) =>
+              carry.origin_period_id === args?.p_period_id &&
+              carry.employee_id === row.employee_id &&
+              carryKind(carry) === "voucher_excess",
+          ),
+      )
+      .map((row) => ({
+        id: `deuda-${(payrollPagedStub.rowSeq += 1)}`,
+        sede_id: periodRow?.sede_id ?? null,
+        employee_id: row.employee_id,
+        amount: Number(row.voucher_excess),
+        origin_period_id: args?.p_period_id,
+        applied_period_id: null,
+        origin_kind: "voucher_excess",
+        created_at: "2026-01-31T23:59:59.000Z",
+      }));
+    // 3b. El SOBRANTE DE LA DEUDA (064, paso 1.8): el ítem trae
+    //     `debt_remainder` (> 0) cuando el tope no alcanzó a absorber toda la
+    //     deuda entrante. Se re-registra como una fila PENDIENTE NUEVA con este
+    //     período como origen y `origin_kind = 'carry_remainder'`, con la misma
+    //     guarda anti-duplicado que 3 pero por su propio tipo.
+    const newRemainders = items
+      .filter((row) => Number(row.debt_remainder ?? 0) > 0)
+      .filter(
+        (row) =>
+          !carries.some(
+            (carry) =>
+              carry.origin_period_id === args?.p_period_id &&
+              carry.employee_id === row.employee_id &&
+              carryKind(carry) === "carry_remainder",
+          ),
+      )
+      .map((row) => ({
+        id: `sobrante-deuda-${(payrollPagedStub.rowSeq += 1)}`,
+        sede_id: periodRow?.sede_id ?? null,
+        employee_id: row.employee_id,
+        amount: Number(row.debt_remainder),
+        origin_period_id: args?.p_period_id,
+        applied_period_id: null,
+        origin_kind: "carry_remainder",
+        created_at: "2026-01-31T23:59:59.000Z",
+      }));
+    payrollPagedStub.tables.payroll_discount_carries = [
+      ...carries,
+      ...newCarries,
+      ...newRemainders,
+    ];
+    // 4. La DEUDA consumida (062, paso 1.7): marca aplicadas las deudas
+    //    recibidas que sigan pendientes. Una ya consumida queda igual: el
+    //    replay es un no-op.
+    const consumed = (args?.p_carry_ids ?? []) as string[];
+    for (const id of consumed) {
+      const carry = payrollPagedStub.tables.payroll_discount_carries.find(
+        (row) => row.id === id,
+      );
+      if (carry && (carry.applied_period_id === null || carry.applied_period_id === undefined)) {
+        carry.applied_period_id = args?.p_period_id;
+      }
+    }
     return { data: persisted.length, error: null };
   };
 
@@ -6898,6 +6993,516 @@ describe("migración 047_payroll_apply_atomic.sql (CL-8)", () => {
     // El número libre siguiente y el archivo hermano (046) que se espeja.
     expect(raw).toContain("047");
     expect(raw).toContain("046");
+  });
+});
+
+// ------------------- NV-01: vales reales y deuda del sobrante de vales ---
+//
+// La columna de vales mostraba el descuento RECORTADO al bruto (para sostener
+// la igualdad del CHECK sin neto negativo) y el sobrante se perdía. Ahora el
+// total REAL vive aparte (`voucher_total`, fuera de la igualdad), el sobrante
+// queda como DEUDA del empleado (`payroll_discount_carries`) y se descuenta en
+// el período siguiente dentro de `other_discounts`, marcado en la MISMA
+// transacción que lo descuenta (062).
+describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-01)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-admin-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const PERIOD_ID = payrollPagedStub.PERIOD_ID;
+  const EARLIER_PERIOD_ID = "33333333-3333-4333-8333-333333333333";
+  const EMPLOYEE_ID = payrollPagedStub.EMPLOYEE_ID;
+  const SERVICE_ID = payrollPagedStub.SERVICE_ID;
+  const CARRY_ID = "44444444-4444-4444-8444-444444444444";
+
+  function employeeRow() {
+    return {
+      id: EMPLOYEE_ID,
+      sede_id: payrollPagedStub.SEDE_ID,
+      user_id: null,
+      full_name: "Empleada de vales",
+      employee_code: "E-7",
+      document: "1000000007",
+      phone: null,
+      position: null,
+      payout_mode: "normal",
+      email: null,
+      birth_date: null,
+      // Porcentaje sin bonos: el bruto ES la comisión, el caso que el dueño
+      // midió (el vale recortado se veía idéntico a la comisión).
+      pay_type: "porcentaje",
+      salary_fixed: null,
+      commission_percent: 10,
+      is_active: true,
+    };
+  }
+
+  /**
+   * Un período ANTERIOR cerrado y el período en borrador, una factura Pagada
+   * del 10% para la comisión, el vale del rango y las deudas sembradas.
+   */
+  function seed(
+    args: {
+      /** Subtotal de la factura pagada: la comisión del empleado es el 10%. */
+      invoiceSubtotal?: number;
+      /** Vale del período (pendiente en el rango). */
+      voucherAmount?: number;
+      /** Deudas ya existentes en `payroll_discount_carries`. */
+      carries?: Array<Record<string, unknown>>;
+    } = {},
+  ) {
+    const invoiceSubtotal = args.invoiceSubtotal ?? 400_000;
+    const vouchers =
+      (args.voucherAmount ?? 0) > 0
+        ? [
+            {
+              id: "vale-1",
+              sede_id: payrollPagedStub.SEDE_ID,
+              employee_id: EMPLOYEE_ID,
+              amount: args.voucherAmount,
+              request_date: "2026-02-15",
+              status: "pendiente",
+              approved_by: null,
+              approval_code: null,
+              observation: null,
+            },
+          ]
+        : [];
+    payrollPagedStub.tables = {
+      payroll_periods: [
+        {
+          id: EARLIER_PERIOD_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          start_date: "2026-01-01",
+          end_date: "2026-01-31",
+          status: "cerrado",
+          created_by: "u-admin-1",
+          closed_at: "2026-02-01T00:00:00.000Z",
+          created_at: "2026-01-01T00:00:00.000Z",
+        },
+        {
+          id: PERIOD_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          start_date: "2026-02-01",
+          end_date: "2026-02-28",
+          status: "borrador",
+          created_by: "u-admin-1",
+          closed_at: null,
+          created_at: "2026-02-01T00:00:00.000Z",
+        },
+      ],
+      employees: [employeeRow()],
+      invoices: [
+        {
+          id: "factura-1",
+          consecutive_number: 1,
+          sede_id: payrollPagedStub.SEDE_ID,
+          status: "Pagada",
+          created_at: "2026-02-15T12:00:00.000Z",
+        },
+      ],
+      invoice_items: [
+        {
+          id: "linea-1",
+          invoice_id: "factura-1",
+          item_type: "servicio",
+          employee_id: EMPLOYEE_ID,
+          qty: 1,
+          unit_price: invoiceSubtotal,
+          subtotal: invoiceSubtotal,
+          no_commission: false,
+          commission_value: null,
+          commission_percent_override: null,
+          product_id: null,
+          service_id: SERVICE_ID,
+        },
+      ],
+      commission_rules: [],
+      voucher_requests: vouchers,
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      payroll_discount_carries: args.carries ?? [],
+      audit_logs: [],
+    };
+  }
+
+  /** La fila de nómina que quedó persistida (lo que la base recibió). */
+  const persistedItem = () => payrollPagedStub.tables.payroll_items[0];
+  const carryRows = () => payrollPagedStub.tables.payroll_discount_carries ?? [];
+
+  /** La identidad del CHECK de `payroll_items` (tolerancia de un centavo). */
+  function expectIdentity(item: Record<string, unknown>) {
+    const identity =
+      Number(item.base_fixed) +
+      Number(item.commissions) +
+      Number(item.bonuses) -
+      Number(item.deductions_vales) -
+      Number(item.other_discounts);
+    expect(Math.abs(Number(item.net_pay) - identity)).toBeLessThan(0.01);
+    expect(Number(item.net_pay)).toBeGreaterThanOrEqual(0);
+  }
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  it("el total real es la SUMA de los vales aunque el tope recorte el descuento aplicado", async () => {
+    // Bruto = comisiones = 1.000 (porcentaje, sin bonos) y vale de 50.000: el
+    // caso del dueño, donde la celda de vales valía exactamente la comisión.
+    seed({ invoiceSubtotal: 10_000, voucherAmount: 50_000 });
+
+    const detail = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      {},
+      ACTOR,
+    );
+
+    const item = detail.items[0];
+    expect(item.commissions).toBe(1_000);
+    // El descuento APLICADO sigue topeado (la identidad y el signo no cambian).
+    expect(item.deductions_vales).toBe(1_000);
+    // El total REAL es lo que el empleado gastó en vales.
+    expect(item.voucher_total).toBe(50_000);
+    expect(item.net_pay).toBe(0);
+    expectIdentity(item as unknown as Record<string, unknown>);
+
+    // El sobrante quedó como deuda PENDIENTE de este período.
+    expect(carryRows()).toHaveLength(1);
+    expect(carryRows()[0]).toMatchObject({
+      employee_id: EMPLOYEE_ID,
+      amount: 49_000,
+      origin_period_id: PERIOD_ID,
+      applied_period_id: null,
+    });
+    // Y la pantalla lo puede leer aparte del neto.
+    expect(item.pending_debt).toBe(49_000);
+  });
+
+  it("voucher_excess es el remanente que el tope no aplicó y es 0 cuando no hubo recorte", async () => {
+    seed({ invoiceSubtotal: 10_000, voucherAmount: 50_000 });
+    await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    expect(persistedItem().voucher_excess).toBe(49_000);
+
+    // Control negativo: el vale entra completo en el bruto y no genera deuda.
+    resetPayrollStubState();
+    seed({ invoiceSubtotal: 10_000, voucherAmount: 500 });
+    await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    expect(persistedItem().voucher_excess).toBe(0);
+    expect(persistedItem().voucher_total).toBe(500);
+    expect(persistedItem().deductions_vales).toBe(500);
+    expect(carryRows()).toHaveLength(0);
+  });
+
+  it("una deuda pendiente de un período anterior se aplica una vez, cae en other_discounts y queda marcada", async () => {
+    seed({
+      invoiceSubtotal: 400_000, // comisión 40.000: alcanza para la deuda
+      voucherAmount: 0,
+      carries: [
+        {
+          id: CARRY_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          employee_id: EMPLOYEE_ID,
+          amount: 30_000,
+          origin_period_id: EARLIER_PERIOD_ID,
+          applied_period_id: null,
+          created_at: "2026-01-31T23:59:59.000Z",
+        },
+      ],
+    });
+
+    const detail = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      {},
+      ACTOR,
+    );
+
+    const item = detail.items[0];
+    // Para el empleado es "otros descuentos": la identidad no se toca.
+    expect(item.commissions).toBe(40_000);
+    expect(item.other_discounts).toBe(30_000);
+    expect(item.net_pay).toBe(10_000);
+    expect(item.deductions_vales).toBe(0);
+    expectIdentity(item as unknown as Record<string, unknown>);
+
+    // La deuda quedó consumida por ESTE período y viajó en la transacción.
+    expect(carryRows()[0].applied_period_id).toBe(PERIOD_ID);
+    const args = payrollPagedStub.rpcCalls[0].args;
+    expect(args.p_carry_ids).toEqual([CARRY_ID]);
+    // Ya no está pendiente: no hay deuda nueva que mostrar.
+    expect(item.pending_debt).toBe(0);
+  });
+
+  it("una deuda totalmente absorbida no deja remanente pendiente", async () => {
+    // Comisión 40.000 y deuda de 30.000: el bruto alcanza y el tope la aplica
+    // completa, así que no hay sobrante que re-registrar.
+    seed({
+      invoiceSubtotal: 400_000,
+      voucherAmount: 0,
+      carries: [
+        {
+          id: CARRY_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          employee_id: EMPLOYEE_ID,
+          amount: 30_000,
+          origin_period_id: EARLIER_PERIOD_ID,
+          applied_period_id: null,
+          created_at: "2026-01-31T23:59:59.000Z",
+        },
+      ],
+    });
+
+    await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+
+    expect(persistedItem().other_discounts).toBe(30_000);
+    expect(persistedItem().debt_remainder).toBe(0);
+    // Una sola fila: la deuda consumida, sin remanente nuevo.
+    expect(carryRows()).toHaveLength(1);
+    expect(carryRows()[0].applied_period_id).toBe(PERIOD_ID);
+    expect(carryRows().some((row) => row.origin_kind === "carry_remainder")).toBe(false);
+  });
+
+  it("la deuda se consume SOLO por lo que el tope aplicó y el resto queda PENDIENTE", async () => {
+    // Bruto = comisiones = 10.000 (porcentaje, sin bonos), vale de 2.000 y deuda
+    // entrante de 30.000: el tope deja 8.000 para la deuda y los 22.000 que no
+    // entraron NO se perdonan, se re-registran como deuda pendiente.
+    seed({
+      invoiceSubtotal: 100_000,
+      voucherAmount: 2_000,
+      carries: [
+        {
+          id: CARRY_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          employee_id: EMPLOYEE_ID,
+          amount: 30_000,
+          origin_period_id: EARLIER_PERIOD_ID,
+          applied_period_id: null,
+          created_at: "2026-01-31T23:59:59.000Z",
+        },
+      ],
+    });
+
+    const detail = await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    const item = detail.items[0];
+
+    // El descuento aplicado: el vale completo y 8.000 de la deuda (lo que el
+    // tope alcanzó). El neto no es negativo y la igualdad se sostiene.
+    expect(item.deductions_vales).toBe(2_000);
+    expect(item.other_discounts).toBe(8_000);
+    expect(item.net_pay).toBe(0);
+    expect(Number(item.net_pay)).toBeGreaterThanOrEqual(0);
+    expectIdentity(item as unknown as Record<string, unknown>);
+
+    // La deuda consumida queda marcada y el sobrante queda PENDIENTE con este
+    // período como origen: lo aplicará un período POSTERIOR, no éste.
+    expect(carryRows()).toHaveLength(2);
+    expect(carryRows()[0]).toMatchObject({
+      id: CARRY_ID,
+      applied_period_id: PERIOD_ID,
+    });
+    expect(carryRows()[1]).toMatchObject({
+      amount: 22_000,
+      origin_period_id: PERIOD_ID,
+      applied_period_id: null,
+      origin_kind: "carry_remainder",
+    });
+    expect(payrollPagedStub.rpcCalls[0].args.p_carry_ids).toEqual([CARRY_ID]);
+    // La columna de deuda pendiente muestra el remanente.
+    expect(item.pending_debt).toBe(22_000);
+  });
+
+  it("recalcular no duplica el remanente de una deuda parcialmente absorbida", async () => {
+    seed({
+      invoiceSubtotal: 100_000,
+      voucherAmount: 2_000,
+      carries: [
+        {
+          id: CARRY_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          employee_id: EMPLOYEE_ID,
+          amount: 30_000,
+          origin_period_id: EARLIER_PERIOD_ID,
+          applied_period_id: null,
+          created_at: "2026-01-31T23:59:59.000Z",
+        },
+      ],
+    });
+
+    const first = await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    expect(first.items[0].other_discounts).toBe(8_000);
+
+    const second = await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    // El recálculo sigue descontando lo mismo (la deuda consumida se relee
+    // porque quedó marcada con ESTE período) y NO vuelve a aplicar el remanente:
+    // su origen es este mismo período, así que no es anterior a sí mismo.
+    expect(second.items[0].other_discounts).toBe(8_000);
+    expect(second.items[0].net_pay).toBe(0);
+    expectIdentity(second.items[0] as unknown as Record<string, unknown>);
+
+    // Sigue habiendo DOS filas y UNA sola de remanente: el recálculo no duplica.
+    expect(carryRows()).toHaveLength(2);
+    const remainders = carryRows().filter((row) => row.origin_kind === "carry_remainder");
+    expect(remainders).toHaveLength(1);
+    expect(remainders[0]).toMatchObject({ amount: 22_000, applied_period_id: null });
+    expect(carryRows()[0].applied_period_id).toBe(PERIOD_ID);
+    expect(payrollPagedStub.rpcCalls[1].args.p_carry_ids).toEqual([]);
+  });
+
+  it("el caso del dueño: porcentaje sin bonos, bruto = comisión, con vale y deuda entrante", async () => {
+    // Comisión = bruto = 2.000; vale de 1.000 y deuda entrante de 5.000. El tope
+    // aplica el vale completo y 1.000 de la deuda; el neto queda en 0 y los
+    // 4.000 restantes siguen siendo deuda, no un perdón silencioso.
+    seed({
+      invoiceSubtotal: 20_000,
+      voucherAmount: 1_000,
+      carries: [
+        {
+          id: CARRY_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          employee_id: EMPLOYEE_ID,
+          amount: 5_000,
+          origin_period_id: EARLIER_PERIOD_ID,
+          applied_period_id: null,
+          created_at: "2026-01-31T23:59:59.000Z",
+        },
+      ],
+    });
+
+    const detail = await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    const item = detail.items[0];
+
+    expect(item.commissions).toBe(2_000);
+    expect(item.bonuses).toBe(0);
+    expect(item.voucher_total).toBe(1_000);
+    expect(item.deductions_vales).toBe(1_000);
+    expect(item.other_discounts).toBe(1_000);
+    expect(item.net_pay).toBe(0);
+    expectIdentity(item as unknown as Record<string, unknown>);
+    // La deuda pendiente de ESTE período es el remanente (4.000), visible
+    // aparte del neto.
+    expect(item.pending_debt).toBe(4_000);
+
+    expect(carryRows()).toHaveLength(2);
+    expect(carryRows()[0].applied_period_id).toBe(PERIOD_ID);
+    expect(carryRows()[1]).toMatchObject({
+      amount: 4_000,
+      origin_period_id: PERIOD_ID,
+      origin_kind: "carry_remainder",
+      applied_period_id: null,
+    });
+  });
+
+  it("una deuda generada por el período que se calcula NO se aplica a sí misma", async () => {
+    // El período ya trae su propio sobrante pendiente (de un cálculo previo).
+    seed({
+      invoiceSubtotal: 10_000,
+      voucherAmount: 50_000,
+      carries: [
+        {
+          id: CARRY_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          employee_id: EMPLOYEE_ID,
+          amount: 49_000,
+          origin_period_id: PERIOD_ID,
+          applied_period_id: null,
+          created_at: "2026-02-28T23:59:59.000Z",
+        },
+      ],
+    });
+
+    const detail = await calculatePayroll(
+      payrollPagedStub.SEDE_ID,
+      PERIOD_ID,
+      {},
+      ACTOR,
+    );
+
+    // Su propia deuda NO entra al descuento del período.
+    expect(detail.items[0].other_discounts).toBe(0);
+    expect(detail.items[0].deductions_vales).toBe(1_000);
+    expect(detail.items[0].voucher_total).toBe(50_000);
+    expectIdentity(detail.items[0] as unknown as Record<string, unknown>);
+    // Sigue PENDIENTE y no se duplicó (la guarda NOT EXISTS de 061).
+    expect(carryRows()).toHaveLength(1);
+    expect(carryRows()[0].applied_period_id).toBeNull();
+  });
+
+  it("recalcular no duplica la deuda del sobrante (guarda NOT EXISTS)", async () => {
+    seed({ invoiceSubtotal: 10_000, voucherAmount: 50_000 });
+    await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+
+    expect(carryRows()).toHaveLength(1);
+    expect(carryRows()[0]).toMatchObject({
+      amount: 49_000,
+      origin_period_id: PERIOD_ID,
+      applied_period_id: null,
+    });
+  });
+
+  it("recalcular no vuelve a aplicar una deuda consumida y conserva el descuento", async () => {
+    seed({
+      invoiceSubtotal: 400_000,
+      voucherAmount: 0,
+      carries: [
+        {
+          id: CARRY_ID,
+          sede_id: payrollPagedStub.SEDE_ID,
+          employee_id: EMPLOYEE_ID,
+          amount: 30_000,
+          origin_period_id: EARLIER_PERIOD_ID,
+          applied_period_id: null,
+          created_at: "2026-01-31T23:59:59.000Z",
+        },
+      ],
+    });
+
+    const first = await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    expect(first.items[0].other_discounts).toBe(30_000);
+    expect(first.items[0].net_pay).toBe(10_000);
+
+    const second = await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    // El recálculo sigue descontando la deuda que ESTE período consumió: el
+    // neto no cambia y la deuda no se pierde.
+    expect(second.items[0].other_discounts).toBe(30_000);
+    expect(second.items[0].net_pay).toBe(10_000);
+    expectIdentity(second.items[0] as unknown as Record<string, unknown>);
+    // No se vuelve a marcar y no se duplica.
+    expect(carryRows()).toHaveLength(1);
+    expect(carryRows()[0].applied_period_id).toBe(PERIOD_ID);
+    expect(payrollPagedStub.rpcCalls[1].args.p_carry_ids).toEqual([]);
+  });
+
+  it("la deuda pendiente se lee aparte y no cruza empleados ni sedes", async () => {
+    seed({ invoiceSubtotal: 10_000, voucherAmount: 50_000 });
+    await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+
+    // Deudas ajenas con el MISMO período de origen: otro empleado y otra sede.
+    payrollPagedStub.tables.payroll_discount_carries = [
+      ...carryRows(),
+      {
+        id: "deuda-otro-empleado",
+        sede_id: payrollPagedStub.SEDE_ID,
+        employee_id: "99999999-9999-4999-8999-999999999999",
+        amount: 999,
+        origin_period_id: PERIOD_ID,
+        applied_period_id: null,
+      },
+      {
+        id: "deuda-otra-sede",
+        sede_id: "88888888-8888-4888-8888-888888888888",
+        employee_id: EMPLOYEE_ID,
+        amount: 888,
+        origin_period_id: PERIOD_ID,
+        applied_period_id: null,
+      },
+    ];
+
+    const detail = await getPeriodDetail(payrollPagedStub.SEDE_ID, PERIOD_ID);
+    expect(detail.items).toHaveLength(1);
+    expect(detail.items[0].pending_debt).toBe(49_000);
   });
 });
 

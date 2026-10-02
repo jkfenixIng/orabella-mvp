@@ -23,6 +23,33 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   `method_code` + `cash_shift_id` (migración 028: método arqueable y turno de
   caja que abrió el vale), `approval_code` (histórico, ya sin uso),
   `observation`; descontada y rechazada terminales).
+- Vales reales y deuda del sobrante (migraciones `061_payroll_voucher_debt.sql`,
+  `062_payroll_carry_apply.sql` y `064_payroll_partial_carry.sql`):
+  `payroll_items.voucher_total` guarda el
+  **total REAL** de vales del empleado en el rango del período, FUERA de la
+  igualdad del neto; `deductions_vales` sigue siendo lo que se **aplicó**
+  (topeado al bruto, con su signo). Cuando un vale supera lo ganado, el
+  exceso (el recorte que el tope no pudo descontar) queda como **deuda** del
+  empleado en `payroll_discount_carries` (por sede + empleado, con el período
+  de ORIGEN y `applied_period_id` nulo mientras está pendiente). La deuda
+  pendiente de períodos ANTERIORES se descuenta en el período siguiente
+  DENTRO de `other_discounts` —así la igualdad del CHECK de `payroll_items`
+  sigue vigente sin modificarla y el empleado lo ve como "otros descuentos"—
+  y su trazabilidad vive en la tabla de deudas. El marcado
+  (`applied_period_id`) ocurre en la MISMA transacción que el descuento
+  (`payroll_apply_atomic`, `062`): un fallo no puede dejar el descuento
+  escrito con la deuda todavía pendiente y aplicarla dos veces. La deuda se
+  consume SOLO por lo que el tope **aplicó de verdad**: cuando `vales + deuda`
+  supera el bruto, el sobrante de la deuda NO se perdona —el ítem lo lleva en
+  `debt_remainder` y `payroll_apply_atomic` (`064`) lo re-registra como deuda
+  **PENDIENTE** en la MISMA transacción, con este período como origen y
+  `origin_kind = 'carry_remainder'`, para que la aplique un período POSTERIOR
+  (nunca el actual: su origen no es anterior a sí mismo)—. Una deuda se
+  aplica UNA vez; recalcular el mismo período no la duplica (guarda
+  `NOT EXISTS` por origen + empleado + `origin_kind`) ni vuelve a marcar una
+  ya consumida, y el ítem expone
+  `voucher_total` y `pending_debt` (la deuda pendiente de ese período) para
+  la UI.
 - Servicio (`service.ts`): `openPayrollPeriod` (23505 del índice →
   `PERIOD_DRAFT_EXISTS`), `calculatePayroll` (fijo según `pay_type`
   fijo/mixto + comisiones desde `invoice_items` del rango por `employee_id`
@@ -72,7 +99,9 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   (`008_hardening.sql`: `TODO(seguridad-T7)` cerrado, claim
   `app_metadata.sede_id`).
 - Notas: el neto se acota a 0 si los descuentos superan el bruto (el CHECK
-  exige `net_pay >= 0`). T8: cálculo (`payroll.calculated`), cierre
+  exige `net_pay >= 0`); el total real de vales NO se pierde por ese recorte:
+  vive en `voucher_total` y el sobrante se arrastra como deuda del empleado
+  (ver arriba). T8: cálculo (`payroll.calculated`), cierre
   (`payroll.closed`) y aprobación de vales (`voucher.approved` con flag
   `over_tope`) auditados vía `writeAudit` (solo servidor).
 - PRD: §5.6 PAY-01…04, §5.7 PAY-05…07, §9
