@@ -14,9 +14,12 @@
 --      DESPUÉS de validar todo (ítems, stock pre-verificado, impuestos,
 --      porciones) e inserta la factura inmediatamente después. El UNIQUE
 --      (sede_id, consecutive_number) impide duplicados aunque dos
---      transacciones compitan; ante fallo posterior a la reserva el
---      servicio intenta limpieza best-effort (ver servicio). Huecos solo
---      ante fallo de BD entre la reserva y el insert (raro y documentado).
+--      transacciones compitan.
+--      CORRECCIÓN (CL-13, migración 052): la reserva y TODAS las escrituras de
+--      la emisión viajan ahora en UNA transacción del servidor, así que el
+--      fallo posterior a la reserva ya no deja hueco: la reserva se revierte
+--      con el resto. La limpieza best-effort que este comentario describía
+--      (`cleanupFailedInvoice`) ya no existe. No hay camino que queme un número.
 --
 -- Stock (FAC-06): la factura con productos genera OUT vía
 -- inventory_movements (reason FACTURA #N) reutilizando registerMovement;

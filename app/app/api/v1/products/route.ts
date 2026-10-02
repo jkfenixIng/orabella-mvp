@@ -1,7 +1,7 @@
 import type { NextRequest } from "next/server";
 import { fail, ok } from "@/src/shared/lib/api-response";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/features/admin/service";
+import { resolveSede } from "@/src/shared/lib/sede";
 import {
   InventoryError,
   listProducts,

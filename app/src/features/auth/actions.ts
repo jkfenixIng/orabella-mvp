@@ -6,6 +6,7 @@ import {
   SESSION_COOKIE_NAME,
   SESSION_TTL_MS,
   adminCreateUser,
+  adminResetUserPassword,
   changeUserPassword,
   confirmPasswordReset,
   getSessionUser,
@@ -14,6 +15,7 @@ import {
   logoutWithToken,
   requestPasswordReset,
 } from "./service";
+import { AdminError, requireAdminSession } from "@/src/features/admin/service";
 
 const isProduction = process.env.NODE_ENV === "production";
 
@@ -27,8 +29,14 @@ function cookieOptions() {
   };
 }
 
+/**
+ * Traduce a respuesta de action los errores de dominio que este módulo puede
+ * lanzar: `AuthError` (servicio de auth) y `AdminError` (guardas de
+ * sesión/rol/sede). Antes solo contemplaba `AuthError`, así que un guard
+ * fallido se reportaba como `INTERNAL` en vez de `UNAUTHENTICATED`/`FORBIDDEN`.
+ */
 function toFailure(error: unknown): { success: false; code: string; message: string } {
-  if (error instanceof AuthError) {
+  if (error instanceof AuthError || error instanceof AdminError) {
     return { success: false, code: error.code, message: error.message };
   }
   return { success: false, code: "INTERNAL", message: "Error interno." };
@@ -103,9 +111,10 @@ export async function confirmResetAction(input: { token: string; nueva: string }
 }
 
 /**
- * Alta solo por admin (AUTH-04). La ruta REST equivalente exige sesión
- * con rol admin; esta action asume que el llamante ya verificó el rol
- * (la verificación por rol/sede la cierra T3 con requireSedeRole).
+ * Alta de usuario solo por admin (AUTH-04). Igual que la ruta REST
+ * equivalente, exige sesión con rol admin antes de tocar nada. La sede se
+ * fuerza desde la sesión: el servicio usa el cliente service_role (salta
+ * RLS), así que un `sede_id` enviado por el cliente jamás se confía.
  */
 export async function adminCreateUserAction(input: {
   email: string;
@@ -117,8 +126,26 @@ export async function adminCreateUserAction(input: {
   sede_id?: string | null;
 }) {
   try {
-    const created = await adminCreateUser(input);
+    const store = await cookies();
+    const session = await requireAdminSession(store.get(SESSION_COOKIE_NAME)?.value);
+    const created = await adminCreateUser({ ...input, sede_id: session.sedeId });
     return { success: true as const, id: created.id };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
+ * Restablece la clave de un usuario de la sede a su documento, con cambio
+ * forzado al entrar (solo admin). Para cuando la olvidan y no hay cómo
+ * recuperarla por la app.
+ */
+export async function adminResetPasswordAction(userId: string) {
+  try {
+    const store = await cookies();
+    const session = await requireAdminSession(store.get(SESSION_COOKIE_NAME)?.value);
+    const data = await adminResetUserPassword(session.sedeId, userId, session.userId);
+    return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
   }

@@ -14,8 +14,8 @@ function tokenOf(request: NextRequest): string | undefined {
 
 /**
  * POST /api/v1/cash-shifts/:id/close — cierra con arqueo (solo
- * admin/caja). Conteo y base dejada obligatorios; base incompleta exige
- * observación; calcula recogido (= contado − base) y diferencia.
+ * admin/caja). Solo conteo; la base es automática y no se justifica;
+ * calcula recogido (= contado − base) y diferencia.
  */
 export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   try {
@@ -25,6 +25,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
     const data = await closeShift(session.sedeId, id, body, {
       userId: session.userId,
       sedeId: session.sedeId,
+      roles: session.roles,
     });
     return ok(data);
   } catch (error) {

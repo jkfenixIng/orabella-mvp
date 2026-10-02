@@ -14,8 +14,16 @@ function readPublicEnv(): { url: string; anonKey: string } {
 }
 
 /**
- * Server-side Supabase client bound to the request cookies (user session,
- * RLS enforced). Use in Server Components, Server Actions and Route Handlers.
+ * Cliente con RLS (anon key + cookies de la request). Hoy NO lo importa nadie:
+ * todo el tráfico de la app va por `createAdminClient()` (service_role), que
+ * bypasea RLS por diseño. Es decir que las políticas por sede del esquema NO se
+ * evalúan nunca y este cliente NO es una segunda línea de defensa: la única
+ * barrera es el código de aplicación (`resolveSede`/`requireSedeRole` en
+ * `src/shared/lib/sede.ts` más los filtros `sede_id` de cada consulta). Un guard
+ * olvidado es una brecha total, sin red abajo.
+ *
+ * Se conserva —y no se borra— porque es el camino correcto si algún día se migra
+ * la app a RLS. Ver la postura completa en `app/README.md` (D8).
  */
 export async function createClient() {
   const { url, anonKey } = readPublicEnv();

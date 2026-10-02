@@ -29,21 +29,27 @@
    Colors - Light Mode
    -------------------------------------------------------------------------- */
 :root {
-  /* Primary - Blue */
-  --color-primary: 175 82%;
-  --color-primary-50: oklch(0.96 0 0);
+  /* Primary - Blue (sin token suelto: el color de marca es la rampa) */
+  /* Peldaño -50: es el fondo de las clases `.bg-*-light` (chips de estado y
+     avisos). Antes tenía chroma 0, así que los cuatro fondos "light" del tema
+     claro salían gris casi blanco y solo el texto llevaba color. Cada -50
+     recupera el hue de su rampa con ~80% de la chroma máxima que el sRGB
+     admite en su L, y sigue siendo más claro que su -100 (la rampa queda
+     ordenada). El texto real sobre esos fondos es el peldaño -600
+     (.text-success/.text-warning/.text-error/.text-primary-color), que conserva
+     AA 4.5:1. El bloque oscuro no se toca. */
+  --color-primary-50: oklch(0.96 0.016 250);
   --color-primary-100: oklch(0.93 0.02 250);
   --color-primary-200: oklch(0.86 0.06 250);
   --color-primary-300: oklch(0.77 0.11 250);
-  --color-primary-400: oklch(0.65 0.16 250);
-  --color-primary-500: oklch(0.55 0.2 250);
-  --color-primary-600: oklch(0.48 0.23 250);
-  --color-primary-700: oklch(0.39 0.24 250);
-  --color-primary-800: oklch(0.31 0.2 250);
-  --color-primary-900: oklch(0.25 0.14 250);
+  --color-primary-400: oklch(0.72 0.11 250);
+  --color-primary-500: oklch(0.55 0.14 250);
+  --color-primary-600: oklch(0.50 0.105 250);
+  --color-primary-700: oklch(0.44 0.11 250);
+  --color-primary-800: oklch(0.31 0.078 250);
+  --color-primary-900: oklch(0.25 0.063 250);
 
-  /* Secondary - Purple/Amber */
-  --color-secondary: 260 70%;
+  /* Secondary - Purple/Amber (sin token suelto: el secundario es una superficie) */
   --color-secondary-50: oklch(0.97 0 0);
   --color-secondary-100: oklch(0.93 0.02 280);
   --color-secondary-200: oklch(0.87 0.05 280);
@@ -56,39 +62,42 @@
   --color-secondary-900: oklch(0.25 0.1 280);
 
   /* Status - Success (Emerald) */
-  --color-success-50: oklch(0.97 0 0);
+  --color-success-50: oklch(0.97 0.035 160);
   --color-success-100: oklch(0.93 0.03 160);
   --color-success-200: oklch(0.86 0.06 160);
   --color-success-300: oklch(0.77 0.1 160);
-  --color-success-400: oklch(0.65 0.16 160);
-  --color-success-500: oklch(0.55 0.2 160);
-  --color-success-600: oklch(0.45 0.23 160);
-  --color-success-700: oklch(0.36 0.18 160);
-  --color-success-800: oklch(0.29 0.13 160);
-  --color-success-900: oklch(0.24 0.08 160);
+  --color-success-400: oklch(0.66 0.105 160);
+  --color-success-500: oklch(0.55 0.111 160);
+  --color-success-600: oklch(0.45 0.075 160);
+  --color-success-700: oklch(0.36 0.073 160);
+  --color-success-800: oklch(0.29 0.059 160);
+  --color-success-900: oklch(0.24 0.048 160);
 
   /* Status - Warning (Amber) */
-  --color-warning-50: oklch(0.98 0 0);
+  /* Warning es la rampa más apretada: su -100 ya está en L 0.96, así que el -50
+     solo puede bajar hasta 0.97 y en L 0.98 el sRGB limita la chroma a 0.0109
+     (tinte imperceptible). Se baja el peldaño un paso, aún más claro que el -100. */
+  --color-warning-50: oklch(0.97 0.014 50);
   --color-warning-100: oklch(0.96 0.02 50);
-  --color-warning-200: oklch(0.9 0.08 50);
-  --color-warning-300: oklch(0.82 0.12 50);
-  --color-warning-400: oklch(0.71 0.17 50);
-  --color-warning-500: oklch(0.61 0.19 50);
-  --color-warning-600: oklch(0.5 0.19 50);
-  --color-warning-700: oklch(0.41 0.15 50);
-  --color-warning-800: oklch(0.33 0.11 50);
+  --color-warning-200: oklch(0.90 0.052 50);
+  --color-warning-300: oklch(0.82 0.10 50);
+  --color-warning-400: oklch(0.72 0.13 50);
+  --color-warning-500: oklch(0.61 0.145 50);
+  --color-warning-600: oklch(0.50 0.095 50);
+  --color-warning-700: oklch(0.41 0.097 50);
+  --color-warning-800: oklch(0.33 0.078 50);
   --color-warning-900: oklch(0.27 0.07 50);
 
   /* Status - Error (Red) */
-  --color-error-50: oklch(0.97 0 0);
+  --color-error-50: oklch(0.96 0.016 25);
   --color-error-100: oklch(0.93 0.03 25);
   --color-error-200: oklch(0.86 0.06 25);
   --color-error-300: oklch(0.77 0.12 25);
-  --color-error-400: oklch(0.65 0.18 25);
+  --color-error-400: oklch(0.66 0.14 25);
   --color-error-500: oklch(0.55 0.2 25);
-  --color-error-600: oklch(0.45 0.2 25);
-  --color-error-700: oklch(0.36 0.16 25);
-  --color-error-800: oklch(0.29 0.12 25);
+  --color-error-600: oklch(0.45 0.135 25);
+  --color-error-700: oklch(0.36 0.131 25);
+  --color-error-800: oklch(0.29 0.105 25);
   --color-error-900: oklch(0.24 0.08 25);
 
   /* Neutrals */
@@ -103,28 +112,69 @@
   --color-neutral-800: oklch(0.24 0 0);
   --color-neutral-900: oklch(0.17 0 0);
 
-  /* Background & Surfaces */
-  --bg-primary: theme(--color-neutral-50);
-  --bg-surface: theme(--color-neutral-50);
-  --bg-surface-hover: theme(--color-neutral-100);
-  --bg-surface-2: theme(--color-neutral-100);
+  /* Background & Surfaces.
+     Aviso de resolución (CL-1): estos tokens se declaran con `var()`, NUNCA con
+     la función `theme()` de Tailwind. `theme()` se resuelve en BUILD TIME contra
+     el tema de Tailwind, y la rampa `--color-neutral-*` de este archivo vive en
+     un `:root` sin capa —fuera de `@theme`—, así que `theme(--color-neutral-50)`
+     no veía estos valores: los resolvía contra el neutral POR DEFECTO de
+     Tailwind. Medido sobre el CSS compilado, los ocho tokens que usaban
+     `theme()` salían con OTRO color que el declarado acá: `--text-secondary`
+     declaraba oklch(0.49 0 0) = #606060 y emitía oklch(55.6% 0 none) = #737373
+     (Δ19 por canal), `--border-color`/`--text-disabled` Δ13, `--text-primary`
+     Δ8, `--border-color-2` Δ4, `--bg-surface-hover` Δ3 y `--bg-primary`
+     /`--bg-surface` Δ2.
+     Con `var()` la referencia queda viva y resuelve a la rampa de ESTE archivo:
+     la declaración de `:root` va sin capa y una regla sin capa gana a la copia de
+     la rampa por defecto que Tailwind emite dentro de `@layer theme` (medido en
+     el CSS compilado: las dos declaraciones existen y la del proyecto es la que
+     computa). Cada peldaño que estos tokens piden —50, 100, 200, 300, 500 y
+     900— está declarado arriba, así que no se inventa ningún valor. La guarda
+     `tests/design-tokens.test.ts` falla si un `theme(--color-neutral-*)` vuelve. */
+  --bg-primary: var(--color-neutral-50);
+  --bg-surface: var(--color-neutral-50);
+  --bg-surface-hover: var(--color-neutral-100);
+  /* Superficie SELECCIONADA (segmento activo de un control segmentado,
+     theme-toggle). La familia de superficies no tenía un tercer peldaño:
+     el estado seleccionado quedaba con el mismo valor que el hover (L 0.96),
+     porque las dos únicas superficies elevadas del tema claro eran el mismo
+     color. Medido contra la página (--bg-surface, L 0.98): hover L 0.96 deja un
+     paso de 0.020 —casi indistinguible—; este peldaño L 0.93 deja 0.050, el
+     mismo paso del `slate-200` original (L 0.929, paso 0.051) que la app usaba
+     antes de mover el segmento a tokens. No se usa --color-neutral-200
+     (L 0.91, paso 0.070): sobrecorrige.
+     El nombre es semántico a propósito: el consumidor pide "seleccionado", no
+     un peldaño de rampa. */
+  --bg-surface-selected: oklch(0.93 0 0);
 
-  /* Borders & Dividers */
-  --border-color: theme(--color-neutral-300);
-  --border-color-2: theme(--color-neutral-200);
+  /* Borders & Dividers (resolución por `var()`: ver el aviso de CL-1 arriba) */
+  --border-color: var(--color-neutral-300);
+  --border-color-2: var(--color-neutral-200);
 
   /* Text */
-  --text-primary: theme(--color-neutral-900);
-  --text-secondary: theme(--color-neutral-500);
-  --text-tertiary: theme(--color-neutral-400);
-  --text-disabled: theme(--color-neutral-300);
+  --text-primary: var(--color-neutral-900);
+  --text-secondary: var(--color-neutral-500);
+  --text-tertiary: oklch(0.55 0 0);
+  /* Anillo de foco: debe existir como utilidad (`ring-ring`) y mantener >= 3:1
+     contra la superficie de su tema. Los botones primary/destructive lo dibujaban
+     en `currentColor` (blanco sobre página clara = foco invisible, WCAG 2.4.7). */
+  --ring: var(--color-primary-600);
+  --text-disabled: var(--color-neutral-300);
 
-  /* Shadows */
+  /* Shadows (la escala es la del proyecto: Tailwind emite la utilidad desde el
+     puente `@theme inline` de globals.css, que mapea --shadow* a estos tokens
+     vivos; por eso la sombra ya no se declara como clase suelta acá). */
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
   --shadow-lg: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
   --shadow-xl: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
-  --shadow-2xl: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+  /* --shadow-2xl se retiró: era un token MUERTO. Ninguna regla leía
+     `var(--shadow-2xl)` y la única utilidad que lleva ese nombre —`shadow-2xl`,
+     7 usos en app/invoices/invoices-client.tsx— resolvía contra la escala por
+     defecto de Tailwind (mismo valor en claro por casualidad: 0.25). Mapearlo
+     en @theme inline habría subido su alfa en oscuro de 0.25 a 0.8 y habría
+     cambiado esos modales de facturación: una regresión visual que nadie pidió.
+     Sin consumidores, el nombre duplicado se va. */
 
   /* Border Radius */
   --radius-sm: 0.25rem;    /* 4px */
@@ -170,35 +220,46 @@
   --color-primary-100: oklch(0.93 0.02 250);
   --color-primary-200: oklch(0.86 0.06 250);
   --color-primary-300: oklch(0.77 0.11 250);
-  --color-primary-400: oklch(0.65 0.16 250);
-  --color-primary-500: oklch(0.55 0.2 250);
-  --color-primary-600: oklch(0.65 0.2 250);
-  --color-primary-700: oklch(0.72 0.17 250);
-  --color-primary-800: oklch(0.8 0.12 250);
+  --color-primary-400: oklch(0.66 0.125 250);
+  --color-primary-500: oklch(0.55 0.14 250);
+  /* En oscuro la escala numérica va de claro a oscuro al revés que en claro:
+     los peldaños 600/700 se usan como FONDO de botón con texto blanco, así que
+     deben bajar de luminosidad para cumplir AA (blanco sobre 0.55 ≈ 4.74:1).
+     El rol de TEXTO en oscuro usa primary-400 (0.65), no estos peldaños. */
+  --color-primary-600: oklch(0.50 0.12 250);
+  --color-primary-700: oklch(0.48 0.122 250);
+  --color-primary-800: oklch(0.80 0.094 250);
   --color-primary-900: oklch(0.9 0.05 250);
 
   --color-secondary-50: oklch(0.97 0 0);
   --color-secondary-600: oklch(0.65 0.17 280);
   --color-secondary-700: oklch(0.72 0.14 280);
 
-  --color-success-600: oklch(0.61 0.18 160);
+  --color-success-600: oklch(0.61 0.124 160);
   --color-warning-600: oklch(0.64 0.16 50);
-  --color-error-600: oklch(0.65 0.18 25);
+  --color-error-600: oklch(0.52 0.19 25);
 
   /* Background & Surfaces */
   --bg-primary: oklch(0.12 0 0);
   --bg-surface: oklch(0.17 0 0);
   --bg-surface-hover: oklch(0.22 0 0);
-  --bg-surface-2: oklch(0.22 0 0);
+  /* En oscuro el paso actual ya era correcto (página 0.17 -> 0.22 = 0.050) y se
+     conserva tal cual: el token es semántico aunque su valor coincida con el
+     hover en este tema. Bajarlo o subirlo sería la regresión, no la mejora. */
+  --bg-surface-selected: oklch(0.22 0 0);
 
   /* Borders & Dividers */
-  --border-color: oklch(0.24 0 0);
-  --border-color-2: oklch(0.21 0 0);
+  --border-color: oklch(0.3 0 0);
+  --border-color-2: oklch(0.27 0 0);
 
   /* Text */
   --text-primary: oklch(0.95 0 0);
   --text-secondary: oklch(0.75 0 0);
-  --text-tertiary: oklch(0.55 0 0);
+  --text-tertiary: oklch(0.62 0 0);
+  /* Mismo anillo de foco que en claro: existe como utilidad (`ring-ring`) y
+     mantiene >= 3:1 contra la superficie oscura (el botón lo pintaba en
+     `currentColor`, que en oscuro tampoco garantiza contraste). */
+  --ring: var(--color-primary-400);
   --text-disabled: oklch(0.45 0 0);
 
   /* Shadows (stronger in dark mode) */
@@ -206,7 +267,65 @@
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
   --shadow-xl: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
-  --shadow-2xl: 0 25px 50px -12px rgba(0, 0, 0, 0.8);
+  /* --shadow-2xl se retiró acá también: token muerto (ver la nota en :root). */
+}
+
+/* --------------------------------------------------------------------------
+   Paper Palette - Hoja de factura: DOCUMENTO, no superficie del tema
+   --------------------------------------------------------------------------
+   La factura se muestra como una hoja de papel. Un papel no se temiza: la
+   hoja sigue siendo blanca y la tinta sigue siendo oscura en los dos temas,
+   igual que el resultado de una impresora no cambia porque la pantalla esté
+   en modo oscuro. Por eso esta familia NO reutiliza los roles de
+   superficie/texto del tema (que sí se invierten) y vive aparte.
+
+   Las dos formas de que el papel se "temice" solo, y las dos que la guarda
+   `tests/no-raw-palette.test.ts` cierra:
+     1. declarar un bloque `.dark` con `--paper-*`;
+     2. darle a un `--paper-*` un valor `var(--token-de-tema)`.
+   Acá no existe ninguna de las dos, a propósito: se declara UNA vez, en
+   `:root`, con literales hex, y no hay bloque `.dark` para esta familia.
+
+   Un token por valor: la hoja usa 18 colores distintos y esta familia tiene
+   exactamente 18 tokens. No se repite un color bajo dos nombres (es el
+   duplicado que ya se retiró con `--bg-surface-2` / `--muted`).
+
+   Los valores son EXACTAMENTE los que la hoja ya renderizaba con la paleta
+   cruda de Tailwind que reemplazan (medidos sobre el CSS compilado: la rampa
+   `slate`/`emerald`/`red`/`blue-50` de Tailwind es invariante de tema, no tiene
+   override en `.dark`, así que su valor es el mismo en los dos temas). Los 184
+   tokens crudos de la hoja pasaron a estos sin mover un píxel: es un cambio de
+   vocabulario, no de color. El cromo de la app (40 tokens) sigue con la paleta
+   cruda porque ahí NO existe un token del proyecto con el mismo valor. */
+:root {
+  /* Superficies de la hoja. */
+  --paper-surface: #ffffff;
+  --paper-surface-soft: #f8fafc;
+  --paper-surface-muted: #f1f5f9;
+
+  /* Filetes de tabla y de recuadro. Los dos sirven además de relleno del
+     control neutro de la hoja (botón y su hover), por eso el nombre es del
+     material y no de la propiedad: el valor es el mismo para los dos usos. */
+  --paper-line: #e2e8f0;
+  --paper-line-strong: #cad5e2;
+
+  /* Tinta, de la más oscura a la más clara. */
+  --paper-ink: #0f172b;
+  --paper-ink-secondary: #314158;
+  --paper-ink-tertiary: #45556c;
+  --paper-ink-muted: #62748e;
+  --paper-ink-soft: #90a1b9;
+
+  /* Estados de la hoja: avisos, importes de comisión, acciones destructivas y
+     los anillos de foco de los casilleros. */
+  --paper-info: #eff6ff;
+  --paper-success: #009966;
+  --paper-success-strong: #007a55;
+  --paper-success-deep: #006045;
+  --paper-danger: #e7000b;
+  --paper-danger-strong: #c10007;
+  --paper-focus-success: #00bc7d;
+  --paper-focus-danger: #fb2c36;
 }
 
 /* --------------------------------------------------------------------------
@@ -267,24 +386,29 @@ button {
    Utility Classes for Design Tokens
    -------------------------------------------------------------------------- */
 
-/* Color text utilities */
-.text-primary { color: var(--text-primary); }
-.text-secondary { color: var(--text-secondary); }
-.text-tertiary { color: var(--text-tertiary); }
-
-/* Background utilities */
-.bg-primary { background-color: var(--bg-primary); }
-.bg-surface { background-color: var(--bg-surface); }
+/* Las utilidades .text-primary, .text-secondary, .text-tertiary y .bg-primary
+   se eliminaron (cero consumidores) y .bg-surface también, porque Tailwind ya
+   la genera igual desde --color-surface. Estaban fuera de todo @layer, así que
+   ganaban en la cascada contra la utilidad homónima de @layer utilities y la
+   dejaban inservible: por eso hay que borrar la declaración, no reordenarla. */
 
 /* Border utilities */
 .border-color { border: 1px solid var(--border-color); }
 .border-color-2 { border: 1px solid var(--border-color-2); }
 
-/* Shadow utilities */
-.shadow-sm { box-shadow: var(--shadow-sm); }
-.shadow-md { box-shadow: var(--shadow-md); }
-.shadow-lg { box-shadow: var(--shadow-lg); }
-.shadow-xl { box-shadow: var(--shadow-xl); }
+/* Shadow utilities: eliminadas. `.shadow-sm|md|lg|xl` vivían acá SIN CAPA, con
+   el mismo nombre que las utilidades que Tailwind genera desde su tema, y
+   ganaban en la cascada solo por eso: una regla sin capa gana a `@layer
+   utilities`. Eso hacía que el valor del proyecto se impusiera por accidente y
+   que, al mismo tiempo, la utilidad de Tailwind siguiera emitiéndose con la
+   receta del registry (y con otro `--tw-shadow`, que es el que reaparece cuando
+   un anillo de foco gana el shorthand `box-shadow`).
+   La escala tiene ahora UNA sola declaración: globals.css mapea --shadow* en
+   `@theme inline` a estos tokens vivos y Tailwind emite la utilidad con
+   `--tw-shadow: var(--shadow-*)`, en ambos temas.
+   Ninguna de estas cuatro clases vuelve como regla suelta: una regla sin capa
+   con el nombre de una utilidad de Tailwind es exactamente el bug que este
+   cambio retira. */
 
 /* Radius utilities */
 .radius-sm { border-radius: var(--radius-sm); }
@@ -302,9 +426,10 @@ button {
 /* --------------------------------------------------------------------------
    Status Colors (Semantic)
    -------------------------------------------------------------------------- */
-.text-success { color: var(--color-success-600); }
-.text-warning { color: var(--color-warning-600); }
-.text-error { color: var(--color-error-600); }
+/* .text-success/.text-warning/.text-error ya no se declaran acá: Tailwind genera
+   esas utilidades con exactamente el mismo color (var(--color-*-600)) desde las
+   claves --color-* de @theme inline. El override de .dark sí sigue acá, porque
+   Tailwind no expresa "otro token según el tema" sin duplicar la utilidad. */
 .text-primary-color { color: var(--color-primary-600); }
 
 .bg-success-light { background-color: var(--color-success-50); }

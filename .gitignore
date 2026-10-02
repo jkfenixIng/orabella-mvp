@@ -34,3 +34,7 @@ coverage/
 
 # Repos (submodules) — anchored to root so app/**/api routes are not ignored
 /API/
+# Local Pi runtime state
+.atl/
+# Standalone frontend repo: lives on disk, never in this repo
+/front/

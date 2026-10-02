@@ -2,8 +2,10 @@ import Link from "next/link";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { Calculator, Package, Receipt, Settings, Ticket, TriangleAlert, Wallet } from "lucide-react";
+import { PageContainer, PageHeader } from "@/src/components/ui/lib/page";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
+import { countUnreadAlerts } from "@/src/features/alerts/service";
 import { listProducts } from "@/src/features/inventory/service";
 import { filterLowStock } from "@/src/features/inventory/schemas";
 
@@ -18,7 +20,7 @@ const MODULES = [
   {
     href: "/cash",
     name: "Caja",
-    purpose: "Abra y cierre turnos, registre movimientos y consulte el arqueo del día.",
+    purpose: "Abra y cierre turnos, registre movimientos y revise el día.",
     Icon: Wallet,
     roles: ["admin", "caja"],
   },
@@ -64,28 +66,54 @@ export default async function HomePage() {
   );
   const canSeeInventory = visibleModules.some((module) => module.href === "/inventory");
   const lowStock = sedeId && canSeeInventory ? filterLowStock(await listProducts(sedeId)) : [];
+  const isAdmin = session.roles.includes("admin");
+  const unreadAlerts =
+    isAdmin && sedeId ? await countUnreadAlerts(sedeId, "caja").catch(() => 0) : 0;
 
   return (
-    <main className="mx-auto flex min-h-screen w-full max-w-4xl flex-col gap-8 px-6 py-12">
-      <header>
-        <p className="text-sm font-medium text-slate-500 dark:text-slate-400">Bienvenido a</p>
-        <h1 className="mt-1 text-3xl font-bold">Orabella</h1>
-        <p className="mt-2 text-slate-600 dark:text-slate-300">
-          El sistema de su negocio de belleza: ventas, caja, inventario y personal en un solo lugar.
-          Elija un módulo para empezar.
-        </p>
-      </header>
+    <PageContainer>
+      {/* Hero de inicio: el antetítulo "Bienvenido a" no lo modela `PageHeader`,
+          así que se conserva inline. El `gap-1` (4px) mantiene la misma
+          separación que tenía el `mt-1` del `<h1>`: el `<h1>` —siempre
+          `text-3xl font-bold`— lo pone el primitivo. */}
+      <div className="flex flex-col gap-1">
+        <p className="text-sm font-medium text-text-tertiary">Bienvenido a</p>
+        <PageHeader
+          title="Orabella"
+          description="El sistema de su negocio de belleza: ventas, caja, inventario y personal en un solo lugar. Elija un módulo para empezar."
+        />
+      </div>
 
+      {/* Alerta de error: mismo shape que el aviso ámbar canónico, con tokens de error. */}
+      {unreadAlerts > 0 ? (
+        <section
+          aria-label="Alertas de caja"
+          className="flex flex-col gap-2 rounded-md bg-error-light px-3 py-2 text-sm font-medium text-error"
+        >
+          <h2 className="font-semibold">
+            Alertas de caja ({unreadAlerts} sin leer)
+          </h2>
+          <Link
+            href="/alerts"
+            aria-label="Ver alertas de caja"
+            className="mt-1 w-fit rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700"
+          >
+            Ver alertas
+          </Link>
+        </section>
+      ) : null}
+
+      {/* Aviso ámbar canónico del proyecto (patrón aceptado). */}
       {lowStock.length > 0 ? (
         <section
           aria-label="Alertas de inventario"
-          className="flex flex-col gap-2 rounded-lg border border-amber-300 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950"
+          className="flex flex-col gap-2 rounded-md bg-warning-light px-3 py-2 text-sm font-medium text-warning"
         >
-          <h2 className="flex items-center gap-2 text-lg font-semibold text-amber-800 dark:text-amber-200">
+          <h2 className="flex items-center gap-2 font-semibold">
             <TriangleAlert className="h-5 w-5" aria-hidden="true" />
             Poco stock ({lowStock.length})
           </h2>
-          <ul className="flex flex-col gap-1 text-sm text-amber-900 dark:text-amber-100">
+          <ul className="flex flex-col gap-1">
             {lowStock.slice(0, 5).map((item) => (
               <li key={item.id}>
                 {item.name} ({item.sku}): quedan {item.stock_qty}, mínimo {item.min_stock}.
@@ -95,7 +123,7 @@ export default async function HomePage() {
           <Link
             href="/inventory"
             aria-label="Ver inventario con poco stock"
-            className="mt-1 w-fit rounded-md bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700"
+            className="mt-1 w-fit rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700"
           >
             Ver inventario
           </Link>
@@ -107,17 +135,17 @@ export default async function HomePage() {
           {visibleModules.map((module) => (
             <li
               key={module.href}
-              className="flex flex-col gap-2 rounded-lg border border-slate-300 p-4 dark:border-slate-700"
+              className="flex flex-col gap-2 rounded-lg border border-border-color p-4 dark:border-border-color-2"
             >
               <h2 className="flex items-center gap-2 text-lg font-semibold">
                 <module.Icon className="h-5 w-5" aria-hidden="true" />
                 {module.name}
               </h2>
-              <p className="text-sm text-slate-600 dark:text-slate-300">{module.purpose}</p>
+              <p className="text-sm text-text-secondary">{module.purpose}</p>
               <Link
                 href={module.href}
                 aria-label={`Ir a ${module.name}`}
-                className="mt-auto inline-block w-fit rounded-md bg-slate-200 px-4 py-2 text-sm font-medium text-slate-900 hover:bg-slate-300 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700"
+                className="mt-auto inline-block w-fit rounded-md border border-border-color bg-surface px-4 py-2 text-sm font-medium text-text-primary hover:bg-surface-hover"
               >
                 Entrar
               </Link>
@@ -125,6 +153,6 @@ export default async function HomePage() {
           ))}
         </ul>
       </section>
-    </main>
+    </PageContainer>
   );
 }

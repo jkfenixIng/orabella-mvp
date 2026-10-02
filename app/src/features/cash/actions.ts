@@ -3,7 +3,8 @@
 import { cookies } from "next/headers";
 import { revalidateTag } from "next/cache";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede, requireSession, requireAdminSession } from "@/src/features/admin/service";
+import { resolveSede } from "@/src/shared/lib/sede";
+import { requireSession, requireAdminSession } from "@/src/features/admin/service";
 import { accumulateDayTotals } from "./schemas";
 import {
   CashError,
@@ -11,13 +12,13 @@ import {
   deleteDenomination,
   getDayView,
   getHistory,
-  getOpenShift,
+  getOpenShiftWithOpener,
   listDenominations,
   listRegisters,
   openShift,
+  recountClosedShift,
   registerPayment,
   requireCashWriter,
-  updateClosedShift,
   updateRegisterBase,
   upsertDenomination,
 } from "./service";
@@ -48,7 +49,14 @@ export async function openShiftAction(input: unknown) {
   }
 }
 
-/** Misma lógica que POST /api/v1/cash/payments (solo admin/caja). */
+/**
+ * Misma lógica que POST /api/v1/cash/payments (solo admin/caja).
+ *
+ * CL-3: el mismo contrato de la ruta —un cobro con `invoice_id` exige
+ * `idempotency_key` (uuid del intento) o se rechaza con VALIDATION 400—. Hoy
+ * ninguna pantalla llama a esta action (el formulario de cobro no existe en
+ * `/cash`), así que el llamador real de la puerta es la ruta REST.
+ */
 export async function registerPaymentAction(input: unknown) {
   try {
     const session = await requireCashWriter(await sessionToken());
@@ -69,6 +77,7 @@ export async function closeShiftAction(id: string, input: unknown) {
     const data = await closeShift(session.sedeId, id, input, {
       userId: session.userId,
       sedeId: session.sedeId,
+      roles: session.roles,
     });
     return { success: true as const, data };
   } catch (error) {
@@ -80,7 +89,7 @@ export async function closeShiftAction(id: string, input: unknown) {
 export async function getOpenShiftAction() {
   try {
     const session = await requireSession(await sessionToken());
-    const data = await getOpenShift(session.sedeId);
+    const data = await getOpenShiftWithOpener(session.sedeId);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -104,10 +113,10 @@ export async function getDayViewAction(input: { fecha: string; sede_id?: string 
         totals: accumulateDayTotals(
           shifts.map((view) => ({
             expectedCash: view.efectivo,
-            countedCash: view.shift.counted_cash,
-            baseLeft: view.shift.base_left,
-            cashWithdrawn: view.shift.cash_withdrawn,
-            baseDifference: view.shift.base_difference,
+            countedCash: view.vigente.counted_cash,
+            baseLeft: view.vigente.base_left,
+            cashWithdrawn: view.vigente.cash_withdrawn,
+            baseDifference: view.vigente.base_difference,
             ventas: view.ventas,
           })),
         ),
@@ -119,12 +128,13 @@ export async function getDayViewAction(input: { fecha: string; sede_id?: string 
 }
 
 /** Misma lógica que GET /api/v1/cash/history (solo admin). */
-export async function getHistoryAction(input: { desde: string; hasta: string; sede_id?: string }) {
+export async function getHistoryAction(input: { desde: string; hasta: string; sede_id?: string; page?: number }) {
   try {
     const session = await requireAdminSession(await sessionToken());
     const data = await getHistory(resolveSede(session.sedeId, input.sede_id), {
       desde: input.desde,
       hasta: input.hasta,
+      page: input.page,
     });
     return { success: true as const, data };
   } catch (error) {
@@ -158,11 +168,15 @@ export async function updateRegisterBaseAction(registerId: string, input: unknow
   }
 }
 
-/** Edición de turno cerrado (solo admin, queda auditado). */
-export async function updateClosedShiftAction(id: string, input: unknown) {
+/**
+ * U3: reconteo de un cierre (solo admin, queda auditado). El cierre firmado
+ * es inmutable: la corrección exige un conteo completo nuevo más un motivo, y
+ * conserva las dos versiones en `cash_shift_recounts`.
+ */
+export async function recountClosedShiftAction(id: string, input: unknown) {
   try {
     const session = await requireAdminSession(await sessionToken());
-    const data = await updateClosedShift(session.sedeId, id, input, {
+    const data = await recountClosedShift(session.sedeId, id, input, {
       userId: session.userId,
       sedeId: session.sedeId,
     });

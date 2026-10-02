@@ -1,87 +1,305 @@
 "use client";
 
 import { useState, useTransition, type FormEvent } from "react";
+import { toast } from "sonner";
 import {
   closeShiftAction,
   getDayViewAction,
   getHistoryAction,
   listDenominationsAction,
   openShiftAction,
+  recountClosedShiftAction,
 } from "@/src/features/cash/actions";
+import { listVouchersAction } from "@/src/features/payroll/actions";
+import type { VoucherRequestRow } from "@/src/features/payroll/service";
 import type {
   CashRegisterRow,
   CashShiftRow,
+  DayShiftView,
   DayView,
   HistoryResult,
 } from "@/src/features/cash/service";
 import type { PaymentMethodRow } from "@/src/features/admin/service";
+import { Alert } from "@/src/components/ui/lib/alert";
+import { Badge } from "@/src/components/ui/lib/badge";
 import {
   Dialog,
-  DialogClose,
   DialogContent,
   DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/src/components/ui/lib/dialog";
 import { cn } from "@/src/components/ui/lib/utils";
-import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import type { ActionResult } from "@/src/shared/lib/api-response";
+import { formatDateTime } from "@/src/shared/lib/format";
+import { HISTORY_PAGE_SIZE } from "@/src/features/cash/schemas";
+import {
+  buttonClass,
+  ghostClass,
+  inputClass,
+  labelClass,
+  mutedTextClass,
+  sectionClass,
+  tableCellClass,
+  tableHeaderClass,
+  tableRowClass,
+} from "@/src/shared/lib/ui-styles";
+import { ArrowLeftRight, Banknote, Coins, CreditCard, Wallet, Zap } from "lucide-react";
 
-const sectionClass = cn(
-  "rounded-lg border border-border-color bg-surface p-4 shadow-sm",
-  "dark:border-border-color-2",
-);
-const labelClass = cn("flex flex-col gap-1 text-sm text-text-primary");
-const inputClass = cn(
-  "rounded-md border border-border-color bg-surface px-3 py-2 text-sm text-text-primary shadow-sm",
-  "dark:border-border-color-2",
-);
-const buttonClass = cn(
-  "inline-flex items-center justify-center gap-2 rounded-md bg-primary-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-all duration-200 hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
-);
-const ghostClass = cn(
-  "inline-flex items-center justify-center gap-2 rounded-md border border-border-color bg-transparent px-4 py-2 text-sm font-medium text-text-primary shadow-sm transition-all duration-200 hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 active:scale-[0.98]",
-  "dark:border-border-color-2 dark:hover:bg-surface-hover",
-);
-const errorClass = cn("text-sm text-error", "dark:text-error");
-const okClass = cn("text-sm text-success", "dark:text-success");
+// Celdas de la tabla de turnos: la base compartida más el no-wrap que
+// necesitan las columnas estrechas (fechas, montos y estados).
+const shiftCellClass = cn(tableCellClass, "whitespace-nowrap");
 
-type ActionResult<T> =
-  | { success: true; data: T }
-  | { success: false; code: string; message: string };
-
-function formatMoney(value: number | string | null): string {
-  if (value === null || value === undefined) return "-";
-  const numeric = typeof value === "string" ? Number(value) : value;
-  if (!Number.isFinite(numeric)) return "-";
-  return new Intl.NumberFormat("es-CO", {
-    style: "currency",
-    currency: "COP",
-    maximumFractionDigits: 0,
-  }).format(numeric);
+// Misma tabla para vista del día e historial: mismas columnas siempre.
+function ShiftsTable({
+  shifts,
+  methodCols,
+  isAdmin,
+  emptyText,
+  onRecount,
+  onShowVersions,
+}: {
+  shifts: DayShiftView[];
+  methodCols: PaymentMethodRow[];
+  isAdmin: boolean;
+  emptyText: string;
+  /** U3: abre el reconteo de un cierre (solo llega desde la columna admin). */
+  onRecount: (view: DayShiftView) => void;
+  /** U3: muestra las dos versiones de un cierre ya recontado. */
+  onShowVersions: (view: DayShiftView) => void;
+}) {
+  const [justOpen, setJustOpen] = useState<Array<{
+    accion: string;
+    fecha: string;
+    nota: string;
+    revisor: string | null;
+  }> | null>(null);
+  return (
+    <>
+      <div className="mt-3 overflow-x-auto">
+        <table className={cn("w-full text-left text-sm", "min-w-[1100px]")}>
+          <thead>
+              <tr className={tableHeaderClass}>
+                <th className={shiftCellClass} scope="col">Apertura</th>
+                <th className={shiftCellClass} scope="col">Estado</th>
+                <th className={shiftCellClass} scope="col">Abrió</th>
+                <th className={shiftCellClass} scope="col">Cerró</th>
+                <th className={shiftCellClass} scope="col">Base inicial</th>
+              {isAdmin && (
+                <>
+                  <th className={shiftCellClass} scope="col">Ventas</th>
+                  <th className={shiftCellClass} scope="col">Efectivo</th>
+                  {methodCols.map((method) => (
+                    <th key={method.id} className={shiftCellClass} scope="col">
+                      {method.name}
+                    </th>
+                  ))}
+                </>
+              )}
+              <th className={shiftCellClass} scope="col">Vales</th>
+              <th className={shiftCellClass} scope="col">Base final</th>
+              {isAdmin && (
+                <>
+                  <th className={shiftCellClass} scope="col">Diferencia</th>
+                  <th className={shiftCellClass} scope="col">Revisada</th>
+                  <th className={shiftCellClass} scope="col">Justificación</th>
+                  {/* U3: el cierre firmado es inmutable; desde acá se abre el
+                      reconteo y se ve que un turno fue corregido. */}
+                  <th className={shiftCellClass} scope="col">Reconteo</th>
+                </>
+              )}
+            </tr>
+          </thead>
+          <tbody>
+            {shifts.map((view) => {
+              const isClosed = view.shift.status === "cerrado";
+              return (
+                <tr key={view.shift.id} className={tableRowClass}>
+                  <td className={shiftCellClass}>{formatDateTime(view.shift.opened_at)}</td>
+                  <td className={shiftCellClass}>{view.shift.status}</td>
+                  <td
+                    className={cn(shiftCellClass, "max-w-48 truncate")}
+                    title={view.abierto_por ?? undefined}
+                  >
+                    {view.abierto_por ?? "—"}
+                  </td>
+                  <td
+                    className={cn(shiftCellClass, "max-w-48 truncate")}
+                    title={view.cerrado_por ?? undefined}
+                  >
+                    {view.cerrado_por ?? "—"}
+                  </td>
+                  <td className={shiftCellClass}>{formatMoney(view.shift.opening_base)}</td>
+                  {isAdmin && (
+                    <>
+                      <td className={shiftCellClass}>{formatMoney(view.ventas)}</td>
+                      <td className={shiftCellClass}>{formatMoney(view.efectivo)}</td>
+                      {methodCols.map((method) => {
+                        const cobrado = view.metodos.find(
+                          (m) => m.method_code === method.code,
+                        )?.amount ?? 0;
+                        return (
+                          <td key={method.id} className={shiftCellClass}>
+                            {formatMoney(cobrado)}
+                          </td>
+                        );
+                      })}
+                    </>
+                  )}
+                  <td className={shiftCellClass}>{formatMoney(view.vales)}</td>
+                  <td className={shiftCellClass}>
+                    {isClosed ? formatMoney(view.vigente.base_left) : "—"}
+                  </td>
+                  {isAdmin && (
+                    <>
+                      <td className={shiftCellClass}>
+                        {!isClosed ? "—" : view.revision ? "Sí" : "No"}
+                      </td>
+                      <td className={shiftCellClass}>
+                        {!view.revision ? "N/A" : view.revision.revisada ? "Sí" : "No"}
+                      </td>
+                      <td className={shiftCellClass}>
+                        {!view.revision ? (
+                          "N/A"
+                        ) : view.revision.notas.length > 0 ? (
+                          <button
+                            type="button"
+                            className="underline"
+                            onClick={() => setJustOpen(view.revision?.notas ?? null)}
+                          >
+                            Ver
+                          </button>
+                        ) : (
+                          ""
+                        )}
+                      </td>
+                      <td className={shiftCellClass}>
+                        {!isClosed ? (
+                          "—"
+                        ) : view.recount ? (
+                          <span className="inline-flex items-center gap-2">
+                            <span className="font-medium text-warning">Recontado</span>
+                            <button
+                              type="button"
+                              className="underline"
+                              onClick={() => onShowVersions(view)}
+                            >
+                              Versiones
+                            </button>
+                          </span>
+                        ) : (
+                          <button type="button" className="underline" onClick={() => onRecount(view)}>
+                            Recontar
+                          </button>
+                        )}
+                      </td>
+                    </>
+                  )}
+                </tr>
+              );
+            })}
+            {shifts.length === 0 && (
+              <tr>
+              <td
+                colSpan={7 + (isAdmin ? 6 + methodCols.length : 0)}
+                  className={cn(tableCellClass, "text-text-secondary")}
+                >
+                  {emptyText}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      {justOpen && (
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setJustOpen(null);
+          }}
+        >
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Justificación de la revisión</DialogTitle>
+            </DialogHeader>
+            <ul className="mt-2 flex flex-col gap-2 text-sm">
+              {(justOpen ?? []).map((item, index) => (
+                <li key={index}>
+                  {item.accion} · {formatDateTime(item.fecha)} — «{item.nota}»
+                  {item.revisor && (
+                    <span className={cn("block", mutedTextClass)}>
+                      Revisada por {item.revisor}.
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+            <DialogFooter>
+              <button type="button" className={ghostClass} onClick={() => setJustOpen(null)}>
+                Cerrar
+              </button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+    </>
+  );
 }
 
-function formatDateTime(value: string | null): string {
-  if (!value) return "-";
-  return new Date(value).toLocaleString("es-CO", {
-    day: "2-digit",
-    month: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+// Brand badge as inline SVG (no external assets): rounded square in the
+// brand color with its initial. Stylized visual aid, not the official logo.
+function BrandBadge({ initial, fill }: { initial: string; fill: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className="h-5 w-5 shrink-0" aria-hidden="true">
+      <rect width="24" height="24" rx="6" fill={fill} />
+      <text
+        x="12"
+        y="16.5"
+        textAnchor="middle"
+        fontSize="12"
+        fontWeight="800"
+        fill="#ffffff"
+        fontFamily="Arial, sans-serif"
+      >
+        {initial}
+      </text>
+    </svg>
+  );
 }
 
-function toNumber(value: string): number | null {
-  const trimmed = value.trim();
-  if (trimmed === "") return null;
-  const parsed = Number(trimmed);
-  return Number.isFinite(parsed) ? parsed : null;
+const payIconClass = "h-5 w-5 shrink-0 text-text-tertiary";
+
+// Visual aid for cash counts: denomination kind or payment method code
+// mapped to a recognizable icon. Unknown codes fall back to a wallet.
+function PayIcon({ code, kind }: { code?: string; kind?: string }) {
+  if (kind === "moneda") return <Coins className={payIconClass} aria-hidden="true" />;
+  if (kind === "billete") return <Banknote className={payIconClass} aria-hidden="true" />;
+  switch (code) {
+    case "efectivo":
+      return <Banknote className={payIconClass} aria-hidden="true" />;
+    case "nequi":
+      return <BrandBadge initial="N" fill="#6b21a8" />;
+    case "daviplata":
+      return <BrandBadge initial="D" fill="#d9261c" />;
+    case "tarjeta":
+      return <CreditCard className={payIconClass} aria-hidden="true" />;
+    case "bre-b":
+      return <Zap className={payIconClass} aria-hidden="true" />;
+    case "transferencia_normal":
+      return <ArrowLeftRight className={payIconClass} aria-hidden="true" />;
+    default:
+      return <Wallet className={payIconClass} aria-hidden="true" />;
+  }
 }
 
 interface CashClientProps {
   sedeId: string;
   today: string;
+  currentUserId: string;
   initialRegisters: CashRegisterRow[];
   initialOpenShift: CashShiftRow | null;
+  initialOpenerName: string | null;
   initialDay: DayView;
   initialHistory: HistoryResult;
   methods: PaymentMethodRow[];
@@ -94,14 +312,9 @@ export function CashClient(props: CashClientProps) {
   const [openShift, setOpenShift] = useState<CashShiftRow | null>(props.initialOpenShift);
   const [day, setDay] = useState<DayView>(props.initialDay);
   const [history, setHistory] = useState<HistoryResult>(props.initialHistory);
-  const [dayFecha, setDayFecha] = useState(props.today);
   const [histDesde, setHistDesde] = useState(props.initialHistory.desde);
   const [histHasta, setHistHasta] = useState(props.initialHistory.hasta);
 
-  const [baseLeft, setBaseLeft] = useState("");
-  const [observation, setObservation] = useState("");
-
-  const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [isOpeningDialogOpen, setIsOpeningDialogOpen] = useState(false);
@@ -112,21 +325,61 @@ export function CashClient(props: CashClientProps) {
   const [closeCounts, setCloseCounts] = useState<Record<string, string>>({});
   const [closeDigitals, setCloseDigitals] = useState<Record<string, string>>({});
   const [closeStep, setCloseStep] = useState<"counts" | "confirm">("counts");
+  // U3: reconteo de un cierre. El cierre firmado no se edita: se abre un
+  // conteo completo nuevo con su motivo y quedan las dos versiones.
+  const [recountTarget, setRecountTarget] = useState<DayShiftView | null>(null);
+  const [recountCounts, setRecountCounts] = useState<Record<string, string>>({});
+  const [recountDigitals, setRecountDigitals] = useState<Record<string, string>>({});
+  const [recountReason, setRecountReason] = useState("");
+  const [recountStep, setRecountStep] = useState<"counts" | "confirm">("counts");
+  const [versionsTarget, setVersionsTarget] = useState<DayShiftView | null>(null);
+  // La vista del día no se carga al entrar (abrir/cerrar no la necesita):
+  // solo se pide si el usuario la muestra.
+  const [showDay, setShowDay] = useState(false);
+  // Item 5: vales del día visibles en caja (se cargan con la vista del día).
+  const [dayVouchers, setDayVouchers] = useState<VoucherRequestRow[]>([]);
+  const [histPage, setHistPage] = useState(1);
+  // Paginador local de la vista del día (el servidor la acota a 50).
+  const [dayPage, setDayPage] = useState(0);
   // Transición para los cambios de vista (día/historial): la UI no se
   // congela mientras la server action responde.
   const [isViewPending, startViewTransition] = useTransition();
 
   const register = registers[0] ?? day.register;
   const baseConfigurada = Number(register?.base_configurada ?? 200000);
+  // Solo quien abrió cierra; el admin es la válvula para no bloquear la caja.
+  const isOpener = openShift !== null && openShift.opened_by === props.currentUserId;
+  const canClose = props.canWrite && (isOpener || props.isAdmin);
+  // Columnas dinámicas: una columna por método activo (desglose de
+  // ventas cobrado real, aunque no sea arqueable).
+  const methodCols = props.methods.filter(
+    (method) => method.is_active && method.code !== "efectivo",
+  );
+  // Paginadores: el historial pagina en servidor (los rangos pueden
+  // traer más de una página); el día pagina en cliente sobre lo cargado.
+  const histPageCount = Math.max(1, Math.ceil(history.total / history.pageSize));
+  const dayPageCount = Math.max(1, Math.ceil(day.shifts.length / HISTORY_PAGE_SIZE));
+  const safeDayPage = Math.min(dayPage, dayPageCount - 1);
+  const dayVisible = day.shifts.slice(
+    safeDayPage * HISTORY_PAGE_SIZE,
+    (safeDayPage + 1) * HISTORY_PAGE_SIZE,
+  );
 
   function showResult<T>(result: ActionResult<T>, okMessage: string): result is { success: true; data: T } {
     if (!result.success) {
+      // El fallo de una acción es ESTADO: deja el mensaje en la vista,
+      // persistente mientras el problema exista.
       setError(result.message);
-      setNotice(null);
       return false;
     }
     setError(null);
-    setNotice(okMessage);
+    if (okMessage) {
+      // El éxito de una acción es EVENTO: acaba de pasar y no tiene que
+      // quedarse en pantalla compitiendo con lo que sí importa. Antes era un
+      // <p role="status"> que persistía hasta la siguiente acción. El texto es
+      // el mismo.
+      toast.success(okMessage);
+    }
     return true;
   }
 
@@ -154,6 +407,21 @@ export function CashClient(props: CashClientProps) {
     if (result.success) setDenominations(result.data);
   }
 
+  // Inventory-style cancel: closing the dialog always resets its state,
+  // so Esc/overlay/Cancel never leave stale counts or steps behind.
+  function cancelOpening() {
+    setOpenCounts({});
+    setOpenDigitals({});
+    setIsOpeningDialogOpen(false);
+  }
+
+  function cancelClosing() {
+    setCloseCounts({});
+    setCloseDigitals({});
+    setCloseStep("counts");
+    setIsClosingDialogOpen(false);
+  }
+
   function buildCloseCounts(): Array<{ method_code: string; denomination: number | null; quantity: number; amount: number }> {
     return [
       ...denominations.map((denom) => {
@@ -171,11 +439,88 @@ export function CashClient(props: CashClientProps) {
     ];
   }
 
-  function openCashTotal(): number {
+  // U3: mismo cierre del bloque anterior pero sobre el estado del reconteo. El
+  // reconteo reutiliza la forma del cierre (conteo completo por denominación +
+  // totales digitales) para no inventar un camino paralelo.
+  function recountCashTotal(): number {
     return denominations.reduce((acc, denom) => {
-      const qty = Number(openCounts[denom.id] ?? "0");
+      const qty = Number(recountCounts[denom.id] ?? "0");
       return acc + (Number.isFinite(qty) ? qty : 0) * Number(denom.value);
     }, 0);
+  }
+
+  function buildRecountCounts(): Array<{ method_code: string; denomination: number | null; quantity: number; amount: number }> {
+    return [
+      ...denominations.map((denom) => {
+        const qty = Math.max(0, Math.floor(Number(recountCounts[denom.id] ?? "0")) || 0);
+        return { method_code: "efectivo", denomination: Number(denom.value), quantity: qty, amount: qty * Number(denom.value) };
+      }),
+      ...props.methods
+        .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
+        .map((method) => ({
+          method_code: method.code,
+          denomination: null,
+          quantity: 1,
+          amount: Number((recountDigitals[method.code] ?? "").replace(/\D/g, "")) || 0,
+        })),
+    ];
+  }
+
+  async function startRecount(view: DayShiftView): Promise<void> {
+    setRecountTarget(view);
+    setRecountCounts({});
+    setRecountDigitals({});
+    setRecountReason("");
+    setRecountStep("counts");
+    const result = await listDenominationsAction();
+    if (result.success) setDenominations(result.data);
+  }
+
+  function cancelRecount(): void {
+    setRecountTarget(null);
+    setRecountCounts({});
+    setRecountDigitals({});
+    setRecountReason("");
+    setRecountStep("counts");
+  }
+
+  async function handleRecount(event: FormEvent): Promise<void> {
+    event.preventDefault();
+    if (!recountTarget) return;
+    if (recountStep === "counts") {
+      setError(null);
+      setRecountStep("confirm");
+      return;
+    }
+    const counted = recountCashTotal();
+    setBusy(true);
+    try {
+      const result = await recountClosedShiftAction(recountTarget.shift.id, {
+        counted_cash: counted,
+        counts: buildRecountCounts(),
+        reason: recountReason,
+      });
+      // La copia de éxito no necesita la data (con `result.data.recount` el
+      // argumento se evalúa antes de que el guard la estreche).
+      if (!showResult(result, "Turno recontado. El cierre firmado queda intacto.")) {
+        // Conteo que no cuadra: volver al detalle para corregirlo, igual que
+        // hace el cierre.
+        if (result.code === "COUNT_MISMATCH") setRecountStep("counts");
+        return;
+      }
+      cancelRecount();
+      const dayResult = await getDayViewAction({ fecha: props.today, sede_id: props.sedeId });
+      if (dayResult.success) setDay(dayResult.data);
+      const histResult = await getHistoryAction({
+        desde: histDesde,
+        hasta: histHasta,
+        sede_id: props.sedeId,
+        page: histPage,
+      });
+      if (histResult.success) setHistory(histResult.data);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function handleOpen(event: FormEvent): Promise<void> {
@@ -198,10 +543,17 @@ export function CashClient(props: CashClientProps) {
     try {
       const result = await openShiftAction({ counts });
       if (result.success) {
-        showResult(result, `Turno abierto con base ${formatMoney(result.data.opening_base)}.`);
-        setOpenShift(result.data);
+        const { shift, mismatches, firstOpen } = result.data;
+        setOpenShift(shift);
+        if (mismatches.length === 0) {
+          showResult(result, `Turno abierto con base ${formatMoney(shift.opening_base)}.`);
+        } else if (firstOpen) {
+          showResult(result, "Turno abierto. Primera apertura: el conteo inicial quedó registrado.");
+        } else {
+          showResult(result, "Turno abierto con diferencias registradas.");
+        }
         setIsOpeningDialogOpen(false);
-        const dayResult = await getDayViewAction({ fecha: dayFecha, sede_id: props.sedeId });
+        const dayResult = await getDayViewAction({ fecha: props.today, sede_id: props.sedeId });
         if (dayResult.success) setDay(dayResult.data);
       } else {
         showResult(result, "");
@@ -214,17 +566,6 @@ export function CashClient(props: CashClientProps) {
   async function handleClose(event: FormEvent): Promise<void> {
     event.preventDefault();
     if (!openShift) return;
-    const base = toNumber(baseLeft);
-    if (base === null || base < 0) {
-      setError("La base dejada es obligatoria.");
-      return;
-    }
-    if (base < baseConfigurada && observation.trim() === "") {
-      setError(
-        `La base quedó incompleta (${formatMoney(base)} de ${formatMoney(baseConfigurada)}): la observación es obligatoria.`,
-      );
-      return;
-    }
     if (closeStep === "counts") {
       setError(null);
       setCloseStep("confirm");
@@ -235,8 +576,6 @@ export function CashClient(props: CashClientProps) {
     try {
       const result = await closeShiftAction(openShift.id, {
         counted_cash: counted,
-        base_left: base,
-        observation: observation.trim() || undefined,
         counts: buildCloseCounts(),
         confirmed: true,
       });
@@ -246,13 +585,15 @@ export function CashClient(props: CashClientProps) {
         const baseDiff = Number(row.base_difference ?? 0);
         const envelope = Number(row.cash_withdrawn ?? 0);
         setOpenShift(null);
-        setBaseLeft("");
-        setObservation("");
         setCloseCounts({});
         setCloseDigitals({});
         setCloseStep("counts");
         setIsClosingDialogOpen(false);
-        if (digitalDiff.length === 0 && baseDiff >= 0) {
+        // Hidden count: only admins see bases, differences and expected
+        // values. Everyone else gets a neutral confirmation.
+        if (!props.isAdmin) {
+          showResult(result, "Turno cerrado.");
+        } else if (digitalDiff.length === 0 && baseDiff >= 0) {
           showResult(result, `Turno cerrado. Base ${formatMoney(row.base_left)} · sobre ${formatMoney(envelope)}.`);
         } else {
           const parts = digitalDiff.map(
@@ -260,15 +601,22 @@ export function CashClient(props: CashClientProps) {
           );
           if (baseDiff < 0) parts.push(`base incompleta (faltante ${formatMoney(-baseDiff)})`);
           if (baseDiff > 0) parts.push(`sobrante en base ${formatMoney(baseDiff)}`);
+          // El cierre con diferencias también es EVENTO —el turno ya se
+          // cerró, solo que con salvedades—, así que sale por el mismo canal
+          // efímero. `setError(null)` se queda: el cierre salió bien y el
+          // fallo anterior (si lo había) ya no es el caso.
           setError(null);
-          setNotice(`Cierre con diferencias: ${parts.join(" · ")}. Sobre ${formatMoney(envelope)}. Se informó a los administradores.`);
+          toast.success(
+            `Cierre con diferencias: ${parts.join(" · ")}. Sobre ${formatMoney(envelope)}. Se informó a los administradores.`,
+          );
         }
-        const dayResult = await getDayViewAction({ fecha: dayFecha, sede_id: props.sedeId });
+        const dayResult = await getDayViewAction({ fecha: props.today, sede_id: props.sedeId });
         if (dayResult.success) setDay(dayResult.data);
         const histResult = await getHistoryAction({
           desde: histDesde,
           hasta: histHasta,
           sede_id: props.sedeId,
+          page: histPage,
         });
         if (histResult.success) setHistory(histResult.data);
       } else {
@@ -280,14 +628,21 @@ export function CashClient(props: CashClientProps) {
     }
   }
 
-  function handleDay(event: FormEvent): void {
-    event.preventDefault();
+  function loadDay(): void {
     startViewTransition(async () => {
       setBusy(true);
       try {
-        const result = await getDayViewAction({ fecha: dayFecha, sede_id: props.sedeId });
-        if (!showResult(result, `Vista del día ${dayFecha} actualizada.`)) return;
+        const result = await getDayViewAction({ fecha: props.today, sede_id: props.sedeId });
+        if (!showResult(result, "Vista del día actualizada.")) return;
         setDay(result.data);
+        setDayPage(0);
+        // Item 5: vales del día (no bloquean la vista si fallan).
+        const vouchers = (await listVouchersAction({
+          request_date: props.today,
+          limit: 200,
+          sede_id: props.sedeId,
+        })) as ActionResult<VoucherRequestRow[]>;
+        if (vouchers.success) setDayVouchers(vouchers.data);
       } finally {
         setBusy(false);
       }
@@ -296,6 +651,11 @@ export function CashClient(props: CashClientProps) {
 
   function handleHistory(event: FormEvent): void {
     event.preventDefault();
+    fetchHistory(1);
+  }
+
+  // Historial paginado en servidor: cada página se pide con su número.
+  function fetchHistory(page: number): void {
     startViewTransition(async () => {
       setBusy(true);
       try {
@@ -303,9 +663,11 @@ export function CashClient(props: CashClientProps) {
           desde: histDesde,
           hasta: histHasta,
           sede_id: props.sedeId,
+          page,
         });
         if (!showResult(result, `Historial ${histDesde} … ${histHasta} actualizado.`)) return;
         setHistory(result.data);
+        setHistPage(page);
       } finally {
         setBusy(false);
       }
@@ -315,49 +677,53 @@ export function CashClient(props: CashClientProps) {
   return (
     <div className="flex flex-col gap-6">
       {error && (
-        <p role="alert" className={errorClass}>
-          {error}
-        </p>
-      )}
-      {notice && (
-        <p role="status" className={okClass}>
-          {notice}
-        </p>
+        // Fallo al abrir o cerrar el turno = ESTADO: sigue siendo el caso
+        // mientras no se corrija, así que va inline y persistente arriba de las
+        // secciones. `destructive` deriva role="alert" (asertivo), el mismo rol
+        // que el `<p role="alert">` escribía a mano.
+        <Alert variant="destructive">{error}</Alert>
       )}
 
       <section className={sectionClass}>
-        <h2 className="text-lg font-semibold">Turno actual</h2>
+        <h2 className="text-lg font-semibold">
+          {openShift && props.initialOpenerName
+            ? `Turno actual de ${props.initialOpenerName}`
+            : "Turno actual"}
+        </h2>
         {openShift ? (
           <div className="mt-3 flex flex-col gap-2 text-sm">
             <p>
               Turno abierto desde {formatDateTime(openShift.opened_at)} con base{" "}
               <strong>{formatMoney(openShift.opening_base)}</strong>.
             </p>
-            <p className="text-slate-600 dark:text-slate-300">
-              Base configurada: {formatMoney(baseConfigurada)}.
-            </p>
-            {props.canWrite && (
+            {props.isAdmin && (
+              <p className={mutedTextClass}>
+                Base configurada: {formatMoney(baseConfigurada)}.
+              </p>
+            )}
+            {canClose ? (
               <div className="mt-3 flex flex-wrap gap-2">
                 <button type="button" onClick={startClosing} className={buttonClass}>
                   Cerrar turno
                 </button>
               </div>
-            )}
+            ) : props.canWrite ? (
+              <p className={cn("mt-3", mutedTextClass)}>
+                Solo quien abrió el turno puede cerrarlo.
+              </p>
+            ) : null}
           </div>
         ) : (
           <div className="mt-3 flex flex-col gap-3 text-sm">
             <p>No hay un turno abierto.</p>
             {props.canWrite ? (
               <div>
-                <p className="w-full text-slate-600 dark:text-slate-300">
-                  Al abrir se valida el pre-arqueo contra el último cierre antes de iniciar.
-                </p>
-                <button type="button" onClick={startOpening} className={`${buttonClass} mt-3`}>
-                  Abrir turno con pre-arqueo
+                <button type="button" onClick={startOpening} className={buttonClass}>
+                  Abrir turno
                 </button>
               </div>
             ) : (
-              <p className="text-slate-600 dark:text-slate-300">
+              <p className={mutedTextClass}>
                 Solo admin o caja pueden abrir turnos.
               </p>
             )}
@@ -366,20 +732,28 @@ export function CashClient(props: CashClientProps) {
       </section>
 
       {props.canWrite && !openShift && (
-        <Dialog open={isOpeningDialogOpen} onOpenChange={setIsOpeningDialogOpen}>
+        <Dialog
+          open={isOpeningDialogOpen}
+          onOpenChange={(open) => {
+            if (!open) cancelOpening();
+            else setIsOpeningDialogOpen(open);
+          }}
+        >
           <DialogContent className="max-w-lg">
             <DialogHeader>
-              <DialogTitle>Pre-arqueo de apertura</DialogTitle>
+              <DialogTitle>Abrir turno</DialogTitle>
             </DialogHeader>
-            <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+            <p className={cn("mt-1", mutedTextClass)}>
               Cuente billetes y monedas por denominación y declare los totales digitales.
-              El sistema valida contra el cierre anterior antes de abrir.
             </p>
             <form onSubmit={handleOpen} className="mt-3 flex flex-col gap-3">
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                 {denominations.map((denom) => (
                   <label key={denom.id} className={labelClass}>
-                    {denom.kind} {formatMoney(denom.value)}
+                    <span className="inline-flex items-center gap-1.5">
+                      <PayIcon kind={denom.kind} />
+                      {denom.kind} {formatMoney(denom.value)}
+                    </span>
                     <input
                       className={inputClass}
                       value={openCounts[denom.id] ?? ""}
@@ -392,12 +766,14 @@ export function CashClient(props: CashClientProps) {
                   </label>
                 ))}
               </div>
-              <p className="text-sm font-semibold">Efectivo contado: {formatMoney(openCashTotal())}</p>
               {props.methods
                 .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
                 .map((method) => (
                   <label key={method.id} className={labelClass}>
-                    {method.name} (total en la aplicación)
+                    <span className="inline-flex items-center gap-1.5">
+                      <PayIcon code={method.code} />
+                      {method.name} (total en la aplicación)
+                    </span>
                     <input
                       className={inputClass}
                       value={formatMoneyInput(openDigitals[method.code] ?? "")}
@@ -410,11 +786,9 @@ export function CashClient(props: CashClientProps) {
                   </label>
                 ))}
               <DialogFooter>
-                <DialogClose asChild>
-                  <button type="button" className={ghostClass}>
-                    Cancelar
-                  </button>
-                </DialogClose>
+                <button type="button" className={ghostClass} onClick={cancelOpening}>
+                  Cancelar
+                </button>
                 <button type="submit" className={buttonClass} disabled={busy}>
                   Validar y abrir
                 </button>
@@ -425,7 +799,13 @@ export function CashClient(props: CashClientProps) {
       )}
 
       {props.canWrite && openShift && (
-        <Dialog open={isClosingDialogOpen} onOpenChange={setIsClosingDialogOpen}>
+        <Dialog
+          open={isClosingDialogOpen}
+          onOpenChange={(open) => {
+            if (!open) cancelClosing();
+            else setIsClosingDialogOpen(open);
+          }}
+        >
           <DialogContent className="max-w-lg">
             <DialogHeader>
               <DialogTitle>Cerrar turno</DialogTitle>
@@ -436,7 +816,10 @@ export function CashClient(props: CashClientProps) {
                 <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                   {denominations.map((denom) => (
                     <label key={denom.id} className={labelClass}>
-                      {denom.kind} {formatMoney(denom.value)}
+                      <span className="inline-flex items-center gap-1.5">
+                        <PayIcon kind={denom.kind} />
+                        {denom.kind} {formatMoney(denom.value)}
+                      </span>
                       <input
                         className={inputClass}
                         value={closeCounts[denom.id] ?? ""}
@@ -449,12 +832,14 @@ export function CashClient(props: CashClientProps) {
                     </label>
                   ))}
                 </div>
-                <p className="text-sm font-semibold">Efectivo contado: {formatMoney(closeCashTotal())}</p>
                 {props.methods
                   .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
                   .map((method) => (
                     <label key={method.id} className={labelClass}>
-                      {method.name} (total en la aplicación)
+                      <span className="inline-flex items-center gap-1.5">
+                        <PayIcon code={method.code} />
+                        {method.name} (total en la aplicación)
+                      </span>
                       <input
                         className={inputClass}
                         value={formatMoneyInput(closeDigitals[method.code] ?? "")}
@@ -466,123 +851,295 @@ export function CashClient(props: CashClientProps) {
                       />
                     </label>
                   ))}
-                <label className={labelClass}>
-                  Base dejada (obligatoria)
-                  <input
-                    className={inputClass}
-                    value={formatMoneyInput(baseLeft)}
-                    onChange={(event) => setBaseLeft(stripMoneyInput(event.target.value))}
-                    inputMode="numeric"
-                    placeholder="200.000"
-                  />
-                </label>
-                <label className={labelClass}>
-                  Observación (obligatoria si la base queda incompleta)
-                  <input
-                    className={inputClass}
-                    value={observation}
-                    onChange={(event) => setObservation(event.target.value)}
-                    placeholder="Faltante de 150000…"
-                  />
-                </label>
               </>
             ) : (
-              <div className="flex flex-col gap-2 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-800 dark:bg-amber-950">
+              <div className="flex flex-col gap-2 rounded-md bg-warning-light px-3 py-2 text-sm font-medium text-warning">
                 <p className="font-semibold">¿Está seguro de cerrar?</p>
-                <p>
-                  Efectivo contado {formatMoney(closeCashTotal())} · base que queda{" "}
-                  {formatMoney(toNumber(baseLeft) ?? 0)} · sobre {formatMoney(closeCashTotal() - (toNumber(baseLeft) ?? 0))}.
-                </p>
-                <p>Después del cierre ya no podrá modificarlo. Solo un administrador puede editarlo y queda registrado.</p>
+                {props.isAdmin && !isOpener && <p>Cierra este turno como administrador.</p>}
+                <p>Después del cierre ya no podrá modificarlo.</p>
               </div>
             )}
             <DialogFooter>
               {closeStep === "confirm" ? (
-                <button type="button" className={ghostClass} onClick={() => setCloseStep("counts")}>
-                  Volver
-                </button>
-              ) : (
-                <DialogClose asChild>
-                  <button type="button" className={ghostClass}>
+                <>
+                  <button type="button" className={ghostClass} onClick={() => setCloseStep("counts")}>
+                    Volver
+                  </button>
+                  <button type="button" className={ghostClass} onClick={cancelClosing}>
                     Cancelar
                   </button>
-                </DialogClose>
+                </>
+              ) : (
+                <button type="button" className={ghostClass} onClick={cancelClosing}>
+                  Cancelar
+                </button>
               )}
               <button type="submit" className={buttonClass} disabled={busy}>
                 {closeStep === "counts" ? "Continuar" : "Sí, cerrar turno"}
               </button>
             </DialogFooter>
             </form>
-            <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-              Base configurada: {formatMoney(baseConfigurada)}. Recogido = contado − base;
-              diferencia = base − configurada.
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/* U3: reconteo de un cierre. Primero el conteo COMPLETO (mismo detalle
+          por denominación y totales digitales que el cierre); después el
+          motivo, que es obligatorio. El cierre firmado no se edita. */}
+      {props.isAdmin && recountTarget && (
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) cancelRecount();
+          }}
+        >
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Recontar turno cerrado</DialogTitle>
+            </DialogHeader>
+            <p className={cn("mt-1", mutedTextClass)}>
+              El cierre firmado no se modifica. Cuente otra vez billetes y monedas por
+              denominación y declare los totales digitales; el sistema guarda las dos versiones.
             </p>
+            <form onSubmit={handleRecount} className="mt-3 flex flex-col gap-3">
+              {recountStep === "counts" ? (
+                <>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                    {denominations.map((denom) => (
+                      <label key={denom.id} className={labelClass}>
+                        <span className="inline-flex items-center gap-1.5">
+                          <PayIcon kind={denom.kind} />
+                          {denom.kind} {formatMoney(denom.value)}
+                        </span>
+                        <input
+                          className={inputClass}
+                          value={recountCounts[denom.id] ?? ""}
+                          onChange={(event) =>
+                            setRecountCounts((prev) => ({ ...prev, [denom.id]: event.target.value.replace(/\D/g, "") }))
+                          }
+                          inputMode="numeric"
+                          placeholder="0"
+                        />
+                      </label>
+                    ))}
+                  </div>
+                  {props.methods
+                    .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
+                    .map((method) => (
+                      <label key={method.id} className={labelClass}>
+                        <span className="inline-flex items-center gap-1.5">
+                          <PayIcon code={method.code} />
+                          {method.name} (total en la aplicación)
+                        </span>
+                        <input
+                          className={inputClass}
+                          value={formatMoneyInput(recountDigitals[method.code] ?? "")}
+                          onChange={(event) =>
+                            setRecountDigitals((prev) => ({ ...prev, [method.code]: stripMoneyInput(event.target.value) }))
+                          }
+                          inputMode="numeric"
+                          placeholder="0"
+                        />
+                      </label>
+                    ))}
+                </>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  <div className="flex flex-col gap-2 rounded-md bg-warning-light px-3 py-2 text-sm font-medium text-warning">
+                    <p className="font-semibold">¿Está seguro de recontar?</p>
+                    <p>
+                      Efectivo contado ahora: {formatMoney(recountCashTotal())}. Cierre original:{" "}
+                      {formatMoney(recountTarget.shift.counted_cash)}.
+                    </p>
+                    <p>El cierre original queda firmado y las dos versiones quedan visibles.</p>
+                  </div>
+                  <label className={labelClass}>
+                    Motivo del reconteo
+                    <textarea
+                      className={inputClass}
+                      rows={3}
+                      value={recountReason}
+                      onChange={(event) => setRecountReason(event.target.value)}
+                      placeholder="Explique por qué se recontá el cierre."
+                    />
+                  </label>
+                </div>
+              )}
+              <DialogFooter>
+                {recountStep === "confirm" ? (
+                  <>
+                    <button type="button" className={ghostClass} onClick={() => setRecountStep("counts")}>
+                      Volver
+                    </button>
+                    <button type="button" className={ghostClass} onClick={cancelRecount}>
+                      Cancelar
+                    </button>
+                  </>
+                ) : (
+                  <button type="button" className={ghostClass} onClick={cancelRecount}>
+                    Cancelar
+                  </button>
+                )}
+                <button
+                  type="submit"
+                  className={buttonClass}
+                  disabled={busy || (recountStep === "confirm" && recountReason.trim().length === 0)}
+                >
+                  {recountStep === "counts" ? "Continuar" : "Sí, recontar"}
+                </button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/* U3: las dos versiones de un cierre recontado, con quién y por qué. */}
+      {props.isAdmin && versionsTarget?.recount && (
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setVersionsTarget(null);
+          }}
+        >
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Versiones del cierre</DialogTitle>
+            </DialogHeader>
+            <div className="mt-2 flex flex-col gap-3 text-sm">
+              <div className="flex flex-col gap-1">
+                <p className="font-semibold">Cierre original (firmado, intacto)</p>
+                <p>
+                  Contado {formatMoney(versionsTarget.recount.previous.counted_cash)} · base{" "}
+                  {formatMoney(versionsTarget.recount.previous.base_left)} · sobre{" "}
+                  {formatMoney(versionsTarget.recount.previous.cash_withdrawn)} · diferencia{" "}
+                  {formatMoney(versionsTarget.recount.previous.base_difference)}.
+                </p>
+              </div>
+              <div className="flex flex-col gap-1">
+                <p className="font-semibold text-warning">Reconteo (gobierna)</p>
+                <p>
+                  Contado {formatMoney(versionsTarget.recount.counted_cash)} · base{" "}
+                  {formatMoney(versionsTarget.recount.base_left)} · sobre{" "}
+                  {formatMoney(versionsTarget.recount.cash_withdrawn)} · diferencia{" "}
+                  {formatMoney(versionsTarget.recount.base_difference)}.
+                </p>
+                <p className={mutedTextClass}>
+                  Motivo: «{versionsTarget.recount.reason}». Recontado por{" "}
+                  {versionsTarget.recount.recounted_by ?? "usuario desconocido"} el{" "}
+                  {formatDateTime(versionsTarget.recount.recounted_at)}.
+                </p>
+              </div>
+            </div>
+            <DialogFooter>
+              <button type="button" className={ghostClass} onClick={() => setVersionsTarget(null)}>
+                Cerrar
+              </button>
+            </DialogFooter>
           </DialogContent>
         </Dialog>
       )}
 
       <section className={sectionClass} aria-busy={isViewPending}>
         <h2 className="text-lg font-semibold">Vista del día</h2>
-        <form onSubmit={handleDay} className="mt-3 flex flex-wrap items-end gap-3">
-          <label className={labelClass}>
-            Fecha
-            <input
-              type="date"
-              className={inputClass}
-              value={dayFecha}
-              onChange={(event) => setDayFecha(event.target.value)}
+        {!showDay ? (
+          <div className="mt-3 flex flex-col gap-3 text-sm">
+            <div>
+              <button
+                type="button"
+                className={ghostClass}
+                disabled={busy || isViewPending}
+                onClick={() => {
+                  setShowDay(true);
+                  loadDay();
+                }}
+              >
+                {isViewPending ? "Cargando…" : "Mostrar vista del día"}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="mt-3">
+              <button
+                type="button"
+                className={ghostClass}
+                disabled={busy || isViewPending}
+                onClick={loadDay}
+              >
+                {isViewPending ? "Actualizando…" : "Actualizar"}
+              </button>
+            </div>
+            <ShiftsTable
+              shifts={dayVisible}
+              methodCols={methodCols}
+              isAdmin={props.isAdmin}
+              emptyText="Sin turnos este día."
+              onRecount={startRecount}
+              onShowVersions={setVersionsTarget}
             />
-          </label>
-          <button type="submit" className={ghostClass} disabled={busy || isViewPending}>
-            {isViewPending ? "Actualizando…" : "Ver día"}
-          </button>
-        </form>
-        <div className="mt-3 overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="text-left text-slate-600 dark:text-slate-300">
-                <th className="py-1 pr-3">Apertura</th>
-                <th className="py-1 pr-3">Estado</th>
-                <th className="py-1 pr-3">Base inicial</th>
-                <th className="py-1 pr-3">Ventas</th>
-                <th className="py-1 pr-3">Esperado</th>
-                <th className="py-1 pr-3">Contado</th>
-                <th className="py-1 pr-3">Base dejada</th>
-                <th className="py-1 pr-3">Recogido</th>
-                <th className="py-1 pr-3">Diferencia</th>
-              </tr>
-            </thead>
-            <tbody>
-              {day.shifts.map((view) => (
-                <tr key={view.shift.id} className="border-t border-slate-200 dark:border-slate-700">
-                  <td className="py-1 pr-3">{formatDateTime(view.shift.opened_at)}</td>
-                  <td className="py-1 pr-3">{view.shift.status}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.shift.opening_base)}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.ventas)}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.efectivo)}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.shift.counted_cash)}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.shift.base_left)}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.shift.cash_withdrawn)}</td>
-                  <td className="py-1 pr-3">{formatMoney(view.shift.base_difference)}</td>
-                </tr>
-              ))}
-              {day.shifts.length === 0 && (
-                <tr>
-                  <td colSpan={9} className="py-2 text-slate-600 dark:text-slate-300">
-                    Sin turnos este día.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-        <p className="mt-3 text-sm">
-          Acumulado ({day.totals.turnos} turnos): ventas {formatMoney(day.totals.ventas)} ·
-          esperado {formatMoney(day.totals.esperado)} · contado {formatMoney(day.totals.contado)} ·
-          base dejada {formatMoney(day.totals.baseDejada)} · recogido {formatMoney(day.totals.recogido)} ·
-          diferencias {formatMoney(day.totals.diferencias)}.
-        </p>
+          {dayPageCount > 1 && (
+            <div className="mt-3 flex items-center gap-2 text-sm">
+              <button
+                type="button"
+                className={ghostClass}
+                disabled={safeDayPage === 0}
+                onClick={() => setDayPage(safeDayPage - 1)}
+              >
+                Anterior
+              </button>
+              <span className={mutedTextClass}>
+                Página {safeDayPage + 1} de {dayPageCount}
+              </span>
+              <button
+                type="button"
+                className={ghostClass}
+                disabled={safeDayPage >= dayPageCount - 1}
+                onClick={() => setDayPage(safeDayPage + 1)}
+              >
+                Siguiente
+              </button>
+            </div>
+          )}
+            {props.isAdmin ? (
+              <p className="mt-3 text-sm">
+                Acumulado ({day.totals.turnos} turnos): ventas {formatMoney(day.totals.ventas)} ·
+                recogido {formatMoney(day.totals.recogido)} ·
+                diferencias {formatMoney(day.totals.diferencias)}.
+              </p>
+            ) : null}
+          </>
+        )}
       </section>
+
+      {showDay ? (
+        <section className={sectionClass} aria-busy={isViewPending}>
+          <h2 className="text-lg font-semibold">Vales del día</h2>
+          {dayVouchers.length === 0 ? (
+            <p className={cn("mt-3", mutedTextClass)}>Sin vales este día.</p>
+          ) : (
+            <>
+              <ul className="mt-3 flex flex-col gap-2 text-sm">
+                {dayVouchers.map((row) => (
+                  <li key={row.id} className="flex flex-wrap items-center gap-2">
+                    <span>
+                      {formatMoney(row.amount)} · {row.request_date}
+                    </span>
+                    <Badge variant="secondary">
+                      {row.status}
+                      {row.status === "descontada" ? " (en nómina)" : ""}
+                    </Badge>
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-3 text-sm">
+                Total en vales:{" "}
+                {formatMoney(dayVouchers.reduce((acc, row) => acc + Number(row.amount), 0))} (
+                {dayVouchers.length} vales).
+              </p>
+            </>
+          )}
+        </section>
+      ) : null}
 
       {props.isAdmin ? (
       <section className={sectionClass} aria-busy={isViewPending}>
@@ -610,25 +1167,37 @@ export function CashClient(props: CashClientProps) {
             {isViewPending ? "Filtrando…" : "Filtrar"}
           </button>
         </form>
-        <ul className="mt-3 flex flex-col gap-2 text-sm">
-          {history.shifts.map((view) => (
-            <li key={view.shift.id} className="border-t border-slate-200 pt-2 dark:border-slate-700">
-              {formatDateTime(view.shift.opened_at)} · {view.shift.status} · base{" "}
-              {formatMoney(view.shift.opening_base)} · ventas {formatMoney(view.ventas)}
-              {view.shift.status === "cerrado" && (
-                <>
-                  {" "}· contado {formatMoney(view.shift.counted_cash)} · base dejada{" "}
-                  {formatMoney(view.shift.base_left)} · recogido {formatMoney(view.shift.cash_withdrawn)} ·
-                  diferencia {formatMoney(view.shift.base_difference)}
-                  {view.shift.observation ? ` · «${view.shift.observation}»` : ""}
-                </>
-              )}
-            </li>
-          ))}
-          {history.shifts.length === 0 && (
-            <li className="text-slate-600 dark:text-slate-300">Sin turnos en el rango.</li>
-          )}
-        </ul>
+        <ShiftsTable
+          shifts={history.shifts}
+          methodCols={methodCols}
+          isAdmin={props.isAdmin}
+          emptyText="Sin turnos en el rango."
+          onRecount={startRecount}
+          onShowVersions={setVersionsTarget}
+        />
+        {histPageCount > 1 && (
+          <div className="mt-3 flex items-center gap-2 text-sm">
+            <button
+              type="button"
+              className={ghostClass}
+              disabled={histPage <= 1 || isViewPending}
+              onClick={() => fetchHistory(histPage - 1)}
+            >
+              Anterior
+            </button>
+            <span className={mutedTextClass}>
+              Página {histPage} de {histPageCount} ({history.total} turnos)
+            </span>
+            <button
+              type="button"
+              className={ghostClass}
+              disabled={histPage >= histPageCount || isViewPending}
+              onClick={() => fetchHistory(histPage + 1)}
+            >
+              Siguiente
+            </button>
+          </div>
+        )}
       </section>
       ) : null}
     </div>

@@ -13,20 +13,31 @@ import {
   type TaxConfigInput,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
-import { getSessionUser } from "@/src/features/auth/service";
+import { getSessionUser, hashPassword } from "@/src/features/auth/service";
+import { readAllPaged } from "@/src/shared/lib/paged";
 import { unstable_cache } from "next/cache";
 
-export class AdminError extends Error {
-  readonly code: string;
-  readonly status: number;
+// Compatibilidad: la identidad de estos guardas vive en
+// `@/src/shared/lib/sede.ts` (import cruzado entre features resuelto).
+// Se re-exportan aquí para no romper importadores existentes; el código
+// nuevo importa desde shared. Misma clase: `instanceof` intacto.
+import {
+  requireSedeRole,
+  SedeError as AdminError,
+} from "@/src/shared/lib/sede";
+export {
+  requireSedeRole,
+  resolveSede,
+  SedeError as AdminError,
+} from "@/src/shared/lib/sede";
 
-  constructor(code: string, message: string, status = 400) {
-    super(message);
-    this.name = "AdminError";
-    this.code = code;
-    this.status = status;
-  }
-}
+/**
+ * Mapa de dominios (SRP, decisión pre-pruebas 2026-09-22):
+ * 1) Sesión (requireSession/requireAdminSession) 2) Sedes 3) Empleados+usuarios
+ * 4) Catálogos (servicios, impuestos, métodos de pago) 5) Roles.
+ * El split físico en módulos se difiere a post-pruebas para no romper
+ * los 12 importadores activos; el código nuevo usa `@/src/shared/lib/sede.ts`.
+ */
 
 /**
  * Cliente privilegiado bajo demanda (service_role, solo servidor).
@@ -62,16 +73,7 @@ function validationMessage(error: { issues: Array<{ message: string }> }): strin
 }
 
 // ------------------------------------------------------- roles por sede ---
-/**
- * TRA/NFR-02 + §10: verifica que la sesión tenga al menos uno de los roles
- * exigidos. Puro (sin red) para poder probarlo en unit tests.
- */
-export function requireSedeRole(roles: RoleCode[], allowed: RoleCode[]): void {
-  const permitted = allowed.some((role) => roles.includes(role));
-  if (!permitted) {
-    throw new AdminError("FORBIDDEN", "No tiene permiso para esta acción.", 403);
-  }
-}
+// `requireSedeRole` vive en `@/src/shared/lib/sede.ts` (re-exportado arriba).
 
 export interface AdminSession {
   userId: string;
@@ -110,13 +112,9 @@ export async function requireSession(token: string | null | undefined): Promise<
 }
 
 /**
- * El MVP opera una sola sede: el sede_id solicitado debe coincidir con el
- * de la sesión (si se omite, se usa el de la sesión).
+ * El MVP opera una sola sede (`resolveSede` en `@/src/shared/lib/sede.ts`,
+ * re-exportado arriba).
  */
-export function resolveSede(sessionSedeId: string, requestedSedeId?: string | null): string {
-  if (!requestedSedeId || requestedSedeId === sessionSedeId) return sessionSedeId;
-  throw new AdminError("FORBIDDEN", "No tiene acceso a esa sede.", 403);
-}
 
 // ----------------------------------------------------------------- sedes ---
 export interface SedeRow {
@@ -165,42 +163,124 @@ export interface EmployeeRow {
   id: string;
   sede_id: string;
   user_id: string | null;
+  full_name: string;
   employee_code: string | null;
   document: string;
   phone: string | null;
   position: string | null;
+  payout_mode: string;
+  email: string | null;
+  birth_date: string | null;
   pay_type: string;
   salary_fixed: number | null;
   commission_percent: number | null;
   is_active: boolean;
 }
 
+export interface SedeUserRow {
+  id: string;
+  sede_id: string | null;
+  full_name: string;
+  id_number: string;
+  roles: RoleCode[];
+}
+
+const EMPLOYEE_SELECT =
+  "id, sede_id, user_id, full_name, employee_code, document, phone, position, payout_mode, email, birth_date, pay_type, salary_fixed, commission_percent, is_active";
+
 async function fetchEmployees(sedeId: string, limit?: number): Promise<EmployeeRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("employees")
-    .select(
-      "id, sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent, is_active",
-    )
+    .select(EMPLOYEE_SELECT)
     .eq("sede_id", sedeId)
-    .order("document")
+    .order("full_name")
     .limit(clampLimit(limit));
   if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
   return (data ?? []) as EmployeeRow[];
+}
+
+/**
+ * U7: la planta COMPLETA de la sede, sin el tope del listado.
+ *
+ * `fetchEmployees` existe para LISTAR con respuesta instantánea: 50 filas por
+ * defecto y 500 como techo interno (`clampLimit`). Ese tope es correcto para una
+ * lista de navegación y equivocado para la nómina: `calculatePayroll` armaba su
+ * alineación con `listEmployees(sedeId, 500)` y `clampLimit` recortaba a 500, así
+ * que el empleado 501 de una sede no quedaba mal pagado —quedaba AUSENTE de la
+ * nómina, sin un solo error—. El conjunto acá SÍ está acotado por la sede, así
+ * que lo correcto es leerlo entero por páginas, con `order()` determinista.
+ *
+ * Sin caché a propósito: una sede cuya última alta es de hace un minuto tiene que
+ * entrar en la nómina de hoy, y una planta cacheada es una planta incompleta (ese
+ * es exactamente el defecto que esto cierra). El fallo de la lectura se PROPAGA
+ * (`PagedReadError`): el llamador de plata lo convierte en un error de negocio a
+ * la vista, nunca en "leí lo que alcancé".
+ */
+export async function listAllEmployees(sedeId: string): Promise<EmployeeRow[]> {
+  const db = await adminDb();
+  return readAllPaged<EmployeeRow>({
+    table: "employees",
+    fetchPage: (from, to) =>
+      db
+        .from("employees")
+        .select(EMPLOYEE_SELECT)
+        .eq("sede_id", sedeId)
+        // El nombre es el orden histórico de la lista; `id` desempata para que
+        // dos homónimos no caigan en páginas distintas (ni se repitan ni falten).
+        .order("full_name")
+        .order("id")
+        .range(from, to),
+  });
 }
 
 export async function getEmployee(id: string): Promise<EmployeeRow> {
   const db = await adminDb();
   const { data, error } = await db
     .from("employees")
-    .select(
-      "id, sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent, is_active",
-    )
+    .select(EMPLOYEE_SELECT)
     .eq("id", id)
     .maybeSingle();
   if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
   if (!data) throw new AdminError("NOT_FOUND", "Empleado no encontrado.", 404);
   return data as EmployeeRow;
+}
+
+/** Usuarios de la sede con sus roles (selector de vínculo + pestaña Roles).
+ * Incluye sin sede para que ninguno quede invisible sin rol. */
+export async function listSedeUsers(sedeId: string): Promise<SedeUserRow[]> {
+  const db = await adminDb();
+  const { data: users, error } = await db
+    .from("users")
+    .select("id, sede_id, full_name, id_number")
+    .or(`sede_id.eq.${sedeId},sede_id.is.null`)
+    .order("full_name");
+  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
+  const rows = (users ?? []) as Array<{ id: string; sede_id: string | null; full_name: string; id_number: string }>;
+  const { data: roleRows, error: roleError } = await db
+    .from("user_roles")
+    .select("user_id, roles(code)")
+    .in(
+      "user_id",
+      rows.map((row) => row.id),
+    );
+  if (roleError) throw new AdminError("INTERNAL", "Error interno.", 500);
+  const byUser = new Map<string, RoleCode[]>();
+  for (const row of (roleRows ?? []) as unknown as Array<{
+    user_id: string;
+    roles: { code: string } | Array<{ code: string }> | null;
+  }>) {
+    const codes = Array.isArray(row.roles)
+      ? row.roles.map((item) => item.code)
+      : row.roles
+        ? [row.roles.code]
+        : [];
+    for (const code of codes) {
+      if (code !== "admin" && code !== "empleado" && code !== "caja") continue;
+      byUser.set(row.user_id, [...(byUser.get(row.user_id) ?? []), code]);
+    }
+  }
+  return rows.map((row) => ({ ...row, roles: byUser.get(row.id) ?? [] }));
 }
 
 /**
@@ -214,6 +294,33 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
   const input: EmployeeInput = parsed.data;
   const code = normalizeEmployeeCode(input.employee_code);
   const db = await adminDb();
+
+  // Vínculo automático por documento (no editable): el usuario de acceso
+  // es el de la sede con el mismo documento. El user_id que traiga el input se
+  // ignora a propósito.
+  //
+  // CL-15: si NO hay coincidencia, el usuario NO se crea acá. La creación viaja
+  // adentro de `upsert_employee_atomic` (054), en la MISMA sentencia que el rol
+  // y el legajo: un usuario creado desde el cliente era la mitad de la ventana
+  // —quedaba con login y rol, y sin legajo, cuando la escritura siguiente
+  // fallaba—.
+  const { data: linked, error: linkedError } = await db
+    .from("users")
+    .select("id")
+    .eq("sede_id", input.sede_id)
+    .eq("id_number", input.document)
+    .maybeSingle();
+  if (linkedError) throw new AdminError("INTERNAL", "Error interno.", 500);
+  const userId = (linked as { id: string } | null)?.id ?? null;
+  if (userId) {
+    let takenQuery = db.from("employees").select("id").eq("user_id", userId).limit(1);
+    if (input.id) takenQuery = takenQuery.neq("id", input.id);
+    const { data: taken, error: takenError } = await takenQuery;
+    if (takenError) throw new AdminError("INTERNAL", "Error interno.", 500);
+    if (taken && taken.length > 0) {
+      throw new AdminError("USER_ALREADY_LINKED", "Ese documento ya está vinculado a otro empleado.", 409);
+    }
+  }
 
   if (code !== null) {
     let conflictQuery = db
@@ -230,25 +337,104 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
     }
   }
 
-  const payload = {
-    ...(input.id ? { id: input.id } : {}),
+  // Red de seguridad de roles (solo al crear): si el usuario vinculado NO tiene
+  // ningún rol, se le asigna `empleado` para que nadie quede sin acceso por
+  // olvido.
+  //
+  // CO-4: la decisión ya NO se toma desde el cliente. Un `select` seguido de un
+  // `insert` son DOS requests de PostgREST —dos transacciones— y entre ellos
+  // nada impide que otro escritor confirme un rol: la red leía "cero roles",
+  // `setUserRoles` dejaba `admin`, y el insert de la red agregaba `empleado`.
+  // El usuario terminaba con DOS roles, y el modelo del proyecto es uno por
+  // usuario (`setUserRolesSchema` exige `.length(1)`). Una relectura de
+  // compensación no arregla nada: también está sin lock y podría borrar un rol
+  // legítimo. La decisión viaja por lo tanto a UNA sentencia del servidor —hoy
+  // `upsert_employee_atomic` (054), que COMPONE `ensure_user_has_role` (040) y
+  // toma el lock de la fila del usuario (`FOR UPDATE`) antes de escribir—. Ese
+  // lock es el MISMO que toma `replace_user_roles` (039): los dos escritores de
+  // roles quedan serializados y el intercalado deja de ser posible.
+  //
+  // CL-15: además, el alta ENTERA —el usuario si hay que crearlo, su rol y el
+  // legajo— viaja en esa misma sentencia. Antes eran hasta TRES requests de
+  // PostgREST: el `insert` del usuario, el rpc de la red de seguridad y el
+  // `upsert` del empleado. Un fallo entre ellos dejaba un usuario con login y
+  // rol pero SIN legajo —puede entrar y no existe como empleado—, y el legajo
+  // quedaba sin la persona que lo respalda. Adentro de una transacción no hay
+  // "entre ellos": o se escriben las tres cosas, o no se escribe ninguna.
+  //
+  // Las comprobaciones de negocio de arriba (`USER_ALREADY_LINKED`,
+  // `EMPLOYEE_CODE_TAKEN`) SIGUEN mandando para el error legible, y la función
+  // las repite adentro sobre la fila bloqueada, que es lo que las vuelve
+  // verdaderas al momento de escribir.
+  //
+  // El rpc levanta `RAISE EXCEPTION` plano (SQLSTATE P0001, o el 23505 del
+  // índice parcial de `employee_code`) cuando el usuario o el rol no existen.
+  // Acá NO se traduce a un error de negocio como en `setUserRoles`: el usuario
+  // y el rol los eligió el propio servicio, así que cualquiera de los dos casos
+  // significa dato o permiso roto —el mismo contrato que ya tenía esta ruta
+  // cuando el catálogo no traía `empleado`— y se reporta como error interno. El
+  // único 23505 que se traduce es el del código de empleado, que es el mismo
+  // contrato de carrera que ya tenía el `upsert` suelto.
+  //
+  // Al actualizar (`input.id`) no se consulta: los roles no se tocan, y el
+  // legajo se sigue escribiendo con su `upsert` de siempre (UNA escritura, que
+  // no necesita transacción para ser atómica).
+  const camposDelEmpleado = {
     sede_id: input.sede_id,
-    user_id: input.user_id ?? null,
+    full_name: input.full_name,
     employee_code: code,
     document: input.document,
     phone: input.phone ?? null,
     position: input.position ?? null,
+    ...(input.payout_mode !== undefined ? { payout_mode: input.payout_mode } : {}),
+    email: input.email?.trim() ? input.email.trim() : null,
+    birth_date: input.birth_date?.trim() ? input.birth_date : null,
     pay_type: input.pay_type,
     salary_fixed: input.salary_fixed ?? null,
     commission_percent: input.commission_percent ?? null,
     ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
   };
+
+  if (!input.id) {
+    const { data: creado, error: altaError } = await db.rpc("upsert_employee_atomic", {
+      p_employee: camposDelEmpleado,
+      p_user_id: userId,
+      p_create_user: userId
+        ? null
+        : {
+            sede_id: input.sede_id,
+            email: input.email?.trim() ? input.email.trim() : null,
+            phone: input.phone ?? null,
+            id_type: "CC",
+            id_number: input.document,
+            password_hash: await hashPassword(input.document),
+            full_name: input.full_name,
+          },
+      p_role_code: "empleado",
+    });
+    if (altaError) {
+      if ((altaError as { code?: string }).code === "23505") {
+        throw new AdminError(
+          "EMPLOYEE_CODE_TAKEN",
+          "El código de empleado ya existe en esta sede.",
+          409,
+        );
+      }
+      throw new AdminError("INTERNAL", "Error interno.", 500);
+    }
+    if (!creado) throw new AdminError("INTERNAL", "Error interno.", 500);
+    return creado as EmployeeRow;
+  }
+
+  const payload = {
+    ...(input.id ? { id: input.id } : {}),
+    ...camposDelEmpleado,
+    user_id: userId,
+  };
   const { data, error } = await db
     .from("employees")
     .upsert(payload, { onConflict: "id" })
-    .select(
-      "id, sede_id, user_id, employee_code, document, phone, position, pay_type, salary_fixed, commission_percent, is_active",
-    )
+    .select(EMPLOYEE_SELECT)
     .single();
   // 23505: carrera perdida contra el índice parcial (doble escritura
   // simultánea); se traduce al mismo error de negocio.
@@ -369,9 +555,10 @@ export interface PaymentMethodRow {
   name: string;
   is_active: boolean;
   arqueable: boolean;
+  fee_percent: number;
 }
 
-const PAYMENT_METHOD_SELECT = "id, sede_id, code, name, is_active, arqueable";
+const PAYMENT_METHOD_SELECT = "id, sede_id, code, name, is_active, arqueable, fee_percent";
 
 async function fetchPaymentMethods(sedeId: string, limit?: number): Promise<PaymentMethodRow[]> {
   const db = await adminDb();
@@ -398,6 +585,7 @@ export async function upsertPaymentMethod(raw: unknown): Promise<PaymentMethodRo
     name: input.name,
     ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
     ...(input.arqueable !== undefined ? { arqueable: input.arqueable } : {}),
+    ...(input.fee_percent !== undefined ? { fee_percent: input.fee_percent } : {}),
   };
   const { data, error } = await db
     .from("payment_methods")
@@ -410,37 +598,65 @@ export async function upsertPaymentMethod(raw: unknown): Promise<PaymentMethodRo
 
 // ------------------------------------------------------------------ roles ---
 /**
- * ADM-04: reemplaza los roles de un usuario (incluye doble rol, p. ej.
- * empleado + caja). Surte efecto en el siguiente refresh de sesión porque
- * getSessionUser lee user_roles en cada request.
+ * Traduce la excepción de `replace_user_roles` a error de negocio. La función
+ * levanta `RAISE EXCEPTION` plano (SQLSTATE P0001), el mismo código que ya
+ * traducen payroll, cash, billing, commissions y los topes 031/034.
+ */
+function roleReplacementError(error: { code?: string; message?: string }): AdminError {
+  if (error.code === "P0001") {
+    const message = error.message ?? "";
+    if (message.includes("USER_NOT_FOUND")) {
+      return new AdminError("NOT_FOUND", "Usuario no encontrado.", 404);
+    }
+    if (message.includes("ROLE_NOT_FOUND")) {
+      return new AdminError("VALIDATION", "Rol desconocido.", 400);
+    }
+  }
+  return new AdminError("INTERNAL", "Error interno.", 500);
+}
+
+/**
+ * ADM-04: reemplaza el rol de un usuario (uno solo) de forma ATÓMICA.
+ *
+ * El reemplazo viaja en UNA sentencia —la función `replace_user_roles` vía
+ * `db.rpc`— y no en un DELETE + INSERT sueltos desde el cliente: PostgREST no
+ * ofrece multi-statement por request (misma nota del README de facturación para
+ * `createInvoice`), así que entre los dos statements no hay transacción. Con el
+ * INSERT fallando, el DELETE ya había confirmado y el usuario quedaba con CERO
+ * roles: `requireSedeRole` lo rechazaba con 403 en todo el app. Adentro de la
+ * función, en cambio, el DELETE y el INSERT comparten la transacción del
+ * servidor: o entra el conjunto nuevo entero, o no entra nada y queda el viejo.
+ * No es una cuestión de orden: borrar primero deja cero roles si el insert
+ * falla, e insertar primero sobre-privilegia si el delete falla. La función
+ * toma además el lock de la fila del usuario, así que dos reemplazos
+ * concurrentes se serializan en vez de intercalarse en un conjunto mezclado.
+ *
+ * Surte efecto en el siguiente refresh de sesión porque getSessionUser lee
+ * user_roles en cada request.
  */
 export async function setUserRoles(raw: unknown): Promise<{ user_id: string; roles: RoleCode[] }> {
   const parsed = setUserRolesSchema.safeParse(raw);
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const db = await adminDb();
 
-  const { data: roleRows, error: roleError } = await db
-    .from("roles")
-    .select("id, code")
-    .in("code", parsed.data.roles);
-  if (roleError) throw new AdminError("INTERNAL", "Error interno.", 500);
-  const found = ((roleRows ?? []) as Array<{ id: string; code: string }>);
-  if (found.length !== parsed.data.roles.length) {
-    throw new AdminError("VALIDATION", "Rol desconocido.", 400);
+  const { data, error } = await db.rpc("replace_user_roles", {
+    p_user_id: parsed.data.user_id,
+    p_role_codes: parsed.data.roles,
+  });
+  if (error) throw roleReplacementError(error);
+
+  // Post-condición: se reporta éxito sólo si la base devolvió el conjunto
+  // pedido. Un arreglo vacío significa "no quedó ningún rol aplicado": eso
+  // jamás es un éxito, por más que el rpc no haya dado error.
+  const aplicados = (Array.isArray(data) ? data : []).filter(
+    (code): code is RoleCode => code === "admin" || code === "empleado" || code === "caja",
+  );
+  const pedidos = parsed.data.roles;
+  if (aplicados.length !== pedidos.length || !aplicados.every((code) => pedidos.includes(code))) {
+    throw new AdminError("INTERNAL", "Error interno.", 500);
   }
 
-  const { error: deleteError } = await db
-    .from("user_roles")
-    .delete()
-    .eq("user_id", parsed.data.user_id);
-  if (deleteError) throw new AdminError("INTERNAL", "Error interno.", 500);
-
-  const { error: insertError } = await db
-    .from("user_roles")
-    .insert(found.map((role) => ({ user_id: parsed.data.user_id, role_id: role.id })));
-  if (insertError) throw new AdminError("INTERNAL", "Error interno.", 500);
-
-  return { user_id: parsed.data.user_id, roles: parsed.data.roles };
+  return { user_id: parsed.data.user_id, roles: aplicados };
 }
 
 // ------------------------------------------ listados con caché (catálogos) ---

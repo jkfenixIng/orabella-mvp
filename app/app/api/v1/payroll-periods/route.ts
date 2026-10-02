@@ -1,7 +1,6 @@
 import type { NextRequest } from "next/server";
 import { fail, ok } from "@/src/shared/lib/api-response";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { requireSession } from "@/src/features/admin/service";
 import {
   PayrollError,
   listPeriods,
@@ -20,11 +19,12 @@ function tokenOf(request: NextRequest): string | undefined {
 
 /**
  * GET /api/v1/payroll-periods — lista los periodos de la sede
- * (requiere sesión, cualquier rol de su sede).
+ * (solo admin: es lectura de nómina completa y el API no tiene alcance por
+ * fila; el recibo del empleado se ve por la action, que sí lo aplica).
  */
 export async function GET(request: NextRequest) {
   try {
-    const session = await requireSession(tokenOf(request));
+    const session = await requirePayrollAdmin(tokenOf(request));
     const data = await listPeriods(session.sedeId);
     return ok(data);
   } catch (error) {

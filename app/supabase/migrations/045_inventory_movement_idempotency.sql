@@ -1,0 +1,290 @@
+-- 045_inventory_movement_idempotency.sql — CL-6: reenviar el MISMO movimiento
+-- MANUAL de inventario deja de escribir un SEGUNDO movimiento y de mover el
+-- stock dos veces.
+--
+-- MOTIVO DEL ARCHIVO
+--
+-- `registerMovement` (src/features/inventory/service.ts) insertaba en
+-- `inventory_movements` sin mirar NADA del ENVÍO. El stock lo aplica el trigger
+-- `trg_inventory_apply_stock` (004, AFTER INSERT, único escritor), así que un
+-- doble clic —o el navegador reenviando el mismo POST después de cortarse la
+-- red— recorría el camino entero otra vez y escribía una SEGUNDA fila de
+-- movimiento: el kardex quedaba con dos entradas y el stock se movía DOS veces
+-- (IN sumaba dos veces, OUT restaba dos veces, ADJUST fijaba el nivel dos
+-- veces). No es dinero —la tabla no tiene ninguna columna de monto y ningún
+-- monto se escribe dos veces— pero corrompe el stock y el kardex, que es el
+-- registro con el que se reconcilia el inventario físico.
+--
+-- No hay transacción que abarque las dos peticiones: PostgREST no ofrece
+-- multi-statement por request (la misma nota que ya está escrita en 005, 040,
+-- 041, 042, 043 y 044), así que el reconocimiento tiene que vivir en una fila.
+--
+-- QUÉ SE MIDIÓ (no lo que se supuso)
+--
+-- El hallazgo se reprodujo con un test que llamaba DOS VECES al servicio con el
+-- MISMO cuerpo y la MISMA marca, ANTES de tocar el código, con un doble de
+-- Supabase que emula los triggers de 004 y el índice de acá. El ROJO quedó como
+-- test permanente, ya en verde:
+--
+--   expected [ { id: 'mov-1', …(8) }, …(1) ] to have a length of 1 but got 2
+--   expected 20 to be 15 // Object.is equality
+--
+-- Es decir: dos movimientos escritos, y el stock 10 → 15 → 20 (movido dos veces
+-- por el mismo movimiento manual reintentado).
+--
+-- LOS LLAMADORES DE `registerMovement`: MANUAL contra FACTURACIÓN
+--
+-- El defecto es del camino MANUAL, y la marca se exige SÓLO en su frontera:
+--
+--   * MANUAL (de acá es el defecto):
+--       - src/features/inventory/actions.ts (server action registerMovementAction)
+--       - app/app/api/v1/inventory/movements/route.ts (POST /api/v1/inventory/movements)
+--     Las dos llaman a `registerManualMovement`, que valida con
+--     `manualMovementSchema` (marca OBLIGATORIA) y recién entonces delega en la
+--     función compartida. Ninguna llama a `registerMovement` directo.
+--   * FACTURACIÓN (ya cubiertos por sus propias guardas, SIN intento propio del
+--     cliente y por eso SIN marca):
+--       - src/features/inventory/service.ts, `deductStock`: el OUT por producto
+--         al EMITIR la factura. La puerta la cierra la marca de la FACTURA (041).
+--       - src/features/billing/service.ts, `cleanupFailedInvoice`: el IN de
+--         compensación de una emisión fallida (camino interno, no de pantalla).
+--       - src/features/billing/service.ts, `annulInvoice`: el IN de reversión de
+--         la anulación, cubierto por el compare-and-swap de estado.
+--       - src/features/billing/service.ts, edición de ítems (dos caminos): los
+--         deltas netos OUT/IN, cubiertos por el testigo de serialización (038).
+--
+--     La marca es OPCIONAL dentro de `registerMovement` por eso: si fuera
+--     obligatoria ahí, los llamadores de facturación —que no tienen un intento
+--     del cliente que marcar— empezarían a morir con VALIDATION. Y dos de esos
+--     caminos insertan N movimientos por operación (un bucle por producto con
+--     una sola marca de factura), así que una marca por fila ni siquiera
+--     existiría en esas filas. La obligatoriedad vive en la frontera manual.
+--
+--     NO se le inventó una marca a ningún llamador de facturación: la puerta del
+--     dinero de la emisión ya está cerrada por la 041 y las otras dos por el
+--     estado (anulación) y el testigo de edición (038).
+--
+-- CÓMO SE RECONOCE UNA REPETICIÓN (decisión del dueño, no del agente)
+--
+-- Por una MARCA que manda el cliente: `inventory_movements.idempotency_key`. NO
+-- por el CONTENIDO. Deduplicar por contenido bloquearía un movimiento
+-- legítimamente repetido —dos conteos físicos del mismo producto el mismo día,
+-- dos entradas del mismo producto por la misma cantidad y con el mismo motivo—
+-- y esos son DOS movimientos; la marca es lo único que distingue "el mismo
+-- envío" de "el mismo contenido".
+--
+-- La marca es un uuid que el llamador acuña al empezar el intento, que reutiliza
+-- en los reintentos del MISMO intento y que suelta al ÉXITO y al CANCELAR (nunca
+-- por tecla ni por render, que serían intentos distintos en cada pulsación). Se
+-- valida con la MISMA definición que las puertas del dinero
+-- (`idempotencyKeySchema`, billing/schemas.ts): una sola forma de reconocer una
+-- repetición en todo el sistema.
+--
+-- LA CLAVE DEL ÍNDICE (la dicta lo que la operación significa)
+--
+-- `(product_id, idempotency_key)`. El registro de un movimiento manual es el
+-- PRODUCTO: es donde vive el stock que el movimiento mueve, es la dimensión del
+-- kardex (`idx_movements_product_created`, 004), es lo que `getKardex` pide y es
+-- lo que el servicio resuelve y valida dentro de la sede del actor ANTES del
+-- lookup. La sede NO entra en la clave porque no agrega identidad: `products.
+-- sede_id` determina la sede de la fila y el servicio exige que sea la del actor
+-- (`resolveSedeOrThrow` → 403 si es ajena) antes de buscar la marca, así que la
+-- marca se resuelve dentro del tenant que la usó y el lookup no puede devolver
+-- el movimiento de otra sede.
+--
+-- POR QUÉ NO `(sede_id, idempotency_key)`: la sede no es el registro de esta
+-- operación, y con esa clave la MISMA marca en DOS productos distintos de la
+-- misma sede colapsaría en UNA operación —el segundo movimiento, legítimo, se
+-- tragaría— y el llamador recibiría el movimiento del PRIMER producto como si
+-- fuera la repetición del que pidió: una respuesta EQUIVOCADA, no un rechazo.
+-- La misma marca para otro producto ES otra operación (probado en el test de
+-- multi-identidad), igual que en 044 la misma marca para otro par es otro pago.
+--
+-- El lookup del servicio filtra EXACTAMENTE las columnas del índice —el mismo
+-- `eq` set (`product_id`, `idempotency_key`)—, así que no puede devolver una
+-- fila que el índice no habría bloqueado.
+--
+-- MECANISMO (dos barreras, en este orden)
+--
+--   1. La columna. Guarda la marca del intento.
+--   2. El índice único PARCIAL. Es la barrera FINAL contra la carrera: el
+--      servicio mira la marca ANTES de la aritmética del stock y ANTES de
+--      insertar (por eso el reintento normal no escribe nada y no recalcula
+--      contra un stock que el primer intento ya movió), pero entre esa lectura y
+--      el INSERT hay una ventana. Si otra transacción con la MISMA marca y el
+--      MISMO producto se confirma ahí adentro, este INSERT choca con el índice
+--      (código 23505), el servicio vuelve a buscar por la marca y devuelve el
+--      movimiento de la ganadora. Si no encuentra ganadora, el 23505 NO es una
+--      repetición: se reporta como INTERNAL, honesto, en vez de disfrazarlo de
+--      éxito. Mismo patrón de barrera final que `uq_invoices_sede_idempotency_key`
+--      (041), los índices de 042/043/044, `uq_cash_shifts_open_per_register`
+--      (006) y `uq_payroll_draft_per_range` (007).
+--
+--      Parcial (`WHERE idempotency_key IS NOT NULL`) por tres razones: las filas
+--      anteriores a esta migración no tienen marca y no deben entrar al índice;
+--      una marca NULL no es una marca y no puede deduplicar nada; y una marca
+--      vacía tampoco. Además deja FUERA del índice a los movimientos de
+--      FACTURACIÓN (marca NULL), que no tienen intento propio: no compiten con
+--      nadie y no pueden chocar entre sí.
+--
+-- LA ARRUGA DE 042 NO APLICA ACÁ: este camino inserta UNA sola fila (una
+-- sentencia de un objeto, no un `insert([...])` de N porciones), así que la
+-- marca vive en esa única fila, no hay porciones hermanas que enumerar y el
+-- índice nunca puede rechazar una operación legítima.
+--
+-- COSTO DECLARADO (no se esconde)
+--
+-- AQUÍ NO SE QUEMA NINGÚN NÚMERO. `inventory_movements.id` es
+-- `uuid PRIMARY KEY DEFAULT gen_random_uuid()` (004): la tabla NO tiene serie ni
+-- consecutivo, así que no hay hueco que declarar, ni en el camino normal ni en
+-- la carrera. El kardex tampoco es una serie numerada: es una lista ordenada por
+-- `created_at` y desempatada por `id` (`sortKardexAscending`), así que una
+-- sentencia abortada —que no deja fila— no deja tampoco un hueco en esa lista.
+-- Lo que sí cuesta la carrera es una sentencia ABORTADA: la perdedora ya había
+-- resuelto el producto y su stock cuando chocó con el índice, y esa sentencia no
+-- deja filas. Es el mismo canje de 042/043/044 —perder trabajo invisible antes
+-- que mover el stock dos veces— sin el hueco de consecutivo que sí existe en la
+-- 041.
+--
+-- EL COSTO DE NUMERACIÓN DE ESTE ARCHIVO: usa el número 045, el siguiente libre
+-- (032 no existe y no existirá; 033–044 están tomados). No se reutiliza ningún
+-- número y no se renombra ningún archivo anterior.
+--
+-- VENTANAS DECLARADAS (lo que este archivo NO cierra, y por qué)
+--
+--   * La marca se resuelve DENTRO del producto: la misma marca con OTRO producto
+--     es otra operación (es la clave, es deliberado y está probado). Dos
+--     movimientos manuales legítimos con marcas distintas siguen siendo dos, y
+--     con la MISMA marca de pantalla no puede pasar, porque la pantalla suelta
+--     la marca al éxito y al cancelar.
+--   * El trigger del stock corre ANTES que la comprobación del índice único (en
+--     Postgres, el BEFORE ROW trigger del INSERT precede al índice). Entonces, en
+--     la CARRERA, un movimiento que además dejaría el stock negativo se rechaza
+--     con INSUFFICIENT_STOCK (P0001) y no con el 23505: ese reintento se rechaza
+--     en vez de reconocerse. El camino NORMAL de la repetición no pasa por ahí
+--     —el lookup corre antes de la aritmética— y el rechazo es ruidoso; con el
+--     stock en nivel válido, la misma marca sigue reconociendo.
+--   * La repetición devuelve el movimiento REGISTRADO y el stock de AHORA (el
+--     que el servicio lee en esa misma llamada), no una foto de la primera
+--     respuesta: el reintento no escribe ni mueve nada, y en el caso real —doble
+--     clic o reenvío segundos después, sin otra escritura en el medio— los dos
+--     números coinciden.
+--   * Las filas anteriores a esta migración no tienen marca y no pueden tenerla:
+--     reconstruirla sería adivinar qué filas fueron el mismo envío.
+--   * Este archivo NO cierra ninguna otra puerta de stock. En particular deja
+--     como estaba, y ya está reportada aparte, la ventana PREEXISTENTE del
+--     camino de facturación: `deductStock` registra un movimiento por producto
+--     en un bucle sin transacción, así que un fallo a mitad del bucle deja un
+--     descuento PARCIAL sin compensación (`cleanupFailedInvoice` sólo compensa
+--     lo que alcanzó a devolver `planned`). No es un duplicado por reintento y
+--     no se arregla acá.
+--
+-- QUÉ NO HACE ESTE ARCHIVO
+--
+--   * No borra ni reescribe filas: `ADD COLUMN IF NOT EXISTS` con NULL (sin
+--     DEFAULT, así que no toca ninguna fila) y un índice. No hay UPDATE de
+--     datos, ni DELETE, ni TRUNCATE, ni backfill.
+--   * No cambia la aritmética del stock ni el comportamiento de los triggers
+--     `trg_inventory_no_negative` y `trg_inventory_apply_stock` (004): la
+--     columna no entra en ninguna regla de negocio, sólo reconoce envíos
+--     repetidos. El stock se sigue escribiendo EXCLUSIVAMENTE por movimientos.
+--   * No toca los llamadores de FACTURACIÓN de `registerMovement` ni su
+--     contrato: la marca es opcional en la función compartida y esos caminos
+--     siguen sin mandarla.
+--   * No agrega índices redundantes: el índice único parcial ya sirve la lectura
+--     por marca.
+--   * No toca `products.stock_qty`, su CHECK de no negativo, ni los índices del
+--     kardex.
+--
+-- ACOPLAMIENTO DE DESPLIEGUE: la 045 va ANTES que este código. Sin la columna,
+-- el INSERT manda siempre `idempotency_key` (NULL cuando no hay marca), así que
+-- PostgREST rechaza la columna desconocida y NINGÚN movimiento de stock se puede
+-- registrar —ni el manual ni el descuento al emitir—, y el lookup de la marca
+-- también falla. Misma regla que 005/034/041/042/043/044.
+--
+-- IDEMPOTENTE Y RE-EJECUTABLE: `ADD COLUMN IF NOT EXISTS`,
+-- `CREATE UNIQUE INDEX IF NOT EXISTS` y el CHECK con `DROP CONSTRAINT IF EXISTS`
+-- + `ADD CONSTRAINT` (el patrón de 038/041/042/043/044) dejan el esquema
+-- idéntico en cada corrida. Ninguna sentencia borra filas. El runner de Supabase
+-- aplica el archivo en una transacción: o entra todo, o no entra nada.
+--
+-- ORDEN DE LOS STATEMENTS (importa y es deliberado):
+--   1. La columna. Va PRIMERO porque es el insumo del CHECK y del índice: sin
+--      ella las dos sentencias siguientes no compilarían.
+--   2. Su comentario (sólo comentario): qué es la marca y por qué las filas
+--      anteriores quedan NULL.
+--   3. La guarda de forma (CHECK). Va ANTES del índice porque es el rechazo más
+--      barato y el más explícito: un escritor crudo que mande una marca que no
+--      es un uuid se rechaza por forma antes de llegar a la comparación del
+--      índice.
+--   4. El índice único PARCIAL. La barrera final de la carrera.
+--   5. La nota final: qué NO protege y qué ventana queda declarada, para el que
+--      lea el kardex y crea que ya está todo cubierto.
+--
+-- NO ejecutado por el agente: requiere base de datos.
+
+-- ===================================================================== ---
+-- 1. La MARCA del intento de movimiento manual
+-- ===================================================================== ---
+
+-- NULL a propósito: las filas anteriores a esta migración no tienen marca (la
+-- decisión del dueño es hacia adelante) y la marca es opcional a nivel de
+-- esquema porque sólo el camino MANUAL la exige; los movimientos de facturación
+-- la dejan NULL. Sin DEFAULT, `ADD COLUMN` no reescribe la tabla y no hay
+-- backfill que inventar.
+ALTER TABLE public.inventory_movements
+  ADD COLUMN IF NOT EXISTS idempotency_key text NULL;
+
+-- ===================================================================== ---
+-- 2. Qué es la marca de esta tabla
+-- ===================================================================== ---
+
+COMMENT ON COLUMN public.inventory_movements.idempotency_key IS
+  'CL-6: marca de idempotencia del intento de movimiento MANUAL (uuid que acuña la pantalla al empezar el intento, se reutiliza en los reintentos del MISMO intento y se suelta al éxito y al cancelar). Reenviar la misma marca para el MISMO producto devuelve el movimiento ya registrado en vez de escribir un segundo movimiento y mover el stock dos veces. La misma marca para OTRO producto es OTRA operación. NULL en los movimientos de FACTURACIÓN (que no tienen intento propio) y en las filas anteriores a 045.';
+
+-- ===================================================================== ---
+-- 3. La guarda de forma: una marca es un uuid, no cualquier texto
+-- ===================================================================== ---
+
+-- El servicio valida el formato ANTES de escribir (`manualMovementSchema`, que
+-- usa `idempotencyKeySchema`: la MISMA definición de las puertas del dinero), así
+-- que ningún camino del usuario puede llegar a este CHECK: es la última red para
+-- un escritor crudo (SQL, un servicio futuro) y prefiere rechazar la fila antes
+-- que guardar una marca que el lookup nunca podría reconocer.
+ALTER TABLE public.inventory_movements
+  DROP CONSTRAINT IF EXISTS inventory_movements_idempotency_key_shape;
+ALTER TABLE public.inventory_movements
+  ADD CONSTRAINT inventory_movements_idempotency_key_shape CHECK (
+    idempotency_key IS NULL
+    OR idempotency_key ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  );
+
+-- ===================================================================== ---
+-- 4. La barrera final: a lo sumo UN movimiento por marca y PRODUCTO
+-- ===================================================================== ---
+
+-- Parcial: la marca NULL (filas históricas y movimientos de facturación) queda
+-- fuera del índice, y una marca vacía tampoco deduplica nada. Es la barrera que
+-- convierte la carrera lookup→INSERT en un 23505 que el servicio traduce en
+-- "devuelve el movimiento existente"; sin ganadora, el servicio reporta INTERNAL
+-- en vez de disfrazarlo de repetición.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_movements_product_idempotency_key
+  ON public.inventory_movements (product_id, idempotency_key)
+  WHERE idempotency_key IS NOT NULL;
+
+-- ===================================================================== ---
+-- 5. Nota: qué NO protege este índice
+-- ===================================================================== ---
+
+--   * No deduplica por CONTENIDO: dos movimientos manuales con la misma
+--     cantidad, el mismo tipo y el mismo motivo pero con DOS MARCAS distintas
+--     son dos operaciones (dos conteos físicos, dos compras iguales). Eso es
+--     deliberado.
+--   * No protege los movimientos de FACTURACIÓN: van sin marca (NULL) y quedan
+--     fuera del índice; sus puertas son la marca de la factura (041), el testigo
+--     de serialización de la edición (038) y el compare-and-swap de la anulación.
+--   * No cierra la ventana de la CARRERA con stock insuficiente (el BEFORE ROW
+--     trigger del stock corre antes del índice: ese choque llega como
+--     INSUFFICIENT_STOCK, no como 23505) ni la ventana PREEXISTENTE del
+--     descuento parcial por producto en `deductStock` (bucle sin transacción).
+--     Las dos están declaradas arriba.

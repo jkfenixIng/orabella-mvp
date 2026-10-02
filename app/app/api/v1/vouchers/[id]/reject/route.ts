@@ -18,14 +18,15 @@ function tokenOf(request: NextRequest): string | undefined {
 
 /**
  * POST /api/v1/vouchers/:id/reject — rechaza un vale pendiente con motivo
- * obligatorio (PAY-06, solo admin). Rechazada es terminal.
+ * obligatorio (PAY-06 + item 5, solo admin; queda auditado). Rechazada es
+ * terminal; descontada (en nómina) no admite cambios.
  */
 export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   try {
     const session = await requirePayrollAdmin(tokenOf(request));
     const { id } = await context.params;
     const body: unknown = await request.json().catch(() => ({}));
-    const data = await rejectVoucher(session.sedeId, id, body);
+    const data = await rejectVoucher(session.sedeId, id, body, { userId: session.userId });
     return ok(data);
   } catch (error) {
     return payrollErrorResponse(error);

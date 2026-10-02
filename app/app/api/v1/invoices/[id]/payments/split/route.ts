@@ -21,13 +21,25 @@ function tokenOf(request: NextRequest): string | undefined {
  * por método de pago (solo admin/caja). Equivale al `payments:split` del
  * PRD §10 (en Next la carpeta no admite `:` en Windows, se usa
  * `payments/split`). Rechaza sobrepago; al completar el total → Pagada.
+ *
+ * CL-2 (idempotencia): el cuerpo exige `idempotency_key` (uuid del intento de
+ * cobro). Es una superficie pública y los reintentos sobre una red cortada son
+ * exactamente su caso de uso, así que la marca NO es opcional: sin ella
+ * responde VALIDATION (400) en vez de cobrar sin protección. Reenviar la misma
+ * marca devuelve la factura ya cobrada —un no-op exitoso para el llamador— en
+ * lugar de tratarlo como un cobro nuevo (que era lo que pasaba: el reintento
+ * moría con OVERPAID por una operación que sí se había registrado).
  */
 export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   try {
     const session = await requireBillingWriter(tokenOf(request));
     const { id } = await context.params;
     const body: unknown = await request.json().catch(() => ({}));
-    const data = await splitPayment(session.sedeId, id, body);
+    const data = await splitPayment(session.sedeId, id, body, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+      roles: session.roles,
+    });
     return ok(data);
   } catch (error) {
     return billingErrorResponse(error);

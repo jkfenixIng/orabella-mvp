@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { roleCodeSchema } from "@/src/features/auth/schemas";
+import { bogotaDay } from "@/src/shared/lib/dates";
 
 /** ADM-08: esquemas de sueldo por empleado. */
 export const payTypeSchema = z.enum(["fijo", "porcentaje", "mixto"]);
@@ -96,16 +97,25 @@ export function checkPayCoherence(args: {
   }
 }
 
-/** ADM-02/ADM-08: empleado con sueldo fijo/porcentaje/mixto. */
+/** ADM-02/ADM-08: empleado con nombre propio y sueldo fijo/porcentaje/mixto.
+ * El vínculo al usuario es automático por documento (no se recibe). */
 export const employeeSchema = z
   .object({
     id: uuidSchema.optional(),
     sede_id: sedeIdSchema,
-    user_id: uuidSchema.nullish(),
+    full_name: z.string().trim().min(2, "Nombre requerido.").max(120, "Nombre muy largo."),
     employee_code: z.string().trim().max(40, "Código muy largo.").nullish(),
     document: z.string().trim().min(3, "Documento inválido.").max(20, "Documento inválido."),
     phone: z.string().trim().max(30, "Teléfono muy largo.").nullish(),
     position: z.string().trim().max(80, "Cargo muy largo.").nullish(),
+    payout_mode: z.enum(["nomina", "inmediato", "no_aplica"]).optional(),
+    email: z.email("Correo inválido.").nullish(),
+    birth_date: z
+      .string()
+      .trim()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, "Fecha inválida (use yyyy-mm-dd).")
+      .refine((value) => value <= bogotaDay(), "La fecha no puede ser futura.")
+      .nullish(),
     pay_type: payTypeSchema,
     salary_fixed: z.coerce.number().nonnegative("El salario no puede ser negativo.").nullish(),
     commission_percent: z.coerce
@@ -168,12 +178,13 @@ export const paymentMethodSchema = z.object({
   name: z.string().trim().min(1, "Nombre requerido.").max(120, "Nombre muy largo."),
   is_active: z.boolean().optional(),
   arqueable: z.boolean().optional(),
+  fee_percent: z.coerce.number().min(0).max(100).optional(),
 });
 export type PaymentMethodInput = z.infer<typeof paymentMethodSchema>;
 
-/** ADM-04: asignación de roles (admin/empleado/caja, doble rol permitido). */
+/** ADM-04: asignación de rol único por usuario. */
 export const setUserRolesSchema = z.object({
   user_id: uuidSchema,
-  roles: z.array(roleCodeSchema).min(1, "Asigne al menos un rol."),
+  roles: z.array(roleCodeSchema).length(1, "Un solo rol por usuario."),
 });
 export type SetUserRolesInput = z.infer<typeof setUserRolesSchema>;

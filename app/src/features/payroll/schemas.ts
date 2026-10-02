@@ -1,5 +1,11 @@
 import { z } from "zod";
-import { moneyEquals, roundMoney } from "@/src/features/billing/schemas";
+import { idempotencyKeySchema, moneyEquals, roundMoney } from "@/src/features/billing/schemas";
+import { cashOutLimitViolation } from "@/src/features/cash/schemas";
+import {
+  lineHasCommissionBasis,
+  resolveEmployeeLineCommission,
+  type RuleRate,
+} from "@/src/features/commissions/schemas";
 
 export { moneyEquals, roundMoney };
 
@@ -55,29 +61,77 @@ export const payrollPortionSchema = z.object({
 });
 export type PayrollPortionInput = z.infer<typeof payrollPortionSchema>;
 
-/** PAY-04: pago del ítem en porciones (deben sumar el neto exacto). */
+/**
+ * PAY-04: pago del ítem en porciones (deben sumar el neto exacto).
+ *
+ * CL-2: la operación exige `idempotency_key`, la MARCA del intento (uuid que
+ * genera la pantalla y que se reutiliza en los reintentos del MISMO intento).
+ * Es la MISMA definición que usa el cobro de factura —vive en
+ * `billing/schemas.ts` y las dos puertas del dinero validan igual, en vez de
+ * tener dos reglas que se pueden separar—. Es OBLIGATORIA: un envío sin marca
+ * no se puede reconocer como repetición, así que aceptarlo sin marca es reabrir
+ * el defecto (pagar dos veces) para ESE llamador, y la ruta REST es la
+ * superficie que más reintenta. El rechazo es ruidoso y no escribe nada.
+ */
 export const payPayrollItemSchema = z.object({
+  idempotency_key: idempotencyKeySchema,
   portions: z.array(payrollPortionSchema).min(1, "Indique al menos una porción de pago."),
 });
 export type PayPayrollItemInput = z.infer<typeof payPayrollItemSchema>;
 
-/** PAY-05: topes de vales por sede (día y semana). */
+/** PAY-05: topes de vales por sede (día/semana opcionales) + días permitidos ISO + tope por día. */
 export const voucherLimitsSchema = z.object({
-  max_per_day: z.coerce.number().nonnegative("El tope diario no puede ser negativo."),
-  max_per_week: z.coerce.number().nonnegative("El tope semanal no puede ser negativo."),
+  max_per_day: z.coerce.number().nonnegative("El tope diario no puede ser negativo.").nullish(),
+  max_per_week: z.coerce.number().nonnegative("El tope semanal no puede ser negativo.").nullish(),
+  allowed_days: z
+    .array(z.coerce.number().int().min(1, "Día inválido (1=lunes…7=domingo).").max(7, "Día inválido (1=lunes…7=domingo)."))
+    .min(1, "Elija al menos un día permitido.")
+    .max(7, "Máximo 7 días.")
+    .optional(),
+  /** V2: tope propio por día ISO; reemplaza al tope diario general ese día. */
+  per_day_limits: z
+    .array(
+      z.object({
+        day: z.coerce.number().int().min(1, "Día inválido (1=lunes…7=domingo).").max(7, "Día inválido (1=lunes…7=domingo)."),
+        amount: z.coerce.number().nonnegative("El tope del día no puede ser negativo."),
+      }),
+    )
+    .max(7, "Máximo 7 días.")
+    .optional(),
 });
 export type VoucherLimitsInput = z.infer<typeof voucherLimitsSchema>;
 
-/** PAY-06: solicitud de vale (monto > 0, fecha opcional, observación opcional). */
+/**
+ * PAY-06: solicitud de vale (monto > 0, método arqueable obligatorio, fecha
+ * opcional, observación opcional). El método se elige AL CREAR el vale (la
+ * caja lo sabe antes de aprobar): es el medio por el que saldrá el dinero.
+ *
+ * CL-5: la operación exige `idempotency_key`, la MARCA del intento (uuid que
+ * acuña la pantalla de vales al empezar el intento y que se reutiliza en los
+ * reintentos del MISMO intento). Es la MISMA definición que usan las otras
+ * puertas del dinero —vive en `billing/schemas.ts` y todas validan igual, en
+ * vez de tener cinco reglas que se pueden separar—. Es OBLIGATORIA: un envío
+ * sin marca no se puede reconocer como repetición, y los topes de 026 son
+ * ACUMULADOS (una obligación total, no la identidad de un envío), así que
+ * mientras `2 × monto` quepa en el día y en la semana el reintento abre un
+ * SEGUNDO vale: segunda salida de caja en el arqueo y segundo descuento de
+ * nómina. Aceptarlo sin marca es reabrir el defecto para ESE llamador; el
+ * rechazo es ruidoso (VALIDATION) y no escribe nada.
+ */
 export const requestVoucherSchema = z.object({
+  idempotency_key: idempotencyKeySchema,
   employee_id: uuidSchema,
   amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+  method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
   request_date: dateSchema.optional(),
   observation: z.string().trim().max(500, "Observación muy larga.").nullish(),
 });
 export type RequestVoucherInput = z.infer<typeof requestVoucherSchema>;
 
-/** PAY-06: aprobación con observación opcional (el código lo genera el servidor). */
+/**
+ * PAY-06: aprobación con observación opcional. Sin código de aprobación: la
+ * autorización queda en `approved_by` + la observación.
+ */
 export const approveVoucherSchema = z.object({
   observation: z.string().trim().max(500, "Observación muy larga.").nullish(),
 });
@@ -88,6 +142,86 @@ export const rejectVoucherSchema = z.object({
   motivo: z.string().trim().min(1, "El motivo del rechazo es requerido.").max(500, "Motivo muy largo."),
 });
 export type RejectVoucherInput = z.infer<typeof rejectVoucherSchema>;
+
+/**
+ * PA-2a: casos extraordinarios que justifican una nómina individual. Vocabulario
+ * CERRADO (mismo enum en el CHECK de la migración 036): el motivo libre no
+ * alcanza para contar el caso, y agregar un caso nuevo es una decisión de
+ * producto, no un texto que cada sede inventa.
+ */
+export const payrollExtraKindSchema = z.enum(["despido", "renuncia", "emergencia", "otro"]);
+export type PayrollExtraKind = z.infer<typeof payrollExtraKindSchema>;
+
+/**
+ * PA-2a: pago individual por caso extraordinario (despido, renuncia,
+ * emergencia del empleado). NO es un período de nómina y no se relaciona con
+ * `payroll_periods`: existe justamente para pagar días que un período CERRADO
+ * ya cubrió, donde `payPayrollItem` no puede entrar (assertDraftPeriod).
+ *
+ * El MOTIVO es obligatorio (no vacío) y el TIPO también: un pago de dinero sin
+ * explicación no es un registro, es un descuadre. `days_from`/`days_to` son
+ * OPCIONALES y son los días que el pago liquida: alimentan la GUÍA (ver
+ * `payrollExtraGuide`) y quedan guardados como referencia de qué se pagó. Van
+ * juntos o ninguno, y el rango tiene que ser real (fin >= inicio).
+ *
+ * CL-5: la operación exige `idempotency_key`, la MARCA del intento (uuid que
+ * acuña la pantalla al empezar el intento y que se reutiliza en los reintentos
+ * del MISMO intento). Es la MISMA definición que usan las otras puertas del
+ * dinero —vive en `billing/schemas.ts` y todas validan igual, en vez de tener
+ * cinco reglas que se pueden separar—. Es OBLIGATORIA: un envío sin marca no se
+ * puede reconocer como repetición, y acá no hay tope que lo frene (el monto lo
+ * escribe el admin y NO se topa), así que aceptarlo sin marca es reabrir el
+ * defecto para ESE llamador: la segunda vez escribe un segundo pago. El rechazo
+ * es ruidoso (VALIDATION) y no escribe nada.
+ */
+export const payrollExtraSchema = z
+  .object({
+    idempotency_key: idempotencyKeySchema,
+    employee_id: uuidSchema,
+    amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+    method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
+    reference: z.string().trim().max(120, "Referencia muy larga.").nullish(),
+    reason: z.string().trim().min(1, "El motivo del pago es obligatorio.").max(500, "Motivo muy largo."),
+    kind: payrollExtraKindSchema,
+    days_from: dateSchema.nullish(),
+    days_to: dateSchema.nullish(),
+  })
+  .superRefine((value, context) => {
+    const from = value.days_from ?? null;
+    const to = value.days_to ?? null;
+    if (from === null && to === null) return;
+    if (from === null || to === null) {
+      context.addIssue({
+        code: "custom",
+        message: "Indique las dos fechas de los días liquidados, o ninguna.",
+        path: ["days_from"],
+      });
+      return;
+    }
+    if (to < from) {
+      context.addIssue({
+        code: "custom",
+        message: "La fecha final no puede ser anterior a la inicial.",
+        path: ["days_to"],
+      });
+    }
+  });
+export type PayrollExtraInput = z.infer<typeof payrollExtraSchema>;
+
+/**
+ * PA-2b: corrección de un período CERRADO. El MOTIVO es obligatorio: una
+ * corrección sin explicación es un número que cambió solo, y lo que se corrige
+ * es plata ya firmada. La razón viaja a la auditoría y a la fila de la
+ * corrección (misma regla en el CHECK de la migración 037).
+ */
+export const correctPayrollPeriodSchema = z.object({
+  reason: z
+    .string()
+    .trim()
+    .min(1, "El motivo de la corrección es obligatorio.")
+    .max(500, "Motivo muy largo."),
+});
+export type CorrectPayrollPeriodInput = z.infer<typeof correctPayrollPeriodSchema>;
 
 // ------------------------------------------------------------ cálculos puros ---
 
@@ -100,10 +234,12 @@ export interface CommissionLine {
   unit_price: number;
   line_subtotal: number;
   commission: number;
+  commission_value: number | null;
 }
 
 export interface DetailLine extends CommissionLine {
   employee_id: string;
+  commission_value: number | null;
 }
 
 /**
@@ -123,6 +259,32 @@ export function computeNetPay(args: {
   const vales = roundMoney(args.vales ?? 0);
   const others = roundMoney(args.otherDiscounts ?? 0);
   return roundMoney(Math.max(0, base + commissions + bonuses - vales - others));
+}
+
+/**
+ * PAY-02: topa el descuento efectivo al bruto para que el neto persistido
+ * (que nunca queda negativo) sea consistente con el CHECK de payroll_items
+ * (neto = bruto − vales − otros). El exceso de descuento se absorbe, no se
+ * arrastra como deuda: por eso el descuento efectivo no puede superar el
+ * bruto. El recorte se aplica primero a other_discounts (descuentos manuales)
+ * y solo después a vales, para priorizar la recuperación del vale ya
+ * desembolsado; un vale queda parcialmente descontado únicamente cuando por
+ * sí solo supera el bruto.
+ */
+export function capPayrollDiscounts(args: {
+  gross: number;
+  vales: number;
+  otherDiscounts: number;
+}): { vales: number; otherDiscounts: number } {
+  const gross = roundMoney(Math.max(0, args.gross));
+  const vales = roundMoney(Math.max(0, args.vales));
+  const others = roundMoney(Math.max(0, args.otherDiscounts));
+  if (roundMoney(vales + others) <= gross) {
+    return { vales, otherDiscounts: others };
+  }
+  const valesCapped = roundMoney(Math.min(vales, gross));
+  const othersCapped = roundMoney(Math.max(0, Math.min(others, roundMoney(gross - vales))));
+  return { vales: valesCapped, otherDiscounts: othersCapped };
 }
 
 /**
@@ -151,6 +313,86 @@ export function buildEmployeeDetail(lines: DetailLine[]): { detail: DetailLine[]
   return { detail, commissions };
 }
 
+/** Línea de factura cruda que alimenta el detalle de comisiones de nómina. */
+export interface PayrollCommissionLine {
+  invoice_id: string;
+  consecutive_number: number | null;
+  item_id: string;
+  item_type: string;
+  qty: number;
+  unit_price: number;
+  line_subtotal: number;
+  commission_value: number | null;
+  /** product_id o service_id según el tipo (null en ítems `custom`). */
+  item_ref_id: string | null;
+  /**
+   * Porcentaje explícito de la línea (personalizado por porcentaje con empleado
+   * de pago fijo). Se usa solo si el empleado no tiene `commission_percent`.
+   */
+  commission_percent_override?: number | null;
+}
+
+/**
+ * PAY-02/PAY-03: arma el detalle por línea de un empleado con la MISMA
+ * resolución que el pago inmediato (`resolveEmployeeLineCommission`). Una línea
+ * entra si tiene base de comisión (`lineHasCommissionBasis`): valor fijo del
+ * ítem, porcentaje plano del empleado o regla ítem×empleado activa. La regla
+ * gana sobre el porcentaje plano; el valor fijo del ítem manda sobre ambos.
+ *
+ * Preserva la semántica histórica:
+ *  - `payout_mode = "no_aplica"` → sin comisión (detalle vacío).
+ *  - `pay_type` fijo sin reglas ni valor fijo → sin detalle (comisión 0).
+ *  - El valor fijo de ítems `custom` y `producto` es POR UNIDAD: se multiplica
+ *    por la cantidad de la línea.
+ * Puro para probarlo sin base de datos.
+ */
+export function buildEmployeeCommissionDetail(args: {
+  employeeId: string;
+  payoutMode?: string | null;
+  payType: string;
+  commissionPercent: number | null;
+  lines: PayrollCommissionLine[];
+  rules: Map<string, RuleRate>;
+}): DetailLine[] {
+  if (args.payoutMode === "no_aplica") return [];
+  const flatPercent =
+    args.payType === "porcentaje" || args.payType === "mixto"
+      ? Number(args.commissionPercent ?? 0)
+      : null;
+  return args.lines
+    .filter((line) =>
+      lineHasCommissionBasis({
+        itemType: line.item_type,
+        itemRefId: line.item_ref_id,
+        commissionValue: line.commission_value,
+        commissionPercentOverride: line.commission_percent_override ?? null,
+        rules: args.rules,
+        flatPercent,
+      }),
+    )
+    .map((line) => ({
+      employee_id: args.employeeId,
+      invoice_id: line.invoice_id,
+      consecutive_number: line.consecutive_number,
+      item_id: line.item_id,
+      item_type: line.item_type,
+      qty: line.qty,
+      unit_price: line.unit_price,
+      line_subtotal: roundMoney(line.line_subtotal),
+      commission: resolveEmployeeLineCommission({
+        itemType: line.item_type,
+        itemRefId: line.item_ref_id,
+        subtotal: line.line_subtotal,
+        qty: line.qty,
+        commissionValue: line.commission_value,
+        commissionPercentOverride: line.commission_percent_override ?? null,
+        rules: args.rules,
+        flatPercent,
+      }),
+      commission_value: line.commission_value,
+    }));
+}
+
 /**
  * PAY-01: rechaza cualquier escritura sobre un periodo cerrado (cerrado =
  * inmutable). El estado llega como string de BD.
@@ -159,6 +401,51 @@ export function assertDraftPeriod(status: string): void {
   if (status === "cerrado") {
     throw new Error("PERIOD_CLOSED");
   }
+}
+
+/**
+ * PAY-01: solo un periodo en borrador puede borrarse. Un periodo cerrado
+ * tiene nómina pagada y es historia: borrarlo la destruiría. Puro para
+ * probarlo sin base de datos.
+ */
+export function assertDeletablePeriod(status: string): void {
+  if (status !== "borrador") {
+    throw new Error("PERIOD_NOT_DRAFT");
+  }
+}
+
+/**
+ * PA-2b: solo un período CERRADO se corrige. Un borrador no se corrige: se
+ * recalcula (es provisional y no hay versión firmada que preservar). Un
+ * período cerrado es historia y no se reabre ni se pisa: se corrige con un
+ * registro propio, con el mismo criterio que el reconteo de turno (033).
+ * Puro para probarlo sin base de datos.
+ */
+export function assertCorrectablePeriod(status: string): void {
+  if (status !== "cerrado") {
+    throw new Error("PERIOD_NOT_CLOSED");
+  }
+}
+
+/**
+ * PAY-01: un borrador solo se bloquea por solapamiento con un período
+ * CERRADO (nómina ya pagada: borrar el rango revertiría vales de historia).
+ * Solapar con otros borradores no bloquea: nada está pagado y el borrador
+ * restante puede recalcularse. Puro para probarlo sin base de datos.
+ */
+export function overlapBlocksDeletion(statuses: string[]): boolean {
+  return statuses.some((status) => status === "cerrado");
+}
+
+/**
+ * PAY-07: estado al que vuelve un vale que había quedado `descontada` cuando
+ * se borra el borrador que lo descontó. La aprobación deja `approved_by`
+ * informado (el flujo automático lo setea al crear dentro de rango); un vale
+ * pendiente nunca lo tiene. Por eso `approved_by` distingue el estado previo
+ * sin columna adicional. Puro para probarlo sin base de datos.
+ */
+export function restoreVoucherStatus(approvedBy: string | null): "aprobada" | "pendiente" {
+  return approvedBy ? "aprobada" : "pendiente";
 }
 
 /**
@@ -196,6 +483,165 @@ export function weekStartOf(dateIso: string): string {
   return `${y}-${m}-${d}`;
 }
 
+/** Un día en milisegundos: la aritmética de fechas de acá es siempre UTC. */
+const DAY_MS = 86_400_000;
+
+/** Día UTC (ms) de una fecha yyyy-mm-dd; `null` si no es una fecha del calendario. */
+function utcDayOf(dateIso: string): number | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateIso.trim());
+  if (!match) return null;
+  const [year, month, day] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  const ms = Date.UTC(year, month - 1, day);
+  const date = new Date(ms);
+  // Rechaza fechas que el calendario NORMALIZA (2026-02-30 → 2026-03-02): una
+  // fecha imposible no puede convertirse en una porción de sueldo.
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return ms;
+}
+
+/** Largo real del mes (28…31) de un mes del calendario. */
+function daysInMonth(year: number, month0: number): number {
+  return new Date(Date.UTC(year, month0 + 1, 0)).getUTCDate();
+}
+
+/**
+ * PR1/PAY-02: porción del sueldo MENSUAL que corresponde a los DÍAS de un
+ * rango de fechas. `salary_fixed` es un valor por MES (003_admin.sql), así que
+ * pagarlo tal cual en cada período paga el mes tantas veces como períodos
+ * tenga: cuatro cierres semanales de septiembre pagaban 4 × el sueldo, sin
+ * error y sin aviso.
+ *
+ * Fórmula (la regla del dueño: "el cálculo máximo que se le paga en esos
+ * días"): por cada mes del calendario que el rango toca,
+ *
+ *     sueldo × (días de ese mes dentro del rango) / (días de ese mes)
+ *
+ * se SUMAN las porciones y se redondea UNA sola vez el total (peso entero,
+ * `roundMoney`), igual que el resto del módulo. Un período que cubre un mes
+ * completo da EXACTAMENTE el sueldo, sea el mes de 28, 29, 30 o 31 días; un
+ * rango que cruza el fin de mes prorratea en los dos meses. NO es un tope del
+ * mes: no mira los otros períodos ni limita la suma de varios (el dueño
+ * rechazó explícitamente un tope mensual); la suma sólo cuadra si los períodos
+ * no comparten días, y de eso se ocupa la guarda de solape (007+035).
+ *
+ * Puro para probarlo sin base de datos. Un rango invertido o una fecha
+ * imposible LANZAN: devolver 0 en silencio sería pagar de menos sin señal.
+ */
+export function prorateFixedSalary(args: {
+  salaryFixed: number | null | undefined;
+  startDate: string;
+  endDate: string;
+}): number {
+  const salary = Number(args.salaryFixed ?? 0);
+  if (!Number.isFinite(salary) || salary <= 0) return 0;
+  const start = utcDayOf(args.startDate);
+  const end = utcDayOf(args.endDate);
+  if (start === null || end === null || end < start) {
+    throw new Error("INVALID_PERIOD_RANGE");
+  }
+  let total = 0;
+  let cursor = start;
+  while (cursor <= end) {
+    const date = new Date(cursor);
+    const year = date.getUTCFullYear();
+    const month0 = date.getUTCMonth();
+    const monthEnd = Date.UTC(year, month0 + 1, 1) - DAY_MS;
+    const last = Math.min(end, monthEnd);
+    const days = (last - cursor) / DAY_MS + 1;
+    total += (salary * days) / daysInMonth(year, month0);
+    cursor = last + DAY_MS;
+  }
+  return roundMoney(total);
+}
+
+/** Rango de fechas inclusivo en ambos extremos (mismo contrato que el rango). */
+export interface DateRange {
+  start_date: string;
+  end_date: string;
+}
+
+/**
+ * PA-2a: la GUÍA de un pago extraordinario, no su tope.
+ *
+ * El dueño lo dijo explícitamente: el sueldo mensual es la BASE GUÍA de lo que
+ * corresponde a los días liquidados, NO un tope. Un pago por despido incluye
+ * la liquidación (prestaciones, indemnización) y no es la porción del sueldo;
+ * una emergencia puede costar más que los días trabajados. Por eso acá se
+ * CALCULA para MOSTRAR y nunca para bloquear: `exceedsGuide` es un aviso para
+ * quien registra el pago, no una condición de rechazo (el servicio y el CHECK
+ * de la base sólo exigen monto > 0 y motivo no vacío).
+ *
+ * Con días: la guía es la porción prorrateada del sueldo mensual de esos días
+ * (reutiliza `prorateFixedSalary`, la misma fórmula del período). Sin días: la
+ * guía es el sueldo mensual completo. Sin sueldo fijo configurado no hay guía
+ * (`null`): inventar un número sería peor que no mostrar ninguno. Un rango
+ * invertido LANZA (`INVALID_PERIOD_RANGE`), igual que la prorata.
+ * Puro para probarlo sin base de datos.
+ */
+export interface PayrollExtraGuide {
+  /** Sueldo fijo mensual del empleado (base guía); null = no configurado. */
+  monthlySalary: number | null;
+  /** Porción prorrateada de los días liquidados; null si no se indicaron días. */
+  proratedAmount: number | null;
+  /** Días del rango indicado (inclusive); null si no hay rango. */
+  days: number | null;
+  /** El monto SUPERA la guía. Es un aviso, NUNCA un rechazo. */
+  exceedsGuide: boolean;
+}
+
+export function payrollExtraGuide(args: {
+  salaryFixed: number | null | undefined;
+  daysFrom?: string | null;
+  daysTo?: string | null;
+  amount?: number | null;
+}): PayrollExtraGuide {
+  const salary = Number(args.salaryFixed ?? 0);
+  const monthlySalary = Number.isFinite(salary) && salary > 0 ? roundMoney(salary) : null;
+  const from = args.daysFrom ?? null;
+  const to = args.daysTo ?? null;
+
+  let proratedAmount: number | null = null;
+  let days: number | null = null;
+  if (from !== null && to !== null) {
+    // La prorata valida el rango (LANZA si es imposible): la guía no puede
+    // mostrar un número calculado sobre un rango que no existe.
+    const start = utcDayOf(from);
+    const end = utcDayOf(to);
+    if (start === null || end === null || end < start) {
+      throw new Error("INVALID_PERIOD_RANGE");
+    }
+    days = (end - start) / DAY_MS + 1;
+    if (monthlySalary !== null) {
+      proratedAmount = prorateFixedSalary({ salaryFixed: monthlySalary, startDate: from, endDate: to });
+    }
+  }
+
+  const guide = proratedAmount ?? monthlySalary;
+  const amount = args.amount === null || args.amount === undefined ? null : roundMoney(Number(args.amount));
+  const exceedsGuide =
+    guide !== null && amount !== null && Number.isFinite(amount) && amount - guide > 0.009;
+
+  return { monthlySalary, proratedAmount, days, exceedsGuide };
+}
+
+/**
+ * PR1/PAY-01: true cuando dos rangos inclusivos comparten AL MENOS un día. Los
+ * rangos ADYACENTES no se solapan (fin 2026-09-07 / inicio 2026-09-08): son la
+ * serie semanal legal del mes y no comparten ningún día. Es la misma cuenta que
+ * hace el filtro SQL (`start_date <= otro.end_date AND end_date >= otro.start_date`)
+ * y la que sostiene `daterange(start_date, end_date, '[]') &&` de la migración
+ * 035. Puro para probarlo sin base de datos.
+ */
+export function rangesOverlap(left: DateRange, right: DateRange): boolean {
+  return left.start_date <= right.end_date && left.end_date >= right.start_date;
+}
+
 export interface VoucherCapCheck {
   /** Acumulado vigente del día + lo solicitado vs tope diario. */
   overDay: boolean;
@@ -205,8 +651,8 @@ export interface VoucherCapCheck {
 
 /**
  * PAY-05/PAY-06: true cuando el vale supera algún tope y por tanto exige
- * aprobación del admin con código (el servicio lo marca pendiente con
- * requires_approval). Topes en 0 o nulos = sin tope (ilimitado).
+ * aprobación del admin (el servicio lo marca pendiente con requires_approval).
+ * Topes en 0 o nulos = sin tope (ilimitado).
  * Puro para probarlo sin base de datos.
  */
 export function checkVoucherCaps(args: {
@@ -230,23 +676,154 @@ export function checkVoucherCaps(args: {
   return { overDay, overWeek };
 }
 
-/** PAY-06: el vale exige aprobación con código cuando supera algún tope. */
+/** PAY-06: el vale exige revisión del admin cuando supera algún tope. */
 export function requiresVoucherApproval(caps: VoucherCapCheck): boolean {
   return caps.overDay || caps.overWeek;
 }
 
 /**
- * PAY-06: código dinámico básico de 6 dígitos para la aprobación.
- * Puro salvo la aleatoriedad (el test valida formato, no valor).
+ * Item 5: día ISO de la semana (1=lunes…7=domingo) de una fecha yyyy-mm-dd.
+ * Puro para probarlo sin base de datos.
  */
-export function generateApprovalCode(): string {
-  const code = Math.floor(100000 + Math.random() * 900000);
-  return String(code);
+export function weekdayIso(dateIso: string): number {
+  const [year, month, day] = dateIso.split("-").map(Number);
+  const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+  return weekday === 0 ? 7 : weekday;
 }
 
-/** PAY-06: formato válido del código (6 dígitos). */
-export function isApprovalCodeValid(code: string | null | undefined): boolean {
-  return typeof code === "string" && /^\d{6}$/.test(code);
+/**
+ * Item 5: normaliza los días permitidos (únicos, ordenados). null/undefined
+ * o vacío = sin restricción (todos los días, comportamiento previo).
+ * Puro para probarlo sin base de datos.
+ */
+export function normalizeAllowedDays(days: Array<number | string> | null | undefined): number[] | null {
+  if (!days || days.length === 0) return null;
+  const unique = [...new Set(days.map(Number).filter((day) => Number.isInteger(day) && day >= 1 && day <= 7))];
+  if (unique.length === 0) return null;
+  return unique.sort((a, b) => a - b);
+}
+
+/**
+ * Item 5: true cuando la fecha cae en un día permitido (null = todos).
+ * Puro para probarlo sin base de datos.
+ */
+export function isVoucherDayAllowed(
+  requestDate: string,
+  allowedDays: Array<number | string> | null | undefined,
+): boolean {
+  const normalized = normalizeAllowedDays(allowedDays);
+  if (!normalized) return true;
+  return normalized.includes(weekdayIso(requestDate));
+}
+
+export interface VoucherEligibility extends VoucherCapCheck {
+  /** La fecha cae fuera de los días permitidos (también exige revisión). */
+  dayNotAllowed: boolean;
+}
+
+/**
+ * V2: normaliza los topes por día a un mapa { "1": 50000 }. Entradas
+ * repetidas: gana la última. Vacío o inválido = null (sin topes por día).
+ * Puro para probarlo sin base de datos.
+ */
+export function normalizePerDayLimits(
+  entries: Array<{ day: number | string; amount: number | string }> | null | undefined,
+): Record<string, number> | null {
+  if (!entries || entries.length === 0) return null;
+  const map: Record<string, number> = {};
+  for (const entry of entries) {
+    const day = Number(entry.day);
+    const amount = Number(entry.amount);
+    if (!Number.isInteger(day) || day < 1 || day > 7) continue;
+    if (!Number.isFinite(amount) || amount < 0) continue;
+    map[String(day)] = roundMoney(amount);
+  }
+  return Object.keys(map).length === 0 ? null : map;
+}
+
+/**
+ * V2: tope diario aplicable a una fecha. El tope propio del día REEMPLAZA al
+ * tope diario general; sin tope propio rige el general. Puro.
+ */
+export function resolveVoucherDayCap(
+  maxPerDay: number | null,
+  perDayLimits: Record<string, number | string> | null | undefined,
+  requestDate: string,
+): number | null {
+  const specific = perDayLimits?.[String(weekdayIso(requestDate))];
+  if (specific !== undefined && specific !== null) return Number(specific);
+  return maxPerDay;
+}
+
+/**
+ * Item 5: elegibilidad completa del vale (topes + día permitido). Pedir
+ * fuera de día permitido NO bloquea: exige revisión del admin igual que
+ * superar topes. Puro para probarlo sin base de datos.
+ */
+export function checkVoucherEligibility(args: {
+  dayTotal: number;
+  weekTotal: number;
+  requested: number;
+  maxPerDay: number | null;
+  maxPerWeek: number | null;
+  requestDate: string;
+  allowedDays: Array<number | string> | null | undefined;
+  /** V2: topes propios por día; reemplazan al general en su día. */
+  perDayLimits?: Record<string, number | string> | null;
+}): VoucherEligibility {
+  const caps = checkVoucherCaps({
+    dayTotal: args.dayTotal,
+    weekTotal: args.weekTotal,
+    requested: args.requested,
+    maxPerDay: resolveVoucherDayCap(args.maxPerDay, args.perDayLimits, args.requestDate),
+    maxPerWeek: args.maxPerWeek,
+  });
+  return { ...caps, dayNotAllowed: !isVoucherDayAllowed(args.requestDate, args.allowedDays) };
+}
+
+/**
+ * Item 5: el vale exige revisión del admin (topes o día no permitido).
+ */
+export function voucherRequiresReview(eligibility: VoucherEligibility): boolean {
+  return eligibility.overDay || eligibility.overWeek || eligibility.dayNotAllowed;
+}
+
+/**
+ * Nuevo flujo: estado con el que nace el vale. Dentro de rango (días
+ * permitidos + topes) se genera directo (aprobada, utilizable de una); fuera
+ * de rango queda pendiente para que el admin lo autorice o rechace.
+ * Puro para probarlo sin base de datos.
+ */
+export function resolveVoucherInitialStatus(
+  eligibility: VoucherEligibility,
+): "aprobada" | "pendiente" {
+  return voucherRequiresReview(eligibility) ? "pendiente" : "aprobada";
+}
+
+/**
+ * PAY-06: valida el tope del 50% de salidas en efectivo del turno al APROBAR
+ * un vale. Un vale puede nacer pendiente por debajo del límite y superarlo al
+ * aprobarse (el acumulado del turno creció): la aprobación repite la misma
+ * regla de la solicitud, con el acumulado YA salido del turno más este vale.
+ * Solo rige para `efectivo` ligado a un turno; los digitales y los vales
+ * históricos sin turno no tienen tope. Reutiliza la regla pura de caja (no la
+ * reescribe). Devuelve null si el monto cabe. Puro para probarlo sin BD.
+ */
+export function voucherApprovalCashOutViolation(args: {
+  methodCode: string | null;
+  cashShiftId: string | null;
+  openingBase: number | null;
+  cashOutUsed: number;
+  amount: number;
+}): { code: string; message: string } | null {
+  if (args.methodCode !== "efectivo") return null;
+  if (!args.cashShiftId || args.openingBase === null || args.openingBase === undefined) return null;
+  return cashOutLimitViolation({
+    methodCode: args.methodCode,
+    openingBase: args.openingBase,
+    cashOutUsed: args.cashOutUsed,
+    amount: args.amount,
+  });
 }
 
 /**
@@ -264,4 +841,492 @@ export function canDiscountVoucher(status: string): boolean {
  */
 export function canReviewVoucher(status: string): boolean {
   return status === "pendiente";
+}
+
+// ------------------------------- vista de la nómina (PA3) ---
+//
+// Con muchos pagos al mes, la pantalla de nómina tiene que poder leerse sin
+// abrir cada período: cuántos empleados liquidó, cuánto neto hay, cuánto se pagó
+// y cuánto queda, agrupado por mes, y qué lleva cada persona en el mes y contra
+// qué períodos. Todo esto es PRESENTACIÓN: se deriva de datos ya liquidados y NO
+// mueve plata (no decide montos, no topa nada, no bloquea nada). Las funciones
+// de acá son puras para poder probarlas sin base de datos.
+//
+// Los tipos de entrada son ESTRUCTURALES a propósito: este módulo es la capa de
+// reglas puras y no puede importar `service` (es el servicio el que importa
+// este módulo).
+
+/** Período, en los campos que la vista necesita para agrupar y etiquetar. */
+export interface PayrollPeriodLike extends DateRange {
+  id: string;
+  status: string;
+}
+
+/** Ítem ya liquidado con lo pagado resuelto (el servicio lo arma al leer). */
+export interface PayrollItemLike {
+  id: string;
+  period_id: string;
+  employee_id: string;
+  base_fixed: number | string;
+  net_pay: number | string;
+  paid: number | string;
+}
+
+/** Totales de un período: lo que se lee sin abrirlo. */
+export interface PayrollItemTotals {
+  /** Cuántos empleados liquidó el período (una fila por empleado). */
+  employeeCount: number;
+  netTotal: number;
+  paidTotal: number;
+  remainingTotal: number;
+}
+
+/** Un período dentro del mes de un empleado ("contra qué" se le pagó). */
+export interface PayrollMonthPeriodEntry {
+  periodId: string;
+  start_date: string;
+  end_date: string;
+  status: string;
+  net: number;
+  paid: number;
+  remaining: number;
+  /** Fijo liquidado (ya prorrateado) de este empleado en este período. */
+  fixed: number;
+  /** Días del período que caen en ESTE mes (el numerador de la prorata). */
+  days: number;
+}
+
+/**
+ * PA3: lo que un empleado lleva en un mes. El mes es el de la fecha de INICIO
+ * del período y los días son los de ese mes: un período que cruza el fin de mes
+ * se prorratea en los dos meses (`prorateFixedSalary`), así que sus días y su
+ * fijo aparecen en el mes donde empieza, que es la parte que ahí se liquida.
+ */
+export interface PayrollMonthEmployeeRow {
+  /** Mes del calendario del período, `yyyy-mm`. */
+  month: string;
+  employeeId: string;
+  netTotal: number;
+  paidTotal: number;
+  remainingTotal: number;
+  /** Fijo liquidado (ya prorrateado por el servidor) de los períodos del mes. */
+  fixedTotal: number;
+  /** Días nominados del mes (la parte de cada período que cae en él). */
+  days: number;
+  periods: PayrollMonthPeriodEntry[];
+}
+
+/** Datos del empleado que la vista de nómina necesita para una fila (ADM-08). */
+export interface PayrollEmployeeView {
+  id: string;
+  full_name: string;
+  employee_code: string | null;
+  document: string | null;
+  /** Lo que la columna de liquidación muestra (fijo/porcentaje/mixto). */
+  pay_type: string;
+  commission_percent: number | null;
+  /** Base mensual de la prorata: se muestra, no se aplica. */
+  salary_fixed: number | null;
+}
+
+/**
+ * Suma de montos para MOSTRAR: se redondea a peso entero en cada paso
+ * (`roundMoney`), sin tolerancia. Una suma que no cierra al peso haría ver un
+ * total distinto del que se puede pagar.
+ */
+export function sumMoney(values: readonly (number | string | null | undefined)[]): number {
+  let total = 0;
+  for (const value of values) {
+    const numeric = Number(value ?? 0);
+    if (Number.isFinite(numeric)) total = roundMoney(total + numeric);
+  }
+  return total;
+}
+
+/**
+ * Totales de un período a partir de sus ítems con lo pagado resuelto.
+ *
+ * El saldo de cada fila es `max(0, neto − pagado)`, el MISMO criterio que
+ * `getPeriodDetail` (una fila nunca muestra saldo negativo), y el total del
+ * período es la suma de lo que muestran sus filas: la lista y el detalle no
+ * pueden decir cosas distintas del mismo período.
+ */
+export function summarizePayrollItems(items: readonly PayrollItemLike[]): PayrollItemTotals {
+  return {
+    employeeCount: items.length,
+    netTotal: sumMoney(items.map((item) => item.net_pay)),
+    paidTotal: sumMoney(items.map((item) => item.paid)),
+    remainingTotal: sumMoney(
+      items.map((item) => Math.max(0, Number(item.net_pay) - Number(item.paid ?? 0))),
+    ),
+  };
+}
+
+/**
+ * PA-2b: los montos de un ítem de nómina en UNA de las dos versiones de una
+ * corrección (la anterior congelada o la corregida). Estructural a propósito:
+ * sirve tanto para la fila de `payroll_items` (versión anterior) como para la
+ * fila de la corrección.
+ */
+export interface PayrollCorrectionAmounts {
+  base_fixed: number | string;
+  commissions: number | string;
+  bonuses: number | string;
+  deductions_vales: number | string;
+  other_discounts: number | string;
+  net_pay: number | string;
+}
+
+/** Una fila de la comparación: lo que decía el período, lo corregido y lo pagado. */
+export interface PayrollCorrectionRowView {
+  employee_id: string;
+  previous: PayrollCorrectionAmounts;
+  corrected: PayrollCorrectionAmounts;
+  /** Pagado a este empleado en este período (suma de `payroll_payments`). */
+  paid: number;
+  /**
+   * Diferencia a liquidar: `pagado − neto corregido`. Positiva = se pagó más
+   * de lo que la versión corregida dice que se debía (a favor de la empresa);
+   * negativa = quedó plata por pagar (a favor del empleado). La corrección NO
+   * la salda: la muestra para que se salde a mano.
+   */
+  difference: number;
+}
+
+/** Las dos versiones de un período corregido, comparadas contra lo pagado. */
+export interface PayrollCorrectionView {
+  rows: PayrollCorrectionRowView[];
+  previousNetTotal: number;
+  correctedNetTotal: number;
+  paidTotal: number;
+  differenceTotal: number;
+}
+
+/** Montos en cero para el empleado que sólo está en una de las dos versiones. */
+const NO_CORRECTION_AMOUNTS: PayrollCorrectionAmounts = {
+  base_fixed: 0,
+  commissions: 0,
+  bonuses: 0,
+  deductions_vales: 0,
+  other_discounts: 0,
+  net_pay: 0,
+};
+
+/**
+ * PA-2b: arma la comparación de un período corregido: por empleado y para el
+ * período, lo que decía la versión anterior, lo que dice la corregida y lo
+ * pagado, con la diferencia `pagado − corregido`.
+ *
+ * El orden de las filas es por `employee_id`: es determinista y no depende del
+ * orden en que el motor devolvió las filas, así que la misma corrección se lee
+ * igual siempre (la pantalla ordena por nombre del empleado para mostrar).
+ * Un empleado que sólo aparezca en la corrección se agrega con la versión
+ * anterior en cero, en vez de desaparecer de la vista.
+ * Los totales son la SUMA de las filas (peso entero, sin tolerancia): la tabla
+ * y sus totales no pueden decir cosas distintas.
+ * Puro para probarlo sin base de datos.
+ */
+export function buildPayrollCorrectionView(args: {
+  previous: ReadonlyArray<PayrollCorrectionAmounts & { employee_id: string }>;
+  corrected: ReadonlyArray<PayrollCorrectionAmounts & { employee_id: string }>;
+  paidByEmployee: ReadonlyMap<string, number>;
+}): PayrollCorrectionView {
+  const correctedByEmployee = new Map(args.corrected.map((row) => [row.employee_id, row]));
+  const employeeIds = [
+    ...new Set([
+      ...args.previous.map((row) => row.employee_id),
+      ...args.corrected.map((row) => row.employee_id),
+    ]),
+  ].sort();
+
+  const rows: PayrollCorrectionRowView[] = employeeIds.map((employeeId) => {
+    const previous = args.previous.find((row) => row.employee_id === employeeId) ?? NO_CORRECTION_AMOUNTS;
+    const corrected = correctedByEmployee.get(employeeId) ?? NO_CORRECTION_AMOUNTS;
+    const paid = roundMoney(Number(args.paidByEmployee.get(employeeId) ?? 0));
+    return {
+      employee_id: employeeId,
+      previous,
+      corrected,
+      paid,
+      difference: roundMoney(paid - roundMoney(Number(corrected.net_pay ?? 0))),
+    };
+  });
+
+  return {
+    rows,
+    previousNetTotal: sumMoney(rows.map((row) => row.previous.net_pay)),
+    correctedNetTotal: sumMoney(rows.map((row) => row.corrected.net_pay)),
+    paidTotal: sumMoney(rows.map((row) => row.paid)),
+    differenceTotal: sumMoney(rows.map((row) => row.difference)),
+  };
+}
+
+/** Mes del calendario (`yyyy-mm`) de una fecha `yyyy-mm-dd`; null si no es fecha. */
+export function monthKeyOf(dateIso: string): string | null {
+  const day = utcDayOf(dateIso);
+  if (day === null) return null;
+  const date = new Date(day);
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+/**
+ * Días de `[startDate, endDate]` que caen dentro de un mes del calendario: el
+ * numerador de la prorata (`prorateFixedSalary`), que se muestra para que el
+ * fijo de los días nominados sea legible y no un número suelto. Una fecha
+ * imposible o un mes que el rango no toca dan 0: nunca se inventan días.
+ */
+export function daysInMonthWithinRange(month: string, startDate: string, endDate: string): number {
+  const match = /^(\d{4})-(\d{2})$/.exec(month.trim());
+  if (!match) return 0;
+  const month0 = Number(match[2]) - 1;
+  if (month0 < 0 || month0 > 11) return 0;
+  const start = utcDayOf(startDate);
+  const end = utcDayOf(endDate);
+  if (start === null || end === null || end < start) return 0;
+  const monthStart = Date.UTC(Number(match[1]), month0, 1);
+  const monthEnd = Date.UTC(Number(match[1]), month0 + 1, 0);
+  const from = Math.max(start, monthStart);
+  const to = Math.min(end, monthEnd);
+  if (to < from) return 0;
+  return (to - from) / DAY_MS + 1;
+}
+
+const MONTHS_LONG = [
+  "enero",
+  "febrero",
+  "marzo",
+  "abril",
+  "mayo",
+  "junio",
+  "julio",
+  "agosto",
+  "septiembre",
+  "octubre",
+  "noviembre",
+  "diciembre",
+];
+
+/**
+ * Etiqueta legible de un mes del calendario ("septiembre 2026"). No usa el
+ * locale del runtime: el nombre del mes es el mismo en el servidor y en el
+ * navegador, y no depende de datos de locale que puedan faltar.
+ */
+export function payrollMonthLabel(month: string): string {
+  const match = /^(\d{4})-(\d{2})$/.exec(month.trim());
+  if (!match) return month;
+  const month0 = Number(match[2]) - 1;
+  if (month0 < 0 || month0 > 11) return month;
+  return `${MONTHS_LONG[month0]} ${match[1]}`;
+}
+
+/**
+ * Conteo de la lista de períodos: SIEMPRE contra el total. La lista se leía
+ * recortada en 20 sin decirlo, y un total que no se nombra es un recorte
+ * invisible. `shown === total` es el caso normal (la lectura es completa); el
+ * otro texto existe para cuando el filtro de estado recorta la vista.
+ */
+export function payrollPeriodCountLabel(args: { total: number; shown: number }): string {
+  const noun = args.total === 1 ? "período" : "períodos";
+  if (args.shown === args.total) return `${args.total} ${noun} en la sede.`;
+  return `Mostrando ${args.shown} de ${args.total} ${noun}.`;
+}
+
+/** Períodos agrupados por el mes del calendario de su fecha de inicio. */
+export interface PayrollMonthGroup<TRow extends PayrollPeriodLike = PayrollPeriodLike> {
+  month: string;
+  periods: TRow[];
+}
+
+/**
+ * Agrupa por mes para que un mes con muchos pagos sea navegable: el mes más
+ * reciente primero y, dentro del mes, el período más reciente primero. Un
+ * período con fecha de inicio ilegible no se pierde: cae al grupo sin mes
+ * etiquetable y la vista lo muestra aparte en vez de esconderlo.
+ *
+ * Es genérica en la fila: el llamador recupera EXACTAMENTE el tipo de período
+ * que pasó (la vista además necesita `closed_at`, que no es del agrupador).
+ */
+export function groupPayrollPeriodsByMonth<TRow extends PayrollPeriodLike>(
+  periods: readonly TRow[],
+): PayrollMonthGroup<TRow>[] {
+  const byMonth = new Map<string, TRow[]>();
+  for (const period of periods) {
+    const month = monthKeyOf(period.start_date) ?? "";
+    const bucket = byMonth.get(month);
+    if (bucket) bucket.push(period);
+    else byMonth.set(month, [period]);
+  }
+  return [...byMonth.entries()]
+    .map(([month, rows]) => ({
+      month,
+      periods: [...rows].sort((left, right) => (left.start_date < right.start_date ? 1 : -1)),
+    }))
+    .sort((left, right) => (left.month < right.month ? 1 : -1));
+}
+
+/**
+ * Mes a la fecha por empleado: qué lleva liquidado y pagado en cada mes y
+ * contra qué períodos, con el fijo prorrateado y los días nominados a la vista.
+ * Se ordena por mes descendente y, dentro del mes, por identificación del
+ * empleado ascendente, para que dos corridas den exactamente lo mismo.
+ */
+export function buildPayrollMonthToDate(args: {
+  periods: readonly PayrollPeriodLike[];
+  items: readonly PayrollItemLike[];
+}): PayrollMonthEmployeeRow[] {
+  const periodById = new Map(args.periods.map((period) => [period.id, period]));
+  /** Por mes: los empleados que tienen algo liquidado ese mes. */
+  const employees = new Map<string, Set<string>>();
+  /** Por mes y empleado: el detalle de cada período, para acumular sin reescribir. */
+  const details = new Map<string, Map<string, Map<string, PayrollMonthPeriodEntry>>>();
+
+  for (const item of args.items) {
+    const period = periodById.get(item.period_id);
+    if (!period) continue;
+    const month = monthKeyOf(period.start_date);
+    if (month === null) continue;
+
+    const monthEmployees = employees.get(month) ?? new Set<string>();
+    employees.set(month, monthEmployees);
+    monthEmployees.add(item.employee_id);
+
+    const byEmployee = details.get(month) ?? new Map<string, Map<string, PayrollMonthPeriodEntry>>();
+    details.set(month, byEmployee);
+    const byPeriod = byEmployee.get(item.employee_id) ?? new Map<string, PayrollMonthPeriodEntry>();
+    byEmployee.set(item.employee_id, byPeriod);
+
+    const net = roundMoney(Number(item.net_pay));
+    const paid = roundMoney(Number(item.paid ?? 0));
+    const remaining = roundMoney(Math.max(0, net - paid));
+    const fixed = roundMoney(Number(item.base_fixed));
+
+    const entry = byPeriod.get(period.id);
+    if (entry) {
+      entry.net = roundMoney(entry.net + net);
+      entry.paid = roundMoney(entry.paid + paid);
+      entry.remaining = roundMoney(entry.remaining + remaining);
+      entry.fixed = roundMoney(entry.fixed + fixed);
+    } else {
+      byPeriod.set(period.id, {
+        periodId: period.id,
+        start_date: period.start_date,
+        end_date: period.end_date,
+        status: period.status,
+        net,
+        paid,
+        remaining,
+        fixed,
+        days: daysInMonthWithinRange(month, period.start_date, period.end_date),
+      });
+    }
+  }
+
+  const rows: PayrollMonthEmployeeRow[] = [];
+  for (const [month, monthEmployees] of employees) {
+    for (const employeeId of monthEmployees) {
+      rows.push(
+        monthRowFrom(month, employeeId, [...(details.get(month)?.get(employeeId)?.values() ?? [])]),
+      );
+    }
+  }
+
+  return rows.sort(compareMonthRows);
+}
+
+/** Orden de la vista: mes más reciente primero y, dentro del mes, por legajo. */
+function compareMonthRows(left: PayrollMonthEmployeeRow, right: PayrollMonthEmployeeRow): number {
+  if (left.month !== right.month) return left.month < right.month ? 1 : -1;
+  return left.employeeId < right.employeeId ? -1 : 1;
+}
+
+/**
+ * Totales de una fila del mes, recalculados SÓLO con sus períodos. Después de
+ * `roundMoney` todos los montos son enteros, así que la suma de los totales de
+ * los períodos es exacta (no depende del orden).
+ */
+function monthRowFrom(
+  month: string,
+  employeeId: string,
+  periods: readonly PayrollMonthPeriodEntry[],
+): PayrollMonthEmployeeRow {
+  const sorted = [...periods].sort((left, right) => (left.start_date < right.start_date ? -1 : 1));
+  return {
+    month,
+    employeeId,
+    netTotal: sumMoney(sorted.map((entry) => entry.net)),
+    paidTotal: sumMoney(sorted.map((entry) => entry.paid)),
+    remainingTotal: sumMoney(sorted.map((entry) => entry.remaining)),
+    fixedTotal: sumMoney(sorted.map((entry) => entry.fixed)),
+    days: sorted.reduce((acc, entry) => acc + entry.days, 0),
+    periods: sorted,
+  };
+}
+
+/**
+ * Reemplaza la porción de UN período dentro del mes a la fecha, con los ítems
+ * que acaba de devolver el detalle (o con NINGUNO si el borrador se borró).
+ *
+ * Por qué existe: el mes a la fecha se lee del servidor al abrir la pantalla,
+ * pero el admin paga, recalcula, cierra o borra dentro de la sesión. Sin esto,
+ * el número que acaba de cambiar seguiría mostrándose viejo hasta recargar —y
+ * un total viejo al lado de una acción recién hecha es una mentira, no un dato
+ * desactualizado—. Los períodos que el detalle no toca quedan intactos.
+ */
+export function replacePayrollMonthPeriod(args: {
+  rows: readonly PayrollMonthEmployeeRow[];
+  period: PayrollPeriodLike;
+  items: readonly PayrollItemLike[];
+}): PayrollMonthEmployeeRow[] {
+  const month = monthKeyOf(args.period.start_date);
+  if (month === null) return [...args.rows];
+
+  // 1. Fuera la porción vieja de ESTE período (y las filas que se quedan sin nada).
+  const next: PayrollMonthEmployeeRow[] = [];
+  for (const row of args.rows) {
+    const periods = row.periods.filter((entry) => entry.periodId !== args.period.id);
+    if (periods.length === row.periods.length) {
+      next.push(row);
+      continue;
+    }
+    if (periods.length === 0) continue;
+    next.push(monthRowFrom(row.month, row.employeeId, periods));
+  }
+
+  // 2. Adentro la porción fresca. Sólo se agrega o se completa: la fila puede
+  //    tener OTROS períodos del mismo mes, que no se pierden.
+  const fresh = buildPayrollMonthToDate({ periods: [args.period], items: args.items });
+  for (const row of fresh) {
+    const index = next.findIndex(
+      (other) => other.month === row.month && other.employeeId === row.employeeId,
+    );
+    if (index === -1) next.push(row);
+    else next[index] = monthRowFrom(row.month, row.employeeId, [...next[index].periods, ...row.periods]);
+  }
+
+  return next.sort(compareMonthRows);
+}
+
+/** Índice de la planta por id: nombrar una fila no recorre la planta entera. */
+export function buildPayrollEmployeeIndex(
+  employees: readonly PayrollEmployeeView[],
+): Map<string, PayrollEmployeeView> {
+  const index = new Map<string, PayrollEmployeeView>();
+  for (const employee of employees) index.set(employee.id, employee);
+  return index;
+}
+
+/**
+ * Nombre legible del empleado: nombre + ID interno (el `employee_code`; si no
+ * está definido, el documento), igual que en vales, para distinguir homónimos.
+ * Un id que no está en la planta (un empleado dado de baja y borrado) cae al
+ * fragmento del id: es una degradación EXPLÍCITA, nunca un nombre inventado.
+ */
+export function payrollEmployeeName(
+  index: ReadonlyMap<string, PayrollEmployeeView>,
+  id: string,
+): string {
+  const found = index.get(id);
+  if (!found) return id.slice(0, 8);
+  const internalId = found.employee_code ? found.employee_code : found.document;
+  return `${found.full_name} (${internalId})`;
 }

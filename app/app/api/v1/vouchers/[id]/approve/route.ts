@@ -17,9 +17,9 @@ function tokenOf(request: NextRequest): string | undefined {
 }
 
 /**
- * POST /api/v1/vouchers/:id/approve — aprueba un vale pendiente (PAY-06,
- * solo admin) con código dinámico de 6 dígitos generado por el servidor
- * + observación opcional. Obligatorio sobre topes.
+ * POST /api/v1/vouchers/:id/approve — el admin autoriza un vale pendiente
+ * (PAY-06, solo admin) con observación opcional. Sin código de aprobación: la
+ * autorización queda en approved_by + observation.
  */
 export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   try {

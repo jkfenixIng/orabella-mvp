@@ -1,6 +1,28 @@
 @import "tailwindcss";
 @import "../src/styles/design-tokens.css";
 
+/* Alcance del escaneo de candidatos (D9a).
+
+   Tailwind v4 arma sus fuentes así: si el CSS no declara `@source`,
+   `source(none)` ni `@tailwind utilities source(...)`, el escáner usa un único
+   glob `**` anclado en el `base` del plugin de PostCSS, y ese `base` es
+   `process.cwd()` cuando el build no le pasa ninguno (`@tailwindcss/postcss`,
+   fábrica del plugin: `base ?? process.cwd()`). O sea: la raíz desde la que
+   corre el build. `next build` corre desde `app/`, así que `odd/**` nunca
+   estuvo en el escaneo; lo que sí entraba era la documentación de `app/`: este
+   README y el de cada feature (9 `.md`). Una clase nombrada en una nota se
+   emitía y la evidencia "esta utilidad se emite" quedaba contaminada.
+
+   Los patrones son relativos a este archivo (`app/app/globals.css`), así que
+   `../../` es la raíz del checkout: quedan afuera TODOS los `.md` del repo,
+   corra el build desde donde corra. Los `.md` no aportan ninguna clase que el
+   código no nombre ya: 0 de las 332 utilidades del CSS compilado aparecían solo
+   en un `.md`, así que el bundle emitido no cambia (verificado antes/después).
+   Los comentarios de los propios `.ts`/`.css` siguen alimentando el escáner
+   —Tailwind lee texto, no distingue comentarios— y eso no se puede acotar por
+   ruta: es un límite conocido, no un olvido. */
+@source not "../../**/*.md";
+
 /* Tailwind CSS 4: dark mode driven by the `.dark` class on <html>. */
 @custom-variant dark (&:where(.dark, .dark *));
 
@@ -11,13 +33,21 @@
 @theme inline {
   --color-surface: var(--bg-surface);
   --color-surface-hover: var(--bg-surface-hover);
+  --color-surface-selected: var(--bg-surface-selected);
   --color-text-primary: var(--text-primary);
   --color-text-secondary: var(--text-secondary);
   --color-text-tertiary: var(--text-tertiary);
   --color-border-color: var(--border-color);
   --color-border-color-2: var(--border-color-2);
+  /* Anillo de foco del sistema (utilidad `ring-ring`): sin esta entrada Tailwind
+     no genera la utilidad y los botones lo pintan en `currentColor`. */
+  --color-ring: var(--ring);
   --color-primary-600: var(--color-primary-600);
   --color-primary-700: var(--color-primary-700);
+  /* Peldaño usado por los estados de foco en oscuro (anillo/borde/texto):
+     dark:ring-primary-400, dark:focus:border-primary-400, dark:text-primary-400.
+     Sin exponerlo, esas utilidades no se generan y el foco queda muerto. */
+  --color-primary-400: var(--color-primary-400);
   --color-success: var(--color-success-600);
   --color-success-400: var(--color-success-400);
   --color-success-600: var(--color-success-600);
@@ -27,12 +57,162 @@
   --color-error: var(--color-error-600);
   --color-error-400: var(--color-error-400);
   --color-error-600: var(--color-error-600);
+
+  /* Claves canónicas de shadcn/ui. Son las que hacen que Tailwind emita las
+     utilidades que esperan los componentes del registry (bg-primary,
+     text-primary-foreground, bg-card, text-muted-foreground, border-border,
+     ...). Antes no existían y esos componentes quedaban sin color.
+
+     Cada clave apunta al alias homónimo de :root de más abajo (esa es la fuente
+     de valor), salvo las tres que el sistema resuelve en otros tokens: primary
+     sale de la rampa de marca, muted-foreground del rol de texto secundario y
+     destructive del token de error. --color-ring ya existía arriba y la familia
+     --radius-* no se toca (Tailwind deriva rounded-* de ella).
+
+     Faltaban las DOS claves base del registry (bg-background y text-foreground,
+     presentes en una parte grande de los componentes de shadcn): sin ellas
+     Tailwind no emitía esas utilidades y el puente quedaba completo para una
+     lista pero falso en general. No van abajo como alias nuevos porque su
+     fuente son los literales --background/--foreground que ya viven en el
+     :root y el .dark de este mismo archivo. */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-primary: var(--color-primary-600);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--color-text-secondary);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--color-error-600);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--color-border-color);
+  --color-input: var(--color-border-color);
+
+  /* ----------------------------------------------------------------------
+     Escala de sombras: puente OFICIAL de los tokens del proyecto.
+
+     design-tokens.css declara --shadow-sm|md|lg|xl en :root y en .dark, pero
+     hasta ahora las sombras del proyecto ganaban por ACCIDENTE DE CASCADA, no
+     por decisión: sus reglas .shadow-* vivían SIN CAPA en design-tokens.css y
+     una regla sin capa gana a cualquier capa (`@layer theme, base, components,
+     utilities`, según node_modules/tailwindcss/index.css). Tailwind, mientras
+     tanto, emitía la receta de su registry inlineada en su propia .shadow-*, así
+     que el MISMO nombre significaba dos cosas distintas: cuál ganaba dependía
+     de dónde estuviera escrita la regla, no de una elección.
+
+     Con estas claves la utilidad que Tailwind emite para shadow/sm/md/lg/xl
+     resuelve contra el token VIVO del proyecto (`var(--shadow-*)`), así que el
+     valor es el de la identidad por DECLARACIÓN y en los dos temas. Un
+     componente que llegue del registry pide `shadow-sm` y recibe el del
+     proyecto sin depender de la cascada ni de que su regla sea la última.
+     `inline` mantiene la referencia viva: si se fijara el literal, el .dark de
+     design-tokens.css dejaría de aplicar.
+
+     `--shadow` (la utilidad suelta `shadow`) no tiene receta propia en el
+     proyecto. Se declara como alias del --shadow-sm del proyecto igual que el
+     registry lo aliasa a su propio sm (index.css declara `--shadow` y
+     `--shadow-sm` con el mismo valor, ya en su bloque "Deprecated"): sin esta
+     línea, un componente del registry que pida `shadow` volvería a salir con la
+     receta del registry. No tiene consumidores en la app (verificado), así que
+     no cambia nada de lo que ya se renderiza.
+
+     El patrón de clave auto-referente (`--x: var(--x)`) es el que ya usan las
+     nueve claves --color-* de arriba: Tailwind emite la auto-referencia dentro
+     de `@layer theme` y la declaración real y sin capa del proyecto gana, así
+     que el token sigue siendo el de design-tokens.css. */
+  --shadow: var(--shadow-sm);
+  --shadow-sm: var(--shadow-sm);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: var(--shadow-lg);
+  --shadow-xl: var(--shadow-xl);
+
+  /* ----------------------------------------------------------------------
+     Puente de la familia del PAPEL (hoja de factura).
+
+     Un documento, no una superficie del tema: estos 18 valores son literales
+     fijos declarados en design-tokens.css, sin bloque `.dark`, y estas claves
+     solo existen para que Tailwind emita las utilidades que la hoja usa
+     (`bg-paper-surface`, `text-paper-ink`, `border-paper-line`, ...).
+
+     Cada clave apunta a su token homónimo y a ninguno más: si alguien la
+     redirigiera a un token del tema, el papel se temizaría. La guarda
+     `tests/no-raw-palette.test.ts` exige esa correspondencia uno a uno, que
+     los valores sean literales y que no exista un `.dark` para ellos.
+
+     Son 18 claves, una por valor: tampoco acá se duplica un color. */
+  --color-paper-surface: var(--paper-surface);
+  --color-paper-surface-soft: var(--paper-surface-soft);
+  --color-paper-surface-muted: var(--paper-surface-muted);
+  --color-paper-line: var(--paper-line);
+  --color-paper-line-strong: var(--paper-line-strong);
+  --color-paper-ink: var(--paper-ink);
+  --color-paper-ink-secondary: var(--paper-ink-secondary);
+  --color-paper-ink-tertiary: var(--paper-ink-tertiary);
+  --color-paper-ink-muted: var(--paper-ink-muted);
+  --color-paper-ink-soft: var(--paper-ink-soft);
+  --color-paper-info: var(--paper-info);
+  --color-paper-success: var(--paper-success);
+  --color-paper-success-strong: var(--paper-success-strong);
+  --color-paper-success-deep: var(--paper-success-deep);
+  --color-paper-danger: var(--paper-danger);
+  --color-paper-danger-strong: var(--paper-danger-strong);
+  --color-paper-focus-success: var(--paper-focus-success);
+  --color-paper-focus-danger: var(--paper-focus-danger);
 }
 
 :root {
   color-scheme: light;
   --background: #ffffff;
   --foreground: #0f172a;
+
+  /* Puente de nombres canónicos de shadcn/ui (app/components.json declara
+     baseColor slate, style new-york, cssVariables true). Todos los alias
+     apuntan a tokens que ya existen en design-tokens.css: como ese archivo
+     invierte sus valores en `.dark`, basta declararlos una vez y el resultado
+     es coherente en ambos temas. Ninguno es un color literal.
+
+     `--primary` no se apoya en el token suelto que antes existía como
+     `--color-primary: 175 82%` ni `--secondary` en `--color-secondary: 260 70%`:
+     ambos eran HSL muertos que nada consumía y se eliminaron. El color de marca
+     sale de la rampa `--color-primary-*`; el fondo secundario/acento, de las
+     superficies neutras del proyecto. `--color-primary` y `--color-secondary`
+     siguen existiendo, pero solo como claves de `@theme inline` (más arriba),
+     que es lo que hace que Tailwind emita `bg-primary`, `text-primary`,
+     `bg-secondary`, etc. `--ring` ya existía en design-tokens.css con este
+     mismo significado, así que no se vuelve a declarar. */
+  --card: var(--bg-surface);
+  --card-foreground: var(--text-primary);
+  --popover: var(--bg-surface);
+  --popover-foreground: var(--text-primary);
+  --primary: var(--color-primary-600);
+  --primary-foreground: var(--color-neutral-50);
+  --secondary: var(--bg-surface-hover);
+  --secondary-foreground: var(--text-primary);
+  /* `--muted` apuntaba a `--bg-surface-2`, que era el mismo color que
+     `--bg-surface-hover` en los dos temas (dos nombres para un valor). Se
+     retiró el duplicado y esta clave usa el superviviente: el valor resuelto no
+     cambia (en claro el mismo `theme()` del peldaño 100; en oscuro el mismo
+     `oklch(0.22 0 0)`), y el token de estado que el código ya pedía en 32
+     apariciones de la utilidad `bg-surface-hover` (14 archivos) deja de tener un
+     gemelo de un solo consumidor. */
+  --muted: var(--bg-surface-hover);
+  --muted-foreground: var(--color-text-secondary);
+  --accent: var(--bg-surface-hover);
+  --accent-foreground: var(--text-primary);
+  --destructive: var(--color-error-600);
+  --destructive-foreground: var(--color-neutral-50);
+  --border: var(--color-border-color);
+  --input: var(--color-border-color);
+  /* Única variable de radio que faltaba: la familia --radius-sm|md|lg|xl|2xl|full
+     ya existe en design-tokens.css y Tailwind v4 genera `rounded-*` desde ella,
+     así que la base solo la referencia y nunca la re-define. */
+  --radius: var(--radius-md);
 }
 
 .dark {
@@ -44,4 +224,66 @@
 body {
   background-color: var(--background);
   color: var(--foreground);
+}
+
+/* --------------------------------------------------------------------------
+   Tinte por tipo del toast (WU-D): sonner 2.x solo aplica sus variables por
+   tipo (`--success-bg`, `--error-text`, ...) bajo `richColors`, y sus valores
+   de fábrica son la paleta propia de sonner (hsl), no la del proyecto. Este
+   bloque las redirige a los tokens del proyecto, con un valor por tema.
+
+   Por qué dos bloques y no un `var(--color-*-50)` global: ese peldaño NO se
+   invierte en `.dark` (lo que se invierte es la CLASE `.dark .bg-*-light`, con
+   literales oklch propios en design-tokens.css), así que un -50 global dejaría
+   el toast casi blanco en oscuro. El bloque claro usa el mismo par que el
+   Alert y el Badge (`-50` de fondo + `-600` de texto); el bloque oscuro usa el
+   MISMO literal de fondo que `.dark .bg-*-light` y el `-400` de texto que usa
+   `.dark .text-*`. El borde es `transparent` en los dos temas, igual que las
+   variantes con tinte del Alert y del Badge (`border-transparent`).
+
+   Por qué el prefijo `html`: sonner inyecta su CSS en runtime con un `<style>`
+   que el navegador coloca DESPUÉS de esta hoja, así que un selector de igual
+   especificidad (`[data-sonner-toaster][data-sonner-theme='...']`) perdería por
+   orden. `html [...]` suma un punto de especificidad y gana sin `!important`
+   y sin depender del orden de inyección. No se toca `--normal-*`: el toast sin
+   tipo conserva la superficie del proyecto en ambos temas.
+   -------------------------------------------------------------------------- */
+html [data-sonner-toaster][data-sonner-theme='light'] {
+  --success-bg: var(--color-success-50);
+  --success-text: var(--color-success-600);
+  --success-border: transparent;
+  --warning-bg: var(--color-warning-50);
+  --warning-text: var(--color-warning-600);
+  --warning-border: transparent;
+  --error-bg: var(--color-error-50);
+  --error-text: var(--color-error-600);
+  --error-border: transparent;
+  --info-bg: var(--color-primary-50);
+  --info-text: var(--color-primary-600);
+  --info-border: transparent;
+}
+
+html [data-sonner-toaster][data-sonner-theme='dark'] {
+  --success-bg: oklch(0.14 0.04 160);
+  --success-text: var(--color-success-400);
+  --success-border: transparent;
+  --warning-bg: oklch(0.14 0.07 50);
+  --warning-text: var(--color-warning-400);
+  --warning-border: transparent;
+  --error-bg: oklch(0.14 0.06 25);
+  --error-text: var(--color-error-400);
+  --error-border: transparent;
+  --info-bg: oklch(0.14 0.06 250);
+  --info-text: var(--color-primary-400);
+  --info-border: transparent;
+}
+
+/* Accesibilidad: respeta la preferencia de reducir movimiento del SO. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

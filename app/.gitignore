@@ -2,5 +2,12 @@ node_modules/
 .next/
 out/
 coverage/
+test-results/
+playwright-report/
+tests/e2e/.auth/
 .env*.local
 *.tsbuildinfo
+.vercel
+.env*
+# Local Pi runtime state
+.atl/

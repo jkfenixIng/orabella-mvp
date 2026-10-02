@@ -2,11 +2,15 @@
 
 import { cookies } from "next/headers";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede, requireSession } from "@/src/features/admin/service";
+import { resolveSede } from "@/src/shared/lib/sede";
+import { requireAdminSession, requireSession } from "@/src/features/admin/service";
 import {
   BillingError,
   annulInvoice,
+  countInvoices,
   createInvoice,
+  editEmittedInvoiceItems,
+  editInvoiceItems,
   getInvoiceDetail,
   listInvoices,
   requireBillingWriter,
@@ -31,17 +35,33 @@ export async function listInvoicesAction(filters: {
   status?: string;
   from?: string;
   to?: string;
+  user_id?: string;
+  consecutive_number?: number;
+  closed_by?: string;
+  employee_id?: string;
+  page?: number;
+  pageSize?: number;
 } = {}) {
   try {
     const session = await requireSession(await sessionToken());
-    const data = await listInvoices(resolveSede(session.sedeId, filters.sede_id), {
+    const sedeId = resolveSede(session.sedeId, filters.sede_id);
+    const isManager = session.roles.includes("admin") || session.roles.includes("caja");
+    // Empleado: solo las propias (filtro forzado para que el total cuadre).
+    const effectiveUserId = isManager ? filters.user_id : session.userId;
+    const where = {
       status: filters.status || undefined,
       from: filters.from || undefined,
       to: filters.to || undefined,
-    });
-    const isManager = session.roles.includes("admin") || session.roles.includes("caja");
-    const scoped = isManager ? data : data.filter((row) => row.user_id === session.userId);
-    return { success: true as const, data: scoped };
+      user_id: effectiveUserId,
+      consecutive_number: filters.consecutive_number,
+      closed_by: filters.closed_by || undefined,
+      employee_id: isManager ? filters.employee_id || undefined : undefined,
+    };
+    const [rows, total] = await Promise.all([
+      listInvoices(sedeId, { ...where, page: filters.page, pageSize: filters.pageSize }),
+      countInvoices(sedeId, where),
+    ]);
+    return { success: true as const, data: { rows, total } };
   } catch (error) {
     return toFailure(error);
   }
@@ -65,13 +85,51 @@ export async function getInvoiceAction(id: string) {
   }
 }
 
-/** Misma lógica que POST /api/v1/invoices (solo admin/caja). */
+/**
+ * Misma lógica que POST /api/v1/invoices (solo admin/caja).
+ *
+ * MO-1: el cuerpo debe traer `idempotency_key` (uuid que la pantalla acuña al
+ * empezar el intento y reutiliza en sus reintentos). Sin marca el servicio
+ * rechaza con VALIDATION: un envío sin marca no se puede reconocer como
+ * repetición, así que aceptarlo reabriría el defecto. Con la marca repetida el
+ * servicio devuelve la factura ya emitida, no otra.
+ */
 export async function createInvoiceAction(input: unknown) {
   try {
     const session = await requireBillingWriter(await sessionToken());
     const data = await createInvoice(input, {
       userId: session.userId,
       sedeId: session.sedeId,
+    });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Edición admin de factura con motivo (solo admin; el servicio refuerza). */
+export async function editInvoiceAction(id: string, input: unknown) {
+  try {
+    const session = await requireAdminSession(await sessionToken());
+    const data = await editInvoiceItems(session.sedeId, id, input, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+      roles: session.roles,
+    });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Edición LIBRE de factura EMITIDA (cajera del turno sin motivo, total se recalcula; el servicio refuerza). */
+export async function editEmittedInvoiceAction(id: string, input: unknown) {
+  try {
+    const session = await requireBillingWriter(await sessionToken());
+    const data = await editEmittedInvoiceItems(session.sedeId, id, input, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+      roles: session.roles,
     });
     return { success: true as const, data };
   } catch (error) {
@@ -94,11 +152,24 @@ export async function annulInvoiceAction(id: string, input: unknown) {
   }
 }
 
-/** Misma lógica que POST /api/v1/invoices/:id/payments/split (solo admin/caja). */
+/**
+ * Misma lógica que POST /api/v1/invoices/:id/payments/split (solo admin/caja).
+ *
+ * CL-2: el cuerpo debe traer `idempotency_key` (uuid que la pantalla acuña al
+ * empezar el intento de cobro y reutiliza en sus reintentos). Sin marca el
+ * servicio rechaza con VALIDATION: un envío sin marca no se puede reconocer como
+ * repetición. Con la marca repetida devuelve el detalle ya cobrado —un no-op
+ * exitoso— en vez de morir con OVERPAID, que es lo que hacía el reintento de un
+ * cobro ya registrado.
+ */
 export async function splitPaymentAction(id: string, input: unknown) {
   try {
     const session = await requireBillingWriter(await sessionToken());
-    const data = await splitPayment(session.sedeId, id, input);
+    const data = await splitPayment(session.sedeId, id, input, {
+      userId: session.userId,
+      sedeId: session.sedeId,
+      roles: session.roles,
+    });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

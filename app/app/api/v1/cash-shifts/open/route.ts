@@ -16,7 +16,9 @@ function tokenOf(request: NextRequest): string | undefined {
  * POST /api/v1/cash-shifts/open — abre un turno (solo admin/caja).
  * Equivale al `cash-shifts:open` del PRD §10 (en Next la carpeta no
  * admite `:` en Windows, se usa `open`). Hereda opening_base del último
- * cierre (o base_configurada si es el primero); rechaza doble apertura.
+ * cierre (o base_configurada si es el primero); el pre-arqueo nunca
+ * bloquea (las diferencias se devuelven y auditan); rechaza doble
+ * apertura.
  */
 export async function POST(request: NextRequest) {
   try {

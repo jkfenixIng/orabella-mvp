@@ -5,10 +5,13 @@ import { getSessionUser } from "@/src/features/auth/service";
 import {
   listEmployees,
   listPaymentMethods,
-  listServices,
+  listSedeUsers,
   listTaxes,
 } from "@/src/features/admin/service";
+import { getVoucherSettings } from "@/src/features/payroll/service";
 import { listDenominations, listRegisters } from "@/src/features/cash/service";
+import { Alert } from "@/src/components/ui/lib/alert";
+import { PageContainer, PageHeader } from "@/src/components/ui/lib/page";
 import { AdminTabs } from "./admin-tabs";
 
 export const dynamic = "force-dynamic";
@@ -31,43 +34,46 @@ export default async function AdminPage() {
   const sedeId = session.user.sede_id;
   if (!sedeId) {
     return (
-      <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-4 px-6 py-12">
-        <h1 className="text-2xl font-bold">Administración</h1>
-        <p role="alert" className="text-sm text-red-600 dark:text-red-400">
-          El usuario no tiene sede asignada.
-        </p>
-      </main>
+      <PageContainer size="narrow">
+        <PageHeader title="Administración" />
+        {/* Sin sede no hay panel que mostrar: es ESTADO (el caso hasta que a
+            alguien se le asigne una sede), así que va inline y persistente.
+            Esta vista es un Server Component: no puede emitir un toast. El
+            texto es el mismo; `destructive` deriva role="alert", el mismo
+            anuncio asertivo que antes estaba escrito a mano. */}
+        <Alert variant="destructive">El usuario no tiene sede asignada.</Alert>
+      </PageContainer>
     );
   }
 
-  const [employees, services, taxes, methods, registers, denominations] = await Promise.all([
-    listEmployees(sedeId),
-    listServices(sedeId),
-    listTaxes(sedeId),
-    listPaymentMethods(sedeId),
-    listRegisters(sedeId),
-    listDenominations(sedeId),
-  ]);
+  const [employees, users, taxes, methods, voucherSettings, registers, denominations] =
+    await Promise.all([
+      listEmployees(sedeId),
+      listSedeUsers(sedeId),
+      listTaxes(sedeId),
+      listPaymentMethods(sedeId),
+      getVoucherSettings(sedeId),
+      listRegisters(sedeId),
+      listDenominations(sedeId),
+    ]);
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-4xl flex-col gap-6 px-6 py-12">
-      <header className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-bold">Administración</h1>
-          <p className="mt-2 text-slate-600 dark:text-slate-300">
-            Empleados, servicios, impuestos y métodos de pago de su sede.
-          </p>
-        </div>
-      </header>
+    <PageContainer>
+      <PageHeader
+        title="Administración"
+        description="Empleados, impuestos y métodos de pago de su sede."
+      />
       <AdminTabs
         sedeId={sedeId}
+        currentUserId={session.user.id}
         initialEmployees={employees}
-        initialServices={services}
+        initialUsers={users}
         initialTaxes={taxes}
         initialMethods={methods}
+        initialVoucherSettings={voucherSettings}
         initialRegisters={registers}
         initialDenominations={denominations}
       />
-    </main>
+    </PageContainer>
   );
 }
