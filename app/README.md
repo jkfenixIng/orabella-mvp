@@ -36,6 +36,96 @@ npm run lint    # eslint .
 npm test        # vitest run
 ```
 
+## Cuenta de plataforma (`superadmin`)
+
+La capa de plataforma (ver `odd/tasks/plataforma-super-admin.md`) se administra
+con UNA sola cuenta: documento `superadmin` con el rol `superadmin`. Esa cuenta
+**no** se crea desde la administración de una sede —`adminCreateUser` no admite
+ese rol, que solo otorga la plataforma— así que se aprovisiona con un script del
+repositorio:
+
+```bash
+npm run create:superadmin
+```
+
+### Variables: se leen del ENTORNO de la corrida (no de `.env.local`)
+
+| Variable | Qué es |
+|---|---|
+| `SUPERADMIN_PASSWORD` | La clave de la cuenta. **Obligatoria y sin valor por defecto**: si falta o viene vacía, el script no escribe nada y falla. |
+| `SUPERADMIN_SEDE_ID` | Uuid de la sede a la que pertenece la cuenta (`users.sede_id` es NOT NULL). Obligatoria: no hay sede por defecto. |
+| `SUPERADMIN_TARGET` | `pruebas` o `produccion`. Obligatoria: es la confirmación explícita del destino, y el script imprime el host de Supabase al que apunta antes de escribir. |
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Las mismas de la app: el script usa `createAdminClient()` (service_role). |
+
+**La clave no está en el repositorio** —no está en `.env.example`, ni en un seed,
+ni en este README, ni en una prueba— y **no hay clave por defecto**, porque el
+respaldo silencioso termina siendo la clave de producción. Vive solo en el
+entorno con el que se corre el script; a la base baja únicamente su hash scrypt
+(`hashPassword` de la app). El script tampoco lee `.env.local`: el entorno de la
+corrida se declara a mano, para que un archivo local no decida contra qué base se
+escribe una credencial.
+
+El documento es el MISMO en los dos entornos; lo único que cambia es el valor de
+las variables:
+
+```bash
+# PRUEBAS y producción se distinguen por el VALOR, no por el usuario.
+export SUPERADMIN_PASSWORD='...'         # solo en este shell, nunca en un archivo del repo
+export SUPERADMIN_SEDE_ID='<uuid de la sede>'
+export SUPERADMIN_TARGET='pruebas'       # o 'produccion'
+export NEXT_PUBLIC_SUPABASE_URL='https://<proyecto>.supabase.co'
+export NEXT_PUBLIC_SUPABASE_ANON_KEY='...'
+export SUPABASE_SERVICE_ROLE_KEY='...'
+npm run create:superadmin
+```
+
+### Qué hace (y qué no)
+
+- **Idempotente**: la primera corrida crea la cuenta; las siguientes **actualizan**
+  la clave y limpian el bloqueo por intentos. Nunca crea una segunda cuenta ni
+  duplica el rol: `replace_user_roles` deja exactamente `superadmin`.
+- **Verifica de punta a punta**: al final vuelve a leer el hash guardado y
+  comprueba que verifica con `verifyPassword()` —la misma función del login— con
+  la clave del entorno. Si no verifica, falla en vez de dejar una cuenta que no
+  puede entrar.
+- Deja `must_change_password = false`: AUTH-01 fuerza el cambio cuando la clave
+  inicial es el documento, pero acá la clave la eligió el despliegue y tiene que
+  servir para entrar.
+- **No habilita una cuenta deshabilitada**: si `users.is_active = false`, falla en
+  vez de deshacer en silencio una decisión del dueño.
+- No escribe auditoría: el vocabulario de `audit_logs` no tiene una acción de
+  aprovisionamiento y esto no es una operación de la aplicación.
+
+### El runner (por qué el script de `package.json` se ve así)
+
+El proyecto no tiene `tsx` ni `ts-node`, y el script tiene que importar el
+`hashPassword` de la app (con el alias `@/`) para que el hash no pueda divergir
+del que verifica el login. El runner disponible es `jiti`: **no está declarado en
+`devDependencies`**, pero queda instalado y fijado en `package-lock.json` como
+dependencia de desarrollo porque `@tailwindcss/node` (y `vite`, como peer) lo
+exigen; por eso **el script se corre en una copia del repo con las dependencias
+de desarrollo instaladas** (con `--omit=dev` no hay runner). El CLI de `jiti` no
+resuelve el alias `@/` sin la variable `JITI_TSCONFIG_PATHS` —que no se puede
+fijar de forma portable en `cmd.exe` y en `sh`—, así que la entrada del
+`package.json` levanta `jiti` con `{ tsconfigPaths: true }` y llama a `main()`.
+Si algún día se agrega un runner propio (`tsx`), la entrada se cambia por
+`tsx scripts/create-superadmin.ts` y el script no se toca.
+
+**El script se corre DESDE la máquina del dueño**, contra la base remota, con esas
+variables en el entorno: no hace parte del despliegue de la app y no se ejecuta
+desde el servidor de producción. Necesita, por lo tanto, un checkout del
+repositorio con las dependencias de desarrollo instaladas (`npm ci`). Si algún día
+tiene que correrse en un entorno que no las tenga, hay que **declarar el runner**
+en el proyecto —`tsx`, por ejemplo—: eso sería su propia unidad, con su propio
+cambio de `package.json` y de `package-lock.json` y su propio gate.
+
+Si el runner no está instalado, el arranque lo dice en vez de morir con el error
+de Node sobre un módulo que no encuentra:
+
+```text
+[superadmin] Falta el runner TypeScript: este comando necesita las dependencias de desarrollo instaladas en el checkout, con npm ci y sin --omit=dev. jiti no es una dependencia declarada del proyecto: llega con @tailwindcss/node y vite. Ver el README: Cuenta de plataforma.
+```
+
 ## Estructura
 
 ```text
@@ -45,6 +135,7 @@ src/shared/{components,lib,config}/  # theme, api-response, supabase client/serv
 supabase/migrations/      # SQL versionado (001 fundación; dominio en T2→T7; endurecimiento en T8; 009→031 ampliaciones)
 supabase/seeds/           # seeds de aceptación §11 (T8, idempotentes)
 tests/                    # suites vitest + e2e Playwright (tests/e2e/)
+scripts/                  # operaciones de despliegue fuera de la app (alta de la cuenta de plataforma, G2)
 ```
 
 ## Convenciones

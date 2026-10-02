@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ACCOUNT_LOCKED_ERROR,
   DocumentRateLimiter,
@@ -32,6 +32,7 @@ import {
 } from "@/src/features/auth/schemas";
 import { requirePlatformAdmin } from "@/src/features/platform/service";
 import { AUDIT_ACTIONS } from "@/src/shared/lib/audit";
+import { main, provisionarSuperadmin } from "@/scripts/create-superadmin";
 
 describe("auth schemas (Zod, sin red)", () => {
   it("login acepta documento+clave y recorta espacios", () => {
@@ -449,7 +450,9 @@ function crearUsuarioConRolAtomico(args: Record<string, unknown>): {
   // AUTH-01: la clave inicial es el documento y el cambio es obligatorio.
   postgrest.rows.users = [
     ...filasDe("users"),
-    { ...usuario, id: userId, must_change_password: true },
+    // `users.is_active` es NOT NULL DEFAULT true en 002_auth.sql: el doble
+    // modela el default (si no, la columna queda ausente y miente).
+    { is_active: true, ...usuario, id: userId, must_change_password: true },
   ];
   postgrest.rows.user_roles = [
     ...filasDe("user_roles"),
@@ -474,6 +477,36 @@ function descartarUsuarioAtomico(args: Record<string, unknown>): {
   return { data: 1, error: null };
 }
 
+/**
+ * Modelo de `replace_user_roles` (039): el reemplazo ENTERO (borrar y escribir)
+ * en una sentencia, y el conjunto APLICADO como retorno —el llamador contrasta
+ * lo que pidió contra lo que la base dice que escribió—.
+ */
+function aplicarReemplazoDeRoles(args: Record<string, unknown>): {
+  data: unknown;
+  error: unknown;
+} {
+  const userId = String(args.p_user_id);
+  const codes = [...new Set((args.p_role_codes ?? []) as string[])];
+  if (!filasDe("users").some((usuario) => usuario.id === userId)) {
+    return { data: null, error: p0001("USER_NOT_FOUND") };
+  }
+  if (codes.length === 0) return { data: null, error: p0001("ROLE_NOT_FOUND") };
+  const roles = filasDe("roles").filter((rol) => codes.includes(String(rol.code)));
+  if (roles.length !== codes.length) return { data: null, error: p0001("ROLE_NOT_FOUND") };
+  if (
+    postgrest.failWrite &&
+    ["user_roles.delete", "user_roles.insert"].includes(postgrest.failWrite.label)
+  ) {
+    return { data: null, error: postgrest.failWrite.error };
+  }
+  postgrest.rows.user_roles = [
+    ...filasDe("user_roles").filter((fila) => fila.user_id !== userId),
+    ...roles.map((rol) => ({ user_id: userId, role_id: rol.id })),
+  ];
+  return { data: roles.map((rol) => String(rol.code)).sort(), error: null };
+}
+
 function aplicarRpc(fn: string, args: Record<string, unknown>): {
   data: unknown;
   error: unknown;
@@ -484,6 +517,7 @@ function aplicarRpc(fn: string, args: Record<string, unknown>): {
   if (fn === "confirm_password_reset") return confirmResetAtomico(args);
   if (fn === "change_user_password") return cambiarClaveAtomico(args);
   if (fn === "create_user_with_role") return crearUsuarioConRolAtomico(args);
+  if (fn === "replace_user_roles") return aplicarReemplazoDeRoles(args);
   if (fn === "discard_created_user") return descartarUsuarioAtomico(args);
   return {
     data: null,
@@ -1413,5 +1447,230 @@ describe("auth: la sesión real lleva el rol de plataforma hasta la guarda (G1)"
       code: "UNAUTHENTICATED",
       status: 401,
     });
+  });
+});
+
+// -------------------------------------- cuenta de plataforma (G2) ---
+
+/**
+ * G2: la cuenta de plataforma se aprovisiona desde el ENTORNO, nunca desde el
+ * repositorio. Dos cosas se fijan acá y no en otro lado:
+ *
+ *   1. PARIDAD DEL HASH. El script no puede tener su propio scrypt: si lo
+ *      tuviera, el hash guardado compilaría y el login lo rechazaría sin que
+ *      nada fallara antes. Por eso la prueba verifica el hash que el script
+ *      escribió con `verifyPassword`, la MISMA función del login, y además
+ *      comprueba que verifica la clave correcta y NO otra (control negativo).
+ *   2. AUSENCIA DE CLAVE POR DEFECTO. Sin `SUPERADMIN_PASSWORD` el script se
+ *      niega y no escribe NADA. El respaldo silencioso es el defecto clásico:
+ *      termina siendo la clave de producción.
+ *
+ * Las claves de esta suite son FICTICIAS a propósito: así como la clave real no
+ * vive en el repositorio, tampoco vive en una prueba.
+ */
+describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () => {
+  const CLAVE_FICTICIA = "clave-ficticia-de-prueba";
+  const OTRA_CLAVE_FICTICIA = "otra-clave-ficticia-de-prueba";
+  const SEDE_INEXISTENTE = "00000000-0000-4000-8000-000000000000";
+  const EXIT_CODE_INICIAL = process.exitCode;
+
+  function sembrar(): void {
+    postgrest.rows = {};
+    postgrest.rows.sedes = [{ id: SEDE, name: "Sede principal" }];
+    postgrest.rows.roles = [{ id: "rol-superadmin", code: "superadmin" }];
+    postgrest.rows.users = [];
+    postgrest.rows.user_roles = [];
+  }
+
+  function cuenta(): Record<string, unknown> | undefined {
+    return filasDe("users").find((fila) => fila.id_number === "superadmin");
+  }
+
+  function rolesDeLaCuenta(): Array<Record<string, unknown>> {
+    const usuario = cuenta();
+    return filasDe("user_roles").filter((fila) => fila.user_id === usuario?.id);
+  }
+
+  function hashGuardado(): string {
+    return String(cuenta()?.password_hash ?? "");
+  }
+
+  /** Captura lo que imprime el CLI sin ensuciar la salida de la suite. */
+  function capturarSalida(): { lineas: string[]; errores: string[]; restaurar: () => void } {
+    const lineas: string[] = [];
+    const errores: string[] = [];
+    const log = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+      lineas.push(args.map(String).join(" "));
+    });
+    const error = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      errores.push(args.map(String).join(" "));
+    });
+    return {
+      lineas,
+      errores,
+      restaurar: () => {
+        log.mockRestore();
+        error.mockRestore();
+      },
+    };
+  }
+
+  beforeEach(() => {
+    postgrest.writes.length = 0;
+    postgrest.rpcCalls.length = 0;
+    postgrest.failWrite = null;
+    postgrest.failRpc = null;
+    postgrest.rpcNoAplica = false;
+    vi.unstubAllEnvs();
+  });
+
+  afterEach(() => {
+    // `main()` marca `process.exitCode`: la suite no puede terminar con el
+    // código de un script que se negó a correr.
+    process.exitCode = EXIT_CODE_INICIAL;
+    vi.unstubAllEnvs();
+  });
+
+  it("el hash que escribe el script VERIFICA con `verifyPassword` de la app", async () => {
+    sembrar();
+
+    const resultado = await provisionarSuperadmin({ clave: CLAVE_FICTICIA, sedeId: SEDE });
+
+    const hash = hashGuardado();
+    expect(resultado.accion).toBe("creada");
+    // El formato es el de la casa (`scrypt$v1$<sal>$<hash>`): el script no
+    // inventa otro esquema de hash.
+    expect(hash.startsWith("scrypt$v1$")).toBe(true);
+    expect(hash).not.toContain(CLAVE_FICTICIA);
+    // LA PRUEBA QUE IMPIDE LA DIVERGENCIA SILENCIOSA: el hash lo verifica la
+    // función del LOGIN, no una copia del script.
+    await expect(verifyPassword(CLAVE_FICTICIA, hash)).resolves.toBe(true);
+    await expect(verifyPassword(OTRA_CLAVE_FICTICIA, hash)).resolves.toBe(false);
+    // Y la credencial del entorno es la que sirve para entrar: sin cambio
+    // forzado y sin bloqueo.
+    expect(cuenta()).toMatchObject({
+      id_number: "superadmin",
+      sede_id: SEDE,
+      id_type: "otro",
+      must_change_password: false,
+      failed_attempts: 0,
+      locked_until: null,
+    });
+  });
+
+  it("sin `SUPERADMIN_PASSWORD` se niega a correr y no escribe nada", async () => {
+    sembrar();
+    vi.stubEnv("SUPERADMIN_PASSWORD", undefined);
+    vi.stubEnv("SUPERADMIN_SEDE_ID", SEDE);
+    vi.stubEnv("SUPERADMIN_TARGET", "pruebas");
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "https://proyecto-de-prueba.supabase.co");
+    const salida = capturarSalida();
+
+    await main();
+
+    expect(process.exitCode).toBe(1);
+    // La clave se valida ANTES de tocar la base: ninguna lectura ni escritura.
+    expect(postgrest.rpcCalls).toEqual([]);
+    expect(postgrest.writes).toEqual([]);
+    expect(cuenta()).toBeUndefined();
+    expect(salida.errores.join("\n")).toContain("SUPERADMIN_PASSWORD");
+    salida.restaurar();
+  });
+
+  it("con la clave vacía tampoco escribe: vacío no es una clave", async () => {
+    sembrar();
+    vi.stubEnv("SUPERADMIN_PASSWORD", "   ");
+    vi.stubEnv("SUPERADMIN_SEDE_ID", SEDE);
+    vi.stubEnv("SUPERADMIN_TARGET", "pruebas");
+    const salida = capturarSalida();
+
+    await main();
+
+    expect(process.exitCode).toBe(1);
+    expect(postgrest.rpcCalls).toEqual([]);
+    expect(cuenta()).toBeUndefined();
+    salida.restaurar();
+  });
+
+  it("la segunda corrida no crea otra cuenta ni duplica el rol (y repone la clave)", async () => {
+    sembrar();
+
+    const primera = await provisionarSuperadmin({ clave: CLAVE_FICTICIA, sedeId: SEDE });
+    const segunda = await provisionarSuperadmin({
+      clave: OTRA_CLAVE_FICTICIA,
+      sedeId: SEDE,
+    });
+
+    expect(primera.accion).toBe("creada");
+    expect(segunda.accion).toBe("actualizada");
+    // UNA cuenta con el documento `superadmin`, no dos (la unicidad de 002 y la
+    // lectura previa del script son las dos redes).
+    expect(filasDe("users").filter((fila) => fila.id_number === "superadmin")).toHaveLength(1);
+    // UN rol: `replace_user_roles` reemplaza el conjunto, no agrega filas.
+    expect(rolesDeLaCuenta()).toHaveLength(1);
+    expect(segunda.roles).toEqual(["superadmin"]);
+    // La clave que manda es la de la ÚLTIMA corrida: es la decisión documentada
+    // (volver a correr el script repone la credencial del entorno).
+    await expect(verifyPassword(OTRA_CLAVE_FICTICIA, hashGuardado())).resolves.toBe(true);
+    await expect(verifyPassword(CLAVE_FICTICIA, hashGuardado())).resolves.toBe(false);
+  });
+
+  it("sin destino declarado se niega: no adivina contra qué base escribe", async () => {
+    sembrar();
+    vi.stubEnv("SUPERADMIN_PASSWORD", CLAVE_FICTICIA);
+    vi.stubEnv("SUPERADMIN_SEDE_ID", SEDE);
+    vi.stubEnv("SUPERADMIN_TARGET", undefined);
+    const salida = capturarSalida();
+
+    await main();
+
+    expect(process.exitCode).toBe(1);
+    expect(postgrest.rpcCalls).toEqual([]);
+    expect(postgrest.writes).toEqual([]);
+    expect(salida.errores.join("\n")).toContain("SUPERADMIN_TARGET");
+    salida.restaurar();
+  });
+
+  it("una sede que no existe se rechaza ANTES de escribir", async () => {
+    sembrar();
+
+    await expect(
+      provisionarSuperadmin({ clave: CLAVE_FICTICIA, sedeId: SEDE_INEXISTENTE }),
+    ).rejects.toMatchObject({ codigo: "SEDE_DESCONOCIDA" });
+
+    expect(postgrest.rpcCalls).toEqual([]);
+    expect(postgrest.writes).toEqual([]);
+    expect(filasDe("users")).toEqual([]);
+  });
+
+  it("si el catálogo no tiene `superadmin` (069 sin aplicar) falla y no crea la cuenta", async () => {
+    sembrar();
+    postgrest.rows.roles = [];
+
+    await expect(
+      provisionarSuperadmin({ clave: CLAVE_FICTICIA, sedeId: SEDE }),
+    ).rejects.toMatchObject({ codigo: "CATALOGO_SIN_ROL" });
+
+    expect(filasDe("users")).toEqual([]);
+  });
+
+  it("con todo declarado imprime el destino y nunca la clave", async () => {
+    sembrar();
+    vi.stubEnv("SUPERADMIN_PASSWORD", CLAVE_FICTICIA);
+    vi.stubEnv("SUPERADMIN_SEDE_ID", SEDE);
+    vi.stubEnv("SUPERADMIN_TARGET", "pruebas");
+    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "https://proyecto-de-prueba.supabase.co");
+    const salida = capturarSalida();
+
+    await main();
+
+    expect(process.exitCode).toBeFalsy();
+    const todo = [...salida.lineas, ...salida.errores].join("\n");
+    // El destino declarado y el host: lo que el operador mira antes de escribir.
+    expect(todo).toContain("pruebas");
+    expect(todo).toContain("proyecto-de-prueba.supabase.co");
+    // La credencial NUNCA sale por la salida del script.
+    expect(todo).not.toContain(CLAVE_FICTICIA);
+    salida.restaurar();
   });
 });
