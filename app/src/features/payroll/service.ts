@@ -29,6 +29,7 @@ import {
   payPayrollItemSchema,
   payrollCycleRange,
   payrollExtraSchema,
+  pendingPayrollSettlements,
   rangesOverlap,
   requestVoucherSchema,
   rejectVoucherSchema,
@@ -50,6 +51,7 @@ import {
   type PayrollCorrectionView,
   type PayrollExtraKind,
   type PayrollMonthEmployeeRow,
+  type PendingPayrollSettlement,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { commissionRuleKey, type RuleRate } from "@/src/features/commissions/schemas";
@@ -653,6 +655,13 @@ async function attachVoucherUserNames(
  * períodos heredados sí comparten días). Los dos NULL caen en el mismo cubo
  * vacío, así que la protección de siempre sigue viva.
  *
+ * F9: además, un período nuevo CON cadencia se rechaza si se superpone con un
+ * período HEREDADO sin cadencia de la misma sede. El cubo vacío es distinto del
+ * de las tres cadencias, así que la guarda por cubo no lo vería, pero el
+ * heredado le pagó el fijo a TODO el plantel (no lo acotaba ningún ciclo):
+ * abrir encima un rango con cadencia pagaría dos veces los mismos días. La
+ * guarda entre cadencias DISTINTAS no se toca.
+ *
  * Barreras ante carreras: la lectura y el INSERT no son atómicos, así que la
  * restricción de exclusión de la base (migración 063) es la barrera final
  * (23P01 → mismo error de negocio, igual que 23505 para el borrador repetido).
@@ -727,6 +736,24 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
       throw new PayrollError(
         "PERIOD_OVERLAP",
         `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${clash.start_date} a ${clash.end_date} (${clash.status}) de esta sede. Un día se nomina una sola vez: ajuste las fechas para que no se crucen con un período existente.`,
+        409,
+      );
+    }
+    // F9: un período HEREDADO sin cadencia (`frequency` NULL, de antes de F7) es un
+    // cubo DISTINTO del de las tres cadencias, así que la guarda de arriba no lo
+    // ve: un período nuevo con cadencia podía superponerse con él. Pero ese
+    // heredado no lo acotaba ningún ciclo, así que le pagó el fijo a TODO el
+    // plantel: abrir encima un rango con cadencia pagaría dos veces los mismos
+    // días. Se rechaza acá, antes del INSERT, con el período heredado a la vista.
+    // La guarda entre cadencias DISTINTAS no se toca: el semanal y el mensual
+    // siguen superponiéndose a propósito (regla del dueño).
+    const legacyClash = candidates.find(
+      (row) => periodCadenceBucket(row.frequency) === "" && rangesOverlap(row, requested),
+    );
+    if (legacyClash) {
+      throw new PayrollError(
+        "PERIOD_OVERLAP",
+        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${legacyClash.start_date} a ${legacyClash.end_date} (${legacyClash.status}) de esta sede, que no tiene cadencia: ese período heredado pagó el fijo a todo el plantel, así que abrir este rango pagaría dos veces los mismos días. Ajuste las fechas para que no se crucen.`,
         409,
       );
     }
@@ -1143,6 +1170,14 @@ export interface PayrollPeriodSummary {
 export interface PayrollOverview {
   summaries: PayrollPeriodSummary[];
   months: PayrollMonthEmployeeRow[];
+  /**
+   * F9: los ciclos ya CERRADOS de la sede que todavía no tienen liquidación por
+   * cadencia, con la gente que cobra así. Es lo que la pantalla necesita para
+   * decir «falta liquidar el ciclo quincenal del 20 sep al 3 oct» en vez de que
+   * el atraso se descubra meses después. Sólo lo recibe el admin: agrega la
+   * planta de la sede (la misma superficie que el resumen de arriba).
+   */
+  pendingSettlements: PendingPayrollSettlement[];
 }
 
 /**
@@ -1235,15 +1270,24 @@ export async function listPayrollOverview(sedeId: string): Promise<PayrollOvervi
   try {
     // `listPeriods` ya es exhaustiva: si se recorta, esto se cae a la vista.
     const periods = await listPeriods(sedeId);
-    if (periods.length === 0) return { summaries: [], months: [] };
+    if (periods.length === 0) {
+      return { summaries: [], months: [], pendingSettlements: [] };
+    }
 
     const db = await payrollDb();
-    const items = await readPaidItemsOfPeriods({
-      db,
-      periodIds: periods.map((period) => period.id),
-      log: "listPayrollOverview",
-      meta: { sede: sedeId },
-    });
+    // F9: la planta es UNA lectura más (paginada, acotada por sede), no una por
+    // cadencia: el aviso de pendientes necesita saber quién cobra con cada
+    // cadencia y cuántos son. Va en paralelo con los ítems, así que no serializa
+    // la lectura. Un fallo de cualquiera de las dos se propaga igual.
+    const [items, employees] = await Promise.all([
+      readPaidItemsOfPeriods({
+        db,
+        periodIds: periods.map((period) => period.id),
+        log: "listPayrollOverview",
+        meta: { sede: sedeId },
+      }),
+      listAllEmployees(sedeId),
+    ]);
 
     const byPeriod = new Map<string, PaidPayrollItem[]>();
     for (const item of items) {
@@ -1258,6 +1302,11 @@ export async function listPayrollOverview(sedeId: string): Promise<PayrollOvervi
         ...summarizePayrollItems(byPeriod.get(period.id) ?? []),
       })),
       months: buildPayrollMonthToDate({ periods, items }),
+      pendingSettlements: pendingPayrollSettlements({
+        periods,
+        employees,
+        referenceDate: bogotaDay(),
+      }),
     };
   } catch (error) {
     throw toPayrollError(error);

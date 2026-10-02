@@ -1077,6 +1077,189 @@ export function cycleProrationFactor(args: {
   return rangeDays / cycleDays;
 }
 
+// ------------------- F9: ciclos cerrados que faltan por liquidar ---
+
+/**
+ * F9 (pedido del dueño, 2026-10-02): cuántos ciclos PENDIENTES se listan por
+ * cadencia. La pantalla avisa de los que faltan, no de una historia sin fin: con
+ * una sede que viene atrasada hace meses, los tres ciclos más recientes de cada
+ * cadencia alcanzan para que el atraso se vea, y el tope evita que el aviso
+ * crezca sin control. El tope es POR CADENCIA: una cadencia muy atrasada no
+ * puede tapar a las otras dos.
+ */
+export const PENDING_SETTLEMENT_LIMIT = 3;
+
+/**
+ * F9: cuántos NOMBRES lleva cada entrada pendiente. Los nombres ya están en
+ * memoria (vienen con la planta), así que nombrar a unos pocos es gratis; el
+ * tope sólo evita una entrada ilegible cuando la cadencia tiene mucha gente. El
+ * `employeeCount` sigue diciendo el total.
+ */
+export const PENDING_SETTLEMENT_NAME_LIMIT = 3;
+
+/** F9: un ciclo cerrado de la sede que todavía no tiene liquidación. */
+export interface PendingPayrollSettlement {
+  /** Cadencia del ciclo (y de los empleados que cobran por ella). */
+  frequency: PayFrequency;
+  start_date: string;
+  end_date: string;
+  /** Etiqueta legible del rango (`20 sep – 3 oct 2026`), la misma del selector. */
+  label: string;
+  /** Cuántos empleados ACTIVOS de la sede cobran con esa cadencia. */
+  employeeCount: number;
+  /** Hasta `PENDING_SETTLEMENT_NAME_LIMIT` nombres, en orden determinista. */
+  employeeNames: string[];
+}
+
+/**
+ * F9: true cuando la sede YA pagó los días de ese ciclo por esa cadencia. Cubre
+ * por SOLAPE (`rangesOverlap`, la misma cuenta de la base y el servicio), no por
+ * coincidencia exacta: un período que comparte días ya pagó esos días.
+ *
+ * La CADENCIA se compara con una asimetría deliberada:
+ *  - Un período de la MISMA cadencia cubre: es su liquidación.
+ *  - Un período de OTRA cadencia NO cubre: el semanal y el mensual comparten días
+ *    A PROPÓSITO (regla del dueño), así que uno no tacha al otro.
+ *  - Un período HEREDADO sin cadencia (`NULL`, de antes de F7) cubre CUALQUIER
+ *    cadencia: no lo acotaba ningún ciclo, así que pagó el fijo a todo el plantel
+ *    y esos días ya salieron de la nómina. Tratarlo como un cubo más —el `''` de
+ *    `coalesce(frequency, '')`, que la guarda de solape sí usa— dejaría el ciclo
+ *    reportándose como pendiente para siempre y el aviso gritaría de más: un
+ *    aviso que grita de más deja de mirarse.
+ *
+ * Reutiliza `periodCadenceBucket` y `rangesOverlap` —las MISMAS reglas del
+ * servicio, la guarda y la base— en vez de repetir aritmética. Puro para
+ * probarlo sin base de datos: es también lo que el selector y la guarda de
+ * apertura del diálogo usan para decidir si un ciclo se puede liquidar, así que
+ * el aviso, las marcas del selector y el diálogo no pueden decir cosas distintas
+ * del mismo ciclo.
+ */
+export function isPayrollCycleSettled(args: {
+  periods: readonly (DateRange & { frequency?: string | null })[];
+  frequency: string | null | undefined;
+  cycle: DateRange;
+}): boolean {
+  const cadence = normalizePayFrequency(args.frequency);
+  if (cadence === null) return false;
+  return args.periods.some((period) => {
+    if (!rangesOverlap(period, args.cycle)) return false;
+    const bucket = periodCadenceBucket(period.frequency ?? null);
+    // Cubo vacío = período heredado sin cadencia: le pagó a todos, así que cubre.
+    return bucket === "" || bucket === cadence;
+  });
+}
+
+/**
+ * F9: los ciclos CERRADOS de la sede que todavía no tienen liquidación, por
+ * cadencia, con lo que la pantalla necesita para decir "falta liquidar esto" y
+ * para abrirlo ya posicionado en ese ciclo.
+ *
+ * Reglas (todas puras, sin base de datos):
+ *  1. Sólo cuenta una cadencia cuando AL MENOS UN empleado ACTIVO la tiene. Sin
+ *     gente de esa cadencia no hay nada que liquidar y no se reporta (un `null` o
+ *     un valor fuera del catálogo es ausencia de cadencia, no una cadencia más).
+ *  2. Sólo cuenta un ciclo ya CERRADO: su sábado es anterior a la fecha de
+ *     referencia (`lastCompletedCycleEndDate`, la misma cuenta de F7). El ciclo en
+ *     curso no se reporta: todavía no ha terminado.
+ *  3. Un ciclo CUBIERTO no se reporta (`isPayrollCycleSettled`): lo cubre un
+ *     período de su MISMA cadencia —el que se solapa o coincide exactamente ya se
+ *     liquidó o se está liquidando en borrador— o un período HEREDADO sin
+ *     cadencia, que le pagó a todo el plantel.
+ *  4. No se reporta historia ANTERIOR a la sede: el recorrido se detiene en el
+ *     arranque del primer período de la sede —antes de eso no había nada que
+ *     liquidar— y sin ningún período no se reporta NADA. Un ciclo que terminó
+ *     antes de ese arranque no aparece.
+ *  5. La lista se TOPA en `limit` ciclos (3 por defecto) POR CADENCIA, tomando
+ *     los más recientes, y se ordena con el más atrasado PRIMERO (por fecha de
+ *     cierre) para que lo más vencido se vea arriba.
+ *
+ * `referenceDate` es un día de Bogotá (lo resuelve el llamador, `bogotaDay()`), la
+ * MISMA convención de fechas del resto del módulo.
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function pendingPayrollSettlements(args: {
+  periods: readonly (DateRange & { frequency?: string | null })[];
+  employees: readonly {
+    full_name: string;
+    pay_frequency?: string | null;
+    is_active?: boolean;
+  }[];
+  referenceDate: string;
+  limit?: number;
+}): PendingPayrollSettlement[] {
+  // Sin períodos no hay historia de la sede: nada que reportar (regla 4).
+  if (args.periods.length === 0) return [];
+  const lastEnd = utcDayOf(lastCompletedCycleEndDate(args.referenceDate) ?? "");
+  if (lastEnd === null) return [];
+
+  // Regla 4: el arranque de la sede es la fecha de inicio MÁS ANTIGUA registrada.
+  // Antes de ahí no había nada que liquidar, así que el recorrido se detiene ahí.
+  let historyStart: number | null = null;
+  for (const period of args.periods) {
+    const start = utcDayOf(period.start_date);
+    if (start === null) continue;
+    if (historyStart === null || start < historyStart) historyStart = start;
+  }
+  if (historyStart === null) return [];
+
+  // Regla 1: la planta que importa es la ACTIVA. Un empleado dado de baja no
+  // puede dejar un aviso de "falta liquidar" que nunca se pueda cerrar.
+  const namesByFrequency = new Map<PayFrequency, string[]>();
+  for (const employee of args.employees) {
+    if (employee.is_active === false) continue;
+    const frequency = normalizePayFrequency(employee.pay_frequency ?? null);
+    if (frequency === null) continue;
+    const bucket = namesByFrequency.get(frequency);
+    if (bucket) bucket.push(employee.full_name);
+    else namesByFrequency.set(frequency, [employee.full_name]);
+  }
+
+  const limit = Math.max(0, Math.trunc(args.limit ?? PENDING_SETTLEMENT_LIMIT));
+  if (limit === 0) return [];
+
+  const pending: PendingPayrollSettlement[] = [];
+  // El catálogo cerrado es UNA sola definición (`payFrequencySchema.options`):
+  // una cadencia nueva entra acá sin tocar este recorrido.
+  for (const frequency of payFrequencySchema.options) {
+    const cadenceNames = namesByFrequency.get(frequency);
+    if (cadenceNames === undefined || cadenceNames.length === 0) continue;
+    const cycleDays = calendarCycleDaysForFrequency(frequency);
+    if (cycleDays === null) continue;
+
+    let found = 0;
+    // Del ciclo completado MÁS RECIENTE hacia atrás: los primeros sin cubrir son
+    // los que el tope conserva.
+    for (let end = lastEnd; end >= historyStart; end -= cycleDays * DAY_MS) {
+      const start = end - (cycleDays - 1) * DAY_MS;
+      const cycle = { start_date: isoDayOf(start), end_date: isoDayOf(end) };
+      if (isPayrollCycleSettled({ periods: args.periods, frequency, cycle })) continue;
+      pending.push({
+        frequency,
+        start_date: cycle.start_date,
+        end_date: cycle.end_date,
+        label: cycleRangeLabel(start, end),
+        employeeCount: cadenceNames.length,
+        // Orden determinista: el mismo atraso se lee igual en cada corrida, sin
+        // depender del orden en que la planta llegó del servidor.
+        employeeNames: [...cadenceNames].sort().slice(0, PENDING_SETTLEMENT_NAME_LIMIT),
+      });
+      found += 1;
+      if (found >= limit) break;
+    }
+  }
+
+  // El más atrasado primero: por fecha de CIERRE (la que marca el atraso) y, a
+  // igualdad, por el orden del catálogo de cadencias.
+  return pending.sort((left, right) => {
+    if (left.end_date !== right.end_date) return left.end_date < right.end_date ? -1 : 1;
+    return (
+      payFrequencySchema.options.indexOf(left.frequency) -
+      payFrequencySchema.options.indexOf(right.frequency)
+    );
+  });
+}
+
 /**
  * F3: cómo se resolvió el fijo de un período. `basis` hace EXPLÍCITA la regla
  * aplicada en vez de dejarla deducir del monto:

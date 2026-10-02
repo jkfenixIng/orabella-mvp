@@ -35,6 +35,7 @@ import {
   buildPayrollEmployeeIndex,
   detailLineCommissionOrigin,
   groupPayrollPeriodsByMonth,
+  isPayrollCycleSettled,
   lastCompletedPayrollCycles,
   nextPeriodStartDate,
   payrollCycleRange,
@@ -43,6 +44,7 @@ import {
   payrollExtraKindSchema,
   payrollMonthLabel,
   payrollPeriodCountLabel,
+  pendingPayrollSettlements,
   periodCadenceBucket,
   roundMoney,
   splitCommissionByOrigin,
@@ -54,6 +56,7 @@ import {
   type PayrollMonthEmployeeRow,
   type PayrollMonthGroup,
   type PayFrequency,
+  type PendingPayrollSettlement,
 } from "@/src/features/payroll/schemas";
 import type { EmployeeRow, PaymentMethodRow } from "@/src/features/admin/service";
 import {
@@ -249,6 +252,24 @@ function formatFullDate(value: string): string {
   const date = parseIsoDate(value);
   if (!date) return value;
   return `${date.day} ${MONTHS_SHORT[date.month - 1]} ${date.year}`;
+}
+
+/**
+ * F9: texto de un ciclo pendiente en el aviso. Nombra la cadencia, el rango del
+ * ciclo y a quién le toca; cuando la cadencia tiene más gente que nombres,
+ * resume el resto con el conteo (que siempre dice el total).
+ */
+function pendingSettlementText(entry: PendingPayrollSettlement): string {
+  const employees =
+    entry.employeeCount === 1
+      ? "1 empleado con esa cadencia"
+      : `${entry.employeeCount} empleados con esa cadencia`;
+  const extra = entry.employeeCount - entry.employeeNames.length;
+  const who =
+    extra > 0
+      ? `${entry.employeeNames.join(", ")} y ${extra} más`
+      : entry.employeeNames.join(", ");
+  return `Falta liquidar el ciclo ${entry.frequency} ${entry.label} (${employees}: ${who}).`;
 }
 
 /**
@@ -1192,6 +1213,14 @@ export function PayrollClient(props: PayrollClientProps) {
   const [openFrequency, setOpenFrequency] = useState<PayFrequency>(DEFAULT_PAY_FREQUENCY);
   // Cierre (sábado) del ciclo elegido. Vacío mientras el diálogo no se abrió.
   const [openCycleEnd, setOpenCycleEnd] = useState("");
+  /**
+   * F9: el ciclo pendiente con el que se abrió el diálogo, cuando se llegó por
+   * el aviso del atraso. Se conserva para que su opción siga en el selector
+   * aunque el atraso sea más antiguo que los últimos ciclos ofrecidos: si la
+   * opción faltara, el `<select>` mostraría otro ciclo del que el estado tiene
+   * elegido y se abriría el período equivocado.
+   */
+  const [pinnedCycle, setPinnedCycle] = useState<PendingPayrollSettlement | null>(null);
   const [openError, setOpenError] = useState<string | null>(null);
   // Pagos: porciones por ítem (método y monto como campos separados en tabla).
   const [portions, setPortions] = useState<Record<string, PortionDraft[]>>({});
@@ -1444,6 +1473,7 @@ export function PayrollClient(props: PayrollClientProps) {
    */
   function openPeriodDialog() {
     setOpenError(null);
+    setPinnedCycle(null);
     setOpenFrequency(DEFAULT_PAY_FREQUENCY);
     setOpenCycleEnd(
       lastCompletedPayrollCycles({
@@ -1452,6 +1482,19 @@ export function PayrollClient(props: PayrollClientProps) {
         count: OPEN_CYCLE_OPTION_LIMIT,
       })[0]?.end_date ?? "",
     );
+    setOpenDialogOpen(true);
+  }
+
+  /**
+   * F9: abre el diálogo ya POSICIONADO en el ciclo que el aviso acaba de
+   * nombrar: la cadencia del ciclo y su cierre quedan elegidos, así el admin no
+   * tiene que buscar a mano el ciclo atrasado entre las opciones.
+   */
+  function openPendingSettlement(entry: PendingPayrollSettlement) {
+    setOpenError(null);
+    setOpenFrequency(entry.frequency);
+    setPinnedCycle(entry);
+    setOpenCycleEnd(entry.end_date);
     setOpenDialogOpen(true);
   }
 
@@ -1465,21 +1508,36 @@ export function PayrollClient(props: PayrollClientProps) {
       setOpenError("La fecha final no puede ser anterior a la inicial.");
       return;
     }
-    // El rango sale del ciclo, pero el piso de la cadencia sigue vigente: un
-    // ciclo ya liquidado (o anterior al último período de su cadencia) no se
-    // puede abrir. F4: el piso es de la MISMA cadencia — un período de otro
-    // ciclo puede compartir días y no impone piso.
-    const minimumStart = nextPeriodStartDate(periods, openFrequency);
-    if (minimumStart !== null && startDate < minimumStart) {
-      setOpenError(
-        `El período no puede empezar antes del ${formatFullDate(minimumStart)}: ese es el día siguiente al fin del último período registrado de esta cadencia.`,
-      );
-      return;
-    }
+    // F9 corregido: la guarda de apertura YA NO es el piso del "día siguiente al
+    // último período de la cadencia". Ese piso contradecía a un ciclo
+    // genuinamente SIN liquidar: con un hueco a mitad de la historia (una
+    // cadencia que nunca se liquidó mientras las otras sí, o un borrador borrado
+    // entre ciclos cerrados) el aviso ofrecía abrir ese ciclo y el propio
+    // diálogo lo rechazaba con "el período no puede empezar antes de X", así que
+    // la promesa del aviso la rompía nuestra guarda.
+    //
+    // La guarda ahora repite la MISMA regla del aviso y de las marcas del
+    // selector (`isPayrollCycleSettled`): sólo bloquea el ciclo que YA está
+    // liquidado por su cadencia —o cubierto por un período heredado sin cadencia,
+    // que le pagó a todo el plantel— y deja pasar cualquier ciclo sin liquidar.
+    // La autoridad de "ya liquidado" y de "se solapa" sigue siendo el servidor
+    // (`openPayrollPeriod`, guarda por cubo de cadencia más la restricción de la
+    // base), que decide sobre lo que el cliente no puede ver.
     const collision = findOverlappingPeriod(periods, startDate, endDate, openFrequency);
     if (collision) {
       setOpenError(
         `El rango se solapa con ${formatPeriodLabel(collision)} (${collision.status}). Ajuste las fechas o la cadencia.`,
+      );
+      return;
+    }
+    const settledCycle = isPayrollCycleSettled({
+      periods,
+      frequency: openFrequency,
+      cycle: { start_date: startDate, end_date: endDate },
+    });
+    if (settledCycle) {
+      setOpenError(
+        "Este ciclo ya tiene su liquidación para la cadencia elegida (o lo cubre un período heredado sin cadencia, que pagó a todo el plantel). Elija otro ciclo.",
       );
       return;
     }
@@ -1532,6 +1590,7 @@ export function PayrollClient(props: PayrollClientProps) {
   function closeOpenDialog() {
     setOpenCycleEnd("");
     setOpenFrequency(DEFAULT_PAY_FREQUENCY);
+    setPinnedCycle(null);
     setOpenError(null);
     setOpenDialogOpen(false);
   }
@@ -1934,10 +1993,12 @@ export function PayrollClient(props: PayrollClientProps) {
     : null;
 
   // Ayuda para elegir el rango del nuevo periodo, construida solo con `periods`.
-  // El piso es el día siguiente al último fin liquidado DE LA MISMA CADENCIA
-  // (función pura del esquema): `null` cuando aún no hay períodos de ese ciclo,
-  // o sea el primero es libre. Cambia con la cadencia elegida; un período de
-  // otro ciclo se puede superponer y no impone piso.
+  // F9: es SÓLO una SUGERENCIA —el ciclo que sigue al último fin registrado DE LA
+  // MISMA CADENCIA (función pura del esquema); `null` cuando aún no hay períodos
+  // de ese ciclo, o sea el primero es libre—, NO un piso: con un hueco a mitad de
+  // la historia el ciclo del hueco sigue sin liquidar y se puede abrir (la guarda
+  // del envío es la regla de liquidación, no esta fecha). Cambia con la cadencia
+  // elegida; un período de otro ciclo se puede superponer y no la mueve.
   const suggestedStart = nextPeriodStartDate(periods, openFrequency);
   // F7: el ciclo elegido y su rango. Es la ÚNICA fuente del rango de un período
   // NUEVO: no hay campos de fecha. `startDate`/`endDate` son los valores
@@ -1950,11 +2011,20 @@ export function PayrollClient(props: PayrollClientProps) {
   const endDate = openCycle?.end_date ?? "";
   // F7: los últimos ciclos COMPLETADOS de la cadencia, el más reciente primero.
   // Cada opción lleva su etiqueta con el rango ya calculado.
-  const openCycleOptions = lastCompletedPayrollCycles({
+  const recentCycles = lastCompletedPayrollCycles({
     frequency: openFrequency,
     referenceDate: bogotaDay(),
     count: OPEN_CYCLE_OPTION_LIMIT,
   });
+  // F9: un ciclo pendiente puede ser MÁS ANTIGUO que los últimos ofrecidos si el
+  // atraso es viejo. Si el elegido no está en la lista, su opción se agrega al
+  // principio: el `<select>` nunca muestra un ciclo distinto del que el estado
+  // tiene elegido (elegir el equivocado abriría el período equivocado).
+  const openCycleOptions =
+    pinnedCycle !== null &&
+    !recentCycles.some((option) => option.end_date === pinnedCycle.end_date)
+      ? [pinnedCycle, ...recentCycles]
+      : recentCycles;
   const draftPeriods = periods.filter((row) => row.status === "borrador");
   // Guarda defensiva conservada: con ciclos el rango derivado siempre termina
   // después de empezar, así que no puede dispararse; se deja a la vista por si
@@ -1996,6 +2066,34 @@ export function PayrollClient(props: PayrollClientProps) {
   const visiblePeriods =
     statusFilter === "todos" ? periods : periods.filter((row) => row.status === statusFilter);
   const periodGroups = groupPayrollPeriodsByMonth(visiblePeriods);
+
+  /**
+   * F9: los ciclos ya CERRADOS que sigue sin liquidar la sede, por cadencia (el
+   * atraso que nadie notaba). Sale de los períodos y la planta que la pantalla
+   * YA tiene cargados: no agrega ninguna lectura —un `select` por cadencia serían
+   * N consultas para el mismo dato— y usa la MISMA función pura que el servicio,
+   * así que la lista y el resumen de la sede no pueden discrepar. Sólo el admin:
+   * es información de la nómina de la sede.
+   */
+  const pendingSettlements = props.canAdmin
+    ? pendingPayrollSettlements({
+        periods,
+        employees: props.initialEmployees,
+        referenceDate: bogotaDay(),
+      })
+    : [];
+
+  /**
+   * F9: marca de un ciclo en el selector del diálogo. Dice si ese ciclo YA tiene
+   * liquidación de su cadencia o si sigue pendiente, con la MISMA regla que usa
+   * el aviso (`isPayrollCycleSettled`), para que el selector y el aviso no puedan
+   * decir cosas distintas del mismo ciclo.
+   */
+  function cycleMarker(cycle: { start_date: string; end_date: string }): string {
+    return isPayrollCycleSettled({ periods, frequency: openFrequency, cycle })
+      ? " — ya liquidado"
+      : " — por liquidar";
+  }
 
   /**
    * Totales de un mes: SÓLO si TODOS sus períodos tienen resumen. Con uno sin
@@ -2097,6 +2195,41 @@ export function PayrollClient(props: PayrollClientProps) {
 
       <section className={sectionClass}>
         <h2 className="text-lg font-semibold">Períodos</h2>
+        {/*
+          F9: el atraso, a la vista donde el admin aterriza. Un ciclo que ya
+          cerró y no tiene liquidación es plata que la sede debe: mientras el
+          aviso no existía, una sede podía liquidar semanal durante meses y
+          nunca pagarle su ciclo a quien cobra quincenal, sin que nadie lo
+          notara. ESTADO, no evento: sigue ahí hasta que el ciclo se liquide,
+          así que va inline y persistente. `warning` (no `destructive`) porque
+          no es un fallo de la pantalla: es un pendiente que exige acción, y la
+          variante deriva su propio rol, sin escribirlo a mano.
+        */}
+        {props.canAdmin && pendingSettlements.length > 0 && (
+          <Alert variant="warning" className="mt-3">
+            <p>
+              Hay ciclos ya cerrados sin liquidar. Mientras sigan pendientes, los empleados que
+              cobran por esas cadencias no reciben su pago.
+            </p>
+            <ul className="mt-1 flex flex-col gap-1">
+              {pendingSettlements.map((entry) => (
+                <li key={`${entry.frequency}-${entry.end_date}`}>
+                  <button
+                    type="button"
+                    onClick={() => openPendingSettlement(entry)}
+                    className="text-left font-medium text-text-primary underline"
+                  >
+                    {pendingSettlementText(entry)}
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <p className="mt-1">
+              Cada uno abre el diálogo ya posicionado en su cadencia y su ciclo, listo para
+              liquidarlo.
+            </p>
+          </Alert>
+        )}
         {props.canAdmin && (
           <p className="mt-2 text-sm text-text-secondary">
             {/* PA3: el conteo se lee SIEMPRE contra el total (la lista se
@@ -2634,6 +2767,10 @@ export function PayrollClient(props: PayrollClientProps) {
                   onChange={(event) => {
                     const next = event.target.value as PayFrequency;
                     setOpenFrequency(next);
+                    // F9: al cambiar de cadencia el ciclo anclado deja de
+                    // pertenecer al selector: se suelta para que no quede una
+                    // opción de OTRA cadencia en la lista.
+                    setPinnedCycle(null);
                     // El ciclo por defecto de la cadencia nueva es el último
                     // completado: al cambiar de cadencia el selector se
                     // recalcula y no queda un ciclo de la cadencia anterior.
@@ -2679,6 +2816,7 @@ export function PayrollClient(props: PayrollClientProps) {
                     openCycleOptions.map((option) => (
                       <option key={option.end_date} value={option.end_date}>
                         {option.label}
+                        {cycleMarker(option)}
                       </option>
                     ))
                   )}

@@ -337,9 +337,17 @@ La restricción `ex_payroll_periods_no_overlap` (063) es
 `openPayrollPeriod` aplica la MISMA regla antes del INSERT: un período estorba
 sólo si comparte días **y** cae en el mismo **cubo de cadencia**
 (`periodCadenceBucket`, `coalesce(frequency, '')`). El NULL es el cubo vacío: dos
-períodos sin cadencia siguen siendo mutuamente excluyentes (protección heredada)
-y un período con cadencia convive con un heredado sin ella. La base sigue siendo
-la barrera final (23P01 → `PERIOD_OVERLAP`).
+períodos sin cadencia siguen siendo mutuamente excluyentes (protección heredada).
+La base sigue siendo la barrera final (23P01 → `PERIOD_OVERLAP`).
+
+Dos cadencias DISTINTAS siguen conviviendo sobre los mismos días a propósito (el
+semanal y el mensual se superponen por decisión del dueño). Pero un período
+NUEVO con cadencia **sí** se rechaza si se superpone con un período HEREDADO sin
+cadencia de la misma sede (`PERIOD_OVERLAP`, 409): ese heredado no lo acotaba
+ningún ciclo, así que le pagó el fijo a **todo el plantel**, y abrir encima un
+rango con cadencia pagaría dos veces los mismos días. La restricción de 063 no ve
+ese cruce —el cubo vacío es distinto del de las tres cadencias—, así que la
+guarda vive en el servicio; los períodos heredados no se reescriben.
 
 ### Exclusión del empleado de otro ciclo
 
@@ -357,15 +365,26 @@ montos en blanco (`—`), que es como ya se renderiza un empleado sin ítem; la
 tabla del período (cerrado o ya calculado) sólo lista ítems, así que no lo
 inventa con ceros.
 
-### El piso de fecha, por cadencia
+### La fecha sugerida, por cadencia (ya no es la guarda del envío)
 
 `nextPeriodStartDate` acepta la cadencia y sólo mira los períodos del MISMO
-cubo: su piso es el día siguiente al fin más lejano de ese ciclo. Un período de
-otra cadencia puede superponerse A PROPÓSITO y no impone piso. El diálogo lo
-recalcula con la cadencia elegida (`openFrequency`), así que el aviso en vivo y
-la validación de envío coinciden con la guarda del servicio y de la base. Sin
-cadencia, el cubo es el vacío (`coalesce(frequency, '')`) y sólo acotan los
-períodos sin cadencia, que es la protección heredada.
+cubo: devuelve el día siguiente al fin más lejano de ese ciclo. Un período de
+otra cadencia puede superponerse A PROPÓSITO y no la mueve. Sin cadencia, el cubo
+es el vacío (`coalesce(frequency, '')`) y sólo acotan los períodos sin cadencia,
+que es la protección heredada.
+
+F9: ese valor es SÓLO la **sugerencia** que el diálogo muestra para el ciclo que
+sigue; NO es la guarda del envío. Como piso era más estricto que el servidor
+—floorea el inicio en el día siguiente al `end_date` más lejano, no en el
+"próximo ciclo sin liquidar"—, un ciclo de un **hueco a mitad de la historia**
+(una cadencia que nunca se liquidó mientras las otras sí, o un borrador borrado
+entre ciclos cerrados) caía por debajo del piso y el diálogo rechazaba con "el
+período no puede empezar antes de X" el ciclo que el aviso acababa de ofrecer.
+La guarda del envío (`handleOpen`) es ahora la MISMA regla del aviso y de las
+marcas del selector: **un ciclo ya liquidado no se puede abrir**
+(`isPayrollCycleSettled` sobre el ciclo derivado) y cualquier ciclo sin liquidar
+pasa para que decida el servidor (`openPayrollPeriod`). La guarda de solape del
+mismo cubo se conserva, con el mensaje que nombra el período en conflicto.
 
 ## Ciclo cerrado del período (F7)
 
@@ -414,11 +433,13 @@ largo de otra cadencia son `false`.
 `start_date`/`end_date` siguen aceptándose por compatibilidad, pero son una
 segunda opinión: si no coinciden con el ciclo derivado, el envío se rechaza
 (`VALIDATION`). `openPayrollPeriod` DERIVA `start_date`/`end_date` con
-`payrollCycleRange` y no acepta un rango arbitrario; la guarda de solape, el
-piso de fecha y el mapeo de `23P01` siguen vigentes. Con los ciclos embaldosando
-el calendario, la guarda por cadencia es lo que impide liquidar dos veces el
-mismo ciclo: el semanal y el mensual se superponen a propósito, dos del mismo
-ciclo no.
+`payrollCycleRange` y no acepta un rango arbitrario; la guarda de solape, la
+regla de ciclo ya liquidado (la del envío del diálogo) y el mapeo de `23P01`
+siguen vigentes. Con los ciclos embaldosando el calendario, la guarda por
+cadencia es lo que impide liquidar dos veces el mismo ciclo: el semanal y el
+mensual se superponen a propósito, dos del mismo ciclo no. Un período heredado
+sin cadencia tampoco se puede tapar con uno nuevo con cadencia: ver "La guarda
+de solape, acotada por cadencia".
 
 Un período NUEVO sin cadencia ya no es válido: "sin cadencia" desapareció del
 diálogo. Los períodos HEREDADOS con `frequency = NULL` no se tocan y siguen
@@ -440,6 +461,84 @@ ciclos muestra su rango ya calculado (p. ej. `27 sep – 3 oct 2026`), y debajo 
 lee el rango derivado en texto. Al cambiar la cadencia, el selector se recalcula
 y se ofrece el último ciclo completado de la cadencia nueva. La nota de la
 primera liquidación (F5) y los avisos del diálogo siguen en su lugar.
+
+## Ciclos cerrados que faltan por liquidar (F9)
+
+Pedido del dueño (2026-10-02): la pantalla de períodos no le decía si la sede
+venía atrasada. Su ejemplo: si el ciclo quincenal venció y no se liquidó, la
+pantalla tiene que DECIRLO —y lo mismo el mensual— siempre que haya empleados
+con esa cadencia. Sin ese aviso, una sede podía liquidar semanal durante dos
+meses y nunca hacer una sola liquidación quincenal para quien cobra así; nadie
+lo notaba hasta mucho después.
+
+### El detector
+
+`pendingPayrollSettlements({ periods, employees, referenceDate, limit })` en
+`schemas.ts` es puro y devuelve los ciclos **pendientes**: para cada cadencia,
+todo ciclo ya CERRADO (su sábado es anterior a `referenceDate`, la misma cuenta
+de F7) que NO esté cubierto por un período de la sede —de su MISMA cadencia, o
+por uno heredado sin cadencia, que le pagó a todo el plantel— y que tenga al
+menos un empleado. Cada entrada lleva `frequency`, el rango del
+ciclo, su `label`, `employeeCount` y hasta `PENDING_SETTLEMENT_NAME_LIMIT` (3)
+nombres.
+
+- **Cubierto** = un período de la sede se solapa con el ciclo, aunque no coincida
+  exactamente, y **o bien** es de la MISMA cadencia **o bien** es un período
+  HEREDADO sin cadencia (`isPayrollCycleSettled`, que reutiliza
+  `periodCadenceBucket` y `rangesOverlap`). Un período de OTRA cadencia NO tacha
+  el ciclo: la guarda de solape (063) los trata como cubos distintos y deja que se
+  superpongan a propósito, así que el ciclo de una cadencia sigue sin su
+  liquidación de esa cadencia. Un heredado sin cadencia, en cambio, **cubre el
+  ciclo de CUALQUIER cadencia**: no lo acotaba ningún ciclo, así que le pagó el
+  fijo a todo el plantel y esos días ya salieron de la nómina; reportarlo como
+  pendiente era el aviso gritando de más, y un aviso que grita de más deja de
+  mirarse. La cobertura es SIMÉTRICA con la apertura: `openPayrollPeriod` también
+  rechaza un período nuevo con cadencia que se superponga con un heredado, por los
+  mismos días doblemente pagados.
+- **Sólo con gente**: una cadencia sin ningún empleado ACTIVO no se reporta.
+  `pay_frequency` `NULL` (o fuera del catálogo) es ausencia de cadencia, no una
+  cadencia más.
+- **El ciclo en curso no se reporta**: sólo cuenta lo ya cerrado, o sea el sábado
+  anterior a la fecha de referencia.
+
+### El límite: la historia de la sede, no la del calendario
+
+El recorrido se detiene en el **arranque de la sede**: la fecha de inicio más
+antigua de sus períodos. Antes de eso no había nada que liquidar, así que no se
+reporta historia anterior (nada de arrastrar años de ciclos de un negocio que no
+existía). Consecuencia directa y deliberada: **sin ningún período no se reporta
+NADA** —una sede sin historia no tiene atraso—, y un ciclo que terminó antes del
+primer período tampoco aparece.
+
+### El tope
+
+`PENDING_SETTLEMENT_LIMIT` (3) ciclos **por cadencia**, tomando los más
+recientes: una sede atrasada hace meses ve que el atraso existe sin que el aviso
+crezca sin control, y una cadencia muy atrasada no tapa a las otras dos. La lista
+sale ordenada con lo MÁS ATRASADO primero (por fecha de cierre, y a igualdad por
+el orden del catálogo), y los nombres van en orden determinista.
+
+### En pantalla
+
+El admin ve el aviso arriba de la sección **Períodos** (un `Alert` de aviso,
+porque es un pendiente que exige acción, no un fallo de la pantalla):
+
+> Falta liquidar el ciclo quincenal 20 sep – 3 oct 2026 (3 empleados con esa
+> cadencia: Ana López, Beto Ruiz y Caro Díaz).
+
+Cada entrada es un botón que abre el diálogo **ya posicionado** en su cadencia y
+su ciclo, así el ciclo atrasado no hay que buscarlo a mano. Además, el selector
+de ciclos marca cada opción con **`— ya liquidado`** o **`— por liquidar`**,
+calculado con la MISMA regla que el aviso (`isPayrollCycleSettled`), para que la
+elección deje de ser confusa. Cuando el ciclo pendiente es más antiguo que los
+últimos ofrecidos, su opción se agrega igual al selector: elegir un ciclo
+distinto del que el estado tiene elegido abriría el período equivocado.
+
+La pantalla deriva la lista de los períodos y la planta que YA llegan leídos (el
+resumen de la sede y `listAllEmployees`): **no agrega ninguna lectura por
+cadencia**. El servicio la expone además en `listPayrollOverview`, con UNA lectura
+más de la planta (paginada y acotada por sede) para que el resumen de la sede sea
+completo por sí solo.
 
 ## Detalle de la liquidación: facturas y vales (F6)
 
