@@ -2580,10 +2580,25 @@ function normalizar(sql: string): string {
 
 const DIR_MIGRACIONES = join(process.cwd(), "supabase", "migrations");
 
-/** Los archivos de migración, en orden, SIN el que esta unidad escribe. */
+/**
+ * Las migraciones que la 074 tiene DELANTE: las numeradas por debajo de ella, en
+ * orden. NO las de después, y el corte es deliberado.
+ *
+ * La 074 reescribe el inventario que existía cuando se corrió. Una migración
+ * posterior que declare otra unicidad o exclusión por sede —o que vuelva a
+ * declarar un objeto que la 074 ya reescribió— no es un defecto de la 074: es de
+ * la unidad que le corresponda, y la 074 no puede soltar un objeto que no existía
+ * cuando se aplicó. Sin este corte, la 075 que ya está en el disco —y cualquier
+ * 076— puede voltear el inventario derivado y hacer caer una guarda que está
+ * correcta, con un mensaje que señala a la 074 un defecto que no tiene.
+ *
+ * El corte conserva la alarma para lo que sí es alarma: cualquier unicidad o
+ * exclusión por sede declarada ANTES de la 074 y que la 074 no reescriba sigue
+ * haciendo fallar la prueba.
+ */
 function migracionesPrevias(): string[] {
   return readdirSync(DIR_MIGRACIONES)
-    .filter((n) => n.endsWith(".sql") && !n.startsWith("074_"))
+    .filter((n) => n.endsWith(".sql") && n < "074_")
     .sort();
 }
 
@@ -2802,6 +2817,269 @@ function revisarSedeLess(
   }
 
   return falta;
+}
+
+/**
+ * Un delimitador de cadena con `$`: `$$` o `$etiqueta$`. Es la forma EXACTA que
+ * acepta el léxico de PostgreSQL —una `$` suelta, o una pegada al identificador,
+ * no encierran nada— y por eso es la única forma que este archivo debe usar.
+ */
+const DELIMITADOR_DOLLAR = /^(?:\$\$|\$[A-Za-z_][A-Za-z0-9_]*\$)/;
+
+/** Todos los delimitadores bien formados que el archivo declara, en orden. */
+function etiquetasDollar(sql: string): string[] {
+  return sql.match(/\$\$|\$[A-Za-z_][A-Za-z0-9_]*\$/g) ?? [];
+}
+
+/** Un delimitador con `$` que apareció dentro de un literal de comilla simple. */
+interface LitoTragado {
+  /** La línea del delimitador tragado. */
+  linea: number;
+  /** La línea donde se abrió el literal que lo tragó. */
+  abre: number;
+  etiqueta: string;
+}
+
+/** Una comilla que CIERRA un literal y delante de la cual queda un identificador. */
+interface ComillaPegada {
+  /** La línea de la comilla que cierra el literal. */
+  linea: number;
+  /** El identificador pegado: la palabra que se quedó fuera del literal. */
+  palabra: string;
+}
+
+/**
+ * El motor de la guarda de literales: devuelve una lista de FALTAS (vacía = el
+ * archivo cumple). Trabaja sobre el TEXTO, como `revisarSedeLess`, para que los
+ * controles negativos puedan inyectarle un 074 sintético.
+ *
+ * Exige cinco cosas, y las cinco importan por un motivo DISTINTO —las dos
+ * primeras son la misma familia de errata de etiqueta, las dos siguientes son las
+ * que impedían que el archivo se analizara, y la quinta es la que la paridad no
+ * puede ver:
+ *
+ *   * que cada `$` abra o cierre un delimitador BIEN FORMADO (`$$` o
+ *     `$etiqueta$`): un `s$q$` deja la `$` pegada al identificador, que es
+ *     justo la errata que empalma el cuerpo de una consulta con el de la otra;
+ *   * que dentro de una cadena CON etiqueta no aparezca OTRA: un `$$` ahí es
+ *     un delimitador que no cierra nada. El anidamiento sólo se admite dentro
+ *     del `$$` del bloque `DO`, que es donde las consultas `$q$` viven;
+ *   * que cada etiqueta distinta aparezca un número PAR de veces, que es el
+ *     emparejamiento: un par impar significa un literal sin terminar, y el
+ *     archivo entero deja de analizarse en la sentencia donde se abre;
+ *   * que dentro del cuerpo de cada `DO $$ … $$` no quede un literal de COMILLA
+ *     SIMPLE sin cerrar. Ésa es la que rompía el archivo: una comilla de menos en
+ *     la etiqueta de una fila del `VALUES` cierra el literal antes de tiempo, el
+ *     paréntesis de la fila se consume de más, y el analizador llega a la
+ *     consulta que sigue esperando `LOOP`.
+ *   * y —en TODO el archivo, no sólo en los bloques `DO`— que ninguna comilla
+ *     que CIERRA un literal lleve un identificador pegado detrás. Es la quinta
+ *     porque las otras cuatro no la ven: una comilla sin doblar que abre una
+ *     palabra por dentro sigue dejando el número de comillas PAR, así que el
+ *     conteo, la paridad y el «literal sin cerrar» dan el archivo por bueno
+ *     mientras la base responde 42601. El detalle de por qué la posición del
+ *     signo es la única señal está en `contarLiteralesSimples`.
+ */
+function revisarLiterales(fuente: string): string[] {
+  const sql = sqlDeMigracion(fuente);
+  const falta: string[] = [];
+  const lineaDe = (pos: number) => sql.slice(0, pos).split("\n").length;
+  const abiertas: Array<{ etiqueta: string; linea: number; desde: number }> = [];
+  const cuerposDo: Array<{ desde: number; hasta: number }> = [];
+
+  let i = 0;
+  while (i < sql.length) {
+    if (sql[i] !== "$") {
+      i += 1;
+      continue;
+    }
+    const cierre = DELIMITADOR_DOLLAR.exec(sql.slice(i));
+    if (!cierre) {
+      falta.push(`línea ${lineaDe(i)}: \`$\` suelta, no abre ni cierra un delimitador`);
+      i += 1;
+      continue;
+    }
+    const etiqueta = cierre[0];
+    const previa = i > 0 ? sql[i - 1] : "";
+    if (/[A-Za-z0-9_]/.test(previa)) {
+      falta.push(
+        `línea ${lineaDe(i)}: \`${previa}${etiqueta}\` — la etiqueta no puede ir pegada a un identificador; cierre con \`${etiqueta}\``,
+      );
+      i += etiqueta.length;
+      continue;
+    }
+    const abierta = abiertas[abiertas.length - 1];
+    if (abierta && abierta.etiqueta !== etiqueta && abierta.etiqueta !== "$$") {
+      falta.push(
+        `línea ${lineaDe(i)}: \`${etiqueta}\` dentro de la cadena \`${abierta.etiqueta}\` abierta en la línea ${abierta.linea}`,
+      );
+      i += etiqueta.length;
+      continue;
+    }
+    if (abierta && abierta.etiqueta === etiqueta) {
+      // El cuerpo del `DO $$ … $$` se vuelve a recorrer como PL/pgSQL más abajo,
+      // y empieza DESPUÉS del delimitador de apertura: si el recorrido arrancara
+      // en él, el propio `$$` se tragaría el cuerpo entero como una cadena opaca
+      // y no habría nada que contar.
+      if (etiqueta === "$$") {
+        cuerposDo.push({ desde: abierta.desde + etiqueta.length, hasta: i });
+      }
+      abiertas.pop();
+    } else {
+      abiertas.push({ etiqueta, linea: lineaDe(i), desde: i });
+    }
+    i += etiqueta.length;
+  }
+  for (const abierta of abiertas) {
+    falta.push(`línea ${abierta.linea}: la cadena \`${abierta.etiqueta}\` nunca se cierra`);
+  }
+
+  // Y el conteo por etiqueta: par es emparejada, impar es un literal colgado.
+  const conteo = new Map<string, number>();
+  for (const etiqueta of etiquetasDollar(sql)) {
+    conteo.set(etiqueta, (conteo.get(etiqueta) ?? 0) + 1);
+  }
+  for (const [etiqueta, veces] of conteo) {
+    if (veces % 2 !== 0) falta.push(`\`${etiqueta}\` aparece ${veces} veces y no queda emparejada`);
+  }
+
+  // Y los literales simples del cuerpo de cada `DO $$ … $$`.
+  for (const cuerpo of cuerposDo) {
+    const simples = contarLiteralesSimples(sql, cuerpo.desde, cuerpo.hasta);
+    for (const pegada of simples.pegadas) {
+      falta.push(
+        `línea ${pegada.linea}: la comilla que cierra el literal deja pegada la palabra \`${pegada.palabra}\` — en un literal hay que doblarla (\`''${pegada.palabra}''\`); así la palabra se sale del literal y PostgreSQL responde 42601`,
+      );
+    }
+    for (const tragado of simples.tragados) {
+      falta.push(
+        `línea ${tragado.linea}: el literal de comilla simple que abre en la línea ${tragado.abre} se tragó el delimitador \`${tragado.etiqueta}\` — el lector perdió la cuenta en ese punto`,
+      );
+    }
+    for (const linea of simples.sinCerrar) {
+      falta.push(
+        `línea ${linea}: el literal de comilla simple que abre aquí no se cierra antes del final del bloque \`DO $$ … $$\``,
+      );
+    }
+  }
+
+  // Y la misma regla FUERA de los bloques `DO`: un literal suelto —un
+  // `COMMENT`, un `RAISE`, una sentencia de nivel superior— también puede
+  // perder una comilla al medio, y ahí no hay bloque que lo revise. En este
+  // recorrido los cuerpos con `$$` son opacos, así que lo ya contado arriba no
+  // aparece dos veces.
+  const exterior = contarLiteralesSimples(sql, 0, sql.length);
+  for (const pegada of exterior.pegadas) {
+    falta.push(
+      `línea ${pegada.linea}: la comilla que cierra el literal deja pegada la palabra \`${pegada.palabra}\` — en un literal hay que doblarla (\`''${pegada.palabra}''\`); así la palabra se sale del literal y PostgreSQL responde 42601`,
+    );
+  }
+
+  return falta;
+}
+
+/**
+ * Recorre el texto COMO PL/pgSQL y cuenta los literales de comilla simple: las
+ * comillas dobladas `''` son una comilla DENTRO del literal, no un cierre, y un
+ * literal con `$` es contenido opaco que se salta entero. Es lo que permite
+ * distinguir un literal bien cerrado de uno que se tragó el resto del cuerpo.
+ *
+ * Deja tres rastros, y los tres son del mismo defecto leído de tres maneras:
+ *
+ *   * `tragados`: un delimitador con `$` apareció DENTRO de un literal simple.
+ *     En este bloque ninguna construcción legítima lo hace —las consultas `$q$`
+ *     están fuera de todo literal— así que es la línea exacta donde el lector
+ *     perdió la cuenta, que no es la misma que la del final del litigio;
+ *   * `sinCerrar`: el bloque terminó con un literal abierto;
+ *   * `pegadas`: una comilla que CIERRA un literal tiene un identificador pegado
+ *     detrás. Es el rastro que la paridad NO ve, y por eso hace falta: en
+ *     `'… WHERE status = 'borrador')'` hay CUATRO comillas —un número par, un
+ *     conteo parejo, ningún literal sin cerrar— y sin embargo `borrador` queda
+ *     FUERA del literal, como identificador suelto, que es exactamente lo que
+ *     PostgreSQL rechaza con 42601.
+ *
+ * POR QUÉ LA POSICIÓN DEL SIGNO ES LA SEÑAL. En el léxico de PostgreSQL la
+ * comilla que abre va DESPUÉS del prefijo (`E'…'`, `B'…'`, `X'…'`, `U&'…'`) y la
+ * que cierra va al final del literal, nunca pegada a nada: ningún constructor
+ * continúa con una letra, un dígito o un `_` sin separador. Así que una
+ * comilla de cierre seguida de `[A-Za-z0-9_$]` no es una forma rara de escribir
+ * un literal: es la única forma que tiene una comilla Suelta de cerrar donde
+ * debía seguir abierta, con la palabra de adentro escapada por delante. Y el
+ * otro lado —la apertura— NO se puede usar para esto, porque `E'…'` pega una
+ * letra a la comilla de apertura en cada literal con escapes de este archivo.
+ * Lo que se reporta es la PALABRA entera pegada, no una letra: el mensaje dice
+ * qué escribir (`''palabra''`) sin que el lector tenga que volver al archivo.
+ *
+ * `desde`/`hasta` son posiciones en `sql`, y las líneas que devuelve son de `sql`.
+ */
+function contarLiteralesSimples(
+  sql: string,
+  desde: number,
+  hasta: number,
+): {
+  abiertos: number;
+  cerrados: number;
+  tragados: LitoTragado[];
+  sinCerrar: number[];
+  pegadas: ComillaPegada[];
+} {
+  const lineaDe = (pos: number) => sql.slice(0, pos).split("\n").length;
+  const tragados: LitoTragado[] = [];
+  const sinCerrar: number[] = [];
+  const pegadas: ComillaPegada[] = [];
+  let dentro = false;
+  let abierta = 0;
+  let abiertos = 0;
+  let cerrados = 0;
+
+  let i = desde;
+  while (i < hasta) {
+    const ch = sql[i];
+    if (dentro && ch === "$") {
+      const delim = DELIMITADOR_DOLLAR.exec(sql.slice(i, hasta));
+      if (delim) {
+        tragados.push({ linea: lineaDe(i), abre: abierta, etiqueta: delim[0] });
+        const cierre = sql.indexOf(delim[0], i + delim[0].length);
+        i = cierre === -1 || cierre > hasta ? hasta : cierre + delim[0].length;
+        continue;
+      }
+    }
+    if (!dentro && ch === "-" && sql[i + 1] === "-") {
+      const salto = sql.indexOf("\n", i);
+      i = salto === -1 || salto > hasta ? hasta : salto + 1;
+      continue;
+    }
+    if (!dentro && ch === "$") {
+      const delim = DELIMITADOR_DOLLAR.exec(sql.slice(i, hasta));
+      if (delim) {
+        const cierre = sql.indexOf(delim[0], i + delim[0].length);
+        i = cierre === -1 || cierre > hasta ? hasta : cierre + delim[0].length;
+        continue;
+      }
+    }
+    if (ch === "'") {
+      if (dentro && sql[i + 1] === "'") {
+        i += 2;
+        continue;
+      }
+      dentro = !dentro;
+      if (dentro) {
+        abiertos += 1;
+        abierta = lineaDe(i);
+      } else {
+        cerrados += 1;
+        // La comilla que acaba de cerrar: si detrás viene un identificador, la
+        // palabra se salió del literal. Se registra acá, y no al final, porque
+        // la posición del signo es lo único que distingue el defecto del par
+        // de comillas bien formado que lo contiene.
+        const pegado = /^[A-Za-z0-9_$]+/.exec(sql.slice(i + 1, hasta));
+        if (pegado) pegadas.push({ linea: lineaDe(i), palabra: pegado[0] });
+      }
+    }
+    i += 1;
+  }
+  if (dentro) sinCerrar.push(abierta);
+  return { abiertos, cerrados, tragados, sinCerrar, pegadas };
 }
 
 describe("migración 074_sede_less_constraints.sql (M3b)", () => {
@@ -3023,6 +3301,121 @@ describe("migración 074_sede_less_constraints.sql (M3b)", () => {
     expect(revisarSedeLess(aflojado, esperado).join(" | ")).toContain(
       "WHERE where employee_code is not null",
     );
+  });
+
+  it("cada literal del archivo está bien formado y emparejado", () => {
+    expect(revisarLiterales(raw)).toEqual([]);
+    // Y no pasa en vacío: el archivo declara UN bloque `DO $$` y DIEZ consultas
+    // `$q$`, o sea veinte delimitadores. Es el conteo que la paridad protege.
+    const etiquetas = etiquetasDollar(sql);
+    expect(etiquetas.filter((e) => e === "$$")).toHaveLength(2);
+    expect(etiquetas.filter((e) => e === "$q$")).toHaveLength(20);
+  });
+
+  it("ninguna comilla cierra un literal dejando una palabra pegada (074 y 075)", () => {
+    // La clase que la paridad NO ve: un número PAR de comillas con una palabra
+    // escapada por delante. Se recorre el archivo entero —no sólo el bloque
+    // `DO`— porque un literal suelto (`COMMENT`, `RAISE`, sentencia de nivel
+    // superior) pierde la comilla igual de fácil. 075 entra por el mismo motor:
+    // sus literales viven en el `RAISE` del pre-vuelo, y sus consultas de sólo
+    // lectura son comentarios que el lector ni toca.
+    const con075 = readFileSync(
+      join(DIR_MIGRACIONES, "075_commission_rule_install_key.sql"),
+      "utf8",
+    );
+    expect(revisarLiterales(raw), "074").toEqual([]);
+    expect(revisarLiterales(con075), "075").toEqual([]);
+
+    // Y la etiqueta de la fila del borrador sigue MOSTRANDO la palabra entre
+    // comillas: lo que se dobló es el signo, no el texto.
+    expect(raw).toContain("WHERE status = ''borrador'')',");
+  });
+
+  it("control negativo: una comilla sin doblar que escapa una palabra queda señalada", () => {
+    // El defecto de la 074 reinyectado tal cual: la etiqueta de la fila del
+    // borrador vuelve a llevar `status = 'borrador'` con la comilla Suelta.
+    const reinfectado = raw.replace(
+      "WHERE status = ''borrador'')',",
+      "WHERE status = 'borrador')',",
+    );
+    expect(reinfectado).not.toBe(raw);
+    const falta = revisarLiterales(reinfectado).join(" | ");
+    // Lo nombra por la palabra que se salió del literal y por su línea, que es
+    // más útil que un conteo: dice QUÉ corregir y DÓNDE.
+    expect(falta).toContain("deja pegada la palabra `borrador`");
+    expect(falta).toContain("línea 256");
+    // Y ÉSTA es la prueba de que la paridad sola no alcanza: la línea rota tiene
+    // CUATRO comillas —un número PAR—, así que el conteo queda parejo, ningún
+    // literal queda abierto y ninguna de las otras reglas se activa. La única
+    // falla es la de la posición del signo.
+    const lineaRota = reinfectado.split("\n")[255];
+    expect(lineaRota).toContain("status = 'borrador'");
+    expect(lineaRota.match(/'/g)).toHaveLength(4);
+    expect(revisarLiterales(reinfectado)).toHaveLength(1);
+    expect(falta).not.toContain("no se cierra antes del final");
+
+    // Y el detector no dispara con lo único que PostgreSQL SÍ permite pegado a
+    // una comilla: el prefijo de la que ABRE (`E'…'`, `B'…'`, `X'…'`). La regla
+    // mira el cierre, y el cierre nunca lleva prefijo.
+    const conPrefijo = raw.replace(
+      "    EXECUTE v_ch.consulta INTO v_detalle;",
+      "    v_informe := v_informe || E'\\n  ';\n    EXECUTE v_ch.consulta INTO v_detalle;",
+    );
+    expect(conPrefijo).not.toBe(raw);
+    expect(revisarLiterales(conPrefijo)).toEqual([]);
+  });
+
+  it("control negativo: una etiqueta pegada al identificador queda señalada", () => {
+    // La errata exacta que estuvo en el archivo: el cierre queda `s$q$)` en vez
+    // de `$q$)`, y desde ahí el cuerpo se empalma con la consulta que sigue.
+    const conErrata = raw.replace("LIMIT 5)$q$),", "LIMIT 5) s$q$),");
+    expect(conErrata).not.toBe(raw);
+    const falta = revisarLiterales(conErrata).join(" | ");
+    expect(falta).toContain("la etiqueta no puede ir pegada a un identificador");
+  });
+
+  it("control negativo: un literal sin cerrar y un $ suelto quedan señalados", () => {
+    // Una etiqueta de más: `$q$` queda con una apertura y un cierre —que es par—
+    // pero el cuerpo que sigue se lleva por delante el resto del archivo.
+    const descolgado = raw.replace("END $$;", "$q$");
+    expect(descolgado).not.toBe(raw);
+    expect(revisarLiterales(descolgado).join(" | ")).toContain("nunca se cierra");
+
+    // Y una `$` que no forma delimitador: el error más chato de todos.
+    const suelta = raw.replace("DO $$", "DO $");
+    expect(suelta).not.toBe(raw);
+    expect(revisarLiterales(suelta).join(" | ")).toContain("`$` suelta");
+  });
+
+  it("control negativo: un literal simple sin cerrar queda señalado por su línea", () => {
+    // El defecto que REALMENTE impedía que el archivo se analizara, reinyectado
+    // tal cual: la etiqueta de la fila de la exclusión pierde la comilla que
+    // dobla la de `'[]'`, el literal cierra antes de tiempo y el resto del
+    // cuerpo queda desincronizado hasta el final del bloque.
+    const sinComilla = raw.replace("end_date, ''[]''))',", "end_date, '[]''))',");
+    expect(sinComilla).not.toBe(raw);
+    const falta = revisarLiterales(sinComilla).join(" | ");
+    expect(falta).toContain("literal de comilla simple");
+    // Y nombra la línea donde el literal quedó abierto, que es la 266.
+    expect(falta).toContain("línea 266");
+  });
+
+  it("control negativo: el lector de PL/pgSQL no confunde las comillas dobladas", () => {
+    // Las comillas dobladas `''` SON una comilla dentro del literal: contarlas
+    // como cierre y apertura haría que un literal bien cerrado pareciera roto.
+    const dobladas = raw.replace(
+      "    EXECUTE v_ch.consulta INTO v_detalle;",
+      "    v_informe := v_informe || '''';\n    EXECUTE v_ch.consulta INTO v_detalle;",
+    );
+    expect(dobladas).not.toBe(raw);
+    expect(revisarLiterales(dobladas)).toEqual([]);
+
+    // Y un literal simple a medio cerrar en ese mismo punto sí se ve.
+    const aMedio = raw.replace(
+      "    EXECUTE v_ch.consulta INTO v_detalle;",
+      "    v_informe := v_informe || 'a medio cerrar;\n    EXECUTE v_ch.consulta INTO v_detalle;",
+    );
+    expect(revisarLiterales(aMedio).join(" | ")).toContain("literal de comilla simple");
   });
 
   it("control negativo: el detector no es un sello de goma", () => {

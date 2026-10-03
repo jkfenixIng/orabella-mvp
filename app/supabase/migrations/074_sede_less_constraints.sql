@@ -193,7 +193,7 @@ BEGIN
                 GROUP BY code, name
                HAVING count(*) > 1
                 ORDER BY code, name
-                LIMIT 5) s$q$),
+                LIMIT 5)$q$),
         ('payment_methods_sede_id_code_key -> UNIQUE (code)',
          $q$SELECT nullif(string_agg(detalle, E' ; '), '') FROM (
                SELECT code || E' -> filas ' || string_agg(id::text, ', ' ORDER BY id) AS detalle
@@ -201,7 +201,7 @@ BEGIN
                 GROUP BY code
                HAVING count(*) > 1
                 ORDER BY code
-                LIMIT 5) s$q$),
+                LIMIT 5)$q$),
         ('products_sede_id_sku_key -> UNIQUE (sku)',
          $q$SELECT nullif(string_agg(detalle, E' ; '), '') FROM (
                SELECT sku || E' -> filas ' || string_agg(id::text, ', ' ORDER BY id) AS detalle
@@ -209,7 +209,7 @@ BEGIN
                 GROUP BY sku
                HAVING count(*) > 1
                 ORDER BY sku
-                LIMIT 5) s$q$),
+                LIMIT 5)$q$),
         ('invoices_sede_id_consecutive_number_key -> UNIQUE (consecutive_number)',
          $q$SELECT nullif(string_agg(detalle, E' ; '), '') FROM (
                SELECT consecutive_number::text || E' -> filas ' || string_agg(id::text, ', ' ORDER BY id) AS detalle
@@ -217,7 +217,7 @@ BEGIN
                 GROUP BY consecutive_number
                HAVING count(*) > 1
                 ORDER BY consecutive_number
-                LIMIT 5) s$q$),
+                LIMIT 5)$q$),
         ('cash_registers_sede_id_name_key -> UNIQUE (name)',
          $q$SELECT nullif(string_agg(detalle, E' ; '), '') FROM (
                SELECT name || E' -> filas ' || string_agg(id::text, ', ' ORDER BY id) AS detalle
@@ -225,7 +225,7 @@ BEGIN
                 GROUP BY name
                HAVING count(*) > 1
                 ORDER BY name
-                LIMIT 5) s$q$),
+                LIMIT 5)$q$),
         ('cash_denominations_sede_id_value_key -> UNIQUE (value)',
          $q$SELECT nullif(string_agg(detalle, E' ; '), '') FROM (
                SELECT value::text || E' -> filas ' || string_agg(id::text, ', ' ORDER BY id) AS detalle
@@ -233,7 +233,7 @@ BEGIN
                 GROUP BY value
                HAVING count(*) > 1
                 ORDER BY value
-                LIMIT 5) s$q$),
+                LIMIT 5)$q$),
         -- Los tres índices parciales, con SU WHERE exacto.
         ('uq_employees_sede_code -> (employee_code, WHERE employee_code IS NOT NULL AND btrim(employee_code) <> '''')',
          $q$SELECT nullif(string_agg(detalle, E' ; '), '') FROM (
@@ -243,7 +243,7 @@ BEGIN
                 GROUP BY employee_code
                HAVING count(*) > 1
                 ORDER BY employee_code
-                LIMIT 5) s$q$),
+                LIMIT 5)$q$),
         ('uq_invoices_sede_idempotency_key -> (idempotency_key, WHERE idempotency_key IS NOT NULL)',
          $q$SELECT nullif(string_agg(detalle, E' ; '), '') FROM (
                SELECT idempotency_key::text || E' -> filas ' || string_agg(id::text, ', ' ORDER BY id) AS detalle
@@ -252,8 +252,8 @@ BEGIN
                 GROUP BY idempotency_key
                HAVING count(*) > 1
                 ORDER BY idempotency_key
-                LIMIT 5) s$q$),
-        ('uq_payroll_draft_per_range -> (start_date, end_date, WHERE status = 'borrador')',
+                LIMIT 5)$q$),
+        ('uq_payroll_draft_per_range -> (start_date, end_date, WHERE status = ''borrador'')',
          $q$SELECT nullif(string_agg(detalle, E' ; '), '') FROM (
                SELECT start_date::text || E' a ' || end_date::text || E' -> filas ' || string_agg(id::text, ', ' ORDER BY id) AS detalle
                  FROM public.payroll_periods
@@ -261,9 +261,9 @@ BEGIN
                 GROUP BY start_date, end_date
                HAVING count(*) > 1
                 ORDER BY start_date, end_date
-                LIMIT 5) s$q$),
+                LIMIT 5)$q$),
         -- La exclusión: dos períodos de la MISMA cadencia con días en común.
-        ('ex_payroll_periods_no_overlap -> (coalesce(frequency, '''') x daterange(start_date, end_date, '[]''))',
+        ('ex_payroll_periods_no_overlap -> (coalesce(frequency, '''') x daterange(start_date, end_date, ''[]''))',
          $q$SELECT nullif(string_agg(detalle, E' ; '), '') FROM (
                SELECT coalesce(a.frequency, '(sin cadencia)') || E': ' || a.id::text
                       || E' [' || a.start_date::text || E' a ' || a.end_date::text || E'] x '
@@ -275,7 +275,7 @@ BEGIN
                   AND a.id < b.id
                   AND daterange(a.start_date, a.end_date, '[]') && daterange(b.start_date, b.end_date, '[]')
                 ORDER BY a.start_date, b.start_date
-                LIMIT 5) s$q$)
+                LIMIT 5)$q$)
       ) AS t(etiqueta, consulta)
   LOOP
     EXECUTE v_ch.consulta INTO v_detalle;
