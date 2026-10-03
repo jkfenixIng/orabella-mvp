@@ -382,7 +382,15 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
 
   if (!input.id) {
     const { data: creado, error: altaError } = await db.rpc("upsert_employee_atomic", {
-      p_employee: { sede_id: sedeId, ...columnasDelLegajo },
+      // El legajo NO lleva la sede: `employees.sede_id` se borra en la 077 y la
+      // guarda de `upsert_employee_atomic` que exigía la clave desaparece con
+      // ella. Mandarla sería mandar un dato que nadie lee.
+      //
+      // La cuenta de acceso SÍ la lleva: `users.sede_id` sobrevive a propósito
+      // (es el anclaje de la cuenta a la instalación y el origen de
+      // `session.sedeId`), así que `p_create_user.sede_id` se sigue mandando
+      // abajo, y es la que ancla la fila de `users` en la instalación única.
+      p_employee: columnasDelLegajo,
       p_user_id: userId,
       p_create_user: userId
         ? null
