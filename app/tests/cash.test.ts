@@ -4614,6 +4614,7 @@ describe("cash: CL-10 el cierre y su arqueo de cierre son UNA transacción", () 
         method_differences: [],
       },
     });
+    expect(audit?.payload).not.toHaveProperty("sede_id");
   });
 
   it("la CARRERA del cierre se RECHAZA (SHIFT_ALREADY_CLOSED) y no deja los conteos de la perdedora", async () => {
@@ -4882,6 +4883,7 @@ describe("cash: CL-10 el reconteo y su detalle son UNA transacción", () => {
         corrected: { counted_cash: 400000, base_left: 200000 },
       },
     });
+    expect(audit?.payload).not.toHaveProperty("sede_id");
   });
 
   it("la CARRERA del reconteo se RECHAZA (ALREADY_RECOUNTED) y no deja nada de la perdedora", async () => {

@@ -1377,7 +1377,6 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   // punto de fallo de estado (`writeAudit` no lanza), así que a lo sumo falta la
   // fila de auditoría, nunca una escritura a medias.
   await writeAudit({
-    sede_id: actor.sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.INVOICE_CREATED,
     entity: "invoices",
@@ -1507,7 +1506,6 @@ export async function annulInvoice(
   }
 
   await writeAudit({
-    sede_id: sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.INVOICE_ANNULLED,
     entity: "invoices",
@@ -1808,7 +1806,6 @@ export async function editInvoiceItems(
   // fila de auditoría, nunca una escritura a medias. Las cifras son las de
   // siempre, con el motivo y los movimientos que el servicio CREYÓ escribir.
   await writeAudit({
-    sede_id: actor.sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.INVOICE_EDITED,
     entity: "invoices",
@@ -2134,7 +2131,6 @@ export async function editEmittedInvoiceItems(
   }
 
   await writeAudit({
-    sede_id: actor.sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.INVOICE_EDITED,
     entity: "invoices",

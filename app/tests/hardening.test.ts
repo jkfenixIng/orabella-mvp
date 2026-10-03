@@ -17,33 +17,41 @@ function readMigration(name: string): string {
 describe("audit payload (T8, sin red)", () => {
   it("construye el payload con metadata por defecto {}", () => {
     const payload = buildAuditPayload({
-      sede_id: "sede-1",
       user_id: "user-1",
       action: AUDIT_ACTIONS.INVOICE_ANNULLED,
       entity: "invoices",
       entity_id: "inv-1",
     });
     expect(payload).toEqual({
-      sede_id: "sede-1",
       user_id: "user-1",
       action: "invoice.annulled",
       entity: "invoices",
       entity_id: "inv-1",
       metadata: {},
     });
+    // La instalación es una sola: la sede dejó de ser parte del rastro y el
+    // payload no la lleva NI con la clave presente.
+    expect(payload).not.toHaveProperty("sede_id");
   });
 
-  it("normaliza sede/user nulos y conserva metadata", () => {
+  it("el login fallido de un documento desconocido deja rastro completo (sin sede)", () => {
+    // El caso que antes escribía `sede_id` NULL: el documento no existe, así que
+    // no hay usuario ni sede que nombrar. El rastro tiene que salir IGUAL de
+    // completo —qué pasó, sobre qué y por qué— y sin el campo que ya no existe.
     const payload = buildAuditPayload({
-      sede_id: null,
       action: AUDIT_ACTIONS.LOGIN_FAILED,
       entity: "users",
       entity_id: "999",
       metadata: { reason: "unknown_or_inactive" },
     });
-    expect(payload.sede_id).toBeNull();
-    expect(payload.user_id).toBeNull();
-    expect(payload.metadata).toEqual({ reason: "unknown_or_inactive" });
+    expect(payload).toEqual({
+      user_id: null,
+      action: "auth.login_failed",
+      entity: "users",
+      entity_id: "999",
+      metadata: { reason: "unknown_or_inactive" },
+    });
+    expect(payload).not.toHaveProperty("sede_id");
   });
 
   it("cubre las acciones críticas del vocabulario T8", () => {
@@ -74,7 +82,6 @@ describe("audit payload (T8, sin red)", () => {
     delete process.env.SUPABASE_SERVICE_ROLE_KEY;
     try {
       const result = await writeAudit({
-        sede_id: "sede-1",
         user_id: "user-1",
         action: AUDIT_ACTIONS.SHIFT_CLOSED,
         entity: "cash_shifts",

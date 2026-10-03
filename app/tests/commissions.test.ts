@@ -1572,6 +1572,31 @@ describe("commissions: el pago inmediato exige factura Pagada (regla del dueño)
     expect(payoutStub.unexpectedQueries).toEqual([]);
   });
 
+  it("el rastro del pago dice QUÉ se pagó, sobre QUÉ fila y POR QUIÉ (sin sede)", async () => {
+    const row = await payCommissionNow({ ...input, amount: 5000 }, actor);
+
+    // El pago es plata que sale de la sede: el rastro tiene que poder leerse
+    // después sin depender de la fila, así que nombra acción, entidad, la fila
+    // y el responsable.
+    expect(payoutStub.audits).toHaveLength(1);
+    expect(payoutStub.audits[0]).toMatchObject({
+      user_id: actor.userId,
+      action: "payroll.commission_paid",
+      entity: "commission_payouts",
+      entity_id: row.id,
+      metadata: {
+        employee_id: payoutStub.EMPLOYEE_ID,
+        invoice_id: payoutStub.INVOICE_ID,
+        cash_shift_id: payoutStub.SHIFT_ID,
+        method_code: payoutStub.METHOD_CODE,
+        amount: 5000,
+        earned_immediate: payoutStub.COMMISSION_VALUE,
+      },
+    });
+    // La instalación es una: la sede ya no viaja como columna del rastro.
+    expect(payoutStub.audits[0]).not.toHaveProperty("sede_id");
+  });
+
   it("una factura `Emitida` se rechaza y NO inserta ninguna fila", async () => {
     payoutStub.invoiceStatus = "Emitida";
     const failure: unknown = await payCommissionNow({ ...input, amount: 5000 }, actor).catch(

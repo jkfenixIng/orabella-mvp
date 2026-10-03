@@ -37,7 +37,6 @@ type DbClient = Awaited<ReturnType<typeof alertsDb>>;
 
 export interface AlertActor {
   userId: string;
-  sedeId: string;
 }
 
 export interface AlertRow {
@@ -240,9 +239,15 @@ export async function countUnreadAlerts(module?: AlertModule): Promise<number> {
   return count ?? 0;
 }
 
-/** Revisa una alerta con justificación obligatoria (acotado a su sede). */
+/**
+ * Revisa una alerta con justificación obligatoria.
+ *
+ * El alcance es la fila que trae el `id`, y nada más: el rastro se escribe sin
+ * sede (una sola instalación), así que un filtro por `sede_id` no hallaría
+ * ninguna fila y "marcar como leída" quedaría en silencio sin efecto. Quién
+ * puede revisar lo define el gate de administrador de la acción, no un filtro.
+ */
 export async function markAlertRead(
-  sedeId: string,
   id: string,
   raw: unknown,
   actor: AlertActor,
@@ -261,7 +266,6 @@ export async function markAlertRead(
       reviewed_by: actor.userId,
     })
     .eq("id", id)
-    .eq("sede_id", sedeId)
     .select("id")
     .maybeSingle();
   if (error) throw toAlertError(error);
@@ -276,12 +280,15 @@ export async function markAlertRead(
  * `review_note`/`reviewed_by`), sin estados nuevos, y filtra por `entity_id`
  * + `is_read:false` para ser idempotente y no pisar otras alertas.
  *
+ * No recibe SEDE, como `markAlertRead`: el rastro se escribe sin `sede_id`, así
+ * que un alcance por sede no alcanzaría la fila y el cierre quedaría en
+ * silencio. Quien puede revisar es cosa del permiso del llamador.
+ *
  * NUNCA lanza: aprobar/rechazar el vale ya quedó aplicado y auditado, así que
  * un fallo al cerrar la alerta no debe tumbar la operación de negocio (la
  * alerta seguiría en la bandeja para revisarla a mano).
  */
 export async function resolveVoucherAlert(
-  sedeId: string,
   voucherId: string,
   reviewedBy: string | null,
   note: string,
@@ -291,7 +298,7 @@ export async function resolveVoucherAlert(
     const { error } = await db
       .from("audit_logs")
       .update(buildVoucherAlertResolution({ reviewedBy, note }))
-      .match(voucherAlertFilter(sedeId, voucherId));
+      .match(voucherAlertFilter(voucherId));
     if (error) {
       console.error("[alerts] no se pudo cerrar la alerta del vale:", error.message);
       return { resolved: false };

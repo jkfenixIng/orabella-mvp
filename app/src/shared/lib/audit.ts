@@ -12,8 +12,6 @@
  */
 
 export interface AuditEntry {
-  /** Sede del evento. Null solo cuando se desconoce (login con documento inexistente). */
-  sede_id: string | null;
   user_id?: string | null;
   action: string;
   entity: string;
@@ -22,7 +20,6 @@ export interface AuditEntry {
 }
 
 export interface AuditPayload {
-  sede_id: string | null;
   user_id: string | null;
   action: string;
   entity: string;
@@ -101,10 +98,16 @@ export const AUDIT_ACTIONS = {
 /**
  * Construye el payload de `audit_logs`. Pura (sin red/BD) para probarla
  * en vitest. Normaliza nulos y garantiza `metadata` como objeto.
+ *
+ * La instalación es UNA sola, así que el rastro no lleva sede: el evento se
+ * ubica por QUIÉN lo hizo (`user_id`) y sobre QUÉ fila (`entity`/`entity_id`).
+ * Antes el campo admitía NULL para los eventos sin tenant —el login con
+ * documento inexistente, que no conoce ni usuario ni sede—, y esa era la única
+ * razón por la que era nullable; hoy ya no hay nada que nombrar y esa entrada
+ * se sigue escribiendo completa igual que las demás.
  */
 export function buildAuditPayload(entry: AuditEntry): AuditPayload {
   return {
-    sede_id: entry.sede_id ?? null,
     user_id: entry.user_id ?? null,
     action: entry.action,
     entity: entry.entity,

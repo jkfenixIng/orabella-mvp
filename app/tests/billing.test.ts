@@ -3483,6 +3483,8 @@ describe("billing: gate de sobre-cobro al bajar el total de una emitida (WU2)", 
         bajo_cobrado_diferencia: 50000,
       },
     });
+    // El rastro nombra el acto, no el tenant: la sede ya no se envía.
+    expect(overCollectionStub.auditInsert).not.toHaveProperty("sede_id");
     expect(overCollectionStub.unexpectedQueries).toEqual([]);
   });
 
@@ -5375,6 +5377,7 @@ describe("billing: las dos ediciones de factura son UNA transacción (CL-12)", (
       entity_id: overCollectionStub.INVOICE_ID,
       metadata: { motivo: ADMIN_MOTIVO, items_before: 3, items_added: 0 },
     });
+    expect(overCollectionStub.auditInsert).not.toHaveProperty("sede_id");
     expect((overCollectionStub.auditInsert?.metadata as { inventory_moves: unknown[] }).inventory_moves).toHaveLength(2);
     expect(overCollectionStub.unexpectedQueries).toEqual([]);
   });

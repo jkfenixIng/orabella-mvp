@@ -296,7 +296,6 @@ export async function setPlatformPayrollStartDate(
 
   // 3) Auditoría: actor, sede objetivo y los dos valores.
   await writeAudit({
-    sede_id: sede.id,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.PLATFORM_PAYROLL_START_DATE_SET,
     entity: "sedes",

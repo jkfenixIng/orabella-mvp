@@ -54,10 +54,7 @@ export async function countUnreadAlertsAction() {
 export async function markAlertReadAction(id: string, note: string) {
   try {
     const session = await requireAdminSession(await sessionToken());
-    const data = await markAlertRead(session.sedeId, id, { note }, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await markAlertRead(id, { note }, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

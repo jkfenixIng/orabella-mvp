@@ -952,6 +952,16 @@ describe("auth: cambio de clave atómico (CL-15 / AUTH-02)", () => {
     expect(postgrest.auditInserts.map((fila) => fila.action)).toEqual([
       "auth.password_changed",
     ]);
+    // Y el rastro sigue nombrando QUIÉN y sobre QUÉ, sin la sede que ya no se
+    // envía: `user_id` y `entity_id` son los que hacen la traza ubicable.
+    expect(postgrest.auditInserts[0]).toMatchObject({
+      user_id: USUARIO,
+      action: "auth.password_changed",
+      entity: "users",
+      entity_id: USUARIO,
+      metadata: {},
+    });
+    expect(postgrest.auditInserts[0]).not.toHaveProperty("sede_id");
   });
 
   it("la operación viaja en UNA sentencia: cero escrituras sueltas", async () => {
@@ -1138,10 +1148,14 @@ describe("auth: alta de usuario atómica (CL-15 / AUTH-04)", () => {
     // El rastro NOMBRA el usuario que quedó y POR QUÉ: es lo que convierte el
     // residuo en trabajo de reparación.
     expect(rastro[0]).toMatchObject({
+      user_id: null,
       entity: "users",
       entity_id: usuarios()[0].id,
       metadata: { email: ALTA.email, motivo: "email_exists" },
     });
+    // El rastro ya no lleva la sede de la instalación: el usuario huérfano se
+    // ubica por `entity`/`entity_id`, no por un tenant que ya no se envía.
+    expect(rastro[0]).not.toHaveProperty("sede_id");
     // Y jamás un secreto: la clave inicial ES el documento del alta.
     expect(JSON.stringify(rastro[0])).not.toContain(ALTA.documento);
     // El rastro usa la acción del VOCABULARIO COMPARTIDO: es lo que hace que la

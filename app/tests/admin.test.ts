@@ -2514,3 +2514,519 @@ describe("migración 073_sede_id_nullable.sql (M3b)", () => {
     expect(tocadas).toHaveLength(17);
   });
 });
+
+// ----------------- M3b-bis: las unicidades ya no dependen de la sede --------
+
+/**
+ * Una unicidad que hoy lleva `sede_id` como elemento, LEÍDA DE LAS MIGRACIONES
+ * y no de una lista escrita a mano.
+ *
+ * La lista no se escribe a propósito: si esta unidad la escribiera a mano, el
+ * día en que una migración nueva declare otra unicidad por sede la prueba
+ * seguiría verde sobre una base que ya tiene la nueva. Al derivarla, esa
+ * migración hace fallar la comparación del inventario y obliga a decidir.
+ */
+interface UnicidadConSede {
+  /** `constraint` = `UNIQUE (…)` en línea; `index` = `CREATE UNIQUE INDEX`. */
+  forma: "constraint" | "index";
+  tabla: string;
+  /** El nombre REAL del objeto en el catálogo, como existe hoy. */
+  nombre: string;
+  /** Columnas en orden, `sede_id` incluida. */
+  columnas: string[];
+  /** Las mismas columnas sin `sede_id`: la forma final que 074 debe dejar. */
+  sinSede: string[];
+  /** El `WHERE` del índice parcial, EXACTO como está escrito; `null` si no es parcial. */
+  where: string | null;
+  /** La migración que lo declaró. */
+  origen: string;
+}
+
+/** Una exclusión `EXCLUDE USING gist`, leída del disco. */
+interface ExclusionesConSede {
+  nombre: string;
+  /** Elementos uno por uno, sin partir dentro de un `(` … `)`. */
+  elementos: string[];
+  origen: string;
+}
+
+/**
+ * Parte una lista de columnas o de elementos de exclusión por las comas de
+ * NIVEL SUPERIOR. Sin esto, `daterange(start_date, end_date, '[]')` se rompería
+ * en tres trozos y `uq_sedes_name (lower(btrim(name)))` en dos.
+ */
+function separarPorComas(cuerpo: string): string[] {
+  const partes: string[] = [];
+  let actual = "";
+  let profundidad = 0;
+  for (const caracter of cuerpo) {
+    if (caracter === "(") profundidad += 1;
+    if (caracter === ")") profundidad -= 1;
+    if (caracter === "," && profundidad === 0) {
+      partes.push(actual);
+      actual = "";
+      continue;
+    }
+    actual += caracter;
+  }
+  if (actual.trim()) partes.push(actual);
+  return partes.map((parte) => parte.replace(/\s+/g, " ").trim());
+}
+
+/** Un solo espacio entre palabras, para comparar SQL sin depender del formato. */
+function normalizar(sql: string): string {
+  return sql.replace(/\s+/g, " ").trim();
+}
+
+const DIR_MIGRACIONES = join(process.cwd(), "supabase", "migrations");
+
+/** Los archivos de migración, en orden, SIN el que esta unidad escribe. */
+function migracionesPrevias(): string[] {
+  return readdirSync(DIR_MIGRACIONES)
+    .filter((n) => n.endsWith(".sql") && !n.startsWith("074_"))
+    .sort();
+}
+
+/**
+ * El SQL sin comentarios: lo que el runner envía a la base. Se parte por línea y
+ * se corta en el `--`, como el lector de 073, para que un objeto citado en la
+ * prosa de una migración no se confunda con el objeto declarado.
+ */
+function sqlDeMigracion(fuente: string): string {
+  return fuente
+    .split("\n")
+    .map((linea) => linea.split("--")[0])
+    .join("\n");
+}
+
+/** Toda unicidad o exclusión que lleva `sede_id` como elemento. */
+function unicidadesYExclusionesConSede(): {
+  unicidades: UnicidadConSede[];
+  exclusiones: ExclusionesConSede[];
+} {
+  // Una migración posterior puede re-declarar un objeto con otro cuerpo —la 063
+  // reemplazó la exclusión de la 035 y le agregó la cadencia—, y gana la ÚLTIMA
+  // declaración, que es la que está vigente en el catálogo. Se indexa por nombre
+  // por eso: 035 y 063 usan el mismo.
+  const unicas = new Map<string, UnicidadConSede>();
+  const exclusiones = new Map<string, ExclusionesConSede>();
+
+  for (const archivo of migracionesPrevias()) {
+    const texto = sqlDeMigracion(readFileSync(join(DIR_MIGRACIONES, archivo), "utf8"));
+
+    // (a) `UNIQUE (…)` escrito en línea dentro del `CREATE TABLE`: su nombre NO
+    //     lo eligió una persona, lo derivó PostgreSQL de las columnas. Ese
+    //     nombre derivado es el que hay que soltar en 074.
+    for (const bloque of texto.matchAll(
+      /CREATE TABLE (?:IF NOT EXISTS )?public\.([a-z0-9_]+) \(([\s\S]*?)\n\);/g,
+    )) {
+      const tabla = bloque[1];
+      for (const linea of bloque[2].split("\n")) {
+        const declarado = linea.match(/^\s*UNIQUE\s*\(([^)]*)\)/i);
+        if (!declarado) continue;
+        const columnas = separarPorComas(declarado[1]);
+        if (!columnas.includes("sede_id")) continue;
+        unicas.set(`${tabla}_${columnas.join("_")}_key`, {
+          forma: "constraint",
+          tabla,
+          nombre: `${tabla}_${columnas.join("_")}_key`,
+          columnas,
+          sinSede: columnas.filter((columna) => columna !== "sede_id"),
+          where: null,
+          origen: archivo,
+        });
+      }
+    }
+
+    // (b) `CREATE UNIQUE INDEX`: nombre elegido a mano, columnas y `WHERE`.
+    for (const declarado of texto.matchAll(
+      /CREATE UNIQUE INDEX (?:IF NOT EXISTS )?([a-z0-9_]+)\s+ON public\.([a-z0-9_]+)\s*\(([^)]*)\)\s*(WHERE\b[^;]*)?;/g,
+    )) {
+      const [, nombre, tabla, columnasCrudas, whereCrudo] = declarado;
+      const columnas = separarPorComas(columnasCrudas);
+      if (!columnas.includes("sede_id")) continue;
+      unicas.set(nombre, {
+        forma: "index",
+        tabla,
+        nombre,
+        columnas,
+        sinSede: columnas.filter((columna) => columna !== "sede_id"),
+        where: whereCrudo ? normalizar(whereCrudo) : null,
+        origen: archivo,
+      });
+    }
+
+    // (c) `EXCLUDE USING gist (…)`, con el nombre que su migración le dio.
+    for (const declarado of texto.matchAll(
+      /ADD CONSTRAINT ([a-z0-9_]+)\s+EXCLUDE USING gist\s*\(([^;]*)\);/g,
+    )) {
+      const elementos = separarPorComas(declarado[2]);
+      if (!elementos.some((elemento) => /^sede_id\b/.test(elemento))) continue;
+      exclusiones.set(declarado[1], { nombre: declarado[1], elementos, origen: archivo });
+    }
+  }
+
+  return { unicidades: [...unicas.values()], exclusiones: [...exclusiones.values()] };
+}
+
+/** El nombre que PostgreSQL deriva de un `UNIQUE (…)`. */
+function nombreDerivado(tabla: string, columnas: string[]): string {
+  return `${tabla}_${columnas.join("_")}_key`;
+}
+
+/**
+ * Lo que 074 DEBE dejar de un objeto, en forma de texto normalizado. Es la
+ * misma forma que se le inyecta a los controles negativos: el motor es uno solo,
+ * así que un control negativo que pasa es un defecto real del detector.
+ */
+function formaFinal(objeto: UnicidadConSede): {
+  soltar: string;
+  declarar: RegExp;
+  esperado: string;
+} {
+  if (objeto.forma === "constraint") {
+    const nuevo = nombreDerivado(objeto.tabla, objeto.sinSede);
+    return {
+      soltar: `DROP CONSTRAINT IF EXISTS ${objeto.nombre}`,
+      declarar: new RegExp(String.raw`ADD CONSTRAINT ${nuevo}\s+UNIQUE\s*\(([^)]*)\)`, "i"),
+      esperado: `ADD CONSTRAINT ${nuevo} UNIQUE (${objeto.sinSede.join(", ")})`,
+    };
+  }
+  return {
+    soltar: `DROP INDEX IF EXISTS public.${objeto.nombre}`,
+    declarar: new RegExp(
+      String.raw`CREATE UNIQUE INDEX ${objeto.nombre}\s+ON public\.${objeto.tabla}\s*\(([^)]*)\)(\s*WHERE\b[^;]*)?;`,
+      "i",
+    ),
+    esperado: `CREATE UNIQUE INDEX ${objeto.nombre} ON public.${objeto.tabla} (${objeto.sinSede.join(", ")})`,
+  };
+}
+
+/**
+ * El motor de la guarda: devuelve una lista de FALTAS (vacía = el archivo
+ * cumple). Trabaja sobre el TEXTO del archivo, no sobre el disco, para que los
+ * controles negativos puedan inyectarle un 074 sintético.
+ */
+function revisarSedeLess(
+  fuente: string,
+  esperado: { unicidades: UnicidadConSede[]; exclusiones: ExclusionesConSede[] },
+): string[] {
+  const sql = normalizar(sqlDeMigracion(fuente)).toLowerCase();
+  const falta: string[] = [];
+
+  // (0) Nada que destruya: esta unidad quita una restricción y la repone.
+  const destructivas: Array<[string, RegExp]> = [
+    ["DELETE", /\bdelete\b/i],
+    ["UPDATE", /\bupdate\b/i],
+    ["TRUNCATE", /\btruncate\b/i],
+    ["DROP COLUMN", /\bdrop\s+column\b/i],
+    ["DROP TABLE", /\bdrop\s+table\b/i],
+    ["DROP POLICY", /\bdrop\s+policy\b/i],
+  ];
+  for (const [etiqueta, patron] of destructivas) {
+    if (patron.test(fuente)) falta.push(`sentencia destructiva ${etiqueta}`);
+  }
+
+  // (1) Cada unicidad por sede queda reescrita sin `sede_id`, con el resto igual.
+  for (const objeto of esperado.unicidades) {
+    const { soltar, declarar, esperado: definicionEsperada } = formaFinal(objeto);
+    if (!sql.includes(soltar.toLowerCase())) {
+      falta.push(`${objeto.nombre}: no se suelta`);
+      continue;
+    }
+    const hallada = declarar.exec(sql);
+    if (!hallada) {
+      falta.push(`${objeto.nombre}: no se vuelve a declarar`);
+      continue;
+    }
+    const declarada = normalizar(hallada[0]);
+    const columnas = separarPorComas(hallada[1]);
+    if (columnas.join(", ") !== objeto.sinSede.join(", ")) {
+      falta.push(
+        `${objeto.nombre}: columnas ${columnas.join(", ")} en vez de ${objeto.sinSede.join(", ")}`,
+      );
+      continue;
+    }
+    // `sede_id` no puede quedar como COLUMNA. El nombre del objeto sí puede
+    // contenerlo —`uq_invoices_sede_idempotency_key` es un nombre ELEGIDO, no
+    // derivado de las columnas—, así que la comparación es sobre el cuerpo con
+    // el nombre puesto aparte.
+    const cuerpo = declarada
+      .replaceAll(objeto.nombre, "")
+      .replaceAll(nombreDerivado(objeto.tabla, objeto.sinSede), "");
+    if (cuerpo.includes("sede_id")) {
+      falta.push(`${objeto.nombre}: la definición todavía nombra sede_id`);
+    }
+    if (!declarada.startsWith(definicionEsperada.toLowerCase())) {
+      falta.push(`${objeto.nombre}: la definición no es la esperada (${declarada})`);
+    }
+    // El `WHERE` de un parcial se copia al carácter: es lo que decide qué filas
+    // entran al índice, y cambiarlo cambia el alcance de la garantía.
+    if (objeto.where !== null) {
+      const whereHallado = hallada[2] ? normalizar(hallada[2]) : "";
+      if (whereHallado.toLowerCase() !== objeto.where.toLowerCase()) {
+        falta.push(`${objeto.nombre}: WHERE ${whereHallado} en vez de ${objeto.where}`);
+      }
+    }
+  }
+
+  // (2) La exclusión: MISMO nombre y exactamente los elementos que quedan.
+  for (const objeto of esperado.exclusiones) {
+    if (!sql.includes(`drop constraint if exists ${objeto.nombre}`.toLowerCase())) {
+      falta.push(`${objeto.nombre}: no se suelta`);
+      continue;
+    }
+    const declarada = new RegExp(
+      String.raw`ADD CONSTRAINT ([a-z0-9_]+)\s+EXCLUDE USING gist\s*\(([^;]*)\);`,
+      "i",
+    ).exec(sql);
+    if (!declarada) {
+      falta.push(`${objeto.nombre}: no se vuelve a declarar`);
+      continue;
+    }
+    if (declarada[1].toLowerCase() !== objeto.nombre.toLowerCase()) {
+      falta.push(
+        `${objeto.nombre}: renombrada a ${declarada[1]} (el nombre es un contrato de ejecución)`,
+      );
+    }
+    const elementos = separarPorComas(declarada[2]);
+    const esperados = objeto.elementos.filter((elemento) => !/^sede_id\b/.test(elemento));
+    if (elementos.length !== esperados.length) {
+      falta.push(`${objeto.nombre}: ${elementos.length} elementos en vez de ${esperados.length}`);
+    }
+    if (elementos.join(" | ").toLowerCase() !== esperados.join(" | ").toLowerCase()) {
+      falta.push(
+        `${objeto.nombre}: elementos ${elementos.join(" | ")} en vez de ${esperados.join(" | ")}`,
+      );
+    }
+  }
+
+  return falta;
+}
+
+describe("migración 074_sede_less_constraints.sql (M3b)", () => {
+  const raw = readFileSync(join(DIR_MIGRACIONES, "074_sede_less_constraints.sql"), "utf8");
+  const sql = sqlDeMigracion(raw);
+  const derivado = unicidadesYExclusionesConSede();
+
+  /**
+   * El único índice único por sede que 074 NO toca, y la razón: el `upsert` de
+   * `src/features/commissions/service.ts` infiere su `ON CONFLICT` con las
+   * CUATRO columnas, y la inferencia exige coincidencia exacta. Sin `sede_id` en
+   * el índice, ese `upsert` falla con 42P10 en cada alta y edición de regla. El
+   * cambio correcto es el otro orden: primero el `onConflict` del servicio,
+   * después el índice.
+   */
+  const ENLISTADO = "uq_commission_rule";
+  const objetos = derivado.unicidades.filter((u) => u.nombre !== ENLISTADO);
+  const esperado = { unicidades: objetos, exclusiones: derivado.exclusiones };
+
+  it("el inventario derivado de las migraciones es el conocido", () => {
+    // Si una migración futura declara otra unicidad o exclusión por sede, esta
+    // comparación falla pidiendo el nombre nuevo: es la alarma que obliga a
+    // decidir si esta unidad —o la que corresponda— tiene que reescribirla.
+    expect(derivado.unicidades.map((u) => u.nombre).sort()).toEqual([
+      "cash_denominations_sede_id_value_key",
+      "cash_registers_sede_id_name_key",
+      "invoices_sede_id_consecutive_number_key",
+      "payment_methods_sede_id_code_key",
+      "products_sede_id_sku_key",
+      "tax_configs_sede_id_code_name_key",
+      "uq_commission_rule",
+      "uq_employees_sede_code",
+      "uq_invoices_sede_idempotency_key",
+      "uq_payroll_draft_per_range",
+    ]);
+    expect(derivado.exclusiones.map((e) => e.nombre)).toEqual([
+      "ex_payroll_periods_no_overlap",
+    ]);
+  });
+
+  it("deriva del disco las nueve unicidades que 074 reescribe", () => {
+    expect(objetos).toHaveLength(9);
+    // El origen se cita uno por uno para que una definición movida de archivo se
+    // note en la prueba, y no en la base.
+    expect(objetos.map((o) => `${o.origen}:${o.nombre}`)).toEqual([
+      "003_admin.sql:tax_configs_sede_id_code_name_key",
+      "003_admin.sql:payment_methods_sede_id_code_key",
+      "003_admin.sql:uq_employees_sede_code",
+      "004_inventory.sql:products_sede_id_sku_key",
+      "005_billing.sql:invoices_sede_id_consecutive_number_key",
+      "006_cash.sql:cash_registers_sede_id_name_key",
+      "007_payroll.sql:uq_payroll_draft_per_range",
+      "010_cash_denominations.sql:cash_denominations_sede_id_value_key",
+      "041_invoice_idempotency.sql:uq_invoices_sede_idempotency_key",
+    ]);
+    // Y todas llevan `sede_id` hoy: eso es exactamente lo que 074 les quita.
+    for (const objeto of objetos) expect(objeto.columnas).toContain("sede_id");
+    // Los tres parciales traen su `WHERE`, que hay que conservar al carácter.
+    expect(objetos.filter((o) => o.where !== null).map((o) => o.nombre)).toEqual([
+      "uq_employees_sede_code",
+      "uq_payroll_draft_per_range",
+      "uq_invoices_sede_idempotency_key",
+    ]);
+  });
+
+  it("074 reescribe cada una sin sede_id, conservando el resto y el WHERE", () => {
+    expect(revisarSedeLess(raw, esperado)).toEqual([]);
+  });
+
+  it("la exclusión conserva el nombre y deja exactamente los dos elementos", () => {
+    const origen = derivado.exclusiones[0];
+    // Leída del disco: hoy son `sede_id` + el cubo de cadencia + el rango.
+    expect(origen.origen).toBe("063_nomina_frecuencias.sql");
+    expect(origen.elementos).toEqual([
+      "sede_id WITH =",
+      "coalesce(frequency, '') WITH =",
+      "daterange(start_date, end_date, '[]') WITH &&",
+    ]);
+
+    const declarada = new RegExp(
+      String.raw`ADD CONSTRAINT ex_payroll_periods_no_overlap\s+EXCLUDE USING gist\s*\(([^;]*)\);`,
+      "i",
+    ).exec(normalizar(sql));
+    expect(declarada).not.toBeNull();
+    expect(separarPorComas(declarada![1])).toEqual([
+      "coalesce(frequency, '') WITH =",
+      "daterange(start_date, end_date, '[]') WITH &&",
+    ]);
+    // Ni un `sede_id` suelto, ni un tercer elemento disfrazado.
+    expect(normalizar(sql)).not.toContain("sede_id WITH =");
+    expect(normalizar(sql).match(/WITH (=|&&)/g) ?? []).toHaveLength(2);
+    // Y el nombre no cambió: es el que el dominio y el mapeo 23P01 →
+    // PERIOD_OVERLAP usan para hablar de la garantía.
+    expect(raw).toContain("DROP CONSTRAINT IF EXISTS ex_payroll_periods_no_overlap;");
+    // Contado sobre el SQL SIN comentarios: la sección de reversión repite la
+    // declaración como texto comentado y no es una segunda declaración.
+    expect(normalizar(sql).match(/ADD CONSTRAINT ex_payroll_periods_no_overlap/g) ?? []).toHaveLength(1);
+  });
+
+  it("el pre-vuelo existe, va primero y aborta en vez de borrar", () => {
+    const preVuelo = sql.indexOf("DO $$");
+    const primeraCaida = sql.search(/\bDROP\s+(CONSTRAINT|INDEX)\b/i);
+    expect(preVuelo).toBeGreaterThan(-1);
+    expect(preVuelo).toBeLessThan(primeraCaida);
+
+    // Aborta nombrando las filas y|elevation qué hacer: no reescribe nada.
+    expect(raw).toContain("RAISE EXCEPTION");
+    expect(raw).toContain("ABORTADA");
+    expect(raw).toContain("No se borró, no se fusionó y no se reescribió ninguna fila");
+    expect(raw).toContain("vuelva a correr el archivo completo");
+
+    // Y chequea los diez puntos: cada objeto reescrito y el solape de nómina.
+    for (const objeto of objetos) {
+      expect(raw, `el pre-vuelo no chequea ${objeto.nombre}`).toContain(objeto.nombre);
+    }
+    expect(raw).toContain("ex_payroll_periods_no_overlap -> (coalesce(frequency");
+  });
+
+  it("no borra ni reescribe datos, y cada DROP es sobre un objeto conocido", () => {
+    for (const sentencia of [
+      /\bDELETE\b/i,
+      /\bUPDATE\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDROP\s+COLUMN\b/i,
+      /\bDROP\s+TABLE\b/i,
+      /\bDROP\s+POLICY\b/i,
+    ]) {
+      expect(raw).not.toMatch(sentencia);
+    }
+    // Cada `DROP` del archivo (contada la prosa, que repite la reversión) suelta
+    // un objeto de la lista: el nombre viejo o el que deriva de las columnas sin
+    // sede. Nada más se suelta en este archivo.
+    const conocidos = new Set<string>([
+      ...objetos.map((o) => o.nombre),
+      ...objetos
+        .filter((o) => o.forma === "constraint")
+        .map((o) => nombreDerivado(o.tabla, o.sinSede)),
+      "ex_payroll_periods_no_overlap",
+    ]);
+    // Dieciséis nombres: los nueve de hoy, los seis que deriva PostgreSQL de las
+    // columnas sin sede, y el de la exclusión.
+    expect(conocidos.size).toBe(16);
+    for (const caida of raw.matchAll(/\bDROP\s+CONSTRAINT\s+IF EXISTS\s+([a-z0-9_]+)/gi)) {
+      expect([...conocidos]).toContain(caida[1]);
+    }
+    for (const caida of raw.matchAll(/\bDROP\s+INDEX\s+IF EXISTS\s+(?:public\.)?([a-z0-9_]+)/gi)) {
+      expect([...conocidos]).toContain(caida[1]);
+    }
+    // Y hay de las dos clases: la exclusión y las nueve unicidades.
+    expect([...raw.matchAll(/\bDROP\s+CONSTRAINT\b/gi)].length).toBeGreaterThan(1);
+    expect([...raw.matchAll(/\bDROP\s+INDEX\b/gi)].length).toBeGreaterThan(1);
+  });
+
+  it("el índice que queda compuesto está declarado como tal, con su motivo", () => {
+    // La excepción es explícita y con su razón: si alguien la mueve sin leerla,
+    // la guardia de abajo y el comentario la señalan.
+    expect(raw).toContain("uq_commission_rule");
+    expect(raw).toContain('onConflict: "sede_id,item_type,item_id,employee_id"');
+    expect(raw).toContain("src/features/commissions/service.ts");
+    expect(raw).toContain("42P10");
+    expect(normalizar(sql)).not.toMatch(/\bDROP\s+INDEX\s+IF EXISTS\s+public\.uq_commission_rule/i);
+  });
+
+  it("declara el motivo, el orden, la nota del editor SQL y que no se ejecutó", () => {
+    expect(raw).toContain("una sola sede");
+    expect(raw).toContain("ADITIVO, IDEMPOTENTE Y RE-EJECUTABLE");
+    expect(raw).toContain("CONFIRMA SENTENCIA POR SENTENCIA");
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+    // Las consultas de sólo lectura.
+    expect(raw).toContain("pg_get_constraintdef");
+    expect(raw).toContain("pg_indexes");
+  });
+
+  it("control negativo: una UNIQUE que conserva sede_id queda señalada", () => {
+    // La forma obvia: el nombre viejo vuelve con sus dos columnas.
+    const conSede = raw.replace(
+      "ADD CONSTRAINT products_sku_key UNIQUE (sku);",
+      "ADD CONSTRAINT products_sede_id_sku_key UNIQUE (sede_id, sku);",
+    );
+    expect(conSede).not.toBe(raw);
+    // El archivo mutado ya no declara la forma final que este objeto debe dejar.
+    expect(revisarSedeLess(conSede, esperado).join(" | ")).toContain("no se vuelve a declarar");
+
+    // Y la sutil: el nombre nuevo correcto, la columna de más.
+    const conSedeMisma = raw.replace(
+      "ADD CONSTRAINT products_sku_key UNIQUE (sku);",
+      "ADD CONSTRAINT products_sku_key UNIQUE (sede_id, sku);",
+    );
+    const falta = revisarSedeLess(conSedeMisma, esperado).join(" | ");
+    expect(falta).toContain("columnas sede_id, sku en vez de sku");
+  });
+
+  it("control negativo: la exclusión renombrada queda señalada", () => {
+    const renombrada = raw
+      .replace(
+        "DROP CONSTRAINT IF EXISTS ex_payroll_periods_no_overlap;",
+        "DROP CONSTRAINT IF EXISTS ex_payroll_periods_no_overlap_sede;",
+      )
+      .replace(
+        "ADD CONSTRAINT ex_payroll_periods_no_overlap\n  EXCLUDE USING gist",
+        "ADD CONSTRAINT ex_payroll_periods_no_overlap_sede\n  EXCLUDE USING gist",
+      );
+    expect(renombrada).not.toBe(raw);
+    const falta = revisarSedeLess(renombrada, esperado).join(" | ");
+    expect(falta).toContain("ex_payroll_periods_no_overlap");
+    expect(falta).toContain("contrato de ejecución");
+  });
+
+  it("control negativo: un WHERE de parcial alterado queda señalado", () => {
+    // El `WHERE` decide qué filas entran al índice: aflojarlo metería filas que
+    // la garantía excluye a propósito (un empleado sin código, una factura sin
+    // marca). Es el cambio que el detector tiene que ver aunque las columnas
+    // estén perfectitas.
+    const aflojado = raw.replace(
+      "WHERE employee_code IS NOT NULL AND btrim(employee_code) <> '';",
+      "WHERE employee_code IS NOT NULL;",
+    );
+    expect(aflojado).not.toBe(raw);
+    expect(revisarSedeLess(aflojado, esperado).join(" | ")).toContain(
+      "WHERE where employee_code is not null",
+    );
+  });
+
+  it("control negativo: el detector no es un sello de goma", () => {
+    expect(revisarSedeLess(raw, esperado)).toEqual([]);
+    expect(revisarSedeLess("", esperado).length).toBeGreaterThan(0);
+  });
+});

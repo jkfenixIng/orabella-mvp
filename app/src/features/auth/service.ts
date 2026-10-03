@@ -320,7 +320,6 @@ export async function loginWithDocument(raw: unknown, now: Date = new Date()): P
   if (!found || !found.user.is_active) {
     await recordRateFailure(documento, LOGIN_BUDGET);
     await writeAudit({
-      sede_id: found?.user.sede_id ?? null,
       user_id: found?.user.id ?? null,
       action: AUDIT_ACTIONS.LOGIN_FAILED,
       entity: "users",
@@ -349,7 +348,6 @@ export async function loginWithDocument(raw: unknown, now: Date = new Date()): P
       .eq("id", user.id);
     if (error) throw new AuthError("INTERNAL", "Error interno.", 500);
     await writeAudit({
-      sede_id: user.sede_id,
       user_id: user.id,
       action: outcome.locked ? AUDIT_ACTIONS.LOGIN_LOCKED : AUDIT_ACTIONS.LOGIN_FAILED,
       entity: "users",
@@ -507,9 +505,7 @@ export async function changeUserPassword(args: {
     throw new AuthError("INTERNAL", "Error interno.", 500);
   }
 
-  const changed = user as { id: string; sede_id: string | null };
   await writeAudit({
-    sede_id: changed.sede_id,
     user_id: args.userId,
     action: AUDIT_ACTIONS.PASSWORD_CHANGED,
     entity: "users",
@@ -632,7 +628,7 @@ type AdminDb = Awaited<ReturnType<typeof adminDb>>;
  */
 async function discardCreatedUser(
   db: AdminDb,
-  args: { userId: string; sedeId: string | null; email: string; motivo: string },
+  args: { userId: string; email: string; motivo: string },
 ): Promise<void> {
   let removido = false;
   try {
@@ -652,7 +648,6 @@ async function discardCreatedUser(
   if (removido) return;
 
   await writeAudit({
-    sede_id: args.sedeId,
     user_id: null,
     action: AUDIT_ACTIONS.USER_CREATE_ROLLBACK_FAILED,
     entity: "users",
@@ -746,7 +741,6 @@ export async function adminCreateUser(raw: unknown): Promise<{ id: string }> {
   if (authError) {
     await discardCreatedUser(db, {
       userId,
-      sedeId: input.sede_id ?? null,
       email: input.email,
       // El motivo se guarda ESTRUCTURADO (código/estado del proveedor) y no como
       // el texto libre que devuelva el otro sistema: un mensaje ajeno no puede
@@ -808,7 +802,6 @@ export async function adminResetUserPassword(
     .eq("id", row.id);
   if (updateError) throw new AuthError("INTERNAL", "Error interno.", 500);
   await writeAudit({
-    sede_id: sedeId,
     user_id: actorUserId,
     action: AUDIT_ACTIONS.PASSWORD_CHANGED,
     entity: "users",

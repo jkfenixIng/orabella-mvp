@@ -1130,7 +1130,6 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     // review state can be joined from the day/history views.
     if (mismatches.length > 0 && !isFirstOpen) {
       await writeAudit({
-        sede_id: actor.sedeId,
         user_id: actor.userId,
         action: AUDIT_ACTIONS.SHIFT_OPEN_MISMATCH,
         entity: "cash_shifts",
@@ -2016,7 +2015,6 @@ export async function closeShift(
     }
     const closed = updated as CashShiftRow;
     await writeAudit({
-      sede_id: sedeId,
       user_id: actor.userId,
       action: AUDIT_ACTIONS.SHIFT_CLOSED,
       entity: "cash_shifts",
@@ -2039,7 +2037,6 @@ export async function closeShift(
     });
     if (methodDifferences.length > 0) {
       await writeAudit({
-        sede_id: sedeId,
         user_id: actor.userId,
         action: AUDIT_ACTIONS.SHIFT_CLOSE_MISMATCH,
         entity: "cash_shifts",
@@ -2077,7 +2074,6 @@ export async function updateRegisterBase(
     .single();
   if (error || !updated) throw new CashError("INTERNAL", "Error interno.", 500);
   await writeAudit({
-    sede_id: sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.REGISTER_BASE_UPDATED,
     entity: "cash_registers",
@@ -2211,7 +2207,6 @@ export async function recountClosedShift(
   }
   const recount = inserted as ShiftRecountRow;
   await writeAudit({
-    sede_id: sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.SHIFT_RECOUNTED,
     entity: "cash_shifts",

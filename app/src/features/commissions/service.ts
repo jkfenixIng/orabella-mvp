@@ -609,7 +609,6 @@ export async function payCommissionNow(
   if (!data) throw new CommissionError("INTERNAL", "Error interno.", 500);
 
   await writeAudit({
-    sede_id: actor.sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.COMMISSION_PAID,
     entity: "commission_payouts",

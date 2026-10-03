@@ -3755,6 +3755,7 @@ describe("payroll: la marca over_tope de la aprobación no puede mentir (U7)", (
     expect(approved.status).toBe("aprobada");
     expect(voucher.status).toBe("aprobada");
     expect((approvalAudit()?.metadata as { over_tope?: unknown }).over_tope).toBe(false);
+    expect(approvalAudit()).not.toHaveProperty("sede_id");
   });
 
   it("control: sobre el tope la marca sigue siendo `true`", async () => {
@@ -3764,6 +3765,7 @@ describe("payroll: la marca over_tope de la aprobación no puede mentir (U7)", (
 
     expect(approved.status).toBe("aprobada");
     expect((approvalAudit()?.metadata as { over_tope?: unknown }).over_tope).toBe(true);
+    expect(approvalAudit()).not.toHaveProperty("sede_id");
   });
 });
 
@@ -6197,7 +6199,6 @@ describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
       entity: "payroll_extras",
       entity_id: row.id,
       user_id: ACTOR.userId,
-      sede_id: payrollPagedStub.SEDE_ID,
       metadata: {
         employee_id: EMPLOYEE_ID,
         amount: 1_800_000,
@@ -6206,6 +6207,9 @@ describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
         method_code: "efectivo",
       },
     });
+    // El pago queda trazable por QUIÉN lo hizo y sobre QUÉ fila; la sede de la
+    // instalación ya no se manda.
+    expect(audit?.payload).not.toHaveProperty("sede_id");
   });
 
   it("funciona para días ya cubiertos por un período CERRADO (el caso que motiva)", async () => {
@@ -7281,7 +7285,6 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
       entity: "payroll_periods",
       entity_id: PERIOD_ID,
       user_id: ACTOR.userId,
-      sede_id: payrollPagedStub.SEDE_ID,
       metadata: {
         correction_id: result.correction.id,
         reason: "El fijo se pagó completo y correspondía la parte de los días.",
@@ -7291,6 +7294,7 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
         difference_total: 1_073_333,
       },
     });
+    expect(audit?.payload).not.toHaveProperty("sede_id");
     // La acción NO es la del cálculo: un auditor no puede leer "se calculó"
     // donde lo que pasó es que se corrigió una liquidación ya firmada.
     expect(AUDIT_ACTIONS.PAYROLL_PERIOD_CORRECTED).not.toBe(AUDIT_ACTIONS.PAYROLL_CALCULATED);
@@ -9551,6 +9555,7 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
       entity_id: PERIOD_ID,
       metadata: { vales_revertidos: 2 },
     });
+    expect(audit?.payload).not.toHaveProperty("sede_id");
   });
 
   it("la precondición de estado no se salta: si el período dejó de ser BORRADOR, se rechaza y no se revierte nada", async () => {
@@ -12768,9 +12773,9 @@ describe("M3b: los ajustes de la instalación viven en system_settings (072)", (
         action: "voucher.limits_set",
         entity: "system_settings",
         // La escritura toca las CUATRO claves: lo que hace ubicable el cambio
-        // en la historia de la sede es la sede, no una clave.
+        // en la historia de la sede es la SEDE nombrada, y lo hace `entity_id`,
+        // no una clave del módulo.
         entity_id: ACTOR.sedeId,
-        sede_id: ACTOR.sedeId,
         user_id: ACTOR.userId,
         metadata: {
           previous_max_per_day: 200000,
@@ -12785,6 +12790,7 @@ describe("M3b: los ajustes de la instalación viven en system_settings (072)", (
           new_allowed_days: [1, 3],
         },
       });
+      expect(audit?.payload).not.toHaveProperty("sede_id");
       // Y lo que la auditoría llama «nuevo» es lo que quedó ESCRITO de verdad:
       // el tope que se pidió, la semana que no se tocó conservada y los días
       // elegidos, leídos otra vez por la puerta de lectura. Sin esto, un

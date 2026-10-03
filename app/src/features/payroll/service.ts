@@ -1652,7 +1652,6 @@ export async function calculatePayroll(
     }
 
     await writeAudit({
-      sede_id: sedeId,
       user_id: actor.userId,
       action: AUDIT_ACTIONS.PAYROLL_CALCULATED,
       entity: "payroll_periods",
@@ -2648,7 +2647,6 @@ export async function payPayrollExtra(raw: unknown, actor: PayrollActor): Promis
     // explicarse. Se audita el empleado, el monto, el TIPO, el MOTIVO y el
     // medio de pago (más los días liquidados, si se indicaron).
     await writeAudit({
-      sede_id: actor.sedeId,
       user_id: actor.userId,
       action: AUDIT_ACTIONS.PAYROLL_EXTRA_PAID,
       entity: "payroll_extras",
@@ -2728,7 +2726,6 @@ export async function closePayrollPeriod(
       .single();
     if (error || !data) throw new PayrollError("INTERNAL", "Error interno.", 500);
     await writeAudit({
-      sede_id: sedeId,
       user_id: actor?.userId ?? null,
       action: AUDIT_ACTIONS.PAYROLL_CLOSED,
       entity: "payroll_periods",
@@ -2897,7 +2894,6 @@ export async function deletePayrollPeriod(
     }
 
     await writeAudit({
-      sede_id: sedeId,
       user_id: actor.userId,
       action: AUDIT_ACTIONS.PAYROLL_DELETED,
       entity: "payroll_periods",
@@ -3177,7 +3173,6 @@ export async function correctPayrollPeriod(
     // La auditoría lleva el motivo y los totales de las DOS versiones: un
     // auditor tiene que poder leer qué cambió sin abrir la pantalla.
     await writeAudit({
-      sede_id: sedeId,
       user_id: actor.userId,
       action: AUDIT_ACTIONS.PAYROLL_PERIOD_CORRECTED,
       entity: "payroll_periods",
@@ -3423,7 +3418,6 @@ export async function setVoucherLimits(raw: unknown, actor: PayrollActor): Promi
   // convierte una configuración ya guardada en un error para quien la guardó.
 
   await writeAudit({
-    sede_id: actor.sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.VOUCHER_LIMITS_SET,
     entity: "system_settings",
@@ -3786,7 +3780,6 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
     if (autoApproved) {
       // Dentro de rango: sale de caja de una; auditado sin código.
       await writeAudit({
-        sede_id: actor.sedeId,
         user_id: actor.userId,
         action: AUDIT_ACTIONS.VOUCHER_APPROVED,
         entity: "voucher_requests",
@@ -3803,7 +3796,6 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
     } else {
       // Fuera de rango: alerta al admin para autorizar o rechazar.
       await writeAudit({
-        sede_id: actor.sedeId,
         user_id: actor.userId,
         action: AUDIT_ACTIONS.VOUCHER_REQUESTED,
         entity: "voucher_requests",
@@ -4038,7 +4030,6 @@ export async function approveVoucher(
       normalizeVoucher(data as unknown as Record<string, unknown>),
     ]);
     await writeAudit({
-      sede_id: sedeId,
       user_id: actor.userId,
       action: AUDIT_ACTIONS.VOUCHER_APPROVED,
       entity: "voucher_requests",
@@ -4051,13 +4042,10 @@ export async function approveVoucher(
       },
     });
     // La alerta abierta por la solicitud fuera de rango queda resuelta:
-    // aprobado el vale, ya no hay nada pendiente de revisar.
-    await resolveVoucherAlert(
-      sedeId,
-      id,
-      actor.userId,
-      voucherAlertResolutionNote("aprobada"),
-    );
+    // aprobado el vale, ya no hay nada pendiente de revisar. El cierre NO se
+    // acota por sede: el rastro se escribe sin `sede_id`, así que un alcance por
+    // sede no hallaría la fila y el vale quedaría aprobado con la alerta abierta.
+    await resolveVoucherAlert(id, actor.userId, voucherAlertResolutionNote("aprobada"));
     return approved;
   } catch (error) {
     throw toPayrollError(error);
@@ -4125,7 +4113,6 @@ export async function rejectVoucher(
       normalizeVoucher(data as unknown as Record<string, unknown>),
     ]);
     await writeAudit({
-      sede_id: sedeId,
       user_id: actor?.userId ?? null,
       action: AUDIT_ACTIONS.VOUCHER_REJECTED,
       entity: "voucher_requests",
@@ -4136,9 +4123,9 @@ export async function rejectVoucher(
         motivo: parsed.data.motivo.trim(),
       },
     });
-    // Rechazado el vale, su alerta pendiente deja de aplicar.
+    // Rechazado el vale, su alerta pendiente deja de aplicar. Tampoco se acota
+    // por sede: la fila del rastro no lleva `sede_id` (ver `resolveVoucherAlert`).
     await resolveVoucherAlert(
-      sedeId,
       id,
       actor?.userId ?? null,
       voucherAlertResolutionNote("rechazada", parsed.data.motivo),

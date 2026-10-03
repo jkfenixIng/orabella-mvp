@@ -404,7 +404,7 @@ describe("plataforma: la escritura de la fecha de nómina", () => {
     expect(dbStub.sedes.find((sede) => sede.id === SEDE_VIEJA)?.payroll_start_date).toBeUndefined();
   });
 
-  it("deja la auditoría con el actor, la sede objetivo y los DOS valores", async () => {
+  it("deja la auditoría con el actor, la sede objetivo (como entidad) y los DOS valores", async () => {
     sembrarInstalacion();
     asSession(["superadmin"]);
 
@@ -414,7 +414,6 @@ describe("plataforma: la escritura de la fecha de nómina", () => {
     expect(AUDIT_ACTIONS.PLATFORM_PAYROLL_START_DATE_SET).toBe("platform.payroll_start_date_set");
     expect(auditStub.entries).toHaveLength(1);
     expect(auditStub.entries[0]).toMatchObject({
-      sede_id: SEDE,
       user_id: "u-plataforma",
       action: "platform.payroll_start_date_set",
       entity: "sedes",
@@ -424,6 +423,9 @@ describe("plataforma: la escritura de la fecha de nómina", () => {
         new_payroll_start_date: NUEVA,
       },
     });
+    // La sede sigue nombrada —como la ENTIDAD que se reconfiguró—, pero ya no
+    // viaja como columna propia.
+    expect(auditStub.entries[0]).not.toHaveProperty("sede_id");
   });
 
   it("limpiarla con null vuelve a «sin configurar» y audita el anterior y el null", async () => {
