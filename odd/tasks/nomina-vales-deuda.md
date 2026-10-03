@@ -1,5 +1,12 @@
 # Nómina: los vales son vales, y el sobrante es deuda del empleado
 
+> **Corrección de rumbo (decisión del dueño 2026-10-01, registrada 2026-10-02).**
+> La instalación es de **una sola sede, físicamente**. Esta unidad **no depende de
+> nada multi sede y sigue igual**: el total real del vale, la deuda arrastrada y el
+> marcado atómico se implementaron tal como se decidió aquí. Lo único que se anota
+> es que la deuda, hoy acotada a sede + empleado, quedará acotada a instalación +
+> empleado cuando se elimine la columna. Ver «Corrección de rumbo» al final.
+
 ## Objective
 Que la columna de vales de la liquidación muestre **la suma real** de los vales del
 empleado dentro del rango del período, y que el sobrante que hoy se pierde cuando el
@@ -38,6 +45,7 @@ Dentro:
 - Persistir el **total real de vales** del período por empleado (hoy solo se guarda el
   valor recortado).
 - Persistir y **arrastrar el sobrante** como deuda del empleado de la sede.
+  — Con una sola sede, la deuda es **de la instalación** y del empleado.
 - La columna "Vales" muestra el total real; el neto sigue con piso en cero y no cambia la
   igualdad de la tabla.
 
@@ -54,16 +62,20 @@ deuda entrante se aplica al neto **dentro de `other_discounts`** (así la iguald
 vigente sin tocarla) y su trazabilidad vive en la tabla de deudas, que registra en qué
 período se aplicó.
 - La deuda es por sede + empleado, y su origen debe ser trazable (de qué período salió).
+  — El índice único hoy es `(sede_id, employee_id)`: mientras la columna exista así
+  queda, y cuando se elimine (M3c) pasa a ser por **instalación + empleado**, sin
+  cambio de comportamiento (una sola instalación, una deuda por empleado).
 - Suite completa y `typecheck` en 0 antes de cerrar.
 
 ## Tasks
-- [ ] WU1 migración: columna `voucher_total` (total real, fuera de la igualdad) + tabla
+- [x] WU1 migración: columna `voucher_total` (total real, fuera de la igualdad) + tabla
   `payroll_discount_carries` + reemplazo de `payroll_apply_atomic` para persistir el total
   real y registrar el sobrante como deuda (SQL, idempotente)
-- [ ] WU2 cálculo: enviar el total real, aplicar la deuda entrante dentro de
+- [x] WU2 cálculo: enviar el total real, aplicar la deuda entrante dentro de
   `other_discounts` y registrar el sobrante saliente
-- [ ] WU3 UI: la columna muestra el total real y la deuda pendiente queda visible
-- [ ] WU4 gate completo + commits por unidad + push
+- [x] WU3 UI: la columna muestra el total real y la deuda pendiente queda visible
+- [ ] WU4 gate completo + commits por unidad + push — sin marcar: el cierre de unidad vive
+      en el gate de la rama, que sigue en curso con M3a
 
 ## Authorized scope
 Nómina (liquidación), migración nueva, cálculo, persistencia y la columna de vales.
@@ -85,9 +97,34 @@ Rama `feat/orabella-mvp`.
   decisión del dueño. Diseño fijado: el total real va en columna propia fuera de la
   igualdad, y la deuda entrante se aplica dentro de `other_discounts` para no tocar el
   `CHECK`. Pendiente: derivar WU1.
+- 2026-10-02: WU1–WU3 cerradas y subidas. La decisión de sede única no altera esta
+  unidad; el único ajuste pendiente es el índice de la deuda, que queda por
+  instalación cuando se elimine la columna (M3c).
+
+## Corrección de rumbo: la instalación es de UNA SOLA SEDE (dueño, 2026-10-01)
+
+**Esta unidad no cambia.** Nada de lo que se decidió aquí dependía de que la
+instalación tuviera varias sedes: el total real del vale vive en su propia columna
+(`voucher_total`, fuera de la igualdad de `payroll_items`), la deuda entrante se
+aplica dentro de `other_discounts` y el sobrante saliente se registra con su período
+de origen. Todo eso se implementó tal cual y sigue vigente.
+
+Lo único que se registra:
+
+- La deuda se sigue indexando por `(sede_id, employee_id)` mientras la columna exista;
+  cuando se elimine (M3c) el índice queda por **instalación + empleado**. Con una
+  sola sede no cambia el comportamiento observable.
+- `voucher_settings` (topes de día y semana) tiene su propia unidad de reemplazo: el
+  dueño eligió una tabla `system_settings` de clave/valor (M3b del plan de sede
+  única). No toca el cálculo de esta unidad, pero conviene tenerlo presente al
+  leer los topes.
+
+El plan completo de la migración a sede única y su estado están en
+`odd/tasks/plataforma-super-admin.md` («Corrección de rumbo y plan de sede única»).
 
 ## Next step
-- WU1 (migración) y WU2 (cálculo) en cuanto se libere `payroll-client.tsx`.
+- Nada pendiente de esta unidad: WU1–WU3 cerradas. Lo que sigue es la rama, con la
+  unidad M3a en curso y M3c (eliminación de la columna) más adelante.
 
 ## Route declaration
 - Delegación a `gentle-ai-worker` por unidad, con superficies disjuntas.
