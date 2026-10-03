@@ -26,7 +26,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
     const session = await requireAdminSession(tokenOf(request));
     const { id } = await context.params;
     const body: unknown = await request.json().catch(() => ({}));
-    const data = await editInvoiceItems(session.sedeId, id, body, {
+    const data = await editInvoiceItems(id, body, {
       userId: session.userId,
       sedeId: session.sedeId,
       roles: session.roles,

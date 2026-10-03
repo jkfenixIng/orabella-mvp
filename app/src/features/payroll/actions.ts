@@ -54,10 +54,7 @@ function toFailure(error: unknown): { success: false; code: string; message: str
 export async function openPayrollPeriodAction(input: unknown) {
   try {
     const session = await requirePayrollAdmin(await sessionToken());
-    const data = await openPayrollPeriod(input, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await openPayrollPeriod(session.sedeId, input, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -68,10 +65,7 @@ export async function openPayrollPeriodAction(input: unknown) {
 export async function calculatePayrollAction(id: string, input: unknown) {
   try {
     const session = await requirePayrollAdmin(await sessionToken());
-    const data = await calculatePayroll(session.sedeId, id, input, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await calculatePayroll(id, input, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -93,10 +87,7 @@ export async function calculatePayrollAction(id: string, input: unknown) {
 export async function payPayrollItemAction(id: string, input: unknown) {
   try {
     const session = await requirePayrollAdmin(await sessionToken());
-    const data = await payPayrollItem(session.sedeId, id, input, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await payPayrollItem(id, input, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -110,10 +101,7 @@ export async function payPayrollItemAction(id: string, input: unknown) {
 export async function payPayrollExtraAction(input: unknown) {
   try {
     const session = await requirePayrollAdmin(await sessionToken());
-    const data = await payPayrollExtra(input, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await payPayrollExtra(input, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -155,8 +143,8 @@ export async function listPayrollMonthRowsAction(input: { month: string; employe
 /** Misma lógica que POST /api/v1/payroll-periods/:id/close (solo admin). */
 export async function closePayrollPeriodAction(id: string) {
   try {
-    const session = await requirePayrollAdmin(await sessionToken());
-    const data = await closePayrollPeriod(session.sedeId, id);
+    await requirePayrollAdmin(await sessionToken());
+    const data = await closePayrollPeriod(id);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -167,10 +155,7 @@ export async function closePayrollPeriodAction(id: string) {
 export async function deletePayrollPeriodAction(id: string) {
   try {
     const session = await requirePayrollAdmin(await sessionToken());
-    const data = await deletePayrollPeriod(session.sedeId, id, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await deletePayrollPeriod(id, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -185,10 +170,7 @@ export async function deletePayrollPeriodAction(id: string) {
 export async function correctPayrollPeriodAction(id: string, input: unknown) {
   try {
     const session = await requirePayrollAdmin(await sessionToken());
-    const data = await correctPayrollPeriod(session.sedeId, id, input, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await correctPayrollPeriod(id, input, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -201,8 +183,8 @@ export async function correctPayrollPeriodAction(id: string, input: unknown) {
  */
 export async function getPayrollPeriodCorrectionAction(id: string) {
   try {
-    const session = await requirePayrollAdmin(await sessionToken());
-    const data = await getPayrollPeriodCorrection(session.sedeId, id);
+    await requirePayrollAdmin(await sessionToken());
+    const data = await getPayrollPeriodCorrection(id);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -232,7 +214,7 @@ export async function listPeriodsAction() {
 export async function getPeriodDetailAction(id: string) {
   try {
     const session = await requirePayrollViewer(await sessionToken());
-    const data = await getPeriodDetail(session.sedeId, id);
+    const data = await getPeriodDetail(id);
     // Solo el admin ve la nómina completa; el empleado ve la suya. La caja no
     // llega hasta acá (requirePayrollViewer la rechaza antes).
     const isManager = (session.roles ?? []).includes("admin");
@@ -272,7 +254,7 @@ export async function getPayrollSettlementSourcesAction(periodId: string, employ
       const mine = (await listAllEmployees()).find((row) => row.user_id === session.userId);
       targetEmployeeId = mine?.id ?? "sin-acceso";
     }
-    const data = await getPayrollSettlementSources(session.sedeId, periodId, targetEmployeeId);
+    const data = await getPayrollSettlementSources(periodId, targetEmployeeId);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -316,10 +298,7 @@ export async function getVoucherSettingsAction() {
 export async function setVoucherLimitsAction(input: unknown) {
   try {
     const session = await requirePayrollAdmin(await sessionToken());
-    const data = await setVoucherLimits(input, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await setVoucherLimits(input, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -332,7 +311,6 @@ export async function requestVoucherAction(input: unknown) {
     const session = await requirePayrollPayer(await sessionToken());
     const data = await requestVoucher(input, {
       userId: session.userId,
-      sedeId: session.sedeId,
       roles: session.roles,
     });
     return { success: true as const, data };
@@ -379,10 +357,7 @@ export async function listVouchersAction(input: {
 export async function approveVoucherAction(id: string, input: unknown) {
   try {
     const session = await requirePayrollAdmin(await sessionToken());
-    const data = await approveVoucher(session.sedeId, id, input, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await approveVoucher(id, input, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -393,7 +368,7 @@ export async function approveVoucherAction(id: string, input: unknown) {
 export async function rejectVoucherAction(id: string, input: unknown) {
   try {
     const session = await requirePayrollAdmin(await sessionToken());
-    const data = await rejectVoucher(session.sedeId, id, input, { userId: session.userId });
+    const data = await rejectVoucher(id, input, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

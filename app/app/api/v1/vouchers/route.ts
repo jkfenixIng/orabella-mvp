@@ -58,7 +58,6 @@ export async function POST(request: NextRequest) {
     const body: unknown = await request.json().catch(() => ({}));
     const data = await requestVoucher(body, {
       userId: session.userId,
-      sedeId: session.sedeId,
       roles: session.roles,
     });
     return ok(data, 201);

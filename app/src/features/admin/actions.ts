@@ -13,7 +13,6 @@ import {
   listTaxes,
   requireAdminSession,
   requireSession,
-  resolveSede,
   setUserRoles,
   upsertEmployee,
   upsertPaymentMethod,
@@ -43,11 +42,11 @@ export async function listEmployeesAction() {
   }
 }
 
-/** Usuarios de la sede con roles (selector de vínculo y pestaña Usuarios). */
-export async function listSedeUsersAction(sedeId?: string) {
+/** Cuentas de la instalación con roles (selector de vínculo y pestaña Usuarios). */
+export async function listSedeUsersAction() {
   try {
     const session = await requireSession(await sessionToken());
-    return { success: true as const, data: await listSedeUsers(resolveSede(session.sedeId, sedeId)) };
+    return { success: true as const, data: await listSedeUsers(session.sedeId) };
   } catch (error) {
     return toFailure(error);
   }
@@ -57,13 +56,10 @@ export async function listSedeUsersAction(sedeId?: string) {
 export async function upsertEmployeeAction(input: unknown) {
   try {
     const session = await requireAdminSession(await sessionToken());
-    const data = await upsertEmployee({
-      ...(typeof input === "object" && input !== null ? input : {}),
-      sede_id: resolveSede(
-        session.sedeId,
-        (input as { sede_id?: string }).sede_id,
-      ),
-    });
+    const data = await upsertEmployee(
+      typeof input === "object" && input !== null ? input : {},
+      session.sedeId,
+    );
     revalidateTag("catalog:employees");
     return { success: true as const, data };
   } catch (error) {
@@ -74,10 +70,8 @@ export async function upsertEmployeeAction(input: unknown) {
 /** Misma lógica que GET /api/v1/employees/:id (requiere sesión). */
 export async function getEmployeeAction(id: string) {
   try {
-    const session = await requireSession(await sessionToken());
-    const data = await getEmployee(id);
-    resolveSede(session.sedeId, data.sede_id);
-    return { success: true as const, data };
+    await requireSession(await sessionToken());
+    return { success: true as const, data: await getEmployee(id) };
   } catch (error) {
     return toFailure(error);
   }
@@ -96,11 +90,8 @@ export async function listServicesAction() {
 /** Misma lógica que POST /api/v1/services (solo admin). */
 export async function upsertServiceAction(input: unknown) {
   try {
-    const session = await requireAdminSession(await sessionToken());
-    const data = await upsertService({
-      ...(typeof input === "object" && input !== null ? input : {}),
-      sede_id: resolveSede(session.sedeId, (input as { sede_id?: string }).sede_id),
-    });
+    await requireAdminSession(await sessionToken());
+    const data = await upsertService(typeof input === "object" && input !== null ? input : {});
     revalidateTag("catalog:services");
     return { success: true as const, data };
   } catch (error) {
@@ -121,11 +112,8 @@ export async function listTaxesAction() {
 /** Misma lógica que POST /api/v1/taxes (solo admin). */
 export async function upsertTaxConfigAction(input: unknown) {
   try {
-    const session = await requireAdminSession(await sessionToken());
-    const data = await upsertTaxConfig({
-      ...(typeof input === "object" && input !== null ? input : {}),
-      sede_id: resolveSede(session.sedeId, (input as { sede_id?: string }).sede_id),
-    });
+    await requireAdminSession(await sessionToken());
+    const data = await upsertTaxConfig(typeof input === "object" && input !== null ? input : {});
     revalidateTag("catalog:taxes");
     return { success: true as const, data };
   } catch (error) {
@@ -149,11 +137,10 @@ export async function listPaymentMethodsAction() {
 /** Misma lógica que POST /api/v1/payment-methods (solo admin). */
 export async function upsertPaymentMethodAction(input: unknown) {
   try {
-    const session = await requireAdminSession(await sessionToken());
-    const data = await upsertPaymentMethod({
-      ...(typeof input === "object" && input !== null ? input : {}),
-      sede_id: resolveSede(session.sedeId, (input as { sede_id?: string }).sede_id),
-    });
+    await requireAdminSession(await sessionToken());
+    const data = await upsertPaymentMethod(
+      typeof input === "object" && input !== null ? input : {},
+    );
     revalidateTag("catalog:payment-methods");
     return { success: true as const, data };
   } catch (error) {

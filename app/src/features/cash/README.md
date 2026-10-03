@@ -48,8 +48,8 @@ totaliza), historial por fecha.
   calcula recogido/diferencia), `getDayView` (siempre hoy en hora Bogotá;
   turnos + acumulado = suma de turnos sin totalizar la base; el contado
   suma solo cerrados), `getHistory` (rango sobre `opened_at` en hora
-  Bogotá, 50 máx). Escritura: admin/caja. Reutiliza `requireSedeRole`/
-  `resolveSede`, `listPaymentMethods` (T3), `getInvoiceDetail` +
+  Bogotá, 50 máx). Escritura: admin/caja. Reutiliza `requireSedeRole`,
+  `listPaymentMethods` (T3), `getInvoiceDetail` +
   `roundMoney`/`moneyEquals` (T5), `ok()`/`fail()`.
 - API-first (`/api/v1`): `POST /cash-shifts/open` (equivale al
   `cash-shifts:open` del PRD; `:` no es válido en carpetas Windows),

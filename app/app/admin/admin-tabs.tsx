@@ -32,8 +32,10 @@ const TABS: Array<{ value: Tab; label: string }> = [
 
 interface AdminTabsProps {
   /**
-   * Sede de la sesión: la siguen pidiendo `listSedeUsers` (usuarios de la sede
-   * con sus roles) y los formularios de alta que guardan `sede_id` en la fila.
+   * Fila de la instalación de la sesión: la siguen pidiendo `listSedeUsers`
+   * (cuentas con sus roles) y el alta de la CUENTA de acceso de un empleado.
+   * Los formularios de catálogos y el legajo ya no la envían: el servidor la
+   * resuelve y la columnanullable ya no la exige.
    */
   sedeId: string;
   currentUserId: string;
@@ -51,7 +53,7 @@ export function AdminTabs(props: AdminTabsProps) {
   const [users, setUsers] = useState(props.initialUsers);
 
   async function refreshUsers() {
-    const result: ActionResult<SedeUserRow[]> = await listSedeUsersAction(props.sedeId);
+    const result: ActionResult<SedeUserRow[]> = await listSedeUsersAction();
     if (result.success) setUsers(result.data);
   }
 
@@ -86,10 +88,10 @@ export function AdminTabs(props: AdminTabsProps) {
         />
       </TabsPanel>
       <TabsPanel value="impuestos">
-        <TaxesSection sedeId={props.sedeId} initial={props.initialTaxes} />
+        <TaxesSection initial={props.initialTaxes} />
       </TabsPanel>
       <TabsPanel value="metodos">
-        <MethodsSection sedeId={props.sedeId} initial={props.initialMethods} />
+        <MethodsSection initial={props.initialMethods} />
       </TabsPanel>
       <TabsPanel value="vales">
         <ValesSection initial={props.initialVoucherSettings} />

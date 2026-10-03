@@ -13,7 +13,7 @@ export type PayType = z.infer<typeof payTypeSchema>;
 export const payFrequencySchema = z.enum(["semanal", "quincenal", "mensual"]);
 export type PayFrequency = z.infer<typeof payFrequencySchema>;
 
-/** ADM-07: catálogo de métodos de pago de Colombia por sede. */
+/** ADM-07: catálogo de métodos de pago de Colombia de la instalación. */
 export const paymentMethodCodeSchema = z.enum([
   "efectivo",
   "transferencia_normal",
@@ -24,16 +24,21 @@ export const paymentMethodCodeSchema = z.enum([
 ]);
 export type PaymentMethodCode = z.infer<typeof paymentMethodCodeSchema>;
 
-/** ADM-06: códigos de impuesto configurables por sede. */
+/** ADM-06: códigos de impuesto configurables de la instalación. */
 export const taxCodeSchema = z.enum(["IVA", "ICA", "Rete", "otro"]);
 export type TaxCode = z.infer<typeof taxCodeSchema>;
 
 const uuidSchema = z.uuid("Identificador inválido.");
-const sedeIdSchema = z.uuid("Sede inválida.");
 export const optionalText = (max: number, label: string) =>
   z.string().trim().max(max, `${label} muy largo.`).optional();
 
-/** ADM-01: sede (nombre, dirección, teléfono, activa/inactiva). */
+/**
+ * ADM-01: sede (nombre, dirección, teléfono, activa/inactiva).
+ *
+ * La fila de `sedes` sigue existiendo y describe LA instalación (una sola), así
+ * que el esquema de la fila no cambia. Lo que se retiró es el catálogo de sedes
+ * del negocio: no hay ni alta ni lista de sedes en la administración.
+ */
 export const sedeSchema = z.object({
   id: uuidSchema.optional(),
   name: z.string().trim().min(1, "Nombre requerido.").max(120, "Nombre muy largo."),
@@ -60,16 +65,20 @@ export function isEmployeeCodeMissing(code: string | null | undefined): boolean 
 
 /**
  * ADM-03: conflicto de unicidad parcial a nivel app (además del índice
- * uq_employees_sede_code). Dos códigos con valor iguales en la misma sede
- * colisionan; los vacíos/nulos nunca colisionan.
+ * uq_employees_sede_code). Dos códigos con valor iguales colisionan; los
+ * vacíos/nulos nunca colisionan.
+ *
+ * Ya NO lleva la sede de cada lado: `uq_employees_sede_code` se recreó sobre
+ * `(employee_code, …)` sin la sede (074), así que la restricción que este
+ * predicado refleja compara sólo el código. Comparar las dos sedes era una
+ * frontera de fila que únicamente tenía sentido con varias instalaciones; con
+ * una sola, los dos lados son siempre la misma fila de negocio y el resultado
+ * no podía cambiar.
  */
 export function areEmployeeCodesConflicting(args: {
-  sedeIdA: string;
   codeA: string | null | undefined;
-  sedeIdB: string;
   codeB: string | null | undefined;
 }): boolean {
-  if (args.sedeIdA !== args.sedeIdB) return false;
   const a = normalizeEmployeeCode(args.codeA);
   const b = normalizeEmployeeCode(args.codeB);
   if (a === null || b === null) return false;
@@ -109,7 +118,6 @@ export function checkPayCoherence(args: {
 export const employeeSchema = z
   .object({
     id: uuidSchema.optional(),
-    sede_id: sedeIdSchema,
     full_name: z.string().trim().min(2, "Nombre requerido.").max(120, "Nombre muy largo."),
     employee_code: z.string().trim().max(40, "Código muy largo.").nullish(),
     document: z.string().trim().min(3, "Documento inválido.").max(20, "Documento inválido."),
@@ -152,7 +160,6 @@ export type EmployeeInput = z.infer<typeof employeeSchema>;
 export const serviceSchema = z
   .object({
     id: uuidSchema.optional(),
-    sede_id: sedeIdSchema,
     name: z.string().trim().min(1, "Nombre requerido.").max(120, "Nombre muy largo."),
     description: z.string().trim().max(500, "Descripción muy larga.").nullish(),
     price: z.coerce.number().nonnegative("El precio no puede ser negativo."),
@@ -170,10 +177,9 @@ export const serviceSchema = z
   });
 export type ServiceInput = z.infer<typeof serviceSchema>;
 
-/** ADM-06: impuesto configurable por sede (inician inactivos en 0). */
+/** ADM-06: impuesto configurable de la instalación (inician inactivos en 0). */
 export const taxConfigSchema = z.object({
   id: uuidSchema.optional(),
-  sede_id: sedeIdSchema,
   code: taxCodeSchema,
   name: z.string().trim().min(1, "Nombre requerido.").max(120, "Nombre muy largo."),
   percent: z.coerce.number().min(0, "El porcentaje mínimo es 0.").max(100, "El porcentaje máximo es 100."),
@@ -181,10 +187,9 @@ export const taxConfigSchema = z.object({
 });
 export type TaxConfigInput = z.infer<typeof taxConfigSchema>;
 
-/** ADM-07: método de pago del catálogo Colombia por sede. */
+/** ADM-07: método de pago del catálogo Colombia de la instalación. */
 export const paymentMethodSchema = z.object({
   id: uuidSchema.optional(),
-  sede_id: sedeIdSchema,
   code: paymentMethodCodeSchema,
   name: z.string().trim().min(1, "Nombre requerido.").max(120, "Nombre muy largo."),
   is_active: z.boolean().optional(),

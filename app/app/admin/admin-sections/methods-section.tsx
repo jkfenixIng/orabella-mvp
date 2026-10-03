@@ -26,7 +26,7 @@ const EMPTY_METHOD = { code: "efectivo", name: "", is_active: true, arqueable: t
  * el alta es secundaria del listado, y el error del intento lo muestra el
  * diálogo porque es el estado de ESE formulario.
  */
-export function MethodsSection({ sedeId, initial }: { sedeId: string; initial: PaymentMethodRow[] }) {
+export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
   const [rows, setRows] = useState(initial);
   const [form, setForm] = useState(EMPTY_METHOD);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -61,7 +61,6 @@ export function MethodsSection({ sedeId, initial }: { sedeId: string; initial: P
     setError(null);
     const result: ActionResult<PaymentMethodRow> = await upsertPaymentMethodAction({
       ...(editingId ? { id: editingId } : {}),
-      sede_id: sedeId,
       code: form.code,
       name: form.name,
       is_active: form.is_active,

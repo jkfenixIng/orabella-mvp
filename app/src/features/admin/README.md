@@ -36,9 +36,9 @@ impuestos por sede (inician inactivos en 0), métodos de pago Colombia por sede.
 - Sin borrado físico: todo se desactiva con `is_active` (TRA-02).
 - RLS deny-by-default en las 5 tablas; políticas T3 permisivas (`USING true`)
   con TODO documentado porque las sesiones del MVP son tokens opacos propios
-  (sin claim de sede en `auth.jwt()`). La segregación por sede la aplica hoy
-  la capa servidor: `requireSedeRole` + `resolveSede` (una sola sede: el
-  `sede_id` solicitado debe coincidir con el de la sesión). Endurecer en T7.
+  (sin claim de sede en `auth.jwt()`). La segregación la aplica hoy la capa
+  servidor por ROL: `requireSedeRole` (una sola sede: ya no hay comparación de
+  sede, la de la columna se retiró con ella). Endurecer en T7.
 
 ## Endpoints (REST API-first, validación Zod en servidor)
 
@@ -67,7 +67,7 @@ Server Actions sobre el mismo servicio que la API.
 
 `tests/admin.test.ts` (vitest, unit, sin red): esquemas Zod (pay_type
 coherente, min<=max, percent 0–100, códigos de pago, roles), unicidad parcial
-(normalización y conflictos), `requireSedeRole`/`resolveSede`, y contenido de
+(normalización y conflictos), `requireSedeRole`, y contenido de
 la migración `003_admin.sql` (5 tablas, índice parcial, NOT NULL + FK,
 políticas RLS con TODO, seeds).
 

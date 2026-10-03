@@ -50,11 +50,8 @@ export async function listCommissionRulesAction(input: {
 /** Crea o ajusta una regla (solo admin). */
 export async function upsertCommissionRuleAction(input: unknown) {
   try {
-    const session = await requireAdminSession(await sessionToken());
-    const data = await upsertCommissionRule(input, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    await requireAdminSession(await sessionToken());
+    const data = await upsertCommissionRule(input);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -64,8 +61,8 @@ export async function upsertCommissionRuleAction(input: unknown) {
 /** Elimina una regla (solo admin). */
 export async function deleteCommissionRuleAction(id: string) {
   try {
-    const session = await requireAdminSession(await sessionToken());
-    const data = await deleteCommissionRule(session.sedeId, id);
+    await requireAdminSession(await sessionToken());
+    const data = await deleteCommissionRule(id);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -76,10 +73,7 @@ export async function deleteCommissionRuleAction(id: string) {
 export async function payCommissionNowAction(input: unknown) {
   try {
     const session = await requireCashWriter(await sessionToken());
-    const data = await payCommissionNow(input, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await payCommissionNow(input, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

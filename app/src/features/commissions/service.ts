@@ -38,11 +38,6 @@ async function commissionsDb() {
 
 type DbClient = Awaited<ReturnType<typeof commissionsDb>>;
 
-export interface CommissionActor {
-  userId: string;
-  sedeId: string;
-}
-
 function validationMessage(error: { issues: Array<{ message: string }> }): string {
   return error.issues[0]?.message ?? "Datos inválidos.";
 }
@@ -50,7 +45,7 @@ function validationMessage(error: { issues: Array<{ message: string }> }): strin
 // ------------------------------------------------------------------ reglas ---
 
 const RULE_SELECT =
-  "id, sede_id, item_type, item_id, employee_id, percent, amount, is_active";
+  "id, item_type, item_id, employee_id, percent, amount, is_active";
 
 /** Reglas (filtro opcional por ítem o empleado). */
 export async function listCommissionRules(
@@ -68,7 +63,7 @@ export async function listCommissionRules(
 
 /**
  * Crea o ajusta la regla de un (ítem × empleado). Solo admin (el gate
- * vive en actions). Valida que ítem y empleado existan en la sede.
+ * vive en actions). Valida que ítem y empleado existan.
  *
  * `onConflict: "item_type,item_id,employee_id"` — la clave es de INSTALACIÓN,
  * sin `sede_id`. La inferencia de `ON CONFLICT` exige coincidencia EXACTA con
@@ -87,10 +82,7 @@ export async function listCommissionRules(
  * anotado en el encabezado de esa migración, en la sección 3 de la 075 y en
  * «LO QUE ESTE ARCHIVO NO TOCA» de la 074.
  */
-export async function upsertCommissionRule(
-  raw: unknown,
-  actor: CommissionActor,
-): Promise<CommissionRuleRow> {
+export async function upsertCommissionRule(raw: unknown): Promise<CommissionRuleRow> {
   const parsed = commissionRuleSchema.safeParse(raw);
   if (!parsed.success) {
     throw new CommissionError("VALIDATION", validationMessage(parsed.error), 400);
@@ -120,7 +112,6 @@ export async function upsertCommissionRule(
     .upsert(
       {
         ...(input.id ? { id: input.id } : {}),
-        sede_id: actor.sedeId,
         item_type: input.item_type,
         item_id: input.item_id,
         employee_id: input.employee_id,
@@ -142,17 +133,13 @@ export async function upsertCommissionRule(
   return data as CommissionRuleRow;
 }
 
-/** Elimina una regla (solo admin, acotado a la sede). */
-export async function deleteCommissionRule(
-  sedeId: string,
-  id: string,
-): Promise<{ id: string }> {
+/** Elimina una regla (solo admin). */
+export async function deleteCommissionRule(id: string): Promise<{ id: string }> {
   const db = await commissionsDb();
   const { data, error } = await db
     .from("commission_rules")
     .delete()
     .eq("id", id)
-    .eq("sede_id", sedeId)
     .select("id")
     .maybeSingle();
   if (error) throw new CommissionError("INTERNAL", "Error interno.", 500);
@@ -161,6 +148,11 @@ export async function deleteCommissionRule(
 }
 
 // ------------------------------------------------------------------- ganado ---
+
+/** El que paga la comisión: sólo su identidad. */
+export interface CommissionActor {
+  userId: string;
+}
 
 export interface EarnedCommission {
   baseSubtotal: number;
@@ -351,7 +343,7 @@ export async function immediatePaidTotal(
 // -------------------------------------------------------------------- pagos ---
 
 const PAYOUT_SELECT =
-  "id, sede_id, employee_id, invoice_id, cash_shift_id, method_code, base_subtotal, percent_applied, fixed_applied, earned_immediate, amount, paid_by, paid_at";
+  "id, employee_id, invoice_id, cash_shift_id, method_code, base_subtotal, percent_applied, fixed_applied, earned_immediate, amount, paid_by, paid_at";
 
 /**
  * CL-5: la fila de `commission_payouts` que YA se registró con esa marca, DENTRO
@@ -369,10 +361,10 @@ const PAYOUT_SELECT =
  * este lookup y la clave del índice son el mismo conjunto, así que este lookup
  * no puede devolver una fila que el índice no habría bloqueado.
  *
- * La sede NO entra en la clave porque no agrega identidad: la factura pertenece
- * a una sola sede y el servicio la resuelve dentro de la del actor (una factura
- * ajena es NOT_FOUND en `earnedCommissionFor`), así que este lookup corre
- * DESPUÉS de esa validación y no puede devolver el pago de otra sede.
+ * La sede NO entra en la clave porque no agrega identidad: la factura es el
+ * registro de la operación (una factura ajena es NOT_FOUND en
+ * `earnedCommissionFor`), así que este lookup corre DESPUÉS de esa validación y
+ * no puede devolver el pago de otra factura.
  */
 async function findCommissionPayoutByIdempotencyKey(
   db: DbClient,
@@ -406,8 +398,8 @@ async function findCommissionPayoutByIdempotencyKey(
  *
  * CL-5 (idempotencia): el orden empieza por la MARCA del intento
  * (`idempotency_key`, columna e índice único parcial de la 044), DESPUÉS de
- * `earnedCommissionFor` —que es lo que valida el par dentro de la sede del
- * actor, así el lookup no puede devolver el pago de otra sede— y ANTES de leer
+ * `earnedCommissionFor` —que es lo que valida el par, así el lookup no puede
+ * devolver el pago de otra factura— y ANTES de leer
  * lo ya pagado y de decidir el pendiente. Un reintento del MISMO envío (doble
  * clic, o el navegador reenviando tras cortarse la red) se reconoce y devuelve
  * el pago ya registrado como un no-op EXITOSO: no paga de nuevo.
@@ -480,7 +472,7 @@ export async function payCommissionNow(
     );
   }
 
-  const shift = await getOpenShift(actor.sedeId).catch(() => {
+  const shift = await getOpenShift().catch(() => {
     throw new CommissionError("INTERNAL", "Error interno.", 500);
   });
   if (!shift) {
@@ -568,7 +560,6 @@ export async function payCommissionNow(
   const { data, error } = await db
     .from("commission_payouts")
     .insert({
-      sede_id: actor.sedeId,
       employee_id: input.employee_id,
       invoice_id: input.invoice_id,
       cash_shift_id: shift.id,

@@ -226,6 +226,13 @@ export function nextFailedLoginState(
 // ----------------------------------------------------------- persistencia ---
 export interface AuthUserRow {
   id: string;
+  /**
+   * La cuenta sigue nombrando la instalación a la que pertenece, y las guardas
+   * de sesión la exigen (`requireSession`, `requireAdminSession`, las de caja,
+   * facturación, inventario y nómina, y `requirePlatformAdmin`): sin ella la
+   * sesión se rechaza con NO_SEDE. Es un campo DEVUELTO de la fila de la cuenta,
+   * no un criterio con el que el negocio acote sus lecturas.
+   */
   sede_id: string | null;
   email: string | null;
   phone: string | null;
@@ -468,7 +475,7 @@ export async function changeUserPassword(args: {
   const db = await adminDb();
   const { data: user, error } = await db
     .from("users")
-    .select("id, password_hash, sede_id")
+    .select("id, password_hash")
     .eq("id", args.userId)
     .maybeSingle();
   if (error) throw new AuthError("INTERNAL", "Error interno.", 500);
@@ -755,12 +762,24 @@ export async function adminCreateUser(raw: unknown): Promise<{ id: string }> {
   }
 
   // Vínculo automático (best-effort, no rompe el alta): empleados sin
-  // usuario con el mismo documento en la sede quedan vinculados.
-  if (input.sede_id) {
+  // usuario con el mismo documento quedan vinculados. Con una sola
+  // instalación, el documento basta para ubicar al empleado.
+  //
+  // El vínculo ya NO se condiciona a que el cuerpo traiga `sede_id`: esa
+  // condición era la frontera que impedía enlazar cuando el cuerpo no la
+  // nominaba, y con una instalación sola el documento identifica al empleado
+  // sin más. `sede_id` sigue declarado en el esquema y este módulo lo sigue
+  // usando en los dos sentidos: lo ESCRIBE en el ARGUMENTO `p_user` de
+  // `create_user_with_role`, que es contrato de la base (ver
+  // `createUserWithRoleSchema`), y lo LEE de vuelta de la fila de la cuenta
+  // (`findUserByDocument`, la lectura de sesión), porque las guardas de sesión
+  // lo exigen (ver `AuthUserRow.sede_id`). Lo que se retiró es el alcance por
+  // sede de las lecturas del negocio, no la columna: eso se va con el borrado
+  // físico de la columna en la migración final de una sola sede (M3c).
+  {
     const { error: linkError } = await db
       .from("employees")
       .update({ user_id: userId })
-      .eq("sede_id", input.sede_id)
       .eq("document", input.documento)
       .is("user_id", null);
     if (linkError) console.error("[auth] no se pudo vincular empleado:", linkError.message);
@@ -773,24 +792,22 @@ export async function adminCreateUser(raw: unknown): Promise<{ id: string }> {
  * AUTH-04: el admin restablece la clave de un usuario de su sede a su
  * documento (convención de clave inicial), con cambio forzado al entrar.
  * Desbloquea y limpia intentos. Queda auditado.
+ *
+ * La comprobación por fila se retiró con la columna: ya no recibe sede.
  */
 export async function adminResetUserPassword(
-  sedeId: string,
   userId: string,
   actorUserId: string,
 ): Promise<{ user_id: string }> {
   const db = await adminDb();
   const { data: target, error: targetError } = await db
     .from("users")
-    .select("id, sede_id, id_number")
+    .select("id, id_number")
     .eq("id", userId)
     .maybeSingle();
   if (targetError) throw new AuthError("INTERNAL", "Error interno.", 500);
   if (!target) throw new AuthError("NOT_FOUND", "Usuario no encontrado.", 404);
-  const row = target as { id: string; sede_id: string | null; id_number: string };
-  if (row.sede_id !== sedeId) {
-    throw new AuthError("FORBIDDEN", "Ese usuario no es de esta sede.", 403);
-  }
+  const row = target as { id: string; id_number: string };
   const { error: updateError } = await db
     .from("users")
     .update({

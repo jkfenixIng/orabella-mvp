@@ -22,9 +22,8 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
     const session = await requireCashWriter(tokenOf(request));
     const { id } = await context.params;
     const body: unknown = await request.json().catch(() => ({}));
-    const data = await closeShift(session.sedeId, id, body, {
+    const data = await closeShift(id, body, {
       userId: session.userId,
-      sedeId: session.sedeId,
       roles: session.roles,
     });
     return ok(data);

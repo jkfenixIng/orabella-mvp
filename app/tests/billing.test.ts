@@ -3428,7 +3428,6 @@ describe("billing: gate de sobre-cobro al bajar el total de una emitida (WU2)", 
 
   function edit(unitPrice: number, extra: Record<string, unknown> = {}) {
     return editEmittedInvoiceItems(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
       editPayload(unitPrice, extra),
       ACTOR,
@@ -3571,7 +3570,6 @@ describe("billing: el candado de nómina cerrada no se trunca (U5)", () => {
   /** Ajuste del precio de la única línea: 300.000 → `unitPrice` (toca pago). */
   function editInvoice(unitPrice: number) {
     return editEmittedInvoiceItems(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
       {
         items: [
@@ -3744,7 +3742,7 @@ describe("billing: la anulación respeta el candado de nómina y guarda el estad
   };
 
   function annul(motivo = "Cobro duplicado") {
-    return annulInvoice(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID, { motivo }, ACTOR);
+    return annulInvoice(overCollectionStub.INVOICE_ID, { motivo }, ACTOR);
   }
 
   beforeEach(() => {
@@ -3958,7 +3956,7 @@ describe("billing: la anulación es UNA transacción (CL-11)", () => {
   };
 
   function annul(motivo = "Cobro duplicado") {
-    return annulInvoice(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID, { motivo }, ACTOR);
+    return annulInvoice(overCollectionStub.INVOICE_ID, { motivo }, ACTOR);
   }
 
   /** Segunda línea de PRODUCTO: dos reversiones = el bucle de ayer. */
@@ -4196,7 +4194,6 @@ describe("billing: la comisión mostrada no se corta con las reglas (U7)", () =>
     expect(FLAT_COMMISSION).not.toBe(RULE_COMMISSION);
 
     const detail = await getInvoiceDetail(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
     );
 
@@ -4212,7 +4209,7 @@ describe("billing: la comisión mostrada no se corta con las reglas (U7)", () =>
       ruleRow(index + 1, EMPLOYEE_ID, RULE_PERCENT),
     );
 
-    await getInvoiceDetail(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID);
+    await getInvoiceDetail(overCollectionStub.INVOICE_ID);
 
     const ruleWindows = pagedStub.windows.filter((window) => window.table === "commission_rules");
     expect(ruleWindows.length).toBeGreaterThan(1);
@@ -4233,7 +4230,7 @@ describe("billing: la comisión mostrada no se corta con las reglas (U7)", () =>
     );
     pagedStub.tables.commission_rules = [];
 
-    await getInvoiceDetail(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID);
+    await getInvoiceDetail(overCollectionStub.INVOICE_ID);
 
     // Más de un lote: 150 ids no entran en una sola URL.
     expect(commissionStub.inSizes.length).toBeGreaterThan(1);
@@ -4246,7 +4243,6 @@ describe("billing: la comisión mostrada no se corta con las reglas (U7)", () =>
     pagedStub.tables.commission_rules = [ruleRow(1, EMPLOYEE_ID, RULE_PERCENT)];
 
     const detail = await getInvoiceDetail(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
     );
 
@@ -4263,7 +4259,6 @@ describe("billing: la comisión mostrada no se corta con las reglas (U7)", () =>
     pagedStub.failAt = { commission_rules: [1] };
 
     const failure: unknown = await getInvoiceDetail(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
     ).catch((error: unknown) => error);
 
@@ -4487,7 +4482,7 @@ describe("billing: dos ediciones de la misma factura se serializan (CO-1)", () =
     invoiceId = overCollectionStub.INVOICE_ID,
     itemId = overCollectionStub.ITEM_ID,
   ) {
-    return editEmittedInvoiceItems(overCollectionStub.SEDE_ID, invoiceId, payload(itemId), ACTOR);
+    return editEmittedInvoiceItems(invoiceId, payload(itemId), ACTOR);
   }
 
   /** Edición ADMIN (total inmutable + motivo): el otro camino del hallazgo. */
@@ -4496,7 +4491,6 @@ describe("billing: dos ediciones de la misma factura se serializan (CO-1)", () =
     itemId = overCollectionStub.ITEM_ID,
   ) {
     return editInvoiceItems(
-      overCollectionStub.SEDE_ID,
       invoiceId,
       { ...payload(itemId), motivo: "Cantidad mal digitada" },
       ACTOR,
@@ -4807,7 +4801,6 @@ describe("billing: el candado de edición cubre el estado de la factura (CL-1)",
   /** Edición ADMIN (total inmutable + motivo). */
   function adminEdit() {
     return editInvoiceItems(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
       { ...payload(overCollectionStub.ITEM_ID), motivo: "Cantidad mal digitada" },
       ACTOR,
@@ -4817,7 +4810,6 @@ describe("billing: el candado de edición cubre el estado de la factura (CL-1)",
   /** Edición LIBRE de emitida (cajera/turno; acá admin, que también puede). */
   function freeEdit() {
     return editEmittedInvoiceItems(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
       payload(overCollectionStub.ITEM_ID),
       ACTOR,
@@ -5139,12 +5131,11 @@ describe("billing: las dos ediciones de factura son UNA transacción (CL-12)", (
   }
 
   function adminEdit() {
-    return editInvoiceItems(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID, adminPayload(), ACTOR);
+    return editInvoiceItems(overCollectionStub.INVOICE_ID, adminPayload(), ACTOR);
   }
 
   function freeEdit() {
     return editEmittedInvoiceItems(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
       freePayload(),
       ACTOR,
@@ -5388,7 +5379,6 @@ describe("billing: las dos ediciones de factura son UNA transacción (CL-12)", (
     // nada más —los grupos vacíos pasan sus redes de conteo (0 = 0)—, que es lo
     // que hace legal editar una factura de servicios sin tocar el kardex.
     const detail = await editEmittedInvoiceItems(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
       {
         items: [
@@ -6301,9 +6291,8 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
   });
 
   it("RED: hoy el reintento del MISMO cobro no se reconoce (y el doble cobro no ocurre por el cobro exacto)", async () => {
-    const first = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const first = await splitPayment(payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
     const second: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6321,8 +6310,8 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
   });
 
   it("la repetición devuelve el MISMO resultado escribiendo nada (no-op exitoso)", async () => {
-    const first = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
-    const repeat = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const first = await splitPayment(payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const repeat = await splitPayment(payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
 
     expect(repeat.invoice.id).toBe(first.invoice.id);
     expect(repeat.invoice.status).toBe("Pagada");
@@ -6336,7 +6325,7 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
   });
 
   it("la carrera (lectura vieja del saldo + marca ya confirmada) relee a la ganadora", async () => {
-    const first = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const first = await splitPayment(payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
     // La otra petición leyó el saldo ANTES de que la ganadora confirmara (el
     // doble le sirve el snapshot viejo una sola vez) y tampoco vio la marca (el
     // doble saltea ese lookup una vez): así pasa la comprobación exacta y llega
@@ -6344,7 +6333,7 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     payStub.stalePaymentsOnce = [];
     payStub.skipMarkLookupOnce = true;
 
-    const second = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const second = await splitPayment(payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
 
     // El reintento sigue siendo un no-op: devuelve la factura de la ganadora.
     expect(second.invoice.id).toBe(first.invoice.id);
@@ -6365,9 +6354,8 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     // MISMA factura (el saldo queda en cero), así que el control se hace con
     // dos facturas: la marca reconoce UNA operación, no encadena cobros.
     seedInvoice(payStub.OTHER_INVOICE_ID, 8);
-    const first = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const first = await splitPayment(payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
     const second = await splitPayment(
-      payStub.SEDE_ID,
       payStub.OTHER_INVOICE_ID,
       closeInvoice(payStub.OTHER_INVOICE_ID, TOTAL, OTHER_MARK),
       ACTOR,
@@ -6379,7 +6367,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     expect(second.invoice.status).toBe("Pagada");
     // Y repetir la SEGUNDA marca devuelve la SEGUNDA factura, no la primera.
     const repeat = await splitPayment(
-      payStub.SEDE_ID,
       payStub.OTHER_INVOICE_ID,
       closeInvoice(payStub.OTHER_INVOICE_ID, TOTAL, OTHER_MARK),
       ACTOR,
@@ -6397,7 +6384,7 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
         { method_code: "transferencia", amount: 40000 },
       ],
     };
-    const result = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, portions, ACTOR);
+    const result = await splitPayment(payStub.INVOICE_ID, portions, ACTOR);
 
     // UNA sentencia multi-fila (no dos inserts fila por fila): es la premisa de
     // la que depende que el 23505 aborte la operación entera.
@@ -6414,7 +6401,7 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     expect(result.invoice.status).toBe("Pagada");
 
     // Y repetir ESA operación también es un no-op: las dos porciones.
-    const repeat = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, portions, ACTOR);
+    const repeat = await splitPayment(payStub.INVOICE_ID, portions, ACTOR);
     expect(payStub.payments).toHaveLength(2);
     expect(payInserts()).toBe(1);
     expect(repeat.payments).toHaveLength(2);
@@ -6424,7 +6411,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     // Una marca nueva NO convierte en cobrable lo que el saldo rechaza: la
     // comprobación exacta y el tope siguen mandando, con marca o sin ella.
     const failure: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID, 60000),
       ACTOR,
@@ -6438,7 +6424,7 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
 
   it("el tope de 031 sigue traduciéndose a OVERPAID cuando la marca NO es una repetición", async () => {
     // El primer cobro cierra la factura...
-    await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    await splitPayment(payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
     // ...y un SEGUNDO intento distinto entra con una lectura VIEJA del saldo (el
     // doble le sirve la foto previa una sola vez), con lo que pasa la
     // comprobación exacta y llega a escribir: ahí lo rechaza el tope de 031
@@ -6446,7 +6432,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     payStub.stalePaymentsOnce = [];
 
     const failure: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID, TOTAL, OTHER_MARK),
       ACTOR,
@@ -6464,13 +6449,11 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     // envío sin marca no se puede reconocer como repetición, y la ruta REST es
     // pública: es justo la que reintenta sobre redes. El rechazo es ruidoso.
     const withoutMark: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       { portions: [{ method_code: "efectivo", amount: TOTAL }] },
       ACTOR,
     ).catch((error: unknown) => error);
     const malformed: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       { idempotency_key: "no-es-un-uuid", portions: [{ method_code: "efectivo", amount: TOTAL }] },
       ACTOR,
@@ -6517,7 +6500,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     payStub.failCloseOnce = true;
 
     const failure: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6538,7 +6520,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
 
     // El reintento del MISMO intento COMPLETA el cobro entero.
     const retry = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6557,7 +6538,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     ];
 
     const result = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       { idempotency_key: MARK, portions },
       ACTOR,
@@ -6597,7 +6577,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     invoice.status = "Anulada";
 
     const failure: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6625,7 +6604,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     payStub.closeShiftBeforeCommit = true;
 
     const failure: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6645,7 +6623,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
   it("CL-17: el reintento COMPLETA el cobro cuando el turno vuelve a estar abierto", async () => {
     payStub.closeShiftBeforeCommit = true;
     await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6656,7 +6633,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     // con el turno abierto es una operación NUEVA que termina el cobro.
     payStub.shiftStatus = "abierto";
     const retry = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6673,7 +6649,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
 
   it("control negativo: con el turno abierto el mismo cobro cierra la factura", async () => {
     const result = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6772,7 +6747,6 @@ describe("billing: CL-11 el diff del servicio vive en el bloque de persistencia"
     const columns = (match as RegExpExecArray)[1].split(",").map((column) => column.trim());
     expect(columns).toEqual([
       "id",
-      "sede_id",
       "consecutive_number",
       "client_name",
       "client_document",

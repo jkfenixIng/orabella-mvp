@@ -16,9 +16,11 @@ function tokenOf(request: NextRequest): string | undefined {
 /** GET /api/v1/invoices/:id — detalle con ítems, impuestos y porciones. */
 export async function GET(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   try {
-    const session = await requireSession(tokenOf(request));
+    // La puerta sigue siendo `requireSession`: el detalle ya no se acota por
+    // sede, así que el resultado no se usa, pero sin sesión la ruta no abre.
+    await requireSession(tokenOf(request));
     const { id } = await context.params;
-    const data = await getInvoiceDetail(session.sedeId, id);
+    const data = await getInvoiceDetail(id);
     return ok(data);
   } catch (error) {
     return billingErrorResponse(error);

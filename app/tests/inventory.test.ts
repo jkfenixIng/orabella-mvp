@@ -22,13 +22,12 @@ import {
   registerMovement,
 } from "@/src/features/inventory/service";
 
-const SEDE_A = "11111111-1111-4111-8111-111111111111";
-const SEDE_B = "22222222-2222-4222-8222-222222222222";
 const PRODUCT_ID = "33333333-3333-4333-8333-333333333333";
 
 function baseProduct(overrides: Record<string, unknown> = {}) {
+  // El cuerpo ya NO lleva `sede_id`: el alta no la escribe y el esquema no la
+  // pide. Dejarla sería una columna que el doble acepta y la base nunca vio.
   return {
-    sede_id: SEDE_A,
     sku: "SH-001",
     name: "Shampoo",
     ...overrides,
@@ -58,21 +57,18 @@ describe("inventory schemas: producto (INV-01)", () => {
     expect(productSchema.safeParse(baseProduct({ commission_value: -1 })).success).toBe(false);
   });
 
-  it("normaliza el SKU (trim + mayúsculas) para unicidad por sede", () => {
+  it("normaliza el SKU (trim + mayúsculas) para la unicidad de la instalación", () => {
     expect(normalizeSku("  sh-001 ")).toBe("SH-001");
     expect(normalizeSku("Sh-001")).toBe("SH-001");
   });
 
-  it("SKU duplicado en la misma sede colisiona; en otra sede no", () => {
-    expect(
-      areSkusConflicting({ sedeIdA: SEDE_A, skuA: "sh-001", sedeIdB: SEDE_A, skuB: " SH-001 " }),
-    ).toBe(true);
-    expect(
-      areSkusConflicting({ sedeIdA: SEDE_A, skuA: "SH-001", sedeIdB: SEDE_A, skuB: "SH-002" }),
-    ).toBe(false);
-    expect(
-      areSkusConflicting({ sedeIdA: SEDE_A, skuA: "SH-001", sedeIdB: SEDE_B, skuB: "SH-001" }),
-    ).toBe(false);
+  it("el SKU normalizado es la clave: dos SKU iguales colisionan aunque lleguen distintos", () => {
+    // El caso que queda es el que la instalación puede encontrar de verdad: el
+    // mismo SKU escrito de dos formas (minúsculas y con espacios) es la misma
+    // fila de negocio. El predicado ya no recibe sedes porque `074` dejó
+    // `products_sku_key UNIQUE (sku)`: la unicidad es de la instalación entera.
+    expect(areSkusConflicting({ skuA: "sh-001", skuB: " SH-001 " })).toBe(true);
+    expect(areSkusConflicting({ skuA: "SH-001", skuB: "SH-002" })).toBe(false);
   });
 });
 
@@ -882,9 +878,12 @@ describe("inventory: el movimiento manual reintentado no mueve el stock dos vece
     expect(invStub.movements).toHaveLength(2);
   });
 
-  it("la marca se resuelve dentro de la sede del actor: un producto de otra sede se rechaza con 403 y sin escrituras", async () => {
+  it("la marca se resuelve dentro del producto: un producto que NO existe se rechaza con 404 y sin escrituras", async () => {
+    // La frontera por fila se retiró con la columna: lo que sigue guardando es
+    // que el PRODUCTO exista antes de que la marca se resuelva. Sin producto,
+    // el movimiento se rechaza con el NOT_FOUND de siempre y con cero
+    // escrituras —ni movimiento ni stock movido.
     const AJENO = "55555555-5555-4555-8555-555555555555";
-    seedStockProduct(AJENO, 7, invStub.OTHER_SEDE_ID);
 
     const outcome = await registerManualMovement(
       manualMovement({ product_id: AJENO }),
@@ -895,9 +894,9 @@ describe("inventory: el movimiento manual reintentado no mueve el stock dos vece
     );
 
     expect(outcome).toBeInstanceOf(InventoryError);
-    expect(outcome).toMatchObject({ code: "FORBIDDEN", status: 403 });
+    expect(outcome).toMatchObject({ code: "NOT_FOUND", status: 404 });
     expect(invStub.movements).toHaveLength(0);
-    expect(stockOf(AJENO)).toBe(7);
+    expect(invStub.products.some((row) => row.id === AJENO)).toBe(false);
   });
 
   it("control de no-extralimitación: el camino de FACTURACIÓN descuenta stock SIN marca (la marca es opcional ahí)", async () => {

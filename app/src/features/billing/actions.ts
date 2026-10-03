@@ -68,7 +68,7 @@ export async function listInvoicesAction(filters: {
 export async function getInvoiceAction(id: string) {
   try {
     const session = await requireSession(await sessionToken());
-    const data = await getInvoiceDetail(session.sedeId, id);
+    const data = await getInvoiceDetail(id);
     const isManager = session.roles.includes("admin") || session.roles.includes("caja");
     if (!isManager && data.invoice.user_id !== session.userId) {
       throw new BillingError("FORBIDDEN", "Sin acceso a esta factura.", 403);
@@ -108,7 +108,7 @@ export async function createInvoiceAction(input: unknown) {
 export async function editInvoiceAction(id: string, input: unknown) {
   try {
     const session = await requireAdminSession(await sessionToken());
-    const data = await editInvoiceItems(session.sedeId, id, input, {
+    const data = await editInvoiceItems(id, input, {
       userId: session.userId,
       sedeId: session.sedeId,
       roles: session.roles,
@@ -123,7 +123,7 @@ export async function editInvoiceAction(id: string, input: unknown) {
 export async function editEmittedInvoiceAction(id: string, input: unknown) {
   try {
     const session = await requireBillingWriter(await sessionToken());
-    const data = await editEmittedInvoiceItems(session.sedeId, id, input, {
+    const data = await editEmittedInvoiceItems(id, input, {
       userId: session.userId,
       sedeId: session.sedeId,
       roles: session.roles,
@@ -138,7 +138,7 @@ export async function editEmittedInvoiceAction(id: string, input: unknown) {
 export async function annulInvoiceAction(id: string, input: unknown) {
   try {
     const session = await requireBillingWriter(await sessionToken());
-    const data = await annulInvoice(session.sedeId, id, input, {
+    const data = await annulInvoice(id, input, {
       userId: session.userId,
       sedeId: session.sedeId,
       roles: session.roles,
@@ -162,7 +162,7 @@ export async function annulInvoiceAction(id: string, input: unknown) {
 export async function splitPaymentAction(id: string, input: unknown) {
   try {
     const session = await requireBillingWriter(await sessionToken());
-    const data = await splitPayment(session.sedeId, id, input, {
+    const data = await splitPayment(id, input, {
       userId: session.userId,
       sedeId: session.sedeId,
       roles: session.roles,

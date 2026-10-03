@@ -24,11 +24,15 @@
  *   login—, para que el hash no pueda divergir del que la aplicación espera.
  *
  * LA SEDE DE LA INSTALACIÓN (decisión del dueño 2026-10-01: una sola sede)
- *   `users.sede_id` es NOT NULL (003_admin.sql), así que la cuenta tiene que
- *   pertenecer a ALGUNA sede. Con la instalación de una sola sede, esa sede es
- *   LA SEDE DEL NEGOCIO: no hace falta ni una fila de sistema que la represente ni
- *   una sentinel que la inventara. Por eso el script NO crea ninguna fila de
- *   `sedes` —no escribe en esa tabla— y se ancla a la que ya existe.
+ *   El resto del negocio dejó de escribir `sede_id`, pero esta cuenta sigue
+ *   anclada a la fila de la instalación, y es a propósito: TODAS las guardas de
+ *   sesión la exigen (`requireSession`, `requireAdminSession`, las de caja,
+ *   facturación, inventario, nómina y `requirePlatformAdmin`), así que una cuenta
+ *   de plataforma sin ella no podría ni entrar a `/plataforma`. Con la
+ *   instalación de una sola sede, esa fila es LA SEDE DEL NEGOCIO: no hace falta
+ *   ni una fila de sistema que la represente ni una sentinel que la inventara. Por
+ *   eso el script NO crea ninguna fila de `sedes` —no escribe en esa tabla— y se
+ *   ancla a la que ya existe.
  *
  *   * La resolución es la MISMA que usa la capa de plataforma
  *     (`leerSedeDeLaInstalacion`, `src/features/platform/service.ts`): la única
@@ -41,12 +45,13 @@
  *     la decisión, `Plataforma (sistema)`) no son la instalación y el script no
  *     las toca, no las cuenta y no las ofrece: su limpieza es de la unidad que
  *     elimina la columna.
- *   * NO se relaja `users.sede_id` ni se toca `requireSedeRole`
- *     (`src/shared/lib/sede.ts`): el aislamiento de las rutas del negocio sigue
- *     sosteniéndose por esa columna. Para el negocio la cuenta sigue siendo un
- *     usuario de su sede; el privilegio de plataforma viene del ROL (G1), y su
- *     rol no se puede cambiar desde la administración de la sede (`setUserRoles`).
- *     Las guardas son PURAS sobre `sede_id` y no miran `sedes.is_active`.
+ *   * NO se toca `requireSedeRole` (`src/shared/lib/sede.ts`) ni ninguna guarda
+ *     de sesión: las rutas siguen autorizando por ROL. Para el negocio la cuenta
+ *     sigue siendo un usuario de su sede —que es lo que las guardas piden—,
+ *     aunque el negocio ya no use esa columna como frontera; el privilegio de
+ *     plataforma viene del ROL (G1), y su rol no se puede cambiar desde la
+ *     administración de la sede (`setUserRoles`). Las guardas son PURAS sobre
+ *     `sede_id` y no miran `sedes.is_active`.
  *
  * QUÉ ESCRIBE (y qué no)
  *   * Crea la cuenta con `create_user_with_role` (054): `users` + `user_roles`
@@ -266,9 +271,9 @@ export async function provisionarSuperadmin(args: {
 }): Promise<ResultadoAprovisionamiento> {
   const db = await adminDb();
 
-  // 1. La SEDE DE LA INSTALACIÓN, ANTES de tocar la cuenta: una cuenta sin sede
-  //    no puede existir (`users.sede_id` es NOT NULL) y una instalación a medias
-  //    es peor que un script que no corrió.
+  // 1. La SEDE DE LA INSTALACIÓN, ANTES de tocar la cuenta: una cuenta sin la
+  //    fila de la instalación no pasa ninguna guarda de sesión, y una instalación
+  //    a medias es peor que un script que no corrió.
   const sede = await sedeDeLaInstalacion(db);
 
   const avisos: string[] = [];

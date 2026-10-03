@@ -40,7 +40,6 @@ export async function openShiftAction(input: unknown) {
     const session = await requireCashWriter(await sessionToken());
     const data = await openShift(input, {
       userId: session.userId,
-      sedeId: session.sedeId,
     });
     return { success: true as const, data };
   } catch (error) {
@@ -61,7 +60,6 @@ export async function registerPaymentAction(input: unknown) {
     const session = await requireCashWriter(await sessionToken());
     const data = await registerPayment(input, {
       userId: session.userId,
-      sedeId: session.sedeId,
     });
     return { success: true as const, data };
   } catch (error) {
@@ -73,9 +71,8 @@ export async function registerPaymentAction(input: unknown) {
 export async function closeShiftAction(id: string, input: unknown) {
   try {
     const session = await requireCashWriter(await sessionToken());
-    const data = await closeShift(session.sedeId, id, input, {
+    const data = await closeShift(id, input, {
       userId: session.userId,
-      sedeId: session.sedeId,
       roles: session.roles,
     });
     return { success: true as const, data };
@@ -87,8 +84,8 @@ export async function closeShiftAction(id: string, input: unknown) {
 /** Turno abierto de la sede (requiere sesión, cualquier rol de su sede). */
 export async function getOpenShiftAction() {
   try {
-    const session = await requireSession(await sessionToken());
-    const data = await getOpenShiftWithOpener(session.sedeId);
+    await requireSession(await sessionToken());
+    const data = await getOpenShiftWithOpener();
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -155,9 +152,8 @@ export async function updateRegisterBaseAction(registerId: string, input: unknow
   try {
     const session = await requireAdminSession(await sessionToken());
     const base = (input as { base_configurada?: unknown }).base_configurada;
-    const data = await updateRegisterBase(session.sedeId, registerId, Number(base), {
+    const data = await updateRegisterBase(registerId, Number(base), {
       userId: session.userId,
-      sedeId: session.sedeId,
     });
     return { success: true as const, data };
   } catch (error) {
@@ -173,9 +169,8 @@ export async function updateRegisterBaseAction(registerId: string, input: unknow
 export async function recountClosedShiftAction(id: string, input: unknown) {
   try {
     const session = await requireAdminSession(await sessionToken());
-    const data = await recountClosedShift(session.sedeId, id, input, {
+    const data = await recountClosedShift(id, input, {
       userId: session.userId,
-      sedeId: session.sedeId,
     });
     return { success: true as const, data };
   } catch (error) {
@@ -200,7 +195,6 @@ export async function upsertDenominationAction(input: unknown) {
     const session = await requireAdminSession(await sessionToken());
     const data = await upsertDenomination(input, {
       userId: session.userId,
-      sedeId: session.sedeId,
     });
     revalidateTag("catalog:denominations");
     return { success: true as const, data };
@@ -212,8 +206,8 @@ export async function upsertDenominationAction(input: unknown) {
 /** Eliminar denominación (solo admin). */
 export async function deleteDenominationAction(id: string) {
   try {
-    const session = await requireAdminSession(await sessionToken());
-    await deleteDenomination(session.sedeId, id);
+    await requireAdminSession(await sessionToken());
+    await deleteDenomination(id);
     revalidateTag("catalog:denominations");
     return { success: true as const };
   } catch (error) {

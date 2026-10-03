@@ -148,7 +148,7 @@ export async function adminResetPasswordAction(userId: string) {
   try {
     const store = await cookies();
     const session = await requireAdminSession(store.get(SESSION_COOKIE_NAME)?.value);
-    const data = await adminResetUserPassword(session.sedeId, userId, session.userId);
+    const data = await adminResetUserPassword(userId, session.userId);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

@@ -1,7 +1,6 @@
 import type { NextRequest } from "next/server";
 import { fail, ok } from "@/src/shared/lib/api-response";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/shared/lib/sede";
 import {
   AdminError,
   listEmployees,
@@ -39,10 +38,7 @@ export async function POST(request: NextRequest) {
     const session = await requireAdminSession(tokenOf(request));
     const body: unknown = await request.json().catch(() => ({}));
     const record = typeof body === "object" && body !== null ? body : {};
-    const data = await upsertEmployee({
-      ...record,
-      sede_id: resolveSede(session.sedeId, (record as { sede_id?: string }).sede_id),
-    });
+    const data = await upsertEmployee(record, session.sedeId);
     return ok(data, 201);
   } catch (error) {
     return adminErrorResponse(error);

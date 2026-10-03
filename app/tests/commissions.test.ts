@@ -855,7 +855,6 @@ function releasePayoutGate(): void {
 function seedPayout(amount: number, earned: number | null = payoutStub.COMMISSION_VALUE): void {
   payoutStub.payouts.push({
     id: `seed-${(payoutStub.nextId += 1)}`,
-    sede_id: payoutStub.SEDE_ID,
     employee_id: payoutStub.EMPLOYEE_ID,
     invoice_id: payoutStub.INVOICE_ID,
     amount,
@@ -888,13 +887,26 @@ function createPayoutStubClient(): unknown {
     let onConflict: string | undefined;
     const eqFilters: Record<string, unknown> = {};
 
-    /** ¿La fila dada tiene los MISMOS valores que la carga en el objetivo? */
+    /**
+     * ¿La fila dada tiene los MISMOS valores que la carga en el objetivo?
+     *
+     * Con la semántica de NULL de un índice UNIQUE: comparar una columna que
+     * falta con otra que también falta da UNKNOWN, no TRUE, así que la fila NO
+     * coincide. Es lo que hace que un objetivo que incluya una columna que la
+     * escritura ya no manda deje de encontrar la fila anterior —el riesgo que
+     * la 074 documenta para todos los índices que empezaban por `sede_id`—, y
+     * es lo que este doble tiene que reproducir para que el control negativo de
+     * abajo signifique algo.
+     */
     const mismaPareja = (
       fila: Record<string, unknown>,
       objetivo: string,
       carga: Record<string, unknown>,
     ): boolean =>
-      objetivo.split(",").every((columna) => fila[columna] === carga[columna]);
+      objetivo.split(",").every((columna) => {
+        if (carga[columna] === undefined || fila[columna] === undefined) return false;
+        return fila[columna] === carga[columna];
+      });
 
     const resolve = async (): Promise<{ data: unknown; error: unknown }> => {
       if (op === "upsert") {
@@ -1044,7 +1056,6 @@ function createPayoutStubClient(): unknown {
             data: {
               id: payoutStub.shiftId,
               cash_register_id: null,
-              sede_id: payoutStub.SEDE_ID,
               opened_by: "u-cajero",
               closed_by: null,
               opened_at: "2026-01-01T08:00:00.000Z",
@@ -1192,7 +1203,6 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
   const methods = [
     {
       id: payoutStub.METHOD_ID,
-      sede_id: payoutStub.SEDE_ID,
       code: payoutStub.METHOD_CODE,
       name: "Transferencia",
       is_active: true,
@@ -1204,7 +1214,7 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
 });
 
 describe("commissions: el pago inmediato no se puede pagar dos veces (034)", () => {
-  const actor = { userId: "u-cajero", sedeId: payoutStub.SEDE_ID };
+  const actor = { userId: "u-cajero" };
   // CL-5: marca del INTENTO del primer envío. Desde la 044 es obligatoria, así
   // que TODA llamada de esta prueba la lleva; la segunda llamada de
   // `paySamePendingTwice` acuña la SUYA, porque dos envíos con la MISMA marca
@@ -1395,7 +1405,7 @@ describe("commissions: el pago inmediato no se puede pagar dos veces (034)", () 
  * nunca puede rechazar una operación legítima.
  */
 describe("commissions: CL-5 el pago inmediato reintentado no paga la comisión dos veces", () => {
-  const actor = { userId: "u-cajero", sedeId: payoutStub.SEDE_ID };
+  const actor = { userId: "u-cajero" };
   const MARK = "7c9e1f6a-2b48-4d13-9a75-3e6b0d8c4a21";
   const OTHER_MARK = "b4a0d3e7-5f62-4c18-8d90-2a7e6f1b3c58";
   const INVOICE_2 = "77777777-7777-4777-8777-777777777777";
@@ -1673,7 +1683,7 @@ describe("commissions: CL-5 el pago inmediato reintentado no paga la comisión d
 // Anulada se sigue rechazando. Antes el doble devolvía `Emitida` y las pruebas
 // del pago pasaban: esa era la prueba de que el servidor no exigía el estado.
 describe("commissions: el pago inmediato exige factura Pagada (regla del dueño)", () => {
-  const actor = { userId: "u-cajero", sedeId: payoutStub.SEDE_ID };
+  const actor = { userId: "u-cajero" };
   const MARK = "3d7f0a52-9c14-4e68-b2f1-8a5c6e0d7b43";
   const input = {
     invoice_id: payoutStub.INVOICE_ID,
@@ -1817,8 +1827,6 @@ describe("commissions: el pago inmediato exige factura Pagada (regla del dueño)
 // el rechazo que el servicio traduce a RULE_CONFLICT.
 
 describe("commissions: el upsert de reglas infiere contra el índice de la instalación (075)", () => {
-  const actor = { userId: "u-admin", sedeId: payoutStub.SEDE_ID };
-  const OTRA_SEDE = "99999999-9999-4999-8999-999999999999";
   const ITEM_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const ITEM_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   const base = {
@@ -1833,7 +1841,7 @@ describe("commissions: el upsert de reglas infiere contra el índice de la insta
   });
 
   it("el objetivo de conflicto es el NUEVO (sin sede) y la escritura entra", async () => {
-    const regla = await upsertCommissionRule({ ...base }, actor);
+    const regla = await upsertCommissionRule({ ...base });
 
     // Lo que el servicio MANDÓ, verbatim: el conjunto de tres columnas que
     // infiere `uq_commission_rule_install_key` (075).
@@ -1843,18 +1851,20 @@ describe("commissions: el upsert de reglas infiere contra el índice de la insta
     // disparó, o sea que la inferencia se resolvió contra un índice real.
     expect(payoutStub.ruleInferenceFailures).toBe(0);
     expect(regla).toMatchObject({
-      sede_id: payoutStub.SEDE_ID,
       item_type: "producto",
       item_id: ITEM_A,
       employee_id: payoutStub.EMPLOYEE_ID,
       percent: 10,
     });
+    // Y la escritura NO manda la columna: es lo que hace que el conjunto de
+    // tres columnas baste para decidir el conflicto.
+    expect(payoutStub.ruleUpserts[0].payload).not.toHaveProperty("sede_id");
     expect(payoutStub.rules).toHaveLength(1);
   });
 
   it("el mismo (ítem × empleado) dos veces NO crea una segunda fila", async () => {
-    const primera = await upsertCommissionRule({ ...base }, actor);
-    const segunda = await upsertCommissionRule({ ...base, percent: 25 }, actor);
+    const primera = await upsertCommissionRule({ ...base });
+    const segunda = await upsertCommissionRule({ ...base, percent: 25 });
 
     // El `ON CONFLICT` del objetivo nuevo resuelve la segunda contra la primera:
     // misma fila, id estable, porcentaje actualizado.
@@ -1864,28 +1874,24 @@ describe("commissions: el upsert de reglas infiere contra el índice de la insta
     expect(payoutStub.rules[0].percent).toBe(25);
   });
 
-  it("la sede ya NO es parte de la clave: el mismo (ítem × empleado) de otra sede es la MISMA regla", async () => {
-    const primera = await upsertCommissionRule({ ...base }, actor);
-    const segunda = await upsertCommissionRule({ ...base, amount: 5000, percent: null }, {
-      userId: "u-admin",
-      sedeId: OTRA_SEDE,
-    });
+  it("la sede ya NO es parte de la clave NI de la escritura: la misma pareja es SIEMPRE la misma regla", async () => {
+    const primera = await upsertCommissionRule({ ...base });
+    const segunda = await upsertCommissionRule({ ...base, amount: 5000, percent: null });
 
     expect(segunda.id).toBe(primera.id);
     expect(payoutStub.rules).toHaveLength(1);
+    // Ni el actor ni el cuerpo nombran ya la sede: no hay segunda fila posible.
+    expect(payoutStub.ruleUpserts.every((entrada) => !("sede_id" in entrada.payload))).toBe(true);
   });
 
-  it("control negativo: con el objetivo VIEJO la misma pareja en otra sede serían DOS filas", async () => {
+  it("control negativo: con el objetivo VIEJO la misma pareja serían DOS filas", async () => {
     // El doble NO es un archivador: decide por el objetivo. Con el conjunto de
-    // cuatro columnas (el de 016) la fila de la otra sede no coincide y entra
-    // como una regla más. Si esta prueba pasara con una sola fila, el doble no
-    // distinguiría los objetivos y las pruebas de arriba no probarían nada.
+    // cuatro columnas (el de 016) la fila no coincide y entra como una regla
+    // más. Si esta prueba pasara con una sola fila, el doble no distinguiría los
+    // objetivos y las pruebas de arriba no probarían nada.
     payoutStub.forceOldConflictTarget = true;
-    await upsertCommissionRule({ ...base }, actor);
-    await upsertCommissionRule({ ...base, amount: 5000, percent: null }, {
-      userId: "u-admin",
-      sedeId: OTRA_SEDE,
-    });
+    await upsertCommissionRule({ ...base });
+    await upsertCommissionRule({ ...base, amount: 5000, percent: null });
 
     expect(payoutStub.rules).toHaveLength(2);
     expect(payoutStub.ruleInferenceFailures).toBe(0);
@@ -1896,7 +1902,7 @@ describe("commissions: el upsert de reglas infiere contra el índice de la insta
     // (con el índice viejo y sin el nuevo) NO tiene contra qué inferir el
     // conjunto de tres columnas. Por eso el índice va antes que el código.
     payoutStub.ruleIndexes = ["sede_id,item_type,item_id,employee_id"];
-    const failure: unknown = await upsertCommissionRule({ ...base }, actor).catch(
+    const failure: unknown = await upsertCommissionRule({ ...base }).catch(
       (error: unknown) => error,
     );
 
@@ -1912,11 +1918,12 @@ describe("commissions: el upsert de reglas infiere contra el índice de la insta
     // (ítem×empleado) choca contra la clave primaria, que no está en el
     // objetivo, y PostgreSQL responde 23505: cambiar el conjunto del `onConflict`
     // no debilitó la garantía de «una regla por ítem×empleado».
-    const existente = await upsertCommissionRule({ ...base, percent: 10 }, actor);
-    const failure: unknown = await upsertCommissionRule(
-      { ...base, item_id: ITEM_B, id: existente.id },
-      actor,
-    ).catch((error: unknown) => error);
+    const existente = await upsertCommissionRule({ ...base, percent: 10 });
+    const failure: unknown = await upsertCommissionRule({
+      ...base,
+      item_id: ITEM_B,
+      id: existente.id,
+    }).catch((error: unknown) => error);
 
     expect(payoutStub.ruleIdClashes).toBe(1);
     expect(failure).toBeInstanceOf(CommissionError);
@@ -1928,8 +1935,8 @@ describe("commissions: el upsert de reglas infiere contra el índice de la insta
   });
 
   it("control de no-extralimitación: la MISMA carga sin `id` NO se rechaza (el rechazo lo causó el `id`)", async () => {
-    const existente = await upsertCommissionRule({ ...base, percent: 10 }, actor);
-    const otra = await upsertCommissionRule({ ...base, item_id: ITEM_B, percent: 30 }, actor);
+    const existente = await upsertCommissionRule({ ...base, percent: 10 });
+    const otra = await upsertCommissionRule({ ...base, item_id: ITEM_B, percent: 30 });
 
     expect(payoutStub.ruleIdClashes).toBe(0);
     expect(otra.id).not.toBe(existente.id);

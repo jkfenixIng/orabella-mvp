@@ -20,7 +20,7 @@ import {
   roleCodeSchema,
   type RoleCode,
 } from "@/src/features/auth/schemas";
-import { requireSedeRole, resolveSede, type SedeRole } from "@/src/shared/lib/sede";
+import { requireSedeRole, type SedeRole } from "@/src/shared/lib/sede";
 import { AdminError, setUserRoles, upsertEmployee } from "@/src/features/admin/service";
 import * as adminActions from "@/src/features/admin/actions";
 
@@ -705,7 +705,6 @@ describe("admin: reemplazo de roles atómico (ADM-04 / CO-2)", () => {
 
 function baseEmployee(overrides: Record<string, unknown> = {}) {
   return {
-    sede_id: SEDE_A,
     full_name: "Carolina Rojas",
     document: "123456",
     pay_type: "fijo",
@@ -853,28 +852,20 @@ describe("admin: unicidad parcial de employee_code (ADM-03)", () => {
     expect(isEmployeeCodeMissing("EMP-01")).toBe(false);
   });
 
-  it("dos códigos con valor iguales en la misma sede colisionan", () => {
-    expect(
-      areEmployeeCodesConflicting({ sedeIdA: SEDE_A, codeA: "EMP-01", sedeIdB: SEDE_A, codeB: "EMP-01" }),
-    ).toBe(true);
-    expect(
-      areEmployeeCodesConflicting({ sedeIdA: SEDE_A, codeA: "EMP-01", sedeIdB: SEDE_A, codeB: "EMP-02" }),
-    ).toBe(false);
+  it("dos códigos con valor iguales colisionan", () => {
+    // Sin sedes: `074` recreó `uq_employees_sede_code` sobre `(employee_code)`
+    // con el mismo WHERE, así que el choque se decide sólo por el código.
+    expect(areEmployeeCodesConflicting({ codeA: "EMP-01", codeB: "EMP-01" })).toBe(true);
+    expect(areEmployeeCodesConflicting({ codeA: "EMP-01", codeB: "EMP-02" })).toBe(false);
   });
 
-  it("vacíos nunca colisionan y sedes distintas nunca colisionan", () => {
-    expect(
-      areEmployeeCodesConflicting({ sedeIdA: SEDE_A, codeA: "", sedeIdB: SEDE_A, codeB: "" }),
-    ).toBe(false);
-    expect(
-      areEmployeeCodesConflicting({ sedeIdA: SEDE_A, codeA: null, sedeIdB: SEDE_A, codeB: "EMP-01" }),
-    ).toBe(false);
-    expect(
-      areEmployeeCodesConflicting({ sedeIdA: SEDE_A, codeA: "EMP-01", sedeIdB: SEDE_B, codeB: "EMP-01" }),
-    ).toBe(false);
+  it("vacíos nunca colisionan", () => {
+    expect(areEmployeeCodesConflicting({ codeA: "", codeB: "" })).toBe(false);
+    expect(areEmployeeCodesConflicting({ codeA: null, codeB: "EMP-01" })).toBe(false);
+    expect(areEmployeeCodesConflicting({ codeA: "EMP-01", codeB: undefined })).toBe(false);
   });
 
-  it("el esquema acepta código vacío (repetible por sede)", () => {
+  it("el esquema acepta código vacío (repetible en la instalación)", () => {
     expect(employeeSchema.safeParse(baseEmployee({ employee_code: "" })).success).toBe(true);
     expect(employeeSchema.safeParse(baseEmployee({ employee_code: null })).success).toBe(true);
   });
@@ -883,7 +874,6 @@ describe("admin: unicidad parcial de employee_code (ADM-03)", () => {
 describe("admin schemas: servicio min<=max (ADM-05)", () => {
   function baseService(overrides: Record<string, unknown> = {}) {
     return {
-      sede_id: SEDE_A,
       name: "Corte",
       price: 50000,
       duracion_min: 30,
@@ -910,7 +900,7 @@ describe("admin schemas: servicio min<=max (ADM-05)", () => {
 
 describe("admin schemas: impuestos y métodos (ADM-06/ADM-07)", () => {
   it("percent acepta 0–100 y rechaza fuera de rango", () => {
-    const base = { sede_id: SEDE_A, code: "IVA", name: "IVA general" };
+    const base = { code: "IVA", name: "IVA general" };
     expect(taxConfigSchema.safeParse({ ...base, percent: 19 }).success).toBe(true);
     expect(taxConfigSchema.safeParse({ ...base, percent: 0 }).success).toBe(true);
     expect(taxConfigSchema.safeParse({ ...base, percent: 100 }).success).toBe(true);
@@ -920,7 +910,7 @@ describe("admin schemas: impuestos y métodos (ADM-06/ADM-07)", () => {
   });
 
   it("solo acepta códigos del catálogo Colombia", () => {
-    const base = { sede_id: SEDE_A, name: "Nequi" };
+    const base = { name: "Nequi" };
     for (const code of ["efectivo", "transferencia_normal", "nequi", "daviplata", "bre-b", "tarjeta"]) {
       expect(paymentMethodSchema.safeParse({ ...base, code }).success).toBe(true);
     }
@@ -940,7 +930,7 @@ describe("admin schemas: impuestos y métodos (ADM-06/ADM-07)", () => {
   });
 });
 
-describe("admin: requireSedeRole y resolveSede (puros)", () => {
+describe("admin: requireSedeRole (puro)", () => {
   it("admin pasa el gate de escritura; empleado/caja no", () => {
     expect(() => requireSedeRole(["admin"], ["admin"])).not.toThrow();
     expect(() => requireSedeRole(["empleado", "caja"], ["empleado", "caja"])).not.toThrow();
@@ -952,12 +942,6 @@ describe("admin: requireSedeRole y resolveSede (puros)", () => {
       expect((error as AdminError).code).toBe("FORBIDDEN");
       expect((error as AdminError).status).toBe(403);
     }
-  });
-
-  it("resolveSede usa la sede de la sesión y rechaza sede ajena", () => {
-    expect(resolveSede(SEDE_A)).toBe(SEDE_A);
-    expect(resolveSede(SEDE_A, SEDE_A)).toBe(SEDE_A);
-    expect(() => resolveSede(SEDE_A, SEDE_B)).toThrowError(AdminError);
   });
 });
 
@@ -1157,7 +1141,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
   it("a quien ya tiene OTRO rol no se le agrega `empleado` (un rol por usuario)", async () => {
     sembrar(["admin"]);
 
-    await upsertEmployee(baseEmployee());
+    await upsertEmployee(baseEmployee(), SEDE_A);
 
     // El empleado sí se creó: la prueba corre por la red de seguridad.
     expect(memoryRows("employees")).toHaveLength(1);
@@ -1173,7 +1157,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
   it("a quien YA es `empleado` no se le vuelve a insertar el rol", async () => {
     sembrar(["empleado"]);
 
-    await upsertEmployee(baseEmployee());
+    await upsertEmployee(baseEmployee(), SEDE_A);
 
     expect(rolesPersistidos()).toEqual(["empleado"]);
     expect(escriturasDeRoles()).toEqual([]);
@@ -1182,7 +1166,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
   it("a quien NO tiene ningún rol igual se le asigna `empleado` (la intención sobrevive)", async () => {
     sembrar([]);
 
-    await upsertEmployee(baseEmployee());
+    await upsertEmployee(baseEmployee(), SEDE_A);
 
     expect(rolesPersistidos()).toEqual(["empleado"]);
   });
@@ -1198,7 +1182,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       ];
     };
 
-    await upsertEmployee(baseEmployee());
+    await upsertEmployee(baseEmployee(), SEDE_A);
 
     // El modelo del proyecto es UN rol por usuario (`setUserRolesSchema` exige
     // `.length(1)`): quedar con `admin` + `empleado` es el defecto, no un
@@ -1213,7 +1197,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
     // Los dos rpc quedan EN VUELO a la vez: el resultado final se mira después
     // de liberarlos, no el orden de llegada.
     postgrest.hold = true;
-    const empleado = upsertEmployee(baseEmployee());
+    const empleado = upsertEmployee(baseEmployee(), SEDE_A);
     await new Promise((resolve) => setTimeout(resolve, 0));
     const reemplazo = setUserRoles({ user_id: USUARIO_ID, roles: ["admin"] });
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1235,7 +1219,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
   it("la red ya no lee ni escribe `user_roles` desde el cliente: la decisión es del servidor", async () => {
     sembrar([]);
 
-    await upsertEmployee(baseEmployee());
+    await upsertEmployee(baseEmployee(), SEDE_A);
 
     // La red vieja leía una columna de `user_roles` para decidir; esa lectura
     // es la mitad del read-then-insert que CO-4 cierra, así que ya no existe.
@@ -1262,7 +1246,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       error: { code: "57014", message: "canceling statement due to statement timeout" },
     };
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1282,7 +1266,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       postgrest.rows.users = [];
     };
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1299,7 +1283,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       ...rol,
     }));
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1322,7 +1306,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       ];
     };
 
-    await upsertEmployee(baseEmployee());
+    await upsertEmployee(baseEmployee(), SEDE_A);
 
     expect(rolesPersistidos()).toEqual(["empleado"]);
     expect(escriturasDeRoles()).toEqual([]);
@@ -1335,7 +1319,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       error: { code: "42501", message: "permission denied for function upsert_employee_atomic" },
     };
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1350,7 +1334,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
     // red, así que no puede terminar en un alta "exitosa".
     postgrest.ensureAppliesNothing = true;
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1364,7 +1348,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
 
     // La red reporta el conjunto que la base DEVOLVIÓ, sin asumir que tiene un
     // solo rol: un usuario arrastrado por el bug viejo se deja como está.
-    await upsertEmployee(baseEmployee());
+    await upsertEmployee(baseEmployee(), SEDE_A);
 
     expect(rolesPersistidos()).toEqual(["admin", "empleado"]);
     expect(escriturasDeRoles()).toEqual([]);
@@ -1382,7 +1366,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       },
     ];
 
-    await upsertEmployee(baseEmployee({ id: EMPLEADO_ID, employee_code: "EMP-01" }));
+    await upsertEmployee(baseEmployee({ id: EMPLEADO_ID, employee_code: "EMP-01" }), SEDE_A);
 
     expect(postgrest.selects.filter((select) => select.table === "user_roles")).toEqual([]);
     expect(escriturasDeRoles()).toEqual([]);
@@ -1507,7 +1491,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
       error: { code: "42501", message: "permission denied for table employees" },
     };
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1526,7 +1510,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
       error: { code: "42501", message: "permission denied for table employees" },
     };
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1544,7 +1528,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
       error: { code: "42501", message: "permission denied for table users" },
     };
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1557,7 +1541,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
   it("el alta viaja en UNA sentencia: cero escrituras sueltas", async () => {
     sembrarSinUsuario();
 
-    const fila = await upsertEmployee(baseEmployee());
+    const fila = await upsertEmployee(baseEmployee(), SEDE_A);
 
     expect(fila.full_name).toBe("Carolina Rojas");
     expect(postgrest.rpcCalls.map((llamada) => llamada.fn)).toEqual(["upsert_employee_atomic"]);
@@ -1578,7 +1562,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
     };
 
     await expect(
-      upsertEmployee(baseEmployee({ employee_code: "EMP-01" })),
+      upsertEmployee(baseEmployee({ employee_code: "EMP-01" }), SEDE_A),
     ).rejects.toMatchObject({ code: "EMPLOYEE_CODE_TAKEN", status: 409 });
 
     // Nada a medias: ni usuario, ni rol, ni legajo.
@@ -1595,7 +1579,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
       ];
     };
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1611,7 +1595,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
       (rol) => ({ ...rol }),
     );
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1837,7 +1821,7 @@ describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", ()
   });
 
   it("el alta escribe la cadencia en el legajo y la devuelve en la fila", async () => {
-    const fila = await upsertEmployee(baseEmployee({ pay_frequency: "semanal" }));
+    const fila = await upsertEmployee(baseEmployee({ pay_frequency: "semanal" }), SEDE_A);
 
     expect(fila.pay_frequency).toBe("semanal");
     expect(memoryRows("employees")[0]?.pay_frequency).toBe("semanal");
@@ -1848,7 +1832,7 @@ describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", ()
   });
 
   it("null es un valor legal: el legajo queda sin cadencia y la clave igual viaja", async () => {
-    const fila = await upsertEmployee(baseEmployee({ pay_frequency: null }));
+    const fila = await upsertEmployee(baseEmployee({ pay_frequency: null }), SEDE_A);
 
     expect(fila.pay_frequency).toBeNull();
     expect(memoryRows("employees")[0]?.pay_frequency).toBeNull();
@@ -1856,7 +1840,7 @@ describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", ()
   });
 
   it("sin la clave también queda en null: la cadencia no se inventa ni se hereda", async () => {
-    const fila = await upsertEmployee(baseEmployee());
+    const fila = await upsertEmployee(baseEmployee(), SEDE_A);
 
     expect(fila.pay_frequency).toBeNull();
     expect(memoryRows("employees")[0]?.pay_frequency).toBeNull();
@@ -1877,7 +1861,7 @@ describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", ()
       },
     ];
 
-    const fila = await upsertEmployee(baseEmployee({ id: EDIT_ID, pay_frequency: "quincenal" }));
+    const fila = await upsertEmployee(baseEmployee({ id: EDIT_ID, pay_frequency: "quincenal" }), SEDE_A);
 
     expect(fila.pay_frequency).toBe("quincenal");
     expect(memoryRows("employees")[0]?.pay_frequency).toBe("quincenal");
@@ -1887,7 +1871,7 @@ describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", ()
   });
 
   it("un valor fuera del catálogo se rechaza ANTES de escribir: ni rpc, ni upsert, ni fila", async () => {
-    await expect(upsertEmployee(baseEmployee({ pay_frequency: "diario" }))).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee({ pay_frequency: "diario" }), SEDE_A)).rejects.toMatchObject({
       code: "VALIDATION",
       status: 400,
     });

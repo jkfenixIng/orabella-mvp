@@ -536,7 +536,7 @@ describe("alerts: la alerta del vale se resuelve al aprobarlo o rechazarlo", () 
    -------------------------------------------------------------------------- */
 
 const SEDE = "sede-1";
-const ACTOR = { userId: "admin-1", sedeId: SEDE, roles: ["admin" as const] };
+const ACTOR = { userId: "admin-1", roles: ["admin" as const] };
 
 /** Vale pendiente de revisar, como lo guarda `voucher_requests`. */
 function filaVoucher(id: string): Record<string, unknown> {
@@ -587,7 +587,7 @@ describe("alerts: aprobar o rechazar un vale deja leída SU alerta", () => {
   });
 
   it("aprobar un vale deja leída la alerta que abrió, y solo la suya", async () => {
-    const aprobado = await approveVoucher(SEDE, "vale-9", {}, ACTOR);
+    const aprobado = await approveVoucher("vale-9", {}, ACTOR);
 
     expect(aprobado.status).toBe("aprobada");
     const propia = dbStub.filas.find((fila) => fila.id === "alerta-9");
@@ -621,7 +621,7 @@ describe("alerts: aprobar o rechazar un vale deja leída SU alerta", () => {
   });
 
   it("rechazar un vale deja leída su alerta, con el motivo de la revisión", async () => {
-    const rechazado = await rejectVoucher(SEDE, "vale-9", { motivo: "sin soporte" }, ACTOR);
+    const rechazado = await rejectVoucher("vale-9", { motivo: "sin soporte" }, ACTOR);
 
     expect(rechazado.status).toBe("rechazada");
     const propia = dbStub.filas.find((fila) => fila.id === "alerta-9");
@@ -632,7 +632,7 @@ describe("alerts: aprobar o rechazar un vale deja leída SU alerta", () => {
   });
 
   it("cerrar dos veces no inventa nada: el segundo cierre no vuelve a escribir", async () => {
-    await approveVoucher(SEDE, "vale-9", {}, ACTOR);
+    await approveVoucher("vale-9", {}, ACTOR);
     const escriturasDelPrimerCierre = dbStub.escrituras.length;
 
     const segundo = await resolveVoucherAlert(

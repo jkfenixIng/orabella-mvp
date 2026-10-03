@@ -1,7 +1,6 @@
 import type { NextRequest } from "next/server";
 import { fail, ok } from "@/src/shared/lib/api-response";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/shared/lib/sede";
 import {
   AdminError,
   getEmployee,
@@ -19,16 +18,15 @@ function tokenOf(request: NextRequest): string | undefined {
   return request.cookies.get(SESSION_COOKIE_NAME)?.value;
 }
 
-/** GET /api/v1/employees/:id — detalle (requiere sesión, solo su sede). */
+/** GET /api/v1/employees/:id — detalle (requiere sesión). */
 export async function GET(
   request: NextRequest,
   context: { params: Promise<{ id: string }> },
 ) {
   try {
-    const session = await requireSession(tokenOf(request));
+    await requireSession(tokenOf(request));
     const { id } = await context.params;
     const data = await getEmployee(id);
-    resolveSede(session.sedeId, data.sede_id);
     return ok(data);
   } catch (error) {
     return adminErrorResponse(error);
@@ -46,15 +44,12 @@ export async function PATCH(
   try {
     const session = await requireAdminSession(tokenOf(request));
     const { id } = await context.params;
-    const current = await getEmployee(id);
-    resolveSede(session.sedeId, current.sede_id);
+    // La existencia se comprueba antes de editar: sin legajo no hay nada que
+    // actualizar, y el error de negocio sigue siendo NOT_FOUND.
+    await getEmployee(id);
     const body: unknown = await request.json().catch(() => ({}));
     const record = typeof body === "object" && body !== null ? body : {};
-    const data = await upsertEmployee({
-      ...record,
-      id,
-      sede_id: resolveSede(session.sedeId, (record as { sede_id?: string }).sede_id),
-    });
+    const data = await upsertEmployee({ ...record, id }, session.sedeId);
     return ok(data);
   } catch (error) {
     return adminErrorResponse(error);

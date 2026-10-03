@@ -6,7 +6,6 @@ export const movementTypeSchema = z.enum(["IN", "OUT", "ADJUST"]);
 export type MovementType = z.infer<typeof movementTypeSchema>;
 
 const uuidSchema = z.uuid("Identificador inválido.");
-const sedeIdSchema = z.uuid("Sede inválida.");
 
 /**
  * INV-01: normaliza el SKU (trim + mayúsculas) para que la unicidad por
@@ -80,23 +79,25 @@ export function proposeSku(name: string, takenSkus: readonly string[]): string {
 }
 
 /**
- * INV-01: conflicto de SKU a nivel app (además del UNIQUE (sede_id, sku)).
- * Dos SKU normalizados iguales en la misma sede colisionan.
+ * INV-01: conflicto de SKU a nivel app (además del UNIQUE (sku) de la base).
+ * Dos SKU normalizados iguales colisionan.
+ *
+ * Ya NO lleva la sede de cada lado: `products_sede_id_sku_key` se sustituyó por
+ * `products_sku_key` (074), así que la restricción que este predicado refleja
+ * compara sólo el SKU. Comparar las dos sedes era una frontera de fila que
+ * únicamente tenía sentido con varias instalaciones; con una sola, los dos lados
+ * son siempre la misma fila de negocio y el resultado no podía cambiar.
  */
 export function areSkusConflicting(args: {
-  sedeIdA: string;
   skuA: string;
-  sedeIdB: string;
   skuB: string;
 }): boolean {
-  if (args.sedeIdA !== args.sedeIdB) return false;
   return normalizeSku(args.skuA) === normalizeSku(args.skuB);
 }
 
 /** INV-01: producto (el stock inicial va vía movimiento IN, nunca directo). */
 export const productSchema = z.object({
   id: uuidSchema.optional(),
-  sede_id: sedeIdSchema,
   sku: z.string().trim().min(1, "SKU requerido.").max(40, "SKU muy largo."),
   name: z.string().trim().min(1, "Nombre requerido.").max(120, "Nombre muy largo."),
   description: z.string().trim().max(500, "Descripción muy larga.").nullish(),

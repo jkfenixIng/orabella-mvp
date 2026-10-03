@@ -23,9 +23,9 @@ function tokenOf(request: NextRequest): string | undefined {
  */
 export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   try {
-    const session = await requirePayrollAdmin(tokenOf(request));
+    await requirePayrollAdmin(tokenOf(request));
     const { id } = await context.params;
-    const data = await closePayrollPeriod(session.sedeId, id);
+    const data = await closePayrollPeriod(id);
     return ok(data);
   } catch (error) {
     return payrollErrorResponse(error);

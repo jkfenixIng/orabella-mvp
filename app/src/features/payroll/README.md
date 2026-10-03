@@ -75,8 +75,8 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   `approveVoucher` (solo pendiente; autorización con `approved_by` +
   observación, SIN código), `rejectVoucher` (solo pendiente, motivo
   obligatorio). Escritura: admin (pagos también caja);
-  lectura: cualquier rol de la sede. Reutiliza `requireSedeRole`/
-  `resolveSede`, `listPaymentMethods` + `getEmployee`/`listEmployees` (T3),
+  lectura: cualquier rol de la sede. Reutiliza `requireSedeRole`,
+  `listPaymentMethods` + `getEmployee`/`listEmployees` (T3),
   `getOpenShiftWithOpener` (T6) para el turno de caja, `roundMoney`/
   `moneyEquals` (T5), `ok()`/`fail()`.
 - API-first (`/api/v1`): `POST /payroll-periods` (+ `GET` lista),

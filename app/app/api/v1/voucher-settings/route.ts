@@ -40,10 +40,7 @@ export async function POST(request: NextRequest) {
   try {
     const session = await requirePayrollAdmin(tokenOf(request));
     const body: unknown = await request.json().catch(() => ({}));
-    const data = await setVoucherLimits(body, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await setVoucherLimits(body, { userId: session.userId });
     return ok(data);
   } catch (error) {
     return payrollErrorResponse(error);

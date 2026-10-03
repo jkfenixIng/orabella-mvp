@@ -40,10 +40,7 @@ export async function POST(request: NextRequest) {
   try {
     const session = await requirePayrollAdmin(tokenOf(request));
     const body: unknown = await request.json().catch(() => ({}));
-    const data = await openPayrollPeriod(body, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await openPayrollPeriod(session.sedeId, body, { userId: session.userId });
     return ok(data, 201);
   } catch (error) {
     return payrollErrorResponse(error);

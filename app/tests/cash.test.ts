@@ -1572,7 +1572,6 @@ const paymentStub = vi.hoisted(() => ({
 /** Las columnas de `PAYMENT_SELECT` (service.ts): el shape que el servicio lee. */
 const PAYMENT_COLUMNS = [
   "id",
-  "sede_id",
   "cash_shift_id",
   "invoice_id",
   "method_id",
@@ -2114,7 +2113,6 @@ const SHIFT_TABLES = new Set([
 const SHIFT_COLUMNS = [
   "id",
   "cash_register_id",
-  "sede_id",
   "opened_by",
   "closed_by",
   "opened_at",
@@ -2655,7 +2653,6 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
   const methods = [
     {
       id: paymentStub.METHOD_ID,
-      sede_id: paymentStub.SEDE_ID,
       code: "efectivo",
       name: "Efectivo",
       is_active: true,
@@ -4491,7 +4488,7 @@ describe("cash: CL-10 el cierre y su arqueo de cierre son UNA transacción", () 
     shiftStub.rpcCalls.filter((call) => call.name === "cash_close_shift_atomic");
   const loose = () => shiftStub.looseWrites.filter((entry) => entry.table !== "audit_logs");
   const close = (raw: unknown = CLOSE_INPUT) =>
-    closeShift(shiftStub.SEDE_ID, shiftStub.SHIFT_ID, raw, ACTOR);
+    closeShift(shiftStub.SHIFT_ID, raw, ACTOR);
 
   beforeEach(() => {
     resetShiftStub();
@@ -4764,7 +4761,7 @@ describe("cash: CL-10 el reconteo y su detalle son UNA transacción", () => {
     shiftStub.rpcCalls.filter((call) => call.name === "cash_recount_shift_atomic");
   const loose = () => shiftStub.looseWrites.filter((entry) => entry.table !== "audit_logs");
   const recount = (raw: unknown = RECOUNT_INPUT) =>
-    recountClosedShift(shiftStub.SEDE_ID, shiftStub.SHIFT_ID, raw, ACTOR);
+    recountClosedShift(shiftStub.SHIFT_ID, raw, ACTOR);
 
   beforeEach(() => {
     resetShiftStub();
@@ -5117,7 +5114,7 @@ describe("cash: CL-19 el cierre no firma un arqueo que ya no corresponde", () =>
     shiftStub.rpcCalls.filter((call) => call.name === "cash_close_shift_atomic");
   const loose = () => shiftStub.looseWrites.filter((entry) => entry.table !== "audit_logs");
   const close = (raw: unknown = CLOSE_INPUT) =>
-    closeShift(shiftStub.SEDE_ID, shiftStub.SHIFT_ID, raw, ACTOR);
+    closeShift(shiftStub.SHIFT_ID, raw, ACTOR);
   /** El efectivo que REALMENTE entró al turno, leído del ledger. */
   const collectedCash = (): number =>
     (shiftStub.tables.payments ?? [])
@@ -5350,7 +5347,6 @@ describe("cash: CL-19 el cierre no firma un arqueo que ya no corresponde", () =>
     seedClosedShift();
 
     const result = await recountClosedShift(
-      shiftStub.SEDE_ID,
       shiftStub.SHIFT_ID,
       {
         counted_cash: 400000,
@@ -5584,7 +5580,7 @@ describe("cash: CL-21 el arqueo lee sus CUATRO fuentes de forma exhaustiva", () 
   const closeCalls = () =>
     shiftStub.rpcCalls.filter((call) => call.name === "cash_close_shift_atomic");
   const close = (raw: unknown = CLOSE_INPUT) =>
-    closeShift(shiftStub.SEDE_ID, shiftStub.SHIFT_ID, raw, ACTOR);
+    closeShift(shiftStub.SHIFT_ID, raw, ACTOR);
   /** El efectivo que REALMENTE entró al turno, leído de las dos fuentes que SUMA. */
   const collectedCash = (): number => {
     const drawer = (shiftStub.tables.payments ?? []).filter(
@@ -5977,7 +5973,7 @@ describe("cash: CL-20 el cierre tampoco firma un arqueo al que le faltan las SAL
   const closeCalls = () =>
     shiftStub.rpcCalls.filter((call) => call.name === "cash_close_shift_atomic");
   const close = (raw: unknown = CLOSE_INPUT) =>
-    closeShift(shiftStub.SEDE_ID, shiftStub.SHIFT_ID, raw, ACTOR);
+    closeShift(shiftStub.SHIFT_ID, raw, ACTOR);
   /** El efectivo que REALMENTE entró al turno, leído del ledger de cobros. */
   const collectedCash = (): number =>
     (shiftStub.tables.payments ?? [])

@@ -92,6 +92,11 @@ export type ResetPasswordInput = z.infer<typeof resetPasswordSchema>;
  * Alta solo por admin (AUTH-04: 0 rutas públicas de creación).
  * Exige correo REAL (sin emails sintéticos tipo id@orabella.local):
  * quien no tenga correo no puede crearse en T2.
+ *
+ * `sede_id` sigue declarado porque su único destino es el ARGUMENTO `p_user` de
+ * `create_user_with_role` (054), que es contrato de la base y este cambio no
+ * toca. No es un alcance por sede de la petición: nada de este módulo lo usa
+ * para filtrar ni para comparar filas.
  */
 export const adminCreateUserSchema = z.object({
   email: z.email("Correo inválido."),

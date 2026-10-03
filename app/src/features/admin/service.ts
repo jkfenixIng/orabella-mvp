@@ -25,7 +25,6 @@ import {
 } from "@/src/shared/lib/sede";
 export {
   requireSedeRole,
-  resolveSede,
   SedeError as AdminError,
 } from "@/src/shared/lib/sede";
 
@@ -110,14 +109,14 @@ export async function requireSession(token: string | null | undefined): Promise<
 }
 
 /**
- * El MVP opera una sola sede (`resolveSede` en `@/src/shared/lib/sede.ts`,
- * re-exportado arriba).
+ * El MVP es de una sola sede: la fila de `sedes` describe LA INSTALACIÓN y
+ * ninguna escritura ni lectura del negocio la nombra ya (ver el bloque final de
+ * este archivo).
  */
 
 // ------------------------------------------------------------- empleados ---
 export interface EmployeeRow {
   id: string;
-  sede_id: string;
   user_id: string | null;
   full_name: string;
   employee_code: string | null;
@@ -145,6 +144,11 @@ export interface EmployeeRow {
 
 export interface SedeUserRow {
   id: string;
+  /**
+   * La fila de la cuenta sigue nombrando la instalación a la que pertenece, y
+   * la pestaña de Roles la muestra (`· sin sede`). Es un campo DEVUELTO de la
+   * lectura, no un criterio con el que esta lectura se acote.
+   */
   sede_id: string | null;
   full_name: string;
   id_number: string;
@@ -152,7 +156,7 @@ export interface SedeUserRow {
 }
 
 const EMPLOYEE_SELECT =
-  "id, sede_id, user_id, full_name, employee_code, document, phone, position, payout_mode, email, birth_date, pay_type, pay_frequency, salary_fixed, commission_percent, is_active";
+  "id, user_id, full_name, employee_code, document, phone, position, payout_mode, email, birth_date, pay_type, pay_frequency, salary_fixed, commission_percent, is_active";
 
 async function fetchEmployees(limit?: number): Promise<EmployeeRow[]> {
   const db = await adminDb();
@@ -209,8 +213,16 @@ export async function getEmployee(id: string): Promise<EmployeeRow> {
   return data as EmployeeRow;
 }
 
-/** Usuarios de la sede con sus roles (selector de vínculo + pestaña Roles).
- * Incluye sin sede para que ninguno quede invisible sin rol. */
+/**
+ * Usuarios de la instalación con sus roles (selector de vínculo + pestaña
+ * Roles). Incluye las cuentas sin sede para que ninguna quede invisible sin
+ * rol.
+ *
+ * El alcance se sigue declarando por `sedeId` (la fila DEVUELTA trae `sede_id` y
+ * la pestaña de Roles la muestra) pero ya NO es una frontera: con una sola
+ * instalación, `sedeId` es el identificador de esa instalación y el filtro sólo
+ * reúne sus cuentas más las que todavía no tienen ninguna.
+ */
 export async function listSedeUsers(sedeId: string): Promise<SedeUserRow[]> {
   const db = await adminDb();
   const { data: users, error } = await db
@@ -250,8 +262,12 @@ export async function listSedeUsers(sedeId: string): Promise<SedeUserRow[]> {
  * ADM-02/ADM-03/ADM-08: crea o actualiza un empleado. Valida la unicidad
  * parcial de employee_code a nivel app (además del índice
  * uq_employees_sede_code) para devolver un error de negocio claro.
+ *
+ * `sedeId` NO viene del cuerpo: lo resuelve el servidor (la sesión) y sólo se usa
+ * para los ARGUMENTOS de `upsert_employee_atomic`, que son contrato de la base y
+ * este cambio no toca. La escritura suelta de una edición NO manda la columna.
  */
-export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
+export async function upsertEmployee(raw: unknown, sedeId: string): Promise<EmployeeRow> {
   const parsed = employeeSchema.safeParse(raw);
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const input: EmployeeInput = parsed.data;
@@ -340,8 +356,11 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
   // Al actualizar (`input.id`) no se consulta: los roles no se tocan, y el
   // legajo se sigue escribiendo con su `upsert` de siempre (UNA escritura, que
   // no necesita transacción para ser atómica).
-  const camposDelEmpleado = {
-    sede_id: input.sede_id,
+  // El argumento del RPC (054/065) es contrato de la base: se entrega completo,
+  // con la fila que nombra la instalación. `columnasDelLegajo` es la MISMA lista
+  // sin esa columna, y es lo que viaja en la escritura suelta de una edición:
+  // el alta y la edición no pueden escribir conjuntos distintos de columnas.
+  const columnasDelLegajo = {
     full_name: input.full_name,
     employee_code: code,
     document: input.document,
@@ -363,12 +382,12 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
 
   if (!input.id) {
     const { data: creado, error: altaError } = await db.rpc("upsert_employee_atomic", {
-      p_employee: camposDelEmpleado,
+      p_employee: { sede_id: sedeId, ...columnasDelLegajo },
       p_user_id: userId,
       p_create_user: userId
         ? null
         : {
-            sede_id: input.sede_id,
+            sede_id: sedeId,
             email: input.email?.trim() ? input.email.trim() : null,
             phone: input.phone ?? null,
             id_type: "CC",
@@ -394,7 +413,7 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
 
   const payload = {
     ...(input.id ? { id: input.id } : {}),
-    ...camposDelEmpleado,
+    ...columnasDelLegajo,
     user_id: userId,
   };
   const { data, error } = await db
@@ -417,7 +436,6 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
 // -------------------------------------------------------------- services ---
 export interface ServiceRow {
   id: string;
-  sede_id: string;
   name: string;
   description: string | null;
   price: number;
@@ -427,7 +445,7 @@ export interface ServiceRow {
 }
 
 const SERVICE_SELECT =
-  "id, sede_id, name, description, price, duracion_min, duracion_max, is_active";
+  "id, name, description, price, duracion_min, duracion_max, is_active";
 
 async function fetchServices(limit?: number): Promise<ServiceRow[]> {
   const db = await adminDb();
@@ -448,7 +466,6 @@ export async function upsertService(raw: unknown): Promise<ServiceRow> {
   const db = await adminDb();
   const payload = {
     ...(input.id ? { id: input.id } : {}),
-    sede_id: input.sede_id,
     name: input.name,
     description: input.description ?? null,
     price: input.price,
@@ -468,14 +485,13 @@ export async function upsertService(raw: unknown): Promise<ServiceRow> {
 // ----------------------------------------------------------------- taxes ---
 export interface TaxConfigRow {
   id: string;
-  sede_id: string;
   code: string;
   name: string;
   percent: number;
   is_active: boolean;
 }
 
-const TAX_SELECT = "id, sede_id, code, name, percent, is_active";
+const TAX_SELECT = "id, code, name, percent, is_active";
 
 async function fetchTaxes(limit?: number): Promise<TaxConfigRow[]> {
   const db = await adminDb();
@@ -488,23 +504,21 @@ async function fetchTaxes(limit?: number): Promise<TaxConfigRow[]> {
   return (data ?? []) as TaxConfigRow[];
 }
 
-/** ADM-06: crea o actualiza un impuesto por sede (upsert por id). */
+/** ADM-06: crea o actualiza un impuesto de la instalación (upsert por id). */
 export async function upsertTaxConfig(raw: unknown): Promise<TaxConfigRow> {
   const parsed = taxConfigSchema.safeParse(raw);
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const input: TaxConfigInput = parsed.data;
   const db = await adminDb();
-  const payload = {
-    ...(input.id ? { id: input.id } : {}),
-    sede_id: input.sede_id,
-    code: input.code,
-    name: input.name,
-    percent: input.percent,
-    ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
-  };
   const { data, error } = await db
     .from("tax_configs")
-    .upsert(payload, { onConflict: "id" })
+    .upsert({
+      ...(input.id ? { id: input.id } : {}),
+      code: input.code,
+      name: input.name,
+      percent: input.percent,
+      ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
+    }, { onConflict: "id" })
     .select(TAX_SELECT)
     .single();
   if (error || !data) throw new AdminError("INTERNAL", "Error interno.", 500);
@@ -514,7 +528,6 @@ export async function upsertTaxConfig(raw: unknown): Promise<TaxConfigRow> {
 // ------------------------------------------------------- payment methods ---
 export interface PaymentMethodRow {
   id: string;
-  sede_id: string;
   code: string;
   name: string;
   is_active: boolean;
@@ -522,7 +535,7 @@ export interface PaymentMethodRow {
   fee_percent: number;
 }
 
-const PAYMENT_METHOD_SELECT = "id, sede_id, code, name, is_active, arqueable, fee_percent";
+const PAYMENT_METHOD_SELECT = "id, code, name, is_active, arqueable, fee_percent";
 
 async function fetchPaymentMethods(limit?: number): Promise<PaymentMethodRow[]> {
   const db = await adminDb();
@@ -535,24 +548,22 @@ async function fetchPaymentMethods(limit?: number): Promise<PaymentMethodRow[]> 
   return (data ?? []) as PaymentMethodRow[];
 }
 
-/** ADM-07: crea o actualiza un método de pago por sede (upsert por id). */
+/** ADM-07: crea o actualiza un método de pago de la instalación (upsert por id). */
 export async function upsertPaymentMethod(raw: unknown): Promise<PaymentMethodRow> {
   const parsed = paymentMethodSchema.safeParse(raw);
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const input: PaymentMethodInput = parsed.data;
   const db = await adminDb();
-  const payload = {
-    ...(input.id ? { id: input.id } : {}),
-    sede_id: input.sede_id,
-    code: input.code,
-    name: input.name,
-    ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
-    ...(input.arqueable !== undefined ? { arqueable: input.arqueable } : {}),
-    ...(input.fee_percent !== undefined ? { fee_percent: input.fee_percent } : {}),
-  };
   const { data, error } = await db
     .from("payment_methods")
-    .upsert(payload, { onConflict: "id" })
+    .upsert({
+      ...(input.id ? { id: input.id } : {}),
+      code: input.code,
+      name: input.name,
+      ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
+      ...(input.arqueable !== undefined ? { arqueable: input.arqueable } : {}),
+      ...(input.fee_percent !== undefined ? { fee_percent: input.fee_percent } : {}),
+    }, { onConflict: "id" })
     .select(PAYMENT_METHOD_SELECT)
     .single();
   if (error || !data) throw new AdminError("INTERNAL", "Error interno.", 500);
@@ -669,20 +680,34 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
 // ------------------------------------------ listados con caché (catálogos) ---
 //
 // G5: la lista de sedes (`listSedes`, etiqueta `catalog:sedes`) se eliminó con
-// sus dos acciones. El negocio ya no lee ni escribe la tabla `sedes`: sólo lo
-// hace la capa de plataforma, para resolver cuál es la sede de la instalación
-// (la única fila activa) y configurar su fecha de nómina.
+// sus dos acciones. Estos servicios ya no leen ni escriben la tabla `sedes`:
+// esa fila la nombra la capa de plataforma, para resolver cuál es la sede de la
+// instalación (la única fila activa) y configurar su fecha de nómina, y el
+// módulo de nómina la lee por clave primaria (`getPayrollStartDate`,
+// `payroll/service.ts`), sin pasar por ninguna lista.
 //
-// La columna `sede_id` sigue existiendo, y con ella `resolveSede`
-// (`src/shared/lib/sede.ts`): con `service_role` bypassing RLS, esa guarda es la
-// frontera de tenant de las rutas del negocio, no plomería de sede. Se retira
-// junto con la migración que relaje la columna, no antes.
+// La columna `sede_id` sigue existiendo y esta unidad NO la retira: lo que se
+// retiró fue el alcance multi sede de las lecturas que ya no lo necesitan, no la
+// columna. Donde la columna todavía la exige, estos servicios la siguen
+// mandando, porque mientras exista la base la exige:
 //
-// Los catálogos de ESTA unidad ya no filtran la lectura por `sede_id`: con una
-// sola sede el filtro era redundante y ninguno de ellos lo necesita para
-// existir. Lo que sigue guardando la frontera es el rechazo POR FILA de una
-// fila cargada de otra sede (`getEmployeeAction`, `getProductAction`,
-// `getKardex`), que compara la `sede_id` de la fila contra la de la sesión.
+//   * `upsertEmployee` la manda en el alta, dentro de `p_employee` y de
+//     `p_create_user` de `upsert_employee_atomic` (065), que inserta en
+//     `employees` y en `users`.
+//   * `listSedeUsers` la trae de vuelta y la usa como predicado: la lectura
+//     devuelve `sede_id` y acota con `sede_id.eq.<sede>,sede_id.is.null`, para
+//     que las cuentas todavía sin sede no queden invisibles sin rol.
+//
+// Todo eso se retira con el borrado FÍSICO de la columna en la migración final
+// de una sola sede (M3c), no antes: hasta entonces el servicio tiene que
+// escribirla donde la base la exige. Y mientras la fila exista, la fecha de
+// nómina tiene dónde escribirse.
+//
+// Lo que queda autorizando es el ROL, no la fila: `requireSedeRole` y las guardas
+// de sesión (`requireSession`, `requireAdminSession`) no se tocan. La sede de la
+// sesión sigue siendo un dato real —la cuenta la tiene— y es lo que permite
+// localizar la fila de la instalación (`getPayrollStartDate`); lo que ya no
+// está es el alcance por sede en las lecturas del resto del negocio.
 
 export const listEmployees = unstable_cache(fetchEmployees, ["catalog:employees"], {
   tags: ["catalog:employees"],

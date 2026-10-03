@@ -145,11 +145,11 @@ crea, no activa ni desactiva ninguna fila— y se ancla a la que ya existe.
   versión anterior de este script— no son la instalación: el script no las
   toca, no las cuenta y no las ofrece. Su limpieza es de la unidad que elimina la
   columna.
-- **No se relaja `users.sede_id` ni se toca `resolveSede`/`requireSedeRole`**
-  (`src/shared/lib/sede.ts`). `resolveSede` **no es plomería de sede**: con
-  `service_role` —que bypasea RLS— es la frontera de tenant de todas las rutas
-  del negocio, y la columna `sede_id` sigue existiendo. Se retira junto con la
-  migración que la relaje, no antes.
+- **No se relaja `users.sede_id` ni se toca `requireSedeRole`**
+  (`src/shared/lib/sede.ts`). La comparación por sede (`resolveSede`) **ya no es
+  frontera de nada**: se retiró junto con la columna, porque con una sola sede
+  instalar comparar la sede solicitada con la de la sesión no acotaba nada. Lo
+  que sigue autorizando es el ROL, por `requireSedeRole`.
 - Si la cuenta estaba anclada a otra sede, la corrida **la re-ancla a la sede de
   la instalación y lo dice** (cambiar de sede cambia lo que esa cuenta ve del
   negocio: no puede ser mudo). El ROL no se toca: `setUserRoles` rechaza otorgar
@@ -276,16 +276,13 @@ Escrito para que nadie cuente con una segunda línea de defensa que no existe.
   key) están exportados y **no los importa nadie**: 0 importadores. No se borran
   —siguen siendo el camino correcto si algún día se migra la app a RLS— pero hoy
   no protegen nada. **No los cuentes como barrera.**
-- **La ÚNICA barrera real es el código de aplicación:** `resolveSede()`
-  (`src/shared/lib/sede.ts:46`), `requireSedeRole()` (`:35`) y los filtros
-  `sede_id` que cada servicio aplica a mano antes de consultar. Un guard
-  olvidado es una brecha total, no un agujero parcial: no hay nada detrás.
-  **`resolveSede` no es plomería de sede**: con la base bypassando RLS, es la
-  frontera de tenant de cada ruta —rechaza tanto un `sede_id` que venga en el
-  cuerpo de una petición como una fila cargada de otra sede— y como
-  `users.sede_id` y las demás columnas por sede siguen existiendo, es hoy la
-  única que queda. No la cuenta como dos barreras ni como una barrera "por
-  sede": es la única, y se retira con la migración que relaje la columna.
+- **La ÚNICA barrera real es el código de aplicación:** `requireSedeRole()`
+  (`src/shared/lib/sede.ts:44`) y los filtros que cada servicio aplica a mano
+  antes de consultar. Un guard olvidado es una brecha total, no un agujero
+  parcial: no hay nada detrás. **La frontera es de ROL, no de sede**: con la
+  base bypassando RLS, lo que rechaza una operación es el rol del actor
+  (`admin`/`caja`/`superadmin`/…), y ya no una comparación de `sede_id` —esa
+  se retiró con la columna.
 - **Qué escriben las migraciones (dato, no protección).** Los bullets de abajo
   describen el esquema, y el esquema sí trae aislamiento por sede:
   `008_hardening.sql:147-166` revoca las 20 políticas `USING (true)` de T2–T7 y

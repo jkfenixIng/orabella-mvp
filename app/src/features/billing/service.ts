@@ -28,10 +28,7 @@ import {
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
-import {
-  requireSedeRole,
-  resolveSede,
-} from "@/src/shared/lib/sede";
+import { requireSedeRole } from "@/src/shared/lib/sede";
 import { dayBounds } from "@/src/shared/lib/dates";
 import { listPaymentMethods, listServices, listTaxes } from "@/src/features/admin/service";
 import {
@@ -126,7 +123,6 @@ export async function requireBillingWriter(
 
 export interface InvoiceRow {
   id: string;
-  sede_id: string;
   consecutive_number: number;
   client_name: string | null;
   client_document: string | null;
@@ -211,7 +207,7 @@ export interface InvoiceDetail {
 }
 
 const INVOICE_SELECT =
-  "id, sede_id, consecutive_number, client_name, client_document, subtotal, discount, tax, surcharge, total, status, user_id, cash_shift_id, closed_by, closed_at, cancel_reason, created_at, edit_version";
+  "id, consecutive_number, client_name, client_document, subtotal, discount, tax, surcharge, total, status, user_id, cash_shift_id, closed_by, closed_at, cancel_reason, created_at, edit_version";
 const ITEM_SELECT =
   "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission, commission_value, commission_mode, commission_percent_override, employees!inner(full_name, employee_code, commission_percent, pay_type, payout_mode)";
 const TAX_SELECT = "id, invoice_id, tax_code, tax_name, percent, amount";
@@ -487,8 +483,12 @@ export async function countInvoices(filters: InvoiceFilters = {}): Promise<numbe
   return count ?? 0;
 }
 
-/** Detalle con ítems, snapshot de impuestos y porciones (solo su sede). */
-export async function getInvoiceDetail(sedeId: string, id: string): Promise<InvoiceDetail> {
+/**
+ * Detalle con ítems, snapshot de impuestos y porciones.
+ *
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
+export async function getInvoiceDetail(id: string): Promise<InvoiceDetail> {
   const db = await billingDb();
   const { data: invoice, error } = await db
     .from("invoices")
@@ -497,13 +497,7 @@ export async function getInvoiceDetail(sedeId: string, id: string): Promise<Invo
     .maybeSingle();
   if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
   if (!invoice) throw new BillingError("NOT_FOUND", "Factura no encontrada.", 404);
-  const row = invoice as InvoiceRow;
-  try {
-    resolveSede(sedeId, row.sede_id);
-  } catch {
-    throw new BillingError("FORBIDDEN", "No tiene acceso a esa sede.", 403);
-  }
-  return loadDetail(db, row);
+  return loadDetail(db, invoice as InvoiceRow);
 }
 
 async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDetail> {
@@ -812,22 +806,24 @@ async function loadRefs(): Promise<ValidatedRefs> {
 }
 
 /**
- * Verifica existencia y sede de cada referencia de los ítems (productos,
- * servicios, empleados). B1: los productos se validan vía la frontera de
- * inventario (getProductsStock) — billing NUNCA toca las tablas de
- * inventory directo. Devuelve el mapa de stock para que el llamador
- * pre-verifique disponibilidad ANTES de reservar el consecutivo
- * (FAC-05 sin huecos) o de mutar. Sin N+1: una sola query con IN por
- * tabla (productos vía servicio + empleados) más el catálogo de
- * servicios; el bucle posterior es en memoria.
+ * Verifica existencia de cada referencia de los ítems (productos, servicios,
+ * empleados). B1: los productos se validan vía la frontera de inventario
+ * (getProductsStock) — billing NUNCA toca las tablas de inventory directo.
+ * Devuelve el mapa de stock para que el llamador pre-verifique disponibilidad
+ * ANTES de reservar el consecutivo (FAC-05 sin huecos) o de mutar. Sin N+1: una
+ * sola query con IN por tabla (productos vía servicio + empleados) más el
+ * catálogo de servicios; el bucle posterior es en memoria.
+ *
+ * La SEDE no es un criterio de esta validación: con una sola instalación, una
+ * referencia que existe PERTENECE a la instalación, así que la comprobación es
+ * de existencia y el error sigue siendo NOT_FOUND.
  */
 async function validateItemRefs(
-  sedeId: string,
   items: InvoiceItemInput[],
 ): Promise<Map<string, StockEntry>> {
   const db = await billingDb();
   const serviceRows = await listServices(500);
-  const serviceSedeById = new Map(serviceRows.map((row) => [row.id, row.sede_id]));
+  const serviceIds = new Set(serviceRows.map((row) => row.id));
 
   const productIds = [...new Set(
     items
@@ -841,35 +837,31 @@ async function validateItemRefs(
       ? getProductsStock(productIds)
       : Promise.resolve(new Map<string, StockEntry>()),
     employeeIds.length > 0
-      ? db.from("employees").select("id, sede_id").in("id", employeeIds)
+      ? db.from("employees").select("id").in("id", employeeIds)
       : Promise.resolve({ data: [], error: null }),
   ]);
   if (employeeRes.error) {
     throw new BillingError("INTERNAL", "Error interno.", 500);
   }
-  const employeeSedeById = new Map(
-    ((employeeRes.data ?? []) as Array<{ id: string; sede_id: string }>).map((row) => [row.id, row.sede_id]),
+  const employeeIdsFound = new Set(
+    ((employeeRes.data ?? []) as Array<{ id: string }>).map((row) => row.id),
   );
 
   for (const item of items) {
+    // `getProductsStock` solo devuelve productos existentes: ausente =
+    // inexistente.
     if (item.item_type === "producto" && item.product_id) {
-      // `getProductsStock` solo devuelve productos existentes: ausente =
-      // inexistente (sin filtrar datos ajenos).
       if (!stockMap.has(item.product_id)) {
         throw new BillingError("NOT_FOUND", "Producto no encontrado.", 404);
       }
     }
     if (item.item_type === "servicio" && item.service_id) {
-      if (serviceSedeById.get(item.service_id) !== sedeId) {
+      if (!serviceIds.has(item.service_id)) {
         throw new BillingError("NOT_FOUND", "Servicio no encontrado en esta sede.", 404);
       }
     }
-    const employeeSedeId = employeeSedeById.get(item.employee_id);
-    if (!employeeSedeId) {
+    if (!employeeIdsFound.has(item.employee_id)) {
       throw new BillingError("NOT_FOUND", "Empleado no encontrado.", 404);
-    }
-    if (employeeSedeId !== sedeId) {
-      throw new BillingError("FORBIDDEN", "No tiene acceso a esa sede.", 403);
     }
   }
   return stockMap;
@@ -1008,6 +1000,11 @@ function toRpcEditError(error: { code?: unknown; message?: unknown } | null): Bi
 
 export interface BillingActor {
   userId: string;
+  /**
+   * Ya no decide nada: la instalación es de una sola sede. El campo sobrevive
+   * porque las fixtures de `tests/billing.test.ts` se anotan como `BillingActor`
+   * y lo declaran; quitarlo de la interfaz las rompería por exceso de propiedad.
+   */
   sedeId: string;
   roles?: RoleCode[];
 }
@@ -1194,7 +1191,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   let stockPlan: PlannedDeduction[];
   try {
     refs = await loadRefs();
-    stockMap = await validateItemRefs(actor.sedeId, input.items);
+    stockMap = await validateItemRefs(input.items);
     // B1/FAC-05: pre-verifica stock con mensaje de negocio POR PRODUCTO. Ya no es
     // la forma de evitar un hueco en la serie —el hueco no puede existir: la
     // reserva es de la transacción— sino la guarda que le dice al operador QUÉ
@@ -1257,7 +1254,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   let cashShiftId: string | null = null;
   let adminOverrideJustification: string | null = null;
   {
-    const openShift = await getOpenShiftWithOpener(actor.sedeId);
+    const openShift = await getOpenShiftWithOpener();
     if (!openShift) {
       throw new BillingError(
         "NO_OPEN_SHIFT",
@@ -1437,8 +1434,10 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
  * transacción, sobre la fila bloqueada: una transacción no es un camino para
  * saltear una guarda.
  */
+/**
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
 export async function annulInvoice(
-  sedeId: string,
   id: string,
   raw: unknown,
   actor: BillingActor,
@@ -1453,7 +1452,7 @@ export async function annulInvoice(
   const motivo = parsed.data.motivo.trim();
   const db = await billingDb();
 
-  const detail = await getInvoiceDetail(sedeId, id);
+  const detail = await getInvoiceDetail(id);
   if (!canAnnulStatus(detail.invoice.status)) {
     throw new BillingError("ANNUL_INVALID", annulBlockedMessage(detail.invoice.status), 409);
   }
@@ -1600,8 +1599,10 @@ function buildEditStockMoves(args: {
  * inmutabilidad del total es ESTRUCTURAL, porque la función no tiene un grupo
  * capaz de escribir dinero.
  */
+/**
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
 export async function editInvoiceItems(
-  sedeId: string,
   invoiceId: string,
   raw: unknown,
   actor: BillingActor,
@@ -1617,7 +1618,7 @@ export async function editInvoiceItems(
   const motivo = input.motivo.trim();
   const db = await billingDb();
 
-  const detail = await getInvoiceDetail(sedeId, invoiceId);
+  const detail = await getInvoiceDetail(invoiceId);
   if (detail.invoice.status === "Anulada") {
     throw new BillingError("ANNUL_INVALID", "Anulada es terminal: no se edita (emita una nueva).", 409);
   }
@@ -1627,7 +1628,6 @@ export async function editInvoiceItems(
   try {
     refs = await loadRefs();
     stockMap = await validateItemRefs(
-      actor.sedeId,
       input.items.map((item) => ({
         item_type: item.item_type,
         product_id: item.product_id,
@@ -1844,8 +1844,10 @@ export async function editInvoiceItems(
  * reemplazo —y los totales, y el stock— son la misma transacción: o queda la
  * colección ANTERIOR completa, o queda la NUEVA completa.
  */
+/**
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
 export async function editEmittedInvoiceItems(
-  sedeId: string,
   invoiceId: string,
   raw: unknown,
   actor: BillingActor,
@@ -1863,7 +1865,7 @@ export async function editEmittedInvoiceItems(
   const motivo = input.motivo?.trim() || null;
   const db = await billingDb();
 
-  const detail = await getInvoiceDetail(sedeId, invoiceId);
+  const detail = await getInvoiceDetail(invoiceId);
   if (detail.invoice.status === "Anulada") {
     throw new BillingError("ANNUL_INVALID", "Anulada es terminal: no se edita (emita una nueva).", 409);
   }
@@ -1876,7 +1878,7 @@ export async function editEmittedInvoiceItems(
   }
 
   if (!isAdmin) {
-    const openShift = await getOpenShiftWithOpener(sedeId).catch(() => null);
+    const openShift = await getOpenShiftWithOpener().catch(() => null);
     if (!openShift) {
       throw new BillingError(
         "NO_OPEN_SHIFT",
@@ -1904,7 +1906,6 @@ export async function editEmittedInvoiceItems(
   try {
     refs = await loadRefs();
     emittedStockMap = await validateItemRefs(
-      actor.sedeId,
       input.items.map((item) => ({
         item_type: item.item_type,
         product_id: item.product_id,
@@ -2317,8 +2318,10 @@ async function findInvoicePaymentsByIdempotencyKey(
  * 042, que siguen corriendo —ahora dentro de la misma transacción— y siguen
  * traduciéndose a los mismos errores.
  */
+/**
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
 export async function splitPayment(
-  sedeId: string,
   id: string,
   raw: unknown,
   actor: BillingActor,
@@ -2328,7 +2331,7 @@ export async function splitPayment(
     throw new BillingError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const db = await billingDb();
-  const detail = await getInvoiceDetail(sedeId, id);
+  const detail = await getInvoiceDetail(id);
   if (detail.invoice.status === "Anulada") {
     throw new BillingError("ANNUL_INVALID", annulBlockedMessage("Anulada"), 409);
   }
@@ -2343,11 +2346,11 @@ export async function splitPayment(
     id,
     parsed.data.idempotency_key,
   );
-  if (repeated.length > 0) return getInvoiceDetail(sedeId, id);
+  if (repeated.length > 0) return getInvoiceDetail(id);
 
   // F2: el cobro exige caja abierta (CAJ-02). Solo la caja dueña del
   // turno o un administrador puede pagar o anular.
-  const openShift = await getOpenShiftWithOpener(sedeId).catch(() => null);
+  const openShift = await getOpenShiftWithOpener().catch(() => null);
   if (!openShift) {
     throw new BillingError(
       "NO_OPEN_SHIFT",
@@ -2494,7 +2497,7 @@ export async function splitPayment(
         id,
         parsed.data.idempotency_key,
       );
-      if (winner.length > 0) return getInvoiceDetail(sedeId, id);
+      if (winner.length > 0) return getInvoiceDetail(id);
       // Sin cobro con esa marca, el rechazo es el de siempre: el tope.
       if (code === "P0001") {
         throw new BillingError("OVERPAID", "Las porciones superan el saldo pendiente.", 422);
@@ -2514,5 +2517,5 @@ export async function splitPayment(
   }
 
   if (closesInvoice) return loadDetail(db, result.invoice);
-  return getInvoiceDetail(sedeId, id);
+  return getInvoiceDetail(id);
 }

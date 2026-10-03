@@ -35,17 +35,19 @@ export { SedeError as PlatformError } from "@/src/shared/lib/sede";
  * inline) porque `tests/action-guards.test.ts` lee del fuente los roles que
  * admite cada guarda; la lista es la única fuente de verdad de este gate.
  *
- * Es un rol ADICIONAL, no una sede nueva: quien lo tenga conserva su `sede_id`
- * (`users.sede_id` es NOT NULL y esa columna no se relaxes en esta unidad) y el
- * privilegio de plataforma viene del ROL, no de dónde esté anclada la cuenta.
+ * Es un rol ADICIONAL, no una sede nueva: el privilegio de plataforma viene del
+ * ROL, no de dónde esté anclada la cuenta. La cuenta sigue apuntando a la fila
+ * de la instalación porque TODAS las guardas de sesión la exigen (ver
+ * `requirePlatformAdmin`), no porque el rol dependa de ella.
  */
 const PLATFORM_ROLES: RoleCode[] = ["superadmin"];
 
 /**
  * Sesión de plataforma: autenticada y con sus roles. La sede NO viaja en el
  * actor: la plataforma no la elige ni la filtra — resuelve la fila de la
- * instalación por dato (`leerSedeDeLaInstalacion`). La sesión sí exige que
- * exista, porque `users.sede_id` es NOT NULL mientras la columna exista.
+ * instalación por dato (`leerSedeDeLaInstalacion`). La sesión sí exige que la
+ * cuenta tenga una, porque TODAS las guardas de la casa la exigen: es la fila
+ * de la instalación, no un alcance por sede del negocio.
  */
 export interface PlatformActor {
   userId: string;
@@ -58,7 +60,8 @@ export interface PlatformActor {
  *
  * Sigue la forma de casa de `requireAdminSession`/`requireSession`
  * (`admin/service`) y de `requirePayrollAdmin` (`payroll/service`): lee la
- * sesión, exige la sede (el rol NO relaja `users.sede_id`) y aplica el gate con
+ * sesión, exige que la cuenta tenga su fila de instalación (el rol NO la
+ * relaja) y aplica el gate con
  * `requireSedeRole`, que responde FORBIDDEN/403. Devuelve el actor para que las
  * lecturas de configuración no tengan que volver a leer la sesión.
  */
@@ -145,9 +148,15 @@ function isMissingPayrollColumn(error: { code?: string | null; message?: string 
  * sede, que es un dato que decide el dueño y no el código. El error nombra las
  * filas para que el arreglo sea evidente.
  *
- * AISLAMIENTO: esta lectura NO usa `resolveSede` (la frontera del negocio) y no
- * filtra por la sede del actor: no es una lectura cross-sede, es la lectura de
- * la fila que ES la instalación.
+ * AISLAMIENTO: esta lectura NO usa la comparación por sede —esa frontera ya no
+ * acota nada en una instalación de una sola sede— y no filtra por la sede del
+ * actor: no es una lectura cross-sede, es la lectura de la fila que ES la
+ * instalación. Lo que la columna conserve hasta su borrado físico (M3c) es la
+ * fila misma —la que nombra la fecha de nómina—, no una comparación de sedes.
+ *
+ * Es la MISMA fila que lee `getPayrollStartDate` (`payroll/service`) por clave
+ * primaria: las dos superficies escriben y leen el mismo ajuste de la misma
+ * fila.
  *
  * Degradación por migración pendiente: con la 068 sin aplicar la columna no
  * existe y PostgREST responde 42703. Se relee sin la columna y la instalación

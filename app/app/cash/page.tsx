@@ -49,7 +49,7 @@ export default async function CashPage() {
   // para no pagar ese costo al entrar solo a abrir o cerrar turno.
   const [registers, openShift, methods] = await Promise.all([
     listRegisters(),
-    getOpenShiftWithOpener(sedeId),
+    getOpenShiftWithOpener(),
     listPaymentMethods(),
   ]);
 
