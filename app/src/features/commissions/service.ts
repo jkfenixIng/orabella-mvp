@@ -69,6 +69,23 @@ export async function listCommissionRules(
 /**
  * Crea o ajusta la regla de un (ítem × empleado). Solo admin (el gate
  * vive en actions). Valida que ítem y empleado existan en la sede.
+ *
+ * `onConflict: "item_type,item_id,employee_id"` — la clave es de INSTALACIÓN,
+ * sin `sede_id`. La inferencia de `ON CONFLICT` exige coincidencia EXACTA con
+ * las columnas de un índice único, así que el orden de esta serie es: PRIMERO
+ * el índice, DESPUÉS el código. Por eso la migración
+ * `075_commission_rule_install_key.sql` declara
+ * `uq_commission_rule_install_key (item_type, item_id, employee_id)` y esta
+ * línea viene con ella; mandar el conjunto viejo contra un esquema sin ese
+ * índice termina en 42P10 («no unique or exclusion constraint matching the ON
+ * CONFLICT specification») en cada alta y cada edición de regla.
+ *
+ * `uq_commission_rule (sede_id, item_type, item_id, employee_id)` —el índice
+ * de 016— SIGUE EN PIE: quitarlo acá abriría una ventana de despliegue en la
+ * que una versión anterior de este código no tenga contra qué inferir. Se borra
+ * en la migración final de una sola sede (M3c), junto con la columna; queda
+ * anotado en el encabezado de esa migración, en la sección 3 de la 075 y en
+ * «LO QUE ESTE ARCHIVO NO TOCA» de la 074.
  */
 export async function upsertCommissionRule(
   raw: unknown,
@@ -111,7 +128,7 @@ export async function upsertCommissionRule(
         amount: input.amount ?? null,
         ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
       },
-      { onConflict: "sede_id,item_type,item_id,employee_id" },
+      { onConflict: "item_type,item_id,employee_id" },
     )
     .select(RULE_SELECT)
     .single();
