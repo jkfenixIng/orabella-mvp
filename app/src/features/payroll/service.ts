@@ -712,7 +712,7 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
     // guarda podría no ver el período que estorba y abrir un rango que comparte
     // días—) y la regla de F10, que necesita saber si la CADENCIA ya tiene
     // historia y no sólo si ese ciclo está tocado.
-    const sedePeriods = await listPeriods(actor.sedeId);
+    const sedePeriods = await listPeriods();
     // F10: la ÚNICA decisión de la FORMA del rango que se persiste. Acepta un
     // ciclo COMPLETO de la cadencia o el PRIMER ciclo —el que CONTIENE la fecha
     // de arranque— RECORTADO a esa fecha, y sólo como primera liquidación de la
@@ -824,29 +824,28 @@ export async function openPayrollPeriod(raw: unknown, actor: PayrollActor): Prom
 }
 
 /**
- * Lista TODOS los períodos de la sede (más recientes primero).
+ * Lista TODOS los períodos (más recientes primero).
  *
  * PA3: antes tenía `.limit(20)` y eso no era un tope de presentación, era un
  * tope de HISTORIA: la pantalla se quedaba con los 20 últimos sin total, sin
  * conteo y sin aviso, así que la sede con más de 20 períodos perdía los viejos
- * de la vista y nada lo decía. El conjunto está acotado por la sede (un día se
- * nomina una sola vez), así que lo correcto es leerlo entero por páginas y con
- * `order()` determinista: sin el desempate por `id`, dos períodos con la misma
- * fecha de inicio pueden caer en páginas distintas y repetirse o perderse.
+ * de la vista y nada lo decía. Lo correcto es leer el conjunto entero por
+ * páginas y con `order()` determinista: sin el desempate por `id`, dos períodos
+ * con la misma fecha de inicio pueden caer en páginas distintas y repetirse o
+ * perderse.
  */
-export async function listPeriods(sedeId: string): Promise<PayrollPeriodRow[]> {
+export async function listPeriods(): Promise<PayrollPeriodRow[]> {
   try {
     const db = await payrollDb();
     return await readAllPayroll<PayrollPeriodRow>({
       log: "listPeriods",
-      what: "períodos de la sede",
-      meta: { sede: sedeId },
+      what: "períodos",
+      meta: {},
       table: "payroll_periods",
       fetchPage: (from, to) =>
         db
           .from("payroll_periods")
           .select(PERIOD_SELECT)
-          .eq("sede_id", sedeId)
           .order("start_date", { ascending: false })
           .order("id")
           .range(from, to),
@@ -926,8 +925,8 @@ export interface PeriodDetail {
       /**
        * NV-01: deuda PENDIENTE del empleado originada en ESTE período (el
        * sobrante de vales que el período produjo y todavía no se aplicó). Se
-       * lee acotada por sede y por período de origen, y se atribuye por
-       * empleado: no puede mostrar la deuda de otra sede ni la de otro empleado.
+       * lee acotada por período de origen y se atribuye por empleado: no puede
+       * mostrar la deuda de otro empleado.
        */
       pending_debt: number;
     }
@@ -997,8 +996,8 @@ export async function getPeriodDetail(sedeId: string, id: string): Promise<Perio
     }
     // NV-01: la deuda PENDIENTE que ESTE período produjo (el sobrante de vales
     // que todavía no se aplicó), para que la pantalla la muestre aparte del
-    // neto. La lectura es ACOTADA por sede y por período de origen y se
-    // atribuye por empleado: no puede mostrar la deuda de otra sede ni la de
+    // neto. La lectura es ACOTADA por período de origen y se atribuye por
+    // empleado: no puede mostrar la deuda de otro empleado ni la de
     // otro empleado. Una deuda ya aplicada no está pendiente y no aparece.
     const pendingDebtByEmployee = new Map<string, number>();
     {
@@ -1011,7 +1010,6 @@ export async function getPeriodDetail(sedeId: string, id: string): Promise<Perio
           db
             .from("payroll_discount_carries")
             .select("employee_id, amount")
-            .eq("sede_id", sedeId)
             .eq("origin_period_id", id)
             .is("applied_period_id", null)
             .order("id")
@@ -1143,9 +1141,9 @@ export function groupSettlementInvoices(detail: readonly DetailLine[]): {
  *
  * El alcance es la clave de la lectura: el período se valida contra la sede del
  * actor (`getPeriodOrThrow`), el ítem se lee por `period_id` + `employee_id` y
- * los vales por `sede_id` + `employee_id` + el rango de fechas del período. No
- * puede devolver la nómina de otra sede ni la de otro empleado, y no consulta
- * ninguna tabla nueva: las facturas ya están en `detail_json`.
+ * los vales por `employee_id` + el rango de fechas del período. No puede
+ * devolver la nómina de otro empleado, y no consulta ninguna tabla nueva: las
+ * facturas ya están en `detail_json`.
  *
  * Sin ítem no hay liquidación: se devuelve vacío y NO se leen los vales del
  * rango. Esos vales no entraron a este período —el cálculo no los tocó (por
@@ -1198,7 +1196,6 @@ export async function getPayrollSettlementSources(
         db
           .from("voucher_requests")
           .select("id, request_date, amount, status")
-          .eq("sede_id", sedeId)
           .eq("employee_id", employeeId)
           .in("status", voucherStatusesForScope("vigentes_y_descontados"))
           .gte("request_date", period.start_date)
@@ -1336,7 +1333,7 @@ async function readPaidItemsOfPeriods(args: {
 export async function listPayrollOverview(sedeId: string): Promise<PayrollOverview> {
   try {
     // `listPeriods` ya es exhaustiva: si se recorta, esto se cae a la vista.
-    const periods = await listPeriods(sedeId);
+    const periods = await listPeriods();
     // F10: la fecha de arranque de la sede acota el aviso de pendientes. Se lee
     // SIEMPRE, también sin períodos: con la fecha configurada, la sede que
     // todavía no liquidó nada tiene justamente su PRIMER ciclo pendiente.
@@ -1358,9 +1355,9 @@ export async function listPayrollOverview(sedeId: string): Promise<PayrollOvervi
         db,
         periodIds: periods.map((period) => period.id),
         log: "listPayrollOverview",
-        meta: { sede: sedeId },
+        meta: {},
       }),
-      listAllEmployees(sedeId),
+      listAllEmployees(),
     ]);
 
     const byPeriod = new Map<string, PaidPayrollItem[]>();
@@ -1406,7 +1403,6 @@ const PAYROLL_MONTH_PATTERN = /^\d{4}-\d{2}$/;
  * otro empleado ni de otro mes.
  */
 export async function listPayrollMonthRows(args: {
-  sedeId: string;
   month: string;
   employeeId: string;
 }): Promise<PayrollMonthEmployeeRow[]> {
@@ -1414,7 +1410,7 @@ export async function listPayrollMonthRows(args: {
     if (!PAYROLL_MONTH_PATTERN.test(args.month)) {
       throw new PayrollError("VALIDATION", "Mes inválido (use yyyy-mm).", 400);
     }
-    const monthPeriods = (await listPeriods(args.sedeId)).filter(
+    const monthPeriods = (await listPeriods()).filter(
       (period) => monthKeyOf(period.start_date) === args.month,
     );
     if (monthPeriods.length === 0) return [];
@@ -1425,7 +1421,7 @@ export async function listPayrollMonthRows(args: {
       periodIds: monthPeriods.map((period) => period.id),
       employeeId: args.employeeId,
       log: "listPayrollMonthRows",
-      meta: { sede: args.sedeId, month: args.month, employee: args.employeeId },
+      meta: { month: args.month, employee: args.employeeId },
     });
 
     return buildPayrollMonthToDate({ periods: monthPeriods, items }).filter(
@@ -1549,11 +1545,11 @@ export async function calculatePayroll(
     }
 
     // La alineación cubre TODA la planta activa de la sede, no el listado de
-    // navegación: U7: antes esto era `listEmployees(sedeId, 500)` y el techo de
-    // `clampLimit` (500) mandaba. El empleado 501 no se liquidaba —ausente, sin
-    // error— y la nómina quedaba firmada como completa. La planta está acotada
-    // por la sede, así que se lee entera por páginas.
-    const employees = await listAllEmployees(sedeId).catch((error) => {
+    // navegación: U7: antes esto armaba la alineación con el listado acotado y
+    // el techo de `clampLimit` (500) mandaba. El empleado 501 no se liquidaba
+    // —ausente, sin error— y la nómina quedaba firmada como completa. La
+    // planta se lee entera por páginas.
+    const employees = await listAllEmployees().catch((error) => {
       throw toPayrollError(error);
     });
     const actives = employees.filter((row) => row.is_active);
@@ -1568,7 +1564,6 @@ export async function calculatePayroll(
 
     const { payload, vouchersToDiscount, carriesToApply } = await computePayrollLines({
       db,
-      sedeId,
       period,
       // El borrador liquida la planta ACTIVA de la sede.
       roster: actives,
@@ -1757,7 +1752,6 @@ interface PayrollCarryRow {
  */
 async function computePayrollLines(args: {
   db: DbClient;
-  sedeId: string;
   period: PayrollPeriodRow;
   roster: EmployeeRow[];
   input: CalculatePayrollInput;
@@ -1765,7 +1759,7 @@ async function computePayrollLines(args: {
   /** Nombre de la operación para el log de una lectura incompleta. */
   log: string;
 }): Promise<PayrollLinesResult> {
-  const { db, sedeId, period, roster, input, voucherScope, log } = args;
+  const { db, period, roster, input, voucherScope, log } = args;
   const periodId = period.id;
 
     // F4: EXCLUSIÓN POR CADENCIA (regla del dueño, 2026-10-01). Cuando las DOS
@@ -1819,7 +1813,6 @@ async function computePayrollLines(args: {
         db
           .from("invoices")
           .select("id, consecutive_number")
-          .eq("sede_id", sedeId)
           .eq("status", "Pagada")
           .gte("created_at", invoiceRange.from)
           .lte("created_at", invoiceRange.to)
@@ -1908,7 +1901,6 @@ async function computePayrollLines(args: {
           db
             .from("commission_rules")
             .select("employee_id, item_type, item_id, percent, amount")
-            .eq("sede_id", sedeId)
             .eq("is_active", true)
             .in(
               "employee_id",
@@ -1947,7 +1939,6 @@ async function computePayrollLines(args: {
         db
           .from("voucher_requests")
           .select("id, employee_id, amount, status")
-          .eq("sede_id", sedeId)
           .in("status", voucherStatusesForScope(voucherScope))
           .gte("request_date", period.start_date)
           .lte("request_date", period.end_date)
@@ -1999,7 +1990,6 @@ async function computePayrollLines(args: {
         db
           .from("payroll_discount_carries")
           .select("id, employee_id, amount, origin_period_id")
-          .eq("sede_id", sedeId)
           .is("applied_period_id", null)
           .order("id")
           .range(from, to),
@@ -2013,7 +2003,6 @@ async function computePayrollLines(args: {
         db
           .from("payroll_discount_carries")
           .select("id, employee_id, amount, origin_period_id")
-          .eq("sede_id", sedeId)
           .eq("applied_period_id", periodId)
           .order("id")
           .range(from, to),
@@ -2085,7 +2074,6 @@ async function computePayrollLines(args: {
             db
               .from("commission_payouts")
               .select("employee_id, amount")
-              .eq("sede_id", sedeId)
               .in("invoice_id", chunk)
               .order("id")
               .range(from, to),
@@ -2409,7 +2397,7 @@ export async function payPayrollItem(
       return { item, paid, remaining: roundMoney(Math.max(0, net - paid)), payments: repeated };
     }
 
-    const methods = await listPaymentMethods(sedeId).catch((error) => {
+    const methods = await listPaymentMethods().catch((error) => {
       throw toPayrollError(error);
     });
     const activeByCode = new Map(methods.filter((row) => row.is_active).map((row) => [row.code, row]));
@@ -2584,7 +2572,7 @@ export async function payPayrollExtra(raw: unknown, actor: PayrollActor): Promis
     );
     if (repeated) return repeated;
 
-    const methods = await listPaymentMethods(actor.sedeId).catch((error) => {
+    const methods = await listPaymentMethods().catch((error) => {
       throw toPayrollError(error);
     });
     const method = methods.find((row) => row.is_active && row.code === parsed.data.method_code);
@@ -2675,19 +2663,18 @@ export async function payPayrollExtra(raw: unknown, actor: PayrollActor): Promis
  * Lectura exhaustiva (U5): son pocos y un listado recortado en silencio
  * mostraría menos plata pagada de la que salió.
  */
-export async function listPayrollExtras(sedeId: string): Promise<PayrollExtraRow[]> {
+export async function listPayrollExtras(): Promise<PayrollExtraRow[]> {
   try {
     const db = await payrollDb();
     return await readAllPayroll<PayrollExtraRow>({
       log: "listPayrollExtras",
       what: "pagos extraordinarios",
-      meta: { sedeId },
+      meta: {},
       table: "payroll_extras",
       fetchPage: (from, to) =>
         db
           .from("payroll_extras")
           .select(EXTRA_SELECT)
-          .eq("sede_id", sedeId)
           .order("paid_at", { ascending: false })
           // `id` desempata: dos pagos con el mismo timestamp no pueden caer en
           // páginas distintas (ni repetirse ni faltar).
@@ -2823,7 +2810,6 @@ export async function deletePayrollPeriod(
     const { data: overlapping, error: overlapError } = await db
       .from("payroll_periods")
       .select("id, status")
-      .eq("sede_id", sedeId)
       .neq("id", periodId)
       .lte("start_date", period.end_date)
       .gte("end_date", period.start_date);
@@ -2839,7 +2825,6 @@ export async function deletePayrollPeriod(
     const { data: discounted, error: discountedError } = await db
       .from("voucher_requests")
       .select("id, approved_by")
-      .eq("sede_id", sedeId)
       .eq("status", "descontada")
       .gte("request_date", period.start_date)
       .lte("request_date", period.end_date);
@@ -3022,7 +3007,7 @@ export async function correctPayrollPeriod(
     // la planta activa de hoy: un empleado dado de baja después del cierre
     // tiene que seguir en la corrección, y un alta posterior no puede aparecer
     // en un período que ya se cerró.
-    const roster = await listAllEmployees(sedeId).catch((error) => {
+    const roster = await listAllEmployees().catch((error) => {
       throw toPayrollError(error);
     });
     const employeeById = new Map(roster.map((row) => [row.id, row]));
@@ -3057,7 +3042,6 @@ export async function correctPayrollPeriod(
 
     const { payload } = await computePayrollLines({
       db,
-      sedeId,
       period,
       roster: correctionRoster,
       input,
@@ -3270,7 +3254,7 @@ export async function getPayrollPeriodCorrection(
 // -------------------------------------------------------------------- vales ---
 
 /** PAY-05/V2: topes vigentes de la sede (null cuando aún no se configuran). */
-export async function getVoucherSettings(sedeId: string): Promise<VoucherSettingsRow | null> {
+export async function getVoucherSettings(): Promise<VoucherSettingsRow | null> {
   const db = await payrollDb();
   // Degradación por migraciones pendientes: 026 (per_day_limits) y 024 (allowed_days).
   const attempts: Array<{ select: string; missing: string }> = [
@@ -3278,7 +3262,7 @@ export async function getVoucherSettings(sedeId: string): Promise<VoucherSetting
     { select: "sede_id, max_per_day, max_per_week, allowed_days", missing: "allowed_days" },
   ];
   for (const attempt of attempts) {
-    const result = await db.from("voucher_settings").select(attempt.select).eq("sede_id", sedeId).maybeSingle();
+    const result = await db.from("voucher_settings").select(attempt.select).maybeSingle();
     if (!result.error) {
       const row = result.data as unknown as Record<string, unknown> | null;
       if (!row) return null;
@@ -3296,7 +3280,6 @@ export async function getVoucherSettings(sedeId: string): Promise<VoucherSetting
   const { data, error } = await db
     .from("voucher_settings")
     .select("sede_id, max_per_day, max_per_week")
-    .eq("sede_id", sedeId)
     .maybeSingle();
   if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
   if (!data) return null;
@@ -3325,7 +3308,7 @@ export async function setVoucherLimits(raw: unknown, actor: PayrollActor): Promi
   }
   const db = await payrollDb();
   // Sin días en el payload se conserva la config vigente (upsert pisa la fila).
-  const current = await getVoucherSettings(actor.sedeId).catch(() => null);
+  const current = await getVoucherSettings().catch(() => null);
   const allowed = parsed.data.allowed_days !== undefined
     ? normalizeAllowedDays(parsed.data.allowed_days)
     : (current?.allowed_days ?? null);
@@ -3376,7 +3359,6 @@ export async function setVoucherLimits(raw: unknown, actor: PayrollActor): Promi
 /** Vales vigentes (pendiente/aprobada) de un empleado en una fecha. */
 async function vigenteTotals(
   db: DbClient,
-  sedeId: string,
   employeeId: string,
   requestDate: string,
   settings: VoucherSettingsRow | null,
@@ -3392,13 +3374,12 @@ async function vigenteTotals(
   const data = await readAllPayroll<{ amount: number | string; request_date: string }>({
     log: "vigenteTotals",
     what: "vales vigentes",
-    meta: { sedeId, employeeId, weekStart, weekEnd },
+    meta: { employeeId, weekStart, weekEnd },
     table: "voucher_requests",
     fetchPage: (from, to) =>
       db
         .from("voucher_requests")
         .select("amount, request_date")
-        .eq("sede_id", sedeId)
         .eq("employee_id", employeeId)
         .in("status", ["pendiente", "aprobada"])
         .gte("request_date", weekStart)
@@ -3608,7 +3589,7 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
     );
     if (repeated) return repeatedVoucherResult(repeated);
     // Método de pago arqueable: del catálogo real de la sede, no hardcodeado.
-    const methods = await listPaymentMethods(actor.sedeId).catch((error) => {
+    const methods = await listPaymentMethods().catch((error) => {
       throw toPayrollError(error);
     });
     const method = methods.find(
@@ -3624,10 +3605,9 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
     // Día del vale en hora de Bogotá: el default de la BD (CURRENT_DATE) usa
     // el día UTC y a partir de las 19:00 COT adelanta la fecha un día.
     const requestDate = parsed.data.request_date ?? bogotaDay();
-    const settings = await getVoucherSettings(actor.sedeId);
+    const settings = await getVoucherSettings();
     const { dayTotal, weekTotal } = await vigenteTotals(
       db,
-      actor.sedeId,
       employee.id,
       requestDate,
       settings,
@@ -3774,7 +3754,6 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
  * Los extremos del rango se validan con el mismo formato (yyyy-mm-dd).
  */
 export async function listVouchers(
-  sedeId: string,
   filters: {
     status?: string;
     employee_id?: string;
@@ -3797,7 +3776,6 @@ export async function listVouchers(
   let query = db
     .from("voucher_requests")
     .select(await resolveVoucherSelect(db))
-    .eq("sede_id", sedeId)
     .order("request_date", { ascending: false })
     .limit(limit);
   if (filters.status) query = query.eq("status", filters.status);
@@ -3914,10 +3892,9 @@ export async function approveVoucher(
     // auditoría solo conoce `true` o `false` verificados. De paso, evaluarlo
     // antes del UPDATE es lo que hace que rechazar no deje un vale aprobado sin
     // auditoría ni alerta resuelta.
-    const settings = await getVoucherSettings(sedeId);
+    const settings = await getVoucherSettings();
     const totals = await vigenteTotals(
       db,
-      sedeId,
       voucher.employee_id,
       voucher.request_date,
       settings,

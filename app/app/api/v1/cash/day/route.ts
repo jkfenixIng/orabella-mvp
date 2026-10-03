@@ -1,7 +1,6 @@
 import type { NextRequest } from "next/server";
 import { fail, ok } from "@/src/shared/lib/api-response";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/shared/lib/sede";
 import { requireSession } from "@/src/features/admin/service";
 import { CashError, getDayView } from "@/src/features/cash/service";
 import { accumulateDayTotals, bogotaDay } from "@/src/features/cash/schemas";
@@ -28,7 +27,7 @@ export async function GET(request: NextRequest) {
   try {
     const session = await requireSession(tokenOf(request));
     const params = request.nextUrl.searchParams;
-    const data = await getDayView(resolveSede(session.sedeId, params.get("sede_id")), {
+    const data = await getDayView({
       fecha: params.get("fecha")?.trim() || todayLocal(),
     });
     if (session.roles.includes("admin")) return ok(data);

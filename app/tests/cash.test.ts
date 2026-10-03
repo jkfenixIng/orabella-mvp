@@ -5787,7 +5787,7 @@ describe("cash: CL-21 el arqueo lee sus CUATRO fuentes de forma exhaustiva", () 
   it("la vista del DÍA ve el conjunto completo (ventas y vales del turno ocupado)", async () => {
     seedBusyShift();
 
-    const day = await getDayView(shiftStub.SEDE_ID, { fecha: "2026-09-30" });
+    const day = await getDayView({ fecha: "2026-09-30" });
 
     expect(day.shifts).toHaveLength(1);
     // La venta del día es la de TODAS las filas (dos fuentes > techo), en pesos.
@@ -5807,7 +5807,7 @@ describe("cash: CL-21 el arqueo lee sus CUATRO fuentes de forma exhaustiva", () 
   it("el HISTORIAL ve el conjunto completo de la misma fuente", async () => {
     seedBusyShift();
 
-    const history = await getHistory(shiftStub.SEDE_ID, {
+    const history = await getHistory({
       desde: "2026-09-01",
       hasta: "2026-09-30",
     });
@@ -5824,7 +5824,7 @@ describe("cash: CL-21 el arqueo lee sus CUATRO fuentes de forma exhaustiva", () 
     seedBusyShift();
     shiftStub.failAt = { payments: [2] };
 
-    const outcome: unknown = await getDayView(shiftStub.SEDE_ID, { fecha: "2026-09-30" }).catch(
+    const outcome: unknown = await getDayView({ fecha: "2026-09-30" }).catch(
       (error: unknown) => error,
     );
 
@@ -7211,7 +7211,7 @@ describe("cash: 414 los filtros .in(...) de caja van troceados", () => {
   it("la vista del día trocea TODO filtro .in(...) y ve el conjunto COMPLETO", async () => {
     seedWideDay();
 
-    const day = await getDayView(shiftStub.SEDE_ID, { fecha: "2026-09-30" });
+    const day = await getDayView({ fecha: "2026-09-30" });
 
     // Ninguna lista de ids viajó en una sola URL: el tope es el de la casa.
     expect(shiftStub.inSizes.length).toBeGreaterThan(0);
@@ -7245,7 +7245,7 @@ describe("cash: 414 los filtros .in(...) de caja van troceados", () => {
   it("el historial trocea sus filtros y ve la página COMPLETA", async () => {
     seedWideDay();
 
-    const history = await getHistory(shiftStub.SEDE_ID, {
+    const history = await getHistory({
       desde: "2026-09-01",
       hasta: "2026-09-30",
     });
@@ -7270,7 +7270,7 @@ describe("cash: 414 los filtros .in(...) de caja van troceados", () => {
     // (3) el segundo, que es el que falla.
     shiftStub.failAt = { invoice_payments: [3] };
 
-    const outcome: unknown = await getDayView(shiftStub.SEDE_ID, { fecha: "2026-09-30" }).catch(
+    const outcome: unknown = await getDayView({ fecha: "2026-09-30" }).catch(
       (error: unknown) => error,
     );
 
@@ -7282,7 +7282,7 @@ describe("cash: 414 los filtros .in(...) de caja van troceados", () => {
 
   it("una lista vacía corta el circuito: no se emite NINGUNA consulta .in(...)", async () => {
     // Sin turnos en la fecha, todas las listas de ids están vacías.
-    const day = await getDayView(shiftStub.SEDE_ID, { fecha: "2026-09-30" });
+    const day = await getDayView({ fecha: "2026-09-30" });
 
     expect(day.shifts).toEqual([]);
     expect(shiftStub.inSizes).toEqual([]);
@@ -7335,7 +7335,7 @@ describe("cash: 414 los filtros .in(...) de caja van troceados", () => {
       audit_logs: [],
     };
 
-    const day = await getDayView(shiftStub.SEDE_ID, { fecha: "2026-09-30" });
+    const day = await getDayView({ fecha: "2026-09-30" });
 
     expect(day.shifts).toHaveLength(5);
     // Diez ids crudos (abrió y cerró) y UNA sola consulta, con un solo id.

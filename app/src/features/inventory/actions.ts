@@ -29,12 +29,11 @@ function toFailure(error: unknown): { success: false; code: string; message: str
   return { success: false, code: "INTERNAL", message: "Error interno." };
 }
 
-/** Misma lógica que GET /api/v1/products (requiere sesión, solo su sede). */
-export async function listProductsAction(sedeId?: string, q?: string) {
+/** Misma lógica que GET /api/v1/products (requiere sesión). */
+export async function listProductsAction(q?: string) {
   try {
-    const session = await requireSession(await sessionToken());
-    const sede = resolveSede(session.sedeId, sedeId);
-    const data = q?.trim() ? await searchProducts(sede, q) : await listProducts(sede);
+    await requireSession(await sessionToken());
+    const data = q?.trim() ? await searchProducts(q) : await listProducts();
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -116,10 +115,10 @@ export async function getKardexAction(productId: string) {
 }
 
 /** Misma lógica que GET /api/v1/inventory/alerts (requiere sesión). */
-export async function lowStockAlertsAction(sedeId?: string) {
+export async function lowStockAlertsAction() {
   try {
-    const session = await requireSession(await sessionToken());
-    const data = await lowStockAlerts(resolveSede(session.sedeId, sedeId));
+    await requireSession(await sessionToken());
+    const data = await lowStockAlerts();
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

@@ -21,16 +21,15 @@ function tokenOf(request: NextRequest): string | undefined {
 }
 
 /**
- * GET /api/v1/products?sede_id=&q= — lista o busca (nombre/SKU) en la sede.
- * Requiere sesión (cualquier rol de su sede).
+ * GET /api/v1/products?q= — lista o busca (nombre/SKU).
+ * Requiere sesión (cualquier rol).
  */
 export async function GET(request: NextRequest) {
   try {
-    const session = await requireSession(tokenOf(request));
+    await requireSession(tokenOf(request));
     const params = request.nextUrl.searchParams;
-    const sede = resolveSede(session.sedeId, params.get("sede_id"));
     const q = params.get("q") ?? "";
-    const data = q.trim() ? await searchProducts(sede, q) : await listProducts(sede);
+    const data = q.trim() ? await searchProducts(q) : await listProducts();
     return ok(data);
   } catch (error) {
     return inventoryErrorResponse(error);

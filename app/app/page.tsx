@@ -66,16 +66,14 @@ export default async function HomePage() {
   const token = store.get(SESSION_COOKIE_NAME)?.value;
   const session = await getSessionUser(token);
   if (!session) redirect("/login?next=/");
-  const sedeId = session.user.sede_id;
 
   const visibleModules = MODULES.filter((module) =>
     module.roles.some((role) => session.roles.includes(role)),
   );
   const canSeeInventory = visibleModules.some((module) => module.href === "/inventory");
-  const lowStock = sedeId && canSeeInventory ? filterLowStock(await listProducts(sedeId)) : [];
+  const lowStock = canSeeInventory ? filterLowStock(await listProducts()) : [];
   const isAdmin = session.roles.includes("admin");
-  const unreadAlerts =
-    isAdmin && sedeId ? await countUnreadAlerts(sedeId, "caja").catch(() => 0) : 0;
+  const unreadAlerts = isAdmin ? await countUnreadAlerts("caja").catch(() => 0) : 0;
 
   return (
     <PageContainer>

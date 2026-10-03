@@ -4336,7 +4336,7 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
   it("RED: countInvoices cuenta TODAS las facturas del empleado, no un recorte", async () => {
     seedEmployeeInvoices(1200);
 
-    const total = await countInvoices(SEDE, { employee_id: EMPLOYEE_ID });
+    const total = await countInvoices({ employee_id: EMPLOYEE_ID });
 
     expect(total).toBe(1200);
   });
@@ -4344,7 +4344,7 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
   it("countInvoices manda los ids en lotes que aguantan la URL y pagina la lectura", async () => {
     seedEmployeeInvoices(1200);
 
-    await countInvoices(SEDE, { employee_id: EMPLOYEE_ID });
+    await countInvoices({ employee_id: EMPLOYEE_ID });
 
     const sizes = invoiceIdInSizes();
     expect(sizes.length).toBeGreaterThan(1);
@@ -4356,7 +4356,7 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
   it("RED: listInvoices no pierde facturas del empleado", async () => {
     seedEmployeeInvoices(1200);
 
-    const rows = await listInvoices(SEDE, { employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
+    const rows = await listInvoices({ employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
 
     expect(rows).toHaveLength(10);
     // La más reciente del conjunto COMPLETO del empleado, no del recorte.
@@ -4366,7 +4366,7 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
   it("listInvoices no arma un `in` gigante y mantiene el orden descendente", async () => {
     seedEmployeeInvoices(1200);
 
-    const rows = await listInvoices(SEDE, { employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
+    const rows = await listInvoices({ employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
 
     expect(rows.map((row) => row.consecutive_number)).toEqual([
       1200, 1199, 1198, 1197, 1196, 1195, 1194, 1193, 1192, 1191,
@@ -4379,7 +4379,7 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
     // el `max-rows` baja a 1000 dejaba a las últimas facturas sin participantes.
     seedEmployeeInvoices(10, 120);
 
-    const rows = await listInvoices(SEDE, { employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
+    const rows = await listInvoices({ employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
 
     expect(rows).toHaveLength(10);
     expect(rows.every((row) => row.employee_names.length === 1)).toBe(true);
@@ -4388,10 +4388,10 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
   it("control: un empleado con pocas facturas sigue listando y contando igual", async () => {
     seedEmployeeInvoices(3);
 
-    const rows = await listInvoices(SEDE, { employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
+    const rows = await listInvoices({ employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
 
     expect(rows.map((row) => row.consecutive_number)).toEqual([3, 2, 1]);
-    expect(await countInvoices(SEDE, { employee_id: EMPLOYEE_ID })).toBe(3);
+    expect(await countInvoices({ employee_id: EMPLOYEE_ID })).toBe(3);
     // Cada lectura pidió su único lote (uno para el listado, uno para el conteo)
     // y ninguna paginó más allá de la primera página: el conjunto entra entero.
     expect(invoiceIdInSizes().every((size) => size <= IN_FILTER_CHUNK_SIZE)).toBe(true);

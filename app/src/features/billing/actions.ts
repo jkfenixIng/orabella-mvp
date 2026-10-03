@@ -2,7 +2,6 @@
 
 import { cookies } from "next/headers";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/shared/lib/sede";
 import { requireAdminSession, requireSession } from "@/src/features/admin/service";
 import {
   BillingError,
@@ -29,9 +28,8 @@ function toFailure(error: unknown): { success: false; code: string; message: str
   return { success: false, code: "INTERNAL", message: "Error interno." };
 }
 
-/** Misma lógica que GET /api/v1/invoices (requiere sesión, solo su sede; empleado ve solo las propias). */
+/** Misma lógica que GET /api/v1/invoices (requiere sesión; empleado ve solo las propias). */
 export async function listInvoicesAction(filters: {
-  sede_id?: string;
   status?: string;
   from?: string;
   to?: string;
@@ -44,7 +42,6 @@ export async function listInvoicesAction(filters: {
 } = {}) {
   try {
     const session = await requireSession(await sessionToken());
-    const sedeId = resolveSede(session.sedeId, filters.sede_id);
     const isManager = session.roles.includes("admin") || session.roles.includes("caja");
     // Empleado: solo las propias (filtro forzado para que el total cuadre).
     const effectiveUserId = isManager ? filters.user_id : session.userId;
@@ -58,8 +55,8 @@ export async function listInvoicesAction(filters: {
       employee_id: isManager ? filters.employee_id || undefined : undefined,
     };
     const [rows, total] = await Promise.all([
-      listInvoices(sedeId, { ...where, page: filters.page, pageSize: filters.pageSize }),
-      countInvoices(sedeId, where),
+      listInvoices({ ...where, page: filters.page, pageSize: filters.pageSize }),
+      countInvoices(where),
     ]);
     return { success: true as const, data: { rows, total } };
   } catch (error) {

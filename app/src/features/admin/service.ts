@@ -154,12 +154,11 @@ export interface SedeUserRow {
 const EMPLOYEE_SELECT =
   "id, sede_id, user_id, full_name, employee_code, document, phone, position, payout_mode, email, birth_date, pay_type, pay_frequency, salary_fixed, commission_percent, is_active";
 
-async function fetchEmployees(sedeId: string, limit?: number): Promise<EmployeeRow[]> {
+async function fetchEmployees(limit?: number): Promise<EmployeeRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("employees")
     .select(EMPLOYEE_SELECT)
-    .eq("sede_id", sedeId)
     .order("full_name")
     .limit(clampLimit(limit));
   if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
@@ -172,10 +171,9 @@ async function fetchEmployees(sedeId: string, limit?: number): Promise<EmployeeR
  * `fetchEmployees` existe para LISTAR con respuesta instantánea: 50 filas por
  * defecto y 500 como techo interno (`clampLimit`). Ese tope es correcto para una
  * lista de navegación y equivocado para la nómina: `calculatePayroll` armaba su
- * alineación con `listEmployees(sedeId, 500)` y `clampLimit` recortaba a 500, así
- * que el empleado 501 de una sede no quedaba mal pagado —quedaba AUSENTE de la
- * nómina, sin un solo error—. El conjunto acá SÍ está acotado por la sede, así
- * que lo correcto es leerlo entero por páginas, con `order()` determinista.
+ * alineación con el listado acotado y `clampLimit` recortaba a 500, así que el
+ * empleado 501 no quedaba mal pagado —quedaba AUSENTE de la nómina, sin un solo
+ * error—. Lo correcto es leerlo entero por páginas, con `order()` determinista.
  *
  * Sin caché a propósito: una sede cuya última alta es de hace un minuto tiene que
  * entrar en la nómina de hoy, y una planta cacheada es una planta incompleta (ese
@@ -183,7 +181,7 @@ async function fetchEmployees(sedeId: string, limit?: number): Promise<EmployeeR
  * (`PagedReadError`): el llamador de plata lo convierte en un error de negocio a
  * la vista, nunca en "leí lo que alcancé".
  */
-export async function listAllEmployees(sedeId: string): Promise<EmployeeRow[]> {
+export async function listAllEmployees(): Promise<EmployeeRow[]> {
   const db = await adminDb();
   return readAllPaged<EmployeeRow>({
     table: "employees",
@@ -191,7 +189,6 @@ export async function listAllEmployees(sedeId: string): Promise<EmployeeRow[]> {
       db
         .from("employees")
         .select(EMPLOYEE_SELECT)
-        .eq("sede_id", sedeId)
         // El nombre es el orden histórico de la lista; `id` desempata para que
         // dos homónimos no caigan en páginas distintas (ni se repitan ni falten).
         .order("full_name")
@@ -273,7 +270,6 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
   const { data: linked, error: linkedError } = await db
     .from("users")
     .select("id")
-    .eq("sede_id", input.sede_id)
     .eq("id_number", input.document)
     .maybeSingle();
   if (linkedError) throw new AdminError("INTERNAL", "Error interno.", 500);
@@ -292,7 +288,6 @@ export async function upsertEmployee(raw: unknown): Promise<EmployeeRow> {
     let conflictQuery = db
       .from("employees")
       .select("id")
-      .eq("sede_id", input.sede_id)
       .eq("employee_code", code)
       .limit(1);
     if (input.id) conflictQuery = conflictQuery.neq("id", input.id);
@@ -434,12 +429,11 @@ export interface ServiceRow {
 const SERVICE_SELECT =
   "id, sede_id, name, description, price, duracion_min, duracion_max, is_active";
 
-async function fetchServices(sedeId: string, limit?: number): Promise<ServiceRow[]> {
+async function fetchServices(limit?: number): Promise<ServiceRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("services")
     .select(SERVICE_SELECT)
-    .eq("sede_id", sedeId)
     .order("name")
     .limit(clampLimit(limit));
   if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
@@ -483,12 +477,11 @@ export interface TaxConfigRow {
 
 const TAX_SELECT = "id, sede_id, code, name, percent, is_active";
 
-async function fetchTaxes(sedeId: string, limit?: number): Promise<TaxConfigRow[]> {
+async function fetchTaxes(limit?: number): Promise<TaxConfigRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("tax_configs")
     .select(TAX_SELECT)
-    .eq("sede_id", sedeId)
     .order("code")
     .limit(clampLimit(limit));
   if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
@@ -531,12 +524,11 @@ export interface PaymentMethodRow {
 
 const PAYMENT_METHOD_SELECT = "id, sede_id, code, name, is_active, arqueable, fee_percent";
 
-async function fetchPaymentMethods(sedeId: string, limit?: number): Promise<PaymentMethodRow[]> {
+async function fetchPaymentMethods(limit?: number): Promise<PaymentMethodRow[]> {
   const db = await adminDb();
   const { data, error } = await db
     .from("payment_methods")
     .select(PAYMENT_METHOD_SELECT)
-    .eq("sede_id", sedeId)
     .order("code")
     .limit(clampLimit(limit));
   if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
@@ -685,6 +677,12 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
 // (`src/shared/lib/sede.ts`): con `service_role` bypassing RLS, esa guarda es la
 // frontera de tenant de las rutas del negocio, no plomería de sede. Se retira
 // junto con la migración que relaje la columna, no antes.
+//
+// Los catálogos de ESTA unidad ya no filtran la lectura por `sede_id`: con una
+// sola sede el filtro era redundante y ninguno de ellos lo necesita para
+// existir. Lo que sigue guardando la frontera es el rechazo POR FILA de una
+// fila cargada de otra sede (`getEmployeeAction`, `getProductAction`,
+// `getKardex`), que compara la `sede_id` de la fila contra la de la sesión.
 
 export const listEmployees = unstable_cache(fetchEmployees, ["catalog:employees"], {
   tags: ["catalog:employees"],

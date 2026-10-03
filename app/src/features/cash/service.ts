@@ -224,13 +224,12 @@ export interface CashDenominationRow {
 
 // ------------------------------------------------------------ denominaciones ---
 
-/** Denominaciones activas de la sede (configurables desde el admin). */
-async function fetchDenominations(sedeId: string): Promise<CashDenominationRow[]> {
+/** Denominaciones activas (configurables desde el admin). */
+async function fetchDenominations(): Promise<CashDenominationRow[]> {
   const db = await cashDb();
   const { data, error } = await db
     .from("cash_denominations")
     .select("id, sede_id, kind, value, is_active")
-    .eq("sede_id", sedeId)
     .eq("is_active", true)
     .order("value", { ascending: false });
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
@@ -285,12 +284,11 @@ export async function deleteDenomination(sedeId: string, id: string): Promise<vo
  * digitales con total declarado. Devuelve totales por método.
  */
 export async function checkCounts(
-  sedeId: string,
   counts: ShiftCountInput[],
 ): Promise<Map<string, number>> {
-  const methods = await listPaymentMethods(sedeId);
+  const methods = await listPaymentMethods();
   const allowed = new Map(methods.filter((m) => m.is_active && m.arqueable).map((m) => [m.code, m]));
-  const denominations = new Set((await listDenominations(sedeId)).map((d) => Number(d.value)));
+  const denominations = new Set((await listDenominations()).map((d) => Number(d.value)));
   const byMethod = new Map<string, ShiftCountInput[]>();
   for (const line of counts) {
     const method = allowed.get(line.method_code);
@@ -918,21 +916,20 @@ async function previousCloseTotals(
 
 // --------------------------------------------------------------- registros ---
 
-/** Lista las cajas de la sede (el MVP opera la "Caja única"). */
-export async function listRegisters(sedeId: string): Promise<CashRegisterRow[]> {
+/** Lista las cajas (el MVP opera la "Caja única"). */
+export async function listRegisters(): Promise<CashRegisterRow[]> {
   const db = await cashDb();
   const { data, error } = await db
     .from("cash_registers")
     .select(REGISTER_SELECT)
-    .eq("sede_id", sedeId)
     .order("created_at");
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
   return (data ?? []) as CashRegisterRow[];
 }
 
 /**
- * Resuelve la caja: por id (verificando sede) o la única activa de la
- * sede. Si la sede aún no tiene caja (sede creada tras la migración),
+ * Resuelve la caja: por id (verificando sede) o la única activa.
+ * Si todavía no hay caja (instalación creada después de la migración),
  * la crea con base 200 000 (misma semilla que 006_cash.sql).
  */
 async function resolveRegister(
@@ -959,7 +956,6 @@ async function resolveRegister(
   const { data, error } = await db
     .from("cash_registers")
     .select(REGISTER_SELECT)
-    .eq("sede_id", sedeId)
     .eq("is_active", true)
     .order("created_at")
     .limit(1)
@@ -975,7 +971,7 @@ async function resolveRegister(
   return created as CashRegisterRow;
 }
 
-/** Turno abierto de la sede (uno a la vez por caja, CAJ-01). */
+/** Turno abierto (uno a la vez por caja, CAJ-01). */
 export async function getOpenShift(sedeId: string): Promise<CashShiftRow | null> {
   const db = await cashDb();
   const { data, error } = await db
@@ -1074,7 +1070,7 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     // close totals only when they exist. Mismatches are recorded and alert
     // administrators (except on the very first open) while the shift opens
     // anyway so the business never stops.
-    const declared = await checkCounts(actor.sedeId, input.counts);
+    const declared = await checkCounts(input.counts);
     const isFirstOpen = prev === null;
     const mismatches: Array<{ method_code: string; expected: number; declared: number }> = [];
     const cashDeclared = declared.get("efectivo") ?? 0;
@@ -1409,7 +1405,7 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
       throw new CashError("SHIFT_CLOSED", "El turno ya está cerrado.", 409);
     }
 
-    const methods = await listPaymentMethods(actor.sedeId).catch((error) => {
+    const methods = await listPaymentMethods().catch((error) => {
       throw toCashError(error);
     });
     const method = methods.find((row) => row.is_active && row.code === input.method_code);
@@ -1919,7 +1915,7 @@ export async function closeShift(
 
     // El conteo de efectivo sale del detalle por denominación (el sistema
     // calcula; el total declarado debe cuadrar con el detalle).
-    const declared = await checkCounts(sedeId, input.counts);
+    const declared = await checkCounts(input.counts);
     const countedFromDetail = declared.get("efectivo") ?? 0;
     if (!moneyEquals(countedFromDetail, input.counted_cash)) {
       throw new CashError("COUNT_MISMATCH", "El conteo no cuadra con el detalle por denominación.", 422);
@@ -2146,7 +2142,7 @@ export async function recountClosedShift(
   // El reconteo es un conteo COMPLETO: mismas reglas que el cierre (métodos
   // arqueables completos, efectivo por denominación). `checkCounts` devuelve el
   // total por método; el efectivo declarado debe cuadrar con su detalle.
-  const declared = await checkCounts(sedeId, parsed.data.counts);
+  const declared = await checkCounts(parsed.data.counts);
   const countedFromDetail = declared.get("efectivo") ?? 0;
   if (!moneyEquals(countedFromDetail, parsed.data.counted_cash)) {
     throw new CashError("COUNT_MISMATCH", "El reconteo no cuadra con el detalle por denominación.", 422);
@@ -2306,7 +2302,7 @@ export interface DayView {
  * dejada, recogido, diferencias). El acumulado cuadra con la suma de
  * turnos (accumulateDayTotals); el contado suma solo turnos cerrados.
  */
-export async function getDayView(sedeId: string, raw: unknown): Promise<DayView> {
+export async function getDayView(raw: unknown): Promise<DayView> {
   const parsed = dayViewSchema.safeParse(raw);
   if (!parsed.success) {
     throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
@@ -2317,7 +2313,6 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
   const { data: shifts, error } = await db
     .from("cash_shifts")
     .select(SHIFT_SELECT)
-    .eq("sede_id", sedeId)
     .gte("opened_at", from)
     .lte("opened_at", to)
     .order("opened_at")
@@ -2361,7 +2356,7 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
     rows.map((row) => row.id),
   );
   const closedIds = rows.filter((row) => row.status === "cerrado").map((row) => row.id);
-  const reviews = await getShiftReviews(sedeId, closedIds);
+  const reviews = await getShiftReviews(closedIds);
   const payoutMaps = await fetchPayoutTotals(
     db,
     rows.map((row) => row.id),
@@ -2429,7 +2424,7 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
     };
   });
 
-  const registers = await listRegisters(sedeId);
+  const registers = await listRegisters();
   return {
     fecha,
     register: registers[0] ?? null,
@@ -2462,7 +2457,7 @@ export interface HistoryResult {
  * paginado en servidor de a HISTORY_PAGE_SIZE para que ningún rango
  * esconda turnos). La página /cash lo pide bajo demanda con el filtro.
  */
-export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryResult> {
+export async function getHistory(raw: unknown): Promise<HistoryResult> {
   const parsed = historySchema.safeParse(raw);
   if (!parsed.success) {
     throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
@@ -2473,7 +2468,6 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
   const { count, error: countError } = await db
     .from("cash_shifts")
     .select("id", { count: "exact", head: true })
-    .eq("sede_id", sedeId)
     .gte("opened_at", from)
     .lte("opened_at", to);
   if (countError) throw new CashError("INTERNAL", "Error interno.", 500);
@@ -2482,7 +2476,6 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
   const { data: shifts, error } = await db
     .from("cash_shifts")
     .select(SHIFT_SELECT)
-    .eq("sede_id", sedeId)
     .gte("opened_at", from)
     .lte("opened_at", to)
     .order("opened_at", { ascending: false })
@@ -2525,7 +2518,7 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
     rows.map((row) => row.id),
   );
   const historyClosedIds = rows.filter((row) => row.status === "cerrado").map((row) => row.id);
-  const historyReviews = await getShiftReviews(sedeId, historyClosedIds);
+  const historyReviews = await getShiftReviews(historyClosedIds);
   const historyPayoutMaps = await fetchPayoutTotals(
     db,
     rows.map((row) => row.id),

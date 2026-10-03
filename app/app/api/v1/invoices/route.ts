@@ -1,7 +1,6 @@
 import type { NextRequest } from "next/server";
 import { fail, ok } from "@/src/shared/lib/api-response";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/shared/lib/sede";
 import { requireSession } from "@/src/features/admin/service";
 import {
   BillingError,
@@ -21,16 +20,16 @@ function tokenOf(request: NextRequest): string | undefined {
 }
 
 /**
- * GET /api/v1/invoices?status=&from=&to= — lista de la sede con filtros
- * de estado/fecha (requiere sesión, cualquier rol de su sede).
+ * GET /api/v1/invoices?status=&from=&to= — lista de facturas con filtros
+ * de estado/fecha (requiere sesión, cualquier rol).
  */
 export async function GET(request: NextRequest) {
   try {
-    const session = await requireSession(tokenOf(request));
+    await requireSession(tokenOf(request));
     const params = request.nextUrl.searchParams;
     const pageParam = params.get("page");
     const consecutiveParam = params.get("consecutive_number");
-    const data = await listInvoices(resolveSede(session.sedeId, params.get("sede_id")), {
+    const data = await listInvoices({
       status: params.get("status") ?? undefined,
       from: params.get("from") ?? undefined,
       to: params.get("to") ?? undefined,

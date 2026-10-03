@@ -2,7 +2,6 @@
 
 import { cookies } from "next/headers";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/shared/lib/sede";
 import { requireAdminSession, requireSession } from "@/src/features/admin/service";
 import { requireCashWriter } from "@/src/features/cash/service";
 import {
@@ -29,16 +28,15 @@ function toFailure(error: unknown): { success: false; code: string; message: str
   return { success: false, code: "INTERNAL", message: "Error interno." };
 }
 
-/** Reglas de la sede (requiere sesión). */
+/** Reglas (requiere sesión). */
 export async function listCommissionRulesAction(input: {
   item_type?: string;
   item_id?: string;
   employee_id?: string;
-  sede_id?: string;
 }) {
   try {
-    const session = await requireSession(await sessionToken());
-    const data = await listCommissionRules(resolveSede(session.sedeId, input.sede_id), {
+    await requireSession(await sessionToken());
+    const data = await listCommissionRules({
       item_type: input.item_type,
       item_id: input.item_id,
       employee_id: input.employee_id,
@@ -100,11 +98,11 @@ export async function getPendingCommissionsAction(input: {
   employee_ids: string[];
 }) {
   try {
-    const session = await requireSession(await sessionToken());
+    await requireSession(await sessionToken());
     const rows = [];
     for (const employee_id of input.employee_ids) {
-      const earned = await earnedCommissionFor(session.sedeId, input.invoice_id, employee_id);
-      const paid = await immediatePaidTotal(session.sedeId, input.invoice_id, employee_id);
+      const earned = await earnedCommissionFor(input.invoice_id, employee_id);
+      const paid = await immediatePaidTotal(input.invoice_id, employee_id);
       rows.push({
         employee_id,
         earned: earned.earned,
@@ -119,16 +117,15 @@ export async function getPendingCommissionsAction(input: {
   }
 }
 
-/** Pagos inmediatos de la sede (requiere sesión). */
+/** Pagos inmediatos (requiere sesión). */
 export async function listCommissionPayoutsAction(input: {
   employee_id?: string;
   invoice_id?: string;
   shift_id?: string;
-  sede_id?: string;
 }) {
   try {
-    const session = await requireSession(await sessionToken());
-    const data = await listCommissionPayouts(resolveSede(session.sedeId, input.sede_id), {
+    await requireSession(await sessionToken());
+    const data = await listCommissionPayouts({
       employee_id: input.employee_id,
       invoice_id: input.invoice_id,
       shift_id: input.shift_id,

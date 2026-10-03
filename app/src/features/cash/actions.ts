@@ -3,7 +3,6 @@
 import { cookies } from "next/headers";
 import { revalidateTag } from "next/cache";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/shared/lib/sede";
 import { requireSession, requireAdminSession } from "@/src/features/admin/service";
 import { accumulateDayTotals } from "./schemas";
 import {
@@ -97,12 +96,10 @@ export async function getOpenShiftAction() {
 }
 
 /** Misma lógica que GET /api/v1/cash/day (admin ve todo; caja solo sus turnos). */
-export async function getDayViewAction(input: { fecha: string; sede_id?: string }) {
+export async function getDayViewAction(input: { fecha: string }) {
   try {
     const session = await requireSession(await sessionToken());
-    const data = await getDayView(resolveSede(session.sedeId, input.sede_id), {
-      fecha: input.fecha,
-    });
+    const data = await getDayView({ fecha: input.fecha });
     if (session.roles.includes("admin")) return { success: true as const, data };
     const shifts = data.shifts.filter((view) => view.shift.opened_by === session.userId);
     return {
@@ -128,10 +125,10 @@ export async function getDayViewAction(input: { fecha: string; sede_id?: string 
 }
 
 /** Misma lógica que GET /api/v1/cash/history (solo admin). */
-export async function getHistoryAction(input: { desde: string; hasta: string; sede_id?: string; page?: number }) {
+export async function getHistoryAction(input: { desde: string; hasta: string; page?: number }) {
   try {
-    const session = await requireAdminSession(await sessionToken());
-    const data = await getHistory(resolveSede(session.sedeId, input.sede_id), {
+    await requireAdminSession(await sessionToken());
+    const data = await getHistory({
       desde: input.desde,
       hasta: input.hasta,
       page: input.page,
@@ -142,11 +139,11 @@ export async function getHistoryAction(input: { desde: string; hasta: string; se
   }
 }
 
-/** Cajas de la sede (requiere sesión, cualquier rol de su sede). */
+/** Cajas (requiere sesión). */
 export async function listRegistersAction() {
   try {
-    const session = await requireSession(await sessionToken());
-    const data = await listRegisters(session.sedeId);
+    await requireSession(await sessionToken());
+    const data = await listRegisters();
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -186,11 +183,11 @@ export async function recountClosedShiftAction(id: string, input: unknown) {
   }
 }
 
-/** Denominaciones activas de la sede (requiere sesión). */
+/** Denominaciones activas (requiere sesión). */
 export async function listDenominationsAction() {
   try {
-    const session = await requireSession(await sessionToken());
-    const data = await listDenominations(session.sedeId);
+    await requireSession(await sessionToken());
+    const data = await listDenominations();
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

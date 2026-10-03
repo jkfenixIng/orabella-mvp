@@ -19,12 +19,11 @@ function tokenOf(request: NextRequest): string | undefined {
   return request.cookies.get(SESSION_COOKIE_NAME)?.value;
 }
 
-/** GET /api/v1/taxes?sede_id= — impuestos de la sede (requiere sesión). */
+/** GET /api/v1/taxes — impuestos (requiere sesión). */
 export async function GET(request: NextRequest) {
   try {
-    const session = await requireSession(tokenOf(request));
-    const requested = request.nextUrl.searchParams.get("sede_id");
-    const data = await listTaxes(resolveSede(session.sedeId, requested));
+    await requireSession(tokenOf(request));
+    const data = await listTaxes();
     return ok(data);
   } catch (error) {
     return adminErrorResponse(error);

@@ -1,7 +1,6 @@
 import type { NextRequest } from "next/server";
 import { fail, ok } from "@/src/shared/lib/api-response";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/shared/lib/sede";
 import {
   InventoryError,
   lowStockAlerts,
@@ -18,14 +17,13 @@ function tokenOf(request: NextRequest): string | undefined {
 }
 
 /**
- * GET /api/v1/inventory/alerts?sede_id= — productos con stock <= mínimo.
- * Requiere sesión (cualquier rol de su sede).
+ * GET /api/v1/inventory/alerts — productos con stock <= mínimo.
+ * Requiere sesión (cualquier rol).
  */
 export async function GET(request: NextRequest) {
   try {
-    const session = await requireSession(tokenOf(request));
-    const requested = request.nextUrl.searchParams.get("sede_id");
-    const data = await lowStockAlerts(resolveSede(session.sedeId, requested));
+    await requireSession(tokenOf(request));
+    const data = await lowStockAlerts();
     return ok(data);
   } catch (error) {
     return inventoryErrorResponse(error);

@@ -34,10 +34,10 @@ function toFailure(error: unknown): { success: false; code: string; message: str
 }
 
 /** Misma lógica que GET /api/v1/employees (requiere sesión). */
-export async function listEmployeesAction(sedeId?: string) {
+export async function listEmployeesAction() {
   try {
-    const session = await requireSession(await sessionToken());
-    return { success: true as const, data: await listEmployees(resolveSede(session.sedeId, sedeId)) };
+    await requireSession(await sessionToken());
+    return { success: true as const, data: await listEmployees() };
   } catch (error) {
     return toFailure(error);
   }
@@ -84,10 +84,10 @@ export async function getEmployeeAction(id: string) {
 }
 
 /** Misma lógica que GET /api/v1/services (requiere sesión). */
-export async function listServicesAction(sedeId?: string) {
+export async function listServicesAction() {
   try {
-    const session = await requireSession(await sessionToken());
-    return { success: true as const, data: await listServices(resolveSede(session.sedeId, sedeId)) };
+    await requireSession(await sessionToken());
+    return { success: true as const, data: await listServices() };
   } catch (error) {
     return toFailure(error);
   }
@@ -109,10 +109,10 @@ export async function upsertServiceAction(input: unknown) {
 }
 
 /** Misma lógica que GET /api/v1/taxes (requiere sesión). */
-export async function listTaxesAction(sedeId?: string) {
+export async function listTaxesAction() {
   try {
-    const session = await requireSession(await sessionToken());
-    return { success: true as const, data: await listTaxes(resolveSede(session.sedeId, sedeId)) };
+    await requireSession(await sessionToken());
+    return { success: true as const, data: await listTaxes() };
   } catch (error) {
     return toFailure(error);
   }
@@ -134,12 +134,12 @@ export async function upsertTaxConfigAction(input: unknown) {
 }
 
 /** Misma lógica que GET /api/v1/payment-methods (requiere sesión). */
-export async function listPaymentMethodsAction(sedeId?: string) {
+export async function listPaymentMethodsAction() {
   try {
-    const session = await requireSession(await sessionToken());
+    await requireSession(await sessionToken());
     return {
       success: true as const,
-      data: await listPaymentMethods(resolveSede(session.sedeId, sedeId)),
+      data: await listPaymentMethods(),
     };
   } catch (error) {
     return toFailure(error);

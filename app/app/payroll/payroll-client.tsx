@@ -332,7 +332,6 @@ function indexPeriodTotals(rows: readonly PayrollPeriodSummary[]): Record<string
 }
 
 interface PayrollClientProps {
-  sedeId: string;
   initialEmployees: EmployeeRow[];
   initialPeriods: PayrollPeriodRow[];
   /**

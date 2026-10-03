@@ -132,13 +132,12 @@ function normalizeProduct(row: Record<string, unknown>): ProductRow {
   };
 }
 
-/** INV-05 + lectura: lista productos activos e inactivos de la sede (máx. 50 por defecto). */
-export async function listProducts(sedeId: string, limit?: number): Promise<ProductRow[]> {
+/** INV-05 + lectura: lista productos activos e inactivos (máx. 50 por defecto). */
+export async function listProducts(limit?: number): Promise<ProductRow[]> {
   const db = await inventoryDb();
   const { data, error } = await db
     .from("products")
     .select(await resolveProductSelect(db))
-    .eq("sede_id", sedeId)
     .order("name")
     .limit(clampLimit(limit));
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
@@ -159,8 +158,8 @@ export async function getProduct(id: string): Promise<ProductRow> {
 
 /**
  * INV-01: crea o actualiza un producto (upsert por id). El SKU se
- * normaliza (trim + mayúsculas) y es único por sede: se valida a nivel
- * app para devolver SKU_TAKEN y el UNIQUE (sede_id, sku) cubre carreras.
+ * normaliza (trim + mayúsculas) y se valida a nivel app para devolver
+ * SKU_TAKEN; el UNIQUE (sede_id, sku) de la base sigue cubriendo carreras.
  * INV-03: nunca toca stock_qty (el stock inicial va vía movimiento IN).
  */
 export async function upsertProduct(raw: unknown): Promise<ProductRow> {
@@ -175,7 +174,6 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
   const conflictQuery = db
     .from("products")
     .select("id")
-    .eq("sede_id", input.sede_id)
     .eq("sku", sku)
     .limit(1);
   const { data: conflicts, error: conflictError } = input.id
@@ -216,17 +214,16 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
   return normalizeProduct(data as unknown as Record<string, unknown>);
 }
 
-/** INV-05: búsqueda por fragmento de nombre o SKU, solo dentro de la sede (máx. 50 por defecto). */
-export async function searchProducts(sedeId: string, q: string, limit?: number): Promise<ProductRow[]> {
+/** INV-05: búsqueda por fragmento de nombre o SKU (máx. 50 por defecto). */
+export async function searchProducts(q: string, limit?: number): Promise<ProductRow[]> {
   const needle = q.trim();
-  if (needle === "") return listProducts(sedeId, limit);
+  if (needle === "") return listProducts(limit);
   const db = await inventoryDb();
   const escaped = needle.replace(/[%_,\\]/g, (char) => `\\${char}`);
   const pattern = `%${escaped}%`;
   const { data, error } = await db
     .from("products")
     .select(await resolveProductSelect(db))
-    .eq("sede_id", sedeId)
     .or(`name.ilike.${pattern},sku.ilike.${pattern}`)
     .order("name")
     .limit(clampLimit(limit));
@@ -237,12 +234,11 @@ export async function searchProducts(sedeId: string, q: string, limit?: number):
 }
 
 /** INV-04: productos con stock en o bajo el mínimo (alerta visible, máx. 200). */
-export async function lowStockAlerts(sedeId: string, limit?: number): Promise<ProductRow[]> {
+export async function lowStockAlerts(limit?: number): Promise<ProductRow[]> {
   const db = await inventoryDb();
   const { data, error } = await db
     .from("products")
     .select(await resolveProductSelect(db))
-    .eq("sede_id", sedeId)
     .eq("is_active", true)
     .order("stock_qty")
     .limit(clampLimit(limit, 200));
@@ -476,9 +472,8 @@ export async function registerMovement(
 
 /**
  * B1/FAC-06 (frontera modular): lectura batch de stock para otros módulos.
- * Billing la usa para validar existencia/sede y pre-chequear stock SIN
- * tocar las tablas de inventario directamente. Una sola query con IN
- * (sin N+1); el mapa solo incluye productos de la sede indicada.
+ * Billing la usa para validar existencia y pre-chequear stock SIN tocar las
+ * tablas de inventario directamente. Una sola query con IN (sin N+1).
  */
 export interface StockEntry {
   name: string;
@@ -487,7 +482,6 @@ export interface StockEntry {
 }
 
 export async function getProductsStock(
-  sedeId: string,
   productIds: string[],
 ): Promise<Map<string, StockEntry>> {
   const unique = [...new Set(productIds)];
@@ -496,7 +490,6 @@ export async function getProductsStock(
   const { data, error } = await db
     .from("products")
     .select("id, sede_id, name, stock_qty")
-    .eq("sede_id", sedeId)
     .in("id", unique);
   if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
   return new Map(
@@ -587,7 +580,7 @@ export async function deductStock(
   const wanted = [...new Set(lines.map((line) => line.product_id).filter((id): id is string => !!id))];
   // Solo servicios/custom: nada que descontar (no tocan stock).
   if (wanted.length === 0) return [];
-  const stockMap = await getProductsStock(actor.sedeId, wanted);
+  const stockMap = await getProductsStock(wanted);
   const stockByProduct = new Map(
     [...stockMap].map(([id, entry]) => [id, { name: entry.name, stock_qty: entry.stock_qty }]),
   );

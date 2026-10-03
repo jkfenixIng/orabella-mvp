@@ -19,12 +19,11 @@ function tokenOf(request: NextRequest): string | undefined {
   return request.cookies.get(SESSION_COOKIE_NAME)?.value;
 }
 
-/** GET /api/v1/employees?sede_id= — lista de la sede (requiere sesión). */
+/** GET /api/v1/employees — lista de la planta (requiere sesión). */
 export async function GET(request: NextRequest) {
   try {
-    const session = await requireSession(tokenOf(request));
-    const requested = request.nextUrl.searchParams.get("sede_id");
-    const data = await listEmployees(resolveSede(session.sedeId, requested));
+    await requireSession(tokenOf(request));
+    const data = await listEmployees();
     return ok(data);
   } catch (error) {
     return adminErrorResponse(error);

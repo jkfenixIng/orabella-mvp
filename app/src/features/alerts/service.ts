@@ -103,11 +103,10 @@ async function userNames(
 }
 
 /**
- * Bandeja del admin: alertas de su sede, más recientes primero, paginadas
- * en servidor para que ningún rango esconda avisos.
+ * Bandeja del admin: alertas, más recientes primero, paginadas en servidor
+ * para que ningún rango esconda avisos.
  */
 export async function listAlerts(
-  sedeId: string,
   raw: unknown,
 ): Promise<AlertsResult> {
   const parsed = alertsQuerySchema.safeParse(raw);
@@ -123,7 +122,6 @@ export async function listAlerts(
   let countQuery = db
     .from("audit_logs")
     .select("id", { count: "exact", head: true })
-    .eq("sede_id", sedeId)
     .in("action", actions);
   if (unreadOnly) countQuery = countQuery.eq("is_read", false);
   if (bounds.from) countQuery = countQuery.gte("created_at", bounds.from);
@@ -135,7 +133,6 @@ export async function listAlerts(
   let query = db
     .from("audit_logs")
     .select(ALERT_SELECT)
-    .eq("sede_id", sedeId)
     .in("action", actions);
   if (unreadOnly) query = query.eq("is_read", false);
   if (bounds.from) query = query.gte("created_at", bounds.from);
@@ -193,7 +190,6 @@ export interface ShiftReview {
  * estado de revisión de las vistas de caja.
  */
 export async function getShiftReviews(
-  sedeId: string,
   shiftIds: string[],
 ): Promise<Map<string, ShiftAuditState[]>> {
   const result = new Map<string, ShiftAuditState[]>();
@@ -202,7 +198,6 @@ export async function getShiftReviews(
   const { data, error } = await db
     .from("audit_logs")
     .select("entity_id, action, created_at, is_read, review_note, reviewed_by")
-    .eq("sede_id", sedeId)
     .eq("entity", "cash_shifts")
     .in("entity_id", shiftIds)
     .in("action", [AUDIT_ACTIONS.SHIFT_OPEN_MISMATCH, AUDIT_ACTIONS.SHIFT_CLOSE_MISMATCH]);
@@ -232,14 +227,13 @@ export async function getShiftReviews(
   }
   return result;
 }
-/** Sin leer de la sede, opcionalmente de un módulo (insignia del menú). */
-export async function countUnreadAlerts(sedeId: string, module?: AlertModule): Promise<number> {
+/** Sin leer de la bandeja, opcionalmente de un módulo (insignia del menú). */
+export async function countUnreadAlerts(module?: AlertModule): Promise<number> {
   const db = await alertsDb();
   const actions = module ? [...ALERT_MODULES[module].actions] : [...ALERT_ACTIONS];
   const { count, error } = await db
     .from("audit_logs")
     .select("id", { count: "exact", head: true })
-    .eq("sede_id", sedeId)
     .in("action", actions)
     .eq("is_read", false);
   if (error) throw toAlertError(error);

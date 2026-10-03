@@ -42,7 +42,6 @@ function emptyForm() {
 }
 
 interface ServicesClientProps {
-  sedeId: string;
   initialServices: ServiceRow[];
   canWrite: boolean;
 }
@@ -88,7 +87,6 @@ export function ServicesClient(props: ServicesClientProps) {
     setError(null);
     const result: ActionResult<ServiceRow> = await upsertServiceAction({
       ...(editingId ? { id: editingId } : {}),
-      sede_id: props.sedeId,
       name: form.name,
       description: form.description.trim() === "" ? null : form.description,
       price: toNumber(form.price) ?? 0,

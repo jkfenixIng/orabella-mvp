@@ -52,13 +52,12 @@ function validationMessage(error: { issues: Array<{ message: string }> }): strin
 const RULE_SELECT =
   "id, sede_id, item_type, item_id, employee_id, percent, amount, is_active";
 
-/** Reglas de la sede (filtro opcional por ítem o empleado). */
+/** Reglas (filtro opcional por ítem o empleado). */
 export async function listCommissionRules(
-  sedeId: string,
   filters: { item_type?: string; item_id?: string; employee_id?: string } = {},
 ): Promise<CommissionRuleRow[]> {
   const db = await commissionsDb();
-  let query = db.from("commission_rules").select(RULE_SELECT).eq("sede_id", sedeId);
+  let query = db.from("commission_rules").select(RULE_SELECT);
   if (filters.item_type) query = query.eq("item_type", filters.item_type);
   if (filters.item_id) query = query.eq("item_id", filters.item_id);
   if (filters.employee_id) query = query.eq("employee_id", filters.employee_id);
@@ -87,7 +86,6 @@ export async function upsertCommissionRule(
     .from(itemTable)
     .select("id")
     .eq("id", input.item_id)
-    .eq("sede_id", actor.sedeId)
     .maybeSingle();
   if (itemError) throw new CommissionError("INTERNAL", "Error interno.", 500);
   if (!item) throw new CommissionError("NOT_FOUND", "Ítem no encontrado en esta sede.", 404);
@@ -96,7 +94,6 @@ export async function upsertCommissionRule(
     .from("employees")
     .select("id")
     .eq("id", input.employee_id)
-    .eq("sede_id", actor.sedeId)
     .maybeSingle();
   if (employeeError) throw new CommissionError("INTERNAL", "Error interno.", 500);
   if (!employee) throw new CommissionError("NOT_FOUND", "Empleado no encontrado en esta sede.", 404);
@@ -198,7 +195,6 @@ function assertInvoicePaid(status: string): void {
  * (`immediateEarned`, solo origen comisión por ítem).
  */
 export async function earnedCommissionFor(
-  sedeId: string,
   invoiceId: string,
   employeeId: string,
 ): Promise<EarnedCommission> {
@@ -207,7 +203,6 @@ export async function earnedCommissionFor(
     .from("invoices")
     .select("id, status")
     .eq("id", invoiceId)
-    .eq("sede_id", sedeId)
     .maybeSingle();
   if (invoiceError) throw new CommissionError("INTERNAL", "Error interno.", 500);
   if (!invoice) throw new CommissionError("NOT_FOUND", "Factura no encontrada.", 404);
@@ -236,7 +231,6 @@ export async function earnedCommissionFor(
   const { data: rules, error: rulesError } = await db
     .from("commission_rules")
     .select("item_type, item_id, percent, amount")
-    .eq("sede_id", sedeId)
     .eq("employee_id", employeeId)
     .eq("is_active", true);
   if (rulesError) throw new CommissionError("INTERNAL", "Error interno.", 500);
@@ -256,7 +250,6 @@ export async function earnedCommissionFor(
     .from("employees")
     .select("pay_type, commission_percent")
     .eq("id", employeeId)
-    .eq("sede_id", sedeId)
     .maybeSingle();
   if (employeeError) throw new CommissionError("INTERNAL", "Error interno.", 500);
   const emp = (employee ?? null) as { pay_type: string; commission_percent: number | string | null } | null;
@@ -323,7 +316,6 @@ export async function earnedCommissionFor(
 
 /** Total ya pagado de inmediato por (factura, empleado). */
 export async function immediatePaidTotal(
-  sedeId: string,
   invoiceId: string,
   employeeId: string,
 ): Promise<number> {
@@ -331,7 +323,6 @@ export async function immediatePaidTotal(
   const { data, error } = await db
     .from("commission_payouts")
     .select("amount")
-    .eq("sede_id", sedeId)
     .eq("invoice_id", invoiceId)
     .eq("employee_id", employeeId);
   if (error) throw new CommissionError("INTERNAL", "Error interno.", 500);
@@ -451,7 +442,6 @@ export async function payCommissionNow(
     .from("employees")
     .select("payout_mode")
     .eq("id", input.employee_id)
-    .eq("sede_id", actor.sedeId)
     .maybeSingle();
   if ((payoutEmployee as { payout_mode?: string } | null)?.payout_mode === "no_aplica") {
     throw new CommissionError(
@@ -461,7 +451,7 @@ export async function payCommissionNow(
     );
   }
 
-  const methods = await listPaymentMethods(actor.sedeId).catch(() => {
+  const methods = await listPaymentMethods().catch(() => {
     throw new CommissionError("INTERNAL", "Error interno.", 500);
   });
   const method = methods.find((row) => row.is_active && row.code === input.method_code);
@@ -484,7 +474,7 @@ export async function payCommissionNow(
     );
   }
 
-  const earned = await earnedCommissionFor(actor.sedeId, input.invoice_id, input.employee_id).catch(
+  const earned = await earnedCommissionFor(input.invoice_id, input.employee_id).catch(
     (error) => {
       if (error instanceof CommissionError) throw error;
       throw new CommissionError("INTERNAL", "Error interno.", 500);
@@ -506,7 +496,7 @@ export async function payCommissionNow(
     input.idempotency_key,
   );
   if (repeated) return repeated;
-  const paid = await immediatePaidTotal(actor.sedeId, input.invoice_id, input.employee_id);
+  const paid = await immediatePaidTotal(input.invoice_id, input.employee_id);
   // El pendiente inmediato es SOLO comisión por ítem: el porcentaje del empleado
   // se acumula y se paga en nómina, nunca de inmediato.
   const pending = pendingCommission(earned.immediateEarned, paid);
@@ -553,7 +543,6 @@ export async function payCommissionNow(
     .from("invoices")
     .select("id, status")
     .eq("id", input.invoice_id)
-    .eq("sede_id", actor.sedeId)
     .maybeSingle();
   if (payoutInvoiceError) throw new CommissionError("INTERNAL", "Error interno.", 500);
   if (!payoutInvoice) throw new CommissionError("NOT_FOUND", "Factura no encontrada.", 404);
@@ -642,13 +631,12 @@ export async function payCommissionNow(
   return data as CommissionPayoutRow;
 }
 
-/** Pagos inmediatos de la sede (filtros opcionales, recientes primero). */
+/** Pagos inmediatos (filtros opcionales, recientes primero). */
 export async function listCommissionPayouts(
-  sedeId: string,
   filters: { employee_id?: string; invoice_id?: string; shift_id?: string } = {},
 ): Promise<CommissionPayoutRow[]> {
   const db = await commissionsDb();
-  let query = db.from("commission_payouts").select(PAYOUT_SELECT).eq("sede_id", sedeId);
+  let query = db.from("commission_payouts").select(PAYOUT_SELECT);
   if (filters.employee_id) query = query.eq("employee_id", filters.employee_id);
   if (filters.invoice_id) query = query.eq("invoice_id", filters.invoice_id);
   if (filters.shift_id) query = query.eq("cash_shift_id", filters.shift_id);

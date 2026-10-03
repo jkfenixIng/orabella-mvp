@@ -31,6 +31,10 @@ const TABS: Array<{ value: Tab; label: string }> = [
 ];
 
 interface AdminTabsProps {
+  /**
+   * Sede de la sesión: la siguen pidiendo `listSedeUsers` (usuarios de la sede
+   * con sus roles) y los formularios de alta que guardan `sede_id` en la fila.
+   */
   sedeId: string;
   currentUserId: string;
   initialEmployees: EmployeeRow[];
@@ -77,7 +81,6 @@ export function AdminTabs(props: AdminTabsProps) {
       <TabsPanel value="roles">
         <UsersSection
           key={users.map((user) => user.id).join(",")}
-          sedeId={props.sedeId}
           initial={users}
           currentUserId={props.currentUserId}
         />

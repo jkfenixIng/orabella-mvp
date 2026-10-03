@@ -1446,7 +1446,7 @@ describe("auth: la sesión real lleva el rol de plataforma hasta la guarda (G1)"
   it("una sesión con `superadmin` LLEGA a la guarda; sin él, no pasa", async () => {
     sembrarSesion(["superadmin"]);
     const actor = await requirePlatformAdmin(TOKEN);
-    expect(actor).toMatchObject({ userId: USUARIO, sedeId: SEDE, roles: ["superadmin"] });
+    expect(actor).toMatchObject({ userId: USUARIO, roles: ["superadmin"] });
 
     sembrarSesion(["admin"]);
     await expect(requirePlatformAdmin(TOKEN)).rejects.toMatchObject({

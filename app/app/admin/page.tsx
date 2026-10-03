@@ -48,13 +48,13 @@ export default async function AdminPage() {
 
   const [employees, users, taxes, methods, voucherSettings, registers, denominations] =
     await Promise.all([
-      listEmployees(sedeId),
+      listEmployees(),
       listSedeUsers(sedeId),
-      listTaxes(sedeId),
-      listPaymentMethods(sedeId),
-      getVoucherSettings(sedeId),
-      listRegisters(sedeId),
-      listDenominations(sedeId),
+      listTaxes(),
+      listPaymentMethods(),
+      getVoucherSettings(),
+      listRegisters(),
+      listDenominations(),
     ]);
 
   return (

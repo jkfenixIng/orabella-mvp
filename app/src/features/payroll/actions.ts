@@ -4,7 +4,6 @@ import { cookies } from "next/headers";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { requireSession } from "@/src/features/admin/service";
 import { listAllEmployees } from "@/src/features/admin/service";
-import { resolveSede } from "@/src/shared/lib/sede";
 import { PagedReadError } from "@/src/shared/lib/paged";
 import {
   PayrollError,
@@ -127,8 +126,8 @@ export async function payPayrollExtraAction(input: unknown) {
  */
 export async function listPayrollExtrasAction() {
   try {
-    const session = await requirePayrollAdmin(await sessionToken());
-    const data = await listPayrollExtras(session.sedeId);
+    await requirePayrollAdmin(await sessionToken());
+    const data = await listPayrollExtras();
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -142,9 +141,8 @@ export async function listPayrollExtrasAction() {
  */
 export async function listPayrollMonthRowsAction(input: { month: string; employeeId: string }) {
   try {
-    const session = await requirePayrollAdmin(await sessionToken());
+    await requirePayrollAdmin(await sessionToken());
     const data = await listPayrollMonthRows({
-      sedeId: session.sedeId,
       month: input.month,
       employeeId: input.employeeId,
     });
@@ -219,8 +217,8 @@ export async function getPayrollPeriodCorrectionAction(id: string) {
  */
 export async function listPeriodsAction() {
   try {
-    const session = await requirePayrollViewer(await sessionToken());
-    const data = await listPeriods(session.sedeId);
+    await requirePayrollViewer(await sessionToken());
+    const data = await listPeriods();
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -245,7 +243,7 @@ export async function getPeriodDetailAction(id: string) {
     // `ownId = "sin-acceso"` y veía su propio detalle vacío. `listAllEmployees`
     // lee la planta COMPLETA, con orden determinista, y propaga el fallo de la
     // lectura en vez de recortar en silencio.
-    const mine = (await listAllEmployees(session.sedeId)).find((row) => row.user_id === session.userId);
+    const mine = (await listAllEmployees()).find((row) => row.user_id === session.userId);
     const ownId = mine?.id ?? "sin-acceso";
     return { success: true as const, data: { ...data, items: data.items.filter((item) => item.employee_id === ownId) } };
   } catch (error) {
@@ -271,7 +269,7 @@ export async function getPayrollSettlementSourcesAction(periodId: string, employ
     if (!isManager) {
       // Mismo motivo que en el detalle del período: la planta COMPLETA (no el
       // listado recortado a 50) para ubicar al empleado logueado.
-      const mine = (await listAllEmployees(session.sedeId)).find((row) => row.user_id === session.userId);
+      const mine = (await listAllEmployees()).find((row) => row.user_id === session.userId);
       targetEmployeeId = mine?.id ?? "sin-acceso";
     }
     const data = await getPayrollSettlementSources(session.sedeId, periodId, targetEmployeeId);
@@ -306,8 +304,8 @@ export async function getPayrollStartDateAction() {
  */
 export async function getVoucherSettingsAction() {
   try {
-    const session = await requireSession(await sessionToken());
-    const data = await getVoucherSettings(session.sedeId);
+    await requireSession(await sessionToken());
+    const data = await getVoucherSettings();
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -350,22 +348,20 @@ export async function listVouchersAction(input: {
   request_date?: string;
   date_from?: string;
   date_to?: string;
-  sede_id?: string;
   limit?: number;
 }) {
   try {
     const session = await requireSession(await sessionToken());
-    const sedeId = resolveSede(session.sedeId, input.sede_id);
     const isManager = session.roles.includes("admin") || session.roles.includes("caja");
     let employeeId = input.employee_id;
     if (!isManager) {
       // U8: mismo motivo que en el detalle del período: la planta completa, no
       // el listado recortado a 50, para que quien está después del 50 no vea su
       // pantalla de vales vacía.
-      const mine = (await listAllEmployees(sedeId)).find((row) => row.user_id === session.userId);
+      const mine = (await listAllEmployees()).find((row) => row.user_id === session.userId);
       employeeId = mine?.id ?? "sin-acceso";
     }
-    const data = await listVouchers(sedeId, {
+    const data = await listVouchers({
       status: input.status,
       employee_id: employeeId,
       request_date: input.request_date,

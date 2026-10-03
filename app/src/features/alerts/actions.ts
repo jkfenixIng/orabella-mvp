@@ -2,7 +2,6 @@
 
 import { cookies } from "next/headers";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/shared/lib/sede";
 import { requireAdminSession } from "@/src/features/admin/service";
 import {
   AlertError,
@@ -24,10 +23,10 @@ function toFailure(error: unknown): { success: false; code: string; message: str
 }
 
 /** Misma lógica que GET /api/v1/alerts (solo admin). */
-export async function getAlertsAction(input: { unreadOnly?: boolean; page?: number; module?: "caja" | "acceso"; from?: string; to?: string; sede_id?: string }) {
+export async function getAlertsAction(input: { unreadOnly?: boolean; page?: number; module?: "caja" | "acceso"; from?: string; to?: string }) {
   try {
-    const session = await requireAdminSession(await sessionToken());
-    const data = await listAlerts(resolveSede(session.sedeId, input.sede_id), {
+    await requireAdminSession(await sessionToken());
+    const data = await listAlerts({
       unreadOnly: input.unreadOnly,
       page: input.page,
       module: input.module,
@@ -40,18 +39,18 @@ export async function getAlertsAction(input: { unreadOnly?: boolean; page?: numb
   }
 }
 
-/** Sin leer de la sede (insignia del menú, solo admin). */
+/** Sin leer de la bandeja (insignia del menú, solo admin). */
 export async function countUnreadAlertsAction() {
   try {
-    const session = await requireAdminSession(await sessionToken());
-    const data = await countUnreadAlerts(session.sedeId);
+    await requireAdminSession(await sessionToken());
+    const data = await countUnreadAlerts();
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
   }
 }
 
-/** Revisa una alerta con justificación (solo admin, acotado a su sede). */
+/** Revisa una alerta con justificación (solo admin). */
 export async function markAlertReadAction(id: string, note: string) {
   try {
     const session = await requireAdminSession(await sessionToken());

@@ -18,14 +18,14 @@ function tokenOf(request: NextRequest): string | undefined {
 }
 
 /**
- * GET /api/v1/payroll-periods — lista los periodos de la sede
+ * GET /api/v1/payroll-periods — lista los periodos
  * (solo admin: es lectura de nómina completa y el API no tiene alcance por
  * fila; el recibo del empleado se ve por la action, que sí lo aplica).
  */
 export async function GET(request: NextRequest) {
   try {
-    const session = await requirePayrollAdmin(tokenOf(request));
-    const data = await listPeriods(session.sedeId);
+    await requirePayrollAdmin(tokenOf(request));
+    const data = await listPeriods();
     return ok(data);
   } catch (error) {
     return payrollErrorResponse(error);

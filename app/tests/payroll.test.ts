@@ -2595,13 +2595,13 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
   return {
     ...actual,
     requireSession: async () => payrollPagedStub.session,
-    listEmployees: async (sedeId: string, limit?: number) =>
+    listEmployees: async (limit?: number) =>
       payrollPagedStub.tables.employees
-        ? actual.listEmployees(sedeId, limit)
+        ? actual.listEmployees(limit)
         : ([employee] as Awaited<ReturnType<typeof actual.listEmployees>>),
-    listAllEmployees: async (sedeId: string) =>
+    listAllEmployees: async () =>
       payrollPagedStub.tables.employees
-        ? actual.listAllEmployees(sedeId)
+        ? actual.listAllEmployees()
         : ([employee] as Awaited<ReturnType<typeof actual.listEmployees>>),
   };
 });
@@ -4022,7 +4022,7 @@ describe("payroll: el listado de vales acepta un rango de fechas inclusivo (pant
 
   it("el camino de caja (`request_date` exacto) no cambió", async () => {
     seedVales();
-    expect(await ids({ request_date: "2026-01-10", limit: 200, sede_id: SEDE })).toEqual(
+    expect(await ids({ request_date: "2026-01-10", limit: 200 })).toEqual(
       ["v-10a", "v-10b"].sort(),
     );
   });
@@ -5622,15 +5622,19 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     expect(periodInserts()).toHaveLength(1);
   });
 
-  it("control negativo: el solape es por SEDE (otra sede no bloquea)", async () => {
-    seedPeriods([periodRow("periodo-otra", "2026-08-30", "2026-09-05", "borrador", OTHER_SEDE, "semanal")]);
+  it("el solape bloquea contra CUALQUIER período sembrado del rango", async () => {
+    // Un día se nomina una sola vez: la installation tiene UNA sede, así que
+    // cualquier período que comparta días estorba, sea del tenant que sea.
+    seedPeriods([periodRow("periodo-1", "2026-08-30", "2026-09-05", "borrador", payrollPagedStub.SEDE_ID, "semanal")]);
 
-    const created = await openPayrollPeriod(
+    const failure: unknown = await openPayrollPeriod(
       { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
-    );
+    ).catch((error: unknown) => error);
 
-    expect(created).toMatchObject({ start_date: "2026-08-30", end_date: "2026-09-05" });
+    expect(failure).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
+    expect((failure as PayrollError).message).toContain("2026-08-30 a 2026-09-05");
+    expect(periodInserts()).toHaveLength(0);
   });
 
   it("F7: persiste la cadencia y el rango DERIVADO del ciclo", async () => {
@@ -6076,7 +6080,7 @@ describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
     expect(payrollPagedStub.updates.filter((entry) => entry.table === "payroll_periods")).toHaveLength(0);
 
     // Y queda visible en los registros del admin (la lista del módulo).
-    const listed = await payrollExtrasService.listPayrollExtras(payrollPagedStub.SEDE_ID);
+    const listed = await payrollExtrasService.listPayrollExtras();
     expect(listed.map((entry) => entry.id)).toContain(row.id);
     expect(listed[0]).toMatchObject({ kind: "despido", reason: "Despido con justa causa" });
   });
@@ -6288,7 +6292,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     // Non-vacuidad del fixture: hay más períodos que el tope viejo de la lista.
     expect(seed).toHaveLength(25);
 
-    const rows = await listPeriods(SEDE);
+    const rows = await listPeriods();
 
     expect(rows).toHaveLength(25);
     expect(rows.map((row) => row.id)).toContain("periodo-00001");
@@ -6297,7 +6301,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
   it("la lista pide el conjunto entero, en páginas y en orden determinista", async () => {
     seedConsecutivePeriods(1200);
 
-    const rows = await listPeriods(SEDE);
+    const rows = await listPeriods();
 
     expect(rows).toHaveLength(1200);
     const windows = payrollPagedStub.windows.filter((window) => window.table === "payroll_periods");
@@ -6317,7 +6321,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
   it("control negativo: una sede chica se lee igual y en una sola página", async () => {
     const seed = seedConsecutivePeriods(3);
 
-    const rows = await listPeriods(SEDE);
+    const rows = await listPeriods();
 
     expect(seed).toHaveLength(3);
     expect(rows.map((row) => row.id)).toEqual(["periodo-00003", "periodo-00002", "periodo-00001"]);
@@ -6453,10 +6457,10 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
 
     // El listado de navegación SÍ corta en 50: es su contrato, y por eso la
     // pantalla de nómina no puede alimentarse de él.
-    const browsing = await listEmployees(SEDE);
+    const browsing = await listEmployees();
     expect(browsing).toHaveLength(50);
 
-    const all = await listAllEmployees(SEDE);
+    const all = await listAllEmployees();
     expect(all).toHaveLength(60);
     const index = buildPayrollEmployeeIndex(all);
     expect(payrollEmployeeName(index, "emp-60")).toBe("Empleado 60 (E-60)");
@@ -6496,7 +6500,6 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     seedLegibilityFixture();
 
     const rows = await listPayrollMonthRows({
-      sedeId: SEDE,
       month: "2026-09",
       employeeId: "emp-01",
     });
@@ -6528,13 +6531,12 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     // Octubre tiene pagos de emp-01 (P3) pero NINGUNO de emp-02: la consulta de
     // emp-02 en octubre devuelve vacío, no los datos de su compañero.
     expect(
-      await listPayrollMonthRows({ sedeId: SEDE, month: "2026-10", employeeId: "emp-02" }),
+      await listPayrollMonthRows({ month: "2026-10", employeeId: "emp-02" }),
     ).toEqual([]);
 
     // El mismo mes, el empleado que SÍ tiene pagos: una sola fila, con los
     // períodos de ESE mes (ninguno de septiembre).
     const october = await listPayrollMonthRows({
-      sedeId: SEDE,
       month: "2026-10",
       employeeId: "emp-01",
     });
@@ -6561,7 +6563,6 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     // La misma base, por la consulta puntual: el saldo de la fila tampoco se
     // inventa negativo (el pagado que supera el neto no descuenta de más).
     const september = await listPayrollMonthRows({
-      sedeId: SEDE,
       month: "2026-09",
       employeeId: "emp-02",
     });
@@ -6576,7 +6577,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     seedLegibilityFixture();
 
     expect(
-      await listPayrollMonthRows({ sedeId: SEDE, month: "2026-11", employeeId: "emp-01" }),
+      await listPayrollMonthRows({ month: "2026-11", employeeId: "emp-01" }),
     ).toEqual([]);
   });
 
@@ -9192,11 +9193,12 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
     expect(payrollPagedStub.rpcCalls[1].args.p_carry_ids).toEqual([]);
   });
 
-  it("la deuda pendiente se lee aparte y no cruza empleados ni sedes", async () => {
+  it("la deuda pendiente se lee aparte y no cruza empleados", async () => {
     seed({ invoiceSubtotal: 10_000, voucherAmount: 50_000 });
     await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
 
-    // Deudas ajenas con el MISMO período de origen: otro empleado y otra sede.
+    // Deuda ajena con el MISMO período de origen: la de OTRO empleado no
+    // puede aparecer en la fila de ÉSTE.
     payrollPagedStub.tables.payroll_discount_carries = [
       ...carryRows(),
       {
@@ -9204,14 +9206,6 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
         sede_id: payrollPagedStub.SEDE_ID,
         employee_id: "99999999-9999-4999-8999-999999999999",
         amount: 999,
-        origin_period_id: PERIOD_ID,
-        applied_period_id: null,
-      },
-      {
-        id: "deuda-otra-sede",
-        sede_id: "88888888-8888-4888-8888-888888888888",
-        employee_id: EMPLOYEE_ID,
-        amount: 888,
         origin_period_id: PERIOD_ID,
         applied_period_id: null,
       },
@@ -10742,7 +10736,7 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
     expect(sources.vouchers).toEqual([]);
   });
 
-  it("devuelve SOLO las fuentes de este empleado (ni otro legajo ni otra sede)", async () => {
+  it("devuelve SOLO las fuentes de este empleado (ni otro legajo)", async () => {
     seed({
       items: [
         {
@@ -10763,7 +10757,6 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       vouchers: [
         { id: "vale-mio", sede_id: SEDE, employee_id: EMPLEADO, amount: 10000, request_date: "2026-01-10", status: "descontada" },
         { id: "vale-ajeno", sede_id: SEDE, employee_id: OTRO, amount: 99999, request_date: "2026-01-10", status: "descontada" },
-        { id: "vale-otra-sede", sede_id: "otra-sede", employee_id: EMPLEADO, amount: 77777, request_date: "2026-01-10", status: "descontada" },
       ],
     });
 

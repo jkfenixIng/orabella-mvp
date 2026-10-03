@@ -2020,7 +2020,6 @@ describe("plataforma: requirePlatformAdmin (G1)", () => {
     asSession(["superadmin"]);
     await expect(requirePlatformAdmin("token-de-prueba")).resolves.toMatchObject({
       userId: "u-prueba",
-      sedeId: SEDE_PRUEBA,
       roles: ["superadmin"],
     });
 

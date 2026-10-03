@@ -289,8 +289,8 @@ async function invoiceIdsOfEmployee(db: DbClient, employeeId: string): Promise<s
   }
 }
 
-/** Lista facturas de la sede con filtros + paginación (más recientes primero). */
-export async function listInvoices(sedeId: string, filters: InvoiceFilters = {}): Promise<InvoiceListItem[]> {
+/** Lista facturas con filtros + paginación (más recientes primero). */
+export async function listInvoices(filters: InvoiceFilters = {}): Promise<InvoiceListItem[]> {
   if (filters.status !== undefined && !["Emitida", "Pagada", "Anulada"].includes(filters.status)) {
     throw new BillingError("VALIDATION", "Estado de filtro inválido.", 400);
   }
@@ -321,7 +321,6 @@ export async function listInvoices(sedeId: string, filters: InvoiceFilters = {})
     let query = db
       .from("invoices")
       .select(`${INVOICE_SELECT}, users!invoices_user_id_fkey(full_name)`)
-      .eq("sede_id", sedeId)
       .order("consecutive_number", { ascending: false });
     if (filters.status) query = query.eq("status", filters.status);
     if (filters.from?.trim()) query = query.gte("created_at", dateBound(filters.from, false));
@@ -452,7 +451,7 @@ export async function listInvoices(sedeId: string, filters: InvoiceFilters = {})
 }
 
 /** Total de facturas con los mismos filtros (para paginar). */
-export async function countInvoices(sedeId: string, filters: InvoiceFilters = {}): Promise<number> {
+export async function countInvoices(filters: InvoiceFilters = {}): Promise<number> {
   const db = await billingDb();
   let employeeInvoiceIds: string[] | null = null;
   if (filters.employee_id) {
@@ -463,7 +462,7 @@ export async function countInvoices(sedeId: string, filters: InvoiceFilters = {}
   // doble de pruebas muta): el `in("id", ...)` con todos los ids de una vez
   // viaja en la URL y con 1000+ ids son ~44 KB → 414, la lectura no ocurre.
   const buildCountQuery = () => {
-    let query = db.from("invoices").select("id", { count: "exact", head: true }).eq("sede_id", sedeId);
+    let query = db.from("invoices").select("id", { count: "exact", head: true });
     if (filters.status) query = query.eq("status", filters.status);
     if (filters.from?.trim()) query = query.gte("created_at", dateBound(filters.from, false));
     if (filters.to?.trim()) query = query.lte("created_at", dateBound(filters.to, true));
@@ -549,7 +548,6 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
   // consulta: el detalle puede mezclar empleados y no se cae en N+1.
   const rulesByEmployee = await loadCommissionRulesByEmployee(
     db,
-    invoice.sede_id,
     [...new Set(itemRows.map((item) => item.employee_id))],
   );
   const items = itemRows.map((item) => {
@@ -629,7 +627,6 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
  */
 async function loadCommissionRulesByEmployee(
   db: DbClient,
-  sedeId: string,
   employeeIds: string[],
 ): Promise<Map<string, Map<string, RuleRate>>> {
   const byEmployee = new Map<string, Map<string, RuleRate>>();
@@ -648,7 +645,6 @@ async function loadCommissionRulesByEmployee(
           db
             .from("commission_rules")
             .select("employee_id, item_type, item_id, percent, amount")
-            .eq("sede_id", sedeId)
             .eq("is_active", true)
             .in("employee_id", chunk)
             .order("id")
@@ -798,10 +794,10 @@ interface ValidatedRefs {
 }
 
 /** Valida catálogos: impuestos activos (snapshot) y métodos activos por código. */
-async function loadRefs(sedeId: string): Promise<ValidatedRefs> {
+async function loadRefs(): Promise<ValidatedRefs> {
   const [taxes, methods] = await Promise.all([
-    listTaxes(sedeId),
-    listPaymentMethods(sedeId),
+    listTaxes(),
+    listPaymentMethods(),
   ]);
   return {
     activeTaxes: taxes
@@ -830,7 +826,7 @@ async function validateItemRefs(
   items: InvoiceItemInput[],
 ): Promise<Map<string, StockEntry>> {
   const db = await billingDb();
-  const serviceRows = await listServices(sedeId, 500);
+  const serviceRows = await listServices(500);
   const serviceSedeById = new Map(serviceRows.map((row) => [row.id, row.sede_id]));
 
   const productIds = [...new Set(
@@ -842,7 +838,7 @@ async function validateItemRefs(
 
   const [stockMap, employeeRes] = await Promise.all([
     productIds.length > 0
-      ? getProductsStock(sedeId, productIds)
+      ? getProductsStock(productIds)
       : Promise.resolve(new Map<string, StockEntry>()),
     employeeIds.length > 0
       ? db.from("employees").select("id, sede_id").in("id", employeeIds)
@@ -857,8 +853,8 @@ async function validateItemRefs(
 
   for (const item of items) {
     if (item.item_type === "producto" && item.product_id) {
-      // getProductsStock solo devuelve productos de esta sede: ausente =
-      // inexistente o de otra sede (sin filtrar datos ajenos).
+      // `getProductsStock` solo devuelve productos existentes: ausente =
+      // inexistente (sin filtrar datos ajenos).
       if (!stockMap.has(item.product_id)) {
         throw new BillingError("NOT_FOUND", "Producto no encontrado.", 404);
       }
@@ -1026,18 +1022,18 @@ export interface BillingActor {
  * repetidas y no deben colapsarse. La marca es lo único que distingue "el mismo
  * envío" de "el mismo contenido".
  *
- * El filtro es por SEDE: la marca se resuelve dentro del tenant que la usó y el
- * detalle de una factura de otra sede nunca se devuelve por acá.
+ * El filtro es por la MARCA, no por la sede: la marca identifica el envío y la
+ * fila se resuelve por `idempotency_key` dentro de las facturas de la instalación
+ * (una sola sede). El detalle de una factura nunca se devuelve por acá sin el
+ * `id` que la pide.
  */
 async function findInvoiceByIdempotencyKey(
   db: DbClient,
-  sedeId: string,
   idempotencyKey: string,
 ): Promise<InvoiceRow | null> {
   const { data, error } = await db
     .from("invoices")
     .select(INVOICE_SELECT)
-    .eq("sede_id", sedeId)
     .eq("idempotency_key", idempotencyKey)
     .maybeSingle();
   if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
@@ -1181,7 +1177,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   // la red) trae la MISMA marca: se devuelve la factura que ya existe y no se
   // reserva nada. El reintento es un no-op EXITOSO para el llamador, no un
   // error; y como no hay reserva, tampoco hay hueco en la serie.
-  const alreadyEmitted = await findInvoiceByIdempotencyKey(db, actor.sedeId, input.idempotency_key);
+  const alreadyEmitted = await findInvoiceByIdempotencyKey(db, input.idempotency_key);
   if (alreadyEmitted) return loadDetail(db, alreadyEmitted);
 
   let refs: ValidatedRefs;
@@ -1194,7 +1190,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   // cálculo.
   let stockPlan: PlannedDeduction[];
   try {
-    refs = await loadRefs(actor.sedeId);
+    refs = await loadRefs();
     stockMap = await validateItemRefs(actor.sedeId, input.items);
     // B1/FAC-05: pre-verifica stock con mensaje de negocio POR PRODUCTO. Ya no es
     // la forma de evitar un hueco en la serie —el hueco no puede existir: la
@@ -1359,7 +1355,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
       // perdedora de la carrera NO quema ningún número. El hueco que la 041
       // documentaba como costo declarado ya no puede existir —y con él se fue la
       // última razón para que el servicio reservara por su cuenta—.
-      const winner = await findInvoiceByIdempotencyKey(db, actor.sedeId, input.idempotency_key);
+      const winner = await findInvoiceByIdempotencyKey(db, input.idempotency_key);
       if (winner) return loadDetail(db, winner);
       // Sin factura con esa marca, el choque es del CONSECUTIVO: comportamiento
       // de siempre (barrera final de 005).
@@ -1463,7 +1459,7 @@ export async function annulInvoice(
   // U6-a: mismo candado que las dos ediciones. Si la lectura del historial no
   // se puede completar, `invoiceInClosedPayroll` LANZA (READ_INCOMPLETE) y la
   // anulación se rechaza: nunca un `false` por no haber podido mirar.
-  if (await invoiceInClosedPayroll(db, sedeId, id)) {
+  if (await invoiceInClosedPayroll(db, id)) {
     throw new BillingError(
       "PAYROLL_LOCKED",
       "La factura ya entró en una nómina cerrada: al empleado pagado no se le toca, y anularla dejaría esa comisión pagada sin reverso.",
@@ -1628,7 +1624,7 @@ export async function editInvoiceItems(
   let refs: ValidatedRefs;
   let stockMap: Map<string, StockEntry>;
   try {
-    refs = await loadRefs(actor.sedeId);
+    refs = await loadRefs();
     stockMap = await validateItemRefs(
       actor.sedeId,
       input.items.map((item) => ({
@@ -1695,7 +1691,7 @@ export async function editInvoiceItems(
     input.items,
   );
 
-  if (diff.payTouched && (await invoiceInClosedPayroll(db, sedeId, invoiceId))) {
+  if (diff.payTouched && (await invoiceInClosedPayroll(db, invoiceId))) {
     throw new BillingError(
       "PAYROLL_LOCKED",
       "La factura ya entró en una nómina cerrada: al empleado pagado no se le toca (empleado, comisión, cant., precio).",
@@ -1906,7 +1902,7 @@ export async function editEmittedInvoiceItems(
   let refs: ValidatedRefs;
   let emittedStockMap: Map<string, StockEntry>;
   try {
-    refs = await loadRefs(actor.sedeId);
+    refs = await loadRefs();
     emittedStockMap = await validateItemRefs(
       actor.sedeId,
       input.items.map((item) => ({
@@ -1974,7 +1970,7 @@ export async function editEmittedInvoiceItems(
     input.items,
   );
 
-  if (diff.payTouched && (await invoiceInClosedPayroll(db, sedeId, invoiceId))) {
+  if (diff.payTouched && (await invoiceInClosedPayroll(db, invoiceId))) {
     throw new BillingError(
       "PAYROLL_LOCKED",
       "La factura ya entró en una nómina cerrada: al empleado pagado no se le toca (empleado, comisión, cant., precio).",
@@ -2203,9 +2199,9 @@ function detailHasInvoice(detail: unknown, invoiceId: string): boolean {
  * se ensancha acá: no existe otra fuente que ligue factura e ítem de nómina, así
  * que cambiar el alcance exige decidir antes qué se considera "pagado".
  */
-async function invoiceInClosedPayroll(db: DbClient, sedeId: string, invoiceId: string): Promise<boolean> {
+async function invoiceInClosedPayroll(db: DbClient, invoiceId: string): Promise<boolean> {
   try {
-    const closedPeriods = await readAllClosedPeriods(db, sedeId);
+    const closedPeriods = await readAllClosedPeriods(db);
     if (closedPeriods.length === 0) return false;
     for (let start = 0; start < closedPeriods.length; start += IN_FILTER_CHUNK_SIZE) {
       const chunk = closedPeriods.slice(start, start + IN_FILTER_CHUNK_SIZE);
@@ -2231,10 +2227,10 @@ async function invoiceInClosedPayroll(db: DbClient, sedeId: string, invoiceId: s
 }
 
 /**
- * Períodos CERRADOS de la sede, todos y en orden (U5: sin `.limit(200)`). Se
- * leen en lotes del tamaño que después aguanta el `in(...)` de los ítems.
+ * Períodos CERRADOS, todos y en orden (U5: sin `.limit(200)`). Se leen en
+ * lotes del tamaño que después aguanta el `in(...)` de los ítems.
  */
-async function readAllClosedPeriods(db: DbClient, sedeId: string): Promise<string[]> {
+async function readAllClosedPeriods(db: DbClient): Promise<string[]> {
   const periods = await readAllPaged<{ id: string }>({
     table: "payroll_periods",
     pageSize: IN_FILTER_CHUNK_SIZE,
@@ -2242,7 +2238,6 @@ async function readAllClosedPeriods(db: DbClient, sedeId: string): Promise<strin
       db
         .from("payroll_periods")
         .select("id")
-        .eq("sede_id", sedeId)
         .eq("status", "cerrado")
         .order("id")
         .range(from, to),
@@ -2373,7 +2368,7 @@ export async function splitPayment(
     );
   }
 
-  const refs = await loadRefs(sedeId);
+  const refs = await loadRefs();
   for (const portion of parsed.data.portions) {
     if (!refs.methodByCode.has(portion.method_code)) {
       throw new BillingError(

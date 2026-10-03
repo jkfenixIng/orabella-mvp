@@ -211,7 +211,7 @@ function asSession(roles: string[]): void {
 
 /** Actor de plataforma para llamar al servicio sin pasar por la sesión. */
 function actorCon(roles: string[]): PlatformActor {
-  return { userId: "u", sedeId: SEDE, roles } as unknown as PlatformActor;
+  return { userId: "u", roles } as unknown as PlatformActor;
 }
 
 /**
@@ -362,7 +362,7 @@ describe("plataforma: la guarda", () => {
 
     const actor = await requirePlatformAdmin("token-de-prueba");
 
-    expect(actor).toMatchObject({ userId: "u-plataforma", sedeId: SEDE, roles: ["superadmin"] });
+    expect(actor).toMatchObject({ userId: "u-plataforma", roles: ["superadmin"] });
     await expect(readPlatformInstallation(actor)).resolves.toMatchObject({ id: SEDE });
   });
 });

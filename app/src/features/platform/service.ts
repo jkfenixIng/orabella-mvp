@@ -41,10 +41,14 @@ export { SedeError as PlatformError } from "@/src/shared/lib/sede";
  */
 const PLATFORM_ROLES: RoleCode[] = ["superadmin"];
 
-/** Sesión de plataforma: autenticada, con su sede, y sus roles. */
+/**
+ * Sesión de plataforma: autenticada y con sus roles. La sede NO viaja en el
+ * actor: la plataforma no la elige ni la filtra — resuelve la fila de la
+ * instalación por dato (`leerSedeDeLaInstalacion`). La sesión sí exige que
+ * exista, porque `users.sede_id` es NOT NULL mientras la columna exista.
+ */
 export interface PlatformActor {
   userId: string;
-  sedeId: string;
   roles: RoleCode[];
 }
 
@@ -69,7 +73,7 @@ export async function requirePlatformAdmin(
     throw new PlatformError("NO_SEDE", "El usuario no tiene sede asignada.", 403);
   }
   requireSedeRole(session.roles, PLATFORM_ROLES);
-  return { userId: session.user.id, sedeId: session.user.sede_id, roles: session.roles };
+  return { userId: session.user.id, roles: session.roles };
 }
 
 // ---------------------------------------------------- sede de la instalación ---
