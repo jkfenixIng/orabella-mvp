@@ -1,0 +1,58 @@
+-- 076_cash_shift_recounts_rls.sql — activa RLS en `cash_shift_recounts`.
+--
+-- QUÉ CORRIGE
+--
+-- `033_closed_shift_recount.sql` creó `public.cash_shift_recounts` sin
+-- `ENABLE ROW LEVEL SECURITY` y sin ninguna política: era la ÚNICA de las 36
+-- tablas de la serie en ese estado. No es un descuido nuevo: es la TERCERA tabla
+-- que llega a la serie con RLS ausente, y las dos primeras ya las había cerrado
+-- `017_hardening_round2.sql` por escrito ("RLS ausente en cash_denominations y
+-- cash_shift_counts (ERROR crítico)"). `033`, creada después, volvió a abrir el
+-- hueco para una hermana de las dos. La serie ya tiene la respuesta escrita;
+-- esta migración la aplica donde faltaba.
+--
+-- POR QUÉ NO HAY EXPOSICIÓN HOY, Y POR QUÉ IGUAL SE CORRIGE
+--
+-- Ninguna ruta de la aplicación usa `anon`/`authenticated` contra esta tabla:
+-- todo el acceso pasa por el cliente de servidor con `service_role`, que hace
+-- bypass de RLS por diseño. Es decir: activar RLS aquí NO cambia el
+-- comportamiento de nada que exista hoy. Lo que cierra es el riesgo hacia
+-- adelante — si mañana aparece un consumidor con JWT (una vista para cliente, un
+-- reporte, un canal de soporte), se encontraría con la tabla sin RLS y leería
+-- los reconteos de efectivo de TODAS las sedes. La evidencia del expediente: los
+-- dos clientes que sí son garantes de RLS (`src/shared/lib/supabase/client.ts`
+-- y el `createClient` de `server.ts`) no tienen ni un solo importador en el
+-- repositorio: la auditoría los localizó y los encontró sin uso.
+--
+-- POR QUÉ DENY-ALL Y NO UNA POLÍTICA POR SEDE
+--
+-- Deliberado. Una política de aislamiento por sede sería más específica, pero
+-- sería speculativa: no hay hoy ningún cliente que la vaya a ejercer, así que
+-- nadie podría detectar que está mal. Deny-all es fail-closed — ante la duda,
+-- cierra — y es la postura correcta para evidencia en efectivo que sólo se
+-- escribe desde el servidor. Cuando exista un consumidor real, la política por
+-- sede se escribe en la migración que lo introduce, junto al consumidor, no aquí
+-- adivinando el alcance de algo que todavía no existe.
+--
+-- IDEMPOTENCIA
+--
+-- `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` es idempotente por sí solo
+-- (repetirlo no cambia el catálogo, ni falla), igual que el bloque RLS de
+-- `036_payroll_extra_payment.sql`. No se crea ninguna política, y por eso tampoco
+-- hay un `DROP POLICY` que ejecutar: con RLS activa y sin política, la tabla es
+-- inaccesible para `anon` y `authenticated` y sigue abierta para
+-- `service_role`.
+--
+-- NO SE TOCA `033`
+--
+-- `033` ya está aplicada en los entornos; editar un archivo ya aplicado rompe
+-- el hash con que la serie verifica su orden y no surtiría efecto en ninguna base
+-- existente. La corrección viaja como migración nueva, que es el patrón del
+-- propio repositorio.
+
+-- --------------------------------------------------- RLS faltante ---
+ALTER TABLE public.cash_shift_recounts ENABLE ROW LEVEL SECURITY;
+
+-- Sin política, a propósito: deny-all para `anon`/`authenticated` y bypass para
+-- `service_role`. No agregar `DROP POLICY`/`CREATE POLICY` aquí sin el cliente
+-- que las ejerce (ver la nota de arriba).
