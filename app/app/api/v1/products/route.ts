@@ -1,7 +1,6 @@
 import type { NextRequest } from "next/server";
 import { fail, ok } from "@/src/shared/lib/api-response";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/shared/lib/sede";
 import {
   InventoryError,
   listProducts,
@@ -21,16 +20,15 @@ function tokenOf(request: NextRequest): string | undefined {
 }
 
 /**
- * GET /api/v1/products?sede_id=&q= — lista o busca (nombre/SKU) en la sede.
- * Requiere sesión (cualquier rol de su sede).
+ * GET /api/v1/products?q= — lista o busca (nombre/SKU).
+ * Requiere sesión (cualquier rol).
  */
 export async function GET(request: NextRequest) {
   try {
-    const session = await requireSession(tokenOf(request));
+    await requireSession(tokenOf(request));
     const params = request.nextUrl.searchParams;
-    const sede = resolveSede(session.sedeId, params.get("sede_id"));
     const q = params.get("q") ?? "";
-    const data = q.trim() ? await searchProducts(sede, q) : await listProducts(sede);
+    const data = q.trim() ? await searchProducts(q) : await listProducts();
     return ok(data);
   } catch (error) {
     return inventoryErrorResponse(error);
@@ -44,13 +42,10 @@ export async function GET(request: NextRequest) {
  */
 export async function POST(request: NextRequest) {
   try {
-    const session = await requireInventoryWriter(tokenOf(request));
+    await requireInventoryWriter(tokenOf(request));
     const body: unknown = await request.json().catch(() => ({}));
     const record = typeof body === "object" && body !== null ? body : {};
-    const data = await upsertProduct({
-      ...record,
-      sede_id: resolveSede(session.sedeId, (record as { sede_id?: string }).sede_id),
-    });
+    const data = await upsertProduct(record);
     return ok(data, 201);
   } catch (error) {
     return inventoryErrorResponse(error);

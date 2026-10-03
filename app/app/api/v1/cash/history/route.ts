@@ -1,7 +1,6 @@
 import type { NextRequest } from "next/server";
 import { fail, ok } from "@/src/shared/lib/api-response";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/shared/lib/sede";
 import { requireAdminSession } from "@/src/features/admin/service";
 import { CashError, getHistory } from "@/src/features/cash/service";
 import { bogotaDay } from "@/src/features/cash/schemas";
@@ -26,9 +25,9 @@ function isoDay(offsetDays: number): string {
  */
 export async function GET(request: NextRequest) {
   try {
-    const session = await requireAdminSession(tokenOf(request));
+    await requireAdminSession(tokenOf(request));
     const params = request.nextUrl.searchParams;
-    const data = await getHistory(resolveSede(session.sedeId, params.get("sede_id")), {
+    const data = await getHistory({
       desde: params.get("desde")?.trim() || isoDay(-30),
       hasta: params.get("hasta")?.trim() || isoDay(0),
       page: params.get("page") ?? undefined,

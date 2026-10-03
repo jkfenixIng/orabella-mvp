@@ -2115,7 +2115,9 @@ function createOverCollectionStubClient(): unknown {
   ): Promise<{ data: unknown; error: unknown }> => {
     const edit = (args?.p_edit ?? {}) as Record<string, unknown>;
     const id = String(args?.p_invoice_id ?? overCollectionStub.INVOICE_ID);
-    const sedeId = String(args?.p_sede_id ?? overCollectionStub.SEDE_ID);
+    // La sede ya NO viaja en la llamada (071): es la de la instalación, y el
+    // doble escribe la de la factura que está editando.
+    const sedeId = overCollectionStub.SEDE_ID;
     const userId = args?.p_user_id ?? null;
     const expectedVersion = Number(args?.p_expected_version ?? 0);
     const expectedStatus = String(args?.p_expected_status ?? "Emitida");
@@ -2550,7 +2552,9 @@ function createInvoiceStubClient(): unknown {
    * comprobar sobre la fila leída.
    */
   const createInvoiceTransaction = (args?: Record<string, unknown>) => {
-    const sedeId = String(args?.p_sede_id ?? "");
+    // La sede ya NO viaja en la llamada (071): la función la toma del TURNO que
+    // bloquea, así que el doble la saca de la misma fila.
+    const sedeId = String(createStub.shift?.sede_id ?? "");
     const mark = String(args?.p_idempotency_key ?? "");
     const invoice = (args?.p_invoice ?? {}) as Record<string, unknown>;
     const items = (args?.p_items ?? []) as Array<Record<string, unknown>>;
@@ -2929,7 +2933,13 @@ function createInvoiceStubClient(): unknown {
       const items = (args?.p_items ?? []) as Array<{ product_id: string; qty: number }>;
       pushMovements(
         items.map((item) => ({
-          sede_id: args?.p_sede_id ?? null,
+          // El movimiento toma la sede del PRODUCTO (la fila que el `JOIN` de
+          // 046 trae), no una sede recibida: la instalación es de una sola sede
+          // (071) y la llamada ya no manda ninguna.
+          sede_id:
+            item.product_id === createStub.product?.id
+              ? (createStub.product.sede_id ?? null)
+              : null,
           product_id: item.product_id,
           type: "OUT",
           qty: item.qty,
@@ -3418,7 +3428,6 @@ describe("billing: gate de sobre-cobro al bajar el total de una emitida (WU2)", 
 
   function edit(unitPrice: number, extra: Record<string, unknown> = {}) {
     return editEmittedInvoiceItems(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
       editPayload(unitPrice, extra),
       ACTOR,
@@ -3473,6 +3482,8 @@ describe("billing: gate de sobre-cobro al bajar el total de una emitida (WU2)", 
         bajo_cobrado_diferencia: 50000,
       },
     });
+    // El rastro nombra el acto, no el tenant: la sede ya no se envía.
+    expect(overCollectionStub.auditInsert).not.toHaveProperty("sede_id");
     expect(overCollectionStub.unexpectedQueries).toEqual([]);
   });
 
@@ -3559,7 +3570,6 @@ describe("billing: el candado de nómina cerrada no se trunca (U5)", () => {
   /** Ajuste del precio de la única línea: 300.000 → `unitPrice` (toca pago). */
   function editInvoice(unitPrice: number) {
     return editEmittedInvoiceItems(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
       {
         items: [
@@ -3732,7 +3742,7 @@ describe("billing: la anulación respeta el candado de nómina y guarda el estad
   };
 
   function annul(motivo = "Cobro duplicado") {
-    return annulInvoice(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID, { motivo }, ACTOR);
+    return annulInvoice(overCollectionStub.INVOICE_ID, { motivo }, ACTOR);
   }
 
   beforeEach(() => {
@@ -3946,7 +3956,7 @@ describe("billing: la anulación es UNA transacción (CL-11)", () => {
   };
 
   function annul(motivo = "Cobro duplicado") {
-    return annulInvoice(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID, { motivo }, ACTOR);
+    return annulInvoice(overCollectionStub.INVOICE_ID, { motivo }, ACTOR);
   }
 
   /** Segunda línea de PRODUCTO: dos reversiones = el bucle de ayer. */
@@ -4184,7 +4194,6 @@ describe("billing: la comisión mostrada no se corta con las reglas (U7)", () =>
     expect(FLAT_COMMISSION).not.toBe(RULE_COMMISSION);
 
     const detail = await getInvoiceDetail(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
     );
 
@@ -4200,7 +4209,7 @@ describe("billing: la comisión mostrada no se corta con las reglas (U7)", () =>
       ruleRow(index + 1, EMPLOYEE_ID, RULE_PERCENT),
     );
 
-    await getInvoiceDetail(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID);
+    await getInvoiceDetail(overCollectionStub.INVOICE_ID);
 
     const ruleWindows = pagedStub.windows.filter((window) => window.table === "commission_rules");
     expect(ruleWindows.length).toBeGreaterThan(1);
@@ -4221,7 +4230,7 @@ describe("billing: la comisión mostrada no se corta con las reglas (U7)", () =>
     );
     pagedStub.tables.commission_rules = [];
 
-    await getInvoiceDetail(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID);
+    await getInvoiceDetail(overCollectionStub.INVOICE_ID);
 
     // Más de un lote: 150 ids no entran en una sola URL.
     expect(commissionStub.inSizes.length).toBeGreaterThan(1);
@@ -4234,7 +4243,6 @@ describe("billing: la comisión mostrada no se corta con las reglas (U7)", () =>
     pagedStub.tables.commission_rules = [ruleRow(1, EMPLOYEE_ID, RULE_PERCENT)];
 
     const detail = await getInvoiceDetail(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
     );
 
@@ -4251,7 +4259,6 @@ describe("billing: la comisión mostrada no se corta con las reglas (U7)", () =>
     pagedStub.failAt = { commission_rules: [1] };
 
     const failure: unknown = await getInvoiceDetail(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
     ).catch((error: unknown) => error);
 
@@ -4326,7 +4333,7 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
   it("RED: countInvoices cuenta TODAS las facturas del empleado, no un recorte", async () => {
     seedEmployeeInvoices(1200);
 
-    const total = await countInvoices(SEDE, { employee_id: EMPLOYEE_ID });
+    const total = await countInvoices({ employee_id: EMPLOYEE_ID });
 
     expect(total).toBe(1200);
   });
@@ -4334,7 +4341,7 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
   it("countInvoices manda los ids en lotes que aguantan la URL y pagina la lectura", async () => {
     seedEmployeeInvoices(1200);
 
-    await countInvoices(SEDE, { employee_id: EMPLOYEE_ID });
+    await countInvoices({ employee_id: EMPLOYEE_ID });
 
     const sizes = invoiceIdInSizes();
     expect(sizes.length).toBeGreaterThan(1);
@@ -4346,7 +4353,7 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
   it("RED: listInvoices no pierde facturas del empleado", async () => {
     seedEmployeeInvoices(1200);
 
-    const rows = await listInvoices(SEDE, { employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
+    const rows = await listInvoices({ employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
 
     expect(rows).toHaveLength(10);
     // La más reciente del conjunto COMPLETO del empleado, no del recorte.
@@ -4356,7 +4363,7 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
   it("listInvoices no arma un `in` gigante y mantiene el orden descendente", async () => {
     seedEmployeeInvoices(1200);
 
-    const rows = await listInvoices(SEDE, { employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
+    const rows = await listInvoices({ employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
 
     expect(rows.map((row) => row.consecutive_number)).toEqual([
       1200, 1199, 1198, 1197, 1196, 1195, 1194, 1193, 1192, 1191,
@@ -4369,7 +4376,7 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
     // el `max-rows` baja a 1000 dejaba a las últimas facturas sin participantes.
     seedEmployeeInvoices(10, 120);
 
-    const rows = await listInvoices(SEDE, { employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
+    const rows = await listInvoices({ employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
 
     expect(rows).toHaveLength(10);
     expect(rows.every((row) => row.employee_names.length === 1)).toBe(true);
@@ -4378,10 +4385,10 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
   it("control: un empleado con pocas facturas sigue listando y contando igual", async () => {
     seedEmployeeInvoices(3);
 
-    const rows = await listInvoices(SEDE, { employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
+    const rows = await listInvoices({ employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
 
     expect(rows.map((row) => row.consecutive_number)).toEqual([3, 2, 1]);
-    expect(await countInvoices(SEDE, { employee_id: EMPLOYEE_ID })).toBe(3);
+    expect(await countInvoices({ employee_id: EMPLOYEE_ID })).toBe(3);
     // Cada lectura pidió su único lote (uno para el listado, uno para el conteo)
     // y ninguna paginó más allá de la primera página: el conjunto entra entero.
     expect(invoiceIdInSizes().every((size) => size <= IN_FILTER_CHUNK_SIZE)).toBe(true);
@@ -4475,7 +4482,7 @@ describe("billing: dos ediciones de la misma factura se serializan (CO-1)", () =
     invoiceId = overCollectionStub.INVOICE_ID,
     itemId = overCollectionStub.ITEM_ID,
   ) {
-    return editEmittedInvoiceItems(overCollectionStub.SEDE_ID, invoiceId, payload(itemId), ACTOR);
+    return editEmittedInvoiceItems(invoiceId, payload(itemId), ACTOR);
   }
 
   /** Edición ADMIN (total inmutable + motivo): el otro camino del hallazgo. */
@@ -4484,7 +4491,6 @@ describe("billing: dos ediciones de la misma factura se serializan (CO-1)", () =
     itemId = overCollectionStub.ITEM_ID,
   ) {
     return editInvoiceItems(
-      overCollectionStub.SEDE_ID,
       invoiceId,
       { ...payload(itemId), motivo: "Cantidad mal digitada" },
       ACTOR,
@@ -4795,7 +4801,6 @@ describe("billing: el candado de edición cubre el estado de la factura (CL-1)",
   /** Edición ADMIN (total inmutable + motivo). */
   function adminEdit() {
     return editInvoiceItems(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
       { ...payload(overCollectionStub.ITEM_ID), motivo: "Cantidad mal digitada" },
       ACTOR,
@@ -4805,7 +4810,6 @@ describe("billing: el candado de edición cubre el estado de la factura (CL-1)",
   /** Edición LIBRE de emitida (cajera/turno; acá admin, que también puede). */
   function freeEdit() {
     return editEmittedInvoiceItems(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
       payload(overCollectionStub.ITEM_ID),
       ACTOR,
@@ -5127,12 +5131,11 @@ describe("billing: las dos ediciones de factura son UNA transacción (CL-12)", (
   }
 
   function adminEdit() {
-    return editInvoiceItems(overCollectionStub.SEDE_ID, overCollectionStub.INVOICE_ID, adminPayload(), ACTOR);
+    return editInvoiceItems(overCollectionStub.INVOICE_ID, adminPayload(), ACTOR);
   }
 
   function freeEdit() {
     return editEmittedInvoiceItems(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
       freePayload(),
       ACTOR,
@@ -5365,6 +5368,7 @@ describe("billing: las dos ediciones de factura son UNA transacción (CL-12)", (
       entity_id: overCollectionStub.INVOICE_ID,
       metadata: { motivo: ADMIN_MOTIVO, items_before: 3, items_added: 0 },
     });
+    expect(overCollectionStub.auditInsert).not.toHaveProperty("sede_id");
     expect((overCollectionStub.auditInsert?.metadata as { inventory_moves: unknown[] }).inventory_moves).toHaveLength(2);
     expect(overCollectionStub.unexpectedQueries).toEqual([]);
   });
@@ -5375,7 +5379,6 @@ describe("billing: las dos ediciones de factura son UNA transacción (CL-12)", (
     // nada más —los grupos vacíos pasan sus redes de conteo (0 = 0)—, que es lo
     // que hace legal editar una factura de servicios sin tocar el kardex.
     const detail = await editEmittedInvoiceItems(
-      overCollectionStub.SEDE_ID,
       overCollectionStub.INVOICE_ID,
       {
         items: [
@@ -6174,8 +6177,10 @@ describe("billing: la emisión es UNA transacción (CL-13)", () => {
     const calls = createStub.rpcCalls.filter((call) => call.name === "invoice_create_atomic");
     expect(calls).toHaveLength(1);
     const args = calls[0].args;
+    // La sede NO viaja: la instalación es de una sola sede (071) y la función
+    // la toma del turno que bloquea. Mandarla sería la segunda frontera.
+    expect(args).not.toHaveProperty("p_sede_id");
     expect(args).toMatchObject({
-      p_sede_id: createStub.SEDE_ID,
       p_user_id: "u-1",
       p_cash_shift_id: createStub.SHIFT_ID,
       p_idempotency_key: IDEMPOTENCY_KEY,
@@ -6286,9 +6291,8 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
   });
 
   it("RED: hoy el reintento del MISMO cobro no se reconoce (y el doble cobro no ocurre por el cobro exacto)", async () => {
-    const first = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const first = await splitPayment(payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
     const second: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6306,8 +6310,8 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
   });
 
   it("la repetición devuelve el MISMO resultado escribiendo nada (no-op exitoso)", async () => {
-    const first = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
-    const repeat = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const first = await splitPayment(payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const repeat = await splitPayment(payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
 
     expect(repeat.invoice.id).toBe(first.invoice.id);
     expect(repeat.invoice.status).toBe("Pagada");
@@ -6321,7 +6325,7 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
   });
 
   it("la carrera (lectura vieja del saldo + marca ya confirmada) relee a la ganadora", async () => {
-    const first = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const first = await splitPayment(payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
     // La otra petición leyó el saldo ANTES de que la ganadora confirmara (el
     // doble le sirve el snapshot viejo una sola vez) y tampoco vio la marca (el
     // doble saltea ese lookup una vez): así pasa la comprobación exacta y llega
@@ -6329,7 +6333,7 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     payStub.stalePaymentsOnce = [];
     payStub.skipMarkLookupOnce = true;
 
-    const second = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const second = await splitPayment(payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
 
     // El reintento sigue siendo un no-op: devuelve la factura de la ganadora.
     expect(second.invoice.id).toBe(first.invoice.id);
@@ -6350,9 +6354,8 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     // MISMA factura (el saldo queda en cero), así que el control se hace con
     // dos facturas: la marca reconoce UNA operación, no encadena cobros.
     seedInvoice(payStub.OTHER_INVOICE_ID, 8);
-    const first = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    const first = await splitPayment(payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
     const second = await splitPayment(
-      payStub.SEDE_ID,
       payStub.OTHER_INVOICE_ID,
       closeInvoice(payStub.OTHER_INVOICE_ID, TOTAL, OTHER_MARK),
       ACTOR,
@@ -6364,7 +6367,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     expect(second.invoice.status).toBe("Pagada");
     // Y repetir la SEGUNDA marca devuelve la SEGUNDA factura, no la primera.
     const repeat = await splitPayment(
-      payStub.SEDE_ID,
       payStub.OTHER_INVOICE_ID,
       closeInvoice(payStub.OTHER_INVOICE_ID, TOTAL, OTHER_MARK),
       ACTOR,
@@ -6382,7 +6384,7 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
         { method_code: "transferencia", amount: 40000 },
       ],
     };
-    const result = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, portions, ACTOR);
+    const result = await splitPayment(payStub.INVOICE_ID, portions, ACTOR);
 
     // UNA sentencia multi-fila (no dos inserts fila por fila): es la premisa de
     // la que depende que el 23505 aborte la operación entera.
@@ -6399,7 +6401,7 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     expect(result.invoice.status).toBe("Pagada");
 
     // Y repetir ESA operación también es un no-op: las dos porciones.
-    const repeat = await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, portions, ACTOR);
+    const repeat = await splitPayment(payStub.INVOICE_ID, portions, ACTOR);
     expect(payStub.payments).toHaveLength(2);
     expect(payInserts()).toBe(1);
     expect(repeat.payments).toHaveLength(2);
@@ -6409,7 +6411,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     // Una marca nueva NO convierte en cobrable lo que el saldo rechaza: la
     // comprobación exacta y el tope siguen mandando, con marca o sin ella.
     const failure: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID, 60000),
       ACTOR,
@@ -6423,7 +6424,7 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
 
   it("el tope de 031 sigue traduciéndose a OVERPAID cuando la marca NO es una repetición", async () => {
     // El primer cobro cierra la factura...
-    await splitPayment(payStub.SEDE_ID, payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
+    await splitPayment(payStub.INVOICE_ID, closeInvoice(payStub.INVOICE_ID), ACTOR);
     // ...y un SEGUNDO intento distinto entra con una lectura VIEJA del saldo (el
     // doble le sirve la foto previa una sola vez), con lo que pasa la
     // comprobación exacta y llega a escribir: ahí lo rechaza el tope de 031
@@ -6431,7 +6432,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     payStub.stalePaymentsOnce = [];
 
     const failure: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID, TOTAL, OTHER_MARK),
       ACTOR,
@@ -6449,13 +6449,11 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     // envío sin marca no se puede reconocer como repetición, y la ruta REST es
     // pública: es justo la que reintenta sobre redes. El rechazo es ruidoso.
     const withoutMark: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       { portions: [{ method_code: "efectivo", amount: TOTAL }] },
       ACTOR,
     ).catch((error: unknown) => error);
     const malformed: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       { idempotency_key: "no-es-un-uuid", portions: [{ method_code: "efectivo", amount: TOTAL }] },
       ACTOR,
@@ -6502,7 +6500,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     payStub.failCloseOnce = true;
 
     const failure: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6523,7 +6520,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
 
     // El reintento del MISMO intento COMPLETA el cobro entero.
     const retry = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6542,7 +6538,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     ];
 
     const result = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       { idempotency_key: MARK, portions },
       ACTOR,
@@ -6582,7 +6577,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     invoice.status = "Anulada";
 
     const failure: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6610,7 +6604,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     payStub.closeShiftBeforeCommit = true;
 
     const failure: unknown = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6630,7 +6623,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
   it("CL-17: el reintento COMPLETA el cobro cuando el turno vuelve a estar abierto", async () => {
     payStub.closeShiftBeforeCommit = true;
     await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6641,7 +6633,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     // con el turno abierto es una operación NUEVA que termina el cobro.
     payStub.shiftStatus = "abierto";
     const retry = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6658,7 +6649,6 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
 
   it("control negativo: con el turno abierto el mismo cobro cierra la factura", async () => {
     const result = await splitPayment(
-      payStub.SEDE_ID,
       payStub.INVOICE_ID,
       closeInvoice(payStub.INVOICE_ID),
       ACTOR,
@@ -6757,7 +6747,6 @@ describe("billing: CL-11 el diff del servicio vive en el bloque de persistencia"
     const columns = (match as RegExpExecArray)[1].split(",").map((column) => column.trim());
     expect(columns).toEqual([
       "id",
-      "sede_id",
       "consecutive_number",
       "client_name",
       "client_document",
@@ -6820,6 +6809,10 @@ describe("migración 056_collection_closes_invoice.sql (CL-17)", () => {
   });
 
   it("dropea la firma vieja del cobro dividido y crea la nueva", () => {
+    // HISTORIA, NO ESTADO: estas aserciones fijan el archivo 056 tal como se
+    // aplicó. Una migración aplicada no se reescribe, así que acá la firma lleva
+    // el parámetro de sede aunque hoy la vigente sea la de 071 (que ya no lo
+    // tiene); la firma de hoy se afirma en la suite de 071, más abajo.
     expect(sql).toContain(
       "DROP FUNCTION IF EXISTS public.invoice_split_payment_atomic(uuid, uuid, uuid, timestamptz, boolean, jsonb)",
     );
@@ -7237,7 +7230,8 @@ describe("migración 051_invoice_edit_atomic.sql (CL-12)", () => {
     expect(sql).toMatch(/v_factura\.status <> p_expected_status/);
     expect(sql).toContain("EDIT_CONFLICT");
     // El estado leído sigue siendo la OTRA mitad (CL-1) y la fila tiene que ser
-    // de la sede del actor.
+    // de la sede del actor. HISTORIA DEL ARCHIVO 051: con la instalación de una
+    // sola sede, 071 saca ese predicado (y el parámetro) sin tocar el candado.
     expect(sql).toMatch(/i\.sede_id = p_sede_id/);
   });
 
@@ -7610,7 +7604,9 @@ describe("migración 052_invoice_create_atomic.sql (CL-13)", () => {
 
   it("la emisión entera vive en UNA función: una sentencia, una transacción", () => {
     expect(sql).toContain("CREATE OR REPLACE FUNCTION public.invoice_create_atomic");
-    // La reserva del consecutivo, ADENTRO (la autoridad de 005).
+    // La reserva del consecutivo, ADENTRO (la autoridad de 005). HISTORIA DEL
+    // ARCHIVO 052: la sede de la llamada se reemplaza en 071 por la del turno que
+    // la función bloquea.
     expect(sql).toContain("public.next_invoice_number(p_sede_id)");
     // Los grupos de escritura, cada uno en UNA sentencia.
     expect(sql).toMatch(/INSERT INTO public\.invoices/);
@@ -7618,6 +7614,7 @@ describe("migración 052_invoice_create_atomic.sql (CL-13)", () => {
     expect(sql).toMatch(/INSERT INTO public\.invoice_taxes/);
     expect(sql).toMatch(/INSERT INTO public\.invoice_payments/);
     // El stock lo escribe la función de 046: una sola escritura, y la misma.
+    // En 071 la llamada pierde su primer argumento y conserva los otros tres.
     expect(sql).toContain("public.deduct_stock_atomic(p_sede_id, p_user_id, v_motivo, p_out_items)");
     // Los grupos llegan como ARREGLO (nunca una fila por request).
     for (const key of ["p_items", "p_taxes", "p_payments", "p_out_items"]) {
@@ -8029,5 +8026,277 @@ describe("invoices-client: cada campo numérico pasa por su máscara (guarda de 
     expect(block).toContain("Number(event.target.value)");
     // Sin el ancla no hay bloque: la guarda falla en vez de pasar sola.
     expect(onChangeBlock(fake, "no-existe:")).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 071_rpc_single_sede.sql: la facturación re-emite sus CINCO funciones sin el
+// parámetro de sede.
+//
+// LO QUE ESTA SUITE FIJA (y antes fijaba contra la firma vieja): 050, 051, 052,
+// 060 y 056 declaraban `p_sede_id` al principio de la firma y filtraban por
+// `sede_id` en la factura, en el turno y en el producto. Con una sola sede,
+// ese parámetro es una frontera más dentro de una base que ya tiene una, y la
+// firma que declara la base tiene que ser EXACTAMENTE la que manda el servidor:
+// un `p_sede_id` de sobra hace fallar al llamador nuevo, y una sobrecarga vieja
+// viva deja pasar al viejo sin que nadie lo note. Por eso el archivo dropea la
+// firma vieja antes de crear la nueva.
+// ---------------------------------------------------------------------------
+
+describe("migración 071_rpc_single_sede.sql (facturación)", () => {
+  const path = join(process.cwd(), "supabase", "migrations", "071_rpc_single_sede.sql");
+  const raw = readFileSync(path, "utf8").replace(/\r\n/g, "\n");
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("piso anti-vacío: el archivo existe y trae DDL real", () => {
+    expect(raw.length).toBeGreaterThan(15000);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("las CINCO funciones se crean SIN el parámetro de sede", () => {
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.invoice_create_atomic\(\s*p_user_id uuid,\s*p_cash_shift_id uuid,\s*p_idempotency_key text,\s*p_invoice jsonb,\s*p_items jsonb,\s*p_taxes jsonb,\s*p_payments jsonb,\s*p_out_reason text,\s*p_out_items jsonb\s*\)/,
+    );
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.invoice_annul_atomic\(\s*p_invoice_id uuid,\s*p_user_id uuid,\s*p_closed_at timestamptz,\s*p_motivo text,\s*p_expected_status text,\s*p_items jsonb\s*\)/,
+    );
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.invoice_edit_items_atomic\(\s*p_invoice_id uuid,\s*p_user_id uuid,\s*p_expected_version integer,\s*p_expected_status text,\s*p_edit jsonb\s*\)/,
+    );
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.invoice_edit_emitted_atomic\(\s*p_invoice_id uuid,\s*p_user_id uuid,\s*p_expected_version integer,\s*p_expected_status text,\s*p_edit jsonb\s*\)/,
+    );
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.invoice_split_payment_atomic\(\s*p_invoice_id uuid,\s*p_shift_id uuid,\s*p_user_id uuid,\s*p_closed_at timestamptz,\s*p_mark_paid boolean,\s*p_portions jsonb\s*\)/,
+    );
+    // Y el predicado de sede NO está en ninguna: si volviera, la firma y el
+    // cuerpo dejarían de contar la misma historia.
+    expect(sql).not.toMatch(/\bsede_id\s*=\s*p_sede_id/);
+    expect(sql).not.toContain("p_sede_id IS NULL");
+    expect(sql).not.toContain("p_sede_id");
+  });
+
+  it("dropea la firma VIEJA de las CINCO antes de crear la nueva", () => {
+    const drops = [
+      "DROP FUNCTION IF EXISTS public.invoice_create_atomic(uuid, uuid, uuid, text, jsonb, jsonb, jsonb, jsonb, text, jsonb)",
+      "DROP FUNCTION IF EXISTS public.invoice_annul_atomic(uuid, uuid, uuid, timestamptz, text, text, jsonb)",
+      "DROP FUNCTION IF EXISTS public.invoice_edit_items_atomic(uuid, uuid, uuid, integer, text, jsonb)",
+      "DROP FUNCTION IF EXISTS public.invoice_edit_emitted_atomic(uuid, uuid, uuid, integer, text, jsonb)",
+      "DROP FUNCTION IF EXISTS public.invoice_split_payment_atomic(uuid, uuid, uuid, uuid, timestamptz, boolean, jsonb)",
+    ];
+    for (const statement of drops) {
+      expect(sql).toContain(statement);
+      const name = statement.slice(statement.indexOf("public.") + 7, statement.indexOf("("));
+      expect(sql.indexOf(statement)).toBeLessThan(
+        sql.indexOf(`CREATE OR REPLACE FUNCTION public.${name}`),
+      );
+    }
+  });
+
+  it("la SEDE que se ESCRIBE sale de la fila bloqueada, no de un parámetro", () => {
+    // La emisión y la anulación no escriben la sede que reciben (ya no la
+    // reciben): toman la del TURNO o la del PRODUCTO que la operación ya tiene
+    // bloqueados. Es lo que deja la columna lista para el `DROP COLUMN`.
+    expect(sql).toMatch(
+      /SELECT s\.status, s\.sede_id\s*\n\s*INTO v_turno_estado, v_sede\s*\n\s*FROM public\.cash_shifts s/,
+    );
+    expect(sql).toContain("public.next_invoice_number(v_sede)");
+    expect(sql).toContain("public.deduct_stock_atomic(v_sede, p_user_id, v_motivo, p_out_items)");
+    // El movimiento de stock, en las cuatro funciones que lo escriben, toma la
+    // del producto (`p.sede_id`), igual que en 046/050/051.
+    expect(sql.match(/SELECT\s*\n\s*p\.sede_id,/g)).toHaveLength(4);
+    // Y la fila espejo/cajón del cobro toma la del turno bloqueado.
+    expect(sql).toContain("(v_turno.sede_id,");
+  });
+
+  it("el permiso y el search_path viajan con la firma NUEVA, y el comentario también", () => {
+    for (const signature of [
+      "invoice_create_atomic(uuid, uuid, text, jsonb, jsonb, jsonb, jsonb, text, jsonb)",
+      "invoice_annul_atomic(uuid, uuid, timestamptz, text, text, jsonb)",
+      "invoice_edit_items_atomic(uuid, uuid, integer, text, jsonb)",
+      "invoice_edit_emitted_atomic(uuid, uuid, integer, text, jsonb)",
+      "invoice_split_payment_atomic(uuid, uuid, uuid, timestamptz, boolean, jsonb)",
+    ]) {
+      expect(sql).toContain(`ALTER FUNCTION public.${signature} SET search_path = public;`);
+      expect(sql).toContain(`REVOKE ALL ON FUNCTION public.${signature} FROM PUBLIC;`);
+      expect(sql).toContain(`REVOKE ALL ON FUNCTION public.${signature} FROM anon;`);
+      expect(sql).toContain(
+        `REVOKE ALL ON FUNCTION public.${signature} FROM authenticated;`,
+      );
+      expect(sql).toContain(`GRANT EXECUTE ON FUNCTION public.${signature} TO service_role;`);
+      expect(sql).toContain(`COMMENT ON FUNCTION public.${signature} IS`);
+    }
+  });
+
+  it("conserva las redes de conteo y los candados: el cambio es de firma, no de comportamiento", () => {
+    for (const code of [
+      "INVOICE_INVALID",
+      "OUT_REASON_INVALID",
+      "SHIFT_NOT_OPEN",
+      "INVOICE_MISMATCH",
+      "ITEM_MISMATCH",
+      "TAX_MISMATCH",
+      "PAYMENT_MISMATCH",
+      "MOVEMENT_MISMATCH",
+      "ANNUL_CONFLICT",
+      "ANNUL_INVALID",
+      "PRODUCT_NOT_FOUND",
+      "EDIT_CONFLICT",
+      "SHIFT_CLOSED",
+      "SHIFT_NOT_FOUND",
+    ]) {
+      expect(sql).toContain(`RAISE EXCEPTION '${code}'`);
+    }
+    // El candado de la edición (038) y el de la 056 sobre el turno siguen.
+    expect(sql).toContain("AND i.edit_version = p_expected_version");
+    expect(sql).toContain("FOR SHARE OF s");
+    expect(sql).toContain("FOR UPDATE OF i");
+    // Y el consecutive la red 041 y el motivo del OUT. El marcador de 060
+    // viaja porque `diagnostics/migraciones_faltantes.sql` distingue la
+    // versión corregida de 052 POR TEXTO.
+    expect(raw).toContain("-- fix-060: esperados ANTES del INSERT");
+    expect(sql).toContain("idempotency_key");
+  });
+
+  it("NO borra la columna ni toca las políticas: ése es el paso irreversible de otra unidad", () => {
+    expect(sql).not.toMatch(/DROP COLUMN/i);
+    expect(sql).not.toMatch(/ALTER TABLE/i);
+    expect(sql).not.toMatch(/\bPOLICY\b/i);
+    expect(sql).not.toMatch(/ROW LEVEL SECURITY/i);
+    expect(raw).toContain("POR QUÉ ESTE ARCHIVO CORRE ANTES DEL BORRADO DE LA COLUMNA");
+  });
+
+  it("NO re-emite next_invoice_number: su parámetro es la FILA del contador, no la sede del actor", () => {
+    // `invoice_sequences` tiene `sede_id` como clave primaria: el parámetro
+    // selecciona la fila que la función bloquea e incrementa. Elegirla sola
+    // dentro de SQL sería inventar una regla de sede que nadie decidió, así que
+    // la función queda como está y quien la llama le pasa la del turno que ya
+    // tiene bloqueada.
+    expect(sql).not.toContain("CREATE OR REPLACE FUNCTION public.next_invoice_number");
+    expect(raw).toContain(
+      "`public.next_invoice_number(p_sede_id uuid)` (005), que se deja tal cual",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 072_system_settings.sql: el consecutivo pasa a ser un AJUSTE de la
+// INSTALACIÓN (`public.system_settings`, una fila por `clave`).
+//
+// La serie de una sola sede (071) dejó `next_invoice_number` como estaba, por una
+// razón que entonces era cierta: `invoice_sequences` tenía `sede_id` como clave
+// primaria, el parámetro SELECCIONABA la fila del contador y no había forma de
+// elegirla dentro de SQL. La 072 resuelve justamente eso —la fila pasa a ser la
+// clave 'invoice_sequence' de una tabla que no tiene sede—, y por eso es la que
+// re-emite la función. Que lo haga un archivo y no el otro no es una
+// contradicción: es el ORDEN de la serie. El parámetro se conserva (aunque el
+// cuerpo ya no lo use) para que la firma que declara la base siga siendo la que
+// `invoice_create_atomic` manda, y su retiro queda para la unidad que borra
+// `sede_id`.
+//
+// Lo que esta suite fija: la FIRMA no cambia, el LOCK de fila se conserva (es lo
+// único que impide el consecutivo duplicado) y la serie no puede REBAJAR con una
+// segunda corrida de la migración.
+// ---------------------------------------------------------------------------
+
+describe("migración 072_system_settings.sql (consecutivo de factura)", () => {
+  const path = join(process.cwd(), "supabase", "migrations", "072_system_settings.sql");
+  const raw = readFileSync(path, "utf8").replace(/\r\n/g, "\n");
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+  /** El cuerpo desplegado de la función, sin prosa. */
+  const functionBody = (): string => {
+    const start = sql.indexOf("CREATE OR REPLACE FUNCTION public.next_invoice_number");
+    expect(start).toBeGreaterThan(-1);
+    const body = sql.slice(start);
+    const end = body.indexOf("$$;");
+    return end === -1 ? body : body.slice(0, end);
+  };
+
+  it("crea la tabla de ajustes con la forma declarada: clave, valor y updated_at", () => {
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.system_settings");
+    expect(sql).toContain("key text PRIMARY KEY");
+    expect(sql).toContain("value jsonb NOT NULL DEFAULT '{}'::jsonb");
+    expect(sql).toContain("updated_at timestamptz NOT NULL DEFAULT now()");
+    expect(sql).toContain("EXECUTE FUNCTION public.set_updated_at()");
+    // Sin sede: es un ajuste de la instalación, no de una sede.
+    expect(sql).not.toMatch(/CREATE TABLE IF NOT EXISTS public\.system_settings \([^)]*sede_id/is);
+  });
+
+  it("re-emite next_invoice_number con la MISMA firma de 005", () => {
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.next_invoice_number(p_sede_id uuid)");
+    expect(sql).toContain("RETURNS integer");
+    expect(sql).toContain("ALTER FUNCTION public.next_invoice_number(uuid) SET search_path = public");
+    // El parámetro sigue declarado pero el cuerpo ya no lo usa: la fila del
+    // contador es la clave, no la sede. Retirarlo de la firma es de la unidad que
+    // borra `sede_id`.
+    // `sede_id` aparece UNA vez en toda la definición: en la firma.
+    const cuerpo = functionBody();
+    expect(cuerpo.match(/sede_id/g) ?? []).toHaveLength(1);
+    expect(cuerpo.slice(cuerpo.indexOf("DECLARE"))).not.toMatch(/sede_id/);
+    expect(raw).toContain("POR QUÉ `next_invoice_number` CONSERVA SU PARÁMETRO");
+  });
+
+  it("el lock de fila se conserva: bloquea la clave del contador y la incrementa adentro", () => {
+    const body = functionBody();
+    // El `SELECT … FOR UPDATE` sobre la fila de la clave: es el idioma que
+    // serializa a los emisores concurrentes (FAC-05) y hace que el segundo espere
+    // y vea el número que el primero dejó.
+    expect(body).toMatch(
+      /SELECT[\s\S]*FROM public\.system_settings s[\s\S]*WHERE s\.key = 'invoice_sequence'[\s\S]*FOR UPDATE;/,
+    );
+    // Y el incremento sigue DENTRO de la misma función, o sea dentro de la
+    // transacción del llamador: un aborto no quema el número.
+    expect(body.indexOf("FOR UPDATE")).toBeLessThan(body.indexOf("UPDATE public.system_settings"));
+    expect(body).toContain("jsonb_set(value, '{last_number}', to_jsonb(v_last + 1), true)");
+    expect(body).toContain("RETURN v_last + 1");
+    // La fila vieja no vuelve a aparecer en el cuerpo.
+    expect(body).not.toContain("invoice_sequences");
+  });
+
+  it("la fila tiene que existir antes de bloquearla, sin pisar el contador vigente", () => {
+    const body = functionBody();
+    expect(body).toContain("INSERT INTO public.system_settings (key, value)");
+    expect(body).toContain("ON CONFLICT (key) DO NOTHING");
+    // El `IF NOT FOUND` conserva el nombre del error de 005, que es lo que
+    // traduce el servicio.
+    expect(body).toContain("IF NOT FOUND THEN");
+    expect(body).toContain("RAISE EXCEPTION 'SEDE_NOT_FOUND'");
+  });
+
+  it("el contador se mueve adelante y NO puede rebajar en una segunda corrida", () => {
+    // El MÁXIMO de `invoice_sequences` (nunca el mínimo: el mínimo devuelve la
+    // serie hacia atrás y repite un número ya emitido) con `DO NOTHING` (nunca
+    // `DO UPDATE`: una segunda corrida no puede rebajar el contador que ya
+    // avanzó con las emisiones de la primera).
+    expect(sql).toMatch(/jsonb_build_object\('last_number', coalesce\(max\(s\.last_number\), 0\)\)/);
+    expect(sql).not.toMatch(/ON CONFLICT \(key\) DO UPDATE/);
+    expect(sql).not.toMatch(/UPDATE\s+public\.invoice_sequences/i);
+  });
+
+  it("invoice_create_atomic la sigue llamando con la misma firma", () => {
+    // 071 no le quitó el parámetro al llamador, y la 072 tampoco se lo quitó a la
+    // función: la llamada y la declaración siguen coincidiendo, que es lo que
+    // hace que un despliegue no falle por una sobrecarga vieja.
+    const previous = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "071_rpc_single_sede.sql"),
+      "utf8",
+    ).replace(/\r\n/g, "\n");
+    expect(previous).toContain("public.next_invoice_number(v_sede)");
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.next_invoice_number(p_sede_id uuid)");
+  });
+
+  it("NO borra invoice_sequences ni la columna: el borrado es de la unidad que quita sede_id", () => {
+    expect(sql).not.toMatch(/DROP TABLE/i);
+    expect(sql).not.toMatch(/DROP COLUMN/i);
+    expect(sql).not.toMatch(/ALTER TABLE public\.invoice_sequences/i);
+    expect(raw).toContain("NO borra `invoice_sequences` ni `voucher_settings`");
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
   });
 });

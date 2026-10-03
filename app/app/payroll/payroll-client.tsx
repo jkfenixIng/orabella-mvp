@@ -67,6 +67,7 @@ import {
   DialogTitle,
 } from "@/src/components/ui/lib/dialog";
 import { cn } from "@/src/components/ui/lib/utils";
+import { DataTable } from "@/src/components/ui/lib/data-table";
 import { Alert } from "@/src/components/ui/lib/alert";
 import { Badge } from "@/src/components/ui/lib/badge";
 import {
@@ -95,6 +96,26 @@ const tableInputClass = cn(
   "w-28 rounded-md border border-border-color bg-surface px-2 py-1 text-right text-sm text-text-primary shadow-sm",
   "dark:border-border-color-2",
 );
+
+/*
+ * Decoración de las DOS tablas de liquidación (12 columnas). Vive acá y no en
+ * `ui-styles.ts` a propósito: es la letra de ESTE módulo, no un estándar.
+ *
+ * - El dinero va a la derecha y con cifras tabulares, para que los dígitos de
+ *   una fila se lean en columna; su encabezado también va a la derecha, para
+ *   que titule el mismo borde donde termina el número.
+ * - `whitespace-nowrap` evita el rótulo de tres palabras partido en cuatro
+ *   renglones dentro de una columna angosta.
+ *
+ * El padding NO se aprieta. `px-3` viene ya en `tableCellClass` y las celdas
+ * de vales y de motivo lo tienen escrito (las congela la guarda de la regla
+ * del dueño); apretarlo solo en las otras diez movería 4px el borde derecho de
+ * la columna de vales y despegaría las cifras entre sí. El ancho lo gana el
+ * diálogo, no la celda.
+ */
+const headCellClass = cn(tableCellClass, "whitespace-nowrap");
+const moneyHeadClass = cn(tableCellClass, "whitespace-nowrap text-right");
+const moneyCellClass = cn(tableCellClass, "text-right tabular-nums whitespace-nowrap");
 
 /** Etiquetas del tipo de pago del empleado (ADM-08: fijo, porcentaje o mixto). */
 const PAY_TYPE_LABELS: Record<string, string> = {
@@ -311,7 +332,6 @@ function indexPeriodTotals(rows: readonly PayrollPeriodSummary[]): Record<string
 }
 
 interface PayrollClientProps {
-  sedeId: string;
   initialEmployees: EmployeeRow[];
   initialPeriods: PayrollPeriodRow[];
   /**
@@ -343,121 +363,122 @@ interface PeriodDetailTableProps {
 /** Tabla del detalle del periodo (solo presentación). */
 function PeriodDetailTable({ items, employeeName, payLabel, onView, onViewSources }: PeriodDetailTableProps) {
   return (
-    <div className="mt-4 overflow-x-auto">
-      <table className={cn("w-full text-left text-sm", "min-w-[1040px]")}>
-        <thead>
-          <tr className={tableHeaderClass}>
-            <th className={tableCellClass} scope="col">
-              Empleado
-            </th>
-            <th className={tableCellClass} scope="col">
-              Fijo (días)
-            </th>
-            <th className={tableCellClass} scope="col">
-              Comisión fija
-            </th>
-            <th className={tableCellClass} scope="col">
-              Comisión por porcentaje
-            </th>
-            <th className={tableCellClass} scope="col">
-              Bonos
-            </th>
-            <th className={tableCellClass} scope="col">
-              Vales (descuento)
-            </th>
-            <th className={tableCellClass} scope="col">
-              Otros (descuento)
-            </th>
-            <th className={tableCellClass} scope="col">
-              Motivo del ajuste
-            </th>
-            <th className={tableCellClass} scope="col">
-              Neto
-            </th>
-            <th className={tableCellClass} scope="col">
-              Pagado
-            </th>
-            <th className={tableCellClass} scope="col">
-              Saldo
-            </th>
-            <th className={tableCellClass} scope="col">
-              Detalle
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {items.map((item) => {
-            // Reclasificación sin mover el total: fija = comisiones − porcentaje.
-            const commission = splitCommissionByOrigin({
-              commissions: item.commissions,
-              detail: item.detail_json,
-            });
-            return (
-              <tr key={item.id} className={tableRowClass}>
-                <td className={tableCellClass}>
-                  <span className="block">{employeeName(item.employee_id)}</span>
-                  <span className="block text-xs text-text-tertiary">
-                    {payLabel(item.employee_id)}
-                  </span>
-                </td>
-                <td className={tableCellClass}>{formatMoney(item.base_fixed)}</td>
-                <td className={tableCellClass}>{formatMoney(commission.fixed)}</td>
-                <td className={tableCellClass}>{formatMoney(commission.percent)}</td>
-                <td className={tableCellClass}>{formatMoney(item.bonuses)}</td>
-                {/*
-                  Regla del dueño (2026-10-01): «vales es solo vales y punto».
-                  La celda muestra ÚNICAMENTE el total REAL de vales del período
-                  (`voucher_total`) con el signo de descuento. Antes imprimía
-                  además `aplicado` y `deuda pendiente`; el aplicado igualaba la
-                  comisión en el caso del dueño y la columna terminaba nombrando
-                  la comisión bajo otra etiqueta. Esa conciliación vive en el
-                  modal «Ver facturas y vales», que es donde se lee el desglose.
-                  El signo es solo presentación: el vale se guarda positivo.
-                */}
-                <td className={tableCellClass} title={voucherCellTitle(item)}>
-                  <span className="block">{`-${formatMoney(item.voucher_total)}`}</span>
-                </td>
-                <td className={tableCellClass}>{`-${formatMoney(item.other_discounts)}`}</td>
-                {/*
-                  F8: la respuesta a «¿por qué este empleado tiene este ajuste?».
-                  El motivo se guarda en el ítem (misma fila y misma
-                  transacción que el monto) y acá se muestra tal cual: una
-                  liquidación cerrada tiene que poder explicarse sola.
-                */}
-                <td className={tableCellClass}>{item.adjustment_reason ?? "—"}</td>
-                <td className={cn(tableCellClass, "font-semibold")}>{formatMoney(item.net_pay)}</td>
-                <td className={tableCellClass}>{formatMoney(item.paid)}</td>
-                <td className={tableCellClass}>{formatMoney(item.remaining)}</td>
-                <td className={tableCellClass}>
-                  <span className="inline-flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      onClick={() => onView(item)}
-                      aria-label={`Ver el desglose de ${employeeName(item.employee_id)}`}
-                      className={ghostClass}
-                    >
-                      Ver
-                    </button>
-                    {/*
-                      F6: abre el modal con las facturas y los vales que
-                      componen ESTA liquidación, con el detalle de cada uno.
-                    */}
-                    <button
-                      type="button"
-                      onClick={() => onViewSources(item)}
-                      aria-label={`Ver facturas y vales de ${employeeName(item.employee_id)}`}
-                      className={ghostClass}
-                    >
-                      Ver facturas y vales
-                    </button>
-                  </span>
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
+    <DataTable minWidth="2xl" wrapperClassName="mt-4">
+      <thead>
+        <tr className={tableHeaderClass}>
+          <th className={headCellClass} scope="col">
+            Empleado
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Fijo (días)
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Comisión fija
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Comisión por porcentaje
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Bonos
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Vales (descuento)
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Otros (descuento)
+          </th>
+          <th className={headCellClass} scope="col">
+            Motivo del ajuste
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Neto
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Pagado
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Saldo
+          </th>
+          <th className={headCellClass} scope="col">
+            Detalle
+          </th>
+        </tr>
+      </thead>
+      <tbody>
+        {items.map((item) => {
+          // Reclasificación sin mover el total: fija = comisiones − porcentaje.
+          const commission = splitCommissionByOrigin({
+            commissions: item.commissions,
+            detail: item.detail_json,
+          });
+          return (
+            <tr key={item.id} className={tableRowClass}>
+              <td className={tableCellClass}>
+                <span className="block">{employeeName(item.employee_id)}</span>
+                <span className="block text-xs text-text-tertiary">
+                  {payLabel(item.employee_id)}
+                </span>
+              </td>
+              <td className={moneyCellClass}>{formatMoney(item.base_fixed)}</td>
+              <td className={moneyCellClass}>{formatMoney(commission.fixed)}</td>
+              <td className={moneyCellClass}>{formatMoney(commission.percent)}</td>
+              <td className={moneyCellClass}>{formatMoney(item.bonuses)}</td>
+              {/*
+                Regla del dueño (2026-10-01): «vales es solo vales y punto».
+                La celda muestra ÚNICAMENTE el total REAL de vales del período
+                (`voucher_total`) con el signo de descuento. Antes imprimía
+                además `aplicado` y `deuda pendiente`; el aplicado igualaba la
+                comisión en el caso del dueño y la columna terminaba nombrando
+                la comisión bajo otra etiqueta. Esa conciliación vive en el
+                modal «Ver facturas y vales», que es donde se lee el desglose.
+                El signo es solo presentación: el vale se guarda positivo.
+
+                El `className` de esta celda lo congela la guarda del dueño: el
+                alineado del dinero va en el `span` de adentro.
+              */}
+              <td className={tableCellClass} title={voucherCellTitle(item)}>
+                <span className="block text-right tabular-nums">{`-${formatMoney(item.voucher_total)}`}</span>
+              </td>
+              <td className={moneyCellClass}>{`-${formatMoney(item.other_discounts)}`}</td>
+              {/*
+                F8: la respuesta a «¿por qué este empleado tiene este ajuste?».
+                El motivo se guarda en el ítem (misma fila y misma
+                transacción que el monto) y acá se muestra tal cual: una
+                liquidación cerrada tiene que poder explicarse sola.
+              */}
+              <td className={tableCellClass}>{item.adjustment_reason ?? "—"}</td>
+              <td className={cn(moneyCellClass, "font-semibold")}>{formatMoney(item.net_pay)}</td>
+              <td className={moneyCellClass}>{formatMoney(item.paid)}</td>
+              <td className={moneyCellClass}>{formatMoney(item.remaining)}</td>
+              <td className={tableCellClass}>
+                <span className="inline-flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => onView(item)}
+                    aria-label={`Ver el desglose de ${employeeName(item.employee_id)}`}
+                    className={ghostClass}
+                  >
+                    Ver
+                  </button>
+                  {/*
+                    F6: abre el modal con las facturas y los vales que
+                    componen ESTA liquidación, con el detalle de cada uno.
+                  */}
+                  <button
+                    type="button"
+                    onClick={() => onViewSources(item)}
+                    aria-label={`Ver facturas y vales de ${employeeName(item.employee_id)}`}
+                    className={ghostClass}
+                  >
+                    Ver facturas y vales
+                  </button>
+                </span>
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </DataTable>
   );
 }
 
@@ -567,190 +588,187 @@ function DraftPayrollTable({
   onViewSources,
 }: DraftPayrollTableProps) {
   return (
-    <div className="mt-4 overflow-x-auto">
-      <table className={cn("w-full text-left text-sm", "min-w-[1040px]")}>
-        <thead>
-          <tr className={tableHeaderClass}>
-            <th className={tableCellClass} scope="col">
-              Empleado
-            </th>
-            <th className={tableCellClass} scope="col">
-              Fijo (días)
-            </th>
-            <th className={tableCellClass} scope="col">
-              Comisión fija
-            </th>
-            <th className={tableCellClass} scope="col">
-              Comisión por porcentaje
-            </th>
-            <th className={tableCellClass} scope="col">
-              Bonos
-            </th>
-            <th className={tableCellClass} scope="col">
-              Vales (descuento)
-            </th>
-            <th className={tableCellClass} scope="col">
-              Otros (descuento)
-            </th>
-            <th className={tableCellClass} scope="col">
-              Motivo del ajuste
-            </th>
-            <th className={tableCellClass} scope="col">
-              Neto
-            </th>
-            <th className={tableCellClass} scope="col">
-              Pagado
-            </th>
-            <th className={tableCellClass} scope="col">
-              Saldo
-            </th>
-            <th className={tableCellClass} scope="col">
-              Detalle
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => {
-            const item = row.item;
-            // F8: el motivo es obligatorio en cuanto la fila tiene un bono o un
-            // descuento distinto de 0. Se DERIVA del valor que se está
-            // editando, no de lo ya persistido, así el campo acompaña el
-            // número que el admin acaba de escribir.
-            const reasonRequired =
-              (toNumber(adjustmentValue(row.employeeId, "bonuses")) ?? 0) !== 0 ||
-              (toNumber(adjustmentValue(row.employeeId, "others")) ?? 0) !== 0;
-            const reasonValue = adjustmentReasonValue(row.employeeId);
-            // F8 (visibilidad): el aviso del motivo faltante vive DENTRO del
-            // diálogo, en la MISMA celda del motivo. El error de la página queda
-            // detrás del modal abierto —el admin no lo ve y cree que el botón no
-            // responde—, así que el aviso va donde está escribiendo. Se deriva
-            // del valor que se está editando: aparece con el monto y desaparece
-            // apenas el motivo existe.
-            const reasonMissing = reasonRequired && reasonValue.trim() === "";
-            // Reclasificación sin mover el total: fija = comisiones − porcentaje.
-            const commission = item
-              ? splitCommissionByOrigin({ commissions: item.commissions, detail: item.detail_json })
-              : null;
-            return (
-              <tr key={row.employeeId} className={tableRowClass}>
-                <td className={tableCellClass}>
-                  <span className="block">{employeeName(row.employeeId)}</span>
-                  <span className="block text-xs text-text-tertiary">{payLabel(row.employeeId)}</span>
-                </td>
-                <td className={tableCellClass}>{item ? formatMoney(item.base_fixed) : "—"}</td>
-                <td className={tableCellClass}>
-                  {commission ? formatMoney(commission.fixed) : "—"}
-                </td>
-                <td className={tableCellClass}>
-                  {commission ? formatMoney(commission.percent) : "—"}
-                </td>
-                <td className={tableCellClass}>
+    <DataTable minWidth="2xl" wrapperClassName="mt-4">
+      <thead>
+        <tr className={tableHeaderClass}>
+          <th className={headCellClass} scope="col">
+            Empleado
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Fijo (días)
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Comisión fija
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Comisión por porcentaje
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Bonos
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Vales (descuento)
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Otros (descuento)
+          </th>
+          <th className={headCellClass} scope="col">
+            Motivo del ajuste
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Neto
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Pagado
+          </th>
+          <th className={moneyHeadClass} scope="col">
+            Saldo
+          </th>
+          <th className={headCellClass} scope="col">
+            Detalle
+          </th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((row) => {
+          const item = row.item;
+          // F8: el motivo es obligatorio en cuanto la fila tiene un bono o un
+          // descuento distinto de 0. Se DERIVA del valor que se está
+          // editando, no de lo ya persistido, así el campo acompaña el
+          // número que el admin acaba de escribir.
+          const reasonRequired =
+            (toNumber(adjustmentValue(row.employeeId, "bonuses")) ?? 0) !== 0 ||
+            (toNumber(adjustmentValue(row.employeeId, "others")) ?? 0) !== 0;
+          const reasonValue = adjustmentReasonValue(row.employeeId);
+          // F8 (visibilidad): el aviso del motivo faltante vive DENTRO del
+          // diálogo, en la MISMA celda del motivo. El error de la página queda
+          // detrás del modal abierto —el admin no lo ve y cree que el botón no
+          // responde—, así que el aviso va donde está escribiendo. Se deriva
+          // del valor que se está editando: aparece con el monto y desaparece
+          // apenas el motivo existe.
+          const reasonMissing = reasonRequired && reasonValue.trim() === "";
+          // Reclasificación sin mover el total: fija = comisiones − porcentaje.
+          const commission = item
+            ? splitCommissionByOrigin({ commissions: item.commissions, detail: item.detail_json })
+            : null;
+          return (
+            <tr key={row.employeeId} className={tableRowClass}>
+              <td className={tableCellClass}>
+                <span className="block">{employeeName(row.employeeId)}</span>
+                <span className="block text-xs text-text-tertiary">{payLabel(row.employeeId)}</span>
+              </td>
+              <td className={moneyCellClass}>{item ? formatMoney(item.base_fixed) : "—"}</td>
+              <td className={moneyCellClass}>{commission ? formatMoney(commission.fixed) : "—"}</td>
+              <td className={moneyCellClass}>{commission ? formatMoney(commission.percent) : "—"}</td>
+              <td className={tableCellClass}>
+                <input
+                  inputMode="numeric"
+                  value={formatMoneyInput(adjustmentValue(row.employeeId, "bonuses"))}
+                  onChange={(event) => onAdjustmentChange(row.employeeId, "bonuses", stripMoneyInput(event.target.value))}
+                  aria-label={`Bonos de ${employeeName(row.employeeId)}`}
+                  className={tableInputClass}
+                />
+              </td>
+              {/*
+                Regla del dueño (2026-10-01): mismo criterio que la tabla
+                cerrada —la celda muestra SOLO el total REAL de vales
+                (`voucher_total`), sin líneas secundarias—. La conciliación del
+                monto aplicado y de la deuda vive en el modal «Ver facturas y
+                vales». El signo es solo presentación: el vale se guarda
+                positivo.
+
+                El `className` de esta celda lo congela la guarda del dueño: el
+                alineado del dinero va en el `span` de adentro.
+              */}
+              <td className={tableCellClass} title={item ? voucherCellTitle(item) : undefined}>
+                {item ? (
+                  <span className="block text-right tabular-nums">{`-${formatMoney(item.voucher_total)}`}</span>
+                ) : (
+                  "—"
+                )}
+              </td>
+              <td className={tableCellClass}>
+                {/* El signo es solo presentación: el descuento se guarda positivo. */}
+                <span className="inline-flex items-center gap-1">
+                  <span aria-hidden="true">−</span>
                   <input
                     inputMode="numeric"
-                    value={formatMoneyInput(adjustmentValue(row.employeeId, "bonuses"))}
-                    onChange={(event) => onAdjustmentChange(row.employeeId, "bonuses", stripMoneyInput(event.target.value))}
-                    aria-label={`Bonos de ${employeeName(row.employeeId)}`}
+                    value={formatMoneyInput(adjustmentValue(row.employeeId, "others"))}
+                    onChange={(event) => onAdjustmentChange(row.employeeId, "others", stripMoneyInput(event.target.value))}
+                    aria-label={`Otros descuentos de ${employeeName(row.employeeId)}`}
                     className={tableInputClass}
                   />
-                </td>
-                {/*
-                  Regla del dueño (2026-10-01): mismo criterio que la tabla
-                  cerrada —la celda muestra SOLO el total REAL de vales
-                  (`voucher_total`), sin líneas secundarias—. La conciliación del
-                  monto aplicado y de la deuda vive en el modal «Ver facturas y
-                  vales». El signo es solo presentación: el vale se guarda
-                  positivo.
-                */}
-                <td className={tableCellClass} title={item ? voucherCellTitle(item) : undefined}>
-                  {item ? (
-                    <span className="block">{`-${formatMoney(item.voucher_total)}`}</span>
-                  ) : (
-                    "—"
-                  )}
-                </td>
-                <td className={tableCellClass}>
-                  {/* El signo es solo presentación: el descuento se guarda positivo. */}
-                  <span className="inline-flex items-center gap-1">
-                    <span aria-hidden="true">−</span>
-                    <input
-                      inputMode="numeric"
-                      value={formatMoneyInput(adjustmentValue(row.employeeId, "others"))}
-                      onChange={(event) => onAdjustmentChange(row.employeeId, "others", stripMoneyInput(event.target.value))}
-                      aria-label={`Otros descuentos de ${employeeName(row.employeeId)}`}
-                      className={tableInputClass}
-                    />
+                </span>
+              </td>
+              {/*
+                F8: el motivo viaja con el monto. Es un campo de texto sin
+                máscara de dinero; `aria-required` y el marcador «Motivo
+                (obligatorio)» lo anuncian cuando la fila lleva ajuste. La
+                guarda de verdad vive en el servicio; la comprobación de la
+                pantalla nombra al empleado y, ahora, avisa INLINE junto al
+                campo (texto plano, nunca un `Alert` ni un `role=` a mano).
+              */}
+              <td className={tableCellClass}>
+                <input
+                  type="text"
+                  value={reasonValue}
+                  onChange={(event) => onAdjustmentChange(row.employeeId, "reason", event.target.value)}
+                  maxLength={ADJUSTMENT_REASON_MAX_LENGTH}
+                  aria-label={`Motivo del ajuste de ${employeeName(row.employeeId)}`}
+                  aria-required={reasonRequired}
+                  placeholder={reasonRequired ? "Motivo (obligatorio)" : "—"}
+                  className={tableInputClass}
+                />
+                {/* El aviso vive pegado al campo, no en el error de la
+                    página: con el diálogo abierto ese error queda detrás. */}
+                {reasonMissing && (
+                  <p className="mt-1 text-xs text-error">
+                    {`Falta el motivo del ajuste de ${employeeName(row.employeeId)}.`}
+                  </p>
+                )}
+              </td>
+                <td className={cn(moneyCellClass, "font-semibold")}>
+                {item ? formatMoney(item.net_pay) : "—"}
+              </td>
+              <td className={moneyCellClass}>{item ? formatMoney(item.paid) : "—"}</td>
+              <td className={moneyCellClass}>{item ? formatMoney(item.remaining) : "—"}</td>
+              <td className={tableCellClass}>
+                {item ? (
+                  <span className="inline-flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => onView(item)}
+                      aria-label={`Ver el desglose de ${employeeName(row.employeeId)}`}
+                      className={ghostClass}
+                    >
+                      Ver
+                    </button>
+                    {/* F6: mismo modal de facturas y vales que la tabla cerrada. */}
+                    <button
+                      type="button"
+                      onClick={() => onViewSources(item)}
+                      aria-label={`Ver facturas y vales de ${employeeName(row.employeeId)}`}
+                      className={ghostClass}
+                    >
+                      Ver facturas y vales
+                    </button>
                   </span>
-                </td>
-                {/*
-                  F8: el motivo viaja con el monto. Es un campo de texto sin
-                  máscara de dinero; `aria-required` y el marcador «Motivo
-                  (obligatorio)» lo anuncian cuando la fila lleva ajuste. La
-                  guarda de verdad vive en el servicio; la comprobación de la
-                  pantalla nombra al empleado y, ahora, avisa INLINE junto al
-                  campo (texto plano, nunca un `Alert` ni un `role=` a mano).
-                */}
-                <td className={tableCellClass}>
-                  <input
-                    type="text"
-                    value={reasonValue}
-                    onChange={(event) => onAdjustmentChange(row.employeeId, "reason", event.target.value)}
-                    maxLength={ADJUSTMENT_REASON_MAX_LENGTH}
-                    aria-label={`Motivo del ajuste de ${employeeName(row.employeeId)}`}
-                    aria-required={reasonRequired}
-                    placeholder={reasonRequired ? "Motivo (obligatorio)" : "—"}
-                    className={tableInputClass}
-                  />
-                  {/* El aviso vive pegado al campo, no en el error de la
-                      página: con el diálogo abierto ese error queda detrás. */}
-                  {reasonMissing && (
-                    <p className="mt-1 text-xs text-error">
-                      {`Falta el motivo del ajuste de ${employeeName(row.employeeId)}.`}
-                    </p>
-                  )}
-                </td>
-                <td className={cn(tableCellClass, "font-semibold")}>
-                  {item ? formatMoney(item.net_pay) : "—"}
-                </td>
-                <td className={tableCellClass}>{item ? formatMoney(item.paid) : "—"}</td>
-                <td className={tableCellClass}>{item ? formatMoney(item.remaining) : "—"}</td>
-                <td className={tableCellClass}>
-                  {item ? (
-                    <span className="inline-flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        onClick={() => onView(item)}
-                        aria-label={`Ver el desglose de ${employeeName(row.employeeId)}`}
-                        className={ghostClass}
-                      >
-                        Ver
-                      </button>
-                      {/* F6: mismo modal de facturas y vales que la tabla cerrada. */}
-                      <button
-                        type="button"
-                        onClick={() => onViewSources(item)}
-                        aria-label={`Ver facturas y vales de ${employeeName(row.employeeId)}`}
-                        className={ghostClass}
-                      >
-                        Ver facturas y vales
-                      </button>
-                    </span>
-                  ) : (
-                    "—"
-                  )}
-                </td>
-              </tr>
-            );
-          })}
-          {rows.length === 0 && (
-            <tr className={tableRowClass}>
-              <td className={tableCellClass} colSpan={12}>
-                No hay empleados activos para liquidar.
+                ) : (
+                  "—"
+                )}
               </td>
             </tr>
-          )}
-        </tbody>
-      </table>
-    </div>
+          );
+        })}
+        {rows.length === 0 && (
+          <tr className={tableRowClass}>
+            <td className={tableCellClass} colSpan={12}>
+              No hay empleados activos para liquidar.
+            </td>
+          </tr>
+        )}
+      </tbody>
+    </DataTable>
   );
 }
 
@@ -2908,7 +2926,16 @@ export function PayrollClient(props: PayrollClientProps) {
             else setDetailDialogOpen(open);
           }}
         >
-          <DialogContent className="max-w-6xl" aria-busy={isViewPending}>
+          {/*
+            El ancho que la liquidación necesita, no el de un modal normal. Con
+            `max-w-6xl` y su `p-6` el diálogo ofrecía 1098px útiles en cualquier
+            monitor, y las 12 columnas piden unos 1450: por eso la tabla leía
+            apretada («espichada») sin que nada estuviera mal escrito. Este es
+            el cambio que devuelve el espacio; el carril angosto lo resuelve
+            `DataTable`, y el dinero alineado y los rótulos en una línea lo que
+            se lee de un vistazo.
+          */}
+          <DialogContent className="sm:max-w-[96vw]" aria-busy={isViewPending}>
             <DialogHeader>
               <DialogTitle>
                 Liquidación {selected.start_date} → {selected.end_date} ({selected.status})

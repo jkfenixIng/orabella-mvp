@@ -61,6 +61,9 @@ import {
   periodRangeDays,
   prorateFixedSalary,
   rangesOverlap,
+  readVoucherCapSetting,
+  readVoucherDaysSetting,
+  readVoucherPerDaySetting,
   resolveFixedSalaryForPeriod,
   resolveMixedBlock,
   resolveOpenPayrollRange,
@@ -75,7 +78,10 @@ import {
   sumMoney,
   summarizePayrollItems,
   voucherApprovalCashOutViolation,
+  voucherCapSettingValue,
+  voucherDaysSettingValue,
   voucherLimitsSchema,
+  voucherPerDaySettingValue,
   voucherRequiresReview,
   weekdayIso,
   weekStartOf,
@@ -94,6 +100,7 @@ import {
   getPayrollSettlementSources,
   getPayrollStartDate,
   getPeriodDetail,
+  getVoucherSettings,
   groupSettlementInvoices,
   listPayrollMonthRows,
   listPayrollOverview,
@@ -101,7 +108,7 @@ import {
   openPayrollPeriod,
   PayrollError,
   rejectVoucher,
-  setPayrollStartDate,
+  setVoucherLimits,
   type PayrollActor,
 } from "@/src/features/payroll/service";
 import { listAllEmployees, listEmployees } from "@/src/features/admin/service";
@@ -719,7 +726,6 @@ describe("payroll: detalle de comisiones con la resolución compartida (PAY-02/P
 describe("payroll: la comisión solo sale de facturas Pagada (regla del dueño)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   const SUBTOTAL = 10_000;
@@ -797,7 +803,7 @@ describe("payroll: la comisión solo sale de facturas Pagada (regla del dueño)"
   it("una factura `Emitida` NO comisiona; una `Pagada` sí", async () => {
     seedInvoices(["Pagada", "Emitida", "Anulada"]);
 
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
 
     const persisted = payrollPagedStub.itemsUpsert ?? [];
     expect(persisted).toHaveLength(1);
@@ -810,7 +816,7 @@ describe("payroll: la comisión solo sale de facturas Pagada (regla del dueño)"
   it("control: sin ninguna factura pagada la comisión es 0", async () => {
     seedInvoices(["Emitida", "Anulada"]);
 
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
 
     const persisted = payrollPagedStub.itemsUpsert ?? [];
     expect(persisted).toHaveLength(1);
@@ -829,7 +835,6 @@ describe("payroll: la comisión solo sale de facturas Pagada (regla del dueño)"
 describe("payroll: el vale ya descontado se sigue contando al recalcular el borrador", () => {
   const ACTOR: PayrollActor = {
     userId: "u-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   const SALARY = 1_400_000;
@@ -903,7 +908,7 @@ describe("payroll: el vale ya descontado se sigue contando al recalcular el borr
   it("un vale `descontada` del rango se vuelve a descontar (no queda en 0)", async () => {
     seed([voucher("vale-1", "2026-01-15", 100_000)]);
 
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
 
     const persisted = payrollPagedStub.itemsUpsert ?? [];
     expect(persisted).toHaveLength(1);
@@ -920,7 +925,7 @@ describe("payroll: el vale ya descontado se sigue contando al recalcular el borr
       voucher("vale-otro", "2025-12-20", 50_000),
     ]);
 
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
 
     const persisted = payrollPagedStub.itemsUpsert ?? [];
     expect(persisted).toHaveLength(1);
@@ -1651,8 +1656,14 @@ const payrollPagedStub = vi.hoisted(() => ({
    * responder como la BASE (una restricción violada, `23P01`), no sólo como un
    * cliente feliz: si no, la carrera contra la restricción de exclusión no se
    * podría probar.
+   *
+   * La base manda las dos cosas de un error de Postgres y las dos sirven: el
+   * `code` describe una restricción violada (`23P01`) y el `message` cualquier
+   * otro fallo —un `upsert` que la base rechaza sin violated constraint no tiene
+   * un `code` que inventarle—. Con `code` el doble arma el mensaje; con
+   * `message` lo usa tal cual; sin ninguno, un error genérico de la base.
    */
-  insertError: null as { table: string; code: string } | null,
+  insertError: null as { table: string; code?: string; message?: string } | null,
   /** Payload de cada UPDATE, por tabla: si la escritura ocurrió o no. */
   updates: [] as Array<{ table: string; payload: unknown }>,
   /**
@@ -1745,6 +1756,19 @@ const payrollPagedStub = vi.hoisted(() => ({
   beforeRpc: null as { run: () => void } | null,
   /** CL-9: borrados efectivos del doble, por tabla (no intentos: hechos). */
   deletes: [] as Array<{ table: string; count: number }>,
+  /**
+   * 072: cada RESERVA del consecutivo y a qué rival vio, para que la prueba de
+   * que el número no se repite no afirme una bandera que ella misma puso.
+   */
+  sequenceChecks: [] as Array<{ sawRival: boolean; emitida: number }>,
+  /**
+   * 072: CONTROL NEGATIVO del guardián. `null` (lo normal) = el lock se lee del
+   * ARTEFACTO. Un booleano lo apaga o lo enciende para comprobar que el doble
+   * DE VERDAD ve el duplicado cuando la fila no se bloquea: sin esta prueba, un
+   * doble que siempre «no repite números» no probaría nada. Sólo lo usan las
+   * pruebas de control; el comportamiento se lee del archivo.
+   */
+  sequenceLockOverride: null as boolean | null,
 }));
 
 const MIGRATIONS_DIR = join(process.cwd(), "supabase", "migrations");
@@ -1780,6 +1804,117 @@ function deployedPayrollCapBody(): string {
  */
 function payrollCapLocksParent(): boolean {
   return /\bFOR\s+UPDATE\b/.test(deployedPayrollCapBody());
+}
+
+/**
+ * 072: el cuerpo DESPLEGADO de `next_invoice_number`: lo declara 005 y lo
+ * re-emite 072 con el cuerpo nuevo (misma firma, otra fila que bloquear). Se
+ * toma la ÚLTIMA definición, así que la 005 deja de mandar en cuanto la 072
+ * está —y si la 072 no existiera, la 005 seguiría siendo la vigente. El cuerpo
+ * se mira sin comentarios: la prosa no es la barrera.
+ */
+function deployedNextInvoiceNumberBody(): string {
+  const files = ["005_billing.sql", "072_system_settings.sql"].filter((file) =>
+    existsSync(join(MIGRATIONS_DIR, file)),
+  );
+  for (const file of files.reverse()) {
+    const raw = readFileSync(join(MIGRATIONS_DIR, file), "utf8");
+    const start = raw.indexOf("CREATE OR REPLACE FUNCTION public.next_invoice_number");
+    if (start === -1) continue;
+    const body = raw.slice(start);
+    const end = body.indexOf("$$;");
+    return (end === -1 ? body : body.slice(0, end))
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("--"))
+      .join("\n");
+  }
+  return "";
+}
+
+/**
+ * 072: ¿el contador desplegado toma el lock de la fila que incrementa? El doble
+ * NO recibe esta respuesta del test: la lee del ARTEFACTO, igual que
+ * `payrollCapLocksParent`. Por eso el test de comportamiento se cae solo si el
+ * `FOR UPDATE` desaparece de la 072 (la serie vuelve a poder repetir un número),
+ * en vez de afirmar una bandera que el test eligió.
+ */
+function invoiceSequenceLocksRow(): boolean {
+  const override = payrollPagedStub.sequenceLockOverride;
+  if (override !== null) return override;
+  const body = deployedNextInvoiceNumberBody();
+  return /\bFOR\s+UPDATE\b/.test(body) && body.includes("'invoice_sequence'");
+}
+
+/**
+ * 072: la fila del consecutivo como la aplica Postgres: se bloquea la fila de la
+ * clave, se lee su `last_number` y se incrementa en la MISMA transacción.
+ *
+ * La parte que decide es la FOTO de la lectura, y depende del lock:
+ *   * con el lock desplegado, el segundo emisor ESPERÓ y su foto es POSTERIOR al
+ *     commit del primero: ve el número que el primero dejó y se lleva el
+ *     siguiente;
+ *   * sin lock, la foto es la de su propia lectura, ANTERIOR: no lo ve y los dos
+ *     emiten el mismo número (el defecto FAC-05 de 005).
+ *
+ * `rival` modela esa otra transacción: su incremento YA está confirmado cuando
+ * ésta entra.
+ */
+function reserveInvoiceSequence(rival: { before: number; emitted: number } | null = null): number {
+  const locksRow = invoiceSequenceLocksRow();
+  const key = "invoice_sequence";
+  const filas = (): Array<Record<string, unknown>> => payrollPagedStub.tables.system_settings ?? [];
+  const fila = () => filas().find((row) => row.key === key);
+  // La fila tiene que existir antes de poder bloquearla: es el
+  // `INSERT … ON CONFLICT DO NOTHING` de la función.
+  if (!fila()) {
+    payrollPagedStub.tables.system_settings = [
+      ...filas(),
+      { key, value: { last_number: 0 }, updated_at: "2026-01-31T23:59:59.000Z" },
+    ];
+  }
+  if (rival !== null) {
+    // La otra transacción reservó y CONFIRMÓ antes de que ésta leyera: la fila
+    // de la clave queda con el número que ella emitió.
+    fila()!.value = { last_number: rival.emitted };
+    payrollPagedStub.tables.system_settings = filas();
+  }
+  const actual = Number((fila()?.value as { last_number?: unknown })?.last_number ?? 0);
+  // LA FOTO de la lectura: con el lock, esta transacción ESPERÓ y lee lo que la
+  // otra dejó (posterior a su commit); sin lock, su foto es la de su propia
+  // lectura, anterior al commit rival, así que emite el mismo número.
+  const leido = rival !== null && !locksRow ? rival.before : actual;
+  const emitida = leido + 1;
+  fila()!.value = { last_number: emitida };
+  payrollPagedStub.tables.system_settings = filas();
+  payrollPagedStub.sequenceChecks.push({ sawRival: locksRow, emitida });
+  return emitida;
+}
+
+/** 072: lo que la fila del consecutivo tiene escrito ahora mismo. */
+function storedInvoiceSequence(): number {
+  const fila = (payrollPagedStub.tables.system_settings ?? []).find(
+    (row) => row.key === "invoice_sequence",
+  );
+  return Number((fila?.value as { last_number?: unknown })?.last_number ?? 0);
+}
+
+/**
+ * 072: las filas de `system_settings` que equivalen a una configuración de topes
+ * de vales. Cada ajuste es UNA fila con su clave y su sobre, que es la forma en
+ * que los escribe `setVoucherLimits` y en que los deja la migración.
+ */
+function voucherSettingRows(settings: {
+  max_per_day?: number | null;
+  max_per_week?: number | null;
+  allowed_days?: number[] | null;
+  per_day_limits?: Record<string, number> | null;
+}): Array<Record<string, unknown>> {
+  return [
+    { key: "voucher_max_per_day", value: { amount: settings.max_per_day ?? null } },
+    { key: "voucher_max_per_week", value: { amount: settings.max_per_week ?? null } },
+    { key: "voucher_per_day_limits", value: { limits: settings.per_day_limits ?? null } },
+    { key: "voucher_allowed_days", value: { days: settings.allowed_days ?? null } },
+  ];
 }
 
 /**
@@ -1873,6 +2008,8 @@ function createPayrollPagedStubClient(): unknown {
     let rangeTo = payrollPagedStub.rowCap - 1;
     let updatePayload: Record<string, unknown> | undefined;
     let insertPayload: unknown;
+    /** 072: columna (o columnas) del destino de conflicto del `upsert`. */
+    let upsertConflict: string | null = null;
 
     const rows = (): Array<Record<string, unknown>> => payrollPagedStub.tables[table] ?? [];
 
@@ -1977,7 +2114,10 @@ function createPayrollPagedStubClient(): unknown {
         if (failure && failure.table === table) {
           return {
             data: null,
-            error: { code: failure.code, message: `doble: ${failure.code} inyectado en el INSERT de ${table}` },
+            error: {
+              code: failure.code ?? "P0001",
+              message: failure.message ?? `doble: ${failure.code ?? "P0001"} inyectado en el INSERT de ${table}`,
+            },
           };
         }
         const values = (Array.isArray(insertPayload) ? insertPayload : [insertPayload]) as Array<
@@ -2021,7 +2161,21 @@ function createPayrollPagedStubClient(): unknown {
           closed_at: null,
           ...row,
         }));
-        payrollPagedStub.tables[table] = [...rows(), ...persisted];
+        // 072: `ON CONFLICT (clave) DO UPDATE` reemplaza la fila que ya tenía
+        // esa clave en vez de dejar dos filas con el mismo ajuste.
+        payrollPagedStub.tables[table] =
+          op === "upsert" && upsertConflict !== null && !upsertConflict.includes(",")
+            ? [
+                ...rows().filter((row) => !values.some((value) => value[upsertConflict!] === row[upsertConflict!])),
+                ...persisted,
+              ]
+            : [...rows(), ...persisted];
+        if (table === "payroll_items" && op === "upsert") {
+          payrollPagedStub.itemsUpsert = persisted;
+          // CL-8: esta escritura quedó CONFIRMADA (camino suelto). Si el descuento
+          // de los vales falla después, el ítem ya es un hecho.
+          payrollPagedStub.itemWrites.push(persisted);
+        }
         return { data: single ? persisted[0] ?? null : persisted, error: null };
       }
       const failOn = payrollPagedStub.failOn;
@@ -2075,19 +2229,17 @@ function createPayrollPagedStubClient(): unknown {
         payrollPagedStub.updates.push({ table, payload });
         return query;
       },
-      upsert: (value?: unknown) => {
+      upsert: (value?: unknown, options?: { onConflict?: string }) => {
         op = "upsert";
-        // El upsert persiste de verdad: `getPeriodDetail` lee después estas filas.
-        const persisted = (Array.isArray(value) ? value : [value]).map((row) => ({
-          ...(row as Record<string, unknown>),
-          id: `item-nomina-${(payrollPagedStub.rowSeq += 1)}`,
-          created_at: "2026-01-31T23:59:59.000Z",
-        }));
-        payrollPagedStub.itemsUpsert = persisted;
-        payrollPagedStub.tables.payroll_items = [...rows(), ...persisted];
-        // CL-8: esta escritura quedó CONFIRMADA (camino suelto). Si el descuento
-        // de los vales falla después, el ítem ya es un hecho.
-        payrollPagedStub.itemWrites.push(persisted);
+        // 072: el destino de conflicto del `ON CONFLICT`. Con UNA sola columna
+        // el doble reemplaza la fila que ya tiene ese valor (es lo que hace el
+        // upsert real); con una lista de columnas se deja el comportamiento de
+        // siempre, que es el que el RPC de la 047 emula aparte.
+        upsertConflict = options?.onConflict ?? null;
+        // El upsert persiste de verdad: `getPeriodDetail` lee después estas
+        // filas. La escritura la aplica el `INSERT` de `select()`, que es por
+        // donde pasa todo upsert que devuelve fila (`… .upsert().select()`).
+        insertPayload = value;
         return query;
       },
       delete: () => {
@@ -2229,7 +2381,9 @@ function createPayrollPagedStubClient(): unknown {
       const period = periods.find((row) => row.id === args?.p_period_id) ?? null;
       // El período BLOQUEADO y su precondición de estado, dentro de la
       // transacción: un borrado concurrente (o un cierre) rechaza, no pisa.
-      if (!period || period.status !== "borrador" || period.sede_id !== args?.p_sede_id) {
+      // La sede ya NO es un parámetro de la función (071): es la de la
+      // instalación, así que el doble no la filtra.
+      if (!period || period.status !== "borrador") {
         return rollback("PAYROLL_PERIOD_CONFLICT");
       }
       // El mismo guardia de solapamiento del servicio, re-evaluado acá: un
@@ -2248,7 +2402,7 @@ function createPayrollPagedStubClient(): unknown {
       const expected = [...toApproved, ...toPending];
       const reverted: string[] = [];
       for (const id of expected) {
-        const row = vouchers.find((entry) => entry.id === id && entry.sede_id === args?.p_sede_id);
+        const row = vouchers.find((entry) => entry.id === id);
         if (row && row.status === "descontada") {
           row.status = toApproved.includes(id) ? "aprobada" : "pendiente";
           reverted.push(id);
@@ -2319,7 +2473,7 @@ function createPayrollPagedStubClient(): unknown {
         (payrollPagedStub.tables.payroll_periods ?? []).find(
           (row) => row.id === args?.p_period_id,
         ) ?? null;
-      if (!period || period.sede_id !== args?.p_sede_id) {
+      if (!period) {
         return rollback("PAYROLL_CORRECTION_CONFLICT");
       }
       if (period.status !== "cerrado") return rollback("PERIOD_NOT_CLOSED");
@@ -2549,6 +2703,8 @@ function resetPayrollStubState(): void {
   payrollPagedStub.failCorrectionLines = null;
   payrollPagedStub.beforeRpc = null;
   payrollPagedStub.deletes.length = 0;
+  payrollPagedStub.sequenceChecks.length = 0;
+  payrollPagedStub.sequenceLockOverride = null;
 }
 
 // Los catálogos de admin/cash son `unstable_cache` (caché de Next). Fuera de un
@@ -2569,7 +2725,6 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/src/features/admin/service")>();
   const employee: Awaited<ReturnType<typeof actual.listEmployees>>[number] = {
     id: payrollPagedStub.EMPLOYEE_ID,
-    sede_id: payrollPagedStub.SEDE_ID,
     user_id: null,
     full_name: "Empleada de prueba",
     employee_code: null,
@@ -2594,13 +2749,13 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
   return {
     ...actual,
     requireSession: async () => payrollPagedStub.session,
-    listEmployees: async (sedeId: string, limit?: number) =>
+    listEmployees: async (limit?: number) =>
       payrollPagedStub.tables.employees
-        ? actual.listEmployees(sedeId, limit)
+        ? actual.listEmployees(limit)
         : ([employee] as Awaited<ReturnType<typeof actual.listEmployees>>),
-    listAllEmployees: async (sedeId: string) =>
+    listAllEmployees: async () =>
       payrollPagedStub.tables.employees
-        ? actual.listAllEmployees(sedeId)
+        ? actual.listAllEmployees()
         : ([employee] as Awaited<ReturnType<typeof actual.listEmployees>>),
   };
 });
@@ -2608,7 +2763,6 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
 describe("payroll: el cálculo lee todas las filas (U5)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   /** Facturas de una sede en el rango: más que el tope por request (1000). */
@@ -2685,7 +2839,7 @@ describe("payroll: el cálculo lee todas las filas (U5)", () => {
     expect(seed.items).toHaveLength(INVOICE_COUNT);
     expect(INVOICE_COUNT).toBeGreaterThan(payrollPagedStub.rowCap);
 
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
 
     const persisted = payrollPagedStub.itemsUpsert ?? [];
     expect(persisted).toHaveLength(1);
@@ -2700,7 +2854,7 @@ describe("payroll: el cálculo lee todas las filas (U5)", () => {
     // comisiones (si la paginación duplicara o perdiera filas, esto lo delata).
     const seed = seedCalculation(50);
 
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
 
     expect(seed.invoices).toHaveLength(50);
     expect(payrollPagedStub.itemsUpsert?.[0].commissions).toBe(50 * COMMISSION_PER_LINE);
@@ -2712,7 +2866,7 @@ describe("payroll: el cálculo lee todas las filas (U5)", () => {
 
   it("pide el conjunto completo, en páginas y con orden explícito", async () => {
     seedCalculation(INVOICE_COUNT);
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
 
     const invoiceWindows = payrollPagedStub.windows.filter((window) => window.table === "invoices");
     expect(invoiceWindows.length).toBeGreaterThan(1);
@@ -2737,9 +2891,7 @@ describe("payroll: el cálculo lee todas las filas (U5)", () => {
     seedCalculation(INVOICE_COUNT);
     payrollPagedStub.failAt = { invoices: [2] };
 
-    const failure: unknown = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const failure: unknown = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       {},
       ACTOR,
     ).catch((error: unknown) => error);
@@ -2756,7 +2908,6 @@ describe("payroll: el cálculo lee todas las filas (U5)", () => {
 describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
 
@@ -2891,7 +3042,7 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
         { pay_type: "fijo", pay_frequency: "semanal", salary_fixed: 1_500_000, commission_percent: null },
       ],
     });
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
     const item = itemFor("empleado-1");
     expect(item.base_fixed).toBe(375_000);
     expect(item.commissions).toBe(0);
@@ -2910,7 +3061,7 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
         { pay_type: "fijo", pay_frequency: "quincenal", salary_fixed: 1_500_000, commission_percent: null },
       ],
     });
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
     expect(itemFor("empleado-1").base_fixed).toBe(750_000);
 
     seed({
@@ -2919,7 +3070,7 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
         { pay_type: "fijo", pay_frequency: "mensual", salary_fixed: 1_500_000, commission_percent: null },
       ],
     });
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
     expect(itemFor("empleado-1").base_fixed).toBe(1_500_000);
     expectIdentity(itemFor("empleado-1"));
   });
@@ -2931,7 +3082,7 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
         { pay_type: "fijo", pay_frequency: "mensual", salary_fixed: 1_500_000, commission_percent: null },
       ],
     });
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
     // F4: antes F3 le escribía un ítem en 0 fijo. Ahora la exclusión ocurre al
     // armar el conjunto de empleados, así que NO hay fila: nada aguas abajo
     // (ítems, totales, resúmenes) ve al excluido.
@@ -2950,7 +3101,7 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
       // Factura Pagada DENTRO del rango del período y del empleado excluido.
       lines: [{ item_type: "servicio", subtotal: 4_000_000 }],
     });
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
     // La comisión de 400.000 NO aparece en ninguna parte: no hay ítem que la
     // lleve y no hay `detail_json` con la factura. Es lo que evita liquidar dos
     // veces la misma factura cuando el semanal y el mensual se superponen.
@@ -2969,7 +3120,7 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
       ],
       lines: [{ item_type: "servicio", subtotal: 4_000_000 }],
     });
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
     const item = itemFor("empleado-1");
     // Falta la cadencia del empleado: rige el comportamiento de HOY, exacto.
     expect(item.base_fixed).toBe(
@@ -2989,7 +3140,7 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
       endDate: "2026-01-07",
       employees: [{ pay_type: "fijo", pay_frequency: null, salary_fixed: 1_500_000, commission_percent: null }],
     });
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
     const item = itemFor("empleado-1");
     expect(item.base_fixed).toBe(
       prorateFixedSalary({ salaryFixed: 1_500_000, startDate: "2026-01-01", endDate: "2026-01-07" }),
@@ -3007,7 +3158,7 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
       ],
       lines: [{ item_type: "servicio", subtotal: 4_000_000 }],
     });
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
     const item = itemFor("empleado-1");
     // 1.200.000 / 4 = 300.000 de básico del período; 10% de 4.000.000 = 400.000.
     expect(item.base_fixed).toBe(300_000);
@@ -3025,7 +3176,7 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
       ],
       lines: [{ item_type: "servicio", subtotal: 2_000_000 }],
     });
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
     const item = itemFor("empleado-1");
     expect(item.base_fixed).toBe(300_000);
     expect(item.commissions).toBe(0); // los porcentajes se absorben
@@ -3049,7 +3200,7 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
         { item_type: "producto", subtotal: 500_000, commission_value: 50_000 }, // fija
       ],
     });
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
     const item = itemFor("empleado-1");
     // El mayor (400.000) + la comisión fija del producto (50.000).
     expect(item.base_fixed).toBe(300_000);
@@ -3218,7 +3369,6 @@ describe("paged: la lectura exhaustiva no recorta en silencio (U5)", () => {
 describe("payroll: la alineación de la planta se lee completa (U7)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   /** El techo del listado de admin: `clampLimit(limit, 50, 500)`. */
@@ -3317,7 +3467,7 @@ describe("payroll: la alineación de la planta se lee completa (U7)", () => {
     expect(PLANT).toBeGreaterThan(LIST_CAP);
     expect(PLANT).toBeGreaterThan(payrollPagedStub.rowCap);
 
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
 
     const persisted = payrollPagedStub.itemsUpsert ?? [];
     // Los 1200, cada uno con su comisión: 1200 × 1.000 = 1.200.000.
@@ -3331,7 +3481,7 @@ describe("payroll: la alineación de la planta se lee completa (U7)", () => {
 
   it("la planta se pide entera y en orden (sin el tope de 500)", async () => {
     seedPlant(1200);
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
 
     const employeeWindows = payrollPagedStub.windows.filter((window) => window.table === "employees");
     // Más de una página: la ventana pedida es la del Data API (1000), no 500.
@@ -3350,9 +3500,7 @@ describe("payroll: la alineación de la planta se lee completa (U7)", () => {
 
   it("control negativo: una sede chica se lee igual (mismos montos, sin duplicados)", async () => {
     const seed = seedPlant(3);
-    const detail = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const detail = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       {},
       ACTOR,
     );
@@ -3375,9 +3523,7 @@ describe("payroll: la alineación de la planta se lee completa (U7)", () => {
     // Falla la SEGUNDA página de la planta: la lectura no se completa.
     payrollPagedStub.failAt = { employees: [2] };
 
-    const failure: unknown = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const failure: unknown = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       {},
       ACTOR,
     ).catch((error: unknown) => error);
@@ -3452,7 +3598,7 @@ describe("payroll: el detalle del período muestra TODO lo pagado (U7)", () => {
     expect(seed.items).toHaveLength(ITEMS);
     expect(ITEMS).toBeGreaterThan(payrollPagedStub.rowCap);
 
-    const detail = await getPeriodDetail(payrollPagedStub.SEDE_ID, PERIOD_ID);
+    const detail = await getPeriodDetail(PERIOD_ID);
 
     // Ni una línea de menos: el período se muestra completo.
     expect(detail.items).toHaveLength(ITEMS);
@@ -3464,7 +3610,7 @@ describe("payroll: el detalle del período muestra TODO lo pagado (U7)", () => {
 
   it("los ids de los pagos van en lotes que aguantan la URL (414)", async () => {
     seedPeriod(1200, PAID_PER_ITEM);
-    await getPeriodDetail(payrollPagedStub.SEDE_ID, PERIOD_ID);
+    await getPeriodDetail(PERIOD_ID);
 
     const paymentInFilters = payrollPagedStub.inFilters.filter(
       (entry) => entry.table === "payroll_payments",
@@ -3477,7 +3623,7 @@ describe("payroll: el detalle del período muestra TODO lo pagado (U7)", () => {
 
   it("las dos lecturas van ordenadas y por páginas", async () => {
     seedPeriod(1200, PAID_PER_ITEM);
-    await getPeriodDetail(payrollPagedStub.SEDE_ID, PERIOD_ID);
+    await getPeriodDetail(PERIOD_ID);
 
     const itemWindows = payrollPagedStub.windows.filter((window) => window.table === "payroll_items");
     const paymentWindows = payrollPagedStub.windows.filter(
@@ -3492,7 +3638,7 @@ describe("payroll: el detalle del período muestra TODO lo pagado (U7)", () => {
 
   it("control negativo: un período chico se lee igual (mismos pagos, sin duplicados)", async () => {
     const seed = seedPeriod(3, PAID_PER_ITEM);
-    const detail = await getPeriodDetail(payrollPagedStub.SEDE_ID, PERIOD_ID);
+    const detail = await getPeriodDetail(PERIOD_ID);
 
     expect(seed.payments).toHaveLength(3);
     expect(detail.items.map((item) => item.id)).toEqual(["item-00001", "item-00002", "item-00003"]);
@@ -3511,7 +3657,7 @@ describe("payroll: el detalle del período muestra TODO lo pagado (U7)", () => {
     seedPeriod(1200, PAID_PER_ITEM);
     payrollPagedStub.failAt = { payroll_payments: [1] };
 
-    const failure: unknown = await getPeriodDetail(payrollPagedStub.SEDE_ID, PERIOD_ID).catch(
+    const failure: unknown = await getPeriodDetail(PERIOD_ID).catch(
       (error: unknown) => error,
     );
 
@@ -3524,7 +3670,6 @@ describe("payroll: la marca over_tope de la aprobación no puede mentir (U7)", (
   const EMPLEADO = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const ACTOR: PayrollActor = {
     userId: "u-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   const REQUEST_DATE = "2026-01-15";
@@ -3546,15 +3691,8 @@ describe("payroll: la marca over_tope de la aprobación no puede mentir (U7)", (
     };
     payrollPagedStub.tables = {
       voucher_requests: [voucher],
-      voucher_settings: [
-        {
-          sede_id: payrollPagedStub.SEDE_ID,
-          max_per_day: maxPerDay,
-          max_per_week: null,
-          allowed_days: null,
-          per_day_limits: null,
-        },
-      ],
+      // 072: los topes se leen de `system_settings`, una fila por ajuste.
+      system_settings: voucherSettingRows({ max_per_day: maxPerDay }),
       users: [],
       audit_logs: [],
     };
@@ -3579,9 +3717,7 @@ describe("payroll: la marca over_tope de la aprobación no puede mentir (U7)", (
     // Falla la lectura del acumulado vigente: la que filtra por `request_date`.
     payrollPagedStub.failOn = { table: "voucher_requests", filter: "request_date" };
 
-    const failure: unknown = await approveVoucher(
-      payrollPagedStub.SEDE_ID,
-      VOUCHER_ID,
+    const failure: unknown = await approveVoucher(VOUCHER_ID,
       {},
       ACTOR,
     ).catch((error: unknown) => error);
@@ -3599,20 +3735,22 @@ describe("payroll: la marca over_tope de la aprobación no puede mentir (U7)", (
   it("control: dentro de topes la marca sigue siendo `false` (ahora es un dato, no un default)", async () => {
     const voucher = seedPendingVoucher(150000, 200000);
 
-    const approved = await approveVoucher(payrollPagedStub.SEDE_ID, VOUCHER_ID, {}, ACTOR);
+    const approved = await approveVoucher(VOUCHER_ID, {}, ACTOR);
 
     expect(approved.status).toBe("aprobada");
     expect(voucher.status).toBe("aprobada");
     expect((approvalAudit()?.metadata as { over_tope?: unknown }).over_tope).toBe(false);
+    expect(approvalAudit()).not.toHaveProperty("sede_id");
   });
 
   it("control: sobre el tope la marca sigue siendo `true`", async () => {
     seedPendingVoucher(150000, 100000);
 
-    const approved = await approveVoucher(payrollPagedStub.SEDE_ID, VOUCHER_ID, {}, ACTOR);
+    const approved = await approveVoucher(VOUCHER_ID, {}, ACTOR);
 
     expect(approved.status).toBe("aprobada");
     expect((approvalAudit()?.metadata as { over_tope?: unknown }).over_tope).toBe(true);
+    expect(approvalAudit()).not.toHaveProperty("sede_id");
   });
 });
 
@@ -3640,7 +3778,6 @@ describe("payroll: la revisión del vale no pisa lo que la nómina descontó (U8
   const EMPLEADO = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const ACTOR: PayrollActor = {
     userId: "u-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   const REQUEST_DATE = "2026-01-15";
@@ -3663,15 +3800,8 @@ describe("payroll: la revisión del vale no pisa lo que la nómina descontó (U8
     };
     payrollPagedStub.tables = {
       voucher_requests: [voucher],
-      voucher_settings: [
-        {
-          sede_id: payrollPagedStub.SEDE_ID,
-          max_per_day: 200000,
-          max_per_week: null,
-          allowed_days: null,
-          per_day_limits: null,
-        },
-      ],
+      // 072: los topes se leen de `system_settings`, una fila por ajuste.
+      system_settings: voucherSettingRows({ max_per_day: 200000 }),
       users: [],
       audit_logs: [],
     };
@@ -3702,9 +3832,7 @@ describe("payroll: la revisión del vale no pisa lo que la nómina descontó (U8
     const voucher = seedVoucher("pendiente");
     nominaDescuentaAntesDelUpdate(voucher);
 
-    const failure: unknown = await approveVoucher(
-      payrollPagedStub.SEDE_ID,
-      VOUCHER_ID,
+    const failure: unknown = await approveVoucher(VOUCHER_ID,
       {},
       ACTOR,
     ).catch((error: unknown) => error);
@@ -3719,9 +3847,7 @@ describe("payroll: la revisión del vale no pisa lo que la nómina descontó (U8
     const voucher = seedVoucher("pendiente");
     nominaDescuentaAntesDelUpdate(voucher);
 
-    const failure: unknown = await rejectVoucher(
-      payrollPagedStub.SEDE_ID,
-      VOUCHER_ID,
+    const failure: unknown = await rejectVoucher(VOUCHER_ID,
       { motivo: "Fuera de política" },
       { userId: "u-1" },
     ).catch((error: unknown) => error);
@@ -3735,7 +3861,7 @@ describe("payroll: la revisión del vale no pisa lo que la nómina descontó (U8
   it("control: un vale pendiente sin carrera se aprueba (la guarda no bloquea el camino legal)", async () => {
     const voucher = seedVoucher("pendiente");
 
-    const approved = await approveVoucher(payrollPagedStub.SEDE_ID, VOUCHER_ID, {}, ACTOR);
+    const approved = await approveVoucher(VOUCHER_ID, {}, ACTOR);
 
     expect(approved.status).toBe("aprobada");
     expect(voucher.status).toBe("aprobada");
@@ -3745,9 +3871,7 @@ describe("payroll: la revisión del vale no pisa lo que la nómina descontó (U8
   it("control: un vale pendiente sin carrera se rechaza", async () => {
     const voucher = seedVoucher("pendiente");
 
-    const rejected = await rejectVoucher(
-      payrollPagedStub.SEDE_ID,
-      VOUCHER_ID,
+    const rejected = await rejectVoucher(VOUCHER_ID,
       { motivo: "Sin justificación" },
       { userId: "u-1" },
     );
@@ -3759,18 +3883,14 @@ describe("payroll: la revisión del vale no pisa lo que la nómina descontó (U8
 
   it("control negativo: lo que ya no es `pendiente` se rechaza en la lectura, sin tocar la fila", async () => {
     seedVoucher("aprobada", { approved_by: "u-1" });
-    const onApproved: unknown = await approveVoucher(
-      payrollPagedStub.SEDE_ID,
-      VOUCHER_ID,
+    const onApproved: unknown = await approveVoucher(VOUCHER_ID,
       {},
       ACTOR,
     ).catch((error: unknown) => error);
     expect(onApproved).toMatchObject({ code: "VOUCHER_IMMUTABLE", status: 409 });
 
     seedVoucher("descontada", { approved_by: "u-1" });
-    const onDiscounted: unknown = await rejectVoucher(
-      payrollPagedStub.SEDE_ID,
-      VOUCHER_ID,
+    const onDiscounted: unknown = await rejectVoucher(VOUCHER_ID,
       { motivo: "x" },
       { userId: "u-1" },
     ).catch((error: unknown) => error);
@@ -4021,7 +4141,7 @@ describe("payroll: el listado de vales acepta un rango de fechas inclusivo (pant
 
   it("el camino de caja (`request_date` exacto) no cambió", async () => {
     seedVales();
-    expect(await ids({ request_date: "2026-01-10", limit: 200, sede_id: SEDE })).toEqual(
+    expect(await ids({ request_date: "2026-01-10", limit: 200 })).toEqual(
       ["v-10a", "v-10b"].sort(),
     );
   });
@@ -4040,7 +4160,6 @@ describe("payroll: el listado de vales acepta un rango de fechas inclusivo (pant
 describe("payroll: el fijo es la parte del sueldo mensual de los DÍAS del período (PR1)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   /** Sueldo MENSUAL (migración 003: `salary_fixed` es por mes). */
@@ -4103,7 +4222,7 @@ describe("payroll: el fijo es la parte del sueldo mensual de los DÍAS del perí
 
   /** `base_fixed` que el servicio persistió al calcular el período dado. */
   async function baseFixedOf(periodId: string): Promise<number> {
-    await calculatePayroll(payrollPagedStub.SEDE_ID, periodId, {}, ACTOR);
+    await calculatePayroll(periodId, {}, ACTOR);
     const persisted = payrollPagedStub.itemsUpsert ?? [];
     expect(persisted).toHaveLength(1);
     return Number(persisted[0].base_fixed);
@@ -4186,7 +4305,7 @@ describe("payroll: el fijo es la parte del sueldo mensual de los DÍAS del perí
     // El porcentaje del mixto vive en `commission_percent`.
     payrollPagedStub.tables.employees[0].commission_percent = 10;
 
-    await calculatePayroll(payrollPagedStub.SEDE_ID, WEEK_1, {}, ACTOR);
+    await calculatePayroll(WEEK_1, {}, ACTOR);
 
     const persisted = payrollPagedStub.itemsUpsert ?? [];
     expect(persisted).toHaveLength(1);
@@ -5516,10 +5635,8 @@ describe("payroll-client: el diálogo de apertura DERIVADO (F10, guarda de fuent
 describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
-  const OTHER_SEDE = "99999999-9999-4999-8999-999999999999";
 
   function seedPeriods(rows: Array<Record<string, unknown>>) {
     payrollPagedStub.tables = {
@@ -5565,8 +5682,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
   it("rechaza abrir un ciclo que comparte días con otro de la sede", async () => {
     seedPeriods([periodRow("periodo-1", "2026-08-01", "2026-09-30", "borrador", payrollPagedStub.SEDE_ID, "semanal")]);
 
-    const failure: unknown = await openPayrollPeriod(
-      { frequency: "semanal", cycle_end_date: "2026-09-05" },
+    const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     ).catch((error: unknown) => error);
 
@@ -5583,8 +5699,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
   it("compartir UN solo día ya bloquea", async () => {
     seedPeriods([periodRow("periodo-1", "2026-09-05", "2026-09-05", "borrador", payrollPagedStub.SEDE_ID, "semanal")]);
 
-    const failure: unknown = await openPayrollPeriod(
-      { frequency: "semanal", cycle_end_date: "2026-09-05" },
+    const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     ).catch((error: unknown) => error);
 
@@ -5594,8 +5709,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
   it("también bloquea contra un período CERRADO: esos días ya se pagaron", async () => {
     seedPeriods([periodRow("periodo-1", "2026-08-30", "2026-09-05", "cerrado", payrollPagedStub.SEDE_ID, "semanal")]);
 
-    const failure: unknown = await openPayrollPeriod(
-      { frequency: "semanal", cycle_end_date: "2026-09-05" },
+    const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     ).catch((error: unknown) => error);
 
@@ -5606,8 +5720,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
   it("control negativo: el ciclo ADYACENTE (el siguiente) se abre", async () => {
     seedPeriods([periodRow("periodo-1", "2026-08-23", "2026-08-29", "borrador", payrollPagedStub.SEDE_ID, "semanal")]);
 
-    const created = await openPayrollPeriod(
-      { frequency: "semanal", cycle_end_date: "2026-09-05" },
+    const created = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     );
 
@@ -5616,20 +5729,25 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
       end_date: "2026-09-05",
       frequency: "semanal",
       status: "borrador",
-      sede_id: payrollPagedStub.SEDE_ID,
     });
     expect(periodInserts()).toHaveLength(1);
+    // Y la fila escrita NO lleva la sede: la columna es nullable y el negocio
+    // ya no la escribe.
+    expect(periodInserts()[0]).not.toHaveProperty("sede_id");
   });
 
-  it("control negativo: el solape es por SEDE (otra sede no bloquea)", async () => {
-    seedPeriods([periodRow("periodo-otra", "2026-08-30", "2026-09-05", "borrador", OTHER_SEDE, "semanal")]);
+  it("el solape bloquea contra CUALQUIER período sembrado del rango", async () => {
+    // Un día se nomina una sola vez: la installation tiene UNA sede, así que
+    // cualquier período que comparta días estorba, sea del tenant que sea.
+    seedPeriods([periodRow("periodo-1", "2026-08-30", "2026-09-05", "borrador", payrollPagedStub.SEDE_ID, "semanal")]);
 
-    const created = await openPayrollPeriod(
-      { frequency: "semanal", cycle_end_date: "2026-09-05" },
+    const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
-    );
+    ).catch((error: unknown) => error);
 
-    expect(created).toMatchObject({ start_date: "2026-08-30", end_date: "2026-09-05" });
+    expect(failure).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
+    expect((failure as PayrollError).message).toContain("2026-08-30 a 2026-09-05");
+    expect(periodInserts()).toHaveLength(0);
   });
 
   it("F7: persiste la cadencia y el rango DERIVADO del ciclo", async () => {
@@ -5642,7 +5760,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
       seedPeriods([]);
       payrollPagedStub.inserts.length = 0;
 
-      const created = await openPayrollPeriod(cycle, ACTOR);
+      const created = await openPayrollPeriod(payrollPagedStub.SEDE_ID, cycle, ACTOR);
 
       expect(created, cycle.frequency).toMatchObject({
         frequency: cycle.frequency,
@@ -5666,7 +5784,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
       { cycle_end_date: "2026-09-05" },
       { frequency: null, cycle_end_date: "2026-09-05" },
     ]) {
-      const failure: unknown = await openPayrollPeriod(body, ACTOR).catch((error: unknown) => error);
+      const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, body, ACTOR).catch((error: unknown) => error);
       expect(failure, JSON.stringify(body)).toBeInstanceOf(PayrollError);
       expect(failure).toMatchObject({ code: "VALIDATION", status: 400 });
     }
@@ -5676,8 +5794,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
   it("F4: rechaza una cadencia fuera del catálogo cerrado (nada se escribe)", async () => {
     seedPeriods([]);
 
-    const failure: unknown = await openPayrollPeriod(
-      { frequency: "anual", cycle_end_date: "2026-09-05" },
+    const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "anual", cycle_end_date: "2026-09-05" },
       ACTOR,
     ).catch((error: unknown) => error);
 
@@ -5690,8 +5807,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     seedPeriods([]);
 
     // Corrido un día: el ciclo derivado empieza el domingo 2026-08-30.
-    const shifted: unknown = await openPayrollPeriod(
-      {
+    const shifted: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, {
         frequency: "semanal",
         cycle_end_date: "2026-09-05",
         start_date: "2026-08-31",
@@ -5705,8 +5821,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
 
     // Y el rango CORRECTO se acepta: el cliente puede mandarlo, pero el ciclo
     // derivado sigue siendo la única fuente de verdad.
-    const created = await openPayrollPeriod(
-      {
+    const created = await openPayrollPeriod(payrollPagedStub.SEDE_ID, {
         frequency: "semanal",
         cycle_end_date: "2026-09-05",
         start_date: "2026-08-30",
@@ -5721,8 +5836,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
   it("F7: rechaza un cierre que no es sábado (nada se escribe)", async () => {
     seedPeriods([]);
 
-    const failure: unknown = await openPayrollPeriod(
-      { frequency: "semanal", cycle_end_date: "2026-09-04" },
+    const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-04" },
       ACTOR,
     ).catch((error: unknown) => error);
 
@@ -5734,8 +5848,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
   it("F7: la PRIMERA liquidación de una sede usa el mismo control de ciclo", async () => {
     seedPeriods([]);
 
-    const created = await openPayrollPeriod(
-      { frequency: "semanal", cycle_end_date: "2026-09-05" },
+    const created = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     );
 
@@ -5752,8 +5865,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
       periodRow("periodo-semanal", "2026-08-30", "2026-09-05", "borrador", payrollPagedStub.SEDE_ID, "semanal"),
     ]);
 
-    const created = await openPayrollPeriod(
-      { frequency: "mensual", cycle_end_date: "2026-09-26" },
+    const created = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "mensual", cycle_end_date: "2026-09-26" },
       ACTOR,
     );
 
@@ -5771,8 +5883,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     // encima un rango con cadencia pagaría dos veces los mismos días.
     seedPeriods([periodRow("periodo-heredado", "2026-08-30", "2026-09-05")]);
 
-    const failure: unknown = await openPayrollPeriod(
-      { frequency: "semanal", cycle_end_date: "2026-09-05" },
+    const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     ).catch((error: unknown) => error);
 
@@ -5797,8 +5908,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     // nueva NO toca esa regla.
     seedPeriods([periodRow("periodo-heredado-1", "2026-08-30", "2026-09-05")]);
 
-    const failure: unknown = await openPayrollPeriod(
-      { frequency: null, cycle_end_date: "2026-09-05" },
+    const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: null, cycle_end_date: "2026-09-05" },
       ACTOR,
     ).catch((error: unknown) => error);
 
@@ -5821,8 +5931,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
       periodRow("periodo-semanal", "2026-08-30", "2026-09-05", "borrador", payrollPagedStub.SEDE_ID, "semanal"),
     ]);
 
-    const created = await openPayrollPeriod(
-      { frequency: "quincenal", cycle_end_date: "2026-09-12" },
+    const created = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "quincenal", cycle_end_date: "2026-09-12" },
       ACTOR,
     );
 
@@ -5839,8 +5948,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     seedPeriods([periodRow("periodo-heredado", "2026-08-23", "2026-08-29")]);
     payrollPagedStub.inserts.length = 0;
 
-    const adjacent = await openPayrollPeriod(
-      { frequency: "semanal", cycle_end_date: "2026-09-05" },
+    const adjacent = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     );
 
@@ -5853,8 +5961,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
       periodRow("periodo-1", "2026-08-30", "2026-09-05", "borrador", payrollPagedStub.SEDE_ID, "semanal"),
     ]);
 
-    const failure: unknown = await openPayrollPeriod(
-      { frequency: "semanal", cycle_end_date: "2026-09-05" },
+    const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     ).catch((error: unknown) => error);
 
@@ -5870,8 +5977,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     // como responde una restricción de exclusión violada.
     payrollPagedStub.insertError = { table: "payroll_periods", code: "23P01" };
 
-    const failure: unknown = await openPayrollPeriod(
-      { frequency: "semanal", cycle_end_date: "2026-09-12" },
+    const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-12" },
       ACTOR,
     ).catch((error: unknown) => error);
 
@@ -5887,8 +5993,7 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     // recortado la guarda podría no ver el período que estorba.
     payrollPagedStub.failAt = { payroll_periods: [1] };
 
-    const failure: unknown = await openPayrollPeriod(
-      { frequency: "semanal", cycle_end_date: "2026-09-05" },
+    const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-05" },
       ACTOR,
     ).catch((error: unknown) => error);
 
@@ -5919,10 +6024,8 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
 describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-admin-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
-  const OTHER_SEDE = "99999999-9999-4999-8999-999999999999";
   const EMPLOYEE_ID = payrollPagedStub.EMPLOYEE_ID;
   const METHOD = {
     id: "pm-efectivo",
@@ -6029,7 +6132,6 @@ describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
     const row = await payrollExtrasService.payPayrollExtra(extraInput(), ACTOR);
 
     expect(row).toMatchObject({
-      sede_id: payrollPagedStub.SEDE_ID,
       employee_id: EMPLOYEE_ID,
       amount: 1_800_000,
       method_id: METHOD.id,
@@ -6041,6 +6143,7 @@ describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
       days_to: "2026-09-16",
       paid_by: ACTOR.userId,
     });
+    expect(extraInserts()[0]).not.toHaveProperty("sede_id");
 
     // La auditoría explica el dinero: quién, cuánto, de qué tipo y por qué.
     const audit = payrollPagedStub.inserts.find((entry) => entry.table === "audit_logs");
@@ -6049,7 +6152,6 @@ describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
       entity: "payroll_extras",
       entity_id: row.id,
       user_id: ACTOR.userId,
-      sede_id: payrollPagedStub.SEDE_ID,
       metadata: {
         employee_id: EMPLOYEE_ID,
         amount: 1_800_000,
@@ -6058,6 +6160,9 @@ describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
         method_code: "efectivo",
       },
     });
+    // El pago queda trazable por QUIÉN lo hizo y sobre QUÉ fila; la sede de la
+    // instalación ya no se manda.
+    expect(audit?.payload).not.toHaveProperty("sede_id");
   });
 
   it("funciona para días ya cubiertos por un período CERRADO (el caso que motiva)", async () => {
@@ -6075,7 +6180,7 @@ describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
     expect(payrollPagedStub.updates.filter((entry) => entry.table === "payroll_periods")).toHaveLength(0);
 
     // Y queda visible en los registros del admin (la lista del módulo).
-    const listed = await payrollExtrasService.listPayrollExtras(payrollPagedStub.SEDE_ID);
+    const listed = await payrollExtrasService.listPayrollExtras();
     expect(listed.map((entry) => entry.id)).toContain(row.id);
     expect(listed[0]).toMatchObject({ kind: "despido", reason: "Despido con justa causa" });
   });
@@ -6119,9 +6224,12 @@ describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
     expect(extraInserts()).toHaveLength(0);
   });
 
-  it("control negativo: un empleado de OTRA sede no se paga desde esta", async () => {
+  it("control negativo: un empleado que NO existe no se paga y no escribe nada", async () => {
+    // La frontera por fila se retiró con la columna: lo que sigue guardando es
+    // que el empleado EXISTA. Sin legajo, el pago se rechaza con el mismo
+    // NOT_FOUND y con cero escrituras.
     seedClosedPeriod();
-    payrollPagedStub.tables.employees = [employeeRow(1_400_000, OTHER_SEDE)];
+    payrollPagedStub.tables.employees = [];
 
     const failure: unknown = await payrollExtrasService
       .payPayrollExtra(extraInput(), ACTOR)
@@ -6129,6 +6237,7 @@ describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
 
     expect(failure).toMatchObject({ code: "NOT_FOUND", status: 404 });
     expect(extraInserts()).toHaveLength(0);
+    expect(payrollPagedStub.inserts.filter((entrada) => entrada.table === "audit_logs")).toEqual([]);
   });
 
   it("control negativo: los días invertidos se rechazan (el rango es real)", async () => {
@@ -6287,7 +6396,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     // Non-vacuidad del fixture: hay más períodos que el tope viejo de la lista.
     expect(seed).toHaveLength(25);
 
-    const rows = await listPeriods(SEDE);
+    const rows = await listPeriods();
 
     expect(rows).toHaveLength(25);
     expect(rows.map((row) => row.id)).toContain("periodo-00001");
@@ -6296,7 +6405,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
   it("la lista pide el conjunto entero, en páginas y en orden determinista", async () => {
     seedConsecutivePeriods(1200);
 
-    const rows = await listPeriods(SEDE);
+    const rows = await listPeriods();
 
     expect(rows).toHaveLength(1200);
     const windows = payrollPagedStub.windows.filter((window) => window.table === "payroll_periods");
@@ -6316,7 +6425,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
   it("control negativo: una sede chica se lee igual y en una sola página", async () => {
     const seed = seedConsecutivePeriods(3);
 
-    const rows = await listPeriods(SEDE);
+    const rows = await listPeriods();
 
     expect(seed).toHaveLength(3);
     expect(rows.map((row) => row.id)).toEqual(["periodo-00003", "periodo-00002", "periodo-00001"]);
@@ -6452,10 +6561,10 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
 
     // El listado de navegación SÍ corta en 50: es su contrato, y por eso la
     // pantalla de nómina no puede alimentarse de él.
-    const browsing = await listEmployees(SEDE);
+    const browsing = await listEmployees();
     expect(browsing).toHaveLength(50);
 
-    const all = await listAllEmployees(SEDE);
+    const all = await listAllEmployees();
     expect(all).toHaveLength(60);
     const index = buildPayrollEmployeeIndex(all);
     expect(payrollEmployeeName(index, "emp-60")).toBe("Empleado 60 (E-60)");
@@ -6495,7 +6604,6 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     seedLegibilityFixture();
 
     const rows = await listPayrollMonthRows({
-      sedeId: SEDE,
       month: "2026-09",
       employeeId: "emp-01",
     });
@@ -6527,13 +6635,12 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     // Octubre tiene pagos de emp-01 (P3) pero NINGUNO de emp-02: la consulta de
     // emp-02 en octubre devuelve vacío, no los datos de su compañero.
     expect(
-      await listPayrollMonthRows({ sedeId: SEDE, month: "2026-10", employeeId: "emp-02" }),
+      await listPayrollMonthRows({ month: "2026-10", employeeId: "emp-02" }),
     ).toEqual([]);
 
     // El mismo mes, el empleado que SÍ tiene pagos: una sola fila, con los
     // períodos de ESE mes (ninguno de septiembre).
     const october = await listPayrollMonthRows({
-      sedeId: SEDE,
       month: "2026-10",
       employeeId: "emp-01",
     });
@@ -6560,7 +6667,6 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     // La misma base, por la consulta puntual: el saldo de la fila tampoco se
     // inventa negativo (el pagado que supera el neto no descuenta de más).
     const september = await listPayrollMonthRows({
-      sedeId: SEDE,
       month: "2026-09",
       employeeId: "emp-02",
     });
@@ -6575,7 +6681,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     seedLegibilityFixture();
 
     expect(
-      await listPayrollMonthRows({ sedeId: SEDE, month: "2026-11", employeeId: "emp-01" }),
+      await listPayrollMonthRows({ month: "2026-11", employeeId: "emp-01" }),
     ).toEqual([]);
   });
 
@@ -6729,10 +6835,8 @@ describe("payroll: derivaciones de la vista de nómina (PA3, funciones puras)", 
 describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2b)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-admin-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
-  const OTHER_SEDE = "99999999-9999-4999-8999-999999999999";
   const EMPLOYEE_ID = payrollPagedStub.EMPLOYEE_ID;
   const PERIOD_ID = payrollPagedStub.PERIOD_ID;
   const ITEM_ID = "item-nomina-1";
@@ -6771,12 +6875,13 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
     payments?: Array<Record<string, unknown>>;
     vouchers?: Array<Record<string, unknown>>;
     sedeId?: string;
+    periodoId?: string;
   } = {}) {
     const sedeId = overrides.sedeId ?? payrollPagedStub.SEDE_ID;
     payrollPagedStub.tables = {
       payroll_periods: [
         {
-          id: PERIOD_ID,
+          id: overrides.periodoId ?? PERIOD_ID,
           sede_id: sedeId,
           start_date: WEEK.start,
           end_date: WEEK.end,
@@ -6869,9 +6974,7 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
     // exige un período en BORRADOR. Aplicar los montos corregidos al registro no
     // puede cambiar ningún pago: no hay forma de pagar desde un cerrado.
     const failure: unknown = await payrollExtrasService
-      .payPayrollItem(
-        payrollPagedStub.SEDE_ID,
-        ITEM_ID,
+      .payPayrollItem(ITEM_ID,
         {
           // CL-2: el cuerpo del pago exige ahora la marca del intento.
           idempotency_key: "3f1c8a2e-9d47-4b6e-8f21-0c5a7b3d9e14",
@@ -6891,9 +6994,7 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
   it("corrige el período: recalcula con las reglas vigentes y guarda las DOS versiones", async () => {
     seedWrongClosedPeriod();
 
-    const result = await payrollExtrasService.correctPayrollPeriod(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    const result = await payrollExtrasService.correctPayrollPeriod(PERIOD_ID,
       { reason: "El fijo se pagó completo y correspondía la parte de los días." },
       ACTOR,
     );
@@ -6940,9 +7041,7 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
 
   it("la versión anterior sigue legible: el período y sus ítems NO se tocan", async () => {
     seedWrongClosedPeriod();
-    await payrollExtrasService.correctPayrollPeriod(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    await payrollExtrasService.correctPayrollPeriod(PERIOD_ID,
       { reason: "Fijo mal prorrateado." },
       ACTOR,
     );
@@ -6950,7 +7049,7 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
     // El original firmado sigue diciendo lo mismo (y se sigue leyendo igual).
     const stored = payrollPagedStub.tables.payroll_items.find((row) => row.id === ITEM_ID);
     expect(stored?.net_pay).toBe(SALARY);
-    const detail = await getPeriodDetail(payrollPagedStub.SEDE_ID, PERIOD_ID);
+    const detail = await getPeriodDetail(PERIOD_ID);
     expect(detail.items).toHaveLength(1);
     expect(detail.items[0]).toMatchObject({ net_pay: SALARY, paid: SALARY });
 
@@ -6960,14 +7059,12 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
 
   it("la corrección se lee de vuelta con las dos versiones comparadas", async () => {
     seedWrongClosedPeriod();
-    await payrollExtrasService.correctPayrollPeriod(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    await payrollExtrasService.correctPayrollPeriod(PERIOD_ID,
       { reason: "Fijo mal prorrateado." },
       ACTOR,
     );
 
-    const read = await getPayrollPeriodCorrection(payrollPagedStub.SEDE_ID, PERIOD_ID);
+    const read = await getPayrollPeriodCorrection(PERIOD_ID);
     expect(read).not.toBeNull();
     expect(read?.correction).toMatchObject({
       previous_net_total: SALARY,
@@ -6981,26 +7078,20 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
     });
 
     // Control negativo: un período que no está en la sede no se lee (404).
-    const failure: unknown = await getPayrollPeriodCorrection(
-      payrollPagedStub.SEDE_ID,
-      "periodo-inexistente",
+    const failure: unknown = await getPayrollPeriodCorrection("periodo-inexistente",
     ).catch((error: unknown) => error);
     expect(failure).toMatchObject({ code: "NOT_FOUND", status: 404 });
   });
 
   it("una corrección por período: la segunda se rechaza y no se apila", async () => {
     seedWrongClosedPeriod();
-    await payrollExtrasService.correctPayrollPeriod(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    await payrollExtrasService.correctPayrollPeriod(PERIOD_ID,
       { reason: "Primera corrección." },
       ACTOR,
     );
 
     const failure: unknown = await payrollExtrasService
-      .correctPayrollPeriod(
-        payrollPagedStub.SEDE_ID,
-        PERIOD_ID,
+      .correctPayrollPeriod(PERIOD_ID,
         { reason: "Segunda corrección." },
         ACTOR,
       )
@@ -7018,7 +7109,7 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
     seedWrongClosedPeriod();
 
     const failure: unknown = await payrollExtrasService
-      .correctPayrollPeriod(payrollPagedStub.SEDE_ID, PERIOD_ID, { reason: "   " }, ACTOR)
+      .correctPayrollPeriod(PERIOD_ID, { reason: "   " }, ACTOR)
       .catch((error: unknown) => error);
 
     expect(failure).toBeInstanceOf(PayrollError);
@@ -7033,9 +7124,7 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
     payrollPagedStub.tables.payroll_periods[0].closed_at = null;
 
     const failure: unknown = await payrollExtrasService
-      .correctPayrollPeriod(
-        payrollPagedStub.SEDE_ID,
-        PERIOD_ID,
+      .correctPayrollPeriod(PERIOD_ID,
         { reason: "No debería corregirse." },
         ACTOR,
       )
@@ -7051,9 +7140,7 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
     payrollPagedStub.tables.payroll_items = [];
 
     const failure: unknown = await payrollExtrasService
-      .correctPayrollPeriod(
-        payrollPagedStub.SEDE_ID,
-        PERIOD_ID,
+      .correctPayrollPeriod(PERIOD_ID,
         { reason: "Sin liquidación." },
         ACTOR,
       )
@@ -7063,19 +7150,19 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
     expect(correctionInserts()).toHaveLength(0);
   });
 
-  it("control negativo: un período de OTRA sede no se corrige desde esta", async () => {
-    seedWrongClosedPeriod({ sedeId: OTHER_SEDE });
+  it("control negativo: un período que NO existe no se corrige y no escribe nada", async () => {
+    // Mismo motivo que en el pago extraordinario: la única frontera que queda es
+    // la EXISTENCIA del período (y su estado), no la sede de la fila.
+    seedWrongClosedPeriod({ periodoId: "periodo-inexistente" });
 
     const failure: unknown = await payrollExtrasService
-      .correctPayrollPeriod(
-        payrollPagedStub.SEDE_ID,
-        PERIOD_ID,
+      .correctPayrollPeriod(PERIOD_ID,
         { reason: "De otra sede." },
         ACTOR,
       )
       .catch((error: unknown) => error);
 
-    expect(failure).toMatchObject({ code: "FORBIDDEN", status: 403 });
+    expect(failure).toMatchObject({ code: "NOT_FOUND", status: 404 });
     expect(correctionInserts()).toHaveLength(0);
   });
 
@@ -7099,9 +7186,7 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
       ],
     });
 
-    const result = await payrollExtrasService.correctPayrollPeriod(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    const result = await payrollExtrasService.correctPayrollPeriod(PERIOD_ID,
       { reason: "Fijo mal prorrateado, con vale ya descontado." },
       ACTOR,
     );
@@ -7123,9 +7208,7 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
 
   it("la corrección es una acción auditada con el motivo y los totales de las DOS versiones", async () => {
     seedWrongClosedPeriod();
-    const result = await payrollExtrasService.correctPayrollPeriod(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    const result = await payrollExtrasService.correctPayrollPeriod(PERIOD_ID,
       { reason: "El fijo se pagó completo y correspondía la parte de los días." },
       ACTOR,
     );
@@ -7136,7 +7219,6 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
       entity: "payroll_periods",
       entity_id: PERIOD_ID,
       user_id: ACTOR.userId,
-      sede_id: payrollPagedStub.SEDE_ID,
       metadata: {
         correction_id: result.correction.id,
         reason: "El fijo se pagó completo y correspondía la parte de los días.",
@@ -7146,6 +7228,7 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
         difference_total: 1_073_333,
       },
     });
+    expect(audit?.payload).not.toHaveProperty("sede_id");
     // La acción NO es la del cálculo: un auditor no puede leer "se calculó"
     // donde lo que pasó es que se corrigió una liquidación ya firmada.
     expect(AUDIT_ACTIONS.PAYROLL_PERIOD_CORRECTED).not.toBe(AUDIT_ACTIONS.PAYROLL_CALCULATED);
@@ -7170,9 +7253,7 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
       ],
     });
 
-    const result = await payrollExtrasService.correctPayrollPeriod(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    const result = await payrollExtrasService.correctPayrollPeriod(PERIOD_ID,
       { reason: "Fijo mal prorrateado." },
       ACTOR,
     );
@@ -7388,7 +7469,6 @@ describe("payroll: la pantalla dice que la corrección no mueve dinero (PA-2b)",
 describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   const ITEM_ID = "item-cl2";
@@ -7470,15 +7550,11 @@ describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
   afterEach(() => resetPayrollStubState());
 
   it("RED: hoy el abono parcial reintentado paga DOS veces (2 x entrante <= saldo)", async () => {
-    const first = await payrollExtrasService.payPayrollItem(
-      payrollPagedStub.SEDE_ID,
-      ITEM_ID,
+    const first = await payrollExtrasService.payPayrollItem(ITEM_ID,
       { idempotency_key: MARK, ...partial(30000) },
       ACTOR,
     );
-    const second = await payrollExtrasService.payPayrollItem(
-      payrollPagedStub.SEDE_ID,
-      ITEM_ID,
+    const second = await payrollExtrasService.payPayrollItem(ITEM_ID,
       { idempotency_key: MARK, ...partial(30000) },
       ACTOR,
     );
@@ -7496,15 +7572,11 @@ describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
   });
 
   it("la repetición devuelve el MISMO resultado escribiendo nada (no-op exitoso)", async () => {
-    const first = await payrollExtrasService.payPayrollItem(
-      payrollPagedStub.SEDE_ID,
-      ITEM_ID,
+    const first = await payrollExtrasService.payPayrollItem(ITEM_ID,
       { idempotency_key: MARK, ...partial(30000) },
       ACTOR,
     );
-    const repeat = await payrollExtrasService.payPayrollItem(
-      payrollPagedStub.SEDE_ID,
-      ITEM_ID,
+    const repeat = await payrollExtrasService.payPayrollItem(ITEM_ID,
       { idempotency_key: MARK, ...partial(30000) },
       ACTOR,
     );
@@ -7521,15 +7593,11 @@ describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
   it("control de no-extralimitación: dos marcas distintas son DOS abonos (y cada marca sigue siendo la suya)", async () => {
     // Un "un solo pago por ítem" global pasaría el caso anterior y estaría mal:
     // pagar en partes es el caso normal de PAY-04.
-    const first = await payrollExtrasService.payPayrollItem(
-      payrollPagedStub.SEDE_ID,
-      ITEM_ID,
+    const first = await payrollExtrasService.payPayrollItem(ITEM_ID,
       { idempotency_key: MARK, ...partial(30000) },
       ACTOR,
     );
-    const second = await payrollExtrasService.payPayrollItem(
-      payrollPagedStub.SEDE_ID,
-      ITEM_ID,
+    const second = await payrollExtrasService.payPayrollItem(ITEM_ID,
       { idempotency_key: OTHER_MARK, ...partial(30000) },
       ACTOR,
     );
@@ -7540,9 +7608,7 @@ describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
     expect(second.paid).toBe(60000);
     // Y repetir la SEGUNDA marca devuelve la SEGUNDA operación, no la primera:
     // el reconocimiento es por (ítem, marca).
-    const repeat = await payrollExtrasService.payPayrollItem(
-      payrollPagedStub.SEDE_ID,
-      ITEM_ID,
+    const repeat = await payrollExtrasService.payPayrollItem(ITEM_ID,
       { idempotency_key: OTHER_MARK, ...partial(30000) },
       ACTOR,
     );
@@ -7555,9 +7621,7 @@ describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
   });
 
   it("la carrera (misma marca entre el lookup y el INSERT) relee a la ganadora", async () => {
-    const first = await payrollExtrasService.payPayrollItem(
-      payrollPagedStub.SEDE_ID,
-      ITEM_ID,
+    const first = await payrollExtrasService.payPayrollItem(ITEM_ID,
       { idempotency_key: MARK, ...partial(30000) },
       ACTOR,
     );
@@ -7565,9 +7629,7 @@ describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
     // saltea el lookup una vez para armar exactamente esa ventana.
     payrollPagedStub.skipMarkLookupOnce = true;
 
-    const second = await payrollExtrasService.payPayrollItem(
-      payrollPagedStub.SEDE_ID,
-      ITEM_ID,
+    const second = await payrollExtrasService.payPayrollItem(ITEM_ID,
       { idempotency_key: MARK, ...partial(30000) },
       ACTOR,
     );
@@ -7583,9 +7645,7 @@ describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
 
   it("una operación de VARIAS porciones no la rechaza su propio índice único", async () => {
     // La arruga: 40% + 20% en una sola operación (una porción por método).
-    const result = await payrollExtrasService.payPayrollItem(
-      payrollPagedStub.SEDE_ID,
-      ITEM_ID,
+    const result = await payrollExtrasService.payPayrollItem(ITEM_ID,
       {
         idempotency_key: MARK,
         portions: [
@@ -7608,9 +7668,7 @@ describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
 
     // Y repetir ESA operación también es un no-op: no escribe nada y el dinero
     // vuelve exacto (el acumulado se relee).
-    const repeat = await payrollExtrasService.payPayrollItem(
-      payrollPagedStub.SEDE_ID,
-      ITEM_ID,
+    const repeat = await payrollExtrasService.payPayrollItem(ITEM_ID,
       {
         idempotency_key: MARK,
         portions: [
@@ -7635,16 +7693,12 @@ describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
     // La primera operación entra; la segunda (marca NUEVA, o sea otro intento)
     // supera el saldo y se rechaza EXACTAMENTE como antes: con marca o sin
     // ella, el tope y el redondeo son los mismos.
-    await payrollExtrasService.payPayrollItem(
-      payrollPagedStub.SEDE_ID,
-      ITEM_ID,
+    await payrollExtrasService.payPayrollItem(ITEM_ID,
       { idempotency_key: MARK, ...partial(30000) },
       ACTOR,
     );
     const failure: unknown = await payrollExtrasService
-      .payPayrollItem(
-        payrollPagedStub.SEDE_ID,
-        ITEM_ID,
+      .payPayrollItem(ITEM_ID,
         { idempotency_key: OTHER_MARK, ...partial(80000) },
         ACTOR,
       )
@@ -7662,12 +7716,10 @@ describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
     // es reabrir el defecto para ESE llamador —y la ruta REST es pública y es
     // justo la que reintenta sobre redes—. El rechazo es ruidoso (VALIDATION).
     const withoutMark: unknown = await payrollExtrasService
-      .payPayrollItem(payrollPagedStub.SEDE_ID, ITEM_ID, partial(30000), ACTOR)
+      .payPayrollItem(ITEM_ID, partial(30000), ACTOR)
       .catch((error: unknown) => error);
     const malformed: unknown = await payrollExtrasService
-      .payPayrollItem(
-        payrollPagedStub.SEDE_ID,
-        ITEM_ID,
+      .payPayrollItem(ITEM_ID,
         { idempotency_key: "no-es-un-uuid", ...partial(30000) },
         ACTOR,
       )
@@ -7750,7 +7802,6 @@ describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
 describe("payroll: CL-5 la nómina extraordinaria reintentada no paga dos veces", () => {
   const ACTOR: PayrollActor = {
     userId: "u-admin-extras",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   const EMPLOYEE_ID = payrollPagedStub.EMPLOYEE_ID;
@@ -8010,7 +8061,6 @@ describe("payroll: CL-5 la nómina extraordinaria reintentada no paga dos veces"
 describe("payroll: CL-5 la solicitud de vale reintentada no abre un segundo vale", () => {
   const ACTOR: PayrollActor = {
     userId: "u-cajero-vale",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   const EMPLOYEE_ID = payrollPagedStub.EMPLOYEE_ID;
@@ -8076,15 +8126,11 @@ describe("payroll: CL-5 la solicitud de vale reintentada no abre un segundo vale
     ];
     payrollPagedStub.tables.employees = [employeeRow(EMPLOYEE_ID), employeeRow(EMPLOYEE_2)];
     payrollPagedStub.tables.payment_methods = [METHOD];
-    payrollPagedStub.tables.voucher_settings = [
-      {
-        sede_id: payrollPagedStub.SEDE_ID,
-        max_per_day: 200000,
-        max_per_week: 400000,
-        allowed_days: null,
-        per_day_limits: null,
-      },
-    ];
+    // 072: los topes se leen de `system_settings`, una fila por ajuste.
+    payrollPagedStub.tables.system_settings = voucherSettingRows({
+      max_per_day: 200000,
+      max_per_week: 400000,
+    });
     payrollPagedStub.tables.voucher_requests = [];
     payrollPagedStub.tables.audit_logs = [];
   }
@@ -8358,7 +8404,6 @@ describe("payroll: CL-5 la solicitud de vale reintentada no abre un segundo vale
 describe("payroll: el cálculo persiste ítems y vales en UNA transacción (CL-8)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-admin-cl8",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   const VOUCHER_ID = "5c0e1f2a-3b4d-4e5f-8a9b-0c1d2e3f4a5b";
@@ -8445,9 +8490,7 @@ describe("payroll: el cálculo persiste ítems y vales en UNA transacción (CL-8
     // La ventana: la escritura que marca el vale falla DESPUÉS del upsert.
     payrollPagedStub.failVoucherFlip = "PAYROLL_VOUCHER_CONFLICT";
 
-    const outcome: unknown = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const outcome: unknown = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       {},
       ACTOR,
     ).catch((error: unknown) => error);
@@ -8465,12 +8508,12 @@ describe("payroll: el cálculo persiste ítems y vales en UNA transacción (CL-8
     seed();
     payrollPagedStub.failVoucherFlip = "PAYROLL_VOUCHER_CONFLICT";
     // La corrida que falla a mitad de camino.
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR).catch(
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR).catch(
       () => undefined,
     );
     // El reintento (la corrida siguiente).
     payrollPagedStub.failVoucherFlip = null;
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
 
     // El vale termina marcado, pero fue DESCONTADO DOS VECES: la primera quedó
     // escrita pese al fallo y la segunda es un descuento nuevo sobre el mismo
@@ -8485,9 +8528,7 @@ describe("payroll: el cálculo persiste ítems y vales en UNA transacción (CL-8
   it("GREEN: un cálculo exitoso escribe cada ítem y descuenta cada vale EXACTAMENTE una vez", async () => {
     seed();
 
-    const detail = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const detail = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       {},
       ACTOR,
     );
@@ -8510,7 +8551,7 @@ describe("payroll: el cálculo persiste ítems y vales en UNA transacción (CL-8
   it("la transacción ESCRIBE lo que el servicio calculó: ningún monto se recalcula en SQL", async () => {
     seed();
 
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
 
     // El payload que la base guardó es el que armó la aritmética de TypeScript:
     // fijo del mes completo (1.400.000), el vale descontado (100.000) y el neto
@@ -8547,9 +8588,7 @@ describe("payroll: el cálculo persiste ítems y vales en UNA transacción (CL-8
       },
     };
 
-    const outcome: unknown = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const outcome: unknown = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       {},
       ACTOR,
     ).catch((error: unknown) => error);
@@ -8569,9 +8608,7 @@ describe("payroll: el cálculo persiste ítems y vales en UNA transacción (CL-8
     // Las guardas de forma y las redes de conteo del servidor.
     payrollPagedStub.failRpcWith = "PAYROLL_INVALID";
 
-    const outcome: unknown = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const outcome: unknown = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       {},
       ACTOR,
     ).catch((error: unknown) => error);
@@ -8590,9 +8627,7 @@ describe("payroll: el cálculo persiste ítems y vales en UNA transacción (CL-8
     // tests de arriba también se cumpliría por vacuidad.
     seed({ vouchers: [], employees: [] });
 
-    const detail = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const detail = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       {},
       ACTOR,
     );
@@ -8605,7 +8640,7 @@ describe("payroll: el cálculo persiste ítems y vales en UNA transacción (CL-8
   it("control negativo: un cálculo exitoso SÍ escribe (la transacción no es un no-op)", async () => {
     seed();
 
-    await calculatePayroll(payrollPagedStub.SEDE_ID, payrollPagedStub.PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
 
     expect(payrollPagedStub.itemWrites).toHaveLength(1);
     expect(payrollPagedStub.tables.payroll_items).toHaveLength(1);
@@ -8723,7 +8758,6 @@ describe("migración 047_payroll_apply_atomic.sql (CL-8)", () => {
 describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-01)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-admin-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   const PERIOD_ID = payrollPagedStub.PERIOD_ID;
@@ -8868,9 +8902,7 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
     // caso del dueño, donde la celda de vales valía exactamente la comisión.
     seed({ invoiceSubtotal: 10_000, voucherAmount: 50_000 });
 
-    const detail = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    const detail = await calculatePayroll(PERIOD_ID,
       {},
       ACTOR,
     );
@@ -8898,13 +8930,13 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
 
   it("voucher_excess es el remanente que el tope no aplicó y es 0 cuando no hubo recorte", async () => {
     seed({ invoiceSubtotal: 10_000, voucherAmount: 50_000 });
-    await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(PERIOD_ID, {}, ACTOR);
     expect(persistedItem().voucher_excess).toBe(49_000);
 
     // Control negativo: el vale entra completo en el bruto y no genera deuda.
     resetPayrollStubState();
     seed({ invoiceSubtotal: 10_000, voucherAmount: 500 });
-    await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(PERIOD_ID, {}, ACTOR);
     expect(persistedItem().voucher_excess).toBe(0);
     expect(persistedItem().voucher_total).toBe(500);
     expect(persistedItem().deductions_vales).toBe(500);
@@ -8928,9 +8960,7 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
       ],
     });
 
-    const detail = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    const detail = await calculatePayroll(PERIOD_ID,
       {},
       ACTOR,
     );
@@ -8970,7 +9000,7 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
       ],
     });
 
-    await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(PERIOD_ID, {}, ACTOR);
 
     expect(persistedItem().other_discounts).toBe(30_000);
     expect(persistedItem().debt_remainder).toBe(0);
@@ -9000,7 +9030,7 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
       ],
     });
 
-    const detail = await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    const detail = await calculatePayroll(PERIOD_ID, {}, ACTOR);
     const item = detail.items[0];
 
     // El descuento aplicado: el vale completo y 8.000 de la deuda (lo que el
@@ -9046,10 +9076,10 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
       ],
     });
 
-    const first = await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    const first = await calculatePayroll(PERIOD_ID, {}, ACTOR);
     expect(first.items[0].other_discounts).toBe(8_000);
 
-    const second = await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    const second = await calculatePayroll(PERIOD_ID, {}, ACTOR);
     // El recálculo sigue descontando lo mismo (la deuda consumida se relee
     // porque quedó marcada con ESTE período) y NO vuelve a aplicar el remanente:
     // su origen es este mismo período, así que no es anterior a sí mismo.
@@ -9086,7 +9116,7 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
       ],
     });
 
-    const detail = await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    const detail = await calculatePayroll(PERIOD_ID, {}, ACTOR);
     const item = detail.items[0];
 
     expect(item.commissions).toBe(2_000);
@@ -9128,9 +9158,7 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
       ],
     });
 
-    const detail = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    const detail = await calculatePayroll(PERIOD_ID,
       {},
       ACTOR,
     );
@@ -9147,8 +9175,8 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
 
   it("recalcular no duplica la deuda del sobrante (guarda NOT EXISTS)", async () => {
     seed({ invoiceSubtotal: 10_000, voucherAmount: 50_000 });
-    await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
-    await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(PERIOD_ID, {}, ACTOR);
 
     expect(carryRows()).toHaveLength(1);
     expect(carryRows()[0]).toMatchObject({
@@ -9175,11 +9203,11 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
       ],
     });
 
-    const first = await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    const first = await calculatePayroll(PERIOD_ID, {}, ACTOR);
     expect(first.items[0].other_discounts).toBe(30_000);
     expect(first.items[0].net_pay).toBe(10_000);
 
-    const second = await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    const second = await calculatePayroll(PERIOD_ID, {}, ACTOR);
     // El recálculo sigue descontando la deuda que ESTE período consumió: el
     // neto no cambia y la deuda no se pierde.
     expect(second.items[0].other_discounts).toBe(30_000);
@@ -9191,11 +9219,12 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
     expect(payrollPagedStub.rpcCalls[1].args.p_carry_ids).toEqual([]);
   });
 
-  it("la deuda pendiente se lee aparte y no cruza empleados ni sedes", async () => {
+  it("la deuda pendiente se lee aparte y no cruza empleados", async () => {
     seed({ invoiceSubtotal: 10_000, voucherAmount: 50_000 });
-    await calculatePayroll(payrollPagedStub.SEDE_ID, PERIOD_ID, {}, ACTOR);
+    await calculatePayroll(PERIOD_ID, {}, ACTOR);
 
-    // Deudas ajenas con el MISMO período de origen: otro empleado y otra sede.
+    // Deuda ajena con el MISMO período de origen: la de OTRO empleado no
+    // puede aparecer en la fila de ÉSTE.
     payrollPagedStub.tables.payroll_discount_carries = [
       ...carryRows(),
       {
@@ -9206,17 +9235,9 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
         origin_period_id: PERIOD_ID,
         applied_period_id: null,
       },
-      {
-        id: "deuda-otra-sede",
-        sede_id: "88888888-8888-4888-8888-888888888888",
-        employee_id: EMPLOYEE_ID,
-        amount: 888,
-        origin_period_id: PERIOD_ID,
-        applied_period_id: null,
-      },
     ];
 
-    const detail = await getPeriodDetail(payrollPagedStub.SEDE_ID, PERIOD_ID);
+    const detail = await getPeriodDetail(PERIOD_ID);
     expect(detail.items).toHaveLength(1);
     expect(detail.items[0].pending_debt).toBe(49_000);
   });
@@ -9246,7 +9267,6 @@ describe("payroll: los vales son vales y el sobrante es deuda del empleado (NV-0
 describe("payroll: el borrado de un borrador revierte los vales y lo borra en UNA transacción (CL-9)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-admin-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   const PERIOD_ID = payrollPagedStub.PERIOD_ID;
@@ -9366,7 +9386,7 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
     payrollPagedStub.failDeletePeriod = "PAYROLL_DELETE_FAILED";
 
     const outcome: unknown = await payrollExtrasService
-      .deletePayrollPeriod(payrollPagedStub.SEDE_ID, PERIOD_ID, ACTOR)
+      .deletePayrollPeriod(PERIOD_ID, ACTOR)
       .catch((error: unknown) => error);
 
     expect(outcome).toBeInstanceOf(PayrollError);
@@ -9386,9 +9406,7 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
   it("GREEN: un borrado exitoso revierte cada vale a SU estado previo y borra el período con sus hijos", async () => {
     seedDraft();
 
-    const result = await payrollExtrasService.deletePayrollPeriod(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    const result = await payrollExtrasService.deletePayrollPeriod(PERIOD_ID,
       ACTOR,
     );
 
@@ -9417,6 +9435,7 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
       entity_id: PERIOD_ID,
       metadata: { vales_revertidos: 2 },
     });
+    expect(audit?.payload).not.toHaveProperty("sede_id");
   });
 
   it("la precondición de estado no se salta: si el período dejó de ser BORRADOR, se rechaza y no se revierte nada", async () => {
@@ -9431,7 +9450,7 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
     };
 
     const outcome: unknown = await payrollExtrasService
-      .deletePayrollPeriod(payrollPagedStub.SEDE_ID, PERIOD_ID, ACTOR)
+      .deletePayrollPeriod(PERIOD_ID, ACTOR)
       .catch((error: unknown) => error);
 
     expect(outcome).toBeInstanceOf(PayrollError);
@@ -9454,7 +9473,7 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
     };
 
     const outcome: unknown = await payrollExtrasService
-      .deletePayrollPeriod(payrollPagedStub.SEDE_ID, PERIOD_ID, ACTOR)
+      .deletePayrollPeriod(PERIOD_ID, ACTOR)
       .catch((error: unknown) => error);
 
     expect(outcome).toBeInstanceOf(PayrollError);
@@ -9492,7 +9511,7 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
     };
 
     const outcome: unknown = await payrollExtrasService
-      .deletePayrollPeriod(payrollPagedStub.SEDE_ID, PERIOD_ID, ACTOR)
+      .deletePayrollPeriod(PERIOD_ID, ACTOR)
       .catch((error: unknown) => error);
 
     expect(outcome).toBeInstanceOf(PayrollError);
@@ -9507,7 +9526,7 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
     (payrollPagedStub.tables.payroll_periods ?? [])[0].status = "cerrado";
 
     const outcome: unknown = await payrollExtrasService
-      .deletePayrollPeriod(payrollPagedStub.SEDE_ID, PERIOD_ID, ACTOR)
+      .deletePayrollPeriod(PERIOD_ID, ACTOR)
       .catch((error: unknown) => error);
 
     expect(outcome).toBeInstanceOf(PayrollError);
@@ -9522,9 +9541,7 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
     seedDraft();
     payrollPagedStub.tables.voucher_requests = [];
 
-    const result = await payrollExtrasService.deletePayrollPeriod(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    const result = await payrollExtrasService.deletePayrollPeriod(PERIOD_ID,
       ACTOR,
     );
 
@@ -9558,9 +9575,7 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
       },
     ];
 
-    const result = await payrollExtrasService.deletePayrollPeriod(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    const result = await payrollExtrasService.deletePayrollPeriod(PERIOD_ID,
       ACTOR,
     );
 
@@ -9590,9 +9605,7 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
       },
     ];
 
-    await payrollExtrasService.deletePayrollPeriod(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    await payrollExtrasService.deletePayrollPeriod(PERIOD_ID,
       ACTOR,
     );
 
@@ -9623,9 +9636,7 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
     };
     payrollPagedStub.tables.payroll_discount_carries = [ajena];
 
-    const result = await payrollExtrasService.deletePayrollPeriod(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    const result = await payrollExtrasService.deletePayrollPeriod(PERIOD_ID,
       ACTOR,
     );
 
@@ -9640,7 +9651,6 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
 describe("payroll: la corrección de un período cerrado escribe cabecera y filas en UNA transacción (CL-9)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-admin-1",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   const EMPLOYEE_ID = payrollPagedStub.EMPLOYEE_ID;
@@ -9729,9 +9739,7 @@ describe("payroll: la corrección de un período cerrado escribe cabecera y fila
   const correctCalls = () =>
     payrollPagedStub.rpcCalls.filter((call) => call.name === "payroll_correct_period_atomic");
   const correct = (reason = REASON) =>
-    payrollExtrasService.correctPayrollPeriod(
-      payrollPagedStub.SEDE_ID,
-      PERIOD_ID,
+    payrollExtrasService.correctPayrollPeriod(PERIOD_ID,
       { reason },
       ACTOR,
     );
@@ -10154,7 +10162,6 @@ describe("migración 066_payroll_carry_delete_fks.sql (PAY-01)", () => {
 describe("payroll: el tope de pagos de nómina bloquea la fila padre (CL-16)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-cl16",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   const ITEM_ID = "item-cl16";
@@ -10227,9 +10234,7 @@ describe("payroll: el tope de pagos de nómina bloquea la fila padre (CL-16)", (
     // nada, pasa, y las dos filas de 60.000 entran —el ítem pagado dos veces—.
     payrollPagedStub.capRace = { itemId: ITEM_ID, amount: 60000, method_code: "efectivo" };
     const failure: unknown = await payrollExtrasService
-      .payPayrollItem(
-        payrollPagedStub.SEDE_ID,
-        ITEM_ID,
+      .payPayrollItem(ITEM_ID,
         { idempotency_key: MARK, ...partial(60000) },
         ACTOR,
       )
@@ -10256,15 +10261,11 @@ describe("payroll: el tope de pagos de nómina bloquea la fila padre (CL-16)", (
     // Sin carrera y con el tope activo: pagar en partes es el caso normal de
     // PAY-04. Dos abonos con marcas DISTINTAS, que suman exactamente el neto, no
     // son una repetición y el tope no tiene por qué rechazarlos.
-    const first = await payrollExtrasService.payPayrollItem(
-      payrollPagedStub.SEDE_ID,
-      ITEM_ID,
+    const first = await payrollExtrasService.payPayrollItem(ITEM_ID,
       { idempotency_key: MARK, ...partial(60000) },
       ACTOR,
     );
-    const second = await payrollExtrasService.payPayrollItem(
-      payrollPagedStub.SEDE_ID,
-      ITEM_ID,
+    const second = await payrollExtrasService.payPayrollItem(ITEM_ID,
       { idempotency_key: OTHER_MARK, ...partial(40000) },
       ACTOR,
     );
@@ -10298,9 +10299,7 @@ describe("payroll: el tope de pagos de nómina bloquea la fila padre (CL-16)", (
       },
     ];
     const failure: unknown = await payrollExtrasService
-      .payPayrollItem(
-        payrollPagedStub.SEDE_ID,
-        ITEM_ID,
+      .payPayrollItem(ITEM_ID,
         { idempotency_key: MARK, ...partial(20000) },
         ACTOR,
       )
@@ -10730,7 +10729,7 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(SEDE, PERIOD_ID, EMPLEADO);
+    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
 
     // Dos líneas de la MISMA factura son UNA fila; la comisión se suma.
     expect(sources.invoices).toEqual([
@@ -10741,7 +10740,7 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
     expect(sources.vouchers).toEqual([]);
   });
 
-  it("devuelve SOLO las fuentes de este empleado (ni otro legajo ni otra sede)", async () => {
+  it("devuelve SOLO las fuentes de este empleado (ni otro legajo)", async () => {
     seed({
       items: [
         {
@@ -10762,11 +10761,10 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       vouchers: [
         { id: "vale-mio", sede_id: SEDE, employee_id: EMPLEADO, amount: 10000, request_date: "2026-01-10", status: "descontada" },
         { id: "vale-ajeno", sede_id: SEDE, employee_id: OTRO, amount: 99999, request_date: "2026-01-10", status: "descontada" },
-        { id: "vale-otra-sede", sede_id: "otra-sede", employee_id: EMPLEADO, amount: 77777, request_date: "2026-01-10", status: "descontada" },
       ],
     });
 
-    const sources = await getPayrollSettlementSources(SEDE, PERIOD_ID, EMPLEADO);
+    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
 
     expect(sources.invoices.map((row) => row.invoice_id)).toEqual(["factura-mia"]);
     expect(sources.vouchers.map((row) => row.id)).toEqual(["vale-mio"]);
@@ -10780,7 +10778,7 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(SEDE, PERIOD_ID, EMPLEADO);
+    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
 
     expect(sources).toEqual({ invoices: [], adjustment: null, vouchers: [] });
   });
@@ -10793,7 +10791,7 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(SEDE, PERIOD_ID, EMPLEADO);
+    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
 
     expect(sources).toEqual({ invoices: [], adjustment: null, vouchers: [] });
   });
@@ -10813,7 +10811,7 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(SEDE, PERIOD_ID, EMPLEADO);
+    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
 
     expect(sources.invoices).toEqual([
       { invoice_id: "factura-1", consecutive_number: 3, commission: 400000 },
@@ -10834,7 +10832,7 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(SEDE, PERIOD_ID, EMPLEADO);
+    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
 
     expect(sources.vouchers.map((row) => row.id)).toEqual([
       "vale-aprobada",
@@ -11011,7 +11009,6 @@ describe("payroll-client: el modal de facturas y vales (F6, guarda de fuente)", 
 describe("payroll: TODO ajuste manual lleva su motivo (F8)", () => {
   const ACTOR: PayrollActor = {
     userId: "u-admin-f8",
-    sedeId: payrollPagedStub.SEDE_ID,
     roles: ["admin"],
   };
   const EMPLOYEE_NAME = "Empleada F8";
@@ -11089,9 +11086,7 @@ describe("payroll: TODO ajuste manual lleva su motivo (F8)", () => {
   it("RED: un ajuste sin motivo se rechaza (VALIDATION) y el mensaje nombra al empleado", async () => {
     seed();
 
-    const outcome: unknown = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const outcome: unknown = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       { adjustments: [{ employee_id: payrollPagedStub.EMPLOYEE_ID, bonuses: 50_000 }] },
       ACTOR,
     ).catch((error: unknown) => error);
@@ -11110,18 +11105,14 @@ describe("payroll: TODO ajuste manual lleva su motivo (F8)", () => {
   it("el descuento manual también exige motivo, y un motivo en blanco cuenta como ausente", async () => {
     seed();
 
-    const withoutReason: unknown = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const withoutReason: unknown = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       { adjustments: [{ employee_id: payrollPagedStub.EMPLOYEE_ID, other_discounts: 10_000 }] },
       ACTOR,
     ).catch((error: unknown) => error);
     expect(withoutReason).toMatchObject({ code: "VALIDATION", status: 400 });
 
     // Un motivo que sólo tiene espacios no justifica nada.
-    const blank: unknown = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const blank: unknown = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       {
         adjustments: [
           { employee_id: payrollPagedStub.EMPLOYEE_ID, bonuses: 1_000, adjustment_reason: "   " },
@@ -11136,9 +11127,7 @@ describe("payroll: TODO ajuste manual lleva su motivo (F8)", () => {
   it("un motivo de más de 200 caracteres se rechaza antes de escribir", async () => {
     seed();
 
-    const outcome: unknown = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const outcome: unknown = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       {
         adjustments: [
           {
@@ -11161,9 +11150,7 @@ describe("payroll: TODO ajuste manual lleva su motivo (F8)", () => {
   it("GREEN: con motivo el ajuste se persiste, se lee de vuelta y viaja en el payload", async () => {
     seed();
 
-    const detail = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const detail = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       {
         adjustments: [
           {
@@ -11189,9 +11176,7 @@ describe("payroll: TODO ajuste manual lleva su motivo (F8)", () => {
   it("sin ajuste no se exige motivo y la columna queda NULL (el payload igual lleva la clave)", async () => {
     seed();
 
-    const detail = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const detail = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       {
         adjustments: [
           { employee_id: payrollPagedStub.EMPLOYEE_ID, bonuses: 0, other_discounts: 0 },
@@ -11211,9 +11196,7 @@ describe("payroll: TODO ajuste manual lleva su motivo (F8)", () => {
   it("un motivo sin ajuste se DESCARTA: nunca queda una justificación huérfana", async () => {
     seed();
 
-    const detail = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const detail = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       {
         adjustments: [
           {
@@ -11235,9 +11218,7 @@ describe("payroll: TODO ajuste manual lleva su motivo (F8)", () => {
   it("la identidad del neto no cambia: el motivo no entra en la aritmética", async () => {
     seed();
 
-    const detail = await calculatePayroll(
-      payrollPagedStub.SEDE_ID,
-      payrollPagedStub.PERIOD_ID,
+    const detail = await calculatePayroll(payrollPagedStub.PERIOD_ID,
       {
         adjustments: [
           {
@@ -11871,7 +11852,7 @@ describe("payroll: los ciclos pendientes con la fecha de arranque (F10, función
 
 describe("payroll: la fecha de arranque de la nómina de la sede (F10, servicio)", () => {
   const SEDE = payrollPagedStub.SEDE_ID;
-  const ACTOR: PayrollActor = { userId: "u-1", sedeId: SEDE, roles: ["admin"] };
+  const ACTOR: PayrollActor = { userId: "u-1", roles: ["admin"] };
 
   function seed(args: { periods?: Array<Record<string, unknown>>; startDate?: string | null } = {}) {
     payrollPagedStub.tables = {
@@ -11934,46 +11915,23 @@ describe("payroll: la fecha de arranque de la nómina de la sede (F10, servicio)
   beforeEach(() => resetPayrollStubState());
   afterEach(() => resetPayrollStubState());
 
-  it("configurar la fecha va y vuelve; limpiarla también, y una fecha inválida no escribe", async () => {
+  it("sin la migración 068 la lectura no configura y no se vuelve error interno", async () => {
     seed({ startDate: null });
-    expect(await getPayrollStartDate(SEDE)).toBeNull();
-    expect(await setPayrollStartDate({ payroll_start_date: "2026-10-05" }, ACTOR)).toEqual({
-      payroll_start_date: "2026-10-05",
-    });
-    expect(await getPayrollStartDate(SEDE)).toBe("2026-10-05");
-    const writes = payrollPagedStub.updates.filter((entry) => entry.table === "sedes").length;
-    const failure: unknown = await setPayrollStartDate(
-      { payroll_start_date: "05/10/2026" },
-      ACTOR,
-    ).catch((error: unknown) => error);
-    expect(failure).toBeInstanceOf(PayrollError);
-    expect(failure).toMatchObject({ code: "VALIDATION", status: 400 });
-    expect(payrollPagedStub.updates.filter((entry) => entry.table === "sedes").length).toBe(writes);
-    // Volver a «sin configurar» es un estado legal, no un error.
-    expect(await setPayrollStartDate({ payroll_start_date: null }, ACTOR)).toEqual({
-      payroll_start_date: null,
-    });
-    expect(await getPayrollStartDate(SEDE)).toBeNull();
-  });
-
-  it("sin la migración 068 la lectura no configura y la escritura avisa", async () => {
-    seed({ startDate: null });
-    // 42703 = undefined_column: la columna todavía no existe en la base.
+    // 42703 = undefined_column: la columna todavía no existe en la base. La
+    // degradación es de la LECTURA; la escritura ya no está en este módulo (la
+    // resuelve la superficie de plataforma, que responde con su propio mensaje).
     payrollPagedStub.failOn = { table: "sedes", filter: "id", code: "42703" };
     expect(await getPayrollStartDate(SEDE)).toBeNull();
-    const failure: unknown = await setPayrollStartDate(
-      { payroll_start_date: "2026-10-05" },
-      ACTOR,
-    ).catch((error: unknown) => error);
-    expect(failure).toBeInstanceOf(PayrollError);
-    expect(failure).toMatchObject({ code: "VALIDATION", status: 409 });
-    expect((failure as PayrollError).message).toContain("068");
+    // Con la columna presente, la lectura devuelve lo que la sede tenga: la
+    // fecha es de la plataforma, pero el módulo la sigue leyendo.
+    payrollPagedStub.failOn = null;
+    seed({ startDate: "2026-10-05" });
+    expect(await getPayrollStartDate(SEDE)).toBe("2026-10-05");
   });
 
   it("rechaza abrir un período anterior a la fecha, nombrando la fecha", async () => {
     seed({ startDate: "2026-10-01" });
-    const failure: unknown = await openPayrollPeriod(
-      { frequency: "semanal", cycle_end_date: "2026-09-26" },
+    const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-26" },
       ACTOR,
     ).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(PayrollError);
@@ -11986,8 +11944,7 @@ describe("payroll: la fecha de arranque de la nómina de la sede (F10, servicio)
 
   it("el PRIMER ciclo de la cadencia se abre RECORTADO a la fecha", async () => {
     seed({ startDate: "2026-10-01" });
-    const row = await openPayrollPeriod(
-      { frequency: "quincenal", cycle_end_date: "2026-10-10" },
+    const row = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "quincenal", cycle_end_date: "2026-10-10" },
       ACTOR,
     );
     expect(row).toMatchObject({
@@ -12011,8 +11968,7 @@ describe("payroll: la fecha de arranque de la nómina de la sede (F10, servicio)
       startDate: "2026-10-01",
       periods: [periodRow("p-1", "2026-11-01", "2026-11-07")],
     });
-    const failure: unknown = await openPayrollPeriod(
-      { frequency: "semanal", cycle_end_date: "2026-10-03" },
+    const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-10-03" },
       ACTOR,
     ).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(PayrollError);
@@ -12029,8 +11985,7 @@ describe("payroll: la fecha de arranque de la nómina de la sede (F10, servicio)
     ] as const;
     for (const item of cases) {
       seed({ startDate: "2026-09-01" });
-      const row = await openPayrollPeriod(
-        { frequency: item.frequency, cycle_end_date: item.cycle_end_date },
+      const row = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: item.frequency, cycle_end_date: item.cycle_end_date },
         ACTOR,
       );
       expect(row, item.frequency).toMatchObject({
@@ -12057,12 +12012,12 @@ describe("payroll: la fecha de arranque de la nómina de la sede (F10, servicio)
     };
     expect(await getPayrollStartDate(SEDE)).toBeNull();
     expect(
-      await openPayrollPeriod({ frequency: "semanal", cycle_end_date: "2026-09-05" }, ACTOR),
+      await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-05" }, ACTOR),
     ).toMatchObject({ start_date: "2026-08-30", end_date: "2026-09-05" });
     // Con la fecha en NULL tampoco hay cota: un ciclo muy anterior se abre igual.
     seed({ startDate: null });
     expect(
-      await openPayrollPeriod({ frequency: "semanal", cycle_end_date: "2026-09-05" }, ACTOR),
+      await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-05" }, ACTOR),
     ).toMatchObject({ start_date: "2026-08-30", end_date: "2026-09-05" });
   });
 
@@ -12095,14 +12050,18 @@ describe("payroll: la fecha de arranque de la nómina de la sede (F10, servicio)
     }
   });
 
-  it("la lectura y la escritura van a la columna de la 068 (guarda de fuente)", () => {
+  it("la LECTURA va a la columna de la 068 y la escritura NO quedó en este módulo (guarda de fuente)", () => {
     const service = readFileSync(
       join(process.cwd(), "src", "features", "payroll", "service.ts"),
       "utf8",
     );
     expect(service).toContain('.from("sedes")');
     expect(service).toContain('.select("id, payroll_start_date")');
-    expect(service).toContain("update({ payroll_start_date: parsed.data.payroll_start_date })");
+    // G3b: la escritura de la fecha es de la plataforma. Si volviera a haber un
+    // `UPDATE` de la columna acá, el módulo tendría una segunda puerta para
+    // cambiar de qué fecha arranca la nómina de la sede.
+    expect(service).not.toContain("setPayrollStartDate");
+    expect(service).not.toMatch(/update\(\{\s*payroll_start_date/);
   });
 });
 
@@ -12127,12 +12086,24 @@ describe("payroll: la fecha de arranque de la nómina (F10/G3b): la escritura sa
       join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
       "utf8",
     );
+    const schemas = readFileSync(
+      join(process.cwd(), "src", "features", "payroll", "schemas.ts"),
+      "utf8",
+    );
     // Control positivo: el módulo sigue exportando la LECTURA.
     expect(actions).toContain("export async function getPayrollStartDateAction");
     // G3b: la ESCRITURA salió. Ni la action, ni el formulario, ni su campo.
     expect(actions).not.toContain("setPayrollStartDateAction");
     expect(client).not.toContain("setPayrollStartDateAction");
     expect(client).not.toContain('id="payroll-start-date"');
+    // Y el CUERPO de la escritura se fue con ella: un validador sin puerta que
+    // lo use es la forma que esta guarda quiere impedir.
+    expect(schemas).not.toContain("setPayrollStartDateSchema");
+    expect(schemas).not.toContain("SetPayrollStartDateInput");
+    // Control positivo del símbolo que la plataforma SÍ valida: `payrollStart-
+    // DateSchema` es otro símbolo (el que usa `setPlatformPayrollStartDate`) y
+    // quitarlo rompería la escritura que acaba de mudarse.
+    expect(schemas).toContain("export const payrollStartDateSchema");
     // La forma del módulo: una acción borrada no puede quedar accesible.
     expect(payrollActions).not.toHaveProperty("setPayrollStartDateAction");
   });
@@ -12206,5 +12177,698 @@ describe("migración 068_payroll_start_date.sql (F10)", () => {
     expect(sql).not.toMatch(/NOT NULL/);
     // Sin DEFAULT: ninguna sede queda con una fecha que el dueño no eligió.
     expect(sql).not.toMatch(/DEFAULT/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 071_rpc_single_sede.sql: la nómina re-emite sus dos funciones de administración
+// SIN el parámetro de sede.
+//
+// LO QUE ESTA SUITE FIJA (y antes fijaba mal): 048 declaraba las dos funciones
+// con `p_sede_id` al principio de la firma y filtraba por `sede_id` en el
+// período, en los vales y en el empleado. Con la instalación de una sola sede,
+// ese parámetro es una segunda frontera dentro de una base que ya tiene una, y
+// la firma que declara la base tiene que ser EXACTAMENTE la que manda el
+// servidor: si queda un `p_sede_id` de más, el llamador nuevo falla ruidoso; si
+// queda una sobrecarga viva de la vieja, el llamador viejo sigue pasando sin
+// que nadie lo note. Por eso el archivo dropea la firma vieja ANTES de crear la
+// nueva.
+// ---------------------------------------------------------------------------
+
+describe("migración 071_rpc_single_sede.sql (nómina)", () => {
+  const path = join(process.cwd(), "supabase", "migrations", "071_rpc_single_sede.sql");
+  const raw = existsSync(path) ? readFileSync(path, "utf8").replace(/\r\n/g, "\n") : "";
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("piso anti-vacío: el archivo existe y trae DDL real", () => {
+    expect(raw.length).toBeGreaterThan(15000);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("las DOS funciones de administración se crean SIN el parámetro de sede", () => {
+    // La firma es lo que se afirma: `p_period_id` al principio y NADA de sede.
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.payroll_delete_period_atomic\(\s*p_period_id uuid,\s*p_to_approved uuid\[\],\s*p_to_pending uuid\[\]\s*\)/,
+    );
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.payroll_correct_period_atomic\(\s*p_period_id uuid,\s*p_correction jsonb,\s*p_items jsonb\s*\)/,
+    );
+    // Y el predicado de sede NO está: si volviera, la firma y el cuerpo
+    // dejarían de contar la misma historia.
+    expect(sql).not.toMatch(/payroll_(?:delete|correct)_period_atomic\(\s*p_sede_id/);
+    expect(sql).not.toContain("p_sede_id IS NULL");
+    expect(sql).not.toMatch(/\bsede_id\s*=\s*p_sede_id/);
+    expect(sql).not.toContain("p_sede_id");
+  });
+
+  it("dropea la firma VIEJA antes de crear la nueva: sin la sobrecarga no hay dos funciones", () => {
+    // El orden importa: un `CREATE OR REPLACE` con otra lista de parámetros no
+    // reemplaza nada, deja la vieja viva al lado de la nueva.
+    const dropDelete = sql.indexOf(
+      "DROP FUNCTION IF EXISTS public.payroll_delete_period_atomic(uuid, uuid, uuid[], uuid[])",
+    );
+    const dropCorrect = sql.indexOf(
+      "DROP FUNCTION IF EXISTS public.payroll_correct_period_atomic(uuid, uuid, jsonb, jsonb)",
+    );
+    const createDelete = sql.indexOf(
+      "CREATE OR REPLACE FUNCTION public.payroll_delete_period_atomic",
+    );
+    const createCorrect = sql.indexOf(
+      "CREATE OR REPLACE FUNCTION public.payroll_correct_period_atomic",
+    );
+    expect(dropDelete).toBeGreaterThan(-1);
+    expect(dropCorrect).toBeGreaterThan(-1);
+    expect(dropDelete).toBeLessThan(createDelete);
+    expect(dropCorrect).toBeLessThan(createCorrect);
+  });
+
+  it("el permiso y el search_path viajan con la firma NUEVA, y el comentario también", () => {
+    for (const signature of [
+      "payroll_delete_period_atomic(uuid, uuid[], uuid[])",
+      "payroll_correct_period_atomic(uuid, jsonb, jsonb)",
+    ]) {
+      const name = signature.slice(0, signature.indexOf("("));
+      // Un ACL sobre la firma vieja no alcanzaría a la función nueva: el
+      // permiso se concede por firma y por eso tiene que repetirse.
+      expect(sql).toContain(`ALTER FUNCTION public.${signature} SET search_path = public;`);
+      expect(sql).toContain(`REVOKE ALL ON FUNCTION public.${signature} FROM PUBLIC;`);
+      expect(sql).toContain(`REVOKE ALL ON FUNCTION public.${signature} FROM anon;`);
+      expect(sql).toContain(
+        `REVOKE ALL ON FUNCTION public.${signature} FROM authenticated;`,
+      );
+      expect(sql).toContain(`GRANT EXECUTE ON FUNCTION public.${signature} TO service_role;`);
+      // Y cada una conserva SUS redes de conteo, DICHA en su propio comentario:
+      // el cambio es de firma, no de comportamiento. El texto del COMMENT viaja
+      // como string en la línea siguiente, así que se lee con la suya.
+      const commentLines = sql.split("\n");
+      const commentAt = commentLines.findIndex((line) =>
+        line.startsWith(`COMMENT ON FUNCTION public.${name}(`),
+      );
+      const comment = commentLines.slice(commentAt, commentAt + 2).join("\n");
+      expect(commentAt).toBeGreaterThan(-1);
+      expect(comment).toContain("CL-9:");
+      if (name === "payroll_delete_period_atomic") {
+        expect(comment).toContain("PAYROLL_VOUCHER_CONFLICT");
+        expect(comment).toContain("PAYROLL_PERIOD_CONFLICT");
+        expect(comment).toContain("PERIOD_OVERLAP_AMBIGUOUS");
+      } else {
+        expect(comment).toContain("PAYROLL_CORRECTION_MISMATCH");
+        expect(comment).toContain("PERIOD_NOT_CLOSED");
+      }
+    }
+  });
+
+  it("NO borra la columna ni toca las políticas: ése es el paso irreversible de otra unidad", () => {
+    // El archivo va ANTES del borrado a propósito: mientras la columna existe,
+    // quitarle el parámetro deja honestos los puntos de llamada, y el
+    // `DROP COLUMN` queda como el último paso, sin vuelta atrás.
+    expect(sql).not.toMatch(/DROP COLUMN/i);
+    expect(sql).not.toMatch(/ALTER TABLE/i);
+    expect(sql).not.toMatch(/\bPOLICY\b/i);
+    expect(sql).not.toMatch(/ROW LEVEL SECURITY/i);
+    // Y lo dice, para que el orden de la serie no dependa de la memoria.
+    expect(raw).toContain("POR QUÉ ESTE ARCHIVO CORRE ANTES DEL BORRADO DE LA COLUMNA");
+    expect(raw).toContain("resolveSede");
+  });
+
+  it("no toca la cadena de la LIQUIDACIÓN: payroll_apply_atomic nunca llevaba p_sede_id", () => {
+    // `payroll_apply_atomic` (047, y sus versiones de 061/062/064/067) toma la
+    // sede del PERÍODO que bloquea: no hay parámetro que quitarle y este
+    // archivo no lo re-emite.
+    expect(sql).not.toContain("payroll_apply_atomic");
+  });
+});
+
+// ===================================================================== ===
+// M3b: el consecutivo y los topes de vales son AJUSTES DE LA INSTALACIÓN
+// (072_system_settings.sql)
+// ========================================================================
+//
+// Con la instalación de una sola sede, `invoice_sequences` y `voucher_settings`
+// se quedan sin clave natural (su clave primaria era `sede_id`) y el dueño
+// decidió reemplazarlas por UNA tabla de `clave`/`valor`:
+// `public.system_settings`.
+//
+// Lo que se prueba acá, en dos niveles:
+//
+//   * COMPORTAMIENTO, contra el doble de la base: el contador avanza de a uno y
+//     no devuelve un número repetido —la fila que se bloquea es la fila de la
+//     clave— y los topes se leen y se escriben por sus cuatro claves, con el
+//     valor por omisión del módulo cuando una clave no está.
+//   * ARTEFACTO, contra el texto de la migración: que la tabla sea la que se
+//     documentó, que el movimiento de datos sea idempotente y que el archivo NO
+//     borre todavía las dos tablas viejas (el borrado es de la unidad que quita
+//     `sede_id`).
+//
+// El doble del contador NO recibe del test si la fila se bloquea: lo lee del
+// archivo desplegado (como `payrollCapLocksParent` con el tope de nómina), así
+// que quitarle el `FOR UPDATE` a la 072 hace caer estas pruebas por sí solas.
+
+/** El texto de la 072, sin prosa: la detección mira sentencias y nombres. */
+const M3B_MIGRATION = "072_system_settings.sql";
+
+describe("M3b: los ajustes de la instalación viven en system_settings (072)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-1",
+    roles: ["admin"],
+  };
+  const raw072 = (): string => readFileSync(join(MIGRATIONS_DIR, M3B_MIGRATION), "utf8");
+  const sql072 = (): string =>
+    raw072()
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("--"))
+      .join("\n");
+  /** Las filas de `system_settings` que quedaron escritas, por clave. */
+  const settingRows = (): Array<Record<string, unknown>> =>
+    payrollPagedStub.tables.system_settings ?? [];
+  const settingValue = (key: string): unknown =>
+    settingRows().find((row) => row.key === key)?.value;
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  describe("el consecutivo: la fila de la clave es la que se bloquea", () => {
+    it("avanza de a uno desde el valor que quedó migrado, y la fila lo acumula", () => {
+      // Lo que deja la migración cuando `invoice_sequences` tenía 41 emitidos.
+      payrollPagedStub.tables.system_settings = [
+        { key: "invoice_sequence", value: { last_number: 41 }, updated_at: "2026-01-31T00:00:00.000Z" },
+      ];
+
+      const emitidos = [
+        reserveInvoiceSequence(),
+        reserveInvoiceSequence(),
+        reserveInvoiceSequence(),
+      ];
+
+      expect(emitidos).toEqual([42, 43, 44]);
+      // Y el sobre de la fila es el contador: no queda en 41 (el de la tabla
+      // vieja) ni en un número de más.
+      expect(settingValue("invoice_sequence")).toEqual({ last_number: 44 });
+      expect(storedInvoiceSequence()).toBe(44);
+    });
+
+    it("sin fila previa, la crea y el primer número es el 1", () => {
+      // El `INSERT … ON CONFLICT DO NOTHING` de la función: una instalación que
+      // nunca emitió no tiene fila, y eso no es un error.
+      expect(settingRows()).toEqual([]);
+
+      expect(reserveInvoiceSequence()).toBe(1);
+      expect(reserveInvoiceSequence()).toBe(2);
+      expect(settingValue("invoice_sequence")).toEqual({ last_number: 2 });
+    });
+
+    it("la fila del contador no tiene forma de sede (la instalación es de una)", () => {
+      reserveInvoiceSequence();
+      reserveInvoiceSequence();
+
+      const fila = settingRows().find((row) => row.key === "invoice_sequence")!;
+      expect(Object.keys(fila).sort()).toEqual(["key", "updated_at", "value"]);
+      expect(fila).not.toHaveProperty("sede_id");
+      expect(fila).not.toHaveProperty("last_number");
+    });
+
+    it("DOS emisores concurrentes NO se llevan el mismo número: el lock es lo que lo evita", () => {
+      // La otra transacción reservó y CONFIRMÓ su número mientras ésta esperaba
+      // en el lock de la fila.
+      expect(reserveInvoiceSequence()).toBe(1);
+      expect(storedInvoiceSequence()).toBe(1);
+
+      const emitido = reserveInvoiceSequence({ before: 1, emitted: 2 });
+
+      // Con el `FOR UPDATE` desplegado, esta lectura vio el 2 que dejó la otra y
+      // se llevó el 3. Sin ver la fila rival habría emitido el 2 también: el
+      // duplicado que la serie no puede tener (FAC-05).
+      expect(emitido).toBe(3);
+      expect(storedInvoiceSequence()).toBe(3);
+      expect(payrollPagedStub.sequenceChecks.at(-1)).toEqual({ sawRival: true, emitida: 3 });
+    });
+
+    it("control negativo del guardián: SIN el FOR UPDATE desplegado el doble repite el número", () => {
+      // El mismo escenario con el lock apagado, para probar que la prueba
+      // anterior no es vacuidad: sin bloquear la fila, el emisor que llegó
+      // segundo lee una foto anterior al commit rival y devuelve el MISMO
+      // número (y el contador tampoco avanza: su escritura se pierde).
+      payrollPagedStub.sequenceLockOverride = false;
+      reserveInvoiceSequence();
+      const emitido = reserveInvoiceSequence({ before: 1, emitted: 2 });
+
+      expect(emitido).toBe(2);
+      expect(storedInvoiceSequence()).toBe(2);
+      expect(payrollPagedStub.sequenceChecks.at(-1)).toEqual({ sawRival: false, emitida: 2 });
+    });
+
+    it("el lock y la firma salen del ARTEFACTO, no de una bandera del test", () => {
+      // La firma NO cambia: es la de 005, con la sede como parámetro, y el
+      // parámetro deja de seleccionar la fila (su retiro es de la unidad que
+      // borra `sede_id`).
+      const body = deployedNextInvoiceNumberBody();
+      expect(body).toContain("CREATE OR REPLACE FUNCTION public.next_invoice_number(p_sede_id uuid)");
+      expect(body).toContain("FOR UPDATE");
+      expect(body).not.toContain("invoice_sequences");
+      // La fila que se bloquea es la clave del contador, y el incremento ocurre
+      // en la misma función (o sea, dentro de la transacción del llamador).
+      expect(body).toContain("'invoice_sequence'");
+      expect(body).toContain("jsonb_set(value, '{last_number}'");
+      // Y el parámetro sigue declarado aunque el cuerpo no lo use.
+      expect(body).toContain("p_sede_id uuid");
+    });
+  });
+
+  describe("los topes se leen y se escriben por sus cuatro claves", () => {
+    it("cada ajuste se lee de SU fila, con el sobre que su clave declara", async () => {
+      payrollPagedStub.tables.system_settings = [
+        { key: "voucher_max_per_day", value: { amount: 200000 } },
+        { key: "voucher_max_per_week", value: { amount: 400000 } },
+        { key: "voucher_per_day_limits", value: { limits: { "3": 50000 } } },
+        { key: "voucher_allowed_days", value: { days: [1, 2, 3, 4, 5] } },
+      ];
+
+      const settings = await getVoucherSettings();
+
+      expect(settings).toEqual({
+        max_per_day: 200000,
+        max_per_week: 400000,
+        per_day_limits: { "3": 50000 },
+        allowed_days: [1, 2, 3, 4, 5],
+      });
+      // Una sola lectura, y de la tabla nueva.
+      expect(payrollPagedStub.windows.filter((w) => w.table === "system_settings")).toHaveLength(1);
+      expect(payrollPagedStub.inFilters).toContainEqual({
+        table: "system_settings",
+        column: "key",
+        count: 4,
+      });
+    });
+
+    it("una clave ausente se lee con el valor por omisión del módulo, no con un error", async () => {
+      // Sólo existe el tope diario: los otros tres ajustes son los de omisión
+      // (sin tope, sin topes por día, todos los días).
+      payrollPagedStub.tables.system_settings = [
+        { key: "voucher_max_per_day", value: { amount: 200000 } },
+      ];
+
+      const settings = await getVoucherSettings();
+
+      expect(settings).toEqual({
+        max_per_day: 200000,
+        max_per_week: null,
+        per_day_limits: null,
+        allowed_days: null,
+      });
+      // Días `null` = TODOS: pedir un vale un domingo no exige revisión, igual
+      // que cuando `allowed_days` venía nulo.
+      expect(isVoucherDayAllowed("2026-01-18", settings.allowed_days)).toBe(true);
+    });
+
+    it("una tabla VACÍA da los cuatro valores por omisión: es la instalación sin configurar", async () => {
+      const settings = await getVoucherSettings();
+
+      expect(settings).toEqual({
+        max_per_day: null,
+        max_per_week: null,
+        per_day_limits: null,
+        allowed_days: null,
+      });
+      // Sin topes, ningún vale exige aprobación por monto.
+      expect(
+        requiresVoucherApproval(
+          checkVoucherCaps({
+            dayTotal: 9_000_000,
+            weekTotal: 9_000_000,
+            requested: 1_000_000,
+            maxPerDay: settings.max_per_day,
+            maxPerWeek: settings.max_per_week,
+          }),
+        ),
+      ).toBe(false);
+    });
+
+    it("un sobre que no es el declarado se lee con el valor por omisión (no rompe la pantalla)", async () => {
+      payrollPagedStub.tables.system_settings = [
+        { key: "voucher_max_per_day", value: { monto: 200000 } },
+        { key: "voucher_max_per_week", value: "no-sobre" },
+        { key: "voucher_per_day_limits", value: { limits: { "0": 1, "9": 2, x: 3 } } },
+        { key: "voucher_allowed_days", value: { days: "lunes" } },
+      ];
+
+      const settings = await getVoucherSettings();
+
+      expect(settings.max_per_day).toBeNull();
+      expect(settings.max_per_week).toBeNull();
+      expect(settings.per_day_limits).toBeNull();
+      expect(settings.allowed_days).toBeNull();
+    });
+
+    it("guardar topes escribe UNA fila por clave, con el destino de conflicto `key`", async () => {
+      payrollPagedStub.tables.system_settings = voucherSettingRows({
+        max_per_day: 200000,
+        allowed_days: [1, 2, 3, 4, 5],
+      });
+
+      const guardado = await setVoucherLimits(
+        {
+          max_per_day: 50000,
+          max_per_week: 0,
+          per_day_limits: [{ day: 3, amount: 50000 }],
+        },
+        ACTOR,
+      );
+
+      // Las cuatro claves siguen existiendo (una fila por ajuste) y cada una con
+      // el sobre de su ajuste.
+      expect(settingRows().map((row) => row.key)).toEqual([
+        "voucher_max_per_day",
+        "voucher_max_per_week",
+        "voucher_per_day_limits",
+        "voucher_allowed_days",
+      ]);
+      expect(settingValue("voucher_max_per_day")).toEqual({ amount: 50000 });
+      // 0 = sin tope, y se guarda como null (026): es lo que ya hacía el
+      // servicio antes de escribir la fila de la sede.
+      expect(settingValue("voucher_max_per_week")).toEqual({ amount: null });
+      expect(settingValue("voucher_per_day_limits")).toEqual({ limits: { "3": 50000 } });
+      // Sin días en el POST se conserva la configuración vigente: la clave que
+      // no se manda no se toca (era el upsert de la fila única).
+      expect(settingValue("voucher_allowed_days")).toEqual({ days: [1, 2, 3, 4, 5] });
+      // Y lo que devuelve es lo que la base confirmó, leído por las mismas
+      // funciones puras que arman el sobre.
+      expect(guardado).toEqual({
+        max_per_day: 50000,
+        max_per_week: null,
+        per_day_limits: { "3": 50000 },
+        allowed_days: [1, 2, 3, 4, 5],
+      });
+    });
+
+    it("guardar sin nada configurado escribe los valores por omisión, no deja claves ausentes", async () => {
+      payrollPagedStub.tables.system_settings = [];
+
+      const guardado = await setVoucherLimits({ max_per_day: 0, max_per_week: 0 }, ACTOR);
+
+      expect(settingValue("voucher_max_per_day")).toEqual({ amount: null });
+      expect(settingValue("voucher_max_per_week")).toEqual({ amount: null });
+      expect(settingValue("voucher_per_day_limits")).toEqual({ limits: null });
+      // Los días que no se eligen se escriben como los siete: es el valor por
+      // omisión de 024 y lo que escribía la columna cuando venían nulos.
+      expect(settingValue("voucher_allowed_days")).toEqual({ days: [1, 2, 3, 4, 5, 6, 7] });
+      expect(guardado.allowed_days).toEqual([1, 2, 3, 4, 5, 6, 7]);
+      // Y el valor nuevo se lee igual por la puerta de lectura.
+      expect(await getVoucherSettings()).toEqual(guardado);
+    });
+
+    it("guardar dos veces REEMPLAZA la fila de la clave, no la duplica", async () => {
+      payrollPagedStub.tables.system_settings = voucherSettingRows({ max_per_day: 200000 });
+
+      await setVoucherLimits({ max_per_day: 50000 }, ACTOR);
+      await setVoucherLimits({ max_per_day: 90000 }, ACTOR);
+
+      const filasTope = settingRows().filter((row) => row.key === "voucher_max_per_day");
+      expect(filasTope).toHaveLength(1);
+      expect(filasTope[0].value).toEqual({ amount: 90000 });
+      expect((await getVoucherSettings()).max_per_day).toBe(90000);
+    });
+
+    it("guardar topes deja AUDITORÍA con el actor y los dos valores (el anterior y el nuevo)", async () => {
+      // Los topes deciden qué vale sale solo de caja y cuál espera aprobación:
+      // cambiarlos con la pantalla abierta es una decisión que tiene que quedar
+      // escrita, y hasta ahora no dejaba ninguna.
+      payrollPagedStub.tables.system_settings = voucherSettingRows({
+        max_per_day: 200000,
+        max_per_week: 400000,
+        per_day_limits: { "3": 50000 },
+        allowed_days: [1, 2, 3, 4, 5],
+      });
+
+      await setVoucherLimits({ max_per_day: 50000, allowed_days: [1, 3] }, ACTOR);
+
+      const audit = payrollPagedStub.inserts.find((entry) => entry.table === "audit_logs");
+      expect(audit?.payload).toMatchObject({
+        action: "voucher.limits_set",
+        entity: "system_settings",
+        // La escritura toca las CUATRO claves de `system_settings`: lo que hace
+        // ubicable el cambio es el GRUPO nombrado, y lo hace `entity_id`, no una
+        // clave del módulo ni una sede que ya no se escribe.
+        entity_id: "voucher_limits",
+        user_id: ACTOR.userId,
+        metadata: {
+          previous_max_per_day: 200000,
+          new_max_per_day: 50000,
+          // Lo que NO se manda conserva lo vigente, y eso es lo que la escritura
+          // dejó y lo que un auditor tiene que poder leer.
+          previous_max_per_week: 400000,
+          new_max_per_week: 400000,
+          previous_per_day_limits: { "3": 50000 },
+          new_per_day_limits: { "3": 50000 },
+          previous_allowed_days: [1, 2, 3, 4, 5],
+          new_allowed_days: [1, 3],
+        },
+      });
+      expect(audit?.payload).not.toHaveProperty("sede_id");
+      // Y lo que la auditoría llama «nuevo» es lo que quedó ESCRITO de verdad:
+      // el tope que se pidió, la semana que no se tocó conservada y los días
+      // elegidos, leídos otra vez por la puerta de lectura. Sin esto, un
+      // `new_*` inventado por el servicio pasaría la aserción de arriba.
+      expect(settingValue("voucher_max_per_day")).toEqual({ amount: 50000 });
+      expect(settingValue("voucher_max_per_week")).toEqual({ amount: 400000 });
+      expect(settingValue("voucher_per_day_limits")).toEqual({ limits: { "3": 50000 } });
+      expect(settingValue("voucher_allowed_days")).toEqual({ days: [1, 3] });
+      expect(await getVoucherSettings()).toEqual({
+        max_per_day: 50000,
+        max_per_week: 400000,
+        per_day_limits: { "3": 50000 },
+        allowed_days: [1, 3],
+      });
+    });
+
+    it("configurar por primera vez audit con el anterior en los DEFAULT del módulo", async () => {
+      // Una instalación que nunca configuró topes: lo anterior NO es «cero» ni
+      // una cadena vacía, es el valor por omisión del módulo (sin tope, todos
+      // los días), que es como se leía antes de que existiera la fila.
+      payrollPagedStub.tables.system_settings = [];
+
+      await setVoucherLimits({ max_per_day: 50000 }, ACTOR);
+
+      const audit = payrollPagedStub.inserts.find((entry) => entry.table === "audit_logs");
+      expect(audit?.payload).toMatchObject({
+        action: "voucher.limits_set",
+        user_id: ACTOR.userId,
+        metadata: {
+          previous_max_per_day: null,
+          new_max_per_day: 50000,
+          previous_max_per_week: null,
+          new_max_per_week: null,
+          previous_per_day_limits: null,
+          new_per_day_limits: null,
+          previous_allowed_days: null,
+          // Sin días elegidos se escriben los siete: es lo que quedó valiendo.
+          new_allowed_days: [1, 2, 3, 4, 5, 6, 7],
+        },
+      });
+    });
+
+    it("un guardado RECHAZADO no deja auditoría: no se registró un cambio que no ocurrió", async () => {
+      payrollPagedStub.tables.system_settings = voucherSettingRows({ max_per_day: 200000 });
+      payrollPagedStub.insertError = { table: "system_settings", message: "boom" };
+
+      const failure: unknown = await setVoucherLimits({ max_per_day: 50000 }, ACTOR).catch(
+        (error: unknown) => error,
+      );
+
+      expect(failure).toBeInstanceOf(PayrollError);
+      expect(payrollPagedStub.inserts.filter((entry) => entry.table === "audit_logs")).toHaveLength(0);
+    });
+
+    it("la acción sale del vocabulario cerrado y NO entra a ningún catálogo de alertas", () => {
+      expect(AUDIT_ACTIONS.VOUCHER_LIMITS_SET).toBe("voucher.limits_set");
+      // No es ninguna de las tres acciones del ciclo de un vale
+      // (pedido/aprobado/rechazado), que es lo que la bandeja de alertas mira:
+      // cambiar la política es configuración, no un desvío que alguien deba
+      // autorizar o rechazar.
+      expect(AUDIT_ACTIONS.VOUCHER_LIMITS_SET).not.toBe(AUDIT_ACTIONS.VOUCHER_REQUESTED);
+      expect(AUDIT_ACTIONS.VOUCHER_LIMITS_SET).not.toBe(AUDIT_ACTIONS.VOUCHER_APPROVED);
+      expect(AUDIT_ACTIONS.VOUCHER_LIMITS_SET).not.toBe(AUDIT_ACTIONS.VOUCHER_REJECTED);
+      // Y el catálogo de la bandeja se lee de la fuente REAL del módulo de
+      // alertas (es una lista literal, no algo que este archivo controle), con
+      // el control de que sí filtra la alerta de vale: si el catálogo saliera
+      // vacío, la ausencia de más abajo no probaría nada.
+      const alertas = readFileSync(join(process.cwd(), "src/features/alerts/schemas.ts"), "utf8");
+      const catalogo = /export const ALERT_ACTIONS = \[([\s\S]*?)\] as const;/.exec(alertas)?.[1] ?? "";
+      const alertados = [...catalogo.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+      expect(alertados).toContain(AUDIT_ACTIONS.VOUCHER_REQUESTED);
+      expect(alertados).not.toContain(AUDIT_ACTIONS.VOUCHER_LIMITS_SET);
+      // Lo mismo por la puerta que la bandeja USA de verdad al filtrar: la
+      // acción de `voucherAlertFilter`, que es la que approve/reject cierra.
+      const filtro = /VOUCHER_ALERT_ACTION = "([^"]+)"/.exec(alertas)?.[1];
+      expect(filtro).toBe(AUDIT_ACTIONS.VOUCHER_REQUESTED);
+      expect(filtro).not.toBe(AUDIT_ACTIONS.VOUCHER_LIMITS_SET);
+      for (const archivo of ["src/features/alerts/service.ts", "src/features/alerts/schemas.ts"]) {
+        const fuente = readFileSync(join(process.cwd(), archivo), "utf8");
+        expect(fuente, `${archivo} menciona la acción`).not.toContain("VOUCHER_LIMITS_SET");
+        expect(fuente, `${archivo} menciona el código`).not.toContain("voucher.limits_set");
+      }
+      // Y el servicio NO re-declara el código a mano: lo toma del vocabulario
+      // compartido, para que no se desincronicen.
+      const fuente = readFileSync(join(process.cwd(), "src/features/payroll/service.ts"), "utf8");
+      expect(fuente).toContain("AUDIT_ACTIONS.VOUCHER_LIMITS_SET");
+      expect(fuente.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "")).not.toContain(
+        '"voucher.limits_set"',
+      );
+    });
+
+    it("el top guardado manda: un vale por encima del tope diario queda pendiente", async () => {
+      // El efecto de negocio de la fila nueva, no sólo su forma: el mismo
+      // control de 006/026 que antes leía `voucher_settings`.
+      payrollPagedStub.tables.system_settings = voucherSettingRows({ max_per_day: 50000 });
+
+      const settings = await getVoucherSettings();
+      const caps = checkVoucherEligibility({
+        dayTotal: 40000,
+        weekTotal: 40000,
+        requested: 20000,
+        maxPerDay: settings.max_per_day,
+        maxPerWeek: settings.max_per_week,
+        requestDate: "2026-01-15",
+        allowedDays: settings.allowed_days,
+        perDayLimits: settings.per_day_limits,
+      });
+
+      expect(caps.overDay).toBe(true);
+      expect(caps.overWeek).toBe(false);
+      expect(caps.dayNotAllowed).toBe(false);
+      expect(requiresVoucherApproval(caps)).toBe(true);
+    });
+
+    it("los días permitidos de la clave siguen mandando sobre la elegibilidad", async () => {
+      payrollPagedStub.tables.system_settings = voucherSettingRows({ allowed_days: [1, 2, 3, 4, 5] });
+      const settings = await getVoucherSettings();
+
+      // Sábado 2026-01-17 y domingo 2026-01-18: fuera de los días configurados.
+      expect(isVoucherDayAllowed("2026-01-17", settings.allowed_days)).toBe(false);
+      expect(isVoucherDayAllowed("2026-01-18", settings.allowed_days)).toBe(false);
+      //structureEl jueves sí, y un día no permitido exige revisión aunque no haya
+      //tope configurado.
+      expect(isVoucherDayAllowed("2026-01-15", settings.allowed_days)).toBe(true);
+      expect(
+        checkVoucherEligibility({
+          dayTotal: 0,
+          weekTotal: 0,
+          requested: 1000,
+          maxPerDay: settings.max_per_day,
+          maxPerWeek: settings.max_per_week,
+          requestDate: "2026-01-17",
+          allowedDays: settings.allowed_days,
+          perDayLimits: settings.per_day_limits,
+        }).dayNotAllowed,
+      ).toBe(true);
+    });
+
+    it("el tope propio por día sigue REEMPLAZANDO al general en su día (026)", () => {
+      // Misma regla de siempre, ahora leída de dos claves distintas.
+      payrollPagedStub.tables.system_settings = voucherSettingRows({
+        max_per_day: 100000,
+        per_day_limits: { "4": 20000 },
+      });
+      const limits = readVoucherPerDaySetting(settingValue("voucher_per_day_limits"));
+
+      // 2026-01-15 es jueves (4) y 2026-01-22 también: rige el tope propio.
+      expect(resolveVoucherDayCap(100000, limits, "2026-01-15")).toBe(20000);
+      expect(resolveVoucherDayCap(100000, limits, "2026-01-22")).toBe(20000);
+      // Cualquier otro día, el general.
+      expect(resolveVoucherDayCap(100000, limits, "2026-01-16")).toBe(100000);
+    });
+  });
+
+  describe("el sobre de cada clave tiene un solo lector y un solo escritor", () => {
+    it("leer y escribir son inversos (lo guardado es lo que se vuelve a leer)", () => {
+      expect(readVoucherCapSetting(voucherCapSettingValue(50000))).toBe(50000);
+      expect(readVoucherCapSetting(voucherCapSettingValue(null))).toBeNull();
+      expect(readVoucherDaysSetting(voucherDaysSettingValue([3, 1, 1]))).toEqual([1, 3]);
+      expect(readVoucherDaysSetting(voucherDaysSettingValue(null))).toBeNull();
+      expect(readVoucherPerDaySetting(voucherPerDaySettingValue({ "3": 50000 }))).toEqual({ "3": 50000 });
+      expect(readVoucherPerDaySetting(voucherPerDaySettingValue(null))).toBeNull();
+    });
+
+    it("un tope negativo o no numérico se lee como valor por omisión, no como un tope raro", () => {
+      // El Zod ya no puede colarlos por la puerta de la escritura; un sobre
+      // corrupto en la base tampoco puede convertirse en un tope de −5 ni en un
+      // NaN que rompa las comparaciones de `checkVoucherCaps`.
+      expect(readVoucherCapSetting({ amount: -5 })).toBeNull();
+      expect(readVoucherCapSetting({ amount: "mucho" })).toBeNull();
+      expect(readVoucherCapSetting({ amount: 0 })).toBe(0);
+      expect(readVoucherCapSetting(undefined)).toBeNull();
+      expect(readVoucherCapSetting(null)).toBeNull();
+    });
+  });
+
+  describe("la 072 es idempotente y todavía no borra nada", () => {
+    it("deja el mismo esquema en cada corrida", () => {
+      const sql = sql072();
+      expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.system_settings");
+      expect(sql).toContain("key text PRIMARY KEY");
+      expect(sql).toContain("value jsonb NOT NULL DEFAULT '{}'::jsonb");
+      expect(sql).toContain("updated_at timestamptz NOT NULL DEFAULT now()");
+      // El trigger y la política se re-emiten con su `IF EXISTS`, que es lo que
+      // los deja idénticos: sin eso, la segunda corrida fallaría.
+      expect(sql).toContain("DROP TRIGGER IF EXISTS trg_system_settings_updated_at");
+      expect(sql).toContain("EXECUTE FUNCTION public.set_updated_at()");
+      expect(sql).toContain("DROP POLICY IF EXISTS pol_system_settings_sede_isolation");
+      expect(sql).toContain("CREATE OR REPLACE FUNCTION public.next_invoice_number(p_sede_id uuid)");
+    });
+
+    it("mueve los datos adelante SIN pisar lo que ya está vigente", () => {
+      const sql = sql072();
+      // Los dos movimientos de datos (contador y topes) son `DO NOTHING`: una
+      // segunda corrida NO puede rebajar el contador ni pisar una configuración
+      // que el admin cambió después de aplicada la migración.
+      const movimientos =
+        sql.match(/INSERT INTO public\.system_settings[\s\S]*?ON CONFLICT \(key\) DO NOTHING;/g) ?? [];
+      // TRES: los dos movimientos de datos (contador y topes) y el
+      // `INSERT … DO NOTHING` de la función, que por lo mismo no puede rebajar
+      // un contador que ya avanzó.
+      expect(movimientos).toHaveLength(3);
+      expect(sql).not.toMatch(/ON CONFLICT \(key\) DO UPDATE/);
+      // Y la copia nunca ESCRIBE en las tablas viejas.
+      expect(sql).not.toMatch(/UPDATE\s+public\.invoice_sequences/i);
+      expect(sql).not.toMatch(/UPDATE\s+public\.voucher_settings/i);
+      expect(sql).not.toMatch(/DELETE\s+FROM/i);
+    });
+
+    it("NO borra las dos tablas viejas ni la columna: es la unidad que quita sede_id", () => {
+      const sql = sql072();
+      expect(sql).not.toMatch(/DROP TABLE/i);
+      expect(sql).not.toMatch(/DROP COLUMN/i);
+      expect(sql).not.toMatch(/ALTER TABLE public\.(invoice_sequences|voucher_settings)/i);
+      // Y el archivo lo dice, para que el orden de la serie no dependa de la
+      // memoria de quien lo lea.
+      expect(raw072()).toContain("NO borra `invoice_sequences` ni `voucher_settings`");
+      expect(raw072()).toContain("POR QUÉ `next_invoice_number` CONSERVA SU PARÁMETRO");
+    });
+
+    it("documenta las cinco claves y el valor por omisión de cada una, con su origen", () => {
+      const raw = raw072();
+      for (const clave of [
+        "invoice_sequence",
+        "voucher_max_per_day",
+        "voucher_max_per_week",
+        "voucher_per_day_limits",
+        "voucher_allowed_days",
+      ]) {
+        expect(sql072()).toContain(`'${clave}'`);
+        expect(raw).toContain(`'${clave}'`);
+      }
+      // Los cuatro valores por omisión de la sección 3 son los de las columnas
+      // que cada ajuste reemplaza, no una decisión nueva de la migración.
+      expect(raw).toContain('{"last_number": 0}');
+      expect(raw).toContain('{"amount": null}');
+      expect(raw).toContain('{"limits": {}}');
+      expect(raw).toContain('{"days": [1..7]}');
+      // Y el motivo de la forma: una fila por ajuste, no una fila por sede.
+      expect(raw).toContain("POR QUÉ CLAVE / VALOR Y NO UNA TABLA POR AJUSTE");
+    });
   });
 });

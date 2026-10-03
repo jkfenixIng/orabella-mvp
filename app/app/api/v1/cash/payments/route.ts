@@ -39,7 +39,6 @@ export async function POST(request: NextRequest) {
     const body: unknown = await request.json().catch(() => ({}));
     const data = await registerPayment(body, {
       userId: session.userId,
-      sedeId: session.sedeId,
     });
     return ok(data, 201);
   } catch (error) {

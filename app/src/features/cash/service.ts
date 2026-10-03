@@ -36,7 +36,7 @@ import {
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
-import { requireSedeRole, resolveSede } from "@/src/shared/lib/sede";
+import { requireSedeRole } from "@/src/shared/lib/sede";
 import {
   chunkIds,
   PagedReadError,
@@ -156,7 +156,6 @@ function toCashError(error: unknown): CashError {
 
 export interface CashRegisterRow {
   id: string;
-  sede_id: string;
   name: string;
   base_configurada: number;
   is_active: boolean;
@@ -165,7 +164,6 @@ export interface CashRegisterRow {
 export interface CashShiftRow {
   id: string;
   cash_register_id: string;
-  sede_id: string;
   opened_by: string;
   closed_by: string | null;
   opened_at: string;
@@ -182,7 +180,6 @@ export interface CashShiftRow {
 
 export interface CashPaymentRow {
   id: string;
-  sede_id: string;
   cash_shift_id: string;
   invoice_id: string | null;
   method_id: string | null;
@@ -192,15 +189,14 @@ export interface CashPaymentRow {
   created_at: string;
 }
 
-const REGISTER_SELECT = "id, sede_id, name, base_configurada, is_active";
+const REGISTER_SELECT = "id, name, base_configurada, is_active";
 const SHIFT_SELECT =
-  "id, cash_register_id, sede_id, opened_by, closed_by, opened_at, closed_at, opening_base, expected_cash, counted_cash, base_left, cash_withdrawn, base_difference, status, observation";
+  "id, cash_register_id, opened_by, closed_by, opened_at, closed_at, opening_base, expected_cash, counted_cash, base_left, cash_withdrawn, base_difference, status, observation";
 const PAYMENT_SELECT =
-  "id, sede_id, cash_shift_id, invoice_id, method_id, method_code, amount, user_id, created_at";
+  "id, cash_shift_id, invoice_id, method_id, method_code, amount, user_id, created_at";
 
 export interface CashActor {
   userId: string;
-  sedeId: string;
   roles?: RoleCode[];
 }
 
@@ -216,7 +212,6 @@ export interface ShiftCountRow {
 
 export interface CashDenominationRow {
   id: string;
-  sede_id: string;
   kind: "billete" | "moneda";
   value: number;
   is_active: boolean;
@@ -224,13 +219,12 @@ export interface CashDenominationRow {
 
 // ------------------------------------------------------------ denominaciones ---
 
-/** Denominaciones activas de la sede (configurables desde el admin). */
-async function fetchDenominations(sedeId: string): Promise<CashDenominationRow[]> {
+/** Denominaciones activas (configurables desde el admin). */
+async function fetchDenominations(): Promise<CashDenominationRow[]> {
   const db = await cashDb();
   const { data, error } = await db
     .from("cash_denominations")
-    .select("id, sede_id, kind, value, is_active")
-    .eq("sede_id", sedeId)
+    .select("id, kind, value, is_active")
     .eq("is_active", true)
     .order("value", { ascending: false });
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
@@ -242,8 +236,15 @@ export const listDenominations = unstable_cache(fetchDenominations, ["cash:denom
   revalidate: 3600,
 });
 
-/** Crea o ajusta una denominación (solo admin; el gate vive en actions). */
+/**
+ * Crea o ajusta una denominación (solo admin; el gate vive en actions).
+ *
+ * `actor` se acepta por compatibilidad posicional (`src/features/cash/actions.ts`,
+ * fuera de la superficie de este cambio) y se descarta: la fila ya no lleva la
+ * columna, así que el autor no decide nada de lo que se escribe.
+ */
 export async function upsertDenomination(raw: unknown, actor: CashActor): Promise<CashDenominationRow> {
+  void actor;
   const parsed = z.object({
     id: z.uuid().optional(),
     kind: z.enum(["billete", "moneda"]),
@@ -256,7 +257,6 @@ export async function upsertDenomination(raw: unknown, actor: CashActor): Promis
   const db = await cashDb();
   const payload = {
     ...(parsed.data.id ? { id: parsed.data.id } : {}),
-    sede_id: actor.sedeId,
     kind: parsed.data.kind,
     value: roundMoney(parsed.data.value),
     ...(parsed.data.is_active !== undefined ? { is_active: parsed.data.is_active } : {}),
@@ -264,16 +264,20 @@ export async function upsertDenomination(raw: unknown, actor: CashActor): Promis
   const { data, error } = await db
     .from("cash_denominations")
     .upsert(payload, { onConflict: "id" })
-    .select("id, sede_id, kind, value, is_active")
+    .select("id, kind, value, is_active")
     .single();
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
   return data as CashDenominationRow;
 }
 
-/** Elimina una denominación (solo admin; el gate vive en actions). */
-export async function deleteDenomination(sedeId: string, id: string): Promise<void> {
+/**
+ * Elimina una denominación (solo admin; el gate vive en actions).
+ *
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
+export async function deleteDenomination(id: string): Promise<void> {
   const db = await cashDb();
-  const { error } = await db.from("cash_denominations").delete().eq("id", id).eq("sede_id", sedeId);
+  const { error } = await db.from("cash_denominations").delete().eq("id", id);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
 }
 
@@ -285,12 +289,11 @@ export async function deleteDenomination(sedeId: string, id: string): Promise<vo
  * digitales con total declarado. Devuelve totales por método.
  */
 export async function checkCounts(
-  sedeId: string,
   counts: ShiftCountInput[],
 ): Promise<Map<string, number>> {
-  const methods = await listPaymentMethods(sedeId);
+  const methods = await listPaymentMethods();
   const allowed = new Map(methods.filter((m) => m.is_active && m.arqueable).map((m) => [m.code, m]));
-  const denominations = new Set((await listDenominations(sedeId)).map((d) => Number(d.value)));
+  const denominations = new Set((await listDenominations()).map((d) => Number(d.value)));
   const byMethod = new Map<string, ShiftCountInput[]>();
   for (const line of counts) {
     const method = allowed.get(line.method_code);
@@ -918,26 +921,27 @@ async function previousCloseTotals(
 
 // --------------------------------------------------------------- registros ---
 
-/** Lista las cajas de la sede (el MVP opera la "Caja única"). */
-export async function listRegisters(sedeId: string): Promise<CashRegisterRow[]> {
+/** Lista las cajas (el MVP opera la "Caja única"). */
+export async function listRegisters(): Promise<CashRegisterRow[]> {
   const db = await cashDb();
   const { data, error } = await db
     .from("cash_registers")
     .select(REGISTER_SELECT)
-    .eq("sede_id", sedeId)
     .order("created_at");
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
   return (data ?? []) as CashRegisterRow[];
 }
 
 /**
- * Resuelve la caja: por id (verificando sede) o la única activa de la
- * sede. Si la sede aún no tiene caja (sede creada tras la migración),
+ * Resuelve la caja: por id o la única activa.
+ * Si todavía no hay caja (instalación creada después de la migración),
  * la crea con base 200 000 (misma semilla que 006_cash.sql).
+ *
+ * La fila de `sedes` no decide qué caja es la de la instalación y el módulo no
+ * escribe la columna, así que esta resolución no recibe ni compara ninguna sede.
  */
 async function resolveRegister(
   db: DbClient,
-  sedeId: string,
   registerId?: string,
 ): Promise<CashRegisterRow> {
   if (registerId) {
@@ -948,18 +952,11 @@ async function resolveRegister(
       .maybeSingle();
     if (error) throw new CashError("INTERNAL", "Error interno.", 500);
     if (!data) throw new CashError("NOT_FOUND", "Caja no encontrada.", 404);
-    const row = data as CashRegisterRow;
-    try {
-      resolveSede(sedeId, row.sede_id);
-    } catch (error) {
-      throw toCashError(error);
-    }
-    return row;
+    return data as CashRegisterRow;
   }
   const { data, error } = await db
     .from("cash_registers")
     .select(REGISTER_SELECT)
-    .eq("sede_id", sedeId)
     .eq("is_active", true)
     .order("created_at")
     .limit(1)
@@ -968,20 +965,19 @@ async function resolveRegister(
   if (data) return data as CashRegisterRow;
   const { data: created, error: createError } = await db
     .from("cash_registers")
-    .insert({ sede_id: sedeId, name: "Caja única", base_configurada: 200000 })
+    .insert({ name: "Caja única", base_configurada: 200000 })
     .select(REGISTER_SELECT)
     .single();
   if (createError || !created) throw new CashError("INTERNAL", "Error interno.", 500);
   return created as CashRegisterRow;
 }
 
-/** Turno abierto de la sede (uno a la vez por caja, CAJ-01). */
-export async function getOpenShift(sedeId: string): Promise<CashShiftRow | null> {
+/** Turno abierto (uno a la vez por caja, CAJ-01). */
+export async function getOpenShift(): Promise<CashShiftRow | null> {
   const db = await cashDb();
   const { data, error } = await db
     .from("cash_shifts")
     .select(SHIFT_SELECT)
-    .eq("sede_id", sedeId)
     .eq("status", "abierto")
     .order("opened_at", { ascending: false })
     .limit(1)
@@ -990,11 +986,15 @@ export async function getOpenShift(sedeId: string): Promise<CashShiftRow | null>
   return (data as CashShiftRow | null) ?? null;
 }
 
-/** Turno abierto con nombre del que lo abrió (para validaciones de facturación). */
-export async function getOpenShiftWithOpener(sedeId: string): Promise<(CashShiftRow & { opener_name: string | null }) | null> {
+/**
+ * Turno abierto con nombre del que lo abrió (para validaciones de facturación).
+ *
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
+export async function getOpenShiftWithOpener(): Promise<(CashShiftRow & { opener_name: string | null }) | null> {
   // Dos queries simples a propósito: cash_shifts tiene DOS FK a users
   // (opened_by y closed_by) y PostgREST no desambigua `users!inner`.
-  const shift = await getOpenShift(sedeId);
+  const shift = await getOpenShift();
   if (!shift) return null;
   const db = await cashDb();
   const { data: user, error } = await db
@@ -1009,7 +1009,7 @@ export async function getOpenShiftWithOpener(sedeId: string): Promise<(CashShift
   };
 }
 
-async function getShiftOrThrow(db: DbClient, sedeId: string, id: string): Promise<CashShiftRow> {
+async function getShiftOrThrow(db: DbClient, id: string): Promise<CashShiftRow> {
   const { data, error } = await db
     .from("cash_shifts")
     .select(SHIFT_SELECT)
@@ -1017,13 +1017,7 @@ async function getShiftOrThrow(db: DbClient, sedeId: string, id: string): Promis
     .maybeSingle();
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
   if (!data) throw new CashError("NOT_FOUND", "Turno no encontrado.", 404);
-  const row = data as CashShiftRow;
-  try {
-    resolveSede(sedeId, row.sede_id);
-  } catch (error) {
-    throw toCashError(error);
-  }
-  return row;
+  return data as CashShiftRow;
 }
 
 // ----------------------------------------------------------------- apertura ---
@@ -1051,7 +1045,7 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
   const input: OpenShiftInput = parsed.data;
   const db = await cashDb();
   try {
-    const register = await resolveRegister(db, actor.sedeId, input.cash_register_id);
+    const register = await resolveRegister(db, input.cash_register_id);
 
     const { data: open, error: openError } = await db
       .from("cash_shifts")
@@ -1074,7 +1068,7 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     // close totals only when they exist. Mismatches are recorded and alert
     // administrators (except on the very first open) while the shift opens
     // anyway so the business never stops.
-    const declared = await checkCounts(actor.sedeId, input.counts);
+    const declared = await checkCounts(input.counts);
     const isFirstOpen = prev === null;
     const mismatches: Array<{ method_code: string; expected: number; declared: number }> = [];
     const cashDeclared = declared.get("efectivo") ?? 0;
@@ -1108,7 +1102,6 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     // `countLines`); el RPC sólo ESCRIBE lo que recibe y devuelve el turno
     // escrito, con las mismas columnas que el servicio leía con SHIFT_SELECT.
     const { data: created, error: createError } = await db.rpc("cash_open_shift_atomic", {
-      p_sede_id: actor.sedeId,
       p_register_id: register.id,
       p_opened_by: actor.userId,
       p_opening_base: openingBase,
@@ -1135,7 +1128,6 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     // review state can be joined from the day/history views.
     if (mismatches.length > 0 && !isFirstOpen) {
       await writeAudit({
-        sede_id: actor.sedeId,
         user_id: actor.userId,
         action: AUDIT_ACTIONS.SHIFT_OPEN_MISMATCH,
         entity: "cash_shifts",
@@ -1233,7 +1225,6 @@ async function findInvoicePaymentsByIdempotencyKey(
  */
 async function repeatedCollectionResult(
   db: DbClient,
-  actor: CashActor,
   invoiceId: string,
   winner: InvoicePaymentRow,
 ): Promise<PaymentResult> {
@@ -1245,10 +1236,10 @@ async function repeatedCollectionResult(
     // devolver, así que se grita en vez de inventar uno.
     throw new CashError("INTERNAL", "Error interno.", 500);
   }
-  const detail = await getInvoiceDetail(actor.sedeId, invoiceId).catch((error) => {
+  const detail = await getInvoiceDetail(invoiceId).catch((error) => {
     throw toCashError(error);
   });
-  const shift = await getShiftOrThrow(db, actor.sedeId, shiftId);
+  const shift = await getShiftOrThrow(db, shiftId);
   const { data, error } = await db
     .from("payments")
     .select(PAYMENT_SELECT)
@@ -1395,8 +1386,8 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
   const db = await cashDb();
   try {
     const shift = input.cash_shift_id
-      ? await getShiftOrThrow(db, actor.sedeId, input.cash_shift_id)
-      : await getOpenShift(actor.sedeId).then((row) => {
+      ? await getShiftOrThrow(db, input.cash_shift_id)
+      : await getOpenShift().then((row) => {
           if (!row) {
             throw new CashError(
               "NO_OPEN_SHIFT",
@@ -1410,7 +1401,7 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
       throw new CashError("SHIFT_CLOSED", "El turno ya está cerrado.", 409);
     }
 
-    const methods = await listPaymentMethods(actor.sedeId).catch((error) => {
+    const methods = await listPaymentMethods().catch((error) => {
       throw toCashError(error);
     });
     const method = methods.find((row) => row.is_active && row.code === input.method_code);
@@ -1440,7 +1431,7 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
     const cardFee = splitGrossCardFee(gross, feePercent);
 
     if (input.invoice_id) {
-      const detail = await getInvoiceDetail(actor.sedeId, input.invoice_id).catch((error) => {
+      const detail = await getInvoiceDetail(input.invoice_id).catch((error) => {
         throw toCashError(error);
       });
       if (detail.invoice.status === "Anulada") {
@@ -1472,7 +1463,7 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
       // se reconoce en vez de confundirse con un cobro nuevo.
       const repeated = await findInvoicePaymentsByIdempotencyKey(db, input.invoice_id, mark);
       if (repeated.length > 0) {
-        return repeatedCollectionResult(db, actor, input.invoice_id, repeated[0]);
+        return repeatedCollectionResult(db, input.invoice_id, repeated[0]);
       }
       invoiceStatus = detail.invoice.status;
       invoiceShiftId = detail.invoice.cash_shift_id;
@@ -1579,7 +1570,6 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
       // 042 no aplica acá). Es la barrera final de la carrera, con el índice
       // único parcial de 042, que ahora corre DENTRO de la transacción.
       const { data: written, error: payError } = await db.rpc("cash_invoice_payment_atomic", {
-        p_sede_id: actor.sedeId,
         p_shift_id: shift.id,
         p_invoice_id: input.invoice_id,
         p_user_id: actor.userId,
@@ -1649,7 +1639,7 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
           // y sólo escribe si el servicio lo decidió.
           const winner = await findInvoicePaymentsByIdempotencyKey(db, input.invoice_id, mark);
           if (winner.length > 0) {
-            return repeatedCollectionResult(db, actor, input.invoice_id, winner[0]);
+            return repeatedCollectionResult(db, input.invoice_id, winner[0]);
           }
           // Sin cobro con esa marca, el rechazo es el de siempre: el tope.
           if (code === "P0001") {
@@ -1706,7 +1696,6 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
       const { data: payment, error: paymentError } = await db
         .from("payments")
         .insert({
-          sede_id: actor.sedeId,
           cash_shift_id: shift.id,
           invoice_id: null,
           method_id: method.id,
@@ -1784,8 +1773,10 @@ export interface CloseShiftResult {
   vales: number;
 }
 
+/**
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
 export async function closeShift(
-  sedeId: string,
   id: string,
   raw: unknown,
   actor: CashActor,
@@ -1797,7 +1788,7 @@ export async function closeShift(
   const input: CloseShiftInput = parsed.data;
   const db = await cashDb();
   try {
-    const shift = await getShiftOrThrow(db, sedeId, id);
+    const shift = await getShiftOrThrow(db, id);
     if (shift.status !== "abierto") {
       throw new CashError("SHIFT_ALREADY_CLOSED", "El turno ya está cerrado.", 409);
     }
@@ -1811,7 +1802,7 @@ export async function closeShift(
     } catch (error) {
       throw toCashError(error);
     }
-    const register = await resolveRegister(db, sedeId, shift.cash_register_id);
+    const register = await resolveRegister(db, shift.cash_register_id);
     try {
       assertCloseInput({ countedCash: input.counted_cash });
     } catch (error) {
@@ -1921,7 +1912,7 @@ export async function closeShift(
 
     // El conteo de efectivo sale del detalle por denominación (el sistema
     // calcula; el total declarado debe cuadrar con el detalle).
-    const declared = await checkCounts(sedeId, input.counts);
+    const declared = await checkCounts(input.counts);
     const countedFromDetail = declared.get("efectivo") ?? 0;
     if (!moneyEquals(countedFromDetail, input.counted_cash)) {
       throw new CashError("COUNT_MISMATCH", "El conteo no cuadra con el detalle por denominación.", 422);
@@ -1968,7 +1959,6 @@ export async function closeShift(
     // `computeCashClose`, y cada línea del conteo de `checkCounts`; el RPC sólo
     // ESCRIBE lo que recibe y devuelve el turno escrito.
     const { data: updated, error: updateError } = await db.rpc("cash_close_shift_atomic", {
-      p_sede_id: sedeId,
       p_shift_id: shift.id,
       p_closed_by: actor.userId,
       p_closed_at: new Date().toISOString(),
@@ -2023,7 +2013,6 @@ export async function closeShift(
     }
     const closed = updated as CashShiftRow;
     await writeAudit({
-      sede_id: sedeId,
       user_id: actor.userId,
       action: AUDIT_ACTIONS.SHIFT_CLOSED,
       entity: "cash_shifts",
@@ -2046,7 +2035,6 @@ export async function closeShift(
     });
     if (methodDifferences.length > 0) {
       await writeAudit({
-        sede_id: sedeId,
         user_id: actor.userId,
         action: AUDIT_ACTIONS.SHIFT_CLOSE_MISMATCH,
         entity: "cash_shifts",
@@ -2064,8 +2052,10 @@ export async function closeShift(
  * CASH: actualiza la base configurada de una caja (solo admin; el gate vive
  * en actions). Queda rastro de auditoría con el valor anterior y el nuevo.
  */
+/**
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
 export async function updateRegisterBase(
-  sedeId: string,
   registerId: string,
   base: number,
   actor: CashActor,
@@ -2074,7 +2064,7 @@ export async function updateRegisterBase(
     throw new CashError("VALIDATION", "Base inválida.", 400);
   }
   const db = await cashDb();
-  const register = await resolveRegister(db, sedeId, registerId);
+  const register = await resolveRegister(db, registerId);
   const previous = Number(register.base_configurada);
   const { data: updated, error } = await db
     .from("cash_registers")
@@ -2084,7 +2074,6 @@ export async function updateRegisterBase(
     .single();
   if (error || !updated) throw new CashError("INTERNAL", "Error interno.", 500);
   await writeAudit({
-    sede_id: sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.REGISTER_BASE_UPDATED,
     entity: "cash_registers",
@@ -2117,8 +2106,10 @@ export interface RecountShiftResult {
   recount: ShiftRecountRow;
 }
 
+/**
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
 export async function recountClosedShift(
-  sedeId: string,
   id: string,
   raw: unknown,
   actor: CashActor,
@@ -2128,7 +2119,7 @@ export async function recountClosedShift(
     throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const db = await cashDb();
-  const shift = await getShiftOrThrow(db, sedeId, id);
+  const shift = await getShiftOrThrow(db, id);
   if (shift.status !== "cerrado") {
     throw new CashError("VALIDATION", "Solo se recontán turnos cerrados.", 400);
   }
@@ -2145,11 +2136,11 @@ export async function recountClosedShift(
       409,
     );
   }
-  const register = await resolveRegister(db, sedeId, shift.cash_register_id);
+  const register = await resolveRegister(db, shift.cash_register_id);
   // El reconteo es un conteo COMPLETO: mismas reglas que el cierre (métodos
   // arqueables completos, efectivo por denominación). `checkCounts` devuelve el
   // total por método; el efectivo declarado debe cuadrar con su detalle.
-  const declared = await checkCounts(sedeId, parsed.data.counts);
+  const declared = await checkCounts(parsed.data.counts);
   const countedFromDetail = declared.get("efectivo") ?? 0;
   if (!moneyEquals(countedFromDetail, parsed.data.counted_cash)) {
     throw new CashError("COUNT_MISMATCH", "El reconteo no cuadra con el detalle por denominación.", 422);
@@ -2176,7 +2167,6 @@ export async function recountClosedShift(
   // `checkCounts`; el RPC sólo ESCRIBE lo que recibe y devuelve el reconteo
   // escrito, con las mismas columnas que el servicio leía con RECOUNT_SELECT.
   const { data: inserted, error } = await db.rpc("cash_recount_shift_atomic", {
-    p_sede_id: sedeId,
     p_shift_id: shift.id,
     p_recounted_by: actor.userId,
     p_recount: {
@@ -2219,7 +2209,6 @@ export async function recountClosedShift(
   }
   const recount = inserted as ShiftRecountRow;
   await writeAudit({
-    sede_id: sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.SHIFT_RECOUNTED,
     entity: "cash_shifts",
@@ -2310,7 +2299,7 @@ export interface DayView {
  * dejada, recogido, diferencias). El acumulado cuadra con la suma de
  * turnos (accumulateDayTotals); el contado suma solo turnos cerrados.
  */
-export async function getDayView(sedeId: string, raw: unknown): Promise<DayView> {
+export async function getDayView(raw: unknown): Promise<DayView> {
   const parsed = dayViewSchema.safeParse(raw);
   if (!parsed.success) {
     throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
@@ -2321,7 +2310,6 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
   const { data: shifts, error } = await db
     .from("cash_shifts")
     .select(SHIFT_SELECT)
-    .eq("sede_id", sedeId)
     .gte("opened_at", from)
     .lte("opened_at", to)
     .order("opened_at")
@@ -2365,7 +2353,7 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
     rows.map((row) => row.id),
   );
   const closedIds = rows.filter((row) => row.status === "cerrado").map((row) => row.id);
-  const reviews = await getShiftReviews(sedeId, closedIds);
+  const reviews = await getShiftReviews(closedIds);
   const payoutMaps = await fetchPayoutTotals(
     db,
     rows.map((row) => row.id),
@@ -2433,7 +2421,7 @@ export async function getDayView(sedeId: string, raw: unknown): Promise<DayView>
     };
   });
 
-  const registers = await listRegisters(sedeId);
+  const registers = await listRegisters();
   return {
     fecha,
     register: registers[0] ?? null,
@@ -2466,7 +2454,7 @@ export interface HistoryResult {
  * paginado en servidor de a HISTORY_PAGE_SIZE para que ningún rango
  * esconda turnos). La página /cash lo pide bajo demanda con el filtro.
  */
-export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryResult> {
+export async function getHistory(raw: unknown): Promise<HistoryResult> {
   const parsed = historySchema.safeParse(raw);
   if (!parsed.success) {
     throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
@@ -2477,7 +2465,6 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
   const { count, error: countError } = await db
     .from("cash_shifts")
     .select("id", { count: "exact", head: true })
-    .eq("sede_id", sedeId)
     .gte("opened_at", from)
     .lte("opened_at", to);
   if (countError) throw new CashError("INTERNAL", "Error interno.", 500);
@@ -2486,7 +2473,6 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
   const { data: shifts, error } = await db
     .from("cash_shifts")
     .select(SHIFT_SELECT)
-    .eq("sede_id", sedeId)
     .gte("opened_at", from)
     .lte("opened_at", to)
     .order("opened_at", { ascending: false })
@@ -2529,7 +2515,7 @@ export async function getHistory(sedeId: string, raw: unknown): Promise<HistoryR
     rows.map((row) => row.id),
   );
   const historyClosedIds = rows.filter((row) => row.status === "cerrado").map((row) => row.id);
-  const historyReviews = await getShiftReviews(sedeId, historyClosedIds);
+  const historyReviews = await getShiftReviews(historyClosedIds);
   const historyPayoutMaps = await fetchPayoutTotals(
     db,
     rows.map((row) => row.id),

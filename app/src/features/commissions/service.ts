@@ -38,11 +38,6 @@ async function commissionsDb() {
 
 type DbClient = Awaited<ReturnType<typeof commissionsDb>>;
 
-export interface CommissionActor {
-  userId: string;
-  sedeId: string;
-}
-
 function validationMessage(error: { issues: Array<{ message: string }> }): string {
   return error.issues[0]?.message ?? "Datos inválidos.";
 }
@@ -50,15 +45,14 @@ function validationMessage(error: { issues: Array<{ message: string }> }): strin
 // ------------------------------------------------------------------ reglas ---
 
 const RULE_SELECT =
-  "id, sede_id, item_type, item_id, employee_id, percent, amount, is_active";
+  "id, item_type, item_id, employee_id, percent, amount, is_active";
 
-/** Reglas de la sede (filtro opcional por ítem o empleado). */
+/** Reglas (filtro opcional por ítem o empleado). */
 export async function listCommissionRules(
-  sedeId: string,
   filters: { item_type?: string; item_id?: string; employee_id?: string } = {},
 ): Promise<CommissionRuleRow[]> {
   const db = await commissionsDb();
-  let query = db.from("commission_rules").select(RULE_SELECT).eq("sede_id", sedeId);
+  let query = db.from("commission_rules").select(RULE_SELECT);
   if (filters.item_type) query = query.eq("item_type", filters.item_type);
   if (filters.item_id) query = query.eq("item_id", filters.item_id);
   if (filters.employee_id) query = query.eq("employee_id", filters.employee_id);
@@ -69,12 +63,26 @@ export async function listCommissionRules(
 
 /**
  * Crea o ajusta la regla de un (ítem × empleado). Solo admin (el gate
- * vive en actions). Valida que ítem y empleado existan en la sede.
+ * vive en actions). Valida que ítem y empleado existan.
+ *
+ * `onConflict: "item_type,item_id,employee_id"` — la clave es de INSTALACIÓN,
+ * sin `sede_id`. La inferencia de `ON CONFLICT` exige coincidencia EXACTA con
+ * las columnas de un índice único, así que el orden de esta serie es: PRIMERO
+ * el índice, DESPUÉS el código. Por eso la migración
+ * `075_commission_rule_install_key.sql` declara
+ * `uq_commission_rule_install_key (item_type, item_id, employee_id)` y esta
+ * línea viene con ella; mandar el conjunto viejo contra un esquema sin ese
+ * índice termina en 42P10 («no unique or exclusion constraint matching the ON
+ * CONFLICT specification») en cada alta y cada edición de regla.
+ *
+ * `uq_commission_rule (sede_id, item_type, item_id, employee_id)` —el índice
+ * de 016— SIGUE EN PIE: quitarlo acá abriría una ventana de despliegue en la
+ * que una versión anterior de este código no tenga contra qué inferir. Se borra
+ * en la migración final de una sola sede (M3c), junto con la columna; queda
+ * anotado en el encabezado de esa migración, en la sección 3 de la 075 y en
+ * «LO QUE ESTE ARCHIVO NO TOCA» de la 074.
  */
-export async function upsertCommissionRule(
-  raw: unknown,
-  actor: CommissionActor,
-): Promise<CommissionRuleRow> {
+export async function upsertCommissionRule(raw: unknown): Promise<CommissionRuleRow> {
   const parsed = commissionRuleSchema.safeParse(raw);
   if (!parsed.success) {
     throw new CommissionError("VALIDATION", validationMessage(parsed.error), 400);
@@ -87,7 +95,6 @@ export async function upsertCommissionRule(
     .from(itemTable)
     .select("id")
     .eq("id", input.item_id)
-    .eq("sede_id", actor.sedeId)
     .maybeSingle();
   if (itemError) throw new CommissionError("INTERNAL", "Error interno.", 500);
   if (!item) throw new CommissionError("NOT_FOUND", "Ítem no encontrado en esta sede.", 404);
@@ -96,7 +103,6 @@ export async function upsertCommissionRule(
     .from("employees")
     .select("id")
     .eq("id", input.employee_id)
-    .eq("sede_id", actor.sedeId)
     .maybeSingle();
   if (employeeError) throw new CommissionError("INTERNAL", "Error interno.", 500);
   if (!employee) throw new CommissionError("NOT_FOUND", "Empleado no encontrado en esta sede.", 404);
@@ -106,7 +112,6 @@ export async function upsertCommissionRule(
     .upsert(
       {
         ...(input.id ? { id: input.id } : {}),
-        sede_id: actor.sedeId,
         item_type: input.item_type,
         item_id: input.item_id,
         employee_id: input.employee_id,
@@ -114,7 +119,7 @@ export async function upsertCommissionRule(
         amount: input.amount ?? null,
         ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
       },
-      { onConflict: "sede_id,item_type,item_id,employee_id" },
+      { onConflict: "item_type,item_id,employee_id" },
     )
     .select(RULE_SELECT)
     .single();
@@ -128,17 +133,13 @@ export async function upsertCommissionRule(
   return data as CommissionRuleRow;
 }
 
-/** Elimina una regla (solo admin, acotado a la sede). */
-export async function deleteCommissionRule(
-  sedeId: string,
-  id: string,
-): Promise<{ id: string }> {
+/** Elimina una regla (solo admin). */
+export async function deleteCommissionRule(id: string): Promise<{ id: string }> {
   const db = await commissionsDb();
   const { data, error } = await db
     .from("commission_rules")
     .delete()
     .eq("id", id)
-    .eq("sede_id", sedeId)
     .select("id")
     .maybeSingle();
   if (error) throw new CommissionError("INTERNAL", "Error interno.", 500);
@@ -147,6 +148,11 @@ export async function deleteCommissionRule(
 }
 
 // ------------------------------------------------------------------- ganado ---
+
+/** El que paga la comisión: sólo su identidad. */
+export interface CommissionActor {
+  userId: string;
+}
 
 export interface EarnedCommission {
   baseSubtotal: number;
@@ -198,7 +204,6 @@ function assertInvoicePaid(status: string): void {
  * (`immediateEarned`, solo origen comisión por ítem).
  */
 export async function earnedCommissionFor(
-  sedeId: string,
   invoiceId: string,
   employeeId: string,
 ): Promise<EarnedCommission> {
@@ -207,7 +212,6 @@ export async function earnedCommissionFor(
     .from("invoices")
     .select("id, status")
     .eq("id", invoiceId)
-    .eq("sede_id", sedeId)
     .maybeSingle();
   if (invoiceError) throw new CommissionError("INTERNAL", "Error interno.", 500);
   if (!invoice) throw new CommissionError("NOT_FOUND", "Factura no encontrada.", 404);
@@ -236,7 +240,6 @@ export async function earnedCommissionFor(
   const { data: rules, error: rulesError } = await db
     .from("commission_rules")
     .select("item_type, item_id, percent, amount")
-    .eq("sede_id", sedeId)
     .eq("employee_id", employeeId)
     .eq("is_active", true);
   if (rulesError) throw new CommissionError("INTERNAL", "Error interno.", 500);
@@ -256,7 +259,6 @@ export async function earnedCommissionFor(
     .from("employees")
     .select("pay_type, commission_percent")
     .eq("id", employeeId)
-    .eq("sede_id", sedeId)
     .maybeSingle();
   if (employeeError) throw new CommissionError("INTERNAL", "Error interno.", 500);
   const emp = (employee ?? null) as { pay_type: string; commission_percent: number | string | null } | null;
@@ -323,7 +325,6 @@ export async function earnedCommissionFor(
 
 /** Total ya pagado de inmediato por (factura, empleado). */
 export async function immediatePaidTotal(
-  sedeId: string,
   invoiceId: string,
   employeeId: string,
 ): Promise<number> {
@@ -331,7 +332,6 @@ export async function immediatePaidTotal(
   const { data, error } = await db
     .from("commission_payouts")
     .select("amount")
-    .eq("sede_id", sedeId)
     .eq("invoice_id", invoiceId)
     .eq("employee_id", employeeId);
   if (error) throw new CommissionError("INTERNAL", "Error interno.", 500);
@@ -343,7 +343,7 @@ export async function immediatePaidTotal(
 // -------------------------------------------------------------------- pagos ---
 
 const PAYOUT_SELECT =
-  "id, sede_id, employee_id, invoice_id, cash_shift_id, method_code, base_subtotal, percent_applied, fixed_applied, earned_immediate, amount, paid_by, paid_at";
+  "id, employee_id, invoice_id, cash_shift_id, method_code, base_subtotal, percent_applied, fixed_applied, earned_immediate, amount, paid_by, paid_at";
 
 /**
  * CL-5: la fila de `commission_payouts` que YA se registró con esa marca, DENTRO
@@ -361,10 +361,10 @@ const PAYOUT_SELECT =
  * este lookup y la clave del índice son el mismo conjunto, así que este lookup
  * no puede devolver una fila que el índice no habría bloqueado.
  *
- * La sede NO entra en la clave porque no agrega identidad: la factura pertenece
- * a una sola sede y el servicio la resuelve dentro de la del actor (una factura
- * ajena es NOT_FOUND en `earnedCommissionFor`), así que este lookup corre
- * DESPUÉS de esa validación y no puede devolver el pago de otra sede.
+ * La sede NO entra en la clave porque no agrega identidad: la factura es el
+ * registro de la operación (una factura ajena es NOT_FOUND en
+ * `earnedCommissionFor`), así que este lookup corre DESPUÉS de esa validación y
+ * no puede devolver el pago de otra factura.
  */
 async function findCommissionPayoutByIdempotencyKey(
   db: DbClient,
@@ -398,8 +398,8 @@ async function findCommissionPayoutByIdempotencyKey(
  *
  * CL-5 (idempotencia): el orden empieza por la MARCA del intento
  * (`idempotency_key`, columna e índice único parcial de la 044), DESPUÉS de
- * `earnedCommissionFor` —que es lo que valida el par dentro de la sede del
- * actor, así el lookup no puede devolver el pago de otra sede— y ANTES de leer
+ * `earnedCommissionFor` —que es lo que valida el par, así el lookup no puede
+ * devolver el pago de otra factura— y ANTES de leer
  * lo ya pagado y de decidir el pendiente. Un reintento del MISMO envío (doble
  * clic, o el navegador reenviando tras cortarse la red) se reconoce y devuelve
  * el pago ya registrado como un no-op EXITOSO: no paga de nuevo.
@@ -451,7 +451,6 @@ export async function payCommissionNow(
     .from("employees")
     .select("payout_mode")
     .eq("id", input.employee_id)
-    .eq("sede_id", actor.sedeId)
     .maybeSingle();
   if ((payoutEmployee as { payout_mode?: string } | null)?.payout_mode === "no_aplica") {
     throw new CommissionError(
@@ -461,7 +460,7 @@ export async function payCommissionNow(
     );
   }
 
-  const methods = await listPaymentMethods(actor.sedeId).catch(() => {
+  const methods = await listPaymentMethods().catch(() => {
     throw new CommissionError("INTERNAL", "Error interno.", 500);
   });
   const method = methods.find((row) => row.is_active && row.code === input.method_code);
@@ -473,7 +472,7 @@ export async function payCommissionNow(
     );
   }
 
-  const shift = await getOpenShift(actor.sedeId).catch(() => {
+  const shift = await getOpenShift().catch(() => {
     throw new CommissionError("INTERNAL", "Error interno.", 500);
   });
   if (!shift) {
@@ -484,7 +483,7 @@ export async function payCommissionNow(
     );
   }
 
-  const earned = await earnedCommissionFor(actor.sedeId, input.invoice_id, input.employee_id).catch(
+  const earned = await earnedCommissionFor(input.invoice_id, input.employee_id).catch(
     (error) => {
       if (error instanceof CommissionError) throw error;
       throw new CommissionError("INTERNAL", "Error interno.", 500);
@@ -506,7 +505,7 @@ export async function payCommissionNow(
     input.idempotency_key,
   );
   if (repeated) return repeated;
-  const paid = await immediatePaidTotal(actor.sedeId, input.invoice_id, input.employee_id);
+  const paid = await immediatePaidTotal(input.invoice_id, input.employee_id);
   // El pendiente inmediato es SOLO comisión por ítem: el porcentaje del empleado
   // se acumula y se paga en nómina, nunca de inmediato.
   const pending = pendingCommission(earned.immediateEarned, paid);
@@ -553,7 +552,6 @@ export async function payCommissionNow(
     .from("invoices")
     .select("id, status")
     .eq("id", input.invoice_id)
-    .eq("sede_id", actor.sedeId)
     .maybeSingle();
   if (payoutInvoiceError) throw new CommissionError("INTERNAL", "Error interno.", 500);
   if (!payoutInvoice) throw new CommissionError("NOT_FOUND", "Factura no encontrada.", 404);
@@ -562,7 +560,6 @@ export async function payCommissionNow(
   const { data, error } = await db
     .from("commission_payouts")
     .insert({
-      sede_id: actor.sedeId,
       employee_id: input.employee_id,
       invoice_id: input.invoice_id,
       cash_shift_id: shift.id,
@@ -620,7 +617,6 @@ export async function payCommissionNow(
   if (!data) throw new CommissionError("INTERNAL", "Error interno.", 500);
 
   await writeAudit({
-    sede_id: actor.sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.COMMISSION_PAID,
     entity: "commission_payouts",
@@ -642,13 +638,12 @@ export async function payCommissionNow(
   return data as CommissionPayoutRow;
 }
 
-/** Pagos inmediatos de la sede (filtros opcionales, recientes primero). */
+/** Pagos inmediatos (filtros opcionales, recientes primero). */
 export async function listCommissionPayouts(
-  sedeId: string,
   filters: { employee_id?: string; invoice_id?: string; shift_id?: string } = {},
 ): Promise<CommissionPayoutRow[]> {
   const db = await commissionsDb();
-  let query = db.from("commission_payouts").select(PAYOUT_SELECT).eq("sede_id", sedeId);
+  let query = db.from("commission_payouts").select(PAYOUT_SELECT);
   if (filters.employee_id) query = query.eq("employee_id", filters.employee_id);
   if (filters.invoice_id) query = query.eq("invoice_id", filters.invoice_id);
   if (filters.shift_id) query = query.eq("cash_shift_id", filters.shift_id);

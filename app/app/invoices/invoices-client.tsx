@@ -276,7 +276,6 @@ function employeeSummary(names: string[]): string {
 }
 
 interface InvoicesClientProps {
-  sedeId: string;
   initialInvoices: InvoiceListItem[];
   initialTotal: number;
   products: ProductRow[];
@@ -416,7 +415,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
     startViewTransition(async () => {
       setError(null);
       const result: ActionResult<{ rows: InvoiceListItem[]; total: number }> = await listInvoicesAction({
-        sede_id: props.sedeId,
         status: filters.status || undefined,
         from: filters.from || undefined,
         to: filters.to || undefined,

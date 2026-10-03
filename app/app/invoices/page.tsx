@@ -52,13 +52,13 @@ export default async function InvoicesPage() {
   // Empleado: solo sus facturas (filtro forzado para que el total cuadre).
   const pageFilters = { page: 1, from: today, to: today, ...(isManager ? {} : { user_id: session.user.id }) };
   const [invoices, totalInvoices, products, services, employees, methods, taxes] = await Promise.all([
-    listInvoices(sedeId, pageFilters),
-    countInvoices(sedeId, { from: today, to: today, ...(isManager ? {} : { user_id: session.user.id })}),
-    listProducts(sedeId),
-    listServices(sedeId),
-    listEmployees(sedeId),
-    listPaymentMethods(sedeId),
-    listTaxes(sedeId),
+    listInvoices(pageFilters),
+    countInvoices({ from: today, to: today, ...(isManager ? {} : { user_id: session.user.id })}),
+    listProducts(),
+    listServices(),
+    listEmployees(),
+    listPaymentMethods(),
+    listTaxes(),
   ]);
 
   return (
@@ -68,7 +68,6 @@ export default async function InvoicesPage() {
         description="Facturas, impuestos y cobros."
       />
       <InvoicesClient
-        sedeId={sedeId}
         initialInvoices={invoices}
         initialTotal={totalInvoices}
         products={products}

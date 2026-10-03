@@ -12,8 +12,6 @@
  */
 
 export interface AuditEntry {
-  /** Sede del evento. Null solo cuando se desconoce (login con documento inexistente). */
-  sede_id: string | null;
   user_id?: string | null;
   action: string;
   entity: string;
@@ -22,7 +20,6 @@ export interface AuditEntry {
 }
 
 export interface AuditPayload {
-  sede_id: string | null;
   user_id: string | null;
   action: string;
   entity: string;
@@ -73,25 +70,44 @@ export const AUDIT_ACTIONS = {
   // firmada. El metadato lleva el motivo y los totales de las dos versiones.
   PAYROLL_PERIOD_CORRECTED: "payroll.period_corrected",
   COMMISSION_PAID: "payroll.commission_paid",
+  // Los topes y los días permitidos de los vales los configura el admin de la
+  // sede y antes cambiaban sin rastro: son los números que deciden qué vale sale
+  // solo de caja y cuál espera aprobación, así que un cambio hecho con la
+  // pantalla abierta tiene que quedar escrito con QUIÉN lo hizo y los dos
+  // valores, el anterior y el nuevo (como la fecha de arranque, más abajo).
+  // NO entra a ningún catálogo de alertas: cambiar la política es una decisión de
+  // configuración, no un desvío que alguien deba autorizar o rechazar.
+  VOUCHER_LIMITS_SET: "voucher.limits_set",
   VOUCHER_APPROVED: "voucher.approved",
   VOUCHER_REQUESTED: "voucher.requested",
   VOUCHER_REJECTED: "voucher.rejected",
-  // G3b: la fecha de inicio de la nómina de una sede la configura SOLO la
-  // cuenta de plataforma, para CUALQUIER sede. Antes cambiaba sin rastro y es
-  // una fecha que mueve meses de dinero: queda con su propia acción para que un
-  // auditor lea «la plataforma configuró la nómina de la sede X» con el valor
-  // anterior y el nuevo, y no la confunda con el negocio. NO entra a ningún
-  // catálogo de alertas: es una decisión de configuración, no un desvío.
+  // La fecha de inicio de la nómina de la INSTALACIÓN la configura SOLO la cuenta
+  // de plataforma. Antes cambiaba sin rastro y es una fecha que mueve meses de
+  // dinero: queda con su propia acción para que un auditor lea «la plataforma
+  // configuró la nómina» con el valor anterior y el nuevo, y no la confunda con
+  // el negocio. NO entra a ningún catálogo de alertas: es una decisión de
+  // configuración, no un desvío.
   PLATFORM_PAYROLL_START_DATE_SET: "platform.payroll_start_date_set",
+  // `platform.sede_created` y `platform.sede_roles_set` (la alta de sedes y los
+  // roles por sede) se retiraron del vocabulario con la decisión de una sola sede:
+  // ya no hay esa operación que auditar. Las filas YA escritas en `audit_logs` con
+  // esos valores se conservan tal cual, como las de `SHIFT_EDITED`: el registro
+  // histórico no se reescribe.
 } as const;
 
 /**
  * Construye el payload de `audit_logs`. Pura (sin red/BD) para probarla
  * en vitest. Normaliza nulos y garantiza `metadata` como objeto.
+ *
+ * La instalación es UNA sola, así que el rastro no lleva sede: el evento se
+ * ubica por QUIÉN lo hizo (`user_id`) y sobre QUÉ fila (`entity`/`entity_id`).
+ * Antes el campo admitía NULL para los eventos sin tenant —el login con
+ * documento inexistente, que no conoce ni usuario ni sede—, y esa era la única
+ * razón por la que era nullable; hoy ya no hay nada que nombrar y esa entrada
+ * se sigue escribiendo completa igual que las demás.
  */
 export function buildAuditPayload(entry: AuditEntry): AuditPayload {
   return {
-    sede_id: entry.sede_id ?? null,
     user_id: entry.user_id ?? null,
     action: entry.action,
     entity: entry.entity,

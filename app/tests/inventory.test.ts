@@ -22,13 +22,12 @@ import {
   registerMovement,
 } from "@/src/features/inventory/service";
 
-const SEDE_A = "11111111-1111-4111-8111-111111111111";
-const SEDE_B = "22222222-2222-4222-8222-222222222222";
 const PRODUCT_ID = "33333333-3333-4333-8333-333333333333";
 
 function baseProduct(overrides: Record<string, unknown> = {}) {
+  // El cuerpo ya NO lleva `sede_id`: el alta no la escribe y el esquema no la
+  // pide. Dejarla sería una columna que el doble acepta y la base nunca vio.
   return {
-    sede_id: SEDE_A,
     sku: "SH-001",
     name: "Shampoo",
     ...overrides,
@@ -58,21 +57,18 @@ describe("inventory schemas: producto (INV-01)", () => {
     expect(productSchema.safeParse(baseProduct({ commission_value: -1 })).success).toBe(false);
   });
 
-  it("normaliza el SKU (trim + mayúsculas) para unicidad por sede", () => {
+  it("normaliza el SKU (trim + mayúsculas) para la unicidad de la instalación", () => {
     expect(normalizeSku("  sh-001 ")).toBe("SH-001");
     expect(normalizeSku("Sh-001")).toBe("SH-001");
   });
 
-  it("SKU duplicado en la misma sede colisiona; en otra sede no", () => {
-    expect(
-      areSkusConflicting({ sedeIdA: SEDE_A, skuA: "sh-001", sedeIdB: SEDE_A, skuB: " SH-001 " }),
-    ).toBe(true);
-    expect(
-      areSkusConflicting({ sedeIdA: SEDE_A, skuA: "SH-001", sedeIdB: SEDE_A, skuB: "SH-002" }),
-    ).toBe(false);
-    expect(
-      areSkusConflicting({ sedeIdA: SEDE_A, skuA: "SH-001", sedeIdB: SEDE_B, skuB: "SH-001" }),
-    ).toBe(false);
+  it("el SKU normalizado es la clave: dos SKU iguales colisionan aunque lleguen distintos", () => {
+    // El caso que queda es el que la instalación puede encontrar de verdad: el
+    // mismo SKU escrito de dos formas (minúsculas y con espacios) es la misma
+    // fila de negocio. El predicado ya no recibe sedes porque `074` dejó
+    // `products_sku_key UNIQUE (sku)`: la unicidad es de la instalación entera.
+    expect(areSkusConflicting({ skuA: "sh-001", skuB: " SH-001 " })).toBe(true);
+    expect(areSkusConflicting({ skuA: "SH-001", skuB: "SH-002" })).toBe(false);
   });
 });
 
@@ -673,8 +669,12 @@ function createInventoryStubClient(): unknown {
     const movementsSnapshot = invStub.movements.length;
     let applied = 0;
     for (const item of items) {
+      // El movimiento toma la SEDE DEL PRODUCTO —la fila que el `JOIN` de 046
+      // trae—, no una sede recibida: la instalación es de una sola sede (071) y
+      // la llamada ya no manda ninguna.
+      const product = invStub.products.find((row) => row.id === item.product_id);
       const written = writeMovement({
-        sede_id: args?.p_sede_id ?? null,
+        sede_id: product?.sede_id ?? null,
         product_id: item.product_id,
         type: "OUT",
         qty: item.qty,
@@ -878,9 +878,12 @@ describe("inventory: el movimiento manual reintentado no mueve el stock dos vece
     expect(invStub.movements).toHaveLength(2);
   });
 
-  it("la marca se resuelve dentro de la sede del actor: un producto de otra sede se rechaza con 403 y sin escrituras", async () => {
+  it("la marca se resuelve dentro del producto: un producto que NO existe se rechaza con 404 y sin escrituras", async () => {
+    // La frontera por fila se retiró con la columna: lo que sigue guardando es
+    // que el PRODUCTO exista antes de que la marca se resuelva. Sin producto,
+    // el movimiento se rechaza con el NOT_FOUND de siempre y con cero
+    // escrituras —ni movimiento ni stock movido.
     const AJENO = "55555555-5555-4555-8555-555555555555";
-    seedStockProduct(AJENO, 7, invStub.OTHER_SEDE_ID);
 
     const outcome = await registerManualMovement(
       manualMovement({ product_id: AJENO }),
@@ -891,9 +894,9 @@ describe("inventory: el movimiento manual reintentado no mueve el stock dos vece
     );
 
     expect(outcome).toBeInstanceOf(InventoryError);
-    expect(outcome).toMatchObject({ code: "FORBIDDEN", status: 403 });
+    expect(outcome).toMatchObject({ code: "NOT_FOUND", status: 404 });
     expect(invStub.movements).toHaveLength(0);
-    expect(stockOf(AJENO)).toBe(7);
+    expect(invStub.products.some((row) => row.id === AJENO)).toBe(false);
   });
 
   it("control de no-extralimitación: el camino de FACTURACIÓN descuenta stock SIN marca (la marca es opcional ahí)", async () => {
@@ -1416,5 +1419,80 @@ describe("inventory: el stock mínimo del producto sólo acepta dígitos (guarda
     expect(block).not.toContain("stripQuantityInput(event.target.value)");
     // Sin el ancla no hay bloque: la guarda falla en vez de pasar sola.
     expect(onChangeBlock(fake, "no-existe:")).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 071_rpc_single_sede.sql: el stock re-emite su deducción sin el parámetro de
+// sede.
+//
+// LO QUE ESTA SUITE FIJA (y antes fijaba contra la firma vieja): 046 declaraba
+// `deduct_stock_atomic(p_sede_id, p_user_id, p_reason, p_items)` y filtraba el
+// JOIN con `products` por la sede del llamador. El movimiento YA tomaba la sede
+// del producto, así que la firma era el único lugar por donde la sede entraba:
+// sin ella, el JOIN une por id y el movimiento sigue llevando la del producto,
+// que es la de la instalación.
+// ---------------------------------------------------------------------------
+
+describe("migración 071_rpc_single_sede.sql (stock)", () => {
+  const path = join(process.cwd(), "supabase", "migrations", "071_rpc_single_sede.sql");
+  const raw = readFileSync(path, "utf8").replace(/\r\n/g, "\n");
+  // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+
+  it("piso anti-vacío: el archivo existe y trae DDL real", () => {
+    expect(raw.length).toBeGreaterThan(15000);
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("deduct_stock_atomic se crea SIN el parámetro de sede y con el JOIN por id", () => {
+    expect(sql).toMatch(
+      /CREATE OR REPLACE FUNCTION public\.deduct_stock_atomic\(\s*p_user_id uuid,\s*p_reason text,\s*p_items jsonb\s*\)/,
+    );
+    // El JOIN ya no filtra por sede: une sólo por el id del producto, y la red
+    // de conteo sigue convirtiendo el producto inexistente en PRODUCT_NOT_FOUND.
+    expect(sql).not.toMatch(/\bsede_id\s*=\s*p_sede_id/);
+    expect(sql).not.toContain("p_sede_id IS NULL");
+    expect(sql).toContain("ON p.id = (item ->> 'product_id')::uuid");
+    expect(sql).toContain("PRODUCT_NOT_FOUND");
+  });
+
+  it("dropea la firma VIEJA antes de crear la nueva", () => {
+    const drop = "DROP FUNCTION IF EXISTS public.deduct_stock_atomic(uuid, uuid, text, jsonb)";
+    expect(sql).toContain(drop);
+    expect(sql.indexOf(drop)).toBeLessThan(
+      sql.indexOf("CREATE OR REPLACE FUNCTION public.deduct_stock_atomic"),
+    );
+  });
+
+  it("el movimiento conserva la SEDE DEL PRODUCTO y el resto del contrato", () => {
+    // La columna sigue existiendo: mientras exista, el movimiento la escribe, y
+    // sale del producto (la fila del JOIN), no de un parámetro.
+    expect(sql).toContain("INSERT INTO public.inventory_movements");
+    expect(sql).toContain("p.sede_id,");
+    // El orden de locks por producto, la marca en NULL y las dos redes.
+    expect(sql).toContain("ORDER BY p.id");
+    expect(sql).toContain("DEDUCTION_INVALID");
+    expect(sql).toMatch(/count\(DISTINCT/);
+    // Y el permiso va sobre la firma nueva, no sobre la vieja.
+    expect(sql).toContain(
+      "REVOKE ALL ON FUNCTION public.deduct_stock_atomic(uuid, text, jsonb) FROM PUBLIC",
+    );
+    expect(sql).toContain(
+      "GRANT EXECUTE ON FUNCTION public.deduct_stock_atomic(uuid, text, jsonb) TO service_role",
+    );
+    expect(sql).toContain(
+      "COMMENT ON FUNCTION public.deduct_stock_atomic(uuid, text, jsonb) IS",
+    );
+  });
+
+  it("NO borra la columna ni toca las políticas: ése es el paso irreversible de otra unidad", () => {
+    expect(sql).not.toMatch(/DROP COLUMN/i);
+    expect(sql).not.toMatch(/ALTER TABLE/i);
+    expect(sql).not.toMatch(/\bPOLICY\b/i);
+    expect(raw).toContain("POR QUÉ ESTE ARCHIVO CORRE ANTES DEL BORRADO DE LA COLUMNA");
   });
 });

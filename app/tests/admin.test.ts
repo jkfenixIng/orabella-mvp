@@ -20,8 +20,9 @@ import {
   roleCodeSchema,
   type RoleCode,
 } from "@/src/features/auth/schemas";
-import { requireSedeRole, resolveSede, type SedeRole } from "@/src/shared/lib/sede";
+import { requireSedeRole, type SedeRole } from "@/src/shared/lib/sede";
 import { AdminError, setUserRoles, upsertEmployee } from "@/src/features/admin/service";
+import * as adminActions from "@/src/features/admin/actions";
 
 const SEDE_A = "11111111-1111-4111-8111-111111111111";
 const SEDE_B = "22222222-2222-4222-8222-222222222222";
@@ -704,7 +705,6 @@ describe("admin: reemplazo de roles atómico (ADM-04 / CO-2)", () => {
 
 function baseEmployee(overrides: Record<string, unknown> = {}) {
   return {
-    sede_id: SEDE_A,
     full_name: "Carolina Rojas",
     document: "123456",
     pay_type: "fijo",
@@ -852,28 +852,20 @@ describe("admin: unicidad parcial de employee_code (ADM-03)", () => {
     expect(isEmployeeCodeMissing("EMP-01")).toBe(false);
   });
 
-  it("dos códigos con valor iguales en la misma sede colisionan", () => {
-    expect(
-      areEmployeeCodesConflicting({ sedeIdA: SEDE_A, codeA: "EMP-01", sedeIdB: SEDE_A, codeB: "EMP-01" }),
-    ).toBe(true);
-    expect(
-      areEmployeeCodesConflicting({ sedeIdA: SEDE_A, codeA: "EMP-01", sedeIdB: SEDE_A, codeB: "EMP-02" }),
-    ).toBe(false);
+  it("dos códigos con valor iguales colisionan", () => {
+    // Sin sedes: `074` recreó `uq_employees_sede_code` sobre `(employee_code)`
+    // con el mismo WHERE, así que el choque se decide sólo por el código.
+    expect(areEmployeeCodesConflicting({ codeA: "EMP-01", codeB: "EMP-01" })).toBe(true);
+    expect(areEmployeeCodesConflicting({ codeA: "EMP-01", codeB: "EMP-02" })).toBe(false);
   });
 
-  it("vacíos nunca colisionan y sedes distintas nunca colisionan", () => {
-    expect(
-      areEmployeeCodesConflicting({ sedeIdA: SEDE_A, codeA: "", sedeIdB: SEDE_A, codeB: "" }),
-    ).toBe(false);
-    expect(
-      areEmployeeCodesConflicting({ sedeIdA: SEDE_A, codeA: null, sedeIdB: SEDE_A, codeB: "EMP-01" }),
-    ).toBe(false);
-    expect(
-      areEmployeeCodesConflicting({ sedeIdA: SEDE_A, codeA: "EMP-01", sedeIdB: SEDE_B, codeB: "EMP-01" }),
-    ).toBe(false);
+  it("vacíos nunca colisionan", () => {
+    expect(areEmployeeCodesConflicting({ codeA: "", codeB: "" })).toBe(false);
+    expect(areEmployeeCodesConflicting({ codeA: null, codeB: "EMP-01" })).toBe(false);
+    expect(areEmployeeCodesConflicting({ codeA: "EMP-01", codeB: undefined })).toBe(false);
   });
 
-  it("el esquema acepta código vacío (repetible por sede)", () => {
+  it("el esquema acepta código vacío (repetible en la instalación)", () => {
     expect(employeeSchema.safeParse(baseEmployee({ employee_code: "" })).success).toBe(true);
     expect(employeeSchema.safeParse(baseEmployee({ employee_code: null })).success).toBe(true);
   });
@@ -882,7 +874,6 @@ describe("admin: unicidad parcial de employee_code (ADM-03)", () => {
 describe("admin schemas: servicio min<=max (ADM-05)", () => {
   function baseService(overrides: Record<string, unknown> = {}) {
     return {
-      sede_id: SEDE_A,
       name: "Corte",
       price: 50000,
       duracion_min: 30,
@@ -909,7 +900,7 @@ describe("admin schemas: servicio min<=max (ADM-05)", () => {
 
 describe("admin schemas: impuestos y métodos (ADM-06/ADM-07)", () => {
   it("percent acepta 0–100 y rechaza fuera de rango", () => {
-    const base = { sede_id: SEDE_A, code: "IVA", name: "IVA general" };
+    const base = { code: "IVA", name: "IVA general" };
     expect(taxConfigSchema.safeParse({ ...base, percent: 19 }).success).toBe(true);
     expect(taxConfigSchema.safeParse({ ...base, percent: 0 }).success).toBe(true);
     expect(taxConfigSchema.safeParse({ ...base, percent: 100 }).success).toBe(true);
@@ -919,7 +910,7 @@ describe("admin schemas: impuestos y métodos (ADM-06/ADM-07)", () => {
   });
 
   it("solo acepta códigos del catálogo Colombia", () => {
-    const base = { sede_id: SEDE_A, name: "Nequi" };
+    const base = { name: "Nequi" };
     for (const code of ["efectivo", "transferencia_normal", "nequi", "daviplata", "bre-b", "tarjeta"]) {
       expect(paymentMethodSchema.safeParse({ ...base, code }).success).toBe(true);
     }
@@ -939,7 +930,7 @@ describe("admin schemas: impuestos y métodos (ADM-06/ADM-07)", () => {
   });
 });
 
-describe("admin: requireSedeRole y resolveSede (puros)", () => {
+describe("admin: requireSedeRole (puro)", () => {
   it("admin pasa el gate de escritura; empleado/caja no", () => {
     expect(() => requireSedeRole(["admin"], ["admin"])).not.toThrow();
     expect(() => requireSedeRole(["empleado", "caja"], ["empleado", "caja"])).not.toThrow();
@@ -951,12 +942,6 @@ describe("admin: requireSedeRole y resolveSede (puros)", () => {
       expect((error as AdminError).code).toBe("FORBIDDEN");
       expect((error as AdminError).status).toBe(403);
     }
-  });
-
-  it("resolveSede usa la sede de la sesión y rechaza sede ajena", () => {
-    expect(resolveSede(SEDE_A)).toBe(SEDE_A);
-    expect(resolveSede(SEDE_A, SEDE_A)).toBe(SEDE_A);
-    expect(() => resolveSede(SEDE_A, SEDE_B)).toThrowError(AdminError);
   });
 });
 
@@ -1156,7 +1141,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
   it("a quien ya tiene OTRO rol no se le agrega `empleado` (un rol por usuario)", async () => {
     sembrar(["admin"]);
 
-    await upsertEmployee(baseEmployee());
+    await upsertEmployee(baseEmployee(), SEDE_A);
 
     // El empleado sí se creó: la prueba corre por la red de seguridad.
     expect(memoryRows("employees")).toHaveLength(1);
@@ -1172,7 +1157,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
   it("a quien YA es `empleado` no se le vuelve a insertar el rol", async () => {
     sembrar(["empleado"]);
 
-    await upsertEmployee(baseEmployee());
+    await upsertEmployee(baseEmployee(), SEDE_A);
 
     expect(rolesPersistidos()).toEqual(["empleado"]);
     expect(escriturasDeRoles()).toEqual([]);
@@ -1181,7 +1166,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
   it("a quien NO tiene ningún rol igual se le asigna `empleado` (la intención sobrevive)", async () => {
     sembrar([]);
 
-    await upsertEmployee(baseEmployee());
+    await upsertEmployee(baseEmployee(), SEDE_A);
 
     expect(rolesPersistidos()).toEqual(["empleado"]);
   });
@@ -1197,7 +1182,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       ];
     };
 
-    await upsertEmployee(baseEmployee());
+    await upsertEmployee(baseEmployee(), SEDE_A);
 
     // El modelo del proyecto es UN rol por usuario (`setUserRolesSchema` exige
     // `.length(1)`): quedar con `admin` + `empleado` es el defecto, no un
@@ -1212,7 +1197,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
     // Los dos rpc quedan EN VUELO a la vez: el resultado final se mira después
     // de liberarlos, no el orden de llegada.
     postgrest.hold = true;
-    const empleado = upsertEmployee(baseEmployee());
+    const empleado = upsertEmployee(baseEmployee(), SEDE_A);
     await new Promise((resolve) => setTimeout(resolve, 0));
     const reemplazo = setUserRoles({ user_id: USUARIO_ID, roles: ["admin"] });
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1234,7 +1219,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
   it("la red ya no lee ni escribe `user_roles` desde el cliente: la decisión es del servidor", async () => {
     sembrar([]);
 
-    await upsertEmployee(baseEmployee());
+    await upsertEmployee(baseEmployee(), SEDE_A);
 
     // La red vieja leía una columna de `user_roles` para decidir; esa lectura
     // es la mitad del read-then-insert que CO-4 cierra, así que ya no existe.
@@ -1261,7 +1246,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       error: { code: "57014", message: "canceling statement due to statement timeout" },
     };
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1281,7 +1266,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       postgrest.rows.users = [];
     };
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1298,7 +1283,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       ...rol,
     }));
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1321,7 +1306,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       ];
     };
 
-    await upsertEmployee(baseEmployee());
+    await upsertEmployee(baseEmployee(), SEDE_A);
 
     expect(rolesPersistidos()).toEqual(["empleado"]);
     expect(escriturasDeRoles()).toEqual([]);
@@ -1334,7 +1319,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       error: { code: "42501", message: "permission denied for function upsert_employee_atomic" },
     };
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1349,7 +1334,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
     // red, así que no puede terminar en un alta "exitosa".
     postgrest.ensureAppliesNothing = true;
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1363,7 +1348,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
 
     // La red reporta el conjunto que la base DEVOLVIÓ, sin asumir que tiene un
     // solo rol: un usuario arrastrado por el bug viejo se deja como está.
-    await upsertEmployee(baseEmployee());
+    await upsertEmployee(baseEmployee(), SEDE_A);
 
     expect(rolesPersistidos()).toEqual(["admin", "empleado"]);
     expect(escriturasDeRoles()).toEqual([]);
@@ -1381,7 +1366,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
       },
     ];
 
-    await upsertEmployee(baseEmployee({ id: EMPLEADO_ID, employee_code: "EMP-01" }));
+    await upsertEmployee(baseEmployee({ id: EMPLEADO_ID, employee_code: "EMP-01" }), SEDE_A);
 
     expect(postgrest.selects.filter((select) => select.table === "user_roles")).toEqual([]);
     expect(escriturasDeRoles()).toEqual([]);
@@ -1506,7 +1491,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
       error: { code: "42501", message: "permission denied for table employees" },
     };
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1525,7 +1510,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
       error: { code: "42501", message: "permission denied for table employees" },
     };
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1543,7 +1528,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
       error: { code: "42501", message: "permission denied for table users" },
     };
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1556,7 +1541,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
   it("el alta viaja en UNA sentencia: cero escrituras sueltas", async () => {
     sembrarSinUsuario();
 
-    const fila = await upsertEmployee(baseEmployee());
+    const fila = await upsertEmployee(baseEmployee(), SEDE_A);
 
     expect(fila.full_name).toBe("Carolina Rojas");
     expect(postgrest.rpcCalls.map((llamada) => llamada.fn)).toEqual(["upsert_employee_atomic"]);
@@ -1577,7 +1562,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
     };
 
     await expect(
-      upsertEmployee(baseEmployee({ employee_code: "EMP-01" })),
+      upsertEmployee(baseEmployee({ employee_code: "EMP-01" }), SEDE_A),
     ).rejects.toMatchObject({ code: "EMPLOYEE_CODE_TAKEN", status: 409 });
 
     // Nada a medias: ni usuario, ni rol, ni legajo.
@@ -1594,7 +1579,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
       ];
     };
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1610,7 +1595,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
       (rol) => ({ ...rol }),
     );
 
-    await expect(upsertEmployee(baseEmployee())).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee(), SEDE_A)).rejects.toMatchObject({
       code: "INTERNAL",
       status: 500,
     });
@@ -1836,7 +1821,7 @@ describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", ()
   });
 
   it("el alta escribe la cadencia en el legajo y la devuelve en la fila", async () => {
-    const fila = await upsertEmployee(baseEmployee({ pay_frequency: "semanal" }));
+    const fila = await upsertEmployee(baseEmployee({ pay_frequency: "semanal" }), SEDE_A);
 
     expect(fila.pay_frequency).toBe("semanal");
     expect(memoryRows("employees")[0]?.pay_frequency).toBe("semanal");
@@ -1847,7 +1832,7 @@ describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", ()
   });
 
   it("null es un valor legal: el legajo queda sin cadencia y la clave igual viaja", async () => {
-    const fila = await upsertEmployee(baseEmployee({ pay_frequency: null }));
+    const fila = await upsertEmployee(baseEmployee({ pay_frequency: null }), SEDE_A);
 
     expect(fila.pay_frequency).toBeNull();
     expect(memoryRows("employees")[0]?.pay_frequency).toBeNull();
@@ -1855,7 +1840,7 @@ describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", ()
   });
 
   it("sin la clave también queda en null: la cadencia no se inventa ni se hereda", async () => {
-    const fila = await upsertEmployee(baseEmployee());
+    const fila = await upsertEmployee(baseEmployee(), SEDE_A);
 
     expect(fila.pay_frequency).toBeNull();
     expect(memoryRows("employees")[0]?.pay_frequency).toBeNull();
@@ -1876,7 +1861,7 @@ describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", ()
       },
     ];
 
-    const fila = await upsertEmployee(baseEmployee({ id: EDIT_ID, pay_frequency: "quincenal" }));
+    const fila = await upsertEmployee(baseEmployee({ id: EDIT_ID, pay_frequency: "quincenal" }), SEDE_A);
 
     expect(fila.pay_frequency).toBe("quincenal");
     expect(memoryRows("employees")[0]?.pay_frequency).toBe("quincenal");
@@ -1886,7 +1871,7 @@ describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", ()
   });
 
   it("un valor fuera del catálogo se rechaza ANTES de escribir: ni rpc, ni upsert, ni fila", async () => {
-    await expect(upsertEmployee(baseEmployee({ pay_frequency: "diario" }))).rejects.toMatchObject({
+    await expect(upsertEmployee(baseEmployee({ pay_frequency: "diario" }), SEDE_A)).rejects.toMatchObject({
       code: "VALIDATION",
       status: 400,
     });
@@ -2194,5 +2179,1231 @@ describe("migración 070_sedes_unique_name.sql (G2)", () => {
         "CREATE INDEX IF NOT EXISTS uq_sedes_name ON public.sedes (lower(btrim(name)));\n",
       ),
     ).toBeNull();
+  });
+});
+
+// -------------------------------------- G5: las sedes salen del alcance ---
+
+/**
+ * G5 cierra los dos agujeros que el negocio tenía sobre la instalación:
+ * `listSedesAction` (guardada solo por `requireSession`, así que CUALQUIER rol
+ * logueado listaba todas las sedes) y `upsertSedeAction` (guardada por
+ * `requireAdminSession`, así que el admin de CUALQUIER sede creaba y editaba
+ * sedes, incluida la fila de la sede del sistema).
+ *
+ * El mapa de consumidores salió vacío —ni una sola referencia en la app— así que
+ * no hubo que reubicar ninguna pantalla: se eliminaron. La instalación pasó a la
+ * superficie de plataforma, que desde la decisión de UNA SOLA SEDE sólo configura
+ * la instalación (la fecha de la nómina): ya no hay lista de sedes ni alta que
+ * reubicar, y el alta de una segunda sede no es una operación que la instalación
+ * admita.
+ *
+ * El bloque afirma las DOS mitades del cierre: que las acciones ya no se
+ * exportan (lo que un admin de sede tenía alcanzable como endpoint POST, porque
+ * `"use server"` convierte cada export en uno) y que el módulo del negocio ya no
+ * tiene con qué leer ni escribir la tabla `sedes`.
+ *
+ * LO QUE EL NEGOCIO CONSERVA (decisión del dueño, 2026-10-01): el admin de la
+ * sede sigue administers su gente —usuarios y roles de SU sede— y el rol de
+ * plataforma no se otorga ni se quita desde acá (`setUserRoles` rechaza ambas
+ * direcciones). Lo que se retiró fue la ESTRUCTURA de sedes, no la gestión de
+ * personas.
+ */
+describe("G5: el admin de una sede ya no lista ni escribe sedes", () => {
+  const acciones = readFileSync(join(process.cwd(), "src", "features", "admin", "actions.ts"), "utf8");
+  const servicio = readFileSync(join(process.cwd(), "src", "features", "admin", "service.ts"), "utf8");
+
+  /** Código sin comentarios: una puerta citada al documentar el cierre no cuenta. */
+  function sinComentarios(source: string): string {
+    return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  }
+
+  it("las dos acciones desaparecieron del módulo alcanzable", () => {
+    for (const nombre of ["listSedesAction", "upsertSedeAction"]) {
+      expect(
+        nombre in adminActions,
+        `${nombre} sigue exportada: "use server" la deja alcanzable como endpoint POST`,
+      ).toBe(false);
+      expect(acciones).not.toContain(`export async function ${nombre}`);
+    }
+  });
+
+  it("sus funciones de servicio también (no se \"re-ubicaron\" con otro nombre)", () => {
+    for (const nombre of ["upsertSede", "listSedes", "fetchSedes", "SedeRow"]) {
+      // `String.raw` y no una plantilla pelada: en una plantilla normal `\s`
+      // vale `s`, así que el patrón compilado era `export s+(?:async s+...)` y
+      // NUNCA podía encontrar una declaración exportada (guarda que no puede
+      // fallar). Con `String.raw` el `\s` llega crudo al motor como clase de
+      // espacio, que es lo que el detector afirma detectar.
+      const declaracion = new RegExp(
+        String.raw`export\s+(?:async\s+function|const|function|interface|type)\s+${nombre}\b`,
+      );
+      expect(servicio, `admin/service.ts todavía declara ${nombre}`).not.toMatch(declaracion);
+      // Sin comentarios: el aviso que documenta el cierre NOMBRA a las funciones
+      // que se quitaron, y nombrarlas al explicar no es declararlas.
+      expect(sinComentarios(acciones)).not.toContain(nombre);
+    }
+  });
+
+  it("el negocio ya no alcanza la tabla `sedes` ni su etiqueta de caché", () => {
+    expect(sinComentarios(servicio)).not.toContain('from("sedes")');
+    expect(sinComentarios(acciones)).not.toContain("catalog:sedes");
+    expect(sinComentarios(acciones)).not.toContain('from("sedes")');
+  });
+
+  it("lo que sí tiene consumidores se quedó: usuarios y roles de la propia sede", () => {
+    // Control de sobre-eliminación: estas dos tienen pantalla que las llama
+    // (`app/admin/admin-tabs.tsx` y `app/admin/admin-sections/users-section.tsx`)
+    // y siguen siendo del admin de su sede. La decisión del dueño (2026-10-01) es
+    // explícita: la estructura de sedes se retiró, la gestión de personas no.
+    for (const nombre of ["listSedeUsersAction", "setUserRolesAction"]) {
+      expect(nombre in adminActions, `${nombre} no debía tocarse`).toBe(true);
+    }
+    // Y la pestaña que las monta sigue viva: la retirada fue la de las sedes, no
+    // la de la gestión de usuarios.
+    const pestañas = readFileSync(join(process.cwd(), "app", "admin", "admin-tabs.tsx"), "utf8");
+    expect(pestañas).toContain("UsersSection");
+  });
+
+  it("el esquema de la fila de sede queda declarado, con su prueba", () => {
+    const schemas = readFileSync(
+      join(process.cwd(), "src", "features", "admin", "schemas.ts"),
+      "utf8",
+    );
+    expect(schemas).toContain("export const sedeSchema");
+    // Su último consumidor era el ALTA de sedes en la plataforma, que se retiró
+    // con la decisión de una sola sede: el esquema queda declarado pero sin
+    // consumidor en producción, y quitarlo (o conservarlo para la unidad que
+    // elimina la tabla) es de esa unidad, no de ésta.
+    expect(schemas).toContain("export type SedeInput");
+  });
+});
+
+// ------------------------- M3b: `sede_id` deja de ser obligatoria ----------
+
+/**
+ * Sentencias que la unidad 073 NO puede escribir, con la etiqueta con la que se
+ * reporta la infracción. Se prueban contra el archivo COMPLETO, comentarios
+ * incluidos: esta unidad es aditiva y su prosa tiene que poder NOMBRAR lo que
+ * no hace, pero al nombrarlo lo hace con palabras, nunca con una sentencia.
+ *
+ * La excepción es `DROP NOT NULL`, que es justamente el cambio: cada patrón
+ * exige la palabra que sigue a `DROP`, así que `DROP NOT NULL` no casa con
+ * ninguno de ellos.
+ */
+const PROHIBIDAS_073: ReadonlyArray<{ etiqueta: string; patron: RegExp }> = [
+  { etiqueta: "DROP COLUMN", patron: /\bDROP\s+COLUMN\b/i },
+  { etiqueta: "DROP CONSTRAINT", patron: /\bDROP\s+CONSTRAINT\b/i },
+  { etiqueta: "DROP INDEX", patron: /\bDROP\s+INDEX\b/i },
+  { etiqueta: "DROP POLICY", patron: /\bDROP\s+POLICY\b/i },
+  { etiqueta: "DROP TABLE", patron: /\bDROP\s+TABLE\b/i },
+  { etiqueta: "DROP SCHEMA", patron: /\bDROP\s+SCHEMA\b/i },
+  { etiqueta: "FOREIGN KEY", patron: /\bFOREIGN\s+KEY\b/i },
+  { etiqueta: "REFERENCES", patron: /\bREFERENCES\b/i },
+  { etiqueta: "INSERT", patron: /\bINSERT\b/i },
+  { etiqueta: "UPDATE", patron: /\bUPDATE\b/i },
+  { etiqueta: "DELETE", patron: /\bDELETE\b/i },
+  { etiqueta: "TRUNCATE", patron: /\bTRUNCATE\b/i },
+  { etiqueta: "MERGE", patron: /\bMERGE\b/i },
+  { etiqueta: "DEFAULT", patron: /\bDEFAULT\b/i },
+  // Mayúsculas, porque sólo puede ser el nombre de la fila del sistema: si
+  // aparece, alguien metió una sentencia de datos sobre ella.
+  { etiqueta: "SEDE", patron: /\bSEDE\b/ },
+];
+
+/** Las infracciones del archivo, en el orden en que se declararon. */
+function infracciones073(fuente: string): string[] {
+  return PROHIBIDAS_073.filter((p) => p.patron.test(fuente)).map((p) => p.etiqueta);
+}
+
+/** Cada `DROP` del archivo, con el objeto que le sigue: la única forma admitida es `NOT NULL`. */
+function dropsDe073(fuente: string): string[] {
+  return [...fuente.matchAll(/\bDROP\b((?:\s+\w+)*)/gi)].map((m) =>
+    m[1].trim().replace(/\s+/g, " ").toUpperCase(),
+  );
+}
+
+/**
+ * Las tablas cuya `sede_id` es OBLIGATORIA, derivadas de las migraciones y no
+ * de una lista escrita a mano: cada `CREATE TABLE` se lee con su cuerpo para
+ * clasificar la declaración de la columna, y cada `SET NOT NULL` posterior
+ * corrige la clasificación (es lo que convierte `users` de nulable en
+ * obligatoria en 003_admin.sql).
+ *
+ * Los comentarios se quitan antes de leer: la sección de reversión de 073
+ * repite el `SET NOT NULL` de las dieciocho tablas como texto comentado, y sin
+ * esta limpieza el archivo se declararía a sí mismo como el origen del
+ * esquema.
+ */
+function esquemaSedeObligatoria(): {
+  obligatorias: string[];
+  porClavePrimaria: string[];
+  yaNulables: string[];
+} {
+  const dir = join(process.cwd(), "supabase", "migrations");
+  const obligatorias = new Set<string>();
+  const porClavePrimaria = new Set<string>();
+  const yaNulables = new Set<string>();
+  for (const archivo of readdirSync(dir).filter((n) => n.endsWith(".sql")).sort()) {
+    const texto = readFileSync(join(dir, archivo), "utf8")
+      .split("\n")
+      .map((linea) => linea.split("--")[0])
+      .join("\n");
+    for (const bloque of texto.matchAll(
+      /CREATE TABLE (?:IF NOT EXISTS )?public\.([a-z0-9_]+) \(([\s\S]*?)\n\);/g,
+    )) {
+      const tabla = bloque[1];
+      const declaracion = bloque[2]
+        .split("\n")
+        .map((linea) => linea.trim())
+        .find((linea) => /^sede_id\b/.test(linea));
+      if (!declaracion) continue;
+      if (/^sede_id\s+uuid\s+PRIMARY KEY\b/i.test(declaracion)) porClavePrimaria.add(tabla);
+      else if (/^sede_id\s+uuid\s+NOT\s+NULL\b/i.test(declaracion)) obligatorias.add(tabla);
+      else yaNulables.add(tabla);
+    }
+    for (const [, tabla] of texto.matchAll(
+      /ALTER TABLE public\.([a-z0-9_]+)\s+ALTER COLUMN sede_id SET NOT NULL/g,
+    )) {
+      yaNulables.delete(tabla);
+      obligatorias.add(tabla);
+    }
+  }
+  const orden = (a: string, b: string) => a.localeCompare(b);
+  return {
+    obligatorias: [...obligatorias].sort(orden),
+    porClavePrimaria: [...porClavePrimaria].sort(orden),
+    yaNulables: [...yaNulables].sort(orden),
+  };
+}
+
+describe("migración 073_sede_id_nullable.sql (M3b)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "073_sede_id_nullable.sql"),
+    "utf8",
+  );
+  /** El archivo sin comentarios: lo que el runner envía a la base. */
+  const sql = raw
+    .split("\n")
+    .filter((linea) => !linea.trimStart().startsWith("--"))
+    .join("\n");
+  const esquema = esquemaSedeObligatoria();
+
+  it("el esquema tiene dieciocho sedes obligatorias, dos por clave primaria y una ya nulable", () => {
+    // La lista de la migración tiene que seguir al ESQUEMA. Si una migración
+    // futura añade una tabla con `sede_id` obligatoria, esta cuenta se mueve y
+    // la comparación exacta de la prueba siguiente falla pidiendo la línea nueva.
+    expect(esquema.obligatorias).toHaveLength(18);
+    // Las dos que son clave primaria NO son relajables sin quitar la clave, que
+    // es justo lo que esta unidad prohíbe; y 072 ya decidió que las borra M3c.
+    expect(esquema.porClavePrimaria).toEqual(["invoice_sequences", "voucher_settings"]);
+    // Y la única que nació nulable a propósito (008_hardening.sql).
+    expect(esquema.yaNulables).toEqual(["audit_logs"]);
+  });
+
+  it("relaja `sede_id` en cada tabla que la exigía, y en ninguna más", () => {
+    for (const tabla of esquema.obligatorias) {
+      expect(sql, `${tabla} sigue con la sede obligatoria`).toContain(
+        `ALTER TABLE public.${tabla} ALTER COLUMN sede_id DROP NOT NULL;`,
+      );
+    }
+    const tocadas = [...new Set([...sql.matchAll(/ALTER TABLE public\.([a-z0-9_]+)/g)].map((m) => m[1]))];
+    expect(tocadas.sort((a, b) => a.localeCompare(b))).toEqual(esquema.obligatorias);
+  });
+
+  it("sólo contiene las dieciocho relajaciones: ni una sentencia más", () => {
+    const sentencias = sql
+      .split("\n")
+      .map((linea) => linea.trim())
+      .filter(Boolean);
+    expect(sentencias).toHaveLength(18);
+    for (const sentencia of sentencias) {
+      expect(sentencia).toMatch(/^ALTER TABLE public\.[a-z0-9_]+ ALTER COLUMN sede_id DROP NOT NULL;$/);
+    }
+  });
+
+  it("no borra nada, no escribe filas, no inventa valores por omisión ni toca a la sede", () => {
+    // Contra el archivo COMPLETO, comentarios incluidos: la prosa puede decir
+    // «no borra la columna», pero no puede traer una sentencia que sí lo haga.
+    expect(infracciones073(raw)).toEqual([]);
+    // Y el único `DROP` del archivo es el de la nulabilidad.
+    expect([...new Set(dropsDe073(raw))]).toEqual(["NOT NULL"]);
+  });
+
+  it("declara el motivo, las tres que quedan fuera, la reversión y que no se ejecutó", () => {
+    expect(raw).toContain("una sola sede");
+    expect(raw).toContain("ADITIVO, REVERSIBLE E IDEMPOTENTE");
+    // Las tres exclusiones, nombradas con el motivo de cada una.
+    expect(raw).toContain("invoice_sequences");
+    expect(raw).toContain("voucher_settings");
+    expect(raw).toContain("audit_logs");
+    expect(raw).toContain("CLAVE PRIMARIA");
+    // La reversión, sentencia por sentencia.
+    expect(raw).toContain("ALTER TABLE public.users ALTER COLUMN sede_id SET NOT NULL;");
+    expect(raw).toContain(
+      "ALTER TABLE public.payroll_discount_carries ALTER COLUMN sede_id SET NOT NULL;",
+    );
+    // Las consultas de sólo lectura: la de nulabilidad por tabla y la que deja
+    // ver que las claves foráneas siguen puestas.
+    expect(raw).toContain("information_schema.columns");
+    expect(raw).toContain("is_nullable");
+    expect(raw).toContain("pg_constraint");
+    // Nombres reales de los objetos que esta unidad NO toca: citarlos en la
+    // prosa es dejar constancia de que se conservaron.
+    expect(raw).toContain("fk_users_sede");
+    expect(raw).toContain("uq_payroll_draft_per_range");
+    expect(raw).toContain("ex_payroll_periods_no_overlap");
+    // La línea de casa: el archivo no se ejecutó contra una base.
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("control negativo: el detector no es un sello de goma", () => {
+    const original = "ALTER TABLE public.users ALTER COLUMN sede_id DROP NOT NULL;";
+
+    // La infracción que abre la unidad: quitar la clave foránea en vez de relajar
+    // la columna. Deja filas apuntando a una sede que ya no se valida.
+    const sinClaveForanea = raw.replace(original, "ALTER TABLE public.users DROP CONSTRAINT fk_users_sede;");
+    expect(sinClaveForanea).not.toBe(raw);
+    expect(infracciones073(sinClaveForanea)).toContain("DROP CONSTRAINT");
+    // El `DROP` aunque no lo nombre la lista también vuelve culpable al archivo.
+    expect(dropsDe073(sinClaveForanea).filter((d) => d !== "NOT NULL")).toEqual([
+      "CONSTRAINT FK_USERS_SEDE",
+    ]);
+
+    // Las otras tres formas de romper la misma promesa.
+    expect(infracciones073(raw.replace(original, "ALTER TABLE public.users DROP COLUMN sede_id;"))).toContain(
+      "DROP COLUMN",
+    );
+    expect(infracciones073(raw.replace(original, "INSERT INTO public.users (email) VALUES ('x@x.com');"))).toContain(
+      "INSERT",
+    );
+    expect(
+      infracciones073(raw.replace(original, "ALTER TABLE public.users ALTER COLUMN sede_id SET DEFAULT NULL;")),
+    ).toContain("DEFAULT");
+
+    // Y el archivo bueno no tiene infracciones: el detector sólo señala de más
+    // cuando hay algo que señalar.
+    expect(infracciones073(raw)).toEqual([]);
+  });
+
+  it("control negativo: una tabla que se queda obligatoria rompe la lista", () => {
+    const sinProductos = raw.replace(
+      "ALTER TABLE public.products ALTER COLUMN sede_id DROP NOT NULL;",
+      "",
+    );
+    const tocadas = [
+      ...sinProductos.matchAll(/ALTER TABLE public\.([a-z0-9_]+) ALTER COLUMN sede_id DROP NOT NULL;/g),
+    ].map((m) => m[1]);
+    expect(tocadas).not.toContain("products");
+    expect(tocadas).toHaveLength(17);
+  });
+});
+
+// ----------------- M3b-bis: las unicidades ya no dependen de la sede --------
+
+/**
+ * Una unicidad que hoy lleva `sede_id` como elemento, LEÍDA DE LAS MIGRACIONES
+ * y no de una lista escrita a mano.
+ *
+ * La lista no se escribe a propósito: si esta unidad la escribiera a mano, el
+ * día en que una migración nueva declare otra unicidad por sede la prueba
+ * seguiría verde sobre una base que ya tiene la nueva. Al derivarla, esa
+ * migración hace fallar la comparación del inventario y obliga a decidir.
+ */
+interface UnicidadConSede {
+  /** `constraint` = `UNIQUE (…)` en línea; `index` = `CREATE UNIQUE INDEX`. */
+  forma: "constraint" | "index";
+  tabla: string;
+  /** El nombre REAL del objeto en el catálogo, como existe hoy. */
+  nombre: string;
+  /** Columnas en orden, `sede_id` incluida. */
+  columnas: string[];
+  /** Las mismas columnas sin `sede_id`: la forma final que 074 debe dejar. */
+  sinSede: string[];
+  /** El `WHERE` del índice parcial, EXACTO como está escrito; `null` si no es parcial. */
+  where: string | null;
+  /** La migración que lo declaró. */
+  origen: string;
+}
+
+/** Una exclusión `EXCLUDE USING gist`, leída del disco. */
+interface ExclusionesConSede {
+  nombre: string;
+  /** Elementos uno por uno, sin partir dentro de un `(` … `)`. */
+  elementos: string[];
+  origen: string;
+}
+
+/**
+ * Parte una lista de columnas o de elementos de exclusión por las comas de
+ * NIVEL SUPERIOR. Sin esto, `daterange(start_date, end_date, '[]')` se rompería
+ * en tres trozos y `uq_sedes_name (lower(btrim(name)))` en dos.
+ */
+function separarPorComas(cuerpo: string): string[] {
+  const partes: string[] = [];
+  let actual = "";
+  let profundidad = 0;
+  for (const caracter of cuerpo) {
+    if (caracter === "(") profundidad += 1;
+    if (caracter === ")") profundidad -= 1;
+    if (caracter === "," && profundidad === 0) {
+      partes.push(actual);
+      actual = "";
+      continue;
+    }
+    actual += caracter;
+  }
+  if (actual.trim()) partes.push(actual);
+  return partes.map((parte) => parte.replace(/\s+/g, " ").trim());
+}
+
+/** Un solo espacio entre palabras, para comparar SQL sin depender del formato. */
+function normalizar(sql: string): string {
+  return sql.replace(/\s+/g, " ").trim();
+}
+
+const DIR_MIGRACIONES = join(process.cwd(), "supabase", "migrations");
+
+/**
+ * Las migraciones que la 074 tiene DELANTE: las numeradas por debajo de ella, en
+ * orden. NO las de después, y el corte es deliberado.
+ *
+ * La 074 reescribe el inventario que existía cuando se corrió. Una migración
+ * posterior que declare otra unicidad o exclusión por sede —o que vuelva a
+ * declarar un objeto que la 074 ya reescribió— no es un defecto de la 074: es de
+ * la unidad que le corresponda, y la 074 no puede soltar un objeto que no existía
+ * cuando se aplicó. Sin este corte, la 075 que ya está en el disco —y cualquier
+ * 076— puede voltear el inventario derivado y hacer caer una guarda que está
+ * correcta, con un mensaje que señala a la 074 un defecto que no tiene.
+ *
+ * El corte conserva la alarma para lo que sí es alarma: cualquier unicidad o
+ * exclusión por sede declarada ANTES de la 074 y que la 074 no reescriba sigue
+ * haciendo fallar la prueba.
+ */
+function migracionesPrevias(): string[] {
+  return readdirSync(DIR_MIGRACIONES)
+    .filter((n) => n.endsWith(".sql") && n < "074_")
+    .sort();
+}
+
+/**
+ * El SQL sin comentarios: lo que el runner envía a la base. Se parte por línea y
+ * se corta en el `--`, como el lector de 073, para que un objeto citado en la
+ * prosa de una migración no se confunda con el objeto declarado.
+ */
+function sqlDeMigracion(fuente: string): string {
+  return fuente
+    .split("\n")
+    .map((linea) => linea.split("--")[0])
+    .join("\n");
+}
+
+/** Toda unicidad o exclusión que lleva `sede_id` como elemento. */
+function unicidadesYExclusionesConSede(): {
+  unicidades: UnicidadConSede[];
+  exclusiones: ExclusionesConSede[];
+} {
+  // Una migración posterior puede re-declarar un objeto con otro cuerpo —la 063
+  // reemplazó la exclusión de la 035 y le agregó la cadencia—, y gana la ÚLTIMA
+  // declaración, que es la que está vigente en el catálogo. Se indexa por nombre
+  // por eso: 035 y 063 usan el mismo.
+  const unicas = new Map<string, UnicidadConSede>();
+  const exclusiones = new Map<string, ExclusionesConSede>();
+
+  for (const archivo of migracionesPrevias()) {
+    const texto = sqlDeMigracion(readFileSync(join(DIR_MIGRACIONES, archivo), "utf8"));
+
+    // (a) `UNIQUE (…)` escrito en línea dentro del `CREATE TABLE`: su nombre NO
+    //     lo eligió una persona, lo derivó PostgreSQL de las columnas. Ese
+    //     nombre derivado es el que hay que soltar en 074.
+    for (const bloque of texto.matchAll(
+      /CREATE TABLE (?:IF NOT EXISTS )?public\.([a-z0-9_]+) \(([\s\S]*?)\n\);/g,
+    )) {
+      const tabla = bloque[1];
+      for (const linea of bloque[2].split("\n")) {
+        const declarado = linea.match(/^\s*UNIQUE\s*\(([^)]*)\)/i);
+        if (!declarado) continue;
+        const columnas = separarPorComas(declarado[1]);
+        if (!columnas.includes("sede_id")) continue;
+        unicas.set(`${tabla}_${columnas.join("_")}_key`, {
+          forma: "constraint",
+          tabla,
+          nombre: `${tabla}_${columnas.join("_")}_key`,
+          columnas,
+          sinSede: columnas.filter((columna) => columna !== "sede_id"),
+          where: null,
+          origen: archivo,
+        });
+      }
+    }
+
+    // (b) `CREATE UNIQUE INDEX`: nombre elegido a mano, columnas y `WHERE`.
+    for (const declarado of texto.matchAll(
+      /CREATE UNIQUE INDEX (?:IF NOT EXISTS )?([a-z0-9_]+)\s+ON public\.([a-z0-9_]+)\s*\(([^)]*)\)\s*(WHERE\b[^;]*)?;/g,
+    )) {
+      const [, nombre, tabla, columnasCrudas, whereCrudo] = declarado;
+      const columnas = separarPorComas(columnasCrudas);
+      if (!columnas.includes("sede_id")) continue;
+      unicas.set(nombre, {
+        forma: "index",
+        tabla,
+        nombre,
+        columnas,
+        sinSede: columnas.filter((columna) => columna !== "sede_id"),
+        where: whereCrudo ? normalizar(whereCrudo) : null,
+        origen: archivo,
+      });
+    }
+
+    // (c) `EXCLUDE USING gist (…)`, con el nombre que su migración le dio.
+    for (const declarado of texto.matchAll(
+      /ADD CONSTRAINT ([a-z0-9_]+)\s+EXCLUDE USING gist\s*\(([^;]*)\);/g,
+    )) {
+      const elementos = separarPorComas(declarado[2]);
+      if (!elementos.some((elemento) => /^sede_id\b/.test(elemento))) continue;
+      exclusiones.set(declarado[1], { nombre: declarado[1], elementos, origen: archivo });
+    }
+  }
+
+  return { unicidades: [...unicas.values()], exclusiones: [...exclusiones.values()] };
+}
+
+/** El nombre que PostgreSQL deriva de un `UNIQUE (…)`. */
+function nombreDerivado(tabla: string, columnas: string[]): string {
+  return `${tabla}_${columnas.join("_")}_key`;
+}
+
+/**
+ * Lo que 074 DEBE dejar de un objeto, en forma de texto normalizado. Es la
+ * misma forma que se le inyecta a los controles negativos: el motor es uno solo,
+ * así que un control negativo que pasa es un defecto real del detector.
+ */
+function formaFinal(objeto: UnicidadConSede): {
+  soltar: string;
+  declarar: RegExp;
+  esperado: string;
+} {
+  if (objeto.forma === "constraint") {
+    const nuevo = nombreDerivado(objeto.tabla, objeto.sinSede);
+    return {
+      soltar: `DROP CONSTRAINT IF EXISTS ${objeto.nombre}`,
+      declarar: new RegExp(String.raw`ADD CONSTRAINT ${nuevo}\s+UNIQUE\s*\(([^)]*)\)`, "i"),
+      esperado: `ADD CONSTRAINT ${nuevo} UNIQUE (${objeto.sinSede.join(", ")})`,
+    };
+  }
+  return {
+    soltar: `DROP INDEX IF EXISTS public.${objeto.nombre}`,
+    declarar: new RegExp(
+      String.raw`CREATE UNIQUE INDEX ${objeto.nombre}\s+ON public\.${objeto.tabla}\s*\(([^)]*)\)(\s*WHERE\b[^;]*)?;`,
+      "i",
+    ),
+    esperado: `CREATE UNIQUE INDEX ${objeto.nombre} ON public.${objeto.tabla} (${objeto.sinSede.join(", ")})`,
+  };
+}
+
+/**
+ * El motor de la guarda: devuelve una lista de FALTAS (vacía = el archivo
+ * cumple). Trabaja sobre el TEXTO del archivo, no sobre el disco, para que los
+ * controles negativos puedan inyectarle un 074 sintético.
+ */
+function revisarSedeLess(
+  fuente: string,
+  esperado: { unicidades: UnicidadConSede[]; exclusiones: ExclusionesConSede[] },
+): string[] {
+  const sql = normalizar(sqlDeMigracion(fuente)).toLowerCase();
+  const falta: string[] = [];
+
+  // (0) Nada que destruya: esta unidad quita una restricción y la repone.
+  const destructivas: Array<[string, RegExp]> = [
+    ["DELETE", /\bdelete\b/i],
+    ["UPDATE", /\bupdate\b/i],
+    ["TRUNCATE", /\btruncate\b/i],
+    ["DROP COLUMN", /\bdrop\s+column\b/i],
+    ["DROP TABLE", /\bdrop\s+table\b/i],
+    ["DROP POLICY", /\bdrop\s+policy\b/i],
+  ];
+  for (const [etiqueta, patron] of destructivas) {
+    if (patron.test(fuente)) falta.push(`sentencia destructiva ${etiqueta}`);
+  }
+
+  // (1) Cada unicidad por sede queda reescrita sin `sede_id`, con el resto igual.
+  for (const objeto of esperado.unicidades) {
+    const { soltar, declarar, esperado: definicionEsperada } = formaFinal(objeto);
+    if (!sql.includes(soltar.toLowerCase())) {
+      falta.push(`${objeto.nombre}: no se suelta`);
+      continue;
+    }
+    const hallada = declarar.exec(sql);
+    if (!hallada) {
+      falta.push(`${objeto.nombre}: no se vuelve a declarar`);
+      continue;
+    }
+    const declarada = normalizar(hallada[0]);
+    const columnas = separarPorComas(hallada[1]);
+    if (columnas.join(", ") !== objeto.sinSede.join(", ")) {
+      falta.push(
+        `${objeto.nombre}: columnas ${columnas.join(", ")} en vez de ${objeto.sinSede.join(", ")}`,
+      );
+      continue;
+    }
+    // `sede_id` no puede quedar como COLUMNA. El nombre del objeto sí puede
+    // contenerlo —`uq_invoices_sede_idempotency_key` es un nombre ELEGIDO, no
+    // derivado de las columnas—, así que la comparación es sobre el cuerpo con
+    // el nombre puesto aparte.
+    const cuerpo = declarada
+      .replaceAll(objeto.nombre, "")
+      .replaceAll(nombreDerivado(objeto.tabla, objeto.sinSede), "");
+    if (cuerpo.includes("sede_id")) {
+      falta.push(`${objeto.nombre}: la definición todavía nombra sede_id`);
+    }
+    if (!declarada.startsWith(definicionEsperada.toLowerCase())) {
+      falta.push(`${objeto.nombre}: la definición no es la esperada (${declarada})`);
+    }
+    // El `WHERE` de un parcial se copia al carácter: es lo que decide qué filas
+    // entran al índice, y cambiarlo cambia el alcance de la garantía.
+    if (objeto.where !== null) {
+      const whereHallado = hallada[2] ? normalizar(hallada[2]) : "";
+      if (whereHallado.toLowerCase() !== objeto.where.toLowerCase()) {
+        falta.push(`${objeto.nombre}: WHERE ${whereHallado} en vez de ${objeto.where}`);
+      }
+    }
+  }
+
+  // (2) La exclusión: MISMO nombre y exactamente los elementos que quedan.
+  for (const objeto of esperado.exclusiones) {
+    if (!sql.includes(`drop constraint if exists ${objeto.nombre}`.toLowerCase())) {
+      falta.push(`${objeto.nombre}: no se suelta`);
+      continue;
+    }
+    const declarada = new RegExp(
+      String.raw`ADD CONSTRAINT ([a-z0-9_]+)\s+EXCLUDE USING gist\s*\(([^;]*)\);`,
+      "i",
+    ).exec(sql);
+    if (!declarada) {
+      falta.push(`${objeto.nombre}: no se vuelve a declarar`);
+      continue;
+    }
+    if (declarada[1].toLowerCase() !== objeto.nombre.toLowerCase()) {
+      falta.push(
+        `${objeto.nombre}: renombrada a ${declarada[1]} (el nombre es un contrato de ejecución)`,
+      );
+    }
+    const elementos = separarPorComas(declarada[2]);
+    const esperados = objeto.elementos.filter((elemento) => !/^sede_id\b/.test(elemento));
+    if (elementos.length !== esperados.length) {
+      falta.push(`${objeto.nombre}: ${elementos.length} elementos en vez de ${esperados.length}`);
+    }
+    if (elementos.join(" | ").toLowerCase() !== esperados.join(" | ").toLowerCase()) {
+      falta.push(
+        `${objeto.nombre}: elementos ${elementos.join(" | ")} en vez de ${esperados.join(" | ")}`,
+      );
+    }
+  }
+
+  return falta;
+}
+
+/**
+ * Un delimitador de cadena con `$`: `$$` o `$etiqueta$`. Es la forma EXACTA que
+ * acepta el léxico de PostgreSQL —una `$` suelta, o una pegada al identificador,
+ * no encierran nada— y por eso es la única forma que este archivo debe usar.
+ */
+const DELIMITADOR_DOLLAR = /^(?:\$\$|\$[A-Za-z_][A-Za-z0-9_]*\$)/;
+
+/** Todos los delimitadores bien formados que el archivo declara, en orden. */
+function etiquetasDollar(sql: string): string[] {
+  return sql.match(/\$\$|\$[A-Za-z_][A-Za-z0-9_]*\$/g) ?? [];
+}
+
+/** Un delimitador con `$` que apareció dentro de un literal de comilla simple. */
+interface LitoTragado {
+  /** La línea del delimitador tragado. */
+  linea: number;
+  /** La línea donde se abrió el literal que lo tragó. */
+  abre: number;
+  etiqueta: string;
+}
+
+/** Una comilla que CIERRA un literal y delante de la cual queda un identificador. */
+interface ComillaPegada {
+  /** La línea de la comilla que cierra el literal. */
+  linea: number;
+  /** El identificador pegado: la palabra que se quedó fuera del literal. */
+  palabra: string;
+}
+
+/**
+ * El motor de la guarda de literales: devuelve una lista de FALTAS (vacía = el
+ * archivo cumple). Trabaja sobre el TEXTO, como `revisarSedeLess`, para que los
+ * controles negativos puedan inyectarle un 074 sintético.
+ *
+ * Exige cinco cosas, y las cinco importan por un motivo DISTINTO —las dos
+ * primeras son la misma familia de errata de etiqueta, las dos siguientes son las
+ * que impedían que el archivo se analizara, y la quinta es la que la paridad no
+ * puede ver:
+ *
+ *   * que cada `$` abra o cierre un delimitador BIEN FORMADO (`$$` o
+ *     `$etiqueta$`): un `s$q$` deja la `$` pegada al identificador, que es
+ *     justo la errata que empalma el cuerpo de una consulta con el de la otra;
+ *   * que dentro de una cadena CON etiqueta no aparezca OTRA: un `$$` ahí es
+ *     un delimitador que no cierra nada. El anidamiento sólo se admite dentro
+ *     del `$$` del bloque `DO`, que es donde las consultas `$q$` viven;
+ *   * que cada etiqueta distinta aparezca un número PAR de veces, que es el
+ *     emparejamiento: un par impar significa un literal sin terminar, y el
+ *     archivo entero deja de analizarse en la sentencia donde se abre;
+ *   * que dentro del cuerpo de cada `DO $$ … $$` no quede un literal de COMILLA
+ *     SIMPLE sin cerrar. Ésa es la que rompía el archivo: una comilla de menos en
+ *     la etiqueta de una fila del `VALUES` cierra el literal antes de tiempo, el
+ *     paréntesis de la fila se consume de más, y el analizador llega a la
+ *     consulta que sigue esperando `LOOP`.
+ *   * y —en TODO el archivo, no sólo en los bloques `DO`— que ninguna comilla
+ *     que CIERRA un literal lleve un identificador pegado detrás. Es la quinta
+ *     porque las otras cuatro no la ven: una comilla sin doblar que abre una
+ *     palabra por dentro sigue dejando el número de comillas PAR, así que el
+ *     conteo, la paridad y el «literal sin cerrar» dan el archivo por bueno
+ *     mientras la base responde 42601. El detalle de por qué la posición del
+ *     signo es la única señal está en `contarLiteralesSimples`.
+ */
+function revisarLiterales(fuente: string): string[] {
+  const sql = sqlDeMigracion(fuente);
+  const falta: string[] = [];
+  const lineaDe = (pos: number) => sql.slice(0, pos).split("\n").length;
+  const abiertas: Array<{ etiqueta: string; linea: number; desde: number }> = [];
+  const cuerposDo: Array<{ desde: number; hasta: number }> = [];
+
+  let i = 0;
+  while (i < sql.length) {
+    if (sql[i] !== "$") {
+      i += 1;
+      continue;
+    }
+    const cierre = DELIMITADOR_DOLLAR.exec(sql.slice(i));
+    if (!cierre) {
+      falta.push(`línea ${lineaDe(i)}: \`$\` suelta, no abre ni cierra un delimitador`);
+      i += 1;
+      continue;
+    }
+    const etiqueta = cierre[0];
+    const previa = i > 0 ? sql[i - 1] : "";
+    if (/[A-Za-z0-9_]/.test(previa)) {
+      falta.push(
+        `línea ${lineaDe(i)}: \`${previa}${etiqueta}\` — la etiqueta no puede ir pegada a un identificador; cierre con \`${etiqueta}\``,
+      );
+      i += etiqueta.length;
+      continue;
+    }
+    const abierta = abiertas[abiertas.length - 1];
+    if (abierta && abierta.etiqueta !== etiqueta && abierta.etiqueta !== "$$") {
+      falta.push(
+        `línea ${lineaDe(i)}: \`${etiqueta}\` dentro de la cadena \`${abierta.etiqueta}\` abierta en la línea ${abierta.linea}`,
+      );
+      i += etiqueta.length;
+      continue;
+    }
+    if (abierta && abierta.etiqueta === etiqueta) {
+      // El cuerpo del `DO $$ … $$` se vuelve a recorrer como PL/pgSQL más abajo,
+      // y empieza DESPUÉS del delimitador de apertura: si el recorrido arrancara
+      // en él, el propio `$$` se tragaría el cuerpo entero como una cadena opaca
+      // y no habría nada que contar.
+      if (etiqueta === "$$") {
+        cuerposDo.push({ desde: abierta.desde + etiqueta.length, hasta: i });
+      }
+      abiertas.pop();
+    } else {
+      abiertas.push({ etiqueta, linea: lineaDe(i), desde: i });
+    }
+    i += etiqueta.length;
+  }
+  for (const abierta of abiertas) {
+    falta.push(`línea ${abierta.linea}: la cadena \`${abierta.etiqueta}\` nunca se cierra`);
+  }
+
+  // Y el conteo por etiqueta: par es emparejada, impar es un literal colgado.
+  const conteo = new Map<string, number>();
+  for (const etiqueta of etiquetasDollar(sql)) {
+    conteo.set(etiqueta, (conteo.get(etiqueta) ?? 0) + 1);
+  }
+  for (const [etiqueta, veces] of conteo) {
+    if (veces % 2 !== 0) falta.push(`\`${etiqueta}\` aparece ${veces} veces y no queda emparejada`);
+  }
+
+  // Y los literales simples del cuerpo de cada `DO $$ … $$`.
+  for (const cuerpo of cuerposDo) {
+    const simples = contarLiteralesSimples(sql, cuerpo.desde, cuerpo.hasta);
+    for (const pegada of simples.pegadas) {
+      falta.push(
+        `línea ${pegada.linea}: la comilla que cierra el literal deja pegada la palabra \`${pegada.palabra}\` — en un literal hay que doblarla (\`''${pegada.palabra}''\`); así la palabra se sale del literal y PostgreSQL responde 42601`,
+      );
+    }
+    for (const tragado of simples.tragados) {
+      falta.push(
+        `línea ${tragado.linea}: el literal de comilla simple que abre en la línea ${tragado.abre} se tragó el delimitador \`${tragado.etiqueta}\` — el lector perdió la cuenta en ese punto`,
+      );
+    }
+    for (const linea of simples.sinCerrar) {
+      falta.push(
+        `línea ${linea}: el literal de comilla simple que abre aquí no se cierra antes del final del bloque \`DO $$ … $$\``,
+      );
+    }
+  }
+
+  // Y la misma regla FUERA de los bloques `DO`: un literal suelto —un
+  // `COMMENT`, un `RAISE`, una sentencia de nivel superior— también puede
+  // perder una comilla al medio, y ahí no hay bloque que lo revise. En este
+  // recorrido los cuerpos con `$$` son opacos, así que lo ya contado arriba no
+  // aparece dos veces.
+  const exterior = contarLiteralesSimples(sql, 0, sql.length);
+  for (const pegada of exterior.pegadas) {
+    falta.push(
+      `línea ${pegada.linea}: la comilla que cierra el literal deja pegada la palabra \`${pegada.palabra}\` — en un literal hay que doblarla (\`''${pegada.palabra}''\`); así la palabra se sale del literal y PostgreSQL responde 42601`,
+    );
+  }
+
+  return falta;
+}
+
+/**
+ * Recorre el texto COMO PL/pgSQL y cuenta los literales de comilla simple: las
+ * comillas dobladas `''` son una comilla DENTRO del literal, no un cierre, y un
+ * literal con `$` es contenido opaco que se salta entero. Es lo que permite
+ * distinguir un literal bien cerrado de uno que se tragó el resto del cuerpo.
+ *
+ * Deja tres rastros, y los tres son del mismo defecto leído de tres maneras:
+ *
+ *   * `tragados`: un delimitador con `$` apareció DENTRO de un literal simple.
+ *     En este bloque ninguna construcción legítima lo hace —las consultas `$q$`
+ *     están fuera de todo literal— así que es la línea exacta donde el lector
+ *     perdió la cuenta, que no es la misma que la del final del litigio;
+ *   * `sinCerrar`: el bloque terminó con un literal abierto;
+ *   * `pegadas`: una comilla que CIERRA un literal tiene un identificador pegado
+ *     detrás. Es el rastro que la paridad NO ve, y por eso hace falta: en
+ *     `'… WHERE status = 'borrador')'` hay CUATRO comillas —un número par, un
+ *     conteo parejo, ningún literal sin cerrar— y sin embargo `borrador` queda
+ *     FUERA del literal, como identificador suelto, que es exactamente lo que
+ *     PostgreSQL rechaza con 42601.
+ *
+ * POR QUÉ LA POSICIÓN DEL SIGNO ES LA SEÑAL. En el léxico de PostgreSQL la
+ * comilla que abre va DESPUÉS del prefijo (`E'…'`, `B'…'`, `X'…'`, `U&'…'`) y la
+ * que cierra va al final del literal, nunca pegada a nada: ningún constructor
+ * continúa con una letra, un dígito o un `_` sin separador. Así que una
+ * comilla de cierre seguida de `[A-Za-z0-9_$]` no es una forma rara de escribir
+ * un literal: es la única forma que tiene una comilla Suelta de cerrar donde
+ * debía seguir abierta, con la palabra de adentro escapada por delante. Y el
+ * otro lado —la apertura— NO se puede usar para esto, porque `E'…'` pega una
+ * letra a la comilla de apertura en cada literal con escapes de este archivo.
+ * Lo que se reporta es la PALABRA entera pegada, no una letra: el mensaje dice
+ * qué escribir (`''palabra''`) sin que el lector tenga que volver al archivo.
+ *
+ * `desde`/`hasta` son posiciones en `sql`, y las líneas que devuelve son de `sql`.
+ */
+function contarLiteralesSimples(
+  sql: string,
+  desde: number,
+  hasta: number,
+): {
+  abiertos: number;
+  cerrados: number;
+  tragados: LitoTragado[];
+  sinCerrar: number[];
+  pegadas: ComillaPegada[];
+} {
+  const lineaDe = (pos: number) => sql.slice(0, pos).split("\n").length;
+  const tragados: LitoTragado[] = [];
+  const sinCerrar: number[] = [];
+  const pegadas: ComillaPegada[] = [];
+  let dentro = false;
+  let abierta = 0;
+  let abiertos = 0;
+  let cerrados = 0;
+
+  let i = desde;
+  while (i < hasta) {
+    const ch = sql[i];
+    if (dentro && ch === "$") {
+      const delim = DELIMITADOR_DOLLAR.exec(sql.slice(i, hasta));
+      if (delim) {
+        tragados.push({ linea: lineaDe(i), abre: abierta, etiqueta: delim[0] });
+        const cierre = sql.indexOf(delim[0], i + delim[0].length);
+        i = cierre === -1 || cierre > hasta ? hasta : cierre + delim[0].length;
+        continue;
+      }
+    }
+    if (!dentro && ch === "-" && sql[i + 1] === "-") {
+      const salto = sql.indexOf("\n", i);
+      i = salto === -1 || salto > hasta ? hasta : salto + 1;
+      continue;
+    }
+    if (!dentro && ch === "$") {
+      const delim = DELIMITADOR_DOLLAR.exec(sql.slice(i, hasta));
+      if (delim) {
+        const cierre = sql.indexOf(delim[0], i + delim[0].length);
+        i = cierre === -1 || cierre > hasta ? hasta : cierre + delim[0].length;
+        continue;
+      }
+    }
+    if (ch === "'") {
+      if (dentro && sql[i + 1] === "'") {
+        i += 2;
+        continue;
+      }
+      dentro = !dentro;
+      if (dentro) {
+        abiertos += 1;
+        abierta = lineaDe(i);
+      } else {
+        cerrados += 1;
+        // La comilla que acaba de cerrar: si detrás viene un identificador, la
+        // palabra se salió del literal. Se registra acá, y no al final, porque
+        // la posición del signo es lo único que distingue el defecto del par
+        // de comillas bien formado que lo contiene.
+        const pegado = /^[A-Za-z0-9_$]+/.exec(sql.slice(i + 1, hasta));
+        if (pegado) pegadas.push({ linea: lineaDe(i), palabra: pegado[0] });
+      }
+    }
+    i += 1;
+  }
+  if (dentro) sinCerrar.push(abierta);
+  return { abiertos, cerrados, tragados, sinCerrar, pegadas };
+}
+
+describe("migración 074_sede_less_constraints.sql (M3b)", () => {
+  const raw = readFileSync(join(DIR_MIGRACIONES, "074_sede_less_constraints.sql"), "utf8");
+  const sql = sqlDeMigracion(raw);
+  const derivado = unicidadesYExclusionesConSede();
+
+  /**
+   * El único índice único por sede que 074 NO toca, y la razón: el `upsert` de
+   * `src/features/commissions/service.ts` infiere su `ON CONFLICT` con las
+   * CUATRO columnas, y la inferencia exige coincidencia exacta. Sin `sede_id` en
+   * el índice, ese `upsert` falla con 42P10 en cada alta y edición de regla. El
+   * cambio correcto es el otro orden: primero el `onConflict` del servicio,
+   * después el índice.
+   */
+  const ENLISTADO = "uq_commission_rule";
+  const objetos = derivado.unicidades.filter((u) => u.nombre !== ENLISTADO);
+  const esperado = { unicidades: objetos, exclusiones: derivado.exclusiones };
+
+  it("el inventario derivado de las migraciones es el conocido", () => {
+    // Si una migración futura declara otra unicidad o exclusión por sede, esta
+    // comparación falla pidiendo el nombre nuevo: es la alarma que obliga a
+    // decidir si esta unidad —o la que corresponda— tiene que reescribirla.
+    expect(derivado.unicidades.map((u) => u.nombre).sort()).toEqual([
+      "cash_denominations_sede_id_value_key",
+      "cash_registers_sede_id_name_key",
+      "invoices_sede_id_consecutive_number_key",
+      "payment_methods_sede_id_code_key",
+      "products_sede_id_sku_key",
+      "tax_configs_sede_id_code_name_key",
+      "uq_commission_rule",
+      "uq_employees_sede_code",
+      "uq_invoices_sede_idempotency_key",
+      "uq_payroll_draft_per_range",
+    ]);
+    expect(derivado.exclusiones.map((e) => e.nombre)).toEqual([
+      "ex_payroll_periods_no_overlap",
+    ]);
+  });
+
+  it("deriva del disco las nueve unicidades que 074 reescribe", () => {
+    expect(objetos).toHaveLength(9);
+    // El origen se cita uno por uno para que una definición movida de archivo se
+    // note en la prueba, y no en la base.
+    expect(objetos.map((o) => `${o.origen}:${o.nombre}`)).toEqual([
+      "003_admin.sql:tax_configs_sede_id_code_name_key",
+      "003_admin.sql:payment_methods_sede_id_code_key",
+      "003_admin.sql:uq_employees_sede_code",
+      "004_inventory.sql:products_sede_id_sku_key",
+      "005_billing.sql:invoices_sede_id_consecutive_number_key",
+      "006_cash.sql:cash_registers_sede_id_name_key",
+      "007_payroll.sql:uq_payroll_draft_per_range",
+      "010_cash_denominations.sql:cash_denominations_sede_id_value_key",
+      "041_invoice_idempotency.sql:uq_invoices_sede_idempotency_key",
+    ]);
+    // Y todas llevan `sede_id` hoy: eso es exactamente lo que 074 les quita.
+    for (const objeto of objetos) expect(objeto.columnas).toContain("sede_id");
+    // Los tres parciales traen su `WHERE`, que hay que conservar al carácter.
+    expect(objetos.filter((o) => o.where !== null).map((o) => o.nombre)).toEqual([
+      "uq_employees_sede_code",
+      "uq_payroll_draft_per_range",
+      "uq_invoices_sede_idempotency_key",
+    ]);
+  });
+
+  it("074 reescribe cada una sin sede_id, conservando el resto y el WHERE", () => {
+    expect(revisarSedeLess(raw, esperado)).toEqual([]);
+  });
+
+  it("la exclusión conserva el nombre y deja exactamente los dos elementos", () => {
+    const origen = derivado.exclusiones[0];
+    // Leída del disco: hoy son `sede_id` + el cubo de cadencia + el rango.
+    expect(origen.origen).toBe("063_nomina_frecuencias.sql");
+    expect(origen.elementos).toEqual([
+      "sede_id WITH =",
+      "coalesce(frequency, '') WITH =",
+      "daterange(start_date, end_date, '[]') WITH &&",
+    ]);
+
+    const declarada = new RegExp(
+      String.raw`ADD CONSTRAINT ex_payroll_periods_no_overlap\s+EXCLUDE USING gist\s*\(([^;]*)\);`,
+      "i",
+    ).exec(normalizar(sql));
+    expect(declarada).not.toBeNull();
+    expect(separarPorComas(declarada![1])).toEqual([
+      "coalesce(frequency, '') WITH =",
+      "daterange(start_date, end_date, '[]') WITH &&",
+    ]);
+    // Ni un `sede_id` suelto, ni un tercer elemento disfrazado.
+    expect(normalizar(sql)).not.toContain("sede_id WITH =");
+    expect(normalizar(sql).match(/WITH (=|&&)/g) ?? []).toHaveLength(2);
+    // Y el nombre no cambió: es el que el dominio y el mapeo 23P01 →
+    // PERIOD_OVERLAP usan para hablar de la garantía.
+    expect(raw).toContain("DROP CONSTRAINT IF EXISTS ex_payroll_periods_no_overlap;");
+    // Contado sobre el SQL SIN comentarios: la sección de reversión repite la
+    // declaración como texto comentado y no es una segunda declaración.
+    expect(normalizar(sql).match(/ADD CONSTRAINT ex_payroll_periods_no_overlap/g) ?? []).toHaveLength(1);
+  });
+
+  it("el pre-vuelo existe, va primero y aborta en vez de borrar", () => {
+    const preVuelo = sql.indexOf("DO $$");
+    const primeraCaida = sql.search(/\bDROP\s+(CONSTRAINT|INDEX)\b/i);
+    expect(preVuelo).toBeGreaterThan(-1);
+    expect(preVuelo).toBeLessThan(primeraCaida);
+
+    // Aborta nombrando las filas y|elevation qué hacer: no reescribe nada.
+    expect(raw).toContain("RAISE EXCEPTION");
+    expect(raw).toContain("ABORTADA");
+    expect(raw).toContain("No se borró, no se fusionó y no se reescribió ninguna fila");
+    expect(raw).toContain("vuelva a correr el archivo completo");
+
+    // Y chequea los diez puntos: cada objeto reescrito y el solape de nómina.
+    for (const objeto of objetos) {
+      expect(raw, `el pre-vuelo no chequea ${objeto.nombre}`).toContain(objeto.nombre);
+    }
+    expect(raw).toContain("ex_payroll_periods_no_overlap -> (coalesce(frequency");
+  });
+
+  it("no borra ni reescribe datos, y cada DROP es sobre un objeto conocido", () => {
+    for (const sentencia of [
+      /\bDELETE\b/i,
+      /\bUPDATE\b/i,
+      /\bTRUNCATE\b/i,
+      /\bDROP\s+COLUMN\b/i,
+      /\bDROP\s+TABLE\b/i,
+      /\bDROP\s+POLICY\b/i,
+    ]) {
+      expect(raw).not.toMatch(sentencia);
+    }
+    // Cada `DROP` del archivo (contada la prosa, que repite la reversión) suelta
+    // un objeto de la lista: el nombre viejo o el que deriva de las columnas sin
+    // sede. Nada más se suelta en este archivo.
+    const conocidos = new Set<string>([
+      ...objetos.map((o) => o.nombre),
+      ...objetos
+        .filter((o) => o.forma === "constraint")
+        .map((o) => nombreDerivado(o.tabla, o.sinSede)),
+      "ex_payroll_periods_no_overlap",
+    ]);
+    // Dieciséis nombres: los nueve de hoy, los seis que deriva PostgreSQL de las
+    // columnas sin sede, y el de la exclusión.
+    expect(conocidos.size).toBe(16);
+    for (const caida of raw.matchAll(/\bDROP\s+CONSTRAINT\s+IF EXISTS\s+([a-z0-9_]+)/gi)) {
+      expect([...conocidos]).toContain(caida[1]);
+    }
+    for (const caida of raw.matchAll(/\bDROP\s+INDEX\s+IF EXISTS\s+(?:public\.)?([a-z0-9_]+)/gi)) {
+      expect([...conocidos]).toContain(caida[1]);
+    }
+    // Y hay de las dos clases: la exclusión y las nueve unicidades.
+    expect([...raw.matchAll(/\bDROP\s+CONSTRAINT\b/gi)].length).toBeGreaterThan(1);
+    expect([...raw.matchAll(/\bDROP\s+INDEX\b/gi)].length).toBeGreaterThan(1);
+  });
+
+  it("el índice que queda compuesto está declarado como tal, con su motivo", () => {
+    // La excepción es explícita y con su razón: si alguien la mueve sin leerla,
+    // la guardia de abajo y el comentario la señalan.
+    expect(raw).toContain("uq_commission_rule");
+    expect(raw).toContain('onConflict: "sede_id,item_type,item_id,employee_id"');
+    expect(raw).toContain("src/features/commissions/service.ts");
+    expect(raw).toContain("42P10");
+    expect(normalizar(sql)).not.toMatch(/\bDROP\s+INDEX\s+IF EXISTS\s+public\.uq_commission_rule/i);
+  });
+
+  it("declara el motivo, el orden, la nota del editor SQL y que no se ejecutó", () => {
+    expect(raw).toContain("una sola sede");
+    expect(raw).toContain("ADITIVO, IDEMPOTENTE Y RE-EJECUTABLE");
+    expect(raw).toContain("CONFIRMA SENTENCIA POR SENTENCIA");
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+    // Las consultas de sólo lectura.
+    expect(raw).toContain("pg_get_constraintdef");
+    expect(raw).toContain("pg_indexes");
+  });
+
+  it("control negativo: una UNIQUE que conserva sede_id queda señalada", () => {
+    // La forma obvia: el nombre viejo vuelve con sus dos columnas.
+    const conSede = raw.replace(
+      "ADD CONSTRAINT products_sku_key UNIQUE (sku);",
+      "ADD CONSTRAINT products_sede_id_sku_key UNIQUE (sede_id, sku);",
+    );
+    expect(conSede).not.toBe(raw);
+    // El archivo mutado ya no declara la forma final que este objeto debe dejar.
+    expect(revisarSedeLess(conSede, esperado).join(" | ")).toContain("no se vuelve a declarar");
+
+    // Y la sutil: el nombre nuevo correcto, la columna de más.
+    const conSedeMisma = raw.replace(
+      "ADD CONSTRAINT products_sku_key UNIQUE (sku);",
+      "ADD CONSTRAINT products_sku_key UNIQUE (sede_id, sku);",
+    );
+    const falta = revisarSedeLess(conSedeMisma, esperado).join(" | ");
+    expect(falta).toContain("columnas sede_id, sku en vez de sku");
+  });
+
+  it("control negativo: la exclusión renombrada queda señalada", () => {
+    const renombrada = raw
+      .replace(
+        "DROP CONSTRAINT IF EXISTS ex_payroll_periods_no_overlap;",
+        "DROP CONSTRAINT IF EXISTS ex_payroll_periods_no_overlap_sede;",
+      )
+      .replace(
+        "ADD CONSTRAINT ex_payroll_periods_no_overlap\n  EXCLUDE USING gist",
+        "ADD CONSTRAINT ex_payroll_periods_no_overlap_sede\n  EXCLUDE USING gist",
+      );
+    expect(renombrada).not.toBe(raw);
+    const falta = revisarSedeLess(renombrada, esperado).join(" | ");
+    expect(falta).toContain("ex_payroll_periods_no_overlap");
+    expect(falta).toContain("contrato de ejecución");
+  });
+
+  it("control negativo: un WHERE de parcial alterado queda señalado", () => {
+    // El `WHERE` decide qué filas entran al índice: aflojarlo metería filas que
+    // la garantía excluye a propósito (un empleado sin código, una factura sin
+    // marca). Es el cambio que el detector tiene que ver aunque las columnas
+    // estén perfectitas.
+    const aflojado = raw.replace(
+      "WHERE employee_code IS NOT NULL AND btrim(employee_code) <> '';",
+      "WHERE employee_code IS NOT NULL;",
+    );
+    expect(aflojado).not.toBe(raw);
+    expect(revisarSedeLess(aflojado, esperado).join(" | ")).toContain(
+      "WHERE where employee_code is not null",
+    );
+  });
+
+  it("cada literal del archivo está bien formado y emparejado", () => {
+    expect(revisarLiterales(raw)).toEqual([]);
+    // Y no pasa en vacío: el archivo declara UN bloque `DO $$` y DIEZ consultas
+    // `$q$`, o sea veinte delimitadores. Es el conteo que la paridad protege.
+    const etiquetas = etiquetasDollar(sql);
+    expect(etiquetas.filter((e) => e === "$$")).toHaveLength(2);
+    expect(etiquetas.filter((e) => e === "$q$")).toHaveLength(20);
+  });
+
+  it("ninguna comilla cierra un literal dejando una palabra pegada (074 y 075)", () => {
+    // La clase que la paridad NO ve: un número PAR de comillas con una palabra
+    // escapada por delante. Se recorre el archivo entero —no sólo el bloque
+    // `DO`— porque un literal suelto (`COMMENT`, `RAISE`, sentencia de nivel
+    // superior) pierde la comilla igual de fácil. 075 entra por el mismo motor:
+    // sus literales viven en el `RAISE` del pre-vuelo, y sus consultas de sólo
+    // lectura son comentarios que el lector ni toca.
+    const con075 = readFileSync(
+      join(DIR_MIGRACIONES, "075_commission_rule_install_key.sql"),
+      "utf8",
+    );
+    expect(revisarLiterales(raw), "074").toEqual([]);
+    expect(revisarLiterales(con075), "075").toEqual([]);
+
+    // Y la etiqueta de la fila del borrador sigue MOSTRANDO la palabra entre
+    // comillas: lo que se dobló es el signo, no el texto.
+    expect(raw).toContain("WHERE status = ''borrador'')',");
+  });
+
+  it("control negativo: una comilla sin doblar que escapa una palabra queda señalada", () => {
+    // El defecto de la 074 reinyectado tal cual: la etiqueta de la fila del
+    // borrador vuelve a llevar `status = 'borrador'` con la comilla Suelta.
+    const reinfectado = raw.replace(
+      "WHERE status = ''borrador'')',",
+      "WHERE status = 'borrador')',",
+    );
+    expect(reinfectado).not.toBe(raw);
+    const falta = revisarLiterales(reinfectado).join(" | ");
+    // Lo nombra por la palabra que se salió del literal y por su línea, que es
+    // más útil que un conteo: dice QUÉ corregir y DÓNDE.
+    expect(falta).toContain("deja pegada la palabra `borrador`");
+    expect(falta).toContain("línea 256");
+    // Y ÉSTA es la prueba de que la paridad sola no alcanza: la línea rota tiene
+    // CUATRO comillas —un número PAR—, así que el conteo queda parejo, ningún
+    // literal queda abierto y ninguna de las otras reglas se activa. La única
+    // falla es la de la posición del signo.
+    const lineaRota = reinfectado.split("\n")[255];
+    expect(lineaRota).toContain("status = 'borrador'");
+    expect(lineaRota.match(/'/g)).toHaveLength(4);
+    expect(revisarLiterales(reinfectado)).toHaveLength(1);
+    expect(falta).not.toContain("no se cierra antes del final");
+
+    // Y el detector no dispara con lo único que PostgreSQL SÍ permite pegado a
+    // una comilla: el prefijo de la que ABRE (`E'…'`, `B'…'`, `X'…'`). La regla
+    // mira el cierre, y el cierre nunca lleva prefijo.
+    const conPrefijo = raw.replace(
+      "    EXECUTE v_ch.consulta INTO v_detalle;",
+      "    v_informe := v_informe || E'\\n  ';\n    EXECUTE v_ch.consulta INTO v_detalle;",
+    );
+    expect(conPrefijo).not.toBe(raw);
+    expect(revisarLiterales(conPrefijo)).toEqual([]);
+  });
+
+  it("control negativo: una etiqueta pegada al identificador queda señalada", () => {
+    // La errata exacta que estuvo en el archivo: el cierre queda `s$q$)` en vez
+    // de `$q$)`, y desde ahí el cuerpo se empalma con la consulta que sigue.
+    const conErrata = raw.replace("LIMIT 5)$q$),", "LIMIT 5) s$q$),");
+    expect(conErrata).not.toBe(raw);
+    const falta = revisarLiterales(conErrata).join(" | ");
+    expect(falta).toContain("la etiqueta no puede ir pegada a un identificador");
+  });
+
+  it("control negativo: un literal sin cerrar y un $ suelto quedan señalados", () => {
+    // Una etiqueta de más: `$q$` queda con una apertura y un cierre —que es par—
+    // pero el cuerpo que sigue se lleva por delante el resto del archivo.
+    const descolgado = raw.replace("END $$;", "$q$");
+    expect(descolgado).not.toBe(raw);
+    expect(revisarLiterales(descolgado).join(" | ")).toContain("nunca se cierra");
+
+    // Y una `$` que no forma delimitador: el error más chato de todos.
+    const suelta = raw.replace("DO $$", "DO $");
+    expect(suelta).not.toBe(raw);
+    expect(revisarLiterales(suelta).join(" | ")).toContain("`$` suelta");
+  });
+
+  it("control negativo: un literal simple sin cerrar queda señalado por su línea", () => {
+    // El defecto que REALMENTE impedía que el archivo se analizara, reinyectado
+    // tal cual: la etiqueta de la fila de la exclusión pierde la comilla que
+    // dobla la de `'[]'`, el literal cierra antes de tiempo y el resto del
+    // cuerpo queda desincronizado hasta el final del bloque.
+    const sinComilla = raw.replace("end_date, ''[]''))',", "end_date, '[]''))',");
+    expect(sinComilla).not.toBe(raw);
+    const falta = revisarLiterales(sinComilla).join(" | ");
+    expect(falta).toContain("literal de comilla simple");
+    // Y nombra la línea donde el literal quedó abierto, que es la 266.
+    expect(falta).toContain("línea 266");
+  });
+
+  it("control negativo: el lector de PL/pgSQL no confunde las comillas dobladas", () => {
+    // Las comillas dobladas `''` SON una comilla dentro del literal: contarlas
+    // como cierre y apertura haría que un literal bien cerrado pareciera roto.
+    const dobladas = raw.replace(
+      "    EXECUTE v_ch.consulta INTO v_detalle;",
+      "    v_informe := v_informe || '''';\n    EXECUTE v_ch.consulta INTO v_detalle;",
+    );
+    expect(dobladas).not.toBe(raw);
+    expect(revisarLiterales(dobladas)).toEqual([]);
+
+    // Y un literal simple a medio cerrar en ese mismo punto sí se ve.
+    const aMedio = raw.replace(
+      "    EXECUTE v_ch.consulta INTO v_detalle;",
+      "    v_informe := v_informe || 'a medio cerrar;\n    EXECUTE v_ch.consulta INTO v_detalle;",
+    );
+    expect(revisarLiterales(aMedio).join(" | ")).toContain("literal de comilla simple");
+  });
+
+  it("control negativo: el detector no es un sello de goma", () => {
+    expect(revisarSedeLess(raw, esperado)).toEqual([]);
+    expect(revisarSedeLess("", esperado).length).toBeGreaterThan(0);
   });
 });

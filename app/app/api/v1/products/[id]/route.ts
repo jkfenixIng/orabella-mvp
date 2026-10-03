@@ -1,7 +1,6 @@
 import type { NextRequest } from "next/server";
 import { fail, ok } from "@/src/shared/lib/api-response";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/shared/lib/sede";
 import {
   InventoryError,
   getProduct,
@@ -21,13 +20,12 @@ function tokenOf(request: NextRequest): string | undefined {
 
 type RouteContext = { params: Promise<{ id: string }> };
 
-/** GET /api/v1/products/:id — detalle (requiere sesión, solo su sede). */
+/** GET /api/v1/products/:id — detalle (requiere sesión). */
 export async function GET(request: NextRequest, context: RouteContext) {
   try {
-    const session = await requireSession(tokenOf(request));
+    await requireSession(tokenOf(request));
     const { id } = await context.params;
     const data = await getProduct(id);
-    resolveSede(session.sedeId, data.sede_id);
     return ok(data);
   } catch (error) {
     return inventoryErrorResponse(error);
@@ -40,17 +38,14 @@ export async function GET(request: NextRequest, context: RouteContext) {
  */
 export async function PATCH(request: NextRequest, context: RouteContext) {
   try {
-    const session = await requireInventoryWriter(tokenOf(request));
+    await requireInventoryWriter(tokenOf(request));
     const { id } = await context.params;
-    const current = await getProduct(id);
-    resolveSede(session.sedeId, current.sede_id);
+    // La existencia se comprueba antes de editar: sin producto no hay nada que
+    // actualizar, y el error de negocio sigue siendo NOT_FOUND.
+    await getProduct(id);
     const body: unknown = await request.json().catch(() => ({}));
     const record = typeof body === "object" && body !== null ? body : {};
-    const data = await upsertProduct({
-      ...record,
-      id,
-      sede_id: resolveSede(session.sedeId, (record as { sede_id?: string }).sede_id),
-    });
+    const data = await upsertProduct({ ...record, id });
     return ok(data);
   } catch (error) {
     return inventoryErrorResponse(error);

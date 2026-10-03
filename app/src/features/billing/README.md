@@ -23,7 +23,7 @@ snapshot y deja espacio para documentos electrónicos sin reestructurar).
   motivo en `cancel_reason`, IN de reversión por producto),
   `splitPayment` (métodos activos, rechaza sobrepago, completa → Pagada).
   Descuentos a nivel factura (más descuento por línea con tope al bruto).
-  Escritura: admin/caja. Reutiliza `requireSedeRole`/`resolveSede`,
+  Escritura: admin/caja. Reutiliza `requireSedeRole`,
   `ok()`/`fail()`, `tax_configs` y `payment_methods` de T3.
 - API-first (`/api/v1`): `POST/GET /invoices` (filtros estado/fecha),
   `GET /invoices/:id`, `POST /invoices/:id/annul` (solo admin),

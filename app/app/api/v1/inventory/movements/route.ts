@@ -32,10 +32,7 @@ export async function POST(request: NextRequest) {
   try {
     const session = await requireInventoryWriter(tokenOf(request));
     const body: unknown = await request.json().catch(() => ({}));
-    const data = await registerManualMovement(body, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await registerManualMovement(body, { userId: session.userId });
     return ok(data, 201);
   } catch (error) {
     return inventoryErrorResponse(error);

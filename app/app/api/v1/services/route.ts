@@ -1,7 +1,6 @@
 import type { NextRequest } from "next/server";
 import { fail, ok } from "@/src/shared/lib/api-response";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/shared/lib/sede";
 import {
   AdminError,
   listServices,
@@ -19,12 +18,11 @@ function tokenOf(request: NextRequest): string | undefined {
   return request.cookies.get(SESSION_COOKIE_NAME)?.value;
 }
 
-/** GET /api/v1/services?sede_id= — catálogo de la sede (requiere sesión). */
+/** GET /api/v1/services — catálogo de servicios (requiere sesión). */
 export async function GET(request: NextRequest) {
   try {
-    const session = await requireSession(tokenOf(request));
-    const requested = request.nextUrl.searchParams.get("sede_id");
-    const data = await listServices(resolveSede(session.sedeId, requested));
+    await requireSession(tokenOf(request));
+    const data = await listServices();
     return ok(data);
   } catch (error) {
     return adminErrorResponse(error);
@@ -37,13 +35,10 @@ export async function GET(request: NextRequest) {
  */
 export async function POST(request: NextRequest) {
   try {
-    const session = await requireAdminSession(tokenOf(request));
+    await requireAdminSession(tokenOf(request));
     const body: unknown = await request.json().catch(() => ({}));
     const record = typeof body === "object" && body !== null ? body : {};
-    const data = await upsertService({
-      ...record,
-      sede_id: resolveSede(session.sedeId, (record as { sede_id?: string }).sede_id),
-    });
+    const data = await upsertService(record);
     return ok(data, 201);
   } catch (error) {
     return adminErrorResponse(error);

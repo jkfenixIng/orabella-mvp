@@ -18,8 +18,10 @@ function readPublicEnv(): { url: string; anonKey: string } {
  * todo el tráfico de la app va por `createAdminClient()` (service_role), que
  * bypasea RLS por diseño. Es decir que las políticas por sede del esquema NO se
  * evalúan nunca y este cliente NO es una segunda línea de defensa: la única
- * barrera es el código de aplicación (`resolveSede`/`requireSedeRole` en
- * `src/shared/lib/sede.ts` más los filtros `sede_id` de cada consulta). Un guard
+ * barrera es el código de aplicación (`requireSedeRole` en
+ * `src/shared/lib/sede.ts`, que autoriza por ROL, más los filtros de cada
+ * consulta). La comparación por sede se retiró con la columna `sede_id`: la
+ * instalación es de una sola sede, así que ya no acotaba nada. Un guard
  * olvidado es una brecha total, sin red abajo.
  *
  * Se conserva —y no se borra— porque es el camino correcto si algún día se migra

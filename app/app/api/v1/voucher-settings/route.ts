@@ -19,13 +19,13 @@ function tokenOf(request: NextRequest): string | undefined {
 }
 
 /**
- * GET /api/v1/voucher-settings — topes vigentes de la sede (requiere
- * sesión, solo su sede).
+ * GET /api/v1/voucher-settings — topes vigentes de los vales (requiere
+ * sesión).
  */
 export async function GET(request: NextRequest) {
   try {
-    const session = await requireSession(tokenOf(request));
-    const data = await getVoucherSettings(session.sedeId);
+    await requireSession(tokenOf(request));
+    const data = await getVoucherSettings();
     return ok(data);
   } catch (error) {
     return payrollErrorResponse(error);
@@ -40,10 +40,7 @@ export async function POST(request: NextRequest) {
   try {
     const session = await requirePayrollAdmin(tokenOf(request));
     const body: unknown = await request.json().catch(() => ({}));
-    const data = await setVoucherLimits(body, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await setVoucherLimits(body, { userId: session.userId });
     return ok(data);
   } catch (error) {
     return payrollErrorResponse(error);

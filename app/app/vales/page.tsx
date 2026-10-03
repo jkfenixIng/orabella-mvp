@@ -39,17 +39,19 @@ export default async function ValesPage() {
       </PageContainer>
     );
   }
+  // El turno abierto se pide sin sede: la instalación es de una sola y el
+  // módulo de caja ya no acota la lectura por esa columna.
 
   // Por defecto la pantalla muestra SOLO los vales de hoy (día de Bogotá). El
   // rango se calcula UNA vez acá y baja como prop para que servidor y cliente
   // no puedan discrepar; ampliarlo (o limpiarlo) es cosa del cliente.
   const today = bogotaDay();
   const [employees, settings, vouchers, methods, shift] = await Promise.all([
-    listEmployees(sedeId),
-    getVoucherSettings(sedeId),
-    listVouchers(sedeId, { date_from: today, date_to: today }),
-    listPaymentMethods(sedeId),
-    getOpenShiftWithOpener(sedeId),
+    listEmployees(),
+    getVoucherSettings(),
+    listVouchers({ date_from: today, date_to: today }),
+    listPaymentMethods(),
+    getOpenShiftWithOpener(),
   ]);
 
   const isAdmin = session.roles.includes("admin");

@@ -35,10 +35,7 @@ export default async function AlertsPage() {
     );
   }
 
-  const initial = await listAlerts(
-    sedeId,
-    { unreadOnly: true, page: 1 },
-  );
+  const initial = await listAlerts({ unreadOnly: true, page: 1 });
 
   return (
     <PageContainer size="wide">

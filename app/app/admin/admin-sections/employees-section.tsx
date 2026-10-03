@@ -95,6 +95,11 @@ export function EmployeesSection({
   users,
   onUsersChanged,
 }: {
+  /**
+   * Sólo la necesita el alta de la CUENTA de acceso del empleado, que sigue
+   * declarando la instalación en su cuerpo (`create_user_with_role`); el alta y
+   * la edición del LEGAJO ya no la envían.
+   */
   sedeId: string;
   initial: EmployeeRow[];
   users: SedeUserRow[];
@@ -206,7 +211,6 @@ export function EmployeesSection({
     }
     const result: ActionResult<EmployeeRow> = await upsertEmployeeAction({
       ...(editingId ? { id: editingId } : {}),
-      sede_id: sedeId,
       full_name: form.full_name,
       document: form.document,
       payout_mode: form.payout_mode,

@@ -26,7 +26,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
     const session = await requireBillingWriter(tokenOf(request));
     const { id } = await context.params;
     const body: unknown = await request.json().catch(() => ({}));
-    const data = await annulInvoice(session.sedeId, id, body, {
+    const data = await annulInvoice(id, body, {
       userId: session.userId,
       sedeId: session.sedeId,
       roles: session.roles,

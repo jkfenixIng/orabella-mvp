@@ -19,14 +19,14 @@ function tokenOf(request: NextRequest): string | undefined {
 }
 
 /**
- * GET /api/v1/vouchers — lista los vales de la sede con filtro opcional
- * (?status=&employee_id=&request_date=). Requiere sesión, solo su sede.
+ * GET /api/v1/vouchers — lista los vales con filtro opcional
+ * (?status=&employee_id=&request_date=). Requiere sesión.
  */
 export async function GET(request: NextRequest) {
   try {
-    const session = await requireSession(tokenOf(request));
+    await requireSession(tokenOf(request));
     const params = request.nextUrl.searchParams;
-    const data = await listVouchers(session.sedeId, {
+    const data = await listVouchers({
       status: params.get("status") ?? undefined,
       employee_id: params.get("employee_id") ?? undefined,
       request_date: params.get("request_date") ?? undefined,
@@ -58,7 +58,6 @@ export async function POST(request: NextRequest) {
     const body: unknown = await request.json().catch(() => ({}));
     const data = await requestVoucher(body, {
       userId: session.userId,
-      sedeId: session.sedeId,
       roles: session.roles,
     });
     return ok(data, 201);

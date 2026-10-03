@@ -28,7 +28,7 @@ const EMPTY_TAX = { code: "IVA", name: "", percent: "", is_active: false };
  * renderiza adentro: el fallo al guardar sigue siendo estado, pero el estado
  * que corresponde al formulario, no uno suelto en la página.
  */
-export function TaxesSection({ sedeId, initial }: { sedeId: string; initial: TaxConfigRow[] }) {
+export function TaxesSection({ initial }: { initial: TaxConfigRow[] }) {
   const [rows, setRows] = useState(initial);
   const [form, setForm] = useState(EMPTY_TAX);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -63,7 +63,6 @@ export function TaxesSection({ sedeId, initial }: { sedeId: string; initial: Tax
     setError(null);
     const result: ActionResult<TaxConfigRow> = await upsertTaxConfigAction({
       ...(editingId ? { id: editingId } : {}),
-      sede_id: sedeId,
       code: form.code,
       name: form.name,
       percent: toNumber(form.percent) ?? 0,

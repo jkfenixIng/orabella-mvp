@@ -19,7 +19,9 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   `method_id` + snapshot `method_code`, `amount > 0`, `paid_at` default now,
   `paid_by`, `reference`; trigger `check_payroll_payments_cap`: la suma por
   ítem nunca excede el neto), `voucher_settings` (`sede_id` PK,
-  `max_per_day`/`max_per_week >= 0`), `voucher_requests` (`sede_id`,
+  `max_per_day`/`max_per_week >= 0`; desde la 072 sus cuatro ajustes viven en
+  `system_settings` y esta tabla queda sin lectores a la espera del borrado —
+  ver "Los ajustes de vales son ajustes de la INSTALACIÓN"), `voucher_requests` (`sede_id`,
   `employee_id`, `amount > 0`, `request_date` default current_date, `status`
   pendiente/aprobada/rechazada/descontada default pendiente, `approved_by`,
   `method_code` + `cash_shift_id` (migración 028: método arqueable y turno de
@@ -65,7 +67,7 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   parciales permitidos —40/40/20 en una o varias llamadas— y el acumulado
   nunca excede el neto), `closePayrollPeriod` (inmutable: `assertDraftPeriod`
   bloquea cálculo, pagos y cambios posteriores), `setVoucherLimits`
-  (upsert por sede), `requestVoucher` (nuevo flujo: la CAJA con turno abierto
+  (un `upsert` de las cuatro claves de `system_settings`, 072), `requestVoucher` (nuevo flujo: la CAJA con turno abierto
   abre el vale; exige turno abierto y dueño o admin; elige el método arqueable
   al crear; valida topes día/semana y días permitidos —dentro de rango se
   genera directo/aprobada, fuera de rango queda pendiente con
@@ -73,8 +75,8 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   `approveVoucher` (solo pendiente; autorización con `approved_by` +
   observación, SIN código), `rejectVoucher` (solo pendiente, motivo
   obligatorio). Escritura: admin (pagos también caja);
-  lectura: cualquier rol de la sede. Reutiliza `requireSedeRole`/
-  `resolveSede`, `listPaymentMethods` + `getEmployee`/`listEmployees` (T3),
+  lectura: cualquier rol de la sede. Reutiliza `requireSedeRole`,
+  `listPaymentMethods` + `getEmployee`/`listEmployees` (T3),
   `getOpenShiftWithOpener` (T6) para el turno de caja, `roundMoney`/
   `moneyEquals` (T5), `ok()`/`fail()`.
 - API-first (`/api/v1`): `POST /payroll-periods` (+ `GET` lista),
@@ -621,17 +623,25 @@ siguiente es completo y vuelve a 750.000.
 
 ### Configurarlo
 
-`getPayrollStartDate(sedeId)` / `setPayrollStartDate({ payroll_start_date },
-actor)` en `service.ts`: la lectura y la escritura con el guard de admin en la
-superficie (`requirePayrollAdmin`), como el resto del módulo. La escritura valida
-la forma de la fecha (`setPayrollStartDateSchema`; una fecha futura es legal: la
-implementación puede arrancar en el ciclo que viene) y `null` vuelve a «sin
-configurar». Si la 068 no está aplicada (columna inexistente, `42703`), la
-lectura devuelve `null` —sin fecha, el módulo hace lo de hoy— y la escritura
-responde un mensaje accionable que nombra la migración, en vez del error crudo de
-la base.
+La CONFIGURACIÓN de la fecha ya no es de este módulo: es de la superficie de
+PLATAFORMA. `setPlatformPayrollStartDate({ sede_id, payroll_start_date }, actor)`
+en `platform/service.ts`, expuesta por `setPlatformPayrollStartDateAction` para
+el rol `superadmin`, es la ÚNICA escritura de la columna y deja AUDITORÍA
+(`platform.payroll_start_date_set`: actor, sede objetivo y los dos valores, el
+anterior y el nuevo). Valida la forma de la fecha con el mismo esquema que este
+módulo (`payrollStartDateSchema`, que la plataforma reutiliza desde acá: una
+fecha futura es legal porque la implementación puede arrancar en el ciclo que
+viene) y `null` vuelve a «sin configurar». Si la 068 no está aplicada (columna
+inexistente, `42703`), la escritura responde un mensaje accionable que nombra la
+migración, en vez del error crudo de la base.
 
-Equivalente manual, UNA línea (el control de la pantalla hace lo mismo):
+Lo que queda acá es la LECTURA: `getPayrollStartDate(sedeId)` en `service.ts`, con
+el guard de admin en la superficie (`requirePayrollAdmin`), como el resto del
+módulo. Es la que alimentan el aviso de pendientes y el diálogo de apertura, los
+dos pisos de los ciclos que se ofrecen y se abren. Con la 068 sin aplicada
+devuelve `null` —sin fecha, el módulo hace lo de hoy— en vez de un error interno.
+
+Equivalente manual, UNA línea (la superficie de plataforma hace lo mismo):
 
 ```sql
 UPDATE public.sedes SET payroll_start_date = '2026-10-05' WHERE id = '<sede>';
@@ -663,10 +673,12 @@ UPDATE public.sedes SET payroll_start_date = '2026-10-05' WHERE id = '<sede>';
   fecha (`isRangeBeforePayrollStart`, que rechaza nombrando la fecha). El
   servidor sigue siendo la autoridad.
 
-Léase `getPayrollStartDate` / `setPayrollStartDate` en `service.ts` y
-`getPayrollStartDateAction` / `setPayrollStartDateAction` en `actions.ts` (solo
-admin, `requirePayrollAdmin`; declaradas en la tabla de roles de
-`tests/action-guards.test.ts`).
+Léase `getPayrollStartDate` en `service.ts` y `getPayrollStartDateAction` en
+`actions.ts` (solo admin, `requirePayrollAdmin`; declaradas en la tabla de roles de
+`tests/action-guards.test.ts`). La ESCRITURA ya no es una superficie de este módulo:
+vive en `platform/service.ts` y `platform/actions.ts`
+(`setPlatformPayrollStartDate` / `setPlatformPayrollStartDateAction`, solo
+`superadmin`), con su propia fila en esa misma tabla.
 
 ## Detalle de la liquidación: facturas y vales (F6)
 

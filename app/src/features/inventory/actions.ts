@@ -2,7 +2,6 @@
 
 import { cookies } from "next/headers";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
-import { resolveSede } from "@/src/shared/lib/sede";
 import {
   InventoryError,
   getKardex,
@@ -29,25 +28,22 @@ function toFailure(error: unknown): { success: false; code: string; message: str
   return { success: false, code: "INTERNAL", message: "Error interno." };
 }
 
-/** Misma lógica que GET /api/v1/products (requiere sesión, solo su sede). */
-export async function listProductsAction(sedeId?: string, q?: string) {
+/** Misma lógica que GET /api/v1/products (requiere sesión). */
+export async function listProductsAction(q?: string) {
   try {
-    const session = await requireSession(await sessionToken());
-    const sede = resolveSede(session.sedeId, sedeId);
-    const data = q?.trim() ? await searchProducts(sede, q) : await listProducts(sede);
+    await requireSession(await sessionToken());
+    const data = q?.trim() ? await searchProducts(q) : await listProducts();
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
   }
 }
 
-/** Misma lógica que GET /api/v1/products/:id (requiere sesión, solo su sede). */
+/** Misma lógica que GET /api/v1/products/:id (requiere sesión). */
 export async function getProductAction(id: string) {
   try {
-    const session = await requireSession(await sessionToken());
-    const data = await getProduct(id);
-    resolveSede(session.sedeId, data.sede_id);
-    return { success: true as const, data };
+    await requireSession(await sessionToken());
+    return { success: true as const, data: await getProduct(id) };
   } catch (error) {
     return toFailure(error);
   }
@@ -60,14 +56,15 @@ export async function upsertProductAction(input: unknown) {
       typeof input === "object" && input !== null && "id" in input &&
       typeof (input as { id?: unknown }).id === "string" &&
       (input as { id: string }).id !== "";
-    const session = isUpdate
-      ? await requireInventoryAdmin(await sessionToken())
-      : await requireInventoryWriter(await sessionToken());
-    const data = await upsertProduct({
-      ...(typeof input === "object" && input !== null ? input : {}),
-      sede_id: resolveSede(session.sedeId, (input as { sede_id?: string }).sede_id),
-    });
-    return { success: true as const, data };
+    if (isUpdate) {
+      await requireInventoryAdmin(await sessionToken());
+    } else {
+      await requireInventoryWriter(await sessionToken());
+    }
+    return {
+      success: true as const,
+      data: await upsertProduct(typeof input === "object" && input !== null ? input : {}),
+    };
   } catch (error) {
     return toFailure(error);
   }
@@ -94,10 +91,7 @@ export async function registerMovementAction(input: unknown) {
     const session = movementType === "IN" || movementType === undefined
       ? await requireInventoryWriter(await sessionToken())
       : await requireInventoryAdmin(await sessionToken());
-    const data = await registerManualMovement(input, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await registerManualMovement(input, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -107,19 +101,18 @@ export async function registerMovementAction(input: unknown) {
 /** Misma lógica que GET /api/v1/inventory/kardex (requiere sesión). */
 export async function getKardexAction(productId: string) {
   try {
-    const session = await requireSession(await sessionToken());
-    const data = await getKardex(session.sedeId, productId);
-    return { success: true as const, data };
+    await requireSession(await sessionToken());
+    return { success: true as const, data: await getKardex(productId) };
   } catch (error) {
     return toFailure(error);
   }
 }
 
 /** Misma lógica que GET /api/v1/inventory/alerts (requiere sesión). */
-export async function lowStockAlertsAction(sedeId?: string) {
+export async function lowStockAlertsAction() {
   try {
-    const session = await requireSession(await sessionToken());
-    const data = await lowStockAlerts(resolveSede(session.sedeId, sedeId));
+    await requireSession(await sessionToken());
+    const data = await lowStockAlerts();
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

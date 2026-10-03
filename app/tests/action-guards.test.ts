@@ -703,20 +703,13 @@ interface SurfaceSpec {
  * coincida con esta tabla.
  */
 const SURFACES: readonly SurfaceSpec[] = [
-  // ---- plataforma: solo la cuenta con el rol `superadmin` (G3a) ----
-  {
-    file: PLATFORM_ACTIONS_FILE,
-    name: "listPlatformSedesAction",
-    kind: "platform",
-    roles: ["superadmin"],
-    why: "lista TODAS las sedes de la instalación: es la superficie de plataforma y ningún rol de sede entra.",
-  },
+  // ---- plataforma: solo la cuenta con el rol `superadmin` ----
   {
     file: PLATFORM_ACTIONS_FILE,
     name: "setPlatformPayrollStartDateAction",
     kind: "platform",
     roles: ["superadmin"],
-    why: "G3b: configura la fecha de inicio de la nómina de la sede ELEGIDA, para cualquier sede. Es configuración de plataforma: ningún rol de sede la cambia.",
+    why: "Configura la fecha de inicio de la nómina de la INSTALACIÓN (de una sola sede). Es configuración de plataforma: ningún rol de sede la cambia, y no hay otra sede a la que elegirle una fecha.",
   },
   // ---- acciones de nómina: solo admin (pagar un ítem incluido) ----
   {
@@ -2027,7 +2020,6 @@ describe("plataforma: requirePlatformAdmin (G1)", () => {
     asSession(["superadmin"]);
     await expect(requirePlatformAdmin("token-de-prueba")).resolves.toMatchObject({
       userId: "u-prueba",
-      sedeId: SEDE_PRUEBA,
       roles: ["superadmin"],
     });
 

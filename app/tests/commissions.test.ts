@@ -16,6 +16,7 @@ import {
   CommissionError,
   canPayCommissionImmediately,
   payCommissionNow,
+  upsertCommissionRule,
 } from "@/src/features/commissions/service";
 import {
   buildEmployeeCommissionDetail,
@@ -726,6 +727,31 @@ const payoutStub = vi.hoisted(() => ({
   markClashes: 0,
   /** INSERT de `commission_payouts` INTENTADOS (sin marca de éxito): no vacuidad. */
   insertAttempts: 0,
+  /** Filas de `commission_rules`: el estado que el `upsert` de reglas escribe. */
+  rules: [] as Array<Record<string, unknown>>,
+  /**
+   * Cada `upsert` de `commission_rules` con el objetivo de conflicto que
+   * mandó el servicio. Es la prueba de que el código infiere contra el índice
+   * que existe, y el doble usa la lista para decidir si hay índice.
+   */
+  ruleUpserts: [] as Array<{ payload: Record<string, unknown>; onConflict: string }>,
+  /**
+   * Índices únicos REALES de `commission_rules`, como los que el catálogo los
+   * tendría. Es la emulación de la INFERENCIA de `ON CONFLICT`: si el conjunto
+   * de columnas del `onConflict` no coincide EXACTAMENTE con uno de ellos,
+   * PostgreSQL responde 42P10 y no escribe. Los dos conviven entre la 075 y
+   * la migración final: el de 016 (con sede) y el de la 075 (sin sede).
+   */
+  ruleIndexes: [
+    "sede_id,item_type,item_id,employee_id",
+    "item_type,item_id,employee_id",
+  ] as string[],
+  /** 42P10 emulados: el objetivo no lo satisface ningún índice (prueba de que se dispara). */
+  ruleInferenceFailures: 0,
+  /** 23505 emulados: el `id` enviado choca con otra fila y NO está en el objetivo. */
+  ruleIdClashes: 0,
+  /** `false` = el `onConflict` se pasa al objetivo viejo a propósito (control negativo). */
+  forceOldConflictTarget: false,
   /** `false` = no hay turno abierto (la guarda que corre ANTES del lookup). */
   shiftOpen: true,
   /**
@@ -776,6 +802,15 @@ function resetPayoutStub(): void {
   payoutStub.skipMarkLookupOnce = false;
   payoutStub.markClashes = 0;
   payoutStub.insertAttempts = 0;
+  payoutStub.rules.length = 0;
+  payoutStub.ruleUpserts.length = 0;
+  payoutStub.ruleIndexes = [
+    "sede_id,item_type,item_id,employee_id",
+    "item_type,item_id,employee_id",
+  ];
+  payoutStub.ruleInferenceFailures = 0;
+  payoutStub.ruleIdClashes = 0;
+  payoutStub.forceOldConflictTarget = false;
   payoutStub.shiftOpen = true;
   payoutStub.shiftId = "55555555-5555-4555-8555-555555555555";
   payoutStub.invoiceStatus = "Pagada";
@@ -820,12 +855,16 @@ function releasePayoutGate(): void {
 function seedPayout(amount: number, earned: number | null = payoutStub.COMMISSION_VALUE): void {
   payoutStub.payouts.push({
     id: `seed-${(payoutStub.nextId += 1)}`,
-    sede_id: payoutStub.SEDE_ID,
     employee_id: payoutStub.EMPLOYEE_ID,
     invoice_id: payoutStub.INVOICE_ID,
     amount,
     earned_immediate: earned,
   });
+}
+
+/** Id con forma de uuid, para que el esquema del servicio lo acepte. */
+function idRegla(n: number): string {
+  return `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
 }
 
 /**
@@ -845,9 +884,99 @@ function createPayoutStubClient(): unknown {
     let op = "select";
     let cols = "";
     let payload: Record<string, unknown> = {};
+    let onConflict: string | undefined;
     const eqFilters: Record<string, unknown> = {};
 
+    /**
+     * ¿La fila dada tiene los MISMOS valores que la carga en el objetivo?
+     *
+     * Con la semántica de NULL de un índice UNIQUE: comparar una columna que
+     * falta con otra que también falta da UNKNOWN, no TRUE, así que la fila NO
+     * coincide. Es lo que hace que un objetivo que incluya una columna que la
+     * escritura ya no manda deje de encontrar la fila anterior —el riesgo que
+     * la 074 documenta para todos los índices que empezaban por `sede_id`—, y
+     * es lo que este doble tiene que reproducir para que el control negativo de
+     * abajo signifique algo.
+     */
+    const mismaPareja = (
+      fila: Record<string, unknown>,
+      objetivo: string,
+      carga: Record<string, unknown>,
+    ): boolean =>
+      objetivo.split(",").every((columna) => {
+        if (carga[columna] === undefined || fila[columna] === undefined) return false;
+        return fila[columna] === carga[columna];
+      });
+
     const resolve = async (): Promise<{ data: unknown; error: unknown }> => {
+      if (op === "upsert") {
+        if (table !== "commission_rules") {
+          payoutStub.unexpectedQueries.push(`${table}.upsert`);
+          return { data: null, error: { message: `stub sin respuesta para ${table}.upsert` } };
+        }
+        // El `onConflict` que manda el servicio, verbatim.
+        const declarado = String(onConflict ?? "");
+        const objetivo = payoutStub.forceOldConflictTarget
+          ? "sede_id,item_type,item_id,employee_id"
+          : declarado;
+        payoutStub.ruleUpserts.push({ payload, onConflict: declarado });
+
+        // (a) 42P10: la inferencia exige coincidencia EXACTA con un índice
+        //     único. Sin esta rama el doble aceptaría cualquier conjunto de
+        //     columnas y la prueba del `onConflict` no probaría nada.
+        if (!payoutStub.ruleIndexes.includes(objetivo)) {
+          payoutStub.ruleInferenceFailures += 1;
+          return {
+            data: null,
+            error: {
+              code: "42P10",
+              message:
+                "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+            },
+          };
+        }
+
+        // (b) 23505 por la clave primaria `id`: el `ON CONFLICT` sólo resuelve
+        //     los choques de SUS índices, así que un `id` que ya existe en otra
+        //     fila (otra pareja ítem×empleado) no lo cubre y Postgres lo
+        //     rechaza. Es el rechazo real que el servicio traduce a
+        //     RULE_CONFLICT con el objetivo nuevo.
+        const id = payload.id;
+        if (
+          id !== undefined &&
+          payoutStub.rules.some(
+            (row) => row.id === id && !mismaPareja(row, objetivo, payload),
+          )
+        ) {
+          payoutStub.ruleIdClashes += 1;
+          return {
+            data: null,
+            error: {
+              code: "23505",
+              message: "duplicate key value violates unique constraint commission_rules_pkey",
+            },
+          };
+        }
+
+        // (c) El objetivo decide cuál fila se actualiza: la que coincide en
+        //     ESAS columnas. Es lo que hace que guardar dos veces la misma
+        //     regla no cree una segunda fila.
+        const existente = payoutStub.rules.find((row) => mismaPareja(row, objetivo, payload));
+        if (existente) {
+          Object.assign(existente, payload);
+          return { data: { ...existente }, error: null };
+        }
+        const creada = {
+          // Con FORMA de uuid: `commissionRuleSchema` valida el `id` que le
+          // llega al servicio, así que un id de juguete haría fallar la
+          // validación antes de llegar al `upsert`.
+          id: idRegla(payoutStub.nextId += 1),
+          is_active: true,
+          ...payload,
+        };
+        payoutStub.rules.push(creada);
+        return { data: { ...creada }, error: null };
+      }
       if (op === "insert") {
         if (table === "audit_logs") {
           payoutStub.audits.push(payload);
@@ -927,7 +1056,6 @@ function createPayoutStubClient(): unknown {
             data: {
               id: payoutStub.shiftId,
               cash_register_id: null,
-              sede_id: payoutStub.SEDE_ID,
               opened_by: "u-cajero",
               closed_by: null,
               opened_at: "2026-01-01T08:00:00.000Z",
@@ -950,6 +1078,11 @@ function createPayoutStubClient(): unknown {
               : { pay_type: "fijo", commission_percent: null },
             error: null,
           };
+        // El camino de `upsertCommissionRule` valida que el ítem exista ANTES de
+        // escribir: eco del id consultado, como hace la base.
+        case "products":
+        case "services":
+          return { data: { id: (eqFilters.id as string) ?? null }, error: null };
         case "invoices": {
           // Eco del id consultado. La prueba de multi-identidad usa una SEGUNDA
           // factura y el doble tiene que comportarse como la base (la fila que
@@ -1036,6 +1169,12 @@ function createPayoutStubClient(): unknown {
         payload = value;
         return query;
       },
+      upsert: (value: Record<string, unknown>, options?: { onConflict?: string }) => {
+        op = "upsert";
+        payload = value;
+        onConflict = options?.onConflict;
+        return query;
+      },
       eq: (column: string, value: unknown) => {
         eqFilters[column] = value;
         return query;
@@ -1064,7 +1203,6 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
   const methods = [
     {
       id: payoutStub.METHOD_ID,
-      sede_id: payoutStub.SEDE_ID,
       code: payoutStub.METHOD_CODE,
       name: "Transferencia",
       is_active: true,
@@ -1076,7 +1214,7 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
 });
 
 describe("commissions: el pago inmediato no se puede pagar dos veces (034)", () => {
-  const actor = { userId: "u-cajero", sedeId: payoutStub.SEDE_ID };
+  const actor = { userId: "u-cajero" };
   // CL-5: marca del INTENTO del primer envío. Desde la 044 es obligatoria, así
   // que TODA llamada de esta prueba la lleva; la segunda llamada de
   // `paySamePendingTwice` acuña la SUYA, porque dos envíos con la MISMA marca
@@ -1267,7 +1405,7 @@ describe("commissions: el pago inmediato no se puede pagar dos veces (034)", () 
  * nunca puede rechazar una operación legítima.
  */
 describe("commissions: CL-5 el pago inmediato reintentado no paga la comisión dos veces", () => {
-  const actor = { userId: "u-cajero", sedeId: payoutStub.SEDE_ID };
+  const actor = { userId: "u-cajero" };
   const MARK = "7c9e1f6a-2b48-4d13-9a75-3e6b0d8c4a21";
   const OTHER_MARK = "b4a0d3e7-5f62-4c18-8d90-2a7e6f1b3c58";
   const INVOICE_2 = "77777777-7777-4777-8777-777777777777";
@@ -1545,7 +1683,7 @@ describe("commissions: CL-5 el pago inmediato reintentado no paga la comisión d
 // Anulada se sigue rechazando. Antes el doble devolvía `Emitida` y las pruebas
 // del pago pasaban: esa era la prueba de que el servidor no exigía el estado.
 describe("commissions: el pago inmediato exige factura Pagada (regla del dueño)", () => {
-  const actor = { userId: "u-cajero", sedeId: payoutStub.SEDE_ID };
+  const actor = { userId: "u-cajero" };
   const MARK = "3d7f0a52-9c14-4e68-b2f1-8a5c6e0d7b43";
   const input = {
     invoice_id: payoutStub.INVOICE_ID,
@@ -1570,6 +1708,31 @@ describe("commissions: el pago inmediato exige factura Pagada (regla del dueño)
     expect(row.amount).toBe(5000);
     expect(payoutStub.payouts).toHaveLength(1);
     expect(payoutStub.unexpectedQueries).toEqual([]);
+  });
+
+  it("el rastro del pago dice QUÉ se pagó, sobre QUÉ fila y POR QUIÉ (sin sede)", async () => {
+    const row = await payCommissionNow({ ...input, amount: 5000 }, actor);
+
+    // El pago es plata que sale de la sede: el rastro tiene que poder leerse
+    // después sin depender de la fila, así que nombra acción, entidad, la fila
+    // y el responsable.
+    expect(payoutStub.audits).toHaveLength(1);
+    expect(payoutStub.audits[0]).toMatchObject({
+      user_id: actor.userId,
+      action: "payroll.commission_paid",
+      entity: "commission_payouts",
+      entity_id: row.id,
+      metadata: {
+        employee_id: payoutStub.EMPLOYEE_ID,
+        invoice_id: payoutStub.INVOICE_ID,
+        cash_shift_id: payoutStub.SHIFT_ID,
+        method_code: payoutStub.METHOD_CODE,
+        amount: 5000,
+        earned_immediate: payoutStub.COMMISSION_VALUE,
+      },
+    });
+    // La instalación es una: la sede ya no viaja como columna del rastro.
+    expect(payoutStub.audits[0]).not.toHaveProperty("sede_id");
   });
 
   it("una factura `Emitida` se rechaza y NO inserta ninguna fila", async () => {
@@ -1643,5 +1806,360 @@ describe("commissions: el pago inmediato exige factura Pagada (regla del dueño)
     payoutStub.invoiceStatus = "Pagada";
     await payCommissionNow({ ...input, amount: 5000 }, actor);
     expect(payoutStub.payouts).toHaveLength(1);
+  });
+});
+
+// ===================================================================== ---
+// 075 — la clave de la regla de comisión pasa a ser de INSTALACIÓN
+// ===================================================================== ---
+//
+// La 016 dejó `uq_commission_rule (sede_id, item_type, item_id, employee_id)` y
+// la 074 explica por qué no lo pudo quitar: el `upsert` del servicio infiere su
+// `ON CONFLICT` contra ese conjunto y la inferencia exige coincidencia EXACTA
+// con las columnas de un índice único. Por eso el orden de esta serie es índice
+// primero y código después, y la 075 hace la primera mitad (el índice nuevo, sin
+// quitar el viejo) y esta unidad la segunda (el `onConflict` nuevo).
+//
+// El doble emula el CONTRATO de la base en el `upsert`, que es lo que hace que
+// estas pruebas no sean de texto: si el objetivo no lo satisface ningún índice
+// devuelve 42P10 sin escribir, y el choque de la clave primaria `id` —que el
+// `ON CONFLICT` NO cubre porque no está en sus columnas— devuelve 23505, que es
+// el rechazo que el servicio traduce a RULE_CONFLICT.
+
+describe("commissions: el upsert de reglas infiere contra el índice de la instalación (075)", () => {
+  const ITEM_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const ITEM_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const base = {
+    item_type: "producto",
+    item_id: ITEM_A,
+    employee_id: payoutStub.EMPLOYEE_ID,
+    percent: 10,
+  } as const;
+
+  beforeEach(() => {
+    resetPayoutStub();
+  });
+
+  it("el objetivo de conflicto es el NUEVO (sin sede) y la escritura entra", async () => {
+    const regla = await upsertCommissionRule({ ...base });
+
+    // Lo que el servicio MANDÓ, verbatim: el conjunto de tres columnas que
+    // infiere `uq_commission_rule_install_key` (075).
+    expect(payoutStub.ruleUpserts).toHaveLength(1);
+    expect(payoutStub.ruleUpserts[0].onConflict).toBe("item_type,item_id,employee_id");
+    // Y el doble no encontró índice que lo satisfaciera: el 42P10 no se
+    // disparó, o sea que la inferencia se resolvió contra un índice real.
+    expect(payoutStub.ruleInferenceFailures).toBe(0);
+    expect(regla).toMatchObject({
+      item_type: "producto",
+      item_id: ITEM_A,
+      employee_id: payoutStub.EMPLOYEE_ID,
+      percent: 10,
+    });
+    // Y la escritura NO manda la columna: es lo que hace que el conjunto de
+    // tres columnas baste para decidir el conflicto.
+    expect(payoutStub.ruleUpserts[0].payload).not.toHaveProperty("sede_id");
+    expect(payoutStub.rules).toHaveLength(1);
+  });
+
+  it("el mismo (ítem × empleado) dos veces NO crea una segunda fila", async () => {
+    const primera = await upsertCommissionRule({ ...base });
+    const segunda = await upsertCommissionRule({ ...base, percent: 25 });
+
+    // El `ON CONFLICT` del objetivo nuevo resuelve la segunda contra la primera:
+    // misma fila, id estable, porcentaje actualizado.
+    expect(segunda.id).toBe(primera.id);
+    expect(segunda.percent).toBe(25);
+    expect(payoutStub.rules).toHaveLength(1);
+    expect(payoutStub.rules[0].percent).toBe(25);
+  });
+
+  it("la sede ya NO es parte de la clave NI de la escritura: la misma pareja es SIEMPRE la misma regla", async () => {
+    const primera = await upsertCommissionRule({ ...base });
+    const segunda = await upsertCommissionRule({ ...base, amount: 5000, percent: null });
+
+    expect(segunda.id).toBe(primera.id);
+    expect(payoutStub.rules).toHaveLength(1);
+    // Ni el actor ni el cuerpo nombran ya la sede: no hay segunda fila posible.
+    expect(payoutStub.ruleUpserts.every((entrada) => !("sede_id" in entrada.payload))).toBe(true);
+  });
+
+  it("control negativo: con el objetivo VIEJO la misma pareja serían DOS filas", async () => {
+    // El doble NO es un archivador: decide por el objetivo. Con el conjunto de
+    // cuatro columnas (el de 016) la fila no coincide y entra como una regla
+    // más. Si esta prueba pasara con una sola fila, el doble no distinguiría los
+    // objetivos y las pruebas de arriba no probarían nada.
+    payoutStub.forceOldConflictTarget = true;
+    await upsertCommissionRule({ ...base });
+    await upsertCommissionRule({ ...base, amount: 5000, percent: null });
+
+    expect(payoutStub.rules).toHaveLength(2);
+    expect(payoutStub.ruleInferenceFailures).toBe(0);
+  });
+
+  it("el esquema sin el índice de la 075 NO acepta el objetivo nuevo: 42P10 y cero filas", async () => {
+    // El orden de la serie, comprobado por el otro lado: una base en estado 074
+    // (con el índice viejo y sin el nuevo) NO tiene contra qué inferir el
+    // conjunto de tres columnas. Por eso el índice va antes que el código.
+    payoutStub.ruleIndexes = ["sede_id,item_type,item_id,employee_id"];
+    const failure: unknown = await upsertCommissionRule({ ...base }).catch(
+      (error: unknown) => error,
+    );
+
+    expect(payoutStub.ruleInferenceFailures).toBe(1);
+    expect(failure).toBeInstanceOf(CommissionError);
+    expect(failure).toMatchObject({ code: "INTERNAL", status: 500 });
+    expect(payoutStub.rules).toHaveLength(0);
+  });
+
+  it("un DUPLICADO real se sigue rechazando con el objetivo nuevo: el `id` de otra regla da 23505", async () => {
+    // Con el objetivo de tres columnas, `ON CONFLICT` sólo resuelve los choques
+    // de SUS columnas. Un `id` que ya existe en la fila de OTRA pareja
+    // (ítem×empleado) choca contra la clave primaria, que no está en el
+    // objetivo, y PostgreSQL responde 23505: cambiar el conjunto del `onConflict`
+    // no debilitó la garantía de «una regla por ítem×empleado».
+    const existente = await upsertCommissionRule({ ...base, percent: 10 });
+    const failure: unknown = await upsertCommissionRule({
+      ...base,
+      item_id: ITEM_B,
+      id: existente.id,
+    }).catch((error: unknown) => error);
+
+    expect(payoutStub.ruleIdClashes).toBe(1);
+    expect(failure).toBeInstanceOf(CommissionError);
+    expect(failure).toMatchObject({ code: "RULE_CONFLICT", status: 409 });
+    // La fila que chocó no se tocó y la pareja nueva no se creó a escondidas.
+    expect(payoutStub.rules).toHaveLength(1);
+    expect(payoutStub.rules[0].item_id).toBe(ITEM_A);
+    expect(payoutStub.rules[0].percent).toBe(10);
+  });
+
+  it("control de no-extralimitación: la MISMA carga sin `id` NO se rechaza (el rechazo lo causó el `id`)", async () => {
+    const existente = await upsertCommissionRule({ ...base, percent: 10 });
+    const otra = await upsertCommissionRule({ ...base, item_id: ITEM_B, percent: 30 });
+
+    expect(payoutStub.ruleIdClashes).toBe(0);
+    expect(otra.id).not.toBe(existente.id);
+    expect(payoutStub.rules).toHaveLength(2);
+  });
+});
+
+// ===================================================================== ---
+// 075 — el archivo de migración y el `onConflict` del servicio
+// ===================================================================== ---
+//
+// La guardia del texto de la migración tiene un motor (una función que devuelve
+// las FALTAS de un archivo) y los controles negativos le inyectan recortes
+// sintéticos del mismo archivo: un motor que no atrapa un 075 que borra el
+// índice viejo no está guardando nada.
+
+/**
+ * Lo que la base EJECUTA de verdad: el SQL sin los comentarios de línea y sin
+ * los literales de texto. Un texto entre comillas simples es un argumento, no
+ * una sentencia: el `COMMENT ON INDEX` de la 075 cita el `DROP` del índice viejo
+ * como prosa del catálogo y ese `DROP` no se ejecuta, así que contarlo sería un
+ * positivo falso.
+ */
+function sqlSinComentarios(fuente: string): string {
+  return fuente
+    .split("\n")
+    .map((linea) => linea.split("--")[0])
+    .join("\n")
+    .replaceAll(/'[^']*'/g, "''");
+}
+
+/** La prosa con los espacios de línea colapsados, para frases multilínea. */
+function prosa(fuente: string): string {
+  return fuente.replace(/\s+/g, " ");
+}
+
+/** FALTAS de un archivo 075 (array vacío = cumple). */
+function revisar075(fuente: string): string[] {
+  const sql = sqlSinComentarios(fuente);
+  const falta: string[] = [];
+
+  // (1) El índice nuevo, con las TRES columnas y en ese orden.
+  const declarado =
+    /CREATE UNIQUE INDEX\s+(?:IF NOT EXISTS\s+)?([a-z0-9_]+)\s+ON\s+public\.commission_rules\s*\(([^)]*)\)/i.exec(
+      sql,
+    );
+  if (!declarado) {
+    falta.push("no declara el índice único de commission_rules");
+  } else {
+    const columnas = declarado[2]
+      .split(",")
+      .map((columna) => columna.trim())
+      .filter(Boolean);
+    if (columnas.join(",") !== "item_type,item_id,employee_id") {
+      falta.push(`uq_commission_rule_install_key: columnas ${columnas.join(",")}`);
+    }
+    if (declarado[1] === "uq_commission_rule") {
+      falta.push("el índice nuevo no puede llamarse como el de 016");
+    }
+  }
+
+  // (2) El índice de 016 SIGUE en pie: ningún `DROP` lo toca.
+  if (/\bDROP\s+INDEX\s+(?:IF EXISTS\s+)?(?:public\.)?uq_commission_rule\s*;/i.test(sql)) {
+    falta.push("borra uq_commission_rule");
+  }
+
+  // (3) El pre-vuelo va antes del `CREATE` y aborta nombrando las filas.
+  const preVuelo = sql.indexOf("DO $$");
+  const creacion = sql.indexOf("CREATE UNIQUE INDEX");
+  if (preVuelo < 0) falta.push("sin pre-vuelo");
+  else if (creacion >= 0 && preVuelo > creacion) falta.push("el pre-vuelo va después del índice");
+
+  // (4) Idempotente: suelta el índice POR SU NOMBRE y lo vuelve a declarar.
+  if (!/\bDROP\s+INDEX\s+IF EXISTS\s+public\.uq_commission_rule_install_key\s*;/i.test(sql)) {
+    falta.push("no suelta el índice por su nombre (no es re-ejecutable)");
+  }
+  return falta;
+}
+
+describe("migración 075: la clave de la regla de comisión es de instalación", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "075_commission_rule_install_key.sql"),
+    "utf8",
+  );
+  const sql = sqlSinComentarios(raw);
+  const texto = prosa(raw);
+
+  it("el archivo existe y agrega el índice nuevo, con su COMMENT", () => {
+    // Piso anti-vacío: el archivo tiene el DDL real y no una prosa.
+    expect(raw.length).toBeGreaterThan(3000);
+    expect(prosa(sql)).toContain(
+      "CREATE UNIQUE INDEX uq_commission_rule_install_key ON public.commission_rules (item_type, item_id, employee_id);",
+    );
+    expect(sql).toContain("COMMENT ON INDEX public.uq_commission_rule_install_key IS");
+    // Y el nombre NO es el de 016: los dos objetos conviven y tienen que poder
+    // distinguirse en el catálogo.
+    expect(sql).not.toContain("CREATE UNIQUE INDEX uq_commission_rule\n");
+    expect(sql).not.toContain("CREATE UNIQUE INDEX uq_commission_rule ");
+  });
+
+  it("cumple su propia guarda (motor compartido con los controles negativos)", () => {
+    expect(revisar075(raw)).toEqual([]);
+  });
+
+  it("NO borra el índice de 016 ni ninguna fila, y deja escrito el DROP pendiente", () => {
+    // Nada de lo que este archivo hace puede quitarle la garantía al código que
+    // hoy infiere contra `uq_commission_rule`.
+    expect(sql).not.toMatch(/\bDELETE\b/i);
+    expect(sql).not.toMatch(/\bUPDATE\b/i);
+    expect(sql).not.toMatch(/\bTRUNCATE\b/i);
+    expect(sql).not.toMatch(/\bDROP\s+COLUMN\b/i);
+    expect(sql).not.toMatch(/\bDROP\s+TABLE\b/i);
+    expect(sql).not.toMatch(/\bDROP\s+POLICY\b/i);
+    expect(sql).not.toMatch(/\bDROP\s+INDEX\b[^;]*uq_commission_rule\s*;/i);
+    // El único `DROP INDEX` del archivo es el del nombre nuevo (idempotencia).
+    const caidos = [...sql.matchAll(/\bDROP\s+INDEX\b[^;]*;/gi)].map((caida) => caida[0]);
+    expect(caidos).toHaveLength(1);
+    expect(caidos[0]).toContain("uq_commission_rule_install_key");
+
+    // Y el DROP que falta queda ESCRITO, con la sentencia exacta y el lugar
+    // donde se hace: es lo que impide que se pierda en la unidad final.
+    expect(texto).toContain("DROP INDEX IF EXISTS public.uq_commission_rule;");
+    expect(texto).toContain("M3c");
+    expect(texto).toContain("074_sede_less_constraints.sql");
+    expect(texto).toContain("src/features/commissions/service.ts");
+  });
+
+  it("el pre-vuelo existe, va primero y aborta nombrando las filas", () => {
+    const preVuelo = sql.indexOf("DO $$");
+    const creacion = sql.indexOf("CREATE UNIQUE INDEX");
+    expect(preVuelo).toBeGreaterThan(-1);
+    expect(preVuelo).toBeLessThan(creacion);
+
+    // Aborta en vez de borrar, y el mensaje dice qué hacer.
+    expect(raw).toContain("RAISE EXCEPTION");
+    expect(raw).toContain("ABORTADA");
+    expect(raw).toContain("No se borró, no se fusionó y no se reescribió ninguna fila");
+    expect(raw).toContain("vuelva a correr el archivo completo");
+    // Y chequea la clave del índice NUEVO (sin sede), que es la que no se
+    // puede escribir si los datos ya la violan.
+    expect(raw).toContain("GROUP BY item_type, item_id, employee_id");
+    expect(raw).toContain("HAVING count(*) > 1");
+    expect(raw).toContain("23505");
+  });
+
+  it("es idempotente y re-ejecutable: suelta el índice por su nombre y lo vuelve a declarar", () => {
+    const suelta = sql.indexOf("DROP INDEX IF EXISTS public.uq_commission_rule_install_key;");
+    const declara = sql.indexOf("CREATE UNIQUE INDEX uq_commission_rule_install_key");
+    expect(suelta).toBeGreaterThan(-1);
+    expect(suelta).toBeLessThan(declara);
+    // Una sola declaración (contada sobre el SQL SIN comentarios: la sección de
+    // reversión repite el nombre como texto comentado).
+    expect([...sql.matchAll(/CREATE UNIQUE INDEX/g)].length).toBe(1);
+    expect(texto).toContain("ADITIVO, IDEMPOTENTE Y RE-EJECUTABLE");
+    expect(texto).toContain("NUMERACIÓN: 075 es el siguiente libre");
+  });
+
+  it("declara el orden (índice primero, código después), el 42P10 y que no se ejecutó", () => {
+    expect(texto).toContain("PRIMERO, CÓDIGO DESPUÉS");
+    expect(texto).toContain("42P10");
+    expect(texto).toContain("onConflict");
+    expect(texto).toContain("item_type,item_id");
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+    // Consultas de sólo lectura para verificar.
+    expect(raw).toContain("pg_indexes");
+    expect(raw).toContain("obj_description");
+  });
+
+  it("control negativo: una 075 que borra el índice de 016 queda señalada", () => {
+    // Mismo motor, archivo sintético: el `DROP` del viejo cuelga del índice
+    // nuevo y el motor lo ve en el SQL ejecutable (la prosa que lo anuncia no
+    // cuenta, porque va comentada).
+    const defectuosa = raw.replace(
+      "CREATE UNIQUE INDEX uq_commission_rule_install_key",
+      "DROP INDEX IF EXISTS public.uq_commission_rule;\n\nCREATE UNIQUE INDEX uq_commission_rule_install_key",
+    );
+    expect(defectuosa).not.toBe(raw);
+    expect(revisar075(defectuosa)).toContain("borra uq_commission_rule");
+    // Y el archivo real, con esa misma línea comentada en la prosa, NO se
+    // marca: el motor mira sentencias, no comentarios.
+    expect(revisar075(raw)).toEqual([]);
+  });
+
+  it("control negativo: un índice con `sede_id`, sin pre-vuelo o sin soltar el nombre queda señalado", () => {
+    const conSede = raw.replace(
+      "ON public.commission_rules (item_type, item_id, employee_id);",
+      "ON public.commission_rules (sede_id, item_type, item_id, employee_id);",
+    );
+    expect(conSede).not.toBe(raw);
+    expect(revisar075(conSede).some((falta) => falta.includes("columnas sede_id"))).toBe(true);
+
+    const sinPreVuelo = sql.replace(/DO \$\$[\s\S]*?END \$\$;?/, "");
+    expect(revisar075(sinPreVuelo)).toContain("sin pre-vuelo");
+
+    const sinSoltar = sql.replace("DROP INDEX IF EXISTS public.uq_commission_rule_install_key;", "");
+    expect(revisar075(sinSoltar)).toContain(
+      "no suelta el índice por su nombre (no es re-ejecutable)",
+    );
+  });
+});
+
+describe("commissions: el servicio infiere contra el índice que existe (075)", () => {
+  const source = readFileSync(
+    join(process.cwd(), "src", "features", "commissions", "service.ts"),
+    "utf8",
+  );
+
+  it("el `onConflict` del upsert es el conjunto NUEVO y el viejo desapareció", () => {
+    // El texto Y el comportamiento: las pruebas del doble de arriba exigen que
+    // el servicio mande estas tres columnas, y esto impide que las vuelva a
+    // mandar por debajo.
+    expect(source).toContain('onConflict: "item_type,item_id,employee_id"');
+    expect(source).not.toContain('onConflict: "sede_id,item_type,item_id,employee_id"');
+  });
+
+  it("el comentario declara el orden y que el índice viejo sigue vivo hasta la unidad final", () => {
+    const encabezado = prosa(source.slice(0, source.indexOf("export async function upsertCommissionRule")));
+    expect(encabezado).toContain("uq_commission_rule_install_key");
+    expect(encabezado).toContain("PRIMERO");
+    expect(encabezado).toContain("DESPUÉS");
+    expect(encabezado).toContain("42P10");
+    expect(encabezado).toContain("M3c");
+    expect(encabezado).toContain("uq_commission_rule (sede_id, item_type, item_id, employee_id)");
+    expect(encabezado).toContain("075_commission_rule_install_key.sql");
   });
 });

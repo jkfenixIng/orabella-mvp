@@ -57,12 +57,6 @@ const dateSchema = z
  */
 export const payrollStartDateSchema = dateSchema.nullable();
 
-/** F10: cuerpo para configurar (o limpiar) la fecha de arranque de la nómina. */
-export const setPayrollStartDateSchema = z.object({
-  payroll_start_date: payrollStartDateSchema,
-});
-export type SetPayrollStartDateInput = z.infer<typeof setPayrollStartDateSchema>;
-
 /**
  * PAY-01/F7: apertura de un período borrador por sede y CICLO.
  *
@@ -1823,6 +1817,100 @@ export function resolveVoucherDayCap(
   const specific = perDayLimits?.[String(weekdayIso(requestDate))];
   if (specific !== undefined && specific !== null) return Number(specific);
   return maxPerDay;
+}
+
+// ------------------------------------------------ 072: ajustes por clave ---
+//
+// Los topes de vales viven en `system_settings` (migración 072): UNA fila por
+// ajuste, identificada por su `clave`, con el contenido del ajuste en `value`
+// (jsonb). Estas funciones son el ÚNICO lugar donde se decide qué sobre se
+// espera de cada clave y qué DEFAULT corresponde cuando la clave no está: son
+// puras (no tocan la base) y se prueban sin dobles.
+//
+// Los DEFAULT son los de las columnas que cada ajuste reemplaza, no una decisión
+// nueva: 0 o null en un tope = sin tope (026, y `checkVoucherCaps` los trata
+// igual), `{}` en los topes por día = sin topes por día, y los siete días
+// ISO = sin restricción de días (024).
+
+/** Envoltorio de un ajuste cuyo sobre es `{"amount": <número|null>}`. */
+export interface VoucherCapSettingValue {
+  amount: number | null;
+}
+
+/** Envoltorio de un ajuste cuyo sobre es `{"limits": {"<día ISO>": <monto>}}`. */
+export interface VoucherPerDaySettingValue {
+  limits: Record<string, number> | null;
+}
+
+/** Envoltorio de un ajuste cuyo sobre es `{"days": [<días ISO>]}`. */
+export interface VoucherDaysSettingValue {
+  days: number[] | null;
+}
+
+/**
+ * 072: lee el sobre de un TOPE (`{"amount": …}`). Una clave ausente, un sobre
+ * sin el dato o un valor que no es número devuelven `null` («sin tope»), que es
+ * el DEFAULT de 026 y lo que el lector devolvía cuando no había fila
+ * configurada. Un 0 explícito se conserva como 0: `checkVoucherCaps` lo trata
+ * como sin tope igual que `null`, y así la fila dice lo que el admin guardó.
+ */
+export function readVoucherCapSetting(value: unknown): number | null {
+  const amount = (value as { amount?: unknown } | null)?.amount;
+  if (amount === null || amount === undefined) return null;
+  const numeric = Number(amount);
+  if (!Number.isFinite(numeric) || numeric < 0) return null;
+  return roundMoney(numeric);
+}
+
+/**
+ * 072: lee el sobre de los TOPES POR DÍA (`{"limits": {"3": 50000}}`) con el
+ * mismo normalizador que la columna `per_day_limits` de 026, así que un sobre
+ * con claves raras (`"0"`, `"8"`, un monto no numérico) se sanea igual que antes
+ * y una clave ausente da `null` («sin topes por día»).
+ */
+export function readVoucherPerDaySetting(value: unknown): Record<string, number> | null {
+  const limits = (value as { limits?: unknown } | null)?.limits;
+  if (limits === null || limits === undefined || typeof limits !== "object") return null;
+  const entries = Object.entries(limits as Record<string, unknown>).map(([day, amount]) => ({
+    day,
+    amount: amount as number,
+  }));
+  return normalizePerDayLimits(entries);
+}
+
+/**
+ * 072: lee el sobre de los DÍAS PERMITIDOS (`{"days": [1,…,7]}`) con el mismo
+ * normalizador que la columna `allowed_days` de 024. Una clave ausente da
+ * `null`, que es «todos los días»: `isVoucherDayAllowed` trata `null` como sin
+ * restricción, igual que antes de la 072.
+ */
+export function readVoucherDaysSetting(value: unknown): number[] | null {
+  const days = (value as { days?: unknown } | null)?.days;
+  if (days === null || days === undefined) return null;
+  if (!Array.isArray(days)) return null;
+  return normalizeAllowedDays(days as Array<number | string>);
+}
+
+/**
+ * 072: el sobre de un ajuste tal como se ESCRIBE (`value` de la fila). Es el
+ * inverso de los tres lectores de arriba y el mismo objeto que la migración deja
+ * escrito de origen, así que lo que la fila guarda y lo que el lector devuelve
+ * no pueden divergir por una forma escrita a mano.
+ */
+export function voucherCapSettingValue(amount: number | null): VoucherCapSettingValue {
+  return { amount: amount === null ? null : roundMoney(Number(amount)) };
+}
+
+/** 072: sobre de los topes por día (null = sin topes por día). */
+export function voucherPerDaySettingValue(
+  limits: Record<string, number> | null,
+): VoucherPerDaySettingValue {
+  return { limits: limits ? normalizePerDayLimits(Object.entries(limits).map(([day, amount]) => ({ day, amount }))) : null };
+}
+
+/** 072: sobre de los días permitidos (null = todos los días). */
+export function voucherDaysSettingValue(days: number[] | null): VoucherDaysSettingValue {
+  return { days: days ? normalizeAllowedDays(days) : null };
 }
 
 /**

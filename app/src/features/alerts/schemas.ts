@@ -151,19 +151,22 @@ export function buildVoucherAlertResolution(args: {
  * Acotar por `entity_id` + `is_read:false` evita tocar revisiones previas u
  * otras alertas, y hace el cierre idempotente (un segundo cierre no cambia
  * nada porque ya no queda la fila `is_read:false`).
+ *
+ * SIN SEDE, a propósito. El rastro se escribe sin `sede_id` (una sola
+ * instalación, ver `buildAuditPayload`), así que un filtro por `sede_id` no
+ * hallaría ninguna fila y, como `.match()` no lanza cuando nada coincide, el
+ * vale quedaría aprobado o rechazado con su alerta todavía abierta y el
+ * llamador recibiría `resolved: true` sin haber cerrado nada. Quien puede
+ * revisar lo define el permiso del llamador, no un filtro sobre una columna
+ * que las filas no tienen.
  */
-export function voucherAlertFilter(
-  sedeId: string,
-  voucherId: string,
-): {
-  sede_id: string;
+export function voucherAlertFilter(voucherId: string): {
   action: string;
   entity: string;
   entity_id: string;
   is_read: false;
 } {
   return {
-    sede_id: sedeId,
     action: VOUCHER_ALERT_ACTION,
     entity: VOUCHER_ALERT_ENTITY,
     entity_id: voucherId,

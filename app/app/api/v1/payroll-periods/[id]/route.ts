@@ -25,9 +25,9 @@ function tokenOf(request: NextRequest): string | undefined {
  */
 export async function GET(_request: NextRequest, context: { params: Promise<{ id: string }> }) {
   try {
-    const session = await requirePayrollAdmin(tokenOf(_request));
+    await requirePayrollAdmin(tokenOf(_request));
     const { id } = await context.params;
-    const data = await getPeriodDetail(session.sedeId, id);
+    const data = await getPeriodDetail(id);
     return ok(data);
   } catch (error) {
     return payrollErrorResponse(error);
@@ -43,10 +43,7 @@ export async function DELETE(request: NextRequest, context: { params: Promise<{ 
   try {
     const session = await requirePayrollAdmin(tokenOf(request));
     const { id } = await context.params;
-    const data = await deletePayrollPeriod(session.sedeId, id, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await deletePayrollPeriod(id, { userId: session.userId });
     return ok(data);
   } catch (error) {
     return payrollErrorResponse(error);

@@ -41,7 +41,7 @@ nombre o SKU (INV-01…05).
   (SKU_TAKEN 409, nunca toca stock), `registerMovement`
   (INSUFFICIENT_STOCK 409), `getKardex` (ascendente), `searchProducts`
   (nombre o SKU, solo sede), `lowStockAlerts` (stock <= mínimo),
-  `listProducts`/`getProduct`. Reutiliza `requireSedeRole`/`resolveSede`
+  `listProducts`/`getProduct`. Reutiliza `requireSedeRole`
   de `admin/service.ts`; escritura solo admin/caja
   (`requireInventoryWriter`), lectura cualquier rol de su sede.
 - `src/features/inventory/actions.ts`: Server Actions espejo.

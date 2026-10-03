@@ -25,7 +25,6 @@ export type CommissionRuleInput = z.infer<typeof commissionRuleSchema>;
 
 export interface CommissionRuleRow {
   id: string;
-  sede_id: string;
   item_type: "producto" | "servicio";
   item_id: string;
   employee_id: string;
@@ -57,7 +56,6 @@ export type CommissionPayoutInput = z.infer<typeof commissionPayoutSchema>;
 
 export interface CommissionPayoutRow {
   id: string;
-  sede_id: string;
   employee_id: string;
   invoice_id: string;
   cash_shift_id: string;

@@ -28,10 +28,7 @@ import {
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
-import {
-  requireSedeRole,
-  resolveSede,
-} from "@/src/shared/lib/sede";
+import { requireSedeRole } from "@/src/shared/lib/sede";
 import { dayBounds } from "@/src/shared/lib/dates";
 import { listPaymentMethods, listServices, listTaxes } from "@/src/features/admin/service";
 import {
@@ -126,7 +123,6 @@ export async function requireBillingWriter(
 
 export interface InvoiceRow {
   id: string;
-  sede_id: string;
   consecutive_number: number;
   client_name: string | null;
   client_document: string | null;
@@ -211,7 +207,7 @@ export interface InvoiceDetail {
 }
 
 const INVOICE_SELECT =
-  "id, sede_id, consecutive_number, client_name, client_document, subtotal, discount, tax, surcharge, total, status, user_id, cash_shift_id, closed_by, closed_at, cancel_reason, created_at, edit_version";
+  "id, consecutive_number, client_name, client_document, subtotal, discount, tax, surcharge, total, status, user_id, cash_shift_id, closed_by, closed_at, cancel_reason, created_at, edit_version";
 const ITEM_SELECT =
   "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission, commission_value, commission_mode, commission_percent_override, employees!inner(full_name, employee_code, commission_percent, pay_type, payout_mode)";
 const TAX_SELECT = "id, invoice_id, tax_code, tax_name, percent, amount";
@@ -289,8 +285,8 @@ async function invoiceIdsOfEmployee(db: DbClient, employeeId: string): Promise<s
   }
 }
 
-/** Lista facturas de la sede con filtros + paginación (más recientes primero). */
-export async function listInvoices(sedeId: string, filters: InvoiceFilters = {}): Promise<InvoiceListItem[]> {
+/** Lista facturas con filtros + paginación (más recientes primero). */
+export async function listInvoices(filters: InvoiceFilters = {}): Promise<InvoiceListItem[]> {
   if (filters.status !== undefined && !["Emitida", "Pagada", "Anulada"].includes(filters.status)) {
     throw new BillingError("VALIDATION", "Estado de filtro inválido.", 400);
   }
@@ -321,7 +317,6 @@ export async function listInvoices(sedeId: string, filters: InvoiceFilters = {})
     let query = db
       .from("invoices")
       .select(`${INVOICE_SELECT}, users!invoices_user_id_fkey(full_name)`)
-      .eq("sede_id", sedeId)
       .order("consecutive_number", { ascending: false });
     if (filters.status) query = query.eq("status", filters.status);
     if (filters.from?.trim()) query = query.gte("created_at", dateBound(filters.from, false));
@@ -452,7 +447,7 @@ export async function listInvoices(sedeId: string, filters: InvoiceFilters = {})
 }
 
 /** Total de facturas con los mismos filtros (para paginar). */
-export async function countInvoices(sedeId: string, filters: InvoiceFilters = {}): Promise<number> {
+export async function countInvoices(filters: InvoiceFilters = {}): Promise<number> {
   const db = await billingDb();
   let employeeInvoiceIds: string[] | null = null;
   if (filters.employee_id) {
@@ -463,7 +458,7 @@ export async function countInvoices(sedeId: string, filters: InvoiceFilters = {}
   // doble de pruebas muta): el `in("id", ...)` con todos los ids de una vez
   // viaja en la URL y con 1000+ ids son ~44 KB → 414, la lectura no ocurre.
   const buildCountQuery = () => {
-    let query = db.from("invoices").select("id", { count: "exact", head: true }).eq("sede_id", sedeId);
+    let query = db.from("invoices").select("id", { count: "exact", head: true });
     if (filters.status) query = query.eq("status", filters.status);
     if (filters.from?.trim()) query = query.gte("created_at", dateBound(filters.from, false));
     if (filters.to?.trim()) query = query.lte("created_at", dateBound(filters.to, true));
@@ -488,8 +483,12 @@ export async function countInvoices(sedeId: string, filters: InvoiceFilters = {}
   return count ?? 0;
 }
 
-/** Detalle con ítems, snapshot de impuestos y porciones (solo su sede). */
-export async function getInvoiceDetail(sedeId: string, id: string): Promise<InvoiceDetail> {
+/**
+ * Detalle con ítems, snapshot de impuestos y porciones.
+ *
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
+export async function getInvoiceDetail(id: string): Promise<InvoiceDetail> {
   const db = await billingDb();
   const { data: invoice, error } = await db
     .from("invoices")
@@ -498,13 +497,7 @@ export async function getInvoiceDetail(sedeId: string, id: string): Promise<Invo
     .maybeSingle();
   if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
   if (!invoice) throw new BillingError("NOT_FOUND", "Factura no encontrada.", 404);
-  const row = invoice as InvoiceRow;
-  try {
-    resolveSede(sedeId, row.sede_id);
-  } catch {
-    throw new BillingError("FORBIDDEN", "No tiene acceso a esa sede.", 403);
-  }
-  return loadDetail(db, row);
+  return loadDetail(db, invoice as InvoiceRow);
 }
 
 async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDetail> {
@@ -549,7 +542,6 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
   // consulta: el detalle puede mezclar empleados y no se cae en N+1.
   const rulesByEmployee = await loadCommissionRulesByEmployee(
     db,
-    invoice.sede_id,
     [...new Set(itemRows.map((item) => item.employee_id))],
   );
   const items = itemRows.map((item) => {
@@ -629,7 +621,6 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
  */
 async function loadCommissionRulesByEmployee(
   db: DbClient,
-  sedeId: string,
   employeeIds: string[],
 ): Promise<Map<string, Map<string, RuleRate>>> {
   const byEmployee = new Map<string, Map<string, RuleRate>>();
@@ -648,7 +639,6 @@ async function loadCommissionRulesByEmployee(
           db
             .from("commission_rules")
             .select("employee_id, item_type, item_id, percent, amount")
-            .eq("sede_id", sedeId)
             .eq("is_active", true)
             .in("employee_id", chunk)
             .order("id")
@@ -798,10 +788,10 @@ interface ValidatedRefs {
 }
 
 /** Valida catálogos: impuestos activos (snapshot) y métodos activos por código. */
-async function loadRefs(sedeId: string): Promise<ValidatedRefs> {
+async function loadRefs(): Promise<ValidatedRefs> {
   const [taxes, methods] = await Promise.all([
-    listTaxes(sedeId),
-    listPaymentMethods(sedeId),
+    listTaxes(),
+    listPaymentMethods(),
   ]);
   return {
     activeTaxes: taxes
@@ -816,22 +806,24 @@ async function loadRefs(sedeId: string): Promise<ValidatedRefs> {
 }
 
 /**
- * Verifica existencia y sede de cada referencia de los ítems (productos,
- * servicios, empleados). B1: los productos se validan vía la frontera de
- * inventario (getProductsStock) — billing NUNCA toca las tablas de
- * inventory directo. Devuelve el mapa de stock para que el llamador
- * pre-verifique disponibilidad ANTES de reservar el consecutivo
- * (FAC-05 sin huecos) o de mutar. Sin N+1: una sola query con IN por
- * tabla (productos vía servicio + empleados) más el catálogo de
- * servicios; el bucle posterior es en memoria.
+ * Verifica existencia de cada referencia de los ítems (productos, servicios,
+ * empleados). B1: los productos se validan vía la frontera de inventario
+ * (getProductsStock) — billing NUNCA toca las tablas de inventory directo.
+ * Devuelve el mapa de stock para que el llamador pre-verifique disponibilidad
+ * ANTES de reservar el consecutivo (FAC-05 sin huecos) o de mutar. Sin N+1: una
+ * sola query con IN por tabla (productos vía servicio + empleados) más el
+ * catálogo de servicios; el bucle posterior es en memoria.
+ *
+ * La SEDE no es un criterio de esta validación: con una sola instalación, una
+ * referencia que existe PERTENECE a la instalación, así que la comprobación es
+ * de existencia y el error sigue siendo NOT_FOUND.
  */
 async function validateItemRefs(
-  sedeId: string,
   items: InvoiceItemInput[],
 ): Promise<Map<string, StockEntry>> {
   const db = await billingDb();
-  const serviceRows = await listServices(sedeId, 500);
-  const serviceSedeById = new Map(serviceRows.map((row) => [row.id, row.sede_id]));
+  const serviceRows = await listServices(500);
+  const serviceIds = new Set(serviceRows.map((row) => row.id));
 
   const productIds = [...new Set(
     items
@@ -842,38 +834,34 @@ async function validateItemRefs(
 
   const [stockMap, employeeRes] = await Promise.all([
     productIds.length > 0
-      ? getProductsStock(sedeId, productIds)
+      ? getProductsStock(productIds)
       : Promise.resolve(new Map<string, StockEntry>()),
     employeeIds.length > 0
-      ? db.from("employees").select("id, sede_id").in("id", employeeIds)
+      ? db.from("employees").select("id").in("id", employeeIds)
       : Promise.resolve({ data: [], error: null }),
   ]);
   if (employeeRes.error) {
     throw new BillingError("INTERNAL", "Error interno.", 500);
   }
-  const employeeSedeById = new Map(
-    ((employeeRes.data ?? []) as Array<{ id: string; sede_id: string }>).map((row) => [row.id, row.sede_id]),
+  const employeeIdsFound = new Set(
+    ((employeeRes.data ?? []) as Array<{ id: string }>).map((row) => row.id),
   );
 
   for (const item of items) {
+    // `getProductsStock` solo devuelve productos existentes: ausente =
+    // inexistente.
     if (item.item_type === "producto" && item.product_id) {
-      // getProductsStock solo devuelve productos de esta sede: ausente =
-      // inexistente o de otra sede (sin filtrar datos ajenos).
       if (!stockMap.has(item.product_id)) {
         throw new BillingError("NOT_FOUND", "Producto no encontrado.", 404);
       }
     }
     if (item.item_type === "servicio" && item.service_id) {
-      if (serviceSedeById.get(item.service_id) !== sedeId) {
+      if (!serviceIds.has(item.service_id)) {
         throw new BillingError("NOT_FOUND", "Servicio no encontrado en esta sede.", 404);
       }
     }
-    const employeeSedeId = employeeSedeById.get(item.employee_id);
-    if (!employeeSedeId) {
+    if (!employeeIdsFound.has(item.employee_id)) {
       throw new BillingError("NOT_FOUND", "Empleado no encontrado.", 404);
-    }
-    if (employeeSedeId !== sedeId) {
-      throw new BillingError("FORBIDDEN", "No tiene acceso a esa sede.", 403);
     }
   }
   return stockMap;
@@ -1012,6 +1000,11 @@ function toRpcEditError(error: { code?: unknown; message?: unknown } | null): Bi
 
 export interface BillingActor {
   userId: string;
+  /**
+   * Ya no decide nada: la instalación es de una sola sede. El campo sobrevive
+   * porque las fixtures de `tests/billing.test.ts` se anotan como `BillingActor`
+   * y lo declaran; quitarlo de la interfaz las rompería por exceso de propiedad.
+   */
   sedeId: string;
   roles?: RoleCode[];
 }
@@ -1026,18 +1019,18 @@ export interface BillingActor {
  * repetidas y no deben colapsarse. La marca es lo único que distingue "el mismo
  * envío" de "el mismo contenido".
  *
- * El filtro es por SEDE: la marca se resuelve dentro del tenant que la usó y el
- * detalle de una factura de otra sede nunca se devuelve por acá.
+ * El filtro es por la MARCA, no por la sede: la marca identifica el envío y la
+ * fila se resuelve por `idempotency_key` dentro de las facturas de la instalación
+ * (una sola sede). El detalle de una factura nunca se devuelve por acá sin el
+ * `id` que la pide.
  */
 async function findInvoiceByIdempotencyKey(
   db: DbClient,
-  sedeId: string,
   idempotencyKey: string,
 ): Promise<InvoiceRow | null> {
   const { data, error } = await db
     .from("invoices")
     .select(INVOICE_SELECT)
-    .eq("sede_id", sedeId)
     .eq("idempotency_key", idempotencyKey)
     .maybeSingle();
   if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
@@ -1147,11 +1140,14 @@ export function buildInvoiceOutReasonTemplate(clientName: string | null | undefi
  * cambio: el registro de qué hacía y de dónde salieron las líneas que se midieron
  * queda en la migración 052.
  *
- * El CONSECUTIVO se reserva ADENTRO (`next_invoice_number`, 005): el incremento
- * de `invoice_sequences` pertenece a la misma transacción, así que un fallo lo
- * REVIERTE con ella y la serie queda sin huecos —ni el que dejaba un fallo
- * posterior a la reserva, ni el que dejaba la carrera de la 041—. El servicio
- * ya no reserva nada: sólo computa y manda DATOS.
+ * El CONSECUTIVO se reserva ADENTRO (`next_invoice_number`, 005 y re-emitida
+ * por 072): el incremento de la fila `invoice_sequence` de `system_settings`
+ * pertenece a la misma transacción, así que un fallo lo REVIERTE con ella y la
+ * serie queda sin huecos —ni el que dejaba un fallo posterior a la reserva, ni
+ * el que dejaba la carrera de la 041—. Esa fila es la que la función bloquea
+ * con `FOR UPDATE`, igual que antes bloqueaba la de `invoice_sequences`: el lock
+ * es lo que impide que dos emisiones concurrentes se lleven el mismo número. El
+ * servicio ya no reserva nada: sólo computa y manda DATOS.
  *
  * QUÉ SIGUE COMPUTANDO EL SERVICIO (y no cruza a SQL): los subtotales por línea
  * (`computeLineSubtotal`), el snapshot de impuestos y los totales
@@ -1181,7 +1177,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   // la red) trae la MISMA marca: se devuelve la factura que ya existe y no se
   // reserva nada. El reintento es un no-op EXITOSO para el llamador, no un
   // error; y como no hay reserva, tampoco hay hueco en la serie.
-  const alreadyEmitted = await findInvoiceByIdempotencyKey(db, actor.sedeId, input.idempotency_key);
+  const alreadyEmitted = await findInvoiceByIdempotencyKey(db, input.idempotency_key);
   if (alreadyEmitted) return loadDetail(db, alreadyEmitted);
 
   let refs: ValidatedRefs;
@@ -1194,8 +1190,8 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   // cálculo.
   let stockPlan: PlannedDeduction[];
   try {
-    refs = await loadRefs(actor.sedeId);
-    stockMap = await validateItemRefs(actor.sedeId, input.items);
+    refs = await loadRefs();
+    stockMap = await validateItemRefs(input.items);
     // B1/FAC-05: pre-verifica stock con mensaje de negocio POR PRODUCTO. Ya no es
     // la forma de evitar un hueco en la serie —el hueco no puede existir: la
     // reserva es de la transacción— sino la guarda que le dice al operador QUÉ
@@ -1258,7 +1254,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   let cashShiftId: string | null = null;
   let adminOverrideJustification: string | null = null;
   {
-    const openShift = await getOpenShiftWithOpener(actor.sedeId);
+    const openShift = await getOpenShiftWithOpener();
     if (!openShift) {
       throw new BillingError(
         "NO_OPEN_SHIFT",
@@ -1292,7 +1288,6 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   // consecutivo—. La clave está en que acá NO se manda un número: la función lo
   // reserva adentro y lo sustituye en la plantilla del motivo del OUT.
   const { data: written, error: createError } = await db.rpc("invoice_create_atomic", {
-    p_sede_id: actor.sedeId,
     p_user_id: actor.userId,
     p_cash_shift_id: cashShiftId,
     p_idempotency_key: input.idempotency_key,
@@ -1360,7 +1355,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
       // perdedora de la carrera NO quema ningún número. El hueco que la 041
       // documentaba como costo declarado ya no puede existir —y con él se fue la
       // última razón para que el servicio reservara por su cuenta—.
-      const winner = await findInvoiceByIdempotencyKey(db, actor.sedeId, input.idempotency_key);
+      const winner = await findInvoiceByIdempotencyKey(db, input.idempotency_key);
       if (winner) return loadDetail(db, winner);
       // Sin factura con esa marca, el choque es del CONSECUTIVO: comportamiento
       // de siempre (barrera final de 005).
@@ -1379,7 +1374,6 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   // punto de fallo de estado (`writeAudit` no lanza), así que a lo sumo falta la
   // fila de auditoría, nunca una escritura a medias.
   await writeAudit({
-    sede_id: actor.sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.INVOICE_CREATED,
     entity: "invoices",
@@ -1440,8 +1434,10 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
  * transacción, sobre la fila bloqueada: una transacción no es un camino para
  * saltear una guarda.
  */
+/**
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
 export async function annulInvoice(
-  sedeId: string,
   id: string,
   raw: unknown,
   actor: BillingActor,
@@ -1456,7 +1452,7 @@ export async function annulInvoice(
   const motivo = parsed.data.motivo.trim();
   const db = await billingDb();
 
-  const detail = await getInvoiceDetail(sedeId, id);
+  const detail = await getInvoiceDetail(id);
   if (!canAnnulStatus(detail.invoice.status)) {
     throw new BillingError("ANNUL_INVALID", annulBlockedMessage(detail.invoice.status), 409);
   }
@@ -1464,7 +1460,7 @@ export async function annulInvoice(
   // U6-a: mismo candado que las dos ediciones. Si la lectura del historial no
   // se puede completar, `invoiceInClosedPayroll` LANZA (READ_INCOMPLETE) y la
   // anulación se rechaza: nunca un `false` por no haber podido mirar.
-  if (await invoiceInClosedPayroll(db, sedeId, id)) {
+  if (await invoiceInClosedPayroll(db, id)) {
     throw new BillingError(
       "PAYROLL_LOCKED",
       "La factura ya entró en una nómina cerrada: al empleado pagado no se le toca, y anularla dejaría esa comisión pagada sin reverso.",
@@ -1491,7 +1487,6 @@ export async function annulInvoice(
   });
 
   const { data: written, error: annulError } = await db.rpc("invoice_annul_atomic", {
-    p_sede_id: sedeId,
     p_invoice_id: id,
     p_user_id: actor.userId,
     // El instante lo resuelve el servicio, como en el cierre de caja (049): la
@@ -1510,7 +1505,6 @@ export async function annulInvoice(
   }
 
   await writeAudit({
-    sede_id: sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.INVOICE_ANNULLED,
     entity: "invoices",
@@ -1605,8 +1599,10 @@ function buildEditStockMoves(args: {
  * inmutabilidad del total es ESTRUCTURAL, porque la función no tiene un grupo
  * capaz de escribir dinero.
  */
+/**
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
 export async function editInvoiceItems(
-  sedeId: string,
   invoiceId: string,
   raw: unknown,
   actor: BillingActor,
@@ -1622,7 +1618,7 @@ export async function editInvoiceItems(
   const motivo = input.motivo.trim();
   const db = await billingDb();
 
-  const detail = await getInvoiceDetail(sedeId, invoiceId);
+  const detail = await getInvoiceDetail(invoiceId);
   if (detail.invoice.status === "Anulada") {
     throw new BillingError("ANNUL_INVALID", "Anulada es terminal: no se edita (emita una nueva).", 409);
   }
@@ -1630,9 +1626,8 @@ export async function editInvoiceItems(
   let refs: ValidatedRefs;
   let stockMap: Map<string, StockEntry>;
   try {
-    refs = await loadRefs(actor.sedeId);
+    refs = await loadRefs();
     stockMap = await validateItemRefs(
-      actor.sedeId,
       input.items.map((item) => ({
         item_type: item.item_type,
         product_id: item.product_id,
@@ -1697,7 +1692,7 @@ export async function editInvoiceItems(
     input.items,
   );
 
-  if (diff.payTouched && (await invoiceInClosedPayroll(db, sedeId, invoiceId))) {
+  if (diff.payTouched && (await invoiceInClosedPayroll(db, invoiceId))) {
     throw new BillingError(
       "PAYROLL_LOCKED",
       "La factura ya entró en una nómina cerrada: al empleado pagado no se le toca (empleado, comisión, cant., precio).",
@@ -1772,7 +1767,6 @@ export async function editInvoiceItems(
     reason: editReason,
   });
   const { data: written, error: editError } = await db.rpc("invoice_edit_items_atomic", {
-    p_sede_id: sedeId,
     p_invoice_id: invoiceId,
     p_user_id: actor.userId,
     p_expected_version: Number(detail.invoice.edit_version),
@@ -1812,7 +1806,6 @@ export async function editInvoiceItems(
   // fila de auditoría, nunca una escritura a medias. Las cifras son las de
   // siempre, con el motivo y los movimientos que el servicio CREYÓ escribir.
   await writeAudit({
-    sede_id: actor.sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.INVOICE_EDITED,
     entity: "invoices",
@@ -1851,8 +1844,10 @@ export async function editInvoiceItems(
  * reemplazo —y los totales, y el stock— son la misma transacción: o queda la
  * colección ANTERIOR completa, o queda la NUEVA completa.
  */
+/**
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
 export async function editEmittedInvoiceItems(
-  sedeId: string,
   invoiceId: string,
   raw: unknown,
   actor: BillingActor,
@@ -1870,7 +1865,7 @@ export async function editEmittedInvoiceItems(
   const motivo = input.motivo?.trim() || null;
   const db = await billingDb();
 
-  const detail = await getInvoiceDetail(sedeId, invoiceId);
+  const detail = await getInvoiceDetail(invoiceId);
   if (detail.invoice.status === "Anulada") {
     throw new BillingError("ANNUL_INVALID", "Anulada es terminal: no se edita (emita una nueva).", 409);
   }
@@ -1883,7 +1878,7 @@ export async function editEmittedInvoiceItems(
   }
 
   if (!isAdmin) {
-    const openShift = await getOpenShiftWithOpener(sedeId).catch(() => null);
+    const openShift = await getOpenShiftWithOpener().catch(() => null);
     if (!openShift) {
       throw new BillingError(
         "NO_OPEN_SHIFT",
@@ -1909,9 +1904,8 @@ export async function editEmittedInvoiceItems(
   let refs: ValidatedRefs;
   let emittedStockMap: Map<string, StockEntry>;
   try {
-    refs = await loadRefs(actor.sedeId);
+    refs = await loadRefs();
     emittedStockMap = await validateItemRefs(
-      actor.sedeId,
       input.items.map((item) => ({
         item_type: item.item_type,
         product_id: item.product_id,
@@ -1977,7 +1971,7 @@ export async function editEmittedInvoiceItems(
     input.items,
   );
 
-  if (diff.payTouched && (await invoiceInClosedPayroll(db, sedeId, invoiceId))) {
+  if (diff.payTouched && (await invoiceInClosedPayroll(db, invoiceId))) {
     throw new BillingError(
       "PAYROLL_LOCKED",
       "La factura ya entró en una nómina cerrada: al empleado pagado no se le toca (empleado, comisión, cant., precio).",
@@ -2089,7 +2083,6 @@ export async function editEmittedInvoiceItems(
     reason: editReason,
   });
   const { data: written, error: editError } = await db.rpc("invoice_edit_emitted_atomic", {
-    p_sede_id: sedeId,
     p_invoice_id: invoiceId,
     p_user_id: actor.userId,
     p_expected_version: Number(detail.invoice.edit_version),
@@ -2139,7 +2132,6 @@ export async function editEmittedInvoiceItems(
   }
 
   await writeAudit({
-    sede_id: actor.sedeId,
     user_id: actor.userId,
     action: AUDIT_ACTIONS.INVOICE_EDITED,
     entity: "invoices",
@@ -2207,9 +2199,9 @@ function detailHasInvoice(detail: unknown, invoiceId: string): boolean {
  * se ensancha acá: no existe otra fuente que ligue factura e ítem de nómina, así
  * que cambiar el alcance exige decidir antes qué se considera "pagado".
  */
-async function invoiceInClosedPayroll(db: DbClient, sedeId: string, invoiceId: string): Promise<boolean> {
+async function invoiceInClosedPayroll(db: DbClient, invoiceId: string): Promise<boolean> {
   try {
-    const closedPeriods = await readAllClosedPeriods(db, sedeId);
+    const closedPeriods = await readAllClosedPeriods(db);
     if (closedPeriods.length === 0) return false;
     for (let start = 0; start < closedPeriods.length; start += IN_FILTER_CHUNK_SIZE) {
       const chunk = closedPeriods.slice(start, start + IN_FILTER_CHUNK_SIZE);
@@ -2235,10 +2227,10 @@ async function invoiceInClosedPayroll(db: DbClient, sedeId: string, invoiceId: s
 }
 
 /**
- * Períodos CERRADOS de la sede, todos y en orden (U5: sin `.limit(200)`). Se
- * leen en lotes del tamaño que después aguanta el `in(...)` de los ítems.
+ * Períodos CERRADOS, todos y en orden (U5: sin `.limit(200)`). Se leen en
+ * lotes del tamaño que después aguanta el `in(...)` de los ítems.
  */
-async function readAllClosedPeriods(db: DbClient, sedeId: string): Promise<string[]> {
+async function readAllClosedPeriods(db: DbClient): Promise<string[]> {
   const periods = await readAllPaged<{ id: string }>({
     table: "payroll_periods",
     pageSize: IN_FILTER_CHUNK_SIZE,
@@ -2246,7 +2238,6 @@ async function readAllClosedPeriods(db: DbClient, sedeId: string): Promise<strin
       db
         .from("payroll_periods")
         .select("id")
-        .eq("sede_id", sedeId)
         .eq("status", "cerrado")
         .order("id")
         .range(from, to),
@@ -2327,8 +2318,10 @@ async function findInvoicePaymentsByIdempotencyKey(
  * 042, que siguen corriendo —ahora dentro de la misma transacción— y siguen
  * traduciéndose a los mismos errores.
  */
+/**
+ * No recibe sede: la instalación es de una sola y la fila no trae la columna.
+ */
 export async function splitPayment(
-  sedeId: string,
   id: string,
   raw: unknown,
   actor: BillingActor,
@@ -2338,7 +2331,7 @@ export async function splitPayment(
     throw new BillingError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const db = await billingDb();
-  const detail = await getInvoiceDetail(sedeId, id);
+  const detail = await getInvoiceDetail(id);
   if (detail.invoice.status === "Anulada") {
     throw new BillingError("ANNUL_INVALID", annulBlockedMessage("Anulada"), 409);
   }
@@ -2353,11 +2346,11 @@ export async function splitPayment(
     id,
     parsed.data.idempotency_key,
   );
-  if (repeated.length > 0) return getInvoiceDetail(sedeId, id);
+  if (repeated.length > 0) return getInvoiceDetail(id);
 
   // F2: el cobro exige caja abierta (CAJ-02). Solo la caja dueña del
   // turno o un administrador puede pagar o anular.
-  const openShift = await getOpenShiftWithOpener(sedeId).catch(() => null);
+  const openShift = await getOpenShiftWithOpener().catch(() => null);
   if (!openShift) {
     throw new BillingError(
       "NO_OPEN_SHIFT",
@@ -2377,7 +2370,7 @@ export async function splitPayment(
     );
   }
 
-  const refs = await loadRefs(sedeId);
+  const refs = await loadRefs();
   for (const portion of parsed.data.portions) {
     if (!refs.methodByCode.has(portion.method_code)) {
       throw new BillingError(
@@ -2443,7 +2436,6 @@ export async function splitPayment(
   // hay caja abierta". El cierre de la factura con sus datos (`closed_by`,
   // `closed_at`) ya viajaba y no cambia.
   const { data: written, error: payError } = await db.rpc("invoice_split_payment_atomic", {
-    p_sede_id: sedeId,
     p_invoice_id: id,
     // CL-17: el TURNO que cobra, como PARÁMETRO de la operación (no sólo dentro
     // de cada porción). La función lo bloquea (`FOR SHARE`) ANTES de bloquear la
@@ -2505,7 +2497,7 @@ export async function splitPayment(
         id,
         parsed.data.idempotency_key,
       );
-      if (winner.length > 0) return getInvoiceDetail(sedeId, id);
+      if (winner.length > 0) return getInvoiceDetail(id);
       // Sin cobro con esa marca, el rechazo es el de siempre: el tope.
       if (code === "P0001") {
         throw new BillingError("OVERPAID", "Las porciones superan el saldo pendiente.", 422);
@@ -2525,5 +2517,5 @@ export async function splitPayment(
   }
 
   if (closesInvoice) return loadDetail(db, result.invoice);
-  return getInvoiceDetail(sedeId, id);
+  return getInvoiceDetail(id);
 }

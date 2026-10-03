@@ -18,14 +18,14 @@ function tokenOf(request: NextRequest): string | undefined {
 
 /**
  * GET /api/v1/inventory/kardex?product_id= — kardex cronológico ascendente.
- * Requiere sesión (cualquier rol de su sede).
+ * Requiere sesión (cualquier rol).
  */
 export async function GET(request: NextRequest) {
   try {
-    const session = await requireSession(tokenOf(request));
+    await requireSession(tokenOf(request));
     const productId = request.nextUrl.searchParams.get("product_id")?.trim() ?? "";
     if (!productId) return fail("VALIDATION", "product_id requerido.", 400);
-    const data = await getKardex(session.sedeId, productId);
+    const data = await getKardex(productId);
     return ok(data);
   } catch (error) {
     return inventoryErrorResponse(error);

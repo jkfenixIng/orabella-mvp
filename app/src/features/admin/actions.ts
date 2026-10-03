@@ -9,16 +9,13 @@ import {
   listEmployees,
   listPaymentMethods,
   listSedeUsers,
-  listSedes,
   listServices,
   listTaxes,
   requireAdminSession,
   requireSession,
-  resolveSede,
   setUserRoles,
   upsertEmployee,
   upsertPaymentMethod,
-  upsertSede,
   upsertService,
   upsertTaxConfig,
 } from "./service";
@@ -36,20 +33,20 @@ function toFailure(error: unknown): { success: false; code: string; message: str
 }
 
 /** Misma lógica que GET /api/v1/employees (requiere sesión). */
-export async function listEmployeesAction(sedeId?: string) {
+export async function listEmployeesAction() {
   try {
-    const session = await requireSession(await sessionToken());
-    return { success: true as const, data: await listEmployees(resolveSede(session.sedeId, sedeId)) };
+    await requireSession(await sessionToken());
+    return { success: true as const, data: await listEmployees() };
   } catch (error) {
     return toFailure(error);
   }
 }
 
-/** Usuarios de la sede con roles (selector de vínculo y pestaña Usuarios). */
-export async function listSedeUsersAction(sedeId?: string) {
+/** Cuentas de la instalación con roles (selector de vínculo y pestaña Usuarios). */
+export async function listSedeUsersAction() {
   try {
     const session = await requireSession(await sessionToken());
-    return { success: true as const, data: await listSedeUsers(resolveSede(session.sedeId, sedeId)) };
+    return { success: true as const, data: await listSedeUsers(session.sedeId) };
   } catch (error) {
     return toFailure(error);
   }
@@ -59,13 +56,10 @@ export async function listSedeUsersAction(sedeId?: string) {
 export async function upsertEmployeeAction(input: unknown) {
   try {
     const session = await requireAdminSession(await sessionToken());
-    const data = await upsertEmployee({
-      ...(typeof input === "object" && input !== null ? input : {}),
-      sede_id: resolveSede(
-        session.sedeId,
-        (input as { sede_id?: string }).sede_id,
-      ),
-    });
+    const data = await upsertEmployee(
+      typeof input === "object" && input !== null ? input : {},
+      session.sedeId,
+    );
     revalidateTag("catalog:employees");
     return { success: true as const, data };
   } catch (error) {
@@ -76,20 +70,18 @@ export async function upsertEmployeeAction(input: unknown) {
 /** Misma lógica que GET /api/v1/employees/:id (requiere sesión). */
 export async function getEmployeeAction(id: string) {
   try {
-    const session = await requireSession(await sessionToken());
-    const data = await getEmployee(id);
-    resolveSede(session.sedeId, data.sede_id);
-    return { success: true as const, data };
+    await requireSession(await sessionToken());
+    return { success: true as const, data: await getEmployee(id) };
   } catch (error) {
     return toFailure(error);
   }
 }
 
 /** Misma lógica que GET /api/v1/services (requiere sesión). */
-export async function listServicesAction(sedeId?: string) {
+export async function listServicesAction() {
   try {
-    const session = await requireSession(await sessionToken());
-    return { success: true as const, data: await listServices(resolveSede(session.sedeId, sedeId)) };
+    await requireSession(await sessionToken());
+    return { success: true as const, data: await listServices() };
   } catch (error) {
     return toFailure(error);
   }
@@ -98,11 +90,8 @@ export async function listServicesAction(sedeId?: string) {
 /** Misma lógica que POST /api/v1/services (solo admin). */
 export async function upsertServiceAction(input: unknown) {
   try {
-    const session = await requireAdminSession(await sessionToken());
-    const data = await upsertService({
-      ...(typeof input === "object" && input !== null ? input : {}),
-      sede_id: resolveSede(session.sedeId, (input as { sede_id?: string }).sede_id),
-    });
+    await requireAdminSession(await sessionToken());
+    const data = await upsertService(typeof input === "object" && input !== null ? input : {});
     revalidateTag("catalog:services");
     return { success: true as const, data };
   } catch (error) {
@@ -111,10 +100,10 @@ export async function upsertServiceAction(input: unknown) {
 }
 
 /** Misma lógica que GET /api/v1/taxes (requiere sesión). */
-export async function listTaxesAction(sedeId?: string) {
+export async function listTaxesAction() {
   try {
-    const session = await requireSession(await sessionToken());
-    return { success: true as const, data: await listTaxes(resolveSede(session.sedeId, sedeId)) };
+    await requireSession(await sessionToken());
+    return { success: true as const, data: await listTaxes() };
   } catch (error) {
     return toFailure(error);
   }
@@ -123,11 +112,8 @@ export async function listTaxesAction(sedeId?: string) {
 /** Misma lógica que POST /api/v1/taxes (solo admin). */
 export async function upsertTaxConfigAction(input: unknown) {
   try {
-    const session = await requireAdminSession(await sessionToken());
-    const data = await upsertTaxConfig({
-      ...(typeof input === "object" && input !== null ? input : {}),
-      sede_id: resolveSede(session.sedeId, (input as { sede_id?: string }).sede_id),
-    });
+    await requireAdminSession(await sessionToken());
+    const data = await upsertTaxConfig(typeof input === "object" && input !== null ? input : {});
     revalidateTag("catalog:taxes");
     return { success: true as const, data };
   } catch (error) {
@@ -136,12 +122,12 @@ export async function upsertTaxConfigAction(input: unknown) {
 }
 
 /** Misma lógica que GET /api/v1/payment-methods (requiere sesión). */
-export async function listPaymentMethodsAction(sedeId?: string) {
+export async function listPaymentMethodsAction() {
   try {
-    const session = await requireSession(await sessionToken());
+    await requireSession(await sessionToken());
     return {
       success: true as const,
-      data: await listPaymentMethods(resolveSede(session.sedeId, sedeId)),
+      data: await listPaymentMethods(),
     };
   } catch (error) {
     return toFailure(error);
@@ -151,11 +137,10 @@ export async function listPaymentMethodsAction(sedeId?: string) {
 /** Misma lógica que POST /api/v1/payment-methods (solo admin). */
 export async function upsertPaymentMethodAction(input: unknown) {
   try {
-    const session = await requireAdminSession(await sessionToken());
-    const data = await upsertPaymentMethod({
-      ...(typeof input === "object" && input !== null ? input : {}),
-      sede_id: resolveSede(session.sedeId, (input as { sede_id?: string }).sede_id),
-    });
+    await requireAdminSession(await sessionToken());
+    const data = await upsertPaymentMethod(
+      typeof input === "object" && input !== null ? input : {},
+    );
     revalidateTag("catalog:payment-methods");
     return { success: true as const, data };
   } catch (error) {
@@ -163,27 +148,28 @@ export async function upsertPaymentMethodAction(input: unknown) {
   }
 }
 
-/** Sedes para el selector del admin (requiere sesión). */
-export async function listSedesAction() {
-  try {
-    await requireSession(await sessionToken());
-    return { success: true as const, data: await listSedes() };
-  } catch (error) {
-    return toFailure(error);
-  }
-}
-
-/** ADM-01: crear/actualizar sede (solo admin). */
-export async function upsertSedeAction(input: unknown) {
-  try {
-    await requireAdminSession(await sessionToken());
-    const data = await upsertSede(input);
-    revalidateTag("catalog:sedes");
-    return { success: true as const, data };
-  } catch (error) {
-    return toFailure(error);
-  }
-}
+/**
+ * G5: aquí YA NO hay ninguna acción de sedes.
+ *
+ * Existían dos y las dos eran agujeros: `listSedesAction` guardada solo por
+ * `requireSession` (cualquier rol logueado listaba TODAS las sedes) y
+ * `upsertSedeAction` guardada por `requireAdminSession` (el admin de CUALQUIER
+ * sede creaba y editaba sedes, incluida la fila de la sede del sistema).
+ *
+ * Se eliminaron y no se re-ubicaron: ninguna tenía consumidores (ni una sola
+ * referencia en la app), y conservar una segunda lectura de sedes con otro
+ * contrato detrás de una caché de una hora sería peor que no tenerla.
+ *
+ * Y ya no hay una lectura que reubicar: la instalación es de UNA SOLA SEDE
+ * (decisión del dueño, 2026-10-01), así que la capa de plataforma
+ * (`src/features/platform`) configura la INSTALACIÓN —la fecha de inicio de su
+ * nómina— y resuelve su sede por dato (la única fila activa de `sedes`), no
+ * leyendo un catálogo para que alguien elija.
+ *
+ * Lo que el negocio conserva es la gestión de personas de SU sede
+ * (`listSedeUsers`/`setUserRoles`, con su pestaña en `/admin`), y el rol de
+ * plataforma no se otorga ni se quita desde acá.
+ */
 
 /** ADM-04: asignar roles a un usuario (solo admin). */
 export async function setUserRolesAction(input: unknown) {

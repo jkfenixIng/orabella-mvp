@@ -8,32 +8,33 @@ import type { ActionResult } from "@/src/shared/lib/api-response";
 import { buttonClass, ghostClass, hintTextClass, inputClass, labelClass } from "@/src/shared/lib/ui-styles";
 
 /**
- * G3b — isla CLIENTE de la superficie de plataforma.
+ * Isla CLIENTE de la superficie de plataforma.
  *
- * La página sigue siendo el componente servidor con la guarda: acá solo vive la
- * interacción del formulario por sede (el campo, el botón de guardar y el de
- * quitar), el toast de éxito y el canal de error. La escritura se pide a la
- * acción de plataforma, que vuelve a aplicar `requirePlatformAdmin` en el
- * servidor: la pantalla no decide quién puede escribir, solo lo ofrece.
+ * La página sigue siendo el componente servidor con la guarda: acá solo viven la
+ * interacción —el campo de la fecha de inicio de la nómina—, el toast de éxito y
+ * el canal de error. La escritura se pide a la acción de plataforma, que vuelve a
+ * aplicar `requirePlatformAdmin` en el servidor: la pantalla no decide quién
+ * puede escribir, solo lo ofrece. El cuerpo NO lleva la sede —la instalación es
+ * de una sola sede y el servidor la resuelve—.
  *
- * El valor inicial viene leído de la página (SSR) y el éxito de la acción lo
- * pisa con lo que el servidor escribió: el servidor es la única fuente de la
- * fecha, igual que en el resto del módulo.
+ * El valor inicial de la fecha viene leído de la página (SSR) y el éxito de la
+ * acción lo pisa con lo que el servidor escribió: el servidor es la única fuente
+ * de la fecha, igual que en el resto del módulo.
  */
 interface PlataformaPayrollStartDateFormProps {
-  sedeId: string;
-  sedeName: string;
+  /** Nombre de la instalación: sólo se usa para nombrar lo que se configuró. */
+  installationName: string;
   initialPayrollStartDate: string | null;
 }
 
-type WriteResult = { sede_id: string; payroll_start_date: string | null };
+/** Lo que la pantalla necesita de la escritura: la fecha que el servidor aplicó. */
+type WriteResult = { payroll_start_date: string | null };
 
 export function PlataformaPayrollStartDateForm({
-  sedeId,
-  sedeName,
+  installationName,
   initialPayrollStartDate,
 }: PlataformaPayrollStartDateFormProps) {
-  // Fecha vigente de la sede, según el servidor. `null` = «sin configurar».
+  // Fecha vigente de la instalación, según el servidor. `null` = «sin configurar».
   const [payrollStartDate, setPayrollStartDate] = useState<string | null>(initialPayrollStartDate);
   // Borrador del campo: lo que se escribió todavía sin guardar (vacío = limpiar).
   const [draft, setDraft] = useState(initialPayrollStartDate ?? "");
@@ -44,7 +45,6 @@ export function PlataformaPayrollStartDateForm({
   async function save(value: string | null) {
     setBusy(true);
     const result = (await setPlatformPayrollStartDateAction({
-      sede_id: sedeId,
       payroll_start_date: value,
     })) as ActionResult<WriteResult>;
     setBusy(false);
@@ -58,8 +58,8 @@ export function PlataformaPayrollStartDateForm({
     // El éxito es EVENTO: sale por el toast y no se queda compitiendo en pantalla.
     toast.success(
       result.data.payroll_start_date === null
-        ? `Se retiró la fecha de inicio de la nómina de ${sedeName}.`
-        : `Inicio de la nómina de ${sedeName}: ${result.data.payroll_start_date}.`,
+        ? `Se retiró la fecha de inicio de la nómina de ${installationName}.`
+        : `Inicio de la nómina de ${installationName}: ${result.data.payroll_start_date}.`,
     );
   }
 
@@ -78,10 +78,10 @@ export function PlataformaPayrollStartDateForm({
       <p className="text-sm text-text-secondary">
         Inicio de nómina: {payrollStartDate ?? "Sin configurar"}
       </p>
-      <label className={labelClass} htmlFor={`payroll-start-date-${sedeId}`}>
+      <label className={labelClass} htmlFor="payroll-start-date">
         Fecha de inicio de la nómina
         <input
-          id={`payroll-start-date-${sedeId}`}
+          id="payroll-start-date"
           type="date"
           value={draft}
           onChange={(event) => setDraft(event.target.value)}

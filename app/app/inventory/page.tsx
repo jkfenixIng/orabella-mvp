@@ -41,7 +41,7 @@ export default async function InventoryPage() {
 
   // Una sola query: las alertas se derivan del listado (misma regla
   // stock <= mínimo que filterLowStock), sin segundo scan completo.
-  const products = await listProducts(sedeId);
+  const products = await listProducts();
   const alertIds = new Set(filterLowStock(products).map((alert) => alert.id));
   const canWrite = session.roles.includes("admin") || session.roles.includes("caja");
   const canAdmin = session.roles.includes("admin");
@@ -53,7 +53,6 @@ export default async function InventoryPage() {
         description="Productos, stock, kardex y alertas de mínimo de su sede."
       />
       <InventoryClient
-        sedeId={sedeId}
         initialProducts={products}
         initialAlertIds={[...alertIds]}
         canWrite={canWrite}

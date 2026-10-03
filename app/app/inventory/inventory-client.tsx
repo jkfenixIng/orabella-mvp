@@ -81,7 +81,6 @@ function newMovementKey(): string {
 }
 
 interface InventoryClientProps {
-  sedeId: string;
   initialProducts: ProductRow[];
   initialAlertIds: string[];
   canWrite: boolean;
@@ -141,7 +140,7 @@ export function InventoryClient(props: InventoryClientProps) {
     );
 
   async function refresh() {
-    const result: ActionResult<ProductRow[]> = await listProductsAction(props.sedeId);
+    const result: ActionResult<ProductRow[]> = await listProductsAction();
     if (result.success) {
       setProducts(result.data);
       setAlertIds(
@@ -221,7 +220,6 @@ export function InventoryClient(props: InventoryClientProps) {
     const minStock = toNumber(form.min_stock);
     const result: ActionResult<ProductRow> = await upsertProductAction({
       ...(editingId ? { id: editingId } : {}),
-      sede_id: props.sedeId,
       sku: form.sku,
       name: form.name,
       description: form.description || null,

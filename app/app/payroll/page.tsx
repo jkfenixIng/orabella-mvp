@@ -58,8 +58,8 @@ export default async function PayrollPage() {
   // fila: pasarle la planta entera sería exponerle documentos, teléfonos y
   // sueldos ajenos.
   const [employees, methods, overview, payrollStartDate] = await Promise.all([
-    listAllEmployees(sedeId),
-    listPaymentMethods(sedeId),
+    listAllEmployees(),
+    listPaymentMethods(),
     canAdmin ? listPayrollOverview(sedeId) : null,
     // F10: la fecha desde la que la nómina OPERA en la sede. Sólo el admin la
     // usa (es el control de configuración de la pantalla): al empleado no se le
@@ -69,7 +69,7 @@ export default async function PayrollPage() {
 
   // El admin ya tiene los períodos dentro del resumen: se usan esos y la lectura
   // no se repite. El empleado lee la lista pelada, como antes.
-  const periods = overview ? overview.summaries.map((row) => row.period) : await listPeriods(sedeId);
+  const periods = overview ? overview.summaries.map((row) => row.period) : await listPeriods();
   const visibleEmployees = canAdmin
     ? employees
     : employees.filter((row) => row.user_id === session.user.id);
@@ -81,7 +81,6 @@ export default async function PayrollPage() {
         description="Periodos con cálculo desde facturación y pago por porciones."
       />
       <PayrollClient
-        sedeId={sedeId}
         initialEmployees={visibleEmployees}
         initialPeriods={periods}
         initialSummaries={overview?.summaries ?? []}

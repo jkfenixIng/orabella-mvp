@@ -38,10 +38,9 @@ export function toNumber(value: string): number | null {
  * sistema en otro huso ve las horas corridas respecto de alguien en Bogotá, sin
  * error, sin aviso y sin registro.
  *
- * Revisado y decidido: se deja así a propósito. La operación es de una sola sede
- * (`src/shared/lib/sede.ts`, `resolveSede`) con el personal en Colombia, así que
- * el corrimiento solo aparece en un cliente con el sistema mal configurado; y
- * fijar el huso acá cambiaría la fecha y hora de todas las pantallas que ya se
+ * Revisado y decidido: se deja así a propósito. La instalación es de una sola
+ * sede y el personal está en Colombia, así que el corrimiento solo aparece en un
+ * cliente con el sistema mal configurado; y fijar el huso acá cambiaría la fecha y hora de todas las pantallas que ya se
  * aceptaron (alertas, caja, nómina, vales) sin una necesidad medida. Si algún día
  * se decide fijarlo, el punto ÚNICO es esta función (`timeZone: "America/Bogota"`
  * en las opciones de abajo), no `dates.ts`: ese archivo es el huso del CÁLCULO de

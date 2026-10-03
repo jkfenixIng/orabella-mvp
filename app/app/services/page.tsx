@@ -35,7 +35,7 @@ export default async function ServicesPage() {
     );
   }
 
-  const services = await listServices(sedeId);
+  const services = await listServices();
   const canWrite = session.roles.includes("admin");
 
   return (
@@ -44,7 +44,7 @@ export default async function ServicesPage() {
         title="Servicios"
         description="Catálogo de servicios de la sede: qué se brinda, con precio y duración estimada."
       />
-      <ServicesClient sedeId={sedeId} initialServices={services} canWrite={canWrite} />
+      <ServicesClient initialServices={services} canWrite={canWrite} />
     </PageContainer>
   );
 }

@@ -18,14 +18,14 @@ function tokenOf(request: NextRequest): string | undefined {
 }
 
 /**
- * GET /api/v1/payroll-periods — lista los periodos de la sede
+ * GET /api/v1/payroll-periods — lista los periodos
  * (solo admin: es lectura de nómina completa y el API no tiene alcance por
  * fila; el recibo del empleado se ve por la action, que sí lo aplica).
  */
 export async function GET(request: NextRequest) {
   try {
-    const session = await requirePayrollAdmin(tokenOf(request));
-    const data = await listPeriods(session.sedeId);
+    await requirePayrollAdmin(tokenOf(request));
+    const data = await listPeriods();
     return ok(data);
   } catch (error) {
     return payrollErrorResponse(error);
@@ -40,10 +40,7 @@ export async function POST(request: NextRequest) {
   try {
     const session = await requirePayrollAdmin(tokenOf(request));
     const body: unknown = await request.json().catch(() => ({}));
-    const data = await openPayrollPeriod(body, {
-      userId: session.userId,
-      sedeId: session.sedeId,
-    });
+    const data = await openPayrollPeriod(session.sedeId, body, { userId: session.userId });
     return ok(data, 201);
   } catch (error) {
     return payrollErrorResponse(error);

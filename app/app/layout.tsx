@@ -36,9 +36,7 @@ export default async function RootLayout({ children }: RootLayoutProps) {
   const session = await getSessionUser(cookieStore.get(SESSION_COOKIE_NAME)?.value);
   const roles = session?.roles ?? [];
   const alertsUnread =
-    session && roles.includes("admin") && session.user.sede_id
-      ? await countUnreadAlerts(session.user.sede_id).catch(() => 0)
-      : 0;
+    session && roles.includes("admin") ? await countUnreadAlerts().catch(() => 0) : 0;
 
   return (
     <html lang="es" className={initialClass} suppressHydrationWarning>

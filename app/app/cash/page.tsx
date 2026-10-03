@@ -48,9 +48,9 @@ export default async function CashPage() {
   // y el historial (solo admin) se cargan bajo demanda desde el cliente,
   // para no pagar ese costo al entrar solo a abrir o cerrar turno.
   const [registers, openShift, methods] = await Promise.all([
-    listRegisters(sedeId),
-    getOpenShiftWithOpener(sedeId),
-    listPaymentMethods(sedeId),
+    listRegisters(),
+    getOpenShiftWithOpener(),
+    listPaymentMethods(),
   ]);
 
   // Día vacío inicial: el cliente lo pide solo si el usuario lo muestra.
@@ -90,7 +90,6 @@ export default async function CashPage() {
         description="Turnos, pagos por método y cierres de caja."
       />
       <CashClient
-        sedeId={sedeId}
         today={today}
         currentUserId={session.user.id}
         initialRegisters={registers}

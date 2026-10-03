@@ -31,10 +31,6 @@ export function UsersSection({
   initial,
   currentUserId,
 }: {
-  // `sedeId` sigue siendo parte del contrato que `admin-tabs.tsx` pasa con el
-  // remount deliberado; la sección ya no lo usa (el alta de usuarios vive en
-  // `employees-section.tsx`), así que no se desestructura.
-  sedeId: string;
   initial: SedeUserRow[];
   currentUserId: string;
 }) {

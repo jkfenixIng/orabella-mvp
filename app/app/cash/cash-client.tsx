@@ -294,7 +294,6 @@ function PayIcon({ code, kind }: { code?: string; kind?: string }) {
 }
 
 interface CashClientProps {
-  sedeId: string;
   today: string;
   currentUserId: string;
   initialRegisters: CashRegisterRow[];
@@ -509,12 +508,11 @@ export function CashClient(props: CashClientProps) {
         return;
       }
       cancelRecount();
-      const dayResult = await getDayViewAction({ fecha: props.today, sede_id: props.sedeId });
+      const dayResult = await getDayViewAction({ fecha: props.today });
       if (dayResult.success) setDay(dayResult.data);
       const histResult = await getHistoryAction({
         desde: histDesde,
         hasta: histHasta,
-        sede_id: props.sedeId,
         page: histPage,
       });
       if (histResult.success) setHistory(histResult.data);
@@ -553,7 +551,7 @@ export function CashClient(props: CashClientProps) {
           showResult(result, "Turno abierto con diferencias registradas.");
         }
         setIsOpeningDialogOpen(false);
-        const dayResult = await getDayViewAction({ fecha: props.today, sede_id: props.sedeId });
+        const dayResult = await getDayViewAction({ fecha: props.today });
         if (dayResult.success) setDay(dayResult.data);
       } else {
         showResult(result, "");
@@ -610,12 +608,11 @@ export function CashClient(props: CashClientProps) {
             `Cierre con diferencias: ${parts.join(" · ")}. Sobre ${formatMoney(envelope)}. Se informó a los administradores.`,
           );
         }
-        const dayResult = await getDayViewAction({ fecha: props.today, sede_id: props.sedeId });
+        const dayResult = await getDayViewAction({ fecha: props.today });
         if (dayResult.success) setDay(dayResult.data);
         const histResult = await getHistoryAction({
           desde: histDesde,
           hasta: histHasta,
-          sede_id: props.sedeId,
           page: histPage,
         });
         if (histResult.success) setHistory(histResult.data);
@@ -632,7 +629,7 @@ export function CashClient(props: CashClientProps) {
     startViewTransition(async () => {
       setBusy(true);
       try {
-        const result = await getDayViewAction({ fecha: props.today, sede_id: props.sedeId });
+        const result = await getDayViewAction({ fecha: props.today });
         if (!showResult(result, "Vista del día actualizada.")) return;
         setDay(result.data);
         setDayPage(0);
@@ -640,7 +637,6 @@ export function CashClient(props: CashClientProps) {
         const vouchers = (await listVouchersAction({
           request_date: props.today,
           limit: 200,
-          sede_id: props.sedeId,
         })) as ActionResult<VoucherRequestRow[]>;
         if (vouchers.success) setDayVouchers(vouchers.data);
       } finally {
@@ -662,7 +658,6 @@ export function CashClient(props: CashClientProps) {
         const result = await getHistoryAction({
           desde: histDesde,
           hasta: histHasta,
-          sede_id: props.sedeId,
           page,
         });
         if (!showResult(result, `Historial ${histDesde} … ${histHasta} actualizado.`)) return;
