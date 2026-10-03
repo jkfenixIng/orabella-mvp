@@ -2294,3 +2294,223 @@ describe("G5: el admin de una sede ya no lista ni escribe sedes", () => {
     expect(schemas).toContain("export type SedeInput");
   });
 });
+
+// ------------------------- M3b: `sede_id` deja de ser obligatoria ----------
+
+/**
+ * Sentencias que la unidad 073 NO puede escribir, con la etiqueta con la que se
+ * reporta la infracción. Se prueban contra el archivo COMPLETO, comentarios
+ * incluidos: esta unidad es aditiva y su prosa tiene que poder NOMBRAR lo que
+ * no hace, pero al nombrarlo lo hace con palabras, nunca con una sentencia.
+ *
+ * La excepción es `DROP NOT NULL`, que es justamente el cambio: cada patrón
+ * exige la palabra que sigue a `DROP`, así que `DROP NOT NULL` no casa con
+ * ninguno de ellos.
+ */
+const PROHIBIDAS_073: ReadonlyArray<{ etiqueta: string; patron: RegExp }> = [
+  { etiqueta: "DROP COLUMN", patron: /\bDROP\s+COLUMN\b/i },
+  { etiqueta: "DROP CONSTRAINT", patron: /\bDROP\s+CONSTRAINT\b/i },
+  { etiqueta: "DROP INDEX", patron: /\bDROP\s+INDEX\b/i },
+  { etiqueta: "DROP POLICY", patron: /\bDROP\s+POLICY\b/i },
+  { etiqueta: "DROP TABLE", patron: /\bDROP\s+TABLE\b/i },
+  { etiqueta: "DROP SCHEMA", patron: /\bDROP\s+SCHEMA\b/i },
+  { etiqueta: "FOREIGN KEY", patron: /\bFOREIGN\s+KEY\b/i },
+  { etiqueta: "REFERENCES", patron: /\bREFERENCES\b/i },
+  { etiqueta: "INSERT", patron: /\bINSERT\b/i },
+  { etiqueta: "UPDATE", patron: /\bUPDATE\b/i },
+  { etiqueta: "DELETE", patron: /\bDELETE\b/i },
+  { etiqueta: "TRUNCATE", patron: /\bTRUNCATE\b/i },
+  { etiqueta: "MERGE", patron: /\bMERGE\b/i },
+  { etiqueta: "DEFAULT", patron: /\bDEFAULT\b/i },
+  // Mayúsculas, porque sólo puede ser el nombre de la fila del sistema: si
+  // aparece, alguien metió una sentencia de datos sobre ella.
+  { etiqueta: "SEDE", patron: /\bSEDE\b/ },
+];
+
+/** Las infracciones del archivo, en el orden en que se declararon. */
+function infracciones073(fuente: string): string[] {
+  return PROHIBIDAS_073.filter((p) => p.patron.test(fuente)).map((p) => p.etiqueta);
+}
+
+/** Cada `DROP` del archivo, con el objeto que le sigue: la única forma admitida es `NOT NULL`. */
+function dropsDe073(fuente: string): string[] {
+  return [...fuente.matchAll(/\bDROP\b((?:\s+\w+)*)/gi)].map((m) =>
+    m[1].trim().replace(/\s+/g, " ").toUpperCase(),
+  );
+}
+
+/**
+ * Las tablas cuya `sede_id` es OBLIGATORIA, derivadas de las migraciones y no
+ * de una lista escrita a mano: cada `CREATE TABLE` se lee con su cuerpo para
+ * clasificar la declaración de la columna, y cada `SET NOT NULL` posterior
+ * corrige la clasificación (es lo que convierte `users` de nulable en
+ * obligatoria en 003_admin.sql).
+ *
+ * Los comentarios se quitan antes de leer: la sección de reversión de 073
+ * repite el `SET NOT NULL` de las dieciocho tablas como texto comentado, y sin
+ * esta limpieza el archivo se declararía a sí mismo como el origen del
+ * esquema.
+ */
+function esquemaSedeObligatoria(): {
+  obligatorias: string[];
+  porClavePrimaria: string[];
+  yaNulables: string[];
+} {
+  const dir = join(process.cwd(), "supabase", "migrations");
+  const obligatorias = new Set<string>();
+  const porClavePrimaria = new Set<string>();
+  const yaNulables = new Set<string>();
+  for (const archivo of readdirSync(dir).filter((n) => n.endsWith(".sql")).sort()) {
+    const texto = readFileSync(join(dir, archivo), "utf8")
+      .split("\n")
+      .map((linea) => linea.split("--")[0])
+      .join("\n");
+    for (const bloque of texto.matchAll(
+      /CREATE TABLE (?:IF NOT EXISTS )?public\.([a-z0-9_]+) \(([\s\S]*?)\n\);/g,
+    )) {
+      const tabla = bloque[1];
+      const declaracion = bloque[2]
+        .split("\n")
+        .map((linea) => linea.trim())
+        .find((linea) => /^sede_id\b/.test(linea));
+      if (!declaracion) continue;
+      if (/^sede_id\s+uuid\s+PRIMARY KEY\b/i.test(declaracion)) porClavePrimaria.add(tabla);
+      else if (/^sede_id\s+uuid\s+NOT\s+NULL\b/i.test(declaracion)) obligatorias.add(tabla);
+      else yaNulables.add(tabla);
+    }
+    for (const [, tabla] of texto.matchAll(
+      /ALTER TABLE public\.([a-z0-9_]+)\s+ALTER COLUMN sede_id SET NOT NULL/g,
+    )) {
+      yaNulables.delete(tabla);
+      obligatorias.add(tabla);
+    }
+  }
+  const orden = (a: string, b: string) => a.localeCompare(b);
+  return {
+    obligatorias: [...obligatorias].sort(orden),
+    porClavePrimaria: [...porClavePrimaria].sort(orden),
+    yaNulables: [...yaNulables].sort(orden),
+  };
+}
+
+describe("migración 073_sede_id_nullable.sql (M3b)", () => {
+  const raw = readFileSync(
+    join(process.cwd(), "supabase", "migrations", "073_sede_id_nullable.sql"),
+    "utf8",
+  );
+  /** El archivo sin comentarios: lo que el runner envía a la base. */
+  const sql = raw
+    .split("\n")
+    .filter((linea) => !linea.trimStart().startsWith("--"))
+    .join("\n");
+  const esquema = esquemaSedeObligatoria();
+
+  it("el esquema tiene dieciocho sedes obligatorias, dos por clave primaria y una ya nulable", () => {
+    // La lista de la migración tiene que seguir al ESQUEMA. Si una migración
+    // futura añade una tabla con `sede_id` obligatoria, esta cuenta se mueve y
+    // la comparación exacta de la prueba siguiente falla pidiendo la línea nueva.
+    expect(esquema.obligatorias).toHaveLength(18);
+    // Las dos que son clave primaria NO son relajables sin quitar la clave, que
+    // es justo lo que esta unidad prohíbe; y 072 ya decidió que las borra M3c.
+    expect(esquema.porClavePrimaria).toEqual(["invoice_sequences", "voucher_settings"]);
+    // Y la única que nació nulable a propósito (008_hardening.sql).
+    expect(esquema.yaNulables).toEqual(["audit_logs"]);
+  });
+
+  it("relaja `sede_id` en cada tabla que la exigía, y en ninguna más", () => {
+    for (const tabla of esquema.obligatorias) {
+      expect(sql, `${tabla} sigue con la sede obligatoria`).toContain(
+        `ALTER TABLE public.${tabla} ALTER COLUMN sede_id DROP NOT NULL;`,
+      );
+    }
+    const tocadas = [...new Set([...sql.matchAll(/ALTER TABLE public\.([a-z0-9_]+)/g)].map((m) => m[1]))];
+    expect(tocadas.sort((a, b) => a.localeCompare(b))).toEqual(esquema.obligatorias);
+  });
+
+  it("sólo contiene las dieciocho relajaciones: ni una sentencia más", () => {
+    const sentencias = sql
+      .split("\n")
+      .map((linea) => linea.trim())
+      .filter(Boolean);
+    expect(sentencias).toHaveLength(18);
+    for (const sentencia of sentencias) {
+      expect(sentencia).toMatch(/^ALTER TABLE public\.[a-z0-9_]+ ALTER COLUMN sede_id DROP NOT NULL;$/);
+    }
+  });
+
+  it("no borra nada, no escribe filas, no inventa valores por omisión ni toca a la sede", () => {
+    // Contra el archivo COMPLETO, comentarios incluidos: la prosa puede decir
+    // «no borra la columna», pero no puede traer una sentencia que sí lo haga.
+    expect(infracciones073(raw)).toEqual([]);
+    // Y el único `DROP` del archivo es el de la nulabilidad.
+    expect([...new Set(dropsDe073(raw))]).toEqual(["NOT NULL"]);
+  });
+
+  it("declara el motivo, las tres que quedan fuera, la reversión y que no se ejecutó", () => {
+    expect(raw).toContain("una sola sede");
+    expect(raw).toContain("ADITIVO, REVERSIBLE E IDEMPOTENTE");
+    // Las tres exclusiones, nombradas con el motivo de cada una.
+    expect(raw).toContain("invoice_sequences");
+    expect(raw).toContain("voucher_settings");
+    expect(raw).toContain("audit_logs");
+    expect(raw).toContain("CLAVE PRIMARIA");
+    // La reversión, sentencia por sentencia.
+    expect(raw).toContain("ALTER TABLE public.users ALTER COLUMN sede_id SET NOT NULL;");
+    expect(raw).toContain(
+      "ALTER TABLE public.payroll_discount_carries ALTER COLUMN sede_id SET NOT NULL;",
+    );
+    // Las consultas de sólo lectura: la de nulabilidad por tabla y la que deja
+    // ver que las claves foráneas siguen puestas.
+    expect(raw).toContain("information_schema.columns");
+    expect(raw).toContain("is_nullable");
+    expect(raw).toContain("pg_constraint");
+    // Nombres reales de los objetos que esta unidad NO toca: citarlos en la
+    // prosa es dejar constancia de que se conservaron.
+    expect(raw).toContain("fk_users_sede");
+    expect(raw).toContain("uq_payroll_draft_per_range");
+    expect(raw).toContain("ex_payroll_periods_no_overlap");
+    // La línea de casa: el archivo no se ejecutó contra una base.
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+
+  it("control negativo: el detector no es un sello de goma", () => {
+    const original = "ALTER TABLE public.users ALTER COLUMN sede_id DROP NOT NULL;";
+
+    // La infracción que abre la unidad: quitar la clave foránea en vez de relajar
+    // la columna. Deja filas apuntando a una sede que ya no se valida.
+    const sinClaveForanea = raw.replace(original, "ALTER TABLE public.users DROP CONSTRAINT fk_users_sede;");
+    expect(sinClaveForanea).not.toBe(raw);
+    expect(infracciones073(sinClaveForanea)).toContain("DROP CONSTRAINT");
+    // El `DROP` aunque no lo nombre la lista también vuelve culpable al archivo.
+    expect(dropsDe073(sinClaveForanea).filter((d) => d !== "NOT NULL")).toEqual([
+      "CONSTRAINT FK_USERS_SEDE",
+    ]);
+
+    // Las otras tres formas de romper la misma promesa.
+    expect(infracciones073(raw.replace(original, "ALTER TABLE public.users DROP COLUMN sede_id;"))).toContain(
+      "DROP COLUMN",
+    );
+    expect(infracciones073(raw.replace(original, "INSERT INTO public.users (email) VALUES ('x@x.com');"))).toContain(
+      "INSERT",
+    );
+    expect(
+      infracciones073(raw.replace(original, "ALTER TABLE public.users ALTER COLUMN sede_id SET DEFAULT NULL;")),
+    ).toContain("DEFAULT");
+
+    // Y el archivo bueno no tiene infracciones: el detector sólo señala de más
+    // cuando hay algo que señalar.
+    expect(infracciones073(raw)).toEqual([]);
+  });
+
+  it("control negativo: una tabla que se queda obligatoria rompe la lista", () => {
+    const sinProductos = raw.replace(
+      "ALTER TABLE public.products ALTER COLUMN sede_id DROP NOT NULL;",
+      "",
+    );
+    const tocadas = [
+      ...sinProductos.matchAll(/ALTER TABLE public\.([a-z0-9_]+) ALTER COLUMN sede_id DROP NOT NULL;/g),
+    ].map((m) => m[1]);
+    expect(tocadas).not.toContain("products");
+    expect(tocadas).toHaveLength(17);
+  });
+});
