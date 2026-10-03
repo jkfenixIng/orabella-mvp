@@ -28,6 +28,8 @@ Estas son las señales más fuertes: dos auditorías que no se vieron llegaron a
 ### Conflicto entre informes, resuelto
 **S4 afirma que la aislación por sede está "backed by RLS". Es incorrecto.** S1 y S3 establecieron independientemente, con evidencia de código, que `createAdminClient()` usa `service_role` y bypasea RLS, y que el cliente con RLS (`server.ts:20-41`) **no lo importa ninguna feature**. S4 repitió la afirmación del README. **Se resuelve a favor de S1+S3**: RLS no es un control activo; la única barrera es `resolveSede` en código de aplicación. Consecuencia práctica: un solo guard olvidado es una brecha total — exactamente lo que fue F1.
 
+**Corrección de 2026-10-02 — la barrera nombrada ya no existe.** `resolveSede` se eliminó de `src/shared/lib/sede.ts` con la retirada de sede única (decisión del dueño, cierre en `odd/tasks/plataforma-super-admin.md`). El hallazgo de fondo **no cambia**: la capa de datos sigue en `service_role`, el cliente con RLS sigue sin importarlo, y RLS sigue sin ser un control activo. Lo que cambió es qué tiene que estar en todas partes para que una fila no se alcance: la autorización por **ROL** (`requireSedeRole`, `requirePlatformAdmin` y las guardas de escritura de cada módulo) y los filtros propios de cada consulta. El modo de fallo que este párrafo describe sigue valiendo intacto, con la defensa cambiada de nombre.
+
 ## CRÍTICOS de dinero (verificados por el orquestador)
 
 ### C1 — El cierre de caja y los totales del día CUENTAN DOS VECES los pagos de factura
@@ -165,3 +167,7 @@ Verificacion independiente: **3.000.000 de flujos aleatorios, cero rechazos de p
 
 ## Estado
 - 2026-10-01: informe consolidado creado tras cerrar las cinco dimensiones. Hallazgos previos ya accionados: F1 de S1 (commit `3544ee4`), cabeceras F9 de S1 (`23cfb54`), endurEcimiento de tests (`fa74bb3`), croma de tokens y aliases (`5d4b6f8`).
+- 2026-10-02: los conteos y hallazgos de este informe se conservan sin cambio: son
+  la foto de la auditoría y no se remedieron. La única corrección es la del párrafo de
+  conflicto entre S4 y S1+S3, que nombraba `resolveSede` como la única barrera y esa
+  función ya no existe.

@@ -42,6 +42,7 @@ Out:
 - [x] USR2 UI sin fricción — pestaña Usuarios sin botón Nuevo usuario; nota de alta automática. Solo roles y reset.
 - [x] VER Verificación — `npm run typecheck`, `npm test`, `next build`, advisors. Evidencia abajo.
 - [x] ARQ1 Guardas de sede/rol a shared — `resolveSede`+`requireSedeRole` viven en `src/shared/lib/sede.ts`; `admin/service` los re-exporta (misma identidad); 21 importadores migrados. Seguimiento: guardas de sesión y deps de datos entre servicios.
+  — **Precisión de 2026-10-02**: `resolveSede` ya no existe (se eliminó de `src/shared/lib/sede.ts` con la retirada de sede única). Ese archivo conserva `SedeError`, `SedeRole` y `requireSedeRole`; lo que autoriza es el ROL. El cierre, con su evidencia, está en `odd/tasks/plataforma-super-admin.md`.
 
 ## Acceptance
 - BD: 0 tablas de negocio sin RLS; advisors sin critical abierto o con decisión registrada; listados con límite y sin N+1 evidente.
@@ -55,6 +56,10 @@ Out:
 
 ## Progress
 - 2026-09-22: documento creado desde revisión pre-pruebas + requisitos DB/comisiones-N/A/auto-usuario. Sin código tocado.
+- 2026-10-02: corrección de ARQ1, la única línea de este documento que nombraba
+  `resolveSede` como frontera vigente. Las tareas USR1/DB2 y la restricción de
+  unicidad por sede quedan como historia del lote: describen cómo se construyó, no
+  qué autoriza hoy.
 
 ## Verification evidence
 - `npm run typecheck`: 0 errores.

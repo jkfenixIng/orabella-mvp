@@ -67,9 +67,15 @@ objeto y no debe volver a decidirse así.
   no se otorga ni se quita desde la administración de una sede. Son autorización, no
   estructura de sedes.
 - **VIGENTE**: la credencial por entorno, sin clave por defecto.
-- **VIGENTE**: `resolveSede` SE QUEDA. Con `service_role` saltándose RLS es la
-  frontera de tenant de las rutas del negocio, y está documentada como tal. Se
-  retira junto con la migración que elimina la columna, no antes.
+- **SUPERADO (2026-10-02)**: `resolveSede` SE QUEDA. Con `service_role` saltándose
+  RLS es la frontera de tenant de las rutas del negocio, y está documentada como
+  tal. Se retira junto con la migración que elimina la columna, no antes.
+  — La premisa de esta viñeta era que la frontera sobrevivía mientras la columna
+  existiera. La columna dejó de ser parte del negocio (M3a, 073, 074, 075) y
+  `resolveSede` se eliminó de `src/shared/lib/sede.ts` el 2026-10-02. Lo que
+  sobrevive es la autorización por **ROL**: `requireSedeRole`, `requirePlatformAdmin`
+  y las guardas de escritura de cada módulo, más los filtros propios de cada
+  consulta. Detalle en «Cierre de la retirada de sede única».
 - **VIGENTE**: la gestión de usuarios **se queda en el admin de sede** (`/admin`).
 - **SUPERADO**: la plataforma ya **no** crea sedes ni reparte admins por sede
   (retirado en M1). `/plataforma` configura **la instalación**: su fecha de
@@ -80,23 +86,66 @@ objeto y no debe volver a decidirse así.
 - **M1 — Hecha.** Retirar la estructura multi sede: superficie de sedes en la
   plataforma, `listSedes`/`upsertSede` y la distribución de admins. `resolveSede`
   se conserva como frontera de tenant y queda documentada como tal.
+  — **Precisión de 2026-10-02**: `resolveSede` **no** se conservó. Se eliminó con
+  el resto del alcance por sede, y la retirada se cerró sin él.
 - **M2 — Hecha.** Re-emitir las 12 funciones atómicas sin `p_sede_id`
   (`071_rpc_single_sede.sql`).
-- **M3a — En curso.** Quitar los 53 filtros de sede en lecturas y la plomería
-  muerta que quedó.
-- **M3b — Pendiente.** Reemplazar `invoice_sequences` (cuya PRIMARY KEY es la sede) y
-  `voucher_settings` por una tabla `system_settings` de clave/valor: es lo que
-  eligió el dueño.
-- **M3c — Pendiente, IRREVERSIBLE.** La migración que elimina la columna: 33
-  políticas, 2 claves primarias, el `EXCLUDE`, ~17 índices y la columna en 21 tablas.
-- **M4 — Pendiente.** Aplastar las 70 migraciones en UN solo archivo aplicado,
-  archivar la historia fuera de la carpeta, resetear las bases y diffear el esquema
-  antes y después.
+- **M3a — Cerrada (2026-10-02).** Quitar los 53 filtros de sede en lecturas y la
+  plomería muerta que quedó.
+- **M3b — Cerrada (2026-10-02).** Reemplazar `invoice_sequences` (cuya PRIMARY KEY
+  es la sede) y `voucher_settings` por una tabla `system_settings` de clave/valor:
+  es lo que eligió el dueño. → `072_system_settings.sql`; `voucher_settings` queda
+  con sus datos y ya nadie la lee ni la escribe.
+- **M3c — Pendiente, IRREVERSIBLE, y reubicada (2026-10-02).** La migración que
+  elimina la columna: 33 políticas, 2 claves primarias, el `EXCLUDE`, ~17 índices y
+  la columna en 21 tablas. — Sigue siendo el paso irreversible, pero ya no se
+  escribe a mano sobre el historial: viaja como `002_*.sql` **encima** del squash
+  (`app/supabase/squash/README.md`, punto 6), que es donde está hoy el inventario
+  vigente de lo que la columna arrastra. Antes de él ya corrieron 073 (se relaja el
+  `NOT NULL` de 18 tablas), 074 (diez unicidades y el `EXCLUDE` sin `sede_id`) y
+  075 (la clave de la regla de comisión, de instalación).
+- **M4 — Pendiente.** Aplastar las 75 migraciones (74 archivos en disco) en UN solo
+  archivo aplicado, archivar la historia fuera de la carpeta, resetear las bases y
+  diffear el esquema antes y después. Procedimiento ya escrito en
+  `app/supabase/squash/README.md`.
 
 **Por qué este orden.** El borrado de la columna va **al final** porque es el único
 paso que no se deshace volviendo el código de la aplicación a su estado anterior. Las
 unidades que cambian mucho archivo (M3a) van primero, donde un error se ve en los
 tests; la irreversible va sola.
+
+### Cierre de la retirada de sede única (2026-10-02)
+**Estado: M1, M2, M3a y M3b cerradas.** La instalación no tiene alcance por sede. Las
+unidades, con su evidencia:
+
+| Unidad | Qué se retiró | Evidencia |
+| --- | --- | --- |
+| M1 — estructura de sedes | Superficie de sedes en la plataforma, `listSedes`/`upsertSede` y la distribución de admins | `sedes` queda como la fila de la instalación; solo la lee la capa de plataforma |
+| M2 — funciones atómicas | `p_sede_id` en las 12 funciones atómicas | `071_rpc_single_sede.sql` |
+| M3a — lecturas | Los 53 filtros de sede en lecturas y la plomería muerta | `a02ba53` |
+| M3b — tablas cuya clave era la sede | `invoice_sequences` y `voucher_settings` → `system_settings` de clave/valor | `072_system_settings.sql` |
+| 073 | `sede_id` deja de ser obligatoria en 18 tablas | `073_sede_id_nullable.sql` |
+| 074 | Diez unicidades y el `EXCLUDE` dejan de llevar `sede_id` (las fronteras por fila, ya sin sede) | `074_sede_less_constraints.sql` |
+| 075 | La clave de la regla de comisión pasa a ser de instalación | `075_commission_rule_install_key.sql` |
+
+**`resolveSede` se eliminó.** El 2026-10-02 salió de `src/shared/lib/sede.ts`: en ese
+archivo quedan `SedeError`, `SedeRole` y `requireSedeRole`. El motivo está escrito en el
+propio archivo — con una sola sede, comparar la sede solicitada con la de la sesión ya
+no acotaba nada. En el código de la aplicación no queda ningún sitio de llamada: el
+nombre solo sobrevive en comentarios y en pruebas que lo citan.
+
+**Lo que sobrevive como frontera.** La autorización por **ROL**: `requireSedeRole`,
+`requirePlatformAdmin` y las guardas de escritura de cada módulo. Y, por debajo, los
+filtros propios de cada consulta: son los que acotan de verdad lo que cada rol lee, y
+es lo que hay que reponer cuando una consulta nueva se escriba. La capa de datos
+sigue usando `service_role` y salta RLS: eso no cambió, y sigue siendo el hecho que
+obliga a que las guardas estén en todas partes.
+
+**Lo que NO se cerró aquí.** El `DROP COLUMN` físico es M3c y viaja dentro de la serie
+del squash, como `002_*.sql` aplicado encima de `001_orabella_schema.sql` (punto 6 de
+`app/supabase/squash/README.md`). Desde la 073 nada lee ni escribe la columna en el
+negocio, así que el paso quedó reducido al borrado mecánico sobre el dump, y las
+fronteras por fila ya están resueltas por la 074 y la 075.
 
 ### Pendientes abiertos
 - La fila de sede inactiva retirada `Plataforma (sistema)` **todavía existe** en la base
@@ -107,6 +156,9 @@ tests; la irreversible va sola.
   bloquea hoy: es limpieza pendiente, no un bloqueo.
 - ¿Se puede borrar también `users.sede_id`? Hoy ancla la cuenta de plataforma
   (`users.sede_id` es NOT NULL). Decisión abierta para M3c/M4.
+  — **Precisión de 2026-10-02**: `users.sede_id` dejó de ser obligatorio con la 073
+  y hoy se usa para anclar la cuenta y acotar el listado de usuarios de
+  administración; no autoriza nada del negocio.
 - Consecuencia concreta de M3b: **quitar `invoice_sequences` reinicia el consecutivo de
   la facturación**. Hay que decidir si el contador arranca de cero o hereda el último
   número en su fila de `system_settings`.
@@ -127,6 +179,13 @@ tests; la irreversible va sola.
     frontera de tenant de las rutas del negocio, porque la capa de datos usa
     `service_role` y salta RLS. No es plomería de sede: se retira junto con la
     migración que elimina la columna, no antes.
+    — **SUPERADO (2026-10-02)**: el argumento era que la columna no admitía nulos, y
+    por eso la frontera no podía moverse. La 073 la volvió nullable y la retirada
+    dejó de depender de ella: `resolveSede` se eliminó el mismo día. Lo que esta
+    viñeta quería dejar dicho — que el privilegio del rol de plataforma viene del
+    ROL y no de una fila — sigue siendo exactamente lo que manda. Las 30 rutas no
+    se dejaron intactas para que `resolveSede` siguiera existiendo: se tocaron para
+    que dejara de hacer falta.
 - Guarda nueva `requirePlatformAdmin` con `PLATFORM_ROLES: RoleCode[] = ["superadmin"]`
   (declarada así para que `action-guards` pueda leerla).
 
@@ -139,7 +198,9 @@ tests; la irreversible va sola.
 - Las lecturas cross-sede son **funciones nuevas y explícitas**
   (`service_role`, sin predicado de sede). Nunca se relaja `resolveSede`.
   — **SUPERADO en su forma**: no hay lecturas cross-sede que hacer. La superficie ya
-  no lista sedes ni muestra directorio de usuarios de otra sede.
+  no lista sedes ni muestra directorio de usuarios de otra sede. Y la frase «nunca
+  se relaja» quedó sin objeto el 2026-10-02: `resolveSede` no se relajó, se
+  eliminó, porque no queda ninguna sede que comparar.
 
 ### Módulos por sede — SUPERADO
 > Este bloque se conserva como historia de una decisión que ya no aplica. El
@@ -171,8 +232,11 @@ admins desde la plataforma se retiraron; el apagado de módulos por sede no se
 construyó y su forma, si se pide, es global.
 
 Fuera:
-- Relajar `resolveSede` o el aislamiento por sede del negocio. — **VIGENTE**: es la
-  frontera de tenant mientras la columna exista.
+- Relajar `resolveSede` o el aislamiento por sede del negocio. — **SUPERADO
+  (2026-10-02)**: `resolveSede` ya no es una frontera que se pueda relajar, porque no
+  existe. Lo que no se relaja es la autorización por ROL — `requireSedeRole`,
+  `requirePlatformAdmin` y las guardas de escritura de cada módulo — ni los filtros
+  que cada consulta se pone a sí misma.
 - Cambiar el `users.sede_id` a nulo. — **SUPERADO como prohibición**: si la columna
   `sede_id` desaparece, `users.sede_id` es parte de lo que hay que decidir. Queda
   abierto si se borra también o si se queda solo para anclar la cuenta de
@@ -203,7 +267,7 @@ Fuera:
       interruptor es de la instalación (global). Unidad nueva cuando corresponda
 - [ ] G7 el resto de los módulos, uno por unidad — igual que G6
 - [ ] G8 gate completo + commits por unidad + push — sin marcar: el cierre de unidad vive
-      en el gate de la rama, que sigue en curso con M3a
+      en el gate de la rama, que sigue en curso con la serie del squash
 
 ## Authorized scope
 Capa de plataforma, roles, sedes, módulos por sede. Rama `feat/orabella-mvp`.
@@ -234,11 +298,18 @@ Capa de plataforma, roles, sedes, módulos por sede. Rama `feat/orabella-mvp`.
   M1 cerrada (estructura de sedes retirada, `resolveSede` conservada y documentada como
   frontera de tenant) y M2 cerrada (12 funciones atómicas re-emitidas sin `p_sede_id`,
   `071_rpc_single_sede.sql`). M3a en curso.
+  — Esa nota queda como historia: el mismo día se cerraron M3a, M3b y las unidades 073,
+  074 y 075, y `resolveSede` se eliminó. Ver «Cierre de la retirada de sede única».
+- 2026-10-02: cierre de la retirada de sede única. M1, M2, M3a y M3b cerradas;
+  `resolveSede` eliminado; la frontera que sobrevive es la de ROL. M3c (el
+  `DROP COLUMN`) queda reubicada dentro de la serie del squash.
 
 ## Next step
-- Continuar M3a (filtros de sede en lecturas y plomería muerta); después M3b
-  (`system_settings`) y solo al final M3c, que es irreversible. Detalle y orden en
-  «Corrección de rumbo y plan de sede única».
+- Continuar la serie del squash (`app/supabase/squash/README.md`): `001_orabella_schema.sql`
+  desde el dump de la base PRUEBAS, y encima el `002_*.sql` que aplica el
+  `DROP COLUMN`. El orden y las condiciones están en el punto 6 de ese manual.
+- Antes del reset: borrar la fila inactiva `Plataforma (sistema)` que sigue en la base
+  del dueño (pendiente abierto más arriba).
 
 ## Route declaration
 - Delegación a `gentle-ai-worker` por unidad, con superficies disjuntas.

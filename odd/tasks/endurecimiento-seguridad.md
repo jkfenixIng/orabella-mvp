@@ -19,6 +19,13 @@ const session = await require<X>(await sessionToken());
 resolveSede(session.sedeId, <sede solicitada>)
 ```
 
+> **Corrección de 2026-10-02.** Ese segundo renglón ya no está en el código:
+> `resolveSede` se eliminó de `src/shared/lib/sede.ts` con la retirada de sede única.
+> El patrón de la casa hoy es la guarda de sesión más `requireSedeRole`, que
+> autoriza por **ROL**. Ninguna action ni ninguna ruta compara sedes, porque la
+> instalación es de una sola y la comparación no acotaba nada. El bloque de arriba
+> se conserva como la foto de 2026-09-28, la fecha en que se verificó F1.
+
 **Consecuencia de diseño del test:** un test de invariante que exija guarda en toda action exportada **nace verde y se pone rojo únicamente por F1**. Es un test de regresión legítimo y no un test acomodado al bug.
 
 Wart secundario detectado en el mismo archivo: `toFailure` (`actions.ts:31-37`) solo reconoce `AuthError`, así que las guardas hermanas que lanzan `AdminError`/`SedeError` colapsan a `code: "INTERNAL"` en vez de reportar `UNAUTHENTICATED`/`FORBIDDEN`. La guarda bloquea igual, pero el código de error miente.
@@ -69,6 +76,8 @@ La guarda se verificó **no bypasseable**: el token sale de la cookie httpOnly y
 
 Divergencia de diseño observada, **no un agujero**: esta action reescribe `sede_id` en silencio, mientras el resto del código usa `resolveSede`, que lanza FORBIDDEN ante una sede ajena (~40 sitios). Falla cerrado, pero oculta un bug del cliente en lugar de rechazarlo.
 
+**Estado de esa divergencia (2026-10-02): desapareció con la función.** `resolveSede` ya no existe, así que los ~40 sitios de llamada que aquí se contaban son hoy cero. La action sigue estampando `sede_id` desde la sesión, pero ya no oculta un bug del cliente: no hay sede ajena que rechazar, y la columna dejó de autorizar nada del negocio. La defensa real quedó en las guardas de ROL y en los filtros de cada consulta.
+
 ### Huecos residuales del test de invariante (candidatos a W3)
 1. La allowlist se indexa por **nombre** de función, no por (archivo, nombre), y la unicidad no se verifica. Una action nueva sin guarda que reutilice `loginAction` / `logoutAction` / `requestResetAction` / `confirmResetAction` se saltea el filtro: el test "debe vivir en auth" usa el primer match y `auth` ordena antes que el resto, así que el duplicado queda sombreado y el test igual pasa.
 2. `GUARD_RE` es un chequeo de **presencia de token**, no de orden ni de efectividad: matchea dentro de comentarios y strings, acepta cualquier `requireAlgo(` que no sea guarda de autorización, y **no verifica que la guarda corra antes de la mutación**. Una action que mute y recién después llame `requireAdminSession` pasaría — que es justo la próxima forma del bug que este test existe para prevenir.
@@ -106,3 +115,4 @@ W4 propuesto: allow-list de imports de plomería (`sessionToken` y similares), c
 - 2026-09-28: creado. Auditoría S1 completa (14 hallazgos, F1 verificado por el orquestador). S2/S3/S4 en curso. Lote autorizado por el usuario ("aplica lo que se pueda") bajo la restricción de cero sobrecostos de infraestructura y cero límites a las pruebas.
 - 2026-10-01: W2 (`23cfb54`) y W3 (`fa74bb3`) commiteados, gate verde en ambos. El linaje `review-91c57d3fbc9f6a7b` quedó **cerrado** con la operación auditada `review abandon` (`reason: operator_disposition`, registro en `.git/gentle-ai/review-transactions/quarantine/`); no se descartó trabajo: cero resultados de lente, cero hallazgos. Tras un `abandon` commiteado corresponde un `inspect` antes de cualquier START nuevo.
 - 2026-10-01: lote de estilos auditado (S5). Hallazgo verificado por el orquestador: los cuatro tokens `-50` en tema claro tienen chroma 0, así que `.bg-*-light` pinta el mismo gris casi blanco y todo badge sale gris en claro y con color en oscuro. WU0 en curso: dar croma a los `-50` y cablear los aliases canónicos de shadcn.
+- 2026-10-02: corregidos los dos puntos de este documento que trataban a `resolveSede` como frontera vigente — el bloque de patrón de casa y la divergencia de `adminCreateUserAction`. El texto original de ambos se conserva; lo que dejó de describir el código es la función. El cierre de la retirada de sede única está en `odd/tasks/plataforma-super-admin.md`. F1–F14 y su estado no cambian.
