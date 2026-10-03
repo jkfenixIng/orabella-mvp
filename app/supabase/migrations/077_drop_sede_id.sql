@@ -174,9 +174,12 @@
 --       --  WHERE table_schema = 'public' AND column_name = 'sede_id';
 --       -- (0 filas)
 --
---   * Las trece funciones existen, y ninguna nombra la columna:
+--   * Las trece funciones existen, y cada una tiene UNA sola firma —en
+--     `payroll_apply_atomic`, la de CUATRO argumentos, con
+--     `p_carry_ids uuid[] DEFAULT '{}'`; la de tres que dejó la 062 al lado ya
+--     no está (ver 3.10):
 --
---       -- SELECT p.proname, pg_get_function_identity_arguments(p.oid)
+--       -- SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS firma
 --       --   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
 --       --  WHERE n.nspname = 'public'
 --       --    AND p.proname IN ('deduct_stock_atomic', 'cash_open_shift_atomic',
@@ -188,18 +191,45 @@
 --       --      'next_invoice_number')
 --       --  ORDER BY 1, 2;
 --
---       -- SELECT p.proname FROM pg_proc p
---       --   JOIN pg_namespace n ON n.oid = p.pronamespace
---       --  WHERE n.nspname = 'public' AND p.prosrc ~ '\msede_id\M';
---       -- (0 filas)
+--   * Y las funciones que nombran la columna NO son cero: son TRES, y las tres
+--     son correctas. La versión anterior de este bloque afirmaba `(0 filas)` y
+--     era FALSA, antes y después de este archivo: nombra la columna que
+--     SOBREVIVE, `users.sede_id`, que es la excepción deliberada del bloque de
+--     alcance de arriba. Las tres, una por una:
+--
+--       -- SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS firma
+--       --   FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+--       --  WHERE n.nspname = 'public' AND p.prosrc ~ '\msede_id\M'
+--       --  ORDER BY 1, 2;
+--
+--       -- create_user_with_role   | p_user jsonb, p_role_codes text[]
+--       -- current_sede_id         |
+--       -- upsert_employee_atomic  | p_employee jsonb, p_user_id uuid,
+--       --                         | p_create_user jsonb, p_role_code text
+--       -- (3 filas)
+--
+--     POR QUÉ CADA UNA ES CORRECTA
+--
+--       * `current_sede_id()` LA LEE: es el predicado de
+--         `pol_users_sede_isolation`, una de las cuatro políticas que este
+--         archivo conserva. Sin ella, esa política no se podría escribir.
+--       * `create_user_with_role(…)` y `upsert_employee_atomic(…)` la ESCRIBEN,
+--         y sólo en `users.sede_id`: es el anclaje de la cuenta a la instalación
+--         única, del que sale `session.sedeId` y del que dependen las siete
+--         guardas de sesión (motivo en el bloque de alcance). La segunda ya no
+--         escribe en `employees.sede_id` —esa columna sí se borra—, así que lo
+--         que sale de su cuerpo es el `INSERT` del legajo y su guarda.
+--       * Ninguna de las trece funciones de 3.x nombra `employees.sede_id`: la
+--         única lectura que quedaba era el filtro `e.sede_id = p.sede_id` de la
+--         sobrecarga obsoleta de tres argumentos, y por eso 3.10 la borra.
 --
 --   * No quedó ninguna política que compare la sede:
 --
 --       -- SELECT pol.polname, pol.polrelid::regclass
 --       --   FROM pg_policy pol
---       --  WHERE coalesce(pg_get_expr(pol.qual, pol.polrelid), '')
+--       --  WHERE coalesce(pg_get_expr(pol.polqual, pol.polrelid), '')
 --       --     ~ 'current_sede_id'
---       --     OR coalesce(pg_get_expr(pol.with_check, pol.polrelid), '')
+--       --     OR coalesce(pg_get_expr(pol.polwithcheck, pol.polrelid), '')
 --       --     ~ 'current_sede_id';
 --       -- (0 filas)
 --
@@ -315,8 +345,17 @@ BEGIN
     FROM (
       SELECT format('política %s ON %s', pol.polname, pol.polrelid::regclass) AS infractor
         FROM pg_policy pol
-       WHERE coalesce(pg_get_expr(pol.qual, pol.polrelid), '') ~ 'sede_id|current_sede_id'
-          OR coalesce(pg_get_expr(pol.with_check, pol.polrelid), '') ~ 'sede_id|current_sede_id'
+       -- Las columnas del catálogo son `polqual` y `polwithcheck`: la vista
+       -- `pg_policies` las publica como `qual` y `with_check`, pero `pg_policy`
+       -- no tiene esos nombres y nombrarlos aquí aborta la migración entera con
+       -- `UndefinedColumn`.
+       --
+       -- Los paréntesis tampoco son decorativos: sin ellos `AND` liga más fuerte
+       -- que `OR`, así que la lista blanca se aplicaría solo a la segunda rama y
+       -- las veintisiete políticas que este archivo borra —que sí nombran la
+       -- sede en su `USING`— entrarían al mensaje como infractoras.
+       WHERE (coalesce(pg_get_expr(pol.polqual, pol.polrelid), '') ~ 'sede_id|current_sede_id'
+          OR coalesce(pg_get_expr(pol.polwithcheck, pol.polrelid), '') ~ 'sede_id|current_sede_id')
          AND pol.polname NOT IN (
            'pol_sedes_sede_isolation', 'pol_employees_sede_isolation',
            'pol_services_sede_isolation', 'pol_tax_configs_sede_isolation',
@@ -401,6 +440,7 @@ DO $$
 DECLARE
   v_regresiones text;
   v_claves      text;
+  v_claves_n    integer;
 BEGIN
   SELECT string_agg(
            format('invoice_sequences.last_number = %s > system_settings[''invoice_sequence''].last_number = %s',
@@ -420,8 +460,9 @@ BEGIN
             HINT = 'El contador de la instalación es la fila `invoice_sequence` de `system_settings` desde 072; la tabla vieja quedó congelada.';
   END IF;
 
-  SELECT string_agg(k.clave, E'\n    ' ORDER BY k.clave)
-    INTO v_claves
+  SELECT string_agg(k.clave, E'\n    ' ORDER BY k.clave),
+         count(*)::integer
+    INTO v_claves, v_claves_n
     FROM (VALUES
       ('voucher_max_per_day'), ('voucher_max_per_week'),
       ('voucher_per_day_limits'), ('voucher_allowed_days')
@@ -430,7 +471,7 @@ BEGIN
      AND NOT EXISTS (SELECT 1 FROM public.system_settings ss WHERE ss.key = k.clave);
 
   IF v_claves IS NOT NULL THEN
-    RAISE EXCEPTION E'migración 077 ABORTADA: `voucher_settings` tiene filas, pero % de sus cuatro claves NO están en `system_settings`, que es donde el servicio lee y escribe los topes desde 072:\n    %\n  QUÉ HACER: copie el ajuste de la tabla vieja a la clave que falta en `system_settings` (o decida que el valor por omisión documentado en 072 es el vigente) y vuelva a correr este archivo completo. Este archivo no escribe, no borra y no fusiona ningún ajuste.', v_claves
+    RAISE EXCEPTION E'migración 077 ABORTADA: `voucher_settings` tiene filas, pero % de sus cuatro claves NO están en `system_settings`, que es donde el servicio lee y escribe los topes desde 072:\n    %\n  QUÉ HACER: copie el ajuste de la tabla vieja a la clave que falta en `system_settings` (o decida que el valor por omisión documentado en 072 es el vigente) y vuelva a correr este archivo completo. Este archivo no escribe, no borra y no fusiona ningún ajuste.', v_claves_n, v_claves
       USING ERRCODE = '23514',
             HINT = 'Las cuatro claves: voucher_max_per_day, voucher_max_per_week, voucher_per_day_limits, voucher_allowed_days.';
   END IF;
@@ -3475,6 +3516,28 @@ COMMENT ON FUNCTION public.cash_invoice_payment_atomic(uuid, uuid, uuid, timesta
 -- red de conteo: sin él, un empleado inexistente escribiría menos ítems en
 -- silencio, y `PAYROLL_ITEM_MISMATCH` seguiría siendo la red que aborta. El
 -- `ORDER BY e.id` —el orden determinista de los locks— también queda.
+--
+-- LA SOBRECARGA OBSOLETA DE TRES ARGUMENTOS, Y POR QUÉ SE BORRA ANTES DE
+-- RE-EMITIR
+--
+-- La 062 no cambió la FIRMA de esta función: le agregó un cuarto parámetro,
+-- `p_carry_ids uuid[] DEFAULT '{}'`. Como `CREATE OR REPLACE` sólo reemplaza
+-- cuando el NOMBRE y la LISTA DE TIPOS son idénticos, el `CREATE OR REPLACE` de
+-- la 062 no reemplazó la de la 061 (que venía de la 047): creó una función NUEVA
+-- al lado, y la de tres argumentos quedó viva junto a la de cuatro.
+--
+-- Por qué hay que borrarla acá y no esperar: su cuerpo es de la serie 047/061 y
+-- todavía compara la sede —`AND e.sede_id = p.sede_id`—, una columna que este
+-- mismo archivo borra al final. O sea que es código muerto e inejecutable, y
+-- además es AMBIGUO: con las dos vivas, una llamada de tres argumentos no cae al
+-- valor por omisión `'{}'` de la de cuatro sino que aborta con
+-- `AmbiguousFunction` ("function public.payroll_apply_atomic(uuid, jsonb,
+-- uuid[]) is not unique"). El `DROP` va PRIMERO, y en el mismo patrón que
+-- `next_invoice_number` más abajo, para que no quede una ventana en la que las
+-- dos conviven: lo que sigue es un `CREATE OR REPLACE` sobre una única función,
+-- que es lo que el `ALTER`/`REVOKE`/`GRANT`/`COMMENT` del final aplican.
+DROP FUNCTION IF EXISTS public.payroll_apply_atomic(uuid, jsonb, uuid[]);
+
 CREATE OR REPLACE FUNCTION public.payroll_apply_atomic(
   p_period_id uuid,
   p_items jsonb,
@@ -4354,7 +4417,8 @@ ALTER TABLE public.payroll_discount_carries DROP COLUMN IF EXISTS sede_id;
 --
 --       -- SELECT pol.polname, pol.polrelid::regclass
 --       --   FROM pg_policy pol
---       --  WHERE coalesce(pg_get_expr(pol.qual, pol.polrelid), '')
+--       --  WHERE (coalesce(pg_get_expr(pol.polqual, pol.polrelid), '')
+--       --     OR coalesce(pg_get_expr(pol.polwithcheck, pol.polrelid), ''))
 --       --     ~ 'current_sede_id|sede_id'
 --       --  ORDER BY 2, 1;
 --       -- pol_password_resets_sede_isolation | password_resets
