@@ -32,6 +32,9 @@ import {
   pendingPayrollSettlements,
   rangesOverlap,
   requestVoucherSchema,
+  readVoucherCapSetting,
+  readVoucherDaysSetting,
+  readVoucherPerDaySetting,
   rejectVoucherSchema,
   requiresVoucherApproval,
   resolveFixedSalaryForPeriod,
@@ -44,7 +47,10 @@ import {
   splitCommissionByOrigin,
   summarizePayrollItems,
   voucherApprovalCashOutViolation,
+  voucherCapSettingValue,
+  voucherDaysSettingValue,
   voucherLimitsSchema,
+  voucherPerDaySettingValue,
   weekStartOf,
   type CalculatePayrollInput,
   type DetailLine,
@@ -466,8 +472,16 @@ export interface PayrollPeriodCorrectionResult {
   view: PayrollCorrectionView;
 }
 
+/**
+ * Los ajustes de vales tal como los ve el resto del módulo (no es una fila: es
+ * la LECTURA de las cuatro claves de `system_settings`, 072).
+ *
+ * Ya NO lleva `sede_id`: los ajustes son de la INSTALACIÓN, que tiene una sola
+ * sede, y la clave de cada ajuste es su identidad. Nadie fuera del módulo leía
+ * ese campo, así que la forma pública de la configuración no cambia para las
+ * pantallas.
+ */
 export interface VoucherSettingsRow {
-  sede_id: string;
   /** V2: null o 0 = sin tope diario general. */
   max_per_day: number | null;
   /** V2: null o 0 = sin tope semanal. */
@@ -3252,62 +3266,117 @@ export async function getPayrollPeriodCorrection(
 }
 
 // -------------------------------------------------------------------- vales ---
+//
+// 072: los ajustes de vales son ajustes de la INSTALACIÓN, no de una sede. Viven
+// en `public.system_settings`, una fila por ajuste, identificada por su `key`, con
+// el contenido del ajuste en `value` (jsonb). `voucher_settings` (007/024/026)
+// sigue existiendo con sus datos —el borrado es de la unidad que borra
+// `sede_id`—, pero a partir de acá NADA la lee ni la escribe: el servicio no
+// puede seguir dependiendo de una tabla que esa unidad va a retirar.
+//
+// Una fila por ajuste y no una fila con cuatro columnas: la clave ES la
+// identidad del ajuste (la instalación tiene una sola sede, así que no hay nada
+// que repetir por sede), cada ajuste declara su propio sobre y la ausencia de
+// una clave se lee con el DEFAULT del módulo en vez de ser un error.
 
-/** PAY-05/V2: topes vigentes de la sede (null cuando aún no se configuran). */
-export async function getVoucherSettings(): Promise<VoucherSettingsRow | null> {
-  const db = await payrollDb();
-  // Degradación por migraciones pendientes: 026 (per_day_limits) y 024 (allowed_days).
-  const attempts: Array<{ select: string; missing: string }> = [
-    { select: "sede_id, max_per_day, max_per_week, allowed_days, per_day_limits", missing: "per_day_limits" },
-    { select: "sede_id, max_per_day, max_per_week, allowed_days", missing: "allowed_days" },
-  ];
-  for (const attempt of attempts) {
-    const result = await db.from("voucher_settings").select(attempt.select).maybeSingle();
-    if (!result.error) {
-      const row = result.data as unknown as Record<string, unknown> | null;
-      if (!row) return null;
-      return {
-        ...(row as unknown as VoucherSettingsRow),
-        allowed_days: (row.allowed_days as number[] | null) ?? null,
-        per_day_limits: readPerDayLimits(row.per_day_limits),
-      };
-    }
-    const message = String((result.error as { message?: string }).message ?? "");
-    if (!new RegExp(attempt.missing, "i").test(message)) {
-      throw new PayrollError("INTERNAL", "Error interno.", 500);
-    }
-  }
-  const { data, error } = await db
-    .from("voucher_settings")
-    .select("sede_id, max_per_day, max_per_week")
-    .maybeSingle();
-  if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
-  if (!data) return null;
+/** Claves de los ajustes de vales en `system_settings` (migración 072). */
+const VOUCHER_SETTING_KEYS = {
+  maxPerDay: "voucher_max_per_day",
+  maxPerWeek: "voucher_max_per_week",
+  perDayLimits: "voucher_per_day_limits",
+  allowedDays: "voucher_allowed_days",
+} as const;
+
+/** Las cuatro claves en el orden en que se leen y se escriben. */
+const VOUCHER_SETTING_KEY_LIST: string[] = [
+  VOUCHER_SETTING_KEYS.maxPerDay,
+  VOUCHER_SETTING_KEYS.maxPerWeek,
+  VOUCHER_SETTING_KEYS.perDayLimits,
+  VOUCHER_SETTING_KEYS.allowedDays,
+];
+
+/**
+ * Los cuatro ajustes tal como los ve el resto del módulo. Una clave ausente (o
+ * un sobre sin el dato) se traduce con el DEFAULT del módulo —topes sin tope,
+ * sin topes por día, todos los días—, que es EXACTAMENTE lo que devolvía la
+ * lectura anterior cuando no había fila configurada. La conversión de cada sobre
+ * es de `schemas.ts` (`readVoucherCapSetting`, `readVoucherPerDaySetting`,
+ * `readVoucherDaysSetting`), las mismas funciones que normalizan las columnas
+ * de 024/026.
+ */
+function voucherSettingsFromPayloads(payloads: Map<string, unknown>): VoucherSettingsRow {
   return {
-    ...(data as unknown as VoucherSettingsRow),
-    allowed_days: null,
-    per_day_limits: null,
+    max_per_day: readVoucherCapSetting(payloads.get(VOUCHER_SETTING_KEYS.maxPerDay)),
+    max_per_week: readVoucherCapSetting(payloads.get(VOUCHER_SETTING_KEYS.maxPerWeek)),
+    per_day_limits: readVoucherPerDaySetting(payloads.get(VOUCHER_SETTING_KEYS.perDayLimits)),
+    allowed_days: readVoucherDaysSetting(payloads.get(VOUCHER_SETTING_KEYS.allowedDays)),
   };
 }
 
-/** V2: lee per_day_limits de la BD (jsonb) a un mapa numérico saneado. */
-function readPerDayLimits(value: unknown): Record<string, number> | null {
-  if (value === null || value === undefined || typeof value !== "object") return null;
-  const entries = Object.entries(value as Record<string, unknown>).map(([day, amount]) => ({
-    day,
-    amount: amount as number,
-  }));
-  return normalizePerDayLimits(entries);
+/**
+ * PAY-05/V2: los topes vigentes de la instalación.
+ *
+ * UNA lectura de `system_settings` por clave (las cuatro juntas en un `in`), que
+ * es donde viven desde la 072. Antes leía una fila de `voucher_settings` con
+ * `maybeSingle`, y la degradación que tenía —un `SELECT` más corto por cada
+ * columna de 024/026 que faltara— desaparece con la tabla vieja: acá la forma de
+ * cada sobre la fija la 072 y no hay columnas que puedan faltar a medias.
+ *
+ * Nunca devuelve `null`: una clave ausente NO es «sin configurar», es el ajuste
+ * con su valor por omisión (sin tope / todos los días), que es como se leía la
+ * fila cuando no existía.
+ */
+export async function getVoucherSettings(): Promise<VoucherSettingsRow> {
+  const db = await payrollDb();
+  const { data, error } = await db
+    .from("system_settings")
+    .select("key, value")
+    .in("key", VOUCHER_SETTING_KEY_LIST);
+  if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+  const rows = (data ?? []) as Array<{ key: string; value: unknown }>;
+  return voucherSettingsFromPayloads(new Map(rows.map((row) => [row.key, row.value])));
 }
 
-/** PAY-05/V2: configura topes día/semana (opcionales) + días permitidos + topes por día. Solo admin. */
+/**
+ * Tope que va en la fila de `voucher_max_per_day` / `voucher_max_per_week`.
+ *
+ * Un tope que NO viene en el POST conserva el vigente: es la misma regla que
+ * siguen `allowed_days` y `per_day_limits`, y es la que hacía el upsert de la
+ * fila única, donde una columna ausente del POST no se tocaba. Con las cuatro
+ * claves de la 072 la escritura SIEMPRE manda las cuatro, así que sin esta
+ * regla un POST parcial (o un cliente que sólo cambia un tope) borraría el
+ * otro en silencio. Explícito sí borra: `null` es «sin tope» (V2 lo guarda así)
+ * y 0 se normaliza a lo mismo.
+ */
+function voucherCapToWrite(sentido: number | null | undefined, vigente: number | null): number | null {
+  if (sentido === undefined) return vigente;
+  if (sentido == null || Number(sentido) === 0) return null;
+  return roundMoney(Number(sentido));
+}
+
+/**
+ * PAY-05/V2: configura topes día/semana (opcionales) + días permitidos + topes
+ * por día. Solo admin.
+ *
+ * El `actor` ya no decide QUÉ fila se escribe: con la instalación de una sola
+ * sede no hay sede que elegir, y la fila de cada ajuste la decide su clave. Lo
+ * que sí es suyo es la AUDITORÍA: los topes deciden qué vale sale solo de caja y
+ * cuál espera aprobación, así que cambiarlos deja entrada con el actor y con los
+ * dos valores, el anterior y el nuevo.
+ *
+ * La escritura es UN `upsert` de las cuatro claves: antes era un `upsert` de
+ * una fila con las cuatro columnas, y lo que se conserva es esa misma
+ * atomicidad —las cuatro claves se escriben juntas o no se escribe ninguna—, y
+ * con ella el destino de conflicto, que pasa de `sede_id` a `key`.
+ */
 export async function setVoucherLimits(raw: unknown, actor: PayrollActor): Promise<VoucherSettingsRow> {
   const parsed = voucherLimitsSchema.safeParse(raw);
   if (!parsed.success) {
     throw new PayrollError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const db = await payrollDb();
-  // Sin días en el payload se conserva la config vigente (upsert pisa la fila).
+  // Sin días en el payload se conserva la config vigente (la clave que no se
+  // manda en el POST no se toca: es lo que hacía el upsert de la fila única).
   const current = await getVoucherSettings().catch(() => null);
   const allowed = parsed.data.allowed_days !== undefined
     ? normalizeAllowedDays(parsed.data.allowed_days)
@@ -3315,45 +3384,63 @@ export async function setVoucherLimits(raw: unknown, actor: PayrollActor): Promi
   const perDay = parsed.data.per_day_limits !== undefined
     ? normalizePerDayLimits(parsed.data.per_day_limits)
     : (current?.per_day_limits ?? null);
-  // V2: "sin topes" se guarda como NULL; 0 también se normaliza a NULL.
-  const maxDay = parsed.data.max_per_day == null || Number(parsed.data.max_per_day) === 0
-    ? null
-    : roundMoney(Number(parsed.data.max_per_day));
-  const maxWeek = parsed.data.max_per_week == null || Number(parsed.data.max_per_week) === 0
-    ? null
-    : roundMoney(Number(parsed.data.max_per_week));
-  const base = { sede_id: actor.sedeId, max_per_day: maxDay, max_per_week: maxWeek };
-  const variants = [
-    { ...base, allowed_days: allowed ?? [1, 2, 3, 4, 5, 6, 7], per_day_limits: perDay ?? {} },
-    { ...base, allowed_days: allowed ?? [1, 2, 3, 4, 5, 6, 7] },
-    base,
+  // V2: "sin topes" se guarda como NULL; 0 también se normaliza a NULL. Lo
+  // que no se manda conserva lo vigente, como los otros dos ajustes.
+  const maxDay = voucherCapToWrite(parsed.data.max_per_day, current?.max_per_day ?? null);
+  const maxWeek = voucherCapToWrite(parsed.data.max_per_week, current?.max_per_week ?? null);
+  // Una fila por ajuste. Los sobres los arman las funciones puras de
+  // `schemas.ts`, que son las MISMAS que los leen: lo que se guarda y lo que se
+  // devuelve no pueden divergir por una forma escrita a mano.
+  const filas = [
+    { key: VOUCHER_SETTING_KEYS.maxPerDay, value: voucherCapSettingValue(maxDay) },
+    { key: VOUCHER_SETTING_KEYS.maxPerWeek, value: voucherCapSettingValue(maxWeek) },
+    { key: VOUCHER_SETTING_KEYS.perDayLimits, value: voucherPerDaySettingValue(perDay) },
+    {
+      key: VOUCHER_SETTING_KEYS.allowedDays,
+      // Sin días elegido se escriben los siete: es el DEFAULT de 024 y lo que
+      // escribía la columna cuando `allowed_days` venía nulo.
+      value: voucherDaysSettingValue(allowed ?? [1, 2, 3, 4, 5, 6, 7]),
+    },
   ];
-  const selects = [
-    "sede_id, max_per_day, max_per_week, allowed_days, per_day_limits",
-    "sede_id, max_per_day, max_per_week, allowed_days",
-    "sede_id, max_per_day, max_per_week",
-  ];
-  for (const [index, payload] of variants.entries()) {
-    const result = await db
-      .from("voucher_settings")
-      .upsert(payload, { onConflict: "sede_id" })
-      .select(selects[index])
-      .single();
-    if (!result.error && result.data) {
-      const row = result.data as unknown as Record<string, unknown>;
-      return {
-        ...(row as unknown as VoucherSettingsRow),
-        allowed_days: (row.allowed_days as number[] | null) ?? current?.allowed_days ?? null,
-        per_day_limits: readPerDayLimits(row.per_day_limits) ?? (index === 0 ? perDay : current?.per_day_limits ?? null),
-      };
-    }
-    const message = String((result.error as { message?: string } | null)?.message ?? "");
-    const expected = index === 0 ? "per_day_limits" : "allowed_days";
-    if (!new RegExp(expected, "i").test(message)) {
-      throw new PayrollError("INTERNAL", "Error interno.", 500);
-    }
-  }
-  throw new PayrollError("INTERNAL", "Error interno.", 500);
+  const { data, error } = await db
+    .from("system_settings")
+    .upsert(filas, { onConflict: "key" })
+    .select("key, value");
+  if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+  // Se devuelve lo que la base CONFIRMÓ, no lo que se pidió: es el mismo
+  // criterio que el resto del módulo (una respuesta que no es la que la base
+  // aplicó no se reporta como una configuración guardada).
+  const confirmados = (data ?? []) as Array<{ key: string; value: unknown }>;
+  const nueva = voucherSettingsFromPayloads(new Map(confirmados.map((row) => [row.key, row.value])));
+
+  // AUDITORÍA: quién movió la política de vales, y de qué valor a cuál. El
+  // anterior sale de la MISMA lectura que resolvió los valores por omisión, así
+  // que lo que se registra es exactamente lo que la escritura reemplazó (si esa
+  // lectura degrada, lo anterior es el DEFAULT del módulo: los topes que
+  // quedaron valiendo, no un dato inventado). `entity_id` es la SEDE y no una
+  // clave porque la escritura toca las cuatro: es lo que hace ubicable el cambio
+  // en la historia de la sede. `writeAudit` nunca lanza: que falle el rastro no
+  // convierte una configuración ya guardada en un error para quien la guardó.
+
+  await writeAudit({
+    sede_id: actor.sedeId,
+    user_id: actor.userId,
+    action: AUDIT_ACTIONS.VOUCHER_LIMITS_SET,
+    entity: "system_settings",
+    entity_id: actor.sedeId,
+    metadata: {
+      previous_max_per_day: current?.max_per_day ?? null,
+      new_max_per_day: nueva.max_per_day,
+      previous_max_per_week: current?.max_per_week ?? null,
+      new_max_per_week: nueva.max_per_week,
+      previous_per_day_limits: current?.per_day_limits ?? null,
+      new_per_day_limits: nueva.per_day_limits,
+      previous_allowed_days: current?.allowed_days ?? null,
+      new_allowed_days: nueva.allowed_days,
+    },
+  });
+
+  return nueva;
 }
 
 /** Vales vigentes (pendiente/aprobada) de un empleado en una fecha. */

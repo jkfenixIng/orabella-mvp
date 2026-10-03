@@ -8205,3 +8205,121 @@ describe("migración 071_rpc_single_sede.sql (facturación)", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// 072_system_settings.sql: el consecutivo pasa a ser un AJUSTE de la
+// INSTALACIÓN (`public.system_settings`, una fila por `clave`).
+//
+// La serie de una sola sede (071) dejó `next_invoice_number` como estaba, por una
+// razón que entonces era cierta: `invoice_sequences` tenía `sede_id` como clave
+// primaria, el parámetro SELECCIONABA la fila del contador y no había forma de
+// elegirla dentro de SQL. La 072 resuelve justamente eso —la fila pasa a ser la
+// clave 'invoice_sequence' de una tabla que no tiene sede—, y por eso es la que
+// re-emite la función. Que lo haga un archivo y no el otro no es una
+// contradicción: es el ORDEN de la serie. El parámetro se conserva (aunque el
+// cuerpo ya no lo use) para que la firma que declara la base siga siendo la que
+// `invoice_create_atomic` manda, y su retiro queda para la unidad que borra
+// `sede_id`.
+//
+// Lo que esta suite fija: la FIRMA no cambia, el LOCK de fila se conserva (es lo
+// único que impide el consecutivo duplicado) y la serie no puede REBAJAR con una
+// segunda corrida de la migración.
+// ---------------------------------------------------------------------------
+
+describe("migración 072_system_settings.sql (consecutivo de factura)", () => {
+  const path = join(process.cwd(), "supabase", "migrations", "072_system_settings.sql");
+  const raw = readFileSync(path, "utf8").replace(/\r\n/g, "\n");
+  const sql = raw
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("--"))
+    .join("\n");
+  /** El cuerpo desplegado de la función, sin prosa. */
+  const functionBody = (): string => {
+    const start = sql.indexOf("CREATE OR REPLACE FUNCTION public.next_invoice_number");
+    expect(start).toBeGreaterThan(-1);
+    const body = sql.slice(start);
+    const end = body.indexOf("$$;");
+    return end === -1 ? body : body.slice(0, end);
+  };
+
+  it("crea la tabla de ajustes con la forma declarada: clave, valor y updated_at", () => {
+    expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.system_settings");
+    expect(sql).toContain("key text PRIMARY KEY");
+    expect(sql).toContain("value jsonb NOT NULL DEFAULT '{}'::jsonb");
+    expect(sql).toContain("updated_at timestamptz NOT NULL DEFAULT now()");
+    expect(sql).toContain("EXECUTE FUNCTION public.set_updated_at()");
+    // Sin sede: es un ajuste de la instalación, no de una sede.
+    expect(sql).not.toMatch(/CREATE TABLE IF NOT EXISTS public\.system_settings \([^)]*sede_id/is);
+  });
+
+  it("re-emite next_invoice_number con la MISMA firma de 005", () => {
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.next_invoice_number(p_sede_id uuid)");
+    expect(sql).toContain("RETURNS integer");
+    expect(sql).toContain("ALTER FUNCTION public.next_invoice_number(uuid) SET search_path = public");
+    // El parámetro sigue declarado pero el cuerpo ya no lo usa: la fila del
+    // contador es la clave, no la sede. Retirarlo de la firma es de la unidad que
+    // borra `sede_id`.
+    // `sede_id` aparece UNA vez en toda la definición: en la firma.
+    const cuerpo = functionBody();
+    expect(cuerpo.match(/sede_id/g) ?? []).toHaveLength(1);
+    expect(cuerpo.slice(cuerpo.indexOf("DECLARE"))).not.toMatch(/sede_id/);
+    expect(raw).toContain("POR QUÉ `next_invoice_number` CONSERVA SU PARÁMETRO");
+  });
+
+  it("el lock de fila se conserva: bloquea la clave del contador y la incrementa adentro", () => {
+    const body = functionBody();
+    // El `SELECT … FOR UPDATE` sobre la fila de la clave: es el idioma que
+    // serializa a los emisores concurrentes (FAC-05) y hace que el segundo espere
+    // y vea el número que el primero dejó.
+    expect(body).toMatch(
+      /SELECT[\s\S]*FROM public\.system_settings s[\s\S]*WHERE s\.key = 'invoice_sequence'[\s\S]*FOR UPDATE;/,
+    );
+    // Y el incremento sigue DENTRO de la misma función, o sea dentro de la
+    // transacción del llamador: un aborto no quema el número.
+    expect(body.indexOf("FOR UPDATE")).toBeLessThan(body.indexOf("UPDATE public.system_settings"));
+    expect(body).toContain("jsonb_set(value, '{last_number}', to_jsonb(v_last + 1), true)");
+    expect(body).toContain("RETURN v_last + 1");
+    // La fila vieja no vuelve a aparecer en el cuerpo.
+    expect(body).not.toContain("invoice_sequences");
+  });
+
+  it("la fila tiene que existir antes de bloquearla, sin pisar el contador vigente", () => {
+    const body = functionBody();
+    expect(body).toContain("INSERT INTO public.system_settings (key, value)");
+    expect(body).toContain("ON CONFLICT (key) DO NOTHING");
+    // El `IF NOT FOUND` conserva el nombre del error de 005, que es lo que
+    // traduce el servicio.
+    expect(body).toContain("IF NOT FOUND THEN");
+    expect(body).toContain("RAISE EXCEPTION 'SEDE_NOT_FOUND'");
+  });
+
+  it("el contador se mueve adelante y NO puede rebajar en una segunda corrida", () => {
+    // El MÁXIMO de `invoice_sequences` (nunca el mínimo: el mínimo devuelve la
+    // serie hacia atrás y repite un número ya emitido) con `DO NOTHING` (nunca
+    // `DO UPDATE`: una segunda corrida no puede rebajar el contador que ya
+    // avanzó con las emisiones de la primera).
+    expect(sql).toMatch(/jsonb_build_object\('last_number', coalesce\(max\(s\.last_number\), 0\)\)/);
+    expect(sql).not.toMatch(/ON CONFLICT \(key\) DO UPDATE/);
+    expect(sql).not.toMatch(/UPDATE\s+public\.invoice_sequences/i);
+  });
+
+  it("invoice_create_atomic la sigue llamando con la misma firma", () => {
+    // 071 no le quitó el parámetro al llamador, y la 072 tampoco se lo quitó a la
+    // función: la llamada y la declaración siguen coincidiendo, que es lo que
+    // hace que un despliegue no falle por una sobrecarga vieja.
+    const previous = readFileSync(
+      join(process.cwd(), "supabase", "migrations", "071_rpc_single_sede.sql"),
+      "utf8",
+    ).replace(/\r\n/g, "\n");
+    expect(previous).toContain("public.next_invoice_number(v_sede)");
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION public.next_invoice_number(p_sede_id uuid)");
+  });
+
+  it("NO borra invoice_sequences ni la columna: el borrado es de la unidad que quita sede_id", () => {
+    expect(sql).not.toMatch(/DROP TABLE/i);
+    expect(sql).not.toMatch(/DROP COLUMN/i);
+    expect(sql).not.toMatch(/ALTER TABLE public\.invoice_sequences/i);
+    expect(raw).toContain("NO borra `invoice_sequences` ni `voucher_settings`");
+    expect(raw).toContain("NO ejecutado por el agente: requiere base de datos.");
+  });
+});

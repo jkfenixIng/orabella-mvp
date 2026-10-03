@@ -1143,11 +1143,14 @@ export function buildInvoiceOutReasonTemplate(clientName: string | null | undefi
  * cambio: el registro de qué hacía y de dónde salieron las líneas que se midieron
  * queda en la migración 052.
  *
- * El CONSECUTIVO se reserva ADENTRO (`next_invoice_number`, 005): el incremento
- * de `invoice_sequences` pertenece a la misma transacción, así que un fallo lo
- * REVIERTE con ella y la serie queda sin huecos —ni el que dejaba un fallo
- * posterior a la reserva, ni el que dejaba la carrera de la 041—. El servicio
- * ya no reserva nada: sólo computa y manda DATOS.
+ * El CONSECUTIVO se reserva ADENTRO (`next_invoice_number`, 005 y re-emitida
+ * por 072): el incremento de la fila `invoice_sequence` de `system_settings`
+ * pertenece a la misma transacción, así que un fallo lo REVIERTE con ella y la
+ * serie queda sin huecos —ni el que dejaba un fallo posterior a la reserva, ni
+ * el que dejaba la carrera de la 041—. Esa fila es la que la función bloquea
+ * con `FOR UPDATE`, igual que antes bloqueaba la de `invoice_sequences`: el lock
+ * es lo que impide que dos emisiones concurrentes se lleven el mismo número. El
+ * servicio ya no reserva nada: sólo computa y manda DATOS.
  *
  * QUÉ SIGUE COMPUTANDO EL SERVICIO (y no cruza a SQL): los subtotales por línea
  * (`computeLineSubtotal`), el snapshot de impuestos y los totales

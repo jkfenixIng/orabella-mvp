@@ -19,7 +19,9 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   `method_id` + snapshot `method_code`, `amount > 0`, `paid_at` default now,
   `paid_by`, `reference`; trigger `check_payroll_payments_cap`: la suma por
   ítem nunca excede el neto), `voucher_settings` (`sede_id` PK,
-  `max_per_day`/`max_per_week >= 0`), `voucher_requests` (`sede_id`,
+  `max_per_day`/`max_per_week >= 0`; desde la 072 sus cuatro ajustes viven en
+  `system_settings` y esta tabla queda sin lectores a la espera del borrado —
+  ver "Los ajustes de vales son ajustes de la INSTALACIÓN"), `voucher_requests` (`sede_id`,
   `employee_id`, `amount > 0`, `request_date` default current_date, `status`
   pendiente/aprobada/rechazada/descontada default pendiente, `approved_by`,
   `method_code` + `cash_shift_id` (migración 028: método arqueable y turno de
@@ -65,7 +67,7 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   parciales permitidos —40/40/20 en una o varias llamadas— y el acumulado
   nunca excede el neto), `closePayrollPeriod` (inmutable: `assertDraftPeriod`
   bloquea cálculo, pagos y cambios posteriores), `setVoucherLimits`
-  (upsert por sede), `requestVoucher` (nuevo flujo: la CAJA con turno abierto
+  (un `upsert` de las cuatro claves de `system_settings`, 072), `requestVoucher` (nuevo flujo: la CAJA con turno abierto
   abre el vale; exige turno abierto y dueño o admin; elige el método arqueable
   al crear; valida topes día/semana y días permitidos —dentro de rango se
   genera directo/aprobada, fuera de rango queda pendiente con

@@ -73,6 +73,14 @@ export const AUDIT_ACTIONS = {
   // firmada. El metadato lleva el motivo y los totales de las dos versiones.
   PAYROLL_PERIOD_CORRECTED: "payroll.period_corrected",
   COMMISSION_PAID: "payroll.commission_paid",
+  // Los topes y los días permitidos de los vales los configura el admin de la
+  // sede y antes cambiaban sin rastro: son los números que deciden qué vale sale
+  // solo de caja y cuál espera aprobación, así que un cambio hecho con la
+  // pantalla abierta tiene que quedar escrito con QUIÉN lo hizo y los dos
+  // valores, el anterior y el nuevo (como la fecha de arranque, más abajo).
+  // NO entra a ningún catálogo de alertas: cambiar la política es una decisión de
+  // configuración, no un desvío que alguien deba autorizar o rechazar.
+  VOUCHER_LIMITS_SET: "voucher.limits_set",
   VOUCHER_APPROVED: "voucher.approved",
   VOUCHER_REQUESTED: "voucher.requested",
   VOUCHER_REJECTED: "voucher.rejected",

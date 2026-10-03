@@ -61,6 +61,9 @@ import {
   periodRangeDays,
   prorateFixedSalary,
   rangesOverlap,
+  readVoucherCapSetting,
+  readVoucherDaysSetting,
+  readVoucherPerDaySetting,
   resolveFixedSalaryForPeriod,
   resolveMixedBlock,
   resolveOpenPayrollRange,
@@ -75,7 +78,10 @@ import {
   sumMoney,
   summarizePayrollItems,
   voucherApprovalCashOutViolation,
+  voucherCapSettingValue,
+  voucherDaysSettingValue,
   voucherLimitsSchema,
+  voucherPerDaySettingValue,
   voucherRequiresReview,
   weekdayIso,
   weekStartOf,
@@ -94,6 +100,7 @@ import {
   getPayrollSettlementSources,
   getPayrollStartDate,
   getPeriodDetail,
+  getVoucherSettings,
   groupSettlementInvoices,
   listPayrollMonthRows,
   listPayrollOverview,
@@ -101,6 +108,7 @@ import {
   openPayrollPeriod,
   PayrollError,
   rejectVoucher,
+  setVoucherLimits,
   type PayrollActor,
 } from "@/src/features/payroll/service";
 import { listAllEmployees, listEmployees } from "@/src/features/admin/service";
@@ -1650,8 +1658,14 @@ const payrollPagedStub = vi.hoisted(() => ({
    * responder como la BASE (una restricción violada, `23P01`), no sólo como un
    * cliente feliz: si no, la carrera contra la restricción de exclusión no se
    * podría probar.
+   *
+   * La base manda las dos cosas de un error de Postgres y las dos sirven: el
+   * `code` describe una restricción violada (`23P01`) y el `message` cualquier
+   * otro fallo —un `upsert` que la base rechaza sin violated constraint no tiene
+   * un `code` que inventarle—. Con `code` el doble arma el mensaje; con
+   * `message` lo usa tal cual; sin ninguno, un error genérico de la base.
    */
-  insertError: null as { table: string; code: string } | null,
+  insertError: null as { table: string; code?: string; message?: string } | null,
   /** Payload de cada UPDATE, por tabla: si la escritura ocurrió o no. */
   updates: [] as Array<{ table: string; payload: unknown }>,
   /**
@@ -1744,6 +1758,19 @@ const payrollPagedStub = vi.hoisted(() => ({
   beforeRpc: null as { run: () => void } | null,
   /** CL-9: borrados efectivos del doble, por tabla (no intentos: hechos). */
   deletes: [] as Array<{ table: string; count: number }>,
+  /**
+   * 072: cada RESERVA del consecutivo y a qué rival vio, para que la prueba de
+   * que el número no se repite no afirme una bandera que ella misma puso.
+   */
+  sequenceChecks: [] as Array<{ sawRival: boolean; emitida: number }>,
+  /**
+   * 072: CONTROL NEGATIVO del guardián. `null` (lo normal) = el lock se lee del
+   * ARTEFACTO. Un booleano lo apaga o lo enciende para comprobar que el doble
+   * DE VERDAD ve el duplicado cuando la fila no se bloquea: sin esta prueba, un
+   * doble que siempre «no repite números» no probaría nada. Sólo lo usan las
+   * pruebas de control; el comportamiento se lee del archivo.
+   */
+  sequenceLockOverride: null as boolean | null,
 }));
 
 const MIGRATIONS_DIR = join(process.cwd(), "supabase", "migrations");
@@ -1779,6 +1806,117 @@ function deployedPayrollCapBody(): string {
  */
 function payrollCapLocksParent(): boolean {
   return /\bFOR\s+UPDATE\b/.test(deployedPayrollCapBody());
+}
+
+/**
+ * 072: el cuerpo DESPLEGADO de `next_invoice_number`: lo declara 005 y lo
+ * re-emite 072 con el cuerpo nuevo (misma firma, otra fila que bloquear). Se
+ * toma la ÚLTIMA definición, así que la 005 deja de mandar en cuanto la 072
+ * está —y si la 072 no existiera, la 005 seguiría siendo la vigente. El cuerpo
+ * se mira sin comentarios: la prosa no es la barrera.
+ */
+function deployedNextInvoiceNumberBody(): string {
+  const files = ["005_billing.sql", "072_system_settings.sql"].filter((file) =>
+    existsSync(join(MIGRATIONS_DIR, file)),
+  );
+  for (const file of files.reverse()) {
+    const raw = readFileSync(join(MIGRATIONS_DIR, file), "utf8");
+    const start = raw.indexOf("CREATE OR REPLACE FUNCTION public.next_invoice_number");
+    if (start === -1) continue;
+    const body = raw.slice(start);
+    const end = body.indexOf("$$;");
+    return (end === -1 ? body : body.slice(0, end))
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("--"))
+      .join("\n");
+  }
+  return "";
+}
+
+/**
+ * 072: ¿el contador desplegado toma el lock de la fila que incrementa? El doble
+ * NO recibe esta respuesta del test: la lee del ARTEFACTO, igual que
+ * `payrollCapLocksParent`. Por eso el test de comportamiento se cae solo si el
+ * `FOR UPDATE` desaparece de la 072 (la serie vuelve a poder repetir un número),
+ * en vez de afirmar una bandera que el test eligió.
+ */
+function invoiceSequenceLocksRow(): boolean {
+  const override = payrollPagedStub.sequenceLockOverride;
+  if (override !== null) return override;
+  const body = deployedNextInvoiceNumberBody();
+  return /\bFOR\s+UPDATE\b/.test(body) && body.includes("'invoice_sequence'");
+}
+
+/**
+ * 072: la fila del consecutivo como la aplica Postgres: se bloquea la fila de la
+ * clave, se lee su `last_number` y se incrementa en la MISMA transacción.
+ *
+ * La parte que decide es la FOTO de la lectura, y depende del lock:
+ *   * con el lock desplegado, el segundo emisor ESPERÓ y su foto es POSTERIOR al
+ *     commit del primero: ve el número que el primero dejó y se lleva el
+ *     siguiente;
+ *   * sin lock, la foto es la de su propia lectura, ANTERIOR: no lo ve y los dos
+ *     emiten el mismo número (el defecto FAC-05 de 005).
+ *
+ * `rival` modela esa otra transacción: su incremento YA está confirmado cuando
+ * ésta entra.
+ */
+function reserveInvoiceSequence(rival: { before: number; emitted: number } | null = null): number {
+  const locksRow = invoiceSequenceLocksRow();
+  const key = "invoice_sequence";
+  const filas = (): Array<Record<string, unknown>> => payrollPagedStub.tables.system_settings ?? [];
+  const fila = () => filas().find((row) => row.key === key);
+  // La fila tiene que existir antes de poder bloquearla: es el
+  // `INSERT … ON CONFLICT DO NOTHING` de la función.
+  if (!fila()) {
+    payrollPagedStub.tables.system_settings = [
+      ...filas(),
+      { key, value: { last_number: 0 }, updated_at: "2026-01-31T23:59:59.000Z" },
+    ];
+  }
+  if (rival !== null) {
+    // La otra transacción reservó y CONFIRMÓ antes de que ésta leyera: la fila
+    // de la clave queda con el número que ella emitió.
+    fila()!.value = { last_number: rival.emitted };
+    payrollPagedStub.tables.system_settings = filas();
+  }
+  const actual = Number((fila()?.value as { last_number?: unknown })?.last_number ?? 0);
+  // LA FOTO de la lectura: con el lock, esta transacción ESPERÓ y lee lo que la
+  // otra dejó (posterior a su commit); sin lock, su foto es la de su propia
+  // lectura, anterior al commit rival, así que emite el mismo número.
+  const leido = rival !== null && !locksRow ? rival.before : actual;
+  const emitida = leido + 1;
+  fila()!.value = { last_number: emitida };
+  payrollPagedStub.tables.system_settings = filas();
+  payrollPagedStub.sequenceChecks.push({ sawRival: locksRow, emitida });
+  return emitida;
+}
+
+/** 072: lo que la fila del consecutivo tiene escrito ahora mismo. */
+function storedInvoiceSequence(): number {
+  const fila = (payrollPagedStub.tables.system_settings ?? []).find(
+    (row) => row.key === "invoice_sequence",
+  );
+  return Number((fila?.value as { last_number?: unknown })?.last_number ?? 0);
+}
+
+/**
+ * 072: las filas de `system_settings` que equivalen a una configuración de topes
+ * de vales. Cada ajuste es UNA fila con su clave y su sobre, que es la forma en
+ * que los escribe `setVoucherLimits` y en que los deja la migración.
+ */
+function voucherSettingRows(settings: {
+  max_per_day?: number | null;
+  max_per_week?: number | null;
+  allowed_days?: number[] | null;
+  per_day_limits?: Record<string, number> | null;
+}): Array<Record<string, unknown>> {
+  return [
+    { key: "voucher_max_per_day", value: { amount: settings.max_per_day ?? null } },
+    { key: "voucher_max_per_week", value: { amount: settings.max_per_week ?? null } },
+    { key: "voucher_per_day_limits", value: { limits: settings.per_day_limits ?? null } },
+    { key: "voucher_allowed_days", value: { days: settings.allowed_days ?? null } },
+  ];
 }
 
 /**
@@ -1872,6 +2010,8 @@ function createPayrollPagedStubClient(): unknown {
     let rangeTo = payrollPagedStub.rowCap - 1;
     let updatePayload: Record<string, unknown> | undefined;
     let insertPayload: unknown;
+    /** 072: columna (o columnas) del destino de conflicto del `upsert`. */
+    let upsertConflict: string | null = null;
 
     const rows = (): Array<Record<string, unknown>> => payrollPagedStub.tables[table] ?? [];
 
@@ -1976,7 +2116,10 @@ function createPayrollPagedStubClient(): unknown {
         if (failure && failure.table === table) {
           return {
             data: null,
-            error: { code: failure.code, message: `doble: ${failure.code} inyectado en el INSERT de ${table}` },
+            error: {
+              code: failure.code ?? "P0001",
+              message: failure.message ?? `doble: ${failure.code ?? "P0001"} inyectado en el INSERT de ${table}`,
+            },
           };
         }
         const values = (Array.isArray(insertPayload) ? insertPayload : [insertPayload]) as Array<
@@ -2020,7 +2163,21 @@ function createPayrollPagedStubClient(): unknown {
           closed_at: null,
           ...row,
         }));
-        payrollPagedStub.tables[table] = [...rows(), ...persisted];
+        // 072: `ON CONFLICT (clave) DO UPDATE` reemplaza la fila que ya tenía
+        // esa clave en vez de dejar dos filas con el mismo ajuste.
+        payrollPagedStub.tables[table] =
+          op === "upsert" && upsertConflict !== null && !upsertConflict.includes(",")
+            ? [
+                ...rows().filter((row) => !values.some((value) => value[upsertConflict!] === row[upsertConflict!])),
+                ...persisted,
+              ]
+            : [...rows(), ...persisted];
+        if (table === "payroll_items" && op === "upsert") {
+          payrollPagedStub.itemsUpsert = persisted;
+          // CL-8: esta escritura quedó CONFIRMADA (camino suelto). Si el descuento
+          // de los vales falla después, el ítem ya es un hecho.
+          payrollPagedStub.itemWrites.push(persisted);
+        }
         return { data: single ? persisted[0] ?? null : persisted, error: null };
       }
       const failOn = payrollPagedStub.failOn;
@@ -2074,19 +2231,17 @@ function createPayrollPagedStubClient(): unknown {
         payrollPagedStub.updates.push({ table, payload });
         return query;
       },
-      upsert: (value?: unknown) => {
+      upsert: (value?: unknown, options?: { onConflict?: string }) => {
         op = "upsert";
-        // El upsert persiste de verdad: `getPeriodDetail` lee después estas filas.
-        const persisted = (Array.isArray(value) ? value : [value]).map((row) => ({
-          ...(row as Record<string, unknown>),
-          id: `item-nomina-${(payrollPagedStub.rowSeq += 1)}`,
-          created_at: "2026-01-31T23:59:59.000Z",
-        }));
-        payrollPagedStub.itemsUpsert = persisted;
-        payrollPagedStub.tables.payroll_items = [...rows(), ...persisted];
-        // CL-8: esta escritura quedó CONFIRMADA (camino suelto). Si el descuento
-        // de los vales falla después, el ítem ya es un hecho.
-        payrollPagedStub.itemWrites.push(persisted);
+        // 072: el destino de conflicto del `ON CONFLICT`. Con UNA sola columna
+        // el doble reemplaza la fila que ya tiene ese valor (es lo que hace el
+        // upsert real); con una lista de columnas se deja el comportamiento de
+        // siempre, que es el que el RPC de la 047 emula aparte.
+        upsertConflict = options?.onConflict ?? null;
+        // El upsert persiste de verdad: `getPeriodDetail` lee después estas
+        // filas. La escritura la aplica el `INSERT` de `select()`, que es por
+        // donde pasa todo upsert que devuelve fila (`… .upsert().select()`).
+        insertPayload = value;
         return query;
       },
       delete: () => {
@@ -2550,6 +2705,8 @@ function resetPayrollStubState(): void {
   payrollPagedStub.failCorrectionLines = null;
   payrollPagedStub.beforeRpc = null;
   payrollPagedStub.deletes.length = 0;
+  payrollPagedStub.sequenceChecks.length = 0;
+  payrollPagedStub.sequenceLockOverride = null;
 }
 
 // Los catálogos de admin/cash son `unstable_cache` (caché de Next). Fuera de un
@@ -3547,15 +3704,8 @@ describe("payroll: la marca over_tope de la aprobación no puede mentir (U7)", (
     };
     payrollPagedStub.tables = {
       voucher_requests: [voucher],
-      voucher_settings: [
-        {
-          sede_id: payrollPagedStub.SEDE_ID,
-          max_per_day: maxPerDay,
-          max_per_week: null,
-          allowed_days: null,
-          per_day_limits: null,
-        },
-      ],
+      // 072: los topes se leen de `system_settings`, una fila por ajuste.
+      system_settings: voucherSettingRows({ max_per_day: maxPerDay }),
       users: [],
       audit_logs: [],
     };
@@ -3664,15 +3814,8 @@ describe("payroll: la revisión del vale no pisa lo que la nómina descontó (U8
     };
     payrollPagedStub.tables = {
       voucher_requests: [voucher],
-      voucher_settings: [
-        {
-          sede_id: payrollPagedStub.SEDE_ID,
-          max_per_day: 200000,
-          max_per_week: null,
-          allowed_days: null,
-          per_day_limits: null,
-        },
-      ],
+      // 072: los topes se leen de `system_settings`, una fila por ajuste.
+      system_settings: voucherSettingRows({ max_per_day: 200000 }),
       users: [],
       audit_logs: [],
     };
@@ -8078,15 +8221,11 @@ describe("payroll: CL-5 la solicitud de vale reintentada no abre un segundo vale
     ];
     payrollPagedStub.tables.employees = [employeeRow(EMPLOYEE_ID), employeeRow(EMPLOYEE_2)];
     payrollPagedStub.tables.payment_methods = [METHOD];
-    payrollPagedStub.tables.voucher_settings = [
-      {
-        sede_id: payrollPagedStub.SEDE_ID,
-        max_per_day: 200000,
-        max_per_week: 400000,
-        allowed_days: null,
-        per_day_limits: null,
-      },
-    ];
+    // 072: los topes se leen de `system_settings`, una fila por ajuste.
+    payrollPagedStub.tables.system_settings = voucherSettingRows({
+      max_per_day: 200000,
+      max_per_week: 400000,
+    });
     payrollPagedStub.tables.voucher_requests = [];
     payrollPagedStub.tables.audit_logs = [];
   }
@@ -12317,5 +12456,575 @@ describe("migración 071_rpc_single_sede.sql (nómina)", () => {
     // sede del PERÍODO que bloquea: no hay parámetro que quitarle y este
     // archivo no lo re-emite.
     expect(sql).not.toContain("payroll_apply_atomic");
+  });
+});
+
+// ===================================================================== ===
+// M3b: el consecutivo y los topes de vales son AJUSTES DE LA INSTALACIÓN
+// (072_system_settings.sql)
+// ========================================================================
+//
+// Con la instalación de una sola sede, `invoice_sequences` y `voucher_settings`
+// se quedan sin clave natural (su clave primaria era `sede_id`) y el dueño
+// decidió reemplazarlas por UNA tabla de `clave`/`valor`:
+// `public.system_settings`.
+//
+// Lo que se prueba acá, en dos niveles:
+//
+//   * COMPORTAMIENTO, contra el doble de la base: el contador avanza de a uno y
+//     no devuelve un número repetido —la fila que se bloquea es la fila de la
+//     clave— y los topes se leen y se escriben por sus cuatro claves, con el
+//     valor por omisión del módulo cuando una clave no está.
+//   * ARTEFACTO, contra el texto de la migración: que la tabla sea la que se
+//     documentó, que el movimiento de datos sea idempotente y que el archivo NO
+//     borre todavía las dos tablas viejas (el borrado es de la unidad que quita
+//     `sede_id`).
+//
+// El doble del contador NO recibe del test si la fila se bloquea: lo lee del
+// archivo desplegado (como `payrollCapLocksParent` con el tope de nómina), así
+// que quitarle el `FOR UPDATE` a la 072 hace caer estas pruebas por sí solas.
+
+/** El texto de la 072, sin prosa: la detección mira sentencias y nombres. */
+const M3B_MIGRATION = "072_system_settings.sql";
+
+describe("M3b: los ajustes de la instalación viven en system_settings (072)", () => {
+  const ACTOR: PayrollActor = {
+    userId: "u-1",
+    sedeId: payrollPagedStub.SEDE_ID,
+    roles: ["admin"],
+  };
+  const raw072 = (): string => readFileSync(join(MIGRATIONS_DIR, M3B_MIGRATION), "utf8");
+  const sql072 = (): string =>
+    raw072()
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("--"))
+      .join("\n");
+  /** Las filas de `system_settings` que quedaron escritas, por clave. */
+  const settingRows = (): Array<Record<string, unknown>> =>
+    payrollPagedStub.tables.system_settings ?? [];
+  const settingValue = (key: string): unknown =>
+    settingRows().find((row) => row.key === key)?.value;
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  describe("el consecutivo: la fila de la clave es la que se bloquea", () => {
+    it("avanza de a uno desde el valor que quedó migrado, y la fila lo acumula", () => {
+      // Lo que deja la migración cuando `invoice_sequences` tenía 41 emitidos.
+      payrollPagedStub.tables.system_settings = [
+        { key: "invoice_sequence", value: { last_number: 41 }, updated_at: "2026-01-31T00:00:00.000Z" },
+      ];
+
+      const emitidos = [
+        reserveInvoiceSequence(),
+        reserveInvoiceSequence(),
+        reserveInvoiceSequence(),
+      ];
+
+      expect(emitidos).toEqual([42, 43, 44]);
+      // Y el sobre de la fila es el contador: no queda en 41 (el de la tabla
+      // vieja) ni en un número de más.
+      expect(settingValue("invoice_sequence")).toEqual({ last_number: 44 });
+      expect(storedInvoiceSequence()).toBe(44);
+    });
+
+    it("sin fila previa, la crea y el primer número es el 1", () => {
+      // El `INSERT … ON CONFLICT DO NOTHING` de la función: una instalación que
+      // nunca emitió no tiene fila, y eso no es un error.
+      expect(settingRows()).toEqual([]);
+
+      expect(reserveInvoiceSequence()).toBe(1);
+      expect(reserveInvoiceSequence()).toBe(2);
+      expect(settingValue("invoice_sequence")).toEqual({ last_number: 2 });
+    });
+
+    it("la fila del contador no tiene forma de sede (la instalación es de una)", () => {
+      reserveInvoiceSequence();
+      reserveInvoiceSequence();
+
+      const fila = settingRows().find((row) => row.key === "invoice_sequence")!;
+      expect(Object.keys(fila).sort()).toEqual(["key", "updated_at", "value"]);
+      expect(fila).not.toHaveProperty("sede_id");
+      expect(fila).not.toHaveProperty("last_number");
+    });
+
+    it("DOS emisores concurrentes NO se llevan el mismo número: el lock es lo que lo evita", () => {
+      // La otra transacción reservó y CONFIRMÓ su número mientras ésta esperaba
+      // en el lock de la fila.
+      expect(reserveInvoiceSequence()).toBe(1);
+      expect(storedInvoiceSequence()).toBe(1);
+
+      const emitido = reserveInvoiceSequence({ before: 1, emitted: 2 });
+
+      // Con el `FOR UPDATE` desplegado, esta lectura vio el 2 que dejó la otra y
+      // se llevó el 3. Sin ver la fila rival habría emitido el 2 también: el
+      // duplicado que la serie no puede tener (FAC-05).
+      expect(emitido).toBe(3);
+      expect(storedInvoiceSequence()).toBe(3);
+      expect(payrollPagedStub.sequenceChecks.at(-1)).toEqual({ sawRival: true, emitida: 3 });
+    });
+
+    it("control negativo del guardián: SIN el FOR UPDATE desplegado el doble repite el número", () => {
+      // El mismo escenario con el lock apagado, para probar que la prueba
+      // anterior no es vacuidad: sin bloquear la fila, el emisor que llegó
+      // segundo lee una foto anterior al commit rival y devuelve el MISMO
+      // número (y el contador tampoco avanza: su escritura se pierde).
+      payrollPagedStub.sequenceLockOverride = false;
+      reserveInvoiceSequence();
+      const emitido = reserveInvoiceSequence({ before: 1, emitted: 2 });
+
+      expect(emitido).toBe(2);
+      expect(storedInvoiceSequence()).toBe(2);
+      expect(payrollPagedStub.sequenceChecks.at(-1)).toEqual({ sawRival: false, emitida: 2 });
+    });
+
+    it("el lock y la firma salen del ARTEFACTO, no de una bandera del test", () => {
+      // La firma NO cambia: es la de 005, con la sede como parámetro, y el
+      // parámetro deja de seleccionar la fila (su retiro es de la unidad que
+      // borra `sede_id`).
+      const body = deployedNextInvoiceNumberBody();
+      expect(body).toContain("CREATE OR REPLACE FUNCTION public.next_invoice_number(p_sede_id uuid)");
+      expect(body).toContain("FOR UPDATE");
+      expect(body).not.toContain("invoice_sequences");
+      // La fila que se bloquea es la clave del contador, y el incremento ocurre
+      // en la misma función (o sea, dentro de la transacción del llamador).
+      expect(body).toContain("'invoice_sequence'");
+      expect(body).toContain("jsonb_set(value, '{last_number}'");
+      // Y el parámetro sigue declarado aunque el cuerpo no lo use.
+      expect(body).toContain("p_sede_id uuid");
+    });
+  });
+
+  describe("los topes se leen y se escriben por sus cuatro claves", () => {
+    it("cada ajuste se lee de SU fila, con el sobre que su clave declara", async () => {
+      payrollPagedStub.tables.system_settings = [
+        { key: "voucher_max_per_day", value: { amount: 200000 } },
+        { key: "voucher_max_per_week", value: { amount: 400000 } },
+        { key: "voucher_per_day_limits", value: { limits: { "3": 50000 } } },
+        { key: "voucher_allowed_days", value: { days: [1, 2, 3, 4, 5] } },
+      ];
+
+      const settings = await getVoucherSettings();
+
+      expect(settings).toEqual({
+        max_per_day: 200000,
+        max_per_week: 400000,
+        per_day_limits: { "3": 50000 },
+        allowed_days: [1, 2, 3, 4, 5],
+      });
+      // Una sola lectura, y de la tabla nueva.
+      expect(payrollPagedStub.windows.filter((w) => w.table === "system_settings")).toHaveLength(1);
+      expect(payrollPagedStub.inFilters).toContainEqual({
+        table: "system_settings",
+        column: "key",
+        count: 4,
+      });
+    });
+
+    it("una clave ausente se lee con el valor por omisión del módulo, no con un error", async () => {
+      // Sólo existe el tope diario: los otros tres ajustes son los de omisión
+      // (sin tope, sin topes por día, todos los días).
+      payrollPagedStub.tables.system_settings = [
+        { key: "voucher_max_per_day", value: { amount: 200000 } },
+      ];
+
+      const settings = await getVoucherSettings();
+
+      expect(settings).toEqual({
+        max_per_day: 200000,
+        max_per_week: null,
+        per_day_limits: null,
+        allowed_days: null,
+      });
+      // Días `null` = TODOS: pedir un vale un domingo no exige revisión, igual
+      // que cuando `allowed_days` venía nulo.
+      expect(isVoucherDayAllowed("2026-01-18", settings.allowed_days)).toBe(true);
+    });
+
+    it("una tabla VACÍA da los cuatro valores por omisión: es la instalación sin configurar", async () => {
+      const settings = await getVoucherSettings();
+
+      expect(settings).toEqual({
+        max_per_day: null,
+        max_per_week: null,
+        per_day_limits: null,
+        allowed_days: null,
+      });
+      // Sin topes, ningún vale exige aprobación por monto.
+      expect(
+        requiresVoucherApproval(
+          checkVoucherCaps({
+            dayTotal: 9_000_000,
+            weekTotal: 9_000_000,
+            requested: 1_000_000,
+            maxPerDay: settings.max_per_day,
+            maxPerWeek: settings.max_per_week,
+          }),
+        ),
+      ).toBe(false);
+    });
+
+    it("un sobre que no es el declarado se lee con el valor por omisión (no rompe la pantalla)", async () => {
+      payrollPagedStub.tables.system_settings = [
+        { key: "voucher_max_per_day", value: { monto: 200000 } },
+        { key: "voucher_max_per_week", value: "no-sobre" },
+        { key: "voucher_per_day_limits", value: { limits: { "0": 1, "9": 2, x: 3 } } },
+        { key: "voucher_allowed_days", value: { days: "lunes" } },
+      ];
+
+      const settings = await getVoucherSettings();
+
+      expect(settings.max_per_day).toBeNull();
+      expect(settings.max_per_week).toBeNull();
+      expect(settings.per_day_limits).toBeNull();
+      expect(settings.allowed_days).toBeNull();
+    });
+
+    it("guardar topes escribe UNA fila por clave, con el destino de conflicto `key`", async () => {
+      payrollPagedStub.tables.system_settings = voucherSettingRows({
+        max_per_day: 200000,
+        allowed_days: [1, 2, 3, 4, 5],
+      });
+
+      const guardado = await setVoucherLimits(
+        {
+          max_per_day: 50000,
+          max_per_week: 0,
+          per_day_limits: [{ day: 3, amount: 50000 }],
+        },
+        ACTOR,
+      );
+
+      // Las cuatro claves siguen existiendo (una fila por ajuste) y cada una con
+      // el sobre de su ajuste.
+      expect(settingRows().map((row) => row.key)).toEqual([
+        "voucher_max_per_day",
+        "voucher_max_per_week",
+        "voucher_per_day_limits",
+        "voucher_allowed_days",
+      ]);
+      expect(settingValue("voucher_max_per_day")).toEqual({ amount: 50000 });
+      // 0 = sin tope, y se guarda como null (026): es lo que ya hacía el
+      // servicio antes de escribir la fila de la sede.
+      expect(settingValue("voucher_max_per_week")).toEqual({ amount: null });
+      expect(settingValue("voucher_per_day_limits")).toEqual({ limits: { "3": 50000 } });
+      // Sin días en el POST se conserva la configuración vigente: la clave que
+      // no se manda no se toca (era el upsert de la fila única).
+      expect(settingValue("voucher_allowed_days")).toEqual({ days: [1, 2, 3, 4, 5] });
+      // Y lo que devuelve es lo que la base confirmó, leído por las mismas
+      // funciones puras que arman el sobre.
+      expect(guardado).toEqual({
+        max_per_day: 50000,
+        max_per_week: null,
+        per_day_limits: { "3": 50000 },
+        allowed_days: [1, 2, 3, 4, 5],
+      });
+    });
+
+    it("guardar sin nada configurado escribe los valores por omisión, no deja claves ausentes", async () => {
+      payrollPagedStub.tables.system_settings = [];
+
+      const guardado = await setVoucherLimits({ max_per_day: 0, max_per_week: 0 }, ACTOR);
+
+      expect(settingValue("voucher_max_per_day")).toEqual({ amount: null });
+      expect(settingValue("voucher_max_per_week")).toEqual({ amount: null });
+      expect(settingValue("voucher_per_day_limits")).toEqual({ limits: null });
+      // Los días que no se eligen se escriben como los siete: es el valor por
+      // omisión de 024 y lo que escribía la columna cuando venían nulos.
+      expect(settingValue("voucher_allowed_days")).toEqual({ days: [1, 2, 3, 4, 5, 6, 7] });
+      expect(guardado.allowed_days).toEqual([1, 2, 3, 4, 5, 6, 7]);
+      // Y el valor nuevo se lee igual por la puerta de lectura.
+      expect(await getVoucherSettings()).toEqual(guardado);
+    });
+
+    it("guardar dos veces REEMPLAZA la fila de la clave, no la duplica", async () => {
+      payrollPagedStub.tables.system_settings = voucherSettingRows({ max_per_day: 200000 });
+
+      await setVoucherLimits({ max_per_day: 50000 }, ACTOR);
+      await setVoucherLimits({ max_per_day: 90000 }, ACTOR);
+
+      const filasTope = settingRows().filter((row) => row.key === "voucher_max_per_day");
+      expect(filasTope).toHaveLength(1);
+      expect(filasTope[0].value).toEqual({ amount: 90000 });
+      expect((await getVoucherSettings()).max_per_day).toBe(90000);
+    });
+
+    it("guardar topes deja AUDITORÍA con el actor y los dos valores (el anterior y el nuevo)", async () => {
+      // Los topes deciden qué vale sale solo de caja y cuál espera aprobación:
+      // cambiarlos con la pantalla abierta es una decisión que tiene que quedar
+      // escrita, y hasta ahora no dejaba ninguna.
+      payrollPagedStub.tables.system_settings = voucherSettingRows({
+        max_per_day: 200000,
+        max_per_week: 400000,
+        per_day_limits: { "3": 50000 },
+        allowed_days: [1, 2, 3, 4, 5],
+      });
+
+      await setVoucherLimits({ max_per_day: 50000, allowed_days: [1, 3] }, ACTOR);
+
+      const audit = payrollPagedStub.inserts.find((entry) => entry.table === "audit_logs");
+      expect(audit?.payload).toMatchObject({
+        action: "voucher.limits_set",
+        entity: "system_settings",
+        // La escritura toca las CUATRO claves: lo que hace ubicable el cambio
+        // en la historia de la sede es la sede, no una clave.
+        entity_id: ACTOR.sedeId,
+        sede_id: ACTOR.sedeId,
+        user_id: ACTOR.userId,
+        metadata: {
+          previous_max_per_day: 200000,
+          new_max_per_day: 50000,
+          // Lo que NO se manda conserva lo vigente, y eso es lo que la escritura
+          // dejó y lo que un auditor tiene que poder leer.
+          previous_max_per_week: 400000,
+          new_max_per_week: 400000,
+          previous_per_day_limits: { "3": 50000 },
+          new_per_day_limits: { "3": 50000 },
+          previous_allowed_days: [1, 2, 3, 4, 5],
+          new_allowed_days: [1, 3],
+        },
+      });
+      // Y lo que la auditoría llama «nuevo» es lo que quedó ESCRITO de verdad:
+      // el tope que se pidió, la semana que no se tocó conservada y los días
+      // elegidos, leídos otra vez por la puerta de lectura. Sin esto, un
+      // `new_*` inventado por el servicio pasaría la aserción de arriba.
+      expect(settingValue("voucher_max_per_day")).toEqual({ amount: 50000 });
+      expect(settingValue("voucher_max_per_week")).toEqual({ amount: 400000 });
+      expect(settingValue("voucher_per_day_limits")).toEqual({ limits: { "3": 50000 } });
+      expect(settingValue("voucher_allowed_days")).toEqual({ days: [1, 3] });
+      expect(await getVoucherSettings()).toEqual({
+        max_per_day: 50000,
+        max_per_week: 400000,
+        per_day_limits: { "3": 50000 },
+        allowed_days: [1, 3],
+      });
+    });
+
+    it("configurar por primera vez audit con el anterior en los DEFAULT del módulo", async () => {
+      // Una instalación que nunca configuró topes: lo anterior NO es «cero» ni
+      // una cadena vacía, es el valor por omisión del módulo (sin tope, todos
+      // los días), que es como se leía antes de que existiera la fila.
+      payrollPagedStub.tables.system_settings = [];
+
+      await setVoucherLimits({ max_per_day: 50000 }, ACTOR);
+
+      const audit = payrollPagedStub.inserts.find((entry) => entry.table === "audit_logs");
+      expect(audit?.payload).toMatchObject({
+        action: "voucher.limits_set",
+        user_id: ACTOR.userId,
+        metadata: {
+          previous_max_per_day: null,
+          new_max_per_day: 50000,
+          previous_max_per_week: null,
+          new_max_per_week: null,
+          previous_per_day_limits: null,
+          new_per_day_limits: null,
+          previous_allowed_days: null,
+          // Sin días elegidos se escriben los siete: es lo que quedó valiendo.
+          new_allowed_days: [1, 2, 3, 4, 5, 6, 7],
+        },
+      });
+    });
+
+    it("un guardado RECHAZADO no deja auditoría: no se registró un cambio que no ocurrió", async () => {
+      payrollPagedStub.tables.system_settings = voucherSettingRows({ max_per_day: 200000 });
+      payrollPagedStub.insertError = { table: "system_settings", message: "boom" };
+
+      const failure: unknown = await setVoucherLimits({ max_per_day: 50000 }, ACTOR).catch(
+        (error: unknown) => error,
+      );
+
+      expect(failure).toBeInstanceOf(PayrollError);
+      expect(payrollPagedStub.inserts.filter((entry) => entry.table === "audit_logs")).toHaveLength(0);
+    });
+
+    it("la acción sale del vocabulario cerrado y NO entra a ningún catálogo de alertas", () => {
+      expect(AUDIT_ACTIONS.VOUCHER_LIMITS_SET).toBe("voucher.limits_set");
+      // No es ninguna de las tres acciones del ciclo de un vale
+      // (pedido/aprobado/rechazado), que es lo que la bandeja de alertas mira:
+      // cambiar la política es configuración, no un desvío que alguien deba
+      // autorizar o rechazar.
+      expect(AUDIT_ACTIONS.VOUCHER_LIMITS_SET).not.toBe(AUDIT_ACTIONS.VOUCHER_REQUESTED);
+      expect(AUDIT_ACTIONS.VOUCHER_LIMITS_SET).not.toBe(AUDIT_ACTIONS.VOUCHER_APPROVED);
+      expect(AUDIT_ACTIONS.VOUCHER_LIMITS_SET).not.toBe(AUDIT_ACTIONS.VOUCHER_REJECTED);
+      // Y el catálogo de la bandeja se lee de la fuente REAL del módulo de
+      // alertas (es una lista literal, no algo que este archivo controle), con
+      // el control de que sí filtra la alerta de vale: si el catálogo saliera
+      // vacío, la ausencia de más abajo no probaría nada.
+      const alertas = readFileSync(join(process.cwd(), "src/features/alerts/schemas.ts"), "utf8");
+      const catalogo = /export const ALERT_ACTIONS = \[([\s\S]*?)\] as const;/.exec(alertas)?.[1] ?? "";
+      const alertados = [...catalogo.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+      expect(alertados).toContain(AUDIT_ACTIONS.VOUCHER_REQUESTED);
+      expect(alertados).not.toContain(AUDIT_ACTIONS.VOUCHER_LIMITS_SET);
+      // Lo mismo por la puerta que la bandeja USA de verdad al filtrar: la
+      // acción de `voucherAlertFilter`, que es la que approve/reject cierra.
+      const filtro = /VOUCHER_ALERT_ACTION = "([^"]+)"/.exec(alertas)?.[1];
+      expect(filtro).toBe(AUDIT_ACTIONS.VOUCHER_REQUESTED);
+      expect(filtro).not.toBe(AUDIT_ACTIONS.VOUCHER_LIMITS_SET);
+      for (const archivo of ["src/features/alerts/service.ts", "src/features/alerts/schemas.ts"]) {
+        const fuente = readFileSync(join(process.cwd(), archivo), "utf8");
+        expect(fuente, `${archivo} menciona la acción`).not.toContain("VOUCHER_LIMITS_SET");
+        expect(fuente, `${archivo} menciona el código`).not.toContain("voucher.limits_set");
+      }
+      // Y el servicio NO re-declara el código a mano: lo toma del vocabulario
+      // compartido, para que no se desincronicen.
+      const fuente = readFileSync(join(process.cwd(), "src/features/payroll/service.ts"), "utf8");
+      expect(fuente).toContain("AUDIT_ACTIONS.VOUCHER_LIMITS_SET");
+      expect(fuente.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "")).not.toContain(
+        '"voucher.limits_set"',
+      );
+    });
+
+    it("el top guardado manda: un vale por encima del tope diario queda pendiente", async () => {
+      // El efecto de negocio de la fila nueva, no sólo su forma: el mismo
+      // control de 006/026 que antes leía `voucher_settings`.
+      payrollPagedStub.tables.system_settings = voucherSettingRows({ max_per_day: 50000 });
+
+      const settings = await getVoucherSettings();
+      const caps = checkVoucherEligibility({
+        dayTotal: 40000,
+        weekTotal: 40000,
+        requested: 20000,
+        maxPerDay: settings.max_per_day,
+        maxPerWeek: settings.max_per_week,
+        requestDate: "2026-01-15",
+        allowedDays: settings.allowed_days,
+        perDayLimits: settings.per_day_limits,
+      });
+
+      expect(caps.overDay).toBe(true);
+      expect(caps.overWeek).toBe(false);
+      expect(caps.dayNotAllowed).toBe(false);
+      expect(requiresVoucherApproval(caps)).toBe(true);
+    });
+
+    it("los días permitidos de la clave siguen mandando sobre la elegibilidad", async () => {
+      payrollPagedStub.tables.system_settings = voucherSettingRows({ allowed_days: [1, 2, 3, 4, 5] });
+      const settings = await getVoucherSettings();
+
+      // Sábado 2026-01-17 y domingo 2026-01-18: fuera de los días configurados.
+      expect(isVoucherDayAllowed("2026-01-17", settings.allowed_days)).toBe(false);
+      expect(isVoucherDayAllowed("2026-01-18", settings.allowed_days)).toBe(false);
+      //structureEl jueves sí, y un día no permitido exige revisión aunque no haya
+      //tope configurado.
+      expect(isVoucherDayAllowed("2026-01-15", settings.allowed_days)).toBe(true);
+      expect(
+        checkVoucherEligibility({
+          dayTotal: 0,
+          weekTotal: 0,
+          requested: 1000,
+          maxPerDay: settings.max_per_day,
+          maxPerWeek: settings.max_per_week,
+          requestDate: "2026-01-17",
+          allowedDays: settings.allowed_days,
+          perDayLimits: settings.per_day_limits,
+        }).dayNotAllowed,
+      ).toBe(true);
+    });
+
+    it("el tope propio por día sigue REEMPLAZANDO al general en su día (026)", () => {
+      // Misma regla de siempre, ahora leída de dos claves distintas.
+      payrollPagedStub.tables.system_settings = voucherSettingRows({
+        max_per_day: 100000,
+        per_day_limits: { "4": 20000 },
+      });
+      const limits = readVoucherPerDaySetting(settingValue("voucher_per_day_limits"));
+
+      // 2026-01-15 es jueves (4) y 2026-01-22 también: rige el tope propio.
+      expect(resolveVoucherDayCap(100000, limits, "2026-01-15")).toBe(20000);
+      expect(resolveVoucherDayCap(100000, limits, "2026-01-22")).toBe(20000);
+      // Cualquier otro día, el general.
+      expect(resolveVoucherDayCap(100000, limits, "2026-01-16")).toBe(100000);
+    });
+  });
+
+  describe("el sobre de cada clave tiene un solo lector y un solo escritor", () => {
+    it("leer y escribir son inversos (lo guardado es lo que se vuelve a leer)", () => {
+      expect(readVoucherCapSetting(voucherCapSettingValue(50000))).toBe(50000);
+      expect(readVoucherCapSetting(voucherCapSettingValue(null))).toBeNull();
+      expect(readVoucherDaysSetting(voucherDaysSettingValue([3, 1, 1]))).toEqual([1, 3]);
+      expect(readVoucherDaysSetting(voucherDaysSettingValue(null))).toBeNull();
+      expect(readVoucherPerDaySetting(voucherPerDaySettingValue({ "3": 50000 }))).toEqual({ "3": 50000 });
+      expect(readVoucherPerDaySetting(voucherPerDaySettingValue(null))).toBeNull();
+    });
+
+    it("un tope negativo o no numérico se lee como valor por omisión, no como un tope raro", () => {
+      // El Zod ya no puede colarlos por la puerta de la escritura; un sobre
+      // corrupto en la base tampoco puede convertirse en un tope de −5 ni en un
+      // NaN que rompa las comparaciones de `checkVoucherCaps`.
+      expect(readVoucherCapSetting({ amount: -5 })).toBeNull();
+      expect(readVoucherCapSetting({ amount: "mucho" })).toBeNull();
+      expect(readVoucherCapSetting({ amount: 0 })).toBe(0);
+      expect(readVoucherCapSetting(undefined)).toBeNull();
+      expect(readVoucherCapSetting(null)).toBeNull();
+    });
+  });
+
+  describe("la 072 es idempotente y todavía no borra nada", () => {
+    it("deja el mismo esquema en cada corrida", () => {
+      const sql = sql072();
+      expect(sql).toContain("CREATE TABLE IF NOT EXISTS public.system_settings");
+      expect(sql).toContain("key text PRIMARY KEY");
+      expect(sql).toContain("value jsonb NOT NULL DEFAULT '{}'::jsonb");
+      expect(sql).toContain("updated_at timestamptz NOT NULL DEFAULT now()");
+      // El trigger y la política se re-emiten con su `IF EXISTS`, que es lo que
+      // los deja idénticos: sin eso, la segunda corrida fallaría.
+      expect(sql).toContain("DROP TRIGGER IF EXISTS trg_system_settings_updated_at");
+      expect(sql).toContain("EXECUTE FUNCTION public.set_updated_at()");
+      expect(sql).toContain("DROP POLICY IF EXISTS pol_system_settings_sede_isolation");
+      expect(sql).toContain("CREATE OR REPLACE FUNCTION public.next_invoice_number(p_sede_id uuid)");
+    });
+
+    it("mueve los datos adelante SIN pisar lo que ya está vigente", () => {
+      const sql = sql072();
+      // Los dos movimientos de datos (contador y topes) son `DO NOTHING`: una
+      // segunda corrida NO puede rebajar el contador ni pisar una configuración
+      // que el admin cambió después de aplicada la migración.
+      const movimientos =
+        sql.match(/INSERT INTO public\.system_settings[\s\S]*?ON CONFLICT \(key\) DO NOTHING;/g) ?? [];
+      // TRES: los dos movimientos de datos (contador y topes) y el
+      // `INSERT … DO NOTHING` de la función, que por lo mismo no puede rebajar
+      // un contador que ya avanzó.
+      expect(movimientos).toHaveLength(3);
+      expect(sql).not.toMatch(/ON CONFLICT \(key\) DO UPDATE/);
+      // Y la copia nunca ESCRIBE en las tablas viejas.
+      expect(sql).not.toMatch(/UPDATE\s+public\.invoice_sequences/i);
+      expect(sql).not.toMatch(/UPDATE\s+public\.voucher_settings/i);
+      expect(sql).not.toMatch(/DELETE\s+FROM/i);
+    });
+
+    it("NO borra las dos tablas viejas ni la columna: es la unidad que quita sede_id", () => {
+      const sql = sql072();
+      expect(sql).not.toMatch(/DROP TABLE/i);
+      expect(sql).not.toMatch(/DROP COLUMN/i);
+      expect(sql).not.toMatch(/ALTER TABLE public\.(invoice_sequences|voucher_settings)/i);
+      // Y el archivo lo dice, para que el orden de la serie no dependa de la
+      // memoria de quien lo lea.
+      expect(raw072()).toContain("NO borra `invoice_sequences` ni `voucher_settings`");
+      expect(raw072()).toContain("POR QUÉ `next_invoice_number` CONSERVA SU PARÁMETRO");
+    });
+
+    it("documenta las cinco claves y el valor por omisión de cada una, con su origen", () => {
+      const raw = raw072();
+      for (const clave of [
+        "invoice_sequence",
+        "voucher_max_per_day",
+        "voucher_max_per_week",
+        "voucher_per_day_limits",
+        "voucher_allowed_days",
+      ]) {
+        expect(sql072()).toContain(`'${clave}'`);
+        expect(raw).toContain(`'${clave}'`);
+      }
+      // Los cuatro valores por omisión de la sección 3 son los de las columnas
+      // que cada ajuste reemplaza, no una decisión nueva de la migración.
+      expect(raw).toContain('{"last_number": 0}');
+      expect(raw).toContain('{"amount": null}');
+      expect(raw).toContain('{"limits": {}}');
+      expect(raw).toContain('{"days": [1..7]}');
+      // Y el motivo de la forma: una fila por ajuste, no una fila por sede.
+      expect(raw).toContain("POR QUÉ CLAVE / VALOR Y NO UNA TABLA POR AJUSTE");
+    });
   });
 });
