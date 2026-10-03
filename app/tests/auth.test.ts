@@ -1268,7 +1268,7 @@ describe("auth: alta de usuario atómica (CL-15 / AUTH-04)", () => {
 
 describe("migración 054_identity_atomic.sql (CL-15)", () => {
   const sql = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "054_identity_atomic.sql"),
+    join(process.cwd(), "supabase", "schema-history", "054_identity_atomic.sql"),
     "utf8",
   );
 
@@ -1348,7 +1348,7 @@ describe("migración 054_identity_atomic.sql (CL-15)", () => {
 
 describe("migración 057_identity_password_cas.sql (CL-18)", () => {
   const sql = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "057_identity_password_cas.sql"),
+    join(process.cwd(), "supabase", "schema-history", "057_identity_password_cas.sql"),
     "utf8",
   );
 

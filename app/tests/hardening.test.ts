@@ -11,7 +11,7 @@ import {
 } from "@/src/shared/lib/rate-limit";
 
 function readMigration(name: string): string {
-  return readFileSync(join(process.cwd(), "supabase", "migrations", name), "utf8");
+  return readFileSync(join(process.cwd(), "supabase", "schema-history", name), "utf8");
 }
 
 describe("audit payload (T8, sin red)", () => {
@@ -231,7 +231,7 @@ describe("seed de aceptación §11 (T8)", () => {
    volver a abrir.
 
    Este bloque es esa imposibilidad. No lleva ninguna lista escrita a mano: deriva
-   el conjunto de tablas leyendo los `CREATE TABLE` de `supabase/migrations` y
+   el conjunto de tablas leyendo los `CREATE TABLE` de `supabase/schema-history` y
    exige que cada una tenga su `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` en
    algún punto de la serie. Una tabla creada mañana sin RLS hace caer la suite
    sola, y cae nombrando la tabla, no con un número de versión que haya que
@@ -256,13 +256,20 @@ describe("seed de aceptación §11 (T8)", () => {
       una tabla, y un `CREATE TABLE` real citado en un comentario no crea nada.
    ========================================================================== */
 
-const MIGRATIONS_DIR = join(process.cwd(), "supabase", "migrations");
+const MIGRATIONS_DIR = join(process.cwd(), "supabase", "schema-history");
 
 /**
  * TODOS los `.sql` del directorio, sin filtro de prefijo (ver punto 2 de la
- * cabecera). Hoy son los 75 de la serie más la 076; el día que la serie se
- * aplane en un único `001_orabella_schema.sql` seguirá siendo un archivo, y el
- * guardián ni se entera.
+ * cabecera). Son los 76 de la serie.
+ *
+ * POR QUÉ ESTE DIRECTORIO: la serie se aplanó en `supabase/migrations/001_orabella_schema.sql`
+ * y sus 76 archivos se movieron intactos a `supabase/schema-history`. Este
+ * guardián deriva el catálogo de tablas de la SERIE y su veredicto tiene que
+ * seguir siendo el mismo de antes —las mismas 36 tablas, el mismo veredicto
+ * sobre RLS—, así que lee el historial, donde los 76 siguen teniendo los mismos
+ * nombres. La prueba de que el archivo único esté completo la da el bloque del
+ * squash de más abajo, que sí lee `supabase/migrations`; leer el historial no
+ * exime al dump de nada, sólo deja de hacer que este barrido dependa de él.
  */
 const MIGRATION_FILES = readdirSync(MIGRATIONS_DIR)
   .filter((name) => name.endsWith(".sql"))
@@ -561,4 +568,166 @@ describe("RLS en toda tabla creada por la serie (fix-076)", () => {
     expect(new Set(collectRlsEnabledTables(archivoUnico))).toEqual(SERIES_RLS);
     expect(offendersIn([archivoUnico])).toEqual([]);
   }, MIGRATION_SCAN_TIMEOUT_MS);
+});
+
+/* ==========================================================================
+   Guardián del SQUASH: `001_orabella_schema.sql` es el artefacto vivo.
+
+   Los 76 archivos de la serie se movieron intactos a `supabase/schema-history`
+   —de ahí leen los guardiánes de arriba— y `supabase/migrations` quedó con UN
+   solo archivo, el volcado completo. Eso cambia quién manda: mientras la serie
+   fueron 76 archivos, el último que escribía una tabla era el que definía el
+   esquema y el RLS lo cubría migración por migración. Ahora el que manda es
+   este archivo, y no hay ningún guardián que lo proteja: nada impide que la
+   próxima migración se escriba en `migrations/`, que el squash vuelva a ser dos
+   archivos, o que un objeto se pierda al regenerarlo. Este bloque es esa
+   protección.
+
+   POR QUÉ AQUÍ Y NO EN `atomic-guards.test.ts`: los dos archivos hacen lo mismo
+   —leer SQL como TEXTO y derivar hechos del esquema— pero este bloque ya tiene
+   las dos piezas que un guardián del volcado necesita y que en el otro archivo
+   no están: el `stripSqlComments` que respeta los cuerpos dollar-quoted (sin él,
+   un `CREATE TABLE` en prosa dentro de una función contaría como tabla) y el
+   bloque de RLS, que es el guardián estructural de la serie y el que primero
+   va a pedir cuenta de cualquier tabla que este archivo deje de declarar.
+
+   QUÉ NO HACE: no vuelve a derivar el catálogo de tablas. Eso ya lo hace el
+   guardián de RLS de arriba sobre la serie, y el inventario sale IDÉNTICO. Aquí
+   se mira el volcado por lo que es —un artefacto único, contable y cerrado—.
+   ========================================================================== */
+
+/** El directorio vivo: el que se aplica a una base nueva. */
+const SQUASH_DIR = join(process.cwd(), "supabase", "migrations");
+const SQUASH_NAME = "001_orabella_schema.sql";
+const SQUASH_SQL = readFileSync(join(SQUASH_DIR, SQUASH_NAME), "utf8");
+
+/**
+ * El volcado como ESQUEMA, sin prosa.
+ *
+ * Son dos filtros, y el segundo es el que importa aquí. El primero borra `--` y
+ * `/* ... *\/` con el `stripSqlComments` de arriba (respetando los cuerpos
+ * `$$`). El segundo borra los `COMMENT ON`: en un volcado de `pg_dump` la
+ * documentación viaja como sentencias `COMMENT ON`, no como comentarios de
+ * fuente, así que el filtro anterior NO las ve — y son las que citan el
+ * `employees.sede_id` que la 077 borró. Contarlas como código daría por vivo un
+ * objeto que ya no existe.
+ *
+ * La forma del volcado es la de `pg_dump`: una sentencia por línea, y las 139
+ * `COMMENT ON` terminan en `';` al fin de línea. Por eso el filtro es anclado a
+ * la línea completa y no un barrido hasta el primer `;`: 60 de esas 139 prosa
+ * llevan un `;` ADENTRO del texto y el barrido las cortaría por la mitad,
+ * dejando prosa suelta en el medio del SQL.
+ */
+function squashSchemaSql(): string {
+  return stripSqlComments(SQUASH_SQL).replace(/^COMMENT ON[^\n]*$/gm, "");
+}
+
+/** Las tablas que declaran una columna `sede_id`, leída de su propio `CREATE TABLE`. */
+function tablasConColumnaSede(sql: string): string[] {
+  const conSede: string[] = [];
+  for (const bloque of sql.matchAll(
+    /CREATE TABLE (?:IF NOT EXISTS )?public\.([a-z0-9_]+) \(([\s\S]*?)\n\);/g,
+  )) {
+    const declaraSede = bloque[2]
+      .split("\n")
+      .some((linea) => /^\s*sede_id\b/.test(linea));
+    if (declaraSede) conSede.push(`public.${bloque[1]}`);
+  }
+  return conSede.sort();
+}
+
+describe("el squash: `001_orabella_schema.sql` es el archivo vivo (squash de la serie)", () => {
+  it("es el ÚNICO archivo de migración que queda, y el directorio no tiene un segundo", () => {
+    // El patrón de nombre es el de la serie: `0NN_nombre.sql`. Con el squash
+    // aplicado tiene que quedar UNO, y ese es el que se aplica a una base nueva.
+    //
+    // AGREGAR UNA MIGRACIÓN NUEVA EXIGE ACTUALIZAR ESTA PRUEBA. Si algún día
+    // aparece un `002_lo_que_sea.sql` en `supabase/migrations`, esta cuenta va a
+    // decir 2 y va a CAER, y que caiga es lo que se quiere: la serie ya no es
+    // un archivo y hay que decidir a mano qué se hace con ella —volver a
+    // aplastar en el archivo único, o dejar de leer el historial y apuntar los
+    // guardiánes de arriba al squash—, no dejar que un segundo archivo se cuele
+    // en silencio. El número es la decisión, no un número que se actualiza solo.
+    const porNombre = readdirSync(SQUASH_DIR)
+      .filter((nombre) => /^0\d\d_.*\.sql$/.test(nombre))
+      .sort();
+    expect(porNombre).toEqual([SQUASH_NAME]);
+  });
+
+  it("el archivo declara las 36 tablas y las 10 políticas de la serie, sin prosa de más", () => {
+    // Los conteos son de DECLARACIONES sobre el SQL sin comentarios ni
+    // `COMMENT ON`: 36 `CREATE TABLE public.` y 10 `CREATE POLICY`. Salen del
+    // volcado, no de una lista escrita a mano, y son los números que el guardián
+    // de RLS de arriba ya conoce sobre la serie: si el squash dejara de declarar
+    // una tabla, esta prueba se cuelga antes de que nadie mire el archivo.
+    const sql = squashSchemaSql();
+    expect(sql.match(/CREATE TABLE public\./g)).toHaveLength(36);
+    expect(sql.match(/\bCREATE POLICY\b/g)).toHaveLength(10);
+  });
+
+  it("`sede_id` es columna sólo de `public.users`", () => {
+    // 077 quitó la columna de sede de todas las tablas menos `users`, que la
+    // conserva como el anclaje de la cuenta a la instalación de una sola sede.
+    // La derivación es por contenido —cada `CREATE TABLE` y sus líneas— para que
+    // la lista siga siendo la que el archivo declara y no la que alguien
+    // recuerda. Una tabla con la columna de vuelta aparece sola en el fallo.
+    expect(tablasConColumnaSede(squashSchemaSql())).toEqual(["public.users"]);
+  });
+
+  it("`payroll_apply_atomic` se declara una sola vez, y con los cuatro argumentos de la serie", () => {
+    // Una segunda declaración del mismo nombre con otra firma es la forma
+    // silenciosa de romper el `POST /rest/v1/rpc/payroll_apply_atomic`: el
+    // cliente manda cuatro argumentos y la base cobra la otra. Se cuentan las
+    // DECLARACIONES (`CREATE FUNCTION`), no las menciones: el `COMMENT ON`, el
+    // `REVOKE` y el `GRANT` nombran la función sin declararla, y están fuera
+    // del conteo a propósito.
+    const declaraciones = [
+      ...squashSchemaSql().matchAll(/CREATE FUNCTION public\.payroll_apply_atomic\s*\(([^)]*)\)/g),
+    ];
+    expect(declaraciones).toHaveLength(1);
+    // Los cuatro, en orden. El cuarto lleva su `DEFAULT`: es el que hace que el
+    // cliente pueda mandar tres y que la 047 siga siendo la que se aplica.
+    expect(declaraciones[0][1].split(",").map((argumento) => argumento.trim())).toEqual([
+      "p_period_id uuid",
+      "p_items jsonb",
+      "p_voucher_ids uuid[]",
+      "p_carry_ids uuid[] DEFAULT '{}'::uuid[]",
+    ]);
+  });
+
+  it("`next_invoice_number` se declara sin argumentos", () => {
+    // 072 lo dejó sin parámetros porque la fila del contador es la clave
+    // `invoice_sequence` de `system_settings`: no hay de qué elegir. Un
+    // `p_sede_id uuid` de vuelta aquí haría que la llamada sin argumentos
+    // fallara contra la base, así que la firma se mira con su lista de
+    // argumentos VACÍA y no por coincidencia de texto.
+    const declaraciones = [
+      ...squashSchemaSql().matchAll(
+        /CREATE FUNCTION public\.next_invoice_number\s*\(([^)]*)\)\s*RETURNS\s+(\w+)/g,
+      ),
+    ];
+    expect(declaraciones).toHaveLength(1);
+    expect(declaraciones[0][1].trim()).toBe("");
+    expect(declaraciones[0][2]).toBe("integer");
+  });
+
+  it("no queda ninguna referencia a `employees.sede_id` fuera de comentarios", () => {
+    // La columna no existe desde 077: `upsert_employee_atomic` no la escribe ni
+    // la exige. Cualquier `employees.sede_id` que sobreviva en el SQL —una
+    // condición, un `INSERT`, un índice— es código roto contra el catálogo, y
+    // el error sólo aparece en producción, cuando alguien guarda un empleado.
+    expect(squashSchemaSql()).not.toMatch(/employees\s*\.\s*sede_id/);
+
+    // CONTROL del guardián: el texto SÍ está en el archivo, dos veces, y las dos
+    // en prosa —una línea `--` y un `COMMENT ON`. Sin esta prueba, la de arriba
+    // podría estar en verde porque el objeto se renombró o porque el filtro
+    // borró el archivo entero; en verde tiene que significar UNA cosa: la
+    // referencia es solo comentario.
+    const menciones = SQUASH_SQL.match(/employees\.sede_id/g) ?? [];
+    expect(menciones).toHaveLength(2);
+    for (const linea of SQUASH_SQL.split("\n").filter((una) => una.includes("employees.sede_id"))) {
+      const esComentario = linea.trimStart().startsWith("--") || linea.startsWith("COMMENT ON");
+      expect(esComentario, linea.slice(0, 60)).toBe(true);
+    }
+  });
 });

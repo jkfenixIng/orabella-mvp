@@ -22,13 +22,22 @@ import { describe, expect, it } from "vitest";
        INSERT ...;                                       -- la ESCRITURA
        GET DIAGNOSTICS v_escritos = ROW_COUNT;           -- mide la ESCRITURA
 
-   Este test lee los `0*.sql` de `supabase/migrations` como TEXTO y falla si
+   Este test lee los `0*.sql` de `supabase/schema-history` como TEXTO y falla si
    encuentra la forma invertida en cualquier guarda. Ningún valor está
    hardcodeado: los archivos se leen del disco. No se habla con la base.
+
+   POR QUÉ `schema-history` Y NO `migrations`: el squash de la serie dejó
+   `supabase/migrations` con un único archivo (`001_orabella_schema.sql`), y los
+   76 archivos de la serie se movieron intactos a `supabase/schema-history`. Este
+   guardián está escrito sobre la SERIE —busca el defecto que la 060 corrige,
+   archivo por archivo—, así que lee el historial: es donde los 76 siguen
+   teniendo los mismos nombres, y el barrido mide exactamente lo que medía.
+   La guarda de que el archivo único siga siendo el único la lleva el bloque
+   del squash en `hardening.test.ts`, que sí mira `supabase/migrations`.
    -------------------------------------------------------------------------- */
 
 const APP_ROOT = process.cwd();
-const MIGRATIONS_DIR = join(APP_ROOT, "supabase", "migrations");
+const MIGRATIONS_DIR = join(APP_ROOT, "supabase", "schema-history");
 const DIAGNOSTICS_PATH = join(APP_ROOT, "supabase", "diagnostics", "migraciones_faltantes.sql");
 
 /** El SQL sin comentarios: la detección mira sentencias, no prosa ni marcadores. */
@@ -71,7 +80,7 @@ const MIGRATION_NAMES = readdirSync(MIGRATIONS_DIR).filter((f) => /^0\d\d_.*\.sq
 /**
  * Margen para las pruebas que LEEN el disco.
  *
- * Estas pruebas abren los 69 archivos de `supabase/migrations` de forma
+ * Estas pruebas abren los 76 archivos de `supabase/schema-history` de forma
  * síncrona. El guardián es rápido: la prueba más pesada mide 16 ms con la máquina
  * descargada y ~47 ms con el dev cargado, y el mismo recorrido sobre los 69
  * archivos, medido por fuera, da ~2 ms. El límite por defecto de vitest (5000 ms

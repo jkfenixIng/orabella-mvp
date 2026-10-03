@@ -296,7 +296,7 @@ describe("inventory: planStockDeduction descuenta la venta (B1/FAC-06)", () => {
 });
 
 describe("migración 004_inventory.sql (T4)", () => {
-  const sql = readFileSync(join(process.cwd(), "supabase", "migrations", "004_inventory.sql"), "utf8");
+  const sql = readFileSync(join(process.cwd(), "supabase", "schema-history", "004_inventory.sql"), "utf8");
 
   it("crea products e inventory_movements con triggers set_updated_at en products", () => {
     expect(sql).toContain("CREATE TABLE public.products");
@@ -334,7 +334,7 @@ describe("migración 004_inventory.sql (T4)", () => {
 });
 
 describe("migración 027_products_commission.sql (I1)", () => {
-  const sql = readFileSync(join(process.cwd(), "supabase", "migrations", "027_products_commission.sql"), "utf8");
+  const sql = readFileSync(join(process.cwd(), "supabase", "schema-history", "027_products_commission.sql"), "utf8");
 
   it("agrega commission_value nullable re-ejecutable con CHECK no negativo", () => {
     expect(sql).toContain("ADD COLUMN IF NOT EXISTS commission_value numeric(12, 2) NULL");
@@ -950,7 +950,7 @@ describe("inventory: el movimiento manual reintentado no mueve el stock dos vece
 
 describe("migración 045_inventory_movement_idempotency.sql (CL-6)", () => {
   const raw = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "045_inventory_movement_idempotency.sql"),
+    join(process.cwd(), "supabase", "schema-history", "045_inventory_movement_idempotency.sql"),
     "utf8",
   );
   // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
@@ -1175,7 +1175,7 @@ describe("inventory: el descuento multi-producto es todo-o-nada (CL-7)", () => {
 
 describe("migración 046_stock_deduction_atomicity.sql (CL-7)", () => {
   const raw = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "046_stock_deduction_atomicity.sql"),
+    join(process.cwd(), "supabase", "schema-history", "046_stock_deduction_atomicity.sql"),
     "utf8",
   );
   // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
@@ -1435,7 +1435,7 @@ describe("inventory: el stock mínimo del producto sólo acepta dígitos (guarda
 // ---------------------------------------------------------------------------
 
 describe("migración 071_rpc_single_sede.sql (stock)", () => {
-  const path = join(process.cwd(), "supabase", "migrations", "071_rpc_single_sede.sql");
+  const path = join(process.cwd(), "supabase", "schema-history", "071_rpc_single_sede.sql");
   const raw = readFileSync(path, "utf8").replace(/\r\n/g, "\n");
   // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
   const sql = raw

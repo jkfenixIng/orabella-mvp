@@ -602,7 +602,7 @@ describe("commissions: el pago inmediato solo ofrece comisiones (no el % del emp
 
 describe("migración 034: tope del pago inmediato de comisión", () => {
   const sql = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "034_commission_payout_cap.sql"),
+    join(process.cwd(), "supabase", "schema-history", "034_commission_payout_cap.sql"),
     "utf8",
   );
   /** Cuerpo del trigger: lo EJECUTABLE, sin el encabezado que lo explica. */
@@ -1642,7 +1642,7 @@ describe("commissions: CL-5 el pago inmediato reintentado no paga la comisión d
 
   it("la migración 044 deja la marca con un índice único PARCIAL y no reescribe filas", () => {
     const raw = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "044_remaining_payment_idempotency.sql"),
+      join(process.cwd(), "supabase", "schema-history", "044_remaining_payment_idempotency.sql"),
       "utf8",
     );
     // La prosa explica lo que el archivo NO hace y nombra esas sentencias; las
@@ -2018,7 +2018,7 @@ function revisar075(fuente: string): string[] {
 
 describe("migración 075: la clave de la regla de comisión es de instalación", () => {
   const raw = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "075_commission_rule_install_key.sql"),
+    join(process.cwd(), "supabase", "schema-history", "075_commission_rule_install_key.sql"),
     "utf8",
   );
   const sql = sqlSinComentarios(raw);

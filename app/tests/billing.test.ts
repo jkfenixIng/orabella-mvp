@@ -444,7 +444,7 @@ describe("billing: consecutivo sin huecos bajo concurrencia (FAC-05)", () => {
 // ------------------------------------------------- migración 005 ---
 
 describe("migración 005_billing.sql (T5)", () => {
-  const sql = readFileSync(join(process.cwd(), "supabase", "migrations", "005_billing.sql"), "utf8");
+  const sql = readFileSync(join(process.cwd(), "supabase", "schema-history", "005_billing.sql"), "utf8");
 
   it("crea secuencias, facturas, ítems, impuestos y porciones", () => {
     expect(sql).toContain("CREATE TABLE public.invoice_sequences");
@@ -5784,7 +5784,7 @@ describe("billing: la emisión repetida no emite dos veces (MO-1)", () => {
 
   it("la migración 041 guarda la marca con un índice único PARCIAL y no reescribe filas", () => {
     const raw = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "041_invoice_idempotency.sql"),
+      join(process.cwd(), "supabase", "schema-history", "041_invoice_idempotency.sql"),
       "utf8",
     );
     // La prosa explica justamente lo que NO hace el archivo y nombra esas
@@ -6765,7 +6765,7 @@ describe("billing: CL-11 el diff del servicio vive en el bloque de persistencia"
       "edit_version",
     ]);
     const sql = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "050_billing_state_atomic.sql"),
+      join(process.cwd(), "supabase", "schema-history", "050_billing_state_atomic.sql"),
       "utf8",
     );
     for (const column of columns) expect(sql, column).toContain(`'${column}'`);
@@ -6794,7 +6794,7 @@ describe("billing: CL-11 el diff del servicio vive en el bloque de persistencia"
 
 describe("migración 056_collection_closes_invoice.sql (CL-17)", () => {
   const raw = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "056_collection_closes_invoice.sql"),
+    join(process.cwd(), "supabase", "schema-history", "056_collection_closes_invoice.sql"),
     "utf8",
   );
   const sql = raw
@@ -6866,7 +6866,7 @@ describe("migración 056_collection_closes_invoice.sql (CL-17)", () => {
 
 describe("migración 050_billing_state_atomic.sql (CL-11)", () => {
   const raw = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "050_billing_state_atomic.sql"),
+    join(process.cwd(), "supabase", "schema-history", "050_billing_state_atomic.sql"),
     "utf8",
   );
   // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
@@ -7161,7 +7161,7 @@ describe("billing: CL-12 el diff del servicio vive en el bloque de persistencia"
 
 describe("migración 051_invoice_edit_atomic.sql (CL-12)", () => {
   const raw = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "051_invoice_edit_atomic.sql"),
+    join(process.cwd(), "supabase", "schema-history", "051_invoice_edit_atomic.sql"),
     "utf8",
   ).replace(/\r\n/g, "\n");
   // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
@@ -7581,7 +7581,7 @@ describe("billing: CL-13 la emisión vive en UNA transacción", () => {
 
 describe("migración 052_invoice_create_atomic.sql (CL-13)", () => {
   const raw = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "052_invoice_create_atomic.sql"),
+    join(process.cwd(), "supabase", "schema-history", "052_invoice_create_atomic.sql"),
     "utf8",
   ).replace(/\r\n/g, "\n");
   // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
@@ -8044,7 +8044,7 @@ describe("invoices-client: cada campo numérico pasa por su máscara (guarda de 
 // ---------------------------------------------------------------------------
 
 describe("migración 071_rpc_single_sede.sql (facturación)", () => {
-  const path = join(process.cwd(), "supabase", "migrations", "071_rpc_single_sede.sql");
+  const path = join(process.cwd(), "supabase", "schema-history", "071_rpc_single_sede.sql");
   const raw = readFileSync(path, "utf8").replace(/\r\n/g, "\n");
   // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
   const sql = raw
@@ -8204,7 +8204,7 @@ describe("migración 071_rpc_single_sede.sql (facturación)", () => {
 // ---------------------------------------------------------------------------
 
 describe("migración 072_system_settings.sql (consecutivo de factura)", () => {
-  const path = join(process.cwd(), "supabase", "migrations", "072_system_settings.sql");
+  const path = join(process.cwd(), "supabase", "schema-history", "072_system_settings.sql");
   const raw = readFileSync(path, "utf8").replace(/\r\n/g, "\n");
   const sql = raw
     .split("\n")
@@ -8285,7 +8285,7 @@ describe("migración 072_system_settings.sql (consecutivo de factura)", () => {
     // función: la llamada y la declaración siguen coincidiendo, que es lo que
     // hace que un despliegue no falle por una sobrecarga vieja.
     const previous = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "071_rpc_single_sede.sql"),
+      join(process.cwd(), "supabase", "schema-history", "071_rpc_single_sede.sql"),
       "utf8",
     ).replace(/\r\n/g, "\n");
     expect(previous).toContain("public.next_invoice_number(v_sede)");
