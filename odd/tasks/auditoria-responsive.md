@@ -282,6 +282,42 @@ decisión de densidad de toda la aplicación, no un defecto de ancho.
 **R7 — CONFIRMADA**: gutter 0 a 320/360/390 — y **también a 1024** en el diálogo de emisión (`p-0`,
 1024 de ancho, gutter 0 en los dos lados).
 
+## El defecto que la medición no podía ver (R38)
+
+**Lo encontró el ojo del dueño, no un instrumento.** En facturación, a 412×924 —y en cualquiera de
+los tres anchos que se midieron, porque 412 también queda por debajo de `sm`— la lista **no muestra
+una tabla con scroll: muestra nueve valores apilados sin una sola etiqueta**.
+
+El encabezado que nombra cada columna es `hidden … sm:grid` (`invoices-client.tsx:1936`) y cada fila
+es `flex flex-col … sm:grid` (`:1952`). Resultado: `#12`, `03/10 16:41`, `Carolina Rojas`, `—`, `—`,
+`Carolina Rojas`, `$120.000`, `Pagada` y los botones, **en ese orden y sin decir qué es cada cosa**. ¿La
+primera fecha es la de emisión o la de cierre? ¿El primer nombre es la vendedora o la que cerró?
+
+**Es el opuesto exacto del «arrumado» que el dueño describió, y es peor**: apilar no es el problema —es
+lo que el contrato pide— pero apilar **sin etiquetas** deja la data ilegible. La fila ya está 80 %
+construida: sólo le faltan los pares etiqueta/valor.
+
+### Por qué la auditoría no lo vio
+
+Los instrumentos de medición de todo el día fueron **geometría**: desborde, controles tapados
+(`elementFromPoint`), recortes, blancos táctiles. Este defecto **no produce ninguna de esas cuatro
+cosas**: no hay desborde (¡apila en vez de desbordar!), ningún control queda tapado, nada se recorta
+y los blancos están bien. Las 100+ capturas que se tomaron **incluyen** este estado y nadie las miró
+como las mira una persona. La lección: **una métrica mide lo que mide; la legibilidad de la data
+necesita su propio criterio**, y el criterio del dueño («cómo se ve la data») es el que lo trajo.
+
+### Lo que cambia en el plan
+
+1. **Facturas deja de ser «convertir a tarjeta» y pasa a ser «terminar la tarjeta que ya es»**: agregar
+   el par etiqueta/valor a cada campo apilado, con la etiqueta visible sólo por debajo de `sm` (arriba
+   el encabezado ya las nombra).
+2. **Facturas es la REFERENCIA, no el caso raro**: es la única lista de la app que ya apila (las otras
+   seis son `<table>` con scroll), así que la pieza reusable sale de terminar ésta y no de inventarla.
+3. **Un criterio de aceptación nuevo, verificable**: cada valor apilado tiene su etiqueta visible por
+   debajo de `sm`. Se puede afirmar en un test sobre el marcado, así que deja de depender del ojo.
+4. **Las otras seis listas** (caja, vales, admin, inventario, servicios, nómina) siguen el camino
+   conocido: hoy son tablas con carril y scroll, y van encadenadas después.
+
 ## Tasks
 
 El orden no es por severidad aislada: **el contrato de data va antes que los arreglos de acciones de
@@ -300,8 +336,11 @@ hacerlo como tarjeta sería pagar dos veces las mismas pantallas.
 - [ ] **R-e — el contrato de presentación de data**: corregir el estándar (§5 y §12 hoy declaran el
       scroll como deuda consciente), construir **una sola vez** las piezas reusables (tarjeta de fila,
       carril con la acción pegada, prioridad de columnas, tokens de alto de fila) y estrenarlas en la
-      **primera lista**: facturas. El test que hoy exige `min-w-[Npx]` dentro del primitivo se
-      actualiza junto con el estándar, no después.
+      **primera lista**: facturas — que no es «convertir a tarjeta» sino **terminar la tarjeta que ya
+      es** (R38: agrega el par etiqueta/valor a cada campo apilado, con la etiqueta visible sólo por
+      debajo de `sm`). El test que hoy exige `min-w-[Npx]` dentro del primitivo se actualiza junto con el
+      estándar, no después, y se agrega el criterio verificable de que **ningún valor apilado queda sin
+      etiqueta**.
 - [ ] **R-e2 — las otras dos listas de mostrador**: vales y caja, con las piezas de R-e ya construidas
       (que es lo que hace que las tres se vean igual).
 - [ ] **R-b — los diálogos que no dejan operar**: el de emisión de factura (R33: **870 px dentro de un
