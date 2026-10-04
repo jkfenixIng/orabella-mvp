@@ -5539,13 +5539,67 @@ describe("payroll-client: el diálogo de apertura DERIVADO (F10, guarda de fuent
     expect(client).toContain("setOpenTarget(entry);");
     expect(client).toContain("setOpenTarget(pendingSettlements[0] ?? null);");
     expect(client).toContain("onClick={() => openPendingSettlement(entry)}");
-    expect(client).toContain("No hay ciclos cerrados sin liquidar en esta sede: no hay período que abrir.");
+    expect(client).toContain("No hay ciclos cerrados sin liquidar: no hay período que abrir.");
     // Confirmar no elige nada: el botón se bloquea sin ciclo pendiente elegido.
     expect(client).toContain("disabled={busy || openTarget === null}");
     // El diálogo NO puede abrir un rango que no salga de un ciclo pendiente.
     const open = dialog();
     expect(open).toContain("pendingSettlements.map((entry) => (");
     expect(open).not.toContain("openResolution.start_date =");
+  });
+
+  it("D3: el vacío del diálogo nombra la CAUSA, con la misma condición del servicio", () => {
+    // El vacío que existe para «ya liquidé todo» se estaba usando para un caso
+    // que no es ese: sin `payroll_start_date` y sin períodos, `pendingPayrollSettlements`
+    // devuelve `[]` por la regla 4 de F10 (sin períodos y sin fecha de arranque no
+    // hay historia) y la causa real es la CONFIGURACIÓN ausente, que se escribe
+    // en /plataforma. La condición es la MISMA del servicio (`listPayrollOverview`,
+    // service.ts:1366): `periods.length === 0 && payrollStartDate === null`.
+    const derivada = client.match(
+      /const vacioPorFechaDeArranque = periods\.length === 0 && payrollStartDate === null;/,
+    );
+    expect(derivada, "la condición derivada del vacío").not.toBeNull();
+
+    const open = dialog();
+    // El texto del marcado está partido por el ajuste de línea del JSX: las
+    // cadenas se comparan sobre el marcado con los espacios normalizados.
+    const plano = (texto: string): string => texto.replace(/\s+/g, " ");
+    // 1) Sin fecha de arranque y sin períodos: falta configurarla, y se dice dónde.
+    expect(open).toContain("vacioPorFechaDeArranque");
+    expect(open).toMatch(
+      /Son DOS vacíos[\s\S]*?vacioPorFechaDeArranque \? \([\s\S]*?fecha de inicio de la nómina[\s\S]*?\/plataforma/,
+    );
+    expect(plano(open)).toContain(
+      "La fecha de inicio de la nómina todavía no está configurada: se configura en /plataforma.",
+    );
+    // 2) Con la fecha configurada, el vacío es el de verdad, y SIN «en esta sede»:
+    //    la instalación es de una sola sede (M1–M3c) y ese alcance ya no existe.
+    expect(plano(open)).toContain(
+      "No hay ciclos cerrados sin liquidar: no hay período que abrir. Cuando un ciclo cierre sin su liquidación aparecerá en el aviso de la pantalla, y desde ahí se abre.",
+    );
+    expect(open).not.toContain("en esta sede");
+
+    // Y la guarda del envío dice lo MISMO, para que el diálogo y su envío no se
+    // contradigan: misma condición, misma rama.
+    const submit = client.slice(
+      client.indexOf("async function handleOpen"),
+      client.indexOf("function closeOpenDialog"),
+    );
+    expect(submit).toContain("if (openTarget === null) {");
+    expect(submit).toMatch(
+      /if \(openTarget === null\) \{\s*setOpenError\(\s*vacioPorFechaDeArranque\s*\?\s*"La fecha de inicio de la nómina todavía no está configurada: se configura en \/plataforma\."\s*:\s*"No hay ciclos cerrados sin liquidar: no hay período que abrir\.",\s*\);/,
+    );
+    expect(submit).not.toContain("en esta sede");
+
+    // CONTROL NEGATIVO: el texto VIEJO nombraba la sede y culpaba a los ciclos,
+    // así que estas aserciones discriminan y no son un sello de goma.
+    const viejo =
+      "No hay ciclos cerrados sin liquidar en esta sede: no hay período que abrir.";
+    expect(viejo).toContain("en esta sede");
+    expect(viejo.replace(" en esta sede", "")).toBe(
+      "No hay ciclos cerrados sin liquidar: no hay período que abrir.",
+    );
+    expect(viejo).not.toContain("/plataforma");
   });
 
   it("F9/F10: el envío bloquea con la regla de LIQUIDACIÓN y la de la FECHA de arranque", () => {

@@ -1210,6 +1210,19 @@ export function PayrollClient(props: PayrollClientProps) {
   // diálogo necesitan.
   const [payrollStartDate] = useState<string | null>(props.initialPayrollStartDate);
 
+  /**
+   * D3: por qué el aviso de pendientes está vacío. Es la MISMA condición que
+   * aplica el servidor en `listPayrollOverview` (F9 regla 4 + F10): sin períodos
+   * y SIN fecha de arranque no hay historia de la que recorrer ciclos, así que la
+   * causa no es «no hay ciclos» sino que la CONFIGURACIÓN falta, y esa fecha la
+   * escribe la plataforma (`/plataforma`), no la nómina. Con la fecha puesta el
+   * vacío es el de verdad —todo está liquidado— y el mismo rótulo serviría.
+   *
+   * Un solo derivado para el aviso, el vacío del diálogo y la guarda del envío:
+   * así los tres dicen lo mismo y no pueden contradecirse.
+   */
+  const vacioPorFechaDeArranque = periods.length === 0 && payrollStartDate === null;
+
   // F10: abrir un período NO se pregunta. La única entrada al diálogo es el
   // aviso de ciclos pendientes: su ciclo queda ELEGIDO y el rango se DERIVA de
   // la fecha de arranque de la sede. `openTarget` es ese ciclo pendiente.
@@ -1484,7 +1497,11 @@ export function PayrollClient(props: PayrollClientProps) {
   async function handleOpen(event: FormEvent) {
     event.preventDefault();
     if (openTarget === null) {
-      setOpenError("No hay ciclos cerrados sin liquidar: no hay período que abrir.");
+      setOpenError(
+        vacioPorFechaDeArranque
+          ? "La fecha de inicio de la nómina todavía no está configurada: se configura en /plataforma."
+          : "No hay ciclos cerrados sin liquidar: no hay período que abrir.",
+      );
       return;
     }
     if (!startDate || !endDate) {
@@ -2762,11 +2779,24 @@ export function PayrollClient(props: PayrollClientProps) {
                 // nunca anunció nada. Sin ciclos cerrados sin liquidar no hay rango
                 // que elegir —ni período que abrir—, así que el diálogo no ofrece
                 // ninguna opción libre.
-                <p className="text-sm text-text-secondary">
-                  No hay ciclos cerrados sin liquidar en esta sede: no hay período que abrir.
-                  Cuando un ciclo cierre sin su liquidación aparecerá en el aviso de la pantalla, y
-                  desde ahí se abre.
-                </p>
+                // Son DOS vacíos y NO son el mismo: sin fecha de arranque
+                // configurada y sin períodos, la lista está vacía porque FALTA LA
+                // CONFIGURACIÓN (no hay piso desde el cual calcular un ciclo), y
+                // decirlo como «no hay ciclos» escondería la causa y el lugar donde
+                // se arregla. La condición es la del servidor, no una regla nueva.
+                vacioPorFechaDeArranque ? (
+                  <p className="text-sm text-text-secondary">
+                    La fecha de inicio de la nómina todavía no está configurada: se configura en
+                    /plataforma. Sin ella no hay un punto de partida desde el cual calcular un
+                    ciclo, así que todavía no hay períodos que liquidar.
+                  </p>
+                ) : (
+                  <p className="text-sm text-text-secondary">
+                    No hay ciclos cerrados sin liquidar: no hay período que abrir. Cuando un ciclo
+                    cierre sin su liquidación aparecerá en el aviso de la pantalla, y desde ahí se
+                    abre.
+                  </p>
+                )
               ) : (
                 <fieldset className="flex flex-col gap-2">
                   <legend className={labelClass}>
