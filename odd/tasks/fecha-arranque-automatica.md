@@ -113,25 +113,126 @@ deuda, porque borrarlos hoy obliga a regenerar el archivo único y resetear las 
 
 ## Verification evidence
 
-Pendiente de la ejecución.
+**Test-first, con el rojo observado antes de tocar el código**: `npx vitest run tests/payroll.test.ts`
+dio **31 fallas sobre 487 pasando** (13 de U9, 12 de U10, 6 de U11) — «sin períodos no hay piso:
+oofrece los últimos ciclos cerrados», «sin períodos y sin fecha declarada NO hay primer período: el
+piso nace mudo», «el piso se DERIVA de los períodos: la columna de la 068 ya no se lee», «el PRIMER
+período se abre RECORTADO a la fecha declarada», «la fecha declarada sólo se acepta en la PRIMERA
+liquidación». Después del cambio: **496 de 496** en el archivo.
+
+**El cambio destapó cinco pruebas que ya existían** y que el nuevo flujo dejó al descubierto
+(F7 persistencia de rango, PR1 «compartir un día», la carrera 23P01, la lectura recortada y la vista
+F9): se repuntaron con la fecha declarada del primer período o con un período ancla, **ninguna se
+borró**.
+
+| Comando | Resultado real |
+| --- | --- |
+| `npx vitest run tests/payroll.test.ts` | **496 passed / 496** (antes 487) |
+| `npm test` | **1978 passed** en 37 archivos (antes 1969; **+9**, ninguna eliminada) |
+| `npm run typecheck` | sin salida |
+| `npx eslint` (6 archivos tocados) | exit 0, 0 problemas |
+
+**Verificación independiente: CONFIRMADA, y el riesgo se revisó aserción por aserción.** El temor de
+una unidad así no es que los tests pasen: es que una de las 31 aserciones repuntadas se haya
+**aflojado** para que pasaran. El verificador comparó los nombres de todos los `it()` entre `HEAD` y el
+árbol de trabajo: 19 con sucesor semántico claro, 11 nuevas, **ninguna borrada**, y **ningún test
+pasando por una razón distinta**. La única relajación real es la que el cambio exige —el diálogo *ahora
+sí* tiene un campo de fecha, así que la guarda que exigía «ningún input de fecha» pasó a exigir que ese
+input sea **el declarado y acotado al ciclo**— y está compensada con aserciones positivas más fuertes.
+Y encontró algo que vale: el «CONTROL NEGATIVO» viejo era **una tautología** —afirmaba propiedades de
+un literal definido en el propio test, sin tocar el código—, así que se retiró y se reemplazó por
+aserciones reales (que el diálogo no nombre `/plataforma`).
+
+Los cinco comportamientos se confirmaron leyendo el código y corriendo los tests, no la descripción:
+el aviso sin piso ofrece los últimos ciclos por cadencia (tope 3); la fecha es obligatoria sin períodos
+**y por ninguna vía se puede crear el primer período sin ella** (la acción y la ruta REST desembocan en
+la misma validación); el recorte y la prorrata son los de F5 sobre el rango **almacenado**; con
+períodos el piso es el mínimo y la fecha declarada se rechaza; y un período nuevo no puede empezar
+antes del piso. Las siete afirmaciones del diseño se verificaron una por una (seis confirmadas, una
+parcial: ver el punto 1 de abajo). El contrato de la columna también: **fuera de
+`src/features/platform/**` no queda ni una lectura ni una escritura de `sedes.payroll_start_date`**. Y
+el gate se reprodujo exacto: 496 en nómina, 1978 en 37 archivos, typecheck y eslint limpios.
+
+### Follow-ups que trajo la verificación
+
+1. **`getPayrollStartDateAction` es código muerto**: no la consume nada de producción, sólo un test la
+   llama. U12 —que retira la capa de plataforma— es su lugar.
+2. **Mensaje duplicado en el cliente** (`payroll-client.tsx:1534`): la guarda en vivo
+   `isRangeBeforePayrollStart` repite el texto del rechazo en vez de usar
+   `openPayrollRejectionMessage`. **Hoy es inalcanzable** (el validador rechazó antes), pero es una
+   segunda copia que puede divergir. Es lo que el writer dio por centralizado y **no lo estaba del
+   todo**: la única afirmación que la verificación dejó en parcial.
+3. **La etiqueta «días del ciclo» es imprecisa para quincenal y mensual**: la prorrata usa el ciclo
+   **comercial** (7/15/30) mientras el ciclo cerrado es de **calendario** (7/14/28). Es comportamiento
+   preexistente de F5, no introducido acá, pero el texto queda flojo.
+4. **Inventario incompleto de la copia del flujo de nómina**: quedan **8** cadenas «de esta sede»
+   (`service.ts:780,798,824,834,2398,2568,3654` y `payroll-client.tsx:2312`). Fuera del alcance de esta
+   unidad por decisión, pero **tienen que estar en la lista de U15**.
+5. **Documentación que quedó vieja**: `admin/service.ts:694,717` y `payroll/README.md:638` siguen
+   citando la firma vieja `getPayrollStartDate(sedeId)`.
+6. **`openPayrollPeriod` conserva `sedeId`** sólo porque la ruta REST lo pasa; cuando esa superficie se
+   toque, el parámetro se cae.
+7. **Un desacuerdo preexistente** entre el aviso y el diálogo en el caso `not-first-cycle` con un tope
+   elevado: el aviso ofrece un ciclo que contiene el piso para una cadencia que ya tiene períodos y el
+   diálogo lo rechaza. No lo introdujo este cambio, pero está medido.
+
+**Lo que esta unidad NO puede verificar**, y por qué: el recorrido real —abrir el primer período
+desde el diálogo, ver el recorte y la prorrata— necesita base y navegador. Va en la pasada manual del
+dueño sobre la base sembrada, que es justamente el flujo nuevo.
+
+### Dónde el diseño del documento no sobrevivió al código
+
+1. **La prop de servidor se quedaba vieja**: `initialPayrollStartDate` venía congelada en `useState` y
+   en cuanto se abre el primer período —lo que esta unidad cambia— quedaba obsoleta para el resto de
+   la sesión. El cliente deriva el piso de `payrollHistoryFloor(periods)`, la misma función pura del
+   servicio, y la prop desaparece.
+2. **`sedeId` dejó de acotar algo**: `getPayrollStartDate()` y `listPayrollOverview()` pierden el
+   parámetro. `openPayrollPeriod` **conserva** `sedeId` porque la ruta `app/api/v1/payroll-periods/route.ts`
+   la llama y esa superficie no estaba permitida en esta unidad: queda documentado en su docblock.
+3. **La fecha declarada pasó a ser OBLIGATORIA sin períodos.** El documento decía «acepta»; sin
+   obligatoriedad el piso puede nacer mudo y el diálogo vacío del dueño **vuelve con otra forma**.
+4. **«Dentro del ciclo elegido» tiene un techo que el documento no decía**: como el aviso ofrece 3
+   ciclos cerrados por cadencia, un negocio que opere desde hace más sólo puede declarar un día del
+   ciclo que liquida. Es coherente con el recorte y es un **límite declarado**, no inventado.
+5. **Sin piso, el recorrido necesitaba un fin**: el bucle no tenía cota inferior. Se derivó del propio
+   tope (sin piso son exactamente `limit` ciclos hacia atrás), lo que además evita un recorrido sin fin.
+6. **Los rechazos se centralizaron** en `openPayrollRejectionMessage` (`schemas.ts`): el servicio y el
+   diálogo dicen lo mismo de la misma regla, como es la convención del módulo.
+7. **El aviso sigue recortando al piso** cuando el piso cae dentro de un ciclo (comportamiento F10
+   preexistente, ahora con piso derivado) para que la lista diga lo que se va a abrir.
 
 ## Progress
 
 | Unidad | Commit |
 | --- | --- |
-| U9 · U10 · U11 · U12 · U13 · U14 | — |
-## Preguntas que la ejecución tiene que responder, no inventar
+| U9 · U10 · U11 — el piso derivado y la primera liquidación | `09158f0` |
+| U12 — retirar la capa de plataforma | pendiente |
+| U14 — sacar del seed la sentencia de la fecha | pendiente |
+| U15 — el barrido de la copia de nómina | pendiente |
+## Las tres preguntas, respondidas por la ejecución
 
-1. **¿Hay puerta de reparación de la fecha declarada?** Si el admin declara mal la fecha, la
-   única vía de arreglo sería mientras el período es **borrador**. Hay que derivar del código si
-   esa puerta existe (`payroll_correct_period_atomic` y el candado de edición) y, si no existe,
-   **declararlo como límite** en lugar de inventar una. La alternativa —no poder corregir nunca—
-   es aceptable porque la fecha se deriva de un período y el período es auditable.
-2. **¿Qué pasa con la auditoría de la escritura que se retira?** `platform.payroll_start_date_set`
-   deja de tener emisor. Se retira con la acción, o se conserva como acción histórica: hay que
-   derivar si `AUDIT_ACTIONS` es un catálogo cerrado o un mapa libre.
-3. **¿La fecha declarada puede ser el día de hoy?** Deriva del código si un ciclo sin cerrar puede
-   ser la primera liquidación; hoy el detector solo camina sobre ciclos **cerrados**.
+1. **¿Hay puerta de reparación de la fecha declarada? — NO, y queda declarado como límite.** Derivado
+del código: `assertCorrectablePeriod` (`schemas.ts:647`) sólo corrige un período **cerrado**, y
+`payroll_correct_period_atomic` (`service.ts:3089`) escribe la cabecera y las filas de la corrección
+pero **nunca** `payroll_periods.start_date`; el único `UPDATE` de esa tabla en el módulo es
+`status: "cerrado"` (`service.ts:2694`). La única puerta real es `assertDeletablePeriod`
+(`service.ts:2781`, sólo borrador) → `payroll_delete_period_atomic` (`service.ts:2837`), auditado con
+`PAYROLL_DELETED` incluyendo `start_date` y `end_date` (`service.ts:2868`). O sea: **una fecha mal
+declarada se repara borrando el borrador y reabriéndolo** (y eso queda auditado); cerrado el período,
+la fecha es historia y no se corrige. Se acepta porque el período es auditable.
+2. **¿Qué pasa con la auditoría de la escritura que se retira? — `AUDIT_ACTIONS` es un catálogo
+cerrado, y hay precedente exacto de retiro.** Es un `as const` (`audit.ts:31`), y `audit.ts:91-95`
+documenta que `platform.sede_created` y `platform.sede_roles_set` **se retiraron del vocabulario**
+cuando ya no había operación que auditar, conservando las filas históricas tal cual.
+`platform.payroll_start_date_set` vive en `audit.ts:84-90`. ⇒ **U12 la retira con ese mismo
+precedente**: se retira la acción, se conserva el comentario, **nunca las filas**.
+3. **¿La fecha declarada puede ser el día de hoy? — No, porque un ciclo sin cerrar no puede ser la
+primera liquidación.** El detector sólo camina ciclos **cerrados** (regla 2 en `schemas.ts:1432` con
+`lastCompletedCycleEndDate`, `schemas.ts:982`: «el sábado **anterior** a la referencia»), así que el
+ciclo que contiene hoy nunca llega al diálogo. Quedó cerrado por partida doble: el campo está acotado
+(`max` = mín(ciclo, hoy)) y el validador rechaza `declared-in-the-future` (`schemas.ts:1273`). La
+regla es «no futura», no «de ayer»: el día de hoy **sí** se acepta si el ciclo lo contiene, lo que por
+esta misma respuesta no ocurre en el camino real.
 
 ## Dos restricciones que trajo la verificación, y que esta unidad hereda
 
