@@ -63,6 +63,26 @@ alcanza en mobile, no es una degradación estética, es una tarea que no se pued
 | R19 | `/services`, `/inventory`, `/admin` | Sin alternativa en tarjetas: toda lista exige scroll horizontal. Pisos `min-w-[640px]`, `min-w-[760px]` y el `880px` por defecto de `DataTable` | `services-client.tsx:141`, `inventory-client.tsx:339,713`, `data-table.tsx:72,44` |
 | R20 | `/payroll`, `/cash` | Sin navegación por secciones: `/payroll` son ~12 secciones apiladas y a 320 px la de calcular/cerrar queda a varias pantallas de scroll | estructura de `payroll-client.tsx`, `cash-client.tsx`; `tabs.tsx` existe y es correcto pero sólo lo usa `/admin` |
 
+### Tercera pasada (primitivas compartidas y login)
+
+| # | Pantalla | Síntoma | Causa |
+| --- | --- | --- | --- |
+| R21 | **los 41 `<Select>` de la app** | El viewport de opciones se ata a la **altura del disparador** (`h-[var(--radix-select-trigger-height)]`), con `position = 'popper'` **por defecto** en el wrapper, mientras el contenedor declara `max-h-96`: el desplegable mostraría **una opción** y el resto habría que buscarlo dentro de una ventana de ~40 px. **A medir antes de afirmarlo** | `src/components/ui/lib/select.tsx:75` (default) y `:94` |
+| R22 | **todas las pantallas** | `inputClass` es `text-sm` (14 px): al enfocar un campo, **iOS hace zoom solo y descoloca la pantalla** en medio de la escritura. Y los campos quedan en ~37 px, bajo el piso táctil | `src/shared/lib/ui-styles.ts:13` |
+| R23 | **global** | `body` no tiene guarda de `overflow-x`: cualquier desborde no contenido arrastra **la página entera** de costado en vez de un carril local | `app/globals.css:224` |
+| R24 | todas | `buttonClass` no fija altura pero la primitiva base `Button` sí (`h-10`/`h-9`) y **fuerza `whitespace-nowrap`**: una etiqueta larga no se envuelve, empuja la fila | `src/components/ui/lib/button.tsx:9,21-25` |
+| R25 | `/invoices` (10 sitios), `/inventory` | **Las reglas que deciden plata viven en `title=`**: los tooltips nativos **nunca aparecen con el dedo**, así que en un teléfono son invisibles. Igual el ayudante del SKU autogenerado | `invoices-client.tsx:1511,1518,1528,1558,2122,2516,2555,2602,2627,2632`; `inventory-client.tsx:491` |
+| R26 | `/invoices`, `/cash`, `/admin` | Nombres con `truncate` + `title=`: la identidad queda cortada y el tooltip es la única recuperación, que en touch no existe | `invoices-client.tsx:1961,1964,1973`; `cash-client.tsx:52,122,128`; `users-section.tsx:121`; `employees-section.tsx:280` |
+| R27 | carcasa | El cajón mide **288 px fijos**: a 320 px deja 32 px de franja, así que el velo para cerrarlo es **casi inagarrable** | `src/shared/components/main-nav.tsx:319` |
+| R28 | `/alerts`, `/inventory`, `/invoices`, `/admin` | Filas de acciones con `flex gap-2` **sin `flex-wrap`**: «Guardar revisión» + «Cancelar» dan ~228 px contra ~240 disponibles | `alerts-client.tsx:263`; `inventory-client.tsx:428`; `invoices-client.tsx:2808`; `cash-section.tsx:215` |
+| R29 | `/invoices` | Diálogos `p-0 max-w-4xl` envolviendo tablas de `min-w-[820px]`: **dos ejes de scroll anidados**, y el arrastre horizontal se come el vertical | `invoices-client.tsx:1403,2025,2330,2847,3276` con `:1449,2380` |
+| R30 | `/payroll` | Un **segundo** scroller vertical dentro del `DialogContent`, que ya scrollea: los gestos pelean entre los dos | `payroll-client.tsx:2968,2974,3197` |
+| R31 | `/login` | 96 px de relleno vertical (`py-12`) queman el 17 % de un viewport de 568 | `src/components/ui/lib/page.tsx:56` |
+
+**Y dos verificaciones de la tercera pasada que valen**: ninguna cadena de una persona lleva un código de
+requisito (está comprobado en los tres estados del login: `payload.code` nunca se renderiza, sólo
+`payload.message`), y **el layout no bloquea el zoom** (no hay `maximum-scale` en el viewport).
+
 ## Verificado y limpio (para no volver a auditarlo)
 
 - **No hay desborde horizontal de página**: `app-shell.tsx:26` empareja `min-w-0 flex-1` con la barra
@@ -76,8 +96,9 @@ alcanza en mobile, no es una degradación estética, es una tarea que no se pued
 
 ## Medición en vivo
 
-**En curso** (dos agentes con shell, la pasada estática no puede manejar navegador: `explore` no
-tiene ejecución). Confirmarán o refutarán cada predicción con un número.
+**En curso**: dos pasadas de medición sobre las rutas del dinero y la carcasa/admin, más una tercera
+focalizada en **las primitivas** (R21–R24, R27–R30), que es la que decide el contenido de la primera
+unidad de arreglo.
 
 **Límite conocido y declarado**: PRUEBAS tiene **cero turnos, cero facturas, cero vales y cero
 períodos**, porque eso es justamente lo que crea la prueba de humo del dueño. Con las tablas vacías,
@@ -85,17 +106,90 @@ el estado vacío **tapa** los defectos de tabla: R3, R4, R5, R6 y R19 no se pued
 hasta que existan datos. **Segunda pasada de medición después de la prueba de humo** — que es la que
 va a medir las tablas con filas reales.
 
+**Además, lo que ninguna medición puede hacer**: R25 y R26 son tooltips. Tienen `path:line` y son
+ciertos por lectura, pero no hay número que los mida: el tooltip nativo simplemente **no aparece con
+el dedo**.
+
+## Medición en vivo (resultados: carcasa, admin, inventario, servicios)
+
+96 capturas y tres corridas de medición en navegador real, 3 anchos × 5 rutas + 6 secciones de
+`/admin` + 7 diálogos. **Sin mutar un solo dato.**
+
+### Confirmado con número
+
+| Predicción | Veredicto y número |
+| --- | --- |
+| R2 — el cajón móvil no es modal | **Confirmado, por tres vías independientes**: con el menú abierto el fondo **sigue scrolleando** (`scrollTo(0,400)` → `scrollY=400` desde 0); **Escape no lo cierra** (`escapeClosed=false` en los tres anchos); y el foco **nunca entra** al abrir y al cerrar queda en `BODY`. En los tres anchos |
+| R7 — diálogos de borde a borde | **Confirmado**: a 320 el diálogo mide `[0,16,320,552]`, gutter 0 en los dos lados, caja de contenido **272 px** (= 320 − 48) |
+| R27 — el cajón mide 288 px fijos | **Confirmado**: `drawerWidth=288` en los tres anchos. A 320 el cierre llega a 272 y los 9 enlaces entran sin quedar cubiertos — el problema del cajón **no es la geometría, es el comportamiento** |
+| R11/R14 — blancos táctiles | **Confirmado**: primarios de **36 px**, ghost de **38**, iconos de **40**, contra el objetivo móvil de 44. Y el censo de los botones-subrayado de 20 px, que son muchos más de los que parecían: **20 en Empleados, 50 en Roles, 22 en Caja, 15 en Vales, 6 en Métodos, 2 en Impuestos** |
+| R13 — la casilla | **Confirmado**: 16×16 px medidos |
+| R3/R4/R19 — acciones de fila fuera de pantalla | **Confirmado**: la primera acción queda en `left` **409 / 619 / 676** contra anchos de 390 / 360 / 320, y hay **20 botones fuera en Empleados, 4 en Servicios y 6 en Inventario** esperando un scroll horizontal de la tabla |
+| R17 — relleno lateral fijo | **Confirmado en sustancia, con la cita corregida**: `app/page.tsx:52` es una entrada del arreglo `MODULES`, no una clase. La clase vive en **`src/components/ui/lib/page.tsx:39`** y mide 24 px por lado sin escalón |
+
+### Refutado o parcial (y por qué importa)
+
+- **R8 (`vh` vs `dvh`) — no observable.** En este Chromium headless `100vh == 100dvh == innerHeight`
+  en los tres anchos, así que el riesgo de la barra del navegador **no se puede medir acá**. El código
+  sí usa `vh` y el estándar del repo pide `dvh`, pero **no hay número que lo pruebe en escritorio
+  headless**: queda como corrección justificada por la regla, no por la medición.
+- **El icono de 32 px no existe**: `ui-styles.ts:24` es `ghostClass` y mide **38 px**. La predicción de
+  «32 px» queda refutada; el piso de 44 sigue sin alcanzarse, pero por 36-40 y no por 32.
+- **R23 (guarda de `overflow-x` en `body`) — innecesaria hoy**: **no hay desborde horizontal de
+  página** en ninguna ruta ni ancho (`documentElement.scrollWidth == innerWidth` en home, admin,
+  services, inventario, alertas y kardex). Los anchos grandes son tablas **dentro** de su carril
+  (admin 494, services 640, inventario 760, kardex 520 contra carriles de 238/222/238). El carril
+  contiene bien: la guarda global queda como defensa, no como defecto.
+- **Cero controles tapados por UI de la aplicación** en 5 rutas × 3 anchos. El único caso medido es
+  `nextjs-portal` —el indicador de desarrollo de Next— tapando un radio de 13 px: **artefacto de dev,
+  no de la app**.
+
+### Nuevo, y es de los peores: R32
+
+**El pie de los formularios no es pegajoso, así que guardar y cancelar quedan bajo el pliegue.**
+Medido en *Nuevo empleado* a 320: el contenido del diálogo mide **1527 px** contra **534 px** de caja,
+y los botones quedan en `y≈1438-1520` contra un viewport de **568**. O sea: **hay que scrollear dentro
+ del diálogo para poder guardar**. Confirmado también a 390.
+
+| # | Pantalla | Síntoma | Causa |
+| --- | --- | --- | --- |
+| R32 | **todos los formularios largos** | La acción primaria y Cancelar quedan fuera de la caja del diálogo y exigen scroll interno | `src/components/ui/lib/form-dialog.tsx:198` — pie **no pegajoso** |
+
+Es una **primitiva**, no una pantalla: paga en todos los formularios.
+
 ## Tasks
 
 Pendientes de la decisión del dueño sobre el alcance, ordenadas por la regla de primitivas primero:
 
-- [ ] **R-a** — las primitivas compartidas: diálogo (R7, R8), combobox (R9), caja (R13), tokens de
-      `ui-styles` (R11, R14), `checkbox` (R13) y la carcasa (R2, R15, R18). Una unidad, porque cada
-      corrección paga en todas las pantallas.
-- [ ] **R-b** — las acciones fuera de pantalla: inventario (R1), caja (R3), vales (R4), nómina (R5,
-      R6).
-- [ ] **R-c** — el resto de la copia visual (R10, R12, R16, R17, R19, R20).
+- [ ] **R-a — las primitivas compartidas**, que es donde cada corrección paga en todas las pantallas:
+      el cajón al `Dialog` de Radix (R2, medido roto por tres vías), el **pie pegajoso** de
+      `form-dialog` (R32, medido), el margen y el `dvh` del diálogo (R7 medido, R8 por regla), el
+      tamaño de los campos (R22: 14 px hace zoom en iOS y quedan en 37), los tokens de
+      `ui-styles` (R11 medido con censo de ~115 subrayados, R14 medido en 36-40), la casilla (R13,
+      16 px medido), el combobox (R9) y el `Select` (R21) **si su medición lo confirma**.
+- [ ] **R-b** — las acciones fuera de pantalla: inventario (R1), admin/servicios/inventario (medido:
+      20/4/6 botones), caja (R3), vales (R4), nómina (R5, R6).
+- [ ] **R-c** — el resto de la copia visual (R10, R12, R16, R17→`page.tsx:39`, R19, R20) y los
+      tooltips que en touch no existen (R25, R26), que no son cosméticos aunque lo parezcan.
 - [ ] **R-d** — la segunda medición, con datos, después de la prueba de humo.
+
+## Pendiente de medición
+
+- **R21 (el `Select` atado a la altura del disparador)** y **R9 (el combobox recortado)**: los mide la
+  pasada de primitivas. R21 decide si existe una unidad entera.
+- **R5, R6, R3, R4** con filas reales: la medición de las tablas anchas no se puede hacer con la base
+  vacía.
+
+## Qué NO se pudo alcanzar sin crear datos
+
+- **No existe un diálogo «nuevo usuario»**: crear un usuario de acceso es una casilla dentro de
+  *Nuevo empleado* (`employees-section.tsx:512`), y la pestaña **Roles** sólo asigna rol y
+  restablece clave.
+- **«servicios» no es sección de `/admin`**: es la ruta `/services`, que sí se midió. Las pestañas
+  reales son Empleados, Roles, Impuestos, Métodos de pago, Vales y Caja.
+- **No se abrieron** las variantes *Editar* de producto, servicio, empleado, impuesto y método, las
+  confirmaciones de borrado, ni nada de caja, facturas, pagos, nómina o vales: requieren registros
+  concretos. Los artefactos están en `~/ui-audit/` (96 capturas, `report.json`).
 
 ## Route declaration
 
