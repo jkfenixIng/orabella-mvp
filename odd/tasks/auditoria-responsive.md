@@ -157,6 +157,29 @@ y los botones quedan en `y≈1438-1520` contra un viewport de **568**. O sea: **
 
 Es una **primitiva**, no una pantalla: paga en todos los formularios.
 
+### Segunda medición: las rutas del dinero
+
+Con datos reales ya en la base (turno abierto, 2 facturas cobradas, 1 vale aprobado), 12
+combinaciones ruta × ancho, sin mutar nada. **Cero desborde horizontal de página** otra vez.
+
+| # | Pantalla | Síntoma medido | Causa |
+| --- | --- | --- | --- |
+| R33 | `/invoices` | **No se puede emitir una factura en un teléfono.** El diálogo de emisión mide **870 px de ancho** dentro de un modal de 320-390: el botón de envío queda en `x 713-846`, fuera de pantalla, y llegar a él exige scrollear el modal a lo ancho ~400-550 px. `scrollHeight 1005` contra `clientHeight 536` | `invoices-client.tsx:1449` (`min-w-[820px]`) + `:1936` (grilla de 9 columnas) |
+| R34 | `/payroll` | La acción primaria del diálogo queda **bajo el pliegue**: en «Abrir período» el contenido mide **1332** contra **534** de caja y «Crear» está en `top 1243`; en «Registrar pago extraordinario», 942 contra 534 y el botón en `top 853` | `payroll-client.tsx:2767` y `:2569` |
+| R35 | **todos los diálogos** | **Ningún diálogo tiene control de cierre visible**: se cierran sólo con Cancelar o Escape, y **en un teléfono no hay tecla Escape** | medido en los 7 diálogos abiertos |
+| R36 | `/invoices` | Dos botones de pie miden **22 px** de alto; el selector de comisión de ítem computa **10 px** de tipografía y **23 px** de alto | `invoices-client.tsx:1687,1718` y `:231` |
+| R37 | `/invoices`, `/vales` | **El combobox recortado queda CONFIRMADO con número**: la lista mide `bottom 771` contra `bottom 655` del contenedor que lo recorta (116 px cortados a 390), **no voltea hacia arriba** (`flipUp false`), son 10 opciones y las de abajo **son inalcanzables**. El `Select` hermano **sí** portalea (`inDialogDom false`): la inconsistencia es real y tiene un objetivo concreto | `combobox.tsx:122` vs `select.tsx:81-89` |
+
+**Refutado en esta pasada**: R10 — a 320 el botón «Personalizado» se sale de su caja por **2 px**, sin
+partirse ni derramar (`scrollHeight == clientHeight`). Es cosmético, no un defecto de layout.
+
+**Matizado**: los 6 radios de ciclo de nómina miden 13×13, pero **la etiqueta que los envuelve es el
+blanco real**, así que el defecto es menor de lo que parecía por tamaño.
+
+**Bloqueado por falta de datos**: la predicción de R5 (la tabla del borrador de 1040 px dentro del
+diálogo) necesita **un período de nómina**, y no hay ninguno: `DraftPayrollTable` sólo se renderiza
+con el detalle del período abierto. El mecanismo está en el código, la medida no se pudo tomar.
+
 ## Tasks
 
 Pendientes de la decisión del dueño sobre el alcance, ordenadas por la regla de primitivas primero:
@@ -166,19 +189,21 @@ Pendientes de la decisión del dueño sobre el alcance, ordenadas por la regla d
       `form-dialog` (R32, medido), el margen y el `dvh` del diálogo (R7 medido, R8 por regla), el
       tamaño de los campos (R22: 14 px hace zoom en iOS y quedan en 37), los tokens de
       `ui-styles` (R11 medido con censo de ~115 subrayados, R14 medido en 36-40), la casilla (R13,
-      16 px medido), el combobox (R9) y el `Select` (R21) **si su medición lo confirma**.
-- [ ] **R-b** — las acciones fuera de pantalla: inventario (R1), admin/servicios/inventario (medido:
-      20/4/6 botones), caja (R3), vales (R4), nómina (R5, R6).
-- [ ] **R-c** — el resto de la copia visual (R10, R12, R16, R17→`page.tsx:39`, R19, R20) y los
-      tooltips que en touch no existen (R25, R26), que no son cosméticos aunque lo parezcan.
-- [ ] **R-d** — la segunda medición, con datos, después de la prueba de humo.
+      16 px medido), el combobox (R37, medido) y el `Select` (R21) **si su medición lo confirma**.
+- [ ] **R-b — el camino de la factura en el teléfono (R33) y las acciones fuera de pantalla**: es el
+      defecto más caro del informe — la pantalla que existe para facturar no factura en un teléfono —
+      junto con admin/servicios/inventario (medido: 20/4/6 botones), caja (R3), vales (R4) y los
+      diálogos de nómina (R34, R5, R6).
+- [ ] **R-c** — el resto de la copia visual (R12, R16→R36, R17→`page.tsx:39`, R19, R20), el cierre
+      visible que falta (R35) y los tooltips que en touch no existen (R25, R26), que no son
+      cosméticos aunque lo parezcan.
+- [ ] **R-d** — la tercera medición, con un período de nómina, para cerrar R5 y el detalle de período.
 
 ## Pendiente de medición
 
-- **R21 (el `Select` atado a la altura del disparador)** y **R9 (el combobox recortado)**: los mide la
-  pasada de primitivas. R21 decide si existe una unidad entera.
-- **R5, R6, R3, R4** con filas reales: la medición de las tablas anchas no se puede hacer con la base
-  vacía.
+- **R21 (el `Select` atado a la altura del disparador)**: lo mide la pasada de primitivas, y decide si
+  existe una unidad entera.
+- **R5 y R6** con un período real: el detalle de período necesita que exista al menos uno.
 
 ## Qué NO se pudo alcanzar sin crear datos
 
@@ -187,9 +212,12 @@ Pendientes de la decisión del dueño sobre el alcance, ordenadas por la regla d
   restablece clave.
 - **«servicios» no es sección de `/admin`**: es la ruta `/services`, que sí se midió. Las pestañas
   reales son Empleados, Roles, Impuestos, Métodos de pago, Vales y Caja.
-- **No se abrieron** las variantes *Editar* de producto, servicio, empleado, impuesto y método, las
-  confirmaciones de borrado, ni nada de caja, facturas, pagos, nómina o vales: requieren registros
-  concretos. Los artefactos están en `~/ui-audit/` (96 capturas, `report.json`).
+- **Lo que falta para cerrar la medición**: un **turno cerrado** (con nota de revisión o reconteo) para
+  que aparezcan `Ver`/`Recontar`/`Versiones`; un vale en estado **`pendiente`** para que aparezcan
+  `Aprobar`/`Rechazar`; y un **período de nómina** para el detalle y su tabla de borrador. Todo eso lo
+  produce la prueba de humo del dueño.
+- No se abrieron las variantes *Editar* ni las confirmaciones de borrado. Los artefactos están en
+  `~/ui-audit/`.
 
 ## Route declaration
 
