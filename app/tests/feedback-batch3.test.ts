@@ -266,7 +266,7 @@ describe("inventario: el texto visible no cambió (cambia el canal, no la copia)
       "Sin coincidencias.",
       "Sin movimientos registrados.",
       "Buscar por nombre o SKU",
-      "Código único por sede (p. ej. SH-001 para shampoo).",
+      "Código único en la instalación (p. ej. SH-001 para shampoo).",
     ]) {
       expect(CLIENT_CODE, `cliente: ${text}`).toContain(text);
     }

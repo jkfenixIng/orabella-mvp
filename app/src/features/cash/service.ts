@@ -126,7 +126,7 @@ function toCashError(error: unknown): CashError {
   if (error instanceof AdminError) return new CashError(error.code, error.message, error.status);
   if (error instanceof BillingError) {
     if (error.code === "NOT_FOUND") return new CashError("INVOICE_NOT_FOUND", "Factura no encontrada.", 404);
-    if (error.code === "FORBIDDEN") return new CashError("FORBIDDEN", "No tiene acceso a esa sede.", 403);
+    if (error.code === "FORBIDDEN") return new CashError("FORBIDDEN", "No tiene permiso para esta acción.", 403);
     return new CashError(error.code, error.message, error.status);
   }
   if (error instanceof Error && error.message === "SHIFT_ALREADY_OPEN") {
@@ -302,7 +302,7 @@ export async function checkCounts(
     }
     if (line.method_code === "efectivo") {
       if (line.denomination == null || !denominations.has(Number(line.denomination))) {
-        throw new CashError("VALIDATION", "Denominación no configurada para esta sede.", 400);
+        throw new CashError("VALIDATION", "Denominación no configurada en la instalación.", 400);
       }
       if (!moneyEquals(line.amount, roundMoney(line.denomination * line.quantity))) {
         throw new CashError("COUNT_MISMATCH", "El detalle del efectivo no cuadra con el total.", 422);
@@ -1408,7 +1408,7 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
     if (!method) {
       throw new CashError(
         "METHOD_INACTIVE",
-        `El método de pago ${input.method_code} no está activo en esta sede.`,
+        `El método de pago ${input.method_code} no está activo en la instalación.`,
         422,
       );
     }

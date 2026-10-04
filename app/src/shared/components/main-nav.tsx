@@ -102,7 +102,7 @@ const NAV_GROUPS: NavGroup[] = [
         {
           href: "/plataforma",
           label: "Plataforma",
-          description: "Sedes de la instalación y su nómina",
+          description: "La instalación y su nómina",
           Icon: ShieldCheck,
           // Solo la cuenta con el rol de plataforma. El filtro fail-closed de
           // abajo la deja invisible para todos los demás sin código nuevo.

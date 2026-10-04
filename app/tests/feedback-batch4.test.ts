@@ -662,7 +662,7 @@ describe("admin: el texto visible no cambió (cambia el canal, no la copia)", ()
       [METHODS_CODE, "Aún no hay métodos de pago configurados en esta sede.", "<EmptyState", "mt-2"],
       [TAXES_CODE, "Aún no hay impuestos configurados en esta sede.", "<EmptyState", "mt-2"],
       [USERS_CODE, "Aún no hay usuarios en esta sede.", "<EmptyState", "mt-2"],
-      [EMPLOYEES_CODE, "Aún no hay empleados en esta sede.", "<EmptyState", "mt-2"],
+      [EMPLOYEES_CODE, "Aún no hay empleados en la instalación.", "<EmptyState", "mt-2"],
       [EMPLOYEES_CODE, "Sin resultados para ese filtro.", "<EmptyState", "mt-2"],
       [VALES_CODE, "Sin configurar: los vales no tienen límite.", "<EmptyState", "mt-1"],
     ];
@@ -685,7 +685,7 @@ describe("admin: el texto visible no cambió (cambia el canal, no la copia)", ()
       [METHODS_CODE, "Aún no hay métodos de pago configurados en esta sede.", true],
       [TAXES_CODE, "Aún no hay impuestos configurados en esta sede.", true],
       [USERS_CODE, "Aún no hay usuarios en esta sede.", false],
-      [EMPLOYEES_CODE, "Aún no hay empleados en esta sede.", true],
+      [EMPLOYEES_CODE, "Aún no hay empleados en la instalación.", true],
     ] as Array<[string, string, boolean]>) {
       expect(code, `${text}: import de EmptyState`).toMatch(EMPTY_STATE_MODULE);
       if (sinAlert) {

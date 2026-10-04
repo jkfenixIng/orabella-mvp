@@ -260,7 +260,7 @@ export function EmployeesSection({
         </label>
         {visibleRows.length === 0 ? (
           <EmptyState className="mt-2">
-            {rows.length === 0 ? "Aún no hay empleados en esta sede." : "Sin resultados para ese filtro."}
+            {rows.length === 0 ? "Aún no hay empleados en la instalación." : "Sin resultados para ese filtro."}
           </EmptyState>
         ) : (
           <DataTable minWidth="none" wrapperClassName="mt-3">
@@ -433,7 +433,7 @@ export function EmployeesSection({
               />
             </label>
             <label className={labelClass}>
-              Código interno (opcional, único por sede)
+              Código interno (opcional, único en la instalación)
               <input
                 value={form.employee_code}
                 onChange={(event) => setForm({ ...form, employee_code: event.target.value })}

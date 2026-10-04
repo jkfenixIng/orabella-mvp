@@ -55,7 +55,7 @@ const MODULES = [
   {
     href: "/plataforma",
     name: "Plataforma",
-    purpose: "Estado de la instalación: las sedes y su fecha de inicio de nómina.",
+    purpose: "Estado de la instalación: la sede y su fecha de inicio de nómina.",
     Icon: ShieldCheck,
     roles: ["superadmin"],
   },

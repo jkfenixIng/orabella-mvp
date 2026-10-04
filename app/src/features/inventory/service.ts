@@ -184,7 +184,7 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
     : await conflictQuery;
   if (conflictError) throw new InventoryError("INTERNAL", "Error interno.", 500);
   if (conflicts && conflicts.length > 0) {
-    throw new InventoryError("SKU_TAKEN", "El SKU ya existe en esta sede.", 409);
+    throw new InventoryError("SKU_TAKEN", "El SKU ya existe.", 409);
   }
 
   const select = await resolveProductSelect(db);
@@ -208,7 +208,7 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
   if (error) {
     // Carrera perdida contra UNIQUE (sku): mismo error de negocio.
     if ((error as { code?: string }).code === "23505") {
-      throw new InventoryError("SKU_TAKEN", "El SKU ya existe en esta sede.", 409);
+      throw new InventoryError("SKU_TAKEN", "El SKU ya existe.", 409);
     }
     throw new InventoryError("INTERNAL", "Error interno.", 500);
   }

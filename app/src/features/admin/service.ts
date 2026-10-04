@@ -146,7 +146,7 @@ export interface SedeUserRow {
   id: string;
   /**
    * La fila de la cuenta sigue nombrando la instalación a la que pertenece, y
-   * la pestaña de Roles la muestra (`· sin sede`). Es un campo DEVUELTO de la
+   * la pestaña de Roles la muestra (`· sin instalación`). Es un campo DEVUELTO de la
    * lectura, no un criterio con el que esta lectura se acote.
    */
   sede_id: string | null;
@@ -310,7 +310,7 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
     const { data: conflicts, error: conflictError } = await conflictQuery;
     if (conflictError) throw new AdminError("INTERNAL", "Error interno.", 500);
     if (conflicts && conflicts.length > 0) {
-      throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe en esta sede.", 409);
+      throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
     }
   }
 
@@ -409,7 +409,7 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
       if ((altaError as { code?: string }).code === "23505") {
         throw new AdminError(
           "EMPLOYEE_CODE_TAKEN",
-          "El código de empleado ya existe en esta sede.",
+          "El código de empleado ya existe.",
           409,
         );
       }
@@ -433,7 +433,7 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
   // simultánea); se traduce al mismo error de negocio.
   if (error) {
     if ((error as { code?: string }).code === "23505") {
-      throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe en esta sede.", 409);
+      throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
     }
     throw new AdminError("INTERNAL", "Error interno.", 500);
   }

@@ -496,7 +496,7 @@ export function InventoryClient(props: InventoryClientProps) {
                 </Button>
               </span>
               <span className="text-xs text-text-tertiary">
-                Código único por sede (p. ej. SH-001 para shampoo).
+                Código único en la instalación (p. ej. SH-001 para shampoo).
               </span>
               {skuTaken ? (
                 // ESTADO que bloquea: con un SKU ya tomado el botón Guardar

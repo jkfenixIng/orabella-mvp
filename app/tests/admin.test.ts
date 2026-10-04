@@ -1563,7 +1563,13 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
 
     await expect(
       upsertEmployee(baseEmployee({ employee_code: "EMP-01" }), SEDE_A),
-    ).rejects.toMatchObject({ code: "EMPLOYEE_CODE_TAKEN", status: 409 });
+    ).rejects.toMatchObject({
+      code: "EMPLOYEE_CODE_TAKEN",
+      status: 409,
+      // La unicidad del código es de la INSTALACIÓN (074 quitó la sede del
+      // índice): el mensaje no puede prometer un alcance por sede.
+      message: "El código de empleado ya existe.",
+    });
 
     // Nada a medias: ni usuario, ni rol, ni legajo.
     expect(usuarios()).toEqual([]);

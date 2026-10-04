@@ -123,7 +123,7 @@ export function UsersSection({
                     >
                       {row.full_name}
                       {isSelf ? " (usted)" : ""}
-                      {!row.sede_id ? " · sin sede" : ""}
+                      {!row.sede_id ? " · sin instalación" : ""}
                     </td>
                     <td className="whitespace-nowrap py-1 pr-3">{row.id_number}</td>
                     <td className="whitespace-nowrap py-1 pr-3">
