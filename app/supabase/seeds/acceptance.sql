@@ -67,131 +67,132 @@ BEGIN
   SELECT id INTO v_admin FROM public.users WHERE id_number = '10000001' LIMIT 1;
 
   -- --------------------------------------- empleados (10, Sonia mixta '13') ---
-  -- Códigos con valor únicos por sede; dos sin código (NULL y vacío) para
-  -- ejercitar la unicidad parcial ADM-03.
-  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone,
+  -- Códigos con valor únicos en la instalación (índice parcial ADM-03 sobre
+  -- employee_code); dos sin código (NULL y vacío) para ejercitar que el índice
+  -- los deja repetir.
+  INSERT INTO public.employees (user_id, full_name, employee_code, document, phone,
 position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, u.full_name, '01', '10000001', '3001110101', 'Administradora', 'fijo', 1500000, NULL FROM public.users u WHERE u.id_number = '10000001'
+  SELECT u.id, u.full_name, '01', '10000001', '3001110101', 'Administradora', 'fijo', 1500000, NULL FROM public.users u WHERE u.id_number = '10000001'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone,
+  INSERT INTO public.employees (user_id, full_name, employee_code, document, phone,
 position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, u.full_name, '02', '10000002', '3001110102', 'Estilista', 'porcentaje', NULL, 30 FROM public.users u WHERE u.id_number = '10000002'
+  SELECT u.id, u.full_name, '02', '10000002', '3001110102', 'Estilista', 'porcentaje', NULL, 30 FROM public.users u WHERE u.id_number = '10000002'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone,
+  INSERT INTO public.employees (user_id, full_name, employee_code, document, phone,
 position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, u.full_name, '03', '10000003', '3001110103', 'Manicurista', 'mixto', 800000, 20 FROM public.users u WHERE u.id_number = '10000003'
+  SELECT u.id, u.full_name, '03', '10000003', '3001110103', 'Manicurista', 'mixto', 800000, 20 FROM public.users u WHERE u.id_number = '10000003'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone,
+  INSERT INTO public.employees (user_id, full_name, employee_code, document, phone,
 position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, u.full_name, '04', '10000004', '3001110104', 'Barbero', 'porcentaje', NULL, 35 FROM public.users u WHERE u.id_number = '10000004'
+  SELECT u.id, u.full_name, '04', '10000004', '3001110104', 'Barbero', 'porcentaje', NULL, 35 FROM public.users u WHERE u.id_number = '10000004'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone,
+  INSERT INTO public.employees (user_id, full_name, employee_code, document, phone,
 position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, u.full_name, NULL, '10000005', '3001110105', 'Recepcionista', 'fijo', 1300000, NULL FROM public.users u WHERE u.id_number = '10000005'
+  SELECT u.id, u.full_name, NULL, '10000005', '3001110105', 'Recepcionista', 'fijo', 1300000, NULL FROM public.users u WHERE u.id_number = '10000005'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone,
+  INSERT INTO public.employees (user_id, full_name, employee_code, document, phone,
 position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, u.full_name, '', '10000006', '3001110106', 'Auxiliar', 'fijo', 1200000, NULL FROM public.users u WHERE u.id_number = '10000006'
+  SELECT u.id, u.full_name, '', '10000006', '3001110106', 'Auxiliar', 'fijo', 1200000, NULL FROM public.users u WHERE u.id_number = '10000006'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone,
+  INSERT INTO public.employees (user_id, full_name, employee_code, document, phone,
 position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, u.full_name, '07', '10000007', '3001110107', 'Cajera', 'fijo', 1400000, NULL FROM public.users u WHERE u.id_number = '10000007'
+  SELECT u.id, u.full_name, '07', '10000007', '3001110107', 'Cajera', 'fijo', 1400000, NULL FROM public.users u WHERE u.id_number = '10000007'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone,
+  INSERT INTO public.employees (user_id, full_name, employee_code, document, phone,
 position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, u.full_name, '08', '10000008', '3001110108', 'Cajero', 'fijo', 1400000, NULL FROM public.users u WHERE u.id_number = '10000008'
+  SELECT u.id, u.full_name, '08', '10000008', '3001110108', 'Cajero', 'fijo', 1400000, NULL FROM public.users u WHERE u.id_number = '10000008'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone,
+  INSERT INTO public.employees (user_id, full_name, employee_code, document, phone,
 position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, u.full_name, '09', '10000009', '3001110109', 'Colorista', 'mixto', 900000, 25 FROM public.users u WHERE u.id_number = '10000009'
+  SELECT u.id, u.full_name, '09', '10000009', '3001110109', 'Colorista', 'mixto', 900000, 25 FROM public.users u WHERE u.id_number = '10000009'
   ON CONFLICT (user_id) DO NOTHING;
 
-  INSERT INTO public.employees (sede_id, user_id, full_name, employee_code, document, phone,
+  INSERT INTO public.employees (user_id, full_name, employee_code, document, phone,
 position, pay_type, salary_fixed, commission_percent)
-  SELECT v_sede, u.id, u.full_name, '13', '10000013', '3001110113', 'Estilista senior', 'mixto', 1000000, 30 FROM public.users u WHERE u.id_number = '10000013'
+  SELECT u.id, u.full_name, '13', '10000013', '3001110113', 'Estilista senior', 'mixto', 1000000, 30 FROM public.users u WHERE u.id_number = '10000013'
   ON CONFLICT (user_id) DO NOTHING;
 
   -- ----------------------------------------------- servicios (4, min/max) ---
-  INSERT INTO public.services (sede_id, name, description, price, duracion_min, duracion_max)
-  SELECT v_sede, 'Corte de cabello', 'Corte unisex con acabado', 35000, 30, 45
-  WHERE NOT EXISTS (SELECT 1 FROM public.services WHERE sede_id = v_sede AND name = 'Corte de cabello');
+  INSERT INTO public.services (name, description, price, duracion_min, duracion_max)
+  SELECT 'Corte de cabello', 'Corte unisex con acabado', 35000, 30, 45
+  WHERE NOT EXISTS (SELECT 1 FROM public.services WHERE name = 'Corte de cabello');
 
-  INSERT INTO public.services (sede_id, name, description, price, duracion_min, duracion_max)
-  SELECT v_sede, 'Tinte completo', 'Coloración con producto incluido', 120000, 90, 150
-  WHERE NOT EXISTS (SELECT 1 FROM public.services WHERE sede_id = v_sede AND name = 'Tinte completo');
+  INSERT INTO public.services (name, description, price, duracion_min, duracion_max)
+  SELECT 'Tinte completo', 'Coloración con producto incluido', 120000, 90, 150
+  WHERE NOT EXISTS (SELECT 1 FROM public.services WHERE name = 'Tinte completo');
 
-  INSERT INTO public.services (sede_id, name, description, price, duracion_min, duracion_max)
-  SELECT v_sede, 'Manicura', 'Manicura tradicional', 30000, 30, 60
-  WHERE NOT EXISTS (SELECT 1 FROM public.services WHERE sede_id = v_sede AND name = 'Manicura');
+  INSERT INTO public.services (name, description, price, duracion_min, duracion_max)
+  SELECT 'Manicura', 'Manicura tradicional', 30000, 30, 60
+  WHERE NOT EXISTS (SELECT 1 FROM public.services WHERE name = 'Manicura');
 
-  INSERT INTO public.services (sede_id, name, description, price, duracion_min, duracion_max)
-  SELECT v_sede, 'Peinado fiesta', 'Peinado para eventos', 50000, 40, 60
-  WHERE NOT EXISTS (SELECT 1 FROM public.services WHERE sede_id = v_sede AND name = 'Peinado fiesta');
+  INSERT INTO public.services (name, description, price, duracion_min, duracion_max)
+  SELECT 'Peinado fiesta', 'Peinado para eventos', 50000, 40, 60
+  WHERE NOT EXISTS (SELECT 1 FROM public.services WHERE name = 'Peinado fiesta');
 
   -- -------------------------------------- productos (3, stock vía IN) ---
-  INSERT INTO public.products (sede_id, sku, name, description, min_stock, cost_price, sale_price)
+  INSERT INTO public.products (sku, name, description, min_stock, cost_price, sale_price)
   VALUES
-    (v_sede, 'SH-500', 'Shampoo 500ml', 'Shampoo uso profesional', 5, 18000, 28000),
-    (v_sede, 'TN-250', 'Tinte rubio 250ml', 'Tinte permanente', 10, 25000, 42000),
-    (v_sede, 'ES-100', 'Esmalte rojo 100ml', 'Esmalte tradicional', 8, 9000, 15000)
-  ON CONFLICT (sede_id, sku) DO NOTHING;
+    ('SH-500', 'Shampoo 500ml', 'Shampoo uso profesional', 5, 18000, 28000),
+    ('TN-250', 'Tinte rubio 250ml', 'Tinte permanente', 10, 25000, 42000),
+    ('ES-100', 'Esmalte rojo 100ml', 'Esmalte tradicional', 8, 9000, 15000)
+  ON CONFLICT (sku) DO NOTHING;
 
   -- Stock inicial SOLO vía movimientos IN (INV-03); el motivo fijo hace el
   -- seed re-ejecutable sin duplicar (el trigger suma al stock).
   -- TN-250 entra con 3 (< mínimo 10) para ejercitar la alerta de mínimo.
-  INSERT INTO public.inventory_movements (sede_id, product_id, type, qty, reason, user_id)
-  SELECT v_sede, p.id, 'IN', 20, 'SEED aceptación §11: stock inicial', v_admin
-  FROM public.products p WHERE p.sede_id = v_sede AND p.sku = 'SH-500'
+  INSERT INTO public.inventory_movements (product_id, type, qty, reason, user_id)
+  SELECT p.id, 'IN', 20, 'SEED aceptación §11: stock inicial', v_admin
+  FROM public.products p WHERE p.sku = 'SH-500'
   AND NOT EXISTS (
     SELECT 1 FROM public.inventory_movements m
     WHERE m.product_id = p.id AND m.reason = 'SEED aceptación §11: stock inicial'
   );
 
-  INSERT INTO public.inventory_movements (sede_id, product_id, type, qty, reason, user_id)
-  SELECT v_sede, p.id, 'IN', 3, 'SEED aceptación §11: stock inicial', v_admin
-  FROM public.products p WHERE p.sede_id = v_sede AND p.sku = 'TN-250'
+  INSERT INTO public.inventory_movements (product_id, type, qty, reason, user_id)
+  SELECT p.id, 'IN', 3, 'SEED aceptación §11: stock inicial', v_admin
+  FROM public.products p WHERE p.sku = 'TN-250'
   AND NOT EXISTS (
     SELECT 1 FROM public.inventory_movements m
     WHERE m.product_id = p.id AND m.reason = 'SEED aceptación §11: stock inicial'
   );
 
-  INSERT INTO public.inventory_movements (sede_id, product_id, type, qty, reason, user_id)
-  SELECT v_sede, p.id, 'IN', 12, 'SEED aceptación §11: stock inicial', v_admin
-  FROM public.products p WHERE p.sede_id = v_sede AND p.sku = 'ES-100'
+  INSERT INTO public.inventory_movements (product_id, type, qty, reason, user_id)
+  SELECT p.id, 'IN', 12, 'SEED aceptación §11: stock inicial', v_admin
+  FROM public.products p WHERE p.sku = 'ES-100'
   AND NOT EXISTS (
     SELECT 1 FROM public.inventory_movements m
     WHERE m.product_id = p.id AND m.reason = 'SEED aceptación §11: stock inicial'
   );
 
   -- ------------------ impuestos (IVA 19% activado de prueba + ICA inactivo) ---
-  INSERT INTO public.tax_configs (sede_id, code, name, percent, is_active)
-  VALUES (v_sede, 'IVA', 'IVA general', 19, true)
-  ON CONFLICT (sede_id, code, name)
+  INSERT INTO public.tax_configs (code, name, percent, is_active)
+  VALUES ('IVA', 'IVA general', 19, true)
+  ON CONFLICT (code, name)
   DO UPDATE SET percent = EXCLUDED.percent, is_active = EXCLUDED.is_active, updated_at = now();
 
-  INSERT INTO public.tax_configs (sede_id, code, name, percent, is_active)
-  VALUES (v_sede, 'ICA', 'ICA', 0, false)
-  ON CONFLICT (sede_id, code, name)
+  INSERT INTO public.tax_configs (code, name, percent, is_active)
+  VALUES ('ICA', 'ICA', 0, false)
+  ON CONFLICT (code, name)
   DO UPDATE SET percent = EXCLUDED.percent, is_active = EXCLUDED.is_active, updated_at = now();
 
   -- ------------------------------------------- métodos de pago (6, activos) ---
-  INSERT INTO public.payment_methods (sede_id, code, name, is_active, fee_percent)
+  INSERT INTO public.payment_methods (code, name, is_active, fee_percent)
   VALUES
-    (v_sede, 'efectivo', 'Efectivo', true, 0),
-    (v_sede, 'transferencia_normal', 'Transferencia / PSE', true, 0),
-    (v_sede, 'nequi', 'Nequi', true, 0),
-    (v_sede, 'daviplata', 'Daviplata', true, 0),
-    (v_sede, 'bre-b', 'Bre-B', true, 0),
-    (v_sede, 'tarjeta', 'Tarjeta', true, 5)
-  ON CONFLICT (sede_id, code)
+    ('efectivo', 'Efectivo', true, 0),
+    ('transferencia_normal', 'Transferencia / PSE', true, 0),
+    ('nequi', 'Nequi', true, 0),
+    ('daviplata', 'Daviplata', true, 0),
+    ('bre-b', 'Bre-B', true, 0),
+    ('tarjeta', 'Tarjeta', true, 5)
+  ON CONFLICT (code)
   DO UPDATE SET name = EXCLUDED.name, is_active = true,
     fee_percent = CASE WHEN payment_methods.fee_percent <> 0
       THEN payment_methods.fee_percent ELSE EXCLUDED.fee_percent END;
@@ -199,9 +200,9 @@ position, pay_type, salary_fixed, commission_percent)
   -- ----------------------- caja lista (base configurada; turnos por UI) ---
   -- Los 2 turnos/día de §11 (casos 400/200 y 300/150) se crean por UI contra
   -- el turno abierto; el seed NO crea cash_shifts.
-  INSERT INTO public.cash_registers (sede_id, name, base_configurada, is_active)
-  VALUES (v_sede, 'Caja única', 300000, true)
-  ON CONFLICT (sede_id, name)
+  INSERT INTO public.cash_registers (name, base_configurada, is_active)
+  VALUES ('Caja única', 300000, true)
+  ON CONFLICT (name)
   DO UPDATE SET base_configurada = EXCLUDED.base_configurada, updated_at = now();
 END
 $$;
