@@ -27,6 +27,9 @@ Out:
 
 ## Constraints
 - `sede_id` + UUID + `created_at/updated_at` en toda tabla de negocio; RLS deny-by-default; `service_role` solo servidor.
+  — **SUPERADO el 2026-10-03**: `sede_id` ya **no** está en las tablas de negocio;
+  sobrevive solo en `users`. Lo demás sigue igual. Ver
+  `esquema-mono-sede-y-archivo-unico.md`.
 - Validación Zod en servidor en toda escritura; UI solo ayuda visual.
 - Un solo turno abierto por caja; cierre exige conteo; base incompleta exige observación.
 - Empleado: `employee_code` vacío repetible, con valor único por sede.
