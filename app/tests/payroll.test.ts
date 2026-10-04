@@ -1192,7 +1192,7 @@ describe("payroll: tope con aprobación obligatoria (PAY-05/PAY-06)", () => {
 
 // ------------------------------------------------- migración 007 ---
 describe("migración 007_payroll.sql (T7)", () => {
-  const sql = readFileSync(join(process.cwd(), "supabase", "migrations", "007_payroll.sql"), "utf8");
+  const sql = readFileSync(join(process.cwd(), "supabase", "schema-history", "007_payroll.sql"), "utf8");
 
   it("crea payroll_periods, payroll_items, payroll_payments, voucher_settings y voucher_requests", () => {
     expect(sql).toContain("CREATE TABLE public.payroll_periods");
@@ -1419,7 +1419,7 @@ describe("V2 topes de vales: opcionales y por día", () => {
 // ------------------------------------------------- migración 026 ---
 
 describe("migración 026_voucher_limits.sql (V2)", () => {
-  const sql = readFileSync(join(process.cwd(), "supabase", "migrations", "026_voucher_limits.sql"), "utf8");
+  const sql = readFileSync(join(process.cwd(), "supabase", "schema-history", "026_voucher_limits.sql"), "utf8");
 
   it("vuelve opcionales los topes y agrega per_day_limits re-ejecutable", () => {
     expect(sql).toContain("max_per_day DROP NOT NULL");
@@ -1432,7 +1432,7 @@ describe("migración 026_voucher_limits.sql (V2)", () => {
 // ------------------------------------------------- migración 024 ---
 
 describe("migración 024_voucher_days.sql (item 5)", () => {
-  const sql = readFileSync(join(process.cwd(), "supabase", "migrations", "024_voucher_days.sql"), "utf8");
+  const sql = readFileSync(join(process.cwd(), "supabase", "schema-history", "024_voucher_days.sql"), "utf8");
 
   it("agrega allowed_days re-ejecutable con CHECK 1…7 y valor por defecto", () => {
     expect(sql).toContain("allowed_days");
@@ -1446,7 +1446,7 @@ describe("migración 024_voucher_days.sql (item 5)", () => {
 
 describe("migración 028_voucher_payment_method.sql (método y turno del vale)", () => {
   const sql = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "028_voucher_payment_method.sql"),
+    join(process.cwd(), "supabase", "schema-history", "028_voucher_payment_method.sql"),
     "utf8",
   );
 
@@ -1465,7 +1465,7 @@ describe("migración 028_voucher_payment_method.sql (método y turno del vale)",
 
 describe("migración 029_voucher_created_by.sql (autor del vale)", () => {
   const sql = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "029_voucher_created_by.sql"),
+    join(process.cwd(), "supabase", "schema-history", "029_voucher_created_by.sql"),
     "utf8",
   );
 
@@ -1527,7 +1527,7 @@ describe("payroll: borrado de un período en borrador (PAY-01)", () => {
   });
 
   it("las FK de 007 son ON DELETE CASCADE (ítems y pagos caen con el período)", () => {
-    const sql = readFileSync(join(process.cwd(), "supabase", "migrations", "007_payroll.sql"), "utf8");
+    const sql = readFileSync(join(process.cwd(), "supabase", "schema-history", "007_payroll.sql"), "utf8");
     expect(sql).toContain(
       "period_id uuid NOT NULL REFERENCES public.payroll_periods (id) ON DELETE CASCADE",
     );
@@ -1771,7 +1771,7 @@ const payrollPagedStub = vi.hoisted(() => ({
   sequenceLockOverride: null as boolean | null,
 }));
 
-const MIGRATIONS_DIR = join(process.cwd(), "supabase", "migrations");
+const MIGRATIONS_DIR = join(process.cwd(), "supabase", "schema-history");
 
 /**
  * CL-16: el cuerpo del tope de nómina que está DESPLEGADO. La 007 lo declara y
@@ -4339,7 +4339,7 @@ describe("payroll: el fijo es la parte del sueldo mensual de los DÍAS del perí
 // ------------------------------------------------- migración 035 ---
 describe("migración 035_payroll_period_proration.sql (PR1)", () => {
   const sql = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "035_payroll_period_proration.sql"),
+    join(process.cwd(), "supabase", "schema-history", "035_payroll_period_proration.sql"),
     "utf8",
   );
   /** Sin espacios de más: compara el DDL, no la indentación del archivo. */
@@ -6114,7 +6114,7 @@ describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
     expect(AUDIT_ACTIONS.PAYROLL_EXTRA_PAID).toBe("payroll.extra_paid");
     // 3) No hay tabla: la migración 036 todavía no existe.
     expect(
-      existsSync(join(process.cwd(), "supabase", "migrations", "036_payroll_extra_payment.sql")),
+      existsSync(join(process.cwd(), "supabase", "schema-history", "036_payroll_extra_payment.sql")),
     ).toBe(true);
   });
 
@@ -6316,7 +6316,7 @@ describe("payroll: la guía de la nómina extraordinaria, no un tope (PA-2a)", (
 // --------------------------------- migración 036 (nómina extraordinaria) ---
 
 describe("migración 036_payroll_extra_payment.sql (PA-2a)", () => {
-  const sqlPath = join(process.cwd(), "supabase", "migrations", "036_payroll_extra_payment.sql");
+  const sqlPath = join(process.cwd(), "supabase", "schema-history", "036_payroll_extra_payment.sql");
   // Lectura tolerante a la ausencia: en RED el archivo no existe todavía y el
   // fallo tiene que ser la ASERCIÓN de cada prueba, no un error de colección
   // que oculte los otros dos huecos.
@@ -6961,7 +6961,7 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
     expect(AUDIT_ACTIONS.PAYROLL_PERIOD_CORRECTED).toBe("payroll.period_corrected");
     // 4) No hay tabla donde guardar las dos versiones.
     expect(
-      existsSync(join(process.cwd(), "supabase", "migrations", "037_payroll_period_correction.sql")),
+      existsSync(join(process.cwd(), "supabase", "schema-history", "037_payroll_period_correction.sql")),
     ).toBe(true);
     // 5) El motivo no era obligatorio en ningún lado.
     expect(correctPayrollPeriodSchema.safeParse({ reason: "   " }).success).toBe(false);
@@ -7337,7 +7337,7 @@ describe("payroll: la comparación de la corrección, función pura (PA-2b)", ()
 // ----------------------------------------- migración 037 (PA-2b) ---
 
 describe("migración 037_payroll_period_correction.sql (PA-2b)", () => {
-  const sqlPath = join(process.cwd(), "supabase", "migrations", "037_payroll_period_correction.sql");
+  const sqlPath = join(process.cwd(), "supabase", "schema-history", "037_payroll_period_correction.sql");
   // Lectura tolerante a la ausencia: en RED el archivo no existe todavía y el
   // fallo tiene que ser la ASERCIÓN de cada prueba, no un error de colección
   // que oculte los otros huecos.
@@ -7737,7 +7737,7 @@ describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
 
   it("la migración 042 deja la marca con un índice único PARCIAL y no reescribe filas", () => {
     const raw = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "042_payment_idempotency.sql"),
+      join(process.cwd(), "supabase", "schema-history", "042_payment_idempotency.sql"),
       "utf8",
     );
     // La prosa explica lo que el archivo NO hace y nombra esas sentencias; las
@@ -8011,7 +8011,7 @@ describe("payroll: CL-5 la nómina extraordinaria reintentada no paga dos veces"
 
   it("la migración 044 deja la marca con un índice único PARCIAL y no reescribe filas", () => {
     const raw = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "044_remaining_payment_idempotency.sql"),
+      join(process.cwd(), "supabase", "schema-history", "044_remaining_payment_idempotency.sql"),
       "utf8",
     );
     const sql = raw
@@ -8339,7 +8339,7 @@ describe("payroll: CL-5 la solicitud de vale reintentada no abre un segundo vale
 
   it("la migración 044 cierra la tercera puerta con su marca, su forma y su índice parcial", () => {
     const raw = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "044_remaining_payment_idempotency.sql"),
+      join(process.cwd(), "supabase", "schema-history", "044_remaining_payment_idempotency.sql"),
       "utf8",
     );
     const sql = raw
@@ -8654,7 +8654,7 @@ describe("migración 047_payroll_apply_atomic.sql (CL-8)", () => {
   // todo el archivo en vez de fallar sólo estos tests.
   const migration = (): { raw: string; sql: string } => {
     const raw = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "047_payroll_apply_atomic.sql"),
+      join(process.cwd(), "supabase", "schema-history", "047_payroll_apply_atomic.sql"),
       "utf8",
     );
     // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
@@ -9928,7 +9928,7 @@ describe("migración 048_payroll_admin_atomic.sql (CL-9)", () => {
   // todo el archivo en vez de fallar sólo estos tests.
   const migration = (): { raw: string; sql: string } => {
     const raw = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "048_payroll_admin_atomic.sql"),
+      join(process.cwd(), "supabase", "schema-history", "048_payroll_admin_atomic.sql"),
       "utf8",
     );
     // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
@@ -10065,7 +10065,7 @@ describe("migración 048_payroll_admin_atomic.sql (CL-9)", () => {
 describe("migración 066_payroll_carry_delete_fks.sql (PAY-01)", () => {
   const migration = (): { raw: string; sql: string } => {
     const raw = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "066_payroll_carry_delete_fks.sql"),
+      join(process.cwd(), "supabase", "schema-history", "066_payroll_carry_delete_fks.sql"),
       "utf8",
     );
     return {
@@ -10317,7 +10317,7 @@ describe("migración 055_payroll_payments_cap_lock.sql (CL-16)", () => {
   // archivo en vez de fallar sólo estos tests (mismo patrón que 048).
   const migration = (): { raw: string; sql: string } => {
     const raw = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "055_payroll_payments_cap_lock.sql"),
+      join(process.cwd(), "supabase", "schema-history", "055_payroll_payments_cap_lock.sql"),
       "utf8",
     );
     // El SQL sin comentarios: las aserciones miran las SENTENCIAS, no la prosa
@@ -10357,7 +10357,7 @@ describe("migración 055_payroll_payments_cap_lock.sql (CL-16)", () => {
 
     // El trigger sigue siendo el de la 007, apuntando a la misma función.
     const original = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "007_payroll.sql"),
+      join(process.cwd(), "supabase", "schema-history", "007_payroll.sql"),
       "utf8",
     );
     expect(original).toContain("CREATE TRIGGER trg_payroll_payments_cap");
@@ -11247,7 +11247,7 @@ describe("payroll: TODO ajuste manual lleva su motivo (F8)", () => {
 describe("migración 067_payroll_adjustment_reason.sql (F8)", () => {
   const migration = (): { raw: string; sql: string } => {
     const raw = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "067_payroll_adjustment_reason.sql"),
+      join(process.cwd(), "supabase", "schema-history", "067_payroll_adjustment_reason.sql"),
       "utf8",
     );
     return {
@@ -12144,7 +12144,7 @@ describe("payroll: la fecha de arranque de la nómina (F10/G3b): la escritura sa
 describe("migración 068_payroll_start_date.sql (F10)", () => {
   const migration = (): { raw: string; sql: string } => {
     const raw = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "068_payroll_start_date.sql"),
+      join(process.cwd(), "supabase", "schema-history", "068_payroll_start_date.sql"),
       "utf8",
     );
     return {
@@ -12196,7 +12196,7 @@ describe("migración 068_payroll_start_date.sql (F10)", () => {
 // ---------------------------------------------------------------------------
 
 describe("migración 071_rpc_single_sede.sql (nómina)", () => {
-  const path = join(process.cwd(), "supabase", "migrations", "071_rpc_single_sede.sql");
+  const path = join(process.cwd(), "supabase", "schema-history", "071_rpc_single_sede.sql");
   const raw = existsSync(path) ? readFileSync(path, "utf8").replace(/\r\n/g, "\n") : "";
   // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
   const sql = raw

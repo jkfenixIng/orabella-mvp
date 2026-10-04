@@ -22,9 +22,11 @@ reales de cada mes (`prorateFixedSalary`) y no existe la idea de "semanal paga
   misma sede que compartan días. Con frecuencias distintas conviviendo en una sede
   eso se vuelve un bloqueo, porque el ciclo semanal y el mensual **se superponen
   a propósito**.
-  - **Nota 2026-10-02**: el discriminante sigue siendo la sede porque la columna
-    `sede_id` todavía existe. Cuando se elimine (unidad M3c), el `EXCLUDE` queda
-    acotado a **instalación + frecuencia**.
+  - **Nota 2026-10-02**: el discriminante era la sede mientras la columna
+    `sede_id` existía. **Resuelto**: la `074_sede_less_constraints.sql` reescribió
+    la restricción con sus dos elementos —la cadencia y el rango de días— y la
+    `077_drop_sede_id.sql` borra la columna sin tocarla. Queda acotada a
+    **instalación + frecuencia**, como estaba previsto.
 - El empleado no guarda su frecuencia de pago, así que no hay de dónde deducir la
   fracción del fijo.
 - El tipo mixto no tiene regla: no está definido que se pague el MAYOR entre su
@@ -128,15 +130,22 @@ Lo único que se registra:
 
 - La guarda de solape (`ex_payroll_periods_no_overlap`) y el piso de fecha del
   período pasan a evaluarse **por instalación**, no por sede. Es el mismo
-  comportamiento con un discriminante menos: hoy el `EXCLUDE` sigue nombrando
-  `sede_id` porque la columna existe, y se ajusta en la unidad M3c, que es la que
-  elimina la columna.
+  comportamiento con un discriminante menos: la `074` reescribió el `EXCLUDE` con
+  sus dos elementos y la `077_drop_sede_id.sql` —que elimina la columna de las
+  veinte tablas de negocio— lo deja intacto.
 - La migración de nómina no se toca por esta decisión.
 
 El plan completo de la migración a sede única y su estado están en
 `odd/tasks/plataforma-super-admin.md` («Corrección de rumbo y plan de sede única»).
-Lo único de ese plan que roza a esta unidad es M3c, que elimina la columna y sus
-índices en las 21 tablas.
+Lo único de ese plan que roza a esta unidad es M3c: la
+`077_drop_sede_id.sql`, última de la serie, que borra la columna y sus índices en
+las **20 tablas de negocio**. El borrado físico viaja en esa migración, no en un
+archivo encima de un squash aplastado: el dueño evaluó el squash a un solo archivo
+y lo descartó, así que el historial de migraciones queda como está. La excepción
+es `users.sede_id`, que sobrevive (ancla la cuenta a la instalación y alimenta
+`session.sedeId`), y por eso `payroll_apply_atomic` pierde los tres predicados
+`e.sede_id = p.sede_id` y las dos columnas de sede de `payroll_discount_carries`,
+pero ninguna otra cosa de la nómina cambia.
 
 ## Next step
 - Nada pendiente de esta unidad: F1–F6 cerradas. Lo que sigue es la rama, con la

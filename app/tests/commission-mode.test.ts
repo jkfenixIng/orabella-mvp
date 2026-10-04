@@ -43,7 +43,7 @@ function customItem(overrides: Record<string, unknown> = {}) {
 
 describe("migración 030: modo de comisión explícito por ítem", () => {
   const sql = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "030_invoice_item_commission_mode.sql"),
+    join(process.cwd(), "supabase", "schema-history", "030_invoice_item_commission_mode.sql"),
     "utf8",
   );
 

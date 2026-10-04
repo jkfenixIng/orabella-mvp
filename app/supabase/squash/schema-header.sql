@@ -1,0 +1,188 @@
+-- =============================================================================
+-- 001_orabella_schema.sql — EL ESQUEMA DE ORABELLA, EN UN SOLO ARCHIVO
+-- =============================================================================
+--
+-- QUÉ ES ESTE ARCHIVO
+--   El esquema completo de Orabella en el estado exacto en que quedó después de
+--   aplicar el historial 001-077: 36 tablas, 28 funciones, 10 políticas RLS, 65
+--   índices, 21 disparadores, 104 restricciones de tabla (34 PRIMARY KEY, 56
+--   FOREIGN KEY, 13 UNIQUE y 1 EXCLUDE), 128 restricciones CHECK en línea y 139
+--   comentarios, con RLS habilitado en las 36 tablas.
+--
+--   Sustituye a las 76 migraciones: se aplica una vez, de una sola pasada, y a
+--   partir de ahí no hay más migraciones que mantener en sincronía.  Es un
+--   VOLCADO de esquema (`--schema-only`), no una migración incremental: asume
+--   el esquema vacío y por eso no lleva `IF NOT EXISTS` sobre las tablas ni
+--   ningún `DROP`.
+--
+-- DE DÓNDE SALE
+--   De `~/orabella-db/esquema-final.sql` (357.380 bytes, 8.100 líneas, UTF-8 sin
+--   BOM), producido por:
+--
+--       pg_dump --schema-only --no-owner --exclude-schema=auth \
+--               --file ~/orabella-db/esquema-final.sql
+--
+--   sobre la base descartable `orabella_build` del servidor de PRUEBAS, ya
+--   sembrada con el historial 001-077.  Ese volcado es la FUENTE DE VERDAD:
+--   este archivo se construye a partir de él y no se edita a mano.  Servidor
+--   PostgreSQL 17.6; cliente pg_dump 18.3.
+--
+-- CÓMO SE REGENERA
+--   1. Aplicar el historial `app/supabase/schema-history/*.sql` en orden sobre
+--      una base limpia, con la fixture de plataforma
+--      `app/supabase/squash/_platform_fixture.sql` antes de la 001.  Ese paso,
+--      junto con la creación de la base y el volcado, es lo que automatiza
+--      `.squash-build.py`.
+--   2. Volcar con el comando de arriba, sin `--no-privileges`: los `REVOKE` y
+--      `GRANT` de las funciones son parte del objeto y el inventario los exige.
+--   3. Reconstruir ESTE archivo: este encabezado + el volcado entero, quitando
+--      únicamente lo que se enumera más abajo en "LÍNEAS DESCARTADAS".  Nada
+--      más se quita, nada se reordena y nada se escribe a mano.
+--
+-- CÓMO SE APLICA
+--   psql -v ON_ERROR_STOP=1 --single-transaction -f 001_orabella_schema.sql
+--
+--   Con `--single-transaction` el archivo es todo o nada: o queda el esquema
+--   completo, o no queda nada.  `ON_ERROR_STOP=1` es lo que hace que un error
+--   corte en vez de seguir.  En el destino hace falta lo mismo, porque las
+--   funciones de negocio llaman a `auth.jwt()` en tiempo de ejecución.
+--
+-- QUÉ NO CONTIENE, Y POR QUÉ
+--   Ningún objeto de PLATAFORMA.  Este archivo describe lo que define Orabella,
+--   no lo que el proyecto de destino ya trae, así que NO declara ningún objeto
+--   de los que administra la plataforma: ni el esquema `auth` con su `jwt()`,
+--   ni `storage`, ni `vault`, ni `extensions`, ni `graphql`, ni `realtime`, ni
+--   `pgbouncer`, ni los roles internos que la plataforma crea sola.
+--
+--     - `auth` está excluido del volcado a propósito (`--exclude-schema=auth`).
+--       El destino ya lo tiene con su definición real; declararlo aquí lo
+--       duplicaría y fallaría al aplicarse.  Lo que sí sobrevive es la
+--       REFERENCIA a `auth.jwt()` dentro del cuerpo de
+--       `public.current_sede_id()`: un volcado captura texto, no comportamiento.
+--     - `storage`, `vault`, `graphql`, `realtime` y `pgbouncer` no aparecen
+--       porque el proyecto los administra la plataforma.  Recrearlos desde acá
+--       sería pelearse con ella y dejarlos en un estado que Supabase no espera.
+--     - `extensions` tampoco se declara.  Las dos extensiones que este esquema
+--       necesita se piden con la forma `IF NOT EXISTS`, que es idempotente y no
+--       ata el archivo a un esquema de destino; véase "EXTENSIONES" más abajo.
+--
+-- POR QUÉ EL HISTORIAL VIVE EN `app/supabase/schema-history/`
+--   Porque este archivo no reemplaza al historial: lo resume.  Las 76
+--   migraciones 001-077 (la 032 nunca existió) se movieron ahí con `git mv`,
+--   con su historial de git intacto, por dos razones:
+--
+--     1. Explican el PORQUÉ de cada objeto.  El volcado captura el resultado,
+--        no la razón.  Los `COMMENT ON` de negocio, el motivo de la 074 al
+--        sacar `sede_id` de la exclusión, la 077 que lo elimina de `users`: todo
+--        eso está en el historial, y nada de eso se puede reconstruir leyendo
+--        un volcado.
+--     2. Son el respaldo para regenerar.  Si el volcado se pierde o este
+--        archivo se corrompe, se reaplica el historial y se vuelve a volcar.  Un
+--        archivo único sin el historial debajo no se puede rehacer; el historial
+--        sin el archivo único se puede volver a compactar.
+--
+--   En una base YA construida, el historial no se aplica: son pasos incrementales
+--   que asumen el estado que dejó el anterior.  Para una base nueva, el archivo
+--   único.  Para reconstruir el archivo único, el historial.
+--
+-- LÍNEAS DESCARTADAS DEL VOLCADO (y solo estas tres cosas)
+--
+--   1. Líneas 1 a 4 del volcado: el banner `--` / `-- PostgreSQL database
+--      dump` / `--` y la línea vacía.  Lo que aportaban —de dónde sale y con qué
+--      versiones— queda arriba, en "DE DÓNDE SALE", en español y con los datos
+--      de este volcado.
+--   2. Línea 5 del volcado: el metacomando `\restrict` de psql 18 con su clave
+--      aleatoria de sesión.
+--   3. Línea 8099 del volcado: el metacomando `\unrestrict` correspondiente.
+--
+--   2 y 3 no son SQL: es lo que psql 18 emite alrededor de un volcado para que
+--   no interprete como metacomando lo que en realidad son literales.  Un archivo
+--   de migración se aplica con otros clientes y con versiones anteriores de
+--   `psql`, que no conocen esos metacomandoS; si se dejaran, el metacomando
+--   desconocido abortaría la carga.  La clave que los acompaña es un token
+--   aleatorio por sesión, no información del esquema.
+--
+--   TODO LO DEMÁS SE CONSERVA LITERAL, en particular:
+--
+--     - Los comentarios `-- Name: <objeto>; Type: ...`, que son los marcadores
+--       de sección del volcado y mapean una a una las tablas, funciones,
+--       índices, políticas y disparadores.  Se dejan: sin ellos el archivo se
+--       sigue aplicando igual, pero se pierde la trazabilidad objeto-origen.
+--     - El preámbulo `SET` completo, líneas 10 a 20 del volcado:
+--       `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`,
+--       `transaction_timeout`, `client_encoding`, `standard_conforming_strings`,
+--       `set_config('search_path', '', false)`, `check_function_bodies`,
+--       `xmloption`, `client_min_messages` y `row_security`.  Los timeouts en 0
+--       son lo que permite que la creación de las 36 tablas y los 65 índices no
+--       se corte a mitad; `row_security = off` es lo que permite leer el
+--       catálogo sin que las políticas filtren el volcado;
+--       `check_function_bodies = false` es lo que permite que los cuerpos
+--       plpgsql que llaman a `auth.jwt()` compilen sin que exista el esquema
+--       `auth`.
+--     - `SELECT pg_catalog.set_config('search_path', '', false)`: se conserva.
+--       Véase "EL SEARCH_PATH VACÍO" más abajo.
+--     - Los comentarios de versión del cliente, líneas 7 y 8 del volcado.
+--
+-- EXTENSIONES: `btree_gist` Y `pgcrypto`
+--   El volcado las pide con la forma `IF NOT EXISTS <ext> WITH SCHEMA public`, tal
+--   cual, sin cambiar una palabra.  Comprobado contra un entorno
+--   que imita a Supabase —esquema `extensions` con las dos extensiones ya
+--   instaladas, que es donde las pone la plataforma—: las dos órdenes NO chocan
+--   con nada.  PostgreSQL responde `NOTICE: extension "btree_gist" already
+--   exists, skipping` (idem `pgcrypto`), no da error y no mueve la extensión de
+--   esquema.  `IF NOT EXISTS` resuelve por el NOMBRE de la extensión, no por el
+--   esquema: la cláusula `WITH SCHEMA` solo se mira en el momento de crearla, y
+--   para eso hace falta que la extensión todavía no exista.
+--
+--   La cláusula queda como está porque es la que describe cómo se construyó el
+--   volcado, y porque `public` es un destino válido si algún día hace falta
+--   instalar de verdad.  Si algún día se quisiera atar el archivo al esquema
+--   `extensions` de la plataforma, la cláusula a cambiar sería `WITH SCHEMA
+--   public` por `WITH SCHEMA extensions`, y SOLO en ese caso: con las extensiones
+--   ya instaladas —el caso real de un proyecto Supabase— ninguna de las dos
+--   formas produce diferencia.
+--
+--   Y nada del esquema depende de dónde vivan: la única función de extensión
+--   que el archivo llama sin calificar es `gen_random_uuid()`, que desde
+--   PostgreSQL 13 vive en `pg_catalog` y no en `pgcrypto`.  El esquema de
+--   instalación importaría para el `search_path` de las 27 funciones que lo fijan
+--   a `public`, y ninguna de ellas llama a `digest()`, `crypt()` ni a otra
+--   función de `pgcrypto`.
+--
+-- EL `search_path` VACÍO: POR QUÉ NO ES UN RIESGO AQUÍ
+--   El volcado deja el `search_path` vacío a propósito, y esa línea se conserva.
+--   Con el `search_path` vacío todo nombre sin calificar falla, y por eso cada
+--   objeto del volcado va escrito con su esquema (`public.`).  Es lo que permite
+--   que el archivo sea reproducible sin depender del `search_path` que tenga la
+--   sesión que lo aplica.
+--
+--   El punto delicado es la exclusión `ex_payroll_periods_no_overlap`, que
+--   compara texto con GiST y depende del operator class que aporta `btree_gist`.
+--   Está comprobado, no supuesto:
+--
+--     - El operador `=` de un índice o de una exclusión NO depende del
+--       `search_path`: es un operador binario de `pg_catalog` y se resuelve
+--       siempre.  Comprobado: con el `search_path` vacío, `SELECT 'a' = 'a'`
+--       funciona, mientras que un operador de fuera de `pg_catalog` escrito sin
+--       calificar da `operator does not exist`.
+--     - El operator class NO se busca por nombre, sino como el OPERATOR CLASS
+--       POR DEFECTO del par (método, tipo), y esa búsqueda del catálogo no filtra
+--       por esquema.  Comprobado: con `btree_gist` instalada en `extensions`, el
+--       `search_path` vacío resuelve igual `extensions.gist_text_ops` para el
+--       elemento de texto y `pg_catalog.range_ops` para el `daterange`, y la
+--       exclusión se crea sin error.
+--     - Lo que SÍ depende del `search_path` es nombrar el operator class de
+--       forma explícita —`... USING gist (frequency gist_text_ops)`, que con el
+--       `search_path` vacío falla con `operator class "gist_text_ops" does not
+--       exist`—.  El volcado nunca lo hace: usa el operator class por defecto.
+--       Ese es el único escenario en el que la ubicación de `btree_gist`
+--       importaría, y este archivo no lo tiene.
+--
+--   Conclusión: el `search_path` vacío se queda.  Fijar uno explícito al
+--   principio del archivo (`public, extensions`) no hace falta y sí haría daño:
+--   habilitaría resolución implícita justo donde el volcado no la quiere, y
+--   ataría el archivo a un esquema de plataforma que puede no existir.
+--
+-- =============================================================================
+-- Cuerpo del volcado, literal, desde la línea 7 del original.
+-- =============================================================================

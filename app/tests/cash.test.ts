@@ -423,7 +423,7 @@ describe("cash: acumulado del día = suma de turnos (CAJ-05)", () => {
 // ------------------------------------------------- migración 006 ---
 
 describe("migración 006_cash.sql (T6)", () => {
-  const sql = readFileSync(join(process.cwd(), "supabase", "migrations", "006_cash.sql"), "utf8");
+  const sql = readFileSync(join(process.cwd(), "supabase", "schema-history", "006_cash.sql"), "utf8");
 
   it("crea cash_registers, cash_shifts y payments con base 200000", () => {
     expect(sql).toContain("CREATE TABLE public.cash_registers");
@@ -708,7 +708,7 @@ describe("cash: T0-a (C1) el arqueo suma cada cobro UNA vez", () => {
 
 describe("cash: T0-a (Defecto 1) el tope de cobro descuenta el recargo emitido", () => {
   const sql = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "031_cash_invoice_payment_integrity.sql"),
+    join(process.cwd(), "supabase", "schema-history", "031_cash_invoice_payment_integrity.sql"),
     "utf8",
   );
 
@@ -1313,7 +1313,7 @@ describe("cash: T0-a (C1) los lectores ya no unen el ledger completo", () => {
       "p_shift_id: shift.id",
     );
     const migration = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "053_cash_payment_state_atomic.sql"),
+      join(process.cwd(), "supabase", "schema-history", "053_cash_payment_state_atomic.sql"),
       "utf8",
     );
     expect(migration).toMatch(/cash_shift_id/,);
@@ -1411,7 +1411,7 @@ describe("billing: T0-a (C2) tope de cobro en BD traducido a OVERPAID", () => {
 
 describe("migración 031_cash_invoice_payment_integrity.sql (T0-a)", () => {
   const sql = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "031_cash_invoice_payment_integrity.sql"),
+    join(process.cwd(), "supabase", "schema-history", "031_cash_invoice_payment_integrity.sql"),
     "utf8",
   );
 
@@ -3229,7 +3229,7 @@ describe("cash: CL-17 el cobro cierra la factura con sus datos y no cae en un tu
 
 describe("migración 056_collection_closes_invoice.sql (CL-17)", () => {
   const raw = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "056_collection_closes_invoice.sql"),
+    join(process.cwd(), "supabase", "schema-history", "056_collection_closes_invoice.sql"),
     "utf8",
   );
   // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
@@ -3907,7 +3907,7 @@ describe("cash: CL-4 el reintento de un pago de cajón sin factura no cuenta el 
 
   it("la migración 043 agrega la marca con un índice único PARCIAL por turno y no reescribe filas", () => {
     const raw = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "043_cash_box_payment_idempotency.sql"),
+      join(process.cwd(), "supabase", "schema-history", "043_cash_box_payment_idempotency.sql"),
       "utf8",
     );
     // La prosa explica justamente lo que NO hace el archivo y nombra esas
@@ -4163,7 +4163,7 @@ describe("cash: U3 un cierre firmado es inmutable y se corrige con un reconteo",
 
 describe("migración 033_closed_shift_recount.sql (U3)", () => {
   const sql = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "033_closed_shift_recount.sql"),
+    join(process.cwd(), "supabase", "schema-history", "033_closed_shift_recount.sql"),
     "utf8",
   );
 
@@ -6198,7 +6198,7 @@ describe("cash: CL-20 el cierre tampoco firma un arqueo al que le faltan las SAL
 describe("migración 049_cash_shift_atomic.sql (CL-10)", () => {
   const migration = (): { raw: string; sql: string } => {
     const raw = readFileSync(
-      join(process.cwd(), "supabase", "migrations", "049_cash_shift_atomic.sql"),
+      join(process.cwd(), "supabase", "schema-history", "049_cash_shift_atomic.sql"),
       "utf8",
     );
     // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
@@ -6371,7 +6371,7 @@ describe("migración 049_cash_shift_atomic.sql (CL-10)", () => {
 
 describe("migración 053_cash_payment_state_atomic.sql (CL-14)", () => {
   const raw = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "053_cash_payment_state_atomic.sql"),
+    join(process.cwd(), "supabase", "schema-history", "053_cash_payment_state_atomic.sql"),
     "utf8",
   );
   // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
@@ -6541,7 +6541,7 @@ describe("migración 053_cash_payment_state_atomic.sql (CL-14)", () => {
 
 describe("migración 058_close_arqueo_consistency.sql (CL-19)", () => {
   const raw = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "058_close_arqueo_consistency.sql"),
+    join(process.cwd(), "supabase", "schema-history", "058_close_arqueo_consistency.sql"),
     "utf8",
   );
   // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
@@ -6793,7 +6793,7 @@ describe("migración 058_close_arqueo_consistency.sql (CL-19)", () => {
 
 describe("migración 059_close_arqueo_outflows.sql (CL-20)", () => {
   const raw = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "059_close_arqueo_outflows.sql"),
+    join(process.cwd(), "supabase", "schema-history", "059_close_arqueo_outflows.sql"),
     "utf8",
   );
   // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
@@ -7357,7 +7357,7 @@ describe("cash: 414 los filtros .in(...) de caja van troceados", () => {
 // ---------------------------------------------------------------------------
 
 describe("migración 071_rpc_single_sede.sql (caja)", () => {
-  const path = join(process.cwd(), "supabase", "migrations", "071_rpc_single_sede.sql");
+  const path = join(process.cwd(), "supabase", "schema-history", "071_rpc_single_sede.sql");
   const raw = readFileSync(path, "utf8").replace(/\r\n/g, "\n");
   // El SQL sin comentarios: las aserciones miran las sentencias, no la prosa.
   const sql = raw

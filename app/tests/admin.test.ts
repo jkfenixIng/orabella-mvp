@@ -122,7 +122,7 @@ const COLUMNAS_REALES: Record<string, Set<string>> = (() => {
   const porTabla: Record<string, Set<string>> = Object.fromEntries(
     tablas.map((tabla) => [tabla, new Set<string>()]),
   );
-  const dir = join(process.cwd(), "supabase", "migrations");
+  const dir = join(process.cwd(), "supabase", "schema-history");
   for (const archivo of readdirSync(dir).filter((nombre) => nombre.endsWith(".sql")).sort()) {
     const sql = readFileSync(join(dir, archivo), "utf8");
     for (const tabla of tablas) {
@@ -947,7 +947,7 @@ describe("admin: requireSedeRole (puro)", () => {
 
 describe("migración 039_atomic_role_replacement.sql (CO-2)", () => {
   const sql = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "039_atomic_role_replacement.sql"),
+    join(process.cwd(), "supabase", "schema-history", "039_atomic_role_replacement.sql"),
     "utf8",
   );
 
@@ -1017,7 +1017,7 @@ describe("migración 039_atomic_role_replacement.sql (CO-2)", () => {
 
 describe("migración 040_ensure_user_has_role.sql (CO-4)", () => {
   const sql = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "040_ensure_user_has_role.sql"),
+    join(process.cwd(), "supabase", "schema-history", "040_ensure_user_has_role.sql"),
     "utf8",
   );
 
@@ -1377,7 +1377,7 @@ describe("admin: red de seguridad de roles al crear empleado (CO-3)", () => {
 });
 
 describe("migración 003_admin.sql (T3)", () => {
-  const sql = readFileSync(join(process.cwd(), "supabase", "migrations", "003_admin.sql"), "utf8");
+  const sql = readFileSync(join(process.cwd(), "supabase", "schema-history", "003_admin.sql"), "utf8");
 
   it("crea las 5 tablas con triggers set_updated_at", () => {
     for (const table of ["sedes", "employees", "services", "tax_configs", "payment_methods"]) {
@@ -1608,7 +1608,7 @@ describe("admin: alta de empleado atómica (CL-15 / ADM-02)", () => {
 
 describe("migración 054_identity_atomic.sql: la función del alta de empleado (CL-15)", () => {
   const sql = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "054_identity_atomic.sql"),
+    join(process.cwd(), "supabase", "schema-history", "054_identity_atomic.sql"),
     "utf8",
   );
 
@@ -1891,7 +1891,7 @@ describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", ()
     "utf8",
   );
   const migration065 = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "065_employee_pay_frequency.sql"),
+    join(process.cwd(), "supabase", "schema-history", "065_employee_pay_frequency.sql"),
     "utf8",
   );
 
@@ -2069,7 +2069,7 @@ describe("admin: la UI de usuarios no ofrece el rol de plataforma (guarda de fue
 
 describe("migración 069_superadmin_role.sql (G1)", () => {
   const raw = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "069_superadmin_role.sql"),
+    join(process.cwd(), "supabase", "schema-history", "069_superadmin_role.sql"),
     "utf8",
   );
   const sql = raw
@@ -2108,7 +2108,7 @@ describe("migración 069_superadmin_role.sql (G1)", () => {
 
 describe("migración 070_sedes_unique_name.sql (G2)", () => {
   const raw = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "070_sedes_unique_name.sql"),
+    join(process.cwd(), "supabase", "schema-history", "070_sedes_unique_name.sql"),
     "utf8",
   );
   const sql = raw
@@ -2340,7 +2340,7 @@ function esquemaSedeObligatoria(): {
   porClavePrimaria: string[];
   yaNulables: string[];
 } {
-  const dir = join(process.cwd(), "supabase", "migrations");
+  const dir = join(process.cwd(), "supabase", "schema-history");
   const obligatorias = new Set<string>();
   const porClavePrimaria = new Set<string>();
   const yaNulables = new Set<string>();
@@ -2379,7 +2379,7 @@ function esquemaSedeObligatoria(): {
 
 describe("migración 073_sede_id_nullable.sql (M3b)", () => {
   const raw = readFileSync(
-    join(process.cwd(), "supabase", "migrations", "073_sede_id_nullable.sql"),
+    join(process.cwd(), "supabase", "schema-history", "073_sede_id_nullable.sql"),
     "utf8",
   );
   /** El archivo sin comentarios: lo que el runner envía a la base. */
@@ -2562,7 +2562,7 @@ function normalizar(sql: string): string {
   return sql.replace(/\s+/g, " ").trim();
 }
 
-const DIR_MIGRACIONES = join(process.cwd(), "supabase", "migrations");
+const DIR_MIGRACIONES = join(process.cwd(), "supabase", "schema-history");
 
 /**
  * Las migraciones que la 074 tiene DELANTE: las numeradas por debajo de ella, en

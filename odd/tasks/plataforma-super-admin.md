@@ -57,9 +57,11 @@ Dos agujeros que ya existen y que esta capa cierra:
 
 **Decisión.** El proyecto no es "una sede por ahora": es de **una sola sede,
 físicamente**. Hay un salón y no hay plan de otro. La premisa que justificaba el
-diseño multi sede desapareció, y con ella la columna `sede_id`, que se va a
-eliminar. Esto no es un matiz: lo que este documento decidió *por sede* queda sin
-objeto y no debe volver a decidirse así.
+diseño multi sede desapareció, y con ella la columna `sede_id` de los datos de
+negocio, que se va a eliminar. Esto no es un matiz: lo que este documento decidió
+*por sede* queda sin objeto y no debe volver a decidirse así. La excepción es
+`users.sede_id`, que sobrevive y no es una decisión por sede: es el anclaje de la
+cuenta a la instalación (ver «Pendientes abiertos»).
 
 ### Qué sobrevive y qué no
 - **VIGENTE**: el rol `superadmin` como rol ADICIONAL (no es una sede), la guarda
@@ -97,17 +99,18 @@ objeto y no debe volver a decidirse así.
   es lo que eligió el dueño. → `072_system_settings.sql`; `voucher_settings` queda
   con sus datos y ya nadie la lee ni la escribe.
 - **M3c — Pendiente, IRREVERSIBLE, y reubicada (2026-10-02).** La migración que
-  elimina la columna: 33 políticas, 2 claves primarias, el `EXCLUDE`, ~17 índices y
-  la columna en 21 tablas. — Sigue siendo el paso irreversible, pero ya no se
-  escribe a mano sobre el historial: viaja como `002_*.sql` **encima** del squash
-  (`app/supabase/squash/README.md`, punto 6), que es donde está hoy el inventario
-  vigente de lo que la columna arrastra. Antes de él ya corrieron 073 (se relaja el
-  `NOT NULL` de 18 tablas), 074 (diez unicidades y el `EXCLUDE` sin `sede_id`) y
-  075 (la clave de la regla de comisión, de instalación).
-- **M4 — Pendiente.** Aplastar las 75 migraciones (74 archivos en disco) en UN solo
-  archivo aplicado, archivar la historia fuera de la carpeta, resetear las bases y
-  diffear el esquema antes y después. Procedimiento ya escrito en
-  `app/supabase/squash/README.md`.
+  elimina la columna de los DATOS DE NEGOCIO: 27 políticas, 2 claves primarias, el
+  `EXCLUDE`, ~17 índices y la columna en 20 tablas. **Ya no se escribe a mano sobre
+  el historial**: viaja como `077_drop_sede_id.sql`, la última de la serie de
+  migraciones, en su propio lugar y no encima de un dump. Antes de ella ya
+  corrieron 073 (se relaja el `NOT NULL` de 18 tablas), 074 (diez unicidades y el
+  `EXCLUDE` sin `sede_id`) y 075 (la clave de la regla de comisión, de instalación).
+- **M4 — Descartado (2026-10-02).** Aplastar las 76 migraciones en un solo archivo
+  aplicado. **El dueño evaluó el squash y lo descartó**: el historial de migraciones
+  queda como está, un archivo por unidad, y la carpeta sigue siendo la fuente del
+  orden y del porqué. El procedimiento que se había escrito en
+  `app/supabase/squash/README.md` queda sin ejecutar; no es que se fechara para más
+  tarde, es que no se va a hacer.
 
 **Por qué este orden.** El borrado de la columna va **al final** porque es el único
 paso que no se deshace volviendo el código de la aplicación a su estado anterior. Las
@@ -141,24 +144,48 @@ es lo que hay que reponer cuando una consulta nueva se escriba. La capa de datos
 sigue usando `service_role` y salta RLS: eso no cambió, y sigue siendo el hecho que
 obliga a que las guardas estén en todas partes.
 
-**Lo que NO se cerró aquí.** El `DROP COLUMN` físico es M3c y viaja dentro de la serie
-del squash, como `002_*.sql` aplicado encima de `001_orabella_schema.sql` (punto 6 de
-`app/supabase/squash/README.md`). Desde la 073 nada lee ni escribe la columna en el
-negocio, así que el paso quedó reducido al borrado mecánico sobre el dump, y las
-fronteras por fila ya están resueltas por la 074 y la 075.
+**Lo que NO se cerró aquí.** El `DROP COLUMN` físico es M3c y viaja como
+`077_drop_sede_id.sql`, la última migración de la serie y el único paso
+irreversible. Desde la 073 nada lee ni escribe la columna en el negocio, así que el
+paso quedó reducido al borrado mecánico, y las fronteras por fila ya están
+resueltas por la 074 y la 075.
+
+**El squash está descartado.** Mientras la 077 estaba por escribirse, el plan era
+escribirla como `002_*.sql` encima de un `001_orabella_schema.sql` aplastado. El
+dueño evaluó esa vía y la descartó: **el historial de migraciones queda como
+está**, un archivo por unidad. La 077 es una migración más de la serie, con su
+pre-vuelo, su ACL y su `COMMENT` como las demás, y no un parche sobre un dump.
 
 ### Pendientes abiertos
 - La fila de sede inactiva retirada `Plataforma (sistema)` **todavía existe** en la base
-  del dueño: es residuo de la estructura multi sede. Hay que borrarla **antes del
-  aplastamiento (M4)**, porque ninguna migración la va a acarrear cuando se elimine la
-  columna. El script de super admin exige exactamente **una** sede **activa**
-  (`leerSedeDeLaInstalacion`) y **no cuenta las inactivas**, así que esa fila no lo
-  bloquea hoy: es limpieza pendiente, no un bloqueo.
-- ¿Se puede borrar también `users.sede_id`? Hoy ancla la cuenta de plataforma
-  (`users.sede_id` es NOT NULL). Decisión abierta para M3c/M4.
-  — **Precisión de 2026-10-02**: `users.sede_id` dejó de ser obligatorio con la 073
-  y hoy se usa para anclar la cuenta y acotar el listado de usuarios de
-  administración; no autoriza nada del negocio.
+  del dueño: es residuo de la estructura multi sede. Hay que borrarla **antes de
+  aplicar la `077_drop_sede_id.sql`**, aunque no la bloquee: ninguna migración la va
+  a acarrear cuando se elimine la columna de las tablas de negocio. El script de
+  super admin exige exactamente **una** sede **activa** (`leerSedeDeLaInstalacion`)
+  y **no cuenta las inactivas**, y el pre-vuelo 1.3 de la 077 también cuenta sólo
+  las activas, así que esa fila no detiene la migración: es limpieza pendiente, no un
+  bloqueo. (La fila se referencia desde `users.sede_id`, que la 077 conserva, así que
+  borrarla no la deja colgando.)
+- ~~¿Se puede borrar también `users.sede_id`?~~ — **DECIDIDO el 2026-10-02: NO.**
+  La columna **se conserva**, y el motivo está escrito en el bloque de alcance del
+  encabezado de `077_drop_sede_id.sql`. No es una clave multi-sede ni una deuda
+  pendiente: cumple dos funciones reales. (1) Ancla la cuenta a la instalación
+  única —la fila de `sedes` que la describe—. (2) Es el origen de `session.sedeId`
+  en `src/features/auth/service.ts`, del que dependen las siete guardas de sesión
+  (`requireAdminSession`, `requireSession`, `requireBillingSession`,
+  `requireCashSession`, `requireInventorySession`, `requirePayrollAdmin` y
+  `requirePlatformAdmin`), que protegen toda ruta autenticada. El modelo de sesión
+  no se cambia en esta unidad: es un contrato de siete guardas y diez puntos de
+  llamada repartidos entre seis features, y no es un efecto colateral de borrar
+  una columna.
+  Consecuencia: `users.sede_id` sobrevive a la 077, con su clave foránea y su
+  índice; sobreviven también `pol_users_sede_isolation`,
+  `pol_user_roles_sede_isolation`, `pol_sessions_sede_isolation` y
+  `pol_password_resets_sede_isolation`, y `current_sede_id()` —que la primera llama
+  en su predicado—. Con una sola sede su valor es constante para todas las
+  cuentas y no acota nada: no se usa como filtro de lectura ni de escritura en
+  ninguna ruta del negocio. Si algún día hubiera más de una sede, esa columna
+  vuelve a ser el punto de anclaje.
 - Consecuencia concreta de M3b: **quitar `invoice_sequences` reinicia el consecutivo de
   la facturación**. Hay que decidir si el contador arranca de cero o hereda el último
   número en su fila de `system_settings`.
@@ -267,7 +294,7 @@ Fuera:
       interruptor es de la instalación (global). Unidad nueva cuando corresponda
 - [ ] G7 el resto de los módulos, uno por unidad — igual que G6
 - [ ] G8 gate completo + commits por unidad + push — sin marcar: el cierre de unidad vive
-      en el gate de la rama, que sigue en curso con la serie del squash
+      en el gate de la rama, que sigue en curso con la serie de migraciones
 
 ## Authorized scope
 Capa de plataforma, roles, sedes, módulos por sede. Rama `feat/orabella-mvp`.
@@ -302,14 +329,21 @@ Capa de plataforma, roles, sedes, módulos por sede. Rama `feat/orabella-mvp`.
   074 y 075, y `resolveSede` se eliminó. Ver «Cierre de la retirada de sede única».
 - 2026-10-02: cierre de la retirada de sede única. M1, M2, M3a y M3b cerradas;
   `resolveSede` eliminado; la frontera que sobrevive es la de ROL. M3c (el
-  `DROP COLUMN`) queda reubicada dentro de la serie del squash.
+  `DROP COLUMN`) escrita como `077_drop_sede_id.sql`, la última de la serie, con
+  el alcance acotado a las 20 tablas de negocio: `users.sede_id` se conserva
+  (decisión del dueño, «Pendientes abiertos») porque ancla la cuenta a la
+  instalación y alimenta `session.sedeId` y las siete guardas de sesión. M4 (el
+  squash) queda **descartado**: el dueño lo evaluó y el historial de migraciones se
+  queda como está.
 
 ## Next step
-- Continuar la serie del squash (`app/supabase/squash/README.md`): `001_orabella_schema.sql`
-  desde el dump de la base PRUEBAS, y encima el `002_*.sql` que aplica el
-  `DROP COLUMN`. El orden y las condiciones están en el punto 6 de ese manual.
-- Antes del reset: borrar la fila inactiva `Plataforma (sistema)` que sigue en la base
-  del dueño (pendiente abierto más arriba).
+- Aplicar `077_drop_sede_id.sql` (M3c, irreversible). Verifica con las consultas de
+  sólo lectura de las secciones 5 del archivo y de su cabecera.
+- Antes de aplicarla: borrar la fila inactiva `Plataforma (sistema)` que sigue en la
+  base del dueño (pendiente abierto más arriba).
+- Antes de aplicar la 077: la lista de usuarios de administración sigue mostrando la
+  sede de la cuenta, porque `users.sede_id` sobrevive. Si algún día se decide
+  retirarla, es otra unidad y empieza por el modelo de sesión.
 
 ## Route declaration
 - Delegación a `gentle-ai-worker` por unidad, con superficies disjuntas.
