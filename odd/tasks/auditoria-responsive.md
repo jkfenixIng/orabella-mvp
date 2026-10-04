@@ -180,24 +180,92 @@ blanco real**, así que el defecto es menor de lo que parecía por tamaño.
 diálogo) necesita **un período de nómina**, y no hay ninguno: `DraftPayrollTable` sólo se renderiza
 con el detalle del período abierto. El mecanismo está en el código, la medida no se pudo tomar.
 
+## Cómo se presenta la data (criterio del dueño, 2026-10-04)
+
+> *«Hay que tener muy en cuenta el cómo se ve la data en tablas, listas, etc., para que no quede
+> arrumada, sino que pueda usar bien el espacio.»*
+
+Esto **no es un criterio de estética: es el que decide el alcance**. Hasta acá la auditoría midió «¿el
+control es alcanzable?». Este criterio agrega «¿la data se lee bien en ese ancho?», y las dos
+preguntas tienen respuestas distintas: una tabla de 1100 px **contenida en un carril con scroll**
+tiene todos sus botones alcanzables y aun así está arrumada — hay que arrastrar de costado para
+saber cuánto se vendió.
+
+### El estado declarado del repo
+
+El comportamiento actual **no es un descuido: es una decisión vieja y escrita**. `docs/ux-ui-standard.md`
+§5 dice *«En móvil, la tabla se desplaza | No se apilan columnas todavía: es deuda consciente (§9)»* y
+§12 la repite como deuda conocida. **Este criterio la paga**, así que la unidad que la implemente
+también **corrige el estándar y su test**: `ux-data-table.test.ts` hoy **exige** que los `min-w-[Npx]`
+vivran dentro del primitivo, con una allowlist exacta de la deuda.
+
+### El contrato que se adopta
+
+**El criterio es global y verificable; el mecanismo se elige por lista.** No todas las listas son
+iguales: una tabla de 4 filas de impuestos no necesita lo mismo que las 20 filas de facturas del día.
+
+**Criterios de aceptación — medidas, no opinadas:**
+
+1. **Nada importante requiere un gesto horizontal.** El dato que identifica la fila (nombre, número)
+   y el dato de dinero o estado **se ven sin arrastrar**, en 320 px.
+2. **La acción de la fila se ve y se toca sin arrastrar.** Es lo que hoy falla en vales (674 px fuera)
+   y en caja (1100 px) y en el admin (20 botones fuera).
+3. **El espacio vertical es el que se usa.** Un teléfono tiene alto de sobra y ancho de menos: la
+   forma natural de una fila en mobile es **una tarjeta con pares etiqueta/valor**, no una tabla
+   apretada ni una columna escondida.
+4. **Nada de dato importante vive en un tooltip.** El `title=` **no existe con el dedo** (R25, R26):
+   un texto recortado necesita su lectura dentro de la pantalla, no en un hover.
+5. **Densidad declarada, no accidental.** Cada lista dice **qué columnas se ven en qué ancho**; ninguna
+   pierde una columna por accidente del `min-w`. Y una sola escala de anchos: **cero `min-w-[Npx]`
+   fuera del primitivo**.
+
+### El mecanismo, por lista
+
+| Lista | Forma en mobile | Por qué |
+| --- | --- | --- |
+| Facturas, vales, caja, nómina | **Tarjeta por fila** | Son las listas que se leen y se accionan en el mostrador: muchas filas, dinero y estado, y una acción por fila |
+| Admin (empleados, usuarios, roles), inventario, servicios | **Prioridad de columnas + carril** | Listas de consulta y edición, con menos filas y sin una acción dominante por fila: 3-4 columnas declaradas y el resto al detalle |
+| Impuestos, métodos de pago, denominaciones | **Como están** | 2-6 filas de 3 campos: no hay nada que apilar |
+
+**Lo que se construye una sola vez, en las primitivas**: la tarjeta de fila (para que las cuatro
+listas de dinero se vean igual), el carril con la **acción pegada** al borde, la declaración de
+prioridad de columnas y los tokens de tipografía y alto de fila. Cada lista de dinero **no** debe
+inventar su propia tarjeta.
+
+### Por qué no se toca todo de una
+
+Son **11 pantallas y 14 tablas**: una sola unidad sería exactamente el cambio enorme de varias áreas
+que hay que evitar. Va **encadenada por lista**, empezando por las que el mostrador usa en un
+teléfono (facturas, vales, caja), y el estándar se corrige **en la misma unidad** que la primitiva,
+no al final.
+
 ## Tasks
 
-Pendientes de la decisión del dueño sobre el alcance, ordenadas por la regla de primitivas primero:
+El orden no es por severidad aislada: **el contrato de data va antes que los arreglos de acciones de
+fila**, porque arreglar «la acción quedó fuera de pantalla» ensanchando el carril y después volver a
+hacerlo como tarjeta sería pagar dos veces las mismas pantallas.
 
-- [ ] **R-a — las primitivas compartidas**, que es donde cada corrección paga en todas las pantallas:
-      el cajón al `Dialog` de Radix (R2, medido roto por tres vías), el **pie pegajoso** de
-      `form-dialog` (R32, medido), el margen y el `dvh` del diálogo (R7 medido, R8 por regla), el
-      tamaño de los campos (R22: 14 px hace zoom en iOS y quedan en 37), los tokens de
-      `ui-styles` (R11 medido con censo de ~115 subrayados, R14 medido en 36-40), la casilla (R13,
-      16 px medido), el combobox (R37, medido) y el `Select` (R21) **si su medición lo confirma**.
-- [ ] **R-b — el camino de la factura en el teléfono (R33) y las acciones fuera de pantalla**: es el
-      defecto más caro del informe — la pantalla que existe para facturar no factura en un teléfono —
-      junto con admin/servicios/inventario (medido: 20/4/6 botones), caja (R3), vales (R4) y los
-      diálogos de nómina (R34, R5, R6).
-- [ ] **R-c** — el resto de la copia visual (R12, R16→R36, R17→`page.tsx:39`, R19, R20), el cierre
-      visible que falta (R35) y los tooltips que en touch no existen (R25, R26), que no son
-      cosméticos aunque lo parezcan.
-- [ ] **R-d** — la tercera medición, con un período de nómina, para cerrar R5 y el detalle de período.
+- [ ] **R-a — las primitivas compartidas**: el cajón al `Dialog` de Radix (R2, medido roto por tres
+      vías), el **pie pegajoso** de `form-dialog` (R32, medido), el margen y el `dvh` del diálogo (R7
+      medido, R8 por regla), el tamaño de los campos (R22: 14 px hace zoom en iOS y quedan en 37), los
+      tokens de `ui-styles` (R11 medido con censo de ~115 subrayados, R14 medido en 36-40), la casilla
+      (R13, 16 px medido), el combobox (R37, medido) y el `Select` (R21) **si su medición lo confirma**.
+- [ ] **R-e — el contrato de presentación de data**: corregir el estándar (§5 y §12 hoy declaran el
+      scroll como deuda consciente), construir **una sola vez** las piezas reusables (tarjeta de fila,
+      carril con la acción pegada, prioridad de columnas, tokens de alto de fila) y estrenarlas en la
+      **primera lista**: facturas. El test que hoy exige `min-w-[Npx]` dentro del primitivo se
+      actualiza junto con el estándar, no después.
+- [ ] **R-e2 — las otras dos listas de mostrador**: vales y caja, con las piezas de R-e ya construidas
+      (que es lo que hace que las tres se vean igual).
+- [ ] **R-b — los diálogos que no dejan operar**: el de emisión de factura (R33: **870 px dentro de un
+      modal de 320** — el peor del informe), los de nómina con la acción bajo el pliegue (R34), el
+      cierre visible que no existe (R35) y las acciones de fila del admin, inventario y servicios
+      (medido: 20/4/6 botones fuera).
+- [ ] **R-c — lo que se ve mal o no se puede leer**: el resto de la copia visual (R12, R16→R36,
+      R17→`page.tsx:39`, R19, R20) y, sobre todo, **la data que vive en tooltips** (R25, R26), que con
+      este criterio deja de ser cosmética: es data que en un teléfono no se puede leer.
+- [ ] **R-d — la tercera medición**, con un período de nómina, para cerrar R5, R6 y verificar el
+      contrato de data con filas reales.
 
 ## Pendiente de medición
 
