@@ -1477,3 +1477,201 @@ Y una advertencia de shell, no de procedimiento: `grep` cuenta líneas con
 `-c`, y `Select-String` devuelve una coincidencia por línea, así que los números
 deben coincidir con los del bash. Si alguno no coincide, el problema casi nunca es
 el conteo: es que se está mirando un archivo distinto del que se generó.
+
+## 8. El RESET del esquema: vaciar `public` sin borrarlo
+
+El manual de arriba resuelve una pregunta —cómo se construye
+`001_orabella_schema.sql`—. Ésta es otra: **cómo se devuelve una base ya
+poblada al estado del archivo único sin perder nada de la plataforma**.
+
+### 8.1 El problema que motiva el procedimiento
+
+La primera versión del reset era:
+
+```sql
+DROP SCHEMA public CASCADE;
+CREATE SCHEMA public;
+-- ... GRANT y ALTER DEFAULT PRIVILEGES de postgres ...
+```
+
+Funciona, y en PRUEBAS se aplicó bien. Pero `DROP SCHEMA` no borra solo objetos:
+borra **el `nspacl` del esquema y las filas de `pg_default_acl` que lo apuntan**.
+Las del rol `postgres` las recrea el propio script; las de los demás roles de la
+plataforma, no. Medido en PRODUCCIÓN (solo lectura):
+
+| rol | `defaclobjtype` | recreable desde `postgres` |
+| --- | --- | --- |
+| `postgres` | `r`, `S`, `f` | sí |
+| `supabase_admin` | `r`, `S`, `f` | **no** |
+
+Son 3 filas por rol, **6 en total**. Por qué no se reponen:
+
+```
+SET ROLE supabase_admin
+  -> ERROR:  permission denied to set role "supabase_admin"
+ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA public ...
+  -> ERROR:  InsufficientPrivilege: permission denied to change default privileges
+```
+
+`postgres` no es superusuario y no es miembro de `supabase_admin`
+(`pg_has_role('postgres','supabase_admin','MEMBER')` → `false` en los dos
+servidores). En PRUEBAS eso es un detalle recuperable. En PRODUCCIÓN es un cambio
+permanente que **nadie puede deshacer desde `postgres`**.
+
+Lo que sí se comprobó es que la pérdida no rompe la aplicación: las tablas
+recreadas heredan las default privileges de `postgres`, y quedan con `anon`,
+`authenticated` y `service_role` en su ACL, que es lo que la app necesita. El
+daño es de plataforma, no funcional.
+
+### 8.2 El procedimiento
+
+En vez de borrar el esquema, se borra **lo que hay dentro**:
+
+1. todas las **relaciones** de `public` con `CASCADE`: tablas, vistas, vistas
+   materializadas, secuencias, tablas foráneas y particionadas (los índices y las
+   constraints van con ellas);
+2. la extensión que vive dentro de `public`, **opcional** (§8.4);
+3. todas las **funciones y procedimientos** con `CASCADE`, dejando fuera los que
+   pertenecen a una extensión;
+4. los **tipos** que no pertenecen a una extensión.
+
+El esquema `public` no se toca. Por eso su ACL y **todas** sus default
+privileges sobreviven, las de los dos roles y las de los que se agreguen después.
+
+El orden importa: primero las relaciones, porque son las que dependen de los
+índices, de las constraints y del `EXCLUDE` que usa las operator classes de
+`btree_gist`; después la extensión, que ya no tiene a quién arrastrar; después
+las funciones y los tipos.
+
+Todo va en **una transacción**: o se vacía `public`, o no se vacía. Y es
+**idempotente**: correrlo dos veces seguidas no falla y no cambia el resultado.
+
+```bash
+psql -v ON_ERROR_STOP=1 -v DROP_BTREE_GIST=0 -f reset-public-sin-borrar-esquema.sql
+```
+
+Después, en el mismo orden de siempre:
+
+```bash
+psql -v ON_ERROR_STOP=1 --single-transaction -f app/supabase/migrations/001_orabella_schema.sql
+psql -v ON_ERROR_STOP=1 --single-transaction -f <datos-de-produccion-adaptados.sql>
+psql -v ON_ERROR_STOP=1 --single-transaction -f app/supabase/seeds/catalog.sql
+```
+
+`catalog.sql` lleva `ON CONFLICT DO NOTHING` en sus ocho sentencias, así que
+aplicado encima de datos reales no pisa nada: solo rellena lo que falte.
+
+### 8.3 Cómo se adapta un volcado de datos al esquema mono-sede
+
+Un `pg_dump --data-only --column-inserts` trae las columnas **nombradas**, y eso
+convierte "quitar `sede_id`" en una operación verificable en vez de una
+sustitución a ciegas: se parsea la lista de columnas y la de valores por
+separado, se borra el par en la misma posición, y se comprueba que el número de
+columnas sigue igual al de valores.
+
+`sede_id` se quita de las 7 tablas que ya no la tienen —`employees`, `services`,
+`payment_methods`, `tax_configs`, `cash_denominations`, `cash_registers`,
+`audit_logs`— y **se conserva en `users`**, que sí la mantiene. Los `id` no se
+tocan: el `id` de la fila de `sedes` y los `sede_id` de `users` siguen
+apuntando el uno al otro, porque ninguno de los dos se reescribe.
+
+`pg_dump` entrecomilla los identificadores, así que `position` (que es palabra
+reservada) sale como `"position"`; un validador de columnas tiene que quitar las
+comillas antes de comparar contra el esquema destino, o va a reportar una columna
+de más que no existe.
+
+### 8.4 La extensión `btree_gist` y por qué el paso es opcional
+
+`btree_gist` vive **dentro** de `public` en PRODUCCIÓN y en PRUEBAS, y
+`001_orabella_schema.sql` la vuelve a crear (`CREATE EXTENSION IF NOT EXISTS
+btree_gist WITH SCHEMA public`). Eso hace que se pueda borrar… pero no hace
+falta: si el esquema no se borra, la extensión tampoco corre peligro.
+
+Medido en el ensayo, sobre una base recién creada en el servidor de PRUEBAS:
+
+| paso | resultado |
+| --- | --- |
+| `CREATE EXTENSION btree_gist WITH SCHEMA public` como `postgres` | propietario resultante: **`supabase_admin`** |
+| `pg_has_role('postgres','supabase_admin','MEMBER')` | `false` |
+| `DROP EXTENSION btree_gist CASCADE` como `postgres` | **funciona** |
+
+O sea: el propietario no es `postgres` (la plataforma se lo asigna al crear la
+extensión) y sin embargo `postgres` sí la puede borrar. Comprobado con
+`DROP_BTREE_GIST=1`, y con esa variante `public` queda **absolutamente vacía**:
+0 relaciones, 0 funciones, 0 tipos, 0 extensiones.
+
+Aun así, la recomendación para PRODUCCIÓN es **`DROP_BTREE_GIST=0`**: no hace
+falta tocar lo que no corre peligro, y con `0` la única diferencia observable es
+que `public` conserva las 188 funciones de soporte de la extensión, que es
+exactamente como está hoy en PRODUCCIÓN.
+
+Lo que **no** se le puede pedir a este procedimiento con `DROP_BTREE_GIST=0` es
+"dejar `public` vacío en absoluto", porque las funciones de la extensión son suyas
+y `postgres` no puede borrarlas sin tirar la extensión. "Vacío" hay que leerlo
+como "vacío de objetos de la aplicación": 0 relaciones, 0 funciones de la app, 0
+tipos propios.
+
+### 8.5 Qué se comprobó, y cómo
+
+El ensayo se hizo entero sobre una base **descartable** del servidor de PRUEBAS
+(`orabella_prod_rehearsal`), con los datos reales de PRODUCCIÓN copiados.
+PRODUCCIÓN solo se leyó, en todo momento.
+
+Antes de aplicar nada, la base descartable se configuró con el mismo `nspacl` y
+las mismas default privileges que tiene PRODUCCIÓN, **para dos roles distintos**,
+que es lo que permite comprobar que sobreviven los de los dos. Al segundo rol no
+se le pudo dar nada siendo `supabase_admin` —`InsufficientPrivilege`, el mismo
+límite del §8.1—, así que se usó `supabase_privileged_role`, del que `postgres` es
+miembro.
+
+Resultado: `nspacl` idéntico antes y después, las **6 filas de `pg_default_acl`
+de los 2 roles** idénticas antes y después, 36 tablas, 36 con RLS, 10 políticas,
+28 funciones, `sede_id` solo en `users`, una sede y activa, 0 `users.sede_id`
+nulas y 0 huérfanas, `payroll_apply_atomic` con una sola firma de 4 argumentos y
+`next_invoice_number` con una sola firma sin argumentos.
+
+Y los datos: los conteos por tabla coinciden con PRODUCCIÓN en las 12 tablas con
+datos, y la comparación **fila por fila** da las 12 tablas idénticas valor por
+valor, con `sede_id` como única columna descartada. `sessions` baja a 0 a
+propósito: son efímeras y están atadas al estado anterior.
+
+`reset-verificacion.sql` (§3) incluye ahora la sección **10.a**, que convierte
+esto en un veredicto y no en una impresión: el `nspacl`, el propietario, los
+roles con default privileges y el número de filas de `pg_default_acl` se comparan
+contra lo que la plataforma deja, y saltan `FALLA` si algo falta. Los roles
+esperados son un parámetro:
+
+```bash
+# en PRODUCCIÓN, con los valores reales del §8.1
+psql -v ON_ERROR_STOP=1 \
+     -v roles_default_esperados='postgres,supabase_admin' \
+     -f app/supabase/squash/reset-verificacion.sql
+
+# sobre la base del ensayo
+psql -v ON_ERROR_STOP=1 \
+     -v roles_default_esperados='postgres,supabase_privileged_role' \
+     -f app/supabase/squash/reset-verificacion.sql
+```
+
+Hoy, sobre PRUEBAS, la 10.a **falla** en las dos filas de default privileges, que
+es la desviación que motivó todo esto:
+
+```
+roles con default privileges  | postgres | postgres,supabase_admin | FALLA
+filas en pg_default_acl       | 3        | 6                        | FALLA
+```
+
+### 8.6 Lo que este procedimiento NO arregla
+
+- **PRUEBAS sigue con las default privileges de `supabase_admin` perdidas.** Este
+  procedimiento evita que vuelvan a perderse; no las repone en una base donde ya
+  desaparecieron. Reponerlas es una operación de plataforma (SQL Editor con
+  `postgres`, o un rol con `ADMIN OPTION` sobre `supabase_admin`), no de este
+  procedimiento.
+- **La extensión y su propietario.** Crear una extensión produce un objeto cuyo
+  propietario es `supabase_admin`, no el rol que la creó (§8.4). Ningún paso de
+  este procedimiento cambia eso.
+- **Los esquemas de plataforma de una base creada desde `template0`.** La base
+  descartable del ensayo tiene `auth` y `extensions`, pero no `storage`, `vault`,
+  `graphql`, `realtime` ni `pgbouncer`. No afecta al reset —que solo toca
+  `public`—, pero ensaya sobre menos superficie de la que hay en PRODUCCIÓN.
