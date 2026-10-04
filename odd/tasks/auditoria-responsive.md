@@ -239,17 +239,64 @@ que hay que evitar. Va **encadenada por lista**, empezando por las que el mostra
 teléfono (facturas, vales, caja), y el estándar se corrige **en la misma unidad** que la primitiva,
 no al final.
 
+### Tercera medición: las primitivas — tres predicciones caídas
+
+De siete predicciones, **tres se cayeron y dos se angostaron**. La lectura de código encontró el
+mecanismo; **sólo la medición dijo si el mecanismo se manifiesta**.
+
+**R21 — REFUTADA, y era la que yo había señalado como la de mayor alcance.** El `Select` **no está
+roto**: `--radix-select-trigger-height` computa 40 px, el viewport mide **208 / 208 / 268 / 228** en
+los cuatro anchos, las **4 opciones se ven enteras en los cuatro**, el viewport no scrollea
+(`scrollHeight == clientHeight`), cada opción se devuelve a sí misma en `elementFromPoint` y hacer
+clic en la última cambia el valor del disparador. **Mecanismo**: Radix pone `flex: 1 1 0%` **inline**
+en el Viewport y eso gana sobre la clase `h-[var(--radix-select-trigger-height)]` — la clase es un
+**no-op** (forzando `flex: none` el viewport mide exactamente 40 px). Mi lectura del código era
+correcta y mi conclusión era falsa, por una interacción de especificidad. **No hay unidad que crear.**
+
+**R15 — REFUTADA.** No hay scroll fantasma: en `/alerts`, `/services` y `/vales` a 390 el
+`scrollHeight` es 907 contra 844, y forzando `min-height: 0` **sigue siendo 907**: los 63 px son
+contenido real, no el `min-h-screen`.
+
+**R28 — REFUTADA donde se pudo medir.** La fila de paginación de facturas mide 222 = 222 y las filas
+de caja 125 = 125, sin desborde. Las de alertas y la paginación de inventario no se renderizaron
+(sin datos): no verificadas, no refutadas.
+
+**R37 — MATIZADA.** A 320 la lista se sale del diálogo **98 px**, no voltea y no portalea — pero **la
+última opción sí es alcanzable** después de scrollear el diálogo, porque la propia lista agrega ese
+rango al scroll. No es inalcanzable: es incómodo. Baja de severidad, no desaparece.
+
+**R1 — CONFIRMADA, más angosta de lo que la lectura decía.** La colisión es real **sólo a 320×568**:
+la barra se pega en `top 0..114`, el encabezado ocupa `0..63`, y `elementFromPoint` en el centro de
+«Crear producto» devuelve el título «Orabella» — **no es clickeable**. A 360 y 390 no hay scroll
+suficiente para llegar a ese estado.
+
+**R32 — CONFIRMADA, y ahora con alcance**: en **tres** diálogos hay que scrollear para guardar.
+«Crear producto» no llega a 360/320 (819 > 606/534); **«Nuevo empleado» no llega en ningún ancho**
+(1471-1527); **«Emitir factura» tampoco** (1005). «Registrar movimiento» sí entra.
+
+**R22 — CONFIRMADA, y es peor de lo que parecía**: los campos miden **14 px** (bajo el umbral de 16 que
+dispara el zoom de iOS) y **38-40 px de alto**; el botón primario 36; la casilla 16×16. Y el piso de 44
+**no es un problema de mobile**: a 1024 hay 22 elementos interactivos y **los 22 están bajo 44**. Es una
+decisión de densidad de toda la aplicación, no un defecto de ancho.
+
+**R7 — CONFIRMADA**: gutter 0 a 320/360/390 — y **también a 1024** en el diálogo de emisión (`p-0`,
+1024 de ancho, gutter 0 en los dos lados).
+
 ## Tasks
 
 El orden no es por severidad aislada: **el contrato de data va antes que los arreglos de acciones de
 fila**, porque arreglar «la acción quedó fuera de pantalla» ensanchando el carril y después volver a
 hacerlo como tarjeta sería pagar dos veces las mismas pantallas.
 
-- [ ] **R-a — las primitivas compartidas**: el cajón al `Dialog` de Radix (R2, medido roto por tres
-      vías), el **pie pegajoso** de `form-dialog` (R32, medido), el margen y el `dvh` del diálogo (R7
-      medido, R8 por regla), el tamaño de los campos (R22: 14 px hace zoom en iOS y quedan en 37), los
-      tokens de `ui-styles` (R11 medido con censo de ~115 subrayados, R14 medido en 36-40), la casilla
-      (R13, 16 px medido), el combobox (R37, medido) y el `Select` (R21) **si su medición lo confirma**.
+- [ ] **R-a — las primitivas compartidas**: el cajón al `Dialog` de Radix (R2: Escape no cierra, el
+      foco se escapa al decimosegundo tabulador, el fondo scrollea y el foco no se restaura), el **pie
+      pegajoso** de `form-dialog` (R32: medido en «Nuevo empleado», «Emitir factura» y «Crear
+      producto»), el margen y el `dvh` del diálogo (R7 medido con gutter 0, R8 por regla), el tamaño de
+      los campos (R22: 14 px y 38-40 de alto, con el piso de 44 incumplido **también en escritorio**),
+      los tokens de `ui-styles` (R11 medido con censo de ~115 subrayados, R14 medido en 36-40), la
+      casilla (R13, 16 px medido) y el combobox (R37, medido y matizado: no portalea ni voltea).
+      **Fuera de esta unidad, por refutadas**: R21 (el `Select` **no** está roto) y R15 (no hay scroll
+      fantasma).
 - [ ] **R-e — el contrato de presentación de data**: corregir el estándar (§5 y §12 hoy declaran el
       scroll como deuda consciente), construir **una sola vez** las piezas reusables (tarjeta de fila,
       carril con la acción pegada, prioridad de columnas, tokens de alto de fila) y estrenarlas en la
@@ -269,9 +316,11 @@ hacerlo como tarjeta sería pagar dos veces las mismas pantallas.
 
 ## Pendiente de medición
 
-- **R21 (el `Select` atado a la altura del disparador)**: lo mide la pasada de primitivas, y decide si
-  existe una unidad entera.
 - **R5 y R6** con un período real: el detalle de período necesita que exista al menos uno.
+- **R28** en alertas y en la paginación de inventario: no se renderizaron por falta de datos.
+- Lo que la medición headless **no puede** ver: el efecto real de la barra del navegador
+  (`100vh == 100dvh == visualViewport.height` en los 16 casos, así que R8 se corrige por la regla del
+  repo y no por una medición).
 
 ## Qué NO se pudo alcanzar sin crear datos
 
