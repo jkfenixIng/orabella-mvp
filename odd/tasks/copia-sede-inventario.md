@@ -73,6 +73,29 @@ instalación única.
 2. **El SKU (B-inventario)**: la copia contradice el código que corre.
 3. **El código de empleado (B-admin)**: la misma contradicción, y esta sí salta en un guardado.
 
+## Decisión del dueño (2026-10-04)
+
+**El vocabulario es «instalación» y el barrido va completo**, no solo sobre los falsos: *«no hay
+sedes así que hay que modificar si dice algo relevante o real»*. Las 73 cadenas se revisan.
+
+La regla que se aplica a cada una, en este orden:
+
+1. **Si la frase afirma un alcance que se retiró, se reescribe** —no se le cambia la palabra—:
+   la unicidad del SKU y del código de empleado es global, y el 403 de caja viene del rol.
+2. **Si nombra a la instalación, dice «instalación»**: «Servicios de la instalación», «no
+   encontrado en la instalación», «no está activo en la instalación».
+3. **Si la condición existe de verdad, se conserva la condición y cambia la palabra**:
+   `users.sede_id` es el ancla de la cuenta, así que «El usuario no tiene sede asignada» pasa a
+   «El usuario no tiene instalación asignada» — la guarda no se toca, el vocabulario sí.
+
+## Tasks
+
+- [ ] **U16** — Las 59 cadenas legítimas, encadenadas por módulo (facturas, vales, caja, admin,
+      servicios, alertas, inventario). Corre **después** de `fecha-arranque-automatica.md`, que es
+      dueña de los mensajes de nómina y de la retirada de `/plataforma`: acá no se toca ninguno de
+      los dos.
+- [ ] **U17** — Gate completo (suite, typecheck, eslint) y commits por unidad.
+
 ## Incertidumbre declarada
 
 El alcance de los métodos de pago y de los mensajes de período se verificó leyendo los
