@@ -1,15 +1,21 @@
 # Squash del esquema — manual del operador
 
-Este archivo es el procedimiento que se sigue **antes** de que exista
-`app/supabase/migrations/001_orabella_schema.sql`. No es documentación del
-esquema: es la lista ordenada de pasos que produce el archivo único, con los
-comandos exactos y las comprobaciones que tienen que salir limpias.
+Este archivo es el procedimiento del squash. `app/supabase/migrations/001_orabella_schema.sql`
+ya existe y está commiteado: lo que este manual describe es cómo se **vuelve a
+producir**, y la diferencia es que ahora ese procedimiento es un script
+(`app/supabase/squash/build-schema.py`) que se corre, y que al terminar
+compara el resultado con el archivo commiteado sha256 contra sha256.
+
+No es documentación del esquema: es el procedimiento que lo produce, con sus
+requisitos, sus comandos exactos y las comprobaciones que tienen que salir
+limpias.
 
 Alcance de este manual:
 
 - el proyecto vive en `D:/u/orabella` y la aplicación en `D:/u/orabella/app`;
-- la fuente es una base con el historial completo aplicado (serie 001-077; 76
-  archivos en `app/supabase/schema-history/`, la 032 nunca existió);
+- la fuente es la serie histórica completa aplicada sobre una base **descartable**
+  (serie 001-077; 76 archivos en `app/supabase/schema-history/`, la 032 nunca
+  existió), no el estado en que esté la base de PRUEBAS (ver 3.1);
 - el resultado es un solo archivo aplicado: `001_orabella_schema.sql`, y el
   historial queda en `app/supabase/schema-history/` como respaldo y como
   explicación (punto 6).
@@ -28,157 +34,184 @@ eso la fuente del archivo único es un `pg_dump --schema-only` de una base con l
 serie aplicada: el volcado no interpreta el historial, describe el resultado, de
 modo que lo sustituye sin que nadie tenga que reconstruir por lectura qué
 declaración sobrevive al final. Lo único que no sale de un `--schema-only` son los
-permisos, y por eso hay una segunda pasada explícita para ellos (2.4).
+permisos, y por eso el volcado del procedimiento va **sin** `--no-privileges`
+(2.4): los `REVOKE` y `GRANT` de las funciones son parte del objeto.
 
 ---
 
-## 2. Los comandos, en orden
+## 2. El procedimiento vigente: un comando
 
-Cada paso depende del anterior. No se salta ninguno.
+El squash ya no se hace a mano. Lo hace **un script commiteado y
+reproducible**: `app/supabase/squash/build-schema.py`. Corre la serie completa
+sobre una base DESCARTABLE del servidor de PRUEBAS, la vuelca, ensambla el
+archivo único y —esto es lo que lo hace un procedimiento y no un juego— **compara
+el resultado con el archivo commiteado, sha256 contra sha256**.
 
-Los bloques de este manual son **bash** (en esta máquina, el bash de Git, que es
-donde están `psql`, `pg_dump` y `createdb` del PostgreSQL 18).
+Los bloques de este manual son **bash** (en esta máquina, el bash de Git). Si la
+terminal es PowerShell, el bloque de la sección 7 es el equivalente comando a
+comando; pero el procedimiento, su orden y sus verificaciones son los mismos, y
+el script no necesita traducción porque es Python nativo de Windows.
 
-Si la terminal es PowerShell, ninguno de esos bloques se puede copiar tal cual:
-`export`, `read -rs`, `$(…)`, `<<'SQL'`, `sed`/`grep`/`diff <(…)` y
-`{ } > tmp && mv` no existen ahí. El equivalente de cada comando está en la
-**sección 7**, en el mismo orden y con los mismos parámetros. El paso 2.2 (la
-clave) tiene su forma propia en 7.2.
-
-### 2.1 Preparación: carpeta de trabajo
-
-```bash
-cd D:/u/orabella/app
-mkdir -p supabase/squash/_verif
-WORK=supabase/squash/_verif
-```
-
-`_verif/` es desechable. `.gitignore` **no** tiene una regla para esa carpeta: no
-la agregues al índice ni la subas.
-
-### 2.2 La credencial, sin pegarla en el documento ni en el historial
-
-La conexión se describe con variables de `libpq`, no con una URI en la línea de
-comandos. Dos vías, en orden de preferencia.
-
-**Vía A — `~/.pgpass` (recomendada).** `psql` y `pg_dump` la leen solos: la
-clave no aparece ni en el historial ni en la lista de procesos.
-
-```
-# ~/.pgpass    (en Windows: %APPDATA%\postgresql\pgpass.conf)
-# formato: host:port:base:usuario:clave
-db.xxxxxxxxxxxx.supabase.co:5432:postgres:xxxxxxxx:CLAVE_DE_LA_BASE
-```
-
-La clave es la de la **base de datos** (Dashboard → Settings → Database →
-Connection string → DB password). **No** es la `service_role` ni la `anon`: esas
-son llaves de la API, no credenciales de PostgreSQL, y no sirven para conectar.
+### 2.1 El comando
 
 ```bash
-chmod 600 ~/.pgpass        # sólo en POSIX; libpq en Windows ignora los permisos
+cd D:/u/orabella
+python app/supabase/squash/build-schema.py
 ```
 
-Usa la conexión directa o el pooler de **sesión** (puerto `5432`). Evita el
-`6543` (transaction pooler) para `pg_dump`: corta la sesión entre sentencias y
-el volcado queda abierto a esa variación.
+Códigos de salida, porque un procedimiento que no dice cómo falla no es un
+procedimiento:
 
-**Vía B — Variable de entorno leída sin eco**, solo si no se puede escribir
-`~/.pgpass`. Se escribe en la sesión actual; no se teclea `export
-PGPASSWORD=...` a mano, porque eso sí queda en el historial.
+| código | qué pasó |
+| --- | --- |
+| `0` | todo salió bien **y** el archivo ensamblado es idéntico al commiteado |
+| `2` | se abortó una guarda: credenciales, prod == pruebas, encabezado inválido, volcado con otra forma |
+| `3` | una migración falló y no se pidió el modo provisional: **no** se produjo volcado |
+| `4` | lo ensamblado **no** coincide con el archivo commiteado, y sin `SQUASH_ESCRIBIR=1` no se escribe nada |
+
+### 2.2 Requisitos
+
+- **`~/orabella-db/pruebas.conninfo`**: la credencial de PRUEBAS, en formato
+  conninfo de libpq (`host`, `port`, `dbname`, `user`, `password`). Vive FUERA
+  del repo y no se pega en ningún lado: el script la lee, y la clave llega a
+  `psql` y a `pg_dump` por el entorno (`PGPASSWORD`), nunca en una línea de
+  comandos. Es la clave de la base de datos (Dashboard → Settings → Database →
+  DB password), no la `service_role` ni la `anon`.
+- **`~/orabella-db/prod.conninfo`**: la de producción, leída **solo** para
+  comparar `host` y `user` con la de pruebas. Si coinciden, el script aborta sin
+  conectarse a nada. Con esto, un conninfo mal puesto no puede convertir una
+  corrida de ensayo en una escritura sobre producción.
+- **Cliente PostgreSQL 18.3 en `PATH`** (`psql` y `pg_dump`). El archivo
+  commiteado lo emitió esa versión; con otra, cambian las cabeceras de sección y
+  la comparación sha256 falla por el cliente, no por el esquema.
+- **Python 3.11 con `psycopg` 3** (`pip install "psycopg[binary]"`). Es el mismo
+  intérprete nativo de Windows; el script usa `os.path.expanduser("~")` para el
+  directorio de trabajo, así que no depende de `/tmp`.
+- **`app/supabase/squash/_platform_fixture.sql`**: el stub descartable de
+  `auth.jwt()`. El script lo **copia** a `~/orabella-db/_platform_fixture.sql` y
+  lo aplica ahí, antes de la 001. En el repo solo se lee.
+- **La base descartable `orabella_build`**, en el servidor de PRUEBAS. No hace
+  falta crearla: el script hace `DROP DATABASE IF EXISTS ... WITH (FORCE)` +
+  `CREATE DATABASE` en cada corrida, que es lo que la hace reproducible.
+
+### 2.3 Lo que hay en `app/supabase/squash/`
+
+| archivo | qué es |
+| --- | --- |
+| `build-schema.py` | el procedimiento: construye, vuelca, ensambla y compara |
+| `schema-header.sql` | las 188 líneas de prosa del encabezado del archivo único. **No se genera**: se concatena tal cual. Cambia cuando cambia el inventario o la explicación, y el cambio se escribe a mano y se revisa como prosa |
+| `_platform_fixture.sql` | el stub de `auth.jwt()`, descartable, para que el historial compile en una base nueva |
+| `README.md` | este manual |
+
+La serie histórica ya **no** está en `app/supabase/migrations/`: está en
+`app/supabase/schema-history/`, y de ahí la lee y la aplica el script.
+
+### 2.4 Qué hace, paso a paso
+
+1. **Guardas.** Lee los dos conninfo, verifica que el host y el usuario de
+   pruebas no sean los de producción, y que `orabella_build` no sea el
+   `dbname` de ninguno de los dos.
+2. **Base temporal.** `DROP DATABASE IF EXISTS orabella_build WITH (FORCE)` +
+   `CREATE DATABASE`, conectándose a `postgres` únicamente como servidor.
+3. **Fixture de plataforma.** Copia `_platform_fixture.sql` fuera del repo, lo
+   aplica con `psql -v ON_ERROR_STOP=1 --single-transaction`, y comprueba que
+   `auth.jwt()` devuelve `NULL::jsonb`.
+4. **`btree_gist`.** Verifica que el usuario del pooler puede crearla: la 035 y la
+   074 la necesitan, y que el historial se frene ahí se sabe antes.
+5. **Serie histórica.** Aplica `app/supabase/schema-history/*.sql` en orden
+   alfabético, **uno por uno**, cada uno con su propia transacción y
+   `ON_ERROR_STOP=1`, y se detiene en el primero que falle reportando archivo,
+   línea y mensaje. No parchea nada, no saltea nada, no reintenta.
+6. **Volcado.** `pg_dump --schema-only --no-owner --exclude-schema=auth` — **sin
+   `--no-privileges`**, porque los `REVOKE` y `GRANT` de las funciones son parte
+   del objeto. Se excluye `auth` porque el destino ya lo tiene.
+7. **Verificaciones del volcado** (secciones 3.3 a 3.6 de este manual).
+8. **Ensamblado.** `app/supabase/squash/schema-header.sql` + el cuerpo del
+   volcado, y la comparación sha256 contra `git show HEAD:...` (sección 3.2).
+9. **Resumen.** Los dos sha256, el veredicto y los conteos.
+
+### 2.5 Las guardas: por qué PRUEBAS y PRODUCCIÓN no se tocan
+
+- El conninfo de **producción** se abre, se lee y se cierra. No hay ninguna
+  llamada a él después: si `host` o `user` coinciden con los de pruebas, se aborta
+  antes de crear nada.
+- A **PRUEBAS** solo se entra para crear y descartar `orabella_build`, y para
+  leer el catálogo de esa base temporal. La base de servicio `postgres` se usa
+  como servidor de administración, no se modifica.
+- El volcado sale de `orabella_build`, no de PRUEBAS: aunque el `--file` apuntara
+  mal, el esquema que se describe es el que el script acaba de construir.
+- `schema-header.sql`, `_platform_fixture.sql` y `app/supabase/schema-history/`
+  se abren **en lectura**. El script no tiene ninguna ruta de escritura sobre
+  ellos.
+
+### 2.6 El ensamblado: encabezado + cuerpo, y las ocho líneas que se descartan
+
+`app/supabase/migrations/001_orabella_schema.sql` son dos piezas, y solo dos:
+
+- el **encabezado**: las 188 líneas de `app/supabase/squash/schema-header.sql`,
+  byte a byte como están. Es prosa, no SQL: se escribe a mano y se revisa como
+  prosa; el script la concatena y no la toca.
+- el **cuerpo**: el volcado entero (8.100 líneas) menos **ocho** líneas, y solo
+  ocho:
+
+  | líneas del volcado | qué son |
+  | --- | --- |
+  | 1 a 5 | el banner `--` / `-- PostgreSQL database dump` / `--`, la vacía, y el metacomando `\restrict` con su clave aleatoria de sesión |
+  | 6 | la vacía que sigue al `\restrict` |
+  | 8.099 | el `\unrestrict` correspondiente |
+  | 8.100 | la vacía del final |
+
+  `\restrict` y `\unrestrict` no son SQL: es lo que psql 18 emite alrededor de un
+  volcado para que no interprete como metacomando lo que en realidad son
+  literales. Un cliente que no los conozca aborta la carga, y el archivo se
+  aplica con otros clientes y con versiones anteriores de `psql`. La clave que
+  los acompaña es un token aleatorio por sesión, no información del esquema.
+
+  Resultado: 188 + 8.092 = **8.280 líneas**, 368.743 bytes. Nada más se quita,
+  nada se reordena y nada se escribe a mano.
+
+Lo que el script produce, y dónde:
+
+| archivo | qué es |
+| --- | --- |
+| `~/orabella-db/esquema-final.sql` | el volcado crudo, con su `\restrict` y su banner |
+| `~/orabella-db/esquema-001-ensamblado.sql` | el archivo único ensamblado, copia de trabajo |
+| `app/supabase/migrations/001_orabella_schema.sql` | **solo** si el ensamblado coincide byte a byte con lo que ya está |
+
+Cuando el ensamblado es idéntico al archivo del repo, el script no escribe
+nada: escribirlo sería un no-op y `git status` sigue limpio.
+
+### 2.7 Los dos modos que no son el normal
+
+**Modo provisional** — solo para revisar una frontera de plataforma sin esperar
+al arreglo:
 
 ```bash
-read -rs -p "Clave de la base PRUEBAS (no se escribe en pantalla ni en el historial): " PGPASSWORD
-echo
-export PGPASSWORD
+SQUASH_PROVISIONAL=1 python app/supabase/squash/build-schema.py
 ```
 
-Parámetros de conexión (no contienen la clave):
+Vuelca el estado **alcanzado hasta la falla** en un archivo con `PROVISIONAL` en
+el nombre, con su banner propio, y lo verifica igual. No parchea la migración, no
+la saltea y no reintenta. **En ese modo no se ensambla el archivo único**: un
+volcado provisional nunca es la fuente de nada.
+
+**Forzar la escritura** — solo con la diferencia ya entendida:
 
 ```bash
-PRUEBAS_HOST=db.xxxxxxxxxxxx.supabase.co
-PRUEBAS_PORT=5432
-PRUEBAS_DB=postgres
-PRUEBAS_USER=postgres
-export PRUEBAS_HOST PRUEBAS_PORT PRUEBAS_DB PRUEBAS_USER
-export PGSSLMODE=require      # la conexión de la plataforma exige TLS
+SQUASH_ESCRIBIR=1 python app/supabase/squash/build-schema.py
 ```
 
-Si se optó por la vía B, `PGPASSWORD` queda exportada en esta sesión. **No
-olvidarla antes de los pasos con base local (3.1):** `libpq` mandaría la clave de
-PRUEBAS al servidor local. Cada comando local de este manual lleva `PGPASSWORD=`
-vacío delante justamente por eso.
+Sin esta variable, si los sha256 difieren, el script imprime la primera línea
+que difiere, dice si la diferencia está en el encabezado o en el cuerpo, deja el
+ensamblado en `~/orabella-db/` para poder compararlo con `diff`, y **no escribe
+el archivo commiteado**. Ver 3.2.
 
-### 2.3 Volcado del esquema desde PRUEBAS
+### 2.8 Regenerar `app/supabase/test-bootstrap.sql`
 
-```bash
-pg_dump \
-  --host="$PRUEBAS_HOST" --port="$PRUEBAS_PORT" \
-  --username="$PRUEBAS_USER" --dbname="$PRUEBAS_DB" \
-  --schema-only \
-  --no-owner \
-  --no-privileges \
-  --file="$WORK/pruebas.dump.sql"
-```
-
-Notas de ese comando, porque cada bandera tiene una razón:
-
-- `--schema-only`: sin datos. Es lo que se quiere; los datos no entran al squash.
-- `--no-owner`: elimina el `ALTER ... OWNER TO` de cada objeto, que en una
-  plataforma apunta al rol interno de la plataforma y no existe en el destino.
-- `--no-privileges`: elimina los `GRANT`/`REVOKE`. **Consecuencia a tener en
-  cuenta: el archivo resultante no trae ninguno**, y el inventario final sí los
-  exige (43 en el archivo actual). Por eso el paso 2.4.
-- `--file=` en vez de `>`: la redirección de PowerShell escribe el archivo en
-  UTF-16 y el SQL resultante no se puede aplicar. `pg_dump --file` no tiene ese
-  problema.
-- **No** añadas `--no-comments`: los `COMMENT ON` son parte del objeto y el
-  inventario final los exige todos.
-
-Comprobación inmediata de que el volcado salió como debía:
-
-```bash
-pg_dump --version                      # anota la versión del cliente en el encabezado
-grep -n "CREATE EXTENSION" "$WORK/pruebas.dump.sql"
-grep -c "^CREATE TABLE public\." "$WORK/pruebas.dump.sql"     # esperado: 36
-```
-
-### 2.4 Segunda pasada: los permisos
-
-`--no-privileges` es lo correcto para el cuerpo del esquema, pero deja fuera los
-`REVOKE`/`GRANT`, y el archivo único los necesita. Se hace el mismo volcado sin
-esa bandera, y de ese segundo archivo se transcriben **solo** los permisos que el
-historial declara a mano:
-
-```bash
-pg_dump \
-  --host="$PRUEBAS_HOST" --port="$PRUEBAS_PORT" \
-  --username="$PRUEBAS_USER" --dbname="$PRUEBAS_DB" \
-  --schema-only \
-  --no-owner \
-  --file="$WORK/pruebas.acl.sql"
-
-grep -cE "^(REVOKE|GRANT) " "$WORK/pruebas.acl.sql"     # el archivo único se queda con 43 de ellos
-```
-
-Lo que se transcribe y lo que no:
-
-- **Sí**: los `REVOKE`/`GRANT` que el historial redactó sobre `anon`,
-  `authenticated`, `PUBLIC` y `service_role` (los de `008_hardening.sql`,
-  `017_hardening_round2.sql`, `018_hardening_followup.sql` y los posteriores).
-  Salen aquí como permisos efectivos sobre el objeto.
-- **No**: los permisos por defecto que la plataforma concede al crear una tabla.
-  Esos los aplica el propio proyecto y no son parte del archivo. La cuenta del
-  punto 3.2 es la que confirma que la transcripción quedó en su sitio justo: el
-  archivo único actual tiene **43** (`grep -cE "^(REVOKE|GRANT) "` da 43, con 21
-  `REVOKE` y 22 `GRANT`), y una cuenta mucho mayor delata permisos por defecto
-  colados.
-
-### 2.5 Regenerar `app/supabase/test-bootstrap.sql`
-
-El archivo actual está **desactualizado**: su encabezado declara
-`Orden: 001 a 010`, o sea que instalaría un esquema de hace 32 migraciones. No
-se arregla a mano; se regenera desde el mismo dump, por concatenación, en el
-mismo orden en que el runner los aplicaría.
+Esto el script **no** lo hace, porque no es parte del esquema: es el bootstrap
+completo (esquema + seeds), y en esta unidad otro writer está sobre los seeds.
+Cuando toque rehacerlo, se hace por concatenación, en el mismo orden en que el
+runner los aplicaría, sobre el archivo único **ya** generado:
 
 ```bash
 cd D:/u/orabella/app
@@ -187,7 +220,7 @@ TMP="$(mktemp)"
 {
   echo "-- test-bootstrap.sql — generado, no editado a mano."
   echo "-- Orden: 001_orabella_schema.sql y luego seeds/acceptance.sql."
-  echo "-- Regenerar con el paso 2.5 de supabase/squash/README.md."
+  echo "-- Regenerar con el paso 2.8 de supabase/squash/README.md."
   echo
   cat "$SQUASH"
   echo
@@ -205,19 +238,15 @@ grep -n "seeds/acceptance.sql"    supabase/test-bootstrap.sql
 ```
 
 Las dos cifras salen del archivo único y solo de él: `seeds/acceptance.sql` es
-dato y no declara ninguna tabla ni ninguna política, así que no suma a ninguna de
-las dos. Las **10** políticas, y no las 37 de una etapa anterior, son las que
-declara el estado POST-077: las políticas por sede que la 074 y la 077 retiraron ya
-no están en el archivo.
+dato y no declara ninguna tabla ni ninguna política, así que no suma a ninguna.
+Las **10** políticas, y no las 37 de una etapa anterior, son las que declara el
+estado POST-077.
 
-Si `001_orabella_schema.sql` todavía no existe, este paso se ejecuta **después**
-de redactar ese archivo, no antes.
-
-### 2.6 `app/supabase/seeds/acceptance.sql` no se toca
+### 2.9 `app/supabase/seeds/acceptance.sql` no se toca
 
 Este seed es **dato**, no esquema: sede, catálogos, empleados y caja lista, con
 nombres ficticios. El squash no lo incluye, el bootstrap lo concatena tal cual, y
-su contenido no se edita en esta unidad. Prueba de que sigue intacto:
+su contenido no se edita. Prueba de que sigue intacto:
 
 ```bash
 git -C D:/u/orabella diff --stat -- app/supabase/seeds/acceptance.sql
@@ -227,263 +256,178 @@ La salida tiene que estar **vacía**.
 
 ---
 
-## 3. Verificación obligatoria antes de cualquier reset
+## 3. Verificación obligatoria
 
-Las cuatro comprobaciones de este punto se ejecutan **antes** de tocar nada. Si
-una sola falla, no se resetea: se corrige el archivo y se vuelve a empezar desde
-2.3.
+La verifica el script, en sus pasos 7 a 9. No hay ritual aparte que hacer a mano
+antes de dar por bueno el archivo: correr el script ES la verificación, y su
+código de salida lo dice.
 
-Un reset solo es sin pérdida si el diff está vacío. Un dump cuyo contenido no
-coincide con la base que iba a reemplazarse es exactamente el modo de fallo que
-el squash existe para eliminar.
+### 3.1 Por qué el ensayo ya no es un volcado desde PRUEBAS
 
-### 3.1 Diff de esquema: la base actual contra el dump
+Antes el manual volcaba el esquema **desde la base de PRUEBAS** y comparaba ese
+volcado contra una base reconstruida en local (`squash_check`). Ese procedimiento
+se descartó, y no por gusto:
 
-El dump tiene que describir la base tal como está, y el archivo final tiene que
-poder reconstruirla. Se comprueba en las dos direcciones, volcando con las
-**mismas** banderas por los dos lados (si a un lado se pasan privilegios y al
-otro no, el diff no significa nada).
+- **PRUEBAS estaba atrasada respecto de la 017**, así que su esquema no era el
+  estado final: el ensayo describía otra base, y una comparación contra otra base
+  no probaba nada sobre el archivo único.
+- Volcar de una base de servicio significa que el resultado depende del estado
+  que ese servicio tenga **en ese momento**. Una corrida de hoy y otra de mañana
+  pueden dar archivos distintos sin que cambie una línea de la serie.
+- Reconstruir en local exigía una instalación de PostgreSQL que esta máquina no
+  tiene, y aun así el diff final era indirecto.
 
-```bash
-cd D:/u/orabella/app
-WORK=supabase/squash/_verif
+Lo que se usa en su lugar es una **base descartable construida desde la serie**:
+`orabella_build` se crea y se tira en cada corrida, se siembra con las 76
+migraciones de `app/supabase/schema-history/` y se vuelca. El ensayo es el
+procedimiento mismo, y el resultado depende del historial, no del estado de
+nadie. La base de PRUEBAS solo aporta el servidor y la credencial.
 
-# (a) el lado que se va a reemplazar: la base PRUEBAS viva
-pg_dump --host="$PRUEBAS_HOST" --port="$PRUEBAS_PORT" \
-  --username="$PRUEBAS_USER" --dbname="$PRUEBAS_DB" \
-  --schema-only --no-owner --no-privileges \
-  --file="$WORK/vivo.sql"
+### 3.2 La comparación que decide: sha256
 
-# (b) el lado reconstruido: el dump aplicado sobre una base VACÍA.
-#     En PostgreSQL local basta una base nueva; no se toca PRUEBAS.
-#     PGPASSWORD= vacío: la clave de PRUEBAS no se manda al servidor local.
-PGPASSWORD= createdb -h localhost -U postgres squash_check
-PGPASSWORD= psql -h localhost -U postgres -d squash_check -v ON_ERROR_STOP=1 \
-  -f "$WORK/pruebas.dump.sql"
-PGPASSWORD= pg_dump -h localhost -U postgres -d squash_check \
-  --schema-only --no-owner --no-privileges \
-  --file="$WORK/reconstruida.sql"
+El script imprime los tres hashes y el veredicto:
+
+```
+sha256 del archivo ENSAMBLADO (este script)    5daaca1ea3c320d493bd3178b76f216ca91d5a84dd17cf8b824d86e642acc7b5
+sha256 del archivo COMMITEADO (git show HEAD:) 5daaca1ea3c320d493bd3178b76f216ca91d5a84dd17cf8b824d86e642acc7b5
+sha256 del archivo EN EL ARBOL DE TRABAJO      5daaca1ea3c320d493bd3178b76f216ca91d5a84dd17cf8b824d86e642acc7b5
+
+VEREDICTO CONTRA LO COMMITEADO: IDENTICO
 ```
 
-`psql` con `-v ON_ERROR_STOP=1` es obligatorio: sin él, un error de sintaxis a
-media carga se pierde en el scroll y la base queda a medio esquema, que es un
-diff que miente.
+Y en el resumen:
 
-Normalización antes de comparar (las cabeceras llevan fecha y versión, que no son
-diferencias de esquema):
-
-```bash
-norm() {
-  sed -e '/^-- Dumped from database version/d' \
-      -e '/^-- Dumped by pg_dump version/d' \
-      -e '/^-- Started on /d' \
-      -e '/^-- Completed on /d' \
-      -e 's/[[:space:]]\+$//' "$1" | grep -v '^$'
-}
-norm "$WORK/vivo.sql"         > "$WORK/a.norm"
-norm "$WORK/reconstruida.sql" > "$WORK/b.norm"
-
-diff -u "$WORK/a.norm" "$WORK/b.norm" > "$WORK/diff.txt" || true
-if [ -s "$WORK/diff.txt" ]; then
-  echo "BLOQUEADO: el diff no está vacío ($(wc -l < "$WORK/diff.txt") líneas)"
-  head -60 "$WORK/diff.txt"
-else
-  echo "OK: diff vacío, el dump describe la base completa"
-fi
+```
+sha256 ensamblado por esta corrida : 5daaca1ea3c320d493bd3178b76f216ca91d5a84dd17cf8b824d86e642acc7b5
+sha256 commiteado (git show HEAD:) : 5daaca1ea3c320d493bd3178b76f216ca91d5a84dd17cf8b824d86e642acc7b5
+veredicto                          : IDENTICO
 ```
 
-Si el diff **solo** reordena sentencias —los OID cambian al restaurar, y
-`pg_dump` ordena parte de los objetos por OID— la comparación por multiconjunto
-descarta ese ruido (bash; la sustitución de proceso no existe en `cmd`):
+Ese SHA-256 es el del archivo único en `HEAD` (`95d21e7`), con su encabezado de
+188 líneas y su cuerpo de 8.092. Es el mismo que imprimiría cualquiera:
 
 ```bash
-diff -u <(sort "$WORK/a.norm") <(sort "$WORK/b.norm") || true
+git show HEAD:app/supabase/migrations/001_orabella_schema.sql | sha256sum
 ```
 
-Que salga vacío ahí significa: mismas sentencias, distinto orden. Cualquier
-línea que mencione un nombre de objeto, un tipo o una columna es una diferencia
-real, no ruido de orden.
+**Si difieren, no se ajusta el archivo commiteado para que coincida.** El archivo
+commiteado es el que dice la verdad: un procedimiento que produce otra cosa no es
+un procedimiento, y "cambiar el archivo hasta que el hash dé" convierte la
+verificación en una tautología. Lo que se hace es:
 
-Los dos `pg_dump` deben salir del **mismo cliente**: anota
-`pg_dump --version` y compáralo con el que genera el archivo final. Versiones
-distintas cambian las cabeceras de sección y pueden marcar diferencias que no
-son de esquema.
+1. Leer el diagnóstico que imprime el script: dice si la diferencia está en el
+   **encabezado** o en el **cuerpo**, y en qué línea del cuerpo.
+2. Si está en el encabezado, la causa es `schema-header.sql`: el inventario
+   cambió, o alguien regeneró la prosa. Va en el commit, con su cuenta.
+3. Si está en el cuerpo, la causa es el historial o el cliente: una migración
+   cambió, o el `pg_dump` que se usó no era el 18.3. **Nunca** se "corrige"
+   editando el archivo único a mano.
+4. Con la causa entendida, y solo entonces, `SQUASH_ESCRIBIR=1` si corresponde.
 
-### 3.2 Conteos por tipo, con los números esperados
+El volcado intermedio (`~/orabella-db/esquema-final.sql`) **no** tiene sha
+estable: su línea `\restrict` lleva una clave aleatoria por sesión. El que se
+compara es el del archivo ensamblado.
 
-Este bloque se ejecuta **dos veces**: contra la base con el historial aplicado y
-contra `squash_check`. Las dos columnas `encontrado` tienen que ser idénticas, y
-cada `encontrado` tiene que estar en la columna `esperado`.
+### 3.3 Conteos por tipo, con los números esperados
 
-Los valores esperados son los que declara el encabezado de
-`001_orabella_schema.sql`, y son **exactos**, no aproximados: ese encabezado es el
-inventario del volcado, y las cifras se corrigen junto con el archivo. Si el
-historial recibe una migración nueva, se actualizan las dos columnas y el
-encabezado, en el mismo commit.
+El script imprime el volcado contra el catálogo y marca `<-- REVISAR` en lo que
+no cuadra. Los valores esperados son los que declara el encabezado del archivo
+único, y son **exactos**: ese encabezado es el inventario.
+
+| tipo | esperado | dónde se comprueba |
+| --- | --- | --- |
+| extensiones | 2 (`btree_gist`, `pgcrypto`) | paso 5 del script, `extensiones instaladas` |
+| tablas | 36 | paso 5, `tablas` |
+| funciones (sin extensión) | 28 | paso 5, `funciones (sin extension)` |
+| políticas RLS | 10 | paso 5, `politicas RLS` |
+| índices (sin PK/UNIQUE/EXCLUDE) | 65 | paso 5, `indices sinPk/UNIQUE/EXCLUDE` |
+| restricciones PRIMARY KEY | 34 | paso 5, `restricciones (total)` desglosado |
+| FOREIGN KEY | 56 | ídem |
+| UNIQUE | 13 | ídem |
+| EXCLUDE | 1 | paso 7, `a) ex_payroll_periods_no_overlap` |
+| CHECK en línea | 128 | paso 5, `CHECK inline en CREATE TABLE` |
+| disparadores | 21 | paso 5, y en el encabezado |
+| tablas con RLS | 36 | paso 5, `RLS habilitadas` |
+| `COMMENT ON` | 139 | `grep -c "^COMMENT ON "` sobre el archivo |
+| `GRANT`/`REVOKE` | 43 (21 + 22) | `grep -cE "^(REVOKE\|GRANT) "` sobre el archivo |
+
+Dos aclaraciones que el script ya imprime, y que conviene no volver a descubrir:
+
+- **Un índice que sostiene una PK, una UNIQUE o una EXCLUDE no sale como
+  `CREATE INDEX`**: sale dentro del `ADD CONSTRAINT`. Por eso `indices` compara 65
+  y no los 81 del catálogo.
+- **El volcado no incluye los objetos que pertenecen a una extensión** (solo su
+  `CREATE EXTENSION`), y `btree_gist` queda instalada en `public` en la base
+  temporal: por eso `funciones` compara 28 contra 28 y no contra las 30 del
+  catálogo sin filtrar.
+
+Los dos `grep` sobre el archivo único:
 
 ```bash
-cat > "$WORK/conteos.sql" <<'SQL'
-SELECT tipo, esperado, encontrado,
-       CASE WHEN encontrado = esperado THEN 'OK' ELSE 'MISMATCH' END AS veredicto
-FROM (
-  SELECT 'extensiones'::text AS tipo, 2 AS esperado, count(*) AS encontrado
-    FROM pg_extension WHERE extname IN ('pgcrypto','btree_gist')
-  UNION ALL
-  SELECT 'tablas', 36, count(*)
-    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-   WHERE n.nspname = 'public' AND c.relkind IN ('r','p')
-  UNION ALL
-  SELECT 'funciones', 28, count(*)
-    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-   WHERE n.nspname = 'public'
-  UNION ALL
-  SELECT 'pk', 34, count(*)
-    FROM pg_constraint WHERE connamespace = 'public'::regnamespace AND contype = 'p'
-  UNION ALL
-  SELECT 'fk', 56, count(*)
-    FROM pg_constraint WHERE connamespace = 'public'::regnamespace AND contype = 'f'
-  UNION ALL
-  SELECT 'check', 128, count(*)
-    FROM pg_constraint WHERE connamespace = 'public'::regnamespace AND contype = 'c'
-  UNION ALL
-  SELECT 'unique_constraint', 13, count(*)
-    FROM pg_constraint WHERE connamespace = 'public'::regnamespace AND contype = 'u'
-  UNION ALL
-  SELECT 'unique_index', 16, count(*)
-    FROM pg_index i
-    JOIN pg_class c ON c.oid = i.indexrelid
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-   WHERE n.nspname = 'public' AND c.relkind IN ('r','p') AND i.indisunique
-     AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = i.indexrelid)
-  UNION ALL
-  SELECT 'plain_index', 49, count(*)
-    FROM pg_index i
-    JOIN pg_class c ON c.oid = i.indexrelid
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-   WHERE n.nspname = 'public' AND c.relkind IN ('r','p')
-     AND NOT i.indisunique AND NOT i.indisprimary AND NOT i.indisexclusion
-  UNION ALL
-  SELECT 'exclusion', 1, count(*)
-    FROM pg_constraint WHERE connamespace = 'public'::regnamespace AND contype = 'x'
-  UNION ALL
-  SELECT 'triggers', 21, count(*)
-    FROM pg_trigger t
-    JOIN pg_class c ON c.oid = t.tgrelid
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-   WHERE n.nspname = 'public' AND NOT t.tgisinternal
-  UNION ALL
-  SELECT 'rls_enabled', 36, count(*)
-    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-   WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relrowsecurity
-  UNION ALL
-  SELECT 'policies', 10, count(*) FROM pg_policies WHERE schemaname = 'public'
-) t ORDER BY tipo;
-SQL
+grep -cE "^(REVOKE|GRANT) " app/supabase/migrations/001_orabella_schema.sql   # 43
+grep -c "^COMMENT ON "        app/supabase/migrations/001_orabella_schema.sql   # 139
 ```
 
-Primero la lectura, contra PRUEBAS:
+### 3.4 La frontera de plataforma
 
-```bash
-psql -v ON_ERROR_STOP=1 -f "$WORK/conteos.sql" \
-  -h "$PRUEBAS_HOST" -p "$PRUEBAS_PORT" -U "$PRUEBAS_USER" -d "$PRUEBAS_DB"
+Lo que el paso 7 del script tiene que imprimir:
+
+- **ningún** objeto de plataforma declarado: cero `CREATE SCHEMA auth`, cero
+  `CREATE FUNCTION auth.`, cero `COMMENT ON SCHEMA auth`, cero `ALTER DEFAULT
+  PRIVILEGES IN SCHEMA auth`, y el único esquema declarado es `public`.
+- las **referencias** a `auth.jwt()` conservadas: las 2 aparecen dentro de
+  cuerpos `$$`, ninguna suelta. Un volcado captura texto, no comportamiento: la
+  referencia sobrevive, la declaración no.
+- el cuerpo de `public.current_sede_id()` idéntico al del historial: la última
+  definición con cuerpo es la de `008_hardening.sql`, y el script la imprime
+  entera y la busca, texto íntegro, dentro del volcado.
+
+### 3.5 Las dos comprobaciones exigidas, y la caída de `sede_id`
+
+El paso 7 las deja cerradas:
+
+```
+a) ex_payroll_periods_no_overlap   ...presenta en el volcado
+b) users.sede_id                   catalogo: presente   volcado: presente
 ```
 
-Después la comparación, con salida sin encabezados para que el diff sea legible
-(`-t -A -F '|'` deja una línea por tipo, terminada en `|OK` o `|MISMATCH`):
+El paso 6 recorre el volcado sin comentarios, literales ni cuerpos `$$`, y lista
+cada línea que nombra `sede_id` y `current_sede_id`, con el objeto al que
+pertenece. El veredicto tiene que ser: `sede_id` solo aparece en `public.users`
+(y `public.sedes` como destino de la FK). Cualquier otra tabla en la lista es una
+fuga de la etapa anterior a la 074 y la 077.
 
-```bash
-psql -v ON_ERROR_STOP=1 -q -t -A -F '|' -f "$WORK/conteos.sql" \
-  -h "$PRUEBAS_HOST" -p "$PRUEBAS_PORT" -U "$PRUEBAS_USER" -d "$PRUEBAS_DB" \
-  > "$WORK/conteos.pruebas.txt"
+### 3.6 Estructura pura: el volcado no lleva datos
 
-psql -v ON_ERROR_STOP=1 -q -t -A -F '|' -f "$WORK/conteos.sql" \
-  -h localhost -U postgres -d squash_check \
-  > "$WORK/conteos.check.txt"
+El paso 8 cuenta, sobre el texto del volcado:
 
-diff -u "$WORK/conteos.pruebas.txt" "$WORK/conteos.check.txt" || true
+| patrón | esperado |
+| --- | --- |
+| `^INSERT INTO ` | 0 |
+| `^COPY ` | 0 |
+| `^SELECT .* FROM public.` | 0 |
+| `generate_series` (dentro de cuerpos) | > 0, y son funciones, no datos |
 
-# Debe imprimir NADA: cualquier línea que no termine en |OK es una discrepancia.
-grep -v "|OK$" "$WORK/conteos.pruebas.txt"
-grep -v "|OK$" "$WORK/conteos.check.txt"
-```
+Las filas que la serie siembra —denominaciones, formas de pago, configs de IVA,
+catálogo de roles, sede única, `system_settings`— viven en la base temporal, que
+es descartable. El archivo único es estructura.
 
-Sobre los números esperados: son los del encabezado del archivo único y no se
-reinterpretan. Las cifras que bajaron de golpe respecto de una etapa anterior son
-las que la 077 tocó —`policies` de 37 a 10, `fk` de 85 a 56, `unique_constraint`
-de 6 a 13 y `rls_enabled` de 35 a 36— y las que subieron también están
-anotadas: `check` 128 y `triggers` 21. Lo exigible sin ambigüedad es doble: que las
-dos bases coincidan entre sí, y que la cifra exacta quede anotada en el encabezado
-de `001_orabella_schema.sql` para que las verificaciones siguientes tengan un
-valor de comparación estable.
+### 3.7 La regla
 
-`REVOKE`/`GRANT` no son objetos del catálogo, así que su conteo es sobre el
-archivo, no sobre la base:
+**Cualquier discrepancia bloquea.** No hay "diferencias menores" ni "esto se ajusta
+a mano después":
 
-```bash
-grep -cE "^(REVOKE|GRANT) " supabase/migrations/001_orabella_schema.sql   # 43
-grep -c "^COMMENT ON "        supabase/migrations/001_orabella_schema.sql   # 139
-```
+- si una migración falla, se busca por qué en el historial; no se parchea el
+  archivo único para que carga;
+- si un conteo no coincide, no se anota el número nuevo: se busca el objeto que
+  falta o sobra;
+- si el sha256 del ensamblado no es el del commiteado, **el archivo commiteado no
+  se toca** hasta que la causa esté entendida (3.2);
+- si aparece una función `SECURITY DEFINER` sin `search_path` fijo, o aparecen
+  más de las que el inventario espera, se vuelve al historial.
 
-### 3.3 Firma, seguridad y `search_path` de las 28 funciones
-
-```bash
-psql -v ON_ERROR_STOP=1 -x \
-  -h "$PRUEBAS_HOST" -p "$PRUEBAS_PORT" -U "$PRUEBAS_USER" -d "$PRUEBAS_DB" \
-  -c "
-SELECT p.proname AS nombre,
-       pg_get_function_identity_arguments(p.oid) AS argumentos,
-       CASE WHEN p.prosecdef THEN 'DEFINER' ELSE 'INVOKER (por defecto)' END AS seguridad,
-       coalesce(array_to_string(p.proconfig, ', '), '(sin SET)') AS opciones,
-       p.prorettype::regtype::text AS retorna
-  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
- WHERE n.nspname = 'public'
- ORDER BY p.proname, argumentos;" > "$WORK/funciones.txt"
-```
-
-Y las dos preguntas cerradas sobre seguridad (contra la base reconstruida, que
-es la que tiene que quedar con el archivo aplicado):
-
-```bash
-PGPASSWORD= psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d squash_check -c "
-SELECT count(*) AS definers
-  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
- WHERE n.nspname = 'public' AND p.prosecdef;"
-# esperado: 1
-
-PGPASSWORD= psql -v ON_ERROR_STOP=1 -h localhost -U postgres -d squash_check -c "
-SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS argumentos,
-       array_to_string(p.proconfig, ', ') AS opciones
-  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
- WHERE n.nspname = 'public' AND p.prosecdef
- ORDER BY 1;"
-# esperado, exactamente esta y nada más:
-#   current_sede_id  ()   SET search_path = public
-```
-
-Era **2** hasta la 077. La segunda era `write_audit_log(uuid, uuid, text, text,
-text, jsonb)`, el helper `SECURITY DEFINER` que escribía en `audit_logs`; la 077
-lo borró por no tener llamadores, junto con sus permisos. Que aquí haya **una** y
-no dos es el estado correcto, no una pérdida: si esta consulta devolviera 2, estaría
-mirando una base con la 077 sin aplicar.
-
-Ninguna función `SECURITY DEFINER` puede salir sin `search_path` fijo. Las otras
-27 son `INVOKER`, que es el valor por defecto: en la columna `seguridad` de
-`$WORK/funciones.txt` tienen que aparecer como `INVOKER (por defecto)`.
-
-Sobre el archivo, no sobre la base:
-
-```bash
-grep -n "SECURITY INVOKER" supabase/migrations/001_orabella_schema.sql   # debe imprimir nada
-grep -n "SECURITY DEFINER" supabase/migrations/001_orabella_schema.sql   # debe imprimir 1 línea
-```
-
-### 3.4 La regla
-
-**Cualquier discrepancia bloquea el reset.** No hay "diferencias menores" ni
-"esto se ajusta a mano después": si el diff no está vacío, si un conteo no
-coincide, si aparece más de una función `DEFINER` o alguna sin `search_path`, se
-vuelve al paso 2.3 y se repite. La secuencia segura es: dump → archivo →
-verificación en base vacía → diff limpio → recién entonces reset.
+La secuencia segura es: serie sobre base descartable → volcado → ensamblado →
+sha256 idéntico al commiteado → recién entonces, commit.
 
 ---
 
@@ -497,7 +441,7 @@ reconocen, no se reescriben. Este es el orden esperado, y el orden real que
 emita el `pg_dump` del propietario manda sobre él:
 
 1. **Encabezado.** Qué es, de qué base salió, con qué versión de `pg_dump`, en qué
-   fecha, y los conteos exactos del punto 3.2 ya anotados.
+   fecha, y los conteos exactos del punto 3.3 ya anotados.
 2. **`SET` de contexto y transacción.** El preámbulo que emite `pg_dump`
    (`set_config('search_path', '', false)`, `BEGIN`/`COMMIT`). No se quita.
 3. **Extensiones** — 2: `pgcrypto` y `btree_gist`.
@@ -796,16 +740,18 @@ Lo que sí lo detecta, y solo eso:
   `users`, una sola declaración de `payroll_apply_atomic` con sus cuatro
   argumentos, `next_invoice_number()` sin argumentos, ninguna referencia ejecutable
   a `employees.sede_id`; y
-- **el procedimiento de construcción con su diff profundo contra una base
-  reconstruida**: el volcado sale de una base con la serie 001-077 aplicada, y se
-  contrasta contra el catálogo. Un archivo editado a mano no sobrevive a esa
-  comparación, porque el procedimiento vuelve a construirlo desde la fuente.
+- **el procedimiento de construcción con su comparación byte a byte**: correr
+  `python app/supabase/squash/build-schema.py` (sección 2) vuelve a construir el
+  archivo desde la fuente y compara su sha256 con el del archivo commiteado
+  (3.2). Un archivo editado a mano no sobrevive a esa comparación, porque el
+  procedimiento lo vuelve a construir desde la serie.
 
 Consecuencia práctica, escrita para que nadie la descubra tarde: el archivo único
 **no está cubierto por la suite**. La suite cubre la serie y vigila un puñado de
-invariantes del archivo; el resto del archivo está cubierto por el diff de
-construcción, que corre aparte. Un cambio al `001_orabella_schema.sql` no se
-verifica con `npm test`.
+invariantes del archivo; el resto del archivo está cubierto por el procedimiento
+de construcción, que corre aparte. Un cambio al `001_orabella_schema.sql` no se
+verifica con `npm test`: se verifica con el script, y su veredicto es
+`IDENTICO` o no es nada.
 
 ### 5.5 La trampa de los helpers que devuelven texto vacío
 
@@ -893,6 +839,15 @@ hechas:
 
 ## 7. Equivalentes en PowerShell
 
+**Esta sección es un apéndice, no el procedimiento.** El procedimiento vigente es
+el de la sección 2: un comando, `python app/supabase/squash/build-schema.py`, que
+además se ejecuta igual desde PowerShell porque es Python. Lo que sigue se
+conserva porque tiene valor real —traducir los comandos a `PS D:\u\orabella\app>`,
+y dejar escrito cómo se hacía a mano el variante con banderas y base local— pero
+**no compite con el script**: es el procedimiento anterior, el que se descartó
+porque volcaba desde PRUEBAS (ver 3.1). Si algo de aquí contradice a la sección
+2, manda la sección 2.
+
 Los bloques de las secciones 2 y 3 están escritos en **bash**. Esta sección es la
 traducción de cada comando a **PowerShell** (Windows), para ejecutar el mismo
 procedimiento desde `PS D:\u\orabella\app>` sin cambiar el orden ni las
@@ -901,9 +856,9 @@ comprobaciones.
 **Lo que no cambia entre los dos shells.** Solo cambia la forma de escribir el
 comando, nunca lo que hay que hacer:
 
-- el **orden**: 2.1 → 2.2 → 2.3 → 2.4 → 2.5 → 2.6, y después 3.1 → 3.2 → 3.3;
-- la **regla de pre-vuelo**: el punto 3 completo se ejecuta **antes** de tocar
-  la base; si una comprobación falla, no se resetea, se vuelve al 2.3;
+- el **orden**: los pasos del script, en el orden en que él los ejecuta (2.4);
+- la **regla de pre-vuelo**: las verificaciones de la sección 3 se ejecutan
+  **antes** de tocar la base; si una falla, no se resetea, se vuelve al script;
 - los **números esperados**, que son los del encabezado de
   `001_orabella_schema.sql` y no se reinterpretan: 36 tablas, 10 políticas, 28
   funciones, 2 extensiones, 34 PK, 56 FK, 128 CHECK, 13 `UNIQUE`, 16 índices
@@ -1066,7 +1021,10 @@ la `service_role` ni la `anon`; y la conexión es la directa o el pooler de
 
 ### 7.3 Volcado del esquema desde PRUEBAS
 
-Equivalente de 2.3: el `pg_dump` estructural **con** `--no-privileges`.
+Procedimiento **anterior**, conservado como referencia: volcar de la base de
+servicio en vez de de una base descartable. El vigente es el paso 6 del script
+(2.4), que vuelca `orabella_build` y **sin** `--no-privileges`. Este bloque es el
+`pg_dump` estructural **con** `--no-privileges`.
 
 ```powershell
 pg_dump `
@@ -1106,8 +1064,10 @@ sustituye a `grep -c` sin cambiar el número esperado.
 
 ### 7.4 Segunda pasada: los permisos
 
-Equivalente de 2.4: el **mismo** volcado **sin** `--no-privileges`. La diferencia
-con 7.3 es exactamente una bandera, y es la que recupera los `REVOKE`/`GRANT`.
+Procedimiento **anterior**, conservado como referencia: la segunda pasada con la
+que se transcribían los permisos a mano. El vigente es el paso 6 del script
+(2.4), que hace **un solo** volcado **sin** `--no-privileges`. La diferencia con
+7.3 es exactamente una bandera, y es la que recupera los `REVOKE`/`GRANT`.
 
 ```powershell
 pg_dump `

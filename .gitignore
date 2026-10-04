@@ -38,3 +38,7 @@ coverage/
 .atl/
 # Standalone frontend repo: lives on disk, never in this repo
 /front/
+
+# Artefactos de Python (el script de construccion del esquema los genera)
+__pycache__/
+*.pyc
