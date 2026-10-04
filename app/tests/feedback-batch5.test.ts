@@ -670,10 +670,26 @@ describe("facturación y login: el texto visible no cambió", () => {
       "Documento o clave inválidos.",
       "La confirmación no coincide.",
       "No se pudo cambiar la clave.",
-      "Su clave inicial es su número de documento. Debe cambiarla antes de continuar (AUTH-01).",
+      "Su clave inicial es su número de documento. Debe cambiarla antes de continuar.",
     ]) {
       expect(LOGIN_FORM_CODE, `login: ${text}`).toContain(text);
     }
+  });
+
+  it("el código interno del requisito no se filtra al texto que lee una persona", () => {
+    // D2: `AUTH-01` es el identificador del REQUISITO, no información del
+    // usuario. Sigue siendo el nombre con el que el paso se cita en el código
+    // (comentario y `step === "force-change"`), pero ninguna cadena que se
+    // renderiza lo lleva.
+    expect(LOGIN_FORM_CODE).not.toContain("(AUTH-01)");
+    expect(LOGIN_FORM_CODE).not.toContain("AUTH-01).");
+    // Control negativo del texto viejo: la cadena anterior sí lo llevaba, así
+    // que la aserción de arriba discrimina y no es un sello de goma.
+    const viejo = "Su clave inicial es su número de documento. Debe cambiarla antes de continuar (AUTH-01).";
+    expect(viejo).toContain("(AUTH-01)");
+    expect(viejo.replace(" (AUTH-01)", "")).toBe(
+      "Su clave inicial es su número de documento. Debe cambiarla antes de continuar.",
+    );
   });
 
   it("no se reescribió la copia (control negativo del 'contiene')", () => {
