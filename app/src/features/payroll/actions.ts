@@ -262,17 +262,19 @@ export async function getPayrollSettlementSourcesAction(periodId: string, employ
 }
 
 /**
- * F10/G3b: la fecha desde la que la nómina OPERA en la sede (la fecha de inicio
- * de la implementación). Nada anterior a esa fecha existe para el sistema.
+ * F10 (2026-10-04): el día desde el que la nómina OPERA, DERIVADO de los
+ * períodos (`min(start_date)`). Nadie lo configura: lo declara la primera
+ * liquidación y, de ahí en adelante, lo dan los períodos que existen.
  *
- * La LECTURA sigue en nómina porque el aviso de ciclos pendientes y el diálogo
- * de apertura la necesitan; la ESCRITURA se movió a la plataforma (G3b): el
- * admin de la sede ya no puede cambiarla.
+ * La LECTURA vive en nómina porque es el piso que usan el aviso de ciclos
+ * pendientes, la apertura de un período y el diálogo; la ESCRITURA ya no está en
+ * ninguna parte de este módulo (la que había se mudó a la plataforma, que se
+ * retira en su unidad).
  */
 export async function getPayrollStartDateAction() {
   try {
-    const session = await requirePayrollAdmin(await sessionToken());
-    const data = await getPayrollStartDate(session.sedeId);
+    await requirePayrollAdmin(await sessionToken());
+    const data = await getPayrollStartDate();
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

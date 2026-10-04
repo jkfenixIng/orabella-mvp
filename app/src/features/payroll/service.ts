@@ -23,6 +23,8 @@ import {
   normalizeAllowedDays,
   normalizePerDayLimits,
   openPeriodSchema,
+  openPayrollRejectionMessage,
+  payrollHistoryFloor,
   periodCadenceBucket,
   periodExcludesEmployeeByCadence,
   overlapBlocksDeletion,
@@ -694,12 +696,18 @@ async function attachVoucherUserNames(
  * calculándose como hoy.
  *
  * F10: la FORMA del rango la resuelve `resolveOpenPayrollRange` —un ciclo
- * COMPLETO, o el PRIMER ciclo de la cadencia RECORTADO a la fecha de arranque de
- * la sede (migración 068)— y nada más. Un ciclo que cierra antes de esa fecha no
- * existe para el sistema y se rechaza nombrando la fecha; un recorte que ya no
- * sería «el primero» (la cadencia tiene períodos) también. El recorte reusa la
- * prorrata de ciclo parcial de F5 (`cycleProrationFactor` ve un rango más corto
- * y paga `días / días del ciclo`): no hay aritmética nueva.
+ * COMPLETO, o el PRIMER ciclo de la cadencia RECORTADO al arranque de la
+ * nómina— y nada más. El arranque es un HECHO DERIVADO (`payrollHistoryFloor`,
+ * el día del primer período) y, cuando todavía no hay ningún período, lo DECLARA
+ * esta misma liquidación: es el único envío que puede traer
+ * `declared_start_date`, y un ciclo que cierra antes del arranque no existe para
+ * el sistema. El recorte reusa la prorrata de ciclo parcial de F5
+ * (`cycleProrationFactor` ve un rango más corto y paga `días / días del ciclo`):
+ * no hay aritmética nueva.
+ *
+ * `sedeId` ya no acotaba nada (los períodos se leen enteros) y se conserva sólo
+ * por la firma pública que llama la ruta de API: quitarlo acá obligaría a tocar
+ * esa superficie, que es de otra unidad.
  */
 export async function openPayrollPeriod(
   sedeId: string,
@@ -722,44 +730,37 @@ export async function openPayrollPeriod(
   }
   const db = await payrollDb();
   try {
-    // F10: la fecha de arranque de la sede entra ANTES de resolver el rango: es
-    // la cota de «nada anterior existe para el sistema».
-    const payrollStartDate = await getPayrollStartDate(sedeId);
-    // F10: los períodos de la sede, en UNA lectura exhaustiva. La necesitan las
-    // dos decisiones de abajo: la guarda de solape (antes era la lectura
-    // filtrada por el rango, con el MISMO contrato —la decisión la toma
-    // `rangesOverlap`, pero la LECTURA es completa y falla a la vista
-    // (READ_INCOMPLETE): con una lectura recortada por el tope del Data API la
-    // guarda podría no ver el período que estorba y abrir un rango que comparte
-    // días—) y la regla de F10, que necesita saber si la CADENCIA ya tiene
-    // historia y no sólo si ese ciclo está tocado.
+    // F10: los períodos de la instalación, en UNA lectura exhaustiva. La
+    // necesitan las tres decisiones de abajo: el arranque (que se deriva de
+    // ellos), la guarda de solape (antes era la lectura filtrada por el rango,
+    // con el MISMO contrato —la decisión la toma `rangesOverlap`, pero la LECTURA
+    // es completa y falla a la vista (READ_INCOMPLETE): con una lectura recortada
+    // por el tope del Data API la guarda podría no ver el período que estorba y
+    // abrir un rango que comparte días—) y la regla del primer ciclo, que
+    // necesita saber si la CADENCIA ya tiene historia y no sólo si ese ciclo está
+    // tocado.
     const sedePeriods = await listPeriods();
-    // F10: la ÚNICA decisión de la FORMA del rango que se persiste. Acepta un
-    // ciclo COMPLETO de la cadencia o el PRIMER ciclo —el que CONTIENE la fecha
-    // de arranque— RECORTADO a esa fecha, y sólo como primera liquidación de la
-    // cadencia. Todo lo demás se rechaza acá, antes de escribir.
+    // F10: el arranque de la nómina es `min(start_date)` de esos períodos.
+    // Cuando no hay ninguno, no hay arranque: lo declara esta liquidación (la
+    // primera, y la única que puede mandarlo).
+    const payrollStartDate = payrollHistoryFloor(sedePeriods);
+    // F10: la ÚNICA decisión de la FORMA del rango que se persiste, y el mensaje
+    // de todo rechazo sale de la misma función que la pantalla usa: el diálogo y
+    // el servicio no pueden decir cosas distintas del mismo ciclo.
     const resolution = resolveOpenPayrollRange({
       frequency: input.frequency,
       cycleEndDate: input.cycle_end_date,
       payrollStartDate,
+      declaredStartDate: input.declared_start_date ?? null,
       periods: sedePeriods,
+      referenceDate: bogotaDay(),
     });
     if (!resolution.ok) {
-      if (resolution.reason === "before-start") {
-        throw new PayrollError(
-          "VALIDATION",
-          `El período no puede empezar antes del ${payrollStartDate}: la nómina de esta sede arranca ese día y nada anterior existe para el sistema.`,
-          400,
-        );
-      }
-      if (resolution.reason === "not-first-cycle") {
-        throw new PayrollError(
-          "VALIDATION",
-          `El ciclo ${cycle.start_date} a ${cycle.end_date} contiene la fecha de inicio de la nómina (${payrollStartDate}), pero esta cadencia ya tiene períodos: el primer ciclo recortado sólo se abre como PRIMERA liquidación de la cadencia. Elija un ciclo completo posterior.`,
-          400,
-        );
-      }
-      throw new PayrollError("VALIDATION", "El cierre del ciclo debe ser un sábado.", 400);
+      throw new PayrollError(
+        "VALIDATION",
+        openPayrollRejectionMessage(resolution.reason, { payrollStartDate, cycle }),
+        400,
+      );
     }
     const requested = {
       start_date: resolution.start_date,
@@ -875,57 +876,29 @@ export async function listPeriods(): Promise<PayrollPeriodRow[]> {
   }
 }
 
-// ------------------------------- F10: fecha de arranque de la nómina ---
+// ---------------- F10: el arranque de la nómina, derivado de los períodos ---
 
 /**
- * F10 (decisión del dueño, 2026-10-01): la fecha desde la que la nómina OPERA en
- * la sede —«la fecha de inicio de la implementación»—, o `null` cuando todavía
- * no está configurada.
+ * F10 (decisión del dueño, 2026-10-04): el día desde el que la nómina OPERA es
+ * un HECHO, no una configuración. Es `min(payroll_periods.start_date)` —el día
+ * del primer período que existe— y por eso se deriva con la función pura
+ * `payrollHistoryFloor`, la misma que usan la apertura, el resumen y la pantalla.
  *
- * Es la MISMA fuente para el aviso de pendientes y para la apertura de un
- * período: una sola lectura (`sedes.payroll_start_date`, migración 068) para las
- * dos superficies, así el aviso y el servicio no pueden discrepar de desde
- * cuándo existe la nómina de la sede.
+ * La columna `sedes.payroll_start_date` (migración 068) queda SIN USO, y no por
+ * decisión de este módulo: borrarla obliga a regenerar el archivo único de
+ * esquema y a resetear las dos bases, y eso no lo vale hoy. Es DEUDA declarada
+ * para el próximo reset. Mientras tanto, ni se lee ni se escribe acá.
  *
- * La ESCRITURA ya no vive acá: la configuración se muda a la superficie de
- * plataforma (`setPlatformPayrollStartDate`, acción auditada
- * `platform.payroll_start_date_set`), que es la única que escribe la columna.
- * Acá queda la LECTURA, que es la que necesitan el aviso de pendientes y el
- * diálogo de apertura.
+ * Sin períodos no hay arranque: la PRIMERA liquidación lo declara
+ * (`declared_start_date`), así que `null` aquí significa exactamente eso —la
+ * nómina todavía no tiene primer período— y no «falta configurarla».
  *
- * Degradación por migración pendiente: si la 068 todavía no se aplicó, la
- * columna no existe y PostgREST responde 42703 (`undefined_column`). Ese caso NO
- * se convierte en error interno: sin fecha configurada el módulo conserva el
- * comportamiento de hoy, que es exactamente el estado en el que está la base
- * mientras la columna no exista. Cualquier otro fallo se propaga.
- *
- * La fila de la instalación inexistente tampoco es un error acá: devuelve
- * `null`, porque «no hay fecha» es la respuesta correcta para todo lo que
- * pregunta desde cuándo existe la nómina.
+ * NO lleva `sedeId`: la instalación es de una sola (M1–M3c) y los períodos se
+ * leen enteros, así que el argumento sería una segunda frontera dentro de una
+ * base que ya tiene una.
  */
-/**
- * F10: la fecha desde la que la nómina OPERA, leída de la fila de la
- * INSTALACIÓN por clave primaria.
- *
- * `sedeId` NO es un alcance ni una frontera: es la búsqueda por clave primaria
- * de la fila que describe la instalación (`sedes`). Es la misma fila que escribe
- * la capa de plataforma (`leerSedeDeLaInstalacion`), así que la lectura y la
- * escritura de este campo no pueden divergir.
- */
-export async function getPayrollStartDate(sedeId: string): Promise<string | null> {
-  const db = await payrollDb();
-  const { data, error } = await db
-    .from("sedes")
-    .select("id, payroll_start_date")
-    .eq("id", sedeId)
-    .maybeSingle();
-  if (error) {
-    const failure = error as { code?: string | null; message?: string | null };
-    if (failure.code === "42703" || /payroll_start_date/i.test(failure.message ?? "")) return null;
-    throw new PayrollError("INTERNAL", "Error interno.", 500);
-  }
-  const row = data as unknown as { payroll_start_date?: string | null } | null;
-  return row?.payroll_start_date ?? null;
+export async function getPayrollStartDate(): Promise<string | null> {
+  return payrollHistoryFloor(await listPeriods());
 }
 
 async function getPeriodOrThrow(db: DbClient, id: string): Promise<PayrollPeriodRow> {
@@ -1342,31 +1315,30 @@ async function readPaidItemsOfPeriods(args: {
 }
 
 /**
- * PA3: la vista COMPLETA de la nómina de una sede, en una lectura y con dos
- * proyecciones de los mismos datos: los totales por período y el mes a la fecha
- * por empleado. Nada de esto mueve plata: es lectura y presentación, y las
- * sumas quedan en peso entero (dentro de los derivadores puros de `schemas`).
+ * PA3: la vista COMPLETA de la nómina, en una lectura y con dos proyecciones de
+ * los mismos datos: los totales por período y el mes a la fecha por empleado.
+ * Nada de esto mueve plata: es lectura y presentación, y las sumas quedan en peso
+ * entero (dentro de los derivadores puros de `schemas`).
  *
  * OJO — AUTORIZACIÓN: el resumen agrega plata de TODA la planta. Es la misma
  * superficie que el detalle SIN alcance por fila
  * (`GET /api/v1/payroll-periods/[id]`), así que quien llama decide: la página
  * sólo la usa para el admin y al empleado le manda nada más que su propia fila.
+ *
+ * NO lleva `sedeId`: la instalación es de una sola (M1–M3c) y tanto los períodos
+ * como la planta se leen enteros, así que el argumento sería una segunda
+ * frontera dentro de una base que ya tiene una.
  */
-export async function listPayrollOverview(sedeId: string): Promise<PayrollOverview> {
+export async function listPayrollOverview(): Promise<PayrollOverview> {
   try {
     // `listPeriods` ya es exhaustiva: si se recorta, esto se cae a la vista.
     const periods = await listPeriods();
-    // F10: la fecha de arranque de la sede acota el aviso de pendientes. Se lee
-    // SIEMPRE, también sin períodos: con la fecha configurada, la sede que
-    // todavía no liquidó nada tiene justamente su PRIMER ciclo pendiente.
-    const payrollStartDate = await getPayrollStartDate(sedeId);
-    // F9 regla 4 (sin F10): sin períodos no hay historia de la sede y el resumen
-    // no inventa pendientes. Con la fecha de arranque configurada SÍ hay piso
-    // —la fecha—, así que el aviso sigue su curso y reporta el primer ciclo.
-    if (periods.length === 0 && payrollStartDate === null) {
-      return { summaries: [], months: [], pendingSettlements: [] };
-    }
-
+    // F9 regla 4 + F10 (2026-10-04): el piso de la historia se deriva de esos
+    // períodos, así que la planta se lee SIEMPRE (también sin períodos: sin
+    // piso, el detector ofrece los últimos ciclos cerrados, que es justamente lo
+    // que hace posible ABRIR el primer período). No hay atajo de «sin períodos no
+    // hay nada»: ese atajo era la circularidad que dejaba al admin sin ciclos
+    // que elegir.
     const db = await payrollDb();
     // F9: la planta es UNA lectura más (paginada, acotada por sede), no una por
     // cadencia: el aviso de pendientes necesita saber quién cobra con cada
@@ -1399,7 +1371,6 @@ export async function listPayrollOverview(sedeId: string): Promise<PayrollOvervi
         periods,
         employees,
         referenceDate: bogotaDay(),
-        payrollStartDate,
       }),
     };
   } catch (error) {

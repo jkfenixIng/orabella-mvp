@@ -41,19 +41,15 @@ const dateSchema = z
   .regex(/^\d{4}-\d{2}-\d{2}$/, "Fecha inválida (use yyyy-mm-dd).");
 
 /**
- * F10 (decisión del dueño, 2026-10-01): la fecha desde la que la nómina OPERA
- * en la sede («la fecha de inicio de la implementación»). Es un día en la forma
- * canónica `yyyy-mm-dd` —la MISMA convención de fechas del módulo—, no un
- * instante.
+ * F10 (decisión del dueño, 2026-10-01, revisada el 2026-10-04): la fecha desde
+ * que la nómina OPERA. Un día en la forma canónica `yyyy-mm-dd` —la MISMA
+ * convención de fechas del módulo—, no un instante.
  *
- * No se rechaza una fecha futura: que la implementación arranque en el ciclo
- * que viene es el caso normal que el dueño describió, no un error de tipeo. La
- * fecha se guarda tal como el admin la elige y la regla del ciclo recortado la
- * resuelve sea cual sea el día de la semana.
- *
- * `null` es un estado LEGAL y significa «todavía no configurada»: sin fecha no
- * hay cota nueva y el módulo conserva el comportamiento de hoy (la historia de
- * la sede).
+ * El 2026-10-04 dejó de ser una CONFIGURACIÓN: la primera liquidación la
+ * DECLARA (`declared_start_date` de `openPeriodSchema`) y, de ahí en adelante, el
+ * arranque se deriva de los períodos (`payrollHistoryFloor`). Este esquema sigue
+ * vivo sólo porque otra superficie (la plataforma, que se retira en su unidad)
+ * valida la columna con él: no es la puerta del módulo de nómina.
  */
 export const payrollStartDateSchema = dateSchema.nullable();
 
@@ -78,15 +74,23 @@ export const payrollStartDateSchema = dateSchema.nullable();
  *
  * F10: la forma del rango que se persiste la resuelve `resolveOpenPayrollRange`
  * —el ÚNICO validador de las DOS formas admisibles: un ciclo COMPLETO o el
- * PRIMER ciclo recortado a la fecha de arranque— porque el recorte depende de
- * la sede (su fecha de arranque y los períodos que ya tiene) y este esquema es
+ * PRIMER ciclo recortado al arranque— porque el recorte depende de
+ * la instalación (su arranque y los períodos que ya tiene) y este esquema es
  * puro. La segunda opinión de `start_date`/`end_date` sigue siendo sobre el
  * CIELO del ciclo elegido: el recorte lo agrega el servicio, no el llamador.
+ *
+ * `declared_start_date` es la fecha desde la que la nómina OPERA, y sólo la
+ * puede mandar la PRIMERA liquidación (cuando la instalación no tiene ningún
+ * período): de ahí en adelante el arranque se deriva de los períodos y nadie
+ * vuelve a preguntar nada. El campo se valida SÍ o SÍ —es un día o no es nada—
+ * porque la decisión de si se ACEPTA y de si es OBLIGATORIA la toma el servicio,
+ * que es quien sabe si ya hay períodos.
  */
 export const openPeriodSchema = z
   .object({
     frequency: payFrequencySchema,
     cycle_end_date: dateSchema,
+    declared_start_date: dateSchema.nullable().optional(),
     start_date: dateSchema.optional(),
     end_date: dateSchema.optional(),
   })
@@ -1101,23 +1105,53 @@ export function cycleProrationFactor(args: {
   return rangeDays / cycleDays;
 }
 
-// ------------------- F10: fecha de arranque de la nómina de la sede ---
+// ------------- F10: el arranque de la nómina, derivado de los períodos ---
+
+/**
+ * F10 (decisión del dueño, 2026-10-04): el arranque de la nómina es un HECHO
+ * derivado, no una configuración — es `min(payroll_periods.start_date)`, el día
+ * del primer período que existe. Ésta es la regla 4 por evidencia que el módulo
+ * ya aplicaba (`floor = fecha ?? historia`): lo que cambia es que ya no hay una
+ * fecha configurada que compita con ella.
+ *
+ * Sin períodos NO hay arranque —y no hay historia que recorrer: eso no es un
+ * vacío mudo, es lo que hace que la PRIMERA liquidación tenga que declarar la
+ * fecha desde la que se opera (`resolveOpenPayrollRange`).
+ *
+ * Un período con `start_date` imposible no acota (mismo criterio que
+ * `isRangeBeforePayrollStart`): si ninguno acota, no hay piso.
+ *
+ * Puro para probarlo sin base de datos. Es la derivación que usan el resumen, la
+ * apertura y la pantalla: una sola definición de «desde cuándo existe la nómina».
+ */
+export function payrollHistoryFloor(
+  periods: readonly (DateRange & { start_date?: string | null })[],
+): string | null {
+  let floor: number | null = null;
+  for (const period of periods) {
+    const start = utcDayOf(period.start_date ?? "");
+    if (start === null) continue;
+    if (floor === null || start < floor) floor = start;
+  }
+  return floor === null ? null : isoDayOf(floor);
+}
 
 /**
  * F10: ¿este rango queda ENTERO antes del arranque de la nómina?
  *
- * LA regla de la fecha de arranque, en UNA sola definición: un rango es
- * ANTERIOR cuando su ÚLTIMO día es anterior a la fecha. El detector de
- * pendientes la usa para no ofrecer un ciclo anterior y el servicio la usa para
- * rechazar la apertura de un período anterior, así que el aviso y el servicio no
- * pueden decir cosas distintas del mismo ciclo.
+ * LA regla del arranque, en UNA sola definición: un rango es ANTERIOR cuando su
+ * ÚLTIMO día es anterior al arranque. El detector de pendientes la usa para no
+ * ofrecer un ciclo anterior y el servicio la usa para rechazar la apertura de un
+ * período anterior, así que el aviso y el servicio no pueden decir cosas
+ * distintas del mismo ciclo.
  *
- * Un rango que CONTIENE la fecha (empieza antes y termina después) NO queda
- * antes: es el ciclo en el que arranca la nómina y se RECORTA a la fecha (ver
+ * Un rango que CONTIENE el arranque (empieza antes y termina después) NO queda
+ * antes: es el ciclo en el que arranca la nómina y se RECORTA a él (ver
  * `resolveOpenPayrollRange`) — es el PRIMER ciclo, no un ciclo anterior.
  *
- * Sin fecha configurada (`null`) no hay cota: `false`, y el llamador conserva
- * el comportamiento de hoy.
+ * Sin arranque (`null`) no hay cota: `false`, y el llamador conserva el
+ * comportamiento del recorrido sin piso (que es ofrecer los ciclos cerrados más
+ * recientes).
  */
 export function isRangeBeforePayrollStart(args: {
   payrollStartDate: string | null | undefined;
@@ -1132,7 +1166,18 @@ export function isRangeBeforePayrollStart(args: {
 }
 
 /** F10: por qué un ciclo NO se puede abrir. */
-export type OpenPayrollRangeRejection = "not-a-cycle" | "before-start" | "not-first-cycle";
+export type OpenPayrollRangeRejection =
+  | "not-a-cycle"
+  | "before-start"
+  | "not-first-cycle"
+  /** La primera liquidación llegó sin declarar desde qué día se opera. */
+  | "declared-required"
+  /** La fecha declarada no cae dentro del ciclo que se quiere liquidar. */
+  | "declared-outside-cycle"
+  /** La fecha declarada es un día que todavía no pasó. */
+  | "declared-in-the-future"
+  /** Llegó una fecha declarada y ya hay períodos: el piso lo dan ellos. */
+  | "declared-with-history";
 
 /** F10: el rango que se persiste, con `trimmed` a la vista. */
 export interface OpenPayrollRange extends PayrollCycleRange {
@@ -1150,26 +1195,34 @@ export type OpenPayrollRangeResolution =
   | { ok: false; reason: OpenPayrollRangeRejection };
 
 /**
- * F10: el ÚNICO validador de la forma de un período NUEVO, con la fecha de
- * arranque y la historia de la cadencia a la vista. Acepta EXACTAMENTE dos
- * formas y rechaza todo lo demás:
+ * F10: el ÚNICO validador de la forma de un período NUEVO, con el arranque de la
+ * nómina y la historia de la cadencia a la vista. Acepta EXACTAMENTE dos formas
+ * y rechaza todo lo demás:
  *
  *   1. Un ciclo COMPLETO de la cadencia (domingo a sábado, 7/14/28 días): la
  *      forma normal de todos los ciclos posteriores al primero.
- *   2. El PRIMER ciclo —el que CONTIENE la fecha de arranque— RECORTADO a esa
- *      fecha: empieza el día del arranque y termina el sábado del ciclo. Sólo
- *      vale como PRIMERO: con otro período de la MISMA cadencia ya registrado,
- *      el recorte dejaría de ser «el primero» y se rechaza
- *      (`not-first-cycle`), porque la única primera liquidación de la cadencia
- *      ya ocurrió.
+ *   2. El PRIMER ciclo —el que CONTIENE el arranque— RECORTADO a él: empieza el
+ *      día del arranque y termina el sábado del ciclo. Sólo vale como PRIMERO:
+ *      con otro período de la MISMA cadencia ya registrado, el recorte dejaría
+ *      de ser «el primero» y se rechaza (`not-first-cycle`), porque la única
+ *      primera liquidación de la cadencia ya ocurrió.
  *
- * Un ciclo que cierra ANTES de la fecha no existe para el sistema
- * (`before-start`): no se ofrece ni se liquida. Un cierre que no es sábado, o
- * una fecha imposible, no es un ciclo (`not-a-cycle`) — la misma verdad de
- * `payrollCycleRange`.
+ * El arranque tiene UNA sola fuente y depende de si la instalación ya liquidó
+ * (decisión del dueño, 2026-10-04):
  *
- * Sin fecha configurada no hay recorte ni cota: todos los ciclos completos son
- * válidos y el comportamiento es el de hoy.
+ *   - **Sin períodos**: no hay nada de dónde derivarlo, así que la PRIMERA
+ *     liquidación lo DECLARA (`declaredStartDate`). Sin declaración no hay
+ *     primer período (`declared-required`): el piso no puede nacer mudo. Y la
+ *     declaración se valida —dentro del ciclo elegido (`declared-outside-cycle`)
+ *     y no en el futuro (`declared-in-the-future`)— porque el recorte sólo
+ *     existe sobre el ciclo que se liquida.
+ *   - **Con períodos**: el arranque es `payrollHistoryFloor` (`payrollStartDate`)
+ *     y una fecha declarada ya NO se acepta (`declared-with-history`): nadie la
+ *     manda, porque el piso son los períodos.
+ *
+ * Un ciclo que cierra ANTES del arranque no existe para el sistema
+ * (`before-start`): no se ofrece ni se liquida. Un cierre que no es sábado no es
+ * un ciclo (`not-a-cycle`) — la misma verdad de `payrollCycleRange`.
  *
  * `frequency` viaja aparte (y no dentro del ciclo) porque no toda cadencia con
  * historia la tiene en sus períodos: los heredados son `NULL` y NO son historia
@@ -1182,18 +1235,64 @@ export type OpenPayrollRangeResolution =
 export function resolveOpenPayrollRange(args: {
   frequency: PayFrequency;
   cycleEndDate: string;
+  /**
+   * El PISO derivado de los períodos existentes
+   * (`payrollHistoryFloor`); `null` cuando todavía no hay ninguno.
+   */
   payrollStartDate?: string | null;
+  /** La fecha que declara la PRIMERA liquidación: sólo con cero períodos. */
+  declaredStartDate?: string | null;
   periods: readonly (DateRange & { frequency?: string | null })[];
+  /**
+   * El día de HOY (Bogotá, la MISMA convención del módulo) para no aceptar una
+   * fecha que todavía no pasó. Opcional: sin él no se comprueba esa mitad.
+   */
+  referenceDate?: string | null;
 }): OpenPayrollRangeResolution {
   const cycle = payrollCycleRange({ frequency: args.frequency, cycleEndDate: args.cycleEndDate });
   if (cycle === null) return { ok: false, reason: "not-a-cycle" };
-  const startBound = args.payrollStartDate ?? null;
-  if (startBound === null) return { ok: true, ...cycle, trimmed: false };
+  const hasHistory = args.periods.length > 0;
+
+  // La declaración se valida ANTES de ser cota: una fecha que no sirve ni para
+  // recortar el ciclo elegido no puede quedarse flotando como si arrancara algo.
+  // Un texto vacío es «no declarada» (el campo sin escribir), no una fecha mala.
+  const declaredText = (args.declaredStartDate ?? "").trim();
+  const declaredRaw = declaredText === "" ? null : declaredText;
+  const declared = declaredRaw === null ? null : utcDayOf(declaredRaw);
+  if (declaredRaw !== null) {
+    if (hasHistory) return { ok: false, reason: "declared-with-history" };
+    const cycleStart = utcDayOf(cycle.start_date);
+    const cycleEnd = utcDayOf(cycle.end_date);
+    // Un día IMPOSIBLE no es una fecha.
+    if (declared === null || cycleStart === null || cycleEnd === null) {
+      return { ok: false, reason: "declared-outside-cycle" };
+    }
+    // Un día que todavía no pasó no puede ser el arranque de nada.
+    if (args.referenceDate != null) {
+      const today = utcDayOf(args.referenceDate);
+      if (today !== null && declared > today) return { ok: false, reason: "declared-in-the-future" };
+    }
+    // El recorte sólo existe sobre el ciclo elegido: la fecha tiene que caer
+    // DENTRO de él (los dos extremos incluidos: el primer día ya es ciclo
+    // completo y el cierre es el recorte más corto posible).
+    if (declared < cycleStart || declared > cycleEnd) {
+      return { ok: false, reason: "declared-outside-cycle" };
+    }
+  }
+
+  // El PISO: la fecha declarada cuando la hay —es el primer período, y entonces
+  // ES el arranque—, si no el derivado de los períodos que ya existen.
+  const startBound = declared === null ? (args.payrollStartDate ?? null) : isoDayOf(declared);
+  // Sin piso y sin declaración no hay primer período: el arranque se declara.
+  if (startBound === null) {
+    if (!hasHistory) return { ok: false, reason: "declared-required" };
+    return { ok: true, ...cycle, trimmed: false };
+  }
   const boundary = utcDayOf(startBound);
   const cycleStart = utcDayOf(cycle.start_date);
   if (boundary === null || cycleStart === null) return { ok: false, reason: "not-a-cycle" };
-  // Un ciclo que cierra antes de la fecha es ANTERIOR: la misma regla que el
-  // aviso de pendientes. La fecha es el ÚLTIMO día que el período puede tocar.
+  // Un ciclo que cierra antes del arranque es ANTERIOR: la misma regla que el
+  // aviso de pendientes. El arranque es el ÚLTIMO día que el período puede tocar.
   if (
     isRangeBeforePayrollStart({
       payrollStartDate: startBound,
@@ -1203,17 +1302,50 @@ export function resolveOpenPayrollRange(args: {
   ) {
     return { ok: false, reason: "before-start" };
   }
-  // El ciclo arranca DESPUÉS de la fecha: es un ciclo completo, la forma normal.
+  // El ciclo arranca DESPUÉS del arranque: es un ciclo completo, la forma normal.
   if (cycleStart >= boundary) return { ok: true, ...cycle, trimmed: false };
-  // El ciclo CONTIENE la fecha: es el PRIMER ciclo y se recorta a la fecha. Su
-  // único título es ser el primero: con historia en la MISMA cadencia, el
-  // recorte ya no es «la primera liquidación» y se rechaza.
+  // El ciclo CONTIENE el arranque: es el PRIMER ciclo y se recorta. Su único
+  // título es ser el primero: con historia en la MISMA cadencia, el recorte ya
+  // no es «la primera liquidación» y se rechaza.
   const bucket = periodCadenceBucket(args.frequency);
   const hasCadenceHistory = args.periods.some(
     (period) => periodCadenceBucket(period.frequency ?? null) === bucket,
   );
   if (hasCadenceHistory) return { ok: false, reason: "not-first-cycle" };
   return { ok: true, start_date: startBound, end_date: cycle.end_date, trimmed: true };
+}
+
+/**
+ * F10: el mensaje de un rechazo, en UNA sola voz para el servicio (que responde
+ * a un envío) y para la pantalla (que avisa mientras se escribe). Que los dos
+ * digan lo mismo no es decoración: es la misma regla contada dos veces.
+ *
+ * `payrollStartDate` es el PISO (derivado o declarado) y `cycle` el ciclo
+ * rechazado; los dos se nombran cuando el motivo los necesita.
+ */
+export function openPayrollRejectionMessage(
+  reason: OpenPayrollRangeRejection,
+  args: { payrollStartDate?: string | null; cycle?: PayrollCycleRange | null } = {},
+): string {
+  const startDate = args.payrollStartDate ?? null;
+  const cycle = args.cycle ?? null;
+  if (reason === "not-a-cycle") return "El cierre del ciclo debe ser un sábado.";
+  if (reason === "before-start") {
+    return `Este ciclo cierra antes del ${startDate}, el día del primer período: la nómina de la instalación arranca ese día y nada anterior existe para el sistema.`;
+  }
+  if (reason === "not-first-cycle") {
+    return `El ciclo ${cycle?.start_date ?? ""} a ${cycle?.end_date ?? ""} contiene el arranque de la nómina (${startDate}), pero esta cadencia ya tiene períodos: el primer ciclo recortado sólo se abre como PRIMERA liquidación de la cadencia. Elija un ciclo completo posterior.`;
+  }
+  if (reason === "declared-required") {
+    return "La primera liquidación declara desde qué día opera la nómina: elija la fecha de inicio del ciclo que va a liquidar.";
+  }
+  if (reason === "declared-outside-cycle") {
+    return `La fecha de inicio debe caer dentro del ciclo elegido (${cycle?.start_date ?? ""} a ${cycle?.end_date ?? ""}): ese es el único ciclo que se recorta a ese día.`;
+  }
+  if (reason === "declared-in-the-future") {
+    return "La fecha de inicio no puede ser un día que todavía no pasó.";
+  }
+  return "La fecha de inicio sólo se declara en la primera liquidación: con períodos registrados, el arranque lo da el período más antiguo.";
 }
 
 // ------------------- F9: ciclos cerrados que faltan por liquidar ---
@@ -1304,24 +1436,23 @@ export function isPayrollCycleSettled(args: {
  *     período de su MISMA cadencia —el que se solapa o coincide exactamente ya se
  *     liquidó o se está liquidando en borrador— o un período HEREDADO sin
  *     cadencia, que le pagó a todo el plantel.
- *  4. No se reporta historia ANTERIOR a la sede: el recorrido se detiene en el
- *     arranque del primer período de la sede —antes de eso no había nada que
- *     liquidar— y sin ningún período NI fecha de arranque no se reporta NADA.
- *     Un ciclo que terminó antes de ese arranque no aparece.
+ *  4. No se reporta historia ANTERIOR al arranque de la nómina: el recorrido se
+ *     detiene en el día del primer período (`payrollHistoryFloor`) —antes de
+ *     ahí no había nada que liquidar— y un ciclo que terminó antes no aparece.
  *  5. La lista se TOPA en `limit` ciclos (3 por defecto) POR CADENCIA, tomando
  *     los más recientes, y se ordena con el más atrasado PRIMERO (por fecha de
  *     cierre) para que lo más vencido se vea arriba.
  *
- * F10: `payrollStartDate` (la fecha desde la que la nómina opera en la sede)
- * REEMPLAZA el arranque por evidencia de la regla 4 cuando está configurada. La
- * fecha es la autoridad sobre dónde empieza la historia de la sede —«nada
- * anterior a la fecha de inicio de la implementación existe para el sistema»—,
- * así que un ciclo que cierra antes NO se reporta (la regla de
- * `isRangeBeforePayrollStart`), y con la fecha configurada el aviso también
- * reporta cuando la sede TODAVÍA no tiene ningún período: el primer ciclo es
- * justamente lo que falta liquidar. Las dos cotas NO se combinan por el máximo:
- * la fecha manda, porque el arranque por evidencia era sólo el mejor dato
- * disponible cuando no había una fecha declarada.
+ * F10 (decisión del dueño, 2026-10-04): el arranque es un HECHO DERIVADO —`min(
+ * payroll_periods.start_date)`—, no una configuración, así que este recorrido no
+ * recibe ninguna fecha. Y SIN períodos NO hay arranque: en vez de devolver `[]`
+ * (que dejaba a la instalación nueva sin nada que liquidar y sin forma de
+ * declarar su fecha) ofrece los últimos ciclos cerrados de cada cadencia, con el
+ * tope de siempre como único límite. Sin piso, el tope ES el alcance del
+ * recorrido: son `limit` ciclos hacia atrás y ni uno más.
+ *
+ * El rango que se REPORTA es el que se va a abrir: el del ciclo, recortado al
+ * arranque cuando el arranque cae dentro de él (el PRIMER ciclo de la cadencia).
  *
  * `referenceDate` es un día de Bogotá (lo resuelve el llamador, `bogotaDay()`), la
  * MISMA convención de fechas del resto del módulo.
@@ -1337,29 +1468,15 @@ export function pendingPayrollSettlements(args: {
   }[];
   referenceDate: string;
   limit?: number;
-  /** F10: fecha de arranque de la nómina de la sede; `null` = sin configurar. */
-  payrollStartDate?: string | null;
 }): PendingPayrollSettlement[] {
   const lastEnd = utcDayOf(lastCompletedCycleEndDate(args.referenceDate) ?? "");
   if (lastEnd === null) return [];
 
-  // F10: con la fecha de arranque configurada, el piso del recorrido ES la
-  // fecha (regla 4 reemplazada): nada anterior a ella existe para el sistema. La
-  // fecha se parsea una sola vez; una fecha imposible no acota (mismo criterio
-  // que `isRangeBeforePayrollStart`).
-  const declaredStart = utcDayOf(args.payrollStartDate ?? "");
-  // Regla 4 por evidencia (SIN fecha configurada): el arranque de la sede es la
-  // fecha de inicio MÁS ANTIGUA registrada. Antes de ahí no había nada que
-  // liquidar, así que el recorrido se detiene ahí.
-  let historyStart: number | null = null;
-  for (const period of args.periods) {
-    const start = utcDayOf(period.start_date);
-    if (start === null) continue;
-    if (historyStart === null || start < historyStart) historyStart = start;
-  }
-  const floor = declaredStart ?? historyStart;
-  // Sin períodos y sin fecha no hay historia de la sede: nada que reportar.
-  if (floor === null) return [];
+  // F10: el piso del recorrido es el primer período que existe, y sólo él. Se
+  // parsea una sola vez; un período con fecha imposible no acota (el mismo
+  // criterio que `isRangeBeforePayrollStart`).
+  const floor = payrollHistoryFloor(args.periods);
+  const floorDay = floor === null ? null : utcDayOf(floor);
 
   // Regla 1: la planta que importa es la ACTIVA. Un empleado dado de baja no
   // puede dejar un aviso de "falta liquidar" que nunca se pueda cerrar.
@@ -1386,16 +1503,20 @@ export function pendingPayrollSettlements(args: {
     if (cycleDays === null) continue;
 
     let found = 0;
+    // F10: sin piso (instalación sin períodos) el tope POR CADENCIA es el
+    // alcance del recorrido: son `limit` ciclos hacia atrás y ni uno más. Con
+    // piso, el recorrido se detiene ahí (nada anterior al primer período).
+    const walkFloor = floorDay === null ? lastEnd - cycleDays * DAY_MS * limit : floorDay;
     // Del ciclo completado MÁS RECIENTE hacia atrás: los primeros sin cubrir son
     // los que el tope conserva.
-    for (let end = lastEnd; end >= floor; end -= cycleDays * DAY_MS) {
+    for (let end = lastEnd; end >= walkFloor; end -= cycleDays * DAY_MS) {
       const start = end - (cycleDays - 1) * DAY_MS;
       const cycle = { start_date: isoDayOf(start), end_date: isoDayOf(end) };
       // F10: un ciclo ANTERIOR al arranque de la nómina no existe para el
       // sistema: no se ofrece ni se liquida (la MISMA regla que el servicio).
       if (
         isRangeBeforePayrollStart({
-          payrollStartDate: args.payrollStartDate,
+          payrollStartDate: floor,
           startDate: cycle.start_date,
           endDate: cycle.end_date,
         })
@@ -1403,12 +1524,12 @@ export function pendingPayrollSettlements(args: {
         break;
       }
       if (isPayrollCycleSettled({ periods: args.periods, frequency, cycle })) continue;
-      // F10: el rango REPORTADO es el que se va a abrir. Cuando la fecha de
-      // arranque cae DENTRO de este ciclo, es el PRIMER ciclo de la cadencia y
-      // su rango se recorta a la fecha (la MISMA forma que el servicio persiste),
-      // así el aviso dice lo que se va a liquidar y no un ciclo completo que la
-      // nómina nunca va a pagar como tal.
-      const reportedStart = declaredStart !== null && declaredStart > start ? declaredStart : start;
+      // F10: el rango REPORTADO es el que se va a abrir. Cuando el arranque
+      // (el día del primer período) cae DENTRO de este ciclo, es el PRIMER
+      // ciclo de la cadencia y su rango se recorta a él (la MISMA forma que el
+      // servicio persiste), así el aviso dice lo que se va a liquidar y no un
+      // ciclo completo que la nómina nunca va a pagar como tal.
+      const reportedStart = floorDay !== null && floorDay > start ? floorDay : start;
       pending.push({
         frequency,
         start_date: isoDayOf(reportedStart),
@@ -2285,7 +2406,11 @@ export function payrollMonthLabel(month: string): string {
  */
 export function payrollPeriodCountLabel(args: { total: number; shown: number }): string {
   const noun = args.total === 1 ? "período" : "períodos";
-  if (args.shown === args.total) return `${args.total} ${noun} en la sede.`;
+  // Sin «en la sede»: la instalación es de una sola (M1–M3c) y el rótulo no
+  // nombra un alcance que no existe (vocabulario del dueño, 2026-10-04).
+  if (args.shown === args.total) {
+    return args.total === 1 ? "1 período registrado." : `${args.total} ${noun} registrados.`;
+  }
   return `Mostrando ${args.shown} de ${args.total} ${noun}.`;
 }
 
