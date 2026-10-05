@@ -1951,37 +1951,49 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 key={row.id}
                 className="flex flex-col gap-1 px-3 py-2.5 sm:grid sm:grid-cols-[2.5rem_7.5rem_minmax(0,1fr)_minmax(0,1fr)_7.5rem_minmax(0,1.2fr)_5.5rem_4.5rem_4.5rem] sm:items-center sm:gap-2"
               >
-                <span className="font-mono text-sm font-semibold text-slate-700 dark:text-slate-300">
-                  #{row.consecutive_number}
+                {/* Las seis líneas de la tarjeta móvil. Abajo de `sm` cada hoja es una
+                    línea con su rótulo —la palabra del encabezado, la misma— y cada
+                    envoltorio `sm:contents` se borra de la grilla de arriba, donde cada
+                    hoja se queda en la columna que su `sm:col-start-N` le fija. */}
+                <span className="flex items-center gap-2 sm:contents">
+                  <span className="font-mono text-sm font-semibold text-slate-700 sm:col-start-1 sm:row-start-1 dark:text-slate-300">
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">ID: </span>#
+                    {row.consecutive_number}
+                  </span>
+                  <span className="whitespace-nowrap text-sm text-slate-500 sm:col-start-2 sm:row-start-1 dark:text-slate-400">
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Fecha: </span>
+                    {new Date(row.created_at).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })}{" "}
+                    {new Date(row.created_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}
+                  </span>
                 </span>
-                <span className="whitespace-nowrap text-sm text-slate-500 dark:text-slate-400">
-                  {new Date(row.created_at).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })}{" "}
-                  {new Date(row.created_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}
+                <span className="flex items-center justify-between gap-2 sm:contents">
+                  <span className="whitespace-nowrap text-sm font-medium text-slate-900 sm:col-start-7 sm:row-start-1 sm:text-right dark:text-slate-100">
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Total: </span>
+                    {formatMoney(row.total)}
+                  </span>
+                  <span className="sm:col-start-8 sm:row-start-1">
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Estado: </span>
+                    <Badge variant={invoiceStatusVariant(row.status)}>{row.status}</Badge>
+                  </span>
                 </span>
-                <span className="truncate text-sm text-slate-600 dark:text-slate-300" title={row.user_name ?? ""}>
-                  {row.user_name ?? "—"}
+                <span className="flex items-center gap-1.5 sm:contents">
+                  <span className="truncate text-sm text-slate-600 sm:col-start-3 sm:row-start-1 dark:text-slate-300" title={row.user_name ?? ""}>
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Abrió: </span>
+                    {row.user_name ?? "—"}
+                  </span>
                 </span>
-                <span className="truncate text-sm text-slate-600 dark:text-slate-300" title={row.closed_by_name ?? ""}>
-                  {row.closed_by_name ?? "—"}
+                <span className="flex items-center gap-1.5 sm:contents">
+                  <span
+                    className="truncate text-sm text-slate-600 sm:col-start-6 sm:row-start-1 dark:text-slate-300"
+                    title={row.employee_names.join(", ")}
+                  >
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Empleados: </span>
+                    {employeeSummary(row.employee_names)}
+                  </span>
                 </span>
-                <span className="whitespace-nowrap text-sm text-slate-500 dark:text-slate-400">
-                  {row.closed_at
-                    ? `${new Date(row.closed_at).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })} ${new Date(row.closed_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}`
-                    : "—"}
-                </span>
-                <span
-                  className="truncate text-sm text-slate-600 dark:text-slate-300"
-                  title={row.employee_names.join(", ")}
-                >
-                  {employeeSummary(row.employee_names)}
-                </span>
-                <span className="whitespace-nowrap text-sm font-medium text-slate-900 sm:text-right dark:text-slate-100">
-                  {formatMoney(row.total)}
-                </span>
-                <span>
-                  <Badge variant={invoiceStatusVariant(row.status)}>{row.status}</Badge>
-                </span>
-                <span className="flex items-center gap-1 sm:justify-center">
+                <span className="flex flex-wrap items-center gap-1 sm:contents">
+                  <span className="flex items-center gap-1 sm:col-start-9 sm:row-start-1 sm:justify-center">
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Acciones: </span>
                   {row.status !== "Anulada" &&
                     (props.isAdmin ||
                       (props.canWrite &&
@@ -2014,6 +2026,21 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     <Eye className="h-4 w-4" aria-hidden="true" />
                   </button>
                 )}
+                </span>
+                </span>
+                {/* Abajo de `sm` el cierre va al pie y más apagado: es el dato menos
+                    consultado de la fila. Arriba vuelve a su columna y a su cuerpo. */}
+                <span className="flex items-center gap-2 sm:contents">
+                  <span className="truncate text-xs text-slate-500 sm:col-start-4 sm:row-start-1 sm:text-sm dark:text-slate-400" title={row.closed_by_name ?? ""}>
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Cerró: </span>
+                    {row.closed_by_name ?? "—"}
+                  </span>
+                  <span className="whitespace-nowrap text-xs text-slate-500 sm:col-start-5 sm:row-start-1 sm:text-sm dark:text-slate-400">
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Cerrada: </span>
+                    {row.closed_at
+                      ? `${new Date(row.closed_at).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })} ${new Date(row.closed_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}`
+                      : "—"}
+                  </span>
                 </span>
                   {detail && detail.invoice.id === row.id && (
                     <Dialog
