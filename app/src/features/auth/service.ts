@@ -133,9 +133,9 @@ export const PASSWORD_CHANGED_ELSEWHERE_ERROR =
 /**
  * ¿El fallo de un `rpc` es una DECISIÓN del contrato (un `RAISE EXCEPTION` de
  * las funciones de 054/057, siempre SQLSTATE P0001) y no una falla del sistema?
- * El mensaje es el vocabulario compartido entre el archivo y este módulo, y
- * también lo lee `scripts/create-superadmin.ts` (G2) para traducir los rechazos
- * de `create_user_with_role`/`replace_user_roles` sin copiar el código P0001.
+ * El mensaje es el vocabulario compartido entre el archivo y este módulo, que
+ * usa el mismo predicado para los tres rechazos que traduce abajo —sin copiar
+ * el código P0001— en lugar de repetir la comparación en cada uno.
  */
 export function esRechazoDeRpc(
   error: { code?: string; message?: string } | null,
@@ -229,9 +229,9 @@ export interface AuthUserRow {
   /**
    * La cuenta sigue nombrando la instalación a la que pertenece, y las guardas
    * de sesión la exigen (`requireSession`, `requireAdminSession`, las de caja,
-   * facturación, inventario y nómina, y `requirePlatformAdmin`): sin ella la
-   * sesión se rechaza con NO_SEDE. Es un campo DEVUELTO de la fila de la cuenta,
-   * no un criterio con el que el negocio acote sus lecturas.
+   * facturación, inventario y nómina): sin ella la sesión se rechaza con
+   * NO_SEDE. Es un campo DEVUELTO de la fila de la cuenta, no un criterio con el
+   * que el negocio acote sus lecturas.
    */
   sede_id: string | null;
   email: string | null;

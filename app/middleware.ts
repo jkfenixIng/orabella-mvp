@@ -63,7 +63,7 @@ export const config = {
   // ÚLTIMO segmento leyera con punto quedaría sin esta puerta. Se acepta porque
   // la invariante del proyecto es que las rutas de aplicación no llevan punto
   // (las de aplicación son segmentos planos: `/payroll`, `/api/v1/payroll-periods`,
-  // `/plataforma`…; y `/login`, `/api/v1/health` y `/api/v1/auth/*`, las únicas
+  // `/vales`…; y `/login`, `/api/v1/health` y `/api/v1/auth/*`, las únicas
   // públicas, tampoco). `tests/middleware-matcher.test.ts` deja esto escrito y
   // verificado, no supuesto.
   //

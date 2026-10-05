@@ -36,185 +36,69 @@ npm run lint    # eslint .
 npm test        # vitest run
 ```
 
-## Cuenta de plataforma (`superadmin`)
+## La instalación no se configura
 
-La capa de plataforma (ver `odd/tasks/plataforma-super-admin.md`) se administra
-con UNA sola cuenta: documento `superadmin` con el rol `superadmin`, anclada a la
-**sede de plataforma**. Esa cuenta **no** se crea desde la administración de una
-sede —`adminCreateUser` no admite
-ese rol, que solo otorga la plataforma— así que se aprovisiona con un script del
-repositorio:
+**No hay cuenta de plataforma, ni pantalla `/plataforma`, ni comando que la cree.**
+No es un pendiente: la capa que las tenía —`src/features/platform`,
+`app/plataforma`, `scripts/create-superadmin.ts` y su entrada de npm
+`create:superadmin`— se retiró por decisión del dueño («del 1 si no hace nada
+eliminarlo») porque su ÚNICA escritura era la fecha de arranque de la nómina, y
+esa configuración ya no existe. `tests/platform-retirement.test.ts` fija el
+retiro: que nada bajo `src/` ni bajo `app/` la nombre, la importe o la enlace.
 
-```bash
-npm run create:superadmin
-```
+La instalación es de **una sola sede** (decisión del dueño, 2026-10-01) y **no
+tiene ninguna propiedad que alguien pueda configurar desde la app**. Un
+operador nuevo no configura nada: crea el proyecto de Supabase, aplica las
+migraciones en orden (ver **Convenciones**), corre
+`supabase/seeds/acceptance.sql` y entra.
 
-### Variables: el script carga los archivos de entorno del proyecto
+### El piso de la nómina lo declara la primera liquidación
 
-El script arranca cargando los archivos de entorno del proyecto con
-`loadEnvConfig` de `@next/env` —el mecanismo canónico de Next, que ya viene con
-`next`—, así que lee los MISMOS archivos que la app (`.env.local` entre ellos)
-**antes** de mirar las variables. Con `.env.local` presente, lo único que hay que
-definir a mano es `SUPERADMIN_PASSWORD`:
+La fecha desde la que la nómina OPERA ya no se configura: se **deriva**. La
+declara el primer período que se liquida y, de ahí en adelante, es
+`min(payroll_periods.start_date)` (`getPayrollStartDate`,
+`src/features/payroll/service.ts`; expuesta como `getPayrollStartDateAction`,
+`src/features/payroll/actions.ts`). Antes de que exista ese primer período el
+valor es `null`, y eso significa exactamente «la nómina todavía no tiene primer
+período», no «falta configurarla».
 
-| Variable | Qué es |
-|---|---|
-| `SUPERADMIN_PASSWORD` | La clave de la cuenta. **Obligatoria y sin valor por defecto**: si falta o viene vacía, el script no escribe nada y falla. Es la ÚNICA variable propia del script y la única que NO va en `.env.local`. |
-| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | Las mismas de la app: salen de `.env.local` y el script usa `createAdminClient()` (service_role). El host de la URL es lo que imprime antes de escribir. |
+La escritura que quedaba —la que fijaba ese día— estaba en la capa de plataforma
+y se retiró con ella. El día se declara UNA vez y después es **solo lectura**:
+moverlo implicaría reescribir períodos ya liquidados, así que no hay superficie
+que lo mueva, y no hace falta que la haya.
 
-**Precedencia:** lo que YA está en el entorno del proceso **gana** sobre el
-archivo (es la precedencia normal de Next, y el script la impone de forma
-explícita para que no dependa de un detalle interno). Así el dueño puede apuntar
-a otra base a propósito, sin editar ningún archivo.
+### El rol `superadmin`: deuda declarada, no superficie
 
-El script dice de dónde salieron las credenciales —solo nombres de archivo, nunca
-valores—:
+El rol **sigue en el catálogo** de la base
+(`supabase/migrations/001_orabella_schema.sql`) y en el tipo `RoleCode`
+(`src/features/auth/schemas.ts`), y sigue **sin ser asignable** desde la
+administración de una sede: lo asignable es `sedeAssignableRoleSchema` =
+`["admin","empleado","caja"]`. `setUserRoles` lo rechaza en las **dos
+direcciones** —otorgarlo, y quitárselo a quien ya lo tenga— antes de llamar al
+`rpc`, así que la base no escribe nada.
 
-```text
-[superadmin] entorno: archivos cargados: .env.local, .env — el entorno del proceso tiene prioridad sobre ellos
-[superadmin] entorno: no se encontraron archivos de entorno; se usa sólo el entorno del proceso
-```
+Es deuda declarada a propósito: retirar el código no borra la fila del catálogo
+ni regenera el archivo único de esquema, porque eso obligaría a resetear las dos
+bases. Quitarla es otra unidad, con su migración. El guard que la mantiene
+escrita está en `tests/platform-retirement.test.ts` («la base NO se toca»).
 
-**No hay variable de destino ni de sede.** El destino no se declara: cada entorno
-tiene su propio `.env` y el script imprime el HOST de Supabase al que le escribe
-justo antes de tocar nada —ese es el chequeo humano—. Y la sede ya no se elige:
-la asegura el script (ver abajo).
+### Lo que sigue autorizando es el ROL, no la sede
 
-**La clave no está en el repositorio** —no está en `.env.example`, ni en un seed,
-ni en este README, ni en una prueba— y **no hay clave por defecto**, porque el
-respaldo silencioso termina siendo la clave de producción. Vive solo en el
-entorno con el que se corre el script; a la base baja únicamente su hash scrypt
-(`hashPassword` de la app). El cargador leería la clave si estuviera en
-`.env.local`, y por eso la decisión es **no ponerla ahí**: la credencial se define
-en el entorno de la corrida, no en un archivo.
+`requireSedeRole()` (`src/shared/lib/sede.ts`) es la frontera real (ver
+**Seguridad**): autoriza por rol. La comparación por sede (`resolveSede`) **ya no
+es frontera de nada** —se retiró con la columna `sede_id`, porque con una sola
+sede comparar la sede solicitada con la de la sesión no acotaba nada—. La
+columna, en cambio, sigue existiendo y la base la sigue exigiendo
+(`users.sede_id` es NOT NULL), así que la sesión la sigue declarando: es un
+campo **devuelto** de la fila de la cuenta, no un criterio con el que el negocio
+acote sus lecturas.
 
-El documento es el MISMO en los dos entornos; lo único que cambia es el valor de
-las variables (y el `.env.local` de cada máquina):
+### Efecto en las variables de entorno
 
-```bash
-# PRUEBAS y producción se distinguen por el VALOR y por el host que el script imprime.
-export SUPERADMIN_PASSWORD='...'   # la ÚNICA a mano; sale del shell, nunca de un archivo
-npm run create:superadmin
-```
-
-Si la máquina NO tiene `.env.local` (o se corre desde otro directorio), hay que
-definir también las tres de Supabase en el entorno, porque no hay archivo del que
-salgan.
-
-### Definir la clave en el shell (la trampa que ya nos costó una corrida)
-
-La clave es la única variable que se define a mano, y **cómo se define depende del
-shell**:
-
-```powershell
-# PowerShell: `set VAR=valor` NO define una variable de entorno (es un alias de
-# Set-Variable: la variable existe en la sesión, pero los procesos hijos NO la
-# heredan, así que npm/node no la ven). Se usa $env:, y vale sólo para esa ventana.
-$env:SUPERADMIN_PASSWORD = '...'
-npm run create:superadmin
-```
-
-```cmd
-:: cmd.exe: `set VAR=valor` SÍ define una variable de entorno (sólo para esa ventana).
-set SUPERADMIN_PASSWORD=...
-npm run create:superadmin
-```
-
-```bash
-# sh/bash: `export` para que el proceso hijo la herede (sólo esa ventana).
-export SUPERADMIN_PASSWORD='...'
-npm run create:superadmin
-```
-
-### La sede de la instalación
-
-`users.sede_id` es NOT NULL (003_admin.sql), así que la cuenta tiene que
-pertenecer a alguna sede. La instalación es de **una sola sede** (decisión del
-dueño, 2026-10-01), así que esa sede es LA SEDE DEL NEGOCIO y no hace falta una
-fila aparte que represente al sistema: el script **no escribe en `sedes`** —no
-crea, no activa ni desactiva ninguna fila— y se ancla a la que ya existe.
-
-- **La resolución es la MISMA que usa la capa de plataforma**
-  (`leerSedeDeLaInstalacion`, `src/features/platform/service.ts`): la única fila
-  **activa** de `sedes`. Se decide por DATO (`is_active`), nunca por el nombre de
-  la fila: renombrarla no cambia qué es la instalación.
-- Si **no hay exactamente una** sede activa, el script **falla antes de tocar la
-  cuenta**: con cero no hay dónde anclar, y con dos o más la instalación ya no es
-  de una sola sede. Ninguna de las dos la decide el script.
-- Las filas **inactivas** que queden —p. ej. la `Plataforma (sistema)` que creó la
-  versión anterior de este script— no son la instalación: el script no las
-  toca, no las cuenta y no las ofrece. Su limpieza es de la unidad que elimina la
-  columna.
-- **No se relaja `users.sede_id` ni se toca `requireSedeRole`**
-  (`src/shared/lib/sede.ts`). La comparación por sede (`resolveSede`) **ya no es
-  frontera de nada**: se retiró junto con la columna, porque con una sola sede
-  instalar comparar la sede solicitada con la de la sesión no acotaba nada. Lo
-  que sigue autorizando es el ROL, por `requireSedeRole`.
-- Si la cuenta estaba anclada a otra sede, la corrida **la re-ancla a la sede de
-  la instalación y lo dice** (cambiar de sede cambia lo que esa cuenta ve del
-  negocio: no puede ser mudo). El ROL no se toca: `setUserRoles` rechaza otorgar
-  o quitar `superadmin` desde la administración de la sede.
-
-**Consecuencia visible:** al anclar la cuenta a la sede del negocio, el admin de
-la sede la ve en su pestaña de Roles (`Administración de plataforma`, rol
-`superadmin`). No puede cambiarle el rol —`setUserRoles` lo rechaza en las dos
-direcciones— pero la fila aparece sin un rol asignable marcado.
-
-### La cuenta ajusta el sistema, no opera el negocio
-
-El conjunto de roles se fija **exactamente en `["superadmin"]`** en cada corrida
-(`replace_user_roles` reemplaza el conjunto, no agrega). Esa es la DEFINICIÓN de
-la cuenta, no una limitación pendiente: la cuenta existe para ajustar el sistema
-y **no** para operar el negocio. Caja, facturas y nómina le quedan **sin
-permisos**, y eso es deliberado.
-
-### Qué hace (y qué no)
-
-- **Idempotente**: la primera corrida crea la cuenta; las siguientes **actualizan**
-  la clave y limpian el bloqueo por intentos. Nunca crea una segunda cuenta, ni
-  duplica el rol: `replace_user_roles` deja exactamente `superadmin`.
-- **Verifica de punta a punta**: al final vuelve a leer el hash guardado y
-  comprueba que verifica con `verifyPassword()` —la misma función del login— con
-  la clave del entorno. Si no verifica, falla en vez de dejar una cuenta que no
-  puede entrar.
-- Deja `must_change_password = false`: AUTH-01 fuerza el cambio cuando la clave
-  inicial es el documento, pero acá la clave la eligió el despliegue y tiene que
-  servir para entrar.
-- **No habilita una cuenta deshabilitada**: si `users.is_active = false`, falla en
-  vez de deshacer en silencio una decisión del dueño.
-- No escribe auditoría: el vocabulario de `audit_logs` no tiene una acción de
-  aprovisionamiento y esto no es una operación de la aplicación.
-
-### El runner (por qué el script de `package.json` se ve así)
-
-El proyecto no tiene `tsx` ni `ts-node`, y el script tiene que importar el
-`hashPassword` de la app (con el alias `@/`) para que el hash no pueda divergir
-del que verifica el login. El runner disponible es `jiti`: **no está declarado en
-`devDependencies`**, pero queda instalado y fijado en `package-lock.json` como
-dependencia de desarrollo porque `@tailwindcss/node` (y `vite`, como peer) lo
-exigen; por eso **el script se corre en una copia del repo con las dependencias
-de desarrollo instaladas** (con `--omit=dev` no hay runner). El CLI de `jiti` no
-resuelve el alias `@/` sin la variable `JITI_TSCONFIG_PATHS` —que no se puede
-fijar de forma portable en `cmd.exe` y en `sh`—, así que la entrada del
-`package.json` levanta `jiti` con `{ tsconfigPaths: true }` y llama a `main()`.
-Si algún día se agrega un runner propio (`tsx`), la entrada se cambia por
-`tsx scripts/create-superadmin.ts` y el script no se toca.
-
-**El script se corre DESDE la máquina del dueño**, contra la base remota, con las
-credenciales que salen de su `.env.local` (o del entorno del proceso, que tiene
-prioridad): no hace parte del despliegue de la app y no se ejecuta desde el
-servidor de producción. Necesita, por lo tanto, un checkout del repositorio con
-las dependencias de desarrollo instaladas (`npm ci`). Si algún día tiene que
-correrse en un entorno que no las tenga, hay que **declarar el runner** en el
-proyecto —`tsx`, por ejemplo—: eso sería su propia unidad, con su propio cambio
-de `package.json` y de `package-lock.json` y su propio gate.
-
-Si el runner no está instalado, el arranque lo dice en vez de morir con el error
-de Node sobre un módulo que no encuentra:
-
-```text
-[superadmin] Falta el runner TypeScript: este comando necesita las dependencias de desarrollo instaladas en el checkout, con npm ci y sin --omit=dev. jiti no es una dependencia declarada del proyecto: llega con @tailwindcss/node y vite. Ver el README: Cuenta de plataforma.
-```
+No queda ninguna variable «de la plataforma». `SUPERADMIN_PASSWORD` —la única
+que vivía fuera de `.env.local`, en el entorno de la corrida— desapareció con el
+script. La tabla de **Env** de arriba es la lista completa de lo que hay que
+definir.
 
 ## Estructura
 
@@ -225,7 +109,7 @@ src/shared/{components,lib,config}/  # theme, api-response, supabase client/serv
 supabase/migrations/      # SQL versionado (001 fundación; dominio en T2→T7; endurecimiento en T8; 009→031 ampliaciones)
 supabase/seeds/           # seeds de aceptación §11 (T8, idempotentes)
 tests/                    # suites vitest + e2e Playwright (tests/e2e/)
-scripts/                  # operaciones de despliegue fuera de la app (alta de la cuenta de plataforma, G2)
+docs/                     # estándar de UX/UI y notas (no hay carpeta scripts/: U12 se llevó el único script)
 ```
 
 ## Convenciones
@@ -281,7 +165,8 @@ Escrito para que nadie cuente con una segunda línea de defensa que no existe.
   antes de consultar. Un guard olvidado es una brecha total, no un agujero
   parcial: no hay nada detrás. **La frontera es de ROL, no de sede**: con la
   base bypassando RLS, lo que rechaza una operación es el rol del actor
-  (`admin`/`caja`/`superadmin`/…), y ya no una comparación de `sede_id` —esa
+  (`admin`/`caja`/`empleado`/…; el `superadmin` del catálogo ya no autoriza
+  nada), y ya no una comparación de `sede_id` —esa
   se retiró con la columna.
 - **Qué escriben las migraciones (dato, no protección).** Los bullets de abajo
   describen el esquema, y el esquema sí trae aislamiento por sede:
