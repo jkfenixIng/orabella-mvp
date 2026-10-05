@@ -151,7 +151,12 @@ const ALLOWLIST = new Map<string, number>([
   ["app/invoices/invoices-client.tsx", 7],
   ["app/payroll/payroll-client.tsx", 4],
   ["app/services/services-client.tsx", 1],
-  ["app/vales/vouchers-client.tsx", 1],
+  // La lista de vales ya no es una `<table min-w-[760px]>` dentro de un carril:
+  // es la tarjeta de R-e2 (abajo de `sm`) sobre una grilla de seis columnas
+  // (arriba). El piso no se transladó a otro lado —la fila no declara ningún
+  // `min-w-[Npx]`—, así que su deuda baja a CERO y la entrada se queda como
+  // testigo de que se pagó, no como permiso.
+  ["app/vales/vouchers-client.tsx", 0],
 ]);
 
 const SOURCES = readProductionSources();
@@ -345,12 +350,13 @@ describe("la escala vive una sola vez: en el primitivo", () => {
       }
     }
     expect(failures).toEqual([]);
-    // Los seis archivos que ya tenían pisos, y 16 en total: si un séptimo
+    // Los seis archivos de la lista, y 15 pisos en total: si un séptimo
     // apareciera sin entrar acá, el test de arriba ya lo habría marcado.
-    // La cifra BAJA cuando una unidad migra un consumidor al primitivo: las dos
-    // tablas de liquidación de `payroll-client.tsx` dejaron de escribir su
-    // `min-w-[1040px]` a mano (6 → 4) y esa deuda queda pagada, no escondida.
-    expect([...ALLOWLIST.values()].reduce((total, hits) => total + hits, 0)).toBe(16);
+    // La cifra BAJA cuando una unidad paga su deuda, porque el piso no se
+    // translada: las dos tablas de liquidación de `payroll-client.tsx`
+    // dejaron de escribir su `min-w-[1040px]` a mano (6 → 4) y la lista de
+    // vales ya no es una tabla con carril (1 → 0). Queda pagada, no escondida.
+    expect([...ALLOWLIST.values()].reduce((total, hits) => total + hits, 0)).toBe(15);
   });
 });
 
