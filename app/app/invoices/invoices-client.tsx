@@ -1400,7 +1400,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   <Plus className="h-4 w-4" aria-hidden="true" />
                   Emitir factura
                 </button>
-                <DialogContent className="max-w-5xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                {/* Sangre completa: `p-0` Y `sm:p-0`. La base de la primitiva trae `sm:p-6`, y `tailwind-merge` deja VIVA la variante de `sm:` porque `p-0` no la compite: con `p-0` solo la hoja quedaba a 24 px del borde del diálogo (medido a 1024 y a 1440). */}
+                <DialogContent className="max-w-5xl border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
                   <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
                     <DialogHeader className="block">
                       <DialogTitle className="sr-only">FACTURA DE VENTA</DialogTitle>
@@ -2049,7 +2050,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         if (!isOpen) closeDetail();
                       }}
                     >
-                    <DialogContent className="max-w-4xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                    {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
+                    <DialogContent className="max-w-4xl border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
                       <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
                         <DialogHeader className="block">
                           <DialogTitle className="sr-only">FACTURA #{detail.invoice.consecutive_number} {detail.invoice.status}</DialogTitle>
@@ -2354,7 +2356,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         if (!isOpen) setIsEditDialogOpen(false);
                       }}
                     >
-                      <DialogContent className="max-w-5xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                      {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
+                      <DialogContent className="max-w-5xl border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
                         <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
                           <DialogHeader className="block">
                             <DialogTitle className="sr-only">EDITAR FACTURA #{detail?.invoice.consecutive_number ?? "—"}</DialogTitle>
@@ -2871,7 +2874,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
           else setIsItemDialogOpen(isOpen);
         }}
       >
-        <DialogContent className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+        {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
+        <DialogContent className="max-w-lg border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
           <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
             <DialogHeader className="block">
               <DialogTitle className="sr-only">
@@ -3197,8 +3201,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
           if (!open && !commissionBusy) closeCommission();
         }}
       >
+        {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
         <DialogContent
-          className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent"
+          className="max-w-lg border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent"
           onInteractOutside={(event) => {
             if (commissionRows.length > 0) event.preventDefault();
           }}
@@ -3300,7 +3305,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
           if (!open && !busy) cancelConfirm();
         }}
       >
-        <DialogContent className="max-w-sm border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+        {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
+        <DialogContent className="max-w-sm border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
           <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
             <DialogHeader className="block">
               <DialogTitle className="sr-only">

@@ -197,16 +197,21 @@ const ALLOWLIST = new Map<string, { hits: number; reason: string }>([
     "src/components/ui/lib/dialog.tsx",
     { hits: 2, reason: "Velo `bg-black/60`: no existe token de velo y no se puede inventar uno." },
   ],
-  [
-    "src/shared/components/main-nav.tsx",
-    { hits: 1, reason: "Velo `bg-black/40`: mismo caso que dialog.tsx." },
-  ],
 ]);
 
-/** Archivos que WU1 dejó limpios: se afirman uno por uno, no solo por el agregado. */
+/**
+ * Archivos que WU1 dejó limpios: se afirman uno por uno, no solo por el agregado.
+ *
+ * `main-nav.tsx` entra acá con la unidad de las primitivas responsivas (R2): su
+ * velo `bg-black/40` estaba en la lista permitida de más abajo, y al migrar el
+ * cajón a la primitiva `Dialog` el velo dejó de ser suyo —lo pinta
+ * `DialogContent`. La lista no se relajó: el archivo pasó de «1 token crudo
+ * declarado» a CERO, y ahora lo cubre la misma regla que a los demás.
+ */
 const WU1_CLEANED = [
   "app/error.tsx",
   "app/not-found.tsx",
+  "src/shared/components/main-nav.tsx",
   "src/shared/components/skeleton.tsx",
   "src/shared/components/theme-toggle.tsx",
 ];

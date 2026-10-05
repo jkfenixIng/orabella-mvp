@@ -4,6 +4,12 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState, useEffect } from "react";
 import { Bell, Calculator, House, Package, Receipt, Settings, ShieldCheck, Sparkles, Ticket, Wallet, type LucideIcon } from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+  DialogTrigger,
+} from "@/src/components/ui/lib/dialog";
 import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 
 interface NavLink {
@@ -166,6 +172,21 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
 
+  // El cajón es de móvil y tableta. Antes el velo y el panel llevaban `lg:hidden`
+  // y con eso se iban solos al pasar a escritorio; con la primitiva hay que
+  // cerrar el diálogo, porque aunque el panel se esconda el velo y el bloqueo de
+  // scroll seguirían activos sobre la barra lateral. Abrir el menú a 390 y girar
+  // el teléfono era el camino.
+  useEffect(() => {
+    const desktop = window.matchMedia("(min-width: 1024px)");
+    const closeOnDesktop = (event: MediaQueryList | MediaQueryListEvent) => {
+      if (event.matches) setDrawerOpen(false);
+    };
+    closeOnDesktop(desktop);
+    desktop.addEventListener("change", closeOnDesktop);
+    return () => desktop.removeEventListener("change", closeOnDesktop);
+  }, []);
+
   function toggleGroup(id: string): void {
     setOpenGroups((prev) => ({ ...prev, [id]: !prev[id] }));
   }
@@ -291,33 +312,49 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
           <SealMark />
           Orabella
         </Link>
-        <button
-          type="button"
-          aria-label={drawerOpen ? "Cerrar menú" : "Abrir menú"}
-          aria-expanded={drawerOpen}
-          aria-controls="menu-movil"
-          onClick={() => setDrawerOpen((prev) => !prev)}
-          className="rounded-md border border-border-color px-3 py-2 text-sm font-medium"
-        >
-          ☰
-        </button>
-      </header>
-
-      {/* Menú móvil en acordeón */}
-      {drawerOpen && (
-        <div className="fixed inset-0 z-40 lg:hidden">
-          <div
-            className="absolute inset-0 bg-black/40 backdrop-blur-sm"
-            aria-hidden="true"
-            onClick={() => setDrawerOpen(false)}
-          />
-          <div
-            id="menu-movil"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Menú principal"
-            className="absolute left-0 top-0 flex h-full w-72 flex-col gap-4 overflow-y-auto bg-surface p-4"
+        <Dialog open={drawerOpen} onOpenChange={setDrawerOpen}>
+          <DialogTrigger
+            asChild
+            className="h-auto bg-transparent px-3 shadow-none"
           >
+            <button
+              type="button"
+              aria-label={drawerOpen ? "Cerrar menú" : "Abrir menú"}
+              aria-controls="menu-movil"
+              className="rounded-md border border-border-color px-3 py-2 text-sm font-medium"
+            >
+              ☰
+            </button>
+          </DialogTrigger>
+
+          {/*
+            R2: el cajón ES `Dialog`, no un `role="dialog"` escrito a mano.
+
+            Medido en Chromium a 320/360/390 con el menú abierto: Escape no lo
+            cerraba, el duodécimo Tab aterrizaba en un input DETRÁS del velo, el
+            fondo seguía scrolleando (`scrollTo(0,400)` → `scrollY=400`) y al
+            cerrar el foco quedaba en `BODY`. La causa era una sola:
+            `aria-modal="true"` es una DECLARACIÓN, no un comportamiento. Le
+            promete al lector de pantalla que lo de atrás está muerto y no lo
+            está, que es justo por lo que el foco se escapa. La primitiva ya
+            tenía la trampa de foco, la tecla Escape, el bloqueo de scroll y el
+            apilado de z-index que comparte con `Select` y `Combobox`.
+
+            Lo que NO cambia es la geometría: `w-72` (288 px) y el panel pegado
+            a la izquierda, que R27 midió y que nunca fue el defecto. Lo que sí
+            cambia es el velo, que pasa a ser el de `DialogContent` (`bg-black/60`
+            con desenfoque en vez de `bg-black/40`), porque el velo también es
+            de la primitiva.
+
+            El `max-h-none` del panel anula la `max-h` de la primitiva
+            (`max-h-[calc(100dvh-2rem)]`): un cajón va de borde a borde, y con
+            2 rem menos se veía una franja de fondo abajo.
+          */}
+          <DialogContent
+            id="menu-movil"
+            className="left-0 top-0 flex h-full max-h-none w-72 max-w-72 translate-x-0 translate-y-0 flex-col gap-4 overflow-y-auto rounded-none border-0 border-r border-border-color p-4 shadow-xl"
+          >
+            <DialogTitle className="sr-only">Menú principal</DialogTitle>
             <div className="flex items-center justify-between">
               <span className="flex items-center gap-2 text-lg font-bold">
                 <SealMark />
@@ -334,9 +371,9 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
             </div>
             {accordion(() => setDrawerOpen(false))}
             {footer}
-          </div>
-        </div>
-      )}
+          </DialogContent>
+        </Dialog>
+      </header>
 
       {/* Barra lateral: solo escritorio, colapsable */}
       <aside
