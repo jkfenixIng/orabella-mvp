@@ -415,6 +415,28 @@ hacerlo como tarjeta sería pagar dos veces las mismas pantallas.
 - No se abrieron las variantes *Editar* ni las confirmaciones de borrado. Los artefactos están en
   `~/ui-audit/`.
 
+## Hazards reportados y refutados
+
+**«La base del diálogo lleva `max-w-lg` sin variante, así que un llamador con `max-w-sm` podría
+recibir 512 en vez de 384.»** Lo reportó el writer que arregló el criterio de ancho, correctamente
+marcado como *no medido*, y **quedó refutado por tres vías independientes**:
+
+1. **El merge elimina al competidor.** `DialogContent` compone sus clases con `cn()`, que es
+   `twMerge(clsx(...))` (`src/components/ui/lib/utils.ts`): el `max-w-lg` de la base y un `max-w-*`
+   del llamador son el mismo grupo, así que **nunca conviven en la lista de clases** y no hay empate
+   posible en la hoja. El propio informe decía «twMerge deja solo el token del llamador» y a
+   continuación concluía que la base ganaría: **la premisa refuta la conclusión**.
+2. **Prueba empírica que ya existía**: el diálogo de inventario pasa `max-w-2xl` y **midió 672 px**
+   en la auditoría — ganó el valor del llamador, no el de la base.
+3. **Y aun en un empate imaginario ganaría el llamador**: el orden de la hoja compilada (69 KB
+   servidos por el dev server) pone `.max-w-lg` en el byte **17603** y `.max-w-sm` en el **17752**,
+   o sea que la regla más chica se emite **después** y gana a igual especificidad. La premisa
+   «Tailwind v4 emite `max-width` de menor a mayor» es **falsa**: el orden observado es
+   `2xl, 4xl, 5xl, lg, md, sm, xl`.
+
+⇒ **No hay nada que arreglar en `dialog.tsx`.** Queda asentado para que nadie «arregle» un defecto
+que no existe — que es el mismo trabajo que encontrar los que sí.
+
 ## Route declaration
 
 Auditoría **de sólo lectura** sobre código y sobre la aplicación corriendo. No muta datos de la
