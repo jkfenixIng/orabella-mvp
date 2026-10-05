@@ -318,6 +318,46 @@ necesita su propio criterio**, y el criterio del dueño («cómo se ve la data»
 4. **Las otras seis listas** (caja, vales, admin, inventario, servicios, nómina) siguen el camino
    conocido: hoy son tablas con carril y scroll, y van encadenadas después.
 
+### Medición de cierre — todo confirmado, con números
+
+Verificado **en navegador sobre la base con datos reales**, en 412×924 —el viewport del dueño, donde
+reportó el defecto—, 390×844, 360×640, 320×568 y 1024×768:
+
+| Qué | Número |
+| --- | --- |
+| Las nueve etiquetas a 412 | **9 de 9 visibles y ningún valor sin la suya.** El orden de lectura es el de la tarjeta aprobada |
+| ¿Se dibujan de verdad? | Sí: `display:inline`/`block` con rect > 0 en los cuatro anchos angostos, y **`display:none` a 1024**, donde el encabezado ya nombra las columnas |
+| Equivalencia de escritorio | Coordenadas de los nueve valores `[318,366,494,523,553,681,714,810,890]` contra las de los nueve encabezados `[319,367,495,524,552,680,713,809,889]`: **deltas de 1 px o menos**, cada valor bajo el encabezado que lo nombra |
+| Acciones alcanzables | `elementFromPoint` devuelve el botón en **412 y en 320** (y en los otros tres anchos) |
+| Gesto horizontal | Ninguno: `scrollX=0` y `scrollWidth == clientWidth` en la fila **y** en la página, en los cinco anchos |
+| Gate | 12/12 en la guarda nueva, **1990 en 38 archivos**, typecheck y eslint limpios |
+
+La lectura real a 412×924, que es lo que el dueño pedía ver:
+
+```
+ID: #2                  Fecha: 4/10 04:45 p. m.
+Total: $ 100.000                  Estado: Pagada
+Abrió: Carolina Rojas
+Empleados: Andrés Quintero
+Acciones:  [Editar] [Ver detalle]
+Cerró: Carolina Rojas   Cerrada: 4/10 04:45 p. m.
+```
+
+### Follow-ups que dejó la verificación (R38)
+
+1. **La guarda mira el MARCADO, no el render** — probado con una sonda: agregarle `hidden` o `sr-only`
+   a una etiqueta la deja **invisible en todos los anchos y el test sigue verde**. Son **tres sitios**
+   con el mismo punto ciego (dos aserciones decorativas y el tope de razonamiento sobre `sm:hidden`), y
+   se arreglan con **una sola corrección lógica que toca dos aserciones**: un predicado por línea móvil
+   que exija la etiqueta visible y **rechace cualquier clase que la colapse**. Va **antes de reusar la
+   guarda en las otras listas**, para no clonar una guarda que no mira lo que dice mirar.
+2. **Cosmético a 320**: el envoltorio de Total/Estado mide 48 px con `flex-wrap:nowrap`, así que el
+   `Badge` de estado se envuelve debajo de su etiqueta y «Estado» queda leyéndose arriba de «Total».
+   Nada se desborda y las acciones siguen respondiendo: es pulido, no defecto.
+3. **Decisión de vocabulario pendiente del dueño**: las etiquetas usan las palabras del encabezado
+   (`Abrió`, `Cerró`), que no son las del mock que se le mostró (`Vendedor`, `Cerrado por`). Si prefiere
+   las amigables, son nueve textos — y hay que aflojar a propósito la aserción del juego de palabras.
+
 ## Tasks
 
 El orden no es por severidad aislada: **el contrato de data va antes que los arreglos de acciones de
