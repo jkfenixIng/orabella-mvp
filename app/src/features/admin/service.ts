@@ -649,10 +649,16 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
   // dejó de alcanzar —ese era exactamente el agujero—. La administración de una
   // sede SOLO toca roles asignables desde sede; el rol de plataforma se rechaza
   // ANTES del rpc, así que la base no escribe nada: ni lo otorga ni lo quita.
+  //
+  // Y con la capa de plataforma ya retirada (U12), no hay a dónde ir por él: el
+  // mensaje que se lleva la persona lo dice, en vez de mandarla a una puerta que
+  // no existe. Es el MISMO literal en las dos guardas —otorgar y quitar son la
+  // misma verdad sobre el mismo rol— y el rechazo queda idéntico: mismo
+  // `FORBIDDEN`, mismo 403, misma puerta antes del rpc.
   if (parsed.data.roles.some((rol) => !isSedeAssignableRole(rol))) {
     throw new AdminError(
       "FORBIDDEN",
-      "El rol de plataforma solo se administra desde la plataforma.",
+      "El rol superadmin no se puede asignar ni quitar desde la aplicación.",
       403,
     );
   }
@@ -660,7 +666,7 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
   if (rolesActuales.some((rol) => !isSedeAssignableRole(rol))) {
     throw new AdminError(
       "FORBIDDEN",
-      "El rol de plataforma solo se administra desde la plataforma.",
+      "El rol superadmin no se puede asignar ni quitar desde la aplicación.",
       403,
     );
   }

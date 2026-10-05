@@ -683,7 +683,15 @@ describe("admin: reemplazo de roles atómico (ADM-04 / CO-2)", () => {
 
     await expect(
       setUserRoles({ user_id: USUARIO_ID, roles: ["superadmin"] }),
-    ).rejects.toMatchObject({ code: "FORBIDDEN", status: 403 });
+    ).rejects.toMatchObject({
+      code: "FORBIDDEN",
+      status: 403,
+      // El mensaje lo LEE una persona en la pantalla de usuarios, así que es
+      // parte del contrato: dice la verdad del código (nadie lo otorga) y no
+      // manda a ninguna puerta que ya no exista (la capa de plataforma se
+      // retiró). Ver `tests/platform-retirement.test.ts` (U13).
+      message: "El rol superadmin no se puede asignar ni quitar desde la aplicación.",
+    });
 
     // La puerta se cerró ANTES del rpc: no hay sentencia ni escritura suelta.
     expect(postgrest.rpcCalls).toEqual([]);
@@ -694,9 +702,15 @@ describe("admin: reemplazo de roles atómico (ADM-04 / CO-2)", () => {
   it("G1: un admin de sede NO puede quitarle `superadmin` a quien lo tiene: rechaza y no escribe", async () => {
     sembrar(["superadmin"]);
 
+    // MISMO rechazo, mismo mensaje: otorgar y quitar son la misma verdad sobre
+    // el mismo rol, y el mensaje es el mismo literal en las dos guardas.
     await expect(
       setUserRoles({ user_id: USUARIO_ID, roles: ["admin"] }),
-    ).rejects.toMatchObject({ code: "FORBIDDEN", status: 403 });
+    ).rejects.toMatchObject({
+      code: "FORBIDDEN",
+      status: 403,
+      message: "El rol superadmin no se puede asignar ni quitar desde la aplicación.",
+    });
 
     expect(postgrest.rpcCalls).toEqual([]);
     expect(rolesPersistidos()).toEqual(["superadmin"]);

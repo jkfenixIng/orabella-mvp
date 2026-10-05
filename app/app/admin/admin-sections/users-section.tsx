@@ -21,9 +21,10 @@ import {
 import { ROLE_OPTIONS, type ActionResult } from "../admin-shared";
 
 /**
- * Roles que esta pantalla puede asignar. `superadmin` es de PLATAFORMA: no se
- * otorga ni se quita desde una sede. El filtro es la puerta de la interfaz; el
- * servicio (`setUserRoles`) rechaza el mismo código aunque llegue por la action.
+ * Roles que esta pantalla puede asignar. `superadmin` no se otorga ni se quita
+ * desde una sede: ninguna superficie de la aplicación lo hace. El filtro es la
+ * puerta de la interfaz; el servicio (`setUserRoles`) rechaza el mismo código
+ * aunque llegue por la action.
  */
 const ASSIGNABLE_ROLE_OPTIONS = ROLE_OPTIONS.filter((option) => option.value !== "superadmin");
 

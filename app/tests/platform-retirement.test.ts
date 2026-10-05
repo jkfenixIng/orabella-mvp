@@ -34,6 +34,7 @@ import { roleCodeSchema, SEDE_ASSIGNABLE_ROLES } from "@/src/features/auth/schem
    5. La DEUDA declarada en la base sigue declarada: el rol `superadmin` y la
       columna `sedes.payroll_start_date`. Retirar el código NO borra la fila ni
       regenera el esquema: eso es otra unidad, con su migración.
+   6. La COPIA ya no promete una plataforma: el bloque U13 de más abajo.
    -------------------------------------------------------------------------- */
 
 const APP_ROOT = process.cwd();
@@ -252,5 +253,134 @@ describe("U12: la base NO se toca (deuda declarada)", () => {
 
   it("el archivo de esquema existe donde el guard dice que está", () => {
     expect(statSync(join(APP_ROOT, SCHEMA)).isFile()).toBe(true);
+  });
+});
+
+/* --------------------------------------------------------------------------
+   U13 — LA COPIA QUE EL RETIRO DEJÓ MENTIRA.
+
+   U12 se llevó las SUPERFICIES de la plataforma; los TEXTOS quedaron, porque
+   viven en otras unidades. Tres frases quedaron prometiendo un "desde la
+   plataforma" que ya no existe: la más grave es el mensaje de `AdminError` que
+   `setUserRoles` lanza —lo lee una persona en la pantalla de usuarios cuando
+   intenta asignar `superadmin`—, y las otras dos son comentarios que describen
+   como si existiera la puerta que ya no está.
+
+   La verdad que la copia tiene que decir, y que es la que el código hace:
+   `superadmin` existe en el catálogo de la base (deuda declarada) y NINGUNA
+   superficie de la aplicación lo otorga ni lo quita. `setUserRoles` sigue
+   rechazando las dos direcciones, con el mismo código y el mismo estado: esto
+   cambia la FRASE, no la puerta.
+
+   Lo que este bloque fija:
+
+   1. Ninguna de las tres frases falsas sobrevive, y el alcance son las tres
+      superficies donde viven, comentarios INCLUIDOS: un comentario que miente
+      sigue mintiéndole al próximo que lo lea.
+   2. El mensaje al usuario dice la verdad del código, en las DOS guardas
+      (otorgar y quitar), con un solo literal: dos redacciones distintas del
+      mismo hecho es una forma de volver a mentir por dentro.
+   3. La mitad que era CIERTA sigue presente en las tres superficies: el rol
+      existe en el catálogo y no se asigna desde una sede. Quitar la mentira no
+      puede costar la verdad.
+
+   El alcance es a propósito: los archivos de las copy-sweeps que corren en
+   paralelo (payroll, vales, cash, invoices, inventory) no entran. Esta guarda no
+   es dueña de esos textos y no puede afirmar por ellos.
+   -------------------------------------------------------------------------- */
+
+/** Superficies donde quedó la copia que nombra a una plataforma que se retiró. */
+const SUPERFICIES_DE_LA_COPIA = [
+  "src/features/admin/service.ts",
+  "src/features/auth/schemas.ts",
+  "app/admin/admin-sections/users-section.tsx",
+] as const;
+
+/**
+ * Las frases falsas, una por una. En minúsculas y sin el punto final: el
+ * ajuste de línea de la prosa no es contrato, así que la comparación va sobre
+ * el texto aplastado (`prosa`). La última está en MAYÚSCULAS a propósito, que
+ * es como estaba escrita: el grito tampoco se conserva.
+ */
+const FRASES_FALSAS = [
+  "se administra desde la plataforma",
+  "lo otorga la plataforma",
+  "de PLATAFORMA",
+] as const;
+
+/**
+ * La prosa con sus espacios aplastados. Antes se quita el `*` de margen del
+ * JSDoc: sin eso, una frase partida de ajuste de línea queda con un asterisco en
+ * medio y el detector no la ve — una guarda que no puede ver la verdad que
+ * afirma no es una guarda.
+ */
+function prosa(texto: string): string {
+  return texto.replace(/^[ \t]*\*[ \t]?/gm, "").replace(/\s+/g, " ");
+}
+
+/** El archivo de la aplicación, con la prosa aplastada. */
+function prosaDe(archivo: string): string {
+  return prosa(readFileSync(join(APP_ROOT, archivo), "utf8"));
+}
+
+/** El mensaje que el servicio le muestra a una persona, con el código y estado. */
+const MENSAJE_VERDADERO = "El rol superadmin no se puede asignar ni quitar desde la aplicación.";
+
+describe("U13: la copia ya no promete una plataforma que se retiró", () => {
+  it("ninguna de las tres frases falsas sobrevive en las superficies de la copia", () => {
+    for (const archivo of SUPERFICIES_DE_LA_COPIA) {
+      const texto = prosaDe(archivo);
+      for (const frase of FRASES_FALSAS) {
+        expect(texto.includes(frase), `${archivo} todavía dice «${frase}»`).toBe(false);
+      }
+    }
+    // Control negativo: el predicado no es de goma. Las tres frases se cazan
+    // cuando alguien las vuelve a escribir, en prosa y en un literal.
+    expect(
+      prosa('const m = "El rol de plataforma solo se administra desde la plataforma.";').includes(
+        "se administra desde la plataforma",
+      ),
+    ).toBe(true);
+    expect(
+      prosa("// `superadmin` queda FUERA: solo lo otorga la plataforma.").includes(
+        "lo otorga la plataforma",
+      ),
+    ).toBe(true);
+    expect(prosa("/** `superadmin` es de PLATAFORMA. */").includes("de PLATAFORMA")).toBe(true);
+  });
+
+  it("el mensaje al usuario dice la verdad del código, en las DOS guardas", () => {
+    const fuente = readFileSync(join(APP_ROOT, "src/features/admin/service.ts"), "utf8");
+    // Otorgar (`superadmin` pedido) y quitar (`superadmin` que ya está) rechazan
+    // con el MISMO literal: son la misma verdad sobre el mismo rol.
+    const ocurrencias = fuente.split(MENSAJE_VERDADERO).length - 1;
+    expect(ocurrencias, "el mensaje verdadero no está en las dos guardas").toBe(2);
+    // Y NINGÚN mensaje del servicio le promete a una persona una puerta que no
+    // existe: se revisan todos los literales de `AdminError` del archivo.
+    const mensajes = [
+      ...fuente.matchAll(/new AdminError\(\s*"[A-Z_]+",\s*"([^"]*)"/g),
+    ].map((encontro) => encontro[1] ?? "");
+    expect(mensajes.length, "el detector no encontró mensajes que revisar").toBeGreaterThan(5);
+    expect(
+      mensajes.filter((mensaje) => mensaje.toLowerCase().includes("plataforma")),
+      "un mensaje al usuario sigue nombrando a la plataforma",
+    ).toEqual([]);
+  });
+
+  it("la mitad que era CIERTA sigue en las tres superficies", () => {
+    // El rol existe en el catálogo de la base…
+    expect(prosaDe("src/features/auth/schemas.ts")).toContain(
+      "`superadmin` existe en el catálogo (069) para la cuenta del dueño",
+    );
+    // …y no se asigna ni se quita desde la administración de una sede.
+    expect(prosaDe("src/features/auth/schemas.ts")).toContain(
+      "NO se asigna ni se quita desde la administración de una sede",
+    );
+    // La puerta que lo deja FUERA sigue siendo el esquema asignable de sede.
+    expect(prosaDe("src/features/auth/schemas.ts")).toContain("sedeAssignableRoleSchema");
+    // Y la pantalla sigue dejando de ofrecerlo, con la misma explicación.
+    expect(prosaDe("app/admin/admin-sections/users-section.tsx")).toContain(
+      "no se otorga ni se quita desde una sede",
+    );
   });
 });
