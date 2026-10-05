@@ -450,16 +450,23 @@ describe("R32: la fila de acciones de `FormDialog` está pegada al borde de abaj
    ========================================================================== */
 
 describe("R7: el diálogoRespira debajo de `sm` y usa la altura dinámica", () => {
-  it("deja gutter a los dos lados por debajo de `sm`", () => {
+  it("deja gutter a los dos lados por debajo de `sm`, con UN solo reclamo de ancho", () => {
     const base = cnBaseClass(DIALOG_CODE, "DialogPrimitive.Content");
     // 1 rem de gutter por lado por debajo de `sm`.
     expect(hasClassToken(base, "w-[calc(100%-2rem)]")).toBe(true);
-    // Lo que ESTE token afirmaba antes era `sm:w-full`, y era un criterio
-    // disfrazado de token: `sm:w-full` PISA a `w-[calc(100%-2rem)]` en la
-    // cascada, así que con él el gutter NO se sostenía arriba de `sm` (medido a
-    // 1024: gutter 0/0). El criterio ahora vive en `anchoEfectivo`, más abajo.
-    // Lo que sí se afirma acá es que la base NO se quite el tope de ancho.
-    expect(hasClassToken(base, "sm:w-full")).toBe(false);
+    // Lo que ESTE test afirmaba antes era `sm:w-full`, y era un criterio
+    // disfrazado de un nombre de token: `sm:w-full` PISA a
+    // `w-[calc(100%-2rem)]` en la cascada, así que con él el gutter NO se
+    // sostenía arriba de `sm` (medido a 1024: gutter 0/0). El problema del
+    // criterio no era que midiera mal: es que `md:w-full` o `2xl:w-*` lo
+    // rompen igual y NADIE los miraba. Ahora se afirma la PROPIEDAD — el
+    // gutter se cuenta como un único reclamo de ancho en la base, sin
+    // variante, que ningún `sm:`/`md:`/`lg:` pueda pisar— y `sm:w-full` queda
+    // como un caso particular de ella, no como el nombre que alguien recuerda.
+    expect(
+      claimsDeAnchoConVariante(base),
+      "la base no reclama el ancho con variante: un `sm:w-full` (o `md:`, `2xl:`) devuelve el gutter a 0",
+    ).toEqual([]);
   });
 
   it("el padding baja en el extremo angosto y sube en el ancho", () => {
@@ -471,24 +478,95 @@ describe("R7: el diálogoRespira debajo de `sm` y usa la altura dinámica", () =
   it("el gutter se sostiene donde `max-w` alcanza el viewport (R7 a 1024)", () => {
     // El criterio, no el token, en las dos mitades: para NINGÚN diálogo, en
     // NINGÚN ancho de pantalla, (1) el ancho efectivo llega al del viewport, ni
-    // (2) deja de respetar el `max-w` que le puso el llamador.
+    // (2) deja de respetar el `max-w` que le puso ESE llamador.
     //
-    // La segunda mitad no es un detalle: `sm:max-w-[calc(100%-2rem)]` —el
-    // arreglo «obvio» que se descartó— cumple la primera y rompe la segunda,
-    // porque `max-width` es una sola propiedad y la variante de `sm:` pisa al
-    // `max-w-5xl` del llamador. MEDIDO: el diálogo de emisión pasaba de 1024 a
-    // 1408 px a 1440. Un guardia que solo mirara el gutter habría dado verde a
-    // ese defecto.
+    // La segunda mitad YA NO es un sello de goma. Antes comparaba contra
+    // `max()` de `anchoToken(t, 1920)` sobre TODOS los tokens: como
+    // `w-[calc(100%-2rem)]` está en esa lista y vale 1888 a 1920, `pedido` era
+    // la CONSTANTE 1888 para los seis diálogos, y con el bucle topado en 1920
+    // la comparación no podía fallar sola. Ahora `pedidoDelLlamador` lee las
+    // clases DEL LLAMADOR: 1024 para `max-w-5xl`, 896 para `max-w-4xl`, 512
+    // para `max-w-lg`, 384 para `max-w-sm`, y el número cambia con cada
+    // llamada.
     const base = cnBaseClass(DIALOG_CODE, "DialogPrimitive.Content");
+    let pedidosComprobados = 0;
     for (const caller of fullBleedClassNames(INVOICES)) {
       const tokens = effectiveContentClass(base, caller);
-      const pedido = Math.max(
-        ...tokens.map((t) => anchoToken(t, 1920)).filter((px): px is number => px !== null && px < 1920),
-      );
       for (const vw of [320, 390, 640, 768, 1024, 1280, 1440, 1920]) {
         const ancho = anchoEfectivo(tokens, vw);
         expect(ancho, `\`${caller}\` a ${vw}px: gutter ≥ 1rem por lado`).toBeLessThanOrEqual(vw - 32);
-        expect(ancho, `\`${caller}\` a ${vw}px: no excede el max-w del llamador`).toBeLessThanOrEqual(pedido);
+        // El máximo de ESTE llamador a ESTE viewport. Si no pide ninguno, no
+        // hay nada que respetar —y comparar contra el `max-w` de la base sería
+        // la tautología que esta cuenta vino a matar.
+        const pedido = pedidoDelLlamador(caller, vw);
+        if (pedido === null) continue;
+        pedidosComprobados += 1;
+        expect(
+          ancho,
+          `\`${caller}\` a ${vw}px: no excede los ${pedido}px que pidió este llamador`,
+        ).toBeLessThanOrEqual(pedido);
+      }
+    }
+    // La cuenta no puede quedarse sin comparar nada: sin esto, un `pedido`
+    // siempre `null` devolvería esta mitad en verde.
+    expect(pedidosComprobados, "se comparó contra un máximo pedido al menos una vez").toBeGreaterThan(0);
+  });
+
+  it("la base NO se queda con un tope de ancho que le gane al llamador", () => {
+    // El otro lado del mismo negocio, dicho como CRITERIO y no como el nombre
+    // del token que existe hoy. `sm:max-w-[calc(100%-2rem)]` es el arreglo
+    // «obvio» que se descartó, pero el predicado no lo nombra: `md:max-w-*`,
+    // `lg:max-w-*` o `2xl:max-w-*` son el mismo defecto —el `max-width` es UNA
+    // sola propiedad y el media query le gana al `max-w-5xl` sin
+    // variante del llamador— y pasaban igual.
+    const base = cnBaseClass(DIALOG_CODE, "DialogPrimitive.Content");
+    expect(
+      topesDeLaBase(base).filter((token) => token.includes(":")),
+      "la base no declara ningún `max-w-*` con variante",
+    ).toEqual([]);
+
+    // Y la mitad que no depende de leer variantes: para todo llamador que SÍ
+    // pide un máximo, la fusión tiene que dejar la clase efectiva SIN ningún
+    // `max-w` que venga de la base. El `max-w-lg` sin variante de la primitiva
+    // (que es su ancho por defecto) sí puede estar, y en este caso NO sobrevive:
+    // `tailwind-merge` lo descarta porque es el mismo grupo que el pedido del
+    // llamador. Si mañana aparece un `sm:max-w-*`, sobrevive y esta falla.
+    const piden = llamadoresQuePidenToppe(INVOICES);
+    expect(piden, "los <DialogContent> de facturación que piden un máximo").not.toEqual([]);
+    for (const caller of piden) {
+      expect(
+        topesDeLaBaseQuePisanAlLlamador(base, caller),
+        `\`${caller}\`: ningún tope de la base sobrevive por encima del pedido del llamador`,
+      ).toEqual([]);
+    }
+  });
+
+  it("el ancho no excede el MÁXIMO QUE PIDIÓ ESE llamador, a ningún viewport", () => {
+    // El criterio que reemplaza la comparación contra la constante 1888, con
+    // los números que se midieron en Chromium: `max-w-4xl` → 896 (con 544 de
+    // gutter a 1440) y `max-w-lg` → 512 (con 512 de gutter a 1024). Si la base
+    // vuelve a tapar al llamador, estos dos se estiran y la comparación falla
+    // con el número al lado, no con un `true` que nadie puede questionar.
+    const base = cnBaseClass(DIALOG_CODE, "DialogPrimitive.Content");
+    const CASOS: { caller: string; pedido: number }[] = [
+      { caller: "max-w-4xl border-0 bg-transparent p-0 sm:p-0 shadow-none", pedido: 896 },
+      { caller: "max-w-lg border-0 bg-transparent p-0 sm:p-0 shadow-none", pedido: 512 },
+      { caller: "max-w-5xl border-0 bg-transparent p-0 sm:p-0 shadow-none", pedido: 1024 },
+      { caller: "max-w-sm border-0 bg-transparent p-0 sm:p-0 shadow-none", pedido: 384 },
+    ];
+    for (const { caller, pedido } of CASOS) {
+      // El número del caso es el que se midió, no el que sale de la cuenta: si
+      // la escala de Tailwind cambiara, esta guarda lo señala en vez de
+      // recalcularse en verde.
+      expect(pedidoDelLlamador(caller, 1920), `\`${caller}\` pide ${pedido}px`).toBe(pedido);
+      const tokens = effectiveContentClass(base, caller);
+      for (const vw of [320, 390, 640, 768, 1024, 1280, 1440, 1920, 2560]) {
+        const ancho = anchoEfectivo(tokens, vw);
+        expect(
+          ancho,
+          `\`${caller}\` a ${vw}px: ${ancho}px no pasa de los ${pedido}px pedidos`,
+        ).toBeLessThanOrEqual(pedido);
+        expect(ancho, `\`${caller}\` a ${vw}px: gutter ≥ 1rem por lado`).toBeLessThanOrEqual(vw - 32);
       }
     }
   });
@@ -563,12 +641,19 @@ describe("R7: el diálogoRespira debajo de `sm` y usa la altura dinámica", () =
    afirmar es que ese menor siempre deja gutter.
    ========================================================================== */
 
+/** Los breakpoints de Tailwind, en px. Una sola tabla: la usan las tres cuentas. */
+const BREAKPOINT_PX: Record<string, number> = {
+  sm: 640,
+  md: 768,
+  lg: 1024,
+  xl: 1280,
+  "2xl": 1536,
+};
+
 /** Ancho en px de un `max-w-*`/`w-*` de Tailwind, o `null` si no se entiende. */
 function anchoToken(token: string, vw: number): number | null {
   const [variant, base] = token.includes(":") ? token.split(":") : [null, token];
-  const bp = variant
-    ? ({ sm: 640, md: 768, lg: 1024, xl: 1280, "2xl": 1536 } as Record<string, number>)[variant]
-    : 0;
+  const bp = variant ? BREAKPOINT_PX[variant] : 0;
   if (bp === undefined || vw < bp) return null;
   const name = base.replace(/^(?:max-)?w-/, "");
   const calc = name.match(/^\[calc\(100%-([\d.]+)rem\)\]$/);
@@ -598,9 +683,7 @@ function anchoEfectivo(tokens: string[], vw: number): number {
     let elegido: { bp: number; px: number } | null = null;
     for (const token of tokens) {
       const [variant] = token.includes(":") ? token.split(":") : [null];
-      const bp = variant
-        ? ({ sm: 640, md: 768, lg: 1024, xl: 1280, "2xl": 1536 } as Record<string, number>)[variant]
-        : 0;
+      const bp = variant ? BREAKPOINT_PX[variant] : 0;
       if (bp === undefined) continue;
       if (property === "w" ? !/^(?:(?:sm|md|lg|xl|2xl):)?w-/.test(token)
                            : !/^(?:(?:sm|md|lg|xl|2xl):)?max-w-/.test(token)) continue;
@@ -612,6 +695,109 @@ function anchoEfectivo(tokens: string[], vw: number): number {
   };
   const candidatos = [gana("w"), gana("max-w")].filter((px): px is number => px !== null);
   return candidatos.length === 0 ? vw : Math.min(...candidatos);
+}
+
+/* ==========================================================================
+   LA CUENTA QUE ANTES ERA UN SELLO DE GOMA.
+
+   La segunda mitad de «el gutter se sostiene…» comparaba el ancho del diálogo
+   contra esto:
+
+       pedido = max() de anchoToken(t, 1920) sobre TODOS los tokens, < 1920
+
+   Eso NO era el máximo del llamador: era una CONSTANTE. `w-[calc(100%-2rem)]`
+   está en la lista de tokens, y a 1920 vale 1888, así que `pedido` salía 1888
+   para los seis diálogos y para cualquier otro. Y como el bucle solo sube
+   hasta 1920, `ancho <= vw−32` ya implica `ancho <= 1888`: la segunda mitad
+   NO PODÍA fallar sola. Replay: con `sm:max-w-[calc(100%-2rem)]` en la base el
+   diálogo de emisión mide 1408 a 1440 y la comparación da `1408 <= 1888`.
+
+   Lo que se afirma ahora, por el mismo caso pero por el MECANISMO:
+
+     1. la base NO reclama un tope de ancho con VARIANTE, porque un `sm:max-w-*`
+        sobrevive al `twMerge` contra el `max-w-*` sin variante del llamador y
+        en el CSS emitido gana por el media query — y no porque el llamador no
+        lo pidiera;
+     2. el ancho se compara contra el máximo que PIDIÓ ESE llamador, deducido de
+        las clases de ESE llamador. Un `max-w-4xl` son 896 y un `max-w-lg` son
+        512, y el diálogo no puede pasar de ahí a NINGÚN ancho de pantalla.
+   ========================================================================== */
+
+/**
+ * Los reclamos de ANCHO de la base que llevan VARIANTE: `sm:w-full`, `lg:max-w-*`…
+ *
+ * El criterio es la PROPIEDAD y no el nombre del token. `sm:w-full` era lo que
+ * se afirmaba y `md:w-full` o `2xl:w-*` pisan el gutter exactamente igual, sin
+ * que nada los mirara. Dentro de una misma propiedad gana la variante más alta
+ * que esté activa, así que un solo reclamo con variante alcanza para borrar el
+ * `w-[calc(100%-2rem)]` de la base desde 640 en adelante.
+ */
+function claimsDeAnchoConVariante(base: string): string[] {
+  return classTokens(base).filter((token) => /^(?:sm|md|lg|xl|2xl):(?:max-)?w-/.test(token));
+}
+
+/** Los `max-w-*` que la BASE declara, con o sin variante. */
+function topesDeLaBase(base: string): string[] {
+  return classTokens(base).filter((token) => /^(?:(?:sm|md|lg|xl|2xl):)?max-w-/.test(token));
+}
+
+/**
+ * Los `max-w-*` DE LA BASE que quedan en la clase efectiva SIN QUE EL LLAMADOR
+ * LOS HAYA PEDIDO: los que se le imponen por encima de su pedido.
+ *
+ * Un `max-w-lg` sin variante en la base NO aparece acá cuando el llamador pide
+ * un máximo: `tailwind-merge` lo descarta porque es el mismo grupo. Un
+ * `sm:max-w-*` sí aparece, y por eso es el que rompe. El criterio no prohíbe
+ * ningún nombre de token: pregunta qué tope de la base le queda al llamador
+ * encima después de la fusión.
+ *
+ * Un token que el propio llamador declara se descarta de la cuenta: si la base
+ * y el llamador piden los mismos 512 px, el `max-w-lg` que sobrevive es el
+ * pedido del llamador, no un tope impuesto. Sin esa salvedad, dos de los seis
+ * diálogos de facturación —los que piden `max-w-lg`— acusarían a la primitiva
+ * por su propio ancho por defecto.
+ */
+function topesDeLaBaseQuePisanAlLlamador(base: string, caller: string): string[] {
+  const efectivo = new Set(effectiveContentClass(base, caller));
+  const pedidos = classTokens(caller).filter((token) =>
+    /^(?:(?:sm|md|lg|xl|2xl):)?max-w-/.test(token),
+  );
+  return topesDeLaBase(base).filter((token) => efectivo.has(token) && !pedidos.includes(token));
+}
+
+/**
+ * El MÁXIMO QUE PIDIÓ EL LLAMADOR a un viewport dado, en px, deducido de las
+ * clases DEL LLAMADOR —o `null` si a ese ancho no hay reclamo suyo vigente.
+ *
+ * Se resuelve la cascada como en `anchoEfectivo`: dentro de una misma propiedad
+ * gana la variante más alta que esté activa. Un llamador que no trae `max-w` no
+ * PIDE nada y devuelve `null`: no es la base la que debe respectar un pedido que
+ * no existe, y compararla contra su propio `max-w-lg` sería la tautología que
+ * esta cuenta vino a matar.
+ */
+function pedidoDelLlamador(caller: string, vw: number): number | null {
+  let elegido: { bp: number; px: number } | null = null;
+  for (const token of classTokens(caller)) {
+    const [variant] = token.includes(":") ? token.split(":") : [null];
+    if (variant !== null && BREAKPOINT_PX[variant] === undefined) continue;
+    if (!/^(?:(?:sm|md|lg|xl|2xl):)?max-w-/.test(token)) continue;
+    const px = anchoToken(token, vw);
+    if (px === null) continue;
+    const bp = variant === null ? 0 : BREAKPOINT_PX[variant];
+    if (elegido === null || bp >= elegido.bp) elegido = { bp, px };
+  }
+  return elegido?.px ?? null;
+}
+
+/** Los llamadores que SÍ piden un máximo, deduplicados por clase efectiva. */
+function llamadoresQuePidenToppe(source: string): string[] {
+  return [
+    ...new Set(
+      dialogContentClassNames(source).filter(
+        (value): value is string => value !== null && pedidoDelLlamador(value, 1920) !== null,
+      ),
+    ),
+  ];
 }
 
 /* ==========================================================================
@@ -749,6 +935,119 @@ describe("control negativo: el gutter se sostiene donde `max-w` alcanza el viewp
     const base = cnBaseClass(DIALOG_CODE, "DialogPrimitive.Content");
     const conW = effectiveContentClass(base, `${LLAMADOR} w-full`);
     expect(anchoEfectivo(conW, 1024)).toBeGreaterThan(1024 - 32);
+  });
+});
+
+/* ==========================================================================
+   Control negativo: el `sm:max-w-[calc(100%-2rem)]` —el arreglo «obvio» que se
+   descartó— hace FALLAR las dos mitades nuevas, y la cuenta VIEJA no lo veía.
+
+   Esta es la replay que sostiene todo lo de arriba, con los números, no con una
+   palabra: con `sm:max-w-[calc(100%-2rem)]` en la base, el diálogo de emisión
+   mide 1408 px a 1440 contra los 1024 que pidió su `max-w-5xl`.
+   ========================================================================== */
+
+describe("control negativo: la regresión que la segunda mitad NO veía", () => {
+  const LLAMADOR = "max-w-5xl border-0 bg-transparent p-0 sm:p-0 shadow-none";
+  // La base REAL con `sm:max-w-[calc(100%-2rem)]` agregado, token por token
+  // como está en `dialog.tsx`. No es una base inventada: es la que el repo tuvo
+  // en tela de juicio, con un token más.
+  const BASE_CON_TOPE =
+    "fixed left-1/2 top-1/2 grid w-[calc(100%-2rem)] max-w-lg sm:max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-lg border border-border-color bg-surface p-4 shadow-xl outline-none transition duration-150 sm:p-6";
+
+  it("la cuenta VIEJA daba verde: `pedido` era la constante 1888", () => {
+    const tokens = effectiveContentClass(BASE_CON_TOPE, LLAMADOR);
+    // La fórmula exacta que estaba en el archivo: el MÁXIMO de lo que vale cada
+    // token a 1920, dejando fuera los que dan 1920.
+    const pedidoViejo = Math.max(
+      ...tokens
+        .map((t) => anchoToken(t, 1920))
+        .filter((px): px is number => px !== null && px < 1920),
+    );
+    expect(pedidoViejo, "el `pedido` viejo no dependía del llamador: era 1888").toBe(1888);
+    // Y el mismo 1888 salía para un `max-w-lg`, o sea que la comparación no
+    // estaba mirando al llamador: miraba al viewport.
+    const pedidoOtroLlamador = Math.max(
+      ...effectiveContentClass(BASE_CON_TOPE, "max-w-lg p-0 sm:p-0")
+        .map((t) => anchoToken(t, 1920))
+        .filter((px): px is number => px !== null && px < 1920),
+    );
+    expect(pedidoOtroLlamador).toBe(pedidoViejo);
+
+    // El defecto medido, y las dos mitades viejas pasándolo.
+    const ancho = anchoEfectivo(tokens, 1440);
+    expect(ancho, "el diálogo de emisión mide 1408px a 1440 con la regresión viva").toBe(1408);
+    expect(ancho, "gutter: 1440−32 = 1408, la primera mitad sigue verde").toBeLessThanOrEqual(1408);
+    expect(ancho, "máximo: 1408 <= 1888, la segunda mitad también").toBeLessThanOrEqual(pedidoViejo);
+  });
+
+  it("el criterio de la base la acusa: un `max-w` con variante, y uno que sobrevive", () => {
+    // Por la PROPIEDAD, no por el nombre del token: el token que se descartó hoy
+    // es `sm:`, pero `md:max-w-[…]` rompe exactamente igual y el criterio lo ve
+    // sin que nadie lo nombre.
+    expect(
+      claimsDeAnchoConVariante(BASE_CON_TOPE),
+      "un `max-w` con variante en la base es una regresión",
+    ).toEqual(["sm:max-w-[calc(100%-2rem)]"]);
+    expect(
+      claimsDeAnchoConVariante(
+        BASE_CON_TOPE.replace("sm:", "md:"),
+      ),
+      "el mismo defecto con otra variante sigue siendo el mismo defecto",
+    ).toEqual(["md:max-w-[calc(100%-2rem)]"]);
+    // Y una base sin ningún reclamo con variante queda limpia: el predicado no
+    // está verde porque no mire, está verde porque no hay nada que mirar.
+    expect(
+      claimsDeAnchoConVariante(BASE_CON_TOPE.replace("sm:max-w-[calc(100%-2rem)] ", "")),
+    ).toEqual([]);
+
+    // Por la mitad que no lee variantes: el tope de la base sobrevive al
+    // `twMerge` del llamador y se le queda encima.
+    expect(topesDeLaBaseQuePisanAlLlamador(BASE_CON_TOPE, LLAMADOR)).toEqual([
+      "sm:max-w-[calc(100%-2rem)]",
+    ]);
+    // Con la misma base SIN el token, el `max-w-lg` de la primitiva NO sobrevive
+    // a un llamador que pide tope: lo descarta `tailwind-merge` porque es el
+    // mismo grupo. Y un llamador que pide el mismo `max-w-lg` que la base
+    // tampoco lo acusa: ese `max-w` es suyo, no un tope impuesto.
+    const baseSana = BASE_CON_TOPE.replace("sm:max-w-[calc(100%-2rem)] ", "");
+    expect(topesDeLaBaseQuePisanAlLlamador(baseSana, LLAMADOR)).toEqual([]);
+    expect(topesDeLaBaseQuePisanAlLlamador(baseSana, "max-w-lg p-0 sm:p-0")).toEqual([]);
+    expect(
+      topesDeLaBaseQuePisanAlLlamador(BASE_CON_TOPE, "max-w-lg p-0 sm:p-0"),
+      "con el `sm:max-w-*` sigue acusando aunque el llamador pida `max-w-lg`",
+    ).toEqual(["sm:max-w-[calc(100%-2rem)]"]);
+  });
+
+  it("el máximo del LLAMADOR la acusa: 1408 > 1024 y 1408 > 512", () => {
+    const tokens = effectiveContentClass(BASE_CON_TOPE, LLAMADOR);
+    const pedido5xl = pedidoDelLlamador(LLAMADOR, 1440);
+    expect(pedido5xl).toBe(1024);
+    expect(anchoEfectivo(tokens, 1440)).toBeGreaterThan(pedido5xl ?? Number.POSITIVE_INFINITY);
+
+    // Y con un llamador que pide menos, que es donde el estiramiento se nota
+    // como documento roto: `max-w-lg` son 512 y el diálogo se va a 1408.
+    const conLg = effectiveContentClass(BASE_CON_TOPE, "max-w-lg p-0 sm:p-0");
+    const pedidoLg = pedidoDelLlamador("max-w-lg p-0 sm:p-0", 1440);
+    expect(pedidoLg).toBe(512);
+    expect(anchoEfectivo(conLg, 1440)).toBe(1408);
+    expect(anchoEfectivo(conLg, 1440)).toBeGreaterThan(pedidoLg ?? Number.POSITIVE_INFINITY);
+  });
+
+  it("con la base sin el `sm:max-w-*` el mismo diálogo vuelve a medir 1024 a 1440", () => {
+    // El otro estado, con la misma pareja base/llamador: el criterio nuevo no
+    // tiene que estar rojo siempre. Con la base de verdad el pedido manda y el
+    // gutter también — 1024 a 1440, con 416 de gutter de los 1440.
+    const baseSana = BASE_CON_TOPE.replace("sm:max-w-[calc(100%-2rem)] ", "");
+    const tokens = effectiveContentClass(baseSana, LLAMADOR);
+    const pedido = pedidoDelLlamador(LLAMADOR, 1440);
+    expect(pedido).toBe(1024);
+    expect(anchoEfectivo(tokens, 1440)).toBe(1024);
+    expect(anchoEfectivo(tokens, 1440)).toBeLessThanOrEqual(1440 - 32);
+    expect(anchoEfectivo(tokens, 1440)).toBeLessThanOrEqual(pedido ?? Number.POSITIVE_INFINITY);
+    // Y los dos criterios que acusan la regresión, en el mismo par.
+    expect(claimsDeAnchoConVariante(baseSana)).toEqual([]);
+    expect(topesDeLaBaseQuePisanAlLlamador(baseSana, LLAMADOR)).toEqual([]);
   });
 });
 
