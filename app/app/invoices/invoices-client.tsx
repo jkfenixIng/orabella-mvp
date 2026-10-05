@@ -1401,9 +1401,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   Emitir factura
                 </button>
                 {/* Sangre completa: `p-0` Y `sm:p-0`. La base de la primitiva trae `sm:p-6`, y `tailwind-merge` deja VIVA la variante de `sm:` porque `p-0` no la compite: con `p-0` solo la hoja quedaba a 24 px del borde del diálogo (medido a 1024 y a 1440). */}
-                <DialogContent className="max-w-5xl border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
-                  <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
-                    <DialogHeader className="block">
+                {/* R32, LA ESTRUCTURA — `flex flex-col overflow-y-hidden`: el diálogo deja de ser el scroller y pasa a ser una columna cuyas tres piezas son encabezado (fijo), medio (scrollea) y pie (fijo). MEDIDO antes, en Chromium, con la sesión y sin enviar nada: 1005 px de contenido en una caja de 536 px a 320×568 y el envío en `y 961-1001`, o sea 393 px más allá del borde inferior del viewport: guardar exigía ~450 px de scroll DENTRO del diálogo (a 390×844, `y 961-1001` contra 844, igual de fuera).
+                    Misma composición que `FormDialog` (encabezado / medio / pie) y SIN `sticky`: el bloque contenedor de un ítem de grilla es su ÁREA, sin recorrido para anclarse, así que un pie pegado con `position: sticky` funcionaría en Chromium y quedaría colgando de la palabra de otro motor. Acá la corrección vive en el árbol, no en el CSS. */}
+                <DialogContent className="max-w-5xl flex flex-col overflow-y-hidden border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
+                  <div className="flex min-h-0 flex-1 flex-col rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
+                    <DialogHeader className="block shrink-0">
                       <DialogTitle className="sr-only">FACTURA DE VENTA</DialogTitle>
                     <div className="border-b-4 border-double border-paper-line-strong px-6 py-5 sm:px-8">
                       <div className="flex flex-wrap items-start justify-between gap-4">
@@ -1421,7 +1423,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       </div>
                     </div>
                     </DialogHeader>
-                    <form onSubmit={submitInvoice} className="flex flex-col gap-5 px-6 py-5 sm:px-8">
+                    <form onSubmit={submitInvoice} className="flex min-h-0 flex-1 flex-col gap-5 px-6 py-5 sm:px-8">
+                      {/* El MEDIO: lo único que scrollea. `min-h-0` para que el hijo pueda encogerse por debajo de su contenido: sin eso el `flex-1` no cede y la hoja vuelve a empujar el pie fuera de la caja. */}
+                      <div className="min-h-0 flex-1 overflow-y-auto">
                       <div className="grid gap-4 sm:grid-cols-2">
                         <label className="flex flex-col gap-1 text-sm font-medium">
                           Señor(es)
@@ -1783,8 +1787,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           // asertivo, el mismo anuncio que el `<p>` escribía.
                           <Alert variant="destructive">{error}</Alert>
                         )}
-
-                        <div className="flex flex-wrap items-center justify-end gap-3 border-t border-paper-line pt-4">
+                        {/* FIN DEL MEDIO scrolleable. */}
+                      </div>
+                        {/* El PIE: `shrink-0` y FUERA del medio, así que la acción primaria y Cancelar están siempre a la vista sin una sola línea de scroll. Última pieza del `<form>` —igual que en `FormDialog`—, o sea que está EN EL FLUJO y no cubre el último campo: no hace falta relleno extra. */}
+                        <div className="flex shrink-0 flex-wrap items-center justify-end gap-3 border-t border-paper-line pt-4">
                           <button
                             type="button"
                             onClick={cancelCreate}
