@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState, useTransition, type ChangeEvent, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition, type ChangeEvent, type FormEvent, type RefObject } from "react";
 import { toast } from "sonner";
 import { Activity, PackageOpen, PackagePlus, Pencil, X } from "lucide-react";
 import {
@@ -80,6 +80,71 @@ function newMovementKey(): string {
   return crypto.randomUUID();
 }
 
+/* --------------------------------------------------------------------------
+   El desplazamiento de la barra de acciones.
+
+   MEDIDO, Chromium, 320x568, con la sesión y scrolleando hasta `scrollY 400` de
+   412: la barra se anclaba en `top 0` y el encabezado del shell ocupa
+   `0 → 63` con `z-30` contra el `z-10` de la barra. `elementFromPoint` en el
+   centro de «Crear producto» devolvía el enlace «Orabella» del encabezado, o
+   sea que el botón NO era clicable. A 360 y 390 no hay recorrido suficiente
+   para llegar a ese estado, y arriba de `lg` el encabezado no existe.
+
+   El arreglo NO es un segundo número. La altura del encabezado no es una
+   constante del proyecto: sale de SU padding y del botón del menú, así que
+   escribir `top-[63px]` acá sería cablear un valor que otro archivo puede
+   cambiar. La barra se ancla a la altura MEDIDA del propio encabezado, que es
+   la misma fuente de la que sale la de él.
+
+   Y falla CERRADO, no abierto: la referencia `var(--shell-header-height)` va
+   SIN valor de reserva. Antes de medir —o si el encabezado no aparece— la
+   variable no está definida, la declaración `top` queda inválida en tiempo de
+   valor calculado y `top` queda en `auto`: la barra sigue siendo `sticky`
+   pero no tiene contra qué anclarse, o sea que aparece en su sitio en el flujo
+   en vez de meterse debajo del encabezado. Un `var(--x, 0px)` sería exactamente
+   el defecto original escrito con otra sintaxis.
+
+   Arriba de `lg` el encabezado es `lg:hidden`, así que mide 0 y la barra se
+   ancla en 0, que es lo correcto porque ahí no hay con quién competir.
+   -------------------------------------------------------------------------- */
+
+/** El NOMBRE de la variable CSS del desplazamiento, en un solo lugar. */
+const SHELL_HEADER_OFFSET_VAR = "--shell-header-height";
+
+/**
+ * El encabezado ANCLADO del shell (`src/shared/components/main-nav.tsx`), y no
+ * `header` a secas: `<header>` también es el del título de la página
+ * (`PageHeader`), que no se ancla y cuya altura no es la que hay que librar.
+ */
+const SHELL_HEADER_SELECTOR = "header.sticky";
+
+/**
+ * Escribe en la barra el alto medido del encabezado del shell.
+ *
+ * `ResizeObserver` y no una medida sola: el alto del encabezado cambia si
+ * cambia el padding, la tipografía o el botón del menú, y una medida tomada al
+ * montar se quedaría vieja sin avisar.
+ *
+ * El `style` en línea nombra la variable con su LITERAL a propósito —el valor
+ * de un `style` no se puede componer con una constante sin volverlo ilegible— y
+ * la guarda de `inventory-dialog-footer.test.ts` comprueba que ese literal y el
+ * `setProperty` de acá nombran la MISMA variable.
+ */
+function useShellHeaderOffset(barra: RefObject<HTMLDivElement | null>): void {
+  useEffect(() => {
+    const elemento = barra.current;
+    const encabezado = document.querySelector<HTMLElement>(SHELL_HEADER_SELECTOR);
+    if (elemento === null || encabezado === null) return;
+    const medir = () => {
+      elemento.style.setProperty(SHELL_HEADER_OFFSET_VAR, `${Math.ceil(encabezado.getBoundingClientRect().height)}px`);
+    };
+    medir();
+    const observador = new ResizeObserver(medir);
+    observador.observe(encabezado);
+    return () => observador.disconnect();
+  }, [barra]);
+}
+
 interface InventoryClientProps {
   initialProducts: ProductRow[];
   initialAlertIds: string[];
@@ -112,6 +177,12 @@ export function InventoryClient(props: InventoryClientProps) {
    */
   const movementKeyRef = useRef<string | null>(null);
   const [movementProductQuery, setMovementProductQuery] = useState("");
+  /**
+   * La barra de acciones se ancla al alto MEDIDO del encabezado del shell, no
+   * a un número escrito acá. Ver `SHELL_HEADER_OFFSET_VAR`.
+   */
+  const barraAccionesRef = useRef<HTMLDivElement>(null);
+  useShellHeaderOffset(barraAccionesRef);
   const movementProductOptions = useMemo(() => {
     const needle = movementProductQuery.trim().toLowerCase();
     if (needle === "") return products;
@@ -314,7 +385,22 @@ export function InventoryClient(props: InventoryClientProps) {
       </section>
 
       {props.canWrite ? (
-        <div className="sticky top-0 z-10 flex flex-wrap gap-2 rounded-lg border border-border-color bg-surface p-3 shadow-sm dark:border-border-color-2">
+        /*
+          LA BARRA, midiendo en vez de suponer. Antes era `sticky top-0`, que
+          compite con el `sticky top-0 z-30` del encabezado del shell y a 320
+          terminaba DEBAJO de él: medido, `elementFromPoint` en el centro de
+          «Crear producto» devolvía el enlace «Orabella» del encabezado, o sea
+          que el botón no era clicable.
+
+          El `top` sale de `var(--shell-header-height)`, SIN reserva: sin valor
+          medido, `top` queda en `auto` y la barra no se ancla en 0. El nombre
+          de la variable y suMEDIDA viven en `useShellHeaderOffset`.
+        */
+        <div
+          ref={barraAccionesRef}
+          style={{ top: "var(--shell-header-height)" }}
+          className="sticky z-10 flex flex-wrap gap-2 rounded-lg border border-border-color bg-surface p-3 shadow-sm dark:border-border-color-2"
+        >
           <Button type="button" onClick={() => startProductDialog()}>
             <PackagePlus className="h-4 w-4" aria-hidden="true" />
             Crear producto
@@ -456,16 +542,39 @@ export function InventoryClient(props: InventoryClientProps) {
           else setProductDialogOpen(open);
         }}
       >
-        <DialogContent className="max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>{editingId ? "Editar producto" : "Crear producto"}</DialogTitle>
-            <DialogDescription>
-              {editingId
-                ? "Actualiza los datos del producto."
-                : "Completa los campos obligatorios para registrar un producto."}
-            </DialogDescription>
-          </DialogHeader>
-          <form onSubmit={handleProductSubmit} className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        {/*
+          LA ESTRUCTURA, y es la misma de `FormDialog` y de la factura: el
+          diálogo es una COLUMNA (`flex flex-col overflow-y-hidden`) que no
+          scrollea ella misma, la hoja cede el alto (`min-h-0`) y las tres
+          piezas son encabezado (fijo), MEDIO (lo único que scrollea) y pie
+          (fijo, FUERA del medio).
+
+          MEDIDO antes, con la sesión y sin enviar nada: 839 px de contenido en
+          una caja de 534 a 320x568 y en una de 706 a 360x740, con NINGÚN
+          scroller interno — scrolleaba el `DialogContent` — y el envío en
+          `y 744-788`: fuera de la caja del diálogo a los dos anchos, o sea que
+          guardar exigía scroll INTERNO del modal.
+
+          Y SIN `sticky` en el pie, a propósito: el bloque contenedor de un
+          ítem de grilla es su ÁREA, sin recorrido para anclarse, así que un
+          pie pegado con `position: sticky` se midió funcionando en Chromium y
+          quedaría colgando de la palabra de otro motor. La corrección vive en
+          el árbol.
+        */}
+        <DialogContent className="max-w-2xl flex flex-col overflow-y-hidden">
+          <div className="flex min-h-0 flex-1 flex-col">
+            <DialogHeader className="shrink-0">
+              <DialogTitle>{editingId ? "Editar producto" : "Crear producto"}</DialogTitle>
+              <DialogDescription>
+                {editingId
+                  ? "Actualiza los datos del producto."
+                  : "Completa los campos obligatorios para registrar un producto."}
+              </DialogDescription>
+            </DialogHeader>
+            <form onSubmit={handleProductSubmit} className="flex min-h-0 flex-1 flex-col">
+              {/* El MEDIO: lo único que scrollea. `min-h-0` para que pueda encogerse por debajo de sus campos; sin eso el `flex-1` no cede y el pie se vuelve a ir de la caja. */}
+              <div className="min-h-0 flex-1 overflow-y-auto">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <Label htmlFor="product-sku" className={labelClass}>
               SKU *
               <span className="flex items-center gap-2">
@@ -587,7 +696,10 @@ export function InventoryClient(props: InventoryClientProps) {
                 {error}
               </Alert>
             ) : null}
-            <DialogFooter className="sm:col-span-2">
+                </div>
+              </div>
+              {/* El PIE: `shrink-0` y FUERA del medio, así que la acción primaria y Cancelar están siempre a la vista sin una sola línea de scroll. Última pieza del `<form>` —igual que en `FormDialog`—, o sea que está EN EL FLUJO y no cubre el último campo. */}
+              <DialogFooter className="shrink-0">
               <Button type="button" variant="outline" onClick={cancelEdit}>
                 Cancelar
               </Button>
@@ -596,6 +708,7 @@ export function InventoryClient(props: InventoryClientProps) {
               </Button>
             </DialogFooter>
           </form>
+          </div>
         </DialogContent>
       </Dialog>
 
