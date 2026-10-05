@@ -74,25 +74,25 @@ export const AUDIT_ACTIONS = {
   // sede y antes cambiaban sin rastro: son los números que deciden qué vale sale
   // solo de caja y cuál espera aprobación, así que un cambio hecho con la
   // pantalla abierta tiene que quedar escrito con QUIÉN lo hizo y los dos
-  // valores, el anterior y el nuevo (como la fecha de arranque, más abajo).
+  // valores, el anterior y el nuevo.
   // NO entra a ningún catálogo de alertas: cambiar la política es una decisión de
   // configuración, no un desvío que alguien deba autorizar o rechazar.
   VOUCHER_LIMITS_SET: "voucher.limits_set",
   VOUCHER_APPROVED: "voucher.approved",
   VOUCHER_REQUESTED: "voucher.requested",
   VOUCHER_REJECTED: "voucher.rejected",
-  // La fecha de inicio de la nómina de la INSTALACIÓN la configura SOLO la cuenta
-  // de plataforma. Antes cambiaba sin rastro y es una fecha que mueve meses de
-  // dinero: queda con su propia acción para que un auditor lea «la plataforma
-  // configuró la nómina» con el valor anterior y el nuevo, y no la confunda con
-  // el negocio. NO entra a ningún catálogo de alertas: es una decisión de
-  // configuración, no un desvío.
-  PLATFORM_PAYROLL_START_DATE_SET: "platform.payroll_start_date_set",
+  // La fecha de inicio de la nómina de la INSTALACIÓN la configuraba SÓLO la
+  // cuenta de plataforma, y esa configuración ya no existe: la declara el PRIMER
+  // settlement y el resto se deriva del período más antiguo. Sin operación no
+  // hay nada que auditar, así que `platform.payroll_start_date_set` sale del
+  // vocabulario cerrado con la capa (decisión del dueño, U12). NO entra a ningún
+  // catálogo de alertas: era configuración, no un desvío.
+  //
   // `platform.sede_created` y `platform.sede_roles_set` (la alta de sedes y los
   // roles por sede) se retiraron del vocabulario con la decisión de una sola sede:
   // ya no hay esa operación que auditar. Las filas YA escritas en `audit_logs` con
   // esos valores se conservan tal cual, como las de `SHIFT_EDITED`: el registro
-  // histórico no se reescribe.
+  // histórico no se reescribe. Ese mismo criterio es el de esta entrada.
 } as const;
 
 /**

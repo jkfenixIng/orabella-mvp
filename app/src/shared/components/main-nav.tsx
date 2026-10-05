@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState, useEffect } from "react";
-import { Bell, Calculator, House, Package, Receipt, Settings, ShieldCheck, Sparkles, Ticket, Wallet, type LucideIcon } from "lucide-react";
+import { Bell, Calculator, House, Package, Receipt, Settings, Sparkles, Ticket, Wallet, type LucideIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -101,21 +101,10 @@ const NAV_GROUPS: NavGroup[] = [
         },
       ],
   },
-  {
-    id: "instalacion",
-    label: "Instalación",
-      links: [
-        {
-          href: "/plataforma",
-          label: "Plataforma",
-          description: "La instalación y su nómina",
-          Icon: ShieldCheck,
-          // Solo la cuenta con el rol de plataforma. El filtro fail-closed de
-          // abajo la deja invisible para todos los demás sin código nuevo.
-          roles: ["superadmin"],
-        },
-      ],
-  },
+  // El grupo «Instalación» se retiró con la capa de plataforma (decisión del
+  // dueño, U12): su única entrada era `/plataforma`, que ya no tiene nada que
+  // configurar. Un grupo sin enlaces no se deja declarado: el filtro fail-closed
+  // de abajo lo escondería, y un nav que nombra una superficie muerta miente.
 ];
 
 function isActive(pathname: string, href: string): boolean {

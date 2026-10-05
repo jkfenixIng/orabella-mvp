@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ACCOUNT_LOCKED_ERROR,
   DocumentRateLimiter,
@@ -30,14 +30,9 @@ import {
   resetPasswordSchema,
   sedeAssignableRoleSchema,
 } from "@/src/features/auth/schemas";
-import { requirePlatformAdmin } from "@/src/features/platform/service";
+import { requireAdminSession } from "@/src/features/admin/service";
+import { requireSedeRole } from "@/src/shared/lib/sede";
 import { AUDIT_ACTIONS } from "@/src/shared/lib/audit";
-import {
-  main,
-  provisionarSuperadmin,
-  cargarEntornoDeProyecto,
-  type CargadorDeEntorno,
-} from "@/scripts/create-superadmin";
 
 describe("auth schemas (Zod, sin red)", () => {
   it("login acepta documento+clave y recorta espacios", () => {
@@ -1406,27 +1401,50 @@ describe("migración 057_identity_password_cas.sql (CL-18)", () => {
 });
 
 /* --------------------------------------------------------------------------
-   G1: la SESIÓN REAL transporta el rol de plataforma.
+   G1: la SESIÓN REAL conserva el rol de plataforma.
 
    Este bloque NO mockea `getSessionUser`: ejercita el camino real contra el
-   doble de PostgREST de este archivo. Es la prueba que faltaba para no dar por
-   cubierta la guarda con una sesión simulada: si el filtro de roles de la
-   sesión descarta `superadmin`, `getSessionUser` lo pierde y la guarda nunca
-   pasa, aunque el resto del mundo devuelva verde.
+   doble de PostgREST de este archivo.
+
+   Lo que sobrevive al retiro de la capa de plataforma (U12) es la SESIÓN y la
+   FORMA de las guardas, que viven fuera de la capa:
+
+     * `getSessionUser` NO descarta `superadmin`: el rol viaja en la sesión.
+     * El gate puro (`requireSedeRole`) y la guarda del negocio
+       (`requireAdminSession`) rechazan sin sesión (401), rechazan al que no
+       trae la fila de la instalación (NO_SEDE 403) y aplican el rol.
+
+   Lo que NO se repone: `requirePlatformAdmin`, `setPlatformPayrollStartDate`,
+   `/plataforma` y el script de aprovisionamiento se retiraron con la capa que
+   los contenía. Una guarda nueva sin operación que proteger sería una puerta
+   que no abre nada. El cierre de esa ausencia está en
+   `tests/platform-retirement.test.ts`.
    -------------------------------------------------------------------------- */
 
-describe("auth: la sesión real lleva el rol de plataforma hasta la guarda (G1)", () => {
+/** Ejecuta y devuelve lo que lanzó, o `null` si no lanzó nada. */
+function errorDe(fn: () => unknown): unknown {
+  try {
+    fn();
+    return null;
+  } catch (error) {
+    return error;
+  }
+}
+
+describe("auth: la sesión real conserva el rol de plataforma (G1)", () => {
   const SESION_ID = "88888888-8888-4888-8888-888888888888";
   const TOKEN = "token-de-sesion-de-plataforma";
 
   /**
    * `roles(code)` es el embed que resuelve PostgREST: el doble devuelve la fila
    * con el objeto embebido, que es exactamente lo que `getSessionUser` lee.
+   * `sedeId` en `null` siembra la cuenta SIN fila de instalación, el estado que
+   * rechazan todas las guardas de sesión.
    */
-  function sembrarSesion(roles: string[]): void {
+  function sembrarSesion(roles: string[], sedeId: string | null = SEDE): void {
     postgrest.rows = {};
     postgrest.rows.users = [
-      { id: USUARIO, sede_id: SEDE, full_name: "Dueño", is_active: true },
+      { id: USUARIO, sede_id: sedeId, full_name: "Dueño", is_active: true },
     ];
     postgrest.rows.sessions = [
       {
@@ -1449,7 +1467,7 @@ describe("auth: la sesión real lleva el rol de plataforma hasta la guarda (G1)"
     postgrest.rows = {};
   });
 
-  it("getSessionUser conserva `superadmin`: el filtro de la sesión ya no lo descarta", async () => {
+  it("getSessionUser conserva `superadmin`: el filtro de la sesión no lo descarta", async () => {
     sembrarSesion(["superadmin"]);
 
     const session = await getSessionUser(TOKEN);
@@ -1457,416 +1475,57 @@ describe("auth: la sesión real lleva el rol de plataforma hasta la guarda (G1)"
     expect(session?.roles).toEqual(["superadmin"]);
   });
 
-  it("una sesión con `superadmin` LLEGA a la guarda; sin él, no pasa", async () => {
+  it("el rol viaja en la sesión, y el gate decide: sólo lo abre quien lo declara", async () => {
     sembrarSesion(["superadmin"]);
-    const actor = await requirePlatformAdmin(TOKEN);
-    expect(actor).toMatchObject({ userId: USUARIO, roles: ["superadmin"] });
 
+    const session = await getSessionUser(TOKEN);
+    expect(session).not.toBeNull();
+    if (!session) return;
+    expect(session.roles).toEqual(["superadmin"]);
+    expect(session.user.sede_id).toBe(SEDE);
+
+    // El gate compartido: el rol de plataforma NO abre nada por sí solo, sólo
+    // la superficie cuyo gate lo declara.
+    expect(errorDe(() => requireSedeRole(session.roles, ["superadmin"]))).toBeNull();
+
+    // Y el rol de un admin NO pasa por un gate que declara otro.
     sembrarSesion(["admin"]);
-    await expect(requirePlatformAdmin(TOKEN)).rejects.toMatchObject({
+    const deAdmin = await getSessionUser(TOKEN);
+    expect(deAdmin).not.toBeNull();
+    if (!deAdmin) return;
+    expect(errorDe(() => requireSedeRole(deAdmin.roles, ["superadmin"]))).toMatchObject({
       code: "FORBIDDEN",
       status: 403,
     });
   });
 
-  it("sin sesión: UNAUTHENTICATED (401)", async () => {
+  it("sin sesión: no hay sesión, y la guarda responde UNAUTHENTICATED (401)", async () => {
     postgrest.rows = {};
-    await expect(requirePlatformAdmin(null)).rejects.toMatchObject({
+
+    await expect(getSessionUser(null)).resolves.toBeNull();
+    await expect(requireAdminSession(null)).rejects.toMatchObject({
       code: "UNAUTHENTICATED",
       status: 401,
     });
   });
-});
 
-// -------------------------------------- cuenta de plataforma (G2) ---
+  it("toda guarda de sesión exige la fila de la instalación: sin ella, NO_SEDE (403)", async () => {
+    sembrarSesion(["admin"], null);
 
-/**
- * G2: la cuenta de plataforma se aprovisiona desde el ENTORNO, nunca desde el
- * repositorio. Dos cosas se fijan acá y no en otro lado:
- *
- *   1. PARIDAD DEL HASH. El script no puede tener su propio scrypt: si lo
- *      tuviera, el hash guardado compilaría y el login lo rechazaría sin que
- *      nada fallara antes. Por eso la prueba verifica el hash que el script
- *      escribió con `verifyPassword`, la MISMA función del login, y además
- *      comprueba que verifica la clave correcta y NO otra (control negativo).
- *   2. AUSENCIA DE CLAVE POR DEFECTO. Sin `SUPERADMIN_PASSWORD` el script se
- *      niega y no escribe NADA. El respaldo silencioso es el defecto clásico:
- *      termina siendo la clave de producción.
- *   3. LA SEDE DE LA INSTALACIÓN. La instalación es de UNA SOLA SEDE, así que la
- *      cuenta se ancla a LA SEDE DEL NEGOCIO y el script no crea ninguna fila de
- *      `sedes`. Se fija que no escriba en esa tabla, que no le importe una fila
- *      inactiva que no es la instalación, y que los dos estados imposibles (ninguna
- *      sede activa, dos o más) se rechacen ANTES de tocar la cuenta y sin elegir una
- *      al azar.
- *
- * Las claves de esta suite son FICTICIAS a propósito: así como la clave real no
- * vive en el repositorio, tampoco vive en una prueba.
- */
-describe("G2: cuenta de plataforma `superadmin` desde variables de entorno", () => {
-  const CLAVE_FICTICIA = "clave-ficticia-de-prueba";
-  const OTRA_CLAVE_FICTICIA = "otra-clave-ficticia-de-prueba";
-  /** Credencial FICTICIA: nada con pinta de real, tampoco en una prueba. */
-  const CLAVE_DE_SERVICIO_FICTICIA = "credencial-ficticia-de-prueba";
-  /** Cargador sin archivos: las pruebas de `main()` no tocan el disco. */
-  const SIN_ARCHIVOS: CargadorDeEntorno = () => ({ loadedEnvFiles: [] });
-  /** Lo que había en el entorno antes de que una prueba escribiera la ficticia. */
-  const CLAVE_DE_SERVICIO_PREVIA = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  const EXIT_CODE_INICIAL = process.exitCode;
-
-  /**
-   * Fila que NO es la instalación: la que esta capa creó antes de la decisión de
-   * una sola sede. Inactiva, y con su nombre propio: el script tiene que resolver
-   * la instalación por DATO (`is_active`), nunca por el nombre de la fila.
-   */
-  const SEDE_VIEJA_DE_PLATAFORMA = "00000000-0000-4000-8000-000000000001";
-  const NOMBRE_SEDE_VIEJA = "Plataforma (sistema)";
-
-  function sembrar(): void {
-    postgrest.rows = {};
-    // La instalación es de UNA sede, ya existente: el script NO la crea.
-    postgrest.rows.sedes = [{ id: SEDE, name: "Sede principal", is_active: true }];
-    postgrest.rows.roles = [{ id: "rol-superadmin", code: "superadmin" }];
-    postgrest.rows.users = [];
-    postgrest.rows.user_roles = [];
-  }
-
-  function cuenta(): Record<string, unknown> | undefined {
-    return filasDe("users").find((fila) => fila.id_number === "superadmin");
-  }
-
-  /** Filas de `sedes` tal como quedaron: el script no debe escribir ninguna. */
-  function filasDeSedes(): Array<Record<string, unknown>> {
-    return filasDe("sedes");
-  }
-
-  function rolesDeLaCuenta(): Array<Record<string, unknown>> {
-    const usuario = cuenta();
-    return filasDe("user_roles").filter((fila) => fila.user_id === usuario?.id);
-  }
-
-  function hashGuardado(): string {
-    return String(cuenta()?.password_hash ?? "");
-  }
-
-  /** Captura lo que imprime el CLI sin ensuciar la salida de la suite. */
-  function capturarSalida(): {
-    lineas: string[];
-    errores: string[];
-    avisos: string[];
-    restaurar: () => void;
-  } {
-    const lineas: string[] = [];
-    const errores: string[] = [];
-    const avisos: string[] = [];
-    const log = vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
-      lineas.push(args.map(String).join(" "));
-    });
-    const error = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
-      errores.push(args.map(String).join(" "));
-    });
-    const warn = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
-      avisos.push(args.map(String).join(" "));
-    });
-    return {
-      lineas,
-      errores,
-      avisos,
-      restaurar: () => {
-        log.mockRestore();
-        error.mockRestore();
-        warn.mockRestore();
-      },
-    };
-  }
-
-  beforeEach(() => {
-    postgrest.writes.length = 0;
-    postgrest.rpcCalls.length = 0;
-    postgrest.failWrite = null;
-    postgrest.failRpc = null;
-    postgrest.rpcNoAplica = false;
-    postgrest.antesDeEscribir = null;
-    vi.unstubAllEnvs();
-  });
-
-  afterEach(() => {
-    // El cargador falso escribe una credencial ficticia en el entorno: se
-    // restaura lo que había para no dejarla pegada al resto de la suite.
-    if (CLAVE_DE_SERVICIO_PREVIA === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
-    else process.env.SUPABASE_SERVICE_ROLE_KEY = CLAVE_DE_SERVICIO_PREVIA;
-    // `main()` marca `process.exitCode`: la suite no puede terminar con el
-    // código de un script que se negó a correr.
-    process.exitCode = EXIT_CODE_INICIAL;
-    vi.unstubAllEnvs();
-  });
-
-  it("carga los archivos de entorno del proyecto, y el entorno del proceso GANA sobre el archivo", () => {
-    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "https://desde-el-proceso.supabase.co");
-    let dirRecibido = "";
-    const cargador: CargadorDeEntorno = (dir) => {
-      dirRecibido = dir;
-      // El archivo PISA todo lo que traiga, incluso lo que ya estaba en el
-      // entorno: así la precedencia la tiene que garantizar el script, no el
-      // cargador.
-      process.env.NEXT_PUBLIC_SUPABASE_URL = "https://desde-el-archivo.supabase.co";
-      process.env.SUPABASE_SERVICE_ROLE_KEY = CLAVE_DE_SERVICIO_FICTICIA;
-      return { loadedEnvFiles: [{ path: ".env.local" }, { path: ".env" }] };
-    };
-
-    const archivos = cargarEntornoDeProyecto("/proyecto", cargador);
-
-    expect(dirRecibido).toBe("/proyecto");
-    expect(archivos).toEqual([".env.local", ".env"]);
-    // Lo que ya estaba en el entorno del proceso sigue mandando...
-    expect(process.env.NEXT_PUBLIC_SUPABASE_URL).toBe("https://desde-el-proceso.supabase.co");
-    // ...y lo que sólo venía del archivo queda cargado.
-    expect(process.env.SUPABASE_SERVICE_ROLE_KEY).toBe(CLAVE_DE_SERVICIO_FICTICIA);
-  });
-
-  it("dice de dónde salieron las credenciales: imprime los archivos cargados y ningún valor", async () => {
-    sembrar();
-    vi.stubEnv("SUPERADMIN_PASSWORD", CLAVE_FICTICIA);
-    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "https://proyecto-de-prueba.supabase.co");
-    const salida = capturarSalida();
-    const cargador: CargadorDeEntorno = () => ({
-      loadedEnvFiles: [{ path: ".env.local" }, { path: ".env" }],
+    const session = await getSessionUser(TOKEN);
+    expect(session?.user.sede_id).toBeNull();
+    await expect(requireAdminSession(TOKEN)).rejects.toMatchObject({
+      code: "NO_SEDE",
+      status: 403,
     });
 
-    await main(cargador);
-
-    expect(process.exitCode).toBeFalsy();
-    const todo = [...salida.lineas, ...salida.avisos, ...salida.errores].join("\n");
-    expect(todo).toContain("archivos cargados: .env.local, .env");
-    // Solo NOMBRES de archivo: ningún valor sale por la salida del script.
-    expect(todo).not.toContain(CLAVE_FICTICIA);
-    salida.restaurar();
-  });
-
-  it("sin archivos de entorno ni variables de Supabase, el aviso de credenciales faltantes sigue saliendo", async () => {
-    sembrar();
-    vi.stubEnv("SUPERADMIN_PASSWORD", CLAVE_FICTICIA);
-    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", undefined);
-    vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", undefined);
-    vi.stubEnv("SUPABASE_SERVICE_ROLE_KEY", undefined);
-    const salida = capturarSalida();
-
-    await main(SIN_ARCHIVOS);
-
-    expect(process.exitCode).toBe(1);
-    // Dijo de dónde salieron (o no) las credenciales...
-    expect(salida.lineas.join("\n")).toContain("no se encontraron archivos de entorno");
-    // ...y el aviso de siempre sigue saliendo, antes de tocar la base.
-    expect(salida.errores.join("\n")).toContain("NEXT_PUBLIC_SUPABASE_URL");
-    expect(postgrest.rpcCalls).toEqual([]);
-    expect(postgrest.writes).toEqual([]);
-    salida.restaurar();
-  });
-
-  it("se ancla a la sede activa de la INSTALACIÓN y el hash que escribe VERIFICA con `verifyPassword`", async () => {
-    sembrar();
-
-    const resultado = await provisionarSuperadmin({ clave: CLAVE_FICTICIA });
-
-    // La instalación es la sede activa que YA existe: el script la usa tal cual.
-    expect(resultado.sede).toMatchObject({ id: SEDE, name: "Sede principal" });
-    // Y NO escribe en `sedes`: ni la crea, ni la activa, ni la desactiva.
-    expect(postgrest.writes.filter((escritura) => escritura.startsWith("sedes."))).toEqual([]);
-    expect(filasDeSedes()).toHaveLength(1);
-    // La cuenta queda anclada a ESA sede.
-    expect(cuenta()?.sede_id).toBe(SEDE);
-
-    const hash = hashGuardado();
-    expect(resultado.accion).toBe("creada");
-    // El formato es el de la casa (`scrypt$v1$<sal>$<hash>`): el script no
-    // inventa otro esquema de hash.
-    expect(hash.startsWith("scrypt$v1$")).toBe(true);
-    expect(hash).not.toContain(CLAVE_FICTICIA);
-    // LA PRUEBA QUE IMPIDE LA DIVERGENCIA SILENCIOSA: el hash lo verifica la
-    // función del LOGIN, no una copia del script.
-    await expect(verifyPassword(CLAVE_FICTICIA, hash)).resolves.toBe(true);
-    await expect(verifyPassword(OTRA_CLAVE_FICTICIA, hash)).resolves.toBe(false);
-    // Y la credencial del entorno es la que sirve para entrar: sin cambio
-    // forzado y sin bloqueo.
-    expect(cuenta()).toMatchObject({
-      id_number: "superadmin",
-      id_type: "otro",
-      must_change_password: false,
-      failed_attempts: 0,
-      locked_until: null,
+    // Y con la fila, la MISMA guarda abre: el rechazo es por el dato ausente,
+    // no por el rol.
+    sembrarSesion(["admin"]);
+    await expect(requireAdminSession(TOKEN)).resolves.toMatchObject({
+      userId: USUARIO,
+      sedeId: SEDE,
+      roles: ["admin"],
     });
-  });
-
-  it("sin `SUPERADMIN_PASSWORD` se niega a correr y no escribe nada", async () => {
-    sembrar();
-    vi.stubEnv("SUPERADMIN_PASSWORD", undefined);
-    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "https://proyecto-de-prueba.supabase.co");
-    const salida = capturarSalida();
-
-    await main(SIN_ARCHIVOS);
-
-    expect(process.exitCode).toBe(1);
-    // La clave se valida ANTES de tocar la base: ninguna lectura ni escritura.
-    expect(postgrest.rpcCalls).toEqual([]);
-    expect(postgrest.writes).toEqual([]);
-    expect(cuenta()).toBeUndefined();
-    expect(salida.errores.join("\n")).toContain("SUPERADMIN_PASSWORD");
-    salida.restaurar();
-  });
-
-  it("con la clave vacía tampoco escribe: vacío no es una clave", async () => {
-    sembrar();
-    vi.stubEnv("SUPERADMIN_PASSWORD", "   ");
-    const salida = capturarSalida();
-
-    await main(SIN_ARCHIVOS);
-
-    expect(process.exitCode).toBe(1);
-    expect(postgrest.rpcCalls).toEqual([]);
-    expect(cuenta()).toBeUndefined();
-    salida.restaurar();
-  });
-
-  it("la segunda corrida no crea otra cuenta y no duplica el rol", async () => {
-    sembrar();
-
-    const primera = await provisionarSuperadmin({ clave: CLAVE_FICTICIA });
-    const segunda = await provisionarSuperadmin({ clave: OTRA_CLAVE_FICTICIA });
-
-    expect(primera.accion).toBe("creada");
-    expect(segunda.accion).toBe("actualizada");
-    // La misma sede de instalación en las dos corridas: no se elige otra.
-    expect(segunda.sede.id).toBe(primera.sede.id);
-    // Y `sedes` sigue como estaba: el aprovisionamiento no escribe en esa tabla.
-    expect(filasDeSedes()).toHaveLength(1);
-    expect(filasDeSedes()[0]).toMatchObject({ id: SEDE, is_active: true });
-    // UNA cuenta con el documento `superadmin`, no dos (la unicidad de 002 y la
-    // lectura previa del script son las dos redes).
-    expect(filasDe("users")).toHaveLength(1);
-    // UN rol: `replace_user_roles` reemplaza el conjunto, no agrega filas.
-    expect(rolesDeLaCuenta()).toHaveLength(1);
-    expect(segunda.roles).toEqual(["superadmin"]);
-    // La clave que manda es la de la ÚLTIMA corrida: es la decisión documentada
-    // (volver a correr el script repone la credencial del entorno).
-    await expect(verifyPassword(OTRA_CLAVE_FICTICIA, hashGuardado())).resolves.toBe(true);
-    await expect(verifyPassword(CLAVE_FICTICIA, hashGuardado())).resolves.toBe(false);
-  });
-
-  it("una fila que NO es la instalación no la desorienta: se ancla a la activa", async () => {
-    sembrar();
-    // La fila que dejó la versión anterior de esta capa, con su nombre de sistema.
-    // No es la instalación —está inactiva— y no debe cambiar ni contarse.
-    postgrest.rows.sedes.push({
-      id: SEDE_VIEJA_DE_PLATAFORMA,
-      name: NOMBRE_SEDE_VIEJA,
-      is_active: false,
-    });
-
-    const resultado = await provisionarSuperadmin({ clave: CLAVE_FICTICIA });
-
-    expect(resultado.sede.id).toBe(SEDE);
-    expect(cuenta()?.sede_id).toBe(SEDE);
-    // La fila vieja queda exactamente como estaba: ni se borra ni se activa.
-    expect(filasDeSedes().find((fila) => fila.id === SEDE_VIEJA_DE_PLATAFORMA)).toMatchObject({
-      name: NOMBRE_SEDE_VIEJA,
-      is_active: false,
-    });
-  });
-
-  it("sin ninguna sede activa falla ANTES de tocar la cuenta", async () => {
-    sembrar();
-    postgrest.rows.sedes = [
-      { id: SEDE_VIEJA_DE_PLATAFORMA, name: NOMBRE_SEDE_VIEJA, is_active: false },
-    ];
-
-    await expect(provisionarSuperadmin({ clave: CLAVE_FICTICIA })).rejects.toMatchObject({
-      codigo: "SEDE_AUSENTE",
-    });
-
-    expect(filasDe("users")).toEqual([]);
-    expect(filasDe("user_roles")).toEqual([]);
-    expect(postgrest.rpcCalls).toEqual([]);
-  });
-
-  it("con dos sedes activas se rechaza: no elige una al azar", async () => {
-    sembrar();
-    postgrest.rows.sedes = [
-      { id: SEDE, name: "Sede principal", is_active: true },
-      { id: SEDE_VIEJA_DE_PLATAFORMA, name: NOMBRE_SEDE_VIEJA, is_active: true },
-    ];
-
-    await expect(provisionarSuperadmin({ clave: CLAVE_FICTICIA })).rejects.toMatchObject({
-      codigo: "SEDE_DUPLICADA",
-    });
-
-    expect(filasDe("users")).toEqual([]);
-    expect(filasDe("sedes")).toHaveLength(2);
-  });
-
-  it("una cuenta anclada a otra sede se re-ancla a la de la instalación y lo dice", async () => {
-    sembrar();
-    const primera = await provisionarSuperadmin({ clave: CLAVE_FICTICIA });
-    // Estado a corregir: la cuenta quedó apuntando a una sede que ya no es la
-    // instalación (la fila vieja que dejó la versión anterior del script).
-    postgrest.rows.users = filasDe("users").map((fila) => ({
-      ...fila,
-      sede_id: SEDE_VIEJA_DE_PLATAFORMA,
-    }));
-
-    const segunda = await provisionarSuperadmin({ clave: OTRA_CLAVE_FICTICIA });
-
-    expect(segunda.sede.id).toBe(primera.sede.id);
-    expect(cuenta()?.sede_id).toBe(SEDE);
-    // Cambiar de sede cambia lo que la cuenta ve del negocio: no puede ser mudo.
-    expect(segunda.avisos.join(" | ")).toContain("otra sede");
-  });
-
-  it("sin ninguna sede activa el CLI lo dice con palabras y no escribe nada", async () => {
-    sembrar();
-    postgrest.rows.sedes = [
-      { id: SEDE_VIEJA_DE_PLATAFORMA, name: NOMBRE_SEDE_VIEJA, is_active: false },
-    ];
-    vi.stubEnv("SUPERADMIN_PASSWORD", CLAVE_FICTICIA);
-    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "https://proyecto-de-prueba.supabase.co");
-    const salida = capturarSalida();
-
-    await main(SIN_ARCHIVOS);
-
-    // El mensaje dice QUÉ hacer (activar la sede del negocio), no sólo el código.
-    expect(process.exitCode).toBe(1);
-    expect(salida.errores.join("\n")).toContain("sede activa");
-    expect(cuenta()).toBeUndefined();
-    expect(postgrest.rpcCalls).toEqual([]);
-    salida.restaurar();
-  });
-
-  it("si el catálogo no tiene `superadmin` (069 sin aplicar) falla y no crea la cuenta", async () => {
-    sembrar();
-    postgrest.rows.roles = [];
-
-    await expect(provisionarSuperadmin({ clave: CLAVE_FICTICIA })).rejects.toMatchObject({
-      codigo: "CATALOGO_SIN_ROL",
-    });
-
-    expect(filasDe("users")).toEqual([]);
-  });
-
-  it("imprime el host de destino y la sede de la instalación, y nunca la clave", async () => {
-    sembrar();
-    vi.stubEnv("SUPERADMIN_PASSWORD", CLAVE_FICTICIA);
-    vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "https://proyecto-de-prueba.supabase.co");
-    const salida = capturarSalida();
-
-    await main(SIN_ARCHIVOS);
-
-    expect(process.exitCode).toBeFalsy();
-    const todo = [...salida.lineas, ...salida.errores, ...salida.avisos].join("\n");
-    // El host de Supabase: es el chequeo humano de a qué base se le escribe.
-    expect(todo).toContain("proyecto-de-prueba.supabase.co");
-    // El nombre Y el id de la sede a la que quedó anclada la cuenta.
-    expect(todo).toContain("Sede principal");
-    expect(todo).toContain(SEDE);
-    // La credencial NUNCA sale por la salida del script.
-    expect(todo).not.toContain(CLAVE_FICTICIA);
-    salida.restaurar();
   });
 });
