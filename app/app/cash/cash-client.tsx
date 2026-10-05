@@ -51,6 +51,53 @@ import { ArrowLeftRight, Banknote, Coins, CreditCard, Wallet, Zap } from "lucide
 // necesitan las columnas estrechas (fechas, montos y estados).
 const shiftCellClass = cn(tableCellClass, "whitespace-nowrap");
 
+/* --------------------------------------------------------------------------
+   R38 — la fila del turno, en el teléfono, NO es una tabla: es una tarjeta con
+   pares etiqueta/valor. La forma es la de la lista de facturas (la referencia):
+   abajo de `sm` cada valor lleva su propia etiqueta —la palabra del
+   encabezado— y arriba de `sm` el encabezado es el que nombra.
+
+   Por qué sigue siendo una `<table>` y no un `<ul>`: acá las columnas son
+   DINÁMICAS (una por método de pago activo) y hay un piso de ancho declarado
+   para el escritorio. Una grilla como la de facturas se escribe con
+   `sm:col-start-N`, una columna por una; esa escala no se puede construir por
+   código —Tailwind no compila una clase armada— y la grilla no sabe cuántas
+   columnas hay. Lo que se replica es el contrato, no el vehículo.
+
+   LO QUE SE APAGABA Y POR QUÉ: el `min-w-[1100px]` sin variante alcanzaba
+   también al teléfono (medido: 1330 px de tabla dentro de un carril de 238, con
+   `Recontar` entre 950 y 1100), y el `whitespace-nowrap` de `shiftCellClass`
+   impedía que un nombre o un motivo bajaran de renglón. Los dos son de
+   ESCRITORIO, y por eso llevan `sm:`.
+   -------------------------------------------------------------------------- */
+
+/** La etiqueta de cada valor en el teléfono: la palabra del encabezado, apagada arriba de `sm`. */
+const campoLabelClass = cn("font-medium text-text-secondary", "sm:hidden");
+
+/** Un valor de una línea completa (fechas, nombres, la acción). */
+const campoClass = cn(
+  shiftCellClass,
+  "block w-full min-w-0 whitespace-normal px-0 py-1 sm:table-cell sm:w-auto sm:whitespace-nowrap sm:px-3 sm:py-2",
+);
+
+/** Dos valores en una línea: los cortos (estado, base, diferencia, revisada). */
+const campoParClass = cn(
+  shiftCellClass,
+  "block w-1/2 min-w-0 whitespace-normal px-0 py-1 sm:table-cell sm:w-auto sm:whitespace-nowrap sm:px-3 sm:py-2",
+);
+
+/** Los nombres de persona: se leen enteros en el teléfono y se recortan arriba, como antes. */
+const campoNombreClass = cn(
+  shiftCellClass,
+  "block w-full min-w-0 whitespace-normal px-0 py-1 sm:table-cell sm:w-auto sm:max-w-48 sm:truncate sm:px-3 sm:py-2",
+);
+
+/** La acción de la fila: su propia línea, a lo ancho, sin nada que la recorte. */
+const accionesClass = cn(
+  shiftCellClass,
+  "flex w-full flex-wrap items-center gap-2 whitespace-normal px-0 py-1 sm:table-cell sm:w-auto sm:whitespace-nowrap sm:px-3 sm:py-2",
+);
+
 // Misma tabla para vista del día e historial: mismas columnas siempre.
 function ShiftsTable({
   shifts,
@@ -78,8 +125,13 @@ function ShiftsTable({
   return (
     <>
       <div className="mt-3 overflow-x-auto">
-        <table className={cn("w-full text-left text-sm", "min-w-[1100px]")}>
-          <thead>
+        {/* Abajo de `sm` esto es una tarjeta por turno; arriba de `sm` es la tabla de
+            siempre, con el mismo carril y el mismo piso. El piso lleva `sm:` porque a
+            1100 px en un teléfono no es «una tabla más ancha»: es el carril entero. */}
+        <table className={cn("w-full text-left text-sm", "sm:min-w-[1100px]", "block sm:table")}>
+          {/* El encabezado nombra las columnas: abajo de `sm` no se ve, y por eso cada
+              valor de la tarjeta lleva su propia etiqueta. */}
+          <thead className="hidden sm:table-header-group">
               <tr className={tableHeaderClass}>
                 <th className={shiftCellClass} scope="col">Apertura</th>
                 <th className={shiftCellClass} scope="col">Estado</th>
@@ -111,99 +163,144 @@ function ShiftsTable({
               )}
             </tr>
           </thead>
-          <tbody>
+          <tbody className="block sm:table-row-group">
             {shifts.map((view) => {
               const isClosed = view.shift.status === "cerrado";
               return (
-                <tr key={view.shift.id} className={tableRowClass}>
-                  <td className={shiftCellClass}>{formatDateTime(view.shift.opened_at)}</td>
-                  <td className={shiftCellClass}>{view.shift.status}</td>
-                  <td
-                    className={cn(shiftCellClass, "max-w-48 truncate")}
-                    title={view.abierto_por ?? undefined}
-                  >
-                    {view.abierto_por ?? "—"}
-                  </td>
-                  <td
-                    className={cn(shiftCellClass, "max-w-48 truncate")}
-                    title={view.cerrado_por ?? undefined}
-                  >
-                    {view.cerrado_por ?? "—"}
-                  </td>
-                  <td className={shiftCellClass}>{formatMoney(view.shift.opening_base)}</td>
-                  {isAdmin && (
+                <tr
+                  key={view.shift.id}
+                  className={cn(
+                    tableRowClass,
+                    "flex flex-wrap items-baseline px-3 py-2 sm:table-row sm:px-0 sm:py-0",
+                  )}
+                >
+                {/* La tarjeta móvil, en el orden en que se lee: primero QUÉ turno es
+                    (cuándo abrió y quién lo abrió), después la plata (base inicial,
+                    base final, vales) y el estado; «Cerró» y la justificación bajan
+                    porque sólo hablan de un turno ya cerrado; y la acción al final, en
+                    su propia línea. Arriba de `sm` este mismo orden de marcado no
+                    manda: cada celda vuelve a su columna por el `thead`. */}
+                <td className={cn(campoClass)}>
+                  <span className={campoLabelClass}>Apertura: </span>
+                  {formatDateTime(view.shift.opened_at)}
+                </td>
+                <td className={cn(campoNombreClass)} title={view.abierto_por ?? undefined}>
+                  <span className={campoLabelClass}>Abrió: </span>
+                  {view.abierto_por ?? "—"}
+                </td>
+                <td className={cn(campoParClass)}>
+                  <span className={campoLabelClass}>Estado: </span>
+                  {view.shift.status}
+                </td>
+                <td className={cn(campoParClass)}>
+                  <span className={campoLabelClass}>Base inicial: </span>
+                  {formatMoney(view.shift.opening_base)}
+                </td>
+                <td className={cn(campoParClass)}>
+                  <span className={campoLabelClass}>Base final: </span>
+                  {isClosed ? formatMoney(view.vigente.base_left) : "—"}
+                </td>
+                <td className={cn(campoParClass)}>
+                  <span className={campoLabelClass}>Vales: </span>
+                  {formatMoney(view.vales)}
+                </td>
+                <td className={cn(campoNombreClass)} title={view.cerrado_por ?? undefined}>
+                  <span className={campoLabelClass}>Cerró: </span>
+                  {view.cerrado_por ?? "—"}
+                </td>
+                {/* Lo de abajo es de ADMIN en el escritorio, y lo es igual en la tarjeta:
+                    un no-admin no ve estas celdas ni sus etiquetas en ninguna de las dos
+                    superficies. Ampliarlo sería cambiar un permiso, no un diseño. */}
+                {isAdmin && (
                     <>
-                      <td className={shiftCellClass}>{formatMoney(view.ventas)}</td>
-                      <td className={shiftCellClass}>{formatMoney(view.efectivo)}</td>
+                      <td className={cn(campoParClass)}>
+                        <span className={campoLabelClass}>Ventas: </span>
+                        {formatMoney(view.ventas)}
+                      </td>
+                      <td className={cn(campoParClass)}>
+                        <span className={campoLabelClass}>Efectivo: </span>
+                        {formatMoney(view.efectivo)}
+                      </td>
                       {methodCols.map((method) => {
                         const cobrado = view.metodos.find(
                           (m) => m.method_code === method.code,
                         )?.amount ?? 0;
                         return (
-                          <td key={method.id} className={shiftCellClass}>
+                          <td key={method.id} className={cn(campoParClass)}>
+                            <span className={campoLabelClass}>{method.name}: </span>
                             {formatMoney(cobrado)}
                           </td>
                         );
                       })}
                     </>
                   )}
-                  <td className={shiftCellClass}>{formatMoney(view.vales)}</td>
-                  <td className={shiftCellClass}>
-                    {isClosed ? formatMoney(view.vigente.base_left) : "—"}
-                  </td>
-                  {isAdmin && (
+                {isAdmin && (
                     <>
-                      <td className={shiftCellClass}>
-                        {!isClosed ? "—" : view.revision ? "Sí" : "No"}
-                      </td>
-                      <td className={shiftCellClass}>
-                        {!view.revision ? "N/A" : view.revision.revisada ? "Sí" : "No"}
-                      </td>
-                      <td className={shiftCellClass}>
-                        {!view.revision ? (
-                          "N/A"
-                        ) : view.revision.notas.length > 0 ? (
-                          <button
-                            type="button"
-                            className="underline"
-                            onClick={() => setJustOpen(view.revision?.notas ?? null)}
-                          >
-                            Ver
-                          </button>
-                        ) : (
-                          ""
-                        )}
-                      </td>
-                      <td className={shiftCellClass}>
-                        {!isClosed ? (
-                          "—"
-                        ) : view.recount ? (
-                          <span className="inline-flex items-center gap-2">
-                            <span className="font-medium text-warning">Recontado</span>
-                            <button
-                              type="button"
-                              className="underline"
-                              onClick={() => onShowVersions(view)}
-                            >
-                              Versiones
-                            </button>
-                          </span>
-                        ) : (
-                          <button type="button" className="underline" onClick={() => onRecount(view)}>
-                            Recontar
-                          </button>
-                        )}
-                      </td>
+                <td className={cn(campoParClass)}>
+                  <span className={campoLabelClass}>Diferencia: </span>
+                  {!isClosed ? "—" : view.revision ? "Sí" : "No"}
+                </td>
+                <td className={cn(campoParClass)}>
+                  <span className={campoLabelClass}>Revisada: </span>
+                  {!view.revision ? "N/A" : view.revision.revisada ? "Sí" : "No"}
+                </td>
+                <td className={cn(campoClass)}>
+                  <span className={campoLabelClass}>Justificación: </span>
+                  {!view.revision ? (
+                    "N/A"
+                  ) : view.revision.notas.length > 0 ? (
+                    <button
+                      type="button"
+                      className="underline"
+                      onClick={() => setJustOpen(view.revision?.notas ?? null)}
+                    >
+                      Ver
+                    </button>
+                  ) : (
+                    ""
+                  )}
+                </td>
+                {/* La acción, en su línea y sin gesto horizontal: antes vivía en la
+                    última columna de una tabla de 1330 px dentro de un carril de 238. */}
+                <td className={cn(accionesClass)}>
+                  <span className={campoLabelClass}>Reconteo: </span>
+                  {!isClosed ? (
+                    "—"
+                  ) : view.recount ? (
+                    <span className="inline-flex items-center gap-2">
+                      <span className="font-medium text-warning">Recontado</span>
+                      <button
+                        type="button"
+                        className="underline"
+                        onClick={() => onShowVersions(view)}
+                      >
+                        Versiones
+                      </button>
+                    </span>
+                  ) : (
+                    <button type="button" className="underline" onClick={() => onRecount(view)}>
+                      Recontar
+                    </button>
+                  )}
+                </td>
                     </>
                   )}
                 </tr>
               );
             })}
             {shifts.length === 0 && (
-              <tr>
+              <tr
+                className={cn(
+                  tableRowClass,
+                  "flex flex-wrap items-baseline px-3 py-2 sm:table-row sm:px-0 sm:py-0",
+                )}
+              >
               <td
                 colSpan={7 + (isAdmin ? 6 + methodCols.length : 0)}
-                  className={cn(tableCellClass, "text-text-secondary")}
+                  className={cn(
+                    campoClass,
+                    "text-text-secondary",
+                  )}
                 >
                   {emptyText}
                 </td>
