@@ -17,12 +17,25 @@ const buttonVariants = cva(
         ghost: 'hover:bg-surface-hover hover:text-text-primary',
         link: 'text-primary-600 underline-offset-4 hover:underline dark:text-primary-400',
       },
+      // R14 (medido en Chromium): `default` 40 px, `sm` 36 px y `icon`
+      // 40×40, contra el objetivo táctil de 44 px de `docs/ux-ui-standard.md`
+      // §8. El piso se aplica con `max-sm:`, o sea SOLO por debajo de 640: a
+      // 1024 los 22 elementos interactivos medidos siguen en 36-40, y subir la
+      // densidad de escritorio es una decisión aparte, no un token.
+      //
+      // `min-h-*` y no `h-*`: `min-height` le gana a `height` en el CSS, así que
+      // abajo de `sm` el piso NO lo puede tumbar un `h-*` del llamador (que es
+      // lo que hace que sea un piso y no una sugerencia) y arriba de `sm` no hay
+      // `min-height` declarado, así que el llamador manda entero. Hoy ningún
+      // llamador pasa un alto (`size` está en 1 de 19 usos de `<Button>`), así
+      // que esto no le quita nada a nadie: lo verifica `tests/touch-floor.test.ts`.
+      // Y en el icono el piso es en los dos ejes: 44×44 es lo que se toca.
       size: {
-        default: 'h-10 px-4 py-2',
-        sm: 'h-9 rounded-md px-3 text-xs',
+        default: 'h-10 px-4 py-2 max-sm:min-h-11',
+        sm: 'h-9 rounded-md px-3 text-xs max-sm:min-h-11',
         lg: 'h-11 rounded-md px-8 text-base',
         xl: 'h-12 rounded-lg px-10 text-lg',
-        icon: 'h-10 w-10',
+        icon: 'h-10 w-10 max-sm:h-11 max-sm:w-11',
       },
     },
     defaultVariants: {
