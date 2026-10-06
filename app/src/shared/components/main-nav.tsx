@@ -358,19 +358,15 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
             className="left-0 top-0 flex h-full max-h-none w-72 max-w-72 translate-x-0 translate-y-0 flex-col gap-4 overflow-y-auto rounded-none border-0 border-r border-border-color p-4 shadow-xl"
           >
             <DialogTitle className="sr-only">Menú principal</DialogTitle>
+            {/* R-C: el cierre del cajón lo monta `DialogContent` (la primitiva),
+                así que acá NO va una segunda ✕. Tenía una propia en este
+                encabezado, y con las dos el panel mostraba dos cierres en el
+                mismo borde: uno por la primitiva y otro por esta línea. */}
             <div className="flex items-center justify-between">
               <span className="flex items-center gap-2 text-lg font-bold">
                 <SealMark />
                 Orabella
               </span>
-              <button
-                type="button"
-                aria-label="Cerrar menú"
-                onClick={() => setDrawerOpen(false)}
-                className="rounded-md border border-border-color px-3 py-1 text-sm"
-              >
-                ✕
-              </button>
             </div>
             {accordion(() => setDrawerOpen(false))}
             {footer}
