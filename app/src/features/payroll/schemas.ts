@@ -805,6 +805,112 @@ export function periodCadenceBucket(frequency: string | null | undefined): strin
   return frequency ?? "";
 }
 
+/* ---------------------------------------------------------- F11: filtro por
+   cadencia ----------------------------------------------------------- */
+
+/**
+ * F11: el cajón SIN cadencia. Es el cubo `""` de `periodCadenceBucket` —los
+ * períodos HEREDADOS, de antes de que la columna existiera—, no una cuarta
+ * cadencia: por eso se nombra como constante y no se escribe el `""` suelto en
+ * las tablas de la vista.
+ */
+export const PERIOD_CADENCE_LEGACY = "";
+
+/**
+ * F11: qué se puede elegir como filtro de cadencia. `todas` es el cajón que no
+ * filtra; las tres cadencias son el catálogo cerrado (`payFrequencySchema`), y
+ * `PERIOD_CADENCE_LEGACY` cubre los períodos heredados.
+ *
+ * No lleva un `string` suelto atrás a propósito: si mañana la base acepta otra
+ * cadencia, el tipo obliga a declararla en el catálogo y no a colarla en un
+ * `select`.
+ */
+export type PeriodCadenceFilter = "todas" | PayFrequency | typeof PERIOD_CADENCE_LEGACY;
+
+/**
+ * F11: las PESTAÑAS del filtro, en orden. Sólo existe una pestaña para la
+ * cadencia que REALMENTE aparece en `periods`, más el cajón heredado si algún
+ * período no tiene cadencia. Una cadencia sin períodos NO recibe pestaña: es
+ * exactamente el espacio visual que el dueño pidió recuperar («si aún no le
+ * pagué a un quincenal y no le toca, para qué hacer que se vea ocupando espacio
+ * visual»).
+ *
+ * El orden es el CANÓNICO del catálogo (`payFrequencySchema.options`) y el
+ * heredado va al final: el juego se lee siempre igual, se agreguen las filas
+ * como se agreguen.
+ *
+ * `periods` debe entrar SIN filtrar por estado (lo llama la vista con la lista
+ * entera): si las opciones salieran de la lista ya recortada, el filtro de
+ * estado podría borrar el juego de pestañas entero y dejar al usuario sin forma
+ * de volver a "todas".
+ *
+ * Reutiliza `periodCadenceBucket` —el cubo que ya usan la restricción de
+ * solape, el piso y el recorrido de pendientes— en vez de repetir la regla.
+ * Puro para probarlo sin base de datos.
+ */
+export function periodCadenceFilterOptions(
+  periods: readonly { frequency?: string | null }[],
+): PeriodCadenceFilter[] {
+  const seen = new Set<string>();
+  for (const period of periods) {
+    seen.add(periodCadenceBucket(period.frequency ?? null));
+  }
+  const options: PeriodCadenceFilter[] = ["todas"];
+  for (const frequency of payFrequencySchema.options) {
+    if (seen.has(frequency)) options.push(frequency);
+  }
+  if (seen.has(PERIOD_CADENCE_LEGACY)) options.push(PERIOD_CADENCE_LEGACY);
+  return options;
+}
+
+/**
+ * F11: los períodos de UNA cadencia. Comparte el MISMO cubo que
+ * `periodCadenceFilterOptions`, así que toda pestaña derivada de las opciones
+ * devuelve al menos un período: una pestaña no puede quedar vacía por
+ * construcción. `todas` devuelve la lista entera (copia, no la referencia).
+ *
+ * Puro para probarlo sin base de datos.
+ */
+export function filterPeriodsByCadence<TRow extends { frequency?: string | null }>(
+  periods: readonly TRow[],
+  filter: PeriodCadenceFilter,
+): TRow[] {
+  if (filter === "todas") return [...periods];
+  const bucket = periodCadenceBucket(filter);
+  return periods.filter((period) => periodCadenceBucket(period.frequency ?? null) === bucket);
+}
+
+/**
+ * F11: cómo se nombra la cadencia de un período en la lista. Una cadencia
+ * ausente NO se dibuja como cadena vacía: «Sin cadencia» es un dato honesto
+ * (es un período heredado) y un vacío sería indistinguible de un bug de
+ * formato.
+ *
+ * Devuelve la cadencia en MAYÚSCULA INICIAL porque es la palabra con la que
+ * empieza la etiqueta de la fila, igual que el estado. Puro para probarlo sin
+ * base de datos.
+ */
+export function periodCadenceLabel(frequency: string | null | undefined): string {
+  const normalized = normalizePayFrequency(frequency);
+  if (normalized === null) return "Sin cadencia";
+  return `${normalized.charAt(0).toUpperCase()}${normalized.slice(1)}`;
+}
+
+/** F11: la etiqueta de una PESTAÑA del filtro (el «todas» va en mayúsculas). */
+export function periodCadenceFilterLabel(filter: PeriodCadenceFilter): string {
+  return filter === "todas" ? "Todas" : periodCadenceLabel(filter);
+}
+
+/**
+ * F11: la `key` de React de una opción del filtro. El cajón heredado es la
+ * cadena vacía —su VALOR lo fija `periodCadenceBucket`, y ese valor no se
+ * cambia— pero como clave necesita un nombre propio: se nombra acá UNA vez en
+ * vez de repetir el `""` suelto por la vista.
+ */
+export function periodCadenceTabKey(filter: PeriodCadenceFilter): string {
+  return filter === PERIOD_CADENCE_LEGACY ? "sin-cadencia" : filter;
+}
+
 /**
  * F4: true cuando el empleado NO pertenece a este período por cadencia: las
  * DOS están definidas y DIFIEREN. La regla del dueño (2026-10-01) lo excluye
@@ -908,6 +1014,42 @@ export const PAY_CYCLE_CALENDAR_DAYS: Record<PayFrequency, number> = {
 export function calendarCycleDaysForFrequency(frequency: string | null | undefined): number | null {
   const normalized = normalizePayFrequency(frequency);
   return normalized === null ? null : PAY_CYCLE_CALENDAR_DAYS[normalized];
+}
+
+/**
+ * F11: el CICLO RECORTADO, detectado. El primer ciclo de cada cadencia se
+ * recorta al arranque de la nómina, así que un mensual puede terminar pagando
+ * 7 de sus 28 días: sin declararlo, el dueño lo lee como un error de cálculo.
+ * La función devuelve las PARTES de esa frase (`days` y `cycleDays`) y no el
+ * texto: la redacción es de la vista y los números salen de las MISMAS tablas
+ * que usa el resto del módulo —`periodRangeDays` y
+ * `calendarCycleDaysForFrequency`—, así que nadie escribe un 7 ni un 28 a mano.
+ *
+ * `trimmed` es `false` en los tres casos en que NO se puede afirmar el recorte:
+ * ciclo completo, período heredado sin cadencia (no hay ciclo contra el cual
+ * comparar) y rango ilegible. Puro para probarlo sin base de datos.
+ */
+export interface PayrollTrimmedCycle {
+  /** El rango es MÁS CORTO que el ciclo natural de su cadencia. */
+  trimmed: boolean;
+  /** Días del rango (inclusivos), o `null` si el rango no se puede leer. */
+  days: number | null;
+  /** Días del ciclo cerrado de la cadencia, o `null` si no hay cadencia. */
+  cycleDays: number | null;
+}
+
+export function payrollTrimmedCycle(args: {
+  frequency: string | null | undefined;
+  startDate: string;
+  endDate: string;
+}): PayrollTrimmedCycle {
+  const days = periodRangeDays(args.startDate, args.endDate);
+  const cycleDays = calendarCycleDaysForFrequency(args.frequency);
+  return {
+    trimmed: days !== null && cycleDays !== null && days < cycleDays,
+    days,
+    cycleDays,
+  };
 }
 
 /** Día de la semana UTC de un día (ms): 0 = domingo … 6 = sábado. */

@@ -27,6 +27,7 @@ import {
   cycleProrationFactor,
   daysInMonthWithinRange,
   detailLineCommissionOrigin,
+  filterPeriodsByCadence,
   fixedFractionForFrequency,
   groupPayrollPeriodsByMonth,
   isPayrollCycleRange,
@@ -55,8 +56,13 @@ import {
   payrollExtraSchema,
   payrollMonthLabel,
   payrollPeriodCountLabel,
+  payrollTrimmedCycle,
   payFrequencySchema,
   periodCadenceBucket,
+  periodCadenceFilterLabel,
+  periodCadenceFilterOptions,
+  periodCadenceLabel,
+  periodCadenceTabKey,
   periodExcludesEmployeeByCadence,
   periodRangeDays,
   prorateFixedSalary,
@@ -13524,3 +13530,199 @@ describe("M3b: los ajustes de la instalación viven en system_settings (072)", (
     });
   });
 });
+
+/* ==========================================================================
+   F11: la cadencia se VE (pestañas por cadencia, fila que la nombra y el
+   ciclo recortado declarado).
+
+   Estas pruebas fijan el DERIVADO, no el render: la vista es cliente de estas
+   funciones puras, así que lo que se prueba acá es exactamente lo que la vista
+   dibuja. La FORMA del marcado se fija más abajo, en la guarda de fuente.
+   ========================================================================== */
+describe("payroll: el filtro por cadencia y el ciclo recortado (F11, funciones puras)", () => {
+  const semanal = { id: "s", start_date: "2026-09-01", end_date: "2026-09-07", frequency: "semanal" };
+  const quincenal = { id: "q", start_date: "2026-09-06", end_date: "2026-09-19", frequency: "quincenal" };
+  const mensual = { id: "m", start_date: "2026-09-06", end_date: "2026-10-03", frequency: "mensual" };
+  // Período HEREDADO: `frequency` NULL, de antes de que la cadencia existiera.
+  const heredado = { id: "h", start_date: "2026-08-01", end_date: "2026-08-31", frequency: null };
+
+  it("una cadencia SIN períodos no recibe pestaña: es el espacio visual que se recupera", () => {
+    // El dueño: «si aún no le pagué a un quincenal y no le toca, para qué hacer
+    // que se vea ocupando espacio visual».
+    expect(periodCadenceFilterOptions([quincenal, mensual])).toEqual([
+      "todas",
+      "quincenal",
+      "mensual",
+    ]);
+    expect(periodCadenceFilterOptions([quincenal])).toEqual(["todas", "quincenal"]);
+    // Sin períodos tampoco hay juego de pestañas que dibujar: sólo el cajón total.
+    expect(periodCadenceFilterOptions([])).toEqual(["todas"]);
+    // El quincenal y el mensual VENCEN JUNTOS (28 es múltiplo de 14): el caso
+    // para el que existe este filtro es el de siempre, no el raro.
+    expect(periodCadenceFilterOptions([mensual, quincenal]).indexOf("semanal")).toBe(-1);
+  });
+
+  it("el orden es el CANÓNICO del catálogo, no el de la lista", () => {
+    // Desordenado a propósito y con el cajón heredado en medio: las pestañas se
+    // leen siempre en el mismo orden, se agreguen las filas como se agreguen.
+    expect(periodCadenceFilterOptions([mensual, heredado, quincenal, semanal])).toEqual([
+      "todas",
+      "semanal",
+      "quincenal",
+      "mensual",
+      "",
+    ]);
+  });
+
+  it("un período heredado (frequency NULL) cae en SU PROPIO cajón", () => {
+    // El cubo es el de `periodCadenceBucket` (`coalesce(frequency, '')`), la MISMA
+    // regla de la restricción de solape: no se escribe una segunda.
+    expect(periodCadenceFilterOptions([quincenal, heredado])).toEqual(["todas", "quincenal", ""]);
+    expect(filterPeriodsByCadence([quincenal, heredado], "").map((row) => row.id)).toEqual(["h"]);
+    // Control negativo: la cadena vacía NO es una cuarta cadencia.
+    expect(filterPeriodsByCadence([quincenal, heredado], "quincenal").map((row) => row.id)).toEqual([
+      "q",
+    ]);
+  });
+
+  it("filtrar por una cadencia devuelve exactamente su cajón, sin dejar la pestaña vacía", () => {
+    const periods = [semanal, quincenal, mensual, heredado];
+    expect(filterPeriodsByCadence(periods, "todas").map((row) => row.id)).toEqual(["s", "q", "m", "h"]);
+    expect(filterPeriodsByCadence(periods, "mensual").map((row) => row.id)).toEqual(["m"]);
+    // Toda pestaña derivada de las opciones devuelve algo: el filtro no puede
+    // quedar vacío por construcción, porque comparte el cubo con las opciones.
+    for (const option of periodCadenceFilterOptions(periods)) {
+      expect(filterPeriodsByCadence(periods, option).length, option).toBeGreaterThan(0);
+    }
+    // Control negativo: no muta la lista recibida.
+    expect(periods).toHaveLength(4);
+  });
+
+  it("una cadencia ausente tiene etiqueta legible, nunca cadena vacía", () => {
+    // Un período heredado dibujaba «1–31 ago» sin decir de qué cadencia era: el
+    // vacío era indistinguible de un bug de formato.
+    expect(periodCadenceLabel("mensual")).toBe("Mensual");
+    expect(periodCadenceLabel(null)).toBe("Sin cadencia");
+    expect(periodCadenceLabel(undefined)).toBe("Sin cadencia");
+    expect(periodCadenceFilterLabel("todas")).toBe("Todas");
+    expect(periodCadenceFilterLabel("")).toBe("Sin cadencia");
+    expect(periodCadenceFilterLabel("quincenal")).toBe("Quincenal");
+    // El cajón heredado necesita nombre propio como clave de React, aunque su
+    // VALOR siga siendo la cadena vacía (el cubo que fija `periodCadenceBucket`).
+    expect(periodCadenceTabKey("")).toBe("sin-cadencia");
+    expect(periodCadenceTabKey("todas")).toBe("todas");
+    expect(periodCadenceTabKey("mensual")).toBe("mensual");
+  });
+
+  it("el detector de ciclo recortado acierta con un mensual de 7 días y NO con uno completo", () => {
+    // El primer mensual tras un arranque de nómina a mitad de ciclo: 7 de 28.
+    const recortado = payrollTrimmedCycle({
+      frequency: "mensual",
+      startDate: "2026-09-22",
+      endDate: "2026-09-28",
+    });
+    expect(recortado.trimmed).toBe(true);
+    expect(recortado.days).toBe(7);
+    expect(recortado.cycleDays).toBe(28);
+
+    // CONTROL NEGATIVO 1: el ciclo completo NO está recortado (misma cadencia,
+    // 28 de 28). Si esto dijera `true`, la nota aparecería en cada período.
+    const completo = payrollTrimmedCycle({
+      frequency: "mensual",
+      startDate: "2026-09-01",
+      endDate: "2026-09-28",
+    });
+    expect(completo.trimmed).toBe(false);
+    expect(completo.days).toBe(28);
+
+    // CONTROL NEGATIVO 2: sin cadencia no hay ciclo contra el cual recortar, así
+    // que el detector no inventa un recorte.
+    expect(
+      payrollTrimmedCycle({ frequency: null, startDate: "2026-09-22", endDate: "2026-09-28" }).trimmed,
+    ).toBe(false);
+
+    // CONTROL NEGATIVO 3: un rango ilegible no inventa días ni recorte.
+    const ilegible = payrollTrimmedCycle({ frequency: "mensual", startDate: "", endDate: "" });
+    expect(ilegible.trimmed).toBe(false);
+    expect(ilegible.days).toBeNull();
+
+    // Los días del ciclo salen de la MISMA tabla que usa el resto del módulo:
+    // un quincenal son 14 días naturales, no 15 comerciales.
+    expect(
+      payrollTrimmedCycle({ frequency: "quincenal", startDate: "2026-09-01", endDate: "2026-09-14" })
+        .cycleDays,
+    ).toBe(14);
+  });
+});
+
+/* ==========================================================================
+   F11: guardas de FUENTE de la vista.
+
+   Lo que estas guardas fijan es la FORMA del código —qué primitiva se usa, qué
+   expresión se escribe y qué texto NO puede reaparecer—, NO el resultado
+   renderizado en un navegador. Lo que se dibuja de verdad está cubierto por las
+   funciones puras de arriba; estas son la red que impide que la vista vuelva a
+   la fila sin cadencia o al rango ISO pelado.
+   ========================================================================== */
+describe("payroll-client: cada período dice su cadencia (F11, guarda de fuente)", () => {
+  const source = readFileSync(join(process.cwd(), "app", "payroll", "payroll-client.tsx"), "utf8");
+  /** Compara sobre el código con los espacios normalizados (ajuste de línea). */
+  const plano = (texto: string): string => texto.replace(/\s+/g, " ");
+
+  it("la fila principal usa la etiqueta de fecha y ya no imprime el rango ISO pelado", () => {
+    // El defecto medido: `{row.start_date} → {row.end_date}` deja tres filas
+    // idénticas cuando tres períodos comparten rango.
+    expect(source).not.toContain("{row.start_date} → {row.end_date}");
+    expect(source).toContain("{formatPeriodLabel(row)}");
+  });
+
+  it("los DOS listados de períodos nombran la cadencia de cada fila", () => {
+    // El de la pantalla y el del diálogo de apertura: son las dos listas por las
+    // que el dueño recorre los períodos.
+    const marcados = source.match(/periodCadenceLabel\(row\.frequency\)/g) ?? [];
+    expect(marcados).toHaveLength(2);
+  });
+
+  it("el filtro de cadencia usa la PRIMITIVA de pestañas, no un tablist a medias", () => {
+    // Un `role="tablist"` escrito a mano promete un contrato que nadie cumple
+    // (sin panel, sin `aria-controls`, sin `tabIndex` rotativo). La primitiva
+    // obliga a emitir el par pestaña/panel.
+    expect(source).toMatch(
+      /import \{[^}]*\bTabs\b[^}]*\} from "@\/src\/components\/ui\/lib\/tabs"/,
+    );
+    expect(source).toContain("<TabsList>");
+    expect(source).toContain("<TabsTrigger");
+    expect(source).toContain("<TabsPanel");
+    expect(source).not.toMatch(/role="tablist"/);
+    expect(source).not.toMatch(/role="tab"/);
+  });
+  it("la pestaña inicial se DERIVA del pendiente, no es un default guardado", () => {
+    // En el primer render el usuario no eligió nada: el estado nace en `null` y
+    // se resuelve. Un default guardado en `useState` quedaría viejo apenas
+    // cambia el pendiente.
+    expect(source).toContain(
+      "const [cadenceChoice, setCadenceChoice] = useState<PeriodCadenceFilter | null>(null);",
+    );
+    expect(plano(source)).toContain('cadenceChoice ?? pendingSettlements[0]?.frequency ?? "todas"');
+    // Las pestañas se derivan de los períodos SIN filtrar por estado, para que el
+    // juego no desaparezca cuando el filtro de estado vacía la lista.
+    expect(source).toContain("periodCadenceFilterOptions(periods)");
+    expect(source).not.toContain("periodCadenceFilterOptions(visiblePeriods)");
+    // Y el filtro de cadencia se aplica JUNTO al de estado, no en su lugar.
+    expect(plano(source)).toContain(
+      "const visiblePeriods = filterPeriodsByCadence( statusFilter === \"todos\" ? periods : periods.filter((row) => row.status === statusFilter), cadenceFilter, );",
+    );
+  });
+
+  it("el aviso dice que cada cadencia se liquida por separado, y declara el ciclo recortado", () => {
+    // T5A: el dueño leyó las dos entradas como el mismo período repetido.
+    expect(plano(source)).toContain("Cada cadencia se liquida por su lado");
+    expect(plano(source)).toContain("no son el mismo período repetido");
+    // T5B: el primer mensual paga 7 de 28 y se lee como error de cálculo. Los
+    // días salen del helper puro; en el cliente no hay un 7 ni un 28 escritos.
+    expect(source).toContain("payrollTrimmedCycle({");
+    expect(source).toContain("trimmedCycleNote(entry)");
+    expect(source).not.toMatch(/de 28 días/);
+  });
+});
+

@@ -35,6 +35,7 @@ import {
   buildPayrollEmployeeIndex,
   cycleDaysForFrequency,
   detailLineCommissionOrigin,
+  filterPeriodsByCadence,
   groupPayrollPeriodsByMonth,
   isPayrollCycleSettled,
   isRangeBeforePayrollStart,
@@ -46,8 +47,13 @@ import {
   payrollHistoryFloor,
   payrollMonthLabel,
   payrollPeriodCountLabel,
+  payrollTrimmedCycle,
   pendingPayrollSettlements,
   periodCadenceBucket,
+  periodCadenceFilterLabel,
+  periodCadenceFilterOptions,
+  periodCadenceLabel,
+  periodCadenceTabKey,
   periodRangeDays,
   resolveOpenPayrollRange,
   roundMoney,
@@ -60,6 +66,7 @@ import {
   type PayrollMonthEmployeeRow,
   type PayrollMonthGroup,
   type PendingPayrollSettlement,
+  type PeriodCadenceFilter,
 } from "@/src/features/payroll/schemas";
 import type { EmployeeRow, PaymentMethodRow } from "@/src/features/admin/service";
 import {
@@ -74,6 +81,7 @@ import { cn } from "@/src/components/ui/lib/utils";
 import { DataTable } from "@/src/components/ui/lib/data-table";
 import { Alert } from "@/src/components/ui/lib/alert";
 import { Badge } from "@/src/components/ui/lib/badge";
+import { Tabs, TabsList, TabsPanel, TabsTrigger } from "@/src/components/ui/lib/tabs";
 import {
   buttonClass,
   ghostClass,
@@ -266,6 +274,28 @@ function pendingSettlementText(entry: PendingPayrollSettlement): string {
       ? `${entry.employeeNames.join(", ")} y ${extra} más`
       : entry.employeeNames.join(", ");
   return `Falta liquidar el ciclo ${entry.frequency} ${entry.label} (${employees}: ${who}).`;
+}
+
+/**
+ * F11/T5B: la frase del CICLO RECORTADO, o `null` cuando el ciclo es completo.
+ * El primer ciclo de cada cadencia se recorta al arranque de la nómina, así que
+ * el primer mensual paga 7 de sus 28 días: sin decirlo, el dueño lo lee como un
+ * error de cálculo. Los dos números salen de `payrollTrimmedCycle` —que los
+ * toma de las mismas tablas que el resto del módulo—, así que acá no hay un 7
+ * ni un 28 escritos a mano.
+ *
+ * Se muestra al lado de la ENTRADA pendiente, que es donde el ciclo recortado
+ * se lista de verdad: el estado vacío del diálogo ya explica el recorte una vez
+ * y no hace falta repetirlo en cada fila.
+ */
+function trimmedCycleNote(entry: PendingPayrollSettlement): string | null {
+  const cycle = payrollTrimmedCycle({
+    frequency: entry.frequency,
+    startDate: entry.start_date,
+    endDate: entry.end_date,
+  });
+  if (!cycle.trimmed || cycle.days === null || cycle.cycleDays === null) return null;
+  return `Primer ciclo recortado: paga ${cycle.days} de ${cycle.cycleDays} días del ciclo ${entry.frequency}, porque la nómina arrancó dentro del rango.`;
 }
 
 /**
@@ -1184,6 +1214,15 @@ export function PayrollClient(props: PayrollClientProps) {
   );
   // Filtro de estado de la lista de períodos.
   const [statusFilter, setStatusFilter] = useState<string>("todos");
+  /**
+   * F11: la cadencia ELEGIDA es estado del usuario y arranca en `null` —en el
+   * primer render no eligió nadie—. Lo que se ve lo resuelve el ciclo
+   * pendiente (abajo, ya derivados los avisos): meter `pendingSettlements`
+   * adentro de un `useState` guardaría un default que queda viejo en cuanto
+   * cambia el pendiente, y `null` deja el filtro de cadencia DERIVADO de las
+   * props en cada render.
+   */
+  const [cadenceChoice, setCadenceChoice] = useState<PeriodCadenceFilter | null>(null);
   // PA3 (consulta puntual): "pagos del mes por empleado" NO llega leído del
   // servidor. El formulario guarda lo ELEGIDO y `monthQuery` lo ÚLTIMO
   // consultado con su resultado; `null` es el estado previo a la consulta, que
@@ -2121,13 +2160,10 @@ export function PayrollClient(props: PayrollClientProps) {
   };
 
   /**
-   * PA3: la lista se filtra por estado y se agrupa por mes, para que un mes con
-   * muchos pagos sea navegable. El conteo se lee SIEMPRE contra el total.
+   * PA3: el filtro de estado de la lista de períodos. El conteo se lee SIEMPRE
+   * contra el total.
    */
   const statusOptions = [...new Set(periods.map((row) => row.status))].sort();
-  const visiblePeriods =
-    statusFilter === "todos" ? periods : periods.filter((row) => row.status === statusFilter);
-  const periodGroups = groupPayrollPeriodsByMonth(visiblePeriods);
 
   /**
    * F9: los ciclos ya CERRADOS que sigue sin liquidar la sede, por cadencia (el
@@ -2150,6 +2186,114 @@ export function PayrollClient(props: PayrollClientProps) {
         referenceDate: bogotaDay(),
       })
     : [];
+
+  /**
+   * F11: el filtro de CADENCIA. Las pestañas se derivan de los períodos
+   * **sin filtrar por estado**: si salieran de la lista ya recortada, elegir un
+   * estado sin períodos abiertos borraría el juego de pestañas y dejaría al
+   * usuario sin forma de volver a "todas". Una cadencia que no aparece NO
+   * recibe pestaña (`periodCadenceFilterOptions`), y el filtro comparte su
+   * MISMO cubo, así que una pestaña no puede quedar vacía por construcción.
+   *
+   * La pestaña inicial se DERIVA y no se guarda: `null` = el usuario no eligió
+   * nada todavía, así que se resuelve contra el ciclo pendiente más atrasado
+   * (el que hay que liquidar primero) y, sin pendientes, contra "todas". Se
+   * acota a las opciones EXISTENTES porque un pendiente de una cadencia que
+   * todavía no tiene períodos no tendría pestaña donde aparecer.
+   */
+  const cadenceOptions = periodCadenceFilterOptions(periods);
+  const preferredCadence: PeriodCadenceFilter =
+    cadenceChoice ?? pendingSettlements[0]?.frequency ?? "todas";
+  const cadenceFilter: PeriodCadenceFilter = cadenceOptions.includes(preferredCadence)
+    ? preferredCadence
+    : "todas";
+
+  /**
+   * PA3: la lista se filtra por estado Y por cadencia, y se agrupa por mes, para
+   * que un mes con muchos pagos sea navegable. El conteo se lee SIEMPRE contra
+   * el total.
+   */
+  const visiblePeriods = filterPeriodsByCadence(
+    statusFilter === "todos" ? periods : periods.filter((row) => row.status === statusFilter),
+    cadenceFilter,
+  );
+
+  /**
+   * F11: por qué la lista quedó vacía. Con dos filtros hay que NOMBRAR los dos,
+   * o el usuario ve un vacío sin salida y no sabe cuál de sus dos elecciones
+   * lo produjo.
+   */
+  function emptyPeriodListText(): string {
+    if (periods.length === 0) return "Sin periodos todavía.";
+    if (statusFilter !== "todos" && cadenceFilter !== "todas") {
+      return `Ningún período con estado ${statusFilter} en la cadencia ${periodCadenceFilterLabel(cadenceFilter)}.`;
+    }
+    if (statusFilter !== "todos") return `Ningún período con estado ${statusFilter}.`;
+    return `Ningún período en la cadencia ${periodCadenceFilterLabel(cadenceFilter)}.`;
+  }
+
+  /**
+   * F11: los grupos por mes de UNA lista de períodos, con su vacío. Es un solo
+   * lugar con el marcado para que las cuatro pestañas no puedan desincronizarse
+   * entre sí (copiarlo cuatro veces es como vuelve la fila sin cadencia).
+   * Devuelve JSX y no es un componente: un componente declarado adentro del
+   * cliente sería un tipo NUEVO en cada render y remontaría la lista entera.
+   */
+  function renderPeriodList(rows: PayrollPeriodRow[]): ReactNode {
+    return (
+      <>
+        {groupPayrollPeriodsByMonth(rows).map((group) => {
+          const totals = groupTotals(group);
+          return (
+            <div key={group.month || "sin-mes"} className="mt-4">
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <h3 className="text-sm font-semibold text-text-primary">
+                  {group.month ? payrollMonthLabel(group.month) : "Sin mes determinable"}
+                </h3>
+                {props.canAdmin && (
+                  <p className="text-xs text-text-tertiary">
+                    {group.periods.length === 1 ? "1 período" : `${group.periods.length} períodos`}
+                    {totals
+                      ? ` · Neto ${formatMoney(totals.net)} · Pagado ${formatMoney(totals.paid)} · Saldo ${formatMoney(totals.remaining)}`
+                      : " · Totales parciales: abra los períodos sin resumen."}
+                  </p>
+                )}
+              </div>
+              <ul className="mt-2 flex flex-col gap-2">
+                {group.periods.map((row) => (
+                  <li key={row.id} className="flex flex-wrap items-center gap-3 text-sm">
+                    <button
+                      type="button"
+                      onClick={() => loadDetail(row.id)}
+                      disabled={isViewPending}
+                      aria-current={row.id === selectedId ? "true" : undefined}
+                      className={ghostClass}
+                    >
+                      {formatPeriodLabel(row)}
+                    </button>
+                    {/* F11: la CADENCIA de la fila. Antes sólo se veían las
+                        fechas, y tres períodos del mismo rango (el quincenal y
+                        el mensual cierran juntos) eran tres filas idénticas. */}
+                    <span className="text-xs text-text-secondary">
+                      {periodCadenceLabel(row.frequency)}
+                    </span>
+                    <Badge variant="secondary">{row.status}</Badge>
+                    {props.canAdmin && (
+                      <span className="text-xs text-text-secondary">{periodSummaryText(row)}</span>
+                    )}
+                    {row.status === "cerrado" && row.closed_at && (
+                      <span className="text-xs text-text-tertiary">Cerrado: {new Date(row.closed_at).toLocaleString("es-CO")}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          );
+        })}
+        {rows.length === 0 && <p className="mt-3 text-sm text-text-tertiary">{emptyPeriodListText()}</p>}
+      </>
+    );
+  }
 
   /**
    * Totales de un mes: SÓLO si TODOS sus períodos tienen resumen. Con uno sin
@@ -2289,9 +2433,28 @@ export function PayrollClient(props: PayrollClientProps) {
                   >
                     {pendingSettlementText(entry)}
                   </button>
+                  {/* F11/T5B: aquí es donde el ciclo recortado REALMENTE se
+                      lista, así que es aquí donde se declara. El estado vacío
+                      del diálogo ya lo explica una vez; repetirlo en cada fila
+                      sería ruido. Los días salen del helper puro: un mensual
+                      puede pagar 7 de 28 y sin esta frase se lee como un error
+                      de cálculo. */}
+                  {trimmedCycleNote(entry) !== null && (
+                    <span className="block text-xs text-text-tertiary">
+                      {trimmedCycleNote(entry)}
+                    </span>
+                  )}
                 </li>
               ))}
             </ul>
+            {/* F11/T5A: la confusión real del dueño fue leer estas dos entradas
+                como el mismo período repetido. No lo son: cada cadencia se
+                liquida por su lado porque son poblaciones distintas. */}
+            <p className="mt-1">
+              Cada cadencia se liquida por su lado: un ciclo paga a los empleados que cobran con
+              esa cadencia y a nadie más, así que liquidar uno no paga el otro. Varias entradas no
+              son el mismo período repetido, son cadencias distintas que vencen a la vez.
+            </p>
             <p className="mt-1">
               Cada uno abre el diálogo con su ciclo ya elegido y listo para liquidarlo: el rango
               sale del ciclo y del arranque de la nómina.
@@ -2302,7 +2465,10 @@ export function PayrollClient(props: PayrollClientProps) {
           <p className="mt-2 text-sm text-text-secondary">
             {/* PA3: el conteo se lee SIEMPRE contra el total (la lista se
                 recortaba en 20 sin decirlo) y el resumen de cada período evita
-                tener que abrirlo para saber cuánto hay y a cuántos empleados. */}
+                tener que abrirlo para saber cuánto hay y a cuántos empleados.
+                F11: `shown` son los períodos que quedan con los DOS filtros
+                (estado y cadencia), así que el rótulo nombra lo que de verdad
+                se está viendo. */}
             {payrollPeriodCountLabel({ total: periods.length, shown: visiblePeriods.length })}
           </p>
         )}
@@ -2339,56 +2505,36 @@ export function PayrollClient(props: PayrollClientProps) {
             Abrir período
           </button>
         )}
-        {/* PA3: agrupados por mes, el más reciente primero, para que un mes con
-            muchos pagos se pueda recorrer sin perder de vista los totales. */}
-        {periodGroups.map((group) => {
-          const totals = groupTotals(group);
-          return (
-            <div key={group.month || "sin-mes"} className="mt-4">
-              <div className="flex flex-wrap items-baseline justify-between gap-2">
-                <h3 className="text-sm font-semibold text-text-primary">
-                  {group.month ? payrollMonthLabel(group.month) : "Sin mes determinable"}
-                </h3>
-                {props.canAdmin && (
-                  <p className="text-xs text-text-tertiary">
-                    {group.periods.length === 1 ? "1 período" : `${group.periods.length} períodos`}
-                    {totals
-                      ? ` · Neto ${formatMoney(totals.net)} · Pagado ${formatMoney(totals.paid)} · Saldo ${formatMoney(totals.remaining)}`
-                      : " · Totales parciales: abra los períodos sin resumen."}
-                  </p>
-                )}
-              </div>
-              <ul className="mt-2 flex flex-col gap-2">
-                {group.periods.map((row) => (
-                  <li key={row.id} className="flex flex-wrap items-center gap-3 text-sm">
-                    <button
-                      type="button"
-                      onClick={() => loadDetail(row.id)}
-                      disabled={isViewPending}
-                      aria-current={row.id === selectedId ? "true" : undefined}
-                      className={ghostClass}
-                    >
-                      {row.start_date} → {row.end_date}
-                    </button>
-                    <Badge variant="secondary">{row.status}</Badge>
-                    {props.canAdmin && (
-                      <span className="text-xs text-text-secondary">{periodSummaryText(row)}</span>
-                    )}
-                    {row.status === "cerrado" && row.closed_at && (
-                      <span className="text-xs text-text-tertiary">Cerrado: {new Date(row.closed_at).toLocaleString("es-CO")}</span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          );
-        })}
-        {visiblePeriods.length === 0 && (
-          <p className="mt-3 text-sm text-text-tertiary">
-            {periods.length === 0
-              ? "Sin periodos todavía."
-              : `Ningún período con estado ${statusFilter}.`}
-          </p>
+        {/*
+          F11: la lista de períodos, POR CADENCIA. Se usa la primitiva de
+          pestañas y no un tablist escrito a mano: un contrato ARIA a medias
+          (pestañas sin panel, sin `aria-controls`, sin `tabIndex` rotativo)
+          promete más de lo que cumple. Con un solo cajón no hay nada que
+          elegir y no se dibuja el control. Cada panel pinta la MISMA lista por
+          el mismo helper: el marcado vive en un solo lugar.
+        */}
+        {cadenceOptions.length > 1 ? (
+          <Tabs
+            value={cadenceFilter}
+            onValueChange={(next) => setCadenceChoice(next as PeriodCadenceFilter)}
+            label="Períodos por cadencia"
+            className="mt-3 gap-3"
+          >
+            <TabsList>
+              {cadenceOptions.map((option) => (
+                <TabsTrigger key={periodCadenceTabKey(option)} value={option}>
+                  {periodCadenceFilterLabel(option)}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+            {cadenceOptions.map((option) => (
+              <TabsPanel key={periodCadenceTabKey(option)} value={option}>
+                {renderPeriodList(filterPeriodsByCadence(visiblePeriods, option))}
+              </TabsPanel>
+            ))}
+          </Tabs>
+        ) : (
+          renderPeriodList(visiblePeriods)
         )}
       </section>
 
@@ -2968,7 +3114,15 @@ export function PayrollClient(props: PayrollClientProps) {
                     <ul className="mt-1 flex flex-col gap-1">
                       {periods.slice(0, PERIOD_VISIBLE_LIMIT).map((row) => (
                         <li key={row.id} className="flex items-center justify-between gap-3">
-                          <span>{formatPeriodLabel(row)}</span>
+                          <span className="flex items-center gap-2">
+                            <span>{formatPeriodLabel(row)}</span>
+                            {/* F11: también acá la cadencia. Tres períodos del
+                                mismo rango son tres filas iguales si nadie dice
+                                de qué cadencia es cada uno. */}
+                            <span className="text-xs text-text-secondary">
+                              {periodCadenceLabel(row.frequency)}
+                            </span>
+                          </span>
                           <span className="text-xs text-text-tertiary">{row.status}</span>
                         </li>
                       ))}
