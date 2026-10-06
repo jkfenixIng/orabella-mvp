@@ -132,10 +132,35 @@ dueño no pidió. Queda escrito en `mem_save` por si aparece la necesidad.
   `CREATE INDEX` ni demostrar que el `23505` desaparezca: los tests de servicio stubbean PostgREST.
   Lo que el test afirma es la FORMA de la declaración en el `.sql`. La prueba funcional la hace el
   dueño con las consultas de sólo lectura del pie de la 078.
-- [ ] **T4** — Pestañas por cadencia + la cadencia rotulada en cada fila, en la lista principal y en
+- [x] **T4** — Pestañas por cadencia + la cadencia rotulada en cada fila, en la lista principal y en
   el diálogo. La lista deja de mostrar fechas ISO crudas.
-- [ ] **T5** — Copy: el primer ciclo recortado se explica, y el aviso de pendientes dice que cada
+  **HECHO** — commit `b3fb001`, con T5. Funciones puras en `payroll/schemas.ts`:
+  `periodCadenceFilterOptions` (una cadencia sin períodos **no recibe pestaña**), `filterPeriodsByCadence`,
+  `periodCadenceLabel`, `periodCadenceFilterLabel`, `periodCadenceTabKey`. Reutilizan
+  `periodCadenceBucket`: no hay una segunda regla del cubo.
+
+  **Un agujero de la especificación que encontró el writer.** La expresión pedida
+  `cadenceChoice ?? pendingSettlements[0]?.frequency ?? "todas"` **falla en un caso real**: el pendiente
+  puede ser de una cadencia que todavía no tiene ningún período —el primer ciclo se ofrece recortado
+  antes de que exista un período de esa cadencia—, y entonces el juego no dibuja ni disparador activo
+  ni panel. Quedó acotada con `cadenceOptions.includes(preferida) ? preferida : "todas"`.
+
+  Otra decisión con motivo: `renderPeriodList` devuelve JSX en vez de ser un componente, porque un
+  componente declarado adentro de `PayrollClient` es un tipo nuevo en cada render y remontaría la
+  lista entera.
+
+- [x] **T5** — Copy: el primer ciclo recortado se explica, y el aviso de pendientes dice que cada
   cadencia es un grupo aparte que se liquida por separado.
+  **HECHO** — commit `b3fb001`. `payrollTrimmedCycle({ frequency, startDate, endDate })` devuelve las
+  **partes** (`trimmed`, `days`, `cycleDays`), no la frase, y no hay ningún 7 ni 28 escrito a mano.
+
+**Compuerta de cierre (corrida por el orquestador, no por un writer)**: `npx vitest run` →
+**48 archivos / 2391 pruebas verdes** (eran 2336), `tsc --noEmit` limpio, `eslint` limpio sobre los
+archivos tocados.
+
+**Sin verificar: el navegador.** Las cinco guardas nuevas de `tests/payroll.test.ts` fijan la FORMA
+del código —qué primitiva se importa, qué expresión se escribe, qué texto no puede reaparecer—, no
+el DOM renderizado. Nadie miró esta pantalla en un viewport real.
 
 ## Fuera de mis manos
 
