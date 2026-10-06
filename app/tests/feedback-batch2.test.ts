@@ -682,13 +682,24 @@ describe("nómina: el texto visible no cambió (cambia el canal, no la copia)", 
       "Indique el rango del período.",
       "La fecha final no puede ser anterior a la inicial.",
       "Ajuste las fechas.",
-      "Aún no hay empleados en la sede: créelos en /admin antes de liquidar.",
+      "Aún no hay empleados en la instalación: créelos en /admin antes de liquidar.",
       "Sin periodos todavía.",
       "Sin períodos todavía: este será el primero.",
     ]) {
       expect(PAYROLL_CLIENT_CODE, `cliente: ${text}`).toContain(text);
     }
     expect(PAYROLL_PAGE_CODE, "página: sede").toContain("El usuario no tiene sede asignada.");
+
+    // U15: la instalación es de UNA sede y su palabra es «instalación» (decisión
+    // del dueño, 2026-10-04). Este vacío nombra la planta, y `fetchEmployees`
+    // (`admin/service.ts`) la lee ENTERA, sin predicado de sede: «en la sede»
+    // nombraba un alcance que la consulta no aplica. Es la misma corrección que
+    // ya recibió el vacío gemelo de admin (`employees-section.tsx`: «Aún no hay
+    // empleados en la instalación.»).
+    //
+    // CONTROL NEGATIVO: la forma vieja no sobrevive en ninguna parte del
+    // cliente, ni como texto ni dentro de otra frase.
+    expect(PAYROLL_CLIENT_CODE).not.toContain("Aún no hay empleados en la sede");
   });
 
   it("no se reescribió la copia (control negativo del 'contiene')", () => {
@@ -699,7 +710,7 @@ describe("nómina: el texto visible no cambió (cambia el canal, no la copia)", 
 
   it("los tres vacíos del módulo siguen siendo texto plano, no avisos", () => {
     for (const text of [
-      "Aún no hay empleados en la sede: créelos en /admin antes de liquidar.",
+      "Aún no hay empleados en la instalación: créelos en /admin antes de liquidar.",
       "Sin periodos todavía.",
       "Sin períodos todavía: este será el primero.",
     ]) {

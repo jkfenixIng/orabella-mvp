@@ -316,7 +316,7 @@ function FixedBasisNote({ start, end }: { start: string; end: string }) {
       {days === 1 ? "día" : "días"} del período ({start} a {end}) es el máximo que se paga por
       ellos; si el período cruza el fin de mes, el sueldo se prorratea en los dos meses. Las
       comisiones y los bonos van aparte, encima del fijo; los mismos días no se pueden nominar
-      en otro período de la sede.
+      en otro período de la instalación.
     </p>
   );
 }
@@ -2309,7 +2309,7 @@ export function PayrollClient(props: PayrollClientProps) {
         {props.canAdmin && props.initialEmployees.length === 0 && (
           // VACÍO: no es un aviso, es el estado base de la sede sin planta.
           <p className="mt-2 text-sm text-text-secondary">
-            Aún no hay empleados en la sede: créelos en /admin antes de liquidar.
+            Aún no hay empleados en la instalación: créelos en /admin antes de liquidar.
           </p>
         )}
         {props.canAdmin && (
