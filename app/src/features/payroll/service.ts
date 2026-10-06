@@ -774,10 +774,17 @@ export async function openPayrollPeriod(
       (row) =>
         periodCadenceBucket(row.frequency) === requestedBucket && rangesOverlap(row, requested),
     );
+    // F10: el remedio que estos rechazos nominan es el ÚNICO que el diálogo
+    // deja —elegir otro ciclo—, el mismo que dice la copia del cliente: el
+    // rango sale del ciclo elegido, así que no hay fechas que ajustar (ni
+    // selector de cadencia) y una instrucción de ese tipo mandaría a tocar
+    // algo que ya no existe. El dato concreto —el rango derivado, el período
+    // que estorba con su estado y por qué el cruce está prohibido— no se
+    // pierde; lo que cambia es dónde está la salida.
     if (clash) {
       throw new PayrollError(
         "PERIOD_OVERLAP",
-        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${clash.start_date} a ${clash.end_date} (${clash.status}) de la instalación. Un día se nomina una sola vez: ajuste las fechas para que no se crucen con un período existente.`,
+        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${clash.start_date} a ${clash.end_date} (${clash.status}) de la instalación. Un día se nomina una sola vez. Elija otro ciclo que no se cruce con un período existente.`,
         409,
       );
     }
@@ -795,7 +802,7 @@ export async function openPayrollPeriod(
     if (legacyClash) {
       throw new PayrollError(
         "PERIOD_OVERLAP",
-        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${legacyClash.start_date} a ${legacyClash.end_date} (${legacyClash.status}) de la instalación, que no tiene cadencia: ese período heredado pagó el fijo a todo el plantel, así que abrir este rango pagaría dos veces los mismos días. Ajuste las fechas para que no se crucen.`,
+        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${legacyClash.start_date} a ${legacyClash.end_date} (${legacyClash.status}) de la instalación, que no tiene cadencia: ese período heredado pagó el fijo a todo el plantel, así que abrir este rango pagaría dos veces los mismos días. Elija otro ciclo que no se cruce con ese período.`,
         409,
       );
     }
@@ -831,7 +838,7 @@ export async function openPayrollPeriod(
       if ((error as { code?: string }).code === "23P01") {
         throw new PayrollError(
           "PERIOD_OVERLAP",
-          "Otro período quedó con días en común mientras se abría este. Un día se nomina una sola vez: revise los períodos existentes y ajuste las fechas.",
+          "Otro período quedó con días en común mientras se abría este. Un día se nomina una sola vez. Elija otro ciclo.",
           409,
         );
       }

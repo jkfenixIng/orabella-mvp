@@ -6219,6 +6219,84 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     );
     expect((failure as PayrollError).message).not.toContain("sede");
   });
+
+  it("el rechazo por solape nombra el remedio REAL: otro ciclo, no ajustar fechas", async () => {
+    // El diálogo "Abrir período" no escribe fechas ni elige cadencia: el rango
+    // sale del ciclo elegido —y, en la primera liquidación, del día declarado
+    // recortado—. «Ajuste las fechas» mandaba a tocar un campo que ya no existe,
+    // y este texto llega a la pantalla por `${result.code}: ${result.message}`
+    // (el `openError` del diálogo), así que era el remedio que la persona leía
+    // de verdad. El del servidor dice lo mismo que el del cliente —«Elija otro
+    // ciclo»— conservando el dato concreto que cada rechazo ya cargaba.
+    seedPeriods([periodRow("periodo-1", "2026-08-01", "2026-09-30", "borrador", payrollPagedStub.SEDE_ID, "semanal")]);
+
+    const solape: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-05" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(solape).toBeInstanceOf(PayrollError);
+    expect(solape).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
+    const message = (solape as PayrollError).message;
+    // El dato que el rechazo ya cargaba NO se pierde: rango derivado del
+    // ciclo, período que estorba con su estado, alcance y la razón de fondo.
+    expect(message).toContain("2026-08-30 a 2026-09-05");
+    expect(message).toContain("2026-08-01 a 2026-09-30");
+    expect(message).toContain("(borrador)");
+    expect(message).toContain("de la instalación.");
+    expect(message).toContain("Un día se nomina una sola vez");
+    // Y el remedio es el ÚNICO que el diálogo deja: otro ciclo.
+    expect(message).toContain("Elija otro ciclo");
+    expect(message).not.toContain("las fechas");
+
+    // Mismo servicio, mismo remedio en el rechazo del HEREDADO sin cadencia.
+    seedPeriods([periodRow("periodo-heredado", "2026-08-30", "2026-09-05")]);
+
+    const heredado: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-05" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(heredado).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
+    expect((heredado as PayrollError).message).toContain("Elija otro ciclo");
+    expect((heredado as PayrollError).message).not.toContain("las fechas");
+
+    // Y en la CARRERA perdida (23P01), que es el mismo error de negocio: mismo
+    // remedio, sin prometer una revisión que el diálogo tampoco ofrece.
+    seedPeriods([]);
+    payrollPagedStub.insertError = { table: "payroll_periods", code: "23P01" };
+
+    const carrera: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-12", declared_start_date: "2026-09-06" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(carrera).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
+    expect((carrera as PayrollError).message).toContain(
+      "Otro período quedó con días en común mientras se abría este.",
+    );
+    expect((carrera as PayrollError).message).toContain("Elija otro ciclo");
+    expect((carrera as PayrollError).message).not.toContain("las fechas");
+
+    // CONTROL NEGATIVO, acotado a ESTOS mensajes: la orden de ajustar fechas no
+    // sobrevive en el módulo. No es un `not.toContain("fechas")` a pelo —la
+    // palabra es legítima en otros textos (el 23505 habla del «rango de fechas»
+    // del índice único)—: lo que no puede quedar es la INSTRUCCIÓN.
+    const service = readFileSync(
+      join(process.cwd(), "src", "features", "payroll", "service.ts"),
+      "utf8",
+    );
+    expect(service).not.toMatch(/[Aa]juste las fechas/);
+    expect(service).not.toContain("las fechas para que no se crucen");
+    // La guarda es sobre la orden, no sobre la palabra: el resto del módulo
+    // conserva sus «fechas» legítimas.
+    expect(service).toContain("Ya existe un borrador para ese rango de fechas.");
+    // Y el detector no es un sello de goma: los textos VIEJOS fallarían esto.
+    const viejo = [
+      "Un día se nomina una sola vez: ajuste las fechas para que no se crucen con un período existente.",
+      "dos veces los mismos días. Ajuste las fechas para que no se crucen.",
+      "Un día se nomina una sola vez: revise los períodos existentes y ajuste las fechas.",
+    ].join("\n");
+    expect(viejo).toMatch(/[Aa]juste las fechas/);
+    expect(viejo).not.toContain("Elija otro ciclo");
+  });
 });
 
 // --------------------------------- nómina extraordinaria individual (PA-2a) ---
