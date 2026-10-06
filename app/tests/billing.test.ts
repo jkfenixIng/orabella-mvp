@@ -3368,7 +3368,6 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/src/features/admin/service")>();
   const method = {
     id: overCollectionStub.METHOD_ID,
-    sede_id: overCollectionStub.SEDE_ID,
     code: "efectivo",
     name: "Efectivo",
     is_active: true,
