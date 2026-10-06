@@ -44,9 +44,6 @@ import {
   labelClass,
   mutedTextClass,
   sectionClass,
-  tableCellClass,
-  tableHeaderClass,
-  tableRowClass,
 } from "@/src/shared/lib/ui-styles";
 
 function emptyProductForm() {
@@ -421,89 +418,149 @@ export function InventoryClient(props: InventoryClientProps) {
           // AGREGARÍA un anuncio que hoy no existe.
           <p className="mt-3 text-sm text-text-tertiary">Sin productos para esta búsqueda.</p>
         ) : (
-          <div className="mt-3 overflow-x-auto">
-            <table className={cn("w-full text-left text-sm", "min-w-[760px]")}>
-              <thead>
-                <tr className={tableHeaderClass}>
-                  <th className={tableCellClass} scope="col">
-                    SKU
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Nombre
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Stock
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Mínimo
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Costo
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Venta
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Comisión
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Estado
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Acciones
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {paged.map((row) => (
-                  <tr key={row.id} className={tableRowClass}>
-                    <td className={cn(tableCellClass, "font-mono")}>{row.sku}</td>
-                    <td className={tableCellClass}>
+          // R19 + R38: la lista de productos. Antes era una `<table>` con un
+          // piso de `min-w-[760px]` dentro de un carril de `overflow-x-auto` de
+          // ~238 px útiles en un teléfono: las dos últimas columnas —`Estado` y
+          // `Acciones`— nunca entraban, y con ellas `Kardex` y `Editar`, que es
+          // lo que esta pantalla existe para hacer. Medido: 6 botones de fila
+          // fuera de pantalla en los cuatro anchos angostos, sin
+          // `elementFromPoint` que los devolviera, y las nueve celdas leídas sin
+          // una sola etiqueta.
+          //
+          // Ahora es el patrón de `invoices-client.tsx` y
+          // `vouchers-client.tsx` (R38), el mismo y no otro: abajo de `sm` cada
+          // fila es una TARJETA de cinco renglones y cada valor lleva su rótulo
+          // —la palabra del encabezado, la misma, y por eso las dos superficies
+          // no pueden divergir—; arriba de `sm` cada hoja se ancla a su columna
+          // con `sm:col-start-N` y la grilla conserva las NUEVE columnas de hoy,
+          // en su orden. La escala se declara una vez por superficie, así que no
+          // hay piso de ancho inventado ni carril que arrastrar.
+          //
+          // PRIORIDAD DE LA TARJETA —lo que hay que ver para decidir sobre un
+          // producto en el mostrador, en el orden en que se lee:
+          // 1. QUÉ PRODUCTO ES (Nombre + SKU): sin identidad no hay decisión.
+          //    El nombre manda y el código lo acompaña a la derecha; el chip
+          //    «Bajo mínimo» se queda donde estaba, dentro del nombre.
+          // 2. QUÉ HAY DE SU STOCK (Stock + Mínimo): el número que hay, al lado
+          //    del umbral que dispara la alerta. Juntos en un renglón se leen de
+          //    un vistazo: «Stock: 3» junto a «Mínimo: 5» ya es la alerta.
+          // 3. A QUÉ SE VENDE (Venta + Costo): primero el precio del mostrador,
+          //    después el costo que lo sostiene.
+          // 4. LA COMISIÓN y el ESTADO: el resto del dinero y la bandera de
+          //    vida del producto.
+          // 5. LA ACCIÓN (Acciones): su propio renglón, con sus dos botones
+          //    envueltos, y sin gesto horizontal para llegar.
+          // La DESCRIPCIÓN no entra: es un campo de formulario, no una columna
+          // de esta lista, y vive en el diálogo de alta y de edición.
+          <div className="mt-3 overflow-hidden rounded-lg border border-color-2 dark:border-border-color">
+            {/* El encabezado nombra las nueve columnas y sólo existe arriba de
+                `sm`: abajo la fila dice cada rótulo con su propio valor. */}
+            <div
+              aria-hidden="true"
+              className="hidden grid-cols-[minmax(0,0.85fr)_minmax(0,1.3fr)_minmax(0,0.35fr)_minmax(0,0.4fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.05fr)_minmax(0,0.85fr)_minmax(5.75rem,1.2fr)] gap-2 border-b border-color-2 bg-surface px-3 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary sm:grid dark:border-border-color"
+            >
+              <span>SKU</span>
+              <span>Nombre</span>
+              <span>Stock</span>
+              <span>Mínimo</span>
+              <span>Costo</span>
+              <span>Venta</span>
+              <span>Comisión</span>
+              <span>Estado</span>
+              <span className="text-center">Acciones</span>
+            </div>
+            <ul className="flex flex-col divide-y divide-color-2 dark:divide-border-color">
+              {paged.map((row) => (
+                <li
+                  key={row.id}
+                  className="flex flex-col gap-1 px-3 py-2.5 sm:grid sm:grid-cols-[minmax(0,0.85fr)_minmax(0,1.3fr)_minmax(0,0.35fr)_minmax(0,0.4fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.05fr)_minmax(0,0.85fr)_minmax(5.75rem,1.2fr)] sm:items-center sm:gap-2"
+                >
+                  {/* Las cinco líneas de la tarjeta móvil. Abajo de `sm` cada
+                      hoja es un renglón con su rótulo —la palabra del
+                      encabezado, la misma— y cada envoltorio `sm:contents` se
+                      borra de la grilla de arriba, donde la hoja se queda en la
+                      columna que su `sm:col-start-N` fija. El orden del DOM es
+                      el de la tarjeta, NO el de las columnas: por eso el pineo
+                      explícito. */}
+                  <span className="flex items-center justify-between gap-2 sm:contents">
+                    <span className="break-words text-sm text-text-primary sm:col-start-2 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Nombre: </span>
                       {row.name}{" "}
                       {alertIds.has(row.id) ? (
                         <Badge variant="warning" size="sm">
                           Bajo mínimo
                         </Badge>
                       ) : null}
-                    </td>
-                    <td className={tableCellClass}>{row.stock_qty}</td>
-                    <td className={tableCellClass}>{row.min_stock}</td>
-                    <td className={tableCellClass}>{formatMoney(row.cost_price)}</td>
-                    <td className={tableCellClass}>{formatMoney(row.sale_price)}</td>
-                    <td className={tableCellClass}>{formatMoney(row.commission_value)}</td>
-                    <td className={tableCellClass}>{row.is_active ? "Activo" : "Inactivo"}</td>
-                    <td className={tableCellClass}>
-                      <div className="flex flex-wrap gap-2">
+                    </span>
+                    <span className="font-mono text-sm text-text-primary sm:col-start-1 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">SKU: </span>
+                      {row.sku}
+                    </span>
+                  </span>
+                  <span className="flex items-center justify-between gap-2 sm:contents">
+                    <span className="whitespace-nowrap text-sm font-medium text-text-primary sm:col-start-3 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Stock: </span>
+                      {row.stock_qty}
+                    </span>
+                    <span className="whitespace-nowrap text-sm text-text-primary sm:col-start-4 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Mínimo: </span>
+                      {row.min_stock}
+                    </span>
+                  </span>
+                  <span className="flex items-center justify-between gap-2 sm:contents">
+                    <span className="whitespace-nowrap text-sm text-text-primary sm:col-start-6 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Venta: </span>
+                      {formatMoney(row.sale_price)}
+                    </span>
+                    <span className="whitespace-nowrap text-sm text-text-primary sm:col-start-5 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Costo: </span>
+                      {formatMoney(row.cost_price)}
+                    </span>
+                  </span>
+                  <span className="flex items-center justify-between gap-2 sm:contents">
+                    <span className="whitespace-nowrap text-sm text-text-primary sm:col-start-7 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Comisión: </span>
+                      {formatMoney(row.commission_value)}
+                    </span>
+                    <span className="text-sm text-text-primary sm:col-start-8 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Estado: </span>
+                      {row.is_active ? "Activo" : "Inactivo"}
+                    </span>
+                  </span>
+                  {/* La acción en su propio renglón: `flex-wrap` para que los
+                      dos botones quepan en 320 px sin empujar la fila. */}
+                  <span className="flex flex-wrap items-center gap-2 sm:contents">
+                    <span className="flex flex-wrap items-center gap-2 sm:col-start-9 sm:row-start-1 sm:justify-center">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Acciones: </span>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        disabled={isViewPending}
+                        onClick={() => showKardex(row)}
+                      >
+                        <Activity
+                          className={cn("h-4 w-4", isViewPending && "animate-spin")}
+                          aria-hidden="true"
+                        />
+                        {isViewPending ? "Cargando…" : "Kardex"}
+                      </Button>
+                      {props.canAdmin ? (
                         <Button
                           type="button"
                           variant="ghost"
                           size="sm"
-                          disabled={isViewPending}
-                          onClick={() => showKardex(row)}
+                          onClick={() => startEdit(row)}
                         >
-                          <Activity
-                            className={cn("h-4 w-4", isViewPending && "animate-spin")}
-                            aria-hidden="true"
-                          />
-                          {isViewPending ? "Cargando…" : "Kardex"}
+                          <Pencil className="h-4 w-4" aria-hidden="true" />
+                          Editar
                         </Button>
-                        {props.canAdmin ? (
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => startEdit(row)}
-                          >
-                            <Pencil className="h-4 w-4" aria-hidden="true" />
-                            Editar
-                          </Button>
-                        ) : null}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                      ) : null}
+                    </span>
+                  </span>
+                </li>
+              ))}
+            </ul>
           </div>
         )}
         {pageCount > 1 ? (
@@ -822,39 +879,70 @@ export function InventoryClient(props: InventoryClientProps) {
             // sin anuncio que agregar.
             <p className="mt-3 text-sm text-text-tertiary">Sin movimientos registrados.</p>
           ) : (
-            <div className="mt-3 overflow-x-auto">
-              <table className={cn("w-full text-left text-sm", "min-w-[520px]")}>
-                <thead>
-                  <tr className={tableHeaderClass}>
-                    <th className={tableCellClass} scope="col">
-                      Fecha
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Tipo
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Cantidad
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Motivo
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Quién
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {kardex.rows.map((row) => (
-                    <tr key={row.id} className={tableRowClass}>
-                      <td className={tableCellClass}>{new Date(row.created_at).toLocaleString("es-CO")}</td>
-                      <td className={cn(tableCellClass, "font-mono")}>{row.type}</td>
-                      <td className={tableCellClass}>{row.qty}</td>
-                      <td className={tableCellClass}>{row.reason}</td>
-                      <td className={tableCellClass}>{row.actor_name ?? "—"}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            // R19 + R38, la MISMA regla que la lista de productos: el kardex
+            // era una `<table>` con un piso de `min-w-[520px]` en un carril de
+            // ~238 px, y sus cinco celdas se leían apiladas —cuando se veían—
+            // sin una sola etiqueta.
+            //
+            // PRIORIDAD DE LA TARJETA —qué necesita leer una persona que
+            // pregunta «¿por qué el stock está así?», en el orden en que se lee:
+            // 1. CUÁNDO (Fecha): el movimiento más reciente es el que explica el
+            //    número de hoy, y por eso abre la tarjeta.
+            // 2. QUÉ PASÓ Y CUÁNTO (Tipo + Cantidad): el signo del movimiento y
+            //    su magnitud, juntos en un renglón.
+            // 3. QUIÉN LO HIZO (Quién): la mano detrás del número.
+            // 4. POR QUÉ (Motivo): el texto libre, último porque es el más largo
+            //    y el menos consultado de un vistazo.
+            <div className="mt-3 overflow-hidden rounded-lg border border-color-2 dark:border-border-color">
+              <div
+                aria-hidden="true"
+                className="hidden grid-cols-[minmax(8.5rem,1.3fr)_minmax(0,0.6fr)_minmax(0,0.5fr)_minmax(0,1.5fr)_minmax(0,0.9fr)] gap-2 border-b border-color-2 bg-surface px-3 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary sm:grid dark:border-border-color"
+              >
+                <span>Fecha</span>
+                <span>Tipo</span>
+                <span>Cantidad</span>
+                <span>Motivo</span>
+                <span>Quién</span>
+              </div>
+              <ul className="flex flex-col divide-y divide-color-2 dark:divide-border-color">
+                {kardex.rows.map((row) => (
+                  <li
+                    key={row.id}
+                    className="flex flex-col gap-1 px-3 py-2.5 sm:grid sm:grid-cols-[minmax(8.5rem,1.3fr)_minmax(0,0.6fr)_minmax(0,0.5fr)_minmax(0,1.5fr)_minmax(0,0.9fr)] sm:items-center sm:gap-2"
+                  >
+                    {/* Las cuatro líneas de la tarjeta móvil, en el orden de la
+                        prioridad y no en el de las columnas. */}
+                    <span className="flex items-center gap-2 sm:contents">
+                      <span className="text-sm text-text-primary sm:col-start-1 sm:row-start-1">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Fecha: </span>
+                        {new Date(row.created_at).toLocaleString("es-CO")}
+                      </span>
+                    </span>
+                    <span className="flex items-center justify-between gap-2 sm:contents">
+                      <span className="font-mono text-sm text-text-primary sm:col-start-2 sm:row-start-1">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Tipo: </span>
+                        {row.type}
+                      </span>
+                      <span className="whitespace-nowrap text-sm font-medium text-text-primary sm:col-start-3 sm:row-start-1">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Cantidad: </span>
+                        {row.qty}
+                      </span>
+                    </span>
+                    <span className="flex items-center gap-2 sm:contents">
+                      <span className="break-words text-sm text-text-primary sm:col-start-5 sm:row-start-1">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Quién: </span>
+                        {row.actor_name ?? "—"}
+                      </span>
+                    </span>
+                    <span className="flex items-center gap-2 sm:contents">
+                      <span className="break-words text-sm text-text-primary sm:col-start-4 sm:row-start-1">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Motivo: </span>
+                        {row.reason}
+                      </span>
+                    </span>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
         </section>
