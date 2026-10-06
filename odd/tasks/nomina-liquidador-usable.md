@@ -120,9 +120,18 @@ dueño no pidió. Queda escrito en `mem_save` por si aparece la necesidad.
 
 ## Tareas
 
-- [ ] **T1** — Migración `078`: `uq_payroll_draft_per_range` consciente de cadencia. Sin esto, la
+- [x] **T1** — Migración `078`: `uq_payroll_draft_per_range` consciente de cadencia. Sin esto, la
   quincenal y la mensual no se pueden abrir. Superficie: `schema-history/078_*.sql`,
   `supabase/test-bootstrap.sql`, `tests/atomic-guards.test.ts`.
+  **HECHO** — commit `1db7f74` (`fix(nomina): el borrador es unico por rango Y por cadencia`),
+  4 archivos, +404/−2. Rojo observado con el test escrito y la 078 inexistente (22:02:51); verde
+  después (22:10:17). Verificado de forma independiente: `npx vitest run tests/atomic-guards.test.ts
+  tests/admin.test.ts` → **148 pruebas, 2 archivos, en verde**. Sin pushear.
+
+  **La prueba es estructural, no de DDL.** Ninguna prueba de unidad de este repo puede ejecutar el
+  `CREATE INDEX` ni demostrar que el `23505` desaparezca: los tests de servicio stubbean PostgREST.
+  Lo que el test afirma es la FORMA de la declaración en el `.sql`. La prueba funcional la hace el
+  dueño con las consultas de sólo lectura del pie de la 078.
 - [ ] **T4** — Pestañas por cadencia + la cadencia rotulada en cada fila, en la lista principal y en
   el diálogo. La lista deja de mostrar fechas ISO crudas.
 - [ ] **T5** — Copy: el primer ciclo recortado se explica, y el aviso de pendientes dice que cada
