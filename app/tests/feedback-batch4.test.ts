@@ -696,24 +696,26 @@ describe("admin: el texto visible no cambió (cambia el canal, no la copia)", ()
 });
 
 /* ==========================================================================
-   Admin: la tabla pasa por el primitivo (DataTable)
+   Admin: las dos listas ya no son tablas
    ========================================================================== */
-describe("admin: la tabla pasa por el primitivo (DataTable)", () => {
-  it("empleados y usuarios renderizan su tabla con DataTable, sin piso ni envoltorio a mano", () => {
-    // Es el primer consumidor del primitivo: las dos tablas del panel vivían
-    // en `<div className="overflow-x-auto">` + `<table className="min-w-full
-    // text-left text-sm">` escritos a mano. El piso es `none` porque la tabla
-    // era `min-w-full`: adoptar el primitivo NO puede inventar un ancho que
-    // la tabla nunca tuvo (la escala está pineada en `ux-data-table.test.ts`).
+describe("admin: las listas de empleados y usuarios ya no son tablas", () => {
+  it("ninguna vuelve a una tabla a mano ni inventa un piso", () => {
+    // Historia, para que se entienda por qué este bloque cambió dos veces: las
+    // dos tablas del panel vivían en `<div className="overflow-x-auto">` +
+    // `<table className="min-w-full text-left text-sm">` escritos a mano;
+    // después pasaron por el primitivo `DataTable` con piso `none`; y con R-e3
+    // dejaron de ser tablas: debajo de `sm` son la tarjeta con etiquetas y
+    // arriba una grilla con cada valor anclado por `sm:col-start-N`.
+    //
+    // La ESTRUCTURA de la tarjeta la afirma `admin-tables-labels.test.ts`. Lo
+    // que este bloque defiende es lo que no puede volver: una tabla a mano y un
+    // piso inventado (la escala está pineada en `ux-data-table.test.ts`).
     for (const [path, code] of [
       ["app/admin/admin-sections/employees-section.tsx", EMPLOYEES_CODE],
       ["app/admin/admin-sections/users-section.tsx", USERS_CODE],
     ] as Array<[string, string]>) {
-      expect(code, `${path}: import de DataTable`).toMatch(
-        /from\s*["']@\/src\/components\/ui\/lib\/data-table["']/,
-      );
-      expect(code, `${path}: envoltorio a mano ya no está`).not.toMatch(/<table\b/);
-      expect(code, `${path}: DataTable con piso explícito`).toMatch(/<DataTable\b[\s\S]*?minWidth="none"/);
+      expect(code, `${path}: tabla a mano ya no está`).not.toMatch(/<table\b/);
+      expect(code, `${path}: piso inventado`).not.toMatch(/min-w-\[/);
     }
     // `vales-section.tsx` no tiene tabla: nada que migrar, y no debe
     // importar el primitivo para fingir que sí.
