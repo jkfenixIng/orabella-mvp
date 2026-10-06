@@ -2055,12 +2055,25 @@ export function PayrollClient(props: PayrollClientProps) {
     openCycleDays === null || openCycleDaysTotal === null
       ? null
       : `${openCycleDays} de ${openCycleDaysTotal} días del ciclo`;
+  /**
+   * F10: de dónde sale el rango, en palabras. La última frase tiene que decir la
+   * verdad en las DOS situaciones: en la PRIMERA liquidación hay un campo de
+   * fecha a la vista («Desde qué día opera la nómina») y el rango arranca en el
+   * día que se escribió, así que «el rango sale del ciclo y del arranque» —y su
+   * «no hay campos de fecha»— eran mentira en el caso que el dueño tenía
+   * delante. La misma bandera decide si ese campo se renderiza, así que la
+   * frase no puede contradecir al formulario.
+   */
   const openRangeText =
     openResolution === null || !openResolution.ok
       ? null
       : `Del ${formatFullDate(startDate)} al ${formatFullDate(endDate)}${
           openCycleDays === null ? "" : ` (${openCycleDays} ${openCycleDays === 1 ? "día" : "días"})`
-        }. El rango sale del ciclo y del arranque de la nómina: no hay campos de fecha.`;
+        }. ${
+          primeraLiquidacion
+            ? "El rango sale del ciclo cerrado y del día que declaró que opera la nómina."
+            : "El rango sale del ciclo y del arranque de la nómina: no hay campos de fecha."
+        }`;
   const openTrimmedNote =
     openResolution === null || !openResolution.ok || !openResolution.trimmed
       ? null
@@ -2804,9 +2817,10 @@ export function PayrollClient(props: PayrollClientProps) {
             <DialogHeader>
               <DialogTitle>Abrir período</DialogTitle>
               <DialogDescription>
-                Elija una liquidación pendiente. No hay fechas que escribir ni cadencia que
-                elegir: el rango sale del ciclo cerrado y del arranque de la nómina, y el período
-                se abre en borrador.
+                Elija una liquidación pendiente: la cadencia no se elige y el rango se deriva
+                del ciclo cerrado; sólo la primera liquidación declara el día desde el que
+                opera la nómina, acotado a ese ciclo. El período se abre en borrador, y desde
+                el segundo el arranque ya no se vuelve a preguntar.
               </DialogDescription>
             </DialogHeader>
             <form onSubmit={handleOpen} className="mt-4 flex flex-col gap-4">
@@ -2829,7 +2843,8 @@ export function PayrollClient(props: PayrollClientProps) {
                     Ciclo a liquidar
                     <span className="mt-1 block text-xs font-normal text-text-tertiary">
                       Son los ciclos ya cerrados que todavía no tienen liquidación, el más atrasado
-                      primero. Al elegir uno quedan derivados su cadencia y su rango.
+                      primero. Al elegir uno quedan derivados su cadencia y su rango, y la fecha
+                      que se pide —sólo en la primera liquidación— es un día de ese mismo ciclo.
                     </span>
                   </legend>
                   {pendingSettlements.map((entry) => (

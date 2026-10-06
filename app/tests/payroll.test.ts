@@ -5546,7 +5546,7 @@ describe("payroll-client: el diálogo de apertura DERIVADO (F10, guarda de fuent
   it("la fecha de arranque la declara la PRIMERA liquidación, y sólo ella", () => {
     const open = dialog();
     // Un campo de fecha, y sólo el día de arranque — NO el rango del período
-    // (que sigue derivado del ciclo, sin campos).
+    // (que sigue derivado del ciclo; ese campo no escribe el rango).
     expect(open).toContain('id="payroll-open-start-date"');
     expect(open).toContain('type="date"');
     // Acotado al ciclo elegido: la fecha declarada tiene que caer dentro del
@@ -5561,6 +5561,43 @@ describe("payroll-client: el diálogo de apertura DERIVADO (F10, guarda de fuent
     // El envío viaja en el CUERPO, y sólo en la primera liquidación.
     expect(client).toContain("declared_start_date");
     expect(client).toContain("...(declaredStartDate ? { declared_start_date: declaredStartDate } : {})");
+  });
+
+  it("la copia del diálogo es verdad en la PRIMERA liquidación y en las siguientes", () => {
+    // Lo que el dueño se encontró hoy: con el diálogo recién abierto y sin
+    // períodos, el campo «Desde qué día opera la nómina» ESTÁ a la vista y es
+    // obligatorio. Una descripción que dice «no hay fechas que escribir» es
+    // entonces falsa en el caso que él tiene delante. La misma descripción
+    // tiene que servir para las liquidaciones SIGUIENTES, donde el campo ya no
+    // aparece: por eso nombra las dos, sin negar ninguna.
+    const open = dialog();
+    // El marcado parte las cadenas en varias líneas: se compara con los espacios
+    // normalizados.
+    const plano = (texto: string): string => texto.replace(/\s+/g, " ");
+    expect(plano(open)).toContain(
+      "Elija una liquidación pendiente: la cadencia no se elige y el rango se deriva del ciclo cerrado; sólo la primera liquidación declara el día desde el que opera la nómina, acotado a ese ciclo. El período se abre en borrador, y desde el segundo el arranque ya no se vuelve a preguntar.",
+    );
+    // Y las dos frases que mentían no pueden volver, en ninguna forma.
+    expect(plano(open)).not.toContain("No hay fechas que escribir");
+    expect(plano(open)).not.toContain("ni cadencia que elegir");
+    // La leyenda sí dice lo que el dueño no podía ver: la ventana de la fecha
+    // pertenece al CICLO elegido (por eso un día de septiembre no era posible
+    // con el ciclo de julio-agosto marcado), sin crecer a párrafo.
+    expect(plano(open)).toContain(
+      "Son los ciclos ya cerrados que todavía no tienen liquidación, el más atrasado primero. Al elegir uno quedan derivados su cadencia y su rango, y la fecha que se pide —sólo en la primera liquidación— es un día de ese mismo ciclo.",
+    );
+    // El rango derivado nombra de dónde sale en CADA caso: en la primera
+    // sale del día declarado (el campo está a la vista), no del arranque.
+    expect(client).toContain("El rango sale del ciclo cerrado y del día que declaró que opera la nómina.");
+    expect(client).toContain("El rango sale del ciclo y del arranque de la nómina: no hay campos de fecha.");
+    // ...y las dos ramas se eligen con el MISMO hecho que decide si el campo de
+    // fecha se renderiza, para que la copia no pueda contradecir al formulario.
+    expect(client).toMatch(
+      /primeraLiquidacion\s*\?\s*"El rango sale del ciclo cerrado y del día que declaró[\s\S]{0,120}"\s*:\s*"El rango sale del ciclo y del arranque de la nómina: no hay campos de fecha\."/,
+    );
+    // La fecha pedida se acota al ciclo elegido (`min`/`declaredMax`): la copia
+    // no promete días de otros ciclos, ni un rango que se escriba.
+    expect(client).toContain("const declaredMin = openCycle?.start_date ?? \"\";");
   });
 
   it("el rango sale del ÚNICO validador, con el piso derivado y la fecha declarada", () => {
