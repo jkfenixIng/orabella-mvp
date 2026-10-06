@@ -900,6 +900,158 @@ describe("el filtro del `Combobox` llega a 16 px y al piso táctil por debajo de
 });
 
 /* ==========================================================================
+   2 bis — EL RESTO DE LA MISMA PRIMITIVA: el disparador y las filas.
+
+   El filtro de arriba ya estaba arreglado y el resto del `Combobox` no. MEDIDO
+   hoy en Chromium real sobre dos comboboxes distintos —los filtros de la
+   factura y el combobox de artículos dentro de «Emitir factura»— con la sesión
+   puesta, sin enviar nada (abrir, medir, Escape):
+
+   | Qué            | 320          | 640          | 1024         |
+   | -------------- | ------------ | ------------ | ------------ |
+   | Disparador     | 40 px / 14 px | 40 px / 14 px | 40 px / 14 px |
+   | Fila de opción | 36 px / 14 px | 36 px / 14 px | 36 px / 14 px |
+   | Filtro         | 44 px / 16 px | 36 px / 14 px | 36 px / 14 px |
+
+   O sea: el filtro ya estaba en el piso y el resto del MISMO control seguía
+   8 px por debajo y en el umbral que dispara el zoom de iOS. No es una
+   propiedad de "los campos": es la misma primitiva, mitad arreglada y mitad no.
+   Este bloque afirma los tres —disparador, fila de opción y fila de limpiar—
+   con el MISMO modelo y por el MISMO motivo, y afirma también que el
+   escritorio no se mueve ni un píxel.
+
+   CALIBRACIÓN MEDIDA, no inventada: `ANTES_DISPARADOR` y `ANTES_OPCION`
+   reproducen con literales los números de la tabla (40/14 y 36/14). Si el
+   modelo no los reproduce, las afirmaciones siguientes no prueban nada.
+   ========================================================================== */
+
+/** La clase del disparador en el estado MEDIDO: 40 px de alto y 14 px de fuente. */
+const ANTES_DISPARADOR =
+  "flex h-10 w-full items-center justify-between gap-2 rounded-md border border-border-color bg-surface px-3 text-sm outline-none transition-colors placeholder:text-text-tertiary hover:border-border-color-2 focus:border-primary-600 focus:ring-2 focus:ring-primary-600/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-border-color-2 dark:bg-surface";
+/** La clase de la fila de opción en el estado MEDIDO: 36 px y 14 px (20+8+8). */
+const ANTES_OPCION =
+  "flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50";
+/** La fila de limpiar («Todos») comparte la forma de la fila de opción. */
+const ANTES_LIMPIAR =
+  "flex w-full items-center rounded-md px-3 py-2 text-left text-sm transition-colors";
+
+/** El `<button>` disparador: el ancla es su `aria-haspopup`, que sólo él declara. */
+function claseDisparadorCombobox(): string {
+  return claseDe(COMBOBOX, 'aria-haspopup="listbox"');
+}
+
+/**
+ * Las filas de la lista: la de opción (`allowClear`) y la de limpiar.
+ *
+ * Se devuelven las DOS porque son el mismo tipo de control con dos
+ * literales base distintos, y un arreglo que sube una y deja la otra pasa
+ * medio camino sin que ninguna cuenta lo note.
+ */
+function clasesFilasCombobox(): { etiqueta: string; clase: string }[] {
+  return [
+    { etiqueta: "fila de opción", clase: claseDe(COMBOBOX, "aria-selected={option.value === value}") },
+    { etiqueta: "fila de limpiar", clase: claseDe(COMBOBOX, "aria-selected={value === ''}") },
+  ];
+}
+
+describe("el disparador y las filas del `Combobox` llegan al piso por debajo de `sm`", () => {
+  it("calibración: el modelo reproduce los 40/14 y 36/14 MEDIDOS del estado previo", () => {
+    expect(altoDe(ANTES_DISPARADOR, 320), "disparador a 320").toBe(40);
+    expect(cajaDe(ANTES_DISPARADOR, 320).fuente, "fuente del disparador a 320").toBe(14);
+    for (const { etiqueta, clase } of [
+      { etiqueta: "fila de opción", clase: ANTES_OPCION },
+      { etiqueta: "fila de limpiar", clase: ANTES_LIMPIAR },
+    ]) {
+      expect(altoDe(clase, 320), `${etiqueta} a 320`).toBe(36);
+      expect(cajaDe(clase, 320).fuente, `fuente de la ${etiqueta} a 320`).toBe(14);
+    }
+  });
+
+  it("el disparador llega a 44 px y a 16 px a 320 —el umbral del zoom de iOS y el piso", () => {
+    const clase = claseDisparadorCombobox();
+    expect(altoDe(clase, 320), "alto a 320").toBeGreaterThanOrEqual(44);
+    expect(cajaDe(clase, 320).fuente, "fuente a 320").toBeGreaterThanOrEqual(16);
+    // Y también en el último píxel del rango, donde la variante `max-sm:`
+    // todavía está activa: 639 no es 640.
+    expect(altoDe(clase, 639), "alto a 639").toBeGreaterThanOrEqual(44);
+    expect(cajaDe(clase, 639).fuente, "fuente a 639").toBeGreaterThanOrEqual(16);
+  });
+
+  it("las DOS filas de la lista llegan a 16 px y a 44 px a 320", () => {
+    const filas = clasesFilasCombobox();
+    expect(filas, "filas afirmadas").toHaveLength(2);
+    for (const { etiqueta, clase } of filas) {
+      expect(altoDe(clase, 320), `alto de la ${etiqueta} a 320`).toBeGreaterThanOrEqual(44);
+      expect(cajaDe(clase, 320).fuente, `fuente de la ${etiqueta} a 320`).toBeGreaterThanOrEqual(16);
+    }
+  });
+
+  it("el escritorio NO se mueve: el disparador 40/14 y las filas 36/14, como hoy", () => {
+    const disparador = claseDisparadorCombobox();
+    expect(altoDe(disparador, 640), "alto del disparador a 640").toBe(40);
+    expect(altoDe(disparador, 1024), "alto del disparador a 1024").toBe(40);
+    expect(cajaDe(disparador, 1024).fuente, "fuente del disparador a 1024").toBe(14);
+    for (const { etiqueta, clase } of clasesFilasCombobox()) {
+      expect(altoDe(clase, 640), `alto de la ${etiqueta} a 640`).toBe(36);
+      expect(altoDe(clase, 1024), `alto de la ${etiqueta} a 1024`).toBe(36);
+      expect(cajaDe(clase, 1024).fuente, `fuente de la ${etiqueta} a 1024`).toBe(14);
+    }
+  });
+
+  it("el piso es `min-h` y la variante es `max-sm:`: un `sm:` sí movería el escritorio", () => {
+    // El `min-h` le gana al `h-10` en el CSS, y la variante tiene que ser la
+    // negativa: `sm:min-h-11` levantaría el escritorio a 44, que es exactamente
+    // la densidad que este arreglo NO puede pagar.
+    expect(altoDe("h-10 max-sm:min-h-11", 320), "abajo de `sm` el piso levanta").toBe(44);
+    expect(altoDe("h-10 max-sm:min-h-11", 1024), "desde `sm` manda el `h-10`").toBe(40);
+    expect(altoDe("h-10 sm:min-h-11", 1024), "un `sm:` sí lo mueve").toBe(44);
+
+    // Y la tipografía es el mismo contrato: `max-sm:text-base` sube a 16 sin
+    // tocar el `text-sm` del escritorio.
+    const disparador = claseDisparadorCombobox();
+    const escritorioForzado = twMerge(disparador, "sm:text-base");
+    expect(cajaDe(escritorioForzado, 1024).fuente, "un `sm:text-base` sí sube el escritorio").toBe(16);
+  });
+
+  it("el piso no los deja escondidos: disparador y filas SE VEN a 320", () => {
+    // El punto ciego de la familia: un `hidden` agregado a la lista deja el
+    // piso intacto y el control invisible, y una guarda que sólo mira alto y
+    // fuente no lo vería. La cascada se resuelve como la resuelve el CSS.
+    expect(tokenQueEsconde(claseDisparadorCombobox(), 320), "disparador a 320").toBe("");
+    for (const { etiqueta, clase } of clasesFilasCombobox()) {
+      expect(tokenQueEsconde(clase, 320), `${etiqueta} a 320`).toBe("");
+    }
+  });
+});
+
+describe("alcance declarado: lo del listbox que NO se sube, y por qué", () => {
+  it("el estado vacío es texto que se lee, no un control que se toca", () => {
+    // El otro elemento de la lista que podía tener el mismo problema:
+    // `px-3 py-4 text-center text-sm`, o sea 52 px de alto y 14 px de fuente.
+    // Se deja como está, y la razón es la del arreglo: el piso de 44 px es
+    // para lo que se TOCA (el objetivo táctil móvil de §8) y el umbral de 16 px
+    // es para lo que se ENFOCA (el zoom de iOS). Un `<p>` no se toca ni se
+    // enfoca: no es un `button`, no tiene `tabindex`, no recibe foco, y su caja
+    // ya pasa el piso por el padding.
+    const clase = claseDe(COMBOBOX, "{noResultsText}");
+    expect(cajaDe(clase, 320).fuente, "la tipografía del estado vacío no se toca").toBe(14);
+    expect(altoDe(clase, 320), "y su caja ya pasa el alto del piso").toBeGreaterThanOrEqual(44);
+    expect(stripComments(COMBOBOX)).toMatch(/<p className="[^"]*">\{noResultsText\}<\/p>/);
+  });
+
+  it("la descripción de la fila es metadato, no el texto que el dedo elige", () => {
+    // `shrink-0 text-xs`: 12 px. Subirlo se llevaría por delante la etiqueta
+    // de la opción que sí identifica la fila, y no compra ni un píxel de área
+    // táctil —el área táctil es la de la fila, que ya está en el piso—.
+    // El ancla va por la clase, no por el texto: `claseDe` sube hasta el `<`
+    // anterior, y desde los hijos de la fila ese `<` es el cierre del `span`
+    // de la etiqueta, que no declara `className`.
+    const clase = claseDe(COMBOBOX, "shrink-0 text-xs");
+    expect(cajaDe(clase, 320).fuente, "la descripción se queda en 12 px").toBe(12);
+  });
+});
+
+/* ==========================================================================
    3 — los botones de icono de la fila de factura.
    ========================================================================== */
 

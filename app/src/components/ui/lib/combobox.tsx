@@ -215,7 +215,15 @@ function Combobox({
         aria-expanded={open}
         aria-label={ariaLabel}
         className={cn(
-          'flex h-10 w-full items-center justify-between gap-2 rounded-md border border-border-color bg-surface px-3 text-sm outline-none transition-colors placeholder:text-text-tertiary hover:border-border-color-2 focus:border-primary-600 focus:ring-2 focus:ring-primary-600/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-border-color-2 dark:bg-surface',
+          // MEDIDO hoy en Chromium real a 320 (filtros de factura y combobox
+          // de artículos de «Emitir factura»): el disparador daba 40 px y 14 px
+          // con el filtro YA arreglado a 44/16. El piso es el de las dos
+          // mitades del mismo control: 44 px para el dedo (objetivo táctil
+          // móvil, §8) y 16 px para que iOS no haga zoom al enfocar. Es el
+          // mismo `max-sm:min-h-11` + `max-sm:text-base` del filtro de abajo:
+          // un `min-height` le gana al `h-10` sin tocarlo, y la variante
+          // negativa deja el escritorio en 40/14 exactamente como está.
+          'flex h-10 max-sm:min-h-11 w-full items-center justify-between gap-2 rounded-md border border-border-color bg-surface px-3 text-sm max-sm:text-base outline-none transition-colors placeholder:text-text-tertiary hover:border-border-color-2 focus:border-primary-600 focus:ring-2 focus:ring-primary-600/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-border-color-2 dark:bg-surface',
           selectedOption ? 'text-text-primary' : 'text-text-tertiary',
         )}
       >
@@ -296,7 +304,11 @@ function Combobox({
                   aria-selected={value === ''}
                   onClick={() => choose('')}
                   className={cn(
-                    'flex w-full items-center rounded-md px-3 py-2 text-left text-sm transition-colors',
+                    // MEDIDO a 320: 36 px y 14 px. Mismo piso y mismo motivo
+                    // que el disparador y el filtro —es la fila que el dedo
+                    // elige—; `py-2` y `text-sm` se quedan porque son los que
+                    // sostienen los 36 px del escritorio.
+                    'flex w-full max-sm:min-h-11 items-center rounded-md px-3 py-2 text-left text-sm max-sm:text-base transition-colors',
                     value === ''
                       ? 'bg-surface-hover font-medium text-text-primary'
                       : 'text-text-primary hover:bg-surface-hover',
@@ -319,7 +331,11 @@ function Combobox({
                       if (!option.disabled) choose(option.value)
                     }}
                     className={cn(
-                      'flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50',
+                      // MEDIDO a 320: 36 px y 14 px. El piso de las filas que
+                      // el dedo elige, por el mismo motivo que el filtro y el
+                      // disparador; `py-2` sigue sosteniendo los 36 px de
+                      // escritorio.
+                      'flex w-full max-sm:min-h-11 items-center gap-2 rounded-md px-3 py-2 text-left text-sm max-sm:text-base transition-colors disabled:cursor-not-allowed disabled:opacity-50',
                       option.value === value
                         ? 'bg-success-light font-medium text-success'
                         : 'text-text-primary hover:bg-surface-hover',

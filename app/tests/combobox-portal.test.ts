@@ -211,6 +211,40 @@ describe("R37: la colocación se calcula como la calcula el navegador", () => {
     expect(cabeEnPantalla(p, alBorde)).toBe(true);
   });
 
+  it("el alto que recibe la cuenta es el MEDIDO del disparador, no una constante", () => {
+    // El piso táctil sube el disparador de 40 a 44 px POR DEBAJO de `sm`, y la
+    // cuenta de la colocación se alimenta con `rect.height`: por eso el caso
+    // medido a 320 se vuelve a afirmar con 44 sin tocar
+    // `computeComboboxPlacement`. Si algún día la lista usara un alto fijo de
+    // 40, esta guarda se caería.
+    expect(COMBOBOX_CODE).toMatch(/height:\s*rect\.height/);
+
+    // El caso MEDIDO a 320, con el disparador ya arreglado: sigue volteando y
+    // sigue cabiendo, con 4 px menos de espacio real.
+    const medido: PlacementInput = {
+      trigger: { top: 500, left: 16, width: 288, height: 44 },
+      viewport: { width: 320, height: 568 },
+    };
+    const con44 = colocar(medido);
+    expect(con44.flippedUp, "con 20 px abajo y 496 arriba, también voltea").toBe(true);
+    expect(cabeEnPantalla(con44, medido), "y la lista no se sale de la pantalla").toBe(true);
+    expect(con44.maxHeight, "el alto lo limita el espacio real, no una constante").toBe(240);
+
+    // Y cuando el disparador es más alto, la cuenta se mueve con él: 4 px más
+    // abajo, el mismo alto (el tope de 240 manda igual) y sigue cabiendo.
+    const holgado: PlacementInput = {
+      trigger: { top: 100, left: 16, width: 288, height: 44 },
+      viewport: { width: 320, height: 568 },
+    };
+    const a40 = colocar({ ...holgado, trigger: { ...holgado.trigger, height: 40 } });
+    const a44 = colocar(holgado);
+    expect(a40.flippedUp, "con lugar de sobra no voltea").toBe(false);
+    expect(a44.flippedUp).toBe(false);
+    expect(a44.top, "la lista abre 4 px más abajo").toBe(a40.top + 4);
+    expect(a44.maxHeight, "y el tope de 240 px manda igual").toBe(a40.maxHeight);
+    expect(cabeEnPantalla(a44, holgado)).toBe(true);
+  });
+
   it("el hueco con el disparador se respeta en las dos direcciones", () => {
     const input: PlacementInput = {
       trigger: { top: 500, left: 16, width: 288, height: 40 },
