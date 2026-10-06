@@ -228,8 +228,15 @@ function CommissionModeSelector(props: {
           onClick={() => props.onChange(mode)}
           className={
             props.value === mode
-              ? "bg-slate-900 px-2 py-1 text-[10px] font-semibold text-white"
-              : "bg-white px-2 py-1 text-[10px] font-medium text-slate-700 hover:bg-slate-100"
+              ? /* R16/R36: el selector computaba 10 px de fuente y 23 px de alto
+                 MEDIDOS en Chromium. El 12 px es el piso de tipografía del repo y
+                 no se negocia en ningún ancho; el alto de 44 es el piso táctil y
+                 va SOLO por debajo de `sm`, con `min-h` y con la variante
+                 negativa: `h-11` o `sm:min-h-11` subirían el escritorio, que
+                 es la densidad que esta fila conserva. MEDIDO después: 12 px y
+                 44 px a 320/412, 12 px y 24 px a 640/1024. */
+                "bg-slate-900 px-2 py-1 text-xs font-semibold text-white max-sm:min-h-11"
+              : "bg-white px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 max-sm:min-h-11"
           }
         >
           {labels[mode]}
@@ -1511,33 +1518,24 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         {item.commission_mode === "ninguna" ? (
                                           <span className="text-xs text-paper-ink-muted">Sin comisión</span>
                                         ) : item.item_type === "servicio" ? (
-                                          <span
-                                            className="text-xs text-paper-ink-tertiary"
-                                            title="Se paga el porcentaje del empleado sobre el subtotal."
-                                          >
+                                          <span className="text-xs text-paper-ink-tertiary">
                                             % del empleado
                                           </span>
                                         ) : item.commission_mode === "porcentaje" ? (
-                                          <span
-                                            className="text-xs text-paper-ink-tertiary"
-                                            title="Porcentaje sobre el subtotal; se paga en nómina."
-                                          >
+                                          <span className="text-xs text-paper-ink-tertiary">
                                             {item.commission_percent_override != null
                                               ? `${item.commission_percent_override}% (ítem)`
                                               : "% del empleado"}
                                           </span>
                                         ) : item.item_type === "producto" ? (
                                           <div className="flex flex-col items-center gap-0.5">
-                                            <span
-                                              className="text-xs text-paper-ink-tertiary"
-                                              title="Valor de comisión por unidad; se multiplica por la cantidad."
-                                            >
+                                            <span className="text-xs text-paper-ink-tertiary">
                                               {item.commission_value == null
                                                 ? "—"
                                                 : formatMoney(item.commission_value)}
                                             </span>
                                             {item.commission_value != null && (
-                                              <span className="text-[10px] text-paper-ink-muted">
+                                              <span className="text-xs text-paper-ink-muted">
                                                 × cantidad
                                               </span>
                                             )}
@@ -1560,14 +1558,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                               placeholder="Valor $"
                                               inputMode="numeric"
                                               aria-label={`Ítem ${index + 1} valor comisión`}
-                                              title="Valor de comisión por unidad; se multiplica por la cantidad."
                                             />
                                             {item.commission_value == null ? (
-                                              <span className="text-[10px] text-paper-ink-muted">
+                                              <span className="text-xs text-paper-ink-muted">
                                                 Requerido
                                               </span>
                                             ) : (
-                                              <span className="text-[10px] text-paper-ink-muted">
+                                              <span className="text-xs text-paper-ink-muted">
                                                 × cantidad
                                               </span>
                                             )}
@@ -1598,6 +1595,20 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             </tbody>
                           </table>
                         </div>
+
+                        {/* R25 — la regla que decide de cuánto se paga a un
+                            empleado NO puede vivir en un `title=`: un tooltip
+                            nativo no se dispara con el dedo, así que en un
+                            teléfono la regla no existía. Va como texto, aquí
+                            debajo, donde se lee la columna de comisión. MEDIDO:
+                            a 320 y a 412 las tres oraciones se leen enteras sin
+                            puntero y sin arrastre horizontal. */}
+                        <p className="text-xs text-paper-ink-muted">
+                          Se paga el porcentaje del empleado sobre el subtotal.
+                          El porcentaje se paga en nómina.
+                          El valor de comisión se multiplica por la cantidad.
+                          Si escribe un porcentaje, ese es el del ítem; si no, aplica el del empleado.
+                        </p>
 
                         <button
                           type="button"
@@ -1984,14 +1995,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   </span>
                 </span>
                 <span className="flex items-center gap-1.5 sm:contents">
-                  <span className="truncate text-sm text-slate-600 sm:col-start-3 sm:row-start-1 dark:text-slate-300" title={row.user_name ?? ""}>
+                  <span className="truncate max-sm:whitespace-normal text-sm text-slate-600 sm:col-start-3 sm:row-start-1 dark:text-slate-300" title={row.user_name ?? ""}>
                     <span className="font-sans font-medium text-text-secondary sm:hidden">Abrió: </span>
                     {row.user_name ?? "—"}
                   </span>
                 </span>
                 <span className="flex items-center gap-1.5 sm:contents">
                   <span
-                    className="truncate text-sm text-slate-600 sm:col-start-6 sm:row-start-1 dark:text-slate-300"
+                    className="truncate max-sm:whitespace-normal text-sm text-slate-600 sm:col-start-6 sm:row-start-1 dark:text-slate-300"
                     title={row.employee_names.join(", ")}
                   >
                     <span className="font-sans font-medium text-text-secondary sm:hidden">Empleados: </span>
@@ -2046,7 +2057,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 {/* Abajo de `sm` el cierre va al pie y más apagado: es el dato menos
                     consultado de la fila. Arriba vuelve a su columna y a su cuerpo. */}
                 <span className="flex items-center gap-2 sm:contents">
-                  <span className="truncate text-xs text-slate-500 sm:col-start-4 sm:row-start-1 sm:text-sm dark:text-slate-400" title={row.closed_by_name ?? ""}>
+                  <span className="truncate max-sm:whitespace-normal text-xs text-slate-500 sm:col-start-4 sm:row-start-1 sm:text-sm dark:text-slate-400" title={row.closed_by_name ?? ""}>
                     <span className="font-sans font-medium text-text-secondary sm:hidden">Cerró: </span>
                     {row.closed_by_name ?? "—"}
                   </span>
@@ -2160,10 +2171,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         {commissionModeOf(row) === "ninguna" ? (
                                           <span className="text-paper-ink-muted">Sin comisión</span>
                                         ) : commissionModeOf(row) === "porcentaje" ? (
-                                          <span
-                                            className="text-paper-ink-tertiary"
-                                            title="Porcentaje sobre el subtotal; se paga en nómina."
-                                          >
+                                          <span className="text-paper-ink-tertiary">
                                             {row.commission_percent_override != null
                                               ? `${row.commission_percent_override}% (ítem)`
                                               : "% del empleado"}
@@ -2180,6 +2188,15 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               </tbody>
                             </table>
                           </div>
+                          {/* R25 — misma regla, mismo texto que en «Emitir factura»:
+                              la que decide de cuánto se paga a un empleado no
+                              puede vivir en un `title=`, que no se dispara con el
+                              dedo. */}
+                          <p className="text-xs text-paper-ink-muted">
+                            Se paga el porcentaje del empleado sobre el subtotal.
+                            El porcentaje se paga en nómina.
+                            El valor de comisión se multiplica por la cantidad.
+                          </p>
                           <h3 className="text-sm font-bold uppercase tracking-wide text-paper-ink-muted">Impuestos</h3>
                           <ul className="mt-1 flex flex-col gap-1 text-sm text-paper-ink">
                             {detail.taxes.map((row) => (
@@ -2575,10 +2592,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         {!clientView && (
                                           <td className="px-3 py-2 text-center">
                                             {item.item_type === "servicio" ? (
-                                              <span
-                                                className="text-[10px] text-paper-ink-muted"
-                                                title="Se paga el porcentaje del empleado sobre el subtotal."
-                                              >
+                                              <span className="text-xs text-paper-ink-muted">
                                                 % del empleado
                                               </span>
                                             ) : item.item_type === "producto" ? (
@@ -2616,14 +2630,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                       placeholder="Valor $"
                                                       inputMode="numeric"
                                                       aria-label={`Editar ítem ${index + 1} valor comisión`}
-                                                      title="Valor de comisión por unidad; se multiplica por la cantidad."
                                                     />
                                                     {item.commission_value == null ? (
-                                                      <span className="text-[10px] text-paper-ink-muted">
+                                                      <span className="text-xs text-paper-ink-muted">
                                                         Opcional
                                                       </span>
                                                     ) : (
-                                                      <span className="text-[10px] text-paper-ink-muted">
+                                                      <span className="text-xs text-paper-ink-muted">
                                                         × cantidad
                                                       </span>
                                                     )}
@@ -2663,12 +2676,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                       placeholder="Valor $"
                                                       inputMode="numeric"
                                                       aria-label={`Editar ítem ${index + 1} valor comisión`}
-                                                      title="Valor de comisión por unidad; se multiplica por la cantidad."
                                                     />
                                                     {item.commission_value == null ? (
-                                                      <span className="text-[10px] text-paper-ink-muted">Requerido</span>
+                                                      <span className="text-xs text-paper-ink-muted">Requerido</span>
                                                     ) : (
-                                                      <span className="text-[10px] text-paper-ink-muted">× cantidad</span>
+                                                      <span className="text-xs text-paper-ink-muted">× cantidad</span>
                                                     )}
                                                   </>
                                                 )}
@@ -2688,13 +2700,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                       placeholder="% ítem"
                                                       inputMode="decimal"
                                                       aria-label={`Editar ítem ${index + 1} porcentaje`}
-                                                      title="Porcentaje del subtotal para este ítem."
                                                     />
                                                   ) : (
-                                                    <span
-                                                      className="text-[10px] text-paper-ink-muted"
-                                                      title="El empleado tiene porcentaje propio."
-                                                    >
+                                                    <span className="text-xs text-paper-ink-muted">
                                                       % del empleado
                                                     </span>
                                                   ))}
@@ -2718,6 +2726,17 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 </tbody>
                               </table>
                             </div>
+                            {/* R25 — aquí la tabla también deja escribir el
+                                porcentaje del ítem, así que la regla de DÓNDE
+                                sale ese porcentaje se lee con las otras tres.
+                                MEDIDO: a 320 y 412 las cuatro oraciones se leen
+                                enteras sin puntero. */}
+                            <p className="text-xs text-paper-ink-muted">
+                              Se paga el porcentaje del empleado sobre el subtotal.
+                              El porcentaje se paga en nómina.
+                              El valor de comisión se multiplica por la cantidad.
+                              Si escribe un porcentaje, ese es el del ítem; si no, aplica el del empleado.
+                            </p>
                             <button
                               type="button"
                               onClick={() => openItemDialog("edit")}

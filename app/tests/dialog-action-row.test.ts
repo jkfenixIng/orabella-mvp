@@ -851,3 +851,344 @@ describe("control negativo: sin la cláusula, la guarda acusa los dos modales", 
     expect(dialogoDeEdicionAislado("")).toBe(false);
   });
 });
+
+/* ==========================================================================
+   R25 — LO QUE DECIDE LA PLATA SE LEE, NO SE ADIVINA EN UN TOOLTIP.
+
+   EL DEFECTO, y por qué no es cosmético: las reglas de comisión —las que dicen
+   CUÁNTO se le paga a un empleado— vivían en `title=` de diez elementos de las
+   tres tablas de ítems de esta pantalla («Emitir factura», «Ver detalle» y
+   «Editar factura»). Un `title=` es un tooltip NATIVO, y un tooltip nativo no
+   se dispara con el dedo: en un teléfono esa regla no existe. No hay forma de
+   recuperarla —tocar el elemento no la muestra, y no hay puntero que la
+   sobrevolara—.
+
+   LO QUE SE AFIRMA, en dos mitades que se necesitan las dos:
+
+     1. LA REGLA SE LEE. Cada regla aparece como TEXTO del marcado, dentro de la
+        región de la tabla donde se decide. Se lee el markup con las ETIQUETAS
+        VACIADAS: si una frase aparece dentro de `title=`, de `aria-label=` o de
+        cualquier atributo, para esta cuenta no está — que es exactamente el
+        defecto.
+     2. NADA QUE DECIDA PLATA VIVE EN UN `title=`. Ni a 320 ni a 1440: el
+        criterio es «no hay regla en un atributo», sin ancho. Y NO es una
+        prohibición de `title=` en general: los que quedan —el motivo del
+        bloqueo de caja, «Totalizar pagos», «Dividir cobro», «Ver detalle», el
+        motivo de guardado— no son reglas de dinero y esta guarda no los toca.
+        Los tres de IDENTIDAD siguen ahí a propósito, porque arriba de `sm` hay
+        ratón y el ratón sí alcanza un tooltip (`invoice-row-labels.test.ts`).
+
+   POR QUÉ NO ES UN GREP DE «NO HAYA `title=`»: sería un criterio que no
+   distingue una identidad de una regla de dinero, y que melarang los tres
+   `title=` legítimos de la fila. Y por qué tampoco basta con «la frase está en
+   el archivo»: la frase ya estaba, dentro del `title=`; lo que se afirma es la
+   POSICIÓN —texto, o atributo— y en qué región.
+   ========================================================================== */
+
+/**
+ * Las reglas de comisión de esta pantalla, como las DECLARA el archivo después
+ * del arreglo. Son las frases que estaban en los diez `title=` de la auditoría,
+ * escritas como texto legible y en el tono que el diálogo ya usaba.
+ */
+const REGLAS_COMUNES = [
+  "Se paga el porcentaje del empleado sobre el subtotal",
+  "El porcentaje se paga en nómina",
+  "El valor de comisión se multiplica por la cantidad",
+];
+
+/** La regla del porcentaje propio del ítem: sólo donde se puede escribir. */
+const REGLA_DEL_ITEM = "Si escribe un porcentaje, ese es el del ítem; si no, aplica el del empleado";
+
+/**
+ * El archivo con TODAS las etiquetas vaciadas: lo que queda es el texto que el
+ * navegador pinta, y nada de lo que vive dentro de un atributo. Se conserva la
+ * longitud, así los índices de las regiones siguen valiendo.
+ *
+ * POR QUÉ NO EL LEXER DE ARRIBA: `etiquetas()` salta los `{…}` enteros porque
+ * no son markup —para encontrar el `<form>` del diálogo está bien—, pero acá eso
+ * justo es el agujero: el `title=` de una fila vive dentro de un
+ * `{items.map(… => (<tr>…))}`, y un lector que se salta la expresión dejaría ese
+ * `title=` intacto y daría por buena una regla que sigue escondida. Este
+ * recorrer mira las etiquetas SIN saltarse las expresiones.
+ *
+ * Y POR QUÉ ESTE RECORRER NO ES UN PARSER, SINO UN CORTADOR HONRADO: sólo toma
+ * por etiqueta una `<` cuya anterior no sea parte de un identificador —un
+ * `useState<string | null>` no entra porque la anterior es una `e`— y cuya
+ * siguiente sea una letra o `/`; una comparación `a < b` tampoco, porque detrás
+ * del `<` hay un espacio. El cierre lo busca `finDeEtiqueta`, que ya salta
+ * cadenas y llaves.
+ *
+ * LO QUE NO SE VACÍA, A PROPÓSITO: las etiquetas de CIERRE. No llevan atributo,
+ * asi que no pueden esconder texto, y son el ancla con el que se localizan las
+ * tres tablas (`Comisión</th>`): si se vaciaran, la región no se encontraría.
+ */
+function markupSinEtiquetas(source: string): string {
+  const salida = source.split("");
+  for (let i = 0; i < source.length; i += 1) {
+    if (source[i] !== "<") continue;
+    // La anterior no puede ser parte de un identificador: asi un
+    // `useState<string | null>` no se confunde con una etiqueta.
+    if (/[A-Za-z0-9_$]/.test(source.slice(0, i).trimEnd().slice(-1))) continue;
+    if (!/[A-Za-z/]/.test(source[i + 1] ?? "")) continue;
+    let fin = -1;
+    try {
+      // El `finDeEtiqueta` de este archivo devuelve además si la etiqueta es
+      // auto-cerrada; acá sólo interesa el índice del `>`.
+      fin = finDeEtiqueta(source, i).indice;
+    } catch {
+      continue;
+    }
+    for (let j = i; j <= fin && j < salida.length; j += 1) salida[j] = " ";
+    i = fin;
+  }
+  return salida.join("");
+}
+/** El índice de la `n`-ésima aparición de `aguja` (0 = la primera). */
+function nEsima(source: string, aguja: string, n: number): number {
+  let i = -1;
+  for (let k = 0; k <= n; k += 1) {
+    i = source.indexOf(aguja, i + 1);
+    if (i < 0) throw new Error(`«${aguja}» no aparece ${n + 1} veces`);
+  }
+  return i;
+}
+
+interface TablaDeItems {
+  /** La fila de la que se habla, para el mensaje del fallo. */
+  nombre: string;
+  /** El índice del encabezado «Comisión» de la columna. */
+  desde: number;
+  /** El índice del `<h3` que cierra el bloque de la tabla. */
+  hasta: number;
+}
+
+/**
+ * Las TRES tablas de ítems que muestran la comisión, en orden de archivo. El
+ * ancla es el encabezado de la columna: es lo único que las tres comparten, y
+ * el `<h3` que viene después es el que termina su bloque, así que una nota
+ * puesta entre `</table>` y ese encabezado cae dentro de la región, y una nota
+ * puesta en otro diálogo no.
+ */
+function tablasDeItems(source: string): TablaDeItems[] {
+  const nombres = ["«Emitir factura»", "«Ver detalle»", "«Editar factura»"];
+  return nombres.map((nombre, indice) => {
+    const desde = nEsima(source, "Comisión</th>", indice);
+    const hasta = source.indexOf("<h3", desde);
+    if (hasta < 0) throw new Error(`${nombre}: la tabla no tiene bloque que la cierre`);
+    return { nombre, desde, hasta };
+  });
+}
+
+/**
+ * La región de una tabla en CUALQUIER versión del archivo de la misma longitud.
+ *
+ * Las regiones se localizan en el fuente SIN vaciar y se leen en el VACÍADO, y
+ * el puente es la longitud: `markupSinEtiquetas` cambia cada carácter de una
+ * etiqueta por un espacio y no mueve nada, así que los mismos índices cortan en
+ * las dos. Sin esto, el ancla (`<h3`) estaría vacía en la versión que hay que
+ * leer.
+ */
+function regionDe(source: string, tabla: TablaDeItems): string {
+  return source.slice(tabla.desde, tabla.hasta);
+}
+
+/** Todas las reglas declaradas que NO se leen como texto en esa región. */
+function reglasNoLegibles(region: string, reglas: string[]): string[] {
+  return reglas.filter((regla) => !region.includes(regla));
+}
+
+/**
+ * El valor declarado de cada `title=` del archivo: el literal, o el código de
+ * la expresión con sus cadenas. Se lee el atributo, no el elemento: lo que se
+ * afirma es que la regla no esté ESCRITA ahí, esté o no se muestre.
+ */
+function titulosDel(source: string): string[] {
+  const valores: string[] = [];
+  for (const match of source.matchAll(/\btitle=/g)) {
+    const desde = match.index + "title=".length;
+    const resto = source.slice(desde);
+    if (resto.startsWith('"')) {
+      valores.push(resto.slice(1, finDeCadena(resto, 0) - 1));
+    } else if (resto.startsWith("{")) {
+      // Sin las llaves outside y con los saltos de línea colapsados: la lista
+      // enumerada de abajo tiene que poder leerse como lo que el archivo dice.
+      valores.push(source.slice(desde + 1, finDeLlaves(source, desde) - 1).replace(/\s+/g, " ").trim());
+    }
+  }
+  return valores;
+}
+
+/**
+ * Qué hace que un tooltip sea una REGLA DE DINERO: dice de cuánto se paga a
+ * alguien o cómo se calcula. Se lee sobre el valor del `title=` —expresión
+ * incluida—, para que un `title={…}` con la frase dentro también caiga.
+ */
+const ES_REGLA_DE_PLATA = /se paga|n[oó]mina|porcentaje|comisi[oó]n|multiplica por la cantidad/i;
+
+/** Los `title=` del archivo que hoy llevan una regla de dinero. */
+const PLATA = titulosDel(INVOICES).filter((valor) => ES_REGLA_DE_PLATA.test(valor));
+
+describe("R25: lo que decide la plata se lee, no vive en un `title=`", () => {
+  it("las tres tablas de ítems se leen del archivo real", () => {
+    const tablas = tablasDeItems(INVOICES);
+    expect(tablas.map((t) => t.nombre), "las tres tablas").toEqual([
+      "«Emitir factura»",
+      "«Ver detalle»",
+      "«Editar factura»",
+    ]);
+    for (const tabla of tablas) {
+      expect(tabla.hasta - tabla.desde, `${tabla.nombre}: la región`).toBeGreaterThan(300);
+    }
+  });
+
+  it("cada tabla dice las reglas de comisión COMO TEXTO, no dentro de un atributo", () => {
+    // La región se lee del markup YA VACÍADO de etiquetas: aquí ya no puede
+    // colarse un `title=` ni un `aria-label=`.
+    const vacio = markupSinEtiquetas(INVOICES);
+    for (const tabla of tablasDeItems(INVOICES)) {
+      expect(reglasNoLegibles(regionDe(vacio, tabla), REGLAS_COMUNES), `${tabla.nombre}: reglas sin texto`).toEqual([]);
+    }
+  });
+
+  it("donde se puede escribir un porcentaje propio, esa regla también se lee", () => {
+    const vacio = markupSinEtiquetas(INVOICES);
+    const tablas = tablasDeItems(INVOICES);
+    // Las dos tablas donde el ítem puede llevar su propio porcentaje: la de
+    // emisión y la de edición. La de detalle es de sólo lectura y no lo muestra.
+    for (const indice of [0, 2]) {
+      expect(
+        reglasNoLegibles(regionDe(vacio, tablas[indice]), [REGLA_DEL_ITEM]),
+        `${tablas[indice].nombre}: la regla del porcentaje propio`,
+      ).toEqual([]);
+    }
+  });
+
+  it("NINGÚN `title=` del archivo declara una regla de dinero, a ningún ancho", () => {
+    expect(PLATA, "reglas de plata dentro de un `title=`").toEqual([]);
+    // Y el ancla del criterio: el archivo SÍ sigue teniendo `title=`, así que
+    // esto no es «no hay tooltips», es «no hay reglas en tooltips».
+    expect(titulosDel(INVOICES).length, "`title=` que quedan en el archivo").toBe(10);
+  });
+
+  it("los diez `title=` que quedan se enumeran, y ninguno es una regla de dinero", () => {
+    // La lista ES la revisión: si alguien mete una regla nueva en uno de ellos,
+    // esta lista es la que hay que actualizar, y actualizarla es revisar.
+    expect(titulosDel(INVOICES)).toEqual([
+      "shiftBlockReason ?? undefined",
+      'canTotalize ? "Rellena la primera porción vacía con el neto pendiente" : "Nada por rellenar"',
+      '!firstFreeMethod ? "Todos los métodos ya están en uso" : undefined',
+      'row.user_name ?? ""',
+      'row.employee_names.join(", ")',
+      'shiftBlockReason ?? (row.status === "Emitida" ? "Editar factura emitida (el total se recalcula)" : "Editar factura (solo admin, con motivo)")',
+      "Ver detalle",
+      'row.closed_by_name ?? ""',
+      'canTotalizeSplit ? "Rellena el monto con el saldo neto pendiente" : "Nada por rellenar"',
+      '!canSaveEdit ? isFreeEdit ? "Agregue al menos un ítem válido para guardar" : "Cuadre subtotal, recargo y motivo para guardar" : undefined',
+    ]);
+  });
+});
+
+describe("control negativo: la guarda de las reglas acusa el tooltip", () => {
+  it("calibración: el mismo predicado, con las reglas de vuelta en `title=`, las acusa", () => {
+    // La calibración tiene que seguir corriendo DESPUÉS del arreglo, así que ya
+    // no puede leer el defecto del archivo real: se lo vuelve a poner encima,
+    // en una COPIA en memoria, y se corre el MISMO predicado de arriba.
+    const antes = INVOICES.replace(
+      "Se paga el porcentaje del empleado sobre el subtotal.",
+      'title="Se paga el porcentaje del empleado sobre el subtotal."',
+    );
+    expect(antes, "la mutación tiene que cambiar el fuente").not.toBe(INVOICES);
+    expect(PLATA, "en el archivo real, ya no hay ninguna").toEqual([]);
+    const encontrados = titulosDel(antes).filter((valor) => ES_REGLA_DE_PLATA.test(valor));
+    expect(encontrados, "reglas de plata en `title=`").toEqual([
+      "Se paga el porcentaje del empleado sobre el subtotal.",
+    ]);
+    expect(encontrados.length, "y son las diez del defecto, una por celda").toBeGreaterThanOrEqual(1);
+  });
+
+  it("y ninguna de las DIEZ herramientas del defecto vuelve, tal cual", () => {
+    // Las diez frases exactas que la auditoría encontró en los `title=` de las
+    // tres tablas. El criterion de arriba las cubre por palabra; esta lista las
+    // congela, para que nadie reintroduzca el texto viejo tal cual sin que la
+    // revisión lo note.
+    const DIEZ_DEL_DEFECTO = [
+      "Se paga el porcentaje del empleado sobre el subtotal.",
+      "Porcentaje sobre el subtotal; se paga en nómina.",
+      "Valor de comisión por unidad; se multiplica por la cantidad.",
+      "Porcentaje del subtotal para este ítem.",
+      "El empleado tiene porcentaje propio.",
+    ];
+    const titles = titulosDel(INVOICES).join(" | ");
+    for (const frase of DIEZ_DEL_DEFECTO) {
+      expect(titles, `«${frase}» volvió a un \`title=\``).not.toContain(frase);
+    }
+    // Y el punto de partida: el defecto eran diez atributos, hoy quedan los diez
+    // que la lista enumerada de arriba revisa.
+    expect(PLATA, "reglas de plata en `title=`").toEqual([]);
+  });
+
+  it("mover una regla de vuelta al `title=` la hace caer por las dos mitades", () => {
+    // La edición que alguien haría para deshacer el arreglo: quitar la frase
+    // del texto y volver a ponerla en el atributo. La mitad de «se lee» la
+    // acusa por la región, y la de «nada de plata en `title=`» por el atributo.
+    const conTooltip = INVOICES.replace(
+      "El valor de comisión se multiplica por la cantidad",
+      'title="Valor de comisión por unidad; se multiplica por la cantidad."',
+    );
+    expect(conTooltip, "la mutación tiene que cambiar el fuente").not.toBe(INVOICES);
+    const tablas = tablasDeItems(conTooltip);
+    // La frase se quitó del texto de la PRIMERA tabla (es la primera que la
+    // tiene en el archivo) y se puso en su `title=`.
+    expect(reglasNoLegibles(regionDe(markupSinEtiquetas(conTooltip), tablas[0]), REGLAS_COMUNES)).toContain(
+      "El valor de comisión se multiplica por la cantidad",
+    );
+    expect(
+      titulosDel(conTooltip).filter((valor) => ES_REGLA_DE_PLATA.test(valor)),
+      "y ahora vive en el atributo",
+    ).not.toEqual([]);
+  });
+
+  it("cambiar de atributo no escapa: un `aria-label=` con la regla también se cuenta", () => {
+    const conAria = INVOICES.replace(
+      "El valor de comisión se multiplica por la cantidad",
+      'aria-label="Valor de comisión por unidad; se multiplica por la cantidad."',
+    );
+    const tablas = tablasDeItems(conAria);
+    expect(reglasNoLegibles(regionDe(markupSinEtiquetas(conAria), tablas[0]), REGLAS_COMUNES)).toContain(
+      "El valor de comisión se multiplica por la cantidad",
+    );
+  });
+
+  it("y dejar el texto fuera la acusa aunque el `title=` quede inocuo", () => {
+    // El otro modo de fallar: cambiar la frase de sitio sin moverla al tooltip.
+    // La mitad de «nada de plata en `title=`» pasa y la de «se lee» no: por eso
+    // hacen falta las dos.
+    const otraPalabra = INVOICES.replace(
+      "El valor de comisión se multiplica por la cantidad",
+      "El valor de comisión es por unidad.",
+    );
+    expect(otraPalabra, "la mutación tiene que cambiar el fuente").not.toBe(INVOICES);
+    expect(
+      reglasNoLegibles(
+        regionDe(markupSinEtiquetas(otraPalabra), tablasDeItems(otraPalabra)[0]),
+        REGLAS_COMUNES,
+      ),
+      "la regla ya no se lee en ninguna parte de esa tabla",
+    ).toContain("El valor de comisión se multiplica por la cantidad");
+  });
+
+  it("el recorrido no se rompe con este archivo: no queda NI UN `title=` en el markup", () => {
+    // Ancla de todo lo de arriba: si el recorrido fallara, `reglasNoLegibles`
+    // mediría sobre una cadena vacía y no probaría nada. Y el atributo que se
+    // mira es el del defecto —`title=`, incluidos los que viven dentro de un
+    // `{items.map(…)}`, que es donde el lexer de arriba se los saltaría—.
+    const vacio = markupSinEtiquetas(INVOICES);
+    expect(vacio.length, "la longitud se conserva").toBe(INVOICES.length);
+    expect(stripComments(vacio), "en el archivo entero").not.toContain("title=");
+    for (const tabla of tablasDeItems(INVOICES)) {
+      const region = regionDe(vacio, tabla);
+      expect(region.length, `${tabla.nombre}: la región vaciada`).toBeGreaterThan(300);
+      expect(stripComments(region), `${tabla.nombre}: no queda ningún \`title=\``).not.toContain("title=");
+    }
+  });
+});

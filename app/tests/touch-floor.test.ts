@@ -184,6 +184,17 @@ function cajaDe(clase: string, vw: number): Caja {
       caja.fuente = TEXTO[texto[1]].px;
       caja.interlineado = TEXTO[texto[1]].lh;
     }
+    // `text-[10px]`: tipografía ARBITRARIA, que no entra en la escala de arriba.
+    // MEDIDO en Chromium contra la hoja compilada del dev server: `text-[10px]`
+    // computa `font-size: 10px` y `line-height: 15px` —el interlineado NO lo
+    // declara la utilidad, lo hereda, y en el cuerpo de la app vale 1.5—; la caja
+    // de un `<span>` así mide 14 px de alto. Sin esta rama el modelo leería 16 px
+    // y daría por bueno el defecto entero.
+    const arbitrario = base.match(/^text-\[(\d+(?:\.\d+)?)px\]$/);
+    if (arbitrario) {
+      caja.fuente = Number(arbitrario[1]);
+      caja.interlineado = caja.fuente * 1.5;
+    }
     const py = base.match(/^py-(\d+(?:\.\d+)?)$/);
     if (py) caja.paddingY = rem(py[1]);
     // `px-*`: los botones de icono de la fila se dimensionan con `p-*`, y sin
@@ -1152,5 +1163,301 @@ describe("control negativo: el modelo de la cola acusa lo que no cumple", () => 
     expect(caja.alto, "alto con piso").toBe(44);
     expect(caja.ancho, "ancho sin piso").toBe(34);
     expect(caja.ancho).toBeLessThan(44);
+  });
+});
+
+/* ==========================================================================
+   4 — LOS CONTROLES CHICOS DE LA PANTALLA DE FACTURAS (R16 y R36).
+
+   Esta cola terminó en los controles que NO son tokens: menú del shell, filtro
+   del combobox, botón de icono de la fila. Faltaron los que viven en una
+   pantalla, y el hallazgo es del mismo género que el de arriba —una guarda que
+   solo lee tokens no los ve—: MEDIDOS hoy en Chromium, con las listas de clase
+   LITERALES del archivo contra la hoja compilada que sirve el dev server:
+
+   | Control (clase literal del archivo)           | 320         | 1024        |
+   | --------------------------------------------- | ----------- | ----------- |
+   | Botón activo del selector de comisión          | 10px / 23px | 10px / 23px |
+   | Botón inactivo del mismo selector              | 10px / 23px | 10px / 23px |
+   | Rótulo «× cantidad» / «Requerido» / «Opcional» | 10px / 14px | 10px / 14px |
+
+   Once `text-[10px]`: once bajo el piso de 12 px que el propio repo se puso
+   (R16), y el botón del selector a 23 px de alto contra el piso móvil de 44.
+
+   LO QUE NO SE AFIRMA, DICHO DE ANTEMBIO: los pies de estos diálogos NO
+   tienen el defecto. Se midieron también, con las mismas listas literales:
+   `h-10 … px-4 text-sm` computa **40 px** a 320 y a 1024, no 22. El «22 px» que
+   arrastra R36 venía de una versión anterior del archivo, en la que esos pies
+   eran `py-1 text-[10px]`; hoy los cobró una unidad cerrada con su propia guarda
+   (`dialog-action-row.test.ts`) y acá no se tocan.
+
+   Y el criterio de esta sección NO es «no exista el token `text-[10px]`» —eso
+   probaría la intención— sino el EFECTO sobre cada lista de clase que el
+   archivo declara: la fuente y el alto que el navegador calcula a cada ancho.
+   Las listas se leen tal como están escritas, se fusionan con `twMerge` —que es
+   la regla de `cn`— y la cascada de variantes la resuelve `cajaDe`.
+   ========================================================================== */
+
+/** El índice siguiente al `}` que cierra la expresión que abre en `start`. */
+function finDeExpresion(source: string, start: number): number {
+  let depth = 0;
+  for (let i = start; i < source.length; i += 1) {
+    const ch = source[i];
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      for (i += 1; i < source.length; i += 1) {
+        if (source[i] === "\\") {
+          i += 1;
+          continue;
+        }
+        if (source[i] === quote) break;
+      }
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  throw new Error(`expresión sin cerrar desde ${start}`);
+}
+
+/**
+ * Las listas de clase que DECLARA la etiqueta que empieza en `inicio`, en el
+ * orden en que las declara. Un `className="…"` es una; un `className={…}` son
+ * todas las cadenas de su expresión —el ternario del botón activo/inactivo, los
+ * literales de un `cn(…)`—.
+ *
+ * Por qué se lee la DECLARACIÓN y no el elemento: lo que se afirma es el
+ * resultado de cada lista por separado, y el resultado no depende de a qué
+ * elemento pertenezca. Y por qué no se infla con el llamador: en esta pantalla
+ * las tres controladoras tienen sus clases escritas en el archivo, y las que
+ * llegan por prop son de primitivas compartidas, que esta cola ya midió con su
+ * propia clase efectiva.
+ */
+function literalesDeClase(source: string, inicio: number): string[] {
+  const resto = source.slice(inicio);
+  const conCota = /^className="([^"]*)"/.exec(resto);
+  if (conCota !== null) return [conCota[1]];
+  const conLlave = /^className=\{/.exec(resto);
+  if (conLlave === null) throw new Error(`la etiqueta en ${inicio} no declara className`);
+  // El conteo de llaves arranca EN la `{` de `className={`, no después: si se
+  // pasa por alto, la primera llave interna cierra la expresión y se leen
+  // cadenas de las dos siguientes.
+  const cuerpo = source.slice(inicio + conLlave[0].length, finDeExpresion(source, inicio + conLlave[0].length - 1));
+  return [...cuerpo.matchAll(/"([^"]*)"/g)].map((m) => m[1]).filter((valor) => valor.trim() !== "");
+}
+
+/** Todas las listas de clase que declara el archivo, sin repetir. */
+function clasesDeclaradas(source: string): string[] {
+  const encontradas: string[] = [];
+  for (const match of source.matchAll(/className=/g)) {
+    for (const clase of literalesDeClase(source, match.index)) {
+      if (!encontradas.includes(clase)) encontradas.push(clase);
+    }
+  }
+  if (encontradas.length === 0) throw new Error("el archivo no declara ninguna clase");
+  return encontradas;
+}
+
+/** Las listas del botón del selector de comisión, por su `aria-pressed`. */
+function clasesSelectorComision(): string[] {
+  const ancla = INVOICES.indexOf("aria-pressed={props.value === mode}");
+  if (ancla < 0) throw new Error("el archivo no declara el selector de comisión");
+  // El `className` va DESPUÉS del `aria-pressed` en la misma etiqueta, así que
+  // hay que subir a su `<` y no leer desde el ancla.
+  const inicio = INVOICES.lastIndexOf("<button", ancla);
+  if (inicio < 0) throw new Error("el `aria-pressed` del selector no vive en un botón");
+  const clase = INVOICES.indexOf("className=", ancla);
+  if (clase < 0 || clase > finDeEtiqueta(INVOICES, inicio)) {
+    throw new Error("el botón del selector no declara `className`");
+  }
+  return literalesDeClase(INVOICES, clase);
+}
+
+/** La clase del rótulo chico que acompaña al valor de comisión. */
+function clasesRotuloComision(): string[] {
+  const ancla = INVOICES.indexOf("× cantidad</span>");
+  if (ancla < 0) throw new Error("el archivo no declara el rótulo «× cantidad»");
+  const inicio = INVOICES.lastIndexOf("<span", ancla);
+  if (inicio < 0) throw new Error("el rótulo no vive en un `span`");
+  const clase = INVOICES.indexOf("className=", inicio);
+  if (clase < 0 || clase > ancla) throw new Error("el rótulo no declara `className`");
+  return literalesDeClase(INVOICES, clase);
+}
+
+/** Las listas del botón del selector tal como el archivo las declara HOY. */
+const SELECTOR_HOY = clasesSelectorComision();
+
+describe("R16 y R36: los controles chicos de facturas llegan al piso", () => {
+  it("el ancla se lee: son dos listas, el estado activo y el inactivo", () => {
+    expect(SELECTOR_HOY, "los dos estados del selector").toHaveLength(2);
+    expect(SELECTOR_HOY[0], "el activo va en negrita").toContain("font-semibold");
+    expect(SELECTOR_HOY[1], "el inactivo, no").toContain("font-medium");
+  });
+
+  it("NINGUNA lista del archivo declara una fuente bajo el piso de 12 px", () => {
+    // El criterio, sobre el efecto y no sobre el token: la fuente que el
+    // navegador calcula a CADA ancho. Una lista que no declare tipografía se
+    // queda en la que hereda (16), así que no puede dar un falso positivo.
+    const bajoPiso: string[] = [];
+    for (const clase of clasesDeclaradas(INVOICES)) {
+      for (const vw of [320, 412, 640, 1024]) {
+        const fuente = cajaDe(clase, vw).fuente;
+        if (fuente < 12) bajoPiso.push(`${fuente}px a ${vw}px: \`${clase.slice(0, 46)}…\``);
+      }
+    }
+    expect(bajoPiso, "listas con tipografía bajo el piso de 12 px").toEqual([]);
+  });
+
+  it("calibración: el modelo reproduce los 10 px / 23 px MEDIDOS del estado previo", () => {
+    // MEDIDO en Chromium contra la hoja compilada, con estas literales:
+    // `font-size: 10px`, `line-height: 15px`, caja de 23 px (15 + 8 + 2).
+    const activo = "bg-slate-900 px-2 py-1 text-[10px] font-semibold text-white";
+    expect(cajaDe(activo, 320).fuente, "fuente").toBe(10);
+    expect(cajaDe(activo, 320).interlineado, "interlineado").toBe(15);
+    expect(altoDe(activo, 320), "alto a 320").toBe(23);
+    expect(altoDe(activo, 1024), "alto a 1024").toBe(23);
+    // Y el rótulo chico: 10 px de fuente. No se afirma su CAJA porque no es un
+    // control que se toque: es texto que se lee, y lo que R16 le pide es la
+    // fuente, no un blanco táctil.
+    expect(cajaDe("text-[10px] text-paper-ink-muted", 320).fuente, "fuente del rótulo").toBe(10);
+  });
+
+  it("el botón del selector llega a 44 px de alto por debajo de `sm`, en LOS DOS estados", () => {
+    for (const clase of SELECTOR_HOY) {
+      for (const vw of [320, 412, 639]) {
+        expect(altoDe(clase, vw), `alto a ${vw}px de \`${clase.slice(0, 30)}…\``).toBeGreaterThanOrEqual(44);
+        expect(cajaDe(clase, vw).fuente, `fuente a ${vw}px`).toBeGreaterThanOrEqual(12);
+      }
+    }
+  });
+
+  it("el escritorio NO gana el piso móvil: la densidad de 640 y 1024 se queda como es", () => {
+    // Lo que se afirma es que el piso es de la variante negativa: con un
+    // `sm:min-h-11` el escritorio subiría a 44, que es la densidad que este
+    // arreglo no puede pagar.
+    for (const clase of SELECTOR_HOY) {
+      for (const vw of [640, 1024]) {
+        expect(altoDe(clase, vw), `alto a ${vw}px`).toBeLessThan(44);
+      }
+    }
+  });
+
+  it("el piso es `min-h`, no `h`: por eso va con la variante `max-sm:`", () => {
+    // El alto explícito le gana al contenido y sube TAMBIÉN el escritorio; el
+    // `min-h` con variante negativa solo levanta abajo de `sm`.
+    expect(altoDe("px-2 py-1 text-xs max-sm:min-h-11", 320)).toBe(44);
+    expect(altoDe("px-2 py-1 text-xs max-sm:min-h-11", 1024), "12/16 de texto + 8 de `py-1`").toBe(24);
+    expect(altoDe("px-2 py-1 text-xs sm:min-h-11", 1024), "un `sm:` movería el escritorio").toBe(44);
+    expect(altoDe("h-11 px-2 py-1 text-xs", 1024), "un `h-11` lo movería siempre").toBe(44);
+  });
+
+  it("los controles con piso SE VEN a 320: el piso no puede dejarlos escondidos", () => {
+    // El punto ciego de la familia, en su forma más discreta: una clase que lo
+    // apaga deja el piso intacto y el control invisible, y una guarda que solo
+    // mira alto y fuente no lo vería.
+    for (const clase of SELECTOR_HOY) {
+      for (const vw of [320, 639]) {
+        expect(tokenQueEsconde(clase, vw), `\`${clase.slice(0, 26)}…\` a ${vw}px`).toBe("");
+      }
+    }
+  });
+
+  it("el rótulo chico de la columna también está en el piso de 12 px", () => {
+    // El rótulo no es un control que se toque —no se le pide un blanco táctil—
+    // pero sí es data que se lee, y por eso comparte el piso de tipografía. El
+    // anclaje es el TEXTO del rótulo, no su token.
+    const rotulo = clasesRotuloComision();
+    expect(rotulo, "el rótulo declara una sola lista").toHaveLength(1);
+    for (const vw of [320, 412, 640, 1024]) {
+      expect(cajaDe(rotulo[0], vw).fuente, `fuente del rótulo a ${vw}px`).toBeGreaterThanOrEqual(12);
+    }
+  });
+
+  it("el pie del diálogo NO es uno de estos controles: mide 40 px y no se toca", () => {
+    // La versión de R36 que se midió hoy, con las listas reales del archivo. Se
+    // deja escrito para que nadie vaya a «arreglar» un pie que ya está en 40.
+    const pie = "h-10 rounded-md border border-paper-line-strong px-4 text-sm font-medium";
+    expect(altoDe(pie, 320), "alto a 320").toBe(40);
+    expect(altoDe(pie, 1024), "alto a 1024").toBe(40);
+    expect(cajaDe(pie, 320).fuente, "fuente").toBe(14);
+  });
+});
+
+describe("control negativo: la guarda de los controles chicos acusa lo que no cumple", () => {
+  it("las tres listas MEDIDAS del estado previo no pasan sus propios pisos", () => {
+    const antes = [
+      "bg-slate-900 px-2 py-1 text-[10px] font-semibold text-white",
+      "bg-white px-2 py-1 text-[10px] font-medium text-slate-700 hover:bg-slate-100",
+      "text-[10px] text-paper-ink-muted",
+    ];
+    for (const clase of antes) {
+      expect(cajaDe(clase, 320).fuente, `fuente de \`${clase.slice(0, 26)}…\``).toBeLessThan(12);
+    }
+    for (const clase of antes.slice(0, 2)) {
+      expect(altoDe(clase, 320), `alto de \`${clase.slice(0, 26)}…\``).toBeLessThan(44);
+    }
+  });
+
+  it("el mismo predicado, con el `text-[10px]` de vuelta, acusa al archivo", () => {
+    // La calibración tiene que seguir corriendo después del arreglo, así que ya
+    // no puede leer el defecto del archivo real: se lo vuelve a poner encima, en
+    // una COPIA en memoria, y se corre el MISMO predicado de arriba. Si pasara
+    // sobre esa copia, no estaría probando nada.
+    const antes = INVOICES
+      .replace(
+        "bg-slate-900 px-2 py-1 text-xs font-semibold text-white max-sm:min-h-11",
+        "bg-slate-900 px-2 py-1 text-[10px] font-semibold text-white",
+      )
+      .replace(
+        "bg-white px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 max-sm:min-h-11",
+        "bg-white px-2 py-1 text-[10px] font-medium text-slate-700 hover:bg-slate-100",
+      )
+      .replace(/"text-xs text-paper-ink-muted"/g, '"text-[10px] text-paper-ink-muted"');
+    expect(antes, "la mutación tiene que cambiar el fuente").not.toBe(INVOICES);
+    const bajoPiso = clasesDeclaradas(antes).filter((clase) => cajaDe(clase, 320).fuente < 12);
+    expect(bajoPiso, "listas bajo el piso").toEqual([
+      "bg-slate-900 px-2 py-1 text-[10px] font-semibold text-white",
+      "bg-white px-2 py-1 text-[10px] font-medium text-slate-700 hover:bg-slate-100",
+      "text-[10px] text-paper-ink-muted",
+    ]);
+  });
+
+  it("el rótulo chico es una de las listas que la cuenta general recorre", () => {
+    // Ancla del criterio general: sin esto, «ninguna lista bajo el piso» podría
+    // pasar porque el lector no leyó ninguna lista. El ancla es el TEXTO del
+    // rótulo, no su token: cuando el `text-[10px]` vuelva, sigue encontrándolo.
+    const rotulo = clasesRotuloComision();
+    expect(rotulo, "el rótulo declara una sola lista").toHaveLength(1);
+    expect(clasesDeclaradas(INVOICES), "y la cuenta general la recorre").toEqual(
+      expect.arrayContaining(rotulo),
+    );
+    expect(rotulo[0], "y está en el piso").not.toMatch(/text-\[/);
+  });
+
+  it("quitarle el `max-sm:min-h-11` al botón se acusa, aunque la fuente ya esté en 12", () => {
+    // El estado QUE SE ESTÁ DESCARTANDO, con la fuente ya arreglada: el defecto
+    // que queda es solo el alto, y la cuenta lo tiene que ver solo.
+    const conPiso = "bg-slate-900 px-2 py-1 text-xs font-semibold text-white max-sm:min-h-11";
+    const sinPiso = twMerge(conPiso).replace(/ ?max-sm:min-h-11/g, "");
+    expect(altoDe(conPiso, 320), "con el piso").toBe(44);
+    expect(altoDe(sinPiso, 320), "se queda en el alto del contenido").toBeLessThan(44);
+    expect(cajaDe(sinPiso, 320).fuente, "y la fuente ya no es el problema").toBeGreaterThanOrEqual(12);
+  });
+
+  it("poner el piso solo en el escritorio se acusa en los tres anchos angostos", () => {
+    const escritorio = "px-2 py-1 text-xs sm:min-h-11";
+    for (const vw of [320, 412, 639]) {
+      expect(altoDe(escritorio, vw), `a ${vw}px`).toBeLessThan(44);
+    }
+    expect(altoDe(escritorio, 1024), "a 1024 sí sube: ese es el costo").toBe(44);
+  });
+
+  it("esconder el botón con la lista correcta se acusa aunque el piso siga puesto", () => {
+    const conPiso = twMerge(SELECTOR_HOY[0], "max-sm:min-h-11");
+    expect(altoDe(conPiso, 320), "el piso está").toBeGreaterThanOrEqual(44);
+    expect(tokenQueEsconde(`${conPiso} max-sm:hidden`, 320), "y aun así no se ve").toBe("max-sm:hidden");
   });
 });

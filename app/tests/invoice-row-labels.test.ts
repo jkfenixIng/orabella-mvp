@@ -769,3 +769,175 @@ describe("la etiqueta que se apaga en el fondo se acusa", () => {
     expect(tokenQueEsconde(etiquetaId(ROW).clase, 1024), "en el escritorio").toBe("sm:hidden");
   });
 });
+
+/* --------------------------------------------------------------------------
+   R26 — LA IDENTIDAD NO VIVE SÓLO EN EL TOOLTIP.
+
+   El defecto: los tres nombres de la fila —quién abrió, quién cerró y los
+   empleados— llevan `truncate` + `title=`. La fila es una tarjeta angosta, así
+   que el nombre se CORTA y la única forma de leerlo entero es el tooltip… que
+   es un `title=` nativo, y un `title=` nativo NO SE DISPARA CON EL DEDO. En un
+   teléfono, esa identidad no existe.
+
+   LA DECISIÓN, Y POR QUÉ NO ES UNA PROHIBICIÓN DE `title=`: abajo de `sm` el
+   nombre SE ENVUELVE y se lee entero; desde `sm` el `truncate` + `title=` se
+   quedan, porque arriba hay ratón y el ratón sí alcanza un tooltip. Por eso esta
+   guarda NO prohíbe `title=`: le pide a cada nombre que, en el ancho donde no
+   hay puntero, la caja se lea completa.
+
+   LA CLASE, Y POR QUÉ NO BASTABA EL TOKEN: la cuenta es la del CSS —dentro de
+   una propiedad gana la utilidad que el motor emite ÚLTIMA, y ese orden es el
+   de las variantes, con las `max-*` al final—, leída sobre la clase EFECTIVA
+   (la de `twMerge`, que es la regla de `cn`). Un token suelto no la vería:
+   `truncate` seguiría en la lista y el nombre seguiría cortado. Lo que se
+   afirma es el `white-space` que gana a cada ancho.
+   -------------------------------------------------------------------------- */
+
+/** Las utilidades que ponen `white-space`, y qué ponen. */
+const BLANCO: Record<string, "normal" | "nowrap"> = {
+  "whitespace-normal": "normal",
+  "whitespace-nowrap": "nowrap",
+};
+
+/** El peso de emisión de una variante; las `max-*` van al final de la hoja. */
+const ORDEN_VARIANTE: Record<string, number> = {
+  sm: 100,
+  md: 200,
+  lg: 300,
+  xl: 400,
+  "2xl": 500,
+  "max-2xl": 600,
+  "max-xl": 700,
+  "max-lg": 800,
+  "max-md": 900,
+  "max-sm": 1000,
+};
+
+/**
+ * El `white-space` que GANA a ese ancho, deducido de la clase efectiva.
+ *
+ * `truncate` no está en el grupo de `white-space` (en Tailwind v4 es la
+ * utilidad de `text-overflow`, y trae `overflow: hidden; text-overflow:
+ * ellipsis; white-space: nowrap`), así que `twMerge` no lo funde con un
+ * `whitespace-*`: los dos sobreviven en la hoja y decide el ORDEN de emisión.
+ * Por eso `truncate` pesa 0 —es una utilidad pelada— y un `max-sm:` pesa más
+ * que cualquier pelada, que es lo que lo hace ganarle por debajo de 640 sin
+ * tocar el escritorio.
+ */
+function blancoDe(clase: string, vw: number): "normal" | "nowrap" | "" {
+  let elegido: "normal" | "nowrap" | "" = "";
+  let mejor = Number.NEGATIVE_INFINITY;
+  for (const token of twMerge(clase).split(/\s+/).filter(Boolean)) {
+    const base = baseName(token);
+    if (base !== "truncate" && !(base in BLANCO)) continue;
+    const corte = token.indexOf(":");
+    let peso: number | null = 0;
+    if (corte !== -1) {
+      const pesoVariante = ORDEN_VARIANTE[token.slice(0, corte)];
+      const bp = BREAKPOINTS[token.slice(0, corte).startsWith("max-")
+        ? token.slice(4, corte)
+        : token.slice(0, corte)];
+      if (pesoVariante === undefined || bp === undefined) continue;
+      const activa = token.slice(0, corte).startsWith("max-") ? vw < bp : vw >= bp;
+      if (!activa) continue;
+      peso = pesoVariante;
+    }
+    if (peso < mejor) continue;
+    elegido = base === "truncate" ? "nowrap" : BLANCO[base];
+    mejor = peso;
+  }
+  return elegido;
+}
+
+/** Las hojas de la fila que recortan: hoy son las tres identidades. */
+function identidades(region: string): SpanNode[] {
+  return valueSpans(region).filter((hoja) => /(^|\s)truncate(\s|$)/.test(hoja.className));
+}
+
+/** La etiqueta de apertura de la hoja, con todos sus atributos. */
+function aperturaDe(hoja: SpanNode, region: string): string {
+  const clase = region.indexOf(`className="${hoja.className}"`);
+  if (clase < 0) throw new Error(`la hoja \`${hoja.className.slice(0, 24)}…\` no se reencontró`);
+  // El `<span` puede estar en la línea de arriba: se busca hacia atrás.
+  const inicio = region.lastIndexOf("<span", clase);
+  if (inicio < 0) throw new Error("la hoja no vive en un `span`");
+  return region.slice(inicio, region.indexOf(">", clase) + 1);
+}
+
+/**
+ * Identidades que en el teléfono NO se leen enteras: el `white-space` que gana
+ * deja la línea en `nowrap`, o sea que el nombre se recorta.
+ */
+function identidadesCortadas(region: string): string[] {
+  const fallos: string[] = [];
+  for (const hoja of identidades(region)) {
+    for (const vw of ANCHOS_MOVILES) {
+      if (blancoDe(hoja.className, vw) !== "normal") {
+        fallos.push(`${hoja.className.slice(0, 26)}… a ${vw}px: \`${blancoDe(hoja.className, vw) || "sin white-space"}\``);
+      }
+    }
+  }
+  return fallos;
+}
+
+describe("R26: la identidad no vive sólo en el tooltip donde no hay puntero", () => {
+  it("las tres identidades de la fila son las que esta guarda mira", () => {
+    // Ancla: si la fila dejara de recortar, esta cuenta no miraría nada. Las
+    // tres son «Abrió», «Empleados» y «Cerró», y las tres conservan su `title=`
+    // para el ancho con ratón.
+    expect(identidades(ROW).map((hoja) => labelOf(hoja)?.inner.trim()), "las tres").toEqual([
+      "Abrió:",
+      "Empleados:",
+      "Cerró:",
+    ]);
+  });
+
+  it("abajo de `sm` las tres se ENVUELVEN: el nombre se lee entero sin puntero", () => {
+    expect(identidadesCortadas(ROW), "identidades recortadas en el teléfono").toEqual([]);
+  });
+
+  it("arriba de `sm` no se mueven: `truncate` manda y el `title=` sigue de áncora", () => {
+    // El escritorio es la densidad de hoy y no se toca. Lo que se afirma es que
+    // la variante que envuelve NO sube: arriba gana `truncate`.
+    for (const hoja of identidades(ROW)) {
+      for (const vw of ANCHOS_ESCRITORIO) {
+        expect(blancoDe(hoja.className, vw), `${hoja.className.slice(0, 26)}… a ${vw}px`).toBe("nowrap");
+      }
+      expect(aperturaDe(hoja, ROW), "el `title=` se conserva").toMatch(/\btitle=/);
+    }
+  });
+
+  it("el arreglo NO es una prohibición de `title=`: los tres lo conservan", () => {
+    // Si alguien «arregla» R26 borrando los `title=` de arriba, esta guarda lo
+    // delata: el `title=` del escritorio es legítmo —ahí hay ratón— y quitarlo
+    // sería perder información sin ganar nada.
+    for (const hoja of identidades(ROW)) {
+      expect(aperturaDe(hoja, ROW), `el \`title=\` de ${hoja.className.slice(0, 20)}…`).toContain("title=");
+    }
+  });
+
+  it("el control negativo: quitarle el `max-sm:whitespace-normal` se acusa en los cuatro anchos", () => {
+    // La edición que hace el defecto de nuevo, y que un token no vería: el
+    // `truncate` sigue ahí, la lista sigue teniendo lo que tenía, y sin embargo
+    // el nombre vuelve a quedar en una sola línea cortada.
+    // SIN la `g`: se le quita el `max-sm:whitespace-normal` a la PRIMERA
+    // identidad y se deja las otras dos como están, para que el recuento del
+    // fallo demuestre que la guarda acusa hoja por hoja.
+    const sinEnvolver = ROW.replace(/(^|[\s"])max-sm:whitespace-normal(?=[\s"])/, "$1");
+    expect(sinEnvolver, "la mutación tiene que cambiar el fuente").not.toBe(ROW);
+    expect(blancoDe(identidades(sinEnvolver)[0].className, 390), "vuelve el recorte").toBe("nowrap");
+    expect(identidadesCortadas(sinEnvolver)).toHaveLength(ANCHOS_MOVILES.length);
+  });
+
+  it("y el `nowrap` pelado se acusa igual: envolver no es lo mismo que recortar", () => {
+    // La otra forma de escribir lo mismo: sin el `truncate` pero con un
+    // `whitespace-nowrap` pelado. El nombre no se recorta… pero tampoco se
+    // envuelve, y en una tarjeta angosta se sale.
+    const nowrapPelado = ROW.replace(
+      /(^|\s)max-sm:whitespace-normal(\s|$)/,
+      "$1whitespace-nowrap$2",
+    );
+    expect(nowrapPelado, "la mutación tiene que cambiar el fuente").not.toBe(ROW);
+    expect(identidadesCortadas(nowrapPelado)).toHaveLength(ANCHOS_MOVILES.length);
+  });
+});
