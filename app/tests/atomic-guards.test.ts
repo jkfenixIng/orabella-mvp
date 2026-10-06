@@ -248,12 +248,40 @@ describe("el índice único del borrador de nómina y el cubo de cadencia (078)"
 /* --------------------------------------------------------------------------
    La deriva entre los DOS artefactos del índice del borrador.
 
-   `supabase/test-bootstrap.sql` es `cat 001_orabella_schema.sql + seeds` (paso
-   2.8 del README del squash), así que la línea de su índice no es una fuente:
-   es una COPIA. Hoy está ALINEADA a mano con la 078, que sí es la fuente del
-   arreglo, y ese puente es compatible hacia adelante: cuando el archivo único se
-   regenere desde el historial —con la 078 adentro—, el paso 2.8 produce la misma
-   línea y no hay nada que corregir.
+   `supabase/test-bootstrap.sql` es `cat 001_orabella_schema.sql` + `seeds/
+   catalog.sql` + `seeds/acceptance.sql` (paso 2.8 del README del squash), así que
+   la línea de su índice no es una fuente: es una COPIA de la que trae el archivo
+   único, que a su vez sale del volcado.
+
+   POR QUÉ LAS DOS COPIAS SE COMPARAN EN MINÚSCULAS, Y NO ES LAXITUD
+
+   Las dos emiten el MISMO índice por dos manos distintas, y las dos son correctas
+   en la base:
+
+     * la 078 está ESCRITA a mano y dice `coalesce(frequency, '')`;
+     * el archivo único lo TRAE de `pg_dump`, que deparsa el índice con
+       `pg_get_indexdef` y devuelve los nombres de función YA NORMALIZADOS por el
+       catálogo: `COALESCE(frequency, ''::text)`.
+
+   En PostgreSQL los identificadores sin comillas son INSENSIBLES a la caja:
+   `coalesce` y `COALESCE` son el mismo nombre, la misma función y el mismo
+   índice. Una comparación que las distingue no está midiendo la garantía del
+   índice —clave de tres elementos y `WHERE` de borradores—, está midiendo cómo
+   se escribió la línea, y eso no es una propiedad del esquema: es la forma que
+   cada herramienta elige al emitirla.
+
+   Y no es hipotético: con la comparación sensible a la caja, regenerar el
+   bootstrap desde el `001` —que es exactamente lo que el paso 2.8 ordena— ponía
+   esta guarda en ROJO contra un índice correcto. El guardián tenía entonces la
+   propiedad contraria de la suya: no detectaba deriva, la FABRICABA.
+
+   La normalización va en `extractIndexDdl`, que es el punto donde las dos
+   declaraciones salen a superficie, y no en las aserciones: una sola función
+   decide qué es «la misma declaración» y todo lo que se compara arriba hereda
+   esa decisión. Lo que la guarda sigue exigiendo es lo de siempre —mismo nombre,
+   misma tabla, clave de TRES elementos y mismo `WHERE`—; quitarle el cubo de
+   cadencia a cualquiera de las dos la pone roja igual, y hay un control positivo
+   abajo que lo demuestra sobre el archivo real.
 
    Lo que no existía era una guarda que lo dijera. Las dos copias pueden
    separarse sin que ninguna prueba se entere: una se regenera, la otra se
@@ -262,16 +290,13 @@ describe("el índice único del borrador de nómina y el cubo de cadencia (078)"
    que promete una cosa y aplica otra — así que esta guarda las ata: si las dos
    definiciones dejan de ser la MISMA forma, el rojo nombra las dos.
 
-   También es lo que hace visible la DERIVA que queda abierta en el archivo
-   único, que todavía declara el índice SIN cadencia y no se regenera solo.
-
    Lectura tolerante y sin base, como las de arriba: se comparan las DECLARACIONES
    como texto —mismo nombre, misma tabla, misma clave de TRES elementos y mismo
    `WHERE`—, no su efecto en el catálogo. El punto de las dos guardas de la 078
    es la forma; éste mide que las dos formas sean la misma.
    -------------------------------------------------------------------------- */
 
-/** La copia de prueba: el `001` concatenado con los seeds (paso 2.8 del squash). */
+/** La copia de prueba: el `001` concatenado con los seeds, en el orden del paso 2.8 del squash. */
 const BOOTSTRAP_PATH = join(APP_ROOT, "supabase", "test-bootstrap.sql");
 
 /** El índice del borrador, en el nombre elegido a mano que citan 007, 074 y 078. */
@@ -279,16 +304,23 @@ const DRAFT_INDEX_NAME = "uq_payroll_draft_per_range";
 
 /**
  * Saca la declaración de UN índice del SQL y la deja comparable: sin
- * comentarios, en una sola línea y SIN los casts que sólo agrega `pg_dump`
- * (`''::text` → `''`, `'borrador'::text` → `'borrador'`). El cast no cambia el
- * índice: es la misma clave y el mismo `WHERE` escritos por otra mano, y quitarlo
- * es lo que hace que las dos copias se puedan comparar carácter por carácter.
+ * comentarios, en una sola línea, SIN los casts que sólo agrega `pg_dump`
+ * (`''::text` → `''`, `'borrador'::text` → `'borrador'`) y en MINÚSCULAS. El
+ * cast no cambia el índice: es la misma clave y el mismo `WHERE` escritos por
+ * otra mano, y quitarlo es lo que hace que las dos copias se puedan comparar
+ * carácter por carácter. La caja tampoco lo cambia —en PostgreSQL los
+ * identificadores sin comillas son insensibles a ella, así que `coalesce` y
+ * `COALESCE` son el MISMO nombre—, y normalizarla es lo que impide que esta
+ * guarda se ponga roja contra un índice correcto cuando las dos declaraciones
+ * vienen de herramientas distintas: la 078 escrita a mano dice `coalesce`, y el
+ * volcado de `pg_dump` dice `COALESCE`. Ver el bloque de arriba: el detalle de
+ * por qué no es laxitud está escrito allí, y va con la guarda, no con la aserción.
  * Una cadena vacía significa que la declaración no estaba: la aserción la nombra.
  */
 function extractIndexDdl(sql: string, indexName: string): string {
   const clean = stripSqlComments(sql).replace(/\s+/g, " ");
   const statement = new RegExp(`CREATE (?:UNIQUE )?INDEX ${indexName}\\b[\\s\\S]*?;`, "i").exec(clean);
-  return (statement?.[0] ?? "").replace(/::[\w ]+(?=[),;]|$)/g, "").replace(/\s+/g, " ").trim();
+  return (statement?.[0] ?? "").replace(/::[\w ]+(?=[),;]|$)/g, "").replace(/\s+/g, " ").toLowerCase().trim();
 }
 
 describe("el índice del borrador: la 078 y el bootstrap de prueba dicen lo mismo", () => {
@@ -311,9 +343,9 @@ describe("el índice del borrador: la 078 y el bootstrap de prueba dicen lo mism
     ] as const) {
       expect(ddl, `${nombre} :: declaración ausente`).not.toBe("");
       expect(ddl, `${nombre} :: clave`).toContain(
-        "USING btree (start_date, end_date, coalesce(frequency, ''))",
+        "using btree (start_date, end_date, coalesce(frequency, ''))",
       );
-      expect(ddl, `${nombre} :: WHERE`).toContain("WHERE (status = 'borrador')");
+      expect(ddl, `${nombre} :: WHERE`).toContain("where (status = 'borrador')");
     }
 
     // Y la igualdad, que es la guarda de verdad: si una de las dos se queda atrás o

@@ -4,26 +4,26 @@
 --
 -- QUÉ ES ESTE ARCHIVO
 --   El esquema completo de Orabella en el estado exacto en que quedó después de
---   aplicar el historial 001-077: 36 tablas, 28 funciones, 10 políticas RLS, 65
+--   aplicar el historial 001-078: 36 tablas, 28 funciones, 10 políticas RLS, 65
 --   índices, 21 disparadores, 104 restricciones de tabla (34 PRIMARY KEY, 56
 --   FOREIGN KEY, 13 UNIQUE y 1 EXCLUDE), 128 restricciones CHECK en línea y 139
 --   comentarios, con RLS habilitado en las 36 tablas.
 --
---   Sustituye a las 76 migraciones: se aplica una vez, de una sola pasada, y a
+--   Sustituye a las 77 migraciones: se aplica una vez, de una sola pasada, y a
 --   partir de ahí no hay más migraciones que mantener en sincronía.  Es un
 --   VOLCADO de esquema (`--schema-only`), no una migración incremental: asume
 --   el esquema vacío y por eso no lleva `IF NOT EXISTS` sobre las tablas ni
 --   ningún `DROP`.
 --
 -- DE DÓNDE SALE
---   De `~/orabella-db/esquema-final.sql` (357.380 bytes, 8.100 líneas, UTF-8 sin
+--   De `~/orabella-db/esquema-final.sql` (357.411 bytes, 8.100 líneas, UTF-8 sin
 --   BOM), producido por:
 --
 --       pg_dump --schema-only --no-owner --exclude-schema=auth \
 --               --file ~/orabella-db/esquema-final.sql
 --
 --   sobre la base descartable `orabella_build` del servidor de PRUEBAS, ya
---   sembrada con el historial 001-077.  Ese volcado es la FUENTE DE VERDAD:
+--   sembrada con el historial 001-078.  Ese volcado es la FUENTE DE VERDAD:
 --   este archivo se construye a partir de él y no se edita a mano.  Servidor
 --   PostgreSQL 17.6; cliente pg_dump 18.3.
 --
@@ -67,8 +67,8 @@
 --       ata el archivo a un esquema de destino; véase "EXTENSIONES" más abajo.
 --
 -- POR QUÉ EL HISTORIAL VIVE EN `app/supabase/schema-history/`
---   Porque este archivo no reemplaza al historial: lo resume.  Las 76
---   migraciones 001-077 (la 032 nunca existió) se movieron ahí con `git mv`,
+--   Porque este archivo no reemplaza al historial: lo resume.  Las 77
+--   migraciones 001-078 (la 032 nunca existió) se movieron ahí con `git mv`,
 --   con su historial de git intacto, por dos razones:
 --
 --     1. Explican el PORQUÉ de cada objeto.  El volcado captura el resultado,
@@ -7160,7 +7160,7 @@ CREATE UNIQUE INDEX uq_payments_shift_idempotency_key ON public.payments USING b
 -- Name: uq_payroll_draft_per_range; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX uq_payroll_draft_per_range ON public.payroll_periods USING btree (start_date, end_date) WHERE (status = 'borrador'::text);
+CREATE UNIQUE INDEX uq_payroll_draft_per_range ON public.payroll_periods USING btree (start_date, end_date, COALESCE(frequency, ''::text)) WHERE (status = 'borrador'::text);
 
 
 --
