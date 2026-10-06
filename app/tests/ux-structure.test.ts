@@ -24,6 +24,13 @@ import { describe, expect, it } from "vitest";
         alguna de las nueve migradas, la guarda FALLA en vez de pasar sola.
      6. Control negativo del detector: la firma vieja se reporta como violación
         por el MISMO predicado que usa la guarda.
+     7. El ritmo del shell vive en UN literal del `<main>` del primitivo: la
+        altura dinámica (`min-h-dvh lg:min-h-0`), el `gap-6`, y el par de
+        padding con sus dos mitades (`px-4 sm:px-6 py-6 sm:py-12`). Es una
+        afirmación LÉXICA del vocabulario —el resultado que gana en la cascada
+        lo afirma `responsive-primitives.test.ts`, con el `twMerge` del `cn` y
+        la cascada por breakpoint—: acá lo que se cierra es que el ritmo no se
+        parta en dos literales, con la mitad nueva fuera del alcance de nadie.
 
    POR QUÉ TOKENS Y NO SUBSTRINGS: este repo se quemó dos veces con grep de
    substring (`text-text-primary` termina en `text-primary`; `border-border`
@@ -213,6 +220,23 @@ function h1Classes(source: string): string[] {
   return match ? tokenize(match[1]).map(utilityOf) : [];
 }
 
+/**
+ * La clase BASE que el primitivo le pasa a su `<main>`: el primer literal de
+ * cadena del `cn(...)` de la etiqueta.
+ *
+ * Es el ritmo del shell, que es UNO solo para las diez pantallas: por eso se
+ * lee el LITERAL y no un token suelto. Un token suelto (`py-12`) no distinguiría
+ * «el ritmo vive acá» de «alguien escribió un `py-12` suelto en otro lado»; el
+ * literal es la unidad que el `cn` del componente fusiona y entrega al DOM.
+ */
+function containerBaseClass(source: string): string[] {
+  const main = stripComments(source).match(/<main\b[^>]*>/);
+  if (!main) throw new Error("el primitivo no declara un `<main>`");
+  const cn = main[0].match(/cn\(\s*'([^']*)'/);
+  if (!cn) throw new Error("el `<main>` del primitivo no pasa un literal a `cn(`");
+  return tokenize(cn[1]);
+}
+
 const PAGES = readPages(PAGES_ROOT);
 
 /* ==========================================================================
@@ -249,6 +273,34 @@ describe("estructura de página: el detector no es un sello de goma", () => {
     expect(
       shellViolations("// <main className=\"mx-auto flex max-w-4xl\">\n/* <h1>x</h1> */"),
     ).toEqual([]);
+  });
+
+  it("`containerBaseClass` lee UN literal: un ritmo partido en dos NO pasa la cuenta", () => {
+    // El caso que la cuenta del ritmo tiene que ver: si alguien parte el
+    // shell en dos literales, el segundo —con el padding— deja de estar en el
+    // alcance de la guarda. Lejos de hacerlo invisible, el recorte la hace
+    // FALLAR en vez de dejarla en verde sobre la mitad nueva.
+    const partido = [
+      "<main",
+      "  className={cn(",
+      "    'mx-auto flex min-h-dvh lg:min-h-0 w-full flex-col gap-6',",
+      "    'px-4 sm:px-6 py-6 sm:py-12',",
+      "  )}",
+      ">",
+    ].join("\n");
+    const base = containerBaseClass(partido);
+    expect(base).toEqual([
+      "mx-auto",
+      "flex",
+      "min-h-dvh",
+      "lg:min-h-0",
+      "w-full",
+      "flex-col",
+      "gap-6",
+    ]);
+    // Y el ritmo partido no pasa: el padding no está en el literal que la
+    // guarda lee.
+    expect(base.filter((token) => /^(?:sm:)?p[xy]-/.test(token))).toEqual([]);
   });
 });
 
@@ -302,5 +354,33 @@ describe("estructura de página: el walk leyó las páginas reales", () => {
     expect(h1Classes(primitive)).toEqual(["text-3xl", "font-bold"]);
     // Una sola vez por página: el primitivo es el único que lo declara.
     expect([...stripComments(primitive).matchAll(/<h1(?=[\s/>])/g)]).toHaveLength(1);
+  });
+
+  it("el ritmo del shell vive en UN literal, con la altura dinámica y el escalón", () => {
+    const primitive = readFileSync(PRIMITIVE_PATH, "utf8");
+    const base = containerBaseClass(primitive);
+
+    // 1. La caja: centrada, columna, de ancho completo, con el ritmo de secciones.
+    expect(base.filter((token) => utilityOf(token) === "mx-auto")).toEqual(["mx-auto"]);
+    expect(base.filter((token) => utilityOf(token) === "gap-6")).toEqual(["gap-6"]);
+    // 2. La altura: lo que el punto 2 del encabezado afirmaba y NINGUNA guarda
+    //    miraba sobre el archivo —solo se afirmaba que el DETECTOR no acusa
+    //    `min-h-dvh`. Ahora se afirma el token en el lugar que lo aplica.
+    expect(base.filter((token) => utilityOf(token) === "min-h-dvh")).toEqual(["min-h-dvh"]);
+    expect(base.filter((token) => token === "lg:min-h-0")).toEqual(["lg:min-h-0"]);
+    // Y el primitivo no vuelve a pedir `min-h-screen` en ninguna parte.
+    expect(minHScreenTokens(primitive)).toEqual([]);
+    // 3. El padding, con SUS DOS MITADES: la angosta y la de escritorio. Un
+    //    `px-6 py-12` pelado es el estado que R17/R31 medió (24 px por lado en
+    //    los seis anchos y 48 arriba y abajo); un `sm:` que aprieta el
+    //    escritorio es el error del otro lado. Lo que GANA de todo esto lo
+    //    afirma `responsive-primitives.test.ts`; acá se afirma que el par vive
+    //    en el MISMO literal y en las dos mitades.
+    expect(base.filter((token) => /^(?:sm:)?p[xy]-/.test(token))).toEqual([
+      "px-4",
+      "sm:px-6",
+      "py-6",
+      "sm:py-12",
+    ]);
   });
 });

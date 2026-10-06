@@ -6,8 +6,8 @@ import { describe, expect, it } from "vitest";
 import { twMerge } from "tailwind-merge";
 
 /* --------------------------------------------------------------------------
-   R2, R32 y R7 — las tres primitivas que la auditoría de responsive midió como
-   bloqueantes, y que pagan en TODAS las pantallas.
+   R2, R32, R7 y R17/R31 — las cuatro primitivas que la auditoría de responsive
+   midió como bloqueantes, y que pagan en TODAS las pantallas.
 
    Ninguna es una pantalla: las tres son `main-nav.tsx` (el cajón móvil),
    `form-dialog.tsx` (el pie de los formularios) y `dialog.tsx` (la caja del
@@ -1684,5 +1684,354 @@ describe("alcance declarado de R-C", () => {
     // cierre se superpone a ese bloque: se reportó con `path:line` en vez de
     // tocar un archivo que otra persona tenía tomado.
     expect(true).toBe(true);
+  });
+});
+
+/* ==========================================================================
+   R17 + R31 — EL GUTTER DE LA PÁGINA BAJA DEBAJO DE `sm`.
+
+   MEDIDO ANTES de este cambio, en Chromium real sobre `/login` (que es la
+   pantalla de `PageContainer size="narrow"`), leyendo `getComputedStyle(main)`:
+
+     | vw   | padding-left/right | padding-top/bottom | caja de contenido |
+     | 320  | 24px / 24px       | 48px / 48px       | 272px             |
+     | 360  | 24px / 24px       | 48px / 48px       | 312px             |
+     | 390  | 24px / 24px       | 48px / 48px       | 342px             |
+     | 412  | 24px / 24px       | 48px / 48px       | 364px             |
+     | 640  | 24px / 24px       | 48px / 48px       | 400px             |
+     | 1024 | 24px / 24px       | 48px / 48px       | 400px             |
+
+   48 de 320 px de gutter antes de que empiece el contenido —15 % del ancho— y
+   96 px de relleno vertical sobre un viewport de 568 (17 %, R31). Es el MISMO
+   número en las diez pantallas porque el shell es uno solo (`page.tsx`), que es
+   lo que hace barato el arreglo y lo que hace caro equivocarse.
+
+   LO QUE AFIRMA ESTA SECCIÓN, y por qué no mira un token: que el token `px-6`
+   esté escrito no es gutter de 24 px; lo que pinta el navegador es lo que GANA
+   en la cascada. Por eso estas guardas resuelven la clase EFECTIVA con el mismo
+   `twMerge` que usa el `cn` del componente y después con la misma cascada por
+   breakpoint que ya usa R-C (`enReposo` + `propiedadDe`). Un `sm:px-2` o un
+   `md:px-10` agregados después NO borran ningún token y sí rompen la guarda.
+
+   LO QUE NO PUEDE AFIRMAR, DICHO DE ANTEMANO: que el navegador pinte estos
+   números. Eso se midió aparte en Chromium real, antes y después del cambio, y
+   está en el informe de la unidad; acá se afirma el CONTRATO de la clase que el
+   navegador recibe.
+   ========================================================================== */
+
+const PAGE_PATH = join(APP_ROOT, "src", "components", "ui", "lib", "page.tsx");
+const PAGE = readFileSync(PAGE_PATH, "utf8");
+const PAGE_CODE = stripComments(PAGE);
+const LOGIN_PAGE_CODE = stripComments(
+  readFileSync(join(APP_ROOT, "app", "login", "page.tsx"), "utf8"),
+);
+
+/** Los anchos de la cuenta, con el corte de `sm` (@ 640) de los dos lados. */
+const ANCHOS_DE_LA_PAGINA = [
+  320, 360, 375, 390, 412, 480, 639, 640, 641, 768, 1024, 1280, 1440, 1920,
+];
+
+/** Abajo de `sm`: 16 px por lado y 24 px arriba y abajo (el hueco de `sm:`). */
+const GUTTER_ANGOSTO_PX = 16;
+const RITMO_ANGOSTO_PX = 24;
+
+/** Desde `sm`: 24 px por lado y 48 px arriba y abajo — el escritorio NO se mueve. */
+const GUTTER_DE_ESCRITORIO_PX = 24;
+const RITMO_DE_ESCRITORIO_PX = 48;
+
+/** El alto del teléfono que la auditoría usó para medir el relleno vertical. */
+const ALTO_DEL_TELEFONO_PX = 568;
+
+/** Los `size` de `SIZE`, leídos del fuente: uno por `<main>` renderizado. */
+function pageSizeClasses(): string[] {
+  const declaracion = PAGE_CODE.match(/const SIZE = \{([\s\S]*?)\} as const/);
+  if (!declaracion) throw new Error("`page.tsx` no declara `const SIZE = { … } as const`");
+  const encontrados = [...declaracion[1].matchAll(/:\s*'([^']+)'/g)].map((hit) => hit[1]);
+  if (encontrados.length !== 3) {
+    throw new Error(`\`SIZE\` declara ${encontrados.length} tamaños y la cuenta espera 3`);
+  }
+  return encontrados;
+}
+
+/** La clase BASE que `PageContainer` le impone a su `<main>`. */
+function pageBaseClass(): string {
+  return cnBaseClass(PAGE_CODE, "main");
+}
+
+/**
+ * La clase EFECTIVA del `<main>`: `cn(base, SIZE[size], className)`, en el
+ * orden en que el componente los pasa. `caller` es el `className` de una
+ * pantalla, para poder ver si un llamador se come el escalón.
+ */
+function effectivePageClass(indiceDelSize: number, caller = ""): string {
+  return [pageBaseClass(), pageSizeClasses()[indiceDelSize], caller]
+    .filter(Boolean)
+    .join(" ");
+}
+
+/** El `padding-{l,r}` y el `padding-{t,b}` EFECTIVOS a ese ancho, en px. */
+function paddingDeLaPagina(
+  clase: string,
+  vw: number,
+): { px: number | null; py: number | null } {
+  const tokens = enReposo(clase, vw);
+  return {
+    px: propiedadDe(tokens, (token) => /^px-/.test(baseDe(token))),
+    py: propiedadDe(tokens, (token) => /^py-/.test(baseDe(token))),
+  };
+}
+
+/** Los tokens de padding CON variante, en orden de fuente. */
+function variantesDePadding(clase: string): string[] {
+  return twMerge(clase)
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter((token) => /^(?:sm|md|lg|xl|2xl):p[xy]-/.test(token));
+}
+
+/**
+ * El gutter lateral como porcentaje del ancho de la caja, en MILÉSIMAS.
+ *
+ * La unidad importa: en centésimas de a uno, `10 %` (el techo del criterio) y
+ * `10 px` darían el mismo número y dos umbrales quedarían ciertos por el motivo
+ * equivocado. Acá `1000` es 10 % y `1500` es el 15 % que R17 midió a 320.
+ */
+function gutterEnMilesimas(gutter: number, caja: number): number {
+  return Math.round((gutter / caja) * 10_000);
+}
+
+/**
+ * Por qué la clase EFECTIVA no cumple el escalón de R17/R31 a ese ancho.
+ * Vacío = cumple. Cada razón es de la PROPIEDAD que gana, no del nombre del
+ * token que alguien recuerda.
+ */
+function violacionesDeR17(clase: string, vw: number): string[] {
+  const fallas: string[] = [];
+  const angosto = vw < 640;
+  const gutter = angosto ? GUTTER_ANGOSTO_PX : GUTTER_DE_ESCRITORIO_PX;
+  const ritmo = angosto ? RITMO_ANGOSTO_PX : RITMO_DE_ESCRITORIO_PX;
+  const { px, py } = paddingDeLaPagina(clase, vw);
+
+  if (px === null) {
+    fallas.push("padding lateral sin valor: la caja toca el borde de la pantalla");
+  } else if (px !== gutter) {
+    fallas.push(`padding lateral ${px}px, el escalón pide ${gutter}px`);
+  }
+  if (py === null) {
+    fallas.push("padding vertical sin valor");
+  } else if (py !== ritmo) {
+    fallas.push(`padding vertical ${py}px, el escalón pide ${ritmo}px`);
+  }
+
+  // Un `p-*` SIN eje no lo modela este resolvedor, que separa `px` de `py`: si
+  // aparece, la guarda lo reporta en vez de suponer que no está.
+  const sinEje = enReposo(clase, vw).filter((token) => /^p-\d/.test(baseDe(token)));
+  if (sinEje.length > 0) {
+    fallas.push(`\`p-*\` sin eje (${sinEje.join(" ")}): esta cuenta resuelve px y py por separado`);
+  }
+
+  // El techo del criterio: el gutter lateral no pasa del 10 % del VIEWPORT. A
+  // 320 px, `px-6` daba 15 % (48 de 320) y eso es el defecto medido; `px-4`
+  // deja 10 % justos, que NO es más que el techo. El denominador es el ancho de
+  // pantalla y no la caja porque, cuando `max-w-*` limita el contenedor, la
+  // franja que sobra NO es padding: es `mx-auto` centrando, y ese aire lateral
+  // de escritorio es exactamente el de siempre.
+  if (px !== null) {
+    const milesimas = gutterEnMilesimas(2 * px, vw);
+    if (milesimas > 1000) {
+      fallas.push(`gutter lateral ${2 * px}px de un viewport de ${vw}px = ${milesimas / 100}%`);
+    }
+  }
+
+  return fallas;
+}
+
+/**
+ * Los `<PageContainer … className="…">` del árbol de `app/` que pasan un token
+ * de padding, y cuántos `<PageContainer>` se leyeron en total.
+ *
+ * Por qué importa: un `sm:px-2` en un llamador SOBREVIVE a `tailwind-merge`
+ * (mismo grupo, distinta variante) y deja el escritorio en 8 px sin borrar
+ * ningún token del primitivo. Hoy ninguno de los diez pasa padding; si mañana
+ * uno lo hace, esta cuenta lo nombra en vez de romper la pantalla.
+ */
+function pageContainerPaddingCallSites(): {
+  offenses: string[];
+  leidos: number;
+  conPadding: number;
+} {
+  const raiz = process.cwd();
+  const offenses: string[] = [];
+  let leidos = 0;
+  let conPadding = 0;
+  const visitar = (dir: string): void => {
+    for (const entrada of readdirSync(dir, { withFileTypes: true })) {
+      const ruta = join(dir, entrada.name);
+      if (entrada.isDirectory()) {
+        if (entrada.name === "node_modules" || entrada.name.startsWith(".")) continue;
+        visitar(ruta);
+        continue;
+      }
+      if (!entrada.name.endsWith(".tsx")) continue;
+      const fuente = stripComments(readFileSync(ruta, "utf8"));
+      for (const segmento of fuente.split("<PageContainer").slice(1)) {
+        leidos += 1;
+        const bloque = segmento.split(">")[0];
+        const clase = bloque.match(/className="([^"]*)"/)?.[1] ?? "";
+        const padding = twMerge(clase)
+          .split(/\s+/)
+          .filter(Boolean)
+          .filter((token) => /^p[xy]?-/.test(token));
+        if (padding.length > 0) {
+          conPadding += 1;
+          offenses.push(
+            `${relative(raiz, ruta).split(SEPARADOR_DE_RUTA).join("/")}: ${padding.join(" ")}`,
+          );
+        }
+      }
+    }
+  };
+  visitar(join(raiz, "app"));
+  return { offenses, leidos, conPadding };
+}
+
+describe("R17/R31: el gutter de la `PageContainer` baja debajo de `sm` y el escritorio no se movió", () => {
+  it("el padding efectivo pide 16/24 por debajo de `sm` y 24/48 desde 640, en los tres tamaños", () => {
+    const sizes = pageSizeClasses();
+    expect(sizes.length, "los `size` de `SIZE`").toBe(3);
+    let comprobados = 0;
+    for (const [indice, size] of sizes.entries()) {
+      for (const vw of ANCHOS_DE_LA_PAGINA) {
+        expect(
+          violacionesDeR17(effectivePageClass(indice), vw),
+          `${size} a ${vw}px`,
+        ).toEqual([]);
+        comprobados += 1;
+      }
+    }
+    // La cuenta no puede quedarse sin comparar nada.
+    expect(comprobados, "combinaciones tamaño × ancho").toBe(
+      sizes.length * ANCHOS_DE_LA_PAGINA.length,
+    );
+  });
+
+  it("a 320 px el gutter lateral deja de ser el 15 % del ancho", () => {
+    // El número del defecto medido: 48 de 320 y 272 de caja de contenido con
+    // `px-6`. Con el escalón son 32 de gutter y 288 de caja.
+    for (const [indice, size] of pageSizeClasses().entries()) {
+      const clase = effectivePageClass(indice);
+      const px = paddingDeLaPagina(clase, 320).px ?? 0;
+      const caja = anchoEfectivo(enReposo(clase, 320), 320);
+      expect(2 * px, `${size}: gutter lateral a 320px`).toBe(32);
+      expect(
+        gutterEnMilesimas(2 * px, 320),
+        `${size}: gutter como % del viewport a 320px`,
+      ).toBeLessThanOrEqual(1000);
+      expect(caja - 2 * px, `${size}: caja de contenido a 320px`).toBe(288);
+    }
+  });
+
+  it("el escritorio se queda donde estaba: 24 px por lado y 48 arriba y abajo", () => {
+    // No alcanza con que el token exista: tiene que GANAR. Se afirma el
+    // ganador en cada breakpoint desde 640, para los tres tamaños.
+    for (const indice of [0, 1, 2]) {
+      for (const vw of [640, 768, 1024, 1280, 1440, 1920]) {
+        expect(
+          paddingDeLaPagina(effectivePageClass(indice), vw),
+          `size ${indice} a ${vw}px`,
+        ).toEqual({ px: GUTTER_DE_ESCRITORIO_PX, py: RITMO_DE_ESCRITORIO_PX });
+      }
+    }
+    // Y NADIE reclama el padding desde `md` en adelante: un `md:px-*` o un
+    // `lg:py-*` posterior dejaría el escritorio distinto sin borrar un token.
+    expect(variantesDePadding(pageBaseClass())).toEqual(["sm:px-6", "sm:py-12"]);
+  });
+
+  it("R31: `/login` deja de quemar el 17 % de un viewport de 568", () => {
+    // La pantalla que la auditoría midió, con el tamaño con el que se renderiza:
+    // si el login cambia de `size`, esta cuenta estaría midiendo otra caja.
+    expect(LOGIN_PAGE_CODE).toMatch(/<PageContainer[^>]*size="narrow"/);
+    const angosto = paddingDeLaPagina(effectivePageClass(0), 320).py ?? 0;
+    const escritorio = paddingDeLaPagina(effectivePageClass(0), 1024).py ?? 0;
+    expect(2 * angosto, "relleno vertical total en el teléfono").toBe(48);
+    expect(
+      gutterEnMilesimas(2 * angosto, ALTO_DEL_TELEFONO_PX),
+      "% de 568px que ocupa el relleno vertical",
+    ).toBeLessThanOrEqual(1000);
+    // El escritorio conserva los 48 px de arriba y de abajo.
+    expect(escritorio, "relleno vertical del escritorio").toBe(RITMO_DE_ESCRITORIO_PX);
+  });
+
+  it("el aire de arriba es el MISMO ritmo que separa las secciones (`gap-6`)", () => {
+    // La razón de `py-6` y no de `py-8` o `py-4`: arriba del contenido el aire
+    // deja de ser un ritmo distinto del que separa las secciones del cuerpo, así
+    // que el scroll de un teléfono no arranca con una franja desproporcionada.
+    const tokens = enReposo(pageBaseClass(), 320);
+    const gap = propiedadDe(tokens, (token) => /^gap-/.test(baseDe(token)));
+    expect(gap, "el `gap-6` del contenedor").toBe(24);
+    expect(paddingDeLaPagina(pageBaseClass(), 320).py, "el `py` del extremo angosto").toBe(gap);
+  });
+
+  it("ningún `page.tsx` del árbol se come el escalón con su propio `className`", () => {
+    const { offenses, leidos, conPadding } = pageContainerPaddingCallSites();
+    expect(offenses, "los llamadores que pasan un token de padding").toEqual([]);
+    // Anti-vacío: el walk leyó las pantallas de verdad y ninguna declaraba
+    // padding, que es la mitad de lo que esta cuenta afirma.
+    expect(leidos, "los `<PageContainer>` leídos").toBeGreaterThanOrEqual(10);
+    expect(conPadding).toBe(0);
+  });
+});
+
+describe("control negativo: el escalón del gutter de la página acusa de verdad", () => {
+  /** La clase del shell tal como estaba antes de este cambio. */
+  const PAGINA_ANTES =
+    "mx-auto flex min-h-dvh lg:min-h-0 w-full flex-col gap-6 px-6 py-12";
+
+  it("la clase de ANTES (`px-6 py-12` pelado) falla en el teléfono", () => {
+    for (const vw of [320, 360, 390, 412, 480, 639]) {
+      const fallas = violacionesDeR17(PAGINA_ANTES, vw).join(" | ");
+      expect(fallas.length, `antes a ${vw}px`).toBeGreaterThan(0);
+      expect(fallas, `antes a ${vw}px`).toContain("padding lateral 24px, el escalón pide 16px");
+      expect(fallas, `antes a ${vw}px`).toContain("padding vertical 48px, el escalón pide 24px");
+    }
+    // El 15 % medido, con el número al lado.
+    expect(violacionesDeR17(PAGINA_ANTES, 320).join(" | ")).toContain(
+      "gutter lateral 48px de un viewport de 320px = 15%",
+    );
+  });
+
+  it("el escritorio de ANTES pasaba: lo que cambia es el teléfono, no el escritorio", () => {
+    for (const vw of [640, 768, 1024, 1280, 1920]) {
+      expect(violacionesDeR17(PAGINA_ANTES, vw), `antes a ${vw}px`).toEqual([]);
+    }
+  });
+
+  it("el escritorio que se aprieta, el que se afloja y el que pierde el gutter fallan", () => {
+    // El error del otro lado del mismo token: el `sm:` bien escrito con el valor
+    // equivocado. Los tokens siguen estando y la guarda tiene que verlo.
+    expect(violacionesDeR17("px-4 sm:px-6 py-6 sm:py-2", 1024).join(" | ")).toContain(
+      "padding vertical 8px",
+    );
+    expect(violacionesDeR17("px-4 sm:px-6 py-6 sm:py-12 md:px-10", 768).join(" | ")).toContain(
+      "padding lateral 40px",
+    );
+    // Y el R7 de esta página: un `lg:px-0` devuelve el gutter a cero.
+    expect(violacionesDeR17("px-4 sm:px-6 py-6 sm:py-12 lg:px-0", 1024).join(" | ")).toContain(
+      "padding lateral 0px",
+    );
+  });
+
+  it("un `p-*` sin eje se reporta en vez de resolverse solo", () => {
+    // La implementación resuelve `px` y `py` por separado (el `p-6` pelado lo
+    // desambigua el CSS por orden de fuente, no por propiedad): prefiere decir
+    // que no puede afirmar antes que suponer.
+    expect(violacionesDeR17("px-4 sm:px-6 p-6", 320).join(" | ")).toContain("sin eje");
+  });
+
+  it("el buen escalón pasa en los catorce anchos: el predicado no está siempre rojo", () => {
+    const clase = effectivePageClass(1);
+    for (const vw of ANCHOS_DE_LA_PAGINA) {
+      expect(violacionesDeR17(clase, vw), `${vw}px`).toEqual([]);
+    }
   });
 });
