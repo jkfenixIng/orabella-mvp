@@ -508,6 +508,73 @@ vive en el cruce, y ningún test de reglas lo iba a mostrar.
 - La **deuda declarada en la base**: el rol `superadmin` y la columna `sedes.payroll_start_date`, que se
   borran en el próximo reset y que hoy tienen una guarda que impide que los borren «de paso».
 
+**Suite al cierre: 2436 pruebas en 48 archivos, todas verdes.**
+
+### La última tanda: los cuatro hallazgos que quedaban, y el rincón sin medir
+
+**R25/R26 — la data que vivía en tooltips.** El defecto, en una sola medición: la regla de
+comisión escrita como texto pinta **53 caracteres en 223×40 px**; la misma regla metida en un
+`title=` pinta **0 caracteres en 0×16 px** — y el tooltip nativo **no existe con el dedo**. Los 20
+`title=` del archivo quedaron inventariados en tres clases y **congelados por una guarda**: diez reglas
+de plata salieron (ahora son **tres notas legibles**, y tres de sus oraciones son **verbatim** las que
+ya usaba el diálogo de ítems: el vocabulario se escribe una sola vez), tres identidades **envuelven**
+debajo de `sm` y conservan el truncado con tooltip arriba (medido: 2 líneas / 40 px, nada recortado), y
+siete no son de la clase. Los controles: el selector de comisión pasa de **10 px y 23 px** a **12 y 44**
+debajo de `sm`.
+
+**R36 — REFUTADO**: los «dos botones de pie de 22 px» **no se reproducen** (miden **40**). Los 22 px
+eran de una revisión anterior que otra unidad ya había arreglado: no se tocó nada y la medición quedó
+escrita en la guarda.
+
+**R35 — el cierre visible, y un componente que no cerraba nada.** Cero de los **29** `DialogContent`
+tenía un cierre visible (se cerraban con Cancelar o Escape, y **en un teléfono no hay Escape**). Y
+`DialogClose` renderizaba **un `Slot` pelado**: no cerraba nada. Lo que lo hacía peligroso es que **no lo
+usaba nadie** — un defecto dormido, y un cierre construido sobre él habría sido un botón que no cierra.
+Ahora la primitiva monta el cierre (clase **constante**, que el llamador no puede fusionar; **fondo
+propio**, porque los diálogos de hoja completa son `bg-transparent`; **dentro de la caja**, porque 3 de
+los 29 recortan su propio borde; y **44 px abajo / 36 en escritorio**, incluido el píxel 639). Se acotó
+una guarda anterior —prohibía cualquier `aria-label` en toda la declaración, y su intención es que el
+nombre del **diálogo** salga del título— a la etiqueta de apertura, y se apretó: **un solo atributo a
+mano**. Y se quitó la ✕ propia del cajón del menú, que con el cierre de la primitiva mostraba **dos**.
+
+**`/alerts` — el último rincón sin medir, y la respuesta es que no hay nada roto.** Medido **en vivo** en
+los cuatro anchos: sin scroll lateral, **cero** hijos fuera de la caja, los cuatro controles devuelven
+`elementFromPoint === self` y miden **44 px**, la fila de alerta entera dentro del viewport con **0
+recortado**, **0 diálogos** y **0 tablas**. Y el mecanismo, medido al píxel: **cada `<input type="date">`
+mide 163 px**, así que el par necesita **338** contra cajas de **254/294/324/346** — **no entra en una
+línea en ningún ancho por debajo de `sm`**. **Envolver *es* el mecanismo**, así que la respuesta correcta
+era **dejarla quieta**, y así se hizo: **ningún archivo cambiado y ninguna guarda escrita**, porque con
+«no está roto» no hay comportamiento que fijar y una aserción sobre `flex-wrap` probaría que la clase está
+escrita, no que la fila envuelva.
+
+**R17 — el margen lateral.** `page.tsx` envuelve **todas** las pantallas y su clase no escalonaba: 24 px
+por lado a 320, o sea **48 de 320 px en margen**. Ahora `px-4 sm:px-6 py-6 sm:py-12`. El efecto lo midió
+**otra unidad** mientras medía su pantalla (verificación independiente): la caja de contenido crece **16
+px en los cuatro anchos** de teléfono. **Consecuencia declarada**: toda medición tomada antes de este
+cambio debajo de `sm` tiene la caja 16 px más angosta — **los números anteriores de este documento quedan
+históricos, no vigentes**.
+
+**Los comentarios que mentían.** Seis comentarios que afirmaban un filtro por sede que ninguna consulta
+tiene (tres en facturación —incluido uno en el camino de creación que el inventario no había visto— y tres
+en comisiones, donde el actor **ni siquiera trae sede**), más un fixture que sembraba una columna que la
+077 borró. Y la clasificación que evita el barrido ciego: se dejaron los comentarios de autorización
+(reafirman el §10, no un predicado) y **los índices únicos `(sede_id, …)`, que sí son reales porque
+`invoices` conserva la columna**.
+
+### Las dos lecciones operativas del día
+
+**La inestabilidad del runner no era del runner: era la máquina.** El desglose de procesos al final del
+día: **30 playwright huérfanos**, 36 subprocesos, 6 de sesión y 5 de un servidor colgado. Los 30
+navegadores que ningún worker cerró saturaban la máquina, y eso explica **todos** los `child exit
+unconfirmed` y los cuelgues de 4 y 30 minutos del día. Un servidor de desarrollo que **escucha pero no
+responde** es un cuelgue, no una caída: hay que matar el proceso y levantarlo, no solo reintentar.
+
+**Y el mecanismo de las sesiones de prueba**: `getSessionUser` **actualiza `last_activity_at` en cada
+petición autenticada**. Una marca de inactividad puesta en el futuro **la pisa la primera lectura**, así
+que un token repartido vale **30 minutos de inactividad** y no más: alcanza para una medición corrida de
+seguido, no para leer código una hora y medir después. La verificación que lo cierra está en
+`src/features/auth/service.ts:431-467`.
+
 ## Hazards reportados y refutados
 
 **«La base del diálogo lleva `max-w-lg` sin variante, así que un llamador con `max-w-sm` podría
