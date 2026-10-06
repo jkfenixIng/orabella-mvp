@@ -174,39 +174,36 @@ function ShiftsTable({
                     "flex flex-wrap items-baseline px-3 py-2 sm:table-row sm:px-0 sm:py-0",
                   )}
                 >
-                {/* La tarjeta móvil, en el orden en que se lee: primero QUÉ turno es
-                    (cuándo abrió y quién lo abrió), después la plata (base inicial,
-                    base final, vales) y el estado; «Cerró» y la justificación bajan
-                    porque sólo hablan de un turno ya cerrado; y la acción al final, en
-                    su propia línea. Arriba de `sm` este mismo orden de marcado no
-                    manda: cada celda vuelve a su columna por el `thead`. */}
+                {/* EL ORDEN DEL MARCADO ES EL DEL ENCABEZADO, y no es una casualidad:
+                    arriba de `sm` cada celda es `sm:table-cell` y una tabla
+                    coloca por ÍNDICE DE DOM, no por nombre —el `<th>` es un rótulo
+                    pintado, no una llave—. Por eso no hay `order-*` ni
+                    `col-start-*`: el orden de lectura del teléfono es el mismo
+                    orden de columnas (Apertura · Estado · Abrió · Cerró · Base
+                    inicial · Ventas · Efectivo · método · Vales · Base final ·
+                    Diferencia), que se lee bien y deja de haber dos órdenes que
+                    mantener en paz. Abajo de `sm` las celdas son `block` y la fila
+                    `flex flex-wrap`: el orden de la fila es el orden de marcado,
+                    así que la tarjeta y la tabla dicen exactamente lo mismo. */}
                 <td className={cn(campoClass)}>
                   <span className={campoLabelClass}>Apertura: </span>
                   {formatDateTime(view.shift.opened_at)}
-                </td>
-                <td className={cn(campoNombreClass)} title={view.abierto_por ?? undefined}>
-                  <span className={campoLabelClass}>Abrió: </span>
-                  {view.abierto_por ?? "—"}
                 </td>
                 <td className={cn(campoParClass)}>
                   <span className={campoLabelClass}>Estado: </span>
                   {view.shift.status}
                 </td>
-                <td className={cn(campoParClass)}>
-                  <span className={campoLabelClass}>Base inicial: </span>
-                  {formatMoney(view.shift.opening_base)}
-                </td>
-                <td className={cn(campoParClass)}>
-                  <span className={campoLabelClass}>Base final: </span>
-                  {isClosed ? formatMoney(view.vigente.base_left) : "—"}
-                </td>
-                <td className={cn(campoParClass)}>
-                  <span className={campoLabelClass}>Vales: </span>
-                  {formatMoney(view.vales)}
+                <td className={cn(campoNombreClass)} title={view.abierto_por ?? undefined}>
+                  <span className={campoLabelClass}>Abrió: </span>
+                  {view.abierto_por ?? "—"}
                 </td>
                 <td className={cn(campoNombreClass)} title={view.cerrado_por ?? undefined}>
                   <span className={campoLabelClass}>Cerró: </span>
                   {view.cerrado_por ?? "—"}
+                </td>
+                <td className={cn(campoParClass)}>
+                  <span className={campoLabelClass}>Base inicial: </span>
+                  {formatMoney(view.shift.opening_base)}
                 </td>
                 {/* Lo de abajo es de ADMIN en el escritorio, y lo es igual en la tarjeta:
                     un no-admin no ve estas celdas ni sus etiquetas en ninguna de las dos
@@ -234,6 +231,14 @@ function ShiftsTable({
                       })}
                     </>
                   )}
+                <td className={cn(campoParClass)}>
+                  <span className={campoLabelClass}>Vales: </span>
+                  {formatMoney(view.vales)}
+                </td>
+                <td className={cn(campoParClass)}>
+                  <span className={campoLabelClass}>Base final: </span>
+                  {isClosed ? formatMoney(view.vigente.base_left) : "—"}
+                </td>
                 {isAdmin && (
                     <>
                 <td className={cn(campoParClass)}>

@@ -580,11 +580,18 @@ function dentroDe(rangos: Array<[number, number]>, indice: number): boolean {
    columnas del escritorio. La guarda los afirma contra el archivo real, así que
    cambiar un orden es un cambio deliberado y no un accidente del marcado.
 
-   LA PRIORIDAD DEL TELÉFONO, y por qué: `Apertura` y `Abrió` abren porque sin
-   ellos no se sabe QUÉ turno es; `Estado`, `Base inicial`, `Base final` y
-   `Vales` son la plata —qué había, qué quedó, qué salió por vales—; `Cerró` y
-   `Justificación` bajan porque sólo tienen sentido en un turno ya cerrado; y
-   `Reconteo` es la acción, al final, en su propia línea.
+   LAS DOS LISTAS SON IGUALES, Y ESO ES LA DECISIÓN, no una coincidencia. La fila
+   tiene UN solo orden de marcado y ese orden es el del encabezado. La razón es
+   que arriba de `sm` las celdas son `sm:table-cell` y una tabla coloca por
+   ÍNDICE DE DOM: el encabezado es un rótulo pintado, no una llave. La otra opción
+   —declarar un orden visual propio del teléfono con `max-sm:order-N` sobre una
+   fila `flex`— se descartó: es un SEGUNDO mecanismo para lo mismo en la misma
+   lista, obliga a que ese orden se escriba y se mantenga por su cuenta (y la
+   guarda lo tendría que congelar aparte), y compra un orden de lectura que el
+   de las columnas ya da: Apertura → Estado → Abrió → Cerró → Base inicial →
+   Ventas → Efectivo → método → Vales → Base final → Diferencia. Se lee bien, dice
+   QUÉ turno es antes que la plata, y sobre todo deja de haber dos órdenes que
+   mantener en paz.
 
    LA PARIDAD POR ROL: `Ventas`, `Efectivo`, los métodos, `Diferencia`,
    `Revisada`, `Justificación` y `Reconteo` son de admin HOY en el escritorio, y
@@ -597,10 +604,20 @@ const SOLO_ADMIN = new Set([
   "Ventas", "Efectivo", "Diferencia", "Revisada", "Justificación", "Reconteo",
 ]);
 
-/** El orden de lectura de la tarjeta móvil. */
+/**
+ * El orden de lectura de la tarjeta móvil: el MISMO que el del escritorio.
+ *
+ * Antes eran dos listas distintas y esa diferencia era el defecto: la fila
+ * traía el orden de lectura del teléfono y el encabezado el de las columnas, y
+ * como la tabla coloca por índice, `Abrió` quedaba bajo `ESTADO`. Se repuntó
+ * esta lista con el arreglo, no se borró la lista: el orden del teléfono sigue
+ * siendo un contrato que la guarda afirma, y ahora afirma que es el MISMO.
+ */
 const ORDEN_MOVIL = [
-  "Apertura", "Abrió", "Estado", "Base inicial", "Base final", "Vales", "Cerró",
-  "Ventas", "Efectivo", PALABRA_METODO, "Diferencia", "Revisada", "Justificación", "Reconteo",
+  "Apertura", "Estado", "Abrió", "Cerró", "Base inicial",
+  "Ventas", "Efectivo", PALABRA_METODO,
+  "Vales", "Base final",
+  "Diferencia", "Revisada", "Justificación", "Reconteo",
 ];
 
 /** El orden de columnas del escritorio: el de siempre, sin cambios. */
@@ -659,6 +676,38 @@ function conjuntoDeEncabezado(lectura: Lectura): Set<string> {
       admin ? `admin:${palabra}` : palabra,
     ),
   );
+}
+
+/**
+ * LA SECUENCIA, no el conjunto. El defecto que esta guarda NO veía, medido con
+ * los datos reales del 2026-10-04: 12 de 17 columnas con el valor debajo de la
+ * palabra equivocada, cada una con `deltaLeft` 0 —el valor SÍ estaba en una
+ * columna, sólo que en la de al lado.
+ *
+ * POR QUÉ EL CONJUNTO NO ALCANZA: arriba de `sm` cada celda es `sm:table-cell`,
+ * y una tabla coloca por ÍNDICE DE DOM, no por nombre. Un `<th>` es un rótulo
+ * pintado, no una llave: si el orden del marcado no es el del encabezado, el
+ * encabezado deja de describir la tabla y pasa a mentir. Todas las
+ * demás invariantes de este archivo pueden pasar con la fila completa y
+ * desalineada —el mismo vocabulario, las mismas etiquetas, la misma cascada—,
+ * porque ninguna mira la POSICIÓN.
+ *
+ * Por eso la cuenta es posición a posición y nombra la que no calza: el
+ * `1b1b269` puso el orden de lectura del teléfono en el marcado y dejó el
+ * encabezado como estaba, así que el archivo era legible y verde.
+ */
+function desalineacionDeColumnas(lectura: Lectura): string[] {
+  const encabezado = palabrasDeEncabezado(lectura).map(({ palabra }) => palabra);
+  const celdas = palabrasDeFila(lectura).map(({ palabra }) => palabra);
+  const fallos: string[] = [];
+  const largo = Math.max(encabezado.length, celdas.length);
+  for (let i = 0; i < largo; i += 1) {
+    const th = encabezado[i] ?? "(sin columna)";
+    const td = celdas[i] ?? "(sin celda)";
+    if (th === td) continue;
+    fallos.push(`columna ${i + 1}: el encabezado dice «${th}» y la celda dice «${td}»`);
+  }
+  return fallos;
 }
 
 /* --------------------------------------------------------------------------
@@ -905,6 +954,43 @@ function conPalabraDistinta(palabra: string, otra: string): Lectura {
   }, { fila: true });
 }
 
+/**
+ * La fila con dos celdas INTERCAMBIADAS entre sí: exactamente la edición que
+ * `1b1b269` hizo —cambiar el orden del marcado sin cambiar el vocabulario—.
+ * Sirve para probar que la cuenta de la SECUENCIA acusa esa edición y que las
+ * de conjunto no.
+ */
+function conCeldasIntercambiadas(una: string, otra: string): Lectura {
+  return lecturaDe((fuente) => {
+    const region = rowRegion(fuente);
+    const base = fuente.indexOf(region);
+    const celda = (palabra: string): [number, number] => {
+      const marca = literalDeEtiqueta(palabra);
+      const desde = region.indexOf(marca);
+      if (desde === -1) throw new Error(`la fila no rotula «${palabra}»`);
+      const inicio = region.lastIndexOf("<td", desde);
+      const fin = region.indexOf("</td>", desde);
+      if (inicio === -1 || fin === -1) throw new Error(`«${palabra}» no tiene celda`);
+      return [inicio, fin + "</td>".length];
+    };
+    const [a0, a1] = celda(una);
+    const [b0, b1] = celda(otra);
+    // Da igual cuál de las dos venía antes: el control vale para cualquier par
+    // que la fila rotule, no sólo para uno que hoy esté en este orden.
+    const [primero, segundo] = a0 < b0 ? [[a0, a1], [b0, b1]] : [[b0, b1], [a0, a1]];
+    const [p0, p1] = primero;
+    const [s0, s1] = segundo;
+    return (
+      fuente.slice(0, base + p0) +
+      region.slice(s0, s1) +
+      region.slice(p1, s0) +
+      region.slice(p0, p1) +
+      region.slice(s1) +
+      fuente.slice(base + region.length)
+    );
+  }, { fila: true });
+}
+
 /* ==========================================================================
    1. Abajo de `sm`: una tarjeta por turno, con su etiqueta en cada valor
    ========================================================================== */
@@ -920,6 +1006,19 @@ describe("caja: la fila de turnos se apila y cada valor dice qué es (R38)", () 
 
   it("las catorce columnas del encabezado siguen ahí, en el orden de siempre", () => {
     expect(palabrasDeEncabezado(LECTURA).map(({ palabra }) => palabra)).toEqual(ORDEN_ESCRITORIO);
+  });
+
+  it("cada celda vuelve a SU columna: la secuencia es la misma, no el mismo conjunto", () => {
+    // Ésta es la que no existía. Con el conjunto basta —las dos superficies
+    // nombran las mismas catorce columnas— y aun así la fila puede estar
+    // desalineada de punta a punta: la tabla coloca por índice de DOM.
+    expect(
+      desalineacionDeColumnas(LECTURA),
+      "columnas con la palabra equivocada arriba",
+    ).toEqual([]);
+    // La paridad de conjunto, que ya existía y que esto NO reemplaza: sigue siendo
+    // cierto que el vocabulario de las dos superficies es el mismo.
+    expect([...conjuntoDeEncabezado(LECTURA)].sort()).toEqual([...conjunto(LECTURA)].sort());
   });
 
   it("la columna dinámica se rotula con el nombre del método, como su encabezado", () => {
@@ -1015,9 +1114,19 @@ describe("caja: la acción de la fila y la paridad por rol", () => {
     ).toEqual(ORDEN_MOVIL.filter((palabra) => SOLO_ADMIN.has(palabra) || palabra === PALABRA_METODO));
   });
 
-  it("el orden de lectura de la tarjeta es el declarado, no el del escritorio", () => {
+  it("el orden de lectura de la tarjeta es el declarado, y es el del escritorio", () => {
     expect(palabrasDeFila(LECTURA).map(({ palabra }) => palabra)).toEqual(ORDEN_MOVIL);
-    expect(ORDEN_MOVIL).not.toEqual(ORDEN_ESCRITORIO);
+    // Ya NO son dos órdenes distintos. Antes esta línea afirmaba lo contrario
+    // (`not.toEqual`) y con razón: eran dos, y por tener dos la tabla mentía.
+    // Ahora la coincidencia ES el contrato: una fila, un orden de marcado, y ese
+    // orden es el que el encabezado nombra.
+    expect(ORDEN_MOVIL).toEqual(ORDEN_ESCRITORIO);
+    // Y el teléfono no necesita un segundo mecanismo: ninguna celda declara un
+    // `order-*`, así que no hay una escala que esta guarda tenga que congelar.
+    expect(
+      camposDe(LECTURA).filter((campo) => /(?:^|\s)(?:[a-z]+:)?order-/.test(campo.clase)),
+      "celdas con `order-*`",
+    ).toEqual([]);
   });
 
   it("la tarjeta no pierde ninguna columna: la densidad es declarada, no accidental", () => {
@@ -1064,6 +1173,43 @@ describe("el predicado no es un sello de goma", () => {
     for (const fallo of fallos) expect(fallo).toContain("no abre con su propia etiqueta");
     expect(nowrapEnElTelefono(vieja), "nowrap").toHaveLength(20);
     expect(etiquetasVisiblesEnEscritorio(vieja), "no hay rótulo que apagar").toEqual([]);
+  });
+});
+
+/* --------------------------------------------------------------------------
+   EL CONTROL NEGATIVO DE LA SECUENCIA. Sin esto, la cuenta nueva podría estar
+   mirando la posición y no estar mirando NADA: un predicado que siempre devuelve
+   `[]` también pasa. Se aplica la edición del defecto real —intercambiar dos
+   celdas— y se exige que la acuse POR POSICIÓN, mientras las cuentas de conjunto
+   y de vocabulario la dejan pasar, que es justo lo que la dejó verde al original.
+   -------------------------------------------------------------------------- */
+
+describe("caja: dos celdas intercambiadas se acusan por posición", () => {
+  it("intercambiar dos celdas rompe la secuencia, y la cuenta nombra la posición", () => {
+    const fila = conCeldasIntercambiadas("Estado", "Abrió");
+    expect(desalineacionDeColumnas(fila)).toEqual([
+      "columna 2: el encabezado dice «Estado» y la celda dice «Abrió»",
+      "columna 3: el encabezado dice «Abrió» y la celda dice «Estado»",
+    ]);
+    expect(palabrasDeFila(fila).map(({ palabra }) => palabra)).toHaveLength(ORDEN_MOVIL.length);
+  });
+
+  it("las cuentas de conjunto y de vocabulario NO la ven: por eso no alcanzaban", () => {
+    const fila = conCeldasIntercambiadas("Estado", "Abrió");
+    expect(vocabularioDivergente(fila), "ninguna palabra inventada").toEqual([]);
+    expect(paridadDeRol(fila), "la paridad por rol sigue en pie").toEqual([]);
+    expect([...conjuntoDeEncabezado(LECTURA)].sort()).toEqual([...conjunto(fila)].sort());
+    // Las demás cuentas del archivo tampoco la ven: mismo rótulo, misma clase,
+    // mismo `nowrap` de escritorio. Sólo la posición delata la fila.
+    expect(sinEtiqueta(fila), "celdas sin etiqueta").toEqual([]);
+    expect(etiquetasApagadasEnElTelefono(fila), "rótulos que no se leen").toEqual([]);
+    expect(etiquetasVisiblesEnEscritorio(fila), "rótulos en escritorio").toEqual([]);
+    expect(nowrapEnElTelefono(fila), "nowrap en el teléfono").toEqual([]);
+    expect(desalineacionDeColumnas(fila), "la que sí la ve").not.toEqual([]);
+  });
+
+  it("el archivo real, con el arreglo, no tiene ninguna columna desalineada", () => {
+    expect(desalineacionDeColumnas(LECTURA)).toEqual([]);
   });
 });
 
