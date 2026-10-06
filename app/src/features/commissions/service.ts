@@ -97,7 +97,7 @@ export async function upsertCommissionRule(raw: unknown): Promise<CommissionRule
     .eq("id", input.item_id)
     .maybeSingle();
   if (itemError) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  if (!item) throw new CommissionError("NOT_FOUND", "Ítem no encontrado en esta sede.", 404);
+  if (!item) throw new CommissionError("NOT_FOUND", "Ítem no encontrado.", 404);
 
   const { data: employee, error: employeeError } = await db
     .from("employees")
@@ -105,7 +105,7 @@ export async function upsertCommissionRule(raw: unknown): Promise<CommissionRule
     .eq("id", input.employee_id)
     .maybeSingle();
   if (employeeError) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  if (!employee) throw new CommissionError("NOT_FOUND", "Empleado no encontrado en esta sede.", 404);
+  if (!employee) throw new CommissionError("NOT_FOUND", "Empleado no encontrado.", 404);
 
   const { data, error } = await db
     .from("commission_rules")
@@ -467,7 +467,7 @@ export async function payCommissionNow(
   if (!method) {
     throw new CommissionError(
       "METHOD_INACTIVE",
-      `El método de pago ${input.method_code} no está activo en esta sede.`,
+      `El método de pago ${input.method_code} no está activo en la instalación.`,
       422,
     );
   }

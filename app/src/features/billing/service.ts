@@ -279,7 +279,7 @@ async function invoiceIdsOfEmployee(db: DbClient, employeeId: string): Promise<s
   } catch (error) {
     throw new BillingError(
       "READ_INCOMPLETE",
-      `${error instanceof Error ? error.message : "La lectura de invoice_items quedó incompleta."} No se puede listar ni contar sin las facturas del empleado: con el conjunto recortado faltarían facturas y el paginador mostraría páginas vacías. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+      `${error instanceof Error ? error.message : "La lectura de invoice_items quedó incompleta."} No se puede listar ni contar sin las facturas del empleado: con el conjunto recortado faltarían facturas y el paginador mostraría páginas vacías. Reintente y, si persiste, revise el volumen de datos de la instalación.`,
       500,
     );
   }
@@ -355,7 +355,7 @@ export async function listInvoices(filters: InvoiceFilters = {}): Promise<Invoic
     } catch (error) {
       throw new BillingError(
         "READ_INCOMPLETE",
-        `${error instanceof Error ? error.message : "La lectura de invoices quedó incompleta."} No se muestra el listado: con las facturas recortadas faltarían facturas del empleado. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+        `${error instanceof Error ? error.message : "La lectura de invoices quedó incompleta."} No se muestra el listado: con las facturas recortadas faltarían facturas del empleado. Reintente y, si persiste, revise el volumen de datos de la instalación.`,
         500,
       );
     }
@@ -406,7 +406,7 @@ export async function listInvoices(filters: InvoiceFilters = {}): Promise<Invoic
   } catch (error) {
     throw new BillingError(
       "READ_INCOMPLETE",
-      `${error instanceof Error ? error.message : "La lectura de los ítems de factura quedó incompleta."} No se muestra el listado: sin los ítems no se sabe qué empleados participaron. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+      `${error instanceof Error ? error.message : "La lectura de los ítems de factura quedó incompleta."} No se muestra el listado: sin los ítems no se sabe qué empleados participaron. Reintente y, si persiste, revise el volumen de datos de la instalación.`,
       500,
     );
   }
@@ -659,7 +659,7 @@ async function loadCommissionRulesByEmployee(
     // no es este camino.
     throw new BillingError(
       "READ_INCOMPLETE",
-      `${error instanceof Error ? error.message : "La lectura de commission_rules quedó incompleta."} No se muestra la comisión: con las reglas incompletas la cifra no coincidiría con lo que paga la nómina. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+      `${error instanceof Error ? error.message : "La lectura de commission_rules quedó incompleta."} No se muestra la comisión: con las reglas incompletas la cifra no coincidiría con lo que paga la nómina. Reintente y, si persiste, revise el volumen de datos de la instalación.`,
       500,
     );
   }
@@ -857,7 +857,7 @@ async function validateItemRefs(
     }
     if (item.item_type === "servicio" && item.service_id) {
       if (!serviceIds.has(item.service_id)) {
-        throw new BillingError("NOT_FOUND", "Servicio no encontrado en esta sede.", 404);
+        throw new BillingError("NOT_FOUND", "Servicio no encontrado.", 404);
       }
     }
     if (!employeeIdsFound.has(item.employee_id)) {
@@ -1228,7 +1228,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
     if (!methodByCode.has(portion.method_code)) {
       throw new BillingError(
         "METHOD_INACTIVE",
-        `El método de pago ${portion.method_code} no está activo en esta sede.`,
+        `El método de pago ${portion.method_code} no está activo en la instalación.`,
         422,
       );
     }
@@ -1661,7 +1661,7 @@ export async function editInvoiceItems(
     if (!method) {
       throw new BillingError(
         "METHOD_INACTIVE",
-        `El método de pago ${payment.method_code} no está activo en esta sede.`,
+        `El método de pago ${payment.method_code} no está activo en la instalación.`,
         422,
       );
     }
@@ -1940,7 +1940,7 @@ export async function editEmittedInvoiceItems(
     if (!method) {
       throw new BillingError(
         "METHOD_INACTIVE",
-        `El método de pago ${payment.method_code} no está activo en esta sede.`,
+        `El método de pago ${payment.method_code} no está activo en la instalación.`,
         422,
       );
     }
@@ -2375,7 +2375,7 @@ export async function splitPayment(
     if (!refs.methodByCode.has(portion.method_code)) {
       throw new BillingError(
         "METHOD_INACTIVE",
-        `El método de pago ${portion.method_code} no está activo en esta sede.`,
+        `El método de pago ${portion.method_code} no está activo en la instalación.`,
         422,
       );
     }

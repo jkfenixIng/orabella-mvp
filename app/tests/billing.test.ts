@@ -3516,6 +3516,31 @@ describe("billing: gate de sobre-cobro al bajar el total de una emitida (WU2)", 
     expect(overCollectionStub.auditInsert).not.toBeNull();
     expect(overCollectionStub.unexpectedQueries).toEqual([]);
   });
+
+  it("cambiar un cobro a un método que NO está en el catálogo se rechaza nombrando la INSTALACIÓN (U15)", async () => {
+    // El catálogo de métodos se lee ENTERO, sin predicado de sede (074 dejó
+    // `UNIQUE (code)`; 077 dropeó `payment_methods.sede_id`): la condición del
+    // rechazo es real, el alcance que el mensaje le atribuía ya no existe.
+    overCollectionStub.payments = [stubPayment(200000)];
+    const failure: unknown = await editEmittedInvoiceItems(
+      overCollectionStub.INVOICE_ID,
+      editPayload(300000, {
+        payments: [{ id: overCollectionStub.PAY_ID, method_code: "tarjeta_inexistente" }],
+      }),
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "METHOD_INACTIVE", status: 422 });
+    expect((failure as BillingError).message).toBe(
+      "El método de pago tarjeta_inexistente no está activo en la instalación.",
+    );
+    expect((failure as BillingError).message).not.toContain("sede");
+    // La edición NO se aplicó: ni totales, ni movimientos, ni rastro.
+    expect(overCollectionStub.writes).toEqual([]);
+    expect(overCollectionStub.invoiceUpdate).toBeNull();
+    expect(overCollectionStub.auditInsert).toBeNull();
+  });
 });
 
 // ------- U5: el candado de nómina cerrada no se trunca ni falla abierto -----
@@ -5594,6 +5619,35 @@ describe("billing: las dos ediciones de factura son UNA transacción (CL-12)", (
     }
     expect(overCollectionStub.unexpectedQueries).toEqual([]);
   });
+
+  it("la edición ADMIN con un método fuera del catálogo nombra la INSTALACIÓN (U15)", async () => {
+    // La cuarta guarda del mismo mensaje: aquí el cobro conserva su id y sólo
+    // cambia el método. El catálogo se lee ENTERO y sin predicado de sede (074
+    // dejó `UNIQUE (code)`, 077 dropeó `payment_methods.sede_id`), así que la
+    // condición del rechazo es real pero el alcance que el texto le atribuía ya
+    // no existe: nombra la instalación, como nómina, vales y caja.
+    overCollectionStub.payments = [stubPayment(300000)];
+
+    const failure: unknown = await editInvoiceItems(
+      overCollectionStub.INVOICE_ID,
+      {
+        ...adminPayload(),
+        payments: [{ id: overCollectionStub.PAY_ID, method_code: "tarjeta_inexistente" }],
+      },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "METHOD_INACTIVE", status: 422 });
+    expect((failure as BillingError).message).toBe(
+      "El método de pago tarjeta_inexistente no está activo en la instalación.",
+    );
+    expect((failure as BillingError).message).not.toContain("sede");
+    // La transacción de la edición no se aplica: ni totales, ni ítems, ni stock.
+    expect(overCollectionStub.writes).toEqual([]);
+    expect(overCollectionStub.invoiceUpdate).toBeNull();
+    expect(overCollectionStub.auditInsert).toBeNull();
+  });
 });
 
 //
@@ -5780,6 +5834,34 @@ describe("billing: la emisión repetida no emite dos veces (MO-1)", () => {
     expect(second.invoice.total).toBe(70000);
     expect(createStub.invoices).toHaveLength(1);
     expect(createStub.consecutives).toEqual([1]);
+  });
+
+  it("una porción con un método que NO está en el catálogo se rechaza nombrando la INSTALACIÓN (U15)", async () => {
+    // El catálogo de métodos se lee ENTERO: `fetchPaymentMethods` no lleva
+    // predicado de sede desde que 074 dejó la restricción en `UNIQUE (code)` y
+    // 077 dropeó `payment_methods.sede_id`. El método que no está es INACTIVO O
+    // INEXISTENTE —una condición real— pero el alcance que el mensaje nombraba ya
+    // no existe: la redacción dice la instalación, como el mismo rechazo en
+    // nómina, vales y caja.
+    const outcome = await createInvoice(
+      emissionPayload({ payments: [{ method_code: "tarjeta_inexistente", amount: 70000 }] }),
+      ACTOR,
+    ).then(
+      () => "emitida" as const,
+      (error: unknown) => error,
+    );
+
+    expect(outcome).toBeInstanceOf(BillingError);
+    expect(outcome).toMatchObject({ code: "METHOD_INACTIVE", status: 422 });
+    expect((outcome as BillingError).message).toBe(
+      "El método de pago tarjeta_inexistente no está activo en la instalación.",
+    );
+    expect((outcome as BillingError).message).not.toContain("sede");
+    // La guarda corre ANTES de la transacción de emisión: ni consecutivo ni
+    // filas, porque la emisión es toda o nada.
+    expect(createStub.consecutives).toEqual([]);
+    expect(createStub.invoices).toEqual([]);
+    expect(createStub.payments).toHaveLength(0);
   });
 
   it("la migración 041 guarda la marca con un índice único PARCIAL y no reescribe filas", () => {
@@ -6587,6 +6669,34 @@ describe("billing: el cobro repetido no cobra dos veces (CL-2)", () => {
     expect(payStub.payments).toEqual([]);
     expect(payInserts()).toBe(0);
     expect(invoice.status).toBe("Anulada");
+  });
+
+  it("una porción con un método que NO está en el catálogo se rechaza nombrando la INSTALACIÓN (U15)", async () => {
+    // El catálogo se lee entero (074 dejó `UNIQUE (code)`, 077 dropeó la columna
+    // `sede_id`): la condición es real —el método tiene que estar activo—, pero
+    // el alcance que el mensaje nombraba ya no existe.
+    const failure: unknown = await splitPayment(
+      payStub.INVOICE_ID,
+      {
+        idempotency_key: MARK,
+        portions: [{ method_code: "tarjeta_inexistente", amount: TOTAL }],
+      },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(BillingError);
+    expect(failure).toMatchObject({ code: "METHOD_INACTIVE", status: 422 });
+    expect((failure as BillingError).message).toBe(
+      "El método de pago tarjeta_inexistente no está activo en la instalación.",
+    );
+    expect((failure as BillingError).message).not.toContain("sede");
+    // Nada cobrado: la guarda corre antes de la transacción del cobro, así que no
+    // hay porción, ni marca, ni cierre de la factura.
+    expect(payStub.payments).toEqual([]);
+    expect(payInserts()).toBe(0);
+    expect(payStub.invoiceUpdate).toBeNull();
+    const invoice = payStub.invoices.find((row) => row.id === payStub.INVOICE_ID) as Record<string, unknown>;
+    expect(invoice.status).toBe("Emitida");
   });
 
   // ---- CL-17: el TURNO se bloquea y se revalida dentro de la transacción ---
