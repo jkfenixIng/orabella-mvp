@@ -599,9 +599,17 @@ describe("nómina: lo persistente va por Alert (estado)", () => {
     expect(PAYROLL_CLIENT_CODE).toMatch(
       /<Alert\s+variant="destructive"\s+role="status">\s*La fecha final no puede ser anterior a la inicial\./,
     );
+    // F10: el aviso del solape sigue siendo el mismo canal `polite`, y su
+    // cierre ya NO promete ajustar fechas: el diálogo no tiene ningún campo
+    // que ajustar. Lo que sí se puede hacer es ELEGIR OTRO CICLO, así que eso
+    // es lo que dice, sin perder el período que choca ni su estado.
     expect(PAYROLL_CLIENT_CODE).toMatch(
-      /<Alert\s+variant="destructive"\s+role="status"[\s\S]{0,200}Ajuste las fechas\.[\s\S]{0,40}<\/Alert>/,
+      /<Alert\s+variant="destructive"\s+role="status"[\s\S]{0,200}El rango se solapa con \{formatPeriodLabel\(overlap\)\} \(\{overlap\.status\}\)\. Elija otro ciclo\.[\s\S]{0,40}<\/Alert>/,
     );
+    // CONTROL NEGATIVO: la instrucción que mandaba a tocar lo que el diálogo
+    // no ofrece no puede sobrevivir en ninguna parte del cliente —ni en el
+    // aviso en vivo ni en la guarda del envío, que dice lo mismo—.
+    expect(PAYROLL_CLIENT_CODE).not.toContain("Ajuste las fechas");
     expect(PAYROLL_CLIENT_CODE).toMatch(
       /<Alert\s+variant="destructive"[\s\S]{0,160}\{openError\}[\s\S]{0,40}<\/Alert>/,
     );
@@ -681,7 +689,9 @@ describe("nómina: el texto visible no cambió (cambia el canal, no la copia)", 
       "Complete el método y un monto mayor a 0 en cada porción.",
       "Indique el rango del período.",
       "La fecha final no puede ser anterior a la inicial.",
-      "Ajuste las fechas.",
+      // F10: el remedio del solape es elegir otro ciclo (guarda del envío y
+      // aviso en vivo dicen lo mismo); «Ajuste las fechas» no puede volver.
+      "Elija otro ciclo.",
       "Aún no hay empleados en la instalación: créelos en /admin antes de liquidar.",
       "Sin periodos todavía.",
       "Sin períodos todavía: este será el primero.",

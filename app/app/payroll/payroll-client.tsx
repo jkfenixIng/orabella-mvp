@@ -1537,8 +1537,13 @@ export function PayrollClient(props: PayrollClientProps) {
     }
     const collision = findOverlappingPeriod(periods, startDate, endDate, openTarget.frequency);
     if (collision) {
+      // F10: el remedio que el diálogo REALMENTE deja es elegir otro ciclo —no
+      // hay fechas que ajustar ni cadencia que elegir: el rango sale del ciclo
+      // elegido—. Y en la primera liquidación tampoco sería el día declarado lo
+      // que arreglara esto: el solape exige un período registrado, así que en ese
+      // caso el campo ni siquiera está a la vista.
       setOpenError(
-        `El rango se solapa con ${formatPeriodLabel(collision)} (${collision.status}). Ajuste las fechas o la cadencia.`,
+        `El rango se solapa con ${formatPeriodLabel(collision)} (${collision.status}). Elija otro ciclo.`,
       );
       return;
     }
@@ -3003,8 +3008,11 @@ export function PayrollClient(props: PayrollClientProps) {
                 </Alert>
               ) : overlap ? (
                 // Mismo caso derivado en vivo y por la misma razón: `polite`.
+                // F10: la frase dice lo que el diálogo deja hacer —elegir otro
+                // ciclo— y no lo que ya no ofrece; el período que choca y su
+                // estado quedan a la vista porque son el dato del rechazo.
                 <Alert variant="destructive" role="status">
-                  El rango se solapa con {formatPeriodLabel(overlap)} ({overlap.status}). Ajuste las fechas.
+                  El rango se solapa con {formatPeriodLabel(overlap)} ({overlap.status}). Elija otro ciclo.
                 </Alert>
               ) : openError ? (
                 <Alert variant="destructive">{openError}</Alert>

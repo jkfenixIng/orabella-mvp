@@ -5708,6 +5708,36 @@ describe("payroll-client: el diálogo de apertura DERIVADO (F10, guarda de fuent
     expect(client).toContain("disabled={busy || openTarget === null}");
   });
 
+  it("F10: el rechazo por solape manda a lo que el diálogo SÍ deja hacer", () => {
+    // El diálogo no escribe fechas ni elige cadencia: el rango sale del ciclo
+    // elegido (la guarda de más arriba lo deja escrito). La frase que cerraba el
+    // rechazo —«Ajuste las fechas o la cadencia»— mandaba a tocar dos cosas que
+    // ya no existen, así que nombra el remedio REAL y conserva el dato
+    // concreto: el período que choca y su estado.
+    const submit = client.slice(
+      client.indexOf("async function handleOpen"),
+      client.indexOf("function closeOpenDialog"),
+    );
+    expect(submit).toContain(
+      "El rango se solapa con ${formatPeriodLabel(collision)} (${collision.status}). Elija otro ciclo.",
+    );
+    // El aviso EN VIVO del diálogo dice lo MISMO: una sola verdad sobre el
+    // remedio, y el mismo texto exacto.
+    const open = dialog();
+    expect(open).toContain(
+      "El rango se solapa con {formatPeriodLabel(overlap)} ({overlap.status}). Elija otro ciclo.",
+    );
+    // CONTROL NEGATIVO: la instrucción vieja no sobrevive en ninguna forma…
+    expect(client).not.toContain("Ajuste las fechas");
+    expect(client).not.toContain("las fechas o la cadencia");
+    // …y el guardia no se movió: el rechazo sigue siendo el MISMO, en el mismo
+    // sitio y con el mismo cálculo.
+    expect(submit).toContain(
+      "const collision = findOverlappingPeriod(periods, startDate, endDate, openTarget.frequency);",
+    );
+    expect(submit).toMatch(/if \(collision\) \{[\s\S]{0,400}setOpenError\([\s\S]{0,200}return;/);
+  });
+
   it("control negativo: el marcado VIEJO (dos selectores) no pasa las guardas nuevas", () => {
     const viejo = [
       '<DialogTitle>Abrir período</DialogTitle>',
