@@ -472,7 +472,41 @@ Y un detalle que vale como lección de consistencia: al unir la razón y el reme
 remedio quedaba en minúscula y **rompía el literal que el cliente comparte** — lo cazó la prueba que el
 propio autor había escrito, y lo obligó a separarlos en dos oraciones.
 
-**Suite al cierre: 2352 pruebas en 48 archivos, todas verdes.**
+**La última clase de copia, en los módulos que nadie había barrido**: **diez cadenas** en facturación y
+comisiones — las cinco del inventario y **cinco más que encontró el re-barrido** —, cada una decidida
+leyendo la consulta detrás de la frase: los métodos de pago pasan a «en la instalación» (el catálogo se
+lee sin predicado y la 074 le quitó la sede a la restricción), los «no encontrado en esta sede» pierden
+un alcance que ninguna consulta aplica, y los avisos de lectura incompleta pasan a «de la instalación».
+Con **cinco guardas nuevas** (código, estado, literal, la negativa de que la palabra aparezca y la
+afirmación de que no se escribió nada).
+
+**Suite al cierre: 2357 pruebas en 48 archivos, todas verdes.**
+
+### Lo que esta unidad NO cierra, y lo que hay que no confundir
+
+**El flujo de nómina tiene un defecto estructural que esta auditoría no vio, y lo encontró otra sesión.**
+Con **piso único + recorte**, y con las tres cadencias cerrando el mismo sábado, **toda** cadencia cuyo
+ciclo contenga el piso produce el mismo rango `(piso, últimoSábado)`: la primera liquidación de dos o más
+cadencias **colisiona siempre** (`PERIOD_OVERLAP` / `PERIOD_DRAFT_EXISTS`), medido contra los datos
+reales. Su plan — *anclaje por cadencia*, cada grupo con su propia línea de tiempo — está en
+`odd/tasks/nomina-anclaje-por-cadencia.md`, que **no es de esta unidad**.
+
+**Y la lección de método es para esta auditoría**: mi verificación de la unidad de nómina confirmó, una
+por una, las **reglas** del diseño (el piso derivado, la fecha declarada, el recorte, las tres
+validaciones) y dio todas por buenas — porque verificó **reglas**, no la **interacción** de tres cadencias
+sobre la misma grilla. **Un conjunto de reglas correctas puede producir un sistema roto**: el defecto
+vive en el cruce, y ningún test de reglas lo iba a mostrar.
+
+**Parkeado, con dueño pendiente** (no se perdió, se dejó de hacer a propósito):
+- El **inventario del README del módulo de nómina** (prosa de la capa retirada, tablas a las que ya no
+  les existe la columna de sede, el `EXCLUDE` sin ese elemento), cuyo arreglo se **revirtió** por
+  pertenecer al área que otra sesión está trabajando.
+- El **residuo de comentarios** del mismo tipo en `billing/service.ts:928-929,969-970` y
+  `commissions/service.ts:364,414,500`: son comentarios, no copia de usuario, y no los fija ningún test.
+- Los **botones de aprobar y rechazar de vales**: siguen sin medición directa porque la base no tiene
+  ningún vale en estado `pendiente`.
+- La **deuda declarada en la base**: el rol `superadmin` y la columna `sedes.payroll_start_date`, que se
+  borran en el próximo reset y que hoy tienen una guarda que impide que los borren «de paso».
 
 ## Hazards reportados y refutados
 
