@@ -5780,6 +5780,12 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     const message = (failure as PayrollError).message;
     expect(message).toContain("2026-08-30 a 2026-09-05");
     expect(message).toContain("2026-08-01 a 2026-09-30");
+    // Y nombra la INSTALACIÓN, no «esta sede»: el período que estorba se busca
+    // en la lectura ENTERA (`listPeriods()` no lleva predicado de sede), así que
+    // un texto con alcance por sede prometería una frontera que el código no
+    // aplica (vocabulario del dueño, 2026-10-04).
+    expect(message).toContain("de la instalación.");
+    expect(message).not.toContain("sede");
     // Nada se escribió: la guarda corre ANTES del INSERT.
     expect(periodInserts()).toHaveLength(0);
   });
@@ -5997,6 +6003,10 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     // El mensaje nombra el rango pedido, el período heredado y POR QUÉ se rechaza.
     expect(message).toContain("2026-08-30 a 2026-09-05");
     expect(message).toContain("no tiene cadencia");
+    // Mismo alcance que el solape de su misma cadencia: lo que estorba es de la
+    // INSTALACIÓN (la lectura de períodos es entera, sin predicado de sede).
+    expect(message).toContain("de la instalación, que no tiene cadencia:");
+    expect(message).not.toContain("sede");
     expect(message).toContain("pagó el fijo a todo el plantel");
     expect(message).toContain("dos veces los mismos días");
     // Nada se escribió: la guarda corre ANTES del INSERT.
@@ -6089,6 +6099,35 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     expect(failure).toMatchObject({ code: "PERIOD_OVERLAP", status: 409 });
     // No es un fallo interno disfrazado: la carrera tiene su propio mensaje.
     expect((failure as PayrollError).code).not.toBe("INTERNAL");
+    // Y el mensaje no promete un alcance por sede: la restricción de exclusión
+    // que rechaza la carrera (`ex_payroll_periods_no_overlap`) ya NO compara
+    // `sede_id` (074 lo retiró: la columna nulable dejaba de participar), así que
+    // «otro período de esta sede» nombraría una frontera que la base no aplica.
+    expect((failure as PayrollError).message).toContain(
+      "Otro período quedó con días en común mientras se abría este.",
+    );
+    expect((failure as PayrollError).message).not.toContain("sede");
+  });
+
+  it("el 23505 del índice de borradores se traduce con el alcance que TIENE (U15)", async () => {
+    // `uq_payroll_draft_per_range` es `UNIQUE (start_date, end_date) WHERE status
+    // = 'borrador'` (074; 007 lo tenía por sede y 074 le quitó `sede_id`), y el
+    // INSERT de un período nuevo tampoco escribe `sede_id`. La unicidad del
+    // borrador es GLOBAL: un texto que dijera «para esta sede» daría a entender
+    // un alcance que la base no aplica, que es la clase de defecto que este
+    // barrido elimina (misma regla que el SKU y el código de empleado).
+    seedPeriods([]);
+    payrollPagedStub.insertError = { table: "payroll_periods", code: "23505" };
+
+    const failure: unknown = await openPayrollPeriod(payrollPagedStub.SEDE_ID, { frequency: "semanal", cycle_end_date: "2026-09-12", declared_start_date: "2026-09-06" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "PERIOD_DRAFT_EXISTS", status: 409 });
+    const message = (failure as PayrollError).message;
+    expect(message).toBe("Ya existe un borrador para ese rango de fechas.");
+    expect(message).not.toContain("sede");
   });
 
   it("si la lectura de períodos no se completa, ABRIR se detiene (no decide con menos)", async () => {
@@ -6105,6 +6144,13 @@ describe("payroll: un día se nomina una sola vez al ABRIR el período (PR1)", (
     expect(failure).toMatchObject({ code: "READ_INCOMPLETE" });
     // No se abrió nada con una lectura incompleta.
     expect(periodInserts()).toHaveLength(0);
+    // Y el aviso que acompaña el corte nombra la INSTALACIÓN: el volumen que se
+    // revisa es el de la planta y los períodos de la instalación, no el de «la
+    // sede» (U15, vocabulario del dueño).
+    expect((failure as PayrollError).message).toContain(
+      "revise el volumen de datos de la instalación",
+    );
+    expect((failure as PayrollError).message).not.toContain("sede");
   });
 });
 
@@ -6325,6 +6371,13 @@ describe("payroll: nómina extraordinaria individual (PA-2a)", () => {
       .catch((error: unknown) => error);
 
     expect(failure).toMatchObject({ code: "METHOD_INACTIVE", status: 422 });
+    // El catálogo de métodos de pago se lee GLOBAL (074 dejó `UNIQUE (code)` y
+    // 077 quitó `payment_methods.sede_id`), así que el texto no puede prometer un
+    // alcance por sede: nombra la instalación (U15).
+    expect((failure as PayrollError).message).toBe(
+      "El método de pago efectivo no está activo en la instalación.",
+    );
+    expect((failure as PayrollError).message).not.toContain("sede");
     expect(extraInserts()).toHaveLength(0);
   });
 
@@ -7145,6 +7198,28 @@ describe("payroll: corregir un período cerrado conserva las dos versiones (PA-2
     });
   });
 
+  it("un empleado de la liquidación que no está en la planta se detiene a la vista (U15)", async () => {
+    // El ítem firmado nombra a alguien que la planta ya no tiene: la corrección
+    // no puede reconstruirse y se detiene con su propio mensaje, que nombra la
+    // INSTALACIÓN (la planta se lee entera, sin predicado de sede) —nunca «la
+    // sede», que daría a entender un alcance que la lectura no aplica.
+    seedWrongClosedPeriod({ item: { employee_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" } });
+
+    const failure: unknown = await payrollExtrasService
+      .correctPayrollPeriod(PERIOD_ID, { reason: "Fijo mal prorrateado." }, ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(failure).toMatchObject({ code: "INTERNAL", status: 500 });
+    expect((failure as PayrollError).message).toBe(
+      "No se pudo corregir: un empleado de la liquidación no está en la planta de la instalación.",
+    );
+    expect((failure as PayrollError).message).not.toContain("sede");
+    // Nada a medias: la corrección no deja una versión escrita.
+    expect(correctionInserts()).toHaveLength(0);
+    expect(moneyInserts()).toHaveLength(0);
+  });
+
   it("la versión anterior sigue legible: el período y sus ítems NO se tocan", async () => {
     seedWrongClosedPeriod();
     await payrollExtrasService.correctPayrollPeriod(PERIOD_ID,
@@ -7841,6 +7916,27 @@ describe("payroll: el abono repetido no paga dos veces (CL-2)", () => {
     expect(storedPayments()).toHaveLength(0);
   });
 
+  it("el método de pago se lee del catálogo GLOBAL y el texto lo dice así (U15)", async () => {
+    // El rechazo por método inactivo al pagar un ítem (`payPayrollItem`): el
+    // catálogo se lee entero y `fetchPaymentMethods` no lleva predicado de sede,
+    // así que el mensaje NUNCA pudo afirmar un alcance por sede. Nombra la
+    // instalación (misma redacción que el pago extraordinario y que el vale).
+    payrollPagedStub.tables.payment_methods = [
+      { ...(payrollPagedStub.tables.payment_methods ?? [])[0], is_active: false },
+    ];
+
+    const failure: unknown = await payrollExtrasService
+      .payPayrollItem(ITEM_ID, { idempotency_key: MARK, ...partial(30000) }, ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: "METHOD_INACTIVE", status: 422 });
+    expect((failure as PayrollError).message).toBe(
+      "El método de pago efectivo no está activo en la instalación.",
+    );
+    expect((failure as PayrollError).message).not.toContain("sede");
+    expect(paymentInserts()).toHaveLength(0);
+  });
+
   it("la migración 042 deja la marca con un índice único PARCIAL y no reescribe filas", () => {
     const raw = readFileSync(
       join(process.cwd(), "supabase", "schema-history", "042_payment_idempotency.sql"),
@@ -8353,6 +8449,25 @@ describe("payroll: CL-5 la solicitud de vale reintentada no abre un segundo vale
     expect(overCap.auto_approved).toBe(false);
     expect(overCap.voucher.status).toBe("pendiente");
     expect(overCap.over_day).toBe(true);
+  });
+
+  it("un método que no es arqueable se rechaza y el texto lo dice así (U15)", async () => {
+    // El vale exige un método ARQUEABLE del catálogo real, que se lee entero y
+    // sin predicado de sede (`fetchPaymentMethods`): el mensaje no puede afirmar
+    // un alcance por sede, nombra la instalación —la misma redacción del módulo
+    // de caja, que ya la sesayó en la unidad vecina.
+    payrollPagedStub.tables.payment_methods = [{ ...METHOD, arqueable: false }];
+
+    const failure: unknown = await payrollExtrasService
+      .requestVoucher(voucherInput(), ACTOR)
+      .catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: "METHOD_NOT_ARCHIVABLE", status: 422 });
+    expect((failure as PayrollError).message).toBe(
+      "El método de pago efectivo no está activo o no es arqueable en la instalación.",
+    );
+    expect((failure as PayrollError).message).not.toContain("sede");
+    expect(voucherInserts()).toHaveLength(0);
   });
 
   it("la carrera (misma marca entre el lookup y el INSERT) relee a la ganadora", async () => {
@@ -9622,6 +9737,13 @@ describe("payroll: el borrado de un borrador revierte los vales y lo borra en UN
 
     expect(outcome).toBeInstanceOf(PayrollError);
     expect(outcome).toMatchObject({ code: "PERIOD_OVERLAP_AMBIGUOUS", status: 409 });
+    // El rechazo nombra el hecho —otro período CERRADO solapa el rango— y no un
+    // alcance que ya no existe: el período que solapa se busca en la lista
+    // entera de períodos, sin predicado de sede (U15).
+    expect((outcome as PayrollError).message).toBe(
+      "No se puede borrar: otro período CERRADO solapa este rango y no se puede determinar qué vales pertenecen a este borrador sin revertir una nómina ya pagada.",
+    );
+    expect((outcome as PayrollError).message).not.toContain("sede");
     expect(voucherStatus(VOUCHER_APPROVED)).toBe("descontada");
     expect(voucherStatus(VOUCHER_PENDING)).toBe("descontada");
     expect(periodStillThere()).toBe(true);

@@ -694,11 +694,16 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
 // ------------------------------------------ listados con caché (catálogos) ---
 //
 // G5: la lista de sedes (`listSedes`, etiqueta `catalog:sedes`) se eliminó con
-// sus dos acciones. Estos servicios ya no leen ni escriben la tabla `sedes`:
-// esa fila la nombra la capa de plataforma, para resolver cuál es la sede de la
-// instalación (la única fila activa) y configurar su fecha de nómina, y el
-// módulo de nómina la lee por clave primaria (`getPayrollStartDate`,
-// `payroll/service.ts`), sin pasar por ninguna lista.
+// sus dos acciones. Estos servicios ya no leen ni escriben la tabla `sedes`, y
+// ya no queda nadie que la lea: se retiró la capa de plataforma, que era la
+// única que nombraba esa fila para CONFIGURAR la fecha de arranque de la nómina.
+// Esa fecha dejó de ser una configuración y pasó a ser un HECHO DERIVADO —
+// `payrollHistoryFloor(periods)`, el `min(payroll_periods.start_date)`, el día
+// del PRIMER período (`payroll/service.ts`)— y cuando todavía no hay ningún
+// período, la declara la primera liquidación, dentro del diálogo de apertura.
+// La fila de `sedes` y su columna de fecha quedan como DEUDA declarada, igual
+// que el rol `superadmin`: borrarlas obliga a regenerar el archivo único de
+// esquema y a resetear las dos bases.
 //
 // La columna `sede_id` sigue existiendo y esta unidad NO la retira: lo que se
 // retiró fue el alcance multi sede de las lecturas que ya no lo necesitan, no la
@@ -714,14 +719,13 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
 //
 // Todo eso se retira con el borrado FÍSICO de la columna en la migración final
 // de una sola sede (M3c), no antes: hasta entonces el servicio tiene que
-// escribirla donde la base la exige. Y mientras la fila exista, la fecha de
-// nómina tiene dónde escribirse.
+// escribirla donde la base la exige.
 //
 // Lo que queda autorizando es el ROL, no la fila: `requireSedeRole` y las guardas
 // de sesión (`requireSession`, `requireAdminSession`) no se tocan. La sede de la
-// sesión sigue siendo un dato real —la cuenta la tiene— y es lo que permite
-// localizar la fila de la instalación (`getPayrollStartDate`); lo que ya no
-// está es el alcance por sede en las lecturas del resto del negocio.
+// sesión sigue siendo un dato real —la cuenta la tiene— y es lo que esos dos
+// candados autorizan; lo que ya no está es el alcance por sede en las lecturas
+// del resto del negocio.
 
 export const listEmployees = unstable_cache(fetchEmployees, ["catalog:employees"], {
   tags: ["catalog:employees"],

@@ -5,18 +5,25 @@
 -- liquidación OPERANDO la aplicación (diálogo «Abrir período»), sin sembrar
 -- ningún período, turno, factura ni vale: eso es justamente el smoke test.
 --
+-- QUÉ NO HACE: no escribe la fecha de arranque de la nómina. Esa fecha dejó de
+-- ser CONFIGURACIÓN (vivía en `sedes.payroll_start_date`, que hoy no lee ni
+-- escribe nadie) y pasó a ser un HECHO: la declara la PRIMERA liquidación,
+-- dentro del diálogo «Abrir período», y de ahí en adelante el arranque se deriva
+-- del período más antiguo (`payrollHistoryFloor`, el `min(start_date)` de los
+-- períodos). Sembrarla por SQL sería escribir un valor que la aplicación ya no
+-- consume.
+--
 -- POR QUÉ NO PARTE DE `acceptance.sql`: `acceptance.sql` es el fixture del
 -- criterio §11 y su propio encabezado declara que los turnos, facturas,
 -- PERÍODOS y vales «se crean por UI/flujos». Editarlo cambiaría ese contrato y
 -- haría que la aceptación dependiera de datos de humo. Este archivo vive
 -- aparte, se aplica después, y no modifica una sola línea del fixture.
 --
--- INTERLOCK — SÓLO PRUEBAS. La fecha de arranque de la nómina
--- (`sedes.payroll_start_date`) es CONFIGURACIÓN del negocio, no un dato: fijarla
--- en la base real declare que nada anterior existe para el sistema
--- (`src/features/payroll/schemas.ts:1122`, `isRangeBeforePayrollStart`) y deja
--- ciclos sin liquidar sin poder abrirlos. Por eso la PRIMERA sentencia aborta
--- antes de escribir si la sesión no es la de PRUEBAS.
+-- INTERLOCK — SÓLO PRUEBAS. Lo único que este archivo escribe es la CADENCIA de
+-- nómina acordada con los diez empleados del fixture de aceptación: sobre la
+-- base real eso sería sobreescribir el dato del negocio de una instalación que
+-- ya opera. Por eso la PRIMERA sentencia aborta antes de escribir si la sesión
+-- no es la de PRUEBAS.
 --
 --   La identidad se mide con `current_user`, NO con el `user=` del conninfo:
 --   Supavisor (el pooler) mapea el rol con sufijo de proyecto al rol `postgres`
@@ -28,11 +35,10 @@
 --   `ejemplo.co`): una instalación de producción con datos reales no la tiene.
 --
 -- IDEMPOTENTE: se puede correr las veces que haga falta sin duplicar nada y sin
--- pisar lo que el dueño haya cambiado a mano en la UI — las dos escrituras sólo
--- tocan lo que está SIN configurar (`pay_frequency IS NULL`,
--- `payroll_start_date IS NULL`), y la asignación de cadencias es determinista
--- (misma fila ⇒ misma cadencia en cada corrida). No toca sueldos, porcentajes,
--- catálogos, caja, ni métodos de pago.
+-- pisar lo que el dueño haya cambiado a mano en la UI: la escritura sólo toca
+-- lo que está SIN configurar (`pay_frequency IS NULL`), y la asignación de
+-- cadencias es determinista (misma fila ⇒ misma cadencia en cada corrida). No
+-- toca sueldos, porcentajes, catálogos, caja, ni métodos de pago.
 --
 -- PARA APLICAR (PRUEBAS; la credencial NUNCA va en la línea de comandos, sale
 -- del archivo de conexión y se lee en la sesión):
@@ -114,48 +120,3 @@ JOIN (VALUES
 WHERE e.user_id = u.id
   AND e.is_active
   AND e.pay_frequency IS NULL;
-
--- ============================ 3. FECHA DE ARRANQUE DE LA NÓMINA (F10) ============
--- `sedes.payroll_start_date` es el PISO de la historia de nómina de la sede
--- (F10). Sin ella, y sin períodos, `pendingPayrollSettlements` devuelve `[]`
--- (`schemas.ts:1331`: sin piso no hay de dónde recorrer ciclos) y `openPayrollPeriod`
--- (`service.ts:704`) no tiene contra qué recortar el primer ciclo.
---
--- LA FECHA ES RELATIVA A `current_date`, nunca un literal: un literal envejece y
--- deja de producir ciclos pendientes. Se deriva con la MISMA aritmética que el
--- código, no con una cuenta propia:
---
---   E = último sábado YA cerrado = `lastCompletedCycleEndDate(current_date)`
---       (`schemas.ts:978`): el sábado EN o ANTES de `current_date - 1`, es decir
---       el sábado estrictamente anterior a la fecha de referencia.
---       En SQL: `current_date - 1 - ((dow(current_date - 1) + 1) % 7)`.
---
---   ARRANQUE = E - 17 días.
---
--- POR QUÉ 17. El detector camina hacia atrás desde E en saltos de
--- `calendarCycleDaysForFrequency` (`schemas.ts:897`): 7 días `semanal`,
--- 14 `quincenal`, 28 `mensual`; el ciclo k termina en `E - k·días` y arranca en
--- `E - k·días - (días-1)`; se detiene cuando el cierre es ANTERIOR al arranque
--- (`isRangeBeforePayrollStart`, `schemas.ts:1122`) y reporta como máximo
--- `PENDING_SETTLEMENT_LIMIT = 3` ciclos por cadencia (`schemas.ts:1229`).
---
---   Con ARRANQUE = E - 17, para las TRES cadencias:
---     · el ciclo k=2 contiene la fecha (E-20 < E-17 <= E-14), así que se
---       RECORTA a ella: es el PRIMER ciclo de la cadencia y lo resuelve
---       `resolveOpenPayrollRange` (`schemas.ts:1182`) pagándolo con la
---       prorrata de ciclo parcial de F5 (`cycleProrationFactor`,
---       `schemas.ts:1081`), que es el caso interesante del smoke test;
---     · hay al menos un ciclo cerrado pendiente en cada cadencia:
---       semanal 3 (k=0,1,2), quincenal 2 (k=0,1), mensual 1 (k=0, recortado);
---     · ningún ciclo anterior al arranque se ofrece ni se puede abrir.
---   -(k=3) `semanal` cerraría en E-21 < E-17 → el recorrido se detiene ahí, que
---   es exactamente la regla de F10.
---
--- Idempotente y sin pisar la UI: sólo escribe donde la fecha AÚN NO está; si el
--- dueño la fijó a mano desde la pantalla, este seed la conserva y no la pisa.
-UPDATE public.sedes
-SET payroll_start_date = (
-      (current_date - 1 - ((EXTRACT(DOW FROM (current_date - 1))::int + 1) % 7)) - 17
-    )::date,
-    updated_at = now()
-WHERE payroll_start_date IS NULL;

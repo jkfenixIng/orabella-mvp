@@ -281,7 +281,7 @@ function toPayrollError(error: unknown): PayrollError {
   if (error instanceof PagedReadError) {
     return new PayrollError(
       error.code,
-      `${error.message} La operación se detuvo: con una lectura incompleta las cifras de nómina (comisiones, vales y pagado) saldrían mal. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+      `${error.message} La operación se detuvo: con una lectura incompleta las cifras de nómina (comisiones, vales y pagado) saldrían mal. Reintente y, si persiste, revise el volumen de datos de la instalación.`,
       500,
     );
   }
@@ -777,7 +777,7 @@ export async function openPayrollPeriod(
     if (clash) {
       throw new PayrollError(
         "PERIOD_OVERLAP",
-        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${clash.start_date} a ${clash.end_date} (${clash.status}) de esta sede. Un día se nomina una sola vez: ajuste las fechas para que no se crucen con un período existente.`,
+        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${clash.start_date} a ${clash.end_date} (${clash.status}) de la instalación. Un día se nomina una sola vez: ajuste las fechas para que no se crucen con un período existente.`,
         409,
       );
     }
@@ -795,7 +795,7 @@ export async function openPayrollPeriod(
     if (legacyClash) {
       throw new PayrollError(
         "PERIOD_OVERLAP",
-        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${legacyClash.start_date} a ${legacyClash.end_date} (${legacyClash.status}) de esta sede, que no tiene cadencia: ese período heredado pagó el fijo a todo el plantel, así que abrir este rango pagaría dos veces los mismos días. Ajuste las fechas para que no se crucen.`,
+        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${legacyClash.start_date} a ${legacyClash.end_date} (${legacyClash.status}) de la instalación, que no tiene cadencia: ese período heredado pagó el fijo a todo el plantel, así que abrir este rango pagaría dos veces los mismos días. Ajuste las fechas para que no se crucen.`,
         409,
       );
     }
@@ -821,7 +821,7 @@ export async function openPayrollPeriod(
       if ((error as { code?: string }).code === "23505") {
         throw new PayrollError(
           "PERIOD_DRAFT_EXISTS",
-          "Ya existe un borrador para esta sede y rango de fechas.",
+          "Ya existe un borrador para ese rango de fechas.",
           409,
         );
       }
@@ -831,7 +831,7 @@ export async function openPayrollPeriod(
       if ((error as { code?: string }).code === "23P01") {
         throw new PayrollError(
           "PERIOD_OVERLAP",
-          "Otro período de esta sede quedó con días en común mientras se abría este. Un día se nomina una sola vez: revise los períodos existentes y ajuste las fechas.",
+          "Otro período quedó con días en común mientras se abría este. Un día se nomina una sola vez: revise los períodos existentes y ajuste las fechas.",
           409,
         );
       }
@@ -2395,7 +2395,7 @@ export async function payPayrollItem(
       if (!activeByCode.has(portion.method_code)) {
         throw new PayrollError(
           "METHOD_INACTIVE",
-          `El método de pago ${portion.method_code} no está activo en esta sede.`,
+          `El método de pago ${portion.method_code} no está activo en la instalación.`,
           422,
         );
       }
@@ -2565,7 +2565,7 @@ export async function payPayrollExtra(raw: unknown, actor: PayrollActor): Promis
     if (!method) {
       throw new PayrollError(
         "METHOD_INACTIVE",
-        `El método de pago ${parsed.data.method_code} no está activo en esta sede.`,
+        `El método de pago ${parsed.data.method_code} no está activo en la instalación.`,
         422,
       );
     }
@@ -2713,7 +2713,7 @@ export async function closePayrollPeriod(
  * redacción: la usan el chequeo previo del servicio y la traducción del
  * rechazo que devuelve el RPC (CL-9), porque es el mismo rechazo. */
 const PERIOD_OVERLAP_MESSAGE =
-  "No se puede borrar: otro período CERRADO de la sede solapa este rango y no se puede determinar qué vales pertenecen a este borrador sin revertir una nómina ya pagada.";
+  "No se puede borrar: otro período CERRADO solapa este rango y no se puede determinar qué vales pertenecen a este borrador sin revertir una nómina ya pagada.";
 
 /**
  * CL-9: el error del RPC `payroll_delete_period_atomic` (048) traducido al
@@ -2996,7 +2996,7 @@ export async function correctPayrollPeriod(
       if (!employee) {
         throw new PayrollError(
           "INTERNAL",
-          "No se pudo corregir: un empleado de la liquidación no está en la planta de la sede.",
+          "No se pudo corregir: un empleado de la liquidación no está en la planta de la instalación.",
           500,
         );
       }
@@ -3651,7 +3651,7 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
     if (!method) {
       throw new PayrollError(
         "METHOD_NOT_ARCHIVABLE",
-        `El método de pago ${parsed.data.method_code} no está activo o no es arqueable en esta sede.`,
+        `El método de pago ${parsed.data.method_code} no está activo o no es arqueable en la instalación.`,
         422,
       );
     }
