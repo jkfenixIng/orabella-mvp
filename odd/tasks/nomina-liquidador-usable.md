@@ -150,6 +150,33 @@ CREATE UNIQUE INDEX uq_payroll_draft_per_range
   WHERE (status = 'borrador');
 ```
 
+**Y con eso la entrega todavía NO está completa.** Pegar la 078 arregla una base existente y nada
+más: el procedimiento de instalación nueva aplica **sólo**
+`app/supabase/migrations/001_orabella_schema.sql` y **no** recorre `supabase/schema-history/`. Ese
+archivo único sigue declarando el índice sin cadencia en su línea 7163, porque la 078 entró al
+historial **después** de que el volcado se construyera. Sin el paso 2, una instalación nueva se
+lleva el índice roto y nadie lo vuelve a mirar: la 078 llega a las bases viejas pegada a mano, y
+las nuevas ni la ven.
+
+1. **Pegar la 078 en el editor SQL de la base de PRUEBAS** — el bloque de arriba, a mano.
+2. **Regenerar `001_orabella_schema.sql` con `supabase/squash/build-schema.py`**, que es lo único que
+   lleva el arreglo a una instalación nueva: el procedimiento documentado instala ese archivo único,
+   no el historial. El historial sólo se aplica dentro de `orabella_build`, para poder rehacer el
+   volcado.
+3. **Hasta que se regenere, `build-schema.py` va a reportar MISMATCH y salir con exit 4.** Es el
+   estado **esperado**, no un fallo nuevo: el `001` commiteado quedó atrás del historial, que ya tiene
+   77 archivos con la 078 adentro, así que el reconstruido no puede dar el mismo sha256. Reconstruido
+   con la serie entera aplicada, el script lo dice así mismo y se detiene antes de escribir; el
+   volcado se reemplaza a propósito, con la diferencia ya entendida.
+4. **El encabezado del `001` va a quedar viejo por prosa, y se corrige solo.** Hoy dice «aplicar el
+   historial 001-077» y «Sustituye a las 76 migraciones»: números que ya no cuadran con los 77
+   archivos del historial. **NO se edita a mano** — ese archivo es un volcado generado; la prosa
+   viene del `schema-header.sql` del squash y se actualiza al regenerar.
+
+Con el paso 2 hecho, `supabase/test-bootstrap.sql` —que es `cat 001 + seeds` (paso 2.8 del README del
+squash)— vuelve a producir sola la línea que hoy está editada a mano: el puente ya está construido
+hacia adelante y nadie lo rompe.
+
 ## Riesgos
 
 - **Techo de 3 ciclos por cadencia.** Si el dueño no liquida, el aviso llega a 9 entradas. Las

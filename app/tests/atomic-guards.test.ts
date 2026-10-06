@@ -244,3 +244,94 @@ describe("el índice único del borrador de nómina y el cubo de cadencia (078)"
     expect(indice).not.toMatch(/\(start_date, end_date\)\s+WHERE/);
   }, FILE_SCAN_TIMEOUT_MS);
 });
+
+/* --------------------------------------------------------------------------
+   La deriva entre los DOS artefactos del índice del borrador.
+
+   `supabase/test-bootstrap.sql` es `cat 001_orabella_schema.sql + seeds` (paso
+   2.8 del README del squash), así que la línea de su índice no es una fuente:
+   es una COPIA. Hoy está ALINEADA a mano con la 078, que sí es la fuente del
+   arreglo, y ese puente es compatible hacia adelante: cuando el archivo único se
+   regenere desde el historial —con la 078 adentro—, el paso 2.8 produce la misma
+   línea y no hay nada que corregir.
+
+   Lo que no existía era una guarda que lo dijera. Las dos copias pueden
+   separarse sin que ninguna prueba se entere: una se regenera, la otra se
+   regenera más tarde, o alguien edita a mano la que «se debía alinear» y la
+   078 avanza sin avisar. El síntoma es silencioso y caro — una copia de prueba
+   que promete una cosa y aplica otra — así que esta guarda las ata: si las dos
+   definiciones dejan de ser la MISMA forma, el rojo nombra las dos.
+
+   También es lo que hace visible la DERIVA que queda abierta en el archivo
+   único, que todavía declara el índice SIN cadencia y no se regenera solo.
+
+   Lectura tolerante y sin base, como las de arriba: se comparan las DECLARACIONES
+   como texto —mismo nombre, misma tabla, misma clave de TRES elementos y mismo
+   `WHERE`—, no su efecto en el catálogo. El punto de las dos guardas de la 078
+   es la forma; éste mide que las dos formas sean la misma.
+   -------------------------------------------------------------------------- */
+
+/** La copia de prueba: el `001` concatenado con los seeds (paso 2.8 del squash). */
+const BOOTSTRAP_PATH = join(APP_ROOT, "supabase", "test-bootstrap.sql");
+
+/** El índice del borrador, en el nombre elegido a mano que citan 007, 074 y 078. */
+const DRAFT_INDEX_NAME = "uq_payroll_draft_per_range";
+
+/**
+ * Saca la declaración de UN índice del SQL y la deja comparable: sin
+ * comentarios, en una sola línea y SIN los casts que sólo agrega `pg_dump`
+ * (`''::text` → `''`, `'borrador'::text` → `'borrador'`). El cast no cambia el
+ * índice: es la misma clave y el mismo `WHERE` escritos por otra mano, y quitarlo
+ * es lo que hace que las dos copias se puedan comparar carácter por carácter.
+ * Una cadena vacía significa que la declaración no estaba: la aserción la nombra.
+ */
+function extractIndexDdl(sql: string, indexName: string): string {
+  const clean = stripSqlComments(sql).replace(/\s+/g, " ");
+  const statement = new RegExp(`CREATE (?:UNIQUE )?INDEX ${indexName}\\b[\\s\\S]*?;`, "i").exec(clean);
+  return (statement?.[0] ?? "").replace(/::[\w ]+(?=[),;]|$)/g, "").replace(/\s+/g, " ").trim();
+}
+
+describe("el índice del borrador: la 078 y el bootstrap de prueba dicen lo mismo", () => {
+  it("las dos definiciones —historial y copia de prueba— son la MISMA forma", () => {
+    // TOLERANCIA A LA AUSENCIA, como el bloque de la 078: en RED el archivo
+    // todavía no existe y el fallo tiene que ser la comparación de abajo —que
+    // nombra las dos formas— y no un ENOENT que se lleve el bloque entero.
+    const delHistorial = existsSync(join(MIGRATIONS_DIR, CADENCE_INDEX_MIGRATION))
+      ? extractIndexDdl(readText(MIGRATIONS_DIR, CADENCE_INDEX_MIGRATION), DRAFT_INDEX_NAME)
+      : "";
+    const deLaCopia = existsSync(BOOTSTRAP_PATH)
+      ? extractIndexDdl(readText(BOOTSTRAP_PATH), DRAFT_INDEX_NAME)
+      : "";
+
+    // La FORMA que las dos tienen que compartir: tres elementos de clave —las dos
+    // fechas y el cubo de cadencia— y el `WHERE` de 007 intacto.
+    for (const [nombre, ddl] of [
+      ["078_payroll_draft_unique_per_cadence.sql", delHistorial],
+      ["test-bootstrap.sql", deLaCopia],
+    ] as const) {
+      expect(ddl, `${nombre} :: declaración ausente`).not.toBe("");
+      expect(ddl, `${nombre} :: clave`).toContain(
+        "USING btree (start_date, end_date, coalesce(frequency, ''))",
+      );
+      expect(ddl, `${nombre} :: WHERE`).toContain("WHERE (status = 'borrador')");
+    }
+
+    // Y la igualdad, que es la guarda de verdad: si una de las dos se queda atrás o
+    // se alinea a mano a medias, la comparación falla nombrando las dos formas.
+    expect(deLaCopia, `deriva entre ${CADENCE_INDEX_MIGRATION} y test-bootstrap.sql`).toBe(delHistorial);
+  }, FILE_SCAN_TIMEOUT_MS);
+
+  it("la guarda CAZA la deriva: quitarle el cubo a una sola de las dos la pone roja", () => {
+    // Control positivo del guardián, con la misma forma que el control positivo
+    // del detector de arriba: si esta aserción no puede fallar, la de arriba
+    // tampoco protege nada. Se parte de la copia de prueba REAL del disco, no de
+    // un texto inventado, y se le saca el tercer elemento como lo haría una
+    // regeneración con el `001` viejo: el resultado tiene que dejar de coincidir.
+    const deLaCopiaReal = extractIndexDdl(readText(BOOTSTRAP_PATH), DRAFT_INDEX_NAME);
+    const deLaCopiaSinCadencia = deLaCopiaReal.replace(", coalesce(frequency, '')", "");
+    expect(deLaCopiaSinCadencia).not.toContain("coalesce(frequency");
+    expect(deLaCopiaSinCadencia).not.toBe(
+      extractIndexDdl(readText(MIGRATIONS_DIR, CADENCE_INDEX_MIGRATION), DRAFT_INDEX_NAME),
+    );
+  }, FILE_SCAN_TIMEOUT_MS);
+});

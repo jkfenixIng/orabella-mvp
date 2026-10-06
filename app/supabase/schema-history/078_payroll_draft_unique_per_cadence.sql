@@ -83,10 +83,44 @@
 -- ADITIVO, IDEMPOTENTE Y RE-EJECUTABLE
 --
 -- Una segunda corrida deja el esquema igual: el `DROP … IF EXISTS` no encuentra
--- nada y el `CREATE` vuelve a declarar la misma definición. Pegado en el editor
--- SQL de la consola —que confirma sentencia por sentencia—, un fallo a mitad del
--- archivo deja el índice viejo en pie, que es el estado de partida: se corrige
--- volviendo a correr el archivo entero.
+-- nada y el `CREATE` vuelve a declarar la misma definición. Idempotente, sí;
+-- atómico, NO, y conviene decir por qué en vez de suponerlo.
+--
+-- LO QUE PASA SI FALLA A MITAD, Y ES LO CONTRARIO DE LO QUE SUENA
+--
+-- El editor SQL de la consola confirma sentencia por sentencia y cada una
+-- corre en su propia transacción con autocommit: no hay nada que las agrupe. Un
+-- `DROP` que tuvo éxito seguido de un `CREATE` que falla deja el índice AUSENTE,
+-- no el viejo. Ese estado intermedio es real y hay que saber qué significa.
+--
+--   * NO es un sistema sin garantía. `ex_payroll_periods_no_overlap` sigue en
+--     pie y es la garantía FUERTE de la pareja: un día no se nomina dos veces
+--     dentro de un ciclo, y nadie lo puede saltar mientras exista.
+--   * Lo que se pierde es la barrera EXTRA contra una carrera puntual: dos
+--     clientes que abren el MISMO rango de la MISMA cadencia entre la lectura y
+--     el `INSERT` ya no reciben el 23505 de este índice. Y esa carrera la sigue
+--     cubriendo la exclusión, que responde 23P01 —que el servicio traduce a
+--     `PERIOD_OVERLAP`—, así que el resultado es un error de solape en vez de
+--     un error de borrador duplicado: distinto mensaje, ninguna ventana abierta.
+--     El 23505 de `PERIOD_DRAFT_EXISTS` sólo vuelve a aparecer cuando el índice
+--     está recreated, y recrearlo es el primer paso de la recuperación.
+--
+-- CÓMO SE RECUPERA
+--
+-- Volviendo a correr el archivo entero, que es la misma respuesta que antes:
+-- el `DROP INDEX IF EXISTS` no encuentra nada que borrar y el `CREATE` restaura
+-- la definición. Ninguna fila de `payroll_periods` se vio afectada, porque este
+-- archivo no escribe, no borra y no reescribe datos.
+--
+-- LA FORMA QUE ELIMINA LA VENTANA, CUANDO EL CLIENTE LA PERMITE
+--
+-- Pegando las dos sentencias dentro de una transacción explícita —
+-- `begin; … commit;`— el `DROP` y el `CREATE` se confirman o se descartan
+-- juntos y no existe estado intermedio. Es la forma correcta cuando el cliente
+-- que se está usando envuelve el envío en una transacción: no se afirma acá que
+-- el editor SQL de la consola lo haga —su confirmación sentencia por sentencia
+-- dice lo contrario— sino que la ventana desaparece donde el cliente sí la
+-- garantiza.
 --
 -- LO QUE ESTE ARCHIVO NO TOCA, Y POR QUÉ
 --
