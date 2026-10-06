@@ -442,6 +442,38 @@ base no tiene), el seed de humo (**ningún test lo lee**: lo verificado es su te
 sale vacía en vivo porque el filtro es por hoy y los datos de humo son de ayer: se midieron sobre un
 nodo réplica con la clase efectiva, y así está rotulado).
 
+### Lo que se sumó después del primer cierre
+
+**Una regresión la introdujo nuestro propio arreglo, y la cazó la verificación siguiente.** El arreglo
+de caja reordenó las celdas al orden de lectura del teléfono y dejó el encabezado en el orden viejo. En
+una tabla las celdas se colocan **por posición en el DOM, no por nombre**, así que en escritorio **12 de
+17 columnas** quedaron con la palabra equivocada arriba (`decía Estado` / `el valor era Jorge Ramírez`),
+todas con **0 px de desviación**: el valor estaba en una columna, en la equivocada. Corregido a **0 de
+17**, y la guarda pasó a comparar **secuencias** en vez de conjuntos — que era exactamente por lo que no
+podía verlo.
+
+**El combobox era inconsistente consigo mismo**: su filtro ya estaba en 44 px y 16 px debajo de `sm` y
+el disparador seguía en 40/14 y las filas de opción en 36/14, medido en dos comboboxes reales a 320, 640
+y 1024. Los tres llegan al piso debajo de `sm` y el escritorio quedó **byte a byte igual**. Y quedaron
+dos elementos **debajo del piso a propósito**, con el criterio escrito en la guarda: el estado vacío (es
+texto para leer, no un blanco para tocar — no es un botón, no tiene tabindex, nunca recibe foco) y la
+descripción de la opción (metadato secundario dentro de una fila que ya está en el piso). **El piso
+aplica a lo que se toca, no a todo lo que es chico.**
+
+**La copia que prometía un mecanismo inexistente: cinco defectos de la misma clase**, y cada arreglo
+destapó el siguiente. En el cliente: la descripción del diálogo («No hay fechas que escribir», falso en
+la primera liquidación), la leyenda (nunca decía que la ventana de fechas pertenece al **ciclo
+elegido**), el texto del rango, y los dos mensajes de solape («Ajuste las fechas o la cadencia»). En el
+**servidor**: tres rechazos de `PERIOD_OVERLAP` que decían lo mismo y **llegan a ese mismo diálogo** por
+`${result.code}: ${result.message}`. Los cinco mandan ahora a lo que el diálogo **sí** deja hacer:
+elegir otro ciclo. La clase quedó con **cero ocurrencias** en las dos superficies.
+
+Y un detalle que vale como lección de consistencia: al unir la razón y el remedio con dos puntos, el
+remedio quedaba en minúscula y **rompía el literal que el cliente comparte** — lo cazó la prueba que el
+propio autor había escrito, y lo obligó a separarlos en dos oraciones.
+
+**Suite al cierre: 2352 pruebas en 48 archivos, todas verdes.**
+
 ## Hazards reportados y refutados
 
 **«La base del diálogo lleva `max-w-lg` sin variante, así que un llamador con `max-w-sm` podría
