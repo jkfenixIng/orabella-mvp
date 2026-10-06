@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -177,5 +177,70 @@ describe("orden de las redes de conteo (ROW_COUNT) en las migraciones 0xx", () =
     // Una fila para la 060 con el mecanismo `functiondef` de 055/059.
     expect(diagnostics).toMatch(/\('060',\s*'functiondef'/);
     expect(diagnostics).toContain("'fix-060'");
+  }, FILE_SCAN_TIMEOUT_MS);
+});
+
+/* --------------------------------------------------------------------------
+   El índice único del borrador y el cubo de cadencia (078).
+
+   `payroll_periods` lleva dos garantías que, sin la cadencia, se contradicen:
+
+     * `ex_payroll_periods_no_overlap` (exclusión de 035, reemplazada por 063 y
+       reescrita por 074) prohíbe dos períodos con días en común SOLO dentro del
+       mismo cubo `coalesce(frequency, '')`. Ciclos distintos que se superponen
+       son la regla del dueño, no un defecto.
+     * `uq_payroll_draft_per_range` (007, reescrito por 074) era
+       `UNIQUE (start_date, end_date) WHERE status = 'borrador'`: SIN cadencia,
+       y por lo tantoERA la garantía fuerte que la anterior cuida dejar floja.
+
+   El primer ciclo de cada cadencia se recorta al arranque de la nómina (F10) y
+   todas las cadencias cierran en sábado, así que los tres primeros ciclos de la
+   instalación comparten el MISMO par de fechas: el índice sin cadencia rechazaba
+   con `23505` —`PERIOD_DRAFT_EXISTS`— liquidaciones que la exclusión declara
+   legítimas. La 078 mete el cubo como TERCER elemento del índice y las dos
+   garantías vuelven a decir lo mismo.
+
+   El guardián lee el archivo como TEXTO, igual que el de arriba: no hay `psql`
+   ni conexión, así que lo que mide es la FORMA de la declaración —el nombre, la
+   tabla y las TRES claves, en orden— y no su efecto en el catálogo. Es una
+   prueba estructural a propósito, no una prueba de DDL disfrazada.
+   -------------------------------------------------------------------------- */
+
+/** El archivo que devuelve el cubo de cadencia al índice único del borrador. */
+const CADENCE_INDEX_MIGRATION = "078_payroll_draft_unique_per_cadence.sql";
+
+describe("el índice único del borrador de nómina y el cubo de cadencia (078)", () => {
+  it("el índice recreado se apoya en start_date, end_date y coalesce(frequency, '')", () => {
+    const path = join(MIGRATIONS_DIR, CADENCE_INDEX_MIGRATION);
+    // Lectura TOLERANTE a propósito (el patrón de 5.5 del README del squash): en
+    // RED el archivo todavía no existe, y el fallo tiene que ser la ASERCION de
+    // abajo —que nombra la definición que falta—, no un ENOENT que se lleve por
+    // delante el resto del bloque. Las aserciones positivas de más abajo son el
+    // piso: sobre texto vacío no pueden pasar.
+    const sql = existsSync(path)
+      ? stripSqlComments(readText(MIGRATIONS_DIR, CADENCE_INDEX_MIGRATION)).replace(/\s+/g, " ").trim()
+      : "";
+
+    // El índice viejo tiene que SALTAR antes de volver a declararse: sin el
+    // `DROP`, el `CREATE` del mismo nombre falla con 42P07.
+    expect(sql).toContain("DROP INDEX IF EXISTS public.uq_payroll_draft_per_range");
+
+    // La declaración recreada, con su MISMO nombre elegido a mano y sus tres
+    // claves: las dos fechas y el cubo de cadencia, que es la misma expresión
+    // que `ex_payroll_periods_no_overlap` compara con `=`.
+    const declaracion = /CREATE UNIQUE INDEX uq_payroll_draft_per_range[\s\S]*?;/.exec(sql);
+    expect(declaracion, `${CADENCE_INDEX_MIGRATION} :: CREATE`).not.toBeNull();
+    const indice = declaracion?.[0] ?? "";
+
+    expect(indice).toContain("ON public.payroll_periods USING btree");
+    expect(indice).toContain("USING btree (start_date, end_date, coalesce(frequency, ''))");
+    // El `WHERE` es el de 007 y no se toca: lo que cambia es la clave, no el
+    // alcance — la garantía sigue siendo sobre borradores.
+    expect(indice).toContain("WHERE (status = 'borrador')");
+
+    // La forma VIEJA, la que la 078 viene a quitar. Sin este control negativo la
+    // prueba de arriba seguiría siendo cierta si el archivo declarara el índice
+    // dos veces: la buena sin cadencia, y la de cadencia después.
+    expect(indice).not.toMatch(/\(start_date, end_date\)\s+WHERE/);
   }, FILE_SCAN_TIMEOUT_MS);
 });

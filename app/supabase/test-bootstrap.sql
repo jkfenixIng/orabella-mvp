@@ -7164,7 +7164,7 @@ CREATE UNIQUE INDEX uq_payments_shift_idempotency_key ON public.payments USING b
 -- Name: uq_payroll_draft_per_range; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX uq_payroll_draft_per_range ON public.payroll_periods USING btree (start_date, end_date) WHERE (status = 'borrador'::text);
+CREATE UNIQUE INDEX uq_payroll_draft_per_range ON public.payroll_periods USING btree (start_date, end_date, coalesce(frequency, ''::text)) WHERE (status = 'borrador'::text);
 
 
 --
