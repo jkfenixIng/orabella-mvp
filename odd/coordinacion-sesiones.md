@@ -53,6 +53,77 @@ forma de pushear «solo lo mío» sin una rama aparte o un `push` de un SHA espe
 Ya pasó una vez en cada dirección (ellos se llevaron tres commits míos). No es un error de nadie:
 es cómo funciona git. Pero **el dueño decide el push**, así que quien pushee está decidiendo por dos.
 
+### TRASPASO — dos pasos de nómina, para que los haga la otra sesión
+
+> Pedido del dueño (2026-10-05): *«esas 2 pasalas al otro agente que está corriendo para que lo haga
+> él cuando termine todo su proceso»*. O sea: **cuando termines tu proceso en curso**, no antes —
+> ninguno de los dos pasos es urgente y los dos tocan el esquema o archivos generados.
+>
+> **Antes de empezar, leé esto:** la herramienta existe y es `psql`, no el editor SQL. El cliente de
+> Supabase (PostgREST) no ejecuta DDL, y por eso esta sesión creyó durante un rato que estos pasos
+> sólo los podía hacer el dueño a mano. Estaba mal: `psql` está en el PATH, `~/orabella-db/` tiene
+> los conninfos, y hay `pg_dump` y `psycopg` 3.3.5. No hace falta pegar nada en ninguna consola.
+
+#### Paso 1 — la migración 078, contra PRUEBAS
+
+El archivo trae las dos sentencias y un montón de prosa. `--single-transaction` es lo que **elimina la
+ventana** que el propio archivo documenta: el `DROP` y el `CREATE` se confirman juntos o no se
+confirma ninguno, así que nunca queda el índice ausente.
+
+```bash
+cd /d/u/orabella
+psql "$(cat ~/orabella-db/pruebas.conninfo)" -v ON_ERROR_STOP=1 --single-transaction \
+  -f app/supabase/schema-history/078_payroll_draft_unique_per_cadence.sql
+```
+
+Verificación, sólo lectura (las dos consultas también están al pie del archivo):
+
+```bash
+psql "$(cat ~/orabella-db/pruebas.conninfo)" -c "SELECT indexdef FROM pg_indexes
+  WHERE schemaname='public' AND indexname='uq_payroll_draft_per_range';"
+```
+
+Tiene que salir con los **TRES** elementos y el `WHERE` intacto:
+`USING btree (start_date, end_date, COALESCE(frequency, ''::text)) WHERE (status = 'borrador'::text)`
+
+Y la prueba funcional, con filas de prueba y **nunca** con las reales: dos borradores del MISMO rango y
+cadencia DISTINTA tienen que entrar los dos, y el tercero con la cadencia del primero tiene que dar
+`23505`. Si querés medir el caso real sin escribir: `EXPLAIN` no sirve, pero un `BEGIN; … ROLLBACK;`
+sí — y es la forma correcta de probar.
+
+#### Paso 2 — regenerar el archivo único (lo que lleva el arreglo a una instalación nueva)
+
+Sin este paso, una instalación nueva desde `001_orabella_schema.sql` se lleva el índice roto y nada lo
+arregla: el procedimiento documentado instala ese archivo y **no** recorre `schema-history/`.
+
+```bash
+cd /d/u/orabella/app/supabase/squash
+python build-schema.py                    # NO escribe: reporta la primera diferencia y sale con 4
+SQUASH_ESCRIBIR=1 python build-schema.py  # escribe, sólo con la diferencia ya entendida
+```
+
+Seguridad, ya resuelta en el script: recrea la base **descartable** `orabella_build` en el servidor de
+PRUEBAS, compara el host y **aborta** si pruebas y producción fueran el mismo. Producción no se toca.
+
+Después hay que **regenerar también `supabase/test-bootstrap.sql`** (paso 2.8 del README del squash:
+es `cat 001 + seeds` más una cabecera propia). Con el `001` regenerado, esa línea sale sola y el
+puente que hoy está editado a mano deja de hacer falta.
+
+#### Después de los dos pasos
+
+- `npx vitest run` completo: la guarda de alineación 078 ↔ `test-bootstrap.sql`
+  (`tests/atomic-guards.test.ts`) tiene que seguir verde.
+- **Commit con rutas explícitas**, en un commit propio y separado: los dos archivos generados son
+  enormes y no se mezclan con nada.
+- Recordá que **el push arrastra todo lo commiteado por delante**, de las dos sesiones. El dueño decide
+  el push.
+
+#### Lo que NO es tuyo
+
+No toques `app/app/payroll/payroll-client.tsx`, `app/src/features/payroll/schemas.ts` ni
+`app/tests/payroll.test.ts`: son de esta sesión y ya están commiteados, pero pueden estar sucios.
+Tampoco `odd/tasks/nomina-liquidador-usable.md`.
+
 ### No lo toco
 
 - `app/src/features/billing/**`, `app/src/features/commissions/**` y sus tests (esos ya entraron en
