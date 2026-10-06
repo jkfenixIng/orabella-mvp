@@ -22,13 +22,7 @@ import { cn } from "@/src/components/ui/lib/utils";
 import { formatMoney, formatMoneyInput, stripMoneyInput, stripQuantityInput } from "@/src/shared/lib/money";
 import type { ActionResult } from "@/src/shared/lib/api-response";
 import { toNumber } from "@/src/shared/lib/format";
-import {
-  inputClass,
-  labelClass,
-  tableCellClass,
-  tableHeaderClass,
-  tableRowClass,
-} from "@/src/shared/lib/ui-styles";
+import { inputClass, labelClass } from "@/src/shared/lib/ui-styles";
 
 function emptyForm() {
   return {
@@ -137,42 +131,93 @@ export function ServicesClient(props: ServicesClientProps) {
           {rows.length === 0 ? (
             <p className="text-sm text-text-tertiary">Aún no hay servicios en esta sede.</p>
           ) : (
-            <div className="overflow-x-auto">
-              <table className={cn("w-full text-left text-sm", "min-w-[640px]")}>
-                <thead>
-                  <tr className={tableHeaderClass}>
-                    <th className={tableCellClass} scope="col">
-                      Servicio
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Precio
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Duración
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Estado
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Acciones
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((row) => (
-                    <tr key={row.id} className={tableRowClass}>
-                      <td className={cn(tableCellClass, "font-medium")}>
+            // R19 + R4 + R38: la fila del catálogo, no una tabla con carril. Antes
+            // era `<div className="overflow-x-auto">` + `<table className={cn("w-full
+            // text-left text-sm", "min-w-[640px]")}>`: 640 px de contenido en un
+            // carril de 222-308 px en un teléfono, así que la columna `Acciones` —
+            // el `Editar`, lo único que la fila hace— quedaba SIEMPRE fuera, en los
+            // cuatro anchos angostos: son los 4 botones fuera que contó la
+            // medición. Y las cinco celdas se leían como cinco valores sueltos, sin
+            // que nada dijera cuál era cuál.
+            //
+            // Ahora es el patrón de `invoices-client.tsx` (R38) y de
+            // `vouchers-client.tsx`, el mismo y no otro: abajo de `sm` cada fila es
+            // una TARJETA de cuatro renglones y cada valor lleva su rótulo —la
+            // palabra del encabezado, la misma, y por eso las dos superficies no
+            // pueden divergir—; arriba de `sm` cada hoja se ancla a su columna con
+            // `sm:col-start-N` y la grilla conserva las CINCO columnas de hoy, en
+            // su orden. La escala se declara una vez por superficie: no queda piso
+            // de ancho inventado ni carril que arrastrar.
+            //
+            // PRIORIDAD DE LA TARJETA — lo que hay que ver para editar o desactivar
+            // un servicio, en el orden en que se lee:
+            // 1. QUÉ servicio es (Servicio): el nombre lo identifica, y sin
+            //    identidad no hay edición; la descripción cuelga de esa misma línea.
+            // 2. CUÁNTO cuesta y SI se ofrece (Precio + Estado): el precio es lo
+            //    que se cotiza en el mostrador y el estado decide si se puede
+            //    facturar; van en un renglón porque los dos se miran al cobrar.
+            // 3. CUÁNTO dura (Duración): se consulta al agendar, no al cobrar, así
+            //    que baja después del estado.
+            // 4. LA ACCIÓN (Acciones): su propio renglón, envuelta, y al alcance
+            //    del dedo sin gesto horizontal.
+            // El estado NO tiene interruptor propio en la fila —hoy es texto—: lo
+            // que activa o desactiva un servicio es la casilla «Activo» del
+            // formulario, que se abre desde el `Editar` de la fila. El camino de
+            // desactivación es, exactamente, ese botón; por eso tiene que quedar
+            // alcanzable, y por eso sigue siendo el único control de la fila.
+            <div className="mt-4 overflow-hidden rounded-lg border border-border-color dark:border-border-color-2">
+              {/* El encabezado nombra las cinco columnas y sólo existe arriba de
+                  `sm`: abajo la fila dice cada rótulo con su propio valor. */}
+              <div
+                aria-hidden="true"
+                className="hidden grid-cols-[minmax(0,1.5fr)_minmax(0,0.85fr)_minmax(0,0.75fr)_minmax(0,0.6fr)_minmax(0,0.85fr)] gap-2 border-b border-border-color bg-surface px-3 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary sm:grid dark:border-border-color-2"
+              >
+                <span>Servicio</span>
+                <span>Precio</span>
+                <span>Duración</span>
+                <span>Estado</span>
+                <span className="text-center">Acciones</span>
+              </div>
+              <ul className="flex flex-col divide-y divide-border-color dark:divide-border-color-2">
+                {rows.map((row) => (
+                  <li
+                    key={row.id}
+                    className="flex flex-col gap-1 px-3 py-2.5 sm:grid sm:grid-cols-[minmax(0,1.5fr)_minmax(0,0.85fr)_minmax(0,0.75fr)_minmax(0,0.6fr)_minmax(0,0.85fr)] sm:items-center sm:gap-2"
+                  >
+                    {/* Las cuatro líneas de la tarjeta móvil. Abajo de `sm` cada hoja
+                        es un renglón con su rótulo; cada envoltorio `sm:contents` se
+                        borra de la grilla de arriba, donde la hoja se queda en la
+                        columna que su `sm:col-start-N` fija. */}
+                    <span className="flex items-center gap-2 sm:contents">
+                      <span className="break-words text-sm font-medium text-text-primary sm:col-start-1 sm:row-start-1">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Servicio: </span>
                         {row.name}
                         {row.description ? (
                           <span className="ml-2 text-xs text-text-tertiary">{row.description}</span>
                         ) : null}
-                      </td>
-                      <td className={tableCellClass}>{formatMoney(row.price)}</td>
-                      <td className={tableCellClass}>
+                      </span>
+                    </span>
+                    <span className="flex items-center justify-between gap-2 sm:contents">
+                      <span className="whitespace-nowrap text-sm font-medium text-text-primary sm:col-start-2 sm:row-start-1">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Precio: </span>
+                        {formatMoney(row.price)}
+                      </span>
+                      <span className="whitespace-nowrap text-sm text-text-primary sm:col-start-4 sm:row-start-1">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Estado: </span>
+                        {row.is_active ? "Activo" : "Inactivo"}
+                      </span>
+                    </span>
+                    <span className="flex items-center gap-2 sm:contents">
+                      <span className="whitespace-nowrap text-sm text-text-primary sm:col-start-3 sm:row-start-1">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Duración: </span>
                         {row.duracion_min}–{row.duracion_max} min
-                      </td>
-                      <td className={tableCellClass}>{row.is_active ? "Activo" : "Inactivo"}</td>
-                      <td className={tableCellClass}>
+                      </span>
+                    </span>
+                    {/* La acción en su propio renglón: `flex-wrap` para que el botón
+                        quepa en 320 px sin empujar la fila. */}
+                    <span className="flex flex-wrap items-center gap-2 sm:contents">
+                      <span className="flex flex-wrap items-center gap-2 sm:col-start-5 sm:row-start-1 sm:justify-center">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Acciones: </span>
                         {props.canWrite && (
                           <Button
                             type="button"
@@ -184,11 +229,11 @@ export function ServicesClient(props: ServicesClientProps) {
                             Editar
                           </Button>
                         )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                      </span>
+                    </span>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
         </CardContent>
