@@ -415,6 +415,33 @@ hacerlo como tarjeta sería pagar dos veces las mismas pantallas.
 - No se abrieron las variantes *Editar* ni las confirmaciones de borrado. Los artefactos están en
   `~/ui-audit/`.
 
+## Estado final de la jornada
+
+**Las siete listas de dinero y administración dejaron de esconder sus acciones**, cada una medida en
+navegador a 320/360/390/412 (y 640/768/1024 donde la grilla de escritorio importa):
+
+| Lista | Valores con etiqueta | Acciones fuera de pantalla | Scroll lateral |
+| --- | --- | --- | --- |
+| Facturas | 9/9 | 0 (era 1) | 0 |
+| Vales | 6/6 | 0 (era 1, a 674 px) | 0 (era un carril de 522 px) |
+| Servicios | 20/20 | **0 (eran 4)** | 0 |
+| Inventario (2 listas) | 27/27 y 5/5 | **0 (eran 6)** | 0 |
+| Admin (empleados, usuarios) | 60/60 cada una | **0 (eran 20 cada una)** | 0 (era 256/347 px) |
+| Caja | en medición | en medición | en medición |
+
+**Y cinco hipótesis se cayeron al medirlas**, que vale tanto como los arreglos: el `Select` atado a la
+altura del disparador (Radix pone `flex` en línea y la clase es un no-op), el scroll fantasma del
+`min-h-screen` (los 63 px eran contenido real), el hazard del `max-w` (el merge elimina al competidor),
+el recorte de 38,5 px del papel (el diálogo scrollea; al fondo el borde cae exacto sobre la caja) y el
+ancho del matcher que abría `/v1.2/payroll` (era un defecto del arreglo propuesto, no del entregado).
+
+**Lo que quedó sin medir, declarado**: el antes/después de caja (su informe nunca llegó, hay una
+medición en curso), los botones de aprobar/rechazar de vales (necesitan un vale **pendiente**, que la
+base no tiene), el seed de humo (**ningún test lo lee**: lo verificado es su texto, no su efecto), el
+`dvh` (indistinguible en headless) y los tres cambios de la fila de facturas del último tramo (la lista
+sale vacía en vivo porque el filtro es por hoy y los datos de humo son de ayer: se midieron sobre un
+nodo réplica con la clase efectiva, y así está rotulado).
+
 ## Hazards reportados y refutados
 
 **«La base del diálogo lleva `max-w-lg` sin variante, así que un llamador con `max-w-sm` podría
