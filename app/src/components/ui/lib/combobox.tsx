@@ -273,7 +273,19 @@ function Combobox({
                 placeholder={filterPlaceholder}
                 autoFocus
                 aria-label={filterPlaceholder}
-                className="h-9 w-full rounded-md border border-border-color bg-surface px-3 text-sm text-text-primary outline-none placeholder:text-text-tertiary focus:border-primary-600 focus:ring-2 focus:ring-primary-600/20 dark:border-border-color-2 dark:bg-surface"
+                /* MEDIDO a 320 con la lista abierta (Chromium, sesión con
+                   datos): 36 px de alto y 14 px de fuente. Los 14 px son el
+                   umbral que dispara el zoom de iOS al enfocar —y el filtro
+                   lleva `autoFocus`, así que el zoom salta apenas se abre la
+                   lista— y los 36 px están bajo el objetivo táctil de 44.
+
+                   El arreglo es el de los tokens compartidos y por el mismo
+                   motivo: `text-base sm:text-sm` (16 px con el dedo, 14 px en
+                   el escritorio) y `max-sm:min-h-11`, que es un `min-height` y
+                   por eso le gana al `h-9` de arriba —cambiar el `h-9` habría
+                   movido la densidad de escritorio—. El `h-9` se queda: desde
+                   `sm` el filtro sigue midiendo 36, igual que hoy. */
+                className="h-9 w-full max-sm:min-h-11 rounded-md border border-border-color bg-surface px-3 text-base text-text-primary outline-none placeholder:text-text-tertiary focus:border-primary-600 focus:ring-2 focus:ring-primary-600/20 sm:text-sm dark:border-border-color-2 dark:bg-surface"
               />
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto p-1">

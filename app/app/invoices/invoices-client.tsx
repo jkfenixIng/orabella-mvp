@@ -2015,7 +2015,15 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       aria-label={`Editar factura ${row.consecutive_number}`}
                       onClick={() => openEdit(row.id)}
                       className={cn(
-                        "rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800",
+                        /* MEDIDO a 320: 34×34 px (16 del icono + 8+8 del `p-2`
+                           + 1+1 del borde), contra el objetivo táctil de 44×
+                           44 (`docs/ux-ui-standard.md` §8). Se sube el blanco
+                           con `max-sm:min-h-11 max-sm:min-w-11` —los dos
+                           ejes, porque 44×44 es lo que se toca— y solo por
+                           debajo de `sm`: desde 640 el botón sigue en 34×34,
+                           que es la densidad de escritorio de esta fila y una
+                           decisión aparte. El icono NO crece. */
+                        "rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800 max-sm:min-h-11 max-sm:min-w-11",
                         shiftBlockReason !== null && "opacity-50",
                       )}
                     >
@@ -2028,7 +2036,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     title="Ver detalle"
                     aria-label={`Ver detalle de la factura ${row.consecutive_number}`}
                     onClick={() => openDetail(row.id)}
-                    className="rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                    className="rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800 max-sm:min-h-11 max-sm:min-w-11"
                   >
                     <Eye className="h-4 w-4" aria-hidden="true" />
                   </button>
@@ -2355,7 +2363,27 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     (props.isAdmin ||
                       (props.canWrite &&
                         row.status === "Emitida" &&
-                        row.user_id === props.currentUserId)) && (
+                        row.user_id === props.currentUserId)) &&
+                    /* R40: `isEditDialogOpen` es UN estado y este `<Dialog>`
+                       vive dentro del `invoices.map`, así que se montaba una
+                       vez por fila elegible: con dos facturas eran dos modales
+                       «EDITAR FACTURA» abiertos a la vez, con dos overlays en
+                       la pila de apilado y con el `hideOthers` de Radix
+                       dejando a los dos con `aria-hidden="true"` (MEDIDO en
+                       Chromium: una consulta por rol no encontraba ninguno).
+
+                       La fila tiene que ser LA factura que se está editando: el
+                       mismo ancla que ya usa el diálogo de detalle y que hace
+                       que ese se monte una vez sola. `detail` es un único
+                       objeto y `row.id` es la clave de la fila, así que a lo
+                       sumo una fila cumple la condición.
+
+                       NO se hoistea fuera de la fila: serían ~480 líneas
+                       movidas en un archivo donde «Emitir factura» y la fila
+                       son unidades cerradas, y sin forma de medir el
+                       resultado (ver informe). Lo que queda pendiente de esa
+                       versión es que el `Dialog` siga naciendo en el bucle. */
+                    detail?.invoice.id === row.id && (
                     <Dialog
                       open={isEditDialogOpen}
                       onOpenChange={(isOpen) => {

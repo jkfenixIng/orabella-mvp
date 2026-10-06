@@ -761,3 +761,93 @@ describe("control negativo: el diagnóstico acusa el estado previo", () => {
     expect(() => diagnosticar(conMap, "onSubmit={nada}")).toThrow();
   });
 });
+
+/* ==========================================================================
+   R40 — «Editar factura» se monta UNA vez, no una por fila.
+
+   EL DEFECTO, MEDIDO en Chromium por la verificación: con dos facturas
+   elegibles hay DOS diálogos «EDITAR FACTURA» en el DOM y los DOS llevan
+   `aria-hidden="true"`, así que una consulta por rol no encuentra ninguno. La
+   causa es una sola y está en el árbol, no en el CSS: `isEditDialogOpen` es UN
+   estado, y el `<Dialog open={isEditDialogOpen}>` se MONTA dentro del
+   `invoices.map`, una vez por fila elegible. Con dos filas elegibles se abren
+   dos modales a la vez: dos overlays en la pila de `useDialogLayer`, dos
+   trampas de foco y el `hideOthers` de Radix dejándose el último consigo mismo
+   y tapando al otro. El detalle no lo sufre porque su `<Dialog>` sí está
+   anclado a la identidad de la factura (`detail.invoice.id === row.id`), que
+   puede ser cierta para una sola fila.
+
+   LO QUE SE AFIRMA, y por qué no es un grep de tokens: lo que importa es
+   CUÁNTAS INSTANCIAS se montan, y eso lo decide la CONDICIÓN que envuelve al
+   `<Dialog>`, no sus clases. Una guarda de clases daría verde sobre los dos
+   diálogos idénticos. La afirmación es estructural —«la condición que monta el
+   diálogo de edición exige que la fila sea la factura que se está editando»— y
+   de ella se sigue la unicidad: `detail` es un único objeto y `row.id` es la
+   clave de la fila, así que a lo sumo una fila cumple. El control negativo del
+   final corre el MISMO predicado contra una copia del fuente sin la cláusula,
+   y tiene que acusarla.
+
+   LO QUE ESTA GUARDA NO PUEDE AFIRMAR, DICHO DE ANTEMANO: acá no hay
+   navegador, así que no cuenta instancias montadas. Lo que la verificación
+   midió en vivo —dos en el DOM, las dos con `aria-hidden="true"`— es el
+   defecto que esta unidad cierra; lo que esta guarda afirma es que la
+   condición que lo causaba ya no está.
+   ========================================================================== */
+
+/** La condición que monta el `<Dialog open={isEditDialogOpen}>`. */
+function dialogoDeEdicionAislado(source: string): boolean {
+  const ancla = "open={isEditDialogOpen}";
+  const i = source.indexOf(ancla);
+  if (i < 0) return false;
+  // Más de un `Dialog` de edición: aunque uno esté bien condicionado, el otro
+  // se abre con el MISMO estado y vuelve a duplicar el modal.
+  if (source.indexOf(ancla, i + 1) >= 0) return false;
+  const ventana = source.slice(Math.max(0, i - 600), i);
+  return /detail\?\.invoice\.id === row\.id\s*&&\s*\(\s*<Dialog\b[^=]*$/.test(ventana);
+}
+
+describe("R40: el diálogo «Editar factura» se monta una vez, no una por fila", () => {
+  it("el diálogo de edición se ancla a la factura que se está editando", () => {
+    expect(dialogoDeEdicionAislado(INVOICES), "el diálogo de edición no está aislado").toBe(true);
+  });
+
+  it("el de detalle sigue anclado a su factura: es el precedente que ya funciona", () => {
+    expect(INVOICES).toMatch(/\{detail && detail\.invoice\.id === row\.id && \(/);
+  });
+
+  it("la fila se identifica por su `id`, que es lo que hace única la condición", () => {
+    // `row.id` es la clave del `<li>`; dos filas distintas no pueden compartirla,
+    // así que «esta fila es la factura que se está editando» es cierto, como
+    // mucho, para una.
+    expect(INVOICES).toMatch(/<li\s+key=\{row\.id\}/);
+    expect(INVOICES).toMatch(/open=\{detailDialogOpen\}/);
+  });
+});
+
+describe("control negativo: sin la cláusula, la guarda acusa los dos modales", () => {
+  it("sacar la identidad de la condición la hace fallar", () => {
+    const sinClausula = INVOICES.replace(
+      /detail\?\.invoice\.id === row\.id && \(/,
+      "(",
+    );
+    expect(sinClausula, "la mutación tiene que cambiar el fuente").not.toBe(INVOICES);
+    expect(dialogoDeEdicionAislado(sinClausula)).toBe(false);
+  });
+
+  it("duplicar el diálogo de edición también la hace fallar, aunque la otra copia esté bien", () => {
+    // El otro modo de fallar: dos `<Dialog open={isEditDialogOpen}>`, uno
+    // condicionado y otro no. El conteo de la condición no alcanza; la guarda
+    // cuenta las instancias de la ANCLA.
+    const duplicado = INVOICES.replace(
+      /open=\{isEditDialogOpen\}/,
+      "open={isEditDialogOpen}\n                    {isEditDialogOpen && (<Dialog\n                      open={isEditDialogOpen}",
+    );
+    expect(duplicado, "la mutación tiene que cambiar el fuente").not.toBe(INVOICES);
+    expect(dialogoDeEdicionAislado(duplicado)).toBe(false);
+  });
+
+  it("y un archivo sin ese diálogo tampoco la engaña: devuelve `false`, no «no sé»", () => {
+    expect(dialogoDeEdicionAislado("<Dialog open={otroCosa} />")).toBe(false);
+    expect(dialogoDeEdicionAislado("")).toBe(false);
+  });
+});

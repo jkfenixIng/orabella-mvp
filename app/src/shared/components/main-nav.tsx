@@ -310,7 +310,21 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
               type="button"
               aria-label={drawerOpen ? "Cerrar menú" : "Abrir menú"}
               aria-controls="menu-movil"
-              className="rounded-md border border-border-color px-3 py-2 text-sm font-medium"
+              /* MEDIDO a 320: 38 px de alto, contra el objetivo táctil de 44
+                 (`docs/ux-ui-standard.md` §8). La clase que llega a este botón
+                 son TRES listas —la base del `DialogTrigger` por `cn`, la del
+                 llamador (`h-auto bg-transparent px-3 shadow-none`) y esta, que
+                 el `Slot` de Radix pega encima sin fusionar—, así que el piso
+                 se pone AQUÍ y no en el token: es lo único que sobrevive a las
+                 tres.
+
+                 `max-sm:min-h-11` y no `min-h-11`: abajo de 640 el `min-height`
+                 le gana al `height`, así que ni el `h-auto` de la primitiva lo
+                 puede tumbar; desde 640 no hay `min-height` declarado y el
+                 escritorio queda en los 38 px de siempre. El ANCHO se queda en
+                 el que da el contenido (38,58 px medidos) porque el hallazgo es
+                 de alto y cambiarlo ensancharía la barra superior del shell. */
+              className="rounded-md border border-border-color px-3 py-2 text-sm font-medium max-sm:min-h-11"
             >
               ☰
             </button>
