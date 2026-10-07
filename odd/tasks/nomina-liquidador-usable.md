@@ -219,3 +219,35 @@ hacia adelante y nadie lo rompe.
   pestañas no lo reducen: reducen lo que ocupa lugar a la vez, no el total.
 - **Un arranque corto se ve como un error.** El primer ciclo paga el 25% del mensual. Sin la
   explicación de T5, se lee como un defecto de cálculo.
+
+## Estado de PRODUCCIÓN (medido el 2026-10-06, sólo lectura)
+
+La entrega de la 078 quedó **hecha en PRUEBAS y no en producción**, y nadie lo miró porque PRUEBAS
+funcionaba. Medido con la conexión de producción, sin una sola escritura:
+
+| Qué | Medición | Consecuencia |
+| --- | --- | --- |
+| `uq_payroll_draft_per_range` | **SIN CADENCIA** (le falta la 078) | El primer borrador semanal bloqueará el **quincenal y el mensual del mismo rango** con `PERIOD_DRAFT_EXISTS` (23505): el mismo defecto de ayer, en la base real |
+| Empleados activos | 2, **los dos con `pay_frequency` NULL** | El aviso de pendientes **no muestra nada** (regla 1: sin cadencia, el empleado se saltea) y no hay nada que liquidar hasta asignarlas |
+| `payroll_periods` | 0 | Correcto para una instalación que no liquidó |
+| Facturas | 0 | El piso es `null`: **correcto** — sin evidencia, la primera liquidación declara su arranque |
+| `sedes.payroll_start_date` | NULL (columna sin uso) | Deuda declarada desde F10 |
+| Esquema | 36 tablas, mono-sede, al día | La 078 es el único delta estructural |
+| `system_settings` | `invoice_sequence` + las cuatro claves de vales | El código nuevo las lee: no falta ninguna |
+
+**Decisión del dueño (2026-10-06): no tocar producción todavía.** Queda declarado, no hecho.
+
+**Lo que hace falta el día de la primera liquidación en producción**, en orden:
+
+1. **El índice de la 078**, en una sola transacción (relaja la unicidad: no puede chocar, hay 0
+   períodos):
+   ```sql
+   DROP INDEX IF EXISTS public.uq_payroll_draft_per_range;
+   CREATE UNIQUE INDEX uq_payroll_draft_per_range
+     ON public.payroll_periods USING btree (start_date, end_date, coalesce(frequency, ''))
+     WHERE (status = 'borrador');
+   ```
+2. **Asignar la cadencia a los 2 empleados** (es el acuerdo con cada uno, no un dato técnico): sin
+   eso la pantalla de nómina queda muda.
+3. **Operar y facturar**: el piso se derivará de la primera factura sin que nadie declare nada, y el
+   anclaje queda disponible si alguno de esos ciclos ya se pagó antes del sistema.
