@@ -11959,21 +11959,23 @@ describe("payroll-client: el aviso de ciclos pendientes y la entrada DERIVADA de
     expect(source).toContain("export function PayrollClient");
   });
 
-  it("la lista sale de la función pura y de los datos que la pantalla YA tiene", () => {
+  it("la lista sale de la función pura y del PISO QUE EL SERVIDOR LE ENTREGA", () => {
     // Sin lectura nueva: los períodos (estado del cliente), la planta que llega
-    // como prop y el piso, que el propio cliente DERIVA de esos períodos con la
-    // misma función pura del servicio. Un `select` por cadencia sería N
-    // consultas para el mismo dato, y una prop de servidor para el piso
-    // quedaría VIEJA en cuanto el primer período se abre.
+    // como prop y el piso, que ahora llega RESUELTO como prop (`
+    // initialHistoryFloor`, la evidencia: períodos + primera factura). El cliente
+    // lo CONSUME tal cual: NO re-deriva el suyo de los períodos, porque con
+    // facturas y sin períodos eso ofrecía ciclos que la facturación ya
+    // desmentía (el caso medido: la factura del 28-sep y el aviso de julio).
     // T5: el anclaje DECLARADO viaja a la misma función (un ciclo cubierto deja
     // de pedirse; uno a medias se reporta recortado a `ancla + 1`).
     expect(source).toMatch(
-      /const pendingSettlements = props\.canAdmin\s*\?\s*pendingPayrollSettlements\(\{\s*periods,\s*employees: props\.initialEmployees,\s*referenceDate: bogotaDay\(\),\s*anchors: declaredAnchors,\s*\}\)/,
+      /const pendingSettlements = props\.canAdmin\s*\?\s*pendingPayrollSettlements\(\{\s*periods,\s*employees: props\.initialEmployees,\s*referenceDate: bogotaDay\(\),\s*floor: payrollStartDate,\s*anchors: declaredAnchors,\s*\}\)/,
     );
     // Sólo el admin: el aviso nombra a la planta de la instalación.
     expect(source).toContain("props.canAdmin && pendingSettlements.length > 0");
-    // El piso sale de la derivación compartida, no de una fecha configurada.
-    expect(source).toContain("const payrollStartDate = payrollHistoryFloor(periods);");
+    // El piso llega del servidor y se consume; el cliente no re-deriva el suyo.
+    expect(source).toContain("useState<string | null>(props.initialHistoryFloor)");
+    expect(source).not.toContain("payrollHistoryFloor(");
     expect(source).not.toContain("props.initialPayrollStartDate");
   });
 
@@ -13887,8 +13889,11 @@ describe("payroll: la fecha de arranque de la nómina de la sede (F10, servicio)
     // fuente de verdad dentro de este módulo.
     expect(codigo).not.toContain('from("sedes")');
     expect(codigo).not.toContain("payroll_start_date");
-    // La derivación es la MISMA función pura que usan el resumen y la apertura.
-    expect(codigo).toContain("payrollHistoryFloor(");
+    // La columna de la 068 sigue MUERTA: la evidencia la compone el piso
+    // (períodos + primera factura), no la columna configurada. Comentarios
+    // fuera, esto sólo mira código: cualquier `payroll_start_date` que vuelva a
+    // colarse —lectura o escritura— hace fallar la guarda.
+    expect(codigo).not.toContain("payroll_start_date");
     // Y la escritura de la fecha nunca estuvo acá: si volviera, el módulo
     // tendría una segunda puerta para cambiar de qué fecha arranca la nómina.
     expect(codigo).not.toContain("setPayrollStartDate");
@@ -13977,20 +13982,219 @@ describe("payroll: el piso de la nómina es un HECHO derivado (decisión del due
     expect(await getPayrollStartDateAction()).toMatchObject({ success: false, code: "FORBIDDEN" });
   });
 
-  it("la pantalla deriva el piso de los períodos que ya tiene y no pide nada por SSR", () => {
+  it("el SSR lee el piso por EVIDENCIA y el cliente lo consume (ya no lo deriva)", () => {
     const page = readFileSync(join(process.cwd(), "app", "payroll", "page.tsx"), "utf8");
     const client = readFileSync(join(process.cwd(), "app", "payroll", "payroll-client.tsx"), "utf8");
-    // La página ya no lee la fecha: una segunda lectura de períodos (o de la
-    // fila de la sede) para un dato que el cliente puede derivar de los
-    // períodos que YA tiene — y que además se refreshed con cada apertura.
-    expect(page).not.toContain("getPayrollStartDate");
+    // La dirección se INVIERTE: el SSR lee el piso (evidencia: períodos + la
+    // primera factura) y lo ENTREGA como prop; el cliente lo CONSUME.
+    expect(page).toContain("getPayrollStartDate()");
+    expect(page).toContain("initialHistoryFloor={historyFloor}");
     expect(page).not.toContain("initialPayrollStartDate");
     expect(client).not.toContain("initialPayrollStartDate");
-    // El piso del cliente sale de la función pura compartida con el servicio:
-    // una sola definición de `min(start_date)`.
-    expect(client).toContain("payrollHistoryFloor(periods)");
+    expect(client).toContain("props.initialHistoryFloor");
+    // Y una SEGUNDA derivación en el cliente hace fallar esto: la única
+    // definición del piso es la del servicio.
+    expect(client).not.toContain("payrollHistoryFloor(");
     // Y la fecha que la PRIMERA liquidación declara viaja en el envío.
     expect(client).toContain("declared_start_date");
+  });
+});
+
+/* ==========================================================================
+   F10 (evidencia del dueño): una instalación que FACTURA sin haber liquidado
+   nunca ya tiene historia. La primera factura acota el aviso y la apertura
+   igual que lo hacía el primer período. El script del caso real: la primera
+   factura es 2026-09-28 y el aviso listaba `mensual 12-jul → 8-ago`.
+   ========================================================================== */
+describe("payroll: el piso de la nómina por EVIDENCIA de factura (F10)", () => {
+  const SEDE = payrollPagedStub.SEDE_ID;
+  const ACTOR: PayrollActor = { userId: "u-1", roles: ["admin"] };
+  /** Reloj congelado en el martes 2026-10-06 (el ciclo mensual cierra el 3-oct). */
+  const HOY = new Date("2026-10-06T15:00:00.000Z");
+
+  function employeeRow(frequency: string, index: number): Record<string, unknown> {
+    return {
+      id: `emp-${frequency}-${index}`,
+      sede_id: SEDE,
+      user_id: null,
+      full_name: "Ana López",
+      employee_code: `E-0${index + 1}`,
+      document: `100${index}`,
+      phone: null,
+      position: null,
+      payout_mode: "normal",
+      email: null,
+      birth_date: null,
+      pay_type: "fijo",
+      pay_frequency: frequency,
+      salary_fixed: 1500000,
+      commission_percent: null,
+      is_active: true,
+    };
+  }
+
+  function invoice(status: string, createdAt: string): Record<string, unknown> {
+    return { id: `inv-${createdAt}`, status, created_at: createdAt };
+  }
+
+  function seedEvidence(args: {
+    periods?: Array<Record<string, unknown>>;
+    invoices?: Array<Record<string, unknown>>;
+    frequencies?: string[];
+  }): void {
+    payrollPagedStub.tables = {
+      payroll_periods: args.periods ?? [],
+      employees: (args.frequencies ?? []).map((frequency, index) =>
+        employeeRow(frequency, index),
+      ),
+      invoices: args.invoices ?? [],
+      invoice_items: [],
+      commission_rules: [],
+      voucher_requests: [],
+      commission_payouts: [],
+      payroll_items: [],
+      payroll_payments: [],
+      audit_logs: [],
+    };
+  }
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  it("el caso del dueño: la factura del 28-sep acota el aviso a UN ciclo recortado por cadencia", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(HOY);
+    try {
+      seedEvidence({
+        // 15:00 UTC = 10:00 en Bogotá: el día del módulo es el 28, no el 29.
+        invoices: [invoice("Pagada", "2026-09-28T15:00:00.000Z")],
+        frequencies: ["mensual", "semanal", "quincenal"],
+      });
+
+      // El piso es el DÍA Bogotá de la factura, no su marca UTC.
+      expect(await getPayrollStartDate()).toBe("2026-09-28");
+
+      const overview = await listPayrollOverview();
+
+      // UN ciclo por cadencia, recortado a la evidencia (el mismo rango para
+      // las tres: el ciclo cerrado 06-sep→03-oct acotado al 28-sep).
+      expect(overview.pendingSettlements).toHaveLength(3);
+      for (const settlement of overview.pendingSettlements) {
+        expect(settlement).toMatchObject({
+          start_date: "2026-09-28",
+          end_date: "2026-10-03",
+        });
+      }
+      // Y los ciclos que la facturación desmiente NO están: ni julio ni agosto,
+      // ni nada que empiece o cierre antes de la primera factura.
+      expect(overview.pendingSettlements.some((row) => row.start_date < "2026-09-28")).toBe(
+        false,
+      );
+      expect(overview.pendingSettlements.some((row) => row.end_date < "2026-09-28")).toBe(
+        false,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("una factura Anulada NO es evidencia: no baja el piso ni recorta el aviso", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(HOY);
+    try {
+      seedEvidence({
+        invoices: [invoice("Anulada", "2026-09-01T15:00:00.000Z")],
+        frequencies: ["mensual"],
+      });
+
+      // La venta que no ocurrió no prueba operación: sin evidencia el piso es
+      // nulo y el aviso es el de una instalación nueva (tres ciclos).
+      expect(await getPayrollStartDate()).toBeNull();
+      const overview = await listPayrollOverview();
+      expect(
+        overview.pendingSettlements.map((row) => `${row.start_date}..${row.end_date}`),
+      ).toEqual([
+        "2026-07-12..2026-08-08",
+        "2026-08-09..2026-09-05",
+        "2026-09-06..2026-10-03",
+      ]);
+      expect(overview.pendingSettlements.some((row) => row.start_date === "2026-09-01")).toBe(
+        false,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("control negativo: SIN facturas el servicio se comporta EXACTAMENTE como hoy", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(HOY);
+    try {
+      // Instalación nueva, cero evidencia: el piso sigue nulo y el aviso sigue
+      // ofreciendo los tres últimos ciclos cerrados de cada cadencia.
+      seedEvidence({ frequencies: ["mensual"] });
+
+      expect(await getPayrollStartDate()).toBeNull();
+      const overview = await listPayrollOverview();
+      expect(
+        overview.pendingSettlements.map((row) => `${row.start_date}..${row.end_date}`),
+      ).toEqual([
+        "2026-07-12..2026-08-08",
+        "2026-08-09..2026-09-05",
+        "2026-09-06..2026-10-03",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("la APERTURA usa el piso por evidencia: el primer ciclo se abre recortado a la factura", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(HOY);
+    try {
+      seedEvidence({ invoices: [invoice("Pagada", "2026-09-28T15:00:00.000Z")] });
+
+      // Sin períodos y con la factura como piso, la primera liquidación mensual
+      // NO pregunta la fecha: la evidencia ya la dice y el ciclo se recorta a
+      // ella (el MISMO rango que el aviso reporta).
+      const created = await openPayrollPeriod(
+        SEDE,
+        { frequency: "mensual", cycle_end_date: "2026-10-03" },
+        ACTOR,
+      );
+
+      expect(created).toMatchObject({
+        start_date: "2026-09-28",
+        end_date: "2026-10-03",
+        frequency: "mensual",
+        status: "borrador",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("la pantalla y el servidor comparten el MISMO piso: el SSR lo FEEDS y el cliente lo CONSUME (guarda de fuente)", () => {
+    const page = readFileSync(join(process.cwd(), "app", "payroll", "page.tsx"), "utf8");
+    const client = readFileSync(
+      join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
+      "utf8",
+    );
+    const service = readFileSync(
+      join(process.cwd(), "src", "features", "payroll", "service.ts"),
+      "utf8",
+    );
+    // El servidor deriva el piso UNA vez con la composición pura de la
+    // evidencia y excluye la anulada; el cliente no reimplementa nada.
+    expect(service).toContain("payrollEvidenceFloor(");
+    expect(service).toContain('.neq("status", "Anulada")');
+    // El SSR lo lee y lo ENTREGA como prop...
+    expect(page).toContain("getPayrollStartDate()");
+    expect(page).toContain("initialHistoryFloor={historyFloor}");
+    // ...y el cliente lo CONSUME en el aviso y en el diálogo, del mismo valor.
+    expect(client).toMatch(/floor: payrollStartDate,\s*anchors: declaredAnchors,/);
+    expect(client).toContain("payrollStartDate: payrollStartDate,");
+    expect(client).not.toContain("payrollHistoryFloor(");
   });
 });
 

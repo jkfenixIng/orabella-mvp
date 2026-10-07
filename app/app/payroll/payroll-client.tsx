@@ -10,6 +10,7 @@ import {
   getPayrollPeriodCorrectionAction,
   getPayrollSettlementSourcesAction,
   getPeriodDetailAction,
+  getPayrollStartDateAction,
   listPayrollExtrasAction,
   listPayrollMonthRowsAction,
   listPeriodsAction,
@@ -50,7 +51,6 @@ import {
   payrollEmployeeName,
   payrollExtraGuide,
   payrollExtraKindSchema,
-  payrollHistoryFloor,
   payrollMonthLabel,
   payrollPeriodCountLabel,
   payrollTrimmedCycle,
@@ -428,6 +428,13 @@ interface PayrollClientProps {
    * superficie del admin; para el empleado van vacíos.
    */
   initialCadenceAnchors: PayrollCadenceAnchors;
+  /**
+   * F10 (evidencia): el piso de la nómina —el más antiguo entre el piso de los
+   * períodos y la primera factura—, leído UNA vez por SSR. El cliente NO lo
+   * deriva: no tiene facturas, y derivarlo de los períodos le hacía ofrecer
+   * ciclos que la facturación ya desmentía.
+   */
+  initialHistoryFloor: string | null;
   methods: PaymentMethodRow[];
   canAdmin: boolean;
   canPay: boolean;
@@ -1295,15 +1302,14 @@ export function PayrollClient(props: PayrollClientProps) {
   const [error, setError] = useState<string | null>(null);
 
   /**
-   * F10 (2026-10-04): el día desde el que la nómina OPERA es un HECHO derivado —
-   * el del primer período (`payrollHistoryFloor`), no una configuración. Se
-   * DERIVA acá de los períodos que la pantalla ya tiene (y que se refrescan con
-   * cada apertura), con la MISMA función pura que usa el servicio: una prop de
-   * servidor para esto quedaría vieja en el instante en que se abre el primer
-   * período. `null` = todavía no hay ningún período, y entonces lo declara esta
-   * liquidación.
+   * F10 (evidencia): el piso de la nómina lo deriva el SERVIDOR —el piso de los
+   * períodos compuesto con la primera factura— y viaja como prop. Acá NO se
+   * recalcula: la pantalla no tiene facturas, y su propia derivación ofrecía
+   * ciclos que la facturación ya desmentía. Vive en estado para poder releerlo
+   * cuando los períodos cambian (`refreshPeriods`), sin recargar la página.
+   * `null` = todavía no hay evidencia, y entonces lo declara esta liquidación.
    */
-  const payrollStartDate = payrollHistoryFloor(periods);
+  const [payrollStartDate, setPayrollStartDate] = useState<string | null>(props.initialHistoryFloor);
 
   /**
    * T5: el anclaje DECLARADO por cadencia. Arranca con lo que el servidor leyó y
@@ -1545,6 +1551,13 @@ export function PayrollClient(props: PayrollClientProps) {
       setPeriods(result.data);
       if (select) setSelectedId(select);
       else if (!selectedId && result.data[0]) setSelectedId(result.data[0].id);
+      // El piso por EVIDENCIA se relee acá, que es el único punto donde los
+      // períodos cambian: así el aviso y el diálogo quedan con el MISMO piso que
+      // el servidor en vez de esperar a que se recargue la página.
+      if (props.canAdmin) {
+        const floor = (await getPayrollStartDateAction()) as ActionResult<string | null>;
+        if (floor.success) setPayrollStartDate(floor.data);
+      }
     }
   }
 
@@ -2357,6 +2370,7 @@ export function PayrollClient(props: PayrollClientProps) {
         periods,
         employees: props.initialEmployees,
         referenceDate: bogotaDay(),
+        floor: payrollStartDate,
         anchors: declaredAnchors,
       })
     : [];

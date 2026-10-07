@@ -5,7 +5,12 @@ import { PageContainer, PageHeader } from "@/src/components/ui/lib/page";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { listAllEmployees, listPaymentMethods } from "@/src/features/admin/service";
-import { getPayrollCadenceAnchors, listPayrollOverview, listPeriods } from "@/src/features/payroll/service";
+import {
+  getPayrollCadenceAnchors,
+  getPayrollStartDate,
+  listPayrollOverview,
+  listPeriods,
+} from "@/src/features/payroll/service";
 import { PayrollClient } from "./payroll-client";
 
 export const dynamic = "force-dynamic";
@@ -57,7 +62,7 @@ export default async function PayrollPage() {
   // que SOLO el admin lo recibe. Al empleado se le manda únicamente su propia
   // fila: pasarle la planta entera sería exponerle documentos, teléfonos y
   // sueldos ajenos.
-  const [employees, methods, overview, cadenceAnchors] = await Promise.all([
+  const [employees, methods, overview, cadenceAnchors, historyFloor] = await Promise.all([
     listAllEmployees(),
     listPaymentMethods(),
     canAdmin ? listPayrollOverview() : null,
@@ -68,6 +73,11 @@ export default async function PayrollPage() {
     // claves en una lectura, y el cliente las recibe ya derivadas (el ancla
     // ajustada al sábado y los días absorbidos), sin volver a aplicar la regla.
     canAdmin ? getPayrollCadenceAnchors() : null,
+    // F10 (evidencia): el piso de la nómina —el más antiguo entre el primer
+    // período y la primera factura— se lee UNA vez acá y viaja como prop. El
+    // cliente no lo re-deriva: con facturas y sin períodos, su propia derivación
+    // ofrecía ciclos que la facturación ya desmentía.
+    canAdmin ? getPayrollStartDate() : null,
   ]);
 
   // El admin ya tiene los períodos dentro del resumen: se usan esos y la lectura
@@ -88,6 +98,7 @@ export default async function PayrollPage() {
         initialPeriods={periods}
         initialSummaries={overview?.summaries ?? []}
         initialCadenceAnchors={cadenceAnchors ?? {}}
+        initialHistoryFloor={historyFloor}
         methods={methods.filter((row) => row.is_active)}
         canAdmin={canAdmin}
         canPay={canPay}

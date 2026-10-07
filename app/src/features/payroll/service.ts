@@ -27,7 +27,7 @@ import {
   normalizePerDayLimits,
   openPeriodSchema,
   openPayrollRejectionMessage,
-  payrollHistoryFloor,
+  payrollEvidenceFloor,
   periodCadenceBucket,
   periodExcludesEmployeeByCadence,
   overlapBlocksDeletion,
@@ -169,6 +169,49 @@ async function readAllPayroll<TRow>(args: {
 
 function validationMessage(error: { issues: Array<{ message: string }> }): string {
   return error.issues[0]?.message ?? "Datos inválidos.";
+}
+
+/**
+ * F10 (evidencia): la factura MÁS ANTIGUA que prueba operación —la de
+ * `created_at` menor entre las que NO están anuladas—, con su día Bogotá ya
+ * resuelto (la convención de fecha del módulo vive acá, con quien lee la base).
+ * Una sola fila: la composición con el piso de los períodos la hace
+ * `payrollEvidenceFloor`, no este lector.
+ *
+ * Una lectura que falle NO se degrada a «sin facturas»: un piso que se cae en
+ * silencio ofrecería ciclos que la facturación ya desmiente. Sin filas (o con
+ * una fecha imposible) no hay evidencia y devuelve `null`.
+ */
+async function readEarliestInvoiceEvidence(
+  db: DbClient,
+): Promise<{ status: string | null; day: string } | null> {
+  const { data, error } = await db
+    .from("invoices")
+    .select("status, created_at")
+    .neq("status", "Anulada")
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+  if (!data) return null;
+  const row = data as { status?: string | null; created_at?: string | null };
+  const instant = row.created_at ? Date.parse(row.created_at) : Number.NaN;
+  if (Number.isNaN(instant)) return null;
+  return { status: row.status ?? null, day: bogotaDay(0, new Date(instant)) };
+}
+
+/**
+ * F10: el piso de la nómina por EVIDENCIA, derivado UNA vez para cada llamador
+ * (apertura, resumen y lectura del piso): el piso de los períodos compuesto con
+ * la primera factura por `payrollEvidenceFloor`. Sin facturas el resultado es
+ * EXACTAMENTE el de siempre (la instalación recién nacida).
+ */
+async function payrollEvidenceFloorFor(
+  db: DbClient,
+  periods: readonly PayrollPeriodRow[],
+): Promise<string | null> {
+  const invoice = await readEarliestInvoiceEvidence(db);
+  return payrollEvidenceFloor({ periods, invoices: invoice === null ? [] : [invoice] });
 }
 
 /**
@@ -745,10 +788,10 @@ export async function openPayrollPeriod(
     // necesita saber si la CADENCIA ya tiene historia y no sólo si ese ciclo está
     // tocado.
     const sedePeriods = await listPeriods();
-    // F10: el arranque de la nómina es `min(start_date)` de esos períodos.
-    // Cuando no hay ninguno, no hay arranque: lo declara esta liquidación (la
-    // primera, y la única que puede mandarlo).
-    const payrollStartDate = payrollHistoryFloor(sedePeriods);
+    // F10: el arranque de la nómina es la EVIDENCIA —el piso de esos períodos
+    // compuesto con la primera factura—. Cuando no hay ninguna, no hay arranque:
+    // lo declara esta liquidación (la primera, y la única que puede mandarlo).
+    const payrollStartDate = await payrollEvidenceFloorFor(db, sedePeriods);
     // T5: el anclaje DECLARADO de ESTA cadencia —los días hasta él ya se
     // pagaron—, nunca el piso: el piso dice desde cuándo HAY historia, no hasta
     // cuándo se pagó. Se lee la declaración vigente tal cual la lee el aviso (una
@@ -926,7 +969,10 @@ export async function listPeriods(): Promise<PayrollPeriodRow[]> {
  * base que ya tiene una.
  */
 export async function getPayrollStartDate(): Promise<string | null> {
-  return payrollHistoryFloor(await listPeriods());
+  // La evidencia vive en dos lugares (los períodos ya liquidados y la primera
+  // factura), así que el piso se compone UNA vez con la regla pura del módulo.
+  const db = await payrollDb();
+  return payrollEvidenceFloorFor(db, await listPeriods());
 }
 
 async function getPeriodOrThrow(db: DbClient, id: string): Promise<PayrollPeriodRow> {
@@ -1377,7 +1423,7 @@ export async function listPayrollOverview(): Promise<PayrollOverview> {
     // lecturas. El aviso lo necesita para no pedir un ciclo ya cubierto, y es la
     // MISMA lectura que la pantalla recibe por SSR: el resumen de la sede y el
     // aviso del cliente no pueden discrepar sobre qué ciclos faltan.
-    const [items, employees, declaredAnchors] = await Promise.all([
+    const [items, employees, declaredAnchors, invoiceEvidence] = await Promise.all([
       readPaidItemsOfPeriods({
         db,
         periodIds: periods.map((period) => period.id),
@@ -1386,7 +1432,19 @@ export async function listPayrollOverview(): Promise<PayrollOverview> {
       }),
       listAllEmployees(),
       getPayrollCadenceAnchors(),
+      // F10 (evidencia): la primera factura entra en la MISMA tanda de lecturas
+      // que la planta y el anclaje. Es la prueba de que la instalación ya
+      // operaba aunque nunca haya liquidado: sin ella, el aviso cae al tope de
+      // siempre y ofrece ciclos que la facturación desmiente.
+      readEarliestInvoiceEvidence(db),
     ]);
+    // El piso de la evidencia se deriva UNA vez y se pasa EXPLÍCITO al aviso:
+    // el resumen de la sede no deriva su propio piso de los períodos (si lo
+    // hiciera, el servidor y la pantalla podrían listar ciclos distintos).
+    const historyFloor = payrollEvidenceFloor({
+      periods,
+      invoices: invoiceEvidence === null ? [] : [invoiceEvidence],
+    });
 
     const byPeriod = new Map<string, PaidPayrollItem[]>();
     for (const item of items) {
@@ -1405,6 +1463,10 @@ export async function listPayrollOverview(): Promise<PayrollOverview> {
         periods,
         employees,
         referenceDate: bogotaDay(),
+        // F10 (evidencia): el piso que el servidor ya derivó de los períodos MÁS
+        // la primera factura. Va EXPLÍCITO: la lista del servidor es la de la
+        // evidencia, no la de sólo-períodos.
+        floor: historyFloor,
         // T5: el anclaje declarado de cada cadencia (nunca el piso, que no es
         // cobertura): un ciclo que cierra en o antes del ancla ya está pagado y
         // no se reporta; uno que la contiene se reporta recortado a `ancla + 1`,
