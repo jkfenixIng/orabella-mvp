@@ -1279,6 +1279,33 @@ export function payrollHistoryFloor(
 }
 
 /**
+ * F10: el día que declara la PRIMERA liquidación cuando nadie lo escribió.
+ *
+ * Cuando la instalación no tiene ningún período, el ciclo que se va a liquidar
+ * YA está elegido, así que su PRIMER día es la fecha desde la que opera la
+ * nómina: pedir que se teclee obliga al dueño a repetir un dato que el sistema
+ * ya tiene. La fecha se DERIVA del ciclo y no se pregunta; lo que se escriba la
+ * pisa.
+ *
+ * El default es válido POR CONSTRUCCIÓN: `cycleStartDate` es exactamente el
+ * `min` del campo de fecha y su `max` es `min(cierre del ciclo, hoy)` —con los
+ * ciclos pendientes ya CERRADOS, el inicio nunca cae después del tope—, así que
+ * el valor derivado siempre cae dentro de la ventana admisible. No es una cota
+ * nueva ni relaja la declaración: es el mismo día que antes se tecleaba.
+ *
+ * Puro para probarlo sin base de datos y definido UNA sola vez: el campo del
+ * diálogo y el cuerpo del envío lo consumen del mismo lugar.
+ */
+export function declaredStartForFirstLiquidation(args: {
+  /** Lo que se escribió en el campo; vacío es «no se escribió nada». */
+  typed: string;
+  /** El primer día del ciclo ofrecido (el `min` del campo de fecha). */
+  cycleStartDate: string;
+}): string {
+  return args.typed || args.cycleStartDate;
+}
+
+/**
  * F10: ¿este rango queda ENTERO antes del arranque de la nómina?
  *
  * LA regla del arranque, en UNA sola definición: un rango es ANTERIOR cuando su

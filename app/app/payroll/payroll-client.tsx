@@ -34,6 +34,7 @@ import {
   ADJUSTMENT_REASON_MAX_LENGTH,
   buildPayrollEmployeeIndex,
   cycleDaysForFrequency,
+  declaredStartForFirstLiquidation,
   detailLineCommissionOrigin,
   filterPeriodsByCadence,
   groupPayrollPeriodsByMonth,
@@ -1602,8 +1603,9 @@ export function PayrollClient(props: PayrollClientProps) {
     // F10: el cuerpo lleva la CADENCIA del ciclo pendiente y su CIERRE. No hay
     // fechas en el envío: el rango (y su recorte) lo deriva el servidor. La
     // ÚNICA fecha que viaja es la que declara la PRIMERA liquidación —con
-    // períodos ya no se manda, porque el arranque lo dan ellos—.
-    const declaredStartDate = primeraLiquidacion ? openDeclaredStart : "";
+    // períodos ya no se manda, porque el arranque lo dan ellos—. `declaredStartDate`
+    // ya es el valor EFECTIVO: si nadie escribió, es el inicio del ciclo elegido
+    // (`declaredStartForFirstLiquidation`), la misma verdad que muestra el campo.
     const result = (await openPayrollPeriodAction({
       frequency: openTarget.frequency,
       cycle_end_date: openTarget.end_date,
@@ -2064,10 +2066,19 @@ export function PayrollClient(props: PayrollClientProps) {
   // entonces lo que se escribió manda, y el resto de la vida del módulo manda
   // el derivado. Con historial, `declaredStartDate` viaja en `null` a propósito.
   const primeraLiquidacion = periods.length === 0;
-  const declaredStartDate = primeraLiquidacion ? openDeclaredStart : "";
   const openCycle = openTarget
     ? payrollCycleRange({ frequency: openTarget.frequency, cycleEndDate: openTarget.end_date })
     : null;
+  // F10: el día declarado EFECTIVO. En la primera liquidación, si no se escribió
+  // nada, es el inicio del ciclo ofrecido —la fecha no se pregunta porque el
+  // ciclo ya está elegido—; lo escrito la pisa. Una sola definición, en
+  // `schemas.ts`: el estado vacío significa «usa el default de este ciclo».
+  const declaredStartDate = primeraLiquidacion
+    ? declaredStartForFirstLiquidation({
+        typed: openDeclaredStart,
+        cycleStartDate: openCycle?.start_date ?? "",
+      })
+    : "";
   // El campo de la fecha está ACOTADO al ciclo elegido (y a hoy): el recorte
   // sólo existe dentro del ciclo, así que la pantalla no ofrece otros días.
   const declaredMin = openCycle?.start_date ?? "";
@@ -3016,7 +3027,9 @@ export function PayrollClient(props: PayrollClientProps) {
                           setOpenTarget(entry);
                           // La fecha declarada pertenece al CICLO: al cambiar de
                           // ciclo, la que estaba escrita ya no aplica (el campo
-                          // está acotado al nuevo) y se pide de nuevo.
+                          // está acotado al nuevo). Vaciar el estado es correcto
+                          // POR CONSTRUCCIÓN: «sin escribir» significa «usa el
+                          // inicio de ESTE ciclo» (el default derivado).
                           setOpenDeclaredStart("");
                         }}
                         className="mt-1"
@@ -3050,7 +3063,7 @@ export function PayrollClient(props: PayrollClientProps) {
                   <input
                     id="payroll-open-start-date"
                     type="date"
-                    value={openDeclaredStart}
+                    value={declaredStartDate}
                     min={declaredMin}
                     max={declaredMax}
                     onChange={(event) => {

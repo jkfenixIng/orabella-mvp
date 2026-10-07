@@ -26,6 +26,7 @@ import {
   cycleDaysForFrequency,
   cycleProrationFactor,
   daysInMonthWithinRange,
+  declaredStartForFirstLiquidation,
   detailLineCommissionOrigin,
   filterPeriodsByCadence,
   fixedFractionForFrequency,
@@ -12290,6 +12291,85 @@ describe("payroll: la fecha que declara la PRIMERA liquidación (función pura)"
     expect(
       resolve({ frequency: "semanal", cycleEndDate: "2026-07-25", payrollStartDate: "2026-08-01", periods: [quincenal] }),
     ).toEqual({ ok: false, reason: "before-start" });
+  });
+});
+
+/* ==========================================================================
+   EL DÍA DECLARADO POR DEFECTO EN LA PRIMERA LIQUIDACIÓN.
+
+   Cuando la instalación no tiene ningún período, el diálogo YA sabe desde qué
+   día arranca la nómina: es el PRIMER día del ciclo que él mismo ofreció. Pedir
+   que se teclee esa fecha obligaba al dueño a escribir un dato que el sistema
+   ya tenía. La regla es una sola y pura —un día escrito gana; sin escribir, el
+   inicio del ciclo— y el componente la usa como valor EFECTIVO, tanto para el
+   campo como para lo que envía.
+   ========================================================================== */
+describe("payroll: el día declarado por DEFECTO de la primera liquidación (F10, función pura)", () => {
+  /** Domingo 2026-10-04: el ciclo semanal que lo contiene cierra el sábado 3. */
+  const REFERENCE = "2026-10-04";
+  const EMPLOYEE = { full_name: "Ana", pay_frequency: "semanal", is_active: true };
+
+  it("un día escrito GANA; sin escribir, el default es el inicio del ciclo", () => {
+    // Lo que el dueño escribió manda sobre el default.
+    expect(
+      declaredStartForFirstLiquidation({ typed: "2026-09-30", cycleStartDate: "2026-09-27" }),
+    ).toBe("2026-09-30");
+    // Y sin escribir nada, el default es el primer día del ciclo ofrecido.
+    expect(
+      declaredStartForFirstLiquidation({ typed: "", cycleStartDate: "2026-09-27" }),
+    ).toBe("2026-09-27");
+  });
+
+  it("para una primera liquidación REAL, el default es el inicio del ciclo ofrecido y cae en [min, max]", () => {
+    const pending = pendingPayrollSettlements({
+      periods: [],
+      employees: [EMPLOYEE],
+      referenceDate: REFERENCE,
+    });
+    const entry = pending.at(0);
+    if (entry === undefined) throw new Error("el aviso tenía que ofrecer un ciclo cerrado sin liquidar");
+    const cycle = payrollCycleRange({ frequency: entry.frequency, cycleEndDate: entry.end_date });
+    if (cycle === null) throw new Error("el ciclo pendiente tenía que resolverse");
+    // El default ES el inicio del ciclo que el aviso reportó: no hay nada que
+    // preguntar.
+    const declared = declaredStartForFirstLiquidation({ typed: "", cycleStartDate: cycle.start_date });
+    expect(declared).toBe(cycle.start_date);
+    // Y cae dentro de la ventana que el campo `date` ofrece:
+    // [min, max] = [inicio del ciclo, min(cierre del ciclo, hoy)]. Es lo que
+    // hace al default válido POR CONSTRUCCIÓN, no por suerte.
+    const max = [cycle.end_date, REFERENCE].sort()[0];
+    expect(declared >= cycle.start_date).toBe(true);
+    expect(declared <= max).toBe(true);
+    // El ÚNICO validador lo acepta tal cual, sin que nadie escriba nada.
+    expect(
+      resolveOpenPayrollRange({
+        frequency: entry.frequency,
+        cycleEndDate: entry.end_date,
+        declaredStartDate: declared,
+        periods: [],
+        referenceDate: REFERENCE,
+      }),
+    ).toMatchObject({ ok: true, start_date: cycle.start_date });
+  });
+
+  it("CONTROL NEGATIVO: el default NO es hoy: no puede caer en `bogotaDay()` por accidente", () => {
+    const pending = pendingPayrollSettlements({
+      periods: [],
+      employees: [EMPLOYEE],
+      referenceDate: REFERENCE,
+    });
+    const entry = pending.at(0);
+    if (entry === undefined) throw new Error("el aviso tenía que ofrecer un ciclo cerrado sin liquidar");
+    const cycle = payrollCycleRange({ frequency: entry.frequency, cycleEndDate: entry.end_date });
+    if (cycle === null) throw new Error("el ciclo pendiente tenía que resolverse");
+    const declared = declaredStartForFirstLiquidation({ typed: "", cycleStartDate: cycle.start_date });
+    // El ciclo semanal cerrado el 3 de octubre empieza el domingo 27 de
+    // septiembre: el default es el INICIO del ciclo, no el día en que se abre el
+    // diálogo (el domingo 4). Si el default fuera `bogotaDay()`, este caso lo
+    // delataría.
+    expect(cycle.start_date).not.toBe(REFERENCE);
+    expect(declared).not.toBe(REFERENCE);
+    expect(declared).toBe(cycle.start_date);
   });
 });
 
