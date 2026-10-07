@@ -106,11 +106,22 @@ cadencia además se rotula **en cada fila**, porque dentro de "Todas" tres perí
 siguen siendo indistinguibles por el solo hecho de tener pestañas.
 
 ## Fuera de alcance (deferido, no descartado)
-
 **El anclaje por cadencia** («¿ya se pagaron los sueldos de este grupo? ¿hasta qué día?»). Con las
 decisiones 1 y 2 —recorte y grilla compartida— las cadencias siguen compartiendo línea de tiempo, así
 que el anclaje ya no separa nada: sólo serviría para declarar historia anterior al sistema, que el
 dueño no pidió. Queda escrito en `mem_save` por si aparece la necesidad.
+
+> **CORREGIDO EL 2026-10-06 — la premisa de este deferimiento es falsa.** «Que el dueño no pidió» es
+al revés de lo registrado: el dueño **sí** lo pidió y lo decidió el 2026-10-05 (cuatro decisiones,
+entre ellas «el anclaje declara COBERTURA, no la fecha de pago» y «¿hasta qué día se pagaron los
+sueldos de este grupo?»). Lo que se perdió fue **el documento de esa unidad**:
+`odd/tasks/nomina-anclaje-por-cadencia.md` estaba referenciado desde acá y desde
+`auditoria-responsive.md:491`, y **nunca se commiteó** (`git log --all --diff-filter=AD --
+'*anclaje*'` sale vacío). O sea: primero desapareció el documento, y después el deferimiento se
+apoyó en una premisa que el propio registro desmiente. La unidad está reconstruida y en curso.
+> Lo único que sigue en pie de este párrafo es la parte técnica: con el recorte y la grilla
+> compartida, el anclaje no separa líneas de tiempo entre cadencias — lo que resuelve es la historia
+> anterior al sistema, por cadencia.
 
 ## Fuera de alcance (definitivo)
 
