@@ -1392,6 +1392,11 @@ export type OpenPayrollRangeRejection =
   | "declared-required"
   /** La fecha declarada no cae dentro del ciclo que se quiere liquidar. */
   | "declared-outside-cycle"
+  /**
+   * F10 (evidencia): la fecha declarada es ANTERIOR al piso de la evidencia.
+   * Con evidencia, la evidencia es el piso y la declaración no puede bajarlo.
+   */
+  | "declared-before-evidence"
   /** La fecha declarada es un día que todavía no pasó. */
   | "declared-in-the-future"
   /** Llegó una fecha declarada y ya hay períodos: el piso lo dan ellos. */
@@ -1466,7 +1471,8 @@ export function resolveOpenPayrollRange(args: {
   cycleEndDate: string;
   /**
    * El PISO derivado de los períodos existentes
-   * (`payrollHistoryFloor`); `null` cuando todavía no hay ninguno.
+   * (`payrollHistoryFloor`); `null` cuando todavía no hay ninguno. Con piso,
+   * una `declaredStartDate` ANTERIOR se rechaza (`declared-before-evidence`).
    */
   payrollStartDate?: string | null;
   /**
@@ -1520,6 +1526,15 @@ export function resolveOpenPayrollRange(args: {
     // completo y el cierre es el recorte más corto posible).
     if (declared < cycleStart || declared > cycleEnd) {
       return { ok: false, reason: "declared-outside-cycle" };
+    }
+    // F10 (evidencia): con EVIDENCIA, la evidencia es el piso. La declaración
+    // conserva su papel —una instalación SIN evidencia declara desde cuándo
+    // opera—, pero no puede bajar el arranque por debajo de lo que ya prueba
+    // operación: un día anterior a la primera factura no existió para el
+    // sistema. Sin piso (`null`, o una fecha imposible) nada cambia.
+    const floor = args.payrollStartDate == null ? null : utcDayOf(args.payrollStartDate);
+    if (floor !== null && declared < floor) {
+      return { ok: false, reason: "declared-before-evidence" };
     }
   }
 
@@ -1601,6 +1616,9 @@ export function openPayrollRejectionMessage(
   }
   if (reason === "declared-in-the-future") {
     return "La fecha de inicio no puede ser un día que todavía no pasó.";
+  }
+  if (reason === "declared-before-evidence") {
+    return `La fecha de inicio no puede ser anterior al ${startDate}: la nómina ya tiene evidencia desde ese día, así que no hay nada anterior que liquidar. Elija un día del ${startDate} en adelante.`;
   }
   if (reason === "covered-by-anchor") {
     const anchor = args.anchor ?? "";

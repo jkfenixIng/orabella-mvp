@@ -5757,9 +5757,14 @@ describe("payroll-client: el diálogo de apertura DERIVADO (F10, guarda de fuent
     expect(client).toMatch(
       /primeraLiquidacion\s*\?\s*"El rango sale del ciclo cerrado y del día que declaró[\s\S]{0,120}"\s*:\s*"El rango sale del ciclo y del arranque de la nómina: no hay campos de fecha\."/,
     );
-    // La fecha pedida se acota al ciclo elegido (`min`/`declaredMax`): la copia
-    // no promete días de otros ciclos, ni un rango que se escriba.
-    expect(client).toContain("const declaredMin = openCycle?.start_date ?? \"\";");
+    // La fecha pedida se acota al ciclo elegido Y al PISO de la evidencia
+    // (`min`/`declaredMax`): la copia no promete días de otros ciclos ni días
+    // anteriores a la evidencia, ni un rango que se escriba. El `min` es el
+    // MAYOR de los dos (ver la guarda del clamp, más abajo en esta suite).
+    expect(client).toContain('const cycleStartDate = openCycle?.start_date ?? "";');
+    expect(client).toMatch(
+      /const declaredMin =\s*payrollStartDate !== null && payrollStartDate > cycleStartDate\s*\?\s*payrollStartDate\s*:\s*cycleStartDate;/,
+    );
   });
 
   it("el rango sale del ÚNICO validador, con el piso derivado y la fecha declarada", () => {
@@ -12055,6 +12060,56 @@ describe("payroll-client: el aviso de ciclos pendientes y la entrada DERIVADA de
     ).not.toBe(viejo);
     expect(source).not.toContain("<p>Períodos</p>");
   });
+
+  it("el campo de la fecha se clampa al PISO, y el default toma el valor clampeado (guarda de fuente)", () => {
+    // El defecto medido: el aviso decía 28-sep..3-oct y el diálogo ofrecía el
+    // INICIO del ciclo (27-sep / 20-sep / 06-sep) —antes de la evidencia—, y ese
+    // era el rango que se persistía. Acá el `min` del campo es el MAYOR de los
+    // dos y el default (`declaredStartForFirstLiquidation`) toma ESE valor, así
+    // que el campo, el envío y el aviso dicen el mismo primer día pagable.
+    // Es una guarda de FUENTE: esta suite no renderiza el componente.
+    expect(source).toContain('const cycleStartDate = openCycle?.start_date ?? "";');
+    expect(source).toMatch(
+      /const declaredMin =\s*payrollStartDate !== null && payrollStartDate > cycleStartDate\s*\?\s*payrollStartDate\s*:\s*cycleStartDate;/,
+    );
+    expect(source).toMatch(
+      /declaredStartForFirstLiquidation\(\{\s*typed: openDeclaredStart,\s*cycleStartDate: declaredMin,\s*\}\)/,
+    );
+    // Y el default NO puede volver a tomar el inicio del ciclo sin clamp: el
+    // valor que se muestra y el que se envía salen del MISMO lugar.
+    expect(source).not.toContain("cycleStartDate: openCycle?.start_date");
+    // El piso se CONSUME: el cliente no re-deriva el suyo (la única definición
+    // es la del servidor) y `declaredMax` no se toca.
+    expect(source).not.toContain("payrollEvidenceFloor(");
+    expect(source).toContain("const declaredMax = openCycle");
+  });
+
+  it("el piso se relee ANTES de que los períodos cambien de estado (guarda de fuente)", () => {
+    // El defecto de orden: `setPeriods` corría PRIMERO y el piso se releía
+    // después, así que por un viaje de red la pantalla tenía períodos nuevos y
+    // un piso viejo —nulo en la primera apertura— y el aviso ofrecía ciclos
+    // anteriores a la evidencia. Ahora el piso se lee antes y las DOS
+    // actualizaciones de estado caen en el mismo paso, después de las lecturas.
+    const start = source.indexOf("async function refreshPeriods(");
+    expect(start, "refreshPeriods").toBeGreaterThan(-1);
+    const end = source.indexOf("function acceptDetail(", start);
+    expect(end, "el fin de refreshPeriods").toBeGreaterThan(start);
+    const body = source.slice(start, end);
+    const floorRead = body.indexOf("getPayrollStartDateAction()");
+    const periodsRead = body.indexOf("listPeriodsAction()");
+    expect(floorRead, "la lectura del piso").toBeGreaterThan(-1);
+    expect(periodsRead, "la lectura de los períodos").toBeGreaterThan(-1);
+    // El piso se lee PRIMERO...
+    expect(floorRead).toBeLessThan(periodsRead);
+    // ...y los dos estados se fijan DESPUÉS de las dos lecturas, en el mismo
+    // paso (sin `await` en medio), así que no hay render con períodos nuevos y
+    // piso viejo.
+    expect(body.indexOf("setPayrollStartDate(")).toBeGreaterThan(periodsRead);
+    expect(body).toMatch(/setPayrollStartDate\(floor\.data\);\s*setPeriods\(result\.data\);/);
+    // Y el piso que se conserva no es `null`: si la lectura falla queda el
+    // último bueno (el de la carga de la página), nunca un piso olvidado.
+    expect(body).toMatch(/if \(floor !== null && floor\.success\) setPayrollStartDate\(floor\.data\);/);
+  });
 });
 
 /* ==========================================================================
@@ -12550,6 +12605,105 @@ describe("payroll: la fecha que declara la PRIMERA liquidación (función pura)"
     expect(
       resolve({ frequency: "semanal", cycleEndDate: "2026-07-25", payrollStartDate: "2026-08-01", periods: [quincenal] }),
     ).toEqual({ ok: false, reason: "before-start" });
+  });
+
+  it("la declaración NO puede bajar del piso de la EVIDENCIA (`declared-before-evidence`)", () => {
+    // El caso medido: la primera factura del 28-sep es el piso, el ciclo
+    // semanal ofrecido es 27-sep → 3-oct y la declaración —el default del
+    // diálogo— era el INICIO del ciclo, un día antes de la evidencia. Con
+    // evidencia la evidencia es el piso: la declaración no puede bajarlo.
+    expect(
+      resolve({
+        frequency: "semanal",
+        cycleEndDate: "2026-10-03",
+        payrollStartDate: "2026-09-28",
+        declaredStartDate: "2026-09-27",
+      }),
+    ).toEqual({ ok: false, reason: "declared-before-evidence" });
+    // El mensual es el caso más caro: el ciclo 06-sep → 3-oct con el piso del
+    // 28-sep abría un rango que arrancaba 22 días antes de la primera factura.
+    expect(
+      resolve({
+        frequency: "mensual",
+        cycleEndDate: "2026-10-03",
+        payrollStartDate: "2026-09-28",
+        declaredStartDate: "2026-09-06",
+      }),
+    ).toEqual({ ok: false, reason: "declared-before-evidence" });
+    // Y el quincenal, la tercera cadencia que el aviso ofrece recortada.
+    expect(
+      resolve({
+        frequency: "quincenal",
+        cycleEndDate: "2026-10-03",
+        payrollStartDate: "2026-09-28",
+        declaredStartDate: "2026-09-20",
+      }),
+    ).toEqual({ ok: false, reason: "declared-before-evidence" });
+  });
+
+  it("el BORDE: un día IGUAL al piso se acepta, y uno posterior también", () => {
+    // La cota es «no ANTES del piso»: el día del piso es el primer día pagable
+    // —el mismo que reporta el aviso— y se acepta como inicio del recorte.
+    expect(
+      resolve({
+        frequency: "semanal",
+        cycleEndDate: "2026-10-03",
+        payrollStartDate: "2026-09-28",
+        declaredStartDate: "2026-09-28",
+      }),
+    ).toEqual({ ok: true, start_date: "2026-09-28", end_date: "2026-10-03", trimmed: true });
+    // El día siguiente al piso también: es un recorte más corto, nada nuevo.
+    expect(
+      resolve({
+        frequency: "semanal",
+        cycleEndDate: "2026-10-03",
+        payrollStartDate: "2026-09-28",
+        declaredStartDate: "2026-09-29",
+      }),
+    ).toEqual({ ok: true, start_date: "2026-09-29", end_date: "2026-10-03", trimmed: true });
+    // El mismo borde en el ciclo mensual: el piso es el inicio del recorte.
+    expect(
+      resolve({
+        frequency: "mensual",
+        cycleEndDate: "2026-10-03",
+        payrollStartDate: "2026-09-28",
+        declaredStartDate: "2026-09-28",
+      }),
+    ).toEqual({ ok: true, start_date: "2026-09-28", end_date: "2026-10-03", trimmed: true });
+  });
+
+  it("CONTROL NEGATIVO: sin evidencia la declaración sigue siendo la que arranca la nómina", () => {
+    // Sin piso (cero períodos y cero facturas) la instalación nueva sigue
+    // declarando: un día DENTRO del ciclo se comporta EXACTAMENTE como hoy...
+    expect(
+      resolve({ frequency: "semanal", cycleEndDate: "2026-09-26", declaredStartDate: "2026-09-20" }),
+    ).toEqual({ ok: true, start_date: "2026-09-20", end_date: "2026-09-26", trimmed: false });
+    // ...y uno ANTERIOR al ciclo sigue siendo imposible por la regla de
+    // SIEMPRE (no por la nueva): la declaración sólo recorta el ciclo elegido.
+    expect(
+      resolve({ frequency: "semanal", cycleEndDate: "2026-09-26", declaredStartDate: "2026-09-13" }),
+    ).toEqual({ ok: false, reason: "declared-outside-cycle" });
+    // Y un piso explícitamente nulo no rechaza nada: el motivo nuevo no
+    // inventa evidencia.
+    expect(
+      resolve({
+        frequency: "semanal",
+        cycleEndDate: "2026-09-26",
+        payrollStartDate: null,
+        declaredStartDate: "2026-09-20",
+      }),
+    ).toEqual({ ok: true, start_date: "2026-09-20", end_date: "2026-09-26", trimmed: false });
+  });
+
+  it("el motivo nuevo nombra el piso y el remedio que existe", () => {
+    const message = openPayrollRejectionMessage("declared-before-evidence", {
+      payrollStartDate: "2026-09-28",
+    });
+    // La fecha del piso, concreta: es lo que la persona necesita para elegir.
+    expect(message).toContain("2026-09-28");
+    // Y la salida que SÍ existe: elegir un día del piso en adelante.
+    expect(message).toContain("adelante");
+    expect(message).toContain("Elija");
   });
 });
 
@@ -13931,7 +14085,11 @@ describe("payroll: la fecha de arranque de la nómina de la sede (F10, servicio)
     // queda sin uso (deuda declarada), pero no puede volver a ser una segunda
     // fuente de verdad dentro de este módulo.
     expect(codigo).not.toContain('from("sedes")');
-    expect(codigo).not.toContain("payroll_start_date");
+    // Control POSITIVO: el piso SÍ se deriva de la evidencia —el servicio llama
+    // a la regla pura que compone períodos + primera factura—. Sin esta
+    // aserción, la guarda sólo podría decir «esto no está» y un archivo vacío
+    // la pasaría.
+    expect(codigo).toContain("payrollEvidenceFloor(");
     // La columna de la 068 sigue MUERTA: la evidencia la compone el piso
     // (períodos + primera factura), no la columna configurada. Comentarios
     // fuera, esto sólo mira código: cualquier `payroll_start_date` que vuelva a
@@ -14210,6 +14368,113 @@ describe("payroll: el piso de la nómina por EVIDENCIA de factura (F10)", () => 
         start_date: "2026-09-28",
         end_date: "2026-10-03",
         frequency: "mensual",
+        status: "borrador",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("con evidencia, la declaración NO puede bajar del piso: el servicio la rechaza", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(HOY);
+    try {
+      seedEvidence({ invoices: [invoice("Pagada", "2026-09-28T15:00:00.000Z")] });
+
+      // El diálogo mandaba SIEMPRE la declaración y su default era el INICIO del
+      // ciclo: 27-sep (semanal), 20-sep (quincenal) y 06-sep (mensual), los tres
+      // ANTES de la única evidencia. El servicio los rechaza con el motivo nuevo
+      // y el mensaje nombra el piso y el remedio que existe.
+      const requests = [
+        { frequency: "semanal", cycle_end_date: "2026-10-03", declared_start_date: "2026-09-27" },
+        { frequency: "quincenal", cycle_end_date: "2026-10-03", declared_start_date: "2026-09-20" },
+        { frequency: "mensual", cycle_end_date: "2026-10-03", declared_start_date: "2026-09-06" },
+      ];
+      for (const request of requests) {
+        const failure: unknown = await openPayrollPeriod(SEDE, request, ACTOR).catch(
+          (error: unknown) => error,
+        );
+        expect(failure, request.frequency).toBeInstanceOf(PayrollError);
+        expect((failure as PayrollError).code, request.frequency).toBe("VALIDATION");
+        expect((failure as PayrollError).message, request.frequency).toContain("2026-09-28");
+        expect((failure as PayrollError).message, request.frequency).toContain("adelante");
+      }
+      // Nada se persistió: el rechazo es ANTES del INSERT.
+      expect(payrollPagedStub.tables.payroll_periods ?? []).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("el BORDE en el servicio: declarar el día del piso persiste el MISMO rango que el aviso", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(HOY);
+    try {
+      // Con planta de las dos cadencias: el aviso sólo nombra cadencias con
+      // gente activa.
+      seedEvidence({
+        invoices: [invoice("Pagada", "2026-09-28T15:00:00.000Z")],
+        frequencies: ["semanal", "quincenal"],
+      });
+
+      const settlement = (await listPayrollOverview()).pendingSettlements.find(
+        (row) => row.frequency === "semanal",
+      );
+      if (settlement === undefined) throw new Error("el aviso tenía que ofrecer el semanal");
+      expect(settlement.start_date).toBe("2026-09-28");
+
+      // El diálogo manda el piso (su `min` clampeado y el default derivado de
+      // él): el rango persistido es EXACTAMENTE el que el aviso reporta, sin
+      // días anteriores a la factura.
+      const created = await openPayrollPeriod(
+        SEDE,
+        {
+          frequency: "semanal",
+          cycle_end_date: settlement.end_date,
+          declared_start_date: settlement.start_date,
+        },
+        ACTOR,
+      );
+      expect(created).toMatchObject({
+        start_date: settlement.start_date,
+        end_date: settlement.end_date,
+        frequency: "semanal",
+      });
+      // Un día DESPUÉS del piso también se acepta: es un recorte más corto. Va
+      // con la instalación otra vez sin períodos —la declaración sólo existe en
+      // la PRIMERA liquidación—, que es el único estado en el que llega.
+      seedEvidence({
+        invoices: [invoice("Pagada", "2026-09-28T15:00:00.000Z")],
+        frequencies: ["quincenal"],
+      });
+      const later = await openPayrollPeriod(
+        SEDE,
+        { frequency: "quincenal", cycle_end_date: "2026-10-03", declared_start_date: "2026-09-29" },
+        ACTOR,
+      );
+      expect(later).toMatchObject({ start_date: "2026-09-29", end_date: "2026-10-03" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("CONTROL NEGATIVO en el servicio: sin evidencia la declaración sigue mandando", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(HOY);
+    try {
+      // Instalación nueva — cero períodos y cero facturas—: el piso es nulo y
+      // declarar el inicio del ciclo se abre como SIEMPRE, completo.
+      seedEvidence({});
+      expect(await getPayrollStartDate()).toBeNull();
+      const created = await openPayrollPeriod(
+        SEDE,
+        { frequency: "semanal", cycle_end_date: "2026-10-03", declared_start_date: "2026-09-27" },
+        ACTOR,
+      );
+      expect(created).toMatchObject({
+        start_date: "2026-09-27",
+        end_date: "2026-10-03",
+        frequency: "semanal",
         status: "borrador",
       });
     } finally {

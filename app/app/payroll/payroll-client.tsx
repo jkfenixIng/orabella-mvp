@@ -1556,19 +1556,25 @@ export function PayrollClient(props: PayrollClientProps) {
   }
 
   async function refreshPeriods(select?: string) {
-    const result = (await listPeriodsAction()) as ActionResult<PayrollPeriodRow[]>;
-    if (result.success) {
-      setPeriods(result.data);
-      if (select) setSelectedId(select);
-      else if (!selectedId && result.data[0]) setSelectedId(result.data[0].id);
-      // El piso por EVIDENCIA se relee acá, que es el único punto donde los
-      // períodos cambian: así el aviso y el diálogo quedan con el MISMO piso que
-      // el servidor en vez de esperar a que se recargue la página.
-      if (props.canAdmin) {
-        const floor = (await getPayrollStartDateAction()) as ActionResult<string | null>;
-        if (floor.success) setPayrollStartDate(floor.data);
-      }
+    // El PISO se relee ANTES de que los períodos cambien de estado: el aviso y
+    // el diálogo se derivan de los dos en el mismo render, así que un piso viejo
+    // con períodos nuevos —nulo en la primera apertura— mostraría por un viaje
+    // de red ciclos anteriores a la evidencia. Las dos lecturas van primero y
+    // los dos estados se fijan después, en el mismo paso: no hay ventana en la
+    // que la pantalla tenga períodos y un piso que no les corresponde.
+    // Si esta lectura falla, el piso NO se olvida: queda el último bueno —el que
+    // el servidor entregó al cargar la página— y los períodos sí se aceptan, así
+    // que la pantalla nunca cae a `null` ni pierde un período recién creado.
+    let floor: ActionResult<string | null> | null = null;
+    if (props.canAdmin) {
+      floor = (await getPayrollStartDateAction()) as ActionResult<string | null>;
     }
+    const result = (await listPeriodsAction()) as ActionResult<PayrollPeriodRow[]>;
+    if (!result.success) return;
+    if (floor !== null && floor.success) setPayrollStartDate(floor.data);
+    setPeriods(result.data);
+    if (select) setSelectedId(select);
+    else if (!selectedId && result.data[0]) setSelectedId(result.data[0].id);
   }
 
   /**
@@ -2244,18 +2250,29 @@ export function PayrollClient(props: PayrollClientProps) {
     ? payrollCycleRange({ frequency: openTarget.frequency, cycleEndDate: openTarget.end_date })
     : null;
   // F10: el día declarado EFECTIVO. En la primera liquidación, si no se escribió
-  // nada, es el inicio del ciclo ofrecido —la fecha no se pregunta porque el
-  // ciclo ya está elegido—; lo escrito la pisa. Una sola definición, en
-  // `schemas.ts`: el estado vacío significa «usa el default de este ciclo».
+  // nada, es el inicio del ciclo ofrecido CLAMPADO AL PISO —la fecha no se
+  // pregunta porque el ciclo ya está elegido—; lo escrito la pisa. Una sola
+  // definición, en `schemas.ts`: el estado vacío significa «usa el default de
+  // este ciclo».
+  //
+  // El campo de la fecha está ACOTADO por el MAYOR de dos días: el inicio del
+  // ciclo elegido (el recorte sólo existe dentro de él) y el PISO por EVIDENCIA
+  // (`payrollStartDate`, el que el servidor ya resolvió y el mismo que muestra
+  // el aviso). Con piso, el `min` y el default caen en él, así que el diálogo
+  // y el aviso dicen el MISMO primer día pagable; sin piso (instalación nueva)
+  // la cota sigue siendo el inicio del ciclo, exactamente como hoy.
+  const cycleStartDate = openCycle?.start_date ?? "";
+  const declaredMin =
+    payrollStartDate !== null && payrollStartDate > cycleStartDate
+      ? payrollStartDate
+      : cycleStartDate;
   const declaredStartDate = primeraLiquidacion
     ? declaredStartForFirstLiquidation({
         typed: openDeclaredStart,
-        cycleStartDate: openCycle?.start_date ?? "",
+        cycleStartDate: declaredMin,
       })
     : "";
-  // El campo de la fecha está ACOTADO al ciclo elegido (y a hoy): el recorte
-  // sólo existe dentro del ciclo, así que la pantalla no ofrece otros días.
-  const declaredMin = openCycle?.start_date ?? "";
+  // El tope del campo NO cambia: el cierre del ciclo elegido, acotado a hoy.
   const declaredMax = openCycle
     ? [openCycle.end_date, bogotaDay()].sort()[0]
     : "";
