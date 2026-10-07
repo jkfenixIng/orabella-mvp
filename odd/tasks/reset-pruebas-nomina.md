@@ -121,6 +121,59 @@ sin cadencia quedan **fuera de todo aviso de pendientes** (regla 1 de `pendingPa
 que el seed produzca lo que declara, o además meter una verificación que mida el seed **en
 ejecución** (la deuda que el propio `4b9103f` declaró: «nada mide el seed en tiempo de ejecución»).
 
+**Decisión tomada el 2026-10-06**: corregir el seed. Y una segunda decisión, porque el `mixto` no
+se podía producir desde el fixture: `acceptance.sql:75` siembra a Carolina Rojas como **`fijo`,
+1.5M, sin comisión**, y el `mixto` 60% que la prosa le atribuía era **otra edición manual** del
+mismo minuto (21:35:33) que se llevó el reset. Se eligió el arreglo que **no inventa ningún dato
+de negocio**: los 10 con cadencia, y la prosa nombra **`quincenal`** —la cadencia que ya ejercita
+`fijo`+`porcentaje`+`mixto`— en vez de `semanal`.
+
+**Lo que el dueño tiene que saber**: el reset se llevó ese `mixto` 60% de Carolina. El fixture la
+siembra `fijo` y sin comisión, así que su liquidación **no va a llevar comisión** hasta que se
+reponga en la UI. El seed no lo repone por decisión explícita (sería pisar lo que la UI cambia).
+
+## Corrección del seed (T8–T9)
+
+`app/supabase/seeds/smoke.sql`: el `VALUES` de cadencias pasa de **8 a 10 filas**
+(`('10000004','semanal')` Andrés, `('10000001','semanal')` Carolina) y la prosa deja de afirmar lo
+que el SQL no produce. La única línea funcional del cambio son esas dos filas: el diff sin
+comentarios agrega dos líneas y **no quita ninguna**, y el bloque
+`WHERE e.user_id = u.id AND e.is_active AND e.pay_frequency IS NULL` queda **byte a byte idéntico**
+(la idempotencia y el contrato de no pisar la UI siguen en pie).
+
+`odd/tasks/datos-humo-pruebas.md`: corregido su registro —el `UPDATE 8` y el «semanal 3 / 0 sin
+cadencia» del mismo bloque no podían ser ciertos a la vez— con nota fechada, más dos prosa
+vencidas que encontró el writer: la línea que declaraba «3 sentencias (interlock, cadencias,
+fecha)» cuando `4b9103f` había quitado la tercera, y el `UPDATE 1` de la tabla de corridas, que ya
+no existe. U5–U8 quedaron tildadas contra `git log` (`d46c35d`, `403068a`), no de memoria.
+
+- [x] **T8** — Worker `muxcynp9-2-koxy`: las dos filas y la prosa. Reportó además las dos prosa
+  vencidas del doc, que se corrigieron en la misma unidad por ser el mismo defecto a cuatro líneas.
+- [x] **T9** — Re-aplicado a PRUEBAS: 1ª corrida **`UPDATE 2`**, 2ª corrida **`UPDATE 0`**. Reparto
+  vivo: `semanal 3` (fijo, porcentaje) · `quincenal 3` (**fijo, mixto, porcentaje**) · `mensual 4` ·
+  **0 sin cadencia**.
+- [x] **T10** — Verificación independiente del efecto: `muxd4v1z-3-7x4z`, read-only. **PASS en el
+  núcleo**: 2 sentencias (`:51` interlock, `:103` UPDATE), el `VALUES` cubre exactamente los 10
+  id_numbers del fixture con los nombres que `acceptance.sql:32–43` les da, el guard
+  `WHERE … pay_frequency IS NULL` (`:123-125`) intacto, ninguna sentencia escribe `pay_type`,
+  `salary_fixed`, `commission_percent`, `payout_mode` ni `sedes.payroll_start_date` (esos tokens
+  sólo aparecen en comentarios), y la base viva confirma `null_cad=0` con `quincenal` como la
+  **única** cadencia con los tres tipos.
+
+  **Cuatro residuos que encontró, todos pagados**: (1) `datos-humo-pruebas.md:119` seguía
+  afirmando `payroll_start_date = 2026-09-16` sin anotar, y hoy es **NULL**; (2) la sección de
+  «Aritmética de la fecha» presuponía un `ARRANQUE` configurado que nadie escribe; (3) **U8 estaba
+  tildada con el arreglo sin commitear** — se paga con el commit de esta unidad; (4) **cuatro
+  referencias de línea driftadas** en la prosa del seed: `schemas.ts:1331` → **1604**,
+  `schemas.ts:817` → **927**, `service.ts:1800` → **1778** y `schemas.ts:978` → **1124** (esta
+  última la encontré yo midiendo, no la reportó el verificador). Las cuatro las verifiqué con
+  `grep` sobre el código, no copiando su informe.
+
+  **No confirmable, declarado**: que los logs de las dos corridas vengan de esta versión del
+  archivo contra esta base (son texto plano sin firma), y la idempotencia general a partir de una
+  sola repetición observada. Lo que sí queda probado por estructura es el guard `IS NULL`, que es
+  el que la garantiza.
+
 ## Criterio de cierre
 
 PRUEBAS = producto del `001` vigente + los tres seeds, con 0 períodos de nómina (estado de primera
