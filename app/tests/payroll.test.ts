@@ -13,6 +13,8 @@ import {
   buildPayrollCorrectionView,
   buildPayrollEmployeeIndex,
   buildPayrollMonthToDate,
+  cadenceAnchorFromDeclaration,
+  cadencePayableFrom,
   calculatePayrollSchema,
   calendarCycleDaysForFrequency,
   canDiscountVoucher,
@@ -31,6 +33,7 @@ import {
   filterPeriodsByCadence,
   fixedFractionForFrequency,
   groupPayrollPeriodsByMonth,
+  isCycleCoveredByAnchor,
   isPayrollCycleRange,
   isPayrollCycleSettled,
   isRangeBeforePayrollStart,
@@ -42,6 +45,7 @@ import {
   nextPeriodStartDate,
   normalizeAllowedDays,
   normalizePerDayLimits,
+  openPayrollRejectionMessage,
   openPeriodSchema,
   overlapBlocksDeletion,
   PAY_CYCLE_CALENDAR_DAYS,
@@ -71,6 +75,7 @@ import {
   readVoucherCapSetting,
   readVoucherDaysSetting,
   readVoucherPerDaySetting,
+  resolveCadenceAnchor,
   resolveFixedSalaryForPeriod,
   resolveMixedBlock,
   resolveOpenPayrollRange,
@@ -5236,6 +5241,153 @@ describe("payroll: los ciclos cerrados que faltan por liquidar (F9, función pur
         cycle: { start_date: "2026-09-13", end_date: "2026-09-19" },
       }),
     ).toBe(false);
+  });
+
+  it("el caso del dueño (T2): el anclaje del mensual silencia SUS ciclos y nada más", () => {
+    // Anclaje mensual «pagado hasta el 2026-10-03» (ya ajustado al sábado por
+    // `cadenceAnchorFromDeclaration`, decisión 1 del documento). Los tres ciclos
+    // mensuales cerrados quedan CUBIERTOS y el aviso deja de pedirlos, mientras
+    // el semanal y el quincenal —sin anclaje— dicen exactamente lo de siempre.
+    const employees = [
+      employee("Ana", "semanal"),
+      employee("Beto", "quincenal"),
+      employee("Caro", "mensual"),
+    ];
+    const deHoy = pendingPayrollSettlements({ periods: [], employees, referenceDate: REFERENCE });
+    const anclado = pendingPayrollSettlements({
+      periods: [],
+      employees,
+      referenceDate: REFERENCE,
+      anchors: { mensual: "2026-10-03" },
+    });
+    // El síntoma visible: `mensual 2026-07-12 → 2026-08-08` deja de aparecer.
+    expect(deHoy.map((row) => `${row.frequency} ${row.start_date}..${row.end_date}`)).toEqual(
+      expect.arrayContaining([
+        "mensual 2026-07-12..2026-08-08",
+        "mensual 2026-08-09..2026-09-05",
+        "mensual 2026-09-06..2026-10-03",
+      ]),
+    );
+    expect(deHoy).toHaveLength(9);
+    expect(anclado.some((row) => row.frequency === "mensual")).toBe(false);
+    expect(anclado).toEqual(deHoy.filter((row) => row.frequency !== "mensual"));
+  });
+
+  it("CONTROL NEGATIVO (T2): sin anclajes declarados el aviso es IDÉNTICO al de hoy", () => {
+    const employees = [
+      employee("Ana", "semanal"),
+      employee("Beto", "quincenal"),
+      employee("Caro", "mensual"),
+    ];
+    // Sin piso: los nueve ciclos de siempre (tres por cadencia).
+    const deHoy = pendingPayrollSettlements({ periods: [], employees, referenceDate: REFERENCE });
+    expect(deHoy).toHaveLength(9);
+    expect(
+      pendingPayrollSettlements({ periods: [], employees, referenceDate: REFERENCE, anchors: {} }),
+    ).toEqual(deHoy);
+    // Un `null` explícito es «no declarado», no un anclaje que cubre.
+    expect(
+      pendingPayrollSettlements({
+        periods: [],
+        employees,
+        referenceDate: REFERENCE,
+        anchors: { semanal: null, quincenal: null, mensual: null },
+      }),
+    ).toEqual(deHoy);
+    // CON piso, el piso NO se comporta como anclaje: el primer ciclo recortado
+    // al piso (`2026-08-01..2026-08-01`) sigue reportándose, porque el piso dice
+    // desde cuándo HAY historia, no hasta cuándo se pagó.
+    const conHistoria = pendingPayrollSettlements({
+      periods: [period("2026-08-01", "2026-08-14", "quincenal")],
+      employees: [employee("Ana", "semanal")],
+      referenceDate: REFERENCE,
+      limit: 20,
+    });
+    expect(conHistoria.map((row) => `${row.start_date}..${row.end_date}`)).toContain(
+      "2026-08-01..2026-08-01",
+    );
+    expect(
+      pendingPayrollSettlements({
+        periods: [period("2026-08-01", "2026-08-14", "quincenal")],
+        employees: [employee("Ana", "semanal")],
+        referenceDate: REFERENCE,
+        limit: 20,
+        anchors: {},
+      }),
+    ).toEqual(conHistoria);
+  });
+
+  it("parcial (T2): un anclaje a mitad de ciclo (2026-09-26) reporta el rango pagable, no el ciclo entero", () => {
+    // El ancla es sábado, pero los ciclos mensuales cierran cada CUARTO sábado:
+    // 2026-09-26 cae DENTRO del ciclo 2026-09-06 → 2026-10-03. Los días hasta el
+    // ancla ya están declarados pagados, así que el aviso recorta el reporte al
+    // primer día pagable (A+1) y el ciclo entero nunca se ofrece.
+    const partial = pendingPayrollSettlements({
+      periods: [],
+      employees: [employee("Caro", "mensual")],
+      referenceDate: REFERENCE,
+      anchors: { mensual: "2026-09-26" },
+    });
+    expect(partial.map((row) => `${row.start_date}..${row.end_date}`)).toEqual([
+      "2026-09-27..2026-10-03",
+    ]);
+    expect(partial[0]).toMatchObject({ frequency: "mensual", label: "27 sep – 3 oct 2026" });
+  });
+
+  it("precedencia (T2): el anclaje declarado le gana al piso y el piso sigue acotando el recorrido", () => {
+    // El piso global es el 2026-08-09 (el período más antiguo). El mensual
+    // declara pagado hasta el 2026-09-26: para SU cadencia el anclaje manda
+    // (decisión 3) — quita el ciclo 08-09..09-05 y recorta 09-06..10-03 al
+    // 09-27..10-03 — mientras el piso sigue acotando el recorrido (nada anterior
+    // al piso se camina, ni con `limit: 20`). El piso lo fija un período
+    // QUINCENAL a propósito: así el piso existe (08-09) sin asentar ningún ciclo
+    // semanal, que es justo lo que el tercer sub-assert necesita mostrar. El
+    // `semanal` 08-16..08-22 asienta la SEGUNDA semana, así que la primera
+    // (08-09..08-15) sigue ofrecida. Con un período semanal 08-09..08-15 el
+    // fixture se asentaba a sí mismo y dejaba al piso sin efecto visible.
+    const periods = [
+      period("2026-08-09", "2026-08-15", "quincenal"),
+      period("2026-08-16", "2026-08-22", "semanal"),
+    ];
+    const conAnclaje = pendingPayrollSettlements({
+      periods,
+      employees: [employee("Caro", "mensual")],
+      referenceDate: REFERENCE,
+      limit: 20,
+      anchors: { mensual: "2026-09-26" },
+    });
+    expect(conAnclaje.map((row) => `${row.start_date}..${row.end_date}`)).toEqual([
+      "2026-09-27..2026-10-03",
+    ]);
+    // Sin anclaje, el MISMO fixture reporta el ciclo recortado al piso.
+    const sinAnclaje = pendingPayrollSettlements({
+      periods,
+      employees: [employee("Caro", "mensual")],
+      referenceDate: REFERENCE,
+      limit: 20,
+    });
+    expect(sinAnclaje.map((row) => `${row.start_date}..${row.end_date}`)).toEqual([
+      "2026-08-09..2026-09-05",
+      "2026-09-06..2026-10-03",
+    ]);
+    // Una cadencia SIN anclaje declarado sigue cayendo al piso: el semanal no
+    // tiene cobertura propia y el piso es su única cota.
+    const semanal = pendingPayrollSettlements({
+      periods,
+      employees: [employee("Ana", "semanal")],
+      referenceDate: REFERENCE,
+      limit: 20,
+      anchors: { mensual: "2026-09-26" },
+    });
+    expect(semanal.map((row) => `${row.start_date}..${row.end_date}`)).toEqual([
+      "2026-08-09..2026-08-15",
+      "2026-08-23..2026-08-29",
+      "2026-08-30..2026-09-05",
+      "2026-09-06..2026-09-12",
+      "2026-09-13..2026-09-19",
+      "2026-09-20..2026-09-26",
+      "2026-09-27..2026-10-03",
+    ]);
   });
 });
 
@@ -12128,6 +12280,104 @@ describe("payroll: la fecha de arranque de la nómina (F10, función pura)", () 
       }).amount,
     ).toBe(1_200_000);
   });
+
+  it("T3: un ciclo CUBIERTO por el anclaje declarado se rechaza con `covered-by-anchor`", () => {
+    // El mensual declaró pagado hasta el 2026-10-03: el ciclo 2026-09-06 →
+    // 2026-10-03 no tiene días pagables y no se abre. El aviso y la apertura
+    // usan la MISMA regla (`isCycleCoveredByAnchor`).
+    expect(
+      resolveOpenPayrollRange({
+        frequency: "mensual",
+        cycleEndDate: "2026-10-03",
+        cadenceAnchor: "2026-10-03",
+        periods: [],
+      }),
+    ).toEqual({ ok: false, reason: "covered-by-anchor" });
+    // Un ciclo que cierra ANTES del ancla también está cubierto.
+    expect(
+      resolveOpenPayrollRange({
+        frequency: "quincenal",
+        cycleEndDate: "2026-09-19",
+        cadenceAnchor: "2026-09-26",
+        periods: [],
+      }),
+    ).toEqual({ ok: false, reason: "covered-by-anchor" });
+    // CONTROL: el MISMO ciclo sin anclaje no se rechaza por cobertura, sino por
+    // la regla de siempre (sin piso ni declaración, `declared-required`).
+    expect(
+      resolveOpenPayrollRange({ frequency: "mensual", cycleEndDate: "2026-10-03", periods: [] }),
+    ).toEqual({ ok: false, reason: "declared-required" });
+  });
+
+  it("T3: el ciclo PARCIALMENTE cubierto se acepta recortado al día siguiente al ancla", () => {
+    // El ancla 2026-09-26 cae dentro del ciclo mensual 2026-09-06 → 2026-10-03
+    // (los ciclos mensuales cierran cada cuarto sábado). Los días hasta el ancla
+    // ya están declarados pagados, así que la apertura arranca en el primer día
+    // pagable: la MISMA forma que reporta el aviso.
+    expect(
+      resolveOpenPayrollRange({
+        frequency: "mensual",
+        cycleEndDate: "2026-10-03",
+        cadenceAnchor: "2026-09-26",
+        periods: [],
+      }),
+    ).toEqual({ ok: true, start_date: "2026-09-27", end_date: "2026-10-03", trimmed: true });
+    // Con historia en OTRA cadencia el piso sigue ahí, pero el anclaje manda.
+    expect(
+      resolveOpenPayrollRange({
+        frequency: "mensual",
+        cycleEndDate: "2026-10-03",
+        cadenceAnchor: "2026-09-26",
+        payrollStartDate: "2026-08-09",
+        periods: [{ start_date: "2026-08-09", end_date: "2026-08-22", frequency: "quincenal" }],
+      }),
+    ).toEqual({ ok: true, start_date: "2026-09-27", end_date: "2026-10-03", trimmed: true });
+    // Y cuando el día pagable YA es el inicio del ciclo no se recorta nada: se
+    // acepta completo, exactamente como hoy.
+    expect(
+      resolveOpenPayrollRange({
+        frequency: "semanal",
+        cycleEndDate: "2026-10-03",
+        cadenceAnchor: "2026-09-26",
+        periods: [],
+      }),
+    ).toEqual({ ok: true, start_date: "2026-09-27", end_date: "2026-10-03", trimmed: false });
+  });
+
+  it("T3: sin anclaje el validador no cambia (control negativo)", () => {
+    expect(
+      resolveOpenPayrollRange({
+        frequency: "semanal",
+        cycleEndDate: "2026-10-03",
+        cadenceAnchor: null,
+        periods: [],
+      }),
+    ).toEqual({ ok: false, reason: "declared-required" });
+    // El mismo ciclo de siempre sigue aceptándose igual con su declaración.
+    expect(
+      resolveOpenPayrollRange({
+        frequency: "semanal",
+        cycleEndDate: "2026-10-03",
+        cadenceAnchor: null,
+        declaredStartDate: "2026-10-01",
+        periods: [],
+      }),
+    ).toEqual({ ok: true, start_date: "2026-10-01", end_date: "2026-10-03", trimmed: true });
+  });
+
+  it("T3: el mensaje del motivo nuevo nombra el ancla y la salida que existe", () => {
+    const message = openPayrollRejectionMessage("covered-by-anchor", {
+      anchor: "2026-10-03",
+      cycle: { start_date: "2026-09-06", end_date: "2026-10-03" },
+    });
+    // Nombra la fecha declarada.
+    expect(message).toContain("2026-10-03");
+    // La declaración cubre HASTA el ancla: el mensaje no puede decir que el
+    // grupo pagó más allá de lo declarado.
+    expect(message).toContain("hasta");
+    // Y la salida que SÍ existe es elegir un ciclo posterior.
+    expect(message).toContain("posterior");
+  });
 });
 
 /* ==========================================================================
@@ -12507,6 +12757,119 @@ describe("payroll: los ciclos pendientes con el piso DERIVADO (F10, función pur
         end_date: entry.end_date,
       });
     }
+  });
+});
+
+/* ==========================================================================
+   EL ANCLAJE POR CADENCIA (cobertura declarada, decisión del dueño 2026-10-05).
+
+   El dueño declaró, por cadencia, «hasta qué día se pagaron los sueldos de este
+   grupo». Un anclaje «pagado hasta X» se corre HACIA ADELANTE hasta el sábado
+   (decisión 1) y absorbe X+1..sábado: el riesgo no es simétrico — pagar dos
+   veces los mismos días es el error grave; declarar de más se corrige en el
+   ciclo siguiente. Estas reglas son puras y son la ÚNICA definición del anclaje;
+   el aviso (T2), la apertura (T3), la persistencia (T4) y la pantalla (T5) las
+   consumen. Ver `odd/tasks/nomina-anclaje-por-cadencia.md`.
+   ========================================================================== */
+describe("payroll: el anclaje por cadencia (decisión 1, función pura)", () => {
+  /** Domingo 2026-10-04: el anclaje no puede declarar un día posterior a él. */
+  const REFERENCE = "2026-10-04";
+
+  it("un día que YA es sábado no absorbe nada: el ancla es el día declarado", () => {
+    // Decisión 1: `saturdayOnOrAfter` de un sábado es él mismo, así que los días
+    // absorbidos son 0 y el ancla coincide con lo declarado.
+    expect(
+      cadenceAnchorFromDeclaration({ paidThrough: "2026-10-03", referenceDate: REFERENCE }),
+    ).toEqual({
+      ok: true,
+      anchor: "2026-10-03",
+      absorbedFrom: "2026-10-04",
+      absorbedDays: 0,
+    });
+  });
+
+  it("el miércoles 2026-09-30 se corre al sábado 2026-10-03 y absorbe 3 días", () => {
+    // Los días absorbidos son DATO (los muestra la pantalla, decisión 1), no una
+    // frase: `absorbedFrom` es el día siguiente al declarado.
+    expect(
+      cadenceAnchorFromDeclaration({ paidThrough: "2026-09-30", referenceDate: REFERENCE }),
+    ).toEqual({
+      ok: true,
+      anchor: "2026-10-03",
+      absorbedFrom: "2026-10-01",
+      absorbedDays: 3,
+    });
+  });
+
+  it("CONTROL NEGATIVO: el ajuste NUNCA va hacia atrás", () => {
+    // El domingo 2026-09-27 cae seis días antes del sábado: el ancla es el 3 de
+    // octubre, no el sábado anterior (2026-09-26). Ir hacia atrás ofrecería días
+    // ya pagados, que es exactamente el error que este anclaje evita.
+    const resolved = cadenceAnchorFromDeclaration({
+      paidThrough: "2026-09-27",
+      referenceDate: REFERENCE,
+    });
+    expect(resolved).toEqual({
+      ok: true,
+      anchor: "2026-10-03",
+      absorbedFrom: "2026-09-28",
+      absorbedDays: 6,
+    });
+    if (!resolved.ok) throw new Error("la declaración del domingo tenía que aceptarse");
+    expect(resolved.anchor >= "2026-09-27").toBe(true);
+    expect(resolved.anchor).not.toBe("2026-09-26");
+  });
+
+  it("rechaza un día vacío (`anchor-not-a-day`) y uno futuro (`anchor-in-the-future`)", () => {
+    // La guarda es sobre el día DECLARADO, no sobre el ancla ajustada: absorber
+    // hasta el sábado siguiente es la semántica pedida, no un error.
+    expect(cadenceAnchorFromDeclaration({ paidThrough: "", referenceDate: REFERENCE })).toEqual({
+      ok: false,
+      reason: "anchor-not-a-day",
+    });
+    expect(
+      cadenceAnchorFromDeclaration({ paidThrough: "2026-13-40", referenceDate: REFERENCE }),
+    ).toEqual({ ok: false, reason: "anchor-not-a-day" });
+    expect(
+      cadenceAnchorFromDeclaration({ paidThrough: "2026-10-05", referenceDate: REFERENCE }),
+    ).toEqual({ ok: false, reason: "anchor-in-the-future" });
+  });
+});
+
+describe("payroll: la precedencia y la cobertura del anclaje (decisión 3, funciones puras)", () => {
+  it("precedencia: el anclaje declarado le gana al piso; sin declarado, el piso; sin ninguno, null", () => {
+    // Decisión 3: el piso global NO desaparece — es el fallback de una cadencia
+    // sin anclaje declarado.
+    expect(resolveCadenceAnchor({ declared: "2026-10-03", globalFloor: "2026-08-01" })).toBe(
+      "2026-10-03",
+    );
+    expect(resolveCadenceAnchor({ declared: null, globalFloor: "2026-08-01" })).toBe("2026-08-01");
+    expect(resolveCadenceAnchor({ declared: null, globalFloor: null })).toBeNull();
+    // Un texto vacío es «no declarada», no un anclaje.
+    expect(resolveCadenceAnchor({ declared: "", globalFloor: "2026-08-01" })).toBe("2026-08-01");
+  });
+
+  it("un ciclo cubierto es el que CIERRA en o antes del ancla", () => {
+    // El ciclo que termina exactamente en el ancla está cubierto; el que termina
+    // el día siguiente NO. Cubierto = no se reporta ni se abre.
+    expect(isCycleCoveredByAnchor({ endDate: "2026-10-03", anchor: "2026-10-03" })).toBe(true);
+    expect(isCycleCoveredByAnchor({ endDate: "2026-10-04", anchor: "2026-10-03" })).toBe(false);
+    // Sin ancla no hay cobertura declarada.
+    expect(isCycleCoveredByAnchor({ endDate: "2026-10-03", anchor: null })).toBe(false);
+  });
+
+  it("el primer día pagable es el día DESPUÉS del ancla, y sin ancla no hay día pagable", () => {
+    expect(cadencePayableFrom("2026-10-03")).toBe("2026-10-04");
+    expect(cadencePayableFrom(null)).toBeNull();
+    expect(cadencePayableFrom("")).toBeNull();
+  });
+
+  it("el caso del dueño: con el mensual anclado al 2026-10-03, el ciclo 2026-09-06 → 2026-10-03 está cubierto", () => {
+    const cycle = { start_date: "2026-09-06", end_date: "2026-10-03" };
+    const anchor = resolveCadenceAnchor({ declared: "2026-10-03", globalFloor: null });
+    expect(anchor).toBe("2026-10-03");
+    expect(isCycleCoveredByAnchor({ endDate: cycle.end_date, anchor })).toBe(true);
+    expect(cadencePayableFrom(anchor)).toBe("2026-10-04");
   });
 });
 

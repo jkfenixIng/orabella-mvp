@@ -1346,7 +1346,9 @@ export type OpenPayrollRangeRejection =
   /** La fecha declarada es un día que todavía no pasó. */
   | "declared-in-the-future"
   /** Llegó una fecha declarada y ya hay períodos: el piso lo dan ellos. */
-  | "declared-with-history";
+  | "declared-with-history"
+  /** El ciclo ya está pagado: cae en o antes del anclaje declarado de su cadencia. */
+  | "covered-by-anchor";
 
 /** F10: el rango que se persiste, con `trimmed` a la vista. */
 export interface OpenPayrollRange extends PayrollCycleRange {
@@ -1397,6 +1399,15 @@ export type OpenPayrollRangeResolution =
  * historia la tiene en sus períodos: los heredados son `NULL` y NO son historia
  * de ninguna cadencia.
  *
+ * Anclaje por cadencia (decisión del dueño, 2026-10-05): `cadenceAnchor` es el
+ * anclaje DECLARADO de la cadencia —los días hasta él ya se pagaron—, no el
+ * piso. Un ciclo que CIERRA en o antes del ancla está CUBIERTO
+ * (`covered-by-anchor`): no tiene días pagables y no se abre. Uno que la
+ * CONTIENE se acepta recortado a `A+1` (`cadencePayableFrom`), que es la MISMA
+ * forma que el aviso reporta. El PISO NO es un anclaje: dice desde cuándo HAY
+ * historia, no hasta cuándo se pagó, así que un ciclo que cierra exactamente en
+ * él sigue reportándose recortado (`F..F`).
+ *
  * Puro para probarlo sin base de datos. Es la MISMA verdad que el detector de
  * pendientes (`isRangeBeforePayrollStart`) y la que el servicio aplica antes del
  * INSERT.
@@ -1409,6 +1420,12 @@ export function resolveOpenPayrollRange(args: {
    * (`payrollHistoryFloor`); `null` cuando todavía no hay ninguno.
    */
   payrollStartDate?: string | null;
+  /**
+   * El anclaje DECLARADO de la cadencia, ya ajustado al sábado
+   * (`resolveCadenceAnchor` con `declared` únicamente; NUNCA el piso); `null`
+   * cuando no se declaró nada. Opcional: sin él, el validador no cambia.
+   */
+  cadenceAnchor?: string | null;
   /** La fecha que declara la PRIMERA liquidación: sólo con cero períodos. */
   declaredStartDate?: string | null;
   periods: readonly (DateRange & { frequency?: string | null })[];
@@ -1421,6 +1438,14 @@ export function resolveOpenPayrollRange(args: {
   const cycle = payrollCycleRange({ frequency: args.frequency, cycleEndDate: args.cycleEndDate });
   if (cycle === null) return { ok: false, reason: "not-a-cycle" };
   const hasHistory = args.periods.length > 0;
+
+  // El anclaje DECLARADO (no el piso): los días hasta él ya se pagaron. Un ciclo
+  // que cierra en o antes del ancla no tiene días pagables y no se abre. El piso
+  // NO entra acá: el piso dice desde cuándo HAY historia, no hasta cuándo se
+  // pagó, y un ciclo que cierra exactamente en él sigue reportándose.
+  if (isCycleCoveredByAnchor({ endDate: cycle.end_date, anchor: args.cadenceAnchor ?? null })) {
+    return { ok: false, reason: "covered-by-anchor" };
+  }
 
   // La declaración se valida ANTES de ser cota: una fecha que no sirve ni para
   // recortar el ciclo elegido no puede quedarse flotando como si arrancara algo.
@@ -1450,8 +1475,16 @@ export function resolveOpenPayrollRange(args: {
   }
 
   // El PISO: la fecha declarada cuando la hay —es el primer período, y entonces
-  // ES el arranque—, si no el derivado de los períodos que ya existen.
-  const startBound = declared === null ? (args.payrollStartDate ?? null) : isoDayOf(declared);
+  // ES el arranque—, si no el derivado de los períodos que ya existen. El
+  // anclaje declarado aporta ADEMÁS su primer día pagable (`A+1`), y la cota
+  // efectiva es el MAYOR de los dos: la misma cuenta que hace el aviso.
+  const baseBound = declared === null ? (args.payrollStartDate ?? null) : isoDayOf(declared);
+  const payableFrom = cadencePayableFrom(args.cadenceAnchor ?? null);
+  const baseDay = baseBound === null ? null : utcDayOf(baseBound);
+  const payableDay = payableFrom === null ? null : utcDayOf(payableFrom);
+  const startDay =
+    baseDay === null ? payableDay : payableDay === null ? baseDay : Math.max(baseDay, payableDay);
+  const startBound = startDay === null ? null : isoDayOf(startDay);
   // Sin piso y sin declaración no hay primer período: el arranque se declara.
   if (startBound === null) {
     if (!hasHistory) return { ok: false, reason: "declared-required" };
@@ -1489,12 +1522,18 @@ export function resolveOpenPayrollRange(args: {
  * a un envío) y para la pantalla (que avisa mientras se escribe). Que los dos
  * digan lo mismo no es decoración: es la misma regla contada dos veces.
  *
- * `payrollStartDate` es el PISO (derivado o declarado) y `cycle` el ciclo
- * rechazado; los dos se nombran cuando el motivo los necesita.
+ * `payrollStartDate` es el PISO (derivado o declarado), `cycle` el ciclo
+ * rechazado y `anchor` el anclaje DECLARADO de la cadencia (no el piso) cuando
+ * el motivo es de cobertura; cada uno se nombra cuando su motivo lo necesita.
  */
 export function openPayrollRejectionMessage(
   reason: OpenPayrollRangeRejection,
-  args: { payrollStartDate?: string | null; cycle?: PayrollCycleRange | null } = {},
+  args: {
+    payrollStartDate?: string | null;
+    cycle?: PayrollCycleRange | null;
+    /** El anclaje declarado de la cadencia, para el motivo de cobertura. */
+    anchor?: string | null;
+  } = {},
 ): string {
   const startDate = args.payrollStartDate ?? null;
   const cycle = args.cycle ?? null;
@@ -1514,7 +1553,154 @@ export function openPayrollRejectionMessage(
   if (reason === "declared-in-the-future") {
     return "La fecha de inicio no puede ser un día que todavía no pasó.";
   }
+  if (reason === "covered-by-anchor") {
+    const anchor = args.anchor ?? "";
+    return `Ya se declaró pagado hasta el ${anchor}: los días de este ciclo (${cycle?.start_date ?? ""} a ${cycle?.end_date ?? ""}) ya están cubiertos y no hay nada que liquidar. Elija un ciclo posterior al ${anchor}.`;
+  }
   return "La fecha de inicio sólo se declara en la primera liquidación: con períodos registrados, el arranque lo da el período más antiguo.";
+}
+
+// ------------- El anclaje por cadencia: la cobertura declarada ---
+
+/**
+ * Anclaje por cadencia (decisión del dueño, 2026-10-05): por qué una
+ * declaración NO sirve como anclaje. Ver
+ * `odd/tasks/nomina-anclaje-por-cadencia.md` (T1).
+ */
+export type CadenceAnchorRejection =
+  /** El texto declarado no es una fecha del calendario. */
+  | "anchor-not-a-day"
+  /** El día declarado todavía no pasó: no se declara pagado lo que no pasó. */
+  | "anchor-in-the-future";
+
+/** Anclaje por cadencia (decisión 1): el ancla, o el motivo del rechazo. */
+export type CadenceAnchorDeclaration =
+  | {
+      ok: true;
+      /**
+       * El día declarado ajustado HACIA ADELANTE a su sábado
+       * (`saturdayOnOrAfter`): el último día que la cadencia declara pagado.
+       */
+      anchor: string;
+      /** El día siguiente al declarado: desde acá absorbe el ajuste (dato). */
+      absorbedFrom: string;
+      /** Cuántos días absorbe el ajuste (0 si el declarado ya era sábado). */
+      absorbedDays: number;
+    }
+  | { ok: false; reason: CadenceAnchorRejection };
+
+/**
+ * Anclaje por cadencia, decisión 1 (dueño, 2026-10-05; ver
+ * `odd/tasks/nomina-anclaje-por-cadencia.md`): convierte «pagado hasta
+ * `paidThrough`» en el último día cubierto de esa cadencia.
+ *
+ * La grilla NO se mueve: sigue domingo→sábado. Si el día declarado no cae en
+ * sábado, el ancla se corre HACIA ADELANTE hasta el sábado de su ciclo
+ * (`saturdayOnOrAfter`), así que absorbe los días entre el declarado y ese
+ * sábado. El ajuste NUNCA va hacia atrás: retroceder ofrecería días ya pagados,
+ * que es el error grave que el anclaje existe para evitar — el riesgo no es
+ * simétrico, y declarar de más se corrige en el ciclo siguiente.
+ *
+ * La guarda es sobre el día DECLARADO, no sobre el ancla ajustada: absorber los
+ * días hasta el sábado siguiente es la semántica pedida, no un error. Un texto
+ * que no es una fecha del calendario es `anchor-not-a-day` y un día posterior a
+ * `referenceDate` es `anchor-in-the-future` — no se declara pagado lo que no
+ * pasó.
+ *
+ * `absorbedFrom` y `absorbedDays` viajan como DATO, nunca como frase: son los
+ * días que la pantalla tiene que MOSTRAR (decisión 1, «no esconderlo»). Puro
+ * para probarlo sin base de datos.
+ */
+export function cadenceAnchorFromDeclaration(args: {
+  /** Lo que se declaró como último día pagado (vacío = no se declaró nada). */
+  paidThrough: string;
+  /** El día de HOY (la MISMA convención del módulo): sin él no se comprueba el futuro. */
+  referenceDate?: string | null;
+}): CadenceAnchorDeclaration {
+  const declared = utcDayOf((args.paidThrough ?? "").trim());
+  if (declared === null) return { ok: false, reason: "anchor-not-a-day" };
+  if (args.referenceDate != null) {
+    const reference = utcDayOf(args.referenceDate);
+    if (reference !== null && declared > reference) {
+      return { ok: false, reason: "anchor-in-the-future" };
+    }
+  }
+  const anchor = saturdayOnOrAfter(declared);
+  return {
+    ok: true,
+    anchor: isoDayOf(anchor),
+    absorbedFrom: isoDayOf(declared + DAY_MS),
+    absorbedDays: (anchor - declared) / DAY_MS,
+  };
+}
+
+/**
+ * Anclaje por cadencia, decisión 3 (dueño, 2026-10-05; ver
+ * `odd/tasks/nomina-anclaje-por-cadencia.md`): el anclaje vigente de UNA
+ * cadencia, con su precedencia.
+ *
+ *   1. El anclaje declarado —ya ajustado al sábado—, si existe.
+ *   2. Si no, el PISO GLOBAL (`payrollHistoryFloor`). El piso global NO
+ *      desaparece: sigue siendo el fallback de una cadencia sin anclaje
+ *      declarado, así que el comportamiento de hoy queda intacto.
+ *   3. Si no hay ninguno de los dos, `null`.
+ *
+ * Un texto vacío es «no declarado», no un anclaje. Puro para probarlo sin base
+ * de datos: el aviso, la apertura y la pantalla consumen la MISMA precedencia.
+ */
+export function resolveCadenceAnchor(args: {
+  /** El anclaje declarado de la cadencia (ya ajustado al sábado), o nada. */
+  declared?: string | null;
+  /** El piso derivado de los períodos (`payrollHistoryFloor`), o nada. */
+  globalFloor?: string | null;
+}): string | null {
+  const declared = (args.declared ?? "").trim();
+  if (declared !== "") return declared;
+  const floor = (args.globalFloor ?? "").trim();
+  return floor === "" ? null : floor;
+}
+
+/**
+ * Anclaje por cadencia (decisión 3; ver
+ * `odd/tasks/nomina-anclaje-por-cadencia.md`): ¿este ciclo ya está CUBIERTO por
+ * el anclaje de su cadencia?
+ *
+ * Es verdadero cuando hay ancla y el ÚLTIMO día del ciclo es menor o igual que
+ * ella. Un ciclo cubierto NO se reporta como pendiente ni se abre — es la única
+ * definición de «cubierto», para que el aviso y la apertura no digan cosas
+ * distintas del mismo ciclo. Sin ancla (`null`) no hay cobertura declarada:
+ * `false`.
+ *
+ * Se compara por el ÚLTIMO día —la misma verdad que `isRangeBeforePayrollStart`,
+ * que compara el último día contra el arranque— porque un ciclo que EMPIEZA
+ * antes del ancla pero cierra después todavía tiene días pagables. Puro para
+ * probarlo sin base de datos.
+ */
+export function isCycleCoveredByAnchor(args: {
+  /** El último día del ciclo (domingo→sábado). */
+  endDate: string;
+  /** El anclaje vigente de la cadencia (`resolveCadenceAnchor`), o nada. */
+  anchor?: string | null;
+}): boolean {
+  const anchor = utcDayOf((args.anchor ?? "").trim());
+  if (anchor === null) return false;
+  const end = utcDayOf(args.endDate);
+  if (end === null) return false;
+  return end <= anchor;
+}
+
+/**
+ * Anclaje por cadencia (decisión 3; ver
+ * `odd/tasks/nomina-anclaje-por-cadencia.md`): el primer día PAGABLE de esa
+ * cadencia, `ancla + 1 día` — en la grilla domingo→sábado, el domingo del ciclo
+ * siguiente al día declarado cubierto.
+ *
+ * Sin ancla (`null`) no hay día pagable declarado: `null`, y el llamador se
+ * queda con el comportamiento de hoy. Puro para probarlo sin base de datos.
+ */
+export function cadencePayableFrom(anchor: string | null | undefined): string | null {
+  const day = utcDayOf((anchor ?? "").trim());
+  return day === null ? null : isoDayOf(day + DAY_MS);
 }
 
 // ------------------- F9: ciclos cerrados que faltan por liquidar ---
@@ -1621,7 +1807,16 @@ export function isPayrollCycleSettled(args: {
  * recorrido: son `limit` ciclos hacia atrás y ni uno más.
  *
  * El rango que se REPORTA es el que se va a abrir: el del ciclo, recortado al
- * arranque cuando el arranque cae dentro de él (el PRIMER ciclo de la cadencia).
+ * arranque cuando el arranque cae dentro de él (el PRIMER ciclo de la cadencia)
+ * y, con anclaje declarado, a su primer día pagable (`A+1`).
+ *
+ * Anclaje por cadencia (decisión del dueño, 2026-10-05): `anchors` declara, por
+ * cadencia, HASTA qué día ya se pagó. Un ciclo que CIERRA en o antes del anclaje
+ * de SU cadencia está CUBIERTO y no se reporta (`isCycleCoveredByAnchor`); uno
+ * que lo CONTIENE se reporta recortado a `A+1` (`cadencePayableFrom`). El PISO
+ * global NO es un anclaje: dice desde cuándo HAY historia, no hasta cuándo se
+ * pagó, así que sigue acotando el recorrido y recortando el primer ciclo.
+ * `null` o ausente es «no declarado», y todo queda como hoy.
  *
  * `referenceDate` es un día de Bogotá (lo resuelve el llamador, `bogotaDay()`), la
  * MISMA convención de fechas del resto del módulo.
@@ -1637,6 +1832,13 @@ export function pendingPayrollSettlements(args: {
   }[];
   referenceDate: string;
   limit?: number;
+  /**
+   * Anclajes DECLARADOS por cadencia (ya ajustados al sábado): los días hasta el
+   * ancla ya se pagaron. `null` o ausente es «no declarado»: sin anclaje la
+   * cadencia cae al piso global y el comportamiento es el de siempre. El piso NO
+   * es un anclaje.
+   */
+  anchors?: Partial<Record<PayFrequency, string | null>>;
 }): PendingPayrollSettlement[] {
   const lastEnd = utcDayOf(lastCompletedCycleEndDate(args.referenceDate) ?? "");
   if (lastEnd === null) return [];
@@ -1670,6 +1872,9 @@ export function pendingPayrollSettlements(args: {
     if (cadenceNames === undefined || cadenceNames.length === 0) continue;
     const cycleDays = calendarCycleDaysForFrequency(frequency);
     if (cycleDays === null) continue;
+    // El anclaje DECLARADO de ESTA cadencia (nunca el piso): `null` es «no
+    // declarado» y deja el comportamiento de hoy.
+    const declaredAnchor = args.anchors?.[frequency] ?? null;
 
     let found = 0;
     // F10: sin piso (instalación sin períodos) el tope POR CADENCIA es el
@@ -1692,13 +1897,26 @@ export function pendingPayrollSettlements(args: {
       ) {
         break;
       }
+      // El anclaje DECLARADO cubre por CICLO, no es una cota del recorrido: un
+      // ciclo que cierra en o antes del ancla ya está pagado y se salta, pero la
+      // caminata la sigue deteniendo el piso (arriba). El piso NO entra acá.
+      if (isCycleCoveredByAnchor({ endDate: cycle.end_date, anchor: declaredAnchor })) {
+        continue;
+      }
       if (isPayrollCycleSettled({ periods: args.periods, frequency, cycle })) continue;
       // F10: el rango REPORTADO es el que se va a abrir. Cuando el arranque
       // (el día del primer período) cae DENTRO de este ciclo, es el PRIMER
       // ciclo de la cadencia y su rango se recorta a él (la MISMA forma que el
       // servicio persiste), así el aviso dice lo que se va a liquidar y no un
       // ciclo completo que la nómina nunca va a pagar como tal.
-      const reportedStart = floorDay !== null && floorDay > start ? floorDay : start;
+      // `max(inicio del ciclo, piso, A+1 del anclaje declarado)`: la misma cota
+      // que el validador aplica al abrir. El anclaje sólo aporta cuando existe;
+      // el piso sigue aportando siempre que acote.
+      const payableFrom = cadencePayableFrom(declaredAnchor);
+      const payableDay = payableFrom === null ? null : utcDayOf(payableFrom);
+      let reportedStart = start;
+      if (floorDay !== null && floorDay > reportedStart) reportedStart = floorDay;
+      if (payableDay !== null && payableDay > reportedStart) reportedStart = payableDay;
       pending.push({
         frequency,
         start_date: isoDayOf(reportedStart),
