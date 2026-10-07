@@ -89,11 +89,13 @@ ofrecer un campo que el servicio va a rechazar.
       **HECHO** — botón `Pago extraordinario` junto a «Abrir período» (`:2837-2862`), que abre el
       diálogo de siempre.
 
-      **Interpretación declarada (el dueño decide)**: la **tabla de pagos extraordinarios
+      **Interpretación declarada**: la **tabla de pagos extraordinarios
       registrados** no podía quedarse en la vista principal (decisión 2) ni borrarse («nada se
       borra», y de ahí sale el llamado al servicio), así que se mudó **adentro del diálogo de la
-      acción**. Eso modifica un diálogo que el brief pedía dejar intacto. Si el dueño prefiere verla
-      en la pestaña «Pagos del mes», es una mudanza de una línea.
+      acción**. Eso modifica un diálogo que el brief pedía dejar intacto, y quedó a la vista del
+      dueño con los números exactos: **el dueño confirmó la ubicación el 2026-10-07** («lo de pagos
+      extraordinarios está bien donde quedó»). La alternativa —moverla a la pestaña «Pagos del
+      mes»— queda descartada, no pendiente.
 - [x] **T3** — «Pagos del mes por empleado» a la pestaña, con su contenido tal cual.
       **HECHO** — switch de vistas con la primitiva `Tabs` del archivo (`:2705-2736`), arranca en
       `periodos`, y el disparador de «Pagos del mes» va con `props.canAdmin` (si no, un empleado
