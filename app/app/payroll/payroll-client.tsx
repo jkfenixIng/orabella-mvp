@@ -310,6 +310,14 @@ const ANCHOR_WINDOW_CLOSED_TEXT =
   "La declaración de este anclaje ya está cerrada: la cadencia tiene períodos registrados, y el primero es la evidencia de hasta cuándo se pagó.";
 
 /**
+ * T6 (decisión 3 del dueño, 2026-10-06): la pantalla tiene DOS vistas de nivel
+ * superior. «Períodos» es la operación diaria (el aviso de pendientes y la
+ * lista); «Pagos del mes» es la CONSULTA, que antes vivía apilada debajo de
+ * todo. El valor es el `value` de las pestañas y el estado nace en la operación.
+ */
+type PayrollViewTab = "periodos" | "pagos-mes";
+
+/**
  * T5 (decisión 1 del dueño: «no esconderlo»): la línea de los días que el ajuste
  * al sábado ABSORBE. Los números salen del DATO —`absorbedFrom`/`absorbedDays`,
  * del anclaje leído en la base o de la regla pura en la vista previa— y nunca de
@@ -1365,6 +1373,8 @@ export function PayrollClient(props: PayrollClientProps) {
    */
   const [openDeclaredStart, setOpenDeclaredStart] = useState<string>("");
   const [openError, setOpenError] = useState<string | null>(null);
+  /** T6 (decisión 3 del dueño): la vista de nivel superior que se está mirando. */
+  const [viewTab, setViewTab] = useState<PayrollViewTab>("periodos");
   // Pagos: porciones por ítem (método y monto como campos separados en tabla).
   const [portions, setPortions] = useState<Record<string, PortionDraft[]>>({});
   // Contador para claves estables de las filas de porciones (no usar el índice:
@@ -2266,6 +2276,30 @@ export function PayrollClient(props: PayrollClientProps) {
           referenceDate: bogotaDay(),
           cadenceAnchor: declaredAnchors[openTarget.frequency] ?? null,
         });
+  //
+  // T6 (decisión 1 del dueño, 2026-10-06): el paso del anclaje vive DENTRO de
+  // «Abrir período» y se rinde SÓLO cuando importa: la cadencia del ciclo
+  // elegido no tiene anclaje declarado, o el ciclo elegido está cubierto (total
+  // o parcialmente) por el anclaje ya declarado. Con el anclaje puesto y un
+  // ciclo NO cubierto no hay nada que preguntar y el paso no ocupa lugar. La
+  // cadencia sale de la MISMA condición de gente activa del anclaje: sin gente
+  // de esa cadencia el paso no aparece.
+  const openAnchorFrequency =
+    openTarget !== null && activeCadences.includes(openTarget.frequency)
+      ? openTarget.frequency
+      : null;
+  const openAnchorDeclared =
+    openAnchorFrequency === null ? undefined : cadenceAnchors[openAnchorFrequency];
+  // El ciclo elegido TOCA el anclaje declarado: cierra en o antes del ancla (ya
+  // pagado) o la contiene (se liquidará desde `ancla + 1`). El ancla y el ciclo
+  // son días ISO, así que la comparación de cadenas ES la de fechas.
+  const openCycleTouchesAnchor =
+    openTarget !== null &&
+    openAnchorDeclared !== undefined &&
+    openTarget.start_date <= openAnchorDeclared.anchor;
+  const openAnchorStepVisible =
+    openAnchorFrequency !== null && (openAnchorDeclared === undefined || openCycleTouchesAnchor);
+
   const startDate = openResolution?.ok ? openResolution.start_date : "";
   const endDate = openResolution?.ok ? openResolution.end_date : "";
   // F10: el rango derivado, en palabras, y la nota del PRIMER ciclo recortado.
@@ -2506,6 +2540,103 @@ export function PayrollClient(props: PayrollClientProps) {
     return `${employees} · Neto ${formatMoney(totals.netTotal)} · Pagado ${formatMoney(totals.paidTotal)} · Saldo ${formatMoney(totals.remainingTotal)}`;
   }
 
+  /**
+   * T5/T6: el paso del anclaje, DENTRO del diálogo de «Abrir período» y para
+   * UNA sola cadencia (la del ciclo elegido). Es el MISMO cuerpo que la pantalla
+   * tenía en su sección —los tres estados, la vista previa con la regla pura y
+   * el aviso de la ventana de reparación—, así que la regla no cambia: cambia su
+   * lugar. Devuelve JSX y no es un componente por la misma razón que
+   * `renderPeriodList`: un componente declarado adentro del cliente es un tipo
+   * NUEVO en cada render y remontaría el campo.
+   */
+  function renderAnchorStep(frequency: PayFrequency): ReactNode {
+    const declared = cadenceAnchors[frequency];
+    // La ventana de reparación se cierra con el primer período de ESA cadencia:
+    // el período es la evidencia de hasta cuándo se pagó.
+    const windowClosed = filterPeriodsByCadence(periods, frequency).length > 0;
+    if (declared !== undefined) {
+      return (
+        <div className="mt-2">
+          <p className="text-sm font-medium text-text-primary">{periodCadenceLabel(frequency)}</p>
+          <p className="mt-1 text-sm text-text-secondary">
+            {`Declarado pagado hasta el ${formatFullDate(declared.paidThrough)}. El anclaje vigente es el ${formatFullDate(declared.anchor)}: el último día cubierto de esta cadencia.`}
+          </p>
+          <p className="mt-1 text-sm text-text-secondary">{absorbedDaysText(declared)}</p>
+          {windowClosed && (
+            <p className="mt-1 text-xs text-text-tertiary">{ANCHOR_WINDOW_CLOSED_TEXT}</p>
+          )}
+        </div>
+      );
+    }
+    if (windowClosed) {
+      return (
+        <div className="mt-2">
+          <p className="text-sm font-medium text-text-primary">{periodCadenceLabel(frequency)}</p>
+          <p className="mt-1 text-sm text-text-secondary">{ANCHOR_WINDOW_CLOSED_TEXT}</p>
+        </div>
+      );
+    }
+    const draft = anchorDrafts[frequency] ?? "";
+    // La vista previa aplica la MISMA regla que el servicio
+    // (`cadenceAnchorFromDeclaration`): el ancla ajustada al sábado y los días
+    // absorbidos que se van a guardar, antes de enviar.
+    const preview = cadenceAnchorFromDeclaration({
+      paidThrough: draft,
+      referenceDate: bogotaDay(),
+    });
+    const error = anchorErrors[frequency];
+    return (
+      <form className="mt-2" onSubmit={(event) => declareCadenceAnchor(event, frequency)}>
+        <label className={labelClass} htmlFor={`payroll-anchor-${frequency}`}>
+          {`¿Hasta qué día se pagaron los sueldos de este grupo? (${periodCadenceLabel(frequency)})`}
+          <input
+            id={`payroll-anchor-${frequency}`}
+            type="date"
+            value={draft}
+            max={bogotaDay()}
+            onChange={(event) => {
+              const value = event.target.value;
+              setAnchorDrafts((prev) => ({ ...prev, [frequency]: value }));
+              setAnchorErrors((prev) => {
+                const next = { ...prev };
+                delete next[frequency];
+                return next;
+              });
+            }}
+            className={inputClass}
+          />
+          <span className="text-xs font-normal text-text-tertiary">
+            El último día consumido y pagado de esta cadencia, no la fecha del pago. El ajuste al
+            sábado corre el anclaje hacia adelante.
+          </span>
+        </label>
+        {draft.trim() !== "" && !preview.ok && (
+          <p className="mt-1 text-sm text-text-secondary">
+            {preview.reason === "anchor-in-the-future"
+              ? "Ese día todavía no pasó: el anclaje declara días ya pagados, así que no puede ser una fecha futura."
+              : "Escriba una fecha del calendario (aaaa-mm-dd)."}
+          </p>
+        )}
+        {preview.ok && (
+          <>
+            <p className="mt-1 text-sm text-text-secondary">
+              {`El anclaje vigente queda el ${formatFullDate(preview.anchor)}.`}
+            </p>
+            <p className="mt-1 text-sm text-text-secondary">{absorbedDaysText(preview)}</p>
+          </>
+        )}
+        {error !== undefined && <p className="mt-1 text-sm text-error">{error}</p>}
+        <button
+          type="submit"
+          className={`${buttonClass} mt-2`}
+          disabled={anchorBusy === frequency || draft.trim() === ""}
+        >
+          Declarar anclaje
+        </button>
+      </form>
+    );
+  }
+
   // PA3 (consulta puntual): los meses que se pueden consultar, derivados de los
   // períodos que la pantalla ya tiene (la fecha de INICIO define el mes, la
   // misma regla que la lectura del servidor). El más reciente primero.
@@ -2572,7 +2703,20 @@ export function PayrollClient(props: PayrollClientProps) {
     props.methods.find((row) => row.code === code)?.name ?? code;
 
   return (
-    <div className="flex flex-col gap-6">
+    /*
+      T6 (decisión 3 del dueño, 2026-10-06): la pantalla deja de ser el módulo
+      entero en una vista. La vista raíz tiene DOS pestañas: «Períodos» es la
+      operación diaria (el aviso de pendientes, la lista y la apertura) y «Pagos
+      del mes» es la CONSULTA, que antes vivía apilada debajo de todo. Se usa la
+      primitiva de pestañas del proyecto: el par `aria-controls`/`aria-labelledby`
+      no puede quedar a medias.
+    */
+    <Tabs
+      value={viewTab}
+      onValueChange={(next) => setViewTab(next as PayrollViewTab)}
+      label="Vistas de nómina"
+      className="flex flex-col gap-6"
+    >
       {error && (
         // Fallo de acción o validación incompleta = ESTADO: sigue siendo el
         // caso mientras no se corrija, así que va inline y persistente arriba
@@ -2581,7 +2725,17 @@ export function PayrollClient(props: PayrollClientProps) {
         <Alert variant="destructive">{error}</Alert>
       )}
 
-      <section className={sectionClass}>
+      <TabsList>
+        <TabsTrigger value="periodos">Períodos</TabsTrigger>
+        {/* «Pagos del mes» agrega plata de TODA la planta y siempre fue del
+            admin (PA3): para el empleado la pestaña no existe, así que el juego
+            queda con una sola pestaña y su panel, sin promesa a medias. */}
+        {props.canAdmin && (
+          <TabsTrigger value="pagos-mes">Pagos del mes</TabsTrigger>
+        )}
+      </TabsList>
+
+      <TabsPanel value="periodos" className={sectionClass}>
         <h2 className="text-lg font-semibold">Períodos</h2>
         {/*
           F10 (2026-10-04): la fecha desde la que la nómina OPERA ya NO se
@@ -2685,13 +2839,29 @@ export function PayrollClient(props: PayrollClientProps) {
           </p>
         )}
         {props.canAdmin && (
-          <button
-            type="button"
-            onClick={openPeriodDialog}
-            className={`${buttonClass} mt-3`}
-          >
-            Abrir período
-          </button>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <button type="button" onClick={openPeriodDialog} className={buttonClass}>
+              Abrir período
+            </button>
+            {/*
+              T6 (decisión 2 del dueño, 2026-10-06): «Pagos extraordinarios» sale
+              de la vista principal como ACCIÓN de excepción. El botón vive donde
+              el ojo ya mira —el encabezado de la lista de períodos— y abre el
+              mismo diálogo de siempre, sin tocar su código. La tabla de lo
+              registrado dejó de apilarse acá: es un registro, no operación
+              diaria.
+            */}
+            <button
+              type="button"
+              onClick={() => {
+                setExtraError(null);
+                setExtraDialogOpen(true);
+              }}
+              className={ghostClass}
+            >
+              Pago extraordinario
+            </button>
+          </div>
         )}
         {/*
           F11: la lista de períodos, POR CADENCIA. Se usa la primitiva de
@@ -2724,195 +2894,9 @@ export function PayrollClient(props: PayrollClientProps) {
         ) : (
           renderPeriodList(visiblePeriods)
         )}
-      </section>
+      </TabsPanel>
 
-      {/*
-        T5 (decisión 3 del dueño, 2026-10-05): el anclaje por cadencia se declara
-        UNA vez y sólo por cadencia CON GENTE ACTIVA —sin empleados de esa
-        cadencia no hay nada que liquidar y la pregunta es ruido—. Con el anclaje
-        puesto se muestra en solo lectura, y si esa cadencia ya tiene períodos el
-        campo se reemplaza por el aviso de la ventana de reparación: el servicio
-        rechaza la declaración (`CADENCE_ANCHOR_LOCKED`) y ofrecer un campo que va
-        a fallar sería mentirle a quien lo usa. Los días que el ajuste al sábado
-        absorbe (decisión 1: «no esconderlo») se muestran en los dos estados,
-        con los números del dato.
-      */}
-      {props.canAdmin && activeCadences.length > 0 && (
-        <section className={sectionClass}>
-          <h2 className="text-lg font-semibold">Anclaje por cadencia</h2>
-          <p className="mt-2 text-sm text-text-secondary">
-            Hasta qué día se pagaron los sueldos de cada grupo. No es la fecha del pago: es el último
-            día consumido y pagado de esa cadencia, y existe para que la primera liquidación no vuelva
-            a pagar días ya pagados.
-          </p>
-          {activeCadences.map((frequency) => {
-            const declared = cadenceAnchors[frequency];
-            // La ventana de reparación se cierra con el primer período de ESA
-            // cadencia: el período es la evidencia de hasta cuándo se pagó.
-            const windowClosed = filterPeriodsByCadence(periods, frequency).length > 0;
-            if (declared !== undefined) {
-              return (
-                <div key={frequency} className="mt-4">
-                  <p className="text-sm font-medium text-text-primary">
-                    {periodCadenceLabel(frequency)}
-                  </p>
-                  <p className="mt-1 text-sm text-text-secondary">
-                    {`Declarado pagado hasta el ${formatFullDate(declared.paidThrough)}. El anclaje vigente es el ${formatFullDate(declared.anchor)}: el último día cubierto de esta cadencia.`}
-                  </p>
-                  <p className="mt-1 text-sm text-text-secondary">{absorbedDaysText(declared)}</p>
-                  {windowClosed && (
-                    <p className="mt-1 text-xs text-text-tertiary">{ANCHOR_WINDOW_CLOSED_TEXT}</p>
-                  )}
-                </div>
-              );
-            }
-            if (windowClosed) {
-              return (
-                <div key={frequency} className="mt-4">
-                  <p className="text-sm font-medium text-text-primary">
-                    {periodCadenceLabel(frequency)}
-                  </p>
-                  <p className="mt-1 text-sm text-text-secondary">{ANCHOR_WINDOW_CLOSED_TEXT}</p>
-                </div>
-              );
-            }
-            const draft = anchorDrafts[frequency] ?? "";
-            // La vista previa aplica la MISMA regla que el servicio
-            // (`cadenceAnchorFromDeclaration`): el ancla ajustada al sábado y
-            // los días absorbidos que se van a guardar, antes de enviar.
-            const preview = cadenceAnchorFromDeclaration({
-              paidThrough: draft,
-              referenceDate: bogotaDay(),
-            });
-            const error = anchorErrors[frequency];
-            return (
-              <form
-                key={frequency}
-                className="mt-4"
-                onSubmit={(event) => declareCadenceAnchor(event, frequency)}
-              >
-                <label className={labelClass} htmlFor={`payroll-anchor-${frequency}`}>
-                  {`¿Hasta qué día se pagaron los sueldos de este grupo? (${periodCadenceLabel(frequency)})`}
-                  <input
-                    id={`payroll-anchor-${frequency}`}
-                    type="date"
-                    value={draft}
-                    max={bogotaDay()}
-                    onChange={(event) => {
-                      const value = event.target.value;
-                      setAnchorDrafts((prev) => ({ ...prev, [frequency]: value }));
-                      setAnchorErrors((prev) => {
-                        const next = { ...prev };
-                        delete next[frequency];
-                        return next;
-                      });
-                    }}
-                    className={inputClass}
-                  />
-                  <span className="text-xs font-normal text-text-tertiary">
-                    El último día consumido y pagado de esta cadencia, no la fecha del pago. El ajuste al
-                    sábado corre el anclaje hacia adelante.
-                  </span>
-                </label>
-                {draft.trim() !== "" && !preview.ok && (
-                  <p className="mt-1 text-sm text-text-secondary">
-                    {preview.reason === "anchor-in-the-future"
-                      ? "Ese día todavía no pasó: el anclaje declara días ya pagados, así que no puede ser una fecha futura."
-                      : "Escriba una fecha del calendario (aaaa-mm-dd)."}
-                  </p>
-                )}
-                {preview.ok && (
-                  <>
-                    <p className="mt-1 text-sm text-text-secondary">
-                      {`El anclaje vigente queda el ${formatFullDate(preview.anchor)}.`}
-                    </p>
-                    <p className="mt-1 text-sm text-text-secondary">{absorbedDaysText(preview)}</p>
-                  </>
-                )}
-                {error !== undefined && <p className="mt-1 text-sm text-error">{error}</p>}
-                <button
-                  type="submit"
-                  className={`${buttonClass} mt-2`}
-                  disabled={anchorBusy === frequency || draft.trim() === ""}
-                >
-                  Declarar anclaje
-                </button>
-              </form>
-            );
-          })}
-        </section>
-      )}
 
-      {/*
-        PA-2a: nómina individual por caso extraordinario. Es el REGISTRO
-        VISIBLE (no sólo la auditoría) de cuánto y cómo se pagó, y existe
-        porque un período cerrado no admite el pago de sus ítems. Sólo admin.
-      */}
-      {props.canAdmin && (
-        <section className={sectionClass}>
-          <h2 className="text-lg font-semibold">Pagos extraordinarios</h2>
-          <p className="mt-2 text-sm text-text-secondary">
-            Nómina individual por despido, renuncia o emergencia del empleado. No es un período: sirve
-            para pagar días que un período cerrado ya cubrió, y queda registrado cuánto y cómo se pagó.
-          </p>
-          <button
-            type="button"
-            onClick={() => {
-              setExtraError(null);
-              setExtraDialogOpen(true);
-            }}
-            className={`${buttonClass} mt-3`}
-          >
-            Registrar pago extraordinario
-          </button>
-          {extras.length === 0 ? (
-            <p className="mt-3 text-sm text-text-tertiary">
-              Sin pagos extraordinarios registrados.
-            </p>
-          ) : (
-            <div className="mt-3 overflow-x-auto">
-              <table className={cn("w-full text-left text-sm", "min-w-[880px]")}>
-                <thead>
-                  <tr className={tableHeaderClass}>
-                    <th className={tableCellClass} scope="col">
-                      Fecha
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Empleado
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Tipo
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Monto
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Método
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Motivo
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {extras.map((row) => (
-                    <tr key={row.id} className={tableRowClass}>
-                      <td className={tableCellClass}>
-                        {row.paid_at ? formatFullDate(row.paid_at.slice(0, 10)) : "—"}
-                      </td>
-                      <td className={tableCellClass}>{employeeName(row.employee_id)}</td>
-                      <td className={tableCellClass}>{PAYROLL_EXTRA_KIND_LABELS[row.kind]}</td>
-                      <td className={tableCellClass}>{formatMoney(row.amount)}</td>
-                      <td className={tableCellClass}>{methodLabel(row.method_code)}</td>
-                      <td className={tableCellClass}>{row.reason}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-      )}
 
       {/*
         PA3: pagos del mes por empleado. Es la respuesta práctica a "qué lleva
@@ -2923,7 +2907,7 @@ export function PayrollClient(props: PayrollClientProps) {
         topa ni bloquea nada.
       */}
       {props.canAdmin && (
-        <section className={sectionClass}>
+        <TabsPanel value="pagos-mes" className={sectionClass}>
           <h2 className="text-lg font-semibold">Pagos del mes por empleado</h2>
           <p className="mt-2 text-sm text-text-secondary">
             Lo que cada empleado lleva liquidado y pagado en el mes, y contra qué períodos. El fijo
@@ -3059,7 +3043,7 @@ export function PayrollClient(props: PayrollClientProps) {
               </table>
             </div>
           )}
-        </section>
+        </TabsPanel>
       )}
 
       {/* PA-2a: el formulario del pago extraordinario. */}
@@ -3257,6 +3241,62 @@ export function PayrollClient(props: PayrollClientProps) {
                 </button>
               </DialogFooter>
             </form>
+
+            {/*
+              T6 (decisión 2 del dueño, 2026-10-06): el registro de lo pagado
+              dejó la vista principal, pero NO se borra. Vive acá, en el mismo
+              diálogo que abre el botón «Pago extraordinario» del encabezado de
+              períodos: la acción de excepción y su registro, en un solo lugar.
+            */}
+            <section className="mt-4 border-t border-border-color pt-3 dark:border-border-color-2">
+              <p className="font-medium text-text-primary">Pagos extraordinarios registrados</p>
+              {extras.length === 0 ? (
+                <p className="mt-2 text-sm text-text-tertiary">
+                  Sin pagos extraordinarios registrados.
+                </p>
+              ) : (
+                <div className="mt-2 overflow-x-auto">
+                  <table className={cn("w-full text-left text-sm", "min-w-[880px]")}>
+                    <thead>
+                      <tr className={tableHeaderClass}>
+                        <th className={tableCellClass} scope="col">
+                          Fecha
+                        </th>
+                        <th className={tableCellClass} scope="col">
+                          Empleado
+                        </th>
+                        <th className={tableCellClass} scope="col">
+                          Tipo
+                        </th>
+                        <th className={tableCellClass} scope="col">
+                          Monto
+                        </th>
+                        <th className={tableCellClass} scope="col">
+                          Método
+                        </th>
+                        <th className={tableCellClass} scope="col">
+                          Motivo
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {extras.map((row) => (
+                        <tr key={row.id} className={tableRowClass}>
+                          <td className={tableCellClass}>
+                            {row.paid_at ? formatFullDate(row.paid_at.slice(0, 10)) : "—"}
+                          </td>
+                          <td className={tableCellClass}>{employeeName(row.employee_id)}</td>
+                          <td className={tableCellClass}>{PAYROLL_EXTRA_KIND_LABELS[row.kind]}</td>
+                          <td className={tableCellClass}>{formatMoney(row.amount)}</td>
+                          <td className={tableCellClass}>{methodLabel(row.method_code)}</td>
+                          <td className={tableCellClass}>{row.reason}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
           </DialogContent>
         </Dialog>
       )}
@@ -3279,7 +3319,7 @@ export function PayrollClient(props: PayrollClientProps) {
                 el segundo el arranque ya no se vuelve a preguntar.
               </DialogDescription>
             </DialogHeader>
-            <form onSubmit={handleOpen} className="mt-4 flex flex-col gap-4">
+            <div className="mt-4 flex flex-col gap-4">
               {pendingSettlements.length === 0 ? (
                 // VACÍO dentro del diálogo: describe lo esperado, no bloquea nada y
                 // nunca anunció nada. Sin ciclos cerrados sin liquidar no hay rango
@@ -3350,7 +3390,11 @@ export function PayrollClient(props: PayrollClientProps) {
                   la PRIMERA liquidación —este mismo diálogo—, no una pantalla
                   que el admin no puede abrir. Con períodos registrados el campo
                   no aparece: el arranque es un hecho derivado y nadie vuelve a
-                  preguntar nada. */}
+                  preguntar nada.
+                  T6: el arranque y el anclaje viven FUERA del formulario de
+                  apertura porque cada uno tiene su propio envío (`handleOpen`
+                  contra `declareCadenceAnchor`) y anidar formularios es HTML
+                  inválido. Los dos son estado controlado, no datos de formulario. */}
               {primeraLiquidacion && openTarget !== null && (
                 <label className={labelClass} htmlFor="payroll-open-start-date">
                   Desde qué día opera la nómina
@@ -3376,6 +3420,30 @@ export function PayrollClient(props: PayrollClientProps) {
                 </label>
               )}
 
+              {/*
+                T6 (decisión 1 del dueño, 2026-10-06): el anclaje dejó de ser una
+                sección de la pantalla y pasó a ser un PASO de este diálogo. Se
+                rinde SÓLO cuando importa: la cadencia del ciclo elegido no tiene
+                anclaje declarado, o el ciclo elegido está cubierto —total o
+                parcialmente— por el anclaje ya declarado. Con el anclaje puesto
+                y un ciclo no cubierto no hay nada que preguntar y el paso no
+                ocupa lugar. La condición de gente activa de la cadencia sigue en
+                pie (`activeCadences`), como en el aviso.
+              */}
+              {props.canAdmin && openAnchorStepVisible && openAnchorFrequency !== null && (
+                <section className="rounded-md border border-border-color p-3 dark:border-border-color-2">
+                  <p className="font-medium text-text-primary">Anclaje de la cadencia</p>
+                  <p className="mt-1 text-sm text-text-secondary">
+                    Hasta qué día se pagaron los sueldos de este grupo. No es la fecha del pago: es el
+                    último día consumido y pagado de esa cadencia, y existe para que la primera
+                    liquidación no vuelva a pagar días ya pagados.
+                  </p>
+                  {renderAnchorStep(openAnchorFrequency)}
+                </section>
+              )}
+            </div>
+
+            <form onSubmit={handleOpen} className="mt-4 flex flex-col gap-4">
               {openRangeText !== null && (
                 <p className="text-xs text-text-tertiary">{openRangeText}</p>
               )}
@@ -3856,6 +3924,6 @@ export function PayrollClient(props: PayrollClientProps) {
         </Dialog>
       )}
 
-    </div>
+    </Tabs>
   );
 }

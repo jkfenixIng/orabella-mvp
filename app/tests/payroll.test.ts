@@ -13504,7 +13504,7 @@ describe("payroll: el anclaje por cadencia de punta a punta (T5)", () => {
     expect(client).toContain("initialCadenceAnchors: PayrollCadenceAnchors;");
   });
 
-  it("el campo se pregunta SÓLO por cadencia con gente activa y mientras no haya anclaje declarado", () => {
+  it("el paso del anclaje se rinde SÓLO por la cadencia del ciclo elegido, con gente activa y cuando importa", () => {
     const source = readFileSync(
       join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
       "utf8",
@@ -13516,11 +13516,24 @@ describe("payroll: el anclaje por cadencia de punta a punta (T5)", () => {
     expect(source).toContain(
       "employee.is_active !== false && normalizePayFrequency(employee.pay_frequency) === frequency",
     );
-    expect(source).toContain("props.canAdmin && activeCadences.length > 0 && (");
-    // Y la sección ITERA sobre las cadencias activas, no sobre las tres: sin esta
-    // aserción, un `map` sobre el catálogo entero pasaba igual y le ofrecía el
-    // campo a una cadencia sin gente (decisión 3).
-    expect(source).toContain("{activeCadences.map((frequency) => {");
+    // T6 (decisión 1 del dueño, 2026-10-06): el paso vive DENTRO de «Abrir
+    // período» y se rinde SÓLO por la cadencia del ciclo elegido. La condición
+    // de gente activa sigue en pie: sin ella, el paso ofrecería un campo para
+    // una cadencia sin planta.
+    expect(source).toContain("activeCadences.includes(openTarget.frequency)");
+    // Las DOS condiciones de la decisión 1: sin anclaje declarado, o ciclo
+    // cubierto por el anclaje. Sin esta aserción, un paso que se rindiera
+    // SIEMPRE —cambiando una pantalla cargada por un diálogo cargado— pasaba.
+    expect(source).toContain("openAnchorDeclared === undefined || openCycleTouchesAnchor");
+    expect(source).toContain("openTarget.start_date <= openAnchorDeclared.anchor");
+    // Y el paso se dibuja en el diálogo, con la condición completa a la vista.
+    expect(source).toContain(
+      "props.canAdmin && openAnchorStepVisible && openAnchorFrequency !== null && (",
+    );
+    expect(source).toContain("{renderAnchorStep(openAnchorFrequency)}");
+    // La sección de la PANTALLA no puede volver: si alguien la re-agrega, este
+    // control negativo falla (la mudanza es de lugar, no de regla).
+    expect(source).not.toContain('>Anclaje por cadencia</h2>');
 
     // Con el anclaje puesto se muestra en SOLO LECTURA: la rama del declarado
     // devuelve antes de llegar al formulario.
@@ -13549,6 +13562,36 @@ describe("payroll: el anclaje por cadencia de punta a punta (T5)", () => {
       "La declaración de este anclaje ya está cerrada: la cadencia tiene períodos registrados, y el primero es la evidencia de hasta cuándo se pagó.",
     );
     expect(source).toContain("if (windowClosed) {");
+  });
+
+  it("T6: la pantalla deja dos vistas y dos acciones, y las secciones que se fueron no vuelven", () => {
+    const source = readFileSync(
+      join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
+      "utf8",
+    );
+
+    // Decisión 3: la vista de nivel superior. La consulta (pagos del mes) sale de
+    // la operación diaria a su propia pestaña, con la MISMA primitiva del
+    // proyecto (su contrato ARIA no puede quedar a medias).
+    expect(source).toContain('<TabsTrigger value="periodos">Períodos</TabsTrigger>');
+    expect(source).toContain('<TabsTrigger value="pagos-mes">Pagos del mes</TabsTrigger>');
+    expect(source).toContain('<TabsPanel value="periodos" className={sectionClass}>');
+    expect(source).toContain('<TabsPanel value="pagos-mes" className={sectionClass}>');
+    // La consulta va "con su contenido tal cual": el rótulo propio sigue ahí.
+    expect(source).toContain(
+      '<h2 className="text-lg font-semibold">Pagos del mes por empleado</h2>',
+    );
+    // Decisión 2: «Pagos extraordinarios» sale de la vista principal como BOTÓN
+    // en el encabezado de períodos, y abre el diálogo que ya existía. El registro
+    // no se borra: sigue dentro de ese diálogo.
+    expect(source).toContain("Pago extraordinario");
+    expect(source).toContain("setExtraDialogOpen(true);");
+    expect(source).toContain("Pagos extraordinarios registrados");
+    // CONTROL NEGATIVO: ninguna de las dos secciones apiladas sobrevive en la
+    // vista principal (si alguien las re-agrega, esto falla).
+    expect(source).not.toContain(
+      '<h2 className="text-lg font-semibold">Pagos extraordinarios</h2>',
+    );
   });
 
   it("los días absorbidos salen del DATO —lectura o regla pura— y nunca de un rango escrito a mano", () => {
