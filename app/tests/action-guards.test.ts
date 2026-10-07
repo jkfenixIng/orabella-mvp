@@ -798,6 +798,13 @@ const SURFACES: readonly SurfaceSpec[] = [
     roles: ["admin"],
     why: "F10: lee desde cuándo existe la nómina de la sede. Es configuración de nómina (y el piso de los ciclos que se ofrecen), no del recibo del empleado: la caja no entra. G3b: la ESCRITURA salió de nómina; esta fila cubre solo la lectura que el aviso y el diálogo necesitan.",
   },
+  {
+    file: PAYROLL_ACTIONS_FILE,
+    name: "setPayrollCadenceAnchorAction",
+    kind: "payroll",
+    roles: ["admin"],
+    why: "declara el anclaje por cadencia: marca días como YA pagados y decide plata (lo que no se declara pagado sigue ofreciéndose para liquidar). Es configuración de nómina de toda la sede y la caja no entra.",
+  },
   // ---- rutas de nómina: solo admin ----
   {
     file: "app/api/v1/payroll-periods/route.ts",

@@ -749,6 +749,14 @@ export async function openPayrollPeriod(
     // Cuando no hay ninguno, no hay arranque: lo declara esta liquidación (la
     // primera, y la única que puede mandarlo).
     const payrollStartDate = payrollHistoryFloor(sedePeriods);
+    // T5: el anclaje DECLARADO de ESTA cadencia —los días hasta él ya se
+    // pagaron—, nunca el piso: el piso dice desde cuándo HAY historia, no hasta
+    // cuándo se pagó. Se lee la declaración vigente tal cual la lee el aviso (una
+    // lectura para las tres cadencias) y se pasa al validador, que decide con la
+    // MISMA regla que el aviso: un ciclo cubierto se rechaza y uno a medias se
+    // abre recortado a `ancla + 1`. Esa coincidencia es la invariante del módulo.
+    const declaredAnchors = await getPayrollCadenceAnchors();
+    const cadenceAnchor = declaredAnchors[input.frequency]?.anchor ?? null;
     // F10: la ÚNICA decisión de la FORMA del rango que se persiste, y el mensaje
     // de todo rechazo sale de la misma función que la pantalla usa: el diálogo y
     // el servicio no pueden decir cosas distintas del mismo ciclo.
@@ -759,11 +767,19 @@ export async function openPayrollPeriod(
       declaredStartDate: input.declared_start_date ?? null,
       periods: sedePeriods,
       referenceDate: bogotaDay(),
+      // El anclaje declarado de la cadencia, ya ajustado al sábado.
+      cadenceAnchor,
     });
     if (!resolution.ok) {
       throw new PayrollError(
         "VALIDATION",
-        openPayrollRejectionMessage(resolution.reason, { payrollStartDate, cycle }),
+        // El ancla viaja al mensaje: el rechazo por cobertura tiene que nombrar
+        // la fecha que la declaración fijó, no sólo el ciclo que no se abre.
+        openPayrollRejectionMessage(resolution.reason, {
+          payrollStartDate,
+          cycle,
+          anchor: cadenceAnchor,
+        }),
         400,
       );
     }
@@ -1356,7 +1372,12 @@ export async function listPayrollOverview(): Promise<PayrollOverview> {
     // cadencia: el aviso de pendientes necesita saber quién cobra con cada
     // cadencia y cuántos son. Va en paralelo con los ítems, así que no serializa
     // la lectura. Un fallo de cualquiera de las dos se propaga igual.
-    const [items, employees] = await Promise.all([
+    //
+    // T5: el anclaje DECLARADO de cada cadencia entra en la MISMA tanda de
+    // lecturas. El aviso lo necesita para no pedir un ciclo ya cubierto, y es la
+    // MISMA lectura que la pantalla recibe por SSR: el resumen de la sede y el
+    // aviso del cliente no pueden discrepar sobre qué ciclos faltan.
+    const [items, employees, declaredAnchors] = await Promise.all([
       readPaidItemsOfPeriods({
         db,
         periodIds: periods.map((period) => period.id),
@@ -1364,6 +1385,7 @@ export async function listPayrollOverview(): Promise<PayrollOverview> {
         meta: {},
       }),
       listAllEmployees(),
+      getPayrollCadenceAnchors(),
     ]);
 
     const byPeriod = new Map<string, PaidPayrollItem[]>();
@@ -1383,6 +1405,11 @@ export async function listPayrollOverview(): Promise<PayrollOverview> {
         periods,
         employees,
         referenceDate: bogotaDay(),
+        // T5: el anclaje declarado de cada cadencia (nunca el piso, que no es
+        // cobertura): un ciclo que cierra en o antes del ancla ya está pagado y
+        // no se reporta; uno que la contiene se reporta recortado a `ancla + 1`,
+        // que es el mismo rango que la apertura va a persistir.
+        anchors: declaredAnchorDays(declaredAnchors),
       }),
     };
   } catch (error) {
@@ -3510,6 +3537,24 @@ function cadenceAnchorsFromPayloads(payloads: Map<string, unknown>): PayrollCade
     };
   }
   return anchors;
+}
+
+/**
+ * T5: los anclajes DECLARADOS, por cadencia, en la forma que consumen las reglas
+ * puras (`Partial<Record<PayFrequency, string | null>>`): el ancla ya ajustada al
+ * sábado. El PISO GLOBAL no entra acá —no es cobertura, es desde cuándo HAY
+ * historia—, así que una cadencia sin declaración queda fuera del mapa y su
+ * comportamiento es el de siempre.
+ */
+function declaredAnchorDays(
+  anchors: PayrollCadenceAnchors,
+): Partial<Record<PayFrequency, string | null>> {
+  const days: Partial<Record<PayFrequency, string | null>> = {};
+  for (const frequency of payFrequencySchema.options) {
+    const anchor = anchors[frequency];
+    if (anchor !== undefined) days[frequency] = anchor.anchor;
+  }
+  return days;
 }
 
 /**

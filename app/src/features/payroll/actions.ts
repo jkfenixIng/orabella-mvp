@@ -29,6 +29,7 @@ import {
   requirePayrollAdmin,
   requirePayrollPayer,
   requirePayrollViewer,
+  setPayrollCadenceAnchor,
   setVoucherLimits,
 } from "./service";
 
@@ -275,6 +276,28 @@ export async function getPayrollStartDateAction() {
   try {
     await requirePayrollAdmin(await sessionToken());
     const data = await getPayrollStartDate();
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
+ * T5 (2026-10-06): declara el anclaje de UNA cadencia — «¿hasta qué día se
+ * pagaron los sueldos de este grupo?».
+ *
+ * Misma lógica y misma guarda que el resto de la escritura de nómina
+ * (`requirePayrollAdmin`): declarar cobertura decide plata —marca días como ya
+ * pagados—, así que la caja no entra al módulo. El actor sale de la sesión, no
+ * del envío, para que la auditoría diga quién lo declaró de verdad. El servicio
+ * valida el día con la MISMA regla que lo lee, respeta la ventana de reparación
+ * y audita el cambio; el cliente muestra su `message` y nunca el código
+ * interno.
+ */
+export async function setPayrollCadenceAnchorAction(input: unknown) {
+  try {
+    const session = await requirePayrollAdmin(await sessionToken());
+    const data = await setPayrollCadenceAnchor(input, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

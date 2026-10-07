@@ -17,9 +17,12 @@ import {
   openPayrollPeriodAction,
   payPayrollExtraAction,
   payPayrollItemAction,
+  setPayrollCadenceAnchorAction,
 } from "@/src/features/payroll/actions";
 import { getInvoiceAction } from "@/src/features/billing/actions";
 import type {
+  PayrollCadenceAnchorConfirmed,
+  PayrollCadenceAnchors,
   PayrollExtraRow,
   PayrollPeriodCorrectionResult,
   PayrollPeriodRow,
@@ -33,6 +36,7 @@ import type { InvoiceDetail } from "@/src/features/billing/service";
 import {
   ADJUSTMENT_REASON_MAX_LENGTH,
   buildPayrollEmployeeIndex,
+  cadenceAnchorFromDeclaration,
   cycleDaysForFrequency,
   declaredStartForFirstLiquidation,
   detailLineCommissionOrigin,
@@ -40,6 +44,7 @@ import {
   groupPayrollPeriodsByMonth,
   isPayrollCycleSettled,
   isRangeBeforePayrollStart,
+  normalizePayFrequency,
   openPayrollRejectionMessage,
   payrollCycleRange,
   payrollEmployeeName,
@@ -49,6 +54,7 @@ import {
   payrollMonthLabel,
   payrollPeriodCountLabel,
   payrollTrimmedCycle,
+  payFrequencySchema,
   pendingPayrollSettlements,
   periodCadenceBucket,
   periodCadenceFilterLabel,
@@ -63,6 +69,7 @@ import {
   summarizePayrollItems,
   type PayrollCorrectionView,
   type PayrollExtraKind,
+  type PayFrequency,
   type PayrollItemTotals,
   type PayrollMonthEmployeeRow,
   type PayrollMonthGroup,
@@ -299,6 +306,46 @@ function trimmedCycleNote(entry: PendingPayrollSettlement): string | null {
   return `Primer ciclo recortado: paga ${cycle.days} de ${cycle.cycleDays} días del ciclo ${entry.frequency}, porque la nómina arrancó dentro del rango.`;
 }
 
+const ANCHOR_WINDOW_CLOSED_TEXT =
+  "La declaración de este anclaje ya está cerrada: la cadencia tiene períodos registrados, y el primero es la evidencia de hasta cuándo se pagó.";
+
+/**
+ * T5 (decisión 1 del dueño: «no esconderlo»): la línea de los días que el ajuste
+ * al sábado ABSORBE. Los números salen del DATO —`absorbedFrom`/`absorbedDays`,
+ * del anclaje leído en la base o de la regla pura en la vista previa— y nunca de
+ * un rango escrito a mano: el ajuste declara pagados días que nadie declaró, así
+ * que la pantalla tiene que decir cuántos y cuáles, no esconderlo en una frase.
+ */
+function absorbedDaysText(anchor: {
+  anchor: string;
+  absorbedFrom: string;
+  absorbedDays: number;
+}): string {
+  if (anchor.absorbedDays === 0) {
+    return `El ajuste al sábado absorbe ${anchor.absorbedDays} días: el día declarado ya cae en sábado.`;
+  }
+  const days = anchor.absorbedDays === 1 ? "1 día" : `${anchor.absorbedDays} días`;
+  return `El ajuste al sábado absorbe ${days}: del ${formatFullDate(anchor.absorbedFrom)} al ${formatFullDate(anchor.anchor)} también quedan declarados como pagados.`;
+}
+
+/**
+ * T5: los anclajes DECLARADOS —el ancla ya ajustada al sábado— en la forma que
+ * consumen las reglas puras del módulo (`PendingPayrollSettlement` y
+ * `resolveOpenPayrollRange`). El piso global NO entra: no es cobertura. La cuenta
+ * es la misma que hace el servicio para el resumen de la sede, para que el aviso
+ * del cliente y el del servidor no puedan discrepar.
+ */
+function declaredAnchorDays(
+  anchors: PayrollCadenceAnchors,
+): Partial<Record<PayFrequency, string | null>> {
+  const days: Partial<Record<PayFrequency, string | null>> = {};
+  for (const frequency of payFrequencySchema.options) {
+    const anchor = anchors[frequency];
+    if (anchor !== undefined) days[frequency] = anchor.anchor;
+  }
+  return days;
+}
+
 /**
  * F4: primer período que COLISIONA con [start, end]: comparte días y cae en el
  * MISMO cubo de cadencia (`coalesce(frequency, '')`, el de la restricción de
@@ -374,6 +421,13 @@ interface PayrollClientProps {
    * Agregan plata de TODA la planta, así que llegan vacíos para el empleado.
    */
   initialSummaries: PayrollPeriodSummary[];
+  /**
+   * T5: los anclajes DECLARADOS por cadencia, ya derivados por el servicio —el
+   * día declarado, el ancla ajustada al sábado y los días absorbidos—. Llegan
+   * del servidor (una sola lectura para las tres cadencias) y sólo los usa la
+   * superficie del admin; para el empleado van vacíos.
+   */
+  initialCadenceAnchors: PayrollCadenceAnchors;
   methods: PaymentMethodRow[];
   canAdmin: boolean;
   canPay: boolean;
@@ -1251,6 +1305,47 @@ export function PayrollClient(props: PayrollClientProps) {
    */
   const payrollStartDate = payrollHistoryFloor(periods);
 
+  /**
+   * T5: el anclaje DECLARADO por cadencia. Arranca con lo que el servidor leyó y
+   * se PISA sólo con lo que la declaración devuelve CONFIRMADO por la base: el
+   * cliente no deriva su propia versión del ancla ajustada ni de los días
+   * absorbidos, así que lo que muestra es lo mismo que el servicio va a aplicar.
+   */
+  const [cadenceAnchors, setCadenceAnchors] = useState<PayrollCadenceAnchors>(
+    props.initialCadenceAnchors,
+  );
+  /**
+   * T5: los anclajes declarados, en la forma que consumen las reglas puras del
+   * módulo. El piso global no entra acá: no es cobertura. Es la MISMA cuenta que
+   * el resumen de la sede (servicio), así que el aviso del cliente y el del
+   * servidor no pueden discrepar sobre qué ciclos faltan.
+   */
+  const declaredAnchors = declaredAnchorDays(cadenceAnchors);
+  /**
+   * T5 (decisión 3): las cadencias en las que el anclaje se PREGUNTA —y se
+   * muestra— son las que tienen al menos un empleado ACTIVO. Sin gente de esa
+   * cadencia no hay nada que liquidar y la pregunta es ruido; un legajo dado de
+   * baja tampoco la sostiene (la MISMA condición de la regla 1 del aviso de
+   * pendientes).
+   */
+  const activeCadences = payFrequencySchema.options.filter((frequency) =>
+    props.initialEmployees.some(
+      (employee) =>
+        employee.is_active !== false && normalizePayFrequency(employee.pay_frequency) === frequency,
+    ),
+  );
+  /** Lo que se está escribiendo en el campo de declaración de cada cadencia. */
+  const [anchorDrafts, setAnchorDrafts] = useState<Partial<Record<PayFrequency, string>>>({});
+  /**
+   * El error de cada declaración, por cadencia. Es el MENSAJE del servicio, no
+   * su código: `CADENCE_ANCHOR_*` es vocabulario interno y no se imprime en
+   * pantalla (el defecto AUTH-01 fue exactamente lo contrario: mostrarle al
+   * usuario un código que no puede resolver).
+   */
+  const [anchorErrors, setAnchorErrors] = useState<Partial<Record<PayFrequency, string>>>({});
+  /** La cadencia cuya declaración está en vuelo (bloquea sólo su propio botón). */
+  const [anchorBusy, setAnchorBusy] = useState<PayFrequency | null>(null);
+
   // F10: abrir un período NO se pregunta el rango. La única entrada al diálogo
   // es la lista de ciclos pendientes: su ciclo queda ELEGIDO y el rango se
   // DERIVA del ciclo y del arranque. `openTarget` es ese ciclo pendiente.
@@ -1533,6 +1628,54 @@ export function PayrollClient(props: PayrollClientProps) {
     setOpenDialogOpen(true);
   }
 
+  /**
+   * T5: declara el anclaje de UNA cadencia («hasta qué día se pagaron los
+   * sueldos de este grupo»).
+   *
+   * El éxito PISA el anclaje local con lo que la base CONFIRMÓ —el ancla
+   * ajustada al sábado y los días absorbidos, que son los que la pantalla
+   * muestra—: el cliente no re-deriva la regla. El error que se muestra es el
+   * MENSAJE del servicio y nunca su código: `CADENCE_ANCHOR_*` es vocabulario
+   * interno, no algo que el admin pueda resolver.
+   */
+  async function declareCadenceAnchor(event: FormEvent, frequency: PayFrequency) {
+    event.preventDefault();
+    setAnchorBusy(frequency);
+    const result = (await setPayrollCadenceAnchorAction({
+      frequency,
+      paid_through: (anchorDrafts[frequency] ?? "").trim(),
+    })) as ActionResult<PayrollCadenceAnchorConfirmed>;
+    setAnchorBusy(null);
+    if (!result.success) {
+      setAnchorErrors((prev) => ({ ...prev, [frequency]: result.message }));
+      return;
+    }
+    setCadenceAnchors((prev) => ({
+      ...prev,
+      [frequency]: {
+        paidThrough: result.data.paidThrough,
+        anchor: result.data.anchor,
+        absorbedFrom: result.data.absorbedFrom,
+        absorbedDays: result.data.absorbedDays,
+      },
+    }));
+    setAnchorDrafts((prev) => {
+      const next = { ...prev };
+      delete next[frequency];
+      return next;
+    });
+    setAnchorErrors((prev) => {
+      const next = { ...prev };
+      delete next[frequency];
+      return next;
+    });
+    // EVENTO: la declaración quedó guardada. El aviso de ciclos pendientes y la
+    // apertura ya leen el anclaje nuevo en este mismo render.
+    toast.success(
+      `Anclaje ${periodCadenceLabel(frequency)} declarado: cubre hasta el ${formatFullDate(result.data.anchor)}.`,
+    );
+  }
+
   async function handleOpen(event: FormEvent) {
     event.preventDefault();
     if (openTarget === null) {
@@ -1553,6 +1696,10 @@ export function PayrollClient(props: PayrollClientProps) {
           : openPayrollRejectionMessage(openResolution.reason, {
               payrollStartDate,
               cycle: openCycle,
+              // T5: el ancla de la cadencia elegida, para que el rechazo por
+              // cobertura nombre la fecha declarada —el MISMO texto que el
+              // servicio responde si el envío llegara igual.
+              anchor: declaredAnchors[openTarget.frequency] ?? null,
             }),
       );
       return;
@@ -2085,6 +2232,11 @@ export function PayrollClient(props: PayrollClientProps) {
   const declaredMax = openCycle
     ? [openCycle.end_date, bogotaDay()].sort()[0]
     : "";
+  // Anclaje por cadencia (T5): la MISMA regla y el MISMO anclaje declarado que el
+  // servicio aplica antes del INSERT. Un ciclo que cierra en o antes del ancla ya
+  // está pagado y no se abre; uno que la contiene se abre recortado a
+  // `ancla + 1`, que es el mismo rango que el aviso reporta. El PISO no entra
+  // acá: el piso dice desde cuándo HAY historia, no hasta cuándo se pagó.
   const openResolution =
     openTarget === null
       ? null
@@ -2095,6 +2247,7 @@ export function PayrollClient(props: PayrollClientProps) {
           declaredStartDate,
           periods,
           referenceDate: bogotaDay(),
+          cadenceAnchor: declaredAnchors[openTarget.frequency] ?? null,
         });
   const startDate = openResolution?.ok ? openResolution.start_date : "";
   const endDate = openResolution?.ok ? openResolution.end_date : "";
@@ -2190,11 +2343,17 @@ export function PayrollClient(props: PayrollClientProps) {
    * últimos ciclos cerrados de cada cadencia. Es la MISMA función que el
    * servicio, así que el aviso y el resumen no pueden discrepar.
    */
+  // T5: los anclajes DECLARADOS por cadencia. Un ciclo que cierra en o antes del
+  // ancla ya está pagado, así que el aviso deja de pedirlo; uno que la contiene se
+  // reporta recortado a `ancla + 1`. Es la MISMA regla y los MISMOS anclajes con
+  // los que el servicio arma el resumen de la sede y con los que la apertura
+  // valida el ciclo, así que el aviso y el resumen no pueden discrepar.
   const pendingSettlements = props.canAdmin
     ? pendingPayrollSettlements({
         periods,
         employees: props.initialEmployees,
         referenceDate: bogotaDay(),
+        anchors: declaredAnchors,
       })
     : [];
 
@@ -2548,6 +2707,123 @@ export function PayrollClient(props: PayrollClientProps) {
           renderPeriodList(visiblePeriods)
         )}
       </section>
+
+      {/*
+        T5 (decisión 3 del dueño, 2026-10-05): el anclaje por cadencia se declara
+        UNA vez y sólo por cadencia CON GENTE ACTIVA —sin empleados de esa
+        cadencia no hay nada que liquidar y la pregunta es ruido—. Con el anclaje
+        puesto se muestra en solo lectura, y si esa cadencia ya tiene períodos el
+        campo se reemplaza por el aviso de la ventana de reparación: el servicio
+        rechaza la declaración (`CADENCE_ANCHOR_LOCKED`) y ofrecer un campo que va
+        a fallar sería mentirle a quien lo usa. Los días que el ajuste al sábado
+        absorbe (decisión 1: «no esconderlo») se muestran en los dos estados,
+        con los números del dato.
+      */}
+      {props.canAdmin && activeCadences.length > 0 && (
+        <section className={sectionClass}>
+          <h2 className="text-lg font-semibold">Anclaje por cadencia</h2>
+          <p className="mt-2 text-sm text-text-secondary">
+            Hasta qué día se pagaron los sueldos de cada grupo. No es la fecha del pago: es el último
+            día consumido y pagado de esa cadencia, y existe para que la primera liquidación no vuelva
+            a pagar días ya pagados.
+          </p>
+          {activeCadences.map((frequency) => {
+            const declared = cadenceAnchors[frequency];
+            // La ventana de reparación se cierra con el primer período de ESA
+            // cadencia: el período es la evidencia de hasta cuándo se pagó.
+            const windowClosed = filterPeriodsByCadence(periods, frequency).length > 0;
+            if (declared !== undefined) {
+              return (
+                <div key={frequency} className="mt-4">
+                  <p className="text-sm font-medium text-text-primary">
+                    {periodCadenceLabel(frequency)}
+                  </p>
+                  <p className="mt-1 text-sm text-text-secondary">
+                    {`Declarado pagado hasta el ${formatFullDate(declared.paidThrough)}. El anclaje vigente es el ${formatFullDate(declared.anchor)}: el último día cubierto de esta cadencia.`}
+                  </p>
+                  <p className="mt-1 text-sm text-text-secondary">{absorbedDaysText(declared)}</p>
+                  {windowClosed && (
+                    <p className="mt-1 text-xs text-text-tertiary">{ANCHOR_WINDOW_CLOSED_TEXT}</p>
+                  )}
+                </div>
+              );
+            }
+            if (windowClosed) {
+              return (
+                <div key={frequency} className="mt-4">
+                  <p className="text-sm font-medium text-text-primary">
+                    {periodCadenceLabel(frequency)}
+                  </p>
+                  <p className="mt-1 text-sm text-text-secondary">{ANCHOR_WINDOW_CLOSED_TEXT}</p>
+                </div>
+              );
+            }
+            const draft = anchorDrafts[frequency] ?? "";
+            // La vista previa aplica la MISMA regla que el servicio
+            // (`cadenceAnchorFromDeclaration`): el ancla ajustada al sábado y
+            // los días absorbidos que se van a guardar, antes de enviar.
+            const preview = cadenceAnchorFromDeclaration({
+              paidThrough: draft,
+              referenceDate: bogotaDay(),
+            });
+            const error = anchorErrors[frequency];
+            return (
+              <form
+                key={frequency}
+                className="mt-4"
+                onSubmit={(event) => declareCadenceAnchor(event, frequency)}
+              >
+                <label className={labelClass} htmlFor={`payroll-anchor-${frequency}`}>
+                  {`¿Hasta qué día se pagaron los sueldos de este grupo? (${periodCadenceLabel(frequency)})`}
+                  <input
+                    id={`payroll-anchor-${frequency}`}
+                    type="date"
+                    value={draft}
+                    max={bogotaDay()}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setAnchorDrafts((prev) => ({ ...prev, [frequency]: value }));
+                      setAnchorErrors((prev) => {
+                        const next = { ...prev };
+                        delete next[frequency];
+                        return next;
+                      });
+                    }}
+                    className={inputClass}
+                  />
+                  <span className="text-xs font-normal text-text-tertiary">
+                    El último día consumido y pagado de esta cadencia, no la fecha del pago. El ajuste al
+                    sábado corre el anclaje hacia adelante.
+                  </span>
+                </label>
+                {draft.trim() !== "" && !preview.ok && (
+                  <p className="mt-1 text-sm text-text-secondary">
+                    {preview.reason === "anchor-in-the-future"
+                      ? "Ese día todavía no pasó: el anclaje declara días ya pagados, así que no puede ser una fecha futura."
+                      : "Escriba una fecha del calendario (aaaa-mm-dd)."}
+                  </p>
+                )}
+                {preview.ok && (
+                  <>
+                    <p className="mt-1 text-sm text-text-secondary">
+                      {`El anclaje vigente queda el ${formatFullDate(preview.anchor)}.`}
+                    </p>
+                    <p className="mt-1 text-sm text-text-secondary">{absorbedDaysText(preview)}</p>
+                  </>
+                )}
+                {error !== undefined && <p className="mt-1 text-sm text-error">{error}</p>}
+                <button
+                  type="submit"
+                  className={`${buttonClass} mt-2`}
+                  disabled={anchorBusy === frequency || draft.trim() === ""}
+                >
+                  Declarar anclaje
+                </button>
+              </form>
+            );
+          })}
+        </section>
+      )}
 
       {/*
         PA-2a: nómina individual por caso extraordinario. Es el REGISTRO

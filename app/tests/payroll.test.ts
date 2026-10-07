@@ -5764,10 +5764,12 @@ describe("payroll-client: el diálogo de apertura DERIVADO (F10, guarda de fuent
   it("el rango sale del ÚNICO validador, con el piso derivado y la fecha declarada", () => {
     // La MISMA función pura que aplica el servicio antes del INSERT: un ciclo
     // COMPLETO o el primer ciclo recortado —al PISO derivado si la cadencia no
-    // tiene períodos, a la fecha declarada en la primera liquidación—. El
-    // cliente no calcula su propia forma de rango.
+    // tiene períodos, a la fecha declarada en la primera liquidación, o al
+    // `ancla + 1` del anclaje declarado—. El cliente no calcula su propia forma
+    // de rango. T5: el anclaje declarado de la cadencia del ciclo elegido viaja
+    // a esa resolución (y no el piso: el piso no es cobertura).
     expect(client).toMatch(
-      /const openResolution =\s*openTarget === null\s*\? null\s*: resolveOpenPayrollRange\(\{\s*frequency: openTarget\.frequency,\s*cycleEndDate: openTarget\.end_date,\s*payrollStartDate: payrollStartDate,\s*declaredStartDate,\s*periods,\s*referenceDate: bogotaDay\(\),\s*\}\);/,
+      /const openResolution =\s*openTarget === null\s*\? null\s*: resolveOpenPayrollRange\(\{\s*frequency: openTarget\.frequency,\s*cycleEndDate: openTarget\.end_date,\s*payrollStartDate: payrollStartDate,\s*declaredStartDate,\s*periods,\s*referenceDate: bogotaDay\(\),\s*cadenceAnchor: declaredAnchors\[openTarget\.frequency\] \?\? null,\s*\}\);/,
     );
     // El rango mostrado y el enviado salen de esa resolución.
     expect(client).toContain("const startDate = openResolution?.ok ? openResolution.start_date : \"\";");
@@ -11962,8 +11964,10 @@ describe("payroll-client: el aviso de ciclos pendientes y la entrada DERIVADA de
     // misma función pura del servicio. Un `select` por cadencia sería N
     // consultas para el mismo dato, y una prop de servidor para el piso
     // quedaría VIEJA en cuanto el primer período se abre.
+    // T5: el anclaje DECLARADO viaja a la misma función (un ciclo cubierto deja
+    // de pedirse; uno a medias se reporta recortado a `ancla + 1`).
     expect(source).toMatch(
-      /const pendingSettlements = props\.canAdmin\s*\?\s*pendingPayrollSettlements\(\{\s*periods,\s*employees: props\.initialEmployees,\s*referenceDate: bogotaDay\(\),\s*\}\)/,
+      /const pendingSettlements = props\.canAdmin\s*\?\s*pendingPayrollSettlements\(\{\s*periods,\s*employees: props\.initialEmployees,\s*referenceDate: bogotaDay\(\),\s*anchors: declaredAnchors,\s*\}\)/,
     );
     // Sólo el admin: el aviso nombra a la planta de la instalación.
     expect(source).toContain("props.canAdmin && pendingSettlements.length > 0");
@@ -13162,6 +13166,451 @@ describe("payroll: el anclaje por cadencia en system_settings (T4, servicio)", (
     expect(fuente.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "")).not.toContain(
       '"payroll.cadence_anchor_set"',
     );
+  });
+});
+
+/* ==========================================================================
+   T5 — el anclaje se DECLARA desde la pantalla y las reglas ya construidas se
+   honran de punta a punta.
+
+   La declaración es UNA por cadencia con gente activa (decisión 3) y se muestra
+   en sólo lectura cuando ya existe; con un período de esa cadencia la ventana de
+   reparación la cierra —el servicio la rechaza con `CADENCE_ANCHOR_LOCKED` y la
+   pantalla dice eso en vez de ofrecer un campo que va a fallar—. Los días que el
+   ajuste al sábado absorbe (decisión 1: «no esconderlo») se muestran en los DOS
+   estados: la vista previa antes de enviar —con la regla pura— y la lectura
+   después. Este bloque prueba lo que se puede probar sin navegador: la
+   delegación de la acción con el actor de la sesión, el mapeo del error, que el
+   resumen de la sede y la apertura reciban el anclaje, y las guardas
+   estructurales de la pantalla. Ver `odd/tasks/nomina-anclaje-por-cadencia.md`.
+   ========================================================================== */
+describe("payroll: el anclaje por cadencia de punta a punta (T5)", () => {
+  const SEDE = payrollPagedStub.SEDE_ID;
+  const ACTOR: PayrollActor = { userId: "u-1", roles: ["admin"] };
+  /** Reloj congelado en el martes 2026-10-06: el último ciclo cerrado es el 3. */
+  const HOY = new Date("2026-10-06T15:00:00.000Z");
+
+  /** Las filas del anclaje que quedaron escritas en el doble. */
+  const settingRows = (): Array<Record<string, unknown>> =>
+    payrollPagedStub.tables.system_settings ?? [];
+  const settingValue = (key: string): unknown =>
+    settingRows().find((row) => row.key === key)?.value;
+  const auditEntries = (): Array<{ table: string; payload: unknown }> =>
+    payrollPagedStub.inserts.filter((entry) => entry.table === "audit_logs");
+  const periodInserts = () =>
+    payrollPagedStub.inserts.filter((entry) => entry.table === "payroll_periods");
+
+  /** Un período de una cadencia, para la ventana de reparación. */
+  function periodRow(frequency: string, id = `p-${frequency}`): Record<string, unknown> {
+    return {
+      id,
+      frequency,
+      start_date: "2026-09-06",
+      end_date: "2026-10-03",
+      status: "cerrado",
+    };
+  }
+
+  /** Un legajo ACTIVO de una cadencia, para el aviso y el resumen. */
+  function employeeRow(frequency: string): Record<string, unknown> {
+    return {
+      id: `emp-${frequency}`,
+      sede_id: SEDE,
+      user_id: null,
+      full_name: "Ana López",
+      employee_code: "E-01",
+      document: "1000",
+      phone: null,
+      position: null,
+      payout_mode: "normal",
+      email: null,
+      birth_date: null,
+      pay_type: "fijo",
+      pay_frequency: frequency,
+      salary_fixed: 1500000,
+      commission_percent: null,
+      is_active: true,
+    };
+  }
+
+  /** El anclaje declarado del mensual al sábado 26-sep, dentro del ciclo 06-sep→03-oct. */
+  const anclajeMensual = { key: "payroll_anchor_mensual", value: { paid_through: "2026-09-26" } };
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  // ------------------------------------------------------------ LA ACCIÓN ---
+
+  it("la acción declara con el actor de la SESIÓN y devuelve lo que la base confirmó", async () => {
+    payrollPagedStub.tables.system_settings = [];
+    payrollPagedStub.session = { userId: "u-admin", sedeId: SEDE, roles: ["admin"] };
+
+    const result = await payrollActions.setPayrollCadenceAnchorAction({
+      frequency: "mensual",
+      paid_through: "2026-09-30",
+    });
+
+    // Lo derivado viaja con la respuesta: el ancla ajustada al sábado y los días
+    // absorbidos, que son los que la pantalla muestra.
+    expect(result).toEqual({
+      success: true,
+      data: {
+        frequency: "mensual",
+        paidThrough: "2026-09-30",
+        anchor: "2026-10-03",
+        absorbedFrom: "2026-10-01",
+        absorbedDays: 3,
+      },
+    });
+    // Se guarda el día DECLARADO (el hecho), no el ancla ajustada.
+    expect(settingValue("payroll_anchor_mensual")).toEqual({ paid_through: "2026-09-30" });
+    // Y el rastro dice quién lo declaró: el actor sale de la sesión, no del envío.
+    expect(auditEntries()[0]?.payload).toMatchObject({
+      user_id: "u-admin",
+      action: "payroll.cadence_anchor_set",
+    });
+  });
+
+  it("los rechazos vuelven con el código del módulo y un MENSAJE que no lo repite, sin escribir", async () => {
+    payrollPagedStub.session = { userId: "u-admin", sedeId: SEDE, roles: ["admin"] };
+    const casos = [
+      { input: { frequency: "mensual", paid_through: "no-es-fecha" }, code: "CADENCE_ANCHOR_NOT_A_DAY" },
+      { input: { frequency: "mensual", paid_through: "2099-12-31" }, code: "CADENCE_ANCHOR_IN_THE_FUTURE" },
+      { input: { frequency: "diaria", paid_through: "2026-09-30" }, code: "CADENCE_ANCHOR_UNKNOWN_CADENCE" },
+    ];
+
+    for (const caso of casos) {
+      payrollPagedStub.tables.system_settings = [];
+
+      const result = await payrollActions.setPayrollCadenceAnchorAction(caso.input);
+
+      expect(result).toMatchObject({ success: false, code: caso.code });
+      if (result.success) throw new Error("una declaración inválida tenía que rechazarse");
+      // El código es vocabulario del módulo; lo que la pantalla muestra es el
+      // MENSAJE, y por eso no puede volver a nombrar el código.
+      expect(result.message).not.toContain("CADENCE_ANCHOR");
+      expect(result.message.length).toBeGreaterThan(20);
+      // Nada se escribió: ni la fila ni el rastro de un cambio que no ocurrió.
+      expect(settingRows()).toEqual([]);
+      expect(auditEntries()).toHaveLength(0);
+    }
+  });
+
+  it("la ventana de reparación: con un período de ESA cadencia la acción rechaza, sin escribir", async () => {
+    payrollPagedStub.session = { userId: "u-admin", sedeId: SEDE, roles: ["admin"] };
+    payrollPagedStub.tables.system_settings = [];
+    payrollPagedStub.tables.payroll_periods = [periodRow("mensual")];
+
+    const result = await payrollActions.setPayrollCadenceAnchorAction({
+      frequency: "mensual",
+      paid_through: "2026-09-30",
+    });
+
+    expect(result).toMatchObject({ success: false, code: "CADENCE_ANCHOR_LOCKED" });
+    if (result.success) throw new Error("la cadencia con períodos no admite declaración");
+    expect(result.message).toContain("mensual");
+    expect(result.message).toContain("período");
+    expect(settingRows()).toEqual([]);
+  });
+
+  it("sólo el admin declara: la caja y el empleado no escriben nada", async () => {
+    payrollPagedStub.tables.system_settings = [];
+    // La caja abre vales, no nómina; el empleado ve su recibo. La declaración
+    // decide plata, así que la guarda es la del admin —la MISMA del resto de la
+    // escritura del módulo— y sin ella no se escribe ni una fila.
+    payrollPagedStub.session = { userId: "u-caja", sedeId: SEDE, roles: ["caja"] };
+    expect(
+      await payrollActions.setPayrollCadenceAnchorAction({
+        frequency: "mensual",
+        paid_through: "2026-09-30",
+      }),
+    ).toMatchObject({ success: false, code: "FORBIDDEN" });
+    payrollPagedStub.session = { userId: "u-emp", sedeId: SEDE, roles: ["empleado"] };
+    expect(
+      await payrollActions.setPayrollCadenceAnchorAction({
+        frequency: "mensual",
+        paid_through: "2026-09-30",
+      }),
+    ).toMatchObject({ success: false, code: "FORBIDDEN" });
+    expect(settingRows()).toEqual([]);
+  });
+
+  // --------------------------------------------------- EL RESUMEN Y EL AVISO ---
+
+  it("el resumen de la sede honra el anclaje: el ciclo cubierto deja de pedirse y el parcial se recorta", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(HOY);
+    try {
+      payrollPagedStub.tables.payroll_periods = [];
+      payrollPagedStub.tables.employees = [employeeRow("mensual")];
+      // CONTROL NEGATIVO: sin anclaje declarado, el mensual arrastra sus tres
+      // ciclos cerrados. Es el comportamiento de hoy, intacto.
+      payrollPagedStub.tables.system_settings = [];
+      const sinAnclaje = await listPayrollOverview();
+      expect(sinAnclaje.pendingSettlements.map((row) => `${row.start_date}..${row.end_date}`)).toEqual([
+        "2026-07-12..2026-08-08",
+        "2026-08-09..2026-09-05",
+        "2026-09-06..2026-10-03",
+      ]);
+
+      // El anclaje declarado —26-sep, un sábado que cae DENTRO del ciclo mensual
+      // 06-sep→03-oct—: los ciclos que cierran en o antes del ancla ya están
+      // pagados y no se reportan; el que la contiene se reporta recortado a
+      // `ancla + 1`. Es el mismo dato que la pantalla recibe por SSR.
+      payrollPagedStub.tables.system_settings = [anclajeMensual];
+      const lecturasAntes = payrollPagedStub.windows.filter(
+        (window) => window.table === "system_settings",
+      ).length;
+      const conAnclaje = await listPayrollOverview();
+
+      expect(conAnclaje.pendingSettlements).toEqual([
+        {
+          frequency: "mensual",
+          start_date: "2026-09-27",
+          end_date: "2026-10-03",
+          label: "27 sep – 3 oct 2026",
+          employeeCount: 1,
+          employeeNames: ["Ana López"],
+        },
+      ]);
+      // UNA lectura de las tres claves, la MISMA que la pantalla recibe.
+      expect(
+        payrollPagedStub.windows.filter((window) => window.table === "system_settings").length -
+          lecturasAntes,
+      ).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("la cobertura es POR CADENCIA: el anclaje del mensual no cubre al quincenal", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(HOY);
+    try {
+      // Las dos cadencias tienen gente; sólo el mensual declaró anclaje.
+      payrollPagedStub.tables.payroll_periods = [];
+      payrollPagedStub.tables.employees = [employeeRow("mensual"), employeeRow("quincenal")];
+      payrollPagedStub.tables.system_settings = [{ ...anclajeMensual }];
+
+      const overview = await listPayrollOverview();
+
+      // El mensual queda cubierto hasta el ancla (una sola entrada, recortada) y
+      // el quincenal conserva su atraso completo: la declaración de UNA cadencia
+      // no es la de las otras.
+      expect(overview.pendingSettlements.map((row) => row.frequency)).toEqual([
+        "quincenal",
+        "quincenal",
+        "quincenal",
+        "mensual",
+      ]);
+      expect(
+        overview.pendingSettlements.find((row) => row.frequency === "mensual"),
+      ).toMatchObject({ start_date: "2026-09-27", end_date: "2026-10-03" });
+      // Y los ciclos quincenales que CIERRAN en o antes del ancla del mensual
+      // siguen reportándose: nadie declaró que el quincenal esté pagado.
+      expect(
+        overview.pendingSettlements.filter((row) => row.frequency === "quincenal").map(
+          (row) => row.end_date,
+        ),
+      ).toEqual(["2026-09-05", "2026-09-19", "2026-10-03"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ----------------------------------------------------------- LA APERTURA ---
+
+  it("la apertura honra el anclaje: el ciclo cubierto se rechaza con su mensaje y el parcial se abre recortado", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(HOY);
+    try {
+      payrollPagedStub.tables.payroll_periods = [];
+      payrollPagedStub.tables.employees = [];
+      payrollPagedStub.tables.system_settings = [anclajeMensual];
+
+      // El ciclo mensual 09-ago→05-sep CIERRA en o antes del ancla 26-sep: no
+      // tiene días pagables y la apertura lo rechaza con el motivo de cobertura
+      // y su mensaje, que nombra el ancla.
+      const cubierto: unknown = await openPayrollPeriod(
+        SEDE,
+        { frequency: "mensual", cycle_end_date: "2026-09-05" },
+        ACTOR,
+      ).catch((error: unknown) => error);
+      expect(cubierto).toBeInstanceOf(PayrollError);
+      expect(cubierto).toMatchObject({ code: "VALIDATION", status: 400 });
+      expect((cubierto as PayrollError).message).toContain("Ya se declaró pagado hasta el 2026-09-26");
+      expect((cubierto as PayrollError).message).toContain("2026-08-09 a 2026-09-05");
+      expect(periodInserts()).toHaveLength(0);
+
+      // CONTROL NEGATIVO: sin el anclaje, ese MISMO ciclo se rechaza por la regla
+      // de siempre —la primera liquidación declara el arranque—, no por cobertura.
+      payrollPagedStub.tables.system_settings = [];
+      const sinAnclaje: unknown = await openPayrollPeriod(
+        SEDE,
+        { frequency: "mensual", cycle_end_date: "2026-09-05" },
+        ACTOR,
+      ).catch((error: unknown) => error);
+      expect(sinAnclaje).toBeInstanceOf(PayrollError);
+      expect((sinAnclaje as PayrollError).message).toContain(
+        "La primera liquidación declara desde qué día opera la nómina",
+      );
+      expect((sinAnclaje as PayrollError).message).not.toContain("Ya se declaró pagado hasta");
+
+      // El ciclo que CONTIENE el ancla se abre recortado a `ancla + 1`.
+      payrollPagedStub.tables.system_settings = [{ ...anclajeMensual }];
+      const creado = await openPayrollPeriod(
+        SEDE,
+        { frequency: "mensual", cycle_end_date: "2026-10-03" },
+        ACTOR,
+      );
+      expect(creado).toMatchObject({
+        start_date: "2026-09-27",
+        end_date: "2026-10-03",
+        frequency: "mensual",
+      });
+
+      // LA INVARIANTE DEL MÓDULO: el aviso reporta EXACTAMENTE el rango que la
+      // apertura persiste, con los mismos anclajes. Si divergieran, el alerta
+      // pediría liquidar un rango que la apertura no acepta (o al revés).
+      const aviso = pendingPayrollSettlements({
+        periods: [],
+        employees: [{ full_name: "Ana López", pay_frequency: "mensual", is_active: true }],
+        // El mismo día congelado del reloj de este caso (martes 2026-10-06).
+        referenceDate: "2026-10-06",
+        anchors: { mensual: "2026-09-26" },
+      });
+      expect(aviso.map((entry) => `${entry.start_date}..${entry.end_date}`)).toEqual([
+        `${creado.start_date}..${creado.end_date}`,
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // -------------------------------------------------- LA PANTALLA (FUENTE) ---
+
+  it("la página le manda al cliente los anclajes ya derivados, y sólo al admin", () => {
+    const page = readFileSync(join(process.cwd(), "app", "payroll", "page.tsx"), "utf8");
+    const client = readFileSync(join(process.cwd(), "app", "payroll", "payroll-client.tsx"), "utf8");
+    // La declaración decide plata y la muestra sólo el admin (el empleado ve su
+    // recibo): no se le lee de más a quien no la usa.
+    expect(page).toContain("canAdmin ? getPayrollCadenceAnchors() : null,");
+    expect(page).toContain("initialCadenceAnchors={cadenceAnchors ?? {}}");
+    // El cliente recibe el TIPO con todo lo derivado (ancla ajustada y días
+    // absorbidos), no una fecha suelta con la que re-derivar la regla.
+    expect(client).toContain("initialCadenceAnchors: PayrollCadenceAnchors;");
+  });
+
+  it("el campo se pregunta SÓLO por cadencia con gente activa y mientras no haya anclaje declarado", () => {
+    const source = readFileSync(
+      join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
+      "utf8",
+    );
+
+    // Decisión 3: sin empleados ACTIVOS de esa cadencia no hay nada que liquidar
+    // y la pregunta es ruido. Misma condición que la regla 1 del aviso.
+    expect(source).toContain("const activeCadences = payFrequencySchema.options.filter((frequency) =>");
+    expect(source).toContain(
+      "employee.is_active !== false && normalizePayFrequency(employee.pay_frequency) === frequency",
+    );
+    expect(source).toContain("props.canAdmin && activeCadences.length > 0 && (");
+
+    // Con el anclaje puesto se muestra en SOLO LECTURA: la rama del declarado
+    // devuelve antes de llegar al formulario.
+    expect(source).toContain("const declared = cadenceAnchors[frequency];");
+    expect(source).toContain("if (declared !== undefined) {");
+    expect(source).toContain("Declarado pagado hasta el ${formatFullDate(declared.paidThrough)}");
+    expect(source).toContain("absorbedDaysText(declared)");
+    // Y el campo del formulario sólo existe en la rama que SÍ puede escribir.
+    expect(source).toContain("const preview = cadenceAnchorFromDeclaration({");
+    expect(source).toContain("id={`payroll-anchor-${frequency}`}");
+  });
+
+  it("con un período de esa cadencia la pantalla dice que la declaración está cerrada, en vez del campo", () => {
+    const source = readFileSync(
+      join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
+      "utf8",
+    );
+
+    // La ventana de reparación se evalúa con la MISMA lista de períodos del
+    // módulo y su mismo cubo de cadencia, no con una consulta paralela.
+    expect(source).toContain("const windowClosed = filterPeriodsByCadence(periods, frequency).length > 0;");
+    // La copia de la ventana cerrada existe, y se rinde ANTES del formulario: un
+    // campo que el servicio va a rechazar sería ofrecerle al usuario algo que
+    // falla.
+    expect(source).toContain(
+      "La declaración de este anclaje ya está cerrada: la cadencia tiene períodos registrados, y el primero es la evidencia de hasta cuándo se pagó.",
+    );
+    expect(source).toContain("if (windowClosed) {");
+  });
+
+  it("los días absorbidos salen del DATO —lectura o regla pura— y nunca de un rango escrito a mano", () => {
+    const source = readFileSync(
+      join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
+      "utf8",
+    );
+
+    // La frase se arma con el conteo y el rango del dato: `absorbedDays` decide
+    // el número y `absorbedFrom`/`anchor` el tramo.
+    expect(source).toContain("const days = anchor.absorbedDays === 1 ? \"1 día\" : `${anchor.absorbedDays} días`;");
+    expect(source).toContain(
+      "El ajuste al sábado absorbe ${days}: del ${formatFullDate(anchor.absorbedFrom)} al ${formatFullDate(anchor.anchor)} también quedan declarados como pagados.",
+    );
+    expect(source).toContain(
+      "El ajuste al sábado absorbe ${anchor.absorbedDays} días: el día declarado ya cae en sábado.",
+    );
+    // Decisión 1 («no esconderlo»): se muestran ANTES de enviar (vista previa con
+    // la regla pura) y DESPUÉS (la lectura). Son la definición y esos dos usos.
+    expect((source.match(/absorbedDaysText\(/g) ?? []).length).toBe(3);
+    expect(source).toContain("absorbedDaysText(preview)");
+    // CONTROL NEGATIVO: el rango de días no está escrito como literal.
+    expect(source).not.toContain("del 1 al 6");
+    expect(source).not.toContain("1 a 6 días");
+  });
+
+  it("la pantalla muestra el MENSAJE del servicio y nunca su código interno", () => {
+    const source = readFileSync(
+      join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
+      "utf8",
+    );
+    const actions = readFileSync(
+      join(process.cwd(), "src", "features", "payroll", "actions.ts"),
+      "utf8",
+    );
+
+    // El error de la declaración es el `message`: `CADENCE_ANCHOR_*` es
+    // vocabulario del módulo y no aparece en la pantalla. El fuente se lee SIN
+    // comentarios: ahí es donde el código no puede imprimirse, y nombrarlo en un
+    // comentario no llega a los ojos de nadie.
+    const sinComentarios = source
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/[^\n]*/g, "");
+    expect(source).toContain("setPayrollCadenceAnchorAction");
+    expect(source).toContain("frequency]: result.message");
+    expect(sinComentarios).not.toContain("CADENCE_ANCHOR_");
+    // La acción existe, delega en el servicio y le pasa el actor de la SESIÓN,
+    // con la misma guarda del resto de la escritura de nómina.
+    expect(actions).toContain("export async function setPayrollCadenceAnchorAction");
+    expect(actions).toContain("await setPayrollCadenceAnchor(input, { userId: session.userId })");
+    expect(actions).toContain("const session = await requirePayrollAdmin(await sessionToken());");
+  });
+
+  it("el éxito pisa el anclaje local con lo confirmado, y la pantalla abre con la MISMA regla del servicio", () => {
+    const source = readFileSync(
+      join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
+      "utf8",
+    );
+
+    // Lo que se guarda en el estado del cliente es lo CONFIRMADO por la base, no
+    // lo que se escribió: el ancla ajustada y los días absorbidos no se
+    // re-derivan en pantalla.
+    expect(source).toContain("absorbedDays: result.data.absorbedDays");
+    expect(source).toContain("anchor: result.data.anchor");
+    // Y el anclaje vigente alimenta las DOS superficies que deciden: el aviso de
+    // pendientes y la apertura de un ciclo.
+    expect(source).toContain("anchors: declaredAnchors");
+    expect(source).toContain("cadenceAnchor: declaredAnchors[openTarget.frequency] ?? null");
+    expect(source).toContain("const declaredAnchors = declaredAnchorDays(cadenceAnchors);");
   });
 });
 

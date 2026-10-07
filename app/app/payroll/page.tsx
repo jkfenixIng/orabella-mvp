@@ -5,7 +5,7 @@ import { PageContainer, PageHeader } from "@/src/components/ui/lib/page";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { listAllEmployees, listPaymentMethods } from "@/src/features/admin/service";
-import { listPayrollOverview, listPeriods } from "@/src/features/payroll/service";
+import { getPayrollCadenceAnchors, listPayrollOverview, listPeriods } from "@/src/features/payroll/service";
 import { PayrollClient } from "./payroll-client";
 
 export const dynamic = "force-dynamic";
@@ -57,10 +57,17 @@ export default async function PayrollPage() {
   // que SOLO el admin lo recibe. Al empleado se le manda únicamente su propia
   // fila: pasarle la planta entera sería exponerle documentos, teléfonos y
   // sueldos ajenos.
-  const [employees, methods, overview] = await Promise.all([
+  const [employees, methods, overview, cadenceAnchors] = await Promise.all([
     listAllEmployees(),
     listPaymentMethods(),
     canAdmin ? listPayrollOverview() : null,
+    // T5: el anclaje DECLARADO por cadencia es configuración de la nómina de la
+    // instalación (decide qué días ya están pagados) y sólo la usa la superficie
+    // del admin —el aviso de pendientes y su declaración—, así que se lee sólo
+    // para el admin: al empleado no se le muestra ni se le lee de más. Son tres
+    // claves en una lectura, y el cliente las recibe ya derivadas (el ancla
+    // ajustada al sábado y los días absorbidos), sin volver a aplicar la regla.
+    canAdmin ? getPayrollCadenceAnchors() : null,
   ]);
 
   // El admin ya tiene los períodos dentro del resumen: se usan esos y la lectura
@@ -80,6 +87,7 @@ export default async function PayrollPage() {
         initialEmployees={visibleEmployees}
         initialPeriods={periods}
         initialSummaries={overview?.summaries ?? []}
+        initialCadenceAnchors={cadenceAnchors ?? {}}
         methods={methods.filter((row) => row.is_active)}
         canAdmin={canAdmin}
         canPay={canPay}
