@@ -152,22 +152,80 @@ catálogo de alertas**: es configuración, no un desvío que alguien deba autori
 
 ## Tareas (T1–T6)
 
-- [ ] **T1** — Las reglas puras y sus tests **en rojo primero**: el ajuste al sábado hacia adelante
+- [x] **T1** — Las reglas puras y sus tests **en rojo primero**: el ajuste al sábado hacia adelante
       con los días absorbidos, la precedencia declarado → piso global → `null`, el ciclo cubierto, y
       las guardas (fecha futura). Superficie: `src/features/payroll/schemas.ts`, `tests/payroll.test.ts`.
-- [ ] **T2** — El aviso de pendientes honra el anclaje **por cadencia**, con el caso del dueño como
+      **HECHO** — commit `3559cde`. RED observado (8 fallas / 517 pasando), después **533/533**.
+      Firmas as-built documentadas arriba. Control negativo: el ajuste nunca va hacia atrás.
+- [x] **T2** — El aviso de pendientes honra el anclaje **por cadencia**, con el caso del dueño como
       test: `mensual 12-jul → 8-ago` deja de aparecer cuando el mensual está anclado. **La cobertura
       la dispara el anclaje DECLARADO, no el piso global**, y el ciclo a medias se reporta recortado
       a `ancla + 1` (ver la tabla de la sección de reglas). **No** se alimenta el piso como cobertura:
       el piso conserva su papel de hoy (corta el recorrido y sube el inicio) y el test `12401` tiene
       que seguir verde sin tocarlo.
-- [ ] **T3** — La apertura honra el anclaje: el ciclo cubierto se rechaza con su motivo y su mensaje
+      **HECHO** — commit `3559cde`. Dos controles negativos en verde: sin anclajes la lista es
+      **idéntica** a la de hoy, y anclaje a mitad de ciclo (`26-sep` en mensual) reporta
+      `27-sep..3-oct`.
+- [x] **T3** — La apertura honra el anclaje: el ciclo cubierto se rechaza con su motivo y su mensaje
       en una sola voz (servicio y pantalla dicen lo mismo), y el ciclo a medias se abre recortado a
       `ancla + 1` — **el mismo rango que reporta el aviso**, que es la invariante del módulo.
-- [ ] **T4** — Lectura y escritura del anclaje en `system_settings` (upsert por `key`), auditada.
-- [ ] **T5** — La pantalla: declarar una vez por cadencia con gente activa, el anclaje vigente en
-      sólo lectura, y **los días absorbidos a la vista**.
-- [ ] **T6** — Aplicarlo a PRUEBAS, medir por lectura, y verificación independiente.
+      **HECHO** — commit `3559cde`: motivo `covered-by-anchor` + su mensaje nombrando el ancla y la
+      salida que existe.
+
+  **Un test del que se perdió la confianza, y por qué se arregló el FIXTURE y no la expectativa**:
+  el test de precedencia traía `period("2026-08-09","2026-08-15","semanal")`, que **asienta el ciclo
+  semanal 08-09..08-15** (misma cadencia, mismo rango), mientras la expectativa mantenía ese ciclo y
+  omitía el siguiente: contradicción interna, imposible de satisfacer con cualquier regla. El writer
+  se negó a torcer la regla y escaló (correcto). Se corrigió el fixture —piso por un período
+  **quincenal** 08-09..08-15, que no asienta ningún ciclo semanal, más un semanal 08-16..08-22 que
+  asienta la segunda semana— y las expectativas quedaron **palabra por palabra**.
+
+- [x] **T4** — Lectura y escritura del anclaje en `system_settings` (upsert por `key`), auditada.
+      **HECHO** — commit `adefa3e`: `getPayrollCadenceAnchors()` y `setPayrollCadenceAnchor()`, clave
+      `payroll_anchor_<cadencia>`, valor `{"paid_through": "..."}`. **Se guarda el día DECLARADO y el
+      ajuste al sábado se deriva al leer.** Ventana de reparación con `CADENCE_ANCHOR_LOCKED` (409).
+      Auditoría `payroll.cadence_anchor_set` con `previous_paid_through`, `new_paid_through` y
+      `new_anchor`. Verificado que ninguna prueba enumera el vocabulario exhaustivamente. 547/547.
+- [x] **T5** — La pantalla: declarar una vez por cadencia con gente activa, el anclaje vigente en
+      sólo lectura, y **los días absorbidos a la vista**. **HECHO** — commit `4f41ebc`, y los residuos
+      de su verificación en `83e0da5`. Tres estados por cadencia **con gente activa**: campo con vista
+      previa; sólo el aviso de la ventana cerrada si esa cadencia ya tiene períodos; sólo lectura si
+      ya está declarado. Los números de los días absorbidos salen del dato, en los dos estados.
+- [x] **T6** — Aplicarlo a PRUEBAS, medir por lectura, y verificación independiente.
+
+  **PRUEBAS quedó limpia de anclajes a propósito** (0 filas en `system_settings`, 0 períodos):
+  declarar el anclaje **es** parte de lo que hay que probar, así que no se pre-declaró nada. El
+  dueño va a encontrar las tres cadencias con su campo abierto y la lista con el atraso completo.
+
+  **Verificación independiente `muxi2rp1-d-x87m`** (read-only): **PASS** en la separación
+  piso/anclaje (intentó falsificarla y no encontró camino: `payrollHistoryFloor` no entra a la
+  cobertura por ningún lado), en la voz única (aviso `27-sep..3-oct` ⇔ apertura del mismo rango), en
+  el gating, y en la persistencia con su auditoría después del upsert confirmado. **Cinco hallazgos,
+  todos pagados o declarados**:
+
+  1. **Una afirmación mía era falsa**: dije que «una prueba fija» el formato `VALIDATION: mensaje`
+     del canal del diálogo, y **no existe tal prueba** — lo inferí de un comentario. Lo que sí había
+     era el defecto: el rechazo por anclaje llegaba a la pantalla con el código interno pegado. Se
+     arregló el canal (`setOpenError(result.message)`) y se agregó la guarda que puede fallar. Las
+     otras tres superficies del módulo llevan código **a propósito** (el banner general) y no se
+     tocaron.
+  2. **`resolveCadenceAnchor` era código muerto** en producción (sólo lo llamaban sus pruebas) y su
+     promesa —el piso como anclaje de respaldo— es la confusión que borra el ciclo que termina justo
+     en el piso. **Se retiró con su prueba**, y el documento dice ahora dónde vive la decisión 3: en
+     el papel del piso dentro del recorrido, no en una precedencia entre los dos.
+  3. **Seis guardas de pantalla eran escaneos de texto** que habrían pasado con la pantalla borrada.
+     Se endurecieron las dos que podían fallar de verdad: la de gating ahora afirma que la sección
+     **itera sobre las cadencias activas** (un `map` sobre las tres pasaba igual) y hay una nueva
+     sobre el canal del diálogo. **Lo que sigue sin poder probarse acá es el RENDER**: ninguna prueba
+     de este repo renderiza la pantalla, así que el resultado visual es del dueño.
+  4. **`openPayrollPeriod` falla si falla la lectura de anclajes**, en vez de degradar a «sin
+     anclaje»: degradar podría reabrir un ciclo ya pagado. Es deliberado y **no tiene prueba** (no
+     hay `failAt` sobre `system_settings`).
+  5. **Un período heredado con `frequency` NULL no cierra ninguna cadencia con nombre**: su cubo es
+     `""`. Es correcto por código y **no tiene prueba** con `frequency: null`.
+
+  **Compuerta final**: 48 archivos / **2.481 pruebas**, `tsc` y `eslint` limpios. Commits de la
+  unidad: `b1dbb59` · `3559cde` · `adefa3e` · `4f41ebc` · `83e0da5` (sin pushear).
 
 ## Fuera de alcance
 
