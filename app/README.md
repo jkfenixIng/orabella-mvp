@@ -52,13 +52,16 @@ operador nuevo no configura nada: crea el proyecto de Supabase, aplica las
 migraciones en orden (ver **Convenciones**), corre
 `supabase/seeds/acceptance.sql` y entra.
 
-### El piso de la nómina lo declara la primera liquidación
+### El piso de la nómina lo da la evidencia
 
-La fecha desde la que la nómina OPERA ya no se configura: se **deriva**. La
-declara el primer período que se liquida y, de ahí en adelante, es
-`min(payroll_periods.start_date)` (`getPayrollStartDate`,
+La fecha desde la que la nómina OPERA ya no se configura: se **deriva** de la
+EVIDENCIA —el día más ANTIGUO entre el inicio más antiguo de los períodos
+(`payrollHistoryFloor`) y el día Bogotá de la primera factura no anulada—, por
+`payrollEvidenceFloor` (`getPayrollStartDate`,
 `src/features/payroll/service.ts`; expuesta como `getPayrollStartDateAction`,
-`src/features/payroll/actions.ts`). Antes de que exista ese primer período el
+`src/features/payroll/actions.ts`). Sin evidencia NINGUNA, el piso lo **declara**
+la PRIMERA liquidación: su primer ciclo se recorta al día declarado
+(`resolveOpenPayrollRange`), y es la única vez que se pregunta. Mientras tanto el
 valor es `null`, y eso significa exactamente «la nómina todavía no tiene primer
 período», no «falta configurarla».
 
