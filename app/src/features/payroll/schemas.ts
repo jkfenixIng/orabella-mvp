@@ -1422,7 +1422,7 @@ export function resolveOpenPayrollRange(args: {
   payrollStartDate?: string | null;
   /**
    * El anclaje DECLARADO de la cadencia, ya ajustado al sábado
-   * (`resolveCadenceAnchor` con `declared` únicamente; NUNCA el piso); `null`
+   * (`cadenceAnchor` es el ancla DECLARADA únicamente; NUNCA el piso); `null`
    * cuando no se declaró nada. Opcional: sin él, el validador no cambia.
    */
   cadenceAnchor?: string | null;
@@ -1636,29 +1636,22 @@ export function cadenceAnchorFromDeclaration(args: {
 
 /**
  * Anclaje por cadencia, decisión 3 (dueño, 2026-10-05; ver
- * `odd/tasks/nomina-anclaje-por-cadencia.md`): el anclaje vigente de UNA
- * cadencia, con su precedencia.
+ * `odd/tasks/nomina-anclaje-por-cadencia.md`): el anclaje de UNA cadencia es
+ * **el DECLARADO, o ninguno**.
  *
- *   1. El anclaje declarado —ya ajustado al sábado—, si existe.
- *   2. Si no, el PISO GLOBAL (`payrollHistoryFloor`). El piso global NO
- *      desaparece: sigue siendo el fallback de una cadencia sin anclaje
- *      declarado, así que el comportamiento de hoy queda intacto.
- *   3. Si no hay ninguno de los dos, `null`.
+ * El piso global NO es un anclaje y no se compone con él: el piso significa «la
+ * historia de la nómina EMPIEZA el día F» (corta el recorrido y sube el inicio,
+ * y el ciclo que TERMINA en F sigue siendo el primer ciclo) mientras el anclaje
+ * significa «los días hasta A están PAGADOS» (el ciclo que TERMINA en A está
+ * cubierto). Por eso la decisión 3 —«el piso no desaparece»— se realiza con el
+ * papel del piso en el recorrido, no con una precedencia entre los dos.
  *
- * Un texto vacío es «no declarado», no un anclaje. Puro para probarlo sin base
- * de datos: el aviso, la apertura y la pantalla consumen la MISMA precedencia.
+ * Acá vivía `resolveCadenceAnchor`, que componía ambos en un «anclaje vigente».
+ * Se retiró el 2026-10-06: nunca tuvo un llamador en producción, y su promesa
+ * —usar el piso como anclaje de respaldo— es exactamente la confusión que borra
+ * el ciclo que termina justo en el piso. El piso se aplica donde corresponde: en
+ * el recorrido y en el recorte del rango.
  */
-export function resolveCadenceAnchor(args: {
-  /** El anclaje declarado de la cadencia (ya ajustado al sábado), o nada. */
-  declared?: string | null;
-  /** El piso derivado de los períodos (`payrollHistoryFloor`), o nada. */
-  globalFloor?: string | null;
-}): string | null {
-  const declared = (args.declared ?? "").trim();
-  if (declared !== "") return declared;
-  const floor = (args.globalFloor ?? "").trim();
-  return floor === "" ? null : floor;
-}
 
 /**
  * Anclaje por cadencia (decisión 3; ver
@@ -1679,7 +1672,7 @@ export function resolveCadenceAnchor(args: {
 export function isCycleCoveredByAnchor(args: {
   /** El último día del ciclo (domingo→sábado). */
   endDate: string;
-  /** El anclaje vigente de la cadencia (`resolveCadenceAnchor`), o nada. */
+  /** El ancla DECLARADA de la cadencia (nunca el piso), o nada. */
   anchor?: string | null;
 }): boolean {
   const anchor = utcDayOf((args.anchor ?? "").trim());

@@ -1760,7 +1760,11 @@ export function PayrollClient(props: PayrollClientProps) {
     })) as ActionResult<PayrollPeriodRow>;
     if (!result.success) {
       setBusy(false);
-      setOpenError(`${result.code}: ${result.message}`);
+      // El MENSAJE, no el código: el código es vocabulario interno del servicio y
+      // el mensaje ya nombra el remedio que existe. Por acá llega el rechazo por
+      // anclaje (`covered-by-anchor`), y un «VALIDATION: …» no le dice nada a
+      // quien lo lee.
+      setOpenError(result.message);
       return;
     }
     const created = result.data;

@@ -75,7 +75,7 @@ import {
   readVoucherCapSetting,
   readVoucherDaysSetting,
   readVoucherPerDaySetting,
-  resolveCadenceAnchor,
+
   resolveFixedSalaryForPeriod,
   resolveMixedBlock,
   resolveOpenPayrollRange,
@@ -12842,19 +12842,14 @@ describe("payroll: el anclaje por cadencia (decisión 1, función pura)", () => 
   });
 });
 
-describe("payroll: la precedencia y la cobertura del anclaje (decisión 3, funciones puras)", () => {
-  it("precedencia: el anclaje declarado le gana al piso; sin declarado, el piso; sin ninguno, null", () => {
-    // Decisión 3: el piso global NO desaparece — es el fallback de una cadencia
-    // sin anclaje declarado.
-    expect(resolveCadenceAnchor({ declared: "2026-10-03", globalFloor: "2026-08-01" })).toBe(
-      "2026-10-03",
-    );
-    expect(resolveCadenceAnchor({ declared: null, globalFloor: "2026-08-01" })).toBe("2026-08-01");
-    expect(resolveCadenceAnchor({ declared: null, globalFloor: null })).toBeNull();
-    // Un texto vacío es «no declarada», no un anclaje.
-    expect(resolveCadenceAnchor({ declared: "", globalFloor: "2026-08-01" })).toBe("2026-08-01");
-  });
-
+describe("payroll: la cobertura del anclaje (decisión 3, funciones puras)", () => {
+  // El papel del PISO no se prueba acá porque NO es un anclaje: que el piso corte
+  // el recorrido y suba el inicio —y que el ciclo que termina justo en el piso se
+  // siga ofreciendo— queda fijado por las pruebas del aviso (la expectativa
+  // "2026-08-01..2026-08-01") y por el servicio. Acá vivía la prueba de
+  // `resolveCadenceAnchor`, que componía los dos: se retiró con la función el
+  // 2026-10-06, por muerta en producción y por prometer justamente la confusión
+  // que borra ese ciclo.
   it("un ciclo cubierto es el que CIERRA en o antes del ancla", () => {
     // El ciclo que termina exactamente en el ancla está cubierto; el que termina
     // el día siguiente NO. Cubierto = no se reporta ni se abre.
@@ -12872,7 +12867,12 @@ describe("payroll: la precedencia y la cobertura del anclaje (decisión 3, funci
 
   it("el caso del dueño: con el mensual anclado al 2026-10-03, el ciclo 2026-09-06 → 2026-10-03 está cubierto", () => {
     const cycle = { start_date: "2026-09-06", end_date: "2026-10-03" };
-    const anchor = resolveCadenceAnchor({ declared: "2026-10-03", globalFloor: null });
+    const declaration = cadenceAnchorFromDeclaration({
+      paidThrough: "2026-10-03",
+      referenceDate: "2026-10-04",
+    });
+    if (!declaration.ok) throw new Error("la declaración del dueño tenía que aceptarse");
+    const anchor = declaration.anchor;
     expect(anchor).toBe("2026-10-03");
     expect(isCycleCoveredByAnchor({ endDate: cycle.end_date, anchor })).toBe(true);
     expect(cadencePayableFrom(anchor)).toBe("2026-10-04");
@@ -13514,6 +13514,10 @@ describe("payroll: el anclaje por cadencia de punta a punta (T5)", () => {
       "employee.is_active !== false && normalizePayFrequency(employee.pay_frequency) === frequency",
     );
     expect(source).toContain("props.canAdmin && activeCadences.length > 0 && (");
+    // Y la sección ITERA sobre las cadencias activas, no sobre las tres: sin esta
+    // aserción, un `map` sobre el catálogo entero pasaba igual y le ofrecía el
+    // campo a una cadencia sin gente (decisión 3).
+    expect(source).toContain("{activeCadences.map((frequency) => {");
 
     // Con el anclaje puesto se muestra en SOLO LECTURA: la rama del declarado
     // devuelve antes de llegar al formulario.
@@ -13588,6 +13592,12 @@ describe("payroll: el anclaje por cadencia de punta a punta (T5)", () => {
     expect(source).toContain("setPayrollCadenceAnchorAction");
     expect(source).toContain("frequency]: result.message");
     expect(sinComentarios).not.toContain("CADENCE_ANCHOR_");
+    // Y el OTRO canal del módulo, el del diálogo de abrir período: por ahí llega
+    // el rechazo `covered-by-anchor` del servicio, así que también tiene que
+    // llevar el mensaje. Las otras tres superficies que imprimen el código son el
+    // banner general del módulo, y eso es deliberado (y está fijado por prueba).
+    expect(source).toMatch(/setOpenError\(result\.message\)/);
+    expect(source).not.toMatch(/setOpenError\(`\$\{result\.code\}/);
     // La acción existe, delega en el servicio y le pasa el actor de la SESIÓN,
     // con la misma guarda del resto de la escritura de nómina.
     expect(actions).toContain("export async function setPayrollCadenceAnchorAction");
