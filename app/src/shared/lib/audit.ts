@@ -78,6 +78,14 @@ export const AUDIT_ACTIONS = {
   // NO entra a ningún catálogo de alertas: cambiar la política es una decisión de
   // configuración, no un desvío que alguien deba autorizar o rechazar.
   VOUCHER_LIMITS_SET: "voucher.limits_set",
+  // El anclaje por cadencia declara «hasta qué día se pagaron los sueldos de este
+  // grupo»: decide plata —marca días como YA PAGADOS, y por eso la primera
+  // liquidación no los vuelve a ofrecer— y tiene que quedar escrito quién, para
+  // qué cadencia, la fecha DECLARADA y la efectiva (el ajuste al sábado). Tiene su
+  // propia acción con el mismo argumento que justifica `VOUCHER_LIMITS_SET`.
+  // NO entra a ningún catálogo de alertas: declarar cobertura es configuración
+  // —una decisión del dueño—, no un desvío que alguien deba autorizar o rechazar.
+  PAYROLL_CADENCE_ANCHOR_SET: "payroll.cadence_anchor_set",
   VOUCHER_APPROVED: "voucher.approved",
   VOUCHER_REQUESTED: "voucher.requested",
   VOUCHER_REJECTED: "voucher.rejected",

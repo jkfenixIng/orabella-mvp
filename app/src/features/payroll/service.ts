@@ -9,6 +9,7 @@ import {
   buildEmployeeDetail,
   buildPayrollCorrectionView,
   buildPayrollMonthToDate,
+  cadenceAnchorFromDeclaration,
   calculatePayrollSchema,
   canDiscountVoucher,
   capPayrollDiscounts,
@@ -17,10 +18,12 @@ import {
   checkVoucherEligibility,
   computeNetPay,
   correctPayrollPeriodSchema,
+  filterPeriodsByCadence,
   mixedAbsorbedDetailLine,
   MIXED_ABSORBED_ITEM_TYPE,
   monthKeyOf,
   normalizeAllowedDays,
+  normalizePayFrequency,
   normalizePerDayLimits,
   openPeriodSchema,
   openPayrollRejectionMessage,
@@ -29,6 +32,7 @@ import {
   periodExcludesEmployeeByCadence,
   overlapBlocksDeletion,
   payPayrollItemSchema,
+  payFrequencySchema,
   payrollCycleRange,
   payrollExtraSchema,
   pendingPayrollSettlements,
@@ -57,6 +61,7 @@ import {
   type CalculatePayrollInput,
   type DetailLine,
   type OpenPeriodInput,
+  type PayFrequency,
   type PayrollCorrectionView,
   type PayrollExtraKind,
   type PayrollMonthEmployeeRow,
@@ -3419,6 +3424,226 @@ export async function setVoucherLimits(raw: unknown, actor: PayrollActor): Promi
   });
 
   return nueva;
+}
+
+// ------------------------------------------------- el anclaje por cadencia ---
+//
+// `odd/tasks/nomina-anclaje-por-cadencia.md` (T4): el dueño declara, POR
+// CADENCIA, «hasta qué día se pagaron los sueldos de este grupo». La declaración
+// vive en `system_settings`, UNA fila por cadencia —el precedente de 072: una
+// fila por ajuste, sin cambio de esquema—, y lo que se guarda es el día
+// DECLARADO (el hecho de negocio), NUNCA el ancla ajustada: el ajuste al sábado
+// es una REGLA y se deriva al leer con `cadenceAnchorFromDeclaration`, que es la
+// única definición del anclaje.
+
+/** El anclaje de UNA cadencia, ya derivado, tal como lo consumen aviso y pantalla. */
+export interface PayrollCadenceAnchor {
+  /** El día DECLARADO (el hecho), sin ajustar. */
+  paidThrough: string;
+  /** El día declarado ajustado HACIA ADELANTE a su sábado (la regla, decisión 1). */
+  anchor: string;
+  /** El día siguiente al declarado: desde acá absorbe el ajuste (dato). */
+  absorbedFrom: string;
+  /** Cuántos días absorbe el ajuste (0 si el declarado ya era sábado). */
+  absorbedDays: number;
+}
+
+/**
+ * Las declaraciones VÁLIDAS, por cadencia. Una cadencia sin declaración —o con
+ * una que la regla rechaza— simplemente no está: el aviso y la pantalla no
+ * re-derivan nada, consumen esto tal cual.
+ */
+export type PayrollCadenceAnchors = Partial<Record<PayFrequency, PayrollCadenceAnchor>>;
+
+/** El anclaje CONFIRMADO por la base al declararlo, con su cadencia. */
+export interface PayrollCadenceAnchorConfirmed extends PayrollCadenceAnchor {
+  frequency: PayFrequency;
+}
+
+/** Claves del anclaje en `system_settings`, una fila por cadencia. */
+const PAYROLL_ANCHOR_SETTING_KEYS: Record<PayFrequency, string> = {
+  semanal: "payroll_anchor_semanal",
+  quincenal: "payroll_anchor_quincenal",
+  mensual: "payroll_anchor_mensual",
+};
+
+/** Las claves en el orden del catálogo cerrado, para la lectura de una sola vez. */
+const PAYROLL_ANCHOR_SETTING_KEY_LIST: string[] = payFrequencySchema.options.map(
+  (frequency) => PAYROLL_ANCHOR_SETTING_KEYS[frequency],
+);
+
+/**
+ * El día DECLARADO de un sobre de `system_settings`, o `null` cuando la forma no
+ * es la esperada (`{ paid_through: "yyyy-mm-dd" }`). Defensivo a propósito: un
+ * valor ausente, de otro tipo o con otra forma NO es «sin declarar» por
+ * accidente, es un dato que no se puede leer y se trata igual que la ausencia.
+ */
+function declaredAnchorDay(value: unknown): string | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const paidThrough = (value as { paid_through?: unknown }).paid_through;
+  return typeof paidThrough === "string" ? paidThrough.trim() : null;
+}
+
+/**
+ * Deriva las declaraciones válidas de los sobres leídos. Pura en el sentido que
+ * importa —no toca la base— y el ajuste al sábado sale de la ÚNICA definición
+ * (`cadenceAnchorFromDeclaration`): lo que se guarda y lo que se deriva no pueden
+ * divergir por una fórmula escrita a mano. Un sobre ausente, malformado o
+ * RECHAZADO por la regla —incluido un día en el futuro, que no se declara
+ * pagado— se lee como «no declarado», nunca como un error.
+ */
+function cadenceAnchorsFromPayloads(payloads: Map<string, unknown>): PayrollCadenceAnchors {
+  const anchors: PayrollCadenceAnchors = {};
+  for (const frequency of payFrequencySchema.options) {
+    const declared = declaredAnchorDay(payloads.get(PAYROLL_ANCHOR_SETTING_KEYS[frequency]));
+    if (declared === null) continue;
+    const declaration = cadenceAnchorFromDeclaration({
+      paidThrough: declared,
+      referenceDate: bogotaDay(),
+    });
+    if (!declaration.ok) continue;
+    anchors[frequency] = {
+      paidThrough: declared,
+      anchor: declaration.anchor,
+      absorbedFrom: declaration.absorbedFrom,
+      absorbedDays: declaration.absorbedDays,
+    };
+  }
+  return anchors;
+}
+
+/**
+ * T4: las declaraciones de anclaje vigentes, POR CADENCIA, con todo lo derivado
+ * —el día declarado, el ancla ajustada al sábado y los días absorbidos—.
+ *
+ * UNA lectura de `system_settings` por clave (las tres juntas en un `in`), el
+ * mismo patrón que los topes de vales. La derivación sale de
+ * `cadenceAnchorFromDeclaration`, así que el aviso (T2) y la pantalla (T5) leen
+ * el mismo hecho sin volver a aplicar la regla: ni uno ni otra re-derivan nada.
+ * Una fila ausente o que la regla rechaza es «sin declaración» —ausente del
+ * mapa—, nunca un error.
+ */
+export async function getPayrollCadenceAnchors(): Promise<PayrollCadenceAnchors> {
+  try {
+    const db = await payrollDb();
+    const { data, error } = await db
+      .from("system_settings")
+      .select("key, value")
+      .in("key", PAYROLL_ANCHOR_SETTING_KEY_LIST);
+    if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    const rows = (data ?? []) as Array<{ key: string; value: unknown }>;
+    return cadenceAnchorsFromPayloads(new Map(rows.map((row) => [row.key, row.value])));
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
+/**
+ * T4: declara el anclaje de UNA cadencia (`{ frequency, paid_through }`).
+ *
+ * El día declarado se valida con `cadenceAnchorFromDeclaration` —la MISMA regla
+ * que lo lee—: un texto que no es una fecha del calendario o un día futuro (no se
+ * declara pagado lo que no pasó) se rechaza con `PayrollError` antes de tocar la
+ * base. Una cadencia fuera del catálogo cerrado también: el anclaje se declara
+ * por cadencia, y una clave que el catálogo no conoce no tiene fila que escribir.
+ *
+ * VENTANA DE REPARACIÓN (decisión del orquestador, documentada en el unit doc):
+ * la declaración es editable mientras ESA cadencia no tenga ningún período —un
+ * error de tipeo en una fecha que marca días como pagados no puede ser
+ * irreversible— y queda de sólo lectura con el primer período, que ya es la
+ * evidencia de hasta cuándo se pagó. Se comprueba con la MISMA lista de períodos
+ * del módulo (`listPeriods`) y el MISMO cubo de cadencia
+ * (`filterPeriodsByCadence`), no con una consulta paralela.
+ *
+ * Lo que se guarda es el día DECLARADO —el hecho, no el ancla ajustada— y lo que
+ * se devuelve es lo que la base CONFIRMÓ, leído otra vez por la puerta de lectura:
+ * una respuesta que no es la que la base aplicó no se reporta como una
+ * configuración guardada. `writeAudit` nunca lanza: que falle el rastro no
+ * convierte una configuración ya guardada en un error para quien la guardó.
+ */
+export async function setPayrollCadenceAnchor(
+  raw: unknown,
+  actor: PayrollActor,
+): Promise<PayrollCadenceAnchorConfirmed> {
+  try {
+    const input = (raw ?? {}) as { frequency?: unknown; paid_through?: unknown };
+    const frequency = normalizePayFrequency(
+      typeof input.frequency === "string" ? input.frequency : null,
+    );
+    if (frequency === null) {
+      throw new PayrollError(
+        "CADENCE_ANCHOR_UNKNOWN_CADENCE",
+        "El anclaje se declara por cadencia, y esa cadencia no está en el catálogo (semanal, quincenal o mensual). Elija una de las tres.",
+        400,
+      );
+    }
+    const paidThrough = typeof input.paid_through === "string" ? input.paid_through : "";
+    const declaration = cadenceAnchorFromDeclaration({ paidThrough, referenceDate: bogotaDay() });
+    if (!declaration.ok) {
+      if (declaration.reason === "anchor-in-the-future") {
+        throw new PayrollError(
+          "CADENCE_ANCHOR_IN_THE_FUTURE",
+          `El día declarado para el anclaje del ${frequency} todavía no pasó. El anclaje declara días YA pagados, así que no puede ser una fecha futura.`,
+          400,
+        );
+      }
+      throw new PayrollError(
+        "CADENCE_ANCHOR_NOT_A_DAY",
+        `El día declarado para el anclaje del ${frequency} no es una fecha del calendario (se espera aaaa-mm-dd).`,
+        400,
+      );
+    }
+    // VENTANA DE REPARACIÓN: el primer período de ESA cadencia cierra la edición.
+    // Se leen los períodos por el mismo camino del módulo.
+    const periods = await listPeriods();
+    if (filterPeriodsByCadence(periods, frequency).length > 0) {
+      throw new PayrollError(
+        "CADENCE_ANCHOR_LOCKED",
+        `El anclaje del ${frequency} ya no se puede declarar: esa cadencia ya tiene períodos registrados, y el primero es la evidencia de hasta cuándo se pagó. Si la declaración está mal, corríjala antes del primer período.`,
+        409,
+      );
+    }
+    // El anterior sale de la MISMA lectura que resuelve la declaración vigente:
+    // lo que se audita es lo que la escritura reemplaza (si esa lectura degrada,
+    // lo anterior es «sin declaración», no un dato inventado).
+    const previous = await getPayrollCadenceAnchors().catch(() => null);
+    const key = PAYROLL_ANCHOR_SETTING_KEYS[frequency];
+    const db = await payrollDb();
+    // Una fila, upsert por `key`: la clave ES la identidad del ajuste, igual que
+    // los topes de vales. Se persiste el día declarado, no el ancla ajustada.
+    const { data, error } = await db
+      .from("system_settings")
+      .upsert({ key, value: { paid_through: paidThrough.trim() } }, { onConflict: "key" })
+      .select("key, value");
+    if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    // Se devuelve lo que la base CONFIRMÓ: la fila que quedó, derivada por la
+    // misma puerta de lectura, no lo que se pidió.
+    const confirmadas = (data ?? []) as Array<{ key: string; value: unknown }>;
+    const confirmado = cadenceAnchorsFromPayloads(
+      new Map(confirmadas.map((row) => [row.key, row.value])),
+    )[frequency];
+    if (!confirmado) throw new PayrollError("INTERNAL", "Error interno.", 500);
+
+    // AUDITORÍA: quién declaró el anclaje, de qué cadencia, y las dos fechas que
+    // deciden plata —la declarada y la efectiva— con el valor anterior. No entra
+    // a ningún catálogo de alertas: es configuración, no un desvío.
+    await writeAudit({
+      user_id: actor.userId,
+      action: AUDIT_ACTIONS.PAYROLL_CADENCE_ANCHOR_SET,
+      entity: "system_settings",
+      entity_id: key,
+      metadata: {
+        frequency,
+        previous_paid_through: previous?.[frequency]?.paidThrough ?? null,
+        new_paid_through: confirmado.paidThrough,
+        new_anchor: confirmado.anchor,
+      },
+    });
+
+    return { frequency, ...confirmado };
+  } catch (error) {
+    throw toPayrollError(error);
+  }
 }
 
 /** Vales vigentes (pendiente/aprobada) de un empleado en una fecha. */

@@ -108,6 +108,7 @@ import {
 import {
   approveVoucher,
   calculatePayroll,
+  getPayrollCadenceAnchors,
   getPayrollPeriodCorrection,
   getPayrollSettlementSources,
   getPayrollStartDate,
@@ -120,6 +121,7 @@ import {
   openPayrollPeriod,
   PayrollError,
   rejectVoucher,
+  setPayrollCadenceAnchor,
   setVoucherLimits,
   type PayrollActor,
 } from "@/src/features/payroll/service";
@@ -12870,6 +12872,296 @@ describe("payroll: la precedencia y la cobertura del anclaje (decisión 3, funci
     expect(anchor).toBe("2026-10-03");
     expect(isCycleCoveredByAnchor({ endDate: cycle.end_date, anchor })).toBe(true);
     expect(cadencePayableFrom(anchor)).toBe("2026-10-04");
+  });
+});
+
+/* ==========================================================================
+   T4 — la persistencia y la auditoría del anclaje por cadencia.
+
+   La declaración vive en `system_settings`, UNA fila por cadencia (el mismo
+   precedente de 072: una fila por ajuste, sin cambio de esquema). Lo que se
+   guarda es el día DECLARADO —el hecho de negocio—, nunca el ancla ajustada: el
+   ajuste al sábado es una REGLA y se deriva al leer con
+   `cadenceAnchorFromDeclaration`, la única definición del anclaje. La lectura
+   devuelve, por cadencia con declaración válida, todo lo derivado (el ancla y
+   los días absorbidos), así que el aviso (T2) y la pantalla (T5) no vuelven a
+   aplicar la regla. La escritura audita el cambio —decide plata— y respeta la
+   ventana de reparación: editable mientras ESA cadencia no tenga períodos. Ver
+   `odd/tasks/nomina-anclaje-por-cadencia.md`.
+   ========================================================================== */
+describe("payroll: el anclaje por cadencia en system_settings (T4, servicio)", () => {
+  const ACTOR: PayrollActor = { userId: "u-ancla", roles: ["admin"] };
+  /** Las filas del anclaje que quedaron escritas en el doble. */
+  const settingRows = (): Array<Record<string, unknown>> =>
+    payrollPagedStub.tables.system_settings ?? [];
+  const settingValue = (key: string): unknown =>
+    settingRows().find((row) => row.key === key)?.value;
+  const auditEntries = (): Array<{ table: string; payload: unknown }> =>
+    payrollPagedStub.inserts.filter((entry) => entry.table === "audit_logs");
+
+  /** Un período de una cadencia, para la ventana de reparación. */
+  function periodRow(frequency: string, id = `p-${frequency}`): Record<string, unknown> {
+    return {
+      id,
+      frequency,
+      start_date: "2026-09-06",
+      end_date: "2026-10-03",
+      status: "cerrado",
+    };
+  }
+
+  beforeEach(() => resetPayrollStubState());
+  afterEach(() => resetPayrollStubState());
+
+  // ------------------------------------------------------------------ READ ---
+
+  it("una declaración válida vuelve con su sábado ajustado y los días absorbidos", async () => {
+    // El día declarado es un HECHO (el miércoles 30-sep, hasta ahí se pagó); el
+    // ancla 03-oct es la REGLA (el ajuste hacia ADELANTE, decisión 1) y los tres
+    // días absorbidos son el dato que la pantalla tiene que mostrar.
+    payrollPagedStub.tables.system_settings = [
+      { key: "payroll_anchor_mensual", value: { paid_through: "2026-09-30" } },
+      { key: "payroll_anchor_quincenal", value: { paid_through: "2026-09-12" } },
+    ];
+
+    expect(await getPayrollCadenceAnchors()).toEqual({
+      quincenal: {
+        paidThrough: "2026-09-12",
+        anchor: "2026-09-12",
+        absorbedFrom: "2026-09-13",
+        absorbedDays: 0,
+      },
+      mensual: {
+        paidThrough: "2026-09-30",
+        anchor: "2026-10-03",
+        absorbedFrom: "2026-10-01",
+        absorbedDays: 3,
+      },
+    });
+    // UNA lectura de las tres claves juntas: el aviso no dispara tres consultas.
+    expect(payrollPagedStub.windows.filter((w) => w.table === "system_settings")).toHaveLength(1);
+  });
+
+  it("un valor ausente, malformado o rechazado por la regla se lee como «sin declaración»", async () => {
+    // Defensivo y sin crash: un sobre que no es el esperado, una fecha que el
+    // calendario tendría que normalizar (2026-02-30) y una clave ausente son
+    // todos «no declarado», que es lo mismo que una instalación sin anclaje.
+    payrollPagedStub.tables.system_settings = [
+      { key: "payroll_anchor_semanal", value: "no-es-un-sobre" },
+      { key: "payroll_anchor_quincenal", value: { paid_through: "2026-02-30" } },
+    ];
+
+    await expect(getPayrollCadenceAnchors()).resolves.toEqual({});
+  });
+
+  it("una declaración futura se ignora por defensiva: no se declara pagado lo que no pasó", async () => {
+    // La escritura ya la rechaza; si una fila futura llegara igual a la base
+    // (editada a mano), la lectura NO la reporta como cobertura.
+    payrollPagedStub.tables.system_settings = [
+      { key: "payroll_anchor_mensual", value: { paid_through: "2099-12-31" } },
+    ];
+
+    await expect(getPayrollCadenceAnchors()).resolves.toEqual({});
+  });
+
+  it("CONTROL NEGATIVO: sin filas, la lectura no devuelve nada y no escribe nada", async () => {
+    payrollPagedStub.tables.system_settings = [];
+
+    await expect(getPayrollCadenceAnchors()).resolves.toEqual({});
+    expect(settingRows()).toEqual([]);
+    expect(payrollPagedStub.inserts).toEqual([]);
+    expect(payrollPagedStub.updates).toEqual([]);
+  });
+
+  // ----------------------------------------------------------------- WRITE ---
+
+  it("declarar guarda el día DECLARADO (no el ancla ajustada) y devuelve lo confirmado", async () => {
+    const confirmado = await setPayrollCadenceAnchor(
+      { frequency: "mensual", paid_through: "2026-09-30" },
+      ACTOR,
+    );
+
+    // Lo que la base CONFIRMÓ, con la derivación completa.
+    expect(confirmado).toEqual({
+      frequency: "mensual",
+      paidThrough: "2026-09-30",
+      anchor: "2026-10-03",
+      absorbedFrom: "2026-10-01",
+      absorbedDays: 3,
+    });
+    // Lo guardado es el HECHO (el día declarado), no la regla aplicada: si se
+    // guardara el ancla, un cambio de regla no podría re-derivarse.
+    expect(settingValue("payroll_anchor_mensual")).toEqual({ paid_through: "2026-09-30" });
+    // Y sólo esa fila.
+    expect(settingRows().map((row) => row.key)).toEqual(["payroll_anchor_mensual"]);
+  });
+
+  it("upsertea por clave: la segunda declaración reemplaza la fila, no la duplica", async () => {
+    payrollPagedStub.tables.system_settings = [
+      { key: "payroll_anchor_mensual", value: { paid_through: "2026-09-12" } },
+    ];
+
+    await setPayrollCadenceAnchor({ frequency: "mensual", paid_through: "2026-09-30" }, ACTOR);
+
+    expect(settingRows().filter((row) => row.key === "payroll_anchor_mensual")).toHaveLength(1);
+    expect(settingValue("payroll_anchor_mensual")).toEqual({ paid_through: "2026-09-30" });
+  });
+
+  it("rechaza un día inválido y uno futuro con su código, sin escribir ni auditar", async () => {
+    // Tres rechazos de la MISMA regla que lee (nada de una validación paralela):
+    // un texto que no es fecha, el vacío, y un día que todavía no pasó.
+    const invalidos: Array<{ paid_through: string; code: string }> = [
+      { paid_through: "no-es-fecha", code: "CADENCE_ANCHOR_NOT_A_DAY" },
+      { paid_through: "", code: "CADENCE_ANCHOR_NOT_A_DAY" },
+      { paid_through: "2099-12-31", code: "CADENCE_ANCHOR_IN_THE_FUTURE" },
+    ];
+
+    for (const caso of invalidos) {
+      payrollPagedStub.tables.system_settings = [];
+      const failure: unknown = await setPayrollCadenceAnchor(
+        { frequency: "mensual", paid_through: caso.paid_through },
+        ACTOR,
+      ).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(PayrollError);
+      expect((failure as PayrollError).code).toBe(caso.code);
+      // NADA se escribió: ni la fila ni el rastro de un cambio que no ocurrió.
+      expect(settingRows()).toEqual([]);
+      expect(auditEntries()).toHaveLength(0);
+    }
+  });
+
+  it("rechaza una cadencia fuera del catálogo cerrado, sin escribir", async () => {
+    const failure: unknown = await setPayrollCadenceAnchor(
+      { frequency: "diaria", paid_through: "2026-09-30" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect((failure as PayrollError).code).toBe("CADENCE_ANCHOR_UNKNOWN_CADENCE");
+    expect(settingRows()).toEqual([]);
+    expect(auditEntries()).toHaveLength(0);
+  });
+
+  // ------------------------------------------------- la ventana de reparación ---
+
+  it("la ventana de reparación: se declara mientras ESA cadencia no tenga períodos", async () => {
+    // Un período de OTRA cadencia no cierra la ventana: el anclaje es por
+    // cadencia y la evidencia también.
+    payrollPagedStub.tables.payroll_periods = [periodRow("semanal")];
+    payrollPagedStub.tables.system_settings = [];
+
+    const confirmado = await setPayrollCadenceAnchor(
+      { frequency: "mensual", paid_through: "2026-09-30" },
+      ACTOR,
+    );
+
+    expect(confirmado.anchor).toBe("2026-10-03");
+    expect(settingValue("payroll_anchor_mensual")).toEqual({ paid_through: "2026-09-30" });
+  });
+
+  it("con el primer período de esa cadencia la declaración queda de sólo lectura", async () => {
+    payrollPagedStub.tables.payroll_periods = [periodRow("mensual")];
+    payrollPagedStub.tables.system_settings = [];
+
+    const failure: unknown = await setPayrollCadenceAnchor(
+      { frequency: "mensual", paid_through: "2026-09-30" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect((failure as PayrollError).code).toBe("CADENCE_ANCHOR_LOCKED");
+    // El mensaje NOMBRA la cadencia y el motivo (el período que ya existe).
+    expect((failure as PayrollError).message).toContain("mensual");
+    expect((failure as PayrollError).message).toContain("período");
+    // Rechazada ANTES del upsert: no se pisó la declaración ni se auditó.
+    expect(settingRows()).toEqual([]);
+    expect(auditEntries()).toHaveLength(0);
+  });
+
+  // --------------------------------------------------------------- AUDIT ---
+
+  it("la auditoría lleva el valor anterior y el nuevo, con la cadencia y su fecha efectiva", async () => {
+    payrollPagedStub.tables.system_settings = [
+      { key: "payroll_anchor_mensual", value: { paid_through: "2026-09-12" } },
+    ];
+
+    await setPayrollCadenceAnchor({ frequency: "mensual", paid_through: "2026-09-30" }, ACTOR);
+
+    const audit = auditEntries()[0]?.payload as Record<string, unknown>;
+    expect(audit).toMatchObject({
+      action: "payroll.cadence_anchor_set",
+      user_id: ACTOR.userId,
+      entity: "system_settings",
+      entity_id: "payroll_anchor_mensual",
+      metadata: {
+        frequency: "mensual",
+        previous_paid_through: "2026-09-12",
+        new_paid_through: "2026-09-30",
+        new_anchor: "2026-10-03",
+      },
+    });
+    // Lo que la auditoría llama «nuevo» es lo que quedó ESCRITO de verdad.
+    expect(settingValue("payroll_anchor_mensual")).toEqual({ paid_through: "2026-09-30" });
+  });
+
+  it("configurar por primera vez audita el anterior como sin declaración", async () => {
+    payrollPagedStub.tables.system_settings = [];
+
+    await setPayrollCadenceAnchor({ frequency: "quincenal", paid_through: "2026-09-12" }, ACTOR);
+
+    const audit = auditEntries()[0]?.payload as Record<string, unknown>;
+    expect(audit).toMatchObject({
+      action: "payroll.cadence_anchor_set",
+      metadata: {
+        frequency: "quincenal",
+        previous_paid_through: null,
+        new_paid_through: "2026-09-12",
+        new_anchor: "2026-09-12",
+      },
+    });
+  });
+
+  it("un guardado RECHAZADO no deja auditoría: no se registró un cambio que no ocurrió", async () => {
+    payrollPagedStub.tables.system_settings = [];
+    payrollPagedStub.insertError = { table: "system_settings", message: "boom" };
+
+    const failure: unknown = await setPayrollCadenceAnchor(
+      { frequency: "mensual", paid_through: "2026-09-30" },
+      ACTOR,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(PayrollError);
+    expect(auditEntries()).toHaveLength(0);
+  });
+
+  it("la acción sale del vocabulario cerrado y NO entra a ningún catálogo de alertas", () => {
+    expect(AUDIT_ACTIONS.PAYROLL_CADENCE_ANCHOR_SET).toBe("payroll.cadence_anchor_set");
+    // Declarar el anclaje decide plata (marca días como ya pagados), pero es
+    // configuración, no un desvío: no comparte valor con la acción del cálculo
+    // ni con la de los topes de vales, las otras dos que también deciden plata.
+    expect(AUDIT_ACTIONS.PAYROLL_CADENCE_ANCHOR_SET).not.toBe(AUDIT_ACTIONS.PAYROLL_CALCULATED);
+    expect(AUDIT_ACTIONS.PAYROLL_CADENCE_ANCHOR_SET).not.toBe(AUDIT_ACTIONS.VOUCHER_LIMITS_SET);
+    // El catálogo de la bandeja se lee de la fuente REAL del módulo de alertas,
+    // con el control de que sí filtra la alerta de vale: si el catálogo saliera
+    // vacío, la ausencia de más abajo no probaría nada.
+    const alertas = readFileSync(join(process.cwd(), "src/features/alerts/schemas.ts"), "utf8");
+    const catalogo = /export const ALERT_ACTIONS = \[([\s\S]*?)\] as const;/.exec(alertas)?.[1] ?? "";
+    const alertados = [...catalogo.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+    expect(alertados).toContain(AUDIT_ACTIONS.VOUCHER_REQUESTED);
+    expect(alertados).not.toContain(AUDIT_ACTIONS.PAYROLL_CADENCE_ANCHOR_SET);
+    for (const archivo of ["src/features/alerts/service.ts", "src/features/alerts/schemas.ts"]) {
+      const fuente = readFileSync(join(process.cwd(), archivo), "utf8");
+      expect(fuente, `${archivo} menciona la acción`).not.toContain("PAYROLL_CADENCE_ANCHOR_SET");
+      expect(fuente, `${archivo} menciona el código`).not.toContain("payroll.cadence_anchor_set");
+    }
+    // Y el servicio NO re-declara el código a mano: lo toma del vocabulario
+    // compartido, para que no se desincronicen.
+    const fuente = readFileSync(join(process.cwd(), "src/features/payroll/service.ts"), "utf8");
+    expect(fuente).toContain("AUDIT_ACTIONS.PAYROLL_CADENCE_ANCHOR_SET");
+    expect(fuente.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "")).not.toContain(
+      '"payroll.cadence_anchor_set"',
+    );
   });
 });
 
