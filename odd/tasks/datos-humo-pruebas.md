@@ -81,14 +81,14 @@ aplicación, nada de PRODUCCIÓN.** Los tres defectos de código son la unidad v
 
 ## Tasks
 
-- [ ] **U5** — `app/supabase/seeds/smoke.sql`: el interlock de PRUEBAS, las cadencias, la
+- [x] **U5** — `app/supabase/seeds/smoke.sql`: el interlock de PRUEBAS, las cadencias, la
       fecha de arranque relativa y (si el código lo exige) los ajustes de vales.
-- [ ] **U6** — Aplicarlo a PRUEBAS y verificar por lectura: la fecha, las cadencias, y los
+- [x] **U6** — Aplicarlo a PRUEBAS y verificar por lectura: la fecha, las cadencias, y los
       ciclos pendientes que F10 deriva con esa fecha.
-- [ ] **U7** — Gate: `npm test` no se toca, pero el seed se prueba con una segunda aplicación
+- [x] **U7** — Gate: `npm test` no se toca, pero el seed se prueba con una segunda aplicación
       (idempotencia) y el interlock se prueba en negativo contra el usuario de PRODUCCIÓN sin
       conectarse a esa base.
-- [ ] **U8** — Commit del seed con su documentación.
+- [x] **U8** — Commit del seed con su documentación.
 
 ## Checks
 
@@ -100,7 +100,11 @@ aplicación, nada de PRODUCCIÓN.** Los tres defectos de código son la unidad v
 
 ## Verification evidence
 
-**El archivo**: `app/supabase/seeds/smoke.sql`, **3 sentencias** (interlock, cadencias, fecha).
+**El archivo**: `app/supabase/seeds/smoke.sql`, **2 sentencias** (interlock, cadencias).
+
+> **Corregido el 2026-10-06**: esta línea decía «**3** sentencias (interlock, cadencias, fecha)».
+> La tercera la quitó `4b9103f` junto con su prosa: el seed **no escribe** `sedes.payroll_start_date`,
+> porque esa fecha dejó de ser configuración — la declara la primera liquidación.
 
 **Aplicado dos veces** a PRUEBAS con `psql -v ON_ERROR_STOP=1 --single-transaction`:
 
@@ -108,16 +112,45 @@ aplicación, nada de PRODUCCIÓN.** Los tres defectos de código son la unidad v
 | --- | --- | --- |
 | salida | `DO` / `UPDATE 8` / `UPDATE 1` | `DO` / `UPDATE 0` / `UPDATE 0` |
 
+> La columna del `UPDATE 1` es histórica: esa sentencia (`sedes.payroll_start_date`) ya no existe
+> en el archivo (`4b9103f`). Hoy el seed tiene **2 sentencias** y escribe sólo cadencias.
+
 **Lectura de vuelta** (verificada por el orquestador, no solo reportada):
 `sedes.payroll_start_date` = **2026-09-16** · empleados **sin cadencia = 0**
 (semanal 3, quincenal 3, mensual 4) · `payroll_periods` = **0** (intacto: los períodos
 los crea la prueba) · sueldos, porcentajes y `payout_mode` sin cambios.
 
+> **Anotado el 2026-10-06**: la fecha de esa lectura de vuelta **ya no la escribe nadie**.
+> `4b9103f` quitó del seed la sentencia que la escribía, y F10 convirtió el arranque en un HECHO
+> DERIVADO: lo declara la primera liquidación y después sale de `payrollHistoryFloor`
+> (`min(payroll_periods.start_date)`). Medido tras el reset del 2026-10-06: la columna está
+> **NULL** y `payroll_periods` en 0. La línea queda como lo que fue: el estado de aquel día.
+
+> **Corrección (2026-10-06)** — de la unidad `odd/tasks/reset-pruebas-nomina.md`.
+> El `UPDATE 8` de la 1ª corrida y el `semanal 3 / 0 sin cadencia` de la lectura de vuelta
+> no miden lo mismo: la `VALUES` de U5 cubre **8** id_numbers (no trae `10000001` ni
+> `10000004`), así que el seed escribió 8 filas. El `semanal 3` y el `0 sin cadencia`
+> salieron de **ediciones manuales en la UI del 2026-10-04** —21:35:33 (Carolina, que además
+> quedó `mixto` 60%) y 21:37:56 (Andrés)—: las 8 filas del seed comparten un `updated_at` de
+> lote (`2026-10-04 22:03:22`) y esas dos tienen el suyo. La lectura documentó un estado
+> **observado** como si fuera **producido**. Las cifras de arriba quedan como se escribieron.
+> El seed ya cubre los **10** id_numbers, así que una instalación limpia produce el reparto
+> declarado sin ninguna edición manual.
+>
+> **Y la prosa del seed también estaba mintiendo, en una cadencia que nadie había medido**:
+> declaraba que los tres `pay_type` convivían en `semanal` (`fijo` Lucía, `porcentaje` Andrés,
+> `mixto` Carolina). Medido sobre la base recién reconstruida, la cadencia que los ejercita es
+> **`quincenal`** (Marco `fijo`, Paola `mixto`, Diego `porcentaje`), y `semanal` es Lucía + Andrés
+> + Carolina, con dos tipos. Corregida la prosa y agregadas las dos filas que faltaban, el seed
+> quedó medido contra la base el 2026-10-06: **1ª corrida `UPDATE 2`, 2ª corrida `UPDATE 0`**, y la
+> lectura de vuelta da `semanal 3` (`fijo`, `porcentaje`), `quincenal 3` (`fijo`, `mixto`,
+> `porcentaje`), `mensual 4`, **0 sin cadencia**.
+
 **Idempotencia**: los conteos después de la 1ª y de la 2ª corrida son idénticos
 (sedes 1, employees 10, users 10, system_settings 5, payroll_periods 0) y el
 `updated_at` de la sede no cambió en la segunda — la segunda corrida no escribió una fila.
 
-**Aritmética de la fecha**, derivada de `lastCompletedCycleEndDate` (`schemas.ts:978`):
+**Aritmética de la fecha**, derivada de `lastCompletedCycleEndDate` (`schemas.ts:1124`):
 `ARRANQUE = E − 17`, con `E` el último sábado cerrado. Es la única ventana que deja
 pendientes en **las tres** cadencias y recorta el primer ciclo de cada una:
 
@@ -126,6 +159,15 @@ pendientes en **las tres** cadencias y recorta el primer ciclo de cada una:
 | semanal | 7 | 3 | 16-09 → 19-09 (4 d, factor 4/7) |
 | quincenal | 14 | 2 | 16-09 → 19-09 (4 d, factor 4/15) |
 | mensual | 28 | 1 | 16-09 → 10-03 (18 d, factor 18/30) |
+
+> **Anotado el 2026-10-06 — esta tabla mide un diseño que ya no rige.** Sus cuentas suponen un
+> `ARRANQUE` **configurado** (16-09), y hoy el arranque es un hecho derivado de los períodos que
+> la primera liquidación declara (F10, `resolveOpenPayrollRange`). Con `payroll_periods` en **0**
+> —el estado de una instalación recién sembrada— no hay piso: el recorrido de
+> `pendingPayrollSettlements` se topa al `limit` por cadencia, así que los pendientes son **3 por
+> cadencia (9 en total)**, cada uno pidiendo declarar la fecha. Los recortes «factor 4/7» y
+> «4/15» sí siguen siendo el comportamiento del primer ciclo, porque el recorte lo resuelve el
+> rango, no la fecha.
 
 **Interlock, en negativo**: el predicado rechaza `postgres.otroref` y `service_role`, y
 acepta las dos formas de la sesión de PRUEBAS. No se abrió ninguna conexión a otra base.

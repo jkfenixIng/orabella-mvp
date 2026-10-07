@@ -80,19 +80,20 @@ $$;
 -- `pay_frequency` es la cadencia ACORDADA con el empleado y es la lista cerrada
 -- `semanal | quincenal | mensual` (`src/features/payroll/schemas.ts:30`
 -- `payFrequencySchema`, el mismo catálogo del CHECK `chk_employees_pay_frequency`).
--- Sin cadencia, `pendingPayrollSettlements` (`schemas.ts:1331`) salta al
+-- Sin cadencia, `pendingPayrollSettlements` (`schemas.ts:1604`) salta al
 -- empleado (`normalizePayFrequency(...) === null`, regla 1): el aviso de
 -- pendientes no lo contaría y su ciclo no se pagaría nunca.
 --
 -- El reparto cumple las dos condiciones del dato de humo:
 --   · las TRES cadencias tienen al menos un empleado activo, y
---   · dentro de UNA sola cadencia —`semanal`— están los TRES `pay_type`
---     (`fijo` Lucía, `porcentaje` Andrés, `mixto` Carolina), así el mismo ciclo
---     ejercita el fijo, el porcentaje y el mixto de una vez. `quincenal` también
---     los tiene (Diego `porcentaje`, Paola `mixto`, Marco `fijo`).
+--   · dentro de UNA sola cadencia —`quincenal`— están los TRES `pay_type`
+--     (`fijo` Marco, `porcentaje` Diego, `mixto` Paola), así el mismo ciclo
+--     ejercita el fijo, el porcentaje y el mixto de una vez. `semanal` trae tres
+--     empleados y dos de los tres tipos (Lucía `fijo`, Andrés `porcentaje`,
+--     Carolina `fijo`).
 -- `payout_mode` NO se toca: no decide quién entra a un período (eso es la
--- cadencia, `schemas.ts:817` `periodExcludesEmployeeByCadence`, aplicada en
--- `service.ts:1800` `payableRoster`); sólo `no_aplica` vacía el detalle de
+-- cadencia, `schemas.ts:927` `periodExcludesEmployeeByCadence`, aplicada en
+-- `service.ts:1778` `payableRoster`); sólo `no_aplica` vacía el detalle de
 -- comisión (`schemas.ts:469`).
 --
 -- Idempotente y sin pisar la UI: sólo escribe donde la cadencia AÚN NO está.
@@ -103,10 +104,12 @@ UPDATE public.employees e
 SET pay_frequency = m.pay_frequency
 FROM public.users u
 JOIN (VALUES
-  -- semanal: se le suma la-fijo a los dos que ya trae (Andrés `porcentaje`,
-  -- Carolina `mixto`) para que la cadencia tenga los tres tipos de pago.
+  -- semanal: tres empleados y dos tipos de pago (Lucía y Carolina `fijo`,
+  -- Andrés `porcentaje`).
   ('10000005', 'semanal'),   -- Lucía Herrera · Recepcionista · fijo
-  -- quincenal: los tres tipos también, para probar la exclusión por cadencia
+  ('10000004', 'semanal'),   -- Andrés Quintero · Barbero · porcentaje
+  ('10000001', 'semanal'),   -- Carolina Rojas · Administradora · fijo
+  -- quincenal: los tres tipos, para probar la exclusión por cadencia
   -- (un quincenal NO cobra en el ciclo semanal, aunque se solapen a propósito).
   ('10000002', 'quincenal'), -- Diego Mejía · Estilista · porcentaje
   ('10000003', 'quincenal'), -- Paola Cifuentes · Manicurista · mixto
