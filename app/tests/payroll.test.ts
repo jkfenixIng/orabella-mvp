@@ -56,6 +56,7 @@ import {
   pendingPayrollSettlements,
   payrollCycleRange,
   payrollEmployeeName,
+  payrollEvidenceFloor,
   payrollExtraGuide,
   payrollExtraKindSchema,
   payrollExtraSchema,
@@ -14917,6 +14918,203 @@ describe("payroll-client: cada período dice su cadencia (F11, guarda de fuente)
     expect(source).toContain("payrollTrimmedCycle({");
     expect(source).toContain("trimmedCycleNote(entry)");
     expect(source).not.toMatch(/de 28 días/);
+  });
+});
+
+/* ==========================================================================
+   EL PISO POR EVIDENCIA — LA PRIMERA FACTURA (regla del dueño).
+
+   El piso de la nómina se derivaba SOLO de los períodos
+   (`payrollHistoryFloor`), así que una instalación que opera y factura pero
+   nunca liquidó no tenía piso: el aviso caía al tope de siempre y listaba
+   ciclos que la facturación ya desmiente (el caso medido: la primera factura
+   es 2026-09-28 y el aviso ofrecía `mensual 12-jul → 8-ago`). La regla recibe
+   el DÍA de cada factura ya resuelto por el llamador: la convención de día
+   Bogotá vive con él y acá no se inventa una segunda.
+   ========================================================================== */
+describe("payroll: el piso por evidencia — la primera factura (función pura)", () => {
+  /** Domingo 2026-10-04: el último ciclo CERRADO es el sábado 2026-10-03. */
+  const REFERENCE = "2026-10-04";
+  /** La primera factura del caso del dueño. */
+  const FIRST_INVOICE = "2026-09-28";
+
+  type PeriodRow = { start_date: string; end_date: string; frequency?: string | null };
+
+  function employee(full_name: string, pay_frequency: string) {
+    return { full_name, pay_frequency, is_active: true };
+  }
+
+  function employees() {
+    return [
+      employee("Ana", "semanal"),
+      employee("Beto", "quincenal"),
+      employee("Caro", "mensual"),
+    ];
+  }
+
+  it("sin evidencia no hay piso: `null`", () => {
+    expect(payrollEvidenceFloor({ periods: [] })).toBeNull();
+    expect(payrollEvidenceFloor({ periods: [], invoices: [] })).toBeNull();
+  });
+
+  it("sólo períodos: el piso es el período MÁS ANTIGUO", () => {
+    const periods: PeriodRow[] = [
+      { start_date: "2026-09-01", end_date: "2026-09-14" },
+      { start_date: "2026-08-15", end_date: "2026-08-28" },
+    ];
+    // La MISMA regla de siempre cuando no hay facturas que la bajen.
+    expect(payrollEvidenceFloor({ periods })).toBe("2026-08-15");
+  });
+
+  it("sólo facturas: el piso es la factura MÁS ANTIGUA", () => {
+    const invoices = [
+      { status: "Pagada", day: "2026-09-28" },
+      { status: "Pagada", day: "2026-09-15" },
+      { status: "Pagada", day: "2026-10-01" },
+    ];
+    expect(payrollEvidenceFloor({ periods: [], invoices })).toBe("2026-09-15");
+  });
+
+  it("dos facturas con días contiguos: gana el día más antiguo (compara DÍAS, no cadenas)", () => {
+    // El llamador ya resolvió el día de Bogotá de cada factura. La regla compara
+    // el DÍA del calendario: una fila escrita con espacios alrededor —el `trim`
+    // de la convención— que resuelve al día anterior gana por ser ANTERIOR, no
+    // por cómo está escrita la cadena.
+    const invoices = [
+      { status: "Pagada", day: "2026-09-28" },
+      { status: "Pagada", day: " 2026-09-27 " },
+    ];
+    expect(payrollEvidenceFloor({ periods: [], invoices })).toBe("2026-09-27");
+    // El orden en que llegaron las filas no cambia el resultado.
+    expect(payrollEvidenceFloor({ periods: [], invoices: [...invoices].reverse() })).toBe(
+      "2026-09-27",
+    );
+  });
+
+  it("con períodos y facturas gana el más antiguo de TODA la evidencia", () => {
+    const periods: PeriodRow[] = [{ start_date: "2026-09-01", end_date: "2026-09-14" }];
+    // La factura es más antigua que los períodos.
+    expect(
+      payrollEvidenceFloor({ periods, invoices: [{ status: "Pagada", day: "2026-08-15" }] }),
+    ).toBe("2026-08-15");
+    // Y al revés: el período es más antiguo que todas las facturas.
+    expect(
+      payrollEvidenceFloor({ periods, invoices: [{ status: "Pagada", day: "2026-09-28" }] }),
+    ).toBe("2026-09-01");
+  });
+
+  it("una factura Anulada NO es evidencia", () => {
+    // Una factura anulada es una venta que no ocurrió: no prueba operación.
+    expect(
+      payrollEvidenceFloor({ periods: [], invoices: [{ status: "Anulada", day: "2026-07-12" }] }),
+    ).toBeNull();
+    // Si es la única factura, el piso cae a los períodos.
+    expect(
+      payrollEvidenceFloor({
+        periods: [{ start_date: "2026-08-15", end_date: "2026-08-28" }],
+        invoices: [{ status: "Anulada", day: "2026-07-12" }],
+      }),
+    ).toBe("2026-08-15");
+    // Control positivo: la MISMA fila sin "Anulada" SÍ es evidencia.
+    expect(
+      payrollEvidenceFloor({ periods: [], invoices: [{ status: "Pagada", day: "2026-07-12" }] }),
+    ).toBe("2026-07-12");
+  });
+
+  it("una factura con día inválido o vacío se ignora sin lanzar", () => {
+    expect(
+      payrollEvidenceFloor({
+        periods: [],
+        invoices: [
+          { status: "Pagada", day: "2026-02-30" },
+          { status: "Pagada", day: "" },
+          { status: "Pagada", day: null },
+          { status: "Pagada" },
+        ],
+      }),
+    ).toBeNull();
+    // Control positivo del mismo lote: un día válido sí cuenta.
+    expect(
+      payrollEvidenceFloor({
+        periods: [],
+        invoices: [
+          { status: "Pagada", day: "2026-02-30" },
+          { status: "Emitida", day: "2026-09-28" },
+        ],
+      }),
+    ).toBe("2026-09-28");
+  });
+
+  it("con el piso explícito, el aviso ofrece UN ciclo por cadencia recortado a la factura", () => {
+    // El piso lo DERIVA el llamador de la primera factura: sin períodos, sin
+    // piso no habría cota y el aviso caminaría el tope entero (84 días atrás).
+    const floor = payrollEvidenceFloor({
+      periods: [],
+      invoices: [{ status: "Pagada", day: FIRST_INVOICE }],
+    });
+    expect(floor).toBe(FIRST_INVOICE);
+    const offered = pendingPayrollSettlements({
+      periods: [],
+      employees: employees(),
+      referenceDate: REFERENCE,
+      floor,
+    });
+    // Un ciclo por cadencia, recortado al día de la factura.
+    expect(offered.map((row) => `${row.frequency} ${row.start_date}..${row.end_date}`)).toEqual([
+      `semanal ${FIRST_INVOICE}..2026-10-03`,
+      `quincenal ${FIRST_INVOICE}..2026-10-03`,
+      `mensual ${FIRST_INVOICE}..2026-10-03`,
+    ]);
+    expect(offered).toHaveLength(3);
+    // Y los ciclos que CIERRAN antes de la factura NO se ofrecen.
+    const ranges = offered.map((row) => `${row.start_date}..${row.end_date}`);
+    for (const viejo of [
+      "2026-07-12..2026-08-08",
+      "2026-08-09..2026-09-05",
+      "2026-09-13..2026-09-19",
+    ]) {
+      expect(ranges).not.toContain(viejo);
+    }
+  });
+
+  it("sin el argumento `floor` el MISMO aviso devuelve la lista de hoy (control negativo)", () => {
+    // El argumento es ADITIVO: una instalación que no pasa nada se comporta
+    // exactamente como antes — el tope de 3 por cadencia, nueve ciclos.
+    const today = pendingPayrollSettlements({
+      periods: [],
+      employees: employees(),
+      referenceDate: REFERENCE,
+    });
+    expect(today).toHaveLength(9);
+    expect(today.map((row) => `${row.frequency} ${row.start_date}..${row.end_date}`)).toEqual([
+      "mensual 2026-07-12..2026-08-08",
+      "quincenal 2026-08-23..2026-09-05",
+      "mensual 2026-08-09..2026-09-05",
+      "semanal 2026-09-13..2026-09-19",
+      "quincenal 2026-09-06..2026-09-19",
+      "semanal 2026-09-20..2026-09-26",
+      "semanal 2026-09-27..2026-10-03",
+      "quincenal 2026-09-20..2026-10-03",
+      "mensual 2026-09-06..2026-10-03",
+    ]);
+  });
+
+  it("sin facturas y sin períodos el piso es `null`: el comportamiento de hoy (control negativo)", () => {
+    expect(payrollEvidenceFloor({ periods: [], invoices: [] })).toBeNull();
+    // Pasar `null` EXPLÍCITO es lo mismo que no pasar nada: la lista de hoy.
+    const withExplicitNull = pendingPayrollSettlements({
+      periods: [],
+      employees: employees(),
+      referenceDate: REFERENCE,
+      floor: null,
+    });
+    const withoutArg = pendingPayrollSettlements({
+      periods: [],
+      employees: employees(),
+      referenceDate: REFERENCE,
+    });
+    expect(withExplicitNull).toEqual(withoutArg);
+    expect(withExplicitNull).toHaveLength(9);
   });
 });
 

@@ -1279,6 +1279,55 @@ export function payrollHistoryFloor(
 }
 
 /**
+ * F10 (regla del dueño): el arranque de la nómina por EVIDENCIA — los períodos
+ * que existen MÁS las facturas que prueban que la instalación ya operaba.
+ *
+ * `payrollHistoryFloor` sólo mira los períodos, así que una instalación que
+ * factura sin haber liquidado nunca no tiene piso: el aviso cae al tope de
+ * siempre y ofrece ciclos que la facturación ya desmiente (el caso medido: la
+ * primera factura es 2026-09-28 y el aviso listaba `mensual 12-jul → 8-ago`).
+ * Ésta es la regla que SÍ lee la evidencia: devuelve el día MÁS ANTIGUO entre
+ * el piso de los períodos (`payrollHistoryFloor`) y los días de las facturas
+ * que prueban operación, o `null` cuando no hay ninguna evidencia.
+ *
+ *  - Una factura con `status === "Anulada"` NO es evidencia: es una venta que
+ *    no ocurrió, y no prueba que la instalación operara ese día.
+ *  - Una fila cuyo `day` no es un día válido del calendario se IGNORA
+ *    (mismo `utcDayOf` y misma tolerancia que `payrollHistoryFloor`): una fecha
+ *    imposible no puede convertirse en el arranque de la nómina.
+ *
+ * La regla recibe el DÍA ya RESUELTO —`invoices[].day`, no una marca de tiempo
+ * ni una fila cruda—: la convención de día Bogotá vive con el llamador, que es
+ * quien lee la base, y acá no se inventa una segunda convención de fecha. Es
+ * pura para probarla sin base de datos. `payrollHistoryFloor` permanece intacta:
+ * sigue siendo la regla de sólo-períodos; ésta la envuelve y le suma evidencia.
+ */
+export function payrollEvidenceFloor(args: {
+  periods: readonly (DateRange & { start_date?: string | null })[];
+  /**
+   * Las facturas que prueban operación, con su DÍA ya resuelto por el llamador
+   * (la convención de día del módulo, Bogotá, es suya). Una anulada no cuenta.
+   */
+  invoices?: readonly { status?: string | null; day?: string | null }[];
+}): string | null {
+  let floor: number | null = null;
+  const consider = (day: string | null | undefined) => {
+    const dayMs = utcDayOf(day ?? "");
+    if (dayMs === null) return;
+    if (floor === null || dayMs < floor) floor = dayMs;
+  };
+  // El piso de los períodos entra como UNA evidencia más: si es el más antiguo,
+  // gana; si no, las facturas lo bajan. Así la regla de sólo-períodos sigue
+  // siendo exactamente la de siempre cuando no hay facturas.
+  consider(payrollHistoryFloor(args.periods));
+  for (const invoice of args.invoices ?? []) {
+    if (invoice.status === "Anulada") continue;
+    consider(invoice.day);
+  }
+  return floor === null ? null : isoDayOf(floor);
+}
+
+/**
  * F10: el día que declara la PRIMERA liquidación cuando nadie lo escribió.
  *
  * Cuando la instalación no tiene ningún período, el ciclo que se va a liquidar
@@ -1799,6 +1848,10 @@ export function isPayrollCycleSettled(args: {
  * tope de siempre como único límite. Sin piso, el tope ES el alcance del
  * recorrido: son `limit` ciclos hacia atrás y ni uno más.
  *
+ * Un piso EXPLÍCITO (`floor`) manda sobre esa derivación: es el punto donde el
+ * llamador aporta la primera factura cuando conoce más evidencia que los
+ * períodos; ausente, todo queda exactamente como hoy.
+ *
  * El rango que se REPORTA es el que se va a abrir: el del ciclo, recortado al
  * arranque cuando el arranque cae dentro de él (el PRIMER ciclo de la cadencia)
  * y, con anclaje declarado, a su primer día pagable (`A+1`).
@@ -1832,14 +1885,24 @@ export function pendingPayrollSettlements(args: {
    * es un anclaje.
    */
   anchors?: Partial<Record<PayFrequency, string | null>>;
+  /**
+   * Piso EXPLÍCITO del recorrido. El piso lo aporta el llamador cuando conoce
+   * más evidencia que los períodos —la primera factura—; sin él, la regla de
+   * siempre. Cuando el argumento ESTÁ (aunque sea `null`), su valor ES el piso;
+   * cuando está AUSENTE, se deriva de `periods` como hasta hoy, así que ninguna
+   * instalación ni prueba que no lo pase cambia de comportamiento.
+   */
+  floor?: string | null;
 }): PendingPayrollSettlement[] {
   const lastEnd = utcDayOf(lastCompletedCycleEndDate(args.referenceDate) ?? "");
   if (lastEnd === null) return [];
 
-  // F10: el piso del recorrido es el primer período que existe, y sólo él. Se
-  // parsea una sola vez; un período con fecha imposible no acota (el mismo
-  // criterio que `isRangeBeforePayrollStart`).
-  const floor = payrollHistoryFloor(args.periods);
+  // F10: el piso del recorrido es el primero que existe. Cuando el llamador lo
+  // aporta (conoce la primera factura) manda su valor, `null` incluido; sin
+  // argumento, la derivación de siempre desde los períodos. Se parsea una sola
+  // vez; un piso con fecha imposible no acota (el mismo criterio que
+  // `isRangeBeforePayrollStart`).
+  const floor = args.floor === undefined ? payrollHistoryFloor(args.periods) : args.floor;
   const floorDay = floor === null ? null : utcDayOf(floor);
 
   // Regla 1: la planta que importa es la ACTIVA. Un empleado dado de baja no
