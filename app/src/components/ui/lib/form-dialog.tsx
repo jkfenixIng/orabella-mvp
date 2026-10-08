@@ -114,6 +114,53 @@ const DESTRUCTIVE_BUTTON_CLASS = cn(
  */
 const NO_DESCRIPTION_ATTR = { 'aria-describedby': undefined } as const
 
+/**
+ * El `DialogContent` de `FormDialog`, sin padding abajo.
+ *
+ * R32 necesita que la barra de acciones quede PEGADA al borde de abajo. El
+ * `padding-bottom` del contenedor es lo que impide que lologre: `position:
+ * sticky` con `bottom: 0` ancla contra la caja de CONTENIDO del contenedor de
+ * scroll, o sea por ENCIMA de su propio padding. Medido: con `p-4` la barra
+ * terminaba 16 px antes del borde y esos 16 px dejaban pasar contenido
+ * scrolleado por debajo — la barra parecía flotar. Sacándole el padding abajo
+ * (`pb-0`), la barra llega al borde, el hueco es 0 y el último campo NO queda
+ * tapado (medido a 320 y 390: campo último `bottom 424`, barra `top 444`).
+ *
+ * Los otros tres lados conservan el `p-4 sm:p-6` de la primitiva.
+ */
+const FORM_DIALOG_CONTENT_CLASS = "pb-0";
+
+/**
+ * La fila de acciones, PEGADA al borde de abajo del diálogo.
+ *
+ * R32, medido: «Nuevo empleado» a 320 tiene 1527 px de contenido en una caja de
+ * 534 px, y los botones quedan en `y≈1438-1520` contra un viewport de 568. Hay
+ * que scrollear DENTRO del diálogo para poder guardar. Es una primitiva, así que
+ * el arreglo paga en todos los formularios de la app.
+ *
+ * Por qué `sticky` y no «el pie fuera del scroll»: `DialogContent` ES el
+ * contenedor de scroll (`overflow-y-auto`), y es la primitiva compartida con
+ * diálogos que traen su propia estructura de grilla. Separar el pie exigiría
+ * que cada llamador metiera sus campos en una caja scrolleable — o sea, volver
+ * a decidirlo en cada formulario, que es exactamente como aparece este defecto.
+ *
+ * Las piezas, y por qué están:
+ *   - `sticky bottom-0`: el pie se ancla al borde de abajo mientras el
+ *     contenido scrollea por detrás. Sigue siendo la última pieza del `<form>`,
+ *     o sea que está EN EL FLUJO y no cubre el último campo: no hace falta
+ *     relleno extra, y por eso la guarda de `responsive-primitives.test.ts`
+ *     exige que no se agregue nada debajo.
+ *   - `bg-surface` + `border-t`: sin fondo opaco el contenido se lee encima de
+ *     los botones; la línea dice «acá hay una barra».
+ *   - `-mx-4 px-4 sm:-mx-6 sm:px-6`: el `DialogContent` conserva `p-4 sm:p-6`
+ *     (R7) en los otros tres lados. El margen negativo cancela ese padding y
+ *     sangra la barra al borde; el `px-*` de vuelta deja los botones donde
+ *     deben estar. Abajo no hay margen negativo porque no hay padding que
+ *     cancelar: eso lo resuelve `FORM_DIALOG_CONTENT_CLASS`.
+ */
+const STICKY_ACTION_ROW_CLASS =
+  "sticky bottom-0 z-10 -mx-4 border-t border-border-color bg-surface px-4 py-3 sm:-mx-6 sm:px-6";
+
 export type FormDialogProps = {
   /** Estado controlado, igual que en `Dialog`. */
   open: boolean
@@ -181,7 +228,7 @@ export function FormDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        className={FORM_DIALOG_SIZE_CLASS[size]}
+        className={cn(FORM_DIALOG_SIZE_CLASS[size], FORM_DIALOG_CONTENT_CLASS)}
         {...(hasDescription ? {} : NO_DESCRIPTION_ATTR)}
       >
         <DialogHeader>
@@ -195,7 +242,7 @@ export function FormDialog({
               {error}
             </Alert>
           ) : null}
-          <DialogFooter className="mt-4">
+          <DialogFooter className={cn(STICKY_ACTION_ROW_CLASS, "mt-4")}>
             {/*
               Cancelar cierra sin tocar el envío: es la salida del usuario. No se
               deshabilita con `busy` porque un botón que no responde es peor que

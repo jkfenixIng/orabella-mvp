@@ -5,10 +5,11 @@ export const idTypeSchema = z.enum(["CC", "CE", "PPT", "PEP", "otro"]);
 export type IdType = z.infer<typeof idTypeSchema>;
 
 /**
- * Roles fijos del MVP (AUTH-07) más el rol de PLATAFORMA `superadmin` (G1).
+ * Roles fijos del MVP (AUTH-07) más el rol `superadmin` (G1).
  * `superadmin` existe en el catálogo (069) para la cuenta del dueño, pero NO se
- * asigna ni se quita desde la administración de una sede: para eso está
- * `sedeAssignableRoleSchema`. Sin permisos granulares.
+ * asigna ni se quita desde la administración de una sede —de hecho, ninguna
+ * superficie de la aplicación lo hace: la capa de plataforma se retiró—. Para
+ * eso queda `sedeAssignableRoleSchema`. Sin permisos granulares.
  */
 export const roleCodeSchema = z.enum(["admin", "empleado", "caja", "superadmin"]);
 export type RoleCode = z.infer<typeof roleCodeSchema>;
@@ -25,7 +26,7 @@ export function isRoleCode(code: unknown): code is RoleCode {
 
 /**
  * Esquema de los roles que la administración de una SEDE puede asignar o
- * quitar. `superadmin` queda FUERA: solo lo otorga la plataforma.
+ * quitar. `superadmin` queda FUERA: no hay superficie que lo otorgue.
  */
 export const sedeAssignableRoleSchema = z.enum(["admin", "empleado", "caja"]);
 export type SedeAssignableRole = z.infer<typeof sedeAssignableRoleSchema>;

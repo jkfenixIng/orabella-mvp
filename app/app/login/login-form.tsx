@@ -159,7 +159,7 @@ export function LoginForm({ next }: { next?: string }) {
       <Alert variant="warning">
         <h2 className={sectionTitleClass}>Cambio de clave obligatorio</h2>
         <p>
-          Su clave inicial es su número de documento. Debe cambiarla antes de continuar (AUTH-01).
+          Su clave inicial es su número de documento. Debe cambiarla antes de continuar.
         </p>
         <form onSubmit={handleForceChange} className="mt-3 flex flex-col gap-3">
           <label className="flex flex-col gap-1 text-sm">

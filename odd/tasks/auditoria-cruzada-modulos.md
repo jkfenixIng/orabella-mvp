@@ -156,6 +156,10 @@ todavía no es universal **hacia atrás**: el histórico puede re-emitir centavo
 6. **Sede — SOSTIENE hoy, sin red.** Toda consulta cruzada leída lleva `sede_id` o un padre ya
    verificado; `admin.getEmployee` e `inventory.getProduct` no filtran y dependen del llamador. No
    encontré una lectura cruzada alcanzable.
+   — **ACTUALIZADO el 2026-10-03**: la primera cláusula quedó **falsa**. Las lecturas ya no llevan
+   `sede_id` —la columna no existe en las tablas de negocio— y la frontera real es la autorización
+   por **ROL** más los filtros propios de cada consulta, que es lo que hay que reponer cuando se
+   escriba una consulta nueva. Lo demás del hallazgo sigue vigente.
 7. **Modos de comisión — ROTO** (hallazgo 7).
 8. **Vales — PARCIALMENTE ROTO**: los conjuntos de caja (aprobados) y nómina (pendientes+aprobados)
    difieren por diseño y se acuerdan sólo por `approved_by`; lo roto son las transiciones sin guarda.

@@ -209,9 +209,28 @@ el archivo commiteado**. Ver 3.2.
 ### 2.8 Regenerar `app/supabase/test-bootstrap.sql`
 
 Esto el script **no** lo hace, porque no es parte del esquema: es el bootstrap
-completo (esquema + seeds), y en esta unidad otro writer está sobre los seeds.
+completo —el archivo único más los seeds—, y el squash no incluye datos.
 Cuando toque rehacerlo, se hace por concatenación, en el mismo orden en que el
-runner los aplicaría, sobre el archivo único **ya** generado:
+runner los aplicaría, sobre el archivo único **ya** generado.
+
+**El orden es de TRES piezas, no de dos**: el archivo único, después
+`seeds/catalog.sql` y después `seeds/acceptance.sql`. El `catalog.sql` va en el
+medio y no es opcional: es el que siembra el catálogo de roles, y el bootstrap
+que lo omite deja la base de prueba sin él. Un paso que diga «el `001` y los
+seeds» sin nombrarlos produce un archivo distinto del que está en el repo, y ese
+es el que después parece una regresión.
+
+El separador también es parte del contrato, porque el archivo es generado y se
+compara byte a byte: **un `echo` entre cada `cat` y el siguiente**, y ninguno
+después del último. No es cosmético y por eso no se puede "normalizar" a ojo:
+
+- el `001` termina en `\n\n` —trae una línea vacía propia—, así que su `echo`
+  deja **dos** líneas vacías antes del marcador de `catalog.sql`;
+- el `catalog.sql` **no** termina en `\n`, así que su `echo` sólo termina su
+  última línea y **no** deja ninguna línea vacía antes del marcador de
+  `acceptance.sql`;
+- después del `cat` final no hay `echo`: el archivo termina donde termina
+  `acceptance.sql`, que sí termina en `\n`.
 
 ```bash
 cd D:/u/orabella/app
@@ -219,10 +238,13 @@ SQUASH=supabase/migrations/001_orabella_schema.sql
 TMP="$(mktemp)"
 {
   echo "-- test-bootstrap.sql — generado, no editado a mano."
-  echo "-- Orden: 001_orabella_schema.sql y luego seeds/acceptance.sql."
+  echo "-- Orden: 001_orabella_schema.sql, luego seeds/catalog.sql y luego seeds/acceptance.sql."
   echo "-- Regenerar con el paso 2.8 de supabase/squash/README.md."
   echo
   cat "$SQUASH"
+  echo
+  echo "-- ================= seeds/catalog.sql ================="
+  cat supabase/seeds/catalog.sql
   echo
   echo "-- ================= seeds/acceptance.sql ================="
   cat supabase/seeds/acceptance.sql
@@ -234,6 +256,7 @@ Y la comprobación de que quedó entero:
 ```bash
 grep -c "^CREATE TABLE public\."  supabase/test-bootstrap.sql     # 36
 grep -c "^CREATE POLICY "         supabase/test-bootstrap.sql     # 10
+grep -n "seeds/catalog.sql"       supabase/test-bootstrap.sql     # el marcador, y el seed entero detrás
 grep -n "seeds/acceptance.sql"    supabase/test-bootstrap.sql
 ```
 
@@ -1090,52 +1113,60 @@ muy por encima de 43 los delata.
 
 ### 7.5 Regenerar `app/supabase/test-bootstrap.sql`
 
-Equivalente de 2.5. El bloque de concatenación de bash usa `mktemp`, `{}` y `&&`;
+Equivalente de 2.8. El bloque de concatenación de bash usa `mktemp`, `{}` y `&&`;
 en PowerShell se arma el contenido en una variable y se escribe con UTF-8 **sin
 BOM**, que es el equivalente de `cat` + `>`:
 
 ```powershell
 Set-Location D:\u\orabella\app
 
-$Squash = 'supabase/migrations/001_orabella_schema.sql'
-$Seed   = 'supabase/seeds/acceptance.sql'
-$Destino = 'supabase/test-bootstrap.sql'
+$Squash   = 'supabase/migrations/001_orabella_schema.sql'
+$Catalog  = 'supabase/seeds/catalog.sql'
+$Seed     = 'supabase/seeds/acceptance.sql'
+$Destino  = 'supabase/test-bootstrap.sql'
 $Temporal = 'supabase/test-bootstrap.sql.tmp'
 
-$contenido = @(
+# Las TRES piezas del 2.8, en el mismo orden y con los MISMOS separadores: un
+# "`n" entre cada `cat`, que es lo que hace que este bloque produzca el mismo
+# archivo, byte a byte, que el de bash.
+$cabecera = @(
   '-- test-bootstrap.sql — generado, no editado a mano.'
-  '-- Orden: 001_orabella_schema.sql y luego seeds/acceptance.sql.'
-  '-- Regenerar con el paso 2.5 de supabase/squash/README.md.'
+  '-- Orden: 001_orabella_schema.sql, luego seeds/catalog.sql y luego seeds/acceptance.sql.'
+  '-- Regenerar con el paso 2.8 de supabase/squash/README.md.'
   ''
-  (Get-Content -LiteralPath $Squash -Raw -Encoding utf8)
-  ''
-  '-- ================= seeds/acceptance.sql ================='
-  (Get-Content -LiteralPath $Seed -Raw -Encoding utf8)
 ) -join "`n"
+
+$contenido = $cabecera + "`n" +
+             (Get-Content -LiteralPath $Squash  -Raw -Encoding utf8) + "`n" +
+             "-- ================= seeds/catalog.sql =================`n" +
+             (Get-Content -LiteralPath $Catalog -Raw -Encoding utf8) + "`n" +
+             "-- ================= seeds/acceptance.sql =================`n" +
+             (Get-Content -LiteralPath $Seed    -Raw -Encoding utf8)
 
 [System.IO.File]::WriteAllText($Temporal, $contenido, [System.Text.UTF8Encoding]::new($false))
 Move-Item -LiteralPath $Temporal -Destination $Destino -Force
 ```
 
 Se escribe primero a un temporal y luego se mueve sobre el destino, igual que el
-`> "$TMP" && mv "$TMP"` del 2.5: así el destino nunca queda a medio escribir si
+`> "$TMP" && mv "$TMP"` del 2.8: así el destino nunca queda a medio escribir si
 algo falla. `UTF8Encoding($false)` es lo que evita el BOM, y el BOM es lo que
 `Set-Content`/`Out-File` meterían sin pedirlo. El separador `"`n"` deja el archivo
 en LF, igual que en bash; si se prefiere CRLF en Windows, es `"`r`n"` y no cambia
-la semántica del SQL.
+la semántica del SQL, pero deja de ser idéntico byte a byte al del bash.
 
-Y las tres comprobaciones del 2.5:
+Y las comprobaciones del 2.8:
 
 ```powershell
 # esperado: 36
 (Select-String -LiteralPath $Destino -Pattern '^CREATE TABLE public\.').Count
 # esperado: 10
 (Select-String -LiteralPath $Destino -Pattern '^CREATE POLICY ').Count
+Select-String -LiteralPath $Destino -Pattern 'seeds/catalog.sql'
 Select-String -LiteralPath $Destino -Pattern 'seeds/acceptance.sql'
 ```
 
 Si `001_orabella_schema.sql` todavía no existe, esto se ejecuta **después** de
-redactar ese archivo, igual que en el 2.5.
+redactar ese archivo, igual que en el 2.8.
 
 ### 7.6 `app/supabase/seeds/acceptance.sql` no se toca
 

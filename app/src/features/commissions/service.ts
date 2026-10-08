@@ -97,7 +97,7 @@ export async function upsertCommissionRule(raw: unknown): Promise<CommissionRule
     .eq("id", input.item_id)
     .maybeSingle();
   if (itemError) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  if (!item) throw new CommissionError("NOT_FOUND", "Ítem no encontrado en esta sede.", 404);
+  if (!item) throw new CommissionError("NOT_FOUND", "Ítem no encontrado.", 404);
 
   const { data: employee, error: employeeError } = await db
     .from("employees")
@@ -105,7 +105,7 @@ export async function upsertCommissionRule(raw: unknown): Promise<CommissionRule
     .eq("id", input.employee_id)
     .maybeSingle();
   if (employeeError) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  if (!employee) throw new CommissionError("NOT_FOUND", "Empleado no encontrado en esta sede.", 404);
+  if (!employee) throw new CommissionError("NOT_FOUND", "Empleado no encontrado.", 404);
 
   const { data, error } = await db
     .from("commission_rules")
@@ -362,9 +362,10 @@ const PAYOUT_SELECT =
  * no puede devolver una fila que el índice no habría bloqueado.
  *
  * La sede NO entra en la clave porque no agrega identidad: la factura es el
- * registro de la operación (una factura ajena es NOT_FOUND en
- * `earnedCommissionFor`), así que este lookup corre DESPUÉS de esa validación y
- * no puede devolver el pago de otra factura.
+ * registro de la operación, y `earnedCommissionFor` no la resuelve por la SEDE
+ * sino por su id —su NOT_FOUND es solo "no existe esa factura"—, así que este
+ * lookup corre DESPUÉS de esa validación y no puede devolver el pago de otra
+ * factura.
  */
 async function findCommissionPayoutByIdempotencyKey(
   db: DbClient,
@@ -411,8 +412,12 @@ async function findCommissionPayoutByIdempotencyKey(
  * se registró—. Es el mismo razonamiento de CL-3 para el cobro de factura.
  *
  * POR QUÉ ACÁ Y NO AL PRINCIPIO DE TODO (limitación declarada): el par tiene que
- * estar validado dentro de la sede del actor antes de que la marca se resuelva,
- * y esa validación vive en `earnedCommissionFor` (la anulación incluida). La
+ * estar validado antes de que la marca se resuelva, y esa validación vive en
+ * `earnedCommissionFor` (la anulación incluida, por `assertInvoicePaid`) más el
+ * `NOTHING_EARNED` que el llamador saca de su `lines`: la factura tiene que
+ * EXISTIR, estar Pagada y el par tener líneas que comisionan. La SEDE no es un
+ * criterio —las lecturas de esa función filtran por id, por factura y por
+ * empleado, y el actor no trae sede—. La
  * contrapartida, declarada: un reintento que llegue con la factura ANULADA, sin
  * turno abierto (NO_OPEN_SHIFT), con el método ya inactivo (METHOD_INACTIVE) o
  * con el empleado marcado `no_aplica` se rechaza en vez de reconocerse —el caso
@@ -467,7 +472,7 @@ export async function payCommissionNow(
   if (!method) {
     throw new CommissionError(
       "METHOD_INACTIVE",
-      `El método de pago ${input.method_code} no está activo en esta sede.`,
+      `El método de pago ${input.method_code} no está activo en la instalación.`,
       422,
     );
   }
@@ -497,7 +502,8 @@ export async function payCommissionNow(
   // pago ya registrado, sin escribir nada y sin que el tope acumulado de 034 (que
   // usa la MISMA aritmética que la validación de abajo) lo confunda con un pago
   // nuevo. Va después de `earnedCommissionFor` porque ahí es donde el par queda
-  // validado dentro de la sede del actor (ver el encabezado).
+  // validado (factura existente y Pagada, con líneas que comisionan; la SEDE no
+  // es un criterio) — ver el encabezado.
   const repeated = await findCommissionPayoutByIdempotencyKey(
     db,
     input.invoice_id,

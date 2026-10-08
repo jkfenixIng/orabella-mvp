@@ -28,16 +28,12 @@ import type { ActionResult } from "@/src/shared/lib/api-response";
 import { bogotaDay } from "@/src/shared/lib/dates";
 import { checkVoucherEligibility, weekStartOf } from "@/src/features/payroll/schemas";
 import { toNumber } from "@/src/shared/lib/format";
-import { cn } from "@/src/components/ui/lib/utils";
 import {
   buttonClass,
   ghostClass,
   inputClass,
   labelClass,
   sectionClass,
-  tableCellClass,
-  tableHeaderClass,
-  tableRowClass,
 } from "@/src/shared/lib/ui-styles";
 
 /** Campo de solo lectura del detalle: etiqueta pequeña sobre el valor. */
@@ -667,72 +663,118 @@ export function VouchersClient(props: VouchersClientProps) {
           // VACÍO con filtros de estado/empleado puestos sobre filas cargadas.
           <p className="mt-4 text-sm text-text-tertiary">Sin vales para estos filtros.</p>
         ) : (
-          <div className="mt-4 overflow-x-auto">
-            <table className={cn("w-full text-left text-sm", "min-w-[760px]")}>
-              <thead>
-                <tr className={tableHeaderClass}>
-                  <th className={tableCellClass} scope="col">
-                    Empleado
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Monto
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Fecha
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Estado
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Método
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Acciones
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredVouchers.map((row) => (
-                  <tr key={row.id} className={tableRowClass}>
-                    <td className={cn(tableCellClass, "font-medium")}>{employeeName(row.employee_id)}</td>
-                    <td className={tableCellClass}>{formatMoney(row.amount)}</td>
-                    <td className={tableCellClass}>{row.request_date}</td>
-                    <td className={tableCellClass}>
+          // R4 + R-e2: la lista del mostrador. Antes era una
+          // `<table className="min-w-[760px]">` dentro de un carril de
+          // `overflow-x-auto` de 238-330 px en un teléfono, así que la columna
+          // `Acciones` —`Ver detalle`, `Aprobar` y `Rechazar`, la acción por la
+          // que existe la pantalla— medía `left 674 / right 776` en los cuatro
+          // anchos angostos y no respondía a `elementFromPoint`.
+
+          // Ahora es el patrón de `invoices-client.tsx` (R38), el mismo y no
+          // otro: abajo de `sm` cada fila es una TARJETA de cuatro renglones y
+          // cada valor lleva su rótulo —la palabra del encabezado, la misma, y
+          // por eso las dos superficies no pueden divergir—; arriba de `sm` cada
+          // hoja se ancla a su columna con `sm:col-start-N` y la grilla conserva
+          // las seis columnas de hoy, en su orden. La escala se declara una vez
+          // por superficie, así que no hay piso de ancho inventado ni carril que
+          // arrastrar.
+
+          // PRIORIDAD DE LA TARJETA —lo que hay que ver para decidir una
+          // aprobación, en el orden en que se lee:
+          // 1. QUIÉN pidió el vale (Empleado): sin identidad no hay decisión.
+          // 2. CUÁNTO y EN QUÉ ESTADO (Monto + Estado): el dinero y el estado
+          // son el veredicto; van en la misma línea, uno a cada lado.
+          // 3. DE QUÉ TIPO y CUÁNDO (Método + Fecha): el método es por dónde
+          // sale el dinero —lo que el admin tiene que contrastar con la
+          // caja— y la fecha es la del día en revisión.
+          // 4. LA ACCIÓN (Acciones): su propio renglón, con sus tres botones
+          // envueltos, y sin gesto horizontal para llegar.
+          // Lo que NO se apila porque no decide y ya está a mano en `Ver
+          // detalle`: quién creó el registro, quién aprobó y la observación.
+          <div className="mt-4 overflow-hidden rounded-lg border border-color-2 dark:border-border-color">
+            {/* El encabezado nombra las seis columnas y sólo existe arriba de
+                `sm`: abajo la fila dice cada rótulo con su propio valor. */}
+            <div
+              aria-hidden="true"
+              className="hidden grid-cols-[minmax(0,1.44fr)_minmax(0,0.77fr)_minmax(0,0.87fr)_minmax(0,0.82fr)_minmax(0,1.21fr)_minmax(0,1.14fr)] gap-2 border-b border-color-2 bg-surface px-3 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary sm:grid dark:border-border-color"
+            >
+              <span>Empleado</span>
+              <span>Monto</span>
+              <span>Fecha</span>
+              <span>Estado</span>
+              <span>Método</span>
+              <span className="text-center">Acciones</span>
+            </div>
+            <ul className="flex flex-col divide-y divide-color-2 dark:divide-border-color">
+              {filteredVouchers.map((row) => (
+                <li
+                  key={row.id}
+                  className="flex flex-col gap-1 px-3 py-2.5 sm:grid sm:grid-cols-[minmax(0,1.44fr)_minmax(0,0.77fr)_minmax(0,0.87fr)_minmax(0,0.82fr)_minmax(0,1.21fr)_minmax(0,1.14fr)] sm:items-center sm:gap-2"
+                >
+                  {/* Las cuatro líneas de la tarjeta móvil. Abajo de `sm` cada
+                      hoja es un renglón con su rótulo; cada envoltorio
+                      `sm:contents` se borra de la grilla de arriba, donde la
+                      hoja se queda en la columna que su `sm:col-start-N` fija. */}
+                  <span className="flex items-center gap-2 sm:contents">
+                    <span className="break-words text-sm font-medium text-text-primary sm:col-start-1 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Empleado: </span>
+                      {employeeName(row.employee_id)}
+                    </span>
+                  </span>
+                  <span className="flex items-center justify-between gap-2 sm:contents">
+                    <span className="whitespace-nowrap text-sm font-medium text-text-primary sm:col-start-2 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Monto: </span>
+                      {formatMoney(row.amount)}
+                    </span>
+                    <span className="sm:col-start-4 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Estado: </span>
                       <span className="rounded bg-surface-hover px-2 py-0.5 text-xs text-text-secondary">
                         {row.status}
                         {row.status === "descontada" ? " (en nómina: sin cambios)" : ""}
                       </span>
-                    </td>
-                    <td className={tableCellClass}>{methodLabel(row.method_code)}</td>
-                    <td className={tableCellClass}>
-                      <div className="flex flex-wrap gap-2">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setError(null);
-                            setDetailTarget(row);
-                          }}
-                          className={ghostClass}
-                          aria-label={`Ver detalle del vale de ${employeeName(row.employee_id)}`}
-                        >
-                          Ver detalle
-                        </button>
-                        {props.canAdmin && row.status === "pendiente" && (
-                          <>
-                            <button type="button" onClick={() => openReview(row.id, "approve")} disabled={busy} className={ghostClass}>
-                              Aprobar
-                            </button>
-                            <button type="button" onClick={() => openReview(row.id, "reject")} disabled={busy} className={ghostClass}>
-                              Rechazar
-                            </button>
-                          </>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                    </span>
+                  </span>
+                  <span className="flex items-center justify-between gap-2 sm:contents">
+                    <span className="break-words text-sm text-text-primary sm:col-start-5 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Método: </span>
+                      {methodLabel(row.method_code)}
+                    </span>
+                    <span className="whitespace-nowrap text-sm text-text-primary sm:col-start-3 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Fecha: </span>
+                      {row.request_date}
+                    </span>
+                  </span>
+                  {/* La acción en su propio renglón: `flex-wrap` para que los
+                      tres botones quepan en 320 px sin empujar la fila. */}
+                  <span className="flex flex-wrap items-center gap-2 sm:contents">
+                    <span className="flex flex-wrap items-center gap-2 sm:col-start-6 sm:row-start-1 sm:justify-center">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Acciones: </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setError(null);
+                          setDetailTarget(row);
+                        }}
+                        className={ghostClass}
+                        aria-label={`Ver detalle del vale de ${employeeName(row.employee_id)}`}
+                      >
+                        Ver detalle
+                      </button>
+                      {props.canAdmin && row.status === "pendiente" && (
+                        <>
+                          <button type="button" onClick={() => openReview(row.id, "approve")} disabled={busy} className={ghostClass}>
+                            Aprobar
+                          </button>
+                          <button type="button" onClick={() => openReview(row.id, "reject")} disabled={busy} className={ghostClass}>
+                            Rechazar
+                          </button>
+                        </>
+                      )}
+                    </span>
+                  </span>
+                </li>
+              ))}
+            </ul>
           </div>
         )}
         {/* Detalle de solo lectura: disponible para cualquier rol, sin acciones. */}

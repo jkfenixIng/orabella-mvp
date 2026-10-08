@@ -5,7 +5,12 @@ import { PageContainer, PageHeader } from "@/src/components/ui/lib/page";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
 import { listAllEmployees, listPaymentMethods } from "@/src/features/admin/service";
-import { getPayrollStartDate, listPayrollOverview, listPeriods } from "@/src/features/payroll/service";
+import {
+  getPayrollCadenceAnchors,
+  getPayrollStartDate,
+  listPayrollOverview,
+  listPeriods,
+} from "@/src/features/payroll/service";
 import { PayrollClient } from "./payroll-client";
 
 export const dynamic = "force-dynamic";
@@ -57,14 +62,22 @@ export default async function PayrollPage() {
   // que SOLO el admin lo recibe. Al empleado se le manda únicamente su propia
   // fila: pasarle la planta entera sería exponerle documentos, teléfonos y
   // sueldos ajenos.
-  const [employees, methods, overview, payrollStartDate] = await Promise.all([
+  const [employees, methods, overview, cadenceAnchors, historyFloor] = await Promise.all([
     listAllEmployees(),
     listPaymentMethods(),
-    canAdmin ? listPayrollOverview(sedeId) : null,
-    // F10: la fecha desde la que la nómina OPERA en la sede. Sólo el admin la
-    // usa (es el control de configuración de la pantalla): al empleado no se le
-    // manda la configuración de la sede, sólo su recibo.
-    canAdmin ? getPayrollStartDate(sedeId) : null,
+    canAdmin ? listPayrollOverview() : null,
+    // T5: el anclaje DECLARADO por cadencia es configuración de la nómina de la
+    // instalación (decide qué días ya están pagados) y sólo la usa la superficie
+    // del admin —el aviso de pendientes y su declaración—, así que se lee sólo
+    // para el admin: al empleado no se le muestra ni se le lee de más. Son tres
+    // claves en una lectura, y el cliente las recibe ya derivadas (el ancla
+    // ajustada al sábado y los días absorbidos), sin volver a aplicar la regla.
+    canAdmin ? getPayrollCadenceAnchors() : null,
+    // F10 (evidencia): el piso de la nómina —el más antiguo entre el primer
+    // período y la primera factura— se lee UNA vez acá y viaja como prop. El
+    // cliente no lo re-deriva: con facturas y sin períodos, su propia derivación
+    // ofrecía ciclos que la facturación ya desmentía.
+    canAdmin ? getPayrollStartDate() : null,
   ]);
 
   // El admin ya tiene los períodos dentro del resumen: se usan esos y la lectura
@@ -84,7 +97,8 @@ export default async function PayrollPage() {
         initialEmployees={visibleEmployees}
         initialPeriods={periods}
         initialSummaries={overview?.summaries ?? []}
-        initialPayrollStartDate={payrollStartDate ?? null}
+        initialCadenceAnchors={cadenceAnchors ?? {}}
+        initialHistoryFloor={historyFloor}
         methods={methods.filter((row) => row.is_active)}
         canAdmin={canAdmin}
         canPay={canPay}

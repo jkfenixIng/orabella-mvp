@@ -2,7 +2,7 @@
 
 import * as React from 'react'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
-import { Slot } from '@radix-ui/react-slot'
+import { X } from 'lucide-react'
 import { cn } from './utils'
 
 type DialogProps = React.ComponentPropsWithoutRef<typeof DialogPrimitive.Root>
@@ -60,26 +60,40 @@ type DialogTriggerProps = React.ComponentPropsWithoutRef<typeof DialogPrimitive.
   asChild?: boolean
 }
 
+/**
+ * Disparador de apertura.
+ *
+ * Renderiza `DialogPrimitive.Trigger` y NO un `Slot` pelado. Antes renderizaba
+ * `Slot` o un `<button>` y nada más: se declaraba del tipo
+ * `DialogPrimitive.Trigger`, pero no ERA uno, así que no se conectaba al
+ * contexto de Radix. Lo que se pierde al no serlo no es cosmético:
+ *
+ *   - `onClick` no alternaba el diálogo, porque el alternado vive en Radix;
+ *   - `triggerRef` quedaba vacío, y `DialogContent` (modal) hace
+ *     `onCloseAutoFocus: preventDefault()` y después
+ *     `triggerRef.current?.focus()`. Sin disparador, ese `?.` no enfoca NADA y
+ *     el `preventDefault()` le impide a `FocusScope` su propio rescate: el foco
+ *     se perdía en el `BODY` al cerrar.
+ *   - tampoco emitía `aria-haspopup="dialog"` ni `aria-expanded`.
+ *
+ * Esa última línea es el R2 medido del cajón móvil («al cerrar el foco queda en
+ * el cuerpo»). El tipo y el `asChild` no cambian: la firma pública queda igual.
+ */
 const DialogTrigger = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Trigger>,
   DialogTriggerProps
->(({ className, children, type, asChild = false, ...props }, ref) => {
-  const Comp = asChild ? Slot : 'button'
-
-  return (
-    <Comp
-      ref={ref}
-      type={type ?? 'button'}
-      className={cn(
-        'inline-flex h-10 items-center justify-center rounded-md border border-border-color bg-surface px-4 py-2 text-sm font-medium text-text-primary shadow-sm transition-all duration-200 hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 dark:border-border-color-2 dark:text-text-primary dark:hover:bg-surface-hover dark:focus-visible:ring-primary-400 dark:focus-visible:ring-offset-2',
-        className,
-      )}
-      {...props}
-    >
-      {children}
-    </Comp>
-  )
-})
+>(({ className, children, ...props }, ref) => (
+  <DialogPrimitive.Trigger
+    ref={ref}
+    className={cn(
+      'inline-flex h-10 items-center justify-center rounded-md border border-border-color bg-surface px-4 py-2 text-sm font-medium text-text-primary shadow-sm transition-all duration-200 hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 dark:border-border-color-2 dark:text-text-primary dark:hover:bg-surface-hover dark:focus-visible:ring-primary-400 dark:focus-visible:ring-offset-2',
+      className,
+    )}
+    {...props}
+  >
+    {children}
+  </DialogPrimitive.Trigger>
+))
 DialogTrigger.displayName = DialogPrimitive.Trigger.displayName
 
 type DialogCloseProps = React.ComponentPropsWithoutRef<typeof DialogPrimitive.Close> & {
@@ -89,23 +103,20 @@ type DialogCloseProps = React.ComponentPropsWithoutRef<typeof DialogPrimitive.Cl
 const DialogClose = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Close>,
   DialogCloseProps
->(({ className, children, type, asChild = false, ...props }, ref) => {
-  const Comp = asChild ? Slot : 'button'
-
-  return (
-    <Comp
-      ref={ref}
-      type={type ?? 'button'}
-      className={cn(
-        'inline-flex h-10 items-center justify-center rounded-md border border-border-color bg-surface px-4 py-2 text-sm font-medium text-text-primary shadow-sm transition-all duration-200 hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 dark:border-border-color-2 dark:text-text-primary dark:hover:bg-surface-hover dark:focus-visible:ring-primary-400 dark:focus-visible:ring-offset-2',
-        className,
-      )}
-      {...props}
-    >
-      {children}
-    </Comp>
-  )
-})
+>(({ className, children, type, asChild = false, ...props }, ref) => (
+  <DialogPrimitive.Close
+    ref={ref}
+    asChild={asChild}
+    type={type ?? 'button'}
+    className={cn(
+      'inline-flex h-10 items-center justify-center rounded-md border border-border-color bg-surface px-4 py-2 text-sm font-medium text-text-primary shadow-sm transition-all duration-200 hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 dark:border-border-color-2 dark:text-text-primary dark:hover:bg-surface-hover dark:focus-visible:ring-primary-400 dark:focus-visible:ring-offset-2',
+      className,
+    )}
+    {...props}
+  >
+    {children}
+  </DialogPrimitive.Close>
+))
 DialogClose.displayName = DialogPrimitive.Close.displayName
 
 const DialogOverlay = React.forwardRef<
@@ -215,6 +226,33 @@ function usePopoverLayer(): number {
   return computePopoverZIndex(useOpenDialogCount())
 }
 
+/**
+ * R-C — LA CLASE DEL CIERRE QUE MONTA `DialogContent`, y que nadie puede
+ * tumbar. Tres decisiones, cada una contra un defecto medido:
+ *
+ *   · ES UNA CONSTANTE, no `cn(constante, props.className)`: si el llamador
+ *     pudiera fusionarle clases, cualquiera podría esconderla y el cierre
+ *     volvería a no existir en esa pantalla. Por eso `className` acá es la
+ *     constante, y `DialogClose` (el componente) sigue aceptando `className`
+ *     para quien lo use por su cuenta.
+ *   · DECLARA SU PROPIO FONDO: los seis diálogos de hoja completa de
+ *     facturación son `bg-transparent` con la hoja de papel adentro; un cierre
+ *     que tomará el fondo del contenedor se volvería invisible sobre la concha
+ *     oscura.
+ *   · NO SE SALE DE LA CAJA: `right-4 top-4`, nunca un desplazamiento negativo.
+ *     Tres de los veintinueve diálogos recortan su propia caja
+ *     (`overflow-y-hidden` en el de emisión y en el cajón, `overflow-hidden` en
+ *     inventario): un cierre empujado hacia afuera se cortaría por la mitad ahí
+ *     y en ningún otro lado, que es la peor forma de fallar.
+ *
+ * Medidas congeladas: 36×36 en escritorio (es la densidad que declara el
+ * diálogo) y 44×44 debajo de `sm`, inclusive en el último píxel del rango
+ * (639), porque ahí es donde un breakpoint mal escrito deja el control corto
+ * sin que nadie lo note.
+ */
+const DIALOG_CLOSE_BUTTON_CLASS =
+  'absolute right-4 top-4 z-10 inline-flex h-9 w-9 items-center justify-center rounded-md border border-border-color bg-surface text-text-secondary shadow-sm transition-colors hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 max-sm:min-h-11 max-sm:min-w-11 dark:border-border-color-2 dark:bg-surface dark:text-text-primary'
+
 const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
   DialogContentProps
@@ -231,12 +269,51 @@ const DialogContent = React.forwardRef<
       <DialogPrimitive.Content
         ref={ref}
         style={{ zIndex: contentZ, ...props.style }}
+        // R7: el diálogoRespira. Antes era `w-full … p-6`, y medido a
+        // 320/360/390 el rect daba `left=0, right=viewport`: GUTTER 0 en los
+        // dos lados, con una caja de contenido de `ancho−48` (272 px a 320).
+        // Un borde pegado al borde no se lee como diálogo: se lee como la
+        // página. Abajo de `sm` el padding baja a `p-4` porque hay menos ancho
+        // para él; desde `sm` vuelve a `p-6`.
+        //
+        // `w-[calc(100%-2rem)]` TODAS las anchuras, no solo abajo de `sm`. MEDIDO
+        // a 1024 con `sm:w-full` a secas: el diálogo de emisión (`max-w-5xl` =
+        // exactamente 1024 px) daba `width=1024`, `left=0`, `right=1024` y
+        // GUTTER 0/0 — el mismo defecto de R7, un breakpoint más arriba. Y a
+        // 1440 el MISMO diálogo mide 1024 con gutter 208/208: no es una hoja
+        // que deba ser de sangre completa, es un `max-w` que a 1024 coincide con
+        // el viewport y se come el gutter.
+        //
+        // POR QUÉ NO SE ARREGLA CON `sm:max-w-[calc(100%-2rem)]`, que parece lo
+        // obvio: `max-width` es UNA PROPIEDAD, y la variante de `sm:` llega
+        // después en la cascada, así que PISA al `max-w-5xl` del llamador en vez
+        // de cruzarse con él. MEDIDO: con ese token el diálogo de emisión mide
+        // 1408 px a 1440 con gutter 16 — la factura se estiraba a lo ancho de
+        // toda la pantalla para tapar un marco de 24 px que ya no existía. Arreglar
+        // R7 así cambia el ancho de un documento: no es un arreglo, es otro
+        // defecto. Sin `sm:w-full`, `width` y `max-width` son propiedades
+        // DISTINTAS y el navegador toma la menor: `min(ancho−2rem, max-w)`, que
+        // deja 1 rem de gutter donde el `max-w` no manda y NO lo toca donde sí
+        // manda (1440 → 1024, igual que antes).
+        //
+        // `100dvh` y no `100vh`: `vh` mide el viewport con la barra de
+        // direcciones DESPLEGADA, así que en un teléfono real el borde
+        // inferior del diálogo queda debajo de la barra y el último campo
+        // (el que la auditoría no alcanzó a medir porque en Chromium headless
+        // `100vh == 100dvh == innerHeight` en los cuatro anchos) es el que
+        // primero se pierde. Es la misma regla que ya aplica
+        // `src/components/ui/lib/page.tsx:56` (`min-h-dvh`) y lo afirma
+        // `tests/ux-structure.test.ts`: el cambio NO es medible acá, es
+        // correcto por la regla.
         className={cn(
-          'fixed left-1/2 top-1/2 grid w-full max-w-lg -translate-x-1/2 -translate-y-1/2 max-h-[calc(100vh-2rem)] overflow-y-auto rounded-lg border border-border-color bg-surface p-6 shadow-xl outline-none transition duration-150 data-[state=open]:scale-100 data-[state=open]:opacity-100 data-[state=closed]:scale-95 data-[state=closed]:opacity-0 dark:border-border-color-2 dark:bg-surface',
+          'fixed left-1/2 top-1/2 grid w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-lg border border-border-color bg-surface p-4 shadow-xl outline-none transition duration-150 data-[state=open]:scale-100 data-[state=open]:opacity-100 data-[state=closed]:scale-95 data-[state=closed]:opacity-0 sm:p-6 dark:border-border-color-2 dark:bg-surface',
           className,
         )}
         {...props}
       >
+        <DialogClose aria-label="Cerrar" className={DIALOG_CLOSE_BUTTON_CLASS}>
+          <X aria-hidden="true" className="h-4 w-4" />
+        </DialogClose>
         {children}
       </DialogPrimitive.Content>
     </DialogPrimitive.Portal>
@@ -268,11 +345,36 @@ const DialogFooter = React.forwardRef<
 ))
 DialogFooter.displayName = 'DialogFooter'
 
+/**
+ * El TÍTULO del diálogo: `DialogPrimitive.Title`, no un `<h2>` pelado.
+ *
+ * MEDIDO antes de este cambio (Chromium, nombre accesible calculado por el
+ * motor): `""` en los siete diálogos abiertos — el cajón móvil, facturación
+ * (facturar, detalle, editar, agregar ítem), «Nuevo empleado» y «Solicitar
+ * vale» — con `aria-labelledby=null` y `aria-label=null`, y con el texto
+ * CORRECTO a la vista adentro. Siete de siete.
+ *
+ * La causa era una línea: este componente se declaraba del tipo
+ * `React.ElementRef<typeof DialogPrimitive.Title>` y hasta le ponía el
+ * `displayName` de Radix, pero RENDERIZABA un `<h2>` sin `id`. Radix no puede
+ * ver un `<h2>`: el nombre accesible no se arma por tener un encabezado, sino
+ * porque el título se REGISTRE en el contexto y exista el `titleId` que
+ * `DialogPrimitive.Content` pone en su `aria-labelledby`. Sin registro, el
+ * contenido del diálogo queda sin nombre.
+ *
+ * Y no por falta de `<DialogTitle>` en los llamadores: hay 29, uno por cada
+ * `DialogContent`, en 10 archivos. El texto estaba; el MECANISMO no. Por eso el
+ * arreglo es acá y no un `aria-label` por pantalla: 29 pantallas que se pueden
+ * olvidar, contra una primitiva.
+ *
+ * `DialogPrimitive.Title` renderiza un `<h2>` (`Primitive.h2`) con las mismas
+ * clases, así que esto no cambia ni un píxel de lo que se ve.
+ */
 const DialogTitle = React.forwardRef<
   HTMLHeadingElement,
   DialogTitleProps
 >(({ className, ...props }, ref) => (
-  <h2
+  <DialogPrimitive.Title
     ref={ref}
     className={cn(
       'text-lg font-semibold leading-none tracking-tight text-text-primary',
@@ -283,11 +385,22 @@ const DialogTitle = React.forwardRef<
 ))
 DialogTitle.displayName = DialogPrimitive.Title.displayName
 
+/**
+ * La DESCRIPCIÓN del diálogo: `DialogPrimitive.Description`, no un `<p>` pelado.
+ *
+ * Mismo defecto, un peldaño más abajo: sin registro no existe el
+ * `descriptionId`, y `DialogPrimitive.Content` deja el `aria-describedby` sin
+ * poner — el diálogo se anuncia con su nombre y sin decir de qué trata. Los
+ * llamadores que la traen (`FormDialog`, inventario, nómina, servicios) ya
+ * estaban escribiendo el texto; lo que faltaba era el vínculo.
+ *
+ * `DialogPrimitive.Description` renderiza un `<p>` (`Primitive.p`).
+ */
 const DialogDescription = React.forwardRef<
   HTMLParagraphElement,
   DialogDescriptionProps
 >(({ className, ...props }, ref) => (
-  <p
+  <DialogPrimitive.Description
     ref={ref}
     className={cn('text-sm text-text-secondary', className)}
     {...props}

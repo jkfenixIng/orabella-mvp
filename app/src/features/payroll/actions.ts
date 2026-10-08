@@ -29,6 +29,7 @@ import {
   requirePayrollAdmin,
   requirePayrollPayer,
   requirePayrollViewer,
+  setPayrollCadenceAnchor,
   setVoucherLimits,
 } from "./service";
 
@@ -262,17 +263,41 @@ export async function getPayrollSettlementSourcesAction(periodId: string, employ
 }
 
 /**
- * F10/G3b: la fecha desde la que la nómina OPERA en la sede (la fecha de inicio
- * de la implementación). Nada anterior a esa fecha existe para el sistema.
+ * F10 (2026-10-04): el día desde el que la nómina OPERA, DERIVADO de los
+ * períodos (`min(start_date)`). Nadie lo configura: lo declara la primera
+ * liquidación y, de ahí en adelante, lo dan los períodos que existen.
  *
- * La LECTURA sigue en nómina porque el aviso de ciclos pendientes y el diálogo
- * de apertura la necesitan; la ESCRITURA se movió a la plataforma (G3b): el
- * admin de la sede ya no puede cambiarla.
+ * La LECTURA vive en nómina porque es el piso que usan el aviso de ciclos
+ * pendientes, la apertura de un período y el diálogo; la ESCRITURA ya no está en
+ * ninguna parte de este módulo (la que había se mudó a la plataforma, que se
+ * retira en su unidad).
  */
 export async function getPayrollStartDateAction() {
   try {
+    await requirePayrollAdmin(await sessionToken());
+    const data = await getPayrollStartDate();
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
+ * T5 (2026-10-06): declara el anclaje de UNA cadencia — «¿hasta qué día se
+ * pagaron los sueldos de este grupo?».
+ *
+ * Misma lógica y misma guarda que el resto de la escritura de nómina
+ * (`requirePayrollAdmin`): declarar cobertura decide plata —marca días como ya
+ * pagados—, así que la caja no entra al módulo. El actor sale de la sesión, no
+ * del envío, para que la auditoría diga quién lo declaró de verdad. El servicio
+ * valida el día con la MISMA regla que lo lee, respeta la ventana de reparación
+ * y audita el cambio; el cliente muestra su `message` y nunca el código
+ * interno.
+ */
+export async function setPayrollCadenceAnchorAction(input: unknown) {
+  try {
     const session = await requirePayrollAdmin(await sessionToken());
-    const data = await getPayrollStartDate(session.sedeId);
+    const data = await setPayrollCadenceAnchor(input, { userId: session.userId });
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

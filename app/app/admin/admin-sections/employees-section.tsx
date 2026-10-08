@@ -13,9 +13,9 @@ import { upsertEmployeeAction } from "@/src/features/admin/actions";
 import { adminCreateUserAction } from "@/src/features/auth/actions";
 import type { EmployeeRow, SedeUserRow } from "@/src/features/admin/service";
 import type { RoleCode } from "@/src/features/auth/schemas";
-import { DataTable } from "@/src/components/ui/lib/data-table";
 import { EmptyState } from "@/src/components/ui/lib/empty-state";
 import { FormDialog } from "@/src/components/ui/lib/form-dialog";
+import { cn } from "@/src/components/ui/lib/utils";
 import {
   buttonClass,
   ghostClass,
@@ -26,7 +26,6 @@ import {
   sectionTitleClass,
   stackClass,
   tableHeaderClass,
-  tableRowClass,
 } from "../admin-styles";
 import {
   ROLE_OPTIONS,
@@ -260,50 +259,111 @@ export function EmployeesSection({
         </label>
         {visibleRows.length === 0 ? (
           <EmptyState className="mt-2">
-            {rows.length === 0 ? "Aún no hay empleados en esta sede." : "Sin resultados para ese filtro."}
+            {rows.length === 0 ? "Aún no hay empleados en la instalación." : "Sin resultados para ese filtro."}
           </EmptyState>
         ) : (
-          <DataTable minWidth="none" wrapperClassName="mt-3">
-            <thead>
-              <tr className={tableHeaderClass}>
-                <th className="whitespace-nowrap py-1 pr-3">Nombre</th>
-                <th className="whitespace-nowrap py-1 pr-3">Documento</th>
-                <th className="whitespace-nowrap py-1 pr-3">Cargo</th>
-                <th className="whitespace-nowrap py-1 pr-3">Estado</th>
-                <th className="whitespace-nowrap py-1 pr-3">Ver</th>
-                <th className="whitespace-nowrap py-1 pr-3">Editar</th>
-              </tr>
-            </thead>
-            <tbody>
+          // R4 + R38: la lista de Empleados. Antes era una TABLA de seis
+          // columnas dentro del carril `overflow-x-auto` de `DataTable`. Sin
+          // piso (`minWidth="none"`) pero con `whitespace-nowrap` en cada
+          // celda, la tabla no bajaba del ancho de su contenido: el carril
+          // desplazaba y las VEINTE acciones de fila —`Consultar` y `Editar`—
+          // quedaban fuera de la pantalla, sin gesto horizontal que las
+          // trayera. En una celda el dato tampoco tenía dónde caerse sin
+          // arrastrar.
+          //
+          // Ahora es el patrón de `invoices-client.tsx` y
+          // `vouchers-client.tsx`, el mismo y no otro: abajo de `sm` cada fila
+          // es una TARJETA de cuatro renglones y cada valor lleva su rótulo —la
+          // palabra del encabezado, la misma, y por eso las dos superficies no
+          // pueden divergir—; arriba de `sm` cada hoja se ancla a su columna
+          // con `sm:col-start-N` y la grilla conserva las seis columnas de hoy,
+          // en su orden.
+          //
+          // PRIORIDAD DE LA TARJETA, en el orden en que se lee:
+          // 1. QUIÉN es (Nombre): sin identidad no hay legajo.
+          // 2. CON QUÉ documento y en qué ESTADO: lo que resuelve la ficha.
+          // 3. PARA QUÉ está (Cargo): lo que se busca al abrir el turno.
+          // 4. LAS ACCIONES (Consultar, Editar): su propio renglón, envuelto, y
+          //    sin gesto horizontal para llegar a él.
+          // Lo que NO se apila porque ya está a mano en `Consultar`: teléfono,
+          // correo, código interno, fecha de nacimiento, forma de pago y el
+          // resto del legajo.
+          <div className="mt-3 overflow-hidden rounded-lg border border-border-color dark:border-border-color-2">
+            {/* El encabezado nombra las seis columnas y sólo existe arriba de
+                `sm`: abajo la fila dice cada rótulo con su propio valor. */}
+            <div
+              aria-hidden="true"
+              className={cn(
+                "hidden grid-cols-[minmax(0,1.35fr)_minmax(0,0.85fr)_minmax(0,1.15fr)_minmax(0,0.60fr)_minmax(0,0.55fr)_minmax(0,0.60fr)] gap-2 border-b border-border-color px-3 py-2 uppercase tracking-wide sm:grid dark:border-border-color-2",
+                tableHeaderClass,
+              )}
+            >
+              <span>Nombre</span>
+              <span>Documento</span>
+              <span>Cargo</span>
+              <span>Estado</span>
+              <span>Ver</span>
+              <span>Editar</span>
+            </div>
+            <ul className="flex flex-col divide-y divide-border-color dark:divide-border-color-2">
               {visibleRows.map((row) => (
-                <tr key={row.id} className={tableRowClass}>
-                  <td className="max-w-48 truncate whitespace-nowrap py-1 pr-3" title={row.full_name}>
-                    {row.full_name}
-                  </td>
-                  <td className="whitespace-nowrap py-1 pr-3">{row.document}</td>
-                  <td className="whitespace-nowrap py-1 pr-3">{row.position ?? "—"}</td>
-                  <td className="whitespace-nowrap py-1 pr-3">{row.is_active ? "Activo" : "Inactivo"}</td>
-                  <td className="whitespace-nowrap py-1 pr-3">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setError(null);
-                        setDialog({ mode: "view", id: row.id });
-                      }}
-                      className={linkButtonClass}
-                    >
-                      Consultar
-                    </button>
-                  </td>
-                  <td className="whitespace-nowrap py-1 pr-3">
-                    <button type="button" onClick={() => openEdit(row)} className={linkButtonClass}>
-                      Editar
-                    </button>
-                  </td>
-                </tr>
+                <li
+                  key={row.id}
+                  className="flex flex-col gap-1 px-3 py-2.5 sm:grid sm:grid-cols-[minmax(0,1.35fr)_minmax(0,0.85fr)_minmax(0,1.15fr)_minmax(0,0.60fr)_minmax(0,0.55fr)_minmax(0,0.60fr)] sm:items-center sm:gap-2"
+                >
+                  {/* Las cuatro líneas de la tarjeta móvil. Abajo de `sm` cada
+                      hoja es un renglón con su rótulo; cada envoltorio
+                      `sm:contents` se borra de la grilla de arriba, donde la
+                      hoja se queda en la columna que su `sm:col-start-N` fija. */}
+                  <span className="flex items-center gap-2 sm:contents">
+                    <span className="break-words text-sm font-medium text-text-primary sm:col-start-1 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Nombre: </span>
+                      {row.full_name}
+                    </span>
+                  </span>
+                  <span className="flex items-center justify-between gap-2 sm:contents">
+                    <span className="break-words text-sm text-text-primary sm:col-start-2 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Documento: </span>
+                      {row.document}
+                    </span>
+                    <span className="text-sm text-text-primary sm:col-start-4 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Estado: </span>
+                      {row.is_active ? "Activo" : "Inactivo"}
+                    </span>
+                  </span>
+                  <span className="flex items-center gap-2 sm:contents">
+                    <span className="break-words text-sm text-text-primary sm:col-start-3 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Cargo: </span>
+                      {row.position ?? "—"}
+                    </span>
+                  </span>
+                  {/* Las dos acciones en su propio renglón: `flex-wrap` para que
+                      los dos botones quepan en 320 px sin empujar la fila. */}
+                  <span className="flex flex-wrap items-center gap-2 sm:contents">
+                    <span className="flex flex-wrap items-center gap-2 sm:col-start-5 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Ver: </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setError(null);
+                          setDialog({ mode: "view", id: row.id });
+                        }}
+                        className={linkButtonClass}
+                      >
+                        Consultar
+                      </button>
+                    </span>
+                    <span className="flex flex-wrap items-center gap-2 sm:col-start-6 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Editar: </span>
+                      <button type="button" onClick={() => openEdit(row)} className={linkButtonClass}>
+                        Editar
+                      </button>
+                    </span>
+                  </span>
+                </li>
               ))}
-            </tbody>
-          </DataTable>
+            </ul>
+          </div>
         )}
       </section>
 
@@ -433,7 +493,7 @@ export function EmployeesSection({
               />
             </label>
             <label className={labelClass}>
-              Código interno (opcional, único por sede)
+              Código interno (opcional, único en la instalación)
               <input
                 value={form.employee_code}
                 onChange={(event) => setForm({ ...form, employee_code: event.target.value })}
@@ -503,7 +563,7 @@ export function EmployeesSection({
             </label>
             {(dialog?.mode === "create" || (dialog?.mode === "edit" && !dialogRow?.user_id)) && (
             <div className="flex flex-col gap-1 text-sm sm:col-span-2">
-              <label className="flex items-center gap-2 font-medium">
+              <label className="relative flex items-center gap-2 font-medium after:absolute after:-inset-1.5">
                 <input
                   type="checkbox"
                   checked={createLogin}
@@ -530,7 +590,10 @@ export function EmployeesSection({
                   <fieldset className="flex flex-col gap-1 text-sm">
                     <legend>Rol</legend>
                     {ROLE_OPTIONS.map((option) => (
-                      <label key={option.value} className="flex items-center gap-1">
+                      <label
+                        key={option.value}
+                        className="relative flex items-center gap-1 after:absolute after:-inset-1.5"
+                      >
                         <input
                           type="radio"
                           name="empleado-rol"
@@ -599,7 +662,7 @@ export function EmployeesSection({
                 className={inputClass}
               />
             </label>
-            <label className="flex items-center gap-2 text-sm">
+            <label className="relative flex items-center gap-2 text-sm after:absolute after:-inset-1.5">
               <input
                 type="checkbox"
                 checked={form.is_active}

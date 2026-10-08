@@ -228,8 +228,15 @@ function CommissionModeSelector(props: {
           onClick={() => props.onChange(mode)}
           className={
             props.value === mode
-              ? "bg-slate-900 px-2 py-1 text-[10px] font-semibold text-white"
-              : "bg-white px-2 py-1 text-[10px] font-medium text-slate-700 hover:bg-slate-100"
+              ? /* R16/R36: el selector computaba 10 px de fuente y 23 px de alto
+                 MEDIDOS en Chromium. El 12 px es el piso de tipografía del repo y
+                 no se negocia en ningún ancho; el alto de 44 es el piso táctil y
+                 va SOLO por debajo de `sm`, con `min-h` y con la variante
+                 negativa: `h-11` o `sm:min-h-11` subirían el escritorio, que
+                 es la densidad que esta fila conserva. MEDIDO después: 12 px y
+                 44 px a 320/412, 12 px y 24 px a 640/1024. */
+                "bg-slate-900 px-2 py-1 text-xs font-semibold text-white max-sm:min-h-11"
+              : "bg-white px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 max-sm:min-h-11"
           }
         >
           {labels[mode]}
@@ -1400,9 +1407,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   <Plus className="h-4 w-4" aria-hidden="true" />
                   Emitir factura
                 </button>
-                <DialogContent className="max-w-5xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
-                  <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
-                    <DialogHeader className="block">
+                {/* Sangre completa: `p-0` Y `sm:p-0`. La base de la primitiva trae `sm:p-6`, y `tailwind-merge` deja VIVA la variante de `sm:` porque `p-0` no la compite: con `p-0` solo la hoja quedaba a 24 px del borde del diálogo (medido a 1024 y a 1440). */}
+                {/* R32, LA ESTRUCTURA — `flex flex-col overflow-y-hidden`: el diálogo deja de ser el scroller y pasa a ser una columna cuyas tres piezas son encabezado (fijo), medio (scrollea) y pie (fijo). MEDIDO antes, en Chromium, con la sesión y sin enviar nada: 1005 px de contenido en una caja de 536 px a 320×568 y el envío en `y 961-1001`, o sea 393 px más allá del borde inferior del viewport: guardar exigía ~450 px de scroll DENTRO del diálogo (a 390×844, `y 961-1001` contra 844, igual de fuera).
+                    Misma composición que `FormDialog` (encabezado / medio / pie) y SIN `sticky`: el bloque contenedor de un ítem de grilla es su ÁREA, sin recorrido para anclarse, así que un pie pegado con `position: sticky` funcionaría en Chromium y quedaría colgando de la palabra de otro motor. Acá la corrección vive en el árbol, no en el CSS. */}
+                <DialogContent className="max-w-5xl flex flex-col overflow-y-hidden border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
+                  <div className="flex min-h-0 flex-1 flex-col rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
+                    <DialogHeader className="block shrink-0">
                       <DialogTitle className="sr-only">FACTURA DE VENTA</DialogTitle>
                     <div className="border-b-4 border-double border-paper-line-strong px-6 py-5 sm:px-8">
                       <div className="flex flex-wrap items-start justify-between gap-4">
@@ -1420,7 +1430,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       </div>
                     </div>
                     </DialogHeader>
-                    <form onSubmit={submitInvoice} className="flex flex-col gap-5 px-6 py-5 sm:px-8">
+                    <form onSubmit={submitInvoice} className="flex min-h-0 flex-1 flex-col gap-5 px-6 py-5 sm:px-8">
+                      {/* El MEDIO: lo único que scrollea. `min-h-0` para que el hijo pueda encogerse por debajo de su contenido: sin eso el `flex-1` no cede y la hoja vuelve a empujar el pie fuera de la caja. */}
+                      <div className="min-h-0 flex-1 overflow-y-auto">
                       <div className="grid gap-4 sm:grid-cols-2">
                         <label className="flex flex-col gap-1 text-sm font-medium">
                           Señor(es)
@@ -1506,33 +1518,24 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         {item.commission_mode === "ninguna" ? (
                                           <span className="text-xs text-paper-ink-muted">Sin comisión</span>
                                         ) : item.item_type === "servicio" ? (
-                                          <span
-                                            className="text-xs text-paper-ink-tertiary"
-                                            title="Se paga el porcentaje del empleado sobre el subtotal."
-                                          >
+                                          <span className="text-xs text-paper-ink-tertiary">
                                             % del empleado
                                           </span>
                                         ) : item.commission_mode === "porcentaje" ? (
-                                          <span
-                                            className="text-xs text-paper-ink-tertiary"
-                                            title="Porcentaje sobre el subtotal; se paga en nómina."
-                                          >
+                                          <span className="text-xs text-paper-ink-tertiary">
                                             {item.commission_percent_override != null
                                               ? `${item.commission_percent_override}% (ítem)`
                                               : "% del empleado"}
                                           </span>
                                         ) : item.item_type === "producto" ? (
                                           <div className="flex flex-col items-center gap-0.5">
-                                            <span
-                                              className="text-xs text-paper-ink-tertiary"
-                                              title="Valor de comisión por unidad; se multiplica por la cantidad."
-                                            >
+                                            <span className="text-xs text-paper-ink-tertiary">
                                               {item.commission_value == null
                                                 ? "—"
                                                 : formatMoney(item.commission_value)}
                                             </span>
                                             {item.commission_value != null && (
-                                              <span className="text-[10px] text-paper-ink-muted">
+                                              <span className="text-xs text-paper-ink-muted">
                                                 × cantidad
                                               </span>
                                             )}
@@ -1555,14 +1558,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                               placeholder="Valor $"
                                               inputMode="numeric"
                                               aria-label={`Ítem ${index + 1} valor comisión`}
-                                              title="Valor de comisión por unidad; se multiplica por la cantidad."
                                             />
                                             {item.commission_value == null ? (
-                                              <span className="text-[10px] text-paper-ink-muted">
+                                              <span className="text-xs text-paper-ink-muted">
                                                 Requerido
                                               </span>
                                             ) : (
-                                              <span className="text-[10px] text-paper-ink-muted">
+                                              <span className="text-xs text-paper-ink-muted">
                                                 × cantidad
                                               </span>
                                             )}
@@ -1593,6 +1595,20 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             </tbody>
                           </table>
                         </div>
+
+                        {/* R25 — la regla que decide de cuánto se paga a un
+                            empleado NO puede vivir en un `title=`: un tooltip
+                            nativo no se dispara con el dedo, así que en un
+                            teléfono la regla no existía. Va como texto, aquí
+                            debajo, donde se lee la columna de comisión. MEDIDO:
+                            a 320 y a 412 las tres oraciones se leen enteras sin
+                            puntero y sin arrastre horizontal. */}
+                        <p className="text-xs text-paper-ink-muted">
+                          Se paga el porcentaje del empleado sobre el subtotal.
+                          El porcentaje se paga en nómina.
+                          El valor de comisión se multiplica por la cantidad.
+                          Si escribe un porcentaje, ese es el del ítem; si no, aplica el del empleado.
+                        </p>
 
                         <button
                           type="button"
@@ -1782,8 +1798,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           // asertivo, el mismo anuncio que el `<p>` escribía.
                           <Alert variant="destructive">{error}</Alert>
                         )}
-
-                        <div className="flex flex-wrap items-center justify-end gap-3 border-t border-paper-line pt-4">
+                        {/* FIN DEL MEDIO scrolleable. */}
+                      </div>
+                        {/* El PIE: `shrink-0` y FUERA del medio, así que la acción primaria y Cancelar están siempre a la vista sin una sola línea de scroll. Última pieza del `<form>` —igual que en `FormDialog`—, o sea que está EN EL FLUJO y no cubre el último campo: no hace falta relleno extra. */}
+                        <div className="flex shrink-0 flex-wrap items-center justify-end gap-3 border-t border-paper-line pt-4">
                           <button
                             type="button"
                             onClick={cancelCreate}
@@ -1951,37 +1969,49 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 key={row.id}
                 className="flex flex-col gap-1 px-3 py-2.5 sm:grid sm:grid-cols-[2.5rem_7.5rem_minmax(0,1fr)_minmax(0,1fr)_7.5rem_minmax(0,1.2fr)_5.5rem_4.5rem_4.5rem] sm:items-center sm:gap-2"
               >
-                <span className="font-mono text-sm font-semibold text-slate-700 dark:text-slate-300">
-                  #{row.consecutive_number}
+                {/* Las seis líneas de la tarjeta móvil. Abajo de `sm` cada hoja es una
+                    línea con su rótulo —la palabra del encabezado, la misma— y cada
+                    envoltorio `sm:contents` se borra de la grilla de arriba, donde cada
+                    hoja se queda en la columna que su `sm:col-start-N` le fija. */}
+                <span className="flex items-center gap-2 sm:contents">
+                  <span className="font-mono text-sm font-semibold text-slate-700 sm:col-start-1 sm:row-start-1 dark:text-slate-300">
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">ID: </span>#
+                    {row.consecutive_number}
+                  </span>
+                  <span className="whitespace-nowrap text-sm text-slate-500 sm:col-start-2 sm:row-start-1 dark:text-slate-400">
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Fecha: </span>
+                    {new Date(row.created_at).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })}{" "}
+                    {new Date(row.created_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}
+                  </span>
                 </span>
-                <span className="whitespace-nowrap text-sm text-slate-500 dark:text-slate-400">
-                  {new Date(row.created_at).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })}{" "}
-                  {new Date(row.created_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}
+                <span className="flex items-center justify-between gap-2 sm:contents">
+                  <span className="whitespace-nowrap text-sm font-medium text-slate-900 sm:col-start-7 sm:row-start-1 sm:text-right dark:text-slate-100">
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Total: </span>
+                    {formatMoney(row.total)}
+                  </span>
+                  <span className="sm:col-start-8 sm:row-start-1">
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Estado: </span>
+                    <Badge variant={invoiceStatusVariant(row.status)}>{row.status}</Badge>
+                  </span>
                 </span>
-                <span className="truncate text-sm text-slate-600 dark:text-slate-300" title={row.user_name ?? ""}>
-                  {row.user_name ?? "—"}
+                <span className="flex items-center gap-1.5 sm:contents">
+                  <span className="truncate max-sm:whitespace-normal text-sm text-slate-600 sm:col-start-3 sm:row-start-1 dark:text-slate-300" title={row.user_name ?? ""}>
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Abrió: </span>
+                    {row.user_name ?? "—"}
+                  </span>
                 </span>
-                <span className="truncate text-sm text-slate-600 dark:text-slate-300" title={row.closed_by_name ?? ""}>
-                  {row.closed_by_name ?? "—"}
+                <span className="flex items-center gap-1.5 sm:contents">
+                  <span
+                    className="truncate max-sm:whitespace-normal text-sm text-slate-600 sm:col-start-6 sm:row-start-1 dark:text-slate-300"
+                    title={row.employee_names.join(", ")}
+                  >
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Empleados: </span>
+                    {employeeSummary(row.employee_names)}
+                  </span>
                 </span>
-                <span className="whitespace-nowrap text-sm text-slate-500 dark:text-slate-400">
-                  {row.closed_at
-                    ? `${new Date(row.closed_at).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })} ${new Date(row.closed_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}`
-                    : "—"}
-                </span>
-                <span
-                  className="truncate text-sm text-slate-600 dark:text-slate-300"
-                  title={row.employee_names.join(", ")}
-                >
-                  {employeeSummary(row.employee_names)}
-                </span>
-                <span className="whitespace-nowrap text-sm font-medium text-slate-900 sm:text-right dark:text-slate-100">
-                  {formatMoney(row.total)}
-                </span>
-                <span>
-                  <Badge variant={invoiceStatusVariant(row.status)}>{row.status}</Badge>
-                </span>
-                <span className="flex items-center gap-1 sm:justify-center">
+                <span className="flex flex-wrap items-center gap-1 sm:contents">
+                  <span className="flex items-center gap-1 sm:col-start-9 sm:row-start-1 sm:justify-center">
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Acciones: </span>
                   {row.status !== "Anulada" &&
                     (props.isAdmin ||
                       (props.canWrite &&
@@ -1996,7 +2026,15 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       aria-label={`Editar factura ${row.consecutive_number}`}
                       onClick={() => openEdit(row.id)}
                       className={cn(
-                        "rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800",
+                        /* MEDIDO a 320: 34×34 px (16 del icono + 8+8 del `p-2`
+                           + 1+1 del borde), contra el objetivo táctil de 44×
+                           44 (`docs/ux-ui-standard.md` §8). Se sube el blanco
+                           con `max-sm:min-h-11 max-sm:min-w-11` —los dos
+                           ejes, porque 44×44 es lo que se toca— y solo por
+                           debajo de `sm`: desde 640 el botón sigue en 34×34,
+                           que es la densidad de escritorio de esta fila y una
+                           decisión aparte. El icono NO crece. */
+                        "rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800 max-sm:min-h-11 max-sm:min-w-11",
                         shiftBlockReason !== null && "opacity-50",
                       )}
                     >
@@ -2009,11 +2047,26 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     title="Ver detalle"
                     aria-label={`Ver detalle de la factura ${row.consecutive_number}`}
                     onClick={() => openDetail(row.id)}
-                    className="rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                    className="rounded-md border border-slate-300 p-2 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800 max-sm:min-h-11 max-sm:min-w-11"
                   >
                     <Eye className="h-4 w-4" aria-hidden="true" />
                   </button>
                 )}
+                </span>
+                </span>
+                {/* Abajo de `sm` el cierre va al pie y más apagado: es el dato menos
+                    consultado de la fila. Arriba vuelve a su columna y a su cuerpo. */}
+                <span className="flex items-center gap-2 sm:contents">
+                  <span className="truncate max-sm:whitespace-normal text-xs text-slate-500 sm:col-start-4 sm:row-start-1 sm:text-sm dark:text-slate-400" title={row.closed_by_name ?? ""}>
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Cerró: </span>
+                    {row.closed_by_name ?? "—"}
+                  </span>
+                  <span className="whitespace-nowrap text-xs text-slate-500 sm:col-start-5 sm:row-start-1 sm:text-sm dark:text-slate-400">
+                    <span className="font-sans font-medium text-text-secondary sm:hidden">Cerrada: </span>
+                    {row.closed_at
+                      ? `${new Date(row.closed_at).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })} ${new Date(row.closed_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}`
+                      : "—"}
+                  </span>
                 </span>
                   {detail && detail.invoice.id === row.id && (
                     <Dialog
@@ -2022,7 +2075,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         if (!isOpen) closeDetail();
                       }}
                     >
-                    <DialogContent className="max-w-4xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                    {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
+                    <DialogContent className="max-w-4xl border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
                       <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
                         <DialogHeader className="block">
                           <DialogTitle className="sr-only">FACTURA #{detail.invoice.consecutive_number} {detail.invoice.status}</DialogTitle>
@@ -2117,10 +2171,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         {commissionModeOf(row) === "ninguna" ? (
                                           <span className="text-paper-ink-muted">Sin comisión</span>
                                         ) : commissionModeOf(row) === "porcentaje" ? (
-                                          <span
-                                            className="text-paper-ink-tertiary"
-                                            title="Porcentaje sobre el subtotal; se paga en nómina."
-                                          >
+                                          <span className="text-paper-ink-tertiary">
                                             {row.commission_percent_override != null
                                               ? `${row.commission_percent_override}% (ítem)`
                                               : "% del empleado"}
@@ -2137,6 +2188,15 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               </tbody>
                             </table>
                           </div>
+                          {/* R25 — misma regla, mismo texto que en «Emitir factura»:
+                              la que decide de cuánto se paga a un empleado no
+                              puede vivir en un `title=`, que no se dispara con el
+                              dedo. */}
+                          <p className="text-xs text-paper-ink-muted">
+                            Se paga el porcentaje del empleado sobre el subtotal.
+                            El porcentaje se paga en nómina.
+                            El valor de comisión se multiplica por la cantidad.
+                          </p>
                           <h3 className="text-sm font-bold uppercase tracking-wide text-paper-ink-muted">Impuestos</h3>
                           <ul className="mt-1 flex flex-col gap-1 text-sm text-paper-ink">
                             {detail.taxes.map((row) => (
@@ -2320,14 +2380,35 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     (props.isAdmin ||
                       (props.canWrite &&
                         row.status === "Emitida" &&
-                        row.user_id === props.currentUserId)) && (
+                        row.user_id === props.currentUserId)) &&
+                    /* R40: `isEditDialogOpen` es UN estado y este `<Dialog>`
+                       vive dentro del `invoices.map`, así que se montaba una
+                       vez por fila elegible: con dos facturas eran dos modales
+                       «EDITAR FACTURA» abiertos a la vez, con dos overlays en
+                       la pila de apilado y con el `hideOthers` de Radix
+                       dejando a los dos con `aria-hidden="true"` (MEDIDO en
+                       Chromium: una consulta por rol no encontraba ninguno).
+
+                       La fila tiene que ser LA factura que se está editando: el
+                       mismo ancla que ya usa el diálogo de detalle y que hace
+                       que ese se monte una vez sola. `detail` es un único
+                       objeto y `row.id` es la clave de la fila, así que a lo
+                       sumo una fila cumple la condición.
+
+                       NO se hoistea fuera de la fila: serían ~480 líneas
+                       movidas en un archivo donde «Emitir factura» y la fila
+                       son unidades cerradas, y sin forma de medir el
+                       resultado (ver informe). Lo que queda pendiente de esa
+                       versión es que el `Dialog` siga naciendo en el bucle. */
+                    detail?.invoice.id === row.id && (
                     <Dialog
                       open={isEditDialogOpen}
                       onOpenChange={(isOpen) => {
                         if (!isOpen) setIsEditDialogOpen(false);
                       }}
                     >
-                      <DialogContent className="max-w-5xl border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+                      {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
+                      <DialogContent className="max-w-5xl border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
                         <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
                           <DialogHeader className="block">
                             <DialogTitle className="sr-only">EDITAR FACTURA #{detail?.invoice.consecutive_number ?? "—"}</DialogTitle>
@@ -2511,10 +2592,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         {!clientView && (
                                           <td className="px-3 py-2 text-center">
                                             {item.item_type === "servicio" ? (
-                                              <span
-                                                className="text-[10px] text-paper-ink-muted"
-                                                title="Se paga el porcentaje del empleado sobre el subtotal."
-                                              >
+                                              <span className="text-xs text-paper-ink-muted">
                                                 % del empleado
                                               </span>
                                             ) : item.item_type === "producto" ? (
@@ -2552,14 +2630,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                       placeholder="Valor $"
                                                       inputMode="numeric"
                                                       aria-label={`Editar ítem ${index + 1} valor comisión`}
-                                                      title="Valor de comisión por unidad; se multiplica por la cantidad."
                                                     />
                                                     {item.commission_value == null ? (
-                                                      <span className="text-[10px] text-paper-ink-muted">
+                                                      <span className="text-xs text-paper-ink-muted">
                                                         Opcional
                                                       </span>
                                                     ) : (
-                                                      <span className="text-[10px] text-paper-ink-muted">
+                                                      <span className="text-xs text-paper-ink-muted">
                                                         × cantidad
                                                       </span>
                                                     )}
@@ -2599,12 +2676,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                       placeholder="Valor $"
                                                       inputMode="numeric"
                                                       aria-label={`Editar ítem ${index + 1} valor comisión`}
-                                                      title="Valor de comisión por unidad; se multiplica por la cantidad."
                                                     />
                                                     {item.commission_value == null ? (
-                                                      <span className="text-[10px] text-paper-ink-muted">Requerido</span>
+                                                      <span className="text-xs text-paper-ink-muted">Requerido</span>
                                                     ) : (
-                                                      <span className="text-[10px] text-paper-ink-muted">× cantidad</span>
+                                                      <span className="text-xs text-paper-ink-muted">× cantidad</span>
                                                     )}
                                                   </>
                                                 )}
@@ -2624,13 +2700,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                       placeholder="% ítem"
                                                       inputMode="decimal"
                                                       aria-label={`Editar ítem ${index + 1} porcentaje`}
-                                                      title="Porcentaje del subtotal para este ítem."
                                                     />
                                                   ) : (
-                                                    <span
-                                                      className="text-[10px] text-paper-ink-muted"
-                                                      title="El empleado tiene porcentaje propio."
-                                                    >
+                                                    <span className="text-xs text-paper-ink-muted">
                                                       % del empleado
                                                     </span>
                                                   ))}
@@ -2654,6 +2726,17 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 </tbody>
                               </table>
                             </div>
+                            {/* R25 — aquí la tabla también deja escribir el
+                                porcentaje del ítem, así que la regla de DÓNDE
+                                sale ese porcentaje se lee con las otras tres.
+                                MEDIDO: a 320 y 412 las cuatro oraciones se leen
+                                enteras sin puntero. */}
+                            <p className="text-xs text-paper-ink-muted">
+                              Se paga el porcentaje del empleado sobre el subtotal.
+                              El porcentaje se paga en nómina.
+                              El valor de comisión se multiplica por la cantidad.
+                              Si escribe un porcentaje, ese es el del ítem; si no, aplica el del empleado.
+                            </p>
                             <button
                               type="button"
                               onClick={() => openItemDialog("edit")}
@@ -2844,7 +2927,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
           else setIsItemDialogOpen(isOpen);
         }}
       >
-        <DialogContent className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+        {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
+        <DialogContent className="max-w-lg border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
           <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
             <DialogHeader className="block">
               <DialogTitle className="sr-only">
@@ -3170,8 +3254,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
           if (!open && !commissionBusy) closeCommission();
         }}
       >
+        {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
         <DialogContent
-          className="max-w-lg border-0 bg-transparent p-0 shadow-none dark:bg-transparent"
+          className="max-w-lg border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent"
           onInteractOutside={(event) => {
             if (commissionRows.length > 0) event.preventDefault();
           }}
@@ -3273,7 +3358,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
           if (!open && !busy) cancelConfirm();
         }}
       >
-        <DialogContent className="max-w-sm border-0 bg-transparent p-0 shadow-none dark:bg-transparent">
+        {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
+        <DialogContent className="max-w-sm border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
           <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
             <DialogHeader className="block">
               <DialogTitle className="sr-only">

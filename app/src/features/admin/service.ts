@@ -146,7 +146,7 @@ export interface SedeUserRow {
   id: string;
   /**
    * La fila de la cuenta sigue nombrando la instalación a la que pertenece, y
-   * la pestaña de Roles la muestra (`· sin sede`). Es un campo DEVUELTO de la
+   * la pestaña de Roles la muestra (`· sin instalación`). Es un campo DEVUELTO de la
    * lectura, no un criterio con el que esta lectura se acote.
    */
   sede_id: string | null;
@@ -310,7 +310,7 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
     const { data: conflicts, error: conflictError } = await conflictQuery;
     if (conflictError) throw new AdminError("INTERNAL", "Error interno.", 500);
     if (conflicts && conflicts.length > 0) {
-      throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe en esta sede.", 409);
+      throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
     }
   }
 
@@ -409,7 +409,7 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
       if ((altaError as { code?: string }).code === "23505") {
         throw new AdminError(
           "EMPLOYEE_CODE_TAKEN",
-          "El código de empleado ya existe en esta sede.",
+          "El código de empleado ya existe.",
           409,
         );
       }
@@ -433,7 +433,7 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
   // simultánea); se traduce al mismo error de negocio.
   if (error) {
     if ((error as { code?: string }).code === "23505") {
-      throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe en esta sede.", 409);
+      throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
     }
     throw new AdminError("INTERNAL", "Error interno.", 500);
   }
@@ -649,10 +649,16 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
   // dejó de alcanzar —ese era exactamente el agujero—. La administración de una
   // sede SOLO toca roles asignables desde sede; el rol de plataforma se rechaza
   // ANTES del rpc, así que la base no escribe nada: ni lo otorga ni lo quita.
+  //
+  // Y con la capa de plataforma ya retirada (U12), no hay a dónde ir por él: el
+  // mensaje que se lleva la persona lo dice, en vez de mandarla a una puerta que
+  // no existe. Es el MISMO literal en las dos guardas —otorgar y quitar son la
+  // misma verdad sobre el mismo rol— y el rechazo queda idéntico: mismo
+  // `FORBIDDEN`, mismo 403, misma puerta antes del rpc.
   if (parsed.data.roles.some((rol) => !isSedeAssignableRole(rol))) {
     throw new AdminError(
       "FORBIDDEN",
-      "El rol de plataforma solo se administra desde la plataforma.",
+      "El rol superadmin no se puede asignar ni quitar desde la aplicación.",
       403,
     );
   }
@@ -660,7 +666,7 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
   if (rolesActuales.some((rol) => !isSedeAssignableRole(rol))) {
     throw new AdminError(
       "FORBIDDEN",
-      "El rol de plataforma solo se administra desde la plataforma.",
+      "El rol superadmin no se puede asignar ni quitar desde la aplicación.",
       403,
     );
   }
@@ -688,11 +694,16 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
 // ------------------------------------------ listados con caché (catálogos) ---
 //
 // G5: la lista de sedes (`listSedes`, etiqueta `catalog:sedes`) se eliminó con
-// sus dos acciones. Estos servicios ya no leen ni escriben la tabla `sedes`:
-// esa fila la nombra la capa de plataforma, para resolver cuál es la sede de la
-// instalación (la única fila activa) y configurar su fecha de nómina, y el
-// módulo de nómina la lee por clave primaria (`getPayrollStartDate`,
-// `payroll/service.ts`), sin pasar por ninguna lista.
+// sus dos acciones. Estos servicios ya no leen ni escriben la tabla `sedes`, y
+// ya no queda nadie que la lea: se retiró la capa de plataforma, que era la
+// única que nombraba esa fila para CONFIGURAR la fecha de arranque de la nómina.
+// Esa fecha dejó de ser una configuración y pasó a ser un HECHO DERIVADO —
+// `payrollHistoryFloor(periods)`, el `min(payroll_periods.start_date)`, el día
+// del PRIMER período (`payroll/service.ts`)— y cuando todavía no hay ningún
+// período, la declara la primera liquidación, dentro del diálogo de apertura.
+// La fila de `sedes` y su columna de fecha quedan como DEUDA declarada, igual
+// que el rol `superadmin`: borrarlas obliga a regenerar el archivo único de
+// esquema y a resetear las dos bases.
 //
 // La columna `sede_id` sigue existiendo y esta unidad NO la retira: lo que se
 // retiró fue el alcance multi sede de las lecturas que ya no lo necesitan, no la
@@ -708,14 +719,13 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
 //
 // Todo eso se retira con el borrado FÍSICO de la columna en la migración final
 // de una sola sede (M3c), no antes: hasta entonces el servicio tiene que
-// escribirla donde la base la exige. Y mientras la fila exista, la fecha de
-// nómina tiene dónde escribirse.
+// escribirla donde la base la exige.
 //
 // Lo que queda autorizando es el ROL, no la fila: `requireSedeRole` y las guardas
 // de sesión (`requireSession`, `requireAdminSession`) no se tocan. La sede de la
-// sesión sigue siendo un dato real —la cuenta la tiene— y es lo que permite
-// localizar la fila de la instalación (`getPayrollStartDate`); lo que ya no
-// está es el alcance por sede en las lecturas del resto del negocio.
+// sesión sigue siendo un dato real —la cuenta la tiene— y es lo que esos dos
+// candados autorizan; lo que ya no está es el alcance por sede en las lecturas
+// del resto del negocio.
 
 export const listEmployees = unstable_cache(fetchEmployees, ["catalog:employees"], {
   tags: ["catalog:employees"],

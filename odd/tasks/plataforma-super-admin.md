@@ -98,14 +98,22 @@ cuenta a la instalación (ver «Pendientes abiertos»).
   es la sede) y `voucher_settings` por una tabla `system_settings` de clave/valor:
   es lo que eligió el dueño. → `072_system_settings.sql`; `voucher_settings` queda
   con sus datos y ya nadie la lee ni la escribe.
-- **M3c — Pendiente, IRREVERSIBLE, y reubicada (2026-10-02).** La migración que
+- **M3c — CERRADA (2026-10-03).** El borrado físico se ejecutó: `sede_id` ya no existe
+  en ninguna base, PRUEBAS y PRODUCCIÓN quedaron con la columna solo en `users`.
+  Detalle en `esquema-mono-sede-y-archivo-unico.md`. Lo que sigue es el plan tal como
+  se escribió el 2026-10-02: la migración que
   elimina la columna de los DATOS DE NEGOCIO: 27 políticas, 2 claves primarias, el
   `EXCLUDE`, ~17 índices y la columna en 20 tablas. **Ya no se escribe a mano sobre
   el historial**: viaja como `077_drop_sede_id.sql`, la última de la serie de
   migraciones, en su propio lugar y no encima de un dump. Antes de ella ya
   corrieron 073 (se relaja el `NOT NULL` de 18 tablas), 074 (diez unicidades y el
   `EXCLUDE` sin `sede_id`) y 075 (la clave de la regla de comisión, de instalación).
-- **M4 — Descartado (2026-10-02).** Aplastar las 76 migraciones en un solo archivo
+- **M4 — Descartado (2026-10-02) y luego REVERTIDO (2026-10-03).** El dueño revirtió
+  esta decisión y pidió que cada base lleve **una sola migración**: el squash se
+  ejecutó y el archivo vigente es `app/supabase/migrations/001_orabella_schema.sql`,
+  con la serie histórica en `app/supabase/schema-history/`. Detalle en
+  `esquema-mono-sede-y-archivo-unico.md`. Lo que sigue es la decisión original, que
+  **ya no manda**: aplastar las 76 migraciones en un solo archivo
   aplicado. **El dueño evaluó el squash y lo descartó**: el historial de migraciones
   queda como está, un archivo por unidad, y la carpeta sigue siendo la fuente del
   orden y del porqué. El procedimiento que se había escrito en
@@ -150,13 +158,19 @@ irreversible. Desde la 073 nada lee ni escribe la columna en el negocio, así qu
 paso quedó reducido al borrado mecánico, y las fronteras por fila ya están
 resueltas por la 074 y la 075.
 
-**El squash está descartado.** Mientras la 077 estaba por escribirse, el plan era
+**El squash está descartado — SUPERADO el 2026-10-03.** El dueño revirtió esta
+ decisión y el squash se hizo: ver `esquema-mono-sede-y-archivo-unico.md`. Se conserva
+ como historia de lo que se decidió entonces. Mientras la 077 estaba por escribirse, el
+ plan era
 escribirla como `002_*.sql` encima de un `001_orabella_schema.sql` aplastado. El
 dueño evaluó esa vía y la descartó: **el historial de migraciones queda como
 está**, un archivo por unidad. La 077 es una migración más de la serie, con su
 pre-vuelo, su ACL y su `COMMENT` como las demás, y no un parche sobre un dump.
 
 ### Pendientes abiertos
+- **RESUELTO (2026-10-03) por el reset:** las dos bases quedaron con exactamente una
+  sede, activa (`Sede principal`), así que la fila inactiva ya no existe en ninguna.
+  Lo que sigue es el pendiente tal como estaba abierto.
 - La fila de sede inactiva retirada `Plataforma (sistema)` **todavía existe** en la base
   del dueño: es residuo de la estructura multi sede. Hay que borrarla **antes de
   aplicar la `077_drop_sede_id.sql`**, aunque no la bloquee: ninguna migración la va
@@ -189,6 +203,10 @@ pre-vuelo, su ACL y su `COMMENT` como las demás, y no un parche sobre un dump.
 - Consecuencia concreta de M3b: **quitar `invoice_sequences` reinicia el consecutivo de
   la facturación**. Hay que decidir si el contador arranca de cero o hereda el último
   número en su fila de `system_settings`.
+  — **RESUELTO (2026-10-03): hereda.** El reset de PRODUCCIÓN trasladó
+  `system_settings` entero —5 filas, idénticas valor por valor— así que el consecutivo
+  de la instalación no se movió. En una base nueva, `next_invoice_number()` crea la
+  fila en cero por su cuenta.
 
 ## Design
 ### Rol

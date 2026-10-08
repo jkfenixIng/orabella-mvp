@@ -2163,3 +2163,40 @@ describe("commissions: el servicio infiere contra el índice que existe (075)", 
     expect(encabezado).toContain("075_commission_rule_install_key.sql");
   });
 });
+
+describe("commissions: el método de pago se lee del catálogo GLOBAL y el texto lo dice así (U15)", () => {
+  const actor = { userId: "u-cajero" };
+  const MARCA = "5f1c0a7e-3d24-4b6a-9e11-0c8b2d4f6a90";
+
+  beforeEach(() => {
+    resetPayoutStub();
+  });
+
+  it("un método que no está en el catálogo nombra la INSTALACIÓN, no «esta sede»", async () => {
+    // `listPaymentMethods` lee el catálogo ENTERO y sin predicado de sede (074
+    // dejó la restricción en `UNIQUE (code)`; 077 dropeó la columna), así que el
+    // rechazo no puede afirmar un alcance por sede. La condición —el método tiene
+    // que estar activo— sí es real: sólo cambia la palabra que nombra el alcance.
+    const failure: unknown = await payCommissionNow(
+      {
+        invoice_id: payoutStub.INVOICE_ID,
+        employee_id: payoutStub.EMPLOYEE_ID,
+        amount: 3000,
+        method_code: "tarjeta_inexistente",
+        idempotency_key: MARCA,
+      },
+      actor,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(CommissionError);
+    expect(failure).toMatchObject({ code: "METHOD_INACTIVE", status: 422 });
+    expect((failure as CommissionError).message).toBe(
+      "El método de pago tarjeta_inexistente no está activo en la instalación.",
+    );
+    expect((failure as CommissionError).message).not.toContain("sede");
+    // Y no se pagó nada: la guarda corre antes de leer el pendiente y de escribir.
+    expect(payoutStub.inserts).toEqual([]);
+    expect(payoutStub.payouts).toEqual([]);
+    expect(payoutStub.audits).toEqual([]);
+  });
+});

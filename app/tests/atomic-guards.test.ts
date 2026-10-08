@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -177,5 +177,193 @@ describe("orden de las redes de conteo (ROW_COUNT) en las migraciones 0xx", () =
     // Una fila para la 060 con el mecanismo `functiondef` de 055/059.
     expect(diagnostics).toMatch(/\('060',\s*'functiondef'/);
     expect(diagnostics).toContain("'fix-060'");
+  }, FILE_SCAN_TIMEOUT_MS);
+});
+
+/* --------------------------------------------------------------------------
+   El índice único del borrador y el cubo de cadencia (078).
+
+   `payroll_periods` lleva dos garantías que, sin la cadencia, se contradicen:
+
+     * `ex_payroll_periods_no_overlap` (exclusión de 035, reemplazada por 063 y
+       reescrita por 074) prohíbe dos períodos con días en común SOLO dentro del
+       mismo cubo `coalesce(frequency, '')`. Ciclos distintos que se superponen
+       son la regla del dueño, no un defecto.
+     * `uq_payroll_draft_per_range` (007, reescrito por 074) era
+       `UNIQUE (start_date, end_date) WHERE status = 'borrador'`: SIN cadencia,
+       y por lo tantoERA la garantía fuerte que la anterior cuida dejar floja.
+
+   El primer ciclo de cada cadencia se recorta al arranque de la nómina (F10) y
+   todas las cadencias cierran en sábado, así que los tres primeros ciclos de la
+   instalación comparten el MISMO par de fechas: el índice sin cadencia rechazaba
+   con `23505` —`PERIOD_DRAFT_EXISTS`— liquidaciones que la exclusión declara
+   legítimas. La 078 mete el cubo como TERCER elemento del índice y las dos
+   garantías vuelven a decir lo mismo.
+
+   El guardián lee el archivo como TEXTO, igual que el de arriba: no hay `psql`
+   ni conexión, así que lo que mide es la FORMA de la declaración —el nombre, la
+   tabla y las TRES claves, en orden— y no su efecto en el catálogo. Es una
+   prueba estructural a propósito, no una prueba de DDL disfrazada.
+   -------------------------------------------------------------------------- */
+
+/** El archivo que devuelve el cubo de cadencia al índice único del borrador. */
+const CADENCE_INDEX_MIGRATION = "078_payroll_draft_unique_per_cadence.sql";
+
+describe("el índice único del borrador de nómina y el cubo de cadencia (078)", () => {
+  it("el índice recreado se apoya en start_date, end_date y coalesce(frequency, '')", () => {
+    const path = join(MIGRATIONS_DIR, CADENCE_INDEX_MIGRATION);
+    // Lectura TOLERANTE a propósito (el patrón de 5.5 del README del squash): en
+    // RED el archivo todavía no existe, y el fallo tiene que ser la ASERCION de
+    // abajo —que nombra la definición que falta—, no un ENOENT que se lleve por
+    // delante el resto del bloque. Las aserciones positivas de más abajo son el
+    // piso: sobre texto vacío no pueden pasar.
+    const sql = existsSync(path)
+      ? stripSqlComments(readText(MIGRATIONS_DIR, CADENCE_INDEX_MIGRATION)).replace(/\s+/g, " ").trim()
+      : "";
+
+    // El índice viejo tiene que SALTAR antes de volver a declararse: sin el
+    // `DROP`, el `CREATE` del mismo nombre falla con 42P07.
+    expect(sql).toContain("DROP INDEX IF EXISTS public.uq_payroll_draft_per_range");
+
+    // La declaración recreada, con su MISMO nombre elegido a mano y sus tres
+    // claves: las dos fechas y el cubo de cadencia, que es la misma expresión
+    // que `ex_payroll_periods_no_overlap` compara con `=`.
+    const declaracion = /CREATE UNIQUE INDEX uq_payroll_draft_per_range[\s\S]*?;/.exec(sql);
+    expect(declaracion, `${CADENCE_INDEX_MIGRATION} :: CREATE`).not.toBeNull();
+    const indice = declaracion?.[0] ?? "";
+
+    expect(indice).toContain("ON public.payroll_periods USING btree");
+    expect(indice).toContain("USING btree (start_date, end_date, coalesce(frequency, ''))");
+    // El `WHERE` es el de 007 y no se toca: lo que cambia es la clave, no el
+    // alcance — la garantía sigue siendo sobre borradores.
+    expect(indice).toContain("WHERE (status = 'borrador')");
+
+    // La forma VIEJA, la que la 078 viene a quitar. Sin este control negativo la
+    // prueba de arriba seguiría siendo cierta si el archivo declarara el índice
+    // dos veces: la buena sin cadencia, y la de cadencia después.
+    expect(indice).not.toMatch(/\(start_date, end_date\)\s+WHERE/);
+  }, FILE_SCAN_TIMEOUT_MS);
+});
+
+/* --------------------------------------------------------------------------
+   La deriva entre los DOS artefactos del índice del borrador.
+
+   `supabase/test-bootstrap.sql` es `cat 001_orabella_schema.sql` + `seeds/
+   catalog.sql` + `seeds/acceptance.sql` (paso 2.8 del README del squash), así que
+   la línea de su índice no es una fuente: es una COPIA de la que trae el archivo
+   único, que a su vez sale del volcado.
+
+   POR QUÉ LAS DOS COPIAS SE COMPARAN EN MINÚSCULAS, Y NO ES LAXITUD
+
+   Las dos emiten el MISMO índice por dos manos distintas, y las dos son correctas
+   en la base:
+
+     * la 078 está ESCRITA a mano y dice `coalesce(frequency, '')`;
+     * el archivo único lo TRAE de `pg_dump`, que deparsa el índice con
+       `pg_get_indexdef` y devuelve los nombres de función YA NORMALIZADOS por el
+       catálogo: `COALESCE(frequency, ''::text)`.
+
+   En PostgreSQL los identificadores sin comillas son INSENSIBLES a la caja:
+   `coalesce` y `COALESCE` son el mismo nombre, la misma función y el mismo
+   índice. Una comparación que las distingue no está midiendo la garantía del
+   índice —clave de tres elementos y `WHERE` de borradores—, está midiendo cómo
+   se escribió la línea, y eso no es una propiedad del esquema: es la forma que
+   cada herramienta elige al emitirla.
+
+   Y no es hipotético: con la comparación sensible a la caja, regenerar el
+   bootstrap desde el `001` —que es exactamente lo que el paso 2.8 ordena— ponía
+   esta guarda en ROJO contra un índice correcto. El guardián tenía entonces la
+   propiedad contraria de la suya: no detectaba deriva, la FABRICABA.
+
+   La normalización va en `extractIndexDdl`, que es el punto donde las dos
+   declaraciones salen a superficie, y no en las aserciones: una sola función
+   decide qué es «la misma declaración» y todo lo que se compara arriba hereda
+   esa decisión. Lo que la guarda sigue exigiendo es lo de siempre —mismo nombre,
+   misma tabla, clave de TRES elementos y mismo `WHERE`—; quitarle el cubo de
+   cadencia a cualquiera de las dos la pone roja igual, y hay un control positivo
+   abajo que lo demuestra sobre el archivo real.
+
+   Lo que no existía era una guarda que lo dijera. Las dos copias pueden
+   separarse sin que ninguna prueba se entere: una se regenera, la otra se
+   regenera más tarde, o alguien edita a mano la que «se debía alinear» y la
+   078 avanza sin avisar. El síntoma es silencioso y caro — una copia de prueba
+   que promete una cosa y aplica otra — así que esta guarda las ata: si las dos
+   definiciones dejan de ser la MISMA forma, el rojo nombra las dos.
+
+   Lectura tolerante y sin base, como las de arriba: se comparan las DECLARACIONES
+   como texto —mismo nombre, misma tabla, misma clave de TRES elementos y mismo
+   `WHERE`—, no su efecto en el catálogo. El punto de las dos guardas de la 078
+   es la forma; éste mide que las dos formas sean la misma.
+   -------------------------------------------------------------------------- */
+
+/** La copia de prueba: el `001` concatenado con los seeds, en el orden del paso 2.8 del squash. */
+const BOOTSTRAP_PATH = join(APP_ROOT, "supabase", "test-bootstrap.sql");
+
+/** El índice del borrador, en el nombre elegido a mano que citan 007, 074 y 078. */
+const DRAFT_INDEX_NAME = "uq_payroll_draft_per_range";
+
+/**
+ * Saca la declaración de UN índice del SQL y la deja comparable: sin
+ * comentarios, en una sola línea, SIN los casts que sólo agrega `pg_dump`
+ * (`''::text` → `''`, `'borrador'::text` → `'borrador'`) y en MINÚSCULAS. El
+ * cast no cambia el índice: es la misma clave y el mismo `WHERE` escritos por
+ * otra mano, y quitarlo es lo que hace que las dos copias se puedan comparar
+ * carácter por carácter. La caja tampoco lo cambia —en PostgreSQL los
+ * identificadores sin comillas son insensibles a ella, así que `coalesce` y
+ * `COALESCE` son el MISMO nombre—, y normalizarla es lo que impide que esta
+ * guarda se ponga roja contra un índice correcto cuando las dos declaraciones
+ * vienen de herramientas distintas: la 078 escrita a mano dice `coalesce`, y el
+ * volcado de `pg_dump` dice `COALESCE`. Ver el bloque de arriba: el detalle de
+ * por qué no es laxitud está escrito allí, y va con la guarda, no con la aserción.
+ * Una cadena vacía significa que la declaración no estaba: la aserción la nombra.
+ */
+function extractIndexDdl(sql: string, indexName: string): string {
+  const clean = stripSqlComments(sql).replace(/\s+/g, " ");
+  const statement = new RegExp(`CREATE (?:UNIQUE )?INDEX ${indexName}\\b[\\s\\S]*?;`, "i").exec(clean);
+  return (statement?.[0] ?? "").replace(/::[\w ]+(?=[),;]|$)/g, "").replace(/\s+/g, " ").toLowerCase().trim();
+}
+
+describe("el índice del borrador: la 078 y el bootstrap de prueba dicen lo mismo", () => {
+  it("las dos definiciones —historial y copia de prueba— son la MISMA forma", () => {
+    // TOLERANCIA A LA AUSENCIA, como el bloque de la 078: en RED el archivo
+    // todavía no existe y el fallo tiene que ser la comparación de abajo —que
+    // nombra las dos formas— y no un ENOENT que se lleve el bloque entero.
+    const delHistorial = existsSync(join(MIGRATIONS_DIR, CADENCE_INDEX_MIGRATION))
+      ? extractIndexDdl(readText(MIGRATIONS_DIR, CADENCE_INDEX_MIGRATION), DRAFT_INDEX_NAME)
+      : "";
+    const deLaCopia = existsSync(BOOTSTRAP_PATH)
+      ? extractIndexDdl(readText(BOOTSTRAP_PATH), DRAFT_INDEX_NAME)
+      : "";
+
+    // La FORMA que las dos tienen que compartir: tres elementos de clave —las dos
+    // fechas y el cubo de cadencia— y el `WHERE` de 007 intacto.
+    for (const [nombre, ddl] of [
+      ["078_payroll_draft_unique_per_cadence.sql", delHistorial],
+      ["test-bootstrap.sql", deLaCopia],
+    ] as const) {
+      expect(ddl, `${nombre} :: declaración ausente`).not.toBe("");
+      expect(ddl, `${nombre} :: clave`).toContain(
+        "using btree (start_date, end_date, coalesce(frequency, ''))",
+      );
+      expect(ddl, `${nombre} :: WHERE`).toContain("where (status = 'borrador')");
+    }
+
+    // Y la igualdad, que es la guarda de verdad: si una de las dos se queda atrás o
+    // se alinea a mano a medias, la comparación falla nombrando las dos formas.
+    expect(deLaCopia, `deriva entre ${CADENCE_INDEX_MIGRATION} y test-bootstrap.sql`).toBe(delHistorial);
+  }, FILE_SCAN_TIMEOUT_MS);
+
+  it("la guarda CAZA la deriva: quitarle el cubo a una sola de las dos la pone roja", () => {
+    // Control positivo del guardián, con la misma forma que el control positivo
+    // del detector de arriba: si esta aserción no puede fallar, la de arriba
+    // tampoco protege nada. Se parte de la copia de prueba REAL del disco, no de
+    // un texto inventado, y se le saca el tercer elemento como lo haría una
+    // regeneración con el `001` viejo: el resultado tiene que dejar de coincidir.
+    const deLaCopiaReal = extractIndexDdl(readText(BOOTSTRAP_PATH), DRAFT_INDEX_NAME);
+    const deLaCopiaSinCadencia = deLaCopiaReal.replace(", coalesce(frequency, '')", "");
+    expect(deLaCopiaSinCadencia).not.toContain("coalesce(frequency");
+    expect(deLaCopiaSinCadencia).not.toBe(
+      extractIndexDdl(readText(MIGRATIONS_DIR, CADENCE_INDEX_MIGRATION), DRAFT_INDEX_NAME),
+    );
   }, FILE_SCAN_TIMEOUT_MS);
 });

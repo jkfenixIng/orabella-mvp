@@ -161,14 +161,16 @@ export async function upsertPaymentMethodAction(input: unknown) {
  * contrato detrás de una caché de una hora sería peor que no tenerla.
  *
  * Y ya no hay una lectura que reubicar: la instalación es de UNA SOLA SEDE
- * (decisión del dueño, 2026-10-01), así que la capa de plataforma
- * (`src/features/platform`) configura la INSTALACIÓN —la fecha de inicio de su
- * nómina— y resuelve su sede por dato (la única fila activa de `sedes`), no
- * leyendo un catálogo para que alguien elija.
+ * (decisión del dueño, 2026-10-01), así que no hay una capa que la configure —
+ * la fecha desde la que la nómina opera la declara la PRIMERA liquidación y se
+ * deriva del período más antiguo (`getPayrollStartDate`, módulo de nómina)— ni
+ * una que resuelva su sede por dato: ya no hay nada que alguien tenga que
+ * elegir.
  *
  * Lo que el negocio conserva es la gestión de personas de SU sede
- * (`listSedeUsers`/`setUserRoles`, con su pestaña en `/admin`), y el rol de
- * plataforma no se otorga ni se quita desde acá.
+ * (`listSedeUsers`/`setUserRoles`, con su pestaña en `/admin`). Y el rol
+ * `superadmin` no se otorga ni se quita desde acá: sigue en el catálogo de la
+ * base, pero no hay ninguna superficie que lo use.
  */
 
 /** ADM-04: asignar roles a un usuario (solo admin). */

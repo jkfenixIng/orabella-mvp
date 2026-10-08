@@ -279,7 +279,7 @@ async function invoiceIdsOfEmployee(db: DbClient, employeeId: string): Promise<s
   } catch (error) {
     throw new BillingError(
       "READ_INCOMPLETE",
-      `${error instanceof Error ? error.message : "La lectura de invoice_items quedó incompleta."} No se puede listar ni contar sin las facturas del empleado: con el conjunto recortado faltarían facturas y el paginador mostraría páginas vacías. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+      `${error instanceof Error ? error.message : "La lectura de invoice_items quedó incompleta."} No se puede listar ni contar sin las facturas del empleado: con el conjunto recortado faltarían facturas y el paginador mostraría páginas vacías. Reintente y, si persiste, revise el volumen de datos de la instalación.`,
       500,
     );
   }
@@ -355,7 +355,7 @@ export async function listInvoices(filters: InvoiceFilters = {}): Promise<Invoic
     } catch (error) {
       throw new BillingError(
         "READ_INCOMPLETE",
-        `${error instanceof Error ? error.message : "La lectura de invoices quedó incompleta."} No se muestra el listado: con las facturas recortadas faltarían facturas del empleado. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+        `${error instanceof Error ? error.message : "La lectura de invoices quedó incompleta."} No se muestra el listado: con las facturas recortadas faltarían facturas del empleado. Reintente y, si persiste, revise el volumen de datos de la instalación.`,
         500,
       );
     }
@@ -406,7 +406,7 @@ export async function listInvoices(filters: InvoiceFilters = {}): Promise<Invoic
   } catch (error) {
     throw new BillingError(
       "READ_INCOMPLETE",
-      `${error instanceof Error ? error.message : "La lectura de los ítems de factura quedó incompleta."} No se muestra el listado: sin los ítems no se sabe qué empleados participaron. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+      `${error instanceof Error ? error.message : "La lectura de los ítems de factura quedó incompleta."} No se muestra el listado: sin los ítems no se sabe qué empleados participaron. Reintente y, si persiste, revise el volumen de datos de la instalación.`,
       500,
     );
   }
@@ -659,7 +659,7 @@ async function loadCommissionRulesByEmployee(
     // no es este camino.
     throw new BillingError(
       "READ_INCOMPLETE",
-      `${error instanceof Error ? error.message : "La lectura de commission_rules quedó incompleta."} No se muestra la comisión: con las reglas incompletas la cifra no coincidiría con lo que paga la nómina. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+      `${error instanceof Error ? error.message : "La lectura de commission_rules quedó incompleta."} No se muestra la comisión: con las reglas incompletas la cifra no coincidiría con lo que paga la nómina. Reintente y, si persiste, revise el volumen de datos de la instalación.`,
       500,
     );
   }
@@ -857,7 +857,7 @@ async function validateItemRefs(
     }
     if (item.item_type === "servicio" && item.service_id) {
       if (!serviceIds.has(item.service_id)) {
-        throw new BillingError("NOT_FOUND", "Servicio no encontrado en esta sede.", 404);
+        throw new BillingError("NOT_FOUND", "Servicio no encontrado.", 404);
       }
     }
     if (!employeeIdsFound.has(item.employee_id)) {
@@ -925,9 +925,12 @@ function toBillingError(error: unknown): BillingError {
  *     el camino viejo también terminaba en ANNUL_CONFLICT, porque el `.single()`
  *     sin filas era el mismo PGRST116.
  *   * `PRODUCT_NOT_FOUND` — la red de conteo de la transacción: un producto de
- *     la reversión no existe o es de otra sede, y la anulación NO se aplicó. Es
- *     el MISMO 404 que devolvía `getProduct` cuando el bucle de reversiones
- *     pasaba por `registerMovement`.
+ *     la reversión no existe y la anulación NO se aplicó. La SEDE no es un
+ *     criterio (igual que en `validateItemRefs`): `products` no trae la columna,
+ *     así que lo único que el conteo puede encontrar es que el producto no
+ *     exista. Es el MISMO 404 —"Producto no encontrado."— que devolvía
+ *     `getProduct` cuando el bucle de reversiones pasaba por
+ *     `registerMovement`.
  *   * `ANNUL_INVALID` (entrada mal formada) y `PAYMENT_MISMATCH` no deberían
  *     poder llegar desde acá: la entrada la arma este mismo módulo y el conteo
  *     lo hace la función. Si llegan, es un fallo real y se reporta como
@@ -966,8 +969,9 @@ function toRpcAnnulError(error: { code?: unknown; message?: unknown } | null): B
  *     desapareció entre la lectura y la escritura— sale por el mismo código: en
  *     el camino viejo también terminaba en EDIT_CONFLICT, porque el `.single()`
  *     sin filas era el mismo PGRST116.
- *   * `PRODUCT_NOT_FOUND` — la red de conteo del ajuste: un producto no existe o
- *     es de otra sede, y la edición NO se aplicó. Es el MISMO 404 que devolvía
+ *   * `PRODUCT_NOT_FOUND` — la red de conteo del ajuste: un producto no existe
+ *     (la SEDE no es un criterio, por la misma razón que arriba) y la edición NO
+ *     se aplicó. Es el MISMO 404 —"Producto no encontrado."— que devolvía
  *     `getProduct` cuando el bucle de ajustes pasaba por `registerMovement`.
  *   * `INSUFFICIENT_STOCK` — el trigger de stock de 004 rechazó un OUT que
  *     dejaría el stock negativo (la foto que tomó `planStockDeduction` puede
@@ -1053,7 +1057,8 @@ async function findInvoiceByIdempotencyKey(
  *     vieja: la guarda que manda es la del trigger, y corre ADENTRO). Es el
  *     MISMO 409 y el MISMO mensaje que devolvía `deductStock`.
  *   * `PRODUCT_NOT_FOUND` — la red de conteo de la deducción: el producto no
- *     existe o es de otra sede. Es el MISMO 404 que devolvía `getProduct`.
+ *     existe (la SEDE no es un criterio, por la misma razón que arriba). Es el
+ *     MISMO 404 —"Producto no encontrado."— que devolvía `getProduct`.
  *   * `SHIFT_NOT_OPEN` — la precondición del turno se vuelve a comprobar sobre
  *     la fila bloqueada y en la ventana lectura→escritura el turno se cerró. Es
  *     el MISMO código, el MISMO mensaje y el MISMO 409 que ya devolvía la
@@ -1228,7 +1233,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
     if (!methodByCode.has(portion.method_code)) {
       throw new BillingError(
         "METHOD_INACTIVE",
-        `El método de pago ${portion.method_code} no está activo en esta sede.`,
+        `El método de pago ${portion.method_code} no está activo en la instalación.`,
         422,
       );
     }
@@ -1661,7 +1666,7 @@ export async function editInvoiceItems(
     if (!method) {
       throw new BillingError(
         "METHOD_INACTIVE",
-        `El método de pago ${payment.method_code} no está activo en esta sede.`,
+        `El método de pago ${payment.method_code} no está activo en la instalación.`,
         422,
       );
     }
@@ -1940,7 +1945,7 @@ export async function editEmittedInvoiceItems(
     if (!method) {
       throw new BillingError(
         "METHOD_INACTIVE",
-        `El método de pago ${payment.method_code} no está activo en esta sede.`,
+        `El método de pago ${payment.method_code} no está activo en la instalación.`,
         422,
       );
     }
@@ -2375,7 +2380,7 @@ export async function splitPayment(
     if (!refs.methodByCode.has(portion.method_code)) {
       throw new BillingError(
         "METHOD_INACTIVE",
-        `El método de pago ${portion.method_code} no está activo en esta sede.`,
+        `El método de pago ${portion.method_code} no está activo en la instalación.`,
         422,
       );
     }

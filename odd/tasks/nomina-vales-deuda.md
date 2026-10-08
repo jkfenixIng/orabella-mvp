@@ -62,9 +62,10 @@ deuda entrante se aplica al neto **dentro de `other_discounts`** (así la iguald
 vigente sin tocarla) y su trazabilidad vive en la tabla de deudas, que registra en qué
 período se aplicó.
 - La deuda es por sede + empleado, y su origen debe ser trazable (de qué período salió).
-  — El índice único hoy es `(sede_id, employee_id)`: mientras la columna exista así
-  queda, y cuando se elimine (M3c) pasa a ser por **instalación + empleado**, sin
-  cambio de comportamiento (una sola instalación, una deuda por empleado).
+  — **RESUELTO (2026-10-03)**: la columna se eliminó (M3c ejecutado), así que el índice quedó por
+  **instalación + empleado**, sin cambio de comportamiento observable: una sola instalación, una
+  deuda por empleado. El texto anterior describía el estado intermedio, cuando la columna todavía
+  existía y el índice era `(sede_id, employee_id)`.
 - Suite completa y `typecheck` en 0 antes de cerrar.
 
 ## Tasks
@@ -111,9 +112,9 @@ de origen. Todo eso se implementó tal cual y sigue vigente.
 
 Lo único que se registra:
 
-- La deuda se sigue indexando por `(sede_id, employee_id)` mientras la columna exista;
-  cuando se elimine (M3c) el índice queda por **instalación + empleado**. Con una
-  sola sede no cambia el comportamiento observable.
+- **RESUELTO (2026-10-03)**: la columna se eliminó (M3c ejecutado) y el índice quedó por
+  **instalación + empleado**, sin cambio de comportamiento observable. El texto anterior
+  describía el estado intermedio, cuando la columna todavía existía.
 - `voucher_settings` (topes de día y semana) tiene su propia unidad de reemplazo: el
   dueño eligió una tabla `system_settings` de clave/valor (M3b del plan de sede
   única). No toca el cálculo de esta unidad, pero conviene tenerlo presente al

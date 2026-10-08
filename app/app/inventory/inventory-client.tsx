@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState, useTransition, type ChangeEvent, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition, type ChangeEvent, type FormEvent, type RefObject } from "react";
 import { toast } from "sonner";
 import { Activity, PackageOpen, PackagePlus, Pencil, X } from "lucide-react";
 import {
@@ -44,9 +44,6 @@ import {
   labelClass,
   mutedTextClass,
   sectionClass,
-  tableCellClass,
-  tableHeaderClass,
-  tableRowClass,
 } from "@/src/shared/lib/ui-styles";
 
 function emptyProductForm() {
@@ -78,6 +75,71 @@ function emptyMovementForm() {
  */
 function newMovementKey(): string {
   return crypto.randomUUID();
+}
+
+/* --------------------------------------------------------------------------
+   El desplazamiento de la barra de acciones.
+
+   MEDIDO, Chromium, 320x568, con la sesión y scrolleando hasta `scrollY 400` de
+   412: la barra se anclaba en `top 0` y el encabezado del shell ocupa
+   `0 → 63` con `z-30` contra el `z-10` de la barra. `elementFromPoint` en el
+   centro de «Crear producto» devolvía el enlace «Orabella» del encabezado, o
+   sea que el botón NO era clicable. A 360 y 390 no hay recorrido suficiente
+   para llegar a ese estado, y arriba de `lg` el encabezado no existe.
+
+   El arreglo NO es un segundo número. La altura del encabezado no es una
+   constante del proyecto: sale de SU padding y del botón del menú, así que
+   escribir `top-[63px]` acá sería cablear un valor que otro archivo puede
+   cambiar. La barra se ancla a la altura MEDIDA del propio encabezado, que es
+   la misma fuente de la que sale la de él.
+
+   Y falla CERRADO, no abierto: la referencia `var(--shell-header-height)` va
+   SIN valor de reserva. Antes de medir —o si el encabezado no aparece— la
+   variable no está definida, la declaración `top` queda inválida en tiempo de
+   valor calculado y `top` queda en `auto`: la barra sigue siendo `sticky`
+   pero no tiene contra qué anclarse, o sea que aparece en su sitio en el flujo
+   en vez de meterse debajo del encabezado. Un `var(--x, 0px)` sería exactamente
+   el defecto original escrito con otra sintaxis.
+
+   Arriba de `lg` el encabezado es `lg:hidden`, así que mide 0 y la barra se
+   ancla en 0, que es lo correcto porque ahí no hay con quién competir.
+   -------------------------------------------------------------------------- */
+
+/** El NOMBRE de la variable CSS del desplazamiento, en un solo lugar. */
+const SHELL_HEADER_OFFSET_VAR = "--shell-header-height";
+
+/**
+ * El encabezado ANCLADO del shell (`src/shared/components/main-nav.tsx`), y no
+ * `header` a secas: `<header>` también es el del título de la página
+ * (`PageHeader`), que no se ancla y cuya altura no es la que hay que librar.
+ */
+const SHELL_HEADER_SELECTOR = "header.sticky";
+
+/**
+ * Escribe en la barra el alto medido del encabezado del shell.
+ *
+ * `ResizeObserver` y no una medida sola: el alto del encabezado cambia si
+ * cambia el padding, la tipografía o el botón del menú, y una medida tomada al
+ * montar se quedaría vieja sin avisar.
+ *
+ * El `style` en línea nombra la variable con su LITERAL a propósito —el valor
+ * de un `style` no se puede componer con una constante sin volverlo ilegible— y
+ * la guarda de `inventory-dialog-footer.test.ts` comprueba que ese literal y el
+ * `setProperty` de acá nombran la MISMA variable.
+ */
+function useShellHeaderOffset(barra: RefObject<HTMLDivElement | null>): void {
+  useEffect(() => {
+    const elemento = barra.current;
+    const encabezado = document.querySelector<HTMLElement>(SHELL_HEADER_SELECTOR);
+    if (elemento === null || encabezado === null) return;
+    const medir = () => {
+      elemento.style.setProperty(SHELL_HEADER_OFFSET_VAR, `${Math.ceil(encabezado.getBoundingClientRect().height)}px`);
+    };
+    medir();
+    const observador = new ResizeObserver(medir);
+    observador.observe(encabezado);
+    return () => observador.disconnect();
+  }, [barra]);
 }
 
 interface InventoryClientProps {
@@ -112,6 +174,12 @@ export function InventoryClient(props: InventoryClientProps) {
    */
   const movementKeyRef = useRef<string | null>(null);
   const [movementProductQuery, setMovementProductQuery] = useState("");
+  /**
+   * La barra de acciones se ancla al alto MEDIDO del encabezado del shell, no
+   * a un número escrito acá. Ver `SHELL_HEADER_OFFSET_VAR`.
+   */
+  const barraAccionesRef = useRef<HTMLDivElement>(null);
+  useShellHeaderOffset(barraAccionesRef);
   const movementProductOptions = useMemo(() => {
     const needle = movementProductQuery.trim().toLowerCase();
     if (needle === "") return products;
@@ -314,7 +382,22 @@ export function InventoryClient(props: InventoryClientProps) {
       </section>
 
       {props.canWrite ? (
-        <div className="sticky top-0 z-10 flex flex-wrap gap-2 rounded-lg border border-border-color bg-surface p-3 shadow-sm dark:border-border-color-2">
+        /*
+          LA BARRA, midiendo en vez de suponer. Antes era `sticky top-0`, que
+          compite con el `sticky top-0 z-30` del encabezado del shell y a 320
+          terminaba DEBAJO de él: medido, `elementFromPoint` en el centro de
+          «Crear producto» devolvía el enlace «Orabella» del encabezado, o sea
+          que el botón no era clicable.
+
+          El `top` sale de `var(--shell-header-height)`, SIN reserva: sin valor
+          medido, `top` queda en `auto` y la barra no se ancla en 0. El nombre
+          de la variable y suMEDIDA viven en `useShellHeaderOffset`.
+        */
+        <div
+          ref={barraAccionesRef}
+          style={{ top: "var(--shell-header-height)" }}
+          className="sticky z-10 flex flex-wrap gap-2 rounded-lg border border-border-color bg-surface p-3 shadow-sm dark:border-border-color-2"
+        >
           <Button type="button" onClick={() => startProductDialog()}>
             <PackagePlus className="h-4 w-4" aria-hidden="true" />
             Crear producto
@@ -335,89 +418,149 @@ export function InventoryClient(props: InventoryClientProps) {
           // AGREGARÍA un anuncio que hoy no existe.
           <p className="mt-3 text-sm text-text-tertiary">Sin productos para esta búsqueda.</p>
         ) : (
-          <div className="mt-3 overflow-x-auto">
-            <table className={cn("w-full text-left text-sm", "min-w-[760px]")}>
-              <thead>
-                <tr className={tableHeaderClass}>
-                  <th className={tableCellClass} scope="col">
-                    SKU
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Nombre
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Stock
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Mínimo
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Costo
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Venta
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Comisión
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Estado
-                  </th>
-                  <th className={tableCellClass} scope="col">
-                    Acciones
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {paged.map((row) => (
-                  <tr key={row.id} className={tableRowClass}>
-                    <td className={cn(tableCellClass, "font-mono")}>{row.sku}</td>
-                    <td className={tableCellClass}>
+          // R19 + R38: la lista de productos. Antes era una `<table>` con un
+          // piso de `min-w-[760px]` dentro de un carril de `overflow-x-auto` de
+          // ~238 px útiles en un teléfono: las dos últimas columnas —`Estado` y
+          // `Acciones`— nunca entraban, y con ellas `Kardex` y `Editar`, que es
+          // lo que esta pantalla existe para hacer. Medido: 6 botones de fila
+          // fuera de pantalla en los cuatro anchos angostos, sin
+          // `elementFromPoint` que los devolviera, y las nueve celdas leídas sin
+          // una sola etiqueta.
+          //
+          // Ahora es el patrón de `invoices-client.tsx` y
+          // `vouchers-client.tsx` (R38), el mismo y no otro: abajo de `sm` cada
+          // fila es una TARJETA de cinco renglones y cada valor lleva su rótulo
+          // —la palabra del encabezado, la misma, y por eso las dos superficies
+          // no pueden divergir—; arriba de `sm` cada hoja se ancla a su columna
+          // con `sm:col-start-N` y la grilla conserva las NUEVE columnas de hoy,
+          // en su orden. La escala se declara una vez por superficie, así que no
+          // hay piso de ancho inventado ni carril que arrastrar.
+          //
+          // PRIORIDAD DE LA TARJETA —lo que hay que ver para decidir sobre un
+          // producto en el mostrador, en el orden en que se lee:
+          // 1. QUÉ PRODUCTO ES (Nombre + SKU): sin identidad no hay decisión.
+          //    El nombre manda y el código lo acompaña a la derecha; el chip
+          //    «Bajo mínimo» se queda donde estaba, dentro del nombre.
+          // 2. QUÉ HAY DE SU STOCK (Stock + Mínimo): el número que hay, al lado
+          //    del umbral que dispara la alerta. Juntos en un renglón se leen de
+          //    un vistazo: «Stock: 3» junto a «Mínimo: 5» ya es la alerta.
+          // 3. A QUÉ SE VENDE (Venta + Costo): primero el precio del mostrador,
+          //    después el costo que lo sostiene.
+          // 4. LA COMISIÓN y el ESTADO: el resto del dinero y la bandera de
+          //    vida del producto.
+          // 5. LA ACCIÓN (Acciones): su propio renglón, con sus dos botones
+          //    envueltos, y sin gesto horizontal para llegar.
+          // La DESCRIPCIÓN no entra: es un campo de formulario, no una columna
+          // de esta lista, y vive en el diálogo de alta y de edición.
+          <div className="mt-3 overflow-hidden rounded-lg border border-color-2 dark:border-border-color">
+            {/* El encabezado nombra las nueve columnas y sólo existe arriba de
+                `sm`: abajo la fila dice cada rótulo con su propio valor. */}
+            <div
+              aria-hidden="true"
+              className="hidden grid-cols-[minmax(0,0.85fr)_minmax(0,1.3fr)_minmax(0,0.35fr)_minmax(0,0.4fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.05fr)_minmax(0,0.85fr)_minmax(5.75rem,1.2fr)] gap-2 border-b border-color-2 bg-surface px-3 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary sm:grid dark:border-border-color"
+            >
+              <span>SKU</span>
+              <span>Nombre</span>
+              <span>Stock</span>
+              <span>Mínimo</span>
+              <span>Costo</span>
+              <span>Venta</span>
+              <span>Comisión</span>
+              <span>Estado</span>
+              <span className="text-center">Acciones</span>
+            </div>
+            <ul className="flex flex-col divide-y divide-color-2 dark:divide-border-color">
+              {paged.map((row) => (
+                <li
+                  key={row.id}
+                  className="flex flex-col gap-1 px-3 py-2.5 sm:grid sm:grid-cols-[minmax(0,0.85fr)_minmax(0,1.3fr)_minmax(0,0.35fr)_minmax(0,0.4fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.05fr)_minmax(0,0.85fr)_minmax(5.75rem,1.2fr)] sm:items-center sm:gap-2"
+                >
+                  {/* Las cinco líneas de la tarjeta móvil. Abajo de `sm` cada
+                      hoja es un renglón con su rótulo —la palabra del
+                      encabezado, la misma— y cada envoltorio `sm:contents` se
+                      borra de la grilla de arriba, donde la hoja se queda en la
+                      columna que su `sm:col-start-N` fija. El orden del DOM es
+                      el de la tarjeta, NO el de las columnas: por eso el pineo
+                      explícito. */}
+                  <span className="flex items-center justify-between gap-2 sm:contents">
+                    <span className="break-words text-sm text-text-primary sm:col-start-2 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Nombre: </span>
                       {row.name}{" "}
                       {alertIds.has(row.id) ? (
                         <Badge variant="warning" size="sm">
                           Bajo mínimo
                         </Badge>
                       ) : null}
-                    </td>
-                    <td className={tableCellClass}>{row.stock_qty}</td>
-                    <td className={tableCellClass}>{row.min_stock}</td>
-                    <td className={tableCellClass}>{formatMoney(row.cost_price)}</td>
-                    <td className={tableCellClass}>{formatMoney(row.sale_price)}</td>
-                    <td className={tableCellClass}>{formatMoney(row.commission_value)}</td>
-                    <td className={tableCellClass}>{row.is_active ? "Activo" : "Inactivo"}</td>
-                    <td className={tableCellClass}>
-                      <div className="flex flex-wrap gap-2">
+                    </span>
+                    <span className="font-mono text-sm text-text-primary sm:col-start-1 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">SKU: </span>
+                      {row.sku}
+                    </span>
+                  </span>
+                  <span className="flex items-center justify-between gap-2 sm:contents">
+                    <span className="whitespace-nowrap text-sm font-medium text-text-primary sm:col-start-3 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Stock: </span>
+                      {row.stock_qty}
+                    </span>
+                    <span className="whitespace-nowrap text-sm text-text-primary sm:col-start-4 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Mínimo: </span>
+                      {row.min_stock}
+                    </span>
+                  </span>
+                  <span className="flex items-center justify-between gap-2 sm:contents">
+                    <span className="whitespace-nowrap text-sm text-text-primary sm:col-start-6 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Venta: </span>
+                      {formatMoney(row.sale_price)}
+                    </span>
+                    <span className="whitespace-nowrap text-sm text-text-primary sm:col-start-5 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Costo: </span>
+                      {formatMoney(row.cost_price)}
+                    </span>
+                  </span>
+                  <span className="flex items-center justify-between gap-2 sm:contents">
+                    <span className="whitespace-nowrap text-sm text-text-primary sm:col-start-7 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Comisión: </span>
+                      {formatMoney(row.commission_value)}
+                    </span>
+                    <span className="text-sm text-text-primary sm:col-start-8 sm:row-start-1">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Estado: </span>
+                      {row.is_active ? "Activo" : "Inactivo"}
+                    </span>
+                  </span>
+                  {/* La acción en su propio renglón: `flex-wrap` para que los
+                      dos botones quepan en 320 px sin empujar la fila. */}
+                  <span className="flex flex-wrap items-center gap-2 sm:contents">
+                    <span className="flex flex-wrap items-center gap-2 sm:col-start-9 sm:row-start-1 sm:justify-center">
+                      <span className="font-sans font-medium text-text-secondary sm:hidden">Acciones: </span>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        disabled={isViewPending}
+                        onClick={() => showKardex(row)}
+                      >
+                        <Activity
+                          className={cn("h-4 w-4", isViewPending && "animate-spin")}
+                          aria-hidden="true"
+                        />
+                        {isViewPending ? "Cargando…" : "Kardex"}
+                      </Button>
+                      {props.canAdmin ? (
                         <Button
                           type="button"
                           variant="ghost"
                           size="sm"
-                          disabled={isViewPending}
-                          onClick={() => showKardex(row)}
+                          onClick={() => startEdit(row)}
                         >
-                          <Activity
-                            className={cn("h-4 w-4", isViewPending && "animate-spin")}
-                            aria-hidden="true"
-                          />
-                          {isViewPending ? "Cargando…" : "Kardex"}
+                          <Pencil className="h-4 w-4" aria-hidden="true" />
+                          Editar
                         </Button>
-                        {props.canAdmin ? (
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => startEdit(row)}
-                          >
-                            <Pencil className="h-4 w-4" aria-hidden="true" />
-                            Editar
-                          </Button>
-                        ) : null}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                      ) : null}
+                    </span>
+                  </span>
+                </li>
+              ))}
+            </ul>
           </div>
         )}
         {pageCount > 1 ? (
@@ -456,16 +599,39 @@ export function InventoryClient(props: InventoryClientProps) {
           else setProductDialogOpen(open);
         }}
       >
-        <DialogContent className="max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>{editingId ? "Editar producto" : "Crear producto"}</DialogTitle>
-            <DialogDescription>
-              {editingId
-                ? "Actualiza los datos del producto."
-                : "Completa los campos obligatorios para registrar un producto."}
-            </DialogDescription>
-          </DialogHeader>
-          <form onSubmit={handleProductSubmit} className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        {/*
+          LA ESTRUCTURA, y es la misma de `FormDialog` y de la factura: el
+          diálogo es una COLUMNA (`flex flex-col overflow-y-hidden`) que no
+          scrollea ella misma, la hoja cede el alto (`min-h-0`) y las tres
+          piezas son encabezado (fijo), MEDIO (lo único que scrollea) y pie
+          (fijo, FUERA del medio).
+
+          MEDIDO antes, con la sesión y sin enviar nada: 839 px de contenido en
+          una caja de 534 a 320x568 y en una de 706 a 360x740, con NINGÚN
+          scroller interno — scrolleaba el `DialogContent` — y el envío en
+          `y 744-788`: fuera de la caja del diálogo a los dos anchos, o sea que
+          guardar exigía scroll INTERNO del modal.
+
+          Y SIN `sticky` en el pie, a propósito: el bloque contenedor de un
+          ítem de grilla es su ÁREA, sin recorrido para anclarse, así que un
+          pie pegado con `position: sticky` se midió funcionando en Chromium y
+          quedaría colgando de la palabra de otro motor. La corrección vive en
+          el árbol.
+        */}
+        <DialogContent className="max-w-2xl flex flex-col overflow-y-hidden">
+          <div className="flex min-h-0 flex-1 flex-col">
+            <DialogHeader className="shrink-0">
+              <DialogTitle>{editingId ? "Editar producto" : "Crear producto"}</DialogTitle>
+              <DialogDescription>
+                {editingId
+                  ? "Actualiza los datos del producto."
+                  : "Completa los campos obligatorios para registrar un producto."}
+              </DialogDescription>
+            </DialogHeader>
+            <form onSubmit={handleProductSubmit} className="flex min-h-0 flex-1 flex-col">
+              {/* El MEDIO: lo único que scrollea. `min-h-0` para que pueda encogerse por debajo de sus campos; sin eso el `flex-1` no cede y el pie se vuelve a ir de la caja. */}
+              <div className="min-h-0 flex-1 overflow-y-auto">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <Label htmlFor="product-sku" className={labelClass}>
               SKU *
               <span className="flex items-center gap-2">
@@ -496,7 +662,7 @@ export function InventoryClient(props: InventoryClientProps) {
                 </Button>
               </span>
               <span className="text-xs text-text-tertiary">
-                Código único por sede (p. ej. SH-001 para shampoo).
+                Código único en la instalación (p. ej. SH-001 para shampoo).
               </span>
               {skuTaken ? (
                 // ESTADO que bloquea: con un SKU ya tomado el botón Guardar
@@ -587,7 +753,10 @@ export function InventoryClient(props: InventoryClientProps) {
                 {error}
               </Alert>
             ) : null}
-            <DialogFooter className="sm:col-span-2">
+                </div>
+              </div>
+              {/* El PIE: `shrink-0` y FUERA del medio, así que la acción primaria y Cancelar están siempre a la vista sin una sola línea de scroll. Última pieza del `<form>` —igual que en `FormDialog`—, o sea que está EN EL FLUJO y no cubre el último campo. */}
+              <DialogFooter className="shrink-0">
               <Button type="button" variant="outline" onClick={cancelEdit}>
                 Cancelar
               </Button>
@@ -596,6 +765,7 @@ export function InventoryClient(props: InventoryClientProps) {
               </Button>
             </DialogFooter>
           </form>
+          </div>
         </DialogContent>
       </Dialog>
 
@@ -709,39 +879,70 @@ export function InventoryClient(props: InventoryClientProps) {
             // sin anuncio que agregar.
             <p className="mt-3 text-sm text-text-tertiary">Sin movimientos registrados.</p>
           ) : (
-            <div className="mt-3 overflow-x-auto">
-              <table className={cn("w-full text-left text-sm", "min-w-[520px]")}>
-                <thead>
-                  <tr className={tableHeaderClass}>
-                    <th className={tableCellClass} scope="col">
-                      Fecha
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Tipo
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Cantidad
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Motivo
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Quién
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {kardex.rows.map((row) => (
-                    <tr key={row.id} className={tableRowClass}>
-                      <td className={tableCellClass}>{new Date(row.created_at).toLocaleString("es-CO")}</td>
-                      <td className={cn(tableCellClass, "font-mono")}>{row.type}</td>
-                      <td className={tableCellClass}>{row.qty}</td>
-                      <td className={tableCellClass}>{row.reason}</td>
-                      <td className={tableCellClass}>{row.actor_name ?? "—"}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+            // R19 + R38, la MISMA regla que la lista de productos: el kardex
+            // era una `<table>` con un piso de `min-w-[520px]` en un carril de
+            // ~238 px, y sus cinco celdas se leían apiladas —cuando se veían—
+            // sin una sola etiqueta.
+            //
+            // PRIORIDAD DE LA TARJETA —qué necesita leer una persona que
+            // pregunta «¿por qué el stock está así?», en el orden en que se lee:
+            // 1. CUÁNDO (Fecha): el movimiento más reciente es el que explica el
+            //    número de hoy, y por eso abre la tarjeta.
+            // 2. QUÉ PASÓ Y CUÁNTO (Tipo + Cantidad): el signo del movimiento y
+            //    su magnitud, juntos en un renglón.
+            // 3. QUIÉN LO HIZO (Quién): la mano detrás del número.
+            // 4. POR QUÉ (Motivo): el texto libre, último porque es el más largo
+            //    y el menos consultado de un vistazo.
+            <div className="mt-3 overflow-hidden rounded-lg border border-color-2 dark:border-border-color">
+              <div
+                aria-hidden="true"
+                className="hidden grid-cols-[minmax(8.5rem,1.3fr)_minmax(0,0.6fr)_minmax(0,0.5fr)_minmax(0,1.5fr)_minmax(0,0.9fr)] gap-2 border-b border-color-2 bg-surface px-3 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary sm:grid dark:border-border-color"
+              >
+                <span>Fecha</span>
+                <span>Tipo</span>
+                <span>Cantidad</span>
+                <span>Motivo</span>
+                <span>Quién</span>
+              </div>
+              <ul className="flex flex-col divide-y divide-color-2 dark:divide-border-color">
+                {kardex.rows.map((row) => (
+                  <li
+                    key={row.id}
+                    className="flex flex-col gap-1 px-3 py-2.5 sm:grid sm:grid-cols-[minmax(8.5rem,1.3fr)_minmax(0,0.6fr)_minmax(0,0.5fr)_minmax(0,1.5fr)_minmax(0,0.9fr)] sm:items-center sm:gap-2"
+                  >
+                    {/* Las cuatro líneas de la tarjeta móvil, en el orden de la
+                        prioridad y no en el de las columnas. */}
+                    <span className="flex items-center gap-2 sm:contents">
+                      <span className="text-sm text-text-primary sm:col-start-1 sm:row-start-1">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Fecha: </span>
+                        {new Date(row.created_at).toLocaleString("es-CO")}
+                      </span>
+                    </span>
+                    <span className="flex items-center justify-between gap-2 sm:contents">
+                      <span className="font-mono text-sm text-text-primary sm:col-start-2 sm:row-start-1">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Tipo: </span>
+                        {row.type}
+                      </span>
+                      <span className="whitespace-nowrap text-sm font-medium text-text-primary sm:col-start-3 sm:row-start-1">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Cantidad: </span>
+                        {row.qty}
+                      </span>
+                    </span>
+                    <span className="flex items-center gap-2 sm:contents">
+                      <span className="break-words text-sm text-text-primary sm:col-start-5 sm:row-start-1">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Quién: </span>
+                        {row.actor_name ?? "—"}
+                      </span>
+                    </span>
+                    <span className="flex items-center gap-2 sm:contents">
+                      <span className="break-words text-sm text-text-primary sm:col-start-4 sm:row-start-1">
+                        <span className="font-sans font-medium text-text-secondary sm:hidden">Motivo: </span>
+                        {row.reason}
+                      </span>
+                    </span>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
         </section>

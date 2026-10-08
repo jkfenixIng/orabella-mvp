@@ -88,8 +88,9 @@ factura con empleado por línea (T5) → métodos de pago (T3/T6) → liquidaci�
   `GET/POST /voucher-settings` (topes; extra fuera del listado mínimo para
   la UI).
 - Fecha de inicio de la nómina (migración `068_payroll_start_date.sql`):
-  `sedes.payroll_start_date date NULL` — la fecha desde la que la nómina OPERA
-  en la sede. `NULL` = todavía no configurada (y el módulo se comporta como hoy).
+  `sedes.payroll_start_date date NULL` — RETIRADA (F10): la columna quedó SIN USO
+  —nada la lee ni la escribe— y el arranque de la nómina se DERIVA de la
+  evidencia. Se conserva como deuda declarada para el próximo reset del esquema.
   F10: ver "Fecha de inicio de la nómina de la sede".
 - UI (`/payroll`, español): periodos (abrir, ver, calcular con ajustes
   bonos/otros por empleado y su motivo obligatorio —F8—, tabla
@@ -443,9 +444,9 @@ largo de otra cadencia son `false`.
 `start_date`/`end_date` siguen aceptándose por compatibilidad, pero son una
 segunda opinión: si no coinciden con el ciclo derivado, el envío se rechaza
 (`VALIDATION`). `openPayrollPeriod` DERIVA el rango con `payrollCycleRange` y,
-con la fecha de arranque configurada, con `resolveOpenPayrollRange` (ciclo
-completo o primer ciclo recortado; ver "Fecha de inicio de la nómina de la
-sede"), y no acepta un rango arbitrario; la guarda de solape, la regla de ciclo
+con el piso de la evidencia, con `resolveOpenPayrollRange` (ciclo completo o
+primer ciclo recortado; ver "Fecha de inicio de la nómina de la sede"), y no
+acepta un rango arbitrario; la guarda de solape, la regla de ciclo
 ya liquidado y el mapeo de `23P01` siguen vigentes. Con los ciclos embaldosando
 el calendario, la guarda por cadencia es lo que impide liquidar dos veces el
 mismo ciclo: el semanal y el mensual se superponen a propósito, dos del mismo
@@ -515,19 +516,28 @@ nombres.
 
 ### El límite: la historia de la sede, no la del calendario
 
-El recorrido se detiene en el **arranque de la sede**: la fecha de inicio más
-antigua de sus períodos. Antes de eso no había nada que liquidar, así que no se
-reporta historia anterior (nada de arrastrar años de ciclos de un negocio que no
-existía). Consecuencia directa y deliberada: **sin ningún período no se reporta
-NADA** —una sede sin historia no tiene atraso—, y un ciclo que terminó antes del
-primer período tampoco aparece.
+El recorrido se detiene en el **piso de la evidencia** (`payrollEvidenceFloor`):
+el día más ANTIGUO entre el inicio más antiguo de sus períodos
+(`payrollHistoryFloor`) y el día Bogotá de la PRIMERA factura no anulada
+(`readEarliestInvoiceEvidence`). Antes de eso no había nada que liquidar, así que
+no se reporta historia anterior (nada de arrastrar años de ciclos de un negocio
+que no existía), y un ciclo que terminó antes del piso tampoco aparece.
 
-F10 (068): cuando la sede tiene **fecha de arranque configurada**, esa fecha
-REEMPLAZA a la evidencia de la historia como cota del aviso —no se combina por el
-máximo: la fecha es la autoridad sobre dónde empieza la nómina— y el aviso sigue
-vivo aunque la sede no tenga ningún período, porque en una sede nueva el primer
-ciclo es justamente lo que falta liquidar. Ver "Fecha de inicio de la nómina de
-la sede".
+Sin evidencia NINGUNA —ni períodos ni facturas— no hay día donde detenerse: el
+recorrido cae al tope de siempre y ofrece los últimos `PENDING_SETTLEMENT_LIMIT`
+(3) ciclos cerrados **por cadencia**, que es todo el alcance que queda cuando no
+hay piso. Una sede sin historia no se calla: muestra los tres ciclos más
+recientes de cada cadencia como lo que falta liquidar, y la PRIMERA liquidación
+declara desde cuándo opera la nómina (ver "El primer ciclo se recorta").
+
+RETIRADO (F10, 068): cuando la sede tenía **fecha de arranque configurada** en
+`sedes.payroll_start_date`, esa fecha REEMPLAZABA a la evidencia como cota del
+aviso —no se combinaba por el máximo: la fecha era la autoridad sobre dónde
+empieza la nómina— y el aviso seguía vivo aunque la sede no tuviera ningún
+período. La columna y su escritura se retiraron: nada la lee ni la escribe.
+
+El piso NO es un anclaje (T5): el piso dice desde cuándo HAY historia; el anclaje
+declarado dice hasta cuándo se PAGÓ. Ver "El anclaje declarado por cadencia (T5)".
 
 ### El tope
 
@@ -566,14 +576,15 @@ opera la nómina —«la fecha de inicio de la implementación»— para no volv
 apuntar a fechas anteriores. **Nada anterior a esa fecha existe para el
 sistema**: no se ofrece, no se liquida y no se puede abrir.
 
-`sedes.payroll_start_date date NULL` (migración 068) guarda esa fecha. Es una
-columna de la SEDE y no de cada período: sobrevive a cada liquidación y hay UNA
-sola por sede (una tabla de configuración aparte haría indistinguible «sin fila»
-de «sin configurar»). `NULL` significa «todavía no configurada» y conserva el
-comportamiento de hoy —el aviso se detiene en el arranque de la historia de la
-sede (F9)—, así que **aplicar la 068 no cambia ninguna liquidación**: el cambio
-empieza cuando el admin fija la fecha. Sin DEFAULT y sin backfill: ninguna sede
-queda con una fecha que el dueño no eligió.
+RETIRADA (F10): `sedes.payroll_start_date date NULL` (migración 068) era la
+columna que guardaba esa fecha. Era una columna de la SEDE y no de cada período:
+sobrevivía a cada liquidación y había UNA sola por sede (una tabla de
+configuración aparte haría indistinguible «sin fila» de «sin configurar»).
+`NULL` significaba «todavía no configurada» y **aplicar la 068 no cambiaba
+ninguna liquidación**. Hoy es una columna MUERTA —deuda declarada para el próximo
+reset del esquema—: nada la lee ni la escribe, ni este módulo ni la capa de
+plataforma, que ya no existe. La fecha no se configura en ninguna parte: se
+DERIVA de la evidencia (`payrollEvidenceFloor`).
 
 ### La regla, en un solo lugar
 
@@ -582,29 +593,37 @@ definición de «es anterior»: un rango lo es cuando su **último día** es ant
 a la fecha. La usan las dos superficies que deciden, y por eso no pueden
 discrepar:
 
-- `pendingPayrollSettlements` no reporta un ciclo que cierre antes de la fecha.
-  Con la fecha configurada, su cota REEMPLAZA al arranque por evidencia de F9 (no
-  se combina por el máximo) y el aviso sigue aunque la sede todavía no tenga
-  períodos. El rango reportado es el que se va a ABRIR: si la fecha cae dentro
-  del ciclo, la entrada sale recortada (`28 sep – 3 oct 2026` y no
-  `27 sep – 3 oct 2026`).
+- `pendingPayrollSettlements` no reporta un ciclo que cierre antes del **piso de
+  la evidencia** (`payrollEvidenceFloor`), que es su cota. Sin piso no hay cota de
+  día: el recorrido cae al tope de `PENDING_SETTLEMENT_LIMIT` por cadencia. El
+  rango reportado es el que se va a ABRIR: si el piso cae dentro del ciclo, la
+  entrada sale recortada (`28 sep – 3 oct 2026` y no `27 sep – 3 oct 2026`).
 - `openPayrollPeriod` rechaza con `VALIDATION` (400), antes del INSERT, un ciclo
-  que cierre antes de la fecha y **nombra la fecha** en el mensaje.
+  que cierre antes del piso y **nombra la fecha** en el mensaje.
 
 ### El primer ciclo se recorta (y lo paga la prorrata de F5)
 
-`resolveOpenPayrollRange({ frequency, cycleEndDate, payrollStartDate, periods })`
+`resolveOpenPayrollRange({ frequency, cycleEndDate, payrollStartDate, cadenceAnchor, declaredStartDate, periods })`
 es el ÚNICO validador de la forma del rango y acepta **exactamente dos formas**:
 
 1. Un **ciclo completo** de la cadencia (domingo a sábado; 7/14/28 días). Es la
    forma normal de todos los ciclos posteriores al primero, y también la del
-   primer ciclo cuando empieza el mismo día del arranque o después.
-2. El **primer ciclo** —el que CONTIENE la fecha de arranque— **recortado** a esa
-   fecha: empieza el día del arranque y termina el sábado de su ciclo. Sólo vale
-   como PRIMERO: si esa MISMA cadencia ya tiene períodos, el recorte se rechaza
+   primer ciclo cuando empieza el mismo día del piso o después.
+2. El **primer ciclo** —el que CONTIENE el piso— **recortado** a esa fecha:
+   empieza el día del piso y termina el sábado de su ciclo. Sólo vale como
+   PRIMERO: si esa MISMA cadencia ya tiene períodos, el recorte se rechaza
    (`not-first-cycle`), porque la única primera liquidación de la cadencia ya
    ocurrió. Un período HEREDADO sin cadencia no es historia de la cadencia; sí lo
    es la de otra cadencia.
+
+Sin evidencia NINGUNA (ni períodos ni facturas) no hay piso, y entonces la
+PRIMERA liquidación lo **declara**: el envío trae `declared_start_date` y su
+primer ciclo se recorta a ese día. Es el ÚNICO envío que puede traerla, y
+`declared-required` es el rechazo cuando no hay evidencia ni declaración —el piso
+no puede nacer mudo—. Después de ese primer período nadie vuelve a preguntar: con
+historia, una fecha declarada se rechaza (`declared-with-history`). La
+declaración se valida dentro del ciclo elegido (`declared-outside-cycle`) y no en
+el futuro (`declared-in-the-future`).
 
 El recorte no inventa aritmética: el rango más corto lo paga la prorrata de ciclo
 parcial de F5 (`días del período / días del ciclo`). Con un sueldo mensual de
@@ -621,27 +640,27 @@ liquidación del 1 al 10 de octubre (500.000) y esa liquidación **incluye la
 primera semana** (1–3 de octubre), que no se pagó aparte; el ciclo quincenal
 siguiente es completo y vuelve a 750.000.
 
-### Configurarlo
+### Configurarlo — RETIRADO
 
-La CONFIGURACIÓN de la fecha ya no es de este módulo: es de la superficie de
-PLATAFORMA. `setPlatformPayrollStartDate({ sede_id, payroll_start_date }, actor)`
-en `platform/service.ts`, expuesta por `setPlatformPayrollStartDateAction` para
-el rol `superadmin`, es la ÚNICA escritura de la columna y deja AUDITORÍA
-(`platform.payroll_start_date_set`: actor, sede objetivo y los dos valores, el
-anterior y el nuevo). Valida la forma de la fecha con el mismo esquema que este
-módulo (`payrollStartDateSchema`, que la plataforma reutiliza desde acá: una
-fecha futura es legal porque la implementación puede arrancar en el ciclo que
-viene) y `null` vuelve a «sin configurar». Si la 068 no está aplicada (columna
-inexistente, `42703`), la escritura responde un mensaje accionable que nombra la
-migración, en vez del error crudo de la base.
+La CONFIGURACIÓN de la fecha ya no existe, en ninguna superficie. Lo que había
+era la superficie de PLATAFORMA: `setPlatformPayrollStartDate({ sede_id,
+payroll_start_date }, actor)` en `platform/service.ts`, expuesta por
+`setPlatformPayrollStartDateAction` para el rol `superadmin`, era la ÚNICA
+escritura de la columna y dejaba AUDITORÍA (`platform.payroll_start_date_set`:
+actor, sede objetivo y los dos valores, el anterior y el nuevo). Toda la capa se
+retiró porque su única escritura era esa fecha, y con ella salió
+`platform.payroll_start_date_set` del vocabulario de auditoría.
 
-Lo que queda acá es la LECTURA: `getPayrollStartDate(sedeId)` en `service.ts`, con
-el guard de admin en la superficie (`requirePayrollAdmin`), como el resto del
-módulo. Es la que alimentan el aviso de pendientes y el diálogo de apertura, los
-dos pisos de los ciclos que se ofrecen y se abren. Con la 068 sin aplicada
-devuelve `null` —sin fecha, el módulo hace lo de hoy— en vez de un error interno.
+Lo que queda acá es la LECTURA: `getPayrollStartDate()` en `service.ts` —sin
+`sedeId`: la instalación es de una sola (M1–M3c) y los períodos se leen enteros—,
+con el guard de admin en la superficie (`requirePayrollAdmin`), como el resto del
+módulo. Es la que alimentan el aviso de pendientes y el diálogo de apertura, el
+piso de los ciclos que se ofrecen y se abren. Deriva el piso de la evidencia
+(`payrollEvidenceFloor`: el inicio más antiguo de los períodos compuesto con el
+día Bogotá de la primera factura no anulada) y `null` significa exactamente «la
+nómina todavía no tiene primer período», no «falta configurarla».
 
-Equivalente manual, UNA línea (la superficie de plataforma hace lo mismo):
+Equivalente manual (RETIRADO: la columna quedó sin uso, no se ejecuta):
 
 ```sql
 UPDATE public.sedes SET payroll_start_date = '2026-10-05' WHERE id = '<sede>';
@@ -649,25 +668,22 @@ UPDATE public.sedes SET payroll_start_date = '2026-10-05' WHERE id = '<sede>';
 
 ### En pantalla
 
-- **El control de la fecha** (sólo admin, en la pantalla de nómina): etiqueta
-  "Fecha de inicio de la nómina", el campo y la ayuda que dice que nada anterior
-  a esa fecha existe para el sistema (y que el primer ciclo de cada cadencia se
-  liquida desde ahí). Está siempre visible —tampoco cuando ya está configurada:
-  se puede corregir y se puede volver a «sin configurar» dejando el campo vacío—
-  y, cuando está en NULL, la ayuda y el aviso invitan a fijarla. Es
-  deliberadamente MÍNIMO (etiqueta, campo y ayuda, sin disposición propia)
-  porque la CONFIGURACIÓN se muda a la superficie de plataforma (super admin):
-  esta pantalla conserva la LECTURA, que es la que el aviso y el diálogo
-  necesitan. La fecha llega leída del servidor como valor inicial
-  (`initialPayrollStartDate`, mismo patrón que `initialPeriods`).
-- **El diálogo de apertura no pregunta nada**: ya no hay selector de cadencia ni
-  de ciclo, y no hay ningún campo de fecha. La única entrada es el aviso de
+- **El control de la fecha — RETIRADO**: hubo una etiqueta "Fecha de inicio de la
+  nómina" con su campo y su ayuda ("nada anterior a esa fecha existe para el
+  sistema"). Ya no existe: la pantalla de nómina no tiene ningún control de la
+  fecha —`initialPayrollStartDate` ni se lee ni se pasa—, porque la fecha no se
+  configura en ninguna parte. El aviso de pendientes y el diálogo la leen ya
+  derivada del servidor.
+- **El diálogo de apertura no pregunta el RANGO**: ya no hay selector de cadencia
+  ni de ciclo, ni campo de fecha de arranque. La única entrada es el aviso de
   ciclos pendientes: cada entrada (o el botón "Abrir período", que nace en la
   MÁS ATRASADA) abre el diálogo con ese ciclo ya elegido y una lista de los
   pendientes —el más atrasado primero, preseleccionado— que sólo se confirma. El
   rango se muestra derivado ("Del 1 oct 2026 al 10 oct 2026 (10 días)") y un
   ciclo recortado lo dice: "Primer ciclo recortado…". Sin ciclos pendientes el
-  diálogo no ofrece nada y lo dice.
+  diálogo no ofrece nada y lo dice. T6: lo ÚNICO que el diálogo pregunta es el
+  anclaje declarado de la cadencia, y sólo cuando hace falta (ver "El anclaje
+  declarado por cadencia (T5)").
 - La guarda del envío repite las DOS verdades del servidor con las mismas
   funciones puras: la regla de liquidación (`isPayrollCycleSettled`) y la de la
   fecha (`isRangeBeforePayrollStart`, que rechaza nombrando la fecha). El
@@ -675,10 +691,57 @@ UPDATE public.sedes SET payroll_start_date = '2026-10-05' WHERE id = '<sede>';
 
 Léase `getPayrollStartDate` en `service.ts` y `getPayrollStartDateAction` en
 `actions.ts` (solo admin, `requirePayrollAdmin`; declaradas en la tabla de roles de
-`tests/action-guards.test.ts`). La ESCRITURA ya no es una superficie de este módulo:
-vive en `platform/service.ts` y `platform/actions.ts`
-(`setPlatformPayrollStartDate` / `setPlatformPayrollStartDateAction`, solo
-`superadmin`), con su propia fila en esa misma tabla.
+`tests/action-guards.test.ts`). La ESCRITURA de la fecha no existe: la que había
+vivía en la capa de plataforma (`setPlatformPayrollStartDate` /
+`setPlatformPayrollStartDateAction`, solo `superadmin`) y se retiró con ella.
+
+## El anclaje declarado por cadencia (T5)
+
+Decisión del dueño (2026-10-05/06): el anclaje **declarado** de una cadencia dice
+**hasta qué día se PAGARON** los sueldos de ese grupo. Es lo que evita reportar
+como pendiente lo que ya se pagó fuera del sistema.
+
+### El piso NO es el anclaje
+
+Son dos verdades distintas, y confundirlas cuesta plata:
+
+- El **piso** (`payrollEvidenceFloor`) dice desde cuándo **HAY historia**: la
+  nómina ARRANCA el día F. Un ciclo que cierra EXACTAMENTE en F sigue siendo el
+  primer ciclo, y se reporta y se abre recortado a `F..F`.
+- El **ancla declarada** dice que los días **HASTA** el día A ya están pagados:
+  `isCycleCoveredByAnchor({ endDate, anchor })` compara el ÚLTIMO día del ciclo
+  contra A, así que un ciclo que cierra en o antes de A está CUBIERTO (ni se
+  reporta ni se abre), y uno que CONTIENE A se reporta y se abre recortado a
+  `A+1` (`cadencePayableFrom`: el día siguiente al ancla). El anclaje nunca entra
+  como piso: sólo aporta su primer día pagable, y la cota efectiva es el MAYOR de
+  los dos.
+
+### Dónde vive y cómo se lee
+
+Una declaración por cadencia en `system_settings`, con la clave
+`payroll_anchor_semanal` / `payroll_anchor_quincenal` / `payroll_anchor_mensual` y
+valor `{ "paid_through": "aaaa-mm-dd" }` (el día DECLARADO, el hecho; el ancla
+ajustada al sábado se deriva). `getPayrollCadenceAnchors` las lee de una sola vez;
+un sobre ausente o malformado se lee como «no declarado», nunca como un error.
+`listPayrollOverview` y `openPayrollPeriod` consumen esa misma lectura, así que el
+aviso y la apertura no pueden discrepar.
+
+### La ventana de reparación
+
+La declaración sólo se puede guardar MIENTRAS la cadencia no tenga períodos: el
+primer período de esa cadencia cierra la edición con `CADENCE_ANCHOR_LOCKED`
+(409), porque ese primer período ya es la evidencia de hasta cuándo se pagó.
+`setPayrollCadenceAnchor` audita el cambio con `payroll.cadence_anchor_set`
+(actor, cadencia, el día declarado anterior y el nuevo, y el ancla efectiva), sin
+entrar a ningún catálogo de alertas: declarar cobertura es configuración, no un
+desvío.
+
+### En pantalla
+
+Es un paso DENTRO del diálogo "Abrir período" (T6): si la cadencia elegida no
+tiene anclaje declarado y el ciclo elegido lo toca, se declara ahí mismo
+("Declarar anclaje"), con la vista previa del ancla ajustada al sábado y los días
+que absorbe.
 
 ## Detalle de la liquidación: facturas y vales (F6)
 

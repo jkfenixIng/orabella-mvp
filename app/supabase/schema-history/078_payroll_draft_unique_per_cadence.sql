@@ -1,0 +1,222 @@
+-- ===================================================================== ---
+-- 078_payroll_draft_unique_per_cadence.sql
+-- ===================================================================== ---
+--
+-- EL BORRADOR DE NÓMINA ES ÚNICO POR RANGO **Y POR CADENCIA**
+--
+-- `payroll_periods` lleva dos garantías sobre los mismos días y, hasta acá, se
+-- contradecían. Una decía «dos períodos sólo se cruzan si son de cadencias
+-- distintas» y la otra decía «dos períodos nunca comparten las mismas fechas»,
+-- sin mirar la cadencia. Con las dos en pie, la segunda manda y la primera deja
+-- de ser la regla: el dueño puede abrir el ciclo quincenal encima del semanal y
+-- la base se lo niega con un 23505 que el servicio traduce a
+-- `PERIOD_DRAFT_EXISTS`, un error de negocio que afirma algo que el propio
+-- módulo de nómina documenta como correcto.
+--
+-- LAS DOS GARANTÍAS, CON SU ORIGEN
+--
+--   * `ex_payroll_periods_no_overlap` — exclusión `gist` que creó 035;
+--     063 la reemplazó por la misma acotada además por cadencia, y 074 le quitó
+--     el elemento `sede_id`. Hoy es:
+--
+--         EXCLUDE USING gist (
+--           coalesce(frequency, '') WITH =,
+--           daterange(start_date, end_date, '[]') WITH &&
+--         )
+--
+--     Su `COMMENT` lo dice sin ambigüedad: «un día se nomina una sola vez
+--     DENTRO DEL MISMO CICLO […] Ciclos distintos (semanal y mensual) sí pueden
+--     superponerse». El cubo `coalesce(frequency, '')` es lo que hace que un
+--     período heredado sin cadencia (`frequency` NULL) sea un cubo PROPIO y
+--     siga siendo excluyente consigo mismo: sin el `coalesce`, un NULL no es
+--     igual a nada y la garantía se apagaría en silencio.
+--
+--   * `uq_payroll_draft_per_range` — índice único PARCIAL que creó 007 como
+--     barrera final ante la carrera de «abrir dos veces el mismo rango»; 074 le
+--     quitó el elemento `sede_id` y lo dejó en `(start_date, end_date)` sobre
+--     `WHERE status = 'borrador'`. No hablaba de cadencia porque en 007 la
+--     cadencia todavía no existía: `payroll_periods.frequency` la agregó 063,
+--     muchas unidades más adelante. El índice se quedó con la forma que tenía
+--     el mundo antes de que las cadencias existieran, y cuando las cadencias
+--     llegaron nadie volvió a mirarlo.
+--
+-- POR QUÉ LAS DOS TERMINAN EN EL MISMO RANGO
+--
+-- F7 obligó a que el rango de un período NUEVO no lo eligiera quien lo abre: lo
+-- deriva el ciclo de su cadencia, y todo ciclo cierra en sábado (7, 14 o 28
+-- días contados con los dos extremos). F10 añadió que el PRIMER ciclo de cada
+-- cadencia se recorta al arranque de la nómina. De las dos reglas sale la
+-- coincidencia: con arranque el 2026-09-27 y primer cierre el sábado
+-- 2026-10-03, el semanal queda `2026-09-27 → 2026-10-03`, el quincenal también
+-- —su ciclo arrancaba el 20 y se recorta al 27— y el mensual también —arrancaba
+-- el 6 y se recorta al 27—. Tres liquidaciones distintas, un solo par de fechas,
+-- y las tres legales para la exclusión porque son tres cubos distintos.
+--
+-- El rechazo tampoco es un incidente raro que se note en la bitácora: el
+-- servicio lo traduce a `PERIOD_DRAFT_EXISTS` («Ya existe un borrador para ese
+-- rango de fechas»), de modo que en la pantalla de la quincenal y la mensual el
+-- rango del semanal se describe como si fuera suyo. Y no se arregla cerrando el
+-- semanal ni esperando al ciclo siguiente: mientras haya un borrador de la
+-- MISMA cadencia con esas fechas, el índice vuelve a negarlo, y el dueño no
+-- tiene ninguna palanca en la base para resolverlo.
+--
+-- QUÉ HACE ESTE ARCHIVO: SÓLO ESO
+--
+-- Recrea `uq_payroll_draft_per_range` con el cubo de cadencia como TERCER
+-- elemento de la clave, conservando el nombre, la tabla, el método y el `WHERE`.
+-- Dos sentencias, el mismo patrón `DROP … IF EXISTS` + `CREATE` de 074, y nada
+-- más: no se escribe, no se borra y no se reescribe ni una fila de
+-- `payroll_periods`.
+--
+-- POR QUÉ NO HACE FALTA PRE-VUELO (a diferencia del de 074)
+--
+-- El de 074 existía porque quitar `sede_id` de una clave ACORTA el conjunto de
+-- filas que el índice tiene que separar, y las que hoy quedaban separadas por la
+-- sede podían chocar entre sí al quedarse sin ella. Acá pasa lo contrario:
+-- agregar un elemento a un índice único nunca crea una colisión, sólo deja de
+-- prohibirse una. Las filas que el índice tiene que separar pasan de «mismo
+-- rango» a «mismo rango y misma cadencia», que es un subconjunto. Como ninguna
+-- fila de las de hoy puede violar el índice nuevo, el `CREATE` no puede fallar
+-- por datos y no hay nada que decidir antes de correrlo: no hay infractores que
+-- nombrar ni filas entre las que el dueño tenga que elegir.
+--
+-- ADITIVO, IDEMPOTENTE Y RE-EJECUTABLE
+--
+-- Una segunda corrida deja el esquema igual: el `DROP … IF EXISTS` no encuentra
+-- nada y el `CREATE` vuelve a declarar la misma definición. Idempotente, sí;
+-- atómico, NO, y conviene decir por qué en vez de suponerlo.
+--
+-- LO QUE PASA SI FALLA A MITAD, Y ES LO CONTRARIO DE LO QUE SUENA
+--
+-- El editor SQL de la consola confirma sentencia por sentencia y cada una
+-- corre en su propia transacción con autocommit: no hay nada que las agrupe. Un
+-- `DROP` que tuvo éxito seguido de un `CREATE` que falla deja el índice AUSENTE,
+-- no el viejo. Ese estado intermedio es real y hay que saber qué significa.
+--
+--   * NO es un sistema sin garantía. `ex_payroll_periods_no_overlap` sigue en
+--     pie y es la garantía FUERTE de la pareja: un día no se nomina dos veces
+--     dentro de un ciclo, y nadie lo puede saltar mientras exista.
+--   * Lo que se pierde es la barrera EXTRA contra una carrera puntual: dos
+--     clientes que abren el MISMO rango de la MISMA cadencia entre la lectura y
+--     el `INSERT` ya no reciben el 23505 de este índice. Y esa carrera la sigue
+--     cubriendo la exclusión, que responde 23P01 —que el servicio traduce a
+--     `PERIOD_OVERLAP`—, así que el resultado es un error de solape en vez de
+--     un error de borrador duplicado: distinto mensaje, ninguna ventana abierta.
+--     El 23505 de `PERIOD_DRAFT_EXISTS` sólo vuelve a aparecer cuando el índice
+--     está recreated, y recrearlo es el primer paso de la recuperación.
+--
+-- CÓMO SE RECUPERA
+--
+-- Volviendo a correr el archivo entero, que es la misma respuesta que antes:
+-- el `DROP INDEX IF EXISTS` no encuentra nada que borrar y el `CREATE` restaura
+-- la definición. Ninguna fila de `payroll_periods` se vio afectada, porque este
+-- archivo no escribe, no borra y no reescribe datos.
+--
+-- LA FORMA QUE ELIMINA LA VENTANA, CUANDO EL CLIENTE LA PERMITE
+--
+-- Pegando las dos sentencias dentro de una transacción explícita —
+-- `begin; … commit;`— el `DROP` y el `CREATE` se confirman o se descartan
+-- juntos y no existe estado intermedio. Es la forma correcta cuando el cliente
+-- que se está usando envuelve el envío en una transacción: no se afirma acá que
+-- el editor SQL de la consola lo haga —su confirmación sentencia por sentencia
+-- dice lo contrario— sino que la ventana desaparece donde el cliente sí la
+-- garantiza.
+--
+-- LO QUE ESTE ARCHIVO NO TOCA, Y POR QUÉ
+--
+--   * `ex_payroll_periods_no_overlap`: no se suelta, no se reescribe y no se
+--     comenta. Es la garantía fuerte de la pareja —un día no se nomina dos
+--     veces DENTRO de un ciclo— y el objeto al que este archivo pone a hablar
+--     con ella, no el que se ajusta para que las dos coincidan. Que el 23P01
+--     siga siendo el código que el servicio traduce a `PERIOD_OVERLAP` es
+--     justamente lo que hace falta.
+--   * `openPayrollPeriod` ni sus errores: el 23505 que este índice levanta
+--     cuando dos clientes abren la MISMA cadencia con el mismo rango sigue
+--     siendo `PERIOD_DRAFT_EXISTS`, y el 23P01 de la exclusión sigue siendo
+--     `PERIOD_OVERLAP`. No cambia ni un código ni una palabra de mensaje, y el
+--     texto de `PERIOD_DRAFT_EXISTS` sigue siendo cierto en todos los casos en
+--     que ahora puede llegar: el mismo rango y la misma cadencia implican el
+--     mismo rango. Lo que cambia es a favor: un 23505 ya no llega cuando la
+--     regla de negocio dice que sí.
+--   * El servicio, los esquemas Zod, los RPC y los `CHECK` de `payroll_periods`,
+--     que ya validan la forma del ciclo y la obligatoriedad de la cadencia en
+--     un período nuevo.
+--   * El archivo único `supabase/migrations/001_orabella_schema.sql`: es un
+--     volcado generado y no se edita a mano. Sigue declarando el índice sin
+--     cadencia porque la 078 entra al historial DESPUÉS de que él se construyó;
+--     el volcado se vuelve a hacer con `squash/build-schema.py`, que compara el
+--     sha256 de lo reconstruido contra el commiteado, cuando haya una base
+--     `orabella_build` con la serie entera aplicada. Los CONTEOS del encabezado
+--     no cambian: sigue siendo el mismo índice, con el mismo nombre y el mismo
+--     `WHERE`; lo que cambia es la lista de columnas.
+--   * `supabase/test-bootstrap.sql`: tampoco lo regenera esta unidad, pero sí
+--     lo ALINEA. Es una concatenación del archivo único y de
+--     `seeds/acceptance.sql` (paso 2.8 del README del squash), así que su
+--     índice venía del volcado viejo y habría seguido declarando la
+--     restricción SIN cadencia: una copia de prueba que promete una cosa y
+--     aplica otra es peor que no tenerla. La línea se actualizó a mano y a
+--     mano se vuelve a generar; cuando el archivo único se rehaga con la 078
+--     dentro, esta línea sale idéntica de ahí y el paso 2.8 no tiene nada que
+--     corregir.
+--
+-- CÓMO VERIFICA EL DUEÑO (sólo lectura)
+--
+--   -- El índice, con sus TRES elementos y el `WHERE` intacto:
+--   -- SELECT indexdef FROM pg_indexes
+--   --  WHERE schemaname = 'public' AND indexname = 'uq_payroll_draft_per_range';
+--   -- CREATE UNIQUE INDEX uq_payroll_draft_per_range ON public.payroll_periods
+--   --   USING btree (start_date, end_date, COALESCE(frequency, ''::text))
+--   --   WHERE (status = 'borrador'::text)
+--
+--   -- Y que la exclusión sigue siendo la de dos elementos y en su nombre:
+--   -- SELECT conname, pg_get_constraintdef(oid)
+--   --   FROM pg_constraint
+--   --  WHERE conname = 'ex_payroll_periods_no_overlap';
+--
+--   -- Prueba funcional, con filas de prueba y nunca con las reales: dos
+--   --   borradores del MISMO rango y de cadencia DISTINTA tienen que entrar
+--   --   los dos, y el tercero —con la cadencia del primero— tiene que chocar
+--   --   con 23505.
+--
+-- CÓMO SE REVIERTE (el par inverso, en el mismo nombre)
+--
+--   --   DROP INDEX IF EXISTS public.uq_payroll_draft_per_range;
+--   --   CREATE UNIQUE INDEX uq_payroll_draft_per_range
+--   --     ON public.payroll_periods (start_date, end_date)
+--   --     WHERE status = 'borrador';
+--
+-- NO ejecutado por el agente: requiere base de datos.
+
+-- ===================================================================== ---
+-- 1. EL ÍNDICE DEL BORRADOR, CON EL CUBO DE CADENCIA EN LA CLAVE
+-- ===================================================================== ---
+--
+-- MISMO NOMBRE, y no por gusto: `uq_payroll_draft_per_range` es un nombre
+-- elegido a mano que citan 007, 074 y el `COMMENT` de la columna, y 063 ya
+-- reemplazó la exclusión en su mismo nombre cuando le agregó la cadencia. Otro
+-- nombre pondría una etiqueta falsa sobre el objeto y dejaría al dominio y a la
+-- base hablando de dos garantías distintas.
+--
+-- MISMO `WHERE`, copiado al carácter: `status = 'borrador'` es lo que decide qué
+-- filas entran al índice, y ampliar ese alcance sin querer dejaría de ser un
+-- índice de borradores —un período cerrado es historia y su rango puede volver a
+-- liquidarse—.
+--
+-- El tercer elemento es `coalesce(frequency, '')`, el MISMO cubo que
+-- `ex_payroll_periods_no_overlap` compara con `=`. Esa es la parte que importa,
+-- y por eso va explícita y no implícita: es exactamente la razón por la que la
+-- exclusión no ve el solape entre ciclos distintos, así que poner el mismo cubo
+-- acá es lo que hace que las dos garantías dejen de contradecirse. Queda un
+-- único borrador por rango Y por cadencia, y un único día por ciclo, y ninguna
+-- de las dos puede negar lo que la otra promete. El `coalesce` se conserva por
+-- la misma razón que en la exclusión: los períodos heredados de antes de F7
+-- tienen `frequency` NULL, y sin él serían un cubo distinto de sí mismos y
+-- podrían repetirse en silencio; con `''` son un cubo propio, igual que para la
+-- exclusión.
+
+DROP INDEX IF EXISTS public.uq_payroll_draft_per_range;
+
+CREATE UNIQUE INDEX uq_payroll_draft_per_range
+  ON public.payroll_periods
+  USING btree (start_date, end_date, coalesce(frequency, ''))
+  WHERE (status = 'borrador');

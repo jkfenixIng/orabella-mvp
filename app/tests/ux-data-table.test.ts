@@ -147,11 +147,23 @@ function readProductionSources(): Map<string, string> {
  */
 const ALLOWLIST = new Map<string, number>([
   ["app/cash/cash-client.tsx", 1],
-  ["app/inventory/inventory-client.tsx", 2],
+  // La deuda de inventario bajó de DOS a cero: las dos listas (productos y
+  // kardex) dejaron de ser tablas con carril y pasaron a la tarjeta de R38
+  // sobre una grilla anclada por `sm:col-start-N`. Los pisos no se mudaron a
+  // otro lado: el módulo no declara ningún `min-w-[Npx]`. La entrada se queda
+  // como testigo de que se pagó, no como permiso.
+  ["app/inventory/inventory-client.tsx", 0],
   ["app/invoices/invoices-client.tsx", 7],
   ["app/payroll/payroll-client.tsx", 4],
-  ["app/services/services-client.tsx", 1],
-  ["app/vales/vouchers-client.tsx", 1],
+  // Lo mismo en servicios: su lista es ahora la tarjeta con etiquetas y la
+  // grilla de cinco columnas, sin piso propio.
+  ["app/services/services-client.tsx", 0],
+  // La lista de vales ya no es una `<table min-w-[760px]>` dentro de un carril:
+  // es la tarjeta de R-e2 (abajo de `sm`) sobre una grilla de seis columnas
+  // (arriba). El piso no se transladó a otro lado —la fila no declara ningún
+  // `min-w-[Npx]`—, así que su deuda baja a CERO y la entrada se queda como
+  // testigo de que se pagó, no como permiso.
+  ["app/vales/vouchers-client.tsx", 0],
 ]);
 
 const SOURCES = readProductionSources();
@@ -345,12 +357,14 @@ describe("la escala vive una sola vez: en el primitivo", () => {
       }
     }
     expect(failures).toEqual([]);
-    // Los seis archivos que ya tenían pisos, y 16 en total: si un séptimo
+    // Los seis archivos de la lista, y 12 pisos en total (bajó de 15 con los
+    // pagos de vales, inventario y servicios): si un séptimo
     // apareciera sin entrar acá, el test de arriba ya lo habría marcado.
-    // La cifra BAJA cuando una unidad migra un consumidor al primitivo: las dos
-    // tablas de liquidación de `payroll-client.tsx` dejaron de escribir su
-    // `min-w-[1040px]` a mano (6 → 4) y esa deuda queda pagada, no escondida.
-    expect([...ALLOWLIST.values()].reduce((total, hits) => total + hits, 0)).toBe(16);
+    // La cifra BAJA cuando una unidad paga su deuda, porque el piso no se
+    // translada: las dos tablas de liquidación de `payroll-client.tsx`
+    // dejaron de escribir su `min-w-[1040px]` a mano (6 → 4) y la lista de
+    // vales ya no es una tabla con carril (1 → 0). Queda pagada, no escondida.
+    expect([...ALLOWLIST.values()].reduce((total, hits) => total + hits, 0)).toBe(12);
   });
 });
 

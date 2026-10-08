@@ -15,8 +15,7 @@
     "test": "vitest run",
     "test:e2e": "playwright test",
     "test:e2e:changed": "playwright test --grep @changed",
-    "test:e2e:full": "playwright test --grep @full",
-    "create:superadmin": "node -e \"let j;try{j=require('jiti')}catch{console.error('[superadmin] Falta el runner TypeScript: este comando necesita las dependencias de desarrollo instaladas en el checkout, con npm ci y sin --omit=dev. jiti no es una dependencia declarada del proyecto: llega con @tailwindcss/node y vite. Ver el README: Cuenta de plataforma.');process.exit(1)}const f=process.cwd()+'/scripts/create-superadmin.ts';j.createJiti(f,{tsconfigPaths:true}).import(f).then(m=>m.main())\""
+    "test:e2e:full": "playwright test --grep @full"
   },
   "dependencies": {
     "@radix-ui/react-checkbox": "^1.3.11",

@@ -9,6 +9,7 @@ import {
   buildEmployeeDetail,
   buildPayrollCorrectionView,
   buildPayrollMonthToDate,
+  cadenceAnchorFromDeclaration,
   calculatePayrollSchema,
   canDiscountVoucher,
   capPayrollDiscounts,
@@ -17,16 +18,21 @@ import {
   checkVoucherEligibility,
   computeNetPay,
   correctPayrollPeriodSchema,
+  filterPeriodsByCadence,
   mixedAbsorbedDetailLine,
   MIXED_ABSORBED_ITEM_TYPE,
   monthKeyOf,
   normalizeAllowedDays,
+  normalizePayFrequency,
   normalizePerDayLimits,
   openPeriodSchema,
+  openPayrollRejectionMessage,
+  payrollEvidenceFloor,
   periodCadenceBucket,
   periodExcludesEmployeeByCadence,
   overlapBlocksDeletion,
   payPayrollItemSchema,
+  payFrequencySchema,
   payrollCycleRange,
   payrollExtraSchema,
   pendingPayrollSettlements,
@@ -55,6 +61,7 @@ import {
   type CalculatePayrollInput,
   type DetailLine,
   type OpenPeriodInput,
+  type PayFrequency,
   type PayrollCorrectionView,
   type PayrollExtraKind,
   type PayrollMonthEmployeeRow,
@@ -162,6 +169,49 @@ async function readAllPayroll<TRow>(args: {
 
 function validationMessage(error: { issues: Array<{ message: string }> }): string {
   return error.issues[0]?.message ?? "Datos inválidos.";
+}
+
+/**
+ * F10 (evidencia): la factura MÁS ANTIGUA que prueba operación —la de
+ * `created_at` menor entre las que NO están anuladas—, con su día Bogotá ya
+ * resuelto (la convención de fecha del módulo vive acá, con quien lee la base).
+ * Una sola fila: la composición con el piso de los períodos la hace
+ * `payrollEvidenceFloor`, no este lector.
+ *
+ * Una lectura que falle NO se degrada a «sin facturas»: un piso que se cae en
+ * silencio ofrecería ciclos que la facturación ya desmiente. Sin filas (o con
+ * una fecha imposible) no hay evidencia y devuelve `null`.
+ */
+async function readEarliestInvoiceEvidence(
+  db: DbClient,
+): Promise<{ status: string | null; day: string } | null> {
+  const { data, error } = await db
+    .from("invoices")
+    .select("status, created_at")
+    .neq("status", "Anulada")
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+  if (!data) return null;
+  const row = data as { status?: string | null; created_at?: string | null };
+  const instant = row.created_at ? Date.parse(row.created_at) : Number.NaN;
+  if (Number.isNaN(instant)) return null;
+  return { status: row.status ?? null, day: bogotaDay(0, new Date(instant)) };
+}
+
+/**
+ * F10: el piso de la nómina por EVIDENCIA, derivado UNA vez para cada llamador
+ * (apertura, resumen y lectura del piso): el piso de los períodos compuesto con
+ * la primera factura por `payrollEvidenceFloor`. Sin facturas el resultado es
+ * EXACTAMENTE el de siempre (la instalación recién nacida).
+ */
+async function payrollEvidenceFloorFor(
+  db: DbClient,
+  periods: readonly PayrollPeriodRow[],
+): Promise<string | null> {
+  const invoice = await readEarliestInvoiceEvidence(db);
+  return payrollEvidenceFloor({ periods, invoices: invoice === null ? [] : [invoice] });
 }
 
 /**
@@ -279,7 +329,7 @@ function toPayrollError(error: unknown): PayrollError {
   if (error instanceof PagedReadError) {
     return new PayrollError(
       error.code,
-      `${error.message} La operación se detuvo: con una lectura incompleta las cifras de nómina (comisiones, vales y pagado) saldrían mal. Reintente y, si persiste, revise el volumen de datos de la sede.`,
+      `${error.message} La operación se detuvo: con una lectura incompleta las cifras de nómina (comisiones, vales y pagado) saldrían mal. Reintente y, si persiste, revise el volumen de datos de la instalación.`,
       500,
     );
   }
@@ -694,12 +744,18 @@ async function attachVoucherUserNames(
  * calculándose como hoy.
  *
  * F10: la FORMA del rango la resuelve `resolveOpenPayrollRange` —un ciclo
- * COMPLETO, o el PRIMER ciclo de la cadencia RECORTADO a la fecha de arranque de
- * la sede (migración 068)— y nada más. Un ciclo que cierra antes de esa fecha no
- * existe para el sistema y se rechaza nombrando la fecha; un recorte que ya no
- * sería «el primero» (la cadencia tiene períodos) también. El recorte reusa la
- * prorrata de ciclo parcial de F5 (`cycleProrationFactor` ve un rango más corto
- * y paga `días / días del ciclo`): no hay aritmética nueva.
+ * COMPLETO, o el PRIMER ciclo de la cadencia RECORTADO al arranque de la
+ * nómina— y nada más. El arranque es un HECHO DERIVADO (`payrollHistoryFloor`,
+ * el día del primer período) y, cuando todavía no hay ningún período, lo DECLARA
+ * esta misma liquidación: es el único envío que puede traer
+ * `declared_start_date`, y un ciclo que cierra antes del arranque no existe para
+ * el sistema. El recorte reusa la prorrata de ciclo parcial de F5
+ * (`cycleProrationFactor` ve un rango más corto y paga `días / días del ciclo`):
+ * no hay aritmética nueva.
+ *
+ * `sedeId` ya no acotaba nada (los períodos se leen enteros) y se conserva sólo
+ * por la firma pública que llama la ruta de API: quitarlo acá obligaría a tocar
+ * esa superficie, que es de otra unidad.
  */
 export async function openPayrollPeriod(
   sedeId: string,
@@ -722,44 +778,53 @@ export async function openPayrollPeriod(
   }
   const db = await payrollDb();
   try {
-    // F10: la fecha de arranque de la sede entra ANTES de resolver el rango: es
-    // la cota de «nada anterior existe para el sistema».
-    const payrollStartDate = await getPayrollStartDate(sedeId);
-    // F10: los períodos de la sede, en UNA lectura exhaustiva. La necesitan las
-    // dos decisiones de abajo: la guarda de solape (antes era la lectura
-    // filtrada por el rango, con el MISMO contrato —la decisión la toma
-    // `rangesOverlap`, pero la LECTURA es completa y falla a la vista
-    // (READ_INCOMPLETE): con una lectura recortada por el tope del Data API la
-    // guarda podría no ver el período que estorba y abrir un rango que comparte
-    // días—) y la regla de F10, que necesita saber si la CADENCIA ya tiene
-    // historia y no sólo si ese ciclo está tocado.
+    // F10: los períodos de la instalación, en UNA lectura exhaustiva. La
+    // necesitan las tres decisiones de abajo: el arranque (que se deriva de
+    // ellos), la guarda de solape (antes era la lectura filtrada por el rango,
+    // con el MISMO contrato —la decisión la toma `rangesOverlap`, pero la LECTURA
+    // es completa y falla a la vista (READ_INCOMPLETE): con una lectura recortada
+    // por el tope del Data API la guarda podría no ver el período que estorba y
+    // abrir un rango que comparte días—) y la regla del primer ciclo, que
+    // necesita saber si la CADENCIA ya tiene historia y no sólo si ese ciclo está
+    // tocado.
     const sedePeriods = await listPeriods();
-    // F10: la ÚNICA decisión de la FORMA del rango que se persiste. Acepta un
-    // ciclo COMPLETO de la cadencia o el PRIMER ciclo —el que CONTIENE la fecha
-    // de arranque— RECORTADO a esa fecha, y sólo como primera liquidación de la
-    // cadencia. Todo lo demás se rechaza acá, antes de escribir.
+    // F10: el arranque de la nómina es la EVIDENCIA —el piso de esos períodos
+    // compuesto con la primera factura—. Cuando no hay ninguna, no hay arranque:
+    // lo declara esta liquidación (la primera, y la única que puede mandarlo).
+    const payrollStartDate = await payrollEvidenceFloorFor(db, sedePeriods);
+    // T5: el anclaje DECLARADO de ESTA cadencia —los días hasta él ya se
+    // pagaron—, nunca el piso: el piso dice desde cuándo HAY historia, no hasta
+    // cuándo se pagó. Se lee la declaración vigente tal cual la lee el aviso (una
+    // lectura para las tres cadencias) y se pasa al validador, que decide con la
+    // MISMA regla que el aviso: un ciclo cubierto se rechaza y uno a medias se
+    // abre recortado a `ancla + 1`. Esa coincidencia es la invariante del módulo.
+    const declaredAnchors = await getPayrollCadenceAnchors();
+    const cadenceAnchor = declaredAnchors[input.frequency]?.anchor ?? null;
+    // F10: la ÚNICA decisión de la FORMA del rango que se persiste, y el mensaje
+    // de todo rechazo sale de la misma función que la pantalla usa: el diálogo y
+    // el servicio no pueden decir cosas distintas del mismo ciclo.
     const resolution = resolveOpenPayrollRange({
       frequency: input.frequency,
       cycleEndDate: input.cycle_end_date,
       payrollStartDate,
+      declaredStartDate: input.declared_start_date ?? null,
       periods: sedePeriods,
+      referenceDate: bogotaDay(),
+      // El anclaje declarado de la cadencia, ya ajustado al sábado.
+      cadenceAnchor,
     });
     if (!resolution.ok) {
-      if (resolution.reason === "before-start") {
-        throw new PayrollError(
-          "VALIDATION",
-          `El período no puede empezar antes del ${payrollStartDate}: la nómina de esta sede arranca ese día y nada anterior existe para el sistema.`,
-          400,
-        );
-      }
-      if (resolution.reason === "not-first-cycle") {
-        throw new PayrollError(
-          "VALIDATION",
-          `El ciclo ${cycle.start_date} a ${cycle.end_date} contiene la fecha de inicio de la nómina (${payrollStartDate}), pero esta cadencia ya tiene períodos: el primer ciclo recortado sólo se abre como PRIMERA liquidación de la cadencia. Elija un ciclo completo posterior.`,
-          400,
-        );
-      }
-      throw new PayrollError("VALIDATION", "El cierre del ciclo debe ser un sábado.", 400);
+      throw new PayrollError(
+        "VALIDATION",
+        // El ancla viaja al mensaje: el rechazo por cobertura tiene que nombrar
+        // la fecha que la declaración fijó, no sólo el ciclo que no se abre.
+        openPayrollRejectionMessage(resolution.reason, {
+          payrollStartDate,
+          cycle,
+          anchor: cadenceAnchor,
+        }),
+        400,
+      );
     }
     const requested = {
       start_date: resolution.start_date,
@@ -773,10 +838,17 @@ export async function openPayrollPeriod(
       (row) =>
         periodCadenceBucket(row.frequency) === requestedBucket && rangesOverlap(row, requested),
     );
+    // F10: el remedio que estos rechazos nominan es el ÚNICO que el diálogo
+    // deja —elegir otro ciclo—, el mismo que dice la copia del cliente: el
+    // rango sale del ciclo elegido, así que no hay fechas que ajustar (ni
+    // selector de cadencia) y una instrucción de ese tipo mandaría a tocar
+    // algo que ya no existe. El dato concreto —el rango derivado, el período
+    // que estorba con su estado y por qué el cruce está prohibido— no se
+    // pierde; lo que cambia es dónde está la salida.
     if (clash) {
       throw new PayrollError(
         "PERIOD_OVERLAP",
-        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${clash.start_date} a ${clash.end_date} (${clash.status}) de esta sede. Un día se nomina una sola vez: ajuste las fechas para que no se crucen con un período existente.`,
+        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${clash.start_date} a ${clash.end_date} (${clash.status}) de la instalación. Un día se nomina una sola vez. Elija otro ciclo que no se cruce con un período existente.`,
         409,
       );
     }
@@ -794,7 +866,7 @@ export async function openPayrollPeriod(
     if (legacyClash) {
       throw new PayrollError(
         "PERIOD_OVERLAP",
-        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${legacyClash.start_date} a ${legacyClash.end_date} (${legacyClash.status}) de esta sede, que no tiene cadencia: ese período heredado pagó el fijo a todo el plantel, así que abrir este rango pagaría dos veces los mismos días. Ajuste las fechas para que no se crucen.`,
+        `El rango ${requested.start_date} a ${requested.end_date} comparte días con el período ${legacyClash.start_date} a ${legacyClash.end_date} (${legacyClash.status}) de la instalación, que no tiene cadencia: ese período heredado pagó el fijo a todo el plantel, así que abrir este rango pagaría dos veces los mismos días. Elija otro ciclo que no se cruce con ese período.`,
         409,
       );
     }
@@ -820,7 +892,7 @@ export async function openPayrollPeriod(
       if ((error as { code?: string }).code === "23505") {
         throw new PayrollError(
           "PERIOD_DRAFT_EXISTS",
-          "Ya existe un borrador para esta sede y rango de fechas.",
+          "Ya existe un borrador para ese rango de fechas.",
           409,
         );
       }
@@ -830,7 +902,7 @@ export async function openPayrollPeriod(
       if ((error as { code?: string }).code === "23P01") {
         throw new PayrollError(
           "PERIOD_OVERLAP",
-          "Otro período de esta sede quedó con días en común mientras se abría este. Un día se nomina una sola vez: revise los períodos existentes y ajuste las fechas.",
+          "Otro período quedó con días en común mientras se abría este. Un día se nomina una sola vez. Elija otro ciclo.",
           409,
         );
       }
@@ -875,57 +947,32 @@ export async function listPeriods(): Promise<PayrollPeriodRow[]> {
   }
 }
 
-// ------------------------------- F10: fecha de arranque de la nómina ---
+// ---------------- F10: el arranque de la nómina, derivado de los períodos ---
 
 /**
- * F10 (decisión del dueño, 2026-10-01): la fecha desde la que la nómina OPERA en
- * la sede —«la fecha de inicio de la implementación»—, o `null` cuando todavía
- * no está configurada.
+ * F10 (decisión del dueño, 2026-10-04): el día desde el que la nómina OPERA es
+ * un HECHO, no una configuración. Es `min(payroll_periods.start_date)` —el día
+ * del primer período que existe— y por eso se deriva con la función pura
+ * `payrollHistoryFloor`, la misma que usan la apertura, el resumen y la pantalla.
  *
- * Es la MISMA fuente para el aviso de pendientes y para la apertura de un
- * período: una sola lectura (`sedes.payroll_start_date`, migración 068) para las
- * dos superficies, así el aviso y el servicio no pueden discrepar de desde
- * cuándo existe la nómina de la sede.
+ * La columna `sedes.payroll_start_date` (migración 068) queda SIN USO, y no por
+ * decisión de este módulo: borrarla obliga a regenerar el archivo único de
+ * esquema y a resetear las dos bases, y eso no lo vale hoy. Es DEUDA declarada
+ * para el próximo reset. Mientras tanto, ni se lee ni se escribe acá.
  *
- * La ESCRITURA ya no vive acá: la configuración se muda a la superficie de
- * plataforma (`setPlatformPayrollStartDate`, acción auditada
- * `platform.payroll_start_date_set`), que es la única que escribe la columna.
- * Acá queda la LECTURA, que es la que necesitan el aviso de pendientes y el
- * diálogo de apertura.
+ * Sin períodos no hay arranque: la PRIMERA liquidación lo declara
+ * (`declared_start_date`), así que `null` aquí significa exactamente eso —la
+ * nómina todavía no tiene primer período— y no «falta configurarla».
  *
- * Degradación por migración pendiente: si la 068 todavía no se aplicó, la
- * columna no existe y PostgREST responde 42703 (`undefined_column`). Ese caso NO
- * se convierte en error interno: sin fecha configurada el módulo conserva el
- * comportamiento de hoy, que es exactamente el estado en el que está la base
- * mientras la columna no exista. Cualquier otro fallo se propaga.
- *
- * La fila de la instalación inexistente tampoco es un error acá: devuelve
- * `null`, porque «no hay fecha» es la respuesta correcta para todo lo que
- * pregunta desde cuándo existe la nómina.
+ * NO lleva `sedeId`: la instalación es de una sola (M1–M3c) y los períodos se
+ * leen enteros, así que el argumento sería una segunda frontera dentro de una
+ * base que ya tiene una.
  */
-/**
- * F10: la fecha desde la que la nómina OPERA, leída de la fila de la
- * INSTALACIÓN por clave primaria.
- *
- * `sedeId` NO es un alcance ni una frontera: es la búsqueda por clave primaria
- * de la fila que describe la instalación (`sedes`). Es la misma fila que escribe
- * la capa de plataforma (`leerSedeDeLaInstalacion`), así que la lectura y la
- * escritura de este campo no pueden divergir.
- */
-export async function getPayrollStartDate(sedeId: string): Promise<string | null> {
+export async function getPayrollStartDate(): Promise<string | null> {
+  // La evidencia vive en dos lugares (los períodos ya liquidados y la primera
+  // factura), así que el piso se compone UNA vez con la regla pura del módulo.
   const db = await payrollDb();
-  const { data, error } = await db
-    .from("sedes")
-    .select("id, payroll_start_date")
-    .eq("id", sedeId)
-    .maybeSingle();
-  if (error) {
-    const failure = error as { code?: string | null; message?: string | null };
-    if (failure.code === "42703" || /payroll_start_date/i.test(failure.message ?? "")) return null;
-    throw new PayrollError("INTERNAL", "Error interno.", 500);
-  }
-  const row = data as unknown as { payroll_start_date?: string | null } | null;
-  return row?.payroll_start_date ?? null;
+  return payrollEvidenceFloorFor(db, await listPeriods());
 }
 
 async function getPeriodOrThrow(db: DbClient, id: string): Promise<PayrollPeriodRow> {
@@ -1342,37 +1389,41 @@ async function readPaidItemsOfPeriods(args: {
 }
 
 /**
- * PA3: la vista COMPLETA de la nómina de una sede, en una lectura y con dos
- * proyecciones de los mismos datos: los totales por período y el mes a la fecha
- * por empleado. Nada de esto mueve plata: es lectura y presentación, y las
- * sumas quedan en peso entero (dentro de los derivadores puros de `schemas`).
+ * PA3: la vista COMPLETA de la nómina, en una lectura y con dos proyecciones de
+ * los mismos datos: los totales por período y el mes a la fecha por empleado.
+ * Nada de esto mueve plata: es lectura y presentación, y las sumas quedan en peso
+ * entero (dentro de los derivadores puros de `schemas`).
  *
  * OJO — AUTORIZACIÓN: el resumen agrega plata de TODA la planta. Es la misma
  * superficie que el detalle SIN alcance por fila
  * (`GET /api/v1/payroll-periods/[id]`), así que quien llama decide: la página
  * sólo la usa para el admin y al empleado le manda nada más que su propia fila.
+ *
+ * NO lleva `sedeId`: la instalación es de una sola (M1–M3c) y tanto los períodos
+ * como la planta se leen enteros, así que el argumento sería una segunda
+ * frontera dentro de una base que ya tiene una.
  */
-export async function listPayrollOverview(sedeId: string): Promise<PayrollOverview> {
+export async function listPayrollOverview(): Promise<PayrollOverview> {
   try {
     // `listPeriods` ya es exhaustiva: si se recorta, esto se cae a la vista.
     const periods = await listPeriods();
-    // F10: la fecha de arranque de la sede acota el aviso de pendientes. Se lee
-    // SIEMPRE, también sin períodos: con la fecha configurada, la sede que
-    // todavía no liquidó nada tiene justamente su PRIMER ciclo pendiente.
-    const payrollStartDate = await getPayrollStartDate(sedeId);
-    // F9 regla 4 (sin F10): sin períodos no hay historia de la sede y el resumen
-    // no inventa pendientes. Con la fecha de arranque configurada SÍ hay piso
-    // —la fecha—, así que el aviso sigue su curso y reporta el primer ciclo.
-    if (periods.length === 0 && payrollStartDate === null) {
-      return { summaries: [], months: [], pendingSettlements: [] };
-    }
-
+    // F9 regla 4 + F10 (2026-10-04): el piso de la historia se deriva de esos
+    // períodos, así que la planta se lee SIEMPRE (también sin períodos: sin
+    // piso, el detector ofrece los últimos ciclos cerrados, que es justamente lo
+    // que hace posible ABRIR el primer período). No hay atajo de «sin períodos no
+    // hay nada»: ese atajo era la circularidad que dejaba al admin sin ciclos
+    // que elegir.
     const db = await payrollDb();
     // F9: la planta es UNA lectura más (paginada, acotada por sede), no una por
     // cadencia: el aviso de pendientes necesita saber quién cobra con cada
     // cadencia y cuántos son. Va en paralelo con los ítems, así que no serializa
     // la lectura. Un fallo de cualquiera de las dos se propaga igual.
-    const [items, employees] = await Promise.all([
+    //
+    // T5: el anclaje DECLARADO de cada cadencia entra en la MISMA tanda de
+    // lecturas. El aviso lo necesita para no pedir un ciclo ya cubierto, y es la
+    // MISMA lectura que la pantalla recibe por SSR: el resumen de la sede y el
+    // aviso del cliente no pueden discrepar sobre qué ciclos faltan.
+    const [items, employees, declaredAnchors, invoiceEvidence] = await Promise.all([
       readPaidItemsOfPeriods({
         db,
         periodIds: periods.map((period) => period.id),
@@ -1380,7 +1431,20 @@ export async function listPayrollOverview(sedeId: string): Promise<PayrollOvervi
         meta: {},
       }),
       listAllEmployees(),
+      getPayrollCadenceAnchors(),
+      // F10 (evidencia): la primera factura entra en la MISMA tanda de lecturas
+      // que la planta y el anclaje. Es la prueba de que la instalación ya
+      // operaba aunque nunca haya liquidado: sin ella, el aviso cae al tope de
+      // siempre y ofrece ciclos que la facturación desmiente.
+      readEarliestInvoiceEvidence(db),
     ]);
+    // El piso de la evidencia se deriva UNA vez y se pasa EXPLÍCITO al aviso:
+    // el resumen de la sede no deriva su propio piso de los períodos (si lo
+    // hiciera, el servidor y la pantalla podrían listar ciclos distintos).
+    const historyFloor = payrollEvidenceFloor({
+      periods,
+      invoices: invoiceEvidence === null ? [] : [invoiceEvidence],
+    });
 
     const byPeriod = new Map<string, PaidPayrollItem[]>();
     for (const item of items) {
@@ -1399,7 +1463,15 @@ export async function listPayrollOverview(sedeId: string): Promise<PayrollOvervi
         periods,
         employees,
         referenceDate: bogotaDay(),
-        payrollStartDate,
+        // F10 (evidencia): el piso que el servidor ya derivó de los períodos MÁS
+        // la primera factura. Va EXPLÍCITO: la lista del servidor es la de la
+        // evidencia, no la de sólo-períodos.
+        floor: historyFloor,
+        // T5: el anclaje declarado de cada cadencia (nunca el piso, que no es
+        // cobertura): un ciclo que cierra en o antes del ancla ya está pagado y
+        // no se reporta; uno que la contiene se reporta recortado a `ancla + 1`,
+        // que es el mismo rango que la apertura va a persistir.
+        anchors: declaredAnchorDays(declaredAnchors),
       }),
     };
   } catch (error) {
@@ -2424,7 +2496,7 @@ export async function payPayrollItem(
       if (!activeByCode.has(portion.method_code)) {
         throw new PayrollError(
           "METHOD_INACTIVE",
-          `El método de pago ${portion.method_code} no está activo en esta sede.`,
+          `El método de pago ${portion.method_code} no está activo en la instalación.`,
           422,
         );
       }
@@ -2594,7 +2666,7 @@ export async function payPayrollExtra(raw: unknown, actor: PayrollActor): Promis
     if (!method) {
       throw new PayrollError(
         "METHOD_INACTIVE",
-        `El método de pago ${parsed.data.method_code} no está activo en esta sede.`,
+        `El método de pago ${parsed.data.method_code} no está activo en la instalación.`,
         422,
       );
     }
@@ -2742,7 +2814,7 @@ export async function closePayrollPeriod(
  * redacción: la usan el chequeo previo del servicio y la traducción del
  * rechazo que devuelve el RPC (CL-9), porque es el mismo rechazo. */
 const PERIOD_OVERLAP_MESSAGE =
-  "No se puede borrar: otro período CERRADO de la sede solapa este rango y no se puede determinar qué vales pertenecen a este borrador sin revertir una nómina ya pagada.";
+  "No se puede borrar: otro período CERRADO solapa este rango y no se puede determinar qué vales pertenecen a este borrador sin revertir una nómina ya pagada.";
 
 /**
  * CL-9: el error del RPC `payroll_delete_period_atomic` (048) traducido al
@@ -3025,7 +3097,7 @@ export async function correctPayrollPeriod(
       if (!employee) {
         throw new PayrollError(
           "INTERNAL",
-          "No se pudo corregir: un empleado de la liquidación no está en la planta de la sede.",
+          "No se pudo corregir: un empleado de la liquidación no está en la planta de la instalación.",
           500,
         );
       }
@@ -3443,6 +3515,244 @@ export async function setVoucherLimits(raw: unknown, actor: PayrollActor): Promi
   return nueva;
 }
 
+// ------------------------------------------------- el anclaje por cadencia ---
+//
+// `odd/tasks/nomina-anclaje-por-cadencia.md` (T4): el dueño declara, POR
+// CADENCIA, «hasta qué día se pagaron los sueldos de este grupo». La declaración
+// vive en `system_settings`, UNA fila por cadencia —el precedente de 072: una
+// fila por ajuste, sin cambio de esquema—, y lo que se guarda es el día
+// DECLARADO (el hecho de negocio), NUNCA el ancla ajustada: el ajuste al sábado
+// es una REGLA y se deriva al leer con `cadenceAnchorFromDeclaration`, que es la
+// única definición del anclaje.
+
+/** El anclaje de UNA cadencia, ya derivado, tal como lo consumen aviso y pantalla. */
+export interface PayrollCadenceAnchor {
+  /** El día DECLARADO (el hecho), sin ajustar. */
+  paidThrough: string;
+  /** El día declarado ajustado HACIA ADELANTE a su sábado (la regla, decisión 1). */
+  anchor: string;
+  /** El día siguiente al declarado: desde acá absorbe el ajuste (dato). */
+  absorbedFrom: string;
+  /** Cuántos días absorbe el ajuste (0 si el declarado ya era sábado). */
+  absorbedDays: number;
+}
+
+/**
+ * Las declaraciones VÁLIDAS, por cadencia. Una cadencia sin declaración —o con
+ * una que la regla rechaza— simplemente no está: el aviso y la pantalla no
+ * re-derivan nada, consumen esto tal cual.
+ */
+export type PayrollCadenceAnchors = Partial<Record<PayFrequency, PayrollCadenceAnchor>>;
+
+/** El anclaje CONFIRMADO por la base al declararlo, con su cadencia. */
+export interface PayrollCadenceAnchorConfirmed extends PayrollCadenceAnchor {
+  frequency: PayFrequency;
+}
+
+/** Claves del anclaje en `system_settings`, una fila por cadencia. */
+const PAYROLL_ANCHOR_SETTING_KEYS: Record<PayFrequency, string> = {
+  semanal: "payroll_anchor_semanal",
+  quincenal: "payroll_anchor_quincenal",
+  mensual: "payroll_anchor_mensual",
+};
+
+/** Las claves en el orden del catálogo cerrado, para la lectura de una sola vez. */
+const PAYROLL_ANCHOR_SETTING_KEY_LIST: string[] = payFrequencySchema.options.map(
+  (frequency) => PAYROLL_ANCHOR_SETTING_KEYS[frequency],
+);
+
+/**
+ * El día DECLARADO de un sobre de `system_settings`, o `null` cuando la forma no
+ * es la esperada (`{ paid_through: "yyyy-mm-dd" }`). Defensivo a propósito: un
+ * valor ausente, de otro tipo o con otra forma NO es «sin declarar» por
+ * accidente, es un dato que no se puede leer y se trata igual que la ausencia.
+ */
+function declaredAnchorDay(value: unknown): string | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const paidThrough = (value as { paid_through?: unknown }).paid_through;
+  return typeof paidThrough === "string" ? paidThrough.trim() : null;
+}
+
+/**
+ * Deriva las declaraciones válidas de los sobres leídos. Pura en el sentido que
+ * importa —no toca la base— y el ajuste al sábado sale de la ÚNICA definición
+ * (`cadenceAnchorFromDeclaration`): lo que se guarda y lo que se deriva no pueden
+ * divergir por una fórmula escrita a mano. Un sobre ausente, malformado o
+ * RECHAZADO por la regla —incluido un día en el futuro, que no se declara
+ * pagado— se lee como «no declarado», nunca como un error.
+ */
+function cadenceAnchorsFromPayloads(payloads: Map<string, unknown>): PayrollCadenceAnchors {
+  const anchors: PayrollCadenceAnchors = {};
+  for (const frequency of payFrequencySchema.options) {
+    const declared = declaredAnchorDay(payloads.get(PAYROLL_ANCHOR_SETTING_KEYS[frequency]));
+    if (declared === null) continue;
+    const declaration = cadenceAnchorFromDeclaration({
+      paidThrough: declared,
+      referenceDate: bogotaDay(),
+    });
+    if (!declaration.ok) continue;
+    anchors[frequency] = {
+      paidThrough: declared,
+      anchor: declaration.anchor,
+      absorbedFrom: declaration.absorbedFrom,
+      absorbedDays: declaration.absorbedDays,
+    };
+  }
+  return anchors;
+}
+
+/**
+ * T5: los anclajes DECLARADOS, por cadencia, en la forma que consumen las reglas
+ * puras (`Partial<Record<PayFrequency, string | null>>`): el ancla ya ajustada al
+ * sábado. El PISO GLOBAL no entra acá —no es cobertura, es desde cuándo HAY
+ * historia—, así que una cadencia sin declaración queda fuera del mapa y su
+ * comportamiento es el de siempre.
+ */
+function declaredAnchorDays(
+  anchors: PayrollCadenceAnchors,
+): Partial<Record<PayFrequency, string | null>> {
+  const days: Partial<Record<PayFrequency, string | null>> = {};
+  for (const frequency of payFrequencySchema.options) {
+    const anchor = anchors[frequency];
+    if (anchor !== undefined) days[frequency] = anchor.anchor;
+  }
+  return days;
+}
+
+/**
+ * T4: las declaraciones de anclaje vigentes, POR CADENCIA, con todo lo derivado
+ * —el día declarado, el ancla ajustada al sábado y los días absorbidos—.
+ *
+ * UNA lectura de `system_settings` por clave (las tres juntas en un `in`), el
+ * mismo patrón que los topes de vales. La derivación sale de
+ * `cadenceAnchorFromDeclaration`, así que el aviso (T2) y la pantalla (T5) leen
+ * el mismo hecho sin volver a aplicar la regla: ni uno ni otra re-derivan nada.
+ * Una fila ausente o que la regla rechaza es «sin declaración» —ausente del
+ * mapa—, nunca un error.
+ */
+export async function getPayrollCadenceAnchors(): Promise<PayrollCadenceAnchors> {
+  try {
+    const db = await payrollDb();
+    const { data, error } = await db
+      .from("system_settings")
+      .select("key, value")
+      .in("key", PAYROLL_ANCHOR_SETTING_KEY_LIST);
+    if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    const rows = (data ?? []) as Array<{ key: string; value: unknown }>;
+    return cadenceAnchorsFromPayloads(new Map(rows.map((row) => [row.key, row.value])));
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
+/**
+ * T4: declara el anclaje de UNA cadencia (`{ frequency, paid_through }`).
+ *
+ * El día declarado se valida con `cadenceAnchorFromDeclaration` —la MISMA regla
+ * que lo lee—: un texto que no es una fecha del calendario o un día futuro (no se
+ * declara pagado lo que no pasó) se rechaza con `PayrollError` antes de tocar la
+ * base. Una cadencia fuera del catálogo cerrado también: el anclaje se declara
+ * por cadencia, y una clave que el catálogo no conoce no tiene fila que escribir.
+ *
+ * VENTANA DE REPARACIÓN (decisión del orquestador, documentada en el unit doc):
+ * la declaración es editable mientras ESA cadencia no tenga ningún período —un
+ * error de tipeo en una fecha que marca días como pagados no puede ser
+ * irreversible— y queda de sólo lectura con el primer período, que ya es la
+ * evidencia de hasta cuándo se pagó. Se comprueba con la MISMA lista de períodos
+ * del módulo (`listPeriods`) y el MISMO cubo de cadencia
+ * (`filterPeriodsByCadence`), no con una consulta paralela.
+ *
+ * Lo que se guarda es el día DECLARADO —el hecho, no el ancla ajustada— y lo que
+ * se devuelve es lo que la base CONFIRMÓ, leído otra vez por la puerta de lectura:
+ * una respuesta que no es la que la base aplicó no se reporta como una
+ * configuración guardada. `writeAudit` nunca lanza: que falle el rastro no
+ * convierte una configuración ya guardada en un error para quien la guardó.
+ */
+export async function setPayrollCadenceAnchor(
+  raw: unknown,
+  actor: PayrollActor,
+): Promise<PayrollCadenceAnchorConfirmed> {
+  try {
+    const input = (raw ?? {}) as { frequency?: unknown; paid_through?: unknown };
+    const frequency = normalizePayFrequency(
+      typeof input.frequency === "string" ? input.frequency : null,
+    );
+    if (frequency === null) {
+      throw new PayrollError(
+        "CADENCE_ANCHOR_UNKNOWN_CADENCE",
+        "El anclaje se declara por cadencia, y esa cadencia no está en el catálogo (semanal, quincenal o mensual). Elija una de las tres.",
+        400,
+      );
+    }
+    const paidThrough = typeof input.paid_through === "string" ? input.paid_through : "";
+    const declaration = cadenceAnchorFromDeclaration({ paidThrough, referenceDate: bogotaDay() });
+    if (!declaration.ok) {
+      if (declaration.reason === "anchor-in-the-future") {
+        throw new PayrollError(
+          "CADENCE_ANCHOR_IN_THE_FUTURE",
+          `El día declarado para el anclaje del ${frequency} todavía no pasó. El anclaje declara días YA pagados, así que no puede ser una fecha futura.`,
+          400,
+        );
+      }
+      throw new PayrollError(
+        "CADENCE_ANCHOR_NOT_A_DAY",
+        `El día declarado para el anclaje del ${frequency} no es una fecha del calendario (se espera aaaa-mm-dd).`,
+        400,
+      );
+    }
+    // VENTANA DE REPARACIÓN: el primer período de ESA cadencia cierra la edición.
+    // Se leen los períodos por el mismo camino del módulo.
+    const periods = await listPeriods();
+    if (filterPeriodsByCadence(periods, frequency).length > 0) {
+      throw new PayrollError(
+        "CADENCE_ANCHOR_LOCKED",
+        `El anclaje del ${frequency} ya no se puede declarar: esa cadencia ya tiene períodos registrados, y el primero es la evidencia de hasta cuándo se pagó. Si la declaración está mal, corríjala antes del primer período.`,
+        409,
+      );
+    }
+    // El anterior sale de la MISMA lectura que resuelve la declaración vigente:
+    // lo que se audita es lo que la escritura reemplaza (si esa lectura degrada,
+    // lo anterior es «sin declaración», no un dato inventado).
+    const previous = await getPayrollCadenceAnchors().catch(() => null);
+    const key = PAYROLL_ANCHOR_SETTING_KEYS[frequency];
+    const db = await payrollDb();
+    // Una fila, upsert por `key`: la clave ES la identidad del ajuste, igual que
+    // los topes de vales. Se persiste el día declarado, no el ancla ajustada.
+    const { data, error } = await db
+      .from("system_settings")
+      .upsert({ key, value: { paid_through: paidThrough.trim() } }, { onConflict: "key" })
+      .select("key, value");
+    if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+    // Se devuelve lo que la base CONFIRMÓ: la fila que quedó, derivada por la
+    // misma puerta de lectura, no lo que se pidió.
+    const confirmadas = (data ?? []) as Array<{ key: string; value: unknown }>;
+    const confirmado = cadenceAnchorsFromPayloads(
+      new Map(confirmadas.map((row) => [row.key, row.value])),
+    )[frequency];
+    if (!confirmado) throw new PayrollError("INTERNAL", "Error interno.", 500);
+
+    // AUDITORÍA: quién declaró el anclaje, de qué cadencia, y las dos fechas que
+    // deciden plata —la declarada y la efectiva— con el valor anterior. No entra
+    // a ningún catálogo de alertas: es configuración, no un desvío.
+    await writeAudit({
+      user_id: actor.userId,
+      action: AUDIT_ACTIONS.PAYROLL_CADENCE_ANCHOR_SET,
+      entity: "system_settings",
+      entity_id: key,
+      metadata: {
+        frequency,
+        previous_paid_through: previous?.[frequency]?.paidThrough ?? null,
+        new_paid_through: confirmado.paidThrough,
+        new_anchor: confirmado.anchor,
+      },
+    });
+
+    return { frequency, ...confirmado };
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
 /** Vales vigentes (pendiente/aprobada) de un empleado en una fecha. */
 async function vigenteTotals(
   db: DbClient,
@@ -3680,7 +3990,7 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
     if (!method) {
       throw new PayrollError(
         "METHOD_NOT_ARCHIVABLE",
-        `El método de pago ${parsed.data.method_code} no está activo o no es arqueable en esta sede.`,
+        `El método de pago ${parsed.data.method_code} no está activo o no es arqueable en la instalación.`,
         422,
       );
     }

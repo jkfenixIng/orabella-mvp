@@ -18,6 +18,27 @@ import { cn } from './utils'
       cortas; en escritorio la altura la resuelve el estirón del shell.
    2. El `<h1>` es SIEMPRE `text-3xl font-bold`, una sola vez por página, y vive
       acá. Ninguna página lo escribe a mano.
+   3. El ritmo lateral y vertical BAJA debajo de `sm`: `px-4 sm:px-6 py-6
+      sm:py-12`. El `px-6 py-12` pelado que tenía acá midió 24 px por lado en LOS
+      SEIS anchos y 48 arriba y abajo —a 320 px eran 48 de 320 px de gutter
+      antes de que empezara el contenido (15 % del ancho) y, en el login, 96 px
+      de relleno vertical sobre un viewport de 568 (17 %; R31)—, y como este
+      `<main>` es el shell de las diez pantallas, ese número se pagaba en todas.
+
+      Los dos valores de abajo de `sm` están elegidos, no puestos:
+        · 16 px por lado es el MISMO gutter que ya deja `dialog.tsx` debajo de
+          `sm` (`w-[calc(100%-2rem)]`): un solo número de aire para el dedo en
+          toda la app. Con 12 px el gutter bajaría a 7,5 %, pero la caja queda
+          demasiado pegada al borde para un control táctil; con 24 px no se
+          arregla nada.
+        · 24 px arriba y abajo es el `gap-6` del propio contenedor: el aire del
+          borde deja de ser un ritmo distinto del que separa las secciones, y
+          el scroll de un teléfono no arranca con una franja desproporcionada.
+      Desde `sm` el par es EXACTAMENTE el que estaba (24 px por lado, 48 arriba
+      y abajo): el escritorio no se toca, ni para airearlo ni para ajustarlo.
+      Las guardas que fijan esto —con la cascada resuelta, no con el token
+      escrito— están en `tests/responsive-primitives.test.ts` (R17/R31) y en
+      `tests/ux-structure.test.ts`.
 
    Sin `'use client'`: no usa hooks, estado ni handlers, así que el mismo
    archivo sirve desde un Server Component y desde un Client Component (mismo
@@ -53,7 +74,9 @@ export function PageContainer({
   return (
     <main
       className={cn(
-        'mx-auto flex min-h-dvh lg:min-h-0 w-full flex-col gap-6 px-6 py-12',
+        // R17/R31: el ritmo baja debajo de `sm` y el escritorio queda igual.
+        // La razón de cada valor está en el comentario de este archivo.
+        'mx-auto flex min-h-dvh lg:min-h-0 w-full flex-col gap-6 px-4 sm:px-6 py-6 sm:py-12',
         SIZE[size],
         className,
       )}
