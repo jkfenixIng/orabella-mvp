@@ -941,15 +941,17 @@ describe("design tokens: guardas de contrato", () => {
 
   it("el escaneo de candidatos sigue excluyendo la documentación (.md)", () => {
     // D9a: sin `@source`, Tailwind v4 escanea `**/*` desde la raíz del build
-    // (`base ?? process.cwd()` en @tailwindcss/postcss), y ahí entraban el
-    // README de la app y el de cada feature: una clase nombrada en una nota se
-    // emitía y la evidencia "esta utilidad se emite" dejaba de valer. Esta
-    // guarda es un TRIPWIRE de texto, no una medición: comprueba que la
+    // (`base ?? process.cwd()` en @tailwindcss/postcss), y ahí entraba la
+    // documentación: el README y el de cada feature. Una clase nombrada en una
+    // nota se emitía y la evidencia "esta utilidad se emite" dejaba de valer.
+    // Esta guarda es un TRIPWIRE de texto, no una medición: comprueba que la
     // directiva sigue declarada y que sigue apuntando a los `.md` de todo el
-    // checkout. El mecanismo real (que el escáner ya no recorra ningún `.md` y
-    // que el CSS emitido no cambie) se verificó con el escáner de PostCSS y con
-    // dos builds comparados byte a byte, no acá.
-    expect(GLOBALS_CSS, "globals.css").toContain('@source not "../../**/*.md"');
+    // checkout. Tras aplanar `app/` a la raíz, el archivo vive en
+    // `app/globals.css`, así que la raíz del checkout es `../`, no `../../`.
+    // El mecanismo real (que el escáner ya no recorra ningún `.md` y que el CSS
+    // emitido no cambie) se verificó con el escáner de PostCSS y con dos builds
+    // comparados byte a byte, no acá.
+    expect(GLOBALS_CSS, "globals.css").toContain('@source not "../**/*.md"');
   });
 
   it("el token de superficie duplicado --bg-surface-2 no existe y --muted conserva su valor", () => {
