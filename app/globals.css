@@ -8,20 +8,21 @@
    glob `**` anclado en el `base` del plugin de PostCSS, y ese `base` es
    `process.cwd()` cuando el build no le pasa ninguno (`@tailwindcss/postcss`,
    fábrica del plugin: `base ?? process.cwd()`). O sea: la raíz desde la que
-   corre el build. `next build` corre desde `app/`, así que `odd/**` nunca
-   estuvo en el escaneo; lo que sí entraba era la documentación de `app/`: este
-   README y el de cada feature (9 `.md`). Una clase nombrada en una nota se
-   emitía y la evidencia "esta utilidad se emite" quedaba contaminada.
+   corre el build. `next build` corre desde la raíz del checkout, y el escáner
+   no recorre lo que `.gitignore` deja afuera (`odd/`, `.agents/`, `.claude/`,
+   `entregables/` y el resto de lo que no es app); lo que sí entraba era la
+   documentación: este README y el de cada feature. Una clase nombrada en una
+   nota se emitía y la evidencia "esta utilidad se emite" quedaba contaminada.
 
-   Los patrones son relativos a este archivo (`app/app/globals.css`), así que
-   `../../` es la raíz del checkout: quedan afuera TODOS los `.md` del repo,
-   corra el build desde donde corra. Los `.md` no aportan ninguna clase que el
+   Los patrones son relativos a este archivo (`app/globals.css`), así que `../`
+   es la raíz del checkout: quedan afuera TODOS los `.md` del repo, corra el
+   build desde donde corra. Los `.md` no aportan ninguna clase que el
    código no nombre ya: 0 de las 332 utilidades del CSS compilado aparecían solo
    en un `.md`, así que el bundle emitido no cambia (verificado antes/después).
    Los comentarios de los propios `.ts`/`.css` siguen alimentando el escáner
    —Tailwind lee texto, no distingue comentarios— y eso no se puede acotar por
    ruta: es un límite conocido, no un olvido. */
-@source not "../../**/*.md";
+@source not "../**/*.md";
 
 /* Tailwind CSS 4: dark mode driven by the `.dark` class on <html>. */
 @custom-variant dark (&:where(.dark, .dark *));

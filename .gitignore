@@ -2,9 +2,21 @@
 node_modules/
 
 # Build outputs
+.next/
+out/
 dist/
 .angular/
 build/
+
+# Test
+coverage/
+test-results/
+playwright-report/
+tests/e2e/.auth/
+.vitest/
+
+# TypeScript
+*.tsbuildinfo
 
 # IDE
 .idea/
@@ -24,20 +36,37 @@ npm-debug.log*
 .env
 .env.local
 .env.*.local
+.env*
+!.env.example
 
-# Test
-coverage/
+# Vercel link
+.vercel
 
 # Misc
 *.bak
 *.tmp
 
-# Repos (submodules) — anchored to root so app/**/api routes are not ignored
+# Repos vecinos: viven en disco, nunca en este repo.
+# Anchored to root so app/api route handlers are not ignored.
 /API/
-# Local Pi runtime state
-.atl/
-# Standalone frontend repo: lives on disk, never in this repo
+# Standalone frontend repo
 /front/
+
+# Fuera del arbol: este repo solo contiene la app. Los archivos siguen en disco.
+/odd/
+/PRD_Orabella_MVP.md
+/MVP_Orabella_Rebuild.docx
+/opencode.json
+
+# Estado local de herramientas
+.atl/
+/.agents/
+/.claude/
+/.codegraph/
+/.perxia/
+/entregables/
+/skills-lock.json
+/.gentle-ai-default-agent.json
 
 # Artefactos de Python (el script de construccion del esquema los genera)
 __pycache__/

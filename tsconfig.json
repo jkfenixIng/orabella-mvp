@@ -1,0 +1,47 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [{ "name": "next" }],
+    "paths": {
+      "@/*": ["./*"]
+    }
+  },
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
+  // El proyecto vive en la raiz del repo, y esa raiz tambien puede contener
+  // checkouts hermanos y estado local (ver .gitignore). `**/*.ts` los alcanzaba:
+  // `front/` aporta 141 archivos .ts de OTRA app y rompia typecheck y build.
+  // `exclude` solo resta del set inicial; nada de esto se importa desde el app.
+  "exclude": [
+    "node_modules",
+    "front",
+    "API",
+    "odd",
+    "entregables",
+    ".agents",
+    ".claude",
+    ".codegraph",
+    ".perxia",
+    ".atl",
+    ".vitest",
+    "out",
+    "dist",
+    "build",
+    ".angular",
+    "coverage",
+    "test-results",
+    "playwright-report",
+    "__pycache__"
+  ]
+}

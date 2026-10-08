@@ -43,7 +43,38 @@ import { describe, expect, it } from "vitest";
 const APP_ROOT = process.cwd();
 
 /** Directorios que no son código de producción (mismo criterio que design-tokens.test.ts). */
-const SKIP_DIRS = new Set(["node_modules", ".next", ".git", "tests"]);
+/**
+ * El walk arranca en la raiz del proyecto. Desde que el proyecto vive en la raiz
+ * del repo, esa raiz tambien puede contener checkouts hermanos y estado local
+ * (ver `.gitignore`), y ninguno es fuente de este proyecto: `front/` aporta 141
+ * archivos `.ts` de otra app que hacian fallar esta guarda por la razon
+ * equivocada. Los nombres son de directorio, se comparan por basename.
+ */
+const SKIP_DIRS = new Set([
+  "node_modules",
+  ".next",
+  ".git",
+  "tests",
+  "front",
+  "API",
+  "odd",
+  "entregables",
+  ".agents",
+  ".claude",
+  ".codegraph",
+  ".perxia",
+  ".atl",
+  ".vitest",
+  ".auth",
+  "out",
+  "dist",
+  "build",
+  ".angular",
+  "coverage",
+  "test-results",
+  "playwright-report",
+  "__pycache__",
+]);
 
 /** Ramas de la paleta por defecto de Tailwind v4. */
 const PALETTE_RAMPS = [
