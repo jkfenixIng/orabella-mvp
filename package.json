@@ -13,6 +13,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
+    "test:db": "vitest run --config vitest.db.config.ts",
+    "verify:backup": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/verify-backup-restore.ts",
     "test:e2e": "playwright test",
     "test:e2e:changed": "playwright test --grep @changed",
     "test:e2e:full": "playwright test --grep @full"
@@ -37,6 +39,7 @@
     "zod": "4.6.5"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "0.5.8",
     "@eslint/js": "^9.39.1",
     "@playwright/test": "^1.63.0",
     "@tailwindcss/postcss": "^4.3.3",

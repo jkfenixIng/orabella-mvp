@@ -1,0 +1,179 @@
+# tests/db — characterization of the real schema (PGlite)
+
+These tests run the **real SQL** of `supabase/migrations/001_orabella_schema.sql`
+(PL/pgSQL functions, triggers, CHECKs, partial unique indexes, the EXCLUDE
+constraint) instead of mocking `supabase-js`. They record what the schema does
+**today**. They do not say what it should do: if a test fails after a schema
+change, the behavior changed.
+
+```
+npm run test:db                                   # this suite only (~70 s)
+npm run verify:backup -- <backup-dir>             # restore check, see below
+```
+
+`npm test` does **not** run this suite (`vitest.config.ts` excludes
+`tests/db/**`). Reasons:
+
+- It takes ~70 s alone, about twice the whole existing unit suite.
+- When both ran in one process the total went from 35 s to 50–89 s. In one of
+  three runs, two existing repo-walking tests (`ui-feedback`, `design-tokens`)
+  failed after 14 s and 36 s, both past Vitest's 5 s default. They pass in
+  under 0.3 s alone. The probable cause is CPU contention with the PGlite WASM
+  instances.
+
+## Engine: PGlite, not production Postgres
+
+| | |
+|---|---|
+| Package | `@electric-sql/pglite` **0.5.8** (pinned, devDependency only, never imported from `src/` or `app/`) |
+| Engine | **PostgreSQL 18.3** compiled to WASM (32-bit), in-process, single connection |
+| Production | **PostgreSQL 17.11** (`prod-version.txt`) |
+
+Every function in the schema compiles and runs on 18.3. No incompatibility was
+found. These version differences show up only in catalog introspection, not in
+behavior:
+
+- PG 18 stores column `NOT NULL` as `pg_constraint` rows (`contype = 'n'`), and
+  PG 17 does not. `scripts/verify-backup-restore.ts` filters them out.
+- The `btree_gist` contrib in PGlite is 1.8. Production runs 1.7. This changes
+  the number of extension functions (240 vs 216), not the schema's own objects.
+
+## How the instance is built (`harness.ts`)
+
+1. **Platform stub** (`PLATFORM_SQL`). This is what a Supabase project already
+   has before `001` runs: the roles `anon`, `authenticated` and `service_role`
+   (NOLOGIN), the `extensions` schema with `pgcrypto` and `uuid-ossp`, and
+   `auth.jwt()` returning `'{}'::jsonb`. `001` grants only to `authenticated`
+   and `service_role`. `anon` stays because every Supabase project has it.
+   `supabase_admin` was removed because nothing in `001` references it.
+2. **`001_orabella_schema.sql` applied verbatim.** No preprocessing: every
+   statement, including `GRANT`/`REVOKE`, `CREATE POLICY` and
+   `CREATE EXTENSION btree_gist WITH SCHEMA public`, runs in PGlite as written.
+   `pgcrypto` is skipped by its own `IF NOT EXISTS`, as in production.
+3. **`seeds/catalog.sql`**: roles, cash register, denominations, payment
+   methods, taxes, settings.
+
+The result is dumped once per test file (`dumpDataDir`). Every test gets a fresh
+instance loaded from that dump (`freshDb()`, about 1 s) instead of re-applying
+the schema. `closeDb()` in `afterEach` tolerates a `beforeEach` that failed
+before creating the instance. Tests call RPCs as `SELECT public.<fn>(...)`
+through `rpc()`, with payloads shaped like the ones in
+`src/features/*/service.ts` (`fixtures.ts` and the per-file builders).
+
+## What is characterized
+
+| Area | Function / object | Behaviors pinned |
+|---|---|---|
+| Cash | `cash_open_shift_atomic` | opening count written; second open shift is `SHIFT_ALREADY_OPEN`; `uq_cash_shifts_open_per_register` is the final barrier (23505); `SHIFT_INVALID`, `SHIFT_REGISTER_NOT_FOUND` |
+| | `cash_close_shift_atomic` | amounts written verbatim plus the closing count; four-key token required; `SHIFT_ALREADY_CLOSED`; the `expected_cash >= 0` CHECK raises 23514; `ARQUEO_STALE` with no write for **each source**: `payments`, `invoice_payments` (both the row of the shift and the historical row without shift whose invoice belongs to it), `commission_payouts`, and `voucher_requests` (only approved vouchers with a method count) |
+| | `cash_recount_shift_atomic` | closed shifts only (`SHIFT_NOT_CLOSED`); once per shift (`ALREADY_RECOUNTED`); the signed close is not touched; a cash line is required |
+| | `cash_invoice_payment_atomic` | writes the mirror row (`invoice_payments`, marked) and the drawer row (`payments`, unmarked); closes with `closed_by`/`closed_at`; a replay with the same mark is 23505 on `uq_invoice_payments_invoice_idempotency_key` and rolls back both rows; mark required (`PAYMENT_INVALID`); `SHIFT_CLOSED`, `SHIFT_NOT_FOUND`; overpayment P0001 (the card fee rides on top of the net cap); `ANNUL_INVALID`; `p_set_shift` decides the invoice's shift link |
+| | `invoice_split_payment_atomic` | all portions or none; mark only on the first one (two marks is `PAYMENT_INVALID`); writes no `payments` row; replay is 23505 and rolls back every portion; overpayment rolls back everything; portions of another shift are `PAYMENT_INVALID`; `SHIFT_CLOSED` |
+| | `trg_commission_payouts_cap` | partial payouts up to `earned_immediate`; the excess is P0001; a row without `earned_immediate` is rejected; idempotency per (invoice, employee, key) |
+| Billing | `invoice_create_atomic` + `next_invoice_number` | no number gaps, even when an emission fails; `SHIFT_NOT_OPEN`; stock deducted with `{consecutivo}` substituted; an idempotency-key replay raises **23505** and burns no number; `INVOICE_INVALID` burns no number either |
+| | `invoice_annul_atomic` | CAS on status (`ANNUL_CONFLICT`); stock returned with IN movements; `PRODUCT_NOT_FOUND` rolls back the annulment |
+| | `invoice_edit_items_atomic` | items removed, updated and inserted; stock moved by the given net delta; `edit_version` +1; **totals untouched**; a stale version or status is `EDIT_CONFLICT` with no write; an `INSUFFICIENT_STOCK` rolls back the items; payments are re-methoded, never re-amounted (`PAYMENT_MISMATCH` for an unknown payment) |
+| | `invoice_edit_emitted_atomic` | tax snapshot replaced (old rows deleted by id, new ones inserted); the five totals rewritten verbatim; stock adjusted; `TAX_MISMATCH` keeps the old snapshot and totals; totals object required (`EDIT_INVALID`); `EDIT_CONFLICT` |
+| | `trg_invoice_payments_cap` | partial payments allowed; overpayment is P0001; the cap is net of the card fee |
+| Inventory | `trg_inventory_apply_stock`, `trg_inventory_no_negative` | IN adds, OUT subtracts, ADJUST sets; `INSUFFICIENT_STOCK`; `PRODUCT_NOT_FOUND`; `products_stock_qty_check` is the only barrier against a negative stock; per-product idempotency index |
+| | `deduct_stock_atomic` | all or nothing; `DEDUCTION_INVALID` (empty plan, repeated product); `PRODUCT_NOT_FOUND` |
+| Payroll | `payroll_apply_atomic` | recalculating **replaces** the item values (upsert) and does **not** duplicate the debts or change their amounts; resending the **same voucher** is **`PAYROLL_VOUCHER_CONFLICT`** with full rollback (item, debts and voucher unchanged; not a silent no-op); carry ids replay as a no-op; `PAYROLL_ITEM_MISMATCH`, `PAYROLL_INVALID` |
+| | `payroll_delete_period_atomic` | draft only (`PAYROLL_PERIOD_CONFLICT`); vouchers reverted to their states; `PERIOD_OVERLAP_AMBIGUOUS` against a closed period of another cadence, including **NULL vs 'mensual'** in both directions; `PAYROLL_VOUCHER_CONFLICT` |
+| | `payroll_correct_period_atomic` | closed periods only (`PERIOD_NOT_CLOSED`); one correction per period (23505 on `uq_payroll_period_corrections_period`); frozen rows written verbatim; `payroll_items` not touched; `PAYROLL_CORRECTION_MISMATCH` rolls back the header; a repeated employee is `PAYROLL_INVALID` |
+| | `ex_payroll_periods_no_overlap` | 23P01 for the same frequency, NULL frequency included; adjacent ranges and different frequencies are allowed |
+| | `trg_payroll_payments_cap` | payment above `net_pay` is P0001 |
+| Users | `replace_user_roles` | sorted, deduplicated result; never zero roles (`ROLE_NOT_FOUND` keeps the old set); `USER_NOT_FOUND` |
+| | `confirm_password_reset` | single use; used, expired or unknown token is `RESET_TOKEN_INVALID` and writes nothing; all sessions revoked |
+| | `change_user_password` | CAS (`PASSWORD_CHANGED_ELSEWHERE`, no write); the precondition is required (`PASSWORD_INVALID`); the other sessions are revoked **in place** (`revoked = true`, not deleted) and the current one stays live |
+| | `create_user_with_role` | user and roles in one transaction; `must_change_password = true`; an empty email is stored as NULL; `ROLE_NOT_FOUND`, `USER_INVALID` and `USER_EXISTS` write nothing |
+| | `ensure_user_has_role` | adds the role only when the user has **none**; never adds to an existing set; `ROLE_NOT_FOUND`, `USER_NOT_FOUND` |
+| | `upsert_employee_atomic` | account, role and record created together; `payout_mode`/`is_active` defaults unless sent; an existing user keeps its roles; an invalid cadence (`EMPLOYEE_INVALID`), `USER_EXISTS` and `USER_NOT_FOUND` write nothing |
+
+Behaviors worth knowing (characterized, not corrected):
+
+- The database does not de-duplicate an invoice or a payment replay: the
+  partial unique index raises 23505. The service handles idempotency with its
+  lookup plus that 23505.
+- Neither payment RPC compares collected vs billed. The status follows
+  `p_mark_paid` as decided by the service: a full payment with `false` stays
+  `Emitida`, and a partial one with `true` closes the invoice. The only
+  database barrier is the overpayment cap (031).
+- `invoice_edit_items_atomic` writes line subtotals verbatim even when they no
+  longer add up to the invoice total. "The total does not change" is enforced
+  by the service, because the function has no money column to write.
+  `invoice_edit_emitted_atomic` does not check the totals arithmetic either:
+  the `invoices_total_surcharge_check` CHECK is the barrier (23514).
+- `PERIOD_OVERLAP_AMBIGUOUS` can only happen across **different** cadences
+  (NULL counts as its own cadence), because the EXCLUDE already stops
+  same-cadence overlaps.
+
+## Out of scope (not covered yet)
+
+- **Real concurrency.** PGlite has one connection, so `FOR UPDATE`/`FOR SHARE`,
+  lock ordering, and "the second caller waits and then sees the new row" cannot
+  be tested here. These tests cover the **sequential** guarantees that make
+  those locks safe: CAS in `WHERE`, count nets, partial unique indexes and
+  idempotency keys. Lock behavior under concurrency still needs a real Postgres
+  with two connections.
+- **RLS.** Tests run as the PGlite superuser, which bypasses policies. Policies
+  are created and inventoried, but not exercised.
+- **`discard_created_user`** has no test yet. PGlite does not block it; it is
+  the low-priority compensation of a user creation.
+- **Count nets** (`*_MISMATCH` raised because an `INSERT` wrote
+  fewer rows than requested) are only reachable through a `JOIN` that drops
+  rows. They are covered where such a `JOIN` exists (unknown product, employee
+  or payment). The remaining nets cannot be triggered with valid input by
+  design.
+
+## Known debt (outside this suite)
+
+- `src/features/billing/service.ts:1352-1353`: the comment says the two unique
+  indexes that can raise 23505 are `(sede_id, consecutive_number)` and
+  `(sede_id, idempotency_key)`. Since 077 neither includes `sede_id`: they are
+  `invoices_consecutive_number_key (consecutive_number)` and
+  `uq_invoices_sede_idempotency_key (idempotency_key)`, the second keeping the
+  old name. Comment only. It was left alone because this phase does not touch
+  `src/`.
+
+## Backup restore check (`scripts/verify-backup-restore.ts`)
+
+This script reads a backup folder and does not modify it. It writes one file,
+`verificacion-restauracion-pglite.txt`, in that same folder. It never connects
+to a remote database. Steps:
+
+1. Checks `SHA256SUMS.txt`. A listed file that is missing is reported as a
+   FAILURE and the run continues.
+2. Builds the schema (platform stub + `001`, without the catalog seed).
+   `prod-version.txt` is optional and informative: when it is missing, the
+   report says so.
+3. Loads `prod-public-data.sql` with `session_replication_role = replica` (the
+   same as `pg_restore --disable-triggers`). The dump holds trigger results
+   such as `products.stock_qty`, so the triggers must not fire again. `\restrict`
+   and `\unrestrict` are skipped. `COPY ... FROM stdin` blocks go through
+   PGlite's `/dev/blob`.
+4. Checks every foreign key explicitly.
+5. Compares exact row counts per table against `prod-conteos.txt`.
+6. Compares the catalog inventory against `prod-catalogo.txt`: own functions
+   (extension functions excluded with `pg_depend deptype = 'e'`), triggers,
+   constraints, indexes and policies. The "difference is only extension
+   functions" note is printed only when the own functions match exactly.
+
+Required files: `SHA256SUMS.txt`, `prod-public-data.sql`, `prod-conteos.txt`,
+`prod-catalogo.txt`. Exit code: 0 OK, 1 differences, 2 bad arguments.
+
+`prod-public.dump` (`-Fc`) is only checksummed. Reading it needs `pg_restore`,
+which is not available here.
+
+### Node version
+
+The script runs as TypeScript with Node's built-in type stripping, with no
+loader. That feature is on by default from **Node 22.18.0 / 23.6.0**. On
+earlier versions, `npm run verify:backup` fails while parsing the file. It was
+verified on Node 24.19.
+
+`package.json` still declares `"engines": { "node": ">=20" }`. It was **not**
+raised on purpose, because Vercel uses `engines.node` to override the
+project's Node version. Today `>=20` resolves to the latest 24.x on Vercel.
+Raising it to `>=22.18.0` would most likely resolve to 24.x too, but that is a
+production runtime decision and it is not taken here. `test:db` runs under
+Vitest and has no such requirement.

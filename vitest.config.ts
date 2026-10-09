@@ -16,5 +16,8 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["tests/**/*.test.ts"],
+    // The PGlite characterization suite runs only with `npm run test:db`
+    // (vitest.db.config.ts): see tests/db/README.md for why it stays out.
+    exclude: ["**/node_modules/**", "tests/db/**"],
   },
 });
