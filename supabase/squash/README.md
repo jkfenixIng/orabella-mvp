@@ -1869,10 +1869,10 @@ producción (rol `postgres`) y `$BK` como la carpeta del respaldo del paso 1.
    dueño y ACL. Después, repetir el paso 4 contra `current_sede_id-antes.txt`:
    esta vez sin ninguna diferencia.
 
-### 9.6 Lo que el bootstrap NO deja listo (pendiente de la Fase 3)
+### 9.6 El rol de la aplicación: `bootstrap/app-role.sql` (Fase 3a)
 
-En un PostgreSQL limpio, `bootstrap → 001 → 002 → seeds` **termina sin
-errores, pero la app no puede operar sobre esa base todavía**:
+En un PostgreSQL limpio, `platform-roles.sql → 001 → 002 → seeds` **termina
+sin errores, pero la app no puede operar con esos roles**:
 
 - El bootstrap crea `service_role` **sin `BYPASSRLS`** y sin ningún privilegio
   propio. En Supabase ese rol trae `BYPASSRLS`; acá no.
@@ -1885,8 +1885,43 @@ errores, pero la app no puede operar sobre esa base todavía**:
   con permisos RLS filtraría todo, porque las políticas son `TO authenticated` y
   el rol no salta RLS.
 
-No se resuelve en esta fase a propósito: el rol con el que se conecte la
-aplicación fuera de Supabase, sus permisos y su relación con RLS los define la
-**Fase 3**. Hasta entonces, la instalación limpia sirve para pruebas
-(PGlite corre como superusuario) y para verificar respaldos, no para servir la
-app.
+La Fase 3a lo resuelve con un archivo aparte, **sin tocar `001`, `002` ni la
+guarda de `tests/hardening.test.ts`** (las migraciones posteriores siguen sin
+poder llevar `GRANT`): `supabase/bootstrap/app-role.sql` crea `orabella_app`, el
+rol con el que la app se conecta cuando `DB_ENGINE=postgres` (`DATABASE_URL`).
+
+| Qué | Por qué |
+| --- | --- |
+| `LOGIN BYPASSRLS INHERIT`, sin superusuario, sin `CREATEROLE`/`CREATEDB` | **Decisión consciente:** replica la postura actual. En Supabase la app va con `service_role`, que salta RLS, y la app no depende de RLS (README raíz, «Postura real (D8)»). Las políticas de `001` son `TO authenticated`: un rol que no las saltara vería cero filas. |
+| `GRANT service_role TO orabella_app` | Hereda el `EXECUTE` que `001` da a `service_role` sobre las RPC, sin repetir la lista. |
+| `USAGE` en `public` y `SELECT, INSERT, UPDATE, DELETE` en cada tabla de `public` (un `DO` que recorre `pg_tables`) | Lo que la app hace hoy. Sin `TRUNCATE`, sin DDL. `001` no tiene secuencias (todas las claves son `gen_random_uuid()`). |
+| Sin contraseña en el archivo | Se asigna fuera del repo, una vez: `psql "<url-superusuario>" -c "\password orabella_app"`, y la cadena resultante va a `DATABASE_URL` como secreto del despliegue. |
+
+Orden completo en PostgreSQL limpio:
+
+    bootstrap/platform-roles.sql → 001 → 002 → bootstrap/app-role.sql → seeds
+
+Reglas:
+
+- Lo aplica un **superusuario** (solo él puede otorgar `BYPASSRLS`).
+- Es **idempotente**. Una tabla que agregue una migración posterior queda sin
+  permisos hasta volver a correrlo (no hay `ALTER DEFAULT PRIVILEGES`, a
+  propósito: el archivo es la lista completa y se puede auditar).
+- **Nunca** se aplica en Supabase: allí la app sigue con `service_role` y el
+  motor por defecto (`DB_ENGINE` sin definir = `supabase`). El archivo lo
+  impide solo: antes de crear nada aborta (`RAISE EXCEPTION`, P0001) si existe
+  `supabase_admin`, `supabase_auth_admin` o `supabase_storage_admin`. Se eligen
+  esos roles y no el esquema `auth` porque son del clúster (están en toda base de
+  una instancia Supabase, aun un proyecto vacío), ningún PostgreSQL limpio los
+  crea (`platform-roles.sql` solo crea `anon`, `authenticated` y
+  `service_role`, que por eso no sirven como señal) y un esquema `auth` puede
+  faltar en otra base del clúster o existir por otras razones. Todo el archivo es
+  un único `DO`: el aborto no deja nada a medias.
+
+Se verifica en `tests/db/app-role.db.test.ts` (`npm run test:db`): atributos del
+rol, lectura de las 36 tablas con `SET ROLE orabella_app`, exactamente los
+cuatro privilegios por tabla (y `TRUNCATE` denegado), escritura a través de
+RLS, `EXECUTE` de `replace_user_roles` heredado de `service_role`, idempotencia
+y la guarda de Supabase (cada uno de los tres roles simulados aborta sin crear
+nada ni modificar un `orabella_app` existente; un esquema `auth` solo no la
+dispara).

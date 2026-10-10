@@ -51,12 +51,17 @@ psql "<connection-string>" -f supabase/seeds/acceptance.sql   # opcional: datos 
 
 En un PostgreSQL que **no** es Supabase, antes de `001`:
 `psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/bootstrap/platform-roles.sql`
-(crea los roles `anon`, `authenticated` y `service_role` si faltan).
-**Esa instalación termina pero la app todavía no puede operar sobre ella:** el
-bootstrap crea `service_role` sin `BYPASSRLS` y sin permisos sobre tablas, y
-`001` depende de los privilegios por defecto que Supabase da sobre `public`. El
-rol de la aplicación fuera de Supabase lo define la Fase 3 (ver
-`supabase/squash/README.md` §9.6).
+(crea los roles `anon`, `authenticated` y `service_role` si faltan), y después
+de `002`, como superusuario,
+`psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/bootstrap/app-role.sql`
+(crea `orabella_app`, el rol con el que la app se conecta con
+`DB_ENGINE=postgres`). Orden completo:
+`platform-roles.sql → 001 → 002 → app-role.sql → seeds`. `orabella_app` se crea
+**con `BYPASSRLS` a propósito**: replica la postura actual (la app va con
+`service_role`, que salta RLS, y no depende de RLS; ver «Postura real (D8)»). La
+contraseña no está en el repo: `\password orabella_app` y la cadena va a
+`DATABASE_URL`. Detalle en `supabase/squash/README.md` §9.6. `app-role.sql`
+**nunca** se aplica en Supabase.
 
 El orden importa: `acceptance.sql` une contra `public.roles` por `code`, así que
 sin `catalog.sql` la asignación de roles queda vacía. **La instalación no se
@@ -72,6 +77,7 @@ configura** (ver «La instalación no se configura»).
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run lint` | `eslint .` |
 | `npm test` | vitest (`tests/**/*.test.ts`) |
+| `npm run test:db` | suite PGlite (`tests/db/**`): esquema real, repositorios Drizzle y rol `orabella_app` |
 | `npm run test:e2e` | Playwright (`tests/e2e/`) |
 | `npm run test:e2e:changed` | Playwright con `--grep @changed` |
 | `npm run test:e2e:full` | Playwright con `--grep @full` |
@@ -89,6 +95,8 @@ son **opcionales** y no vienen en `.env.example`: se leen directo de
 | `SUPABASE_SERVICE_ROLE_KEY` | **solo servidor** | jamás prefijo `NEXT_PUBLIC_`, jamás en cliente; solo vía `createAdminClient()` |
 | `UPSTASH_REDIS_REST_URL` | solo servidor (opcional) | rate-limit externo; sin ella hay fallback a memoria con advertencia |
 | `UPSTASH_REDIS_REST_TOKEN` | solo servidor (opcional) | par de la anterior; nunca prefijo `NEXT_PUBLIC_` |
+| `DB_ENGINE` | solo servidor (opcional) | `supabase` (por defecto, lo que corre producción) o `postgres` (conexión directa con Drizzle + postgres-js). Se recortan los espacios. Hoy solo el catálogo de servicios lee esta bandera; el resto de la app sigue en supabase-js. Con `supabase` no se evalúa nada de `drizzle-orm`, de `postgres` ni de `src/shared/db/client.ts`: el adaptador directo (`repos/services.drizzle.ts`) y la conexión se cargan con `import()` solo con `postgres` (los paquetes sí van en el build del servidor) |
+| `DATABASE_URL` | **solo servidor**, obligatoria si `DB_ENGINE=postgres` | cadena `postgres://` del rol `orabella_app` (o del pooler de Supabase en modo transacción); sin ella el arranque con `postgres` falla con un mensaje claro. Con el motor por defecto se ignora |
 
 Esta tabla es la lista completa de lo que hay que definir.
 
@@ -106,6 +114,8 @@ src/
                               # un módulo por feature, cada uno con su README
   shared/lib/                 # supabase (client/server), audit, rate-limit, sede,
                               #   dates, format, money, paged, api-response, theme, env
+  shared/db/                  # conexión directa a PostgreSQL (DB_ENGINE=postgres): client
+                              #   (solo servidor, import dinámico), errors, schema/ escrito a mano
   shared/components/          # app-shell, main-nav, theme-provider, theme-toggle, skeleton
   components/ui/              # primitivas de UI
   styles/design-tokens.css    # tokens de diseño
@@ -113,6 +123,7 @@ supabase/
   migrations/001_orabella_schema.sql   # EL esquema completo (squash; aplicado, no se edita)
   migrations/002_portable_platform.sql # current_sede_id() sin auth.jwt()
   bootstrap/platform-roles.sql         # roles de API, solo para PostgreSQL fuera de Supabase
+  bootstrap/app-role.sql               # rol orabella_app (BYPASSRLS), solo fuera de Supabase
   schema-history/             # la serie histórica 001–078 (explicación y respaldo)
   seeds/                      # catalog.sql, acceptance.sql, smoke.sql, test-invoices.sql
   squash/README.md            # procedimiento que regenera el archivo único

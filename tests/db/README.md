@@ -96,6 +96,17 @@ through `rpc()`, with payloads shaped like the ones in
 | | `create_user_with_role` | user and roles in one transaction; `must_change_password = true`; an empty email is stored as NULL; `ROLE_NOT_FOUND`, `USER_INVALID` and `USER_EXISTS` write nothing |
 | | `ensure_user_has_role` | adds the role only when the user has **none**; never adds to an existing set; `ROLE_NOT_FOUND`, `USER_NOT_FOUND` |
 | | `upsert_employee_atomic` | account, role and record created together; `payout_mode`/`is_active` defaults unless sent; an existing user keeps its roles; an invalid cadence (`EMPLOYEE_INVALID`), `USER_EXISTS` and `USER_NOT_FOUND` write nothing |
+| Direct engine | `drizzleServicesRepo` (`services.repo.db.test.ts`) | `drizzle-orm/pglite` over `freshDb()`; one table of equivalence cases runs against the supabase-js adapter and the Drizzle adapter with the same expected result (see the note below); `numeric(12,2)` comes back as a JS number; `toDbError` keeps P0001, 23505 (with detail), 23514 and 23P01 |
+| | `bootstrap/app-role.sql` (`app-role.db.test.ts`) | `orabella_app` is LOGIN BYPASSRLS without password, member of `service_role` only; reads the 36 tables with `SET ROLE`; exactly SELECT/INSERT/UPDATE/DELETE (no TRUNCATE); writes through RLS; runs `replace_user_roles`; idempotent. **Supabase guard:** if `supabase_admin`, `supabase_auth_admin` or `supabase_storage_admin` exists, it aborts (P0001) without creating or changing anything; an `auth` schema alone does not trigger it |
+
+**What the "equivalence" proves, and what it does not.** Only the Drizzle side
+runs against real PostgreSQL (PGlite). The supabase-js side runs against a
+**hand-written double** of PostgREST inside `services.repo.db.test.ts`, not
+against a real PostgREST: it checks that both adapters map the same answers to
+the same domain result. The exact request the supabase-js adapter sends
+(columns, `order("name")`, `limit`, the upsert payload and `onConflict: "id"`)
+is pinned by the characterization in `tests/admin-services.test.ts`, which ran
+before the extraction and still passes after it.
 
 Behaviors worth knowing (characterized, not corrected):
 

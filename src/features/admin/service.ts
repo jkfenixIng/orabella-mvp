@@ -14,6 +14,7 @@ import { isRoleCode, isSedeAssignableRole, type RoleCode } from "@/src/features/
 import { getSessionUser, hashPassword } from "@/src/features/auth/service";
 import { readAllPaged } from "@/src/shared/lib/paged";
 import { unstable_cache } from "next/cache";
+import { servicesRepo, type ServiceRow } from "./repos/services";
 
 // Compatibilidad: la identidad de estos guardas vive en
 // `@/src/shared/lib/sede.ts` (import cruzado entre features resuelto).
@@ -442,28 +443,18 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
 }
 
 // -------------------------------------------------------------- services ---
-export interface ServiceRow {
-  id: string;
-  name: string;
-  description: string | null;
-  price: number;
-  duracion_min: number;
-  duracion_max: number;
-  is_active: boolean;
-}
-
-const SERVICE_SELECT =
-  "id, name, description, price, duracion_min, duracion_max, is_active";
+// Data access goes through the repository port (`./repos/services.ts`), which
+// picks supabase-js or the direct PostgreSQL connection from DB_ENGINE. Any
+// repository failure keeps the historical answer: INTERNAL 500.
+export type { ServiceRow } from "./repos/services";
 
 async function fetchServices(limit?: number): Promise<ServiceRow[]> {
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("services")
-    .select(SERVICE_SELECT)
-    .order("name")
-    .limit(clampLimit(limit));
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as ServiceRow[];
+  const repo = await servicesRepo();
+  try {
+    return await repo.list(clampLimit(limit));
+  } catch {
+    throw new AdminError("INTERNAL", "Error interno.", 500);
+  }
 }
 
 /** ADM-05: crea o actualiza un servicio (upsert por id). */
@@ -471,7 +462,7 @@ export async function upsertService(raw: unknown): Promise<ServiceRow> {
   const parsed = serviceSchema.safeParse(raw);
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const input: ServiceInput = parsed.data;
-  const db = await adminDb();
+  const repo = await servicesRepo();
   const payload = {
     ...(input.id ? { id: input.id } : {}),
     name: input.name,
@@ -481,13 +472,14 @@ export async function upsertService(raw: unknown): Promise<ServiceRow> {
     duracion_max: input.duracion_max,
     ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
   };
-  const { data, error } = await db
-    .from("services")
-    .upsert(payload, { onConflict: "id" })
-    .select(SERVICE_SELECT)
-    .single();
-  if (error || !data) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return data as ServiceRow;
+  let data: ServiceRow | null;
+  try {
+    data = await repo.upsert(payload);
+  } catch {
+    throw new AdminError("INTERNAL", "Error interno.", 500);
+  }
+  if (!data) throw new AdminError("INTERNAL", "Error interno.", 500);
+  return data;
 }
 
 // ----------------------------------------------------------------- taxes ---
