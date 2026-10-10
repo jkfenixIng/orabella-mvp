@@ -109,6 +109,7 @@ export function postgrestDouble(pg: Db, authAdmin?: AuthAdminDouble): SupabaseCl
             onConflict?: string;
           }
         | null = null;
+      const inner: string[] = [];
       let returning = false;
       const filters: Filter[] = [];
       const orders: string[] = [];
@@ -137,15 +138,34 @@ export function postgrestDouble(pg: Db, authAdmin?: AuthAdminDouble): SupabaseCl
       };
 
       const statement = (params: unknown[]): string => {
-        const projection = columns
-          .split(",")
+        const projection = (() => {
+          const parts: string[] = [];
+          let rest = columns;
+          while (rest.length > 0) {
+            const embedded = /^([a-z_]+)(?:!([a-z_]+))?\(([a-z_, ]+)\)(?:,\s*|$)/.exec(rest);
+            if (embedded) {
+              parts.push(embedded[0].replace(/,\s*$/, ""));
+              rest = rest.slice(embedded[0].length);
+              continue;
+            }
+            const plain = /^([^,]+)(?:,\s*|$)/.exec(rest);
+            if (!plain) throw new Error(`unsupported select: ${rest}`);
+            parts.push(plain[1]);
+            rest = rest.slice(plain[0].length);
+          }
+          return parts;
+        })()
           .map((column) => {
-            const embed = /^([a-z_]+)\(([a-z_, ]+)\)$/.exec(column.trim());
+            const embed = /^([a-z_]+)(?:!([a-z_]+))?\(([a-z_, ]+)\)$/.exec(column.trim());
             if (!embed) return ident(column.trim());
-            // Many-to-one embed: the row of `embed[1]` its `<singular>_id` points to.
-            const [, target, list] = embed;
+            // Many-to-one embed: the row of `target` its foreign key points to.
+            // `!<table>_<column>_fkey` names the FK column; `!inner` keeps only
+            // rows whose embed exists (applied in `where`).
+            const [, target, hint, list] = embed;
             const fields = list.split(",").map((field) => `'${field.trim()}', e.${ident(field.trim())}`);
-            const fk = `${target.replace(/s$/, "")}_id`;
+            const named = hint && hint !== "inner" ? /^[a-z]+_([a-z_]+)_fkey$/.exec(hint)?.[1] : undefined;
+            const fk = named ?? `${target.replace(/s$/, "")}_id`;
+            if (hint === "inner") inner.push(`EXISTS (SELECT 1 FROM public.${ident(target)} e WHERE e.id = t.${ident(fk)})`);
             return `(SELECT json_build_object(${fields.join(", ")}) FROM public.${ident(target)} e WHERE e.id = t.${ident(fk)}) AS ${ident(target)}`;
           })
           .join(", ");
@@ -177,7 +197,9 @@ export function postgrestDouble(pg: Db, authAdmin?: AuthAdminDouble): SupabaseCl
           }
           return `WITH w AS (${body} RETURNING ${returning ? projection : "1 AS x"}) SELECT coalesce(json_agg(w), '[]'::json) AS rows FROM w`;
         }
-        const base = `SELECT ${projection} FROM public.${ident(table)} t${where(params)}`;
+        const filtered = where(params);
+        const innerClause = inner.length ? `${filtered ? " AND " : " WHERE "}${inner.join(" AND ")}` : "";
+        const base = `SELECT ${projection} FROM public.${ident(table)} t${filtered}${innerClause}`;
         if (head) return `SELECT count(*)::int AS n FROM (${base}) q`;
         const order = orders.length ? ` ORDER BY ${orders.join(", ")}` : "";
         const window = `${limit !== null ? ` LIMIT ${limit}` : ""}${offset ? ` OFFSET ${offset}` : ""}`;
