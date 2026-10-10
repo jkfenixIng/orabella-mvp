@@ -583,6 +583,12 @@ describe("RLS en toda tabla creada por la serie (fix-076)", () => {
    archivos, o que un objeto se pierda al regenerarlo. Este bloque es esa
    protección.
 
+   DESDE 002: 001 ya está aplicado en producción y no se edita, así que un
+   cambio posterior va en una migración numerada nueva (`002_portable_platform.sql`
+   fue la primera). La prueba del directorio las acepta una por una, en orden
+   estricto, y exige que no declaren tablas, políticas ni permisos: los conteos
+   de 001 siguen siendo los del esquema.
+
    POR QUÉ AQUÍ Y NO EN `atomic-guards.test.ts`: los dos archivos hacen lo mismo
    —leer SQL como TEXTO y derivar hechos del esquema— pero este bloque ya tiene
    las dos piezas que un guardián del volcado necesita y que en el otro archivo
@@ -636,22 +642,113 @@ function tablasConColumnaSede(sql: string): string[] {
   return conSede.sort();
 }
 
+/**
+ * Las migraciones posteriores al squash, ACEPTADAS una por una. 001 ya está
+ * aplicado en producción y no se edita: lo que cambia después va en un archivo
+ * numerado nuevo, y entra en esta lista a mano, con su decisión escrita en
+ * `supabase/squash/README.md` (5.3).
+ */
+const MIGRACIONES_POSTERIORES = ["002_portable_platform.sql"] as const;
+
+/**
+ * Lo que una migración posterior NO puede hacer, con la marca que lo nombra.
+ * Se aplica sobre el SQL ya sin comentarios y sin literales de cadena (la prosa
+ * de un `COMMENT ON` no es una sentencia); los cuerpos `$$` sí se miran, porque
+ * un `DO $$ ... DROP ... $$` ejecuta lo que dice.
+ */
+const PATRONES_PROHIBIDOS: Array<[string, RegExp]> = [
+  ["CREATE TABLE", /\bCREATE\s+(?:(?:GLOBAL|LOCAL)\s+)?(?:TEMP(?:ORARY)?\s+|UNLOGGED\s+)?TABLE\b/i],
+  ["CREATE UNLOGGED TABLE", /\bCREATE\s+UNLOGGED\s+TABLE\b/i],
+  ["CREATE POLICY", /\bCREATE\s+POLICY\b/i],
+  ["ALTER POLICY", /\bALTER\s+POLICY\b/i],
+  ["GRANT/REVOKE", /\b(?:GRANT|REVOKE)\b/i],
+  ["DROP", /\bDROP\b/i],
+  ["ALTER TABLE", /\bALTER\s+TABLE\b/i],
+  ["OWNER TO", /\bOWNER\s+TO\b/i],
+  ["ROW LEVEL SECURITY", /\bROW\s+LEVEL\s+SECURITY\b/i],
+];
+
+/** Las marcas de `PATRONES_PROHIBIDOS` que aparecen en el SQL (sin comentarios). */
+function sentenciasProhibidas(sinComentarios: string): string[] {
+  const sinLiterales = sinComentarios.replace(/'(?:[^']|'')*'/g, "''");
+  return PATRONES_PROHIBIDOS.filter(([, patron]) => patron.test(sinLiterales)).map(([marca]) => marca);
+}
+
 describe("el squash: `001_orabella_schema.sql` es el archivo vivo (squash de la serie)", () => {
-  it("es el ÚNICO archivo de migración que queda, y el directorio no tiene un segundo", () => {
-    // El patrón de nombre es el de la serie: `0NN_nombre.sql`. Con el squash
-    // aplicado tiene que quedar UNO, y ese es el que se aplica a una base nueva.
+  it("001 abre la serie, y cada migración posterior es una decisión explícita y en orden", () => {
+    // El patrón de nombre es el de la serie: `0NN_nombre.sql`. 001 es el squash
+    // y va primero; después vienen SOLO las migraciones de la lista de arriba.
     //
-    // AGREGAR UNA MIGRACIÓN NUEVA EXIGE ACTUALIZAR ESTA PRUEBA. Si algún día
-    // aparece un `002_lo_que_sea.sql` en `supabase/migrations`, esta cuenta va a
-    // decir 2 y va a CAER, y que caiga es lo que se quiere: la serie ya no es
-    // un archivo y hay que decidir a mano qué se hace con ella —volver a
-    // aplastar en el archivo único, o dejar de leer el historial y apuntar los
-    // guardiánes de arriba al squash—, no dejar que un segundo archivo se cuele
-    // en silencio. El número es la decisión, no un número que se actualiza solo.
+    // AGREGAR UNA MIGRACIÓN NUEVA EXIGE ACTUALIZAR ESTA PRUEBA. Un `003_*.sql`
+    // que aparezca sin entrar en `MIGRACIONES_POSTERIORES` la hace CAER, y que
+    // caiga es lo que se quiere: ningún archivo se cuela en silencio. El número
+    // es la decisión, no un número que se actualiza solo.
     const porNombre = readdirSync(SQUASH_DIR)
       .filter((nombre) => /^0\d\d_.*\.sql$/.test(nombre))
       .sort();
-    expect(porNombre).toEqual([SQUASH_NAME]);
+    expect(porNombre).toEqual([SQUASH_NAME, ...MIGRACIONES_POSTERIORES]);
+
+    // Orden ESTRICTO: 001, 002, 003… sin huecos ni números repetidos. El orden
+    // de aplicación es el orden de nombre, así que un hueco o un duplicado es
+    // una ambigüedad de arranque.
+    expect(porNombre.map((nombre) => Number(nombre.slice(0, 3)))).toEqual(
+      porNombre.map((_, indice) => indice + 1),
+    );
+  });
+
+  it("las migraciones posteriores no tocan tablas, políticas, permisos, dueños ni RLS", () => {
+    // Los conteos de abajo (36 tablas, 10 políticas), el inventario de GRANT y el
+    // RLS de las 36 tablas se leen SOLO de 001. Una migración posterior que
+    // declarara, borrara o alterara uno de esos objetos —o desactivara RLS, o
+    // cambiara un dueño— dejaría a 001 describiendo otro esquema y las pruebas
+    // seguirían en verde mirando el archivo equivocado. Cuando haga falta, se
+    // cambia esta prueba junto con los conteos: a la vista, no por omisión.
+    for (const nombre of MIGRACIONES_POSTERIORES) {
+      const sql = stripSqlComments(readFileSync(join(SQUASH_DIR, nombre), "utf8"));
+      expect(sentenciasProhibidas(sql), nombre).toEqual([]);
+      // Transaccional: todo o nada.
+      expect(sql.trim(), nombre).toMatch(/^BEGIN;[\s\S]*COMMIT;$/);
+    }
+  });
+
+  it("el detector de sentencias prohibidas CAZA cada patrón (control negativo)", () => {
+    // Si una de estas líneas pasa sin marca, la guarda de arriba no protege nada.
+    const casos: Array<[string, string]> = [
+      ["CREATE TABLE public.x (id int);", "CREATE TABLE"],
+      ["CREATE UNLOGGED TABLE public.x (id int);", "CREATE UNLOGGED TABLE"],
+      ["create temp table x (id int);", "CREATE TABLE"],
+      ["CREATE POLICY p ON public.users USING (true);", "CREATE POLICY"],
+      ["ALTER POLICY pol_users_sede_isolation ON public.users TO PUBLIC;", "ALTER POLICY"],
+      ["GRANT ALL ON public.users TO anon;", "GRANT/REVOKE"],
+      ["BEGIN; REVOKE ALL ON FUNCTION public.current_sede_id() FROM service_role;", "GRANT/REVOKE"],
+      ["DROP POLICY pol_roles_readonly ON public.roles;", "DROP"],
+      ["DROP FUNCTION IF EXISTS public.current_sede_id();", "DROP"],
+      ["ALTER TABLE public.users ADD COLUMN x int;", "ALTER TABLE"],
+      ["ALTER FUNCTION public.current_sede_id() OWNER TO anon;", "OWNER TO"],
+      ["ALTER TABLE public.users DISABLE ROW LEVEL SECURITY;", "ROW LEVEL SECURITY"],
+      ["ALTER TABLE ONLY public.users NO FORCE ROW LEVEL SECURITY;", "ROW LEVEL SECURITY"],
+    ];
+    for (const [fragmento, marca] of casos) {
+      expect(sentenciasProhibidas(stripSqlComments(fragmento)), fragmento).toContain(marca);
+    }
+    // Y no es de goma: la prosa entre comillas y los comentarios no cuentan.
+    expect(sentenciasProhibidas(stripSqlComments("-- DROP TABLE x\nCOMMENT ON FUNCTION f() IS 'no hace DROP ni GRANT';"))).toEqual([]);
+  });
+
+  it("002 deja `current_sede_id()` sin `auth.jwt()` y con los mismos atributos que 001", () => {
+    const sql = stripSqlComments(readFileSync(join(SQUASH_DIR, "002_portable_platform.sql"), "utf8")).replace(
+      /^COMMENT ON[^\n]*$/gm,
+      "",
+    );
+    // Sin dependencia del esquema `auth` en SQL ejecutable (la prosa de `COMMENT ON` no cuenta).
+    expect(sql).not.toMatch(/\bauth\s*\./);
+    // Lee lo mismo que `auth.jwt()` de Supabase.
+    expect(sql).toContain("current_setting('request.jwt.claims', true)");
+    expect(sql).toContain("current_setting('request.jwt.claim', true)");
+    // Misma cabecera que 001: firma, lenguaje, volatilidad, definer y search_path.
+    const cabecera = /CREATE FUNCTION public\.current_sede_id\(\) RETURNS uuid\s+LANGUAGE sql STABLE SECURITY DEFINER\s+SET search_path TO 'public'/;
+    expect(squashSchemaSql()).toMatch(cabecera);
+    expect(sql.replace("CREATE OR REPLACE FUNCTION", "CREATE FUNCTION")).toMatch(cabecera);
   });
 
   it("el archivo declara las 36 tablas y las 10 políticas de la serie, sin prosa de más", () => {

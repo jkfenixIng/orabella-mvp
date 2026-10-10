@@ -709,15 +709,29 @@ hay un guardián que lo lea. El bloque `describe("el squash: ...")` de
 `app/tests/hardening.test.ts` es esa vigilancia, y son **6 pruebas nuevas** —las 6
 que suman las 1958—:
 
-1. **`001_orabella_schema.sql` es el único archivo de `migrations/` que cumple
-   `/^0\d\d_.*\.sql$/`.** El `readdirSync` del directorio vivo se filtra con el
-   patrón de nombre de la serie y tiene que dar `[SQUASH_NAME]`, nada más.
-   > **AGREGAR UNA MIGRACIÓN NUEVA OBLIGA A ACTUALIZAR ESTA PRUEBA.** Si un día
-   > aparece un `002_lo_que_sea.sql`, la cuenta da 2 y la prueba **cae**, y que
-   > caiga es lo que se quiere: la serie ya no es un archivo y hay que decidir a
-   > mano qué se hace —volver a compactar en el archivo único, o dejar de leer el
-   > historial— en vez de dejar que un segundo archivo se cuele en silencio. El
-   > número es una decisión, no un número que se actualiza solo.
+1. **`001_orabella_schema.sql` abre `migrations/`, y lo que viene después está
+   en una lista explícita.** El `readdirSync` del directorio vivo se filtra con
+   el patrón `/^0\d\d_.*\.sql$/` y tiene que dar exactamente
+   `[SQUASH_NAME, ...MIGRACIONES_POSTERIORES]`, numerados 001, 002, 003… sin
+   huecos ni duplicados. Hasta la fase 2 de la extracción de Supabase la lista
+   estaba vacía (001 era el único archivo); hoy tiene `002_portable_platform.sql`
+   (sección 9).
+   > **AGREGAR UNA MIGRACIÓN NUEVA OBLIGA A ACTUALIZAR ESTA PRUEBA.** Un
+   > `003_*.sql` que no entre a mano en `MIGRACIONES_POSTERIORES` la hace
+   > **caer**. 001 ya está aplicado en producción y no se edita: la alternativa
+   > a una migración nueva es volver a compactar, y esa decisión se toma a mano.
+   > El número es una decisión, no un número que se actualiza solo.
+
+   Tres pruebas acompañan a la lista: **las migraciones posteriores no tocan
+   tablas, políticas, permisos, dueños ni RLS** —ni `CREATE [UNLOGGED|TEMP]
+   TABLE`, `CREATE`/`ALTER POLICY`, `GRANT`/`REVOKE`, `DROP`, `ALTER TABLE`,
+   `OWNER TO` o `ROW LEVEL SECURITY`— y van envueltas en `BEGIN; … COMMIT;` (los
+   conteos de abajo siguen leyendo solo 001, así que un objeto declarado o
+   alterado después quedaría fuera del inventario sin que nadie lo viera); el
+   **control negativo** de ese detector, con un fragmento por patrón que tiene
+   que marcar; y **002 deja `current_sede_id()` sin `auth.` y con la misma
+   cabecera que 001** (`LANGUAGE sql STABLE SECURITY DEFINER`, `SET search_path
+   TO 'public'`).
 2. **36 `CREATE TABLE public.` y 10 `CREATE POLICY`.** Los conteos son de
    *declaraciones* sobre el SQL sin comentarios ni `COMMENT ON` (5.3 explica por
    qué ese segundo filtro es necesario), y salen del archivo, no de una lista
@@ -819,7 +833,9 @@ Regla para quien repunte una lectura tolerante:
 ## 6. La caída de `sede_id` y el estado que declara el archivo único
 
 **La instalación de una sola sede ya ocurrió, y el archivo único la refleja.** No
-hay un `002_*.sql` pendiente, y no se va a escribir uno.
+hay un `002_*.sql` pendiente por la sede. (El `002_portable_platform.sql` que
+existe hoy es de otra unidad —la portabilidad fuera de Supabase, sección 9— y no
+toca `sede_id`.)
 
 La secuencia real fue esta:
 
@@ -1706,3 +1722,171 @@ filas en pg_default_acl       | 3        | 6                        | FALLA
   descartable del ensayo tiene `auth` y `extensions`, pero no `storage`, `vault`,
   `graphql`, `realtime` ni `pgbouncer`. No afecta al reset —que solo toca
   `public`—, pero ensaya sobre menos superficie de la que hay en PRODUCCIÓN.
+
+## 9. Después del squash: `002_portable_platform.sql` y el arranque en PostgreSQL limpio
+
+`001` está aplicado en producción y **no se edita**. La fase 2 de la extracción
+de Supabase necesitaba que el esquema se instalara en un PostgreSQL sin la
+plataforma, y lo resolvió sin tocarlo.
+
+### 9.1 Las dos dependencias de plataforma de 001
+
+| Dependencia | Qué pasa en un PostgreSQL limpio | Medido en PGlite (PostgreSQL 18.3) |
+| --- | --- | --- |
+| `GRANT ... TO authenticated / service_role` y `CREATE POLICY ... TO authenticated` | `001` aborta | `role "authenticated" does not exist` en la primera sentencia que lo nombra |
+| `current_sede_id()` llama a `auth.jwt()` | `001` **sí** crea la función: su preámbulo fija `check_function_bodies = false`, así que el cuerpo SQL no se valida al crearla. La **llamada** falla | `schema "auth" does not exist` al ejecutar `SELECT public.current_sede_id()`. Con `check_function_bodies = true`, el mismo `CREATE FUNCTION` falla al crearse |
+
+Las extensiones no son una dependencia: `001` pide `btree_gist` y `pgcrypto`
+con `CREATE EXTENSION IF NOT EXISTS ... WITH SCHEMA public` y no califica nada
+con `extensions.`. `btree_gist` es necesaria (la exclusión
+`ex_payroll_periods_no_overlap`). `pgcrypto` se instala pero no se usa: el único
+generador que el esquema llama es `gen_random_uuid()`, nativo desde PostgreSQL
+13, y ninguna función llama a `digest()`, `crypt()` ni `gen_random_bytes()`.
+`uuid-ossp` vive en `extensions` en producción pero `001` ni la pide ni la usa.
+Ninguna de las tres se quita de `001`.
+
+### 9.2 La decisión: bootstrap + 002, no re-squash
+
+- **`supabase/bootstrap/platform-roles.sql`** crea `anon`, `authenticated` y
+  `service_role` NOLOGIN **solo si no existen**. Corre antes de `001` y únicamente
+  fuera de Supabase (en Supabase no hace nada). No crea `auth` ni `extensions`:
+  no hacen falta.
+- **`supabase/migrations/002_portable_platform.sql`** redefine
+  `current_sede_id()` con `CREATE OR REPLACE`: mismo `LANGUAGE sql STABLE
+  SECURITY DEFINER`, mismo `search_path`, mismo `CASE`, y en lugar de
+  `auth.jwt()` evalúa la misma expresión que Supabase usa para definirla
+  (`coalesce(nullif(current_setting('request.jwt.claim', true), ''),
+  nullif(current_setting('request.jwt.claims', true), ''))::jsonb`, migración
+  `20220531120530_add_auth_jwt_function` de `supabase/auth`). Es idempotente y
+  va en `BEGIN; … COMMIT;`. `CREATE OR REPLACE` conserva propietario y ACL: los
+  `GRANT` de `001` siguen en pie y las políticas no cambian.
+
+Por qué no un re-squash: regenerar `001` sin los `GRANT` o sin `auth.jwt()`
+cambiaría el texto de un archivo que ya está aplicado en producción, rompería
+la comparación byte a byte del 3.2 y dejaría al repo describiendo una base que
+no es la de producción. El bootstrap no toca nada aplicado y `002` es un cambio
+incremental normal que producción puede recibir como cualquier migración.
+
+### 9.3 Orden de arranque
+
+- **Supabase:** `001 → 002 → seeds`.
+- **PostgreSQL limpio:** `bootstrap/platform-roles.sql → 001 → 002 → seeds`.
+
+### 9.4 Cómo se verifica
+
+- `tests/hardening.test.ts`, bloque del squash: lista explícita de migraciones
+  posteriores, orden estricto; las posteriores no pueden contener `CREATE
+  [UNLOGGED|TEMP] TABLE`, `CREATE`/`ALTER POLICY`, `GRANT`/`REVOKE`, `DROP`,
+  `ALTER TABLE`, `OWNER TO` ni `ROW LEVEL SECURITY` (con un control negativo que
+  demuestra que el detector marca cada patrón); y la cabecera de
+  `current_sede_id()` en 001 y 002.
+- `tests/db/portable-platform.db.test.ts` (`npm run test:db`): instalación
+  completa sin `auth`; `current_sede_id()` con y sin claims; la misma salida que
+  el cuerpo de `001` bajo el `auth.jwt()` real de Supabase en 11 casos; `002`
+  aplicado dos veces; ACL, propietario, atributos y políticas iguales antes y
+  después; los 21 `GRANT` a `service_role`.
+- `npm run verify:backup -- <carpeta>`: aplica bootstrap + 001 + 002 y declara en
+  el reporte la única diferencia esperada con producción (el cuerpo de
+  `current_sede_id()`, hasta que producción tenga 002).
+
+### 9.5 Aplicar 002 en producción
+
+Lo decide y lo ejecuta una persona; nada de este repo lo corre solo. Los
+comandos son `bash` con `psql`, con `$PROD` como la cadena de conexión de
+producción (rol `postgres`) y `$BK` como la carpeta del respaldo del paso 1.
+
+1. **Respaldo.** Procedimiento habitual (carpeta `~/orabella-db/backups/<fecha>/`)
+   y `npm run verify:backup -- "$BK"` en verde.
+2. **Capturar el estado actual (solo lectura) en la carpeta del respaldo.** Son
+   la fuente de la vuelta atrás y de la comparación del paso 4:
+
+   ```bash
+   # definición, dueño, ACL y comentario, legibles
+   psql "$PROD" -v ON_ERROR_STOP=1 -X -A -t -c "
+     SELECT 'owner|' || pg_get_userbyid(p.proowner),
+            'acl|'   || coalesce(p.proacl::text, '-'),
+            'comment|' || coalesce(obj_description(p.oid, 'pg_proc'), '-')
+       FROM pg_proc p WHERE p.oid = 'public.current_sede_id()'::regprocedure" \
+     > "$BK/current_sede_id-antes.txt"
+
+   # la vuelta atrás, lista para ejecutar: definición capturada + su COMMENT
+   psql "$PROD" -v ON_ERROR_STOP=1 -X -A -t -c "
+     SELECT 'BEGIN;' || chr(10)
+         || pg_get_functiondef(p.oid) || ';' || chr(10)
+         || format('COMMENT ON FUNCTION public.current_sede_id() IS %L;', obj_description(p.oid, 'pg_proc')) || chr(10)
+         || 'COMMIT;'
+       FROM pg_proc p WHERE p.oid = 'public.current_sede_id()'::regprocedure" \
+     > "$BK/current_sede_id-rollback.sql"
+
+   # resultado de la función, sin claims y con un sede_id (caso positivo)
+   psql "$PROD" -v ON_ERROR_STOP=1 -X -A -t \
+     -c "SELECT coalesce(public.current_sede_id()::text, 'NULL');" \
+     -c "BEGIN; SELECT set_config('request.jwt.claims','{\"app_metadata\":{\"sede_id\":\"<uuid>\"}}', true); SELECT public.current_sede_id(); ROLLBACK;" \
+     > "$BK/current_sede_id-resultado-antes.txt"
+   ```
+
+   `<uuid>` es cualquier UUID fijo, por ejemplo el `id` de la fila de `sedes`; el
+   mismo en el paso 4. Revisar que `current_sede_id-rollback.sql` empiece por
+   `CREATE OR REPLACE FUNCTION public.current_sede_id()` y contenga `auth.jwt()`.
+3. **Aplicar** con el rol `postgres` (dueño de la función):
+
+   ```bash
+   psql "$PROD" -v ON_ERROR_STOP=1 -f supabase/migrations/002_portable_platform.sql
+   ```
+
+   Aplicado con `psql`, 002 **no queda registrado en el historial de migraciones
+   de la CLI de Supabase** (`supabase_migrations.schema_migrations`), igual que
+   `001`, que también se aplicó a mano. Es seguro: 002 es idempotente, y si algún
+   día alguien lo vuelve a aplicar —por la CLI o a mano— deja exactamente lo
+   mismo.
+4. **Verificar** contra lo capturado:
+
+   ```bash
+   psql "$PROD" -v ON_ERROR_STOP=1 -X -A -t -c "<la misma consulta de dueño/ACL/comentario del paso 2>" \
+     > "$BK/current_sede_id-despues.txt"
+   psql "$PROD" -v ON_ERROR_STOP=1 -X -A -t \
+     -c "SELECT coalesce(public.current_sede_id()::text, 'NULL');" \
+     -c "BEGIN; SELECT set_config('request.jwt.claims','{\"app_metadata\":{\"sede_id\":\"<uuid>\"}}', true); SELECT public.current_sede_id(); ROLLBACK;" \
+     > "$BK/current_sede_id-resultado-despues.txt"
+   diff "$BK/current_sede_id-resultado-antes.txt" "$BK/current_sede_id-resultado-despues.txt"   # vacío
+   diff "$BK/current_sede_id-antes.txt" "$BK/current_sede_id-despues.txt"                       # solo la línea comment|
+   psql "$PROD" -X -A -t -c "SELECT pg_get_functiondef('public.current_sede_id()'::regprocedure)" | grep -c 'auth\.'   # 0
+   ```
+
+   Lo esperado: el resultado sin claims (`NULL`) y el caso positivo (`<uuid>`)
+   idénticos antes y después; dueño y ACL idénticos; el comentario cambia (002 le
+   agrega una frase); el cuerpo ya no nombra `auth.`. La app sigue operando: va
+   con `service_role` y no llama a la función.
+5. **Vuelta atrás**, si hiciera falta: la definición **capturada en producción**
+   en el paso 2, no el bloque de `001` (si producción y `001` difirieran, se
+   restaura lo que había):
+
+   ```bash
+   psql "$PROD" -v ON_ERROR_STOP=1 -f "$BK/current_sede_id-rollback.sql"
+   ```
+
+   Restaura cuerpo y comentario en una transacción; `CREATE OR REPLACE` conserva
+   dueño y ACL. Después, repetir el paso 4 contra `current_sede_id-antes.txt`:
+   esta vez sin ninguna diferencia.
+
+### 9.6 Lo que el bootstrap NO deja listo (pendiente de la Fase 3)
+
+En un PostgreSQL limpio, `bootstrap → 001 → 002 → seeds` **termina sin
+errores, pero la app no puede operar sobre esa base todavía**:
+
+- El bootstrap crea `service_role` **sin `BYPASSRLS`** y sin ningún privilegio
+  propio. En Supabase ese rol trae `BYPASSRLS`; acá no.
+- `001` **no tiene ningún `GRANT` sobre tablas ni secuencias**: sus 22 `GRANT`
+  son sobre funciones. En Supabase las tablas quedan accesibles para
+  `service_role` por los **privilegios por defecto** de la plataforma
+  (`ALTER DEFAULT PRIVILEGES` de `postgres` y `supabase_admin` sobre `public`,
+  §8.1), que un PostgreSQL limpio no tiene.
+- Resultado: con `service_role`, las 36 tablas dan `permission denied`, y aun
+  con permisos RLS filtraría todo, porque las políticas son `TO authenticated` y
+  el rol no salta RLS.
+
+No se resuelve en esta fase a propósito: el rol con el que se conecte la
+aplicación fuera de Supabase, sus permisos y su relación con RLS los define la
+**Fase 3**. Hasta entonces, la instalación limpia sirve para pruebas
+(PGlite corre como superusuario) y para verificar respaldos, no para servir la
+app.

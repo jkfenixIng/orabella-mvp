@@ -35,23 +35,31 @@ behavior:
 
 - PG 18 stores column `NOT NULL` as `pg_constraint` rows (`contype = 'n'`), and
   PG 17 does not. `scripts/verify-backup-restore.ts` filters them out.
-- The `btree_gist` contrib in PGlite is 1.8. Production runs 1.7. This changes
-  the number of extension functions (240 vs 216), not the schema's own objects.
+- The `btree_gist` contrib in PGlite is 1.8. Production runs 1.7. Also,
+  without an `extensions` schema, `001` installs `pgcrypto` in `public`
+  (production has it in `extensions`). Both change only the number of extension
+  functions in `public` (277 vs 216), not the schema's own objects.
 
 ## How the instance is built (`harness.ts`)
 
-1. **Platform stub** (`PLATFORM_SQL`). This is what a Supabase project already
-   has before `001` runs: the roles `anon`, `authenticated` and `service_role`
-   (NOLOGIN), the `extensions` schema with `pgcrypto` and `uuid-ossp`, and
-   `auth.jwt()` returning `'{}'::jsonb`. `001` grants only to `authenticated`
-   and `service_role`. `anon` stays because every Supabase project has it.
-   `supabase_admin` was removed because nothing in `001` references it.
-2. **`001_orabella_schema.sql` applied verbatim.** No preprocessing: every
-   statement, including `GRANT`/`REVOKE`, `CREATE POLICY` and
-   `CREATE EXTENSION btree_gist WITH SCHEMA public`, runs in PGlite as written.
-   `pgcrypto` is skipped by its own `IF NOT EXISTS`, as in production.
+The instance follows the **clean PostgreSQL** install path. There is no `auth`
+schema and no `extensions` schema.
+
+1. **`supabase/bootstrap/platform-roles.sql`**: creates `anon`, `authenticated`
+   and `service_role` (NOLOGIN) if they are missing. Nothing else.
+2. **Every `supabase/migrations/NNN_*.sql` in order, verbatim** (`001`, then
+   `002`). No preprocessing: `GRANT`/`REVOKE`, `CREATE POLICY` and the
+   `CREATE EXTENSION IF NOT EXISTS ... WITH SCHEMA public` of `btree_gist` and
+   `pgcrypto` run as written. `001` creates `current_sede_id()` with a call to
+   `auth.jwt()` (allowed because its preamble sets
+   `check_function_bodies = false`), and `002` replaces it with a body that
+   reads `request.jwt.claims` directly.
 3. **`seeds/catalog.sql`**: roles, cash register, denominations, payment
    methods, taxes, settings.
+
+`portable-platform.db.test.ts` covers that install path, the idempotency of
+`002`, the ACL after `002`, and the equivalence of `current_sede_id()` against
+Supabase's own `auth.jwt()` definition.
 
 The result is dumped once per test file (`dumpDataDir`). Every test gets a fresh
 instance loaded from that dump (`freshDb()`, about 1 s) instead of re-applying
@@ -127,6 +135,18 @@ Behaviors worth knowing (characterized, not corrected):
 
 ## Known debt (outside this suite)
 
+- **`supabase/test-bootstrap.sql` (the E2E base) drifted: it does not include
+  `002`.** It is still `001` + `seeds/catalog.sql` + `seeds/acceptance.sql`, so
+  its `current_sede_id()` still calls `auth.jwt()`. This works on a Supabase
+  test project, which has `auth`, and fails to *call* on a plain PostgreSQL.
+  Pending: regenerate it with `002` after `001` (squash README, steps 2.8 and
+  7.5). It was left alone on purpose in this phase.
+- **A clean PostgreSQL install is not usable by the app yet.** The bootstrap
+  creates `service_role` without `BYPASSRLS` and without table privileges,
+  because `001` relies on Supabase's default privileges on `public`. These
+  tests run as the PGlite superuser, so they do not see it. Phase 3 defines the
+  application role (squash README §9.6).
+
 - `src/features/billing/service.ts:1352-1353`: the comment says the two unique
   indexes that can raise 23505 are `(sede_id, consecutive_number)` and
   `(sede_id, idempotency_key)`. Since 077 neither includes `sede_id`: they are
@@ -143,9 +163,12 @@ to a remote database. Steps:
 
 1. Checks `SHA256SUMS.txt`. A listed file that is missing is reported as a
    FAILURE and the run continues.
-2. Builds the schema (platform stub + `001`, without the catalog seed).
+2. Builds the schema (bootstrap + `001` + `002`, without the catalog seed).
    `prod-version.txt` is optional and informative: when it is missing, the
-   report says so.
+   report says so. The report states one **expected difference**: until `002`
+   is applied in production, production's `current_sede_id()` still calls
+   `auth.jwt()`. Step 6 compares signatures, so it cannot see it. The script
+   fails if the repo's body still references `auth.`.
 3. Loads `prod-public-data.sql` with `session_replication_role = replica` (the
    same as `pg_restore --disable-triggers`). The dump holds trigger results
    such as `products.stock_qty`, so the triggers must not fire again. `\restrict`

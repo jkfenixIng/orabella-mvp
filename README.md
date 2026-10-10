@@ -38,15 +38,25 @@ cp .env.example .env.local     # completar las 3 variables (ver Env)
 npm run dev                    # http://localhost:3000
 ```
 
-Base de datos, en este orden. El esquema se aplica **una sola vez**; los dos
+Base de datos, en este orden. `001` se aplica **una sola vez**; `002` y los dos
 seeds son idempotentes y se pueden reejecutar:
 
 ```bash
 # apuntando al proyecto Supabase nuevo (connection string del dashboard)
 psql "<connection-string>" -v ON_ERROR_STOP=1 --single-transaction -f supabase/migrations/001_orabella_schema.sql
+psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/002_portable_platform.sql
 psql "<connection-string>" -f supabase/seeds/catalog.sql      # catálogo mínimo: roles, sede, caja, pagos, impuestos, ajustes
 psql "<connection-string>" -f supabase/seeds/acceptance.sql   # opcional: datos de prueba §11
 ```
+
+En un PostgreSQL que **no** es Supabase, antes de `001`:
+`psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/bootstrap/platform-roles.sql`
+(crea los roles `anon`, `authenticated` y `service_role` si faltan).
+**Esa instalación termina pero la app todavía no puede operar sobre ella:** el
+bootstrap crea `service_role` sin `BYPASSRLS` y sin permisos sobre tablas, y
+`001` depende de los privilegios por defecto que Supabase da sobre `public`. El
+rol de la aplicación fuera de Supabase lo define la Fase 3 (ver
+`supabase/squash/README.md` §9.6).
 
 El orden importa: `acceptance.sql` une contra `public.roles` por `code`, así que
 sin `catalog.sql` la asignación de roles queda vacía. **La instalación no se
@@ -100,7 +110,9 @@ src/
   components/ui/              # primitivas de UI
   styles/design-tokens.css    # tokens de diseño
 supabase/
-  migrations/001_orabella_schema.sql   # EL esquema completo, en un solo archivo
+  migrations/001_orabella_schema.sql   # EL esquema completo (squash; aplicado, no se edita)
+  migrations/002_portable_platform.sql # current_sede_id() sin auth.jwt()
+  bootstrap/platform-roles.sql         # roles de API, solo para PostgreSQL fuera de Supabase
   schema-history/             # la serie histórica 001–078 (explicación y respaldo)
   seeds/                      # catalog.sql, acceptance.sql, smoke.sql, test-invoices.sql
   squash/README.md            # procedimiento que regenera el archivo único
@@ -213,13 +225,21 @@ definir.
   `NEXT_PUBLIC_`); validación Zod server-side en toda escritura; RLS está **fuera
   del modelo de amenaza** (ver **Seguridad**).
 - **Migraciones y seeds:** `supabase/migrations/001_orabella_schema.sql` es el
-  esquema completo en **un solo archivo** (36 tablas, 28 funciones, 10 políticas,
-  65 índices, 21 disparadores): un volcado de la serie histórica 001–078. Se
-  aplica **una vez** sobre un proyecto Supabase nuevo, dentro de una transacción
-  (`psql -v ON_ERROR_STOP=1 --single-transaction`). El arranque es esquema →
-  `supabase/seeds/catalog.sql` → `supabase/seeds/acceptance.sql`. La serie
-  original queda en `supabase/schema-history/` como explicación y respaldo; el
-  procedimiento que regenera el archivo único está en `supabase/squash/README.md`.
+  esquema completo (36 tablas, 28 funciones, 10 políticas, 65 índices, 21
+  disparadores): un volcado de la serie histórica 001–078. Se aplica **una
+  vez**, dentro de una transacción (`psql -v ON_ERROR_STOP=1
+  --single-transaction`), y ya está aplicado en producción: **no se edita**. Lo
+  que cambia después va en migraciones numeradas (`002_portable_platform.sql`,
+  …), en orden estricto; `tests/hardening.test.ts` exige que cada una se acepte
+  a mano. Arranque:
+  - **Supabase:** `001` → `002` → `supabase/seeds/catalog.sql` →
+    `supabase/seeds/acceptance.sql`.
+  - **PostgreSQL limpio:** `supabase/bootstrap/platform-roles.sql` → `001` →
+    `002` → seeds.
+
+  La serie original queda en `supabase/schema-history/` como explicación y
+  respaldo; el procedimiento que regenera `001`, y la decisión de `002` y el
+  bootstrap (sección 9), están en `supabase/squash/README.md`.
 
 ---
 
@@ -259,9 +279,11 @@ Escrito para que nadie cuente con una segunda línea de defensa que no existe.
   - **6 usan `USING (true)`**: `pol_roles_readonly` (catálogo global, solo
     `SELECT`) y cinco de nómina / ajustes que se quedaron sin `sede_id` cuando la
     077 lo borró de las veinte tablas de negocio.
-- `public.current_sede_id()` lee `auth.jwt() -> 'app_metadata' ->> 'sede_id'`.
-  La inyección de ese claim depende del Auth Hook del proyecto Supabase, que no
-  se declara en el repo.
+- `public.current_sede_id()` lee `app_metadata.sede_id` de los claims del JWT.
+  Desde `002` los toma de `request.jwt.claims` directamente (lo mismo que hace
+  `auth.jwt()` de Supabase), sin depender del esquema `auth`. La inyección de
+  ese claim depende del Auth Hook del proyecto Supabase, que no se declara en
+  el repo.
 - Aun así **no es una defensa activa**: como el tráfico de la app va con
   `service_role`, RLS no se evalúa nunca.
 

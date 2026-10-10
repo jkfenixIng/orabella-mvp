@@ -5,67 +5,69 @@
  * to WASM and running in-process: no server, no Docker, no credentials, and no
  * network. Nothing here can reach a remote database.
  *
- * Build order (see tests/db/README.md):
- *   1. platform stub  — roles, `extensions` schema with pgcrypto/uuid-ossp,
- *                       `auth.jwt()` returning '{}'::jsonb (what Supabase provides)
- *   2. 001_orabella_schema.sql — applied VERBATIM, no preprocessing
+ * Build order = the clean-PostgreSQL install path (see tests/db/README.md):
+ *   1. supabase/bootstrap/platform-roles.sql — the API roles, nothing else
+ *   2. every supabase/migrations/NNN_*.sql in order (001, 002, ...), VERBATIM
  *   3. seeds/catalog.sql (optional)
+ *
+ * No `auth` schema and no `extensions` schema: the instance is a plain
+ * PostgreSQL, not a Supabase imitation.
  *
  * The built data directory is dumped once per test file and every test starts
  * from a fresh instance loaded from that dump (no schema re-apply per test).
  */
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gist } from "@electric-sql/pglite/contrib/btree_gist";
 import { pgcrypto } from "@electric-sql/pglite/contrib/pgcrypto";
-import { uuid_ossp } from "@electric-sql/pglite/contrib/uuid_ossp";
 
 export const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-export const SCHEMA_PATH = join(REPO_ROOT, "supabase", "migrations", "001_orabella_schema.sql");
+export const MIGRATIONS_DIR = join(REPO_ROOT, "supabase", "migrations");
+export const SCHEMA_PATH = join(MIGRATIONS_DIR, "001_orabella_schema.sql");
+export const PORTABLE_PATH = join(MIGRATIONS_DIR, "002_portable_platform.sql");
+export const BOOTSTRAP_PATH = join(REPO_ROOT, "supabase", "bootstrap", "platform-roles.sql");
 export const CATALOG_PATH = join(REPO_ROOT, "supabase", "seeds", "catalog.sql");
 
-/** Contrib modules the schema (and the Supabase platform layout) needs. */
-const EXTENSIONS = { btree_gist, pgcrypto, uuid_ossp };
+/** The migrations in apply order: `NNN_name.sql`, sorted by number. */
+export const MIGRATION_PATHS = readdirSync(MIGRATIONS_DIR)
+  .filter((name) => /^\d{3}_.*\.sql$/.test(name))
+  .sort()
+  .map((name) => join(MIGRATIONS_DIR, name));
+
+/**
+ * Contrib modules a plain PostgreSQL server must have available: 001 runs
+ * `CREATE EXTENSION IF NOT EXISTS` for btree_gist (the EXCLUDE) and pgcrypto
+ * (installed, unused). PGlite needs them registered up front.
+ */
+const EXTENSIONS = { btree_gist, pgcrypto };
 
 /** Generous budget for hooks that build or load an instance. */
 export const DB_HOOK_TIMEOUT = 120_000;
 
-/**
- * Minimal platform layer, mirroring what a Supabase project already has before
- * 001 runs (prod-plataforma.txt): pgcrypto and uuid-ossp live in `extensions`,
- * the API roles exist, and `auth.jwt()` resolves. 001 then creates btree_gist
- * in `public` itself (`CREATE EXTENSION IF NOT EXISTS ... WITH SCHEMA public`)
- * and skips pgcrypto because it already exists — the same outcome as production.
- *
- * Roles: 001 only grants to `authenticated` and `service_role` (GRANT/POLICY ...
- * TO). `anon` is kept because every Supabase project has it and the API grants
- * of a future migration would target it; `supabase_admin` is not referenced.
- */
-export const PLATFORM_SQL = `
-CREATE ROLE anon NOLOGIN;
-CREATE ROLE authenticated NOLOGIN;
-CREATE ROLE service_role NOLOGIN;
-CREATE SCHEMA extensions;
-CREATE EXTENSION pgcrypto WITH SCHEMA extensions;
-CREATE EXTENSION "uuid-ossp" WITH SCHEMA extensions;
-CREATE SCHEMA auth;
-CREATE FUNCTION auth.jwt() RETURNS jsonb LANGUAGE sql STABLE AS $$ SELECT '{}'::jsonb $$;
-`;
-
 export type Db = PGlite;
+
+/** A new, empty PostgreSQL instance with the contrib modules available. */
+export function emptyDb(): Promise<Db> {
+  return PGlite.create({ extensions: EXTENSIONS });
+}
+
+/** Runs one SQL file verbatim. */
+export async function applyFile(db: Db, path: string): Promise<void> {
+  await db.exec(readFileSync(path, "utf8"));
+}
 
 export interface BuildOptions {
   /** Apply supabase/seeds/catalog.sql after the schema (default true). */
   catalog?: boolean;
 }
 
-/** Builds a new instance: platform stub + 001 verbatim (+ catalog). */
+/** Builds a new instance: bootstrap + every migration verbatim (+ catalog). */
 export async function buildSchemaDb(options: BuildOptions = {}): Promise<Db> {
-  const db = await PGlite.create({ extensions: EXTENSIONS });
-  await db.exec(PLATFORM_SQL);
-  await db.exec(readFileSync(SCHEMA_PATH, "utf8"));
+  const db = await emptyDb();
+  await applyFile(db, BOOTSTRAP_PATH);
+  for (const path of MIGRATION_PATHS) await applyFile(db, path);
   if (options.catalog ?? true) {
     await db.exec(readFileSync(CATALOG_PATH, "utf8"));
   }

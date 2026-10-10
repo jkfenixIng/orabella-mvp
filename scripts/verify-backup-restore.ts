@@ -7,9 +7,14 @@
  *   SHA256SUMS.txt, prod-public-data.sql, prod-conteos.txt, prod-catalogo.txt
  * Writes exactly one file: <backup-dir>/verificacion-restauracion-pglite.txt
  *
- * Steps: checksums -> 001 schema (platform stub + 001 verbatim, NO catalog seed,
- * the dump brings its own rows) -> data load -> FK check -> exact row count per
- * table vs prod-conteos.txt -> catalog inventory vs prod-catalogo.txt.
+ * Steps: checksums -> schema (bootstrap/platform-roles.sql + 001 + 002 verbatim,
+ * NO catalog seed, the dump brings its own rows) -> data load -> FK check ->
+ * exact row count per table vs prod-conteos.txt -> catalog inventory vs
+ * prod-catalogo.txt.
+ *
+ * Expected difference: 002 redefines current_sede_id() without auth.jwt(). The
+ * inventory compares signatures, so it does not show up there; the report says
+ * it explicitly until production has 002 applied.
  * No network and no remote database: PGlite runs in-process.
  */
 import { createHash } from "node:crypto";
@@ -21,7 +26,7 @@ import { join, resolve } from "node:path";
 // import, so the harness is loaded by URL and typed through `typeof import`.
 type Harness = typeof import("../tests/db/harness");
 const harnessUrl = new URL("../tests/db/harness.ts", import.meta.url).href;
-const { buildSchemaDb } = (await import(harnessUrl)) as Harness;
+const { buildSchemaDb, MIGRATION_PATHS } = (await import(harnessUrl)) as Harness;
 type Db = Awaited<ReturnType<Harness["buildSchemaDb"]>>;
 
 const dir = resolve(process.argv[2] ?? "");
@@ -76,7 +81,18 @@ log(
       : "(sin prod-version.txt: version de produccion no registrada)"
   }`,
 );
-log("  001_orabella_schema.sql aplicado literal sobre el stub de plataforma (tests/db/harness.ts)");
+log(
+  `  supabase/bootstrap/platform-roles.sql + ${MIGRATION_PATHS.map((path) => path.split(/[\\/]/).pop()).join(" + ")} aplicados literales (tests/db/harness.ts), sin esquema auth`,
+);
+const sedeFnDef = (
+  await db.query<{ d: string }>(`SELECT pg_get_functiondef('public.current_sede_id()'::regprocedure) AS d`)
+).rows[0].d;
+log(
+  `  diferencia ESPERADA con produccion: current_sede_id() del repo lee request.jwt.claims directo (002); ` +
+    `produccion la tiene con auth.jwt() (001) hasta que se aplique 002. Mismo resultado, distinto cuerpo. ` +
+    `El inventario del paso 6 compara firmas y no la ve.`,
+);
+if (/\bauth\./.test(sedeFnDef)) fail("current_sede_id() del repo todavia referencia auth.* despues de 002");
 
 // 3. Data load. psql meta-commands `\restrict`/`\unrestrict` are not SQL and are
 // skipped; COPY ... FROM stdin blocks are fed through PGlite's /dev/blob.
@@ -210,13 +226,19 @@ const prodSummary = new Map(
 const extVersion = (await db.query<{ v: string }>(`SELECT extversion AS v FROM pg_extension WHERE extname = 'btree_gist'`)).rows[0].v;
 
 log("");
-log("== 6. Inventario del catalogo (prod-catalogo.txt vs 001 aplicado) ==");
+log("== 6. Inventario del catalogo (prod-catalogo.txt vs 001 + 002 aplicados) ==");
 const notNullRows = (
   await db.query<{ n: number }>(
     `SELECT count(*)::int AS n FROM pg_constraint k JOIN pg_namespace s ON s.oid = k.connamespace WHERE s.nspname = 'public' AND k.contype = 'n'`,
   )
 ).rows[0].n;
 log(`  btree_gist local ${extVersion}; produccion 1.7 (prod-plataforma.txt). Funciones de extension excluidas por pg_depend deptype='e' del lado local; del lado de produccion se excluyen las mismas firmas.`);
+const extLocations = (
+  await db.query<{ e: string }>(
+    `SELECT string_agg(e.extname || '@' || n.nspname, ', ' ORDER BY e.extname) AS e FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname <> 'plpgsql'`,
+  )
+).rows[0].e;
+log(`  extensiones locales: ${extLocations}. En produccion pgcrypto vive en extensions (prod-plataforma.txt); en PostgreSQL limpio 001 la crea en public. El esquema no la usa: solo cambia el total de funciones de extension.`);
 log(`  PostgreSQL 18 registra los NOT NULL de columna en pg_constraint (contype 'n'); PostgreSQL 17 no. Se excluyen de la comparacion: ${notNullRows} filas 'n' locales, artefacto de version y no de esquema.`);
 for (const kind of ["function", "trigger", "constraint", "index", "policy"]) {
   const isKind = (line: string): boolean => line.startsWith(`${kind}|`);
