@@ -68,7 +68,7 @@ import {
 import { cn } from "@/src/components/ui/lib/utils";
 import { formatMoney, formatMoneyInput, stripMoneyInput, stripPercentageInput, stripQuantityInput } from "@/src/shared/lib/money";
 import type { ActionResult } from "@/src/shared/lib/api-response";
-import { toNumber } from "@/src/shared/lib/format";
+import { formatBogotaDateTime, formatBogotaLongDate, toNumber } from "@/src/shared/lib/format";
 
 const inputClass = cn(
   "flex h-10 w-full rounded-lg border border-color bg-surface px-3 text-sm text-text-primary outline-none transition-colors duration-200 placeholder:text-text-tertiary focus:border-primary-600 focus:ring-2 focus:ring-primary-600/20 disabled:cursor-not-allowed disabled:opacity-50 dark:border-border-color dark:bg-surface dark:text-text-primary",
@@ -377,8 +377,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
   const [shiftOpen, setShiftOpen] = useState(false);
   const [shiftOwn, setShiftOwn] = useState(true);
   const [shiftOwner, setShiftOwner] = useState<string | null>(null);
-  // Base de apertura del turno (referencia del tope de efectivo del 50%).
-  const [shiftOpeningBase, setShiftOpeningBase] = useState<number | null>(null);
   const [blockNotice, setBlockNotice] = useState<string | null>(null);
   useEffect(() => {
     if (!props.canWrite && !props.canAnnul) return;
@@ -391,7 +389,6 @@ export function InvoicesClient(props: InvoicesClientProps) {
       setShiftOpen(shift !== null);
       setShiftOwn(shift === null || shift.opened_by === props.currentUserId || props.isAdmin);
       setShiftOwner(shift?.opener_name?.trim() || null);
-      setShiftOpeningBase(shift ? Number(shift.opening_base) : null);
     })();
     return () => {
       cancelled = true;
@@ -1212,7 +1209,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
   }
 
   // Hoja factura: totales vivos del borrador (solo presentación; la verdad la calcula el servidor).
-  const todayStr = new Date().toLocaleDateString("es-CO", { year: "numeric", month: "long", day: "numeric" });
+  const todayStr = formatBogotaLongDate(new Date().toISOString());
   const draftSubtotal = items.reduce((acc, item) => {
     const qty = toNumber(item.qty) ?? 0;
     const price = toNumber(item.unit_price) ?? 0;
@@ -1341,10 +1338,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     return row.custom_name?.trim() ? row.custom_name : "Ítem personalizado";
   }
 
-  /**
-   * Botón "Modo cliente": alterna la vista para mostrar la factura en
-   * pantalla. Activo oculta empleado y comisión (datos internos de nómina).
-   */
+  /** Botón "Modo cliente": alterna la factura sin datos internos de personal. */
   function clientViewToggle() {
     return (
       <button
@@ -1603,12 +1597,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             debajo, donde se lee la columna de comisión. MEDIDO:
                             a 320 y a 412 las tres oraciones se leen enteras sin
                             puntero y sin arrastre horizontal. */}
-                        <p className="text-xs text-paper-ink-muted">
-                          Se paga el porcentaje del empleado sobre el subtotal.
-                          El porcentaje se paga en nómina.
-                          El valor de comisión se multiplica por la cantidad.
-                          Si escribe un porcentaje, ese es el del ítem; si no, aplica el del empleado.
-                        </p>
+                        {!clientView && (
+                          <p className="text-xs text-paper-ink-muted">
+                            Se paga el porcentaje del empleado sobre el subtotal.
+                            El porcentaje se paga en nómina.
+                            El valor de comisión se multiplica por la cantidad.
+                            Si escribe un porcentaje, ese es el del ítem; si no, aplica el del empleado.
+                          </p>
+                        )}
 
                         <button
                           type="button"
@@ -1980,8 +1976,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   </span>
                   <span className="whitespace-nowrap text-sm text-slate-500 sm:col-start-2 sm:row-start-1 dark:text-slate-400">
                     <span className="font-sans font-medium text-text-secondary sm:hidden">Fecha: </span>
-                    {new Date(row.created_at).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })}{" "}
-                    {new Date(row.created_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}
+                    {formatBogotaDateTime(row.created_at)}
                   </span>
                 </span>
                 <span className="flex items-center justify-between gap-2 sm:contents">
@@ -2064,7 +2059,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   <span className="whitespace-nowrap text-xs text-slate-500 sm:col-start-5 sm:row-start-1 sm:text-sm dark:text-slate-400">
                     <span className="font-sans font-medium text-text-secondary sm:hidden">Cerrada: </span>
                     {row.closed_at
-                      ? `${new Date(row.closed_at).toLocaleDateString("es-CO", { day: "2-digit", month: "2-digit" })} ${new Date(row.closed_at).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" })}`
+                      ? formatBogotaDateTime(row.closed_at)
                       : "—"}
                   </span>
                 </span>
@@ -2094,11 +2089,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 </Badge>
                               </h2>
                               <p className="text-sm text-paper-ink-muted">
-                                {new Date(detail.invoice.created_at).toLocaleDateString("es-CO", {
-                                  year: "numeric",
-                                  month: "long",
-                                  day: "numeric",
-                                })}
+                                {formatBogotaLongDate(detail.invoice.created_at)}
                                 {detail.invoice.status === "Anulada" && detail.invoice.cancel_reason
                                   ? ` · Motivo: ${detail.invoice.cancel_reason}`
                                   : ""}
@@ -2192,11 +2183,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               la que decide de cuánto se paga a un empleado no
                               puede vivir en un `title=`, que no se dispara con el
                               dedo. */}
-                          <p className="text-xs text-paper-ink-muted">
-                            Se paga el porcentaje del empleado sobre el subtotal.
-                            El porcentaje se paga en nómina.
-                            El valor de comisión se multiplica por la cantidad.
-                          </p>
+                          {!clientView && (
+                            <p className="text-xs text-paper-ink-muted">
+                              Se paga el porcentaje del empleado sobre el subtotal.
+                              El porcentaje se paga en nómina.
+                              El valor de comisión se multiplica por la cantidad.
+                            </p>
+                          )}
                           <h3 className="text-sm font-bold uppercase tracking-wide text-paper-ink-muted">Impuestos</h3>
                           <ul className="mt-1 flex flex-col gap-1 text-sm text-paper-ink">
                             {detail.taxes.map((row) => (
@@ -2731,12 +2724,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 sale ese porcentaje se lee con las otras tres.
                                 MEDIDO: a 320 y 412 las cuatro oraciones se leen
                                 enteras sin puntero. */}
-                            <p className="text-xs text-paper-ink-muted">
-                              Se paga el porcentaje del empleado sobre el subtotal.
-                              El porcentaje se paga en nómina.
-                              El valor de comisión se multiplica por la cantidad.
-                              Si escribe un porcentaje, ese es el del ítem; si no, aplica el del empleado.
-                            </p>
+                            {!clientView && (
+                              <p className="text-xs text-paper-ink-muted">
+                                Se paga el porcentaje del empleado sobre el subtotal.
+                                El porcentaje se paga en nómina.
+                                El valor de comisión se multiplica por la cantidad.
+                                Si escribe un porcentaje, ese es el del ítem; si no, aplica el del empleado.
+                              </p>
+                            )}
                             <button
                               type="button"
                               onClick={() => openItemDialog("edit")}
@@ -3243,11 +3238,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
         </DialogContent>
       </Dialog>
 
-      {/* Pago inmediato de comisión(es): aparece al dejar la factura Pagada si
-          hay empleados con payout_mode "inmediato" y comisión pendiente. Solo
-          se paga la comisión por ítem; el porcentaje del empleado se acumula y
-          se paga en nómina. Mientras haya pendientes el modal NO se cierra por
-          clic fuera ni con Escape: solo al pagar o al dejarla para nómina. */}
+      {/* Pago inmediato de comisión(es): aparece al dejar la factura Pagada si hay
+          empleados con payout_mode "inmediato" y comisión pendiente. */}
       <Dialog
         open={commissionOpen}
         onOpenChange={(open) => {
@@ -3308,21 +3300,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       </SelectContent>
                     </Select>
                   </label>
-                  {row.method_code === "efectivo" && (
-                    <p className="mt-2 text-xs text-paper-ink-muted">
-                      El efectivo no puede superar el 50% de la base de apertura del turno
-                      {shiftOpeningBase !== null ? ` (${formatMoney(shiftOpeningBase)})` : ""}. Si lo
-                      supera, el sistema lo rechazará indicando cuánto queda disponible.
-                    </p>
-                  )}
+
                 </div>
               ))}
-              <p className="rounded-md bg-paper-surface-soft px-3 py-2 text-xs text-paper-ink-tertiary">
-                Solo se paga de inmediato la comisión por ítem. El porcentaje del
-                empleado se acumula y se paga en la nómina del período: si eliges
-                «Dejar para nómina», la comisión también queda pendiente para la
-                nómina. No se pierde.
-              </p>
+
               {commissionError && (
                 // ESTADO: el fallo del pago de la comisión conserva la fila para
                 // reintentar, así que el aviso sigue siendo el caso.

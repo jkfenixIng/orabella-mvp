@@ -18,6 +18,7 @@ import {
   getPeriodDetail,
   getVoucherSettings,
   listPayrollExtras,
+  listPayrollMonthOptions,
   listPayrollMonthRows,
   listPeriods,
   listVouchers,
@@ -135,6 +136,17 @@ export async function listPayrollMonthRowsAction(input: { month: string; employe
       month: input.month,
       employeeId: input.employeeId,
     });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Meses consultables en «Pagos del mes»: períodos más pagos extraordinarios. */
+export async function listPayrollMonthOptionsAction() {
+  try {
+    await requirePayrollAdmin(await sessionToken());
+    const data = await listPayrollMonthOptions();
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

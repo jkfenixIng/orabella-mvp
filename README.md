@@ -220,14 +220,12 @@ definir.
   cookie `orabella-theme` leída en SSR (clase inicial en `<html>`) + script
   inline bloqueante (`beforeInteractive`, en `app/layout.tsx`) +
   `suppressHydrationWarning` + variables CSS (`@custom-variant dark` en Tailwind 4).
-- **Zona horaria de presentación (D5, decisión: dejarlo como está):** el cálculo
-  de negocio usa `America/Bogota` (`src/shared/lib/dates.ts`), pero lo que se
-  **muestra** en pantalla sale del reloj del navegador: `formatDateTime`
-  (`src/shared/lib/format.ts`) llama a `toLocaleString` sin `timeZone`. Un
-  usuario con la máquina en otro huso ve las horas corridas, sin error ni aviso.
-  Se revisó y se dejó así a propósito (una sola sede, personal en Colombia, y
-  fijarlo cambiaría la fecha y hora de todas las pantallas ya aceptadas); el
-  punto único si algún día se fija es esa función. No es un olvido.
+- **Zona horaria de presentación (reemplaza D5):** los `timestamptz` se guardan
+  como instantes exactos y se **muestran** siempre en `America/Bogota` mediante
+  `src/shared/lib/format.ts` (`formatBogotaDateTime`, `formatBogotaDate` y
+  variantes). Las columnas `date` son fechas civiles y se formatean con
+  `formatCivilDate`, sin convertirlas a instante. `tests/format.test.ts` impide
+  nuevos `toLocale*` o `Intl.DateTimeFormat` fuera de los helpers centrales.
 - **API-first (§10):** lógica en servicios del servidor; web vía Server Actions,
   futura app vía REST `/api/v1` (hoy todas las rutas autentican con la cookie de
   sesión `orabella_session`, no con JWT de Supabase; errores

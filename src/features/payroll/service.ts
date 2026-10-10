@@ -21,6 +21,7 @@ import {
   filterPeriodsByCadence,
   mixedAbsorbedDetailLine,
   MIXED_ABSORBED_ITEM_TYPE,
+  bogotaMonthOf,
   monthKeyOf,
   normalizeAllowedDays,
   normalizePayFrequency,
@@ -1496,6 +1497,51 @@ const PAYROLL_MONTH_PATTERN = /^\d{4}-\d{2}$/;
  * Sin filas para ese par (mes, empleado) devuelve `[]`: no cae a los datos de
  * otro empleado ni de otro mes.
  */
+function monthBounds(month: string): { from: string; to: string } {
+  const [year, monthNumber] = month.split("-").map(Number);
+  const lastDay = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+  return rangeBounds(`${month}-01`, `${month}-${String(lastDay).padStart(2, "0")}`);
+}
+
+async function readPayrollExtras(args: {
+  db: DbClient;
+  month?: string;
+  employeeId?: string;
+  log: string;
+}): Promise<PayrollExtraRow[]> {
+  const bounds = args.month ? monthBounds(args.month) : null;
+  return readAllPayroll<PayrollExtraRow>({
+    log: args.log,
+    what: "pagos extraordinarios",
+    meta: { month: args.month, employee: args.employeeId },
+    table: "payroll_extras",
+    fetchPage: (from, to) => {
+      let query = args.db.from("payroll_extras").select(EXTRA_SELECT);
+      if (args.employeeId) query = query.eq("employee_id", args.employeeId);
+      // Límites explícitos -05:00: el mes es el calendario de Bogotá, no UTC.
+      if (bounds) query = query.gte("paid_at", bounds.from).lte("paid_at", bounds.to);
+      return query.order("paid_at", { ascending: false }).range(from, to);
+    },
+  });
+}
+
+/** Meses con períodos o pagos extraordinarios, ordenados del más reciente. */
+export async function listPayrollMonthOptions(): Promise<string[]> {
+  try {
+    const db = await payrollDb();
+    const [periods, extras] = await Promise.all([
+      listPeriods(),
+      readPayrollExtras({ db, log: "listPayrollMonthOptions" }),
+    ]);
+    return [...new Set([
+      ...periods.map((period) => monthKeyOf(period.start_date)),
+      ...extras.map((extra) => bogotaMonthOf(extra.paid_at)),
+    ].filter((month): month is string => month !== null))].sort((left, right) => (left < right ? 1 : -1));
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
 export async function listPayrollMonthRows(args: {
   month: string;
   employeeId: string;
@@ -1504,21 +1550,21 @@ export async function listPayrollMonthRows(args: {
     if (!PAYROLL_MONTH_PATTERN.test(args.month)) {
       throw new PayrollError("VALIDATION", "Mes inválido (use yyyy-mm).", 400);
     }
-    const monthPeriods = (await listPeriods()).filter(
-      (period) => monthKeyOf(period.start_date) === args.month,
-    );
-    if (monthPeriods.length === 0) return [];
-
     const db = await payrollDb();
-    const items = await readPaidItemsOfPeriods({
-      db,
-      periodIds: monthPeriods.map((period) => period.id),
-      employeeId: args.employeeId,
-      log: "listPayrollMonthRows",
-      meta: { month: args.month, employee: args.employeeId },
-    });
-
-    return buildPayrollMonthToDate({ periods: monthPeriods, items }).filter(
+    const monthPeriods = (await listPeriods()).filter((period) => monthKeyOf(period.start_date) === args.month);
+    const [items, extras] = await Promise.all([
+      monthPeriods.length === 0
+        ? Promise.resolve([])
+        : readPaidItemsOfPeriods({
+            db,
+            periodIds: monthPeriods.map((period) => period.id),
+            employeeId: args.employeeId,
+            log: "listPayrollMonthRows",
+            meta: { month: args.month, employee: args.employeeId },
+          }),
+      readPayrollExtras({ db, month: args.month, employeeId: args.employeeId, log: "listPayrollMonthRows" }),
+    ]);
+    return buildPayrollMonthToDate({ periods: monthPeriods, items, extras }).filter(
       (row) => row.month === args.month && row.employeeId === args.employeeId,
     );
   } catch (error) {

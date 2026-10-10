@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { idempotencyKeySchema, moneyEquals, roundMoney } from "@/src/features/billing/schemas";
 import { cashOutLimitViolation } from "@/src/features/cash/schemas";
+import { bogotaDay } from "@/src/shared/lib/dates";
 import {
   employeeLineCommissionOrigin,
   employeeLineCommissionPercent,
@@ -2642,10 +2643,25 @@ export interface PayrollMonthPeriodEntry {
  * se prorratea en los dos meses (`prorateFixedSalary`), así que sus días y su
  * fijo aparecen en el mes donde empieza, que es la parte que ahí se liquida.
  */
+export interface PayrollMonthExtraEntry {
+  id: string;
+  amount: number;
+  method_code: string;
+  reason: string;
+  kind: PayrollExtraKind;
+  paid_at: string;
+}
+
 export interface PayrollMonthEmployeeRow {
   /** Mes del calendario del período, `yyyy-mm`. */
   month: string;
   employeeId: string;
+  /** Totales del período; los extraordinarios no alteran liquidación ni saldo. */
+  periodNet: number;
+  periodPaid: number;
+  periodRemaining: number;
+  extrasPaid: number;
+  monthPaid: number;
   netTotal: number;
   paidTotal: number;
   remainingTotal: number;
@@ -2654,6 +2670,7 @@ export interface PayrollMonthEmployeeRow {
   /** Días nominados del mes (la parte de cada período que cae en él). */
   days: number;
   periods: PayrollMonthPeriodEntry[];
+  extras: PayrollMonthExtraEntry[];
 }
 
 /** Datos del empleado que la vista de nómina necesita para una fila (ADM-08). */
@@ -2917,6 +2934,7 @@ export function groupPayrollPeriodsByMonth<TRow extends PayrollPeriodLike>(
 export function buildPayrollMonthToDate(args: {
   periods: readonly PayrollPeriodLike[];
   items: readonly PayrollItemLike[];
+  extras?: readonly (PayrollMonthExtraEntry & { employee_id: string })[];
 }): PayrollMonthEmployeeRow[] {
   const periodById = new Map(args.periods.map((period) => [period.id, period]));
   /** Por mes: los empleados que tienen algo liquidado ese mes. */
@@ -2965,11 +2983,36 @@ export function buildPayrollMonthToDate(args: {
     }
   }
 
+  const extrasByMonth = new Map<string, Map<string, PayrollMonthExtraEntry[]>>();
+  for (const extra of args.extras ?? []) {
+    const month = bogotaMonthOf(extra.paid_at);
+    if (month === null) continue;
+    const monthEmployees = employees.get(month) ?? new Set<string>();
+    employees.set(month, monthEmployees);
+    monthEmployees.add(extra.employee_id);
+    const byEmployee = extrasByMonth.get(month) ?? new Map<string, PayrollMonthExtraEntry[]>();
+    extrasByMonth.set(month, byEmployee);
+    const entry: PayrollMonthExtraEntry = {
+      id: extra.id,
+      amount: roundMoney(Number(extra.amount)),
+      method_code: extra.method_code,
+      reason: extra.reason,
+      kind: extra.kind,
+      paid_at: extra.paid_at,
+    };
+    byEmployee.set(extra.employee_id, [...(byEmployee.get(extra.employee_id) ?? []), entry]);
+  }
+
   const rows: PayrollMonthEmployeeRow[] = [];
   for (const [month, monthEmployees] of employees) {
     for (const employeeId of monthEmployees) {
       rows.push(
-        monthRowFrom(month, employeeId, [...(details.get(month)?.get(employeeId)?.values() ?? [])]),
+        monthRowFrom(
+          month,
+          employeeId,
+          [...(details.get(month)?.get(employeeId)?.values() ?? [])],
+          extrasByMonth.get(month)?.get(employeeId) ?? [],
+        ),
       );
     }
   }
@@ -2992,18 +3035,37 @@ function monthRowFrom(
   month: string,
   employeeId: string,
   periods: readonly PayrollMonthPeriodEntry[],
+  extras: readonly PayrollMonthExtraEntry[] = [],
 ): PayrollMonthEmployeeRow {
   const sorted = [...periods].sort((left, right) => (left.start_date < right.start_date ? -1 : 1));
+  const sortedExtras = [...extras].sort((left, right) => (left.paid_at < right.paid_at ? -1 : 1));
+  const periodNet = sumMoney(sorted.map((entry) => entry.net));
+  const periodPaid = sumMoney(sorted.map((entry) => entry.paid));
+  const periodRemaining = sumMoney(sorted.map((entry) => entry.remaining));
+  const extrasPaid = sumMoney(sortedExtras.map((entry) => entry.amount));
   return {
     month,
     employeeId,
-    netTotal: sumMoney(sorted.map((entry) => entry.net)),
-    paidTotal: sumMoney(sorted.map((entry) => entry.paid)),
-    remainingTotal: sumMoney(sorted.map((entry) => entry.remaining)),
+    periodNet,
+    periodPaid,
+    periodRemaining,
+    extrasPaid,
+    monthPaid: sumMoney([periodPaid, extrasPaid]),
+    netTotal: periodNet,
+    paidTotal: periodPaid,
+    remainingTotal: periodRemaining,
     fixedTotal: sumMoney(sorted.map((entry) => entry.fixed)),
     days: sorted.reduce((acc, entry) => acc + entry.days, 0),
     periods: sorted,
+    extras: sortedExtras,
   };
+}
+
+/** Mes `yyyy-mm` de un instante, según el calendario de Bogotá. */
+export function bogotaMonthOf(instant: string): string | null {
+  const date = new Date(instant);
+  if (Number.isNaN(date.getTime())) return null;
+  return bogotaDay(0, date).slice(0, 7);
 }
 
 /**
@@ -3032,8 +3094,8 @@ export function replacePayrollMonthPeriod(args: {
       next.push(row);
       continue;
     }
-    if (periods.length === 0) continue;
-    next.push(monthRowFrom(row.month, row.employeeId, periods));
+    if (periods.length === 0 && row.extras.length === 0) continue;
+    next.push(monthRowFrom(row.month, row.employeeId, periods, row.extras));
   }
 
   // 2. Adentro la porción fresca. Sólo se agrega o se completa: la fila puede
@@ -3044,7 +3106,14 @@ export function replacePayrollMonthPeriod(args: {
       (other) => other.month === row.month && other.employeeId === row.employeeId,
     );
     if (index === -1) next.push(row);
-    else next[index] = monthRowFrom(row.month, row.employeeId, [...next[index].periods, ...row.periods]);
+    else {
+      next[index] = monthRowFrom(
+        row.month,
+        row.employeeId,
+        [...next[index].periods, ...row.periods],
+        next[index].extras,
+      );
+    }
   }
 
   return next.sort(compareMonthRows);

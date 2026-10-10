@@ -38,7 +38,7 @@ import {
 import { cn } from "@/src/components/ui/lib/utils";
 import { formatMoney, formatMoneyInput, stripMoneyInput, stripQuantityInput } from "@/src/shared/lib/money";
 import type { ActionResult } from "@/src/shared/lib/api-response";
-import { toNumber } from "@/src/shared/lib/format";
+import { formatBogotaFullDateTime, toNumber } from "@/src/shared/lib/format";
 import {
   inputClass,
   labelClass,
@@ -915,7 +915,7 @@ export function InventoryClient(props: InventoryClientProps) {
                     <span className="flex items-center gap-2 sm:contents">
                       <span className="text-sm text-text-primary sm:col-start-1 sm:row-start-1">
                         <span className="font-sans font-medium text-text-secondary sm:hidden">Fecha: </span>
-                        {new Date(row.created_at).toLocaleString("es-CO")}
+                        {formatBogotaFullDateTime(row.created_at)}
                       </span>
                     </span>
                     <span className="flex items-center justify-between gap-2 sm:contents">

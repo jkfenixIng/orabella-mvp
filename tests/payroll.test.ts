@@ -116,6 +116,7 @@ import {
   getPeriodDetail,
   getVoucherSettings,
   groupSettlementInvoices,
+  listPayrollMonthOptions,
   listPayrollMonthRows,
   listPayrollOverview,
   listPeriods,
@@ -2273,12 +2274,18 @@ function createPayrollPagedStubClient(): unknown {
       },
       gte: (column: string, value: unknown) => {
         filterColumns.push(column);
-        filters.push((row) => String(row[column] ?? "") >= String(value));
+        filters.push((row) => {
+          if (column !== "paid_at") return String(row[column] ?? "") >= String(value);
+          return Date.parse(String(row[column] ?? "")) >= Date.parse(String(value));
+        });
         return query;
       },
       lte: (column: string, value: unknown) => {
         filterColumns.push(column);
-        filters.push((row) => String(row[column] ?? "") <= String(value));
+        filters.push((row) => {
+          if (column !== "paid_at") return String(row[column] ?? "") <= String(value);
+          return Date.parse(String(row[column] ?? "")) <= Date.parse(String(value));
+        });
         return query;
       },
       // `.is(col, null)` del cliente Supabase: la lectura de pendientes
@@ -7145,6 +7152,110 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
       netTotal: 500000,
       paidTotal: 700000,
       remainingTotal: 0,
+    });
+  });
+
+  function extraFixture(id: string, employeeId: string, amount: number, paidAt: string): Record<string, unknown> {
+    return {
+      id,
+      employee_id: employeeId,
+      amount,
+      method_id: null,
+      method_code: "efectivo",
+      reference: null,
+      reason: `Motivo ${id}`,
+      kind: "emergencia",
+      days_from: null,
+      days_to: null,
+      paid_by: "u-1",
+      paid_at: paidAt,
+      created_at: paidAt,
+    };
+  }
+
+  it("suma pagos extraordinarios por mes Bogotá sin alterar neto ni saldo del período", async () => {
+    seedLegibilityFixture();
+    payrollPagedStub.tables.payroll_extras = [
+      extraFixture("extra-sep", "emp-01", 50000, "2026-10-01T00:30:00Z"),
+      extraFixture("extra-oct", "emp-01", 70000, "2026-10-01T05:00:00Z"),
+    ];
+
+    const [september] = await listPayrollMonthRows({ month: "2026-09", employeeId: "emp-01" });
+    const [october] = await listPayrollMonthRows({ month: "2026-10", employeeId: "emp-01" });
+
+    expect(september).toMatchObject({
+      periodNet: 1900000,
+      periodPaid: 1300000,
+      periodRemaining: 600000,
+      extrasPaid: 50000,
+      monthPaid: 1350000,
+    });
+    expect(september.extras.map((row) => row.id)).toEqual(["extra-sep"]);
+    expect(october).toMatchObject({
+      periodNet: 1100000,
+      periodPaid: 200000,
+      periodRemaining: 900000,
+      extrasPaid: 70000,
+      monthPaid: 270000,
+    });
+    expect(october.extras.map((row) => row.id)).toEqual(["extra-oct"]);
+  });
+
+  it.each([
+    ["2026-01", "2026-02", "2026-02-01T04:59:59.999Z", "2026-02-01T05:00:00.000Z"],
+    ["2026-04", "2026-05", "2026-05-01T04:59:59.999Z", "2026-05-01T05:00:00.000Z"],
+    ["2024-02", "2024-03", "2024-03-01T04:59:59.999Z", "2024-03-01T05:00:00.000Z"],
+    ["2026-02", "2026-03", "2026-03-01T04:59:59.999Z", "2026-03-01T05:00:00.000Z"],
+  ])("separa extras en la frontera Bogotá de %s y %s", async (month, nextMonth, lastInstant, nextInstant) => {
+    seedLegibilityFixture();
+    payrollPagedStub.tables.payroll_extras = [
+      extraFixture(`last-${month}`, "emp-01", 10000, lastInstant),
+      extraFixture(`first-${nextMonth}`, "emp-01", 20000, nextInstant),
+    ];
+
+    const [current] = await listPayrollMonthRows({ month, employeeId: "emp-01" });
+    const [next] = await listPayrollMonthRows({ month: nextMonth, employeeId: "emp-01" });
+
+    expect(current.extras.map((row) => row.id)).toEqual([`last-${month}`]);
+    expect(next.extras.map((row) => row.id)).toEqual([`first-${nextMonth}`]);
+    const options = await listPayrollMonthOptions();
+    expect(options).toEqual(expect.arrayContaining([month, nextMonth]));
+    expect(options).toEqual([...options].sort((left, right) => (left < right ? 1 : -1)));
+  });
+
+  it("un mes con solo pagos extraordinarios aparece y su saldo de período es cero", async () => {
+    seedLegibilityFixture();
+    payrollPagedStub.tables.payroll_extras = [
+      extraFixture("extra-nov", "emp-01", 90000, "2026-11-10T15:00:00Z"),
+    ];
+
+    expect(await listPayrollMonthRows({ month: "2026-11", employeeId: "emp-01" })).toEqual([
+      expect.objectContaining({
+        periodNet: 0,
+        periodPaid: 0,
+        periodRemaining: 0,
+        extrasPaid: 90000,
+        monthPaid: 90000,
+        periods: [],
+      }),
+    ]);
+    expect(await listPayrollMonthOptions()).toEqual(["2026-11", "2026-10", "2026-09"]);
+  });
+
+  it("un empleado sin extras conserva el resultado anterior", async () => {
+    seedLegibilityFixture();
+    payrollPagedStub.tables.payroll_extras = [
+      extraFixture("extra-other", "emp-02", 90000, "2026-09-10T15:00:00Z"),
+    ];
+
+    const [row] = await listPayrollMonthRows({ month: "2026-09", employeeId: "emp-01" });
+    expect(row).toMatchObject({
+      netTotal: 1900000,
+      paidTotal: 1300000,
+      remainingTotal: 600000,
+      extrasPaid: 0,
+      monthPaid: 1300000,
+      extras: [],
     });
   });
 

@@ -12,6 +12,7 @@ import {
   getPeriodDetailAction,
   getPayrollStartDateAction,
   listPayrollExtrasAction,
+  listPayrollMonthOptionsAction,
   listPayrollMonthRowsAction,
   listPeriodsAction,
   listVouchersAction,
@@ -102,7 +103,8 @@ import {
 } from "@/src/shared/lib/ui-styles";
 import type { ActionResult } from "@/src/shared/lib/api-response";
 import { bogotaDay } from "@/src/shared/lib/dates";
-import { toNumber } from "@/src/shared/lib/format";
+import { formatBogotaDate, formatBogotaFullDateTime, toNumber } from "@/src/shared/lib/format";
+import { refreshPayrollMonthAfterExtra } from "./payroll-month-refresh";
 import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 
 /** Acción destructiva (borrar borrador): contorno y texto en rojo, separada de las demás. */
@@ -1168,7 +1170,7 @@ function SettlementSourcesPanel({
                           {invoiceDetail.invoice.client_name ?? "—"}
                         </SourceDetailField>
                         <SourceDetailField label="Fecha">
-                          {new Date(invoiceDetail.invoice.created_at).toLocaleString("es-CO")}
+                          {formatBogotaFullDateTime(invoiceDetail.invoice.created_at)}
                         </SourceDetailField>
                         <SourceDetailField label="Total">
                           {formatMoney(invoiceDetail.invoice.total)}
@@ -1297,6 +1299,7 @@ export function PayrollClient(props: PayrollClientProps) {
   // servidor. El formulario guarda lo ELEGIDO y `monthQuery` lo ÚLTIMO
   // consultado con su resultado; `null` es el estado previo a la consulta, que
   // no muestra tabla ni número alguno.
+  const [monthOptions, setMonthOptions] = useState<string[]>([]);
   const [queryMonth, setQueryMonth] = useState<string>("");
   const [queryEmployeeId, setQueryEmployeeId] = useState<string>("");
   const [monthQuery, setMonthQuery] = useState<{
@@ -1488,6 +1491,14 @@ export function PayrollClient(props: PayrollClientProps) {
     return () => {
       active = false;
     };
+  }, [props.canAdmin]);
+
+  useEffect(() => {
+    if (!props.canAdmin) return;
+    void listPayrollMonthOptionsAction().then((result) => {
+      if (result.success) setMonthOptions(result.data);
+      else setError(`${result.code}: ${result.message}`);
+    });
   }, [props.canAdmin]);
 
   // Filas del borrador: la planta activa más los empleados ya calculados que
@@ -2148,6 +2159,15 @@ export function PayrollClient(props: PayrollClientProps) {
       // marca (si no, devolvería este mismo pago). `closeExtraDialog` la suelta.
       closeExtraDialog();
       await loadExtras();
+      await refreshPayrollMonthAfterExtra({
+        extra: result.data,
+        monthQuery,
+        loadRows: listPayrollMonthRowsAction,
+        loadOptions: listPayrollMonthOptionsAction,
+        show,
+        setMonthQuery,
+        setMonthOptions,
+      });
     }
   }
 
@@ -2521,7 +2541,7 @@ export function PayrollClient(props: PayrollClientProps) {
                       <span className="text-xs text-text-secondary">{periodSummaryText(row)}</span>
                     )}
                     {row.status === "cerrado" && row.closed_at && (
-                      <span className="text-xs text-text-tertiary">Cerrado: {new Date(row.closed_at).toLocaleString("es-CO")}</span>
+                      <span className="text-xs text-text-tertiary">Cerrado: {formatBogotaFullDateTime(row.closed_at)}</span>
                     )}
                   </li>
                 ))}
@@ -2654,13 +2674,6 @@ export function PayrollClient(props: PayrollClientProps) {
     );
   }
 
-  // PA3 (consulta puntual): los meses que se pueden consultar, derivados de los
-  // períodos que la pantalla ya tiene (la fecha de INICIO define el mes, la
-  // misma regla que la lectura del servidor). El más reciente primero.
-  const monthOptions = groupPayrollPeriodsByMonth(periods)
-    .map((group) => group.month)
-    .filter((month) => month !== "");
-
   /**
    * PA3 (consulta puntual): el admin pide los pagos de UN mes de UN empleado.
    * Es una lectura del servidor (agrega plata de la sede) envuelta en la
@@ -2681,6 +2694,15 @@ export function PayrollClient(props: PayrollClientProps) {
       }
     });
   }
+
+  // Unión de meses: los períodos vivos de la pantalla y los meses Bogotá de los
+  // extraordinarios que devuelve el servidor.
+  const queryMonthOptions = [
+    ...new Set([
+      ...groupPayrollPeriodsByMonth(periods).map((group) => group.month).filter((month) => month !== ""),
+      ...monthOptions,
+    ]),
+  ].sort((left, right) => (left < right ? 1 : -1));
 
   /** Sueldo mensual del empleado: la base de la prorata, a la vista. */
   function monthSalaryLabel(id: string): string {
@@ -2930,9 +2952,9 @@ export function PayrollClient(props: PayrollClientProps) {
             Lo que cada empleado lleva liquidado y pagado en el mes, y contra qué períodos. El fijo
             se muestra prorrateado por los días nominados: el sueldo mensual es la base, no lo que se
             paga en cada período. Un período que cruza el fin de mes se prorratea en los dos meses y
-            acá aparece en el mes donde empieza. Los pagos extraordinarios individuales
-            (despido, renuncia, emergencia) NO entran en estos totales: no pertenecen a ningún
-            período y están listados en su propia sección.
+            acá aparece en el mes donde empieza. Los pagos extraordinarios se listan aparte por su
+            fecha en Bogotá: suman al total pagado del mes, pero no cambian el neto ni el saldo de
+            los períodos.
           </p>
           {/*
             PA3 (consulta puntual): el mes y el empleado los ELIGE el admin; la
@@ -2951,7 +2973,7 @@ export function PayrollClient(props: PayrollClientProps) {
                 required
               >
                 <option value="">Mes…</option>
-                {monthOptions.map((month) => (
+                {queryMonthOptions.map((month) => (
                   <option key={month} value={month}>
                     {payrollMonthLabel(month)}
                   </option>
@@ -3006,13 +3028,16 @@ export function PayrollClient(props: PayrollClientProps) {
                       Neto
                     </th>
                     <th className={tableCellClass} scope="col">
-                      Pagado
+                      Pagado períodos
+                    </th>
+                    <th className={tableCellClass} scope="col">
+                      Pagado mes (incluye extraordinarios)
                     </th>
                     <th className={tableCellClass} scope="col">
                       Saldo
                     </th>
                     <th className={tableCellClass} scope="col">
-                      Períodos
+                      Períodos y pagos extraordinarios
                     </th>
                   </tr>
                 </thead>
@@ -3031,10 +3056,11 @@ export function PayrollClient(props: PayrollClientProps) {
                           {row.days === 1 ? "1 día nominado" : `${row.days} días nominados`}
                         </span>
                       </td>
-                      <td className={tableCellClass}>{formatMoney(row.netTotal)}</td>
-                      <td className={tableCellClass}>{formatMoney(row.paidTotal)}</td>
+                      <td className={tableCellClass}>{formatMoney(row.periodNet)}</td>
+                      <td className={tableCellClass}>{formatMoney(row.periodPaid)}</td>
+                      <td className={tableCellClass}>{formatMoney(row.monthPaid)}</td>
                       <td className={cn(tableCellClass, "font-semibold")}>
-                        {formatMoney(row.remainingTotal)}
+                        {formatMoney(row.periodRemaining)}
                       </td>
                       <td className={tableCellClass}>
                         <ul className="flex flex-col gap-0.5">
@@ -3045,13 +3071,20 @@ export function PayrollClient(props: PayrollClientProps) {
                               {formatMoney(entry.remaining)}
                             </li>
                           ))}
+                          {row.extras.map((entry) => (
+                            <li key={entry.id}>
+                              Pago extraordinario · {PAYROLL_EXTRA_KIND_LABELS[entry.kind]} ·{" "}
+                              {methodLabel(entry.method_code)} · {formatBogotaFullDateTime(entry.paid_at)}:{" "}
+                              {formatMoney(entry.amount)} — {entry.reason}
+                            </li>
+                          ))}
                         </ul>
                       </td>
                     </tr>
                   ))}
                   {monthQuery.rows.length === 0 && (
                     <tr className={tableRowClass}>
-                      <td className={tableCellClass} colSpan={6}>
+                      <td className={tableCellClass} colSpan={7}>
                         {`Sin pagos de nómina de ${employeeName(monthQuery.employeeId)} en ${payrollMonthLabel(monthQuery.month)}.`}
                       </td>
                     </tr>
@@ -3300,7 +3333,7 @@ export function PayrollClient(props: PayrollClientProps) {
                       {extras.map((row) => (
                         <tr key={row.id} className={tableRowClass}>
                           <td className={tableCellClass}>
-                            {row.paid_at ? formatFullDate(row.paid_at.slice(0, 10)) : "—"}
+                            {formatBogotaDate(row.paid_at)}
                           </td>
                           <td className={tableCellClass}>{employeeName(row.employee_id)}</td>
                           <td className={tableCellClass}>{PAYROLL_EXTRA_KIND_LABELS[row.kind]}</td>
@@ -3641,7 +3674,7 @@ export function PayrollClient(props: PayrollClientProps) {
                             {CORRECTION_ORIGINAL_STILL_SHOWN}
                           </p>
                           <p className="mt-2 text-xs text-text-tertiary">
-                            {`Corregido el ${new Date(correction.correction.corrected_at).toLocaleString("es-CO")} — motivo: ${correction.correction.reason}`}
+                            {`Corregido el ${formatBogotaFullDateTime(correction.correction.corrected_at)} — motivo: ${correction.correction.reason}`}
                           </p>
                           <CorrectionComparison view={correction.view} employeeName={employeeName} />
                         </>
