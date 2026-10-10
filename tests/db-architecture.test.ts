@@ -23,6 +23,16 @@ import { describe, expect, it } from "vitest";
 const ROOT = process.cwd();
 const DB_DIR = "src/shared/db/";
 const CLIENT = "src/shared/db/client.ts";
+const SCHEMA_DIR = "src/shared/db/schema/";
+const SCHEMA_FORBIDDEN = /^(?:@\/src\/features\/|@\/app\/|hono(?:\/|$)|fastify(?:\/|$)|next(?:\/|$)|@supabase\/)/;
+
+function schemaViolations(src: Sources, files: string[]): string[] {
+  return files.flatMap((file) =>
+    staticImports(src.read(file))
+      .filter((specifier) => SCHEMA_FORBIDDEN.test(specifier) || resolveImport(src, file, specifier)?.startsWith("src/features/"))
+      .map((specifier) => `${file} -> ${specifier}`),
+  );
+}
 
 /** Repo files by repo-relative path; `virtual` overlays the disk. */
 interface Sources {
@@ -156,6 +166,12 @@ describe("src/shared/db is server only", () => {
     expect(clientDbViolations(DISK, ALL_FILES)).toEqual([]);
   });
 
+  it("shared schemas stay infrastructure-only", () => {
+    const schemaFiles = sourceFiles(SCHEMA_DIR);
+    expect(schemaFiles).toEqual(expect.arrayContaining(["src/shared/db/schema/cash.ts", "src/shared/db/schema/billing.ts", "src/shared/db/schema/commissions.ts", "src/shared/db/schema/payroll.ts"]));
+    expect(schemaViolations(DISK, schemaFiles)).toEqual([]);
+  });
+
   it("the connection module is never imported statically, only with import()", () => {
     const statics = ALL_FILES.filter((file) =>
       staticImports(DISK.read(file)).some((specifier) => resolveImport(DISK, file, specifier) === CLIENT),
@@ -239,6 +255,26 @@ describe("the detector itself (negative controls)", () => {
         "app/fake/server.ts": `import { getDb } from "@/src/shared/db/client";\n`,
       }),
     ).toEqual([]);
+  });
+
+  it("flags forbidden feature and server imports in schema fixtures", () => {
+    const fixtures = {
+      "src/shared/db/schema/fake-feature.ts": 'import { x } from "@/src/features/cash/service";',
+      "src/shared/db/schema/fake-server.ts": 'import { Hono } from "hono";',
+      "src/shared/db/schema/fake-supabase.ts": 'import { createClient } from "@supabase/supabase-js";',
+      "src/shared/db/schema/fake-fastify.ts": 'import Fastify from "fastify";',
+      "src/shared/db/schema/fake-next.ts": 'import { headers } from "next/headers";',
+      "src/shared/db/schema/fake-relative.ts": 'export { rows } from "../../../features/payroll/service";',
+      "src/features/payroll/service.ts": "export const rows = [];",
+    };
+    expect(schemaViolations(sources(fixtures), Object.keys(fixtures).filter((file) => file.startsWith(SCHEMA_DIR)))).toEqual([
+      "src/shared/db/schema/fake-feature.ts -> @/src/features/cash/service",
+      "src/shared/db/schema/fake-server.ts -> hono",
+      "src/shared/db/schema/fake-supabase.ts -> @supabase/supabase-js",
+      "src/shared/db/schema/fake-fastify.ts -> fastify",
+      "src/shared/db/schema/fake-next.ts -> next/headers",
+      "src/shared/db/schema/fake-relative.ts -> ../../../features/payroll/service",
+    ]);
   });
 
   it("a directive after code does not count", () => {

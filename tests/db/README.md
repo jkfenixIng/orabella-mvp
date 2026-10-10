@@ -69,6 +69,14 @@ before creating the instance. Tests call RPCs as `SELECT public.<fn>(...)`
 through `rpc()`, with payloads shaped like the ones in
 `src/features/*/service.ts` (`fixtures.ts` and the per-file builders).
 
+## Monetary RPC contract (direct connection)
+
+Money operations keep the database RPC as their **unit of work**: call it as one
+`SELECT public.fn(...)` statement with bound parameters and explicit casts
+(`numeric`, `boolean`, `uuid[]`, `jsonb`, etc.). Do not rebuild its transaction
+client-side. In one monetary operation, do not mix Drizzle queries and an RPC
+from a different engine; select the engine once and keep the RPC boundary.
+
 ## What is characterized
 
 | Area | Function / object | Behaviors pinned |

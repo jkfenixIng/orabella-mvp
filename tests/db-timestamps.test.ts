@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { toPostgrestTimestamp } from "@/src/shared/db/timestamps";
+import { toPostgrestTimestamp, withPostgrestTimestamps } from "@/src/shared/db/timestamps";
+
+describe("withPostgrestTimestamps", () => {
+  it("normalizes only the named timestamp fields of a money row", () => {
+    const row = { amount: -12.34, paid_at: "2026-10-09 14:32:18.1-05", closed_at: null, detail_json: [{ amount: 1 }] };
+    expect(withPostgrestTimestamps(row, ["paid_at", "closed_at"])).toEqual({ ...row, paid_at: "2026-10-09T14:32:18.1-05:00" });
+  });
+});
 
 describe("toPostgrestTimestamp", () => {
   it.each([

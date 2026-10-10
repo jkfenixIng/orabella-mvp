@@ -12,20 +12,33 @@
 import { sql, type SQL } from "drizzle-orm";
 import type { Database } from "./client";
 
+const RPC_CASTS = [
+  "uuid",
+  "text",
+  "integer",
+  "numeric",
+  "boolean",
+  "jsonb",
+  "timestamptz",
+  "text[]",
+  "uuid[]",
+] as const;
+
 export interface RpcArg {
   value: unknown;
-  cast: "uuid" | "text" | "integer" | "jsonb" | "timestamptz" | "text[]";
+  cast: (typeof RPC_CASTS)[number];
 }
 
 /**
- * Arguments travel as text and PostgreSQL casts them, so both drivers send the
- * same bytes: jsonb as its JSON text, text[] as an array literal with every
- * element quoted (commas, braces and quotes inside an element are data).
+ * Arguments travel as bound parameters and PostgreSQL casts them: jsonb as its
+ * JSON text (a string is taken as already serialized), arrays as an array
+ * literal with every element quoted (commas, braces and quotes are data).
+ * Booleans and numbers stay parameters too; nothing is interpolated.
  */
 function toParam(value: unknown, cast: RpcArg["cast"]): unknown {
   if (value === null || value === undefined) return null;
   if (cast === "jsonb") return typeof value === "string" ? value : JSON.stringify(value);
-  if (cast === "text[]") {
+  if (cast === "text[]" || cast === "uuid[]") {
     const items = (value as unknown[]).map((item) => `"${String(item).replace(/[\\"]/g, "\\$&")}"`);
     return `{${items.join(",")}}`;
   }
@@ -34,7 +47,10 @@ function toParam(value: unknown, cast: RpcArg["cast"]): unknown {
 
 /** `public.fn(arg::cast, ...)`: the name is validated, every value is a parameter. */
 function invocation(fn: string, args: RpcArg[]): SQL {
-  if (!/^[a-z_][a-z0-9_]*$/.test(fn)) throw new Error("Invalid RPC name.");
+  if (!/^[a-z_][a-z0-9_]{0,62}$/.test(fn)) throw new Error("Invalid RPC name.");
+  for (const { cast } of args) {
+    if (!(RPC_CASTS as readonly string[]).includes(cast)) throw new Error("Invalid RPC cast.");
+  }
   const params: SQL[] = args.map(({ value, cast }) => sql`${toParam(value, cast)}::${sql.raw(cast)}`);
   return sql`${sql.raw(`public.${fn}`)}(${sql.join(params, sql`, `)})`;
 }

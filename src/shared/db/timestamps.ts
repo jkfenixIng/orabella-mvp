@@ -28,3 +28,16 @@ export function toPostgrestTimestamp(value: string | null): string | null {
   const [, day, time, hours, minutes = ":00", seconds = ""] = match;
   return `${day}T${time}${hours}${minutes}${seconds}`;
 }
+
+/** Converts only named timestamptz fields, leaving money and jsonb values intact. */
+export function withPostgrestTimestamps<T extends Record<string, unknown>, K extends keyof T>(
+  row: T,
+  fields: readonly K[],
+): T {
+  const normalized = { ...row };
+  for (const field of fields) {
+    const value = normalized[field];
+    if (typeof value === "string" || value === null) normalized[field] = toPostgrestTimestamp(value as string | null) as T[K];
+  }
+  return normalized;
+}
