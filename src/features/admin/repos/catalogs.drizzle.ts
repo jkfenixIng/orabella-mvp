@@ -12,6 +12,7 @@
 import { asc, eq, sql } from "drizzle-orm";
 import type { Database } from "@/src/shared/db/client";
 import { DbQueryError, toDbError } from "@/src/shared/db/errors";
+import type { PagedResponse } from "@/src/shared/lib/paged";
 import { employees, paymentMethods, taxConfigs } from "@/src/shared/db/schema";
 import type {
   CatalogsRepo,
@@ -176,5 +177,18 @@ export function drizzleCatalogsRepo(db: Database): CatalogsRepo {
         const rows = await db.select(EMPLOYEE_COLUMNS).from(employees).where(eq(employees.id, id)).limit(1);
         return rows[0] ? toEmployeeRow(rows[0]) : null;
       }),
+    employeesPage: async (from, to): Promise<PagedResponse<EmployeeCatalogRow> & { count: null }> => {
+      try {
+        const rows = await db
+          .select(EMPLOYEE_COLUMNS)
+          .from(employees)
+          .orderBy(asc(employees.fullName), asc(employees.id))
+          .offset(from)
+          .limit(to - from + 1);
+        return { data: rows.map(toEmployeeRow), error: null, count: null };
+      } catch (error) {
+        return { data: null, error: toDbError(error), count: null };
+      }
+    },
   };
 }

@@ -31,6 +31,7 @@ const CASES: Case[] = [
   { name: "taxes sorted by code, numeric as number", run: (repo) => repo.listTaxes(50) },
   { name: "payment methods sorted by code, honoring the limit", run: (repo) => repo.listPaymentMethods(3) },
   { name: "employees sorted by name", run: (repo) => repo.listEmployees(50) },
+  { name: "employee pages use full_name then id and the exact range", run: async (repo) => [await repo.employeesPage(0, 1), await repo.employeesPage(2, 3)] },
   { name: "tax insert keeps the database default is_active", run: async (repo) => blankId(await repo.upsertTax({ code: "otro", name: "Otro", percent: 10.5 })) },
   { name: "tax update by id without is_active keeps it", run: (repo) => repo.upsertTax({ id: ID, code: "IVA", name: "IVA 2", percent: 5 }) },
   { name: "tax CHECK violation is 23514", run: (repo) => repo.upsertTax({ code: "IVA", name: "Mal", percent: 101 }) },
@@ -51,7 +52,9 @@ async function seed(instance: Db) {
   await instance.query(`INSERT INTO public.payment_methods (id, code, name, arqueo_mode) VALUES ($1, 'zeta', 'Zeta', 'none')`, [METHOD_ID]);
   await instance.query(`INSERT INTO public.employees (id, full_name, document, pay_type, salary_fixed, commission_percent, birth_date)
     VALUES ('00000000-0000-4000-8000-0000000000e2', 'Beto', '2', 'mixto', 1234.5, 7.25, '1990-02-03'),
-           ('00000000-0000-4000-8000-0000000000e1', 'Ana', '1', 'fijo', NULL, NULL, NULL)`);
+           ('00000000-0000-4000-8000-0000000000e1', 'Ana', '1', 'fijo', NULL, NULL, NULL),
+           ('00000000-0000-4000-8000-0000000000e4', 'Beto', '4', 'fijo', NULL, NULL, NULL),
+           ('00000000-0000-4000-8000-0000000000e3', 'Beto', '3', 'fijo', NULL, NULL, NULL)`);
 }
 
 describe("admin catalogs repository: equivalence supabase-js ↔ drizzle", () => {

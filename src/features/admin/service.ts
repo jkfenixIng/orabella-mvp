@@ -119,6 +119,9 @@ export async function requireSession(token: string | null | undefined): Promise<
  */
 
 // ------------------------------------------------------------- empleados ---
+const EMPLOYEE_SELECT =
+  "id, user_id, full_name, employee_code, document, phone, position, payout_mode, email, birth_date, pay_type, pay_frequency, salary_fixed, commission_percent, is_active";
+
 /**
  * F2: `pay_frequency` is always selected; `null` means no declared cadence.
  * Re-exported from the port so both adapters have exactly this domain contract.
@@ -138,9 +141,6 @@ export interface SedeUserRow {
   id_number: string;
   roles: RoleCode[];
 }
-
-const EMPLOYEE_SELECT =
-  "id, user_id, full_name, employee_code, document, phone, position, payout_mode, email, birth_date, pay_type, pay_frequency, salary_fixed, commission_percent, is_active";
 
 async function fetchEmployees(limit?: number): Promise<EmployeeRow[]> {
   const repo = await catalogsRepo();
@@ -173,18 +173,11 @@ async function internalOnFailure<T>(call: () => Promise<T>): Promise<T> {
  * la vista, nunca en "leí lo que alcancé".
  */
 export async function listAllEmployees(): Promise<EmployeeRow[]> {
-  const db = await adminDb();
+  const repo = await catalogsRepo();
+  // Orden (full_name, id) determinista: lo fija el puerto en ambos motores.
   return readAllPaged<EmployeeRow>({
     table: "employees",
-    fetchPage: (from, to) =>
-      db
-        .from("employees")
-        .select(EMPLOYEE_SELECT)
-        // El nombre es el orden histórico de la lista; `id` desempata para que
-        // dos homónimos no caigan en páginas distintas (ni se repitan ni falten).
-        .order("full_name")
-        .order("id")
-        .range(from, to),
+    fetchPage: (from, to) => repo.employeesPage(from, to),
   });
 }
 

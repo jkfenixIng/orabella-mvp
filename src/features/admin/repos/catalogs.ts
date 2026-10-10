@@ -9,11 +9,12 @@
  *
  * Out of this port on purpose (still supabase-js in the service): reads with
  * the `roles(code)` embed, the `upsert_employee_atomic` / `replace_user_roles`
- * RPCs, the `.or()` user listing and the paged/maybeSingle employee reads.
+ * RPCs and the `.or()` user listing.
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { getDbConfig } from "@/src/shared/config/env";
 import { DbQueryError, toDbError } from "@/src/shared/db/errors";
+import type { PagedResponse } from "@/src/shared/lib/paged";
 import type { ArqueoMode } from "../schemas";
 
 export interface TaxConfigRow {
@@ -82,6 +83,12 @@ export interface CatalogsRepo {
   listEmployees(limit: number): Promise<EmployeeCatalogRow[]>;
   /** One employee by id; `null` when there is none (maybeSingle). */
   findEmployee(id: string): Promise<EmployeeCatalogRow | null>;
+  /**
+   * One `range(from, to)` window of the whole staff ordered by (full_name, id),
+   * for `readAllPaged`. Failures come back in `error` (never thrown) so the
+   * exhaustive reader keeps raising `PagedReadError`.
+   */
+  employeesPage(from: number, to: number): PromiseLike<PagedResponse<EmployeeCatalogRow>>;
 }
 const TAX = "id, code, name, percent, is_active";
 const PAYMENT = "id, code, name, is_active, arqueable, arqueo_mode, fee_percent";
@@ -139,6 +146,15 @@ export function supabaseCatalogsRepo(db: SupabaseClient): CatalogsRepo {
       if (error) fail(error);
       return (data ?? null) as EmployeeCatalogRow | null;
     },
+    employeesPage: (from, to) =>
+      db
+        .from("employees")
+        .select(EMPLOYEE)
+        // Name is the historical order; `id` breaks ties so homonyms never
+        // straddle pages (neither repeated nor missing).
+        .order("full_name")
+        .order("id")
+        .range(from, to) as unknown as PromiseLike<PagedResponse<EmployeeCatalogRow>>,
   };
 }
 

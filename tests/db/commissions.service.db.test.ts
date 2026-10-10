@@ -1,8 +1,8 @@
 /**
  * `payCommissionNow` through the SERVICE on both engines, over the real schema.
- * Cash, admin and audit stay external collaborators (mocked here); the money
- * barriers are the real 034 / 003 triggers and the 044 index, and each engine
- * must translate them to the same CommissionError.
+ * Admin and cash collaborators are real on both engines; PostgreSQL mode must
+ * not instantiate Supabase. The 034 / 003 triggers and the 044 index preserve
+ * the same CommissionError contract.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { DB_HOOK_TIMEOUT, closeDb, freshDb, one, warmTemplate, type Db } from "./harness";
@@ -13,14 +13,20 @@ const engine = vi.hoisted(() => ({
   shift: "",
   /** Runs once, right before the payout INSERT reaches PostgreSQL. */
   beforeInsert: null as null | (() => Promise<void>),
-  /** Runs inside the friendly cash pre-check (between the reads and the INSERT). */
-  duringPrecheck: null as null | (() => Promise<void>),
+  /** Runs once, right after the real cash pre-check reads the method balance. */
+  afterPrecheck: null as null | (() => Promise<void>),
+  /** createAdminClient calls: must stay 0 on DB_ENGINE=postgres even if a caller swallows errors. */
+  supabaseCalls: 0,
 }));
 
+// Only Next's cache wrapper is bypassed (no incremental cache outside Next);
+// the admin/cash services themselves run for real.
+vi.mock("next/cache", () => ({ unstable_cache: <T>(fn: T) => fn }));
 vi.mock("@/src/shared/lib/supabase/server", async () => {
   const { postgrestDouble } = await import("./postgrest-double");
   return {
     createAdminClient: () => {
+      engine.supabaseCalls += 1;
       if (process.env.DB_ENGINE === "postgres") throw new Error("Supabase used on the postgres engine");
       return postgrestDouble(engine.pg);
     },
@@ -30,27 +36,6 @@ vi.mock("@/src/shared/db/client", async () => {
   const { drizzle } = await import("drizzle-orm/pglite");
   const schema = await import("@/src/shared/db/schema");
   return { getDb: () => drizzle({ client: engine.pg, schema }) };
-});
-vi.mock("@/src/features/cash/service", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/src/features/cash/service")>();
-  return {
-    ...actual,
-    getOpenShift: async () => ({ id: engine.shift }),
-    // The friendly pre-check is skipped on purpose: the trigger must decide.
-    assertCashMethodOutflow: async () => {
-      await engine.duringPrecheck?.();
-    },
-  };
-});
-vi.mock("@/src/features/admin/service", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/src/features/admin/service")>();
-  return {
-    ...actual,
-    listPaymentMethods: async () => [
-      { id: "m1", code: "efectivo", name: "Efectivo", is_active: true, arqueable: true, arqueo_mode: "denominations", fee_percent: 0 },
-      { id: "m2", code: "nequi", name: "Nequi", is_active: true, arqueable: true, arqueo_mode: "declared_total", fee_percent: 0 },
-    ],
-  };
 });
 vi.mock("@/src/shared/lib/audit", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/src/shared/lib/audit")>()),
@@ -67,7 +52,8 @@ beforeAll(warmTemplate, DB_HOOK_TIMEOUT);
 beforeEach(async () => {
   engine.pg = await freshDb();
   engine.beforeInsert = null;
-  engine.duringPrecheck = null;
+  engine.afterPrecheck = null;
+  engine.supabaseCalls = 0;
   user = await insertUser(engine.pg);
   employee = await insertEmployee(engine.pg);
   const product = await insertProduct(engine.pg, 5);
@@ -86,7 +72,13 @@ beforeEach(async () => {
       engine.beforeInsert = null;
       await hook();
     }
-    return query(...args);
+    const result = await query(...args);
+    if (engine.afterPrecheck && /cash_shift_method_expected_balance/i.test(String(args[0]))) {
+      const hook = engine.afterPrecheck;
+      engine.afterPrecheck = null;
+      await hook();
+    }
+    return result;
   }) as Db["query"]);
 }, DB_HOOK_TIMEOUT);
 afterEach(async () => {
@@ -107,6 +99,10 @@ describe.each(["supabase", "postgres"] as const)("payCommissionNow on %s", (name
   beforeEach(() => {
     vi.stubEnv("DB_ENGINE", name === "postgres" ? "postgres" : "");
     vi.stubEnv("DATABASE_URL", name === "postgres" ? "postgres://unused.invalid/db" : "");
+  });
+  afterEach(() => {
+    if (name === "postgres") expect(engine.supabaseCalls).toBe(0);
+    else expect(engine.supabaseCalls).toBeGreaterThan(0);
   });
   const pay = async (amount: number, key = KEY, method_code = "nequi") => {
     const { payCommissionNow } = await import("@/src/features/commissions/service");
@@ -154,11 +150,22 @@ describe.each(["supabase", "postgres"] as const)("payCommissionNow on %s", (name
     expect(await pay(110000, OTHER, "efectivo")).toMatchObject({ amount: 110000 });
   });
 
-  it("re-reads the invoice right before the INSERT: annulled in flight is INVOICE_ANNULLED, nothing written", async () => {
-    engine.duringPrecheck = async () => {
+  it("re-reads the invoice right before the INSERT: annulled after the real pre-check is INVOICE_ANNULLED", async () => {
+    engine.afterPrecheck = async () => {
       await engine.pg.query(`UPDATE public.invoices SET status = 'Anulada', cancel_reason = 'prueba' WHERE id = $1`, [invoice]);
     };
     expect(await failure(pay(1000))).toMatchObject({ code: "INVOICE_ANNULLED", status: 422 });
+    expect(engine.afterPrecheck).toBeNull();
+    expect(await payouts()).toBe(0);
+  });
+
+  it("uses the real admin catalog and cash shift: no open shift is NO_OPEN_SHIFT", async () => {
+    // A minimal valid closed row: only the real "no open shift" read matters here.
+    await engine.pg.query(
+      `UPDATE public.cash_shifts SET status = 'cerrado', closed_at = now(), counted_cash = 0, base_left = 0, cash_withdrawn = 0, base_difference = 0 WHERE id = $1`,
+      [engine.shift],
+    );
+    expect(await failure(pay(1000))).toMatchObject({ code: "NO_OPEN_SHIFT" });
     expect(await payouts()).toBe(0);
   });
 
