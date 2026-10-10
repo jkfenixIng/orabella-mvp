@@ -9,7 +9,8 @@
  * column lists and a many-to-one embed `table(col)` resolved through the
  * `<singular>_id` foreign key, an object or null like PostgREST), count exact
  * head, in/eq/neq/is/gte/lte/match, `or` with `ilike` items, order,
- * range/limit, insert/update/upsert(onConflict id), single and maybeSingle
+ * range/limit, insert/upsert of one row or an array (upsert with an
+ * onConflict column list, default id), update, delete, single and maybeSingle
  * (PGRST116 when the row count does not fit), and `rpc` with PostgREST's named
  * arguments (resolved against pg_proc, result serialized with to_json).
  *
@@ -101,7 +102,13 @@ export function postgrestDouble(pg: Db, authAdmin?: AuthAdminDouble): SupabaseCl
       let columns = "*";
       let head = false;
       let count = false;
-      let write: { kind: "insert" | "update" | "upsert" | "delete"; values: Record<string, unknown>; onConflict?: string } | null = null;
+      let write:
+        | {
+            kind: "insert" | "update" | "upsert" | "delete";
+            values: Record<string, unknown> | Record<string, unknown>[];
+            onConflict?: string;
+          }
+        | null = null;
       let returning = false;
       const filters: Filter[] = [];
       const orders: string[] = [];
@@ -143,24 +150,31 @@ export function postgrestDouble(pg: Db, authAdmin?: AuthAdminDouble): SupabaseCl
           })
           .join(", ");
         if (write) {
-          const keys = Object.keys(write.values);
-          const values = keys.map((key) => {
-            params.push(write!.values[key]);
+          // PostgREST takes one object or an array (one multi-row statement).
+          const writeRows = (Array.isArray(write.values) ? write.values : [write.values]) as Record<string, unknown>[];
+          const keys = Object.keys(writeRows[0] ?? {});
+          const placeholder = (value: unknown) => {
+            params.push(value);
             return `$${params.length}`;
-          });
+          };
           // PostgREST `on_conflict` + merge-duplicates: the arbiter is the given
           // column list (default the primary key) and every SENT key is set from
           // `excluded`, including `id` when the payload carries it.
           const target = (write.onConflict ?? "id").split(",").map((column) => ident(column.trim())).join(", ");
-          const body =
-            write.kind === "delete"
-              ? `DELETE FROM public.${ident(table)} t${where(params)}`
-              : write.kind === "update"
-              ? `UPDATE public.${ident(table)} SET ${keys.map((key, index) => `${ident(key)} = ${values[index]}`).join(", ")}${where(params)}`
-              : `INSERT INTO public.${ident(table)} (${keys.map(ident).join(", ")}) VALUES (${values.join(", ")})` +
-                (write.kind === "upsert"
-                  ? ` ON CONFLICT (${target}) DO UPDATE SET ${keys.map((key) => `${ident(key)} = excluded.${ident(key)}`).join(", ")}`
-                  : "");
+          let body: string;
+          if (write.kind === "delete") {
+            body = `DELETE FROM public.${ident(table)} t${where(params)}`;
+          } else if (write.kind === "update") {
+            const set = keys.map((key) => `${ident(key)} = ${placeholder(writeRows[0][key])}`).join(", ");
+            body = `UPDATE public.${ident(table)} SET ${set}${where(params)}`;
+          } else {
+            const rows = writeRows.map((row) => `(${keys.map((key) => placeholder(row[key])).join(", ")})`).join(", ");
+            body =
+              `INSERT INTO public.${ident(table)} (${keys.map(ident).join(", ")}) VALUES ${rows}` +
+              (write.kind === "upsert"
+                ? ` ON CONFLICT (${target}) DO UPDATE SET ${keys.map((key) => `${ident(key)} = excluded.${ident(key)}`).join(", ")}`
+                : "");
+          }
           return `WITH w AS (${body} RETURNING ${returning ? projection : "1 AS x"}) SELECT coalesce(json_agg(w), '[]'::json) AS rows FROM w`;
         }
         const base = `SELECT ${projection} FROM public.${ident(table)} t${where(params)}`;
@@ -207,7 +221,7 @@ export function postgrestDouble(pg: Db, authAdmin?: AuthAdminDouble): SupabaseCl
           head = options?.head === true;
           return query;
         },
-        insert(values: Record<string, unknown>) {
+        insert(values: Record<string, unknown> | Record<string, unknown>[]) {
           write = { kind: "insert", values };
           return query;
         },
@@ -215,7 +229,7 @@ export function postgrestDouble(pg: Db, authAdmin?: AuthAdminDouble): SupabaseCl
           write = { kind: "update", values };
           return query;
         },
-        upsert(values: Record<string, unknown>, options?: { onConflict?: string }) {
+        upsert(values: Record<string, unknown> | Record<string, unknown>[], options?: { onConflict?: string }) {
           write = { kind: "upsert", values, onConflict: options?.onConflict };
           return query;
         },
