@@ -182,6 +182,7 @@ describe("src/shared/db is server only", () => {
     expect(DISK.read("src/features/alerts/repos/alerts.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
     expect(DISK.read("src/features/inventory/repos/inventory.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
     expect(DISK.read("src/features/auth/repos/auth.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
+    expect(DISK.read("src/features/commissions/repos/commissions.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
     expect(DISK.read("src/shared/lib/repos/audit.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
     expect(DISK.read("src/shared/lib/audit.ts")).not.toMatch(/supabase\/server/);
   });
@@ -192,6 +193,7 @@ describe("src/shared/db is server only", () => {
       ...graph(DISK, "src/features/alerts/service.ts", { dynamic: false }),
       ...graph(DISK, "src/features/inventory/service.ts", { dynamic: false }),
       ...graph(DISK, "src/features/auth/service.ts", { dynamic: false }),
+      ...graph(DISK, "src/features/commissions/service.ts", { dynamic: false }),
       ...graph(DISK, "src/shared/lib/repos/audit.ts", { dynamic: false }),
     ];
     const driverImporters = [...new Set(reached)].filter((file) =>
@@ -202,7 +204,20 @@ describe("src/shared/db is server only", () => {
     expect(reached).toContain("src/features/alerts/repos/alerts.ts");
     expect(reached).toContain("src/features/inventory/repos/inventory.ts");
     expect(reached).toContain("src/features/auth/repos/auth.ts");
+    expect(reached).toContain("src/features/commissions/repos/commissions.ts");
+    expect(reached).not.toContain("src/features/commissions/repos/commissions.drizzle.ts");
     expect(driverImporters).toEqual([]);
+  });
+
+  it("the commissions adapters leave locking to the 003/034 triggers: no client transaction or lock", () => {
+    for (const file of ["src/features/commissions/repos/commissions.ts", "src/features/commissions/repos/commissions.drizzle.ts"]) {
+      const code = DISK.read(file);
+      expect(code, file).not.toMatch(/\.transaction\(|\bBEGIN\b|FOR UPDATE|FOR SHARE|pg_advisory|\.for\(/);
+    }
+    const service = DISK.read("src/features/commissions/service.ts");
+    expect(service).not.toMatch(/supabase\/server|from\("commission_payouts"\)/);
+    expect(service).toContain("assertCashMethodOutflow");
+    expect(service).toContain("writeAudit");
   });
 
   it("every Drizzle adapter is reached only through import() from its port", () => {
@@ -211,6 +226,7 @@ describe("src/shared/db is server only", () => {
       expect.arrayContaining([
         "src/features/inventory/repos/inventory.drizzle.ts",
         "src/features/auth/repos/auth.drizzle.ts",
+        "src/features/commissions/repos/commissions.drizzle.ts",
         "src/shared/lib/repos/audit.drizzle.ts",
       ]),
     );

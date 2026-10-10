@@ -101,7 +101,7 @@ export function postgrestDouble(pg: Db, authAdmin?: AuthAdminDouble): SupabaseCl
       let columns = "*";
       let head = false;
       let count = false;
-      let write: { kind: "insert" | "update" | "upsert"; values: Record<string, unknown> } | null = null;
+      let write: { kind: "insert" | "update" | "upsert" | "delete"; values: Record<string, unknown>; onConflict?: string } | null = null;
       let returning = false;
       const filters: Filter[] = [];
       const orders: string[] = [];
@@ -148,12 +148,18 @@ export function postgrestDouble(pg: Db, authAdmin?: AuthAdminDouble): SupabaseCl
             params.push(write!.values[key]);
             return `$${params.length}`;
           });
+          // PostgREST `on_conflict` + merge-duplicates: the arbiter is the given
+          // column list (default the primary key) and every SENT key is set from
+          // `excluded`, including `id` when the payload carries it.
+          const target = (write.onConflict ?? "id").split(",").map((column) => ident(column.trim())).join(", ");
           const body =
-            write.kind === "update"
+            write.kind === "delete"
+              ? `DELETE FROM public.${ident(table)} t${where(params)}`
+              : write.kind === "update"
               ? `UPDATE public.${ident(table)} SET ${keys.map((key, index) => `${ident(key)} = ${values[index]}`).join(", ")}${where(params)}`
               : `INSERT INTO public.${ident(table)} (${keys.map(ident).join(", ")}) VALUES (${values.join(", ")})` +
                 (write.kind === "upsert"
-                  ? ` ON CONFLICT (id) DO UPDATE SET ${keys.map((key) => `${ident(key)} = excluded.${ident(key)}`).join(", ")}`
+                  ? ` ON CONFLICT (${target}) DO UPDATE SET ${keys.map((key) => `${ident(key)} = excluded.${ident(key)}`).join(", ")}`
                   : "");
           return `WITH w AS (${body} RETURNING ${returning ? projection : "1 AS x"}) SELECT coalesce(json_agg(w), '[]'::json) AS rows FROM w`;
         }
@@ -209,8 +215,12 @@ export function postgrestDouble(pg: Db, authAdmin?: AuthAdminDouble): SupabaseCl
           write = { kind: "update", values };
           return query;
         },
-        upsert(values: Record<string, unknown>) {
-          write = { kind: "upsert", values };
+        upsert(values: Record<string, unknown>, options?: { onConflict?: string }) {
+          write = { kind: "upsert", values, onConflict: options?.onConflict };
+          return query;
+        },
+        delete() {
+          write = { kind: "delete", values: {} };
           return query;
         },
         eq(column: string, value: unknown) {

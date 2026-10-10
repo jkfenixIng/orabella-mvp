@@ -74,3 +74,20 @@ describe("servicesRepo selector", () => {
     await expect(servicesRepo()).rejects.toThrow("DATABASE_URL is required when DB_ENGINE=postgres.");
   });
 });
+
+describe("commissionsRepo selector", () => {
+  it("uses supabase-js by default and leaves the postgres driver unloaded", async () => {
+    vi.stubEnv("DB_ENGINE", "");
+    const { commissionsRepo } = await import("@/src/features/commissions/repos/commissions");
+    const repo = await commissionsRepo();
+    expect(typeof repo.listRules).toBe("function");
+    expect(Object.keys(globalThis)).not.toContain("__orabellaDb");
+  });
+
+  it("validates postgres configuration before loading the direct adapter", async () => {
+    vi.stubEnv("DB_ENGINE", "postgres");
+    vi.stubEnv("DATABASE_URL", "");
+    const { commissionsRepo } = await import("@/src/features/commissions/repos/commissions");
+    await expect(commissionsRepo()).rejects.toThrow("DATABASE_URL is required when DB_ENGINE=postgres.");
+  });
+});
