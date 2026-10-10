@@ -3,7 +3,6 @@ import {
   normalizeEmployeeCode,
   normalizePaymentMethodCode,
   paymentMethodSchema,
-  type ArqueoMode,
   serviceSchema,
   setUserRolesSchema,
   taxConfigSchema,
@@ -17,6 +16,8 @@ import { getSessionUser, hashPassword } from "@/src/features/auth/service";
 import { readAllPaged } from "@/src/shared/lib/paged";
 import { unstable_cache } from "next/cache";
 import { servicesRepo, type ServiceRow } from "./repos/services";
+import { catalogsRepo } from "./repos/catalogs";
+import { DbQueryError } from "@/src/shared/db/errors";
 
 // Compatibilidad: la identidad de estos guardas vive en
 // `@/src/shared/lib/sede.ts` (import cruzado entre features resuelto).
@@ -118,32 +119,12 @@ export async function requireSession(token: string | null | undefined): Promise<
  */
 
 // ------------------------------------------------------------- empleados ---
-export interface EmployeeRow {
-  id: string;
-  user_id: string | null;
-  full_name: string;
-  employee_code: string | null;
-  document: string;
-  phone: string | null;
-  position: string | null;
-  payout_mode: string;
-  email: string | null;
-  birth_date: string | null;
-  pay_type: string;
-  /**
-   * F2: cadencia acordada con el empleado (`employees.pay_frequency`, 063).
-   * `null` es «sin cadencia definida»: el fijo se prorratea por los días del
-   * período, que es el comportamiento de hoy.
-   *
-   * REQUERIDA: `EMPLOYEE_SELECT` la trae siempre, así que el tipo no puede
-   * mentir dejándola opcional. Una fila sin la clave sería un legajo leído con
-   * un `select` incompleto, no un caso válido.
-   */
-  pay_frequency: string | null;
-  salary_fixed: number | null;
-  commission_percent: number | null;
-  is_active: boolean;
-}
+/**
+ * F2: `pay_frequency` is always selected; `null` means no declared cadence.
+ * Re-exported from the port so both adapters have exactly this domain contract.
+ */
+export type { EmployeeCatalogRow as EmployeeRow } from "./repos/catalogs";
+import type { EmployeeCatalogRow as EmployeeRow } from "./repos/catalogs";
 
 export interface SedeUserRow {
   id: string;
@@ -162,14 +143,17 @@ const EMPLOYEE_SELECT =
   "id, user_id, full_name, employee_code, document, phone, position, payout_mode, email, birth_date, pay_type, pay_frequency, salary_fixed, commission_percent, is_active";
 
 async function fetchEmployees(limit?: number): Promise<EmployeeRow[]> {
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("employees")
-    .select(EMPLOYEE_SELECT)
-    .order("full_name")
-    .limit(clampLimit(limit));
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as EmployeeRow[];
+  const repo = await catalogsRepo();
+  return internalOnFailure(() => repo.listEmployees(clampLimit(limit)));
+}
+
+/** A repository failure keeps the historical answer of the catalog readers. */
+async function internalOnFailure<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch {
+    throw new AdminError("INTERNAL", "Error interno.", 500);
+  }
 }
 
 /**
@@ -205,15 +189,10 @@ export async function listAllEmployees(): Promise<EmployeeRow[]> {
 }
 
 export async function getEmployee(id: string): Promise<EmployeeRow> {
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("employees")
-    .select(EMPLOYEE_SELECT)
-    .eq("id", id)
-    .maybeSingle();
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
+  const repo = await catalogsRepo();
+  const data = await internalOnFailure(() => repo.findEmployee(id));
   if (!data) throw new AdminError("NOT_FOUND", "Empleado no encontrado.", 404);
-  return data as EmployeeRow;
+  return data;
 }
 
 /**
@@ -485,25 +464,12 @@ export async function upsertService(raw: unknown): Promise<ServiceRow> {
 }
 
 // ----------------------------------------------------------------- taxes ---
-export interface TaxConfigRow {
-  id: string;
-  code: string;
-  name: string;
-  percent: number;
-  is_active: boolean;
-}
-
-const TAX_SELECT = "id, code, name, percent, is_active";
+export type { TaxConfigRow } from "./repos/catalogs";
+import type { TaxConfigRow } from "./repos/catalogs";
 
 async function fetchTaxes(limit?: number): Promise<TaxConfigRow[]> {
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("tax_configs")
-    .select(TAX_SELECT)
-    .order("code")
-    .limit(clampLimit(limit));
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as TaxConfigRow[];
+  const repo = await catalogsRepo();
+  return internalOnFailure(() => repo.listTaxes(clampLimit(limit)));
 }
 
 /** ADM-06: crea o actualiza un impuesto de la instalación (upsert por id). */
@@ -511,45 +477,27 @@ export async function upsertTaxConfig(raw: unknown): Promise<TaxConfigRow> {
   const parsed = taxConfigSchema.safeParse(raw);
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const input: TaxConfigInput = parsed.data;
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("tax_configs")
-    .upsert({
+  const repo = await catalogsRepo();
+  const data = await internalOnFailure(() =>
+    repo.upsertTax({
       ...(input.id ? { id: input.id } : {}),
       code: input.code,
       name: input.name,
       percent: input.percent,
       ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
-    }, { onConflict: "id" })
-    .select(TAX_SELECT)
-    .single();
-  if (error || !data) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return data as TaxConfigRow;
+    }),
+  );
+  if (!data) throw new AdminError("INTERNAL", "Error interno.", 500);
+  return data;
 }
 
 // ------------------------------------------------------- payment methods ---
-export interface PaymentMethodRow {
-  id: string;
-  code: string;
-  name: string;
-  is_active: boolean;
-  /** Derived compatibility flag: `arqueo_mode !== "none"`. */
-  arqueable: boolean;
-  arqueo_mode: ArqueoMode;
-  fee_percent: number;
-}
-
-const PAYMENT_METHOD_SELECT = "id, code, name, is_active, arqueable, arqueo_mode, fee_percent";
+export type { PaymentMethodRow } from "./repos/catalogs";
+import type { PaymentMethodRow } from "./repos/catalogs";
 
 async function fetchPaymentMethods(limit?: number): Promise<PaymentMethodRow[]> {
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("payment_methods")
-    .select(PAYMENT_METHOD_SELECT)
-    .order("code")
-    .limit(clampLimit(limit));
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as PaymentMethodRow[];
+  const repo = await catalogsRepo();
+  return internalOnFailure(() => repo.listPaymentMethods(clampLimit(limit)));
 }
 
 /**
@@ -563,7 +511,7 @@ export async function upsertPaymentMethod(raw: unknown): Promise<PaymentMethodRo
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const input: PaymentMethodInput = parsed.data;
   const code = input.code ? normalizePaymentMethodCode(input.code) : undefined;
-  const db = await adminDb();
+  const repo = await catalogsRepo();
   const fields = {
     name: input.name,
     ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
@@ -571,36 +519,36 @@ export async function upsertPaymentMethod(raw: unknown): Promise<PaymentMethodRo
     ...(input.fee_percent !== undefined ? { fee_percent: input.fee_percent } : {}),
   };
   if (input.id) {
-    const { data: current, error: readError } = await db
-      .from("payment_methods")
-      .select("code")
-      .eq("id", input.id)
-      .maybeSingle();
-    if (readError) throw new AdminError("INTERNAL", "Error interno.", 500);
+    const id = input.id;
+    const current = await internalOnFailure(() => repo.findPaymentMethod(id));
     if (!current) throw new AdminError("NOT_FOUND", "Método de pago no encontrado.", 404);
-    if (code && code !== (current as { code: string }).code) {
+    if (code && code !== current.code) {
       throw new AdminError("PAYMENT_METHOD_CODE_IMMUTABLE", "El código de un método no se puede cambiar.", 409);
     }
-    const { data, error } = await db
-      .from("payment_methods")
-      .update(fields)
-      .eq("id", input.id)
-      .select(PAYMENT_METHOD_SELECT)
-      .single();
-    if (error || !data) throw paymentMethodWriteError(error);
-    return data as PaymentMethodRow;
+    return paymentMethodWrite(() => repo.updatePaymentMethod(id, fields));
   }
-  const { data, error } = await db
-    .from("payment_methods")
-    .insert({ code, arqueo_mode: "none", ...fields })
-    .select(PAYMENT_METHOD_SELECT)
-    .single();
-  if (error || !data) throw paymentMethodWriteError(error);
-  return data as PaymentMethodRow;
+  // `code` is present on creation: the schema requires it without an id.
+  return paymentMethodWrite(() =>
+    repo.insertPaymentMethod({ code: code as string, arqueo_mode: "none", ...fields }),
+  );
+}
+
+/** A write that fails or returns no row goes through `paymentMethodWriteError`. */
+async function paymentMethodWrite(call: () => Promise<PaymentMethodRow | null>): Promise<PaymentMethodRow> {
+  let data: PaymentMethodRow | null;
+  try {
+    data = await call();
+  } catch (error) {
+    throw paymentMethodWriteError(error instanceof DbQueryError ? error.error : null);
+  }
+  if (!data) throw paymentMethodWriteError(null);
+  return data;
 }
 
 /** Maps the stable database errors of 003 to business errors. */
-export function paymentMethodWriteError(error: { code?: string; message?: string; details?: string } | null): AdminError {
+export function paymentMethodWriteError(
+  error: { code?: string | null; message?: string; details?: string | null } | null,
+): AdminError {
   const text = `${error?.message ?? ""} ${error?.details ?? ""}`;
   if (text.includes("PAYMENT_METHOD_CODE_IMMUTABLE")) {
     return new AdminError("PAYMENT_METHOD_CODE_IMMUTABLE", "El código de un método no se puede cambiar.", 409);

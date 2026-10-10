@@ -162,14 +162,21 @@ describe("src/shared/db is server only", () => {
     );
     expect(statics).toEqual([]);
     expect(DISK.read("src/features/admin/repos/services.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
+    expect(DISK.read("src/features/admin/repos/catalogs.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
+    expect(DISK.read("src/features/alerts/repos/alerts.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
   });
 
-  it("the default engine's static graph loads neither drizzle-orm nor postgres-js", () => {
-    const reached = [...graph(DISK, "src/features/admin/service.ts", { dynamic: false })];
-    const driverImporters = reached.filter((file) =>
+  it("the default engine's static graphs load neither drizzle-orm nor postgres-js", () => {
+    const reached = [
+      ...graph(DISK, "src/features/admin/service.ts", { dynamic: false }),
+      ...graph(DISK, "src/features/alerts/service.ts", { dynamic: false }),
+    ];
+    const driverImporters = [...new Set(reached)].filter((file) =>
       staticImports(DISK.read(file)).some((specifier) => /^(drizzle-orm|postgres)(\/|$)/.test(specifier)),
     );
     expect(reached).toContain("src/features/admin/repos/services.ts");
+    expect(reached).toContain("src/features/admin/repos/catalogs.ts");
+    expect(reached).toContain("src/features/alerts/repos/alerts.ts");
     expect(driverImporters).toEqual([]);
   });
 });

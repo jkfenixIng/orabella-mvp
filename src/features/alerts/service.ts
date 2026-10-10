@@ -11,6 +11,8 @@ import {
   type ShiftAuditState,
 } from "./schemas";
 import { AUDIT_ACTIONS } from "@/src/shared/lib/audit";
+import { DbQueryError } from "@/src/shared/db/errors";
+import { alertsRepo, type AlertsRepo } from "./repos/alerts";
 
 export class AlertError extends Error {
   readonly code: string;
@@ -24,16 +26,6 @@ export class AlertError extends Error {
   }
 }
 
-/**
- * Cliente privilegiado bajo demanda (service_role, solo servidor).
- * Import dinámico para que los tests unitarios (sin red/env) nunca lo carguen.
- */
-async function alertsDb() {
-  const { createAdminClient } = await import("@/src/shared/lib/supabase/server");
-  return createAdminClient();
-}
-
-type DbClient = Awaited<ReturnType<typeof alertsDb>>;
 
 export interface AlertActor {
   userId: string;
@@ -62,9 +54,6 @@ export interface AlertsResult {
   total: number;
 }
 
-const ALERT_SELECT =
-  "id, action, entity, entity_id, metadata, user_id, is_read, read_at, review_note, reviewed_by, created_at";
-
 function validationMessage(error: { issues: Array<{ message: string }> }): string {
   return error.issues[0]?.message ?? "Datos inválidos.";
 }
@@ -74,7 +63,7 @@ function validationMessage(error: { issues: Array<{ message: string }> }): strin
  * aplicar en la base a la que apunta la app) a un error accionable en
  * vez de un "Error interno" opaco.
  */
-function toAlertError(error: { message?: string } | null): AlertError {
+function toAlertError(error: { message?: string } | null | undefined): AlertError {
   const message = error?.message ?? "";
   if (/column .* does not exist|relation .* does not exist/i.test(message)) {
     return new AlertError(
@@ -86,19 +75,24 @@ function toAlertError(error: { message?: string } | null): AlertError {
   return new AlertError("INTERNAL", "Error interno.", 500);
 }
 
-async function userNames(
-  db: DbClient,
-  userIds: Array<string | null>,
-): Promise<Map<string, string>> {
+/** Runs a repository call and maps a database failure with `toAlertError`. */
+async function guarded<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (error) {
+    if (error instanceof DbQueryError) throw toAlertError(error.error);
+    throw error;
+  }
+}
+
+async function userNames(repo: AlertsRepo, userIds: Array<string | null>): Promise<Map<string, string>> {
   const ids = [...new Set(userIds.filter((id): id is string => !!id))];
   if (ids.length === 0) return new Map();
-  const { data, error } = await db.from("users").select("id, full_name").in("id", ids);
-  if (error) throw new AlertError("INTERNAL", "Error interno.", 500);
-  const names = new Map<string, string>();
-  for (const row of (data ?? []) as Array<{ id: string; full_name: string }>) {
-    names.set(row.id, row.full_name);
+  try {
+    return new Map((await repo.userNames(ids)).map((row) => [row.id, row.full_name]));
+  } catch {
+    throw new AlertError("INTERNAL", "Error interno.", 500);
   }
-  return names;
 }
 
 /**
@@ -117,44 +111,13 @@ export async function listAlerts(
   // Rango inclusivo en hora de Bogotá (igual que facturación): cada extremo
   // se aplica solo cuando viene, sobre la misma consulta (sin RPC nuevo).
   const bounds = alertDateBounds(from, to);
-  const db = await alertsDb();
-  let countQuery = db
-    .from("audit_logs")
-    .select("id", { count: "exact", head: true })
-    .in("action", actions);
-  if (unreadOnly) countQuery = countQuery.eq("is_read", false);
-  if (bounds.from) countQuery = countQuery.gte("created_at", bounds.from);
-  if (bounds.to) countQuery = countQuery.lte("created_at", bounds.to);
-  const { count, error: countError } = await countQuery;
-  if (countError) throw toAlertError(countError);
-  const total = count ?? 0;
+  const repo = await alertsRepo();
+  const filters = { actions, unreadOnly, ...bounds };
+  const total = await guarded(() => repo.count(filters));
   const offset = (page - 1) * ALERTS_PAGE_SIZE;
-  let query = db
-    .from("audit_logs")
-    .select(ALERT_SELECT)
-    .in("action", actions);
-  if (unreadOnly) query = query.eq("is_read", false);
-  if (bounds.from) query = query.gte("created_at", bounds.from);
-  if (bounds.to) query = query.lte("created_at", bounds.to);
-  const { data, error } = await query
-    .order("created_at", { ascending: false })
-    .range(offset, offset + ALERTS_PAGE_SIZE - 1);
-  if (error) throw toAlertError(error);
-  const rows = (data ?? []) as Array<{
-    id: string;
-    action: string;
-    entity: string;
-    entity_id: string;
-    metadata: Record<string, unknown> | null;
-    user_id: string | null;
-    is_read: boolean;
-    read_at: string | null;
-    review_note: string | null;
-    reviewed_by: string | null;
-    created_at: string;
-  }>;
+  const rows = await guarded(() => repo.list({ ...filters, offset, limit: ALERTS_PAGE_SIZE }));
   const names = await userNames(
-    db,
+    repo,
     rows.flatMap((row) => [row.user_id, row.reviewed_by]),
   );
   return {
@@ -193,26 +156,11 @@ export async function getShiftReviews(
 ): Promise<Map<string, ShiftAuditState[]>> {
   const result = new Map<string, ShiftAuditState[]>();
   if (shiftIds.length === 0) return result;
-  const db = await alertsDb();
-  const { data, error } = await db
-    .from("audit_logs")
-    .select("entity_id, action, created_at, is_read, review_note, reviewed_by")
-    .eq("entity", "cash_shifts")
-    .in("entity_id", shiftIds)
-    .in("action", [AUDIT_ACTIONS.SHIFT_OPEN_MISMATCH, AUDIT_ACTIONS.SHIFT_CLOSE_MISMATCH]);
-  if (error) throw toAlertError(error);
-  const rows = (data ?? []) as Array<{
-    entity_id: string;
-    action: string;
-    created_at: string;
-    is_read: boolean;
-    review_note: string | null;
-    reviewed_by: string | null;
-  }>;
-  const names = await userNames(
-    db,
-    rows.map((row) => row.reviewed_by),
+  const repo = await alertsRepo();
+  const rows = await guarded(() =>
+    repo.shiftReviews(shiftIds, [AUDIT_ACTIONS.SHIFT_OPEN_MISMATCH, AUDIT_ACTIONS.SHIFT_CLOSE_MISMATCH]),
   );
+  const names = await userNames(repo, rows.map((row) => row.reviewed_by));
   for (const row of rows) {
     const list = result.get(row.entity_id) ?? [];
     list.push({
@@ -228,15 +176,9 @@ export async function getShiftReviews(
 }
 /** Sin leer de la bandeja, opcionalmente de un módulo (insignia del menú). */
 export async function countUnreadAlerts(module?: AlertModule): Promise<number> {
-  const db = await alertsDb();
+  const repo = await alertsRepo();
   const actions = module ? [...ALERT_MODULES[module].actions] : [...ALERT_ACTIONS];
-  const { count, error } = await db
-    .from("audit_logs")
-    .select("id", { count: "exact", head: true })
-    .in("action", actions)
-    .eq("is_read", false);
-  if (error) throw toAlertError(error);
-  return count ?? 0;
+  return guarded(() => repo.count({ actions, unreadOnly: true }));
 }
 
 /**
@@ -256,21 +198,17 @@ export async function markAlertRead(
   if (!parsed.success) {
     throw new AlertError("VALIDATION", validationMessage(parsed.error), 400);
   }
-  const db = await alertsDb();
-  const { data, error } = await db
-    .from("audit_logs")
-    .update({
+  const repo = await alertsRepo();
+  const data = await guarded(() =>
+    repo.markRead(id, {
       is_read: true,
       read_at: new Date().toISOString(),
       review_note: parsed.data.note,
       reviewed_by: actor.userId,
-    })
-    .eq("id", id)
-    .select("id")
-    .maybeSingle();
-  if (error) throw toAlertError(error);
+    }),
+  );
   if (!data) throw new AlertError("NOT_FOUND", "Alerta no encontrada.", 404);
-  return { id: (data as { id: string }).id };
+  return data;
 }
 
 /**
@@ -294,15 +232,8 @@ export async function resolveVoucherAlert(
   note: string,
 ): Promise<{ resolved: boolean }> {
   try {
-    const db = await alertsDb();
-    const { error } = await db
-      .from("audit_logs")
-      .update(buildVoucherAlertResolution({ reviewedBy, note }))
-      .match(voucherAlertFilter(voucherId));
-    if (error) {
-      console.error("[alerts] no se pudo cerrar la alerta del vale:", error.message);
-      return { resolved: false };
-    }
+    const repo = await alertsRepo();
+    await repo.resolveVoucher(voucherAlertFilter(voucherId), buildVoucherAlertResolution({ reviewedBy, note }));
     return { resolved: true };
   } catch (error) {
     console.error(
