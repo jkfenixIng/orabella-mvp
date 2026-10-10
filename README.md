@@ -38,13 +38,14 @@ cp .env.example .env.local     # completar las 3 variables (ver Env)
 npm run dev                    # http://localhost:3000
 ```
 
-Base de datos, en este orden. `001` se aplica **una sola vez**; `002` y los dos
-seeds son idempotentes y se pueden reejecutar:
+Base de datos, en este orden. `001` se aplica **una sola vez**; `002` y `003`
+son migraciones transaccionales; los seeds son idempotentes y se pueden reejecutar:
 
 ```bash
 # apuntando al proyecto Supabase nuevo (connection string del dashboard)
 psql "<connection-string>" -v ON_ERROR_STOP=1 --single-transaction -f supabase/migrations/001_orabella_schema.sql
 psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/002_portable_platform.sql
+psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/003_payment_method_arqueo.sql
 psql "<connection-string>" -f supabase/seeds/catalog.sql      # catálogo mínimo: roles, sede, caja, pagos, impuestos, ajustes
 psql "<connection-string>" -f supabase/seeds/acceptance.sql   # opcional: datos de prueba §11
 ```
@@ -56,8 +57,82 @@ de `002`, como superusuario,
 `psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/bootstrap/app-role.sql`
 (crea `orabella_app`, el rol con el que la app se conecta con
 `DB_ENGINE=postgres`). Orden completo:
-`platform-roles.sql → 001 → 002 → app-role.sql → seeds`. `orabella_app` se crea
-**con `BYPASSRLS` a propósito**: replica la postura actual (la app va con
+`platform-roles.sql → 001 → 002 → 003 → app-role.sql → seeds`.
+
+### Métodos arqueables y producción (`003`)
+
+`003_payment_method_arqueo.sql` libera el código del método (normalizado, único
+e inmutable), agrega `payment_methods.arqueo_mode` (`none`, `denominations`,
+`declared_total`) y crea `cash_shift_method_balances`. El backfill conserva el
+`arqueable` vigente: `efectivo` arqueable → denominaciones, otros arqueables →
+total declarado, no arqueables → `none`. Se cambia después en
+Administración → Métodos de pago. Solo un método puede contarse por
+denominaciones (el cajón físico).
+
+Cada apertura congela una base por método arqueable activo. Una comisión
+inmediata o un vale aprobado por un método arqueable no puede dejar su saldo del
+turno —base + cobros − comisiones − vales aprobados— por debajo del 50 % de su
+base. Las ventas reponen el disponible. Nómina y pagos extraordinarios no entran.
+
+Un vale cuenta solo aprobado (o ya descontado en nómina); pendiente o rechazado
+nunca. Aprobado → rechazado está prohibido (`VOUCHER_CASH_OUT_IMMUTABLE`).
+Cambiar el método/turno/monto de un cobro ya registrado solo se permite si los
+dos métodos quedan sobre su mínimo (`CASH_METHOD_BALANCE_UPDATE_BREACH`). En
+un turno abierto antes de `003`, cualquier cambio real de método, monto o turno
+de un cobro se rechaza con `CASH_METHOD_BALANCE_REQUIRED` («Cierre y abra de
+nuevo el turno para usar arqueo por método.»); reescribir los mismos valores
+sigue permitido. Un método activado como arqueable después de abrir tampoco
+puede recibir ni entregar movimientos hasta el próximo turno; uno congelado al
+abrir conserva su base aunque luego se marque `none`. Para
+evitar deadlocks, el orden único de caja/factura es: turno → balance por método
+→ factura → producto. Las RPC públicas de edición de factura conservan firma y
+ACL pero 003 las envuelve para bloquear primero los turnos/balances de los
+métodos que cambian y después la factura. La prueba PGlite verifica este contrato
+SQL y ACL; la concurrencia real requiere una corrida PostgreSQL de dos sesiones.
+
+**Turnos abiertos antes de `003`:** no tienen base por método y no se
+reconstruyen. Sus comisiones y vales por métodos arqueables se rechazan con
+`CASH_METHOD_BALANCE_REQUIRED` hasta cerrar el turno y abrir uno nuevo. Es la
+opción con menor riesgo de caja: nunca deja una salida sin control.
+
+**Procedimiento en producción:** 1) respaldo; 2) cerrar el turno abierto si lo
+hay; 3) desplegar la app nueva y aplicar `003` en la misma ventana, con
+`psql -v ON_ERROR_STOP=1 -f supabase/migrations/003_payment_method_arqueo.sql`;
+4) revisar en Administración el modo de arqueo de cada método; 5) abrir turno.
+La app vieja no envía todas las bases que exige la apertura nueva: por eso app y
+migración van juntas.
+
+**Rollback seguro (sin `DROP` destructivo):** no se borran tablas ni datos.
+Volver a desplegar la app anterior requiere desactivar las dos guardas y
+restaurar la apertura de `001`, en una transacción:
+
+```sql
+BEGIN;
+ALTER TABLE public.commission_payouts DISABLE TRIGGER trg_commission_payouts_balance_guard;
+ALTER TABLE public.voucher_requests DISABLE TRIGGER trg_voucher_requests_balance_guard;
+ALTER TABLE public.voucher_requests DISABLE TRIGGER trg_voucher_requests_cash_out_state;
+ALTER TABLE public.invoice_payments DISABLE TRIGGER trg_invoice_payments_balance_guard;
+ALTER TABLE public.payments DISABLE TRIGGER trg_payments_balance_guard;
+ALTER FUNCTION public.invoice_edit_items_atomic(uuid, uuid, integer, text, jsonb) RENAME TO invoice_edit_items_atomic_003;
+ALTER FUNCTION public.invoice_edit_items_atomic_legacy(uuid, uuid, integer, text, jsonb) RENAME TO invoice_edit_items_atomic;
+ALTER FUNCTION public.invoice_edit_emitted_atomic(uuid, uuid, integer, text, jsonb) RENAME TO invoice_edit_emitted_atomic_003;
+ALTER FUNCTION public.invoice_edit_emitted_atomic_legacy(uuid, uuid, integer, text, jsonb) RENAME TO invoice_edit_emitted_atomic;
+ALTER FUNCTION public.cash_open_shift_atomic(uuid, uuid, numeric, jsonb) RENAME TO cash_open_shift_atomic_003;
+ALTER FUNCTION public.cash_open_shift_atomic_legacy(uuid, uuid, numeric, jsonb) RENAME TO cash_open_shift_atomic;
+GRANT ALL ON FUNCTION public.cash_open_shift_atomic(uuid, uuid, numeric, jsonb) TO service_role;
+ALTER FUNCTION public.cash_recount_shift_atomic(uuid, uuid, jsonb, jsonb) RENAME TO cash_recount_shift_atomic_003;
+ALTER FUNCTION public.cash_recount_shift_atomic_legacy(uuid, uuid, jsonb, jsonb) RENAME TO cash_recount_shift_atomic;
+GRANT ALL ON FUNCTION public.cash_recount_shift_atomic(uuid, uuid, jsonb, jsonb) TO service_role;
+COMMIT;
+```
+
+`cash_shift_method_balances`, `arqueo_mode` y los códigos nuevos quedan en la
+base, sin efecto. La app anterior solo admite los seis códigos: antes de volver,
+desactive los métodos con código libre. Volver a la versión nueva es revertir
+esos pasos. Un rollback **nunca** reintroduce `payment_methods_code_check` si
+ya existen códigos libres.
+
+`orabella_app` se crea **con `BYPASSRLS` a propósito**: replica la postura actual (la app va con
 `service_role`, que salta RLS, y no depende de RLS; ver «Postura real (D8)»). La
 contraseña no está en el repo: `\password orabella_app` y la cadena va a
 `DATABASE_URL`. Detalle en `supabase/squash/README.md` §9.6. `app-role.sql`
@@ -122,6 +197,7 @@ src/
 supabase/
   migrations/001_orabella_schema.sql   # EL esquema completo (squash; aplicado, no se edita)
   migrations/002_portable_platform.sql # current_sede_id() sin auth.jwt()
+  migrations/003_payment_method_arqueo.sql # métodos libres, modo de arqueo y base por método
   bootstrap/platform-roles.sql         # roles de API, solo para PostgreSQL fuera de Supabase
   bootstrap/app-role.sql               # rol orabella_app (BYPASSRLS), solo fuera de Supabase
   schema-history/             # la serie histórica 001–078 (explicación y respaldo)
@@ -241,10 +317,10 @@ definir.
   que cambia después va en migraciones numeradas (`002_portable_platform.sql`,
   …), en orden estricto; `tests/hardening.test.ts` exige que cada una se acepte
   a mano. Arranque:
-  - **Supabase:** `001` → `002` → `supabase/seeds/catalog.sql` →
+  - **Supabase:** `001` → `002` → `003` → `supabase/seeds/catalog.sql` →
     `supabase/seeds/acceptance.sql`.
   - **PostgreSQL limpio:** `supabase/bootstrap/platform-roles.sql` → `001` →
-    `002` → seeds.
+    `002` → `003` → `app-role.sql` → seeds.
 
   La serie original queda en `supabase/schema-history/` como explicación y
   respaldo; el procedimiento que regenera `001`, y la decisión de `002` y el

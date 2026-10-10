@@ -53,7 +53,6 @@ import {
   roundMoney,
   splitCommissionByOrigin,
   summarizePayrollItems,
-  voucherApprovalCashOutViolation,
   voucherCapSettingValue,
   voucherDaysSettingValue,
   voucherLimitsSchema,
@@ -70,8 +69,12 @@ import {
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { commissionRuleKey, type RuleRate } from "@/src/features/commissions/schemas";
-import { cashOutUsedInShift, getOpenShiftWithOpener } from "@/src/features/cash/service";
-import { cashOutLimitViolation } from "@/src/features/cash/schemas";
+import {
+  assertCashMethodOutflow,
+  CashError,
+  cashMethodRuleError,
+  getOpenShiftWithOpener,
+} from "@/src/features/cash/service";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { bogotaDay, rangeBounds } from "@/src/shared/lib/dates";
 import {
@@ -323,6 +326,12 @@ export async function requirePayrollPayer(
   const session = await payrollSession(token);
   requirePayrollRoles(session.roles, PAYER_ROLES);
   return session;
+}
+
+/** 003: the cash method rule keeps its stable code across features. */
+function payrollFromCash(error: unknown): PayrollError {
+  if (error instanceof CashError) return new PayrollError(error.code, error.message, error.status);
+  return toPayrollError(error);
 }
 
 function toPayrollError(error: unknown): PayrollError {
@@ -4077,21 +4086,18 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
     const voucherSelect = await resolveVoucherSelect(db);
     const hasMethodColumns = voucherMethodColumns !== false;
     const hasCreatedByColumn = voucherCreatedByColumn !== false;
-    // Tope de salidas en efectivo del turno (50% de la base de apertura): el
-    // vale no puede dejar el acumulado del turno por encima del tope. Solo
-    // aplica al efectivo y solo cuando el vale queda ligado a un turno
-    // (migración 028); los digitales no tienen tope.
-    if (hasMethodColumns && method.code === "efectivo") {
-      const usedCashOut = await cashOutUsedInShift(openShift.id).catch((error) => {
-        throw toPayrollError(error);
-      });
-      const violation = cashOutLimitViolation({
-        methodCode: method.code,
-        openingBase: Number(openShift.opening_base),
-        cashOutUsed: usedCashOut,
+    // 003: only a voucher that leaves the drawer now (approved directly) moves
+    // money. It cannot leave this method's balance in the shift below 50% of
+    // its own opening base. A pending voucher is checked again on approval.
+    // Friendly pre-check; the database trigger is the authority.
+    if (hasMethodColumns && autoApproved) {
+      await assertCashMethodOutflow({
+        shiftId: openShift.id,
+        method,
         amount: voucherAmount,
+      }).catch((error) => {
+        throw payrollFromCash(error);
       });
-      if (violation) throw new PayrollError(violation.code, violation.message, 422);
     }
     const { data, error } = await db
       .from("voucher_requests")
@@ -4114,6 +4120,8 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
       .select(voucherSelect)
       .single();
     if (error || !data) {
+      const cashRule = cashMethodRuleError(error as { message?: string } | null);
+      if (cashRule) throw payrollFromCash(cashRule);
       // CL-5: carrera perdida contra el índice único parcial de la 044 (23505).
       // El lookup de arriba y este INSERT no son atómicos: si otro envío con la
       // MISMA marca para el MISMO empleado se confirmó en esa ventana, la
@@ -4275,32 +4283,20 @@ export async function approveVoucher(
         409,
       );
     }
-    // Tope del 50% de salidas en efectivo del turno: un vale puede nacer
-    // pendiente por debajo del límite y superarlo al aprobarse (el acumulado
-    // del turno creció). Se repite la validación de la solicitud con lo YA
-    // salido del turno (otros vales aprobados + pagos inmediatos) más este
-    // vale. Solo aplica al efectivo ligado a un turno (028); los digitales y
-    // los vales históricos sin turno no tienen tope.
-    if (voucher.method_code === "efectivo" && voucher.cash_shift_id) {
-      const { data: shift, error: shiftError } = await db
-        .from("cash_shifts")
-        .select("id, opening_base")
-        .eq("id", voucher.cash_shift_id)
-        .maybeSingle();
-      if (shiftError) throw new PayrollError("INTERNAL", "Error interno.", 500);
-      if (shift) {
-        const cashOutUsed = await cashOutUsedInShift(voucher.cash_shift_id).catch((error) => {
-          throw toPayrollError(error);
-        });
-        const violation = voucherApprovalCashOutViolation({
-          methodCode: voucher.method_code,
-          cashShiftId: voucher.cash_shift_id,
-          openingBase: Number((shift as { opening_base: number | string }).opening_base),
-          cashOutUsed,
-          amount: Number(voucher.amount),
-        });
-        if (violation) throw new PayrollError(violation.code, violation.message, 422);
-      }
+    // 003: approving is when the money leaves the drawer. The balance may have
+    // changed since the request (sales replenish it, other outflows drain it),
+    // so the method's own 50% floor is checked again here. Vouchers without a
+    // shift or method (historical rows) do not touch the drawer.
+    if (voucher.method_code && voucher.cash_shift_id) {
+      const method = (await listPaymentMethods()).find((row) => row.code === voucher.method_code);
+      if (!method) throw new PayrollError("METHOD_NOT_ARCHIVABLE", "El método del vale ya no existe.", 422);
+      await assertCashMethodOutflow({
+        shiftId: voucher.cash_shift_id,
+        method,
+        amount: Number(voucher.amount),
+      }).catch((error) => {
+        throw payrollFromCash(error);
+      });
     }
     const observation = parsed.data.observation?.trim()
       ? parsed.data.observation.trim()
@@ -4362,6 +4358,8 @@ export async function approveVoucher(
       .select(await resolveVoucherSelect(db))
       .single();
     if (error || !data) {
+      const cashRule = cashMethodRuleError(error as { message?: string } | null);
+      if (cashRule) throw payrollFromCash(cashRule);
       // Carrera perdida contra la guarda de estado (PGRST116 = `.single()` sin
       // filas, el patrón del cliente Supabase: el mismo que usan el cierre de
       // caja —SHIFT_ALREADY_CLOSED— y la anulación de factura —ANNUL_CONFLICT—).

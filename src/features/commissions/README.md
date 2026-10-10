@@ -41,14 +41,16 @@ anulada), y `payCommissionNow` la vuelve a exigir antes de insertar el pago.
   exige que la factura esté `Pagada` y devuelve `earned` y, separado,
   `immediateEarned` con solo el origen comisión por ítem), `immediatePaidTotal`,
   `payCommissionNow` (exige factura `Pagada`, turno abierto, método activo,
-  empleado distinto de `no_aplica`, tope `ganado − pagado` y el tope de salida
-  en efectivo del turno; relee el estado de la factura antes de insertar) y
+  empleado distinto de `no_aplica`, tope `ganado − pagado` y que el método
+  arqueable conserve en el turno al menos el 50 % de su propia base —regla de
+  saldo de 003, ver `cash/README.md`—; relee el estado de la factura antes de
+  insertar) y
   `listCommissionPayouts`. Errores
   tipados con `CommissionError` (`NO_OPEN_SHIFT`, `NOTHING_EARNED`,
   `NOTHING_PENDING`, `COMMISSION_OVERPAID`, `METHOD_INACTIVE`,
   `COMMISSION_NOT_APPLICABLE`, `INVOICE_NOT_PAID`, `INVOICE_ANNULLED`, …). Reutiliza
   `requireSession`/`requireAdminSession` (admin), `requireCashWriter`,
-  `getOpenShift`/`cashOutUsedInShift` + `cashOutLimitViolation` (caja),
+  `getOpenShift`/`assertCashMethodOutflow` (caja),
   `listPaymentMethods` (admin) y `writeAudit` (auditoría).
 - Cálculo puro (`schemas.ts`): `commissionRuleSchema` (exige % o fijo,
   porcentaje 0–100), `commissionPayoutSchema` (monto > 0), `commissionRuleKey`,

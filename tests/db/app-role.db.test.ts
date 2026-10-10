@@ -2,7 +2,7 @@
  * supabase/bootstrap/app-role.sql on the clean-PostgreSQL install path:
  * platform-roles.sql → 001 → 002 → (catalog) → app-role.sql.
  *
- * Proves that `orabella_app` reads all 36 tables of `public`, writes them, runs
+ * Proves that `orabella_app` reads every public table, writes them, runs
  * the RPCs through its membership in service_role, bypasses RLS, and that the
  * file is idempotent.
  */
@@ -11,6 +11,8 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { DB_HOOK_TIMEOUT, REPO_ROOT, applyFile, closeDb, freshDb, one, rpc, warmTemplate, type Db } from "./harness";
 
 const APP_ROLE_PATH = join(REPO_ROOT, "supabase", "bootstrap", "app-role.sql");
+/** 36 tables from 001 + cash_shift_method_balances from 003. */
+const TABLES = 37;
 
 let db: Db;
 
@@ -63,13 +65,13 @@ describe("app-role.sql on a clean PostgreSQL", () => {
       no_password: true,
       in_service_role: true,
       memberships: 1,
-      table_grants: 36 * 4,
+      table_grants: TABLES * 4,
     });
   });
 
-  it("reads every one of the 36 public tables as orabella_app", async () => {
+  it("reads every public table as orabella_app", async () => {
     const tables = await publicTables();
-    expect(tables).toHaveLength(36);
+    expect(tables).toHaveLength(TABLES);
     const readable = await asApp(async () => {
       const ok: string[] = [];
       for (const table of tables) {
@@ -140,7 +142,7 @@ describe("app-role.sql Supabase guard", () => {
     );
     expect(rows).toEqual([]);
     await applyFile(db, APP_ROLE_PATH);
-    expect(await footprint()).toEqual({ role: 1, grants: 36 * 4 });
+    expect(await footprint()).toEqual({ role: 1, grants: TABLES * 4 });
   });
 
   it.each(["supabase_admin", "supabase_auth_admin", "supabase_storage_admin"])(
@@ -168,6 +170,6 @@ describe("app-role.sql Supabase guard", () => {
   it("the auth schema alone is not a Supabase signal", async () => {
     await db.exec(`CREATE SCHEMA auth; CREATE TABLE auth.users (id uuid);`);
     await applyFile(db, APP_ROLE_PATH);
-    expect(await footprint()).toEqual({ role: 1, grants: 36 * 4 });
+    expect(await footprint()).toEqual({ role: 1, grants: TABLES * 4 });
   });
 });

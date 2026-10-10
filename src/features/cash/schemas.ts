@@ -11,32 +11,40 @@ export interface MethodDifference {
   difference: number;
 }
 
-/**
- * CAJ-03/04: total digital esperado al cierre = saldo de apertura del turno
- * más lo cobrado en el turno menos lo pagado inmediato (el "total en la
- * aplicación"). Puro para probarlo sin base de datos.
- */
+/** Expected balance of one arqueable payment method in one shift. */
+export function expectedMethodBalance(openingBase: number, collected: number, paidOut = 0): number {
+  return roundMoney(roundMoney(openingBase) + roundMoney(collected) - roundMoney(paidOut));
+}
+
+/** Legacy name retained for callers that render declared-total methods. */
 export function expectedDigitalTotal(openAmount: number, paidAmount: number, paidOut = 0): number {
-  return roundMoney(roundMoney(openAmount) + roundMoney(paidAmount) - roundMoney(paidOut));
+  return expectedMethodBalance(openAmount, paidAmount, paidOut);
 }
 
 /** Vale tal como lo lee el arqueo para descontarlo de la caja. */
 export interface VoucherCashOutInput {
   /** Quién autorizó: null = nunca aprobado (pendiente/rechazada). */
   approved_by: string | null;
+  /** Estado actual; ausente en lecturas históricas sin la columna. */
+  status?: string;
   /** Método arqueable por el que salió el dinero; null = histórico sin método. */
   method_code: string | null;
   amount: number | string;
 }
 
+/** 003: states in which an approved voucher's cash has left the drawer. */
+export const VOUCHER_CASH_OUT_STATUSES = ["aprobada", "descontada"] as const;
+
 /**
- * Regla de dinero del vale: un vale SOLO toca caja cuando fue aprobado
- * (approved_by no nulo) y tiene método arqueable. Un vale pendiente o
- * rechazado NUNCA afecta el arqueo; uno aprobado sí, aunque después pase a
- * descontada en nómina (el efectivo ya salió del cajón). Puro para probarlo.
+ * The one definition of a voucher that affects cash (mirrors SQL
+ * `voucher_is_cash_out`): approved (`approved_by` set), with a method, and in
+ * `aprobada` or `descontada` (payroll discounts it later; the cash already
+ * left). `pendiente` and `rechazada` NEVER count. Leaving the cash-out state is
+ * rejected by the database (`VOUCHER_CASH_OUT_IMMUTABLE`). Pure.
  */
 export function isVoucherCashOut(row: VoucherCashOutInput): boolean {
-  return row.approved_by !== null && row.method_code !== null;
+  if (row.approved_by === null || row.method_code === null) return false;
+  return row.status === undefined || (VOUCHER_CASH_OUT_STATUSES as readonly string[]).includes(row.status);
 }
 
 /**
@@ -83,48 +91,38 @@ export function sumMethodTotal(map: Map<string, number> | null | undefined): num
   return roundMoney(total);
 }
 
-/**
- * Regla de negocio del efectivo del turno: las salidas en efectivo (vales
- * aprobados + comisiones pagadas inmediatas) no pueden superar el 50% de la
- * base de apertura. El otro 50% permanece físicamente en el cajón para dar
- * vueltos y nuevos vales. El tope es INCLUSIVO: el acumulado puede llegar
- * exactamente al límite; solo superarlo lo rechaza. Puro para probarlo sin
- * base de datos.
- */
+/** A method must retain this fraction of its own frozen opening base. */
 export const CASH_OUT_LIMIT_RATIO = 0.5;
-
-/** Código de negocio cuando una salida en efectivo supera el tope del turno. */
-export const CASH_OUT_LIMIT_CODE = "CASH_OUT_LIMIT_EXCEEDED";
+export const CASH_OUT_LIMIT_CODE = "CASH_METHOD_MINIMUM_BREACH";
 
 export interface CashOutLimitState {
-  /** Base de apertura del turno. */
   base: number;
-  /** Tope de salidas en efectivo: roundMoney(base * 0.5). */
-  limit: number;
-  /** Salidas en efectivo ya acumuladas en el turno. */
-  used: number;
-  /** Disponible para nuevas salidas en efectivo (nunca negativo). */
+  minimum: number;
+  expected: number;
   available: number;
 }
 
-/** Estado del tope de salidas en efectivo para una base y un acumulado dados. */
-export function cashOutLimitState(openingBase: number, cashOutUsed: number): CashOutLimitState {
+/** The available outflow is expected balance minus the method's minimum. */
+export function cashOutLimitState(openingBase: number, expectedBalance: number): CashOutLimitState {
   const base = roundMoney(openingBase);
-  const limit = roundMoney(base * CASH_OUT_LIMIT_RATIO);
-  const used = roundMoney(cashOutUsed);
-  return { base, limit, used, available: roundMoney(Math.max(0, limit - used)) };
+  const minimum = roundMoney(base * CASH_OUT_LIMIT_RATIO);
+  const expected = roundMoney(expectedBalance);
+  return { base, minimum, expected, available: roundMoney(Math.max(0, expected - minimum)) };
 }
 
-/**
- * true cuando pagar `amount` en efectivo deja el acumulado del turno por
- * encima del tope. Al ser INCLUSIVO, un proyectado exactamente igual al
- * límite se permite; solo el exceso de al menos un centavo se rechaza. La
- * resta se redondea a centavos para no fallar por representación flotante
- * (100000.01 − 100000 = 0.00999…). Puro.
- */
+/** Admin-only cash view projection; no customer invoice consumes this data. */
+export function methodAvailability(row: { method_code: string; opening_base: number; expected: number }): {
+  method_code: string;
+  minimum: number;
+  expected: number;
+  available: number;
+} {
+  const state = cashOutLimitState(row.opening_base, row.expected);
+  return { method_code: row.method_code, minimum: state.minimum, expected: state.expected, available: state.available };
+}
+
 export function exceedsCashOutLimit(state: CashOutLimitState, amount: number): boolean {
-  const projected = roundMoney(state.used + roundMoney(amount));
-  return roundMoney(projected - state.limit) > 0;
+  return roundMoney(roundMoney(amount) - state.available) > 0;
 }
 
 export interface CashOutLimitViolation {
@@ -133,26 +131,20 @@ export interface CashOutLimitViolation {
 }
 
 /**
- * Valida una salida en efectivo contra el tope del turno. Devuelve null si el
- * monto cabe (acumulado dentro del tope) y el detalle del rechazo si lo
- * supera. Solo rige para `efectivo`: los métodos digitales no tienen tope.
- * Puro para probarlo sin base de datos.
+ * Friendly pre-validation of the database authority. It is intentionally about
+ * a method balance, not its code: sales replenish the available amount.
  */
 export function cashOutLimitViolation(args: {
   methodCode: string;
   openingBase: number;
-  cashOutUsed: number;
+  expectedBalance: number;
   amount: number;
 }): CashOutLimitViolation | null {
-  if (args.methodCode !== "efectivo") return null;
-  const state = cashOutLimitState(args.openingBase, args.cashOutUsed);
+  const state = cashOutLimitState(args.openingBase, args.expectedBalance);
   if (!exceedsCashOutLimit(state, args.amount)) return null;
-  const amount = roundMoney(args.amount);
   return {
     code: CASH_OUT_LIMIT_CODE,
-    message:
-      `No se puede pagar ${amount} en efectivo: supera el máximo del 50% de la base ` +
-      `del turno (${state.base}). Quedan ${state.available} disponibles para salidas en efectivo.`,
+    message: `No se puede pagar ${roundMoney(args.amount)} por ${args.methodCode}: dejaría menos del mínimo de ${state.minimum} para este turno.`,
   };
 }
 
@@ -163,6 +155,19 @@ export interface ShiftCountMaps {
   paidOut?: Map<string, number>;
   /** Null cuando el turno sigue abierto (aún no hay conteo de cierre). */
   closed: Map<string, number> | null;
+  /** Methods whose count is by denominations (excluded from declared totals). */
+  denominationCodes?: ReadonlySet<string>;
+}
+
+/**
+ * Historical views without the method catalog at hand: before 003 the only
+ * denomination-counted method was the cash code.
+ */
+const DEFAULT_DENOMINATION_CODES: ReadonlySet<string> = new Set(["efectivo"]);
+
+/** The physical drawer is configured by mode, never by a magic payment code. */
+export function drawerMethodCode(methods: Array<{ code: string; arqueo_mode?: string; is_active: boolean }>): string | null {
+  return methods.find((method) => method.is_active && method.arqueo_mode === "denominations")?.code ?? null;
 }
 
 /**
@@ -180,13 +185,14 @@ export function buildMethodViews(maps: ShiftCountMaps): {
     amount: roundMoney(amount),
   }));
   const source = maps.closed ?? maps.open;
+  const denominationCodes = maps.denominationCodes ?? DEFAULT_DENOMINATION_CODES;
   const declarados = [...source.entries()]
-    .filter(([method_code]) => method_code !== "efectivo")
+    .filter(([method_code]) => !denominationCodes.has(method_code))
     .map(([method_code, amount]) => ({ method_code, amount: roundMoney(amount) }));
   const diferencias: MethodDifference[] = [];
   if (maps.closed) {
     const codes = new Set([...maps.closed.keys(), ...maps.open.keys(), ...maps.paid.keys(), ...(maps.paidOut?.keys() ?? [])]);
-    codes.delete("efectivo");
+    for (const code of denominationCodes) codes.delete(code);
     for (const code of codes) {
       const expected = expectedDigitalTotal(
         maps.open.get(code) ?? 0,

@@ -18,6 +18,7 @@ import {
   computeCashClose,
   dayBounds,
   dayViewSchema,
+  drawerMethodCode,
   exceedsCashOutLimit,
   expectedDigitalTotal,
   governingClose,
@@ -559,114 +560,78 @@ describe("cash: total de vales por turno (columna Vales)", () => {
 
 // --------------------------------- tope de salidas en efectivo (50% base) ---
 
-describe("cash: tope de salidas en efectivo = 50% de la base del turno", () => {
-  const base = 200000; // tope 100000
+describe("cash: one definition of a voucher that affects cash (003)", () => {
+  it("only approved vouchers in aprobada/descontada with a method count; pending and rejected never do", () => {
+    const base = { approved_by: "u1", method_code: "efectivo", amount: 10000 };
+    expect(isVoucherCashOut({ ...base, status: "aprobada" })).toBe(true);
+    expect(isVoucherCashOut({ ...base, status: "descontada" })).toBe(true);
+    expect(isVoucherCashOut({ ...base, status: "rechazada" })).toBe(false);
+    expect(isVoucherCashOut({ ...base, status: "pendiente" })).toBe(false);
+    expect(isVoucherCashOut({ ...base, approved_by: null, status: "pendiente" })).toBe(false);
+  });
+});
 
-  it("calcula el tope como la mitad de la base de apertura", () => {
+describe("cash: the drawer is the method configured by denominations, not the cash code (003)", () => {
+  const method = (code: string, arqueo_mode: string, is_active = true) => ({ code, arqueo_mode, is_active });
+
+  it("finds the active denomination method whatever its code", () => {
+    expect(drawerMethodCode([method("nequi", "declared_total"), method("caja-billetes", "denominations")])).toBe("caja-billetes");
+    expect(drawerMethodCode([method("efectivo", "declared_total")])).toBeNull();
+    expect(drawerMethodCode([method("efectivo", "denominations", false)])).toBeNull();
+  });
+
+  it("the method views treat the configured denomination method as the drawer", () => {
+    const views = buildMethodViews({
+      paid: new Map([["caja-billetes", 10000], ["efectivo", 5000]]),
+      open: new Map([["caja-billetes", 200000], ["efectivo", 0]]),
+      closed: new Map([["caja-billetes", 210000], ["efectivo", 0]]),
+      denominationCodes: new Set(["caja-billetes"]),
+    });
+    expect(views.declarados.map((row) => row.method_code)).toEqual(["efectivo"]);
+    // `efectivo` is now a declared-total method: 0 declared vs 5000 expected.
+    expect(views.diferencias.map((row) => row.method_code)).toEqual(["efectivo"]);
+  });
+});
+
+describe("cash: each arqueable method keeps 50% of its own opening base (003)", () => {
+  const base = 200000; // floor 100000
+
+  it("available = expected balance − 50% of the method's opening base", () => {
     expect(CASH_OUT_LIMIT_RATIO).toBe(0.5);
-    expect(cashOutLimitState(base, 0)).toEqual({
+    expect(cashOutLimitState(base, 200000)).toEqual({
       base: 200000,
-      limit: 100000,
-      used: 0,
+      minimum: 100000,
+      expected: 200000,
       available: 100000,
     });
-    // El disponible nunca queda negativo aunque el acumulado supere el tope.
-    expect(cashOutLimitState(base, 120000).available).toBe(0);
+    // Never negative even if the balance is already below the floor.
+    expect(cashOutLimitState(base, 80000).available).toBe(0);
   });
 
-  it("un vale en efectivo por debajo del tope se permite", () => {
-    const state = cashOutLimitState(base, 40000);
-    expect(exceedsCashOutLimit(state, 30000)).toBe(false);
-    expect(
-      cashOutLimitViolation({
-        methodCode: "efectivo",
-        openingBase: base,
-        cashOutUsed: 40000,
-        amount: 30000,
-      }),
-    ).toBeNull();
-  });
-
-  it("un vale en efectivo exactamente en el 50% se permite (tope inclusivo)", () => {
-    const state = cashOutLimitState(base, 0);
-    expect(exceedsCashOutLimit(state, 100000)).toBe(false);
-    expect(
-      cashOutLimitViolation({
-        methodCode: "efectivo",
-        openingBase: base,
-        cashOutUsed: 0,
-        amount: 100000,
-      }),
-    ).toBeNull();
-    // Acumulado 60000 + 40000 = 100000 = tope: también se permite.
-    expect(
-      cashOutLimitViolation({
-        methodCode: "efectivo",
-        openingBase: base,
-        cashOutUsed: 60000,
-        amount: 40000,
-      }),
-    ).toBeNull();
-    // Un PESO por encima ya se rechaza (CAMBIÓ: antes era un centavo). Un
-    // monto con centavos no existe como dinero: se normaliza al peso.
-    expect(exceedsCashOutLimit(cashOutLimitState(base, 60000), 40000.01)).toBe(false);
-    expect(exceedsCashOutLimit(cashOutLimitState(base, 60000), 40001)).toBe(true);
-  });
-
-  it("un vale en efectivo que supera el tope se rechaza con el código de negocio", () => {
-    const violation = cashOutLimitViolation({
-      methodCode: "efectivo",
-      openingBase: base,
-      cashOutUsed: 0,
-      amount: 150000,
-    });
-    expect(violation).not.toBeNull();
+  it("an outflow that leaves exactly the floor is allowed; one peso more is rejected", () => {
+    expect(cashOutLimitViolation({ methodCode: "efectivo", openingBase: base, expectedBalance: 200000, amount: 100000 })).toBeNull();
+    const violation = cashOutLimitViolation({ methodCode: "efectivo", openingBase: base, expectedBalance: 200000, amount: 100001 });
     expect(violation?.code).toBe(CASH_OUT_LIMIT_CODE);
-    expect(violation?.code).toBe("CASH_OUT_LIMIT_EXCEEDED");
-    expect(violation?.message).toContain("150000");
-    expect(violation?.message).toContain("200000");
+    expect(violation?.code).toBe("CASH_METHOD_MINIMUM_BREACH");
+  });
+
+  it("it is a balance rule, not a cumulative cap: sales replenish what is available", () => {
+    // 100000 already paid out, then 60000 collected: balance 160000 → 60000 available.
+    expect(cashOutLimitViolation({ methodCode: "efectivo", openingBase: base, expectedBalance: 160000, amount: 60000 })).toBeNull();
+    expect(exceedsCashOutLimit(cashOutLimitState(base, 160000), 60001)).toBe(true);
+  });
+
+  it("applies to every arqueable method by its own base, not to the cash code only", () => {
+    expect(cashOutLimitViolation({ methodCode: "nequi", openingBase: 50000, expectedBalance: 50000, amount: 25001 })?.code)
+      .toBe(CASH_OUT_LIMIT_CODE);
+    expect(cashOutLimitViolation({ methodCode: "billetera-qr", openingBase: 0, expectedBalance: 30000, amount: 30000 })).toBeNull();
+  });
+
+  it("the message speaks of the minimum, without internal formulas", () => {
+    const violation = cashOutLimitViolation({ methodCode: "efectivo", openingBase: base, expectedBalance: 150000, amount: 70000 });
+    expect(violation?.message).toContain("70000");
     expect(violation?.message).toContain("100000");
-  });
-
-  it("el tope rige sobre el acumulado: 40000 ya salidos + 70000 nuevo lo supera", () => {
-    // Tope 100000; 40000 + 70000 = 110000 > 100000 → rechazado.
-    const violation = cashOutLimitViolation({
-      methodCode: "efectivo",
-      openingBase: base,
-      cashOutUsed: 40000,
-      amount: 70000,
-    });
-    expect(violation?.code).toBe(CASH_OUT_LIMIT_CODE);
-    // El disponible reportado es el real: 100000 − 40000 = 60000.
-    expect(violation?.message).toContain("60000");
-  });
-
-  it("las salidas por método digital se permiten aunque superen el 50%", () => {
-    expect(
-      cashOutLimitViolation({
-        methodCode: "nequi",
-        openingBase: base,
-        cashOutUsed: 0,
-        amount: 999999,
-      }),
-    ).toBeNull();
-    expect(
-      cashOutLimitViolation({
-        methodCode: "tarjeta",
-        openingBase: base,
-        cashOutUsed: 90000,
-        amount: 50000,
-      }),
-    ).toBeNull();
-    // El mismo monto en efectivo sí se rechaza.
-    expect(
-      cashOutLimitViolation({
-        methodCode: "efectivo",
-        openingBase: base,
-        cashOutUsed: 90000,
-        amount: 50000,
-      })?.code,
-    ).toBe(CASH_OUT_LIMIT_CODE);
+    expect(violation?.message).not.toMatch(/50%|opening|expected/i);
   });
 });
 
@@ -2657,6 +2622,7 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
       name: "Efectivo",
       is_active: true,
       arqueable: true,
+      arqueo_mode: "denominations",
       fee_percent: 0,
     },
   ] as Awaited<ReturnType<typeof actual.listPaymentMethods>>;

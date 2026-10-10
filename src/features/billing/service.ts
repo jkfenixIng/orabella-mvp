@@ -994,6 +994,20 @@ function toRpcEditError(error: { code?: unknown; message?: unknown } | null): Bi
   if (message.includes("INSUFFICIENT_STOCK")) {
     return new BillingError("INSUFFICIENT_STOCK", "Stock insuficiente para el ajuste.", 409);
   }
+  if (message.includes("CASH_METHOD_BALANCE_UPDATE_BREACH")) {
+    return new BillingError(
+      "CASH_METHOD_BALANCE_UPDATE_BREACH",
+      "No se puede cambiar el método del cobro: dejaría una caja por debajo del mínimo del turno.",
+      422,
+    );
+  }
+  if (message.includes("CASH_METHOD_BALANCE_REQUIRED")) {
+    return new BillingError(
+      "CASH_METHOD_BALANCE_REQUIRED",
+      "Cierre y abra de nuevo el turno para usar arqueo por método.",
+      409,
+    );
+  }
   if (message.includes("PRODUCT_NOT_FOUND")) {
     return new BillingError("NOT_FOUND", "Producto no encontrado.", 404);
   }

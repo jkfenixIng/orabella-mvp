@@ -25,7 +25,7 @@ describe("cash_open_shift_atomic", () => {
       [shift],
     );
     expect(row).toEqual({ status: "abierto", expected_cash: "0.00" });
-    expect(await count(db, `SELECT 1 FROM public.cash_shift_counts WHERE shift_id = $1 AND phase = 'apertura'`, [shift])).toBe(2);
+    expect(await count(db, `SELECT 1 FROM public.cash_shift_counts WHERE shift_id = $1 AND phase = 'apertura'`, [shift])).toBe(6);
 
     const error = await pgError(openShift(db, register, user));
     expect(error.message).toBe("SHIFT_ALREADY_OPEN");
@@ -57,7 +57,7 @@ describe("cash_close_shift_atomic", () => {
     const shift = await openShift(db, register, user);
     const closed = await closeShiftCall(db, { shift, user, counted: 250000 });
     expect(closed).toMatchObject({ status: "cerrado", counted_cash: 250000, base_left: 200000, cash_withdrawn: 50000, closed_by: user });
-    expect(await count(db, `SELECT 1 FROM public.cash_shift_counts WHERE shift_id = $1 AND phase = 'cierre'`, [shift])).toBe(2);
+    expect(await count(db, `SELECT 1 FROM public.cash_shift_counts WHERE shift_id = $1 AND phase = 'cierre'`, [shift])).toBe(6);
   });
 
   it("rejects with ARQUEO_STALE when a collection source changed after the read, writing nothing", async () => {
@@ -143,7 +143,7 @@ describe("cash_recount_shift_atomic", () => {
     await closeShiftCall(db, { shift, user });
     const written = await recount(shift);
     expect(written).toMatchObject({ shift_id: shift, counted_cash: 210000, previous_counted_cash: 200000, reason: "Billete mal contado" });
-    expect(await count(db, `SELECT 1 FROM public.cash_shift_counts WHERE shift_id = $1 AND phase = 'reconteo'`, [shift])).toBe(2);
+    expect(await count(db, `SELECT 1 FROM public.cash_shift_counts WHERE shift_id = $1 AND phase = 'reconteo'`, [shift])).toBe(6);
     const closed = await one<{ counted_cash: string }>(db, `SELECT counted_cash::text FROM public.cash_shifts WHERE id = $1`, [shift]);
     expect(closed.counted_cash).toBe("200000.00");
 

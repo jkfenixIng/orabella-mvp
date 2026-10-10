@@ -26,7 +26,7 @@ import { join, resolve } from "node:path";
 // import, so the harness is loaded by URL and typed through `typeof import`.
 type Harness = typeof import("../tests/db/harness");
 const harnessUrl = new URL("../tests/db/harness.ts", import.meta.url).href;
-const { buildSchemaDb, MIGRATION_PATHS } = (await import(harnessUrl)) as Harness;
+const { buildSchemaDb, MIGRATION_PATHS, PORTABLE_PATH, SCHEMA_PATH, applyFile } = (await import(harnessUrl)) as Harness;
 type Db = Awaited<ReturnType<Harness["buildSchemaDb"]>>;
 
 const dir = resolve(process.argv[2] ?? "");
@@ -37,6 +37,52 @@ if (!process.argv[2] || REQUIRED.some((file) => !existsSync(join(dir, file)))) {
 }
 
 const read = (file: string): string => readFileSync(join(dir, file), "utf8");
+
+/**
+ * Catalog objects that exist in the repo because of 003 and not yet in the
+ * production backup. They are EXPECTED differences, listed one by one: anything
+ * outside this list (or missing from production) is still a failure. The
+ * dropped `payment_methods_code_check` is the one object production has and
+ * the repo intentionally no longer has.
+ */
+const EXPECTED_003 = {
+  tables: new Set(["cash_shift_method_balances"]),
+  onlyInRepo: new Set([
+    "function|cash_open_shift_atomic_legacy(p_register_id uuid, p_opened_by uuid, p_opening_base numeric, p_counts jsonb)",
+    "function|cash_recount_shift_atomic_legacy(p_shift_id uuid, p_recounted_by uuid, p_recount jsonb, p_counts jsonb)",
+    "function|cash_shift_method_expected_balance(p_shift_id uuid, p_method_code text)",
+    "function|voucher_is_cash_out(p_status text, p_approved_by uuid, p_method_code text, p_cash_shift_id uuid)",
+    "function|enforce_voucher_cash_out_state()",
+    "function|enforce_collection_move_minimum()",
+    "function|lock_invoice_edit_payment_balances(p_invoice_id uuid, p_edit jsonb)",
+    "function|invoice_edit_items_atomic_legacy(p_invoice_id uuid, p_user_id uuid, p_expected_version integer, p_expected_status text, p_edit jsonb)",
+    "function|invoice_edit_emitted_atomic_legacy(p_invoice_id uuid, p_user_id uuid, p_expected_version integer, p_expected_status text, p_edit jsonb)",
+    "trigger|voucher_requests.trg_voucher_requests_cash_out_state",
+    "trigger|invoice_payments.trg_invoice_payments_balance_guard",
+    "trigger|payments.trg_payments_balance_guard",
+    "function|enforce_cash_method_minimum(p_shift_id uuid, p_method_code text, p_amount numeric, p_old_amount numeric)",
+    "function|enforce_commission_cash_method_minimum()",
+    "function|enforce_voucher_cash_method_minimum()",
+    "function|payment_method_code_immutable()",
+    "trigger|payment_methods.trg_payment_methods_code_immutable",
+    "trigger|commission_payouts.trg_commission_payouts_balance_guard",
+    "trigger|voucher_requests.trg_voucher_requests_balance_guard",
+    "constraint|payment_methods.payment_methods_code_format_check|c",
+    "constraint|payment_methods.payment_methods_arqueo_mode_check|c",
+    "constraint|payment_methods.payment_methods_arqueo_coherent_check|c",
+    "constraint|cash_shift_method_balances.cash_shift_method_balances_pkey|p",
+    "constraint|cash_shift_method_balances.cash_shift_method_balances_opening_base_check|c",
+    "constraint|cash_shift_method_balances.cash_shift_method_balances_shift_method_key|u",
+    "constraint|cash_shift_method_balances.cash_shift_method_balances_shift_code_key|u",
+    "constraint|cash_shift_method_balances.cash_shift_method_balances_cash_shift_id_fkey|f",
+    "constraint|cash_shift_method_balances.cash_shift_method_balances_payment_method_id_fkey|f",
+    "index|cash_shift_method_balances.cash_shift_method_balances_pkey",
+    "index|cash_shift_method_balances.cash_shift_method_balances_shift_method_key",
+    "index|cash_shift_method_balances.cash_shift_method_balances_shift_code_key",
+    "index|payment_methods.uq_payment_methods_single_denominations",
+  ]),
+  onlyInProduction: new Set(["constraint|payment_methods.payment_methods_code_check|c"]),
+};
 const report: string[] = [];
 const log = (line = ""): void => {
   report.push(line);
@@ -66,9 +112,14 @@ for (const line of read("SHA256SUMS.txt").split("\n").filter(Boolean)) {
   else fail(`${file}: esperado ${expected}, calculado ${actual}`);
 }
 
-// 2. Schema from the repo (001 verbatim), without the catalog seed.
+// 2. The backup predates 003: build its compatible 001+002 shape first, load
+// its rows, then apply 003 as the migration backfill. That is the production
+// order; applying 003 before COPY would make the new NOT NULL column reject the
+// old dump. No backup input is modified.
 const started = Date.now();
-const db: Db = await buildSchemaDb({ catalog: false });
+const legacyMigrationPaths = [SCHEMA_PATH, PORTABLE_PATH];
+const laterMigrationPaths = MIGRATION_PATHS.filter((path) => !legacyMigrationPaths.includes(path));
+const db: Db = await buildSchemaDb({ catalog: false, migrations: legacyMigrationPaths });
 const version = (await db.query<{ v: string }>("SELECT version() AS v")).rows[0].v;
 log("");
 log("== 2. Esquema ==");
@@ -139,6 +190,25 @@ log("");
 log("== 3. Carga de datos ==");
 log(`  ${copies} bloques COPY cargados en una transaccion (triggers y FK diferidos como --disable-triggers)`);
 
+// 3b. Later migrations over the restored data, the way production applies them.
+for (const path of laterMigrationPaths) await applyFile(db, path);
+const methodModes = (
+  await db.query<{ code: string; arqueable: boolean; arqueo_mode: string }>(
+    `SELECT code, arqueable, arqueo_mode FROM public.payment_methods ORDER BY code`,
+  )
+).rows;
+log("");
+log("== 3b. Migraciones posteriores sobre los datos restaurados ==");
+log(`  aplicadas: ${laterMigrationPaths.map((path) => path.split(/[\\/]/).pop()).join(", ") || "(ninguna)"}`);
+for (const row of methodModes) log(`  backfill 003: ${row.code.padEnd(22)} arqueable=${row.arqueable} arqueo_mode=${row.arqueo_mode}`);
+const incoherent = methodModes.filter((row) => row.arqueable !== (row.arqueo_mode !== "none"));
+if (incoherent.length > 0) fail(`backfill 003 incoherente: ${incoherent.map((row) => row.code).join(", ")}`);
+const openShifts = (await db.query<{ n: number }>(`SELECT count(*)::int AS n FROM public.cash_shifts WHERE status = 'abierto'`)).rows[0].n;
+log(
+  `  turnos abiertos sin base por metodo: ${openShifts}. Regla segura de 003: sus comisiones y vales por metodos ` +
+    `arqueables se rechazan (CASH_METHOD_BALANCE_REQUIRED) hasta cerrarlos y abrir uno nuevo; no se reconstruyen.`,
+);
+
 // 4. Every foreign key holds on the restored data.
 log("");
 log("== 4. Integridad referencial ==");
@@ -190,6 +260,9 @@ for (const table of [...new Set([...expectedCounts.keys(), ...tables])].sort()) 
     : undefined;
   const label = `${table.padEnd(34)} prod=${String(expected ?? "-").padStart(4)} restaurado=${String(actual ?? "-").padStart(4)}`;
   if (expected !== undefined && expected === actual) log(`  OK    ${label}`);
+  // A table that only 003 creates: empty after the migration (no shift is
+  // reconstructed). Any row would be a failure.
+  else if (expected === undefined && EXPECTED_003.tables.has(table) && actual === 0) log(`  ESPERADA (003, aun no en produccion) ${label}`);
   else fail(label);
 }
 
@@ -244,8 +317,14 @@ for (const kind of ["function", "trigger", "constraint", "index", "policy"]) {
   const isKind = (line: string): boolean => line.startsWith(`${kind}|`);
   const prodOwn = new Set(prodLines.filter(isKind).filter((line) => !localExtension.has(line)));
   const localOwn = new Set([...localAll].filter(isKind).filter((line) => !localExtension.has(line)));
-  const missing = [...prodOwn].filter((line) => !localOwn.has(line)).sort();
-  const extra = [...localOwn].filter((line) => !prodOwn.has(line)).sort();
+  const missingAll = [...prodOwn].filter((line) => !localOwn.has(line)).sort();
+  const extraAll = [...localOwn].filter((line) => !prodOwn.has(line)).sort();
+  const expectedMissing = missingAll.filter((line) => EXPECTED_003.onlyInProduction.has(line));
+  const expectedExtra = extraAll.filter((line) => EXPECTED_003.onlyInRepo.has(line));
+  const missing = missingAll.filter((line) => !EXPECTED_003.onlyInProduction.has(line));
+  const extra = extraAll.filter((line) => !EXPECTED_003.onlyInRepo.has(line));
+  for (const line of expectedMissing) log(`        ESPERADA (003 la borra, produccion la conserva hasta aplicar 003): ${line}`);
+  for (const line of expectedExtra) log(`        ESPERADA (003, aun no en produccion): ${line}`);
   const prodTotal = prodLines.filter(isKind).length;
   const localTotal = [...localAll].filter(isKind).length;
   const summaryKey = kind === "index" ? "indexes" : kind === "policy" ? "policies" : `${kind}s`;
@@ -256,7 +335,7 @@ for (const kind of ["function", "trigger", "constraint", "index", "policy"]) {
   for (const line of extra) log(`        solo en el repo:    ${line}`);
   // Only when the own objects match exactly is the remaining gap made of
   // extension functions (the lines excluded on both sides): say so then, never otherwise.
-  if (kind === "function" && prodTotal !== localTotal && missing.length === 0 && extra.length === 0) {
+  if (kind === "function" && prodTotal !== localTotal && missing.length === 0 && extra.length === 0 && expectedExtra.length === 0) {
     log(
       `        nota: la diferencia de totales (${prodTotal} vs ${localTotal}) es solo de funciones de extension ` +
         `(prod ${prodTotal - prodOwn.size}, repo ${localTotal - localOwn.size}); las propias coinciden`,

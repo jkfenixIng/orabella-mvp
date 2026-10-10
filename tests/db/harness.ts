@@ -61,13 +61,15 @@ export async function applyFile(db: Db, path: string): Promise<void> {
 export interface BuildOptions {
   /** Apply supabase/seeds/catalog.sql after the schema (default true). */
   catalog?: boolean;
+  /** Only the migrations in this list, in order (default: all of them). */
+  migrations?: readonly string[];
 }
 
 /** Builds a new instance: bootstrap + every migration verbatim (+ catalog). */
 export async function buildSchemaDb(options: BuildOptions = {}): Promise<Db> {
   const db = await emptyDb();
   await applyFile(db, BOOTSTRAP_PATH);
-  for (const path of MIGRATION_PATHS) await applyFile(db, path);
+  for (const path of options.migrations ?? MIGRATION_PATHS) await applyFile(db, path);
   if (options.catalog ?? true) {
     await db.exec(readFileSync(CATALOG_PATH, "utf8"));
   }

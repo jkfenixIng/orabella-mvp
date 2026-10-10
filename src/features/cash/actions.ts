@@ -12,6 +12,7 @@ import {
   getDayView,
   getHistory,
   getOpenShiftWithOpener,
+  getShiftMethodBalances,
   listDenominations,
   listRegisters,
   openShift,
@@ -75,6 +76,17 @@ export async function closeShiftAction(id: string, input: unknown) {
       userId: session.userId,
       roles: session.roles,
     });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** 003: per-method minimum and availability of a shift. Admin only (internal). */
+export async function getShiftMethodBalancesAction(shiftId: string) {
+  try {
+    await requireAdminSession(await sessionToken());
+    const data = await getShiftMethodBalances(shiftId);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

@@ -715,21 +715,21 @@ que suman las 1958—:
    `[SQUASH_NAME, ...MIGRACIONES_POSTERIORES]`, numerados 001, 002, 003… sin
    huecos ni duplicados. Hasta la fase 2 de la extracción de Supabase la lista
    estaba vacía (001 era el único archivo); hoy tiene `002_portable_platform.sql`
-   (sección 9).
+   y `003_payment_method_arqueo.sql` (sección 9).
    > **AGREGAR UNA MIGRACIÓN NUEVA OBLIGA A ACTUALIZAR ESTA PRUEBA.** Un
    > `003_*.sql` que no entre a mano en `MIGRACIONES_POSTERIORES` la hace
    > **caer**. 001 ya está aplicado en producción y no se edita: la alternativa
    > a una migración nueva es volver a compactar, y esa decisión se toma a mano.
    > El número es una decisión, no un número que se actualiza solo.
 
-   Tres pruebas acompañan a la lista: **las migraciones posteriores no tocan
-   tablas, políticas, permisos, dueños ni RLS** —ni `CREATE [UNLOGGED|TEMP]
-   TABLE`, `CREATE`/`ALTER POLICY`, `GRANT`/`REVOKE`, `DROP`, `ALTER TABLE`,
-   `OWNER TO` o `ROW LEVEL SECURITY`— y van envueltas en `BEGIN; … COMMIT;` (los
-   conteos de abajo siguen leyendo solo 001, así que un objeto declarado o
-   alterado después quedaría fuera del inventario sin que nadie lo viera); el
-   **control negativo** de ese detector, con un fragmento por patrón que tiene
-   que marcar; y **002 deja `current_sede_id()` sin `auth.` y con la misma
+   `002` sigue bajo la prohibición total de tocar tablas, políticas, permisos,
+   dueños o RLS. `003` es la excepción explícita y mínima: el mismo guardián
+   lista por archivo, objeto y acción sus únicos `ALTER`, `CREATE TABLE`,
+   funciones, triggers, RLS y grants permitidos. Cualquier otro objeto o acción
+   falla, incluidos `ALTER` sobre otra columna, otro `GRANT`, otra tabla, `DROP`,
+   policy, dueño o DDL escondido dentro de un cuerpo `$$`; los fixtures negativos
+   lo demuestran. Las dos siguen envueltas en `BEGIN; … COMMIT;`. También se
+   verifica que **002 deja `current_sede_id()` sin `auth.` y con la misma
    cabecera que 001** (`LANGUAGE sql STABLE SECURITY DEFINER`, `SET search_path
    TO 'public'`).
 2. **36 `CREATE TABLE public.` y 10 `CREATE POLICY`.** Los conteos son de
@@ -1769,25 +1769,43 @@ incremental normal que producción puede recibir como cualquier migración.
 
 ### 9.3 Orden de arranque
 
-- **Supabase:** `001 → 002 → seeds`.
-- **PostgreSQL limpio:** `bootstrap/platform-roles.sql → 001 → 002 → seeds`.
+- **Supabase:** `001 → 002 → 003 → seeds`.
+
+### 003 — arqueo: orden global de locks
+
+`003_payment_method_arqueo.sql` conserva intacto el squash `001`, pero versiona
+las dos RPC públicas de edición de factura. El orden global para caja, cobros,
+comisiones, vales y factura es: `cash_shifts` (FOR SHARE, por id) →
+`cash_shift_method_balances` (FOR UPDATE, por turno+código) → `invoices` (FOR
+UPDATE) → productos (trigger de inventario, por id). Las wrappers públicas
+`invoice_edit_items_atomic` e `invoice_edit_emitted_atomic` mantienen firma,
+dueño y ACL de 001; bloquean los métodos de cobro que cambian y luego delegan en
+los cuerpos `_legacy`, que conservan la lógica de 001. Esto elimina el ciclo
+comisión (turno→balance→factura) frente a edición (antes factura→balance).
+PGlite comprueba la definición y el contrato de ACL; antes de producción debe
+correrse el caso de dos sesiones sobre PostgreSQL real.
+- **PostgreSQL limpio:** `bootstrap/platform-roles.sql → 001 → 002 → 003 → app-role.sql → seeds`.
 
 ### 9.4 Cómo se verifica
 
 - `tests/hardening.test.ts`, bloque del squash: lista explícita de migraciones
-  posteriores, orden estricto; las posteriores no pueden contener `CREATE
-  [UNLOGGED|TEMP] TABLE`, `CREATE`/`ALTER POLICY`, `GRANT`/`REVOKE`, `DROP`,
-  `ALTER TABLE`, `OWNER TO` ni `ROW LEVEL SECURITY` (con un control negativo que
-  demuestra que el detector marca cada patrón); y la cabecera de
+  posteriores y orden estricto; 002 sigue con prohibición total y 003 tiene una
+  allowlist explícita por archivo/objeto/acción, con fixtures negativos para
+  ALTER, GRANT, CREATE TABLE y DROP no autorizados. También verifica la
+  inmutabilidad byte a byte de 001 y 002 desde el commit base, y la cabecera de
   `current_sede_id()` en 001 y 002.
+- `tests/db/payment-method-arqueo.db.test.ts` (`npm run test:db`): 001+002+003,
+  backfill, código libre/inmutable, balance por método, borde del 50 %, ventas
+  que reponen el saldo, legado bloqueado y secuencia comisión+vale.
 - `tests/db/portable-platform.db.test.ts` (`npm run test:db`): instalación
   completa sin `auth`; `current_sede_id()` con y sin claims; la misma salida que
   el cuerpo de `001` bajo el `auth.jwt()` real de Supabase en 11 casos; `002`
   aplicado dos veces; ACL, propietario, atributos y políticas iguales antes y
   después; los 21 `GRANT` a `service_role`.
-- `npm run verify:backup -- <carpeta>`: aplica bootstrap + 001 + 002 y declara en
-  el reporte la única diferencia esperada con producción (el cuerpo de
-  `current_sede_id()`, hasta que producción tenga 002).
+- `npm run verify:backup -- <carpeta>`: restaura primero con 001+002 (forma del
+  backup), aplica 003 después para backfill y declara cada diferencia esperada de
+  003 por nombre; cualquier otra diferencia sigue fallando. También reporta los
+  turnos abiertos que quedan deliberadamente sin base por método.
 
 ### 9.5 Aplicar 002 en producción
 
@@ -1899,7 +1917,7 @@ rol con el que la app se conecta cuando `DB_ENGINE=postgres` (`DATABASE_URL`).
 
 Orden completo en PostgreSQL limpio:
 
-    bootstrap/platform-roles.sql → 001 → 002 → bootstrap/app-role.sql → seeds
+    bootstrap/platform-roles.sql → 001 → 002 → 003 → bootstrap/app-role.sql → seeds
 
 Reglas:
 
@@ -1919,7 +1937,8 @@ Reglas:
   un único `DO`: el aborto no deja nada a medias.
 
 Se verifica en `tests/db/app-role.db.test.ts` (`npm run test:db`): atributos del
-rol, lectura de las 36 tablas con `SET ROLE orabella_app`, exactamente los
+rol, lectura de las 37 tablas con `SET ROLE orabella_app` (36 de 001 + la base
+por método de 003), exactamente los
 cuatro privilegios por tabla (y `TRUNCATE` denegado), escritura a través de
 RLS, `EXECUTE` de `replace_user_roles` heredado de `service_role`, idempotencia
 y la guarda de Supabase (cada uno de los tres roles simulados aborta sin crear

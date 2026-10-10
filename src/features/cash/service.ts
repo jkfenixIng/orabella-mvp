@@ -5,10 +5,13 @@ import {
   assertShiftCloser,
   buildMethodViews,
   buildRecountRecord,
+  CASH_OUT_LIMIT_CODE,
+  cashOutLimitViolation,
   closeShiftSchema,
   computeCashClose,
   dayBounds,
   dayViewSchema,
+  drawerMethodCode,
   expectedDigitalTotal,
   governingClose,
   HISTORY_PAGE_SIZE,
@@ -22,6 +25,7 @@ import {
   resolveOpeningBase,
   roundMoney,
   moneyEquals,
+  methodAvailability,
   sumMethodMaps,
   sumMethodTotal,
   voucherOutByMethod,
@@ -292,7 +296,7 @@ export async function checkCounts(
   counts: ShiftCountInput[],
 ): Promise<Map<string, number>> {
   const methods = await listPaymentMethods();
-  const allowed = new Map(methods.filter((m) => m.is_active && m.arqueable).map((m) => [m.code, m]));
+  const allowed = new Map(methods.filter((m) => m.is_active && m.arqueo_mode !== "none").map((m) => [m.code, m]));
   const denominations = new Set((await listDenominations()).map((d) => Number(d.value)));
   const byMethod = new Map<string, ShiftCountInput[]>();
   for (const line of counts) {
@@ -300,15 +304,19 @@ export async function checkCounts(
     if (!method) {
       throw new CashError("VALIDATION", `Método no arqueable: ${line.method_code}.`, 400);
     }
-    if (line.method_code === "efectivo") {
+    // `arqueo_mode` exists after 003. The line-shape fallback only keeps the
+    // application compatible while an old response is cached; it never names a
+    // payment-method code.
+    const arqueoMode = method.arqueo_mode ?? (line.denomination == null ? "declared_total" : "denominations");
+    if (arqueoMode === "denominations") {
       if (line.denomination == null || !denominations.has(Number(line.denomination))) {
         throw new CashError("VALIDATION", "Denominación no configurada en la instalación.", 400);
       }
       if (!moneyEquals(line.amount, roundMoney(line.denomination * line.quantity))) {
-        throw new CashError("COUNT_MISMATCH", "El detalle del efectivo no cuadra con el total.", 422);
+        throw new CashError("COUNT_MISMATCH", "El detalle por denominación no cuadra con el total.", 422);
       }
     } else if (line.denomination != null || line.quantity !== 1) {
-      throw new CashError("VALIDATION", "Los métodos digitales se declaran con el total.", 400);
+      throw new CashError("VALIDATION", `${method.name} se declara con el total.`, 400);
     }
     const group = byMethod.get(line.method_code) ?? [];
     group.push(line);
@@ -541,6 +549,7 @@ async function fetchVoucherOutRows(
   const rows = await readAllSourceInChunks<{
     cash_shift_id: string;
     approved_by: string | null;
+    status: string;
     method_code: string | null;
     amount: number | string;
   }>({
@@ -550,7 +559,7 @@ async function fetchVoucherOutRows(
     fetchPage: (chunk, from, to) =>
       db
         .from("voucher_requests")
-        .select("cash_shift_id, approved_by, method_code, amount")
+        .select("cash_shift_id, approved_by, status, method_code, amount")
         .in("cash_shift_id", chunk)
         .order("id")
         .range(from, to),
@@ -558,7 +567,7 @@ async function fetchVoucherOutRows(
   const byShift = new Map<string, VoucherCashOutInput[]>();
   for (const row of rows) {
     const list = byShift.get(row.cash_shift_id) ?? [];
-    list.push({ approved_by: row.approved_by, method_code: row.method_code, amount: row.amount });
+    list.push({ approved_by: row.approved_by, status: row.status, method_code: row.method_code, amount: row.amount });
     byShift.set(row.cash_shift_id, list);
   }
   for (const [shiftId, rows] of byShift) {
@@ -592,15 +601,93 @@ async function fetchVoucherOutTotals(
  * Reutiliza exactamente la misma lógica del arqueo (fetchVoucherOutTotals +
  * fetchPayoutTotals), de modo que el tope y el cierre nunca divergen.
  */
-export async function cashOutUsedInShift(shiftId: string): Promise<number> {
+/** Stable error raised by the 003 triggers and by this pre-check. */
+export const CASH_METHOD_BALANCE_REQUIRED = "CASH_METHOD_BALANCE_REQUIRED";
+
+const BALANCE_REQUIRED_MESSAGE =
+  "Cierre y abra de nuevo el turno para usar arqueo por método.";
+
+/**
+ * Maps the 003 trigger errors (raised as P0001 with a stable message) to the
+ * business error. Returns null for any other error.
+ */
+export function cashMethodRuleError(error: { message?: string } | null | undefined): CashError | null {
+  const message = String(error?.message ?? "");
+  if (message.includes(CASH_OUT_LIMIT_CODE)) {
+    return new CashError(
+      CASH_OUT_LIMIT_CODE,
+      "La salida dejaría el método por debajo del mínimo que debe quedar en caja en este turno.",
+      422,
+    );
+  }
+  if (message.includes(CASH_METHOD_BALANCE_REQUIRED)) {
+    return new CashError(CASH_METHOD_BALANCE_REQUIRED, BALANCE_REQUIRED_MESSAGE, 409);
+  }
+  return null;
+}
+
+/**
+ * 003: friendly pre-check of an outflow (immediate commission or approved
+ * voucher) against the method's own balance in the shift. The database
+ * triggers are the authority and serialize concurrent outflows; this read only
+ * gives the operator the amount available before writing. Non-arqueable
+ * methods are not checked. A shift opened before 003 has no frozen base: it is
+ * rejected, never allowed uncontrolled.
+ */
+export async function assertCashMethodOutflow(args: {
+  shiftId: string;
+  method: { code: string; arqueo_mode: string };
+  amount: number;
+}): Promise<void> {
   const db = await cashDb();
-  const [voucherOutMaps, payoutMaps] = await Promise.all([
-    fetchVoucherOutTotals(db, [shiftId]),
-    fetchPayoutTotals(db, [shiftId]),
-  ]);
-  const voucherOut = voucherOutMaps.get(shiftId) ?? new Map<string, number>();
-  const payoutOut = payoutMaps.get(shiftId) ?? new Map<string, number>();
-  return roundMoney((voucherOut.get("efectivo") ?? 0) + (payoutOut.get("efectivo") ?? 0));
+  const { data: balance, error: balanceError } = await db
+    .from("cash_shift_method_balances")
+    .select("opening_base")
+    .eq("cash_shift_id", args.shiftId)
+    .eq("method_code", args.method.code)
+    .maybeSingle();
+  if (balanceError) throw new CashError("INTERNAL", "Error interno.", 500);
+  if (!balance) {
+    // A shift that froze no base for a method that is not arqueable today has
+    // no rule to apply. Any other missing base is a legacy shift: rejected.
+    if (args.method.arqueo_mode === "none") return;
+    throw new CashError(CASH_METHOD_BALANCE_REQUIRED, BALANCE_REQUIRED_MESSAGE, 409);
+  }
+  const { data: expected, error: expectedError } = await db.rpc("cash_shift_method_expected_balance", {
+    p_shift_id: args.shiftId,
+    p_method_code: args.method.code,
+  });
+  if (expectedError) throw cashMethodRuleError(expectedError) ?? new CashError("INTERNAL", "Error interno.", 500);
+  const violation = cashOutLimitViolation({
+    methodCode: args.method.code,
+    openingBase: Number((balance as { opening_base: number | string }).opening_base),
+    expectedBalance: Number(expected),
+    amount: args.amount,
+  });
+  if (violation) throw new CashError(violation.code, violation.message, 422);
+}
+
+/** Admin view of the frozen bases and the derived balances of one shift. */
+export async function getShiftMethodBalances(shiftId: string): Promise<
+  Array<{ method_code: string; minimum: number; expected: number; available: number }>
+> {
+  const db = await cashDb();
+  const { data, error } = await db
+    .from("cash_shift_method_balances")
+    .select("method_code, opening_base")
+    .eq("cash_shift_id", shiftId)
+    .order("method_code");
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  const result = [];
+  for (const row of (data ?? []) as Array<{ method_code: string; opening_base: number | string }>) {
+    const { data: expected, error: expectedError } = await db.rpc("cash_shift_method_expected_balance", {
+      p_shift_id: shiftId,
+      p_method_code: row.method_code,
+    });
+    if (expectedError) throw cashMethodRuleError(expectedError) ?? new CashError("INTERNAL", "Error interno.", 500);
+    result.push(methodAvailability({ method_code: row.method_code, opening_base: Number(row.opening_base), expected: Number(expected) }));
+  }
+  return result;
 }
 
 /** Fila mínima del ledger de dinero del turno (`payments` / `invoice_payments`). */
@@ -880,6 +967,23 @@ function signedAmounts(shift: CashShiftRow): CloseAmounts {
   };
 }
 
+/**
+ * 003: the arqueo configuration the cash flows read. `drawer` is the active
+ * method counted by denominations (the physical drawer whose total is
+ * `counted_cash` / `expected_cash`); the rest are declared totals.
+ */
+async function arqueoConfig(): Promise<{ drawer: string | null; denominationCodes: Set<string> }> {
+  const methods = await listPaymentMethods();
+  return {
+    drawer: drawerMethodCode(methods),
+    denominationCodes: new Set(methods.filter((m) => m.arqueo_mode === "denominations").map((m) => m.code)),
+  };
+}
+
+async function drawerCode(): Promise<string | null> {
+  return (await arqueoConfig()).drawer;
+}
+
 /** Totales del último cierre (por método) para validar la apertura. */
 async function previousCloseTotals(
   db: DbClient,
@@ -1069,15 +1173,17 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     // administrators (except on the very first open) while the shift opens
     // anyway so the business never stops.
     const declared = await checkCounts(input.counts);
+    // 003: the drawer is the method configured by denominations, not a code.
+    const drawer = await drawerCode();
     const isFirstOpen = prev === null;
     const mismatches: Array<{ method_code: string; expected: number; declared: number }> = [];
-    const cashDeclared = declared.get("efectivo") ?? 0;
-    if (!moneyEquals(cashDeclared, openingBase)) {
-      mismatches.push({ method_code: "efectivo", expected: openingBase, declared: cashDeclared });
+    const cashDeclared = drawer ? (declared.get(drawer) ?? 0) : 0;
+    if (drawer && !moneyEquals(cashDeclared, openingBase)) {
+      mismatches.push({ method_code: drawer, expected: openingBase, declared: cashDeclared });
     }
     if (prev?.hasCounts) {
       for (const [code, total] of declared) {
-        if (code === "efectivo") continue;
+        if (code === drawer) continue;
         const expected = prev.byMethod.get(code) ?? 0;
         if (!moneyEquals(total, expected)) {
           mismatches.push({ method_code: code, expected, declared: total });
@@ -1905,26 +2011,24 @@ export async function closeShift(
     // Facturas cobradas en este turno (emitidas aquí o en turnos anteriores):
     // ya suman al esperado y al arqueo por método en `paidByMethod`.
     const { total: invoicesTotal, count: invoicesCount } = invoiceCollectionsSummary(invoicePays);
-
+    const { drawer, denominationCodes } = await arqueoConfig();
     const expectedCash = roundMoney(
-      (paidByMethod.get("efectivo") ?? 0) - (paidOutByMethod.get("efectivo") ?? 0),
+      drawer ? (paidByMethod.get(drawer) ?? 0) - (paidOutByMethod.get(drawer) ?? 0) : 0,
     );
 
-    // El conteo de efectivo sale del detalle por denominación (el sistema
-    // calcula; el total declarado debe cuadrar con el detalle).
+    // The configured denomination method, if any, is the physical drawer.
     const declared = await checkCounts(input.counts);
-    const countedFromDetail = declared.get("efectivo") ?? 0;
-    if (!moneyEquals(countedFromDetail, input.counted_cash)) {
+    const countedFromDetail = drawer ? (declared.get(drawer) ?? 0) : 0;
+    if (drawer && !moneyEquals(countedFromDetail, input.counted_cash)) {
       throw new CashError("COUNT_MISMATCH", "El conteo no cuadra con el detalle por denominación.", 422);
     }
-    // Digitales: lo declarado contra el saldo de apertura del turno más
-    // lo cobrado en el turno menos lo pagado inmediato (el "total en la
-    // aplicación").
+    // Declared-total methods reconcile against their own opening base +
+    // collections - outflows. This never depends on a magic code.
     const countMaps = await fetchCountTotals(db, [shift.id]);
     const openByMethod = countMaps.get(shift.id)?.open ?? new Map<string, number>();
     const methodDifferences: MethodDifference[] = [];
     for (const [code, total] of declared) {
-      if (code === "efectivo") continue;
+      if (denominationCodes.has(code)) continue;
       const expected = expectedDigitalTotal(
         openByMethod.get(code) ?? 0,
         paidByMethod.get(code) ?? 0,
@@ -2141,8 +2245,9 @@ export async function recountClosedShift(
   // arqueables completos, efectivo por denominación). `checkCounts` devuelve el
   // total por método; el efectivo declarado debe cuadrar con su detalle.
   const declared = await checkCounts(parsed.data.counts);
-  const countedFromDetail = declared.get("efectivo") ?? 0;
-  if (!moneyEquals(countedFromDetail, parsed.data.counted_cash)) {
+  const drawer = await drawerCode();
+  const countedFromDetail = drawer ? (declared.get(drawer) ?? 0) : 0;
+  if (drawer && !moneyEquals(countedFromDetail, parsed.data.counted_cash)) {
     throw new CashError("COUNT_MISMATCH", "El reconteo no cuadra con el detalle por denominación.", 422);
   }
   const record = buildRecountRecord({
@@ -2354,6 +2459,7 @@ export async function getDayView(raw: unknown): Promise<DayView> {
   );
   const closedIds = rows.filter((row) => row.status === "cerrado").map((row) => row.id);
   const reviews = await getShiftReviews(closedIds);
+  const { denominationCodes } = await arqueoConfig();
   const payoutMaps = await fetchPayoutTotals(
     db,
     rows.map((row) => row.id),
@@ -2396,6 +2502,7 @@ export async function getDayView(raw: unknown): Promise<DayView> {
       paidOut: sumMethodMaps(payoutMaps.get(shift.id), voucherOutMaps.get(shift.id)),
       closed:
         shift.status === "cerrado" ? (recountRow ? counts.recount : counts.closed) : null,
+      denominationCodes,
     });
     const revision = assembleShiftRevision(
       reviews.get(shift.id) ?? [],
@@ -2405,7 +2512,7 @@ export async function getDayView(raw: unknown): Promise<DayView> {
       shift,
       ventas: roundMoney(list.reduce((acc, row) => acc + row.amount, 0)),
       efectivo: roundMoney(
-        list.filter((row) => row.method_code === "efectivo").reduce((acc, row) => acc + row.amount, 0),
+        list.filter((row) => denominationCodes.has(row.method_code)).reduce((acc, row) => acc + row.amount, 0),
       ),
       vales: sumMethodTotal(voucherOutMaps.get(shift.id)),
       metodos,
@@ -2516,6 +2623,7 @@ export async function getHistory(raw: unknown): Promise<HistoryResult> {
   );
   const historyClosedIds = rows.filter((row) => row.status === "cerrado").map((row) => row.id);
   const historyReviews = await getShiftReviews(historyClosedIds);
+  const { denominationCodes: historyDenominationCodes } = await arqueoConfig();
   const historyPayoutMaps = await fetchPayoutTotals(
     db,
     rows.map((row) => row.id),
@@ -2559,6 +2667,7 @@ export async function getHistory(raw: unknown): Promise<HistoryResult> {
         paidOut: sumMethodMaps(historyPayoutMaps.get(shift.id), historyVoucherOutMaps.get(shift.id)),
         closed:
           shift.status === "cerrado" ? (recountRow ? counts.recount : counts.closed) : null,
+        denominationCodes: historyDenominationCodes,
       });
       const revision = assembleShiftRevision(
         historyReviews.get(shift.id) ?? [],
@@ -2568,7 +2677,7 @@ export async function getHistory(raw: unknown): Promise<HistoryResult> {
         shift,
         ventas: roundMoney(list.reduce((acc, row) => acc + row.amount, 0)),
         efectivo: roundMoney(
-          list.filter((row) => row.method_code === "efectivo").reduce((acc, row) => acc + row.amount, 0),
+          list.filter((row) => historyDenominationCodes.has(row.method_code)).reduce((acc, row) => acc + row.amount, 0),
         ),
         vales: sumMethodTotal(historyVoucherOutMaps.get(shift.id)),
         metodos,

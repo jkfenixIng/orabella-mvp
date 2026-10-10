@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -606,6 +607,10 @@ describe("RLS en toda tabla creada por la serie (fix-076)", () => {
 const SQUASH_DIR = join(process.cwd(), "supabase", "migrations");
 const SQUASH_NAME = "001_orabella_schema.sql";
 const SQUASH_SQL = readFileSync(join(SQUASH_DIR, SQUASH_NAME), "utf8");
+// Git blob SHA-1 at the user's required base commit 13c477b. This is a strict
+// no-touch regression guard for the applied 001 and portable 002 migrations.
+const BASE_SHA_001 = "b00a917d4e3c5f6683dc2bcf9a092fe762a7acd5";
+const BASE_SHA_002 = "65e6a3ad89b3164545b5436ccb3e9f58ab61d485";
 
 /**
  * El volcado como ESQUEMA, sin prosa.
@@ -648,7 +653,156 @@ function tablasConColumnaSede(sql: string): string[] {
  * numerado nuevo, y entra en esta lista a mano, con su decisión escrita en
  * `supabase/squash/README.md` (5.3).
  */
-const MIGRACIONES_POSTERIORES = ["002_portable_platform.sql"] as const;
+const MIGRACIONES_POSTERIORES = ["002_portable_platform.sql", "003_payment_method_arqueo.sql"] as const;
+
+/**
+ * Top-level statements of a SQL file, comments removed. Splits on `;` only
+ * outside single-quoted literals and dollar-quoted bodies, so a `;` inside a
+ * COMMENT text or a function body never cuts a statement.
+ */
+function sqlStatements(sql: string): string[] {
+  const body = stripSqlComments(sql);
+  const statements: string[] = [];
+  let current = "";
+  let i = 0;
+  while (i < body.length) {
+    const ch = body[i];
+    if (ch === "$") {
+      // Own matcher: `matchDollarTag` anchors with `^`, which under the sticky
+      // flag only matches at offset 0.
+      const tag = /\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/y;
+      tag.lastIndex = i;
+      const found = tag.exec(body)?.[0] ?? null;
+      if (found !== null) {
+        const close = body.indexOf(found, i + found.length);
+        const end = close === -1 ? body.length : close + found.length;
+        current += body.slice(i, end);
+        i = end;
+        continue;
+      }
+    }
+    if (ch === "'") {
+      let end = i + 1;
+      while (end < body.length && !(body[end] === "'" && body[end + 1] !== "'")) end += body[end] === "'" ? 2 : 1;
+      current += body.slice(i, end + 1);
+      i = end + 1;
+      continue;
+    }
+    if (ch === ";") {
+      if (current.trim()) statements.push(current.trim().replace(/\s+/g, " "));
+      current = "";
+      i += 1;
+      continue;
+    }
+    current += ch;
+    i += 1;
+  }
+  if (current.trim()) statements.push(current.trim().replace(/\s+/g, " "));
+  return statements;
+}
+
+/** The objects 003 is authorized to touch, and nothing else. */
+const OBJ_003 = {
+  functions: "(?:payment_method_code_immutable|cash_open_shift_atomic|cash_open_shift_atomic_legacy|cash_recount_shift_atomic|cash_recount_shift_atomic_legacy|voucher_is_cash_out|enforce_voucher_cash_out_state|cash_shift_method_expected_balance|enforce_cash_method_minimum|enforce_commission_cash_method_minimum|enforce_voucher_cash_method_minimum|enforce_collection_move_minimum|lock_invoice_edit_payment_balances|invoice_edit_items_atomic|invoice_edit_emitted_atomic)",
+  triggers:
+    "(?:trg_payment_methods_code_immutable ON public\\.payment_methods|trg_voucher_requests_cash_out_state ON public\\.voucher_requests|trg_invoice_payments_balance_guard ON public\\.invoice_payments|trg_payments_balance_guard ON public\\.payments|trg_commission_payouts_balance_guard ON public\\.commission_payouts|trg_voucher_requests_balance_guard ON public\\.voucher_requests)",
+  constraints: "(?:payment_methods_code_check|payment_methods_code_format_check|payment_methods_arqueo_mode_check|payment_methods_arqueo_coherent_check)",
+};
+
+/**
+ * EXPLICIT allowlist of 003: one anchored pattern per authorized object and
+ * action. A statement that matches none of them is unauthorized, even if its
+ * verb is legitimate elsewhere in the file (e.g. another ALTER TABLE action on
+ * payment_methods, a grant to another role, a second table).
+ */
+const ALLOWLIST_003: ReadonlyArray<[string, RegExp]> = [
+  ["transaction", /^(?:BEGIN|COMMIT)$/],
+  ["payment_methods: add arqueo_mode", /^ALTER TABLE public\.payment_methods ADD COLUMN IF NOT EXISTS arqueo_mode text$/],
+  ["payment_methods: backfill arqueo_mode", /^UPDATE public\.payment_methods SET arqueo_mode = CASE [^;]* END WHERE arqueo_mode IS NULL$/],
+  ["payment_methods: arqueo_mode NOT NULL", /^ALTER TABLE public\.payment_methods ALTER COLUMN arqueo_mode SET NOT NULL$/],
+  [
+    "payment_methods: drop the six-code CHECK and 003's own constraints",
+    new RegExp(`^ALTER TABLE public\\.payment_methods DROP CONSTRAINT IF EXISTS ${OBJ_003.constraints}(?:, DROP CONSTRAINT IF EXISTS ${OBJ_003.constraints})*$`),
+  ],
+  [
+    "payment_methods: add 003's CHECKs",
+    new RegExp(`^ALTER TABLE public\\.payment_methods ADD CONSTRAINT ${OBJ_003.constraints} CHECK \\(.*\\)(?:, ADD CONSTRAINT ${OBJ_003.constraints} CHECK \\(.*\\))*$`),
+  ],
+  ["payment_methods: one denominations method", /^CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_methods_single_denominations ON public\.payment_methods \(\(true\)\) WHERE arqueo_mode = 'denominations'$/],
+  ["cash_shift_method_balances: table", /^CREATE TABLE IF NOT EXISTS public\.cash_shift_method_balances \(/],
+  ["cash_shift_method_balances: RLS", /^ALTER TABLE public\.cash_shift_method_balances ENABLE ROW LEVEL SECURITY$/],
+  [
+    "comments",
+    /^COMMENT ON (?:TABLE public\.cash_shift_method_balances|FUNCTION public\.cash_open_shift_atomic\(uuid, uuid, numeric, jsonb\)|FUNCTION public\.(?:invoice_edit_items_atomic|invoice_edit_emitted_atomic)\(uuid, uuid, integer, text, jsonb\)) IS '/,
+  ],
+  [
+    "rename of 001's two invoice edit RPCs (only these, inside DO)",
+    /^DO \$\$ BEGIN IF to_regprocedure\('public\.(invoice_edit_items_atomic|invoice_edit_emitted_atomic)_legacy\(uuid,uuid,integer,text,jsonb\)'\) IS NULL THEN ALTER FUNCTION public\.\1\(uuid, uuid, integer, text, jsonb\) RENAME TO \1_legacy; END IF; END; \$\$$/,
+  ],
+  [
+    "edit RPC legacy bodies keep 001's ACL (PUBLIC revoked, service_role only)",
+    /^(?:REVOKE ALL ON FUNCTION public\.(?:invoice_edit_items_atomic|invoice_edit_emitted_atomic)_legacy\(uuid, uuid, integer, text, jsonb\) FROM PUBLIC|GRANT ALL ON FUNCTION public\.(?:invoice_edit_items_atomic|invoice_edit_emitted_atomic)_legacy\(uuid, uuid, integer, text, jsonb\) TO service_role)$/,
+  ],
+  [
+    "rename of 001's opener (only this, inside DO)",
+    /^DO \$\$ BEGIN IF to_regprocedure\('public\.cash_open_shift_atomic_legacy\(uuid,uuid,numeric,jsonb\)'\) IS NULL THEN ALTER FUNCTION public\.cash_open_shift_atomic\(uuid, uuid, numeric, jsonb\) RENAME TO cash_open_shift_atomic_legacy; END IF; END; \$\$$/,
+  ],
+  [
+    "rename of 001's recount (only this, inside DO)",
+    /^DO \$\$ BEGIN IF to_regprocedure\('public\.cash_recount_shift_atomic_legacy\(uuid,uuid,jsonb,jsonb\)'\) IS NULL THEN ALTER FUNCTION public\.cash_recount_shift_atomic\(uuid, uuid, jsonb, jsonb\) RENAME TO cash_recount_shift_atomic_legacy; END IF; END; \$\$$/,
+  ],
+  ["functions", new RegExp(`^CREATE OR REPLACE FUNCTION public\\.${OBJ_003.functions}\\(`)],
+  ["drop own triggers", new RegExp(`^DROP TRIGGER IF EXISTS ${OBJ_003.triggers}$`)],
+  [
+    "trigger: code immutability + arqueo sync",
+    /^CREATE TRIGGER trg_payment_methods_code_immutable BEFORE INSERT OR UPDATE ON public\.payment_methods FOR EACH ROW EXECUTE FUNCTION public\.payment_method_code_immutable\(\)$/,
+  ],
+  [
+    "trigger: commission balance guard",
+    /^CREATE TRIGGER trg_commission_payouts_balance_guard BEFORE INSERT OR UPDATE OF amount, method_code, cash_shift_id ON public\.commission_payouts FOR EACH ROW EXECUTE FUNCTION public\.enforce_commission_cash_method_minimum\(\)$/,
+  ],
+  [
+    "trigger: voucher balance guard",
+    /^CREATE TRIGGER trg_voucher_requests_balance_guard BEFORE INSERT OR UPDATE OF amount, method_code, cash_shift_id, status, approved_by ON public\.voucher_requests FOR EACH ROW EXECUTE FUNCTION public\.enforce_voucher_cash_method_minimum\(\)$/,
+  ],
+  [
+    "trigger: voucher cash-out state invariant",
+    /^CREATE TRIGGER trg_voucher_requests_cash_out_state BEFORE INSERT OR UPDATE OF status, approved_by, method_code, cash_shift_id ON public\.voucher_requests FOR EACH ROW EXECUTE FUNCTION public\.enforce_voucher_cash_out_state\(\)$/,
+  ],
+  [
+    "trigger: invoice collection move guard",
+    /^CREATE TRIGGER trg_invoice_payments_balance_guard BEFORE UPDATE OF amount, method_code, cash_shift_id ON public\.invoice_payments FOR EACH ROW EXECUTE FUNCTION public\.enforce_collection_move_minimum\(\)$/,
+  ],
+  [
+    "trigger: drawer collection move guard",
+    /^CREATE TRIGGER trg_payments_balance_guard BEFORE UPDATE OF amount, method_code, cash_shift_id, invoice_id ON public\.payments FOR EACH ROW EXECUTE FUNCTION public\.enforce_collection_move_minimum\(\)$/,
+  ],
+  ["revoke from PUBLIC", new RegExp(`^REVOKE ALL ON FUNCTION public\\.${OBJ_003.functions}\\([a-z, ]*\\) FROM PUBLIC$`)],
+  [
+    "revoke the internal legacy RPCs from service_role",
+    /^REVOKE ALL ON FUNCTION public\.(?:cash_open_shift_atomic_legacy\(uuid, uuid, numeric, jsonb\)|cash_recount_shift_atomic_legacy\(uuid, uuid, jsonb, jsonb\)) FROM service_role$/,
+  ],
+  [
+    "grant the three public RPCs to service_role",
+    /^GRANT ALL ON FUNCTION public\.(?:cash_open_shift_atomic\(uuid, uuid, numeric, jsonb\)|cash_recount_shift_atomic\(uuid, uuid, jsonb, jsonb\)|cash_shift_method_expected_balance\(uuid, text\)|lock_invoice_edit_payment_balances\(uuid, jsonb\)|invoice_edit_items_atomic\(uuid, uuid, integer, text, jsonb\)|invoice_edit_emitted_atomic\(uuid, uuid, integer, text, jsonb\)) TO service_role$/,
+  ],
+];
+
+/** Statements of 003 outside its allowlist, plus privileged DDL hidden in a function body. */
+function unauthorized003(sql: string): string[] {
+  const offenders: string[] = [];
+  for (const statement of sqlStatements(sql)) {
+    if (!ALLOWLIST_003.some(([, allowed]) => allowed.test(statement))) {
+      offenders.push(statement.slice(0, 140));
+      continue;
+    }
+    // A function body executes what it says: it may not hide DDL or grants.
+    if (/^CREATE OR REPLACE FUNCTION/.test(statement) && sentenciasProhibidas(statement).length > 0) {
+      offenders.push(`${statement.slice(0, 80)} … ${sentenciasProhibidas(statement).join(", ")}`);
+    }
+  }
+  return offenders;
+}
 
 /**
  * Lo que una migración posterior NO puede hacer, con la marca que lo nombra.
@@ -696,18 +850,96 @@ describe("el squash: `001_orabella_schema.sql` es el archivo vivo (squash de la 
     );
   });
 
-  it("las migraciones posteriores no tocan tablas, políticas, permisos, dueños ni RLS", () => {
-    // Los conteos de abajo (36 tablas, 10 políticas), el inventario de GRANT y el
-    // RLS de las 36 tablas se leen SOLO de 001. Una migración posterior que
-    // declarara, borrara o alterara uno de esos objetos —o desactivara RLS, o
-    // cambiara un dueño— dejaría a 001 describiendo otro esquema y las pruebas
-    // seguirían en verde mirando el archivo equivocado. Cuando haga falta, se
-    // cambia esta prueba junto con los conteos: a la vista, no por omisión.
-    for (const nombre of MIGRACIONES_POSTERIORES) {
-      const sql = stripSqlComments(readFileSync(join(SQUASH_DIR, nombre), "utf8"));
-      expect(sentenciasProhibidas(sql), nombre).toEqual([]);
-      // Transaccional: todo o nada.
-      expect(sql.trim(), nombre).toMatch(/^BEGIN;[\s\S]*COMMIT;$/);
+  it("002 stays narrow and 003 is restricted by its explicit object/action allowlist", () => {
+    const sql002 = stripSqlComments(readFileSync(join(SQUASH_DIR, "002_portable_platform.sql"), "utf8"));
+    expect(sentenciasProhibidas(sql002), "002_portable_platform.sql").toEqual([]);
+    expect(sql002.trim(), "002_portable_platform.sql").toMatch(/^BEGIN;[\s\S]*COMMIT;$/);
+
+    const sql003 = readFileSync(join(SQUASH_DIR, "003_payment_method_arqueo.sql"), "utf8");
+    expect(stripSqlComments(sql003).trim(), "003_payment_method_arqueo.sql").toMatch(/^BEGIN;[\s\S]*COMMIT;$/);
+    expect(unauthorized003(sql003), "003_payment_method_arqueo.sql").toEqual([]);
+    // 003's unavoidable privileged operations are only its named objects.
+    expect(stripSqlComments(sql003)).toMatch(/CREATE TABLE IF NOT EXISTS public\.cash_shift_method_balances/);
+    expect(stripSqlComments(sql003)).toMatch(/ALTER TABLE public\.payment_methods/);
+    expect(stripSqlComments(sql003)).not.toMatch(/\bCREATE\s+POLICY\b/i);
+    expect(stripSqlComments(sql003)).not.toMatch(/\bDROP\s+TABLE\b/i);
+  });
+
+  it("003's allowlist rejects anything outside its named objects and actions (negative fixtures)", () => {
+    const wrap = (statement: string) => `BEGIN;\n${statement}\nCOMMIT;`;
+    const unauthorized: string[] = [
+      // Other actions on the authorized table.
+      "ALTER TABLE public.payment_methods DROP COLUMN fee_percent;",
+      "ALTER TABLE public.payment_methods DROP CONSTRAINT payment_methods_code_key;",
+      "ALTER TABLE public.payment_methods DISABLE ROW LEVEL SECURITY;",
+      "ALTER TABLE public.payment_methods OWNER TO anon;",
+      // Any other table.
+      "ALTER TABLE public.users ADD COLUMN x int;",
+      "CREATE TABLE public.otra (id uuid PRIMARY KEY);",
+      "CREATE TABLE IF NOT EXISTS public.cash_shift_method_balances_v2 (id uuid);",
+      "ALTER TABLE public.cash_shift_method_balances DISABLE ROW LEVEL SECURITY;",
+      // Grants beyond the two RPCs to service_role.
+      "GRANT ALL ON FUNCTION public.cash_shift_method_expected_balance(uuid, text) TO anon;",
+      "GRANT ALL ON FUNCTION public.cash_open_shift_atomic_legacy(uuid, uuid, numeric, jsonb) TO service_role;",
+      "GRANT SELECT ON public.cash_shift_method_balances TO authenticated;",
+      // Drops.
+      "DROP TABLE public.cash_shift_method_balances;",
+      "DROP FUNCTION public.cash_close_shift_atomic(uuid, uuid, timestamptz, jsonb, jsonb, jsonb);",
+      "DROP TRIGGER IF EXISTS trg_commission_payouts_cap ON public.commission_payouts;",
+      "DROP POLICY pol_roles_readonly ON public.roles;",
+      // Policies and foreign functions/triggers.
+      "CREATE POLICY p ON public.cash_shift_method_balances USING (true);",
+      "CREATE OR REPLACE FUNCTION public.current_sede_id() RETURNS uuid LANGUAGE sql AS $$ SELECT NULL::uuid $$;",
+      "CREATE TRIGGER trg_x BEFORE INSERT ON public.users FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();",
+      // DDL hidden inside an authorized function body executes too.
+      "CREATE OR REPLACE FUNCTION public.enforce_cash_method_minimum(p uuid) RETURNS void LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'x'; DROP TABLE public.users; END; $$;",
+      // An anonymous block other than the single authorized rename.
+      "DO $$ BEGIN DROP TABLE public.users; END; $$;",
+      // The collection/voucher guards: only their exact table, events and function.
+      "CREATE TRIGGER trg_payments_balance_guard BEFORE DELETE ON public.payments FOR EACH ROW EXECUTE FUNCTION public.enforce_collection_move_minimum();",
+      "CREATE TRIGGER trg_invoice_payments_balance_guard BEFORE UPDATE OF amount ON public.invoices FOR EACH ROW EXECUTE FUNCTION public.enforce_collection_move_minimum();",
+      "CREATE TRIGGER trg_voucher_requests_cash_out_state BEFORE UPDATE ON public.voucher_requests FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();",
+      "DROP TRIGGER IF EXISTS trg_invoice_payments_cap ON public.invoice_payments;",
+      "GRANT ALL ON FUNCTION public.voucher_is_cash_out(text, uuid, text, uuid) TO service_role;",
+      "GRANT ALL ON FUNCTION public.enforce_collection_move_minimum() TO anon;",
+      "ALTER TABLE public.invoice_payments DISABLE TRIGGER trg_invoice_payments_balance_guard;",
+      "ALTER TABLE public.payments DISABLE TRIGGER trg_payments_balance_guard;",
+      "CREATE TRIGGER trg_payments_balance_guard BEFORE UPDATE OF amount ON public.payments FOR EACH ROW EXECUTE FUNCTION public.enforce_collection_move_minimum();",
+      "CREATE TRIGGER trg_invoice_payments_balance_guard BEFORE UPDATE OF amount, cash_shift_id ON public.invoice_payments FOR EACH ROW EXECUTE FUNCTION public.enforce_collection_move_minimum();",
+      // The edit-RPC versioning: only these two renames, no other 001 RPC, no wider grants.
+      "DO $$ BEGIN IF to_regprocedure('public.invoice_annul_atomic_legacy(uuid,uuid,integer,text,jsonb)') IS NULL THEN ALTER FUNCTION public.invoice_annul_atomic(uuid, uuid, integer, text, jsonb) RENAME TO invoice_annul_atomic_legacy; END IF; END; $$;",
+      "DO $$ BEGIN IF to_regprocedure('public.invoice_edit_items_atomic_legacy(uuid,uuid,integer,text,jsonb)') IS NULL THEN ALTER FUNCTION public.invoice_edit_emitted_atomic(uuid, uuid, integer, text, jsonb) RENAME TO invoice_edit_items_atomic_legacy; END IF; END; $$;",
+      "CREATE OR REPLACE FUNCTION public.invoice_annul_atomic(p uuid) RETURNS jsonb LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$;",
+      "GRANT ALL ON FUNCTION public.invoice_edit_items_atomic(uuid, uuid, integer, text, jsonb) TO anon;",
+      "GRANT ALL ON FUNCTION public.invoice_edit_items_atomic_legacy(uuid, uuid, integer, text, jsonb) TO authenticated;",
+      "GRANT ALL ON FUNCTION public.lock_invoice_edit_payment_balances(uuid, jsonb) TO PUBLIC;",
+      "ALTER FUNCTION public.invoice_edit_items_atomic(uuid, uuid, integer, text, jsonb) SECURITY DEFINER;",
+      // Data changes outside the backfill.
+      "UPDATE public.payment_methods SET arqueo_mode = 'none';",
+      "DELETE FROM public.payment_methods;",
+    ];
+    for (const statement of unauthorized) {
+      expect(unauthorized003(wrap(statement)), statement).toHaveLength(1);
+    }
+    // Positive control: authorized statements pass, so the empty list above is meaningful.
+    for (const statement of [
+      "ALTER TABLE public.payment_methods ADD COLUMN IF NOT EXISTS arqueo_mode text;",
+      "GRANT ALL ON FUNCTION public.cash_shift_method_expected_balance(uuid, text) TO service_role;",
+      "DROP TRIGGER IF EXISTS trg_voucher_requests_balance_guard ON public.voucher_requests;",
+    ]) {
+      expect(unauthorized003(wrap(statement)), statement).toEqual([]);
+    }
+  });
+
+  it("001 and 002 are not modified by this change (byte-identical to the base commit)", () => {
+    for (const [name, sha] of [
+      ["001_orabella_schema.sql", BASE_SHA_001],
+      ["002_portable_platform.sql", BASE_SHA_002],
+    ] as const) {
+      const text = readFileSync(join(SQUASH_DIR, name));
+      // Git's blob hash is "blob <byteLength>\\0" followed by the bytes.
+      const actual = createHash("sha1").update(`blob ${text.length}\0`).update(text).digest("hex");
+      expect(actual, name).toBe(sha);
     }
   });
 

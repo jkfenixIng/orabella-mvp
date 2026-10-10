@@ -50,11 +50,18 @@ export async function methodId(db: Db, code: string): Promise<string> {
   return (await one<{ id: string }>(db, `SELECT id FROM public.payment_methods WHERE code = $1`, [code])).id;
 }
 
-/** `countLines` (cash/service.ts): one cash line with denomination + one digital line. */
+/** The catalog's declared-total methods (all arqueable after 003's backfill). */
+export const DECLARED_TOTAL_METHODS = ["transferencia_normal", "nequi", "daviplata", "bre-b", "tarjeta"];
+
+/**
+ * `countLines` (cash/service.ts): the cash line by denomination + one declared
+ * total per arqueable method. Since 003 an opening must count every active
+ * arqueable method (its frozen base).
+ */
 export function countLines(cash = 200000): Array<Record<string, unknown>> {
   return [
     { method_code: "efectivo", denomination: 10000, quantity: cash / 10000, amount: cash },
-    { method_code: "nequi", denomination: null, quantity: 1, amount: 0 },
+    ...DECLARED_TOTAL_METHODS.map((method_code) => ({ method_code, denomination: null, quantity: 1, amount: 0 })),
   ];
 }
 

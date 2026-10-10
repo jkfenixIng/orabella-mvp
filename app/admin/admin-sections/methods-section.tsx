@@ -4,6 +4,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { upsertPaymentMethodAction } from "@/src/features/admin/actions";
 import type { PaymentMethodRow } from "@/src/features/admin/service";
+import type { ArqueoMode } from "@/src/features/admin/schemas";
 import { EmptyState } from "@/src/components/ui/lib/empty-state";
 import { FormDialog } from "@/src/components/ui/lib/form-dialog";
 import {
@@ -18,7 +19,18 @@ import {
 } from "../admin-styles";
 import type { ActionResult } from "../admin-shared";
 
-const EMPTY_METHOD = { code: "efectivo", name: "", is_active: true, arqueable: true };
+const ARQUEO_MODE_LABEL: Record<ArqueoMode, string> = {
+  none: "Sin arqueo",
+  denominations: "Se arquea por denominaciones",
+  declared_total: "Se arquea con total declarado",
+};
+
+const EMPTY_METHOD: { code: string; name: string; is_active: boolean; arqueo_mode: ArqueoMode } = {
+  code: "",
+  name: "",
+  is_active: true,
+  arqueo_mode: "none",
+};
 
 /**
  * Alta y edición de un método de pago: `FormDialog`, no un formulario pegado
@@ -43,7 +55,7 @@ export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
 
   function startEdit(row: PaymentMethodRow) {
     setEditingId(row.id);
-    setForm({ code: row.code, name: row.name, is_active: row.is_active, arqueable: row.arqueable });
+    setForm({ code: row.code, name: row.name, is_active: row.is_active, arqueo_mode: row.arqueo_mode });
     setError(null);
     setDialogOpen(true);
   }
@@ -60,11 +72,10 @@ export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
     setBusy(true);
     setError(null);
     const result: ActionResult<PaymentMethodRow> = await upsertPaymentMethodAction({
-      ...(editingId ? { id: editingId } : {}),
-      code: form.code,
+      ...(editingId ? { id: editingId } : { code: form.code }),
       name: form.name,
       is_active: form.is_active,
-      arqueable: form.arqueable,
+      arqueo_mode: form.arqueo_mode,
     });
     setBusy(false);
     if (!result.success) {
@@ -100,7 +111,7 @@ export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
                 <span>
                   <strong>{row.name}</strong> ({row.code}) ·{" "}
                   {row.is_active ? "activo" : "inactivo"} ·{" "}
-                  {row.arqueable ? "se arquea" : "sin arqueo"}
+                  {ARQUEO_MODE_LABEL[row.arqueo_mode]}
                 </span>
                 <button type="button" onClick={() => startEdit(row)} className={linkButtonClass}>
                   Editar
@@ -128,18 +139,24 @@ export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <label className={labelClass}>
             Código
-            <select
+            <input
               value={form.code}
               onChange={(event) => setForm({ ...form, code: event.target.value })}
               className={inputClass}
-            >
-              <option value="efectivo">efectivo</option>
-              <option value="transferencia_normal">transferencia_normal</option>
-              <option value="nequi">nequi</option>
-              <option value="daviplata">daviplata</option>
-              <option value="bre-b">bre-b</option>
-              <option value="tarjeta">tarjeta</option>
-            </select>
+              readOnly={editingId !== null}
+              aria-readonly={editingId !== null}
+              aria-describedby="payment-method-code-help"
+              required={editingId === null}
+              minLength={2}
+              maxLength={40}
+              autoCapitalize="none"
+              spellCheck={false}
+            />
+            <span id="payment-method-code-help" className="text-xs text-text-secondary">
+              {editingId
+                ? "El código no se puede cambiar: es el registro histórico de los pagos."
+                : "Minúsculas, números, guion o guion bajo. No se podrá cambiar."}
+            </span>
           </label>
           <label className={labelClass}>
             Nombre
@@ -157,13 +174,17 @@ export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
             />
             Activo (solo activos aceptan cobros)
           </label>
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={form.arqueable}
-              onChange={(event) => setForm({ ...form, arqueable: event.target.checked })}
-            />
-            Se arquea (desactívelo si no se puede contar, p. ej. tarjeta por terminal)
+          <label className={labelClass}>
+            Arqueo en caja
+            <select
+              value={form.arqueo_mode}
+              onChange={(event) => setForm({ ...form, arqueo_mode: event.target.value as ArqueoMode })}
+              className={inputClass}
+            >
+              <option value="none">{ARQUEO_MODE_LABEL.none}</option>
+              <option value="denominations">{ARQUEO_MODE_LABEL.denominations}</option>
+              <option value="declared_total">{ARQUEO_MODE_LABEL.declared_total}</option>
+            </select>
           </label>
         </div>
       </FormDialog>

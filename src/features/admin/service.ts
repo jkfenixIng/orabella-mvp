@@ -1,7 +1,9 @@
 import {
   employeeSchema,
   normalizeEmployeeCode,
+  normalizePaymentMethodCode,
   paymentMethodSchema,
+  type ArqueoMode,
   serviceSchema,
   setUserRolesSchema,
   taxConfigSchema,
@@ -531,11 +533,13 @@ export interface PaymentMethodRow {
   code: string;
   name: string;
   is_active: boolean;
+  /** Derived compatibility flag: `arqueo_mode !== "none"`. */
   arqueable: boolean;
+  arqueo_mode: ArqueoMode;
   fee_percent: number;
 }
 
-const PAYMENT_METHOD_SELECT = "id, code, name, is_active, arqueable, fee_percent";
+const PAYMENT_METHOD_SELECT = "id, code, name, is_active, arqueable, arqueo_mode, fee_percent";
 
 async function fetchPaymentMethods(limit?: number): Promise<PaymentMethodRow[]> {
   const db = await adminDb();
@@ -548,26 +552,69 @@ async function fetchPaymentMethods(limit?: number): Promise<PaymentMethodRow[]> 
   return (data ?? []) as PaymentMethodRow[];
 }
 
-/** ADM-07: crea o actualiza un método de pago de la instalación (upsert por id). */
+/**
+ * ADM-07/003: creates a method with a free normalized code, or edits name,
+ * active flag, fee and arqueo mode of an existing one. The code is immutable:
+ * an edit that sends a different code is rejected before writing (the
+ * database trigger is the final barrier).
+ */
 export async function upsertPaymentMethod(raw: unknown): Promise<PaymentMethodRow> {
   const parsed = paymentMethodSchema.safeParse(raw);
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const input: PaymentMethodInput = parsed.data;
+  const code = input.code ? normalizePaymentMethodCode(input.code) : undefined;
   const db = await adminDb();
+  const fields = {
+    name: input.name,
+    ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
+    ...(input.arqueo_mode !== undefined ? { arqueo_mode: input.arqueo_mode } : {}),
+    ...(input.fee_percent !== undefined ? { fee_percent: input.fee_percent } : {}),
+  };
+  if (input.id) {
+    const { data: current, error: readError } = await db
+      .from("payment_methods")
+      .select("code")
+      .eq("id", input.id)
+      .maybeSingle();
+    if (readError) throw new AdminError("INTERNAL", "Error interno.", 500);
+    if (!current) throw new AdminError("NOT_FOUND", "Método de pago no encontrado.", 404);
+    if (code && code !== (current as { code: string }).code) {
+      throw new AdminError("PAYMENT_METHOD_CODE_IMMUTABLE", "El código de un método no se puede cambiar.", 409);
+    }
+    const { data, error } = await db
+      .from("payment_methods")
+      .update(fields)
+      .eq("id", input.id)
+      .select(PAYMENT_METHOD_SELECT)
+      .single();
+    if (error || !data) throw paymentMethodWriteError(error);
+    return data as PaymentMethodRow;
+  }
   const { data, error } = await db
     .from("payment_methods")
-    .upsert({
-      ...(input.id ? { id: input.id } : {}),
-      code: input.code,
-      name: input.name,
-      ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
-      ...(input.arqueable !== undefined ? { arqueable: input.arqueable } : {}),
-      ...(input.fee_percent !== undefined ? { fee_percent: input.fee_percent } : {}),
-    }, { onConflict: "id" })
+    .insert({ code, arqueo_mode: "none", ...fields })
     .select(PAYMENT_METHOD_SELECT)
     .single();
-  if (error || !data) throw new AdminError("INTERNAL", "Error interno.", 500);
+  if (error || !data) throw paymentMethodWriteError(error);
   return data as PaymentMethodRow;
+}
+
+/** Maps the stable database errors of 003 to business errors. */
+export function paymentMethodWriteError(error: { code?: string; message?: string; details?: string } | null): AdminError {
+  const text = `${error?.message ?? ""} ${error?.details ?? ""}`;
+  if (text.includes("PAYMENT_METHOD_CODE_IMMUTABLE")) {
+    return new AdminError("PAYMENT_METHOD_CODE_IMMUTABLE", "El código de un método no se puede cambiar.", 409);
+  }
+  if (text.includes("uq_payment_methods_single_denominations")) {
+    return new AdminError("VALIDATION", "Solo un método puede contarse por denominaciones.", 400);
+  }
+  if (error?.code === "23505") {
+    return new AdminError("PAYMENT_METHOD_CODE_TAKEN", "Ya existe un método con ese código.", 409);
+  }
+  if (text.includes("payment_methods_code_format_check")) {
+    return new AdminError("VALIDATION", "Código inválido: use minúsculas, números, guion o guion bajo.", 400);
+  }
+  return new AdminError("INTERNAL", "Error interno.", 500);
 }
 
 // ------------------------------------------------------------------ roles ---

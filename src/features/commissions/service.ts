@@ -11,8 +11,12 @@ import {
   type RuleRate,
 } from "./schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
-import { cashOutUsedInShift, getOpenShift } from "@/src/features/cash/service";
-import { cashOutLimitViolation } from "@/src/features/cash/schemas";
+import {
+  assertCashMethodOutflow,
+  CashError,
+  cashMethodRuleError,
+  getOpenShift,
+} from "@/src/features/cash/service";
 import { listPaymentMethods } from "@/src/features/admin/service";
 
 export class CommissionError extends Error {
@@ -40,6 +44,12 @@ type DbClient = Awaited<ReturnType<typeof commissionsDb>>;
 
 function validationMessage(error: { issues: Array<{ message: string }> }): string {
   return error.issues[0]?.message ?? "Datos inválidos.";
+}
+
+/** 003: the cash method rule keeps its stable code across features. */
+function commissionFromCash(error: unknown): CommissionError {
+  if (error instanceof CashError) return new CommissionError(error.code, error.message, error.status);
+  return new CommissionError("INTERNAL", "Error interno.", 500);
 }
 
 // ------------------------------------------------------------------ reglas ---
@@ -532,21 +542,11 @@ export async function payCommissionNow(
     );
   }
 
-  // Tope de salidas en efectivo del turno (50% de la base de apertura): la
-  // comisión pagada en efectivo no puede dejar el acumulado del turno por
-  // encima del tope. Solo aplica al efectivo; los digitales no tienen tope.
-  if (method.code === "efectivo") {
-    const usedCashOut = await cashOutUsedInShift(shift.id).catch(() => {
-      throw new CommissionError("INTERNAL", "Error interno.", 500);
-    });
-    const violation = cashOutLimitViolation({
-      methodCode: method.code,
-      openingBase: Number(shift.opening_base),
-      cashOutUsed: usedCashOut,
-      amount,
-    });
-    if (violation) throw new CommissionError(violation.code, violation.message, 422);
-  }
+  // 003: the payout cannot leave this method's shift balance below 50% of its
+  // own opening base. Friendly pre-check; the database trigger is the authority.
+  await assertCashMethodOutflow({ shiftId: shift.id, method, amount }).catch((error) => {
+    throw commissionFromCash(error);
+  });
 
   // Defensa en profundidad: `earnedCommissionFor` ya exigió `Pagada`, pero el
   // estado pudo cambiar entre esa lectura y este INSERT (anulación o cobro en
@@ -611,6 +611,8 @@ export async function payCommissionNow(
     // acumulado de la base rechazó el pago (la suma del par ya estaba completa
     // cuando entró esta fila). Mismo código que traducen payroll, cash y
     // billing; la condición de negocio es la misma que valida el pendiente.
+    const cashRule = cashMethodRuleError(error as { message?: string });
+    if (cashRule) throw commissionFromCash(cashRule);
     if ((error as { code?: string }).code === "P0001") {
       throw new CommissionError(
         "COMMISSION_OVERPAID",

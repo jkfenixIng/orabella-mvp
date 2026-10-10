@@ -48,12 +48,13 @@ schema and no `extensions` schema.
 1. **`supabase/bootstrap/platform-roles.sql`**: creates `anon`, `authenticated`
    and `service_role` (NOLOGIN) if they are missing. Nothing else.
 2. **Every `supabase/migrations/NNN_*.sql` in order, verbatim** (`001`, then
-   `002`). No preprocessing: `GRANT`/`REVOKE`, `CREATE POLICY` and the
-   `CREATE EXTENSION IF NOT EXISTS ... WITH SCHEMA public` of `btree_gist` and
-   `pgcrypto` run as written. `001` creates `current_sede_id()` with a call to
-   `auth.jwt()` (allowed because its preamble sets
-   `check_function_bodies = false`), and `002` replaces it with a body that
-   reads `request.jwt.claims` directly.
+   `002`, then `003`). No preprocessing: `GRANT`/`REVOKE`, `CREATE POLICY` and
+   the `CREATE EXTENSION IF NOT EXISTS ... WITH SCHEMA public` of `btree_gist`
+   and `pgcrypto` run as written. `001` creates `current_sede_id()` with a call
+   to `auth.jwt()` (allowed because its preamble sets
+   `check_function_bodies = false`), `002` replaces it with a body that reads
+   `request.jwt.claims` directly, and `003` adds free payment-method codes,
+   explicit arqueo modes and frozen per-method opening bases.
 3. **`seeds/catalog.sql`**: roles, cash register, denominations, payment
    methods, taxes, settings.
 
@@ -72,12 +73,12 @@ through `rpc()`, with payloads shaped like the ones in
 
 | Area | Function / object | Behaviors pinned |
 |---|---|---|
-| Cash | `cash_open_shift_atomic` | opening count written; second open shift is `SHIFT_ALREADY_OPEN`; `uq_cash_shifts_open_per_register` is the final barrier (23505); `SHIFT_INVALID`, `SHIFT_REGISTER_NOT_FOUND` |
+| Cash | `cash_open_shift_atomic` | opening count and one `cash_shift_method_balances` row per active arqueable method written atomically; second open shift is `SHIFT_ALREADY_OPEN`; `uq_cash_shifts_open_per_register` is the final barrier (23505); `SHIFT_INVALID`, `SHIFT_REGISTER_NOT_FOUND`, `SHIFT_BALANCE_MISMATCH` |
 | | `cash_close_shift_atomic` | amounts written verbatim plus the closing count; four-key token required; `SHIFT_ALREADY_CLOSED`; the `expected_cash >= 0` CHECK raises 23514; `ARQUEO_STALE` with no write for **each source**: `payments`, `invoice_payments` (both the row of the shift and the historical row without shift whose invoice belongs to it), `commission_payouts`, and `voucher_requests` (only approved vouchers with a method count) |
 | | `cash_recount_shift_atomic` | closed shifts only (`SHIFT_NOT_CLOSED`); once per shift (`ALREADY_RECOUNTED`); the signed close is not touched; a cash line is required |
 | | `cash_invoice_payment_atomic` | writes the mirror row (`invoice_payments`, marked) and the drawer row (`payments`, unmarked); closes with `closed_by`/`closed_at`; a replay with the same mark is 23505 on `uq_invoice_payments_invoice_idempotency_key` and rolls back both rows; mark required (`PAYMENT_INVALID`); `SHIFT_CLOSED`, `SHIFT_NOT_FOUND`; overpayment P0001 (the card fee rides on top of the net cap); `ANNUL_INVALID`; `p_set_shift` decides the invoice's shift link |
 | | `invoice_split_payment_atomic` | all portions or none; mark only on the first one (two marks is `PAYMENT_INVALID`); writes no `payments` row; replay is 23505 and rolls back every portion; overpayment rolls back everything; portions of another shift are `PAYMENT_INVALID`; `SHIFT_CLOSED` |
-| | `trg_commission_payouts_cap` | partial payouts up to `earned_immediate`; the excess is P0001; a row without `earned_immediate` is rejected; idempotency per (invoice, employee, key) |
+| | `trg_commission_payouts_cap` + 003 balance guard | partial payouts up to `earned_immediate`; the excess is P0001; a row without `earned_immediate` is rejected; idempotency per (invoice, employee, key). The 003 guard also rejects a commission or approved voucher that would leave an arqueable method below 50% of its frozen opening base (`CASH_METHOD_MINIMUM_BREACH`); a legacy open shift without a frozen row is `CASH_METHOD_BALANCE_REQUIRED`. Pending/rejected vouchers never count; approved → rejected is `VOUCHER_CASH_OUT_IMMUTABLE`; moving a collection between methods is rejected with `CASH_METHOD_BALANCE_UPDATE_BREACH` when either method would fall below its floor (both rows/balances unchanged); any real method/amount/shift change of a collection on a legacy shift without frozen balances is `CASH_METHOD_BALANCE_REQUIRED` (rows unchanged), while an unchanged rewrite stays allowed. A method made arqueable after opening needs no hidden base: any real move or outflow using it is `CASH_METHOD_BALANCE_REQUIRED`; a method frozen at opening remains guarded even if its catalog mode later becomes `none`. |
 | Billing | `invoice_create_atomic` + `next_invoice_number` | no number gaps, even when an emission fails; `SHIFT_NOT_OPEN`; stock deducted with `{consecutivo}` substituted; an idempotency-key replay raises **23505** and burns no number; `INVOICE_INVALID` burns no number either |
 | | `invoice_annul_atomic` | CAS on status (`ANNUL_CONFLICT`); stock returned with IN movements; `PRODUCT_NOT_FOUND` rolls back the annulment |
 | | `invoice_edit_items_atomic` | items removed, updated and inserted; stock moved by the given net delta; `edit_version` +1; **totals untouched**; a stale version or status is `EDIT_CONFLICT` with no write; an `INSUFFICIENT_STOCK` rolls back the items; payments are re-methoded, never re-amounted (`PAYMENT_MISMATCH` for an unknown payment) |
@@ -131,9 +132,10 @@ Behaviors worth knowing (characterized, not corrected):
 - **Real concurrency.** PGlite has one connection, so `FOR UPDATE`/`FOR SHARE`,
   lock ordering, and "the second caller waits and then sees the new row" cannot
   be tested here. These tests cover the **sequential** guarantees that make
-  those locks safe: CAS in `WHERE`, count nets, partial unique indexes and
-  idempotency keys. Lock behavior under concurrency still needs a real Postgres
-  with two connections.
+  those locks safe: CAS in `WHERE`, count nets, partial unique indexes,
+  idempotency keys and the ordered commission+voucher balance sequence. The
+  003 trigger locks `cash_shifts` then the per-method balance row; real
+  two-connection PostgreSQL still needs to verify waiting behavior.
 - **RLS.** Tests run as the PGlite superuser, which bypasses policies. Policies
   are created and inventoried, but not exercised.
 - **`discard_created_user`** has no test yet. PGlite does not block it; it is

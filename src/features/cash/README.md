@@ -73,6 +73,50 @@ totaliza), historial por fecha.
   `base_incompleta`, vía `writeAudit`, solo servidor).
 - PRD: §5.5 CAJ-01…06, §9 cash_registers/cash_shifts/payments, §10 Caja.
 
+## Arqueo por método (003)
+
+- El modo de cada método (`payment_methods.arqueo_mode`) decide su conteo: el
+  método `denominations` es el cajón físico (billetes y monedas) y los
+  `declared_total` se declaran con un total. Ningún flujo depende del código
+  `efectivo`.
+- La apertura congela una base por método arqueable activo en
+  `cash_shift_method_balances` (misma transacción que el turno).
+- Comisiones inmediatas y vales aprobados no pueden dejar el saldo del método en
+  el turno por debajo del 50 % de su base. Saldo = base + cobros (`payments` sin
+  factura + `invoice_payments`) − comisiones − vales aprobados; las ventas
+  reponen el disponible. La autoridad son los triggers de 003
+  (`CASH_METHOD_MINIMUM_BREACH`); `assertCashMethodOutflow` da el mensaje antes.
+- Turnos abiertos antes de 003 no tienen base: sus salidas por métodos
+  arqueables se rechazan (`CASH_METHOD_BALANCE_REQUIRED`) hasta cerrar y abrir.
+- Una sola definición de vale que afecta caja (`voucher_is_cash_out` en SQL,
+  `isVoucherCashOut` en TS): `approved_by` presente, estado `aprobada` o
+  `descontada`, con método y turno. Pendiente y rechazada nunca cuentan. El
+  dominio no tiene transición aprobada → rechazada/pendiente: la base la rechaza
+  con `VOUCHER_CASH_OUT_IMMUTABLE`, y también un vale con aprobador en estado no
+  aprobado (así el token de 001 y el saldo cuentan lo mismo).
+- Mover un cobro (`invoice_payments` por la edición de factura, o un `payments`
+  directo) entre métodos/turnos/montos se permite solo si ambos métodos siguen
+  sobre su mínimo; si no, `CASH_METHOD_BALANCE_UPDATE_BREACH` y no se escribe
+  nada. Reescribir con los mismos valores es un no-op. Si el movimiento toca un
+  turno abierto antes de 003 (sin bases congeladas), se rechaza siempre con
+  `CASH_METHOD_BALANCE_REQUIRED`: «Cierre y abra de nuevo el turno para usar
+  arqueo por método.» Un método que pasa a arqueable después de abrir también
+  se rechaza si no tuvo base congelada; uno que tuvo base al abrir sigue
+  validándose aunque luego se marque `none`.
+- Vista interna: «Ver disponible por método» (solo admin) muestra saldo,
+  mínimo y disponible del turno abierto. No llega a la factura ni a la vista
+  cliente.
+- Orden global de locks de caja/factura: `cash_shifts` (FOR SHARE, por id) →
+  `cash_shift_method_balances` (FOR UPDATE, por turno+código) → `invoices`
+  (FOR UPDATE) → productos (trigger de inventario, por id). Comisiones siguen
+  ese orden mediante su trigger. Las dos RPC públicas de edición de factura
+  conservan firma, dueño y ACL de 001, pero 003 las envuelve: bloquean primero
+  los turnos y balances de los cobros cuyo método cambia y después invocan el
+  cuerpo legado, que bloquea la factura. Así no invierten el orden frente a una
+  comisión. PGlite caracteriza el SQL/ACL; la concurrencia real se valida en
+  PostgreSQL con dos sesiones antes del despliegue.
+- Nómina y pagos extraordinarios no entran en esta regla.
+
 ## Límites de lectura
 
 - Navegación instantánea: `/cash` entra solo con cajas + turno abierto + vista del día (el historial de 30 días se carga bajo demanda con el filtro); `getHistory` acotado a 50 turnos.

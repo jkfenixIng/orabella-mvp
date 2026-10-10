@@ -2542,27 +2542,23 @@ export function resolveVoucherInitialStatus(
 }
 
 /**
- * PAY-06: valida el tope del 50% de salidas en efectivo del turno al APROBAR
- * un vale. Un vale puede nacer pendiente por debajo del límite y superarlo al
- * aprobarse (el acumulado del turno creció): la aprobación repite la misma
- * regla de la solicitud, con el acumulado YA salido del turno más este vale.
- * Solo rige para `efectivo` ligado a un turno; los digitales y los vales
- * históricos sin turno no tienen tope. Reutiliza la regla pura de caja (no la
- * reescribe). Devuelve null si el monto cabe. Puro para probarlo sin BD.
+ * PAY-06/003: re-checks the method floor when a voucher is APPROVED. A voucher
+ * can be requested while the method had room and be approved after the balance
+ * fell. Vouchers without a shift or a method are historical and never touch the
+ * drawer. Pure; the database trigger is the authority.
  */
 export function voucherApprovalCashOutViolation(args: {
   methodCode: string | null;
   cashShiftId: string | null;
   openingBase: number | null;
-  cashOutUsed: number;
+  expectedBalance: number;
   amount: number;
 }): { code: string; message: string } | null {
-  if (args.methodCode !== "efectivo") return null;
-  if (!args.cashShiftId || args.openingBase === null || args.openingBase === undefined) return null;
+  if (!args.methodCode || !args.cashShiftId || args.openingBase === null) return null;
   return cashOutLimitViolation({
     methodCode: args.methodCode,
     openingBase: args.openingBase,
-    cashOutUsed: args.cashOutUsed,
+    expectedBalance: args.expectedBalance,
     amount: args.amount,
   });
 }
