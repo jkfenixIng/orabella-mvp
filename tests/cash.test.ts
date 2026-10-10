@@ -778,26 +778,15 @@ describe("cash: CL-14 el cobro de una factura escribe por UNA transacción (053)
   it("el cobro CON factura escribe con UNA `rpc`, y ninguna de sus tres filas por su cuenta", () => {
     // La transacción de la 053: el espejo, el libro de cajón y el estado de la
     // factura, en UNA sentencia (una sentencia corre entera o no corre).
-    expect(body).toContain('db.rpc("cash_invoice_payment_atomic"');
+    expect(body).toContain("db.invoicePaymentAtomic<");
     // Ninguna escritura suelta del cliente sobre las dos tablas del dinero ni
-    // sobre el estado de la factura: si alguna volviera, volvería también la
-    // ventana entre ella y las otras dos.
-    const writes = ["invoice_payments", "payments", "invoices"].flatMap((table) =>
-      body
-        .split(`.from("${table}")`)
-        .slice(1)
-        .map((chunk) => {
-          const end = chunk.indexOf(".from(");
-          return (end === -1 ? chunk : chunk.slice(0, end)).trimStart();
-        }),
-    );
-    const loose = writes.filter(
-      (chain) => chain.startsWith(".insert(") || chain.startsWith(".update("),
-    );
-    // La única escritura suelta que queda es el pago SIN factura (CL-4), cuya
-    // fila ES la operación entera.
+    // sobre el estado de la factura: el servicio ya no habla con tablas (todo
+    // pasa por CashRepo), y la única escritura que no es una transacción es el
+    // pago SIN factura (CL-4), cuya fila ES la operación entera.
+    expect(body).not.toContain(".from(");
+    const loose = body.split("db.insertPaymentWithoutInvoice<").slice(1);
     expect(loose).toHaveLength(1);
-    expect(loose[0]).toContain("idempotency_key: mark");
+    expect(loose[0].slice(0, loose[0].indexOf("});"))).toContain("idempotency_key: mark");
   });
 
   it("ya no hay compensación del par: NINGÚN DELETE de dinero en el camino del cobro", () => {
@@ -860,8 +849,8 @@ describe("cash: T0-a (Defecto 1/2) el cobro de caja deriva el recargo del BRUTO"
   const start = service.indexOf("export async function registerPayment");
   const body = service.slice(start, service.indexOf("export async function", start + 10));
   /** El objeto que viaja como DATO a `cash_invoice_payment_atomic` (053). */
-  const collection = body.slice(
-    body.indexOf("p_collection: {"),
+    const collection = body.slice(
+    body.indexOf("collection: {"),
     body.indexOf("if (payError)"),
   );
 
@@ -892,8 +881,8 @@ describe("cash: T0-a (Defecto 1/2) el cobro de caja deriva el recargo del BRUTO"
     expect(body).toContain(
       "moneyEquals(roundMoney(invoiceBalance.netCollected + cardFee.net), invoiceBalance.netBilled)",
     );
-    expect(body).toContain("p_mark_paid: markPaid");
-    expect(body).toContain("p_set_shift: setShift");
+    expect(body).toContain("markPaid,");
+    expect(body).toContain("setShift,");
     // Los dos chequeos viejos (bruto de caja contra el total) no pueden volver.
     expect(body).not.toContain("roundMoney(invoicePaid + input.amount)");
     expect(body).not.toContain("moneyEquals(paid, invoiceTotal)");
@@ -1222,6 +1211,10 @@ describe("cash: T0-a (C1) los lectores ya no unen el ledger completo", () => {
     join(process.cwd(), "src", "features", "cash", "service.ts"),
     "utf8",
   );
+  const cashPort = readFileSync(
+    join(process.cwd(), "src", "features", "cash", "repos", "cash.ts"),
+    "utf8",
+  );
 
   /**
    * Cadena desde cada `.from("<tabla>")` hasta el siguiente `.from(`: cubre la
@@ -1238,35 +1231,27 @@ describe("cash: T0-a (C1) los lectores ya no unen el ledger completo", () => {
   }
 
   it("los tres lectores de payments filtran invoice_id IS NULL", () => {
-    const selects = dbChains(service, "payments").filter((chain) =>
+    // Las consultas viven en el puerto (supabase-js); el servicio las usa en los
+    // tres lectores del arqueo (cierre, vista del día, historial).
+    expect(service.match(/db\.drawerPaymentsPage\(/g) ?? []).toHaveLength(1);
+    expect(service.match(/db\.drawerPaymentsByShiftsPage\(/g) ?? []).toHaveLength(2);
+    const selects = dbChains(cashPort, "payments").filter((chain) =>
       chain.trimStart().startsWith(".select("),
     );
-    // Los tres LECTORES del arqueo (cierre, vista del día, historial) excluyen
+    // Las dos consultas LECTORAS del arqueo (un turno / varios turnos) excluyen
     // los pagos con factura: ese dinero ya vive en `invoice_payments` y sumarlo
     // acá lo contaría dos veces.
     const readers = selects.filter((chain) => chain.includes('.is("invoice_id", null)'));
-    expect(readers).toHaveLength(3);
-    for (const chain of readers) {
-      expect(chain).toContain('.is("invoice_id", null)');
-    }
-    // CL-3: la CUARTA cadena de `payments` es otra cosa —la búsqueda de la fila
-    // de cajón del intento GANADOR, para devolverla en una repetición— y filtra
-    // por factura EXACTA, no por ausencia de factura. Se pincha para que el
-    // conjunto de arriba no pueda crecer en silencio.
-    const repeatLookups = selects.filter((chain) =>
-      chain.includes('.eq("invoice_id", winner.invoice_id)'),
-    );
+    expect(readers).toHaveLength(2);
+    // CL-3: la búsqueda de la fila de cajón del intento GANADOR filtra por
+    // factura EXACTA, no por ausencia de factura.
+    const repeatLookups = selects.filter((chain) => chain.includes('.eq("invoice_id", invoiceId)'));
     expect(repeatLookups).toHaveLength(1);
-    // CL-4: la QUINTA cadena de `payments` es el lookup por MARCA del libro de
-    // cajón (el pago SIN factura, cuya identidad es esa fila), que filtra por
-    // TURNO y marca, no por factura. Se pincha por la misma razón que la
-    // anterior: que el conjunto no pueda crecer en silencio, porque ninguna de
-    // estas cadenas es un lector del arqueo.
-    const markLookups = selects.filter((chain) =>
-      chain.includes('.eq("idempotency_key", idempotencyKey)'),
-    );
+    // CL-4: el lookup por MARCA del libro de cajón filtra por TURNO y marca.
+    const markLookups = selects.filter((chain) => chain.includes('.eq("idempotency_key", key)'));
     expect(markLookups).toHaveLength(1);
-    expect(selects).toHaveLength(5);
+    // Que el conjunto no pueda crecer en silencio.
+    expect(selects).toHaveLength(4);
   });
 
   it("la transacción escribe el turno que COBRA en las dos filas del dinero", () => {
@@ -1275,7 +1260,7 @@ describe("cash: T0-a (C1) los lectores ya no unen el ledger completo", () => {
     // suma el arqueo) como en el libro de cajón y en el enlace de la factura.
     // Antes esto se medía en el `.insert` del espejo; ahora donde está.
     expect(service.slice(service.indexOf("export async function registerPayment"))).toContain(
-      "p_shift_id: shift.id",
+      "shiftId: shift.id",
     );
     const migration = readFileSync(
       join(process.cwd(), "supabase", "schema-history", "053_cash_payment_state_atomic.sql"),
@@ -1300,7 +1285,7 @@ describe("cash: T0-a (C1) los lectores ya no unen el ledger completo", () => {
       chain.trimStart().startsWith(".update("),
     );
     expect(updates).toEqual([]);
-    expect(close).toContain('db.rpc("cash_close_shift_atomic"');
+    expect(close).toContain("db.closeShiftAtomic<");
     expect(close).toContain('"SHIFT_ALREADY_CLOSED"');
   });
 
@@ -1321,13 +1306,13 @@ describe("cash: T0-a (C1) los lectores ya no unen el ledger completo", () => {
 
   it("la rama sin turno sigue viva solo por filas NULL (no solapa)", () => {
     const fetcher = service.slice(service.indexOf("async function fetchInvoicePaymentsByShift"));
-    expect(fetcher).toContain('.is("cash_shift_id", null)');
-    // 414: el filtro por turno sigue siendo el mismo; lo que cambió es que la
-    // lista viaja TROCEADA (`chunk` de `readAllSourceInChunks`) y su origen
-    // sigue siendo `shiftIds`.
+    expect(fetcher).toContain("db.historicInvoicePaymentsPage(chunk, from, to)");
+    // 414: el filtro por turno sigue siendo el mismo y queda encapsulado en el
+    // puerto; la lista viaja TROCEADA (`chunk`) y su origen sigue siendo
+    // `shiftIds`.
     expect(fetcher).toContain("readAllSourceInChunks");
     expect(fetcher).toContain("values: shiftIds");
-    expect(fetcher).toContain('.in("cash_shift_id", chunk)');
+    expect(fetcher).toContain("db.invoicePaymentsByShiftsPage(chunk, from, to)");
   });
 });
 
@@ -1366,7 +1351,7 @@ describe("billing: T0-a (C2) tope de cobro en BD traducido a OVERPAID", () => {
     // La SEGUNDA puerta, en su hogar nuevo: el cobro dividido escribe por la
     // transacción de la 050 y traduce el MISMO P0001 del tope a OVERPAID.
     const split = service.slice(service.indexOf("export async function splitPayment"));
-    expect(split).toContain('db.rpc("invoice_split_payment_atomic"');
+    expect(split).toContain("db.splitPaymentAtomic<");
     expect(split).toContain('if (code === "23505" || code === "P0001") {');
     expect(split).toContain(
       'throw new BillingError("OVERPAID", "Las porciones superan el saldo pendiente.", 422);',
@@ -4074,14 +4059,14 @@ describe("cash: U3 un cierre firmado es inmutable y se corrige con un reconteo",
     );
     expect(shiftChains).toEqual([]);
     // La versión corregida entra en la tabla nueva...
-    expect(body).toContain('.from("cash_shift_recounts")');
+    expect(body).toContain("db.recountShiftAtomic<");
     expect(body).toContain("previous_counted_cash: record.previous.counted_cash");
     // ...y las líneas por denominación, en la MISMA tabla del arqueo, fase
     // reconteo. CL-10: viajan como DATO con la fila del reconteo —el `shift_id`
     // y la fase los pone la transacción, no el llamador— y las escribe la MISMA
     // sentencia que firma el reconteo, así que la evidencia por denominación no
     // puede quedar atrás.
-    expect(body).toContain("p_counts: countLines(parsed.data.counts)");
+    expect(body).toContain("counts: countLines(parsed.data.counts)");
     expect(body).not.toContain("insertCounts");
     // Un cierre se recontá una vez (misma barrera que el índice único).
     expect(body).toContain("ALREADY_RECOUNTED");
@@ -4925,21 +4910,21 @@ describe("cash: CL-10 el diff del servicio vive en el bloque de persistencia", (
 
   it("las TRES operaciones escriben por RPC y ninguna abre una escritura suelta", () => {
     const cases = [
-      { name: "openShift", rpc: "cash_open_shift_atomic", table: "cash_shifts" },
-      { name: "closeShift", rpc: "cash_close_shift_atomic", table: "cash_shifts" },
+      { name: "openShift", rpc: "openShiftAtomic", table: "cash_shifts" },
+      { name: "closeShift", rpc: "closeShiftAtomic", table: "cash_shifts" },
       {
         name: "recountClosedShift",
-        rpc: "cash_recount_shift_atomic",
+        rpc: "recountShiftAtomic",
         table: "cash_shift_recounts",
       },
     ] as const;
 
     for (const item of cases) {
       const body = bodyOf(item.name);
-      // UNA transacción por operación: ni dos `rpc` por un descuido, ni uno de
-      // menos.
-      expect(body.match(/db\.rpc\(/g) ?? [], item.name).toHaveLength(1);
-      expect(body, item.name).toContain(`db.rpc("${item.rpc}"`);
+      // UNA transacción por operación (el RPC vive en CashRepo): ni dos
+      // llamadas por un descuido, ni una de menos.
+      expect(body.match(/db\.\w+Atomic</g) ?? [], item.name).toHaveLength(1);
+      expect(body, item.name).toContain(`db.${item.rpc}<`);
       // El turno (o el reconteo) ya no se escribe con un INSERT/UPDATE suelto.
       const writes = chains(body, item.table).filter(
         (chain) =>
@@ -4950,7 +4935,7 @@ describe("cash: CL-10 el diff del servicio vive en el bloque de persistencia", (
       // DATO con la operación y las escribe su transacción.
       expect(body, item.name).not.toContain('.from("cash_shift_counts")');
       expect(body, item.name).not.toContain("insertCounts");
-      expect(body, item.name).toContain("p_counts: countLines(");
+      expect(body, item.name).toContain("counts: countLines(");
     }
   });
 
@@ -4977,8 +4962,12 @@ describe("cash: CL-10 el diff del servicio vive en el bloque de persistencia", (
     // comparan contra los `select(...)` con los que el servicio leía esas filas
     // antes de CL-10, y son también las que el `jsonb_build_object` del RPC
     // devuelve (ver el bloque de la migración 049).
+    const cashPort = readFileSync(
+      join(process.cwd(), "src", "features", "cash", "repos", "cash.ts"),
+      "utf8",
+    );
     const columnsOf = (name: string): string[] => {
-      const match = new RegExp(`const ${name} =\\s*"([^"]+)"`).exec(service);
+      const match = new RegExp(`export const ${name} =\\s*"([^"]+)"`).exec(cashPort);
       expect(match, name).not.toBeNull();
       return (match as RegExpExecArray)[1].split(",").map((column) => column.trim());
     };
@@ -5383,7 +5372,7 @@ describe("cash: CL-19 el cierre no firma un arqueo que ya no corresponde", () =>
     expect(close).toContain('table: "commission_payouts"');
     expect(close).toContain("const voucherRows = voucherRowsByShift.get(shift.id) ?? []");
     expect(close).toContain("voucherOutByMethod(voucherRows)");
-    expect(close).toContain("p_collection_counts: collectionCounts");
+    expect(close).toContain("collectionCounts,");
     // Y el rechazo de la transacción se traduce a su código propio.
     expect(close).toContain('errorMessage.includes("ARQUEO_STALE")');
     expect(close).toContain('"ARQUEO_STALE",');
@@ -6606,10 +6595,9 @@ describe("migración 058_close_arqueo_consistency.sql (CL-19)", () => {
     // origen de cada lista sigue fijado en `values`).
     expect(fetcher).toContain("readAllSourceInChunks");
     expect(fetcher).toContain("values: shiftIds");
-    expect(fetcher).toContain('.in("cash_shift_id", chunk)');
+    expect(fetcher).toContain("db.invoicePaymentsByShiftsPage(chunk, from, to)");
     expect(fetcher).toContain("values: [...shiftByInvoice.keys()]");
-    expect(fetcher).toContain('.in("invoice_id", chunk)');
-    expect(fetcher).toContain('.is("cash_shift_id", null)');
+    expect(fetcher).toContain("db.historicInvoicePaymentsPage(chunk, from, to)");
     // F1: trocar los DOS `values` (darle a la directa `[...shiftByInvoice.keys()]` y a la histórica `shiftIds`, dejando los `.in(..., chunk)`) pasa todos los tokens sueltos de arriba, deja las dos consultas vacías y borra del arqueo toda colección de factura; por eso la lista y su columna se afirman POR BLOQUE.
     const bloqueDirecto = fetcher.slice(
       fetcher.indexOf('what: "los cobros de factura del turno"'),
@@ -6620,22 +6608,12 @@ describe("migración 058_close_arqueo_consistency.sql (CL-19)", () => {
       fetcher.indexOf("for (const row of nullShiftRows)"),
     );
     expect(bloqueDirecto).toContain("values: shiftIds");
-    expect(bloqueDirecto).toContain('.in("cash_shift_id", chunk)');
+    expect(bloqueDirecto).toContain("db.invoicePaymentsByShiftsPage(chunk, from, to)");
     expect(bloqueDirecto).not.toContain("values: [...shiftByInvoice.keys()]");
-    expect(bloqueDirecto).not.toContain('.in("invoice_id"');
-    expect(bloqueDirecto.indexOf("values:")).toBeLessThan(
-      bloqueDirecto.indexOf('.in("cash_shift_id", chunk)'),
-    );
+    expect(bloqueDirecto).not.toContain("historicInvoicePaymentsPage");
     expect(bloqueHistorico).toContain("values: [...shiftByInvoice.keys()]");
-    expect(bloqueHistorico).toContain('.in("invoice_id", chunk)');
-    expect(bloqueHistorico).toContain('.is("cash_shift_id", null)');
+    expect(bloqueHistorico).toContain("db.historicInvoicePaymentsPage(chunk, from, to)");
     expect(bloqueHistorico).not.toContain("values: shiftIds");
-    expect(bloqueHistorico.indexOf("values: [...shiftByInvoice.keys()]")).toBeLessThan(
-      bloqueHistorico.indexOf('.in("invoice_id", chunk)'),
-    );
-    expect(bloqueHistorico.indexOf('.in("invoice_id", chunk)')).toBeLessThan(
-      bloqueHistorico.indexOf('.is("cash_shift_id", null)'),
-    );
   });
 
   it("NO mueve aritmética de dinero a SQL: los dos conteo son `count(*)`, no `sum(...)`", () => {
@@ -6870,7 +6848,7 @@ describe("migración 059_close_arqueo_outflows.sql (CL-20)", () => {
     // 414: mismo filtro, lista troceada; el origen sigue fijado en `values`.
     expect(fetcher).toContain("readAllSourceInChunks");
     expect(fetcher).toContain("values: shiftIds");
-    expect(fetcher).toContain('.in("cash_shift_id", chunk)');
+    expect(fetcher).toContain("db.vouchersByShiftsPage(chunk, from, to)");
     expect(fetcher).toContain("rows.filter(isVoucherCashOut)");
     // Y la comparación de los CUATRO contra el token, con el MISMO rechazo de 058.
     expect(ddl).toMatch(

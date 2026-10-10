@@ -65,6 +65,7 @@ export interface BillingRepo {
   listInvoicePayments<T>(invoiceId: string): Promise<BillingResult<T[]>>;
   employeeRulesPage<T>(employeeIds: string[], from: number, to: number): BillingPage<T>;
   employeesByIds(ids: string[]): Promise<BillingResult<Array<{ id: string; user_id: string | null; full_name: string }>>>;
+  employeeIds(ids: string[]): Promise<BillingResult<Array<{ id: string }>>>;
   userNames(ids: string[]): Promise<BillingResult<Array<{ id: string; full_name: string }>>>;
   findInvoiceByIdempotencyKey<T>(key: string): Promise<BillingResult<T>>;
   findInvoicePaymentsByIdempotency<T>(invoiceId: string, key: string): Promise<BillingResult<T[]>>;
@@ -139,6 +140,7 @@ export function supabaseBillingRepo(db: SupabaseClient): BillingRepo {
           .range(from, to),
       ),
     employeesByIds: (ids) => result(db.from("employees").select("id, user_id, full_name").in("id", ids)),
+    employeeIds: (ids) => result(db.from("employees").select("id").in("id", ids)),
     userNames: (ids) => result(db.from("users").select("id, full_name").in("id", ids)),
     findInvoiceByIdempotencyKey: (key) => result(db.from("invoices").select(INVOICE_SELECT).eq("idempotency_key", key).maybeSingle()),
     findInvoicePaymentsByIdempotency: (invoiceId, key) =>

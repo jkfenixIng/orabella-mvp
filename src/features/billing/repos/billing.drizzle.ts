@@ -54,6 +54,7 @@ export function drizzleBillingRepo(db: Database): BillingRepo {
     listInvoicePayments: (invoiceId) => many(() => db.select(PAYMENT).from(invoicePayments).where(eq(invoicePayments.invoiceId, invoiceId)).orderBy(asc(invoicePayments.createdAt), asc(invoicePayments.id))),
     employeeRulesPage: (ids, from, to) => page((offset, limit) => db.select({ employee_id: commissionRules.employeeId, item_type: commissionRules.itemType, item_id: commissionRules.itemId, percent: commissionRules.percent, amount: commissionRules.amount }).from(commissionRules).where(and(eq(commissionRules.isActive, true), inArray(commissionRules.employeeId, ids))).orderBy(asc(commissionRules.id)).offset(offset).limit(limit), from, to),
     employeesByIds: (ids) => many(() => db.select({ id: employees.id, user_id: employees.userId, full_name: employees.fullName }).from(employees).where(inArray(employees.id, ids))),
+    employeeIds: (ids) => many(() => db.select({ id: employees.id }).from(employees).where(inArray(employees.id, ids))),
     userNames: (ids) => many(() => db.select({ id: users.id, full_name: users.fullName }).from(users).where(inArray(users.id, ids))),
     findInvoiceByIdempotencyKey: (key) => maybe(() => db.select(INVOICE).from(invoices).where(eq(invoices.idempotencyKey, key)).limit(1)),
     findInvoicePaymentsByIdempotency: (invoiceId, key) => many(() => db.select({ ...PAYMENT, idempotency_key: invoicePayments.idempotencyKey }).from(invoicePayments).where(and(eq(invoicePayments.invoiceId, invoiceId), eq(invoicePayments.idempotencyKey, key)))),
