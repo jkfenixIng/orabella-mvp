@@ -611,6 +611,8 @@ const SQUASH_SQL = readFileSync(join(SQUASH_DIR, SQUASH_NAME), "utf8");
 // no-touch regression guard for the applied 001 and portable 002 migrations.
 const BASE_SHA_001 = "b00a917d4e3c5f6683dc2bcf9a092fe762a7acd5";
 const BASE_SHA_002 = "65e6a3ad89b3164545b5436ccb3e9f58ab61d485";
+/** 003 as committed at 6d0d38d: 004 is a new file and must not edit 003. */
+const BASE_SHA_003 = "d42592f55717b6b991b115589d6fee01c864ab8e";
 
 /**
  * El volcado como ESQUEMA, sin prosa.
@@ -653,7 +655,7 @@ function tablasConColumnaSede(sql: string): string[] {
  * numerado nuevo, y entra en esta lista a mano, con su decisión escrita en
  * `supabase/squash/README.md` (5.3).
  */
-const MIGRACIONES_POSTERIORES = ["002_portable_platform.sql", "003_payment_method_arqueo.sql"] as const;
+const MIGRACIONES_POSTERIORES = ["002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql"] as const;
 
 /**
  * Top-level statements of a SQL file, comments removed. Splits on `;` only
@@ -804,6 +806,116 @@ function unauthorized003(sql: string): string[] {
   return offenders;
 }
 
+/** 004 can define exactly one literal search function, its ACL and its comment. */
+const SEARCH_004 = "public.search_products_literal(text, integer, integer)";
+const ALLOWLIST_004: ReadonlyArray<[string, RegExp]> = [
+  ["transaction", /^(?:BEGIN|COMMIT)$/],
+  ["literal search function", /^CREATE OR REPLACE FUNCTION public\.search_products_literal\( p_query text, p_limit integer, p_offset integer DEFAULT 0 \) RETURNS TABLE \(/],
+  ["revoke PUBLIC/anon/authenticated", /^REVOKE ALL ON FUNCTION public\.search_products_literal\(text, integer, integer\) FROM (?:PUBLIC|anon|authenticated)$/],
+  ["grant service_role", /^GRANT ALL ON FUNCTION public\.search_products_literal\(text, integer, integer\) TO service_role$/],
+  ["function comment", /^COMMENT ON FUNCTION public\.search_products_literal\(text, integer, integer\) IS '/],
+];
+
+/**
+ * 004's body is deliberately a narrow read-only program. Checking its prefix
+ * was insufficient: everything after RETURNS TABLE was effectively free. Keep
+ * the clauses that define the function contract explicit, then reject every
+ * write/privilege/dynamic-SQL escape hatch inside the dollar-quoted body.
+ */
+/** Whitespace/comment-insensitive representation of 004's intended function body. */
+function canonical004Body(body: string): string {
+  // The body contains no SQL string literal with `--`; stripping these comments
+  // makes a review-only explanation unable to relax the executable contract.
+  return body.replace(/--[^\n]*/g, "").replace(/\s+/g, " ").trim();
+}
+
+const EXPECTED_004_BODY = canonical004Body(`
+DECLARE
+  v_escape constant text := chr(92);
+  v_pattern text;
+  v_limit integer := least(greatest(coalesce(p_limit, 50), 1), 500);
+  v_offset integer := greatest(coalesce(p_offset, 0), 0);
+BEGIN
+  v_pattern := '%' || replace(
+    replace(
+      replace(coalesce(p_query, ''), v_escape, v_escape || v_escape),
+      '%', v_escape || '%'
+    ),
+    '_', v_escape || '_'
+  ) || '%';
+  RETURN QUERY
+  SELECT
+    p.id, p.sku, p.name, p.description, p.stock_qty, p.min_stock,
+    p.cost_price, p.sale_price, p.commission_value, p.is_active
+  FROM public.products AS p
+  WHERE p.name ILIKE v_pattern ESCAPE v_escape
+     OR p.sku ILIKE v_pattern ESCAPE v_escape
+  ORDER BY p.name ASC, p.id ASC
+  LIMIT v_limit
+  OFFSET v_offset;
+END;
+`);
+
+function invalid004Function(statement: string): string[] {
+  const failures: string[] = [];
+  const header = /^CREATE OR REPLACE FUNCTION public\.search_products_literal\( p_query text, p_limit integer, p_offset integer DEFAULT 0 \) RETURNS TABLE \( id uuid, sku text, name text, description text, stock_qty integer, min_stock integer, cost_price numeric, sale_price numeric, commission_value numeric, is_active boolean \) LANGUAGE plpgsql SECURITY INVOKER SET search_path TO 'public' AS \$\$/;
+  if (!header.test(statement)) failures.push("exact signature, SECURITY INVOKER or search_path");
+  const body = /AS \$\$([\s\S]*)\$\$$/.exec(statement)?.[1];
+  if (body === undefined) {
+    failures.push("missing dollar-quoted body");
+  } else if (canonical004Body(body) !== EXPECTED_004_BODY) {
+    // The body is an allowlist, not a blacklist: any extra statement (DML,
+    // DDL, grants, SET ROLE, CALL, PERFORM, dynamic SQL...) changes it.
+    failures.push("non-canonical read-only function body");
+  }
+  return failures;
+}
+
+function unauthorized004(sql: string): string[] {
+  const offenders: string[] = [];
+  const statements = sqlStatements(sql);
+  let literalFunctionCount = 0;
+  const revokedRoles = new Set<string>();
+  let grantCount = 0;
+  for (const statement of statements) {
+    if (!ALLOWLIST_004.some(([, allowed]) => allowed.test(statement))) {
+      offenders.push(statement.slice(0, 140));
+      continue;
+    }
+    if (/^CREATE OR REPLACE FUNCTION/.test(statement)) {
+      literalFunctionCount += 1;
+      const invalid = invalid004Function(statement);
+      if (invalid.length > 0) offenders.push(`${statement.slice(0, 80)} … ${invalid.join(", ")}`);
+    }
+    const revoke = /^REVOKE ALL ON FUNCTION public\.search_products_literal\(text, integer, integer\) FROM (PUBLIC|anon|authenticated)$/.exec(statement);
+    if (revoke) revokedRoles.add(revoke[1]);
+    if (/^GRANT ALL ON FUNCTION public\.search_products_literal/.test(statement)) grantCount += 1;
+  }
+  // Full migrations that define 004 must contain exactly its explicit ACL.
+  const expectedRevokes = ["PUBLIC", "anon", "authenticated"];
+  if (literalFunctionCount > 0 && (literalFunctionCount !== 1 || grantCount !== 1 || expectedRevokes.some((role) => !revokedRoles.has(role)) || revokedRoles.size !== expectedRevokes.length)) {
+    offenders.push(`004 cardinality function=${literalFunctionCount} revoke=${[...revokedRoles].sort().join(",")} grant=${grantCount}`);
+  }
+  return offenders;
+}
+
+/** The whole 004 file: allowlisted statements AND exactly one function, ACL pair and comment. */
+function invalid004File(sql: string): string[] {
+  const offenders = unauthorized004(sql);
+  const statements = sqlStatements(sql);
+  const count = (pattern: RegExp) => statements.filter((statement) => pattern.test(statement)).length;
+  const shape: Array<[string, number]> = [
+    ["CREATE search_products_literal", count(/^CREATE OR REPLACE FUNCTION public\.search_products_literal\(/)],
+    ["REVOKE PUBLIC", count(/^REVOKE ALL ON FUNCTION public\.search_products_literal\(text, integer, integer\) FROM PUBLIC$/)],
+    ["REVOKE anon", count(/^REVOKE ALL ON FUNCTION public\.search_products_literal\(text, integer, integer\) FROM anon$/)],
+    ["REVOKE authenticated", count(/^REVOKE ALL ON FUNCTION public\.search_products_literal\(text, integer, integer\) FROM authenticated$/)],
+    ["GRANT service_role", count(/^GRANT ALL ON FUNCTION public\.search_products_literal\(text, integer, integer\) TO service_role$/)],
+    ["COMMENT", count(/^COMMENT ON FUNCTION public\.search_products_literal\(text, integer, integer\) IS '/)],
+  ];
+  for (const [label, found] of shape) if (found !== 1) offenders.push(`004 expects exactly one ${label}, found ${found}`);
+  return offenders;
+}
+
 /**
  * Lo que una migración posterior NO puede hacer, con la marca que lo nombra.
  * Se aplica sobre el SQL ya sin comentarios y sin literales de cadena (la prosa
@@ -850,7 +962,7 @@ describe("el squash: `001_orabella_schema.sql` es el archivo vivo (squash de la 
     );
   });
 
-  it("002 stays narrow and 003 is restricted by its explicit object/action allowlist", () => {
+  it("002 stays narrow, 003 is restricted, and 004 contains only the literal search RPC", () => {
     const sql002 = stripSqlComments(readFileSync(join(SQUASH_DIR, "002_portable_platform.sql"), "utf8"));
     expect(sentenciasProhibidas(sql002), "002_portable_platform.sql").toEqual([]);
     expect(sql002.trim(), "002_portable_platform.sql").toMatch(/^BEGIN;[\s\S]*COMMIT;$/);
@@ -863,6 +975,143 @@ describe("el squash: `001_orabella_schema.sql` es el archivo vivo (squash de la 
     expect(stripSqlComments(sql003)).toMatch(/ALTER TABLE public\.payment_methods/);
     expect(stripSqlComments(sql003)).not.toMatch(/\bCREATE\s+POLICY\b/i);
     expect(stripSqlComments(sql003)).not.toMatch(/\bDROP\s+TABLE\b/i);
+
+    const sql004 = readFileSync(join(SQUASH_DIR, "004_inventory_literal_search.sql"), "utf8");
+    const body004 = stripSqlComments(sql004);
+    expect(body004.trim(), "004_inventory_literal_search.sql").toMatch(/^BEGIN;[\s\S]*COMMIT;$/);
+    expect(invalid004File(sql004), "004_inventory_literal_search.sql").toEqual([]);
+    expect(sqlStatements(sql004).filter((statement) => /^CREATE OR REPLACE FUNCTION/.test(statement))).toHaveLength(1);
+    expect(body004).toMatch(/SECURITY INVOKER/);
+    expect(body004).toMatch(/SET search_path TO 'public'/);
+    expect(body004).not.toMatch(/SECURITY DEFINER|\bEXECUTE\b|format\s*\(/i);
+    // LIKE with an explicit ESCAPE, the escape doubled first, then % and _.
+    expect(body004.match(/ILIKE v_pattern ESCAPE v_escape/g)).toHaveLength(2);
+    expect(body004).toMatch(/replace\(coalesce\(p_query, ''\), v_escape, v_escape \|\| v_escape\)/);
+    expect(body004).toMatch(/'%', v_escape \|\| '%'/);
+    expect(body004).toMatch(/'_', v_escape \|\| '_'/);
+    expect(body004).toMatch(/ORDER BY p\.name ASC, p\.id ASC/);
+    expect(body004).toMatch(/least\(greatest\(coalesce\(p_limit, 50\), 1\), 500\)/);
+    for (const role of ["PUBLIC", "anon", "authenticated"]) {
+      expect(sql004).toContain(`REVOKE ALL ON FUNCTION ${SEARCH_004} FROM ${role};`);
+    }
+    expect(sql004).toContain(`GRANT ALL ON FUNCTION ${SEARCH_004} TO service_role;`);
+  });
+
+  it("004's guard inspects the WHOLE function, not only its prefix (mutations of the real file)", () => {
+    const real = readFileSync(join(SQUASH_DIR, "004_inventory_literal_search.sql"), "utf8");
+    const mutate = (from: string, to: string) => {
+      expect(real, `fixture anchor: ${from}`).toContain(from);
+      return real.replace(from, to);
+    };
+    const bodyEnd = "  OFFSET v_offset;\n";
+    // Every `bodyInjection` keeps header, signature, SECURITY INVOKER,
+    // search_path, predicates, order and clamps intact. It can only fail because
+    // the complete-body allowlist sees the extra executable statement.
+    const bodyInjection = (label: string, statement: string): [string, string] => [
+      label,
+      mutate(bodyEnd, `${bodyEnd}  ${statement}\n`),
+    ];
+    const bodyMutations: Array<[string, string]> = [
+      bodyInjection("DELETE in the body", "DELETE FROM public.products;"),
+      bodyInjection("UPDATE in the body", "UPDATE public.products SET name = 'x';"),
+      bodyInjection("INSERT in the body", "INSERT INTO public.audit_logs (action, entity, entity_id) VALUES ('a', 'b', 'c');"),
+      bodyInjection("MERGE in the body", "MERGE INTO public.products p USING public.products q ON false WHEN NOT MATCHED THEN DO NOTHING;"),
+      bodyInjection("COPY in the body", "COPY public.products TO '/tmp/x';"),
+      bodyInjection("TRUNCATE in the body", "TRUNCATE public.products;"),
+      bodyInjection("GRANT in the body", "GRANT ALL ON public.products TO anon;"),
+      bodyInjection("DROP in the body", "DROP TABLE public.audit_logs;"),
+      bodyInjection("ALTER in the body", "ALTER TABLE public.products ADD COLUMN injected text;"),
+      bodyInjection("CREATE TABLE in the body", "CREATE TABLE public.injected (id uuid);"),
+      bodyInjection("LOCK TABLE in the body", "LOCK TABLE public.products IN ACCESS EXCLUSIVE MODE;"),
+      bodyInjection("CALL in the body", "CALL public.some_procedure();"),
+      bodyInjection("PERFORM set_config role in the body", "PERFORM set_config('role', 'postgres', true);"),
+      bodyInjection("second RETURN QUERY public.users", "RETURN QUERY SELECT u.id, u.id::text, u.full_name, NULL::text, 0, 0, NULL::numeric, NULL::numeric, NULL::numeric, true FROM public.users u;"),
+      bodyInjection("SET ROLE in the body", "SET ROLE postgres;"),
+      bodyInjection("SET LOCAL ROLE in the body", "SET LOCAL ROLE service_role;"),
+      bodyInjection("dynamic EXECUTE in the body", "EXECUTE 'SELECT 1';"),
+      bodyInjection("format() in the body", "PERFORM format('%s', 1);"),
+    ];
+    for (const [label, sql] of bodyMutations) {
+      expect(invalid004Function(sqlStatements(sql).find((statement) => /^CREATE OR REPLACE FUNCTION/.test(statement)) ?? ""), label).toContain("non-canonical read-only function body");
+    }
+    const mutations: Array<[string, string]> = [
+      ...bodyMutations,
+      ["SECURITY DEFINER in the CREATE", mutate("SECURITY INVOKER", "SECURITY DEFINER")],
+      ["SECURITY INVOKER removed", mutate("SECURITY INVOKER\n", "")],
+      ["search_path widened", mutate("SET search_path TO 'public'", "SET search_path TO 'public', 'pg_temp'")],
+      ["predicate changed", mutate("OR p.sku ILIKE v_pattern ESCAPE v_escape", "OR true")],
+      ["limit clamp removed", mutate("least(greatest(coalesce(p_limit, 50), 1), 500)", "p_limit")],
+      ["escape order changed", mutate("v_escape, v_escape || v_escape", "v_escape, v_escape")],
+      ["an extra column in RETURNS TABLE", mutate("  is_active boolean\n)", "  is_active boolean,\n  password_hash text\n)")],
+      ["a second, alternative function", mutate("REVOKE ALL ON FUNCTION", "CREATE OR REPLACE FUNCTION public.search_products_any(p text) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;\nREVOKE ALL ON FUNCTION")],
+      ["another function name with the same body", mutate("FUNCTION public.search_products_literal(\n", "FUNCTION public.search_products_other(\n")],
+      ["the REVOKE removed", mutate("REVOKE ALL ON FUNCTION public.search_products_literal(text, integer, integer) FROM PUBLIC;\n", "")],
+      ["the GRANT duplicated", mutate("TO service_role;\n", "TO service_role;\nGRANT ALL ON FUNCTION public.search_products_literal(text, integer, integer) TO service_role;\n")],
+      ["the CREATE removed", real.replace(/CREATE OR REPLACE FUNCTION[\s\S]*?\$\$;\n/, "")],
+    ];
+    for (const [label, sql] of mutations) {
+      expect(invalid004File(sql), label).not.toEqual([]);
+    }
+    // Positive control: the real file passes, and harmless formatting does too.
+    expect(invalid004File(real)).toEqual([]);
+    expect(invalid004File(real.replace(/\n {2}/g, "\n    ").replace(/-- Escape[^\n]*\n/, ""))).toEqual([]);
+  });
+
+  it("004's allowlist rejects any other object, grant or DDL (negative fixtures)", () => {
+    const wrap = (statement: string) => `BEGIN;\n${statement}\nCOMMIT;`;
+    const unauthorized = [
+      "CREATE OR REPLACE FUNCTION public.search_products(p_query text) RETURNS SETOF public.products LANGUAGE sql AS $$ SELECT * FROM public.products $$;",
+      "CREATE OR REPLACE FUNCTION public.search_products_literal(p_query text) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;",
+      "CREATE OR REPLACE FUNCTION public.search_products_literal( p_query text, p_limit integer, p_offset integer DEFAULT 0 ) RETURNS TABLE (id uuid) LANGUAGE plpgsql AS $$ BEGIN DROP TABLE public.products; END; $$;",
+      "CREATE OR REPLACE FUNCTION public.search_products_literal( p_query text, p_limit integer, p_offset integer DEFAULT 0 ) RETURNS TABLE (id uuid) LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'SELECT ' || p_query; END; $$;",
+      "CREATE OR REPLACE FUNCTION public.search_products_literal( p_query text, p_limit integer, p_offset integer DEFAULT 0 ) RETURNS TABLE (id uuid) LANGUAGE plpgsql AS $$ BEGIN GRANT ALL ON public.products TO anon; END; $$;",
+      `GRANT ALL ON FUNCTION ${SEARCH_004} TO anon;`,
+      `GRANT ALL ON FUNCTION ${SEARCH_004} TO authenticated;`,
+      `GRANT ALL ON FUNCTION ${SEARCH_004} TO PUBLIC;`,
+      `REVOKE ALL ON FUNCTION ${SEARCH_004} FROM service_role;`,
+      "GRANT SELECT ON public.products TO anon;",
+      "REVOKE ALL ON FUNCTION public.deduct_stock_atomic(uuid, text, jsonb) FROM service_role;",
+      `ALTER FUNCTION ${SEARCH_004} SECURITY DEFINER;`,
+      `ALTER FUNCTION ${SEARCH_004} OWNER TO anon;`,
+      `DROP FUNCTION ${SEARCH_004};`,
+      "CREATE INDEX idx_products_name_trgm ON public.products (name);",
+      "CREATE TABLE public.search_cache (id uuid);",
+      "ALTER TABLE public.products ADD COLUMN search text;",
+      "CREATE POLICY p ON public.products USING (true);",
+      "CREATE TRIGGER trg_x BEFORE INSERT ON public.products FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();",
+      "COMMENT ON TABLE public.products IS 'x';",
+      "DO $$ BEGIN DROP TABLE public.products; END; $$;",
+      "UPDATE public.products SET name = 'x';",
+      "DELETE FROM public.products;",
+    ];
+    // The exact signature prefix the OLD rule accepted, followed by a harmful
+    // body or clause. Every one of these passed the prefix-only allowlist.
+    const prefix =
+      "CREATE OR REPLACE FUNCTION public.search_products_literal( p_query text, p_limit integer, p_offset integer DEFAULT 0 ) RETURNS TABLE ( id uuid, sku text, name text, description text, stock_qty integer, min_stock integer, cost_price numeric, sale_price numeric, commission_value numeric, is_active boolean )";
+    const invoker = "LANGUAGE plpgsql SECURITY INVOKER SET search_path TO 'public'";
+    unauthorized.push(
+      `${prefix} ${invoker} AS $$ BEGIN DELETE FROM public.products; END; $$;`,
+      `${prefix} ${invoker} AS $$ BEGIN UPDATE public.products SET name = 'x'; END; $$;`,
+      `${prefix} ${invoker} AS $$ BEGIN INSERT INTO public.products (sku, name) VALUES ('x', 'y'); END; $$;`,
+      `${prefix} ${invoker} AS $$ BEGIN SET ROLE postgres; END; $$;`,
+      `${prefix} LANGUAGE plpgsql SECURITY DEFINER SET search_path TO 'public' AS $$ BEGIN RETURN; END; $$;`,
+      `${prefix} ${invoker} AS $$ BEGIN RETURN QUERY EXECUTE format('SELECT * FROM %I', p_query); END; $$;`,
+    );
+    for (const statement of unauthorized) {
+      expect(unauthorized004(wrap(statement)), statement).not.toEqual([]);
+    }
+    // The old prefix-only rule really accepted those harmful statements.
+    const prefixOnly = /^CREATE OR REPLACE FUNCTION public\.search_products_literal\( p_query text, p_limit integer, p_offset integer DEFAULT 0 \) RETURNS TABLE \(/;
+    expect(unauthorized.slice(-6).every((statement) => prefixOnly.test(sqlStatements(wrap(statement))[1]))).toBe(true);
+    for (const statement of [
+      `REVOKE ALL ON FUNCTION ${SEARCH_004} FROM PUBLIC;`,
+      `REVOKE ALL ON FUNCTION ${SEARCH_004} FROM anon;`,
+      `REVOKE ALL ON FUNCTION ${SEARCH_004} FROM authenticated;`,
+      `GRANT ALL ON FUNCTION ${SEARCH_004} TO service_role;`,
+      `COMMENT ON FUNCTION ${SEARCH_004} IS 'x';`,
+    ]) {
+      expect(unauthorized004(wrap(statement)), statement).toEqual([]);
+    }
   });
 
   it("003's allowlist rejects anything outside its named objects and actions (negative fixtures)", () => {
@@ -931,10 +1180,11 @@ describe("el squash: `001_orabella_schema.sql` es el archivo vivo (squash de la 
     }
   });
 
-  it("001 and 002 are not modified by this change (byte-identical to the base commit)", () => {
+  it("001, 002 and 003 are not modified by this change (byte-identical to the base commit)", () => {
     for (const [name, sha] of [
       ["001_orabella_schema.sql", BASE_SHA_001],
       ["002_portable_platform.sql", BASE_SHA_002],
+      ["003_payment_method_arqueo.sql", BASE_SHA_003],
     ] as const) {
       const text = readFileSync(join(SQUASH_DIR, name));
       // Git's blob hash is "blob <byteLength>\\0" followed by the bytes.

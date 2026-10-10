@@ -1769,7 +1769,7 @@ incremental normal que producción puede recibir como cualquier migración.
 
 ### 9.3 Orden de arranque
 
-- **Supabase:** `001 → 002 → 003 → seeds`.
+- **Supabase:** `001 → 002 → 003 → 004 → seeds`.
 
 ### 003 — arqueo: orden global de locks
 
@@ -1784,16 +1784,16 @@ los cuerpos `_legacy`, que conservan la lógica de 001. Esto elimina el ciclo
 comisión (turno→balance→factura) frente a edición (antes factura→balance).
 PGlite comprueba la definición y el contrato de ACL; antes de producción debe
 correrse el caso de dos sesiones sobre PostgreSQL real.
-- **PostgreSQL limpio:** `bootstrap/platform-roles.sql → 001 → 002 → 003 → app-role.sql → seeds`.
+- **PostgreSQL limpio:** `bootstrap/platform-roles.sql → 001 → 002 → 003 → 004 → app-role.sql → seeds`.
 
 ### 9.4 Cómo se verifica
 
 - `tests/hardening.test.ts`, bloque del squash: lista explícita de migraciones
-  posteriores y orden estricto; 002 sigue con prohibición total y 003 tiene una
-  allowlist explícita por archivo/objeto/acción, con fixtures negativos para
-  ALTER, GRANT, CREATE TABLE y DROP no autorizados. También verifica la
-  inmutabilidad byte a byte de 001 y 002 desde el commit base, y la cabecera de
-  `current_sede_id()` en 001 y 002.
+  posteriores y orden estricto; 002 sigue con prohibición total y 003/004 tienen
+  allowlists explícitas por archivo/objeto/acción, con fixtures negativos para
+  ALTER, GRANT, CREATE TABLE, DDL dentro de funciones y DROP no autorizados.
+  También verifica la inmutabilidad byte a byte de 001, 002 y 003 desde el
+  commit base, y la cabecera de `current_sede_id()` en 001 y 002.
 - `tests/db/payment-method-arqueo.db.test.ts` (`npm run test:db`): 001+002+003,
   backfill, código libre/inmutable, balance por método, borde del 50 %, ventas
   que reponen el saldo, legado bloqueado y secuencia comisión+vale.

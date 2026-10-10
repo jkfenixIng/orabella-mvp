@@ -45,6 +45,26 @@ function findPgError(error: unknown): PgLike | null {
   return null;
 }
 
+/**
+ * Drizzle's `DrizzleQueryError` message is "Failed query: <sql>\nparams: <values>":
+ * the values can be password hashes or token hashes. Such a wrapper never
+ * provides the message; its driver `cause` does (the PostgreSQL message, which
+ * never echoes bound parameters), or a generic text. Only the three normalized
+ * fields leave this module: the driver error object itself (which may carry
+ * `params`) is never forwarded.
+ */
+const isQueryWrapper = (value: PgLike | null): boolean =>
+  value !== null && typeof value.message === "string" && value.message.startsWith("Failed query:");
+
+function safeMessage(error: unknown): string {
+  let current = asPgLike(error);
+  for (let depth = 0; current && depth < 5; depth += 1) {
+    if (!isQueryWrapper(current) && typeof current.message === "string") return current.message;
+    current = asPgLike(current.cause);
+  }
+  return isQueryWrapper(asPgLike(error)) ? "Database query failed." : String(error);
+}
+
 export function toDbError(error: unknown): DbError {
   const pg = findPgError(error);
   const source = pg ?? asPgLike(error);
@@ -53,7 +73,7 @@ export function toDbError(error: unknown): DbError {
   const code = pg ? (pg.code as string) : typeof source?.code === "string" ? source.code : null;
   return {
     code,
-    message: typeof source?.message === "string" ? source.message : String(error),
-    details: typeof detail === "string" ? detail : null,
+    message: pg && typeof pg.message === "string" && !isQueryWrapper(pg) ? pg.message : safeMessage(error),
+    details: typeof detail === "string" && !isQueryWrapper(source) ? detail : null,
   };
 }

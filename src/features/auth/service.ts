@@ -1,5 +1,13 @@
 import { createHash, randomBytes, scrypt as scryptCb, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
+import { DbQueryError } from "@/src/shared/db/errors";
+import {
+  authRepo,
+  type AuthRepo,
+  type AuthUserRow,
+  type PasswordResetRow,
+  type SessionRow,
+} from "./repos/auth";
 import {
   adminCreateUserSchema,
   changePasswordSchema,
@@ -224,52 +232,46 @@ export function nextFailedLoginState(
 }
 
 // ----------------------------------------------------------- persistencia ---
-export interface AuthUserRow {
-  id: string;
-  /**
-   * La cuenta sigue nombrando la instalación a la que pertenece, y las guardas
-   * de sesión la exigen (`requireSession`, `requireAdminSession`, las de caja,
-   * facturación, inventario y nómina): sin ella la sesión se rechaza con
-   * NO_SEDE. Es un campo DEVUELTO de la fila de la cuenta, no un criterio con el
-   * que el negocio acote sus lecturas.
-   */
-  sede_id: string | null;
-  email: string | null;
-  phone: string | null;
-  id_type: string;
-  id_number: string;
-  password_hash: string;
-  full_name: string;
-  is_active: boolean;
-  must_change_password: boolean;
-  failed_attempts: number;
-  locked_until: string | null;
+export type { AuthUserRow, PasswordResetRow, SessionRow } from "./repos/auth";
+
+/**
+ * Repositorio del motor configurado (supabase por defecto), cargado bajo
+ * demanda: los tests unitarios (sin red/env) nunca cargan un cliente real.
+ */
+async function adminDb(): Promise<AuthRepo> {
+  return authRepo();
 }
 
-export interface SessionRow {
-  id: string;
-  user_id: string;
-  token_hash: string;
-  expires_at: string;
-  revoked: boolean;
-  last_activity_at: string;
-}
-
-export interface PasswordResetRow {
-  id: string;
-  user_id: string;
-  token_hash: string;
-  expires_at: string;
-  used: boolean;
+function internal(): AuthError {
+  return new AuthError("INTERNAL", "Error interno.", 500);
 }
 
 /**
- * Cliente privilegiado bajo demanda (service_role, solo servidor).
- * Import dinámico para que los tests unitarios (sin red/env) nunca lo carguen.
+ * Una llamada al repositorio con el contrato de este módulo: cualquier falla
+ * de la base es INTERNAL 500. El mensaje de la base (que puede describir la
+ * consulta) jamás llega al cliente.
  */
-async function adminDb() {
-  const { createAdminClient } = await import("@/src/shared/lib/supabase/server");
-  return createAdminClient();
+async function guarded<T>(query: () => Promise<T>): Promise<T> {
+  try {
+    return await query();
+  } catch {
+    throw internal();
+  }
+}
+
+/**
+ * El error de una RPC con la forma que lee `esRechazoDeRpc` (SQLSTATE y
+ * mensaje exacto del RAISE EXCEPTION). Un fallo que no viene de la base queda
+ * como un error sin código: nunca es un rechazo de contrato.
+ */
+function rpcFailure(error: unknown): { code?: string; message?: string } {
+  if (!(error instanceof DbQueryError)) return { message: "" };
+  return { code: error.error.code ?? undefined, message: error.error.message };
+}
+
+/** Códigos de rol de la cuenta: el embed `roles(code)`, filtrado al catálogo. */
+function roleCodes(rows: Array<{ roles: { code: string } | null }>): RoleCode[] {
+  return rows.map((row) => row.roles?.code).filter(isRoleCode);
 }
 
 function validationMessage(error: { issues: Array<{ message: string }> }): string {
@@ -281,25 +283,10 @@ async function findUserByDocument(documento: string): Promise<{
   roles: RoleCode[];
 } | null> {
   const db = await adminDb();
-  const { data: user, error } = await db
-    .from("users")
-    .select(
-      "id, sede_id, email, phone, id_type, id_number, password_hash, full_name, is_active, must_change_password, failed_attempts, locked_until",
-    )
-    .eq("id_number", documento)
-    .maybeSingle();
-  if (error) throw new AuthError("INTERNAL", "Error interno.", 500);
+  const user = await guarded(() => db.findUserByDocument(documento));
   if (!user) return null;
-  const row = user as AuthUserRow;
-  const { data: roleRows, error: roleError } = await db
-    .from("user_roles")
-    .select("roles(code)")
-    .eq("user_id", row.id);
-  if (roleError) throw new AuthError("INTERNAL", "Error interno.", 500);
-  const roles = ((roleRows ?? []) as unknown as Array<{ roles: { code: string } | null }>)
-    .map((r) => r.roles?.code)
-    .filter(isRoleCode);
-  return { user: row, roles };
+  const roles = roleCodes(await guarded(() => db.roleEmbeds(user.id)));
+  return { user, roles };
 }
 
 export interface LoginResult {
@@ -346,14 +333,12 @@ export async function loginWithDocument(raw: unknown, now: Date = new Date()): P
   if (!matches) {
     const outcome = nextFailedLoginState(user.failed_attempts, now);
     await recordRateFailure(documento, LOGIN_BUDGET);
-    const { error } = await db
-      .from("users")
-      .update({
+    await guarded(() =>
+      db.updateLoginState(user.id, {
         failed_attempts: outcome.failedAttempts,
         locked_until: outcome.lockedUntil?.toISOString() ?? null,
-      })
-      .eq("id", user.id);
-    if (error) throw new AuthError("INTERNAL", "Error interno.", 500);
+      }),
+    );
     await writeAudit({
       user_id: user.id,
       action: outcome.locked ? AUDIT_ACTIONS.LOGIN_LOCKED : AUDIT_ACTIONS.LOGIN_FAILED,
@@ -369,18 +354,10 @@ export async function loginWithDocument(raw: unknown, now: Date = new Date()): P
   }
 
   const issued = createSessionToken(now);
-  const { error: sessionError } = await db.from("sessions").insert({
-    user_id: user.id,
-    token_hash: issued.tokenHash,
-    expires_at: issued.expiresAt.toISOString(),
-  });
-  if (sessionError) throw new AuthError("INTERNAL", "Error interno.", 500);
-
-  const { error: resetError } = await db
-    .from("users")
-    .update({ failed_attempts: 0, locked_until: null })
-    .eq("id", user.id);
-  if (resetError) throw new AuthError("INTERNAL", "Error interno.", 500);
+  await guarded(() =>
+    db.insertSession({ user_id: user.id, token_hash: issued.tokenHash, expires_at: issued.expiresAt.toISOString() }),
+  );
+  await guarded(() => db.updateLoginState(user.id, { failed_attempts: 0, locked_until: null }));
 
   await resetRateLimit(documento, LOGIN_BUDGET);
   return {
@@ -395,12 +372,7 @@ export async function loginWithDocument(raw: unknown, now: Date = new Date()): P
 export async function logoutWithToken(token: string | null | undefined): Promise<{ revoked: boolean }> {
   if (!token) return { revoked: false };
   const db = await adminDb();
-  const { error } = await db
-    .from("sessions")
-    .update({ revoked: true })
-    .eq("token_hash", hashToken(token))
-    .eq("revoked", false);
-  if (error) throw new AuthError("INTERNAL", "Error interno.", 500);
+  await guarded(() => db.revokeSession(hashToken(token)));
   return { revoked: true };
 }
 
@@ -420,14 +392,8 @@ export async function getSessionUser(
 ): Promise<SessionUser | null> {
   if (!token) return null;
   const db = await adminDb();
-  const { data: session, error } = await db
-    .from("sessions")
-    .select("id, user_id, token_hash, expires_at, revoked, last_activity_at")
-    .eq("token_hash", hashToken(token))
-    .maybeSingle();
-  if (error) throw new AuthError("INTERNAL", "Error interno.", 500);
-  if (!session) return null;
-  const sessionRow = session as SessionRow;
+  const sessionRow = await guarded(() => db.findSession(hashToken(token)));
+  if (!sessionRow) return null;
   const validity = checkSessionValidity({
     revoked: sessionRow.revoked,
     expiresAt: new Date(sessionRow.expires_at),
@@ -436,29 +402,14 @@ export async function getSessionUser(
   });
   if (!validity.valid) return null;
 
-  const { data: user, error: userError } = await db
-    .from("users")
-    .select(
-      "id, sede_id, email, phone, id_type, id_number, password_hash, full_name, is_active, must_change_password, failed_attempts, locked_until",
-    )
-    .eq("id", sessionRow.user_id)
-    .maybeSingle();
-  if (userError) throw new AuthError("INTERNAL", "Error interno.", 500);
-  if (!user || !(user as AuthUserRow).is_active) return null;
+  const user = await guarded(() => db.findUserById(sessionRow.user_id));
+  if (!user || !user.is_active) return null;
 
-  await db
-    .from("sessions")
-    .update({ last_activity_at: now.toISOString() })
-    .eq("id", sessionRow.id);
-
-  const { data: roleRows } = await db
-    .from("user_roles")
-    .select("roles(code)")
-    .eq("user_id", sessionRow.user_id);
-  const roles = ((roleRows ?? []) as unknown as Array<{ roles: { code: string } | null }>)
-    .map((r) => r.roles?.code)
-    .filter(isRoleCode);
-  return { user: user as AuthUserRow, roles, session: sessionRow };
+  // Best-effort, como siempre: un fallo al refrescar la actividad o al leer los
+  // roles no invalida la sesión (los roles quedan vacíos y el gate decide).
+  await db.touchSession(sessionRow.id, now.toISOString()).catch(() => undefined);
+  const roles = roleCodes(await db.roleEmbeds(sessionRow.user_id).catch(() => []));
+  return { user, roles, session: sessionRow };
 }
 
 /**
@@ -473,15 +424,10 @@ export async function changeUserPassword(args: {
   const parsed = changePasswordSchema.safeParse(args.raw);
   if (!parsed.success) throw new AuthError("VALIDATION", validationMessage(parsed.error), 400);
   const db = await adminDb();
-  const { data: user, error } = await db
-    .from("users")
-    .select("id, password_hash")
-    .eq("id", args.userId)
-    .maybeSingle();
-  if (error) throw new AuthError("INTERNAL", "Error interno.", 500);
+  const user = await guarded(() => db.findPasswordHash(args.userId));
   if (!user) throw new AuthError("UNAUTHENTICATED", "Se requiere autenticación.", 401);
 
-  const matches = await verifyPassword(parsed.data.actual, (user as { password_hash: string }).password_hash);
+  const matches = await verifyPassword(parsed.data.actual, user.password_hash);
   if (!matches) throw new AuthError("INVALID_CREDENTIALS", "La clave actual no es correcta.", 401);
 
   // CL-18: la clave nueva, la expulsión de las DEMÁS sesiones y el CAS sobre
@@ -496,12 +442,15 @@ export async function changeUserPassword(args: {
   // La post-condición —"ninguna otra sesión viva"— se comprueba ADENTRO de la
   // función, sobre la fila bloqueada: si no se cumple, la transacción entera se
   // revierte y la clave no cambia.
-  const { error: changeError } = await db.rpc("change_user_password", {
-    p_user_id: args.userId,
-    p_password_hash: await hashPassword(parsed.data.nueva),
-    p_current_token_hash: args.currentTokenHash,
-    p_expected_password_hash: (user as { password_hash: string }).password_hash,
-  });
+  const passwordHash = await hashPassword(parsed.data.nueva);
+  const changeError = await db
+    .changeUserPassword({
+      userId: args.userId,
+      passwordHash,
+      currentTokenHash: args.currentTokenHash,
+      expectedPasswordHash: user.password_hash,
+    })
+    .then(() => null, rpcFailure);
   if (changeError) {
     // El CAS perdió: la clave cambió por debajo entre la lectura y la
     // escritura. Es un rechazo DE CONTRATO (P0001), no un 500: el usuario
@@ -543,12 +492,13 @@ export async function requestPasswordReset(
 
   const issued = createPasswordResetToken(now);
   const db = await adminDb();
-  const { error } = await db.from("password_resets").insert({
-    user_id: found.user.id,
-    token_hash: issued.tokenHash,
-    expires_at: issued.expiresAt.toISOString(),
-  });
-  if (error) throw new AuthError("INTERNAL", "Error interno.", 500);
+  await guarded(() =>
+    db.insertPasswordReset({
+      user_id: found.user.id,
+      token_hash: issued.tokenHash,
+      expires_at: issued.expiresAt.toISOString(),
+    }),
+  );
 
   if (process.env.NODE_ENV === "production") return { requested: true };
   return { requested: true, devToken: issued.token };
@@ -568,13 +518,7 @@ export async function confirmPasswordReset(
   // La comprobación que MANDA es la de adentro de `confirm_password_reset`
   // (054), sobre la fila bloqueada: entre esta lectura y esa sentencia, otro
   // puede haber usado el token.
-  const { data: reset, error } = await db
-    .from("password_resets")
-    .select("id, user_id, token_hash, expires_at, used")
-    .eq("token_hash", tokenHash)
-    .maybeSingle();
-  if (error) throw new AuthError("INTERNAL", "Error interno.", 500);
-  const row = reset as PasswordResetRow | null;
+  const row: PasswordResetRow | null = await guarded(() => db.findPasswordReset(tokenHash));
   if (
     !row ||
     !isResetTokenUsable({ used: row.used, expiresAt: new Date(row.expires_at), now })
@@ -590,11 +534,10 @@ export async function confirmPasswordReset(
   // de recuperación en el MVP, la cuenta quedaba inaccesible PARA SIEMPRE. Es
   // el único hallazgo del barrido que era un callejón sin salida, y por eso la
   // marca y la clave son ahora indivisibles.
-  const { error: resetError } = await db.rpc("confirm_password_reset", {
-    p_token_hash: tokenHash,
-    p_password_hash: await hashPassword(parsed.data.nueva),
-    p_now: now.toISOString(),
-  });
+  const passwordHash = await hashPassword(parsed.data.nueva);
+  const resetError = await db
+    .confirmPasswordReset({ tokenHash, passwordHash, now: now.toISOString() })
+    .then(() => null, rpcFailure);
   if (resetError) {
     // Un token que se consumió (o venció) entre la lectura de arriba y la
     // sentencia: la función lo rechaza con el MISMO error que el usuario ya
@@ -639,15 +582,8 @@ async function discardCreatedUser(
 ): Promise<void> {
   let removido = false;
   try {
-    const { error } = await db.rpc("discard_created_user", { p_user_id: args.userId });
-    if (!error) {
-      const { data: resto, error: readError } = await db
-        .from("users")
-        .select("id")
-        .eq("id", args.userId)
-        .maybeSingle();
-      removido = !readError && !resto;
-    }
+    await db.discardCreatedUser(args.userId);
+    removido = !(await db.findUserIdBy("id", args.userId));
   } catch {
     removido = false;
   }
@@ -686,41 +622,35 @@ export async function adminCreateUser(raw: unknown): Promise<{ id: string }> {
   const input = parsed.data;
   const db = await adminDb();
 
-  const { data: existingDoc } = await db
-    .from("users")
-    .select("id")
-    .eq("id_number", input.documento)
-    .maybeSingle();
+  // Pre-chequeos de cortesía: como antes, un error de lectura no frena el alta
+  // (la unicidad real la impone `create_user_with_role`).
+  const existingDoc = await db.findUserIdBy("id_number", input.documento).catch(() => null);
   if (existingDoc) throw new AuthError("USER_EXISTS", "El documento ya está registrado.", 409);
-  const { data: existingEmail } = await db
-    .from("users")
-    .select("id")
-    .eq("email", input.email)
-    .maybeSingle();
+  const existingEmail = await db.findUserIdBy("email", input.email).catch(() => null);
   if (existingEmail) throw new AuthError("USER_EXISTS", "El correo ya está registrado.", 409);
 
-  const { data: roleRows, error: roleError } = await db
-    .from("roles")
-    .select("id, code")
-    .in("code", input.roles);
-  if (roleError) throw new AuthError("INTERNAL", "Error interno.", 500);
-  const roleIds = ((roleRows ?? []) as Array<{ id: string; code: string }>).map((r) => r.id);
+  const roleIds = (await guarded(() => db.findRoles(input.roles))).map((role) => role.id);
   if (roleIds.length !== input.roles.length) {
     throw new AuthError("VALIDATION", "Rol desconocido.", 400);
   }
 
-  const { data: createdId, error: createError } = await db.rpc("create_user_with_role", {
-    p_user: {
-      sede_id: input.sede_id ?? null,
-      email: input.email,
-      phone: input.phone ?? null,
-      id_type: input.id_type,
-      id_number: input.documento,
-      password_hash: await hashPassword(input.documento),
-      full_name: input.full_name,
-    },
-    p_role_codes: input.roles,
-  });
+  const passwordHash = await hashPassword(input.documento);
+  const created = await db
+    .createUserWithRole(
+      {
+        sede_id: input.sede_id ?? null,
+        email: input.email,
+        phone: input.phone ?? null,
+        id_type: input.id_type,
+        id_number: input.documento,
+        password_hash: passwordHash,
+        full_name: input.full_name,
+      },
+      input.roles,
+    )
+    .then((data) => ({ data }), (error) => ({ error: rpcFailure(error) }));
+  const createdId = "data" in created ? created.data : null;
+  const createError = "error" in created ? created.error : null;
   if (createError) {
     // Un rol que no está en el catálogo conserva su error de negocio (el
     // pre-chequeo de arriba ya devolvía éste); una carrera de unicidad y todo
@@ -739,7 +669,12 @@ export async function adminCreateUser(raw: unknown): Promise<{ id: string }> {
   // no puede entrar en la transacción de la línea de arriba. Un fallo acá se
   // compensa deshaciendo lo escrito, y si la compensación también falla el
   // residuo queda AUDITADO (ver `discardCreatedUser`).
-  const { error: authError } = await db.auth.admin.createUser({
+  //
+  // Fase 3b-2: con DB_ENGINE=postgres NO existe Supabase Auth. Ese motor omite
+  // el espejo (una copia que nadie lee: auth.users tiene 0 filas en producción)
+  // y responde "sin error", así que tampoco hay compensación. Con el motor
+  // `supabase` el espejo y su compensación siguen exactamente como antes.
+  const authError = await db.mirrorAuthUser({
     email: input.email,
     password: input.documento,
     email_confirm: true,
@@ -752,11 +687,7 @@ export async function adminCreateUser(raw: unknown): Promise<{ id: string }> {
       // El motivo se guarda ESTRUCTURADO (código/estado del proveedor) y no como
       // el texto libre que devuelva el otro sistema: un mensaje ajeno no puede
       // terminar escribiendo en la auditoría algo que el usuario mandó.
-      motivo: String(
-        (authError as { code?: string; status?: number }).code ??
-          (authError as { status?: number }).status ??
-          "auth_error",
-      ),
+      motivo: String(authError.code ?? authError.status ?? "auth_error"),
     });
     throw new AuthError("INTERNAL", "Error interno.", 500);
   }
@@ -776,13 +707,13 @@ export async function adminCreateUser(raw: unknown): Promise<{ id: string }> {
   // lo exigen (ver `AuthUserRow.sede_id`). Lo que se retiró es el alcance por
   // sede de las lecturas del negocio, no la columna: eso se va con el borrado
   // físico de la columna en la migración final de una sola sede (M3c).
-  {
-    const { error: linkError } = await db
-      .from("employees")
-      .update({ user_id: userId })
-      .eq("document", input.documento)
-      .is("user_id", null);
-    if (linkError) console.error("[auth] no se pudo vincular empleado:", linkError.message);
+  try {
+    await db.linkEmployees(userId, input.documento);
+  } catch (linkError) {
+    console.error(
+      "[auth] no se pudo vincular empleado:",
+      linkError instanceof DbQueryError ? linkError.error.message : "Error interno.",
+    );
   }
 
   return { id: userId };
@@ -800,24 +731,10 @@ export async function adminResetUserPassword(
   actorUserId: string,
 ): Promise<{ user_id: string }> {
   const db = await adminDb();
-  const { data: target, error: targetError } = await db
-    .from("users")
-    .select("id, id_number")
-    .eq("id", userId)
-    .maybeSingle();
-  if (targetError) throw new AuthError("INTERNAL", "Error interno.", 500);
-  if (!target) throw new AuthError("NOT_FOUND", "Usuario no encontrado.", 404);
-  const row = target as { id: string; id_number: string };
-  const { error: updateError } = await db
-    .from("users")
-    .update({
-      password_hash: await hashPassword(row.id_number),
-      must_change_password: true,
-      failed_attempts: 0,
-      locked_until: null,
-    })
-    .eq("id", row.id);
-  if (updateError) throw new AuthError("INTERNAL", "Error interno.", 500);
+  const row = await guarded(() => db.findUserDocument(userId));
+  if (!row) throw new AuthError("NOT_FOUND", "Usuario no encontrado.", 404);
+  const passwordHash = await hashPassword(row.id_number);
+  await guarded(() => db.resetPasswordToDocument(row.id, passwordHash));
   await writeAudit({
     user_id: actorUserId,
     action: AUDIT_ACTIONS.PASSWORD_CHANGED,

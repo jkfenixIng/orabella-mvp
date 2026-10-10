@@ -6,20 +6,97 @@
  * arrives as `{ code, message, details }` with the SQLSTATE.
  *
  * It covers only the builder calls the repositories use: select (plain
- * column lists), count exact head, in/eq/gte/lte/match, order, range/limit,
- * insert/update/upsert(onConflict id), single and maybeSingle (PGRST116 when
- * the row count does not fit, like PostgREST).
+ * column lists and a many-to-one embed `table(col)` resolved through the
+ * `<singular>_id` foreign key, an object or null like PostgREST), count exact
+ * head, in/eq/neq/is/gte/lte/match, `or` with `ilike` items, order,
+ * range/limit, insert/update/upsert(onConflict id), single and maybeSingle
+ * (PGRST116 when the row count does not fit), and `rpc` with PostgREST's named
+ * arguments (resolved against pg_proc, result serialized with to_json).
+ *
+ * `or()` parses PostgREST's logic-tree grammar: a double-quoted value with `\`
+ * escapes, or an unquoted value that ends at `,` or `)`; `*` becomes `%` in a
+ * like value. That is what makes the quoting of a search observable here.
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Db } from "./harness";
 
 type Result = { data: unknown; count?: number | null; error: unknown };
-type Filter = { column: string; op: "=" | ">=" | "<=" | "in"; value: unknown };
+type Filter =
+  | { column: string; op: "=" | "<>" | ">=" | "<=" | "in" | "is"; value: unknown }
+  | { op: "or"; items: Array<{ column: string; value: string }> };
 
 const ident = (name: string) => `"${name.replace(/"/g, '""')}"`;
 
-export function postgrestDouble(pg: Db): SupabaseClient {
+/** A PostgREST error object from a PostgreSQL error, as PostgREST sends it. */
+function toPostgrestError(raw: unknown) {
+  const error = raw as { code?: string; message: string; detail?: string };
+  return { code: error.code ?? null, message: error.message, details: error.detail ?? null };
+}
+
+/** `col.ilike.value,col.ilike."value"` -> items; the PostgREST logic-tree grammar. */
+export function parseOrIlike(tree: string): Array<{ column: string; value: string }> {
+  const items: Array<{ column: string; value: string }> = [];
+  let rest = tree;
+  while (rest.length > 0) {
+    const head = /^([a-z_]+)\.ilike\./.exec(rest);
+    if (!head) throw new Error(`unsupported or() item: ${rest}`);
+    rest = rest.slice(head[0].length);
+    let value = "";
+    if (rest.startsWith('"')) {
+      let index = 1;
+      for (; index < rest.length && rest[index] !== '"'; index += 1) {
+        if (rest[index] === "\\") index += 1;
+        value += rest[index];
+      }
+      rest = rest.slice(index + 1);
+    } else {
+      const end = rest.search(/[,)]/);
+      value = end === -1 ? rest : rest.slice(0, end);
+      rest = end === -1 ? "" : rest.slice(end);
+    }
+    items.push({ column: head[1], value: value.replace(/\*/g, "%") });
+    if (rest.startsWith(",")) rest = rest.slice(1);
+    else if (rest.length > 0) throw new Error(`malformed or() filter near: ${rest}`);
+  }
+  return items;
+}
+
+async function rpc(pg: Db, fn: string, args: Record<string, unknown> = {}): Promise<{ data: unknown; error: unknown }> {
+  const { rows } = await pg.query<{ name: string; type: string; returns_set: boolean }>(
+    `SELECT unnest(p.proargnames) AS name, unnest(string_to_array(oidvectortypes(p.proargtypes), ', ')) AS type, p.proretset AS returns_set
+       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public' AND p.proname = $1`,
+    [fn],
+  );
+  const types = new Map(rows.map((row) => [row.name, row.type]));
+  const params: unknown[] = [];
+  const named = Object.entries(args).map(([name, value]) => {
+    const type = types.get(name);
+    if (!type) throw new Error(`rpc ${fn}: unknown argument ${name}`);
+    params.push(type === "jsonb" && value !== null ? JSON.stringify(value) : value);
+    return `${ident(name)} => $${params.length}::${type}`;
+  });
+  try {
+    const returnsSet = rows[0]?.returns_set === true;
+    const statement = returnsSet
+      ? `SELECT coalesce(json_agg(result), '[]'::json) AS result FROM (SELECT * FROM public.${ident(fn)}(${named.join(", ")})) result`
+      : `SELECT to_json(public.${ident(fn)}(${named.join(", ")})) AS result`;
+    const result = await pg.query<{ result: unknown }>(statement, params);
+    return { data: result.rows[0].result, error: null };
+  } catch (raw) {
+    return { data: null, error: toPostgrestError(raw) };
+  }
+}
+
+export interface AuthAdminDouble {
+  createUser(values: Record<string, unknown>): Promise<{ data: unknown; error: unknown }>;
+}
+
+export function postgrestDouble(pg: Db, authAdmin?: AuthAdminDouble): SupabaseClient {
   return {
+    rpc: (fn: string, args?: Record<string, unknown>) => rpc(pg, fn, args),
+    auth: { admin: authAdmin },
+
     from(table: string) {
       let columns = "*";
       let head = false;
@@ -35,6 +112,15 @@ export function postgrestDouble(pg: Db): SupabaseClient {
         if (filters.length === 0) return "";
         return ` WHERE ${filters
           .map((filter) => {
+            if (filter.op === "or") {
+              return `(${filter.items
+                .map((item) => {
+                  params.push(item.value);
+                  return `${ident(item.column)} ILIKE $${params.length}`;
+                })
+                .join(" OR ")})`;
+            }
+            if (filter.op === "is") return `${ident(filter.column)} IS NULL`;
             params.push(filter.value);
             return filter.op === "in"
               ? `${ident(filter.column)}::text = ANY($${params.length}::text[])`
@@ -46,7 +132,15 @@ export function postgrestDouble(pg: Db): SupabaseClient {
       const statement = (params: unknown[]): string => {
         const projection = columns
           .split(",")
-          .map((column) => ident(column.trim()))
+          .map((column) => {
+            const embed = /^([a-z_]+)\(([a-z_, ]+)\)$/.exec(column.trim());
+            if (!embed) return ident(column.trim());
+            // Many-to-one embed: the row of `embed[1]` its `<singular>_id` points to.
+            const [, target, list] = embed;
+            const fields = list.split(",").map((field) => `'${field.trim()}', e.${ident(field.trim())}`);
+            const fk = `${target.replace(/s$/, "")}_id`;
+            return `(SELECT json_build_object(${fields.join(", ")}) FROM public.${ident(target)} e WHERE e.id = t.${ident(fk)}) AS ${ident(target)}`;
+          })
           .join(", ");
         if (write) {
           const keys = Object.keys(write.values);
@@ -63,7 +157,7 @@ export function postgrestDouble(pg: Db): SupabaseClient {
                   : "");
           return `WITH w AS (${body} RETURNING ${returning ? projection : "1 AS x"}) SELECT coalesce(json_agg(w), '[]'::json) AS rows FROM w`;
         }
-        const base = `SELECT ${projection} FROM public.${ident(table)}${where(params)}`;
+        const base = `SELECT ${projection} FROM public.${ident(table)} t${where(params)}`;
         if (head) return `SELECT count(*)::int AS n FROM (${base}) q`;
         const order = orders.length ? ` ORDER BY ${orders.join(", ")}` : "";
         const window = `${limit !== null ? ` LIMIT ${limit}` : ""}${offset ? ` OFFSET ${offset}` : ""}`;
@@ -77,8 +171,7 @@ export function postgrestDouble(pg: Db): SupabaseClient {
           const row = result.rows[0];
           return head ? { rows: [], n: row.n } : { rows: (row.rows ?? []) as unknown[] };
         } catch (raw) {
-          const error = raw as { code?: string; message: string; detail?: string };
-          return { error: { code: error.code ?? null, message: error.message, details: error.detail ?? null } };
+          return { error: toPostgrestError(raw) };
         }
       };
 
@@ -122,6 +215,19 @@ export function postgrestDouble(pg: Db): SupabaseClient {
         },
         eq(column: string, value: unknown) {
           filters.push({ column, op: "=", value });
+          return query;
+        },
+        neq(column: string, value: unknown) {
+          filters.push({ column, op: "<>", value });
+          return query;
+        },
+        is(column: string, value: null) {
+          if (value !== null) throw new Error("is() supports only null");
+          filters.push({ column, op: "is", value });
+          return query;
+        },
+        or(tree: string) {
+          filters.push({ op: "or", items: parseOrIlike(tree) });
           return query;
         },
         gte(column: string, value: unknown) {

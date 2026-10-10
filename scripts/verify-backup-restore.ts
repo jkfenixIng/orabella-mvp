@@ -8,13 +8,14 @@
  * Writes exactly one file: <backup-dir>/verificacion-restauracion-pglite.txt
  *
  * Steps: checksums -> schema (bootstrap/platform-roles.sql + 001 + 002 verbatim,
- * NO catalog seed, the dump brings its own rows) -> data load -> FK check ->
- * exact row count per table vs prod-conteos.txt -> catalog inventory vs
- * prod-catalogo.txt.
+ * NO catalog seed, the dump brings its own rows) -> data load -> every later
+ * migration (003, 004...) -> FK check -> exact row count per table vs
+ * prod-conteos.txt -> catalog inventory vs prod-catalogo.txt.
  *
- * Expected difference: 002 redefines current_sede_id() without auth.jwt(). The
- * inventory compares signatures, so it does not show up there; the report says
- * it explicitly until production has 002 applied.
+ * Expected differences are declared by exact object name below: 002 redefines
+ * current_sede_id() and 003/004 add repo-only objects until production applies
+ * them. The inventory compares signatures, so it does not confuse that with a
+ * data/schema drift.
  * No network and no remote database: PGlite runs in-process.
  */
 import { createHash } from "node:crypto";
@@ -39,13 +40,13 @@ if (!process.argv[2] || REQUIRED.some((file) => !existsSync(join(dir, file)))) {
 const read = (file: string): string => readFileSync(join(dir, file), "utf8");
 
 /**
- * Catalog objects that exist in the repo because of 003 and not yet in the
+ * Catalog objects that exist in the repo because of 003/004 and not yet in the
  * production backup. They are EXPECTED differences, listed one by one: anything
  * outside this list (or missing from production) is still a failure. The
  * dropped `payment_methods_code_check` is the one object production has and
  * the repo intentionally no longer has.
  */
-const EXPECTED_003 = {
+const EXPECTED_LATER = {
   tables: new Set(["cash_shift_method_balances"]),
   onlyInRepo: new Set([
     "function|cash_open_shift_atomic_legacy(p_register_id uuid, p_opened_by uuid, p_opening_base numeric, p_counts jsonb)",
@@ -80,6 +81,8 @@ const EXPECTED_003 = {
     "index|cash_shift_method_balances.cash_shift_method_balances_shift_method_key",
     "index|cash_shift_method_balances.cash_shift_method_balances_shift_code_key",
     "index|payment_methods.uq_payment_methods_single_denominations",
+    // 004: literal inventory search, used by both database engines.
+    "function|search_products_literal(p_query text, p_limit integer, p_offset integer)",
   ]),
   onlyInProduction: new Set(["constraint|payment_methods.payment_methods_code_check|c"]),
 };
@@ -262,7 +265,7 @@ for (const table of [...new Set([...expectedCounts.keys(), ...tables])].sort()) 
   if (expected !== undefined && expected === actual) log(`  OK    ${label}`);
   // A table that only 003 creates: empty after the migration (no shift is
   // reconstructed). Any row would be a failure.
-  else if (expected === undefined && EXPECTED_003.tables.has(table) && actual === 0) log(`  ESPERADA (003, aun no en produccion) ${label}`);
+  else if (expected === undefined && EXPECTED_LATER.tables.has(table) && actual === 0) log(`  ESPERADA (migracion posterior, aun no en produccion) ${label}`);
   else fail(label);
 }
 
@@ -319,12 +322,12 @@ for (const kind of ["function", "trigger", "constraint", "index", "policy"]) {
   const localOwn = new Set([...localAll].filter(isKind).filter((line) => !localExtension.has(line)));
   const missingAll = [...prodOwn].filter((line) => !localOwn.has(line)).sort();
   const extraAll = [...localOwn].filter((line) => !prodOwn.has(line)).sort();
-  const expectedMissing = missingAll.filter((line) => EXPECTED_003.onlyInProduction.has(line));
-  const expectedExtra = extraAll.filter((line) => EXPECTED_003.onlyInRepo.has(line));
-  const missing = missingAll.filter((line) => !EXPECTED_003.onlyInProduction.has(line));
-  const extra = extraAll.filter((line) => !EXPECTED_003.onlyInRepo.has(line));
+  const expectedMissing = missingAll.filter((line) => EXPECTED_LATER.onlyInProduction.has(line));
+  const expectedExtra = extraAll.filter((line) => EXPECTED_LATER.onlyInRepo.has(line));
+  const missing = missingAll.filter((line) => !EXPECTED_LATER.onlyInProduction.has(line));
+  const extra = extraAll.filter((line) => !EXPECTED_LATER.onlyInRepo.has(line));
   for (const line of expectedMissing) log(`        ESPERADA (003 la borra, produccion la conserva hasta aplicar 003): ${line}`);
-  for (const line of expectedExtra) log(`        ESPERADA (003, aun no en produccion): ${line}`);
+  for (const line of expectedExtra) log(`        ESPERADA (migracion posterior, aun no en produccion): ${line}`);
   const prodTotal = prodLines.filter(isKind).length;
   const localTotal = [...localAll].filter(isKind).length;
   const summaryKey = kind === "index" ? "indexes" : kind === "policy" ? "policies" : `${kind}s`;

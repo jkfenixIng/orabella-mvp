@@ -164,12 +164,19 @@ describe("src/shared/db is server only", () => {
     expect(DISK.read("src/features/admin/repos/services.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
     expect(DISK.read("src/features/admin/repos/catalogs.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
     expect(DISK.read("src/features/alerts/repos/alerts.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
+    expect(DISK.read("src/features/inventory/repos/inventory.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
+    expect(DISK.read("src/features/auth/repos/auth.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
+    expect(DISK.read("src/shared/lib/repos/audit.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
+    expect(DISK.read("src/shared/lib/audit.ts")).not.toMatch(/supabase\/server/);
   });
 
   it("the default engine's static graphs load neither drizzle-orm nor postgres-js", () => {
     const reached = [
       ...graph(DISK, "src/features/admin/service.ts", { dynamic: false }),
       ...graph(DISK, "src/features/alerts/service.ts", { dynamic: false }),
+      ...graph(DISK, "src/features/inventory/service.ts", { dynamic: false }),
+      ...graph(DISK, "src/features/auth/service.ts", { dynamic: false }),
+      ...graph(DISK, "src/shared/lib/repos/audit.ts", { dynamic: false }),
     ];
     const driverImporters = [...new Set(reached)].filter((file) =>
       staticImports(DISK.read(file)).some((specifier) => /^(drizzle-orm|postgres)(\/|$)/.test(specifier)),
@@ -177,7 +184,24 @@ describe("src/shared/db is server only", () => {
     expect(reached).toContain("src/features/admin/repos/services.ts");
     expect(reached).toContain("src/features/admin/repos/catalogs.ts");
     expect(reached).toContain("src/features/alerts/repos/alerts.ts");
+    expect(reached).toContain("src/features/inventory/repos/inventory.ts");
+    expect(reached).toContain("src/features/auth/repos/auth.ts");
     expect(driverImporters).toEqual([]);
+  });
+
+  it("every Drizzle adapter is reached only through import() from its port", () => {
+    const adapters = ALL_FILES.filter((file) => file.endsWith(".drizzle.ts"));
+    expect(adapters).toEqual(
+      expect.arrayContaining([
+        "src/features/inventory/repos/inventory.drizzle.ts",
+        "src/features/auth/repos/auth.drizzle.ts",
+        "src/shared/lib/repos/audit.drizzle.ts",
+      ]),
+    );
+    const statics = ALL_FILES.filter((file) =>
+      staticImports(DISK.read(file)).some((specifier) => adapters.includes(resolveImport(DISK, file, specifier) ?? "")),
+    );
+    expect(statics).toEqual([]);
   });
 });
 

@@ -2,7 +2,6 @@ import {
   applyMovementStock,
   filterLowStock,
   manualMovementSchema,
-  matchesProductQuery,
   movementSchema,
   normalizeSku,
   planStockDeduction,
@@ -10,7 +9,6 @@ import {
   sortKardexAscending,
   type DeductionLine,
   type MovementInput,
-  type MovementType,
   type PlannedDeduction,
   type ProductInput,
 } from "./schemas";
@@ -18,6 +16,15 @@ import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
 import { requireSedeRole } from "@/src/shared/lib/sede";
 import { requireSession } from "@/src/features/admin/service";
+import { DbQueryError } from "@/src/shared/db/errors";
+import {
+  inventoryRepo,
+  type InventoryRepo,
+  type MovementRow,
+  type ProductRow,
+} from "./repos/inventory";
+
+export type { MovementRow, ProductRow } from "./repos/inventory";
 
 export class InventoryError extends Error {
   readonly code: string;
@@ -31,13 +38,9 @@ export class InventoryError extends Error {
   }
 }
 
-/**
- * Cliente privilegiado bajo demanda (service_role, solo servidor).
- * Import dinámico para que los tests unitarios (sin red/env) nunca lo carguen.
- */
-async function inventoryDb() {
-  const { createAdminClient } = await import("@/src/shared/lib/supabase/server");
-  return createAdminClient();
+/** Repositorio del motor configurado (supabase por defecto), cargado bajo demanda. */
+async function inventoryDb(): Promise<InventoryRepo> {
+  return inventoryRepo();
 }
 
 /**
@@ -89,74 +92,31 @@ export async function requireInventoryWriter(
 }
 
 // ------------------------------------------------------------------ productos ---
-export interface ProductRow {
-  id: string;
-  sku: string;
-  name: string;
-  description: string | null;
-  stock_qty: number;
-  min_stock: number;
-  cost_price: number | null;
-  sale_price: number | null;
-  /** I1: comisión sugerida del producto (absoluta); null = sin sugerencia. */
-  commission_value: number | null;
-  is_active: boolean;
+/** Any database failure of this module is the same opaque INTERNAL error. */
+function internal(): InventoryError {
+  return new InventoryError("INTERNAL", "Error interno.", 500);
 }
 
-const PRODUCT_SELECT =
-  "id, sku, name, description, stock_qty, min_stock, cost_price, sale_price, commission_value, is_active";
-/** Misma selección sin la comisión: la migración 027 aún sin aplicar en esta base. */
-const PRODUCT_SELECT_LEGACY =
-  "id, sku, name, description, stock_qty, min_stock, cost_price, sale_price, is_active";
-
-// I1: commission_value llega con la migración 027. La primera consulta decide y
-// se cachea para no repetir la prueba; un error distinto (red/permisos) no se
-// cachea, así la consulta real lo reporta en vez de degradar en silencio.
-let commissionColumn: boolean | null = null;
-
-async function resolveProductSelect(db: Awaited<ReturnType<typeof inventoryDb>>): Promise<string> {
-  if (commissionColumn === null) {
-    const probe = await db.from("products").select("commission_value").limit(1);
-    if (!probe.error) {
-      commissionColumn = true;
-    } else {
-      const message = String((probe.error as { message?: string }).message ?? "");
-      if (/commission_value/i.test(message)) commissionColumn = false;
-    }
+/** Runs a repository read; a database failure becomes INTERNAL 500. */
+async function read<T>(query: (db: InventoryRepo) => Promise<T>): Promise<T> {
+  const db = await inventoryDb();
+  try {
+    return await query(db);
+  } catch {
+    throw internal();
   }
-  return commissionColumn === false ? PRODUCT_SELECT_LEGACY : PRODUCT_SELECT;
-}
-
-/** Rellena commission_value cuando la columna no está disponible en esta base. */
-function normalizeProduct(row: Record<string, unknown>): ProductRow {
-  return {
-    ...(row as unknown as ProductRow),
-    commission_value: (row.commission_value as number | null) ?? null,
-  };
 }
 
 /** INV-05 + lectura: lista productos activos e inactivos (máx. 50 por defecto). */
 export async function listProducts(limit?: number): Promise<ProductRow[]> {
-  const db = await inventoryDb();
-  const { data, error } = await db
-    .from("products")
-    .select(await resolveProductSelect(db))
-    .order("name")
-    .limit(clampLimit(limit));
-  if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  return ((data ?? []) as unknown as Array<Record<string, unknown>>).map(normalizeProduct);
+  // Orden total name, id (fase 3b-2): los empates de nombre no se repiten entre páginas.
+  return read((db) => db.listProducts(clampLimit(limit)));
 }
 
 export async function getProduct(id: string): Promise<ProductRow> {
-  const db = await inventoryDb();
-  const { data, error } = await db
-    .from("products")
-    .select(await resolveProductSelect(db))
-    .eq("id", id)
-    .maybeSingle();
-  if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  if (!data) throw new InventoryError("NOT_FOUND", "Producto no encontrado.", 404);
-  return normalizeProduct(data as unknown as Record<string, unknown>);
+  const product = await read((db) => db.findProduct(id));
+  if (!product) throw new InventoryError("NOT_FOUND", "Producto no encontrado.", 404);
+  return product;
 }
 
 /**
@@ -174,95 +134,59 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
   const sku = normalizeSku(input.sku);
   const db = await inventoryDb();
 
-  const conflictQuery = db
-    .from("products")
-    .select("id")
-    .eq("sku", sku)
-    .limit(1);
-  const { data: conflicts, error: conflictError } = input.id
-    ? await conflictQuery.neq("id", input.id)
-    : await conflictQuery;
-  if (conflictError) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  if (conflicts && conflicts.length > 0) {
+  const conflicts = await read(() => db.skuConflicts(sku, input.id));
+  if (conflicts.length > 0) {
     throw new InventoryError("SKU_TAKEN", "El SKU ya existe.", 409);
   }
 
-  const select = await resolveProductSelect(db);
-  const payload = {
-    ...(input.id ? { id: input.id } : {}),
-    sku,
-    name: input.name,
-    description: input.description ?? null,
-    min_stock: input.min_stock,
-    cost_price: input.cost_price ?? null,
-    sale_price: input.sale_price ?? null,
-    // Con la columna ausente (027 sin aplicar) no se envía la comisión.
-    ...(select === PRODUCT_SELECT ? { commission_value: input.commission_value ?? null } : {}),
-    ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
-  };
-  const { data, error } = await db
-    .from("products")
-    .upsert(payload, { onConflict: "id" })
-    .select(select)
-    .single();
-  if (error) {
+  let saved: ProductRow | null;
+  try {
+    saved = await db.upsertProduct({
+      ...(input.id ? { id: input.id } : {}),
+      sku,
+      name: input.name,
+      description: input.description ?? null,
+      min_stock: input.min_stock,
+      cost_price: input.cost_price ?? null,
+      sale_price: input.sale_price ?? null,
+      commission_value: input.commission_value ?? null,
+      ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
+    });
+  } catch (error) {
     // Carrera perdida contra UNIQUE (sku): mismo error de negocio.
-    if ((error as { code?: string }).code === "23505") {
+    if (error instanceof DbQueryError && error.error.code === "23505") {
       throw new InventoryError("SKU_TAKEN", "El SKU ya existe.", 409);
     }
-    throw new InventoryError("INTERNAL", "Error interno.", 500);
+    throw internal();
   }
-  if (!data) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  return normalizeProduct(data as unknown as Record<string, unknown>);
+  if (!saved) throw internal();
+  return saved;
 }
 
-/** INV-05: búsqueda por fragmento de nombre o SKU (máx. 50 por defecto). */
+/**
+ * INV-05: búsqueda por fragmento de nombre o SKU (máx. 50 por defecto).
+ *
+ * Fase 3b-2 (corrección intencional): el fragmento es TEXTO LITERAL en los dos
+ * motores —comas, paréntesis, comillas, `%`, `_` y `\` nunca son sintaxis—.
+ * Antes el valor iba sin comillas en el `.or()` de PostgREST, donde `,` y `)`
+ * cortaban el filtro, y `*` no tenía escape (PostgREST lo vuelve `%`).
+ *
+ * Migración 004: la búsqueda la hace `search_products_literal` en los dos
+ * motores, con el texto como parámetro tipado. `*` es literal, la respuesta ya
+ * es exacta y completa: una sola lectura de una página, sin filtro posterior.
+ */
 export async function searchProducts(q: string, limit?: number): Promise<ProductRow[]> {
   const needle = q.trim();
   if (needle === "") return listProducts(limit);
-  const db = await inventoryDb();
-  const escaped = needle.replace(/[%_,\\]/g, (char) => `\\${char}`);
-  const pattern = `%${escaped}%`;
-  const { data, error } = await db
-    .from("products")
-    .select(await resolveProductSelect(db))
-    .or(`name.ilike.${pattern},sku.ilike.${pattern}`)
-    .order("name")
-    .limit(clampLimit(limit));
-  if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  const rows = ((data ?? []) as unknown as Array<Record<string, unknown>>).map(normalizeProduct);
-  // Filtro de apoyo en memoria (misma regla que matchesProductQuery).
-  return rows.filter((row) => matchesProductQuery(row, needle));
+  return read((db) => db.searchProducts(needle, clampLimit(limit)));
 }
 
 /** INV-04: productos con stock en o bajo el mínimo (alerta visible, máx. 200). */
 export async function lowStockAlerts(limit?: number): Promise<ProductRow[]> {
-  const db = await inventoryDb();
-  const { data, error } = await db
-    .from("products")
-    .select(await resolveProductSelect(db))
-    .eq("is_active", true)
-    .order("stock_qty")
-    .limit(clampLimit(limit, 200));
-  if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  return filterLowStock(((data ?? []) as unknown as Array<Record<string, unknown>>).map(normalizeProduct));
+  return filterLowStock(await read((db) => db.activeByStock(clampLimit(limit, 200))));
 }
 
 // ---------------------------------------------------------------- movimientos ---
-export interface MovementRow {
-  id: string;
-  product_id: string;
-  type: MovementType;
-  qty: number;
-  reason: string;
-  user_id: string | null;
-  actor_name?: string | null;
-  created_at: string;
-}
-
-const MOVEMENT_SELECT =
-  "id, product_id, type, qty, reason, user_id, created_at";
-
 /** El que registra el movimiento: sólo su identidad. */
 export interface MovementActor {
   userId: string;
@@ -297,19 +221,16 @@ export interface RegisterMovementResult {
  * equivocado como si fuera la repetición del que se pidió).
  */
 async function findMovementByIdempotencyKey(
-  db: Awaited<ReturnType<typeof inventoryDb>>,
+  db: InventoryRepo,
   productId: string,
   idempotencyKey: string,
 ): Promise<MovementRow | null> {
-  const { data, error } = await db
-    .from("inventory_movements")
-    .select(MOVEMENT_SELECT)
-    .eq("product_id", productId)
-    .eq("idempotency_key", idempotencyKey)
-    .limit(1)
-    .maybeSingle();
-  if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  return (data as MovementRow | null) ?? null;
+  return read(() => db.findMovementByKey(productId, idempotencyKey));
+}
+
+/** INSUFFICIENT_STOCK is decided by the RAISE EXCEPTION message on both engines. */
+function isInsufficientStock(error: unknown): boolean {
+  return error instanceof DbQueryError && error.error.message.includes("INSUFFICIENT_STOCK");
 }
 
 /**
@@ -415,9 +336,9 @@ export async function registerMovement(
     throw new InventoryError("VALIDATION", "Cantidad inválida.", 400);
   }
 
-  const { data, error } = await db
-    .from("inventory_movements")
-    .insert({
+  let data: MovementRow | null;
+  try {
+    data = await db.insertMovement({
       product_id: product.id,
       type: input.type,
       qty: input.qty,
@@ -427,11 +348,9 @@ export async function registerMovement(
       // del índice parcial de la 045 (los caminos de facturación, que no
       // tienen intento propio, no entran al índice y no compiten con nadie).
       idempotency_key: input.idempotency_key ?? null,
-    })
-    .select(MOVEMENT_SELECT)
-    .single();
-  if (error) {
-    if (typeof error.message === "string" && error.message.includes("INSUFFICIENT_STOCK")) {
+    });
+  } catch (error) {
+    if (isInsufficientStock(error)) {
       throw new InventoryError(
         "INSUFFICIENT_STOCK",
         "Stock insuficiente: el movimiento dejaría el stock negativo.",
@@ -451,7 +370,8 @@ export async function registerMovement(
     // misma marca sigue reconociendo cuando la guarda se levanta.
     if (
       input.idempotency_key &&
-      (error as { code?: string } | null)?.code === "23505"
+      error instanceof DbQueryError &&
+      error.error.code === "23505"
     ) {
       const winner = await findMovementByIdempotencyKey(
         db,
@@ -469,7 +389,7 @@ export async function registerMovement(
   if (!data) throw new InventoryError("INTERNAL", "Error interno.", 500);
 
   const current = await getProduct(product.id);
-  return { movement: data as MovementRow, stock_qty: current.stock_qty };
+  return { movement: data, stock_qty: current.stock_qty };
 }
 
 /**
@@ -487,17 +407,8 @@ export async function getProductsStock(
 ): Promise<Map<string, StockEntry>> {
   const unique = [...new Set(productIds)];
   if (unique.length === 0) return new Map();
-  const db = await inventoryDb();
-  const { data, error } = await db
-    .from("products")
-    .select("id, name, stock_qty")
-    .in("id", unique);
-  if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  return new Map(
-    ((data ?? []) as Array<{ id: string; name: string; stock_qty: number }>).map(
-      (row) => [row.id, { name: row.name, stock_qty: Number(row.stock_qty) }],
-    ),
-  );
+  const rows = await read((db) => db.productStocks(unique));
+  return new Map(rows.map((row) => [row.id, { name: row.name, stock_qty: Number(row.stock_qty) }]));
 }
 
 function toStockError(error: unknown): InventoryError {
@@ -594,12 +505,16 @@ export async function deductStock(
   }
 
   const db = await inventoryDb();
-  const { data: applied, error } = await db.rpc("deduct_stock_atomic", {
-    p_user_id: actor.userId,
-    p_reason: reason,
-    p_items: planned.map((item) => ({ product_id: item.product_id, qty: item.qty })),
-  });
-  if (error) throw toRpcDeductionError(error as { message?: unknown } | null);
+  let applied: unknown;
+  try {
+    applied = await db.deductStockAtomic(
+      actor.userId,
+      reason,
+      planned.map((item) => ({ product_id: item.product_id, qty: item.qty })),
+    );
+  } catch (error) {
+    throw toRpcDeductionError(error instanceof DbQueryError ? error.error : null);
+  }
   // Segunda barrera en la frontera: la función ya revierte si escribió menos de
   // lo pedido, así que un conteo distinto sólo puede venir de una respuesta
   // incoherente. Se reporta como fallo real en vez de devolver un `planned` que
@@ -622,22 +537,13 @@ export async function getKardex(
 ): Promise<MovementRow[]> {
   await getProduct(productId);
   const db = await inventoryDb();
-  const { data, error } = await db
-    .from("inventory_movements")
-    .select(MOVEMENT_SELECT)
-    .eq("product_id", productId)
-    .order("created_at", { ascending: true })
-    .order("id", { ascending: true })
-    .limit(clampLimit(limit, 200));
-  if (error) throw new InventoryError("INTERNAL", "Error interno.", 500);
-  const rows = sortKardexAscending((data ?? []) as MovementRow[]);
+  const rows = sortKardexAscending(await read(() => db.kardex(productId, clampLimit(limit, 200))));
   const actorIds = [...new Set(rows.map((row) => row.user_id).filter((id): id is string => id !== null))];
   const actorNames = new Map<string, string>();
   if (actorIds.length > 0) {
-    const { data: users } = await db.from("users").select("id, full_name").in("id", actorIds);
-    for (const user of ((users ?? []) as Array<{ id: string; full_name: string }>)) {
-      actorNames.set(user.id, user.full_name);
-    }
+    // Los nombres son decorativos: una lectura fallida deja actor_name en null.
+    const users = await db.userNames(actorIds).catch(() => []);
+    for (const user of users) actorNames.set(user.id, user.full_name);
   }
   return rows.map((row) => ({
     ...row,

@@ -38,14 +38,16 @@ cp .env.example .env.local     # completar las 3 variables (ver Env)
 npm run dev                    # http://localhost:3000
 ```
 
-Base de datos, en este orden. `001` se aplica **una sola vez**; `002` y `003`
-son migraciones transaccionales; los seeds son idempotentes y se pueden reejecutar:
+Base de datos, en este orden. `001` se aplica **una sola vez**; `002`, `003` y
+`004` son migraciones transaccionales; los seeds son idempotentes y se pueden
+reejecutar:
 
 ```bash
 # apuntando al proyecto Supabase nuevo (connection string del dashboard)
 psql "<connection-string>" -v ON_ERROR_STOP=1 --single-transaction -f supabase/migrations/001_orabella_schema.sql
 psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/002_portable_platform.sql
 psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/003_payment_method_arqueo.sql
+psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/004_inventory_literal_search.sql
 psql "<connection-string>" -f supabase/seeds/catalog.sql      # catálogo mínimo: roles, sede, caja, pagos, impuestos, ajustes
 psql "<connection-string>" -f supabase/seeds/acceptance.sql   # opcional: datos de prueba §11
 ```
@@ -57,7 +59,16 @@ de `002`, como superusuario,
 `psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/bootstrap/app-role.sql`
 (crea `orabella_app`, el rol con el que la app se conecta con
 `DB_ENGINE=postgres`). Orden completo:
-`platform-roles.sql → 001 → 002 → 003 → app-role.sql → seeds`.
+`platform-roles.sql → 001 → 002 → 003 → 004 → app-role.sql → seeds`.
+
+### Búsqueda literal de inventario (`004`)
+
+`004_inventory_literal_search.sql` agrega la RPC `search_products_literal`.
+La búsqueda de inventario por nombre/SKU ahora es literal y case-insensitive:
+`%`, `_`, `*`, barra invertida, comas, paréntesis y comillas son texto, no
+wildcards ni sintaxis PostgREST/SQL. Devuelve una página limitada y estable por
+`name, id`; la app Supabase y la conexión PostgreSQL directa llaman la misma
+función. Es un cambio observable intencional: `*` dejó de ser wildcard.
 
 ### Métodos arqueables y producción (`003`)
 
@@ -198,6 +209,7 @@ supabase/
   migrations/001_orabella_schema.sql   # EL esquema completo (squash; aplicado, no se edita)
   migrations/002_portable_platform.sql # current_sede_id() sin auth.jwt()
   migrations/003_payment_method_arqueo.sql # métodos libres, modo de arqueo y base por método
+  migrations/004_inventory_literal_search.sql # búsqueda literal de productos
   bootstrap/platform-roles.sql         # roles de API, solo para PostgreSQL fuera de Supabase
   bootstrap/app-role.sql               # rol orabella_app (BYPASSRLS), solo fuera de Supabase
   schema-history/             # la serie histórica 001–078 (explicación y respaldo)
