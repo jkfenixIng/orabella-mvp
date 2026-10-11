@@ -35,9 +35,9 @@ For a plain PostgreSQL target, use a migration connection with the database priv
 
 ## Deterministic migration plan
 
-`npm run plan:portable-migrations` is the only migration-selection mechanism in this runbook. It reads migration files with numeric prefixes `002` and later, validates their names, SHA-256 hashes, duplicate versions, and consecutive lexical order, then produces a plan from a destination applied-state manifest. It never connects to or writes a database.
+`npm run plan:portable-migrations` is the only migration-selection mechanism in this runbook. The Node 20-compatible `.mjs` planner reads numeric migration files `002+`, validates names, hashes, duplicates, and order, then produces a contiguous plan. It never connects to or writes a database.
 
-The destination applied-state manifest is an export of the durable `public.portable_migration_audit` ledger. The target owner applies `supabase/bootstrap/portable-migration-audit.sql` once before the first portable plan. That bootstrap creates only the ledger; it does not apply migrations. For a destination that predates this ledger, reconcile its already-applied state from approved explicit object markers before writing ledger rows; never infer a migration from a filename or claim a production state in this runbook. Export the ledger without values other than filenames and hashes:
+The separate deployment-control bootstrap `supabase/bootstrap/portable-migration-audit.sql` creates the durable `public.portable_migration_audit` ledger and a dedicated `migration_operator` role. It is not an application migration. `migration_operator` is `NOLOGIN NOINHERIT`; the database owner must either use a distinct migration connection whose login can `SET ROLE migration_operator`, or use SQL Editor as a role that was deliberately granted that membership. `orabella_app` and `service_role` do not receive this membership. The ledger revokes all app writes: only `migration_operator` receives `INSERT`; `service_role` gets read-only access. For a destination that predates this ledger, reconcile approved explicit schema markers before recording any legacy state; never infer or forge an entry. Export the ledger without values other than filenames and hashes:
 
 ```bash
 psql "$STAGING_DB_URL" -X -v ON_ERROR_STOP=1 -A -t -c "
@@ -86,12 +86,16 @@ for file in \
   supabase/bootstrap/platform-roles.sql \
   supabase/bootstrap/portable-migration-audit.sql \
   supabase/bootstrap/app-role.sql \
-  scripts/plan-portable-migrations.ts \
-  scripts/verify-portable-migration-plan.ts \
+  scripts/portable-migrations.mjs \
+  scripts/plan-portable-migrations.mjs \
+  scripts/apply-portable-migration-plan.mjs \
+  scripts/verify-portable-migration-plan.mjs \
   scripts/verify-backup-restore.ts; do
   test -f "$file" || { echo "missing: $file"; exit 1; }
 done
 npm run plan:portable-migrations -- --help
+npm run apply:portable-migrations -- --help
+npm run test:portable-migrations
 npm run typecheck
 npm run test:db
 ```
@@ -206,13 +210,13 @@ psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f supabase/bootstrap/app-role.sql
 
 ### 5. Apply staged migrations
 
-**WRITE: changes staging schema, triggers, functions, ACLs, and data backfills.** Do not wrap migration files in an outer transaction: each migration manages its own transaction. The operator must execute the generated plan in order; no command in this repository applies migrations automatically.
+**WRITE: changes staging schema, triggers, functions, ACLs, and data backfills.** The Node apply script is the only executor: it verifies plan hashes immediately, executes every generated entry in order with `psql -v ON_ERROR_STOP=1`, and appends `SET ROLE migration_operator; INSERT ...` in the same `psql` session only after the migration file succeeds. It refuses `DATABASE_URL`; provide a distinct `MIGRATION_DATABASE_URL` for the migration runner identity.
 
 ```bash
-# One-time, plain PostgreSQL target only: create the durable ledger.
+# One-time, plain PostgreSQL target only. Run as DB owner; it grants the owner
+# a non-inheriting membership for SQL Editor / runner SET ROLE use.
 psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f supabase/bootstrap/portable-migration-audit.sql
 
-# Export the current ledger, then generate the only allowed application plan.
 psql "$STAGING_DB_URL" -X -v ON_ERROR_STOP=1 -A -t -c "
   SELECT coalesce(jsonb_build_object(
     'applied', coalesce(jsonb_agg(jsonb_build_object('filename', filename, 'sha256', sha256) ORDER BY filename), '[]'::jsonb),
@@ -222,9 +226,15 @@ psql "$STAGING_DB_URL" -X -v ON_ERROR_STOP=1 -A -t -c "
 npm run plan:portable-migrations -- \
   --state "$BACKUP_DIR/staging-scope-manifest.json" \
   --output "$BACKUP_DIR/staging-portable-migration-plan.json"
+
+MIGRATION_DATABASE_URL='<migration-runner-connection-url>' \
+  npm run apply:portable-migrations -- \
+    --plan "$BACKUP_DIR/staging-portable-migration-plan.json"
 ```
 
-Review the generated `apply` array and execute every listed entry in order. After each successful `psql -f` execution, the operator records that exact filename and SHA-256 in `public.portable_migration_audit`; do not record a failed or skipped migration. Re-export the ledger after the final entry and verify it against the unchanged plan:
+The migration files already own `BEGIN`/`COMMIT`, so the ledger insert cannot share their transaction without editing those files. The executor guarantees the insert is never attempted after a failed migration. If a process or connection fails after the migration commits but before the insert, it fails closed: the ledger remains incomplete and the verifier blocks cutover. Stop, capture evidence, and have the DB owner reconcile the approved schema marker and hash under the change process; **never manually insert a ledger row**.
+
+After the executor exits successfully, retain the final ledger export as evidence and create an approved read-only schema-marker JSON. The marker file is a JSON object whose keys are every planned/applied migration filename and whose values are `true` only when that migration's reviewed marker query passed. For `002`–`005`, use the marker SQL in this runbook; for an integrated `006`/`007`, use only its approved marker contract. The verifier queries the live ledger through `MIGRATION_DATABASE_URL` and verifies it with the markers against the unchanged plan:
 
 ```bash
 psql "$STAGING_DB_URL" -X -v ON_ERROR_STOP=1 -A -t -c "
@@ -233,13 +243,15 @@ psql "$STAGING_DB_URL" -X -v ON_ERROR_STOP=1 -A -t -c "
     'deferred', '[]'::jsonb
   )::text, '{\"applied\":[],\"deferred\":[]}')
   FROM public.portable_migration_audit;" > "$BACKUP_DIR/staging-applied-state-after.json"
-npm run verify:portable-migrations -- \
-  --state "$BACKUP_DIR/staging-applied-state-after.json" \
-  --plan "$BACKUP_DIR/staging-portable-migration-plan.json"
+MIGRATION_DATABASE_URL='<migration-runner-connection-url>' \
+  npm run verify:portable-migrations -- \
+    --scope "$BACKUP_DIR/staging-scope-manifest.json" \
+    --plan "$BACKUP_DIR/staging-portable-migration-plan.json" \
+    --markers "$BACKUP_DIR/staging-schema-markers.json"
 psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f supabase/bootstrap/app-role.sql
 ```
 
-A plan that lists an `apply` item is incomplete until the ledger export contains that item with the planned SHA-256. A plan with an empty `apply` array has no schema migration to execute.
+A plan that lists an `apply` item is incomplete until the final ledger has that exact filename and SHA-256. A plan with an empty `apply` array has no schema migration to execute.
 
 `003` makes outflows through arqueable methods fail on shifts opened before it until the shift is closed and reopened; it does not reconstruct opening balances. Plan that operational boundary before staging and production.
 
@@ -251,15 +263,22 @@ The following SQL is read-only and verifies migration markers, ACLs, and the who
 SELECT
   r.rolname,
   r.rolcanlogin,
+  r.rolinherit,
   r.rolbypassrls,
-  pg_has_role('orabella_app', 'service_role', 'member') AS inherits_service_role
+  pg_has_role('orabella_app', 'service_role', 'member') AS inherits_service_role,
+  pg_has_role('orabella_app', 'migration_operator', 'member') AS app_is_migration_operator,
+  pg_has_role('service_role', 'migration_operator', 'member') AS service_is_migration_operator
 FROM pg_roles r
-WHERE r.rolname IN ('anon', 'authenticated', 'service_role', 'orabella_app')
+WHERE r.rolname IN ('anon', 'authenticated', 'service_role', 'orabella_app', 'migration_operator')
 ORDER BY r.rolname;
 
 SELECT
   has_schema_privilege('orabella_app', 'public', 'USAGE') AS app_schema_usage,
   has_table_privilege('orabella_app', 'public.services', 'SELECT,INSERT,UPDATE,DELETE') AS app_services_dml,
+  has_table_privilege('orabella_app', 'public.portable_migration_audit', 'INSERT') AS app_ledger_insert,
+  has_table_privilege('service_role', 'public.portable_migration_audit', 'SELECT') AS service_ledger_select,
+  has_table_privilege('service_role', 'public.portable_migration_audit', 'INSERT') AS service_ledger_insert,
+  has_table_privilege('migration_operator', 'public.portable_migration_audit', 'INSERT') AS operator_ledger_insert,
   has_table_privilege('orabella_app', 'public.cop_legacy_cents_audit', 'SELECT') AS app_cents_audit_select,
   has_function_privilege('service_role', 'public.search_products_literal(text,integer,integer)', 'EXECUTE') AS service_literal_search_execute,
   has_function_privilege('authenticated', 'public.search_products_literal(text,integer,integer)', 'EXECUTE') AS authenticated_literal_search_execute;
@@ -318,10 +337,10 @@ Repeat the fresh backup procedure with `SOURCE_DB_URL` set to the production sou
 
 ### 8. Production migration and role bootstrap
 
-**IRREVERSIBLE WRITE BOUNDARY: changes production schema, triggers, functions, ACLs, and backfills.** After the human approval gate, use the same deterministic plan process as staging with `PROD_DB_URL`; do not construct or edit a filename list.
+**IRREVERSIBLE WRITE BOUNDARY: changes production schema, triggers, functions, ACLs, and backfills.** After the human approval gate, use the same deterministic plan and dedicated migration-runner process as staging with `PROD_DB_URL`; do not construct, edit, or manually execute a filename list.
 
 ```bash
-# One-time, plain PostgreSQL target only: create the durable ledger.
+# One-time, plain PostgreSQL target only; execute as DB owner.
 psql "$PROD_DB_URL" -v ON_ERROR_STOP=1 -f supabase/bootstrap/portable-migration-audit.sql
 
 psql "$PROD_DB_URL" -X -v ON_ERROR_STOP=1 -A -t -c "
@@ -334,16 +353,24 @@ psql "$PROD_DB_URL" -X -v ON_ERROR_STOP=1 -A -t -c "
 npm run plan:portable-migrations -- \
   --state "$BACKUP_DIR/prod-scope-manifest.json" \
   --output "$BACKUP_DIR/prod-portable-migration-plan.json"
+
+MIGRATION_DATABASE_URL='<migration-runner-connection-url>' \
+  npm run apply:portable-migrations -- \
+    --plan "$BACKUP_DIR/prod-portable-migration-plan.json"
 ```
 
-Execute the generated production `apply` array in order, record each successful entry in the ledger, then export `prod-applied-state-after.json` with the same query and run:
+Retain `prod-applied-state-after.json` as evidence, create `prod-schema-markers.json` from the approved marker queries, then verify the live ledger and markers before granting the application role:
 
 ```bash
-npm run verify:portable-migrations -- \
-  --state "$BACKUP_DIR/prod-applied-state-after.json" \
-  --plan "$BACKUP_DIR/prod-portable-migration-plan.json"
+MIGRATION_DATABASE_URL='<migration-runner-connection-url>' \
+  npm run verify:portable-migrations -- \
+    --scope "$BACKUP_DIR/prod-scope-manifest.json" \
+    --plan "$BACKUP_DIR/prod-portable-migration-plan.json" \
+    --markers "$BACKUP_DIR/prod-schema-markers.json"
 psql "$PROD_DB_URL" -v ON_ERROR_STOP=1 -f supabase/bootstrap/app-role.sql
 ```
+
+The same crash rule applies: if a migration committed but no ledger entry exists, stop and reconcile its approved marker under the change process; never manually insert the missing ledger row.
 
 Then run the staging verification SQL against production. Capture output, especially `cop_legacy_cents_audit` and role/ACL results.
 
@@ -417,7 +444,7 @@ This rollback changes deployment configuration; it does **not** revert applied d
 ## Evidence to retain
 
 - backup directory and checksum verification output;
-- signed/approved scope manifest, generated SHA-256 plan, and final ledger-verification output;
+- signed/approved scope manifest, generated SHA-256 plan, schema-marker JSON, and final ledger-verification output;
 - migration command output in verified order;
 - staging and production marker, ACL, and `cop_legacy_cents_audit` SQL output;
 - test and health-smoke output;

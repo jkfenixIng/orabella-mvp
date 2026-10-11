@@ -76,7 +76,11 @@ BEGIN
   GRANT USAGE ON SCHEMA public TO orabella_app;
 
   FOR table_name IN
-    SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public' ORDER BY tablename
+    SELECT tablename
+      FROM pg_catalog.pg_tables
+     WHERE schemaname = 'public'
+       AND tablename <> 'portable_migration_audit'
+     ORDER BY tablename
   LOOP
     IF table_name IN ('installation_owner', 'installation_owner_operation') THEN
       EXECUTE pg_catalog.format('REVOKE ALL ON TABLE public.%I FROM orabella_app', table_name);
