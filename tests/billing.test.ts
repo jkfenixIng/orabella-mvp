@@ -199,8 +199,10 @@ describe("billing: subtotal por línea (FAC-01)", () => {
     expect(roundMoney(10.005)).toBe(10);
     expect(roundMoney(10.5)).toBe(11);
     expect(roundMoney(10.4999)).toBe(10);
+    // COP: comparisons are in whole pesos; legacy cents compare rounded.
     expect(moneyEquals(10.004, 10.0)).toBe(true);
-    expect(moneyEquals(10.02, 10.0)).toBe(false);
+    expect(moneyEquals(10.02, 10.0)).toBe(true);
+    expect(moneyEquals(10.5, 10.0)).toBe(false);
   });
 });
 
@@ -388,7 +390,7 @@ describe("billing: frontera modular con inventario (B1)", () => {
     // su trigger. Billing sigue sin tocar las tablas de inventario.
     expect(service).toContain("planStockDeduction");
     expect(service).toContain("getProductsStock");
-    expect(service).toContain("p_out_items:");
+    expect(service).toContain("outItems:");
   });
 
   it("billing no toca tablas de inventory directo (products, inventory_movements)", () => {
@@ -6786,6 +6788,10 @@ describe("billing: CL-11 el diff del servicio vive en el bloque de persistencia"
     join(process.cwd(), "src", "features", "billing", "service.ts"),
     "utf8",
   );
+  const billingPort = readFileSync(
+    join(process.cwd(), "src", "features", "billing", "repos", "billing.ts"),
+    "utf8",
+  );
 
   /** Cuerpo del `export async function <name>` (hasta la siguiente exportada). */
   function bodyOf(name: string): string {
@@ -6797,16 +6803,16 @@ describe("billing: CL-11 el diff del servicio vive en el bloque de persistencia"
 
   it("las DOS operaciones escriben por RPC y ninguna abre una escritura suelta", () => {
     const cases = [
-      { name: "annulInvoice", rpc: "invoice_annul_atomic" },
-      { name: "splitPayment", rpc: "invoice_split_payment_atomic" },
+      { name: "annulInvoice", rpc: "annulInvoiceAtomic" },
+      { name: "splitPayment", rpc: "splitPaymentAtomic" },
     ] as const;
 
     for (const item of cases) {
       const body = bodyOf(item.name);
-      // UNA transacción por operación: ni dos `rpc` por un descuido, ni uno de
-      // menos.
-      expect(body.match(/db\.rpc\(/g) ?? [], item.name).toHaveLength(1);
-      expect(body, item.name).toContain(`db.rpc("${item.rpc}"`);
+      // UNA transacción por operación (el RPC vive en el puerto BillingRepo):
+      // ni dos llamadas por un descuido, ni una de menos.
+      expect(body.match(/db\.\w+Atomic</g) ?? [], item.name).toHaveLength(1);
+      expect(body, item.name).toContain(`db.${item.rpc}<`);
       // La factura ya no se escribe desde el cliente en ninguna de las dos.
       expect(body, item.name).not.toContain('.from("invoices")');
     }
@@ -6827,31 +6833,34 @@ describe("billing: CL-11 el diff del servicio vive en el bloque de persistencia"
     expect(annul).toContain("canAnnulStatus(");
     expect(annul).toContain("invoiceInClosedPayroll(");
     expect(annul).toContain("buildReversalReasons(");
-    expect(annul).toContain("p_items: reversals.map(");
+    expect(annul).toContain("items: reversals.map(");
     // El cobro: el reparto por método, el saldo, la igualdad exacta y la
     // decisión de cerrar la factura — exactamente las líneas que ya estaban.
     const split = bodyOf("splitPayment");
     expect(split).toContain("computeCardFees(");
     expect(split).toContain("invoiceNetBalance({");
     expect(split).toContain("moneyEquals(");
-    expect(split).toContain("balance.netCollected + netSum - balance.netBilled");
+    expect(split).toContain("invoicePaymentCapExceeded({");
+    expect(split).toContain("alreadyPaid: balance.netCollected");
+    expect(split).toContain("incoming: netSum");
+    expect(split).toContain("cap: balance.netBilled");
     expect(split).toContain(
       'const closesInvoice = fullyPaid && detail.invoice.status === "Emitida"',
     );
-    expect(split).toContain("p_mark_paid: closesInvoice,");
-    expect(split).toContain("p_portions: fees.map(");
+    expect(split).toContain("markPaid: closesInvoice,");
+    expect(split).toContain("portions: fees.map(");
     // Y la marca de la 042 se sigue buscando ANTES de la escritura: una
     // repetición no llega a la transacción.
     expect(split.indexOf("findInvoicePaymentsByIdempotencyKey(")).toBeLessThan(
-      split.indexOf('db.rpc("invoice_split_payment_atomic"'),
+      split.indexOf("db.splitPaymentAtomic<"),
     );
   });
 
   it("las funciones escriben las MISMAS columnas que el servicio leía con INVOICE_SELECT", () => {
     // La lista no es una transcripción a mano: es la del `select(...)` con el
-    // que el servicio leía esa fila, y es la que el `jsonb_build_object` de la
-    // 050 devuelve (ver el bloque de la migración).
-    const match = /const INVOICE_SELECT =\s*\n?\s*"([^"]+)"/.exec(service);
+    // que se lee esa fila (hoy en el puerto BillingRepo), y es la que el
+    // `jsonb_build_object` de la 050 devuelve (ver el bloque de la migración).
+    const match = /export const INVOICE_SELECT =\s*\n?\s*"([^"]+)"/.exec(billingPort);
     expect(match, "INVOICE_SELECT").not.toBeNull();
     const columns = (match as RegExpExecArray)[1].split(",").map((column) => column.trim());
     expect(columns).toEqual([
@@ -6885,7 +6894,7 @@ describe("billing: CL-11 el diff del servicio vive en el bloque de persistencia"
     // cada porción: es el turno que la función BLOQUEA y al que exige que
     // pertenezcan TODAS las porciones.
     const split = bodyOf("splitPayment");
-    expect(split).toContain("p_shift_id: payShift.id");
+    expect(split).toContain("shiftId: payShift.id");
     // Y el rechazo de adentro (SHIFT_CLOSED/SHIFT_NOT_FOUND, que llegan con el
     // SQLSTATE del tope P0001) se traduce al MISMO error que el servicio usa
     // para "no hay caja abierta", mirando el MENSAJE antes que el código.
@@ -7177,16 +7186,15 @@ describe("billing: CL-12 el diff del servicio vive en el bloque de persistencia"
 
   it("las DOS ediciones escriben por RPC y ninguna abre una escritura suelta", () => {
     const cases = [
-      { name: "editInvoiceItems", rpc: "invoice_edit_items_atomic" },
-      { name: "editEmittedInvoiceItems", rpc: "invoice_edit_emitted_atomic" },
+      { name: "editInvoiceItems", rpc: "editItemsAtomic" },
+      { name: "editEmittedInvoiceItems", rpc: "editEmittedAtomic" },
     ] as const;
 
     for (const item of cases) {
       const body = bodyOf(item.name);
-      // UNA transacción por edición: ni dos `rpc` por un descuido, ni uno de
-      // menos.
-      expect(body.match(/db\.rpc\(/g) ?? [], item.name).toHaveLength(1);
-      expect(body, item.name).toContain(`db.rpc("${item.rpc}"`);
+      // UNA transacción por edición: el RPC está encapsulado en BillingRepo.
+      expect(body.match(/db\.\w+Atomic</g) ?? [], item.name).toHaveLength(1);
+      expect(body, item.name).toContain(`db.${item.rpc}<`);
       // Ninguna escritura suelta: ni la factura, ni los ítems, ni los impuestos,
       // ni los cobros, ni el kardex (el kardex lo escribe la función).
       for (const table of [
@@ -7214,8 +7222,8 @@ describe("billing: CL-12 el diff del servicio vive en el bloque de persistencia"
     // fila bloqueada.
     for (const name of ["editInvoiceItems", "editEmittedInvoiceItems"] as const) {
       const body = bodyOf(name);
-      expect(body, name).toContain("p_expected_version: Number(detail.invoice.edit_version)");
-      expect(body, name).toContain("p_expected_status: detail.invoice.status");
+      expect(body, name).toContain("expectedVersion: Number(detail.invoice.edit_version)");
+      expect(body, name).toContain("expectedStatus: detail.invoice.status");
     }
   });
 
@@ -7261,7 +7269,7 @@ describe("billing: CL-12 el diff del servicio vive en el bloque de persistencia"
       const body = bodyOf(name);
       // El RPC se llama ANTES de la auditoría: la fila de auditoría no forma
       // parte de la transacción (es el mismo límite que declaran 049 y 050).
-      expect(body.indexOf('db.rpc("'), name).toBeLessThan(body.indexOf("await writeAudit("));
+      expect(body.indexOf("Atomic<"), name).toBeLessThan(body.indexOf("await writeAudit("));
     }
   });
 });
@@ -7592,9 +7600,8 @@ describe("billing: CL-13 la emisión vive en UNA transacción", () => {
 
   it("la emisión escribe por RPC y no abre una sola escritura suelta", () => {
     const body = bodyOf("createInvoice");
-    // UNA transacción: ni dos `rpc` por un descuido, ni uno de menos.
-    expect(body.match(/db\.rpc\(/g) ?? []).toHaveLength(1);
-    expect(body).toContain('db.rpc("invoice_create_atomic"');
+    // UNA transacción: el RPC vive en BillingRepo, una llamada del servicio.
+    expect(body.match(/db\.createInvoiceAtomic</g) ?? []).toHaveLength(1);
     // Ninguna escritura suelta: ni la factura, ni los ítems, ni los impuestos,
     // ni los cobros, ni el kardex (el kardex lo escribe la función).
     for (const table of [
@@ -7623,7 +7630,7 @@ describe("billing: CL-13 la emisión vive en UNA transacción", () => {
     expect(body).not.toContain(".delete(");
     // Y no hay compensación porque no hay nada que compensar: el servidor
     // revierte la transacción entera.
-    expect(body).toContain('db.rpc("invoice_create_atomic"');
+    expect(body).toContain("db.createInvoiceAtomic<");
   });
 
   it("la aritmética y las decisiones de plata se quedan en TypeScript: viajan como DATO", () => {
@@ -7640,22 +7647,22 @@ describe("billing: CL-13 la emisión vive en UNA transacción", () => {
     expect(body).toContain("portionsMatchBalance(");
     expect(body).toContain("insufficientStockError(");
     // Los cinco grupos viajan como ARREGLOS computados, en UN solo pedido.
-    expect(body).toContain("p_items: input.items.map(");
-    expect(body).toContain("p_taxes: totals.taxes.map(");
-    expect(body).toContain("p_payments: fees.map(");
-    expect(body).toContain("p_out_items: stockPlan.map(");
-    expect(body).toContain("p_invoice: {");
+    expect(body).toContain("items: input.items.map(");
+    expect(body).toContain("taxes: totals.taxes.map(");
+    expect(body).toContain("payments: fees.map(");
+    expect(body).toContain("outItems: stockPlan.map(");
+    expect(body).toContain("invoice: {");
   });
 
   it("la marca (041) se busca ANTES de la transacción y la auditoría queda FUERA", () => {
     const body = bodyOf("createInvoice");
     // Una repetición no llega a la transacción: el lookup de la marca va primero.
     expect(body.indexOf("findInvoiceByIdempotencyKey(")).toBeLessThan(
-      body.indexOf('db.rpc("invoice_create_atomic"'),
+      body.indexOf("db.createInvoiceAtomic<"),
     );
     // La auditoría se escribe DESPUÉS del commit (fuera de la transacción), como
     // en las anulaciones y las ediciones: no es un punto de fallo de estado.
-    expect(body.indexOf('db.rpc("invoice_create_atomic"')).toBeLessThan(
+    expect(body.indexOf("db.createInvoiceAtomic<")).toBeLessThan(
       body.indexOf("await writeAudit("),
     );
   });
@@ -7813,8 +7820,8 @@ describe("migración 052_invoice_create_atomic.sql (CL-13)", () => {
 
   it("devuelve EXACTAMENTE lo que el servicio leía (mismo shape)", () => {
     expect(sql.match(/jsonb_build_object\(/g) ?? []).toHaveLength(1);
-    const match = /const INVOICE_SELECT =\s*\n?\s*"([^"]+)"/.exec(
-      readFileSync(join(process.cwd(), "src", "features", "billing", "service.ts"), "utf8"),
+    const match = /export const INVOICE_SELECT =\s*\n?\s*"([^"]+)"/.exec(
+      readFileSync(join(process.cwd(), "src", "features", "billing", "repos", "billing.ts"), "utf8"),
     );
     expect(match, "INVOICE_SELECT").not.toBeNull();
     for (const column of (match as RegExpExecArray)[1].split(",").map((c) => c.trim())) {

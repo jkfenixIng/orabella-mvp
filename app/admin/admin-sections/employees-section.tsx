@@ -38,6 +38,7 @@ import {
   stripMoneyInput,
   stripPercentageInput,
 } from "@/src/shared/lib/money";
+import { copInputDigits } from "@/src/shared/money/cop";
 
 const EMPTY_EMPLOYEE = {
   full_name: "",
@@ -158,7 +159,7 @@ export function EmployeesSection({
       birth_date: row.birth_date ?? "",
       pay_type: row.pay_type,
       pay_frequency: row.pay_frequency ?? "",
-      salary_fixed: row.salary_fixed != null ? String(row.salary_fixed) : "",
+      salary_fixed: copInputDigits(row.salary_fixed),
       commission_percent: row.commission_percent != null ? String(row.commission_percent) : "",
       is_active: row.is_active,
     });

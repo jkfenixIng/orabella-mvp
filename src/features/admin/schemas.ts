@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { roleCodeSchema } from "@/src/features/auth/schemas";
 import { bogotaDay } from "@/src/shared/lib/dates";
+import { copSchema } from "@/src/shared/money/cop";
 
 /** ADM-08: esquemas de sueldo por empleado. */
 export const payTypeSchema = z.enum(["fijo", "porcentaje", "mixto"]);
@@ -13,16 +14,18 @@ export type PayType = z.infer<typeof payTypeSchema>;
 export const payFrequencySchema = z.enum(["semanal", "quincenal", "mensual"]);
 export type PayFrequency = z.infer<typeof payFrequencySchema>;
 
-/** ADM-07: catálogo de métodos de pago de Colombia de la instalación. */
-export const paymentMethodCodeSchema = z.enum([
-  "efectivo",
-  "transferencia_normal",
-  "nequi",
-  "daviplata",
-  "bre-b",
-  "tarjeta",
-]);
+/** ADM-07/003: a stable free identifier, normalized by the service before Zod. */
+export const paymentMethodCodeSchema = z.string()
+  .min(2, "El código debe tener al menos 2 caracteres.")
+  .max(40, "El código es muy largo.")
+  .regex(/^[a-z0-9]+(?:[-_][a-z0-9]+)*$/, "Use minúsculas, números, guion o guion bajo.");
 export type PaymentMethodCode = z.infer<typeof paymentMethodCodeSchema>;
+export const arqueoModeSchema = z.enum(["none", "denominations", "declared_total"]);
+export type ArqueoMode = z.infer<typeof arqueoModeSchema>;
+
+export function normalizePaymentMethodCode(code: string): string {
+  return code.trim().toLowerCase().replace(/\s+/g, "-");
+}
 
 /** ADM-06: códigos de impuesto configurables de la instalación. */
 export const taxCodeSchema = z.enum(["IVA", "ICA", "Rete", "otro"]);
@@ -136,7 +139,7 @@ export const employeeSchema = z
     // cadencia definida": el fijo se sigue prorrateando por los días del
     // período, que es el comportamiento de hoy. Sólo se cierra el catálogo.
     pay_frequency: payFrequencySchema.nullish(),
-    salary_fixed: z.coerce.number().nonnegative("El salario no puede ser negativo.").nullish(),
+    salary_fixed: copSchema("El salario no puede ser negativo.").nullish(),
     commission_percent: z.coerce
       .number()
       .min(0, "La comisión mínima es 0%.")
@@ -162,7 +165,7 @@ export const serviceSchema = z
     id: uuidSchema.optional(),
     name: z.string().trim().min(1, "Nombre requerido.").max(120, "Nombre muy largo."),
     description: z.string().trim().max(500, "Descripción muy larga.").nullish(),
-    price: z.coerce.number().nonnegative("El precio no puede ser negativo."),
+    price: copSchema("El precio no puede ser negativo."),
     duracion_min: z.coerce.number().int("Minutos enteros.").nonnegative("La duración mínima no puede ser negativa."),
     duracion_max: z.coerce.number().int("Minutos enteros.").nonnegative("La duración máxima no puede ser negativa."),
     is_active: z.boolean().optional(),
@@ -187,14 +190,24 @@ export const taxConfigSchema = z.object({
 });
 export type TaxConfigInput = z.infer<typeof taxConfigSchema>;
 
-/** ADM-07: método de pago del catálogo Colombia de la instalación. */
+/** ADM-07/003: payment method code is only accepted on creation. */
 export const paymentMethodSchema = z.object({
   id: uuidSchema.optional(),
-  code: paymentMethodCodeSchema,
+  code: z.string().trim().optional(),
   name: z.string().trim().min(1, "Nombre requerido.").max(120, "Nombre muy largo."),
   is_active: z.boolean().optional(),
-  arqueable: z.boolean().optional(),
+  arqueo_mode: arqueoModeSchema.optional(),
   fee_percent: z.coerce.number().min(0).max(100).optional(),
+}).superRefine((value, context) => {
+  if (!value.id && !value.code) {
+    context.addIssue({ code: "custom", path: ["code"], message: "Código requerido." });
+    return;
+  }
+  if (value.code) {
+    const normalized = normalizePaymentMethodCode(value.code);
+    const parsed = paymentMethodCodeSchema.safeParse(normalized);
+    if (!parsed.success) context.addIssue({ code: "custom", path: ["code"], message: parsed.error.issues[0]?.message ?? "Código inválido." });
+  }
 });
 export type PaymentMethodInput = z.infer<typeof paymentMethodSchema>;
 

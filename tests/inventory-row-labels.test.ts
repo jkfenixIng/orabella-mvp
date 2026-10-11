@@ -120,7 +120,7 @@ const LISTAS: Lista[] = [
     palabras: ["Fecha", "Tipo", "Cantidad", "Motivo", "Quién"],
     // Fecha · Tipo+Cantidad · Quién · Motivo.
     orden: [1, 2, 3, 5, 4],
-    ancla: { etiqueta: "Fecha: ", valor: '{new Date(row.created_at).toLocaleString("es-CO")}' },
+    ancla: { etiqueta: "Fecha: ", valor: "{formatBogotaFullDateTime(row.created_at)}" },
   },
 ];
 

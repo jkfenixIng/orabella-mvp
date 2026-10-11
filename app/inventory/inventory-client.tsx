@@ -37,8 +37,9 @@ import {
 } from "@/src/components/ui/lib/select";
 import { cn } from "@/src/components/ui/lib/utils";
 import { formatMoney, formatMoneyInput, stripMoneyInput, stripQuantityInput } from "@/src/shared/lib/money";
+import { copInputDigits } from "@/src/shared/money/cop";
 import type { ActionResult } from "@/src/shared/lib/api-response";
-import { toNumber } from "@/src/shared/lib/format";
+import { formatBogotaFullDateTime, toNumber } from "@/src/shared/lib/format";
 import {
   inputClass,
   labelClass,
@@ -226,9 +227,9 @@ export function InventoryClient(props: InventoryClientProps) {
             name: row.name,
             description: row.description ?? "",
             min_stock: String(row.min_stock),
-    cost_price: row.cost_price == null ? "" : String(row.cost_price),
-    sale_price: row.sale_price == null ? "" : String(row.sale_price),
-    commission_value: row.commission_value == null ? "" : String(row.commission_value),
+    cost_price: copInputDigits(row.cost_price),
+    sale_price: copInputDigits(row.sale_price),
+    commission_value: copInputDigits(row.commission_value),
             is_active: row.is_active,
           }
         : emptyProductForm(),
@@ -915,7 +916,7 @@ export function InventoryClient(props: InventoryClientProps) {
                     <span className="flex items-center gap-2 sm:contents">
                       <span className="text-sm text-text-primary sm:col-start-1 sm:row-start-1">
                         <span className="font-sans font-medium text-text-secondary sm:hidden">Fecha: </span>
-                        {new Date(row.created_at).toLocaleString("es-CO")}
+                        {formatBogotaFullDateTime(row.created_at)}
                       </span>
                     </span>
                     <span className="flex items-center justify-between gap-2 sm:contents">

@@ -6,6 +6,7 @@ import {
   closeShiftAction,
   getDayViewAction,
   getHistoryAction,
+  getShiftMethodBalancesAction,
   listDenominationsAction,
   openShiftAction,
   recountClosedShiftAction,
@@ -34,6 +35,7 @@ import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib
 import type { ActionResult } from "@/src/shared/lib/api-response";
 import { formatDateTime } from "@/src/shared/lib/format";
 import { HISTORY_PAGE_SIZE } from "@/src/features/cash/schemas";
+import { arqueoMethods, buildArqueoCountLines } from "./arqueo-lines";
 import {
   buttonClass,
   ghostClass,
@@ -439,6 +441,10 @@ export function CashClient(props: CashClientProps) {
   const [showDay, setShowDay] = useState(false);
   // Item 5: vales del día visibles en caja (se cargan con la vista del día).
   const [dayVouchers, setDayVouchers] = useState<VoucherRequestRow[]>([]);
+  // 003 (internal, admin only): per-method minimum and availability of the open shift.
+  const [methodBalances, setMethodBalances] = useState<
+    Array<{ method_code: string; minimum: number; expected: number; available: number }> | null
+  >(null);
   const [histPage, setHistPage] = useState(1);
   // Paginador local de la vista del día (el servidor la acota a 50).
   const [dayPage, setDayPage] = useState(0);
@@ -453,8 +459,9 @@ export function CashClient(props: CashClientProps) {
   const canClose = props.canWrite && (isOpener || props.isAdmin);
   // Columnas dinámicas: una columna por método activo (desglose de
   // ventas cobrado real, aunque no sea arqueable).
+  const activeArqueo = arqueoMethods(props.methods);
   const methodCols = props.methods.filter(
-    (method) => method.is_active && method.code !== "efectivo",
+    (method) => method.is_active && method.code !== activeArqueo.drawer?.code,
   );
   // Paginadores: el historial pagina en servidor (los rangos pueden
   // traer más de una página); el día pagina en cliente sobre lo cargado.
@@ -523,21 +530,13 @@ export function CashClient(props: CashClientProps) {
     setIsClosingDialogOpen(false);
   }
 
-  function buildCloseCounts(): Array<{ method_code: string; denomination: number | null; quantity: number; amount: number }> {
-    return [
-      ...denominations.map((denom) => {
-        const qty = Math.max(0, Math.floor(Number(closeCounts[denom.id] ?? "0")) || 0);
-        return { method_code: "efectivo", denomination: Number(denom.value), quantity: qty, amount: qty * Number(denom.value) };
-      }),
-      ...props.methods
-        .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
-        .map((method) => ({
-          method_code: method.code,
-          denomination: null,
-          quantity: 1,
-          amount: Number((closeDigitals[method.code] ?? "").replace(/\D/g, "")) || 0,
-        })),
-    ];
+  function buildCloseCounts() {
+    return buildArqueoCountLines({
+      methods: props.methods,
+      denominations,
+      quantities: closeCounts,
+      totals: closeDigitals,
+    });
   }
 
   // U3: mismo cierre del bloque anterior pero sobre el estado del reconteo. El
@@ -550,21 +549,13 @@ export function CashClient(props: CashClientProps) {
     }, 0);
   }
 
-  function buildRecountCounts(): Array<{ method_code: string; denomination: number | null; quantity: number; amount: number }> {
-    return [
-      ...denominations.map((denom) => {
-        const qty = Math.max(0, Math.floor(Number(recountCounts[denom.id] ?? "0")) || 0);
-        return { method_code: "efectivo", denomination: Number(denom.value), quantity: qty, amount: qty * Number(denom.value) };
-      }),
-      ...props.methods
-        .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
-        .map((method) => ({
-          method_code: method.code,
-          denomination: null,
-          quantity: 1,
-          amount: Number((recountDigitals[method.code] ?? "").replace(/\D/g, "")) || 0,
-        })),
-    ];
+  function buildRecountCounts() {
+    return buildArqueoCountLines({
+      methods: props.methods,
+      denominations,
+      quantities: recountCounts,
+      totals: recountDigitals,
+    });
   }
 
   async function startRecount(view: DayShiftView): Promise<void> {
@@ -625,20 +616,15 @@ export function CashClient(props: CashClientProps) {
 
   async function handleOpen(event: FormEvent): Promise<void> {
     event.preventDefault();
-    const counts: Array<{ method_code: string; denomination: number | null; quantity: number; amount: number }> = [
-      ...denominations.map((denom) => {
-        const qty = Math.max(0, Math.floor(Number(openCounts[denom.id] ?? "0")) || 0);
-        return { method_code: "efectivo", denomination: Number(denom.value), quantity: qty, amount: qty * Number(denom.value) };
-      }),
-      ...props.methods
-        .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
-        .map((method) => ({
-          method_code: method.code,
-          denomination: null,
-          quantity: 1,
-          amount: Number((openDigitals[method.code] ?? "").replace(/\D/g, "")) || 0,
-        })),
-    ];
+    // 003: every active arqueable method declares its OWN opening base, by
+    // denominations or by declared total, as configured. Inputs only accept
+    // digits, so a base can never be negative.
+    const counts = buildArqueoCountLines({
+      methods: props.methods,
+      denominations,
+      quantities: openCounts,
+      totals: openDigitals,
+    });
     setBusy(true);
     try {
       const result = await openShiftAction({ counts });
@@ -793,11 +779,37 @@ export function CashClient(props: CashClientProps) {
               Turno abierto desde {formatDateTime(openShift.opened_at)} con base{" "}
               <strong>{formatMoney(openShift.opening_base)}</strong>.
             </p>
-            {props.isAdmin && (
-              <p className={mutedTextClass}>
-                Base configurada: {formatMoney(baseConfigurada)}.
-              </p>
-            )}
+             {props.isAdmin && (
+               <p className={mutedTextClass}>
+                 Base configurada: {formatMoney(baseConfigurada)}.
+               </p>
+             )}
+             {props.isAdmin && (
+               <div>
+                 <button
+                   type="button"
+                   className={ghostClass}
+                   disabled={busy}
+                   onClick={async () => {
+                     const result = await getShiftMethodBalancesAction(openShift.id);
+                     if (showResult(result, "")) setMethodBalances(result.data);
+                   }}
+                 >
+                   Ver disponible por método
+                 </button>
+               </div>
+             )}
+             {props.isAdmin && methodBalances && (
+               <ul className="flex flex-col gap-1" aria-label="Disponible por método">
+                 {methodBalances.map((row) => (
+                   <li key={row.method_code}>
+                     {props.methods.find((method) => method.code === row.method_code)?.name ?? row.method_code}:
+                     {" "}saldo {formatMoney(row.expected)} · mínimo {formatMoney(row.minimum)} ·
+                     {" "}Disponible sobre el mínimo {formatMoney(row.available)}
+                   </li>
+                 ))}
+               </ul>
+             )}
             {canClose ? (
               <div className="mt-3 flex flex-wrap gap-2">
                 <button type="button" onClick={startClosing} className={buttonClass}>
@@ -841,11 +853,11 @@ export function CashClient(props: CashClientProps) {
               <DialogTitle>Abrir turno</DialogTitle>
             </DialogHeader>
             <p className={cn("mt-1", mutedTextClass)}>
-              Cuente billetes y monedas por denominación y declare los totales digitales.
+              Declare la base de cada método arqueable: por denominaciones o por total, según su configuración.
             </p>
             <form onSubmit={handleOpen} className="mt-3 flex flex-col gap-3">
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                {denominations.map((denom) => (
+                    {activeArqueo.drawer && denominations.map((denom) => (
                   <label key={denom.id} className={labelClass}>
                     <span className="inline-flex items-center gap-1.5">
                       <PayIcon kind={denom.kind} />
@@ -863,13 +875,13 @@ export function CashClient(props: CashClientProps) {
                   </label>
                 ))}
               </div>
-              {props.methods
-                .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
+              {activeArqueo.declared
+                .filter((method) => method.is_active)
                 .map((method) => (
                   <label key={method.id} className={labelClass}>
                     <span className="inline-flex items-center gap-1.5">
                       <PayIcon code={method.code} />
-                      {method.name} (total en la aplicación)
+                      {method.name} (total declarado)
                     </span>
                     <input
                       className={inputClass}
@@ -911,7 +923,7 @@ export function CashClient(props: CashClientProps) {
             {closeStep === "counts" ? (
               <>
                 <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                  {denominations.map((denom) => (
+                  {activeArqueo.drawer && denominations.map((denom) => (
                     <label key={denom.id} className={labelClass}>
                       <span className="inline-flex items-center gap-1.5">
                         <PayIcon kind={denom.kind} />
@@ -929,13 +941,13 @@ export function CashClient(props: CashClientProps) {
                     </label>
                   ))}
                 </div>
-                {props.methods
-                  .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
+                {activeArqueo.declared
+                  .filter((method) => method.is_active)
                   .map((method) => (
                     <label key={method.id} className={labelClass}>
                       <span className="inline-flex items-center gap-1.5">
                         <PayIcon code={method.code} />
-                        {method.name} (total en la aplicación)
+                        {method.name} (total declarado)
                       </span>
                       <input
                         className={inputClass}
@@ -1002,7 +1014,7 @@ export function CashClient(props: CashClientProps) {
               {recountStep === "counts" ? (
                 <>
                   <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                    {denominations.map((denom) => (
+                {activeArqueo.drawer && denominations.map((denom) => (
                       <label key={denom.id} className={labelClass}>
                         <span className="inline-flex items-center gap-1.5">
                           <PayIcon kind={denom.kind} />
@@ -1020,13 +1032,13 @@ export function CashClient(props: CashClientProps) {
                       </label>
                     ))}
                   </div>
-                  {props.methods
-                    .filter((method) => method.is_active && method.arqueable && method.code !== "efectivo")
+                  {activeArqueo.declared
+                    .filter((method) => method.is_active)
                     .map((method) => (
                       <label key={method.id} className={labelClass}>
                         <span className="inline-flex items-center gap-1.5">
                           <PayIcon code={method.code} />
-                          {method.name} (total en la aplicación)
+                          {method.name} (total declarado)
                         </span>
                         <input
                           className={inputClass}

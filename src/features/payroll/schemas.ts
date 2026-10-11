@@ -1,6 +1,9 @@
 import { z } from "zod";
 import { idempotencyKeySchema, moneyEquals, roundMoney } from "@/src/features/billing/schemas";
 import { cashOutLimitViolation } from "@/src/features/cash/schemas";
+import { bogotaDay } from "@/src/shared/lib/dates";
+import { copExceeds, copSchema, positiveCopSchema } from "@/src/shared/money/cop";
+import { payrollPaymentCapExceeded } from "@/src/shared/money/caps";
 import {
   employeeLineCommissionOrigin,
   employeeLineCommissionPercent,
@@ -134,8 +137,8 @@ export const ADJUSTMENT_REASON_MAX_LENGTH = 200;
 /** PAY-02: ajustes manuales por empleado al calcular (bonos y otros descuentos). */
 export const employeeAdjustmentSchema = z.object({
   employee_id: uuidSchema,
-  bonuses: z.coerce.number().nonnegative("Los bonos no pueden ser negativos.").default(0),
-  other_discounts: z.coerce.number().nonnegative("Los descuentos no pueden ser negativos.").default(0),
+  bonuses: copSchema("Los bonos no pueden ser negativos.").default(0),
+  other_discounts: copSchema("Los descuentos no pueden ser negativos.").default(0),
   /**
    * F8: el motivo escrito del ajuste. Viaja en la MISMA fila que el monto que
    * justifica (`payroll_items.adjustment_reason`, 067) y con él se confirma o se
@@ -165,7 +168,7 @@ export type CalculatePayrollInput = z.infer<typeof calculatePayrollSchema>;
 /** PAY-04: porción del pago del ítem con su método (monto > 0). */
 export const payrollPortionSchema = z.object({
   method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
-  amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+  amount: positiveCopSchema("El monto debe ser mayor a 0."),
   reference: z.string().trim().max(120, "Referencia muy larga.").nullish(),
 });
 export type PayrollPortionInput = z.infer<typeof payrollPortionSchema>;
@@ -190,8 +193,8 @@ export type PayPayrollItemInput = z.infer<typeof payPayrollItemSchema>;
 
 /** PAY-05: topes de vales por sede (día/semana opcionales) + días permitidos ISO + tope por día. */
 export const voucherLimitsSchema = z.object({
-  max_per_day: z.coerce.number().nonnegative("El tope diario no puede ser negativo.").nullish(),
-  max_per_week: z.coerce.number().nonnegative("El tope semanal no puede ser negativo.").nullish(),
+  max_per_day: copSchema("El tope diario no puede ser negativo.").nullish(),
+  max_per_week: copSchema("El tope semanal no puede ser negativo.").nullish(),
   allowed_days: z
     .array(z.coerce.number().int().min(1, "Día inválido (1=lunes…7=domingo).").max(7, "Día inválido (1=lunes…7=domingo)."))
     .min(1, "Elija al menos un día permitido.")
@@ -202,7 +205,7 @@ export const voucherLimitsSchema = z.object({
     .array(
       z.object({
         day: z.coerce.number().int().min(1, "Día inválido (1=lunes…7=domingo).").max(7, "Día inválido (1=lunes…7=domingo)."),
-        amount: z.coerce.number().nonnegative("El tope del día no puede ser negativo."),
+        amount: copSchema("El tope del día no puede ser negativo."),
       }),
     )
     .max(7, "Máximo 7 días.")
@@ -230,7 +233,7 @@ export type VoucherLimitsInput = z.infer<typeof voucherLimitsSchema>;
 export const requestVoucherSchema = z.object({
   idempotency_key: idempotencyKeySchema,
   employee_id: uuidSchema,
-  amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+  amount: positiveCopSchema("El monto debe ser mayor a 0."),
   method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
   request_date: dateSchema.optional(),
   observation: z.string().trim().max(500, "Observación muy larga.").nullish(),
@@ -287,7 +290,7 @@ export const payrollExtraSchema = z
   .object({
     idempotency_key: idempotencyKeySchema,
     employee_id: uuidSchema,
-    amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+    amount: positiveCopSchema("El monto debe ser mayor a 0."),
     method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
     reference: z.string().trim().max(120, "Referencia muy larga.").nullish(),
     reason: z.string().trim().min(1, "El motivo del pago es obligatorio.").max(500, "Motivo muy largo."),
@@ -656,6 +659,32 @@ export function assertCorrectablePeriod(status: string): void {
  * Solapar con otros borradores no bloquea: nada está pagado y el borrador
  * restante puede recalcularse. Puro para probarlo sin base de datos.
  */
+export interface PayrollDeletionOverlap extends DateRange {
+  status: string;
+  frequency?: string | null;
+}
+
+export type PayrollDeletionOverlapDecision =
+  | { allowed: true; code: null }
+  | { allowed: false; code: "PERIOD_OVERLAP_AMBIGUOUS" };
+
+/**
+ * Decision before deleting a draft period. Unlike the exclusion constraint used
+ * when opening periods, deletion is ambiguous for ANY closed overlapping range,
+ * regardless of cadence: voucher ownership is range-based. Bounds are inclusive
+ * and NULL cadence stays distinct data, never a reason to skip the comparison.
+ */
+export function decidePayrollDeletionOverlap(args: {
+  target: DateRange;
+  periods: readonly PayrollDeletionOverlap[];
+}): PayrollDeletionOverlapDecision {
+  const blocked = args.periods.some(
+    (period) => period.status === "cerrado" && rangesOverlap(args.target, period),
+  );
+  return blocked ? { allowed: false, code: "PERIOD_OVERLAP_AMBIGUOUS" } : { allowed: true, code: null };
+}
+
+/** Compatibility adapter for callers that already queried the SQL-overlapping range. */
 export function overlapBlocksDeletion(statuses: string[]): boolean {
   return statuses.some((status) => status === "cerrado");
 }
@@ -689,7 +718,11 @@ export function assertPortionsMatchNet(portions: Array<{ amount: number }>, netP
  * neto. Puro para probarlo sin base de datos.
  */
 export function assertNoOverpay(args: { alreadyPaid: number; newAmount: number; netPay: number }): void {
-  if (roundMoney(args.alreadyPaid + args.newAmount) - roundMoney(args.netPay) > 0.009) {
+  if (payrollPaymentCapExceeded({
+    alreadyPaid: args.alreadyPaid,
+    incoming: args.newAmount,
+    cap: args.netPay,
+  })) {
     throw new Error("OVERPAID");
   }
 }
@@ -2229,7 +2262,7 @@ export function payrollExtraGuide(args: {
   const guide = proratedAmount ?? monthlySalary;
   const amount = args.amount === null || args.amount === undefined ? null : roundMoney(Number(args.amount));
   const exceedsGuide =
-    guide !== null && amount !== null && Number.isFinite(amount) && amount - guide > 0.009;
+    guide !== null && amount !== null && Number.isFinite(amount) && copExceeds(amount, guide);
 
   return { monthlySalary, proratedAmount, days, exceedsGuide };
 }
@@ -2313,12 +2346,12 @@ export function checkVoucherCaps(args: {
     args.maxPerDay !== null &&
     args.maxPerDay !== undefined &&
     roundMoney(args.maxPerDay) > 0 &&
-    roundMoney(args.dayTotal + requested) - roundMoney(args.maxPerDay) > 0.009;
+    copExceeds(args.dayTotal + requested, args.maxPerDay);
   const overWeek =
     args.maxPerWeek !== null &&
     args.maxPerWeek !== undefined &&
     roundMoney(args.maxPerWeek) > 0 &&
-    roundMoney(args.weekTotal + requested) - roundMoney(args.maxPerWeek) > 0.009;
+    copExceeds(args.weekTotal + requested, args.maxPerWeek);
   return { overDay, overWeek };
 }
 
@@ -2541,27 +2574,23 @@ export function resolveVoucherInitialStatus(
 }
 
 /**
- * PAY-06: valida el tope del 50% de salidas en efectivo del turno al APROBAR
- * un vale. Un vale puede nacer pendiente por debajo del límite y superarlo al
- * aprobarse (el acumulado del turno creció): la aprobación repite la misma
- * regla de la solicitud, con el acumulado YA salido del turno más este vale.
- * Solo rige para `efectivo` ligado a un turno; los digitales y los vales
- * históricos sin turno no tienen tope. Reutiliza la regla pura de caja (no la
- * reescribe). Devuelve null si el monto cabe. Puro para probarlo sin BD.
+ * PAY-06/003: re-checks the method floor when a voucher is APPROVED. A voucher
+ * can be requested while the method had room and be approved after the balance
+ * fell. Vouchers without a shift or a method are historical and never touch the
+ * drawer. Pure; the database trigger is the authority.
  */
 export function voucherApprovalCashOutViolation(args: {
   methodCode: string | null;
   cashShiftId: string | null;
   openingBase: number | null;
-  cashOutUsed: number;
+  expectedBalance: number;
   amount: number;
 }): { code: string; message: string } | null {
-  if (args.methodCode !== "efectivo") return null;
-  if (!args.cashShiftId || args.openingBase === null || args.openingBase === undefined) return null;
+  if (!args.methodCode || !args.cashShiftId || args.openingBase === null) return null;
   return cashOutLimitViolation({
     methodCode: args.methodCode,
     openingBase: args.openingBase,
-    cashOutUsed: args.cashOutUsed,
+    expectedBalance: args.expectedBalance,
     amount: args.amount,
   });
 }
@@ -2642,10 +2671,25 @@ export interface PayrollMonthPeriodEntry {
  * se prorratea en los dos meses (`prorateFixedSalary`), así que sus días y su
  * fijo aparecen en el mes donde empieza, que es la parte que ahí se liquida.
  */
+export interface PayrollMonthExtraEntry {
+  id: string;
+  amount: number;
+  method_code: string;
+  reason: string;
+  kind: PayrollExtraKind;
+  paid_at: string;
+}
+
 export interface PayrollMonthEmployeeRow {
   /** Mes del calendario del período, `yyyy-mm`. */
   month: string;
   employeeId: string;
+  /** Totales del período; los extraordinarios no alteran liquidación ni saldo. */
+  periodNet: number;
+  periodPaid: number;
+  periodRemaining: number;
+  extrasPaid: number;
+  monthPaid: number;
   netTotal: number;
   paidTotal: number;
   remainingTotal: number;
@@ -2654,6 +2698,7 @@ export interface PayrollMonthEmployeeRow {
   /** Días nominados del mes (la parte de cada período que cae en él). */
   days: number;
   periods: PayrollMonthPeriodEntry[];
+  extras: PayrollMonthExtraEntry[];
 }
 
 /** Datos del empleado que la vista de nómina necesita para una fila (ADM-08). */
@@ -2917,6 +2962,7 @@ export function groupPayrollPeriodsByMonth<TRow extends PayrollPeriodLike>(
 export function buildPayrollMonthToDate(args: {
   periods: readonly PayrollPeriodLike[];
   items: readonly PayrollItemLike[];
+  extras?: readonly (PayrollMonthExtraEntry & { employee_id: string })[];
 }): PayrollMonthEmployeeRow[] {
   const periodById = new Map(args.periods.map((period) => [period.id, period]));
   /** Por mes: los empleados que tienen algo liquidado ese mes. */
@@ -2965,11 +3011,36 @@ export function buildPayrollMonthToDate(args: {
     }
   }
 
+  const extrasByMonth = new Map<string, Map<string, PayrollMonthExtraEntry[]>>();
+  for (const extra of args.extras ?? []) {
+    const month = bogotaMonthOf(extra.paid_at);
+    if (month === null) continue;
+    const monthEmployees = employees.get(month) ?? new Set<string>();
+    employees.set(month, monthEmployees);
+    monthEmployees.add(extra.employee_id);
+    const byEmployee = extrasByMonth.get(month) ?? new Map<string, PayrollMonthExtraEntry[]>();
+    extrasByMonth.set(month, byEmployee);
+    const entry: PayrollMonthExtraEntry = {
+      id: extra.id,
+      amount: roundMoney(Number(extra.amount)),
+      method_code: extra.method_code,
+      reason: extra.reason,
+      kind: extra.kind,
+      paid_at: extra.paid_at,
+    };
+    byEmployee.set(extra.employee_id, [...(byEmployee.get(extra.employee_id) ?? []), entry]);
+  }
+
   const rows: PayrollMonthEmployeeRow[] = [];
   for (const [month, monthEmployees] of employees) {
     for (const employeeId of monthEmployees) {
       rows.push(
-        monthRowFrom(month, employeeId, [...(details.get(month)?.get(employeeId)?.values() ?? [])]),
+        monthRowFrom(
+          month,
+          employeeId,
+          [...(details.get(month)?.get(employeeId)?.values() ?? [])],
+          extrasByMonth.get(month)?.get(employeeId) ?? [],
+        ),
       );
     }
   }
@@ -2992,18 +3063,37 @@ function monthRowFrom(
   month: string,
   employeeId: string,
   periods: readonly PayrollMonthPeriodEntry[],
+  extras: readonly PayrollMonthExtraEntry[] = [],
 ): PayrollMonthEmployeeRow {
   const sorted = [...periods].sort((left, right) => (left.start_date < right.start_date ? -1 : 1));
+  const sortedExtras = [...extras].sort((left, right) => (left.paid_at < right.paid_at ? -1 : 1));
+  const periodNet = sumMoney(sorted.map((entry) => entry.net));
+  const periodPaid = sumMoney(sorted.map((entry) => entry.paid));
+  const periodRemaining = sumMoney(sorted.map((entry) => entry.remaining));
+  const extrasPaid = sumMoney(sortedExtras.map((entry) => entry.amount));
   return {
     month,
     employeeId,
-    netTotal: sumMoney(sorted.map((entry) => entry.net)),
-    paidTotal: sumMoney(sorted.map((entry) => entry.paid)),
-    remainingTotal: sumMoney(sorted.map((entry) => entry.remaining)),
+    periodNet,
+    periodPaid,
+    periodRemaining,
+    extrasPaid,
+    monthPaid: sumMoney([periodPaid, extrasPaid]),
+    netTotal: periodNet,
+    paidTotal: periodPaid,
+    remainingTotal: periodRemaining,
     fixedTotal: sumMoney(sorted.map((entry) => entry.fixed)),
     days: sorted.reduce((acc, entry) => acc + entry.days, 0),
     periods: sorted,
+    extras: sortedExtras,
   };
+}
+
+/** Mes `yyyy-mm` de un instante, según el calendario de Bogotá. */
+export function bogotaMonthOf(instant: string): string | null {
+  const date = new Date(instant);
+  if (Number.isNaN(date.getTime())) return null;
+  return bogotaDay(0, date).slice(0, 7);
 }
 
 /**
@@ -3032,8 +3122,8 @@ export function replacePayrollMonthPeriod(args: {
       next.push(row);
       continue;
     }
-    if (periods.length === 0) continue;
-    next.push(monthRowFrom(row.month, row.employeeId, periods));
+    if (periods.length === 0 && row.extras.length === 0) continue;
+    next.push(monthRowFrom(row.month, row.employeeId, periods, row.extras));
   }
 
   // 2. Adentro la porción fresca. Sólo se agrega o se completa: la fila puede
@@ -3044,7 +3134,14 @@ export function replacePayrollMonthPeriod(args: {
       (other) => other.month === row.month && other.employeeId === row.employeeId,
     );
     if (index === -1) next.push(row);
-    else next[index] = monthRowFrom(row.month, row.employeeId, [...next[index].periods, ...row.periods]);
+    else {
+      next[index] = monthRowFrom(
+        row.month,
+        row.employeeId,
+        [...next[index].periods, ...row.periods],
+        next[index].extras,
+      );
+    }
   }
 
   return next.sort(compareMonthRows);

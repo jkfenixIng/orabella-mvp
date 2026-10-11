@@ -3,7 +3,13 @@ import { join, relative, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import type { ActionResult } from "@/src/shared/lib/api-response";
-import { formatDateTime, toNumber } from "@/src/shared/lib/format";
+import {
+  formatBogotaDate,
+  formatBogotaDateTime,
+  formatCivilDate,
+  formatDateTime,
+  toNumber,
+} from "@/src/shared/lib/format";
 import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 
 /* --------------------------------------------------------------------------
@@ -313,15 +319,20 @@ describe("formatDateTime unificado", () => {
     expect(formatDateTime("")).toBe(EMPTY);
   });
 
-  it("formatea día/mes y hora/minuto en es-CO", () => {
-    /* Se construye en hora LOCAL para que la aserción no dependa del huso del
-       runner: las dos copias usaban `toLocaleString` sin `timeZone` y eso se
-       conserva tal cual (unificación, no cambio de huso).
-       Ojo con el relleno, que NO es uniforme en es-CO y es el que ya rendían
-       las copias: la hora y el minuto van a dos dígitos, el día y el mes no. */
-    expect(formatDateTime(new Date(2024, 2, 5, 9, 30).toISOString())).toBe("5/3, 09:30 a. m.");
-    expect(formatDateTime(new Date(2024, 2, 5, 15, 7).toISOString())).toBe("5/3, 03:07 p. m.");
-    expect(formatDateTime(new Date(2024, 11, 25, 8, 5).toISOString())).toBe("25/12, 08:05 a. m.");
+  it("muestra instantes en hora de Bogotá, independiente de la zona del runner", () => {
+    expect(formatDateTime("2026-10-01T00:30:00Z")).toBe("30/9, 07:30 p. m.");
+    expect(formatDateTime("2026-10-01T05:00:00Z")).toBe("1/10, 12:00 a. m.");
+    expect(formatBogotaDateTime("2026-10-01T00:30:00Z")).toBe("30/9, 07:30 p. m.");
+    expect(formatBogotaDateTime("2026-10-01T05:00:00Z")).toBe("1/10, 12:00 a. m.");
+  });
+
+  it("toma el día civil de Bogotá para un instante", () => {
+    expect(formatBogotaDate("2026-10-01T00:30:00Z")).toBe("30/9/2026");
+    expect(formatBogotaDate("2026-10-01T05:00:00Z")).toBe("1/10/2026");
+  });
+
+  it("no desplaza las fechas civiles", () => {
+    expect(formatCivilDate("2026-10-01")).toBe("1/10/2026");
   });
 
   it("normaliza en «—» el marcador que caja escribía como «-»", () => {
@@ -404,17 +415,45 @@ describe("guarda: cada helper se declara exactamente una vez", () => {
       { path: "app/cash/cash-client.tsx", pattern: /import \{ formatDateTime \} from "@\/src\/shared\/lib\/format"/ },
       { path: "app/alerts/alerts-client.tsx", pattern: /import \{ formatDateTime \} from "@\/src\/shared\/lib\/format"/ },
       { path: "app/alerts/alerts-client.tsx", pattern: /import type \{ ActionResult \} from "@\/src\/shared\/lib\/api-response"/ },
-      { path: "app/payroll/payroll-client.tsx", pattern: /import \{ toNumber \} from "@\/src\/shared\/lib\/format"/ },
-      { path: "app/inventory/inventory-client.tsx", pattern: /import \{ toNumber \} from "@\/src\/shared\/lib\/format"/ },
-      { path: "app/invoices/invoices-client.tsx", pattern: /import \{ toNumber \} from "@\/src\/shared\/lib\/format"/ },
-      { path: "app/services/services-client.tsx", pattern: /import \{ toNumber \} from "@\/src\/shared\/lib\/format"/ },
-      { path: "app/vales/vouchers-client.tsx", pattern: /import \{ toNumber \} from "@\/src\/shared\/lib\/format"/ },
+      { path: "app/payroll/payroll-client.tsx", pattern: /import \{[^}]*\btoNumber\b[^}]*\} from "@\/src\/shared\/lib\/format"/ },
+      { path: "app/inventory/inventory-client.tsx", pattern: /import \{[^}]*\btoNumber\b[^}]*\} from "@\/src\/shared\/lib\/format"/ },
+      { path: "app/invoices/invoices-client.tsx", pattern: /import \{[^}]*\btoNumber\b[^}]*\} from "@\/src\/shared\/lib\/format"/ },
+      { path: "app/services/services-client.tsx", pattern: /import \{[^}]*\btoNumber\b[^}]*\} from "@\/src\/shared\/lib\/format"/ },
+      { path: "app/vales/vouchers-client.tsx", pattern: /import \{[^}]*\btoNumber\b[^}]*\} from "@\/src\/shared\/lib\/format"/ },
     ];
     for (const entry of imports) {
       const code = byPath.get(entry.path);
       expect(code, `no se leyó ${entry.path}`).toBeDefined();
       expect(entry.pattern.test(code ?? ""), `${entry.path} no importa como se espera`).toBe(true);
     }
+  });
+});
+
+describe("guarda: los formatos de fecha se centralizan en Bogotá", () => {
+  const RAW_DATE_FORMAT =
+    /\b(?:toLocale(?:String|DateString|TimeString)|Intl\.DateTimeFormat)\s*\(|\b(?:const|let|var)\s*\{[^}]*\bDateTimeFormat\b[^}]*\}\s*=\s*Intl\b/;
+  const CENTRAL_DATE_FORMATTERS = new Set(["src/shared/lib/format.ts", "src/shared/lib/dates.ts"]);
+
+  it("no deja formatos de fecha del runtime fuera de los helpers centrales", () => {
+    const offenders = SOURCES.filter(
+      (source) =>
+        /^(?:app|src)\//.test(source.path) &&
+        !CENTRAL_DATE_FORMATTERS.has(source.path) &&
+        RAW_DATE_FORMAT.test(blankOutComments(source.code)),
+    ).map((source) => source.path);
+    expect(offenders).toEqual([]);
+  });
+
+  it("detecta un formato de fecha directo (control negativo)", () => {
+    expect(RAW_DATE_FORMAT.test('new Date(value).toLocaleString("es-CO")')).toBe(true);
+    expect(RAW_DATE_FORMAT.test('new Intl.DateTimeFormat("es-CO").format(date)')).toBe(true);
+    expect(RAW_DATE_FORMAT.test("const { DateTimeFormat } = Intl;")).toBe(true);
+    expect(RAW_DATE_FORMAT.test("const { DateTimeFormat: Formatter } = Intl;")).toBe(true);
+  });
+
+  it("no marca opciones de tipo ni nombres parecidos", () => {
+    expect(RAW_DATE_FORMAT.test("const options: Intl.DateTimeFormatOptions = {};")).toBe(false);
+    expect(RAW_DATE_FORMAT.test("const DateTimeFormat = createFormatter();")).toBe(false);
   });
 });
 

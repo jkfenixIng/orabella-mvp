@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { formatMoney } from "@/src/shared/lib/money";
+import { copEquals, copExceeds, copSchema, positiveCopSchema, roundCop } from "@/src/shared/money/cop";
 
 /** FAC-01: un solo origen por línea (producto O servicio O custom). */
 export const invoiceItemTypeSchema = z.enum(["producto", "servicio", "custom"]);
@@ -135,17 +136,17 @@ export const MONEY_EPSILON = 0.01;
  * redondea el neto facturado a peso entero porque es el monto que el datafono
  * cobra (ver ahí la regla completa).
  */
-export function roundMoney(value: number): number {
-  return Math.round(value);
-}
+export const roundMoney = roundCop;
 
-/** true cuando dos montos cuadran dentro de la tolerancia de centavo. */
+/**
+ * New money is whole-peso; legacy cents are compared after the same rounding.
+ * `MONEY_EPSILON` remains exported only for historical consumers.
+ */
 export function moneyEquals(a: number, b: number): boolean {
-  return Math.abs(a - b) < MONEY_EPSILON;
+  return copEquals(a, b);
 }
 
-const moneySchema = (label: string) =>
-  z.coerce.number().nonnegative(`${label} no puede ser negativo.`);
+const moneySchema = (label: string) => copSchema(`${label} no puede ser negativo.`);
 
 /**
  * FAC-01/FAC-02: línea de factura. El origen único se valida en
@@ -164,7 +165,7 @@ export const invoiceItemSchema = z
     unit_price: moneySchema("El precio"),
     discount: moneySchema("El descuento").default(0),
     no_commission: z.boolean().optional().default(false),
-    commission_value: z.coerce.number().min(0, "La comisión no puede ser negativa.").optional().nullable(),
+    commission_value: copSchema("La comisión no puede ser negativa.").optional().nullable(),
     /**
      * Modo de comisión explícito (migración 030). `nullish` por
      * retrocompatibilidad: un payload que no lo mande deriva el modo de
@@ -248,7 +249,7 @@ export type InvoiceItemInput = z.infer<typeof invoiceItemSchema>;
 /** FAC-07: porción del cobro con su método de pago (monto > 0). */
 export const paymentPortionSchema = z.object({
   method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
-  amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+  amount: positiveCopSchema("El monto debe ser mayor a 0."),
 });
 export type PaymentPortionInput = z.infer<typeof paymentPortionSchema>;
 
@@ -363,7 +364,7 @@ export function overCollectedEdit(balance: {
   netCollected: number;
 }): OverCollectedEdit | null {
   const diferencia = balance.netCollected - balance.netBilled;
-  if (diferencia < MONEY_EPSILON) return null;
+  if (!copExceeds(balance.netCollected, balance.netBilled)) return null;
   return { cobrado: balance.netCollected, total: balance.netBilled, diferencia };
 }
 
@@ -620,7 +621,7 @@ export function computeInvoiceTotals(args: {
     args.items.reduce((acc, item) => acc + computeLineSubtotal(item).subtotal, 0),
   );
   const discount = roundMoney(args.discount);
-  if (discount - subtotal > MONEY_EPSILON) {
+  if (copExceeds(discount, subtotal)) {
     throw new Error("DESCUENTO_EXCEDE");
   }
   const base = roundMoney(Math.max(0, subtotal - discount));
@@ -648,7 +649,7 @@ export function applyPaymentSplit(args: {
   const incoming = roundMoney(args.portions.reduce((acc, row) => acc + row.amount, 0));
   if (incoming <= 0) throw new Error("PORCION_INVALIDA");
   const paid = roundMoney(args.paidSoFar + incoming);
-  if (paid - args.total > MONEY_EPSILON) throw new Error("SOBREPAGO");
+  if (copExceeds(paid, args.total)) throw new Error("SOBREPAGO");
   const remaining = roundMoney(Math.max(0, args.total - paid));
   return { paid, remaining, fullyPaid: moneyEquals(paid, args.total) };
 }

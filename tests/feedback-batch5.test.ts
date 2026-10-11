@@ -829,7 +829,7 @@ describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", 
     expect(SUBMIT_BUTTON).not.toContain("Totalizar pago");
   });
 
-  it("el handler escribe el saldo NETO del detalle, redondeado a 2 como la emisión", () => {
+  it("el handler escribe el saldo NETO del detalle redondeado a peso entero", () => {
     // Fuente del gesto: el saldo NETO que ya trae el detalle
     // (`service.ts`: `remaining: round2(max(0, netRemaining))`). Se pina el
     // campo para que el gesto no se reapunte a `total` (que es BRUTO).
@@ -841,7 +841,9 @@ describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", 
     const HANDLER = INVOICES_CLIENT_CODE.slice(handlerStart, INVOICES_CLIENT_CODE.indexOf("\n  }", handlerStart));
     // Escribe el monto del borrador de cobro con el NETO pendiente…
     expect(HANDLER).toContain("setSplitDraft((prev) => ({ ...prev, amount: value }))");
-    expect(HANDLER).toContain("Math.round(splitRemaining * 100) / 100");
+    // COP: la terminal no cobra centavos y la máscara solo deja dígitos.
+    expect(HANDLER).toContain("copInputDigits(splitRemaining)");
+    expect(HANDLER).not.toContain("Math.round(splitRemaining * 100) / 100");
     // …y SOLO con eso: el recargo lo suma el servidor al TOTAL, no al monto. Si
     // alguien metiera `surcharge` o un `fee`, este control lo acusa.
     expect(HANDLER).not.toMatch(/surcharge|\bfee\b/);

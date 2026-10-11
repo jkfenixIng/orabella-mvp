@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { idempotencyKeySchema, moneyEquals, roundMoney } from "@/src/features/billing/schemas";
+import { copSchema, positiveCopSchema } from "@/src/shared/money/cop";
 
 export { moneyEquals, roundMoney };
 
@@ -13,7 +14,7 @@ export const commissionRuleSchema = z
     item_id: uuidSchema,
     employee_id: uuidSchema,
     percent: z.coerce.number().min(0, "El porcentaje mínimo es 0.").max(100, "El máximo es 100.").nullish(),
-    amount: z.coerce.number().nonnegative("El valor no puede ser negativo.").nullish(),
+    amount: copSchema("El valor no puede ser negativo.").nullish(),
     is_active: z.boolean().optional(),
   })
   .superRefine((value, context) => {
@@ -49,7 +50,7 @@ export const commissionPayoutSchema = z.object({
   idempotency_key: idempotencyKeySchema,
   invoice_id: uuidSchema,
   employee_id: uuidSchema,
-  amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+  amount: positiveCopSchema("El monto debe ser mayor a 0."),
   method_code: z.string().trim().min(1, "Método requerido.").max(40, "Método muy largo.").default("efectivo"),
 });
 export type CommissionPayoutInput = z.infer<typeof commissionPayoutSchema>;

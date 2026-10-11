@@ -116,6 +116,7 @@ import {
   getPeriodDetail,
   getVoucherSettings,
   groupSettlementInvoices,
+  listPayrollMonthOptions,
   listPayrollMonthRows,
   listPayrollOverview,
   listPeriods,
@@ -1554,53 +1555,39 @@ describe("payroll: borrado de un período en borrador (PAY-01)", () => {
 
 // ------------------------------------------- tope de efectivo al aprobar (PAY-06) ---
 
-describe("payroll: tope del 50% de salidas en efectivo al APROBAR un vale (PAY-06)", () => {
-  it("aprueba un vale de efectivo dentro del tope (acumulado + vale <= 50% de la base)", () => {
-    // Base 200000 → tope 100000; ya salió 20000; el vale de 50000 deja 70000.
-    expect(
-      voucherApprovalCashOutViolation({
-        methodCode: "efectivo",
-        cashShiftId: "shift-1",
-        openingBase: 200000,
-        cashOutUsed: 20000,
-        amount: 50000,
-      }),
-    ).toBeNull();
-  });
-
-  it("rechaza un vale de efectivo que supera el tope contando lo ya salido del turno", () => {
-    // Base 200000 → tope 100000; ya salió 80000; el vale de 30000 proyecta 110000.
-    const violation = voucherApprovalCashOutViolation({
-      methodCode: "efectivo",
-      cashShiftId: "shift-1",
-      openingBase: 200000,
-      cashOutUsed: 80000,
-      amount: 30000,
-    });
-    expect(violation?.code).toBe("CASH_OUT_LIMIT_EXCEEDED");
-    expect(violation?.message).toContain("30000");
-    expect(violation?.message).toContain("200000");
-  });
-
-  it("no aplica tope a un vale NO efectivo aunque supere el 50%", () => {
+describe("payroll: approving a voucher re-checks the method floor (003)", () => {
+  it("approves when the method keeps at least 50% of its own opening base", () => {
+    // Base 200000 → floor 100000; balance 150000; the 50000 voucher leaves 100000.
     expect(
       voucherApprovalCashOutViolation({
         methodCode: "nequi",
         cashShiftId: "shift-1",
         openingBase: 200000,
-        cashOutUsed: 80000,
-        amount: 300000,
+        expectedBalance: 150000,
+        amount: 50000,
       }),
     ).toBeNull();
   });
 
-  it("un vale histórico sin turno ni método no tiene tope (no se puede acumular)", () => {
+  it("rejects when the method would end below its floor, whatever its code is", () => {
+    const violation = voucherApprovalCashOutViolation({
+      methodCode: "billetera-qr",
+      cashShiftId: "shift-1",
+      openingBase: 200000,
+      expectedBalance: 120000,
+      amount: 30000,
+    });
+    expect(violation?.code).toBe("CASH_METHOD_MINIMUM_BREACH");
+    expect(violation?.message).toContain("100000");
+  });
+
+  it("a historical voucher without shift or method never touches the drawer", () => {
     expect(
       voucherApprovalCashOutViolation({
         methodCode: "efectivo",
         cashShiftId: null,
         openingBase: null,
-        cashOutUsed: 0,
+        expectedBalance: 0,
         amount: 999999,
       }),
     ).toBeNull();
@@ -2273,12 +2260,18 @@ function createPayrollPagedStubClient(): unknown {
       },
       gte: (column: string, value: unknown) => {
         filterColumns.push(column);
-        filters.push((row) => String(row[column] ?? "") >= String(value));
+        filters.push((row) => {
+          if (column !== "paid_at") return String(row[column] ?? "") >= String(value);
+          return Date.parse(String(row[column] ?? "")) >= Date.parse(String(value));
+        });
         return query;
       },
       lte: (column: string, value: unknown) => {
         filterColumns.push(column);
-        filters.push((row) => String(row[column] ?? "") <= String(value));
+        filters.push((row) => {
+          if (column !== "paid_at") return String(row[column] ?? "") <= String(value);
+          return Date.parse(String(row[column] ?? "")) <= Date.parse(String(value));
+        });
         return query;
       },
       // `.is(col, null)` del cliente Supabase: la lectura de pendientes
@@ -2351,6 +2344,18 @@ function createPayrollPagedStubClient(): unknown {
     args?: Record<string, unknown>,
   ): Promise<{ data: unknown; error: unknown }> => {
     payrollPagedStub.rpcCalls.push({ name, args: args ?? {} });
+    // 003: the derived balance of a method in a shift, from the double's own
+    // tables (frozen opening base − approved vouchers of that method).
+    if (name === "cash_shift_method_expected_balance") {
+      const balance = (payrollPagedStub.tables.cash_shift_method_balances ?? []).find(
+        (row) => row.cash_shift_id === args?.p_shift_id && row.method_code === args?.p_method_code,
+      );
+      if (!balance) return { data: null, error: { code: "P0001", message: "CASH_METHOD_BALANCE_REQUIRED" } };
+      const out = (payrollPagedStub.tables.voucher_requests ?? [])
+        .filter((row) => row.cash_shift_id === args?.p_shift_id && row.method_code === args?.p_method_code && row.approved_by)
+        .reduce((acc, row) => acc + Number(row.amount), 0);
+      return { data: Number(balance.opening_base) - out, error: null };
+    }
     /**
      * CL-9: `payroll_delete_period_atomic` (048). El doble emula UNA
      * transacción del servidor: la reversión de los vales y el borrado del
@@ -7148,6 +7153,110 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     });
   });
 
+  function extraFixture(id: string, employeeId: string, amount: number, paidAt: string): Record<string, unknown> {
+    return {
+      id,
+      employee_id: employeeId,
+      amount,
+      method_id: null,
+      method_code: "efectivo",
+      reference: null,
+      reason: `Motivo ${id}`,
+      kind: "emergencia",
+      days_from: null,
+      days_to: null,
+      paid_by: "u-1",
+      paid_at: paidAt,
+      created_at: paidAt,
+    };
+  }
+
+  it("suma pagos extraordinarios por mes Bogotá sin alterar neto ni saldo del período", async () => {
+    seedLegibilityFixture();
+    payrollPagedStub.tables.payroll_extras = [
+      extraFixture("extra-sep", "emp-01", 50000, "2026-10-01T00:30:00Z"),
+      extraFixture("extra-oct", "emp-01", 70000, "2026-10-01T05:00:00Z"),
+    ];
+
+    const [september] = await listPayrollMonthRows({ month: "2026-09", employeeId: "emp-01" });
+    const [october] = await listPayrollMonthRows({ month: "2026-10", employeeId: "emp-01" });
+
+    expect(september).toMatchObject({
+      periodNet: 1900000,
+      periodPaid: 1300000,
+      periodRemaining: 600000,
+      extrasPaid: 50000,
+      monthPaid: 1350000,
+    });
+    expect(september.extras.map((row) => row.id)).toEqual(["extra-sep"]);
+    expect(october).toMatchObject({
+      periodNet: 1100000,
+      periodPaid: 200000,
+      periodRemaining: 900000,
+      extrasPaid: 70000,
+      monthPaid: 270000,
+    });
+    expect(october.extras.map((row) => row.id)).toEqual(["extra-oct"]);
+  });
+
+  it.each([
+    ["2026-01", "2026-02", "2026-02-01T04:59:59.999Z", "2026-02-01T05:00:00.000Z"],
+    ["2026-04", "2026-05", "2026-05-01T04:59:59.999Z", "2026-05-01T05:00:00.000Z"],
+    ["2024-02", "2024-03", "2024-03-01T04:59:59.999Z", "2024-03-01T05:00:00.000Z"],
+    ["2026-02", "2026-03", "2026-03-01T04:59:59.999Z", "2026-03-01T05:00:00.000Z"],
+  ])("separa extras en la frontera Bogotá de %s y %s", async (month, nextMonth, lastInstant, nextInstant) => {
+    seedLegibilityFixture();
+    payrollPagedStub.tables.payroll_extras = [
+      extraFixture(`last-${month}`, "emp-01", 10000, lastInstant),
+      extraFixture(`first-${nextMonth}`, "emp-01", 20000, nextInstant),
+    ];
+
+    const [current] = await listPayrollMonthRows({ month, employeeId: "emp-01" });
+    const [next] = await listPayrollMonthRows({ month: nextMonth, employeeId: "emp-01" });
+
+    expect(current.extras.map((row) => row.id)).toEqual([`last-${month}`]);
+    expect(next.extras.map((row) => row.id)).toEqual([`first-${nextMonth}`]);
+    const options = await listPayrollMonthOptions();
+    expect(options).toEqual(expect.arrayContaining([month, nextMonth]));
+    expect(options).toEqual([...options].sort((left, right) => (left < right ? 1 : -1)));
+  });
+
+  it("un mes con solo pagos extraordinarios aparece y su saldo de período es cero", async () => {
+    seedLegibilityFixture();
+    payrollPagedStub.tables.payroll_extras = [
+      extraFixture("extra-nov", "emp-01", 90000, "2026-11-10T15:00:00Z"),
+    ];
+
+    expect(await listPayrollMonthRows({ month: "2026-11", employeeId: "emp-01" })).toEqual([
+      expect.objectContaining({
+        periodNet: 0,
+        periodPaid: 0,
+        periodRemaining: 0,
+        extrasPaid: 90000,
+        monthPaid: 90000,
+        periods: [],
+      }),
+    ]);
+    expect(await listPayrollMonthOptions()).toEqual(["2026-11", "2026-10", "2026-09"]);
+  });
+
+  it("un empleado sin extras conserva el resultado anterior", async () => {
+    seedLegibilityFixture();
+    payrollPagedStub.tables.payroll_extras = [
+      extraFixture("extra-other", "emp-02", 90000, "2026-09-10T15:00:00Z"),
+    ];
+
+    const [row] = await listPayrollMonthRows({ month: "2026-09", employeeId: "emp-01" });
+    expect(row).toMatchObject({
+      netTotal: 1900000,
+      paidTotal: 1300000,
+      remainingTotal: 600000,
+      extrasPaid: 0,
+      monthPaid: 1300000,
+      extras: [],
+    });
+  });
+
   it("control negativo: un mes sin períodos no devuelve filas", async () => {
     seedLegibilityFixture();
 
@@ -8590,6 +8699,7 @@ describe("payroll: CL-5 la solicitud de vale reintentada no abre un segundo vale
     name: "Efectivo",
     is_active: true,
     arqueable: true,
+    arqueo_mode: "denominations",
     fee_percent: 0,
   };
   const MARK = "4a8d2f61-9b03-4c75-8e12-5d7f0a3b6c94";
@@ -8642,6 +8752,13 @@ describe("payroll: CL-5 la solicitud de vale reintentada no abre un segundo vale
     ];
     payrollPagedStub.tables.employees = [employeeRow(EMPLOYEE_ID), employeeRow(EMPLOYEE_2)];
     payrollPagedStub.tables.payment_methods = [METHOD];
+    // 003: both shifts froze a base for the method; 500000 leaves room for
+    // every voucher of this suite (floor 250000).
+    payrollPagedStub.tables.cash_shift_method_balances = [SHIFT_ID, OTHER_SHIFT_ID].map((shift) => ({
+      cash_shift_id: shift,
+      method_code: "efectivo",
+      opening_base: 500000,
+    }));
     // 072: los topes se leen de `system_settings`, una fila por ajuste.
     payrollPagedStub.tables.system_settings = voucherSettingRows({
       max_per_day: 200000,

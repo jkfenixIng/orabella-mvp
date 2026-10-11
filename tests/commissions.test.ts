@@ -1119,6 +1119,10 @@ function createPayoutStubClient(): unknown {
           };
         case "commission_rules":
           return { data: [], error: null };
+        // 003: the shift froze a large base for the method, so the 50% floor
+        // never interferes with the commission-cap scenarios of this suite.
+        case "cash_shift_method_balances":
+          return { data: { opening_base: 0 }, error: null };
         case "commission_payouts": {
           // CL-5: el lookup por MARCA (el que la 044 hace posible). Se reconoce
           // por su filtro; devuelve la fila que la marca identifica dentro del
@@ -1191,7 +1195,13 @@ function createPayoutStubClient(): unknown {
     return query;
   };
 
-  return { from };
+  // 003: derived balance of the method in the shift (opening 0 → floor 0).
+  const rpc = async (name: string) =>
+    name === "cash_shift_method_expected_balance"
+      ? { data: 1_000_000, error: null }
+      : { data: null, error: { message: `stub sin respuesta para rpc ${name}` } };
+
+  return { from, rpc };
 }
 
 vi.mock("@/src/shared/lib/supabase/server", () => ({
@@ -1207,6 +1217,7 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
       name: "Transferencia",
       is_active: true,
       arqueable: true,
+      arqueo_mode: "declared_total",
       fee_percent: 0,
     },
   ] as Awaited<ReturnType<typeof actual.listPaymentMethods>>;

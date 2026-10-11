@@ -1,14 +1,17 @@
 /**
  * T8 — Auditoría de acciones críticas (TRA-01, PRD §5.8).
  *
- * SOLO SERVIDOR. Este módulo usa `createAdminClient()` (service_role, bypass
- * de RLS). NUNCA importarlo en Client Components ni en código con "use client":
- * expondría la service_role key. Los servicios del servidor (login fallido /
- * bloqueo, anulación de factura, cierre con base incompleta, cálculo / cierre
- * de nómina, vales sobre tope, cambio de clave) llaman a `writeAudit()`.
+ * SOLO SERVIDOR. La persistencia se selecciona por DB_ENGINE: Supabase usa el
+ * cliente service_role; PostgreSQL directo usa el adaptador Drizzle cargado
+ * dinámicamente. NUNCA importarlo en Client Components ni en código con
+ * "use client": expondría una credencial o incluiría infraestructura de BD.
+ * Los servicios del servidor (login fallido / bloqueo, anulación de factura,
+ * cierre con base incompleta, cálculo / cierre de nómina, vales sobre tope,
+ * cambio de clave) llaman a `writeAudit()`.
  *
- * `writeAudit()` NUNCA lanza: ante cualquier fallo (red, env, BD) registra en
- * consola y devuelve `{ written: false }` para no romper el flujo de negocio.
+ * `writeAudit()` NUNCA lanza: ante cualquier fallo (red, env, BD) registra un
+ * diagnóstico sin parámetros de consulta y devuelve `{ written: false }` para
+ * no romper el flujo de negocio.
  */
 
 export interface AuditEntry {
@@ -131,15 +134,13 @@ export function buildAuditPayload(entry: AuditEntry): AuditPayload {
 export async function writeAudit(entry: AuditEntry): Promise<{ written: boolean }> {
   try {
     const payload = buildAuditPayload(entry);
-    const { createAdminClient } = await import("@/src/shared/lib/supabase/server");
-    const db = createAdminClient();
-    const { error } = await db.from("audit_logs").insert(payload);
-    if (error) {
-      console.error("[audit] no se pudo escribir audit_logs:", error.message);
-      return { written: false };
-    }
+    const { auditRepo } = await import("./repos/audit");
+    await (await auditRepo()).insert(payload);
     return { written: true };
   } catch (error) {
+    // Supabase: the same message as before (the PostgREST `error.message`).
+    // PostgreSQL: the adapter already reduced it to a SQLSTATE diagnostic, so
+    // neither Drizzle's bound parameters nor an echoed value reach the log.
     console.error(
       "[audit] no se pudo escribir audit_logs:",
       error instanceof Error ? error.message : error,

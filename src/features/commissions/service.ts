@@ -10,10 +10,18 @@ import {
   type CommissionRuleRow,
   type RuleRate,
 } from "./schemas";
+import { commissionsRepo, type CommissionRepo } from "./repos/commissions";
+import { DbQueryError } from "@/src/shared/db/errors";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
-import { cashOutUsedInShift, getOpenShift } from "@/src/features/cash/service";
-import { cashOutLimitViolation } from "@/src/features/cash/schemas";
+import {
+  assertCashMethodOutflow,
+  CashError,
+  cashMethodRuleError,
+  getOpenShift,
+} from "@/src/features/cash/service";
 import { listPaymentMethods } from "@/src/features/admin/service";
+import { COP_WHOLE_PESO_MESSAGE, copValidationError } from "@/src/shared/money/cop";
+import { commissionPayoutCapExceeded } from "@/src/shared/money/caps";
 
 export class CommissionError extends Error {
   readonly code: string;
@@ -27,38 +35,49 @@ export class CommissionError extends Error {
   }
 }
 
-/**
- * Cliente privilegiado bajo demanda (service_role, solo servidor).
- * Import dinámico para que los tests unitarios (sin red/env) nunca lo carguen.
- */
-async function commissionsDb() {
-  const { createAdminClient } = await import("@/src/shared/lib/supabase/server");
-  return createAdminClient();
+/** Commissions' COP write boundary: the unambiguous 005 P0001 is validation. */
+function commissionCopValidation(error: unknown): CommissionError | null {
+  return copValidationError(error, () => new CommissionError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400));
 }
 
-type DbClient = Awaited<ReturnType<typeof commissionsDb>>;
+function throwCommissionCop(error: unknown): void {
+  const cop = commissionCopValidation(error);
+  if (cop) throw cop;
+}
+
+/** Any database failure of a plain read/write is INTERNAL, as before the port. */
+async function internal<T>(work: () => Promise<T>): Promise<T> {
+  try {
+    return await work();
+  } catch (error) {
+    if (error instanceof CommissionError) throw error;
+    throwCommissionCop(error);
+    throw new CommissionError("INTERNAL", "Error interno.", 500);
+  }
+}
+
+/** The configured engine's repository (loaded on demand, server only). */
+const repo = (): Promise<CommissionRepo> => internal(commissionsRepo);
+
+const dbCode = (error: unknown): string | null => (error instanceof DbQueryError ? error.error.code : null);
 
 function validationMessage(error: { issues: Array<{ message: string }> }): string {
   return error.issues[0]?.message ?? "Datos inválidos.";
 }
 
-// ------------------------------------------------------------------ reglas ---
+/** 003: the cash method rule keeps its stable code across features. */
+function commissionFromCash(error: unknown): CommissionError {
+  if (error instanceof CashError) return new CommissionError(error.code, error.message, error.status);
+  return new CommissionError("INTERNAL", "Error interno.", 500);
+}
 
-const RULE_SELECT =
-  "id, item_type, item_id, employee_id, percent, amount, is_active";
+// ------------------------------------------------------------------ reglas ---
 
 /** Reglas (filtro opcional por ítem o empleado). */
 export async function listCommissionRules(
   filters: { item_type?: string; item_id?: string; employee_id?: string } = {},
 ): Promise<CommissionRuleRow[]> {
-  const db = await commissionsDb();
-  let query = db.from("commission_rules").select(RULE_SELECT);
-  if (filters.item_type) query = query.eq("item_type", filters.item_type);
-  if (filters.item_id) query = query.eq("item_id", filters.item_id);
-  if (filters.employee_id) query = query.eq("employee_id", filters.employee_id);
-  const { data, error } = await query.order("created_at");
-  if (error) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as CommissionRuleRow[];
+  return internal(async () => (await repo()).listRules(filters));
 }
 
 /**
@@ -88,63 +107,45 @@ export async function upsertCommissionRule(raw: unknown): Promise<CommissionRule
     throw new CommissionError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const input = parsed.data;
-  const db = await commissionsDb();
+  const db = await repo();
 
   const itemTable = input.item_type === "producto" ? "products" : "services";
-  const { data: item, error: itemError } = await db
-    .from(itemTable)
-    .select("id")
-    .eq("id", input.item_id)
-    .maybeSingle();
-  if (itemError) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  if (!item) throw new CommissionError("NOT_FOUND", "Ítem no encontrado.", 404);
+  if (!(await internal(() => db.itemExists(itemTable, input.item_id)))) {
+    throw new CommissionError("NOT_FOUND", "Ítem no encontrado.", 404);
+  }
+  if (!(await internal(() => db.employeeExists(input.employee_id)))) {
+    throw new CommissionError("NOT_FOUND", "Empleado no encontrado.", 404);
+  }
 
-  const { data: employee, error: employeeError } = await db
-    .from("employees")
-    .select("id")
-    .eq("id", input.employee_id)
-    .maybeSingle();
-  if (employeeError) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  if (!employee) throw new CommissionError("NOT_FOUND", "Empleado no encontrado.", 404);
-
-  const { data, error } = await db
-    .from("commission_rules")
-    .upsert(
-      {
-        ...(input.id ? { id: input.id } : {}),
-        item_type: input.item_type,
-        item_id: input.item_id,
-        employee_id: input.employee_id,
-        percent: input.percent ?? null,
-        amount: input.amount ?? null,
-        ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
-      },
-      { onConflict: "item_type,item_id,employee_id" },
-    )
-    .select(RULE_SELECT)
-    .single();
-  if (error) {
-    if ((error as { code?: string }).code === "23505") {
+  let data: CommissionRuleRow | null;
+  try {
+    // Both adapters send ON CONFLICT (item_type, item_id, employee_id)
+    // (`onConflict` in repos/commissions.ts): the 075 index.
+    data = await db.upsertRule({
+      ...(input.id ? { id: input.id } : {}),
+      item_type: input.item_type,
+      item_id: input.item_id,
+      employee_id: input.employee_id,
+      percent: input.percent ?? null,
+      amount: input.amount ?? null,
+      ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
+    });
+  } catch (error) {
+    throwCommissionCop(error);
+    if (dbCode(error) === "23505") {
       throw new CommissionError("RULE_CONFLICT", "Ya existe una regla para ese ítem y empleado.", 409);
     }
     throw new CommissionError("INTERNAL", "Error interno.", 500);
   }
   if (!data) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  return data as CommissionRuleRow;
+  return data;
 }
 
 /** Elimina una regla (solo admin). */
 export async function deleteCommissionRule(id: string): Promise<{ id: string }> {
-  const db = await commissionsDb();
-  const { data, error } = await db
-    .from("commission_rules")
-    .delete()
-    .eq("id", id)
-    .select("id")
-    .maybeSingle();
-  if (error) throw new CommissionError("INTERNAL", "Error interno.", 500);
+  const data = await internal(async () => (await repo()).deleteRule(id));
   if (!data) throw new CommissionError("NOT_FOUND", "Regla no encontrada.", 404);
-  return { id: (data as { id: string }).id };
+  return { id: data.id };
 }
 
 // ------------------------------------------------------------------- ganado ---
@@ -207,25 +208,13 @@ export async function earnedCommissionFor(
   invoiceId: string,
   employeeId: string,
 ): Promise<EarnedCommission> {
-  const db = await commissionsDb();
-  const { data: invoice, error: invoiceError } = await db
-    .from("invoices")
-    .select("id, status")
-    .eq("id", invoiceId)
-    .maybeSingle();
-  if (invoiceError) throw new CommissionError("INTERNAL", "Error interno.", 500);
+  const db = await repo();
+  const invoice = await internal(() => db.invoiceStatus(invoiceId));
   if (!invoice) throw new CommissionError("NOT_FOUND", "Factura no encontrada.", 404);
-  assertInvoicePaid((invoice as { status: string }).status);
+  assertInvoicePaid(invoice.status);
 
-  const { data: lines, error: linesError } = await db
-    .from("invoice_items")
-    .select(
-      "item_type, product_id, service_id, qty, unit_price, subtotal, no_commission, commission_value, commission_percent_override",
-    )
-    .eq("invoice_id", invoiceId)
-    .eq("employee_id", employeeId);
-  if (linesError) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  const earning = ((lines ?? []) as Array<{
+  const lines = await internal(() => db.invoiceLines(invoiceId, employeeId));
+  const earning = (lines as Array<{
     item_type: string;
     product_id: string | null;
     service_id: string | null;
@@ -237,14 +226,9 @@ export async function earnedCommissionFor(
     commission_percent_override: number | string | null;
   }>).filter((line) => !line.no_commission);
 
-  const { data: rules, error: rulesError } = await db
-    .from("commission_rules")
-    .select("item_type, item_id, percent, amount")
-    .eq("employee_id", employeeId)
-    .eq("is_active", true);
-  if (rulesError) throw new CommissionError("INTERNAL", "Error interno.", 500);
+  const rules = await internal(() => db.activeRules(employeeId));
   const ruleByItem = new Map<string, RuleRate>(
-    ((rules ?? []) as Array<{ item_type: string; item_id: string; percent: number | null; amount: number | null }>).map(
+    (rules as Array<{ item_type: string; item_id: string; percent: number | null; amount: number | null }>).map(
       (rule) => [
         commissionRuleKey(rule.item_type, rule.item_id),
         {
@@ -255,13 +239,10 @@ export async function earnedCommissionFor(
     ),
   );
 
-  const { data: employee, error: employeeError } = await db
-    .from("employees")
-    .select("pay_type, commission_percent")
-    .eq("id", employeeId)
-    .maybeSingle();
-  if (employeeError) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  const emp = (employee ?? null) as { pay_type: string; commission_percent: number | string | null } | null;
+  const emp = (await internal(() => db.employeeRate(employeeId))) as {
+    pay_type: string;
+    commission_percent: number | string | null;
+  } | null;
   const flatPercent =
     emp && (emp.pay_type === "porcentaje" || emp.pay_type === "mixto")
       ? Number(emp.commission_percent ?? 0)
@@ -328,22 +309,11 @@ export async function immediatePaidTotal(
   invoiceId: string,
   employeeId: string,
 ): Promise<number> {
-  const db = await commissionsDb();
-  const { data, error } = await db
-    .from("commission_payouts")
-    .select("amount")
-    .eq("invoice_id", invoiceId)
-    .eq("employee_id", employeeId);
-  if (error) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  return roundMoney(
-    ((data ?? []) as Array<{ amount: number | string }>).reduce((acc, row) => acc + Number(row.amount), 0),
-  );
+  const amounts = await internal(async () => (await repo()).paidAmounts(invoiceId, employeeId));
+  return roundMoney(amounts.reduce((acc, amount) => acc + amount, 0));
 }
 
 // -------------------------------------------------------------------- pagos ---
-
-const PAYOUT_SELECT =
-  "id, employee_id, invoice_id, cash_shift_id, method_code, base_subtotal, percent_applied, fixed_applied, earned_immediate, amount, paid_by, paid_at";
 
 /**
  * CL-5: la fila de `commission_payouts` que YA se registró con esa marca, DENTRO
@@ -367,22 +337,13 @@ const PAYOUT_SELECT =
  * lookup corre DESPUÉS de esa validación y no puede devolver el pago de otra
  * factura.
  */
-async function findCommissionPayoutByIdempotencyKey(
-  db: DbClient,
+function findCommissionPayoutByIdempotencyKey(
+  db: CommissionRepo,
   invoiceId: string,
   employeeId: string,
   idempotencyKey: string,
 ): Promise<CommissionPayoutRow | null> {
-  const { data, error } = await db
-    .from("commission_payouts")
-    .select(PAYOUT_SELECT)
-    .eq("invoice_id", invoiceId)
-    .eq("employee_id", employeeId)
-    .eq("idempotency_key", idempotencyKey)
-    .limit(1)
-    .maybeSingle();
-  if (error) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  return (data as CommissionPayoutRow | null) ?? null;
+  return internal(() => db.findPayoutByKey(invoiceId, employeeId, idempotencyKey));
 }
 
 /**
@@ -450,14 +411,12 @@ export async function payCommissionNow(
   // valor para la validación del pendiente, el tope de caja y la fila
   // guardada (lo que se valida es lo que se guarda).
   const amount = roundMoney(input.amount);
-  const db = await commissionsDb();
+  const db = await repo();
 
-  const { data: payoutEmployee } = await db
-    .from("employees")
-    .select("payout_mode")
-    .eq("id", input.employee_id)
-    .maybeSingle();
-  if ((payoutEmployee as { payout_mode?: string } | null)?.payout_mode === "no_aplica") {
+  // As before the port, a failed read of the payout mode does not block the
+  // payment here: the remaining guards and the database still decide.
+  const payoutMode = await db.employeePayoutMode(input.employee_id).catch(() => null);
+  if (payoutMode === "no_aplica") {
     throw new CommissionError(
       "COMMISSION_NOT_APPLICABLE",
       "Ese empleado no aplica para comisiones.",
@@ -524,7 +483,7 @@ export async function payCommissionNow(
       422,
     );
   }
-  if (amount - pending > 0.009) {
+  if (commissionPayoutCapExceeded({ alreadyPaid: paid, incoming: amount, cap: earned.immediateEarned })) {
     throw new CommissionError(
       "COMMISSION_OVERPAID",
       `El monto supera la comisión pendiente (${pending}).`,
@@ -532,21 +491,11 @@ export async function payCommissionNow(
     );
   }
 
-  // Tope de salidas en efectivo del turno (50% de la base de apertura): la
-  // comisión pagada en efectivo no puede dejar el acumulado del turno por
-  // encima del tope. Solo aplica al efectivo; los digitales no tienen tope.
-  if (method.code === "efectivo") {
-    const usedCashOut = await cashOutUsedInShift(shift.id).catch(() => {
-      throw new CommissionError("INTERNAL", "Error interno.", 500);
-    });
-    const violation = cashOutLimitViolation({
-      methodCode: method.code,
-      openingBase: Number(shift.opening_base),
-      cashOutUsed: usedCashOut,
-      amount,
-    });
-    if (violation) throw new CommissionError(violation.code, violation.message, 422);
-  }
+  // 003: the payout cannot leave this method's shift balance below 50% of its
+  // own opening base. Friendly pre-check; the database trigger is the authority.
+  await assertCashMethodOutflow({ shiftId: shift.id, method, amount }).catch((error) => {
+    throw commissionFromCash(error);
+  });
 
   // Defensa en profundidad: `earnedCommissionFor` ya exigió `Pagada`, pero el
   // estado pudo cambiar entre esa lectura y este INSERT (anulación o cobro en
@@ -554,18 +503,13 @@ export async function payCommissionNow(
   // lectura previa: se relee la factura justo antes de escribir y se vuelve a
   // exigir el mismo estado. Corre DESPUÉS del reconocimiento de la marca CL-5,
   // así que un reintento ya registrado sigue siendo un no-op exitoso.
-  const { data: payoutInvoice, error: payoutInvoiceError } = await db
-    .from("invoices")
-    .select("id, status")
-    .eq("id", input.invoice_id)
-    .maybeSingle();
-  if (payoutInvoiceError) throw new CommissionError("INTERNAL", "Error interno.", 500);
+  const payoutInvoice = await internal(() => db.invoiceStatus(input.invoice_id));
   if (!payoutInvoice) throw new CommissionError("NOT_FOUND", "Factura no encontrada.", 404);
-  assertInvoicePaid((payoutInvoice as { status: string }).status);
+  assertInvoicePaid(payoutInvoice.status);
 
-  const { data, error } = await db
-    .from("commission_payouts")
-    .insert({
+  let data: CommissionPayoutRow | null;
+  try {
+    data = await db.insertPayout({
       employee_id: input.employee_id,
       invoice_id: input.invoice_id,
       cash_shift_id: shift.id,
@@ -583,10 +527,11 @@ export async function payCommissionNow(
       // arriba usan la misma clave. Sin ella no habría forma de distinguir "el
       // mismo envío" de "un segundo pago parcial legítimo".
       idempotency_key: input.idempotency_key,
-    })
-    .select(PAYOUT_SELECT)
-    .single();
-  if (error) {
+    });
+  } catch (failure) {
+    throwCommissionCop(failure);
+    if (!(failure instanceof DbQueryError)) throw new CommissionError("INTERNAL", "Error interno.", 500);
+    const error = failure.error;
     // CL-5: carrera perdida contra el índice único parcial de la 044 (23505). El
     // lookup de arriba y este INSERT no son atómicos: si otro envío con la MISMA
     // marca en el MISMO par se confirmó en esa ventana, la repetición se relee y
@@ -597,7 +542,7 @@ export async function payCommissionNow(
     // código de la base las distingue. Si la fila que chocó es de la MISMA marca,
     // la respuesta correcta es la operación ya registrada; el tope, en cambio,
     // sólo habla de dinero que se pasa del ganado.
-    if ((error as { code?: string }).code === "23505") {
+    if (error.code === "23505") {
       const winner = await findCommissionPayoutByIdempotencyKey(
         db,
         input.invoice_id,
@@ -611,7 +556,10 @@ export async function payCommissionNow(
     // acumulado de la base rechazó el pago (la suma del par ya estaba completa
     // cuando entró esta fila). Mismo código que traducen payroll, cash y
     // billing; la condición de negocio es la misma que valida el pendiente.
-    if ((error as { code?: string }).code === "P0001") {
+    throwCommissionCop(error);
+    const cashRule = cashMethodRuleError(error);
+    if (cashRule) throw commissionFromCash(cashRule);
+    if (error.code === "P0001") {
       throw new CommissionError(
         "COMMISSION_OVERPAID",
         "El monto supera la comisión pendiente.",
@@ -626,7 +574,7 @@ export async function payCommissionNow(
     user_id: actor.userId,
     action: AUDIT_ACTIONS.COMMISSION_PAID,
     entity: "commission_payouts",
-    entity_id: (data as CommissionPayoutRow).id,
+    entity_id: data.id,
     metadata: {
       employee_id: input.employee_id,
       invoice_id: input.invoice_id,
@@ -641,19 +589,12 @@ export async function payCommissionNow(
       earned_immediate: earned.immediateEarned,
     },
   });
-  return data as CommissionPayoutRow;
+  return data;
 }
 
 /** Pagos inmediatos (filtros opcionales, recientes primero). */
 export async function listCommissionPayouts(
   filters: { employee_id?: string; invoice_id?: string; shift_id?: string } = {},
 ): Promise<CommissionPayoutRow[]> {
-  const db = await commissionsDb();
-  let query = db.from("commission_payouts").select(PAYOUT_SELECT);
-  if (filters.employee_id) query = query.eq("employee_id", filters.employee_id);
-  if (filters.invoice_id) query = query.eq("invoice_id", filters.invoice_id);
-  if (filters.shift_id) query = query.eq("cash_shift_id", filters.shift_id);
-  const { data, error } = await query.order("paid_at", { ascending: false }).limit(200);
-  if (error) throw new CommissionError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as CommissionPayoutRow[];
+  return internal(async () => (await repo()).listPayouts(filters));
 }
