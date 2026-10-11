@@ -24,6 +24,16 @@ const operator = {
   current_in_app_role: false,
   session_in_app_role: false,
   is_migration_operator: true,
+  operator_role: {
+    rolcanlogin: false,
+    rolinherit: false,
+    rolsuper: false,
+    rolcreatedb: false,
+    rolcreaterole: false,
+    rolreplication: false,
+    rolbypassrls: false,
+    app_members: [],
+  },
 };
 const plan = (applied = []) => buildMigrationPlan(discovered, applied, [], contracts);
 
@@ -71,6 +81,20 @@ for (const identity of [
   await rejects(applyPlan(context(db)), /application|superuser nor a migration_operator/);
   assert.deepEqual(db.state.executed, []);
 }
+
+// A preexisting or tampered operator role is refused in both modes before any migration.
+for (const attribute of ["rolcanlogin", "rolinherit", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls"]) {
+  for (const session_is_superuser of [false, true]) {
+    const db = fakeDb({ identity: { ...operator, session_is_superuser, operator_role: { ...operator.operator_role, [attribute]: true } } });
+    await rejects(applyPlan(context(db)), new RegExp(`forbidden attributes \\(${attribute}\\)`));
+    assert.deepEqual(db.state.executed, []);
+  }
+}
+await rejects(
+  applyPlan(context(fakeDb({ identity: { ...operator, operator_role: { ...operator.operator_role, app_members: ["orabella_app"] } } }))),
+  /application roles are migration_operator members/,
+);
+await rejects(applyPlan(context(fakeDb({ identity: { ...operator, operator_role: null } }))), /does not exist/);
 
 // An audited DB owner/superuser without explicit app-role grants is an allowed mode.
 {

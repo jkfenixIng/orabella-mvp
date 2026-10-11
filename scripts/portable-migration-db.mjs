@@ -71,7 +71,22 @@ export const IDENTITY_SQL = `SELECT jsonb_build_object(
   'session_is_superuser', (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = session_user),
   'current_in_app_role', ${appMembership("current_user")},
   'session_in_app_role', ${appMembership("session_user")},
-  'is_migration_operator', coalesce(pg_has_role(current_user, pg_catalog.to_regrole('migration_operator'), 'MEMBER'), false)
+  'is_migration_operator', coalesce(pg_has_role(current_user, pg_catalog.to_regrole('migration_operator'), 'MEMBER'), false),
+  'operator_role', (
+    SELECT jsonb_build_object(
+      'rolcanlogin', r.rolcanlogin, 'rolinherit', r.rolinherit, 'rolsuper', r.rolsuper,
+      'rolcreatedb', r.rolcreatedb, 'rolcreaterole', r.rolcreaterole,
+      'rolreplication', r.rolreplication, 'rolbypassrls', r.rolbypassrls,
+      'app_members', (
+        SELECT coalesce(jsonb_agg(member.rolname), '[]'::jsonb)
+          FROM pg_catalog.pg_auth_members m
+          JOIN pg_catalog.pg_roles member ON member.oid = m.member
+         WHERE m.roleid = r.oid
+           AND member.rolname IN ('orabella_app', 'service_role', 'anon', 'authenticated')
+      )
+    )
+    FROM pg_catalog.pg_roles r WHERE r.rolname = 'migration_operator'
+  )
 )::text`;
 
 export const LEDGER_SQL = `SELECT jsonb_build_object('applied', coalesce(jsonb_agg(jsonb_build_object('filename', filename, 'sha256', sha256) ORDER BY filename), '[]'::jsonb))::text

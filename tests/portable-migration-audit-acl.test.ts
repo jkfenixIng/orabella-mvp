@@ -9,7 +9,7 @@ describe("portable migration audit bootstrap", () => {
   it("grants operator membership only to an explicit <MIGRATION_LOGIN>, never implicitly", () => {
     expect(auditBootstrap).toMatch(/CREATE ROLE migration_operator NOLOGIN NOINHERIT/);
     expect(auditBootstrap).toMatch(/GRANT migration_operator TO <MIGRATION_LOGIN>/);
-    expect(auditBootstrap).not.toMatch(/current_user/);
+    expect(auditBootstrap).not.toMatch(/GRANT migration_operator TO current_user/);
   });
 
   it("keeps application identities out of the ledger and the operator role", () => {

@@ -9,17 +9,52 @@
 -- grant it to orabella_app, service_role, anon or authenticated. A SQL Editor
 -- operator must use a login with this same explicit membership and SET ROLE.
 
+-- A preexisting migration_operator is normalized, never trusted: whatever
+-- attributes it had (LOGIN, INHERIT, SUPERUSER, CREATEROLE, BYPASSRLS, ...)
+-- are reset. If the executing role cannot ALTER it, the file fails closed with
+-- an explicit error instead of leaving a privileged operator role in place.
 DO $bootstrap$
-DECLARE role_name text;
+DECLARE
+  role_name text;
+  bad_member text;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'migration_operator') THEN
-    CREATE ROLE migration_operator NOLOGIN NOINHERIT;
+    CREATE ROLE migration_operator NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  ELSE
+    BEGIN
+      ALTER ROLE migration_operator NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    EXCEPTION WHEN insufficient_privilege THEN
+      RAISE EXCEPTION 'portable-migration-audit.sql: existing role migration_operator cannot be normalized by %', current_user
+        USING HINT = 'Run this file as the database owner/superuser, or drop and recreate migration_operator.';
+    END;
   END IF;
+
   FOREACH role_name IN ARRAY ARRAY['orabella_app', 'service_role', 'anon', 'authenticated'] LOOP
     IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = role_name) THEN
+      -- Application roles are never members of the operator role...
       EXECUTE pg_catalog.format('REVOKE migration_operator FROM %I', role_name);
+      -- ...and the operator role never reaches an application role.
+      EXECUTE pg_catalog.format('REVOKE %I FROM migration_operator', role_name);
     END IF;
   END LOOP;
+
+  IF EXISTS (
+    SELECT 1 FROM pg_catalog.pg_roles
+     WHERE rolname = 'migration_operator'
+       AND (rolcanlogin OR rolinherit OR rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls)
+  ) THEN
+    RAISE EXCEPTION 'portable-migration-audit.sql: migration_operator attributes were not normalized';
+  END IF;
+
+  SELECT r.rolname INTO bad_member
+    FROM pg_catalog.pg_auth_members m
+    JOIN pg_catalog.pg_roles r ON r.oid = m.member
+   WHERE m.roleid = 'migration_operator'::regrole
+     AND r.rolname IN ('orabella_app', 'service_role', 'anon', 'authenticated')
+   LIMIT 1;
+  IF bad_member IS NOT NULL THEN
+    RAISE EXCEPTION 'portable-migration-audit.sql: application role % is still a migration_operator member', bad_member;
+  END IF;
 END
 $bootstrap$;
 

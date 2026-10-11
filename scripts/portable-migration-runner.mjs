@@ -1,7 +1,8 @@
 // Portable migration operations. Pure orchestration over an injected database
 // adapter (see portable-migration-db.mjs), so every safety rule is testable
 // without a server. The adapter contract:
-//   identity()            -> { current_user, session_user, current_roles[], session_roles[] }
+//   identity()            -> { current_user, session_user, current_roles[], session_roles[],
+//                              session_is_superuser, is_migration_operator, operator_role{...} }
 //   ledger()              -> { applied: [{ filename, sha256 }] }   (live, ordered)
 //   markers(filenames[])  -> { [filename]: boolean }                (read-only)
 //   applyMigration(m, sql)   runs the file, then the ledger INSERT as migration_operator
@@ -10,6 +11,15 @@ import { MIGRATION_MARKERS } from "./portable-migration-markers.mjs";
 import { buildMigrationPlan, fail, hash, same } from "./portable-migrations.mjs";
 
 const applicationRoles = new Set(["orabella_app", "service_role", "anon", "authenticated"]);
+const forbiddenOperatorAttributes = ["rolcanlogin", "rolinherit", "rolsuper", "rolcreatedb", "rolcreaterole", "rolreplication", "rolbypassrls"];
+
+/** The live migration_operator role must be exactly what the bootstrap creates. */
+export function assertOperatorRole(role) {
+  if (!role) fail("migration_operator role does not exist; apply portable-migration-audit.sql");
+  const enabled = forbiddenOperatorAttributes.filter((attribute) => role[attribute] !== false);
+  if (enabled.length > 0) fail(`migration_operator has forbidden attributes (${enabled.join(", ")}); re-run portable-migration-audit.sql`);
+  if ((role.app_members ?? []).length > 0) fail(`application roles are migration_operator members (${role.app_members.join(", ")})`);
+}
 
 /**
  * Two operator modes are accepted; application identities never are.
@@ -26,6 +36,9 @@ export function assertRunnerIdentity(identity) {
     fail("migration runner is an application identity");
   }
   if (explicitRoles.some((role) => applicationRoles.has(role))) fail("migration runner has an application-role membership");
+  // Both modes switch to migration_operator for the ledger INSERT, so the live
+  // role attributes are checked before either is accepted.
+  assertOperatorRole(identity.operator_role);
   if (identity.session_is_superuser === true) return "superuser";
   if (identity.current_in_app_role || identity.session_in_app_role) fail("migration runner has an application-role membership");
   if (!identity.is_migration_operator || !(identity.current_roles ?? []).includes("migration_operator")) {
