@@ -1,10 +1,9 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
 
 const ROOT = process.cwd();
-const SOURCE_ROOTS = ["src", "app"] as const;
+const CONFIG_PATH = join(ROOT, "tsconfig.json");
 const ALLOWED = new Map([
   ["src/features/admin/repos/catalogs.ts", "admin catalog repository adapter"],
   ["src/features/admin/repos/services.ts", "admin service repository adapter"],
@@ -20,20 +19,57 @@ const ALLOWED = new Map([
   ["src/shared/lib/supabase/client.ts", "shared browser client factory"],
   ["src/shared/lib/supabase/server.ts", "shared server client factory"],
 ]);
+const EXCLUDED = new Map([
+  ["next-env.d.ts", "generated Next environment declaration"],
+  ["playwright.config.ts", "Playwright test configuration"],
+  ["vitest.config.ts", "Vitest test configuration"],
+  ["vitest.db.config.ts", "Vitest database test configuration"],
+  ["vitest.postgres-closure.config.ts", "Vitest PostgreSQL closure configuration"],
+  ["scripts/", "offline maintenance scripts"],
+  ["tests/", "test sources"],
+]);
 const SUPABASE = "@supabase/";
-// `.d.ts` participates in type resolution, so it is scanned too; `allowJs` adds the JS family.
-const SOURCE_EXTENSIONS = [".d.ts", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"] as const;
 
-function isSourceFile(path: string): boolean {
-  return SOURCE_EXTENSIONS.some((extension) => path.endsWith(extension));
+function repoPath(path: string): string {
+  return relative(ROOT, path).replaceAll("\\", "/");
 }
 
-function sourceFiles(directory: string): string[] {
-  if (!existsSync(directory)) return [];
-  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
-    const path = join(directory, entry.name);
-    return entry.isDirectory() ? sourceFiles(path) : isSourceFile(path) ? [path] : [];
+const TEST_FILE = /\.test\.[cm]?[jt]sx?$/;
+/** Root-level production files: anything else at the root must be classified explicitly. */
+const ROOT_PRODUCTION = new Set(["middleware.ts", "next.config.ts"]);
+
+function exclusionFor(path: string): string | null {
+  if (TEST_FILE.test(path)) return "*.test.*";
+  return [...EXCLUDED.keys()].find((entry) => (entry.endsWith("/") ? path.startsWith(entry) : path === entry)) ?? null;
+}
+
+function isExcluded(path: string): boolean {
+  return exclusionFor(path) !== null;
+}
+
+let compiledFiles: string[] | undefined;
+
+/** Repo-relative files the project's tsconfig compiles (include/exclude/allowJs applied by TypeScript). */
+function compiledByTsconfig(): string[] {
+  if (compiledFiles) return compiledFiles;
+  const parsed = ts.getParsedCommandLineOfConfigFile(CONFIG_PATH, {}, {
+    ...ts.sys,
+    onUnRecoverableConfigFileDiagnostic: (diagnostic) => {
+      throw new Error(ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"));
+    },
   });
+  if (!parsed) throw new Error("could not parse tsconfig.json");
+  if (parsed.errors.length > 0) throw new Error(ts.flattenDiagnosticMessageText(parsed.errors[0].messageText, "\n"));
+  compiledFiles = parsed.fileNames.map(repoPath);
+  return compiledFiles;
+}
+
+function productionSources(): Record<string, string> {
+  return Object.fromEntries(
+    compiledByTsconfig()
+      .filter((path) => !isExcluded(path))
+      .map((path) => [path, ts.sys.readFile(join(ROOT, path)) ?? ""]),
+  );
 }
 
 function moduleSpecifier(expression: ts.Expression): string | null {
@@ -105,22 +141,30 @@ function violations(files: Record<string, string>): string[] {
   return Object.entries(files).flatMap(([path, code]) => sourceViolations(path, code));
 }
 
-function projectSources(): Record<string, string> {
-  return Object.fromEntries(
-    SOURCE_ROOTS.flatMap((root) => sourceFiles(join(ROOT, root)))
-      .map((path) => [path.slice(ROOT.length + 1).replaceAll("\\", "/"), readFileSync(path, "utf8")]),
-  );
-}
-
 describe("Supabase boundary", () => {
-  it("scans all production source roots and allows only named infrastructure boundaries", () => {
-    expect(SOURCE_ROOTS).toEqual(["src", "app"]);
+  it("scans every production file compiled by tsconfig and allows only named infrastructure boundaries", () => {
+    const sources = productionSources();
+    expect(Object.keys(sources)).toEqual(expect.arrayContaining(["middleware.ts", "next.config.ts", "src/shared/lib/supabase/server.ts", "app/page.tsx"]));
     expect([...ALLOWED.values()]).toEqual(expect.arrayContaining(["shared audit repository adapter", "shared server client factory"]));
-    expect(violations(projectSources())).toEqual([]);
+    expect(violations(sources)).toEqual([]);
+  });
+
+  it("keeps compiled non-production exclusions exact: every entry is live, every root file is classified", () => {
+    const compiled = compiledByTsconfig();
+    // A stale exclusion (its file/directory no longer compiled) fails here.
+    const unused = [...EXCLUDED.keys()].filter((entry) => !compiled.some((path) => exclusionFor(path) === entry));
+    expect(unused).toEqual([]);
+    // A new root-level compiled file must be declared production or excluded with a reason.
+    const unclassifiedRoot = compiled.filter((path) => !path.includes("/") && !isExcluded(path) && !ROOT_PRODUCTION.has(path));
+    expect(unclassifiedRoot).toEqual([]);
+    expect([...ROOT_PRODUCTION].filter((path) => !compiled.includes(path))).toEqual([]);
+    // Exclusions only cover tests, offline scripts, test configs and generated declarations.
+    expect(compiled.filter(isExcluded).filter((path) => !/^(tests\/|scripts\/)/.test(path) && !EXCLUDED.has(path))).toEqual([]);
   });
 
   it.each([
     ["a package import", "src/shared/lib/random.ts", 'import { createClient } from "@supabase/supabase-js";'],
+    ["a root middleware import", "middleware.ts", 'import { createClient } from "@supabase/supabase-js";'],
     ["an import type", "src/features/cash/service.ts", 'type Client = import("@supabase/supabase-js").SupabaseClient;'],
     ["a literal dynamic package import", "src/features/cash/service.ts", 'const client = import("@supabase/ssr");'],
     ["a concatenated dynamic package import", "src/features/cash/service.ts", "const client = import('@supabase/' + 'supabase-js');"],
@@ -140,18 +184,10 @@ describe("Supabase boundary", () => {
     expect(violations({ "src/features/cash/service.ts": code })).toHaveLength(1);
   });
 
-  it("scans every source extension the TypeScript configuration can compile", () => {
-    const { config } = ts.readConfigFile(join(ROOT, "tsconfig.json"), ts.sys.readFile);
-    const allowJs = config?.compilerOptions?.allowJs === true;
-    expect(SOURCE_EXTENSIONS).toEqual(expect.arrayContaining([".ts", ".tsx", ".mts", ".cts", ".d.ts"]));
-    if (allowJs) expect(SOURCE_EXTENSIONS).toEqual(expect.arrayContaining([".js", ".jsx", ".mjs", ".cjs"]));
-    expect(SOURCE_EXTENSIONS.every((extension) => isSourceFile(`x${extension}`))).toBe(true);
-  });
-
   it("allows existing repository and shared client boundaries", () => {
     expect(violations({
       "src/features/cash/repos/cash.ts": 'import type { SupabaseClient } from "@supabase/supabase-js";',
-      "src/shared/lib/supabase/server.ts": 'const client = import(moduleName);',
+      "src/shared/lib/supabase/server.ts": "const client = import(moduleName);",
     })).toEqual([]);
   });
 });
