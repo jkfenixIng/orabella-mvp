@@ -332,6 +332,9 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
         full_name: input.full_name,
       }, DEFAULT_EMPLOYEE_ROLE);
     } catch (error) {
+      if (isCopWholePesoError(error)) {
+        throw new AdminError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+      }
       if (error instanceof DbQueryError && error.error.code === "23505") {
         throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
       }
@@ -345,6 +348,9 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
   try {
     data = await repo.upsertEmployee({ id: input.id, ...columnasDelLegajo, user_id: userId });
   } catch (error) {
+    if (isCopWholePesoError(error)) {
+      throw new AdminError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+    }
     if (error instanceof DbQueryError && error.error.code === "23505") {
       throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
     }

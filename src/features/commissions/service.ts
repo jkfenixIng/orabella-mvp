@@ -119,6 +119,9 @@ export async function upsertCommissionRule(raw: unknown): Promise<CommissionRule
       ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
     });
   } catch (error) {
+    if (isCopWholePesoError(error)) {
+      throw new CommissionError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+    }
     if (dbCode(error) === "23505") {
       throw new CommissionError("RULE_CONFLICT", "Ya existe una regla para ese ítem y empleado.", 409);
     }

@@ -26,6 +26,41 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
 }));
 vi.mock("next/cache", () => ({ unstable_cache: (fn: unknown) => fn, revalidateTag: () => {} }));
 
+/**
+ * Repository doubles for the two writes whose catch blocks map database errors:
+ * the reads succeed and the protected write rejects with `writeError`, shaped as
+ * the adapters raise it (`DbQueryError` carrying the normalized error).
+ */
+const writes = vi.hoisted(() => ({ writeError: null as unknown }));
+
+vi.mock("@/src/features/admin/repos/users", async () => {
+  const { DbQueryError } = await import("@/src/shared/db/errors");
+  const fail = () => Promise.reject(new DbQueryError(writes.writeError as { code: string | null; message: string; details: string | null }));
+  return {
+    adminUsersRepo: async () => ({
+      findUserByDocument: async () => null,
+      employeeForUser: async () => [],
+      employeeCodeConflicts: async () => [],
+      upsertEmployeeAtomic: fail,
+      upsertEmployee: fail,
+    }),
+  };
+});
+
+vi.mock("@/src/features/commissions/repos/commissions", async () => {
+  const { DbQueryError } = await import("@/src/shared/db/errors");
+  return {
+    commissionsRepo: async () => ({
+      itemExists: async () => true,
+      employeeExists: async () => true,
+      upsertRule: () => Promise.reject(new DbQueryError(writes.writeError as { code: string | null; message: string; details: string | null })),
+    }),
+  };
+});
+
+const COP_DB_ERROR = { code: "P0001", message: "COP_WHOLE_PESO_REQUIRED", details: "employees.salary_fixed" };
+const OTHER_DB_ERROR = { code: "23514", message: "check violation", details: null };
+
 const COP_ERROR = { code: "P0001", message: "COP_WHOLE_PESO_REQUIRED" };
 const root = process.cwd();
 
@@ -122,6 +157,32 @@ describe("COP_WHOLE_PESO_REQUIRED becomes a 400 on catalog writes", () => {
     repo.error = { code: "23514", message: "check" };
     await expect(upsertService({ name: "Corte", price: 10, duracion_min: 1, duracion_max: 1 }))
       .rejects.toMatchObject({ code: "INTERNAL", status: 500 });
+  });
+
+  it.each([
+    ["creation (upsert_employee_atomic)", {}],
+    ["edition (upsertEmployee)", { id: "00000000-0000-4000-8000-0000000000e1" }],
+  ])("upsertEmployee %s: COP P0001 is VALIDATION 400, any other error stays INTERNAL 500", async (_path, extra) => {
+    const { upsertEmployee } = await import("@/src/features/admin/service");
+    const employee = { full_name: "Bea", document: "200", pay_type: "fijo", salary_fixed: 1000, ...extra };
+    writes.writeError = COP_DB_ERROR;
+    await expect(upsertEmployee(employee, "sede")).rejects.toMatchObject({ code: "VALIDATION", status: 400 });
+    writes.writeError = OTHER_DB_ERROR;
+    await expect(upsertEmployee(employee, "sede")).rejects.toMatchObject({ code: "INTERNAL", status: 500 });
+  });
+
+  it("upsertCommissionRule: COP P0001 is VALIDATION 400, any other error stays INTERNAL 500", async () => {
+    const { upsertCommissionRule } = await import("@/src/features/commissions/service");
+    const rule = {
+      item_type: "producto",
+      item_id: "00000000-0000-4000-8000-0000000000a1",
+      employee_id: "00000000-0000-4000-8000-0000000000e1",
+      amount: 1000,
+    };
+    writes.writeError = { ...COP_DB_ERROR, details: "commission_rules.amount" };
+    await expect(upsertCommissionRule(rule)).rejects.toMatchObject({ code: "VALIDATION", status: 400 });
+    writes.writeError = OTHER_DB_ERROR;
+    await expect(upsertCommissionRule(rule)).rejects.toMatchObject({ code: "INTERNAL", status: 500 });
   });
 
   it("upsertProduct maps the 005 rejection to VALIDATION 400", async () => {
