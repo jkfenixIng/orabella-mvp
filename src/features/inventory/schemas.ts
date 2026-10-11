@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { idempotencyKeySchema } from "@/src/features/billing/schemas";
+import { copSchema } from "@/src/shared/money/cop";
 
 /** INV-02: tipos de movimiento del kardex. */
 export const movementTypeSchema = z.enum(["IN", "OUT", "ADJUST"]);
@@ -102,10 +103,10 @@ export const productSchema = z.object({
   name: z.string().trim().min(1, "Nombre requerido.").max(120, "Nombre muy largo."),
   description: z.string().trim().max(500, "Descripción muy larga.").nullish(),
   min_stock: z.coerce.number().int("Mínimo entero.").nonnegative("El mínimo no puede ser negativo.").default(0),
-  cost_price: z.coerce.number().nonnegative("El costo no puede ser negativo.").nullish(),
-  sale_price: z.coerce.number().nonnegative("El precio no puede ser negativo.").nullish(),
+  cost_price: copSchema("El costo no puede ser negativo.").nullish(),
+  sale_price: copSchema("El precio no puede ser negativo.").nullish(),
   /** I1: comisión sugerida (valor absoluto) que precarga la línea de factura. */
-  commission_value: z.coerce.number().nonnegative("La comisión no puede ser negativa.").nullish(),
+  commission_value: copSchema("La comisión no puede ser negativa.").nullish(),
   is_active: z.boolean().optional(),
 });
 export type ProductInput = z.infer<typeof productSchema>;

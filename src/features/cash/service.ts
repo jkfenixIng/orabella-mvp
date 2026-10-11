@@ -41,6 +41,7 @@ import {
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
 import { requireSedeRole } from "@/src/shared/lib/sede";
+import { COP_WHOLE_PESO_MESSAGE, copExceeds, isCopWholePesoError, positiveCopSchema } from "@/src/shared/money/cop";
 import {
   chunkIds,
   PagedReadError,
@@ -123,6 +124,7 @@ export async function requireCashWriter(
 
 function toCashError(error: unknown): CashError {
   if (error instanceof CashError) return error;
+  if (isCopWholePesoError(error)) return new CashError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
   // CL-21: una lectura exhaustiva que no se completó no puede degradar a
   // "Error interno". El código de la lectura (`READ_INCOMPLETE`) y la fila donde
   // se cortó son lo que hace accionable el fallo; perderlos sería justo lo
@@ -243,7 +245,7 @@ export async function upsertDenomination(raw: unknown, actor: CashActor): Promis
   const parsed = z.object({
     id: z.uuid().optional(),
     kind: z.enum(["billete", "moneda"]),
-    value: z.coerce.number().positive(),
+    value: positiveCopSchema("La denominación debe ser mayor a 0."),
     is_active: z.boolean().optional(),
   }).safeParse(raw);
   if (!parsed.success) {
@@ -253,7 +255,7 @@ export async function upsertDenomination(raw: unknown, actor: CashActor): Promis
   const payload = {
     ...(parsed.data.id ? { id: parsed.data.id } : {}),
     kind: parsed.data.kind,
-    value: roundMoney(parsed.data.value),
+    value: parsed.data.value,
     ...(parsed.data.is_active !== undefined ? { is_active: parsed.data.is_active } : {}),
   };
   const { data, error } = await db.upsertDenomination<CashDenominationRow>(payload);
@@ -571,6 +573,7 @@ const BALANCE_REQUIRED_MESSAGE =
  * business error. Returns null for any other error.
  */
 export function cashMethodRuleError(error: { message?: string | null } | null | undefined): CashError | null {
+  if (isCopWholePesoError(error)) return new CashError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
   const message = String(error?.message ?? "");
   if (message.includes(CASH_OUT_LIMIT_CODE)) {
     return new CashError(
@@ -1446,7 +1449,7 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
         surcharge: detail.invoice.surcharge,
         payments: detail.payments,
       });
-      if (invoiceBalance.netCollected + cardFee.net - invoiceBalance.netBilled > 0.009) {
+      if (copExceeds(invoiceBalance.netCollected + cardFee.net, invoiceBalance.netBilled)) {
         throw new CashError("OVERPAID", "El pago supera el saldo pendiente de la factura.", 422);
       }
     }

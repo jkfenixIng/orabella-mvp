@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { roleCodeSchema } from "@/src/features/auth/schemas";
 import { bogotaDay } from "@/src/shared/lib/dates";
+import { copSchema } from "@/src/shared/money/cop";
 
 /** ADM-08: esquemas de sueldo por empleado. */
 export const payTypeSchema = z.enum(["fijo", "porcentaje", "mixto"]);
@@ -138,7 +139,7 @@ export const employeeSchema = z
     // cadencia definida": el fijo se sigue prorrateando por los días del
     // período, que es el comportamiento de hoy. Sólo se cierra el catálogo.
     pay_frequency: payFrequencySchema.nullish(),
-    salary_fixed: z.coerce.number().nonnegative("El salario no puede ser negativo.").nullish(),
+    salary_fixed: copSchema("El salario no puede ser negativo.").nullish(),
     commission_percent: z.coerce
       .number()
       .min(0, "La comisión mínima es 0%.")
@@ -164,7 +165,7 @@ export const serviceSchema = z
     id: uuidSchema.optional(),
     name: z.string().trim().min(1, "Nombre requerido.").max(120, "Nombre muy largo."),
     description: z.string().trim().max(500, "Descripción muy larga.").nullish(),
-    price: z.coerce.number().nonnegative("El precio no puede ser negativo."),
+    price: copSchema("El precio no puede ser negativo."),
     duracion_min: z.coerce.number().int("Minutos enteros.").nonnegative("La duración mínima no puede ser negativa."),
     duracion_max: z.coerce.number().int("Minutos enteros.").nonnegative("La duración máxima no puede ser negativa."),
     is_active: z.boolean().optional(),

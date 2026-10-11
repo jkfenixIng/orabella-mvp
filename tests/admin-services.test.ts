@@ -137,7 +137,7 @@ describe("upsertService (supabase-js)", () => {
           [
             "upsert",
             [
-              { name: "Corte", description: null, price: 25000.5, duracion_min: 30, duracion_max: 45 },
+              { name: "Corte", description: null, price: 25001, duracion_min: 30, duracion_max: 45 },
               { onConflict: "id" },
             ],
           ],

@@ -14,7 +14,6 @@ import {
   editInvoiceSchema,
   editItemsSubtotal,
   moneyEquals,
-  MONEY_EPSILON,
   normalizeCommissionFields,
   overCollectedEdit,
   overCollectedEditMessage,
@@ -30,6 +29,7 @@ import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
 import { requireSedeRole } from "@/src/shared/lib/sede";
 import { dayBounds } from "@/src/shared/lib/dates";
+import { COP_WHOLE_PESO_MESSAGE, copExceeds, isCopWholePesoError } from "@/src/shared/money/cop";
 import { listPaymentMethods, listServices, listTaxes } from "@/src/features/admin/service";
 import {
   getProductsStock,
@@ -835,6 +835,7 @@ function insufficientStockError(error: unknown): BillingError {
 
 function toBillingError(error: unknown): BillingError {
   if (error instanceof BillingError) return error;
+  if (isCopWholePesoError(error)) return new BillingError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
   if (error instanceof PagedReadError) {
     return new BillingError(
       error.code,
@@ -884,6 +885,7 @@ function toBillingError(error: unknown): BillingError {
  *     INTERNAL en vez de disfrazarse.
  */
 function toRpcAnnulError(error: { code?: unknown; message?: unknown } | null): BillingError {
+  if (isCopWholePesoError(error)) return new BillingError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
   const message = String(error?.message ?? "");
   if (message.includes("ANNUL_CONFLICT") || message.includes("INVOICE_NOT_FOUND")) {
     return new BillingError(
@@ -930,6 +932,7 @@ function toRpcAnnulError(error: { code?: unknown; message?: unknown } | null): B
  *     y se reporta como INTERNAL en vez de disfrazarse.
  */
 function toRpcEditError(error: { code?: unknown; message?: unknown } | null): BillingError {
+  if (isCopWholePesoError(error)) return new BillingError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
   const message = String(error?.message ?? "");
   if (message.includes("EDIT_CONFLICT") || message.includes("INVOICE_NOT_FOUND")) {
     return new BillingError(
@@ -1029,6 +1032,7 @@ async function findInvoiceByIdempotencyKey(
  *     INTERNAL en vez de disfrazarse.
  */
 function toRpcCreateError(error: { message?: unknown } | null): BillingError {
+  if (isCopWholePesoError(error)) return new BillingError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
   const message = String(error?.message ?? "");
   if (message.includes("INSUFFICIENT_STOCK")) {
     return new BillingError(
@@ -2374,8 +2378,9 @@ export async function splitPayment(
   // Cierra la factura el NETO cobrado, no el bruto: con el recargo de un
   // cobro posterior a la emisión el bruto supera `total` y comparar bruto
   // contra total era lo que marcaba Pagada sin neto completo.
-  const fullyPaid =
-    balance.netCollected + netSum - balance.netBilled > -MONEY_EPSILON;
+  // Values may contain historical cents, so completion compares their rounded
+  // peso values. New payments and new totals are always integers.
+  const fullyPaid = !copExceeds(balance.netBilled, balance.netCollected + netSum);
   // CL-11: la DECISIÓN de cerrar la factura se toma acá (con `fullyPaid` y el
   // estado leído) y viaja como un booleano: la transacción no compara el cobrado
   // contra el facturado ni una vez.

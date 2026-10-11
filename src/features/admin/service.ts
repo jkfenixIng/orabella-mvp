@@ -25,6 +25,7 @@ import { servicesRepo, type ServiceRow } from "./repos/services";
 import { catalogsRepo } from "./repos/catalogs";
 import { adminUsersRepo } from "./repos/users";
 import { DbQueryError } from "@/src/shared/db/errors";
+import { COP_WHOLE_PESO_MESSAGE, isCopWholePesoError } from "@/src/shared/money/cop";
 
 // Compatibilidad: la identidad de estos guardas vive en
 // `@/src/shared/lib/sede.ts` (import cruzado entre features resuelto).
@@ -516,6 +517,7 @@ async function currentRoleCodes(userId: string): Promise<RoleCode[]> {
  * traducen payroll, cash, billing, commissions y los topes 031/034.
  */
 function roleReplacementError(error: { code?: string; message?: string }): AdminError {
+  if (isCopWholePesoError(error)) return new AdminError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
   if (error.code === "P0001") {
     const message = error.message ?? "";
     if (message.includes("USER_NOT_FOUND")) {

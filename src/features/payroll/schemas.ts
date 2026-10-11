@@ -2,6 +2,7 @@ import { z } from "zod";
 import { idempotencyKeySchema, moneyEquals, roundMoney } from "@/src/features/billing/schemas";
 import { cashOutLimitViolation } from "@/src/features/cash/schemas";
 import { bogotaDay } from "@/src/shared/lib/dates";
+import { copExceeds, copSchema, positiveCopSchema } from "@/src/shared/money/cop";
 import {
   employeeLineCommissionOrigin,
   employeeLineCommissionPercent,
@@ -135,8 +136,8 @@ export const ADJUSTMENT_REASON_MAX_LENGTH = 200;
 /** PAY-02: ajustes manuales por empleado al calcular (bonos y otros descuentos). */
 export const employeeAdjustmentSchema = z.object({
   employee_id: uuidSchema,
-  bonuses: z.coerce.number().nonnegative("Los bonos no pueden ser negativos.").default(0),
-  other_discounts: z.coerce.number().nonnegative("Los descuentos no pueden ser negativos.").default(0),
+  bonuses: copSchema("Los bonos no pueden ser negativos.").default(0),
+  other_discounts: copSchema("Los descuentos no pueden ser negativos.").default(0),
   /**
    * F8: el motivo escrito del ajuste. Viaja en la MISMA fila que el monto que
    * justifica (`payroll_items.adjustment_reason`, 067) y con él se confirma o se
@@ -166,7 +167,7 @@ export type CalculatePayrollInput = z.infer<typeof calculatePayrollSchema>;
 /** PAY-04: porción del pago del ítem con su método (monto > 0). */
 export const payrollPortionSchema = z.object({
   method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
-  amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+  amount: positiveCopSchema("El monto debe ser mayor a 0."),
   reference: z.string().trim().max(120, "Referencia muy larga.").nullish(),
 });
 export type PayrollPortionInput = z.infer<typeof payrollPortionSchema>;
@@ -191,8 +192,8 @@ export type PayPayrollItemInput = z.infer<typeof payPayrollItemSchema>;
 
 /** PAY-05: topes de vales por sede (día/semana opcionales) + días permitidos ISO + tope por día. */
 export const voucherLimitsSchema = z.object({
-  max_per_day: z.coerce.number().nonnegative("El tope diario no puede ser negativo.").nullish(),
-  max_per_week: z.coerce.number().nonnegative("El tope semanal no puede ser negativo.").nullish(),
+  max_per_day: copSchema("El tope diario no puede ser negativo.").nullish(),
+  max_per_week: copSchema("El tope semanal no puede ser negativo.").nullish(),
   allowed_days: z
     .array(z.coerce.number().int().min(1, "Día inválido (1=lunes…7=domingo).").max(7, "Día inválido (1=lunes…7=domingo)."))
     .min(1, "Elija al menos un día permitido.")
@@ -203,7 +204,7 @@ export const voucherLimitsSchema = z.object({
     .array(
       z.object({
         day: z.coerce.number().int().min(1, "Día inválido (1=lunes…7=domingo).").max(7, "Día inválido (1=lunes…7=domingo)."),
-        amount: z.coerce.number().nonnegative("El tope del día no puede ser negativo."),
+        amount: copSchema("El tope del día no puede ser negativo."),
       }),
     )
     .max(7, "Máximo 7 días.")
@@ -231,7 +232,7 @@ export type VoucherLimitsInput = z.infer<typeof voucherLimitsSchema>;
 export const requestVoucherSchema = z.object({
   idempotency_key: idempotencyKeySchema,
   employee_id: uuidSchema,
-  amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+  amount: positiveCopSchema("El monto debe ser mayor a 0."),
   method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
   request_date: dateSchema.optional(),
   observation: z.string().trim().max(500, "Observación muy larga.").nullish(),
@@ -288,7 +289,7 @@ export const payrollExtraSchema = z
   .object({
     idempotency_key: idempotencyKeySchema,
     employee_id: uuidSchema,
-    amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+    amount: positiveCopSchema("El monto debe ser mayor a 0."),
     method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
     reference: z.string().trim().max(120, "Referencia muy larga.").nullish(),
     reason: z.string().trim().min(1, "El motivo del pago es obligatorio.").max(500, "Motivo muy largo."),
@@ -716,7 +717,7 @@ export function assertPortionsMatchNet(portions: Array<{ amount: number }>, netP
  * neto. Puro para probarlo sin base de datos.
  */
 export function assertNoOverpay(args: { alreadyPaid: number; newAmount: number; netPay: number }): void {
-  if (roundMoney(args.alreadyPaid + args.newAmount) - roundMoney(args.netPay) > 0.009) {
+  if (copExceeds(args.alreadyPaid + args.newAmount, args.netPay)) {
     throw new Error("OVERPAID");
   }
 }
@@ -2256,7 +2257,7 @@ export function payrollExtraGuide(args: {
   const guide = proratedAmount ?? monthlySalary;
   const amount = args.amount === null || args.amount === undefined ? null : roundMoney(Number(args.amount));
   const exceedsGuide =
-    guide !== null && amount !== null && Number.isFinite(amount) && amount - guide > 0.009;
+    guide !== null && amount !== null && Number.isFinite(amount) && copExceeds(amount, guide);
 
   return { monthlySalary, proratedAmount, days, exceedsGuide };
 }
@@ -2340,12 +2341,12 @@ export function checkVoucherCaps(args: {
     args.maxPerDay !== null &&
     args.maxPerDay !== undefined &&
     roundMoney(args.maxPerDay) > 0 &&
-    roundMoney(args.dayTotal + requested) - roundMoney(args.maxPerDay) > 0.009;
+    copExceeds(args.dayTotal + requested, args.maxPerDay);
   const overWeek =
     args.maxPerWeek !== null &&
     args.maxPerWeek !== undefined &&
     roundMoney(args.maxPerWeek) > 0 &&
-    roundMoney(args.weekTotal + requested) - roundMoney(args.maxPerWeek) > 0.009;
+    copExceeds(args.weekTotal + requested, args.maxPerWeek);
   return { overDay, overWeek };
 }
 

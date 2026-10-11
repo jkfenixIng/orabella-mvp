@@ -874,7 +874,7 @@ describe("cash: T0-a (Defecto 1/2) el cobro de caja deriva el recargo del BRUTO"
   it("la factura se marca Pagada por NETO, no por bruto contra total", () => {
     expect(body).toContain("invoiceNetBalance({");
     expect(body).toContain(
-      "invoiceBalance.netCollected + cardFee.net - invoiceBalance.netBilled > 0.009",
+      "copExceeds(invoiceBalance.netCollected + cardFee.net, invoiceBalance.netBilled)",
     );
     // La DECISIÓN se toma acá y viaja como booleano: la función no compara el
     // cobrado contra el facturado ni una vez.
@@ -1171,7 +1171,7 @@ describe("billing: T0-a (Defecto 2) el cobro posterior exige el saldo NETO", () 
   it("splitPayment compara las porciones contra invoiceNetBalance", () => {
     expect(split).toContain("invoiceNetBalance({");
     expect(split).toContain("netSum - balance.netRemaining");
-    expect(split).toContain("balance.netCollected + netSum - balance.netBilled");
+    expect(split).toContain("copExceeds(balance.netBilled, balance.netCollected + netSum)");
     // El bruto contra total (el saldo corto) no puede volver al código: la
     // mención en el comentario no cuenta como uso.
     expect(split).not.toMatch(/round2\(Number\(detail\.invoice\.total\) - detail\.paid\)/);

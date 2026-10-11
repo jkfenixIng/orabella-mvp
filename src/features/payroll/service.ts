@@ -76,6 +76,7 @@ import {
 } from "@/src/features/cash/service";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { DbQueryError } from "@/src/shared/db/errors";
+import { COP_WHOLE_PESO_MESSAGE, isCopWholePesoError } from "@/src/shared/money/cop";
 import type { PayrollRepo } from "./repos/payroll";
 import { planIncomingCarries, settlePayrollCarries, type CarryRow } from "./carries";
 import { bogotaDay, rangeBounds } from "@/src/shared/lib/dates";
@@ -338,6 +339,7 @@ function payrollFromCash(error: unknown): PayrollError {
 
 function toPayrollError(error: unknown): PayrollError {
   if (error instanceof PayrollError) return error;
+  if (isCopWholePesoError(error)) return new PayrollError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
   if (error instanceof PagedReadError) {
     return new PayrollError(
       error.code,
@@ -2397,6 +2399,7 @@ export async function payPayrollItem(
         // fallo real y se reporta como tal (no hay "ganadora" que devolver).
         throw new PayrollError("INTERNAL", "Error interno.", 500);
       }
+      if (isCopWholePesoError(insertError)) throw new PayrollError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
       // Carrera perdida contra trg_payroll_payments_cap.
       if ((insertError as { code?: string }).code === "P0001") {
         throw new PayrollError("OVERPAID", "Las porciones superan el neto del ítem.", 422);

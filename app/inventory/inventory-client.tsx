@@ -37,6 +37,7 @@ import {
 } from "@/src/components/ui/lib/select";
 import { cn } from "@/src/components/ui/lib/utils";
 import { formatMoney, formatMoneyInput, stripMoneyInput, stripQuantityInput } from "@/src/shared/lib/money";
+import { copInputDigits } from "@/src/shared/money/cop";
 import type { ActionResult } from "@/src/shared/lib/api-response";
 import { formatBogotaFullDateTime, toNumber } from "@/src/shared/lib/format";
 import {
@@ -226,9 +227,9 @@ export function InventoryClient(props: InventoryClientProps) {
             name: row.name,
             description: row.description ?? "",
             min_stock: String(row.min_stock),
-    cost_price: row.cost_price == null ? "" : String(row.cost_price),
-    sale_price: row.sale_price == null ? "" : String(row.sale_price),
-    commission_value: row.commission_value == null ? "" : String(row.commission_value),
+    cost_price: copInputDigits(row.cost_price),
+    sale_price: copInputDigits(row.sale_price),
+    commission_value: copInputDigits(row.commission_value),
             is_active: row.is_active,
           }
         : emptyProductForm(),

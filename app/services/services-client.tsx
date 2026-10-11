@@ -20,6 +20,7 @@ import {
 } from "@/src/components/ui/lib/dialog";
 import { cn } from "@/src/components/ui/lib/utils";
 import { formatMoney, formatMoneyInput, stripMoneyInput, stripQuantityInput } from "@/src/shared/lib/money";
+import { copInputDigits } from "@/src/shared/money/cop";
 import type { ActionResult } from "@/src/shared/lib/api-response";
 import { toNumber } from "@/src/shared/lib/format";
 import { inputClass, labelClass } from "@/src/shared/lib/ui-styles";
@@ -66,7 +67,7 @@ export function ServicesClient(props: ServicesClientProps) {
     setForm({
       name: row.name,
       description: row.description ?? "",
-      price: String(row.price),
+      price: copInputDigits(row.price),
       duracion_min: String(row.duracion_min),
       duracion_max: String(row.duracion_max),
       is_active: row.is_active,

@@ -20,6 +20,7 @@ import {
   getOpenShift,
 } from "@/src/features/cash/service";
 import { listPaymentMethods } from "@/src/features/admin/service";
+import { COP_WHOLE_PESO_MESSAGE, copExceeds, isCopWholePesoError } from "@/src/shared/money/cop";
 
 export class CommissionError extends Error {
   readonly code: string;
@@ -469,7 +470,7 @@ export async function payCommissionNow(
       422,
     );
   }
-  if (amount - pending > 0.009) {
+  if (copExceeds(amount, pending)) {
     throw new CommissionError(
       "COMMISSION_OVERPAID",
       `El monto supera la comisión pendiente (${pending}).`,
@@ -541,6 +542,7 @@ export async function payCommissionNow(
     // acumulado de la base rechazó el pago (la suma del par ya estaba completa
     // cuando entró esta fila). Mismo código que traducen payroll, cash y
     // billing; la condición de negocio es la misma que valida el pendiente.
+    if (isCopWholePesoError(error)) throw new CommissionError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
     const cashRule = cashMethodRuleError(error);
     if (cashRule) throw commissionFromCash(cashRule);
     if (error.code === "P0001") {

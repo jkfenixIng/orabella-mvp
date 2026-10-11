@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { idempotencyKeySchema, moneyEquals, roundMoney } from "@/src/features/billing/schemas";
+import { copSchema, positiveCopSchema } from "@/src/shared/money/cop";
 
 export { moneyEquals, roundMoney };
 
@@ -221,9 +222,9 @@ const uuidSchema = z.uuid("Identificador inválido.");
  */
 export const shiftCountSchema = z.object({
   method_code: z.string().trim().min(1, "Método requerido.").max(40, "Método muy largo."),
-  denomination: z.coerce.number().positive("Denominación inválida.").nullish(),
+  denomination: positiveCopSchema("Denominación inválida.").nullish(),
   quantity: z.coerce.number().int().nonnegative("Cantidad inválida."),
-  amount: z.coerce.number().nonnegative("Monto inválido."),
+  amount: copSchema("Monto inválido."),
 });
 export type ShiftCountInput = z.infer<typeof shiftCountSchema>;
 
@@ -267,7 +268,7 @@ export const registerPaymentSchema = z
     cash_shift_id: uuidSchema.optional(),
     invoice_id: uuidSchema.nullish(),
     method_code: z.string().trim().min(1, "Método de pago requerido.").max(40, "Método muy largo."),
-    amount: z.coerce.number().positive("El monto debe ser mayor a 0."),
+    amount: positiveCopSchema("El monto debe ser mayor a 0."),
     /** CL-3/CL-4: marca del INTENTO de pago (uuid); obligatoria siempre. */
     idempotency_key: idempotencyKeySchema.optional(),
   })
@@ -288,8 +289,8 @@ export type RegisterPaymentInput = z.infer<typeof registerPaymentSchema>;
  * ni se justifica en el cierre (método de arqueo escondido).
  */
 export const closeShiftSchema = z.object({
-  counted_cash: z.coerce.number({ error: "El conteo de efectivo es obligatorio." }).nonnegative("El conteo no puede ser negativo."),
-  base_left: z.coerce.number().nonnegative("La base no puede ser negativa.").optional(),
+  counted_cash: copSchema("El conteo no puede ser negativo.", "El conteo de efectivo es obligatorio."),
+  base_left: copSchema("La base no puede ser negativa.").optional(),
   observation: z.string().trim().max(500, "Observación muy larga.").nullish(),
   counts: z.array(shiftCountSchema).min(1, "El detalle del conteo es obligatorio para cerrar."),
   confirmed: z.boolean().refine((value) => value === true, "Confirme el cierre: después no se puede modificar."),
@@ -305,7 +306,7 @@ export type CloseShiftInput = z.infer<typeof closeShiftSchema>;
  * Puro para probarlo sin base de datos.
  */
 export const recountShiftSchema = z.object({
-  counted_cash: z.coerce.number({ error: "El conteo de efectivo es obligatorio." }).nonnegative("El conteo no puede ser negativo."),
+  counted_cash: copSchema("El conteo no puede ser negativo.", "El conteo de efectivo es obligatorio."),
   counts: z.array(shiftCountSchema).min(1, "El detalle del reconteo es obligatorio."),
   reason: z.string().trim().min(1, "El motivo del reconteo es obligatorio.").max(500, "Motivo muy largo."),
 });

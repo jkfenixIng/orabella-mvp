@@ -199,8 +199,10 @@ describe("billing: subtotal por línea (FAC-01)", () => {
     expect(roundMoney(10.005)).toBe(10);
     expect(roundMoney(10.5)).toBe(11);
     expect(roundMoney(10.4999)).toBe(10);
+    // COP: comparisons are in whole pesos; legacy cents compare rounded.
     expect(moneyEquals(10.004, 10.0)).toBe(true);
-    expect(moneyEquals(10.02, 10.0)).toBe(false);
+    expect(moneyEquals(10.02, 10.0)).toBe(true);
+    expect(moneyEquals(10.5, 10.0)).toBe(false);
   });
 });
 
@@ -6838,7 +6840,7 @@ describe("billing: CL-11 el diff del servicio vive en el bloque de persistencia"
     expect(split).toContain("computeCardFees(");
     expect(split).toContain("invoiceNetBalance({");
     expect(split).toContain("moneyEquals(");
-    expect(split).toContain("balance.netCollected + netSum - balance.netBilled");
+    expect(split).toContain("copExceeds(balance.netBilled, balance.netCollected + netSum)");
     expect(split).toContain(
       'const closesInvoice = fullyPaid && detail.invoice.status === "Emitida"',
     );
