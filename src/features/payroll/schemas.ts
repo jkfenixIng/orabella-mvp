@@ -657,6 +657,32 @@ export function assertCorrectablePeriod(status: string): void {
  * Solapar con otros borradores no bloquea: nada está pagado y el borrador
  * restante puede recalcularse. Puro para probarlo sin base de datos.
  */
+export interface PayrollDeletionOverlap extends DateRange {
+  status: string;
+  frequency?: string | null;
+}
+
+export type PayrollDeletionOverlapDecision =
+  | { allowed: true; code: null }
+  | { allowed: false; code: "PERIOD_OVERLAP_AMBIGUOUS" };
+
+/**
+ * Decision before deleting a draft period. Unlike the exclusion constraint used
+ * when opening periods, deletion is ambiguous for ANY closed overlapping range,
+ * regardless of cadence: voucher ownership is range-based. Bounds are inclusive
+ * and NULL cadence stays distinct data, never a reason to skip the comparison.
+ */
+export function decidePayrollDeletionOverlap(args: {
+  target: DateRange;
+  periods: readonly PayrollDeletionOverlap[];
+}): PayrollDeletionOverlapDecision {
+  const blocked = args.periods.some(
+    (period) => period.status === "cerrado" && rangesOverlap(args.target, period),
+  );
+  return blocked ? { allowed: false, code: "PERIOD_OVERLAP_AMBIGUOUS" } : { allowed: true, code: null };
+}
+
+/** Compatibility adapter for callers that already queried the SQL-overlapping range. */
 export function overlapBlocksDeletion(statuses: string[]): boolean {
   return statuses.some((status) => status === "cerrado");
 }

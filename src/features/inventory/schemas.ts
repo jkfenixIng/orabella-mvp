@@ -225,6 +225,11 @@ export interface InsufficientStockDetails {
   requested: number;
 }
 
+/**
+ * Application authority for a multi-product OUT projection before an atomic
+ * writer persists it. It aggregates repeated products and delegates every
+ * resulting movement to `applyMovementStock`.
+ */
 export function planStockDeduction(
   lines: DeductionLine[],
   stockByProduct: Map<string, { name: string; stock_qty: number }>,
@@ -259,10 +264,37 @@ export function planStockDeduction(
   return planned;
 }
 
+export interface StockMovementLine {
+  product_id: string;
+  type: MovementType;
+  qty: number;
+}
+
+/**
+ * Projects a batch of movements in order through `applyMovementStock`. Unknown
+ * products start at 0 for IN/ADJUST (only quantity validity matters there) and
+ * fail with PRODUCT_NOT_FOUND for OUT, the same code the trigger raises.
+ */
+export function projectStockMovements(
+  moves: readonly StockMovementLine[],
+  stockByProduct: ReadonlyMap<string, { stock_qty: number }>,
+): Map<string, number> {
+  const projected = new Map<string, number>();
+  for (const move of moves) {
+    const known = projected.get(move.product_id) ?? stockByProduct.get(move.product_id)?.stock_qty;
+    if (known === undefined && move.type === "OUT") throw new Error("PRODUCT_NOT_FOUND");
+    projected.set(move.product_id, applyMovementStock(known ?? 0, move.type, move.qty));
+  }
+  return projected;
+}
+
 /**
  * Aplica un movimiento al stock en memoria. Lanza INSUFFICIENT_STOCK si un
  * OUT dejaría el stock negativo (misma regla que el trigger
  * trg_inventory_no_negative). Puro para poder probarlo sin base de datos.
+ * Application authority for the stock projection. All TS writers must plan or
+ * validate through this function; the inventory triggers remain the locked,
+ * TOCTOU-safe physical defense at persistence time.
  */
 export function applyMovementStock(
   current: number,

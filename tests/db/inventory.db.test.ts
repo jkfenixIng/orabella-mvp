@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { DB_HOOK_TIMEOUT, closeDb, count, freshDb, one, pgError, rpc, warmTemplate, type Db } from "./harness";
 import { insertProduct, insertUser } from "./fixtures";
+import { applyMovementStock, projectStockMovements } from "@/src/features/inventory/schemas";
 
 let db: Db;
 let user: string;
@@ -32,6 +33,31 @@ describe("trg_inventory_apply_stock / trg_inventory_no_negative", () => {
     expect(await stock(product)).toBe(7);
     await move(product, "ADJUST", 2);
     expect(await stock(product)).toBe(2);
+  });
+
+  it("matches the TypeScript projection for IN, OUT, ADJUST and multiple products", async () => {
+    const a = await insertProduct(db, 4);
+    const b = await insertProduct(db, 1);
+    const moves = [
+      { product_id: a, type: "IN" as const, qty: 3 },
+      { product_id: a, type: "OUT" as const, qty: 2 },
+      { product_id: b, type: "ADJUST" as const, qty: 5 },
+    ];
+    const projected = projectStockMovements(moves, new Map([[a, { stock_qty: 4 }], [b, { stock_qty: 1 }]]));
+    for (const moveEntry of moves) await move(moveEntry.product_id, moveEntry.type, moveEntry.qty);
+    expect([await stock(a), await stock(b)]).toEqual([projected.get(a), projected.get(b)]);
+    expect(applyMovementStock(4, "OUT", 4)).toBe(0);
+  });
+
+  it("matches the exact-zero, exceed and zero-quantity decisions", async () => {
+    const product = await insertProduct(db, 2);
+    expect(() => applyMovementStock(2, "OUT", 3)).toThrow("INSUFFICIENT_STOCK");
+    expect((await pgError(move(product, "OUT", 3))).message).toBe("INSUFFICIENT_STOCK");
+    expect(applyMovementStock(2, "OUT", 2)).toBe(0);
+    await move(product, "OUT", 2);
+    expect(await stock(product)).toBe(0);
+    expect(() => applyMovementStock(0, "IN", 0)).toThrow("INVALID_QTY");
+    expect((await pgError(move(product, "IN", 0))).constraint).toBe("inventory_movements_qty_check");
   });
 
   it("rejects an OUT larger than the stock and writes no movement", async () => {

@@ -107,13 +107,13 @@ export function drizzleAdminUsersRepo(db: Database): AdminUsersRepo {
           .where(exceptId ? and(eq(employees.employeeCode, code), ne(employees.id, exceptId)) : eq(employees.employeeCode, code))
           .limit(1),
       ),
-    upsertEmployeeAtomic: (write: EmployeeAtomicWrite, userId: string | null, createUser: NewEmployeeUser | null) =>
+    upsertEmployeeAtomic: (write: EmployeeAtomicWrite, userId: string | null, createUser: NewEmployeeUser | null, roleCode: "empleado") =>
       run(() =>
         callRpc<EmployeeCatalogRow | null>(db, "upsert_employee_atomic", [
           { value: write, cast: "jsonb" },
           { value: userId, cast: "uuid" },
           { value: createUser, cast: "jsonb" },
-          { value: "empleado", cast: "text" },
+          { value: roleCode, cast: "text" },
         ]),
       ),
     upsertEmployee: (write) =>

@@ -33,7 +33,7 @@ export interface PayrollRepo {
   periodsPage<T>(from: number, to: number): PayrollPage<T>;
   findPeriod<T>(id: string): Promise<PayrollResult<T>>;
   closePeriod<T>(id: string, closedAt: string): Promise<PayrollResult<T>>;
-  overlappingPeriods(id: string, start: string, end: string): Promise<PayrollResult<Array<{ id: string; status: string }>>>;
+  overlappingPeriods(id: string, start: string, end: string): Promise<PayrollResult<Array<{ id: string; status: string; start_date: string; end_date: string; frequency: string | null }>>>;
   periodEndsPage<T>(ids: string[], from: number, to: number): PayrollPage<T>;
   periodItemsPage<T>(periodId: string, from: number, to: number): PayrollPage<T>;
   employeeItemDetailPage<T>(periodId: string, employeeId: string, from: number, to: number): PayrollPage<T>;
@@ -123,7 +123,7 @@ export function supabasePayrollRepo(db: SupabaseClient): PayrollRepo {
     closePeriod: (id, closedAt) =>
       result(db.from("payroll_periods").update({ status: "cerrado", closed_at: closedAt }).eq("id", id).select(PERIOD_SELECT).single()),
     overlappingPeriods: (id, start, end) =>
-      result(db.from("payroll_periods").select("id, status").neq("id", id).lte("start_date", end).gte("end_date", start)),
+      result(db.from("payroll_periods").select("id, status, start_date, end_date, frequency").neq("id", id).lte("start_date", end).gte("end_date", start)),
     periodEndsPage: (ids, from, to) => page(db.from("payroll_periods").select("id, end_date").in("id", ids).order("id").range(from, to)),
     periodItemsPage: (periodId, from, to) =>
       page(db.from("payroll_items").select(ITEM_SELECT).eq("period_id", periodId).order("created_at").order("id").range(from, to)),

@@ -231,7 +231,13 @@ export function drizzlePayrollRepo(db: Database): PayrollRepo {
     overlappingPeriods: (id, start, end) =>
       many(() =>
         db
-          .select({ id: payrollPeriods.id, status: payrollPeriods.status })
+          .select({
+            id: payrollPeriods.id,
+            status: payrollPeriods.status,
+            start_date: payrollPeriods.startDate,
+            end_date: payrollPeriods.endDate,
+            frequency: payrollPeriods.frequency,
+          })
           .from(payrollPeriods)
           .where(and(ne(payrollPeriods.id, id), lte(payrollPeriods.startDate, end), gte(payrollPeriods.endDate, start))),
       ),

@@ -77,7 +77,7 @@ export interface AdminUsersRepo {
   findUserByDocument(document: string): Promise<{ id: string } | null>;
   employeeForUser(userId: string, exceptId?: string): Promise<Array<{ id: string }>>;
   employeeCodeConflicts(code: string, exceptId?: string): Promise<Array<{ id: string }>>;
-  upsertEmployeeAtomic(write: EmployeeAtomicWrite, userId: string | null, createUser: NewEmployeeUser | null): Promise<EmployeeCatalogRow | null>;
+  upsertEmployeeAtomic(write: EmployeeAtomicWrite, userId: string | null, createUser: NewEmployeeUser | null, roleCode: "empleado"): Promise<EmployeeCatalogRow | null>;
   upsertEmployee(write: EmployeeWrite): Promise<EmployeeCatalogRow | null>;
   /** `replace_user_roles`: the applied codes (text[]). */
   replaceUserRoles(userId: string, roleCodes: RoleCode[]): Promise<unknown>;
@@ -135,12 +135,12 @@ export function supabaseAdminUsersRepo(db: SupabaseClient): AdminUsersRepo {
       if (error) fail(error);
       return (data ?? []) as Array<{ id: string }>;
     },
-    async upsertEmployeeAtomic(write, userId, createUser) {
+    async upsertEmployeeAtomic(write, userId, createUser, roleCode) {
       const { data, error } = await db.rpc("upsert_employee_atomic", {
         p_employee: write,
         p_user_id: userId,
         p_create_user: createUser,
-        p_role_code: "empleado",
+        p_role_code: roleCode,
       });
       if (error) fail(error);
       return (data ?? null) as EmployeeCatalogRow | null;

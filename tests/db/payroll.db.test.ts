@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { DB_HOOK_TIMEOUT, closeDb, count, freshDb, one, pgError, rpc, warmTemplate, type Db } from "./harness";
 import { insertEmployee, insertPeriod, insertUser, insertVoucher, payrollItem } from "./fixtures";
+import { decidePayrollDeletionOverlap } from "@/src/features/payroll/schemas";
 
 let db: Db;
 let employee: string;
@@ -151,6 +152,24 @@ describe("payroll_delete_period_atomic", () => {
     await insertPeriod(db, { start: "2026-10-01", end: "2026-10-31", status: "cerrado", frequency: null });
     const mensual = await insertPeriod(db, { start: "2026-10-01", end: "2026-10-31", frequency: "mensual" });
     expect((await pgError(remove(mensual, [], []))).message).toBe("PERIOD_OVERLAP_AMBIGUOUS");
+  });
+
+  it.each([
+    ["no overlap", { start: "2026-08-01", end: "2026-08-31", status: "cerrado", frequency: "mensual" }, "2026-09-01", "2026-09-15", "quincenal", null],
+    ["draft overlap", { start: "2026-09-01", end: "2026-09-30", status: "borrador", frequency: "mensual" }, "2026-09-01", "2026-09-15", "quincenal", null],
+    ["closed overlap", { start: "2026-09-01", end: "2026-09-30", status: "cerrado", frequency: "mensual" }, "2026-09-01", "2026-09-15", "quincenal", "PERIOD_OVERLAP_AMBIGUOUS"],
+    ["exact inclusive bound", { start: "2026-08-17", end: "2026-09-01", status: "cerrado", frequency: "semanal" }, "2026-09-01", "2026-09-15", "quincenal", "PERIOD_OVERLAP_AMBIGUOUS"],
+    ["NULL vs frequency", { start: "2026-09-01", end: "2026-09-30", status: "cerrado", frequency: null }, "2026-09-10", "2026-09-20", "mensual", "PERIOD_OVERLAP_AMBIGUOUS"],
+  ] as const)("TS overlap decision equals SQL: %s", async (_label, other, start, end, frequency, code) => {
+    await insertPeriod(db, other);
+    const draft = await insertPeriod(db, { start, end, frequency });
+    const periods = (await db.query<{ start_date: string; end_date: string; status: string; frequency: string | null }>(
+      `SELECT start_date::text, end_date::text, status, frequency FROM public.payroll_periods WHERE id <> $1 AND start_date <= $3 AND end_date >= $2`,
+      [draft, start, end],
+    )).rows;
+    expect(decidePayrollDeletionOverlap({ target: { start_date: start, end_date: end }, periods }).code).toBe(code);
+    const sql = code ? (await pgError(remove(draft, [], []))).message : await remove(draft, [], []);
+    expect(sql).toBe(code ?? 0);
   });
 
   it("aborts with PAYROLL_VOUCHER_CONFLICT when a voucher is no longer discounted", async () => {

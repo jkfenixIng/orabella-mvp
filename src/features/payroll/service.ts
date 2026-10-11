@@ -12,7 +12,6 @@ import {
   cadenceAnchorFromDeclaration,
   calculatePayrollSchema,
   canDiscountVoucher,
-  capPayrollDiscounts,
   canReviewVoucher,
   checkVoucherCaps,
   checkVoucherEligibility,
@@ -31,7 +30,7 @@ import {
   payrollEvidenceFloor,
   periodCadenceBucket,
   periodExcludesEmployeeByCadence,
-  overlapBlocksDeletion,
+  decidePayrollDeletionOverlap,
   payPayrollItemSchema,
   payFrequencySchema,
   payrollCycleRange,
@@ -78,6 +77,7 @@ import {
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { DbQueryError } from "@/src/shared/db/errors";
 import type { PayrollRepo } from "./repos/payroll";
+import { planIncomingCarries, settlePayrollCarries, type CarryRow } from "./carries";
 import { bogotaDay, rangeBounds } from "@/src/shared/lib/dates";
 import {
   chunkIds,
@@ -1759,13 +1759,6 @@ interface PayrollLinesResult {
   carriesToApply: string[];
 }
 
-/** NV-01: una deuda de sobrante de vales, como la lee el cálculo. */
-interface PayrollCarryRow {
-  id: string;
-  employee_id: string;
-  amount: number | string;
-  origin_period_id: string;
-}
 
 /**
  * La aritmética de la nómina de un período (PAY-02/PAY-03), COMPARTIDA por el
@@ -1994,19 +1987,19 @@ async function computePayrollLines(args: {
     // posterior tampoco entra. La restricción de exclusión de 035 impide que
     // dos períodos de la sede compartan un día, así que el origen es anterior o
     // posterior, nunca solapado.
-    const pendingCarryRows = await readAllPayroll<PayrollCarryRow>({
+    const pendingCarryRows = await readAllPayroll<CarryRow>({
       log,
       what: "deudas pendientes de vales",
       meta: { periodId },
       table: "payroll_discount_carries",
-      fetchPage: (from, to) => db.pendingCarriesPage<PayrollCarryRow>(from, to),
+      fetchPage: (from, to) => db.pendingCarriesPage<CarryRow>(from, to),
     });
-    const appliedHereCarryRows = await readAllPayroll<PayrollCarryRow>({
+    const appliedHereCarryRows = await readAllPayroll<CarryRow>({
       log,
       what: "deudas ya aplicadas a este período",
       meta: { periodId },
       table: "payroll_discount_carries",
-      fetchPage: (from, to) => db.appliedCarriesPage<PayrollCarryRow>(periodId, from, to),
+      fetchPage: (from, to) => db.appliedCarriesPage<CarryRow>(periodId, from, to),
     });
     const carryRows = [...pendingCarryRows, ...appliedHereCarryRows];
     // Las fechas del período de ORIGEN de cada deuda: `end_date` es lo que
@@ -2024,29 +2017,16 @@ async function computePayrollLines(args: {
       });
       for (const row of originPeriods) originEndById.set(row.id, row.end_date);
     }
-    // Una deuda solo se aplica si su período de ORIGEN termina ANTES de que
-    // empiece el que se calcula.
-    const isEarlierCarry = (row: PayrollCarryRow): boolean => {
-      const originEnd = originEndById.get(row.origin_period_id);
-      return originEnd !== undefined && originEnd < period.start_date;
-    };
-    // Deuda APLICABLE por empleado: el total que entra a `other_discounts`. Una
-    // deuda cuyo origen no es estrictamente anterior a este período se ignora
-    // por completo (no se suma ni se marca).
-    const carriesByEmployee = new Map<string, number>();
-    for (const row of carryRows) {
-      if (!isEarlierCarry(row)) continue;
-      carriesByEmployee.set(
-        row.employee_id,
-        roundMoney((carriesByEmployee.get(row.employee_id) ?? 0) + Number(row.amount)),
-      );
-    }
-    // Los ids que la transacción marca aplicados son SOLO los que estaban
-    // pendientes y pertenecen a un empleado que SÍ cobra este período (F4: la
-    // deuda de un excluido no se consume sin descontarse).
-    const carriesToApply = pendingCarryRows
-      .filter((row) => isEarlierCarry(row) && payableEmployeeIds.has(row.employee_id))
-      .map((row) => row.id);
+    // La regla de qué deuda entra y cuál se marca vive en `planIncomingCarries`
+    // (origen estrictamente anterior; sólo pendientes de empleados que cobran).
+    // `payroll_apply_atomic` sigue siendo el consumo único y anti-duplicado.
+    const { debtByEmployee: carriesByEmployee, carriesToApply } = planIncomingCarries({
+      pending: pendingCarryRows,
+      appliedHere: appliedHereCarryRows,
+      originEndById,
+      periodStart: period.start_date,
+      payableEmployeeIds,
+    });
 
     const adjustments = new Map(
       input.adjustments.map((row) => [row.employee_id, row]),
@@ -2180,51 +2160,23 @@ async function computePayrollLines(args: {
           ? (adjustment?.adjustment_reason ?? "").trim() || null
           : null;
       const incomingDebt = carriesByEmployee.get(employee.id) ?? 0;
-      const otherDiscounts = roundMoney(manualOtherDiscounts + incomingDebt);
       // El TOTAL REAL de vales del período, sin recorte: es el valor que la
-      // columna "Vales" debe mostrar y el que revela el sobrante.
+      // columna "Vales" debe mostrar y el que revela el sobrante. La proyección
+      // pura conserva el orden del tope (vales y luego otros); el RPC sólo
+      // consume bajo lock los ids que recibió.
       const vales = valesByEmployee.get(employee.id)?.total ?? 0;
-      // El neto nunca queda negativo: si vales + otros supera el bruto, el
-      // descuento efectivo se topa al bruto para que el neto persistido (0)
-      // sea consistente con el CHECK de payroll_items
-      // (neto = bruto − vales − otros). `deductions_vales` sigue siendo el
-      // descuento APLICADO (topeado); el sobrante que el tope no pudo aplicar
-      // se registra como deuda del empleado (voucher_excess) para el período
-      // siguiente.
-      const applied = capPayrollDiscounts({
+      const settlement = settlePayrollCarries({
         gross: roundMoney(baseFixed + commissions + bonuses),
         vales,
-        otherDiscounts,
+        manualOtherDiscounts,
+        incomingDebt,
       });
-      // El sobrante es la parte del total REAL que el tope NO aplicó. Sin
-      // recorte vale 0 y no genera deuda.
-      const voucherExcess = roundMoney(Math.max(0, vales - applied.vales));
-      // NV-02: de la deuda entrante SOLO se consume lo que el tope APLICÓ de
-      // verdad. `applied.otherDiscounts` es el total que quedó aplicado en esa
-      // columna y `manualOtherDiscounts` es la parte que el admin escribió a
-      // mano: la diferencia es la porción de la DEUDA que entró al neto. Se
-      // acota a `incomingDebt` (el tope nunca aplica más que manual + deuda) y
-      // a 0 (un tope que ni alcanza para el descuento manual no absorbe deuda).
-      // El resto, `incomingDebt − absorbedDebt`, NO se perdona: viaja como
-      // `debt_remainder` y el RPC lo re-registra PENDIENTE en la MISMA
-      // transacción, para que lo aplique un período POSTERIOR. El orden del
-      // tope no cambia (vales primero y después otros) y no hace falta: la
-      // deuda se suma dentro de `other_discounts`, así que el total pendiente
-      // es el mismo con cualquier orden y lo único que importa es que el
-      // reparto entre consumido y pendiente sea exacto.
-      const absorbedDebt = roundMoney(
-        Math.max(
-          0,
-          Math.min(incomingDebt, roundMoney(applied.otherDiscounts - manualOtherDiscounts)),
-        ),
-      );
-      const debtRemainder = roundMoney(incomingDebt - absorbedDebt);
       const net = computeNetPay({
         baseFixed,
         commissions,
         bonuses,
-        vales: applied.vales,
-        otherDiscounts: applied.otherDiscounts,
+        vales: settlement.appliedVales,
+        otherDiscounts: settlement.appliedOtherDiscounts,
       });
       return {
         period_id: period.id,
@@ -2233,13 +2185,13 @@ async function computePayrollLines(args: {
         commissions,
         bonuses,
         adjustment_reason: adjustmentReason,
-        deductions_vales: applied.vales,
-        other_discounts: applied.otherDiscounts,
+        deductions_vales: settlement.appliedVales,
+        other_discounts: settlement.appliedOtherDiscounts,
         net_pay: net,
         detail_json: detail,
         voucher_total: vales,
-        voucher_excess: voucherExcess,
-        debt_remainder: debtRemainder,
+        voucher_excess: settlement.voucherExcess,
+        debt_remainder: settlement.debtRemainder,
       };
     });
 
@@ -2763,10 +2715,12 @@ export async function deletePayrollPeriod(
       period.end_date,
     );
     if (overlapError) throw new PayrollError("INTERNAL", "Error interno.", 500);
-    const overlappingStatuses = ((overlapping ?? []) as Array<{ status: string }>).map(
-      (row) => row.status,
-    );
-    if (overlapBlocksDeletion(overlappingStatuses)) {
+    // The app makes the decision explicit; the RPC repeats it under lock.
+    const overlapDecision = decidePayrollDeletionOverlap({
+      target: period,
+      periods: overlapping ?? [],
+    });
+    if (!overlapDecision.allowed) {
       throw new PayrollError("PERIOD_OVERLAP_AMBIGUOUS", PERIOD_OVERLAP_MESSAGE, 409);
     }
 

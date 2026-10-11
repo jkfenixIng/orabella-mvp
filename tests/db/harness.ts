@@ -30,6 +30,11 @@ export const PORTABLE_PATH = join(MIGRATIONS_DIR, "002_portable_platform.sql");
 export const BOOTSTRAP_PATH = join(REPO_ROOT, "supabase", "bootstrap", "platform-roles.sql");
 export const CATALOG_PATH = join(REPO_ROOT, "supabase", "seeds", "catalog.sql");
 
+/** Reads the immutable baseline schema for characterization assertions. */
+export function readSchema(): string {
+  return readFileSync(SCHEMA_PATH, "utf8");
+}
+
 /** The migrations in apply order: `NNN_name.sql`, sorted by number. */
 export const MIGRATION_PATHS = readdirSync(MIGRATIONS_DIR)
   .filter((name) => /^\d{3}_.*\.sql$/.test(name))

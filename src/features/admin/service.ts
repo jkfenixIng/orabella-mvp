@@ -11,7 +11,13 @@ import {
   type ServiceInput,
   type TaxConfigInput,
 } from "./schemas";
-import { isRoleCode, isSedeAssignableRole, type RoleCode } from "@/src/features/auth/schemas";
+import { isRoleCode, type RoleCode } from "@/src/features/auth/schemas";
+import {
+  DEFAULT_EMPLOYEE_ROLE,
+  roleIsAssignableForSede,
+  rolesAreNonEmpty,
+  violatesSuperadminGuard,
+} from "./role-policy";
 import { getSessionUser, hashPassword } from "@/src/features/auth/service";
 import { readAllPaged } from "@/src/shared/lib/paged";
 import { unstable_cache } from "next/cache";
@@ -323,7 +329,7 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
         id_number: input.document,
         password_hash: await hashPassword(input.document),
         full_name: input.full_name,
-      });
+      }, DEFAULT_EMPLOYEE_ROLE);
     } catch (error) {
       if (error instanceof DbQueryError && error.error.code === "23505") {
         throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
@@ -555,7 +561,10 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
   // no existe. Es el MISMO literal en las dos guardas —otorgar y quitar son la
   // misma verdad sobre el mismo rol— y el rechazo queda idéntico: mismo
   // `FORBIDDEN`, mismo 403, misma puerta antes del rpc.
-  if (parsed.data.roles.some((rol) => !isSedeAssignableRole(rol))) {
+  if (!rolesAreNonEmpty(parsed.data.roles)) {
+    throw new AdminError("VALIDATION", "Un solo rol por usuario.", 400);
+  }
+  if (violatesSuperadminGuard(parsed.data.roles)) {
     throw new AdminError(
       "FORBIDDEN",
       "El rol superadmin no se puede asignar ni quitar desde la aplicación.",
@@ -563,7 +572,7 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
     );
   }
   const rolesActuales = await currentRoleCodes(parsed.data.user_id);
-  if (rolesActuales.some((rol) => !isSedeAssignableRole(rol))) {
+  if (violatesSuperadminGuard(rolesActuales)) {
     throw new AdminError(
       "FORBIDDEN",
       "El rol superadmin no se puede asignar ni quitar desde la aplicación.",
@@ -582,7 +591,9 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
   // Post-condición: se reporta éxito sólo si la base devolvió el conjunto
   // pedido. Un arreglo vacío significa "no quedó ningún rol aplicado": eso
   // jamás es un éxito, por más que el rpc no haya dado error.
-  const aplicados = (Array.isArray(data) ? data : []).filter(isSedeAssignableRole);
+  const aplicados = (Array.isArray(data) ? data : []).filter(
+    (code): code is RoleCode => roleIsAssignableForSede(code),
+  );
   const pedidos = parsed.data.roles;
   if (aplicados.length !== pedidos.length || !aplicados.every((code) => pedidos.includes(code))) {
     throw new AdminError("INTERNAL", "Error interno.", 500);

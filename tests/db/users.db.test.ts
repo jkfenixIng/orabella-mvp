@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { DB_HOOK_TIMEOUT, closeDb, count, freshDb, one, pgError, rpc, warmTemplate, type Db } from "./harness";
 import { insertUser } from "./fixtures";
+import { isResetTokenUsable } from "@/src/features/auth/service";
 
 let db: Db;
 let user: string;
@@ -58,6 +59,25 @@ describe("confirm_password_reset", () => {
     );
   const confirm = (token: string, now = new Date()) =>
     rpc<boolean>(db, "confirm_password_reset", [token, "hash-v2", now.toISOString()], ["text", "text", "timestamptz"]);
+
+  it.each([
+    ["missing", null, false, false],
+    ["used", "1 hour", true, false],
+    ["expires exactly now", "1 second", false, false],
+    ["active", "1 hour", false, true],
+  ] as const)("has the same usable decision as SQL: %s", async (_label, expiresIn, used, usable) => {
+    const token = `equivalence-${_label}`;
+    const now = new Date();
+    if (expiresIn !== null) await addReset(token, expiresIn, used);
+    const row = expiresIn === null
+      ? null
+      : await one<{ used: boolean; expires_at: string }>(db, `SELECT used, expires_at FROM public.password_resets WHERE token_hash = $1`, [token]);
+    const evaluationNow = _label === "expires exactly now" && row ? new Date(row.expires_at) : now;
+    const app = row !== null && isResetTokenUsable({ used: row.used, expiresAt: new Date(row.expires_at), now: evaluationNow });
+    expect(app).toBe(usable);
+    const result = usable ? await confirm(token, evaluationNow) : (await pgError(confirm(token, evaluationNow))).message;
+    expect(result).toBe(usable ? true : "RESET_TOKEN_INVALID");
+  });
 
   it("consumes the token, writes the password and revokes every session", async () => {
     await addReset("tok-ok", "1 hour");
