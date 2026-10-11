@@ -64,11 +64,18 @@ for (const identity of [
   { ...operator, session_user: "service_role" },
   { ...operator, current_roles: ["migration_operator", "service_role"], current_in_app_role: true },
   { ...operator, current_roles: [], session_roles: [], is_migration_operator: false },
-  { ...operator, session_is_superuser: true },
+  // Superuser remains refused when it has an explicit app-role grant.
+  { ...operator, session_is_superuser: true, current_roles: ["migration_operator", "service_role"] },
 ]) {
   const db = fakeDb({ identity });
-  await rejects(applyPlan(context(db)), /application|migration_operator member|superuser/);
+  await rejects(applyPlan(context(db)), /application|superuser nor a migration_operator/);
   assert.deepEqual(db.state.executed, []);
+}
+
+// An audited DB owner/superuser without explicit app-role grants is an allowed mode.
+{
+  const db = fakeDb({ identity: { ...operator, session_is_superuser: true, current_in_app_role: true, session_in_app_role: true } });
+  assert.deepEqual(await applyPlan(context(db)), ["002_a.sql", "003_b.sql", "004_c.sql"]);
 }
 
 // Live ledger differs from the plan state: apply aborts before migration work.

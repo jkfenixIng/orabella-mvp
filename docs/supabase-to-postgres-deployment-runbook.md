@@ -37,11 +37,14 @@ For a plain PostgreSQL target, use a migration connection with the database priv
 
 `npm run plan:portable-migrations` is the only migration-selection mechanism in this runbook. The Node 20-compatible `.mjs` planner reads numeric migration files `002+`, validates names, hashes, duplicates, order, and that **every migration has a versioned marker contract** in [`scripts/portable-migration-markers.mjs`](../scripts/portable-migration-markers.mjs), then produces a contiguous plan that pins both the migration manifest SHA-256 and the marker-contract SHA-256. It never connects to or writes a database. A new migration (an integrated `006`/`007` included) cannot be planned until its reviewed read-only marker query is added to that file.
 
-The separate deployment-control bootstrap `supabase/bootstrap/portable-migration-audit.sql` creates the durable `public.portable_migration_audit` ledger and the `NOLOGIN NOINHERIT` role `migration_operator`. It is not an application migration and grants membership to nobody implicitly. After applying it, the DB owner grants the role explicitly to the dedicated runner login, a non-superuser created for this purpose:
+The separate deployment-control bootstrap `supabase/bootstrap/portable-migration-audit.sql` creates the durable `public.portable_migration_audit` ledger and the `NOLOGIN NOINHERIT` role `migration_operator`. It is not an application migration and grants membership to nobody implicitly. There are exactly two approved operator modes:
 
-```sql
-GRANT migration_operator TO <MIGRATION_LOGIN> WITH INHERIT FALSE;
-```
+1. **Audited DB owner / superuser** — runs the command through SQL Editor or `psql`. A superuser is allowed because it is explicitly authorized for this manual database operation; it is still refused if it has an **explicit** application-role grant.
+2. **Dedicated migration login** — a non-superuser login granted the role explicitly by the DB owner:
+
+   ```sql
+   GRANT migration_operator TO <MIGRATION_LOGIN> WITH INHERIT FALSE;
+   ```
 
 `orabella_app`, `service_role`, `anon`, and `authenticated` are never members; the bootstrap revokes any such membership. Only `migration_operator` has `INSERT` on the ledger; `service_role` is read-only; nobody has `UPDATE`/`DELETE`. A destination that predates the ledger is brought into it only through `reconcile` (below), never by hand. Export the ledger without values other than filenames and hashes:
 
@@ -64,7 +67,7 @@ npm run plan:portable-migrations -- \
   --output "$BACKUP_DIR/staging-portable-migration-plan.json"
 ```
 
-At this revision a target with no portable migrations recorded receives `002` through `005`. If `006`, `007`, or later migrations are integrated before the release window, the planner discovers them dynamically. It will fail until their filename/order, scope, and destination state are valid; it does not invent an owner or caps procedure.
+At this revision the repository contains `002` through `005` only. If `006`, `007`, or later migrations are integrated before the release window, the planner discovers them dynamically but **fails closed** until each has a reviewed marker contract in `scripts/portable-migration-markers.mjs`; no real `006`/`007` marker is present or inferred today. It does not invent an owner or caps procedure.
 
 For a clean plain PostgreSQL target, the order is:
 
@@ -221,7 +224,7 @@ psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f supabase/bootstrap/app-role.sql
 **WRITE: changes staging schema, triggers, functions, ACLs, and data backfills.** The Node apply script is the only executor. `MIGRATION_DATABASE_URL` must be the `<MIGRATION_LOGIN>` connection (never equal to the app `DATABASE_URL`), and `--psql` must be the absolute path of an existing `psql` executable (`psql.exe` on Windows); it is spawned without a shell. Before any migration it:
 
 1. verifies the plan still matches the repository hashes and marker contracts;
-2. checks the live identity: refuses if `current_user`/`session_user` is `orabella_app`, `service_role`, `anon`, or `authenticated`, if either is a member of `orabella_app`/`service_role`, if the session is a superuser, or if `current_user` is not an explicit `migration_operator` member; and performs a dry `SET ROLE migration_operator; RESET ROLE`;
+2. checks the live identity and performs a dry `SET ROLE migration_operator; RESET ROLE`: it always refuses `orabella_app`, `service_role`, `anon`, and `authenticated`, or any explicit membership in `orabella_app`/`service_role`; it accepts either the audited DB owner/superuser or a non-superuser explicit `migration_operator` member;
 3. re-reads the **live** ledger and aborts unless it equals the plan's applied prefix (a stale plan must be regenerated);
 4. runs every pending marker read-only and refuses to run any migration whose marker is already true (it may have committed before a crash — use `reconcile`).
 

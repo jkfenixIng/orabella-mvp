@@ -11,20 +11,27 @@ import { buildMigrationPlan, fail, hash, same } from "./portable-migrations.mjs"
 
 const applicationRoles = new Set(["orabella_app", "service_role", "anon", "authenticated"]);
 
+/**
+ * Two operator modes are accepted; application identities never are.
+ *   - "superuser": the audited DB owner/superuser (SQL editor or psql). pg_has_role
+ *     is true for a superuser on EVERY role, so for this mode only the explicit
+ *     grants (pg_auth_members closure) are checked against application roles.
+ *   - "migration_operator": a non-superuser login explicitly granted
+ *     migration_operator, with no application-role membership at all.
+ * The adapter's dry SET ROLE migration_operator / RESET ROLE runs before this.
+ */
 export function assertRunnerIdentity(identity) {
-  const roles = [...(identity.current_roles ?? []), ...(identity.session_roles ?? [])];
+  const explicitRoles = [...(identity.current_roles ?? []), ...(identity.session_roles ?? [])];
   if (applicationRoles.has(identity.current_user) || applicationRoles.has(identity.session_user)) {
     fail("migration runner is an application identity");
   }
-  // A superuser is implicitly a member of every role, so membership checks cannot
-  // isolate it; the runner must be a dedicated non-superuser login.
-  if (identity.session_is_superuser) fail("migration runner must not be a superuser; use the dedicated <MIGRATION_LOGIN>");
-  if (identity.current_in_app_role || identity.session_in_app_role || roles.some((role) => applicationRoles.has(role))) {
-    fail("migration runner has an application-role membership");
-  }
+  if (explicitRoles.some((role) => applicationRoles.has(role))) fail("migration runner has an application-role membership");
+  if (identity.session_is_superuser === true) return "superuser";
+  if (identity.current_in_app_role || identity.session_in_app_role) fail("migration runner has an application-role membership");
   if (!identity.is_migration_operator || !(identity.current_roles ?? []).includes("migration_operator")) {
-    fail("migration runner is not a migration_operator member");
+    fail("migration runner is neither a superuser nor a migration_operator member");
   }
+  return "migration_operator";
 }
 
 /** The plan must still be the deterministic plan for the repo. */
