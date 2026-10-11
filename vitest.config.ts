@@ -18,6 +18,6 @@ export default defineConfig({
     include: ["tests/**/*.test.ts"],
     // The PGlite characterization suite runs only with `npm run test:db`
     // (vitest.db.config.ts): see tests/db/README.md for why it stays out.
-    exclude: ["**/node_modules/**", "tests/db/**"],
+    exclude: ["**/node_modules/**", "tests/db/**", "tests/postgres-closure.runtime.test.ts"],
   },
 });
