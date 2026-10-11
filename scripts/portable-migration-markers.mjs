@@ -7,6 +7,16 @@
 // Changing a contract changes `markerContractsSha256` in every generated plan.
 export const MARKER_CONTRACT_VERSION = 1;
 
+// 006 ACL subjects: only roles present in pg_roles are checked, so a role absent
+// from plain PostgreSQL or Supabase is treated as holding no privilege.
+const APP_ROLES = `SELECT oid FROM pg_catalog.pg_roles
+ WHERE rolname IN ('anon', 'authenticated', 'service_role', 'orabella_app')`;
+const OPERATOR_RPCS = `SELECT oid, prosecdef, proconfig, proacl, proowner FROM pg_catalog.pg_proc
+ WHERE oid IN (
+   pg_catalog.to_regprocedure('public.provision_installation_owner(uuid)'),
+   pg_catalog.to_regprocedure('public.break_glass_transfer_installation_owner(uuid,text)')
+ )`;
+
 export const MIGRATION_MARKERS = Object.freeze({
   // 002: current_sede_id() reads request.jwt.claims directly instead of auth.jwt().
   "002_portable_platform.sql": Object.freeze({
@@ -49,10 +59,41 @@ export const MIGRATION_MARKERS = Object.freeze({
    ) AS present`,
   }),
   // 006: singleton owner table and the DB-operator-only provision/recovery boundary.
+  // Beyond existence, the ACL must match 006's REVOKEs: PUBLIC and every app/API
+  // role that exists (missing roles hold no privilege) cannot touch the table or
+  // execute the two SECURITY DEFINER operator RPCs (pinned search_path).
   "006_installation_owner.sql": Object.freeze({
     sql: `SELECT pg_catalog.to_regclass('public.installation_owner') IS NOT NULL
-   AND pg_catalog.to_regprocedure('public.provision_installation_owner(uuid)') IS NOT NULL
-   AND pg_catalog.to_regprocedure('public.break_glass_transfer_installation_owner(uuid,text)') IS NOT NULL
+   AND (SELECT count(*) FROM (${OPERATOR_RPCS}) AS rpc) = 2
+   AND NOT EXISTS (
+     SELECT 1 FROM (${OPERATOR_RPCS}) AS rpc
+      WHERE NOT prosecdef
+         OR proconfig IS NULL
+         OR NOT ('search_path=pg_catalog, public' = ANY (proconfig))
+   )
+   AND NOT EXISTS (
+     SELECT 1
+       FROM pg_catalog.pg_class c,
+            pg_catalog.aclexplode(coalesce(c.relacl, pg_catalog.acldefault('r', c.relowner))) a
+      WHERE c.oid = pg_catalog.to_regclass('public.installation_owner')
+        AND a.grantee = 0
+        AND a.privilege_type IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE')
+   )
+   AND NOT EXISTS (
+     SELECT 1 FROM (${APP_ROLES}) AS r, pg_catalog.pg_class c
+      WHERE c.oid = pg_catalog.to_regclass('public.installation_owner')
+        AND pg_catalog.has_table_privilege(r.oid, c.oid, 'SELECT, INSERT, UPDATE, DELETE')
+   )
+   AND NOT EXISTS (
+     SELECT 1
+       FROM (${OPERATOR_RPCS}) AS p,
+            pg_catalog.aclexplode(coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))) a
+      WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE'
+   )
+   AND NOT EXISTS (
+     SELECT 1 FROM (${APP_ROLES}) AS r, (${OPERATOR_RPCS}) AS p
+      WHERE pg_catalog.has_function_privilege(r.oid, p.oid, 'EXECUTE')
+   )
    AND EXISTS (
      SELECT 1 FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace

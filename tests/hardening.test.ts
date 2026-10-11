@@ -613,6 +613,9 @@ const BASE_SHA_001 = "b00a917d4e3c5f6683dc2bcf9a092fe762a7acd5";
 const BASE_SHA_002 = "65e6a3ad89b3164545b5436ccb3e9f58ab61d485";
 /** 003 as committed at 6d0d38d: 004 is a new file and must not edit 003. */
 const BASE_SHA_003 = "d42592f55717b6b991b115589d6fee01c864ab8e";
+// SHA-256 of the exact file bytes from 7138fde, the pre-006 integration base.
+const BASE_SHA256_004 = "dbc796e2eeaf06db88519c03cd7952d841f4f442c9f4c104da10bae18f350c5a";
+const BASE_SHA256_005 = "7755a739fc1ea2bd65d5e04ac798e8c15f2eae69da743bc387cd3b4cf055ba7d";
 
 /**
  * El volcado como ESQUEMA, sin prosa.
@@ -1201,7 +1204,7 @@ describe("el squash: `001_orabella_schema.sql` es el archivo vivo (squash de la 
     }
   });
 
-  it("001, 002 and 003 are not modified by this change (byte-identical to the base commit)", () => {
+  it("001-005 are not modified by this change (byte-identical to the integration base)", () => {
     for (const [name, sha] of [
       ["001_orabella_schema.sql", BASE_SHA_001],
       ["002_portable_platform.sql", BASE_SHA_002],
@@ -1210,6 +1213,13 @@ describe("el squash: `001_orabella_schema.sql` es el archivo vivo (squash de la 
       const text = readFileSync(join(SQUASH_DIR, name));
       // Git's blob hash is "blob <byteLength>\\0" followed by the bytes.
       const actual = createHash("sha1").update(`blob ${text.length}\0`).update(text).digest("hex");
+      expect(actual, name).toBe(sha);
+    }
+    for (const [name, sha] of [
+      ["004_inventory_literal_search.sql", BASE_SHA256_004],
+      ["005_cop_whole_peso.sql", BASE_SHA256_005],
+    ] as const) {
+      const actual = createHash("sha256").update(readFileSync(join(SQUASH_DIR, name))).digest("hex");
       expect(actual, name).toBe(sha);
     }
   });

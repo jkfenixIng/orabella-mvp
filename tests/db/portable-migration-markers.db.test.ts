@@ -30,6 +30,27 @@ describe("portable migration marker contracts", () => {
     }
   });
 
+  it("rejects 006 when service_role can execute its operator RPC", async () => {
+    const db = await buildSchemaDb({ catalog: false });
+    try {
+      await db.exec("GRANT EXECUTE ON FUNCTION public.provision_installation_owner(uuid) TO service_role");
+      expect(await marker(db, "006_installation_owner.sql")).toBe(false);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it("rejects 006 when orabella_app can read the owner table", async () => {
+    const db = await buildSchemaDb({ catalog: false });
+    try {
+      await db.exec("CREATE ROLE orabella_app");
+      await db.exec("GRANT SELECT ON TABLE public.installation_owner TO orabella_app");
+      expect(await marker(db, "006_installation_owner.sql")).toBe(false);
+    } finally {
+      await db.close();
+    }
+  });
+
   it("are false on the 001-only baseline", async () => {
     const db = await buildSchemaDb({ catalog: false, migrations: [SCHEMA_PATH] });
     try {

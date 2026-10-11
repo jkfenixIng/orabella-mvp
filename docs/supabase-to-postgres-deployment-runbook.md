@@ -67,7 +67,7 @@ npm run plan:portable-migrations -- \
   --output "$BACKUP_DIR/staging-portable-migration-plan.json"
 ```
 
-At this revision the repository contains `002` through `007`, each with a reviewed marker contract. The `006` marker requires `installation_owner`, both owner triggers and the `provision_installation_owner(uuid)` / `break_glass_transfer_installation_owner(uuid,text)` functions; the `007` marker requires the five replaced cap/minimum functions and the `round(` projection in the invoice cap and cash minimum. A governed deferment of `006` must also defer `007` (contiguous suffix `006`+`007`); `007` alone may be deferred. Any later migration fails closed until its marker contract is reviewed. The planner never provisions an owner.
+At this revision the repository contains `002` through `007`, each with a reviewed marker contract. The `006` marker requires `installation_owner`, both owner triggers and the `provision_installation_owner(uuid)` / `break_glass_transfer_installation_owner(uuid,text)` functions as `SECURITY DEFINER` with `search_path=pg_catalog, public`, and reads the ACL: `PUBLIC` and any existing `anon`, `authenticated`, `service_role` or `orabella_app` role (a missing role counts as no privilege) must hold no `SELECT/INSERT/UPDATE/DELETE` on the table and no `EXECUTE` on either function; the `007` marker requires the five replaced cap/minimum functions and the `round(` projection in the invoice cap and cash minimum. A governed deferment of `006` must also defer `007` (contiguous suffix `006`+`007`); `007` alone may be deferred. Any later migration fails closed until its marker contract is reviewed. The planner never provisions an owner.
 
 For a clean plain PostgreSQL target, the order is:
 
