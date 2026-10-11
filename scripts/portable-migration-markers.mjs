@@ -48,4 +48,36 @@ export const MIGRATION_MARKERS = Object.freeze({
       WHERE n.nspname = 'public' AND t.tgname = 'trg_cop_whole_peso'
    ) AS present`,
   }),
+  // 006: singleton owner table and the DB-operator-only provision/recovery boundary.
+  "006_installation_owner.sql": Object.freeze({
+    sql: `SELECT pg_catalog.to_regclass('public.installation_owner') IS NOT NULL
+   AND pg_catalog.to_regprocedure('public.provision_installation_owner(uuid)') IS NOT NULL
+   AND pg_catalog.to_regprocedure('public.break_glass_transfer_installation_owner(uuid,text)') IS NOT NULL
+   AND EXISTS (
+     SELECT 1 FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relname = 'installation_owner' AND t.tgname = 'trg_installation_owner_immutable'
+   )
+   AND EXISTS (
+     SELECT 1 FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public' AND c.relname = 'user_roles' AND t.tgname = 'trg_superadmin_owner'
+   ) AS present`,
+  }),
+  // 007: the five cap/minimum functions contain 007's exact whole-peso round() comparisons
+  // (001/003 already used round() with other operands, so the expression itself is the marker).
+  "007_money_cap_policy.sql": Object.freeze({
+    sql: `SELECT count(*) = 5 AS present
+  FROM (VALUES
+    ('check_commission_payouts_cap', '', 'round(v_paid + coalesce(NEW.amount, 0)) > round(v_earned)'),
+    ('check_invoice_payments_cap', '', 'round(v_paid_net + v_new_net) > round(v_total - coalesce(v_surcharge, 0))'),
+    ('check_payroll_payments_cap', '', 'round(v_paid + NEW.amount) > round(v_net)'),
+    ('enforce_cash_method_minimum', 'p_shift_id uuid, p_method_code text, p_amount numeric, p_old_amount numeric', 'round(v_expected) - round(p_amount) < round(round(v_opening) * 0.5)'),
+    ('enforce_collection_move_minimum', '', '< round(round(v_pair.opening_base) * 0.5)')
+  ) AS expected(proname, args, fragment)
+  JOIN pg_catalog.pg_proc p ON p.proname = expected.proname
+  JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace AND n.nspname = 'public'
+ WHERE pg_catalog.pg_get_function_identity_arguments(p.oid) = expected.args
+   AND pg_catalog.strpos(p.prosrc, expected.fragment) > 0`,
+  }),
 });

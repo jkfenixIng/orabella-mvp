@@ -1,5 +1,5 @@
 # Estado
 
-- **Etapa completada:** documentación de despliegue.
-- **Decisión reciente:** el runner Node 20 verifica identidad y ledger en vivo antes de aplicar; acepta el DB owner/superuser auditado o `<MIGRATION_LOGIN>` con `migration_operator`, exige contrato de marcador por migración y reconcilia únicamente el primer pendiente comprobado. `006` owner / posible `007` caps siguen sin detalles inventados.
-- **Siguiente:** en una ventana autorizada, crear el ledger, otorgar `migration_operator` explícitamente a `<MIGRATION_LOGIN>`, generar/aplicar/verificar el plan en vivo; para `006` owner y posible `007` caps, integrar el contrato y marcador aprobados o registrar un aplazamiento como sufijo gobernado.
+- **Etapa completada:** integración local de 006/007, cierre PostgreSQL y runbook de despliegue en `chore/extraccion-supabase-fase1`.
+- **Decisión reciente:** el plan portátil descubre `002`–`007` con marcadores SQL revisados; 006 solo se provisiona/recupera por DB owner y 007 conserva céntimos históricos al comparar topes con `round()`.
+- **Siguiente:** ventana autorizada de staging/producción: bootstrap de ledger, plan/aplicación/verificación y, si 006 entra en alcance, provisión manual del owner por DB owner. Sin push ni despliegue en esta integración.

@@ -56,6 +56,15 @@ try {
   const repoPlan = JSON.parse(readFileSync(output, "utf8"));
   assert.equal(repoPlan.format, 2);
   assert.match(repoPlan.markerContractsSha256, /^[a-f0-9]{64}$/);
+  assert.deepEqual(repoPlan.discovered.map((migration) => migration.filename), [
+    "002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql",
+    "005_cop_whole_peso.sql", "006_installation_owner.sql", "007_money_cap_policy.sql",
+  ]);
+  const repoDeferred = buildMigrationPlan(repoPlan.discovered, [], ["006_installation_owner.sql", "007_money_cap_policy.sql"]);
+  assert.deepEqual(repoDeferred.apply.map((migration) => migration.filename), [
+    "002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql", "005_cop_whole_peso.sql",
+  ]);
+  assert.deepEqual(repoDeferred.deferred.map((migration) => migration.filename), ["006_installation_owner.sql", "007_money_cap_policy.sql"]);
 
   // Apply refuses missing MIGRATION_DATABASE_URL, the app DATABASE_URL, and an unsafe psql path before contacting a DB.
   result = run(apply, ["--plan", output], { MIGRATION_DATABASE_URL: "", DATABASE_URL: "" });

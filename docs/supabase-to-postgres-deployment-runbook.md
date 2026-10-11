@@ -2,13 +2,13 @@
 
 ## Scope and safety boundary
 
-This runbook moves the application's database target from Supabase to a plain PostgreSQL instance. It applies the discovered incremental migrations after the already-applied `001` baseline, validates staging first, and changes the deployment to `DB_ENGINE=postgres` only after production approval. At this revision, the discovered set is `002` through `005`; later integrated migrations are not assumed.
+This runbook moves the application's database target from Supabase to a plain PostgreSQL instance. It applies the discovered incremental migrations after the already-applied `001` baseline, validates staging first, and changes the deployment to `DB_ENGINE=postgres` only after production approval. At this revision, the discovered set is `002` through `007`.
 
 - **Read-only / preparation** sections do not change a database or deployment.
 - **Write** sections run migrations, provisioning, restore, or deployment changes. Treat every such command as irreversible unless this runbook explicitly says otherwise.
 - Run commands from the repository root. Do not put connection strings, passwords, emails, or user UUIDs in the repository or shell history.
 - `001_orabella_schema.sql` is an already-applied baseline; do **not** edit or reapply it to an existing environment.
-- `006` (database owner) and a possible `007` (caps) are integration dependencies. No migration files or final contracts for them exist in this repository at this revision; this runbook intentionally does not guess their contents.
+- `006_installation_owner.sql` (singleton installation owner) and `007_money_cap_policy.sql` (whole-peso caps) are integrated; their marker contracts are in `scripts/portable-migration-markers.mjs`. Owner provisioning is a separate, DB-operator-only step (section 4).
 - This repository does not define a source-to-target data-copy contract. The fresh backup is mandatory recovery evidence, but importing it into a new target must use a separately approved, compatibility-checked transfer procedure; do not treat the backup-verifier input as a production restore command.
 
 ## Interfaces and access
@@ -35,7 +35,7 @@ For a plain PostgreSQL target, use a migration connection with the database priv
 
 ## Deterministic migration plan
 
-`npm run plan:portable-migrations` is the only migration-selection mechanism in this runbook. The Node 20-compatible `.mjs` planner reads numeric migration files `002+`, validates names, hashes, duplicates, order, and that **every migration has a versioned marker contract** in [`scripts/portable-migration-markers.mjs`](../scripts/portable-migration-markers.mjs), then produces a contiguous plan that pins both the migration manifest SHA-256 and the marker-contract SHA-256. It never connects to or writes a database. A new migration (an integrated `006`/`007` included) cannot be planned until its reviewed read-only marker query is added to that file.
+`npm run plan:portable-migrations` is the only migration-selection mechanism in this runbook. The Node 20-compatible `.mjs` planner reads numeric migration files `002+`, validates names, hashes, duplicates, order, and that **every migration has a versioned marker contract** in [`scripts/portable-migration-markers.mjs`](../scripts/portable-migration-markers.mjs), then produces a contiguous plan that pins both the migration manifest SHA-256 and the marker-contract SHA-256. It never connects to or writes a database. A new migration (`008` or later) cannot be planned until its reviewed read-only marker query is added to that file.
 
 The separate deployment-control bootstrap `supabase/bootstrap/portable-migration-audit.sql` creates the durable `public.portable_migration_audit` ledger and the `NOLOGIN NOINHERIT` role `migration_operator`. It is not an application migration and grants membership to nobody implicitly. If that role already exists, the bootstrap normalizes it to `NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`; if the DB owner cannot alter it, the bootstrap raises an explicit error and makes no unsafe acceptance. The runner reads and validates these attributes live before it accepts the dedicated-login mode. There are exactly two approved operator modes:
 
@@ -67,7 +67,7 @@ npm run plan:portable-migrations -- \
   --output "$BACKUP_DIR/staging-portable-migration-plan.json"
 ```
 
-At this revision the repository contains `002` through `005` only. If `006`, `007`, or later migrations are integrated before the release window, the planner discovers them dynamically but **fails closed** until each has a reviewed marker contract in `scripts/portable-migration-markers.mjs`; no real `006`/`007` marker is present or inferred today. It does not invent an owner or caps procedure.
+At this revision the repository contains `002` through `007`, each with a reviewed marker contract. The `006` marker requires `installation_owner`, both owner triggers and the `provision_installation_owner(uuid)` / `break_glass_transfer_installation_owner(uuid,text)` functions; the `007` marker requires the five replaced cap/minimum functions and the `round(` projection in the invoice cap and cash minimum. A governed deferment of `006` must also defer `007` (contiguous suffix `006`+`007`); `007` alone may be deferred. Any later migration fails closed until its marker contract is reviewed. The planner never provisions an owner.
 
 For a clean plain PostgreSQL target, the order is:
 
@@ -82,7 +82,7 @@ supabase/bootstrap/platform-roles.sql
 
 Run `supabase/bootstrap/app-role.sql` only after all migrations in the generated plan exist, then again after any later migration adds public tables.
 
-`002` replaces `current_sede_id()` without `auth.jwt()`. `003` adds payment-method arqueo guards and does not reconstruct pre-existing open shifts. `004` creates the service-role-only literal product-search RPC. `005` adds whole-peso write guards without rewriting historical cents and exposes `public.cop_legacy_cents_audit` to `service_role`.
+`002` replaces `current_sede_id()` without `auth.jwt()`. `003` adds payment-method arqueo guards and does not reconstruct pre-existing open shifts. `004` creates the service-role-only literal product-search RPC. `005` adds whole-peso write guards without rewriting historical cents and exposes `public.cop_legacy_cents_audit` to `service_role`. `006` creates the empty singleton `public.installation_owner`, makes `superadmin` assignable only to that owner, and revokes table/function access from `PUBLIC`, `anon`, `authenticated` and `service_role`; it never infers an owner. `007` replaces the cap and cash-minimum trigger functions so caps compare `round()`ed whole pesos; it rewrites no data.
 
 ## Phase 1 — preparation and backup (read-only except backup artifact creation)
 
@@ -170,6 +170,7 @@ SELECT
   to_regprocedure('public.search_products_literal(text,integer,integer)') IS NOT NULL AS migration_004,
   to_regclass('public.cash_shift_method_balances') IS NOT NULL AS migration_003,
   to_regclass('public.cop_legacy_cents_audit') IS NOT NULL AS migration_005,
+  to_regclass('public.installation_owner') IS NOT NULL AS migration_006,
   EXISTS (
     SELECT 1 FROM pg_trigger t
     JOIN pg_class c ON c.oid = t.tgrelid
@@ -202,17 +203,23 @@ A source baseline that lacks `005` does not fail this preflight; the audit is re
 
 **WRITE: creates roles and schema objects on staging.** For a clean target, use the full order above. For a target populated through the separately approved transfer procedure, do not apply a migration twice: export `portable_migration_audit`, generate the plan, and execute only its contiguous `apply` list.
 
-Before provisioning the database owner, stop at this integration dependency:
+**WRITE: installation-owner provisioning (`006`), once per database, after `006` and the catalog seed.** It is **DB-operator-only**: run it through SQL Editor/`psql` as the identity that owns `public.installation_owner` (the audited DB owner). `orabella_app`, `service_role`, `anon` and `authenticated` have no access to the table or functions; the app and its service key can never provision or transfer. There is no GUC or session-setting bypass.
 
-```text
-PENDING 006 — database-specific owner provisioning
-Owner: <integration owner>
-Inputs: <approved target database ownership / authentication contract>
-Action: execute the approved, database-specific provisioning procedure.
-Do not substitute an email address, UUID, or role name from this runbook.
+```sql
+-- As the DB owner; OWNER_USER_ID is the real active users.id in THIS database.
+SELECT public.provision_installation_owner('OWNER_USER_ID'::uuid);
 ```
 
-The existing application-role bootstrap remains separate from that pending owner work:
+- Exactly one `superadmin` exists: the owner. Provisioning fails without changes (`INSTALLATION_OWNER_PREEXISTING_SUPERADMIN`) if any `superadmin` already exists, and (`INSTALLATION_OWNER_ALREADY_PROVISIONED`) if an owner exists. Resolve a preexisting `superadmin` manually first; never infer the owner.
+- Recovery is the only transfer, also DB-owner-only and audited (`audit_logs.metadata` records `old`, `new`, `reason`, `operator`):
+
+  ```sql
+  SELECT public.break_glass_transfer_installation_owner('NEW_OWNER_USER_ID'::uuid, '<incident and approval reference>');
+  ```
+
+- Do not put an email or UUID in the repository or shell history. If `006` is deferred for the scope, record the deferment and skip this step.
+
+The existing application-role bootstrap remains separate from owner provisioning:
 
 ```bash
 # Plain PostgreSQL only; run as a superuser after the generated migration plan.
@@ -254,7 +261,7 @@ MIGRATION_DATABASE_URL='<MIGRATION_LOGIN connection url>' \
 
 #### Crash recovery (`reconcile`)
 
-Migration files `002`–`005` own their `BEGIN`/`COMMIT` and are not modified, so the ledger `INSERT` cannot share their transaction. A failed migration never reaches the `INSERT` (`ON_ERROR_STOP`). The only gap is a crash or lost connection **after** the file's `COMMIT` and **before** the `INSERT`: the ledger then lags the schema, `apply` refuses to rerun that migration because its marker is true, and `verify` blocks cutover.
+Migration files `002`–`007` own their `BEGIN`/`COMMIT` and are not modified, so the ledger `INSERT` cannot share their transaction. A failed migration never reaches the `INSERT` (`ON_ERROR_STOP`). The only gap is a crash or lost connection **after** the file's `COMMIT` and **before** the `INSERT`: the ledger then lags the schema, `apply` refuses to rerun that migration because its marker is true, and `verify` blocks cutover.
 
 Recovery is automated and narrow — **never insert a ledger row manually**:
 
@@ -352,8 +359,8 @@ Proceed only when a human release owner explicitly approves all of the following
 - [ ] Staging SQL confirms migration markers, role attributes, ACLs, and `cop_legacy_cents_audit` results.
 - [ ] The staging build with `DB_ENGINE=postgres` passed the health smoke and listed tests.
 - [ ] The `003` open-shift boundary is understood and an operational plan exists to close/reopen affected shifts.
-- [ ] `006` owner is either included through its approved database-specific integration procedure or explicitly deferred for this deployment scope.
-- [ ] Possible `007` caps is either included only after its final integration contract is approved or explicitly deferred for this deployment scope.
+- [ ] `006` is either applied with the owner provisioned by the DB owner (section 4) or explicitly deferred together with `007` for this deployment scope.
+- [ ] `007` caps is either applied or explicitly deferred for this deployment scope.
 - [ ] The release owner has approved the production window and rollback authority.
 
 **Stop here without explicit human approval.**
@@ -461,12 +468,12 @@ This rollback changes deployment configuration; it does **not** revert applied d
 - If the application deployment must return to its prior connection mode, revert the deployment configuration only after confirming database compatibility. This does not undo database migrations.
 - `005` rejects new non-whole-peso writes with `COP_WHOLE_PESO_REQUIRED`; its legacy audit does not authorize changing historic cents.
 
-## Pending integration dependencies
+## Integrated migrations requiring operator decisions
 
-| Dependency | Status | Required input | Action |
+| Migration | Status | Required input | Action |
 | --- | --- | --- | --- |
-| `006` database owner | Pending | final database-specific ownership/authentication contract and owner | Integrate and apply only when in deployment scope; otherwise record explicit deferment. This runbook has no hardcoded identity. |
-| possible `007` caps | Pending | final integration contract | Integrate and apply only when in deployment scope; otherwise record explicit deferment. Do not infer schema, checks, values, or rollback behavior. |
+| `006` installation owner | Integrated | real active `users.id` of the owner in the target database | Apply via the plan, then DB owner runs `provision_installation_owner` (section 4); or defer `006`+`007` as a suffix. No hardcoded identity. |
+| `007` whole-peso caps | Integrated | none | Apply via the plan, or defer it as the latest suffix. It rewrites no data. |
 
 ## Evidence to retain
 
