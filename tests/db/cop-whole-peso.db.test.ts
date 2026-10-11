@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { applyFile, buildSchemaDb, closeDb, one, pgError, rpc, type Db } from "./harness";
+import { applyFile, buildSchemaDb, closeDb, one, pgError, rpc, type Db, withCopTriggersDisabled } from "./harness";
 import { createInvoiceCall, insertEmployee, insertUser, openShift, registerId } from "./fixtures";
 
 let db: Db | undefined;
@@ -16,6 +16,13 @@ async function legacyThen005(): Promise<Db> {
 
 afterEach(async () => closeDb(db));
 
+/** A pre-005 employee row: written with the guard off, as history would be. */
+async function withLegacyEmployee(current: Db): Promise<void> {
+  await withCopTriggersDisabled(current, () =>
+    current.query("INSERT INTO public.employees (document, pay_type, full_name, salary_fixed) VALUES ('legacy-employee', 'fijo', 'Legacy employee', 10.50)"),
+  );
+}
+
 describe("005 COP whole-peso migration", () => {
   it("is idempotent; rejects new cents and preserves legacy cents on non-money updates", async () => {
     const current = await legacyThen005();
@@ -24,11 +31,20 @@ describe("005 COP whole-peso migration", () => {
     expect(await one<{ price: string; is_active: boolean }>(current, "SELECT price::text, is_active FROM public.services WHERE name = 'Legacy'")).toEqual({ price: "10.50", is_active: false });
   });
 
+  it("rejects an employee salary with cents but allows an is_active update on legacy cents", async () => {
+    const current = await legacyThen005();
+    expect(await pgError(current.query("INSERT INTO public.employees (document, pay_type, full_name, salary_fixed) VALUES ('decimal-employee', 'fijo', 'Decimal employee', 10.5)"))).toMatchObject({ code: "P0001", message: "COP_WHOLE_PESO_REQUIRED" });
+    await withLegacyEmployee(current);
+    await current.query("UPDATE public.employees SET is_active = false WHERE document = 'legacy-employee'");
+    expect(await one<{ salary_fixed: string; is_active: boolean }>(current, "SELECT salary_fixed::text, is_active FROM public.employees WHERE document = 'legacy-employee'")).toEqual({ salary_fixed: "10.50", is_active: false });
+  });
+
   it("covers direct-money tables while leaving derived fee fields outside the guard", async () => {
     const current = await legacyThen005();
     for (const sql of [
       "INSERT INTO public.cash_denominations (kind, value) VALUES ('moneda', 10.5)",
       "UPDATE public.cash_registers SET base_configurada = 10.5",
+      "INSERT INTO public.employees (document, pay_type, full_name, salary_fixed) VALUES ('decimal-employee', 'fijo', 'Decimal employee', 10.5)",
       "INSERT INTO public.products (sku, name, cost_price) VALUES ('D', 'Decimal product', 10.5)",
       "INSERT INTO public.voucher_settings (max_per_day) VALUES (10.5)",
       "INSERT INTO public.system_settings (key, value) VALUES ('voucher_max_per_day', '{\"amount\":10.5}')",

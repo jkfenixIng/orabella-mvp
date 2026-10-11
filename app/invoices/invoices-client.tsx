@@ -67,6 +67,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/src/components/ui/lib/utils";
 import { formatMoney, formatMoneyInput, stripMoneyInput, stripPercentageInput, stripQuantityInput } from "@/src/shared/lib/money";
+import { copInputDigits } from "@/src/shared/money/cop";
 import type { ActionResult } from "@/src/shared/lib/api-response";
 import { formatBogotaDateTime, formatBogotaLongDate, toNumber } from "@/src/shared/lib/format";
 
@@ -464,14 +465,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
   function autofillDraftPrice(type: ItemDraft["item_type"], refId: string) {
     if (type === "producto") {
       const found = props.products.find((row) => row.id === refId);
-      if (found?.sale_price != null) patchDraft({ unit_price: String(found.sale_price) });
+      if (found?.sale_price != null) patchDraft({ unit_price: copInputDigits(found.sale_price) });
       if (found && found.commission_value != null && found.commission_value > 0) {
         patchDraft({ commission_value: found.commission_value, no_commission: false, commission_mode: "comision" });
       }
     }
     if (type === "servicio") {
       const found = props.services.find((row) => row.id === refId);
-      if (found) patchDraft({ unit_price: String(found.price) });
+      if (found) patchDraft({ unit_price: copInputDigits(found.price) });
     }
   }
 
@@ -622,7 +623,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
       custom_name: row.custom_name ?? "",
       employee_id: row.employee_id,
       qty: String(row.qty),
-      unit_price: String(row.unit_price),
+      unit_price: copInputDigits(row.unit_price),
       discount: Number(row.discount),
       no_commission: Boolean(row.no_commission),
       commission_value: commissionValue,
@@ -1290,7 +1291,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     const filled = portions.reduce((acc, portion) => acc + (toNumber(portion.amount) ?? 0), 0);
     const remaining = Math.max(0, draftTotal - filled);
     if (remaining <= 0) return;
-    const value = String(Math.round(remaining * 100) / 100);
+    const value = copInputDigits(remaining);
     setPortions((prev) => prev.map((row, i) => (i === firstEmpty ? { ...row, amount: value } : row)));
   }
 
@@ -1302,7 +1303,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
 
   function totalizeSplitPayment() {
     if (splitRemaining <= 0) return;
-    const value = String(Math.round(splitRemaining * 100) / 100);
+    const value = copInputDigits(splitRemaining);
     setSplitDraft((prev) => ({ ...prev, amount: value }));
   }
 
@@ -1539,7 +1540,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                             <input
                                               className={`${paperInputClass} h-9 w-28 text-right`}
                                               value={formatMoneyInput(
-                                                item.commission_value == null ? "" : String(item.commission_value),
+                                                copInputDigits(item.commission_value),
                                               )}
                                               onChange={(event) =>
                                                 patchDraftItem(index, {
@@ -1719,7 +1720,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                           !prev.some((portion) => portion.method_code === row.code),
                                       )?.code ?? "efectivo",
                                     amount:
-                                      remainingPrev > 0 ? String(Math.round(remainingPrev * 100) / 100) : "",
+                                      remainingPrev > 0 ? copInputDigits(remainingPrev) : "",
                                   },
                                 ];
                               })
@@ -2497,7 +2498,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                 patchEditItem(index, { ref_id: value });
                                                 const found = props.products.find((row) => row.id === value);
                                                 if (found?.sale_price != null) {
-                                                  patchEditItem(index, { unit_price: String(found.sale_price) });
+                                                  patchEditItem(index, { unit_price: copInputDigits(found.sale_price) });
                                                 }
                                               }}
                                               placeholder="Producto…"
@@ -2524,7 +2525,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                               onValueChange={(value) => {
                                                 patchEditItem(index, { ref_id: value });
                                                 const found = props.services.find((row) => row.id === value);
-                                                if (found) patchEditItem(index, { unit_price: String(found.price) });
+                                                if (found) patchEditItem(index, { unit_price: copInputDigits(found.price) });
                                               }}
                                               placeholder="Servicio…"
                                               options={props.services
@@ -2610,7 +2611,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                     <input
                                                       className={`${paperInputClass} h-9 w-28 text-right`}
                                                       value={formatMoneyInput(
-                                                        item.commission_value == null ? "" : String(item.commission_value),
+                                                        copInputDigits(item.commission_value),
                                                       )}
                                                       onChange={(event) =>
                                                         patchEditItem(index, {
@@ -2656,7 +2657,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                     <input
                                                       className={`${paperInputClass} h-9 w-28 text-right`}
                                                       value={formatMoneyInput(
-                                                        item.commission_value == null ? "" : String(item.commission_value),
+                                                        copInputDigits(item.commission_value),
                                                       )}
                                                       onChange={(event) =>
                                                         patchEditItem(index, {
@@ -3120,7 +3121,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         Valor de la comisión ($)
                         <input
                           className={paperInputClass}
-                          value={formatMoneyInput(itemDraft.commission_value == null ? "" : String(itemDraft.commission_value))}
+                          value={formatMoneyInput(copInputDigits(itemDraft.commission_value))}
                           onChange={(event) =>
                             patchDraft({
                               commission_value:
@@ -3168,7 +3169,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         Valor de la comisión ($)
                         <input
                           className={paperInputClass}
-                          value={formatMoneyInput(itemDraft.commission_value == null ? "" : String(itemDraft.commission_value))}
+                          value={formatMoneyInput(copInputDigits(itemDraft.commission_value))}
                           onChange={(event) =>
                             patchDraft({
                               commission_value:

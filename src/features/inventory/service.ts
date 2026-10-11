@@ -17,6 +17,7 @@ import { getSessionUser } from "@/src/features/auth/service";
 import { requireSedeRole } from "@/src/shared/lib/sede";
 import { requireSession } from "@/src/features/admin/service";
 import { DbQueryError } from "@/src/shared/db/errors";
+import { COP_WHOLE_PESO_MESSAGE, isCopWholePesoError } from "@/src/shared/money/cop";
 import {
   inventoryRepo,
   type InventoryRepo,
@@ -157,6 +158,7 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
     if (error instanceof DbQueryError && error.error.code === "23505") {
       throw new InventoryError("SKU_TAKEN", "El SKU ya existe.", 409);
     }
+    if (isCopWholePesoError(error)) throw new InventoryError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
     throw internal();
   }
   if (!saved) throw internal();

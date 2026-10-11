@@ -41,7 +41,7 @@ import {
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
 import { requireSedeRole } from "@/src/shared/lib/sede";
-import { COP_WHOLE_PESO_MESSAGE, copExceeds, isCopWholePesoError, positiveCopSchema } from "@/src/shared/money/cop";
+import { COP_WHOLE_PESO_MESSAGE, copExceeds, copSchema, isCopWholePesoError, positiveCopSchema } from "@/src/shared/money/cop";
 import {
   chunkIds,
   PagedReadError,
@@ -259,6 +259,7 @@ export async function upsertDenomination(raw: unknown, actor: CashActor): Promis
     ...(parsed.data.is_active !== undefined ? { is_active: parsed.data.is_active } : {}),
   };
   const { data, error } = await db.upsertDenomination<CashDenominationRow>(payload);
+  if (error && isCopWholePesoError(error)) throw new CashError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
   return data as CashDenominationRow;
 }
@@ -2005,23 +2006,26 @@ export async function closeShift(
  */
 export async function updateRegisterBase(
   registerId: string,
-  base: number,
+  rawBase: unknown,
   actor: CashActor,
 ): Promise<CashRegisterRow> {
-  if (!Number.isFinite(base) || base < 0) {
+  const parsed = copSchema("Base inválida.", "Base inválida.").safeParse(rawBase);
+  if (!parsed.success) {
     throw new CashError("VALIDATION", "Base inválida.", 400);
   }
+  const base = parsed.data;
   const db = await cashDb();
   const register = await resolveRegister(db, registerId);
   const previous = Number(register.base_configurada);
-  const { data: updated, error } = await db.updateRegisterBase<CashRegisterRow>(register.id, roundMoney(base));
+  const { data: updated, error } = await db.updateRegisterBase<CashRegisterRow>(register.id, base);
+  if (error && isCopWholePesoError(error)) throw new CashError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
   if (error || !updated) throw new CashError("INTERNAL", "Error interno.", 500);
   await writeAudit({
     user_id: actor.userId,
     action: AUDIT_ACTIONS.REGISTER_BASE_UPDATED,
     entity: "cash_registers",
     entity_id: register.id,
-    metadata: { previous_base: previous, new_base: roundMoney(base) },
+    metadata: { previous_base: previous, new_base: base },
   });
   return updated as CashRegisterRow;
 }

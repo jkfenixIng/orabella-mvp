@@ -5,6 +5,7 @@ import { revalidateTag } from "next/cache";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { requireSession, requireAdminSession } from "@/src/features/admin/service";
 import { accumulateDayTotals } from "./schemas";
+import { copSchema } from "@/src/shared/money/cop";
 import {
   CashError,
   closeShift,
@@ -163,8 +164,11 @@ export async function listRegistersAction() {
 export async function updateRegisterBaseAction(registerId: string, input: unknown) {
   try {
     const session = await requireAdminSession(await sessionToken());
-    const base = (input as { base_configurada?: unknown }).base_configurada;
-    const data = await updateRegisterBase(registerId, Number(base), {
+    const parsed = copSchema("Base inválida.", "Base inválida.").safeParse(
+      (input as { base_configurada?: unknown } | null)?.base_configurada,
+    );
+    if (!parsed.success) throw new CashError("VALIDATION", "Base inválida.", 400);
+    const data = await updateRegisterBase(registerId, parsed.data, {
       userId: session.userId,
     });
     return { success: true as const, data };

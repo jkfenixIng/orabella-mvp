@@ -387,7 +387,8 @@ export async function upsertService(raw: unknown): Promise<ServiceRow> {
   let data: ServiceRow | null;
   try {
     data = await repo.upsert(payload);
-  } catch {
+  } catch (error) {
+    if (isCopWholePesoError(error)) throw new AdminError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
     throw new AdminError("INTERNAL", "Error interno.", 500);
   }
   if (!data) throw new AdminError("INTERNAL", "Error interno.", 500);

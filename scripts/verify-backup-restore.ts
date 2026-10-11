@@ -93,6 +93,7 @@ const EXPECTED_LATER = {
     "trigger|cash_shifts.trg_cop_whole_peso",
     "trigger|commission_payouts.trg_cop_whole_peso",
     "trigger|commission_rules.trg_cop_whole_peso",
+    "trigger|employees.trg_cop_whole_peso",
     "trigger|invoice_items.trg_cop_whole_peso",
     "trigger|invoice_payments.trg_cop_whole_peso",
     "trigger|invoices.trg_cop_whole_peso",

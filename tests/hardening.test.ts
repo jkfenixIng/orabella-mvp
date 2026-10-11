@@ -997,6 +997,28 @@ describe("el squash: `001_orabella_schema.sql` es el archivo vivo (squash de la 
     expect(sql004).toContain(`GRANT ALL ON FUNCTION ${SEARCH_004} TO service_role;`);
   });
 
+  it("005 enforces whole-peso guards with fixed search_path, invoker security and closed ACLs", () => {
+    const sql005 = readFileSync(join(SQUASH_DIR, "005_cop_whole_peso.sql"), "utf8");
+    const body = stripSqlComments(sql005);
+    expect(body.trim()).toMatch(/^BEGIN;[\s\S]*COMMIT;$/);
+    for (const fn of ["assert_cop_whole_peso", "assert_cop_whole_peso_settings"]) {
+      expect(body).toMatch(new RegExp(`CREATE OR REPLACE FUNCTION public\\.${fn}\\(\\)[\\s\\S]*?SECURITY INVOKER[\\s\\S]*?SET search_path TO 'public'`));
+      for (const role of ["PUBLIC", "anon", "authenticated"]) {
+        expect(sql005).toContain(`REVOKE ALL ON FUNCTION public.${fn}() FROM ${role};`);
+      }
+      expect(sql005).toContain(`GRANT ALL ON FUNCTION public.${fn}() TO service_role;`);
+    }
+    expect(body).toContain("COP_WHOLE_PESO_REQUIRED");
+    expect(body).toContain("('employees', ARRAY['salary_fixed'])");
+    expect(body).toContain("IS NOT DISTINCT FROM");
+    expect(body).toContain("CREATE OR REPLACE VIEW public.cop_legacy_cents_audit");
+    for (const role of ["PUBLIC", "anon", "authenticated"]) {
+      expect(sql005).toContain(`REVOKE ALL ON public.cop_legacy_cents_audit FROM ${role};`);
+    }
+    expect(sql005).toContain("GRANT SELECT ON public.cop_legacy_cents_audit TO service_role;");
+    expect(body).not.toMatch(/GRANT\s+(?:ALL|INSERT|UPDATE|DELETE)\s+ON public\.cop_legacy_cents_audit/i);
+  });
+
   it("004's guard inspects the WHOLE function, not only its prefix (mutations of the real file)", () => {
     const real = readFileSync(join(SQUASH_DIR, "004_inventory_literal_search.sql"), "utf8");
     const mutate = (from: string, to: string) => {

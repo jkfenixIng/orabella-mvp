@@ -18,7 +18,7 @@
 -- Guarded columns (direct money inputs written by the app or an RPC that only
 -- forwards app-computed values):
 --   cash_denominations.value            cash_registers.base_configurada
---   cash_shift_counts.denomination, amount
+--   employees.salary_fixed               cash_shift_counts.denomination, amount
 --   cash_shifts.opening_base, counted_cash, base_left, cash_withdrawn, base_difference
 --   cash_shift_recounts.counted_cash, base_left, cash_withdrawn, base_difference
 --   commission_rules.amount             commission_payouts.amount
@@ -102,6 +102,7 @@ BEGIN
       ('cash_shift_recounts', ARRAY['counted_cash', 'base_left', 'cash_withdrawn', 'base_difference']),
       ('cash_shifts', ARRAY['opening_base', 'counted_cash', 'base_left', 'cash_withdrawn', 'base_difference']),
       ('commission_rules', ARRAY['amount']),
+      ('employees', ARRAY['salary_fixed']),
       ('commission_payouts', ARRAY['amount']),
       ('invoices', ARRAY['discount']),
       ('invoice_items', ARRAY['unit_price', 'discount', 'commission_value']),

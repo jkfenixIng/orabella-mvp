@@ -106,6 +106,7 @@ import { bogotaDay } from "@/src/shared/lib/dates";
 import { formatBogotaDate, formatBogotaFullDateTime, toNumber } from "@/src/shared/lib/format";
 import { refreshPayrollMonthAfterExtra } from "./payroll-month-refresh";
 import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import { copInputDigits } from "@/src/shared/money/cop";
 
 /** Acción destructiva (borrar borrador): contorno y texto en rojo, separada de las demás. */
 const dangerOutlineClass = cn(
@@ -1545,7 +1546,7 @@ export function PayrollClient(props: PayrollClientProps) {
     if (edited !== undefined) return edited;
     const item = itemByEmployee.get(employeeId);
     if (!item) return "";
-    return String(field === "bonuses" ? item.bonuses : item.other_discounts);
+    return copInputDigits(field === "bonuses" ? item.bonuses : item.other_discounts);
   }
 
   /**
@@ -1911,7 +1912,7 @@ export function PayrollClient(props: PayrollClientProps) {
     return {
       key: `portion-${portionKeyRef.current}`,
       method_code: free,
-      amount: remaining > 0 ? String(remaining) : "",
+      amount: remaining > 0 ? copInputDigits(remaining) : "",
     };
   }
 
@@ -1949,7 +1950,7 @@ export function PayrollClient(props: PayrollClientProps) {
       if (remaining <= 0) return prev;
       return {
         ...prev,
-        [item.id]: rows.map((row, i) => (i === index ? { ...row, amount: String(remaining) } : row)),
+        [item.id]: rows.map((row, i) => (i === index ? { ...row, amount: copInputDigits(remaining) } : row)),
       };
     });
   }

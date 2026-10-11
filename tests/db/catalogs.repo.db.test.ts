@@ -5,14 +5,14 @@ import { supabaseCatalogsRepo, type CatalogsRepo } from "@/src/features/admin/re
 import type { Database } from "@/src/shared/db/client";
 import { DbQueryError } from "@/src/shared/db/errors";
 import * as schema from "@/src/shared/db/schema";
-import { DB_HOOK_TIMEOUT, closeDb, freshDb, warmTemplate, type Db } from "./harness";
+import { DB_HOOK_TIMEOUT, closeDb, freshDb, setCopTriggers, warmTemplate, type Db } from "./harness";
 import { postgrestDouble } from "./postgrest-double";
 
 const ID = "00000000-0000-4000-8000-000000000001";
 const METHOD_ID = "00000000-0000-4000-8000-000000000002";
 let pg: Db; let db: Database;
 beforeAll(warmTemplate, DB_HOOK_TIMEOUT);
-beforeEach(async () => { pg = await freshDb(); db = drizzle({ client: pg, schema }) as unknown as Database; }, DB_HOOK_TIMEOUT);
+beforeEach(async () => { pg = await freshDb(); await setCopTriggers(pg, false); db = drizzle({ client: pg, schema }) as unknown as Database; }, DB_HOOK_TIMEOUT);
 afterEach(() => closeDb(pg));
 
 async function outcome(run: () => Promise<unknown>) {
@@ -62,6 +62,7 @@ describe("admin catalogs repository: equivalence supabase-js ↔ drizzle", () =>
   // case starts from the same state on both sides.
   it.each(CASES)("$name", async ({ run }) => {
     const other = await freshDb();
+    await setCopTriggers(other, false);
     try {
       await seed(pg);
       await seed(other);
@@ -77,6 +78,7 @@ describe("admin catalogs repository: equivalence supabase-js ↔ drizzle", () =>
 describe("admin catalogs drizzle repository", () => {
   it("keeps homonymous employee pages ordered by full_name then id on both adapters", async () => {
     const other = await freshDb();
+    await setCopTriggers(other, false);
     try {
       await seed(pg);
       await seed(other);
