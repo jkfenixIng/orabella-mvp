@@ -14,7 +14,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:db": "vitest run --config vitest.db.config.ts",
-    "test:concurrency": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON tests/concurrency/run.ts",
+    "test:concurrency": "node tests/concurrency/preflight.mjs && node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON tests/concurrency/run.ts",
     "verify:backup": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/verify-backup-restore.ts",
     "test:e2e": "playwright test",
     "test:e2e:changed": "playwright test --grep @changed",
