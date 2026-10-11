@@ -28,9 +28,11 @@ describe("real-concurrency harness contract", () => {
     expect(run).toMatch(/process\.once\("unhandledRejection"/);
     expect(run).toMatch(/process\.once\("uncaughtException"/);
     expect(source("preflight.mjs")).toMatch(/Node 22\.18\+ or 23\.6\+/);
-    // 005 and 007 are applied to the real cluster and smoke-checked there.
-    expect(cluster).toContain('"005_cop_whole_peso.sql"');
-    expect(cluster).toContain('"007_money_cap_policy.sql"');
+    // Every numeric migration present in this checkout is applied in lexical order,
+    // so later integration migrations join the real cluster without harness edits.
+    expect(cluster).toMatch(/readdirSync\(MIGRATIONS_DIR\)/);
+    expect(cluster).toContain("/^\\d{3}_.+\\.sql$/");
+    expect(cluster).toMatch(/\.sort\(\)/);
     expect(run).toMatch(/l\. concurrent installation owner guards/);
     expect(run).toMatch(/m\. 005 COP whole-peso smoke/);
     expect(run).toMatch(/n\. 007 whole-peso cap smoke/);

@@ -2,13 +2,28 @@ import postgres, { type Sql } from "postgres";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { startCluster, stopCluster, type Cluster } from "./concurrency/cluster";
 
+const supabase = vi.hoisted(() => ({ attempts: 0 }));
 vi.mock("next/cache", () => ({ unstable_cache: <T>(fn: T) => fn }));
+vi.mock("@supabase/supabase-js", () => ({
+  createClient: () => {
+    supabase.attempts += 1;
+    throw new Error("Supabase client construction is forbidden in postgres closure");
+  },
+}));
 
-let cluster: Cluster;
-let sql: Sql;
+const SUPABASE_ENV = [
+  "NEXT_PUBLIC_SUPABASE_URL",
+  "NEXT_PUBLIC_SUPABASE_ANON_KEY",
+  "SUPABASE_SERVICE_ROLE_KEY",
+] as const;
+type SupabaseEnv = Record<(typeof SUPABASE_ENV)[number], { exists: boolean; value?: string }>;
+
+let cluster: Cluster | undefined;
+let sql: Sql | undefined;
 let userId: string;
 let employeeId: string;
 let productId: string;
+let originalEnv: SupabaseEnv;
 
 async function scalar<T>(query: Promise<readonly T[]>): Promise<T> {
   const [row] = await query;
@@ -16,7 +31,36 @@ async function scalar<T>(query: Promise<readonly T[]>): Promise<T> {
   return row;
 }
 
+function snapshotSupabaseEnv(): SupabaseEnv {
+  return Object.fromEntries(
+    SUPABASE_ENV.map((name) => [name, { exists: Object.hasOwn(process.env, name), value: process.env[name] }]),
+  ) as SupabaseEnv;
+}
+
+function poisonSupabaseEnv(): void {
+  for (const name of SUPABASE_ENV) delete process.env[name];
+}
+
+function restoreSupabaseEnv(snapshot: SupabaseEnv): void {
+  for (const name of SUPABASE_ENV) {
+    if (snapshot[name].exists) process.env[name] = snapshot[name].value;
+    else delete process.env[name];
+  }
+}
+
+async function cleanup(label: string, work: () => Promise<void>, failures: Error[]): Promise<void> {
+  try {
+    await work();
+  } catch (error) {
+    failures.push(new Error(`${label}: ${error instanceof Error ? error.message : String(error)}`));
+  }
+}
+
 beforeAll(async () => {
+  originalEnv = snapshotSupabaseEnv();
+  poisonSupabaseEnv();
+  supabase.attempts = 0;
+  vi.resetModules();
   cluster = await startCluster();
   sql = postgres(cluster.url, { max: 1 });
   process.env.DB_ENGINE = "postgres";
@@ -44,17 +88,38 @@ beforeAll(async () => {
 }, 120_000);
 
 afterAll(async () => {
-  const holder = globalThis as typeof globalThis & { __orabellaDb?: { sql: { end(options?: unknown): Promise<void> } } };
-  await holder.__orabellaDb?.sql.end({ timeout: 5 });
-  delete holder.__orabellaDb;
-  await sql.end({ timeout: 5 });
-  await stopCluster(cluster);
-  delete process.env.DB_ENGINE;
-  delete process.env.DATABASE_URL;
+  const failures: Error[] = [];
+  try {
+    const holder = globalThis as typeof globalThis & { __orabellaDb?: { sql: { end(options?: unknown): Promise<void> } } };
+    const holderSql = holder.__orabellaDb?.sql;
+    const suiteSql = sql;
+    const currentCluster = cluster;
+    if (holderSql) await cleanup("close shared PostgreSQL client", () => holderSql.end({ timeout: 5 }), failures);
+    delete holder.__orabellaDb;
+    if (suiteSql) await cleanup("close suite PostgreSQL client", () => suiteSql.end({ timeout: 5 }), failures);
+    if (currentCluster) await cleanup("stop ephemeral PostgreSQL cluster", () => stopCluster(currentCluster), failures);
+    if (failures.length > 0) throw new AggregateError(failures, "postgres closure cleanup failed");
+  } finally {
+    delete process.env.DB_ENGINE;
+    delete process.env.DATABASE_URL;
+    restoreSupabaseEnv(originalEnv);
+    vi.resetModules();
+  }
 }, 120_000);
 
 describe("DB_ENGINE=postgres closure on an ephemeral PostgreSQL cluster", () => {
-  it("runs auth login/session/reset/admin reset without Supabase configuration", async () => {
+  it("runs with Supabase credentials unavailable and rejects privileged client construction", async () => {
+    expect(Object.fromEntries(SUPABASE_ENV.map((name) => [name, process.env[name]]))).toEqual({
+      NEXT_PUBLIC_SUPABASE_URL: undefined,
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: undefined,
+      SUPABASE_SERVICE_ROLE_KEY: undefined,
+    });
+    const { createAdminClient } = await import("@/src/shared/lib/supabase/server");
+    expect(() => createAdminClient()).toThrow("Missing Supabase public env vars");
+    expect(supabase.attempts).toBe(0);
+  });
+
+  it("runs auth login/session/reset/admin reset without Supabase", async () => {
     const auth = await import("@/src/features/auth/service");
     const login = await auth.loginWithDocument({ documento: "closure-user", password: "Clave123" });
     expect((await auth.getSessionUser(login.sessionToken))?.user.id).toBe(userId);
@@ -77,7 +142,7 @@ describe("DB_ENGINE=postgres closure on an ephemeral PostgreSQL cluster", () => 
     await expect(admin.upsertTaxConfig({ code: "otro", name: "Closure", percent: 0 })).resolves.toMatchObject({ code: "otro" });
     await expect(inventory.registerMovement({ product_id: productId, type: "IN", qty: 1, reason: "closure" }, { userId })).resolves.toMatchObject({ stock_qty: 11 });
 
-    const register = await scalar(sql<{ id: string }[]>`SELECT id FROM public.cash_registers ORDER BY name LIMIT 1`);
+    const register = await scalar((sql as Sql)<{ id: string }[]>`SELECT id FROM public.cash_registers ORDER BY name LIMIT 1`);
     const counts = [
       { method_code: "efectivo", denomination: 10000, quantity: 20, amount: 200000 },
       ...["transferencia_normal", "nequi", "daviplata", "bre-b", "tarjeta"].map((method_code) => ({ method_code, denomination: null, quantity: 1, amount: 0 })),
@@ -94,5 +159,6 @@ describe("DB_ENGINE=postgres closure on an ephemeral PostgreSQL cluster", () => 
     await expect(commissions.upsertCommissionRule({ item_type: "producto", item_id: productId, employee_id: employeeId, amount: 1000 })).resolves.toMatchObject({ amount: 1000 });
     await expect(payroll.requestVoucher({ employee_id: employeeId, amount: 1000, method_code: "efectivo", idempotency_key: "73e47cf1-27e9-43ee-8656-0ac3b3a1dcbf" }, actor)).resolves.toMatchObject({ voucher: { cash_shift_id: opened.shift.id } });
     expect(invoice.invoice.cash_shift_id).toBe(opened.shift.id);
+    expect(supabase.attempts).toBe(0);
   }, 30_000);
 });

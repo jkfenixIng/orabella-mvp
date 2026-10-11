@@ -1,6 +1,6 @@
 /** Ephemeral PostgreSQL cluster for the real-concurrency suite. */
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -63,9 +63,16 @@ function owner(cluster: Pick<Cluster, "dataDir" | "runnerPid">): Marker {
 }
 
 const MIGRATIONS_DIR = join(REPO_ROOT, "supabase", "migrations");
+const migrationFiles = () =>
+  readdirSync(MIGRATIONS_DIR)
+    .filter((name) => /^\d{3}_.+\.sql$/.test(name))
+    .sort()
+    .map((name) => join(MIGRATIONS_DIR, name));
+
+/** Every numeric migration in the checkout, so future integration migrations join automatically. */
 export const SCHEMA_FILES = [
   join(REPO_ROOT, "supabase", "bootstrap", "platform-roles.sql"),
-  ...["001_orabella_schema.sql", "002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql", "005_cop_whole_peso.sql", "006_installation_owner.sql", "007_money_cap_policy.sql"].map((name) => join(MIGRATIONS_DIR, name)),
+  ...migrationFiles(),
   join(REPO_ROOT, "supabase", "seeds", "catalog.sql"),
   join(REPO_ROOT, "supabase", "bootstrap", "app-role.sql"),
 ];
