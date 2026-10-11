@@ -276,17 +276,20 @@ la provisión explícita, cualquier asignación normal de `superadmin` falla con
 rol; `setUserRoles` y el alta de empleados sólo aceptan `admin`, `empleado` o
 `caja`.
 
-La provisión se ejecuta una sola vez por un operador de base o `service_role`,
-después de aplicar `006` y el catálogo, usando el `users.id` real de esa base:
+La provisión se ejecuta una sola vez por un **operador de base** (la identidad
+propietaria de la tabla/base), después de aplicar `006` y el catálogo, usando el
+`users.id` real de esa base:
 
 ```sql
 SELECT public.provision_installation_owner('OWNER_USER_ID'::uuid);
 ```
 
-No se codifica email ni UUID en el repositorio. El dueño no se borra ni cambia
-con SQL directo ni mediante `replace_user_roles`. Si pierde acceso, la única
-recuperación es un procedimiento manual y auditado fuera de la app, ejecutado
-por un operador de base o `service_role`:
+No se codifica email ni UUID en el repositorio. La provisión falla sin cambiar
+nada si ya existe algún `superadmin`: el operador debe resolver esa situación
+manualmente antes de designar un dueño. El dueño no se borra ni cambia con SQL
+directo ni mediante `replace_user_roles`. Si pierde acceso, la única recuperación
+es un procedimiento manual y auditado fuera de la app, ejecutado por un operador
+de base:
 
 ```sql
 SELECT public.break_glass_transfer_installation_owner(
@@ -296,8 +299,11 @@ SELECT public.break_glass_transfer_installation_owner(
 ```
 
 El procedimiento exige motivo y deja `audit_logs.metadata` con `old`, `new`,
-`reason` y `operator`. `orabella_app`, `anon` y `authenticated` no tienen acceso
-a la tabla ni a estas funciones.
+`reason` y `operator`. `orabella_app`, `service_role`, `anon` y `authenticated`
+no tienen acceso a la tabla ni a estas funciones. Una clave de servicio es una
+credencial de aplicación, no un operador de base: ejecutar estas sentencias
+requiere SQL Editor/`psql` con la identidad del operador; nunca la app ni su
+service key.
 
 ### Lo que sigue autorizando es el ROL, no la sede
 

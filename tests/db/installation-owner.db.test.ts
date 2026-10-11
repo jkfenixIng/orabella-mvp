@@ -14,6 +14,7 @@ let db: Db | undefined;
 async function preparedDb(): Promise<Db> {
   db = await buildSchemaDb({ catalog: true, migrations: before006 });
   await applyFile(db, "supabase/migrations/006_installation_owner.sql");
+  await db.exec("CREATE ROLE orabella_app LOGIN; GRANT service_role TO orabella_app;");
   return db;
 }
 
@@ -53,15 +54,16 @@ describe("006 installation owner", () => {
     expect(await roleCodes(current, user)).toEqual([]);
   });
 
-  it("provisions one active owner once, grants only their superadmin role, and rejects a second provision", async () => {
+  it("provisions one active owner once, preserves their normal role, and rejects a second provision", async () => {
     const current = await preparedDb();
     const owner = await addUser(current, "owner");
     const other = await addUser(current, "other");
+    await rpc(current, "replace_user_roles", [owner, ["admin"]], ["uuid", "text[]"]);
 
     await rpc(current, "provision_installation_owner", [owner], ["uuid"]);
 
     expect(await one<{ owner_user_id: string }>(current, "SELECT owner_user_id FROM public.installation_owner")).toEqual({ owner_user_id: owner });
-    expect(await roleCodes(current, owner)).toEqual(["superadmin"]);
+    expect(await roleCodes(current, owner)).toEqual(["admin", "superadmin"]);
     expect(await pgError(rpc(current, "provision_installation_owner", [other], ["uuid"]))).toMatchObject({
       code: "P0001",
       message: "INSTALLATION_OWNER_ALREADY_PROVISIONED",
@@ -70,6 +72,26 @@ describe("006 installation owner", () => {
       code: "P0001",
       message: "SUPERADMIN_OWNER_ONLY",
     });
+  });
+
+  it("refuses provisioning when a legacy superadmin already exists without changing roles", async () => {
+    const current = await preparedDb();
+    const legacy = await addUser(current, "legacy");
+    const candidate = await addUser(current, "candidate");
+    await current.exec("ALTER TABLE public.user_roles DISABLE TRIGGER trg_superadmin_owner");
+    await current.query(
+      `INSERT INTO public.user_roles (user_id, role_id) SELECT $1, id FROM public.roles WHERE code = 'superadmin'`,
+      [legacy],
+    );
+    await current.exec("ALTER TABLE public.user_roles ENABLE TRIGGER trg_superadmin_owner");
+
+    expect(await pgError(rpc(current, "provision_installation_owner", [candidate], ["uuid"]))).toMatchObject({
+      code: "P0001",
+      message: "INSTALLATION_OWNER_PREEXISTING_SUPERADMIN",
+    });
+    expect(await roleCodes(current, legacy)).toEqual(["superadmin"]);
+    expect(await roleCodes(current, candidate)).toEqual([]);
+    expect(await one<{ n: number }>(current, "SELECT count(*)::int AS n FROM public.installation_owner")).toEqual({ n: 0 });
   });
 
   it("rejects an inactive candidate and direct or RPC attempts to remove the owner role", async () => {
@@ -123,16 +145,43 @@ describe("006 installation owner", () => {
     });
   });
 
-  it("keeps owner procedures out of app roles and hardens their search path", async () => {
+  it("rejects app and service principals even after they set the legacy bypass GUCs", async () => {
     const current = await preparedDb();
-    const acl = await one<{ anon: boolean; authenticated: boolean; service: boolean; public_execute: boolean }>(
+    const owner = await addUser(current, "owner");
+    const attacker = await addUser(current, "attacker");
+    await rpc(current, "provision_installation_owner", [owner], ["uuid"]);
+    await current.exec("CREATE ROLE owner_test_service LOGIN; GRANT service_role TO owner_test_service;");
+
+    for (const role of ["orabella_app", "owner_test_service"]) {
+      await current.exec(`BEGIN; SET LOCAL ROLE ${role}; SET LOCAL orabella.owner_break_glass = 'on'; SET LOCAL orabella.owner_provision = 'on';`);
+      try {
+        expect(await pgError(current.query(
+          `INSERT INTO public.user_roles (user_id, role_id) SELECT $1, id FROM public.roles WHERE code = 'superadmin'`,
+          [attacker],
+        ))).toMatchObject({ code: expect.stringMatching(/^(P0001|42501)$/) });
+        await current.exec("ROLLBACK; BEGIN; SET LOCAL ROLE " + role + "; SET LOCAL orabella.owner_break_glass = 'on'; SET LOCAL orabella.owner_provision = 'on';");
+        expect(await pgError(current.query("UPDATE public.installation_owner SET owner_user_id = $1", [attacker]))).toMatchObject({ code: expect.stringMatching(/^(P0001|42501)$/) });
+        await current.exec("ROLLBACK; BEGIN; SET LOCAL ROLE " + role + "; SET LOCAL orabella.owner_break_glass = 'on'; SET LOCAL orabella.owner_provision = 'on';");
+        expect(await pgError(rpc(current, "break_glass_transfer_installation_owner", [attacker, "attacker"], ["uuid", "text"]))).toMatchObject({ code: "42501" });
+      } finally {
+        await current.exec("ROLLBACK");
+      }
+    }
+    expect(await roleCodes(current, owner)).toEqual(["superadmin"]);
+    expect(await roleCodes(current, attacker)).toEqual([]);
+  });
+
+  it("keeps owner procedures out of every app-facing role and hardens their search path", async () => {
+    const current = await preparedDb();
+    const acl = await one<{ anon: boolean; authenticated: boolean; service: boolean; app: boolean; public_execute: boolean }>(
       current,
       `SELECT has_function_privilege('anon', 'public.provision_installation_owner(uuid)', 'EXECUTE') AS anon,
               has_function_privilege('authenticated', 'public.provision_installation_owner(uuid)', 'EXECUTE') AS authenticated,
               has_function_privilege('service_role', 'public.provision_installation_owner(uuid)', 'EXECUTE') AS service,
+              has_function_privilege('orabella_app', 'public.provision_installation_owner(uuid)', 'EXECUTE') AS app,
               has_function_privilege('public', 'public.provision_installation_owner(uuid)', 'EXECUTE') AS public_execute`,
     );
-    expect(acl).toEqual({ anon: false, authenticated: false, service: true, public_execute: false });
+    expect(acl).toEqual({ anon: false, authenticated: false, service: false, app: false, public_execute: false });
     const paths = await current.query<{ proname: string; proconfig: string[] | null }>(
       `SELECT proname, proconfig FROM pg_proc WHERE proname IN ('provision_installation_owner', 'break_glass_transfer_installation_owner') ORDER BY proname`,
     );

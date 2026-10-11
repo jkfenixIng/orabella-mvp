@@ -121,7 +121,13 @@ async function scenarioInstallationOwner(o: Sql, a: Sql, b: Sql): Promise<string
   assert(removal.code === "P0001" && removal.message.includes("INSTALLATION_OWNER_ROLE_IMMUTABLE"), `owner removal got ${removal.code}/${removal.message}`);
   const assignment = await errorOf(b`SELECT public.replace_user_roles(${other}::uuid, ARRAY['superadmin']::text[])`);
   assert(assignment.code === "P0001" && assignment.message.includes("SUPERADMIN_OWNER_ONLY"), `other assignment got ${assignment.code}/${assignment.message}`);
-  return "owner removal=P0001/INSTALLATION_OWNER_ROLE_IMMUTABLE; other assignment=P0001/SUPERADMIN_OWNER_ONLY";
+  const transfer = track(a`SELECT public.break_glass_transfer_installation_owner(${other}::uuid, 'Concurrent recovery test')`);
+  const secondTransfer = track(b`SELECT public.break_glass_transfer_installation_owner(${owner}::uuid, 'Concurrent recovery test')`);
+  await transfer;
+  await secondTransfer;
+  const state = await o<{ owner: string; superadmins: string }[]>`SELECT (SELECT owner_user_id::text FROM public.installation_owner) AS owner, (SELECT string_agg(ur.user_id::text, ',' ORDER BY ur.user_id) FROM public.user_roles ur JOIN public.roles r ON r.id = ur.role_id WHERE r.code = 'superadmin') AS superadmins`;
+  assert(state[0].owner === state[0].superadmins, `owner state ${JSON.stringify(state[0])}`);
+  return "owner removal=P0001; other assignment=P0001; concurrent transfers serialize with one owner superadmin";
 }
 
 async function scenarioCopWholePeso(o: Sql, a: Sql): Promise<string> {

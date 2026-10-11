@@ -78,8 +78,8 @@ BEGIN
   FOR table_name IN
     SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public' ORDER BY tablename
   LOOP
-    IF table_name = 'installation_owner' THEN
-      EXECUTE 'REVOKE ALL ON TABLE public.installation_owner FROM orabella_app';
+    IF table_name IN ('installation_owner', 'installation_owner_operation') THEN
+      EXECUTE pg_catalog.format('REVOKE ALL ON TABLE public.%I FROM orabella_app', table_name);
     ELSE
       EXECUTE pg_catalog.format(
         'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO orabella_app',
