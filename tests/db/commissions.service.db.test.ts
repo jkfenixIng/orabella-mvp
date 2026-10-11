@@ -20,7 +20,7 @@ const engine = vi.hoisted(() => ({
 }));
 
 // Only Next's cache wrapper is bypassed (no incremental cache outside Next);
-// the admin/cash services themselves run for real.
+// the admin/cash services and the audit writer run for real.
 vi.mock("next/cache", () => ({ unstable_cache: <T>(fn: T) => fn }));
 vi.mock("@/src/shared/lib/supabase/server", async () => {
   const { postgrestDouble } = await import("./postgrest-double");
@@ -37,10 +37,6 @@ vi.mock("@/src/shared/db/client", async () => {
   const schema = await import("@/src/shared/db/schema");
   return { getDb: () => drizzle({ client: engine.pg, schema }) };
 });
-vi.mock("@/src/shared/lib/audit", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/src/shared/lib/audit")>()),
-  writeAudit: async () => {},
-}));
 
 const KEY = "1e5b7c4a-8d29-4f36-a0b1-c7d3e9f2a5b8";
 const OTHER = "c6f2a809-3b14-4e57-92d8-0a4b7c1e6f93";
@@ -115,6 +111,12 @@ describe.each(["supabase", "postgres"] as const)("payCommissionNow on %s", (name
     expect(first).toMatchObject({ amount: 150000, earned_immediate: 150000, method_code: "nequi", cash_shift_id: engine.shift });
     expect(await pay(150000)).toEqual(first);
     expect(await payouts()).toBe(1);
+    // Real audit on both engines: exactly one row for the single payout (the retry writes none).
+    const audits = (await engine.pg.query<{ user_id: string; entity_id: string; metadata: Record<string, unknown> }>(
+      `SELECT user_id, entity_id, metadata FROM public.audit_logs WHERE action = 'payroll.commission_paid'`,
+    )).rows;
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({ user_id: user, entity_id: first.id, metadata: { invoice_id: invoice, employee_id: employee, amount: 150000, method_code: "nequi" } });
     const { immediatePaidTotal, listCommissionPayouts } = await import("@/src/features/commissions/service");
     expect(await immediatePaidTotal(invoice, employee)).toBe(150000);
     expect((await listCommissionPayouts({ invoice_id: invoice })).map((row) => row.id)).toEqual([first.id]);

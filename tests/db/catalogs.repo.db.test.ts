@@ -75,6 +75,28 @@ describe("admin catalogs repository: equivalence supabase-js ↔ drizzle", () =>
 });
 
 describe("admin catalogs drizzle repository", () => {
+  it("keeps homonymous employee pages ordered by full_name then id on both adapters", async () => {
+    const other = await freshDb();
+    try {
+      await seed(pg);
+      await seed(other);
+      const expected = [
+        "00000000-0000-4000-8000-0000000000e1",
+        "00000000-0000-4000-8000-0000000000e2",
+        "00000000-0000-4000-8000-0000000000e3",
+        "00000000-0000-4000-8000-0000000000e4",
+      ];
+      const ids = async (repo: CatalogsRepo) => [
+        ...((await repo.employeesPage(0, 1)).data ?? []),
+        ...((await repo.employeesPage(2, 3)).data ?? []),
+      ].map((employee) => employee.id);
+      await expect(ids(drizzleCatalogsRepo(db))).resolves.toEqual(expected);
+      await expect(ids(supabaseCatalogsRepo(postgrestDouble(other)))).resolves.toEqual(expected);
+    } finally {
+      await closeDb(other);
+    }
+  });
+
   it("uses numeric number mode for every catalog money/percentage field", async () => {
     await seed(pg);
     const repo = drizzleCatalogsRepo(db);

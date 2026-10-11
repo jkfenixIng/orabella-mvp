@@ -1,38 +1,49 @@
 /**
  * Cash and billing SERVICES on both engines over the real schema (001-004).
- * With DB_ENGINE=postgres the Supabase client throws, so any direct access left
- * in a service fails the test; the default engine keeps the PostgREST path.
+ * Every collaborator (admin catalogs, audit, alerts, inventory) runs for real;
+ * only Next's cache wrapper is bypassed. With DB_ENGINE=postgres the Supabase
+ * client throws AND its calls are counted (a caller that swallows the error
+ * still fails the run); the default engine must keep using Supabase.
+ *
+ * Out of 3b-3: admin user management (listSedeUsers, upsertEmployee,
+ * currentRoleCodes, setUserRoles) still uses supabase-js and is not exercised.
  */
+import { drizzle } from "drizzle-orm/pglite";
+import * as schema from "@/src/shared/db/schema";
+import { bogotaDay } from "@/src/shared/lib/dates";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { DB_HOOK_TIMEOUT, closeDb, freshDb, one, warmTemplate, type Db } from "./harness";
 import { insertEmployee, insertProduct, insertUser, registerId } from "./fixtures";
+import { postgrestDouble } from "./postgrest-double";
 
-const engine = vi.hoisted(() => ({ pg: null as unknown as Db }));
+const engine = vi.hoisted(() => ({ pg: null as unknown as Db, supabaseCalls: 0 }));
 
+// Vitest 5 resolves the REAL module for the second of two concurrent dynamic
+// import() of a vi.mock'ed path (billing loads two catalogs with Promise.all),
+// so the engine seams are not mocked by path. Instead both real seams land on
+// the same doubles: `getDb()` finds this PGlite in its process cache for the
+// test URL, and the real `createAdminClient()` builds its client through the
+// mocked (statically imported) supabase-js factory, which counts and throws on
+// postgres.
+const DATABASE_URL = "postgres://unused.invalid/db";
 vi.mock("next/cache", () => ({ unstable_cache: <T>(fn: T) => fn }));
-vi.mock("@/src/shared/lib/supabase/server", async () => {
-  const { postgrestDouble } = await import("./postgrest-double");
-  return {
-    createAdminClient: () => {
-      if (process.env.DB_ENGINE === "postgres") throw new Error("Supabase used on the postgres engine");
-      return postgrestDouble(engine.pg);
-    },
-  };
-});
-vi.mock("@/src/shared/db/client", async () => {
-  const { drizzle } = await import("drizzle-orm/pglite");
-  const schema = await import("@/src/shared/db/schema");
-  return { getDb: () => drizzle({ client: engine.pg, schema }) };
-});
-// Catalogs are external collaborators: read the real seeded rows, engine-agnostic.
-vi.mock("@/src/features/admin/service", () => ({
-  listPaymentMethods: async () =>
-    (await engine.pg.query(`SELECT id, code, name, is_active, arqueo_mode, fee_percent::float8 AS fee_percent FROM public.payment_methods`)).rows,
-  listServices: async () => [],
-  listTaxes: async () => [],
+vi.mock("@supabase/supabase-js", () => ({
+  createClient: () => {
+    engine.supabaseCalls += 1;
+    if (process.env.DB_ENGINE === "postgres") throw new Error("Supabase used on the postgres engine");
+    return postgrestDouble(engine.pg);
+  },
 }));
-vi.mock("@/src/shared/lib/audit", () => ({ AUDIT_ACTIONS: new Proxy({}, { get: (_, key) => String(key) }), writeAudit: async () => {} }));
-vi.mock("@/src/features/alerts/service", () => ({ getShiftReviews: async () => new Map() }));
+
+function bindEngineSeams() {
+  Object.assign(globalThis, {
+    __orabellaDb: { url: DATABASE_URL, sql: { end: () => Promise.resolve() }, db: drizzle({ client: engine.pg, schema }) },
+  });
+  // Inert placeholders: createClient is mocked, nothing is ever contacted.
+  vi.stubEnv("NEXT_PUBLIC_SUPABASE_URL", "http://supabase.invalid");
+  vi.stubEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY", "unused");
+  vi.stubEnv("SUPABASE_SERVICE_ROLE_KEY", "unused");
+}
 
 let user: string;
 let employee: string;
@@ -41,12 +52,15 @@ let product: string;
 beforeAll(warmTemplate, DB_HOOK_TIMEOUT);
 beforeEach(async () => {
   engine.pg = await freshDb();
+  engine.supabaseCalls = 0;
+  bindEngineSeams();
   user = await insertUser(engine.pg);
   employee = await insertEmployee(engine.pg);
   product = await insertProduct(engine.pg, 10);
 }, DB_HOOK_TIMEOUT);
 afterEach(async () => {
   vi.unstubAllEnvs();
+  delete (globalThis as { __orabellaDb?: unknown }).__orabellaDb;
   await closeDb(engine.pg);
 });
 
@@ -66,7 +80,7 @@ function load() {
 describe.each(["supabase", "postgres"] as const)("cash/billing services on %s", (name) => {
   beforeEach(() => {
     vi.stubEnv("DB_ENGINE", name === "postgres" ? "postgres" : "");
-    vi.stubEnv("DATABASE_URL", name === "postgres" ? "postgres://unused.invalid/db" : "");
+    vi.stubEnv("DATABASE_URL", name === "postgres" ? DATABASE_URL : "");
   });
 
   it("opens 003 balances, pays cash without invoice, creates invoice, closes/recounts, and reads day/history", async () => {
@@ -93,7 +107,7 @@ describe.each(["supabase", "postgres"] as const)("cash/billing services on %s", 
     expect(closed.shift.status).toBe("cerrado");
     const recounted = await cash.recountClosedShift(opened.shift.id, { counted_cash: 220000, counts: counts(220000), reason: "Verificación" }, actor());
     expect(recounted.recount.shift_id).toBe(opened.shift.id);
-    expect((await cash.getDayView({ fecha: new Date().toISOString().slice(0, 10) })).shifts).toHaveLength(1);
+    expect((await cash.getDayView({ fecha: bogotaDay() })).shifts).toHaveLength(1);
     expect((await cash.getHistory({ desde: "2020-01-01", hasta: "2030-01-01", page: 1 })).total).toBe(1);
   });
 
@@ -124,6 +138,11 @@ describe.each(["supabase", "postgres"] as const)("cash/billing services on %s", 
     const paid = await billing.splitPayment(first.invoice.id, { idempotency_key: "4f7f6c58-3df4-4e58-8a5a-c9d5a3c1b7e2", portions: [{ method_code: "efectivo", amount: 10000 }] }, actor());
     expect(paid.invoice.status).toBe("Pagada");
     expect(paid.invoice.cash_shift_id).toBe(opened.shift.id);
+  });
+
+  afterEach(() => {
+    if (name === "postgres") expect(engine.supabaseCalls).toBe(0);
+    else expect(engine.supabaseCalls).toBeGreaterThan(0);
   });
 
   it("rejects an outflow on a legacy shift without frozen balances", async () => {
