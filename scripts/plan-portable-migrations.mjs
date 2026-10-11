@@ -1,4 +1,6 @@
+import console from "node:console";
 import { mkdirSync, writeFileSync } from "node:fs";
+import process from "node:process";
 import { dirname, resolve } from "node:path";
 import { buildMigrationPlan, discoverMigrations, fail, readJson } from "./portable-migrations.mjs";
 

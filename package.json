@@ -20,7 +20,8 @@
     "plan:portable-migrations": "node scripts/plan-portable-migrations.mjs",
     "verify:portable-migrations": "node scripts/verify-portable-migration-plan.mjs",
     "apply:portable-migrations": "node scripts/apply-portable-migration-plan.mjs",
-    "test:portable-migrations": "node tests/portable-migration-cli.test.mjs",
+    "reconcile:portable-migrations": "node scripts/reconcile-portable-migration.mjs",
+    "test:portable-migrations": "node tests/portable-migration-cli.test.mjs && node tests/portable-migration-runner.test.mjs",
     "test:e2e": "playwright test",
     "test:e2e:changed": "playwright test --grep @changed",
     "test:e2e:full": "playwright test --grep @full"
