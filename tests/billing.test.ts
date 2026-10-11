@@ -6840,7 +6840,10 @@ describe("billing: CL-11 el diff del servicio vive en el bloque de persistencia"
     expect(split).toContain("computeCardFees(");
     expect(split).toContain("invoiceNetBalance({");
     expect(split).toContain("moneyEquals(");
-    expect(split).toContain("copExceeds(balance.netBilled, balance.netCollected + netSum)");
+    expect(split).toContain("invoicePaymentCapExceeded({");
+    expect(split).toContain("alreadyPaid: balance.netCollected");
+    expect(split).toContain("incoming: netSum");
+    expect(split).toContain("cap: balance.netBilled");
     expect(split).toContain(
       'const closesInvoice = fullyPaid && detail.invoice.status === "Emitida"',
     );

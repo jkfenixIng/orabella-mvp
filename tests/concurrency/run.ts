@@ -148,6 +148,20 @@ async function scenarioCopWholePeso(o: Sql, a: Sql): Promise<string> {
     return `triggers=${triggers}; decimal=P0001/COP_WHOLE_PESO_REQUIRED; legacyUpdate=10.50; auditAcl=service_role SELECT only`;
   } finally { await rollback(a); }
 }
+/** 007 smoke: trigger caps project legacy cents to whole pesos without rewriting them. */
+async function scenarioMoneyCapPolicy(o: Sql, a: Sql): Promise<string> {
+  await begin(a);
+  try {
+    const invoice = (await a<{ id: string }[]>`INSERT INTO public.invoices (consecutive_number, subtotal, discount, tax, surcharge, total, status) VALUES (900001, 1.01, 0, 0, 0, 1.01, 'Emitida') RETURNING id`)[0].id;
+    await a`ALTER TABLE public.invoice_payments DISABLE TRIGGER trg_cop_whole_peso`;
+    await a`INSERT INTO public.invoice_payments (invoice_id, method_code, amount, fee_amount) VALUES (${invoice}, 'efectivo', 0.01, 0)`;
+    await a`ALTER TABLE public.invoice_payments ENABLE TRIGGER trg_cop_whole_peso`;
+    const accepted = await a<{ amount: string }[]>`INSERT INTO public.invoice_payments (invoice_id, method_code, amount, fee_amount) VALUES (${invoice}, 'efectivo', 1, 0) RETURNING amount::text AS amount`;
+    const rejected = await errorOf(a`INSERT INTO public.invoice_payments (invoice_id, method_code, amount, fee_amount) VALUES (${invoice}, 'efectivo', 1, 0)`);
+    assert(accepted[0].amount === '1.00' && rejected.code === 'P0001', `007 invoice cap got ${accepted[0]?.amount}/${rejected.code}/${rejected.message}`);
+    return 'legacy=0.01 plus whole-peso=1 accepted-at-rounded-cap; next-peso=P0001';
+  } finally { await rollback(a); }
+}
 async function recover({ observer, a, b, c, pids }: Sessions): Promise<void> { await observer`SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE pid = ANY(${pids}::int[]) AND state <> 'idle'`; await Promise.all([rollback(a), rollback(b), rollback(c)]); }
 async function runScenario(sessions: Sessions, name: string, fn: () => Promise<string>, repetitions?: number): Promise<Result> {
   const operation = fn(); let timer: NodeJS.Timeout | undefined;
@@ -166,7 +180,7 @@ async function main(): Promise<void> {
   try {
     cluster = await startCluster(); observer = postgres(cluster.url, { max: 1, connect_timeout: 5, onnotice: () => undefined }); a = postgres(cluster.url, { max: 1, connect_timeout: 5, onnotice: () => undefined }); b = postgres(cluster.url, { max: 1, connect_timeout: 5, onnotice: () => undefined }); c = postgres(cluster.url, { max: 1, connect_timeout: 5, onnotice: () => undefined });
     const o = observer, x = a, y = b, z = c, sessions = { observer: o, a: x, b: y, c: z, pids: await Promise.all([backendPid(x), backendPid(y), backendPid(z)]) };
-    const scenarios: Array<[string, () => Promise<string>, number?]> = [["a. concurrent shift opens", () => scenarioOpen(o, x, y)], ["b. close vs cash invoice payment", () => scenarioCloseVsPayment(o, x, y, false)], ["c. close vs split invoice payment", () => scenarioCloseVsPayment(o, x, y, true)], ["d. concurrent closes", () => scenarioDoubleClose(o, x, y)], ["e. stale arqueo after collection", () => scenarioStale(o, x, y, z)], ["f. concurrent arqueo-method outflows", () => scenarioMinimum(o, x, y)], ["g. invoice method edit vs commission", () => scenarioEditVsCommission(o, x, y), 20], ["h. concurrent invoice consecutives", () => scenarioInvoiceConcurrency(o, x, y)], ["i. same idempotency key", () => scenarioIdempotency(o, x, y)], ["j. concurrent payroll payments cap", () => scenarioPayrollCap(o, x, y)], ["k. concurrent payroll apply", () => scenarioPayrollApply(o, x, y)], ["l. concurrent installation owner guards", () => scenarioInstallationOwner(o, x, y)], ["m. 005 COP whole-peso smoke", () => scenarioCopWholePeso(o, x)]];
+    const scenarios: Array<[string, () => Promise<string>, number?]> = [["a. concurrent shift opens", () => scenarioOpen(o, x, y)], ["b. close vs cash invoice payment", () => scenarioCloseVsPayment(o, x, y, false)], ["c. close vs split invoice payment", () => scenarioCloseVsPayment(o, x, y, true)], ["d. concurrent closes", () => scenarioDoubleClose(o, x, y)], ["e. stale arqueo after collection", () => scenarioStale(o, x, y, z)], ["f. concurrent arqueo-method outflows", () => scenarioMinimum(o, x, y)], ["g. invoice method edit vs commission", () => scenarioEditVsCommission(o, x, y), 20], ["h. concurrent invoice consecutives", () => scenarioInvoiceConcurrency(o, x, y)], ["i. same idempotency key", () => scenarioIdempotency(o, x, y)], ["j. concurrent payroll payments cap", () => scenarioPayrollCap(o, x, y)], ["k. concurrent payroll apply", () => scenarioPayrollApply(o, x, y)], ["l. concurrent installation owner guards", () => scenarioInstallationOwner(o, x, y)], ["m. 005 COP whole-peso smoke", () => scenarioCopWholePeso(o, x), ["n. 007 whole-peso cap smoke", () => scenarioMoneyCapPolicy(o, x)]];
     const results: Result[] = []; for (const [name, fn, repetitions] of scenarios) { const result = await runScenario(sessions, name, fn, repetitions); console.log(`${result.status} ${name}${repetitions ? ` (${repetitions}x)` : ""}: ${result.detail}`); results.push(result); } if (results.some((result) => result.status === "FAIL")) process.exitCode = 1;
   } finally { await Promise.all([a && rollback(a), b && rollback(b), c && rollback(c)].filter(Boolean)); await Promise.all([observer?.end({ timeout: 1 }), a?.end({ timeout: 1 }), b?.end({ timeout: 1 }), c?.end({ timeout: 1 })].filter(Boolean)); await teardown(); }
 }

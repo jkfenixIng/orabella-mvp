@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { idempotencyKeySchema, moneyEquals, roundMoney } from "@/src/features/billing/schemas";
 import { copSchema, positiveCopSchema } from "@/src/shared/money/cop";
+import { cashMinimumBreached } from "@/src/shared/money/caps";
 
 export { moneyEquals, roundMoney };
 
@@ -123,7 +124,7 @@ export function methodAvailability(row: { method_code: string; opening_base: num
 }
 
 export function exceedsCashOutLimit(state: CashOutLimitState, amount: number): boolean {
-  return roundMoney(roundMoney(amount) - state.available) > 0;
+  return cashMinimumBreached(state.base, state.expected, amount);
 }
 
 export interface CashOutLimitViolation {

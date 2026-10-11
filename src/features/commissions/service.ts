@@ -20,7 +20,8 @@ import {
   getOpenShift,
 } from "@/src/features/cash/service";
 import { listPaymentMethods } from "@/src/features/admin/service";
-import { COP_WHOLE_PESO_MESSAGE, copExceeds, copValidationError } from "@/src/shared/money/cop";
+import { COP_WHOLE_PESO_MESSAGE, copValidationError } from "@/src/shared/money/cop";
+import { commissionPayoutCapExceeded } from "@/src/shared/money/caps";
 
 export class CommissionError extends Error {
   readonly code: string;
@@ -482,7 +483,7 @@ export async function payCommissionNow(
       422,
     );
   }
-  if (copExceeds(amount, pending)) {
+  if (commissionPayoutCapExceeded({ alreadyPaid: paid, incoming: amount, cap: earned.immediateEarned })) {
     throw new CommissionError(
       "COMMISSION_OVERPAID",
       `El monto supera la comisión pendiente (${pending}).`,

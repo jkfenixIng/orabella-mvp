@@ -3,6 +3,7 @@ import { idempotencyKeySchema, moneyEquals, roundMoney } from "@/src/features/bi
 import { cashOutLimitViolation } from "@/src/features/cash/schemas";
 import { bogotaDay } from "@/src/shared/lib/dates";
 import { copExceeds, copSchema, positiveCopSchema } from "@/src/shared/money/cop";
+import { payrollPaymentCapExceeded } from "@/src/shared/money/caps";
 import {
   employeeLineCommissionOrigin,
   employeeLineCommissionPercent,
@@ -717,7 +718,11 @@ export function assertPortionsMatchNet(portions: Array<{ amount: number }>, netP
  * neto. Puro para probarlo sin base de datos.
  */
 export function assertNoOverpay(args: { alreadyPaid: number; newAmount: number; netPay: number }): void {
-  if (copExceeds(args.alreadyPaid + args.newAmount, args.netPay)) {
+  if (payrollPaymentCapExceeded({
+    alreadyPaid: args.alreadyPaid,
+    incoming: args.newAmount,
+    cap: args.netPay,
+  })) {
     throw new Error("OVERPAID");
   }
 }

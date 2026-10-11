@@ -655,7 +655,7 @@ function tablasConColumnaSede(sql: string): string[] {
  * numerado nuevo, y entra en esta lista a mano, con su decisión escrita en
  * `supabase/squash/README.md` (5.3).
  */
-const MIGRACIONES_POSTERIORES = ["002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql", "005_cop_whole_peso.sql", "006_installation_owner.sql"] as const;
+const MIGRACIONES_POSTERIORES = ["002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql", "005_cop_whole_peso.sql", "006_installation_owner.sql", "007_money_cap_policy.sql"] as const;
 
 /**
  * Top-level statements of a SQL file, comments removed. Splits on `;` only
@@ -954,12 +954,11 @@ describe("el squash: `001_orabella_schema.sql` es el archivo vivo (squash de la 
       .sort();
     expect(porNombre).toEqual([SQUASH_NAME, ...MIGRACIONES_POSTERIORES]);
 
-    // Orden ESTRICTO: 001, 002, 003… sin huecos ni números repetidos. El orden
-    // de aplicación es el orden de nombre, así que un hueco o un duplicado es
-    // una ambigüedad de arranque.
-    expect(porNombre.map((nombre) => Number(nombre.slice(0, 3)))).toEqual(
-      porNombre.map((_, indice) => indice + 1),
-    );
+    // Orden ESTRICTO de los números asignados: no se reutiliza un hueco de una
+    // migración retirada; el orden de aplicación sigue siendo el de nombre.
+    const numbers = porNombre.map((nombre) => Number(nombre.slice(0, 3)));
+    expect(new Set(numbers).size).toBe(numbers.length);
+    expect(numbers).toEqual([...numbers].sort((left, right) => left - right));
   });
 
   it("002 stays narrow, 003 is restricted, and 004 contains only the literal search RPC", () => {

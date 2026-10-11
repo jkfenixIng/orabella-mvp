@@ -29,7 +29,8 @@ import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
 import { requireSedeRole } from "@/src/shared/lib/sede";
 import { dayBounds } from "@/src/shared/lib/dates";
-import { COP_WHOLE_PESO_MESSAGE, copExceeds, copValidationError } from "@/src/shared/money/cop";
+import { COP_WHOLE_PESO_MESSAGE, copValidationError } from "@/src/shared/money/cop";
+import { invoicePaymentCapExceeded } from "@/src/shared/money/caps";
 import { listPaymentMethods, listServices, listTaxes } from "@/src/features/admin/service";
 import {
   getProductsStock,
@@ -2395,7 +2396,11 @@ export async function splitPayment(
   // contra total era lo que marcaba Pagada sin neto completo.
   // Values may contain historical cents, so completion compares their rounded
   // peso values. New payments and new totals are always integers.
-  const fullyPaid = !copExceeds(balance.netBilled, balance.netCollected + netSum);
+  const fullyPaid = !invoicePaymentCapExceeded({
+    alreadyPaid: balance.netCollected,
+    incoming: netSum,
+    cap: balance.netBilled,
+  });
   // CL-11: la DECISIÓN de cerrar la factura se toma acá (con `fullyPaid` y el
   // estado leído) y viaja como un booleano: la transacción no compara el cobrado
   // contra el facturado ni una vez.

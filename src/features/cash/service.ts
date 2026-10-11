@@ -41,7 +41,8 @@ import {
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
 import { requireSedeRole } from "@/src/shared/lib/sede";
-import { COP_WHOLE_PESO_MESSAGE, copExceeds, copSchema, copValidationError, positiveCopSchema } from "@/src/shared/money/cop";
+import { COP_WHOLE_PESO_MESSAGE, copSchema, copValidationError, positiveCopSchema } from "@/src/shared/money/cop";
+import { invoicePaymentCapExceeded } from "@/src/shared/money/caps";
 import {
   chunkIds,
   PagedReadError,
@@ -1457,14 +1458,18 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
       // la porción entra en neto (bruto − recargo). El bruto de un cobro con
       // tarjeta supera `invoices.total` cuando el recargo es de un cobro
       // POSTERIOR a la emisión: comparar el bruto contra el total rechazaba
-      // como "sobrepago" un cobro legítimo. Mismo tope y tolerancia que el
-      // trigger de 031 (0.009), que es la barrera real ante carreras.
+      // como "sobrepago" un cobro legítimo. El predicado compartido compara el
+      // mismo neto en pesos enteros que el trigger (la barrera real ante carreras).
       invoiceBalance = invoiceNetBalance({
         total: detail.invoice.total,
         surcharge: detail.invoice.surcharge,
         payments: detail.payments,
       });
-      if (copExceeds(invoiceBalance.netCollected + cardFee.net, invoiceBalance.netBilled)) {
+      if (invoicePaymentCapExceeded({
+        alreadyPaid: invoiceBalance.netCollected,
+        incoming: cardFee.net,
+        cap: invoiceBalance.netBilled,
+      })) {
         throw new CashError("OVERPAID", "El pago supera el saldo pendiente de la factura.", 422);
       }
     }
