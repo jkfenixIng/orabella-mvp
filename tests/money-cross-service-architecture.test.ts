@@ -24,6 +24,10 @@ describe("money services cross-service boundary", () => {
     }
   });
 
+  it("admin service has no direct Supabase client", () => {
+    expect(code("src/features/admin/service.ts")).not.toMatch(/createAdminClient|supabase\/server|\.from\(|\.rpc\(/);
+  });
+
   it("admin collaborators used by money modules go through the catalogs port", () => {
     const admin = code("src/features/admin/service.ts");
     expect(exportedFunction(admin, "listAllEmployees")).toContain("catalogsRepo()");

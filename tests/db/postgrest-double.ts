@@ -8,7 +8,7 @@
  * It covers only the builder calls the repositories use: select (plain
  * column lists and a many-to-one embed `table(col)` resolved through the
  * `<singular>_id` foreign key, an object or null like PostgREST), count exact
- * head, in/eq/neq/is/gte/lte/match, `or` with `ilike` items, order,
+ * head, in/eq/neq/is/gte/lte/match, `or` with `ilike`/`eq`/`is.null` items, order,
  * range/limit, insert/upsert of one row or an array (upsert with an
  * onConflict column list, default id), update, delete, single and maybeSingle
  * (PGRST116 when the row count does not fit), and `rpc` with PostgREST's named
@@ -24,7 +24,7 @@ import type { Db } from "./harness";
 type Result = { data: unknown; count?: number | null; error: unknown };
 type Filter =
   | { column: string; op: "=" | "<>" | ">=" | "<=" | "in" | "is"; value: unknown }
-  | { op: "or"; items: Array<{ column: string; value: string }> };
+  | { op: "or"; items: OrItem[] };
 
 const ident = (name: string) => `"${name.replace(/"/g, '""')}"`;
 
@@ -34,13 +34,24 @@ function toPostgrestError(raw: unknown) {
   return { code: error.code ?? null, message: error.message, details: error.detail ?? null };
 }
 
+type OrItem = { column: string; op: "ilike" | "eq" | "is"; value: string };
+
 /** `col.ilike.value,col.ilike."value"` -> items; the PostgREST logic-tree grammar. */
 export function parseOrIlike(tree: string): Array<{ column: string; value: string }> {
-  const items: Array<{ column: string; value: string }> = [];
+  return parseOrTree(tree).map((item) => {
+    if (item.op !== "ilike") throw new Error(`unsupported or() item: ${item.column}.${item.op}`);
+    return { column: item.column, value: item.value };
+  });
+}
+
+/** `col.ilike|eq|is.value` items; `is` accepts only `null`, `*` is `%` only in ilike. */
+export function parseOrTree(tree: string): OrItem[] {
+  const items: OrItem[] = [];
   let rest = tree;
   while (rest.length > 0) {
-    const head = /^([a-z_]+)\.ilike\./.exec(rest);
+    const head = /^([a-z_]+)\.(ilike|eq|is)\./.exec(rest);
     if (!head) throw new Error(`unsupported or() item: ${rest}`);
+    const op = head[2] as OrItem["op"];
     rest = rest.slice(head[0].length);
     let value = "";
     if (rest.startsWith('"')) {
@@ -55,7 +66,8 @@ export function parseOrIlike(tree: string): Array<{ column: string; value: strin
       value = end === -1 ? rest : rest.slice(0, end);
       rest = end === -1 ? "" : rest.slice(end);
     }
-    items.push({ column: head[1], value: value.replace(/\*/g, "%") });
+    if (op === "is" && value !== "null") throw new Error(`unsupported is value: ${value}`);
+    items.push({ column: head[1], op, value: op === "ilike" ? value.replace(/\*/g, "%") : value });
     if (rest.startsWith(",")) rest = rest.slice(1);
     else if (rest.length > 0) throw new Error(`malformed or() filter near: ${rest}`);
   }
@@ -123,8 +135,13 @@ export function postgrestDouble(pg: Db, authAdmin?: AuthAdminDouble): SupabaseCl
             if (filter.op === "or") {
               return `(${filter.items
                 .map((item) => {
+                  if (item.op === "is") return `${ident(item.column)} IS NULL`;
                   params.push(item.value);
-                  return `${ident(item.column)} ILIKE $${params.length}`;
+                  // `eq` compares as text: PostgREST hands the literal to the column's input
+                  // function, so a malformed uuid is still data (22P02), never syntax.
+                  return item.op === "eq"
+                    ? `${ident(item.column)} = $${params.length}`
+                    : `${ident(item.column)} ILIKE $${params.length}`;
                 })
                 .join(" OR ")})`;
             }
@@ -273,7 +290,7 @@ export function postgrestDouble(pg: Db, authAdmin?: AuthAdminDouble): SupabaseCl
           return query;
         },
         or(tree: string) {
-          filters.push({ op: "or", items: parseOrIlike(tree) });
+          filters.push({ op: "or", items: parseOrTree(tree) });
           return query;
         },
         gte(column: string, value: unknown) {

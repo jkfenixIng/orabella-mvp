@@ -179,6 +179,7 @@ describe("src/shared/db is server only", () => {
     expect(statics).toEqual([]);
     expect(DISK.read("src/features/admin/repos/services.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
     expect(DISK.read("src/features/admin/repos/catalogs.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
+    expect(DISK.read("src/features/admin/repos/users.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
     expect(DISK.read("src/features/alerts/repos/alerts.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
     expect(DISK.read("src/features/inventory/repos/inventory.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
     expect(DISK.read("src/features/auth/repos/auth.ts")).toMatch(/import\("@\/src\/shared\/db\/client"\)/);
@@ -201,6 +202,7 @@ describe("src/shared/db is server only", () => {
     );
     expect(reached).toContain("src/features/admin/repos/services.ts");
     expect(reached).toContain("src/features/admin/repos/catalogs.ts");
+    expect(reached).toContain("src/features/admin/repos/users.ts");
     expect(reached).toContain("src/features/alerts/repos/alerts.ts");
     expect(reached).toContain("src/features/inventory/repos/inventory.ts");
     expect(reached).toContain("src/features/auth/repos/auth.ts");
@@ -224,6 +226,7 @@ describe("src/shared/db is server only", () => {
     const adapters = ALL_FILES.filter((file) => file.endsWith(".drizzle.ts"));
     expect(adapters).toEqual(
       expect.arrayContaining([
+        "src/features/admin/repos/users.drizzle.ts",
         "src/features/inventory/repos/inventory.drizzle.ts",
         "src/features/auth/repos/auth.drizzle.ts",
         "src/features/commissions/repos/commissions.drizzle.ts",

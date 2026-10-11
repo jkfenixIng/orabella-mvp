@@ -7,9 +7,9 @@
  * extraction, unchanged. `./catalogs.drizzle.ts` is loaded with import() only
  * when DB_ENGINE=postgres. Both throw `DbQueryError` on a database failure.
  *
- * Out of this port on purpose (still supabase-js in the service): reads with
- * the `roles(code)` embed, the `upsert_employee_atomic` / `replace_user_roles`
- * RPCs and the `.or()` user listing.
+ * User management (the `roles(code)` embed, the `upsert_employee_atomic` /
+ * `replace_user_roles` RPCs and the installation user listing) lives in the
+ * sibling port `./users.ts`.
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { getDbConfig } from "@/src/shared/config/env";

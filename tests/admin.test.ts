@@ -1902,7 +1902,7 @@ describe("admin: la cadencia de pago se persiste y viaja por el legajo (F2)", ()
 
   // ---- guardas de fuente: el select, la migración y la UI -----------------
   const serviceSource = readFileSync(
-    join(process.cwd(), "src", "features", "admin", "service.ts"),
+    join(process.cwd(), "src", "features", "admin", "repos", "users.ts"),
     "utf8",
   );
   const employeesSection = readFileSync(

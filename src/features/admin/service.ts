@@ -17,6 +17,7 @@ import { readAllPaged } from "@/src/shared/lib/paged";
 import { unstable_cache } from "next/cache";
 import { servicesRepo, type ServiceRow } from "./repos/services";
 import { catalogsRepo } from "./repos/catalogs";
+import { adminUsersRepo } from "./repos/users";
 import { DbQueryError } from "@/src/shared/db/errors";
 
 // Compatibilidad: la identidad de estos guardas vive en
@@ -39,15 +40,6 @@ export {
  * El split físico en módulos se difiere a post-pruebas para no romper
  * los 12 importadores activos; el código nuevo usa `@/src/shared/lib/sede.ts`.
  */
-
-/**
- * Cliente privilegiado bajo demanda (service_role, solo servidor).
- * Import dinámico para que los tests unitarios (sin red/env) nunca lo carguen.
- */
-async function adminDb() {
-  const { createAdminClient } = await import("@/src/shared/lib/supabase/server");
-  return createAdminClient();
-}
 
 /**
  * Límite de lectura para listados (navegación instantánea): todo listado
@@ -119,9 +111,6 @@ export async function requireSession(token: string | null | undefined): Promise<
  */
 
 // ------------------------------------------------------------- empleados ---
-const EMPLOYEE_SELECT =
-  "id, user_id, full_name, employee_code, document, phone, position, payout_mode, email, birth_date, pay_type, pay_frequency, salary_fixed, commission_percent, is_active";
-
 /**
  * F2: `pay_frequency` is always selected; `null` means no declared cadence.
  * Re-exported from the port so both adapters have exactly this domain contract.
@@ -199,36 +188,16 @@ export async function getEmployee(id: string): Promise<EmployeeRow> {
  * reúne sus cuentas más las que todavía no tienen ninguna.
  */
 export async function listSedeUsers(sedeId: string): Promise<SedeUserRow[]> {
-  const db = await adminDb();
-  const { data: users, error } = await db
-    .from("users")
-    .select("id, sede_id, full_name, id_number")
-    .or(`sede_id.eq.${sedeId},sede_id.is.null`)
-    .order("full_name");
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
-  const rows = (users ?? []) as Array<{ id: string; sede_id: string | null; full_name: string; id_number: string }>;
-  const { data: roleRows, error: roleError } = await db
-    .from("user_roles")
-    .select("user_id, roles(code)")
-    .in(
-      "user_id",
-      rows.map((row) => row.id),
-    );
-  if (roleError) throw new AdminError("INTERNAL", "Error interno.", 500);
+  // Data access goes through `./repos/users` (DB_ENGINE). Intentional change on
+  // both engines: the sede is a quoted/typed value, never PostgREST syntax, and
+  // the order is total (full_name, id).
+  const repo = await adminUsersRepo();
+  const rows = await internalOnFailure(() => repo.listSedeUsers(sedeId));
+  const roleRows = await internalOnFailure(() => repo.roleEmbeds(rows.map((row) => row.id)));
   const byUser = new Map<string, RoleCode[]>();
-  for (const row of (roleRows ?? []) as unknown as Array<{
-    user_id: string;
-    roles: { code: string } | Array<{ code: string }> | null;
-  }>) {
-    const codes = Array.isArray(row.roles)
-      ? row.roles.map((item) => item.code)
-      : row.roles
-        ? [row.roles.code]
-        : [];
-    for (const code of codes) {
-      if (!isRoleCode(code)) continue;
-      byUser.set(row.user_id, [...(byUser.get(row.user_id) ?? []), code]);
-    }
+  for (const code of roleRows) {
+    if (!code.roles || !isRoleCode(code.roles.code)) continue;
+    byUser.set(code.user_id, [...(byUser.get(code.user_id) ?? []), code.roles.code]);
   }
   return rows.map((row) => ({ ...row, roles: byUser.get(row.id) ?? [] }));
 }
@@ -247,7 +216,7 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const input: EmployeeInput = parsed.data;
   const code = normalizeEmployeeCode(input.employee_code);
-  const db = await adminDb();
+  const repo = await adminUsersRepo();
 
   // Vínculo automático por documento (no editable): el usuario de acceso
   // es el de la sede con el mismo documento. El user_id que traiga el input se
@@ -258,33 +227,18 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
   // y el legajo: un usuario creado desde el cliente era la mitad de la ventana
   // —quedaba con login y rol, y sin legajo, cuando la escritura siguiente
   // fallaba—.
-  const { data: linked, error: linkedError } = await db
-    .from("users")
-    .select("id")
-    .eq("id_number", input.document)
-    .maybeSingle();
-  if (linkedError) throw new AdminError("INTERNAL", "Error interno.", 500);
-  const userId = (linked as { id: string } | null)?.id ?? null;
+  const linked = await internalOnFailure(() => repo.findUserByDocument(input.document));
+  const userId = linked?.id ?? null;
   if (userId) {
-    let takenQuery = db.from("employees").select("id").eq("user_id", userId).limit(1);
-    if (input.id) takenQuery = takenQuery.neq("id", input.id);
-    const { data: taken, error: takenError } = await takenQuery;
-    if (takenError) throw new AdminError("INTERNAL", "Error interno.", 500);
-    if (taken && taken.length > 0) {
+    const taken = await internalOnFailure(() => repo.employeeForUser(userId, input.id));
+    if (taken.length > 0) {
       throw new AdminError("USER_ALREADY_LINKED", "Ese documento ya está vinculado a otro empleado.", 409);
     }
   }
 
   if (code !== null) {
-    let conflictQuery = db
-      .from("employees")
-      .select("id")
-      .eq("employee_code", code)
-      .limit(1);
-    if (input.id) conflictQuery = conflictQuery.neq("id", input.id);
-    const { data: conflicts, error: conflictError } = await conflictQuery;
-    if (conflictError) throw new AdminError("INTERNAL", "Error interno.", 500);
-    if (conflicts && conflicts.length > 0) {
+    const conflicts = await internalOnFailure(() => repo.employeeCodeConflicts(code, input.id));
+    if (conflicts.length > 0) {
       throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
     }
   }
@@ -356,64 +310,41 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
   };
 
   if (!input.id) {
-    const { data: creado, error: altaError } = await db.rpc("upsert_employee_atomic", {
-      // El legajo NO lleva la sede: `employees.sede_id` se borra en la 077 y la
-      // guarda de `upsert_employee_atomic` que exigía la clave desaparece con
-      // ella. Mandarla sería mandar un dato que nadie lee.
-      //
-      // La cuenta de acceso SÍ la lleva: `users.sede_id` sobrevive a propósito
-      // (es el anclaje de la cuenta a la instalación y el origen de
-      // `session.sedeId`), así que `p_create_user.sede_id` se sigue mandando
-      // abajo, y es la que ancla la fila de `users` en la instalación única.
-      p_employee: columnasDelLegajo,
-      p_user_id: userId,
-      p_create_user: userId
-        ? null
-        : {
-            sede_id: sedeId,
-            email: input.email?.trim() ? input.email.trim() : null,
-            phone: input.phone ?? null,
-            id_type: "CC",
-            id_number: input.document,
-            password_hash: await hashPassword(input.document),
-            full_name: input.full_name,
-          },
-      p_role_code: "empleado",
-    });
-    if (altaError) {
-      if ((altaError as { code?: string }).code === "23505") {
-        throw new AdminError(
-          "EMPLOYEE_CODE_TAKEN",
-          "El código de empleado ya existe.",
-          409,
-        );
+    // El legajo NO lleva la sede (`employees.sede_id` se borró en la 077); la
+    // cuenta de acceso SÍ: `p_create_user.sede_id` ancla la fila de `users` a la
+    // instalación y es el origen de `session.sedeId`.
+    let created: EmployeeRow | null;
+    try {
+      created = await repo.upsertEmployeeAtomic(columnasDelLegajo, userId, userId ? null : {
+        sede_id: sedeId,
+        email: input.email?.trim() ? input.email.trim() : null,
+        phone: input.phone ?? null,
+        id_type: "CC",
+        id_number: input.document,
+        password_hash: await hashPassword(input.document),
+        full_name: input.full_name,
+      });
+    } catch (error) {
+      if (error instanceof DbQueryError && error.error.code === "23505") {
+        throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
       }
       throw new AdminError("INTERNAL", "Error interno.", 500);
     }
-    if (!creado) throw new AdminError("INTERNAL", "Error interno.", 500);
-    return creado as EmployeeRow;
+    if (!created) throw new AdminError("INTERNAL", "Error interno.", 500);
+    return created;
   }
 
-  const payload = {
-    ...(input.id ? { id: input.id } : {}),
-    ...columnasDelLegajo,
-    user_id: userId,
-  };
-  const { data, error } = await db
-    .from("employees")
-    .upsert(payload, { onConflict: "id" })
-    .select(EMPLOYEE_SELECT)
-    .single();
-  // 23505: carrera perdida contra el índice parcial (doble escritura
-  // simultánea); se traduce al mismo error de negocio.
-  if (error) {
-    if ((error as { code?: string }).code === "23505") {
+  let data: EmployeeRow | null;
+  try {
+    data = await repo.upsertEmployee({ id: input.id, ...columnasDelLegajo, user_id: userId });
+  } catch (error) {
+    if (error instanceof DbQueryError && error.error.code === "23505") {
       throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
     }
     throw new AdminError("INTERNAL", "Error interno.", 500);
   }
   if (!data) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return data as EmployeeRow;
+  return data;
 }
 
 // -------------------------------------------------------------- services ---
@@ -568,20 +499,9 @@ export function paymentMethodWriteError(
  * mirar el conjunto actual antes de pedirlo.
  */
 async function currentRoleCodes(userId: string): Promise<RoleCode[]> {
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("user_roles")
-    .select("roles(code)")
-    .eq("user_id", userId);
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
-  const codes: RoleCode[] = [];
-  for (const row of (data ?? []) as unknown as Array<{
-    roles: { code: string } | Array<{ code: string }> | null;
-  }>) {
-    const embedded = Array.isArray(row.roles) ? row.roles : row.roles ? [row.roles] : [];
-    for (const item of embedded) if (isRoleCode(item.code)) codes.push(item.code);
-  }
-  return codes;
+  const repo = await adminUsersRepo();
+  const rows = await internalOnFailure(() => repo.userRoleEmbeds(userId));
+  return rows.flatMap((row) => row.roles && isRoleCode(row.roles.code) ? [row.roles.code] : []);
 }
 
 /**
@@ -651,13 +571,13 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
     );
   }
 
-  const db = await adminDb();
-
-  const { data, error } = await db.rpc("replace_user_roles", {
-    p_user_id: parsed.data.user_id,
-    p_role_codes: parsed.data.roles,
-  });
-  if (error) throw roleReplacementError(error);
+  const repo = await adminUsersRepo();
+  let data: unknown;
+  try {
+    data = await repo.replaceUserRoles(parsed.data.user_id, parsed.data.roles);
+  } catch (error) {
+    throw roleReplacementError(error instanceof DbQueryError ? { code: error.error.code ?? undefined, message: error.error.message } : {});
+  }
 
   // Post-condición: se reporta éxito sólo si la base devolvió el conjunto
   // pedido. Un arreglo vacío significa "no quedó ningún rol aplicado": eso
@@ -694,7 +614,7 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
 //     `p_create_user` de `upsert_employee_atomic` (065), que inserta en
 //     `employees` y en `users`.
 //   * `listSedeUsers` la trae de vuelta y la usa como predicado: la lectura
-//     devuelve `sede_id` y acota con `sede_id.eq.<sede>,sede_id.is.null`, para
+//     devuelve `sede_id` y acota con "sede_id = <sede> o sede_id nulo", para
 //     que las cuentas todavía sin sede no queden invisibles sin rol.
 //
 // Todo eso se retira con el borrado FÍSICO de la columna en la migración final

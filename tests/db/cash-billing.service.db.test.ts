@@ -5,8 +5,8 @@
  * client throws AND its calls are counted (a caller that swallows the error
  * still fails the run); the default engine must keep using Supabase.
  *
- * Out of 3b-3: admin user management (listSedeUsers, upsertEmployee,
- * currentRoleCodes, setUserRoles) still uses supabase-js and is not exercised.
+ * Admin user management (listSedeUsers, upsertEmployee, currentRoleCodes,
+ * setUserRoles) is exercised on both engines in admin-users.service.db.test.ts.
  */
 import { drizzle } from "drizzle-orm/pglite";
 import * as schema from "@/src/shared/db/schema";
