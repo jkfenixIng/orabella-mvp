@@ -1,5 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { DB_HOOK_TIMEOUT, closeDb, freshDb, setCopTriggers, one, pgError, readSchema, warmTemplate, type Db } from "./harness";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { DB_HOOK_TIMEOUT, MIGRATIONS_DIR, closeDb, freshDb, setCopTriggers, one, warmTemplate, type Db } from "./harness";
 import { insertEmployee, insertPeriod } from "./fixtures";
 import { MONEY_EPSILON, moneyEquals } from "@/src/features/billing/schemas";
 import { assertNoOverpay } from "@/src/features/payroll/schemas";
@@ -18,27 +20,22 @@ const sqlCapAllows = async (delta: number) =>
   (await one<{ allowed: boolean }>(db, `SELECT NOT ($1::numeric > 0.009) AS allowed`, [delta])).allowed;
 
 /**
- * Characterization only, no unification: SQL caps for invoice, payroll and
- * commission reject deltas > 0.009; cash reuses the invoice trigger. TS money
- * equality (COP policy) compares whole pesos, so every sub-peso delta is equal;
- * MONEY_EPSILON = 0.01 stays exported for history only. Legacy invoice cents are
- * compared against round(total - surcharge).
+ * 007 characterizes caps in rounded whole pesos: legacy cents remain stored but
+ * every sub-peso delta projects to the same cap. TS money equality follows the
+ * same policy; MONEY_EPSILON = 0.01 stays exported for history only.
  */
 describe("money tolerance characterization", () => {
-  it("the three SQL cap triggers still use the documented 0.009 predicate", () => {
-    const sql = readSchema();
-    expect(sql).toContain("IF v_paid_net + v_new_net - round(v_total - coalesce(v_surcharge, 0)) > 0.009 THEN");
-    expect(sql).toContain("IF v_paid + NEW.amount - v_net > 0.009 THEN");
-    expect(sql).toContain("IF v_paid + coalesce(NEW.amount, 0) - v_earned > 0.009 THEN");
+  it("the three SQL cap triggers use 007 whole-peso comparisons", () => {
+    const sql = readFileSync(join(MIGRATIONS_DIR, "007_money_cap_policy.sql"), "utf8");
+    expect(sql).toContain("IF round(v_paid_net + v_new_net) > round(v_total - coalesce(v_surcharge, 0)) THEN");
+    expect(sql).toContain("IF round(v_paid + NEW.amount) > round(v_net) THEN");
+    expect(sql).toContain("IF round(v_paid + coalesce(NEW.amount, 0)) > round(v_earned) THEN");
     expect(MONEY_EPSILON).toBe(0.01);
   });
 
   it.each(DELTAS)("delta %s: SQL caps vs TS predicates", async (delta) => {
     const sql = await sqlCapAllows(delta);
     expect(sql).toBe(delta <= 0.009);
-    // Commission and cash TS caps compare the raw delta with the same `> 0.009`.
-    expect(!(delta > 0.009)).toBe(sql);
-    // COP policy: TS equality compares rounded whole pesos (sub-peso deltas are equal).
     expect(moneyEquals(100 + delta, 100)).toBe(true);
   });
 
@@ -57,14 +54,10 @@ describe("money tolerance characterization", () => {
       [item.id, 100 + delta],
     );
     const tsAllows = (() => { try { assertNoOverpay({ alreadyPaid: 0, newAmount: 100 + delta, netPay: 100 }); return true; } catch { return false; } })();
-    const sqlAllows = Number(stored.amount) - 100 <= 0.009;
-    if (sqlAllows) await insert;
-    else expect((await pgError(insert)).message).toContain("supera el neto");
-    // Documented divergence: TS rounds to whole pesos before comparing, so every
-    // sub-peso delta passes the precheck; SQL stores cents and rejects >= 0.01.
-    // The trigger is the defense that remains authoritative for legacy cents.
+    // 007: the stored legacy cents round to the same whole peso, so SQL and TS agree.
+    await insert;
+    expect(Math.round(Number(stored.amount))).toBe(100);
     expect(tsAllows).toBe(true);
-    expect(sqlAllows).toBe(delta === 0);
   });
 
   it("legacy invoice cents: collectible is round(total - surcharge)", async () => {

@@ -220,17 +220,18 @@ describe("payout triggers stay the authority on both engines", () => {
   const efectivo = (side: Ctx, amount: number, key: string) =>
     side.repo.insertPayout(payout(side, amount, key, { method_code: "efectivo", earned_immediate: 1_000_000 }));
 
-  it("034: Σ + new = earned is accepted; one peso above is P0001 and writes nothing", async () => {
+  it("007: rounded whole-peso cap accepts legacy cents but rejects one peso above", async () => {
     await same((side) => side.repo.insertPayout(payout(side, 300, KEY)));
     await same((side) => side.repo.insertPayout(payout(side, 1, KEY_B)));
-    const over = await same((side) => side.repo.insertPayout(payout(side, 0.01, KEY_C)));
+    await same((side) => side.repo.insertPayout(payout(side, 0.01, KEY_C)));
+    const over = await same((side) => side.repo.insertPayout(payout(side, 1, "00000000-0000-4000-8000-000000000001")));
     expect(over.code).toBe("P0001");
     expect(over.message).toContain("El pago supera la comisión ganada");
     // A row without earned_immediate is rejected by the same trigger.
     const missing = await same((side) => side.repo.insertPayout(payout(side, 1, KEY_C, { earned_immediate: null as unknown as number })));
     expect(missing.code).toBe("P0001");
     for (const side of ctx) {
-      expect((await one<{ n: number }>(side.db, `SELECT count(*)::int AS n FROM public.commission_payouts`)).n).toBe(2);
+      expect((await one<{ n: number }>(side.db, `SELECT count(*)::int AS n FROM public.commission_payouts`)).n).toBe(3);
     }
   });
 
