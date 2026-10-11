@@ -105,9 +105,17 @@ export interface AuthAdminDouble {
   createUser(values: Record<string, unknown>): Promise<{ data: unknown; error: unknown }>;
 }
 
-export function postgrestDouble(pg: Db, authAdmin?: AuthAdminDouble): SupabaseClient {
+export function postgrestDouble(
+  pg: Db,
+  authAdmin?: AuthAdminDouble,
+  onRpc?: (fn: string, args: Record<string, unknown>) => void,
+): SupabaseClient {
   return {
-    rpc: (fn: string, args?: Record<string, unknown>) => rpc(pg, fn, args),
+    rpc: (fn: string, args?: Record<string, unknown>) => {
+      const named = args ?? {};
+      onRpc?.(fn, named);
+      return rpc(pg, fn, named);
+    },
     auth: { admin: authAdmin },
 
     from(table: string) {

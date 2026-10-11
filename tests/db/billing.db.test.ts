@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { DB_HOOK_TIMEOUT, closeDb, count, freshDb, one, pgError, rpc, warmTemplate, type Db } from "./harness";
+import { applyMovementStock, planStockReversals } from "@/src/features/inventory/schemas";
 import {
   closeShiftCall,
   createInvoiceCall,
@@ -111,6 +112,37 @@ describe("invoice_annul_atomic", () => {
     // A second annulment with the old precondition loses the CAS.
     expect((await pgError(annul(invoice.id as string, "Emitida", items))).message).toBe("ANNUL_CONFLICT");
     expect(await count(db, `SELECT 1 FROM public.inventory_movements WHERE type = 'IN'`)).toBe(1);
+  });
+
+  it("matches the TypeScript IN reversal projection, preserves every line and has no max-stock rule", async () => {
+    const product = await insertProduct(db, 2);
+    const invoice = await createInvoiceCall(db, { user, shift, employee, product: { id: product, qty: 2 } });
+    const reversals = planStockReversals([
+      { product_id: product, qty: 1, reason: "linea uno" },
+      { product_id: product, qty: 1, reason: "linea dos" },
+    ]);
+    expect(reversals).toEqual([
+      { product_id: product, qty: 1, reason: "linea uno" },
+      { product_id: product, qty: 1, reason: "linea dos" },
+    ]);
+    expect(applyMovementStock(0, "IN", 2)).toBe(2);
+    await annul(invoice.id as string, "Emitida", reversals);
+    expect((await one<{ stock_qty: number }>(db, `SELECT stock_qty FROM public.products WHERE id = $1`, [product])).stock_qty).toBe(2);
+    expect(await count(db, `SELECT 1 FROM public.inventory_movements WHERE product_id = $1 AND type = 'IN'`, [product])).toBe(2);
+    // PostgreSQL has no max-stock constraint: a large IN remains legal and TS
+    // intentionally makes the same decision.
+    expect(applyMovementStock(2, "IN", 999_999_999)).toBe(1_000_000_001);
+    await db.query(`INSERT INTO public.inventory_movements (product_id, type, qty, reason, user_id) VALUES ($1, 'IN', 999999999, 'sin tope', $2)`, [product, user]);
+    expect((await one<{ stock_qty: number }>(db, `SELECT stock_qty FROM public.products WHERE id = $1`, [product])).stock_qty).toBe(1_000_000_001);
+  });
+
+  it("rejects a zero-quantity reversal in TS and in the RPC without annulling", async () => {
+    const product = await insertProduct(db, 1);
+    const invoice = await createInvoiceCall(db, { user, shift, employee, product: { id: product, qty: 1 } });
+    const zero = [{ product_id: product, qty: 0, reason: "cero" }];
+    expect(() => planStockReversals(zero)).toThrow("INVALID_QTY");
+    expect((await pgError(annul(invoice.id as string, "Emitida", zero))).message).toBe("ANNUL_INVALID");
+    expect((await one<{ status: string }>(db, `SELECT status FROM public.invoices WHERE id = $1`, [invoice.id])).status).toBe("Emitida");
   });
 
   it("rolls the annulment back when a reversal targets an unknown product", async () => {

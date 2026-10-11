@@ -4,6 +4,17 @@ import { describe, expect, it } from "vitest";
 
 const source = (path: string) => readFileSync(join(process.cwd(), path), "utf8");
 
+function exportedFunction(sourceText: string, name: string): string {
+  const start = sourceText.search(new RegExp(`export (?:async )?function ${name}\\b`));
+  expect(start, name).toBeGreaterThanOrEqual(0);
+  const next = sourceText.slice(start + 1).search(/\nexport /);
+  return next < 0 ? sourceText.slice(start) : sourceText.slice(start, start + 1 + next);
+}
+
+function expectsStockProjection(writer: string): void {
+  expect(writer).toMatch(/planStockDeduction\(|applyMovementStock\(|planStockReversals\(|projectStockMovements\(/);
+}
+
 describe("Fase 4 authority boundaries", () => {
   it("routes TS stock writers through the authoritative projections", () => {
     const inventory = source("src/features/inventory/service.ts");
@@ -12,6 +23,23 @@ describe("Fase 4 authority boundaries", () => {
     expect(inventory).toContain("planStockDeduction(lines, stockByProduct)");
     expect(billing.match(/planStockDeduction\(/g)?.length).toBeGreaterThanOrEqual(3);
     expect(billing).not.toMatch(/registerMovement\(/);
+  });
+
+  it("every exported writer that sends movements to an RPC/table uses a stock projection", () => {
+    const billing = source("src/features/billing/service.ts");
+    const inventory = source("src/features/inventory/service.ts");
+    for (const name of ["createInvoice", "annulInvoice", "editInvoiceItems", "editEmittedInvoiceItems"]) {
+      expectsStockProjection(exportedFunction(billing, name));
+    }
+    for (const name of ["registerMovement", "deductStock"]) expectsStockProjection(exportedFunction(inventory, name));
+    const annul = exportedFunction(billing, "annulInvoice");
+    expect(annul.indexOf("planStockReversals(")).toBeLessThan(annul.indexOf("db.annulInvoiceAtomic"));
+    expect(annul).toMatch(/items: reversals\.map/);
+  });
+
+  it("negative fixture: an annulment that sends raw reversals is detected", () => {
+    const bypass = `export async function annulInvoice() { const reversals = buildReversalReasons(args); await db.annulInvoiceAtomic({ items: reversals }); }`;
+    expect(() => expectsStockProjection(exportedFunction(bypass, "annulInvoice"))).toThrow();
   });
 
   it("admin role writers use the pure role policy before the SQL unit of work", () => {
@@ -40,6 +68,7 @@ describe("Fase 4 authority boundaries", () => {
     expect(auth).toContain("isResetTokenUsable");
     expect(auth).toContain(".confirmPasswordReset({ tokenHash, passwordHash");
     expect(sql).toContain("CREATE TRIGGER trg_inventory_apply_stock");
+    expect(sql).toContain("CREATE FUNCTION public.invoice_annul_atomic");
     expect(sql).toContain("CREATE FUNCTION public.confirm_password_reset");
     expect(sql).toContain("CREATE FUNCTION public.payroll_delete_period_atomic");
   });

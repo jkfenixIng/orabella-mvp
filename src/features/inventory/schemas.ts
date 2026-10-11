@@ -288,6 +288,29 @@ export function projectStockMovements(
   return projected;
 }
 
+export interface StockReversalLine {
+  product_id: string;
+  qty: number;
+  reason: string;
+}
+
+/**
+ * Application authority for annulment reversals: one IN per invoice line (the
+ * kardex keeps every line, so nothing is aggregated) validated through
+ * `projectStockMovements`. The lines are returned unchanged. There is no upper
+ * business-stock rule in the application; PostgreSQL's integer representation
+ * remains the physical range defense.
+ */
+export function planStockReversals(lines: readonly StockReversalLine[]): StockReversalLine[] {
+  // IN never depends on the current stock, so no read is needed; a missing
+  // product is still rejected by the RPC count net (PRODUCT_NOT_FOUND).
+  projectStockMovements(
+    lines.map((line) => ({ product_id: line.product_id, type: "IN" as const, qty: line.qty })),
+    new Map(),
+  );
+  return lines.map((line) => ({ product_id: line.product_id, qty: line.qty, reason: line.reason }));
+}
+
 /**
  * Aplica un movimiento al stock en memoria. Lanza INSUFFICIENT_STOCK si un
  * OUT dejaría el stock negativo (misma regla que el trigger

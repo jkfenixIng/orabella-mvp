@@ -36,7 +36,11 @@ import {
   InventoryError,
   type StockEntry,
 } from "@/src/features/inventory/service";
-import { planStockDeduction, type PlannedDeduction } from "@/src/features/inventory/schemas";
+import {
+  planStockDeduction,
+  planStockReversals,
+  type PlannedDeduction,
+} from "@/src/features/inventory/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import {
   chunkIds,
@@ -1438,11 +1442,16 @@ export async function annulInvoice(
   const productItems = detail.items
     .filter((item) => item.item_type === "producto" && item.product_id)
     .map((item) => ({ product_id: item.product_id as string, qty: item.qty }));
-  const reversals = buildReversalReasons({
-    consecutiveNumber: detail.invoice.consecutive_number,
-    motivo,
-    productItems,
-  });
+  // Every movement path goes through the application stock projection. An
+  // annulment is an IN-only projection: the SQL trigger still writes it under
+  // the invoice CAS, but TypeScript owns the validation and payload decision.
+  const reversals = planStockReversals(
+    buildReversalReasons({
+      consecutiveNumber: detail.invoice.consecutive_number,
+      motivo,
+      productItems,
+    }),
+  );
 
   const { data: written, error: annulError } = await db.annulInvoiceAtomic<InvoiceRow>({
     invoiceId: id,
