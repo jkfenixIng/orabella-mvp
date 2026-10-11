@@ -5,10 +5,13 @@ import {
   assertShiftCloser,
   buildMethodViews,
   buildRecountRecord,
+  CASH_OUT_LIMIT_CODE,
+  cashOutLimitViolation,
   closeShiftSchema,
   computeCashClose,
   dayBounds,
   dayViewSchema,
+  drawerMethodCode,
   expectedDigitalTotal,
   governingClose,
   HISTORY_PAGE_SIZE,
@@ -22,6 +25,7 @@ import {
   resolveOpeningBase,
   roundMoney,
   moneyEquals,
+  methodAvailability,
   sumMethodMaps,
   sumMethodTotal,
   voucherOutByMethod,
@@ -37,6 +41,8 @@ import {
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
 import { requireSedeRole } from "@/src/shared/lib/sede";
+import { COP_WHOLE_PESO_MESSAGE, copSchema, copValidationError, positiveCopSchema } from "@/src/shared/money/cop";
+import { invoicePaymentCapExceeded } from "@/src/shared/money/caps";
 import {
   chunkIds,
   PagedReadError,
@@ -60,6 +66,7 @@ import { getShiftReviews } from "@/src/features/alerts/service";
 import { assembleShiftRevision, type ShiftRevision } from "@/src/features/alerts/schemas";
 import { unstable_cache } from "next/cache";
 import { z } from "zod";
+import { cashRepo, type CashRepo } from "./repos/cash";
 
 export class CashError extends Error {
   readonly code: string;
@@ -74,15 +81,15 @@ export class CashError extends Error {
 }
 
 /**
- * Cliente privilegiado bajo demanda (service_role, solo servidor).
- * Import dinámico para que los tests unitarios (sin red/env) nunca lo carguen.
+ * The cash data port for the configured engine (DB_ENGINE, resolved lazily so
+ * unit tests without env never load a driver). Each operation takes ONE
+ * repository and passes it down: engines are never mixed inside an operation.
  */
-async function cashDb() {
-  const { createAdminClient } = await import("@/src/shared/lib/supabase/server");
-  return createAdminClient();
+async function cashDb(): Promise<CashRepo> {
+  return cashRepo();
 }
 
-type DbClient = Awaited<ReturnType<typeof cashDb>>;
+type DbClient = CashRepo;
 
 function validationMessage(error: { issues: Array<{ message: string }> }): string {
   return error.issues[0]?.message ?? "Datos inválidos.";
@@ -116,8 +123,21 @@ export async function requireCashWriter(
   return { userId: session.user.id, sedeId: session.user.sede_id, roles: session.roles };
 }
 
+/** Cash's COP write boundary: 005 is always a 400 before business P0001 rules. */
+function cashCopValidation(error: unknown): CashError | null {
+  return copValidationError(error, () => new CashError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400));
+}
+
+/** Throws the shared 005 validation result; non-COP errors keep their local mapping. */
+function throwCashCop(error: unknown): void {
+  const cop = cashCopValidation(error);
+  if (cop) throw cop;
+}
+
 function toCashError(error: unknown): CashError {
   if (error instanceof CashError) return error;
+  const cop = cashCopValidation(error);
+  if (cop) return cop;
   // CL-21: una lectura exhaustiva que no se completó no puede degradar a
   // "Error interno". El código de la lectura (`READ_INCOMPLETE`) y la fila donde
   // se cortó son lo que hace accionable el fallo; perderlos sería justo lo
@@ -189,12 +209,6 @@ export interface CashPaymentRow {
   created_at: string;
 }
 
-const REGISTER_SELECT = "id, name, base_configurada, is_active";
-const SHIFT_SELECT =
-  "id, cash_register_id, opened_by, closed_by, opened_at, closed_at, opening_base, expected_cash, counted_cash, base_left, cash_withdrawn, base_difference, status, observation";
-const PAYMENT_SELECT =
-  "id, cash_shift_id, invoice_id, method_id, method_code, amount, user_id, created_at";
-
 export interface CashActor {
   userId: string;
   roles?: RoleCode[];
@@ -222,13 +236,9 @@ export interface CashDenominationRow {
 /** Denominaciones activas (configurables desde el admin). */
 async function fetchDenominations(): Promise<CashDenominationRow[]> {
   const db = await cashDb();
-  const { data, error } = await db
-    .from("cash_denominations")
-    .select("id, kind, value, is_active")
-    .eq("is_active", true)
-    .order("value", { ascending: false });
+  const { data, error } = await db.listActiveDenominations<CashDenominationRow>();
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as CashDenominationRow[];
+  return data ?? [];
 }
 
 export const listDenominations = unstable_cache(fetchDenominations, ["cash:denominations"], {
@@ -248,7 +258,7 @@ export async function upsertDenomination(raw: unknown, actor: CashActor): Promis
   const parsed = z.object({
     id: z.uuid().optional(),
     kind: z.enum(["billete", "moneda"]),
-    value: z.coerce.number().positive(),
+    value: positiveCopSchema("La denominación debe ser mayor a 0."),
     is_active: z.boolean().optional(),
   }).safeParse(raw);
   if (!parsed.success) {
@@ -258,14 +268,11 @@ export async function upsertDenomination(raw: unknown, actor: CashActor): Promis
   const payload = {
     ...(parsed.data.id ? { id: parsed.data.id } : {}),
     kind: parsed.data.kind,
-    value: roundMoney(parsed.data.value),
+    value: parsed.data.value,
     ...(parsed.data.is_active !== undefined ? { is_active: parsed.data.is_active } : {}),
   };
-  const { data, error } = await db
-    .from("cash_denominations")
-    .upsert(payload, { onConflict: "id" })
-    .select("id, kind, value, is_active")
-    .single();
+  const { data, error } = await db.upsertDenomination<CashDenominationRow>(payload);
+  throwCashCop(error);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
   return data as CashDenominationRow;
 }
@@ -277,7 +284,7 @@ export async function upsertDenomination(raw: unknown, actor: CashActor): Promis
  */
 export async function deleteDenomination(id: string): Promise<void> {
   const db = await cashDb();
-  const { error } = await db.from("cash_denominations").delete().eq("id", id);
+  const { error } = await db.deleteDenomination(id);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
 }
 
@@ -292,7 +299,7 @@ export async function checkCounts(
   counts: ShiftCountInput[],
 ): Promise<Map<string, number>> {
   const methods = await listPaymentMethods();
-  const allowed = new Map(methods.filter((m) => m.is_active && m.arqueable).map((m) => [m.code, m]));
+  const allowed = new Map(methods.filter((m) => m.is_active && m.arqueo_mode !== "none").map((m) => [m.code, m]));
   const denominations = new Set((await listDenominations()).map((d) => Number(d.value)));
   const byMethod = new Map<string, ShiftCountInput[]>();
   for (const line of counts) {
@@ -300,15 +307,19 @@ export async function checkCounts(
     if (!method) {
       throw new CashError("VALIDATION", `Método no arqueable: ${line.method_code}.`, 400);
     }
-    if (line.method_code === "efectivo") {
+    // `arqueo_mode` exists after 003. The line-shape fallback only keeps the
+    // application compatible while an old response is cached; it never names a
+    // payment-method code.
+    const arqueoMode = method.arqueo_mode ?? (line.denomination == null ? "declared_total" : "denominations");
+    if (arqueoMode === "denominations") {
       if (line.denomination == null || !denominations.has(Number(line.denomination))) {
         throw new CashError("VALIDATION", "Denominación no configurada en la instalación.", 400);
       }
       if (!moneyEquals(line.amount, roundMoney(line.denomination * line.quantity))) {
-        throw new CashError("COUNT_MISMATCH", "El detalle del efectivo no cuadra con el total.", 422);
+        throw new CashError("COUNT_MISMATCH", "El detalle por denominación no cuadra con el total.", 422);
       }
     } else if (line.denomination != null || line.quantity !== 1) {
-      throw new CashError("VALIDATION", "Los métodos digitales se declaran con el total.", 400);
+      throw new CashError("VALIDATION", `${method.name} se declara con el total.`, 400);
     }
     const group = byMethod.get(line.method_code) ?? [];
     group.push(line);
@@ -362,13 +373,7 @@ async function fetchCountTotals(
     table: "cash_shift_counts",
     what: "los conteos del turno",
     values: shiftIds,
-    fetchPage: (chunk, from, to) =>
-      db
-        .from("cash_shift_counts")
-        .select("shift_id, phase, method_code, amount")
-        .in("shift_id", chunk)
-        .order("id")
-        .range(from, to),
+    fetchPage: (chunk, from, to) => db.shiftCountsPage(chunk, from, to),
   });
   for (const row of rows) {
     const entry = result.get(row.shift_id) ?? {
@@ -478,13 +483,7 @@ async function fetchPayoutTotals(
     table: "commission_payouts",
     what: "los pagos de comisión del turno",
     values: shiftIds,
-    fetchPage: (chunk, from, to) =>
-      db
-        .from("commission_payouts")
-        .select("cash_shift_id, method_code, amount")
-        .in("cash_shift_id", chunk)
-        .order("id")
-        .range(from, to),
+    fetchPage: (chunk, from, to) => db.payoutsByShiftsPage(chunk, from, to),
   });
   for (const row of rows) {
     const byMethod = result.get(row.cash_shift_id) ?? new Map<string, number>();
@@ -495,22 +494,12 @@ async function fetchPayoutTotals(
 }
 
 // 028 (method_code/cash_shift_id en voucher_requests) puede no estar aplicada
-// en esta base: la primera consulta decide y se cachea. Sin las columnas
-// simplemente no hay salidas por vale (el arqueo no se rompe). Un error
-// distinto (red/permisos) no se cachea: la consulta real lo reporta.
-let voucherOutColumns: boolean | null = null;
-
+// en esta base: la primera consulta decide y se cachea (en el adaptador
+// supabase; el motor postgres corre sobre 001-004, donde siempre existen). Sin
+// las columnas simplemente no hay salidas por vale (el arqueo no se rompe). Un
+// error distinto (red/permisos) no se cachea: la consulta real lo reporta.
 async function hasVoucherOutColumns(db: DbClient): Promise<boolean> {
-  if (voucherOutColumns === null) {
-    const probe = await db.from("voucher_requests").select("method_code, cash_shift_id").limit(1);
-    if (!probe.error) {
-      voucherOutColumns = true;
-    } else {
-      const message = String((probe.error as { message?: string }).message ?? "");
-      if (/method_code|cash_shift_id/i.test(message)) voucherOutColumns = false;
-    }
-  }
-  return voucherOutColumns !== false;
+  return db.voucherOutColumns();
 }
 
 /**
@@ -541,24 +530,19 @@ async function fetchVoucherOutRows(
   const rows = await readAllSourceInChunks<{
     cash_shift_id: string;
     approved_by: string | null;
+    status: string;
     method_code: string | null;
     amount: number | string;
   }>({
     table: "voucher_requests",
     what: "los vales del turno",
     values: shiftIds,
-    fetchPage: (chunk, from, to) =>
-      db
-        .from("voucher_requests")
-        .select("cash_shift_id, approved_by, method_code, amount")
-        .in("cash_shift_id", chunk)
-        .order("id")
-        .range(from, to),
+    fetchPage: (chunk, from, to) => db.vouchersByShiftsPage(chunk, from, to),
   });
   const byShift = new Map<string, VoucherCashOutInput[]>();
   for (const row of rows) {
     const list = byShift.get(row.cash_shift_id) ?? [];
-    list.push({ approved_by: row.approved_by, method_code: row.method_code, amount: row.amount });
+    list.push({ approved_by: row.approved_by, status: row.status, method_code: row.method_code, amount: row.amount });
     byShift.set(row.cash_shift_id, list);
   }
   for (const [shiftId, rows] of byShift) {
@@ -592,15 +576,80 @@ async function fetchVoucherOutTotals(
  * Reutiliza exactamente la misma lógica del arqueo (fetchVoucherOutTotals +
  * fetchPayoutTotals), de modo que el tope y el cierre nunca divergen.
  */
-export async function cashOutUsedInShift(shiftId: string): Promise<number> {
+/** Stable error raised by the 003 triggers and by this pre-check. */
+export const CASH_METHOD_BALANCE_REQUIRED = "CASH_METHOD_BALANCE_REQUIRED";
+
+const BALANCE_REQUIRED_MESSAGE =
+  "Cierre y abra de nuevo el turno para usar arqueo por método.";
+
+/**
+ * Maps the 003 trigger errors (raised as P0001 with a stable message) to the
+ * business error. Returns null for any other error.
+ */
+export function cashMethodRuleError(error: { message?: string | null } | null | undefined): CashError | null {
+  const cop = cashCopValidation(error);
+  if (cop) return cop;
+  const message = String(error?.message ?? "");
+  if (message.includes(CASH_OUT_LIMIT_CODE)) {
+    return new CashError(
+      CASH_OUT_LIMIT_CODE,
+      "La salida dejaría el método por debajo del mínimo que debe quedar en caja en este turno.",
+      422,
+    );
+  }
+  if (message.includes(CASH_METHOD_BALANCE_REQUIRED)) {
+    return new CashError(CASH_METHOD_BALANCE_REQUIRED, BALANCE_REQUIRED_MESSAGE, 409);
+  }
+  return null;
+}
+
+/**
+ * 003: friendly pre-check of an outflow (immediate commission or approved
+ * voucher) against the method's own balance in the shift. The database
+ * triggers are the authority and serialize concurrent outflows; this read only
+ * gives the operator the amount available before writing. Non-arqueable
+ * methods are not checked. A shift opened before 003 has no frozen base: it is
+ * rejected, never allowed uncontrolled.
+ */
+export async function assertCashMethodOutflow(args: {
+  shiftId: string;
+  method: { code: string; arqueo_mode: string };
+  amount: number;
+}): Promise<void> {
   const db = await cashDb();
-  const [voucherOutMaps, payoutMaps] = await Promise.all([
-    fetchVoucherOutTotals(db, [shiftId]),
-    fetchPayoutTotals(db, [shiftId]),
-  ]);
-  const voucherOut = voucherOutMaps.get(shiftId) ?? new Map<string, number>();
-  const payoutOut = payoutMaps.get(shiftId) ?? new Map<string, number>();
-  return roundMoney((voucherOut.get("efectivo") ?? 0) + (payoutOut.get("efectivo") ?? 0));
+  const { data: balance, error: balanceError } = await db.methodBalance(args.shiftId, args.method.code);
+  if (balanceError) throw new CashError("INTERNAL", "Error interno.", 500);
+  if (!balance) {
+    // A shift that froze no base for a method that is not arqueable today has
+    // no rule to apply. Any other missing base is a legacy shift: rejected.
+    if (args.method.arqueo_mode === "none") return;
+    throw new CashError(CASH_METHOD_BALANCE_REQUIRED, BALANCE_REQUIRED_MESSAGE, 409);
+  }
+  const { data: expected, error: expectedError } = await db.expectedMethodBalance(args.shiftId, args.method.code);
+  if (expectedError) throw cashMethodRuleError(expectedError) ?? new CashError("INTERNAL", "Error interno.", 500);
+  const violation = cashOutLimitViolation({
+    methodCode: args.method.code,
+    openingBase: Number(balance.opening_base),
+    expectedBalance: Number(expected),
+    amount: args.amount,
+  });
+  if (violation) throw new CashError(violation.code, violation.message, 422);
+}
+
+/** Admin view of the frozen bases and the derived balances of one shift. */
+export async function getShiftMethodBalances(shiftId: string): Promise<
+  Array<{ method_code: string; minimum: number; expected: number; available: number }>
+> {
+  const db = await cashDb();
+  const { data, error } = await db.listShiftMethodBalances(shiftId);
+  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  const result = [];
+  for (const row of data ?? []) {
+    const { data: expected, error: expectedError } = await db.expectedMethodBalance(shiftId, row.method_code);
+    if (expectedError) throw cashMethodRuleError(expectedError) ?? new CashError("INTERNAL", "Error interno.", 500);
+    result.push(methodAvailability({ method_code: row.method_code, opening_base: Number(row.opening_base), expected: Number(expected) }));
+  }
+  return result;
 }
 
 /** Fila mínima del ledger de dinero del turno (`payments` / `invoice_payments`). */
@@ -699,13 +748,7 @@ async function fetchInvoicePaymentsByShift(
     table: "invoice_payments",
     what: "los cobros de factura del turno",
     values: shiftIds,
-    fetchPage: (chunk, from, to) =>
-      db
-        .from("invoice_payments")
-        .select("invoice_id, cash_shift_id, method_code, amount")
-        .in("cash_shift_id", chunk)
-        .order("id")
-        .range(from, to),
+    fetchPage: (chunk, from, to) => db.invoicePaymentsByShiftsPage(chunk, from, to),
   });
   for (const row of direct) {
     push(row.cash_shift_id, row);
@@ -714,13 +757,7 @@ async function fetchInvoicePaymentsByShift(
     table: "invoices",
     what: "las facturas del turno",
     values: shiftIds,
-    fetchPage: (chunk, from, to) =>
-      db
-        .from("invoices")
-        .select("id, cash_shift_id")
-        .in("cash_shift_id", chunk)
-        .order("id")
-        .range(from, to),
+    fetchPage: (chunk, from, to) => db.invoicesByShiftsPage(chunk, from, to),
   });
   const shiftByInvoice = new Map(invoices.map((row) => [row.id, row.cash_shift_id]));
   if (shiftByInvoice.size === 0) return result;
@@ -736,14 +773,7 @@ async function fetchInvoicePaymentsByShift(
     table: "invoice_payments",
     what: "los cobros de factura históricos del turno",
     values: [...shiftByInvoice.keys()],
-    fetchPage: (chunk, from, to) =>
-      db
-        .from("invoice_payments")
-        .select("invoice_id, method_code, amount")
-        .in("invoice_id", chunk)
-        .is("cash_shift_id", null)
-        .order("id")
-        .range(from, to),
+    fetchPage: (chunk, from, to) => db.historicInvoicePaymentsPage(chunk, from, to),
   });
   for (const row of nullShiftRows) {
     const shiftId = shiftByInvoice.get(row.invoice_id);
@@ -815,9 +845,6 @@ export interface ShiftRecountView {
   recounted_at: string;
 }
 
-const RECOUNT_SELECT =
-  "id, shift_id, previous_counted_cash, previous_base_left, previous_cash_withdrawn, previous_base_difference, counted_cash, base_left, cash_withdrawn, base_difference, reason, recounted_by, recounted_at";
-
 /** Reconteos de los turnos pedidos, uno por turno (a lo sumo existe uno). */
 async function fetchRecounts(
   db: DbClient,
@@ -830,13 +857,7 @@ async function fetchRecounts(
     table: "cash_shift_recounts",
     what: "los reconteos del turno",
     values: shiftIds,
-    fetchPage: (chunk, from, to) =>
-      db
-        .from("cash_shift_recounts")
-        .select(RECOUNT_SELECT)
-        .in("shift_id", chunk)
-        .order("id")
-        .range(from, to),
+    fetchPage: (chunk, from, to) => db.recountsPage(chunk, from, to),
   });
   for (const row of rows) {
     result.set(row.shift_id, row);
@@ -880,40 +901,45 @@ function signedAmounts(shift: CashShiftRow): CloseAmounts {
   };
 }
 
+/**
+ * 003: the arqueo configuration the cash flows read. `drawer` is the active
+ * method counted by denominations (the physical drawer whose total is
+ * `counted_cash` / `expected_cash`); the rest are declared totals.
+ */
+async function arqueoConfig(): Promise<{ drawer: string | null; denominationCodes: Set<string> }> {
+  const methods = await listPaymentMethods();
+  return {
+    drawer: drawerMethodCode(methods),
+    denominationCodes: new Set(methods.filter((m) => m.arqueo_mode === "denominations").map((m) => m.code)),
+  };
+}
+
+async function drawerCode(): Promise<string | null> {
+  return (await arqueoConfig()).drawer;
+}
+
 /** Totales del último cierre (por método) para validar la apertura. */
 async function previousCloseTotals(
   db: DbClient,
   registerId: string,
 ): Promise<{ baseLeft: number | null; byMethod: Map<string, number>; hasCounts: boolean } | null> {
-  const { data: last, error: lastError } = await db
-    .from("cash_shifts")
-    .select("id, base_left")
-    .eq("cash_register_id", registerId)
-    .eq("status", "cerrado")
-    .order("closed_at", { ascending: false })
-    .order("opened_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  const { data: last, error: lastError } = await db.lastClosedShiftForRegister(registerId);
   if (lastError) throw new CashError("INTERNAL", "Error interno.", 500);
   if (!last) return null;
   // U3: si el último cierre fue recontado, la base que hereda el próximo turno
   // y los totales digitales contra los que se compara la apertura son los
   // CORREGIDOS; el cierre firmado sigue intacto en `cash_shifts` pero no
   // gobierna la cadena.
-  const recountMap = await fetchRecounts(db, [(last as { id: string }).id]);
-  const recountRow = recountMap.get((last as { id: string }).id) ?? null;
-  const { data: counts, error: countsError } = await db
-    .from("cash_shift_counts")
-    .select("method_code, amount")
-    .eq("shift_id", (last as { id: string }).id)
-    .eq("phase", recountRow ? "reconteo" : "cierre");
+  const recountMap = await fetchRecounts(db, [last.id]);
+  const recountRow = recountMap.get(last.id) ?? null;
+  const { data: counts, error: countsError } = await db.listShiftCounts(last.id, recountRow ? "reconteo" : "cierre");
   if (countsError) throw new CashError("INTERNAL", "Error interno.", 500);
   const byMethod = new Map<string, number>();
-  for (const row of ((counts ?? []) as Array<{ method_code: string; amount: number | string }>)) {
+  for (const row of counts ?? []) {
     byMethod.set(row.method_code, roundMoney((byMethod.get(row.method_code) ?? 0) + Number(row.amount)));
   }
   return {
-    baseLeft: recountRow ? Number(recountRow.base_left) : (last as { base_left: number | null }).base_left,
+    baseLeft: recountRow ? Number(recountRow.base_left) : last.base_left,
     byMethod,
     hasCounts: byMethod.size > 0,
   };
@@ -923,13 +949,13 @@ async function previousCloseTotals(
 
 /** Lista las cajas (el MVP opera la "Caja única"). */
 export async function listRegisters(): Promise<CashRegisterRow[]> {
-  const db = await cashDb();
-  const { data, error } = await db
-    .from("cash_registers")
-    .select(REGISTER_SELECT)
-    .order("created_at");
+  return fetchRegisters(await cashDb());
+}
+
+async function fetchRegisters(db: DbClient): Promise<CashRegisterRow[]> {
+  const { data, error } = await db.listRegisters<CashRegisterRow>();
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as CashRegisterRow[];
+  return data ?? [];
 }
 
 /**
@@ -945,45 +971,31 @@ async function resolveRegister(
   registerId?: string,
 ): Promise<CashRegisterRow> {
   if (registerId) {
-    const { data, error } = await db
-      .from("cash_registers")
-      .select(REGISTER_SELECT)
-      .eq("id", registerId)
-      .maybeSingle();
+    const { data, error } = await db.getRegister<CashRegisterRow>(registerId);
     if (error) throw new CashError("INTERNAL", "Error interno.", 500);
     if (!data) throw new CashError("NOT_FOUND", "Caja no encontrada.", 404);
-    return data as CashRegisterRow;
+    return data;
   }
-  const { data, error } = await db
-    .from("cash_registers")
-    .select(REGISTER_SELECT)
-    .eq("is_active", true)
-    .order("created_at")
-    .limit(1)
-    .maybeSingle();
+  const { data, error } = await db.firstActiveRegister<CashRegisterRow>();
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  if (data) return data as CashRegisterRow;
-  const { data: created, error: createError } = await db
-    .from("cash_registers")
-    .insert({ name: "Caja única", base_configurada: 200000 })
-    .select(REGISTER_SELECT)
-    .single();
+  if (data) return data;
+  const { data: created, error: createError } = await db.ensureDefaultRegister<CashRegisterRow>({
+    name: "Caja única",
+    base_configurada: 200000,
+  });
   if (createError || !created) throw new CashError("INTERNAL", "Error interno.", 500);
-  return created as CashRegisterRow;
+  return created;
 }
 
 /** Turno abierto (uno a la vez por caja, CAJ-01). */
 export async function getOpenShift(): Promise<CashShiftRow | null> {
-  const db = await cashDb();
-  const { data, error } = await db
-    .from("cash_shifts")
-    .select(SHIFT_SELECT)
-    .eq("status", "abierto")
-    .order("opened_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+  return fetchOpenShift(await cashDb());
+}
+
+async function fetchOpenShift(db: DbClient): Promise<CashShiftRow | null> {
+  const { data, error } = await db.getOpenShift<CashShiftRow>();
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  return (data as CashShiftRow | null) ?? null;
+  return data ?? null;
 }
 
 /**
@@ -994,30 +1006,22 @@ export async function getOpenShift(): Promise<CashShiftRow | null> {
 export async function getOpenShiftWithOpener(): Promise<(CashShiftRow & { opener_name: string | null }) | null> {
   // Dos queries simples a propósito: cash_shifts tiene DOS FK a users
   // (opened_by y closed_by) y PostgREST no desambigua `users!inner`.
-  const shift = await getOpenShift();
-  if (!shift) return null;
   const db = await cashDb();
-  const { data: user, error } = await db
-    .from("users")
-    .select("full_name")
-    .eq("id", shift.opened_by)
-    .maybeSingle();
+  const shift = await fetchOpenShift(db);
+  if (!shift) return null;
+  const { data: user, error } = await db.userFullName(shift.opened_by);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
   return {
     ...shift,
-    opener_name: (user as { full_name?: string | null } | null)?.full_name ?? null,
+    opener_name: user?.full_name ?? null,
   };
 }
 
 async function getShiftOrThrow(db: DbClient, id: string): Promise<CashShiftRow> {
-  const { data, error } = await db
-    .from("cash_shifts")
-    .select(SHIFT_SELECT)
-    .eq("id", id)
-    .maybeSingle();
+  const { data, error } = await db.getShift<CashShiftRow>(id);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
   if (!data) throw new CashError("NOT_FOUND", "Turno no encontrado.", 404);
-  return data as CashShiftRow;
+  return data;
 }
 
 // ----------------------------------------------------------------- apertura ---
@@ -1047,12 +1051,7 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
   try {
     const register = await resolveRegister(db, input.cash_register_id);
 
-    const { data: open, error: openError } = await db
-      .from("cash_shifts")
-      .select("id")
-      .eq("cash_register_id", register.id)
-      .eq("status", "abierto")
-      .limit(1);
+    const { data: open, error: openError } = await db.openShiftIdsForRegister(register.id);
     if (openError) throw new CashError("INTERNAL", "Error interno.", 500);
     assertNoOpenShift((open ?? []).length > 0);
 
@@ -1069,15 +1068,17 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     // administrators (except on the very first open) while the shift opens
     // anyway so the business never stops.
     const declared = await checkCounts(input.counts);
+    // 003: the drawer is the method configured by denominations, not a code.
+    const drawer = await drawerCode();
     const isFirstOpen = prev === null;
     const mismatches: Array<{ method_code: string; expected: number; declared: number }> = [];
-    const cashDeclared = declared.get("efectivo") ?? 0;
-    if (!moneyEquals(cashDeclared, openingBase)) {
-      mismatches.push({ method_code: "efectivo", expected: openingBase, declared: cashDeclared });
+    const cashDeclared = drawer ? (declared.get(drawer) ?? 0) : 0;
+    if (drawer && !moneyEquals(cashDeclared, openingBase)) {
+      mismatches.push({ method_code: drawer, expected: openingBase, declared: cashDeclared });
     }
     if (prev?.hasCounts) {
       for (const [code, total] of declared) {
-        if (code === "efectivo") continue;
+        if (code === drawer) continue;
         const expected = prev.byMethod.get(code) ?? 0;
         if (!moneyEquals(total, expected)) {
           mismatches.push({ method_code: code, expected, declared: total });
@@ -1101,13 +1102,14 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     // y cada línea del conteo de `checkCounts` (con su monto ya redondeado en
     // `countLines`); el RPC sólo ESCRIBE lo que recibe y devuelve el turno
     // escrito, con las mismas columnas que el servicio leía con SHIFT_SELECT.
-    const { data: created, error: createError } = await db.rpc("cash_open_shift_atomic", {
-      p_register_id: register.id,
-      p_opened_by: actor.userId,
-      p_opening_base: openingBase,
-      p_counts: countLines(input.counts),
+    const { data: created, error: createError } = await db.openShiftAtomic<CashShiftRow>({
+      registerId: register.id,
+      openedBy: actor.userId,
+      openingBase,
+      counts: countLines(input.counts),
     });
     if (createError) {
+      throwCashCop(createError);
       // Carrera perdida contra uq_cash_shifts_open_per_register (23505, la
       // barrera final de la base) o contra el guardia de "un turno abierto por
       // caja" re-evaluado dentro de la transacción.
@@ -1176,15 +1178,9 @@ async function findInvoicePaymentsByIdempotencyKey(
   invoiceId: string,
   idempotencyKey: string,
 ): Promise<InvoicePaymentRow[]> {
-  const { data, error } = await db
-    .from("invoice_payments")
-    .select(
-      "id, invoice_id, method_id, method_code, amount, fee_percent, fee_amount, cash_shift_id, created_at, idempotency_key",
-    )
-    .eq("invoice_id", invoiceId)
-    .eq("idempotency_key", idempotencyKey);
+  const { data, error } = await db.findInvoicePaymentByIdempotency<InvoicePaymentRow>(invoiceId, idempotencyKey);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as InvoicePaymentRow[];
+  return data ?? [];
 }
 
 /**
@@ -1240,15 +1236,12 @@ async function repeatedCollectionResult(
     throw toCashError(error);
   });
   const shift = await getShiftOrThrow(db, shiftId);
-  const { data, error } = await db
-    .from("payments")
-    .select(PAYMENT_SELECT)
-    .eq("invoice_id", winner.invoice_id)
-    .eq("cash_shift_id", shiftId)
-    .eq("method_code", winner.method_code)
-    .eq("amount", roundMoney(Number(winner.amount)))
-    .limit(1)
-    .maybeSingle();
+  const { data, error } = await db.findInvoicePaymentMirror<CashPaymentRow>({
+    invoiceId: winner.invoice_id,
+    shiftId,
+    methodCode: winner.method_code,
+    amount: roundMoney(Number(winner.amount)),
+  });
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
   if (!data) {
     throw new CashError(
@@ -1300,15 +1293,9 @@ async function findDrawerPaymentByIdempotencyKey(
   shiftId: string,
   idempotencyKey: string,
 ): Promise<CashPaymentRow | null> {
-  const { data, error } = await db
-    .from("payments")
-    .select(PAYMENT_SELECT)
-    .eq("cash_shift_id", shiftId)
-    .eq("idempotency_key", idempotencyKey)
-    .limit(1)
-    .maybeSingle();
+  const { data, error } = await db.findPaymentByIdempotency<CashPaymentRow>(shiftId, idempotencyKey);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  return (data as CashPaymentRow | null) ?? null;
+  return data ?? null;
 }
 
 /**
@@ -1387,7 +1374,7 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
   try {
     const shift = input.cash_shift_id
       ? await getShiftOrThrow(db, input.cash_shift_id)
-      : await getOpenShift().then((row) => {
+      : await fetchOpenShift(db).then((row) => {
           if (!row) {
             throw new CashError(
               "NO_OPEN_SHIFT",
@@ -1471,14 +1458,18 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
       // la porción entra en neto (bruto − recargo). El bruto de un cobro con
       // tarjeta supera `invoices.total` cuando el recargo es de un cobro
       // POSTERIOR a la emisión: comparar el bruto contra el total rechazaba
-      // como "sobrepago" un cobro legítimo. Mismo tope y tolerancia que el
-      // trigger de 031 (0.009), que es la barrera real ante carreras.
+      // como "sobrepago" un cobro legítimo. El predicado compartido compara el
+      // mismo neto en pesos enteros que el trigger (la barrera real ante carreras).
       invoiceBalance = invoiceNetBalance({
         total: detail.invoice.total,
         surcharge: detail.invoice.surcharge,
         payments: detail.payments,
       });
-      if (invoiceBalance.netCollected + cardFee.net - invoiceBalance.netBilled > 0.009) {
+      if (invoicePaymentCapExceeded({
+        alreadyPaid: invoiceBalance.netCollected,
+        incoming: cardFee.net,
+        cap: invoiceBalance.netBilled,
+      })) {
         throw new CashError("OVERPAID", "El pago supera el saldo pendiente de la factura.", 422);
       }
     }
@@ -1569,20 +1560,17 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
       // sentencia de un objeto: la arruga de "la marca en la primera porción" de
       // 042 no aplica acá). Es la barrera final de la carrera, con el índice
       // único parcial de 042, que ahora corre DENTRO de la transacción.
-      const { data: written, error: payError } = await db.rpc("cash_invoice_payment_atomic", {
-        p_shift_id: shift.id,
-        p_invoice_id: input.invoice_id,
-        p_user_id: actor.userId,
-        // CL-17: el INSTANTE del cierre, resuelto acá (el SERVICIO) como en el
-        // cierre de turno (049) y en el cobro dividido y la anulación (050): la
-        // función lo escribe VERBATIM cuando la factura se cierra. Antes este
-        // camino no lo mandaba y una factura `Pagada` quedaba con `closed_at`
-        // NULL, contradiciendo el contrato de la columna (025) y dejando la
-        // columna "Cerrada" del listado en guion sobre una factura cerrada.
-        p_closed_at: new Date().toISOString(),
-        p_set_shift: setShift,
-        p_mark_paid: markPaid,
-        p_collection: {
+      const { data: written, error: payError } = await db.invoicePaymentAtomic<{
+        payment?: CashPaymentRow | null;
+        invoice?: { status?: string | null } | null;
+      }>({
+        shiftId: shift.id,
+        invoiceId: input.invoice_id,
+        userId: actor.userId,
+        closedAt: new Date().toISOString(),
+        setShift,
+        markPaid,
+        collection: {
           method_id: method.id,
           method_code: method.code,
           amount: gross,
@@ -1592,6 +1580,7 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
         },
       });
       if (payError) {
+        throwCashCop(payError);
         const code = (payError as { code?: string } | null)?.code;
         const message = String((payError as { message?: unknown } | null)?.message ?? "");
         // Las precondiciones que la transacción revalida ADENTRO sobre las filas
@@ -1693,21 +1682,17 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
       // estado de factura que escribir). La marca del intento la lleva ESTA fila
       // (columna e índice de 043): es la identidad de la operación, porque no hay
       // un espejo que la identifique.
-      const { data: payment, error: paymentError } = await db
-        .from("payments")
-        .insert({
-          cash_shift_id: shift.id,
-          invoice_id: null,
-          method_id: method.id,
-          method_code: method.code,
-          amount: gross,
-          user_id: actor.userId,
-          // La marca del intento, en la fila del libro de cajón (043).
-          idempotency_key: mark,
-        })
-        .select(PAYMENT_SELECT)
-        .single();
+      const { data: payment, error: paymentError } = await db.insertPaymentWithoutInvoice<CashPaymentRow>({
+        cash_shift_id: shift.id,
+        invoice_id: null,
+        method_id: method.id,
+        method_code: method.code,
+        amount: gross,
+        user_id: actor.userId,
+        idempotency_key: mark,
+      });
       if (paymentError || !payment) {
+      throwCashCop(paymentError);
         // CL-4: barrera FINAL de la carrera del pago SIN factura. El lookup de
         // arriba y este INSERT no son atómicos: si otro envío con la MISMA marca
         // en el MISMO turno confirmó en esa ventana, este INSERT choca con el
@@ -1826,14 +1811,7 @@ export async function closeShift(
     const shiftPayments = await readAllSource<{ amount: number | string; method_code: string }>({
       table: "payments",
       what: "los cobros del turno",
-      fetchPage: (from, to) =>
-        db
-          .from("payments")
-          .select("amount, method_code")
-          .eq("cash_shift_id", shift.id)
-          .is("invoice_id", null)
-          .order("id")
-          .range(from, to),
+      fetchPage: (from, to) => db.drawerPaymentsPage(shift.id, from, to),
     });
     const invoicePayMaps = await fetchInvoicePaymentsByShift(db, [shift.id]);
     const invoicePays = invoicePayMaps.get(shift.id) ?? [];
@@ -1867,13 +1845,7 @@ export async function closeShift(
     const payoutRows = await readAllSource<{ method_code: string; amount: number | string }>({
       table: "commission_payouts",
       what: "los pagos de comisión del turno",
-      fetchPage: (from, to) =>
-        db
-          .from("commission_payouts")
-          .select("method_code, amount")
-          .eq("cash_shift_id", shift.id)
-          .order("id")
-          .range(from, to),
+      fetchPage: (from, to) => db.shiftPayoutsPage(shift.id, from, to),
     });
     const paidOutByMethod = new Map<string, number>();
     for (const row of payoutRows) {
@@ -1905,26 +1877,24 @@ export async function closeShift(
     // Facturas cobradas en este turno (emitidas aquí o en turnos anteriores):
     // ya suman al esperado y al arqueo por método en `paidByMethod`.
     const { total: invoicesTotal, count: invoicesCount } = invoiceCollectionsSummary(invoicePays);
-
+    const { drawer, denominationCodes } = await arqueoConfig();
     const expectedCash = roundMoney(
-      (paidByMethod.get("efectivo") ?? 0) - (paidOutByMethod.get("efectivo") ?? 0),
+      drawer ? (paidByMethod.get(drawer) ?? 0) - (paidOutByMethod.get(drawer) ?? 0) : 0,
     );
 
-    // El conteo de efectivo sale del detalle por denominación (el sistema
-    // calcula; el total declarado debe cuadrar con el detalle).
+    // The configured denomination method, if any, is the physical drawer.
     const declared = await checkCounts(input.counts);
-    const countedFromDetail = declared.get("efectivo") ?? 0;
-    if (!moneyEquals(countedFromDetail, input.counted_cash)) {
+    const countedFromDetail = drawer ? (declared.get(drawer) ?? 0) : 0;
+    if (drawer && !moneyEquals(countedFromDetail, input.counted_cash)) {
       throw new CashError("COUNT_MISMATCH", "El conteo no cuadra con el detalle por denominación.", 422);
     }
-    // Digitales: lo declarado contra el saldo de apertura del turno más
-    // lo cobrado en el turno menos lo pagado inmediato (el "total en la
-    // aplicación").
+    // Declared-total methods reconcile against their own opening base +
+    // collections - outflows. This never depends on a magic code.
     const countMaps = await fetchCountTotals(db, [shift.id]);
     const openByMethod = countMaps.get(shift.id)?.open ?? new Map<string, number>();
     const methodDifferences: MethodDifference[] = [];
     for (const [code, total] of declared) {
-      if (code === "efectivo") continue;
+      if (denominationCodes.has(code)) continue;
       const expected = expectedDigitalTotal(
         openByMethod.get(code) ?? 0,
         paidByMethod.get(code) ?? 0,
@@ -1958,11 +1928,11 @@ export async function closeShift(
     // dejada de `resolveClosingBase`, el recogido y el sobre de
     // `computeCashClose`, y cada línea del conteo de `checkCounts`; el RPC sólo
     // ESCRIBE lo que recibe y devuelve el turno escrito.
-    const { data: updated, error: updateError } = await db.rpc("cash_close_shift_atomic", {
-      p_shift_id: shift.id,
-      p_closed_by: actor.userId,
-      p_closed_at: new Date().toISOString(),
-      p_close: {
+    const { data: updated, error: updateError } = await db.closeShiftAtomic<CashShiftRow>({
+      shiftId: shift.id,
+      closedBy: actor.userId,
+      closedAt: new Date().toISOString(),
+      close: {
         expected_cash: expectedCash,
         counted_cash: roundMoney(input.counted_cash),
         base_left: roundMoney(baseLeft),
@@ -1970,10 +1940,11 @@ export async function closeShift(
         base_difference: close.baseDifference,
         observation,
       },
-      p_counts: countLines(input.counts),
-      p_collection_counts: collectionCounts,
+      counts: countLines(input.counts),
+      collectionCounts,
     });
     if (updateError || !updated) {
+      throwCashCop(updateError);
       // CHECK expected_cash >= 0 (006_cash.sql): el turno tiene más salidas
       // en efectivo (vales/comisiones) que efectivo cobrado. Es una regla de
       // negocio, no un fallo interno: se reporta con su código y ayuda. El CHECK
@@ -2057,28 +2028,26 @@ export async function closeShift(
  */
 export async function updateRegisterBase(
   registerId: string,
-  base: number,
+  rawBase: unknown,
   actor: CashActor,
 ): Promise<CashRegisterRow> {
-  if (!Number.isFinite(base) || base < 0) {
+  const parsed = copSchema("Base inválida.", "Base inválida.").safeParse(rawBase);
+  if (!parsed.success) {
     throw new CashError("VALIDATION", "Base inválida.", 400);
   }
+  const base = parsed.data;
   const db = await cashDb();
   const register = await resolveRegister(db, registerId);
   const previous = Number(register.base_configurada);
-  const { data: updated, error } = await db
-    .from("cash_registers")
-    .update({ base_configurada: roundMoney(base) })
-    .eq("id", register.id)
-    .select(REGISTER_SELECT)
-    .single();
+  const { data: updated, error } = await db.updateRegisterBase<CashRegisterRow>(register.id, base);
+  throwCashCop(error);
   if (error || !updated) throw new CashError("INTERNAL", "Error interno.", 500);
   await writeAudit({
     user_id: actor.userId,
     action: AUDIT_ACTIONS.REGISTER_BASE_UPDATED,
     entity: "cash_registers",
     entity_id: register.id,
-    metadata: { previous_base: previous, new_base: roundMoney(base) },
+    metadata: { previous_base: previous, new_base: base },
   });
   return updated as CashRegisterRow;
 }
@@ -2123,11 +2092,7 @@ export async function recountClosedShift(
   if (shift.status !== "cerrado") {
     throw new CashError("VALIDATION", "Solo se recontán turnos cerrados.", 400);
   }
-  const { data: existing, error: existingError } = await db
-    .from("cash_shift_recounts")
-    .select("id")
-    .eq("shift_id", shift.id)
-    .maybeSingle();
+  const { data: existing, error: existingError } = await db.findRecountId(shift.id);
   if (existingError) throw new CashError("INTERNAL", "Error interno.", 500);
   if (existing) {
     throw new CashError(
@@ -2141,8 +2106,9 @@ export async function recountClosedShift(
   // arqueables completos, efectivo por denominación). `checkCounts` devuelve el
   // total por método; el efectivo declarado debe cuadrar con su detalle.
   const declared = await checkCounts(parsed.data.counts);
-  const countedFromDetail = declared.get("efectivo") ?? 0;
-  if (!moneyEquals(countedFromDetail, parsed.data.counted_cash)) {
+  const drawer = await drawerCode();
+  const countedFromDetail = drawer ? (declared.get(drawer) ?? 0) : 0;
+  if (drawer && !moneyEquals(countedFromDetail, parsed.data.counted_cash)) {
     throw new CashError("COUNT_MISMATCH", "El reconteo no cuadra con el detalle por denominación.", 422);
   }
   const record = buildRecountRecord({
@@ -2166,10 +2132,10 @@ export async function recountClosedShift(
   // `resolveClosingBase` + `computeCashClose`) y cada línea del conteo nuevo de
   // `checkCounts`; el RPC sólo ESCRIBE lo que recibe y devuelve el reconteo
   // escrito, con las mismas columnas que el servicio leía con RECOUNT_SELECT.
-  const { data: inserted, error } = await db.rpc("cash_recount_shift_atomic", {
-    p_shift_id: shift.id,
-    p_recounted_by: actor.userId,
-    p_recount: {
+  const { data: inserted, error } = await db.recountShiftAtomic<ShiftRecountRow>({
+    shiftId: shift.id,
+    recountedBy: actor.userId,
+    recount: {
       previous_counted_cash: record.previous.counted_cash,
       previous_base_left: record.previous.base_left,
       previous_cash_withdrawn: record.previous.cash_withdrawn,
@@ -2185,9 +2151,10 @@ export async function recountClosedShift(
     // `phase`). Así la evidencia por denominación del reconteo es tan real como
     // la del cierre, y viaja ENTERA con la fila del reconteo: no hay mitad del
     // camino donde quedar firmada sin ella.
-    p_counts: countLines(parsed.data.counts),
+    counts: countLines(parsed.data.counts),
   });
   if (error || !inserted) {
+    throwCashCop(error);
     const errorCode = (error as { code?: string } | null)?.code;
     const errorMessage = String((error as { message?: string } | null)?.message ?? "");
     // Carrera perdida contra el índice único por turno (23505) o contra el
@@ -2278,9 +2245,9 @@ async function userNames(
   // reconteos); la lista deduplicada viaja en lotes que aguantan la URL. Es
   // SOLO display: conserva el error INTERNAL, no el READ_INCOMPLETE del arqueo.
   for (const chunk of chunkIds(ids)) {
-    const { data, error } = await db.from("users").select("id, full_name").in("id", chunk);
+    const { data, error } = await db.userNames(chunk);
     if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-    for (const row of (data ?? []) as Array<{ id: string; full_name: string }>) {
+    for (const row of data ?? []) {
       names.set(row.id, row.full_name);
     }
   }
@@ -2307,15 +2274,9 @@ export async function getDayView(raw: unknown): Promise<DayView> {
   const { fecha } = parsed.data;
   const db = await cashDb();
   const { from, to } = dayBounds(fecha);
-  const { data: shifts, error } = await db
-    .from("cash_shifts")
-    .select(SHIFT_SELECT)
-    .gte("opened_at", from)
-    .lte("opened_at", to)
-    .order("opened_at")
-    .limit(50);
+  const { data: shifts, error } = await db.dayShifts<CashShiftRow>(from, to);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  const rows = (shifts ?? []) as CashShiftRow[];
+  const rows = shifts ?? [];
 
   let paymentsByShift = new Map<string, Array<{ amount: number; method_code: string }>>();
   if (rows.length > 0) {
@@ -2331,14 +2292,7 @@ export async function getDayView(raw: unknown): Promise<DayView> {
       table: "payments",
       what: "los cobros del día",
       values: rows.map((row) => row.id),
-      fetchPage: (chunk, pageFrom, pageTo) =>
-        db
-          .from("payments")
-          .select("cash_shift_id, amount, method_code")
-          .in("cash_shift_id", chunk)
-          .is("invoice_id", null)
-          .order("id")
-          .range(pageFrom, pageTo),
+      fetchPage: (chunk, pageFrom, pageTo) => db.drawerPaymentsByShiftsPage(chunk, pageFrom, pageTo),
     });
     paymentsByShift = new Map();
     for (const row of payments) {
@@ -2354,6 +2308,7 @@ export async function getDayView(raw: unknown): Promise<DayView> {
   );
   const closedIds = rows.filter((row) => row.status === "cerrado").map((row) => row.id);
   const reviews = await getShiftReviews(closedIds);
+  const { denominationCodes } = await arqueoConfig();
   const payoutMaps = await fetchPayoutTotals(
     db,
     rows.map((row) => row.id),
@@ -2396,6 +2351,7 @@ export async function getDayView(raw: unknown): Promise<DayView> {
       paidOut: sumMethodMaps(payoutMaps.get(shift.id), voucherOutMaps.get(shift.id)),
       closed:
         shift.status === "cerrado" ? (recountRow ? counts.recount : counts.closed) : null,
+      denominationCodes,
     });
     const revision = assembleShiftRevision(
       reviews.get(shift.id) ?? [],
@@ -2405,7 +2361,7 @@ export async function getDayView(raw: unknown): Promise<DayView> {
       shift,
       ventas: roundMoney(list.reduce((acc, row) => acc + row.amount, 0)),
       efectivo: roundMoney(
-        list.filter((row) => row.method_code === "efectivo").reduce((acc, row) => acc + row.amount, 0),
+        list.filter((row) => denominationCodes.has(row.method_code)).reduce((acc, row) => acc + row.amount, 0),
       ),
       vales: sumMethodTotal(voucherOutMaps.get(shift.id)),
       metodos,
@@ -2421,7 +2377,7 @@ export async function getDayView(raw: unknown): Promise<DayView> {
     };
   });
 
-  const registers = await listRegisters();
+  const registers = await fetchRegisters(db);
   return {
     fecha,
     register: registers[0] ?? null,
@@ -2462,23 +2418,13 @@ export async function getHistory(raw: unknown): Promise<HistoryResult> {
   const { desde, hasta, page } = parsed.data;
   const db = await cashDb();
   const { from, to } = rangeBounds(desde, hasta);
-  const { count, error: countError } = await db
-    .from("cash_shifts")
-    .select("id", { count: "exact", head: true })
-    .gte("opened_at", from)
-    .lte("opened_at", to);
+  const { count, error: countError } = await db.historyCount(from, to);
   if (countError) throw new CashError("INTERNAL", "Error interno.", 500);
   const total = count ?? 0;
   const offset = (page - 1) * HISTORY_PAGE_SIZE;
-  const { data: shifts, error } = await db
-    .from("cash_shifts")
-    .select(SHIFT_SELECT)
-    .gte("opened_at", from)
-    .lte("opened_at", to)
-    .order("opened_at", { ascending: false })
-    .range(offset, offset + HISTORY_PAGE_SIZE - 1);
+  const { data: shifts, error } = await db.historyPage<CashShiftRow>(from, to, offset, HISTORY_PAGE_SIZE);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
-  const rows = (shifts ?? []) as CashShiftRow[];
+  const rows = shifts ?? [];
 
   let paymentsByShift = new Map<string, Array<{ amount: number; method_code: string }>>();
   if (rows.length > 0) {
@@ -2493,14 +2439,7 @@ export async function getHistory(raw: unknown): Promise<HistoryResult> {
       table: "payments",
       what: "los cobros del historial",
       values: rows.map((row) => row.id),
-      fetchPage: (chunk, pageFrom, pageTo) =>
-        db
-          .from("payments")
-          .select("cash_shift_id, amount, method_code")
-          .in("cash_shift_id", chunk)
-          .is("invoice_id", null)
-          .order("id")
-          .range(pageFrom, pageTo),
+      fetchPage: (chunk, pageFrom, pageTo) => db.drawerPaymentsByShiftsPage(chunk, pageFrom, pageTo),
     });
     paymentsByShift = new Map();
     for (const row of payments) {
@@ -2516,6 +2455,7 @@ export async function getHistory(raw: unknown): Promise<HistoryResult> {
   );
   const historyClosedIds = rows.filter((row) => row.status === "cerrado").map((row) => row.id);
   const historyReviews = await getShiftReviews(historyClosedIds);
+  const { denominationCodes: historyDenominationCodes } = await arqueoConfig();
   const historyPayoutMaps = await fetchPayoutTotals(
     db,
     rows.map((row) => row.id),
@@ -2559,6 +2499,7 @@ export async function getHistory(raw: unknown): Promise<HistoryResult> {
         paidOut: sumMethodMaps(historyPayoutMaps.get(shift.id), historyVoucherOutMaps.get(shift.id)),
         closed:
           shift.status === "cerrado" ? (recountRow ? counts.recount : counts.closed) : null,
+        denominationCodes: historyDenominationCodes,
       });
       const revision = assembleShiftRevision(
         historyReviews.get(shift.id) ?? [],
@@ -2568,7 +2509,7 @@ export async function getHistory(raw: unknown): Promise<HistoryResult> {
         shift,
         ventas: roundMoney(list.reduce((acc, row) => acc + row.amount, 0)),
         efectivo: roundMoney(
-          list.filter((row) => row.method_code === "efectivo").reduce((acc, row) => acc + row.amount, 0),
+          list.filter((row) => historyDenominationCodes.has(row.method_code)).reduce((acc, row) => acc + row.amount, 0),
         ),
         vales: sumMethodTotal(historyVoucherOutMaps.get(shift.id)),
         metodos,

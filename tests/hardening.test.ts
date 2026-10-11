@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -583,6 +584,12 @@ describe("RLS en toda tabla creada por la serie (fix-076)", () => {
    archivos, o que un objeto se pierda al regenerarlo. Este bloque es esa
    protección.
 
+   DESDE 002: 001 ya está aplicado en producción y no se edita, así que un
+   cambio posterior va en una migración numerada nueva (`002_portable_platform.sql`
+   fue la primera). La prueba del directorio las acepta una por una, en orden
+   estricto, y exige que no declaren tablas, políticas ni permisos: los conteos
+   de 001 siguen siendo los del esquema.
+
    POR QUÉ AQUÍ Y NO EN `atomic-guards.test.ts`: los dos archivos hacen lo mismo
    —leer SQL como TEXTO y derivar hechos del esquema— pero este bloque ya tiene
    las dos piezas que un guardián del volcado necesita y que en el otro archivo
@@ -600,6 +607,15 @@ describe("RLS en toda tabla creada por la serie (fix-076)", () => {
 const SQUASH_DIR = join(process.cwd(), "supabase", "migrations");
 const SQUASH_NAME = "001_orabella_schema.sql";
 const SQUASH_SQL = readFileSync(join(SQUASH_DIR, SQUASH_NAME), "utf8");
+// Git blob SHA-1 at the user's required base commit 13c477b. This is a strict
+// no-touch regression guard for the applied 001 and portable 002 migrations.
+const BASE_SHA_001 = "b00a917d4e3c5f6683dc2bcf9a092fe762a7acd5";
+const BASE_SHA_002 = "65e6a3ad89b3164545b5436ccb3e9f58ab61d485";
+/** 003 as committed at 6d0d38d: 004 is a new file and must not edit 003. */
+const BASE_SHA_003 = "d42592f55717b6b991b115589d6fee01c864ab8e";
+// SHA-256 of the exact file bytes from 7138fde, the pre-006 integration base.
+const BASE_SHA256_004 = "dbc796e2eeaf06db88519c03cd7952d841f4f442c9f4c104da10bae18f350c5a";
+const BASE_SHA256_005 = "7755a739fc1ea2bd65d5e04ac798e8c15f2eae69da743bc387cd3b4cf055ba7d";
 
 /**
  * El volcado como ESQUEMA, sin prosa.
@@ -636,22 +652,616 @@ function tablasConColumnaSede(sql: string): string[] {
   return conSede.sort();
 }
 
+/**
+ * Las migraciones posteriores al squash, ACEPTADAS una por una. 001 ya está
+ * aplicado en producción y no se edita: lo que cambia después va en un archivo
+ * numerado nuevo, y entra en esta lista a mano, con su decisión escrita en
+ * `supabase/squash/README.md` (5.3).
+ */
+const MIGRACIONES_POSTERIORES = ["002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql", "005_cop_whole_peso.sql", "006_installation_owner.sql", "007_money_cap_policy.sql"] as const;
+
+/**
+ * Top-level statements of a SQL file, comments removed. Splits on `;` only
+ * outside single-quoted literals and dollar-quoted bodies, so a `;` inside a
+ * COMMENT text or a function body never cuts a statement.
+ */
+function sqlStatements(sql: string): string[] {
+  const body = stripSqlComments(sql);
+  const statements: string[] = [];
+  let current = "";
+  let i = 0;
+  while (i < body.length) {
+    const ch = body[i];
+    if (ch === "$") {
+      // Own matcher: `matchDollarTag` anchors with `^`, which under the sticky
+      // flag only matches at offset 0.
+      const tag = /\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/y;
+      tag.lastIndex = i;
+      const found = tag.exec(body)?.[0] ?? null;
+      if (found !== null) {
+        const close = body.indexOf(found, i + found.length);
+        const end = close === -1 ? body.length : close + found.length;
+        current += body.slice(i, end);
+        i = end;
+        continue;
+      }
+    }
+    if (ch === "'") {
+      let end = i + 1;
+      while (end < body.length && !(body[end] === "'" && body[end + 1] !== "'")) end += body[end] === "'" ? 2 : 1;
+      current += body.slice(i, end + 1);
+      i = end + 1;
+      continue;
+    }
+    if (ch === ";") {
+      if (current.trim()) statements.push(current.trim().replace(/\s+/g, " "));
+      current = "";
+      i += 1;
+      continue;
+    }
+    current += ch;
+    i += 1;
+  }
+  if (current.trim()) statements.push(current.trim().replace(/\s+/g, " "));
+  return statements;
+}
+
+/** The objects 003 is authorized to touch, and nothing else. */
+const OBJ_003 = {
+  functions: "(?:payment_method_code_immutable|cash_open_shift_atomic|cash_open_shift_atomic_legacy|cash_recount_shift_atomic|cash_recount_shift_atomic_legacy|voucher_is_cash_out|enforce_voucher_cash_out_state|cash_shift_method_expected_balance|enforce_cash_method_minimum|enforce_commission_cash_method_minimum|enforce_voucher_cash_method_minimum|enforce_collection_move_minimum|lock_invoice_edit_payment_balances|invoice_edit_items_atomic|invoice_edit_emitted_atomic)",
+  triggers:
+    "(?:trg_payment_methods_code_immutable ON public\\.payment_methods|trg_voucher_requests_cash_out_state ON public\\.voucher_requests|trg_invoice_payments_balance_guard ON public\\.invoice_payments|trg_payments_balance_guard ON public\\.payments|trg_commission_payouts_balance_guard ON public\\.commission_payouts|trg_voucher_requests_balance_guard ON public\\.voucher_requests)",
+  constraints: "(?:payment_methods_code_check|payment_methods_code_format_check|payment_methods_arqueo_mode_check|payment_methods_arqueo_coherent_check)",
+};
+
+/**
+ * EXPLICIT allowlist of 003: one anchored pattern per authorized object and
+ * action. A statement that matches none of them is unauthorized, even if its
+ * verb is legitimate elsewhere in the file (e.g. another ALTER TABLE action on
+ * payment_methods, a grant to another role, a second table).
+ */
+const ALLOWLIST_003: ReadonlyArray<[string, RegExp]> = [
+  ["transaction", /^(?:BEGIN|COMMIT)$/],
+  ["payment_methods: add arqueo_mode", /^ALTER TABLE public\.payment_methods ADD COLUMN IF NOT EXISTS arqueo_mode text$/],
+  ["payment_methods: backfill arqueo_mode", /^UPDATE public\.payment_methods SET arqueo_mode = CASE [^;]* END WHERE arqueo_mode IS NULL$/],
+  ["payment_methods: arqueo_mode NOT NULL", /^ALTER TABLE public\.payment_methods ALTER COLUMN arqueo_mode SET NOT NULL$/],
+  [
+    "payment_methods: drop the six-code CHECK and 003's own constraints",
+    new RegExp(`^ALTER TABLE public\\.payment_methods DROP CONSTRAINT IF EXISTS ${OBJ_003.constraints}(?:, DROP CONSTRAINT IF EXISTS ${OBJ_003.constraints})*$`),
+  ],
+  [
+    "payment_methods: add 003's CHECKs",
+    new RegExp(`^ALTER TABLE public\\.payment_methods ADD CONSTRAINT ${OBJ_003.constraints} CHECK \\(.*\\)(?:, ADD CONSTRAINT ${OBJ_003.constraints} CHECK \\(.*\\))*$`),
+  ],
+  ["payment_methods: one denominations method", /^CREATE UNIQUE INDEX IF NOT EXISTS uq_payment_methods_single_denominations ON public\.payment_methods \(\(true\)\) WHERE arqueo_mode = 'denominations'$/],
+  ["cash_shift_method_balances: table", /^CREATE TABLE IF NOT EXISTS public\.cash_shift_method_balances \(/],
+  ["cash_shift_method_balances: RLS", /^ALTER TABLE public\.cash_shift_method_balances ENABLE ROW LEVEL SECURITY$/],
+  [
+    "comments",
+    /^COMMENT ON (?:TABLE public\.cash_shift_method_balances|FUNCTION public\.cash_open_shift_atomic\(uuid, uuid, numeric, jsonb\)|FUNCTION public\.(?:invoice_edit_items_atomic|invoice_edit_emitted_atomic)\(uuid, uuid, integer, text, jsonb\)) IS '/,
+  ],
+  [
+    "rename of 001's two invoice edit RPCs (only these, inside DO)",
+    /^DO \$\$ BEGIN IF to_regprocedure\('public\.(invoice_edit_items_atomic|invoice_edit_emitted_atomic)_legacy\(uuid,uuid,integer,text,jsonb\)'\) IS NULL THEN ALTER FUNCTION public\.\1\(uuid, uuid, integer, text, jsonb\) RENAME TO \1_legacy; END IF; END; \$\$$/,
+  ],
+  [
+    "edit RPC legacy bodies keep 001's ACL (PUBLIC revoked, service_role only)",
+    /^(?:REVOKE ALL ON FUNCTION public\.(?:invoice_edit_items_atomic|invoice_edit_emitted_atomic)_legacy\(uuid, uuid, integer, text, jsonb\) FROM PUBLIC|GRANT ALL ON FUNCTION public\.(?:invoice_edit_items_atomic|invoice_edit_emitted_atomic)_legacy\(uuid, uuid, integer, text, jsonb\) TO service_role)$/,
+  ],
+  [
+    "rename of 001's opener (only this, inside DO)",
+    /^DO \$\$ BEGIN IF to_regprocedure\('public\.cash_open_shift_atomic_legacy\(uuid,uuid,numeric,jsonb\)'\) IS NULL THEN ALTER FUNCTION public\.cash_open_shift_atomic\(uuid, uuid, numeric, jsonb\) RENAME TO cash_open_shift_atomic_legacy; END IF; END; \$\$$/,
+  ],
+  [
+    "rename of 001's recount (only this, inside DO)",
+    /^DO \$\$ BEGIN IF to_regprocedure\('public\.cash_recount_shift_atomic_legacy\(uuid,uuid,jsonb,jsonb\)'\) IS NULL THEN ALTER FUNCTION public\.cash_recount_shift_atomic\(uuid, uuid, jsonb, jsonb\) RENAME TO cash_recount_shift_atomic_legacy; END IF; END; \$\$$/,
+  ],
+  ["functions", new RegExp(`^CREATE OR REPLACE FUNCTION public\\.${OBJ_003.functions}\\(`)],
+  ["drop own triggers", new RegExp(`^DROP TRIGGER IF EXISTS ${OBJ_003.triggers}$`)],
+  [
+    "trigger: code immutability + arqueo sync",
+    /^CREATE TRIGGER trg_payment_methods_code_immutable BEFORE INSERT OR UPDATE ON public\.payment_methods FOR EACH ROW EXECUTE FUNCTION public\.payment_method_code_immutable\(\)$/,
+  ],
+  [
+    "trigger: commission balance guard",
+    /^CREATE TRIGGER trg_commission_payouts_balance_guard BEFORE INSERT OR UPDATE OF amount, method_code, cash_shift_id ON public\.commission_payouts FOR EACH ROW EXECUTE FUNCTION public\.enforce_commission_cash_method_minimum\(\)$/,
+  ],
+  [
+    "trigger: voucher balance guard",
+    /^CREATE TRIGGER trg_voucher_requests_balance_guard BEFORE INSERT OR UPDATE OF amount, method_code, cash_shift_id, status, approved_by ON public\.voucher_requests FOR EACH ROW EXECUTE FUNCTION public\.enforce_voucher_cash_method_minimum\(\)$/,
+  ],
+  [
+    "trigger: voucher cash-out state invariant",
+    /^CREATE TRIGGER trg_voucher_requests_cash_out_state BEFORE INSERT OR UPDATE OF status, approved_by, method_code, cash_shift_id ON public\.voucher_requests FOR EACH ROW EXECUTE FUNCTION public\.enforce_voucher_cash_out_state\(\)$/,
+  ],
+  [
+    "trigger: invoice collection move guard",
+    /^CREATE TRIGGER trg_invoice_payments_balance_guard BEFORE UPDATE OF amount, method_code, cash_shift_id ON public\.invoice_payments FOR EACH ROW EXECUTE FUNCTION public\.enforce_collection_move_minimum\(\)$/,
+  ],
+  [
+    "trigger: drawer collection move guard",
+    /^CREATE TRIGGER trg_payments_balance_guard BEFORE UPDATE OF amount, method_code, cash_shift_id, invoice_id ON public\.payments FOR EACH ROW EXECUTE FUNCTION public\.enforce_collection_move_minimum\(\)$/,
+  ],
+  ["revoke from PUBLIC", new RegExp(`^REVOKE ALL ON FUNCTION public\\.${OBJ_003.functions}\\([a-z, ]*\\) FROM PUBLIC$`)],
+  [
+    "revoke the internal legacy RPCs from service_role",
+    /^REVOKE ALL ON FUNCTION public\.(?:cash_open_shift_atomic_legacy\(uuid, uuid, numeric, jsonb\)|cash_recount_shift_atomic_legacy\(uuid, uuid, jsonb, jsonb\)) FROM service_role$/,
+  ],
+  [
+    "grant the three public RPCs to service_role",
+    /^GRANT ALL ON FUNCTION public\.(?:cash_open_shift_atomic\(uuid, uuid, numeric, jsonb\)|cash_recount_shift_atomic\(uuid, uuid, jsonb, jsonb\)|cash_shift_method_expected_balance\(uuid, text\)|lock_invoice_edit_payment_balances\(uuid, jsonb\)|invoice_edit_items_atomic\(uuid, uuid, integer, text, jsonb\)|invoice_edit_emitted_atomic\(uuid, uuid, integer, text, jsonb\)) TO service_role$/,
+  ],
+];
+
+/** Statements of 003 outside its allowlist, plus privileged DDL hidden in a function body. */
+function unauthorized003(sql: string): string[] {
+  const offenders: string[] = [];
+  for (const statement of sqlStatements(sql)) {
+    if (!ALLOWLIST_003.some(([, allowed]) => allowed.test(statement))) {
+      offenders.push(statement.slice(0, 140));
+      continue;
+    }
+    // A function body executes what it says: it may not hide DDL or grants.
+    if (/^CREATE OR REPLACE FUNCTION/.test(statement) && sentenciasProhibidas(statement).length > 0) {
+      offenders.push(`${statement.slice(0, 80)} … ${sentenciasProhibidas(statement).join(", ")}`);
+    }
+  }
+  return offenders;
+}
+
+/** 004 can define exactly one literal search function, its ACL and its comment. */
+const SEARCH_004 = "public.search_products_literal(text, integer, integer)";
+const ALLOWLIST_004: ReadonlyArray<[string, RegExp]> = [
+  ["transaction", /^(?:BEGIN|COMMIT)$/],
+  ["literal search function", /^CREATE OR REPLACE FUNCTION public\.search_products_literal\( p_query text, p_limit integer, p_offset integer DEFAULT 0 \) RETURNS TABLE \(/],
+  ["revoke PUBLIC/anon/authenticated", /^REVOKE ALL ON FUNCTION public\.search_products_literal\(text, integer, integer\) FROM (?:PUBLIC|anon|authenticated)$/],
+  ["grant service_role", /^GRANT ALL ON FUNCTION public\.search_products_literal\(text, integer, integer\) TO service_role$/],
+  ["function comment", /^COMMENT ON FUNCTION public\.search_products_literal\(text, integer, integer\) IS '/],
+];
+
+/**
+ * 004's body is deliberately a narrow read-only program. Checking its prefix
+ * was insufficient: everything after RETURNS TABLE was effectively free. Keep
+ * the clauses that define the function contract explicit, then reject every
+ * write/privilege/dynamic-SQL escape hatch inside the dollar-quoted body.
+ */
+/** Whitespace/comment-insensitive representation of 004's intended function body. */
+function canonical004Body(body: string): string {
+  // The body contains no SQL string literal with `--`; stripping these comments
+  // makes a review-only explanation unable to relax the executable contract.
+  return body.replace(/--[^\n]*/g, "").replace(/\s+/g, " ").trim();
+}
+
+const EXPECTED_004_BODY = canonical004Body(`
+DECLARE
+  v_escape constant text := chr(92);
+  v_pattern text;
+  v_limit integer := least(greatest(coalesce(p_limit, 50), 1), 500);
+  v_offset integer := greatest(coalesce(p_offset, 0), 0);
+BEGIN
+  v_pattern := '%' || replace(
+    replace(
+      replace(coalesce(p_query, ''), v_escape, v_escape || v_escape),
+      '%', v_escape || '%'
+    ),
+    '_', v_escape || '_'
+  ) || '%';
+  RETURN QUERY
+  SELECT
+    p.id, p.sku, p.name, p.description, p.stock_qty, p.min_stock,
+    p.cost_price, p.sale_price, p.commission_value, p.is_active
+  FROM public.products AS p
+  WHERE p.name ILIKE v_pattern ESCAPE v_escape
+     OR p.sku ILIKE v_pattern ESCAPE v_escape
+  ORDER BY p.name ASC, p.id ASC
+  LIMIT v_limit
+  OFFSET v_offset;
+END;
+`);
+
+function invalid004Function(statement: string): string[] {
+  const failures: string[] = [];
+  const header = /^CREATE OR REPLACE FUNCTION public\.search_products_literal\( p_query text, p_limit integer, p_offset integer DEFAULT 0 \) RETURNS TABLE \( id uuid, sku text, name text, description text, stock_qty integer, min_stock integer, cost_price numeric, sale_price numeric, commission_value numeric, is_active boolean \) LANGUAGE plpgsql SECURITY INVOKER SET search_path TO 'public' AS \$\$/;
+  if (!header.test(statement)) failures.push("exact signature, SECURITY INVOKER or search_path");
+  const body = /AS \$\$([\s\S]*)\$\$$/.exec(statement)?.[1];
+  if (body === undefined) {
+    failures.push("missing dollar-quoted body");
+  } else if (canonical004Body(body) !== EXPECTED_004_BODY) {
+    // The body is an allowlist, not a blacklist: any extra statement (DML,
+    // DDL, grants, SET ROLE, CALL, PERFORM, dynamic SQL...) changes it.
+    failures.push("non-canonical read-only function body");
+  }
+  return failures;
+}
+
+function unauthorized004(sql: string): string[] {
+  const offenders: string[] = [];
+  const statements = sqlStatements(sql);
+  let literalFunctionCount = 0;
+  const revokedRoles = new Set<string>();
+  let grantCount = 0;
+  for (const statement of statements) {
+    if (!ALLOWLIST_004.some(([, allowed]) => allowed.test(statement))) {
+      offenders.push(statement.slice(0, 140));
+      continue;
+    }
+    if (/^CREATE OR REPLACE FUNCTION/.test(statement)) {
+      literalFunctionCount += 1;
+      const invalid = invalid004Function(statement);
+      if (invalid.length > 0) offenders.push(`${statement.slice(0, 80)} … ${invalid.join(", ")}`);
+    }
+    const revoke = /^REVOKE ALL ON FUNCTION public\.search_products_literal\(text, integer, integer\) FROM (PUBLIC|anon|authenticated)$/.exec(statement);
+    if (revoke) revokedRoles.add(revoke[1]);
+    if (/^GRANT ALL ON FUNCTION public\.search_products_literal/.test(statement)) grantCount += 1;
+  }
+  // Full migrations that define 004 must contain exactly its explicit ACL.
+  const expectedRevokes = ["PUBLIC", "anon", "authenticated"];
+  if (literalFunctionCount > 0 && (literalFunctionCount !== 1 || grantCount !== 1 || expectedRevokes.some((role) => !revokedRoles.has(role)) || revokedRoles.size !== expectedRevokes.length)) {
+    offenders.push(`004 cardinality function=${literalFunctionCount} revoke=${[...revokedRoles].sort().join(",")} grant=${grantCount}`);
+  }
+  return offenders;
+}
+
+/** The whole 004 file: allowlisted statements AND exactly one function, ACL pair and comment. */
+function invalid004File(sql: string): string[] {
+  const offenders = unauthorized004(sql);
+  const statements = sqlStatements(sql);
+  const count = (pattern: RegExp) => statements.filter((statement) => pattern.test(statement)).length;
+  const shape: Array<[string, number]> = [
+    ["CREATE search_products_literal", count(/^CREATE OR REPLACE FUNCTION public\.search_products_literal\(/)],
+    ["REVOKE PUBLIC", count(/^REVOKE ALL ON FUNCTION public\.search_products_literal\(text, integer, integer\) FROM PUBLIC$/)],
+    ["REVOKE anon", count(/^REVOKE ALL ON FUNCTION public\.search_products_literal\(text, integer, integer\) FROM anon$/)],
+    ["REVOKE authenticated", count(/^REVOKE ALL ON FUNCTION public\.search_products_literal\(text, integer, integer\) FROM authenticated$/)],
+    ["GRANT service_role", count(/^GRANT ALL ON FUNCTION public\.search_products_literal\(text, integer, integer\) TO service_role$/)],
+    ["COMMENT", count(/^COMMENT ON FUNCTION public\.search_products_literal\(text, integer, integer\) IS '/)],
+  ];
+  for (const [label, found] of shape) if (found !== 1) offenders.push(`004 expects exactly one ${label}, found ${found}`);
+  return offenders;
+}
+
+/**
+ * Lo que una migración posterior NO puede hacer, con la marca que lo nombra.
+ * Se aplica sobre el SQL ya sin comentarios y sin literales de cadena (la prosa
+ * de un `COMMENT ON` no es una sentencia); los cuerpos `$$` sí se miran, porque
+ * un `DO $$ ... DROP ... $$` ejecuta lo que dice.
+ */
+const PATRONES_PROHIBIDOS: Array<[string, RegExp]> = [
+  ["CREATE TABLE", /\bCREATE\s+(?:(?:GLOBAL|LOCAL)\s+)?(?:TEMP(?:ORARY)?\s+|UNLOGGED\s+)?TABLE\b/i],
+  ["CREATE UNLOGGED TABLE", /\bCREATE\s+UNLOGGED\s+TABLE\b/i],
+  ["CREATE POLICY", /\bCREATE\s+POLICY\b/i],
+  ["ALTER POLICY", /\bALTER\s+POLICY\b/i],
+  ["GRANT/REVOKE", /\b(?:GRANT|REVOKE)\b/i],
+  ["DROP", /\bDROP\b/i],
+  ["ALTER TABLE", /\bALTER\s+TABLE\b/i],
+  ["OWNER TO", /\bOWNER\s+TO\b/i],
+  ["ROW LEVEL SECURITY", /\bROW\s+LEVEL\s+SECURITY\b/i],
+];
+
+/** Las marcas de `PATRONES_PROHIBIDOS` que aparecen en el SQL (sin comentarios). */
+function sentenciasProhibidas(sinComentarios: string): string[] {
+  const sinLiterales = sinComentarios.replace(/'(?:[^']|'')*'/g, "''");
+  return PATRONES_PROHIBIDOS.filter(([, patron]) => patron.test(sinLiterales)).map(([marca]) => marca);
+}
+
 describe("el squash: `001_orabella_schema.sql` es el archivo vivo (squash de la serie)", () => {
-  it("es el ÚNICO archivo de migración que queda, y el directorio no tiene un segundo", () => {
-    // El patrón de nombre es el de la serie: `0NN_nombre.sql`. Con el squash
-    // aplicado tiene que quedar UNO, y ese es el que se aplica a una base nueva.
+  it("001 abre la serie, y cada migración posterior es una decisión explícita y en orden", () => {
+    // El patrón de nombre es el de la serie: `0NN_nombre.sql`. 001 es el squash
+    // y va primero; después vienen SOLO las migraciones de la lista de arriba.
     //
-    // AGREGAR UNA MIGRACIÓN NUEVA EXIGE ACTUALIZAR ESTA PRUEBA. Si algún día
-    // aparece un `002_lo_que_sea.sql` en `supabase/migrations`, esta cuenta va a
-    // decir 2 y va a CAER, y que caiga es lo que se quiere: la serie ya no es
-    // un archivo y hay que decidir a mano qué se hace con ella —volver a
-    // aplastar en el archivo único, o dejar de leer el historial y apuntar los
-    // guardiánes de arriba al squash—, no dejar que un segundo archivo se cuele
-    // en silencio. El número es la decisión, no un número que se actualiza solo.
+    // AGREGAR UNA MIGRACIÓN NUEVA EXIGE ACTUALIZAR ESTA PRUEBA. Un `003_*.sql`
+    // que aparezca sin entrar en `MIGRACIONES_POSTERIORES` la hace CAER, y que
+    // caiga es lo que se quiere: ningún archivo se cuela en silencio. El número
+    // es la decisión, no un número que se actualiza solo.
     const porNombre = readdirSync(SQUASH_DIR)
       .filter((nombre) => /^0\d\d_.*\.sql$/.test(nombre))
       .sort();
-    expect(porNombre).toEqual([SQUASH_NAME]);
+    expect(porNombre).toEqual([SQUASH_NAME, ...MIGRACIONES_POSTERIORES]);
+
+    // Orden ESTRICTO de los números asignados: no se reutiliza un hueco de una
+    // migración retirada; el orden de aplicación sigue siendo el de nombre.
+    const numbers = porNombre.map((nombre) => Number(nombre.slice(0, 3)));
+    expect(new Set(numbers).size).toBe(numbers.length);
+    expect(numbers).toEqual([...numbers].sort((left, right) => left - right));
+  });
+
+  it("002 stays narrow, 003 is restricted, and 004 contains only the literal search RPC", () => {
+    const sql002 = stripSqlComments(readFileSync(join(SQUASH_DIR, "002_portable_platform.sql"), "utf8"));
+    expect(sentenciasProhibidas(sql002), "002_portable_platform.sql").toEqual([]);
+    expect(sql002.trim(), "002_portable_platform.sql").toMatch(/^BEGIN;[\s\S]*COMMIT;$/);
+
+    const sql003 = readFileSync(join(SQUASH_DIR, "003_payment_method_arqueo.sql"), "utf8");
+    expect(stripSqlComments(sql003).trim(), "003_payment_method_arqueo.sql").toMatch(/^BEGIN;[\s\S]*COMMIT;$/);
+    expect(unauthorized003(sql003), "003_payment_method_arqueo.sql").toEqual([]);
+    // 003's unavoidable privileged operations are only its named objects.
+    expect(stripSqlComments(sql003)).toMatch(/CREATE TABLE IF NOT EXISTS public\.cash_shift_method_balances/);
+    expect(stripSqlComments(sql003)).toMatch(/ALTER TABLE public\.payment_methods/);
+    expect(stripSqlComments(sql003)).not.toMatch(/\bCREATE\s+POLICY\b/i);
+    expect(stripSqlComments(sql003)).not.toMatch(/\bDROP\s+TABLE\b/i);
+
+    const sql004 = readFileSync(join(SQUASH_DIR, "004_inventory_literal_search.sql"), "utf8");
+    const body004 = stripSqlComments(sql004);
+    expect(body004.trim(), "004_inventory_literal_search.sql").toMatch(/^BEGIN;[\s\S]*COMMIT;$/);
+    expect(invalid004File(sql004), "004_inventory_literal_search.sql").toEqual([]);
+    expect(sqlStatements(sql004).filter((statement) => /^CREATE OR REPLACE FUNCTION/.test(statement))).toHaveLength(1);
+    expect(body004).toMatch(/SECURITY INVOKER/);
+    expect(body004).toMatch(/SET search_path TO 'public'/);
+    expect(body004).not.toMatch(/SECURITY DEFINER|\bEXECUTE\b|format\s*\(/i);
+    // LIKE with an explicit ESCAPE, the escape doubled first, then % and _.
+    expect(body004.match(/ILIKE v_pattern ESCAPE v_escape/g)).toHaveLength(2);
+    expect(body004).toMatch(/replace\(coalesce\(p_query, ''\), v_escape, v_escape \|\| v_escape\)/);
+    expect(body004).toMatch(/'%', v_escape \|\| '%'/);
+    expect(body004).toMatch(/'_', v_escape \|\| '_'/);
+    expect(body004).toMatch(/ORDER BY p\.name ASC, p\.id ASC/);
+    expect(body004).toMatch(/least\(greatest\(coalesce\(p_limit, 50\), 1\), 500\)/);
+    for (const role of ["PUBLIC", "anon", "authenticated"]) {
+      expect(sql004).toContain(`REVOKE ALL ON FUNCTION ${SEARCH_004} FROM ${role};`);
+    }
+    expect(sql004).toContain(`GRANT ALL ON FUNCTION ${SEARCH_004} TO service_role;`);
+  });
+
+  it("005 enforces whole-peso guards with fixed search_path, invoker security and closed ACLs", () => {
+    const sql005 = readFileSync(join(SQUASH_DIR, "005_cop_whole_peso.sql"), "utf8");
+    const body = stripSqlComments(sql005);
+    expect(body.trim()).toMatch(/^BEGIN;[\s\S]*COMMIT;$/);
+    for (const fn of ["assert_cop_whole_peso", "assert_cop_whole_peso_settings"]) {
+      expect(body).toMatch(new RegExp(`CREATE OR REPLACE FUNCTION public\\.${fn}\\(\\)[\\s\\S]*?SECURITY INVOKER[\\s\\S]*?SET search_path TO 'public'`));
+      for (const role of ["PUBLIC", "anon", "authenticated"]) {
+        expect(sql005).toContain(`REVOKE ALL ON FUNCTION public.${fn}() FROM ${role};`);
+      }
+      expect(sql005).toContain(`GRANT ALL ON FUNCTION public.${fn}() TO service_role;`);
+    }
+    expect(body).toContain("COP_WHOLE_PESO_REQUIRED");
+    expect(body).toContain("('employees', ARRAY['salary_fixed'])");
+    expect(body).toContain("IS NOT DISTINCT FROM");
+    expect(body).toContain("CREATE OR REPLACE VIEW public.cop_legacy_cents_audit");
+    for (const role of ["PUBLIC", "anon", "authenticated"]) {
+      expect(sql005).toContain(`REVOKE ALL ON public.cop_legacy_cents_audit FROM ${role};`);
+    }
+    expect(sql005).toContain("GRANT SELECT ON public.cop_legacy_cents_audit TO service_role;");
+    expect(body).not.toMatch(/GRANT\s+(?:ALL|INSERT|UPDATE|DELETE)\s+ON public\.cop_legacy_cents_audit/i);
+  });
+
+  it("004's guard inspects the WHOLE function, not only its prefix (mutations of the real file)", () => {
+    const real = readFileSync(join(SQUASH_DIR, "004_inventory_literal_search.sql"), "utf8");
+    const mutate = (from: string, to: string) => {
+      expect(real, `fixture anchor: ${from}`).toContain(from);
+      return real.replace(from, to);
+    };
+    const bodyEnd = "  OFFSET v_offset;\n";
+    // Every `bodyInjection` keeps header, signature, SECURITY INVOKER,
+    // search_path, predicates, order and clamps intact. It can only fail because
+    // the complete-body allowlist sees the extra executable statement.
+    const bodyInjection = (label: string, statement: string): [string, string] => [
+      label,
+      mutate(bodyEnd, `${bodyEnd}  ${statement}\n`),
+    ];
+    const bodyMutations: Array<[string, string]> = [
+      bodyInjection("DELETE in the body", "DELETE FROM public.products;"),
+      bodyInjection("UPDATE in the body", "UPDATE public.products SET name = 'x';"),
+      bodyInjection("INSERT in the body", "INSERT INTO public.audit_logs (action, entity, entity_id) VALUES ('a', 'b', 'c');"),
+      bodyInjection("MERGE in the body", "MERGE INTO public.products p USING public.products q ON false WHEN NOT MATCHED THEN DO NOTHING;"),
+      bodyInjection("COPY in the body", "COPY public.products TO '/tmp/x';"),
+      bodyInjection("TRUNCATE in the body", "TRUNCATE public.products;"),
+      bodyInjection("GRANT in the body", "GRANT ALL ON public.products TO anon;"),
+      bodyInjection("DROP in the body", "DROP TABLE public.audit_logs;"),
+      bodyInjection("ALTER in the body", "ALTER TABLE public.products ADD COLUMN injected text;"),
+      bodyInjection("CREATE TABLE in the body", "CREATE TABLE public.injected (id uuid);"),
+      bodyInjection("LOCK TABLE in the body", "LOCK TABLE public.products IN ACCESS EXCLUSIVE MODE;"),
+      bodyInjection("CALL in the body", "CALL public.some_procedure();"),
+      bodyInjection("PERFORM set_config role in the body", "PERFORM set_config('role', 'postgres', true);"),
+      bodyInjection("second RETURN QUERY public.users", "RETURN QUERY SELECT u.id, u.id::text, u.full_name, NULL::text, 0, 0, NULL::numeric, NULL::numeric, NULL::numeric, true FROM public.users u;"),
+      bodyInjection("SET ROLE in the body", "SET ROLE postgres;"),
+      bodyInjection("SET LOCAL ROLE in the body", "SET LOCAL ROLE service_role;"),
+      bodyInjection("dynamic EXECUTE in the body", "EXECUTE 'SELECT 1';"),
+      bodyInjection("format() in the body", "PERFORM format('%s', 1);"),
+    ];
+    for (const [label, sql] of bodyMutations) {
+      expect(invalid004Function(sqlStatements(sql).find((statement) => /^CREATE OR REPLACE FUNCTION/.test(statement)) ?? ""), label).toContain("non-canonical read-only function body");
+    }
+    const mutations: Array<[string, string]> = [
+      ...bodyMutations,
+      ["SECURITY DEFINER in the CREATE", mutate("SECURITY INVOKER", "SECURITY DEFINER")],
+      ["SECURITY INVOKER removed", mutate("SECURITY INVOKER\n", "")],
+      ["search_path widened", mutate("SET search_path TO 'public'", "SET search_path TO 'public', 'pg_temp'")],
+      ["predicate changed", mutate("OR p.sku ILIKE v_pattern ESCAPE v_escape", "OR true")],
+      ["limit clamp removed", mutate("least(greatest(coalesce(p_limit, 50), 1), 500)", "p_limit")],
+      ["escape order changed", mutate("v_escape, v_escape || v_escape", "v_escape, v_escape")],
+      ["an extra column in RETURNS TABLE", mutate("  is_active boolean\n)", "  is_active boolean,\n  password_hash text\n)")],
+      ["a second, alternative function", mutate("REVOKE ALL ON FUNCTION", "CREATE OR REPLACE FUNCTION public.search_products_any(p text) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;\nREVOKE ALL ON FUNCTION")],
+      ["another function name with the same body", mutate("FUNCTION public.search_products_literal(\n", "FUNCTION public.search_products_other(\n")],
+      ["the REVOKE removed", mutate("REVOKE ALL ON FUNCTION public.search_products_literal(text, integer, integer) FROM PUBLIC;\n", "")],
+      ["the GRANT duplicated", mutate("TO service_role;\n", "TO service_role;\nGRANT ALL ON FUNCTION public.search_products_literal(text, integer, integer) TO service_role;\n")],
+      ["the CREATE removed", real.replace(/CREATE OR REPLACE FUNCTION[\s\S]*?\$\$;\n/, "")],
+    ];
+    for (const [label, sql] of mutations) {
+      expect(invalid004File(sql), label).not.toEqual([]);
+    }
+    // Positive control: the real file passes, and harmless formatting does too.
+    expect(invalid004File(real)).toEqual([]);
+    expect(invalid004File(real.replace(/\n {2}/g, "\n    ").replace(/-- Escape[^\n]*\n/, ""))).toEqual([]);
+  });
+
+  it("004's allowlist rejects any other object, grant or DDL (negative fixtures)", () => {
+    const wrap = (statement: string) => `BEGIN;\n${statement}\nCOMMIT;`;
+    const unauthorized = [
+      "CREATE OR REPLACE FUNCTION public.search_products(p_query text) RETURNS SETOF public.products LANGUAGE sql AS $$ SELECT * FROM public.products $$;",
+      "CREATE OR REPLACE FUNCTION public.search_products_literal(p_query text) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;",
+      "CREATE OR REPLACE FUNCTION public.search_products_literal( p_query text, p_limit integer, p_offset integer DEFAULT 0 ) RETURNS TABLE (id uuid) LANGUAGE plpgsql AS $$ BEGIN DROP TABLE public.products; END; $$;",
+      "CREATE OR REPLACE FUNCTION public.search_products_literal( p_query text, p_limit integer, p_offset integer DEFAULT 0 ) RETURNS TABLE (id uuid) LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'SELECT ' || p_query; END; $$;",
+      "CREATE OR REPLACE FUNCTION public.search_products_literal( p_query text, p_limit integer, p_offset integer DEFAULT 0 ) RETURNS TABLE (id uuid) LANGUAGE plpgsql AS $$ BEGIN GRANT ALL ON public.products TO anon; END; $$;",
+      `GRANT ALL ON FUNCTION ${SEARCH_004} TO anon;`,
+      `GRANT ALL ON FUNCTION ${SEARCH_004} TO authenticated;`,
+      `GRANT ALL ON FUNCTION ${SEARCH_004} TO PUBLIC;`,
+      `REVOKE ALL ON FUNCTION ${SEARCH_004} FROM service_role;`,
+      "GRANT SELECT ON public.products TO anon;",
+      "REVOKE ALL ON FUNCTION public.deduct_stock_atomic(uuid, text, jsonb) FROM service_role;",
+      `ALTER FUNCTION ${SEARCH_004} SECURITY DEFINER;`,
+      `ALTER FUNCTION ${SEARCH_004} OWNER TO anon;`,
+      `DROP FUNCTION ${SEARCH_004};`,
+      "CREATE INDEX idx_products_name_trgm ON public.products (name);",
+      "CREATE TABLE public.search_cache (id uuid);",
+      "ALTER TABLE public.products ADD COLUMN search text;",
+      "CREATE POLICY p ON public.products USING (true);",
+      "CREATE TRIGGER trg_x BEFORE INSERT ON public.products FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();",
+      "COMMENT ON TABLE public.products IS 'x';",
+      "DO $$ BEGIN DROP TABLE public.products; END; $$;",
+      "UPDATE public.products SET name = 'x';",
+      "DELETE FROM public.products;",
+    ];
+    // The exact signature prefix the OLD rule accepted, followed by a harmful
+    // body or clause. Every one of these passed the prefix-only allowlist.
+    const prefix =
+      "CREATE OR REPLACE FUNCTION public.search_products_literal( p_query text, p_limit integer, p_offset integer DEFAULT 0 ) RETURNS TABLE ( id uuid, sku text, name text, description text, stock_qty integer, min_stock integer, cost_price numeric, sale_price numeric, commission_value numeric, is_active boolean )";
+    const invoker = "LANGUAGE plpgsql SECURITY INVOKER SET search_path TO 'public'";
+    unauthorized.push(
+      `${prefix} ${invoker} AS $$ BEGIN DELETE FROM public.products; END; $$;`,
+      `${prefix} ${invoker} AS $$ BEGIN UPDATE public.products SET name = 'x'; END; $$;`,
+      `${prefix} ${invoker} AS $$ BEGIN INSERT INTO public.products (sku, name) VALUES ('x', 'y'); END; $$;`,
+      `${prefix} ${invoker} AS $$ BEGIN SET ROLE postgres; END; $$;`,
+      `${prefix} LANGUAGE plpgsql SECURITY DEFINER SET search_path TO 'public' AS $$ BEGIN RETURN; END; $$;`,
+      `${prefix} ${invoker} AS $$ BEGIN RETURN QUERY EXECUTE format('SELECT * FROM %I', p_query); END; $$;`,
+    );
+    for (const statement of unauthorized) {
+      expect(unauthorized004(wrap(statement)), statement).not.toEqual([]);
+    }
+    // The old prefix-only rule really accepted those harmful statements.
+    const prefixOnly = /^CREATE OR REPLACE FUNCTION public\.search_products_literal\( p_query text, p_limit integer, p_offset integer DEFAULT 0 \) RETURNS TABLE \(/;
+    expect(unauthorized.slice(-6).every((statement) => prefixOnly.test(sqlStatements(wrap(statement))[1]))).toBe(true);
+    for (const statement of [
+      `REVOKE ALL ON FUNCTION ${SEARCH_004} FROM PUBLIC;`,
+      `REVOKE ALL ON FUNCTION ${SEARCH_004} FROM anon;`,
+      `REVOKE ALL ON FUNCTION ${SEARCH_004} FROM authenticated;`,
+      `GRANT ALL ON FUNCTION ${SEARCH_004} TO service_role;`,
+      `COMMENT ON FUNCTION ${SEARCH_004} IS 'x';`,
+    ]) {
+      expect(unauthorized004(wrap(statement)), statement).toEqual([]);
+    }
+  });
+
+  it("003's allowlist rejects anything outside its named objects and actions (negative fixtures)", () => {
+    const wrap = (statement: string) => `BEGIN;\n${statement}\nCOMMIT;`;
+    const unauthorized: string[] = [
+      // Other actions on the authorized table.
+      "ALTER TABLE public.payment_methods DROP COLUMN fee_percent;",
+      "ALTER TABLE public.payment_methods DROP CONSTRAINT payment_methods_code_key;",
+      "ALTER TABLE public.payment_methods DISABLE ROW LEVEL SECURITY;",
+      "ALTER TABLE public.payment_methods OWNER TO anon;",
+      // Any other table.
+      "ALTER TABLE public.users ADD COLUMN x int;",
+      "CREATE TABLE public.otra (id uuid PRIMARY KEY);",
+      "CREATE TABLE IF NOT EXISTS public.cash_shift_method_balances_v2 (id uuid);",
+      "ALTER TABLE public.cash_shift_method_balances DISABLE ROW LEVEL SECURITY;",
+      // Grants beyond the two RPCs to service_role.
+      "GRANT ALL ON FUNCTION public.cash_shift_method_expected_balance(uuid, text) TO anon;",
+      "GRANT ALL ON FUNCTION public.cash_open_shift_atomic_legacy(uuid, uuid, numeric, jsonb) TO service_role;",
+      "GRANT SELECT ON public.cash_shift_method_balances TO authenticated;",
+      // Drops.
+      "DROP TABLE public.cash_shift_method_balances;",
+      "DROP FUNCTION public.cash_close_shift_atomic(uuid, uuid, timestamptz, jsonb, jsonb, jsonb);",
+      "DROP TRIGGER IF EXISTS trg_commission_payouts_cap ON public.commission_payouts;",
+      "DROP POLICY pol_roles_readonly ON public.roles;",
+      // Policies and foreign functions/triggers.
+      "CREATE POLICY p ON public.cash_shift_method_balances USING (true);",
+      "CREATE OR REPLACE FUNCTION public.current_sede_id() RETURNS uuid LANGUAGE sql AS $$ SELECT NULL::uuid $$;",
+      "CREATE TRIGGER trg_x BEFORE INSERT ON public.users FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();",
+      // DDL hidden inside an authorized function body executes too.
+      "CREATE OR REPLACE FUNCTION public.enforce_cash_method_minimum(p uuid) RETURNS void LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'x'; DROP TABLE public.users; END; $$;",
+      // An anonymous block other than the single authorized rename.
+      "DO $$ BEGIN DROP TABLE public.users; END; $$;",
+      // The collection/voucher guards: only their exact table, events and function.
+      "CREATE TRIGGER trg_payments_balance_guard BEFORE DELETE ON public.payments FOR EACH ROW EXECUTE FUNCTION public.enforce_collection_move_minimum();",
+      "CREATE TRIGGER trg_invoice_payments_balance_guard BEFORE UPDATE OF amount ON public.invoices FOR EACH ROW EXECUTE FUNCTION public.enforce_collection_move_minimum();",
+      "CREATE TRIGGER trg_voucher_requests_cash_out_state BEFORE UPDATE ON public.voucher_requests FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();",
+      "DROP TRIGGER IF EXISTS trg_invoice_payments_cap ON public.invoice_payments;",
+      "GRANT ALL ON FUNCTION public.voucher_is_cash_out(text, uuid, text, uuid) TO service_role;",
+      "GRANT ALL ON FUNCTION public.enforce_collection_move_minimum() TO anon;",
+      "ALTER TABLE public.invoice_payments DISABLE TRIGGER trg_invoice_payments_balance_guard;",
+      "ALTER TABLE public.payments DISABLE TRIGGER trg_payments_balance_guard;",
+      "CREATE TRIGGER trg_payments_balance_guard BEFORE UPDATE OF amount ON public.payments FOR EACH ROW EXECUTE FUNCTION public.enforce_collection_move_minimum();",
+      "CREATE TRIGGER trg_invoice_payments_balance_guard BEFORE UPDATE OF amount, cash_shift_id ON public.invoice_payments FOR EACH ROW EXECUTE FUNCTION public.enforce_collection_move_minimum();",
+      // The edit-RPC versioning: only these two renames, no other 001 RPC, no wider grants.
+      "DO $$ BEGIN IF to_regprocedure('public.invoice_annul_atomic_legacy(uuid,uuid,integer,text,jsonb)') IS NULL THEN ALTER FUNCTION public.invoice_annul_atomic(uuid, uuid, integer, text, jsonb) RENAME TO invoice_annul_atomic_legacy; END IF; END; $$;",
+      "DO $$ BEGIN IF to_regprocedure('public.invoice_edit_items_atomic_legacy(uuid,uuid,integer,text,jsonb)') IS NULL THEN ALTER FUNCTION public.invoice_edit_emitted_atomic(uuid, uuid, integer, text, jsonb) RENAME TO invoice_edit_items_atomic_legacy; END IF; END; $$;",
+      "CREATE OR REPLACE FUNCTION public.invoice_annul_atomic(p uuid) RETURNS jsonb LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END; $$;",
+      "GRANT ALL ON FUNCTION public.invoice_edit_items_atomic(uuid, uuid, integer, text, jsonb) TO anon;",
+      "GRANT ALL ON FUNCTION public.invoice_edit_items_atomic_legacy(uuid, uuid, integer, text, jsonb) TO authenticated;",
+      "GRANT ALL ON FUNCTION public.lock_invoice_edit_payment_balances(uuid, jsonb) TO PUBLIC;",
+      "ALTER FUNCTION public.invoice_edit_items_atomic(uuid, uuid, integer, text, jsonb) SECURITY DEFINER;",
+      // Data changes outside the backfill.
+      "UPDATE public.payment_methods SET arqueo_mode = 'none';",
+      "DELETE FROM public.payment_methods;",
+    ];
+    for (const statement of unauthorized) {
+      expect(unauthorized003(wrap(statement)), statement).toHaveLength(1);
+    }
+    // Positive control: authorized statements pass, so the empty list above is meaningful.
+    for (const statement of [
+      "ALTER TABLE public.payment_methods ADD COLUMN IF NOT EXISTS arqueo_mode text;",
+      "GRANT ALL ON FUNCTION public.cash_shift_method_expected_balance(uuid, text) TO service_role;",
+      "DROP TRIGGER IF EXISTS trg_voucher_requests_balance_guard ON public.voucher_requests;",
+    ]) {
+      expect(unauthorized003(wrap(statement)), statement).toEqual([]);
+    }
+  });
+
+  it("001-005 are not modified by this change (byte-identical to the integration base)", () => {
+    for (const [name, sha] of [
+      ["001_orabella_schema.sql", BASE_SHA_001],
+      ["002_portable_platform.sql", BASE_SHA_002],
+      ["003_payment_method_arqueo.sql", BASE_SHA_003],
+    ] as const) {
+      const text = readFileSync(join(SQUASH_DIR, name));
+      // Git's blob hash is "blob <byteLength>\\0" followed by the bytes.
+      const actual = createHash("sha1").update(`blob ${text.length}\0`).update(text).digest("hex");
+      expect(actual, name).toBe(sha);
+    }
+    for (const [name, sha] of [
+      ["004_inventory_literal_search.sql", BASE_SHA256_004],
+      ["005_cop_whole_peso.sql", BASE_SHA256_005],
+    ] as const) {
+      const actual = createHash("sha256").update(readFileSync(join(SQUASH_DIR, name))).digest("hex");
+      expect(actual, name).toBe(sha);
+    }
+  });
+
+  it("el detector de sentencias prohibidas CAZA cada patrón (control negativo)", () => {
+    // Si una de estas líneas pasa sin marca, la guarda de arriba no protege nada.
+    const casos: Array<[string, string]> = [
+      ["CREATE TABLE public.x (id int);", "CREATE TABLE"],
+      ["CREATE UNLOGGED TABLE public.x (id int);", "CREATE UNLOGGED TABLE"],
+      ["create temp table x (id int);", "CREATE TABLE"],
+      ["CREATE POLICY p ON public.users USING (true);", "CREATE POLICY"],
+      ["ALTER POLICY pol_users_sede_isolation ON public.users TO PUBLIC;", "ALTER POLICY"],
+      ["GRANT ALL ON public.users TO anon;", "GRANT/REVOKE"],
+      ["BEGIN; REVOKE ALL ON FUNCTION public.current_sede_id() FROM service_role;", "GRANT/REVOKE"],
+      ["DROP POLICY pol_roles_readonly ON public.roles;", "DROP"],
+      ["DROP FUNCTION IF EXISTS public.current_sede_id();", "DROP"],
+      ["ALTER TABLE public.users ADD COLUMN x int;", "ALTER TABLE"],
+      ["ALTER FUNCTION public.current_sede_id() OWNER TO anon;", "OWNER TO"],
+      ["ALTER TABLE public.users DISABLE ROW LEVEL SECURITY;", "ROW LEVEL SECURITY"],
+      ["ALTER TABLE ONLY public.users NO FORCE ROW LEVEL SECURITY;", "ROW LEVEL SECURITY"],
+    ];
+    for (const [fragmento, marca] of casos) {
+      expect(sentenciasProhibidas(stripSqlComments(fragmento)), fragmento).toContain(marca);
+    }
+    // Y no es de goma: la prosa entre comillas y los comentarios no cuentan.
+    expect(sentenciasProhibidas(stripSqlComments("-- DROP TABLE x\nCOMMENT ON FUNCTION f() IS 'no hace DROP ni GRANT';"))).toEqual([]);
+  });
+
+  it("002 deja `current_sede_id()` sin `auth.jwt()` y con los mismos atributos que 001", () => {
+    const sql = stripSqlComments(readFileSync(join(SQUASH_DIR, "002_portable_platform.sql"), "utf8")).replace(
+      /^COMMENT ON[^\n]*$/gm,
+      "",
+    );
+    // Sin dependencia del esquema `auth` en SQL ejecutable (la prosa de `COMMENT ON` no cuenta).
+    expect(sql).not.toMatch(/\bauth\s*\./);
+    // Lee lo mismo que `auth.jwt()` de Supabase.
+    expect(sql).toContain("current_setting('request.jwt.claims', true)");
+    expect(sql).toContain("current_setting('request.jwt.claim', true)");
+    // Misma cabecera que 001: firma, lenguaje, volatilidad, definer y search_path.
+    const cabecera = /CREATE FUNCTION public\.current_sede_id\(\) RETURNS uuid\s+LANGUAGE sql STABLE SECURITY DEFINER\s+SET search_path TO 'public'/;
+    expect(squashSchemaSql()).toMatch(cabecera);
+    expect(sql.replace("CREATE OR REPLACE FUNCTION", "CREATE FUNCTION")).toMatch(cabecera);
   });
 
   it("el archivo declara las 36 tablas y las 10 políticas de la serie, sin prosa de más", () => {

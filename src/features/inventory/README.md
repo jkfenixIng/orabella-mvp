@@ -5,7 +5,7 @@ motivo y responsable (kardex), stock derivado exclusivamente de
 movimientos, bloqueo de venta sin stock, alerta de mínimo y búsqueda por
 nombre o SKU (INV-01…05).
 
-## Tablas (migración `supabase/migrations/004_inventory.sql`)
+## Tablas (esquema histórico `004_inventory.sql`; búsqueda literal en migración activa `004_inventory_literal_search.sql`)
 
 - `products`: `sede_id` FK NOT NULL, `sku` NOT NULL (UNIQUE por sede),
   `name`, `description`, `stock_qty` (default 0, CHECK >= 0),
@@ -59,6 +59,21 @@ Deny-by-default con políticas por sede permisivas temporales
 (`USING true`) + `TODO(seguridad-T7)`: las sesiones del MVP son tokens
 opacos propios, sin claim de sede en `auth.jwt()`; la segregación la
 aplica la capa servidor. Endurecer al migrar a JWT de Supabase.
+
+## Búsqueda literal de productos (cambio observable intencional)
+
+La búsqueda de nombre/SKU ahora se resuelve en PostgreSQL por
+`public.search_products_literal(text, integer, integer)` (migración 004), tanto
+para Supabase como para PostgreSQL directo. El texto viaja como parámetro tipado,
+no como un filtro `.or()` de PostgREST:
+
+- `%`, `_`, `*`, barra invertida, comas, paréntesis y comillas simples/dobles se
+  tratan como texto literal, sin sintaxis SQL ni PostgREST.
+- **`*` ya no es wildcard.** Una búsqueda `a*` encuentra texto que contiene los
+  dos caracteres `a` y `*`; no los nombres que empiezan por `a`.
+- La búsqueda es completa para su página final: no hay over-fetch ni filtro en
+  memoria después de aplicar el límite. El orden total es `name ASC, id ASC` y
+  acepta offset para páginas siguientes.
 
 ## Límites de lectura
 

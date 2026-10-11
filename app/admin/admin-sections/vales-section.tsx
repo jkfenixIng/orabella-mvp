@@ -24,6 +24,7 @@ import {
 } from "../admin-styles";
 import { formatMoney, toNumber, type ActionResult } from "../admin-shared";
 import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import { copInputDigits } from "@/src/shared/money/cop";
 
 /** Días ISO (1=lunes…7=domingo) con su nombre corto. */
 const DAY_NAMES: Array<{ day: number; label: string }> = [
@@ -85,7 +86,7 @@ function voucherPerDayValues(initial: VoucherSettingsRow | null): Record<number,
   const map: Record<number, string> = {};
   for (const [day, amount] of Object.entries(initial?.per_day_limits ?? {})) {
     const numericDay = Number(day);
-    if (numericDay >= 1 && numericDay <= 7) map[numericDay] = String(amount);
+    if (numericDay >= 1 && numericDay <= 7) map[numericDay] = copInputDigits(amount);
   }
   return map;
 }
@@ -123,8 +124,8 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
   const [selectedDays, setSelectedDays] = useState<number[]>(() => voucherSelectedDays(initial));
   const [capsMode, setCapsMode] = useState<VoucherCapsMode>(() => voucherCapsMode(initial));
   const [perDayMode, setPerDayMode] = useState<VoucherPerDayMode>(() => voucherPerDayMode(initial));
-  const [maxDay, setMaxDay] = useState(() => (initial?.max_per_day ? String(initial.max_per_day) : ""));
-  const [maxWeek, setMaxWeek] = useState(() => (initial?.max_per_week ? String(initial.max_per_week) : ""));
+  const [maxDay, setMaxDay] = useState(() => (copInputDigits(initial?.max_per_day)));
+  const [maxWeek, setMaxWeek] = useState(() => (copInputDigits(initial?.max_per_week)));
   const [perDayValues, setPerDayValues] = useState<Record<number, string>>(() => voucherPerDayValues(initial));
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -142,8 +143,8 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
     setSelectedDays(voucherSelectedDays(row));
     setCapsMode(voucherCapsMode(row));
     setPerDayMode(voucherPerDayMode(row));
-    setMaxDay(row.max_per_day ? String(row.max_per_day) : "");
-    setMaxWeek(row.max_per_week ? String(row.max_per_week) : "");
+    setMaxDay(copInputDigits(row.max_per_day));
+    setMaxWeek(copInputDigits(row.max_per_week));
     setPerDayValues(voucherPerDayValues(row));
   }
 

@@ -23,4 +23,18 @@ es un evento rutinario que no pide ninguna acción del admin.
   revisión con justificación obligatoria (una o todas con nota
   compartida), detalle por acción con valores (superficie
   solo-admin). Entrada en el menú (grupo Control) con insignia de sin leer.
+- Orden de la bandeja (cambio intencional, Fase 3b-1 de la extracción de
+  Supabase): `created_at DESC, id DESC` en los dos motores (supabase-js y
+  PostgreSQL directo). Antes solo era `created_at DESC`, y PostgreSQL no
+  garantiza el orden entre alertas del mismo instante: al paginar, una alerta
+  podía repetirse en dos páginas o no aparecer en ninguna. El `id` desempata y
+  vuelve el orden total. Lo único observable es el orden RELATIVO de alertas
+  con el mismo `created_at`; el conteo, los filtros y el tamaño de página no
+  cambian.
+- Acceso a datos: puerto `repos/alerts.ts` (supabase-js por defecto) y
+  `repos/alerts.drizzle.ts` (solo con `DB_ENGINE=postgres`, cargado con
+  `import()`).
 - Tests (`tests/alerts.test.ts`): conjunto, tamaño de página y esquema.
+  `tests/alerts-service.test.ts` fija las peticiones de supabase-js;
+  `tests/db/alerts.repo.db.test.ts` prueba la equivalencia entre motores,
+  incluidos empates de `created_at` repartidos entre dos páginas.

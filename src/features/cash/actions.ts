@@ -5,6 +5,7 @@ import { revalidateTag } from "next/cache";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { requireSession, requireAdminSession } from "@/src/features/admin/service";
 import { accumulateDayTotals } from "./schemas";
+import { copSchema } from "@/src/shared/money/cop";
 import {
   CashError,
   closeShift,
@@ -12,6 +13,7 @@ import {
   getDayView,
   getHistory,
   getOpenShiftWithOpener,
+  getShiftMethodBalances,
   listDenominations,
   listRegisters,
   openShift,
@@ -75,6 +77,17 @@ export async function closeShiftAction(id: string, input: unknown) {
       userId: session.userId,
       roles: session.roles,
     });
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** 003: per-method minimum and availability of a shift. Admin only (internal). */
+export async function getShiftMethodBalancesAction(shiftId: string) {
+  try {
+    await requireAdminSession(await sessionToken());
+    const data = await getShiftMethodBalances(shiftId);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);
@@ -151,8 +164,11 @@ export async function listRegistersAction() {
 export async function updateRegisterBaseAction(registerId: string, input: unknown) {
   try {
     const session = await requireAdminSession(await sessionToken());
-    const base = (input as { base_configurada?: unknown }).base_configurada;
-    const data = await updateRegisterBase(registerId, Number(base), {
+    const parsed = copSchema("Base inválida.", "Base inválida.").safeParse(
+      (input as { base_configurada?: unknown } | null)?.base_configurada,
+    );
+    if (!parsed.success) throw new CashError("VALIDATION", "Base inválida.", 400);
+    const data = await updateRegisterBase(registerId, parsed.data, {
       userId: session.userId,
     });
     return { success: true as const, data };

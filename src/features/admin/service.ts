@@ -1,6 +1,7 @@
 import {
   employeeSchema,
   normalizeEmployeeCode,
+  normalizePaymentMethodCode,
   paymentMethodSchema,
   serviceSchema,
   setUserRolesSchema,
@@ -10,10 +11,21 @@ import {
   type ServiceInput,
   type TaxConfigInput,
 } from "./schemas";
-import { isRoleCode, isSedeAssignableRole, type RoleCode } from "@/src/features/auth/schemas";
+import { isRoleCode, type RoleCode } from "@/src/features/auth/schemas";
+import {
+  DEFAULT_EMPLOYEE_ROLE,
+  roleIsAssignableForSede,
+  rolesAreNonEmpty,
+  violatesSuperadminGuard,
+} from "./role-policy";
 import { getSessionUser, hashPassword } from "@/src/features/auth/service";
 import { readAllPaged } from "@/src/shared/lib/paged";
 import { unstable_cache } from "next/cache";
+import { servicesRepo, type ServiceRow } from "./repos/services";
+import { catalogsRepo } from "./repos/catalogs";
+import { adminUsersRepo } from "./repos/users";
+import { DbQueryError } from "@/src/shared/db/errors";
+import { COP_WHOLE_PESO_MESSAGE, copValidationError } from "@/src/shared/money/cop";
 
 // Compatibilidad: la identidad de estos guardas vive en
 // `@/src/shared/lib/sede.ts` (import cruzado entre features resuelto).
@@ -35,15 +47,6 @@ export {
  * El split físico en módulos se difiere a post-pruebas para no romper
  * los 12 importadores activos; el código nuevo usa `@/src/shared/lib/sede.ts`.
  */
-
-/**
- * Cliente privilegiado bajo demanda (service_role, solo servidor).
- * Import dinámico para que los tests unitarios (sin red/env) nunca lo carguen.
- */
-async function adminDb() {
-  const { createAdminClient } = await import("@/src/shared/lib/supabase/server");
-  return createAdminClient();
-}
 
 /**
  * Límite de lectura para listados (navegación instantánea): todo listado
@@ -115,32 +118,12 @@ export async function requireSession(token: string | null | undefined): Promise<
  */
 
 // ------------------------------------------------------------- empleados ---
-export interface EmployeeRow {
-  id: string;
-  user_id: string | null;
-  full_name: string;
-  employee_code: string | null;
-  document: string;
-  phone: string | null;
-  position: string | null;
-  payout_mode: string;
-  email: string | null;
-  birth_date: string | null;
-  pay_type: string;
-  /**
-   * F2: cadencia acordada con el empleado (`employees.pay_frequency`, 063).
-   * `null` es «sin cadencia definida»: el fijo se prorratea por los días del
-   * período, que es el comportamiento de hoy.
-   *
-   * REQUERIDA: `EMPLOYEE_SELECT` la trae siempre, así que el tipo no puede
-   * mentir dejándola opcional. Una fila sin la clave sería un legajo leído con
-   * un `select` incompleto, no un caso válido.
-   */
-  pay_frequency: string | null;
-  salary_fixed: number | null;
-  commission_percent: number | null;
-  is_active: boolean;
-}
+/**
+ * F2: `pay_frequency` is always selected; `null` means no declared cadence.
+ * Re-exported from the port so both adapters have exactly this domain contract.
+ */
+export type { EmployeeCatalogRow as EmployeeRow } from "./repos/catalogs";
+import type { EmployeeCatalogRow as EmployeeRow } from "./repos/catalogs";
 
 export interface SedeUserRow {
   id: string;
@@ -155,18 +138,29 @@ export interface SedeUserRow {
   roles: RoleCode[];
 }
 
-const EMPLOYEE_SELECT =
-  "id, user_id, full_name, employee_code, document, phone, position, payout_mode, email, birth_date, pay_type, pay_frequency, salary_fixed, commission_percent, is_active";
-
 async function fetchEmployees(limit?: number): Promise<EmployeeRow[]> {
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("employees")
-    .select(EMPLOYEE_SELECT)
-    .order("full_name")
-    .limit(clampLimit(limit));
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as EmployeeRow[];
+  const repo = await catalogsRepo();
+  return internalOnFailure(() => repo.listEmployees(clampLimit(limit)));
+}
+
+/** Admin's COP write boundary: the unambiguous 005 P0001 is always validation. */
+function adminCopValidation(error: unknown): AdminError | null {
+  return copValidationError(error, () => new AdminError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400));
+}
+
+function throwAdminCop(error: unknown): void {
+  const cop = adminCopValidation(error);
+  if (cop) throw cop;
+}
+
+/** A repository failure keeps the historical answer of the catalog readers. */
+async function internalOnFailure<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (error) {
+    throwAdminCop(error);
+    throw new AdminError("INTERNAL", "Error interno.", 500);
+  }
 }
 
 /**
@@ -186,31 +180,19 @@ async function fetchEmployees(limit?: number): Promise<EmployeeRow[]> {
  * la vista, nunca en "leí lo que alcancé".
  */
 export async function listAllEmployees(): Promise<EmployeeRow[]> {
-  const db = await adminDb();
+  const repo = await catalogsRepo();
+  // Orden (full_name, id) determinista: lo fija el puerto en ambos motores.
   return readAllPaged<EmployeeRow>({
     table: "employees",
-    fetchPage: (from, to) =>
-      db
-        .from("employees")
-        .select(EMPLOYEE_SELECT)
-        // El nombre es el orden histórico de la lista; `id` desempata para que
-        // dos homónimos no caigan en páginas distintas (ni se repitan ni falten).
-        .order("full_name")
-        .order("id")
-        .range(from, to),
+    fetchPage: (from, to) => repo.employeesPage(from, to),
   });
 }
 
 export async function getEmployee(id: string): Promise<EmployeeRow> {
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("employees")
-    .select(EMPLOYEE_SELECT)
-    .eq("id", id)
-    .maybeSingle();
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
+  const repo = await catalogsRepo();
+  const data = await internalOnFailure(() => repo.findEmployee(id));
   if (!data) throw new AdminError("NOT_FOUND", "Empleado no encontrado.", 404);
-  return data as EmployeeRow;
+  return data;
 }
 
 /**
@@ -224,36 +206,16 @@ export async function getEmployee(id: string): Promise<EmployeeRow> {
  * reúne sus cuentas más las que todavía no tienen ninguna.
  */
 export async function listSedeUsers(sedeId: string): Promise<SedeUserRow[]> {
-  const db = await adminDb();
-  const { data: users, error } = await db
-    .from("users")
-    .select("id, sede_id, full_name, id_number")
-    .or(`sede_id.eq.${sedeId},sede_id.is.null`)
-    .order("full_name");
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
-  const rows = (users ?? []) as Array<{ id: string; sede_id: string | null; full_name: string; id_number: string }>;
-  const { data: roleRows, error: roleError } = await db
-    .from("user_roles")
-    .select("user_id, roles(code)")
-    .in(
-      "user_id",
-      rows.map((row) => row.id),
-    );
-  if (roleError) throw new AdminError("INTERNAL", "Error interno.", 500);
+  // Data access goes through `./repos/users` (DB_ENGINE). Intentional change on
+  // both engines: the sede is a quoted/typed value, never PostgREST syntax, and
+  // the order is total (full_name, id).
+  const repo = await adminUsersRepo();
+  const rows = await internalOnFailure(() => repo.listSedeUsers(sedeId));
+  const roleRows = await internalOnFailure(() => repo.roleEmbeds(rows.map((row) => row.id)));
   const byUser = new Map<string, RoleCode[]>();
-  for (const row of (roleRows ?? []) as unknown as Array<{
-    user_id: string;
-    roles: { code: string } | Array<{ code: string }> | null;
-  }>) {
-    const codes = Array.isArray(row.roles)
-      ? row.roles.map((item) => item.code)
-      : row.roles
-        ? [row.roles.code]
-        : [];
-    for (const code of codes) {
-      if (!isRoleCode(code)) continue;
-      byUser.set(row.user_id, [...(byUser.get(row.user_id) ?? []), code]);
-    }
+  for (const code of roleRows) {
+    if (!code.roles || !isRoleCode(code.roles.code)) continue;
+    byUser.set(code.user_id, [...(byUser.get(code.user_id) ?? []), code.roles.code]);
   }
   return rows.map((row) => ({ ...row, roles: byUser.get(row.id) ?? [] }));
 }
@@ -272,7 +234,7 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const input: EmployeeInput = parsed.data;
   const code = normalizeEmployeeCode(input.employee_code);
-  const db = await adminDb();
+  const repo = await adminUsersRepo();
 
   // Vínculo automático por documento (no editable): el usuario de acceso
   // es el de la sede con el mismo documento. El user_id que traiga el input se
@@ -283,33 +245,18 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
   // y el legajo: un usuario creado desde el cliente era la mitad de la ventana
   // —quedaba con login y rol, y sin legajo, cuando la escritura siguiente
   // fallaba—.
-  const { data: linked, error: linkedError } = await db
-    .from("users")
-    .select("id")
-    .eq("id_number", input.document)
-    .maybeSingle();
-  if (linkedError) throw new AdminError("INTERNAL", "Error interno.", 500);
-  const userId = (linked as { id: string } | null)?.id ?? null;
+  const linked = await internalOnFailure(() => repo.findUserByDocument(input.document));
+  const userId = linked?.id ?? null;
   if (userId) {
-    let takenQuery = db.from("employees").select("id").eq("user_id", userId).limit(1);
-    if (input.id) takenQuery = takenQuery.neq("id", input.id);
-    const { data: taken, error: takenError } = await takenQuery;
-    if (takenError) throw new AdminError("INTERNAL", "Error interno.", 500);
-    if (taken && taken.length > 0) {
+    const taken = await internalOnFailure(() => repo.employeeForUser(userId, input.id));
+    if (taken.length > 0) {
       throw new AdminError("USER_ALREADY_LINKED", "Ese documento ya está vinculado a otro empleado.", 409);
     }
   }
 
   if (code !== null) {
-    let conflictQuery = db
-      .from("employees")
-      .select("id")
-      .eq("employee_code", code)
-      .limit(1);
-    if (input.id) conflictQuery = conflictQuery.neq("id", input.id);
-    const { data: conflicts, error: conflictError } = await conflictQuery;
-    if (conflictError) throw new AdminError("INTERNAL", "Error interno.", 500);
-    if (conflicts && conflicts.length > 0) {
+    const conflicts = await internalOnFailure(() => repo.employeeCodeConflicts(code, input.id));
+    if (conflicts.length > 0) {
       throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
     }
   }
@@ -381,89 +328,58 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
   };
 
   if (!input.id) {
-    const { data: creado, error: altaError } = await db.rpc("upsert_employee_atomic", {
-      // El legajo NO lleva la sede: `employees.sede_id` se borra en la 077 y la
-      // guarda de `upsert_employee_atomic` que exigía la clave desaparece con
-      // ella. Mandarla sería mandar un dato que nadie lee.
-      //
-      // La cuenta de acceso SÍ la lleva: `users.sede_id` sobrevive a propósito
-      // (es el anclaje de la cuenta a la instalación y el origen de
-      // `session.sedeId`), así que `p_create_user.sede_id` se sigue mandando
-      // abajo, y es la que ancla la fila de `users` en la instalación única.
-      p_employee: columnasDelLegajo,
-      p_user_id: userId,
-      p_create_user: userId
-        ? null
-        : {
-            sede_id: sedeId,
-            email: input.email?.trim() ? input.email.trim() : null,
-            phone: input.phone ?? null,
-            id_type: "CC",
-            id_number: input.document,
-            password_hash: await hashPassword(input.document),
-            full_name: input.full_name,
-          },
-      p_role_code: "empleado",
-    });
-    if (altaError) {
-      if ((altaError as { code?: string }).code === "23505") {
-        throw new AdminError(
-          "EMPLOYEE_CODE_TAKEN",
-          "El código de empleado ya existe.",
-          409,
-        );
+    // El legajo NO lleva la sede (`employees.sede_id` se borró en la 077); la
+    // cuenta de acceso SÍ: `p_create_user.sede_id` ancla la fila de `users` a la
+    // instalación y es el origen de `session.sedeId`.
+    let created: EmployeeRow | null;
+    try {
+      created = await repo.upsertEmployeeAtomic(columnasDelLegajo, userId, userId ? null : {
+        sede_id: sedeId,
+        email: input.email?.trim() ? input.email.trim() : null,
+        phone: input.phone ?? null,
+        id_type: "CC",
+        id_number: input.document,
+        password_hash: await hashPassword(input.document),
+        full_name: input.full_name,
+      }, DEFAULT_EMPLOYEE_ROLE);
+    } catch (error) {
+      throwAdminCop(error);
+      if (error instanceof DbQueryError && error.error.code === "23505") {
+        throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
       }
       throw new AdminError("INTERNAL", "Error interno.", 500);
     }
-    if (!creado) throw new AdminError("INTERNAL", "Error interno.", 500);
-    return creado as EmployeeRow;
+    if (!created) throw new AdminError("INTERNAL", "Error interno.", 500);
+    return created;
   }
 
-  const payload = {
-    ...(input.id ? { id: input.id } : {}),
-    ...columnasDelLegajo,
-    user_id: userId,
-  };
-  const { data, error } = await db
-    .from("employees")
-    .upsert(payload, { onConflict: "id" })
-    .select(EMPLOYEE_SELECT)
-    .single();
-  // 23505: carrera perdida contra el índice parcial (doble escritura
-  // simultánea); se traduce al mismo error de negocio.
-  if (error) {
-    if ((error as { code?: string }).code === "23505") {
+  let data: EmployeeRow | null;
+  try {
+    data = await repo.upsertEmployee({ id: input.id, ...columnasDelLegajo, user_id: userId });
+  } catch (error) {
+    throwAdminCop(error);
+    if (error instanceof DbQueryError && error.error.code === "23505") {
       throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
     }
     throw new AdminError("INTERNAL", "Error interno.", 500);
   }
   if (!data) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return data as EmployeeRow;
+  return data;
 }
 
 // -------------------------------------------------------------- services ---
-export interface ServiceRow {
-  id: string;
-  name: string;
-  description: string | null;
-  price: number;
-  duracion_min: number;
-  duracion_max: number;
-  is_active: boolean;
-}
-
-const SERVICE_SELECT =
-  "id, name, description, price, duracion_min, duracion_max, is_active";
+// Data access goes through the repository port (`./repos/services.ts`), which
+// picks supabase-js or the direct PostgreSQL connection from DB_ENGINE. Any
+// repository failure keeps the historical answer: INTERNAL 500.
+export type { ServiceRow } from "./repos/services";
 
 async function fetchServices(limit?: number): Promise<ServiceRow[]> {
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("services")
-    .select(SERVICE_SELECT)
-    .order("name")
-    .limit(clampLimit(limit));
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as ServiceRow[];
+  const repo = await servicesRepo();
+  try {
+    return await repo.list(clampLimit(limit));
+  } catch {
+    throw new AdminError("INTERNAL", "Error interno.", 500);
+  }
 }
 
 /** ADM-05: crea o actualiza un servicio (upsert por id). */
@@ -471,7 +387,7 @@ export async function upsertService(raw: unknown): Promise<ServiceRow> {
   const parsed = serviceSchema.safeParse(raw);
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const input: ServiceInput = parsed.data;
-  const db = await adminDb();
+  const repo = await servicesRepo();
   const payload = {
     ...(input.id ? { id: input.id } : {}),
     name: input.name,
@@ -481,35 +397,24 @@ export async function upsertService(raw: unknown): Promise<ServiceRow> {
     duracion_max: input.duracion_max,
     ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
   };
-  const { data, error } = await db
-    .from("services")
-    .upsert(payload, { onConflict: "id" })
-    .select(SERVICE_SELECT)
-    .single();
-  if (error || !data) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return data as ServiceRow;
+  let data: ServiceRow | null;
+  try {
+    data = await repo.upsert(payload);
+  } catch (error) {
+    throwAdminCop(error);
+    throw new AdminError("INTERNAL", "Error interno.", 500);
+  }
+  if (!data) throw new AdminError("INTERNAL", "Error interno.", 500);
+  return data;
 }
 
 // ----------------------------------------------------------------- taxes ---
-export interface TaxConfigRow {
-  id: string;
-  code: string;
-  name: string;
-  percent: number;
-  is_active: boolean;
-}
-
-const TAX_SELECT = "id, code, name, percent, is_active";
+export type { TaxConfigRow } from "./repos/catalogs";
+import type { TaxConfigRow } from "./repos/catalogs";
 
 async function fetchTaxes(limit?: number): Promise<TaxConfigRow[]> {
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("tax_configs")
-    .select(TAX_SELECT)
-    .order("code")
-    .limit(clampLimit(limit));
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as TaxConfigRow[];
+  const repo = await catalogsRepo();
+  return internalOnFailure(() => repo.listTaxes(clampLimit(limit)));
 }
 
 /** ADM-06: crea o actualiza un impuesto de la instalación (upsert por id). */
@@ -517,65 +422,92 @@ export async function upsertTaxConfig(raw: unknown): Promise<TaxConfigRow> {
   const parsed = taxConfigSchema.safeParse(raw);
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const input: TaxConfigInput = parsed.data;
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("tax_configs")
-    .upsert({
+  const repo = await catalogsRepo();
+  const data = await internalOnFailure(() =>
+    repo.upsertTax({
       ...(input.id ? { id: input.id } : {}),
       code: input.code,
       name: input.name,
       percent: input.percent,
       ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
-    }, { onConflict: "id" })
-    .select(TAX_SELECT)
-    .single();
-  if (error || !data) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return data as TaxConfigRow;
+    }),
+  );
+  if (!data) throw new AdminError("INTERNAL", "Error interno.", 500);
+  return data;
 }
 
 // ------------------------------------------------------- payment methods ---
-export interface PaymentMethodRow {
-  id: string;
-  code: string;
-  name: string;
-  is_active: boolean;
-  arqueable: boolean;
-  fee_percent: number;
-}
-
-const PAYMENT_METHOD_SELECT = "id, code, name, is_active, arqueable, fee_percent";
+export type { PaymentMethodRow } from "./repos/catalogs";
+import type { PaymentMethodRow } from "./repos/catalogs";
 
 async function fetchPaymentMethods(limit?: number): Promise<PaymentMethodRow[]> {
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("payment_methods")
-    .select(PAYMENT_METHOD_SELECT)
-    .order("code")
-    .limit(clampLimit(limit));
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as PaymentMethodRow[];
+  const repo = await catalogsRepo();
+  return internalOnFailure(() => repo.listPaymentMethods(clampLimit(limit)));
 }
 
-/** ADM-07: crea o actualiza un método de pago de la instalación (upsert por id). */
+/**
+ * ADM-07/003: creates a method with a free normalized code, or edits name,
+ * active flag, fee and arqueo mode of an existing one. The code is immutable:
+ * an edit that sends a different code is rejected before writing (the
+ * database trigger is the final barrier).
+ */
 export async function upsertPaymentMethod(raw: unknown): Promise<PaymentMethodRow> {
   const parsed = paymentMethodSchema.safeParse(raw);
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const input: PaymentMethodInput = parsed.data;
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("payment_methods")
-    .upsert({
-      ...(input.id ? { id: input.id } : {}),
-      code: input.code,
-      name: input.name,
-      ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
-      ...(input.arqueable !== undefined ? { arqueable: input.arqueable } : {}),
-      ...(input.fee_percent !== undefined ? { fee_percent: input.fee_percent } : {}),
-    }, { onConflict: "id" })
-    .select(PAYMENT_METHOD_SELECT)
-    .single();
-  if (error || !data) throw new AdminError("INTERNAL", "Error interno.", 500);
-  return data as PaymentMethodRow;
+  const code = input.code ? normalizePaymentMethodCode(input.code) : undefined;
+  const repo = await catalogsRepo();
+  const fields = {
+    name: input.name,
+    ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
+    ...(input.arqueo_mode !== undefined ? { arqueo_mode: input.arqueo_mode } : {}),
+    ...(input.fee_percent !== undefined ? { fee_percent: input.fee_percent } : {}),
+  };
+  if (input.id) {
+    const id = input.id;
+    const current = await internalOnFailure(() => repo.findPaymentMethod(id));
+    if (!current) throw new AdminError("NOT_FOUND", "Método de pago no encontrado.", 404);
+    if (code && code !== current.code) {
+      throw new AdminError("PAYMENT_METHOD_CODE_IMMUTABLE", "El código de un método no se puede cambiar.", 409);
+    }
+    return paymentMethodWrite(() => repo.updatePaymentMethod(id, fields));
+  }
+  // `code` is present on creation: the schema requires it without an id.
+  return paymentMethodWrite(() =>
+    repo.insertPaymentMethod({ code: code as string, arqueo_mode: "none", ...fields }),
+  );
+}
+
+/** A write that fails or returns no row goes through `paymentMethodWriteError`. */
+async function paymentMethodWrite(call: () => Promise<PaymentMethodRow | null>): Promise<PaymentMethodRow> {
+  let data: PaymentMethodRow | null;
+  try {
+    data = await call();
+  } catch (error) {
+    throw paymentMethodWriteError(error instanceof DbQueryError ? error.error : null);
+  }
+  if (!data) throw paymentMethodWriteError(null);
+  return data;
+}
+
+/** Maps the stable database errors of 003 to business errors. */
+export function paymentMethodWriteError(
+  error: { code?: string | null; message?: string; details?: string | null } | null,
+): AdminError {
+  const text = `${error?.message ?? ""} ${error?.details ?? ""}`;
+  if (text.includes("PAYMENT_METHOD_CODE_IMMUTABLE")) {
+    return new AdminError("PAYMENT_METHOD_CODE_IMMUTABLE", "El código de un método no se puede cambiar.", 409);
+  }
+  if (text.includes("uq_payment_methods_single_denominations")) {
+    return new AdminError("VALIDATION", "Solo un método puede contarse por denominaciones.", 400);
+  }
+  if (error?.code === "23505") {
+    return new AdminError("PAYMENT_METHOD_CODE_TAKEN", "Ya existe un método con ese código.", 409);
+  }
+  if (text.includes("payment_methods_code_format_check")) {
+    return new AdminError("VALIDATION", "Código inválido: use minúsculas, números, guion o guion bajo.", 400);
+  }
+  return new AdminError("INTERNAL", "Error interno.", 500);
 }
 
 // ------------------------------------------------------------------ roles ---
@@ -588,20 +520,9 @@ export async function upsertPaymentMethod(raw: unknown): Promise<PaymentMethodRo
  * mirar el conjunto actual antes de pedirlo.
  */
 async function currentRoleCodes(userId: string): Promise<RoleCode[]> {
-  const db = await adminDb();
-  const { data, error } = await db
-    .from("user_roles")
-    .select("roles(code)")
-    .eq("user_id", userId);
-  if (error) throw new AdminError("INTERNAL", "Error interno.", 500);
-  const codes: RoleCode[] = [];
-  for (const row of (data ?? []) as unknown as Array<{
-    roles: { code: string } | Array<{ code: string }> | null;
-  }>) {
-    const embedded = Array.isArray(row.roles) ? row.roles : row.roles ? [row.roles] : [];
-    for (const item of embedded) if (isRoleCode(item.code)) codes.push(item.code);
-  }
-  return codes;
+  const repo = await adminUsersRepo();
+  const rows = await internalOnFailure(() => repo.userRoleEmbeds(userId));
+  return rows.flatMap((row) => row.roles && isRoleCode(row.roles.code) ? [row.roles.code] : []);
 }
 
 /**
@@ -610,6 +531,8 @@ async function currentRoleCodes(userId: string): Promise<RoleCode[]> {
  * traducen payroll, cash, billing, commissions y los topes 031/034.
  */
 function roleReplacementError(error: { code?: string; message?: string }): AdminError {
+  const cop = adminCopValidation(error);
+  if (cop) return cop;
   if (error.code === "P0001") {
     const message = error.message ?? "";
     if (message.includes("USER_NOT_FOUND")) {
@@ -655,7 +578,10 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
   // no existe. Es el MISMO literal en las dos guardas —otorgar y quitar son la
   // misma verdad sobre el mismo rol— y el rechazo queda idéntico: mismo
   // `FORBIDDEN`, mismo 403, misma puerta antes del rpc.
-  if (parsed.data.roles.some((rol) => !isSedeAssignableRole(rol))) {
+  if (!rolesAreNonEmpty(parsed.data.roles)) {
+    throw new AdminError("VALIDATION", "Un solo rol por usuario.", 400);
+  }
+  if (violatesSuperadminGuard(parsed.data.roles)) {
     throw new AdminError(
       "FORBIDDEN",
       "El rol superadmin no se puede asignar ni quitar desde la aplicación.",
@@ -663,7 +589,7 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
     );
   }
   const rolesActuales = await currentRoleCodes(parsed.data.user_id);
-  if (rolesActuales.some((rol) => !isSedeAssignableRole(rol))) {
+  if (violatesSuperadminGuard(rolesActuales)) {
     throw new AdminError(
       "FORBIDDEN",
       "El rol superadmin no se puede asignar ni quitar desde la aplicación.",
@@ -671,18 +597,20 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
     );
   }
 
-  const db = await adminDb();
-
-  const { data, error } = await db.rpc("replace_user_roles", {
-    p_user_id: parsed.data.user_id,
-    p_role_codes: parsed.data.roles,
-  });
-  if (error) throw roleReplacementError(error);
+  const repo = await adminUsersRepo();
+  let data: unknown;
+  try {
+    data = await repo.replaceUserRoles(parsed.data.user_id, parsed.data.roles);
+  } catch (error) {
+    throw roleReplacementError(error instanceof DbQueryError ? { code: error.error.code ?? undefined, message: error.error.message } : {});
+  }
 
   // Post-condición: se reporta éxito sólo si la base devolvió el conjunto
   // pedido. Un arreglo vacío significa "no quedó ningún rol aplicado": eso
   // jamás es un éxito, por más que el rpc no haya dado error.
-  const aplicados = (Array.isArray(data) ? data : []).filter(isSedeAssignableRole);
+  const aplicados = (Array.isArray(data) ? data : []).filter(
+    (code): code is RoleCode => roleIsAssignableForSede(code),
+  );
   const pedidos = parsed.data.roles;
   if (aplicados.length !== pedidos.length || !aplicados.every((code) => pedidos.includes(code))) {
     throw new AdminError("INTERNAL", "Error interno.", 500);
@@ -714,7 +642,7 @@ export async function setUserRoles(raw: unknown): Promise<{ user_id: string; rol
 //     `p_create_user` de `upsert_employee_atomic` (065), que inserta en
 //     `employees` y en `users`.
 //   * `listSedeUsers` la trae de vuelta y la usa como predicado: la lectura
-//     devuelve `sede_id` y acota con `sede_id.eq.<sede>,sede_id.is.null`, para
+//     devuelve `sede_id` y acota con "sede_id = <sede> o sede_id nulo", para
 //     que las cuentas todavía sin sede no queden invisibles sin rol.
 //
 // Todo eso se retira con el borrado FÍSICO de la columna en la migración final

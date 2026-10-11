@@ -511,7 +511,7 @@ describe("caja: el texto visible no cambió", () => {
       "¿Está seguro de cerrar?",
       "Después del cierre ya no podrá modificarlo.",
       "Cierra este turno como administrador.",
-      "Cuente billetes y monedas por denominación y declare los totales digitales.",
+      "Declare la base de cada método arqueable: por denominaciones o por total, según su configuración.",
       "Justificación de la revisión",
       "Total en vales:",
       "Acumulado (",

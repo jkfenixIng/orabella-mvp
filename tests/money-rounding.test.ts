@@ -375,11 +375,11 @@ describe("dinero: nómina, comisiones y caja siguen la misma regla", () => {
 
   it("el tope de salida en efectivo y el total digital son enteros", () => {
     // 50% de 200001 = 100000.5 → 100001 (medio arriba).
-    expect(cashOutLimitState(200001, 0).limit).toBe(100001);
-    expect(cashOutLimitState(200000, 0)).toEqual({
+    expect(cashOutLimitState(200001, 200001).minimum).toBe(100001);
+    expect(cashOutLimitState(200000, 200000)).toEqual({
       base: 200000,
-      limit: 100000,
-      used: 0,
+      minimum: 100000,
+      expected: 200000,
       available: 100000,
     });
     // Apertura + cobrado − pagado, todo normalizado al peso.
@@ -393,7 +393,7 @@ describe("dinero: nómina, comisiones y caja siguen la misma regla", () => {
       resolveLineCommission({ subtotal: 9999, qty: 1, rule: { percent: 3, amount: null } }),
       pendingCommission(166.67, 100),
       computeNetPay({ baseFixed: 1000.5, commissions: 0.5, bonuses: 0.5, vales: 0.5 }),
-      cashOutLimitState(200001, 0).limit,
+      cashOutLimitState(200001, 200001).minimum,
       expectedDigitalTotal(100.5, 0.5),
       sumMethodTotal(new Map([["nequi", 1234.4]])),
     ];

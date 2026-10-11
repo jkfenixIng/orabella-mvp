@@ -14,7 +14,6 @@ import {
   editInvoiceSchema,
   editItemsSubtotal,
   moneyEquals,
-  MONEY_EPSILON,
   normalizeCommissionFields,
   overCollectedEdit,
   overCollectedEditMessage,
@@ -30,13 +29,19 @@ import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
 import { requireSedeRole } from "@/src/shared/lib/sede";
 import { dayBounds } from "@/src/shared/lib/dates";
+import { COP_WHOLE_PESO_MESSAGE, copValidationError } from "@/src/shared/money/cop";
+import { invoicePaymentCapExceeded } from "@/src/shared/money/caps";
 import { listPaymentMethods, listServices, listTaxes } from "@/src/features/admin/service";
 import {
   getProductsStock,
   InventoryError,
   type StockEntry,
 } from "@/src/features/inventory/service";
-import { planStockDeduction, type PlannedDeduction } from "@/src/features/inventory/schemas";
+import {
+  planStockDeduction,
+  planStockReversals,
+  type PlannedDeduction,
+} from "@/src/features/inventory/schemas";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import {
   chunkIds,
@@ -48,6 +53,7 @@ import {
 import { getOpenShiftWithOpener } from "@/src/features/cash/service";
 import { commissionRuleKey, type RuleRate } from "@/src/features/commissions/schemas";
 import { computeInvoiceItemCommission } from "./commission";
+import { billingRepo, type BillingRepo, type InvoiceQueryFilters } from "./repos/billing";
 
 export class BillingError extends Error {
   readonly code: string;
@@ -62,15 +68,15 @@ export class BillingError extends Error {
 }
 
 /**
- * Cliente privilegiado bajo demanda (service_role, solo servidor).
- * Import dinámico para que los tests unitarios (sin red/env) nunca lo carguen.
+ * The billing data port for the configured engine (DB_ENGINE, resolved lazily
+ * so unit tests without env never load a driver). Each operation takes ONE
+ * repository and passes it down: engines are never mixed inside an operation.
  */
-async function billingDb() {
-  const { createAdminClient } = await import("@/src/shared/lib/supabase/server");
-  return createAdminClient();
+async function billingDb(): Promise<BillingRepo> {
+  return billingRepo();
 }
 
-type DbClient = Awaited<ReturnType<typeof billingDb>>;
+type DbClient = BillingRepo;
 
 function validationMessage(error: { issues: Array<{ message: string }> }): string {
   return error.issues[0]?.message ?? "Datos inválidos.";
@@ -206,13 +212,6 @@ export interface InvoiceDetail {
   remaining: number;
 }
 
-const INVOICE_SELECT =
-  "id, consecutive_number, client_name, client_document, subtotal, discount, tax, surcharge, total, status, user_id, cash_shift_id, closed_by, closed_at, cancel_reason, created_at, edit_version";
-const ITEM_SELECT =
-  "id, invoice_id, item_type, product_id, service_id, custom_name, employee_id, qty, unit_price, discount, subtotal, no_commission, commission_value, commission_mode, commission_percent_override, employees!inner(full_name, employee_code, commission_percent, pay_type, payout_mode)";
-const TAX_SELECT = "id, invoice_id, tax_code, tax_name, percent, amount";
-const PAYMENT_SELECT = "id, invoice_id, method_id, method_code, amount, fee_percent, fee_amount, cash_shift_id, created_at";
-
 // ----------------------------------------------------------------- lectura ---
 
 export interface InvoiceFilters {
@@ -253,6 +252,17 @@ function dateBound(value: string, end: boolean): string {
   return trimmed;
 }
 
+function invoiceQueryFilters(filters: InvoiceFilters): InvoiceQueryFilters {
+  return {
+    ...(filters.status ? { status: filters.status } : {}),
+    ...(filters.from?.trim() ? { from: dateBound(filters.from, false) } : {}),
+    ...(filters.to?.trim() ? { to: dateBound(filters.to, true) } : {}),
+    ...(filters.user_id ? { user_id: filters.user_id } : {}),
+    ...(filters.closed_by ? { closed_by: filters.closed_by } : {}),
+    ...(filters.consecutive_number !== undefined ? { consecutive_number: filters.consecutive_number } : {}),
+  };
+}
+
 /**
  * U8: los ids de factura en los que participa un empleado, leídos de forma
  * EXHAUSTIVA. Antes cada llamador usaba un `.limit(N)` (`2000` en el listado,
@@ -267,13 +277,7 @@ async function invoiceIdsOfEmployee(db: DbClient, employeeId: string): Promise<s
   try {
     const rows = await readAllPaged<{ invoice_id: string }>({
       table: "invoice_items",
-      fetchPage: (from, to) =>
-        db
-          .from("invoice_items")
-          .select("invoice_id")
-          .eq("employee_id", employeeId)
-          .order("id")
-          .range(from, to),
+      fetchPage: (from, to) => db.invoiceIdsForEmployeePage(employeeId, from, to),
     });
     return [...new Set(rows.map((row) => row.invoice_id))];
   } catch (error) {
@@ -310,22 +314,7 @@ export async function listInvoices(filters: InvoiceFilters = {}): Promise<Invoic
   const offset = limit === null ? (page - 1) * pageSize : 0;
   const size = limit ?? pageSize;
 
-  // Constructor de la consulta con TODOS los filtros, nuevo en cada llamada:
-  // los constructores encadenables de Supabase son inmutables y el doble de
-  // pruebas muta, así que reutilizar uno acumularía filtros entre lotes.
-  const buildInvoiceQuery = () => {
-    let query = db
-      .from("invoices")
-      .select(`${INVOICE_SELECT}, users!invoices_user_id_fkey(full_name)`)
-      .order("consecutive_number", { ascending: false });
-    if (filters.status) query = query.eq("status", filters.status);
-    if (filters.from?.trim()) query = query.gte("created_at", dateBound(filters.from, false));
-    if (filters.to?.trim()) query = query.lte("created_at", dateBound(filters.to, true));
-    if (filters.user_id) query = query.eq("user_id", filters.user_id);
-    if (filters.closed_by) query = query.eq("closed_by", filters.closed_by);
-    if (filters.consecutive_number !== undefined) query = query.eq("consecutive_number", filters.consecutive_number);
-    return query;
-  };
+  const queryFilters = invoiceQueryFilters(filters);
 
   interface JoinedUser {
     users?: { full_name?: string | null } | null;
@@ -344,11 +333,7 @@ export async function listInvoices(filters: InvoiceFilters = {}): Promise<Invoic
         all.push(
           ...(await readAllPaged<InvoiceRow>({
             table: "invoices",
-            fetchPage: (from, to) =>
-              buildInvoiceQuery()
-                .in("id", chunk)
-                .order("id", { ascending: false })
-                .range(from, to),
+            fetchPage: (from, to) => db.invoicesByIdsPage<InvoiceRow>(queryFilters, chunk, from, to),
           })),
         );
       }
@@ -366,13 +351,13 @@ export async function listInvoices(filters: InvoiceFilters = {}): Promise<Invoic
     );
     pageRows = all.slice(offset, offset + size);
   } else {
-    const { data, error } = await buildInvoiceQuery().range(offset, offset + size - 1);
+    const { data, error } = await db.listInvoices<InvoiceRow>(queryFilters, { offset, limit: size });
     if (error) {
-      // Diagnóstico servidor (no se expone al cliente): código/mensaje de PostgREST.
+      // Diagnóstico servidor (no se expone al cliente): código/mensaje de la base.
       console.error("PG listInvoices:", JSON.stringify({ code: error.code, message: error.message, details: error.details, hint: error.hint }));
       throw new BillingError("INTERNAL", "Error interno.", 500);
     }
-    pageRows = (data ?? []) as unknown as InvoiceRow[];
+    pageRows = data ?? [];
   }
   const rows = pageRows.map((row) => ({
     ...row,
@@ -392,14 +377,7 @@ export async function listInvoices(filters: InvoiceFilters = {}): Promise<Invoic
       itemRows.push(
         ...(await readAllPaged<{ invoice_id: string; employee_id: string }>({
           table: "invoice_items",
-          fetchPage: (from, to) =>
-            db
-              .from("invoice_items")
-              .select("invoice_id, employee_id")
-              .in("invoice_id", chunk)
-              .order("created_at")
-              .order("id")
-              .range(from, to),
+          fetchPage: (from, to) => db.listItemEmployeesPage(chunk, from, to),
         })),
       );
     }
@@ -416,18 +394,14 @@ export async function listInvoices(filters: InvoiceFilters = {}): Promise<Invoic
   const nameByUser = new Map<string, string>();
   if (userIds.length > 0) {
     const [{ data: empRows }, { data: userRows }] = await Promise.all([
-      empIds.length > 0
-        ? db.from("employees").select("id, user_id, full_name").in("id", empIds)
-        : Promise.resolve({ data: [] }),
-      closerIds.length > 0
-        ? db.from("users").select("id, full_name").in("id", closerIds)
-        : Promise.resolve({ data: [] }),
+      empIds.length > 0 ? db.employeesByIds(empIds) : Promise.resolve({ data: [] }),
+      closerIds.length > 0 ? db.userNames(closerIds) : Promise.resolve({ data: [] }),
     ]);
-    for (const row of ((empRows ?? []) as Array<{ id: string; user_id: string | null; full_name: string }>)) {
+    for (const row of empRows ?? []) {
       nameByUser.set(row.id, row.full_name);
       if (row.user_id) nameByUser.set(row.user_id, row.full_name);
     }
-    for (const row of ((userRows ?? []) as Array<{ id: string; full_name: string }>)) {
+    for (const row of userRows ?? []) {
       if (!nameByUser.has(row.id)) nameByUser.set(row.id, row.full_name);
     }
   }
@@ -454,33 +428,35 @@ export async function countInvoices(filters: InvoiceFilters = {}): Promise<numbe
     employeeInvoiceIds = await invoiceIdsOfEmployee(db, filters.employee_id);
     if (employeeInvoiceIds.length === 0) return 0;
   }
-  // Constructor nuevo por lote (los encadenables de Supabase son inmutables y el
-  // doble de pruebas muta): el `in("id", ...)` con todos los ids de una vez
-  // viaja en la URL y con 1000+ ids son ~44 KB → 414, la lectura no ocurre.
-  const buildCountQuery = () => {
-    let query = db.from("invoices").select("id", { count: "exact", head: true });
-    if (filters.status) query = query.eq("status", filters.status);
-    if (filters.from?.trim()) query = query.gte("created_at", dateBound(filters.from, false));
-    if (filters.to?.trim()) query = query.lte("created_at", dateBound(filters.to, true));
-    if (filters.user_id) query = query.eq("user_id", filters.user_id);
-    if (filters.closed_by) query = query.eq("closed_by", filters.closed_by);
-    if (filters.consecutive_number !== undefined) query = query.eq("consecutive_number", filters.consecutive_number);
-    return query;
-  };
+  // El `in("id", ...)` con todos los ids de una vez viaja en la URL y con 1000+
+  // ids son ~44 KB → 414, la lectura no ocurre.
+  const queryFilters = invoiceQueryFilters(filters);
   if (employeeInvoiceIds) {
     // U8: el conteo se hace por lotes DISJUNTOS de ids y se suma: la suma es el
     // total exacto y cada URL queda dentro del tamaño que aguanta.
     let total = 0;
     for (const chunk of chunkIds(employeeInvoiceIds)) {
-      const { count, error } = await buildCountQuery().in("id", chunk);
+      const { count, error } = await db.countInvoices(queryFilters, chunk);
       if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
       total += count ?? 0;
     }
     return total;
   }
-  const { count, error } = await buildCountQuery();
+  const { count, error } = await db.countInvoices(queryFilters);
   if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
   return count ?? 0;
+}
+
+/** The employee embed (`employees!inner`) of a detail item row. */
+interface EmbeddedEmployee {
+  full_name?: string | null;
+  employee_code?: string | null;
+  commission_percent?: number | null;
+  pay_type?: string | null;
+  payout_mode?: string | null;
+}
+interface JoinedEmployee {
+  employees?: EmbeddedEmployee | EmbeddedEmployee[] | null;
 }
 
 /**
@@ -489,22 +465,21 @@ export async function countInvoices(filters: InvoiceFilters = {}): Promise<numbe
  * No recibe sede: la instalación es de una sola y la fila no trae la columna.
  */
 export async function getInvoiceDetail(id: string): Promise<InvoiceDetail> {
-  const db = await billingDb();
-  const { data: invoice, error } = await db
-    .from("invoices")
-    .select(INVOICE_SELECT)
-    .eq("id", id)
-    .maybeSingle();
+  return fetchInvoiceDetail(await billingDb(), id);
+}
+
+async function fetchInvoiceDetail(db: DbClient, id: string): Promise<InvoiceDetail> {
+  const { data: invoice, error } = await db.getInvoice<InvoiceRow>(id);
   if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
   if (!invoice) throw new BillingError("NOT_FOUND", "Factura no encontrada.", 404);
-  return loadDetail(db, invoice as InvoiceRow);
+  return loadDetail(db, invoice);
 }
 
 async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDetail> {
   const [itemsRes, taxesRes, paymentsRes] = await Promise.all([
-    db.from("invoice_items").select(ITEM_SELECT).eq("invoice_id", invoice.id).order("created_at"),
-    db.from("invoice_taxes").select(TAX_SELECT).eq("invoice_id", invoice.id).order("tax_code"),
-    db.from("invoice_payments").select(PAYMENT_SELECT).eq("invoice_id", invoice.id).order("created_at"),
+    db.listInvoiceItemsWithEmployee<InvoiceItemRow & JoinedEmployee>(invoice.id),
+    db.listInvoiceTaxes<InvoiceTaxRow>(invoice.id),
+    db.listInvoicePayments<InvoicePaymentRow>(invoice.id),
   ]);
   if (itemsRes.error || taxesRes.error || paymentsRes.error) {
     console.error(
@@ -517,27 +492,9 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
     );
     throw new BillingError("INTERNAL", "Error interno.", 500);
   }
-  const payments = (paymentsRes.data ?? []) as InvoicePaymentRow[];
+  const payments = paymentsRes.data ?? [];
   const paid = round2(payments.reduce((acc, row) => acc + Number(row.amount), 0));
-  interface JoinedEmployee {
-    employees?:
-      | {
-          full_name?: string | null;
-          employee_code?: string | null;
-          commission_percent?: number | null;
-          pay_type?: string | null;
-          payout_mode?: string | null;
-        }
-      | Array<{
-          full_name?: string | null;
-          employee_code?: string | null;
-          commission_percent?: number | null;
-          pay_type?: string | null;
-          payout_mode?: string | null;
-        }>
-      | null;
-  }
-  const itemRows = (itemsRes.data ?? []) as Array<InvoiceItemRow & JoinedEmployee>;
+  const itemRows = itemsRes.data ?? [];
   // Reglas ítem×empleado de TODOS los empleados de la factura en una sola
   // consulta: el detalle puede mezclar empleados y no se cae en N+1.
   const rulesByEmployee = await loadCommissionRulesByEmployee(
@@ -592,8 +549,8 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
   return {
     invoice,
     items,
-    taxes: (taxesRes.data ?? []) as InvoiceTaxRow[],
-    payments: (paymentsRes.data ?? []) as InvoicePaymentRow[],
+    taxes: taxesRes.data ?? [],
+    payments,
     paid,
     remaining: round2(Math.max(0, balance.netRemaining)),
   };
@@ -635,14 +592,7 @@ async function loadCommissionRulesByEmployee(
         amount: number | string | null;
       }>({
         table: "commission_rules",
-        fetchPage: (from, to) =>
-          db
-            .from("commission_rules")
-            .select("employee_id, item_type, item_id, percent, amount")
-            .eq("is_active", true)
-            .in("employee_id", chunk)
-            .order("id")
-            .range(from, to),
+        fetchPage: (from, to) => db.employeeRulesPage(chunk, from, to),
       });
       for (const rule of rules) {
         const byItem = byEmployee.get(rule.employee_id) ?? new Map<string, RuleRate>();
@@ -819,9 +769,9 @@ async function loadRefs(): Promise<ValidatedRefs> {
  * de existencia y el error sigue siendo NOT_FOUND.
  */
 async function validateItemRefs(
+  db: DbClient,
   items: InvoiceItemInput[],
 ): Promise<Map<string, StockEntry>> {
-  const db = await billingDb();
   const serviceRows = await listServices(500);
   const serviceIds = new Set(serviceRows.map((row) => row.id));
 
@@ -837,15 +787,13 @@ async function validateItemRefs(
       ? getProductsStock(productIds)
       : Promise.resolve(new Map<string, StockEntry>()),
     employeeIds.length > 0
-      ? db.from("employees").select("id").in("id", employeeIds)
+      ? db.employeeIds(employeeIds)
       : Promise.resolve({ data: [], error: null }),
   ]);
   if (employeeRes.error) {
     throw new BillingError("INTERNAL", "Error interno.", 500);
   }
-  const employeeIdsFound = new Set(
-    ((employeeRes.data ?? []) as Array<{ id: string }>).map((row) => row.id),
-  );
+  const employeeIdsFound = new Set((employeeRes.data ?? []).map((row) => row.id));
 
   for (const item of items) {
     // `getProductsStock` solo devuelve productos existentes: ausente =
@@ -886,8 +834,20 @@ function insufficientStockError(error: unknown): BillingError {
   return toBillingError(error);
 }
 
+/** Billing's shared 005 boundary, ahead of all business P0001 mappings. */
+function billingCopValidation(error: unknown): BillingError | null {
+  return copValidationError(error, () => new BillingError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400));
+}
+
+function throwBillingCop(error: unknown): void {
+  const cop = billingCopValidation(error);
+  if (cop) throw cop;
+}
+
 function toBillingError(error: unknown): BillingError {
   if (error instanceof BillingError) return error;
+  const cop = billingCopValidation(error);
+  if (cop) return cop;
   if (error instanceof PagedReadError) {
     return new BillingError(
       error.code,
@@ -937,6 +897,8 @@ function toBillingError(error: unknown): BillingError {
  *     INTERNAL en vez de disfrazarse.
  */
 function toRpcAnnulError(error: { code?: unknown; message?: unknown } | null): BillingError {
+  const cop = billingCopValidation(error);
+  if (cop) return cop;
   const message = String(error?.message ?? "");
   if (message.includes("ANNUL_CONFLICT") || message.includes("INVOICE_NOT_FOUND")) {
     return new BillingError(
@@ -983,6 +945,8 @@ function toRpcAnnulError(error: { code?: unknown; message?: unknown } | null): B
  *     y se reporta como INTERNAL en vez de disfrazarse.
  */
 function toRpcEditError(error: { code?: unknown; message?: unknown } | null): BillingError {
+  const cop = billingCopValidation(error);
+  if (cop) return cop;
   const message = String(error?.message ?? "");
   if (message.includes("EDIT_CONFLICT") || message.includes("INVOICE_NOT_FOUND")) {
     return new BillingError(
@@ -993,6 +957,20 @@ function toRpcEditError(error: { code?: unknown; message?: unknown } | null): Bi
   }
   if (message.includes("INSUFFICIENT_STOCK")) {
     return new BillingError("INSUFFICIENT_STOCK", "Stock insuficiente para el ajuste.", 409);
+  }
+  if (message.includes("CASH_METHOD_BALANCE_UPDATE_BREACH")) {
+    return new BillingError(
+      "CASH_METHOD_BALANCE_UPDATE_BREACH",
+      "No se puede cambiar el método del cobro: dejaría una caja por debajo del mínimo del turno.",
+      422,
+    );
+  }
+  if (message.includes("CASH_METHOD_BALANCE_REQUIRED")) {
+    return new BillingError(
+      "CASH_METHOD_BALANCE_REQUIRED",
+      "Cierre y abra de nuevo el turno para usar arqueo por método.",
+      409,
+    );
   }
   if (message.includes("PRODUCT_NOT_FOUND")) {
     return new BillingError("NOT_FOUND", "Producto no encontrado.", 404);
@@ -1032,13 +1010,9 @@ async function findInvoiceByIdempotencyKey(
   db: DbClient,
   idempotencyKey: string,
 ): Promise<InvoiceRow | null> {
-  const { data, error } = await db
-    .from("invoices")
-    .select(INVOICE_SELECT)
-    .eq("idempotency_key", idempotencyKey)
-    .maybeSingle();
+  const { data, error } = await db.findInvoiceByIdempotencyKey<InvoiceRow>(idempotencyKey);
   if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
-  return (data as InvoiceRow | null) ?? null;
+  return data ?? null;
 }
 
 /**
@@ -1072,6 +1046,8 @@ async function findInvoiceByIdempotencyKey(
  *     INTERNAL en vez de disfrazarse.
  */
 function toRpcCreateError(error: { message?: unknown } | null): BillingError {
+  const cop = billingCopValidation(error);
+  if (cop) return cop;
   const message = String(error?.message ?? "");
   if (message.includes("INSUFFICIENT_STOCK")) {
     return new BillingError(
@@ -1196,7 +1172,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   let stockPlan: PlannedDeduction[];
   try {
     refs = await loadRefs();
-    stockMap = await validateItemRefs(input.items);
+    stockMap = await validateItemRefs(db, input.items);
     // B1/FAC-05: pre-verifica stock con mensaje de negocio POR PRODUCTO. Ya no es
     // la forma de evitar un hueco en la serie —el hueco no puede existir: la
     // reserva es de la transacción— sino la guarda que le dice al operador QUÉ
@@ -1292,11 +1268,11 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
   // o no se escribe ninguno —y con ellos se revierte la reserva del
   // consecutivo—. La clave está en que acá NO se manda un número: la función lo
   // reserva adentro y lo sustituye en la plantilla del motivo del OUT.
-  const { data: written, error: createError } = await db.rpc("invoice_create_atomic", {
-    p_user_id: actor.userId,
-    p_cash_shift_id: cashShiftId,
-    p_idempotency_key: input.idempotency_key,
-    p_invoice: {
+  const { data: written, error: createError } = await db.createInvoiceAtomic<InvoiceRow>({
+    userId: actor.userId,
+    cashShiftId,
+    idempotencyKey: input.idempotency_key,
+    invoice: {
       client_name: input.client_name?.trim() || null,
       client_document: input.client_document?.trim() || null,
       subtotal: totals.subtotal,
@@ -1308,7 +1284,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
       closed_by: status === "Pagada" ? actor.userId : null,
       closed_at: status === "Pagada" ? new Date().toISOString() : null,
     },
-    p_items: input.items.map((item) => ({
+    items: input.items.map((item) => ({
       item_type: item.item_type,
       product_id: item.product_id ?? null,
       service_id: item.service_id ?? null,
@@ -1323,7 +1299,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
       // discrepar, en pesos enteros.
       subtotal: computeLineSubtotal(item).subtotal,
     })),
-    p_taxes: totals.taxes.map((tax) => ({
+    taxes: totals.taxes.map((tax) => ({
       tax_code: tax.tax_code,
       tax_name: tax.tax_name,
       percent: tax.percent,
@@ -1331,7 +1307,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
     })),
     // `cash_shift_id` NO viaja por porción: es el mismo en todas (la sede tiene
     // un turno abierto) y la función escribe el escalar en cada fila.
-    p_payments: fees.map((fee) => ({
+    payments: fees.map((fee) => ({
       method_id: methodByCode.get(fee.method_code)?.id ?? null,
       method_code: fee.method_code,
       amount: fee.gross,
@@ -1340,13 +1316,14 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
     })),
     // El motivo del OUT como PLANTILLA (ver `buildInvoiceOutReasonTemplate`): el
     // consecutivo lo conoce la transacción, que lo reserva, no el servicio.
-    p_out_reason: buildInvoiceOutReasonTemplate(input.client_name),
+    outReason: buildInvoiceOutReasonTemplate(input.client_name),
     // El plan de stock: QUÉ se descuenta, agregado por producto, lo computó
     // `planStockDeduction`. La función lo escribe vía `deduct_stock_atomic`
     // (046), con su conteo y el trigger de 004 como autoridad final.
-    p_out_items: stockPlan.map((item) => ({ product_id: item.product_id, qty: item.qty })),
+    outItems: stockPlan.map((item) => ({ product_id: item.product_id, qty: item.qty })),
   });
   if (createError || !written) {
+    throwBillingCop(createError);
     console.error("PG invoice_create_atomic:", JSON.stringify(createError));
     if ((createError as { code?: string } | null)?.code === "23505") {
       // Dos índices únicos pueden dar 23505 acá: el consecutivo
@@ -1371,7 +1348,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
     // como siempre (`toRpcCreateError`).
     throw toRpcCreateError(createError as { message?: unknown } | null);
   }
-  const invoice = written as InvoiceRow;
+  const invoice = written;
   const consecutive = invoice.consecutive_number;
 
   // Audit log para creación de factura (con info de admin override si aplica).
@@ -1457,7 +1434,7 @@ export async function annulInvoice(
   const motivo = parsed.data.motivo.trim();
   const db = await billingDb();
 
-  const detail = await getInvoiceDetail(id);
+  const detail = await fetchInvoiceDetail(db, id);
   if (!canAnnulStatus(detail.invoice.status)) {
     throw new BillingError("ANNUL_INVALID", annulBlockedMessage(detail.invoice.status), 409);
   }
@@ -1485,21 +1462,26 @@ export async function annulInvoice(
   const productItems = detail.items
     .filter((item) => item.item_type === "producto" && item.product_id)
     .map((item) => ({ product_id: item.product_id as string, qty: item.qty }));
-  const reversals = buildReversalReasons({
-    consecutiveNumber: detail.invoice.consecutive_number,
-    motivo,
-    productItems,
-  });
+  // Every movement path goes through the application stock projection. An
+  // annulment is an IN-only projection: the SQL trigger still writes it under
+  // the invoice CAS, but TypeScript owns the validation and payload decision.
+  const reversals = planStockReversals(
+    buildReversalReasons({
+      consecutiveNumber: detail.invoice.consecutive_number,
+      motivo,
+      productItems,
+    }),
+  );
 
-  const { data: written, error: annulError } = await db.rpc("invoice_annul_atomic", {
-    p_invoice_id: id,
-    p_user_id: actor.userId,
+  const { data: written, error: annulError } = await db.annulInvoiceAtomic<InvoiceRow>({
+    invoiceId: id,
+    userId: actor.userId,
     // El instante lo resuelve el servicio, como en el cierre de caja (049): la
     // función escribe lo que recibe.
-    p_closed_at: new Date().toISOString(),
-    p_motivo: motivo,
-    p_expected_status: detail.invoice.status,
-    p_items: reversals.map((reversal) => ({
+    closedAt: new Date().toISOString(),
+    motivo,
+    expectedStatus: detail.invoice.status,
+    items: reversals.map((reversal) => ({
       product_id: reversal.product_id,
       qty: reversal.qty,
       reason: reversal.reason,
@@ -1521,7 +1503,7 @@ export async function annulInvoice(
     },
   });
 
-  return loadDetail(db, written as InvoiceRow);
+  return loadDetail(db, written);
 }
 
 // ------------------------------------------------------------------ editar ---
@@ -1536,6 +1518,17 @@ export async function annulInvoice(
  * y los campos de comisión de `normalizeCommissionFields`, en TypeScript. La
  * función de la 051 la escribe verbatim.
  */
+/** What the two edit RPCs (051) return: the written row and their write counts. */
+interface EditRpcResult {
+  invoice: InvoiceRow;
+  items: number;
+  movements: number;
+}
+interface SplitPaymentRpcResult {
+  invoice: InvoiceRow;
+  portions: number;
+}
+
 function editItemColumns(item: EditInvoiceItemInput): Record<string, unknown> {
   const line = computeLineSubtotal({ qty: item.qty, unit_price: item.unit_price, discount: item.discount });
   return {
@@ -1623,7 +1616,7 @@ export async function editInvoiceItems(
   const motivo = input.motivo.trim();
   const db = await billingDb();
 
-  const detail = await getInvoiceDetail(invoiceId);
+  const detail = await fetchInvoiceDetail(db, invoiceId);
   if (detail.invoice.status === "Anulada") {
     throw new BillingError("ANNUL_INVALID", "Anulada es terminal: no se edita (emita una nueva).", 409);
   }
@@ -1633,6 +1626,7 @@ export async function editInvoiceItems(
   try {
     refs = await loadRefs();
     stockMap = await validateItemRefs(
+      db,
       input.items.map((item) => ({
         item_type: item.item_type,
         product_id: item.product_id,
@@ -1771,12 +1765,12 @@ export async function editInvoiceItems(
     newQtyByProduct,
     reason: editReason,
   });
-  const { data: written, error: editError } = await db.rpc("invoice_edit_items_atomic", {
-    p_invoice_id: invoiceId,
-    p_user_id: actor.userId,
-    p_expected_version: Number(detail.invoice.edit_version),
-    p_expected_status: detail.invoice.status,
-    p_edit: {
+  const { data: written, error: editError } = await db.editItemsAtomic<EditRpcResult>({
+    invoiceId,
+    userId: actor.userId,
+    expectedVersion: Number(detail.invoice.edit_version),
+    expectedStatus: detail.invoice.status,
+    edit: {
       items_remove: diff.removed.map((row) => row.id),
       items_update: diff.changed.map(({ old, next }) => ({ id: old.id, ...editItemColumns(next) })),
       items_insert: diff.added.map((item) => editItemColumns(item)),
@@ -1798,7 +1792,7 @@ export async function editInvoiceItems(
   // lo pedido, así que un conteo distinto sólo puede venir de una respuesta
   // incoherente. Se reporta como fallo real en vez de devolver un detalle que la
   // base no escribió.
-  const result = written as { invoice: InvoiceRow; items: number; movements: number };
+  const result = written;
   if (
     result.items !== diff.removed.length + diff.changed.length + diff.added.length ||
     result.movements !== inventoryMoves.length
@@ -1870,7 +1864,7 @@ export async function editEmittedInvoiceItems(
   const motivo = input.motivo?.trim() || null;
   const db = await billingDb();
 
-  const detail = await getInvoiceDetail(invoiceId);
+  const detail = await fetchInvoiceDetail(db, invoiceId);
   if (detail.invoice.status === "Anulada") {
     throw new BillingError("ANNUL_INVALID", "Anulada es terminal: no se edita (emita una nueva).", 409);
   }
@@ -1911,6 +1905,7 @@ export async function editEmittedInvoiceItems(
   try {
     refs = await loadRefs();
     emittedStockMap = await validateItemRefs(
+      db,
       input.items.map((item) => ({
         item_type: item.item_type,
         product_id: item.product_id,
@@ -2087,12 +2082,12 @@ export async function editEmittedInvoiceItems(
     newQtyByProduct,
     reason: editReason,
   });
-  const { data: written, error: editError } = await db.rpc("invoice_edit_emitted_atomic", {
-    p_invoice_id: invoiceId,
-    p_user_id: actor.userId,
-    p_expected_version: Number(detail.invoice.edit_version),
-    p_expected_status: detail.invoice.status,
-    p_edit: {
+  const { data: written, error: editError } = await db.editEmittedAtomic<EditRpcResult>({
+    invoiceId,
+    userId: actor.userId,
+    expectedVersion: Number(detail.invoice.edit_version),
+    expectedStatus: detail.invoice.status,
+    edit: {
       items_remove: diff.removed.map((row) => row.id),
       items_update: diff.changed.map(({ old, next }) => ({ id: old.id, ...editItemColumns(next) })),
       items_insert: diff.added.map((item) => editItemColumns(item)),
@@ -2128,7 +2123,7 @@ export async function editEmittedInvoiceItems(
   }
 
   // Segunda barrera en la frontera (la misma de la edición admin).
-  const result = written as { invoice: InvoiceRow; items: number; movements: number };
+  const result = written;
   if (
     result.items !== diff.removed.length + diff.changed.length + diff.added.length ||
     result.movements !== inventoryMoves.length
@@ -2212,13 +2207,7 @@ async function invoiceInClosedPayroll(db: DbClient, invoiceId: string): Promise<
       const chunk = closedPeriods.slice(start, start + IN_FILTER_CHUNK_SIZE);
       for await (const batch of readPagedBatches<{ detail_json: unknown }>({
         table: "payroll_items",
-        fetchPage: (from, to) =>
-          db
-            .from("payroll_items")
-            .select("detail_json")
-            .in("period_id", chunk)
-            .order("id")
-            .range(from, to),
+          fetchPage: (from, to) => db.payrollItemDetailsPage(chunk, from, to),
       })) {
         if (batch.some((row) => detailHasInvoice(row.detail_json, invoiceId))) return true;
       }
@@ -2239,13 +2228,7 @@ async function readAllClosedPeriods(db: DbClient): Promise<string[]> {
   const periods = await readAllPaged<{ id: string }>({
     table: "payroll_periods",
     pageSize: IN_FILTER_CHUNK_SIZE,
-    fetchPage: (from, to) =>
-      db
-        .from("payroll_periods")
-        .select("id")
-        .eq("status", "cerrado")
-        .order("id")
-        .range(from, to),
+    fetchPage: (from, to) => db.closedPayrollPeriodsPage(from, to),
   });
   return periods.map((row) => row.id);
 }
@@ -2270,13 +2253,9 @@ async function findInvoicePaymentsByIdempotencyKey(
   invoiceId: string,
   idempotencyKey: string,
 ): Promise<InvoicePaymentRow[]> {
-  const { data, error } = await db
-    .from("invoice_payments")
-    .select(`${PAYMENT_SELECT}, idempotency_key`)
-    .eq("invoice_id", invoiceId)
-    .eq("idempotency_key", idempotencyKey);
+  const { data, error } = await db.findInvoicePaymentsByIdempotency<InvoicePaymentRow>(invoiceId, idempotencyKey);
   if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
-  return (data ?? []) as InvoicePaymentRow[];
+  return data ?? [];
 }
 
 /**
@@ -2336,7 +2315,7 @@ export async function splitPayment(
     throw new BillingError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const db = await billingDb();
-  const detail = await getInvoiceDetail(id);
+  const detail = await fetchInvoiceDetail(db, id);
   if (detail.invoice.status === "Anulada") {
     throw new BillingError("ANNUL_INVALID", annulBlockedMessage("Anulada"), 409);
   }
@@ -2351,7 +2330,7 @@ export async function splitPayment(
     id,
     parsed.data.idempotency_key,
   );
-  if (repeated.length > 0) return getInvoiceDetail(id);
+  if (repeated.length > 0) return fetchInvoiceDetail(db, id);
 
   // F2: el cobro exige caja abierta (CAJ-02). Solo la caja dueña del
   // turno o un administrador puede pagar o anular.
@@ -2415,8 +2394,13 @@ export async function splitPayment(
   // Cierra la factura el NETO cobrado, no el bruto: con el recargo de un
   // cobro posterior a la emisión el bruto supera `total` y comparar bruto
   // contra total era lo que marcaba Pagada sin neto completo.
-  const fullyPaid =
-    balance.netCollected + netSum - balance.netBilled > -MONEY_EPSILON;
+  // Values may contain historical cents, so completion compares their rounded
+  // peso values. New payments and new totals are always integers.
+  const fullyPaid = !invoicePaymentCapExceeded({
+    alreadyPaid: balance.netCollected,
+    incoming: netSum,
+    cap: balance.netBilled,
+  });
   // CL-11: la DECISIÓN de cerrar la factura se toma acá (con `fullyPaid` y el
   // estado leído) y viaja como un booleano: la transacción no compara el cobrado
   // contra el facturado ni una vez.
@@ -2440,19 +2424,19 @@ export async function splitPayment(
   // abajo se traduce al mismo error de negocio que el servicio ya usa para "no
   // hay caja abierta". El cierre de la factura con sus datos (`closed_by`,
   // `closed_at`) ya viajaba y no cambia.
-  const { data: written, error: payError } = await db.rpc("invoice_split_payment_atomic", {
-    p_invoice_id: id,
+  const { data: written, error: payError } = await db.splitPaymentAtomic<SplitPaymentRpcResult>({
+    invoiceId: id,
     // CL-17: el TURNO que cobra, como PARÁMETRO de la operación (no sólo dentro
     // de cada porción). La función lo bloquea (`FOR SHARE`) ANTES de bloquear la
     // factura —orden global `cash_shifts > invoices`— y lo revalida: un
     // `closeShift` concurrente ya no puede cerrar el turno a mitad del cobro, así
     // que las porciones no pueden caer en un turno recién cerrado. Además exige
     // que TODAS las porciones pertenezcan a ese turno.
-    p_shift_id: payShift.id,
-    p_user_id: actor.userId,
-    p_closed_at: new Date().toISOString(),
-    p_mark_paid: closesInvoice,
-    p_portions: fees.map((fee, index) => ({
+    shiftId: payShift.id,
+    userId: actor.userId,
+    closedAt: new Date().toISOString(),
+    markPaid: closesInvoice,
+    portions: fees.map((fee, index) => ({
       method_id: refs.methodByCode.get(fee.method_code)?.id ?? null,
       method_code: fee.method_code,
       amount: fee.gross,
@@ -2463,6 +2447,7 @@ export async function splitPayment(
     })),
   });
   if (payError) {
+    throwBillingCop(payError);
     // CL-11: la transacción revalida adentro las precondiciones que el servicio
     // ya revisó (la factura no puede estar Anulada) y sus `RAISE EXCEPTION`
     // salen con el MISMO SQLSTATE que el tope de 031 (P0001), así que el MENSAJE
@@ -2502,7 +2487,7 @@ export async function splitPayment(
         id,
         parsed.data.idempotency_key,
       );
-      if (winner.length > 0) return getInvoiceDetail(id);
+      if (winner.length > 0) return fetchInvoiceDetail(db, id);
       // Sin cobro con esa marca, el rechazo es el de siempre: el tope.
       if (code === "P0001") {
         throw new BillingError("OVERPAID", "Las porciones superan el saldo pendiente.", 422);
@@ -2512,7 +2497,7 @@ export async function splitPayment(
     throw new BillingError("INTERNAL", "Error interno.", 500);
   }
 
-  const result = written as { invoice: InvoiceRow; portions: number } | null;
+  const result = written;
   // Segunda barrera en la frontera: la función ya revierte si escribió menos de
   // lo pedido, así que un conteo distinto sólo puede venir de una respuesta
   // incoherente. Se reporta como fallo real en vez de devolver un detalle que la
@@ -2522,5 +2507,5 @@ export async function splitPayment(
   }
 
   if (closesInvoice) return loadDetail(db, result.invoice);
-  return getInvoiceDetail(id);
+  return fetchInvoiceDetail(db, id);
 }
