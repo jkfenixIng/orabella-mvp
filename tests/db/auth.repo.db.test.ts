@@ -203,7 +203,18 @@ describe.each(["supabase", "postgres"] as const)("auth service on the %s engine"
        VALUES (${SEDE_ROW}, $1, 'CC', $2, $3, 'Ana') RETURNING id`,
       [`${documento}@b.co`, documento, await hashPassword("Clave123")],
     );
-    await engine.pg.query(`INSERT INTO public.user_roles (user_id, role_id) SELECT $1, id FROM public.roles WHERE code = ANY($2::text[])`, [rows[0].id, roles]);
+    if (roles.includes("superadmin")) {
+      await engine.pg.query(`SELECT public.provision_installation_owner($1::uuid)`, [rows[0].id]);
+      if (roles.some((role) => role !== "superadmin")) {
+        await engine.pg.query(
+          `INSERT INTO public.user_roles (user_id, role_id)
+           SELECT $1, id FROM public.roles WHERE code = ANY($2::text[]) AND code <> 'superadmin'`,
+          [rows[0].id, roles],
+        );
+      }
+    } else {
+      await engine.pg.query(`INSERT INTO public.user_roles (user_id, role_id) SELECT $1, id FROM public.roles WHERE code = ANY($2::text[])`, [rows[0].id, roles]);
+    }
     return { id: rows[0].id, documento };
   }
 

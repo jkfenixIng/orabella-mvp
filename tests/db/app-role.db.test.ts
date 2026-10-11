@@ -11,8 +11,9 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { DB_HOOK_TIMEOUT, REPO_ROOT, applyFile, closeDb, freshDb, one, rpc, warmTemplate, type Db } from "./harness";
 
 const APP_ROLE_PATH = join(REPO_ROOT, "supabase", "bootstrap", "app-role.sql");
-/** 36 tables from 001 + cash_shift_method_balances from 003. */
-const TABLES = 37;
+/** 36 tables from 001 + cash_shift_method_balances from 003 + installation_owner from 006. */
+const TABLES = 38;
+const APP_TABLES = TABLES - 1;
 
 let db: Db;
 
@@ -65,22 +66,24 @@ describe("app-role.sql on a clean PostgreSQL", () => {
       no_password: true,
       in_service_role: true,
       memberships: 1,
-      table_grants: TABLES * 4,
+      table_grants: APP_TABLES * 4,
     });
   });
 
-  it("reads every public table as orabella_app", async () => {
+  it("reads every app table as orabella_app but cannot read installation ownership", async () => {
     const tables = await publicTables();
     expect(tables).toHaveLength(TABLES);
+    const appTables = tables.filter((table) => table !== "installation_owner");
     const readable = await asApp(async () => {
       const ok: string[] = [];
-      for (const table of tables) {
+      for (const table of appTables) {
         await db.query(`SELECT * FROM public.${table} LIMIT 1`);
         ok.push(table);
       }
+      await expect(db.query("SELECT * FROM public.installation_owner")).rejects.toMatchObject({ code: "42501" });
       return ok;
     });
-    expect(readable).toEqual(tables);
+    expect(readable).toEqual(appTables);
   });
 
   it("has exactly SELECT, INSERT, UPDATE, DELETE on each table (no TRUNCATE, no DDL)", async () => {
@@ -89,7 +92,7 @@ describe("app-role.sql on a clean PostgreSQL", () => {
          FROM information_schema.role_table_grants WHERE grantee = 'orabella_app'
         GROUP BY table_name ORDER BY table_name`,
     );
-    expect(rows.map((row) => row.table_name)).toEqual(await publicTables());
+    expect(rows.map((row) => row.table_name)).toEqual((await publicTables()).filter((table) => table !== "installation_owner"));
     expect(new Set(rows.map((row) => row.privileges))).toEqual(new Set(["DELETE,INSERT,SELECT,UPDATE"]));
     await asApp(async () => {
       await expect(db.query(`TRUNCATE public.services`)).rejects.toMatchObject({ code: "42501" });
@@ -142,7 +145,7 @@ describe("app-role.sql Supabase guard", () => {
     );
     expect(rows).toEqual([]);
     await applyFile(db, APP_ROLE_PATH);
-    expect(await footprint()).toEqual({ role: 1, grants: TABLES * 4 });
+    expect(await footprint()).toEqual({ role: 1, grants: APP_TABLES * 4 });
   });
 
   it.each(["supabase_admin", "supabase_auth_admin", "supabase_storage_admin"])(
@@ -170,6 +173,6 @@ describe("app-role.sql Supabase guard", () => {
   it("the auth schema alone is not a Supabase signal", async () => {
     await db.exec(`CREATE SCHEMA auth; CREATE TABLE auth.users (id uuid);`);
     await applyFile(db, APP_ROLE_PATH);
-    expect(await footprint()).toEqual({ role: 1, grants: TABLES * 4 });
+    expect(await footprint()).toEqual({ role: 1, grants: APP_TABLES * 4 });
   });
 });

@@ -30,7 +30,8 @@ describe("real-concurrency harness contract", () => {
     expect(source("preflight.mjs")).toMatch(/Node 22\.18\+ or 23\.6\+/);
     // 005 is applied to the real cluster and smoke-checked there.
     expect(cluster).toContain('"005_cop_whole_peso.sql"');
-    expect(run).toMatch(/l\. 005 COP whole-peso smoke/);
+    expect(run).toMatch(/l\. concurrent installation owner guards/);
+    expect(run).toMatch(/m\. 005 COP whole-peso smoke/);
     expect(run).toMatch(/COP_WHOLE_PESO_REQUIRED/);
   });
 });

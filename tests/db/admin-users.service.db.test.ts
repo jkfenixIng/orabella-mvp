@@ -53,7 +53,7 @@ beforeEach(async () => {
   root = await addUser("101", "Root", null);
   await addUser("102", "Zoe", otherSede);
   await engine.pg.query(`SELECT public.replace_user_roles($1::uuid, ARRAY['empleado']::text[])`, [ana]);
-  await engine.pg.query(`SELECT public.replace_user_roles($1::uuid, ARRAY['superadmin']::text[])`, [root]);
+  await engine.pg.query(`SELECT public.provision_installation_owner($1::uuid)`, [root]);
 }, DB_HOOK_TIMEOUT);
 afterEach(async () => {
   vi.unstubAllEnvs();

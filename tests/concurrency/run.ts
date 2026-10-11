@@ -109,6 +109,21 @@ async function scenarioPayrollApply(o: Sql, a: Sql, b: Sql): Promise<string> { c
  * before 005) still accepts a non-money UPDATE, and the audit view is
  * service_role-only. Everything runs in one transaction that is rolled back.
  */
+async function scenarioInstallationOwner(o: Sql, a: Sql, b: Sql): Promise<string> {
+  const owner = await user(o), other = await user(o);
+  await o`SELECT public.provision_installation_owner(${owner}::uuid)`;
+  await begin(a);
+  await a`SELECT id FROM public.users WHERE id = ${owner} FOR UPDATE`;
+  const remove = track(b`SELECT public.replace_user_roles(${owner}::uuid, ARRAY['admin']::text[])`);
+  await expectWaiting(o, await backendPid(b));
+  await commit(a);
+  const removal = await errorOf(remove);
+  assert(removal.code === "P0001" && removal.message.includes("INSTALLATION_OWNER_ROLE_IMMUTABLE"), `owner removal got ${removal.code}/${removal.message}`);
+  const assignment = await errorOf(b`SELECT public.replace_user_roles(${other}::uuid, ARRAY['superadmin']::text[])`);
+  assert(assignment.code === "P0001" && assignment.message.includes("SUPERADMIN_OWNER_ONLY"), `other assignment got ${assignment.code}/${assignment.message}`);
+  return "owner removal=P0001/INSTALLATION_OWNER_ROLE_IMMUTABLE; other assignment=P0001/SUPERADMIN_OWNER_ONLY";
+}
+
 async function scenarioCopWholePeso(o: Sql, a: Sql): Promise<string> {
   const triggers = (await o<{ n: number }[]>`SELECT count(*)::int AS n FROM pg_trigger WHERE tgname IN ('trg_cop_whole_peso', 'trg_cop_whole_peso_settings') AND NOT tgisinternal`)[0].n;
   assert(triggers >= 20, `expected the 005 triggers, found ${triggers}`);
@@ -145,7 +160,7 @@ async function main(): Promise<void> {
   try {
     cluster = await startCluster(); observer = postgres(cluster.url, { max: 1, connect_timeout: 5, onnotice: () => undefined }); a = postgres(cluster.url, { max: 1, connect_timeout: 5, onnotice: () => undefined }); b = postgres(cluster.url, { max: 1, connect_timeout: 5, onnotice: () => undefined }); c = postgres(cluster.url, { max: 1, connect_timeout: 5, onnotice: () => undefined });
     const o = observer, x = a, y = b, z = c, sessions = { observer: o, a: x, b: y, c: z, pids: await Promise.all([backendPid(x), backendPid(y), backendPid(z)]) };
-    const scenarios: Array<[string, () => Promise<string>, number?]> = [["a. concurrent shift opens", () => scenarioOpen(o, x, y)], ["b. close vs cash invoice payment", () => scenarioCloseVsPayment(o, x, y, false)], ["c. close vs split invoice payment", () => scenarioCloseVsPayment(o, x, y, true)], ["d. concurrent closes", () => scenarioDoubleClose(o, x, y)], ["e. stale arqueo after collection", () => scenarioStale(o, x, y, z)], ["f. concurrent arqueo-method outflows", () => scenarioMinimum(o, x, y)], ["g. invoice method edit vs commission", () => scenarioEditVsCommission(o, x, y), 20], ["h. concurrent invoice consecutives", () => scenarioInvoiceConcurrency(o, x, y)], ["i. same idempotency key", () => scenarioIdempotency(o, x, y)], ["j. concurrent payroll payments cap", () => scenarioPayrollCap(o, x, y)], ["k. concurrent payroll apply", () => scenarioPayrollApply(o, x, y)], ["l. 005 COP whole-peso smoke", () => scenarioCopWholePeso(o, x)]];
+    const scenarios: Array<[string, () => Promise<string>, number?]> = [["a. concurrent shift opens", () => scenarioOpen(o, x, y)], ["b. close vs cash invoice payment", () => scenarioCloseVsPayment(o, x, y, false)], ["c. close vs split invoice payment", () => scenarioCloseVsPayment(o, x, y, true)], ["d. concurrent closes", () => scenarioDoubleClose(o, x, y)], ["e. stale arqueo after collection", () => scenarioStale(o, x, y, z)], ["f. concurrent arqueo-method outflows", () => scenarioMinimum(o, x, y)], ["g. invoice method edit vs commission", () => scenarioEditVsCommission(o, x, y), 20], ["h. concurrent invoice consecutives", () => scenarioInvoiceConcurrency(o, x, y)], ["i. same idempotency key", () => scenarioIdempotency(o, x, y)], ["j. concurrent payroll payments cap", () => scenarioPayrollCap(o, x, y)], ["k. concurrent payroll apply", () => scenarioPayrollApply(o, x, y)], ["l. concurrent installation owner guards", () => scenarioInstallationOwner(o, x, y)], ["m. 005 COP whole-peso smoke", () => scenarioCopWholePeso(o, x)]];
     const results: Result[] = []; for (const [name, fn, repetitions] of scenarios) { const result = await runScenario(sessions, name, fn, repetitions); console.log(`${result.status} ${name}${repetitions ? ` (${repetitions}x)` : ""}: ${result.detail}`); results.push(result); } if (results.some((result) => result.status === "FAIL")) process.exitCode = 1;
   } finally { await Promise.all([a && rollback(a), b && rollback(b), c && rollback(c)].filter(Boolean)); await Promise.all([observer?.end({ timeout: 1 }), a?.end({ timeout: 1 }), b?.end({ timeout: 1 }), c?.end({ timeout: 1 })].filter(Boolean)); await teardown(); }
 }

@@ -47,7 +47,7 @@ const read = (file: string): string => readFileSync(join(dir, file), "utf8");
  * the repo intentionally no longer has.
  */
 const EXPECTED_LATER = {
-  tables: new Set(["cash_shift_method_balances"]),
+  tables: new Set(["cash_shift_method_balances", "installation_owner"]),
   onlyInRepo: new Set([
     "function|cash_open_shift_atomic_legacy(p_register_id uuid, p_opened_by uuid, p_opening_base numeric, p_counts jsonb)",
     "function|cash_recount_shift_atomic_legacy(p_shift_id uuid, p_recounted_by uuid, p_recount jsonb, p_counts jsonb)",
@@ -108,6 +108,20 @@ const EXPECTED_LATER = {
     "trigger|system_settings.trg_cop_whole_peso_settings",
     "trigger|voucher_requests.trg_cop_whole_peso",
     "trigger|voucher_settings.trg_cop_whole_peso",
+    // 006: immutable singleton owner and superadmin guard.
+    "function|assert_installation_owner_operator()",
+    "function|assert_installation_owner_immutable()",
+    "function|assert_superadmin_owner()",
+    "function|provision_installation_owner(p_owner_user_id uuid)",
+    "function|break_glass_transfer_installation_owner(p_new_owner_user_id uuid, p_reason text)",
+    "trigger|installation_owner.trg_installation_owner_immutable",
+    "trigger|user_roles.trg_superadmin_owner",
+    "constraint|installation_owner.installation_owner_pkey|p",
+    "constraint|installation_owner.installation_owner_singleton_check|c",
+    "constraint|installation_owner.installation_owner_owner_user_id_key|u",
+    "constraint|installation_owner.installation_owner_owner_user_id_fkey|f",
+    "index|installation_owner.installation_owner_pkey",
+    "index|installation_owner.installation_owner_owner_user_id_key",
   ]),
   onlyInProduction: new Set(["constraint|payment_methods.payment_methods_code_check|c"]),
 };

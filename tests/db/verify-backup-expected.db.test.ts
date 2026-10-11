@@ -2,7 +2,7 @@
  * `scripts/verify-backup-restore.ts` restores a production backup with 001+002,
  * then applies every later migration, and tolerates ONLY the catalog objects it
  * declares in `EXPECTED_LATER.onlyInRepo`. That declared set must be exactly
- * what 003 and 004 add over 001+002: a missing entry makes a real restore fail,
+ * what later migrations add over 001+002: a missing entry makes a real restore fail,
  * an extra entry would hide drift. The script runs on import, so its set is
  * read from its source text.
  */
@@ -41,7 +41,7 @@ async function inventory(db: Db): Promise<Set<string>> {
 }
 
 describe("verify-backup-restore: declared repo-only objects", () => {
-  it("equal exactly what the migrations after 001+002 add (003 and 004)", async () => {
+  it("equals exactly what the migrations after 001+002 add", async () => {
     expect(MIGRATION_PATHS.map((path) => path.split(/[\\/]/).pop())).toContain("004_inventory_literal_search.sql");
     const legacy = await buildSchemaDb({ catalog: false, migrations: [SCHEMA_PATH, PORTABLE_PATH] });
     const current = await buildSchemaDb({ catalog: false });

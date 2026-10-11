@@ -32,6 +32,12 @@ export const users = pgTable("users", {
   idNumber: text("id_number").notNull(),
 });
 
+/** Singleton owner record. No application repository reads or writes it. */
+export const installationOwner = pgTable("installation_owner", {
+  singleton: boolean("singleton").notNull().primaryKey(),
+  ownerUserId: uuid("owner_user_id").notNull(),
+});
+
 export const employees = pgTable("employees", {
   id: uuid("id").defaultRandom().notNull().primaryKey(),
   userId: uuid("user_id"),

@@ -38,8 +38,8 @@ cp .env.example .env.local     # completar las 3 variables (ver Env)
 npm run dev                    # http://localhost:3000
 ```
 
-Base de datos, en este orden. `001` se aplica **una sola vez**; `002`, `003` y
-`004` son migraciones transaccionales; los seeds son idempotentes y se pueden
+Base de datos, en este orden. `001` se aplica **una sola vez**; `002` a `006`
+son migraciones transaccionales; los seeds son idempotentes y se pueden
 reejecutar:
 
 ```bash
@@ -48,6 +48,8 @@ psql "<connection-string>" -v ON_ERROR_STOP=1 --single-transaction -f supabase/m
 psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/002_portable_platform.sql
 psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/003_payment_method_arqueo.sql
 psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/004_inventory_literal_search.sql
+psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/005_cop_whole_peso.sql
+psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/006_installation_owner.sql
 psql "<connection-string>" -f supabase/seeds/catalog.sql      # catálogo mínimo: roles, sede, caja, pagos, impuestos, ajustes
 psql "<connection-string>" -f supabase/seeds/acceptance.sql   # opcional: datos de prueba §11
 ```
@@ -59,7 +61,7 @@ de `002`, como superusuario,
 `psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/bootstrap/app-role.sql`
 (crea `orabella_app`, el rol con el que la app se conecta con
 `DB_ENGINE=postgres`). Orden completo:
-`platform-roles.sql → 001 → 002 → 003 → 004 → app-role.sql → seeds`.
+`platform-roles.sql → 001 → 002 → 003 → 004 → 005 → 006 → app-role.sql → seeds`.
 
 ### Búsqueda literal de inventario (`004`)
 
@@ -265,22 +267,37 @@ y se retiró con ella. El día se declara UNA vez y después es **solo lectura**
 moverlo implicaría reescribir períodos ya liquidados, así que no hay superficie
 que lo mueva, y no hace falta que la haya.
 
-### El rol `superadmin`: deuda declarada, no superficie
+### El único `superadmin`: dueño de instalación, no superficie
 
-El rol **sigue en el catálogo** de la base
-(`supabase/migrations/001_orabella_schema.sql`) y en el tipo `RoleCode`
-(`src/features/auth/schemas.ts`), y sigue **sin ser asignable** desde la
-administración de una sede: lo asignable es `sedeAssignableRoleSchema` =
-`["admin","empleado","caja"]`. `setUserRoles` lo rechaza en las **dos
-direcciones** —otorgarlo, y quitárselo a quien ya lo tenga— antes de llamar al
-`rpc`, así que la base no escribe nada.
+`006_installation_owner.sql` fija el invariante de **un solo** dueño activo con
+rol `superadmin`. La migración no infiere ni convierte usuarios existentes: hasta
+la provisión explícita, cualquier asignación normal de `superadmin` falla con
+`OWNER_NOT_PROVISIONED`. La app nunca ofrece, asigna, retira ni transfiere ese
+rol; `setUserRoles` y el alta de empleados sólo aceptan `admin`, `empleado` o
+`caja`.
 
-Es deuda declarada a propósito: retirar el código no borra la fila del catálogo
-ni regenera el archivo único de esquema, porque eso obligaría a resetear las dos
-bases. Quitarla es otra unidad, con su migración. El guard que la mantiene
-escrita está en `tests/platform-retirement.test.ts` («la base NO se toca»). La
-misma deuda incluye `sedes.payroll_start_date`, la columna que ya no tiene
-quien la escriba ni la lea.
+La provisión se ejecuta una sola vez por un operador de base o `service_role`,
+después de aplicar `006` y el catálogo, usando el `users.id` real de esa base:
+
+```sql
+SELECT public.provision_installation_owner('OWNER_USER_ID'::uuid);
+```
+
+No se codifica email ni UUID en el repositorio. El dueño no se borra ni cambia
+con SQL directo ni mediante `replace_user_roles`. Si pierde acceso, la única
+recuperación es un procedimiento manual y auditado fuera de la app, ejecutado
+por un operador de base o `service_role`:
+
+```sql
+SELECT public.break_glass_transfer_installation_owner(
+  'OWNER_USER_ID'::uuid,
+  'Ticket de incidente y aprobación documentada'
+);
+```
+
+El procedimiento exige motivo y deja `audit_logs.metadata` con `old`, `new`,
+`reason` y `operator`. `orabella_app`, `anon` y `authenticated` no tienen acceso
+a la tabla ni a estas funciones.
 
 ### Lo que sigue autorizando es el ROL, no la sede
 

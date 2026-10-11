@@ -65,7 +65,7 @@ function owner(cluster: Pick<Cluster, "dataDir" | "runnerPid">): Marker {
 const MIGRATIONS_DIR = join(REPO_ROOT, "supabase", "migrations");
 export const SCHEMA_FILES = [
   join(REPO_ROOT, "supabase", "bootstrap", "platform-roles.sql"),
-  ...["001_orabella_schema.sql", "002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql", "005_cop_whole_peso.sql"].map((name) => join(MIGRATIONS_DIR, name)),
+  ...["001_orabella_schema.sql", "002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql", "005_cop_whole_peso.sql", "006_installation_owner.sql"].map((name) => join(MIGRATIONS_DIR, name)),
   join(REPO_ROOT, "supabase", "seeds", "catalog.sql"),
   join(REPO_ROOT, "supabase", "bootstrap", "app-role.sql"),
 ];
