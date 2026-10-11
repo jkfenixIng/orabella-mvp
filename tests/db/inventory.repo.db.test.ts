@@ -10,7 +10,7 @@ import { supabaseInventoryRepo, type InventoryRepo } from "@/src/features/invent
 import type { Database } from "@/src/shared/db/client";
 import { DbQueryError } from "@/src/shared/db/errors";
 import * as schema from "@/src/shared/db/schema";
-import { DB_HOOK_TIMEOUT, closeDb, freshDb, warmTemplate, type Db } from "./harness";
+import { DB_HOOK_TIMEOUT, closeDb, freshDb, setCopTriggers, warmTemplate, type Db } from "./harness";
 import { parseOrIlike, postgrestDouble } from "./postgrest-double";
 
 const USER = "00000000-0000-4000-8000-0000000000a1";
@@ -23,6 +23,7 @@ let right: Db;
 beforeAll(warmTemplate, DB_HOOK_TIMEOUT);
 beforeEach(async () => {
   [left, right] = await Promise.all([freshDb(), freshDb()]);
+  await Promise.all([setCopTriggers(left, false), setCopTriggers(right, false)]);
   await Promise.all([seed(left), seed(right)]);
 }, DB_HOOK_TIMEOUT);
 afterEach(async () => {

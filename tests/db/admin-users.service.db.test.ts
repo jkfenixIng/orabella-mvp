@@ -6,7 +6,7 @@
  */
 import { drizzle } from "drizzle-orm/pglite";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { DB_HOOK_TIMEOUT, closeDb, count, freshDb, one, warmTemplate, type Db } from "./harness";
+import { DB_HOOK_TIMEOUT, closeDb, count, freshDb, one, setCopTriggers, warmTemplate, type Db } from "./harness";
 
 const engine = vi.hoisted(() => ({ pg: null as unknown as Db, supabaseCalls: 0 }));
 vi.mock("next/cache", () => ({ unstable_cache: <T>(fn: T) => fn }));
@@ -45,6 +45,7 @@ const roleCodes = async (userId: string) =>
 beforeAll(warmTemplate, DB_HOOK_TIMEOUT);
 beforeEach(async () => {
   engine.pg = await freshDb();
+  await setCopTriggers(engine.pg, false);
   engine.supabaseCalls = 0;
   sede = (await one<{ id: string }>(engine.pg, `SELECT id FROM public.sedes ORDER BY name LIMIT 1`)).id;
   otherSede = (await one<{ id: string }>(engine.pg, `INSERT INTO public.sedes (name) VALUES ('Otra') RETURNING id`)).id;
@@ -113,7 +114,7 @@ describe.each(["supabase", "postgres"] as const)("admin user service on %s", (na
   it("upsertEmployee creates account, role and legajo through the RPC, then edits the legajo", async () => {
     const { upsertEmployee } = await service();
     const created = await upsertEmployee({ full_name: "Bea", document: "200", employee_code: "E-1", pay_type: "mixto", salary_fixed: 1234.5, commission_percent: 7.25 }, sede);
-    expect(created).toMatchObject({ full_name: "Bea", document: "200", employee_code: "E-1", salary_fixed: 1234.5, commission_percent: 7.25, payout_mode: "nomina", is_active: true, pay_frequency: null });
+    expect(created).toMatchObject({ full_name: "Bea", document: "200", employee_code: "E-1", salary_fixed: 1235, commission_percent: 7.25, payout_mode: "nomina", is_active: true, pay_frequency: null });
     const account = await one<{ id: string; sede_id: string; password_hash: string }>(engine.pg, `SELECT id, sede_id, password_hash FROM public.users WHERE id_number = '200'`);
     expect(created.user_id).toBe(account.id);
     expect(account.sede_id).toBe(sede);

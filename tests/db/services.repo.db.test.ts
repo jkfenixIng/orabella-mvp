@@ -22,7 +22,7 @@ import { drizzleServicesRepo } from "@/src/features/admin/repos/services.drizzle
 import type { Database } from "@/src/shared/db/client";
 import { DbQueryError, toDbError } from "@/src/shared/db/errors";
 import * as schema from "@/src/shared/db/schema";
-import { DB_HOOK_TIMEOUT, closeDb, freshDb, warmTemplate, type Db } from "./harness";
+import { DB_HOOK_TIMEOUT, closeDb, freshDb, setCopTriggers, warmTemplate, type Db } from "./harness";
 
 const ID_A = "0a0a0a0a-0000-4000-8000-00000000000a";
 const ID_B = "0b0b0b0b-0000-4000-8000-00000000000b";
@@ -34,6 +34,7 @@ let db: Database;
 beforeAll(warmTemplate, DB_HOOK_TIMEOUT);
 beforeEach(async () => {
   pg = await freshDb();
+  await setCopTriggers(pg, false);
   db = drizzle({ client: pg, schema }) as unknown as Database;
 }, DB_HOOK_TIMEOUT);
 afterEach(async () => {

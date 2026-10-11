@@ -12,7 +12,7 @@ import { drizzleCashRepo } from "@/src/features/cash/repos/cash.drizzle";
 import { supabaseCashRepo, type CashRepo } from "@/src/features/cash/repos/cash";
 import type { Database } from "@/src/shared/db/client";
 import * as schema from "@/src/shared/db/schema";
-import { DB_HOOK_TIMEOUT, closeDb, freshDb, one, warmTemplate, type Db } from "./harness";
+import { DB_HOOK_TIMEOUT, closeDb, freshDb, setCopTriggers, one, warmTemplate, type Db } from "./harness";
 import { countLines, createInvoiceCall, registerId } from "./fixtures";
 import { postgrestDouble } from "./postgrest-double";
 
@@ -29,6 +29,7 @@ let register: string;
 beforeAll(warmTemplate, DB_HOOK_TIMEOUT);
 beforeEach(async () => {
   [left, right] = await Promise.all([freshDb(), freshDb()]);
+  await Promise.all([setCopTriggers(left, false), setCopTriggers(right, false)]);
   await Promise.all([seed(left), seed(right)]);
   register = await registerId(left);
 }, DB_HOOK_TIMEOUT);

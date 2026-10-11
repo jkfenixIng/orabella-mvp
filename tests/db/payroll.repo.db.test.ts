@@ -14,7 +14,7 @@ import { supabasePayrollRepo, type PayrollRepo } from "@/src/features/payroll/re
 import type { Database } from "@/src/shared/db/client";
 import * as schema from "@/src/shared/db/schema";
 import { bogotaDay, rangeBounds } from "@/src/shared/lib/dates";
-import { DB_HOOK_TIMEOUT, closeDb, freshDb, one, warmTemplate, type Db } from "./harness";
+import { DB_HOOK_TIMEOUT, closeDb, freshDb, setCopTriggers, one, warmTemplate, type Db } from "./harness";
 import { countLines, payrollItem, registerId } from "./fixtures";
 import { postgrestDouble } from "./postgrest-double";
 
@@ -38,6 +38,7 @@ let shifts: [string, string];
 beforeAll(warmTemplate, DB_HOOK_TIMEOUT);
 beforeEach(async () => {
   [left, right] = await Promise.all([freshDb(), freshDb()]);
+  await Promise.all([setCopTriggers(left, false), setCopTriggers(right, false)]);
   shifts = (await Promise.all([seed(left), seed(right)])) as [string, string];
 }, DB_HOOK_TIMEOUT);
 afterEach(async () => {

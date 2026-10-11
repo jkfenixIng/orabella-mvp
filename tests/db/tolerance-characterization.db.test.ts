@@ -1,12 +1,16 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { DB_HOOK_TIMEOUT, closeDb, freshDb, one, pgError, readSchema, warmTemplate, type Db } from "./harness";
+import { DB_HOOK_TIMEOUT, closeDb, freshDb, setCopTriggers, one, pgError, readSchema, warmTemplate, type Db } from "./harness";
 import { insertEmployee, insertPeriod } from "./fixtures";
 import { MONEY_EPSILON, moneyEquals } from "@/src/features/billing/schemas";
 import { assertNoOverpay } from "@/src/features/payroll/schemas";
 
 let db: Db;
 beforeAll(warmTemplate, DB_HOOK_TIMEOUT);
-beforeEach(async () => { db = await freshDb(); }, DB_HOOK_TIMEOUT);
+// The cap triggers are characterized on legacy cent rows (pre-005 writes).
+beforeEach(async () => {
+  db = await freshDb();
+  await setCopTriggers(db, false);
+}, DB_HOOK_TIMEOUT);
 afterEach(async () => { await closeDb(db); });
 
 const DELTAS = [0, 0.009, 0.0095, 0.01] as const;
@@ -15,9 +19,10 @@ const sqlCapAllows = async (delta: number) =>
 
 /**
  * Characterization only, no unification: SQL caps for invoice, payroll and
- * commission reject deltas > 0.009; cash reuses the invoice trigger. TS billing
- * equality keeps MONEY_EPSILON = 0.01. Legacy invoice cents are compared
- * against round(total - surcharge).
+ * commission reject deltas > 0.009; cash reuses the invoice trigger. TS money
+ * equality (COP policy) compares whole pesos, so every sub-peso delta is equal;
+ * MONEY_EPSILON = 0.01 stays exported for history only. Legacy invoice cents are
+ * compared against round(total - surcharge).
  */
 describe("money tolerance characterization", () => {
   it("the three SQL cap triggers still use the documented 0.009 predicate", () => {
@@ -33,8 +38,8 @@ describe("money tolerance characterization", () => {
     expect(sql).toBe(delta <= 0.009);
     // Commission and cash TS caps compare the raw delta with the same `> 0.009`.
     expect(!(delta > 0.009)).toBe(sql);
-    // Billing equality is a different, documented rule (< 0.01).
-    expect(moneyEquals(100 + delta, 100)).toBe(delta < 0.01);
+    // COP policy: TS equality compares rounded whole pesos (sub-peso deltas are equal).
+    expect(moneyEquals(100 + delta, 100)).toBe(true);
   });
 
   it.each(DELTAS)("payroll payment trigger at delta %s matches assertNoOverpay", async (delta) => {

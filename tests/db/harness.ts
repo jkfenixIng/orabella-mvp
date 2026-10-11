@@ -63,6 +63,32 @@ export async function applyFile(db: Db, path: string): Promise<void> {
   await db.exec(readFileSync(path, "utf8"));
 }
 
+/**
+ * Test-only switch for the 005 whole-peso triggers. Repository-equivalence
+ * suites characterize how both engines map `numeric(12,2)` (cents included) and
+ * legacy fixtures must reproduce rows written before 005; the policy itself is
+ * covered by cop-whole-peso.db.test.ts with the triggers ON.
+ */
+export async function setCopTriggers(db: Db, enabled: boolean): Promise<void> {
+  const { rows } = await db.query<{ table_name: string; trigger_name: string }>(
+    `SELECT DISTINCT event_object_table AS table_name, trigger_name
+       FROM information_schema.triggers
+      WHERE trigger_schema = 'public' AND trigger_name LIKE 'trg_cop_whole_peso%'`,
+  );
+  const verb = enabled ? "ENABLE" : "DISABLE";
+  for (const row of rows) await db.exec(`ALTER TABLE public.${row.table_name} ${verb} TRIGGER ${row.trigger_name}`);
+}
+
+/** Runs `run` with the 005 triggers disabled: a legacy (pre-005) write. */
+export async function withCopTriggersDisabled<T>(db: Db, run: () => Promise<T>): Promise<T> {
+  await setCopTriggers(db, false);
+  try {
+    return await run();
+  } finally {
+    await setCopTriggers(db, true);
+  }
+}
+
 export interface BuildOptions {
   /** Apply supabase/seeds/catalog.sql after the schema (default true). */
   catalog?: boolean;

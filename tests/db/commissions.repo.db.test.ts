@@ -10,7 +10,7 @@ import { supabaseCommissionRepo, type CommissionRepo, type PayoutWrite } from "@
 import type { Database } from "@/src/shared/db/client";
 import { DbQueryError } from "@/src/shared/db/errors";
 import * as schema from "@/src/shared/db/schema";
-import { DB_HOOK_TIMEOUT, closeDb, freshDb, one, type Db, warmTemplate } from "./harness";
+import { DB_HOOK_TIMEOUT, closeDb, freshDb, setCopTriggers, one, type Db, warmTemplate } from "./harness";
 import { createInvoiceCall, insertEmployee, insertProduct, insertUser, openShift, registerId } from "./fixtures";
 import { postgrestDouble } from "./postgrest-double";
 
@@ -38,6 +38,7 @@ async function seed(db: Db, repo: CommissionRepo): Promise<Ctx> {
 beforeAll(warmTemplate, DB_HOOK_TIMEOUT);
 beforeEach(async () => {
   const [left, right] = await Promise.all([freshDb(), freshDb()]);
+  await Promise.all([setCopTriggers(left, false), setCopTriggers(right, false)]);
   ctx = await Promise.all([
     seed(left, supabaseCommissionRepo(postgrestDouble(left))),
     seed(right, drizzleCommissionRepo(drizzle({ client: right, schema }) as unknown as Database)),
