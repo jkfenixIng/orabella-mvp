@@ -2,7 +2,7 @@
 
 ## Scope and safety boundary
 
-This runbook moves the application's database target from Supabase to a plain PostgreSQL instance. It applies the existing incremental migrations `002` through `005` after the already-applied `001` baseline, provisions the existing application role only on the target PostgreSQL, validates staging first, and changes the deployment to `DB_ENGINE=postgres` only after production approval.
+This runbook moves the application's database target from Supabase to a plain PostgreSQL instance. It applies the discovered incremental migrations after the already-applied `001` baseline, validates staging first, and changes the deployment to `DB_ENGINE=postgres` only after production approval. At this revision, the discovered set is `002` through `005`; later integrated migrations are not assumed.
 
 - **Read-only / preparation** sections do not change a database or deployment.
 - **Write** sections run migrations, provisioning, restore, or deployment changes. Treat every such command as irreversible unless this runbook explicitly says otherwise.
@@ -33,28 +33,36 @@ export BACKUP_DIR='<approved-backup-directory>'
 
 For a plain PostgreSQL target, use a migration connection with the database privileges needed by the migration files. `bootstrap/app-role.sql` additionally requires a superuser because it grants `BYPASSRLS` to `orabella_app`. Never run that bootstrap in Supabase: it aborts when Supabase platform roles are present.
 
-## Verified migration order
+## Migration discovery and order
 
-For an existing database based on `001`, apply exactly this order:
+Discover the actual repository migration set before each staging or production window. This is read-only and must be attached to the release evidence:
 
-1. `supabase/migrations/002_portable_platform.sql`
-2. `supabase/migrations/003_payment_method_arqueo.sql`
-3. `supabase/migrations/004_inventory_literal_search.sql`
-4. `supabase/migrations/005_cop_whole_peso.sql`
-5. `supabase/bootstrap/app-role.sql` after all target tables exist, then again after any later migration that adds public tables.
+```bash
+find supabase/migrations -maxdepth 1 -type f -name '[0-9][0-9][0-9]_*.sql' -printf '%f\n' | sort
+```
 
-For a clean plain PostgreSQL target, the full order is:
+The files sort lexically by their zero-padded numeric prefix. At this revision the discovered incremental order after `001` is:
+
+```text
+002_portable_platform.sql
+003_payment_method_arqueo.sql
+004_inventory_literal_search.sql
+005_cop_whole_peso.sql
+```
+
+For an existing database based on `001`, apply every discovered migration after `001` in that exact order. If `006`, `007`, or a later migration has been integrated before the release window, include it in the discovered list only after its reviewed contract, dependencies, and rollback boundary are available. Do not substitute a guessed owner or caps procedure.
+
+For a clean plain PostgreSQL target, the order is:
 
 ```text
 supabase/bootstrap/platform-roles.sql
 → supabase/migrations/001_orabella_schema.sql
-→ 002_portable_platform.sql
-→ 003_payment_method_arqueo.sql
-→ 004_inventory_literal_search.sql
-→ 005_cop_whole_peso.sql
+→ every discovered 002–latest migration in lexical order
 → supabase/bootstrap/app-role.sql
 → approved seed procedure
 ```
+
+Run `supabase/bootstrap/app-role.sql` only after all currently discovered target tables exist, then again after any later migration adds public tables.
 
 `002` replaces `current_sede_id()` without `auth.jwt()`. `003` adds payment-method arqueo guards and does not reconstruct pre-existing open shifts. `004` creates the service-role-only literal product-search RPC. `005` adds whole-peso write guards without rewriting historical cents and exposes `public.cop_legacy_cents_audit` to `service_role`.
 
@@ -66,15 +74,12 @@ These checks are safe and do not connect to a database:
 
 ```bash
 for file in \
-  supabase/migrations/002_portable_platform.sql \
-  supabase/migrations/003_payment_method_arqueo.sql \
-  supabase/migrations/004_inventory_literal_search.sql \
-  supabase/migrations/005_cop_whole_peso.sql \
   supabase/bootstrap/platform-roles.sql \
   supabase/bootstrap/app-role.sql \
   scripts/verify-backup-restore.ts; do
   test -f "$file" || { echo "missing: $file"; exit 1; }
 done
+find supabase/migrations -maxdepth 1 -type f -name '[0-9][0-9][0-9]_*.sql' -printf '%f\n' | sort
 npm run typecheck
 npm run test:db
 ```
@@ -145,12 +150,24 @@ SELECT
     WHERE n.nspname = 'public' AND t.tgname = 'trg_cop_whole_peso'
   ) AS migration_005_trigger;
 
-SELECT table_name, column_name, row_count
-FROM public.cop_legacy_cents_audit
-ORDER BY table_name, column_name;
+DO $$
+DECLARE audit_row record;
+BEGIN
+  IF to_regclass('public.cop_legacy_cents_audit') IS NULL THEN
+    RAISE NOTICE '005 is not present; cop_legacy_cents_audit is unavailable on this baseline. This is not a preflight failure.';
+    RETURN;
+  END IF;
+
+  FOR audit_row IN EXECUTE
+    'SELECT table_name, column_name, row_count FROM public.cop_legacy_cents_audit ORDER BY table_name, column_name'
+  LOOP
+    RAISE NOTICE '% | % | %', audit_row.table_name, audit_row.column_name, audit_row.row_count;
+  END LOOP;
+END;
+$$;
 ```
 
-The audit is a preserved-history report, not a cleanup task: `005` deliberately does not backfill or alter legacy cents. A non-zero result is evidence to retain and assess; do not rewrite it during this migration.
+A source baseline that lacks `005` does not fail this preflight; the audit is required only after `005` is applied on the destination. The audit is a preserved-history report, not a cleanup task: `005` deliberately does not backfill or alter legacy cents. A non-zero result is evidence to retain and assess; do not rewrite it during this migration.
 
 ## Phase 2 — staging migration and smoke
 
@@ -177,13 +194,20 @@ psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f supabase/bootstrap/app-role.sql
 
 ### 5. Apply staged migrations
 
-**WRITE: changes staging schema, triggers, functions, ACLs, and data backfills.** Do not wrap these files in an outer transaction: each migration manages its own transaction.
+**WRITE: changes staging schema, triggers, functions, ACLs, and data backfills.** Do not wrap these files in an outer transaction: each migration manages its own transaction. Review the discovered list first; apply only migrations after the already-applied baseline and never run a migration twice.
 
 ```bash
-psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/002_portable_platform.sql
-psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/003_payment_method_arqueo.sql
-psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/004_inventory_literal_search.sql
-psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/005_cop_whole_peso.sql
+find supabase/migrations -maxdepth 1 -type f -name '[0-9][0-9][0-9]_*.sql' -printf '%f\n' | sort
+
+# Set this only after comparing the discovered list with destination markers.
+# It is the ordered, reviewed 002–latest subset not already applied; 001 is never included.
+# Do not copy a static list: include an integrated 006/007 only when its contract is approved.
+export MIGRATIONS_TO_APPLY='<reviewed migration filenames, in lexical order>'
+
+for migration in $MIGRATIONS_TO_APPLY; do
+  test -f "supabase/migrations/$migration" || { echo "unknown migration: $migration"; exit 1; }
+  psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f "supabase/migrations/$migration"
+done
 psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f supabase/bootstrap/app-role.sql
 ```
 
@@ -246,12 +270,12 @@ Proceed only when a human release owner explicitly approves all of the following
 
 - [ ] A fresh backup was captured and `npm run verify:backup -- "$BACKUP_DIR"` succeeded.
 - [ ] The source-to-target transfer procedure, if needed, is separately approved and its target compatibility has been verified.
-- [ ] Staging applied `002` → `003` → `004` → `005` and the target role bootstrap completed.
+- [ ] Staging applied the reviewed `002`–latest discovered migration subset in order, and the target role bootstrap completed.
 - [ ] Staging SQL confirms migration markers, role attributes, ACLs, and `cop_legacy_cents_audit` results.
 - [ ] The staging build with `DB_ENGINE=postgres` passed the health smoke and listed tests.
 - [ ] The `003` open-shift boundary is understood and an operational plan exists to close/reopen affected shifts.
-- [ ] `006` owner provisioning is either approved through its database-specific integration procedure or explicitly deferred without blocking the planned scope.
-- [ ] Possible `007` caps remains unimplemented until its integration dependency supplies final details; it is not represented as an applied migration.
+- [ ] `006` owner is either included through its approved database-specific integration procedure or explicitly deferred for this deployment scope.
+- [ ] Possible `007` caps is either included only after its final integration contract is approved or explicitly deferred for this deployment scope.
 - [ ] The release owner has approved the production window and rollback authority.
 
 **Stop here without explicit human approval.**
@@ -264,19 +288,36 @@ Repeat the fresh backup procedure with `SOURCE_DB_URL` set to the production sou
 
 ### 8. Production migration and role bootstrap
 
-**IRREVERSIBLE WRITE BOUNDARY: changes production schema, triggers, functions, ACLs, and backfills.** After the human approval gate, run the same commands as staging with `PROD_DB_URL`:
+**IRREVERSIBLE WRITE BOUNDARY: changes production schema, triggers, functions, ACLs, and backfills.** After the human approval gate and documented review of the discovered migration list, run the same commands as staging with `PROD_DB_URL`:
 
 ```bash
-psql "$PROD_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/002_portable_platform.sql
-psql "$PROD_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/003_payment_method_arqueo.sql
-psql "$PROD_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/004_inventory_literal_search.sql
-psql "$PROD_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/005_cop_whole_peso.sql
+find supabase/migrations -maxdepth 1 -type f -name '[0-9][0-9][0-9]_*.sql' -printf '%f\n' | sort
+
+# Set this only after comparing the discovered list with destination markers.
+# It is the ordered, reviewed 002–latest subset not already applied; 001 is never included.
+# Do not copy a static list: include an integrated 006/007 only when its contract is approved.
+export MIGRATIONS_TO_APPLY='<reviewed migration filenames, in lexical order>'
+
+for migration in $MIGRATIONS_TO_APPLY; do
+  test -f "supabase/migrations/$migration" || { echo "unknown migration: $migration"; exit 1; }
+  psql "$PROD_DB_URL" -v ON_ERROR_STOP=1 -f "supabase/migrations/$migration"
+done
 psql "$PROD_DB_URL" -v ON_ERROR_STOP=1 -f supabase/bootstrap/app-role.sql
 ```
 
 Then run the staging verification SQL against production. Capture output, especially `cop_legacy_cents_audit` and role/ACL results.
 
-### 9. Switch the application engine
+### 9. Capture configuration and switch the application engine
+
+Before changing deployment configuration, capture a **redacted configuration manifest** from the approved deployment system. This is preparation: record variable names, whether each is set, the target environment, release identifier, and the configuration version; never record values.
+
+```text
+Required for Supabase mode: NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY
+Current engine selector: DB_ENGINE
+Direct PostgreSQL setting: DATABASE_URL
+```
+
+Store the manifest with the release evidence and confirm the three Supabase variables are recoverable before the cutover. This runbook does not prescribe a provider-specific export command.
 
 **IRREVERSIBLE WRITE BOUNDARY: changes production deployment configuration.** Set only server-side deployment secrets:
 
@@ -293,6 +334,30 @@ curl --fail --silent --show-error "$PROD_APP_URL/api/v1/health"
 
 Repeat the read-only verification SQL against `PROD_DB_URL` and record the evidence. Keep Supabase secrets only while the deployed application still requires them; this runbook does not authorize removing unrelated variables.
 
+### 10. Application-engine rollback to Supabase
+
+This rollback changes deployment configuration; it does **not** revert applied database migrations. Use it only with the release owner's approval and the pre-cutover configuration manifest.
+
+1. Restore the required Supabase environment variables from the approved secret store, without printing their values:
+
+   ```text
+   NEXT_PUBLIC_SUPABASE_URL=<restored value>
+   NEXT_PUBLIC_SUPABASE_ANON_KEY=<restored value>
+   SUPABASE_SERVICE_ROLE_KEY=<restored value>
+   DB_ENGINE=supabase
+   ```
+
+2. Remove `DATABASE_URL` from the deployment environment, or ensure the deployment system ignores it. In Supabase mode the application does not evaluate the direct PostgreSQL client or `DATABASE_URL`; removal avoids leaving an unused target credential active.
+3. Redeploy the last approved Supabase-mode build/configuration.
+4. Run the exact rollback smoke and validation before declaring rollback complete:
+
+   ```bash
+   curl --fail --silent --show-error "$PROD_APP_URL/api/v1/health"
+   ```
+
+   Then confirm in the approved deployment system that `DB_ENGINE=supabase`, the three named Supabase variables are set, and `DATABASE_URL` is removed or ignored. Run the normal approved application smoke suite for the restored release. The health endpoint alone does not prove database connectivity.
+5. Record the rollback release identifier, redacted configuration manifest, health response, validation outcome, and the fact that database migrations remain applied.
+
 ## Rollback and stop conditions
 
 - Migrations already applied are **not automatically reverted**. Do not rerun an older migration, edit an applied migration, or use ad-hoc `DROP` statements as a rollback.
@@ -306,8 +371,8 @@ Repeat the read-only verification SQL against `PROD_DB_URL` and record the evide
 
 | Dependency | Status | Required input | Action |
 | --- | --- | --- | --- |
-| `006` database owner | Pending | final database-specific ownership/authentication contract and owner | Run only the approved provisioning procedure; this runbook has no hardcoded identity. |
-| possible `007` caps | Pending | final integration contract | Add and review its migration only after its details are supplied; do not infer schema, checks, values, or rollback behavior. |
+| `006` database owner | Pending | final database-specific ownership/authentication contract and owner | Integrate and apply only when in deployment scope; otherwise record explicit deferment. This runbook has no hardcoded identity. |
+| possible `007` caps | Pending | final integration contract | Integrate and apply only when in deployment scope; otherwise record explicit deferment. Do not infer schema, checks, values, or rollback behavior. |
 
 ## Evidence to retain
 
