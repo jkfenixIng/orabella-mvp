@@ -1,4 +1,8 @@
-/** PostgreSQL money flows must retain their real admin/cash collaborators. */
+/**
+ * Payroll SERVICE on both engines with its real admin/cash/audit collaborators.
+ * With DB_ENGINE=postgres the Supabase client throws and must never be called;
+ * the default engine must keep working through Supabase (PostgREST double).
+ */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { DB_HOOK_TIMEOUT, closeDb, freshDb, warmTemplate, type Db } from "./harness";
 import { insertEmployee, insertPeriod, insertUser, openShift, registerId } from "./fixtures";
@@ -26,10 +30,12 @@ let user: string;
 let employee: string;
 let shift: string;
 
+const ORIGINAL_ENV = { DB_ENGINE: process.env.DB_ENGINE, DATABASE_URL: process.env.DATABASE_URL };
+
 beforeAll(warmTemplate, DB_HOOK_TIMEOUT);
 beforeEach(async () => {
-  vi.stubEnv("DB_ENGINE", "postgres");
-  vi.stubEnv("DATABASE_URL", "postgres://unused.invalid/db");
+  // Each engine's stubs must be gone before the next test starts.
+  expect({ DB_ENGINE: process.env.DB_ENGINE, DATABASE_URL: process.env.DATABASE_URL }).toEqual(ORIGINAL_ENV);
   engine.supabaseCalls = 0;
   engine.pg = await freshDb();
   user = await insertUser(engine.pg);
@@ -37,12 +43,19 @@ beforeEach(async () => {
   shift = await openShift(engine.pg, await registerId(engine.pg), user);
 }, DB_HOOK_TIMEOUT);
 afterEach(async () => {
-  expect(engine.supabaseCalls).toBe(0);
   vi.unstubAllEnvs();
   await closeDb(engine.pg);
 });
 
-describe("payroll service on postgres", () => {
+describe.each(["supabase", "postgres"] as const)("payroll service on %s", (name) => {
+  beforeEach(() => {
+    vi.stubEnv("DB_ENGINE", name === "postgres" ? "postgres" : "");
+    vi.stubEnv("DATABASE_URL", name === "postgres" ? "postgres://unused.invalid/db" : "");
+  });
+  afterEach(() => {
+    if (name === "postgres") expect(engine.supabaseCalls).toBe(0);
+    else expect(engine.supabaseCalls).toBeGreaterThan(0);
+  });
   it("calculates the active roster through the dual admin catalog", async () => {
     const period = await insertPeriod(engine.pg, { start: "2026-09-01", end: "2026-09-15" });
     const { calculatePayroll } = await import("@/src/features/payroll/service");
@@ -73,5 +86,10 @@ describe("payroll service on postgres", () => {
     );
     const approved = await approveVoucher(pending.rows[0].id, { observation: "Aprobado" }, { userId: user });
     expect(approved.status).toBe("aprobada");
+    const stored = await engine.pg.query<{ status: string; approved_by: string }>(
+      `SELECT status, approved_by FROM public.voucher_requests WHERE id = $1`,
+      [pending.rows[0].id],
+    );
+    expect(stored.rows[0]).toEqual({ status: "aprobada", approved_by: user });
   });
 });
