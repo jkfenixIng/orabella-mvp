@@ -17,7 +17,7 @@ import { getSessionUser } from "@/src/features/auth/service";
 import { requireSedeRole } from "@/src/shared/lib/sede";
 import { requireSession } from "@/src/features/admin/service";
 import { DbQueryError } from "@/src/shared/db/errors";
-import { COP_WHOLE_PESO_MESSAGE, isCopWholePesoError } from "@/src/shared/money/cop";
+import { COP_WHOLE_PESO_MESSAGE, copValidationError } from "@/src/shared/money/cop";
 import {
   inventoryRepo,
   type InventoryRepo,
@@ -93,6 +93,16 @@ export async function requireInventoryWriter(
 }
 
 // ------------------------------------------------------------------ productos ---
+/** Inventory's COP write boundary: the unambiguous 005 P0001 is validation. */
+function inventoryCopValidation(error: unknown): InventoryError | null {
+  return copValidationError(error, () => new InventoryError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400));
+}
+
+function throwInventoryCop(error: unknown): void {
+  const cop = inventoryCopValidation(error);
+  if (cop) throw cop;
+}
+
 /** Any database failure of this module is the same opaque INTERNAL error. */
 function internal(): InventoryError {
   return new InventoryError("INTERNAL", "Error interno.", 500);
@@ -103,7 +113,8 @@ async function read<T>(query: (db: InventoryRepo) => Promise<T>): Promise<T> {
   const db = await inventoryDb();
   try {
     return await query(db);
-  } catch {
+  } catch (error) {
+    throwInventoryCop(error);
     throw internal();
   }
 }
@@ -154,11 +165,11 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
       ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
     });
   } catch (error) {
+    throwInventoryCop(error);
     // Carrera perdida contra UNIQUE (sku): mismo error de negocio.
     if (error instanceof DbQueryError && error.error.code === "23505") {
       throw new InventoryError("SKU_TAKEN", "El SKU ya existe.", 409);
     }
-    if (isCopWholePesoError(error)) throw new InventoryError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
     throw internal();
   }
   if (!saved) throw internal();
@@ -352,6 +363,7 @@ export async function registerMovement(
       idempotency_key: input.idempotency_key ?? null,
     });
   } catch (error) {
+    throwInventoryCop(error);
     if (isInsufficientStock(error)) {
       throw new InventoryError(
         "INSUFFICIENT_STOCK",
@@ -515,6 +527,7 @@ export async function deductStock(
       planned.map((item) => ({ product_id: item.product_id, qty: item.qty })),
     );
   } catch (error) {
+    throwInventoryCop(error);
     throw toRpcDeductionError(error instanceof DbQueryError ? error.error : null);
   }
   // Segunda barrera en la frontera: la función ya revierte si escribió menos de

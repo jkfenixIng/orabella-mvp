@@ -41,7 +41,7 @@ import {
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
 import { requireSedeRole } from "@/src/shared/lib/sede";
-import { COP_WHOLE_PESO_MESSAGE, copExceeds, copSchema, isCopWholePesoError, positiveCopSchema } from "@/src/shared/money/cop";
+import { COP_WHOLE_PESO_MESSAGE, copExceeds, copSchema, copValidationError, positiveCopSchema } from "@/src/shared/money/cop";
 import {
   chunkIds,
   PagedReadError,
@@ -122,9 +122,21 @@ export async function requireCashWriter(
   return { userId: session.user.id, sedeId: session.user.sede_id, roles: session.roles };
 }
 
+/** Cash's COP write boundary: 005 is always a 400 before business P0001 rules. */
+function cashCopValidation(error: unknown): CashError | null {
+  return copValidationError(error, () => new CashError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400));
+}
+
+/** Throws the shared 005 validation result; non-COP errors keep their local mapping. */
+function throwCashCop(error: unknown): void {
+  const cop = cashCopValidation(error);
+  if (cop) throw cop;
+}
+
 function toCashError(error: unknown): CashError {
   if (error instanceof CashError) return error;
-  if (isCopWholePesoError(error)) return new CashError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+  const cop = cashCopValidation(error);
+  if (cop) return cop;
   // CL-21: una lectura exhaustiva que no se completó no puede degradar a
   // "Error interno". El código de la lectura (`READ_INCOMPLETE`) y la fila donde
   // se cortó son lo que hace accionable el fallo; perderlos sería justo lo
@@ -259,7 +271,7 @@ export async function upsertDenomination(raw: unknown, actor: CashActor): Promis
     ...(parsed.data.is_active !== undefined ? { is_active: parsed.data.is_active } : {}),
   };
   const { data, error } = await db.upsertDenomination<CashDenominationRow>(payload);
-  if (error && isCopWholePesoError(error)) throw new CashError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+  throwCashCop(error);
   if (error) throw new CashError("INTERNAL", "Error interno.", 500);
   return data as CashDenominationRow;
 }
@@ -574,7 +586,8 @@ const BALANCE_REQUIRED_MESSAGE =
  * business error. Returns null for any other error.
  */
 export function cashMethodRuleError(error: { message?: string | null } | null | undefined): CashError | null {
-  if (isCopWholePesoError(error)) return new CashError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+  const cop = cashCopValidation(error);
+  if (cop) return cop;
   const message = String(error?.message ?? "");
   if (message.includes(CASH_OUT_LIMIT_CODE)) {
     return new CashError(
@@ -1095,6 +1108,7 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
       counts: countLines(input.counts),
     });
     if (createError) {
+      throwCashCop(createError);
       // Carrera perdida contra uq_cash_shifts_open_per_register (23505, la
       // barrera final de la base) o contra el guardia de "un turno abierto por
       // caja" re-evaluado dentro de la transacción.
@@ -1561,6 +1575,7 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
         },
       });
       if (payError) {
+        throwCashCop(payError);
         const code = (payError as { code?: string } | null)?.code;
         const message = String((payError as { message?: unknown } | null)?.message ?? "");
         // Las precondiciones que la transacción revalida ADENTRO sobre las filas
@@ -1672,6 +1687,7 @@ export async function registerPayment(raw: unknown, actor: CashActor): Promise<P
         idempotency_key: mark,
       });
       if (paymentError || !payment) {
+      throwCashCop(paymentError);
         // CL-4: barrera FINAL de la carrera del pago SIN factura. El lookup de
         // arriba y este INSERT no son atómicos: si otro envío con la MISMA marca
         // en el MISMO turno confirmó en esa ventana, este INSERT choca con el
@@ -1923,6 +1939,7 @@ export async function closeShift(
       collectionCounts,
     });
     if (updateError || !updated) {
+      throwCashCop(updateError);
       // CHECK expected_cash >= 0 (006_cash.sql): el turno tiene más salidas
       // en efectivo (vales/comisiones) que efectivo cobrado. Es una regla de
       // negocio, no un fallo interno: se reporta con su código y ayuda. El CHECK
@@ -2018,7 +2035,7 @@ export async function updateRegisterBase(
   const register = await resolveRegister(db, registerId);
   const previous = Number(register.base_configurada);
   const { data: updated, error } = await db.updateRegisterBase<CashRegisterRow>(register.id, base);
-  if (error && isCopWholePesoError(error)) throw new CashError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+  throwCashCop(error);
   if (error || !updated) throw new CashError("INTERNAL", "Error interno.", 500);
   await writeAudit({
     user_id: actor.userId,
@@ -2132,6 +2149,7 @@ export async function recountClosedShift(
     counts: countLines(parsed.data.counts),
   });
   if (error || !inserted) {
+    throwCashCop(error);
     const errorCode = (error as { code?: string } | null)?.code;
     const errorMessage = String((error as { message?: string } | null)?.message ?? "");
     // Carrera perdida contra el índice único por turno (23505) o contra el

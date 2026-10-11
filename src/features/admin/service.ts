@@ -25,7 +25,7 @@ import { servicesRepo, type ServiceRow } from "./repos/services";
 import { catalogsRepo } from "./repos/catalogs";
 import { adminUsersRepo } from "./repos/users";
 import { DbQueryError } from "@/src/shared/db/errors";
-import { COP_WHOLE_PESO_MESSAGE, isCopWholePesoError } from "@/src/shared/money/cop";
+import { COP_WHOLE_PESO_MESSAGE, copValidationError } from "@/src/shared/money/cop";
 
 // Compatibilidad: la identidad de estos guardas vive en
 // `@/src/shared/lib/sede.ts` (import cruzado entre features resuelto).
@@ -143,11 +143,22 @@ async function fetchEmployees(limit?: number): Promise<EmployeeRow[]> {
   return internalOnFailure(() => repo.listEmployees(clampLimit(limit)));
 }
 
+/** Admin's COP write boundary: the unambiguous 005 P0001 is always validation. */
+function adminCopValidation(error: unknown): AdminError | null {
+  return copValidationError(error, () => new AdminError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400));
+}
+
+function throwAdminCop(error: unknown): void {
+  const cop = adminCopValidation(error);
+  if (cop) throw cop;
+}
+
 /** A repository failure keeps the historical answer of the catalog readers. */
 async function internalOnFailure<T>(call: () => Promise<T>): Promise<T> {
   try {
     return await call();
-  } catch {
+  } catch (error) {
+    throwAdminCop(error);
     throw new AdminError("INTERNAL", "Error interno.", 500);
   }
 }
@@ -332,9 +343,7 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
         full_name: input.full_name,
       }, DEFAULT_EMPLOYEE_ROLE);
     } catch (error) {
-      if (isCopWholePesoError(error)) {
-        throw new AdminError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
-      }
+      throwAdminCop(error);
       if (error instanceof DbQueryError && error.error.code === "23505") {
         throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
       }
@@ -348,9 +357,7 @@ export async function upsertEmployee(raw: unknown, sedeId: string): Promise<Empl
   try {
     data = await repo.upsertEmployee({ id: input.id, ...columnasDelLegajo, user_id: userId });
   } catch (error) {
-    if (isCopWholePesoError(error)) {
-      throw new AdminError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
-    }
+    throwAdminCop(error);
     if (error instanceof DbQueryError && error.error.code === "23505") {
       throw new AdminError("EMPLOYEE_CODE_TAKEN", "El código de empleado ya existe.", 409);
     }
@@ -394,7 +401,7 @@ export async function upsertService(raw: unknown): Promise<ServiceRow> {
   try {
     data = await repo.upsert(payload);
   } catch (error) {
-    if (isCopWholePesoError(error)) throw new AdminError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+    throwAdminCop(error);
     throw new AdminError("INTERNAL", "Error interno.", 500);
   }
   if (!data) throw new AdminError("INTERNAL", "Error interno.", 500);
@@ -524,7 +531,8 @@ async function currentRoleCodes(userId: string): Promise<RoleCode[]> {
  * traducen payroll, cash, billing, commissions y los topes 031/034.
  */
 function roleReplacementError(error: { code?: string; message?: string }): AdminError {
-  if (isCopWholePesoError(error)) return new AdminError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+  const cop = adminCopValidation(error);
+  if (cop) return cop;
   if (error.code === "P0001") {
     const message = error.message ?? "";
     if (message.includes("USER_NOT_FOUND")) {

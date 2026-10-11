@@ -75,6 +75,15 @@ export function isCopWholePesoError(error: unknown): boolean {
   return false;
 }
 
+/**
+ * Shared feature-boundary translation for the unambiguous 005 P0001. A feature
+ * supplies its domain error constructor; all non-COP errors deliberately stay
+ * untouched for the feature's existing business/error mapping.
+ */
+export function copValidationError<T>(error: unknown, create: () => T): T | null {
+  return isCopWholePesoError(error) ? create() : null;
+}
+
 interface CopMessages {
   /** Message for an invalid or negative input. */
   invalid: string;

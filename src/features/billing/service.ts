@@ -29,7 +29,7 @@ import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
 import { requireSedeRole } from "@/src/shared/lib/sede";
 import { dayBounds } from "@/src/shared/lib/dates";
-import { COP_WHOLE_PESO_MESSAGE, copExceeds, isCopWholePesoError } from "@/src/shared/money/cop";
+import { COP_WHOLE_PESO_MESSAGE, copExceeds, copValidationError } from "@/src/shared/money/cop";
 import { listPaymentMethods, listServices, listTaxes } from "@/src/features/admin/service";
 import {
   getProductsStock,
@@ -833,9 +833,20 @@ function insufficientStockError(error: unknown): BillingError {
   return toBillingError(error);
 }
 
+/** Billing's shared 005 boundary, ahead of all business P0001 mappings. */
+function billingCopValidation(error: unknown): BillingError | null {
+  return copValidationError(error, () => new BillingError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400));
+}
+
+function throwBillingCop(error: unknown): void {
+  const cop = billingCopValidation(error);
+  if (cop) throw cop;
+}
+
 function toBillingError(error: unknown): BillingError {
   if (error instanceof BillingError) return error;
-  if (isCopWholePesoError(error)) return new BillingError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+  const cop = billingCopValidation(error);
+  if (cop) return cop;
   if (error instanceof PagedReadError) {
     return new BillingError(
       error.code,
@@ -885,7 +896,8 @@ function toBillingError(error: unknown): BillingError {
  *     INTERNAL en vez de disfrazarse.
  */
 function toRpcAnnulError(error: { code?: unknown; message?: unknown } | null): BillingError {
-  if (isCopWholePesoError(error)) return new BillingError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+  const cop = billingCopValidation(error);
+  if (cop) return cop;
   const message = String(error?.message ?? "");
   if (message.includes("ANNUL_CONFLICT") || message.includes("INVOICE_NOT_FOUND")) {
     return new BillingError(
@@ -932,7 +944,8 @@ function toRpcAnnulError(error: { code?: unknown; message?: unknown } | null): B
  *     y se reporta como INTERNAL en vez de disfrazarse.
  */
 function toRpcEditError(error: { code?: unknown; message?: unknown } | null): BillingError {
-  if (isCopWholePesoError(error)) return new BillingError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+  const cop = billingCopValidation(error);
+  if (cop) return cop;
   const message = String(error?.message ?? "");
   if (message.includes("EDIT_CONFLICT") || message.includes("INVOICE_NOT_FOUND")) {
     return new BillingError(
@@ -1032,7 +1045,8 @@ async function findInvoiceByIdempotencyKey(
  *     INTERNAL en vez de disfrazarse.
  */
 function toRpcCreateError(error: { message?: unknown } | null): BillingError {
-  if (isCopWholePesoError(error)) return new BillingError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+  const cop = billingCopValidation(error);
+  if (cop) return cop;
   const message = String(error?.message ?? "");
   if (message.includes("INSUFFICIENT_STOCK")) {
     return new BillingError(
@@ -1308,6 +1322,7 @@ export async function createInvoice(raw: unknown, actor: BillingActor): Promise<
     outItems: stockPlan.map((item) => ({ product_id: item.product_id, qty: item.qty })),
   });
   if (createError || !written) {
+    throwBillingCop(createError);
     console.error("PG invoice_create_atomic:", JSON.stringify(createError));
     if ((createError as { code?: string } | null)?.code === "23505") {
       // Dos índices únicos pueden dar 23505 acá: el consecutivo
@@ -2427,6 +2442,7 @@ export async function splitPayment(
     })),
   });
   if (payError) {
+    throwBillingCop(payError);
     // CL-11: la transacción revalida adentro las precondiciones que el servicio
     // ya revisó (la factura no puede estar Anulada) y sus `RAISE EXCEPTION`
     // salen con el MISMO SQLSTATE que el tope de 031 (P0001), así que el MENSAJE

@@ -20,7 +20,7 @@ import {
   getOpenShift,
 } from "@/src/features/cash/service";
 import { listPaymentMethods } from "@/src/features/admin/service";
-import { COP_WHOLE_PESO_MESSAGE, copExceeds, isCopWholePesoError } from "@/src/shared/money/cop";
+import { COP_WHOLE_PESO_MESSAGE, copExceeds, copValidationError } from "@/src/shared/money/cop";
 
 export class CommissionError extends Error {
   readonly code: string;
@@ -34,12 +34,23 @@ export class CommissionError extends Error {
   }
 }
 
+/** Commissions' COP write boundary: the unambiguous 005 P0001 is validation. */
+function commissionCopValidation(error: unknown): CommissionError | null {
+  return copValidationError(error, () => new CommissionError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400));
+}
+
+function throwCommissionCop(error: unknown): void {
+  const cop = commissionCopValidation(error);
+  if (cop) throw cop;
+}
+
 /** Any database failure of a plain read/write is INTERNAL, as before the port. */
 async function internal<T>(work: () => Promise<T>): Promise<T> {
   try {
     return await work();
   } catch (error) {
     if (error instanceof CommissionError) throw error;
+    throwCommissionCop(error);
     throw new CommissionError("INTERNAL", "Error interno.", 500);
   }
 }
@@ -119,9 +130,7 @@ export async function upsertCommissionRule(raw: unknown): Promise<CommissionRule
       ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
     });
   } catch (error) {
-    if (isCopWholePesoError(error)) {
-      throw new CommissionError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
-    }
+    throwCommissionCop(error);
     if (dbCode(error) === "23505") {
       throw new CommissionError("RULE_CONFLICT", "Ya existe una regla para ese ítem y empleado.", 409);
     }
@@ -519,6 +528,7 @@ export async function payCommissionNow(
       idempotency_key: input.idempotency_key,
     });
   } catch (failure) {
+    throwCommissionCop(failure);
     if (!(failure instanceof DbQueryError)) throw new CommissionError("INTERNAL", "Error interno.", 500);
     const error = failure.error;
     // CL-5: carrera perdida contra el índice único parcial de la 044 (23505). El
@@ -545,7 +555,7 @@ export async function payCommissionNow(
     // acumulado de la base rechazó el pago (la suma del par ya estaba completa
     // cuando entró esta fila). Mismo código que traducen payroll, cash y
     // billing; la condición de negocio es la misma que valida el pendiente.
-    if (isCopWholePesoError(error)) throw new CommissionError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+    throwCommissionCop(error);
     const cashRule = cashMethodRuleError(error);
     if (cashRule) throw commissionFromCash(cashRule);
     if (error.code === "P0001") {

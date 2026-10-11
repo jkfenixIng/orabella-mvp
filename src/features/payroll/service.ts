@@ -76,7 +76,7 @@ import {
 } from "@/src/features/cash/service";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { DbQueryError } from "@/src/shared/db/errors";
-import { COP_WHOLE_PESO_MESSAGE, isCopWholePesoError } from "@/src/shared/money/cop";
+import { COP_WHOLE_PESO_MESSAGE, copValidationError } from "@/src/shared/money/cop";
 import type { PayrollRepo } from "./repos/payroll";
 import { planIncomingCarries, settlePayrollCarries, type CarryRow } from "./carries";
 import { bogotaDay, rangeBounds } from "@/src/shared/lib/dates";
@@ -337,9 +337,20 @@ function payrollFromCash(error: unknown): PayrollError {
   return toPayrollError(error);
 }
 
+/** Payroll's COP write boundary: 005 is always validation before business P0001 rules. */
+function payrollCopValidation(error: unknown): PayrollError | null {
+  return copValidationError(error, () => new PayrollError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400));
+}
+
+function throwPayrollCop(error: unknown): void {
+  const cop = payrollCopValidation(error);
+  if (cop) throw cop;
+}
+
 function toPayrollError(error: unknown): PayrollError {
   if (error instanceof PayrollError) return error;
-  if (isCopWholePesoError(error)) return new PayrollError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
+  const cop = payrollCopValidation(error);
+  if (cop) return cop;
   if (error instanceof PagedReadError) {
     return new PayrollError(
       error.code,
@@ -1652,6 +1663,7 @@ export async function calculatePayroll(
         carriesToApply,
       );
       if (applyError) {
+        throwPayrollCop(applyError);
         console.error(
           "[payroll] calculatePayroll: fallo al aplicar ítems y vales de la nómina:",
           JSON.stringify({
@@ -2368,6 +2380,7 @@ export async function payPayrollItem(
         })),
     );
     if (insertError) {
+      throwPayrollCop(insertError);
       // Dos barreras pueden rechazar este INSERT, y el código lo dice: el tope
       // de 007 (trigger BEFORE INSERT → P0001) y el índice único parcial de
       // identidad de la 042 (23505).
@@ -2399,7 +2412,6 @@ export async function payPayrollItem(
         // fallo real y se reporta como tal (no hay "ganadora" que devolver).
         throw new PayrollError("INTERNAL", "Error interno.", 500);
       }
-      if (isCopWholePesoError(insertError)) throw new PayrollError("VALIDATION", COP_WHOLE_PESO_MESSAGE, 400);
       // Carrera perdida contra trg_payroll_payments_cap.
       if ((insertError as { code?: string }).code === "P0001") {
         throw new PayrollError("OVERPAID", "Las porciones superan el neto del ítem.", 422);
@@ -2532,6 +2544,7 @@ export async function payPayrollExtra(raw: unknown, actor: PayrollActor): Promis
         idempotency_key: parsed.data.idempotency_key,
       });
     if (error || !data) {
+      throwPayrollCop(error);
       // CL-5: carrera perdida contra el índice único parcial de la 044 (23505).
       // El lookup de arriba y este INSERT no son atómicos: si otro envío con la
       // MISMA marca para el MISMO empleado se confirmó en esa ventana, la
@@ -3011,6 +3024,7 @@ export async function correctPayrollPeriod(
       correctionItemPayload,
     );
     if (error) {
+      throwPayrollCop(error);
       console.error(
         "[payroll] correctPayrollPeriod: fallo al escribir la corrección y sus filas:",
         JSON.stringify({
@@ -3280,7 +3294,10 @@ export async function setVoucherLimits(raw: unknown, actor: PayrollActor): Promi
     },
   ];
   const { data, error } = await db.upsertSettings(filas);
-  if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+  if (error) {
+    throwPayrollCop(error);
+    throw new PayrollError("INTERNAL", "Error interno.", 500);
+  }
   // Se devuelve lo que la base CONFIRMÓ, no lo que se pidió: es el mismo
   // criterio que el resto del módulo (una respuesta que no es la que la base
   // aplicó no se reporta como una configuración guardada).
@@ -3849,6 +3866,7 @@ export async function requestVoucher(raw: unknown, actor: PayrollActor): Promise
         idempotency_key: parsed.data.idempotency_key,
       });
     if (error || !data) {
+      throwPayrollCop(error);
       const cashRule = cashMethodRuleError(error as { message?: string } | null);
       if (cashRule) throw payrollFromCash(cashRule);
       // CL-5: carrera perdida contra el índice único parcial de la 044 (23505).
