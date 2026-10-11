@@ -152,6 +152,8 @@ async function scenarioCopWholePeso(o: Sql, a: Sql): Promise<string> {
 async function scenarioMoneyCapPolicy(o: Sql, a: Sql): Promise<string> {
   await begin(a);
   try {
+    const rounding = await a<{ negative_half: string; positive_half: string }[]>`SELECT round(-0.5::numeric)::text AS negative_half, round(10.5::numeric)::text AS positive_half`;
+    assert(rounding[0].negative_half === '-1' && rounding[0].positive_half === '11', `PostgreSQL numeric round got ${JSON.stringify(rounding[0])}`);
     const invoice = (await a<{ id: string }[]>`INSERT INTO public.invoices (consecutive_number, subtotal, discount, tax, surcharge, total, status) VALUES (900001, 1.01, 0, 0, 0, 1.01, 'Emitida') RETURNING id`)[0].id;
     await a`ALTER TABLE public.invoice_payments DISABLE TRIGGER trg_cop_whole_peso`;
     await a`INSERT INTO public.invoice_payments (invoice_id, method_code, amount, fee_amount) VALUES (${invoice}, 'efectivo', 0.01, 0)`;
@@ -159,7 +161,7 @@ async function scenarioMoneyCapPolicy(o: Sql, a: Sql): Promise<string> {
     const accepted = await a<{ amount: string }[]>`INSERT INTO public.invoice_payments (invoice_id, method_code, amount, fee_amount) VALUES (${invoice}, 'efectivo', 1, 0) RETURNING amount::text AS amount`;
     const rejected = await errorOf(a`INSERT INTO public.invoice_payments (invoice_id, method_code, amount, fee_amount) VALUES (${invoice}, 'efectivo', 1, 0)`);
     assert(accepted[0].amount === '1.00' && rejected.code === 'P0001', `007 invoice cap got ${accepted[0]?.amount}/${rejected.code}/${rejected.message}`);
-    return 'legacy=0.01 plus whole-peso=1 accepted-at-rounded-cap; next-peso=P0001';
+    return 'round(-0.5)=-1; round(10.5)=11; legacy=0.01 plus whole-peso=1 accepted-at-rounded-cap; next-peso=P0001';
   } finally { await rollback(a); }
 }
 async function recover({ observer, a, b, c, pids }: Sessions): Promise<void> { await observer`SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE pid = ANY(${pids}::int[]) AND state <> 'idle'`; await Promise.all([rollback(a), rollback(b), rollback(c)]); }

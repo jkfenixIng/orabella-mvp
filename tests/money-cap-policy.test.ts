@@ -3,6 +3,7 @@ import {
   commissionPayoutCapExceeded,
   invoicePaymentCapExceeded,
   payrollPaymentCapExceeded,
+  postgresNumericRound,
 } from "@/src/shared/money/caps";
 import { cashOutLimitViolation } from "@/src/features/cash/schemas";
 import { closeDb, freshDb, warmTemplate, type Db } from "./db/harness";
@@ -15,9 +16,23 @@ afterEach(async () => closeDb(db));
 
 describe("whole-peso cap policy", () => {
   it.each([
+    ["legacy -0.009 rounds to zero", -0.009, 0],
+    ["legacy -0.01 rounds to zero", -0.01, 0],
+    ["negative half rounds away from zero", -0.5, -1],
+    ["negative one-and-a-half rounds away from zero", -1.5, -2],
+    ["positive half stays upward", 0.5, 1],
+    ["positive ten-and-a-half stays upward", 10.5, 11],
+  ])("mirrors PostgreSQL numeric round for cap values: %s", async (_label, value, expected) => {
+    const sql = await db.query<{ rounded: number }>("SELECT round($1::numeric)::int AS rounded", [value]);
+    expect(postgresNumericRound(value)).toBe(expected);
+    expect(sql.rows[0]?.rounded).toBe(expected);
+  });
+
+  it.each([
     ["legacy 0.009 stays below a 0.01 cap", 0.009, 0, 0.01, false],
     ["legacy 0.01 equals a 0.01 cap", 0.01, 0, 0.01, false],
     ["a half peso rounds up before the cap", 0.5, 0, 0, true],
+    ["a negative half accumulated value cannot undercut the cap", -0.5, 0, 0, false],
   ])("keeps invoice, payroll and commission predicates equivalent to SQL: %s", async (_label, paid, incoming, cap, expected) => {
     const sql = await db.query<{ exceeded: boolean }>(
       "SELECT round(($1::numeric + $2::numeric)) > round($3::numeric) AS exceeded",

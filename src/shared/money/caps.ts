@@ -1,4 +1,8 @@
-import { roundCop } from "./cop";
+/** PostgreSQL numeric `round()` semantics: halves are away from zero. */
+export function postgresNumericRound(value: number): number {
+  const rounded = value < 0 ? -Math.round(-value) : Math.round(value);
+  return rounded === 0 ? 0 : rounded;
+}
 
 export interface MoneyCapInput {
   alreadyPaid: number;
@@ -12,7 +16,7 @@ export interface MoneyCapInput {
  * without mutation and projected into the terminal's whole-peso unit.
  */
 export function moneyCapExceeded({ alreadyPaid, incoming, cap }: MoneyCapInput): boolean {
-  return roundCop(alreadyPaid + incoming) > roundCop(cap);
+  return postgresNumericRound(alreadyPaid + incoming) > postgresNumericRound(cap);
 }
 
 export const invoicePaymentCapExceeded = moneyCapExceeded;
@@ -21,5 +25,8 @@ export const commissionPayoutCapExceeded = moneyCapExceeded;
 
 /** The cash minimum is also a whole-peso comparison, including its 50% floor. */
 export function cashMinimumBreached(openingBase: number, expectedBalance: number, outgoing: number): boolean {
-  return roundCop(expectedBalance) - roundCop(outgoing) < roundCop(roundCop(openingBase) * 0.5);
+  return (
+    postgresNumericRound(expectedBalance) - postgresNumericRound(outgoing) <
+    postgresNumericRound(postgresNumericRound(openingBase) * 0.5)
+  );
 }

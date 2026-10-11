@@ -6,7 +6,7 @@ Los topes de factura, nómina, comisión y mínimo de caja comparan **pesos ente
 
 ## Filas históricas
 
-No hay backfill ni cambio de tipo. Para una fila legacy con centavos, el predicado proyecta acumulado, entrada y tope con `round(...)`/`roundCop(...)` antes de comparar. Así `0.009`, `0.01` y `0.5` tienen una regla explícita y la misma semántica en TypeScript y PostgreSQL.
+No hay backfill ni cambio de tipo. Para una fila legacy con centavos, el predicado proyecta acumulado, entrada y tope con `round(...)`/`postgresNumericRound(...)` antes de comparar. Esta última replica `numeric round` de PostgreSQL: los medios se alejan de cero (`-0.5 → -1`, `0.5 → 1`). Así `-0.009`, `-0.01`, `-0.5`, `-1.5`, `0.009`, `0.01` y `0.5` tienen una regla explícita y la misma semántica en TypeScript y PostgreSQL.
 
 La política no modifica el estado de aprobación ya persistido. 005 mantiene las actualizaciones no monetarias sobre filas legacy: un trigger solo valida la columna monetaria si cambió.
 
