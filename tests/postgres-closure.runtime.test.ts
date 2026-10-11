@@ -16,14 +16,16 @@ const SUPABASE_ENV = [
   "NEXT_PUBLIC_SUPABASE_ANON_KEY",
   "SUPABASE_SERVICE_ROLE_KEY",
 ] as const;
-type SupabaseEnv = Record<(typeof SUPABASE_ENV)[number], { exists: boolean; value?: string }>;
+const DATABASE_ENV = ["DB_ENGINE", "DATABASE_URL"] as const;
+const CLOSURE_ENV = [...SUPABASE_ENV, ...DATABASE_ENV] as const;
+type ClosureEnv = Record<(typeof CLOSURE_ENV)[number], { exists: boolean; value?: string }>;
 
 let cluster: Cluster | undefined;
 let sql: Sql | undefined;
 let userId: string;
 let employeeId: string;
 let productId: string;
-let originalEnv: SupabaseEnv;
+let originalEnv: ClosureEnv;
 
 async function scalar<T>(query: Promise<readonly T[]>): Promise<T> {
   const [row] = await query;
@@ -31,21 +33,21 @@ async function scalar<T>(query: Promise<readonly T[]>): Promise<T> {
   return row;
 }
 
-function snapshotSupabaseEnv(): SupabaseEnv {
+function snapshotEnv(names: readonly string[] = CLOSURE_ENV): ClosureEnv {
   return Object.fromEntries(
-    SUPABASE_ENV.map((name) => [name, { exists: Object.hasOwn(process.env, name), value: process.env[name] }]),
-  ) as SupabaseEnv;
+    names.map((name) => [name, { exists: Object.hasOwn(process.env, name), value: process.env[name] }]),
+  ) as ClosureEnv;
+}
+
+function restoreEnv(snapshot: ClosureEnv): void {
+  for (const name of CLOSURE_ENV) {
+    if (snapshot[name].exists) process.env[name] = snapshot[name].value;
+    else delete process.env[name];
+  }
 }
 
 function poisonSupabaseEnv(): void {
   for (const name of SUPABASE_ENV) delete process.env[name];
-}
-
-function restoreSupabaseEnv(snapshot: SupabaseEnv): void {
-  for (const name of SUPABASE_ENV) {
-    if (snapshot[name].exists) process.env[name] = snapshot[name].value;
-    else delete process.env[name];
-  }
 }
 
 async function cleanup(label: string, work: () => Promise<void>, failures: Error[]): Promise<void> {
@@ -56,58 +58,81 @@ async function cleanup(label: string, work: () => Promise<void>, failures: Error
   }
 }
 
+async function releaseResources(): Promise<Error[]> {
+  const failures: Error[] = [];
+  const holder = globalThis as typeof globalThis & { __orabellaDb?: { sql: { end(options?: unknown): Promise<void> } } };
+  const holderSql = holder.__orabellaDb?.sql;
+  const suiteSql = sql;
+  const currentCluster = cluster;
+  if (holderSql) await cleanup("close shared PostgreSQL client", () => holderSql.end({ timeout: 5 }), failures);
+  delete holder.__orabellaDb;
+  if (suiteSql) await cleanup("close suite PostgreSQL client", () => suiteSql.end({ timeout: 5 }), failures);
+  if (currentCluster) await cleanup("stop ephemeral PostgreSQL cluster", () => stopCluster(currentCluster), failures);
+  return failures;
+}
+
 beforeAll(async () => {
-  originalEnv = snapshotSupabaseEnv();
+  originalEnv = snapshotEnv();
   poisonSupabaseEnv();
   supabase.attempts = 0;
   vi.resetModules();
-  cluster = await startCluster();
-  sql = postgres(cluster.url, { max: 1 });
-  process.env.DB_ENGINE = "postgres";
-  process.env.DATABASE_URL = cluster.url;
-  const { hashPassword } = await import("@/src/features/auth/service");
-  const user = await scalar(sql<{ id: string }[]>`
-    INSERT INTO public.users (sede_id, email, id_type, id_number, password_hash, full_name)
-    VALUES ((SELECT id FROM public.sedes LIMIT 1), 'closure@test.local', 'CC', 'closure-user', ${await hashPassword("Clave123")}, 'Closure User')
-    RETURNING id
-  `);
-  userId = user.id;
-  await sql`INSERT INTO public.user_roles (user_id, role_id) SELECT ${userId}::uuid, id FROM public.roles WHERE code = 'admin'`;
-  const employee = await scalar(sql<{ id: string }[]>`
-    INSERT INTO public.employees (document, full_name, pay_type, salary_fixed)
-    VALUES ('closure-employee', 'Closure Employee', 'fijo', 1000000)
-    RETURNING id
-  `);
-  employeeId = employee.id;
-  const product = await scalar(sql<{ id: string }[]>`
-    INSERT INTO public.products (sku, name, stock_qty, sale_price)
-    VALUES ('CLOSURE-1', 'Closure Product', 10, 10000)
-    RETURNING id
-  `);
-  productId = product.id;
+  try {
+    cluster = await startCluster();
+    sql = postgres(cluster.url, { max: 1 });
+    process.env.DB_ENGINE = "postgres";
+    process.env.DATABASE_URL = cluster.url;
+    const { hashPassword } = await import("@/src/features/auth/service");
+    const user = await scalar(sql<{ id: string }[]>`
+      INSERT INTO public.users (sede_id, email, id_type, id_number, password_hash, full_name)
+      VALUES ((SELECT id FROM public.sedes LIMIT 1), 'closure@test.local', 'CC', 'closure-user', ${await hashPassword("Clave123")}, 'Closure User')
+      RETURNING id
+    `);
+    userId = user.id;
+    await sql`INSERT INTO public.user_roles (user_id, role_id) SELECT ${userId}::uuid, id FROM public.roles WHERE code = 'admin'`;
+    const employee = await scalar(sql<{ id: string }[]>`
+      INSERT INTO public.employees (document, full_name, pay_type, salary_fixed)
+      VALUES ('closure-employee', 'Closure Employee', 'fijo', 1000000)
+      RETURNING id
+    `);
+    employeeId = employee.id;
+    const product = await scalar(sql<{ id: string }[]>`
+      INSERT INTO public.products (sku, name, stock_qty, sale_price)
+      VALUES ('CLOSURE-1', 'Closure Product', 10, 10000)
+      RETURNING id
+    `);
+    productId = product.id;
+  } catch (error) {
+    const failures = await releaseResources();
+    restoreEnv(originalEnv);
+    vi.resetModules();
+    if (failures.length > 0) throw new AggregateError([error, ...failures], "postgres closure bootstrap and cleanup failed");
+    throw error;
+  }
 }, 120_000);
 
 afterAll(async () => {
-  const failures: Error[] = [];
   try {
-    const holder = globalThis as typeof globalThis & { __orabellaDb?: { sql: { end(options?: unknown): Promise<void> } } };
-    const holderSql = holder.__orabellaDb?.sql;
-    const suiteSql = sql;
-    const currentCluster = cluster;
-    if (holderSql) await cleanup("close shared PostgreSQL client", () => holderSql.end({ timeout: 5 }), failures);
-    delete holder.__orabellaDb;
-    if (suiteSql) await cleanup("close suite PostgreSQL client", () => suiteSql.end({ timeout: 5 }), failures);
-    if (currentCluster) await cleanup("stop ephemeral PostgreSQL cluster", () => stopCluster(currentCluster), failures);
+    const failures = await releaseResources();
     if (failures.length > 0) throw new AggregateError(failures, "postgres closure cleanup failed");
   } finally {
-    delete process.env.DB_ENGINE;
-    delete process.env.DATABASE_URL;
-    restoreSupabaseEnv(originalEnv);
+    restoreEnv(originalEnv);
     vi.resetModules();
   }
 }, 120_000);
 
 describe("DB_ENGINE=postgres closure on an ephemeral PostgreSQL cluster", () => {
+  it("snapshots and restores pre-existing database environment values", () => {
+    const closure = snapshotEnv();
+    process.env.DB_ENGINE = "pre-existing-engine";
+    process.env.DATABASE_URL = "postgres://pre-existing.invalid/orabella";
+    const preExisting = snapshotEnv();
+    process.env.DB_ENGINE = "postgres";
+    process.env.DATABASE_URL = "postgres://temporary.invalid/closure";
+    restoreEnv(preExisting);
+    expect(snapshotEnv()).toEqual(preExisting);
+    restoreEnv(closure);
+  });
+
   it("runs with Supabase credentials unavailable and rejects privileged client construction", async () => {
     expect(Object.fromEntries(SUPABASE_ENV.map((name) => [name, process.env[name]]))).toEqual({
       NEXT_PUBLIC_SUPABASE_URL: undefined,
