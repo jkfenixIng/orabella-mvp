@@ -33,36 +33,45 @@ export BACKUP_DIR='<approved-backup-directory>'
 
 For a plain PostgreSQL target, use a migration connection with the database privileges needed by the migration files. `bootstrap/app-role.sql` additionally requires a superuser because it grants `BYPASSRLS` to `orabella_app`. Never run that bootstrap in Supabase: it aborts when Supabase platform roles are present.
 
-## Migration discovery and order
+## Deterministic migration plan
 
-Discover the actual repository migration set before each staging or production window. This is read-only and must be attached to the release evidence:
+`npm run plan:portable-migrations` is the only migration-selection mechanism in this runbook. It reads migration files with numeric prefixes `002` and later, validates their names, SHA-256 hashes, duplicate versions, and consecutive lexical order, then produces a plan from a destination applied-state manifest. It never connects to or writes a database.
+
+The destination applied-state manifest is an export of the durable `public.portable_migration_audit` ledger. The target owner applies `supabase/bootstrap/portable-migration-audit.sql` once before the first portable plan. That bootstrap creates only the ledger; it does not apply migrations. For a destination that predates this ledger, reconcile its already-applied state from approved explicit object markers before writing ledger rows; never infer a migration from a filename or claim a production state in this runbook. Export the ledger without values other than filenames and hashes:
 
 ```bash
-find supabase/migrations -maxdepth 1 -type f -name '[0-9][0-9][0-9]_*.sql' -printf '%f\n' | sort
+psql "$STAGING_DB_URL" -X -v ON_ERROR_STOP=1 -A -t -c "
+  SELECT coalesce(jsonb_build_object(
+    'applied', coalesce(jsonb_agg(jsonb_build_object('filename', filename, 'sha256', sha256) ORDER BY filename), '[]'::jsonb),
+    'deferred', '[]'::jsonb
+  )::text, '{\"applied\":[],\"deferred\":[]}')
+  FROM public.portable_migration_audit;" > "$BACKUP_DIR/staging-scope-manifest.json"
 ```
 
-The files sort lexically by their zero-padded numeric prefix. At this revision the discovered incremental order after `001` is:
+For a governed deferment, the exported state becomes the approved **scope manifest**: change only its `deferred` array, name the approved scope in release evidence, and keep the ledger-derived `applied` array unchanged. Deferred filenames must be a contiguous latest suffix. The planner rejects a deferred `006` if a later `007` is still in scope, so a later migration cannot bypass a deferred dependency. The scope manifest is an evidence artifact, not a database command.
 
-```text
-002_portable_platform.sql
-003_payment_method_arqueo.sql
-004_inventory_literal_search.sql
-005_cop_whole_peso.sql
+Create the plan and checksum manifest:
+
+```bash
+npm run plan:portable-migrations -- \
+  --state "$BACKUP_DIR/staging-scope-manifest.json" \
+  --output "$BACKUP_DIR/staging-portable-migration-plan.json"
 ```
 
-For an existing database based on `001`, apply every discovered migration after `001` in that exact order. If `006`, `007`, or a later migration has been integrated before the release window, include it in the discovered list only after its reviewed contract, dependencies, and rollback boundary are available. Do not substitute a guessed owner or caps procedure.
+At this revision a target with no portable migrations recorded receives `002` through `005`. If `006`, `007`, or later migrations are integrated before the release window, the planner discovers them dynamically. It will fail until their filename/order, scope, and destination state are valid; it does not invent an owner or caps procedure.
 
 For a clean plain PostgreSQL target, the order is:
 
 ```text
 supabase/bootstrap/platform-roles.sql
 → supabase/migrations/001_orabella_schema.sql
-→ every discovered 002–latest migration in lexical order
+→ supabase/bootstrap/portable-migration-audit.sql
+→ generated portable migration plan (002–latest)
 → supabase/bootstrap/app-role.sql
 → approved seed procedure
 ```
 
-Run `supabase/bootstrap/app-role.sql` only after all currently discovered target tables exist, then again after any later migration adds public tables.
+Run `supabase/bootstrap/app-role.sql` only after all migrations in the generated plan exist, then again after any later migration adds public tables.
 
 `002` replaces `current_sede_id()` without `auth.jwt()`. `003` adds payment-method arqueo guards and does not reconstruct pre-existing open shifts. `004` creates the service-role-only literal product-search RPC. `005` adds whole-peso write guards without rewriting historical cents and exposes `public.cop_legacy_cents_audit` to `service_role`.
 
@@ -75,11 +84,14 @@ These checks are safe and do not connect to a database:
 ```bash
 for file in \
   supabase/bootstrap/platform-roles.sql \
+  supabase/bootstrap/portable-migration-audit.sql \
   supabase/bootstrap/app-role.sql \
+  scripts/plan-portable-migrations.ts \
+  scripts/verify-portable-migration-plan.ts \
   scripts/verify-backup-restore.ts; do
   test -f "$file" || { echo "missing: $file"; exit 1; }
 done
-find supabase/migrations -maxdepth 1 -type f -name '[0-9][0-9][0-9]_*.sql' -printf '%f\n' | sort
+npm run plan:portable-migrations -- --help
 npm run typecheck
 npm run test:db
 ```
@@ -173,7 +185,7 @@ A source baseline that lacks `005` does not fail this preflight; the audit is re
 
 ### 4. Provision the target database and application role
 
-**WRITE: creates roles and schema objects on staging.** For a clean target, use the full order above. For a target populated through the separately approved transfer procedure, do not apply a migration twice: verify its object markers and apply only the missing incremental migrations in the verified order.
+**WRITE: creates roles and schema objects on staging.** For a clean target, use the full order above. For a target populated through the separately approved transfer procedure, do not apply a migration twice: export `portable_migration_audit`, generate the plan, and execute only its contiguous `apply` list.
 
 Before provisioning the database owner, stop at this integration dependency:
 
@@ -188,28 +200,46 @@ Do not substitute an email address, UUID, or role name from this runbook.
 The existing application-role bootstrap remains separate from that pending owner work:
 
 ```bash
-# Plain PostgreSQL only; run as a superuser after 002–005.
+# Plain PostgreSQL only; run as a superuser after the generated migration plan.
 psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f supabase/bootstrap/app-role.sql
 ```
 
 ### 5. Apply staged migrations
 
-**WRITE: changes staging schema, triggers, functions, ACLs, and data backfills.** Do not wrap these files in an outer transaction: each migration manages its own transaction. Review the discovered list first; apply only migrations after the already-applied baseline and never run a migration twice.
+**WRITE: changes staging schema, triggers, functions, ACLs, and data backfills.** Do not wrap migration files in an outer transaction: each migration manages its own transaction. The operator must execute the generated plan in order; no command in this repository applies migrations automatically.
 
 ```bash
-find supabase/migrations -maxdepth 1 -type f -name '[0-9][0-9][0-9]_*.sql' -printf '%f\n' | sort
+# One-time, plain PostgreSQL target only: create the durable ledger.
+psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f supabase/bootstrap/portable-migration-audit.sql
 
-# Set this only after comparing the discovered list with destination markers.
-# It is the ordered, reviewed 002–latest subset not already applied; 001 is never included.
-# Do not copy a static list: include an integrated 006/007 only when its contract is approved.
-export MIGRATIONS_TO_APPLY='<reviewed migration filenames, in lexical order>'
+# Export the current ledger, then generate the only allowed application plan.
+psql "$STAGING_DB_URL" -X -v ON_ERROR_STOP=1 -A -t -c "
+  SELECT coalesce(jsonb_build_object(
+    'applied', coalesce(jsonb_agg(jsonb_build_object('filename', filename, 'sha256', sha256) ORDER BY filename), '[]'::jsonb),
+    'deferred', '[]'::jsonb
+  )::text, '{\"applied\":[],\"deferred\":[]}')
+  FROM public.portable_migration_audit;" > "$BACKUP_DIR/staging-scope-manifest.json"
+npm run plan:portable-migrations -- \
+  --state "$BACKUP_DIR/staging-scope-manifest.json" \
+  --output "$BACKUP_DIR/staging-portable-migration-plan.json"
+```
 
-for migration in $MIGRATIONS_TO_APPLY; do
-  test -f "supabase/migrations/$migration" || { echo "unknown migration: $migration"; exit 1; }
-  psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f "supabase/migrations/$migration"
-done
+Review the generated `apply` array and execute every listed entry in order. After each successful `psql -f` execution, the operator records that exact filename and SHA-256 in `public.portable_migration_audit`; do not record a failed or skipped migration. Re-export the ledger after the final entry and verify it against the unchanged plan:
+
+```bash
+psql "$STAGING_DB_URL" -X -v ON_ERROR_STOP=1 -A -t -c "
+  SELECT coalesce(jsonb_build_object(
+    'applied', coalesce(jsonb_agg(jsonb_build_object('filename', filename, 'sha256', sha256) ORDER BY filename), '[]'::jsonb),
+    'deferred', '[]'::jsonb
+  )::text, '{\"applied\":[],\"deferred\":[]}')
+  FROM public.portable_migration_audit;" > "$BACKUP_DIR/staging-applied-state-after.json"
+npm run verify:portable-migrations -- \
+  --state "$BACKUP_DIR/staging-applied-state-after.json" \
+  --plan "$BACKUP_DIR/staging-portable-migration-plan.json"
 psql "$STAGING_DB_URL" -v ON_ERROR_STOP=1 -f supabase/bootstrap/app-role.sql
 ```
+
+A plan that lists an `apply` item is incomplete until the ledger export contains that item with the planned SHA-256. A plan with an empty `apply` array has no schema migration to execute.
 
 `003` makes outflows through arqueable methods fail on shifts opened before it until the shift is closed and reopened; it does not reconstruct opening balances. Plan that operational boundary before staging and production.
 
@@ -270,7 +300,7 @@ Proceed only when a human release owner explicitly approves all of the following
 
 - [ ] A fresh backup was captured and `npm run verify:backup -- "$BACKUP_DIR"` succeeded.
 - [ ] The source-to-target transfer procedure, if needed, is separately approved and its target compatibility has been verified.
-- [ ] Staging applied the reviewed `002`–latest discovered migration subset in order, and the target role bootstrap completed.
+- [ ] Staging generated a valid portable migration plan, executed its complete `apply` array in order, and verified the resulting durable ledger before the target role bootstrap.
 - [ ] Staging SQL confirms migration markers, role attributes, ACLs, and `cop_legacy_cents_audit` results.
 - [ ] The staging build with `DB_ENGINE=postgres` passed the health smoke and listed tests.
 - [ ] The `003` open-shift boundary is understood and an operational plan exists to close/reopen affected shifts.
@@ -288,20 +318,30 @@ Repeat the fresh backup procedure with `SOURCE_DB_URL` set to the production sou
 
 ### 8. Production migration and role bootstrap
 
-**IRREVERSIBLE WRITE BOUNDARY: changes production schema, triggers, functions, ACLs, and backfills.** After the human approval gate and documented review of the discovered migration list, run the same commands as staging with `PROD_DB_URL`:
+**IRREVERSIBLE WRITE BOUNDARY: changes production schema, triggers, functions, ACLs, and backfills.** After the human approval gate, use the same deterministic plan process as staging with `PROD_DB_URL`; do not construct or edit a filename list.
 
 ```bash
-find supabase/migrations -maxdepth 1 -type f -name '[0-9][0-9][0-9]_*.sql' -printf '%f\n' | sort
+# One-time, plain PostgreSQL target only: create the durable ledger.
+psql "$PROD_DB_URL" -v ON_ERROR_STOP=1 -f supabase/bootstrap/portable-migration-audit.sql
 
-# Set this only after comparing the discovered list with destination markers.
-# It is the ordered, reviewed 002–latest subset not already applied; 001 is never included.
-# Do not copy a static list: include an integrated 006/007 only when its contract is approved.
-export MIGRATIONS_TO_APPLY='<reviewed migration filenames, in lexical order>'
+psql "$PROD_DB_URL" -X -v ON_ERROR_STOP=1 -A -t -c "
+  SELECT coalesce(jsonb_build_object(
+    'applied', coalesce(jsonb_agg(jsonb_build_object('filename', filename, 'sha256', sha256) ORDER BY filename), '[]'::jsonb),
+    'deferred', '[]'::jsonb
+  )::text, '{\"applied\":[],\"deferred\":[]}')
+  FROM public.portable_migration_audit;" > "$BACKUP_DIR/prod-scope-manifest.json"
+# If scope defers a future migration, edit only the deferred array in this evidence artifact.
+npm run plan:portable-migrations -- \
+  --state "$BACKUP_DIR/prod-scope-manifest.json" \
+  --output "$BACKUP_DIR/prod-portable-migration-plan.json"
+```
 
-for migration in $MIGRATIONS_TO_APPLY; do
-  test -f "supabase/migrations/$migration" || { echo "unknown migration: $migration"; exit 1; }
-  psql "$PROD_DB_URL" -v ON_ERROR_STOP=1 -f "supabase/migrations/$migration"
-done
+Execute the generated production `apply` array in order, record each successful entry in the ledger, then export `prod-applied-state-after.json` with the same query and run:
+
+```bash
+npm run verify:portable-migrations -- \
+  --state "$BACKUP_DIR/prod-applied-state-after.json" \
+  --plan "$BACKUP_DIR/prod-portable-migration-plan.json"
 psql "$PROD_DB_URL" -v ON_ERROR_STOP=1 -f supabase/bootstrap/app-role.sql
 ```
 
@@ -377,6 +417,7 @@ This rollback changes deployment configuration; it does **not** revert applied d
 ## Evidence to retain
 
 - backup directory and checksum verification output;
+- signed/approved scope manifest, generated SHA-256 plan, and final ledger-verification output;
 - migration command output in verified order;
 - staging and production marker, ACL, and `cop_legacy_cents_audit` SQL output;
 - test and health-smoke output;

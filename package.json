@@ -17,6 +17,8 @@
     "test:concurrency": "node tests/concurrency/preflight.mjs && node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON tests/concurrency/run.ts",
     "test:postgres-closure": "vitest run --config vitest.postgres-closure.config.ts",
     "verify:backup": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/verify-backup-restore.ts",
+    "plan:portable-migrations": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/plan-portable-migrations.ts",
+    "verify:portable-migrations": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/verify-portable-migration-plan.ts",
     "test:e2e": "playwright test",
     "test:e2e:changed": "playwright test --grep @changed",
     "test:e2e:full": "playwright test --grep @full"
