@@ -17,13 +17,13 @@ describe("portable migration marker contracts", () => {
     }
   });
 
-  it("distinguish 006-008 from a 001-005 baseline", async () => {
+  it("distinguish 006-009 from a 001-005 baseline", async () => {
     const through005 = MIGRATION_PATHS.filter((path) => /[\\/]00[1-5]_[^\\/]+\.sql$/.test(path));
     expect(through005).toHaveLength(5);
     const db = await buildSchemaDb({ catalog: false, migrations: through005 });
     try {
       for (const filename of Object.keys(MIGRATION_MARKERS)) {
-        expect(await marker(db, filename)).toBe(!/^00[678]_/.test(filename));
+        expect(await marker(db, filename)).toBe(!/^00[6789]_/.test(filename));
       }
     } finally {
       await db.close();
@@ -46,6 +46,22 @@ describe("portable migration marker contracts", () => {
       await db.exec("CREATE ROLE orabella_app");
       await db.exec("GRANT SELECT ON TABLE public.installation_owner TO orabella_app");
       expect(await marker(db, "006_installation_owner.sql")).toBe(false);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it.each([
+    "GRANT EXECUTE ON FUNCTION public.cash_open_shift_atomic(uuid, uuid, numeric, jsonb) TO anon",
+    "GRANT EXECUTE ON FUNCTION public.cash_open_shift_atomic(uuid, uuid, numeric, jsonb) TO authenticated",
+    "GRANT EXECUTE ON FUNCTION public.cash_open_shift_atomic_legacy(uuid, uuid, numeric, jsonb) TO authenticated",
+    "GRANT EXECUTE ON FUNCTION public.cash_open_shift_atomic(uuid, uuid, numeric, jsonb) TO PUBLIC",
+    "REVOKE EXECUTE ON FUNCTION public.cash_open_shift_atomic_legacy(uuid, uuid, numeric, jsonb) FROM service_role",
+  ])("rejects 009 after: %s", async (statement) => {
+    const db = await buildSchemaDb({ catalog: false });
+    try {
+      await db.exec(statement);
+      expect(await marker(db, "009_cash_opening_bounds.sql")).toBe(false);
     } finally {
       await db.close();
     }

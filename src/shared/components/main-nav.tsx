@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useState, useEffect } from "react";
-import { Bell, Calculator, House, Package, Receipt, Settings, Sparkles, Ticket, Wallet, type LucideIcon } from "lucide-react";
+import { Bell, Calculator, House, LogOut, Package, Receipt, Settings, Sparkles, Ticket, Wallet, type LucideIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -453,7 +453,21 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
         ) : (
           accordion()
         )}
-        {!sidebarCollapsed && footer}
+        {sidebarCollapsed ? (
+          <button
+            type="button"
+            onClick={handleLogout}
+            disabled={loggingOut}
+            aria-busy={loggingOut}
+            aria-label={loggingOut ? "Cerrando sesión…" : "Cerrar sesión"}
+            title={userName ? `Cerrar sesión de ${userName}` : "Cerrar sesión"}
+            className="mt-auto flex min-h-11 items-center justify-center rounded-md border border-border-color text-text-primary hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <LogOut className="h-5 w-5" aria-hidden="true" />
+          </button>
+        ) : (
+          footer
+        )}
       </aside>
     </>
   );

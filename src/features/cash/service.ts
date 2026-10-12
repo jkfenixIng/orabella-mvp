@@ -62,6 +62,7 @@ import {
   type InvoicePaymentRow,
 } from "@/src/features/billing/service";
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
+import { formatMoney } from "@/src/shared/lib/money";
 import { getShiftReviews } from "@/src/features/alerts/service";
 import { assembleShiftRevision, type ShiftRevision } from "@/src/features/alerts/schemas";
 import { unstable_cache } from "next/cache";
@@ -132,6 +133,21 @@ function cashCopValidation(error: unknown): CashError | null {
 function throwCashCop(error: unknown): void {
   const cop = cashCopValidation(error);
   if (cop) throw cop;
+}
+
+/** Server-side log of an infrastructure failure: SQLSTATE and message only, never the payload. */
+function logCashFailure(operation: string, error: unknown): void {
+  const { code, message } = (error ?? {}) as { code?: unknown; message?: unknown };
+  console.error(`[cash] ${operation} failed`, {
+    code: typeof code === "string" ? code : null,
+    message: typeof message === "string" ? message : error instanceof Error ? error.message : null,
+  });
+}
+
+/** A failed repository read: logged, then the generic error (details stay server-side). */
+function cashReadFailure(operation: string, error: unknown): CashError {
+  logCashFailure(operation, error);
+  return new CashError("INTERNAL", "Error interno.", 500);
 }
 
 function toCashError(error: unknown): CashError {
@@ -930,7 +946,7 @@ async function previousCloseTotals(
   registerId: string,
 ): Promise<{ baseLeft: number | null; byMethod: Map<string, number>; hasCounts: boolean } | null> {
   const { data: last, error: lastError } = await db.lastClosedShiftForRegister(registerId);
-  if (lastError) throw new CashError("INTERNAL", "Error interno.", 500);
+  if (lastError) throw cashReadFailure("lastClosedShiftForRegister", lastError);
   if (!last) return null;
   // U3: si el último cierre fue recontado, la base que hereda el próximo turno
   // y los totales digitales contra los que se compara la apertura son los
@@ -939,7 +955,7 @@ async function previousCloseTotals(
   const recountMap = await fetchRecounts(db, [last.id]);
   const recountRow = recountMap.get(last.id) ?? null;
   const { data: counts, error: countsError } = await db.listShiftCounts(last.id, recountRow ? "reconteo" : "cierre");
-  if (countsError) throw new CashError("INTERNAL", "Error interno.", 500);
+  if (countsError) throw cashReadFailure("listShiftCounts", countsError);
   const byMethod = new Map<string, number>();
   for (const row of counts ?? []) {
     byMethod.set(row.method_code, roundMoney((byMethod.get(row.method_code) ?? 0) + Number(row.amount)));
@@ -978,18 +994,19 @@ async function resolveRegister(
 ): Promise<CashRegisterRow> {
   if (registerId) {
     const { data, error } = await db.getRegister<CashRegisterRow>(registerId);
-    if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+    if (error) throw cashReadFailure("getRegister", error);
     if (!data) throw new CashError("NOT_FOUND", "Caja no encontrada.", 404);
     return data;
   }
   const { data, error } = await db.firstActiveRegister<CashRegisterRow>();
-  if (error) throw new CashError("INTERNAL", "Error interno.", 500);
+  if (error) throw cashReadFailure("firstActiveRegister", error);
   if (data) return data;
   const { data: created, error: createError } = await db.ensureDefaultRegister<CashRegisterRow>({
     name: "Caja única",
     base_configurada: 200000,
   });
-  if (createError || !created) throw new CashError("INTERNAL", "Error interno.", 500);
+  if (createError) throw cashReadFailure("ensureDefaultRegister", createError);
+  if (!created) throw new CashError("INTERNAL", "Error interno.", 500);
   return created;
 }
 
@@ -1054,41 +1071,98 @@ const OPEN_SHIFT_SQL_ERRORS: ReadonlyArray<readonly [string, string, number]> = 
   ["SHIFT_WRITE_MISMATCH", "No se pudo registrar la apertura del turno. Intente nuevamente.", 500],
   ["SHIFT_COUNT_MISMATCH", "No se pudo registrar el conteo de apertura. Intente nuevamente.", 500],
   ["SHIFT_INVALID", "El conteo de apertura no es válido. Revise los valores e intente nuevamente.", 400],
+  // 009: drawer-cash bounds re-checked under the register lock. The service
+  // raises the same codes first with the amounts in the message.
+  ["OPENING_ABOVE_BASE", "El efectivo de apertura supera la base configurada de la caja. Retire el excedente para abrir.", 422],
+  ["OPENING_BELOW_PREVIOUS_CLOSE", "El efectivo de apertura es menor que la base que dejó el cierre anterior.", 422],
+  ["OPENING_BASE_CONFLICT", "La base que dejó el último cierre supera la base configurada. Un administrador debe ajustar la base de la caja.", 409],
 ];
 
-/** Maps the stable errors of `cash_open_shift_atomic` (001 + 003) to business errors. */
+/** Infrastructure SQLSTATEs with an actionable, non-sensitive message. */
+const OPEN_SHIFT_PG_CODES: Readonly<Record<string, readonly [string, string, number]>> = {
+  "42883": ["SCHEMA_OUTDATED", "La base de datos no tiene la última versión de caja. Aplique las migraciones pendientes.", 503],
+  "42P01": ["SCHEMA_OUTDATED", "La base de datos no tiene la última versión de caja. Aplique las migraciones pendientes.", 503],
+  "23503": ["OPENING_USER_INVALID", "El usuario que abre caja no existe en la base de datos. Cierre sesión e ingrese de nuevo.", 409],
+  "23502": ["OPENING_DATA_INVALID", "Faltan datos obligatorios para abrir el turno. Revise la configuración de la caja.", 400],
+  "23514": ["OPENING_DATA_INVALID", "Los datos de apertura no cumplen una regla de la base de datos. Revise los valores.", 400],
+};
+
+/** Maps the stable errors of `cash_open_shift_atomic` (001 + 003 + 009) to business errors. */
 export function openShiftAtomicError(error: unknown): CashError {
   const { code, message, details } = (error ?? {}) as { code?: unknown; message?: unknown; details?: unknown };
   // Lost race against uq_cash_shifts_open_per_register: same business error.
   if (code === "23505") return new CashError(...OPEN_SHIFT_SQL_ERRORS[0]);
   const text = `${typeof message === "string" ? message : ""} ${typeof details === "string" ? details : ""}`;
   const known = OPEN_SHIFT_SQL_ERRORS.find(([sqlCode]) => text.includes(sqlCode));
-  return known ? new CashError(...known) : new CashError("INTERNAL", "Error interno.", 500);
+  if (known) return new CashError(...known);
+  const mapped = typeof code === "string" ? OPEN_SHIFT_PG_CODES[code] : undefined;
+  // Anything else is infrastructure: log SQLSTATE + message (no payload) so
+  // the operator can see the real cause instead of a silent INTERNAL.
+  logCashFailure("cash_open_shift_atomic", error);
+  return mapped ? new CashError(...mapped) : new CashError("INTERNAL", "Error interno.", 500);
 }
 
-export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShiftResult> {
-  // The RPC needs one count line per active arqueable method: without any such
-  // method the client sends no lines and no count can be valid, so fail with
-  // the fix before validating the payload or calling the RPC.
-  const methods = await listPaymentMethods();
-  if (!methods.some((method) => method.is_active && method.arqueo_mode !== "none")) {
+/**
+ * Drawer-cash bounds at opening (C = declared drawer cash, B = configured
+ * base, M = base_left of the last close, recount wins; first opening M = 0):
+ * M <= C <= B. A previous close above B cannot be satisfied by any count.
+ */
+export function assertOpeningCashBounds(args: {
+  cash: number;
+  previousBaseLeft: number | null;
+  baseConfigurada: number;
+}): void {
+  const cash = roundMoney(args.cash);
+  const base = roundMoney(args.baseConfigurada);
+  const minimum = roundMoney(args.previousBaseLeft ?? 0);
+  if (minimum > base) {
     throw new CashError(
-      "NO_ARQUEABLE_METHODS",
-      "No hay métodos de pago activos con arqueo. Configure al menos uno en Administración antes de abrir caja.",
+      "OPENING_BASE_CONFLICT",
+      `La base que dejó el último cierre (${formatMoney(minimum)}) supera la base configurada (${formatMoney(base)}). Un administrador debe ajustar la base de la caja.`,
       409,
     );
   }
-  const parsed = openShiftSchema.safeParse(raw);
-  if (!parsed.success) {
-    throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
+  if (cash > base) {
+    throw new CashError(
+      "OPENING_ABOVE_BASE",
+      `El efectivo de apertura (${formatMoney(cash)}) supera la base configurada de la caja (${formatMoney(base)}). Retire el excedente para abrir.`,
+      422,
+    );
   }
-  const input: OpenShiftInput = parsed.data;
-  const db = await cashDb();
+  if (cash < minimum) {
+    throw new CashError(
+      "OPENING_BELOW_PREVIOUS_CLOSE",
+      `El efectivo de apertura (${formatMoney(cash)}) es menor que la base que dejó el cierre anterior (${formatMoney(minimum)}).`,
+      422,
+    );
+  }
+}
+
+export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShiftResult> {
+  // Every read (catalogs included) runs inside the try: an AdminError or a
+  // repository failure surfaces as its own CashError, never a bare INTERNAL.
   try {
+    // The RPC needs one count line per active arqueable method: without any
+    // such method the client sends no lines and no count can be valid, so fail
+    // with the fix before validating the payload or calling the RPC.
+    const methods = await listPaymentMethods();
+    if (!methods.some((method) => method.is_active && method.arqueo_mode !== "none")) {
+      throw new CashError(
+        "NO_ARQUEABLE_METHODS",
+        "No hay métodos de pago activos con arqueo. Configure al menos uno en Administración antes de abrir caja.",
+        409,
+      );
+    }
+    const parsed = openShiftSchema.safeParse(raw);
+    if (!parsed.success) {
+      throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
+    }
+    const input: OpenShiftInput = parsed.data;
+    const db = await cashDb();
     const register = await resolveRegister(db, input.cash_register_id);
 
     const { data: open, error: openError } = await db.openShiftIdsForRegister(register.id);
-    if (openError) throw new CashError("INTERNAL", "Error interno.", 500);
+    if (openError) throw cashReadFailure("openShiftIdsForRegister", openError);
     assertNoOpenShift((open ?? []).length > 0);
 
     // U3: la base que hereda el turno sale de `previousCloseTotals`, que ya
@@ -1109,6 +1183,14 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     const isFirstOpen = prev === null;
     const mismatches: Array<{ method_code: string; expected: number; declared: number }> = [];
     const cashDeclared = drawer ? (declared.get(drawer) ?? 0) : 0;
+    // Physical drawer only; digital methods keep the mismatch-only behaviour.
+    if (drawer) {
+      assertOpeningCashBounds({
+        cash: cashDeclared,
+        previousBaseLeft: prev?.baseLeft ?? null,
+        baseConfigurada: Number(register.base_configurada),
+      });
+    }
     if (drawer && !moneyEquals(cashDeclared, openingBase)) {
       mismatches.push({ method_code: drawer, expected: openingBase, declared: cashDeclared });
     }
@@ -1163,7 +1245,9 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     }
     return { shift, mismatches, firstOpen: isFirstOpen };
   } catch (error) {
-    throw toCashError(error);
+    const mapped = toCashError(error);
+    if (mapped.code === "INTERNAL" && !(error instanceof CashError)) logCashFailure("openShift", error);
+    throw mapped;
   }
 }
 

@@ -2,13 +2,13 @@
 
 ## Scope and safety boundary
 
-This runbook moves the application's database target from Supabase to a plain PostgreSQL instance. It applies the discovered incremental migrations after the already-applied `001` baseline, validates staging first, and changes the deployment to `DB_ENGINE=postgres` only after production approval. At this revision, the discovered set is `002` through `008`.
+This runbook moves the application's database target from Supabase to a plain PostgreSQL instance. It applies the discovered incremental migrations after the already-applied `001` baseline, validates staging first, and changes the deployment to `DB_ENGINE=postgres` only after production approval. At this revision, the discovered set is `002` through `009`.
 
 - **Read-only / preparation** sections do not change a database or deployment.
 - **Write** sections run migrations, provisioning, restore, or deployment changes. Treat every such command as irreversible unless this runbook explicitly says otherwise.
 - Run commands from the repository root. Do not put connection strings, passwords, emails, or user UUIDs in the repository or shell history.
 - `001_orabella_schema.sql` is an already-applied baseline; do **not** edit or reapply it to an existing environment.
-- `006_installation_owner.sql` (singleton installation owner), `007_money_cap_policy.sql` (whole-peso caps), and `008_inactive_payment_method_arqueo.sql` (inactive methods force `arqueo_mode = none`) are integrated; their marker contracts are in `scripts/portable-migration-markers.mjs`. Owner provisioning is a separate, DB-operator-only step (section 4).
+- `006_installation_owner.sql` (singleton installation owner), `007_money_cap_policy.sql` (whole-peso caps), `008_inactive_payment_method_arqueo.sql` (inactive methods force `arqueo_mode = none`) and `009_cash_opening_bounds.sql` (drawer cash stays between effective previous base and configured base) are integrated; their marker contracts are in `scripts/portable-migration-markers.mjs`. Owner provisioning is a separate, DB-operator-only step (section 4).
 - This repository does not define a source-to-target data-copy contract. The fresh backup is mandatory recovery evidence, but importing it into a new target must use a separately approved, compatibility-checked transfer procedure; do not treat the backup-verifier input as a production restore command.
 
 ## Interfaces and access
@@ -67,7 +67,7 @@ npm run plan:portable-migrations -- \
   --output "$BACKUP_DIR/staging-portable-migration-plan.json"
 ```
 
-At this revision the repository contains `002` through `008`, each with a reviewed marker contract. The `006` marker requires `installation_owner`, both owner triggers and the `provision_installation_owner(uuid)` / `break_glass_transfer_installation_owner(uuid,text)` functions as `SECURITY DEFINER` with `search_path=pg_catalog, public`, and reads the ACL: `PUBLIC` and any existing `anon`, `authenticated`, `service_role` or `orabella_app` role (a missing role counts as no privilege) must hold no `SELECT/INSERT/UPDATE/DELETE` on the table and no `EXECUTE` on either function; the `007` marker requires the five replaced cap/minimum functions and the `round(` projection in the invoice cap and cash minimum; the `008` marker requires the inactive-method coherence constraint and trigger branch. A governed deferment of `006` must also defer `007` and `008` (contiguous suffix); `007` must also defer `008`. Any later migration fails closed until its marker contract is reviewed. The planner never provisions an owner.
+At this revision the repository contains `002` through `009`, each with a reviewed marker contract. The `006` marker requires `installation_owner`, both owner triggers and the `provision_installation_owner(uuid)` / `break_glass_transfer_installation_owner(uuid,text)` functions as `SECURITY DEFINER` with `search_path=pg_catalog, public`, and reads the ACL: `PUBLIC` and any existing `anon`, `authenticated`, `service_role` or `orabella_app` role (a missing role counts as no privilege) must hold no `SELECT/INSERT/UPDATE/DELETE` on the table and no `EXECUTE` on either function; the `007` marker requires the five replaced cap/minimum functions and the `round(` projection in the invoice cap and cash minimum; the `008` marker requires the inactive-method coherence constraint and trigger branch. A governed deferment of `006` must also defer `007` and `008` (contiguous suffix); `007` must also defer `008`. Any later migration fails closed until its marker contract is reviewed. The planner never provisions an owner.
 
 For a clean plain PostgreSQL target, the order is:
 
@@ -82,7 +82,7 @@ supabase/bootstrap/platform-roles.sql
 
 Run `supabase/bootstrap/app-role.sql` only after all migrations in the generated plan exist, then again after any later migration adds public tables.
 
-`002` replaces `current_sede_id()` without `auth.jwt()`. `003` adds payment-method arqueo guards and does not reconstruct pre-existing open shifts. `004` creates the service-role-only literal product-search RPC. `005` adds whole-peso write guards without rewriting historical cents and exposes `public.cop_legacy_cents_audit` to `service_role`. `006` creates the empty singleton `public.installation_owner`, makes `superadmin` assignable only to that owner, and revokes table/function access from `PUBLIC`, `anon`, `authenticated` and `service_role`; it never infers an owner. `007` replaces the cap and cash-minimum trigger functions so caps compare `round()`ed whole pesos; it rewrites no data.
+`002` replaces `current_sede_id()` without `auth.jwt()`. `003` adds payment-method arqueo guards and does not reconstruct pre-existing open shifts. `004` creates the service-role-only literal product-search RPC. `005` adds whole-peso write guards without rewriting historical cents and exposes `public.cop_legacy_cents_audit` to `service_role`. `006` creates the empty singleton `public.installation_owner`, makes `superadmin` assignable only to that owner, and revokes table/function access from `PUBLIC`, `anon`, `authenticated` and `service_role`; it never infers an owner. `007` replaces the cap and cash-minimum trigger functions so caps compare `round()`ed whole pesos; it rewrites no data. `009` replaces the `cash_open_shift_atomic` wrapper (same signature), revokes it and `cash_open_shift_atomic_legacy` from `PUBLIC`, `anon` and `authenticated`, grants both only to `service_role` (the invoker wrapper calls the legacy function), so the drawer count must be between the last effective `base_left` and `base_configurada`; it rewrites no data and depends on `003`.
 
 ## Phase 1 — preparation and backup (read-only except backup artifact creation)
 
@@ -261,7 +261,7 @@ MIGRATION_DATABASE_URL='<MIGRATION_LOGIN connection url>' \
 
 #### Crash recovery (`reconcile`)
 
-Migration files `002`–`008` own their `BEGIN`/`COMMIT` and are not modified, so the ledger `INSERT` cannot share their transaction. A failed migration never reaches the `INSERT` (`ON_ERROR_STOP`). The only gap is a crash or lost connection **after** the file's `COMMIT` and **before** the `INSERT`: the ledger then lags the schema, `apply` refuses to rerun that migration because its marker is true, and `verify` blocks cutover.
+Migration files `002`–`009` own their `BEGIN`/`COMMIT` and are not modified, so the ledger `INSERT` cannot share their transaction. A failed migration never reaches the `INSERT` (`ON_ERROR_STOP`). The only gap is a crash or lost connection **after** the file's `COMMIT` and **before** the `INSERT`: the ledger then lags the schema, `apply` refuses to rerun that migration because its marker is true, and `verify` blocks cutover.
 
 Recovery is automated and narrow — **never insert a ledger row manually**:
 

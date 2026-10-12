@@ -29,8 +29,9 @@ import { Toaster as Sonner, type ToasterProps } from 'sonner'
       principal viven en el centro/abajo, así que abajo a la derecha tapaba lo
       que el usuario acaba de mirar. Arriba a la derecha queda al lado de la
       campana de alertas del shell, que es donde ya está mirando.
-   4. `closeButton`: el defecto que esta primitiva viene a arreglar es el
-      mensaje que no se va nunca. El toast se va solo y además se puede cerrar.
+   4. Persistencia: los toasts esperan el cierre explícito para que la persona
+      pueda leerlos; el botón de cierre es visible, táctil y está etiquetado.
+      `visibleToasts={5}` conserva espacio para los avisos nuevos.
 
    `richColors` SÍ está activo (WU-D): en sonner 2.x las variables por tipo
    (`--success-bg`, `--error-bg`, …) solo aplican bajo `[data-rich-colors='true']`,
@@ -51,7 +52,15 @@ const Toaster = ({ ...props }: ToasterProps) => {
     <Sonner
       theme={theme as ToasterProps['theme']}
       position="top-right"
+      duration={Infinity}
       closeButton
+      visibleToasts={5}
+      toastOptions={{
+        closeButtonAriaLabel: "Cerrar notificación",
+        classNames: {
+          closeButton: "min-h-11 min-w-11 !border-current focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-600 sm:min-h-6 sm:min-w-6",
+        },
+      }}
       richColors
       className="toaster group"
       icons={{

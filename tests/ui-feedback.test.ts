@@ -407,6 +407,17 @@ describe("toast: dependencia y montaje único", () => {
       expect(SONNER_TSX, `icons.${type}`).toMatch(new RegExp(`\\b${type}:\\s*<`));
     }
   });
+
+  it("los toasts persisten, se pueden cerrar y no ocultan los nuevos", () => {
+    const source = SONNER_TSX.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+    const openTag = source.slice(source.indexOf("<Sonner"), source.indexOf("{...props}"));
+
+    expect(openTag, "duración persistente").toMatch(/\bduration=\{Infinity\}/);
+    expect(openTag, "botón de cierre").toMatch(/\bcloseButton\b/);
+    expect(openTag, "etiqueta accesible en español").toMatch(/closeButtonAriaLabel:\s*["']Cerrar notificación["']/);
+    expect(openTag, "máximo de toasts visibles").toMatch(/visibleToasts=\{5\}/);
+    expect(openTag, "cierre táctil visible").toMatch(/classNames:\s*\{\s*closeButton:\s*"[^"]*\bmin-h-11\b[^"]*\bmin-w-11\b/);
+  });
 });
 
 /* --------------------------------------------------------------------------
