@@ -81,7 +81,10 @@ export function ServicesClient(props: ServicesClientProps) {
   const hasLoadedRef = useRef(false);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => setAppliedQuery(query), SEARCH_DEBOUNCE_MS);
+    const timer = window.setTimeout(() => {
+      setPage(0);
+      setAppliedQuery(query);
+    }, SEARCH_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
   }, [query]);
 
