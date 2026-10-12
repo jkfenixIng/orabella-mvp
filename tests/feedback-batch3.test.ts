@@ -230,7 +230,9 @@ describe("inventario: lo persistente va por Alert (estado)", () => {
     // cambiara una variante), el conteo lo delata.
     expect(alertOpenerCount(CLIENT_CODE)).toBe(4);
     expect([...CLIENT_CODE.matchAll(/<Alert\b/g)]).toHaveLength(4);
-    expect([...CLIENT_CODE.matchAll(/variant="destructive"/g)]).toHaveLength(4);
+    expect([...CLIENT_CODE.matchAll(/<Alert\s+variant="destructive"/g)]).toHaveLength(4);
+    // The fifth destructive variant is the "Sin existencias" Badge, not a message.
+    expect([...CLIENT_CODE.matchAll(/<Badge\s+variant="destructive"/g)]).toHaveLength(1);
     // Ni un `warning` ni un `info` ni un `success` de `Alert` por acá: no hay
     // precondiciones pendientes en este módulo que merezcan la variante de
     // aviso (el único `warning` del archivo es el `Badge` de "Bajo mínimo",

@@ -5,7 +5,7 @@
  * the request the service sends to PostgREST and how it maps every outcome.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { AdminError, listServices, upsertService } from "@/src/features/admin/service";
+import { AdminError, listServices, listServicesPage, upsertService } from "@/src/features/admin/service";
 
 const SERVICE_ID = "8b0f5e2a-1c3d-4e5f-8a7b-9c0d1e2f3a4b";
 const SERVICE_SELECT = "id, name, description, price, duracion_min, duracion_max, is_active";
@@ -13,7 +13,7 @@ const SERVICE_SELECT = "id, name, description, price, duracion_min, duracion_max
 /** Minimal PostgREST double: records the call chain and returns a canned answer. */
 const postgrest = vi.hoisted(() => ({
   calls: [] as Array<{ table: string; chain: Array<[string, unknown[]]> }>,
-  response: { data: null as unknown, error: null as unknown },
+  response: { data: null, error: null } as { data: unknown; error: unknown; count?: number | null },
 }));
 
 function createStubClient() {
@@ -22,7 +22,7 @@ function createStubClient() {
       const call = { table, chain: [] as Array<[string, unknown[]]> };
       postgrest.calls.push(call);
       const query: Record<string, unknown> = {};
-      for (const method of ["select", "order", "limit", "upsert"]) {
+      for (const method of ["select", "order", "limit", "upsert", "or", "eq", "range"]) {
         query[method] = (...args: unknown[]) => {
           call.chain.push([method, args]);
           return query;
@@ -74,7 +74,48 @@ async function rejection(promise: Promise<unknown>): Promise<AdminError> {
 
 beforeEach(() => {
   postgrest.calls = [];
-  postgrest.response = { data: null, error: null };
+  postgrest.response = { data: null, error: null, count: null };
+});
+
+describe("listServicesPage (supabase-js)", () => {
+  it("searches name and description literally, filters status and returns an exact total", async () => {
+    postgrest.response = { data: [ROW], error: null, count: 41 };
+    const page = await listServicesPage({ query: " 50%_(x), ", active: false, limit: 20, offset: 20 });
+    expect(page).toEqual({ rows: [ROW], total: 41 });
+    const pattern = String.raw`"%50\\%\\_(x),%"`;
+    expect(postgrest.calls[0]).toEqual({
+      table: "services",
+      chain: [
+        ["select", [SERVICE_SELECT, { count: "exact" }]],
+        ["or", [`name.ilike.${pattern},description.ilike.${pattern}`]],
+        ["eq", ["is_active", false]],
+        ["order", ["name"]],
+        ["order", ["id"]],
+        ["range", [20, 39]],
+      ],
+    });
+  });
+
+  it("omits search and status filters when absent", async () => {
+    postgrest.response = { data: [], error: null, count: 0 };
+    expect(await listServicesPage({})).toEqual({ rows: [], total: 0 });
+    expect(postgrest.calls[0].chain.map(([method]) => method)).toEqual(["select", "order", "order", "range"]);
+  });
+
+  it.each([{ limit: 21 }, { offset: -1 }, { query: "x".repeat(121) }])(
+    "rejects invalid page input %j before querying",
+    async (input) => {
+      const error = await rejection(listServicesPage(input));
+      expect([error.code, error.status]).toEqual(["VALIDATION", 400]);
+      expect(postgrest.calls).toEqual([]);
+    },
+  );
+
+  it("maps a page read error to INTERNAL 500", async () => {
+    postgrest.response = { data: null, error: { code: "42501", message: "denied" }, count: null };
+    const error = await rejection(listServicesPage({}));
+    expect([error.code, error.status]).toEqual(["INTERNAL", 500]);
+  });
 });
 
 describe("listServices (supabase-js)", () => {

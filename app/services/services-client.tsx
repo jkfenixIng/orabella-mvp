@@ -1,15 +1,17 @@
 "use client";
 
-import { useState, useTransition, type FormEvent } from "react";
+import { useEffect, useRef, useState, useTransition, type FormEvent } from "react";
 import { toast } from "sonner";
-import { upsertServiceAction } from "@/src/features/admin/actions";
-import type { ServiceRow } from "@/src/features/admin/service";
+import { listServicesPageAction, upsertServiceAction } from "@/src/features/admin/actions";
+import type { ServicePage, ServiceRow } from "@/src/features/admin/service";
 import { Alert } from "@/src/components/ui/lib/alert";
 import { Button } from "@/src/components/ui/lib/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/src/components/ui/lib/card";
 import { Checkbox } from "@/src/components/ui/lib/checkbox";
 import { Input } from "@/src/components/ui/lib/input";
 import { Label } from "@/src/components/ui/lib/label";
+import { Badge } from "@/src/components/ui/lib/badge";
+import { ListPager, ListToolbar } from "@/src/components/ui/lib/list-toolbar";
 import {
   Dialog,
   DialogContent,
@@ -36,8 +38,22 @@ function emptyForm() {
   };
 }
 
+const PAGE_SIZE = 20;
+const SEARCH_DEBOUNCE_MS = 300;
+type StatusFilter = "all" | "active" | "inactive";
+const STATUS_OPTIONS = [
+  { value: "all", label: "Todos" },
+  { value: "active", label: "Activos" },
+  { value: "inactive", label: "Inactivos" },
+];
+
+function activeFilter(status: StatusFilter): boolean | undefined {
+  if (status === "all") return undefined;
+  return status === "active";
+}
+
 interface ServicesClientProps {
-  initialServices: ServiceRow[];
+  initialPage: ServicePage;
   canWrite: boolean;
 }
 
@@ -47,13 +63,67 @@ interface ServicesClientProps {
  * stock ni movimientos, solo el CRUD de servicios.
  */
 export function ServicesClient(props: ServicesClientProps) {
-  const [rows, setRows] = useState<ServiceRow[]>(props.initialServices);
+  const [rows, setRows] = useState<ServiceRow[]>(props.initialPage.rows);
+  const [total, setTotal] = useState(props.initialPage.total);
+  const [query, setQuery] = useState("");
+  const [appliedQuery, setAppliedQuery] = useState("");
+  const [status, setStatus] = useState<StatusFilter>("all");
+  const [page, setPage] = useState(0);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [listError, setListError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
   const [form, setForm] = useState(emptyForm());
   const [editingId, setEditingId] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [isPending, startRefresh] = useTransition();
+  const hasLoadedRef = useRef(false);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setAppliedQuery(query), SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [query]);
+
+  useEffect(() => {
+    if (!hasLoadedRef.current) {
+      hasLoadedRef.current = true;
+      return;
+    }
+    let current = true;
+    setLoading(true);
+    setListError(null);
+    listServicesPageAction({
+      query: appliedQuery,
+      active: activeFilter(status),
+      limit: PAGE_SIZE,
+      offset: page * PAGE_SIZE,
+    }).then((result) => {
+      if (!current) return;
+      setLoading(false);
+      if (!result.success) {
+        setListError(result.message);
+        return;
+      }
+      setRows(result.data.rows);
+      setTotal(result.data.total);
+    });
+    return () => { current = false; };
+  }, [appliedQuery, status, page, reloadKey]);
+
+  const hasFilters = appliedQuery.trim() !== "" || status !== "all";
+
+  function applyFilters() {
+    setPage(0);
+    setAppliedQuery(query);
+  }
+
+  function clearFilters() {
+    setQuery("");
+    setAppliedQuery("");
+    setStatus("all");
+    setPage(0);
+  }
 
   function openCreate() {
     setEditingId(null);
@@ -94,13 +164,7 @@ export function ServicesClient(props: ServicesClientProps) {
       setError(`[${result.code}] ${result.message}`);
       return;
     }
-    setRows((current) => {
-      const exists = current.some((row) => row.id === result.data.id);
-      const next = exists
-        ? current.map((row) => (row.id === result.data.id ? result.data : row))
-        : [...current, result.data];
-      return [...next].sort((a, b) => a.name.localeCompare(b.name));
-    });
+    setReloadKey((key) => key + 1);
     // Éxito = EVENTO: acaba de pasar y no tiene que quedarse en pantalla
     // compitiendo con lo que sí importa. Antes era un <p role="status"> que
     // persistía hasta la siguiente acción. El texto es el mismo.
@@ -129,8 +193,27 @@ export function ServicesClient(props: ServicesClientProps) {
           </div>
         </CardHeader>
         <CardContent>
-          {rows.length === 0 ? (
-            <p className="text-sm text-text-tertiary">Aún no hay servicios en esta sede.</p>
+          <ListToolbar
+            searchId="service-search"
+            searchLabel="Buscar"
+            searchValue={query}
+            searchPlaceholder="Nombre o descripción"
+            onSearchChange={setQuery}
+            statusLabel="Estado"
+            statusValue={status}
+            statusOptions={STATUS_OPTIONS}
+            onStatusChange={(value) => { setStatus(value as StatusFilter); setPage(0); }}
+            onFilter={applyFilters}
+            onClear={clearFilters}
+          />
+          {listError ? <Alert variant="destructive" className="mt-4">{listError}</Alert> : null}
+          {loading ? <p className="mt-4 text-sm text-text-secondary">Cargando servicios…</p> : null}
+          {rows.length === 0 && !loading ? (
+            hasFilters ? (
+              <p className="mt-4 text-sm text-text-tertiary">Sin servicios para estos filtros.</p>
+            ) : (
+              <p className="text-sm text-text-tertiary">Aún no hay servicios en esta sede.</p>
+            )
           ) : (
             // R19 + R4 + R38: la fila del catálogo, no una tabla con carril. Antes
             // era `<div className="overflow-x-auto">` + `<table className={cn("w-full
@@ -205,7 +288,9 @@ export function ServicesClient(props: ServicesClientProps) {
                       </span>
                       <span className="whitespace-nowrap text-sm text-text-primary sm:col-start-4 sm:row-start-1">
                         <span className="font-sans font-medium text-text-secondary sm:hidden">Estado: </span>
-                        {row.is_active ? "Activo" : "Inactivo"}
+                        <Badge variant={row.is_active ? "success" : "destructive"} size="sm">
+                          {row.is_active ? "Activo" : "Inactivo"}
+                        </Badge>
                       </span>
                     </span>
                     <span className="flex items-center gap-2 sm:contents">
@@ -237,6 +322,11 @@ export function ServicesClient(props: ServicesClientProps) {
               </ul>
             </div>
           )}
+          {total > 0 ? (
+            <div className="mt-4">
+              <ListPager page={page} pageSize={PAGE_SIZE} total={total} onPageChange={setPage} />
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -256,7 +346,7 @@ export function ServicesClient(props: ServicesClientProps) {
             <DialogHeader>
               <DialogTitle>{editingId ? "Editar servicio" : "Nuevo servicio"}</DialogTitle>
               <DialogDescription>
-                Precio y duración estimada; el servicio se ofrece al facturar.
+                Precio y duración estimada.
               </DialogDescription>
             </DialogHeader>
             <form onSubmit={handleSubmit} className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">

@@ -199,6 +199,14 @@ export const serviceSchema = z
   });
 export type ServiceInput = z.infer<typeof serviceSchema>;
 
+export const servicePageSchema = z.object({
+  query: z.string().trim().max(120, "Búsqueda muy larga.").default(""),
+  active: z.boolean().optional(),
+  limit: z.coerce.number().int().min(1).max(20).default(20),
+  offset: z.coerce.number().int().min(0).default(0),
+});
+export type ServicePageInput = z.infer<typeof servicePageSchema>;
+
 /** ADM-06: impuesto configurable de la instalación (inician inactivos en 0). */
 export const taxConfigSchema = z.object({
   id: uuidSchema.optional(),

@@ -14,6 +14,7 @@ import type {
   ProductRow,
 } from "@/src/features/inventory/service";
 import { proposeSku } from "@/src/features/inventory/schemas";
+import { matchesStockFilter, stockBadge, type StockFilter } from "@/src/features/inventory/schemas";
 import { Alert } from "@/src/components/ui/lib/alert";
 import { Badge } from "@/src/components/ui/lib/badge";
 import { Button } from "@/src/components/ui/lib/button";
@@ -28,6 +29,7 @@ import {
 } from "@/src/components/ui/lib/dialog";
 import { Input } from "@/src/components/ui/lib/input";
 import { Label } from "@/src/components/ui/lib/label";
+import { ListPager, ListToolbar } from "@/src/components/ui/lib/list-toolbar";
 import {
   Select,
   SelectContent,
@@ -43,7 +45,6 @@ import { formatBogotaFullDateTime, toNumber } from "@/src/shared/lib/format";
 import {
   inputClass,
   labelClass,
-  mutedTextClass,
   sectionClass,
 } from "@/src/shared/lib/ui-styles";
 
@@ -145,15 +146,14 @@ function useShellHeaderOffset(barra: RefObject<HTMLDivElement | null>): void {
 
 interface InventoryClientProps {
   initialProducts: ProductRow[];
-  initialAlertIds: string[];
   canWrite: boolean;
   canAdmin: boolean;
 }
 
 export function InventoryClient(props: InventoryClientProps) {
   const [products, setProducts] = useState(props.initialProducts);
-  const [alertIds, setAlertIds] = useState<Set<string>>(new Set(props.initialAlertIds));
   const [query, setQuery] = useState("");
+  const [stockFilter, setStockFilter] = useState<StockFilter>("all");
   const [page, setPage] = useState(0);
   const PAGE_SIZE = 15;
   const [error, setError] = useState<string | null>(null);
@@ -193,12 +193,11 @@ export function InventoryClient(props: InventoryClientProps) {
 
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    if (needle === "") return products;
-    return products.filter(
-      (row) =>
-        row.name.toLowerCase().includes(needle) || row.sku.toLowerCase().includes(needle),
-    );
-  }, [products, query]);
+    return products.filter((row) => {
+      const matchesQuery = needle === "" || row.name.toLowerCase().includes(needle) || row.sku.toLowerCase().includes(needle);
+      return matchesQuery && matchesStockFilter(row, stockFilter);
+    });
+  }, [products, query, stockFilter]);
   const pageCount = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
   const paged = visible.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
@@ -212,9 +211,6 @@ export function InventoryClient(props: InventoryClientProps) {
     const result: ActionResult<ProductRow[]> = await listProductsAction();
     if (result.success) {
       setProducts(result.data);
-      setAlertIds(
-        new Set(result.data.filter((row) => row.stock_qty <= row.min_stock).map((row) => row.id)),
-      );
     }
   }
 
@@ -369,18 +365,23 @@ export function InventoryClient(props: InventoryClientProps) {
         <Alert variant="destructive">{error}</Alert>
       ) : null}
 
-      <section className={sectionClass}>
-        <Label htmlFor="inventory-search" className={labelClass}>
-          Buscar por nombre o SKU
-          <Input
-            id="inventory-search"
-            className={inputClass}
-            value={query}
-            onChange={(event: ChangeEvent<HTMLInputElement>) => { setPage(0); setQuery(event.target.value); }}
-            placeholder="Ej. shampoo o SH-001"
-          />
-        </Label>
-      </section>
+      <ListToolbar
+        searchId="inventory-search"
+        searchLabel="Buscar por nombre o SKU"
+        searchValue={query}
+        searchPlaceholder="Nombre o SKU"
+        onSearchChange={(value) => { setPage(0); setQuery(value); }}
+        statusLabel="Stock"
+        statusValue={stockFilter}
+        statusOptions={[
+          { value: "all", label: "Todos" },
+          { value: "low", label: "Bajo mínimo" },
+          { value: "empty", label: "Sin existencias" },
+        ]}
+        onStatusChange={(value) => { setPage(0); setStockFilter(value as StockFilter); }}
+        onFilter={() => setPage(0)}
+        onClear={() => { setQuery(""); setStockFilter("all"); setPage(0); }}
+      />
 
       {props.canWrite ? (
         /*
@@ -487,7 +488,11 @@ export function InventoryClient(props: InventoryClientProps) {
                     <span className="break-words text-sm text-text-primary sm:col-start-2 sm:row-start-1">
                       <span className="font-sans font-medium text-text-secondary sm:hidden">Nombre: </span>
                       {row.name}{" "}
-                      {alertIds.has(row.id) ? (
+                      {stockBadge(row) === "empty" ? (
+                        <Badge variant="destructive" size="sm">
+                          Sin existencias
+                        </Badge>
+                      ) : stockBadge(row) === "low" ? (
                         <Badge variant="warning" size="sm">
                           Bajo mínimo
                         </Badge>
@@ -564,31 +569,9 @@ export function InventoryClient(props: InventoryClientProps) {
             </ul>
           </div>
         )}
-        {pageCount > 1 ? (
-          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-sm">
-            <span className={mutedTextClass}>
-              Página {safePage + 1} de {pageCount} · {visible.length} productos
-            </span>
-            <div className="flex gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={safePage === 0}
-                onClick={() => setPage(safePage - 1)}
-              >
-                Anterior
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={safePage >= pageCount - 1}
-                onClick={() => setPage(safePage + 1)}
-              >
-                Siguiente
-              </Button>
-            </div>
+        {visible.length > 0 ? (
+          <div className="mt-3">
+            <ListPager page={safePage} pageSize={PAGE_SIZE} total={visible.length} onPageChange={setPage} />
           </div>
         ) : null}
       </section>
