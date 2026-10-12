@@ -11,9 +11,11 @@ import type { CashDenominationRow, CashRegisterRow } from "@/src/features/cash/s
 import { Alert } from "@/src/components/ui/lib/alert";
 import { EmptyState } from "@/src/components/ui/lib/empty-state";
 import { ConfirmDialog, FormDialog } from "@/src/components/ui/lib/form-dialog";
+import { ListToolbar } from "@/src/components/ui/lib/list-toolbar";
 import {
   buttonClass,
   inputClass,
+  MoneyField,
   labelClass,
   linkButtonClass,
   listItemClass,
@@ -21,7 +23,7 @@ import {
   sectionTitleClass,
   stackClass,
 } from "../admin-styles";
-import { formatMoney, type ActionResult } from "../admin-shared";
+import { ACTIVE_STATUS_OPTIONS, formatMoney, matchesActiveStatus, matchesQuery, type ActionResult, type ActiveStatusFilter } from "../admin-shared";
 import { formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
 
 /**
@@ -60,6 +62,11 @@ export function CashSection({
   const [denominationError, setDenominationError] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [denominationQuery, setDenominationQuery] = useState("");
+  const [denominationStatus, setDenominationStatus] = useState<ActiveStatusFilter>("all");
+  const visibleDenominations = denominations.filter(
+    (row) => matchesActiveStatus(row.is_active, denominationStatus) && matchesQuery(denominationQuery, [row.kind, String(row.value)]),
+  );
 
   function openAdd() {
     setNewKind("billete");
@@ -172,18 +179,22 @@ export function CashSection({
         ) : (
           <ul className="mt-2 flex flex-col gap-2">
             {registers.map((row) => (
-              <li key={row.id} className={listItemClass}>
-                <span>
+              <li
+                key={row.id}
+                className="grid grid-cols-1 items-center gap-2 rounded border border-border-color-2 px-3 py-2 text-sm sm:grid-cols-[minmax(0,1fr)_minmax(10rem,14rem)_auto]"
+              >
+                <span className="min-w-0 break-words">
                   <strong>{row.name}</strong> · base actual {formatMoney(row.base_configurada)}
                 </span>
-                <input
+                <MoneyField
                   value={formatMoneyInput(baseDrafts[row.id] ?? "")}
                   onChange={(event) => setBaseDrafts((current) => ({ ...current, [row.id]: stripMoneyInput(event.target.value) }))}
                   inputMode="numeric"
                   placeholder="Nueva base"
-                  className={inputClass}
+                  aria-label={`Nueva base de ${row.name}`}
+                  className="w-full"
                 />
-                <button type="button" disabled={busy} onClick={() => handleBase(row.id)} className={buttonClass}>
+                <button type="button" disabled={busy} onClick={() => handleBase(row.id)} className={`${buttonClass} w-full sm:w-auto`}>
                   {busy ? "Guardando…" : "Guardar base"}
                 </button>
               </li>
@@ -200,19 +211,38 @@ export function CashSection({
 
       <section className={sectionClass} aria-label="Denominaciones">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className={sectionTitleClass}>Denominaciones ({denominations.length})</h2>
+          <h2 className={sectionTitleClass}>Denominaciones ({visibleDenominations.length})</h2>
           <button type="button" onClick={openAdd} className={buttonClass}>
             Nueva denominación
           </button>
         </div>
-        {denominations.length === 0 ? (
-          <EmptyState className="mt-3">Aún no hay denominaciones registradas.</EmptyState>
+        {denominations.length > 0 ? (
+          <ListToolbar
+            className="mt-3"
+            aria-label="Filtrar denominaciones"
+            searchId="admin-denominations-search"
+            searchLabel="Buscar"
+            searchValue={denominationQuery}
+            searchPlaceholder="Tipo o valor"
+            onSearchChange={setDenominationQuery}
+            statusLabel="Estado"
+            statusValue={denominationStatus}
+            statusOptions={ACTIVE_STATUS_OPTIONS}
+            onStatusChange={(value) => setDenominationStatus(value as ActiveStatusFilter)}
+            onClear={() => {
+              setDenominationQuery("");
+              setDenominationStatus("all");
+            }}
+          />
+        ) : null}
+        {visibleDenominations.length === 0 ? (
+          <EmptyState className="mt-3">{denominations.length === 0 ? "Aún no hay denominaciones registradas." : "Sin resultados para ese filtro."}</EmptyState>
         ) : (
           <ul className="mt-3 flex flex-col gap-2">
-            {denominations.map((row) => (
+            {visibleDenominations.map((row) => (
               <li key={row.id} className={`${listItemClass} justify-between`}>
                 <span>
-                  {row.kind} · {row.value} · {row.is_active ? "activa" : "inactiva"}
+                  {row.kind} · {formatMoney(row.value)} · {row.is_active ? "activa" : "inactiva"}
                 </span>
                 <div className="flex gap-2">
                   <button type="button" disabled={busy} onClick={() => toggleDenomination(row)} className={linkButtonClass}>
@@ -259,7 +289,7 @@ export function CashSection({
           </label>
           <label className={labelClass}>
             Valor
-            <input value={formatMoneyInput(newValue)} onChange={(event) => setNewValue(stripMoneyInput(event.target.value))} inputMode="numeric" className={inputClass} />
+            <MoneyField value={formatMoneyInput(newValue)} onChange={(event) => setNewValue(stripMoneyInput(event.target.value))} inputMode="numeric" />
           </label>
         </div>
       </FormDialog>
