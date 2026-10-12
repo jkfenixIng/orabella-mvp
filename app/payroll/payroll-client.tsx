@@ -1372,7 +1372,7 @@ export function PayrollClient(props: PayrollClientProps) {
   const [invoiceSources, setInvoiceSources] = useState<Extract<PayrollSettlementSources, { kind: "invoices" }> | null>(null);
   const [voucherSources, setVoucherSources] = useState<Extract<PayrollSettlementSources, { kind: "vouchers" }> | null>(null);
   const [selectedSourceKind, setSelectedSourceKind] = useState<"invoices" | "vouchers" | null>(null);
-  const [sourcesBusy, setSourcesBusy] = useState(false);
+  const [sourcesBusy, setSourcesBusy] = useState<{ invoices: boolean; vouchers: boolean }>({ invoices: false, vouchers: false });
   /** F6: detalle de la factura abierta con la lectura existente de facturación. */
   const [invoiceTargetId, setInvoiceTargetId] = useState<string | null>(null);
   const [invoiceDetail, setInvoiceDetail] = useState<InvoiceDetail | null>(null);
@@ -1915,7 +1915,7 @@ export function PayrollClient(props: PayrollClientProps) {
     setInvoiceSources(null);
     setVoucherSources(null);
     setSelectedSourceKind(null);
-    setSourcesBusy(false);
+    setSourcesBusy({ invoices: false, vouchers: false });
     setInvoiceTargetId(null);
     setInvoiceDetail(null);
     setVoucherTargetId(null);
@@ -1930,14 +1930,14 @@ export function PayrollClient(props: PayrollClientProps) {
     }
     setSelectedSourceKind(kind);
     const loaded = kind === "invoices" ? invoiceSources : voucherSources;
-    if (!sourcesTarget || loaded !== null || sourcesBusy) return;
-    setSourcesBusy(true);
+    if (!sourcesTarget || loaded !== null || sourcesBusy[kind]) return;
+    setSourcesBusy((current) => ({ ...current, [kind]: true }));
     const result = (await getPayrollSettlementSourcesAction(
       sourcesTarget.periodId,
       sourcesTarget.employeeId,
       kind,
     )) as ActionResult<PayrollSettlementSources>;
-    setSourcesBusy(false);
+    setSourcesBusy((current) => ({ ...current, [kind]: false }));
     if (!show(result)) return;
     if (result.data.kind === "invoices") setInvoiceSources(result.data);
     else setVoucherSources(result.data);
@@ -1948,7 +1948,7 @@ export function PayrollClient(props: PayrollClientProps) {
     setInvoiceSources(null);
     setVoucherSources(null);
     setSelectedSourceKind(null);
-    setSourcesBusy(false);
+    setSourcesBusy({ invoices: false, vouchers: false });
     setInvoiceTargetId(null);
     setInvoiceDetail(null);
     setVoucherTargetId(null);
@@ -3932,7 +3932,7 @@ export function PayrollClient(props: PayrollClientProps) {
                   voucherSources={voucherSources}
                   selectedKind={selectedSourceKind}
                   item={itemByEmployee.get(sourcesTarget.employeeId) ?? null}
-                  busy={sourcesBusy}
+                  busy={sourcesBusy[selectedSourceKind]}
                   onViewInvoice={(invoiceId) => void openInvoiceDetail(invoiceId)}
                   onViewVoucher={(voucher) => void openVoucherDetail(voucher)}
                 />
