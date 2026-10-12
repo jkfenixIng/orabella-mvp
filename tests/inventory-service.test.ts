@@ -36,7 +36,7 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
       postgrest.calls.push(call);
       const answer = () => postgrest.answers.shift() ?? { data: null, error: null };
       const query: Record<string, unknown> = {};
-      for (const method of ["select", "eq", "neq", "in", "or", "order", "limit", "range", "insert", "upsert"]) {
+      for (const method of ["select", "eq", "neq", "in", "ilike", "or", "order", "limit", "range", "insert", "upsert"]) {
         query[method] = (...args: unknown[]) => {
           call.chain.push([method, args]);
           return query;
@@ -167,8 +167,21 @@ describe("upsertProduct (supabase-js)", () => {
     withProbe({ data: [{ sku: "SHAMPO-001" }, { sku: "shampo-007" }], error: null }, { data: ROW, error: null });
     expect(await upsertProduct(input)).toEqual(ROW);
     const skuRead = postgrest.calls.find((call) => call.chain[0]?.[0] === "select" && call.chain[0]?.[1]?.[0] === "sku");
-    expect(skuRead?.chain).toEqual([["select", ["sku"]]]);
+    expect(skuRead?.chain).toEqual([["select", ["sku"]], ["ilike", ["sku", "SHAMPO-%"]], ["order", ["sku"]], ["range", [0, 999]]]);
     expect(postgrest.calls.at(-1)?.chain[0]).toEqual(["upsert", [insert("SHAMPO-008"), { onConflict: "id" }]]);
+  });
+
+  it("pages more than 1000 matching SKUs and ignores other prefixes when finding the maximum", async () => {
+    const firstPage = Array.from({ length: 1000 }, (_, index) => ({ sku: `SHAMPO-${String(index + 1).padStart(3, "0")}` }));
+    withProbe({ data: firstPage, error: null }, { data: [{ sku: "SHAMPO-1001" }], error: null }, { data: ROW, error: null });
+
+    expect(await upsertProduct(input)).toEqual(ROW);
+    const skuReads = postgrest.calls.filter((call) => call.chain.some(([method]) => method === "ilike"));
+    expect(skuReads.map((call) => call.chain)).toEqual([
+      [["select", ["sku"]], ["ilike", ["sku", "SHAMPO-%"]], ["order", ["sku"]], ["range", [0, 999]]],
+      [["select", ["sku"]], ["ilike", ["sku", "SHAMPO-%"]], ["order", ["sku"]], ["range", [1000, 1999]]],
+    ]);
+    expect(postgrest.calls.at(-1)?.chain[0]).toEqual(["upsert", [insert("SHAMPO-1002"), { onConflict: "id" }]]);
   });
 
   it("edit keeps the stored SKU even when another one is sent", async () => {

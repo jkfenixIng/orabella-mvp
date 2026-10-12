@@ -15,7 +15,7 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
   createAdminClient: () => ({
     from() {
       const query: Record<string, unknown> = {};
-      for (const method of ["select", "order", "limit", "upsert", "eq", "neq", "update", "maybeSingle"]) {
+      for (const method of ["select", "order", "limit", "range", "ilike", "upsert", "eq", "neq", "update", "maybeSingle"]) {
         query[method] = () => query;
       }
       query.single = () => Promise.resolve({ data: null, error: repo.error });

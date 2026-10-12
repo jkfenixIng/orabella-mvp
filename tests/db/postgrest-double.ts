@@ -8,7 +8,7 @@
  * It covers only the builder calls the repositories use: select (plain
  * column lists and a many-to-one embed `table(col)` resolved through the
  * `<singular>_id` foreign key, an object or null like PostgREST), count exact
- * head, in/eq/neq/is/gte/lte/match, `or` with `ilike`/`eq`/`is.null` items, order,
+ * head, in/eq/neq/ilike/is/gte/lte/match, `or` with `ilike`/`eq`/`is.null` items, order,
  * range/limit, insert/upsert of one row or an array (upsert with an
  * onConflict column list, default id), update, delete, single and maybeSingle
  * (PGRST116 when the row count does not fit), and `rpc` with PostgREST's named
@@ -23,7 +23,7 @@ import type { Db } from "./harness";
 
 type Result = { data: unknown; count?: number | null; error: unknown };
 type Filter =
-  | { column: string; op: "=" | "<>" | ">=" | "<=" | "in" | "is"; value: unknown }
+  | { column: string; op: "=" | "<>" | ">=" | "<=" | "in" | "is" | "ilike"; value: unknown }
   | { op: "or"; items: OrItem[] };
 
 const ident = (name: string) => `"${name.replace(/"/g, '""')}"`;
@@ -155,9 +155,9 @@ export function postgrestDouble(
             }
             if (filter.op === "is") return `${ident(filter.column)} IS NULL`;
             params.push(filter.value);
-            return filter.op === "in"
-              ? `${ident(filter.column)}::text = ANY($${params.length}::text[])`
-              : `${ident(filter.column)} ${filter.op} $${params.length}`;
+            if (filter.op === "in") return `${ident(filter.column)}::text = ANY($${params.length}::text[])`;
+            if (filter.op === "ilike") return `${ident(filter.column)} ILIKE $${params.length} ESCAPE '\\'`;
+            return `${ident(filter.column)} ${filter.op} $${params.length}`;
           })
           .join(" AND ")}`;
       };
@@ -290,6 +290,10 @@ export function postgrestDouble(
         },
         neq(column: string, value: unknown) {
           filters.push({ column, op: "<>", value });
+          return query;
+        },
+        ilike(column: string, value: string) {
+          filters.push({ column, op: "ilike", value });
           return query;
         },
         is(column: string, value: null) {

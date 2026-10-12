@@ -4,6 +4,7 @@ import {
   manualMovementSchema,
   movementSchema,
   productSkuForName,
+  productSkuPrefix,
   planStockDeduction,
   productSchema,
   sortKardexAscending,
@@ -170,7 +171,7 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
   }
 
   for (let attempt = 1; ; attempt += 1) {
-    const existing = await read(() => db.listProductSkus());
+    const existing = await read(() => db.listSkusByPrefix(productSkuPrefix(input.name)));
     const sku = productSkuForName(input.name, existing);
     try {
       return await productWrite(db, { sku, ...fields });

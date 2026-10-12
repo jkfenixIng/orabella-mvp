@@ -81,8 +81,8 @@ export interface InventoryRepo {
   /** Ordered by name, id. */
   listProducts(limit: number): Promise<ProductRow[]>;
   findProduct(id: string): Promise<ProductRow | null>;
-  /** Every stored SKU, used only to pick a unique generated SKU on create. */
-  listProductSkus(): Promise<string[]>;
+  /** Every stored SKU shaped `PREFIX-…` (case-insensitive), ordered by sku; picks the next generated SKU. */
+  listSkusByPrefix(prefix: string): Promise<string[]>;
   /** Literal, case-insensitive fragment of name or SKU; ordered by name, id. */
   searchProducts(needle: string, limit: number, offset?: number): Promise<ProductRow[]>;
   /** Server-filtered catalog page plus the total of the same filtered relation. */
@@ -111,6 +111,14 @@ export interface InventoryRepo {
 export const SEARCH_PRODUCTS_RPC = "search_products_literal";
 /** Migration 010: catalog query, stock filter, page and total in one RPC. */
 export const CATALOG_PAGE_RPC = "inventory_catalog_page";
+
+/** ILIKE pattern `PREFIX-%` with `\`, `%` and `_` escaped, so the prefix is literal. */
+export function skuPrefixPattern(prefix: string): string {
+  return `${prefix.replace(/[\\%_]/g, (char) => `\\${char}`)}-%`;
+}
+
+/** PostgREST's default max-rows: SKU pages are read in windows of this size. */
+const SKU_PAGE_SIZE = 1000;
 
 type CatalogRow = Record<string, unknown> & { total_count?: unknown };
 
@@ -176,10 +184,22 @@ export function supabaseInventoryRepo(db: SupabaseClient): InventoryRepo {
       if (error) fail(error);
       return data ? normalizeProduct(data as unknown as Record<string, unknown>) : null;
     },
-    async listProductSkus() {
-      const { data, error } = await db.from("products").select("sku");
-      if (error) fail(error);
-      return (data ?? []).map((row) => String((row as { sku: string }).sku));
+    async listSkusByPrefix(prefix) {
+      const pattern = skuPrefixPattern(prefix);
+      const skus: string[] = [];
+      // Ranged pages ordered by the unique sku: never truncated by max-rows.
+      for (let from = 0; ; from += SKU_PAGE_SIZE) {
+        const { data, error } = await db
+          .from("products")
+          .select("sku")
+          .ilike("sku", pattern)
+          .order("sku")
+          .range(from, from + SKU_PAGE_SIZE - 1);
+        if (error) fail(error);
+        const page = (data ?? []).map((row) => String((row as { sku: string }).sku));
+        skus.push(...page);
+        if (page.length < SKU_PAGE_SIZE) return skus;
+      }
     },
     async searchProducts(needle, limit, offset = 0) {
       const { data, error } = await db.rpc(SEARCH_PRODUCTS_RPC, { p_query: needle, p_limit: limit, p_offset: offset });
