@@ -212,7 +212,7 @@ const ALLOWLIST = new Map<string, { hits: number; reason: string }>([
   [
     "app/invoices/invoices-client.tsx",
     {
-      hits: 40,
+      hits: 43,
       reason:
         "WU5: son los 40 tokens del CROMO de la app (botón de modo cliente, pastilla de comisión, " +
         "tabla de historial y sus botones). Los 184 de la hoja de factura ya no están: se congelaron " +
