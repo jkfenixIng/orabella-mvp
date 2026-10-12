@@ -8,98 +8,53 @@ export type MovementType = z.infer<typeof movementTypeSchema>;
 
 const uuidSchema = z.uuid("Identificador inválido.");
 
-/**
- * INV-01: normaliza el SKU (trim + mayúsculas) para que la unicidad por
- * sede sea insensible a caja y espacios. Se guarda ya normalizado.
- */
-export function normalizeSku(sku: string | null | undefined): string {
-  return (sku ?? "").trim().toUpperCase();
-}
-
-/** Tope del campo `sku` en `productSchema`; también el de la propuesta. */
-const PROPOSED_SKU_MAX_LENGTH = 40;
-/** Base de reserva cuando el nombre no aporta ningún alfanumérico. */
-const PROPOSED_SKU_FALLBACK = "PROD";
+/** Length limit of the stored SKU. */
+const PRODUCT_SKU_MAX_LENGTH = 40;
+/** Prefix used when the name has no letter or digit. */
+const PRODUCT_SKU_FALLBACK_PREFIX = "PROD";
+const PRODUCT_SKU_PREFIX_LENGTH = 6;
+const PRODUCT_SKU_SEQUENCE_WIDTH = 3;
 
 /**
- * INV-01: deriva la base de un SKU a partir del NOMBRE del producto.
- *
- * Sin acentos ni diacríticos (se borran las marcas combinantes: `ñ` → `n`,
- * `á` → `a`), en mayúsculas, sólo `[A-Z0-9]`, con los tramos no alfanuméricos
- * colapsados en un solo `-` y los separadores de los extremos recortados. Si
- * no queda nada (un nombre sólo de signos) la base es `PROD`.
+ * INV-01: SKU prefix from the product name: accents stripped, uppercase,
+ * letters and digits only, at most 6 characters (`"Shampú de Ñandú"` →
+ * `SHAMPU`). Only `[A-Z0-9]`, so it is also a literal regex fragment.
  */
-function skuBaseFromName(name: string): string {
-  const base = name
+export function productSkuPrefix(name: string): string {
+  const prefix = name
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  return base === "" ? PROPOSED_SKU_FALLBACK : base;
-}
-
-/** Recorta a `max` sin dejar un separador colgando al final. */
-function capSku(value: string, max: number): string {
-  return value.slice(0, Math.max(0, max)).replace(/-+$/g, "");
+    .replace(/[^A-Z0-9]+/g, "")
+    .slice(0, PRODUCT_SKU_PREFIX_LENGTH);
+  return prefix === "" ? PRODUCT_SKU_FALLBACK_PREFIX : prefix;
 }
 
 /**
- * INV-01: propone un SKU a partir del NOMBRE del producto (puro, sin BD).
- *
- * Lo usa el botón de ayuda del formulario de alta, para quien no sabe qué SKU
- * escribir. La base sale del nombre —`"Shampú de Ñandú"` → `SHAMPU-DE-NANDU`,
- * `"¡$%&/()=?"` → `PROD`— y se desambigua contra los SKU ya cargados con la
- * MISMA regla de unicidad de la app (trim + mayúsculas, `normalizeSku`):
- * primero la base, y si está tomada `-2`, `-3`, … hasta encontrar una libre.
- *
- * El resultado siempre cumple el campo `sku` de `productSchema` (no vacío y de
- * 40 caracteres o menos) y es determinista: los mismos argumentos devuelven el
- * mismo SKU, sin importar el orden de `takenSkus`. El sufijo entra en el tope
- * de 40 —la base se recorta para que quepa— y el recorte nunca deja un `-`
- * colgando al final.
+ * INV-01: server-generated SKU `PREFIX-NNN`, the next number after the
+ * highest one already used with that prefix (`SHAMPU-001`, `SHAMPU-002`, …).
+ * Deterministic for the same name and existing SKUs; SKUs that do not follow
+ * the pattern are ignored. Always within the 40 characters of the column.
  */
-export function proposeSku(name: string, takenSkus: readonly string[]): string {
-  const base = skuBaseFromName(name);
-  const taken = new Set(takenSkus.map((sku) => normalizeSku(sku)));
-
-  const plain = capSku(base, PROPOSED_SKU_MAX_LENGTH);
-  if (!taken.has(plain)) return plain;
-
-  for (let n = 2; n <= 10_000; n += 1) {
-    const suffix = `-${n}`;
-    const candidate = `${capSku(base, PROPOSED_SKU_MAX_LENGTH - suffix.length)}${suffix}`;
-    if (!taken.has(candidate)) return candidate;
+export function productSkuForName(name: string, existingSkus: Iterable<string>): string {
+  const prefix = productSkuPrefix(name);
+  const pattern = new RegExp(`^${prefix}-(\\d+)$`);
+  let highest = 0;
+  for (const sku of existingSkus) {
+    const match = pattern.exec(sku.trim().toUpperCase());
+    if (match) highest = Math.max(highest, Number(match[1]));
   }
-
-  // Inalcanzable con datos reales (haría falta una lista con 10 000 variantes
-  // del mismo nombre): se devuelve la última candidata, que sigue cumpliendo el
-  // esquema, en vez de dejar la propuesta vacía.
-  const lastSuffix = "-10000";
-  return `${capSku(base, PROPOSED_SKU_MAX_LENGTH - lastSuffix.length)}${lastSuffix}`;
+  const sku = `${prefix}-${String(highest + 1).padStart(PRODUCT_SKU_SEQUENCE_WIDTH, "0")}`;
+  return sku.slice(0, PRODUCT_SKU_MAX_LENGTH);
 }
 
 /**
- * INV-01: conflicto de SKU a nivel app (además del UNIQUE (sku) de la base).
- * Dos SKU normalizados iguales colisionan.
- *
- * Ya NO lleva la sede de cada lado: `products_sede_id_sku_key` se sustituyó por
- * `products_sku_key` (074), así que la restricción que este predicado refleja
- * compara sólo el SKU. Comparar las dos sedes era una frontera de fila que
- * únicamente tenía sentido con varias instalaciones; con una sola, los dos lados
- * son siempre la misma fila de negocio y el resultado no podía cambiar.
+ * INV-01: product (initial stock goes through an IN movement, never directly).
+ * Public writes never carry the SKU: it is generated on create and immutable
+ * on edit, so an unknown `sku` key is stripped and ignored.
  */
-export function areSkusConflicting(args: {
-  skuA: string;
-  skuB: string;
-}): boolean {
-  return normalizeSku(args.skuA) === normalizeSku(args.skuB);
-}
-
-/** INV-01: producto (el stock inicial va vía movimiento IN, nunca directo). */
 export const productSchema = z.object({
   id: uuidSchema.optional(),
-  sku: z.string().trim().min(1, "SKU requerido.").max(40, "SKU muy largo."),
   name: z.string().trim().min(1, "Nombre requerido.").max(120, "Nombre muy largo."),
   description: z.string().trim().max(500, "Descripción muy larga.").nullish(),
   min_stock: z.coerce.number().int("Mínimo entero.").nonnegative("El mínimo no puede ser negativo.").default(0),

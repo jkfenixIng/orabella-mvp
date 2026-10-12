@@ -102,8 +102,7 @@ describe("inventory repository: equivalence supabase-js ↔ drizzle", () => {
     await same((repo) => repo.findProduct("00000000-0000-4000-8000-0000000000ff"));
     await same((repo) => repo.activeByStock(200));
     await same((repo) => repo.productStocks([P1, P2]));
-    await same((repo) => repo.skuConflicts("SKU-1"));
-    await same((repo) => repo.skuConflicts("SKU-1", P1));
+    await same((repo) => repo.listProductSkus());
   });
 
   it.each<[string, string[]]>([

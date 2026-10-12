@@ -3,7 +3,7 @@ import {
   filterLowStock,
   manualMovementSchema,
   movementSchema,
-  normalizeSku,
+  productSkuForName,
   planStockDeduction,
   productSchema,
   sortKardexAscending,
@@ -26,6 +26,7 @@ import {
   type MovementRow,
   type ProductPage,
   type ProductRow,
+  type ProductWrite,
 } from "./repos/inventory";
 
 export type { MovementRow, ProductPage, ProductRow } from "./repos/inventory";
@@ -134,11 +135,15 @@ export async function getProduct(id: string): Promise<ProductRow> {
   return product;
 }
 
+const PRODUCT_SKU_ATTEMPTS = 3;
+
 /**
- * INV-01: crea o actualiza un producto (upsert por id). El SKU se
- * normaliza (trim + mayúsculas) y se valida a nivel app para devolver
- * SKU_TAKEN; el UNIQUE (sku) de la base sigue cubriendo carreras.
- * INV-03: nunca toca stock_qty (el stock inicial va vía movimiento IN).
+ * INV-01: creates a product with a server-generated SKU or edits an existing
+ * one (upsert by id). Public input never carries the SKU: an unknown `sku`
+ * key is ignored, and an edit writes back the stored SKU, so it is immutable.
+ * A concurrent create that takes the same SKU (23505 on UNIQUE (sku)) is
+ * retried with the next number.
+ * INV-03: never touches stock_qty (initial stock goes through an IN movement).
  */
 export async function upsertProduct(raw: unknown): Promise<ProductRow> {
   const parsed = productSchema.safeParse(raw);
@@ -146,32 +151,46 @@ export async function upsertProduct(raw: unknown): Promise<ProductRow> {
     throw new InventoryError("VALIDATION", validationMessage(parsed.error), 400);
   }
   const input: ProductInput = parsed.data;
-  const sku = normalizeSku(input.sku);
   const db = await inventoryDb();
+  const fields = {
+    name: input.name,
+    description: input.description ?? null,
+    min_stock: input.min_stock,
+    cost_price: input.cost_price ?? null,
+    sale_price: input.sale_price ?? null,
+    commission_value: input.commission_value ?? null,
+    ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
+  };
 
-  const conflicts = await read(() => db.skuConflicts(sku, input.id));
-  if (conflicts.length > 0) {
-    throw new InventoryError("SKU_TAKEN", "El SKU ya existe.", 409);
+  if (input.id) {
+    const id = input.id;
+    const current = await read(() => db.findProduct(id));
+    if (!current) throw new InventoryError("NOT_FOUND", "Producto no encontrado.", 404);
+    return productWrite(db, { id, sku: current.sku, ...fields });
   }
 
+  for (let attempt = 1; ; attempt += 1) {
+    const existing = await read(() => db.listProductSkus());
+    const sku = productSkuForName(input.name, existing);
+    try {
+      return await productWrite(db, { sku, ...fields });
+    } catch (error) {
+      // A concurrent creation took the same generated SKU: recompute the number.
+      const raced = error instanceof InventoryError && error.code === "SKU_TAKEN";
+      if (!raced || attempt >= PRODUCT_SKU_ATTEMPTS) throw error;
+    }
+  }
+}
+
+/** A product write; 23505 on UNIQUE (sku) is SKU_TAKEN, other failures INTERNAL. */
+async function productWrite(db: InventoryRepo, write: ProductWrite): Promise<ProductRow> {
   let saved: ProductRow | null;
   try {
-    saved = await db.upsertProduct({
-      ...(input.id ? { id: input.id } : {}),
-      sku,
-      name: input.name,
-      description: input.description ?? null,
-      min_stock: input.min_stock,
-      cost_price: input.cost_price ?? null,
-      sale_price: input.sale_price ?? null,
-      commission_value: input.commission_value ?? null,
-      ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
-    });
+    saved = await db.upsertProduct(write);
   } catch (error) {
     throwInventoryCop(error);
-    // Carrera perdida contra UNIQUE (sku): mismo error de negocio.
     if (error instanceof DbQueryError && error.error.code === "23505") {
-      throw new InventoryError("SKU_TAKEN", "El SKU ya existe.", 409);
+      throw new InventoryError("SKU_TAKEN", "No se pudo generar un SKU único. Intente de nuevo.", 409);
     }
     throw internal();
   }

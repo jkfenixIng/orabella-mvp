@@ -57,6 +57,7 @@ export interface MovementRow {
 /** Validated product write; never carries stock_qty (INV-03). */
 export interface ProductWrite {
   id?: string;
+  /** Generated on insert; an edit writes back the stored SKU unchanged. */
   sku: string;
   name: string;
   description: string | null;
@@ -80,8 +81,8 @@ export interface InventoryRepo {
   /** Ordered by name, id. */
   listProducts(limit: number): Promise<ProductRow[]>;
   findProduct(id: string): Promise<ProductRow | null>;
-  /** Ids of products with that SKU other than `exceptId` (at most one). */
-  skuConflicts(sku: string, exceptId?: string): Promise<Array<{ id: string }>>;
+  /** Every stored SKU, used only to pick a unique generated SKU on create. */
+  listProductSkus(): Promise<string[]>;
   /** Literal, case-insensitive fragment of name or SKU; ordered by name, id. */
   searchProducts(needle: string, limit: number, offset?: number): Promise<ProductRow[]>;
   /** Server-filtered catalog page plus the total of the same filtered relation. */
@@ -175,11 +176,10 @@ export function supabaseInventoryRepo(db: SupabaseClient): InventoryRepo {
       if (error) fail(error);
       return data ? normalizeProduct(data as unknown as Record<string, unknown>) : null;
     },
-    async skuConflicts(sku, exceptId) {
-      const query = db.from("products").select("id").eq("sku", sku).limit(1);
-      const { data, error } = exceptId ? await query.neq("id", exceptId) : await query;
+    async listProductSkus() {
+      const { data, error } = await db.from("products").select("sku");
       if (error) fail(error);
-      return (data ?? []) as Array<{ id: string }>;
+      return (data ?? []).map((row) => String((row as { sku: string }).sku));
     },
     async searchProducts(needle, limit, offset = 0) {
       const { data, error } = await db.rpc(SEARCH_PRODUCTS_RPC, { p_query: needle, p_limit: limit, p_offset: offset });
