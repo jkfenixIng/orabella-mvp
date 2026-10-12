@@ -19,7 +19,14 @@ import { DbQueryError, toDbError } from "@/src/shared/db/errors";
 import { callRpc, callRpcRows } from "@/src/shared/db/rpc";
 import { inventoryMovements, products, users } from "@/src/shared/db/schema";
 import { toPostgrestTimestamp } from "@/src/shared/db/timestamps";
-import { SEARCH_PRODUCTS_RPC, type InventoryRepo, type MovementRow, type ProductRow } from "./inventory";
+import {
+  CATALOG_PAGE_RPC,
+  SEARCH_PRODUCTS_RPC,
+  toProductPage,
+  type InventoryRepo,
+  type MovementRow,
+  type ProductRow,
+} from "./inventory";
 
 const PRODUCT_COLUMNS = {
   id: products.id,
@@ -94,6 +101,16 @@ export function drizzleInventoryRepo(db: Database): InventoryRepo {
           { value: offset, cast: "integer" },
         ]);
         return rows.map(toProduct);
+      }),
+    catalogPage: ({ query, stockFilter, limit, offset }) =>
+      run(async () => {
+        const rows = await callRpcRows<Record<string, unknown>>(db, CATALOG_PAGE_RPC, [
+          { value: query, cast: "text" },
+          { value: stockFilter, cast: "text" },
+          { value: limit, cast: "integer" },
+          { value: offset, cast: "integer" },
+        ]);
+        return toProductPage(rows, (row) => toProduct(row as { [K in keyof ProductRow]: unknown }));
       }),
     activeByStock: (limit) =>
       run(async () =>

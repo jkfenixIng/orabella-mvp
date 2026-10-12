@@ -173,4 +173,16 @@ export const MIGRATION_MARKERS = Object.freeze({
      AND pg_catalog.has_function_privilege(r.oid, f.oid, 'EXECUTE')
 ) = 2 AS present`,
   }),
+  // 010: server-side inventory catalog filtering, page and total.
+  "010_inventory_catalog_page.sql": Object.freeze({
+    sql: `SELECT EXISTS (
+  SELECT 1 FROM pg_catalog.pg_proc p
+    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace AND n.nspname = 'public'
+   WHERE p.oid = pg_catalog.to_regprocedure('public.inventory_catalog_page(text,text,integer,integer)')
+     AND pg_catalog.strpos(p.prosrc, 'INVALID_STOCK_FILTER') > 0
+     AND pg_catalog.strpos(p.prosrc, 'total_count') > 0
+     AND pg_catalog.strpos(p.prosrc, 'count(*) OVER ()') > 0
+     AND pg_catalog.strpos(p.prosrc, 'p.stock_qty > 0 AND p.stock_qty <= p.min_stock') > 0
+) AS present`,
+  }),
 });

@@ -4,7 +4,7 @@ import { Alert } from "@/src/components/ui/lib/alert";
 import { PageContainer, PageHeader } from "@/src/components/ui/lib/page";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
-import { listProducts } from "@/src/features/inventory/service";
+import { getProductCatalogPage } from "@/src/features/inventory/service";
 import { InventoryClient } from "./inventory-client";
 
 export const dynamic = "force-dynamic";
@@ -36,7 +36,7 @@ export default async function InventoryPage() {
     );
   }
 
-  const products = await listProducts();
+  const catalog = await getProductCatalogPage();
   const canWrite = session.roles.includes("admin") || session.roles.includes("caja");
   const canAdmin = session.roles.includes("admin");
 
@@ -47,7 +47,7 @@ export default async function InventoryPage() {
         description="Productos, stock, kardex y alertas de mínimo de su sede."
       />
       <InventoryClient
-        initialProducts={products}
+        initialCatalog={catalog}
         canWrite={canWrite}
         canAdmin={canAdmin}
       />

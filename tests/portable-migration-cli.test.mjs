@@ -64,9 +64,9 @@ try {
   assert.deepEqual(repoPlan.discovered.map((migration) => migration.filename), [
     "002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql",
     "005_cop_whole_peso.sql", "006_installation_owner.sql", "007_money_cap_policy.sql",
-    "008_inactive_payment_method_arqueo.sql", "009_cash_opening_bounds.sql",
+    "008_inactive_payment_method_arqueo.sql", "009_cash_opening_bounds.sql", "010_inventory_catalog_page.sql",
   ]);
-  const deferred = ["006_installation_owner.sql", "007_money_cap_policy.sql", "008_inactive_payment_method_arqueo.sql", "009_cash_opening_bounds.sql"];
+  const deferred = ["006_installation_owner.sql", "007_money_cap_policy.sql", "008_inactive_payment_method_arqueo.sql", "009_cash_opening_bounds.sql", "010_inventory_catalog_page.sql"];
   const repoDeferred = buildMigrationPlan(repoPlan.discovered, [], deferred);
   assert.deepEqual(repoDeferred.apply.map((migration) => migration.filename), [
     "002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql", "005_cop_whole_peso.sql",

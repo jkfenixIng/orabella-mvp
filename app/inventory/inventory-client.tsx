@@ -1,20 +1,22 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useTransition, type ChangeEvent, type FormEvent, type RefObject } from "react";
+import { useEffect, useRef, useState, useTransition, type ChangeEvent, type FormEvent, type RefObject } from "react";
 import { toast } from "sonner";
 import { Activity, PackageOpen, PackagePlus, Pencil, X } from "lucide-react";
 import {
   getKardexAction,
-  listProductsAction,
+  listProductCatalogAction,
   registerMovementAction,
+  searchProductsAction,
   upsertProductAction,
 } from "@/src/features/inventory/actions";
 import type {
   MovementRow,
+  ProductPage,
   ProductRow,
 } from "@/src/features/inventory/service";
 import { proposeSku } from "@/src/features/inventory/schemas";
-import { matchesStockFilter, stockBadge, type StockFilter } from "@/src/features/inventory/schemas";
+import { stockBadge, type StockFilter } from "@/src/features/inventory/schemas";
 import { Alert } from "@/src/components/ui/lib/alert";
 import { Badge } from "@/src/components/ui/lib/badge";
 import { Button } from "@/src/components/ui/lib/button";
@@ -145,17 +147,36 @@ function useShellHeaderOffset(barra: RefObject<HTMLDivElement | null>): void {
 }
 
 interface InventoryClientProps {
-  initialProducts: ProductRow[];
+  initialCatalog: ProductPage;
   canWrite: boolean;
   canAdmin: boolean;
 }
 
+/** Rows per catalog page; the server applies the same default. */
+export const INVENTORY_PAGE_SIZE = 15;
+const SEARCH_DEBOUNCE_MS = 300;
+
+/** Runs `effect` after `value` stays unchanged for the debounce window. */
+function useDebouncedEffect(value: string, effect: (value: string) => void, skip: boolean): void {
+  const latest = useRef(effect);
+  latest.current = effect;
+  useEffect(() => {
+    if (skip) return;
+    const timer = setTimeout(() => latest.current(value), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [value, skip]);
+}
+
 export function InventoryClient(props: InventoryClientProps) {
-  const [products, setProducts] = useState(props.initialProducts);
+  const [catalog, setCatalog] = useState(props.initialCatalog);
+  const products = catalog.rows;
   const [query, setQuery] = useState("");
   const [stockFilter, setStockFilter] = useState<StockFilter>("all");
   const [page, setPage] = useState(0);
-  const PAGE_SIZE = 15;
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  /** Only the latest catalog request may update the list. */
+  const catalogRequest = useRef(0);
+  const firstQueryRender = useRef(true);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // Transición para los cambios de vista (kardex): la UI no se congela
@@ -181,38 +202,57 @@ export function InventoryClient(props: InventoryClientProps) {
    */
   const barraAccionesRef = useRef<HTMLDivElement>(null);
   useShellHeaderOffset(barraAccionesRef);
-  const movementProductOptions = useMemo(() => {
-    const needle = movementProductQuery.trim().toLowerCase();
-    if (needle === "") return products;
-    return products.filter(
-      (row) =>
-        row.name.toLowerCase().includes(needle) || row.sku.toLowerCase().includes(needle),
-    );
-  }, [products, movementProductQuery]);
+  const [movementProductOptions, setMovementProductOptions] = useState<ProductRow[]>(products);
   const [kardex, setKardex] = useState<{ product: ProductRow; rows: MovementRow[] } | null>(null);
-
-  const visible = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    return products.filter((row) => {
-      const matchesQuery = needle === "" || row.name.toLowerCase().includes(needle) || row.sku.toLowerCase().includes(needle);
-      return matchesQuery && matchesStockFilter(row, stockFilter);
-    });
-  }, [products, query, stockFilter]);
-  const pageCount = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
+  const pageCount = Math.max(1, Math.ceil(catalog.total / INVENTORY_PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
-  const paged = visible.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
   const skuTaken =
     form.sku.trim() !== "" &&
     products.some(
       (row) => row.sku.trim().toLowerCase() === form.sku.trim().toLowerCase() && row.id !== editingId,
     );
 
-  async function refresh() {
-    const result: ActionResult<ProductRow[]> = await listProductsAction();
-    if (result.success) {
-      setProducts(result.data);
+  async function loadCatalog(nextPage = page, nextQuery = query, nextStockFilter = stockFilter) {
+    const request = ++catalogRequest.current;
+    setCatalogLoading(true);
+    const result: ActionResult<ProductPage> = await listProductCatalogAction({
+      query: nextQuery,
+      stockFilter: nextStockFilter,
+      page: nextPage,
+      limit: INVENTORY_PAGE_SIZE,
+    });
+    if (request !== catalogRequest.current) return;
+    setCatalogLoading(false);
+    if (!result.success) {
+      setError(result.message);
+      return;
     }
+    const lastPage = Math.max(0, Math.ceil(result.data.total / INVENTORY_PAGE_SIZE) - 1);
+    if (nextPage > lastPage) {
+      setPage(lastPage);
+      void loadCatalog(lastPage, nextQuery, nextStockFilter);
+      return;
+    }
+    setCatalog(result.data);
   }
+
+  function applyFilters(nextQuery = query, nextStockFilter = stockFilter) {
+    setPage(0);
+    void loadCatalog(0, nextQuery, nextStockFilter);
+  }
+
+  useDebouncedEffect(query, (nextQuery) => {
+    if (firstQueryRender.current) {
+      firstQueryRender.current = false;
+      return;
+    }
+    applyFilters(nextQuery);
+  }, false);
+
+  useDebouncedEffect(movementProductQuery, async (nextQuery) => {
+    const result: ActionResult<ProductRow[]> = await searchProductsAction(nextQuery);
+    if (result.success) setMovementProductOptions(result.data);
+  }, !movementDialogOpen);
 
   function startProductDialog(row?: ProductRow) {
     setEditingId(row?.id ?? null);
@@ -253,11 +293,16 @@ export function InventoryClient(props: InventoryClientProps) {
    * que después de generar el aviso lee limpio y Guardar no queda bloqueado.
    * Sólo cambia el campo al presionar: no rellena nada al abrir el diálogo.
    */
-  function proposeSkuFromName() {
-    const takenSkus = products
+  async function proposeSkuFromName() {
+    // Every candidate starts with the first 34 characters of the base (the
+    // longest suffix is `-10000`), so one server search covers all collisions.
+    const prefix = proposeSku(form.name, []).slice(0, 34).replace(/-+$/g, "");
+    const result: ActionResult<ProductRow[]> = await searchProductsAction(prefix, 500);
+    const candidates = result.success ? result.data : products;
+    const takenSkus = candidates
       .filter((row) => row.id !== editingId)
       .map((row) => row.sku);
-    setForm({ ...form, sku: proposeSku(form.name, takenSkus) });
+    setForm((current) => ({ ...current, sku: proposeSku(current.name, takenSkus) }));
   }
 
   function openMovementDialog() {
@@ -303,7 +348,7 @@ export function InventoryClient(props: InventoryClientProps) {
     // y no como texto pegado a la pantalla. Antes era un `notice` de estado.
     toast.success(editingId ? "Producto actualizado." : "Producto creado.");
     cancelEdit();
-    await refresh();
+    await loadCatalog();
   }
 
   async function handleMovementSubmit(event: FormEvent) {
@@ -336,7 +381,7 @@ export function InventoryClient(props: InventoryClientProps) {
     // EVENTO: el movimiento acaba de registrarse; efímero, no estado.
     toast.success(`Movimiento registrado. Stock actual: ${result.data.stock_qty}.`);
     setMovement(emptyMovementForm());
-    await refresh();
+    await loadCatalog();
     if (kardex && kardex.product.id === result.data.movement.product_id) {
       await showKardex(kardex.product);
     }
@@ -370,17 +415,25 @@ export function InventoryClient(props: InventoryClientProps) {
         searchLabel="Buscar por nombre o SKU"
         searchValue={query}
         searchPlaceholder="Nombre o SKU"
-        onSearchChange={(value) => { setPage(0); setQuery(value); }}
+        onSearchChange={setQuery}
         statusLabel="Stock"
         statusValue={stockFilter}
         statusOptions={[
           { value: "all", label: "Todos" },
           { value: "low", label: "Bajo mínimo" },
-          { value: "empty", label: "Sin existencias" },
+          { value: "out", label: "Sin existencias" },
         ]}
-        onStatusChange={(value) => { setPage(0); setStockFilter(value as StockFilter); }}
-        onFilter={() => setPage(0)}
-        onClear={() => { setQuery(""); setStockFilter("all"); setPage(0); }}
+        onStatusChange={(value) => {
+          const next = value as StockFilter;
+          setStockFilter(next);
+          applyFilters(query, next);
+        }}
+        onFilter={() => applyFilters()}
+        onClear={() => {
+          setQuery("");
+          setStockFilter("all");
+          applyFilters("", "all");
+        }}
       />
 
       {props.canWrite ? (
@@ -412,8 +465,8 @@ export function InventoryClient(props: InventoryClientProps) {
       ) : null}
 
       <section className={sectionClass}>
-        <h2 className="text-lg font-semibold">Productos ({visible.length})</h2>
-        {visible.length === 0 ? (
+        <h2 className="text-lg font-semibold">Productos ({catalog.total})</h2>
+        {catalog.total === 0 ? (
           // VACÍO: el estado base de la tabla cuando la búsqueda no devuelve
           // nada. Describe lo esperado, no bloquea nada y nunca anunció nada
           // (no tenía rol), así que NO se envuelve en `Alert`: envolverlo
@@ -472,7 +525,7 @@ export function InventoryClient(props: InventoryClientProps) {
               <span className="text-center">Acciones</span>
             </div>
             <ul className="flex flex-col divide-y divide-color-2 dark:divide-border-color">
-              {paged.map((row) => (
+               {products.map((row) => (
                 <li
                   key={row.id}
                   className="flex flex-col gap-1 px-3 py-2.5 sm:grid sm:grid-cols-[minmax(0,0.85fr)_minmax(0,1.3fr)_minmax(0,0.35fr)_minmax(0,0.4fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.05fr)_minmax(0,0.85fr)_minmax(5.75rem,1.2fr)] sm:items-center sm:gap-2"
@@ -569,9 +622,17 @@ export function InventoryClient(props: InventoryClientProps) {
             </ul>
           </div>
         )}
-        {visible.length > 0 ? (
-          <div className="mt-3">
-            <ListPager page={safePage} pageSize={PAGE_SIZE} total={visible.length} onPageChange={setPage} />
+         {catalog.total > 0 ? (
+           <div className="mt-3" aria-busy={catalogLoading}>
+             <ListPager
+               page={safePage}
+               pageSize={INVENTORY_PAGE_SIZE}
+               total={catalog.total}
+               onPageChange={(nextPage) => {
+                 setPage(nextPage);
+                 void loadCatalog(nextPage);
+               }}
+             />
           </div>
         ) : null}
       </section>
