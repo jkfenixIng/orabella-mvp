@@ -67,6 +67,21 @@ describe("portable migration marker contracts", () => {
     }
   });
 
+  it.each([
+    "GRANT EXECUTE ON FUNCTION public.inventory_catalog_page(text, text, integer, integer) TO PUBLIC",
+    "GRANT EXECUTE ON FUNCTION public.inventory_catalog_page(text, text, integer, integer) TO anon",
+    "GRANT EXECUTE ON FUNCTION public.inventory_catalog_page(text, text, integer, integer) TO authenticated",
+    "REVOKE EXECUTE ON FUNCTION public.inventory_catalog_page(text, text, integer, integer) FROM service_role",
+  ])("rejects 010 after: %s", async (statement) => {
+    const db = await buildSchemaDb({ catalog: false });
+    try {
+      await db.exec(statement);
+      expect(await marker(db, "010_inventory_catalog_page.sql")).toBe(false);
+    } finally {
+      await db.close();
+    }
+  });
+
   it("are false on the 001-only baseline", async () => {
     const db = await buildSchemaDb({ catalog: false, migrations: [SCHEMA_PATH] });
     try {

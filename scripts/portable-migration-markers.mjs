@@ -22,6 +22,9 @@ const CASH_OPENERS = `SELECT oid, proacl, proowner FROM pg_catalog.pg_proc
    pg_catalog.to_regprocedure('public.cash_open_shift_atomic(uuid,uuid,numeric,jsonb)'),
    pg_catalog.to_regprocedure('public.cash_open_shift_atomic_legacy(uuid,uuid,numeric,jsonb)')
  )`;
+// 010 ACL subject: the service-role-only inventory catalog page RPC.
+const CATALOG_PAGE = `SELECT oid, proacl, proowner FROM pg_catalog.pg_proc
+ WHERE oid = pg_catalog.to_regprocedure('public.inventory_catalog_page(text,text,integer,integer)')`;
 
 export const MIGRATION_MARKERS = Object.freeze({
   // 002: current_sede_id() reads request.jwt.claims directly instead of auth.jwt().
@@ -173,7 +176,8 @@ export const MIGRATION_MARKERS = Object.freeze({
      AND pg_catalog.has_function_privilege(r.oid, f.oid, 'EXECUTE')
 ) = 2 AS present`,
   }),
-  // 010: server-side inventory catalog filtering, page and total.
+  // 010: server-side inventory catalog filtering, page and total; like 009,
+  // only the service role may execute it (PUBLIC, anon, authenticated revoked).
   "010_inventory_catalog_page.sql": Object.freeze({
     sql: `SELECT EXISTS (
   SELECT 1 FROM pg_catalog.pg_proc p
@@ -183,6 +187,21 @@ export const MIGRATION_MARKERS = Object.freeze({
      AND pg_catalog.strpos(p.prosrc, 'total_count') > 0
      AND pg_catalog.strpos(p.prosrc, 'count(*) OVER ()') > 0
      AND pg_catalog.strpos(p.prosrc, 'p.stock_qty > 0 AND p.stock_qty <= p.min_stock') > 0
-) AS present`,
+) AND NOT EXISTS (
+  SELECT 1
+    FROM (${CATALOG_PAGE}) AS f,
+         pg_catalog.aclexplode(coalesce(f.proacl, pg_catalog.acldefault('f', f.proowner))) a
+   WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE'
+) AND NOT EXISTS (
+  SELECT 1
+    FROM pg_catalog.pg_roles r, (${CATALOG_PAGE}) AS f
+   WHERE r.rolname IN ('anon', 'authenticated')
+     AND pg_catalog.has_function_privilege(r.oid, f.oid, 'EXECUTE')
+) AND (
+  SELECT count(*)
+    FROM pg_catalog.pg_roles r, (${CATALOG_PAGE}) AS f
+   WHERE r.rolname = 'service_role'
+     AND pg_catalog.has_function_privilege(r.oid, f.oid, 'EXECUTE')
+) = 1 AS present`,
   }),
 });
