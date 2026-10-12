@@ -212,9 +212,9 @@ const ALLOWLIST = new Map<string, { hits: number; reason: string }>([
   [
     "app/invoices/invoices-client.tsx",
     {
-      hits: 43,
+      hits: 34,
       reason:
-        "WU5: son los 40 tokens del CROMO de la app (botón de modo cliente, pastilla de comisión, " +
+        "WU5 + modo oscuro de flujos: quedan 34 tokens del CROMO de la app (botón de modo cliente, pastilla de comisión, " +
         "tabla de historial y sus botones). Los 184 de la hoja de factura ya no están: se congelaron " +
         "en la familia `--paper-*` (documento, no tema), que renderiza igual en claro y en oscuro, y " +
         "el reemplazo fue de vocabulario, no de píxeles. Estos 40 NO tienen un token del proyecto con " +
