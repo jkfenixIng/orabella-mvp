@@ -20,7 +20,7 @@ describe("COP whole-peso input policy", () => {
 
   it("keeps percentage fields decimal while rounding all money schemas", () => {
     expect(serviceSchema.parse({ name: "Corte", price: "10.5", duracion_min: 1, duracion_max: 2 }).price).toBe(11);
-    expect(productSchema.parse({ sku: "A", name: "A", cost_price: "10.5", sale_price: "10.49", commission_value: "0.4" })).toMatchObject({ cost_price: 11, sale_price: 10, commission_value: 0 });
+    expect(productSchema.parse({ name: "A", cost_price: "10.5", sale_price: "10.49", commission_value: "0.4" })).toMatchObject({ cost_price: 11, sale_price: 10, commission_value: 0 });
     expect(employeeAdjustmentSchema.parse({ employee_id: uuid, bonuses: "10.5", other_discounts: "10.49" })).toMatchObject({ bonuses: 11, other_discounts: 10 });
     expect(payrollPortionSchema.parse({ method_code: "cash", amount: "10.5" }).amount).toBe(11);
     expect(commissionRuleSchema.parse({ item_type: "producto", item_id: uuid, employee_id: uuid, percent: "7.5", amount: "10.5" })).toMatchObject({ percent: 7.5, amount: 11 });

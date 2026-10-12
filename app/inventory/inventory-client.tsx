@@ -15,7 +15,6 @@ import type {
   ProductPage,
   ProductRow,
 } from "@/src/features/inventory/service";
-import { proposeSku } from "@/src/features/inventory/schemas";
 import { stockBadge, type StockFilter } from "@/src/features/inventory/schemas";
 import { Alert } from "@/src/components/ui/lib/alert";
 import { Badge } from "@/src/components/ui/lib/badge";
@@ -52,7 +51,6 @@ import {
 
 function emptyProductForm() {
   return {
-    sku: "",
     name: "",
     description: "",
     min_stock: "0",
@@ -185,6 +183,7 @@ export function InventoryClient(props: InventoryClientProps) {
   const [productDialogOpen, setProductDialogOpen] = useState(false);
   const [movementDialogOpen, setMovementDialogOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingSku, setEditingSku] = useState<string | null>(null);
   const [form, setForm] = useState(emptyProductForm());
   const [movement, setMovement] = useState(emptyMovementForm());
   /**
@@ -206,11 +205,6 @@ export function InventoryClient(props: InventoryClientProps) {
   const [kardex, setKardex] = useState<{ product: ProductRow; rows: MovementRow[] } | null>(null);
   const pageCount = Math.max(1, Math.ceil(catalog.total / INVENTORY_PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
-  const skuTaken =
-    form.sku.trim() !== "" &&
-    products.some(
-      (row) => row.sku.trim().toLowerCase() === form.sku.trim().toLowerCase() && row.id !== editingId,
-    );
 
   async function loadCatalog(nextPage = page, nextQuery = query, nextStockFilter = stockFilter) {
     const request = ++catalogRequest.current;
@@ -256,10 +250,10 @@ export function InventoryClient(props: InventoryClientProps) {
 
   function startProductDialog(row?: ProductRow) {
     setEditingId(row?.id ?? null);
+    setEditingSku(row?.sku ?? null);
     setForm(
       row
         ? {
-            sku: row.sku,
             name: row.name,
             description: row.description ?? "",
             min_stock: String(row.min_stock),
@@ -280,29 +274,9 @@ export function InventoryClient(props: InventoryClientProps) {
 
   function cancelEdit() {
     setEditingId(null);
+    setEditingSku(null);
     setForm(emptyProductForm());
     setProductDialogOpen(false);
-  }
-
-  /**
-   * AYUDA del SKU: el usuario presiona el botón y obtiene un SKU propuesto a
-   * partir del NOMBRE del producto, libre de choques con los SKU ya cargados.
-   *
-   * Se calcula contra `products` excluyendo el producto en edición: es la MISMA
-   * regla que el aviso `skuTaken` (que compara por `row.id !== editingId`), así
-   * que después de generar el aviso lee limpio y Guardar no queda bloqueado.
-   * Sólo cambia el campo al presionar: no rellena nada al abrir el diálogo.
-   */
-  async function proposeSkuFromName() {
-    // Every candidate starts with the first 34 characters of the base (the
-    // longest suffix is `-10000`), so one server search covers all collisions.
-    const prefix = proposeSku(form.name, []).slice(0, 34).replace(/-+$/g, "");
-    const result: ActionResult<ProductRow[]> = await searchProductsAction(prefix, 500);
-    const candidates = result.success ? result.data : products;
-    const takenSkus = candidates
-      .filter((row) => row.id !== editingId)
-      .map((row) => row.sku);
-    setForm((current) => ({ ...current, sku: proposeSku(current.name, takenSkus) }));
   }
 
   function openMovementDialog() {
@@ -330,7 +304,6 @@ export function InventoryClient(props: InventoryClientProps) {
     const minStock = toNumber(form.min_stock);
     const result: ActionResult<ProductRow> = await upsertProductAction({
       ...(editingId ? { id: editingId } : {}),
-      sku: form.sku,
       name: form.name,
       description: form.description || null,
       min_stock: minStock ?? 0,
@@ -670,62 +643,20 @@ export function InventoryClient(props: InventoryClientProps) {
               <DialogDescription>
                 {editingId
                   ? "Actualiza los datos del producto."
-                  : "Completa los campos obligatorios para registrar un producto."}
+                  : "Completa los campos obligatorios; el SKU se genera automáticamente."}
               </DialogDescription>
             </DialogHeader>
             <form onSubmit={handleProductSubmit} className="flex min-h-0 flex-1 flex-col">
               {/* El MEDIO: lo único que scrollea. `min-h-0` para que pueda encogerse por debajo de sus campos; sin eso el `flex-1` no cede y el pie se vuelve a ir de la caja. */}
               <div className="min-h-0 flex-1 overflow-y-auto">
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <Label htmlFor="product-sku" className={labelClass}>
-              SKU *
-              <span className="flex items-center gap-2">
-                <Input
-                  id="product-sku"
-                  className={cn(inputClass, "flex-1")}
-                  value={form.sku}
-                  onChange={(event: ChangeEvent<HTMLInputElement>) => setForm({ ...form, sku: event.target.value })}
-                  placeholder="SH-001"
-                  required
-                />
-                {/*
-                  AYUDA: para quien no sabe qué SKU escribir. Propone uno a
-                  partir del nombre del producto y lo escribe en el campo. Es
-                  un evento del usuario (`type="button"` para no enviar el
-                  formulario), no un relleno automático.
-                */}
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  id="product-sku-propose"
-                  title="Genera un SKU único a partir del nombre del producto."
-                  aria-label="Generar SKU a partir del nombre del producto"
-                  onClick={proposeSkuFromName}
-                >
-                  Generar
-                </Button>
-              </span>
-              <span className="text-xs text-text-tertiary">
-                Código único en la instalación (p. ej. SH-001 para shampoo).
-              </span>
-              {skuTaken ? (
-                // ESTADO que bloquea: con un SKU ya tomado el botón Guardar
-                // queda deshabilitado, y el aviso sigue siendo el caso hasta
-                // que se corrija.
-                //
-                // `role="status"` explícito (polite): este aviso se DERIVA del
-                // formulario mientras el usuario escribe el SKU, no es el
-                // desenlace de una acción enviada. `destructive` derivaría
-                // `alert` (asertivo), y una región asertiva que interrumpe a
-                // quien está tecleando es el antipatrón de sobreanuncio. Es el
-                // mismo tratamiento que los dos avisos derivados en vivo de
-                // nómina: una clase de mensaje, una sola ARIA.
-                <Alert variant="destructive" role="status" className="text-xs">
-                  Este SKU ya existe en otro producto.
-                </Alert>
-              ) : null}
-            </Label>
+            {editingSku ? (
+              // The SKU is generated on create and immutable: shown, never editable.
+              <p className={cn(labelClass, "sm:col-span-2")}>
+                SKU
+                <span className="font-mono text-sm text-text-primary">{editingSku}</span>
+              </p>
+            ) : null}
             <Label htmlFor="product-name" className={labelClass}>
               Nombre *
               <Input
@@ -805,7 +736,7 @@ export function InventoryClient(props: InventoryClientProps) {
               <Button type="button" variant="outline" onClick={cancelEdit}>
                 Cancelar
               </Button>
-              <Button type="submit" disabled={busy || skuTaken}>
+              <Button type="submit" disabled={busy}>
                 {busy ? "Guardando…" : editingId ? "Guardar cambios" : "Crear producto"}
               </Button>
             </DialogFooter>

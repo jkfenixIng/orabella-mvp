@@ -13,7 +13,7 @@
  *   the service as a `DbQueryError` with the SQLSTATE and message unchanged.
  * - `deduct_stock_atomic` runs as `SELECT public.fn(casts...)` (integer back).
  */
-import { and, asc, eq, inArray, ne } from "drizzle-orm";
+import { and, asc, eq, ilike, inArray } from "drizzle-orm";
 import type { Database } from "@/src/shared/db/client";
 import { DbQueryError, toDbError } from "@/src/shared/db/errors";
 import { callRpc, callRpcRows } from "@/src/shared/db/rpc";
@@ -22,6 +22,7 @@ import { toPostgrestTimestamp } from "@/src/shared/db/timestamps";
 import {
   CATALOG_PAGE_RPC,
   SEARCH_PRODUCTS_RPC,
+  skuPrefixPattern,
   toProductPage,
   type InventoryRepo,
   type MovementRow,
@@ -85,13 +86,15 @@ export function drizzleInventoryRepo(db: Database): InventoryRepo {
         const [row] = await productQuery().where(eq(products.id, id)).limit(1);
         return row ? toProduct(row) : null;
       }),
-    skuConflicts: (sku, exceptId) =>
-      run(() =>
-        db
-          .select({ id: products.id })
-          .from(products)
-          .where(and(eq(products.sku, sku), exceptId ? ne(products.id, exceptId) : undefined))
-          .limit(1),
+    listSkusByPrefix: (prefix) =>
+      run(async () =>
+        (
+          await db
+            .select({ sku: products.sku })
+            .from(products)
+            .where(ilike(products.sku, skuPrefixPattern(prefix)))
+            .orderBy(asc(products.sku))
+        ).map((row) => row.sku),
       ),
     searchProducts: (needle, limit, offset = 0) =>
       run(async () => {

@@ -98,16 +98,8 @@ describe("detector de roles ad-hoc: no es un sello de goma", () => {
     expect(adHocRoles(stripComments(`/* role="status" */ // role="alert"`))).toEqual([]);
   });
 
-  it("el módulo explica el criterio en comentarios, y el stripper es quien evita el falso positivo", () => {
-    // El archivo crudo SÍ menciona el rol: está en los comentarios que explican
-    // por qué `destructive` deriva `role="alert"` y por qué el aviso del SKU
-    // pasa `role="status"`. Si el stripper dejara de funcionar, la guarda de
-    // "ningún rol ad-hoc" fallaría sola y este test documenta por qué eso sería
-    // un falso positivo, no una regresión.
-    expect(adHocRoles(CLIENT_TSX).length, "menciones en comentarios").toBeGreaterThan(1);
-    // En código queda exactamente UN rol escrito a mano: el override deliberado
-    // del SKU (test dedicado más abajo).
-    expect(adHocRoles(CLIENT_CODE)).toEqual(["role="]);
+  it("no deja roles ad-hoc en el cliente", () => {
+    expect(adHocRoles(CLIENT_CODE)).toEqual([]);
   });
 
   it("los dos archivos se leyeron de verdad (si el walk se rompe, esto falla)", () => {
@@ -119,15 +111,9 @@ describe("detector de roles ad-hoc: no es un sello de goma", () => {
     expect(PAGE_CODE).toContain("export default async function InventoryPage");
   });
 
-  it("no queda ningún rol ad-hoc, salvo el override deliberado del SKU", () => {
-    // La página servidor sigue sin un solo `role=` escrito a mano.
+  it("no queda ningún rol ad-hoc", () => {
     expect(adHocRoles(PAGE_CODE), "role= en app/inventory/page.tsx").toEqual([]);
-    // El cliente tiene UNA excepción DELIBERADA: el `role="status"` del aviso
-    // de SKU tomado, que se deriva en vivo del formulario y por eso anuncia
-    // `polite` (test dedicado más abajo). Cualquier otro `role=` sigue siendo el
-    // defecto que esta guarda caza.
-    expect(adHocRoles(CLIENT_CODE), "excepción deliberada").toEqual(["role="]);
-    expect(CLIENT_CODE).toMatch(/<Alert variant="destructive" role="status" className="text-xs">/);
+    expect(adHocRoles(CLIENT_CODE), "role= en inventory-client.tsx").toEqual([]);
   });
 });
 
@@ -193,44 +179,14 @@ describe("inventario: lo persistente va por Alert (estado)", () => {
     expect(CLIENT_CODE).not.toMatch(/errorClass/);
   });
 
-  it("'este SKU ya existe' bloquea el alta: Alert destructivo con rol polite explícito", () => {
-    // ESTADO derivado del formulario: mientras el SKU esté tomado el botón
-    // Guardar queda deshabilitado, así que el aviso sigue siendo el caso. Se
-    // calcula MIENTRAS el usuario escribe el SKU, no es el desenlace de una
-    // acción enviada, así que conserva la presentación `destructive` pero pasa
-    // `role="status"` explícito (polite). Es el mismo tratamiento que los dos
-    // avisos derivados en vivo de nómina: una clase de mensaje, una sola ARIA.
-    const sku = linesWith(CLIENT_CODE, "Este SKU ya existe en otro producto.");
-    expect(sku).toHaveLength(1);
-    expect(CLIENT_CODE).toMatch(
-      /<Alert variant="destructive" role="status" className="text-xs">\s*Este SKU ya existe en otro producto\./,
-    );
-
-    // CONTROL NEGATIVO: el override no se aplicó en bloque. Los fallos
-    // confirmados (arriba y dentro de cada modal) quedan sin rol explícito, o
-    // sea asertivos: el usuario tiene que enterarse antes de navegar. Si
-    // alguien pasara `role="status"` a todos los Alert destructivos, el conteo
-    // de abajo pasaría de 1 a 4 y fallaría.
-    expect([...CLIENT_CODE.matchAll(/<Alert variant="destructive" role="status"/g)]).toHaveLength(1);
-    for (const committed of [
-      '<Alert variant="destructive">{error}</Alert>',
-      '<Alert variant="destructive" className="sm:col-span-2">',
-    ]) {
-      const lines = linesWith(CLIENT_CODE, committed);
-      expect(lines, committed).toHaveLength(committed === '<Alert variant="destructive">{error}</Alert>' ? 1 : 2);
-      for (const line of lines) {
-        expect(line, committed).not.toContain('role="status"');
-      }
-    }
-  });
-
-  it("no se inventaron avisos: el módulo tiene exactamente cuatro Alert, todos destructivos", () => {
-    // Uno por el error de carga/guardado arriba, dos por el mismo error dentro
-    // de cada modal y uno por el SKU tomado. Si apareciera un quinto (o alguien
-    // cambiara una variante), el conteo lo delata.
-    expect(alertOpenerCount(CLIENT_CODE)).toBe(4);
-    expect([...CLIENT_CODE.matchAll(/<Alert\b/g)]).toHaveLength(4);
-    expect([...CLIENT_CODE.matchAll(/<Alert\s+variant="destructive"/g)]).toHaveLength(4);
+  it("no se inventaron avisos: el módulo tiene exactamente tres Alert, todos destructivos", () => {
+    // Uno por el error de carga/guardado arriba y dos por el mismo error dentro
+    // de cada modal (el SKU ya no se escribe, así que no hay aviso de SKU
+    // tomado). Si apareciera un cuarto (o alguien cambiara una variante), el
+    // conteo lo delata.
+    expect(alertOpenerCount(CLIENT_CODE)).toBe(3);
+    expect([...CLIENT_CODE.matchAll(/<Alert\b/g)]).toHaveLength(3);
+    expect([...CLIENT_CODE.matchAll(/<Alert\s+variant="destructive"/g)]).toHaveLength(3);
     // The fifth destructive variant is the "Sin existencias" Badge, not a message.
     expect([...CLIENT_CODE.matchAll(/<Badge\s+variant="destructive"/g)]).toHaveLength(1);
     // Ni un `warning` ni un `info` ni un `success` de `Alert` por acá: no hay
@@ -263,12 +219,13 @@ describe("inventario: el texto visible no cambió (cambia el canal, no la copia)
       "Producto actualizado.",
       "Producto creado.",
       "Movimiento registrado. Stock actual:",
-      "Este SKU ya existe en otro producto.",
+
       "Sin productos para esta búsqueda.",
       "Sin coincidencias.",
       "Sin movimientos registrados.",
       "Buscar por nombre o SKU",
-      "Código único en la instalación (p. ej. SH-001 para shampoo).",
+       "el SKU se genera automáticamente.",
+
     ]) {
       expect(CLIENT_CODE, `cliente: ${text}`).toContain(text);
     }

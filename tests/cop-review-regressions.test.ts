@@ -15,7 +15,7 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
   createAdminClient: () => ({
     from() {
       const query: Record<string, unknown> = {};
-      for (const method of ["select", "order", "limit", "upsert", "eq", "neq", "update", "maybeSingle"]) {
+      for (const method of ["select", "order", "limit", "range", "ilike", "upsert", "eq", "neq", "update", "maybeSingle"]) {
         query[method] = () => query;
       }
       query.single = () => Promise.resolve({ data: null, error: repo.error });
@@ -188,7 +188,7 @@ describe("COP_WHOLE_PESO_REQUIRED becomes a 400 on catalog writes", () => {
   it("upsertProduct maps the 005 rejection to VALIDATION 400", async () => {
     const { upsertProduct } = await import("@/src/features/inventory/service");
     repo.error = COP_ERROR;
-    await expect(upsertProduct({ sku: "X-1", name: "Shampoo", min_stock: 0, sale_price: 10 }))
+    await expect(upsertProduct({ name: "Shampoo", min_stock: 0, sale_price: 10 }))
       .rejects.toMatchObject({ code: "VALIDATION", status: 400 });
   });
 });

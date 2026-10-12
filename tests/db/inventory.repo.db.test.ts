@@ -102,8 +102,14 @@ describe("inventory repository: equivalence supabase-js ↔ drizzle", () => {
     await same((repo) => repo.findProduct("00000000-0000-4000-8000-0000000000ff"));
     await same((repo) => repo.activeByStock(200));
     await same((repo) => repo.productStocks([P1, P2]));
-    await same((repo) => repo.skuConflicts("SKU-1"));
-    await same((repo) => repo.skuConflicts("SKU-1", P1));
+  });
+
+  it("SKU lookup is scoped to `PREFIX-`, case-insensitive, ordered by sku, and wildcards stay literal", async () => {
+    await Promise.all([left, right].map((pg) => pg.query(`INSERT INTO public.products (sku, name) VALUES ('sku-9', 'Lower'), ('SKUX-1', 'Other')`)));
+    const skus = async (prefix: string) => ((await same((repo) => repo.listSkusByPrefix(prefix))) as { value: string[] }).value;
+    expect(await skus("SKU")).toEqual(["SKU-1", "SKU-2", "sku-9"]);
+    expect(await skus("S_U")).toEqual([]);
+    expect(await skus("%")).toEqual([]);
   });
 
   it.each<[string, string[]]>([

@@ -729,7 +729,7 @@ describe("inventario: la acción primaria de «Crear producto» se alcanza sin s
     // movimiento declara otro `onSubmit` y sus campos son otros. Se afirma por
     // el CAMPO, no por la posición en el archivo (el handler del movimiento se
     // declara antes que el formulario de producto).
-    expect(CODIGO.slice(D.formulario.inicio, D.formulario.fin)).toContain('id="product-sku"');
+    expect(CODIGO.slice(D.formulario.inicio, D.formulario.fin)).toContain('id="product-name"');
     expect(CODIGO.slice(D.formulario.inicio, D.formulario.fin)).not.toContain(
       "handleMovementSubmit",
     );
