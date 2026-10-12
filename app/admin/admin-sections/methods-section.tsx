@@ -7,6 +7,7 @@ import type { PaymentMethodRow } from "@/src/features/admin/service";
 import type { ArqueoMode } from "@/src/features/admin/schemas";
 import { EmptyState } from "@/src/components/ui/lib/empty-state";
 import { FormDialog } from "@/src/components/ui/lib/form-dialog";
+import { ListToolbar } from "@/src/components/ui/lib/list-toolbar";
 import {
   buttonClass,
   inputClass,
@@ -17,7 +18,13 @@ import {
   sectionTitleClass,
   stackClass,
 } from "../admin-styles";
-import type { ActionResult } from "../admin-shared";
+import {
+  ACTIVE_STATUS_OPTIONS,
+  matchesActiveStatus,
+  matchesQuery,
+  type ActionResult,
+  type ActiveStatusFilter,
+} from "../admin-shared";
 
 const ARQUEO_MODE_LABEL: Record<ArqueoMode, string> = {
   none: "Sin arqueo",
@@ -44,6 +51,12 @@ export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [query, setQuery] = useState("");
+  const [status, setStatus] = useState<ActiveStatusFilter>("all");
+
+  const visibleRows = rows.filter(
+    (row) => matchesActiveStatus(row.is_active, status) && matchesQuery(query, [row.name, ARQUEO_MODE_LABEL[row.arqueo_mode]]),
+  );
 
   function openCreate() {
     setEditingId(null);
@@ -94,18 +107,37 @@ export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
     <div className={stackClass}>
       <section className={sectionClass} aria-label="Listado de métodos de pago">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className={sectionTitleClass}>Métodos de pago ({rows.length})</h2>
+          <h2 className={sectionTitleClass}>Métodos de pago ({visibleRows.length})</h2>
           <button type="button" onClick={openCreate} className={buttonClass}>
             Nuevo método
           </button>
         </div>
-        {rows.length === 0 ? (
+        {rows.length > 0 ? (
+          <ListToolbar
+            className="mt-3"
+            aria-label="Filtrar métodos de pago"
+            searchId="admin-payment-methods-search"
+            searchLabel="Buscar"
+            searchValue={query}
+            searchPlaceholder="Nombre o arqueo"
+            onSearchChange={setQuery}
+            statusLabel="Estado"
+            statusValue={status}
+            statusOptions={ACTIVE_STATUS_OPTIONS}
+            onStatusChange={(value) => setStatus(value as ActiveStatusFilter)}
+            onClear={() => {
+              setQuery("");
+              setStatus("all");
+            }}
+          />
+        ) : null}
+        {visibleRows.length === 0 ? (
           <EmptyState className="mt-2">
-            Aún no hay métodos de pago configurados en esta sede.
+            {rows.length === 0 ? "Aún no hay métodos de pago configurados en esta sede." : "Sin resultados para ese filtro."}
           </EmptyState>
         ) : (
           <ul className="mt-2 flex flex-col gap-2">
-            {rows.map((row) => (
+            {visibleRows.map((row) => (
               <li key={row.id} className={`${listItemClass} justify-between`}>
                 <span>
                   <strong>{row.name}</strong> · {row.is_active ? "activo" : "inactivo"} ·{" "}
@@ -155,7 +187,7 @@ export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
                 })
               }
             />
-            Activo (solo activos aceptan cobros)
+            Activo (acepta cobros)
           </label>
           <label className={labelClass}>
             Arqueo en caja

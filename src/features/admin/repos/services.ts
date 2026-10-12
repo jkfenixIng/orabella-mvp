@@ -34,9 +34,22 @@ export interface ServiceWrite {
   is_active?: boolean;
 }
 
+export interface ServicePage {
+  rows: ServiceRow[];
+  total: number;
+}
+
+export interface ServicePageQuery {
+  query: string;
+  active?: boolean;
+  limit: number;
+  offset: number;
+}
+
 export interface ServicesRepo {
   /** Services ordered by name; `limit` is already clamped by the caller. */
   list(limit: number): Promise<ServiceRow[]>;
+  listPage(query: ServicePageQuery): Promise<ServicePage>;
   /** Insert or update by id; `null` when no row came back. */
   upsert(write: ServiceWrite): Promise<ServiceRow | null>;
 }
@@ -46,8 +59,33 @@ export interface ServicesRepo {
 const SERVICE_SELECT =
   "id, name, description, price, duracion_min, duracion_max, is_active";
 
+/** LIKE pattern with `\`, `%` and `_` escaped, so the needle is literal text. */
+export function containsPattern(needle: string): string {
+  return `%${needle.replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
+}
+
+/** A PostgREST double-quoted value: commas and parentheses stay data. */
+function quotePostgrest(value: string): string {
+  return `"${value.replace(/[\\"]/g, (char) => `\\${char}`)}"`;
+}
+
 export function supabaseServicesRepo(db: SupabaseClient): ServicesRepo {
   return {
+    async listPage({ query, active, limit, offset }) {
+      let request = db.from("services").select(SERVICE_SELECT, { count: "exact" });
+      const needle = query.trim();
+      if (needle !== "") {
+        const pattern = quotePostgrest(containsPattern(needle));
+        request = request.or(`name.ilike.${pattern},description.ilike.${pattern}`);
+      }
+      if (active !== undefined) request = request.eq("is_active", active);
+      const { data, error, count } = await request
+        .order("name")
+        .order("id")
+        .range(offset, offset + limit - 1);
+      if (error) throw new DbQueryError(toDbError(error));
+      return { rows: (data ?? []) as ServiceRow[], total: count ?? 0 };
+    },
     async list(limit) {
       const { data, error } = await db
         .from("services")

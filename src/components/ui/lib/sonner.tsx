@@ -62,7 +62,7 @@ const Toaster = ({ ...props }: ToasterProps) => {
         },
       }}
       richColors
-      className="toaster group"
+      className="pointer-events-auto toaster group"
       icons={{
         success: <CircleCheck className="size-4" />,
         info: <Info className="size-4" />,

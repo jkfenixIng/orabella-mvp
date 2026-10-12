@@ -107,15 +107,15 @@ const CONVERTED: Array<{
 }> = [
   {
     path: "app/invoices/invoices-client.tsx",
-    badges: 7,
+    badges: 8,
     variants: new Map([
       ["dynamic:invoiceStatusVariant", 2],
-      ["static:default", 1],
+      ["static:default", 2],
       ["static:secondary", 1],
       ["static:success", 2],
       ["static:warning", 1],
     ]),
-    note: "Ambos estados de factura + Borrador + Comisión + Sin comisión + recargo + Total inmutable.",
+    note: "Ambos estados de factura + Borrador + Comisión + Sin comisión + recargo + Total inmutable + contador de Más filtros.",
   },
   {
     path: "app/payroll/payroll-client.tsx",

@@ -152,6 +152,13 @@ describe("`ConfirmDialog`", () => {
   it("explica qué se pierde: lleva `DialogDescription` obligatoria", () => {
     expect(CONFIRM_BODY).toContain("<DialogDescription>");
   });
+
+  it("mantiene el error dentro de la confirmación abierta", () => {
+    expect(SOURCE).toContain("error?: string | null");
+    expect(CONFIRM_BODY).toMatch(/\{error \? \(\s*<Alert variant="destructive"/);
+    expect(CONFIRM_BODY.indexOf("<DialogHeader>")).toBeLessThan(CONFIRM_BODY.indexOf("{error ? ("));
+    expect(CONFIRM_BODY.indexOf("{error ? (")).toBeLessThan(CONFIRM_BODY.indexOf("<DialogFooter"));
+  });
 });
 
 describe("`FormDialog`", () => {

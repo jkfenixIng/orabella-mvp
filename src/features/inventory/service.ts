@@ -7,10 +7,12 @@ import {
   planStockDeduction,
   productSchema,
   sortKardexAscending,
+  stockFilterSchema,
   type DeductionLine,
   type MovementInput,
   type PlannedDeduction,
   type ProductInput,
+  type StockFilter,
 } from "./schemas";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { getSessionUser } from "@/src/features/auth/service";
@@ -22,10 +24,11 @@ import {
   inventoryRepo,
   type InventoryRepo,
   type MovementRow,
+  type ProductPage,
   type ProductRow,
 } from "./repos/inventory";
 
-export type { MovementRow, ProductRow } from "./repos/inventory";
+export type { MovementRow, ProductPage, ProductRow } from "./repos/inventory";
 
 export class InventoryError extends Error {
   readonly code: string;
@@ -192,6 +195,31 @@ export async function searchProducts(q: string, limit?: number): Promise<Product
   const needle = q.trim();
   if (needle === "") return listProducts(limit);
   return read((db) => db.searchProducts(needle, clampLimit(limit)));
+}
+
+export interface ProductCatalogPageInput {
+  query?: string;
+  stockFilter?: StockFilter;
+  page?: number;
+  limit?: number;
+}
+
+/**
+ * Server-side inventory catalog: literal name/SKU query, stock status and
+ * pagination are evaluated by migration 010's RPC. The total describes the
+ * same filtered relation as `rows`, never a client-side approximation.
+ */
+export async function getProductCatalogPage(input: ProductCatalogPageInput = {}): Promise<ProductPage> {
+  const limit = clampLimit(input.limit, 15, 50);
+  const page = Number.isFinite(input.page) ? Math.max(0, Math.floor(input.page ?? 0)) : 0;
+  const filter = stockFilterSchema.safeParse(input.stockFilter ?? "all");
+  if (!filter.success) throw new InventoryError("VALIDATION", "Filtro de stock inválido.", 400);
+  return read((db) => db.catalogPage({
+    query: input.query?.trim() ?? "",
+    stockFilter: filter.data,
+    limit,
+    offset: page * limit,
+  }));
 }
 
 /** INV-04: productos con stock en o bajo el mínimo (alerta visible, máx. 200). */

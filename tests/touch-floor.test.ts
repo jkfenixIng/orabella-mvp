@@ -1408,20 +1408,20 @@ describe("control negativo: la guarda de los controles chicos acusa lo que no cu
     // sobre esa copia, no estaría probando nada.
     const antes = INVOICES
       .replace(
-        "bg-slate-900 px-2 py-1 text-xs font-semibold text-white max-sm:min-h-11",
-        "bg-slate-900 px-2 py-1 text-[10px] font-semibold text-white",
+        "bg-primary-600 px-2 py-1 text-xs font-semibold text-white max-sm:min-h-11",
+        "bg-primary-600 px-2 py-1 text-[10px] font-semibold text-white",
       )
       .replace(
-        "bg-white px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 max-sm:min-h-11",
-        "bg-white px-2 py-1 text-[10px] font-medium text-slate-700 hover:bg-slate-100",
+        "bg-surface px-2 py-1 text-xs font-medium text-text-secondary hover:bg-surface-hover max-sm:min-h-11",
+        "bg-surface px-2 py-1 text-[10px] font-medium text-text-secondary hover:bg-surface-hover",
       )
-      .replace(/"text-xs text-paper-ink-muted"/g, '"text-[10px] text-paper-ink-muted"');
+      .replace(/"text-xs text-text-secondary"/g, '"text-[10px] text-text-secondary"');
     expect(antes, "la mutación tiene que cambiar el fuente").not.toBe(INVOICES);
     const bajoPiso = clasesDeclaradas(antes).filter((clase) => cajaDe(clase, 320).fuente < 12);
     expect(bajoPiso, "listas bajo el piso").toEqual([
-      "bg-slate-900 px-2 py-1 text-[10px] font-semibold text-white",
-      "bg-white px-2 py-1 text-[10px] font-medium text-slate-700 hover:bg-slate-100",
-      "text-[10px] text-paper-ink-muted",
+      "bg-primary-600 px-2 py-1 text-[10px] font-semibold text-white",
+      "bg-surface px-2 py-1 text-[10px] font-medium text-text-secondary hover:bg-surface-hover",
+      "text-[10px] text-text-secondary",
     ]);
   });
 

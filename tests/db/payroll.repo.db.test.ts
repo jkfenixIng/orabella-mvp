@@ -173,6 +173,17 @@ describe("payroll repository: reads", () => {
     await same((repo) => repo.overlappingPeriods(DRAFT, "2026-08-20", "2026-09-02"));
   });
 
+  it("period list: server filters, offset window and exact count match on both engines", async () => {
+    const page = data(await same((repo) => repo.listPeriods<Record<string, unknown>>({ status: "cerrado" }, { offset: 1, limit: 1 })));
+    expect(page.map((row) => row.id)).toEqual([ORIGIN]);
+    expect((await same((repo) => repo.countPeriods({ status: "cerrado" }))).count).toBe(2);
+    expect((await same((repo) => repo.countPeriods({ frequency: null }))).count).toBe(2);
+    expect((await same((repo) => repo.countPeriods({ frequency: "quincenal", from: "2026-08-01", to: "2026-08-31" }))).count).toBe(1);
+    expect((await same((repo) => repo.countPeriods({ day: "2026-09-10" }))).count).toBe(1);
+    const term = data(await same((repo) => repo.listPeriods<Record<string, unknown>>({ term: "quin" }, { offset: 0, limit: 10 })));
+    expect(term.map((row) => row.id)).toEqual([ORIGIN]);
+  });
+
   it("items: numeric money as numbers and jsonb detail parsed, both orders and employee filter", async () => {
     const items = data(await same((repo) => repo.periodItemsPage<Record<string, unknown>>(DRAFT, 0, 99)));
     expect(items.map((row) => row.id)).toEqual([ITEM, ITEM2]);

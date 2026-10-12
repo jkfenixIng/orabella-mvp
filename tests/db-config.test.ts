@@ -63,7 +63,7 @@ describe("servicesRepo selector", () => {
     vi.stubEnv("DB_ENGINE", "");
     const { servicesRepo } = await import("@/src/features/admin/repos/services");
     const repo = await servicesRepo();
-    expect(Object.keys(repo).sort()).toEqual(["list", "upsert"]);
+    expect(Object.keys(repo).sort()).toEqual(["list", "listPage", "upsert"]);
     expect(Object.keys(globalThis)).not.toContain("__orabellaDb");
   });
 

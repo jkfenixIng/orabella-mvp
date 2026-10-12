@@ -945,29 +945,20 @@ export function periodCadenceTabKey(filter: PeriodCadenceFilter): string {
 }
 
 /**
- * F4: true cuando el empleado NO pertenece a este período por cadencia: las
- * DOS están definidas y DIFIEREN. La regla del dueño (2026-10-01) lo excluye
- * ENTERO del período —sin fijo y sin comisiones, con sus facturas fuera de la
- * ventana— porque lo paga su propio ciclo.
+ * Un período con cadencia sólo liquida empleados de esa MISMA cadencia. Un
+ * legajo sin cadencia (o con un valor inválido) no entra en ningún período
+ * regular: se liquida exclusivamente mediante pagos extraordinarios.
  *
- * Si CUALQUIERA de las dos cadencias faltan (NULL = "sin cadencia definida") el
- * predicado es false y rige el comportamiento de hoy: prorrateo por días más
- * comisiones. Es deliberado que la comparación use las cadencias NORMALIZADAS
- * (un valor fuera del catálogo es ausencia, no una cadencia distinta).
- *
- * Puro para probarlo sin base de datos.
+ * Los períodos heredados sin cadencia no se reinterpretan: conservan su planta
+ * original para que leerlos o corregirlos no borre liquidaciones ya firmadas.
  */
 export function periodExcludesEmployeeByCadence(args: {
   employeeFrequency: string | null | undefined;
   periodFrequency: string | null | undefined;
 }): boolean {
-  const employeeFrequency = normalizePayFrequency(args.employeeFrequency);
   const periodFrequency = normalizePayFrequency(args.periodFrequency);
-  return (
-    employeeFrequency !== null &&
-    periodFrequency !== null &&
-    employeeFrequency !== periodFrequency
-  );
+  if (periodFrequency === null) return false;
+  return normalizePayFrequency(args.employeeFrequency) !== periodFrequency;
 }
 
 /**
@@ -2653,6 +2644,7 @@ export interface PayrollItemTotals {
 /** Un período dentro del mes de un empleado ("contra qué" se le pagó). */
 export interface PayrollMonthPeriodEntry {
   periodId: string;
+  itemId: string;
   start_date: string;
   end_date: string;
   status: string;
@@ -2999,6 +2991,7 @@ export function buildPayrollMonthToDate(args: {
     } else {
       byPeriod.set(period.id, {
         periodId: period.id,
+        itemId: item.id,
         start_date: period.start_date,
         end_date: period.end_date,
         status: period.status,

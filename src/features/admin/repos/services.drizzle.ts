@@ -6,11 +6,11 @@
  * `import()` only when DB_ENGINE=postgres. The database instance is injected,
  * so the tests run it against PGlite.
  */
-import { asc, sql } from "drizzle-orm";
+import { and, asc, count, eq, ilike, or, sql } from "drizzle-orm";
 import { DbQueryError, toDbError } from "@/src/shared/db/errors";
 import { services } from "@/src/shared/db/schema/services";
 import type { Database } from "@/src/shared/db/client";
-import type { ServiceRow, ServicesRepo, ServiceWrite } from "./services";
+import { containsPattern, type ServiceRow, type ServicesRepo, type ServiceWrite } from "./services";
 
 /** Same columns, same names and same JS types as SERVICE_SELECT over PostgREST. */
 const SERVICE_COLUMNS = {
@@ -53,6 +53,29 @@ const EXCLUDED: Record<keyof Omit<ServiceWrite, "id">, ReturnType<typeof sql.raw
 
 export function drizzleServicesRepo(db: Database): ServicesRepo {
   return {
+    async listPage({ query, active, limit, offset }) {
+      const needle = query.trim();
+      const pattern = containsPattern(needle);
+      const where = and(
+        needle === "" ? undefined : or(ilike(services.name, pattern), ilike(services.description, pattern)),
+        active === undefined ? undefined : eq(services.isActive, active),
+      );
+      try {
+        const [rows, [{ total }]] = await Promise.all([
+          db
+            .select(SERVICE_COLUMNS)
+            .from(services)
+            .where(where)
+            .orderBy(asc(services.name), asc(services.id))
+            .limit(limit)
+            .offset(offset),
+          db.select({ total: count() }).from(services).where(where),
+        ]);
+        return { rows: rows.map(toServiceRow), total: Number(total) };
+      } catch (error) {
+        throw new DbQueryError(toDbError(error));
+      }
+    },
     async list(limit) {
       try {
         const rows = await db

@@ -310,7 +310,7 @@ describe("vales: lo persistente va por Alert (estado)", () => {
     );
     const lines = linesWith(VALES_CLIENT_CODE, "Elija el empleado e indique un monto mayor a 0.");
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatch(/setError\(/);
+    expect(lines[0]).toMatch(/setCreateError\(/);
   });
 
   it("'sin configurar' y 'sin caja' bloquean la solicitud: Alert de aviso, no de error", () => {

@@ -3,6 +3,7 @@ import {
   normalizeEmployeeCode,
   paymentMethodCodeForName,
   paymentMethodSchema,
+  servicePageSchema,
   serviceSchema,
   setUserRolesSchema,
   taxConfigSchema,
@@ -377,6 +378,23 @@ async function fetchServices(limit?: number): Promise<ServiceRow[]> {
   const repo = await servicesRepo();
   try {
     return await repo.list(clampLimit(limit));
+  } catch {
+    throw new AdminError("INTERNAL", "Error interno.", 500);
+  }
+}
+
+export interface ServicePage {
+  rows: ServiceRow[];
+  total: number;
+}
+
+/** Paginated catalog search, deliberately uncached because its filters vary per request. */
+export async function listServicesPage(raw: unknown): Promise<ServicePage> {
+  const parsed = servicePageSchema.safeParse(raw);
+  if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
+  const repo = await servicesRepo();
+  try {
+    return await repo.listPage(parsed.data);
   } catch {
     throw new AdminError("INTERNAL", "Error interno.", 500);
   }

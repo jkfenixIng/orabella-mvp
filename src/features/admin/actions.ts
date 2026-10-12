@@ -10,6 +10,7 @@ import {
   listPaymentMethods,
   listSedeUsers,
   listServices,
+  listServicesPage,
   listTaxes,
   requireAdminSession,
   requireSession,
@@ -82,6 +83,19 @@ export async function listServicesAction() {
   try {
     await requireSession(await sessionToken());
     return { success: true as const, data: await listServices() };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Búsqueda paginada de servicios para usuarios admin y caja. */
+export async function listServicesPageAction(input: unknown) {
+  try {
+    const session = await requireSession(await sessionToken());
+    if (!session.roles.some((role) => role === "admin" || role === "caja")) {
+      throw new AdminError("FORBIDDEN", "No tiene permiso para consultar servicios.", 403);
+    }
+    return { success: true as const, data: await listServicesPage(input) };
   } catch (error) {
     return toFailure(error);
   }

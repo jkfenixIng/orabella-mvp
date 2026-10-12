@@ -7,6 +7,7 @@ import {
   assertPortionsMatchNet,
   buildEmployeeCommissionDetail,
   buildEmployeeDetail,
+  detailLineCommissionOrigin,
   buildPayrollCorrectionView,
   buildPayrollMonthToDate,
   cadenceAnchorFromDeclaration,
@@ -35,6 +36,7 @@ import {
   payFrequencySchema,
   payrollCycleRange,
   payrollExtraSchema,
+  payrollStatusSchema,
   pendingPayrollSettlements,
   rangesOverlap,
   requestVoucherSchema,
@@ -77,7 +79,7 @@ import {
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { DbQueryError } from "@/src/shared/db/errors";
 import { COP_WHOLE_PESO_MESSAGE, copValidationError } from "@/src/shared/money/cop";
-import type { PayrollRepo } from "./repos/payroll";
+import type { PayrollPeriodQuery, PayrollRepo } from "./repos/payroll";
 import { planIncomingCarries, settlePayrollCarries, type CarryRow } from "./carries";
 import { bogotaDay, rangeBounds } from "@/src/shared/lib/dates";
 import {
@@ -889,6 +891,96 @@ export async function openPayrollPeriod(
  * con la misma fecha de inicio pueden caer en páginas distintas y repetirse o
  * perderse.
  */
+
+/** Server response for one visible period-table page. */
+export interface PayrollPeriodList {
+  rows: PayrollPeriodRow[];
+  total: number;
+}
+
+/** Rows per page of every payroll list (periods and Pagos del mes). */
+export const PAYROLL_LIST_PAGE_SIZE = 10;
+const PAYROLL_LIST_MAX_PAGE_SIZE = 50;
+/** Free-text search: letters, digits, spaces, dot and hyphen (safe inside a quoted PostgREST value). */
+const PAYROLL_PERIOD_SEARCH_PATTERN = /^[\p{L}\p{N} .-]{1,80}$/u;
+const PAYROLL_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Validated page window; malformed input is a VALIDATION error, never a silent default. */
+function payrollPageWindow(value: Record<string, unknown>): { offset: number; limit: number } {
+  const page = value.page ?? 0;
+  const limit = value.limit ?? PAYROLL_LIST_PAGE_SIZE;
+  if (typeof page !== "number" || !Number.isInteger(page) || page < 0) {
+    throw new PayrollError("VALIDATION", "Página inválida.", 400);
+  }
+  if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > PAYROLL_LIST_MAX_PAGE_SIZE) {
+    throw new PayrollError("VALIDATION", "Tamaño de página inválido.", 400);
+  }
+  return { offset: page * limit, limit };
+}
+
+function payrollPeriodQuery(input: unknown): { filters: PayrollPeriodQuery; offset: number; limit: number } {
+  const value = (input ?? {}) as Record<string, unknown>;
+  const filters: PayrollPeriodQuery = {};
+  const status = value.status ?? "";
+  if (status !== "") {
+    if (!payrollStatusSchema.safeParse(status).success) throw new PayrollError("VALIDATION", "Estado inválido.", 400);
+    filters.status = status as string;
+  }
+  const cadence = value.frequency ?? "todas";
+  if (cadence === "sin-cadencia") filters.frequency = null;
+  else if (cadence !== "todas") {
+    if (!payFrequencySchema.safeParse(cadence).success) throw new PayrollError("VALIDATION", "Cadencia inválida.", 400);
+    filters.frequency = cadence as string;
+  }
+  const month = value.month ?? "";
+  if (month !== "") {
+    if (typeof month !== "string" || !PAYROLL_MONTH_PATTERN.test(month)) {
+      throw new PayrollError("VALIDATION", "Mes inválido (use yyyy-mm).", 400);
+    }
+    const bounds = monthDays(month);
+    filters.from = bounds.first;
+    filters.to = bounds.last;
+  }
+  const search = typeof value.search === "string" ? value.search.trim() : "";
+  if (search !== "") {
+    if (PAYROLL_DAY_PATTERN.test(search) && utcDayOf(search) !== null) filters.day = search;
+    else if (PAYROLL_PERIOD_SEARCH_PATTERN.test(search)) filters.term = search.toLocaleLowerCase();
+    else throw new PayrollError("VALIDATION", "Búsqueda inválida: use letras, números o una fecha aaaa-mm-dd.", 400);
+  }
+  return { filters, ...payrollPageWindow(value) };
+}
+
+/** First and last civil day of a validated `yyyy-mm`. */
+function monthDays(month: string): { first: string; last: string } {
+  const [year, monthNumber] = month.split("-").map(Number);
+  const lastDay = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+  return { first: `${month}-01`, last: `${month}-${String(lastDay).padStart(2, "0")}` };
+}
+
+function utcDayOf(day: string): number | null {
+  const time = Date.parse(`${day}T00:00:00Z`);
+  return Number.isNaN(time) || new Date(time).toISOString().slice(0, 10) !== day ? null : time;
+}
+
+/** Server-side period list: the UI receives only its requested window and exact total. */
+export async function listPayrollPeriods(input: unknown = {}): Promise<PayrollPeriodList> {
+  try {
+    const { filters, offset, limit } = payrollPeriodQuery(input);
+    const db = await payrollDb();
+    const [rows, count] = await Promise.all([
+      db.listPeriods<PayrollPeriodRow>(filters, { offset, limit }),
+      db.countPeriods(filters),
+    ]);
+    if (rows.error || count.error || rows.data === null || count.count === null) {
+      throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
+    return { rows: rows.data, total: count.count };
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
+/** Exhaustive domain read; list UI must use `listPayrollPeriods` instead. */
 export async function listPeriods(): Promise<PayrollPeriodRow[]> {
   try {
     const db = await payrollDb();
@@ -939,6 +1031,10 @@ async function getPeriodOrThrow(db: DbClient, id: string): Promise<PayrollPeriod
   return data as PayrollPeriodRow;
 }
 
+export interface PayrollItemPaymentDetail extends PayrollPaymentRow {
+  paid_by_name: string | null;
+}
+
 export interface PeriodDetail {
   period: PayrollPeriodRow;
   items: Array<
@@ -952,6 +1048,7 @@ export interface PeriodDetail {
        * mostrar la deuda de otro empleado.
        */
       pending_debt: number;
+      payments: PayrollItemPaymentDetail[];
     }
   >;
 }
@@ -982,26 +1079,30 @@ export async function getPeriodDetail(id: string): Promise<PeriodDetail> {
       table: "payroll_items",
       fetchPage: (from, to) => db.periodItemsPage<PayrollItemRow>(id, from, to),
     });
-    let paidByItem = new Map<string, number>();
+    const paidByItem = new Map<string, number>();
+    const paymentsByItem = new Map<string, PayrollItemPaymentDetail[]>();
     if (rows.length > 0) {
-      // U7: los ids van en lotes del tamaño que aguanta la URL (una lista sin
-      // tope termina en 414 y la lectura no ocurre) y cada lote se pagina hasta
-      // agotar, con `order("id")` para que dos corridas lean lo mismo.
-      paidByItem = new Map();
+      const payments: PayrollPaymentRow[] = [];
       for (const chunk of chunkIds(rows.map((row) => row.id))) {
-        const payments = await readAllPayroll<{ payroll_item_id: string; amount: number | string }>({
+        payments.push(...(await readAllPayroll<PayrollPaymentRow>({
           log: "getPeriodDetail",
           what: "pagos del período",
           meta: { periodId: id, items: rows.length, ids: chunk.length },
           table: "payroll_payments",
-          fetchPage: (from, to) => db.paymentAmountsPage(chunk, from, to),
-        });
-        for (const row of payments) {
-          paidByItem.set(
-            row.payroll_item_id,
-            roundMoney((paidByItem.get(row.payroll_item_id) ?? 0) + Number(row.amount)),
-          );
-        }
+          fetchPage: (from, to) => db.paymentDetailsPage<PayrollPaymentRow>(chunk, from, to),
+        })));
+      }
+      const payerIds = [...new Set(payments.map((payment) => payment.paid_by).filter((payer): payer is string => payer !== null))];
+      const payerNames = new Map<string, string | null>();
+      if (payerIds.length > 0) {
+        const { data, error } = await db.userNames(payerIds);
+        if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+        for (const payer of data ?? []) payerNames.set(payer.id, payer.full_name ?? null);
+      }
+      for (const payment of payments) {
+        paidByItem.set(payment.payroll_item_id, roundMoney((paidByItem.get(payment.payroll_item_id) ?? 0) + Number(payment.amount)));
+        const detailed = { ...payment, amount: roundMoney(Number(payment.amount)), paid_by_name: payment.paid_by ? payerNames.get(payment.paid_by) ?? null : null };
+        paymentsByItem.set(payment.payroll_item_id, [...(paymentsByItem.get(payment.payroll_item_id) ?? []), detailed]);
       }
     }
     // NV-01: la deuda PENDIENTE que ESTE período produjo (el sobrante de vales
@@ -1034,6 +1135,7 @@ export async function getPeriodDetail(id: string): Promise<PeriodDetail> {
           paid,
           remaining: roundMoney(Math.max(0, Number(item.net_pay) - paid)),
           pending_debt: pendingDebtByEmployee.get(item.employee_id) ?? 0,
+          payments: paymentsByItem.get(item.id) ?? [],
         };
       }),
     };
@@ -1063,6 +1165,8 @@ export interface PayrollSettlementInvoice {
   consecutive_number: number | null;
   /** Comisión de ESTA liquidación por la factura (suma de todas sus líneas). */
   commission: number;
+  fixed_commission: number;
+  percent_commission: number;
 }
 
 /**
@@ -1094,11 +1198,18 @@ export interface PayrollSettlementVoucher {
  * leen con la MISMA forma que el cálculo (sede + `request_date` en el rango +
  * el alcance de estados que descuenta), acotados por empleado.
  */
-export interface PayrollSettlementSources {
-  invoices: PayrollSettlementInvoice[];
-  adjustment: PayrollSettlementAdjustment | null;
-  vouchers: PayrollSettlementVoucher[];
-}
+export type PayrollSettlementSourceKind = "invoices" | "vouchers";
+
+export type PayrollSettlementSources =
+  | {
+      kind: "invoices";
+      invoices: PayrollSettlementInvoice[];
+      adjustment: PayrollSettlementAdjustment | null;
+    }
+  | {
+      kind: "vouchers";
+      vouchers: PayrollSettlementVoucher[];
+    };
 
 /**
  * F6: agrupa el `detail_json` de UN ítem por factura y separa el ajuste del
@@ -1128,8 +1239,16 @@ export function groupSettlementInvoices(detail: readonly DetailLine[]): {
       invoice_id: line.invoice_id,
       consecutive_number: line.consecutive_number ?? null,
       commission: 0,
+      fixed_commission: 0,
+      percent_commission: 0,
     };
-    current.commission = roundMoney(current.commission + Number(line.commission));
+    const commission = Number(line.commission);
+    current.commission = roundMoney(current.commission + commission);
+    if (detailLineCommissionOrigin(line) === "percent") {
+      current.percent_commission = roundMoney(current.percent_commission + commission);
+    } else {
+      current.fixed_commission = roundMoney(current.fixed_commission + commission);
+    }
     byInvoice.set(line.invoice_id, current);
   }
   return {
@@ -1155,10 +1274,14 @@ export function groupSettlementInvoices(detail: readonly DetailLine[]): {
  *
  * Las dos lecturas son exhaustivas (`readAllPayroll`): una lectura recortada
  * mostraría menos facturas o menos vales que los que la liquidación tiene.
+ *
+ * `kind` elige UNA fuente: la pantalla carga facturas y vales por separado, a
+ * pedido, y una lectura nunca trae la otra.
  */
 export async function getPayrollSettlementSources(
   periodId: string,
   employeeId: string,
+  kind: PayrollSettlementSourceKind,
 ): Promise<PayrollSettlementSources> {
   try {
     const db = await payrollDb();
@@ -1170,10 +1293,11 @@ export async function getPayrollSettlementSources(
       table: "payroll_items",
       fetchPage: (from, to) => db.employeeItemDetailPage(periodId, employeeId, from, to),
     });
-    if (items.length === 0) {
-      return { invoices: [], adjustment: null, vouchers: [] };
+    if (kind === "invoices") {
+      const grouped = groupSettlementInvoices(items[0]?.detail_json ?? []);
+      return { kind, invoices: grouped.invoices, adjustment: grouped.adjustment };
     }
-    const grouped = groupSettlementInvoices(items[0].detail_json ?? []);
+    if (items.length === 0) return { kind, vouchers: [] };
     // Misma forma que el cálculo (`voucherStatusesForScope("vigentes_y_descontados")`:
     // pendiente/aprobada/descontada): un vale ya descontado por este período
     // sigue siendo parte de la liquidación y tiene que verse.
@@ -1198,8 +1322,7 @@ export async function getPayrollSettlementSources(
         ),
     });
     return {
-      invoices: grouped.invoices,
-      adjustment: grouped.adjustment,
+      kind,
       vouchers: voucherRows.map((row) => ({
         id: row.id,
         request_date: row.request_date,
@@ -1452,16 +1575,48 @@ export async function listPayrollMonthOptions(): Promise<string[]> {
   }
 }
 
+/** One roster read: employees whose name, code or document contains the term. */
+async function employeeIdsMatching(search: string): Promise<Set<string>> {
+  const term = search.toLocaleLowerCase();
+  const roster = await listAllEmployees();
+  return new Set(
+    roster
+      .filter((row) =>
+        [row.full_name, row.employee_code, row.document].some((value) => (value ?? "").toLocaleLowerCase().includes(term)),
+      )
+      .map((row) => row.id),
+  );
+}
+
+export interface PayrollMonthRowsList {
+  rows: PayrollMonthEmployeeRow[];
+  total: number;
+}
+
+/** Server-side page of closed/paid monthly rows. */
 export async function listPayrollMonthRows(args: {
   month: string;
-  employeeId: string;
-}): Promise<PayrollMonthEmployeeRow[]> {
+  employeeId?: string;
+  search?: string;
+  page?: number;
+  limit?: number;
+}): Promise<PayrollMonthRowsList> {
   try {
-    if (!PAYROLL_MONTH_PATTERN.test(args.month)) {
+    if (typeof args?.month !== "string" || !PAYROLL_MONTH_PATTERN.test(args.month)) {
       throw new PayrollError("VALIDATION", "Mes inválido (use yyyy-mm).", 400);
     }
+    if (args.employeeId !== undefined && (typeof args.employeeId !== "string" || args.employeeId.trim() === "")) {
+      throw new PayrollError("VALIDATION", "Empleado inválido.", 400);
+    }
+    const { offset, limit } = payrollPageWindow(args as Record<string, unknown>);
+    const search = typeof args.search === "string" ? args.search.trim() : "";
+    if (search !== "" && !PAYROLL_PERIOD_SEARCH_PATTERN.test(search)) {
+      throw new PayrollError("VALIDATION", "Búsqueda inválida: use letras, números, espacios, punto o guion.", 400);
+    }
     const db = await payrollDb();
-    const monthPeriods = (await listPeriods()).filter((period) => monthKeyOf(period.start_date) === args.month);
+    const monthPeriods = (await listPeriods()).filter(
+      (period) => monthKeyOf(period.start_date) === args.month && period.status === "cerrado",
+    );
     const [items, extras] = await Promise.all([
       monthPeriods.length === 0
         ? Promise.resolve([])
@@ -1474,9 +1629,12 @@ export async function listPayrollMonthRows(args: {
           }),
       readPayrollExtras({ db, month: args.month, employeeId: args.employeeId, log: "listPayrollMonthRows" }),
     ]);
-    return buildPayrollMonthToDate({ periods: monthPeriods, items, extras }).filter(
-      (row) => row.month === args.month && row.employeeId === args.employeeId,
+    const rows = buildPayrollMonthToDate({ periods: monthPeriods, items, extras }).filter(
+      (row) => row.month === args.month && (args.employeeId === undefined || row.employeeId === args.employeeId),
     );
+    const matches = search === "" ? null : await employeeIdsMatching(search);
+    const filtered = matches === null ? rows : rows.filter((row) => matches.has(row.employeeId));
+    return { rows: filtered.slice(offset, offset + limit), total: filtered.length };
   } catch (error) {
     throw toPayrollError(error);
   }
@@ -1804,15 +1962,10 @@ async function computePayrollLines(args: {
   const { db, period, roster, input, voucherScope, log } = args;
   const periodId = period.id;
 
-    // F4: EXCLUSIÓN POR CADENCIA (regla del dueño, 2026-10-01). Cuando las DOS
-    // cadencias están definidas y DIFIEREN, el empleado queda FUERA de este
-    // período: no se le arma ítem, no se le lee regla y sus facturas Pagada del
-    // rango no entran en `detail_json` ni en las comisiones. Se paga en su
-    // propio ciclo. Por eso la exclusión vive acá, al armar el conjunto de
-    // empleados: nada aguas abajo (ítems, totales, resúmenes, corrección) ve al
-    // excluido. Si CUALQUIERA de las dos cadencias falta (NULL = sin cadencia
-    // definida), el empleado entra y rige el comportamiento de hoy (prorrateo
-    // por días más comisiones).
+    // EXCLUSIÓN POR CADENCIA (regla del dueño): el período regular sólo liquida
+    // a quien tiene EXACTAMENTE su cadencia. Un legajo sin cadencia no entra en
+    // ningún período regular; se paga sólo con pagos extraordinarios. Al
+    // excluido no se le arma ítem ni comisiones: nada aguas abajo lo ve.
     //
     // EXCLUIR LAS COMISIONES ES PARTE DE LA EXCLUSIÓN, no un extra: con un
     // período semanal y uno mensual que se superponen A PROPÓSITO, una factura

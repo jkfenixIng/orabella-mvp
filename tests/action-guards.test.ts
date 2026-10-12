@@ -800,6 +800,13 @@ const SURFACES: readonly SurfaceSpec[] = [
   },
   {
     file: PAYROLL_ACTIONS_FILE,
+    name: "listPayrollPeriodsPageAction",
+    kind: "payroll",
+    roles: ["admin", "empleado"],
+    why: "una página de la tabla de períodos con filtros validados en el servidor: mismo público que listPeriodsAction; la caja no entra.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
     name: "getPayrollStartDateAction",
     kind: "payroll",
     roles: ["admin"],

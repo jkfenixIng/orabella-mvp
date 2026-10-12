@@ -21,7 +21,7 @@ describe("factura: la comisión no expone mecánica interna al cliente", () => {
     const occurrences = source.split(RULE).length - 1;
     const guarded =
       source.match(
-        /\{!clientView && \(\s*<p className="text-xs text-paper-ink-muted">\s*Se paga el porcentaje del empleado sobre el subtotal\.\s*El porcentaje se paga en nómina\./g,
+        /\{!clientView && \(\s*<p className="text-xs text-text-secondary">\s*Se paga el porcentaje del empleado sobre el subtotal\.\s*El porcentaje se paga en nómina\./g,
       ) ?? [];
     expect(occurrences).toBe(3);
     expect(guarded).toHaveLength(occurrences);

@@ -119,6 +119,7 @@ import {
   listPayrollMonthOptions,
   listPayrollMonthRows,
   listPayrollOverview,
+  listPayrollPeriods,
   listPeriods,
   openPayrollPeriod,
   PayrollError,
@@ -144,6 +145,11 @@ import {
   PagedReadError,
   readAllPaged,
 } from "@/src/shared/lib/paged";
+
+/** Every row of a month query (one wide server page), for row-level assertions. */
+async function monthRowsOf(args: { month: string; employeeId?: string }) {
+  return (await listPayrollMonthRows({ ...args, limit: 50 })).rows;
+}
 
 // ------------------------------------------------- neto (PAY-02) ---
 
@@ -2015,7 +2021,7 @@ function createPayrollPagedStubClient(): unknown {
 
     const rows = (): Array<Record<string, unknown>> => payrollPagedStub.tables[table] ?? [];
 
-    const select = (single: boolean): { data: unknown; error: unknown } => {
+    const select = (single: boolean): { data: unknown; error: unknown; count?: number } => {
       if (op === "update") {
         // U8: la otra transacción escribe ANTES de que este UPDATE evalúe sus
         // filtros (la carrera real). Se dispara una sola vez.
@@ -2202,6 +2208,10 @@ function createPayrollPagedStubClient(): unknown {
         payrollPagedStub.skipMarkLookupOnce = false;
         return { data: single ? null : [], error: null };
       }
+      if (countHead) {
+        const count = rows().filter((row) => filters.every((matches) => matches(row))).length;
+        return { data: null, count, error: null };
+      }
       const to = Math.min(rangeTo, rangeFrom + payrollPagedStub.rowCap - 1);
       payrollPagedStub.windows.push({ table, from: rangeFrom, to, order: orderKeys.map((key) => key.column) });
       const filtered = rows().filter((row) => filters.every((matches) => matches(row)));
@@ -2217,8 +2227,20 @@ function createPayrollPagedStubClient(): unknown {
       return { data: single ? window[0] ?? null : window, error: null };
     };
 
+    /** `select(cols, { count: "exact", head: true })`: PostgREST's exact count. */
+    let countHead = false;
     const query: Record<string, unknown> = {
-      select: () => query,
+      select: (_columns?: string, options?: { count?: string; head?: boolean }) => {
+        countHead = options?.count === "exact" && options.head === true;
+        return query;
+      },
+      or: (tree: string) => {
+        // Only the `col.ilike."*term*"` items the period list sends.
+        const items = [...tree.matchAll(/([a-z_]+)\.ilike\."\*([^"]*)\*"/g)].map((match) => ({ column: match[1], term: match[2].toLowerCase() }));
+        filterColumns.push(...items.map((item) => item.column));
+        filters.push((row) => items.some((item) => String(row[item.column] ?? "").toLowerCase().includes(item.term)));
+        return query;
+      },
       insert: (payload?: unknown) => {
         op = "insert";
         insertPayload = payload;
@@ -3130,30 +3152,20 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
     expect(payrollPagedStub.rpcCalls).toHaveLength(0);
   });
 
-  it("cadencia indefinida en el legajo: conserva el prorrateo por días Y las comisiones (F4)", async () => {
+  it("cadencia indefinida en el legajo queda fuera del período regular", async () => {
     seed({
       periodFrequency: "semanal",
-      startDate: "2026-01-01",
-      endDate: "2026-01-07",
       employees: [
         { pay_type: "mixto", pay_frequency: null, salary_fixed: 1_200_000, commission_percent: 10 },
       ],
       lines: [{ item_type: "servicio", subtotal: 4_000_000 }],
     });
     await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
-    const item = itemFor("empleado-1");
-    // Falta la cadencia del empleado: rige el comportamiento de HOY, exacto.
-    expect(item.base_fixed).toBe(
-      prorateFixedSalary({ salaryFixed: 1_200_000, startDate: "2026-01-01", endDate: "2026-01-07" }),
-    );
-    expect(item.base_fixed).not.toBe(300_000); // no la fracción mensual/4
-    expect(item.commissions).toBe(400_000); // 10% de 4.000.000, como hoy
-    expect(item.net_pay).toBe(Math.round(item.base_fixed as number) + 400_000);
-    expect(detailSum(item)).toBe(400_000);
-    expectIdentity(item);
+    expect(payrollPagedStub.itemsUpsert).toBeNull();
+    expect(payrollPagedStub.rpcCalls).toHaveLength(0);
   });
 
-  it("sin cadencia en el período ni en el legajo rige el prorrateo por días de hoy", async () => {
+  it("un período heredado sin cadencia conserva su planta y el prorrateo por días", async () => {
     seed({
       periodFrequency: null,
       startDate: "2026-01-01",
@@ -3162,11 +3174,7 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
     });
     await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
     const item = itemFor("empleado-1");
-    expect(item.base_fixed).toBe(
-      prorateFixedSalary({ salaryFixed: 1_500_000, startDate: "2026-01-01", endDate: "2026-01-07" }),
-    );
     expect(item.base_fixed).toBe(338_710);
-    expect(item.base_fixed).not.toBe(375_000);
     expectIdentity(item);
   });
 
@@ -5484,33 +5492,19 @@ describe("payroll: la cadencia del período, exclusión y cubo de solape (F4, fu
     expect(periodCadenceBucket("mensual")).toBe("mensual");
   });
 
-  it("excluye SÓLO cuando las dos cadencias están definidas y difieren", () => {
+  it("un período con cadencia incluye SÓLO a quien tiene esa misma cadencia", () => {
     expect(
       periodExcludesEmployeeByCadence({ employeeFrequency: "mensual", periodFrequency: "semanal" }),
     ).toBe(true);
     expect(
-      periodExcludesEmployeeByCadence({ employeeFrequency: "semanal", periodFrequency: "quincenal" }),
-    ).toBe(true);
-    expect(
       periodExcludesEmployeeByCadence({ employeeFrequency: "semanal", periodFrequency: "semanal" }),
     ).toBe(false);
-    // Cualquiera de los dos lados sin cadencia conserva el comportamiento de hoy.
-    expect(
-      periodExcludesEmployeeByCadence({ employeeFrequency: null, periodFrequency: "semanal" }),
-    ).toBe(false);
-    expect(
-      periodExcludesEmployeeByCadence({ employeeFrequency: "semanal", periodFrequency: null }),
-    ).toBe(false);
-    expect(
-      periodExcludesEmployeeByCadence({ employeeFrequency: null, periodFrequency: null }),
-    ).toBe(false);
-    expect(
-      periodExcludesEmployeeByCadence({ employeeFrequency: undefined, periodFrequency: undefined }),
-    ).toBe(false);
-    // Un valor fuera del catálogo es AUSENCIA, no otra cadencia.
-    expect(
-      periodExcludesEmployeeByCadence({ employeeFrequency: "anual", periodFrequency: "semanal" }),
-    ).toBe(false);
+    // Sin cadencia (o inválida) no entra a ningún período regular.
+    expect(periodExcludesEmployeeByCadence({ employeeFrequency: null, periodFrequency: "semanal" })).toBe(true);
+    expect(periodExcludesEmployeeByCadence({ employeeFrequency: "anual", periodFrequency: "semanal" })).toBe(true);
+    // Un período heredado sin cadencia no se reinterpreta.
+    expect(periodExcludesEmployeeByCadence({ employeeFrequency: "semanal", periodFrequency: null })).toBe(false);
+    expect(periodExcludesEmployeeByCadence({ employeeFrequency: null, periodFrequency: null })).toBe(false);
   });
 });
 
@@ -5862,7 +5856,7 @@ describe("payroll-client: el diálogo de apertura DERIVADO (F10, guarda de fuent
       /isRangeBeforePayrollStart\(\{ payrollStartDate, startDate, endDate \}\)/,
     );
     expect(submit).toContain(
-      'setOpenError(\n        `Este ciclo cierra antes del ${payrollStartDate}, el día del primer período: la nómina de la instalación arranca ese día y nada anterior existe para el sistema.`,\n      );',
+      "Este ciclo cierra antes del ${payrollStartDate}, el día del primer período",
     );
     expect(submit).not.toContain("de esta sede");
     // El piso del "día siguiente al último período" YA NO existe en ninguna forma.
@@ -6982,9 +6976,9 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
         sede_id: SEDE,
         start_date: "2026-09-01",
         end_date: "2026-09-15",
-        status: "borrador",
+        status: "cerrado",
         created_by: "u-1",
-        closed_at: null,
+        closed_at: "2026-09-16T00:00:00.000Z",
         created_at: "2026-09-01T00:00:00.000Z",
       },
       {
@@ -7076,10 +7070,36 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     });
   });
 
+  it("pagina y filtra períodos en el servidor con total exacto", async () => {
+    seedLegibilityFixture();
+    payrollPagedStub.tables.payroll_periods.push(
+      ...Array.from({ length: 11 }, (_, index) => ({
+        id: `period-${index}`,
+        sede_id: SEDE,
+        start_date: `2025-01-${String(index + 1).padStart(2, "0")}`,
+        end_date: `2025-01-${String(index + 1).padStart(2, "0")}`,
+        frequency: index % 2 === 0 ? "semanal" : "quincenal",
+        status: index % 2 === 0 ? "cerrado" : "borrador",
+        created_by: "u-1",
+        closed_at: null,
+        created_at: `2025-01-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
+      })),
+    );
+
+    const first = await listPayrollPeriods({ page: 0, limit: 2, status: "cerrado", frequency: "semanal" });
+    const second = await listPayrollPeriods({ page: 1, limit: 2, status: "cerrado", frequency: "semanal" });
+    expect(first.total).toBe(6);
+    expect(first.rows).toHaveLength(2);
+    expect(second.rows).toHaveLength(2);
+    expect(second.rows[0]?.id).not.toBe(first.rows[0]?.id);
+    await expect(listPayrollPeriods({ page: -1 })).rejects.toMatchObject({ code: "VALIDATION" });
+    await expect(listPayrollPeriods({ search: "<script>" })).rejects.toMatchObject({ code: "VALIDATION" });
+  });
+
   it("los pagos del mes de un empleado: lo pagado y contra qué períodos (consulta puntual)", async () => {
     seedLegibilityFixture();
 
-    const rows = await listPayrollMonthRows({
+    const rows = await monthRowsOf({
       month: "2026-09",
       employeeId: "emp-01",
     });
@@ -7096,7 +7116,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     // Contra qué períodos: los dos de septiembre, en orden de fecha.
     expect(rows[0].periods.map((row) => row.periodId)).toEqual([P1, P2]);
     expect(rows[0].periods[0]).toMatchObject({
-      status: "borrador",
+      status: "cerrado",
       net: 1000000,
       paid: 400000,
       remaining: 600000,
@@ -7105,28 +7125,36 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     });
   });
 
+  it("pagina Pagos del mes en el servidor y conserva solo cerrados/pagados", async () => {
+    seedLegibilityFixture();
+    const first = await listPayrollMonthRows({ month: "2026-09", page: 0, limit: 1 });
+    const second = await listPayrollMonthRows({ month: "2026-09", page: 1, limit: 1 });
+    expect(first).toMatchObject({ total: 2 });
+    expect(first.rows).toHaveLength(1);
+    expect(second.rows).toHaveLength(1);
+    expect(second.rows[0]?.employeeId).not.toBe(first.rows[0]?.employeeId);
+    await expect(listPayrollMonthRows({ month: "2026-09", page: 0, limit: 99 })).rejects.toMatchObject({ code: "VALIDATION" });
+  });
+
   it("la consulta del mes está acotada por mes Y por empleado", async () => {
     seedLegibilityFixture();
 
     // Octubre tiene pagos de emp-01 (P3) pero NINGUNO de emp-02: la consulta de
     // emp-02 en octubre devuelve vacío, no los datos de su compañero.
     expect(
-      await listPayrollMonthRows({ month: "2026-10", employeeId: "emp-02" }),
+      await monthRowsOf({ month: "2026-10", employeeId: "emp-02" }),
     ).toEqual([]);
 
-    // El mismo mes, el empleado que SÍ tiene pagos: una sola fila, con los
-    // períodos de ESE mes (ninguno de septiembre).
-    const october = await listPayrollMonthRows({
-      month: "2026-10",
-      employeeId: "emp-01",
-    });
-    expect(october.map((row) => `${row.month}/${row.employeeId}`)).toEqual(["2026-10/emp-01"]);
-    expect(october[0]).toMatchObject({
-      netTotal: 1100000,
-      paidTotal: 200000,
-      remainingTotal: 900000,
-    });
-    expect(october[0].periods.map((row) => row.periodId)).toEqual([P3]);
+    // El período de octubre sigue en borrador: no aparece hasta cerrarse.
+    expect(await monthRowsOf({ month: "2026-10", employeeId: "emp-01" })).toEqual([]);
+  });
+
+  it("sin empleado la consulta trae la planta del mes, solo de períodos cerrados", async () => {
+    seedLegibilityFixture();
+
+    const september = await monthRowsOf({ month: "2026-09" });
+    expect(september.map((row) => row.employeeId)).toEqual(["emp-01", "emp-02"]);
+    expect(await monthRowsOf({ month: "2026-10" })).toEqual([]);
   });
 
   it("control negativo: una fila con más pagado que neto no resta del saldo", async () => {
@@ -7142,7 +7170,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
 
     // La misma base, por la consulta puntual: el saldo de la fila tampoco se
     // inventa negativo (el pagado que supera el neto no descuenta de más).
-    const september = await listPayrollMonthRows({
+    const september = await monthRowsOf({
       month: "2026-09",
       employeeId: "emp-02",
     });
@@ -7178,8 +7206,8 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
       extraFixture("extra-oct", "emp-01", 70000, "2026-10-01T05:00:00Z"),
     ];
 
-    const [september] = await listPayrollMonthRows({ month: "2026-09", employeeId: "emp-01" });
-    const [october] = await listPayrollMonthRows({ month: "2026-10", employeeId: "emp-01" });
+    const [september] = await monthRowsOf({ month: "2026-09", employeeId: "emp-01" });
+    const october = await monthRowsOf({ month: "2026-10", employeeId: "emp-01" });
 
     expect(september).toMatchObject({
       periodNet: 1900000,
@@ -7189,14 +7217,16 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
       monthPaid: 1350000,
     });
     expect(september.extras.map((row) => row.id)).toEqual(["extra-sep"]);
-    expect(october).toMatchObject({
-      periodNet: 1100000,
-      periodPaid: 200000,
-      periodRemaining: 900000,
-      extrasPaid: 70000,
-      monthPaid: 270000,
-    });
-    expect(october.extras.map((row) => row.id)).toEqual(["extra-oct"]);
+    expect(october).toEqual([
+      expect.objectContaining({
+        periodNet: 0,
+        periodPaid: 0,
+        periodRemaining: 0,
+        extrasPaid: 70000,
+        monthPaid: 70000,
+        extras: [expect.objectContaining({ id: "extra-oct" })],
+      }),
+    ]);
   });
 
   it.each([
@@ -7211,8 +7241,8 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
       extraFixture(`first-${nextMonth}`, "emp-01", 20000, nextInstant),
     ];
 
-    const [current] = await listPayrollMonthRows({ month, employeeId: "emp-01" });
-    const [next] = await listPayrollMonthRows({ month: nextMonth, employeeId: "emp-01" });
+    const [current] = await monthRowsOf({ month, employeeId: "emp-01" });
+    const [next] = await monthRowsOf({ month: nextMonth, employeeId: "emp-01" });
 
     expect(current.extras.map((row) => row.id)).toEqual([`last-${month}`]);
     expect(next.extras.map((row) => row.id)).toEqual([`first-${nextMonth}`]);
@@ -7227,7 +7257,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
       extraFixture("extra-nov", "emp-01", 90000, "2026-11-10T15:00:00Z"),
     ];
 
-    expect(await listPayrollMonthRows({ month: "2026-11", employeeId: "emp-01" })).toEqual([
+    expect(await monthRowsOf({ month: "2026-11", employeeId: "emp-01" })).toEqual([
       expect.objectContaining({
         periodNet: 0,
         periodPaid: 0,
@@ -7246,7 +7276,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
       extraFixture("extra-other", "emp-02", 90000, "2026-09-10T15:00:00Z"),
     ];
 
-    const [row] = await listPayrollMonthRows({ month: "2026-09", employeeId: "emp-01" });
+    const [row] = await monthRowsOf({ month: "2026-09", employeeId: "emp-01" });
     expect(row).toMatchObject({
       netTotal: 1900000,
       paidTotal: 1300000,
@@ -7257,11 +7287,11 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     });
   });
 
-  it("control negativo: un mes sin períodos no devuelve filas", async () => {
+  it("control negativo: un mes sin períodos ni pagos extraordinarios no devuelve filas", async () => {
     seedLegibilityFixture();
 
     expect(
-      await listPayrollMonthRows({ month: "2026-11", employeeId: "emp-01" }),
+      await monthRowsOf({ month: "2026-11", employeeId: "emp-01" }),
     ).toEqual([]);
   });
 
@@ -11084,95 +11114,6 @@ describe("migración 055_payroll_payments_cap_lock.sql (CL-16)", () => {
 });
 
 /* ==========================================================================
-   Nómina: los montos sólo aceptan dígitos con formato de dinero (guarda)
-
-   `inputMode="numeric"` no impide teclear una letra. Los cuatro campos de
-   MONTO de `payroll-client.tsx` —bonos, otros descuentos, monto de la porción
-   y monto extra— se guardan como dígitos con `stripMoneyInput` y se muestran
-   con `formatMoneyInput`, igual que el dinero del resto de la app. Esta guarda
-   falla si alguien vuelve a leer el valor crudo.
-   ========================================================================== */
-describe("payroll-client: los campos de monto pasan por la máscara de dinero (guarda de fuente)", () => {
-  const source = readFileSync(
-    join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
-    "utf8",
-  );
-
-  /** Bloque `onChange={...}` cuyo cuerpo contiene `anchor` ("" si no existe). */
-  function onChangeBlock(text: string, anchor: string): string {
-    const at = text.indexOf(anchor);
-    if (at === -1) return "";
-    const start = text.lastIndexOf("onChange={", at);
-    if (start === -1) return "";
-    let depth = 0;
-    for (let i = start + "onChange={".length; i < text.length; i += 1) {
-      const ch = text[i];
-      if (ch === "{") depth += 1;
-      else if (ch === "}") {
-        depth -= 1;
-        if (depth === 0) return text.slice(start, i + 1);
-      }
-    }
-    return text.slice(start);
-  }
-
-  /** El campo lleva la máscara y NO además el valor crudo. */
-  function assertMasked(block: string, raw: string): void {
-    expect(block).not.toBe("");
-    expect(block).toContain("stripMoneyInput(event.target.value)");
-    expect(block).not.toContain(raw);
-  }
-
-  it("piso anti-vacío: el cliente se leyó de verdad", () => {
-    expect(source.length).toBeGreaterThan(20_000);
-    expect(source).toContain("stripMoneyInput");
-  });
-
-  it("los bonos del empleado usan la máscara de dinero", () => {
-    assertMasked(
-      onChangeBlock(source, 'onAdjustmentChange(row.employeeId, "bonuses"'),
-      'onAdjustmentChange(row.employeeId, "bonuses", event.target.value)',
-    );
-    expect(source).toContain('value={formatMoneyInput(adjustmentValue(row.employeeId, "bonuses"))}');
-  });
-
-  it("los otros descuentos usan la máscara de dinero", () => {
-    assertMasked(
-      onChangeBlock(source, 'onAdjustmentChange(row.employeeId, "others"'),
-      'onAdjustmentChange(row.employeeId, "others", event.target.value)',
-    );
-    expect(source).toContain('value={formatMoneyInput(adjustmentValue(row.employeeId, "others"))}');
-  });
-
-  it("el monto de la porción usa la máscara de dinero", () => {
-    assertMasked(
-      onChangeBlock(source, "onPortionChange(portion.key, { amount:"),
-      "onPortionChange(portion.key, { amount: event.target.value })",
-    );
-    expect(source).toContain("value={formatMoneyInput(portion.amount)}");
-  });
-
-  it("el monto extra de nómina usa la máscara de dinero", () => {
-    assertMasked(
-      onChangeBlock(source, "setExtraAmount(stripMoneyInput"),
-      "setExtraAmount(event.target.value)",
-    );
-    expect(source).toContain("value={formatMoneyInput(extraAmount)}");
-  });
-
-  it("el detector no es un sello de goma (control negativo)", () => {
-    const fake = `<input onChange={(event) => setExtraAmount(event.target.value)} />`;
-    const block = onChangeBlock(fake, "setExtraAmount(");
-    expect(block).not.toBe("");
-    // Sin el cable a la máscara, la misma guarda falla.
-    expect(block).not.toContain("stripMoneyInput(event.target.value)");
-    expect(block).toContain("setExtraAmount(event.target.value)");
-    // Sin el ancla no hay bloque: la guarda falla en vez de pasar sola.
-    expect(onChangeBlock(fake, "no-existe:")).toBe("");
-  });
-});
-
-/* ==========================================================================
    NV-01 + regla del dueño (2026-10-01): «vales es solo vales y punto».
 
    El defecto que midió el dueño: un vale de 50.000 sobre un bruto de 7.000 se
@@ -11388,15 +11329,19 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
+    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "invoices");
 
     // Dos líneas de la MISMA factura son UNA fila; la comisión se suma.
-    expect(sources.invoices).toEqual([
-      { invoice_id: "factura-1", consecutive_number: 7, commission: 3500 },
-      { invoice_id: "factura-2", consecutive_number: 8, commission: 400 },
-    ]);
-    expect(sources.adjustment).toBeNull();
-    expect(sources.vouchers).toEqual([]);
+    expect(sources).toMatchObject({
+      kind: "invoices",
+      invoices: [
+        { invoice_id: "factura-1", consecutive_number: 7, commission: 3500 },
+        { invoice_id: "factura-2", consecutive_number: 8, commission: 400 },
+      ],
+      adjustment: null,
+    });
+    // Cargar facturas NO consulta vales.
+    expect(payrollPagedStub.requests.voucher_requests ?? 0).toBe(0);
   });
 
   it("devuelve SOLO las fuentes de este empleado (ni otro legajo)", async () => {
@@ -11423,10 +11368,11 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
+    const invoices = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "invoices");
+    const vouchers = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "vouchers");
 
-    expect(sources.invoices.map((row) => row.invoice_id)).toEqual(["factura-mia"]);
-    expect(sources.vouchers.map((row) => row.id)).toEqual(["vale-mio"]);
+    expect(invoices.kind === "invoices" && invoices.invoices.map((row) => row.invoice_id)).toEqual(["factura-mia"]);
+    expect(vouchers.kind === "vouchers" && vouchers.vouchers.map((row) => row.id)).toEqual(["vale-mio"]);
   });
 
   it("sin fuentes no inventa datos: un vale fuera del rango no es de la liquidación", async () => {
@@ -11437,9 +11383,15 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
-
-    expect(sources).toEqual({ invoices: [], adjustment: null, vouchers: [] });
+    expect(await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "invoices")).toEqual({
+      kind: "invoices",
+      invoices: [],
+      adjustment: null,
+    });
+    expect(await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "vouchers")).toEqual({
+      kind: "vouchers",
+      vouchers: [],
+    });
   });
 
   it("sin ítem para el empleado el período no tiene liquidación: todo vacío", async () => {
@@ -11450,9 +11402,11 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
-
-    expect(sources).toEqual({ invoices: [], adjustment: null, vouchers: [] });
+    expect(await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "vouchers")).toEqual({
+      kind: "vouchers",
+      vouchers: [],
+    });
+    expect(payrollPagedStub.requests.voucher_requests ?? 0).toBe(0);
   });
 
   it("el ajuste del mixto se separa de las facturas, con su monto en negativo", async () => {
@@ -11470,9 +11424,10 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
+    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "invoices");
+    if (sources.kind !== "invoices") throw new Error("expected invoices");
 
-    expect(sources.invoices).toEqual([
+    expect(sources.invoices).toMatchObject([
       { invoice_id: "factura-1", consecutive_number: 3, commission: 400000 },
     ]);
     expect(sources.adjustment).toEqual({ commission: -300000 });
@@ -11491,7 +11446,8 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
+    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "vouchers");
+    if (sources.kind !== "vouchers") throw new Error("expected vouchers");
 
     expect(sources.vouchers.map((row) => row.id)).toEqual([
       "vale-aprobada",
@@ -11508,7 +11464,13 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       // Sin `invoice_id` no hay factura que abrir: no inventa una fila.
       detailLine({ invoice_id: "", consecutive_number: null, item_id: "suelto", commission: 5000 }) as never,
     ]);
-    expect(grouped.invoices).toEqual([{ invoice_id: "a", consecutive_number: 1, commission: 2000 }]);
+    expect(grouped.invoices).toEqual([
+      { invoice_id: "a", consecutive_number: 1, commission: 2000, fixed_commission: 0, percent_commission: 2000 },
+    ]);
+    const fixed = groupSettlementInvoices([
+      detailLine({ invoice_id: "b", item_type: "producto", commission_value: 500, commission: 500 }) as never,
+    ]);
+    expect(fixed.invoices[0]).toMatchObject({ fixed_commission: 500, percent_commission: 0 });
     expect(grouped.adjustment).toBeNull();
   });
 
@@ -11558,101 +11520,79 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
     payrollPagedStub.session = { userId: MI_USER, sedeId: SEDE, roles: ["empleado"] };
 
     // El empleado PIDE el legajo ajeno; la action resuelve el suyo y lo ignora.
-    const result = await getPayrollSettlementSourcesAction(PERIOD_ID, OTRO);
+    const result = await getPayrollSettlementSourcesAction(PERIOD_ID, OTRO, "invoices");
 
     expect(result.success).toBe(true);
-    if (!result.success) return;
+    if (!result.success || result.data.kind !== "invoices") return;
     expect(result.data.invoices.map((row) => row.invoice_id)).toEqual(["factura-mia"]);
   });
-});
 
-/* ==========================================================================
-   F6: el cableado del modal "Ver facturas y vales" (guarda de fuente).
+  it("el panel muestra solo la fuente elegida y explica las comisiones cubiertas", async () => {
+    const [{ createElement }, { renderToStaticMarkup }, { SettlementSourcesPanel }] = await Promise.all([
+      import("react"),
+      import("react-dom/server"),
+      import("@/app/payroll/payroll-client"),
+    ]);
+    const invoiceSources = {
+      kind: "invoices" as const,
+      invoices: [{ invoice_id: "f-1", consecutive_number: 9, commission: 0, fixed_commission: 0, percent_commission: 0 }],
+      adjustment: { commission: -300000 },
+    };
+    const voucherSources = {
+      kind: "vouchers" as const,
+      vouchers: [{ id: "v-1", request_date: "2026-01-10", amount: 5000, status: "descontada" }],
+    };
+    const render = (selectedKind: "invoices" | "vouchers") =>
+      renderToStaticMarkup(
+        createElement(SettlementSourcesPanel, {
+          invoiceSources,
+          voucherSources,
+          selectedKind,
+          item: null,
+          busy: false,
+          onViewInvoice: () => undefined,
+          onViewVoucher: () => undefined,
+        }),
+      );
 
-   Sin DOM y sobre el texto real del cliente: el botón que abre el modal, las
-   dos listas, el botón de detalle de cada fila (con la lectura EXISTENTE de
-   facturación y de vales) y el ajuste del mixto renderizado como ajuste.
-   ========================================================================== */
-describe("payroll-client: el modal de facturas y vales (F6, guarda de fuente)", () => {
-  const source = readFileSync(
-    join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
-    "utf8",
-  );
+    const invoices = render("invoices");
+    expect(invoices).toContain("Comisiones cubiertas por sueldo base");
+    expect(invoices.replace(/\u00a0/g, " ")).toContain(
+      "Las comisiones por porcentaje suman $ 300.000. Como no superan su sueldo base, no generan un pago adicional.",
+    );
+    expect(invoices).not.toMatch(/absorb|-\$\s?300\.000|\$\s?-300\.000/);
+    expect(invoices).not.toContain("Vales de la liquidación");
 
-  /** Cuántas veces aparece un fragmento literal en el fuente. */
-  function count(needle: string): number {
-    return source.split(needle).length - 1;
-  }
-
-  it("piso anti-vacío: el cliente se leyó de verdad", () => {
-    expect(source.length).toBeGreaterThan(20_000);
-    expect(source).toContain("export function PayrollClient");
+    const vouchers = render("vouchers");
+    expect(vouchers).toContain("Vales de la liquidación");
+    expect(vouchers).not.toContain("Facturas de la liquidación");
+    // Columnas fijas: los encabezados no se montan y la acción no se parte.
+    for (const markup of [invoices, vouchers]) {
+      expect(markup).toContain("table-fixed");
+      expect(markup).toMatch(/<td class="[^"]*whitespace-nowrap[^"]*"><button[^>]*>Ver detalle/);
+    }
   });
 
-  it("el botón 'Ver facturas y vales' existe en las dos tablas y abre el modal", () => {
-    // Una línea de botón por tabla de liquidación: la cerrada y el borrador.
-    // (El conteo por línea exacta no confunde el texto del botón con la
-    // `aria-label` ni con los comentarios que lo mencionan.)
-    const botones = source
-      .split("\n")
-      .filter((line) => line.trim() === "Ver facturas y vales");
-    expect(botones).toHaveLength(2);
-    expect(count("onViewSources(item)")).toBe(2);
-    // El cableado resuelve el período vigente y el empleado de la fila.
-    expect(count("void openSettlementSources(selected.id, item.employee_id)")).toBe(3);
-    expect(count("getPayrollSettlementSourcesAction(")).toBe(1);
-  });
-
-  it("las dos listas existen, rotuladas y alimentadas por la lectura nueva", () => {
-    expect(source).toContain("Facturas de la liquidación");
-    expect(source).toContain("Vales de la liquidación");
-    expect(source).toContain("(sources?.invoices ?? []).map");
-    expect(source).toContain("(sources?.vouchers ?? []).map");
-  });
-
-  it("cada fila abre su detalle con la lectura EXISTENTE", () => {
-    // Factura: la lectura de facturación; vale: la lectura de vales.
-    expect(source).toContain("await getInvoiceAction(invoiceId)");
-    expect(source).toContain("await listVouchersAction({");
-    expect(source).toContain("onViewInvoice(invoice.invoice_id)");
-    expect(source).toContain("onViewVoucher(voucher)");
-    // Un botón "Ver detalle" por lista (factura y vale).
-    const botones = source.split("\n").filter((line) => line.trim() === "Ver detalle");
-    expect(botones).toHaveLength(2);
-    expect(source).toContain("Ver el detalle de la factura");
-    expect(source).toContain("Ver el detalle del vale del");
-  });
-
-  it("el ajuste del mixto se muestra como ajuste y NO como factura", () => {
-    expect(source).toContain("Ajuste del mixto");
-    expect(source).toContain("sources?.adjustment");
-    expect(source).toContain("El básico absorbió");
-    // Se pinta aparte: no se recorre `invoices` para el ajuste ni se rotula
-    // como consecutivo.
-    expect(source).not.toContain("Factura #ajuste_mixto");
-    expect(source).toContain("{formatMoney(sources.adjustment.commission)}");
-  });
-
-  it("los vacíos son honestos y en texto plano (no un aviso)", () => {
-    expect(source).toContain("La liquidación no tiene facturas");
-    expect(source).toContain("La liquidación no tiene vales");
-    // El vacío no se envuelve en `Alert` (agregaría un anuncio que no existe).
-    const lineas = source
-      .split("\n")
-      .filter((line) => line.includes("La liquidación no tiene facturas"));
-    expect(lineas).toHaveLength(1);
-    expect(lineas[0]).not.toContain("Alert");
-  });
-
-  it("el detector no es un sello de goma (control negativo)", () => {
-    // El marcado VIEJO: una sola celda "Ver" sin modal de fuentes.
-    const viejo = "<td>Ver</td>";
-    expect(viejo.split("Ver facturas y vales").length - 1).toBe(0);
-    expect(viejo.includes("Ajuste del mixto")).toBe(false);
-    expect(viejo.includes("onViewInvoice(")).toBe(false);
-    expect(viejo.includes("onViewVoucher(")).toBe(false);
-    // Sin `onViewSources` el botón no estaría cableado al modal.
-    expect(viejo.split("onViewSources(item)").length - 1).toBe(0);
+  it("las fuentes se eligen sin conteos y el detalle de factura usa el ancho de escritorio", async () => {
+    const { settlementSourceLabel, invoiceCommissionOrigin } = await import("@/app/payroll/payroll-client");
+    expect(settlementSourceLabel("invoices")).toBe("Facturas");
+    expect(settlementSourceLabel("vouchers")).toBe("Vales");
+    const { readFile } = await import("node:fs/promises");
+    const [client, actions] = await Promise.all([
+      readFile("app/payroll/payroll-client.tsx", "utf8"),
+      readFile("src/features/payroll/actions.ts", "utf8"),
+    ]);
+    // Ninguna lectura de solo-conteo: ni la action existe ni el cliente la pide.
+    expect(actions).not.toMatch(/SourceCounts/);
+    expect(client).not.toMatch(/SourceCounts|sourceCounts/);
+    // Detalle de factura: ancho grande en escritorio, con margen en móvil.
+    const invoiceDialog = client.slice(client.indexOf("{invoiceTargetId && ("), client.indexOf("{voucherTargetId && ("));
+    expect(invoiceDialog).toContain('<DialogContent className="w-[calc(100%-2rem)] max-w-7xl">');
+    expect(invoiceDialog).toContain('<DataTable minWidth="lg" wrapperClassName="rounded-md border border-border-color">');
+    expect(invoiceDialog).toContain("Origen comisión");
+    const origin = invoiceCommissionOrigin({ no_commission: false, commission_mode: "porcentaje", commission_amount: 1200, employee_full_name: "Ana" });
+    expect(origin.replace(/\u00a0/g, " ")).toBe("Porcentaje · $ 1.200 · Ana");
+    expect(invoiceCommissionOrigin({ no_commission: true, commission_mode: null, commission_amount: 0, employee_full_name: null })).toBe("Sin comisión");
   });
 });
 
@@ -12002,26 +11942,17 @@ describe("payroll-client: el motivo del ajuste (F8, guarda de fuente)", () => {
     expect(source).toContain("adjustmentReasonValue");
   });
 
-  it("cada fila del borrador tiene el campo de motivo, cableado al mismo registro", () => {
-    expect(source).toContain("aria-label={`Motivo del ajuste de ${employeeName(row.employeeId)}`}");
-    expect(source).toContain('onAdjustmentChange(row.employeeId, "reason", event.target.value)');
+  it("bonos y otros descuentos se editan en diálogo, no inline", () => {
+    expect(source).toContain('onClick={() => onEditAdjustment(row.employeeId, "bonuses")}');
+    expect(source).toContain('onClick={() => onEditAdjustment(row.employeeId, "others")}');
+    expect(source).not.toContain("onAdjustmentChange(row.employeeId");
     expect(source).toContain('adjustment_reason: reason === "" ? null : reason,');
-    expect(source).toContain("aria-required={reasonRequired}");
-    expect(source).toContain("Motivo (obligatorio)");
+    expect(source).toContain('id="payroll-adjustment-reason"');
   });
 
-  it("el motivo faltante se avisa INLINE, junto a la fila, y nombra al empleado", () => {
-    // El aviso vive en la MISMA celda del motivo, pegado al input y dentro del
-    // diálogo: el error de la página queda detrás del modal abierto.
-    const cell = reasonCellBody(source);
-    expect(cell, "aviso inline del motivo faltante").toMatch(INLINE_REASON_NOTICE);
-    // Texto plano: un `Alert` o un `role=` movería las guardas de feedback-batch2.
-    expect(cell).not.toContain("<Alert");
-    expect(cell).not.toMatch(/\brole\s*=/);
-    // Se deriva de la MISMA condición que marca el campo obligatorio, y deja de
-    // mostrarse apenas el motivo existe (`reasonValue.trim() !== ""`).
-    expect(source).toContain('const reasonMissing = reasonRequired && reasonValue.trim() === "";');
-    expect(source).toContain("const reasonValue = adjustmentReasonValue(row.employeeId);");
+  it("el diálogo exige motivo sólo si el valor cambió y avisa adentro", () => {
+    expect(source).toContain("if (next !== current && !adjustmentDialog.reason.trim()) {");
+    expect(source).toContain('{adjustmentError ? <Alert variant="destructive">{adjustmentError}</Alert> : null}');
   });
 
   it("el detector del aviso inline no es un sello de goma (control negativo)", () => {
@@ -15532,10 +15463,14 @@ describe("payroll-client: cada período dice su cadencia (F11, guarda de fuente)
     // juego no desaparezca cuando el filtro de estado vacía la lista.
     expect(source).toContain("periodCadenceFilterOptions(periods)");
     expect(source).not.toContain("periodCadenceFilterOptions(visiblePeriods)");
-    // Y el filtro de cadencia se aplica JUNTO al de estado, no en su lugar.
-    expect(plano(source)).toContain(
-      "const visiblePeriods = filterPeriodsByCadence( statusFilter === \"todos\" ? periods : periods.filter((row) => row.status === statusFilter), cadenceFilter, );",
-    );
+    // La cadencia viaja como filtro a la action paginada: no se vuelve a cortar
+    // una lista completa en el navegador.
+    expect(plano(source)).toContain('frequency: periodCadenceParam');
+    expect(source).toContain("listPayrollPeriodsPageAction({");
+    // Ninguna tabla de nómina se pagina cortando filas en el navegador.
+    expect(source).not.toMatch(/\.slice\(\s*(periodPage|monthPage)/);
+    expect(source).toContain("total={tablePeriodTotal}");
+    expect(source).toContain("total={monthTotal}");
   });
 
   it("el aviso dice que cada cadencia se liquida por separado, y declara el ciclo recortado", () => {

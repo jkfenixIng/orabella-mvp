@@ -5,7 +5,9 @@ import type { PayrollMonthEmployeeRow } from "@/src/features/payroll/schemas";
 type MonthQuery = {
   month: string;
   employeeId: string;
+  search: string;
   rows: PayrollMonthEmployeeRow[];
+  total: number;
 } | null;
 
 type ExtraIdentity = { employee_id: string; paid_at: string };
@@ -13,16 +15,32 @@ type ExtraIdentity = { employee_id: string; paid_at: string };
 export async function refreshPayrollMonthAfterExtra(args: {
   extra: ExtraIdentity;
   monthQuery: MonthQuery;
-  loadRows: (input: { month: string; employeeId: string }) => Promise<ActionResult<PayrollMonthEmployeeRow[]>>;
+  /** Current server page; the refresh re-reads that same page and criteria. */
+  page: number;
+  loadRows: (input: {
+    month: string;
+    employeeId?: string;
+    search: string;
+    page: number;
+    limit: number;
+  }) => Promise<ActionResult<{ rows: PayrollMonthEmployeeRow[]; total: number }>>;
+  pageSize: number;
   loadOptions: () => Promise<ActionResult<string[]>>;
   show: <T>(result: ActionResult<T>) => result is { success: true; data: T };
   setMonthQuery: (query: Exclude<MonthQuery, null>) => void;
   setMonthOptions: (months: string[]) => void;
 }): Promise<void> {
   const paidMonth = bogotaDateOf(args.extra.paid_at)?.slice(0, 7) ?? null;
-  if (paidMonth !== null && args.monthQuery?.month === paidMonth && args.monthQuery.employeeId === args.extra.employee_id) {
-    const rows = await args.loadRows({ month: paidMonth, employeeId: args.extra.employee_id });
-    if (rows.success) args.setMonthQuery({ month: paidMonth, employeeId: args.extra.employee_id, rows: rows.data });
+  const query = args.monthQuery;
+  if (paidMonth !== null && query !== null && query.month === paidMonth && (query.employeeId === "" || query.employeeId === args.extra.employee_id)) {
+    const rows = await args.loadRows({
+      month: paidMonth,
+      employeeId: query.employeeId || undefined,
+      search: query.search,
+      page: args.page,
+      limit: args.pageSize,
+    });
+    if (rows.success) args.setMonthQuery({ ...query, rows: rows.data.rows, total: rows.data.total });
     else {
       args.show({
         success: false,

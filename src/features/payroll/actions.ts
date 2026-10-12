@@ -20,6 +20,7 @@ import {
   listPayrollExtras,
   listPayrollMonthOptions,
   listPayrollMonthRows,
+  listPayrollPeriods,
   listPeriods,
   listVouchers,
   payPayrollExtra,
@@ -129,12 +130,15 @@ export async function listPayrollExtrasAction() {
  * lectura del panorama acotada a la consulta que el admin hace en la pantalla:
  * el mes de toda la planta ya no viaja al abrir, viaja cuando se pide.
  */
-export async function listPayrollMonthRowsAction(input: { month: string; employeeId: string }) {
+export async function listPayrollMonthRowsAction(input: unknown) {
   try {
     await requirePayrollAdmin(await sessionToken());
-    const data = await listPayrollMonthRows({
-      month: input.month,
-      employeeId: input.employeeId,
+    const data = await listPayrollMonthRows(input as {
+      month: string;
+      employeeId?: string;
+      search?: string;
+      page?: number;
+      limit?: number;
     });
     return { success: true as const, data };
   } catch (error) {
@@ -221,6 +225,20 @@ export async function listPeriodsAction() {
 }
 
 /**
+ * One server page of the period table: validated filters, exact total. Same
+ * audience as `listPeriodsAction` (periods carry no employee data).
+ */
+export async function listPayrollPeriodsPageAction(input: unknown) {
+  try {
+    await requirePayrollViewer(await sessionToken());
+    const data = await listPayrollPeriods(input);
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
  * Detalle del periodo con ítems y saldos (admin ven todo; empleado solo sus
  * ítems; la caja no entra al módulo).
  */
@@ -256,9 +274,16 @@ export async function getPeriodDetailAction(id: string) {
  * no entra al módulo (`requirePayrollViewer`). Una lectura incompleta no se
  * degrada a vacío: sale con el código accionable de `toFailure`.
  */
-export async function getPayrollSettlementSourcesAction(periodId: string, employeeId: string) {
+export async function getPayrollSettlementSourcesAction(
+  periodId: string,
+  employeeId: string,
+  kind: "invoices" | "vouchers",
+) {
   try {
     const session = await requirePayrollViewer(await sessionToken());
+    if (kind !== "invoices" && kind !== "vouchers") {
+      throw new PayrollError("VALIDATION", "Fuente de la liquidación inválida.", 400);
+    }
     const isManager = (session.roles ?? []).includes("admin");
     let targetEmployeeId = employeeId;
     if (!isManager) {
@@ -267,7 +292,7 @@ export async function getPayrollSettlementSourcesAction(periodId: string, employ
       const mine = (await listAllEmployees()).find((row) => row.user_id === session.userId);
       targetEmployeeId = mine?.id ?? "sin-acceso";
     }
-    const data = await getPayrollSettlementSources(periodId, targetEmployeeId);
+    const data = await getPayrollSettlementSources(periodId, targetEmployeeId, kind);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

@@ -4408,6 +4408,39 @@ describe("billing: el filtro por empleado no recorta ni rompe la URL (U8)", () =
     expect(rows.every((row) => row.employee_names.length === 1)).toBe(true);
   });
 
+  it("payroll_locked: one batch read marks only invoices present in closed payrolls", async () => {
+    seedEmployeeInvoices(3);
+    pagedStub.tables.payroll_periods = [
+      { id: "p-closed", status: "cerrado" },
+      { id: "p-draft", status: "borrador" },
+    ];
+    pagedStub.tables.payroll_items = [
+      { id: "pi-1", period_id: "p-closed", detail_json: [{ invoice_id: "fac-00002" }] },
+      { id: "pi-2", period_id: "p-draft", detail_json: [{ invoice_id: "fac-00003" }] },
+    ];
+
+    const rows = await listInvoices({ employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
+
+    expect(Object.fromEntries(rows.map((row) => [row.id, row.payroll_locked]))).toEqual({
+      "fac-00003": false,
+      "fac-00002": true,
+      "fac-00001": false,
+    });
+    // No N+1: the closed periods are read once for the whole page.
+    expect(pagedStub.windows.filter((window) => window.table === "payroll_periods")).toHaveLength(1);
+  });
+
+  it("payroll_locked fails closed when the payroll history cannot be read", async () => {
+    seedEmployeeInvoices(2);
+    pagedStub.tables.payroll_periods = [{ id: "p-closed", status: "cerrado" }];
+    pagedStub.tables.payroll_items = [{ id: "pi-1", period_id: "p-closed", detail_json: [] }];
+    pagedStub.failAt = { payroll_items: [1] };
+
+    const rows = await listInvoices({ employee_id: EMPLOYEE_ID, page: 1, pageSize: 10 });
+
+    expect(rows.map((row) => row.payroll_locked)).toEqual([true, true]);
+  });
+
   it("control: un empleado con pocas facturas sigue listando y contando igual", async () => {
     seedEmployeeInvoices(3);
 

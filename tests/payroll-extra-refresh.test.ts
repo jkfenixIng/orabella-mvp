@@ -5,7 +5,7 @@ import type { ActionResult } from "@/src/shared/lib/api-response";
 import type { PayrollMonthEmployeeRow } from "@/src/features/payroll/schemas";
 
 const EXTRA = { employee_id: "emp-01", paid_at: "2026-10-01T00:30:00Z" };
-const QUERY = { month: "2026-09", employeeId: "emp-01", rows: [] as PayrollMonthEmployeeRow[] };
+const QUERY = { month: "2026-09", employeeId: "emp-01", search: "", rows: [] as PayrollMonthEmployeeRow[], total: 0 };
 
 function failure(message: string): ActionResult<never> {
   return { success: false, code: "INTERNAL", message };
@@ -25,6 +25,8 @@ describe("pago extraordinario: refresco posterior", () => {
     await refreshPayrollMonthAfterExtra({
       extra: EXTRA,
       monthQuery: QUERY,
+      page: 0,
+      pageSize: 10,
       loadRows: async () => failure("filas no disponibles"),
       loadOptions: async () => failure("meses no disponibles"),
       show,
@@ -47,6 +49,8 @@ describe("pago extraordinario: refresco posterior", () => {
     await refreshPayrollMonthAfterExtra({
       extra: EXTRA,
       monthQuery: { ...QUERY, month: "2026-10" },
+      page: 0,
+      pageSize: 10,
       loadRows,
       loadOptions: async () => ({ success: true, data: ["2026-10", "2026-09"] }),
       show: <T,>(result: ActionResult<T>): result is { success: true; data: T } => result.success,

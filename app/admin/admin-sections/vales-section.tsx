@@ -16,8 +16,8 @@ import { EmptyState } from "@/src/components/ui/lib/empty-state";
 import {
   buttonClass,
   ghostClass,
-  inputClass,
   labelClass,
+  MoneyField,
   sectionClass,
   sectionTitleClass,
   stackClass,
@@ -336,12 +336,11 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
           {hasWeekly ? (
             <label className={`${labelClass} max-w-xs`}>
               Tope por semana
-              <input
+              <MoneyField
                 value={formatMoneyInput(maxWeek)}
                 onChange={(event) => setMaxWeek(stripMoneyInput(event.target.value))}
                 placeholder="500000"
                 inputMode="numeric"
-                className={inputClass}
               />
             </label>
           ) : null}
@@ -372,12 +371,11 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
               {perDayMode === "same" ? (
                 <label className={`${labelClass} max-w-xs`}>
                   Tope diario
-                  <input
+                  <MoneyField
                     value={formatMoneyInput(maxDay)}
                     onChange={(event) => setMaxDay(stripMoneyInput(event.target.value))}
                     placeholder="200000"
                     inputMode="numeric"
-                    className={inputClass}
                   />
                 </label>
               ) : perDayDays.length > 0 ? (
@@ -385,14 +383,13 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
                   {perDayDays.map((day) => (
                     <label key={day} className={labelClass}>
                       {DAY_NAMES[day - 1]?.label ?? day}
-                      <input
+                      <MoneyField
                         value={formatMoneyInput(perDayValues[day] ?? "")}
                         onChange={(event) =>
                           setPerDayValues((prev) => ({ ...prev, [day]: stripMoneyInput(event.target.value) }))
                         }
                         placeholder="200000"
                         inputMode="numeric"
-                        className={inputClass}
                       />
                     </label>
                   ))}
@@ -420,8 +417,8 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
             <Alert variant="destructive">{error}</Alert>
           ) : null}
 
-          <div>
-            <button type="submit" disabled={busy} className={buttonClass}>
+          <div className="flex">
+            <button type="submit" disabled={busy} className={`${buttonClass} w-full sm:w-auto`}>
               {busy ? "Guardando…" : "Guardar configuración"}
             </button>
           </div>
@@ -439,8 +436,7 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
             <DialogTitle>Guardar configuración de vales</DialogTitle>
           </DialogHeader>
           <p className="mt-2 text-sm text-text-secondary">
-            ¿Está seguro de guardar la configuración de vales? Esta acción reemplaza los topes y días
-            vigentes.
+            Reemplaza los topes y días vigentes por:
           </p>
           <p className="mt-2 rounded-md border border-border-color bg-surface-hover px-3 py-2 text-sm text-text-primary">
             {previewDraft()}
@@ -460,7 +456,7 @@ export function ValesSection({ initial }: { initial: VoucherSettingsRow | null }
               disabled={busy}
               className={buttonClass}
             >
-              {busy ? "Guardando…" : "OK"}
+              {busy ? "Guardando…" : "Guardar"}
             </button>
           </DialogFooter>
         </DialogContent>

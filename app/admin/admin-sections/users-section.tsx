@@ -8,6 +8,7 @@ import type { SedeUserRow } from "@/src/features/admin/service";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { EmptyState } from "@/src/components/ui/lib/empty-state";
 import { Alert } from "@/src/components/ui/lib/alert";
+import { ListToolbar } from "@/src/components/ui/lib/list-toolbar";
 import { cn } from "@/src/components/ui/lib/utils";
 import {
   hintTextClass,
@@ -17,7 +18,7 @@ import {
   stackClass,
   tableHeaderClass,
 } from "../admin-styles";
-import { ROLE_OPTIONS, type ActionResult } from "../admin-shared";
+import { matchesQuery, ROLE_OPTIONS, type ActionResult } from "../admin-shared";
 
 /**
  * Roles que esta pantalla puede asignar. `superadmin` no se otorga ni se quita
@@ -26,6 +27,19 @@ import { ROLE_OPTIONS, type ActionResult } from "../admin-shared";
  * aunque llegue por la action.
  */
 const ASSIGNABLE_ROLE_OPTIONS = ROLE_OPTIONS.filter((option) => option.value !== "superadmin");
+
+/** Read-only list filter: it narrows rows and never changes what can be assigned. */
+const ROLE_FILTER_OPTIONS = [
+  { value: "all", label: "Todos" },
+  ...ASSIGNABLE_ROLE_OPTIONS,
+  { value: "none", label: "Sin rol" },
+];
+
+function matchesRole(roles: RoleCode[], filter: string): boolean {
+  if (filter === "all") return true;
+  if (filter === "none") return roles.length === 0;
+  return roles.some((role) => role === filter);
+}
 
 export function UsersSection({
   initial,
@@ -41,6 +55,14 @@ export function UsersSection({
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [confirmResetId, setConfirmResetId] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [roleFilter, setRoleFilter] = useState("all");
+
+  const visibleRows = rows.filter(
+    (row) =>
+      matchesRole(row.roles, roleFilter) &&
+      matchesQuery(query, [row.full_name, row.id_number, row.roles.join(" ")]),
+  );
 
   function selectRole(userId: string, role: RoleCode) {
     setSelected((prev) => ({ ...prev, [userId]: role }));
@@ -92,13 +114,32 @@ export function UsersSection({
     <div className={stackClass}>
       <section className={sectionClass} aria-label="Listado de usuarios">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className={sectionTitleClass}>Usuarios ({rows.length})</h2>
+          <h2 className={sectionTitleClass}>Usuarios ({visibleRows.length})</h2>
           <p className={hintTextClass}>
-            Los usuarios se crean solos al crear el empleado. Aquí solo se asigna rol y se restablece clave.
+            Cree usuarios desde empleados; aquí puede asignar rol o restablecer clave.
           </p>
         </div>
-        {rows.length === 0 ? (
-          <EmptyState className="mt-2">Aún no hay usuarios en esta sede.</EmptyState>
+        {rows.length > 0 ? (
+          <ListToolbar
+            className="mt-3"
+            aria-label="Filtrar usuarios"
+            searchId="admin-users-search"
+            searchLabel="Buscar"
+            searchValue={query}
+            searchPlaceholder="Nombre, documento o rol"
+            onSearchChange={setQuery}
+            statusLabel="Rol"
+            statusValue={roleFilter}
+            statusOptions={ROLE_FILTER_OPTIONS}
+            onStatusChange={setRoleFilter}
+            onClear={() => {
+              setQuery("");
+              setRoleFilter("all");
+            }}
+          />
+        ) : null}
+        {visibleRows.length === 0 ? (
+          <EmptyState className="mt-2">{rows.length === 0 ? "Aún no hay usuarios en esta sede." : "Sin resultados para ese filtro."}</EmptyState>
         ) : (
           // R4 + R38: la lista de Usuarios. Antes era una TABLA de seis columnas
           // dentro del carril `overflow-x-auto` de `DataTable`: sin piso
@@ -143,7 +184,7 @@ export function UsersSection({
               <span>Clave</span>
             </div>
             <ul className="flex flex-col divide-y divide-border-color dark:divide-border-color-2">
-              {rows.map((row) => {
+              {visibleRows.map((row) => {
                 const sel = selected[row.id] ?? row.roles[0] ?? null;
                 const isSelf = row.id === currentUserId;
                 return (

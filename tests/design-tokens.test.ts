@@ -510,26 +510,22 @@ function bareClassNames(css: string): string[] {
 
 /** Extensiones donde un nombre de clase llega al DOM. */
 const CLASS_CONSUMER_EXTENSIONS = [".ts", ".tsx"];
-const CLASS_CONSUMER_SKIP_DIRS = new Set(["node_modules", ".next", ".git", "tests"]);
+const CLASS_CONSUMER_ROOTS = ["src", "app"];
 
 /** Contenido de todos los .ts/.tsx de producción, indexado por ruta relativa. */
 function readClassConsumers(): Map<string, string> {
   const files = new Map<string, string>();
   const walk = (dir: string): void => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
       if (entry.isDirectory()) {
-        if (!CLASS_CONSUMER_SKIP_DIRS.has(entry.name)) {
-          walk(join(dir, entry.name));
-        }
-        continue;
-      }
-      if (CLASS_CONSUMER_EXTENSIONS.some((ext) => entry.name.endsWith(ext))) {
-        const path = join(dir, entry.name);
+        walk(path);
+      } else if (CLASS_CONSUMER_EXTENSIONS.some((ext) => entry.name.endsWith(ext))) {
         files.set(path.slice(APP_ROOT.length + 1), readFileSync(path, "utf8"));
       }
     }
   };
-  walk(APP_ROOT);
+  for (const root of CLASS_CONSUMER_ROOTS) walk(join(APP_ROOT, root));
   return files;
 }
 

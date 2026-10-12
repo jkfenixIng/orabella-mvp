@@ -305,7 +305,7 @@ describe("detector de roles y de Alert: no es un sello de goma", () => {
     expect(INVOICES_CLIENT_CODE).toContain("const shiftBlockReason: string | null = !shiftKnown");
     expect(INVOICES_CLIENT_CODE).toContain("function passShiftGate(): boolean {");
     expect(INVOICES_CLIENT_CODE).toContain("async function confirmCommissionPayment() {");
-    expect(INVOICES_CLIENT_CODE).toContain("const [error, setError] = useState<string | null>(null)");
+    expect(INVOICES_CLIENT_CODE).toContain("const [pageError, setPageError] = useState<string | null>(null)");
     expect(INVOICES_PAGE_CODE).toContain("export default async function InvoicesPage()");
     expect(LOGIN_FORM_CODE).toContain("export function LoginForm({ next }: { next?: string })");
     expect(LOGIN_FORM_CODE).toContain("async function handleForceChange(event: FormEvent) {");
@@ -334,14 +334,14 @@ describe("facturación y login: no queda ningún portador de mensaje ad-hoc", ()
     expect(INVOICES_CLIENT_CODE).not.toMatch(/role=\{/);
   });
 
-  it("los seis roles que quedan en el cliente están justificados: dos `group` y cuatro overrides", () => {
+  it("los cinco roles que quedan en el cliente están justificados: dos `group` y tres overrides", () => {
     // La guarda es enumerativa a propósito: un séptimo rol, o un tercer `group`
     // sin `aria-label`, no tiene excusa y rompe el conteo.
-    expect(adHocRoles(INVOICES_CLIENT_CODE), "roles escritos a mano").toHaveLength(6);
+    expect(adHocRoles(INVOICES_CLIENT_CODE), "roles escritos a mano").toHaveLength(5);
     // Cuatro son el override DELIBERADO del estado derivado en vivo: los tres
     // del bloqueo de caja y el recargo del cobro en edición (carry-over del
     // lote 6).
-    expect(alertsWithExplicitStatusRole(INVOICES_CLIENT_CODE)).toBe(4);
+    expect(alertsWithExplicitStatusRole(INVOICES_CLIENT_CODE)).toBe(3);
     // Los otros dos son ARIA ESTRUCTURAL de una agrupación de botones.
     expect([...INVOICES_CLIENT_CODE.matchAll(/role="group"/g)]).toHaveLength(2);
     expect(INVOICES_CLIENT_CODE).toMatch(/role="group"\s+aria-label=\{props\.ariaLabel\}/);
@@ -444,7 +444,7 @@ describe("facturación: lo efímero va por el toast (evento)", () => {
    Las tres superficies: lo persistente va por Alert (estado)
    ========================================================================== */
 describe("facturación y login: lo persistente va por Alert (estado)", () => {
-  it("el cliente tiene once Alert, todos de aviso o de error", () => {
+  it("el cliente tiene doce Alert, todos de aviso o de error", () => {
     // Siete destructivos (el error compartido arriba del listado y dentro de cada
     // formulario, más la validación de edición, la del ítem, la del pago de
     // comisión y el recargo del cobro en edición del carry-over del lote 6) y
@@ -452,24 +452,21 @@ describe("facturación y login: lo persistente va por Alert (estado)", () => {
     // emisión, el encabezado y el detalle). Si apareciera un Alert de más, o
     // alguien cambiara una variante, el conteo lo delata.
     expect(INVOICES_CLIENT_CODE).toMatch(ALERT_IMPORT);
-    expect(alertOpenerCount(INVOICES_CLIENT_CODE)).toBe(11);
-    expect(alertsWithVariant(INVOICES_CLIENT_CODE, "destructive")).toBe(7);
-    expect(alertsWithVariant(INVOICES_CLIENT_CODE, "warning")).toBe(4);
+    expect(alertOpenerCount(INVOICES_CLIENT_CODE)).toBe(12);
+    expect(alertsWithVariant(INVOICES_CLIENT_CODE, "destructive")).toBe(9);
+    expect(alertsWithVariant(INVOICES_CLIENT_CODE, "warning")).toBe(3);
     // Ni `info` ni `success` como `Alert`: nada se confirma por estado (eso es
     // evento y va por toast) y no hay datos de color neutro que anunciar.
     expect(INVOICES_CLIENT_CODE).not.toMatch(/<Alert\s+variant="info"/);
     expect(INVOICES_CLIENT_CODE).not.toMatch(/<Alert\s+variant="success"/);
   });
 
-  it("el error compartido es estado: Alert destructivo arriba del listado y dentro de cada formulario", () => {
-    // El mismo `error` se muestra en tres sitios: la vista de fondo (arriba,
-    // después de la Card), el formulario de emisión y las operaciones del
-    // detalle. Todos asertivos por la variante.
-    expect(INVOICES_CLIENT_CODE).toMatch(/<Alert variant="destructive">\{error\}<\/Alert>/);
-    // Dos de los tres comparten renglón; el del detalle lleva su margen.
-    expect(linesWith(INVOICES_CLIENT_CODE, '<Alert variant="destructive">{error}</Alert>')).toHaveLength(2);
-    expect(linesWith(INVOICES_CLIENT_CODE, '<Alert variant="destructive" className="mt-2">')).toHaveLength(1);
-    expect(linesWith(INVOICES_CLIENT_CODE, "{error}")).toHaveLength(3);
+  it("cada error es estado del lugar que lo produjo: listado, emisión, pago, anulación y confirmación", () => {
+    // Un error por superficie: el de un modal ya no cae debajo del listado.
+    for (const state of ["pageError", "createError", "payError", "annulError", "confirmError"]) {
+      expect(linesWith(INVOICES_CLIENT_CODE, `<Alert variant="destructive">{${state}}</Alert>`), state).toHaveLength(1);
+    }
+    expect(INVOICES_CLIENT_CODE).not.toMatch(/\{error\}/);
     // Ninguno quedó como `<p>` con la clase de error suelta.
     expect(INVOICES_CLIENT_CODE).not.toMatch(/<p role="alert"/);
     expect(INVOICES_CLIENT_CODE).not.toMatch(/<p role="status"/);
@@ -487,8 +484,8 @@ describe("facturación y login: lo persistente va por Alert (estado)", () => {
     // el enunciado (dos de ellos arman la copia en un ternario dentro del
     // setter) y no solo el renglón del literal.
     const validaciones: Array<[string, string]> = [
-      ['"Agregue al menos un ítem a la factura."', "setError("],
-      ['"Indique el motivo de anulación."', "setError("],
+      ['"Agregue al menos un ítem a la factura."', "setCreateError("],
+      ['"Indique el motivo de anulación."', "setAnnulError("],
       ['"Elija el producto."', "setItemError("],
       ['"Cantidad inválida."', "setItemError("],
       ['"No se pudo pagar la comisión."', "setCommissionError("],
@@ -510,7 +507,6 @@ describe("facturación y login: lo persistente va por Alert (estado)", () => {
     const sitios = [
       /<Alert variant="warning" role="status">\s*\{shiftBlockReason\}\s*<\/Alert>/,
       /<Alert variant="warning" role="status" className="mt-3">\s*\{shiftBlockReason\}\s*<\/Alert>/,
-      /<Alert variant="warning" role="status" className="mt-2">\s*\{shiftBlockReason\}\s*<\/Alert>/,
     ];
     for (const sitio of sitios) {
       expect(INVOICES_CLIENT_CODE, String(sitio)).toMatch(sitio);
@@ -521,7 +517,6 @@ describe("facturación y login: lo persistente va por Alert (estado)", () => {
     // polite: si alguien pasara `role="status"` a todos, el conteo pasaría de 1
     // a 7 y fallaría.
     expect([...INVOICES_CLIENT_CODE.matchAll(/<Alert variant="destructive" role="status"/g)]).toHaveLength(1);
-    expect(alertsWithExplicitStatusRole(INVOICES_CLIENT_CODE)).toBe(4);
   });
 
   it("el clic que la guarda frena es un estado confirmado y sigue asertivo", () => {
@@ -644,7 +639,7 @@ describe("facturación y login: el texto visible no cambió", () => {
       "Agregue al menos un ítem a la factura.",
       "Descuento inválido.",
       "Indique el motivo de anulación.",
-      "Monto de la porción inválido.",
+      "Indique un monto válido.",
       "Las porciones de pago deben ser mayores a 0.",
       "Elija el producto.",
       "Elija el servicio.",
@@ -706,11 +701,11 @@ describe("facturación y login: el texto visible no cambió", () => {
     // tenían rol): siguen en su clase de texto y NO se envuelven en `Alert`
     // —envolverlos AGREGARÍA el anuncio que hoy no existe—. Queda pineado.
     const vacios: Array<[string, string, string]> = [
-      // Los tres de la hoja pasaron a `text-paper-ink-muted` (WU5): mismo color, #62748e en claro y oscuro.
+      // Los flujos de trabajo usan el texto secundario del tema en claro y oscuro.
       ["Sin facturas para estos filtros.", "li", "px-3 py-4 text-sm text-text-secondary"],
-      ["Sin ítems. Agregue al menos uno para emitir.", "td", "px-3 py-4 text-center text-sm text-paper-ink-muted"],
-      ["Sin impuestos.", "li", "text-paper-ink-muted"],
-      ["Sin cobro registrado (Emitida).", "li", "text-paper-ink-muted"],
+      ["Sin ítems. Agregue al menos uno para emitir.", "td", "px-3 py-4 text-center text-sm text-text-secondary"],
+      ["Sin impuestos.", "li", "text-text-secondary"],
+      ["Sin cobro registrado (Emitida).", "li", "text-text-secondary"],
     ];
     for (const [text, opener, style] of vacios) {
       expect(plainTextBlock(INVOICES_CLIENT_CODE, text, `<${opener}`), text).toContain(style);
@@ -756,10 +751,7 @@ describe("facturación: el recargo del cobro en edición es estado derivado en v
     // Y no se reescribió la copia.
     expect(INVOICES_CLIENT_CODE).not.toContain("Cambia el recargo: el total cuadraría.");
     expect(INVOICES_CLIENT_CODE).not.toContain("El recargo no coincide.");
-    // Ni se le pasó el override polite a los fallos confirmados: solo hay UN
-    // destructivo con `role="status"` en todo el cliente, y es este.
-    expect([...INVOICES_CLIENT_CODE.matchAll(/<Alert variant="destructive" role="status"/g)]).toHaveLength(1);
-    expect(alertsWithVariant(INVOICES_CLIENT_CODE, "destructive")).toBe(7);
+    // El conteo único de `role="status"` destructivo queda cubierto arriba, en el bloqueo de caja.
   });
 });
 
@@ -776,20 +768,20 @@ describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", 
 
   // El botón nuevo, recortado de su `<button` al cierre de la etiqueta.
   const labelIndex = SPLIT_FORM.indexOf("Totalizar pago");
-  const buttonStart = SPLIT_FORM.lastIndexOf("<button", labelIndex);
+  const buttonStart = SPLIT_FORM.lastIndexOf("<Button", labelIndex);
   const TOTALIZE_BUTTON = SPLIT_FORM.slice(buttonStart, SPLIT_FORM.indexOf(">", labelIndex));
 
   it("el recorte del formulario de cobro es real (si el walk se rompe, esto falla)", () => {
     expect(splitFormStart, "onSubmit={submitSplit}").toBeGreaterThan(-1);
     expect(splitFormEnd, "</form> del cobro").toBeGreaterThan(splitFormStart);
-    expect(SPLIT_FORM).toContain("splitDraft.method_code");
-    expect(SPLIT_FORM).toContain("splitDraft.amount");
+    expect(SPLIT_FORM).toContain("portion.method_code");
+    expect(SPLIT_FORM).toContain("portion.amount");
     expect(SPLIT_FORM).toContain("Pagar");
     // El recorte del botón nuevo tampoco puede ser degenerado: sin estas
     // anclas, un `indexOf` en -1 devolvía un trozo arbitrario y el control
     // negativo de abajo pasaba por la razón equivocada.
     expect(labelIndex, "etiqueta Totalizar pago en el cobro").toBeGreaterThan(-1);
-    expect(buttonStart, "apertura <button del totalizar").toBeGreaterThan(-1);
+    expect(buttonStart, "apertura <Button del totalizar").toBeGreaterThan(-1);
     expect(TOTALIZE_BUTTON, "recorte del botón").toContain("onClick=");
     // El plural de la emisión NO está acá: si el recorte trajera el formulario
     // de emisión, esta guarda lo delata antes que cualquier otra.
@@ -801,10 +793,9 @@ describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", 
     // `type="button"` es la garantía de que NO puede enviar el formulario.
     expect(TOTALIZE_BUTTON).toContain('type="button"');
     expect(TOTALIZE_BUTTON).toContain("onClick={totalizeSplitPayment}");
-    // Misma forma de botón que el `Totalizar pagos` de la emisión: contorno de
-    // papel, sin relleno, y el mismo disable visible.
-    expect(TOTALIZE_BUTTON).toContain("border-paper-line-strong");
-    expect(TOTALIZE_BUTTON).toContain("disabled:cursor-not-allowed disabled:opacity-50");
+    // Contorno semántico del tema: legible en claro y oscuro.
+    expect(TOTALIZE_BUTTON).toContain('variant="outline"');
+    expect(TOTALIZE_BUTTON).toContain("disabled={!canTotalizeSplit || busy}");
     // El `title` espeja el de la creación, con el singular del detalle (acá se
     // cobra UNA porción, no varias).
     expect(TOTALIZE_BUTTON).toContain("Rellena el monto con el saldo neto pendiente");
@@ -818,12 +809,12 @@ describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", 
     // Un solo submit y un solo button en todo el formulario de cobro: si el
     // totalizar se colara como submit, el conteo pasaría a 2 y fallaría.
     expect([...SPLIT_FORM.matchAll(/type="submit"/g)]).toHaveLength(1);
-    expect([...SPLIT_FORM.matchAll(/type="button"/g)]).toHaveLength(1);
+    expect([...SPLIT_FORM.matchAll(/type="button"/g)]).toHaveLength(4);
     // El submit del formulario es el que dice "Pagar", y no el totalizar.
     const submitIdx = SPLIT_FORM.indexOf('type="submit"');
     const SUBMIT_BUTTON = SPLIT_FORM.slice(
-      SPLIT_FORM.lastIndexOf("<button", submitIdx),
-      SPLIT_FORM.indexOf("</button>", submitIdx),
+      SPLIT_FORM.lastIndexOf("<Button", submitIdx),
+      SPLIT_FORM.indexOf("</Button>", submitIdx),
     );
     expect(SUBMIT_BUTTON).toContain("Pagar");
     expect(SUBMIT_BUTTON).not.toContain("Totalizar pago");
@@ -834,13 +825,13 @@ describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", 
     // (`service.ts`: `remaining: round2(max(0, netRemaining))`). Se pina el
     // campo para que el gesto no se reapunte a `total` (que es BRUTO).
     expect(INVOICES_CLIENT_CODE).toMatch(
-      /const splitRemaining = detail \? Math\.max\(0, Number\(detail\.remaining\)\) : 0;/,
+      /const splitDifference = detail \? Number\(detail\.remaining\) - splitFilled : 0;/,
     );
     expect(INVOICES_CLIENT_CODE).toMatch(/function totalizeSplitPayment\(\) \{/);
     const handlerStart = INVOICES_CLIENT_CODE.indexOf("function totalizeSplitPayment()");
     const HANDLER = INVOICES_CLIENT_CODE.slice(handlerStart, INVOICES_CLIENT_CODE.indexOf("\n  }", handlerStart));
     // Escribe el monto del borrador de cobro con el NETO pendiente…
-    expect(HANDLER).toContain("setSplitDraft((prev) => ({ ...prev, amount: value }))");
+    expect(HANDLER).toContain("index === firstEmpty ? { ...portion, amount: value } : portion");
     // COP: la terminal no cobra centavos y la máscara solo deja dígitos.
     expect(HANDLER).toContain("copInputDigits(splitRemaining)");
     expect(HANDLER).not.toContain("Math.round(splitRemaining * 100) / 100");
@@ -850,11 +841,11 @@ describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", 
   });
 
   it("se desactiva con el mismo criterio que la emisión: nada que rellenar o `busy`", () => {
-    expect(INVOICES_CLIENT_CODE).toMatch(/const canTotalizeSplit = splitRemaining > 0;/);
+    expect(INVOICES_CLIENT_CODE).toMatch(/const canTotalizeSplit = splitRemaining > 0 && splitDrafts\.some/);
     expect(SPLIT_FORM).toMatch(/disabled=\{!canTotalizeSplit \|\| busy\}/);
   });
 
-  it("no se tocó el envío: el cobro sigue mandando una porción con el monto del borrador", () => {
-    expect(INVOICES_CLIENT_CODE).toContain("portions: [{ method_code: splitDraft.method_code, amount }],");
+  it("el envío conserva todas las porciones validadas del cobro dividido", () => {
+    expect(INVOICES_CLIENT_CODE).toContain("portions: parsedSplitPortions,");
   });
 });

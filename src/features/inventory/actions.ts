@@ -2,11 +2,12 @@
 
 import { cookies } from "next/headers";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
+import type { StockFilter } from "./schemas";
 import {
   InventoryError,
   getKardex,
   getProduct,
-  listProducts,
+  getProductCatalogPage,
   lowStockAlerts,
   registerManualMovement,
   requireInventoryAdmin,
@@ -28,12 +29,28 @@ function toFailure(error: unknown): { success: false; code: string; message: str
   return { success: false, code: "INTERNAL", message: "Error interno." };
 }
 
-/** Misma lógica que GET /api/v1/products (requiere sesión). */
-export async function listProductsAction(q?: string) {
+interface ProductCatalogRequest {
+  query?: string;
+  stockFilter?: StockFilter;
+  page?: number;
+  limit?: number;
+}
+
+/** Inventory catalog: filtering, paging and total are resolved on the server. */
+export async function listProductCatalogAction(input: ProductCatalogRequest = {}) {
   try {
-    await requireSession(await sessionToken());
-    const data = q?.trim() ? await searchProducts(q) : await listProducts();
-    return { success: true as const, data };
+    await requireInventoryWriter(await sessionToken());
+    return { success: true as const, data: await getProductCatalogPage(input) };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/** Bounded product lookup for the movement selector (requires inventory writer). */
+export async function searchProductsAction(q: string, limit?: number) {
+  try {
+    await requireInventoryWriter(await sessionToken());
+    return { success: true as const, data: await searchProducts(q, limit) };
   } catch (error) {
     return toFailure(error);
   }

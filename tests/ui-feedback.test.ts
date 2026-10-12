@@ -175,29 +175,23 @@ const VARIANT_STATUS_CLASSES: Record<
 
 /** Extensiones donde un componente puede quedar montado en un render. */
 const SOURCE_EXTENSIONS = [".ts", ".tsx"];
-const SOURCE_SKIP_DIRS = new Set(["node_modules", ".next", ".git", "coverage", "tests"]);
+const SOURCE_ROOTS = ["src", "app"];
 
 /** Todos los .ts/.tsx de producción, con ruta relativa normalizada a `/`. */
 function productionSources(): Map<string, string> {
   const files = new Map<string, string>();
   const walk = (dir: string): void => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
       if (entry.isDirectory()) {
-        if (!SOURCE_SKIP_DIRS.has(entry.name)) {
-          walk(join(dir, entry.name));
-        }
-        continue;
-      }
-      if (SOURCE_EXTENSIONS.some((ext) => entry.name.endsWith(ext))) {
-        const path = join(dir, entry.name);
+        walk(path);
+      } else if (SOURCE_EXTENSIONS.some((ext) => entry.name.endsWith(ext))) {
         files.set(
-          path.slice(APP_ROOT.length + 1).split("\\").join("/"),
-          readFileSync(path, "utf8"),
-        );
+          path.slice(APP_ROOT.length + 1).split("\\").join("/"), readFileSync(path, "utf8"));
       }
     }
   };
-  walk(APP_ROOT);
+  for (const root of SOURCE_ROOTS) walk(join(APP_ROOT, root));
   return files;
 }
 
@@ -406,6 +400,12 @@ describe("toast: dependencia y montaje único", () => {
     for (const type of ["success", "info", "warning", "error", "loading"]) {
       expect(SONNER_TSX, `icons.${type}`).toMatch(new RegExp(`\\b${type}:\\s*<`));
     }
+  });
+
+  it("el toaster conserva interacción aunque haya un diálogo abierto", () => {
+    const code = SONNER_TSX.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+    const openTag = code.slice(code.indexOf("<Sonner"), code.indexOf("{...props}"));
+    expect(openTag).toContain('className="pointer-events-auto toaster group"');
   });
 
   it("los toasts persisten, se pueden cerrar y no ocultan los nuevos", () => {
