@@ -10,6 +10,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { buildMigrationPlan, discoverMigrations } from "../scripts/portable-migrations.mjs";
 import { resolvePsql } from "../scripts/portable-migration-db.mjs";
+import { MIGRATION_MARKERS } from "../scripts/portable-migration-markers.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const planner = join(root, "scripts", "plan-portable-migrations.mjs");
@@ -56,6 +57,10 @@ try {
   const repoPlan = JSON.parse(readFileSync(output, "utf8"));
   assert.equal(repoPlan.format, 2);
   assert.match(repoPlan.markerContractsSha256, /^[a-f0-9]{64}$/);
+  const cashOpeningMarker = MIGRATION_MARKERS["009_cash_opening_bounds.sql"].sql;
+  for (const required of ["rolname IN ('anon', 'authenticated')", "cash_open_shift_atomic_legacy", "has_function_privilege", "grantee = 0"]) {
+    assert.ok(cashOpeningMarker.includes(required), `009 marker must check ${required}`);
+  }
   assert.deepEqual(repoPlan.discovered.map((migration) => migration.filename), [
     "002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql",
     "005_cop_whole_peso.sql", "006_installation_owner.sql", "007_money_cap_policy.sql",

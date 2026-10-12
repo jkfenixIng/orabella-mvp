@@ -16,8 +16,10 @@
 -- denomination lines (the same jsonb sum 003 already uses to freeze each
 -- method balance); M and B are read verbatim. The comparison is the guard.
 --
--- Same signature and 003 behaviour; CREATE OR REPLACE keeps the existing ACL
--- (PUBLIC revoked, service_role only). Transactional and idempotent.
+-- Same signature and 003 behavior. CREATE OR REPLACE preserves prior grants,
+-- so the explicit ACL below is required to deny Supabase's anon/authenticated
+-- defaults. The wrapper is SECURITY INVOKER, therefore service_role also needs
+-- EXECUTE on its internal legacy callee. Transactional and idempotent.
 BEGIN;
 
 CREATE OR REPLACE FUNCTION public.cash_open_shift_atomic(
@@ -130,6 +132,18 @@ END;
 $$;
 
 COMMENT ON FUNCTION public.cash_open_shift_atomic(uuid, uuid, numeric, jsonb) IS
-  '009: 003 opening wrapper (001 logic as cash_open_shift_atomic_legacy + one frozen base per active arqueable method) plus physical drawer bounds re-checked under lock: the denomination total must be >= the last close base_left (recount wins; 0 on first opening) and <= cash_registers.base_configurada. OPENING_ABOVE_BASE, OPENING_BELOW_PREVIOUS_CLOSE, OPENING_BASE_CONFLICT, SHIFT_BALANCE_MISMATCH, SHIFT_INVALID.';
+  '009: 003 opening wrapper (001 logic as cash_open_shift_atomic_legacy + one frozen base per active arqueable method) plus physical drawer bounds re-checked under lock: the denomination total must be >= the last close base_left (recount wins; 0 on first opening) and <= cash_registers.base_configurada. OPENING_ABOVE_BASE, OPENING_BELOW_PREVIOUS_CLOSE, OPENING_BASE_CONFLICT, SHIFT_BALANCE_MISMATCH, SHIFT_INVALID. Only service_role can execute it.';
+
+-- Supabase grants EXECUTE to anon/authenticated by default; revoking PUBLIC alone
+-- leaves those role-specific grants. The wrapper is SECURITY INVOKER and calls
+-- the legacy function, so service_role retains the internal EXECUTE it needs.
+REVOKE ALL ON FUNCTION public.cash_open_shift_atomic(uuid, uuid, numeric, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.cash_open_shift_atomic(uuid, uuid, numeric, jsonb) FROM anon;
+REVOKE ALL ON FUNCTION public.cash_open_shift_atomic(uuid, uuid, numeric, jsonb) FROM authenticated;
+GRANT EXECUTE ON FUNCTION public.cash_open_shift_atomic(uuid, uuid, numeric, jsonb) TO service_role;
+REVOKE ALL ON FUNCTION public.cash_open_shift_atomic_legacy(uuid, uuid, numeric, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.cash_open_shift_atomic_legacy(uuid, uuid, numeric, jsonb) FROM anon;
+REVOKE ALL ON FUNCTION public.cash_open_shift_atomic_legacy(uuid, uuid, numeric, jsonb) FROM authenticated;
+GRANT EXECUTE ON FUNCTION public.cash_open_shift_atomic_legacy(uuid, uuid, numeric, jsonb) TO service_role;
 
 COMMIT;

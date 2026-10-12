@@ -51,6 +51,22 @@ describe("portable migration marker contracts", () => {
     }
   });
 
+  it.each([
+    "GRANT EXECUTE ON FUNCTION public.cash_open_shift_atomic(uuid, uuid, numeric, jsonb) TO anon",
+    "GRANT EXECUTE ON FUNCTION public.cash_open_shift_atomic(uuid, uuid, numeric, jsonb) TO authenticated",
+    "GRANT EXECUTE ON FUNCTION public.cash_open_shift_atomic_legacy(uuid, uuid, numeric, jsonb) TO authenticated",
+    "GRANT EXECUTE ON FUNCTION public.cash_open_shift_atomic(uuid, uuid, numeric, jsonb) TO PUBLIC",
+    "REVOKE EXECUTE ON FUNCTION public.cash_open_shift_atomic_legacy(uuid, uuid, numeric, jsonb) FROM service_role",
+  ])("rejects 009 after: %s", async (statement) => {
+    const db = await buildSchemaDb({ catalog: false });
+    try {
+      await db.exec(statement);
+      expect(await marker(db, "009_cash_opening_bounds.sql")).toBe(false);
+    } finally {
+      await db.close();
+    }
+  });
+
   it("are false on the 001-only baseline", async () => {
     const db = await buildSchemaDb({ catalog: false, migrations: [SCHEMA_PATH] });
     try {

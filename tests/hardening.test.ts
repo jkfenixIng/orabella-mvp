@@ -1021,6 +1021,21 @@ describe("el squash: `001_orabella_schema.sql` es el archivo vivo (squash de la 
     expect(body).not.toMatch(/GRANT\s+(?:ALL|INSERT|UPDATE|DELETE)\s+ON public\.cop_legacy_cents_audit/i);
   });
 
+  it("009 restricts the opening wrapper and its invoker callee to service_role", () => {
+    const sql009 = readFileSync(join(SQUASH_DIR, "009_cash_opening_bounds.sql"), "utf8");
+    const statements = sqlStatements(sql009);
+    expect(stripSqlComments(sql009).trim()).toMatch(/^BEGIN;[\s\S]*COMMIT;$/);
+    expect(statements.find((statement) => /^CREATE OR REPLACE FUNCTION public\.cash_open_shift_atomic\(/.test(statement))).not.toMatch(/SECURITY DEFINER/);
+    for (const fn of ["cash_open_shift_atomic", "cash_open_shift_atomic_legacy"]) {
+      const signature = `public.${fn}(uuid, uuid, numeric, jsonb)`;
+      for (const role of ["PUBLIC", "anon", "authenticated"]) {
+        expect(statements).toContain(`REVOKE ALL ON FUNCTION ${signature} FROM ${role}`);
+      }
+      expect(statements).toContain(`GRANT EXECUTE ON FUNCTION ${signature} TO service_role`);
+    }
+    expect(statements.filter((statement) => /^GRANT\b/.test(statement))).toHaveLength(2);
+  });
+
   it("004's guard inspects the WHOLE function, not only its prefix (mutations of the real file)", () => {
     const real = readFileSync(join(SQUASH_DIR, "004_inventory_literal_search.sql"), "utf8");
     const mutate = (from: string, to: string) => {

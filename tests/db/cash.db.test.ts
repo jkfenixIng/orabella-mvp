@@ -41,6 +41,34 @@ describe("cash_open_shift_atomic", () => {
     expect(error.constraint ?? error.message).toContain("uq_cash_shifts_open_per_register");
   });
 
+  it("limits both opening functions to service_role", async () => {
+    const acl = await one<{ anon: boolean; authenticated: boolean; service: boolean; public_execute: boolean }>(db, `
+      SELECT bool_or(has_function_privilege('anon', p.oid, 'EXECUTE')) AS anon,
+             bool_or(has_function_privilege('authenticated', p.oid, 'EXECUTE')) AS authenticated,
+             bool_and(has_function_privilege('service_role', p.oid, 'EXECUTE')) AS service,
+             bool_or(EXISTS (
+               SELECT 1
+                 FROM pg_catalog.aclexplode(coalesce(p.proacl, pg_catalog.acldefault('f', p.proowner))) a
+                WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE'
+             )) AS public_execute
+        FROM pg_catalog.pg_proc p
+       WHERE p.oid IN (
+         'public.cash_open_shift_atomic(uuid,uuid,numeric,jsonb)'::regprocedure,
+         'public.cash_open_shift_atomic_legacy(uuid,uuid,numeric,jsonb)'::regprocedure
+       )
+    `);
+    expect(acl).toEqual({ anon: false, authenticated: false, service: true, public_execute: false });
+
+    for (const role of ["anon", "authenticated"]) {
+      await db.exec(`SET ROLE ${role}`);
+      try {
+        expect((await pgError(openShift(db, register, user))).code, role).toBe("42501");
+      } finally {
+        await db.exec("RESET ROLE");
+      }
+    }
+  });
+
   describe("009 drawer bounds", () => {
     /** Drawer by 1-peso denomination so any whole amount is a valid line. */
     const drawerLines = (cash: number) => [
