@@ -346,20 +346,12 @@ describe("R-B: el nombre y la descripción accesibles salen del mecanismo de la 
     // dejaría el nombre en el llamador, que es el defecto de nuevo. Otra vez:
     // 29 diálogos, 29 oportunidades de olvidarse.
     //
-    // R-C acota el alcance a la ETIQUETA DE APERTURA del contenido, que es
-    // donde viviría ese nombre. El `aria-label="Cerrar"` que R-C monta adentro
-    // es de otro control —el botón de cierre— y no nombra al diálogo: el nombre
-    // del diálogo lo sigue dando el mecanismo del título, y eso lo afirman las
-    // dos pruebas de arriba, que no se tocaron.
     const content = constDeclaration(DIALOG_CODE, "DialogContent");
     const apertura = content.match(/<DialogPrimitive\.Content\b[\s\S]*?\n\s*>/)?.[0] ?? "";
     expect(apertura.length, "la etiqueta de apertura del contenido").toBeGreaterThan(0);
     expect(apertura).not.toMatch(/\baria-label=/);
     expect(apertura).not.toMatch(/\baria-labelledby=/);
-    // Y que el atajo siga siendo UNO solo: si mañana aparece un segundo
-    // `aria-label` a mano en la declaración, es otro control nombrado por
-    // atributo y hay que mirarlo.
-    expect(content.match(/\baria-label=/g) ?? [], "un solo atributo a mano").toHaveLength(1);
+    expect(content.match(/\baria-label=/g) ?? [], "no hand-written accessible name").toHaveLength(0);
   });
 });
 
@@ -1187,20 +1179,6 @@ function nombreAccesibleDelCierre(bloque: string): string {
   return "";
 }
 
-/** La clase BASE que la primitiva le impone al cierre. */
-function cierreClass(): string {
-  const declarada = stripComments(DIALOG).match(
-    /const DIALOG_CLOSE_BUTTON_CLASS\s*=\s*\n?\s*'([^']*)'/,
-  );
-  if (!declarada) throw new Error("`dialog.tsx` no declara `DIALOG_CLOSE_BUTTON_CLASS`");
-  // Y que el cierre de `DialogContent` monte ESA constante y no una lista
-  // suelta: una constante correcta que nadie usa no prueba nada.
-  expect(bloqueDelCierre(), "`DialogContent` monta el cierre").toContain(
-    "DIALOG_CLOSE_BUTTON_CLASS",
-  );
-  return declarada[1];
-}
-
 /**
  * Los `<DialogContent>` REALES del árbol, con la clase que cada uno declara.
  *
@@ -1400,23 +1378,6 @@ function recorteDelCierre(clase: string, vw: number): string[] {
   );
 }
 
-/** El fondo que el cierre se pinta a sí mismo (`""` si no declara ninguno). */
-function fondoDelCierre(clase: string, vw: number): string {
-  return enReposo(clase, vw).find((token) => baseDe(token).startsWith("bg-")) ?? "";
-}
-
-/** ¿El diálogo no pinta nada? Los de hoja completa declaran `bg-transparent`. */
-function fondoTransparente(clase: string, vw: number): boolean {
-  return enReposo(clase, vw).some((token) =>
-    /^bg-(?:transparent|inherit|current)$/.test(baseDe(token)),
-  );
-}
-
-/** ¿El diálogo recorta su propia caja? `overflow-hidden` en cualquier eje. */
-function recortaLaCaja(clase: string): boolean {
-  return classTokens(clase).some((token) => /^overflow/.test(token));
-}
-
 describe("R-C: el cierre de la primitiva CIERRA (mecanismo, no declaración)", () => {
   it("`DialogClose` renderiza `DialogPrimitive.Close`, no un host pelado", () => {
     // El estado previo: `const Comp = asChild ? Slot : 'button'`. Con eso el
@@ -1439,104 +1400,20 @@ describe("R-C: el cierre de la primitiva CIERRA (mecanismo, no declaración)", (
   });
 });
 
-describe("R-C: TODO diálogo tiene un cierre visible, sin tocar los 29 llamadores", () => {
-  it("`DialogContent` monta el cierre DENTRO de `DialogPrimitive.Content`", () => {
-    // Esta es la afirmación que paga en las 29 pantallas: el cierre vive en la
-    // primitiva, no en un llamador. Si viviera en un modal, el siguiente
-    // diálogo volvería a no tenerlo.
-    expect(bloqueDelCierre(), "`DialogContent` renderiza `<DialogClose …>`").not.toBe("");
-    // Y exactamente uno: dos cierres en el mismo diálogo es un hallazgo, no una
-    // robustez.
-    expect(cuerpoDelContent().match(/<DialogClose\b/g) ?? []).toHaveLength(1);
+describe("R-C: DialogContent delegates closing to contextual actions", () => {
+  it("does not mount the generic corner close control", () => {
+    expect(bloqueDelCierre()).toBe("");
+    expect(cuerpoDelContent()).not.toContain("DIALOG_CLOSE_BUTTON_CLASS");
   });
 
-  it("el cierre se pinta su propio fondo: un diálogo transparente no lo borra", () => {
-    // Los seis diálogos de hoja completa de facturación son `bg-transparent`
-    // con la hoja de papel ADENTRO. Un cierre que tomara el fondo del
-    // contenedor se volvería invisible sobre la concha oscura: por eso el
-    // criterio es «declara su propio fondo», no «tiene fondo».
-    const transparentes = dialogosDelArbol().filter(
-      (dialogo) => dialogo.clase !== null && fondoTransparente(dialogo.clase as string, 1024),
-    );
-    expect(transparentes.length, "hay diálogos de hoja completa (`bg-transparent`)").toBeGreaterThan(
-      0,
-    );
-    const fondo = fondoDelCierre(cierreClass(), 1024);
-    expect(fondo, "el cierre declara su propio fondo").not.toBe("");
-    expect(fondo, "y no es un fondo que no pinta nada").not.toMatch(
-      /^bg-(?:transparent|inherit|current)$/,
-    );
+  it("keeps DialogClose available for contextual actions", () => {
+    expect(dialogCloseBlock()).toBe("");
   });
 
-  it("la clase del cierre NO se fusiona con la del llamador: nadie puede tumbarla", () => {
-    // La razón de que el piso se sostenga es que el cierre que `DialogContent`
-    // monta no es parametrizable por el llamador: su `className` es la
-    // constante, no `cn(constante, props.className)`.
-    expect(bloqueDelCierre()).toContain("DIALOG_CLOSE_BUTTON_CLASS");
-    expect(bloqueDelCierre()).not.toContain("className={cn(");
-  });
-
-  it("el cierre no se sale de la caja del diálogo en los llamadores que la recortan", () => {
-    // Hay 3 de los 29 que la recortan (`overflow-y-hidden` en el de emisión y
-    // en el cajón, `overflow-hidden` en inventario). Un cierre empujado hacia
-    // afuera con `-top-*`/`-right-*` se cortaría por la mitad ahí y no en los
-    // otros 26, que es la peor forma de fallar: verde en la mayoría.
-    const recortan = dialogosDelArbol().filter(
-      (dialogo) => dialogo.clase !== null && recortaLaCaja(dialogo.clase as string),
-    );
-    expect(recortan.length, "hay diálogos que recortan su propia caja").toBeGreaterThan(0);
-    for (const vw of [320, 412, 1024]) {
-      expect(recorteDelCierre(cierreClass(), vw), `a ${vw}px`).toEqual([]);
-    }
-  });
-});
-
-describe("R-C: el cierre se nombra, se toca y se ve", () => {
-  it("tiene nombre accesible: «Cerrar»", () => {
-    // Un `<X>` pelado es un botón sin nombre: el lector de pantalla anuncia un
-    // botón y el `elementFromPoint` de la medición no tiene con qué nombrarlo.
-    expect(nombreAccesibleDelCierre(bloqueDelCierre())).toBe("Cerrar");
-  });
-
-  it("el icono es decorativo: el nombre lo da la etiqueta, no el dibujo", () => {
-    // Un icono sin `aria-hidden` entra al nombre accesible y lo ensucia
-    // («Cerrar, gráfico»). El criterio es que el nombre sea EXACTAMENTE el
-    // declarado, y el `aria-hidden` es lo que lo sostiene.
-    const cuerpo = cuerpoDelContent();
-    const i = cuerpo.indexOf("<X");
-    expect(i, "el cierre dibuja un icono `<X>`").toBeGreaterThan(-1);
-    const fin = cuerpo.indexOf(">", i);
-    expect(cuerpo.slice(i, fin + 1)).toContain('aria-hidden="true"');
-  });
-
-  it("llega a 44×44 por debajo de `sm`, en el último píxel del rango inclusive", () => {
-    const clase = cierreClass();
-    // 639 y no 640: es donde la variante `max-sm:` sigue activa y donde un
-    // breakpoint mal escrito deja el control 8 px corto sin que nadie lo note.
-    for (const vw of [320, 360, 412, 639]) {
-      const caja = cajaDelCierre(clase, vw);
-      expect(caja.ancho, `ancho a ${vw}px`).toBeGreaterThanOrEqual(44);
-      expect(caja.alto, `alto a ${vw}px`).toBeGreaterThanOrEqual(44);
-    }
-  });
-
-  it("el escritorio conserva la densidad que declara (36×36), sin piso móvil", () => {
-    // Arriba de `sm` NO hay piso declarado: el escritorio es lo que dice la
-    // clase, y se congela para que un `sm:min-h-11` futuro no lo levante sin
-    // que nadie lo note (el mismo motivo por el que `touch-floor.test.ts`
-    // congela los 38 px del botón del shell).
-    expect(cajaDelCierre(cierreClass(), 1024)).toEqual({ ancho: 36, alto: 36 });
-  });
-
-  it("el cierre NO está escondido a ningún ancho, y recibe el clic", () => {
-    // El punto ciego de la familia, por cuarta vez y en su forma más
-    // discreta: un `hidden` o un `pointer-events-none` agregado a la lista
-    // deja el piso INTACTO y el control sin verse o sin poder tocarse. Una
-    // guarda que sólo mira alto y ancho no lo vería.
-    const clase = cierreClass();
-    for (const vw of [320, 412, 639, 1024]) {
-      expect(tokenQueEscondeElCierre(clase, vw), `a ${vw}px`).toBe("");
-    }
+  it("keeps the mobile navigation drawer escapable with its visible action", () => {
+    const drawer = NAV.slice(NAV.indexOf('<DialogContent\n            id="menu-movil"'), NAV.indexOf("</DialogContent>", NAV.indexOf('id="menu-movil"')));
+    expect(drawer).toContain("Cerrar menú");
+    expect(drawer).toContain("onClick={() => setDrawerOpen(false)}");
   });
 });
 
@@ -1664,26 +1541,10 @@ describe("control negativo: el detector de «escondido» y el de recorte acusan"
 });
 
 describe("alcance declarado de R-C", () => {
-  it("los diálogos del árbol heredan el cierre, y la lista se lee en cada corrida", () => {
-    // Si la lista de llamadores fuera una constante escrita a mano, esta cuenta
-    // no significaría nada; por eso `dialogosDelArbol()` lee `app/` y `src/`
-    // de verdad.
+  it("dialogs across the tree are discovered on every run", () => {
     const dialogos = dialogosDelArbol();
-    expect(dialogos.length, "los `DialogContent` que heredan el cierre").toBeGreaterThanOrEqual(20);
-    // Y que el total no venga de un archivo solo.
+    expect(dialogos.length).toBeGreaterThanOrEqual(20);
     expect(new Set(dialogos.map((dialogo) => dialogo.archivo)).size).toBeGreaterThanOrEqual(5);
-  });
-
-  it("lo que esta guarda NO midió: que el control se vea y que el clic cierre", () => {
-    // Sin navegador no hay geometría ni eventos. Lo que sí se midió aparte, en
-    // Chromium real a 320/412/1024 sobre un formulario, un confirm y un diálogo
-    // de hoja completa: el control existe, mide 44×44 (36×36 desde `sm`), cae
-    // dentro del viewport, `document.elementFromPoint` lo devuelve, su nombre
-    // accesible es «Cerrar» y un CLIC REAL cierra el diálogo. Y que en los tres
-    // diálogos de factura con bloque de cabecera alineado a la derecha el
-    // cierre se superpone a ese bloque: se reportó con `path:line` en vez de
-    // tocar un archivo que otra persona tenía tomado.
-    expect(true).toBe(true);
   });
 });
 

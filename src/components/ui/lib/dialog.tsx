@@ -2,7 +2,6 @@
 
 import * as React from 'react'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
-import { X } from 'lucide-react'
 import { cn } from './utils'
 
 type DialogProps = React.ComponentPropsWithoutRef<typeof DialogPrimitive.Root>
@@ -227,32 +226,10 @@ function usePopoverLayer(): number {
 }
 
 /**
- * R-C — LA CLASE DEL CIERRE QUE MONTA `DialogContent`, y que nadie puede
- * tumbar. Tres decisiones, cada una contra un defecto medido:
- *
- *   · ES UNA CONSTANTE, no `cn(constante, props.className)`: si el llamador
- *     pudiera fusionarle clases, cualquiera podría esconderla y el cierre
- *     volvería a no existir en esa pantalla. Por eso `className` acá es la
- *     constante, y `DialogClose` (el componente) sigue aceptando `className`
- *     para quien lo use por su cuenta.
- *   · DECLARA SU PROPIO FONDO: los seis diálogos de hoja completa de
- *     facturación son `bg-transparent` con la hoja de papel adentro; un cierre
- *     que tomará el fondo del contenedor se volvería invisible sobre la concha
- *     oscura.
- *   · NO SE SALE DE LA CAJA: `right-4 top-4`, nunca un desplazamiento negativo.
- *     Tres de los veintinueve diálogos recortan su propia caja
- *     (`overflow-y-hidden` en el de emisión y en el cajón, `overflow-hidden` en
- *     inventario): un cierre empujado hacia afuera se cortaría por la mitad ahí
- *     y en ningún otro lado, que es la peor forma de fallar.
- *
- * Medidas congeladas: 36×36 en escritorio (es la densidad que declara el
- * diálogo) y 44×44 debajo de `sm`, inclusive en el último píxel del rango
- * (639), porque ahí es donde un breakpoint mal escrito deja el control corto
- * sin que nadie lo note.
+ * `DialogContent` does not mount a generic corner close control: every dialog
+ * owns a contextual action (Cancel, Close, Back). Escape and outside click
+ * still dismiss through Radix unless a caller overrides those handlers.
  */
-const DIALOG_CLOSE_BUTTON_CLASS =
-  'absolute right-4 top-4 z-10 inline-flex h-9 w-9 items-center justify-center rounded-md border border-border-color bg-surface text-text-secondary shadow-sm transition-colors hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 max-sm:min-h-11 max-sm:min-w-11 dark:border-border-color-2 dark:bg-surface dark:text-text-primary'
-
 const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
   DialogContentProps
@@ -311,9 +288,6 @@ const DialogContent = React.forwardRef<
         )}
         {...props}
       >
-        <DialogClose aria-label="Cerrar" className={DIALOG_CLOSE_BUTTON_CLASS}>
-          <X aria-hidden="true" className="h-4 w-4" />
-        </DialogClose>
         {children}
       </DialogPrimitive.Content>
     </DialogPrimitive.Portal>

@@ -12,7 +12,7 @@ import {
 } from "@/src/components/ui/lib/dialog";
 import { ThemeToggle } from "@/src/shared/components/theme-toggle";
 
-interface NavLink {
+export interface NavLink {
   href: string;
   label: string;
   description: string;
@@ -20,13 +20,13 @@ interface NavLink {
   roles: string[];
 }
 
-interface NavGroup {
+export interface NavGroup {
   id: string;
   label: string;
   links: NavLink[];
 }
 
-const NAV_GROUPS: NavGroup[] = [
+export const NAV_GROUPS: NavGroup[] = [
   {
     id: "operacion",
     label: "Operación",
@@ -109,6 +109,20 @@ const NAV_GROUPS: NavGroup[] = [
 
 function isActive(pathname: string, href: string): boolean {
   return pathname === href || pathname.startsWith(`${href}/`);
+}
+
+export interface NavLocation {
+  group: Pick<NavGroup, "id" | "label">;
+  link: Pick<NavLink, "href" | "label">;
+}
+
+/** Route metadata shared by the sidebar and the breadcrumb. */
+export function findNavLocation(pathname: string): NavLocation | null {
+  for (const group of NAV_GROUPS) {
+    const link = group.links.find((candidate) => isActive(pathname, candidate.href));
+    if (link) return { group: { id: group.id, label: group.label }, link: { href: link.href, label: link.label } };
+  }
+  return null;
 }
 
 function groupHasActive(pathname: string, group: NavGroup): boolean {
@@ -358,15 +372,18 @@ export function MainNav({ roles, userName, alertsUnread }: { roles: string[]; us
             className="left-0 top-0 flex h-full max-h-none w-72 max-w-72 translate-x-0 translate-y-0 flex-col gap-4 overflow-y-auto rounded-none border-0 border-r border-border-color p-4 shadow-xl"
           >
             <DialogTitle className="sr-only">Menú principal</DialogTitle>
-            {/* R-C: el cierre del cajón lo monta `DialogContent` (la primitiva),
-                así que acá NO va una segunda ✕. Tenía una propia en este
-                encabezado, y con las dos el panel mostraba dos cierres en el
-                mismo borde: uno por la primitiva y otro por esta línea. */}
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-3">
               <span className="flex items-center gap-2 text-lg font-bold">
                 <SealMark />
                 Orabella
               </span>
+              <button
+                type="button"
+                onClick={() => setDrawerOpen(false)}
+                className="min-h-11 rounded-md px-3 py-2 text-sm font-medium text-text-secondary hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600"
+              >
+                Cerrar menú
+              </button>
             </div>
             {accordion(() => setDrawerOpen(false))}
             {footer}
