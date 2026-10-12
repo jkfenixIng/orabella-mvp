@@ -5,4 +5,5 @@
 - **Aplicado:** `008` corre en PRODUCCIÓN y en la base del CLIENTE (marcadores `002`–`008` en 7/7, inventario de objetos idéntico). PRUEBAS sigue sin `002`–`008`.
 - **Corrección reciente:** `009` agrega límites del efectivo físico de apertura y observabilidad de errores de apertura; PRUEBAS sin `003` falla la lectura del catálogo por la columna `arqueo_mode` ausente y la app ahora lo expone como error accionable.
 - **`009` aplicada (2026-10-12) en PRODUCCIÓN y CLIENTE:** `cash_open_shift_atomic` y `_legacy` ejecutables solo por `service_role`; marcadores `002`–`009` en 8/8, inventario idéntico. Evidencia en `~/orabella-db/evidencia-migraciones.txt`.
+- **UX (feat/ux-feedback):** diálogos mantienen errores inline; toasts son interactivos sin cerrar el modal; alertas usan selector claro; inicio saluda según sesión y módulos visibles; loading states cubren inicio, caja, admin, alertas y vales.
 - **Siguiente:** verificar el deploy de Vercel con la apertura de caja real. PRUEBAS ya no existe.

@@ -419,6 +419,7 @@ export function CashClient(props: CashClientProps) {
   const [histHasta, setHistHasta] = useState(props.initialHistory.hasta);
 
   const [error, setError] = useState<string | null>(null);
+  const [dialogError, setDialogError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [isOpeningDialogOpen, setIsOpeningDialogOpen] = useState(false);
   const [isClosingDialogOpen, setIsClosingDialogOpen] = useState(false);
@@ -492,11 +493,13 @@ export function CashClient(props: CashClientProps) {
   }
 
   async function startOpening() {
+    setDialogError(null);
     setOpenCounts({});
     setOpenDigitals({});
     setIsOpeningDialogOpen(true);
     const result = await listDenominationsAction();
     if (result.success) setDenominations(result.data);
+    else setDialogError(result.message);
   }
 
   function closeCashTotal(): number {
@@ -507,12 +510,14 @@ export function CashClient(props: CashClientProps) {
   }
 
   async function startClosing() {
+    setDialogError(null);
     setCloseCounts({});
     setCloseDigitals({});
     setCloseStep("counts");
     setIsClosingDialogOpen(true);
     const result = await listDenominationsAction();
     if (result.success) setDenominations(result.data);
+    else setDialogError(result.message);
   }
 
   // Inventory-style cancel: closing the dialog always resets its state,
@@ -559,6 +564,7 @@ export function CashClient(props: CashClientProps) {
   }
 
   async function startRecount(view: DayShiftView): Promise<void> {
+    setDialogError(null);
     setRecountTarget(view);
     setRecountCounts({});
     setRecountDigitals({});
@@ -566,6 +572,7 @@ export function CashClient(props: CashClientProps) {
     setRecountStep("counts");
     const result = await listDenominationsAction();
     if (result.success) setDenominations(result.data);
+    else setDialogError(result.message);
   }
 
   function cancelRecount(): void {
@@ -594,12 +601,14 @@ export function CashClient(props: CashClientProps) {
       });
       // La copia de éxito no necesita la data (con `result.data.recount` el
       // argumento se evalúa antes de que el guard la estreche).
-      if (!showResult(result, "Turno recontado. El cierre firmado queda intacto.")) {
+      if (!result.success) {
+        setDialogError(result.message);
         // Conteo que no cuadra: volver al detalle para corregirlo, igual que
         // hace el cierre.
         if (result.code === "COUNT_MISMATCH") setRecountStep("counts");
         return;
       }
+      showResult(result, "Turno recontado. El cierre firmado queda intacto.");
       cancelRecount();
       const dayResult = await getDayViewAction({ fecha: props.today });
       if (dayResult.success) setDay(dayResult.data);
@@ -642,7 +651,7 @@ export function CashClient(props: CashClientProps) {
         const dayResult = await getDayViewAction({ fecha: props.today });
         if (dayResult.success) setDay(dayResult.data);
       } else {
-        showResult(result, "");
+        setDialogError(result.message);
       }
     } finally {
       setBusy(false);
@@ -706,7 +715,7 @@ export function CashClient(props: CashClientProps) {
         if (histResult.success) setHistory(histResult.data);
       } else {
         if (result.code === "COUNT_MISMATCH") setCloseStep("counts");
-        showResult(result, "");
+        setDialogError(result.message);
       }
     } finally {
       setBusy(false);
@@ -856,6 +865,7 @@ export function CashClient(props: CashClientProps) {
               Declare la base de cada método arqueable: por denominaciones o por total, según su configuración.
             </p>
             <form onSubmit={handleOpen} className="mt-3 flex flex-col gap-3">
+              {dialogError ? <Alert variant="destructive">{dialogError}</Alert> : null}
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                     {activeArqueo.drawer && denominations.map((denom) => (
                   <label key={denom.id} className={labelClass}>
@@ -920,6 +930,7 @@ export function CashClient(props: CashClientProps) {
               <DialogTitle>Cerrar turno</DialogTitle>
             </DialogHeader>
             <form onSubmit={handleClose} className="mt-3 flex flex-col gap-3">
+              {dialogError ? <Alert variant="destructive">{dialogError}</Alert> : null}
             {closeStep === "counts" ? (
               <>
                 <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
@@ -1007,10 +1018,11 @@ export function CashClient(props: CashClientProps) {
               <DialogTitle>Recontar turno cerrado</DialogTitle>
             </DialogHeader>
             <p className={cn("mt-1", mutedTextClass)}>
-              El cierre firmado no se modifica. Cuente otra vez billetes y monedas por
-              denominación y declare los totales digitales; el sistema guarda las dos versiones.
+              El cierre original no cambia. Cuente de nuevo el efectivo y los totales digitales.
+              Se guardan las dos versiones.
             </p>
             <form onSubmit={handleRecount} className="mt-3 flex flex-col gap-3">
+              {dialogError ? <Alert variant="destructive">{dialogError}</Alert> : null}
               {recountStep === "counts" ? (
                 <>
                   <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
@@ -1069,7 +1081,7 @@ export function CashClient(props: CashClientProps) {
                       rows={3}
                       value={recountReason}
                       onChange={(event) => setRecountReason(event.target.value)}
-                      placeholder="Explique por qué se recontá el cierre."
+                      placeholder="Por qué se recuenta"
                     />
                   </label>
                 </div>

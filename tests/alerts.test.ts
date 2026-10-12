@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ALERT_ACTIONS,
@@ -665,5 +667,18 @@ describe("alerts: aprobar o rechazar un vale deja leída SU alerta", () => {
     expect(dbStub.filas.find((fila) => fila.id === "alerta-9")?.is_read).toBe(false);
     // Y el guard del guard: sin esta fila, el control podría pasar por casualidad.
     expect(() => expect(porSede.data).not.toBeNull()).toThrow();
+  });
+});
+
+describe("alerts: selector de lectura", () => {
+  it("expone opciones claras para sin leer y todas", () => {
+    const source = readFileSync(join(process.cwd(), "app", "alerts", "alerts-client.tsx"), "utf8");
+    expect(source).toContain('<legend className="sr-only">Estado de alertas</legend>');
+    expect(source).toContain("aria-pressed={unreadOnly}");
+    expect(source).toContain("aria-pressed={!unreadOnly}");
+    expect(source).toContain("Sin leer");
+    expect(source).toContain("Todas");
+    expect(source).toContain("fetchAlerts(1, true, module, dateFrom, dateTo)");
+    expect(source).toContain("fetchAlerts(1, false, module, dateFrom, dateTo)");
   });
 });

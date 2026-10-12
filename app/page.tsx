@@ -8,47 +8,48 @@ import { getSessionUser } from "@/src/features/auth/service";
 import { countUnreadAlerts } from "@/src/features/alerts/service";
 import { listProducts } from "@/src/features/inventory/service";
 import { filterLowStock } from "@/src/features/inventory/schemas";
+import { homeWelcomeDescription, homeWelcomeTitle } from "./home-copy";
 
 const MODULES = [
   {
     href: "/invoices",
     name: "Facturación",
-    purpose: "Cree las cuentas de sus clientes y reciba pagos en efectivo, tarjeta o mezcla de ambos.",
+    purpose: "Cree cuentas y reciba pagos.",
     Icon: Receipt,
     roles: ["admin", "caja", "empleado"],
   },
   {
     href: "/cash",
     name: "Caja",
-    purpose: "Abra y cierre turnos, registre movimientos y revise el día.",
+    purpose: "Abra y cierre turnos y revise el día.",
     Icon: Wallet,
     roles: ["admin", "caja"],
   },
   {
     href: "/inventory",
     name: "Inventario",
-    purpose: "Controle los productos de la tienda: existencias, entradas, salidas y alertas de poco stock.",
+    purpose: "Controle existencias y productos con poco stock.",
     Icon: Package,
     roles: ["admin", "caja"],
   },
   {
     href: "/admin",
     name: "Administración",
-    purpose: "Gestione empleados, servicios, precios, impuestos y formas de pago de su sede.",
+    purpose: "Configure empleados, impuestos y pagos.",
     Icon: Settings,
     roles: ["admin"],
   },
   {
     href: "/payroll",
     name: "Nómina",
-    purpose: "Calcule la nómina del personal desde la facturación.",
+    purpose: "Calcule la nómina del personal.",
     Icon: Calculator,
     roles: ["admin", "empleado"],
   },
   {
     href: "/vales",
     name: "Vales",
-    purpose: "Solicite y apruebe vales para empleados con topes.",
+    purpose: "Solicite y apruebe vales.",
     Icon: Ticket,
     roles: ["admin", "caja", "empleado"],
   },
@@ -67,23 +68,15 @@ export default async function HomePage() {
     module.roles.some((role) => session.roles.includes(role)),
   );
   const canSeeInventory = visibleModules.some((module) => module.href === "/inventory");
+  const welcomeTitle = homeWelcomeTitle(session.user.full_name);
+  const welcomeDescription = homeWelcomeDescription(visibleModules.map((module) => module.name));
   const lowStock = canSeeInventory ? filterLowStock(await listProducts()) : [];
   const isAdmin = session.roles.includes("admin");
   const unreadAlerts = isAdmin ? await countUnreadAlerts("caja").catch(() => 0) : 0;
 
   return (
     <PageContainer>
-      {/* Hero de inicio: el antetítulo "Bienvenido a" no lo modela `PageHeader`,
-          así que se conserva inline. El `gap-1` (4px) mantiene la misma
-          separación que tenía el `mt-1` del `<h1>`: el `<h1>` —siempre
-          `text-3xl font-bold`— lo pone el primitivo. */}
-      <div className="flex flex-col gap-1">
-        <p className="text-sm font-medium text-text-tertiary">Bienvenido a</p>
-        <PageHeader
-          title="Orabella"
-          description="El sistema de su negocio de belleza: ventas, caja, inventario y personal en un solo lugar. Elija un módulo para empezar."
-        />
-      </div>
+      <PageHeader title={welcomeTitle} description={welcomeDescription} />
 
       {/* Alerta de error: mismo shape que el aviso ámbar canónico, con tokens de error. */}
       {unreadAlerts > 0 ? (

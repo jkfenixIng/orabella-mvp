@@ -88,6 +88,7 @@ export function VouchersClient(props: VouchersClientProps) {
   // corrija (fallo de acción o validación incompleta). Lo que acaba de pasar
   // (éxito) es EVENTO y sale por `toast`, no por estado.
   const [error, setError] = useState<string | null>(null);
+  const [createError, setCreateError] = useState<string | null>(null);
   const [voucherEmployee, setVoucherEmployee] = useState("");
   const [voucherAmount, setVoucherAmount] = useState("");
   const [voucherMethod, setVoucherMethod] = useState("");
@@ -291,11 +292,11 @@ export function VouchersClient(props: VouchersClientProps) {
     event.preventDefault();
     const amount = toNumber(voucherAmount);
     if (!voucherEmployee || amount === null) {
-      setError("Elija el empleado e indique un monto mayor a 0.");
+      setCreateError("Elija el empleado e indique un monto mayor a 0.");
       return;
     }
     if (!voucherMethod) {
-      setError("Elija el método de pago por el que saldrá el dinero.");
+      setCreateError("Elija el método de pago por el que saldrá el dinero.");
       return;
     }
     // V1: fuera de rango no se envía todavía: primero se confirma que nacerá
@@ -311,6 +312,7 @@ export function VouchersClient(props: VouchersClientProps) {
   // Llega acá directo (en rango) o tras confirmar (fuera de rango).
   async function submitVoucherRequest(amount: number) {
     setBusy(true);
+    setCreateError(null);
     // CL-5: la marca del INTENTO. Se acuña al empezar y se conserva si el
     // intento falla (el reintento tiene que llevar la misma para que el servidor
     // devuelva el vale ya registrado en vez de abrir un segundo vale).
@@ -326,18 +328,17 @@ export function VouchersClient(props: VouchersClientProps) {
       observation: voucherNote || undefined,
     })) as ActionResult<VoucherRequestResult>;
     setBusy(false);
-    // V1: la confirmación cumplió su papel en cuanto el intento obtuvo
-    // respuesta: el éxito o el fallo se muestran donde siempre (toast y Alert
-    // del alta, que queda al descubierto). No se reabre ni se reintenta sola.
+    if (!result.success) {
+      setCreateError(`${result.code}: ${result.message}`);
+      return;
+    }
     setOutOfRangeConfirmOpen(false);
     if (
       show(
         result,
-        !result.success
-          ? undefined
-          : result.data.auto_approved
-            ? "Vale aprobado: dentro de rango se generó directo con su método de pago."
-            : "Vale pendiente: fuera de rango (día o topes), el admin debe autorizarlo.",
+        result.data.auto_approved
+          ? "Vale aprobado: dentro de rango se generó directo con su método de pago."
+          : "Vale pendiente: fuera de rango (día o topes), el admin debe autorizarlo.",
       )
     ) {
       setVoucherAmount("");
@@ -356,35 +357,44 @@ export function VouchersClient(props: VouchersClientProps) {
    */
   function closeCreateDialog() {
     voucherKeyRef.current = null;
+    setCreateError(null);
     setIsCreateOpen(false);
   }
 
-  async function handleApprove(id: string) {
+  async function handleApprove(id: string): Promise<boolean> {
     setBusy(true);
     const result = (await approveVoucherAction(id, {
       observation: reviewNote || undefined,
     })) as ActionResult<VoucherRequestRow>;
     setBusy(false);
-    if (show(result, "Vale aprobado. Su alerta quedó resuelta.")) {
-      setReviewNote("");
-      await refreshVouchers();
+    if (!result.success) {
+      setReviewError(`${result.code}: ${result.message}`);
+      return false;
     }
+    show(result, "Vale aprobado. Su alerta quedó resuelta.");
+    setReviewNote("");
+    await refreshVouchers();
+    return true;
   }
 
-  async function handleReject(id: string) {
+  async function handleReject(id: string): Promise<boolean> {
     if (!rejectReason.trim()) {
-      setError("El motivo del rechazo es requerido.");
-      return;
+      setReviewError("El motivo del rechazo es requerido.");
+      return false;
     }
     setBusy(true);
     const result = (await rejectVoucherAction(id, {
       motivo: rejectReason,
     })) as ActionResult<VoucherRequestRow>;
     setBusy(false);
-    if (show(result, "Vale rechazado. Su alerta quedó resuelta.")) {
-      setRejectReason("");
-      await refreshVouchers();
+    if (!result.success) {
+      setReviewError(`${result.code}: ${result.message}`);
+      return false;
     }
+    show(result, "Vale rechazado. Su alerta quedó resuelta.");
+    setRejectReason("");
+    await refreshVouchers();
+    return true;
   }
 
   function openReview(id: string, action: "approve" | "reject") {
@@ -409,12 +419,9 @@ export function VouchersClient(props: VouchersClientProps) {
       return;
     }
     const { id, action } = reviewTarget;
-    if (action === "approve") {
-      await handleApprove(id);
-    } else {
-      await handleReject(id);
-    }
-    closeReview();
+    setReviewError(null);
+    const done = action === "approve" ? await handleApprove(id) : await handleReject(id);
+    if (done) closeReview();
   }
 
   // Filtrado en cliente: estado exacto y empleado por nombre/ID interno. El
@@ -469,12 +476,13 @@ export function VouchersClient(props: VouchersClientProps) {
               type="button"
               title={
                 !configured
-                  ? "Configure los topes antes de solicitar vales"
+                  ? "Primero configure los topes"
                   : shiftBlockReason ?? undefined
               }
               disabled={!configured || shiftBlockReason !== null}
               onClick={() => {
                 setError(null);
+                setCreateError(null);
                 setIsCreateOpen(true);
               }}
               className={`${buttonClass} disabled:cursor-not-allowed disabled:opacity-50`}
@@ -513,6 +521,7 @@ export function VouchersClient(props: VouchersClientProps) {
                 <DialogTitle>Solicitar vale</DialogTitle>
               </DialogHeader>
               <form onSubmit={handleRequestVoucher} className="mt-3 flex flex-col gap-3">
+                {createError ? <Alert variant="destructive">{createError}</Alert> : null}
                 <label className={labelClass}>
                   Empleado
                   <Combobox
@@ -597,6 +606,7 @@ export function VouchersClient(props: VouchersClientProps) {
             busyLabel="Solicitando…"
             variant="default"
             busy={busy}
+            error={createError}
             onConfirm={() => {
               // El aviso solo existe con monto válido, pero la carga útil
               // nunca se inventa: sin monto no se envía nada.

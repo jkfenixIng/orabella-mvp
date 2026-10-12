@@ -58,6 +58,7 @@ export function CashSection({
   const [baseError, setBaseError] = useState<string | null>(null);
   const [addError, setAddError] = useState<string | null>(null);
   const [denominationError, setDenominationError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   function openAdd() {
@@ -74,11 +75,13 @@ export function CashSection({
 
   function openDelete(row: CashDenominationRow) {
     setDenominationError(null);
+    setDeleteError(null);
     setPendingDelete(row);
   }
 
   function closeDelete() {
     setPendingDelete(null);
+    setDeleteError(null);
   }
 
   async function handleBase(registerId: string) {
@@ -146,17 +149,16 @@ export function CashSection({
 
   async function removeDenomination(id: string) {
     setBusy(true);
-    setDenominationError(null);
+    setDeleteError(null);
     const result = await deleteDenominationAction(id);
     setBusy(false);
-    // `ConfirmDialog` no tiene prop de error: el fallo cierra la confirmación y
-    // queda en el `Alert` de la lista, que es donde el usuario puede leerlo y
-    // reintentar. Dejarlo abierto taparía el mensaje detrás del overlay.
-    setPendingDelete(null);
+    // El fallo se queda DENTRO de la confirmación abierta: ahí el usuario lo
+    // lee y puede reintentar o cancelar.
     if (!result.success) {
-      setDenominationError(result.message);
+      setDeleteError(result.message);
       return;
     }
+    setPendingDelete(null);
     setDenominations((current) => current.filter((item) => item.id !== id));
     toast.success("Denominación eliminada.");
   }
@@ -279,6 +281,7 @@ export function CashSection({
         busyLabel="Eliminando…"
         variant="destructive"
         busy={busy}
+        error={deleteError}
         onConfirm={() => {
           if (pendingDelete) {
             void removeDenomination(pendingDelete.id);

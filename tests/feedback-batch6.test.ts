@@ -368,8 +368,8 @@ describe("caja: lo efímero va por el toast (evento)", () => {
     // de éxito (los `showResult(result, "")` de las ramas de fallo no lo tocan).
     expect(CASH_CLIENT_CODE).toMatch(/toast\.success\(okMessage\)/);
     expect(CASH_CLIENT_CODE).toMatch(/if \(okMessage\) \{/);
-    // Las dos llamadas con copia vacía existen: el guard no es decorativo.
-    expect(linesWith(CASH_CLIENT_CODE, 'showResult(result, "");')).toHaveLength(2);
+    // Abrir y cerrar ya no usan el embudo para fallar: su error queda en el diálogo.
+    expect(linesWith(CASH_CLIENT_CODE, 'showResult(result, "");')).toHaveLength(0);
   });
 
   it("el aviso de éxito dejó de ser estado: ya no hay `notice` ni setNotice", () => {
@@ -401,13 +401,11 @@ describe("caja: lo efímero va por el toast (evento)", () => {
    Las dos superficies: lo persistente va por Alert (estado)
    ========================================================================== */
 describe("caja: lo persistente va por Alert (estado)", () => {
-  it("el cliente tiene un solo Alert, destructivo: el error compartido", () => {
-    // Un solo mensaje persistente en todo el cliente (el fallo de abrir o cerrar
-    // el turno). Si apareciera un Alert de más, o alguien cambiara la variante,
-    // el conteo lo delata.
+  it("el cliente usa Alert destructivo para la página y para cada diálogo de escritura", () => {
+    // Uno para fallos de la vista y uno dentro de abrir, cerrar y recontar.
     expect(CASH_CLIENT_CODE).toMatch(ALERT_IMPORT);
-    expect(alertOpenerCount(CASH_CLIENT_CODE)).toBe(1);
-    expect(alertsWithVariant(CASH_CLIENT_CODE, "destructive")).toBe(1);
+    expect(alertOpenerCount(CASH_CLIENT_CODE)).toBe(4);
+    expect(alertsWithVariant(CASH_CLIENT_CODE, "destructive")).toBe(4);
     expect(alertsWithVariant(CASH_CLIENT_CODE, "warning")).toBe(0);
     // Ni `info` ni `success` como `Alert`: nada se confirma por estado (eso es
     // evento y va por toast) y no hay datos de color neutro que anunciar.

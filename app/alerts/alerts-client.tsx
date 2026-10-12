@@ -66,7 +66,7 @@ function alertDetail(alert: AlertRow): string {
     if (meta.over_day) reasons.push("sobre tope diario");
     if (meta.over_week) reasons.push("sobre tope semanal");
     if (meta.day_not_allowed) reasons.push("día no permitido");
-    return `Vale por ${amount} que exige revisión (${reasons.join(", ") || "revise el detalle"}). Acepte o rechace con motivo en Vales.`;
+    return `Vale por ${amount} por revisar (${reasons.join(", ") || "ver detalle"}). Resuélvalo en Vales.`;
   }
   return `${alert.action} en ${alert.entity}.`;
 }
@@ -193,15 +193,27 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
               className={inputClass}
             />
           </label>
-          <button
-            type="button"
-            className={ghostClass}
-            aria-pressed={unreadOnly}
-            disabled={busy || isViewPending}
-            onClick={() => fetchAlerts(1, !unreadOnly, module, dateFrom, dateTo)}
-          >
-            Sin leer
-          </button>
+          <fieldset className="flex rounded-md border border-border-color p-1 dark:border-border-color-2">
+            <legend className="sr-only">Estado de alertas</legend>
+            <button
+              type="button"
+              className={cn(ghostClass, unreadOnly && "bg-surface-hover")}
+              aria-pressed={unreadOnly}
+              disabled={busy || isViewPending}
+              onClick={() => fetchAlerts(1, true, module, dateFrom, dateTo)}
+            >
+              Sin leer
+            </button>
+            <button
+              type="button"
+              className={cn(ghostClass, !unreadOnly && "bg-surface-hover")}
+              aria-pressed={!unreadOnly}
+              disabled={busy || isViewPending}
+              onClick={() => fetchAlerts(1, false, module, dateFrom, dateTo)}
+            >
+              Todas
+            </button>
+          </fieldset>
         </div>
 
         <ul className="mt-3 flex flex-col gap-2 text-sm">
@@ -251,12 +263,12 @@ export function AlertsClient({ initial }: { initial: AlertsResult }) {
                     }}
                   >
                     <label className={labelClass}>
-                      Justificación (queda en la traza)
+                      Justificación
                       <textarea
                         className={inputClass}
                         value={reviewNote}
                         onChange={(event) => setReviewNote(event.target.value)}
-                        placeholder="Qué pasó y qué se habló"
+                        placeholder="Qué pasó"
                         rows={2}
                       />
                     </label>
