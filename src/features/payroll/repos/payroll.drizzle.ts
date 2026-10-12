@@ -15,7 +15,7 @@
  * - Requires migrations 001-004: voucher method/shift/creator columns and the
  *   003 cash triggers always exist, so there is no column probe here.
  */
-import { and, asc, desc, eq, gte, inArray, isNull, lte, ne, sql, type SQL } from "drizzle-orm";
+import { and, asc, count, desc, eq, gte, ilike, inArray, isNull, lte, ne, or, sql, type SQL } from "drizzle-orm";
 import type { Database } from "@/src/shared/db/client";
 import { toDbError } from "@/src/shared/db/errors";
 import { callRpc, type RpcArg } from "@/src/shared/db/rpc";
@@ -36,7 +36,7 @@ import {
   voucherRequests,
 } from "@/src/shared/db/schema";
 import { withPostgrestTimestamps } from "@/src/shared/db/timestamps";
-import type { PayrollPage, PayrollRepo, PayrollResult } from "./payroll";
+import type { PayrollCount, PayrollPage, PayrollPeriodQuery, PayrollRepo, PayrollResult } from "./payroll";
 
 type Row = Record<string, unknown>;
 const NO_ROWS = { code: "PGRST116", message: "JSON object requested, multiple (or no) rows returned", details: "0 rows" };
@@ -195,6 +195,19 @@ function voucherPatch(patch: Row) {
   };
 }
 
+/** Same predicate as the supabase adapter's `applyPeriodFilters`. */
+function periodWhere(filters: PayrollPeriodQuery): SQL | undefined {
+  const pattern = filters.term ? `%${filters.term}%` : null;
+  return and(
+    filters.status ? eq(payrollPeriods.status, filters.status) : undefined,
+    filters.frequency === null ? isNull(payrollPeriods.frequency) : filters.frequency ? eq(payrollPeriods.frequency, filters.frequency) : undefined,
+    filters.from ? gte(payrollPeriods.startDate, filters.from) : undefined,
+    filters.to ? lte(payrollPeriods.startDate, filters.to) : undefined,
+    filters.day ? and(lte(payrollPeriods.startDate, filters.day), gte(payrollPeriods.endDate, filters.day)) : undefined,
+    pattern ? or(ilike(payrollPeriods.frequency, pattern), ilike(payrollPeriods.status, pattern)) : undefined,
+  );
+}
+
 function rpc(db: Database, fn: string, args: RpcArg[]) {
   return query(() => callRpc<unknown>(db, fn, args));
 }
@@ -225,6 +238,18 @@ export function drizzlePayrollRepo(db: Database): PayrollRepo {
       ),
     periodsPage: (from, to) =>
       page((offset, limit) => db.select(PERIOD).from(payrollPeriods).orderBy(desc(payrollPeriods.startDate), asc(payrollPeriods.id)).offset(offset).limit(limit), from, to),
+    listPeriods: (filters, window) =>
+      many(() =>
+        db.select(PERIOD).from(payrollPeriods).where(periodWhere(filters)).orderBy(desc(payrollPeriods.startDate), asc(payrollPeriods.id)).offset(window.offset).limit(window.limit),
+      ),
+    countPeriods: async (filters): Promise<PayrollCount> => {
+      try {
+        const [value] = await db.select({ total: count() }).from(payrollPeriods).where(periodWhere(filters));
+        return { data: null, count: Number(value?.total ?? 0), error: null };
+      } catch (error) {
+        return { data: null, count: null, error: toDbError(error) };
+      }
+    },
     findPeriod: (id) => maybe(() => db.select(PERIOD).from(payrollPeriods).where(eq(payrollPeriods.id, id)).limit(1)),
     closePeriod: (id, closedAt) =>
       single(() => db.update(payrollPeriods).set({ status: "cerrado", closedAt }).where(eq(payrollPeriods.id, id)).returning(PERIOD)),
@@ -431,22 +456,6 @@ export function drizzlePayrollRepo(db: Database): PayrollRepo {
       page((offset, limit) =>
         db
           .select({ id: voucherRequests.id, request_date: voucherRequests.requestDate, amount: voucherRequests.amount, status: voucherRequests.status })
-          .from(voucherRequests)
-          .where(
-            and(
-              eq(voucherRequests.employeeId, employeeId),
-              inArray(voucherRequests.status, statuses),
-              gte(voucherRequests.requestDate, start),
-              lte(voucherRequests.requestDate, end),
-            ),
-          )
-          .orderBy(asc(voucherRequests.id))
-          .offset(offset)
-          .limit(limit), from, to),
-    employeeVoucherIdsPage: (employeeId, statuses, start, end, from, to) =>
-      page((offset, limit) =>
-        db
-          .select({ id: voucherRequests.id })
           .from(voucherRequests)
           .where(
             and(

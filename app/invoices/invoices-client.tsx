@@ -220,7 +220,7 @@ function CommissionModeSelector(props: {
   };
   return (
     <div
-      className="inline-flex overflow-hidden rounded-md border border-slate-300"
+      className="inline-flex overflow-hidden rounded-md border border-border-color dark:border-border-color-2"
       role="group"
       aria-label={props.ariaLabel}
     >
@@ -239,8 +239,8 @@ function CommissionModeSelector(props: {
                  negativa: `h-11` o `sm:min-h-11` subirían el escritorio, que
                  es la densidad que esta fila conserva. MEDIDO después: 12 px y
                  44 px a 320/412, 12 px y 24 px a 640/1024. */
-                "bg-slate-900 px-2 py-1 text-xs font-semibold text-white max-sm:min-h-11"
-              : "bg-white px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 max-sm:min-h-11"
+                "bg-primary-600 px-2 py-1 text-xs font-semibold text-white max-sm:min-h-11"
+              : "bg-surface px-2 py-1 text-xs font-medium text-text-secondary hover:bg-surface-hover max-sm:min-h-11"
           }
         >
           {labels[mode]}
@@ -1439,7 +1439,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
         type="button"
         onClick={() => setClientView((prev) => !prev)}
         aria-pressed={clientView}
-        className="inline-flex items-center gap-2 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-100"
+        className="inline-flex items-center gap-2 rounded-md border border-border-color bg-surface px-3 py-1.5 text-xs font-semibold text-text-primary transition-colors hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 dark:border-border-color-2"
       >
         {clientView ? (
           <EyeOff className="h-3.5 w-3.5" aria-hidden="true" />
@@ -1455,8 +1455,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
   // oscuro, el filete del tema separa la hoja del cromo de la app.
   const paperSheetClass =
     "rounded-xl bg-paper-surface text-paper-ink shadow-2xl dark:shadow-none dark:ring-1 dark:ring-border-color-2";
-  const paperInputClass =
-    "flex h-10 w-full rounded-md border border-paper-line-strong bg-paper-surface px-3 text-sm text-paper-ink outline-none transition-colors placeholder:text-paper-ink-soft focus:border-paper-ink-muted disabled:cursor-not-allowed disabled:opacity-50";
+  const workflowSheetClass =
+    "rounded-xl border border-border-color bg-surface text-text-primary shadow-xl dark:border-border-color-2 dark:bg-surface dark:text-text-primary";
+  const workflowInputClass = inputClass;
+  const workflowPanelClass =
+    "rounded-lg border border-border-color bg-surface-hover text-text-primary dark:border-border-color-2 dark:bg-surface-hover dark:text-text-primary";
+  const workflowFooterClass =
+    "border-t border-border-color dark:border-border-color-2";
 
   // Empleado elegido en el diálogo de ítem: define si el porcentaje del
   // personalizado se toma del empleado o se digita explícitamente.
@@ -1502,18 +1507,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 {/* R32, LA ESTRUCTURA — `flex flex-col overflow-y-hidden`: el diálogo deja de ser el scroller y pasa a ser una columna cuyas tres piezas son encabezado (fijo), medio (scrollea) y pie (fijo). MEDIDO antes, en Chromium, con la sesión y sin enviar nada: 1005 px de contenido en una caja de 536 px a 320×568 y el envío en `y 961-1001`, o sea 393 px más allá del borde inferior del viewport: guardar exigía ~450 px de scroll DENTRO del diálogo (a 390×844, `y 961-1001` contra 844, igual de fuera).
                     Misma composición que `FormDialog` (encabezado / medio / pie) y SIN `sticky`: el bloque contenedor de un ítem de grilla es su ÁREA, sin recorrido para anclarse, así que un pie pegado con `position: sticky` funcionaría en Chromium y quedaría colgando de la palabra de otro motor. Acá la corrección vive en el árbol, no en el CSS. */}
                 <DialogContent className="max-w-5xl flex flex-col overflow-y-hidden border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
-                  <div className={cn("flex min-h-0 flex-1 flex-col", paperSheetClass)}>
+                  <div className={cn("flex min-h-0 flex-1 flex-col", workflowSheetClass)}>
                     <DialogHeader className="block shrink-0">
                       <DialogTitle className="sr-only">FACTURA DE VENTA</DialogTitle>
-                    <div className="border-b-4 border-double border-paper-line-strong px-6 py-5 sm:px-8">
+                    <div className="border-b-4 border-double border-border-color dark:border-border-color-2 px-6 py-5 sm:px-8">
                       <div className="flex flex-wrap items-start justify-between gap-4">
                         <div>
                           <p className="text-xl font-black tracking-tight">ORABELLA</p>
-                          <p className="text-xs text-paper-ink-muted">Belleza · Factura de venta</p>
+                          <p className="text-xs text-text-secondary">Belleza · Factura de venta</p>
                         </div>
                         <div className="text-right">
                           <h2 className="text-lg font-bold">FACTURA DE VENTA</h2>
-                          <p className="text-sm text-paper-ink-muted">N.º por asignar · {todayStr}</p>
+                          <p className="text-sm text-text-secondary">N.º por asignar · {todayStr}</p>
                           <Badge variant="warning" className="mt-1">
                             Borrador
                           </Badge>
@@ -1528,7 +1533,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         <label className="flex flex-col gap-1 text-sm font-medium">
                           Señor(es)
                           <input
-                            className={paperInputClass}
+                            className={workflowInputClass}
                             value={clientName}
                             onChange={(event) => setClientName(event.target.value)}
                             placeholder="Nombre del cliente (opcional)"
@@ -1537,7 +1542,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         <label className="flex flex-col gap-1 text-sm font-medium">
                           Documento (opcional)
                           <input
-                            className={paperInputClass}
+                            className={workflowInputClass}
                             value={clientDocument}
                             onChange={(event) => setClientDocument(event.target.value)}
                             placeholder="CC / NIT"
@@ -1548,10 +1553,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         <div className="flex justify-end">
                           {clientViewToggle()}
                         </div>
-                        <div className="overflow-x-auto rounded-lg border border-paper-line">
-                          <table className="w-full min-w-[820px] text-left text-sm text-paper-ink">
+                        <div className="overflow-x-auto rounded-lg border border-border-color dark:border-border-color-2">
+                          <table className="w-full min-w-[820px] text-left text-sm text-text-primary">
                             <thead>
-                              <tr className="bg-paper-surface-muted text-xs uppercase tracking-wide text-paper-ink-muted">
+                              <tr className="bg-surface-hover text-xs uppercase tracking-wide text-text-secondary">
                                 <th className="px-3 py-2">#</th>
                                 <th className="px-3 py-2">Cant.</th>
                                 <th className="px-3 py-2">Descripción</th>
@@ -1570,14 +1575,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   <tr
                                     key={index}
                                     className={cn(
-                                      "border-t border-paper-line align-top",
-                                      steeredRow?.target === "create" && steeredRow.index === index && "bg-paper-surface-muted",
+                                      "border-t border-border-color dark:border-border-color-2 align-top",
+                                      steeredRow?.target === "create" && steeredRow.index === index && "bg-surface-hover",
                                     )}
                                   >
                                     <td className="px-3 py-2 font-semibold">{index + 1}</td>
                                     <td className="px-3 py-2">
                                       <input
-                                        className={`${paperInputClass} w-20`}
+                                        className={`${workflowInputClass} w-20`}
                                         value={item.qty}
                                         onChange={(event) => patchDraftItem(index, { qty: stripQuantityInput(event.target.value) })}
                                         placeholder="1"
@@ -1587,7 +1592,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     </td>
                                     <td className="min-w-[200px] px-3 py-2">
                                       <p className="font-medium">{draftItemName(item)}</p>
-                                      <p className="text-xs text-paper-ink-muted">
+                                      <p className="text-xs text-text-secondary">
                                         {item.item_type === "producto"
                                           ? "Producto"
                                           : item.item_type === "servicio"
@@ -1607,26 +1612,26 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     {!clientView && (
                                       <td className="whitespace-nowrap px-3 py-2 text-center">
                                         {item.commission_mode === "ninguna" ? (
-                                          <span className="text-xs text-paper-ink-muted">Sin comisión</span>
+                                          <span className="text-xs text-text-secondary">Sin comisión</span>
                                         ) : item.item_type === "servicio" ? (
-                                          <span className="text-xs text-paper-ink-tertiary">
+                                          <span className="text-xs text-text-secondary">
                                             % del empleado
                                           </span>
                                         ) : item.commission_mode === "porcentaje" ? (
-                                          <span className="text-xs text-paper-ink-tertiary">
+                                          <span className="text-xs text-text-secondary">
                                             {item.commission_percent_override != null
                                               ? `${item.commission_percent_override}% (ítem)`
                                               : "% del empleado"}
                                           </span>
                                         ) : item.item_type === "producto" ? (
                                           <div className="flex flex-col items-center gap-0.5">
-                                            <span className="text-xs text-paper-ink-tertiary">
+                                            <span className="text-xs text-text-secondary">
                                               {item.commission_value == null
                                                 ? "—"
                                                 : formatMoney(item.commission_value)}
                                             </span>
                                             {item.commission_value != null && (
-                                              <span className="text-xs text-paper-ink-muted">
+                                              <span className="text-xs text-text-secondary">
                                                 × cantidad
                                               </span>
                                             )}
@@ -1634,7 +1639,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         ) : (
                                           <div className="flex flex-col items-center gap-0.5">
                                             <input
-                                              className={`${paperInputClass} h-9 w-28 text-right`}
+                                              className={`${workflowInputClass} h-9 w-28 text-right`}
                                               value={formatMoneyInput(
                                                 copInputDigits(item.commission_value),
                                               )}
@@ -1651,11 +1656,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                               aria-label={`Ítem ${index + 1} valor comisión`}
                                             />
                                             {item.commission_value == null ? (
-                                              <span className="text-xs text-paper-ink-muted">
+                                              <span className="text-xs text-text-secondary">
                                                 Requerido
                                               </span>
                                             ) : (
-                                              <span className="text-xs text-paper-ink-muted">
+                                              <span className="text-xs text-text-secondary">
                                                 × cantidad
                                               </span>
                                             )}
@@ -1668,7 +1673,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         type="button"
                                         aria-label={`Quitar ítem ${index + 1}`}
                                         onClick={() => setItems((prev) => prev.filter((_, i) => i !== index))}
-                                        className="rounded-md border border-paper-line-strong p-2 text-paper-ink-muted hover:bg-paper-surface-muted"
+                                        className="rounded-md border border-border-color dark:border-border-color-2 p-2 text-text-secondary hover:bg-surface-hover"
                                       >
                                         <Trash2 className="h-4 w-4" aria-hidden="true" />
                                       </button>
@@ -1678,7 +1683,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               })}
                               {items.length === 0 && (
                                 <tr>
-                                  <td colSpan={clientView ? 6 : 8} className="px-3 py-4 text-center text-sm text-paper-ink-muted">
+                                  <td colSpan={clientView ? 6 : 8} className="px-3 py-4 text-center text-sm text-text-secondary">
                                     Sin ítems. Agregue al menos uno para emitir.
                                   </td>
                                 </tr>
@@ -1695,7 +1700,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             a 320 y a 412 las tres oraciones se leen enteras sin
                             puntero y sin arrastre horizontal. */}
                         {!clientView && (
-                          <p className="text-xs text-paper-ink-muted">
+                          <p className="text-xs text-text-secondary">
                             Se paga el porcentaje del empleado sobre el subtotal.
                             El porcentaje se paga en nómina.
                             El valor de comisión se multiplica por la cantidad.
@@ -1706,19 +1711,19 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         <button
                           type="button"
                           onClick={() => openItemDialog("create")}
-                              className="flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-paper-success-strong text-sm font-semibold text-white shadow-sm hover:bg-paper-success-deep focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-paper-focus-success"
+                              className="flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-primary-600 text-sm font-semibold text-white shadow-sm hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600"
                         >
                           <Plus className="h-4 w-4" aria-hidden="true" />
                           Agregar ítem
                         </button>
 
-                        <h3 className="text-sm font-bold uppercase tracking-wide text-paper-ink-muted">
+                        <h3 className="text-sm font-bold uppercase tracking-wide text-text-secondary">
                           Cobro inmediato (opcional)
                         </h3>
                         <div className="flex flex-col gap-3">
                           {portions.map((portion, index) => (
                             <div key={index} className="flex flex-col gap-2 sm:flex-row sm:items-end">
-                              <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-paper-ink">
+                              <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-text-primary">
                                 Método {index + 1}
                                 <Select
                                   value={portion.method_code}
@@ -1728,7 +1733,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     )
                                   }
                                 >
-                                  <SelectTrigger className={paperInputClass}>
+                                  <SelectTrigger className={workflowInputClass}>
                                     <SelectValue placeholder="Método de pago" />
                                   </SelectTrigger>
                                   <SelectContent>
@@ -1747,10 +1752,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   </SelectContent>
                                 </Select>
                               </label>
-                              <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-paper-ink">
+                              <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-text-primary">
                                 Monto (vacío = sin cobro inmediato)
                                 <input
-                                  className={paperInputClass}
+                                  className={workflowInputClass}
                                   value={formatMoneyInput(portion.amount)}
                                   onChange={(event) =>
                                     setPortions((prev) =>
@@ -1761,7 +1766,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   inputMode="numeric"
                                 />
                                 {draftFees[index] && draftFees[index].fee > 0 && (
-                                  <span className="text-xs font-normal text-paper-success-strong">
+                                  <span className="text-xs font-normal text-success">
                                     +{formatMoney(draftFees[index].fee)} recargo → cobra{" "}
                                     {formatMoney(draftFees[index].gross)}
                                   </span>
@@ -1771,7 +1776,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 <button
                                   type="button"
                                   onClick={() => setPortions((prev) => prev.filter((_, i) => i !== index))}
-                                  className="flex h-10 items-center gap-1 rounded-md border border-paper-line-strong px-3 text-sm font-medium text-paper-ink-tertiary hover:bg-paper-surface-muted"
+                                  className="flex h-10 items-center gap-1 rounded-md border border-border-color dark:border-border-color-2 px-3 text-sm font-medium text-text-secondary hover:bg-surface-hover"
                                 >
                                   <Trash2 className="h-4 w-4" aria-hidden="true" />
                                   Quitar
@@ -1791,7 +1796,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 : "Nada por rellenar"
                             }
                             onClick={totalizePortions}
-                            className="flex h-10 flex-1 items-center justify-center gap-2 rounded-lg border border-paper-line-strong text-sm font-medium text-paper-ink-secondary hover:bg-paper-surface-soft disabled:cursor-not-allowed disabled:opacity-50"
+                            className="flex h-10 flex-1 items-center justify-center gap-2 rounded-lg border border-border-color dark:border-border-color-2 text-sm font-medium text-text-secondary hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             Totalizar pagos
                           </button>
@@ -1821,18 +1826,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 ];
                               })
                             }
-                            className="flex h-10 flex-1 items-center justify-center gap-2 rounded-lg border border-dashed border-paper-line-strong text-sm font-medium text-paper-ink-tertiary hover:bg-paper-surface-soft disabled:cursor-not-allowed disabled:opacity-50"
+                            className="flex h-10 flex-1 items-center justify-center gap-2 rounded-lg border border-dashed border-border-color dark:border-border-color-2 text-sm font-medium text-text-secondary hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             <Banknote className="h-4 w-4" aria-hidden="true" />
                             Dividir cobro
                           </button>
                         </div>
                         {!firstFreeMethod && (
-                          <p className="text-xs text-paper-ink-muted">Todos los métodos ya están en uso.</p>
+                          <p className="text-xs text-text-secondary">Todos los métodos ya están en uso.</p>
                         )}
 
                         <div className="flex justify-end">
-                          <dl className="w-full max-w-md space-y-2 rounded-lg border border-paper-line bg-paper-surface-soft p-4 text-sm text-paper-ink">
+                          <dl className="w-full max-w-md space-y-2 rounded-lg border border-border-color dark:border-border-color-2 bg-surface-hover p-4 text-sm text-text-primary">
                             <div className="flex justify-between gap-3">
                               <dt>Subtotal</dt>
                               <dd className="font-medium">{formatMoney(draftSubtotal)}</dd>
@@ -1846,7 +1851,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               </dt>
                               <dd>
                                 <input
-                                  className={`${paperInputClass} h-9 w-28 text-right`}
+                                  className={`${workflowInputClass} h-9 w-28 text-right`}
                                   value={formatMoneyInput(discount)}
                                   onChange={(event) => setDiscount(stripMoneyInput(event.target.value))}
                                   placeholder="0"
@@ -1860,12 +1865,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               <dd className="font-medium">{formatMoney(draftTaxes)}</dd>
                             </div>
                             {draftSurcharge > 0 && (
-                              <div className="flex justify-between gap-3 text-paper-success-strong">
+                              <div className="flex justify-between gap-3 text-success">
                                 <dt>Recargo{draftFeeLabel !== "" ? ` (${draftFeeLabel})` : ""}</dt>
                                 <dd className="font-medium">+{formatMoney(draftSurcharge)}</dd>
                               </div>
                             )}
-                            <div className="mt-1 flex items-baseline justify-between gap-3 border-t-2 border-paper-ink pt-3 text-xl font-black">
+                            <div className="mt-1 flex items-baseline justify-between gap-3 border-t-2 border-text-primary pt-3 text-xl font-black">
                               <dt className="text-base">TOTAL</dt>
                               <dd>{formatMoney(draftGrandTotal)}</dd>
                             </div>
@@ -1888,18 +1893,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         {/* FIN DEL MEDIO scrolleable. */}
                       </div>
                         {/* El PIE: `shrink-0` y FUERA del medio, así que la acción primaria y Cancelar están siempre a la vista sin una sola línea de scroll. Última pieza del `<form>` —igual que en `FormDialog`—, o sea que está EN EL FLUJO y no cubre el último campo: no hace falta relleno extra. */}
-                        <div className="flex shrink-0 flex-wrap items-center justify-end gap-3 border-t border-paper-line pt-4">
+                        <div className="flex shrink-0 flex-wrap items-center justify-end gap-3 border-t border-border-color dark:border-border-color-2 pt-4">
                           <button
                             type="button"
                             onClick={cancelCreate}
-                            className="h-10 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-paper-ink-secondary hover:bg-paper-surface-muted"
+                            className="h-10 rounded-md border border-border-color dark:border-border-color-2 px-4 text-sm font-medium text-text-secondary hover:bg-surface-hover"
                           >
                             Cancelar
                           </button>
                           <button
                             type="submit"
                             disabled={busy}
-                            className="h-10 rounded-md bg-paper-success-strong px-6 text-sm font-semibold text-white hover:bg-paper-success-deep focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-paper-focus-success focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-900 disabled:opacity-50"
+                            className="h-10 rounded-md bg-primary-600 px-6 text-sm font-semibold text-white hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-surface disabled:opacity-50"
                           >
                             {busy ? "Emitiendo…" : hasImmediatePayment ? "Emitir y pagar" : "Emitir factura"}
                           </button>
@@ -2072,14 +2077,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     >
                     {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
                     <DialogContent className="max-w-4xl border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
-                      <div className={paperSheetClass}>
+                      <div className={workflowSheetClass}>
                         <DialogHeader className="block">
                           <DialogTitle className="sr-only">FACTURA #{detail.invoice.consecutive_number} {detail.invoice.status}</DialogTitle>
-                        <div className="border-b-4 border-double border-paper-line-strong px-6 py-5 sm:px-8">
+                        <div className="border-b-4 border-double border-border-color dark:border-border-color-2 px-6 py-5 sm:px-8">
                           <div className="flex flex-wrap items-start justify-between gap-4">
                             <div>
                               <p className="text-xl font-black tracking-tight">ORABELLA</p>
-                              <p className="text-xs text-paper-ink-muted">Belleza · Factura de venta</p>
+                              <p className="text-xs text-text-secondary">Belleza · Factura de venta</p>
                             </div>
                             <div className="text-right">
                               <h2 className="text-lg font-bold">
@@ -2088,7 +2093,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   {detail.invoice.status}
                                 </Badge>
                               </h2>
-                              <p className="text-sm text-paper-ink-muted">
+                              <p className="text-sm text-text-secondary">
                                 {formatBogotaLongDate(detail.invoice.created_at)}
                                 {detail.invoice.status === "Anulada" && detail.invoice.cancel_reason
                                   ? ` · Motivo: ${detail.invoice.cancel_reason}`
@@ -2111,22 +2116,22 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             </p>
                           </div>
                           <div className="flex flex-wrap items-center justify-between gap-3">
-                            <h3 className="text-sm font-bold uppercase tracking-wide text-paper-ink-muted">Ítems</h3>
+                            <h3 className="text-sm font-bold uppercase tracking-wide text-text-secondary">Ítems</h3>
                             <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
                               <button
                                 type="button"
                                 onClick={openCustomerPreview}
-                                className="inline-flex h-10 items-center gap-2 rounded-md border border-paper-line-strong px-3 text-sm font-semibold text-paper-ink-secondary hover:bg-paper-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-paper-ink-muted"
+                                className="inline-flex h-10 items-center gap-2 rounded-md border border-border-color dark:border-border-color-2 px-3 text-sm font-semibold text-text-secondary hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600"
                               >
                                 <Eye className="h-4 w-4" aria-hidden="true" />
                                 Ver como cliente
                               </button>
                             </div>
                           </div>
-                          <div className="mt-2 overflow-x-auto rounded-lg border border-paper-line">
-                            <table className="w-full min-w-[560px] text-left text-sm text-paper-ink">
+                          <div className="mt-2 overflow-x-auto rounded-lg border border-border-color dark:border-border-color-2">
+                            <table className="w-full min-w-[560px] text-left text-sm text-text-primary">
                               <thead>
-                                <tr className="bg-paper-surface-muted text-xs uppercase tracking-wide text-paper-ink-muted">
+                                <tr className="bg-surface-hover text-xs uppercase tracking-wide text-text-secondary">
                                   <th className="px-3 py-2">#</th>
                                   <th className="px-3 py-2">Descripción</th>
                                   {!clientView && <th className="px-3 py-2">Empleado</th>}
@@ -2138,7 +2143,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               </thead>
                               <tbody>
                                 {detail.items.map((row, index) => (
-                                  <tr key={row.id} className="border-t border-paper-line">
+                                  <tr key={row.id} className="border-t border-border-color dark:border-border-color-2">
                                     <td className="px-3 py-2 font-semibold">{index + 1}</td>
                                     <td className="px-3 py-2">
                                       {detailItemName(row)}
@@ -2159,7 +2164,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                       <td className="px-3 py-2">
                                         {row.employee_full_name ?? "—"}
                                         {row.employee_code ? (
-                                          <span className="text-xs text-paper-ink-muted"> ({row.employee_code})</span>
+                                          <span className="text-xs text-text-secondary"> ({row.employee_code})</span>
                                         ) : null}
                                       </td>
                                     )}
@@ -2169,17 +2174,17 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     {!clientView && (
                                       <td className="px-3 py-2 text-center">
                                         {commissionModeOf(row) === "ninguna" ? (
-                                          <span className="text-paper-ink-muted">Sin comisión</span>
+                                          <span className="text-text-secondary">Sin comisión</span>
                                         ) : commissionModeOf(row) === "porcentaje" ? (
-                                          <span className="text-paper-ink-tertiary">
+                                          <span className="text-text-secondary">
                                             {row.commission_percent_override != null
                                               ? `${row.commission_percent_override}% (ítem)`
                                               : "% del empleado"}
                                           </span>
                                         ) : commissionDisplayValue(row) !== null ? (
-                                          <span className="font-medium text-paper-success-strong">{formatMoney(commissionDisplayValue(row))}</span>
+                                          <span className="font-medium text-success">{formatMoney(commissionDisplayValue(row))}</span>
                                         ) : (
-                                          <span className="text-paper-ink-soft">—</span>
+                                          <span className="text-text-tertiary">—</span>
                                         )}
                                       </td>
                                     )}
@@ -2193,23 +2198,23 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               puede vivir en un `title=`, que no se dispara con el
                               dedo. */}
                           {!clientView && (
-                            <p className="text-xs text-paper-ink-muted">
+                            <p className="text-xs text-text-secondary">
                               Se paga el porcentaje del empleado sobre el subtotal.
                               El porcentaje se paga en nómina.
                               El valor de comisión se multiplica por la cantidad.
                             </p>
                           )}
-                          <h3 className="text-sm font-bold uppercase tracking-wide text-paper-ink-muted">Impuestos</h3>
-                          <ul className="mt-1 flex flex-col gap-1 text-sm text-paper-ink">
+                          <h3 className="text-sm font-bold uppercase tracking-wide text-text-secondary">Impuestos</h3>
+                          <ul className="mt-1 flex flex-col gap-1 text-sm text-text-primary">
                             {detail.taxes.map((row) => (
                               <li key={row.id}>
                                 {row.tax_name} ({row.percent}%) = {formatMoney(row.amount)}
                               </li>
                             ))}
-                            {detail.taxes.length === 0 && <li className="text-paper-ink-muted">Sin impuestos.</li>}
+                            {detail.taxes.length === 0 && <li className="text-text-secondary">Sin impuestos.</li>}
                           </ul>
                           <div className="flex justify-end">
-                            <dl className="w-full max-w-md space-y-2 rounded-lg border border-paper-line bg-paper-surface-soft p-4 text-sm text-paper-ink">
+                            <dl className="w-full max-w-md space-y-2 rounded-lg border border-border-color dark:border-border-color-2 bg-surface-hover p-4 text-sm text-text-primary">
                               <div className="flex justify-between gap-3">
                                 <dt>Subtotal</dt>
                                 <dd className="font-medium">{formatMoney(detail.invoice.subtotal)}</dd>
@@ -2223,19 +2228,19 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 <dd className="font-medium">{formatMoney(detail.invoice.tax)}</dd>
                               </div>
                               {Number(detail.invoice.surcharge ?? 0) > 0 && (
-                                <div className="flex justify-between gap-3 text-paper-success-strong">
+                                <div className="flex justify-between gap-3 text-success">
                                   <dt>Recargo</dt>
                                   <dd className="font-medium">+{formatMoney(Number(detail.invoice.surcharge))}</dd>
                                 </div>
                               )}
-                              <div className="mt-1 flex items-baseline justify-between gap-3 border-t-2 border-paper-ink pt-3 text-xl font-black">
+                              <div className="mt-1 flex items-baseline justify-between gap-3 border-t-2 border-text-primary pt-3 text-xl font-black">
                                 <dt className="text-base">TOTAL</dt>
                                 <dd>{formatMoney(detail.invoice.total)}</dd>
                               </div>
                             </dl>
                           </div>
-                          <h3 className="text-sm font-bold uppercase tracking-wide text-paper-ink-muted">Cobro</h3>
-                          <ul className="mt-1 flex flex-col gap-1 text-sm text-paper-ink">
+                          <h3 className="text-sm font-bold uppercase tracking-wide text-text-secondary">Cobro</h3>
+                          <ul className="mt-1 flex flex-col gap-1 text-sm text-text-primary">
                             {detail.payments.map((row) => (
                               <li key={row.id}>
                                 {row.method_code} = {formatMoney(row.amount)}
@@ -2247,19 +2252,19 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               </li>
                             ))}
                             {detail.payments.length === 0 && (
-                              <li className="text-paper-ink-muted">Sin cobro registrado (Emitida).</li>
+                              <li className="text-text-secondary">Sin cobro registrado (Emitida).</li>
                             )}
                           </ul>
-                          <p className="text-sm text-paper-ink">
+                          <p className="text-sm text-text-primary">
                             Pagado {formatMoney(detail.paid)} · Saldo {formatMoney(detail.remaining)}
                           </p>
 
                         </div>
-                        <div className="flex flex-wrap items-center justify-end gap-3 border-t border-paper-line px-6 py-4 sm:px-8">
+                        <div className="flex flex-wrap items-center justify-end gap-3 border-t border-border-color dark:border-border-color-2 px-6 py-4 sm:px-8">
                           <button
                             type="button"
                             onClick={closeDetail}
-                            className="h-10 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-paper-ink-secondary hover:bg-paper-surface-muted"
+                            className="h-10 rounded-md border border-border-color dark:border-border-color-2 px-4 text-sm font-medium text-text-secondary hover:bg-surface-hover"
                           >
                             Cerrar
                           </button>
@@ -2269,7 +2274,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               aria-disabled={shiftBlockReason !== null}
                               onClick={openPaymentFromDetail}
                               className={cn(
-                                "inline-flex h-10 items-center justify-center gap-2 rounded-md bg-paper-success-strong px-5 text-sm font-semibold text-white hover:bg-paper-success-deep focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-paper-focus-success focus-visible:ring-offset-2 max-sm:min-h-11",
+                                "inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary-600 px-5 text-sm font-semibold text-white hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 max-sm:min-h-11",
                                 shiftBlockReason !== null && "opacity-50",
                               )}
                             >
@@ -2278,7 +2283,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             </button>
                           )}
                           {canPayDetail && shiftBlockReason !== null && (
-                            <p className="basis-full text-right text-xs text-paper-ink-muted">{shiftBlockReason}</p>
+                            <p className="basis-full text-right text-xs text-text-secondary">{shiftBlockReason}</p>
                           )}
                         </div>
                       </div>
@@ -2318,7 +2323,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     >
                       {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
                       <DialogContent className="max-w-5xl border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
-                        <div className={paperSheetClass}>
+                        <div className={workflowSheetClass}>
                           <DialogHeader className="block">
                             <DialogTitle className="sr-only">EDITAR FACTURA #{detail?.invoice.consecutive_number ?? "—"}</DialogTitle>
                             <DialogDescription className="sr-only">
@@ -2326,11 +2331,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 ? "Edición libre de emitida (sin motivo, el total se recalcula)"
                                 : "Edición con motivo y auditoría"}
                             </DialogDescription>
-                          <div className="border-b-4 border-double border-paper-line-strong px-6 py-5 sm:px-8">
+                          <div className="border-b-4 border-double border-border-color dark:border-border-color-2 px-6 py-5 sm:px-8">
                             <div className="flex flex-wrap items-start justify-between gap-4">
                               <div>
                                 <p className="text-xl font-black tracking-tight">ORABELLA</p>
-                                <p className="text-xs text-paper-ink-muted">
+                                <p className="text-xs text-text-secondary">
                                   {isFreeEdit
                                     ? "Edición libre de emitida (sin motivo, el total se recalcula)"
                                     : "Edición con motivo y auditoría"}
@@ -2356,7 +2361,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               <label className="flex flex-col gap-1 text-sm font-medium">
                                 Motivo de la edición (obligatorio, queda auditado)
                                 <input
-                                  className={paperInputClass}
+                                  className={workflowInputClass}
                                   value={editMotivo}
                                   onChange={(event) => setEditMotivo(event.target.value)}
                                   placeholder="Ej. Servicio mal depreciado: se ajusta y agrega kit"
@@ -2366,10 +2371,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             <div className="flex justify-end">
                               {clientViewToggle()}
                             </div>
-                            <div className="overflow-x-auto rounded-lg border border-paper-line">
-                              <table className="w-full min-w-[860px] text-left text-sm text-paper-ink">
+                            <div className="overflow-x-auto rounded-lg border border-border-color dark:border-border-color-2">
+                              <table className="w-full min-w-[860px] text-left text-sm text-text-primary">
                                 <thead>
-                                  <tr className="bg-paper-surface-muted text-xs uppercase tracking-wide text-paper-ink-muted">
+                                  <tr className="bg-surface-hover text-xs uppercase tracking-wide text-text-secondary">
                                     <th className="px-3 py-2">#</th>
                                     <th className="px-3 py-2">Cant.</th>
                                     <th className="px-3 py-2">Descripción</th>
@@ -2390,14 +2395,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                       <tr
                                         key={item.id ?? `nuevo-${index}`}
                                         className={cn(
-                                          "border-t border-paper-line align-top",
-                                          steeredRow?.target === "edit" && steeredRow.index === index && "bg-paper-surface-muted",
+                                          "border-t border-border-color dark:border-border-color-2 align-top",
+                                          steeredRow?.target === "edit" && steeredRow.index === index && "bg-surface-hover",
                                         )}
                                       >
                                         <td className="px-3 py-2 font-semibold">{index + 1}</td>
                                         <td className="px-3 py-2">
                                           <input
-                                            className={`${paperInputClass} w-20`}
+                                            className={`${workflowInputClass} w-20`}
                                             value={item.qty}
                                             onChange={(event) => patchEditItem(index, { qty: stripQuantityInput(event.target.value) })}
                                             placeholder="1"
@@ -2452,14 +2457,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                           )}
                                           {item.item_type === "custom" && (
                                             <input
-                                              className={paperInputClass}
+                                              className={workflowInputClass}
                                               value={item.custom_name}
                                               onChange={(event) => patchEditItem(index, { custom_name: event.target.value })}
                                               placeholder="Descripción"
                                               aria-label={`Editar ítem ${index + 1} descripción`}
                                             />
                                           )}
-                                          <p className="mt-1 text-xs text-paper-ink-muted">
+                                          <p className="mt-1 text-xs text-text-secondary">
                                             {item.item_type === "producto"
                                               ? "Producto"
                                               : item.item_type === "servicio"
@@ -2485,7 +2490,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         )}
                                         <td className="px-3 py-2">
                                           <input
-                                            className={`${paperInputClass} w-28 text-right`}
+                                            className={`${workflowInputClass} w-28 text-right`}
                                             value={formatMoneyInput(item.unit_price)}
                                             onChange={(event) =>
                                               patchEditItem(index, { unit_price: stripMoneyInput(event.target.value) })
@@ -2501,7 +2506,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                         {!clientView && (
                                           <td className="px-3 py-2 text-center">
                                             {item.item_type === "servicio" ? (
-                                              <span className="text-xs text-paper-ink-muted">
+                                              <span className="text-xs text-text-secondary">
                                                 % del empleado
                                               </span>
                                             ) : item.item_type === "producto" ? (
@@ -2517,14 +2522,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                         commission_value: event.target.checked ? item.commission_value : null,
                                                       })
                                                     }
-                                                    className="rounded border-paper-line-strong text-paper-success focus:ring-paper-focus-success"
+                                                    className="rounded border-border-color dark:border-border-color-2 text-primary-600 focus:ring-primary-600"
                                                   />
-                                                  <span className="text-paper-ink-tertiary">¿Comisión?</span>
+                                                  <span className="text-text-secondary">¿Comisión?</span>
                                                 </label>
                                                 {item.commission_mode === "comision" && (
                                                   <>
                                                     <input
-                                                      className={`${paperInputClass} h-9 w-28 text-right`}
+                                                      className={`${workflowInputClass} h-9 w-28 text-right`}
                                                       value={formatMoneyInput(
                                                         copInputDigits(item.commission_value),
                                                       )}
@@ -2541,11 +2546,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                       aria-label={`Editar ítem ${index + 1} valor comisión`}
                                                     />
                                                     {item.commission_value == null ? (
-                                                      <span className="text-xs text-paper-ink-muted">
+                                                      <span className="text-xs text-text-secondary">
                                                         Opcional
                                                       </span>
                                                     ) : (
-                                                      <span className="text-xs text-paper-ink-muted">
+                                                      <span className="text-xs text-text-secondary">
                                                         × cantidad
                                                       </span>
                                                     )}
@@ -2570,7 +2575,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                 {item.commission_mode === "comision" && (
                                                   <>
                                                     <input
-                                                      className={`${paperInputClass} h-9 w-28 text-right`}
+                                                      className={`${workflowInputClass} h-9 w-28 text-right`}
                                                       value={formatMoneyInput(
                                                         copInputDigits(item.commission_value),
                                                       )}
@@ -2587,16 +2592,16 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                       aria-label={`Editar ítem ${index + 1} valor comisión`}
                                                     />
                                                     {item.commission_value == null ? (
-                                                      <span className="text-xs text-paper-ink-muted">Requerido</span>
+                                                      <span className="text-xs text-text-secondary">Requerido</span>
                                                     ) : (
-                                                      <span className="text-xs text-paper-ink-muted">× cantidad</span>
+                                                      <span className="text-xs text-text-secondary">× cantidad</span>
                                                     )}
                                                   </>
                                                 )}
                                                 {item.commission_mode === "porcentaje" &&
                                                   (fixedPay ? (
                                                     <input
-                                                      className={`${paperInputClass} h-9 w-28 text-right`}
+                                                      className={`${workflowInputClass} h-9 w-28 text-right`}
                                                       value={item.commission_percent_override ?? ""}
                                                       onChange={(event) =>
                                                         patchEditItem(index, {
@@ -2611,7 +2616,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                                       aria-label={`Editar ítem ${index + 1} porcentaje`}
                                                     />
                                                   ) : (
-                                                    <span className="text-xs text-paper-ink-muted">
+                                                    <span className="text-xs text-text-secondary">
                                                       % del empleado
                                                     </span>
                                                   ))}
@@ -2624,7 +2629,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                             type="button"
                                             aria-label={`Quitar ítem ${index + 1}`}
                                             onClick={() => setEditItems((prev) => prev.filter((_, i) => i !== index))}
-                                            className="rounded-md border border-paper-line-strong p-2 text-paper-ink-muted hover:bg-paper-surface-muted"
+                                            className="rounded-md border border-border-color dark:border-border-color-2 p-2 text-text-secondary hover:bg-surface-hover"
                                           >
                                             <Trash2 className="h-4 w-4" aria-hidden="true" />
                                           </button>
@@ -2641,7 +2646,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 MEDIDO: a 320 y 412 las cuatro oraciones se leen
                                 enteras sin puntero. */}
                             {!clientView && (
-                              <p className="text-xs text-paper-ink-muted">
+                              <p className="text-xs text-text-secondary">
                                 Se paga el porcentaje del empleado sobre el subtotal.
                                 El porcentaje se paga en nómina.
                                 El valor de comisión se multiplica por la cantidad.
@@ -2651,14 +2656,14 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             <button
                               type="button"
                               onClick={() => openItemDialog("edit")}
-                          className="flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-paper-success-strong text-sm font-semibold text-white shadow-sm hover:bg-paper-success-deep focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-paper-focus-success"
+                          className="flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-primary-600 text-sm font-semibold text-white shadow-sm hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600"
                             >
                               <Plus className="h-4 w-4" aria-hidden="true" />
                               Agregar ítem
                             </button>
                             {!isFreeEdit && (
                             <div>
-                              <h3 className="mb-2 text-sm font-bold uppercase tracking-wide text-paper-ink-muted">
+                              <h3 className="mb-2 text-sm font-bold uppercase tracking-wide text-text-secondary">
                                 Cobros (solo cambia el método, montos intactos)
                               </h3>
                               <div className="flex flex-col gap-2">
@@ -2671,7 +2676,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                   const feeOk = feePct === Number(payment.fee_percent ?? 0);
                                   return (
                                     <div key={payment.id} className="flex flex-col gap-2 sm:flex-row sm:items-end">
-                                      <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-paper-ink">
+                                      <label className="flex min-w-0 flex-1 flex-col gap-1 text-sm font-medium text-text-primary">
                                         Método ({formatMoney(payment.amount)})
                                         <Select
                                           value={code}
@@ -2683,7 +2688,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                             )
                                           }
                                         >
-                                          <SelectTrigger className={paperInputClass}>
+                                          <SelectTrigger className={workflowInputClass}>
                                             <SelectValue placeholder="Método" />
                                           </SelectTrigger>
                                           <SelectContent>
@@ -2724,7 +2729,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                             </div>
                             )}
                             {isFreeEdit ? (
-                              <div className="rounded-md bg-paper-info px-3 py-2 text-sm text-paper-ink">
+                              <div className="rounded-md bg-primary-light px-3 py-2 text-sm text-text-primary">
                                 <p>
                                   Subtotal nuevo: {formatMoney(editSubtotal)} (antes{" "}
                                   {detail ? formatMoney(detail.invoice.subtotal) : "—"})
@@ -2734,7 +2739,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                 </p>
                               </div>
                             ) : (
-                            <div className="rounded-md bg-paper-surface-soft px-3 py-2 text-sm text-paper-ink">
+                            <div className="rounded-md bg-surface-hover px-3 py-2 text-sm text-text-primary">
                               <p>
                                 Subtotal: {formatMoney(editSubtotal)} / emitido{" "}
                                 {detail ? formatMoney(detail.invoice.subtotal) : "—"}{" "}
@@ -2757,11 +2762,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               <Alert variant="destructive">{editError}</Alert>
                             )}
                           </div>
-                          <div className="flex flex-wrap items-center justify-end gap-3 border-t border-paper-line px-6 py-4 sm:px-8">
+                          <div className="flex flex-wrap items-center justify-end gap-3 border-t border-border-color dark:border-border-color-2 px-6 py-4 sm:px-8">
                             <button
                               type="button"
                               onClick={() => setIsEditDialogOpen(false)}
-                              className="h-10 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-paper-ink-secondary hover:bg-paper-surface-muted"
+                              className="h-10 rounded-md border border-border-color dark:border-border-color-2 px-4 text-sm font-medium text-text-secondary hover:bg-surface-hover"
                             >
                               Cancelar
                             </button>
@@ -2779,7 +2784,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                                     : "Cuadre subtotal, recargo y motivo para guardar"
                                   : undefined
                               }
-                              className="h-10 rounded-md bg-paper-ink px-6 text-sm font-semibold text-white hover:bg-paper-ink-secondary disabled:opacity-50"
+                              className="h-10 rounded-md bg-primary-600 px-6 text-sm font-semibold text-white hover:bg-primary-700 disabled:opacity-50"
                             >
                               {busy ? "Guardando…" : "Guardar edición"}
                             </button>
@@ -2836,16 +2841,16 @@ export function InvoicesClient(props: InvoicesClientProps) {
       >
         {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
         <DialogContent className="max-w-lg border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
-          <div className={cn("max-h-[calc(100dvh-3rem)] overflow-y-auto", paperSheetClass)}>
+          <div className={cn("max-h-[calc(100dvh-3rem)] overflow-y-auto", workflowSheetClass)}>
             <DialogHeader className="block">
               <DialogTitle className="sr-only">
                 {itemDialogTarget === "edit" ? "Agregar ítem a la edición" : "Agregar ítem"}
               </DialogTitle>
-            <div className="border-b border-paper-line px-5 py-3">
+            <div className="border-b border-border-color dark:border-border-color-2 px-5 py-3">
               <h2 className="text-lg font-bold">
                 {itemDialogTarget === "edit" ? "Agregar ítem a la edición" : "Agregar ítem"}
               </h2>
-              <p className="text-sm text-paper-ink-muted">
+              <p className="text-sm text-text-secondary">
                 Subtotal:{" "}
                 {formatMoney(
                   (toNumber(itemDraft.qty) ?? 0) * (toNumber(itemDraft.unit_price) ?? 0),
@@ -2886,8 +2891,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       }
                       className={
                         itemDraft.item_type === type
-                          ? "h-9 rounded-md bg-paper-ink text-sm font-semibold text-white"
-                          : "h-9 rounded-md border border-paper-line-strong text-sm font-medium text-paper-ink-secondary hover:bg-paper-surface-muted"
+                          ? "h-9 rounded-md bg-primary-600 text-sm font-semibold text-white"
+                          : "h-9 rounded-md border border-border-color dark:border-border-color-2 text-sm font-medium text-text-secondary hover:bg-surface-hover"
                       }
                     >
                       {label}
@@ -2898,7 +2903,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
               {itemDraft.item_type === "producto" && (
                 <div>
                   <p className="mb-1 text-sm font-medium">
-                    Producto <span className="text-xs font-normal text-paper-success-strong">puede llevar comisión</span>
+                    Producto <span className="text-xs font-normal text-success">puede llevar comisión</span>
                   </p>
                   <Combobox
                     value={itemDraft.ref_id}
@@ -2933,7 +2938,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
               {itemDraft.item_type === "servicio" && (
                 <div>
                   <p className="mb-1 text-sm font-medium">
-                    Servicio <span className="text-xs font-normal text-paper-success-strong">comisión % del empleado</span>
+                    Servicio <span className="text-xs font-normal text-success">comisión % del empleado</span>
                   </p>
                   <Combobox
                     value={itemDraft.ref_id}
@@ -2954,7 +2959,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 <label className="flex flex-col gap-1 text-sm font-medium">
                   Descripción
                   <input
-                    className={paperInputClass}
+                    className={workflowInputClass}
                     value={itemDraft.custom_name}
                     onChange={(event) => patchDraft({ custom_name: event.target.value })}
                     placeholder="Ej. Peinado novia"
@@ -2984,7 +2989,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 <label className="flex flex-col gap-1 text-sm font-medium">
                   Cantidad
                   <input
-                    className={paperInputClass}
+                    className={workflowInputClass}
                     value={itemDraft.qty}
                     onChange={(event) => patchDraft({ qty: stripQuantityInput(event.target.value) })}
                     placeholder="1"
@@ -2994,7 +2999,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 <label className="flex flex-col gap-1 text-sm font-medium">
                   Precio unitario
                   <input
-                    className={paperInputClass}
+                    className={workflowInputClass}
                     value={formatMoneyInput(itemDraft.unit_price)}
                     onChange={(event) =>
                       patchDraft({ unit_price: stripMoneyInput(event.target.value) })
@@ -3017,11 +3022,11 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           commission_value: event.target.checked ? itemDraft.commission_value : null,
                         })
                       }
-                      className="rounded border-paper-line-strong text-paper-success focus:ring-paper-focus-success"
+                      className="rounded border-border-color dark:border-border-color-2 text-primary-600 focus:ring-primary-600"
                     />
-                    <span className="text-paper-ink-secondary">¿Tiene comisión?</span>
+                    <span className="text-text-secondary">¿Tiene comisión?</span>
                     {itemDraft.commission_mode === "comision" && itemDraft.commission_value != null && (
-                      <span className="text-paper-ink-muted">
+                      <span className="text-text-secondary">
                         Comisión: {formatMoney(itemDraft.commission_value)}
                       </span>
                     )}
@@ -3031,7 +3036,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       <label className="flex flex-col gap-1 text-sm font-medium">
                         Valor de la comisión ($)
                         <input
-                          className={paperInputClass}
+                          className={workflowInputClass}
                           value={formatMoneyInput(copInputDigits(itemDraft.commission_value))}
                           onChange={(event) =>
                             patchDraft({
@@ -3043,7 +3048,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           inputMode="numeric"
                         />
                       </label>
-                      <p className="text-xs text-paper-ink-muted">
+                      <p className="text-xs text-text-secondary">
                         El valor de comisión se multiplica por la cantidad.
                       </p>
                     </>
@@ -3051,7 +3056,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 </div>
               )}
               {itemDraft.item_type === "servicio" && (
-                <p className="text-xs text-paper-ink-muted">
+                <p className="text-xs text-text-secondary">
                   Se paga el porcentaje del empleado sobre el subtotal.
                 </p>
               )}
@@ -3079,7 +3084,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       <label className="flex flex-col gap-1 text-sm font-medium">
                         Valor de la comisión ($)
                         <input
-                          className={paperInputClass}
+                          className={workflowInputClass}
                           value={formatMoneyInput(copInputDigits(itemDraft.commission_value))}
                           onChange={(event) =>
                             patchDraft({
@@ -3091,7 +3096,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           inputMode="numeric"
                         />
                       </label>
-                      <p className="text-xs text-paper-ink-muted">
+                      <p className="text-xs text-text-secondary">
                         El valor de comisión se multiplica por la cantidad.
                       </p>
                     </>
@@ -3101,7 +3106,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                       <label className="flex flex-col gap-1 text-sm font-medium">
                         Porcentaje para este ítem (%)
                         <input
-                          className={paperInputClass}
+                          className={workflowInputClass}
                           value={itemDraft.commission_percent_override ?? ""}
                           onChange={(event) =>
                             patchDraft({
@@ -3114,7 +3119,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         />
                       </label>
                     ) : (
-                      <p className="text-xs text-paper-ink-muted">
+                      <p className="text-xs text-text-secondary">
                         Se paga el % del empleado
                         {itemDraftEmployee?.commission_percent != null
                           ? ` (${itemDraftEmployee.commission_percent}%)`
@@ -3130,18 +3135,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 <Alert variant="destructive">{itemError}</Alert>
               )}
             </div>
-            <div className="flex flex-wrap items-center justify-end gap-3 border-t border-paper-line px-5 py-3">
+            <div className="flex flex-wrap items-center justify-end gap-3 border-t border-border-color dark:border-border-color-2 px-5 py-3">
               <button
                 type="button"
                 onClick={() => setIsItemDialogOpen(false)}
-                className="h-10 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-paper-ink-secondary hover:bg-paper-surface-muted"
+                className="h-10 rounded-md border border-border-color dark:border-border-color-2 px-4 text-sm font-medium text-text-secondary hover:bg-surface-hover"
               >
                 Cancelar
               </button>
               <button
                 type="button"
                 onClick={addItemFromDialog}
-                className="h-10 rounded-md bg-paper-ink px-6 text-sm font-semibold text-white hover:bg-paper-ink-secondary"
+                className="h-10 rounded-md bg-primary-600 px-6 text-sm font-semibold text-white hover:bg-primary-700"
               >
                 {itemDialogTarget === "edit" ? "Agregar a la edición" : "Agregar a la factura"}
               </button>
@@ -3151,58 +3156,60 @@ export function InvoicesClient(props: InvoicesClientProps) {
       </Dialog>
 
       <Dialog open={paymentDialogOpen} onOpenChange={(open) => { if (!open && !busy) closePayment(); }}>
-        <DialogContent className="max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>Pagar factura</DialogTitle>
-            <DialogDescription>Registre un pago contra el saldo pendiente.</DialogDescription>
-          </DialogHeader>
-          {detail && (
-            <form onSubmit={submitSplit} className="space-y-5">
-              <section className="rounded-lg border border-paper-line bg-paper-surface-soft p-4 text-paper-ink dark:border-border-color-2">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div><p className="text-sm text-paper-ink-muted">Factura #{detail.invoice.consecutive_number}</p><p className="font-semibold">{detail.invoice.client_name}</p></div>
-                  <span className="text-sm font-medium text-paper-ink-muted">{detail.invoice.status}</span>
-                </div>
-                <ul className="mt-4 divide-y divide-paper-line text-sm">
-                  {detail.items.map((item) => <li key={item.id} className="flex justify-between gap-3 py-2"><span>{detailItemName(item)} · Cantidad {item.qty}</span><span className="font-medium">{formatMoney(item.subtotal)}</span></li>)}
-                </ul>
-                <dl className="mt-4 space-y-2 border-t border-paper-line pt-3 text-sm">
-                  <div className="flex justify-between gap-3"><dt>Total factura</dt><dd className="font-semibold">{formatMoney(detail.invoice.total)}</dd></div>
-                  <div className="flex justify-between gap-3"><dt>Pagado</dt><dd>{formatMoney(detail.paid)}</dd></div>
-                  <div className="flex justify-between gap-3 text-base font-bold"><dt>Saldo pendiente</dt><dd>{formatMoney(detail.remaining)}</dd></div>
-                </dl>
-              </section>
-              <fieldset className="space-y-3">
-                <legend className="text-sm font-medium text-text-primary">Porciones de pago</legend>
-                {splitDrafts.map((portion, portionIndex) => (
-                  <div key={portionIndex} className="grid gap-2 rounded-lg border border-border-color bg-surface p-3 text-text-primary sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-end dark:border-border-color-2">
-                    <Label className="min-w-0">Método
-                      <Select value={portion.method_code} onValueChange={(method_code) => setSplitDrafts((prev) => prev.map((row, index) => index === portionIndex ? { ...row, method_code } : row))}>
-                        <SelectTrigger className={inputClass}><SelectValue placeholder="Método de pago" /></SelectTrigger>
-                        <SelectContent>{props.methods.filter((method) => method.is_active !== false && (method.code === portion.method_code || !usedSplitMethodCodes.has(method.code))).map((method) => <SelectItem key={method.id} value={method.code}>{method.name}{method.fee_percent > 0 ? ` (+${method.fee_percent}%)` : ""}</SelectItem>)}</SelectContent>
-                      </Select>
-                    </Label>
-                    <Label className="min-w-0">Monto
-                      <MoneyInput className={inputClass} value={portion.amount} onValueChange={(amount) => setSplitDrafts((prev) => prev.map((row, index) => index === portionIndex ? { ...row, amount } : row))} placeholder="0" />
-                    </Label>
-                    {splitDrafts.length > 1 && <Button type="button" variant="outline" onClick={() => setSplitDrafts((prev) => prev.filter((_, index) => index !== portionIndex))}>Quitar</Button>}
+        <DialogContent className="max-w-2xl bg-surface text-text-primary dark:border-border-color-2 dark:bg-surface dark:text-text-primary">
+          <div className="space-y-5">
+            <DialogHeader className="border-b border-border-color pb-4 dark:border-border-color-2">
+              <DialogTitle>Pagar factura</DialogTitle>
+              <DialogDescription>Registre un pago contra el saldo pendiente.</DialogDescription>
+            </DialogHeader>
+            {detail && (
+              <form onSubmit={submitSplit} className="space-y-5">
+                <section className={cn(workflowPanelClass, "p-4")}>
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div><p className="text-sm text-text-secondary">Factura #{detail.invoice.consecutive_number}</p><p className="font-semibold">{detail.invoice.client_name}</p></div>
+                    <span className="text-sm font-medium text-text-secondary">{detail.invoice.status}</span>
                   </div>
-                ))}
-              </fieldset>
-              <div className="flex flex-wrap items-center gap-2">
-                <button type="button" disabled={!canTotalizeSplit || busy} title={canTotalizeSplit ? "Rellena el monto con el saldo neto pendiente" : "Nada por rellenar"} onClick={totalizeSplitPayment} className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-text-primary hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50 max-sm:min-h-11 dark:border-border-color-2">
-                  <Banknote className="h-4 w-4" aria-hidden="true" /> Totalizar pago
-                </button>
-                <Button type="button" variant="outline" disabled={usedSplitMethodCodes.size >= props.methods.filter((method) => method.is_active !== false).length} onClick={addSplitPaymentPortion}>Agregar porción</Button>
-                <p className="min-w-0 text-sm text-text-secondary sm:ml-auto">Restante: <strong>{formatMoney(splitRemaining)}</strong></p>
-              </div>
-              {payError && <Alert variant="destructive">{payError}</Alert>}
-              <div className="flex flex-col-reverse gap-3 border-t border-border-color pt-4 sm:flex-row sm:justify-end dark:border-border-color-2">
-                <Button type="button" variant="outline" onClick={closePayment}>{paymentReturnsToDetail ? "Volver al detalle" : "Cancelar"}</Button>
-                <Button type="submit" size="lg" disabled={busy || !canSubmitSplit}><CreditCard className="h-4 w-4" aria-hidden="true" />{busy ? "Pagando…" : "Pagar"}</Button>
-              </div>
-            </form>
-          )}
+                  <ul className="mt-4 divide-y divide-border-color-2 text-sm dark:divide-border-color">
+                    {detail.items.map((item) => <li key={item.id} className="flex justify-between gap-3 py-2"><span>{detailItemName(item)} · Cantidad {item.qty}</span><span className="font-medium">{formatMoney(item.subtotal)}</span></li>)}
+                  </ul>
+                  <dl className="mt-4 space-y-2 border-t border-border-color-2 pt-3 text-sm dark:border-border-color">
+                    <div className="flex justify-between gap-3"><dt>Total factura</dt><dd className="font-semibold">{formatMoney(detail.invoice.total)}</dd></div>
+                    <div className="flex justify-between gap-3"><dt>Pagado</dt><dd>{formatMoney(detail.paid)}</dd></div>
+                    <div className="flex justify-between gap-3 text-base font-bold"><dt>Saldo pendiente</dt><dd>{formatMoney(detail.remaining)}</dd></div>
+                  </dl>
+                </section>
+                <fieldset className="space-y-3">
+                  <legend className="text-sm font-medium text-text-primary">Porciones de pago</legend>
+                  {splitDrafts.map((portion, portionIndex) => (
+                    <div key={portionIndex} className={cn("grid gap-2 p-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-end", workflowPanelClass)}>
+                      <Label className="min-w-0">Método
+                        <Select value={portion.method_code} onValueChange={(method_code) => setSplitDrafts((prev) => prev.map((row, index) => index === portionIndex ? { ...row, method_code } : row))}>
+                          <SelectTrigger className={workflowInputClass}><SelectValue placeholder="Método de pago" /></SelectTrigger>
+                          <SelectContent>{props.methods.filter((method) => method.is_active !== false && (method.code === portion.method_code || !usedSplitMethodCodes.has(method.code))).map((method) => <SelectItem key={method.id} value={method.code}>{method.name}{method.fee_percent > 0 ? ` (+${method.fee_percent}%)` : ""}</SelectItem>)}</SelectContent>
+                        </Select>
+                      </Label>
+                      <Label className="min-w-0">Monto
+                        <MoneyInput className={workflowInputClass} value={portion.amount} onValueChange={(amount) => setSplitDrafts((prev) => prev.map((row, index) => index === portionIndex ? { ...row, amount } : row))} placeholder="0" />
+                      </Label>
+                      {splitDrafts.length > 1 && <Button type="button" variant="outline" onClick={() => setSplitDrafts((prev) => prev.filter((_, index) => index !== portionIndex))}>Quitar</Button>}
+                    </div>
+                  ))}
+                </fieldset>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button type="button" variant="outline" disabled={!canTotalizeSplit || busy} title={canTotalizeSplit ? "Rellena el monto con el saldo neto pendiente" : "Nada por rellenar"} onClick={totalizeSplitPayment}>
+                    <Banknote className="h-4 w-4" aria-hidden="true" /> Totalizar pago
+                  </Button>
+                  <Button type="button" variant="outline" disabled={usedSplitMethodCodes.size >= props.methods.filter((method) => method.is_active !== false).length} onClick={addSplitPaymentPortion}>Agregar porción</Button>
+                  <p className="min-w-0 text-sm text-text-secondary sm:ml-auto">Restante: <strong>{formatMoney(splitRemaining)}</strong></p>
+                </div>
+                {payError && <Alert variant="destructive">{payError}</Alert>}
+                <div className={cn("flex flex-col-reverse gap-3 pt-4 sm:flex-row sm:justify-end", workflowFooterClass)}>
+                  <Button type="button" variant="outline" onClick={closePayment}>{paymentReturnsToDetail ? "Volver al detalle" : "Cancelar"}</Button>
+                  <Button type="submit" size="lg" disabled={busy || !canSubmitSplit}><CreditCard className="h-4 w-4" aria-hidden="true" />{busy ? "Pagando…" : "Pagar"}</Button>
+                </div>
+              </form>
+            )}
+          </div>
         </DialogContent>
       </Dialog>
 
@@ -3258,7 +3265,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 <button
                   type="button"
                   onClick={closeCustomerPreview}
-                  className="h-10 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-paper-ink-secondary hover:bg-paper-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-paper-ink-muted max-sm:min-h-11"
+                  className="h-10 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-paper-ink-secondary hover:bg-paper-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 max-sm:min-h-11"
                 >
                   Volver al detalle
                 </button>
@@ -3292,16 +3299,16 @@ export function InvoicesClient(props: InvoicesClientProps) {
             if (commissionRows.length > 0) event.preventDefault();
           }}
         >
-          <div className={cn("max-h-[calc(100dvh-3rem)] overflow-y-auto", paperSheetClass)}>
+          <div className={cn("max-h-[calc(100dvh-3rem)] overflow-y-auto", workflowSheetClass)}>
             <DialogHeader className="block">
               <DialogTitle className="sr-only">Pagar comisión al empleado</DialogTitle>
               <DialogDescription className="sr-only">
                 {commissionInvoice ? `Factura #${commissionInvoice.number}` : "Factura"} · el pago
                 sale de la caja del turno abierto.
               </DialogDescription>
-            <div className="border-b border-paper-line px-6 py-4">
+            <div className="border-b border-border-color dark:border-border-color-2 px-6 py-4">
               <h2 className="text-lg font-bold">Pagar comisión al empleado</h2>
-              <p className="text-sm text-paper-ink-muted">
+              <p className="text-sm text-text-secondary">
                 {commissionInvoice ? `Factura #${commissionInvoice.number}` : "Factura"} · el
                 pago sale de la caja del turno abierto.
               </p>
@@ -3309,12 +3316,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
             </DialogHeader>
             <div className="flex flex-col gap-4 px-6 py-4">
               {commissionRows.map((row, index) => (
-                <div key={row.employee_id} className="rounded-lg border border-paper-line p-3">
+                <div key={row.employee_id} className="rounded-lg border border-border-color dark:border-border-color-2 p-3">
                   <div className="flex flex-wrap items-baseline justify-between gap-2">
                     <span className="text-sm font-semibold">{row.employee_name}</span>
                     <span className="text-sm font-medium">{formatMoney(row.pending)}</span>
                   </div>
-                  <label className="mt-3 flex flex-col gap-1 text-sm font-medium text-paper-ink">
+                  <label className="mt-3 flex flex-col gap-1 text-sm font-medium text-text-primary">
                     Método de pago
                     <Select
                       value={row.method_code}
@@ -3324,7 +3331,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         )
                       }
                     >
-                      <SelectTrigger className={paperInputClass}>
+                      <SelectTrigger className={workflowInputClass}>
                         <SelectValue placeholder="Método" />
                       </SelectTrigger>
                       <SelectContent>
@@ -3346,12 +3353,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 <Alert variant="destructive">{commissionError}</Alert>
               )}
             </div>
-            <div className="flex flex-wrap items-center justify-end gap-3 border-t border-paper-line px-6 py-4">
+            <div className="flex flex-wrap items-center justify-end gap-3 border-t border-border-color dark:border-border-color-2 px-6 py-4">
               <button
                 type="button"
                 onClick={closeCommission}
                 disabled={commissionBusy}
-                className="h-10 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-paper-ink-secondary hover:bg-paper-surface-muted disabled:opacity-50"
+                className="h-10 rounded-md border border-border-color dark:border-border-color-2 px-4 text-sm font-medium text-text-secondary hover:bg-surface-hover disabled:opacity-50"
               >
                 Dejar para nómina
               </button>
@@ -3359,7 +3366,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 type="button"
                 onClick={() => void confirmCommissionPayment()}
                 disabled={commissionBusy || commissionRows.length === 0 || props.methods.length === 0}
-                className="h-10 rounded-md bg-paper-success-strong px-6 text-sm font-semibold text-white hover:bg-paper-success-deep disabled:opacity-50"
+                className="h-10 rounded-md bg-primary-600 px-6 text-sm font-semibold text-white hover:bg-primary-700 disabled:opacity-50"
               >
                 {commissionBusy ? "Pagando…" : "Confirmar pago"}
               </button>
@@ -3377,7 +3384,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
       >
         {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
         <DialogContent className="max-w-sm border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
-          <div className={paperSheetClass}>
+          <div className={workflowSheetClass}>
             <DialogHeader className="block">
               <DialogTitle className="sr-only">
                 {confirmKind === "bajo_cobrado"
@@ -3402,7 +3409,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                         ? "Emitir y pagar"
                         : "Emitir factura"}
               </h2>
-              <p className="mt-2 text-sm text-paper-ink-tertiary">
+              <p className="mt-2 text-sm text-text-secondary">
                 {confirmKind === "bajo_cobrado" ? (
                   <>
                     {bajoCobradoNotice ?? "El nuevo total dejaría la factura sobre-cobrada."}
@@ -3431,7 +3438,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 type="button"
                 onClick={cancelConfirm}
                 disabled={busy}
-                className="h-10 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-paper-ink-secondary hover:bg-paper-surface-muted disabled:opacity-50"
+                className="h-10 rounded-md border border-border-color dark:border-border-color-2 px-4 text-sm font-medium text-text-secondary hover:bg-surface-hover disabled:opacity-50"
               >
                 Cancelar
               </button>
@@ -3446,8 +3453,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 }}
                 className={
                   confirmKind === "annul" || confirmKind === "bajo_cobrado"
-                    ? "h-10 rounded-md bg-paper-danger px-6 text-sm font-semibold text-white hover:bg-paper-danger-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-paper-focus-danger focus-visible:ring-offset-2 disabled:opacity-50"
-                    : "h-10 rounded-md bg-paper-success-strong px-6 text-sm font-semibold text-white hover:bg-paper-success-deep focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-paper-focus-success focus-visible:ring-offset-2 disabled:opacity-50"
+                    ? "h-10 rounded-md bg-error-600 px-6 text-sm font-semibold text-white hover:bg-error/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-error-600 focus-visible:ring-offset-2 disabled:opacity-50"
+                    : "h-10 rounded-md bg-primary-600 px-6 text-sm font-semibold text-white hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 disabled:opacity-50"
                 }
               >
                 {busy

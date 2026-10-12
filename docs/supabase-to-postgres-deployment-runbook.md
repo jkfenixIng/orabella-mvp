@@ -2,13 +2,13 @@
 
 ## Scope and safety boundary
 
-This runbook moves the application's database target from Supabase to a plain PostgreSQL instance. It applies the discovered incremental migrations after the already-applied `001` baseline, validates staging first, and changes the deployment to `DB_ENGINE=postgres` only after production approval. At this revision, the discovered set is `002` through `009`.
+This runbook moves the application's database target from Supabase to a plain PostgreSQL instance. It applies the discovered incremental migrations after the already-applied `001` baseline, validates staging first, and changes the deployment to `DB_ENGINE=postgres` only after production approval. At this revision, the discovered set is `002` through `010`.
 
 - **Read-only / preparation** sections do not change a database or deployment.
 - **Write** sections run migrations, provisioning, restore, or deployment changes. Treat every such command as irreversible unless this runbook explicitly says otherwise.
 - Run commands from the repository root. Do not put connection strings, passwords, emails, or user UUIDs in the repository or shell history.
 - `001_orabella_schema.sql` is an already-applied baseline; do **not** edit or reapply it to an existing environment.
-- `006_installation_owner.sql` (singleton installation owner), `007_money_cap_policy.sql` (whole-peso caps), `008_inactive_payment_method_arqueo.sql` (inactive methods force `arqueo_mode = none`) and `009_cash_opening_bounds.sql` (drawer cash stays between effective previous base and configured base) are integrated; their marker contracts are in `scripts/portable-migration-markers.mjs`. Owner provisioning is a separate, DB-operator-only step (section 4).
+- `006_installation_owner.sql` (singleton installation owner), `007_money_cap_policy.sql` (whole-peso caps), `008_inactive_payment_method_arqueo.sql` (inactive methods force `arqueo_mode = none`), `009_cash_opening_bounds.sql` (drawer cash stays between effective previous base and configured base) and `010_inventory_catalog_page.sql` (server-side product query, stock filter, page and total) are integrated; their marker contracts are in `scripts/portable-migration-markers.mjs`. Owner provisioning is a separate, DB-operator-only step (section 4).
 - This repository does not define a source-to-target data-copy contract. The fresh backup is mandatory recovery evidence, but importing it into a new target must use a separately approved, compatibility-checked transfer procedure; do not treat the backup-verifier input as a production restore command.
 
 ## Interfaces and access
@@ -67,7 +67,7 @@ npm run plan:portable-migrations -- \
   --output "$BACKUP_DIR/staging-portable-migration-plan.json"
 ```
 
-At this revision the repository contains `002` through `009`, each with a reviewed marker contract. The `006` marker requires `installation_owner`, both owner triggers and the `provision_installation_owner(uuid)` / `break_glass_transfer_installation_owner(uuid,text)` functions as `SECURITY DEFINER` with `search_path=pg_catalog, public`, and reads the ACL: `PUBLIC` and any existing `anon`, `authenticated`, `service_role` or `orabella_app` role (a missing role counts as no privilege) must hold no `SELECT/INSERT/UPDATE/DELETE` on the table and no `EXECUTE` on either function; the `007` marker requires the five replaced cap/minimum functions and the `round(` projection in the invoice cap and cash minimum; the `008` marker requires the inactive-method coherence constraint and trigger branch. A governed deferment of `006` must also defer `007` and `008` (contiguous suffix); `007` must also defer `008`. Any later migration fails closed until its marker contract is reviewed. The planner never provisions an owner.
+At this revision the repository contains `002` through `010`, each with a reviewed marker contract. The `006` marker requires `installation_owner`, both owner triggers and the `provision_installation_owner(uuid)` / `break_glass_transfer_installation_owner(uuid,text)` functions as `SECURITY DEFINER` with `search_path=pg_catalog, public`, and reads the ACL: `PUBLIC` and any existing `anon`, `authenticated`, `service_role` or `orabella_app` role (a missing role counts as no privilege) must hold no `SELECT/INSERT/UPDATE/DELETE` on the table and no `EXECUTE` on either function; the `007` marker requires the five replaced cap/minimum functions and the `round(` projection in the invoice cap and cash minimum; the `008` marker requires the inactive-method coherence constraint and trigger branch. A governed deferment of `006` must also defer `007` and `008` (contiguous suffix); `007` must also defer `008`. Any later migration fails closed until its marker contract is reviewed. The planner never provisions an owner.
 
 For a clean plain PostgreSQL target, the order is:
 

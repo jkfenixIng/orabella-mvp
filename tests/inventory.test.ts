@@ -236,7 +236,7 @@ describe("inventory: estado visible de stock", () => {
   it("los filtros no mezclan Bajo mínimo con Sin existencias", () => {
     const empty = { stock_qty: 0, min_stock: 5 };
     const low = { stock_qty: 2, min_stock: 5 };
-    expect(matchesStockFilter(empty, "empty")).toBe(true);
+    expect(matchesStockFilter(empty, "out")).toBe(true);
     expect(matchesStockFilter(empty, "low")).toBe(false);
     expect(matchesStockFilter(low, "low")).toBe(true);
     expect(matchesStockFilter(low, "all")).toBe(true);

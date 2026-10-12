@@ -177,7 +177,8 @@ export function isLowStock(product: LowStockCandidate): boolean {
   return product.stock_qty <= product.min_stock;
 }
 
-export type StockFilter = "all" | "low" | "empty";
+export const stockFilterSchema = z.enum(["all", "low", "out"]);
+export type StockFilter = z.infer<typeof stockFilterSchema>;
 export type StockBadge = "empty" | "low" | null;
 
 /** Visible stock state: zero is red; positive stock at or below minimum is orange. */
@@ -187,7 +188,8 @@ export function stockBadge(product: LowStockCandidate): StockBadge {
 }
 
 export function matchesStockFilter(product: LowStockCandidate, filter: StockFilter): boolean {
-  return filter === "all" || stockBadge(product) === filter;
+  if (filter === "all") return true;
+  return stockBadge(product) === (filter === "out" ? "empty" : "low");
 }
 
 /** INV-04: filtra los productos que necesitan alerta de mínimo. */

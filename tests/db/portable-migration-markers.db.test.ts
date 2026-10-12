@@ -17,13 +17,13 @@ describe("portable migration marker contracts", () => {
     }
   });
 
-  it("distinguish 006-009 from a 001-005 baseline", async () => {
+  it("distinguish 006-010 from a 001-005 baseline", async () => {
     const through005 = MIGRATION_PATHS.filter((path) => /[\\/]00[1-5]_[^\\/]+\.sql$/.test(path));
     expect(through005).toHaveLength(5);
     const db = await buildSchemaDb({ catalog: false, migrations: through005 });
     try {
       for (const filename of Object.keys(MIGRATION_MARKERS)) {
-        expect(await marker(db, filename)).toBe(!/^00[6789]_/.test(filename));
+        expect(await marker(db, filename)).toBe(!/^(?:00[6-9]|010)_/.test(filename));
       }
     } finally {
       await db.close();
@@ -62,6 +62,21 @@ describe("portable migration marker contracts", () => {
     try {
       await db.exec(statement);
       expect(await marker(db, "009_cash_opening_bounds.sql")).toBe(false);
+    } finally {
+      await db.close();
+    }
+  });
+
+  it.each([
+    "GRANT EXECUTE ON FUNCTION public.inventory_catalog_page(text, text, integer, integer) TO PUBLIC",
+    "GRANT EXECUTE ON FUNCTION public.inventory_catalog_page(text, text, integer, integer) TO anon",
+    "GRANT EXECUTE ON FUNCTION public.inventory_catalog_page(text, text, integer, integer) TO authenticated",
+    "REVOKE EXECUTE ON FUNCTION public.inventory_catalog_page(text, text, integer, integer) FROM service_role",
+  ])("rejects 010 after: %s", async (statement) => {
+    const db = await buildSchemaDb({ catalog: false });
+    try {
+      await db.exec(statement);
+      expect(await marker(db, "010_inventory_catalog_page.sql")).toBe(false);
     } finally {
       await db.close();
     }

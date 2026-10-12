@@ -30,6 +30,18 @@ export interface ProductRow {
   is_active: boolean;
 }
 
+export interface ProductPage {
+  rows: ProductRow[];
+  total: number;
+}
+
+export interface ProductCatalogQuery {
+  query: string;
+  stockFilter: "all" | "low" | "out";
+  limit: number;
+  offset: number;
+}
+
 export interface MovementRow {
   id: string;
   product_id: string;
@@ -72,6 +84,8 @@ export interface InventoryRepo {
   skuConflicts(sku: string, exceptId?: string): Promise<Array<{ id: string }>>;
   /** Literal, case-insensitive fragment of name or SKU; ordered by name, id. */
   searchProducts(needle: string, limit: number, offset?: number): Promise<ProductRow[]>;
+  /** Server-filtered catalog page plus the total of the same filtered relation. */
+  catalogPage(query: ProductCatalogQuery): Promise<ProductPage>;
   /** Active products ordered by stock_qty, id. */
   activeByStock(limit: number): Promise<ProductRow[]>;
   upsertProduct(write: ProductWrite): Promise<ProductRow | null>;
@@ -94,6 +108,22 @@ export interface InventoryRepo {
  * string is built from user input. Its rows are the PRODUCT_SELECT columns.
  */
 export const SEARCH_PRODUCTS_RPC = "search_products_literal";
+/** Migration 010: catalog query, stock filter, page and total in one RPC. */
+export const CATALOG_PAGE_RPC = "inventory_catalog_page";
+
+type CatalogRow = Record<string, unknown> & { total_count?: unknown };
+
+/** Splits the window total from rows; an empty page has no row carrying it. */
+export function toProductPage(data: unknown, toProduct: (row: Record<string, unknown>) => ProductRow): ProductPage {
+  const rows = (data ?? []) as CatalogRow[];
+  return {
+    rows: rows.map(({ total_count: _total, ...row }) => {
+      void _total;
+      return toProduct(row);
+    }),
+    total: Number(rows[0]?.total_count ?? 0),
+  };
+}
 
 // ---------------------------------------------------------------- supabase ---
 
@@ -155,6 +185,16 @@ export function supabaseInventoryRepo(db: SupabaseClient): InventoryRepo {
       const { data, error } = await db.rpc(SEARCH_PRODUCTS_RPC, { p_query: needle, p_limit: limit, p_offset: offset });
       if (error) fail(error);
       return products(data);
+    },
+    async catalogPage({ query, stockFilter, limit, offset }) {
+      const { data, error } = await db.rpc(CATALOG_PAGE_RPC, {
+        p_query: query,
+        p_stock_filter: stockFilter,
+        p_limit: limit,
+        p_offset: offset,
+      });
+      if (error) fail(error);
+      return toProductPage(data, normalizeProduct);
     },
     async activeByStock(limit) {
       const { data, error } = await db.from("products").select(await resolveProductSelect(db)).eq("is_active", true).order("stock_qty").order("id").limit(limit);

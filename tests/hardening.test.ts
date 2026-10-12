@@ -658,7 +658,7 @@ function tablasConColumnaSede(sql: string): string[] {
  * numerado nuevo, y entra en esta lista a mano, con su decisión escrita en
  * `supabase/squash/README.md` (5.3).
  */
-const MIGRACIONES_POSTERIORES = ["002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql", "005_cop_whole_peso.sql", "006_installation_owner.sql", "007_money_cap_policy.sql", "008_inactive_payment_method_arqueo.sql", "009_cash_opening_bounds.sql"] as const;
+const MIGRACIONES_POSTERIORES = ["002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql", "005_cop_whole_peso.sql", "006_installation_owner.sql", "007_money_cap_policy.sql", "008_inactive_payment_method_arqueo.sql", "009_cash_opening_bounds.sql", "010_inventory_catalog_page.sql"] as const;
 
 /**
  * Top-level statements of a SQL file, comments removed. Splits on `;` only
@@ -1034,6 +1034,24 @@ describe("el squash: `001_orabella_schema.sql` es el archivo vivo (squash de la 
       expect(statements).toContain(`GRANT EXECUTE ON FUNCTION ${signature} TO service_role`);
     }
     expect(statements.filter((statement) => /^GRANT\b/.test(statement))).toHaveLength(2);
+  });
+
+  it("010 is one read-only invoker catalog RPC restricted to service_role", () => {
+    const sql010 = readFileSync(join(SQUASH_DIR, "010_inventory_catalog_page.sql"), "utf8");
+    const body = stripSqlComments(sql010);
+    const statements = sqlStatements(sql010);
+    const signature = "public.inventory_catalog_page(text, text, integer, integer)";
+    expect(body.trim()).toMatch(/^BEGIN;[\s\S]*COMMIT;$/);
+    expect(statements.filter((statement) => /^CREATE OR REPLACE FUNCTION/.test(statement))).toHaveLength(1);
+    expect(body).toMatch(/SECURITY INVOKER/);
+    expect(body).toMatch(/SET search_path TO 'public'/);
+    expect(body).not.toMatch(/SECURITY DEFINER|format\s*\(|\b(?:INSERT|UPDATE|DELETE|TRUNCATE)\b/i);
+    expect(body.match(/ILIKE v_pattern ESCAPE v_escape/g)).toHaveLength(2);
+    for (const role of ["PUBLIC", "anon", "authenticated"]) {
+      expect(statements).toContain(`REVOKE ALL ON FUNCTION ${signature} FROM ${role}`);
+    }
+    expect(statements).toContain(`GRANT EXECUTE ON FUNCTION ${signature} TO service_role`);
+    expect(statements.filter((statement) => /^GRANT\b/.test(statement))).toHaveLength(1);
   });
 
   it("004's guard inspects the WHOLE function, not only its prefix (mutations of the real file)", () => {

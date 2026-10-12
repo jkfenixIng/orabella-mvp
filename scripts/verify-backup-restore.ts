@@ -83,6 +83,8 @@ const EXPECTED_LATER = {
     "index|payment_methods.uq_payment_methods_single_denominations",
     // 004: literal inventory search, used by both database engines.
     "function|search_products_literal(p_query text, p_limit integer, p_offset integer)",
+    // 010: server-side inventory catalog query, filter, page and total.
+    "function|inventory_catalog_page(p_query text, p_stock_filter text, p_limit integer, p_offset integer)",
     // 005: whole-peso COP guards (additive; legacy numeric rows stay intact).
     "function|assert_cop_whole_peso()",
     "function|assert_cop_whole_peso_settings()",

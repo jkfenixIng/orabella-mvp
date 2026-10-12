@@ -41,13 +41,25 @@ describe("invoice payment and list layout", () => {
     expect(client).toContain('Vista para cliente');
   });
 
-  it("uses tokenized paper surfaces for invoice dialogs and MoneyInput for split amounts", () => {
-    const sheet = client.match(/const paperSheetClass =\s*"([^"]+)"/)?.[1] ?? "";
-    expect(sheet.split(" ")).toEqual(expect.arrayContaining(["bg-paper-surface", "shadow-2xl", "dark:shadow-none", "dark:ring-border-color-2"]));
-    // Create, detail, edit, item, preview, commission and confirm sheets.
-    expect(client.match(/\bpaperSheetClass\)?\}/g)?.length).toBe(7);
+  it("keeps only the customer preview paper-like and uses semantic dark surfaces for workflows", () => {
+    const paperSheet = client.match(/const paperSheetClass =\s*"([^"]+)"/)?.[1] ?? "";
+    const workflowSheet = client.match(/const workflowSheetClass =\s*"([^"]+)"/)?.[1] ?? "";
+    expect(paperSheet.split(" ")).toEqual(expect.arrayContaining(["bg-paper-surface", "shadow-2xl"]));
+    expect(workflowSheet.split(" ")).toEqual(expect.arrayContaining(["border-border-color", "bg-surface", "text-text-primary", "dark:border-border-color-2", "dark:bg-surface"]));
+    expect(client.match(/\bpaperSheetClass\)?\}/g)?.length).toBe(1);
+    expect(client.match(/\bworkflowSheetClass\)?\}/g)?.length).toBe(6);
+    const payment = client.slice(client.indexOf("<Dialog open={paymentDialogOpen}"), client.indexOf("<Dialog open={customerPreviewOpen}"));
+    expect(payment).toContain("bg-surface text-text-primary dark:border-border-color-2 dark:bg-surface dark:text-text-primary");
+    expect(payment).not.toMatch(/\bpaper-/);
+    // Emit, detail, edit, item and payment workflows: no paper-only colors before the customer preview.
+    const workflows = client.slice(client.indexOf('<DialogContent className="max-w-5xl flex'), client.indexOf("<Dialog open={customerPreviewOpen}"));
+    expect(workflows).toContain("EDITAR FACTURA");
+    expect(workflows).not.toMatch(/\b(?:bg|text|border|divide|ring)-paper-/);
+    expect(client).toContain("const workflowInputClass = inputClass");
+    expect(client).toContain("const workflowPanelClass");
+    expect(client).toContain("const workflowFooterClass");
     expect(client).not.toContain("rgba(255,255,255");
-    expect(client).toContain('<MoneyInput className={inputClass}');
+    expect(client).toContain('<MoneyInput className={workflowInputClass}');
     expect(client).toContain('onValueChange={(amount) => setSplitDrafts');
   });
 });

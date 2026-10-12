@@ -701,11 +701,11 @@ describe("facturación y login: el texto visible no cambió", () => {
     // tenían rol): siguen en su clase de texto y NO se envuelven en `Alert`
     // —envolverlos AGREGARÍA el anuncio que hoy no existe—. Queda pineado.
     const vacios: Array<[string, string, string]> = [
-      // Los tres de la hoja pasaron a `text-paper-ink-muted` (WU5): mismo color, #62748e en claro y oscuro.
+      // Los flujos de trabajo usan el texto secundario del tema en claro y oscuro.
       ["Sin facturas para estos filtros.", "li", "px-3 py-4 text-sm text-text-secondary"],
-      ["Sin ítems. Agregue al menos uno para emitir.", "td", "px-3 py-4 text-center text-sm text-paper-ink-muted"],
-      ["Sin impuestos.", "li", "text-paper-ink-muted"],
-      ["Sin cobro registrado (Emitida).", "li", "text-paper-ink-muted"],
+      ["Sin ítems. Agregue al menos uno para emitir.", "td", "px-3 py-4 text-center text-sm text-text-secondary"],
+      ["Sin impuestos.", "li", "text-text-secondary"],
+      ["Sin cobro registrado (Emitida).", "li", "text-text-secondary"],
     ];
     for (const [text, opener, style] of vacios) {
       expect(plainTextBlock(INVOICES_CLIENT_CODE, text, `<${opener}`), text).toContain(style);
@@ -768,7 +768,7 @@ describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", 
 
   // El botón nuevo, recortado de su `<button` al cierre de la etiqueta.
   const labelIndex = SPLIT_FORM.indexOf("Totalizar pago");
-  const buttonStart = SPLIT_FORM.lastIndexOf("<button", labelIndex);
+  const buttonStart = SPLIT_FORM.lastIndexOf("<Button", labelIndex);
   const TOTALIZE_BUTTON = SPLIT_FORM.slice(buttonStart, SPLIT_FORM.indexOf(">", labelIndex));
 
   it("el recorte del formulario de cobro es real (si el walk se rompe, esto falla)", () => {
@@ -781,7 +781,7 @@ describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", 
     // anclas, un `indexOf` en -1 devolvía un trozo arbitrario y el control
     // negativo de abajo pasaba por la razón equivocada.
     expect(labelIndex, "etiqueta Totalizar pago en el cobro").toBeGreaterThan(-1);
-    expect(buttonStart, "apertura <button del totalizar").toBeGreaterThan(-1);
+    expect(buttonStart, "apertura <Button del totalizar").toBeGreaterThan(-1);
     expect(TOTALIZE_BUTTON, "recorte del botón").toContain("onClick=");
     // El plural de la emisión NO está acá: si el recorte trajera el formulario
     // de emisión, esta guarda lo delata antes que cualquier otra.
@@ -793,10 +793,9 @@ describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", 
     // `type="button"` es la garantía de que NO puede enviar el formulario.
     expect(TOTALIZE_BUTTON).toContain('type="button"');
     expect(TOTALIZE_BUTTON).toContain("onClick={totalizeSplitPayment}");
-    // Misma forma de botón que el `Totalizar pagos` de la emisión: contorno de
-    // papel, sin relleno, y el mismo disable visible.
-    expect(TOTALIZE_BUTTON).toContain("border-paper-line-strong");
-    expect(TOTALIZE_BUTTON).toContain("disabled:cursor-not-allowed disabled:opacity-50");
+    // Contorno semántico del tema: legible en claro y oscuro.
+    expect(TOTALIZE_BUTTON).toContain('variant="outline"');
+    expect(TOTALIZE_BUTTON).toContain("disabled={!canTotalizeSplit || busy}");
     // El `title` espeja el de la creación, con el singular del detalle (acá se
     // cobra UNA porción, no varias).
     expect(TOTALIZE_BUTTON).toContain("Rellena el monto con el saldo neto pendiente");
