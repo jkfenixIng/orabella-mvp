@@ -800,10 +800,10 @@ const SURFACES: readonly SurfaceSpec[] = [
   },
   {
     file: PAYROLL_ACTIONS_FILE,
-    name: "getPayrollSettlementSourceCountsAction",
+    name: "listPayrollPeriodsPageAction",
     kind: "payroll",
     roles: ["admin", "empleado"],
-    why: "cuenta facturas y vales de la liquidación de UN empleado, sin detalles (alcance por fila: el empleado solo la suya); la caja no entra.",
+    why: "una página de la tabla de períodos con filtros validados en el servidor: mismo público que listPeriodsAction; la caja no entra.",
   },
   {
     file: PAYROLL_ACTIONS_FILE,

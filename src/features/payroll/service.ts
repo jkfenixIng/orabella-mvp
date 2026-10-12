@@ -36,6 +36,7 @@ import {
   payFrequencySchema,
   payrollCycleRange,
   payrollExtraSchema,
+  payrollStatusSchema,
   pendingPayrollSettlements,
   rangesOverlap,
   requestVoucherSchema,
@@ -78,7 +79,7 @@ import {
 import { AUDIT_ACTIONS, writeAudit } from "@/src/shared/lib/audit";
 import { DbQueryError } from "@/src/shared/db/errors";
 import { COP_WHOLE_PESO_MESSAGE, copValidationError } from "@/src/shared/money/cop";
-import type { PayrollRepo } from "./repos/payroll";
+import type { PayrollPeriodQuery, PayrollRepo } from "./repos/payroll";
 import { planIncomingCarries, settlePayrollCarries, type CarryRow } from "./carries";
 import { bogotaDay, rangeBounds } from "@/src/shared/lib/dates";
 import {
@@ -890,6 +891,96 @@ export async function openPayrollPeriod(
  * con la misma fecha de inicio pueden caer en páginas distintas y repetirse o
  * perderse.
  */
+
+/** Server response for one visible period-table page. */
+export interface PayrollPeriodList {
+  rows: PayrollPeriodRow[];
+  total: number;
+}
+
+/** Rows per page of every payroll list (periods and Pagos del mes). */
+export const PAYROLL_LIST_PAGE_SIZE = 10;
+const PAYROLL_LIST_MAX_PAGE_SIZE = 50;
+/** Free-text search: letters, digits, spaces, dot and hyphen (safe inside a quoted PostgREST value). */
+const PAYROLL_PERIOD_SEARCH_PATTERN = /^[\p{L}\p{N} .-]{1,80}$/u;
+const PAYROLL_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Validated page window; malformed input is a VALIDATION error, never a silent default. */
+function payrollPageWindow(value: Record<string, unknown>): { offset: number; limit: number } {
+  const page = value.page ?? 0;
+  const limit = value.limit ?? PAYROLL_LIST_PAGE_SIZE;
+  if (typeof page !== "number" || !Number.isInteger(page) || page < 0) {
+    throw new PayrollError("VALIDATION", "Página inválida.", 400);
+  }
+  if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > PAYROLL_LIST_MAX_PAGE_SIZE) {
+    throw new PayrollError("VALIDATION", "Tamaño de página inválido.", 400);
+  }
+  return { offset: page * limit, limit };
+}
+
+function payrollPeriodQuery(input: unknown): { filters: PayrollPeriodQuery; offset: number; limit: number } {
+  const value = (input ?? {}) as Record<string, unknown>;
+  const filters: PayrollPeriodQuery = {};
+  const status = value.status ?? "";
+  if (status !== "") {
+    if (!payrollStatusSchema.safeParse(status).success) throw new PayrollError("VALIDATION", "Estado inválido.", 400);
+    filters.status = status as string;
+  }
+  const cadence = value.frequency ?? "todas";
+  if (cadence === "sin-cadencia") filters.frequency = null;
+  else if (cadence !== "todas") {
+    if (!payFrequencySchema.safeParse(cadence).success) throw new PayrollError("VALIDATION", "Cadencia inválida.", 400);
+    filters.frequency = cadence as string;
+  }
+  const month = value.month ?? "";
+  if (month !== "") {
+    if (typeof month !== "string" || !PAYROLL_MONTH_PATTERN.test(month)) {
+      throw new PayrollError("VALIDATION", "Mes inválido (use yyyy-mm).", 400);
+    }
+    const bounds = monthDays(month);
+    filters.from = bounds.first;
+    filters.to = bounds.last;
+  }
+  const search = typeof value.search === "string" ? value.search.trim() : "";
+  if (search !== "") {
+    if (PAYROLL_DAY_PATTERN.test(search) && utcDayOf(search) !== null) filters.day = search;
+    else if (PAYROLL_PERIOD_SEARCH_PATTERN.test(search)) filters.term = search.toLocaleLowerCase();
+    else throw new PayrollError("VALIDATION", "Búsqueda inválida: use letras, números o una fecha aaaa-mm-dd.", 400);
+  }
+  return { filters, ...payrollPageWindow(value) };
+}
+
+/** First and last civil day of a validated `yyyy-mm`. */
+function monthDays(month: string): { first: string; last: string } {
+  const [year, monthNumber] = month.split("-").map(Number);
+  const lastDay = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+  return { first: `${month}-01`, last: `${month}-${String(lastDay).padStart(2, "0")}` };
+}
+
+function utcDayOf(day: string): number | null {
+  const time = Date.parse(`${day}T00:00:00Z`);
+  return Number.isNaN(time) || new Date(time).toISOString().slice(0, 10) !== day ? null : time;
+}
+
+/** Server-side period list: the UI receives only its requested window and exact total. */
+export async function listPayrollPeriods(input: unknown = {}): Promise<PayrollPeriodList> {
+  try {
+    const { filters, offset, limit } = payrollPeriodQuery(input);
+    const db = await payrollDb();
+    const [rows, count] = await Promise.all([
+      db.listPeriods<PayrollPeriodRow>(filters, { offset, limit }),
+      db.countPeriods(filters),
+    ]);
+    if (rows.error || count.error || rows.data === null || count.count === null) {
+      throw new PayrollError("INTERNAL", "Error interno.", 500);
+    }
+    return { rows: rows.data, total: count.count };
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
+/** Exhaustive domain read; list UI must use `listPayrollPeriods` instead. */
 export async function listPeriods(): Promise<PayrollPeriodRow[]> {
   try {
     const db = await payrollDb();
@@ -1120,12 +1211,6 @@ export type PayrollSettlementSources =
       vouchers: PayrollSettlementVoucher[];
     };
 
-/** Conteos de fuentes de una liquidación; no expone sus detalles. */
-export interface PayrollSettlementSourceCounts {
-  invoices: number;
-  vouchers: number;
-}
-
 /**
  * F6: agrupa el `detail_json` de UN ítem por factura y separa el ajuste del
  * mixto.
@@ -1245,48 +1330,6 @@ export async function getPayrollSettlementSources(
         status: row.status,
       })),
     };
-  } catch (error) {
-    throw toPayrollError(error);
-  }
-}
-
-/**
- * Conteo liviano de las dos fuentes, para rotular la elección antes de cargar
- * cualquier detalle. Facturas: del `detail_json` del ítem. Vales: solo ids con el
- * MISMO alcance que `getPayrollSettlementSources` (sin ítem no hay vales).
- */
-export async function getPayrollSettlementSourceCounts(
-  periodId: string,
-  employeeId: string,
-): Promise<PayrollSettlementSourceCounts> {
-  try {
-    const db = await payrollDb();
-    const period = await getPeriodOrThrow(db, periodId);
-    const items = await readAllPayroll<{ detail_json: DetailLine[] | null }>({
-      log: "getPayrollSettlementSourceCounts",
-      what: "ítem del empleado en el período",
-      meta: { periodId, employeeId },
-      table: "payroll_items",
-      fetchPage: (from, to) => db.employeeItemDetailPage(periodId, employeeId, from, to),
-    });
-    if (items.length === 0) return { invoices: 0, vouchers: 0 };
-    const invoices = groupSettlementInvoices(items[0]?.detail_json ?? []).invoices.length;
-    const voucherIds = await readAllPayroll<{ id: string }>({
-      log: "getPayrollSettlementSourceCounts",
-      what: "vales del empleado en el período",
-      meta: { periodId, employeeId },
-      table: "voucher_requests",
-      fetchPage: (from, to) =>
-        db.employeeVoucherIdsPage(
-          employeeId,
-          voucherStatusesForScope("vigentes_y_descontados"),
-          period.start_date,
-          period.end_date,
-          from,
-          to,
-        ),
-    });
-    return { invoices, vouchers: voucherIds.length };
   } catch (error) {
     throw toPayrollError(error);
   }
@@ -1532,14 +1575,43 @@ export async function listPayrollMonthOptions(): Promise<string[]> {
   }
 }
 
+/** One roster read: employees whose name, code or document contains the term. */
+async function employeeIdsMatching(search: string): Promise<Set<string>> {
+  const term = search.toLocaleLowerCase();
+  const roster = await listAllEmployees();
+  return new Set(
+    roster
+      .filter((row) =>
+        [row.full_name, row.employee_code, row.document].some((value) => (value ?? "").toLocaleLowerCase().includes(term)),
+      )
+      .map((row) => row.id),
+  );
+}
+
+export interface PayrollMonthRowsList {
+  rows: PayrollMonthEmployeeRow[];
+  total: number;
+}
+
+/** Server-side page of closed/paid monthly rows. */
 export async function listPayrollMonthRows(args: {
   month: string;
-  /** Opcional: sin empleado devuelve toda la planta del mes (acotada por la planta). */
   employeeId?: string;
-}): Promise<PayrollMonthEmployeeRow[]> {
+  search?: string;
+  page?: number;
+  limit?: number;
+}): Promise<PayrollMonthRowsList> {
   try {
-    if (!PAYROLL_MONTH_PATTERN.test(args.month)) {
+    if (typeof args?.month !== "string" || !PAYROLL_MONTH_PATTERN.test(args.month)) {
       throw new PayrollError("VALIDATION", "Mes inválido (use yyyy-mm).", 400);
+    }
+    if (args.employeeId !== undefined && (typeof args.employeeId !== "string" || args.employeeId.trim() === "")) {
+      throw new PayrollError("VALIDATION", "Empleado inválido.", 400);
+    }
+    const { offset, limit } = payrollPageWindow(args as Record<string, unknown>);
+    const search = typeof args.search === "string" ? args.search.trim() : "";
+    if (search !== "" && !PAYROLL_PERIOD_SEARCH_PATTERN.test(search)) {
+      throw new PayrollError("VALIDATION", "Búsqueda inválida: use letras, números, espacios, punto o guion.", 400);
     }
     const db = await payrollDb();
     const monthPeriods = (await listPeriods()).filter(
@@ -1557,9 +1629,12 @@ export async function listPayrollMonthRows(args: {
           }),
       readPayrollExtras({ db, month: args.month, employeeId: args.employeeId, log: "listPayrollMonthRows" }),
     ]);
-    return buildPayrollMonthToDate({ periods: monthPeriods, items, extras }).filter(
+    const rows = buildPayrollMonthToDate({ periods: monthPeriods, items, extras }).filter(
       (row) => row.month === args.month && (args.employeeId === undefined || row.employeeId === args.employeeId),
     );
+    const matches = search === "" ? null : await employeeIdsMatching(search);
+    const filtered = matches === null ? rows : rows.filter((row) => matches.has(row.employeeId));
+    return { rows: filtered.slice(offset, offset + limit), total: filtered.length };
   } catch (error) {
     throw toPayrollError(error);
   }

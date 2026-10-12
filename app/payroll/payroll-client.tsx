@@ -9,13 +9,13 @@ import {
   correctPayrollPeriodAction,
   deletePayrollPeriodAction,
   getPayrollPeriodCorrectionAction,
-  getPayrollSettlementSourceCountsAction,
   getPayrollSettlementSourcesAction,
   getPeriodDetailAction,
   getPayrollStartDateAction,
   listPayrollExtrasAction,
   listPayrollMonthOptionsAction,
   listPayrollMonthRowsAction,
+  listPayrollPeriodsPageAction,
   listPeriodsAction,
   listVouchersAction,
   openPayrollPeriodAction,
@@ -140,6 +140,8 @@ const tableInputClass = cn(
  * la columna de vales y despegaría las cifras entre sí. El ancho lo gana el
  * diálogo, no la celda.
  */
+/** Rows per server page of «Pagos del mes» (same size the service defaults to). */
+const MONTH_PAGE_SIZE = 10;
 const headCellClass = cn(tableCellClass, "whitespace-nowrap");
 const moneyHeadClass = cn(tableCellClass, "whitespace-nowrap text-right");
 const moneyCellClass = cn(tableCellClass, "text-right tabular-nums whitespace-nowrap");
@@ -1039,25 +1041,9 @@ function ExpandedItemPanel({
   );
 }
 
-/**
- * Cantidad visible en cada opción de fuentes. Las facturas salen del detalle ya
- * leído; los vales solo se cuentan cuando su lectura dedicada ya llegó.
- */
-function settlementSourceCount(
-  kind: "invoices" | "vouchers",
-  loaded: PayrollSettlementSources | null,
-  counts: { invoices: number; vouchers: number } | null,
-): number | null {
-  if (loaded?.kind === "invoices") return loaded.invoices.length;
-  if (loaded?.kind === "vouchers") return loaded.vouchers.length;
-  return counts?.[kind] ?? null;
-}
-
-/** Rótulo de la opción: `Facturas (N)` / `Vales (M)`, o `…` mientras se cuenta. */
-export function settlementSourceLabel(kind: "invoices" | "vouchers", count: number | null, busy: boolean): string {
-  const name = kind === "invoices" ? "Facturas" : "Vales";
-  if (count !== null) return `${name} (${count})`;
-  return busy ? `${name} (…)` : name;
+/** Rótulo de la opción de fuentes: el detalle se carga sólo al seleccionarla. */
+export function settlementSourceLabel(kind: "invoices" | "vouchers"): string {
+  return kind === "invoices" ? "Facturas" : "Vales";
 }
 
 /** Campo de solo lectura del detalle de una factura o un vale. */
@@ -1205,6 +1191,15 @@ export function SettlementSourcesPanel({
 
 export function PayrollClient(props: PayrollClientProps) {
   const [periods, setPeriods] = useState<PayrollPeriodRow[]>(props.initialPeriods);
+  /**
+   * The period TABLE is a server page (filters + page travel to the action).
+   * `periods` above stays the exhaustive domain read that cadence, overlap and
+   * pending-cycle rules need; it is never sliced for display.
+   */
+  const [periodTable, setPeriodTable] = useState<{ rows: PayrollPeriodRow[]; total: number } | null>(null);
+  const [periodTableBusy, setPeriodTableBusy] = useState(false);
+  const [periodTableVersion, setPeriodTableVersion] = useState(0);
+  const periodTableRequestRef = useRef(0);
   const [selectedId, setSelectedId] = useState<string | null>(props.initialPeriods[0]?.id ?? null);
   const [detail, setDetail] = useState<PeriodDetail | null>(null);
   const [detailTargetId, setDetailTargetId] = useState<string | null>(null);
@@ -1245,7 +1240,9 @@ export function PayrollClient(props: PayrollClientProps) {
   const [monthQuery, setMonthQuery] = useState<{
     month: string;
     employeeId: string;
+    search: string;
     rows: PayrollMonthEmployeeRow[];
+    total: number;
   } | null>(null);
   const [monthPaymentTarget, setMonthPaymentTarget] = useState<string | null>(null);
   const [monthPaymentRows, setMonthPaymentRows] = useState<PayrollItemPaymentDetail[] | null>(null);
@@ -1417,9 +1414,6 @@ export function PayrollClient(props: PayrollClientProps) {
    * empleado si el usuario cambia de período mientras carga.
    */
   const [sourcesTarget, setSourcesTarget] = useState<{ periodId: string; employeeId: string } | null>(null);
-  const [sourceCounts, setSourceCounts] = useState<{ invoices: number; vouchers: number } | null>(null);
-  const [sourceCountsBusy, setSourceCountsBusy] = useState(false);
-  const sourceCountsKeyRef = useRef<string | null>(null);
   const [invoiceSources, setInvoiceSources] = useState<Extract<PayrollSettlementSources, { kind: "invoices" }> | null>(null);
   const [voucherSources, setVoucherSources] = useState<Extract<PayrollSettlementSources, { kind: "vouchers" }> | null>(null);
   const [selectedSourceKind, setSelectedSourceKind] = useState<"invoices" | "vouchers" | null>(null);
@@ -1558,6 +1552,24 @@ export function PayrollClient(props: PayrollClientProps) {
     setAdjustmentDialog(null);
   }
 
+  async function loadPeriodTable(page = periodPage) {
+    const request = periodTableRequestRef.current + 1;
+    periodTableRequestRef.current = request;
+    setPeriodTableBusy(true);
+    const result = await listPayrollPeriodsPageAction({
+      page,
+      limit: 10,
+      status: statusFilter === "todos" ? "" : statusFilter,
+      frequency: periodCadenceParam,
+      month: periodMonth,
+      search: periodSearch,
+    });
+    if (periodTableRequestRef.current !== request) return;
+    setPeriodTableBusy(false);
+    if (result.success) setPeriodTable(result.data);
+    else show(result);
+  }
+
   async function refreshPeriods(select?: string) {
     // El PISO se relee ANTES de que los períodos cambien de estado: el aviso y
     // el diálogo se derivan de los dos en el mismo render, así que un piso viejo
@@ -1576,6 +1588,7 @@ export function PayrollClient(props: PayrollClientProps) {
     if (!result.success) return;
     if (floor !== null && floor.success) setPayrollStartDate(floor.data);
     setPeriods(result.data);
+    setPeriodTableVersion((version) => version + 1);
     if (select) setSelectedId(select);
     else if (!selectedId && result.data[0]) setSelectedId(result.data[0].id);
   }
@@ -1963,16 +1976,6 @@ export function PayrollClient(props: PayrollClientProps) {
    */
   function openSettlementSources(periodId: string, employeeId: string) {
     setSourcesTarget({ periodId, employeeId });
-    setSourceCounts(null);
-    setSourceCountsBusy(true);
-    const requestKey = `${periodId}:${employeeId}`;
-    sourceCountsKeyRef.current = requestKey;
-    void getPayrollSettlementSourceCountsAction(periodId, employeeId).then((result) => {
-      if (sourceCountsKeyRef.current !== requestKey) return;
-      if (result.success) setSourceCounts(result.data);
-      else show(result);
-      setSourceCountsBusy(false);
-    });
     setInvoiceSources(null);
     setVoucherSources(null);
     setSelectedSourceKind(null);
@@ -2006,9 +2009,6 @@ export function PayrollClient(props: PayrollClientProps) {
 
   function closeSettlementSources() {
     setSourcesTarget(null);
-    sourceCountsKeyRef.current = null;
-    setSourceCounts(null);
-    setSourceCountsBusy(false);
     setInvoiceSources(null);
     setVoucherSources(null);
     setSelectedSourceKind(null);
@@ -2187,6 +2187,8 @@ export function PayrollClient(props: PayrollClientProps) {
       await refreshPayrollMonthAfterExtra({
         extra: result.data,
         monthQuery,
+        page: monthPage,
+        pageSize: MONTH_PAGE_SIZE,
         loadRows: listPayrollMonthRowsAction,
         loadOptions: listPayrollMonthOptionsAction,
         show,
@@ -2493,21 +2495,22 @@ export function PayrollClient(props: PayrollClientProps) {
     : "todas";
 
   /**
-   * PA3: la lista se filtra por estado Y por cadencia, y se agrupa por mes, para
-   * que un mes con muchos pagos sea navegable. El conteo se lee SIEMPRE contra
-   * el total.
+   * PA3: status, cadence, month and search are SERVER filters. The table shows
+   * only the page the action returned, and the count always names the total.
    */
   const periodMonthOptions = [...new Set(periods.map((row) => row.start_date.slice(0, 7)).filter((month) => /^\d{4}-\d{2}$/.test(month)))].sort((left, right) => left < right ? 1 : -1);
-  const visiblePeriods = filterPeriodsByCadence(
-    statusFilter === "todos" ? periods : periods.filter((row) => row.status === statusFilter),
-    cadenceFilter,
-  );
-  const periodQuery = periodSearch.trim().toLocaleLowerCase();
-  const tablePeriods = visiblePeriods.filter((period) =>
-    (periodMonth === "" || period.start_date.startsWith(periodMonth)) &&
-    (periodQuery === "" || `${formatPeriodLabel(period)} ${period.frequency ?? ""} ${period.status}`.toLocaleLowerCase().includes(periodQuery)),
-  );
+  const periodQuery = periodSearch.trim();
   const PERIOD_PAGE_SIZE = 10;
+  const periodCadenceParam = periodCadenceTabKey(cadenceFilter);
+  const tablePeriods = periodTable?.rows ?? [];
+  const tablePeriodTotal = periodTable?.total ?? 0;
+
+  // Debounced so typing does not fire one request per key; filters and page
+  // changes reuse the same path.
+  useEffect(() => {
+    const timer = setTimeout(() => void loadPeriodTable(periodPage), periodQuery === "" ? 0 : 250);
+    return () => clearTimeout(timer);
+  }, [periodPage, statusFilter, periodCadenceParam, periodMonth, periodQuery, periodTableVersion]);
 
   /**
    * F11: por qué la lista quedó vacía. Con dos filtros hay que NOMBRAR los dos,
@@ -2688,15 +2691,21 @@ export function PayrollClient(props: PayrollClientProps) {
   function handleMonthQuery(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!queryMonth) return;
-    setMonthPage(0);
+    loadMonthPage({ month: queryMonth, employeeId: queryEmployeeId, search: monthSearch.trim() }, 0);
+  }
+
+  /** One server page of «Pagos del mes» for the criteria last submitted. */
+  function loadMonthPage(criteria: { month: string; employeeId: string; search: string }, page: number) {
+    setMonthPage(page);
     startViewTransition(async () => {
       const result = (await listPayrollMonthRowsAction({
-        month: queryMonth,
-        employeeId: queryEmployeeId || undefined,
-      })) as ActionResult<PayrollMonthEmployeeRow[]>;
-      if (show(result)) {
-        setMonthQuery({ month: queryMonth, employeeId: queryEmployeeId, rows: result.data });
-      }
+        month: criteria.month,
+        employeeId: criteria.employeeId || undefined,
+        search: criteria.search,
+        page,
+        limit: MONTH_PAGE_SIZE,
+      })) as ActionResult<{ rows: PayrollMonthEmployeeRow[]; total: number }>;
+      if (show(result)) setMonthQuery({ ...criteria, rows: result.data.rows, total: result.data.total });
     });
   }
 
@@ -2716,11 +2725,8 @@ export function PayrollClient(props: PayrollClientProps) {
   // Unión de meses: los períodos vivos de la pantalla y los meses Bogotá de los
   // extraordinarios que devuelve el servidor.
   const queryMonthOptions = [...new Set(monthOptions)].sort((left, right) => (left < right ? 1 : -1));
-  const MONTH_PAGE_SIZE = 10;
-  const monthRows = (monthQuery?.rows ?? []).filter((row) =>
-    employeeName(row.employeeId).toLocaleLowerCase().includes(monthSearch.trim().toLocaleLowerCase()),
-  );
-  const monthPageRows = monthRows.slice(monthPage * MONTH_PAGE_SIZE, (monthPage + 1) * MONTH_PAGE_SIZE);
+  const monthPageRows = monthQuery?.rows ?? [];
+  const monthTotal = monthQuery?.total ?? 0;
 
   /** Sueldo mensual del empleado: la base de la prorata, a la vista. */
   function monthSalaryLabel(id: string): string {
@@ -2868,7 +2874,7 @@ export function PayrollClient(props: PayrollClientProps) {
                 F11: `shown` son los períodos que quedan con los DOS filtros
                 (estado y cadencia), así que el rótulo nombra lo que de verdad
                 se está viendo. */}
-            {payrollPeriodCountLabel({ total: periods.length, shown: tablePeriods.length })}
+            {payrollPeriodCountLabel({ total: tablePeriodTotal, shown: tablePeriods.length })}
             {tablePeriods.length > 0 ? ` ${filteredTotalsText(tablePeriods)}` : ""}
           </p>
         )}
@@ -2944,9 +2950,11 @@ export function PayrollClient(props: PayrollClientProps) {
           elegir y no se dibuja el control. Cada panel pinta la MISMA lista por
           el mismo helper: el marcado vive en un solo lugar.
         */}
-        {renderPeriodList(tablePeriods.slice(periodPage * PERIOD_PAGE_SIZE, (periodPage + 1) * PERIOD_PAGE_SIZE))}
-        {tablePeriods.length > 0 ? (
-          <ListPager page={periodPage} pageSize={PERIOD_PAGE_SIZE} total={tablePeriods.length} onPageChange={setPeriodPage} />
+        {periodTableBusy && periodTable === null ? (
+          <p className="mt-3 text-sm text-text-tertiary">Consultando períodos…</p>
+        ) : renderPeriodList(tablePeriods)}
+        {tablePeriodTotal > 0 ? (
+          <ListPager page={periodPage} pageSize={PERIOD_PAGE_SIZE} total={tablePeriodTotal} onPageChange={setPeriodPage} />
         ) : null}
       </TabsPanel>
 
@@ -2978,11 +2986,11 @@ export function PayrollClient(props: PayrollClientProps) {
             searchLabel="Buscar empleado"
             searchValue={monthSearch}
             searchPlaceholder="Nombre, código o documento"
-            onSearchChange={(value) => { setMonthSearch(value); setMonthPage(0); }}
+            onSearchChange={setMonthSearch}
             statusLabel="Mes"
             statusValue={queryMonth}
             statusOptions={[{ value: "", label: "Mes…" }, ...queryMonthOptions.map((month) => ({ value: month, label: payrollMonthLabel(month) }))]}
-            onStatusChange={(value) => { setQueryMonth(value); setMonthPage(0); }}
+            onStatusChange={setQueryMonth}
             onFilter={() => handleMonthQuery({ preventDefault: () => undefined } as FormEvent<HTMLFormElement>)}
             onClear={() => { setMonthSearch(""); setQueryMonth(""); setQueryEmployeeId(""); setMonthQuery(null); setMonthPage(0); }}
             secondaryFilters={
@@ -3068,7 +3076,7 @@ export function PayrollClient(props: PayrollClientProps) {
                       </td>
                     </tr>
                   ))}
-                  {monthRows.length === 0 && (
+                  {monthTotal === 0 && (
                     <tr className={tableRowClass}>
                       <td className={tableCellClass} colSpan={7}>
                         {`Sin pagos cerrados en ${payrollMonthLabel(monthQuery.month)}.`}
@@ -3077,7 +3085,9 @@ export function PayrollClient(props: PayrollClientProps) {
                   )}
                 </tbody>
               </DataTable>
-              {monthRows.length > 0 ? <ListPager page={monthPage} pageSize={MONTH_PAGE_SIZE} total={monthRows.length} onPageChange={setMonthPage} /> : null}
+              {monthTotal > 0 ? (
+                <ListPager page={monthPage} pageSize={MONTH_PAGE_SIZE} total={monthTotal} onPageChange={(page) => loadMonthPage(monthQuery, page)} />
+              ) : null}
             </>
           )}
         </TabsPanel>
@@ -3921,11 +3931,6 @@ export function PayrollClient(props: PayrollClientProps) {
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-2" aria-label="Fuentes de la liquidación">
                 {(["invoices", "vouchers"] as const).map((kind) => {
                   const selected = selectedSourceKind === kind;
-                  const count = settlementSourceCount(
-                    kind,
-                    kind === "invoices" ? invoiceSources : voucherSources,
-                    sourceCounts,
-                  );
                   return (
                     <button
                       key={kind}
@@ -3934,7 +3939,7 @@ export function PayrollClient(props: PayrollClientProps) {
                       aria-pressed={selected}
                       className={cn(ghostClass, "justify-between", selected && "border-primary-600 bg-primary-600/10")}
                     >
-                      <span>{settlementSourceLabel(kind, count, sourceCountsBusy)}</span>
+                      <span>{settlementSourceLabel(kind)}</span>
                     </button>
                   );
                 })}
@@ -3967,7 +3972,7 @@ export function PayrollClient(props: PayrollClientProps) {
       */}
       {invoiceTargetId && (
         <Dialog open onOpenChange={(open) => !open && setInvoiceTargetId(null)}>
-          <DialogContent className="max-w-3xl">
+          <DialogContent className="w-[calc(100%-2rem)] max-w-7xl">
             <DialogHeader>
               <DialogTitle>Detalle de factura</DialogTitle>
             </DialogHeader>

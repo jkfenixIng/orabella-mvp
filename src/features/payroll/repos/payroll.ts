@@ -17,7 +17,45 @@ import type { PagedResponse } from "@/src/shared/lib/paged";
 export type PayrollDbError = { code?: string | null; message?: string | null; details?: string | null; hint?: string | null };
 export type PayrollResult<T> = { data: T | null; error: PayrollDbError | null };
 export type PayrollPage<T> = Promise<PagedResponse<T>>;
+/** PostgREST `count: exact, head: true` shape (`data` is always null). */
+export type PayrollCount = { data?: null; count: number | null; error: PayrollDbError | null };
 type Row = Record<string, unknown>;
+
+type FilterBuilder = {
+  eq(column: string, value: unknown): FilterBuilder;
+  is(column: string, value: null): FilterBuilder;
+  gte(column: string, value: unknown): FilterBuilder;
+  lte(column: string, value: unknown): FilterBuilder;
+  or(tree: string): FilterBuilder;
+};
+
+/**
+ * Server-side filters of the period list, already validated by the service.
+ * `frequency: null` is the legacy bucket (periods without cadence); omitted
+ * means every cadence. `from`/`to` bound `start_date` (the month filter);
+ * `day` keeps the periods that contain that civil day; `term` matches
+ * cadence or status (letters, digits and spaces only).
+ */
+export interface PayrollPeriodQuery {
+  status?: string;
+  frequency?: string | null;
+  from?: string;
+  to?: string;
+  day?: string;
+  term?: string;
+}
+
+function applyPeriodFilters<Q>(query: Q, filters: PayrollPeriodQuery): Q {
+  let next = query as unknown as FilterBuilder;
+  if (filters.status) next = next.eq("status", filters.status);
+  if (filters.frequency === null) next = next.is("frequency", null);
+  else if (filters.frequency) next = next.eq("frequency", filters.frequency);
+  if (filters.from) next = next.gte("start_date", filters.from);
+  if (filters.to) next = next.lte("start_date", filters.to);
+  if (filters.day) next = next.lte("start_date", filters.day).gte("end_date", filters.day);
+  if (filters.term) next = next.or(`frequency.ilike."*${filters.term}*",status.ilike."*${filters.term}*"`);
+  return next as unknown as Q;
+}
 
 export interface VoucherFilters {
   status?: string;
@@ -31,6 +69,8 @@ export interface PayrollRepo {
   earliestInvoice(): Promise<PayrollResult<{ status: string | null; created_at: string | null }>>;
   insertPeriod<T>(row: { start_date: string; end_date: string; frequency: string; status: string; created_by: string }): Promise<PayrollResult<T>>;
   periodsPage<T>(from: number, to: number): PayrollPage<T>;
+  listPeriods<T>(filters: PayrollPeriodQuery, window: { offset: number; limit: number }): Promise<PayrollResult<T[]>>;
+  countPeriods(filters: PayrollPeriodQuery): Promise<PayrollCount>;
   findPeriod<T>(id: string): Promise<PayrollResult<T>>;
   closePeriod<T>(id: string, closedAt: string): Promise<PayrollResult<T>>;
   overlappingPeriods(id: string, start: string, end: string): Promise<PayrollResult<Array<{ id: string; status: string; start_date: string; end_date: string; frequency: string | null }>>>;
@@ -56,7 +96,6 @@ export interface PayrollRepo {
   payoutsPage<T>(invoiceIds: string[], from: number, to: number): PayrollPage<T>;
   periodVouchersPage<T>(statuses: string[], start: string, end: string, from: number, to: number): PayrollPage<T>;
   employeeVouchersPage<T>(employeeId: string, statuses: string[], start: string, end: string, from: number, to: number): PayrollPage<T>;
-  employeeVoucherIdsPage<T>(employeeId: string, statuses: string[], start: string, end: string, from: number, to: number): PayrollPage<T>;
   discountedVouchers(start: string, end: string): Promise<PayrollResult<Array<{ id: string; approved_by: string | null }>>>;
   findCorrectionId(periodId: string): Promise<PayrollResult<{ id: string }>>;
   findCorrection<T>(periodId: string): Promise<PayrollResult<T>>;
@@ -121,6 +160,10 @@ export function supabasePayrollRepo(db: SupabaseClient): PayrollRepo {
     insertPeriod: (row) => result(db.from("payroll_periods").insert(row).select(PERIOD_SELECT).single()),
     periodsPage: (from, to) =>
       page(db.from("payroll_periods").select(PERIOD_SELECT).order("start_date", { ascending: false }).order("id").range(from, to)),
+    listPeriods: (filters, window) =>
+      result(applyPeriodFilters(db.from("payroll_periods").select(PERIOD_SELECT), filters).order("start_date", { ascending: false }).order("id").range(window.offset, window.offset + window.limit - 1)),
+    countPeriods: (filters) =>
+      applyPeriodFilters(db.from("payroll_periods").select("id", { count: "exact", head: true }), filters) as unknown as Promise<PayrollCount>,
     findPeriod: (id) => result(db.from("payroll_periods").select(PERIOD_SELECT).eq("id", id).maybeSingle()),
     closePeriod: (id, closedAt) =>
       result(db.from("payroll_periods").update({ status: "cerrado", closed_at: closedAt }).eq("id", id).select(PERIOD_SELECT).single()),
@@ -177,18 +220,6 @@ export function supabasePayrollRepo(db: SupabaseClient): PayrollRepo {
         db
           .from("voucher_requests")
           .select("id, request_date, amount, status")
-          .eq("employee_id", employeeId)
-          .in("status", statuses)
-          .gte("request_date", start)
-          .lte("request_date", end)
-          .order("id")
-          .range(from, to),
-      ),
-    employeeVoucherIdsPage: (employeeId, statuses, start, end, from, to) =>
-      page(
-        db
-          .from("voucher_requests")
-          .select("id")
           .eq("employee_id", employeeId)
           .in("status", statuses)
           .gte("request_date", start)

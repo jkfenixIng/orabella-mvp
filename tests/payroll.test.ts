@@ -111,7 +111,6 @@ import {
   calculatePayroll,
   getPayrollCadenceAnchors,
   getPayrollPeriodCorrection,
-  getPayrollSettlementSourceCounts,
   getPayrollSettlementSources,
   getPayrollStartDate,
   getPeriodDetail,
@@ -120,6 +119,7 @@ import {
   listPayrollMonthOptions,
   listPayrollMonthRows,
   listPayrollOverview,
+  listPayrollPeriods,
   listPeriods,
   openPayrollPeriod,
   PayrollError,
@@ -132,7 +132,6 @@ import { listAllEmployees, listEmployees } from "@/src/features/admin/service";
 import * as payrollExtrasService from "@/src/features/payroll/service";
 import { AUDIT_ACTIONS } from "@/src/shared/lib/audit";
 import {
-  getPayrollSettlementSourceCountsAction,
   getPayrollSettlementSourcesAction,
   getPayrollStartDateAction,
   getPeriodDetailAction,
@@ -146,6 +145,11 @@ import {
   PagedReadError,
   readAllPaged,
 } from "@/src/shared/lib/paged";
+
+/** Every row of a month query (one wide server page), for row-level assertions. */
+async function monthRowsOf(args: { month: string; employeeId?: string }) {
+  return (await listPayrollMonthRows({ ...args, limit: 50 })).rows;
+}
 
 // ------------------------------------------------- neto (PAY-02) ---
 
@@ -2017,7 +2021,7 @@ function createPayrollPagedStubClient(): unknown {
 
     const rows = (): Array<Record<string, unknown>> => payrollPagedStub.tables[table] ?? [];
 
-    const select = (single: boolean): { data: unknown; error: unknown } => {
+    const select = (single: boolean): { data: unknown; error: unknown; count?: number } => {
       if (op === "update") {
         // U8: la otra transacción escribe ANTES de que este UPDATE evalúe sus
         // filtros (la carrera real). Se dispara una sola vez.
@@ -2204,6 +2208,10 @@ function createPayrollPagedStubClient(): unknown {
         payrollPagedStub.skipMarkLookupOnce = false;
         return { data: single ? null : [], error: null };
       }
+      if (countHead) {
+        const count = rows().filter((row) => filters.every((matches) => matches(row))).length;
+        return { data: null, count, error: null };
+      }
       const to = Math.min(rangeTo, rangeFrom + payrollPagedStub.rowCap - 1);
       payrollPagedStub.windows.push({ table, from: rangeFrom, to, order: orderKeys.map((key) => key.column) });
       const filtered = rows().filter((row) => filters.every((matches) => matches(row)));
@@ -2219,8 +2227,20 @@ function createPayrollPagedStubClient(): unknown {
       return { data: single ? window[0] ?? null : window, error: null };
     };
 
+    /** `select(cols, { count: "exact", head: true })`: PostgREST's exact count. */
+    let countHead = false;
     const query: Record<string, unknown> = {
-      select: () => query,
+      select: (_columns?: string, options?: { count?: string; head?: boolean }) => {
+        countHead = options?.count === "exact" && options.head === true;
+        return query;
+      },
+      or: (tree: string) => {
+        // Only the `col.ilike."*term*"` items the period list sends.
+        const items = [...tree.matchAll(/([a-z_]+)\.ilike\."\*([^"]*)\*"/g)].map((match) => ({ column: match[1], term: match[2].toLowerCase() }));
+        filterColumns.push(...items.map((item) => item.column));
+        filters.push((row) => items.some((item) => String(row[item.column] ?? "").toLowerCase().includes(item.term)));
+        return query;
+      },
       insert: (payload?: unknown) => {
         op = "insert";
         insertPayload = payload;
@@ -7050,10 +7070,36 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     });
   });
 
+  it("pagina y filtra períodos en el servidor con total exacto", async () => {
+    seedLegibilityFixture();
+    payrollPagedStub.tables.payroll_periods.push(
+      ...Array.from({ length: 11 }, (_, index) => ({
+        id: `period-${index}`,
+        sede_id: SEDE,
+        start_date: `2025-01-${String(index + 1).padStart(2, "0")}`,
+        end_date: `2025-01-${String(index + 1).padStart(2, "0")}`,
+        frequency: index % 2 === 0 ? "semanal" : "quincenal",
+        status: index % 2 === 0 ? "cerrado" : "borrador",
+        created_by: "u-1",
+        closed_at: null,
+        created_at: `2025-01-${String(index + 1).padStart(2, "0")}T00:00:00.000Z`,
+      })),
+    );
+
+    const first = await listPayrollPeriods({ page: 0, limit: 2, status: "cerrado", frequency: "semanal" });
+    const second = await listPayrollPeriods({ page: 1, limit: 2, status: "cerrado", frequency: "semanal" });
+    expect(first.total).toBe(6);
+    expect(first.rows).toHaveLength(2);
+    expect(second.rows).toHaveLength(2);
+    expect(second.rows[0]?.id).not.toBe(first.rows[0]?.id);
+    await expect(listPayrollPeriods({ page: -1 })).rejects.toMatchObject({ code: "VALIDATION" });
+    await expect(listPayrollPeriods({ search: "<script>" })).rejects.toMatchObject({ code: "VALIDATION" });
+  });
+
   it("los pagos del mes de un empleado: lo pagado y contra qué períodos (consulta puntual)", async () => {
     seedLegibilityFixture();
 
-    const rows = await listPayrollMonthRows({
+    const rows = await monthRowsOf({
       month: "2026-09",
       employeeId: "emp-01",
     });
@@ -7079,25 +7125,36 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     });
   });
 
+  it("pagina Pagos del mes en el servidor y conserva solo cerrados/pagados", async () => {
+    seedLegibilityFixture();
+    const first = await listPayrollMonthRows({ month: "2026-09", page: 0, limit: 1 });
+    const second = await listPayrollMonthRows({ month: "2026-09", page: 1, limit: 1 });
+    expect(first).toMatchObject({ total: 2 });
+    expect(first.rows).toHaveLength(1);
+    expect(second.rows).toHaveLength(1);
+    expect(second.rows[0]?.employeeId).not.toBe(first.rows[0]?.employeeId);
+    await expect(listPayrollMonthRows({ month: "2026-09", page: 0, limit: 99 })).rejects.toMatchObject({ code: "VALIDATION" });
+  });
+
   it("la consulta del mes está acotada por mes Y por empleado", async () => {
     seedLegibilityFixture();
 
     // Octubre tiene pagos de emp-01 (P3) pero NINGUNO de emp-02: la consulta de
     // emp-02 en octubre devuelve vacío, no los datos de su compañero.
     expect(
-      await listPayrollMonthRows({ month: "2026-10", employeeId: "emp-02" }),
+      await monthRowsOf({ month: "2026-10", employeeId: "emp-02" }),
     ).toEqual([]);
 
     // El período de octubre sigue en borrador: no aparece hasta cerrarse.
-    expect(await listPayrollMonthRows({ month: "2026-10", employeeId: "emp-01" })).toEqual([]);
+    expect(await monthRowsOf({ month: "2026-10", employeeId: "emp-01" })).toEqual([]);
   });
 
   it("sin empleado la consulta trae la planta del mes, solo de períodos cerrados", async () => {
     seedLegibilityFixture();
 
-    const september = await listPayrollMonthRows({ month: "2026-09" });
+    const september = await monthRowsOf({ month: "2026-09" });
     expect(september.map((row) => row.employeeId)).toEqual(["emp-01", "emp-02"]);
-    expect(await listPayrollMonthRows({ month: "2026-10" })).toEqual([]);
+    expect(await monthRowsOf({ month: "2026-10" })).toEqual([]);
   });
 
   it("control negativo: una fila con más pagado que neto no resta del saldo", async () => {
@@ -7113,7 +7170,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
 
     // La misma base, por la consulta puntual: el saldo de la fila tampoco se
     // inventa negativo (el pagado que supera el neto no descuenta de más).
-    const september = await listPayrollMonthRows({
+    const september = await monthRowsOf({
       month: "2026-09",
       employeeId: "emp-02",
     });
@@ -7149,8 +7206,8 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
       extraFixture("extra-oct", "emp-01", 70000, "2026-10-01T05:00:00Z"),
     ];
 
-    const [september] = await listPayrollMonthRows({ month: "2026-09", employeeId: "emp-01" });
-    const october = await listPayrollMonthRows({ month: "2026-10", employeeId: "emp-01" });
+    const [september] = await monthRowsOf({ month: "2026-09", employeeId: "emp-01" });
+    const october = await monthRowsOf({ month: "2026-10", employeeId: "emp-01" });
 
     expect(september).toMatchObject({
       periodNet: 1900000,
@@ -7184,8 +7241,8 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
       extraFixture(`first-${nextMonth}`, "emp-01", 20000, nextInstant),
     ];
 
-    const [current] = await listPayrollMonthRows({ month, employeeId: "emp-01" });
-    const [next] = await listPayrollMonthRows({ month: nextMonth, employeeId: "emp-01" });
+    const [current] = await monthRowsOf({ month, employeeId: "emp-01" });
+    const [next] = await monthRowsOf({ month: nextMonth, employeeId: "emp-01" });
 
     expect(current.extras.map((row) => row.id)).toEqual([`last-${month}`]);
     expect(next.extras.map((row) => row.id)).toEqual([`first-${nextMonth}`]);
@@ -7200,7 +7257,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
       extraFixture("extra-nov", "emp-01", 90000, "2026-11-10T15:00:00Z"),
     ];
 
-    expect(await listPayrollMonthRows({ month: "2026-11", employeeId: "emp-01" })).toEqual([
+    expect(await monthRowsOf({ month: "2026-11", employeeId: "emp-01" })).toEqual([
       expect.objectContaining({
         periodNet: 0,
         periodPaid: 0,
@@ -7219,7 +7276,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
       extraFixture("extra-other", "emp-02", 90000, "2026-09-10T15:00:00Z"),
     ];
 
-    const [row] = await listPayrollMonthRows({ month: "2026-09", employeeId: "emp-01" });
+    const [row] = await monthRowsOf({ month: "2026-09", employeeId: "emp-01" });
     expect(row).toMatchObject({
       netTotal: 1900000,
       paidTotal: 1300000,
@@ -7234,7 +7291,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     seedLegibilityFixture();
 
     expect(
-      await listPayrollMonthRows({ month: "2026-11", employeeId: "emp-01" }),
+      await monthRowsOf({ month: "2026-11", employeeId: "emp-01" }),
     ).toEqual([]);
   });
 
@@ -11287,30 +11344,6 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
     expect(payrollPagedStub.requests.voucher_requests ?? 0).toBe(0);
   });
 
-  it("cuenta ambas fuentes sin cargar detalles de vales", async () => {
-    seed({
-      items: [
-        {
-          id: "item-contado",
-          period_id: PERIOD_ID,
-          employee_id: EMPLEADO,
-          detail_json: [
-            detailLine({ invoice_id: "factura-1", consecutive_number: 1, item_id: "l1", commission: 1000 }),
-            detailLine({ invoice_id: "factura-1", consecutive_number: 1, item_id: "l2", commission: 2000 }),
-            detailLine({ invoice_id: "factura-2", consecutive_number: 2, item_id: "l3", commission: 3000 }),
-          ],
-        },
-      ],
-      vouchers: [
-        { id: "vale-1", sede_id: SEDE, employee_id: EMPLEADO, amount: 1000, request_date: "2026-01-05", status: "pendiente" },
-        { id: "vale-2", sede_id: SEDE, employee_id: EMPLEADO, amount: 2000, request_date: "2026-01-06", status: "descontada" },
-        { id: "vale-rechazado", sede_id: SEDE, employee_id: EMPLEADO, amount: 3000, request_date: "2026-01-07", status: "rechazada" },
-      ],
-    });
-
-    expect(await getPayrollSettlementSourceCounts(PERIOD_ID, EMPLEADO)).toEqual({ invoices: 2, vouchers: 2 });
-  });
-
   it("devuelve SOLO las fuentes de este empleado (ni otro legajo)", async () => {
     seed({
       items: [
@@ -11492,10 +11525,6 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
     expect(result.success).toBe(true);
     if (!result.success || result.data.kind !== "invoices") return;
     expect(result.data.invoices.map((row) => row.invoice_id)).toEqual(["factura-mia"]);
-    expect(await getPayrollSettlementSourceCountsAction(PERIOD_ID, OTRO)).toEqual({
-      success: true,
-      data: { invoices: 1, vouchers: 0 },
-    });
   });
 
   it("el panel muestra solo la fuente elegida y explica las comisiones cubiertas", async () => {
@@ -11544,11 +11573,23 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
     }
   });
 
-  it("rotula las fuentes con su conteo antes de cargar el detalle", async () => {
+  it("las fuentes se eligen sin conteos y el detalle de factura usa el ancho de escritorio", async () => {
     const { settlementSourceLabel, invoiceCommissionOrigin } = await import("@/app/payroll/payroll-client");
-    expect(settlementSourceLabel("invoices", 3, false)).toBe("Facturas (3)");
-    expect(settlementSourceLabel("vouchers", 0, false)).toBe("Vales (0)");
-    expect(settlementSourceLabel("vouchers", null, true)).toBe("Vales (…)");
+    expect(settlementSourceLabel("invoices")).toBe("Facturas");
+    expect(settlementSourceLabel("vouchers")).toBe("Vales");
+    const { readFile } = await import("node:fs/promises");
+    const [client, actions] = await Promise.all([
+      readFile("app/payroll/payroll-client.tsx", "utf8"),
+      readFile("src/features/payroll/actions.ts", "utf8"),
+    ]);
+    // Ninguna lectura de solo-conteo: ni la action existe ni el cliente la pide.
+    expect(actions).not.toMatch(/SourceCounts/);
+    expect(client).not.toMatch(/SourceCounts|sourceCounts/);
+    // Detalle de factura: ancho grande en escritorio, con margen en móvil.
+    const invoiceDialog = client.slice(client.indexOf("{invoiceTargetId && ("), client.indexOf("{voucherTargetId && ("));
+    expect(invoiceDialog).toContain('<DialogContent className="w-[calc(100%-2rem)] max-w-7xl">');
+    expect(invoiceDialog).toContain('<DataTable minWidth="lg" wrapperClassName="rounded-md border border-border-color">');
+    expect(invoiceDialog).toContain("Origen comisión");
     const origin = invoiceCommissionOrigin({ no_commission: false, commission_mode: "porcentaje", commission_amount: 1200, employee_full_name: "Ana" });
     expect(origin.replace(/\u00a0/g, " ")).toBe("Porcentaje · $ 1.200 · Ana");
     expect(invoiceCommissionOrigin({ no_commission: true, commission_mode: null, commission_amount: 0, employee_full_name: null })).toBe("Sin comisión");
@@ -15422,10 +15463,14 @@ describe("payroll-client: cada período dice su cadencia (F11, guarda de fuente)
     // juego no desaparezca cuando el filtro de estado vacía la lista.
     expect(source).toContain("periodCadenceFilterOptions(periods)");
     expect(source).not.toContain("periodCadenceFilterOptions(visiblePeriods)");
-    // Y el filtro de cadencia se aplica JUNTO al de estado, no en su lugar.
-    expect(plano(source)).toContain(
-      "const visiblePeriods = filterPeriodsByCadence( statusFilter === \"todos\" ? periods : periods.filter((row) => row.status === statusFilter), cadenceFilter, );",
-    );
+    // La cadencia viaja como filtro a la action paginada: no se vuelve a cortar
+    // una lista completa en el navegador.
+    expect(plano(source)).toContain('frequency: periodCadenceParam');
+    expect(source).toContain("listPayrollPeriodsPageAction({");
+    // Ninguna tabla de nómina se pagina cortando filas en el navegador.
+    expect(source).not.toMatch(/\.slice\(\s*(periodPage|monthPage)/);
+    expect(source).toContain("total={tablePeriodTotal}");
+    expect(source).toContain("total={monthTotal}");
   });
 
   it("el aviso dice que cada cadencia se liquida por separado, y declara el ciclo recortado", () => {
