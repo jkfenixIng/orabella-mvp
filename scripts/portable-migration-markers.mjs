@@ -16,6 +16,12 @@ const OPERATOR_RPCS = `SELECT oid, prosecdef, proconfig, proacl, proowner FROM p
    pg_catalog.to_regprocedure('public.provision_installation_owner(uuid)'),
    pg_catalog.to_regprocedure('public.break_glass_transfer_installation_owner(uuid,text)')
  )`;
+// 009 ACL subjects: the invoker wrapper and the legacy function it calls.
+const CASH_OPENERS = `SELECT oid, proacl, proowner FROM pg_catalog.pg_proc
+ WHERE oid IN (
+   pg_catalog.to_regprocedure('public.cash_open_shift_atomic(uuid,uuid,numeric,jsonb)'),
+   pg_catalog.to_regprocedure('public.cash_open_shift_atomic_legacy(uuid,uuid,numeric,jsonb)')
+ )`;
 
 export const MIGRATION_MARKERS = Object.freeze({
   // 002: current_sede_id() reads request.jwt.claims directly instead of auth.jwt().
@@ -135,5 +141,36 @@ export const MIGRATION_MARKERS = Object.freeze({
    WHERE p.proname = 'payment_method_code_immutable'
      AND pg_catalog.strpos(p.prosrc, 'IF NEW.is_active IS NOT TRUE THEN') > 0
 ) AS present`,
+  }),
+  // 009: the public opening wrapper enforces C between the effective last
+  // base_left (recount wins) and the register's configured base; only the
+  // service role may execute the invoker wrapper or its legacy callee.
+  "009_cash_opening_bounds.sql": Object.freeze({
+    sql: `SELECT EXISTS (
+  SELECT 1 FROM pg_catalog.pg_proc p
+    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace AND n.nspname = 'public'
+   WHERE p.oid = pg_catalog.to_regprocedure('public.cash_open_shift_atomic(uuid,uuid,numeric,jsonb)')
+     AND pg_catalog.strpos(p.prosrc, 'OPENING_ABOVE_BASE') > 0
+     AND pg_catalog.strpos(p.prosrc, 'OPENING_BELOW_PREVIOUS_CLOSE') > 0
+     AND pg_catalog.strpos(p.prosrc, 'OPENING_BASE_CONFLICT') > 0
+     AND pg_catalog.strpos(p.prosrc, 'cash_shift_recounts') > 0
+     AND pg_catalog.strpos(p.prosrc, 'FOR UPDATE OF s') > 0
+) AND (SELECT count(*) FROM (${CASH_OPENERS}) AS f) = 2
+  AND NOT EXISTS (
+  SELECT 1
+    FROM (${CASH_OPENERS}) AS f,
+         pg_catalog.aclexplode(coalesce(f.proacl, pg_catalog.acldefault('f', f.proowner))) a
+   WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE'
+) AND NOT EXISTS (
+  SELECT 1
+    FROM pg_catalog.pg_roles r, (${CASH_OPENERS}) AS f
+   WHERE r.rolname IN ('anon', 'authenticated')
+     AND pg_catalog.has_function_privilege(r.oid, f.oid, 'EXECUTE')
+) AND (
+  SELECT count(*)
+    FROM pg_catalog.pg_roles r, (${CASH_OPENERS}) AS f
+   WHERE r.rolname = 'service_role'
+     AND pg_catalog.has_function_privilege(r.oid, f.oid, 'EXECUTE')
+) = 2 AS present`,
   }),
 });

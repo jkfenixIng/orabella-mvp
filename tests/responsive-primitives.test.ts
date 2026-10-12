@@ -327,6 +327,28 @@ describe("R2: el cajón móvil es la primitiva `Dialog`, no un `aria-modal` de m
    hoy hay 27 `<DialogTitle>` puestos en 11 archivos y el nombre era `""` en todos.
    ========================================================================== */
 
+describe("R-N: la barra lateral colapsada conserva el cierre de sesión", () => {
+  it("muestra un botón de salida accesible y táctil al final del rail", () => {
+    const start = NAV_CODE.lastIndexOf("{sidebarCollapsed ? (");
+    const end = NAV_CODE.indexOf(") : (", start);
+    expect(start, "rama colapsada").toBeGreaterThan(-1);
+    expect(end, "fin de la rama colapsada").toBeGreaterThan(start);
+    const collapsedBranch = NAV_CODE.slice(start, end);
+
+    expect(collapsedBranch).toContain("LogOut");
+    expect(collapsedBranch).toContain("onClick={handleLogout}");
+    expect(collapsedBranch).toContain("disabled={loggingOut}");
+    expect(collapsedBranch).toContain("aria-busy={loggingOut}");
+    expect(collapsedBranch).toMatch(/aria-label=\{loggingOut \? "Cerrando sesión…" : "Cerrar sesión"\}/);
+    expect(collapsedBranch).toContain('title={userName ? `Cerrar sesión de ${userName}` : "Cerrar sesión"}');
+    expect(collapsedBranch).toContain("min-h-11");
+    expect(collapsedBranch).toContain("mt-auto");
+    expect(collapsedBranch).toContain("focus-visible:ring-2");
+    expect(collapsedBranch).toMatch(/<LogOut[^>]*aria-hidden="true"/);
+    expect(collapsedBranch).not.toContain("rounded-full");
+  });
+});
+
 describe("R-B: el nombre y la descripción accesibles salen del mecanismo de la primitiva", () => {
   it("`DialogTitle` es `DialogPrimitive.Title`, no un `<h2>` pelado", () => {
     // Falla contra el estado previo (`<h2 …>` sin `id`): es exactamente lo que
