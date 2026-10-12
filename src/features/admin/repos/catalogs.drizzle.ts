@@ -138,7 +138,7 @@ export function drizzleCatalogsRepo(db: Database): CatalogsRepo {
     findPaymentMethod: (id) =>
       run(async () => {
         const rows = await db
-          .select({ code: paymentMethods.code })
+          .select({ code: paymentMethods.code, is_active: paymentMethods.isActive })
           .from(paymentMethods)
           .where(eq(paymentMethods.id, id))
           .limit(2);

@@ -54,13 +54,23 @@ describe("admin catalog supabase-js characterization", () => {
     expect(postgrest.calls[0]).toEqual({ table: "tax_configs", chain: [["upsert", [{ id: TAX_ID, code: "IVA", name: "IVA", percent: 19, is_active: true }, { onConflict: "id" }]], ["select", [TAX]], ["single", []]] });
   });
 
-  it("reads current code with maybeSingle and updates only mutable payment fields", async () => {
-    answer({ data: { code: "nequi" }, error: null }, { data: method, error: null });
-    expect(await upsertPaymentMethod({ id: METHOD_ID, name: " Nequi ", arqueo_mode: "none", fee_percent: "0" })).toEqual(method);
+  it("reads current state with maybeSingle and ignores an external code on edit", async () => {
+    answer({ data: { code: "nequi", is_active: true }, error: null }, { data: method, error: null });
+    expect(await upsertPaymentMethod({ id: METHOD_ID, code: "changed", name: " Nequi ", arqueo_mode: "none", fee_percent: "0" })).toEqual(method);
     expect(postgrest.calls).toEqual([
-      { table: "payment_methods", chain: [["select", ["code"]], ["eq", ["id", METHOD_ID]], ["maybeSingle", []]] },
+      { table: "payment_methods", chain: [["select", ["code, is_active"]], ["eq", ["id", METHOD_ID]], ["maybeSingle", []]] },
       { table: "payment_methods", chain: [["update", [{ name: "Nequi", arqueo_mode: "none", fee_percent: 0 }]], ["eq", ["id", METHOD_ID]], ["select", [PAYMENT]], ["single", []]] },
     ]);
+  });
+
+  it("forces an inactive method to no arqueo, including an already inactive row", async () => {
+    answer({ data: { code: "nequi", is_active: true }, error: null }, { data: method, error: null });
+    await upsertPaymentMethod({ id: METHOD_ID, name: "Nequi", is_active: false, arqueo_mode: "declared_total" });
+    expect(postgrest.calls[1].chain[0]).toEqual(["update", [{ name: "Nequi", is_active: false, arqueo_mode: "none" }]]);
+    postgrest.calls = [];
+    answer({ data: { code: "nequi", is_active: false }, error: null }, { data: method, error: null });
+    await upsertPaymentMethod({ id: METHOD_ID, name: "Nequi", arqueo_mode: "denominations" });
+    expect(postgrest.calls[1].chain[0]).toEqual(["update", [{ name: "Nequi", arqueo_mode: "none" }]]);
   });
 
   it("reads one employee with maybeSingle: null is NOT_FOUND 404, an error is INTERNAL 500", async () => {
@@ -74,18 +84,21 @@ describe("admin catalog supabase-js characterization", () => {
     }
   });
 
-  it("maps payment write failures through the 003 error table", async () => {
-    answer({ data: null, error: { code: "23505", message: "duplicate key value violates unique constraint \"payment_methods_code_key\"" } });
-    const taken = await upsertPaymentMethod({ code: "nequi", name: "N" }).catch((reason: unknown) => reason);
-    expect((taken as AdminError).code).toBe("PAYMENT_METHOD_CODE_TAKEN");
-    answer({ data: null, error: null });
-    const empty = await upsertPaymentMethod({ code: "nequi", name: "N" }).catch((reason: unknown) => reason);
+  it("retries a raced generated code and maps a write without row to INTERNAL", async () => {
+    const duplicate = { data: null, error: { code: "23505", message: "duplicate key value violates unique constraint \"payment_methods_code_key\"" } };
+    answer({ data: [], error: null }, duplicate, { data: [{ ...method, code: "nequi" }], error: null }, { data: method, error: null });
+    await upsertPaymentMethod({ name: "Nequi" });
+    expect(postgrest.calls[1].chain[0]).toEqual(["insert", [{ code: "nequi", name: "Nequi", arqueo_mode: "none" }]]);
+    expect(postgrest.calls[3].chain[0]).toEqual(["insert", [{ code: "nequi-2", name: "Nequi", arqueo_mode: "none" }]]);
+    postgrest.calls = [];
+    answer({ data: [], error: null }, { data: null, error: null });
+    const empty = await upsertPaymentMethod({ name: "N" }).catch((reason: unknown) => reason);
     expect((empty as AdminError).code).toBe("INTERNAL");
   });
 
-  it("creates a payment method with normalized code and none mode", async () => {
-    answer({ data: method, error: null });
-    await upsertPaymentMethod({ code: " Billetera QR ", name: " QR " });
-    expect(postgrest.calls[0]).toEqual({ table: "payment_methods", chain: [["insert", [{ code: "billetera-qr", arqueo_mode: "none", name: "QR" }]], ["select", [PAYMENT]], ["single", []]] });
+  it("creates a payment method with a generated code and ignores external code", async () => {
+    answer({ data: [{ ...method, code: "efectivo" }, { ...method, code: "billetera-qr" }], error: null }, { data: method, error: null });
+    await upsertPaymentMethod({ code: "efectivo", name: " Billetera QR ", is_active: false, arqueo_mode: "declared_total" });
+    expect(postgrest.calls[1]).toEqual({ table: "payment_methods", chain: [["insert", [{ code: "billetera-qr-2", name: "Billetera QR", is_active: false, arqueo_mode: "none" }]], ["select", [PAYMENT]], ["single", []]] });
   });
 });

@@ -121,4 +121,19 @@ export const MIGRATION_MARKERS = Object.freeze({
  WHERE pg_catalog.pg_get_function_identity_arguments(p.oid) = expected.args
    AND pg_catalog.strpos(p.prosrc, expected.fragment) > 0`,
   }),
+  // 008: inactive methods are forced to no arqueo by the 003 trigger and the
+  // coherence CHECK keeps that invariant when triggers are bypassed.
+  "008_inactive_payment_method_arqueo.sql": Object.freeze({
+    sql: `SELECT EXISTS (
+  SELECT 1 FROM pg_catalog.pg_constraint c
+   WHERE c.conrelid = pg_catalog.to_regclass('public.payment_methods')
+     AND c.conname = 'payment_methods_arqueo_coherent_check'
+     AND pg_catalog.strpos(pg_catalog.pg_get_constraintdef(c.oid), 'is_active') > 0
+) AND EXISTS (
+  SELECT 1 FROM pg_catalog.pg_proc p
+    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace AND n.nspname = 'public'
+   WHERE p.proname = 'payment_method_code_immutable'
+     AND pg_catalog.strpos(p.prosrc, 'IF NEW.is_active IS NOT TRUE THEN') > 0
+) AS present`,
+  }),
 });

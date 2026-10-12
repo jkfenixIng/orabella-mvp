@@ -43,6 +43,7 @@ import {
   invoiceCollectionsSummary,
   mergeShiftMoney,
   openShift,
+  openShiftAtomicError,
   recountClosedShift,
   registerPayment,
   sumShiftMoneyByMethod,
@@ -132,6 +133,28 @@ function extractBranch(source: string, marker: string): string {
 }
 
 // ------------------------------------------------- base encadenada (CAJ-01) ---
+
+describe("cash: errores de apertura atómica", () => {
+  it.each([
+    ["SHIFT_INVALID", "SHIFT_INVALID", 400],
+    ["SHIFT_BALANCE_MISMATCH", "SHIFT_BALANCE_MISMATCH", 400],
+    ["SHIFT_REGISTER_NOT_FOUND", "SHIFT_REGISTER_NOT_FOUND", 404],
+    ["SHIFT_WRITE_MISMATCH", "SHIFT_WRITE_MISMATCH", 500],
+    ["SHIFT_COUNT_MISMATCH", "SHIFT_COUNT_MISMATCH", 500],
+  ])("maps %s to a safe CashError", (sqlMessage, code, status) => {
+    expect(openShiftAtomicError({ message: sqlMessage })).toMatchObject({ code, status });
+  });
+
+  it("maps a unique-index race to SHIFT_ALREADY_OPEN and preserves success data", () => {
+    expect(openShiftAtomicError({ code: "23505" })).toMatchObject({ code: "SHIFT_ALREADY_OPEN", status: 409 });
+    const result = { success: true as const, data: { shift: { id: "shift" } } };
+    expect(result.success ? result.data.shift.id : null).toBe("shift");
+  });
+
+  it("keeps unknown database errors private", () => {
+    expect(openShiftAtomicError({ message: "driver detail" })).toMatchObject({ code: "INTERNAL", message: "Error interno." });
+  });
+});
 
 describe("cash: apertura hereda la base del último cierre (CAJ-01)", () => {
   it("el primer turno abre con base_configurada (default 200000)", () => {
@@ -4257,6 +4280,13 @@ describe("cash: CL-10 la apertura y su arqueo de apertura son UNA transacción",
     shiftStub.lifecycle = true;
   });
   afterEach(() => resetShiftStub());
+
+  it("rejects empty opening counts before calling the atomic RPC", async () => {
+    seed();
+    const outcome = await openShift({ counts: [] }, ACTOR).catch((error: unknown) => error);
+    expect(outcome).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(openCalls()).toHaveLength(0);
+  });
 
   it("si el arqueo falla, la apertura no deja NADA escrito (RED medido: hoy deja el turno abierto sin su conteo)", async () => {
     seed();

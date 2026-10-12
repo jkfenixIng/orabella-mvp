@@ -923,12 +923,10 @@ describe("admin schemas: impuestos y métodos (ADM-06/ADM-07)", () => {
     expect(taxConfigSchema.safeParse({ ...base, code: "OTRO", percent: 5 }).success).toBe(false);
   });
 
-  it("accepts a free normalized payment method code only when creating", () => {
+  it("strips public payment method codes on create and edit", () => {
     const base = { name: "Billetera" };
-    expect(paymentMethodSchema.safeParse({ ...base, code: "billetera-qr_1", arqueo_mode: "declared_total" }).success).toBe(true);
-    expect(paymentMethodSchema.safeParse({ ...base, code: "PSE" }).success).toBe(true);
-    expect(paymentMethodSchema.safeParse({ ...base, code: "a" }).success).toBe(false);
-    expect(paymentMethodSchema.safeParse({ ...base, id: SEDE_A, arqueo_mode: "none" }).success).toBe(true);
+    expect(paymentMethodSchema.parse({ ...base, code: "external", arqueo_mode: "declared_total" })).not.toHaveProperty("code");
+    expect(paymentMethodSchema.parse({ ...base, id: SEDE_A, code: "changed", arqueo_mode: "none" })).not.toHaveProperty("code");
   });
 
   it("setUserRoles exige un solo rol válido (ADM-04)", () => {
