@@ -48,6 +48,7 @@ import {
 } from "@/src/components/ui/lib/dialog";
 import { Input } from "@/src/components/ui/lib/input";
 import { Label } from "@/src/components/ui/lib/label";
+import { MoneyInput } from "@/src/components/ui/lib/money-input";
 import {
   Select,
   SelectContent,
@@ -343,6 +344,8 @@ export function InvoicesClient(props: InvoicesClientProps) {
   const [clientView, setClientView] = useState(false);
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [detailDialogOpen, setDetailDialogOpen] = useState(false);
+  const [customerPreviewOpen, setCustomerPreviewOpen] = useState(false);
+  const [paymentReturnsToDetail, setPaymentReturnsToDetail] = useState(false);
   type EditItemDraft = ItemDraft & { id?: string; discount: number };
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
   const [editItems, setEditItems] = useState<EditItemDraft[]>([]);
@@ -596,12 +599,30 @@ export function InvoicesClient(props: InvoicesClientProps) {
       setDetail(result.data);
       setMotivo("");
       setClientView(false);
+      setCustomerPreviewOpen(false);
       setDetailDialogOpen(true);
     });
   }
 
+  function openPaymentFromDetail() {
+    if (!detail || !passShiftGate()) return;
+    setPayError(null);
+    setSplitDrafts([{ method_code: "efectivo", amount: "" }]);
+    setDetailDialogOpen(false);
+    setPaymentReturnsToDetail(true);
+    setPaymentDialogOpen(true);
+  }
+
+  /** Back behavior: a payment opened from the detail returns to that detail. */
+  function closePayment() {
+    setPaymentDialogOpen(false);
+    if (paymentReturnsToDetail && detail) setDetailDialogOpen(true);
+    setPaymentReturnsToDetail(false);
+  }
+
   async function openPayment(id: string) {
     if (!passShiftGate()) return;
+    setPaymentReturnsToDetail(false);
     setPayError(null);
     const result = await getInvoiceAction(id);
     if (!result.success) {
@@ -1130,7 +1151,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setDetail(result.data);
     setSplitDrafts([{ method_code: "efectivo", amount: "" }]);
     setConfirmKind(null);
-    setPaymentDialogOpen(false);
+    closePayment();
     await applyFilters(undefined, invoicePage);
     await askCommissionPayment(result.data);
   }
@@ -1353,6 +1374,17 @@ export function InvoicesClient(props: InvoicesClientProps) {
   const canTotalizeSplit = splitRemaining > 0 && splitDrafts.some((portion) => portion.amount.trim() === "");
   const canSubmitSplit = moneyEquals(splitDifference, 0) && splitDrafts.every((portion) => (toNumber(portion.amount) ?? 0) > 0);
   const usedSplitMethodCodes = new Set(splitDrafts.map((portion) => portion.method_code));
+  const canPayDetail = props.canWrite && detail?.invoice.status === "Emitida";
+
+  function openCustomerPreview() {
+    setDetailDialogOpen(false);
+    setCustomerPreviewOpen(true);
+  }
+
+  function closeCustomerPreview() {
+    setCustomerPreviewOpen(false);
+    if (detail) setDetailDialogOpen(true);
+  }
 
   function totalizeSplitPayment() {
     if (splitRemaining <= 0) return;
@@ -1419,7 +1451,10 @@ export function InvoicesClient(props: InvoicesClientProps) {
     );
   }
 
-  // Papel factura: paleta clara fija a propósito (documento, no tema).
+  // Papel factura: paleta clara fija a propósito (documento, no tema). En
+  // oscuro, el filete del tema separa la hoja del cromo de la app.
+  const paperSheetClass =
+    "rounded-xl bg-paper-surface text-paper-ink shadow-2xl dark:shadow-none dark:ring-1 dark:ring-border-color-2";
   const paperInputClass =
     "flex h-10 w-full rounded-md border border-paper-line-strong bg-paper-surface px-3 text-sm text-paper-ink outline-none transition-colors placeholder:text-paper-ink-soft focus:border-paper-ink-muted disabled:cursor-not-allowed disabled:opacity-50";
 
@@ -1467,7 +1502,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 {/* R32, LA ESTRUCTURA — `flex flex-col overflow-y-hidden`: el diálogo deja de ser el scroller y pasa a ser una columna cuyas tres piezas son encabezado (fijo), medio (scrollea) y pie (fijo). MEDIDO antes, en Chromium, con la sesión y sin enviar nada: 1005 px de contenido en una caja de 536 px a 320×568 y el envío en `y 961-1001`, o sea 393 px más allá del borde inferior del viewport: guardar exigía ~450 px de scroll DENTRO del diálogo (a 390×844, `y 961-1001` contra 844, igual de fuera).
                     Misma composición que `FormDialog` (encabezado / medio / pie) y SIN `sticky`: el bloque contenedor de un ítem de grilla es su ÁREA, sin recorrido para anclarse, así que un pie pegado con `position: sticky` funcionaría en Chromium y quedaría colgando de la palabra de otro motor. Acá la corrección vive en el árbol, no en el CSS. */}
                 <DialogContent className="max-w-5xl flex flex-col overflow-y-hidden border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
-                  <div className="flex min-h-0 flex-1 flex-col rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
+                  <div className={cn("flex min-h-0 flex-1 flex-col", paperSheetClass)}>
                     <DialogHeader className="block shrink-0">
                       <DialogTitle className="sr-only">FACTURA DE VENTA</DialogTitle>
                     <div className="border-b-4 border-double border-paper-line-strong px-6 py-5 sm:px-8">
@@ -1746,7 +1781,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           ))}
                         </div>
 
-                        <div className="flex flex-col gap-2 sm:flex-row">
+                        <div className="flex flex-wrap items-center gap-2">
                           <button
                             type="button"
                             disabled={!canTotalize}
@@ -2037,7 +2072,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     >
                     {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
                     <DialogContent className="max-w-4xl border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
-                      <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl dark:shadow-[0_0_0_1px_rgba(255,255,255,0.1)]">
+                      <div className={paperSheetClass}>
                         <DialogHeader className="block">
                           <DialogTitle className="sr-only">FACTURA #{detail.invoice.consecutive_number} {detail.invoice.status}</DialogTitle>
                         <div className="border-b-4 border-double border-paper-line-strong px-6 py-5 sm:px-8">
@@ -2075,9 +2110,18 @@ export function InvoicesClient(props: InvoicesClientProps) {
                               {formatMoney(detail.invoice.total)}
                             </p>
                           </div>
-                          <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center justify-between gap-3">
                             <h3 className="text-sm font-bold uppercase tracking-wide text-paper-ink-muted">Ítems</h3>
-                            {clientViewToggle()}
+                            <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
+                              <button
+                                type="button"
+                                onClick={openCustomerPreview}
+                                className="inline-flex h-10 items-center gap-2 rounded-md border border-paper-line-strong px-3 text-sm font-semibold text-paper-ink-secondary hover:bg-paper-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-paper-ink-muted"
+                              >
+                                <Eye className="h-4 w-4" aria-hidden="true" />
+                                Ver como cliente
+                              </button>
+                            </div>
                           </div>
                           <div className="mt-2 overflow-x-auto rounded-lg border border-paper-line">
                             <table className="w-full min-w-[560px] text-left text-sm text-paper-ink">
@@ -2219,6 +2263,23 @@ export function InvoicesClient(props: InvoicesClientProps) {
                           >
                             Cerrar
                           </button>
+                          {canPayDetail && (
+                            <button
+                              type="button"
+                              aria-disabled={shiftBlockReason !== null}
+                              onClick={openPaymentFromDetail}
+                              className={cn(
+                                "inline-flex h-10 items-center justify-center gap-2 rounded-md bg-paper-success-strong px-5 text-sm font-semibold text-white hover:bg-paper-success-deep focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-paper-focus-success focus-visible:ring-offset-2 max-sm:min-h-11",
+                                shiftBlockReason !== null && "opacity-50",
+                              )}
+                            >
+                              <CreditCard className="h-4 w-4" aria-hidden="true" />
+                              Pagar factura
+                            </button>
+                          )}
+                          {canPayDetail && shiftBlockReason !== null && (
+                            <p className="basis-full text-right text-xs text-paper-ink-muted">{shiftBlockReason}</p>
+                          )}
                         </div>
                       </div>
                     </DialogContent>
@@ -2257,7 +2318,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                     >
                       {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
                       <DialogContent className="max-w-5xl border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
-                        <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
+                        <div className={paperSheetClass}>
                           <DialogHeader className="block">
                             <DialogTitle className="sr-only">EDITAR FACTURA #{detail?.invoice.consecutive_number ?? "—"}</DialogTitle>
                             <DialogDescription className="sr-only">
@@ -2775,7 +2836,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
       >
         {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
         <DialogContent className="max-w-lg border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
-          <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
+          <div className={cn("max-h-[calc(100dvh-3rem)] overflow-y-auto", paperSheetClass)}>
             <DialogHeader className="block">
               <DialogTitle className="sr-only">
                 {itemDialogTarget === "edit" ? "Agregar ítem a la edición" : "Agregar ítem"}
@@ -3089,7 +3150,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={paymentDialogOpen} onOpenChange={(open) => { if (!open && !busy) setPaymentDialogOpen(false); }}>
+      <Dialog open={paymentDialogOpen} onOpenChange={(open) => { if (!open && !busy) closePayment(); }}>
         <DialogContent className="max-w-2xl">
           <DialogHeader>
             <DialogTitle>Pagar factura</DialogTitle>
@@ -3097,7 +3158,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
           </DialogHeader>
           {detail && (
             <form onSubmit={submitSplit} className="space-y-5">
-              <section className="rounded-lg border border-paper-line bg-paper-surface-soft p-4 text-paper-ink">
+              <section className="rounded-lg border border-paper-line bg-paper-surface-soft p-4 text-paper-ink dark:border-border-color-2">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div><p className="text-sm text-paper-ink-muted">Factura #{detail.invoice.consecutive_number}</p><p className="font-semibold">{detail.invoice.client_name}</p></div>
                   <span className="text-sm font-medium text-paper-ink-muted">{detail.invoice.status}</span>
@@ -3114,33 +3175,95 @@ export function InvoicesClient(props: InvoicesClientProps) {
               <fieldset className="space-y-3">
                 <legend className="text-sm font-medium text-text-primary">Porciones de pago</legend>
                 {splitDrafts.map((portion, portionIndex) => (
-                  <div key={portionIndex} className="flex flex-col gap-2 rounded-lg border border-border-color p-3 sm:flex-row sm:items-end dark:border-border-color-2">
-                    <Label className="flex-1">Método
+                  <div key={portionIndex} className="grid gap-2 rounded-lg border border-border-color bg-surface p-3 text-text-primary sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-end dark:border-border-color-2">
+                    <Label className="min-w-0">Método
                       <Select value={portion.method_code} onValueChange={(method_code) => setSplitDrafts((prev) => prev.map((row, index) => index === portionIndex ? { ...row, method_code } : row))}>
                         <SelectTrigger className={inputClass}><SelectValue placeholder="Método de pago" /></SelectTrigger>
                         <SelectContent>{props.methods.filter((method) => method.is_active !== false && (method.code === portion.method_code || !usedSplitMethodCodes.has(method.code))).map((method) => <SelectItem key={method.id} value={method.code}>{method.name}{method.fee_percent > 0 ? ` (+${method.fee_percent}%)` : ""}</SelectItem>)}</SelectContent>
                       </Select>
                     </Label>
-                    <Label className="flex-1">Monto
-                      <Input className={inputClass} value={formatMoneyInput(portion.amount)} onChange={(event) => setSplitDrafts((prev) => prev.map((row, index) => index === portionIndex ? { ...row, amount: stripMoneyInput(event.target.value) } : row))} inputMode="numeric" placeholder="0" />
+                    <Label className="min-w-0">Monto
+                      <MoneyInput className={inputClass} value={portion.amount} onValueChange={(amount) => setSplitDrafts((prev) => prev.map((row, index) => index === portionIndex ? { ...row, amount } : row))} placeholder="0" />
                     </Label>
                     {splitDrafts.length > 1 && <Button type="button" variant="outline" onClick={() => setSplitDrafts((prev) => prev.filter((_, index) => index !== portionIndex))}>Quitar</Button>}
                   </div>
                 ))}
               </fieldset>
-              <div className="flex flex-col gap-2 sm:flex-row">
-                <button type="button" disabled={!canTotalizeSplit || busy} title={canTotalizeSplit ? "Rellena el monto con el saldo neto pendiente" : "Nada por rellenar"} onClick={totalizeSplitPayment} className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-text-primary hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50 max-sm:min-h-11">
+              <div className="flex flex-wrap items-center gap-2">
+                <button type="button" disabled={!canTotalizeSplit || busy} title={canTotalizeSplit ? "Rellena el monto con el saldo neto pendiente" : "Nada por rellenar"} onClick={totalizeSplitPayment} className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-text-primary hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50 max-sm:min-h-11 dark:border-border-color-2">
                   <Banknote className="h-4 w-4" aria-hidden="true" /> Totalizar pago
                 </button>
                 <Button type="button" variant="outline" disabled={usedSplitMethodCodes.size >= props.methods.filter((method) => method.is_active !== false).length} onClick={addSplitPaymentPortion}>Agregar porción</Button>
-                <p className="self-center text-sm text-text-secondary">Restante: <strong>{formatMoney(splitRemaining)}</strong></p>
+                <p className="min-w-0 text-sm text-text-secondary sm:ml-auto">Restante: <strong>{formatMoney(splitRemaining)}</strong></p>
               </div>
               {payError && <Alert variant="destructive">{payError}</Alert>}
               <div className="flex flex-col-reverse gap-3 border-t border-border-color pt-4 sm:flex-row sm:justify-end dark:border-border-color-2">
-                <Button type="button" variant="outline" onClick={() => setPaymentDialogOpen(false)}>Cancelar</Button>
+                <Button type="button" variant="outline" onClick={closePayment}>{paymentReturnsToDetail ? "Volver al detalle" : "Cancelar"}</Button>
                 <Button type="submit" size="lg" disabled={busy || !canSubmitSplit}><CreditCard className="h-4 w-4" aria-hidden="true" />{busy ? "Pagando…" : "Pagar"}</Button>
               </div>
             </form>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={customerPreviewOpen} onOpenChange={(open) => { if (!open) closeCustomerPreview(); }}>
+        <DialogContent className="max-w-3xl border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
+          {detail && (
+            <article className={cn("flex max-h-[calc(100dvh-3rem)] min-w-0 flex-col overflow-hidden", paperSheetClass)}>
+              <DialogHeader className="block shrink-0 border-b-4 border-double border-paper-line-strong px-5 py-5 sm:px-8">
+                <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="text-xl font-black tracking-tight">ORABELLA</p>
+                    <p className="text-xs text-paper-ink-muted">Belleza · Factura de venta</p>
+                  </div>
+                  <div className="min-w-0 text-right">
+                    <DialogTitle className="text-lg font-bold text-paper-ink">Factura #{detail.invoice.consecutive_number}</DialogTitle>
+                    <DialogDescription className="text-sm text-paper-ink-muted">
+                      Vista para cliente · {formatBogotaLongDate(detail.invoice.created_at)}
+                    </DialogDescription>
+                  </div>
+                </div>
+              </DialogHeader>
+              <div className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-5 py-5 sm:px-8">
+                <p className="text-sm">
+                  <span className="font-semibold">Señor(es): </span>
+                  {detail.invoice.client_name}
+                  {detail.invoice.client_document ? ` · ${detail.invoice.client_document}` : ""}
+                </p>
+                <ul className="divide-y divide-paper-line rounded-lg border border-paper-line text-sm">
+                  {detail.items.map((row) => (
+                    <li key={row.id} className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-1 px-3 py-2">
+                      <span className="min-w-0 break-words font-medium">{detailItemName(row)}</span>
+                      <span className="text-right font-semibold">{formatMoney(row.subtotal)}</span>
+                      <span className="col-span-2 text-xs text-paper-ink-muted">
+                        {row.qty} × {formatMoney(row.unit_price)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                <dl className="ml-auto w-full max-w-sm space-y-2 rounded-lg border border-paper-line bg-paper-surface-soft p-4 text-sm">
+                  <div className="flex justify-between gap-3"><dt>Subtotal</dt><dd className="font-medium">{formatMoney(detail.invoice.subtotal)}</dd></div>
+                  <div className="flex justify-between gap-3"><dt>Descuento</dt><dd className="font-medium">{formatMoney(detail.invoice.discount)}</dd></div>
+                  <div className="flex justify-between gap-3"><dt>Impuestos</dt><dd className="font-medium">{formatMoney(detail.invoice.tax)}</dd></div>
+                  {Number(detail.invoice.surcharge ?? 0) > 0 && (
+                    <div className="flex justify-between gap-3"><dt>Recargo</dt><dd className="font-medium">+{formatMoney(Number(detail.invoice.surcharge))}</dd></div>
+                  )}
+                  <div className="flex items-baseline justify-between gap-3 border-t-2 border-paper-ink pt-3 text-xl font-black">
+                    <dt className="text-base">TOTAL</dt><dd>{formatMoney(detail.invoice.total)}</dd>
+                  </div>
+                </dl>
+                <p className="text-sm">Pagado {formatMoney(detail.paid)} · Saldo {formatMoney(detail.remaining)}</p>
+              </div>
+              <div className="flex shrink-0 flex-wrap justify-end gap-3 border-t border-paper-line px-5 py-4 sm:px-8">
+                <button
+                  type="button"
+                  onClick={closeCustomerPreview}
+                  className="h-10 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-paper-ink-secondary hover:bg-paper-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-paper-ink-muted max-sm:min-h-11"
+                >
+                  Volver al detalle
+                </button>
+              </div>
+            </article>
           )}
         </DialogContent>
       </Dialog>
@@ -3169,7 +3292,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
             if (commissionRows.length > 0) event.preventDefault();
           }}
         >
-          <div className="max-h-[calc(100dvh-3rem)] overflow-y-auto rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
+          <div className={cn("max-h-[calc(100dvh-3rem)] overflow-y-auto", paperSheetClass)}>
             <DialogHeader className="block">
               <DialogTitle className="sr-only">Pagar comisión al empleado</DialogTitle>
               <DialogDescription className="sr-only">
@@ -3254,7 +3377,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
       >
         {/* Sangre completa: `p-0` Y `sm:p-0`. Sin el `sm:p-0` la variante `sm:p-6` de la base sobrevive a la fusión y la hoja queda a 24 px del borde. */}
         <DialogContent className="max-w-sm border-0 bg-transparent p-0 sm:p-0 shadow-none dark:bg-transparent">
-          <div className="rounded-xl bg-paper-surface text-paper-ink shadow-2xl">
+          <div className={paperSheetClass}>
             <DialogHeader className="block">
               <DialogTitle className="sr-only">
                 {confirmKind === "bajo_cobrado"
