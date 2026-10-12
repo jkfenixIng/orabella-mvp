@@ -36,6 +36,7 @@ import {
   voucherOutByMethod,
 } from "@/src/features/cash/schemas";
 import {
+  assertOpeningCashBounds,
   CashError,
   closeShift,
   getDayView,
@@ -53,6 +54,7 @@ import {
   splitGrossCardFee,
 } from "@/src/features/billing/service";
 import { AUDIT_ACTIONS } from "@/src/shared/lib/audit";
+import { AdminError } from "@/src/features/admin/service";
 import { IN_FILTER_CHUNK_SIZE } from "@/src/shared/lib/paged";
 
 // ------------------------------------------------------ helpers de recorte ---
@@ -141,6 +143,9 @@ describe("cash: errores de apertura atómica", () => {
     ["SHIFT_REGISTER_NOT_FOUND", "SHIFT_REGISTER_NOT_FOUND", 404],
     ["SHIFT_WRITE_MISMATCH", "SHIFT_WRITE_MISMATCH", 500],
     ["SHIFT_COUNT_MISMATCH", "SHIFT_COUNT_MISMATCH", 500],
+    ["OPENING_ABOVE_BASE", "OPENING_ABOVE_BASE", 422],
+    ["OPENING_BELOW_PREVIOUS_CLOSE", "OPENING_BELOW_PREVIOUS_CLOSE", 422],
+    ["OPENING_BASE_CONFLICT", "OPENING_BASE_CONFLICT", 409],
   ])("maps %s to a safe CashError", (sqlMessage, code, status) => {
     expect(openShiftAtomicError({ message: sqlMessage })).toMatchObject({ code, status });
   });
@@ -151,8 +156,61 @@ describe("cash: errores de apertura atómica", () => {
     expect(result.success ? result.data.shift.id : null).toBe("shift");
   });
 
-  it("keeps unknown database errors private", () => {
-    expect(openShiftAtomicError({ message: "driver detail" })).toMatchObject({ code: "INTERNAL", message: "Error interno." });
+  it("keeps unknown database errors private but logs their SQLSTATE", () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(openShiftAtomicError({ code: "XX000", message: "driver detail" })).toMatchObject({ code: "INTERNAL", message: "Error interno." });
+      expect(log).toHaveBeenCalledWith(expect.stringContaining("cash_open_shift_atomic"), { code: "XX000", message: "driver detail" });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it.each([
+    ["42883", "SCHEMA_OUTDATED", 503],
+    ["42P01", "SCHEMA_OUTDATED", 503],
+    ["23503", "OPENING_USER_INVALID", 409],
+    ["23502", "OPENING_DATA_INVALID", 400],
+    ["23514", "OPENING_DATA_INVALID", 400],
+  ])("maps SQLSTATE %s to %s and logs it", (pgCode, code, status) => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = openShiftAtomicError({ code: pgCode, message: "relation detail" });
+      expect(error).toMatchObject({ code, status });
+      expect(error.message).not.toContain("relation detail");
+      expect(log).toHaveBeenCalledWith(expect.any(String), { code: pgCode, message: "relation detail" });
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
+
+describe("cash: límites del efectivo de apertura", () => {
+  it.each([
+    ["primera apertura en cero", 0, null, 200000],
+    ["primera apertura igual a la base", 200000, null, 200000],
+    ["apertura igual a la base del cierre", 150000, 150000, 300000],
+    ["apertura igual a la base configurada", 300000, 150000, 300000],
+  ])("acepta %s", (_label, cash, previous, base) => {
+    expect(() => assertOpeningCashBounds({ cash, previousBaseLeft: previous, baseConfigurada: base })).not.toThrow();
+  });
+
+  it("rechaza efectivo sobre la base configurada", () => {
+    expect(() => assertOpeningCashBounds({ cash: 200001, previousBaseLeft: null, baseConfigurada: 200000 })).toThrow(
+      expect.objectContaining({ code: "OPENING_ABOVE_BASE", status: 422, message: expect.stringContaining("Retire el excedente") }),
+    );
+  });
+
+  it("rechaza efectivo bajo la base del cierre anterior", () => {
+    expect(() => assertOpeningCashBounds({ cash: 149999, previousBaseLeft: 150000, baseConfigurada: 300000 })).toThrow(
+      expect.objectContaining({ code: "OPENING_BELOW_PREVIOUS_CLOSE", status: 422 }),
+    );
+  });
+
+  it("rechaza un cierre anterior con base mayor a la configurada", () => {
+    expect(() => assertOpeningCashBounds({ cash: 250000, previousBaseLeft: 250000, baseConfigurada: 200000 })).toThrow(
+      expect.objectContaining({ code: "OPENING_BASE_CONFLICT", status: 409, message: expect.stringContaining("administrador") }),
+    );
   });
 });
 
@@ -2068,6 +2126,10 @@ const shiftStub = vi.hoisted(() => ({
    */
   inSizes: [] as Array<{ table: string; column: string; size: number }>,
   rowSeq: 0,
+  /** Extra catalog methods (declared totals) for opening payloads. */
+  extraMethods: [] as Array<Record<string, unknown>>,
+  /** Error thrown by the mocked `listPaymentMethods`. */
+  methodsError: null as unknown,
 }));
 
 /** Tablas que el ciclo del turno consulta de verdad. */
@@ -2609,6 +2671,8 @@ function resetShiftStub(): void {
   shiftStub.failSelects.length = 0;
   shiftStub.inSizes.length = 0;
   shiftStub.rowSeq = 0;
+  shiftStub.extraMethods = [];
+  shiftStub.methodsError = null;
 }
 
 // Los catálogos de cash son `unstable_cache` (caché de Next). Fuera de un
@@ -2638,7 +2702,13 @@ vi.mock("@/src/features/admin/service", async (importOriginal) => {
       fee_percent: 0,
     },
   ] as Awaited<ReturnType<typeof actual.listPaymentMethods>>;
-  return { ...actual, listPaymentMethods: async () => methods };
+  return {
+    ...actual,
+    listPaymentMethods: async () => {
+      if (shiftStub.methodsError) throw shiftStub.methodsError;
+      return [...methods, ...shiftStub.extraMethods] as typeof methods;
+    },
+  };
 });
 
 vi.mock("@/src/features/billing/service", async (importOriginal) => {
@@ -4280,6 +4350,71 @@ describe("cash: CL-10 la apertura y su arqueo de apertura son UNA transacción",
     shiftStub.lifecycle = true;
   });
   afterEach(() => resetShiftStub());
+
+  it("preserves an AdminError from the payment-method read", async () => {
+    seed();
+    shiftStub.methodsError = new AdminError("CATALOG_UNAVAILABLE", "Catálogo no disponible.", 503);
+    await expect(open()).rejects.toMatchObject({ code: "CATALOG_UNAVAILABLE", message: "Catálogo no disponible.", status: 503 });
+    expect(openCalls()).toHaveLength(0);
+  });
+
+  it("accepts the reproduced 200000 drawer payload with digital zeroes", async () => {
+    seed();
+    shiftStub.tables.cash_denominations.push({ id: "den-100000", sede_id: shiftStub.SEDE_ID, kind: "billete", value: 100000, is_active: true });
+    shiftStub.extraMethods = [
+      { id: "m-nequi", code: "nequi", name: "Nequi", is_active: true, arqueable: true, arqueo_mode: "declared_total", fee_percent: 0 },
+      { id: "m-daviplata", code: "daviplata", name: "Daviplata", is_active: true, arqueable: true, arqueo_mode: "declared_total", fee_percent: 0 },
+    ];
+    const result = await openShift({
+      counts: [
+        { method_code: "efectivo", denomination: 100000, quantity: 2, amount: 200000 },
+        { method_code: "efectivo", denomination: 50000, quantity: 0, amount: 0 },
+        { method_code: "nequi", denomination: null, quantity: 1, amount: 0 },
+        { method_code: "daviplata", denomination: null, quantity: 1, amount: 0 },
+      ],
+    }, ACTOR);
+    expect(result.shift).toMatchObject({ opening_base: 200000, status: "abierto" });
+  });
+
+  describe("drawer bounds before the RPC", () => {
+    const cash = (amount: number) => openShift({ counts: [{ method_code: "efectivo", denomination: 50000, quantity: amount / 50000, amount }] }, ACTOR);
+    const closedShift = (baseLeft: number) => ({
+      id: "turno-previo", cash_register_id: shiftStub.REGISTER_ID, status: "cerrado", base_left: baseLeft,
+      opened_at: "2026-09-29T12:00:00.000Z", closed_at: "2026-09-29T20:00:00.000Z",
+    });
+
+    it("first opening: 0 and B pass, B + 50000 is OPENING_ABOVE_BASE with formatted amounts", async () => {
+      seed();
+      await expect(cash(250000)).rejects.toMatchObject({ code: "OPENING_ABOVE_BASE", status: 422, message: expect.stringMatching(/250\.000.*200\.000/) });
+      expect(openCalls()).toHaveLength(0);
+      await expect(cash(0)).resolves.toMatchObject({ firstOpen: true });
+      shiftStub.tables.cash_shifts = [];
+      await expect(cash(200000)).resolves.toMatchObject({ firstOpen: true });
+    });
+
+    it("later opening: base_left and B pass, below base_left is rejected", async () => {
+      seed();
+      shiftStub.tables.cash_shifts = [closedShift(150000)];
+      await expect(cash(100000)).rejects.toMatchObject({ code: "OPENING_BELOW_PREVIOUS_CLOSE", status: 422 });
+      await expect(cash(150000)).resolves.toMatchObject({ firstOpen: false });
+      shiftStub.tables.cash_shifts = [closedShift(150000)];
+      await expect(cash(200000)).resolves.toMatchObject({ firstOpen: false });
+    });
+
+    it("a recount's base_left is the minimum, not the signed close", async () => {
+      seed();
+      shiftStub.tables.cash_shifts = [closedShift(150000)];
+      shiftStub.tables.cash_shift_recounts = [{ id: "rc-1", shift_id: "turno-previo", base_left: 100000, counted_cash: 100000 }];
+      await expect(cash(100000)).resolves.toMatchObject({ firstOpen: false });
+    });
+
+    it("a previous base above B is OPENING_BASE_CONFLICT", async () => {
+      seed();
+      shiftStub.tables.cash_shifts = [closedShift(250000)];
+      await expect(cash(250000)).rejects.toMatchObject({ code: "OPENING_BASE_CONFLICT", status: 409 });
+      expect(openCalls()).toHaveLength(0);
+    });
+  });
 
   it("rejects empty opening counts before calling the atomic RPC", async () => {
     seed();

@@ -136,4 +136,18 @@ export const MIGRATION_MARKERS = Object.freeze({
      AND pg_catalog.strpos(p.prosrc, 'IF NEW.is_active IS NOT TRUE THEN') > 0
 ) AS present`,
   }),
+  // 009: the public opening wrapper enforces C between the effective last
+  // base_left (recount wins) and the register's configured base.
+  "009_cash_opening_bounds.sql": Object.freeze({
+    sql: `SELECT EXISTS (
+  SELECT 1 FROM pg_catalog.pg_proc p
+    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace AND n.nspname = 'public'
+   WHERE p.oid = pg_catalog.to_regprocedure('public.cash_open_shift_atomic(uuid,uuid,numeric,jsonb)')
+     AND pg_catalog.strpos(p.prosrc, 'OPENING_ABOVE_BASE') > 0
+     AND pg_catalog.strpos(p.prosrc, 'OPENING_BELOW_PREVIOUS_CLOSE') > 0
+     AND pg_catalog.strpos(p.prosrc, 'OPENING_BASE_CONFLICT') > 0
+     AND pg_catalog.strpos(p.prosrc, 'cash_shift_recounts') > 0
+     AND pg_catalog.strpos(p.prosrc, 'FOR UPDATE OF s') > 0
+) AS present`,
+  }),
 });
