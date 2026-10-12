@@ -185,7 +185,7 @@ const ALLOWLIST = new Map<string, number>([
   // como testigo de que se pagó, no como permiso.
   ["app/inventory/inventory-client.tsx", 0],
   ["app/invoices/invoices-client.tsx", 7],
-  ["app/payroll/payroll-client.tsx", 4],
+  ["app/payroll/payroll-client.tsx", 3],
   // Lo mismo en servicios: su lista es ahora la tarjeta con etiquetas y la
   // grilla de cinco columnas, sin piso propio.
   ["app/services/services-client.tsx", 0],
@@ -388,14 +388,9 @@ describe("la escala vive una sola vez: en el primitivo", () => {
       }
     }
     expect(failures).toEqual([]);
-    // Los seis archivos de la lista, y 12 pisos en total (bajó de 15 con los
-    // pagos de vales, inventario y servicios): si un séptimo
-    // apareciera sin entrar acá, el test de arriba ya lo habría marcado.
-    // La cifra BAJA cuando una unidad paga su deuda, porque el piso no se
-    // translada: las dos tablas de liquidación de `payroll-client.tsx`
-    // dejaron de escribir su `min-w-[1040px]` a mano (6 → 4) y la lista de
-    // vales ya no es una tabla con carril (1 → 0). Queda pagada, no escondida.
-    expect([...ALLOWLIST.values()].reduce((total, hits) => total + hits, 0)).toBe(12);
+    // La cifra baja cuando una unidad migra una tabla al primitivo: la consulta
+    // «Pagos del mes» dejó su piso manual para usar `DataTable`.
+    expect([...ALLOWLIST.values()].reduce((total, hits) => total + hits, 0)).toBe(11);
   });
 });
 
@@ -499,8 +494,18 @@ describe("las tablas de liquidación de nómina pasan por `DataTable`", () => {
       // Y cierra con el primitivo, no con un `</table>` suelto.
       expect(block.split("</DataTable>").length - 1, `${name}: cierra con DataTable`).toBe(1);
     }
-    // Las dos, y solo dos: este carril no se multiplica.
-    expect(source.split("<DataTable ").length - 1).toBe(SETTLEMENT_TABLES.length);
+    // Liquidación + lista de períodos + pagos del mes + detalle administrativo.
+    expect(source.split("<DataTable ").length - 1).toBe(SETTLEMENT_TABLES.length + 3);
+  });
+
+  it("las listas grandes usan tabla compartida, filtros unificados y encabezados sin solape", () => {
+    expect(source).toContain('<DataTable minWidth="xl" wrapperClassName="mt-4">');
+    expect(source).toContain('<DataTable minWidth="xl" wrapperClassName="mt-3" className="table-fixed">');
+    expect(source.split("<ListToolbar").length - 1).toBe(2);
+    expect(source.split("<ListPager").length - 1).toBe(2);
+    expect(source).toContain('<th className={cn(headCellClass, "w-80")} scope="col">Pagos</th>');
+    expect(source).toContain('className={cn(tableCellClass, "max-w-80 truncate")} title={periodSummaryText(row)}');
+    expect(source).toContain('<td className={cn(tableCellClass, "whitespace-nowrap")}>\n                <button');
   });
 
   it("ninguna de las dos escribe su propio carril ni su propio piso de ancho", () => {
@@ -511,7 +516,7 @@ describe("las tablas de liquidación de nómina pasan por `DataTable`", () => {
     }
   });
 
-  it("la deuda del archivo bajó: los cuatro pisos que quedan son de otras tablas", () => {
+  it("la deuda del archivo bajó: los pisos que quedan son de otras tablas", () => {
     // El 6 → 4 de la allowlist no es borrar un token suelto: los dos que
     // faltan son los que el primitivo renderiza hoy por su cuenta, y las dos
     // tablas que los tenían ya no los escriben.

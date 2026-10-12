@@ -111,6 +111,7 @@ import {
   calculatePayroll,
   getPayrollCadenceAnchors,
   getPayrollPeriodCorrection,
+  getPayrollSettlementSourceCounts,
   getPayrollSettlementSources,
   getPayrollStartDate,
   getPeriodDetail,
@@ -131,6 +132,7 @@ import { listAllEmployees, listEmployees } from "@/src/features/admin/service";
 import * as payrollExtrasService from "@/src/features/payroll/service";
 import { AUDIT_ACTIONS } from "@/src/shared/lib/audit";
 import {
+  getPayrollSettlementSourceCountsAction,
   getPayrollSettlementSourcesAction,
   getPayrollStartDateAction,
   getPeriodDetailAction,
@@ -7090,6 +7092,14 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     expect(await listPayrollMonthRows({ month: "2026-10", employeeId: "emp-01" })).toEqual([]);
   });
 
+  it("sin empleado la consulta trae la planta del mes, solo de períodos cerrados", async () => {
+    seedLegibilityFixture();
+
+    const september = await listPayrollMonthRows({ month: "2026-09" });
+    expect(september.map((row) => row.employeeId)).toEqual(["emp-01", "emp-02"]);
+    expect(await listPayrollMonthRows({ month: "2026-10" })).toEqual([]);
+  });
+
   it("control negativo: una fila con más pagado que neto no resta del saldo", async () => {
     seedLegibilityFixture();
     // Con la base actual no puede pasar (`assertNoOverpay`), pero la vista no
@@ -11277,6 +11287,30 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
     expect(payrollPagedStub.requests.voucher_requests ?? 0).toBe(0);
   });
 
+  it("cuenta ambas fuentes sin cargar detalles de vales", async () => {
+    seed({
+      items: [
+        {
+          id: "item-contado",
+          period_id: PERIOD_ID,
+          employee_id: EMPLEADO,
+          detail_json: [
+            detailLine({ invoice_id: "factura-1", consecutive_number: 1, item_id: "l1", commission: 1000 }),
+            detailLine({ invoice_id: "factura-1", consecutive_number: 1, item_id: "l2", commission: 2000 }),
+            detailLine({ invoice_id: "factura-2", consecutive_number: 2, item_id: "l3", commission: 3000 }),
+          ],
+        },
+      ],
+      vouchers: [
+        { id: "vale-1", sede_id: SEDE, employee_id: EMPLEADO, amount: 1000, request_date: "2026-01-05", status: "pendiente" },
+        { id: "vale-2", sede_id: SEDE, employee_id: EMPLEADO, amount: 2000, request_date: "2026-01-06", status: "descontada" },
+        { id: "vale-rechazado", sede_id: SEDE, employee_id: EMPLEADO, amount: 3000, request_date: "2026-01-07", status: "rechazada" },
+      ],
+    });
+
+    expect(await getPayrollSettlementSourceCounts(PERIOD_ID, EMPLEADO)).toEqual({ invoices: 2, vouchers: 2 });
+  });
+
   it("devuelve SOLO las fuentes de este empleado (ni otro legajo)", async () => {
     seed({
       items: [
@@ -11458,6 +11492,10 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
     expect(result.success).toBe(true);
     if (!result.success || result.data.kind !== "invoices") return;
     expect(result.data.invoices.map((row) => row.invoice_id)).toEqual(["factura-mia"]);
+    expect(await getPayrollSettlementSourceCountsAction(PERIOD_ID, OTRO)).toEqual({
+      success: true,
+      data: { invoices: 1, vouchers: 0 },
+    });
   });
 
   it("el panel muestra solo la fuente elegida y explica las comisiones cubiertas", async () => {
@@ -11499,6 +11537,21 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
     const vouchers = render("vouchers");
     expect(vouchers).toContain("Vales de la liquidación");
     expect(vouchers).not.toContain("Facturas de la liquidación");
+    // Columnas fijas: los encabezados no se montan y la acción no se parte.
+    for (const markup of [invoices, vouchers]) {
+      expect(markup).toContain("table-fixed");
+      expect(markup).toMatch(/<td class="[^"]*whitespace-nowrap[^"]*"><button[^>]*>Ver detalle/);
+    }
+  });
+
+  it("rotula las fuentes con su conteo antes de cargar el detalle", async () => {
+    const { settlementSourceLabel, invoiceCommissionOrigin } = await import("@/app/payroll/payroll-client");
+    expect(settlementSourceLabel("invoices", 3, false)).toBe("Facturas (3)");
+    expect(settlementSourceLabel("vouchers", 0, false)).toBe("Vales (0)");
+    expect(settlementSourceLabel("vouchers", null, true)).toBe("Vales (…)");
+    const origin = invoiceCommissionOrigin({ no_commission: false, commission_mode: "porcentaje", commission_amount: 1200, employee_full_name: "Ana" });
+    expect(origin.replace(/\u00a0/g, " ")).toBe("Porcentaje · $ 1.200 · Ana");
+    expect(invoiceCommissionOrigin({ no_commission: true, commission_mode: null, commission_amount: 0, employee_full_name: null })).toBe("Sin comisión");
   });
 });
 

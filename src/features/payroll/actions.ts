@@ -13,6 +13,7 @@ import {
   correctPayrollPeriod,
   deletePayrollPeriod,
   getPayrollPeriodCorrection,
+  getPayrollSettlementSourceCounts,
   getPayrollSettlementSources,
   getPayrollStartDate,
   getPeriodDetail,
@@ -129,7 +130,7 @@ export async function listPayrollExtrasAction() {
  * lectura del panorama acotada a la consulta que el admin hace en la pantalla:
  * el mes de toda la planta ya no viaja al abrir, viaja cuando se pide.
  */
-export async function listPayrollMonthRowsAction(input: { month: string; employeeId: string }) {
+export async function listPayrollMonthRowsAction(input: { month: string; employeeId?: string }) {
   try {
     await requirePayrollAdmin(await sessionToken());
     const data = await listPayrollMonthRows({
@@ -275,6 +276,25 @@ export async function getPayrollSettlementSourcesAction(
       targetEmployeeId = mine?.id ?? "sin-acceso";
     }
     const data = await getPayrollSettlementSources(periodId, targetEmployeeId, kind);
+    return { success: true as const, data };
+  } catch (error) {
+    return toFailure(error);
+  }
+}
+
+/**
+ * Conteo de facturas y vales de UNA liquidación, sin detalles. Mismo alcance por
+ * fila que `getPayrollSettlementSourcesAction`: el empleado solo cuenta la suya.
+ */
+export async function getPayrollSettlementSourceCountsAction(periodId: string, employeeId: string) {
+  try {
+    const session = await requirePayrollViewer(await sessionToken());
+    let targetEmployeeId = employeeId;
+    if (!(session.roles ?? []).includes("admin")) {
+      const mine = (await listAllEmployees()).find((row) => row.user_id === session.userId);
+      targetEmployeeId = mine?.id ?? "sin-acceso";
+    }
+    const data = await getPayrollSettlementSourceCounts(periodId, targetEmployeeId);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

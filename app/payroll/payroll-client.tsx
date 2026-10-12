@@ -9,6 +9,7 @@ import {
   correctPayrollPeriodAction,
   deletePayrollPeriodAction,
   getPayrollPeriodCorrectionAction,
+  getPayrollSettlementSourceCountsAction,
   getPayrollSettlementSourcesAction,
   getPeriodDetailAction,
   getPayrollStartDateAction,
@@ -45,11 +46,9 @@ import {
   declaredStartForFirstLiquidation,
   detailLineCommissionOrigin,
   filterPeriodsByCadence,
-  groupPayrollPeriodsByMonth,
   isPayrollCycleSettled,
   isRangeBeforePayrollStart,
   normalizePayFrequency,
-  MIXED_ABSORBED_ITEM_TYPE,
   openPayrollRejectionMessage,
   payrollCycleRange,
   payrollEmployeeName,
@@ -77,7 +76,6 @@ import {
   type PayFrequency,
   type PayrollItemTotals,
   type PayrollMonthEmployeeRow,
-  type PayrollMonthGroup,
   type PendingPayrollSettlement,
   type PeriodCadenceFilter,
 } from "@/src/features/payroll/schemas";
@@ -92,6 +90,7 @@ import {
 } from "@/src/components/ui/lib/dialog";
 import { cn } from "@/src/components/ui/lib/utils";
 import { DataTable } from "@/src/components/ui/lib/data-table";
+import { ListPager, ListToolbar } from "@/src/components/ui/lib/list-toolbar";
 import { Alert } from "@/src/components/ui/lib/alert";
 import { Badge } from "@/src/components/ui/lib/badge";
 import { Tabs, TabsList, TabsPanel, TabsTrigger } from "@/src/components/ui/lib/tabs";
@@ -165,6 +164,19 @@ function detailLineLabel(itemType: string): string {
   if (itemType === "servicio") return "Servicio";
   if (itemType === "custom") return "Personalizado";
   return itemType;
+}
+
+/** Origen administrativo de la comisión de una línea de factura. */
+export function invoiceCommissionOrigin(row: {
+  no_commission: boolean;
+  commission_mode: string | null;
+  commission_amount: number | null;
+  employee_full_name: string | null;
+}): string {
+  if (row.no_commission || row.commission_mode === "ninguna") return "Sin comisión";
+  if (row.commission_amount === null) return "Sin empleado asignado";
+  const mode = row.commission_mode === "porcentaje" ? "Porcentaje" : row.commission_mode === "comision" ? "Valor fijo" : "Regla del empleado";
+  return `${mode} · ${formatMoney(row.commission_amount)}${row.employee_full_name ? ` · ${row.employee_full_name}` : ""}`;
 }
 
 /** Porcentaje sin decimales innecesarios (10 → "10", 10.5 → "10.5"). */
@@ -1034,16 +1046,18 @@ function ExpandedItemPanel({
 function settlementSourceCount(
   kind: "invoices" | "vouchers",
   loaded: PayrollSettlementSources | null,
-  item: DetailItem | null,
+  counts: { invoices: number; vouchers: number } | null,
 ): number | null {
   if (loaded?.kind === "invoices") return loaded.invoices.length;
   if (loaded?.kind === "vouchers") return loaded.vouchers.length;
-  if (kind === "vouchers" || !item) return null;
-  return new Set(
-    (item.detail_json ?? [])
-      .filter((line) => line.invoice_id && line.item_type !== MIXED_ABSORBED_ITEM_TYPE)
-      .map((line) => line.invoice_id),
-  ).size;
+  return counts?.[kind] ?? null;
+}
+
+/** Rótulo de la opción: `Facturas (N)` / `Vales (M)`, o `…` mientras se cuenta. */
+export function settlementSourceLabel(kind: "invoices" | "vouchers", count: number | null, busy: boolean): string {
+  const name = kind === "invoices" ? "Facturas" : "Vales";
+  if (count !== null) return `${name} (${count})`;
+  return busy ? `${name} (…)` : name;
 }
 
 /** Campo de solo lectura del detalle de una factura o un vale. */
@@ -1116,17 +1130,32 @@ export function SettlementSourcesPanel({
           <section>
             <h3 className="text-sm font-semibold text-text-primary">Facturas de la liquidación</h3>
             {invoices.length === 0 ? <p className="mt-1 text-sm text-text-tertiary">La liquidación no tiene facturas: no hubo comisiones por factura en este período.</p> : null}
-            <ul className="mt-2 flex flex-col gap-2">
-              {invoices.map((invoice) => (
-                <li key={invoice.invoice_id} className="rounded border border-border-color p-2 dark:border-border-color-2">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="text-sm text-text-primary">{`Factura #${invoice.consecutive_number ?? "sin consecutivo"}`}</span>
-                    <span className="text-sm text-text-secondary">{invoice.percent_commission !== 0 && invoice.fixed_commission !== 0 ? `Fija ${formatMoney(invoice.fixed_commission)} · Porcentaje ${formatMoney(invoice.percent_commission)}` : `${invoice.percent_commission !== 0 ? "Porcentaje" : "Fija"} ${formatMoney(invoice.commission)}`}</span>
-                    <button type="button" onClick={() => onViewInvoice(invoice.invoice_id)} aria-label={`Ver el detalle de la factura ${invoice.consecutive_number ?? "sin consecutivo"}`} className={ghostClass}>Ver detalle</button>
-                  </div>
-                </li>
-              ))}
-            </ul>
+            {invoices.length > 0 ? (
+              <div className="mt-2 overflow-x-auto">
+                <table className="w-full min-w-full table-fixed text-left text-sm">
+                  <thead>
+                    <tr className={tableHeaderClass}>
+                      <th className={cn(headCellClass, "w-32")} scope="col">Factura</th>
+                      <th className={cn(moneyHeadClass, "w-28")} scope="col">Fija</th>
+                      <th className={cn(moneyHeadClass, "w-28")} scope="col">Porcentaje</th>
+                      <th className={cn(moneyHeadClass, "w-28")} scope="col">Total</th>
+                      <th className={cn(headCellClass, "w-28")} scope="col">Acción</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {invoices.map((invoice) => (
+                      <tr key={invoice.invoice_id} className={tableRowClass}>
+                        <td className={cn(tableCellClass, "truncate")}>{`#${invoice.consecutive_number ?? "sin consecutivo"}`}</td>
+                        <td className={moneyCellClass}>{formatMoney(invoice.fixed_commission)}</td>
+                        <td className={moneyCellClass}>{formatMoney(invoice.percent_commission)}</td>
+                        <td className={moneyCellClass}>{formatMoney(invoice.commission)}</td>
+                        <td className={cn(tableCellClass, "whitespace-nowrap")}><button type="button" onClick={() => onViewInvoice(invoice.invoice_id)} aria-label={`Ver el detalle de la factura ${invoice.consecutive_number ?? "sin consecutivo"}`} className={ghostClass}>Ver detalle</button></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
           </section>
         </>
       ) : null}
@@ -1134,16 +1163,30 @@ export function SettlementSourcesPanel({
         <section>
           <h3 className="text-sm font-semibold text-text-primary">Vales de la liquidación</h3>
           {vouchers.length === 0 ? <p className="mt-1 text-sm text-text-tertiary">La liquidación no tiene vales: no hubo vales descontados en este período.</p> : null}
-          <ul className="mt-2 flex flex-col gap-2">
-            {vouchers.map((voucher) => (
-              <li key={voucher.id} className="rounded border border-border-color p-2 dark:border-border-color-2">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-sm text-text-primary">{formatFullDate(voucher.request_date)}</span><span className="text-sm text-text-secondary">{formatMoney(voucher.amount)}</span><span className="text-sm text-text-secondary">{voucher.status}</span>
-                  <button type="button" onClick={() => onViewVoucher(voucher)} aria-label={`Ver el detalle del vale del ${voucher.request_date}`} className={ghostClass}>Ver detalle</button>
-                </div>
-              </li>
-            ))}
-          </ul>
+          {vouchers.length > 0 ? (
+            <div className="mt-2 overflow-x-auto">
+              <table className="w-full min-w-full table-fixed text-left text-sm">
+                <thead>
+                  <tr className={tableHeaderClass}>
+                    <th className={cn(headCellClass, "w-40")} scope="col">Fecha</th>
+                    <th className={cn(moneyHeadClass, "w-28")} scope="col">Monto</th>
+                    <th className={cn(headCellClass, "w-28")} scope="col">Estado</th>
+                    <th className={cn(headCellClass, "w-28")} scope="col">Acción</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {vouchers.map((voucher) => (
+                    <tr key={voucher.id} className={tableRowClass}>
+                      <td className={cn(tableCellClass, "truncate")} title={formatFullDate(voucher.request_date)}>{formatFullDate(voucher.request_date)}</td>
+                      <td className={moneyCellClass}>{formatMoney(voucher.amount)}</td>
+                      <td className={cn(tableCellClass, "truncate")}>{voucher.status}</td>
+                      <td className={cn(tableCellClass, "whitespace-nowrap")}><button type="button" onClick={() => onViewVoucher(voucher)} aria-label={`Ver el detalle del vale del ${voucher.request_date}`} className={ghostClass}>Ver detalle</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
           {item && item.deductions_vales < item.voucher_total ? (
             <p className="mt-2 text-sm text-text-secondary">
               {`Del total de vales, el neto de este período descuenta ${formatMoney(item.deductions_vales)}: el tope de descuentos no aplicó el resto.`}
@@ -1178,6 +1221,11 @@ export function PayrollClient(props: PayrollClientProps) {
   );
   // Filtro de estado de la lista de períodos.
   const [statusFilter, setStatusFilter] = useState<string>("todos");
+  const [periodSearch, setPeriodSearch] = useState("");
+  const [periodMonth, setPeriodMonth] = useState("");
+  const [periodPage, setPeriodPage] = useState(0);
+  const [monthSearch, setMonthSearch] = useState("");
+  const [monthPage, setMonthPage] = useState(0);
   /**
    * F11: la cadencia ELEGIDA es estado del usuario y arranca en `null` —en el
    * primer render no eligió nadie—. Lo que se ve lo resuelve el ciclo
@@ -1369,6 +1417,9 @@ export function PayrollClient(props: PayrollClientProps) {
    * empleado si el usuario cambia de período mientras carga.
    */
   const [sourcesTarget, setSourcesTarget] = useState<{ periodId: string; employeeId: string } | null>(null);
+  const [sourceCounts, setSourceCounts] = useState<{ invoices: number; vouchers: number } | null>(null);
+  const [sourceCountsBusy, setSourceCountsBusy] = useState(false);
+  const sourceCountsKeyRef = useRef<string | null>(null);
   const [invoiceSources, setInvoiceSources] = useState<Extract<PayrollSettlementSources, { kind: "invoices" }> | null>(null);
   const [voucherSources, setVoucherSources] = useState<Extract<PayrollSettlementSources, { kind: "vouchers" }> | null>(null);
   const [selectedSourceKind, setSelectedSourceKind] = useState<"invoices" | "vouchers" | null>(null);
@@ -1912,6 +1963,16 @@ export function PayrollClient(props: PayrollClientProps) {
    */
   function openSettlementSources(periodId: string, employeeId: string) {
     setSourcesTarget({ periodId, employeeId });
+    setSourceCounts(null);
+    setSourceCountsBusy(true);
+    const requestKey = `${periodId}:${employeeId}`;
+    sourceCountsKeyRef.current = requestKey;
+    void getPayrollSettlementSourceCountsAction(periodId, employeeId).then((result) => {
+      if (sourceCountsKeyRef.current !== requestKey) return;
+      if (result.success) setSourceCounts(result.data);
+      else show(result);
+      setSourceCountsBusy(false);
+    });
     setInvoiceSources(null);
     setVoucherSources(null);
     setSelectedSourceKind(null);
@@ -1945,6 +2006,9 @@ export function PayrollClient(props: PayrollClientProps) {
 
   function closeSettlementSources() {
     setSourcesTarget(null);
+    sourceCountsKeyRef.current = null;
+    setSourceCounts(null);
+    setSourceCountsBusy(false);
     setInvoiceSources(null);
     setVoucherSources(null);
     setSelectedSourceKind(null);
@@ -2433,10 +2497,17 @@ export function PayrollClient(props: PayrollClientProps) {
    * que un mes con muchos pagos sea navegable. El conteo se lee SIEMPRE contra
    * el total.
    */
+  const periodMonthOptions = [...new Set(periods.map((row) => row.start_date.slice(0, 7)).filter((month) => /^\d{4}-\d{2}$/.test(month)))].sort((left, right) => left < right ? 1 : -1);
   const visiblePeriods = filterPeriodsByCadence(
     statusFilter === "todos" ? periods : periods.filter((row) => row.status === statusFilter),
     cadenceFilter,
   );
+  const periodQuery = periodSearch.trim().toLocaleLowerCase();
+  const tablePeriods = visiblePeriods.filter((period) =>
+    (periodMonth === "" || period.start_date.startsWith(periodMonth)) &&
+    (periodQuery === "" || `${formatPeriodLabel(period)} ${period.frequency ?? ""} ${period.status}`.toLocaleLowerCase().includes(periodQuery)),
+  );
+  const PERIOD_PAGE_SIZE = 10;
 
   /**
    * F11: por qué la lista quedó vacía. Con dos filtros hay que NOMBRAR los dos,
@@ -2445,6 +2516,7 @@ export function PayrollClient(props: PayrollClientProps) {
    */
   function emptyPeriodListText(): string {
     if (periods.length === 0) return "Sin periodos todavía.";
+    if (periodQuery !== "" || periodMonth !== "") return "Ningún período coincide con los filtros.";
     if (statusFilter !== "todos" && cadenceFilter !== "todas") {
       return `Ningún período con estado ${statusFilter} en la cadencia ${periodCadenceFilterLabel(cadenceFilter)}.`;
     }
@@ -2460,74 +2532,45 @@ export function PayrollClient(props: PayrollClientProps) {
    * cliente sería un tipo NUEVO en cada render y remontaría la lista entera.
    */
   function renderPeriodList(rows: PayrollPeriodRow[]): ReactNode {
+    if (rows.length === 0) return <p className="mt-3 text-sm text-text-tertiary">{emptyPeriodListText()}</p>;
     return (
-      <>
-        {groupPayrollPeriodsByMonth(rows).map((group) => {
-          const totals = groupTotals(group);
-          return (
-            <div key={group.month || "sin-mes"} className="mt-4">
-              <div className="flex flex-wrap items-baseline justify-between gap-2">
-                <h3 className="text-sm font-semibold text-text-primary">
-                  {group.month ? payrollMonthLabel(group.month) : "Sin mes determinable"}
-                </h3>
-                {props.canAdmin && (
-                  <p className="text-xs text-text-tertiary">
-                    {group.periods.length === 1 ? "1 período" : `${group.periods.length} períodos`}
-                    {totals
-                      ? ` · Neto ${formatMoney(totals.net)} · Pagado ${formatMoney(totals.paid)} · Saldo ${formatMoney(totals.remaining)}`
-                      : " · Totales parciales: abra los períodos sin resumen."}
-                  </p>
-                )}
-              </div>
-              <ul className="mt-2 flex flex-col gap-2">
-                {group.periods.map((row) => (
-                  <li key={row.id} className="flex flex-wrap items-center gap-3 text-sm">
-                    <button
-                      type="button"
-                      onClick={() => loadDetail(row.id)}
-                      disabled={isViewPending}
-                      aria-current={row.id === selectedId ? "true" : undefined}
-                      className={ghostClass}
-                    >
-                      {formatPeriodLabel(row)}
-                    </button>
-                    {/* F11: la CADENCIA de la fila. Antes sólo se veían las
-                        fechas, y tres períodos del mismo rango (el quincenal y
-                        el mensual cierran juntos) eran tres filas idénticas. */}
-                    <span className="text-xs text-text-secondary">
-                      {periodCadenceLabel(row.frequency)}
-                    </span>
-                    <Badge variant="secondary">{row.status}</Badge>
-                    {props.canAdmin && (
-                      <span className="text-xs text-text-secondary">{periodSummaryText(row)}</span>
-                    )}
-                    {row.status === "cerrado" && row.closed_at && (
-                      <span className="text-xs text-text-tertiary">Cerrado: {formatBogotaFullDateTime(row.closed_at)}</span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          );
-        })}
-        {rows.length === 0 && <p className="mt-3 text-sm text-text-tertiary">{emptyPeriodListText()}</p>}
-      </>
+      <DataTable minWidth="xl" wrapperClassName="mt-4">
+        <thead>
+          <tr className={tableHeaderClass}>
+            <th className={headCellClass} scope="col">Período</th>
+            <th className={headCellClass} scope="col">Cadencia</th>
+            <th className={headCellClass} scope="col">Estado</th>
+            {props.canAdmin ? <th className={headCellClass} scope="col">Liquidación</th> : null}
+            <th className={headCellClass} scope="col">Cierre</th>
+            <th className={headCellClass} scope="col">Acción</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.id} className={tableRowClass}>
+              <td className={cn(tableCellClass, "max-w-60 truncate")} title={formatPeriodLabel(row)}>{formatPeriodLabel(row)}</td>
+              <td className={cn(tableCellClass, "whitespace-nowrap")}>{periodCadenceLabel(row.frequency)}</td>
+              <td className={tableCellClass}><Badge variant="secondary">{row.status}</Badge></td>
+              {props.canAdmin ? <td className={cn(tableCellClass, "max-w-80 truncate")} title={periodSummaryText(row)}>{periodSummaryText(row)}</td> : null}
+              <td className={cn(tableCellClass, "whitespace-nowrap")}>{row.status === "cerrado" && row.closed_at ? formatBogotaFullDateTime(row.closed_at) : "—"}</td>
+              <td className={cn(tableCellClass, "whitespace-nowrap")}>
+                <button type="button" onClick={() => loadDetail(row.id)} disabled={isViewPending} aria-current={row.id === selectedId ? "true" : undefined} className={tableActionClass}>Ver detalle</button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </DataTable>
     );
   }
 
   /**
-   * Totales de un mes: SÓLO si TODOS sus períodos tienen resumen. Con uno sin
-   * resumen el total de la fila mentiría por omisión, así que se dice. Los
-   * montos van en peso entero (`sumMoney` sobre `roundMoney`).
+   * Totales de los períodos filtrados: SÓLO si TODOS tienen resumen. Con uno sin
+   * resumen el total mentiría por omisión, así que se dice.
    */
-  function groupTotals(group: PayrollMonthGroup<PayrollPeriodRow>) {
-    const totals = group.periods.map((row) => summaries[row.id]);
-    if (totals.some((row) => row === undefined)) return null;
-    return {
-      net: sumMoney(totals.map((row) => row?.netTotal ?? 0)),
-      paid: sumMoney(totals.map((row) => row?.paidTotal ?? 0)),
-      remaining: sumMoney(totals.map((row) => row?.remainingTotal ?? 0)),
-    };
+  function filteredTotalsText(rows: readonly PayrollPeriodRow[]): string {
+    const totals = rows.map((row) => summaries[row.id]);
+    if (totals.some((row) => row === undefined)) return "Totales parciales: abra los períodos sin resumen.";
+    return `Neto ${formatMoney(sumMoney(totals.map((row) => row?.netTotal ?? 0)))} · Pagado ${formatMoney(sumMoney(totals.map((row) => row?.paidTotal ?? 0)))} · Saldo ${formatMoney(sumMoney(totals.map((row) => row?.remainingTotal ?? 0)))}`;
   }
 
   /** Resumen de un período en la lista: se lee sin abrirlo. */
@@ -2644,11 +2687,12 @@ export function PayrollClient(props: PayrollClientProps) {
    */
   function handleMonthQuery(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!queryMonth || !queryEmployeeId) return;
+    if (!queryMonth) return;
+    setMonthPage(0);
     startViewTransition(async () => {
       const result = (await listPayrollMonthRowsAction({
         month: queryMonth,
-        employeeId: queryEmployeeId,
+        employeeId: queryEmployeeId || undefined,
       })) as ActionResult<PayrollMonthEmployeeRow[]>;
       if (show(result)) {
         setMonthQuery({ month: queryMonth, employeeId: queryEmployeeId, rows: result.data });
@@ -2672,6 +2716,11 @@ export function PayrollClient(props: PayrollClientProps) {
   // Unión de meses: los períodos vivos de la pantalla y los meses Bogotá de los
   // extraordinarios que devuelve el servidor.
   const queryMonthOptions = [...new Set(monthOptions)].sort((left, right) => (left < right ? 1 : -1));
+  const MONTH_PAGE_SIZE = 10;
+  const monthRows = (monthQuery?.rows ?? []).filter((row) =>
+    employeeName(row.employeeId).toLocaleLowerCase().includes(monthSearch.trim().toLocaleLowerCase()),
+  );
+  const monthPageRows = monthRows.slice(monthPage * MONTH_PAGE_SIZE, (monthPage + 1) * MONTH_PAGE_SIZE);
 
   /** Sueldo mensual del empleado: la base de la prorata, a la vista. */
   function monthSalaryLabel(id: string): string {
@@ -2819,26 +2868,42 @@ export function PayrollClient(props: PayrollClientProps) {
                 F11: `shown` son los períodos que quedan con los DOS filtros
                 (estado y cadencia), así que el rótulo nombra lo que de verdad
                 se está viendo. */}
-            {payrollPeriodCountLabel({ total: periods.length, shown: visiblePeriods.length })}
+            {payrollPeriodCountLabel({ total: periods.length, shown: tablePeriods.length })}
+            {tablePeriods.length > 0 ? ` ${filteredTotalsText(tablePeriods)}` : ""}
           </p>
         )}
         {props.canAdmin && (
-          <label className={labelClass} htmlFor="payroll-status-filter">
-            Estado
-            <select
-              id="payroll-status-filter"
-              value={statusFilter}
-              onChange={(event) => setStatusFilter(event.target.value)}
-              className={inputClass}
-            >
-              <option value="todos">Todos los estados</option>
-              {statusOptions.map((status) => (
-                <option key={status} value={status}>
-                  {status}
-                </option>
-              ))}
-            </select>
-          </label>
+          <ListToolbar
+            className="mt-3"
+            searchId="payroll-period-search"
+            searchLabel="Buscar período"
+            searchValue={periodSearch}
+            searchPlaceholder="Fecha, cadencia o estado"
+            onSearchChange={(value) => { setPeriodSearch(value); setPeriodPage(0); }}
+            statusLabel="Estado"
+            statusValue={statusFilter}
+            statusOptions={[{ value: "todos", label: "Todos los estados" }, ...statusOptions.map((status) => ({ value: status, label: status }))]}
+            onStatusChange={(value) => { setStatusFilter(value); setPeriodPage(0); }}
+            onClear={() => { setPeriodSearch(""); setStatusFilter("todos"); setCadenceChoice(null); setPeriodMonth(""); setPeriodPage(0); }}
+            secondaryFilters={
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className={labelClass} htmlFor="payroll-cadence-filter">
+                  Cadencia
+                  <select id="payroll-cadence-filter" value={cadenceFilter} onChange={(event) => { setCadenceChoice(event.target.value as PeriodCadenceFilter); setPeriodPage(0); }} className={inputClass}>
+                    {cadenceOptions.map((option) => <option key={periodCadenceTabKey(option)} value={option}>{periodCadenceFilterLabel(option)}</option>)}
+                  </select>
+                </label>
+                <label className={labelClass} htmlFor="payroll-period-month-filter">
+                  Mes
+                  <select id="payroll-period-month-filter" value={periodMonth} onChange={(event) => { setPeriodMonth(event.target.value); setPeriodPage(0); }} className={inputClass}>
+                    <option value="">Todos los meses</option>
+                    {periodMonthOptions.map((month) => <option key={month} value={month}>{payrollMonthLabel(month)}</option>)}
+                  </select>
+                </label>
+              </div>
+            }
+            activeFilterCount={(cadenceFilter === "todas" ? 0 : 1) + (periodMonth === "" ? 0 : 1)}
+          />
         )}
         {props.canAdmin && props.initialEmployees.length === 0 && (
           // VACÍO: no es un aviso, es el estado base de la sede sin planta.
@@ -2879,29 +2944,10 @@ export function PayrollClient(props: PayrollClientProps) {
           elegir y no se dibuja el control. Cada panel pinta la MISMA lista por
           el mismo helper: el marcado vive en un solo lugar.
         */}
-        {cadenceOptions.length > 1 ? (
-          <Tabs
-            value={cadenceFilter}
-            onValueChange={(next) => setCadenceChoice(next as PeriodCadenceFilter)}
-            label="Períodos por cadencia"
-            className="mt-3 gap-3"
-          >
-            <TabsList>
-              {cadenceOptions.map((option) => (
-                <TabsTrigger key={periodCadenceTabKey(option)} value={option}>
-                  {periodCadenceFilterLabel(option)}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-            {cadenceOptions.map((option) => (
-              <TabsPanel key={periodCadenceTabKey(option)} value={option}>
-                {renderPeriodList(filterPeriodsByCadence(visiblePeriods, option))}
-              </TabsPanel>
-            ))}
-          </Tabs>
-        ) : (
-          renderPeriodList(visiblePeriods)
-        )}
+        {renderPeriodList(tablePeriods.slice(periodPage * PERIOD_PAGE_SIZE, (periodPage + 1) * PERIOD_PAGE_SIZE))}
+        {tablePeriods.length > 0 ? (
+          <ListPager page={periodPage} pageSize={PERIOD_PAGE_SIZE} total={tablePeriods.length} onPageChange={setPeriodPage} />
+        ) : null}
       </TabsPanel>
 
 
@@ -2926,111 +2972,78 @@ export function PayrollClient(props: PayrollClientProps) {
             la misma del resto de la pantalla, así que la UI no se congela
             mientras el servidor responde.
           */}
-          <form onSubmit={handleMonthQuery} className="mt-3 flex flex-wrap items-end gap-3">
-            <label className={labelClass} htmlFor="payroll-month-filter">
-              Mes
-              <select
-                id="payroll-month-filter"
-                value={queryMonth}
-                onChange={(event) => setQueryMonth(event.target.value)}
-                className={inputClass}
-                required
-              >
-                <option value="">Mes…</option>
-                {queryMonthOptions.map((month) => (
-                  <option key={month} value={month}>
-                    {payrollMonthLabel(month)}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className={labelClass} htmlFor="payroll-month-employee">
-              Empleado
-              <select
-                id="payroll-month-employee"
-                value={queryEmployeeId}
-                onChange={(event) => setQueryEmployeeId(event.target.value)}
-                className={inputClass}
-                required
-              >
-                <option value="">Empleado…</option>
-                {props.initialEmployees.map((row) => (
-                  <option key={row.id} value={row.id}>
-                    {employeeName(row.id)}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button
-              type="submit"
-              disabled={!queryMonth || !queryEmployeeId || isViewPending}
-              className={buttonClass}
-            >
-              {isViewPending ? "Consultando…" : "Consultar"}
-            </button>
-          </form>
+          <ListToolbar
+            className="mt-3"
+            searchId="payroll-month-search"
+            searchLabel="Buscar empleado"
+            searchValue={monthSearch}
+            searchPlaceholder="Nombre, código o documento"
+            onSearchChange={(value) => { setMonthSearch(value); setMonthPage(0); }}
+            statusLabel="Mes"
+            statusValue={queryMonth}
+            statusOptions={[{ value: "", label: "Mes…" }, ...queryMonthOptions.map((month) => ({ value: month, label: payrollMonthLabel(month) }))]}
+            onStatusChange={(value) => { setQueryMonth(value); setMonthPage(0); }}
+            onFilter={() => handleMonthQuery({ preventDefault: () => undefined } as FormEvent<HTMLFormElement>)}
+            onClear={() => { setMonthSearch(""); setQueryMonth(""); setQueryEmployeeId(""); setMonthQuery(null); setMonthPage(0); }}
+            secondaryFilters={
+              <label className={labelClass} htmlFor="payroll-month-employee">
+                Empleado
+                <select id="payroll-month-employee" value={queryEmployeeId} onChange={(event) => setQueryEmployeeId(event.target.value)} className={inputClass}>
+                  <option value="">Todos los empleados</option>
+                  {props.initialEmployees.map((row) => <option key={row.id} value={row.id}>{employeeName(row.id)}</option>)}
+                </select>
+              </label>
+            }
+            activeFilterCount={queryEmployeeId === "" ? 0 : 1}
+          />
           {monthQuery === null ? (
             // Antes de la consulta no hay tabla ni número: la pantalla sólo pide
             // el mes y el empleado.
             <p className="mt-3 text-sm text-text-tertiary">
-              Elija mes y empleado para consultar sus pagos.
+              Elija un mes y pulse Filtrar.
             </p>
           ) : isViewPending ? (
             <p className="mt-3 text-sm text-text-tertiary">Consultando…</p>
           ) : (
-            <div className="mt-3 overflow-x-auto">
-              <table className={cn("w-full text-left text-sm", "min-w-[960px]")}>
+            <>
+              <DataTable minWidth="xl" wrapperClassName="mt-3" className="table-fixed">
                 <thead>
                   <tr className={tableHeaderClass}>
-                    <th className={tableCellClass} scope="col">
-                      Empleado
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Fijo prorrateado (días)
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Neto
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Pagado períodos
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Pagado mes
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Saldo
-                    </th>
-                    <th className={tableCellClass} scope="col">
-                      Pagos
-                    </th>
+                    <th className={cn(headCellClass, "w-48")} scope="col">Empleado</th>
+                    <th className={cn(moneyHeadClass, "w-40")} scope="col">Fijo prorrateado (días)</th>
+                    <th className={cn(moneyHeadClass, "w-28")} scope="col">Neto</th>
+                    <th className={cn(moneyHeadClass, "w-32")} scope="col">Pagado períodos</th>
+                    <th className={cn(moneyHeadClass, "w-28")} scope="col">Pagado mes</th>
+                    <th className={cn(moneyHeadClass, "w-28")} scope="col">Saldo</th>
+                    <th className={cn(headCellClass, "w-80")} scope="col">Pagos</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {monthQuery.rows.map((row) => (
+                  {monthPageRows.map((row) => (
                     <tr key={`${row.month}-${row.employeeId}`} className={tableRowClass}>
                       <td className={tableCellClass}>
-                        <span className="block">{employeeName(row.employeeId)}</span>
-                        <span className="block text-xs text-text-tertiary">
+                        <span className="block truncate" title={employeeName(row.employeeId)}>{employeeName(row.employeeId)}</span>
+                        <span className="block truncate text-xs text-text-tertiary" title={monthSalaryLabel(row.employeeId)}>
                           {monthSalaryLabel(row.employeeId)}
                         </span>
                       </td>
-                      <td className={tableCellClass}>
+                      <td className={moneyCellClass}>
                         <span className="block">{formatMoney(row.fixedTotal)}</span>
                         <span className="block text-xs text-text-tertiary">
                           {row.days === 1 ? "1 día nominado" : `${row.days} días nominados`}
                         </span>
                       </td>
-                      <td className={tableCellClass}>{formatMoney(row.periodNet)}</td>
-                      <td className={tableCellClass}>{formatMoney(row.periodPaid)}</td>
-                      <td className={tableCellClass}>{formatMoney(row.monthPaid)}</td>
-                      <td className={cn(tableCellClass, "font-semibold")}>
+                      <td className={moneyCellClass}>{formatMoney(row.periodNet)}</td>
+                      <td className={moneyCellClass}>{formatMoney(row.periodPaid)}</td>
+                      <td className={moneyCellClass}>{formatMoney(row.monthPaid)}</td>
+                      <td className={cn(moneyCellClass, "font-semibold")}>
                         {formatMoney(row.periodRemaining)}
                       </td>
                       <td className={tableCellClass}>
                         <ul className="flex flex-col gap-0.5">
                           {row.periods.map((entry) => (
-                            <li key={entry.periodId} className="flex items-center gap-2">
-                              <span>
+                            <li key={entry.periodId} className="flex min-w-0 items-center gap-2">
+                              <span className="min-w-0 truncate" title={`${formatPeriodLabel(entry)}: pagado ${formatMoney(entry.paid)}`}>
                                 {formatPeriodLabel(entry)}: pagado {formatMoney(entry.paid)}
                               </span>
                               <button
@@ -3038,14 +3051,14 @@ export function PayrollClient(props: PayrollClientProps) {
                                 title="Ver detalle"
                                 aria-label={`Ver detalle de pagos de ${formatPeriodLabel(entry)}`}
                                 onClick={() => void openMonthPaymentDetail(entry)}
-                                className={tableActionClass}
+                                className={cn(tableActionClass, "shrink-0")}
                               >
                                 <Eye className="h-4 w-4" aria-hidden="true" />
                               </button>
                             </li>
                           ))}
                           {row.extras.map((entry) => (
-                            <li key={entry.id}>
+                            <li key={entry.id} className="break-words">
                               Pago extraordinario · {PAYROLL_EXTRA_KIND_LABELS[entry.kind]} ·{" "}
                               {methodLabel(entry.method_code)} · {formatBogotaFullDateTime(entry.paid_at)}:{" "}
                               {formatMoney(entry.amount)} — {entry.reason}
@@ -3055,7 +3068,7 @@ export function PayrollClient(props: PayrollClientProps) {
                       </td>
                     </tr>
                   ))}
-                  {monthQuery.rows.length === 0 && (
+                  {monthRows.length === 0 && (
                     <tr className={tableRowClass}>
                       <td className={tableCellClass} colSpan={7}>
                         {`Sin pagos cerrados en ${payrollMonthLabel(monthQuery.month)}.`}
@@ -3063,8 +3076,9 @@ export function PayrollClient(props: PayrollClientProps) {
                     </tr>
                   )}
                 </tbody>
-              </table>
-            </div>
+              </DataTable>
+              {monthRows.length > 0 ? <ListPager page={monthPage} pageSize={MONTH_PAGE_SIZE} total={monthRows.length} onPageChange={setMonthPage} /> : null}
+            </>
           )}
         </TabsPanel>
       )}
@@ -3900,7 +3914,7 @@ export function PayrollClient(props: PayrollClientProps) {
                 {`Facturas y vales de ${employeeName(sourcesTarget.employeeId)}`}
               </DialogTitle>
               <DialogDescription>
-                Las facturas y los vales que componen esta liquidación, con el detalle de cada uno.
+                Elija qué revisar. Cada lista se carga al abrirla.
               </DialogDescription>
             </DialogHeader>
             <div className="max-h-[calc(100dvh-12rem)] overflow-y-auto pr-1">
@@ -3910,7 +3924,7 @@ export function PayrollClient(props: PayrollClientProps) {
                   const count = settlementSourceCount(
                     kind,
                     kind === "invoices" ? invoiceSources : voucherSources,
-                    itemByEmployee.get(sourcesTarget.employeeId) ?? null,
+                    sourceCounts,
                   );
                   return (
                     <button
@@ -3920,8 +3934,7 @@ export function PayrollClient(props: PayrollClientProps) {
                       aria-pressed={selected}
                       className={cn(ghostClass, "justify-between", selected && "border-primary-600 bg-primary-600/10")}
                     >
-                      <span>{kind === "invoices" ? "Facturas" : "Vales"}</span>
-                      {count === null ? null : <span className="text-sm text-text-tertiary">{count}</span>}
+                      <span>{settlementSourceLabel(kind, count, sourceCountsBusy)}</span>
                     </button>
                   );
                 })}
@@ -3963,10 +3976,10 @@ export function PayrollClient(props: PayrollClientProps) {
             ) : invoiceDetail ? (
               <div className="flex flex-col gap-5">
                 <div className="flex flex-wrap items-start justify-between gap-4 border-b border-border-color pb-4">
-                  <div><p className="text-lg font-bold">Factura #{invoiceDetail.invoice.consecutive_number}</p><p className="text-sm text-text-secondary">{invoiceDetail.invoice.client_name}{invoiceDetail.invoice.client_document ? ` · ${invoiceDetail.invoice.client_document}` : ""}</p></div>
+                  <div><p className="text-lg font-bold">Factura #{invoiceDetail.invoice.consecutive_number}</p><p className="text-sm text-text-secondary">Detalle administrativo de la liquidación</p></div>
                   <div className="text-right"><span className="text-sm text-text-secondary">{invoiceDetail.invoice.status}</span><p className="mt-2 text-lg font-semibold">{formatMoney(invoiceDetail.invoice.total)}</p></div>
                 </div>
-                <div className="overflow-x-auto rounded-md border border-border-color"><table className="w-full text-left text-sm"><thead><tr className={tableHeaderClass}><th className={tableCellClass}>Descripción</th><th className={moneyHeadClass}>Cant.</th><th className={moneyHeadClass}>V. unitario</th><th className={moneyHeadClass}>Subtotal</th></tr></thead><tbody>{invoiceDetail.items.map((row) => <tr key={row.id} className={tableRowClass}><td className={tableCellClass}>{row.custom_name ?? detailLineLabel(row.item_type)}</td><td className={moneyCellClass}>{row.qty}</td><td className={moneyCellClass}>{formatMoney(row.unit_price)}</td><td className={moneyCellClass}>{formatMoney(row.subtotal)}</td></tr>)}</tbody></table></div>
+                <DataTable minWidth="lg" wrapperClassName="rounded-md border border-border-color"><thead><tr className={tableHeaderClass}><th className={headCellClass}>Descripción</th><th className={moneyHeadClass}>Cant.</th><th className={moneyHeadClass}>V. unitario</th><th className={moneyHeadClass}>Subtotal</th><th className={headCellClass}>Origen comisión</th></tr></thead><tbody>{invoiceDetail.items.map((row) => <tr key={row.id} className={tableRowClass}><td className={cn(tableCellClass, "max-w-64 truncate")} title={row.custom_name ?? detailLineLabel(row.item_type)}>{row.custom_name ?? detailLineLabel(row.item_type)}</td><td className={moneyCellClass}>{row.qty}</td><td className={moneyCellClass}>{formatMoney(row.unit_price)}</td><td className={moneyCellClass}>{formatMoney(row.subtotal)}</td><td className={cn(tableCellClass, "whitespace-nowrap")}>{invoiceCommissionOrigin(row)}</td></tr>)}</tbody></DataTable>
                 <div className="flex justify-end"><dl className="w-full max-w-md space-y-2 rounded-md border border-border-color p-4 text-sm"><div className="flex justify-between gap-3"><dt>Subtotal</dt><dd>{formatMoney(invoiceDetail.invoice.subtotal)}</dd></div><div className="flex justify-between gap-3"><dt>Descuento</dt><dd>{formatMoney(invoiceDetail.invoice.discount)}</dd></div><div className="flex justify-between gap-3"><dt>Impuestos</dt><dd>{formatMoney(invoiceDetail.invoice.tax)}</dd></div><div className="flex justify-between gap-3 border-t border-border-color pt-2 text-base font-semibold"><dt>Total</dt><dd>{formatMoney(invoiceDetail.invoice.total)}</dd></div></dl></div>
               </div>
             ) : <p className="text-sm text-text-tertiary">No se pudo abrir la factura.</p>}
@@ -3980,7 +3993,7 @@ export function PayrollClient(props: PayrollClientProps) {
           <DialogContent className="max-w-lg">
             <DialogHeader><DialogTitle>Detalle del vale</DialogTitle></DialogHeader>
             {voucherBusy ? <p className="text-sm text-text-tertiary">Leyendo el vale…</p> : voucherDetail ? (
-              <dl className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2"><SourceDetailField label="Empleado">{employeeName(voucherDetail.employee_id)}</SourceDetailField><SourceDetailField label="Monto">{formatMoney(voucherDetail.amount)}</SourceDetailField><SourceDetailField label="Fecha de solicitud">{voucherDetail.request_date}</SourceDetailField><SourceDetailField label="Estado">{voucherDetail.status}{voucherDetail.status === "descontada" ? " (en nómina: sin cambios)" : ""}</SourceDetailField><SourceDetailField label="Método de pago">{voucherDetail.method_code ?? "—"}</SourceDetailField><SourceDetailField label="Observación">{voucherDetail.observation ?? "—"}</SourceDetailField></dl>
+              <dl className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2"><SourceDetailField label="Empleado">{employeeName(voucherDetail.employee_id)}</SourceDetailField><SourceDetailField label="Monto">{formatMoney(voucherDetail.amount)}</SourceDetailField><SourceDetailField label="Fecha de solicitud">{formatFullDate(voucherDetail.request_date)}</SourceDetailField><SourceDetailField label="Estado">{voucherDetail.status}{voucherDetail.status === "descontada" ? " (ya descontado en nómina)" : ""}</SourceDetailField><SourceDetailField label="Método de pago">{voucherDetail.method_code ? methodLabel(voucherDetail.method_code) : "—"}</SourceDetailField><SourceDetailField label="Abierto por">{voucherDetail.created_by_name ?? "—"}</SourceDetailField><SourceDetailField label="Aprobado por">{voucherDetail.approved_by_name ?? "—"}</SourceDetailField><SourceDetailField label="Observación">{voucherDetail.observation ?? "—"}</SourceDetailField><SourceDetailField label="Identificador">{voucherDetail.id}</SourceDetailField></dl>
             ) : <p className="text-sm text-text-tertiary">No se pudo abrir el vale.</p>}
             <DialogFooter><button type="button" className={ghostClass} onClick={() => setVoucherTargetId(null)}>Cerrar</button></DialogFooter>
           </DialogContent>

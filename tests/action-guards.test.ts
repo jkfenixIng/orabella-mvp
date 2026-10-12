@@ -800,6 +800,13 @@ const SURFACES: readonly SurfaceSpec[] = [
   },
   {
     file: PAYROLL_ACTIONS_FILE,
+    name: "getPayrollSettlementSourceCountsAction",
+    kind: "payroll",
+    roles: ["admin", "empleado"],
+    why: "cuenta facturas y vales de la liquidación de UN empleado, sin detalles (alcance por fila: el empleado solo la suya); la caja no entra.",
+  },
+  {
+    file: PAYROLL_ACTIONS_FILE,
     name: "getPayrollStartDateAction",
     kind: "payroll",
     roles: ["admin"],
