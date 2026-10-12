@@ -256,9 +256,16 @@ export async function getPeriodDetailAction(id: string) {
  * no entra al módulo (`requirePayrollViewer`). Una lectura incompleta no se
  * degrada a vacío: sale con el código accionable de `toFailure`.
  */
-export async function getPayrollSettlementSourcesAction(periodId: string, employeeId: string) {
+export async function getPayrollSettlementSourcesAction(
+  periodId: string,
+  employeeId: string,
+  kind: "invoices" | "vouchers",
+) {
   try {
     const session = await requirePayrollViewer(await sessionToken());
+    if (kind !== "invoices" && kind !== "vouchers") {
+      throw new PayrollError("VALIDATION", "Fuente de la liquidación inválida.", 400);
+    }
     const isManager = (session.roles ?? []).includes("admin");
     let targetEmployeeId = employeeId;
     if (!isManager) {
@@ -267,7 +274,7 @@ export async function getPayrollSettlementSourcesAction(periodId: string, employ
       const mine = (await listAllEmployees()).find((row) => row.user_id === session.userId);
       targetEmployeeId = mine?.id ?? "sin-acceso";
     }
-    const data = await getPayrollSettlementSources(periodId, targetEmployeeId);
+    const data = await getPayrollSettlementSources(periodId, targetEmployeeId, kind);
     return { success: true as const, data };
   } catch (error) {
     return toFailure(error);

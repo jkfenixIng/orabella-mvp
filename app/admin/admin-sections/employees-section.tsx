@@ -15,10 +15,12 @@ import type { EmployeeRow, SedeUserRow } from "@/src/features/admin/service";
 import type { RoleCode } from "@/src/features/auth/schemas";
 import { EmptyState } from "@/src/components/ui/lib/empty-state";
 import { FormDialog } from "@/src/components/ui/lib/form-dialog";
+import { ListToolbar } from "@/src/components/ui/lib/list-toolbar";
 import { cn } from "@/src/components/ui/lib/utils";
 import {
   buttonClass,
   ghostClass,
+  MoneyField,
   inputClass,
   labelClass,
   linkButtonClass,
@@ -28,10 +30,14 @@ import {
   tableHeaderClass,
 } from "../admin-styles";
 import {
+  ACTIVE_STATUS_OPTIONS,
   ROLE_OPTIONS,
   formatMoney,
+  matchesActiveStatus,
+  matchesQuery,
   toNumber,
   type ActionResult,
+  type ActiveStatusFilter,
 } from "../admin-shared";
 import {
   formatMoneyInput,
@@ -110,6 +116,7 @@ export function EmployeesSection({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [dialog, setDialog] = useState<EmployeeDialog | null>(null);
   const [filter, setFilter] = useState("");
+  const [status, setStatus] = useState<ActiveStatusFilter>("all");
   const [createLogin, setCreateLogin] = useState(true);
   const [loginIdType, setLoginIdType] = useState("CC");
   const [loginRole, setLoginRole] = useState<RoleCode>("empleado");
@@ -121,15 +128,11 @@ export function EmployeesSection({
       ? (rows.find((row) => row.id === dialog.id) ?? null)
       : null;
 
-  const visibleRows = rows.filter((row) => {
-    const query = filter.trim().toLowerCase();
-    if (query === "") return true;
-    return (
-      row.full_name.toLowerCase().includes(query) ||
-      row.document.toLowerCase().includes(query) ||
-      (row.position ?? "").toLowerCase().includes(query)
-    );
-  });
+  const visibleRows = rows.filter(
+    (row) =>
+      matchesActiveStatus(row.is_active, status) &&
+      matchesQuery(filter, [row.full_name, row.document, row.position]),
+  );
 
   const userById = new Map(users.map((user) => [user.id, user]));
 
@@ -249,15 +252,25 @@ export function EmployeesSection({
             Nuevo empleado
           </button>
         </div>
-        <label className={`${labelClass} mt-3 max-w-md`}>
-          Buscar
-          <input
-            value={filter}
-            onChange={(event) => setFilter(event.target.value)}
-            placeholder="Nombre, documento o cargo"
-            className={inputClass}
+        {rows.length > 0 ? (
+          <ListToolbar
+            className="mt-3"
+            aria-label="Filtrar empleados"
+            searchId="admin-employees-search"
+            searchLabel="Buscar"
+            searchValue={filter}
+            searchPlaceholder="Nombre, documento o cargo"
+            onSearchChange={setFilter}
+            statusLabel="Estado"
+            statusValue={status}
+            statusOptions={ACTIVE_STATUS_OPTIONS}
+            onStatusChange={(value) => setStatus(value as ActiveStatusFilter)}
+            onClear={() => {
+              setFilter("");
+              setStatus("all");
+            }}
           />
-        </label>
+        ) : null}
         {visibleRows.length === 0 ? (
           <EmptyState className="mt-2">
             {rows.length === 0 ? "Aún no hay empleados en la instalación." : "Sin resultados para ese filtro."}
@@ -570,7 +583,7 @@ export function EmployeesSection({
                   checked={createLogin}
                   onChange={(event) => setCreateLogin(event.target.checked)}
                 />
-                Crear usuario de acceso (usa nombre, documento, correo y teléfono de arriba)
+                Crear usuario de acceso con estos datos
               </label>
               {createLogin && (
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -622,16 +635,15 @@ export function EmployeesSection({
               </select>
             </label>
             <label className={labelClass}>
-              Salario fijo mensual (fijo/mixto)
-              <input
+              Salario fijo mensual
+              <MoneyField
                 value={formatMoneyInput(form.salary_fixed)}
                 onChange={(event) => setForm({ ...form, salary_fixed: stripMoneyInput(event.target.value) })}
                 placeholder="1400000"
                 inputMode="numeric"
-                className={inputClass}
               />
               <span className="text-xs text-text-tertiary">
-                Es el sueldo por MES: la nómina paga la parte que corresponde a los días del período.
+                Valor mensual; la nómina paga la parte del período.
               </span>
             </label>
             <label className={labelClass}>
@@ -648,13 +660,12 @@ export function EmployeesSection({
                 ))}
               </select>
               <span className="text-xs text-text-tertiary">
-                Cómo se paga el salario fijo mensual: semanal, un cuarto (mensual / 4);
-                quincenal, la mitad (mensual / 2); mensual, el mes completo. «Sin definir»
-                conserva el cálculo de hoy: el fijo se prorratea por los días del período.
+                Semanal paga mensual / 4; quincenal, mensual / 2; mensual, el mes completo.
+                «Sin definir» conserva el cálculo de hoy (prorrateo por días).
               </span>
             </label>
             <label className={labelClass}>
-              Comisión % (porcentaje/mixto, 0–100)
+              Comisión % (0–100)
               <input
                 value={form.commission_percent}
                 onChange={(event) => setForm({ ...form, commission_percent: stripPercentageInput(event.target.value) })}

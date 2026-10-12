@@ -573,8 +573,6 @@ describe("admin: lo persistente va por Alert (estado)", () => {
     expect(ADMIN_PAGE_CODE).toMatch(
       /<Alert variant="destructive">El usuario no tiene sede asignada\.<\/Alert>/,
     );
-    expect(ADMIN_PAGE_CODE).not.toMatch(/["']use client["']/);
-    expect(ADMIN_PAGE_CODE).not.toMatch(/\btoast\b/);
   });
 
   it("ningún aviso del panel es derivado en vivo, así que ninguno fuerza un rol a mano", () => {

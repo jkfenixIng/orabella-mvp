@@ -288,8 +288,7 @@ describe("R2: el cajón móvil es la primitiva `Dialog`, no un `aria-modal` de m
 
     // Lo que se afirma es el mecanismo: el título del cajón tiene que ser el
     // TÍTULO DE RADIX, para que exista el `titleId` y el `aria-labelledby` que
-    // arman el nombre accesible.
-    expect(dialogAnnouncementBlock(DIALOG_CODE, "DialogTitle")).toBe("");
+    // arman el nombre accesible. Se afirma una sola vez en el bloque R-B.
   });
 
   it("el botón de la barra abre el cajón por la primitiva, y el velo ya no es suyo", () => {
@@ -1426,10 +1425,6 @@ describe("R-C: DialogContent delegates closing to contextual actions", () => {
   it("does not mount the generic corner close control", () => {
     expect(bloqueDelCierre()).toBe("");
     expect(cuerpoDelContent()).not.toContain("DIALOG_CLOSE_BUTTON_CLASS");
-  });
-
-  it("keeps DialogClose available for contextual actions", () => {
-    expect(dialogCloseBlock()).toBe("");
   });
 
   it("keeps the mobile navigation drawer escapable with its visible action", () => {

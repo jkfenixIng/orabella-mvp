@@ -12,6 +12,7 @@ import {
   splitPaymentAction,
 } from "@/src/features/billing/actions";
 import { getOpenShiftAction } from "@/src/features/cash/actions";
+import { moneyEquals } from "@/src/features/billing/schemas";
 import {
   getPendingCommissionsAction,
   payCommissionNowAction,
@@ -370,7 +371,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
   // operador tiene que ver antes de confirmar; la confirmación reenvía el mismo
   // ajuste con `confirmar_bajo_cobrado`.
   const [bajoCobradoNotice, setBajoCobradoNotice] = useState<string | null>(null);
-  const [splitDraft, setSplitDraft] = useState<PortionDraft>({ method_code: "efectivo", amount: "" });
+  const [splitDrafts, setSplitDrafts] = useState<PortionDraft[]>([{ method_code: "efectivo", amount: "" }]);
   // Pago inmediato de comisión(es) al dejar la factura Pagada.
   const [commissionOpen, setCommissionOpen] = useState(false);
   const [commissionRows, setCommissionRows] = useState<CommissionPayRow[]>([]);
@@ -608,7 +609,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
       return;
     }
     setDetail(result.data);
-    setSplitDraft({ method_code: "efectivo", amount: "" });
+    setSplitDrafts([{ method_code: "efectivo", amount: "" }]);
     setPaymentDialogOpen(true);
   }
 
@@ -627,7 +628,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
   function closeDetail() {
     setDetail(null);
     setMotivo("");
-    setSplitDraft({ method_code: "efectivo", amount: "" });
+    setSplitDrafts([{ method_code: "efectivo", amount: "" }]);
     // CL-2: cerrar el desglose abandona cualquier cobro a medias; el próximo
     // cobro es otro intento y acuña su propia marca.
     payKeyRef.current = null;
@@ -1057,6 +1058,15 @@ export function InvoicesClient(props: InvoicesClientProps) {
     await applyFilters(undefined, invoicePage);
   }
 
+  function parsedSplitPaymentPortions(): Array<{ method_code: string; amount: number }> | null {
+    const parsed = splitDrafts.map((portion) => ({
+      method_code: portion.method_code,
+      amount: toNumber(portion.amount),
+    }));
+    if (parsed.some((portion) => portion.amount == null || portion.amount <= 0)) return null;
+    return parsed as Array<{ method_code: string; amount: number }>;
+  }
+
   function submitSplit(event: FormEvent) {
     event.preventDefault();
     if (!detail) return;
@@ -1064,9 +1074,12 @@ export function InvoicesClient(props: InvoicesClientProps) {
       setPayError(shiftBlockReason);
       return;
     }
-    const amount = toNumber(splitDraft.amount);
-    if (amount == null || amount <= 0) {
+    if (parsedSplitPaymentPortions() === null) {
       setPayError("Indique un monto válido.");
+      return;
+    }
+    if (!canSubmitSplit) {
+      setPayError("Las porciones deben cubrir exactamente el saldo pendiente.");
       return;
     }
     setPayError(null);
@@ -1076,9 +1089,9 @@ export function InvoicesClient(props: InvoicesClientProps) {
 
   async function confirmPay() {
     if (!detail || busy) return;
-    const amount = toNumber(splitDraft.amount);
-    if (amount == null || amount <= 0) {
-      setConfirmError("Indique un monto válido.");
+    const parsedSplitPortions = parsedSplitPaymentPortions();
+    if (parsedSplitPortions === null || !canSubmitSplit) {
+      setConfirmError("Las porciones deben ser mayores a 0 y cubrir exactamente el saldo pendiente.");
       return;
     }
     setConfirmError(null);
@@ -1092,7 +1105,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
     try {
       result = await splitPaymentAction(detail.invoice.id, {
         idempotency_key: payKey,
-        portions: [{ method_code: splitDraft.method_code, amount }],
+        portions: parsedSplitPortions,
       });
     } catch (thrown) {
       result = { success: false, code: "NETWORK", message: thrown instanceof Error ? thrown.message : "No se pudo registrar el pago." };
@@ -1115,7 +1128,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
         : `Porción registrada. Saldo: ${formatMoney(result.data.remaining)}.`,
     );
     setDetail(result.data);
-    setSplitDraft({ method_code: "efectivo", amount: "" });
+    setSplitDrafts([{ method_code: "efectivo", amount: "" }]);
     setConfirmKind(null);
     setPaymentDialogOpen(false);
     await applyFilters(undefined, invoicePage);
@@ -1332,16 +1345,27 @@ export function InvoicesClient(props: InvoicesClientProps) {
     setPortions((prev) => prev.map((row, i) => (i === firstEmpty ? { ...row, amount: value } : row)));
   }
 
-  // Totalizar pago (detalle): el monto del cobro es NETO, igual que las
-  // porciones de la emisión; el recargo de tarjeta lo suma el servidor al
-  // total, no al monto. Fuente: el saldo NETO pendiente que ya trae el detalle.
-  const splitRemaining = detail ? Math.max(0, Number(detail.remaining)) : 0;
-  const canTotalizeSplit = splitRemaining > 0;
+  // Totalizar pago (detalle): las porciones son NETAS; el recargo lo suma el
+  // servidor. El servicio exige que su suma cubra exactamente el saldo neto.
+  const splitFilled = splitDrafts.reduce((sum, portion) => sum + (toNumber(portion.amount) ?? 0), 0);
+  const splitDifference = detail ? Number(detail.remaining) - splitFilled : 0;
+  const splitRemaining = Math.max(0, splitDifference);
+  const canTotalizeSplit = splitRemaining > 0 && splitDrafts.some((portion) => portion.amount.trim() === "");
+  const canSubmitSplit = moneyEquals(splitDifference, 0) && splitDrafts.every((portion) => (toNumber(portion.amount) ?? 0) > 0);
+  const usedSplitMethodCodes = new Set(splitDrafts.map((portion) => portion.method_code));
 
   function totalizeSplitPayment() {
     if (splitRemaining <= 0) return;
+    const firstEmpty = splitDrafts.findIndex((portion) => portion.amount.trim() === "");
+    if (firstEmpty === -1) return;
     const value = copInputDigits(splitRemaining);
-    setSplitDraft((prev) => ({ ...prev, amount: value }));
+    setSplitDrafts((prev) => prev.map((portion, index) => (index === firstEmpty ? { ...portion, amount: value } : portion)));
+  }
+
+  function addSplitPaymentPortion() {
+    const method_code = props.methods.find((method) => method.is_active !== false && !usedSplitMethodCodes.has(method.code))?.code;
+    if (!method_code) return;
+    setSplitDrafts((prev) => [...prev, { method_code, amount: "" }]);
   }
 
   // Métodos ya usados en otras porciones: cada método se cobra una sola vez.
@@ -1869,13 +1893,13 @@ export function InvoicesClient(props: InvoicesClientProps) {
         </CardHeader>
         <CardContent>
           <form onSubmit={applyFilters} className="space-y-3">
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(9rem,1fr)_minmax(9rem,1fr)_auto_auto]">
+            <div className="grid items-end gap-3 sm:grid-cols-2 lg:grid-cols-[minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(9rem,1fr)_minmax(9rem,1fr)_auto_auto]">
               <Label>N.º de factura<Input className={inputClass} value={filters.number} onChange={(event) => setFilters({ ...filters, number: stripQuantityInput(event.target.value) })} placeholder="Ej. 123" inputMode="numeric" /></Label>
               <Label>Estado<Select value={filters.status} onValueChange={(status) => setFilters({ ...filters, status })}><SelectTrigger className={inputClass}><SelectValue placeholder="Todas" /></SelectTrigger><SelectContent><SelectItem value="">Todas</SelectItem><SelectItem value="Emitida">Emitida</SelectItem><SelectItem value="Pagada">Pagada</SelectItem><SelectItem value="Anulada">Anulada</SelectItem></SelectContent></Select></Label>
               <Label>Desde<Input type="date" className={inputClass} value={filters.from} onChange={(event) => setFilters({ ...filters, from: event.target.value })} /></Label>
               <Label>Hasta<Input type="date" className={inputClass} value={filters.to} onChange={(event) => setFilters({ ...filters, to: event.target.value })} /></Label>
-              <Button type="submit" loading={isViewPending}><Search className="h-4 w-4" aria-hidden="true" />{isViewPending ? "Filtrando…" : "Filtrar"}</Button>
-              <Button type="button" variant="outline" onClick={() => { const reset = { status: "", from: "", to: "", seller: "", number: "", closedBy: "", employee: "" }; setFilters(reset); startViewTransition(async () => { const result = await listInvoicesAction({ page: 1 }); if (result.success) { setInvoices(result.data.rows); setTotalInvoices(result.data.total); setInvoicePage(1); } else setPageError(result.message); }); }}>Limpiar</Button>
+              <Button type="submit" loading={isViewPending} className="max-sm:w-full"><Search className="h-4 w-4" aria-hidden="true" />{isViewPending ? "Filtrando…" : "Filtrar"}</Button>
+              <Button type="button" variant="outline" className="max-sm:w-full" onClick={() => { const reset = { status: "", from: "", to: "", seller: "", number: "", closedBy: "", employee: "" }; setFilters(reset); startViewTransition(async () => { const result = await listInvoicesAction({ page: 1 }); if (result.success) { setInvoices(result.data.rows); setTotalInvoices(result.data.total); setInvoicePage(1); } else setPageError(result.message); }); }}>Limpiar</Button>
             </div>
             <div><Button type="button" variant="outline" size="sm" aria-expanded={moreFiltersOpen} onClick={() => setMoreFiltersOpen((open) => !open)}>Más filtros{activeMoreFilterCount > 0 && <Badge variant="default">{activeMoreFilterCount}</Badge>}</Button></div>
             {moreFiltersOpen && <div className="grid gap-3 rounded-lg border border-border-color p-3 sm:grid-cols-3 dark:border-border-color-2">
@@ -1945,7 +1969,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                   </span>
                 </span>
                 <span className="flex flex-wrap items-center gap-1 sm:contents">
-                  <span className="flex items-center gap-1 sm:col-start-9 sm:row-start-1 sm:justify-center">
+                  <span className="invoice-row-actions flex min-w-0 flex-wrap items-center gap-1 sm:col-start-9 sm:row-start-1 sm:justify-center">
                     <span className="font-sans font-medium text-text-secondary sm:hidden">Acciones: </span>
                   {row.status !== "Anulada" &&
                     (props.isAdmin ||
@@ -3073,33 +3097,48 @@ export function InvoicesClient(props: InvoicesClientProps) {
           </DialogHeader>
           {detail && (
             <form onSubmit={submitSplit} className="space-y-5">
-              <dl className="grid gap-3 rounded-lg border border-border-color bg-surface-hover p-4 text-sm sm:grid-cols-3 dark:border-border-color-2">
-                <div><dt className="text-text-secondary">Total factura</dt><dd className="font-semibold">{formatMoney(detail.invoice.total)}</dd></div>
-                <div><dt className="text-text-secondary">Pagado</dt><dd className="font-semibold">{formatMoney(detail.paid)}</dd></div>
-                <div><dt className="text-text-secondary">Saldo pendiente</dt><dd className="text-lg font-bold text-primary-600 dark:text-primary-400">{formatMoney(detail.remaining)}</dd></div>
-              </dl>
-              <fieldset className="space-y-2">
-                <legend className="text-sm font-medium text-text-primary">Método de pago</legend>
-                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                  {props.methods.map((method) => (
-                    <button key={method.id} type="button" aria-pressed={splitDraft.method_code === method.code} onClick={() => setSplitDraft({ ...splitDraft, method_code: method.code })} className={cn("h-11 rounded-md border px-3 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600", splitDraft.method_code === method.code ? "border-primary-600 bg-primary-600 text-white" : "border-border-color hover:bg-surface-hover dark:border-border-color-2")}>
-                      {method.name}{method.fee_percent > 0 ? ` (+${method.fee_percent}%)` : ""}
-                    </button>
-                  ))}
+              <section className="rounded-lg border border-paper-line bg-paper-surface-soft p-4 text-paper-ink">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div><p className="text-sm text-paper-ink-muted">Factura #{detail.invoice.consecutive_number}</p><p className="font-semibold">{detail.invoice.client_name}</p></div>
+                  <span className="text-sm font-medium text-paper-ink-muted">{detail.invoice.status}</span>
                 </div>
+                <ul className="mt-4 divide-y divide-paper-line text-sm">
+                  {detail.items.map((item) => <li key={item.id} className="flex justify-between gap-3 py-2"><span>{detailItemName(item)} · Cantidad {item.qty}</span><span className="font-medium">{formatMoney(item.subtotal)}</span></li>)}
+                </ul>
+                <dl className="mt-4 space-y-2 border-t border-paper-line pt-3 text-sm">
+                  <div className="flex justify-between gap-3"><dt>Total factura</dt><dd className="font-semibold">{formatMoney(detail.invoice.total)}</dd></div>
+                  <div className="flex justify-between gap-3"><dt>Pagado</dt><dd>{formatMoney(detail.paid)}</dd></div>
+                  <div className="flex justify-between gap-3 text-base font-bold"><dt>Saldo pendiente</dt><dd>{formatMoney(detail.remaining)}</dd></div>
+                </dl>
+              </section>
+              <fieldset className="space-y-3">
+                <legend className="text-sm font-medium text-text-primary">Porciones de pago</legend>
+                {splitDrafts.map((portion, portionIndex) => (
+                  <div key={portionIndex} className="flex flex-col gap-2 rounded-lg border border-border-color p-3 sm:flex-row sm:items-end dark:border-border-color-2">
+                    <Label className="flex-1">Método
+                      <Select value={portion.method_code} onValueChange={(method_code) => setSplitDrafts((prev) => prev.map((row, index) => index === portionIndex ? { ...row, method_code } : row))}>
+                        <SelectTrigger className={inputClass}><SelectValue placeholder="Método de pago" /></SelectTrigger>
+                        <SelectContent>{props.methods.filter((method) => method.is_active !== false && (method.code === portion.method_code || !usedSplitMethodCodes.has(method.code))).map((method) => <SelectItem key={method.id} value={method.code}>{method.name}{method.fee_percent > 0 ? ` (+${method.fee_percent}%)` : ""}</SelectItem>)}</SelectContent>
+                      </Select>
+                    </Label>
+                    <Label className="flex-1">Monto
+                      <Input className={inputClass} value={formatMoneyInput(portion.amount)} onChange={(event) => setSplitDrafts((prev) => prev.map((row, index) => index === portionIndex ? { ...row, amount: stripMoneyInput(event.target.value) } : row))} inputMode="numeric" placeholder="0" />
+                    </Label>
+                    {splitDrafts.length > 1 && <Button type="button" variant="outline" onClick={() => setSplitDrafts((prev) => prev.filter((_, index) => index !== portionIndex))}>Quitar</Button>}
+                  </div>
+                ))}
               </fieldset>
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
-                <Label className="flex-1">Monto
-                  <Input className={inputClass} value={formatMoneyInput(splitDraft.amount)} onChange={(event) => setSplitDraft({ ...splitDraft, amount: stripMoneyInput(event.target.value) })} inputMode="numeric" placeholder="0" />
-                </Label>
-                <button type="button" disabled={!canTotalizeSplit || busy} title={canTotalizeSplit ? "Rellena el monto con el saldo neto pendiente" : "Nada por rellenar"} onClick={totalizeSplitPayment} className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-text-primary hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50">
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <button type="button" disabled={!canTotalizeSplit || busy} title={canTotalizeSplit ? "Rellena el monto con el saldo neto pendiente" : "Nada por rellenar"} onClick={totalizeSplitPayment} className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-paper-line-strong px-4 text-sm font-medium text-text-primary hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50 max-sm:min-h-11">
                   <Banknote className="h-4 w-4" aria-hidden="true" /> Totalizar pago
                 </button>
+                <Button type="button" variant="outline" disabled={usedSplitMethodCodes.size >= props.methods.filter((method) => method.is_active !== false).length} onClick={addSplitPaymentPortion}>Agregar porción</Button>
+                <p className="self-center text-sm text-text-secondary">Restante: <strong>{formatMoney(splitRemaining)}</strong></p>
               </div>
               {payError && <Alert variant="destructive">{payError}</Alert>}
-              <div className="flex flex-wrap justify-end gap-3 border-t border-border-color pt-4 dark:border-border-color-2">
+              <div className="flex flex-col-reverse gap-3 border-t border-border-color pt-4 sm:flex-row sm:justify-end dark:border-border-color-2">
                 <Button type="button" variant="outline" onClick={() => setPaymentDialogOpen(false)}>Cancelar</Button>
-                <Button type="submit" size="lg" disabled={busy}><CreditCard className="h-4 w-4" aria-hidden="true" />{busy ? "Pagando…" : "Pagar"}</Button>
+                <Button type="submit" size="lg" disabled={busy || !canSubmitSplit}><CreditCard className="h-4 w-4" aria-hidden="true" />{busy ? "Pagando…" : "Pagar"}</Button>
               </div>
             </form>
           )}
@@ -3109,7 +3148,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
       <Dialog open={annulDialogOpen} onOpenChange={(open) => { if (!open && !busy) setAnnulDialogOpen(false); }}>
         <DialogContent className="max-w-lg">
           <DialogHeader><DialogTitle>Anular factura</DialogTitle><DialogDescription>Indique el motivo antes de confirmar la anulación.</DialogDescription></DialogHeader>
-          <form onSubmit={submitAnnul} className="space-y-4"><Label>Motivo<input className={inputClass} value={motivo} onChange={(event) => setMotivo(event.target.value)} placeholder="Motivo de anulación" /></Label>{annulError && <Alert variant="destructive">{annulError}</Alert>}<div className="flex justify-end"><Button type="submit" variant="destructive" disabled={busy}>Continuar</Button></div></form>
+          <form onSubmit={submitAnnul} className="flex flex-col gap-5"><Label>Motivo<textarea className={cn(inputClass, "min-h-24 resize-y")} value={motivo} onChange={(event) => setMotivo(event.target.value)} placeholder="Motivo de anulación" /></Label>{annulError && <Alert variant="destructive">{annulError}</Alert>}<div className="flex flex-col-reverse gap-3 border-t border-border-color pt-4 sm:flex-row sm:justify-end"><Button type="button" variant="outline" onClick={() => setAnnulDialogOpen(false)}>Cancelar</Button><Button type="submit" variant="destructive" disabled={busy}>Continuar</Button></div></form>
         </DialogContent>
       </Dialog>
       {/* Pago inmediato de comisión(es): aparece al dejar la factura Pagada si hay
@@ -3252,7 +3291,7 @@ export function InvoicesClient(props: InvoicesClientProps) {
                 ) : confirmKind === "annul"
                   ? `Se anulará la factura${detail ? ` #${detail.invoice.consecutive_number}` : ""} y se revertirá el stock. No se puede deshacer.`
                   : confirmKind === "pay"
-                    ? `Se registrará un pago de ${formatMoney(toNumber(splitDraft.amount) ?? 0)} (${splitDraft.method_code})${detail ? ` en la factura #${detail.invoice.consecutive_number}` : ""}.`
+                    ? `Se registrará un pago de ${formatMoney(splitFilled)} en ${splitDrafts.length} porción(es)${detail ? ` en la factura #${detail.invoice.consecutive_number}` : ""}.`
                     : hasImmediatePayment
                       ? `Se emitirá y cobrará la factura por ${formatMoney(draftGrandTotal)}.`
                       : `Se emitirá la factura por ${formatMoney(draftGrandTotal)}. No se podrá eliminar.`}

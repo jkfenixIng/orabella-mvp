@@ -1765,31 +1765,13 @@ describe("admin: los campos numéricos de las secciones pasan por su máscara (g
     );
   });
 
-  it("el tope semanal de vales usa la máscara de dinero", () => {
-    assertMasked(
-      onChangeBlock(vales, 'placeholder="500000"'),
-      "Money",
-      "setMaxWeek(event.target.value)",
-    );
-    expect(vales).toContain("value={formatMoneyInput(maxWeek)}");
-  });
-
-  it("el tope diario de vales usa la máscara de dinero", () => {
-    assertMasked(
-      onChangeBlock(vales, 'placeholder="200000"', 0),
-      "Money",
-      "setMaxDay(event.target.value)",
-    );
-    expect(vales).toContain("value={formatMoneyInput(maxDay)}");
-  });
-
-  it("el tope propio por día usa la máscara de dinero", () => {
-    assertMasked(
-      onChangeBlock(vales, 'placeholder="200000"', 1),
-      "Money",
-      "[day]: event.target.value",
-    );
-    expect(vales).toContain('value={formatMoneyInput(perDayValues[day] ?? "")}');
+  it.each([
+    ["semanal", 'placeholder="500000"', 0, "setMaxWeek(event.target.value)", "value={formatMoneyInput(maxWeek)}"],
+    ["diario", 'placeholder="200000"', 0, "setMaxDay(event.target.value)", "value={formatMoneyInput(maxDay)}"],
+    ["propio por día", 'placeholder="200000"', 1, "[day]: event.target.value", 'value={formatMoneyInput(perDayValues[day] ?? "")}'],
+  ])("el tope %s de vales usa la máscara de dinero", (_kind, anchor, occurrence, raw, value) => {
+    assertMasked(onChangeBlock(vales, anchor, occurrence), "Money", raw);
+    expect(vales).toContain(value);
   });
 
   it("el detector no es un sello de goma (control negativo)", () => {
@@ -1801,6 +1783,27 @@ describe("admin: los campos numéricos de las secciones pasan por su máscara (g
     expect(block).toContain("setNewValue(event.target.value)");
     // Sin el ancla no hay bloque: la guarda falla en vez de pasar sola.
     expect(onChangeBlock(fake, "no-existe:")).toBe("");
+  });
+});
+
+describe("admin: client list filters and money field", () => {
+  it("filters by status and visible text, case-insensitively; blank matches all", async () => {
+    const { matchesActiveStatus, matchesQuery } = await import("../app/admin/admin-shared");
+    expect([true, false].filter((active) => matchesActiveStatus(active, "all"))).toEqual([true, false]);
+    expect([true, false].filter((active) => matchesActiveStatus(active, "inactive"))).toEqual([false]);
+    expect(matchesQuery("  ", [null])).toBe(true);
+    expect(matchesQuery("ESTI", ["Ana", null, "Estilista"])).toBe(true);
+    expect(matchesQuery("caja", ["Ana", "123"])).toBe(false);
+  });
+
+  it("MoneyField adds a decorative $ and forwards the digit-only value untouched", async () => {
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const { createElement } = await import("react");
+    const { MoneyField } = await import("../app/admin/admin-styles");
+    const html = renderToStaticMarkup(createElement(MoneyField, { value: "1.400.000", readOnly: true, inputMode: "numeric" }));
+    expect(html).toMatch(/<span aria-hidden="true"[^>]*>\$<\/span>/);
+    expect(html).toContain('value="1.400.000"');
+    expect(html).toContain('inputMode="numeric"');
   });
 });
 

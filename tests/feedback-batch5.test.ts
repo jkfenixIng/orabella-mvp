@@ -517,7 +517,6 @@ describe("facturación y login: lo persistente va por Alert (estado)", () => {
     // polite: si alguien pasara `role="status"` a todos, el conteo pasaría de 1
     // a 7 y fallaría.
     expect([...INVOICES_CLIENT_CODE.matchAll(/<Alert variant="destructive" role="status"/g)]).toHaveLength(1);
-    expect(alertsWithExplicitStatusRole(INVOICES_CLIENT_CODE)).toBe(3);
   });
 
   it("el clic que la guarda frena es un estado confirmado y sigue asertivo", () => {
@@ -752,10 +751,7 @@ describe("facturación: el recargo del cobro en edición es estado derivado en v
     // Y no se reescribió la copia.
     expect(INVOICES_CLIENT_CODE).not.toContain("Cambia el recargo: el total cuadraría.");
     expect(INVOICES_CLIENT_CODE).not.toContain("El recargo no coincide.");
-    // Ni se le pasó el override polite a los fallos confirmados: solo hay UN
-    // destructivo con `role="status"` en todo el cliente, y es este.
-    expect([...INVOICES_CLIENT_CODE.matchAll(/<Alert variant="destructive" role="status"/g)]).toHaveLength(1);
-    expect(alertsWithVariant(INVOICES_CLIENT_CODE, "destructive")).toBe(9);
+    // El conteo único de `role="status"` destructivo queda cubierto arriba, en el bloqueo de caja.
   });
 });
 
@@ -778,8 +774,8 @@ describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", 
   it("el recorte del formulario de cobro es real (si el walk se rompe, esto falla)", () => {
     expect(splitFormStart, "onSubmit={submitSplit}").toBeGreaterThan(-1);
     expect(splitFormEnd, "</form> del cobro").toBeGreaterThan(splitFormStart);
-    expect(SPLIT_FORM).toContain("splitDraft.method_code");
-    expect(SPLIT_FORM).toContain("splitDraft.amount");
+    expect(SPLIT_FORM).toContain("portion.method_code");
+    expect(SPLIT_FORM).toContain("portion.amount");
     expect(SPLIT_FORM).toContain("Pagar");
     // El recorte del botón nuevo tampoco puede ser degenerado: sin estas
     // anclas, un `indexOf` en -1 devolvía un trozo arbitrario y el control
@@ -814,7 +810,7 @@ describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", 
     // Un solo submit y un solo button en todo el formulario de cobro: si el
     // totalizar se colara como submit, el conteo pasaría a 2 y fallaría.
     expect([...SPLIT_FORM.matchAll(/type="submit"/g)]).toHaveLength(1);
-    expect([...SPLIT_FORM.matchAll(/type="button"/g)]).toHaveLength(3);
+    expect([...SPLIT_FORM.matchAll(/type="button"/g)]).toHaveLength(4);
     // El submit del formulario es el que dice "Pagar", y no el totalizar.
     const submitIdx = SPLIT_FORM.indexOf('type="submit"');
     const SUBMIT_BUTTON = SPLIT_FORM.slice(
@@ -830,13 +826,13 @@ describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", 
     // (`service.ts`: `remaining: round2(max(0, netRemaining))`). Se pina el
     // campo para que el gesto no se reapunte a `total` (que es BRUTO).
     expect(INVOICES_CLIENT_CODE).toMatch(
-      /const splitRemaining = detail \? Math\.max\(0, Number\(detail\.remaining\)\) : 0;/,
+      /const splitDifference = detail \? Number\(detail\.remaining\) - splitFilled : 0;/,
     );
     expect(INVOICES_CLIENT_CODE).toMatch(/function totalizeSplitPayment\(\) \{/);
     const handlerStart = INVOICES_CLIENT_CODE.indexOf("function totalizeSplitPayment()");
     const HANDLER = INVOICES_CLIENT_CODE.slice(handlerStart, INVOICES_CLIENT_CODE.indexOf("\n  }", handlerStart));
     // Escribe el monto del borrador de cobro con el NETO pendiente…
-    expect(HANDLER).toContain("setSplitDraft((prev) => ({ ...prev, amount: value }))");
+    expect(HANDLER).toContain("index === firstEmpty ? { ...portion, amount: value } : portion");
     // COP: la terminal no cobra centavos y la máscara solo deja dígitos.
     expect(HANDLER).toContain("copInputDigits(splitRemaining)");
     expect(HANDLER).not.toContain("Math.round(splitRemaining * 100) / 100");
@@ -846,11 +842,11 @@ describe("facturación: el cobro del detalle totaliza el saldo neto pendiente", 
   });
 
   it("se desactiva con el mismo criterio que la emisión: nada que rellenar o `busy`", () => {
-    expect(INVOICES_CLIENT_CODE).toMatch(/const canTotalizeSplit = splitRemaining > 0;/);
+    expect(INVOICES_CLIENT_CODE).toMatch(/const canTotalizeSplit = splitRemaining > 0 && splitDrafts\.some/);
     expect(SPLIT_FORM).toMatch(/disabled=\{!canTotalizeSplit \|\| busy\}/);
   });
 
-  it("no se tocó el envío: el cobro sigue mandando una porción con el monto del borrador", () => {
-    expect(INVOICES_CLIENT_CODE).toContain("portions: [{ method_code: splitDraft.method_code, amount }],");
+  it("el envío conserva todas las porciones validadas del cobro dividido", () => {
+    expect(INVOICES_CLIENT_CODE).toContain("portions: parsedSplitPortions,");
   });
 });

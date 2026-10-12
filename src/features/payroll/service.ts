@@ -1107,11 +1107,18 @@ export interface PayrollSettlementVoucher {
  * leen con la MISMA forma que el cálculo (sede + `request_date` en el rango +
  * el alcance de estados que descuenta), acotados por empleado.
  */
-export interface PayrollSettlementSources {
-  invoices: PayrollSettlementInvoice[];
-  adjustment: PayrollSettlementAdjustment | null;
-  vouchers: PayrollSettlementVoucher[];
-}
+export type PayrollSettlementSourceKind = "invoices" | "vouchers";
+
+export type PayrollSettlementSources =
+  | {
+      kind: "invoices";
+      invoices: PayrollSettlementInvoice[];
+      adjustment: PayrollSettlementAdjustment | null;
+    }
+  | {
+      kind: "vouchers";
+      vouchers: PayrollSettlementVoucher[];
+    };
 
 /**
  * F6: agrupa el `detail_json` de UN ítem por factura y separa el ajuste del
@@ -1176,10 +1183,14 @@ export function groupSettlementInvoices(detail: readonly DetailLine[]): {
  *
  * Las dos lecturas son exhaustivas (`readAllPayroll`): una lectura recortada
  * mostraría menos facturas o menos vales que los que la liquidación tiene.
+ *
+ * `kind` elige UNA fuente: la pantalla carga facturas y vales por separado, a
+ * pedido, y una lectura nunca trae la otra.
  */
 export async function getPayrollSettlementSources(
   periodId: string,
   employeeId: string,
+  kind: PayrollSettlementSourceKind,
 ): Promise<PayrollSettlementSources> {
   try {
     const db = await payrollDb();
@@ -1191,10 +1202,11 @@ export async function getPayrollSettlementSources(
       table: "payroll_items",
       fetchPage: (from, to) => db.employeeItemDetailPage(periodId, employeeId, from, to),
     });
-    if (items.length === 0) {
-      return { invoices: [], adjustment: null, vouchers: [] };
+    if (kind === "invoices") {
+      const grouped = groupSettlementInvoices(items[0]?.detail_json ?? []);
+      return { kind, invoices: grouped.invoices, adjustment: grouped.adjustment };
     }
-    const grouped = groupSettlementInvoices(items[0].detail_json ?? []);
+    if (items.length === 0) return { kind, vouchers: [] };
     // Misma forma que el cálculo (`voucherStatusesForScope("vigentes_y_descontados")`:
     // pendiente/aprobada/descontada): un vale ya descontado por este período
     // sigue siendo parte de la liquidación y tiene que verse.
@@ -1219,8 +1231,7 @@ export async function getPayrollSettlementSources(
         ),
     });
     return {
-      invoices: grouped.invoices,
-      adjustment: grouped.adjustment,
+      kind,
       vouchers: voucherRows.map((row) => ({
         id: row.id,
         request_date: row.request_date,

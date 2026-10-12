@@ -21,7 +21,7 @@ export interface ListToolbarProps extends Omit<React.FormHTMLAttributes<HTMLForm
   statusValue: string;
   statusOptions: ListToolbarOption[];
   onStatusChange: (value: string) => void;
-  onFilter: () => void;
+  onFilter?: () => void;
   onClear: () => void;
   secondaryFilters?: React.ReactNode;
   activeFilterCount?: number;
@@ -51,7 +51,7 @@ export function ListToolbar({
       className={cn("flex flex-col gap-3 rounded-lg border border-border-color bg-surface p-4 dark:border-border-color-2", className)}
       onSubmit={(event) => {
         event.preventDefault();
-        onFilter();
+        onFilter?.();
       }}
       {...props}
     >
@@ -66,7 +66,7 @@ export function ListToolbar({
             placeholder={searchPlaceholder}
           />
         </label>
-        <label className="flex min-w-0 flex-col gap-1 text-sm text-text-primary">
+        <label className="flex min-w-0 flex-col gap-1 text-sm text-text-primary sm:min-w-40">
           {statusLabel}
           <select
             className="h-10 rounded-md border border-border-color bg-surface px-3 text-sm text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-600 focus-visible:ring-offset-2 dark:border-border-color-2"
@@ -76,8 +76,9 @@ export function ListToolbar({
             {statusOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
           </select>
         </label>
-        <div className="flex flex-wrap gap-2">
-          <Button type="submit">Filtrar</Button>
+        {/* Below `sm` every action takes the full row width, so nothing overlaps. */}
+        <div className="flex flex-wrap gap-2 [&>*]:flex-1 sm:[&>*]:flex-none">
+          {onFilter ? <Button type="submit">Filtrar</Button> : null}
           <Button type="button" variant="outline" onClick={onClear}>Limpiar</Button>
           {secondaryFilters ? (
             <Button type="button" variant="ghost" onClick={() => setMoreOpen((open) => !open)} aria-expanded={moreOpen}>
