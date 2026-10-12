@@ -1120,6 +1120,12 @@ export type PayrollSettlementSources =
       vouchers: PayrollSettlementVoucher[];
     };
 
+/** Conteos de fuentes de una liquidación; no expone sus detalles. */
+export interface PayrollSettlementSourceCounts {
+  invoices: number;
+  vouchers: number;
+}
+
 /**
  * F6: agrupa el `detail_json` de UN ítem por factura y separa el ajuste del
  * mixto.
@@ -1239,6 +1245,48 @@ export async function getPayrollSettlementSources(
         status: row.status,
       })),
     };
+  } catch (error) {
+    throw toPayrollError(error);
+  }
+}
+
+/**
+ * Conteo liviano de las dos fuentes, para rotular la elección antes de cargar
+ * cualquier detalle. Facturas: del `detail_json` del ítem. Vales: solo ids con el
+ * MISMO alcance que `getPayrollSettlementSources` (sin ítem no hay vales).
+ */
+export async function getPayrollSettlementSourceCounts(
+  periodId: string,
+  employeeId: string,
+): Promise<PayrollSettlementSourceCounts> {
+  try {
+    const db = await payrollDb();
+    const period = await getPeriodOrThrow(db, periodId);
+    const items = await readAllPayroll<{ detail_json: DetailLine[] | null }>({
+      log: "getPayrollSettlementSourceCounts",
+      what: "ítem del empleado en el período",
+      meta: { periodId, employeeId },
+      table: "payroll_items",
+      fetchPage: (from, to) => db.employeeItemDetailPage(periodId, employeeId, from, to),
+    });
+    if (items.length === 0) return { invoices: 0, vouchers: 0 };
+    const invoices = groupSettlementInvoices(items[0]?.detail_json ?? []).invoices.length;
+    const voucherIds = await readAllPayroll<{ id: string }>({
+      log: "getPayrollSettlementSourceCounts",
+      what: "vales del empleado en el período",
+      meta: { periodId, employeeId },
+      table: "voucher_requests",
+      fetchPage: (from, to) =>
+        db.employeeVoucherIdsPage(
+          employeeId,
+          voucherStatusesForScope("vigentes_y_descontados"),
+          period.start_date,
+          period.end_date,
+          from,
+          to,
+        ),
+    });
+    return { invoices, vouchers: voucherIds.length };
   } catch (error) {
     throw toPayrollError(error);
   }
@@ -1486,7 +1534,8 @@ export async function listPayrollMonthOptions(): Promise<string[]> {
 
 export async function listPayrollMonthRows(args: {
   month: string;
-  employeeId: string;
+  /** Opcional: sin empleado devuelve toda la planta del mes (acotada por la planta). */
+  employeeId?: string;
 }): Promise<PayrollMonthEmployeeRow[]> {
   try {
     if (!PAYROLL_MONTH_PATTERN.test(args.month)) {
@@ -1509,7 +1558,7 @@ export async function listPayrollMonthRows(args: {
       readPayrollExtras({ db, month: args.month, employeeId: args.employeeId, log: "listPayrollMonthRows" }),
     ]);
     return buildPayrollMonthToDate({ periods: monthPeriods, items, extras }).filter(
-      (row) => row.month === args.month && row.employeeId === args.employeeId,
+      (row) => row.month === args.month && (args.employeeId === undefined || row.employeeId === args.employeeId),
     );
   } catch (error) {
     throw toPayrollError(error);

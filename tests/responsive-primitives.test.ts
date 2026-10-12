@@ -608,7 +608,7 @@ describe("R7: el diálogoRespira debajo de `sm` y usa la altura dinámica", () =
     expect(DIALOG_CODE).not.toMatch(/\b\d*vh\b/);
   });
 
-  it("los SEIS diálogos `p-0` quedan SIN padding en la clase EFECTIVA", () => {
+  it("los SIETE diálogos `p-0` quedan SIN padding en la clase EFECTIVA", () => {
     // MEDIDO antes del arreglo, en Chromium, a 1024 y a 1440: los diálogos de
     // hoja completa («Emitir factura», «Ver detalle», «Editar factura», «Agregar
     // ítem»)computaban `padding: 24px` en los cuatro lados y la hoja interior
@@ -626,7 +626,7 @@ describe("R7: el diálogoRespira debajo de `sm` y usa la altura dinámica", () =
     expect(
       fullBleed,
       "los <DialogContent> de hoja completa (`p-0`) de facturación",
-    ).toHaveLength(6);
+    ).toHaveLength(7);
 
     for (const [index, caller] of fullBleed.entries()) {
       const etiqueta = `diálogo de hoja completa ${index + 1} (\`${caller}\`)`;

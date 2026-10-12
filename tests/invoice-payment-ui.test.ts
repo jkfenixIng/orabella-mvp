@@ -31,4 +31,23 @@ describe("invoice payment and list layout", () => {
     expect(client).toContain('className="flex flex-col-reverse gap-3 border-t border-border-color pt-4 sm:flex-row sm:justify-end"');
     expect(client).toContain('className="flex flex-col gap-5"');
   });
+
+  it("keeps payment available from an emitted invoice detail and isolates the customer preview", () => {
+    expect(client).toContain('const canPayDetail = props.canWrite && detail?.invoice.status === "Emitida"');
+    expect(client).toContain('Pagar factura');
+    expect(client).toContain('openPaymentFromDetail');
+    expect(client).toContain('setCustomerPreviewOpen(true)');
+    expect(client).toContain('Dialog open={customerPreviewOpen}');
+    expect(client).toContain('Vista para cliente');
+  });
+
+  it("uses tokenized paper surfaces for invoice dialogs and MoneyInput for split amounts", () => {
+    const sheet = client.match(/const paperSheetClass =\s*"([^"]+)"/)?.[1] ?? "";
+    expect(sheet.split(" ")).toEqual(expect.arrayContaining(["bg-paper-surface", "shadow-2xl", "dark:shadow-none", "dark:ring-border-color-2"]));
+    // Create, detail, edit, item, preview, commission and confirm sheets.
+    expect(client.match(/\bpaperSheetClass\)?\}/g)?.length).toBe(7);
+    expect(client).not.toContain("rgba(255,255,255");
+    expect(client).toContain('<MoneyInput className={inputClass}');
+    expect(client).toContain('onValueChange={(amount) => setSplitDrafts');
+  });
 });

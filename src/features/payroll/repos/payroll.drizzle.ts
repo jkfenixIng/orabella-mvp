@@ -443,6 +443,22 @@ export function drizzlePayrollRepo(db: Database): PayrollRepo {
           .orderBy(asc(voucherRequests.id))
           .offset(offset)
           .limit(limit), from, to),
+    employeeVoucherIdsPage: (employeeId, statuses, start, end, from, to) =>
+      page((offset, limit) =>
+        db
+          .select({ id: voucherRequests.id })
+          .from(voucherRequests)
+          .where(
+            and(
+              eq(voucherRequests.employeeId, employeeId),
+              inArray(voucherRequests.status, statuses),
+              gte(voucherRequests.requestDate, start),
+              lte(voucherRequests.requestDate, end),
+            ),
+          )
+          .orderBy(asc(voucherRequests.id))
+          .offset(offset)
+          .limit(limit), from, to),
     discountedVouchers: (start, end) =>
       many(() =>
         db

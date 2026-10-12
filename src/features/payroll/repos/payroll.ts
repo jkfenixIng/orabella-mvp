@@ -56,6 +56,7 @@ export interface PayrollRepo {
   payoutsPage<T>(invoiceIds: string[], from: number, to: number): PayrollPage<T>;
   periodVouchersPage<T>(statuses: string[], start: string, end: string, from: number, to: number): PayrollPage<T>;
   employeeVouchersPage<T>(employeeId: string, statuses: string[], start: string, end: string, from: number, to: number): PayrollPage<T>;
+  employeeVoucherIdsPage<T>(employeeId: string, statuses: string[], start: string, end: string, from: number, to: number): PayrollPage<T>;
   discountedVouchers(start: string, end: string): Promise<PayrollResult<Array<{ id: string; approved_by: string | null }>>>;
   findCorrectionId(periodId: string): Promise<PayrollResult<{ id: string }>>;
   findCorrection<T>(periodId: string): Promise<PayrollResult<T>>;
@@ -176,6 +177,18 @@ export function supabasePayrollRepo(db: SupabaseClient): PayrollRepo {
         db
           .from("voucher_requests")
           .select("id, request_date, amount, status")
+          .eq("employee_id", employeeId)
+          .in("status", statuses)
+          .gte("request_date", start)
+          .lte("request_date", end)
+          .order("id")
+          .range(from, to),
+      ),
+    employeeVoucherIdsPage: (employeeId, statuses, start, end, from, to) =>
+      page(
+        db
+          .from("voucher_requests")
+          .select("id")
           .eq("employee_id", employeeId)
           .in("status", statuses)
           .gte("request_date", start)
