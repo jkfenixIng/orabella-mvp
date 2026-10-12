@@ -11047,87 +11047,6 @@ describe("migración 055_payroll_payments_cap_lock.sql (CL-16)", () => {
 });
 
 /* ==========================================================================
-   Nómina: los montos sólo aceptan dígitos con formato de dinero (guarda)
-
-   `inputMode="numeric"` no impide teclear una letra. Los cuatro campos de
-   MONTO de `payroll-client.tsx` —bonos, otros descuentos, monto de la porción
-   y monto extra— se guardan como dígitos con `stripMoneyInput` y se muestran
-   con `formatMoneyInput`, igual que el dinero del resto de la app. Esta guarda
-   falla si alguien vuelve a leer el valor crudo.
-   ========================================================================== */
-describe("payroll-client: los campos de monto pasan por la máscara de dinero (guarda de fuente)", () => {
-  const source = readFileSync(
-    join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
-    "utf8",
-  );
-
-  /** Bloque `onChange={...}` cuyo cuerpo contiene `anchor` ("" si no existe). */
-  function onChangeBlock(text: string, anchor: string): string {
-    const at = text.indexOf(anchor);
-    if (at === -1) return "";
-    const start = text.lastIndexOf("onChange={", at);
-    if (start === -1) return "";
-    let depth = 0;
-    for (let i = start + "onChange={".length; i < text.length; i += 1) {
-      const ch = text[i];
-      if (ch === "{") depth += 1;
-      else if (ch === "}") {
-        depth -= 1;
-        if (depth === 0) return text.slice(start, i + 1);
-      }
-    }
-    return text.slice(start);
-  }
-
-  /** El campo lleva la máscara y NO además el valor crudo. */
-  function assertMasked(block: string, raw: string): void {
-    expect(block).not.toBe("");
-    expect(block).toContain("stripMoneyInput(event.target.value)");
-    expect(block).not.toContain(raw);
-  }
-
-  it("piso anti-vacío: el cliente se leyó de verdad", () => {
-    expect(source.length).toBeGreaterThan(20_000);
-    expect(source).toContain("stripMoneyInput");
-  });
-
-  it("bonos y otros descuentos usan la máscara de dinero en su diálogo", () => {
-    assertMasked(
-      onChangeBlock(source, "value: stripMoneyInput(event.target.value)"),
-      "value: event.target.value",
-    );
-    expect(source).toContain("value={formatMoneyInput(adjustmentDialog.value)}");
-  });
-
-  it("el monto de la porción usa la máscara de dinero", () => {
-    assertMasked(
-      onChangeBlock(source, "onPortionChange(portion.key, { amount:"),
-      "onPortionChange(portion.key, { amount: event.target.value })",
-    );
-    expect(source).toContain("value={formatMoneyInput(portion.amount)}");
-  });
-
-  it("el monto extra de nómina usa la máscara de dinero", () => {
-    assertMasked(
-      onChangeBlock(source, "setExtraAmount(stripMoneyInput"),
-      "setExtraAmount(event.target.value)",
-    );
-    expect(source).toContain("value={formatMoneyInput(extraAmount)}");
-  });
-
-  it("el detector no es un sello de goma (control negativo)", () => {
-    const fake = `<input onChange={(event) => setExtraAmount(event.target.value)} />`;
-    const block = onChangeBlock(fake, "setExtraAmount(");
-    expect(block).not.toBe("");
-    // Sin el cable a la máscara, la misma guarda falla.
-    expect(block).not.toContain("stripMoneyInput(event.target.value)");
-    expect(block).toContain("setExtraAmount(event.target.value)");
-    // Sin el ancla no hay bloque: la guarda falla en vez de pasar sola.
-    expect(onChangeBlock(fake, "no-existe:")).toBe("");
-  });
-});
-
-/* ==========================================================================
    NV-01 + regla del dueño (2026-10-01): «vales es solo vales y punto».
 
    El defecto que midió el dueño: un vale de 50.000 sobre un bruto de 7.000 se
@@ -11343,15 +11262,19 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
+    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "invoices");
 
     // Dos líneas de la MISMA factura son UNA fila; la comisión se suma.
-    expect(sources.invoices).toMatchObject([
-      { invoice_id: "factura-1", consecutive_number: 7, commission: 3500 },
-      { invoice_id: "factura-2", consecutive_number: 8, commission: 400 },
-    ]);
-    expect(sources.adjustment).toBeNull();
-    expect(sources.vouchers).toEqual([]);
+    expect(sources).toMatchObject({
+      kind: "invoices",
+      invoices: [
+        { invoice_id: "factura-1", consecutive_number: 7, commission: 3500 },
+        { invoice_id: "factura-2", consecutive_number: 8, commission: 400 },
+      ],
+      adjustment: null,
+    });
+    // Cargar facturas NO consulta vales.
+    expect(payrollPagedStub.requests.voucher_requests ?? 0).toBe(0);
   });
 
   it("devuelve SOLO las fuentes de este empleado (ni otro legajo)", async () => {
@@ -11378,10 +11301,11 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
+    const invoices = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "invoices");
+    const vouchers = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "vouchers");
 
-    expect(sources.invoices.map((row) => row.invoice_id)).toEqual(["factura-mia"]);
-    expect(sources.vouchers.map((row) => row.id)).toEqual(["vale-mio"]);
+    expect(invoices.kind === "invoices" && invoices.invoices.map((row) => row.invoice_id)).toEqual(["factura-mia"]);
+    expect(vouchers.kind === "vouchers" && vouchers.vouchers.map((row) => row.id)).toEqual(["vale-mio"]);
   });
 
   it("sin fuentes no inventa datos: un vale fuera del rango no es de la liquidación", async () => {
@@ -11392,9 +11316,15 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
-
-    expect(sources).toEqual({ invoices: [], adjustment: null, vouchers: [] });
+    expect(await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "invoices")).toEqual({
+      kind: "invoices",
+      invoices: [],
+      adjustment: null,
+    });
+    expect(await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "vouchers")).toEqual({
+      kind: "vouchers",
+      vouchers: [],
+    });
   });
 
   it("sin ítem para el empleado el período no tiene liquidación: todo vacío", async () => {
@@ -11405,9 +11335,11 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
-
-    expect(sources).toEqual({ invoices: [], adjustment: null, vouchers: [] });
+    expect(await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "vouchers")).toEqual({
+      kind: "vouchers",
+      vouchers: [],
+    });
+    expect(payrollPagedStub.requests.voucher_requests ?? 0).toBe(0);
   });
 
   it("el ajuste del mixto se separa de las facturas, con su monto en negativo", async () => {
@@ -11425,7 +11357,8 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
+    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "invoices");
+    if (sources.kind !== "invoices") throw new Error("expected invoices");
 
     expect(sources.invoices).toMatchObject([
       { invoice_id: "factura-1", consecutive_number: 3, commission: 400000 },
@@ -11446,7 +11379,8 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       ],
     });
 
-    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
+    const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO, "vouchers");
+    if (sources.kind !== "vouchers") throw new Error("expected vouchers");
 
     expect(sources.vouchers.map((row) => row.id)).toEqual([
       "vale-aprobada",
@@ -11519,95 +11453,52 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
     payrollPagedStub.session = { userId: MI_USER, sedeId: SEDE, roles: ["empleado"] };
 
     // El empleado PIDE el legajo ajeno; la action resuelve el suyo y lo ignora.
-    const result = await getPayrollSettlementSourcesAction(PERIOD_ID, OTRO);
+    const result = await getPayrollSettlementSourcesAction(PERIOD_ID, OTRO, "invoices");
 
     expect(result.success).toBe(true);
-    if (!result.success) return;
+    if (!result.success || result.data.kind !== "invoices") return;
     expect(result.data.invoices.map((row) => row.invoice_id)).toEqual(["factura-mia"]);
   });
-});
 
-/* ==========================================================================
-   F6: el cableado del modal "Ver facturas y vales" (guarda de fuente).
+  it("el panel muestra solo la fuente elegida y explica las comisiones cubiertas", async () => {
+    const [{ createElement }, { renderToStaticMarkup }, { SettlementSourcesPanel }] = await Promise.all([
+      import("react"),
+      import("react-dom/server"),
+      import("@/app/payroll/payroll-client"),
+    ]);
+    const invoiceSources = {
+      kind: "invoices" as const,
+      invoices: [{ invoice_id: "f-1", consecutive_number: 9, commission: 0, fixed_commission: 0, percent_commission: 0 }],
+      adjustment: { commission: -300000 },
+    };
+    const voucherSources = {
+      kind: "vouchers" as const,
+      vouchers: [{ id: "v-1", request_date: "2026-01-10", amount: 5000, status: "descontada" }],
+    };
+    const render = (selectedKind: "invoices" | "vouchers") =>
+      renderToStaticMarkup(
+        createElement(SettlementSourcesPanel, {
+          invoiceSources,
+          voucherSources,
+          selectedKind,
+          item: null,
+          busy: false,
+          onViewInvoice: () => undefined,
+          onViewVoucher: () => undefined,
+        }),
+      );
 
-   Sin DOM y sobre el texto real del cliente: el botón que abre el modal, las
-   dos listas, el botón de detalle de cada fila (con la lectura EXISTENTE de
-   facturación y de vales) y el ajuste del mixto renderizado como ajuste.
-   ========================================================================== */
-describe("payroll-client: el modal de facturas y vales (F6, guarda de fuente)", () => {
-  const source = readFileSync(
-    join(process.cwd(), "app", "payroll", "payroll-client.tsx"),
-    "utf8",
-  );
+    const invoices = render("invoices");
+    expect(invoices).toContain("Comisiones cubiertas por sueldo base");
+    expect(invoices.replace(/\u00a0/g, " ")).toContain(
+      "Las comisiones por porcentaje suman $ 300.000. Como no superan su sueldo base, no generan un pago adicional.",
+    );
+    expect(invoices).not.toMatch(/absorb|-\$\s?300\.000|\$\s?-300\.000/);
+    expect(invoices).not.toContain("Vales de la liquidación");
 
-  /** Cuántas veces aparece un fragmento literal en el fuente. */
-  function count(needle: string): number {
-    return source.split(needle).length - 1;
-  }
-
-  it("piso anti-vacío: el cliente se leyó de verdad", () => {
-    expect(source.length).toBeGreaterThan(20_000);
-    expect(source).toContain("export function PayrollClient");
-  });
-
-  it("las fuentes se abren desde las dos tablas y se cargan al pedirlas", () => {
-    expect(count("onViewSources(item)")).toBe(2);
-    expect(count("openSettlementSources(selected.id, item.employee_id)")).toBe(3);
-    expect(source).toContain("Ver facturas y vales");
-    expect(source).toContain("async function toggleSettlementSources()");
-    expect(source).toContain("getPayrollSettlementSourcesAction(");
-  });
-
-  it("las dos listas existen, rotuladas y alimentadas por la lectura nueva", () => {
-    expect(source).toContain("Facturas de la liquidación");
-    expect(source).toContain("Vales de la liquidación");
-    expect(source).toContain("(sources?.invoices ?? []).map");
-    expect(source).toContain("(sources?.vouchers ?? []).map");
-  });
-
-  it("cada fila abre su detalle con la lectura EXISTENTE", () => {
-    // Factura: la lectura de facturación; vale: la lectura de vales.
-    expect(source).toContain("await getInvoiceAction(invoiceId)");
-    expect(source).toContain("await listVouchersAction({");
-    expect(source).toContain("onViewInvoice(invoice.invoice_id)");
-    expect(source).toContain("onViewVoucher(voucher)");
-    // Un botón "Ver detalle" por lista (factura y vale).
-    const botones = source.split("\n").filter((line) => line.trim() === "Ver detalle");
-    expect(botones).toHaveLength(2);
-    expect(source).toContain("Ver el detalle de la factura");
-    expect(source).toContain("Ver el detalle del vale del");
-  });
-
-  it("el ajuste del mixto se muestra como ajuste y NO como factura", () => {
-    expect(source).toContain("Ajuste del mixto");
-    expect(source).toContain("sources?.adjustment");
-    expect(source).toContain("Su salario base ya cubre");
-    // Se pinta aparte: no se recorre `invoices` para el ajuste ni se rotula
-    // como consecutivo.
-    expect(source).not.toContain("Factura #ajuste_mixto");
-    expect(source).toContain("{formatMoney(sources.adjustment.commission)}");
-  });
-
-  it("los vacíos son honestos y en texto plano (no un aviso)", () => {
-    expect(source).toContain("La liquidación no tiene facturas");
-    expect(source).toContain("La liquidación no tiene vales");
-    // El vacío no se envuelve en `Alert` (agregaría un anuncio que no existe).
-    const lineas = source
-      .split("\n")
-      .filter((line) => line.includes("La liquidación no tiene facturas"));
-    expect(lineas).toHaveLength(1);
-    expect(lineas[0]).not.toContain("Alert");
-  });
-
-  it("el detector no es un sello de goma (control negativo)", () => {
-    // El marcado VIEJO: una sola celda "Ver" sin modal de fuentes.
-    const viejo = "<td>Ver</td>";
-    expect(viejo.split("Ver facturas y vales").length - 1).toBe(0);
-    expect(viejo.includes("Ajuste del mixto")).toBe(false);
-    expect(viejo.includes("onViewInvoice(")).toBe(false);
-    expect(viejo.includes("onViewVoucher(")).toBe(false);
-    // Sin `onViewSources` el botón no estaría cableado al modal.
-    expect(viejo.split("onViewSources(item)").length - 1).toBe(0);
+    const vouchers = render("vouchers");
+    expect(vouchers).toContain("Vales de la liquidación");
+    expect(vouchers).not.toContain("Facturas de la liquidación");
   });
 });
 

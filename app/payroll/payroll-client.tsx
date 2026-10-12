@@ -49,6 +49,7 @@ import {
   isPayrollCycleSettled,
   isRangeBeforePayrollStart,
   normalizePayFrequency,
+  MIXED_ABSORBED_ITEM_TYPE,
   openPayrollRejectionMessage,
   payrollCycleRange,
   payrollEmployeeName,
@@ -108,7 +109,8 @@ import type { ActionResult } from "@/src/shared/lib/api-response";
 import { bogotaDay } from "@/src/shared/lib/dates";
 import { formatBogotaDate, formatBogotaFullDateTime, toNumber } from "@/src/shared/lib/format";
 import { refreshPayrollMonthAfterExtra } from "./payroll-month-refresh";
-import { formatMoney, formatMoneyInput, stripMoneyInput } from "@/src/shared/lib/money";
+import { formatMoney } from "@/src/shared/lib/money";
+import { MoneyInput } from "@/src/components/ui/lib/money-input";
 import { copInputDigits } from "@/src/shared/money/cop";
 
 /** Acción destructiva (borrar borrador): contorno y texto en rojo, separada de las demás. */
@@ -961,10 +963,9 @@ function ExpandedItemPanel({
                       </select>
                     </td>
                     <td className={tableCellClass}>
-                      <input
-                        inputMode="numeric"
-                        value={formatMoneyInput(portion.amount)}
-                        onChange={(event) => onPortionChange(portion.key, { amount: stripMoneyInput(event.target.value) })}
+                      <MoneyInput
+                        value={portion.amount}
+                        onValueChange={(amount) => onPortionChange(portion.key, { amount })}
                         aria-label={`Monto de la porción ${index + 1}`}
                         placeholder="0"
                         className={tableInputClass}
@@ -1026,6 +1027,25 @@ function ExpandedItemPanel({
   );
 }
 
+/**
+ * Cantidad visible en cada opción de fuentes. Las facturas salen del detalle ya
+ * leído; los vales solo se cuentan cuando su lectura dedicada ya llegó.
+ */
+function settlementSourceCount(
+  kind: "invoices" | "vouchers",
+  loaded: PayrollSettlementSources | null,
+  item: DetailItem | null,
+): number | null {
+  if (loaded?.kind === "invoices") return loaded.invoices.length;
+  if (loaded?.kind === "vouchers") return loaded.vouchers.length;
+  if (kind === "vouchers" || !item) return null;
+  return new Set(
+    (item.detail_json ?? [])
+      .filter((line) => line.invoice_id && line.item_type !== MIXED_ABSORBED_ITEM_TYPE)
+      .map((line) => line.invoice_id),
+  ).size;
+}
+
 /** Campo de solo lectura del detalle de una factura o un vale. */
 function SourceDetailField({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -1037,7 +1057,9 @@ function SourceDetailField({ label, children }: { label: string; children: React
 }
 
 interface SettlementSourcesPanelProps {
-  sources: PayrollSettlementSources | null;
+  invoiceSources: Extract<PayrollSettlementSources, { kind: "invoices" }> | null;
+  voucherSources: Extract<PayrollSettlementSources, { kind: "vouchers" }> | null;
+  selectedKind: "invoices" | "vouchers" | null;
   /**
    * F6/regla del dueño (2026-10-01): el ítem de nómina del empleado.
    *
@@ -1066,104 +1088,74 @@ interface SettlementSourcesPanelProps {
  * descontó el neto y cuánta deuda quedó— se lee acá, junto a los vales que la
  * componen, y solo cuando cada cifra aplica.
  */
-function SettlementSourcesPanel({
-  sources,
+export function SettlementSourcesPanel({
+  invoiceSources,
+  voucherSources,
+  selectedKind,
   item,
   busy,
   onViewInvoice,
   onViewVoucher,
 }: SettlementSourcesPanelProps) {
+  const invoices = invoiceSources?.invoices ?? [];
+  const vouchers = voucherSources?.vouchers ?? [];
+  const sources = selectedKind === "invoices" ? invoiceSources : voucherSources;
   return (
     <div className="mt-3 flex flex-col gap-5">
-      {busy && !sources ? (
-        <p className="text-sm text-text-tertiary">Leyendo facturas y vales…</p>
+      {busy && !sources ? <p className="text-sm text-text-tertiary">Leyendo {selectedKind === "invoices" ? "facturas" : "vales"}…</p> : null}
+      {selectedKind === "invoices" && invoiceSources ? (
+        <>
+          {invoiceSources.adjustment ? (
+            <section className="rounded-md border border-border-color p-3 dark:border-border-color-2">
+              <h3 className="text-sm font-semibold text-text-primary">Comisiones cubiertas por sueldo base</h3>
+              <p className="mt-1 text-sm text-text-secondary">
+                {`Las comisiones por porcentaje suman ${formatMoney(-invoiceSources.adjustment.commission)}. Como no superan su sueldo base, no generan un pago adicional.`}
+              </p>
+            </section>
+          ) : null}
+          <section>
+            <h3 className="text-sm font-semibold text-text-primary">Facturas de la liquidación</h3>
+            {invoices.length === 0 ? <p className="mt-1 text-sm text-text-tertiary">La liquidación no tiene facturas: no hubo comisiones por factura en este período.</p> : null}
+            <ul className="mt-2 flex flex-col gap-2">
+              {invoices.map((invoice) => (
+                <li key={invoice.invoice_id} className="rounded border border-border-color p-2 dark:border-border-color-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-sm text-text-primary">{`Factura #${invoice.consecutive_number ?? "sin consecutivo"}`}</span>
+                    <span className="text-sm text-text-secondary">{invoice.percent_commission !== 0 && invoice.fixed_commission !== 0 ? `Fija ${formatMoney(invoice.fixed_commission)} · Porcentaje ${formatMoney(invoice.percent_commission)}` : `${invoice.percent_commission !== 0 ? "Porcentaje" : "Fija"} ${formatMoney(invoice.commission)}`}</span>
+                    <button type="button" onClick={() => onViewInvoice(invoice.invoice_id)} aria-label={`Ver el detalle de la factura ${invoice.consecutive_number ?? "sin consecutivo"}`} className={ghostClass}>Ver detalle</button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </section>
+        </>
       ) : null}
-
-      {sources?.adjustment ? (
-        <section className="rounded-md border border-border-color p-3 dark:border-border-color-2">
-          <h3 className="text-sm font-semibold text-text-primary">Ajuste del mixto</h3>
-          <p className="mt-1 text-sm text-text-secondary">
-            {`Su salario base ya cubre ${formatMoney(-sources.adjustment.commission)} de comisiones de este período, por eso no se suman aparte.`}
-          </p>
-          <p className="mt-1 text-sm font-semibold text-text-primary">
-            {formatMoney(sources.adjustment.commission)}
-          </p>
+      {selectedKind === "vouchers" && voucherSources ? (
+        <section>
+          <h3 className="text-sm font-semibold text-text-primary">Vales de la liquidación</h3>
+          {vouchers.length === 0 ? <p className="mt-1 text-sm text-text-tertiary">La liquidación no tiene vales: no hubo vales descontados en este período.</p> : null}
+          <ul className="mt-2 flex flex-col gap-2">
+            {vouchers.map((voucher) => (
+              <li key={voucher.id} className="rounded border border-border-color p-2 dark:border-border-color-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-sm text-text-primary">{formatFullDate(voucher.request_date)}</span><span className="text-sm text-text-secondary">{formatMoney(voucher.amount)}</span><span className="text-sm text-text-secondary">{voucher.status}</span>
+                  <button type="button" onClick={() => onViewVoucher(voucher)} aria-label={`Ver el detalle del vale del ${voucher.request_date}`} className={ghostClass}>Ver detalle</button>
+                </div>
+              </li>
+            ))}
+          </ul>
+          {item && item.deductions_vales < item.voucher_total ? (
+            <p className="mt-2 text-sm text-text-secondary">
+              {`Del total de vales, el neto de este período descuenta ${formatMoney(item.deductions_vales)}: el tope de descuentos no aplicó el resto.`}
+            </p>
+          ) : null}
+          {item && item.pending_debt > 0 ? (
+            <p className="mt-1 text-sm text-text-secondary">
+              {`Queda una deuda de ${formatMoney(item.pending_debt)} originada en este período: es el sobrante de vales que el tope no alcanzó a descontar.`}
+            </p>
+          ) : null}
         </section>
       ) : null}
-
-      <section>
-        <h3 className="text-sm font-semibold text-text-primary">Facturas de la liquidación</h3>
-        {sources && sources.invoices.length === 0 ? (
-          <p className="mt-1 text-sm text-text-tertiary">
-            La liquidación no tiene facturas: no hubo comisiones por factura en este período.
-          </p>
-        ) : null}
-        <ul className="mt-2 flex flex-col gap-2">
-          {(sources?.invoices ?? []).map((invoice) => (
-            <li
-              key={invoice.invoice_id}
-              className="rounded border border-border-color p-2 dark:border-border-color-2"
-            >
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="text-sm text-text-primary">
-                  {`Factura #${invoice.consecutive_number ?? "sin consecutivo"}`}
-                </span>
-                <span className="text-sm text-text-secondary">
-                  {invoice.percent_commission !== 0 && invoice.fixed_commission !== 0
-                    ? `Fija ${formatMoney(invoice.fixed_commission)} · Porcentaje ${formatMoney(invoice.percent_commission)}`
-                    : `${invoice.percent_commission !== 0 ? "Porcentaje" : "Fija"} ${formatMoney(invoice.commission)}`}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => onViewInvoice(invoice.invoice_id)}
-                  aria-label={`Ver el detalle de la factura ${invoice.consecutive_number ?? "sin consecutivo"}`}
-                  className={ghostClass}
-                >
-                  Ver detalle
-                </button>
-              </div>
-            </li>
-          ))}
-        </ul>
-      </section>
-
-      <section>
-        <h3 className="text-sm font-semibold text-text-primary">Vales de la liquidación</h3>
-        {sources && sources.vouchers.length === 0 ? (
-          <p className="mt-1 text-sm text-text-tertiary">
-            La liquidación no tiene vales: no hubo vales descontados en este período.
-          </p>
-        ) : null}
-        <ul className="mt-2 flex flex-col gap-2">
-          {(sources?.vouchers ?? []).map((voucher) => (
-            <li key={voucher.id} className="rounded border border-border-color p-2 dark:border-border-color-2">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="text-sm text-text-primary">{formatFullDate(voucher.request_date)}</span>
-                <span className="text-sm text-text-secondary">{formatMoney(voucher.amount)}</span>
-                <span className="text-sm text-text-secondary">{voucher.status}</span>
-                <button
-                  type="button"
-                  onClick={() => onViewVoucher(voucher)}
-                  aria-label={`Ver el detalle del vale del ${voucher.request_date}`}
-                  className={ghostClass}
-                >
-                  Ver detalle
-                </button>
-              </div>
-            </li>
-          ))}
-        </ul>
-        {item && item.deductions_vales < item.voucher_total ? (
-          <p className="mt-2 text-sm text-text-secondary">
-            {`Del total de vales, el neto de este período descuenta ${formatMoney(item.deductions_vales)}: el tope de descuentos no aplicó el resto.`}
-          </p>
-        ) : null}
-        {item && item.pending_debt > 0 ? (
-          <p className="mt-1 text-sm text-text-secondary">
-            {`Queda una deuda de ${formatMoney(item.pending_debt)} originada en este período: es el sobrante de vales que el tope no alcanzó a descontar.`}
-          </p>
-        ) : null}
-      </section>
     </div>
   );
 }
@@ -1377,8 +1369,9 @@ export function PayrollClient(props: PayrollClientProps) {
    * empleado si el usuario cambia de período mientras carga.
    */
   const [sourcesTarget, setSourcesTarget] = useState<{ periodId: string; employeeId: string } | null>(null);
-  const [sources, setSources] = useState<PayrollSettlementSources | null>(null);
-  const [sourcesVisible, setSourcesVisible] = useState(false);
+  const [invoiceSources, setInvoiceSources] = useState<Extract<PayrollSettlementSources, { kind: "invoices" }> | null>(null);
+  const [voucherSources, setVoucherSources] = useState<Extract<PayrollSettlementSources, { kind: "vouchers" }> | null>(null);
+  const [selectedSourceKind, setSelectedSourceKind] = useState<"invoices" | "vouchers" | null>(null);
   const [sourcesBusy, setSourcesBusy] = useState(false);
   /** F6: detalle de la factura abierta con la lectura existente de facturación. */
   const [invoiceTargetId, setInvoiceTargetId] = useState<string | null>(null);
@@ -1919,8 +1912,9 @@ export function PayrollClient(props: PayrollClientProps) {
    */
   function openSettlementSources(periodId: string, employeeId: string) {
     setSourcesTarget({ periodId, employeeId });
-    setSources(null);
-    setSourcesVisible(false);
+    setInvoiceSources(null);
+    setVoucherSources(null);
+    setSelectedSourceKind(null);
     setSourcesBusy(false);
     setInvoiceTargetId(null);
     setInvoiceDetail(null);
@@ -1928,26 +1922,32 @@ export function PayrollClient(props: PayrollClientProps) {
     setVoucherDetail(null);
   }
 
-  async function toggleSettlementSources() {
-    if (sourcesVisible) {
-      setSourcesVisible(false);
+  /** Carga una sola fuente a pedido; la otra no se consulta. */
+  async function toggleSettlementSourceKind(kind: "invoices" | "vouchers") {
+    if (selectedSourceKind === kind) {
+      setSelectedSourceKind(null);
       return;
     }
-    setSourcesVisible(true);
-    if (!sourcesTarget || sources !== null || sourcesBusy) return;
+    setSelectedSourceKind(kind);
+    const loaded = kind === "invoices" ? invoiceSources : voucherSources;
+    if (!sourcesTarget || loaded !== null || sourcesBusy) return;
     setSourcesBusy(true);
     const result = (await getPayrollSettlementSourcesAction(
       sourcesTarget.periodId,
       sourcesTarget.employeeId,
+      kind,
     )) as ActionResult<PayrollSettlementSources>;
     setSourcesBusy(false);
-    if (show(result)) setSources(result.data);
+    if (!show(result)) return;
+    if (result.data.kind === "invoices") setInvoiceSources(result.data);
+    else setVoucherSources(result.data);
   }
 
   function closeSettlementSources() {
     setSourcesTarget(null);
-    setSources(null);
-    setSourcesVisible(false);
+    setInvoiceSources(null);
+    setVoucherSources(null);
+    setSelectedSourceKind(null);
     setSourcesBusy(false);
     setInvoiceTargetId(null);
     setInvoiceDetail(null);
@@ -3130,12 +3130,11 @@ export function PayrollClient(props: PayrollClientProps) {
                 </label>
                 <label className={labelClass} htmlFor="payroll-extra-amount">
                   Monto
-                  <input
+                  <MoneyInput
                     id="payroll-extra-amount"
-                    inputMode="numeric"
-                    value={formatMoneyInput(extraAmount)}
-                    onChange={(event) => {
-                      setExtraAmount(stripMoneyInput(event.target.value));
+                    value={extraAmount}
+                    onValueChange={(amount) => {
+                      setExtraAmount(amount);
                       setExtraError(null);
                     }}
                     placeholder="0"
@@ -3845,12 +3844,11 @@ export function PayrollClient(props: PayrollClientProps) {
             <form onSubmit={saveAdjustmentDialog} className="mt-4 flex flex-col gap-4">
               <label className={labelClass} htmlFor="payroll-adjustment-value">
                 Nuevo valor
-                <input
+                <MoneyInput
                   id="payroll-adjustment-value"
-                  inputMode="numeric"
-                  value={formatMoneyInput(adjustmentDialog.value)}
-                  onChange={(event) => {
-                    setAdjustmentDialog({ ...adjustmentDialog, value: stripMoneyInput(event.target.value) });
+                  value={adjustmentDialog.value}
+                  onValueChange={(value) => {
+                    setAdjustmentDialog({ ...adjustmentDialog, value });
                     setAdjustmentError(null);
                   }}
                   className={inputClass}
@@ -3906,17 +3904,33 @@ export function PayrollClient(props: PayrollClientProps) {
               </DialogDescription>
             </DialogHeader>
             <div className="max-h-[calc(100dvh-12rem)] overflow-y-auto pr-1">
-              <button
-                type="button"
-                onClick={() => void toggleSettlementSources()}
-                className={ghostClass}
-                aria-expanded={sourcesVisible}
-              >
-                {sourcesVisible ? "Ocultar fuentes" : "Ver facturas y vales"}
-              </button>
-              {sourcesVisible ? (
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2" aria-label="Fuentes de la liquidación">
+                {(["invoices", "vouchers"] as const).map((kind) => {
+                  const selected = selectedSourceKind === kind;
+                  const count = settlementSourceCount(
+                    kind,
+                    kind === "invoices" ? invoiceSources : voucherSources,
+                    itemByEmployee.get(sourcesTarget.employeeId) ?? null,
+                  );
+                  return (
+                    <button
+                      key={kind}
+                      type="button"
+                      onClick={() => void toggleSettlementSourceKind(kind)}
+                      aria-pressed={selected}
+                      className={cn(ghostClass, "justify-between", selected && "border-primary-600 bg-primary-600/10")}
+                    >
+                      <span>{kind === "invoices" ? "Facturas" : "Vales"}</span>
+                      {count === null ? null : <span className="text-sm text-text-tertiary">{count}</span>}
+                    </button>
+                  );
+                })}
+              </div>
+              {selectedSourceKind ? (
                 <SettlementSourcesPanel
-                  sources={sources}
+                  invoiceSources={invoiceSources}
+                  voucherSources={voucherSources}
+                  selectedKind={selectedSourceKind}
                   item={itemByEmployee.get(sourcesTarget.employeeId) ?? null}
                   busy={sourcesBusy}
                   onViewInvoice={(invoiceId) => void openInvoiceDetail(invoiceId)}
@@ -3947,18 +3961,14 @@ export function PayrollClient(props: PayrollClientProps) {
             {invoiceBusy ? (
               <p className="text-sm text-text-tertiary">Leyendo la factura…</p>
             ) : invoiceDetail ? (
-              <>
-                <div className="flex flex-wrap justify-between gap-2 text-sm">
-                  <span>Factura #{invoiceDetail.invoice.consecutive_number}</span>
-                  <span>{invoiceDetail.invoice.status}</span>
-                  <span>{formatMoney(invoiceDetail.invoice.total)}</span>
+              <div className="flex flex-col gap-5">
+                <div className="flex flex-wrap items-start justify-between gap-4 border-b border-border-color pb-4">
+                  <div><p className="text-lg font-bold">Factura #{invoiceDetail.invoice.consecutive_number}</p><p className="text-sm text-text-secondary">{invoiceDetail.invoice.client_name}{invoiceDetail.invoice.client_document ? ` · ${invoiceDetail.invoice.client_document}` : ""}</p></div>
+                  <div className="text-right"><span className="text-sm text-text-secondary">{invoiceDetail.invoice.status}</span><p className="mt-2 text-lg font-semibold">{formatMoney(invoiceDetail.invoice.total)}</p></div>
                 </div>
-                <div className="mt-3 overflow-x-auto"><table className="w-full text-left text-sm">
-                  <thead><tr className={tableHeaderClass}><th className={tableCellClass}>Ítem</th><th className={moneyHeadClass}>Cant.</th><th className={moneyHeadClass}>Subtotal</th></tr></thead>
-                  <tbody>{invoiceDetail.items.map((row) => <tr key={row.id} className={tableRowClass}><td className={tableCellClass}>{row.custom_name ?? detailLineLabel(row.item_type)}</td><td className={moneyCellClass}>{row.qty}</td><td className={moneyCellClass}>{formatMoney(row.subtotal)}</td></tr>)}</tbody>
-                </table></div>
-                <p className="mt-3 text-right text-sm font-semibold">Total: {formatMoney(invoiceDetail.invoice.total)}</p>
-              </>
+                <div className="overflow-x-auto rounded-md border border-border-color"><table className="w-full text-left text-sm"><thead><tr className={tableHeaderClass}><th className={tableCellClass}>Descripción</th><th className={moneyHeadClass}>Cant.</th><th className={moneyHeadClass}>V. unitario</th><th className={moneyHeadClass}>Subtotal</th></tr></thead><tbody>{invoiceDetail.items.map((row) => <tr key={row.id} className={tableRowClass}><td className={tableCellClass}>{row.custom_name ?? detailLineLabel(row.item_type)}</td><td className={moneyCellClass}>{row.qty}</td><td className={moneyCellClass}>{formatMoney(row.unit_price)}</td><td className={moneyCellClass}>{formatMoney(row.subtotal)}</td></tr>)}</tbody></table></div>
+                <div className="flex justify-end"><dl className="w-full max-w-md space-y-2 rounded-md border border-border-color p-4 text-sm"><div className="flex justify-between gap-3"><dt>Subtotal</dt><dd>{formatMoney(invoiceDetail.invoice.subtotal)}</dd></div><div className="flex justify-between gap-3"><dt>Descuento</dt><dd>{formatMoney(invoiceDetail.invoice.discount)}</dd></div><div className="flex justify-between gap-3"><dt>Impuestos</dt><dd>{formatMoney(invoiceDetail.invoice.tax)}</dd></div><div className="flex justify-between gap-3 border-t border-border-color pt-2 text-base font-semibold"><dt>Total</dt><dd>{formatMoney(invoiceDetail.invoice.total)}</dd></div></dl></div>
+              </div>
             ) : <p className="text-sm text-text-tertiary">No se pudo abrir la factura.</p>}
             <DialogFooter><button type="button" className={ghostClass} onClick={() => setInvoiceTargetId(null)}>Cerrar</button></DialogFooter>
           </DialogContent>
@@ -3970,7 +3980,7 @@ export function PayrollClient(props: PayrollClientProps) {
           <DialogContent className="max-w-lg">
             <DialogHeader><DialogTitle>Detalle del vale</DialogTitle></DialogHeader>
             {voucherBusy ? <p className="text-sm text-text-tertiary">Leyendo el vale…</p> : voucherDetail ? (
-              <dl className="grid grid-cols-1 gap-3 sm:grid-cols-2"><SourceDetailField label="Empleado">{employeeName(voucherDetail.employee_id)}</SourceDetailField><SourceDetailField label="Monto">{formatMoney(voucherDetail.amount)}</SourceDetailField><SourceDetailField label="Fecha">{voucherDetail.request_date}</SourceDetailField><SourceDetailField label="Estado">{voucherDetail.status}</SourceDetailField><SourceDetailField label="Método">{voucherDetail.method_code ?? "—"}</SourceDetailField><SourceDetailField label="Observación">{voucherDetail.observation ?? "—"}</SourceDetailField></dl>
+              <dl className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2"><SourceDetailField label="Empleado">{employeeName(voucherDetail.employee_id)}</SourceDetailField><SourceDetailField label="Monto">{formatMoney(voucherDetail.amount)}</SourceDetailField><SourceDetailField label="Fecha de solicitud">{voucherDetail.request_date}</SourceDetailField><SourceDetailField label="Estado">{voucherDetail.status}{voucherDetail.status === "descontada" ? " (en nómina: sin cambios)" : ""}</SourceDetailField><SourceDetailField label="Método de pago">{voucherDetail.method_code ?? "—"}</SourceDetailField><SourceDetailField label="Observación">{voucherDetail.observation ?? "—"}</SourceDetailField></dl>
             ) : <p className="text-sm text-text-tertiary">No se pudo abrir el vale.</p>}
             <DialogFooter><button type="button" className={ghostClass} onClick={() => setVoucherTargetId(null)}>Cerrar</button></DialogFooter>
           </DialogContent>

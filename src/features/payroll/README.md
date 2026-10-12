@@ -753,8 +753,9 @@ en su propio recibo.
 
 ### La lectura
 
-`getPayrollSettlementSources(sedeId, periodId, employeeId)` devuelve las fuentes
-de la liquidación de UN empleado de UN período, sin tabla ni columna nuevas:
+`getPayrollSettlementSources(periodId, employeeId, kind)` devuelve UNA fuente
+(`kind: "invoices" | "vouchers"`) de la liquidación de UN empleado de UN
+período, sin tabla ni columna nuevas. Pedir facturas nunca lee vales:
 
 - **Facturas**: se agrupan desde `payroll_items.detail_json`. El detalle guarda
   una línea por factura/ítem, así que el read las **suma por `invoice_id`** y
@@ -780,7 +781,7 @@ los tocó, por ejemplo por exclusión de cadencia). Las dos lecturas son
 exhaustivas (`readAllPayroll`): una lectura recortada mostraría menos fuentes que
 las reales.
 
-La action `getPayrollSettlementSourcesAction(periodId, employeeId)` es el mismo
+La action `getPayrollSettlementSourcesAction(periodId, employeeId, kind)` es el mismo
 alcance por fila que `getPeriodDetailAction`: el admin abre el empleado que pida;
 el empleado logueado solo la suya (su legajo se resuelve contra la planta
 completa y reemplaza el pedido). La caja no entra al módulo
@@ -788,6 +789,9 @@ completa y reemplaza el pedido). La caja no entra al módulo
 
 ### El modal
 
+- El modal abre con dos opciones independientes, **Facturas** y **Vales**. Cada
+  una carga su fuente solo al elegirla, queda en caché mientras el modal está
+  abierto y se oculta/muestra sin volver a consultar.
 - **Facturas de la liquidación**: una fila por factura con su consecutivo y la
   comisión que ESTA liquidación le asignó, más un botón **"Ver detalle"** que
   abre la factura con la lectura EXISTENTE de facturación (`getInvoiceAction`),
@@ -797,9 +801,10 @@ completa y reemplaza el pedido). La caja no entra al módulo
   un botón **"Ver detalle"** que abre el vale con la lectura EXISTENTE de vales
   (`listVouchersAction`, filtrada por el mismo empleado y la misma fecha de
   solicitud).
-- **Ajuste del mixto**: bloque aparte que explica que el básico absorbió ese
-  porcentaje y que ya no se suma aparte, con el monto en negativo tal como vive
-  en `detail_json`. Nunca se rotula como "Factura #ajuste_mixto".
+- **Comisiones cubiertas por sueldo base**: bloque aparte que dice "Las
+  comisiones por porcentaje suman {monto}. Como no superan su sueldo base, no
+  generan un pago adicional." No muestra el negativo suelto. Nunca se rotula
+  como "Factura #ajuste_mixto".
 - **Vacíos honestos**: "La liquidación no tiene facturas…" / "…no tiene vales…"
   son texto plano (estado esperado, no un aviso) y describen que el período no
 tuvo comisiones por factura o vales descontados.
