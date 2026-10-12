@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useTransition, type FormEvent, type ReactNode } from "react";
+import { Eye, HandCoins, Pencil, ReceiptText } from "lucide-react";
 import { toast } from "sonner";
 import {
   calculatePayrollAction,
@@ -26,6 +27,7 @@ import type {
   PayrollCadenceAnchorConfirmed,
   PayrollCadenceAnchors,
   PayrollExtraRow,
+  PayrollItemPaymentDetail,
   PayrollPeriodCorrectionResult,
   PayrollPeriodRow,
   PayrollPeriodSummary,
@@ -62,6 +64,7 @@ import {
   periodCadenceFilterOptions,
   periodCadenceLabel,
   periodCadenceTabKey,
+  periodExcludesEmployeeByCadence,
   periodRangeDays,
   resolveOpenPayrollRange,
   roundMoney,
@@ -457,12 +460,15 @@ interface PeriodDetailTableProps {
   items: DetailItem[];
   employeeName: (id: string) => string;
   payLabel: (id: string) => string;
+  canPay: boolean;
   onView: (item: DetailItem) => void;
   onViewSources: (item: DetailItem) => void;
 }
 
+const tableActionClass = cn(ghostClass, "min-h-9 min-w-9 p-2");
+
 /** Tabla del detalle del periodo (solo presentación). */
-function PeriodDetailTable({ items, employeeName, payLabel, onView, onViewSources }: PeriodDetailTableProps) {
+function PeriodDetailTable({ items, employeeName, payLabel, canPay, onView, onViewSources }: PeriodDetailTableProps) {
   return (
     <DataTable minWidth="2xl" wrapperClassName="mt-4">
       <thead>
@@ -552,26 +558,28 @@ function PeriodDetailTable({ items, employeeName, payLabel, onView, onViewSource
               <td className={moneyCellClass}>{formatMoney(item.paid)}</td>
               <td className={moneyCellClass}>{formatMoney(item.remaining)}</td>
               <td className={tableCellClass}>
-                <span className="inline-flex flex-wrap gap-2">
+                <span className="inline-flex gap-1">
                   <button
                     type="button"
+                    title={canPay && item.remaining > 0 ? "Pagar" : "Ver detalle"}
                     onClick={() => onView(item)}
-                    aria-label={`Ver el desglose de ${employeeName(item.employee_id)}`}
-                    className={ghostClass}
+                    aria-label={`${canPay && item.remaining > 0 ? "Pagar" : "Ver detalle"} de ${employeeName(item.employee_id)}`}
+                    className={tableActionClass}
                   >
-                    Ver
+                    {canPay && item.remaining > 0 ? (
+                      <HandCoins className="h-4 w-4" aria-hidden="true" />
+                    ) : (
+                      <Eye className="h-4 w-4" aria-hidden="true" />
+                    )}
                   </button>
-                  {/*
-                    F6: abre el modal con las facturas y los vales que
-                    componen ESTA liquidación, con el detalle de cada uno.
-                  */}
                   <button
                     type="button"
+                    title="Ver fuentes"
                     onClick={() => onViewSources(item)}
-                    aria-label={`Ver facturas y vales de ${employeeName(item.employee_id)}`}
-                    className={ghostClass}
+                    aria-label={`Ver fuentes de ${employeeName(item.employee_id)}`}
+                    className={tableActionClass}
                   >
-                    Ver facturas y vales
+                    <ReceiptText className="h-4 w-4" aria-hidden="true" />
                   </button>
                 </span>
               </td>
@@ -667,16 +675,15 @@ interface DraftPayrollTableProps {
   payLabel: (id: string) => string;
   adjustmentValue: (employeeId: string, field: AdjustmentMoneyField) => string;
   adjustmentReasonValue: (employeeId: string) => string;
-  onAdjustmentChange: (employeeId: string, field: AdjustmentField, value: string) => void;
+  onEditAdjustment: (employeeId: string, field: AdjustmentMoneyField) => void;
+  canPay: boolean;
   onView: (item: DetailItem) => void;
   onViewSources: (item: DetailItem) => void;
 }
 
 /**
- * Tabla editable del borrador: muestra lo calculado por empleado (fijo,
- * comisiones, vales, neto) y permite ajustar bonos y otros descuentos por
- * fila antes de recalcular. Los empleados aún sin cálculo aparecen con sus
- * montos en blanco ("—") para poder cargarles un ajuste.
+ * Tabla del borrador. Bonos y otros descuentos son de solo lectura; cada uno se
+ * edita en un diálogo con su motivo.
  */
 function DraftPayrollTable({
   rows,
@@ -684,7 +691,8 @@ function DraftPayrollTable({
   payLabel,
   adjustmentValue,
   adjustmentReasonValue,
-  onAdjustmentChange,
+  onEditAdjustment,
+  canPay,
   onView,
   onViewSources,
 }: DraftPayrollTableProps) {
@@ -733,21 +741,6 @@ function DraftPayrollTable({
       <tbody>
         {rows.map((row) => {
           const item = row.item;
-          // F8: el motivo es obligatorio en cuanto la fila tiene un bono o un
-          // descuento distinto de 0. Se DERIVA del valor que se está
-          // editando, no de lo ya persistido, así el campo acompaña el
-          // número que el admin acaba de escribir.
-          const reasonRequired =
-            (toNumber(adjustmentValue(row.employeeId, "bonuses")) ?? 0) !== 0 ||
-            (toNumber(adjustmentValue(row.employeeId, "others")) ?? 0) !== 0;
-          const reasonValue = adjustmentReasonValue(row.employeeId);
-          // F8 (visibilidad): el aviso del motivo faltante vive DENTRO del
-          // diálogo, en la MISMA celda del motivo. El error de la página queda
-          // detrás del modal abierto —el admin no lo ve y cree que el botón no
-          // responde—, así que el aviso va donde está escribiendo. Se deriva
-          // del valor que se está editando: aparece con el monto y desaparece
-          // apenas el motivo existe.
-          const reasonMissing = reasonRequired && reasonValue.trim() === "";
           // Reclasificación sin mover el total: fija = comisiones − porcentaje.
           const commission = item
             ? splitCommissionByOrigin({ commissions: item.commissions, detail: item.detail_json })
@@ -762,13 +755,18 @@ function DraftPayrollTable({
               <td className={moneyCellClass}>{commission ? formatMoney(commission.fixed) : "—"}</td>
               <td className={moneyCellClass}>{commission ? formatMoney(commission.percent) : "—"}</td>
               <td className={tableCellClass}>
-                <input
-                  inputMode="numeric"
-                  value={formatMoneyInput(adjustmentValue(row.employeeId, "bonuses"))}
-                  onChange={(event) => onAdjustmentChange(row.employeeId, "bonuses", stripMoneyInput(event.target.value))}
-                  aria-label={`Bonos de ${employeeName(row.employeeId)}`}
-                  className={tableInputClass}
-                />
+                <span className="inline-flex items-center gap-1 text-right tabular-nums">
+                  {formatMoney(toNumber(adjustmentValue(row.employeeId, "bonuses")) ?? 0)}
+                  <button
+                    type="button"
+                    title="Editar bonos"
+                    aria-label={`Editar bonos de ${employeeName(row.employeeId)}`}
+                    onClick={() => onEditAdjustment(row.employeeId, "bonuses")}
+                    className={tableActionClass}
+                  >
+                    <Pencil className="h-4 w-4" aria-hidden="true" />
+                  </button>
+                </span>
               </td>
               {/*
                 Regla del dueño (2026-10-01): mismo criterio que la tabla
@@ -789,45 +787,20 @@ function DraftPayrollTable({
                 )}
               </td>
               <td className={tableCellClass}>
-                {/* El signo es solo presentación: el descuento se guarda positivo. */}
-                <span className="inline-flex items-center gap-1">
-                  <span aria-hidden="true">−</span>
-                  <input
-                    inputMode="numeric"
-                    value={formatMoneyInput(adjustmentValue(row.employeeId, "others"))}
-                    onChange={(event) => onAdjustmentChange(row.employeeId, "others", stripMoneyInput(event.target.value))}
-                    aria-label={`Otros descuentos de ${employeeName(row.employeeId)}`}
-                    className={tableInputClass}
-                  />
+                <span className="inline-flex items-center gap-1 text-right tabular-nums">
+                  {`-${formatMoney(toNumber(adjustmentValue(row.employeeId, "others")) ?? 0)}`}
+                  <button
+                    type="button"
+                    title="Editar otros descuentos"
+                    aria-label={`Editar otros descuentos de ${employeeName(row.employeeId)}`}
+                    onClick={() => onEditAdjustment(row.employeeId, "others")}
+                    className={tableActionClass}
+                  >
+                    <Pencil className="h-4 w-4" aria-hidden="true" />
+                  </button>
                 </span>
               </td>
-              {/*
-                F8: el motivo viaja con el monto. Es un campo de texto sin
-                máscara de dinero; `aria-required` y el marcador «Motivo
-                (obligatorio)» lo anuncian cuando la fila lleva ajuste. La
-                guarda de verdad vive en el servicio; la comprobación de la
-                pantalla nombra al empleado y, ahora, avisa INLINE junto al
-                campo (texto plano, nunca un `Alert` ni un `role=` a mano).
-              */}
-              <td className={tableCellClass}>
-                <input
-                  type="text"
-                  value={reasonValue}
-                  onChange={(event) => onAdjustmentChange(row.employeeId, "reason", event.target.value)}
-                  maxLength={ADJUSTMENT_REASON_MAX_LENGTH}
-                  aria-label={`Motivo del ajuste de ${employeeName(row.employeeId)}`}
-                  aria-required={reasonRequired}
-                  placeholder={reasonRequired ? "Motivo (obligatorio)" : "—"}
-                  className={tableInputClass}
-                />
-                {/* El aviso vive pegado al campo, no en el error de la
-                    página: con el diálogo abierto ese error queda detrás. */}
-                {reasonMissing && (
-                  <p className="mt-1 text-xs text-error">
-                    {`Falta el motivo del ajuste de ${employeeName(row.employeeId)}.`}
-                  </p>
-                )}
-              </td>
+              <td className={tableCellClass}>{adjustmentReasonValue(row.employeeId) || "—"}</td>
                 <td className={cn(moneyCellClass, "font-semibold")}>
                 {item ? formatMoney(item.net_pay) : "—"}
               </td>
@@ -835,23 +808,28 @@ function DraftPayrollTable({
               <td className={moneyCellClass}>{item ? formatMoney(item.remaining) : "—"}</td>
               <td className={tableCellClass}>
                 {item ? (
-                  <span className="inline-flex flex-wrap gap-2">
+                  <span className="inline-flex gap-1">
                     <button
                       type="button"
+                      title={canPay && item.remaining > 0 ? "Pagar" : "Ver detalle"}
                       onClick={() => onView(item)}
-                      aria-label={`Ver el desglose de ${employeeName(row.employeeId)}`}
-                      className={ghostClass}
+                      aria-label={`${canPay && item.remaining > 0 ? "Pagar" : "Ver detalle"} de ${employeeName(row.employeeId)}`}
+                      className={tableActionClass}
                     >
-                      Ver
+                      {canPay && item.remaining > 0 ? (
+                        <HandCoins className="h-4 w-4" aria-hidden="true" />
+                      ) : (
+                        <Eye className="h-4 w-4" aria-hidden="true" />
+                      )}
                     </button>
-                    {/* F6: mismo modal de facturas y vales que la tabla cerrada. */}
                     <button
                       type="button"
+                      title="Ver fuentes"
                       onClick={() => onViewSources(item)}
-                      aria-label={`Ver facturas y vales de ${employeeName(row.employeeId)}`}
-                      className={ghostClass}
+                      aria-label={`Ver fuentes de ${employeeName(row.employeeId)}`}
+                      className={tableActionClass}
                     >
-                      Ver facturas y vales
+                      <ReceiptText className="h-4 w-4" aria-hidden="true" />
                     </button>
                   </span>
                 ) : (
@@ -885,6 +863,7 @@ interface ExpandedItemPanelProps {
   methods: PaymentMethodRow[];
   canPay: boolean;
   busy: boolean;
+  error: string | null;
   portions: PortionDraft[];
   onPortionChange: (key: string, patch: Partial<Pick<PortionDraft, "method_code" | "amount">>) => void;
   onAddPortion: () => void;
@@ -904,6 +883,7 @@ function ExpandedItemPanel({
   methods,
   canPay,
   busy,
+  error,
   portions,
   onPortionChange,
   onAddPortion,
@@ -938,6 +918,7 @@ function ExpandedItemPanel({
           ))}
         </ul>
       )}
+      {error ? <Alert variant="destructive" className="mt-3">{error}</Alert> : null}
       {canPay && (
         <form
           onSubmit={(event) => {
@@ -1067,23 +1048,13 @@ interface SettlementSourcesPanelProps {
    */
   item: DetailItem | null;
   busy: boolean;
-  invoiceTargetId: string | null;
-  invoiceDetail: InvoiceDetail | null;
-  invoiceBusy: boolean;
-  voucherTargetId: string | null;
-  voucherDetail: VoucherRequestRow | null;
-  voucherBusy: boolean;
-  employeeName: (id: string) => string;
   onViewInvoice: (invoiceId: string) => void;
   onViewVoucher: (voucher: PayrollSettlementVoucher) => void;
 }
 
 /**
- * F6: contenido del modal "Ver facturas y vales": las dos listas del empleado
- * (facturas y vales) y el detalle de la fila elegida, en un panel EN LÍNEA (no
- * otro diálogo). El detalle de la factura sale de la lectura EXISTENTE de
- * facturación (`getInvoiceAction`) y el del vale de la lectura existente de
- * vales (`listVouchersAction`): acá no se duplica ninguna consulta.
+ * F6: listas de facturas y vales de la liquidación. Cada detalle se abre en su
+ * propio diálogo con las lecturas existentes de facturación y vales.
  *
  * El ajuste del mixto (`ajuste_mixto`) NO es una factura: se muestra aparte, con
  * su monto y su explicación, para que el lector no lo confunda con un
@@ -1099,13 +1070,6 @@ function SettlementSourcesPanel({
   sources,
   item,
   busy,
-  invoiceTargetId,
-  invoiceDetail,
-  invoiceBusy,
-  voucherTargetId,
-  voucherDetail,
-  voucherBusy,
-  employeeName,
   onViewInvoice,
   onViewVoucher,
 }: SettlementSourcesPanelProps) {
@@ -1119,7 +1083,7 @@ function SettlementSourcesPanel({
         <section className="rounded-md border border-border-color p-3 dark:border-border-color-2">
           <h3 className="text-sm font-semibold text-text-primary">Ajuste del mixto</h3>
           <p className="mt-1 text-sm text-text-secondary">
-            {`El básico absorbió ${formatMoney(-sources.adjustment.commission)} de los porcentajes de servicios: ese porcentaje no se suma aparte. Se muestra en negativo para que la suma del detalle cuadre con las comisiones.`}
+            {`Su salario base ya cubre ${formatMoney(-sources.adjustment.commission)} de comisiones de este período, por eso no se suman aparte.`}
           </p>
           <p className="mt-1 text-sm font-semibold text-text-primary">
             {formatMoney(sources.adjustment.commission)}
@@ -1145,7 +1109,9 @@ function SettlementSourcesPanel({
                   {`Factura #${invoice.consecutive_number ?? "sin consecutivo"}`}
                 </span>
                 <span className="text-sm text-text-secondary">
-                  {`Comisión de la liquidación: ${formatMoney(invoice.commission)}`}
+                  {invoice.percent_commission !== 0 && invoice.fixed_commission !== 0
+                    ? `Fija ${formatMoney(invoice.fixed_commission)} · Porcentaje ${formatMoney(invoice.percent_commission)}`
+                    : `${invoice.percent_commission !== 0 ? "Porcentaje" : "Fija"} ${formatMoney(invoice.commission)}`}
                 </span>
                 <button
                   type="button"
@@ -1156,42 +1122,6 @@ function SettlementSourcesPanel({
                   Ver detalle
                 </button>
               </div>
-              {invoiceTargetId === invoice.invoice_id ? (
-                <div className="mt-2 rounded bg-surface-hover p-2">
-                  {invoiceBusy ? (
-                    <p className="text-xs text-text-tertiary">Leyendo la factura…</p>
-                  ) : invoiceDetail ? (
-                    <>
-                      <dl className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                        <SourceDetailField label="Consecutivo">
-                          {invoiceDetail.invoice.consecutive_number}
-                        </SourceDetailField>
-                        <SourceDetailField label="Estado">{invoiceDetail.invoice.status}</SourceDetailField>
-                        <SourceDetailField label="Cliente">
-                          {invoiceDetail.invoice.client_name ?? "—"}
-                        </SourceDetailField>
-                        <SourceDetailField label="Fecha">
-                          {formatBogotaFullDateTime(invoiceDetail.invoice.created_at)}
-                        </SourceDetailField>
-                        <SourceDetailField label="Total">
-                          {formatMoney(invoiceDetail.invoice.total)}
-                        </SourceDetailField>
-                        <SourceDetailField label="Pagado">{formatMoney(invoiceDetail.paid)}</SourceDetailField>
-                        <SourceDetailField label="Saldo">{formatMoney(invoiceDetail.remaining)}</SourceDetailField>
-                      </dl>
-                      <ul className="mt-2 flex flex-col gap-1 text-xs text-text-secondary">
-                        {invoiceDetail.items.map((item) => (
-                          <li key={item.id}>
-                            {`${item.custom_name ?? detailLineLabel(item.item_type)} × ${item.qty} = ${formatMoney(item.subtotal)}`}
-                          </li>
-                        ))}
-                      </ul>
-                    </>
-                  ) : (
-                    <p className="text-xs text-text-tertiary">No se pudo abrir la factura.</p>
-                  )}
-                </div>
-              ) : null}
             </li>
           ))}
         </ul>
@@ -1220,40 +1150,6 @@ function SettlementSourcesPanel({
                   Ver detalle
                 </button>
               </div>
-              {voucherTargetId === voucher.id ? (
-                <div className="mt-2 rounded bg-surface-hover p-2">
-                  {voucherBusy ? (
-                    <p className="text-xs text-text-tertiary">Leyendo el vale…</p>
-                  ) : voucherDetail ? (
-                    <dl className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                      <SourceDetailField label="Empleado">
-                        {employeeName(voucherDetail.employee_id)}
-                      </SourceDetailField>
-                      <SourceDetailField label="Monto">{formatMoney(voucherDetail.amount)}</SourceDetailField>
-                      <SourceDetailField label="Fecha de solicitud">
-                        {voucherDetail.request_date}
-                      </SourceDetailField>
-                      <SourceDetailField label="Estado">{voucherDetail.status}</SourceDetailField>
-                      <SourceDetailField label="Método de pago">
-                        {voucherDetail.method_code ?? "—"}
-                      </SourceDetailField>
-                      <SourceDetailField label="Creado por">
-                        {voucherDetail.created_by_name ?? "—"}
-                      </SourceDetailField>
-                      {voucherDetail.approved_by_name ? (
-                        <SourceDetailField label="Aprobado por">
-                          {voucherDetail.approved_by_name}
-                        </SourceDetailField>
-                      ) : null}
-                      <SourceDetailField label="Observación">
-                        {voucherDetail.observation ?? "-"}
-                      </SourceDetailField>
-                    </dl>
-                  ) : (
-                    <p className="text-xs text-text-tertiary">No se pudo abrir el vale.</p>
-                  )}
-                </div>
-              ) : null}
             </li>
           ))}
         </ul>
@@ -1277,6 +1173,9 @@ export function PayrollClient(props: PayrollClientProps) {
   const [selectedId, setSelectedId] = useState<string | null>(props.initialPeriods[0]?.id ?? null);
   const [detail, setDetail] = useState<PeriodDetail | null>(null);
   const [detailTargetId, setDetailTargetId] = useState<string | null>(null);
+  const [paymentError, setPaymentError] = useState<string | null>(null);
+  // Errors of the payment dialog stay inside that dialog.
+  const paymentFeedback = { setError: setPaymentError };
   // PA3: el resumen por período llega leído del servidor (agrega plata de TODA
   // la planta) y se PISA con el detalle más fresco de cada período: abrir,
   // calcular, pagar, cerrar o borrar. Es estado, no derivación, porque el
@@ -1308,6 +1207,10 @@ export function PayrollClient(props: PayrollClientProps) {
     employeeId: string;
     rows: PayrollMonthEmployeeRow[];
   } | null>(null);
+  const [monthPaymentTarget, setMonthPaymentTarget] = useState<string | null>(null);
+  const [monthPaymentRows, setMonthPaymentRows] = useState<PayrollItemPaymentDetail[] | null>(null);
+  const [monthPaymentBusy, setMonthPaymentBusy] = useState(false);
+  const [monthPaymentError, setMonthPaymentError] = useState<string | null>(null);
   // Un solo canal de ESTADO: lo que sigue siendo el caso mientras no se
   // corrija (fallo de acción o validación incompleta). Lo que acaba de pasar
   // (éxito) es EVENTO y sale por `toast`, no por estado.
@@ -1426,6 +1329,13 @@ export function PayrollClient(props: PayrollClientProps) {
   const [adjustments, setAdjustments] = useState<
     Record<string, Partial<Record<AdjustmentField, string>>>
   >({});
+  const [adjustmentDialog, setAdjustmentDialog] = useState<{
+    employeeId: string;
+    field: AdjustmentMoneyField;
+    value: string;
+    reason: string;
+  } | null>(null);
+  const [adjustmentError, setAdjustmentError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [detailDialogOpen, setDetailDialogOpen] = useState(false);
   // Confirmación clásica antes de una acción destructiva (borrar borrador).
@@ -1468,6 +1378,7 @@ export function PayrollClient(props: PayrollClientProps) {
    */
   const [sourcesTarget, setSourcesTarget] = useState<{ periodId: string; employeeId: string } | null>(null);
   const [sources, setSources] = useState<PayrollSettlementSources | null>(null);
+  const [sourcesVisible, setSourcesVisible] = useState(false);
   const [sourcesBusy, setSourcesBusy] = useState(false);
   /** F6: detalle de la factura abierta con la lectura existente de facturación. */
   const [invoiceTargetId, setInvoiceTargetId] = useState<string | null>(null);
@@ -1505,8 +1416,16 @@ export function PayrollClient(props: PayrollClientProps) {
   // Filas del borrador: la planta activa más los empleados ya calculados que
   // hayan quedado inactivos después del cálculo (no se pierden al recalcular).
   const itemByEmployee = new Map((detail?.items ?? []).map((item) => [item.employee_id, item]));
+  const selectedPeriodFrequency = periods.find((row) => row.id === selectedId)?.frequency ?? null;
   const activeEmployeeIds = props.initialEmployees
-    .filter((row) => row.is_active)
+    .filter(
+      (row) =>
+        row.is_active &&
+        !periodExcludesEmployeeByCadence({
+          employeeFrequency: row.pay_frequency,
+          periodFrequency: selectedPeriodFrequency,
+        }),
+    )
     .map((row) => row.id);
   const draftEmployeeIds = [
     ...activeEmployeeIds,
@@ -1519,11 +1438,15 @@ export function PayrollClient(props: PayrollClientProps) {
     item: itemByEmployee.get(employeeId) ?? null,
   }));
 
-  function show<T>(result: ActionResult<T>, okText?: string): result is { success: true; data: T } {
+  function show<T>(
+    result: ActionResult<T>,
+    okText?: string,
+    setFailure?: (message: string) => void,
+  ): result is { success: true; data: T } {
     if (!result.success) {
-      // El fallo de una acción es ESTADO: deja el mensaje en la vista,
-      // persistente mientras el problema exista.
-      setError(`${result.code}: ${result.message}`);
+      // El fallo es ESTADO: un modal lo muestra adentro; la página, arriba.
+      if (setFailure) setFailure(result.message);
+      else setError(`${result.code}: ${result.message}`);
       return false;
     }
     if (okText) {
@@ -1565,6 +1488,30 @@ export function PayrollClient(props: PayrollClientProps) {
       ...prev,
       [employeeId]: { ...prev[employeeId], [field]: value },
     }));
+  }
+
+  function openAdjustmentDialog(employeeId: string, field: AdjustmentMoneyField) {
+    setAdjustmentError(null);
+    setAdjustmentDialog({
+      employeeId,
+      field,
+      value: adjustmentValue(employeeId, field),
+      reason: adjustmentReasonValue(employeeId),
+    });
+  }
+
+  function saveAdjustmentDialog(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!adjustmentDialog) return;
+    const current = toNumber(adjustmentValue(adjustmentDialog.employeeId, adjustmentDialog.field)) ?? 0;
+    const next = toNumber(adjustmentDialog.value) ?? 0;
+    if (next !== current && !adjustmentDialog.reason.trim()) {
+      setAdjustmentError("Escriba el motivo del cambio.");
+      return;
+    }
+    updateAdjustment(adjustmentDialog.employeeId, adjustmentDialog.field, adjustmentDialog.value);
+    updateAdjustment(adjustmentDialog.employeeId, "reason", adjustmentDialog.reason);
+    setAdjustmentDialog(null);
   }
 
   async function refreshPeriods(select?: string) {
@@ -1957,6 +1904,7 @@ export function PayrollClient(props: PayrollClientProps) {
 
   /** Abre el desglose de un ítem y deja una porción lista con el saldo pendiente. */
   function openItemDetail(item: DetailItem) {
+    setPaymentError(null);
     setDetailTargetId(item.id);
     if (!props.canPay || item.remaining <= 0) return;
     if (itemPortions(item.id).length > 0) return;
@@ -1969,18 +1917,28 @@ export function PayrollClient(props: PayrollClientProps) {
    * El empleado logueado solo puede abrir la suya (el alcance por fila lo aplica
    * la action, igual que el detalle del período).
    */
-  async function openSettlementSources(periodId: string, employeeId: string) {
+  function openSettlementSources(periodId: string, employeeId: string) {
     setSourcesTarget({ periodId, employeeId });
     setSources(null);
-    setSourcesBusy(true);
-    // El detalle de una fila anterior no sobrevive al cambio de empleado.
+    setSourcesVisible(false);
+    setSourcesBusy(false);
     setInvoiceTargetId(null);
     setInvoiceDetail(null);
     setVoucherTargetId(null);
     setVoucherDetail(null);
+  }
+
+  async function toggleSettlementSources() {
+    if (sourcesVisible) {
+      setSourcesVisible(false);
+      return;
+    }
+    setSourcesVisible(true);
+    if (!sourcesTarget || sources !== null || sourcesBusy) return;
+    setSourcesBusy(true);
     const result = (await getPayrollSettlementSourcesAction(
-      periodId,
-      employeeId,
+      sourcesTarget.periodId,
+      sourcesTarget.employeeId,
     )) as ActionResult<PayrollSettlementSources>;
     setSourcesBusy(false);
     if (show(result)) setSources(result.data);
@@ -1989,6 +1947,7 @@ export function PayrollClient(props: PayrollClientProps) {
   function closeSettlementSources() {
     setSourcesTarget(null);
     setSources(null);
+    setSourcesVisible(false);
     setSourcesBusy(false);
     setInvoiceTargetId(null);
     setInvoiceDetail(null);
@@ -2030,14 +1989,14 @@ export function PayrollClient(props: PayrollClientProps) {
   async function handlePay(item: DetailItem) {
     const rows = itemPortions(item.id);
     if (rows.length === 0) {
-      setError("Agregue al menos una porción de pago.");
+      paymentFeedback.setError("Agregue al menos una porción de pago.");
       return;
     }
     const parts: Array<{ method_code: string; amount: number }> = [];
     for (const row of rows) {
       const amount = toNumber(row.amount);
       if (!row.method_code.trim() || amount === null || amount <= 0) {
-        setError("Complete el método y un monto mayor a 0 en cada porción.");
+        paymentFeedback.setError("Complete el método y un monto mayor a 0 en cada porción.");
         return;
       }
       parts.push({ method_code: row.method_code.trim(), amount });
@@ -2046,11 +2005,12 @@ export function PayrollClient(props: PayrollClientProps) {
     // pendiente (misma regla OVERPAID que `assertNoOverpay`).
     const total = parts.reduce((acc, part) => acc + part.amount, 0);
     if (total - item.remaining > 0.009) {
-      setError(
+      setPaymentError(
         `Las porciones (${formatMoney(total)}) superan el saldo pendiente (${formatMoney(item.remaining)}).`,
       );
       return;
     }
+    setPaymentError(null);
     setBusy(true);
     // CL-2: la marca del INTENTO. Se acuña al empezar y se conserva si el
     // intento falla (el reintento tiene que llevar la misma para que el
@@ -2064,7 +2024,7 @@ export function PayrollClient(props: PayrollClientProps) {
       portions: parts,
     })) as ActionResult<{ paid: number; remaining: number }>;
     setBusy(false);
-    if (show(result, "Pago registrado.")) {
+    if (show(result, "Pago registrado.", setPaymentError)) {
       // El intento TERMINÓ bien: el próximo pago de este ítem es OTRO intento y
       // merece otra marca (si no, devolvería este mismo pago).
       paymentKeyRef.current.delete(item.id);
@@ -2208,7 +2168,7 @@ export function PayrollClient(props: PayrollClientProps) {
     })) as ActionResult<PayrollPeriodCorrectionResult>;
     setCorrectionBusy(false);
     if (
-      show(result, "Período corregido. La corrección queda registrada y no mueve dinero.")
+      show(result, "Período corregido. La corrección queda registrada y no mueve dinero.", setCorrectionError)
     ) {
       closeCorrectionDialog();
       // La corrección no cambia la liquidación firmada: se recarga igual para
@@ -2696,14 +2656,22 @@ export function PayrollClient(props: PayrollClientProps) {
     });
   }
 
+  async function openMonthPaymentDetail(entry: PayrollMonthEmployeeRow["periods"][number]) {
+    setMonthPaymentTarget(entry.itemId);
+    setMonthPaymentRows(null);
+    setMonthPaymentError(null);
+    setMonthPaymentBusy(true);
+    const result = (await getPeriodDetailAction(entry.periodId)) as ActionResult<PeriodDetail>;
+    setMonthPaymentBusy(false);
+    if (!show(result, undefined, setMonthPaymentError)) return;
+    const item = result.data.items.find((candidate) => candidate.id === entry.itemId);
+    if (item) setMonthPaymentRows(item.payments);
+    else setMonthPaymentError("No se encontró el pago.");
+  }
+
   // Unión de meses: los períodos vivos de la pantalla y los meses Bogotá de los
   // extraordinarios que devuelve el servidor.
-  const queryMonthOptions = [
-    ...new Set([
-      ...groupPayrollPeriodsByMonth(periods).map((group) => group.month).filter((month) => month !== ""),
-      ...monthOptions,
-    ]),
-  ].sort((left, right) => (left < right ? 1 : -1));
+  const queryMonthOptions = [...new Set(monthOptions)].sort((left, right) => (left < right ? 1 : -1));
 
   /** Sueldo mensual del empleado: la base de la prorata, a la vista. */
   function monthSalaryLabel(id: string): string {
@@ -2950,12 +2918,7 @@ export function PayrollClient(props: PayrollClientProps) {
         <TabsPanel value="pagos-mes" className={sectionClass}>
           <h2 className="text-lg font-semibold">Pagos del mes por empleado</h2>
           <p className="mt-2 text-sm text-text-secondary">
-            Lo que cada empleado lleva liquidado y pagado en el mes, y contra qué períodos. El fijo
-            se muestra prorrateado por los días nominados: el sueldo mensual es la base, no lo que se
-            paga en cada período. Un período que cruza el fin de mes se prorratea en los dos meses y
-            acá aparece en el mes donde empieza. Los pagos extraordinarios se listan aparte por su
-            fecha en Bogotá: suman al total pagado del mes, pero no cambian el neto ni el saldo de
-            los períodos.
+            Períodos cerrados y pagos extraordinarios del mes.
           </p>
           {/*
             PA3 (consulta puntual): el mes y el empleado los ELIGE el admin; la
@@ -3032,13 +2995,13 @@ export function PayrollClient(props: PayrollClientProps) {
                       Pagado períodos
                     </th>
                     <th className={tableCellClass} scope="col">
-                      Pagado mes (incluye extraordinarios)
+                      Pagado mes
                     </th>
                     <th className={tableCellClass} scope="col">
                       Saldo
                     </th>
                     <th className={tableCellClass} scope="col">
-                      Períodos y pagos extraordinarios
+                      Pagos
                     </th>
                   </tr>
                 </thead>
@@ -3066,10 +3029,19 @@ export function PayrollClient(props: PayrollClientProps) {
                       <td className={tableCellClass}>
                         <ul className="flex flex-col gap-0.5">
                           {row.periods.map((entry) => (
-                            <li key={entry.periodId}>
-                              {formatPeriodLabel(entry)} ({entry.status}): neto{" "}
-                              {formatMoney(entry.net)}, pagado {formatMoney(entry.paid)}, saldo{" "}
-                              {formatMoney(entry.remaining)}
+                            <li key={entry.periodId} className="flex items-center gap-2">
+                              <span>
+                                {formatPeriodLabel(entry)}: pagado {formatMoney(entry.paid)}
+                              </span>
+                              <button
+                                type="button"
+                                title="Ver detalle"
+                                aria-label={`Ver detalle de pagos de ${formatPeriodLabel(entry)}`}
+                                onClick={() => void openMonthPaymentDetail(entry)}
+                                className={tableActionClass}
+                              >
+                                <Eye className="h-4 w-4" aria-hidden="true" />
+                              </button>
                             </li>
                           ))}
                           {row.extras.map((entry) => (
@@ -3086,7 +3058,7 @@ export function PayrollClient(props: PayrollClientProps) {
                   {monthQuery.rows.length === 0 && (
                     <tr className={tableRowClass}>
                       <td className={tableCellClass} colSpan={7}>
-                        {`Sin pagos de nómina de ${employeeName(monthQuery.employeeId)} en ${payrollMonthLabel(monthQuery.month)}.`}
+                        {`Sin pagos cerrados en ${payrollMonthLabel(monthQuery.month)}.`}
                       </td>
                     </tr>
                   )}
@@ -3646,9 +3618,10 @@ export function PayrollClient(props: PayrollClientProps) {
                       items={detail.items}
                       employeeName={employeeName}
                       payLabel={employeePayLabel}
+                      canPay={props.canPay}
                       onView={openItemDetail}
                       onViewSources={(item) =>
-                        void openSettlementSources(selected.id, item.employee_id)
+                        openSettlementSources(selected.id, item.employee_id)
                       }
                     />
                   )}
@@ -3714,10 +3687,11 @@ export function PayrollClient(props: PayrollClientProps) {
                     payLabel={employeePayLabel}
                     adjustmentValue={adjustmentValue}
                     adjustmentReasonValue={adjustmentReasonValue}
-                    onAdjustmentChange={updateAdjustment}
+                    onEditAdjustment={openAdjustmentDialog}
+                    canPay={props.canPay}
                     onView={openItemDetail}
                     onViewSources={(item) =>
-                      void openSettlementSources(selected.id, item.employee_id)
+                      openSettlementSources(selected.id, item.employee_id)
                     }
                   />
                   {pendingItems.length > 0 && (
@@ -3774,9 +3748,10 @@ export function PayrollClient(props: PayrollClientProps) {
                     items={detail.items}
                     employeeName={employeeName}
                     payLabel={employeePayLabel}
+                    canPay={props.canPay}
                     onView={openItemDetail}
                     onViewSources={(item) =>
-                      void openSettlementSources(selected.id, item.employee_id)
+                      openSettlementSources(selected.id, item.employee_id)
                     }
                   />
                 )
@@ -3812,15 +3787,14 @@ export function PayrollClient(props: PayrollClientProps) {
           <DialogContent className="max-w-3xl">
             <DialogHeader>
               <DialogTitle>Desglose de {employeeName(detailTarget.employee_id)}</DialogTitle>
-              <DialogDescription>
-                Comisiones del período y registro de pagos por porciones.
-              </DialogDescription>
+              <DialogDescription>Comisiones y pagos del período.</DialogDescription>
             </DialogHeader>
             <ExpandedItemPanel
               item={detailTarget}
               methods={props.methods}
               canPay={props.canPay && detailTarget.remaining > 0}
               busy={busy}
+              error={paymentError}
               portions={itemPortions(detailTarget.id)}
               onPortionChange={(key, patch) => changePortion(detailTarget.id, key, patch)}
               onAddPortion={() => addPortion(detailTarget)}
@@ -3833,6 +3807,80 @@ export function PayrollClient(props: PayrollClientProps) {
                 Cerrar
               </button>
             </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {monthPaymentTarget && (
+        <Dialog open onOpenChange={(open) => !open && setMonthPaymentTarget(null)}>
+          <DialogContent className="max-w-xl">
+            <DialogHeader><DialogTitle>Detalle de pagos</DialogTitle></DialogHeader>
+            {monthPaymentBusy ? <p className="text-sm text-text-tertiary">Leyendo pagos…</p> : null}
+            {monthPaymentError ? <Alert variant="destructive">{monthPaymentError}</Alert> : null}
+            {monthPaymentRows ? (
+              <div className="mt-3 overflow-x-auto"><table className="w-full text-left text-sm">
+                <thead><tr className={tableHeaderClass}><th className={tableCellClass}>Método</th><th className={moneyHeadClass}>Monto</th><th className={tableCellClass}>Fecha</th><th className={tableCellClass}>Pagó</th></tr></thead>
+                <tbody>{monthPaymentRows.map((payment) => <tr key={payment.id} className={tableRowClass}><td className={tableCellClass}>{methodLabel(payment.method_code)}</td><td className={moneyCellClass}>{formatMoney(payment.amount)}</td><td className={tableCellClass}>{formatBogotaFullDateTime(payment.paid_at)}</td><td className={tableCellClass}>{payment.paid_by_name ?? "—"}</td></tr>)}</tbody>
+              </table></div>
+            ) : null}
+            <DialogFooter><button type="button" className={ghostClass} onClick={() => setMonthPaymentTarget(null)}>Cerrar</button></DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {adjustmentDialog && (
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setAdjustmentDialog(null);
+          }}
+        >
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>
+                {adjustmentDialog.field === "bonuses" ? "Editar bonos" : "Editar otros descuentos"}
+              </DialogTitle>
+              <DialogDescription>{employeeName(adjustmentDialog.employeeId)}</DialogDescription>
+            </DialogHeader>
+            <form onSubmit={saveAdjustmentDialog} className="mt-4 flex flex-col gap-4">
+              <label className={labelClass} htmlFor="payroll-adjustment-value">
+                Nuevo valor
+                <input
+                  id="payroll-adjustment-value"
+                  inputMode="numeric"
+                  value={formatMoneyInput(adjustmentDialog.value)}
+                  onChange={(event) => {
+                    setAdjustmentDialog({ ...adjustmentDialog, value: stripMoneyInput(event.target.value) });
+                    setAdjustmentError(null);
+                  }}
+                  className={inputClass}
+                  autoFocus
+                />
+              </label>
+              <label className={labelClass} htmlFor="payroll-adjustment-reason">
+                Motivo
+                <textarea
+                  id="payroll-adjustment-reason"
+                  value={adjustmentDialog.reason}
+                  onChange={(event) => {
+                    setAdjustmentDialog({ ...adjustmentDialog, reason: event.target.value });
+                    setAdjustmentError(null);
+                  }}
+                  maxLength={ADJUSTMENT_REASON_MAX_LENGTH}
+                  rows={2}
+                  className={inputClass}
+                />
+              </label>
+              {adjustmentError ? <Alert variant="destructive">{adjustmentError}</Alert> : null}
+              <DialogFooter>
+                <button type="button" className={ghostClass} onClick={() => setAdjustmentDialog(null)}>
+                  Cancelar
+                </button>
+                <button type="submit" className={buttonClass}>
+                  Aplicar
+                </button>
+              </DialogFooter>
+            </form>
           </DialogContent>
         </Dialog>
       )}
@@ -3858,20 +3906,23 @@ export function PayrollClient(props: PayrollClientProps) {
               </DialogDescription>
             </DialogHeader>
             <div className="max-h-[calc(100dvh-12rem)] overflow-y-auto pr-1">
-              <SettlementSourcesPanel
-                sources={sources}
-                item={itemByEmployee.get(sourcesTarget.employeeId) ?? null}
-                busy={sourcesBusy}
-                invoiceTargetId={invoiceTargetId}
-                invoiceDetail={invoiceDetail}
-                invoiceBusy={invoiceBusy}
-                voucherTargetId={voucherTargetId}
-                voucherDetail={voucherDetail}
-                voucherBusy={voucherBusy}
-                employeeName={employeeName}
-                onViewInvoice={(invoiceId) => void openInvoiceDetail(invoiceId)}
-                onViewVoucher={(voucher) => void openVoucherDetail(voucher)}
-              />
+              <button
+                type="button"
+                onClick={() => void toggleSettlementSources()}
+                className={ghostClass}
+                aria-expanded={sourcesVisible}
+              >
+                {sourcesVisible ? "Ocultar fuentes" : "Ver facturas y vales"}
+              </button>
+              {sourcesVisible ? (
+                <SettlementSourcesPanel
+                  sources={sources}
+                  item={itemByEmployee.get(sourcesTarget.employeeId) ?? null}
+                  busy={sourcesBusy}
+                  onViewInvoice={(invoiceId) => void openInvoiceDetail(invoiceId)}
+                  onViewVoucher={(voucher) => void openVoucherDetail(voucher)}
+                />
+              ) : null}
             </div>
             <DialogFooter className="mt-4">
               <button type="button" className={ghostClass} onClick={closeSettlementSources}>
@@ -3887,6 +3938,45 @@ export function PayrollClient(props: PayrollClientProps) {
         diálogo dice, en el mismo lugar donde se firma, que la corrección no
         mueve dinero y que la diferencia se salda con un pago extraordinario.
       */}
+      {invoiceTargetId && (
+        <Dialog open onOpenChange={(open) => !open && setInvoiceTargetId(null)}>
+          <DialogContent className="max-w-3xl">
+            <DialogHeader>
+              <DialogTitle>Detalle de factura</DialogTitle>
+            </DialogHeader>
+            {invoiceBusy ? (
+              <p className="text-sm text-text-tertiary">Leyendo la factura…</p>
+            ) : invoiceDetail ? (
+              <>
+                <div className="flex flex-wrap justify-between gap-2 text-sm">
+                  <span>Factura #{invoiceDetail.invoice.consecutive_number}</span>
+                  <span>{invoiceDetail.invoice.status}</span>
+                  <span>{formatMoney(invoiceDetail.invoice.total)}</span>
+                </div>
+                <div className="mt-3 overflow-x-auto"><table className="w-full text-left text-sm">
+                  <thead><tr className={tableHeaderClass}><th className={tableCellClass}>Ítem</th><th className={moneyHeadClass}>Cant.</th><th className={moneyHeadClass}>Subtotal</th></tr></thead>
+                  <tbody>{invoiceDetail.items.map((row) => <tr key={row.id} className={tableRowClass}><td className={tableCellClass}>{row.custom_name ?? detailLineLabel(row.item_type)}</td><td className={moneyCellClass}>{row.qty}</td><td className={moneyCellClass}>{formatMoney(row.subtotal)}</td></tr>)}</tbody>
+                </table></div>
+                <p className="mt-3 text-right text-sm font-semibold">Total: {formatMoney(invoiceDetail.invoice.total)}</p>
+              </>
+            ) : <p className="text-sm text-text-tertiary">No se pudo abrir la factura.</p>}
+            <DialogFooter><button type="button" className={ghostClass} onClick={() => setInvoiceTargetId(null)}>Cerrar</button></DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {voucherTargetId && (
+        <Dialog open onOpenChange={(open) => !open && setVoucherTargetId(null)}>
+          <DialogContent className="max-w-lg">
+            <DialogHeader><DialogTitle>Detalle del vale</DialogTitle></DialogHeader>
+            {voucherBusy ? <p className="text-sm text-text-tertiary">Leyendo el vale…</p> : voucherDetail ? (
+              <dl className="grid grid-cols-1 gap-3 sm:grid-cols-2"><SourceDetailField label="Empleado">{employeeName(voucherDetail.employee_id)}</SourceDetailField><SourceDetailField label="Monto">{formatMoney(voucherDetail.amount)}</SourceDetailField><SourceDetailField label="Fecha">{voucherDetail.request_date}</SourceDetailField><SourceDetailField label="Estado">{voucherDetail.status}</SourceDetailField><SourceDetailField label="Método">{voucherDetail.method_code ?? "—"}</SourceDetailField><SourceDetailField label="Observación">{voucherDetail.observation ?? "—"}</SourceDetailField></dl>
+            ) : <p className="text-sm text-text-tertiary">No se pudo abrir el vale.</p>}
+            <DialogFooter><button type="button" className={ghostClass} onClick={() => setVoucherTargetId(null)}>Cerrar</button></DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
       {props.canAdmin && selected && (
         <Dialog
           open={correctionDialogOpen}

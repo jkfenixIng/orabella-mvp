@@ -3130,30 +3130,20 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
     expect(payrollPagedStub.rpcCalls).toHaveLength(0);
   });
 
-  it("cadencia indefinida en el legajo: conserva el prorrateo por días Y las comisiones (F4)", async () => {
+  it("cadencia indefinida en el legajo queda fuera del período regular", async () => {
     seed({
       periodFrequency: "semanal",
-      startDate: "2026-01-01",
-      endDate: "2026-01-07",
       employees: [
         { pay_type: "mixto", pay_frequency: null, salary_fixed: 1_200_000, commission_percent: 10 },
       ],
       lines: [{ item_type: "servicio", subtotal: 4_000_000 }],
     });
     await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
-    const item = itemFor("empleado-1");
-    // Falta la cadencia del empleado: rige el comportamiento de HOY, exacto.
-    expect(item.base_fixed).toBe(
-      prorateFixedSalary({ salaryFixed: 1_200_000, startDate: "2026-01-01", endDate: "2026-01-07" }),
-    );
-    expect(item.base_fixed).not.toBe(300_000); // no la fracción mensual/4
-    expect(item.commissions).toBe(400_000); // 10% de 4.000.000, como hoy
-    expect(item.net_pay).toBe(Math.round(item.base_fixed as number) + 400_000);
-    expect(detailSum(item)).toBe(400_000);
-    expectIdentity(item);
+    expect(payrollPagedStub.itemsUpsert).toBeNull();
+    expect(payrollPagedStub.rpcCalls).toHaveLength(0);
   });
 
-  it("sin cadencia en el período ni en el legajo rige el prorrateo por días de hoy", async () => {
+  it("un período heredado sin cadencia conserva su planta y el prorrateo por días", async () => {
     seed({
       periodFrequency: null,
       startDate: "2026-01-01",
@@ -3162,11 +3152,7 @@ describe("payroll: la cadencia decide el fijo y el mixto cobra el mayor (F3)", (
     });
     await calculatePayroll(payrollPagedStub.PERIOD_ID, {}, ACTOR);
     const item = itemFor("empleado-1");
-    expect(item.base_fixed).toBe(
-      prorateFixedSalary({ salaryFixed: 1_500_000, startDate: "2026-01-01", endDate: "2026-01-07" }),
-    );
     expect(item.base_fixed).toBe(338_710);
-    expect(item.base_fixed).not.toBe(375_000);
     expectIdentity(item);
   });
 
@@ -5484,33 +5470,19 @@ describe("payroll: la cadencia del período, exclusión y cubo de solape (F4, fu
     expect(periodCadenceBucket("mensual")).toBe("mensual");
   });
 
-  it("excluye SÓLO cuando las dos cadencias están definidas y difieren", () => {
+  it("un período con cadencia incluye SÓLO a quien tiene esa misma cadencia", () => {
     expect(
       periodExcludesEmployeeByCadence({ employeeFrequency: "mensual", periodFrequency: "semanal" }),
     ).toBe(true);
     expect(
-      periodExcludesEmployeeByCadence({ employeeFrequency: "semanal", periodFrequency: "quincenal" }),
-    ).toBe(true);
-    expect(
       periodExcludesEmployeeByCadence({ employeeFrequency: "semanal", periodFrequency: "semanal" }),
     ).toBe(false);
-    // Cualquiera de los dos lados sin cadencia conserva el comportamiento de hoy.
-    expect(
-      periodExcludesEmployeeByCadence({ employeeFrequency: null, periodFrequency: "semanal" }),
-    ).toBe(false);
-    expect(
-      periodExcludesEmployeeByCadence({ employeeFrequency: "semanal", periodFrequency: null }),
-    ).toBe(false);
-    expect(
-      periodExcludesEmployeeByCadence({ employeeFrequency: null, periodFrequency: null }),
-    ).toBe(false);
-    expect(
-      periodExcludesEmployeeByCadence({ employeeFrequency: undefined, periodFrequency: undefined }),
-    ).toBe(false);
-    // Un valor fuera del catálogo es AUSENCIA, no otra cadencia.
-    expect(
-      periodExcludesEmployeeByCadence({ employeeFrequency: "anual", periodFrequency: "semanal" }),
-    ).toBe(false);
+    // Sin cadencia (o inválida) no entra a ningún período regular.
+    expect(periodExcludesEmployeeByCadence({ employeeFrequency: null, periodFrequency: "semanal" })).toBe(true);
+    expect(periodExcludesEmployeeByCadence({ employeeFrequency: "anual", periodFrequency: "semanal" })).toBe(true);
+    // Un período heredado sin cadencia no se reinterpreta.
+    expect(periodExcludesEmployeeByCadence({ employeeFrequency: "semanal", periodFrequency: null })).toBe(false);
+    expect(periodExcludesEmployeeByCadence({ employeeFrequency: null, periodFrequency: null })).toBe(false);
   });
 });
 
@@ -5862,7 +5834,7 @@ describe("payroll-client: el diálogo de apertura DERIVADO (F10, guarda de fuent
       /isRangeBeforePayrollStart\(\{ payrollStartDate, startDate, endDate \}\)/,
     );
     expect(submit).toContain(
-      'setOpenError(\n        `Este ciclo cierra antes del ${payrollStartDate}, el día del primer período: la nómina de la instalación arranca ese día y nada anterior existe para el sistema.`,\n      );',
+      "Este ciclo cierra antes del ${payrollStartDate}, el día del primer período",
     );
     expect(submit).not.toContain("de esta sede");
     // El piso del "día siguiente al último período" YA NO existe en ninguna forma.
@@ -6982,9 +6954,9 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
         sede_id: SEDE,
         start_date: "2026-09-01",
         end_date: "2026-09-15",
-        status: "borrador",
+        status: "cerrado",
         created_by: "u-1",
-        closed_at: null,
+        closed_at: "2026-09-16T00:00:00.000Z",
         created_at: "2026-09-01T00:00:00.000Z",
       },
       {
@@ -7096,7 +7068,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     // Contra qué períodos: los dos de septiembre, en orden de fecha.
     expect(rows[0].periods.map((row) => row.periodId)).toEqual([P1, P2]);
     expect(rows[0].periods[0]).toMatchObject({
-      status: "borrador",
+      status: "cerrado",
       net: 1000000,
       paid: 400000,
       remaining: 600000,
@@ -7114,19 +7086,8 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
       await listPayrollMonthRows({ month: "2026-10", employeeId: "emp-02" }),
     ).toEqual([]);
 
-    // El mismo mes, el empleado que SÍ tiene pagos: una sola fila, con los
-    // períodos de ESE mes (ninguno de septiembre).
-    const october = await listPayrollMonthRows({
-      month: "2026-10",
-      employeeId: "emp-01",
-    });
-    expect(october.map((row) => `${row.month}/${row.employeeId}`)).toEqual(["2026-10/emp-01"]);
-    expect(october[0]).toMatchObject({
-      netTotal: 1100000,
-      paidTotal: 200000,
-      remainingTotal: 900000,
-    });
-    expect(october[0].periods.map((row) => row.periodId)).toEqual([P3]);
+    // El período de octubre sigue en borrador: no aparece hasta cerrarse.
+    expect(await listPayrollMonthRows({ month: "2026-10", employeeId: "emp-01" })).toEqual([]);
   });
 
   it("control negativo: una fila con más pagado que neto no resta del saldo", async () => {
@@ -7179,7 +7140,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     ];
 
     const [september] = await listPayrollMonthRows({ month: "2026-09", employeeId: "emp-01" });
-    const [october] = await listPayrollMonthRows({ month: "2026-10", employeeId: "emp-01" });
+    const october = await listPayrollMonthRows({ month: "2026-10", employeeId: "emp-01" });
 
     expect(september).toMatchObject({
       periodNet: 1900000,
@@ -7189,14 +7150,16 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
       monthPaid: 1350000,
     });
     expect(september.extras.map((row) => row.id)).toEqual(["extra-sep"]);
-    expect(october).toMatchObject({
-      periodNet: 1100000,
-      periodPaid: 200000,
-      periodRemaining: 900000,
-      extrasPaid: 70000,
-      monthPaid: 270000,
-    });
-    expect(october.extras.map((row) => row.id)).toEqual(["extra-oct"]);
+    expect(october).toEqual([
+      expect.objectContaining({
+        periodNet: 0,
+        periodPaid: 0,
+        periodRemaining: 0,
+        extrasPaid: 70000,
+        monthPaid: 70000,
+        extras: [expect.objectContaining({ id: "extra-oct" })],
+      }),
+    ]);
   });
 
   it.each([
@@ -7257,7 +7220,7 @@ describe("payroll: la vista de nómina es legible con muchos pagos al mes (PA3)"
     });
   });
 
-  it("control negativo: un mes sin períodos no devuelve filas", async () => {
+  it("control negativo: un mes sin períodos ni pagos extraordinarios no devuelve filas", async () => {
     seedLegibilityFixture();
 
     expect(
@@ -11128,20 +11091,12 @@ describe("payroll-client: los campos de monto pasan por la máscara de dinero (g
     expect(source).toContain("stripMoneyInput");
   });
 
-  it("los bonos del empleado usan la máscara de dinero", () => {
+  it("bonos y otros descuentos usan la máscara de dinero en su diálogo", () => {
     assertMasked(
-      onChangeBlock(source, 'onAdjustmentChange(row.employeeId, "bonuses"'),
-      'onAdjustmentChange(row.employeeId, "bonuses", event.target.value)',
+      onChangeBlock(source, "value: stripMoneyInput(event.target.value)"),
+      "value: event.target.value",
     );
-    expect(source).toContain('value={formatMoneyInput(adjustmentValue(row.employeeId, "bonuses"))}');
-  });
-
-  it("los otros descuentos usan la máscara de dinero", () => {
-    assertMasked(
-      onChangeBlock(source, 'onAdjustmentChange(row.employeeId, "others"'),
-      'onAdjustmentChange(row.employeeId, "others", event.target.value)',
-    );
-    expect(source).toContain('value={formatMoneyInput(adjustmentValue(row.employeeId, "others"))}');
+    expect(source).toContain("value={formatMoneyInput(adjustmentDialog.value)}");
   });
 
   it("el monto de la porción usa la máscara de dinero", () => {
@@ -11391,7 +11346,7 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
     const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
 
     // Dos líneas de la MISMA factura son UNA fila; la comisión se suma.
-    expect(sources.invoices).toEqual([
+    expect(sources.invoices).toMatchObject([
       { invoice_id: "factura-1", consecutive_number: 7, commission: 3500 },
       { invoice_id: "factura-2", consecutive_number: 8, commission: 400 },
     ]);
@@ -11472,7 +11427,7 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
 
     const sources = await getPayrollSettlementSources(PERIOD_ID, EMPLEADO);
 
-    expect(sources.invoices).toEqual([
+    expect(sources.invoices).toMatchObject([
       { invoice_id: "factura-1", consecutive_number: 3, commission: 400000 },
     ]);
     expect(sources.adjustment).toEqual({ commission: -300000 });
@@ -11508,7 +11463,13 @@ describe("payroll: las fuentes de la liquidación (F6)", () => {
       // Sin `invoice_id` no hay factura que abrir: no inventa una fila.
       detailLine({ invoice_id: "", consecutive_number: null, item_id: "suelto", commission: 5000 }) as never,
     ]);
-    expect(grouped.invoices).toEqual([{ invoice_id: "a", consecutive_number: 1, commission: 2000 }]);
+    expect(grouped.invoices).toEqual([
+      { invoice_id: "a", consecutive_number: 1, commission: 2000, fixed_commission: 0, percent_commission: 2000 },
+    ]);
+    const fixed = groupSettlementInvoices([
+      detailLine({ invoice_id: "b", item_type: "producto", commission_value: 500, commission: 500 }) as never,
+    ]);
+    expect(fixed.invoices[0]).toMatchObject({ fixed_commission: 500, percent_commission: 0 });
     expect(grouped.adjustment).toBeNull();
   });
 
@@ -11589,18 +11550,12 @@ describe("payroll-client: el modal de facturas y vales (F6, guarda de fuente)", 
     expect(source).toContain("export function PayrollClient");
   });
 
-  it("el botón 'Ver facturas y vales' existe en las dos tablas y abre el modal", () => {
-    // Una línea de botón por tabla de liquidación: la cerrada y el borrador.
-    // (El conteo por línea exacta no confunde el texto del botón con la
-    // `aria-label` ni con los comentarios que lo mencionan.)
-    const botones = source
-      .split("\n")
-      .filter((line) => line.trim() === "Ver facturas y vales");
-    expect(botones).toHaveLength(2);
+  it("las fuentes se abren desde las dos tablas y se cargan al pedirlas", () => {
     expect(count("onViewSources(item)")).toBe(2);
-    // El cableado resuelve el período vigente y el empleado de la fila.
-    expect(count("void openSettlementSources(selected.id, item.employee_id)")).toBe(3);
-    expect(count("getPayrollSettlementSourcesAction(")).toBe(1);
+    expect(count("openSettlementSources(selected.id, item.employee_id)")).toBe(3);
+    expect(source).toContain("Ver facturas y vales");
+    expect(source).toContain("async function toggleSettlementSources()");
+    expect(source).toContain("getPayrollSettlementSourcesAction(");
   });
 
   it("las dos listas existen, rotuladas y alimentadas por la lectura nueva", () => {
@@ -11626,7 +11581,7 @@ describe("payroll-client: el modal de facturas y vales (F6, guarda de fuente)", 
   it("el ajuste del mixto se muestra como ajuste y NO como factura", () => {
     expect(source).toContain("Ajuste del mixto");
     expect(source).toContain("sources?.adjustment");
-    expect(source).toContain("El básico absorbió");
+    expect(source).toContain("Su salario base ya cubre");
     // Se pinta aparte: no se recorre `invoices` para el ajuste ni se rotula
     // como consecutivo.
     expect(source).not.toContain("Factura #ajuste_mixto");
@@ -12002,26 +11957,17 @@ describe("payroll-client: el motivo del ajuste (F8, guarda de fuente)", () => {
     expect(source).toContain("adjustmentReasonValue");
   });
 
-  it("cada fila del borrador tiene el campo de motivo, cableado al mismo registro", () => {
-    expect(source).toContain("aria-label={`Motivo del ajuste de ${employeeName(row.employeeId)}`}");
-    expect(source).toContain('onAdjustmentChange(row.employeeId, "reason", event.target.value)');
+  it("bonos y otros descuentos se editan en diálogo, no inline", () => {
+    expect(source).toContain('onClick={() => onEditAdjustment(row.employeeId, "bonuses")}');
+    expect(source).toContain('onClick={() => onEditAdjustment(row.employeeId, "others")}');
+    expect(source).not.toContain("onAdjustmentChange(row.employeeId");
     expect(source).toContain('adjustment_reason: reason === "" ? null : reason,');
-    expect(source).toContain("aria-required={reasonRequired}");
-    expect(source).toContain("Motivo (obligatorio)");
+    expect(source).toContain('id="payroll-adjustment-reason"');
   });
 
-  it("el motivo faltante se avisa INLINE, junto a la fila, y nombra al empleado", () => {
-    // El aviso vive en la MISMA celda del motivo, pegado al input y dentro del
-    // diálogo: el error de la página queda detrás del modal abierto.
-    const cell = reasonCellBody(source);
-    expect(cell, "aviso inline del motivo faltante").toMatch(INLINE_REASON_NOTICE);
-    // Texto plano: un `Alert` o un `role=` movería las guardas de feedback-batch2.
-    expect(cell).not.toContain("<Alert");
-    expect(cell).not.toMatch(/\brole\s*=/);
-    // Se deriva de la MISMA condición que marca el campo obligatorio, y deja de
-    // mostrarse apenas el motivo existe (`reasonValue.trim() !== ""`).
-    expect(source).toContain('const reasonMissing = reasonRequired && reasonValue.trim() === "";');
-    expect(source).toContain("const reasonValue = adjustmentReasonValue(row.employeeId);");
+  it("el diálogo exige motivo sólo si el valor cambió y avisa adentro", () => {
+    expect(source).toContain("if (next !== current && !adjustmentDialog.reason.trim()) {");
+    expect(source).toContain('{adjustmentError ? <Alert variant="destructive">{adjustmentError}</Alert> : null}');
   });
 
   it("el detector del aviso inline no es un sello de goma (control negativo)", () => {
