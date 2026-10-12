@@ -305,7 +305,11 @@ export async function checkCounts(
   for (const line of counts) {
     const method = allowed.get(line.method_code);
     if (!method) {
-      throw new CashError("VALIDATION", `Método no arqueable: ${line.method_code}.`, 400);
+      throw new CashError(
+        "VALIDATION",
+        "El conteo incluye un método inactivo o sin arqueo. Actualice la página y vuelva a contar.",
+        400,
+      );
     }
     // `arqueo_mode` exists after 003. The line-shape fallback only keeps the
     // application compatible while an old response is cached; it never names a
@@ -325,9 +329,9 @@ export async function checkCounts(
     group.push(line);
     byMethod.set(line.method_code, group);
   }
-  for (const method of allowed.keys()) {
-    if (!byMethod.has(method)) {
-      throw new CashError("COUNT_REQUIRED", `Falta el conteo de ${method}.`, 400);
+  for (const [code, method] of allowed) {
+    if (!byMethod.has(code)) {
+      throw new CashError("COUNT_REQUIRED", `Falta el conteo de ${method.name}.`, 400);
     }
   }
   const totals = new Map<string, number>();
@@ -910,7 +914,9 @@ async function arqueoConfig(): Promise<{ drawer: string | null; denominationCode
   const methods = await listPaymentMethods();
   return {
     drawer: drawerMethodCode(methods),
-    denominationCodes: new Set(methods.filter((m) => m.arqueo_mode === "denominations").map((m) => m.code)),
+    denominationCodes: new Set(
+      methods.filter((m) => m.is_active && m.arqueo_mode === "denominations").map((m) => m.code),
+    ),
   };
 }
 
@@ -1041,7 +1047,37 @@ export interface OpenShiftResult {
   firstOpen: boolean;
 }
 
+const OPEN_SHIFT_SQL_ERRORS: ReadonlyArray<readonly [string, string, number]> = [
+  ["SHIFT_ALREADY_OPEN", "Ya hay un turno abierto en esta caja. Ciérrelo antes de abrir otro.", 409],
+  ["SHIFT_BALANCE_MISMATCH", "Falta el conteo de un método arqueable activo. Actualice la página y vuelva a contar.", 400],
+  ["SHIFT_REGISTER_NOT_FOUND", "La caja seleccionada no existe. Actualice la página e intente nuevamente.", 404],
+  ["SHIFT_WRITE_MISMATCH", "No se pudo registrar la apertura del turno. Intente nuevamente.", 500],
+  ["SHIFT_COUNT_MISMATCH", "No se pudo registrar el conteo de apertura. Intente nuevamente.", 500],
+  ["SHIFT_INVALID", "El conteo de apertura no es válido. Revise los valores e intente nuevamente.", 400],
+];
+
+/** Maps the stable errors of `cash_open_shift_atomic` (001 + 003) to business errors. */
+export function openShiftAtomicError(error: unknown): CashError {
+  const { code, message, details } = (error ?? {}) as { code?: unknown; message?: unknown; details?: unknown };
+  // Lost race against uq_cash_shifts_open_per_register: same business error.
+  if (code === "23505") return new CashError(...OPEN_SHIFT_SQL_ERRORS[0]);
+  const text = `${typeof message === "string" ? message : ""} ${typeof details === "string" ? details : ""}`;
+  const known = OPEN_SHIFT_SQL_ERRORS.find(([sqlCode]) => text.includes(sqlCode));
+  return known ? new CashError(...known) : new CashError("INTERNAL", "Error interno.", 500);
+}
+
 export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShiftResult> {
+  // The RPC needs one count line per active arqueable method: without any such
+  // method the client sends no lines and no count can be valid, so fail with
+  // the fix before validating the payload or calling the RPC.
+  const methods = await listPaymentMethods();
+  if (!methods.some((method) => method.is_active && method.arqueo_mode !== "none")) {
+    throw new CashError(
+      "NO_ARQUEABLE_METHODS",
+      "No hay métodos de pago activos con arqueo. Configure al menos uno en Administración antes de abrir caja.",
+      409,
+    );
+  }
   const parsed = openShiftSchema.safeParse(raw);
   if (!parsed.success) {
     throw new CashError("VALIDATION", validationMessage(parsed.error), 400);
@@ -1110,19 +1146,7 @@ export async function openShift(raw: unknown, actor: CashActor): Promise<OpenShi
     });
     if (createError) {
       throwCashCop(createError);
-      // Carrera perdida contra uq_cash_shifts_open_per_register (23505, la
-      // barrera final de la base) o contra el guardia de "un turno abierto por
-      // caja" re-evaluado dentro de la transacción.
-      const code = (createError as { code?: string }).code;
-      const message = String((createError as { message?: string }).message ?? "");
-      if (code === "23505" || message.includes("SHIFT_ALREADY_OPEN")) {
-        throw new CashError(
-          "SHIFT_ALREADY_OPEN",
-          "Ya hay un turno abierto en esta caja. Ciérrelo antes de abrir otro.",
-          409,
-        );
-      }
-      throw new CashError("INTERNAL", "Error interno.", 500);
+      throw openShiftAtomicError(createError);
     }
     if (!created) throw new CashError("INTERNAL", "Error interno.", 500);
     const shift = created as CashShiftRow;

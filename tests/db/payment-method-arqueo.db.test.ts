@@ -62,6 +62,17 @@ async function insertVoucher(shift: string, code: string, amount: number, status
 }
 
 describe("003 payment method arqueo", () => {
+  it("forces inactive methods to none through 008 and the coherence constraint", async () => {
+    await db.query(`UPDATE public.payment_methods SET arqueo_mode = 'declared_total' WHERE code = 'nequi'`);
+    await db.query(`UPDATE public.payment_methods SET is_active = false WHERE code = 'nequi'`);
+    expect(await one<{ arqueable: boolean; arqueo_mode: string }>(db, `SELECT arqueable, arqueo_mode FROM public.payment_methods WHERE code = 'nequi'`))
+      .toEqual({ arqueable: false, arqueo_mode: "none" });
+    await db.query("SET session_replication_role = replica");
+    const error = await pgError(db.query(`UPDATE public.payment_methods SET arqueo_mode = 'declared_total' WHERE code = 'nequi'`));
+    await db.query("SET session_replication_role = origin");
+    expect(error.code).toBe("23514");
+  });
+
   it("backfills current arqueable methods and accepts a free normalized code that cannot change", async () => {
     const modes = await db.query<{ code: string; arqueable: boolean; arqueo_mode: string }>(
       `SELECT code, arqueable, arqueo_mode FROM public.payment_methods ORDER BY code`,

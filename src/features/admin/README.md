@@ -30,11 +30,12 @@ impuestos por sede (inician inactivos en 0), métodos de pago Colombia por sede.
   en el siguiente request porque `getSessionUser` lee `user_roles` siempre.
 - ADM-05: `upsertService` con `duracion_min <= duracion_max` (Zod + CHECK).
 - ADM-06: `upsertTaxConfig` con `percent` 0–100; seed IVA 19% e ICA inactivos.
-- ADM-07/003: `upsertPaymentMethod` crea métodos con código libre normalizado
-  (minúsculas, números, `-` o `_`, 2–40), único e inmutable. Al editar solo
-  cambian nombre, activo, recargo y `arqueo_mode` (`none`, `denominations`,
-  `declared_total`); el código se rechaza si cambia. Solo un método puede
-  contarse por denominaciones. El seed sigue creando los 6 métodos iniciales.
+- ADM-07/003: `upsertPaymentMethod` genera un código interno, único e inmutable
+  desde el nombre (slug normalizado, máximo 40 y sufijos `-2`, `-3` para
+  colisiones); la entrada pública lo ignora. Al editar solo cambian nombre,
+  activo, recargo y `arqueo_mode` (`none`, `denominations`, `declared_total`).
+  Un método inactivo se fuerza a `none`. Solo un método puede contarse por
+  denominaciones. El seed conserva los 6 códigos iniciales.
 - Sin borrado físico: todo se desactiva con `is_active` (TRA-02).
 - RLS deny-by-default en las 5 tablas; políticas T3 permisivas (`USING true`)
   con TODO documentado porque las sesiones del MVP son tokens opacos propios

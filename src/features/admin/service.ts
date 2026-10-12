@@ -1,7 +1,7 @@
 import {
   employeeSchema,
   normalizeEmployeeCode,
-  normalizePaymentMethodCode,
+  paymentMethodCodeForName,
   paymentMethodSchema,
   serviceSchema,
   setUserRolesSchema,
@@ -445,37 +445,51 @@ async function fetchPaymentMethods(limit?: number): Promise<PaymentMethodRow[]> 
   return internalOnFailure(() => repo.listPaymentMethods(clampLimit(limit)));
 }
 
+const PAYMENT_METHOD_CODE_ATTEMPTS = 3;
+
 /**
- * ADM-07/003: creates a method with a free normalized code, or edits name,
- * active flag, fee and arqueo mode of an existing one. The code is immutable:
- * an edit that sends a different code is rejected before writing (the
- * database trigger is the final barrier).
+ * ADM-07/003: creates a method with an internal code generated from its name,
+ * or edits name, active flag, fee and arqueo mode of an existing one. Public
+ * input never carries the code: an unknown `code` key is ignored and the
+ * stored code stays immutable. An inactive method is never arqueable.
  */
 export async function upsertPaymentMethod(raw: unknown): Promise<PaymentMethodRow> {
   const parsed = paymentMethodSchema.safeParse(raw);
   if (!parsed.success) throw new AdminError("VALIDATION", validationMessage(parsed.error), 400);
   const input: PaymentMethodInput = parsed.data;
-  const code = input.code ? normalizePaymentMethodCode(input.code) : undefined;
   const repo = await catalogsRepo();
-  const fields = {
-    name: input.name,
-    ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
-    ...(input.arqueo_mode !== undefined ? { arqueo_mode: input.arqueo_mode } : {}),
-    ...(input.fee_percent !== undefined ? { fee_percent: input.fee_percent } : {}),
-  };
   if (input.id) {
     const id = input.id;
     const current = await internalOnFailure(() => repo.findPaymentMethod(id));
     if (!current) throw new AdminError("NOT_FOUND", "Método de pago no encontrado.", 404);
-    if (code && code !== current.code) {
-      throw new AdminError("PAYMENT_METHOD_CODE_IMMUTABLE", "El código de un método no se puede cambiar.", 409);
-    }
+    const fields = paymentMethodFields(input, input.is_active ?? current.is_active);
     return paymentMethodWrite(() => repo.updatePaymentMethod(id, fields));
   }
-  // `code` is present on creation: the schema requires it without an id.
-  return paymentMethodWrite(() =>
-    repo.insertPaymentMethod({ code: code as string, arqueo_mode: "none", ...fields }),
-  );
+  const fields = paymentMethodFields(input, input.is_active ?? true);
+  for (let attempt = 1; ; attempt += 1) {
+    const methods = await internalOnFailure(() => repo.listPaymentMethods(500));
+    const code = paymentMethodCodeForName(input.name, methods.map((method) => method.code));
+    try {
+      return await paymentMethodWrite(() =>
+        repo.insertPaymentMethod({ code, ...fields, arqueo_mode: fields.arqueo_mode ?? "none" }),
+      );
+    } catch (error) {
+      // A concurrent creation took the same generated code: recompute the suffix.
+      const raced = error instanceof AdminError && error.code === "PAYMENT_METHOD_CODE_TAKEN";
+      if (!raced || attempt >= PAYMENT_METHOD_CODE_ATTEMPTS) throw error;
+    }
+  }
+}
+
+/** Mutable fields; an inactive method always writes `arqueo_mode: "none"`. */
+function paymentMethodFields(input: PaymentMethodInput, active: boolean) {
+  const arqueoMode = active ? input.arqueo_mode : "none";
+  return {
+    name: input.name,
+    ...(input.is_active !== undefined ? { is_active: input.is_active } : {}),
+    ...(arqueoMode !== undefined ? { arqueo_mode: arqueoMode } : {}),
+    ...(input.fee_percent !== undefined ? { fee_percent: input.fee_percent } : {}),
+  };
 }
 
 /** A write that fails or returns no row goes through `paymentMethodWriteError`. */

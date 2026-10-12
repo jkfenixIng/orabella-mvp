@@ -14,17 +14,36 @@ export type PayType = z.infer<typeof payTypeSchema>;
 export const payFrequencySchema = z.enum(["semanal", "quincenal", "mensual"]);
 export type PayFrequency = z.infer<typeof payFrequencySchema>;
 
-/** ADM-07/003: a stable free identifier, normalized by the service before Zod. */
+/** ADM-07/003: internal stable identifier generated from the public name. */
 export const paymentMethodCodeSchema = z.string()
   .min(2, "El código debe tener al menos 2 caracteres.")
   .max(40, "El código es muy largo.")
-  .regex(/^[a-z0-9]+(?:[-_][a-z0-9]+)*$/, "Use minúsculas, números, guion o guion bajo.");
+  .regex(/^[a-z0-9]+(?:[-_][a-z0-9]+)*$/, "Código interno inválido.");
 export type PaymentMethodCode = z.infer<typeof paymentMethodCodeSchema>;
 export const arqueoModeSchema = z.enum(["none", "denominations", "declared_total"]);
 export type ArqueoMode = z.infer<typeof arqueoModeSchema>;
 
-export function normalizePaymentMethodCode(code: string): string {
-  return code.trim().toLowerCase().replace(/\s+/g, "-");
+export function normalizePaymentMethodCode(name: string): string {
+  const slug = name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40)
+    .replace(/-+$/g, "");
+  return slug.length >= 2 ? slug : "metodo";
+}
+
+export function paymentMethodCodeForName(name: string, existingCodes: Iterable<string>): PaymentMethodCode {
+  const existing = new Set(existingCodes);
+  const base = normalizePaymentMethodCode(name);
+  if (!existing.has(base)) return base;
+  for (let suffix = 2; ; suffix += 1) {
+    const ending = `-${suffix}`;
+    const candidate = `${base.slice(0, 40 - ending.length).replace(/-+$/g, "")}${ending}`;
+    if (!existing.has(candidate)) return candidate;
+  }
 }
 
 /** ADM-06: códigos de impuesto configurables de la instalación. */
@@ -190,24 +209,13 @@ export const taxConfigSchema = z.object({
 });
 export type TaxConfigInput = z.infer<typeof taxConfigSchema>;
 
-/** ADM-07/003: payment method code is only accepted on creation. */
+/** ADM-07/003: public writes never accept a payment method code. */
 export const paymentMethodSchema = z.object({
   id: uuidSchema.optional(),
-  code: z.string().trim().optional(),
   name: z.string().trim().min(1, "Nombre requerido.").max(120, "Nombre muy largo."),
   is_active: z.boolean().optional(),
   arqueo_mode: arqueoModeSchema.optional(),
   fee_percent: z.coerce.number().min(0).max(100).optional(),
-}).superRefine((value, context) => {
-  if (!value.id && !value.code) {
-    context.addIssue({ code: "custom", path: ["code"], message: "Código requerido." });
-    return;
-  }
-  if (value.code) {
-    const normalized = normalizePaymentMethodCode(value.code);
-    const parsed = paymentMethodCodeSchema.safeParse(normalized);
-    if (!parsed.success) context.addIssue({ code: "custom", path: ["code"], message: parsed.error.issues[0]?.message ?? "Código inválido." });
-  }
 });
 export type PaymentMethodInput = z.infer<typeof paymentMethodSchema>;
 
