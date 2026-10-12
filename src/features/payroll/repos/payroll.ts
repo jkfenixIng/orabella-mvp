@@ -40,6 +40,7 @@ export interface PayrollRepo {
   itemsOfPeriodsPage<T>(periodIds: string[], employeeId: string | undefined, from: number, to: number): PayrollPage<T>;
   findItem<T>(id: string): Promise<PayrollResult<T>>;
   paymentAmountsPage<T>(itemIds: string[], from: number, to: number): PayrollPage<T>;
+  paymentDetailsPage<T>(itemIds: string[], from: number, to: number): PayrollPage<T>;
   paymentAmounts(itemId: string): Promise<PayrollResult<Array<{ amount: number | string }>>>;
   paymentsByKey<T>(itemId: string, key: string): Promise<PayrollResult<T[]>>;
   insertPayments<T>(rows: Row[]): Promise<PayrollResult<T[]>>;
@@ -137,6 +138,8 @@ export function supabasePayrollRepo(db: SupabaseClient): PayrollRepo {
     findItem: (id) => result(db.from("payroll_items").select(ITEM_SELECT).eq("id", id).maybeSingle()),
     paymentAmountsPage: (itemIds, from, to) =>
       page(db.from("payroll_payments").select("payroll_item_id, amount").in("payroll_item_id", itemIds).order("id").range(from, to)),
+    paymentDetailsPage: (itemIds, from, to) =>
+      page(db.from("payroll_payments").select(PAYMENT_SELECT).in("payroll_item_id", itemIds).order("id").range(from, to)),
     paymentAmounts: (itemId) => result(db.from("payroll_payments").select("amount").eq("payroll_item_id", itemId)),
     paymentsByKey: (itemId, key) =>
       result(db.from("payroll_payments").select(`${PAYMENT_SELECT}, idempotency_key`).eq("payroll_item_id", itemId).eq("idempotency_key", key)),

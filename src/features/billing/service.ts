@@ -203,6 +203,8 @@ export interface InvoicePaymentRow {
 
 export interface InvoiceDetail {
   invoice: InvoiceRow;
+  /** True when a closed payroll contains a commission line for this invoice. */
+  payroll_locked: boolean;
   items: InvoiceItemRow[];
   taxes: InvoiceTaxRow[];
   payments: InvoicePaymentRow[];
@@ -229,6 +231,8 @@ export interface InvoiceFilters {
 
 /** Fila de lista: factura + quién abrió/cerró + empleados participantes. */
 export interface InvoiceListItem extends InvoiceRow {
+  /** True when a closed payroll contains a commission line for this invoice. */
+  payroll_locked: boolean;
   user_name: string | null;
   closed_by_name: string | null;
   employee_names: string[];
@@ -365,6 +369,9 @@ export async function listInvoices(filters: InvoiceFilters = {}): Promise<Invoic
   }));
   if (rows.length === 0) return [];
 
+  // Payroll lock is batch-loaded once for the whole page, never per invoice.
+  const payrollLockedIds = await payrollLockedInvoiceIds(db, rows.map((row) => row.id));
+
   // Enriquecimiento: quién cerró + empleados participantes (sin N+1: 3 queries).
   const ids = rows.map((row) => row.id);
   // U8: lectura exhaustiva, por lotes de ids. Antes `.limit(2000)` (que el
@@ -415,6 +422,7 @@ export async function listInvoices(filters: InvoiceFilters = {}): Promise<Invoic
   }
   return rows.map((row) => ({
     ...row,
+    payroll_locked: payrollLockedIds.has(row.id),
     closed_by_name: row.closed_by ? (nameByUser.get(row.closed_by) ?? null) : null,
     employee_names: namesByInvoice.get(row.id) ?? [],
   }));
@@ -465,21 +473,26 @@ interface JoinedEmployee {
  * No recibe sede: la instalación es de una sola y la fila no trae la columna.
  */
 export async function getInvoiceDetail(id: string): Promise<InvoiceDetail> {
-  return fetchInvoiceDetail(await billingDb(), id);
+  return fetchInvoiceDetail(await billingDb(), id, true);
 }
 
-async function fetchInvoiceDetail(db: DbClient, id: string): Promise<InvoiceDetail> {
+async function fetchInvoiceDetail(db: DbClient, id: string, readLock = false): Promise<InvoiceDetail> {
   const { data: invoice, error } = await db.getInvoice<InvoiceRow>(id);
   if (error) throw new BillingError("INTERNAL", "Error interno.", 500);
   if (!invoice) throw new BillingError("NOT_FOUND", "Factura no encontrada.", 404);
-  return loadDetail(db, invoice);
+  return loadDetail(db, invoice, readLock);
 }
 
-async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDetail> {
-  const [itemsRes, taxesRes, paymentsRes] = await Promise.all([
+async function loadDetail(db: DbClient, invoice: InvoiceRow, readLock = false): Promise<InvoiceDetail> {
+  const [itemsRes, taxesRes, paymentsRes, lockedIds] = await Promise.all([
     db.listInvoiceItemsWithEmployee<InvoiceItemRow & JoinedEmployee>(invoice.id),
     db.listInvoiceTaxes<InvoiceTaxRow>(invoice.id),
     db.listInvoicePayments<InvoicePaymentRow>(invoice.id),
+    // An annulled invoice is terminal and a just-emitted one cannot be in any
+    // payroll yet: neither needs the history read.
+    invoice.status === "Anulada" || !readLock
+      ? Promise.resolve(new Set<string>())
+      : payrollLockedInvoiceIds(db, [invoice.id]),
   ]);
   if (itemsRes.error || taxesRes.error || paymentsRes.error) {
     console.error(
@@ -548,6 +561,7 @@ async function loadDetail(db: DbClient, invoice: InvoiceRow): Promise<InvoiceDet
   });
   return {
     invoice,
+    payroll_locked: lockedIds.has(invoice.id),
     items,
     taxes: taxesRes.data ?? [],
     payments,
@@ -2217,6 +2231,42 @@ async function invoiceInClosedPayroll(db: DbClient, invoiceId: string): Promise<
     // "No se pudo evaluar" se traduce a un error de negocio: el llamador rechaza
     // la edición. Si esto devolviera `false`, el candado fallaría ABIERTO.
     throw toBillingError(error);
+  }
+}
+
+/**
+ * Batch version of the payroll lock for read models (list rows and detail).
+ * One exhaustive read of closed periods and their item details per call, no
+ * N+1. Fails closed: if the history cannot be read completely, every requested
+ * invoice is reported as locked (never `false` for "could not look"). It only
+ * feeds the UI; the write guards above stay authoritative.
+ */
+async function payrollLockedInvoiceIds(db: DbClient, invoiceIds: string[]): Promise<Set<string>> {
+  const wanted = new Set(invoiceIds);
+  const locked = new Set<string>();
+  if (wanted.size === 0) return locked;
+  try {
+    const closedPeriods = await readAllClosedPeriods(db);
+    for (let start = 0; start < closedPeriods.length; start += IN_FILTER_CHUNK_SIZE) {
+      const chunk = closedPeriods.slice(start, start + IN_FILTER_CHUNK_SIZE);
+      for await (const batch of readPagedBatches<{ detail_json: unknown }>({
+        table: "payroll_items",
+        fetchPage: (from, to) => db.payrollItemDetailsPage(chunk, from, to),
+      })) {
+        for (const row of batch) {
+          if (!Array.isArray(row.detail_json)) continue;
+          for (const line of row.detail_json) {
+            const id = typeof line === "object" && line !== null ? (line as { invoice_id?: unknown }).invoice_id : undefined;
+            if (typeof id === "string" && wanted.has(id)) locked.add(id);
+          }
+        }
+        if (locked.size === wanted.size) return locked;
+      }
+    }
+    return locked;
+  } catch (error) {
+    console.error("payrollLockedInvoiceIds: lectura incompleta, se marca bloqueado.", error instanceof Error ? error.message : error);
+    return wanted;
   }
 }
 

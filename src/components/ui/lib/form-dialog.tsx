@@ -283,6 +283,11 @@ export type ConfirmDialogProps = {
   busy?: boolean
   /** `destructive` para lo que no se deshace; `default` para lo que sí. */
   variant?: ConfirmDialogVariant
+  /**
+   * Fallo del último intento. Se muestra DENTRO del diálogo abierto: cerrar la
+   * confirmación y pintar el error detrás del overlay lo deja fuera de vista.
+   */
+  error?: string | null
 }
 
 /**
@@ -299,6 +304,7 @@ export function ConfirmDialog({
   onConfirm,
   busy = false,
   variant = 'destructive',
+  error,
 }: ConfirmDialogProps) {
   const confirmClass = variant === 'destructive' ? DESTRUCTIVE_BUTTON_CLASS : buttonClass
 
@@ -312,6 +318,11 @@ export function ConfirmDialog({
               además del título. */}
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
+        {error ? (
+          <Alert variant="destructive" className="mt-3">
+            {error}
+          </Alert>
+        ) : null}
         <DialogFooter className="mt-4">
           <button type="button" className={ghostClass} onClick={() => onOpenChange(false)}>
             Cancelar

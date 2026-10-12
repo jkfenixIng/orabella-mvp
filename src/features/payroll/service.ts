@@ -7,6 +7,7 @@ import {
   assertPortionsMatchNet,
   buildEmployeeCommissionDetail,
   buildEmployeeDetail,
+  detailLineCommissionOrigin,
   buildPayrollCorrectionView,
   buildPayrollMonthToDate,
   cadenceAnchorFromDeclaration,
@@ -939,6 +940,10 @@ async function getPeriodOrThrow(db: DbClient, id: string): Promise<PayrollPeriod
   return data as PayrollPeriodRow;
 }
 
+export interface PayrollItemPaymentDetail extends PayrollPaymentRow {
+  paid_by_name: string | null;
+}
+
 export interface PeriodDetail {
   period: PayrollPeriodRow;
   items: Array<
@@ -952,6 +957,7 @@ export interface PeriodDetail {
        * mostrar la deuda de otro empleado.
        */
       pending_debt: number;
+      payments: PayrollItemPaymentDetail[];
     }
   >;
 }
@@ -982,26 +988,30 @@ export async function getPeriodDetail(id: string): Promise<PeriodDetail> {
       table: "payroll_items",
       fetchPage: (from, to) => db.periodItemsPage<PayrollItemRow>(id, from, to),
     });
-    let paidByItem = new Map<string, number>();
+    const paidByItem = new Map<string, number>();
+    const paymentsByItem = new Map<string, PayrollItemPaymentDetail[]>();
     if (rows.length > 0) {
-      // U7: los ids van en lotes del tamaño que aguanta la URL (una lista sin
-      // tope termina en 414 y la lectura no ocurre) y cada lote se pagina hasta
-      // agotar, con `order("id")` para que dos corridas lean lo mismo.
-      paidByItem = new Map();
+      const payments: PayrollPaymentRow[] = [];
       for (const chunk of chunkIds(rows.map((row) => row.id))) {
-        const payments = await readAllPayroll<{ payroll_item_id: string; amount: number | string }>({
+        payments.push(...(await readAllPayroll<PayrollPaymentRow>({
           log: "getPeriodDetail",
           what: "pagos del período",
           meta: { periodId: id, items: rows.length, ids: chunk.length },
           table: "payroll_payments",
-          fetchPage: (from, to) => db.paymentAmountsPage(chunk, from, to),
-        });
-        for (const row of payments) {
-          paidByItem.set(
-            row.payroll_item_id,
-            roundMoney((paidByItem.get(row.payroll_item_id) ?? 0) + Number(row.amount)),
-          );
-        }
+          fetchPage: (from, to) => db.paymentDetailsPage<PayrollPaymentRow>(chunk, from, to),
+        })));
+      }
+      const payerIds = [...new Set(payments.map((payment) => payment.paid_by).filter((payer): payer is string => payer !== null))];
+      const payerNames = new Map<string, string | null>();
+      if (payerIds.length > 0) {
+        const { data, error } = await db.userNames(payerIds);
+        if (error) throw new PayrollError("INTERNAL", "Error interno.", 500);
+        for (const payer of data ?? []) payerNames.set(payer.id, payer.full_name ?? null);
+      }
+      for (const payment of payments) {
+        paidByItem.set(payment.payroll_item_id, roundMoney((paidByItem.get(payment.payroll_item_id) ?? 0) + Number(payment.amount)));
+        const detailed = { ...payment, amount: roundMoney(Number(payment.amount)), paid_by_name: payment.paid_by ? payerNames.get(payment.paid_by) ?? null : null };
+        paymentsByItem.set(payment.payroll_item_id, [...(paymentsByItem.get(payment.payroll_item_id) ?? []), detailed]);
       }
     }
     // NV-01: la deuda PENDIENTE que ESTE período produjo (el sobrante de vales
@@ -1034,6 +1044,7 @@ export async function getPeriodDetail(id: string): Promise<PeriodDetail> {
           paid,
           remaining: roundMoney(Math.max(0, Number(item.net_pay) - paid)),
           pending_debt: pendingDebtByEmployee.get(item.employee_id) ?? 0,
+          payments: paymentsByItem.get(item.id) ?? [],
         };
       }),
     };
@@ -1063,6 +1074,8 @@ export interface PayrollSettlementInvoice {
   consecutive_number: number | null;
   /** Comisión de ESTA liquidación por la factura (suma de todas sus líneas). */
   commission: number;
+  fixed_commission: number;
+  percent_commission: number;
 }
 
 /**
@@ -1128,8 +1141,16 @@ export function groupSettlementInvoices(detail: readonly DetailLine[]): {
       invoice_id: line.invoice_id,
       consecutive_number: line.consecutive_number ?? null,
       commission: 0,
+      fixed_commission: 0,
+      percent_commission: 0,
     };
-    current.commission = roundMoney(current.commission + Number(line.commission));
+    const commission = Number(line.commission);
+    current.commission = roundMoney(current.commission + commission);
+    if (detailLineCommissionOrigin(line) === "percent") {
+      current.percent_commission = roundMoney(current.percent_commission + commission);
+    } else {
+      current.fixed_commission = roundMoney(current.fixed_commission + commission);
+    }
     byInvoice.set(line.invoice_id, current);
   }
   return {
@@ -1461,7 +1482,9 @@ export async function listPayrollMonthRows(args: {
       throw new PayrollError("VALIDATION", "Mes inválido (use yyyy-mm).", 400);
     }
     const db = await payrollDb();
-    const monthPeriods = (await listPeriods()).filter((period) => monthKeyOf(period.start_date) === args.month);
+    const monthPeriods = (await listPeriods()).filter(
+      (period) => monthKeyOf(period.start_date) === args.month && period.status === "cerrado",
+    );
     const [items, extras] = await Promise.all([
       monthPeriods.length === 0
         ? Promise.resolve([])
@@ -1804,15 +1827,10 @@ async function computePayrollLines(args: {
   const { db, period, roster, input, voucherScope, log } = args;
   const periodId = period.id;
 
-    // F4: EXCLUSIÓN POR CADENCIA (regla del dueño, 2026-10-01). Cuando las DOS
-    // cadencias están definidas y DIFIEREN, el empleado queda FUERA de este
-    // período: no se le arma ítem, no se le lee regla y sus facturas Pagada del
-    // rango no entran en `detail_json` ni en las comisiones. Se paga en su
-    // propio ciclo. Por eso la exclusión vive acá, al armar el conjunto de
-    // empleados: nada aguas abajo (ítems, totales, resúmenes, corrección) ve al
-    // excluido. Si CUALQUIERA de las dos cadencias falta (NULL = sin cadencia
-    // definida), el empleado entra y rige el comportamiento de hoy (prorrateo
-    // por días más comisiones).
+    // EXCLUSIÓN POR CADENCIA (regla del dueño): el período regular sólo liquida
+    // a quien tiene EXACTAMENTE su cadencia. Un legajo sin cadencia no entra en
+    // ningún período regular; se paga sólo con pagos extraordinarios. Al
+    // excluido no se le arma ítem ni comisiones: nada aguas abajo lo ve.
     //
     // EXCLUIR LAS COMISIONES ES PARTE DE LA EXCLUSIÓN, no un extra: con un
     // período semanal y uno mensual que se superponen A PROPÓSITO, una factura

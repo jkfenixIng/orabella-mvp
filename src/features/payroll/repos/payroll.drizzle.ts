@@ -275,6 +275,15 @@ export function drizzlePayrollRepo(db: Database): PayrollRepo {
           .orderBy(asc(payrollPayments.id))
           .offset(offset)
           .limit(limit), from, to),
+    paymentDetailsPage: (itemIds, from, to) =>
+      page((offset, limit) =>
+        db
+          .select(PAYMENT)
+          .from(payrollPayments)
+          .where(inArray(payrollPayments.payrollItemId, itemIds))
+          .orderBy(asc(payrollPayments.id))
+          .offset(offset)
+          .limit(limit), from, to),
     paymentAmounts: (itemId) =>
       many(() => db.select({ amount: payrollPayments.amount }).from(payrollPayments).where(eq(payrollPayments.payrollItemId, itemId))),
     paymentsByKey: (itemId, key) =>

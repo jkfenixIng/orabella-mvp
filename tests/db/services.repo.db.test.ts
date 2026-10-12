@@ -231,6 +231,20 @@ describe("drizzle services repository on the real schema", () => {
     expect(rows[0].fresh).toBe(true);
   });
 
+  it("listPage searches name or description literally, filters status and counts every match", async () => {
+    await seedPglite([
+      ...SEED,
+      { id: "0d0d0d0d-0000-4000-8000-00000000000d", name: "Promo 50%", description: null, price: 1, duracion_min: 1, duracion_max: 1, is_active: false },
+      { id: "0e0e0e0e-0000-4000-8000-00000000000e", name: "Promo 500", description: null, price: 1, duracion_min: 1, duracion_max: 1, is_active: false },
+    ]);
+    const repo = drizzleServicesRepo(db);
+    expect(await repo.listPage({ query: "clas", limit: 20, offset: 0 })).toEqual({ rows: [SEED[1]], total: 1 });
+    expect((await repo.listPage({ query: "50%", limit: 20, offset: 0 })).rows.map((row) => row.name)).toEqual(["Promo 50%"]);
+    const inactive = await repo.listPage({ query: "", active: false, limit: 1, offset: 1 });
+    expect(inactive.total).toBe(3);
+    expect(inactive.rows.map((row) => row.name)).toEqual(["Promo 50%"]);
+  });
+
   it("rejects the duration CHECK (23514) and writes nothing", async () => {
     const failure = await drizzleServicesRepo(db)
       .upsert({ name: "Mal", description: null, price: 1, duracion_min: 9, duracion_max: 1 })

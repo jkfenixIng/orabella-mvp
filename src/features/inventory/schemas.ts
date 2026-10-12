@@ -177,6 +177,19 @@ export function isLowStock(product: LowStockCandidate): boolean {
   return product.stock_qty <= product.min_stock;
 }
 
+export type StockFilter = "all" | "low" | "empty";
+export type StockBadge = "empty" | "low" | null;
+
+/** Visible stock state: zero is red; positive stock at or below minimum is orange. */
+export function stockBadge(product: LowStockCandidate): StockBadge {
+  if (product.stock_qty === 0) return "empty";
+  return product.stock_qty <= product.min_stock ? "low" : null;
+}
+
+export function matchesStockFilter(product: LowStockCandidate, filter: StockFilter): boolean {
+  return filter === "all" || stockBadge(product) === filter;
+}
+
 /** INV-04: filtra los productos que necesitan alerta de mínimo. */
 export function filterLowStock<T extends LowStockCandidate>(rows: T[]): T[] {
   return rows.filter(isLowStock);

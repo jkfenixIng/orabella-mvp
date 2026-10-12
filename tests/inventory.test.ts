@@ -6,6 +6,8 @@ import {
   areSkusConflicting,
   filterLowStock,
   isLowStock,
+  matchesStockFilter,
+  stockBadge,
   manualMovementSchema,
   matchesProductQuery,
   movementSchema,
@@ -221,6 +223,31 @@ describe("inventory: alertas de mínimo (INV-04)", () => {
       { id: "igual", stock_qty: 3, min_stock: 3 },
     ];
     expect(filterLowStock(rows).map((row) => row.id)).toEqual(["bajo", "igual"]);
+  });
+});
+
+describe("inventory: estado visible de stock", () => {
+  it("cero es Sin existencias y positivo hasta el mínimo es Bajo mínimo", () => {
+    expect(stockBadge({ stock_qty: 0, min_stock: 0 })).toBe("empty");
+    expect(stockBadge({ stock_qty: 1, min_stock: 1 })).toBe("low");
+    expect(stockBadge({ stock_qty: 2, min_stock: 1 })).toBeNull();
+  });
+
+  it("los filtros no mezclan Bajo mínimo con Sin existencias", () => {
+    const empty = { stock_qty: 0, min_stock: 5 };
+    const low = { stock_qty: 2, min_stock: 5 };
+    expect(matchesStockFilter(empty, "empty")).toBe(true);
+    expect(matchesStockFilter(empty, "low")).toBe(false);
+    expect(matchesStockFilter(low, "low")).toBe(true);
+    expect(matchesStockFilter(low, "all")).toBe(true);
+  });
+
+  it("la lista usa ListToolbar, ListPager y badges rojo/naranja", () => {
+    const client = readFileSync(join(process.cwd(), "app", "inventory", "inventory-client.tsx"), "utf8");
+    expect(client).toContain("<ListToolbar");
+    expect(client).toContain("<ListPager");
+    expect(client).toMatch(/stockBadge\(row\) === "empty"[\s\S]{0,80}variant="destructive"[\s\S]{0,80}Sin existencias/);
+    expect(client).toMatch(/stockBadge\(row\) === "low"[\s\S]{0,80}variant="warning"[\s\S]{0,80}Bajo mínimo/);
   });
 });
 

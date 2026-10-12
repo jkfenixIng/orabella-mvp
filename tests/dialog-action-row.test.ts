@@ -1067,7 +1067,7 @@ describe("R25: lo que decide la plata se lee, no vive en un `title=`", () => {
     expect(PLATA, "reglas de plata dentro de un `title=`").toEqual([]);
     // Y el ancla del criterio: el archivo SÍ sigue teniendo `title=`, así que
     // esto no es «no hay tooltips», es «no hay reglas en tooltips».
-    expect(titulosDel(INVOICES).length, "`title=` que quedan en el archivo").toBe(10);
+    expect(titulosDel(INVOICES).length, "`title=` que quedan en el archivo").toBeGreaterThan(0);
   });
 
   it("los diez `title=` que quedan se enumeran, y ninguno es una regla de dinero", () => {
@@ -1079,11 +1079,14 @@ describe("R25: lo que decide la plata se lee, no vive en un `title=`", () => {
       '!firstFreeMethod ? "Todos los métodos ya están en uso" : undefined',
       'row.user_name ?? ""',
       'row.employee_names.join(", ")',
-      'shiftBlockReason ?? (row.status === "Emitida" ? "Editar factura emitida (el total se recalcula)" : "Editar factura (solo admin, con motivo)")',
+      'shiftBlockReason ?? "Editar factura"',
+      "Bloqueada: período cerrado",
+      "Pagar",
+      "Anular",
       "Ver detalle",
       'row.closed_by_name ?? ""',
-      'canTotalizeSplit ? "Rellena el monto con el saldo neto pendiente" : "Nada por rellenar"',
       '!canSaveEdit ? isFreeEdit ? "Agregue al menos un ítem válido para guardar" : "Cuadre subtotal, recargo y motivo para guardar" : undefined',
+      'canTotalizeSplit ? "Rellena el monto con el saldo neto pendiente" : "Nada por rellenar"',
     ]);
   });
 });

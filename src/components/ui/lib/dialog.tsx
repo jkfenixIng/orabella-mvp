@@ -234,9 +234,17 @@ const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
   DialogContentProps
 >(({ className, children, ...props }, ref) => {
+  const { onPointerDownOutside, onInteractOutside, ...contentProps } = props
   const open = React.useContext(DialogOpenContext)
   const level = Math.max(1, useDialogLayer(open))
   const { overlay: overlayZ, content: contentZ } = computeDialogZIndex(level)
+  // Toasts live outside the modal portal. A click on them must not dismiss it.
+  const keepToastInteractive = (event: Event) => {
+    const target = event.target
+    if (target instanceof Element && target.closest('[data-sonner-toaster]')) {
+      event.preventDefault()
+    }
+  }
   return (
     <DialogPrimitive.Portal>
       <DialogPrimitive.Overlay
@@ -245,7 +253,7 @@ const DialogContent = React.forwardRef<
       />
       <DialogPrimitive.Content
         ref={ref}
-        style={{ zIndex: contentZ, ...props.style }}
+        style={{ zIndex: contentZ, ...contentProps.style }}
         // R7: el diálogoRespira. Antes era `w-full … p-6`, y medido a
         // 320/360/390 el rect daba `left=0, right=viewport`: GUTTER 0 en los
         // dos lados, con una caja de contenido de `ancho−48` (272 px a 320).
@@ -286,7 +294,15 @@ const DialogContent = React.forwardRef<
           'fixed left-1/2 top-1/2 grid w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-lg border border-border-color bg-surface p-4 shadow-xl outline-none transition duration-150 data-[state=open]:scale-100 data-[state=open]:opacity-100 data-[state=closed]:scale-95 data-[state=closed]:opacity-0 sm:p-6 dark:border-border-color-2 dark:bg-surface',
           className,
         )}
-        {...props}
+        {...contentProps}
+        onPointerDownOutside={(event) => {
+          onPointerDownOutside?.(event)
+          keepToastInteractive(event)
+        }}
+        onInteractOutside={(event) => {
+          onInteractOutside?.(event)
+          keepToastInteractive(event)
+        }}
       >
         {children}
       </DialogPrimitive.Content>

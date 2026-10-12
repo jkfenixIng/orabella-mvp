@@ -4,7 +4,7 @@ import { Alert } from "@/src/components/ui/lib/alert";
 import { PageContainer, PageHeader } from "@/src/components/ui/lib/page";
 import { SESSION_COOKIE_NAME } from "@/src/features/auth/constants";
 import { getSessionUser } from "@/src/features/auth/service";
-import { listServices } from "@/src/features/admin/service";
+import { listServicesPage } from "@/src/features/admin/service";
 import { ServicesClient } from "./services-client";
 
 export const dynamic = "force-dynamic";
@@ -35,7 +35,8 @@ export default async function ServicesPage() {
     );
   }
 
-  const services = await listServices();
+  if (!session.roles.includes("admin") && !session.roles.includes("caja")) redirect("/");
+  const initialPage = await listServicesPage({});
   const canWrite = session.roles.includes("admin");
 
   return (
@@ -44,7 +45,7 @@ export default async function ServicesPage() {
         title="Servicios"
         description="Catálogo de servicios de la sede: qué se brinda, con precio y duración estimada."
       />
-      <ServicesClient initialServices={services} canWrite={canWrite} />
+      <ServicesClient initialPage={initialPage} canWrite={canWrite} />
     </PageContainer>
   );
 }

@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   computeDialogZIndex,
@@ -51,5 +53,47 @@ describe("computePopoverZIndex", () => {
 
   it("sin diálogos abiertos usa la banda del nivel 1", () => {
     expect(computePopoverZIndex(0)).toBe(computePopoverZIndex(1));
+  });
+});
+
+describe("DialogContent y notificaciones", () => {
+  const source = readFileSync(join(process.cwd(), "src", "components", "ui", "lib", "dialog.tsx"), "utf8");
+
+  it("no cierra el diálogo al tocar una notificación", () => {
+    expect(source).toContain("target.closest('[data-sonner-toaster]')");
+    expect(source).toMatch(/onPointerDownOutside=\{\(event\) => \{\s*onPointerDownOutside\?\.\(event\)\s*keepToastInteractive\(event\)/);
+    expect(source).toMatch(/onInteractOutside=\{\(event\) => \{\s*onInteractOutside\?\.\(event\)\s*keepToastInteractive\(event\)/);
+  });
+
+  it("sigue usando el contenido modal de Radix, con su foco atrapado", () => {
+    expect(source).toContain("<DialogPrimitive.Content");
+    expect(source).not.toContain("modal={false}");
+  });
+});
+
+describe("errores dentro del diálogo activo", () => {
+  const read = (...parts: string[]) => readFileSync(join(process.cwd(), ...parts), "utf8");
+
+  it("la baja de denominación conserva la confirmación y su error", () => {
+    const source = read("app", "admin", "admin-sections", "cash-section.tsx");
+    const remove = source.slice(source.indexOf("async function removeDenomination"), source.indexOf("return (", source.indexOf("async function removeDenomination")));
+    expect(remove.indexOf("setDeleteError(result.message)")).toBeLessThan(remove.indexOf("setPendingDelete(null)"));
+    expect(source).toMatch(/<ConfirmDialog[\s\S]*?error=\{deleteError\}/);
+  });
+
+  it("caja muestra los fallos de abrir, cerrar y recontar dentro de su diálogo", () => {
+    const source = read("app", "cash", "cash-client.tsx");
+    for (const handler of ["handleOpen", "handleClose", "handleRecount"]) {
+      expect(source).toMatch(new RegExp(`onSubmit=\\{${handler}\\}[^>]*>\\s*\\{dialogError \\? <Alert variant="destructive">\\{dialogError\\}</Alert> : null\\}`));
+    }
+    expect(source.match(/setDialogError\(result\.message\)/g)?.length).toBeGreaterThanOrEqual(6);
+  });
+
+  it("vales deja abiertos solicitar, confirmar y revisar cuando fallan", () => {
+    const source = read("app", "vales", "vouchers-client.tsx");
+    expect(source).toMatch(/onSubmit=\{handleRequestVoucher\}[^>]*>\s*\{createError \? <Alert variant="destructive">\{createError\}<\/Alert> : null\}/);
+    expect(source).toMatch(/<ConfirmDialog[\s\S]*?error=\{createError\}/);
+    expect(source).toContain("if (done) closeReview();");
+    expect(source.match(/setReviewError\(`\$\{result\.code\}: \$\{result\.message\}`\)/g)).toHaveLength(2);
   });
 });

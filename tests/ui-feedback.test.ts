@@ -408,6 +408,12 @@ describe("toast: dependencia y montaje único", () => {
     }
   });
 
+  it("el toaster conserva interacción aunque haya un diálogo abierto", () => {
+    const code = SONNER_TSX.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+    const openTag = code.slice(code.indexOf("<Sonner"), code.indexOf("{...props}"));
+    expect(openTag).toContain('className="pointer-events-auto toaster group"');
+  });
+
   it("los toasts persisten, se pueden cerrar y no ocultan los nuevos", () => {
     const source = SONNER_TSX.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
     const openTag = source.slice(source.indexOf("<Sonner"), source.indexOf("{...props}"));
