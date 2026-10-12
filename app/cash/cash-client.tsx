@@ -798,18 +798,24 @@ export function CashClient(props: CashClientProps) {
                  <button
                    type="button"
                    className={ghostClass}
-                   disabled={busy}
-                   onClick={async () => {
-                     const result = await getShiftMethodBalancesAction(openShift.id);
-                     if (showResult(result, "")) setMethodBalances(result.data);
-                   }}
-                 >
-                   Ver disponible por método
-                 </button>
+                    disabled={busy}
+                    aria-expanded={methodBalances !== null}
+                    aria-controls="cash-method-balances"
+                    onClick={async () => {
+                      if (methodBalances !== null) {
+                        setMethodBalances(null);
+                        return;
+                      }
+                      const result = await getShiftMethodBalancesAction(openShift.id);
+                      if (showResult(result, "")) setMethodBalances(result.data);
+                    }}
+                  >
+                    {methodBalances ? "Ocultar disponible por método" : "Ver disponible por método"}
+                  </button>
                </div>
              )}
              {props.isAdmin && methodBalances && (
-               <ul className="flex flex-col gap-1" aria-label="Disponible por método">
+               <ul id="cash-method-balances" className="flex flex-col gap-1" aria-label="Disponible por método">
                  {methodBalances.map((row) => (
                    <li key={row.method_code}>
                      {props.methods.find((method) => method.code === row.method_code)?.name ?? row.method_code}:
