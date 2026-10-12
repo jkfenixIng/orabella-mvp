@@ -8,7 +8,7 @@ async function marker(db: Awaited<ReturnType<typeof buildSchemaDb>>, filename: s
 }
 
 describe("portable migration marker contracts", () => {
-  it("are true after 001-007", async () => {
+  it("are true after every migration", async () => {
     const db = await buildSchemaDb({ catalog: false });
     try {
       for (const filename of Object.keys(MIGRATION_MARKERS)) expect(await marker(db, filename)).toBe(true);
@@ -17,13 +17,13 @@ describe("portable migration marker contracts", () => {
     }
   });
 
-  it("distinguish 006 and 007 from a 001-005 baseline", async () => {
+  it("distinguish 006-008 from a 001-005 baseline", async () => {
     const through005 = MIGRATION_PATHS.filter((path) => /[\\/]00[1-5]_[^\\/]+\.sql$/.test(path));
     expect(through005).toHaveLength(5);
     const db = await buildSchemaDb({ catalog: false, migrations: through005 });
     try {
       for (const filename of Object.keys(MIGRATION_MARKERS)) {
-        expect(await marker(db, filename)).toBe(!/^00[67]_/.test(filename));
+        expect(await marker(db, filename)).toBe(!/^00[678]_/.test(filename));
       }
     } finally {
       await db.close();

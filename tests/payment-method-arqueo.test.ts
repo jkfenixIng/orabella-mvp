@@ -1,26 +1,28 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { normalizePaymentMethodCode, paymentMethodSchema } from "@/src/features/admin/schemas";
+import { normalizePaymentMethodCode, paymentMethodCodeForName, paymentMethodSchema } from "@/src/features/admin/schemas";
 import { paymentMethodWriteError } from "@/src/features/admin/service";
 import { CASH_METHOD_BALANCE_REQUIRED, cashMethodRuleError } from "@/src/features/cash/service";
 import { methodAvailability } from "@/src/features/cash/schemas";
 
 const read = (path: string) => readFileSync(join(process.cwd(), path), "utf8");
 
-describe("payment methods: free, normalized and immutable code (003)", () => {
-  it("normalizes before validating, so 'Billetera QR' becomes a valid stable code", () => {
+describe("payment methods: generated immutable code and arqueo mode (003)", () => {
+  it("normalizes names and creates deterministic collision suffixes within 40 characters", () => {
     expect(normalizePaymentMethodCode("  Billetera QR ")).toBe("billetera-qr");
-    expect(paymentMethodSchema.safeParse({ code: "  Billetera QR ", name: "QR" }).success).toBe(true);
-    expect(paymentMethodSchema.safeParse({ code: "qr!", name: "QR" }).success).toBe(false);
-    expect(paymentMethodSchema.safeParse({ name: "Sin código" }).success).toBe(false);
+    expect(paymentMethodCodeForName("Billetera QR", [])).toBe("billetera-qr");
+    expect(paymentMethodCodeForName("Billetera QR", ["billetera-qr"])).toBe("billetera-qr-2");
+    expect(paymentMethodCodeForName("Billetera QR", ["billetera-qr", "billetera-qr-2"])).toBe("billetera-qr-3");
+    expect(paymentMethodCodeForName("x".repeat(80), [])).toHaveLength(40);
   });
 
-  it("accepts the three arqueo modes and nothing else", () => {
+  it("does not accept public code input and accepts only known arqueo modes", () => {
+    expect(paymentMethodSchema.safeParse({ code: "external", name: "QR" }).data).not.toHaveProperty("code");
     for (const mode of ["none", "denominations", "declared_total"]) {
-      expect(paymentMethodSchema.safeParse({ code: "qr", name: "QR", arqueo_mode: mode }).success).toBe(true);
+      expect(paymentMethodSchema.safeParse({ name: "QR", arqueo_mode: mode }).success).toBe(true);
     }
-    expect(paymentMethodSchema.safeParse({ code: "qr", name: "QR", arqueo_mode: "yes" }).success).toBe(false);
+    expect(paymentMethodSchema.safeParse({ name: "QR", arqueo_mode: "yes" }).success).toBe(false);
   });
 
   it("maps the stable database errors to business errors", () => {
@@ -33,14 +35,13 @@ describe("payment methods: free, normalized and immutable code (003)", () => {
     expect(paymentMethodWriteError({ code: "XX000", message: "boom" }).code).toBe("INTERNAL");
   });
 
-  it("the form asks for a free code on creation, read-only on edit, and the arqueo mode", () => {
+  it("the form never displays or submits a code and disables arqueo when inactive", () => {
     const source = read("app/admin/admin-sections/methods-section.tsx");
-    expect(source).not.toMatch(/<option value="efectivo">/);
-    expect(source).toContain("readOnly={editingId !== null}");
+    expect(source).not.toMatch(/Código|form\.code|row\.code/);
     expect(source).toContain('value="denominations"');
     expect(source).toContain('value="declared_total"');
-    // The code only travels on creation.
-    expect(source).toContain("...(editingId ? { id: editingId } : { code: form.code })");
+    expect(source).toContain('arqueo_mode: event.target.checked ? form.arqueo_mode : "none"');
+    expect(source).toContain("disabled={!form.is_active}");
   });
 });
 

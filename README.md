@@ -38,7 +38,7 @@ cp .env.example .env.local     # completar las 3 variables (ver Env)
 npm run dev                    # http://localhost:3000
 ```
 
-Base de datos, en este orden. `001` se aplica **una sola vez**; `002` a `007`
+Base de datos, en este orden. `001` se aplica **una sola vez**; `002` a `008`
 son migraciones transaccionales; los seeds son idempotentes y se pueden
 reejecutar:
 
@@ -51,6 +51,7 @@ psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/004_invento
 psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/005_cop_whole_peso.sql
 psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/006_installation_owner.sql
 psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/007_money_cap_policy.sql
+psql "<connection-string>" -v ON_ERROR_STOP=1 -f supabase/migrations/008_inactive_payment_method_arqueo.sql
 psql "<connection-string>" -f supabase/seeds/catalog.sql      # catálogo mínimo: roles, sede, caja, pagos, impuestos, ajustes
 psql "<connection-string>" -f supabase/seeds/acceptance.sql   # opcional: datos de prueba §11
 ```

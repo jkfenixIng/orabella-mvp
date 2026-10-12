@@ -658,7 +658,7 @@ function tablasConColumnaSede(sql: string): string[] {
  * numerado nuevo, y entra en esta lista a mano, con su decisión escrita en
  * `supabase/squash/README.md` (5.3).
  */
-const MIGRACIONES_POSTERIORES = ["002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql", "005_cop_whole_peso.sql", "006_installation_owner.sql", "007_money_cap_policy.sql"] as const;
+const MIGRACIONES_POSTERIORES = ["002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql", "005_cop_whole_peso.sql", "006_installation_owner.sql", "007_money_cap_policy.sql", "008_inactive_payment_method_arqueo.sql"] as const;
 
 /**
  * Top-level statements of a SQL file, comments removed. Splits on `;` only

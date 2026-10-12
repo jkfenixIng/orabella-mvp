@@ -25,8 +25,7 @@ const ARQUEO_MODE_LABEL: Record<ArqueoMode, string> = {
   declared_total: "Se arquea con total declarado",
 };
 
-const EMPTY_METHOD: { code: string; name: string; is_active: boolean; arqueo_mode: ArqueoMode } = {
-  code: "",
+const EMPTY_METHOD: { name: string; is_active: boolean; arqueo_mode: ArqueoMode } = {
   name: "",
   is_active: true,
   arqueo_mode: "none",
@@ -55,7 +54,7 @@ export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
 
   function startEdit(row: PaymentMethodRow) {
     setEditingId(row.id);
-    setForm({ code: row.code, name: row.name, is_active: row.is_active, arqueo_mode: row.arqueo_mode });
+    setForm({ name: row.name, is_active: row.is_active, arqueo_mode: row.is_active ? row.arqueo_mode : "none" });
     setError(null);
     setDialogOpen(true);
   }
@@ -72,7 +71,7 @@ export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
     setBusy(true);
     setError(null);
     const result: ActionResult<PaymentMethodRow> = await upsertPaymentMethodAction({
-      ...(editingId ? { id: editingId } : { code: form.code }),
+      ...(editingId ? { id: editingId } : {}),
       name: form.name,
       is_active: form.is_active,
       arqueo_mode: form.arqueo_mode,
@@ -109,8 +108,7 @@ export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
             {rows.map((row) => (
               <li key={row.id} className={`${listItemClass} justify-between`}>
                 <span>
-                  <strong>{row.name}</strong> ({row.code}) ·{" "}
-                  {row.is_active ? "activo" : "inactivo"} ·{" "}
+                  <strong>{row.name}</strong> · {row.is_active ? "activo" : "inactivo"} ·{" "}
                   {ARQUEO_MODE_LABEL[row.arqueo_mode]}
                 </span>
                 <button type="button" onClick={() => startEdit(row)} className={linkButtonClass}>
@@ -138,27 +136,6 @@ export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
       >
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <label className={labelClass}>
-            Código
-            <input
-              value={form.code}
-              onChange={(event) => setForm({ ...form, code: event.target.value })}
-              className={inputClass}
-              readOnly={editingId !== null}
-              aria-readonly={editingId !== null}
-              aria-describedby="payment-method-code-help"
-              required={editingId === null}
-              minLength={2}
-              maxLength={40}
-              autoCapitalize="none"
-              spellCheck={false}
-            />
-            <span id="payment-method-code-help" className="text-xs text-text-secondary">
-              {editingId
-                ? "El código no se puede cambiar: es el registro histórico de los pagos."
-                : "Minúsculas, números, guion o guion bajo. No se podrá cambiar."}
-            </span>
-          </label>
-          <label className={labelClass}>
             Nombre
             <input
               value={form.name}
@@ -170,7 +147,13 @@ export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
             <input
               type="checkbox"
               checked={form.is_active}
-              onChange={(event) => setForm({ ...form, is_active: event.target.checked })}
+              onChange={(event) =>
+                setForm({
+                  ...form,
+                  is_active: event.target.checked,
+                  arqueo_mode: event.target.checked ? form.arqueo_mode : "none",
+                })
+              }
             />
             Activo (solo activos aceptan cobros)
           </label>
@@ -180,6 +163,7 @@ export function MethodsSection({ initial }: { initial: PaymentMethodRow[] }) {
               value={form.arqueo_mode}
               onChange={(event) => setForm({ ...form, arqueo_mode: event.target.value as ArqueoMode })}
               className={inputClass}
+              disabled={!form.is_active}
             >
               <option value="none">{ARQUEO_MODE_LABEL.none}</option>
               <option value="denominations">{ARQUEO_MODE_LABEL.denominations}</option>

@@ -77,7 +77,7 @@ export interface CatalogsRepo {
   listTaxes(limit: number): Promise<TaxRow[]>;
   upsertTax(row: TaxWrite): Promise<TaxRow | null>;
   listPaymentMethods(limit: number): Promise<PaymentRow[]>;
-  findPaymentMethod(id: string): Promise<Pick<PaymentRow, "code"> | null>;
+  findPaymentMethod(id: string): Promise<Pick<PaymentRow, "code" | "is_active"> | null>;
   updatePaymentMethod(id: string, fields: PaymentMethodFields): Promise<PaymentRow | null>;
   insertPaymentMethod(row: PaymentMethodInsert): Promise<PaymentRow | null>;
   listEmployees(limit: number): Promise<EmployeeCatalogRow[]>;
@@ -117,9 +117,9 @@ export function supabaseCatalogsRepo(db: SupabaseClient): CatalogsRepo {
       return (data ?? []) as PaymentRow[];
     },
     async findPaymentMethod(id) {
-      const { data, error } = await db.from("payment_methods").select("code").eq("id", id).maybeSingle();
+      const { data, error } = await db.from("payment_methods").select("code, is_active").eq("id", id).maybeSingle();
       if (error) fail(error);
-      return (data ?? null) as Pick<PaymentRow, "code"> | null;
+      return (data ?? null) as Pick<PaymentRow, "code" | "is_active"> | null;
     },
     async updatePaymentMethod(id, fields) {
       const { data, error } = await db

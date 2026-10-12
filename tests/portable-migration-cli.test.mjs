@@ -59,12 +59,14 @@ try {
   assert.deepEqual(repoPlan.discovered.map((migration) => migration.filename), [
     "002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql",
     "005_cop_whole_peso.sql", "006_installation_owner.sql", "007_money_cap_policy.sql",
+    "008_inactive_payment_method_arqueo.sql",
   ]);
-  const repoDeferred = buildMigrationPlan(repoPlan.discovered, [], ["006_installation_owner.sql", "007_money_cap_policy.sql"]);
+  const deferred = ["006_installation_owner.sql", "007_money_cap_policy.sql", "008_inactive_payment_method_arqueo.sql"];
+  const repoDeferred = buildMigrationPlan(repoPlan.discovered, [], deferred);
   assert.deepEqual(repoDeferred.apply.map((migration) => migration.filename), [
     "002_portable_platform.sql", "003_payment_method_arqueo.sql", "004_inventory_literal_search.sql", "005_cop_whole_peso.sql",
   ]);
-  assert.deepEqual(repoDeferred.deferred.map((migration) => migration.filename), ["006_installation_owner.sql", "007_money_cap_policy.sql"]);
+  assert.deepEqual(repoDeferred.deferred.map((migration) => migration.filename), deferred);
 
   // Apply refuses missing MIGRATION_DATABASE_URL, the app DATABASE_URL, and an unsafe psql path before contacting a DB.
   result = run(apply, ["--plan", output], { MIGRATION_DATABASE_URL: "", DATABASE_URL: "" });
