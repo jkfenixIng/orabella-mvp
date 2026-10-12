@@ -36,7 +36,7 @@ vi.mock("@/src/shared/lib/supabase/server", () => ({
       postgrest.calls.push(call);
       const answer = () => postgrest.answers.shift() ?? { data: null, error: null };
       const query: Record<string, unknown> = {};
-      for (const method of ["select", "eq", "neq", "in", "or", "order", "limit", "range", "insert", "upsert"]) {
+      for (const method of ["select", "eq", "neq", "in", "ilike", "or", "order", "limit", "range", "insert", "upsert"]) {
         query[method] = (...args: unknown[]) => {
           call.chain.push([method, args]);
           return query;
@@ -159,29 +159,50 @@ describe("literal search (supabase-js)", () => {
   });
 });
 describe("upsertProduct (supabase-js)", () => {
-  const input = { sku: " sh-1 ", name: "Shampoo", min_stock: 2 };
+  const input = { sku: "CLIENT-SKU", name: "Shampoo", min_stock: 2 };
+  const insert = (sku: string) => ({ sku, name: "Shampoo", description: null, min_stock: 2, cost_price: null, sale_price: null, commission_value: null });
+  const duplicate = { data: null, error: { code: "23505", message: "duplicate key value violates unique constraint \"products_sku_key\"" } };
 
-  it("pre-checks the normalized SKU, then upserts by id with the commission and returns the row", async () => {
-    withProbe({ data: [], error: null }, { data: ROW, error: null });
-    expect(await upsertProduct({ ...input, id: P })).toEqual(ROW);
-    const [check, write] = postgrest.calls.slice(-2);
-    expect(check.chain).toEqual([["select", ["id"]], ["eq", ["sku", "SH-1"]], ["limit", [1]], ["neq", ["id", P]]]);
-    expect(write.chain).toEqual([
-      ["upsert", [{ id: P, sku: "SH-1", name: "Shampoo", description: null, min_stock: 2, cost_price: null, sale_price: null, commission_value: null }, { onConflict: "id" }]],
-      ["select", [PRODUCT_SELECT]], ["single", []],
-    ]);
+  it("create ignores the input SKU and generates the next one for the name prefix", async () => {
+    withProbe({ data: [{ sku: "SHAMPO-001" }, { sku: "shampo-007" }], error: null }, { data: ROW, error: null });
+    expect(await upsertProduct(input)).toEqual(ROW);
+    const skuRead = postgrest.calls.find((call) => call.chain[0]?.[0] === "select" && call.chain[0]?.[1]?.[0] === "sku");
+    expect(skuRead?.chain).toEqual([["select", ["sku"]], ["ilike", ["sku", "SHAMPO-%"]], ["order", ["sku"]], ["range", [0, 999]]]);
+    expect(postgrest.calls.at(-1)?.chain[0]).toEqual(["upsert", [insert("SHAMPO-008"), { onConflict: "id" }]]);
   });
 
-  it("SKU taken by the pre-check or by the 23505 race is SKU_TAKEN 409; other failures INTERNAL", async () => {
-    answer({ data: [{ id: "other" }], error: null });
-    expect(await rejection(upsertProduct(input))).toMatchObject({ code: "SKU_TAKEN", status: 409 });
-    answer({ data: [], error: null }, { data: null, error: { code: "23505", message: "duplicate key value violates unique constraint \"products_sku_key\"" } });
+  it("pages more than 1000 matching SKUs and ignores other prefixes when finding the maximum", async () => {
+    const firstPage = Array.from({ length: 1000 }, (_, index) => ({ sku: `SHAMPO-${String(index + 1).padStart(3, "0")}` }));
+    withProbe({ data: firstPage, error: null }, { data: [{ sku: "SHAMPO-1001" }], error: null }, { data: ROW, error: null });
+
+    expect(await upsertProduct(input)).toEqual(ROW);
+    const skuReads = postgrest.calls.filter((call) => call.chain.some(([method]) => method === "ilike"));
+    expect(skuReads.map((call) => call.chain)).toEqual([
+      [["select", ["sku"]], ["ilike", ["sku", "SHAMPO-%"]], ["order", ["sku"]], ["range", [0, 999]]],
+      [["select", ["sku"]], ["ilike", ["sku", "SHAMPO-%"]], ["order", ["sku"]], ["range", [1000, 1999]]],
+    ]);
+    expect(postgrest.calls.at(-1)?.chain[0]).toEqual(["upsert", [insert("SHAMPO-1002"), { onConflict: "id" }]]);
+  });
+
+  it("edit keeps the stored SKU even when another one is sent", async () => {
+    withProbe({ data: ROW, error: null }, { data: ROW, error: null });
+    expect(await upsertProduct({ ...input, id: P })).toEqual(ROW);
+    expect(postgrest.calls.at(-1)?.chain[0]).toEqual(["upsert", [{ id: P, ...insert("SH-1") }, { onConflict: "id" }]]);
+    answer({ data: null, error: null });
+    expect(await rejection(upsertProduct({ ...input, id: P }))).toMatchObject({ code: "NOT_FOUND", status: 404 });
+  });
+
+  it("a 23505 race recomputes the SKU, up to three attempts; other failures INTERNAL", async () => {
+    answer({ data: [], error: null }, duplicate, { data: [{ sku: "SHAMPO-001" }], error: null }, { data: ROW, error: null });
+    expect(await upsertProduct(input)).toEqual(ROW);
+    expect(postgrest.calls.at(-1)?.chain[0]).toEqual(["upsert", [insert("SHAMPO-002"), { onConflict: "id" }]]);
+    answer({ data: [], error: null }, duplicate, { data: [], error: null }, duplicate, { data: [], error: null }, duplicate);
     expect(await rejection(upsertProduct(input))).toMatchObject({ code: "SKU_TAKEN", status: 409 });
     answer({ data: [], error: null }, { data: null, error: { code: "23514", message: "check" } });
     expect(await rejection(upsertProduct(input))).toMatchObject({ code: "INTERNAL", status: 500 });
     answer({ data: null, error: { message: "down" } });
     expect(await rejection(upsertProduct(input))).toMatchObject({ code: "INTERNAL", status: 500 });
-    expect(await rejection(upsertProduct({ sku: "", name: "" }))).toMatchObject({ code: "VALIDATION", status: 400 });
+    expect(await rejection(upsertProduct({ name: "" }))).toMatchObject({ code: "VALIDATION", status: 400 });
   });
 });
 

@@ -34,11 +34,12 @@ nombre o SKU (INV-01…05).
 
 - `src/features/inventory/schemas.ts`: `productSchema`,
   `movementSchema` (qty > 0, motivo obligatorio) + puros
-  (`normalizeSku`, `areSkusConflicting`, `applyMovementStock`,
+  (`productSkuPrefix`, `productSkuForName`, `applyMovementStock`,
   `matchesProductQuery`, `isLowStock`/`filterLowStock`,
   `sortKardexAscending`).
 - `src/features/inventory/service.ts`: `upsertProduct`
-  (SKU_TAKEN 409, nunca toca stock), `registerMovement`
+  (SKU generado en servidor e inmutable; reintenta 23505, SKU_TAKEN 409
+  tras 3 intentos; nunca toca stock), `registerMovement`
   (INSUFFICIENT_STOCK 409), `getKardex` (ascendente), `searchProducts`
   (nombre o SKU, solo sede), `lowStockAlerts` (stock <= mínimo),
   `listProducts`/`getProduct`. Reutiliza `requireSedeRole`
