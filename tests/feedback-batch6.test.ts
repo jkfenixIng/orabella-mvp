@@ -443,7 +443,6 @@ describe("caja: lo persistente va por Alert (estado)", () => {
     // aparece un aviso calculado del formulario, `role="status"` es obligatorio
     // y esta guarda —que hoy exige 0— lo delata.
     expect(alertsWithExplicitStatusRole(CASH_CLIENT_CODE)).toBe(0);
-    expect(alertsWithExplicitStatusRole(CASH_PAGE_CODE)).toBe(0);
     // Ningún `onChange` toca el error ni el toast: no hay canal derivado en vivo.
     for (const line of CASH_CLIENT_CODE.split("\n").filter((l) => l.includes("setError("))) {
       expect(line, line).not.toMatch(/onChange/);

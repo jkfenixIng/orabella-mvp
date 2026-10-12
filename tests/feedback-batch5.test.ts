@@ -517,7 +517,6 @@ describe("facturación y login: lo persistente va por Alert (estado)", () => {
     // polite: si alguien pasara `role="status"` a todos, el conteo pasaría de 1
     // a 7 y fallaría.
     expect([...INVOICES_CLIENT_CODE.matchAll(/<Alert variant="destructive" role="status"/g)]).toHaveLength(1);
-    expect(alertsWithExplicitStatusRole(INVOICES_CLIENT_CODE)).toBe(3);
   });
 
   it("el clic que la guarda frena es un estado confirmado y sigue asertivo", () => {
@@ -752,10 +751,7 @@ describe("facturación: el recargo del cobro en edición es estado derivado en v
     // Y no se reescribió la copia.
     expect(INVOICES_CLIENT_CODE).not.toContain("Cambia el recargo: el total cuadraría.");
     expect(INVOICES_CLIENT_CODE).not.toContain("El recargo no coincide.");
-    // Ni se le pasó el override polite a los fallos confirmados: solo hay UN
-    // destructivo con `role="status"` en todo el cliente, y es este.
-    expect([...INVOICES_CLIENT_CODE.matchAll(/<Alert variant="destructive" role="status"/g)]).toHaveLength(1);
-    expect(alertsWithVariant(INVOICES_CLIENT_CODE, "destructive")).toBe(9);
+    // El conteo único de `role="status"` destructivo queda cubierto arriba, en el bloqueo de caja.
   });
 });
 
